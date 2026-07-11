@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.claude/worktrees/
+examples/**/.claude/worktrees/
+test-output/
