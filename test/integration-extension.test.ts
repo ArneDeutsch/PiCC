@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import picc from "../src/index.js";
+import { resolveGitBashPath } from "../src/engine/shell-inject.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 
@@ -100,18 +101,24 @@ describe("tool surface registration", () => {
   });
 
   it("/skills lists the loaded corpus grouped by invocability", async () => {
-    pi.messages.length = 0;
+    pi.entries.length = 0;
     await pi.commands.get("skills").handler("", pi.ctx());
-    const out = pi.messages.map((m) => String(m.message.content)).join("\n");
+    const out = pi.entries
+      .filter((e) => e.customType === "picc-control")
+      .map((e) => String(e.data?.output ?? ""))
+      .join("\n");
     expect(out).toContain("Invocable as slash commands");
     expect(out).toContain("/deploy");
     expect(out).toMatch(/Model-invocable only|User-only/);
   });
 
   it("/agents lists subagents with tools and read-only markers", async () => {
-    pi.messages.length = 0;
+    pi.entries.length = 0;
     await pi.commands.get("agents").handler("", pi.ctx());
-    const out = pi.messages.map((m) => String(m.message.content)).join("\n");
+    const out = pi.entries
+      .filter((e) => e.customType === "picc-control")
+      .map((e) => String(e.data?.output ?? ""))
+      .join("\n");
     expect(out).toContain("subagent(s) available");
     expect(out).toContain("reviewer");
     expect(out).toMatch(/reviewer[^\n]*read-only/);
@@ -352,21 +359,29 @@ describe("session lifecycle hooks", () => {
   });
 
   it("/doctor renders the registry-generated breakdown", async () => {
-    pi.messages.length = 0;
+    pi.entries.length = 0;
     await pi.commands.get("doctor").handler("", pi.ctx());
-    const doctor = pi.messages.map((m) => String(m.message.content)).join("\n");
+    const doctor = pi.entries
+      .filter((e) => e.customType === "picc-control")
+      .map((e) => String(e.data?.output ?? ""))
+      .join("\n");
     expect(doctor).toContain("claude-code-2.1.x");
     expect(doctor.toLowerCase()).toContain("mcp");
   });
 
-  it("compaction: PostCompact re-injects active skills (NFR §9)", async () => {
+  it("compaction: PostCompact re-injects active skills mid-run via steer (NFR §9)", async () => {
     const skillTool = pi.tools.get("Skill");
     await skillTool.execute("t6", { name: "deploy", arguments: "prod 2.0" });
     pi.messages.length = 0;
     await pi.fire("session_compact", { reason: "threshold" });
-    const preserved = pi.messages.map((m) => String(m.message.content)).join("\n");
+    const entry = pi.messages.find((m) => m.message?.customType === "picc-preserved");
+    expect(entry, "expected a picc-preserved message").toBeDefined();
+    const preserved = String(entry?.message?.content ?? "");
     expect(preserved).toContain("preserved across compaction");
     expect(preserved).toContain("FS-SKILL-ARGS-BODY");
+    // Auto-compaction happens MID-RUN; "nextTurn" would queue until the next user
+    // prompt and never reach the continuing/retried run (the /doctor-class bug).
+    expect(entry?.options?.deliverAs).toBe("steer");
   });
 });
 
@@ -386,7 +401,12 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     expect(fs.existsSync(path.join(wt, ".worktree-seeded"))).toBe(true);
 
     // the project's own git-plumbing probe must report worktree mode from the new cwd
-    const bashCandidates = ["C:\\Program Files\\Git\\bin\\bash.exe", "bash"];
+    // (resolveGitBashPath covers user-local Git installs the hardcoded path missed)
+    const bashCandidates = [
+      resolveGitBashPath(),
+      "C:\\Program Files\\Git\\bin\\bash.exe",
+      "bash",
+    ].filter(Boolean) as string[];
     let probe = "";
     for (const bash of bashCandidates) {
       try {

@@ -1,3 +1,4 @@
+import path from "node:path";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { HookRunner } from "../../engine/hook-runner.js";
@@ -11,7 +12,7 @@ import type { WorktreeManagerLike } from "../subagents.js";
  */
 export function createWorktreeTools(deps: {
   worktrees: WorktreeManagerLike & {
-    reapOrphans(): Promise<{ reaped: string[]; diagnostics: unknown[] }>;
+    reapOrphans(options?: { maxAgeDays?: number }): Promise<{ reaped: string[]; diagnostics: unknown[] }>;
   };
   cwdState: CwdState;
   hookRunner: HookRunner;
@@ -26,9 +27,18 @@ export function createWorktreeTools(deps: {
       path: Type.Optional(Type.String({ description: "Existing worktree path to re-enter" })),
     }),
     async execute(_id: string, params: { name?: string; path?: string }) {
+      const previous = deps.cwdState.getWorktree();
       const result = await deps.worktrees.enter({ name: params.name, path: params.path });
       if (!result.ok || !result.worktreePath) {
         throw new Error(result.error ?? "EnterWorktree failed");
+      }
+      // Already inside a different worktree: CwdState has no stack (plan §4.4),
+      // so release the previous one (keep + unlock) — otherwise its on-disk
+      // `git worktree lock` leaks and blocks the project's own remove/prune.
+      let releasedLine: string | undefined;
+      if (previous !== undefined && path.resolve(previous) !== path.resolve(result.worktreePath)) {
+        await deps.worktrees.exit({ worktreePath: previous, action: "keep" });
+        releasedLine = `Left previous worktree (kept, unlocked): ${previous}`;
       }
       deps.cwdState.enterWorktree(result.worktreePath);
       const created = (result as { created?: boolean }).created ?? false;
@@ -44,6 +54,7 @@ export function createWorktreeTools(deps: {
         `${created ? "Created and entered" : "Entered"} worktree: ${result.worktreePath}`,
         (result as { branch?: string }).branch ? `Branch: ${(result as { branch?: string }).branch}` : undefined,
         seeded.length ? `Seeded from .worktreeinclude: ${seeded.join(", ")}` : undefined,
+        releasedLine,
         "The session working directory is now inside the worktree; all relative paths and shell commands run there.",
       ].filter(Boolean);
       return {
@@ -78,14 +89,18 @@ export function createWorktreeTools(deps: {
       const result = (await deps.worktrees.exit({ worktreePath, action: params.action })) as {
         removed?: boolean;
         orphaned?: boolean;
+        error?: string;
       };
       deps.cwdState.exitWorktree();
+      // Report truthfully: "removed" only when removal actually happened.
       const text =
         params.action === "keep"
           ? `Exited worktree (kept): ${worktreePath}. Working directory restored to ${deps.cwdState.getBase()}.`
-          : result.orphaned
-            ? `Exited worktree; removal was blocked (Windows file lock?) — it will be reaped later. Working directory restored.`
-            : `Exited and removed worktree: ${worktreePath}. Working directory restored.`;
+          : result.removed === true
+            ? `Exited and removed worktree: ${worktreePath}. Working directory restored.`
+            : result.orphaned === true
+              ? `Exited worktree; removal was blocked (Windows file lock?) — it will be reaped later. Working directory restored.`
+              : `Exited worktree, but removal FAILED${result.error ? ` (${result.error})` : ""} — ${worktreePath} was kept. Working directory restored.`;
       return { content: [{ type: "text", text }], details: { worktreePath, ...result } };
     },
   };

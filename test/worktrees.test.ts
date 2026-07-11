@@ -29,8 +29,12 @@ function makeRepo(): string {
   return dir;
 }
 
-function makeManager(projectRoot: string, settings: WorktreeSettings = { baseRef: "head" }): WorktreeManager {
-  return new WorktreeManager({ projectRoot, settings });
+function makeManager(
+  projectRoot: string,
+  settings: WorktreeSettings = { baseRef: "head" },
+  extra: { cleanupPeriodDays?: number } = {},
+): WorktreeManager {
+  return new WorktreeManager({ projectRoot, settings, ...extra });
 }
 
 async function stopChild(child: ChildProcess): Promise<void> {
@@ -168,6 +172,59 @@ describe("WorktreeManager.enter (name mode)", () => {
     expect(reuse.branch).toBe("worktree-leftover");
     expect(git(reuse.worktreePath!, "rev-parse", "--abbrev-ref", "HEAD")).toBe("worktree-leftover");
   });
+
+  it("reuses a diverged leftover branch at its tip and records the merge-base, not the resolved base", async () => {
+    const repo = makeRepo();
+    const fork = git(repo, "rev-parse", "HEAD");
+
+    // Leftover branch with unmerged work of its own.
+    git(repo, "checkout", "-b", "worktree-stale");
+    fs.writeFileSync(path.join(repo, "wip.txt"), "wip\n", "utf8");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-m", "stale wip");
+    const staleTip = git(repo, "rev-parse", "HEAD");
+
+    // Main advances past the fork point.
+    git(repo, "checkout", "main");
+    fs.writeFileSync(path.join(repo, "main2.txt"), "2\n", "utf8");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-m", "main advances");
+    const newHead = git(repo, "rev-parse", "HEAD");
+
+    const mgr = makeManager(repo);
+    const res = await mgr.enter({ name: "stale" });
+    expect(res.ok).toBe(true);
+    expect(res.branch).toBe("worktree-stale");
+    // Checkout preserves the branch's unmerged work (never reset).
+    expect(git(res.worktreePath!, "rev-parse", "HEAD")).toBe(staleTip);
+    // Recorded base = where the branch diverged, so base..HEAD is the unit of work.
+    expect(res.baseCommit).toBe(fork);
+    expect(res.baseCommit).not.toBe(newHead);
+    const baseFile = path.join(res.worktreePath!, ".claude", ".picc", "base-commit");
+    expect(fs.readFileSync(baseFile, "utf8")).toBe(`${fork}\n`);
+  });
+
+  it("reaps an orphaned non-worktree dir with the same name and recreates a real worktree", async () => {
+    const repo = makeRepo();
+    const mgr = makeManager(repo);
+
+    // Shape left behind by a partially failed removal: dir exists, .git pointer
+    // severed, not registered. Old code adopted it (created:false, branch undefined)
+    // and the session's git context silently became the MAIN repo.
+    const orphan = path.join(repo, ".claude", "worktrees", "zomb");
+    fs.mkdirSync(path.join(orphan, "leftover"), { recursive: true });
+    fs.writeFileSync(path.join(orphan, "leftover", "junk.txt"), "x\n", "utf8");
+
+    const res = await mgr.enter({ name: "zomb" });
+    expect(res.ok).toBe(true);
+    expect(res.created).toBe(true);
+    expect(res.branch).toBe("worktree-zomb");
+    expect(res.diagnostics.some((d) => /not a registered worktree/.test(d.message))).toBe(true);
+    // A real linked worktree now: .git pointer file, no stale junk.
+    expect(fs.statSync(path.join(orphan, ".git")).isFile()).toBe(true);
+    expect(fs.existsSync(path.join(orphan, "leftover"))).toBe(false);
+    expect(git(orphan, "rev-parse", "--abbrev-ref", "HEAD")).toBe("worktree-zomb");
+  });
 });
 
 describe("WorktreeManager.enter (path mode)", () => {
@@ -202,11 +259,36 @@ describe("WorktreeManager.enter (path mode)", () => {
     expect(missing.ok).toBe(false);
     expect(missing.error).toMatch(/not an existing directory/);
 
+    // Outside .claude/worktrees -> containment rejection.
     const plainDir = path.join(repo, "plain");
     fs.mkdirSync(plainDir);
     const notWorktree = await mgr.enter({ path: plainDir });
     expect(notWorktree.ok).toBe(false);
-    expect(notWorktree.error).toMatch(/not a registered git worktree/);
+    expect(notWorktree.error).toMatch(/outside/);
+
+    // Inside .claude/worktrees but never registered -> worktree rejection.
+    const containedDir = path.join(repo, ".claude", "worktrees", "fake");
+    fs.mkdirSync(containedDir, { recursive: true });
+    const contained = await mgr.enter({ path: containedDir });
+    expect(contained.ok).toBe(false);
+    expect(contained.error).toMatch(/not a registered git worktree/);
+  });
+
+  it("rejects the main working tree and any linked worktree outside .claude/worktrees", async () => {
+    const repo = makeRepo();
+    const mgr = makeManager(repo);
+
+    // The main working tree IS listed by `git worktree list` — must still be rejected.
+    const main = await mgr.enter({ path: repo });
+    expect(main.ok).toBe(false);
+    expect(main.error).toMatch(/main working tree/);
+
+    // A genuine linked worktree outside the managed root is not ours to manage.
+    const sideDir = path.join(repo, "side-wt");
+    git(repo, "worktree", "add", "-b", "side-branch", sideDir);
+    const side = await mgr.enter({ path: sideDir });
+    expect(side.ok).toBe(false);
+    expect(side.error).toMatch(/outside/);
   });
 });
 
@@ -232,6 +314,52 @@ describe(".worktreeinclude seeding", () => {
     expect(res.seededFiles).toEqual([".env.local", "config/x.secret"]);
     expect(fs.readFileSync(path.join(res.worktreePath!, ".env.local"), "utf8")).toBe("SECRET=1\n");
     expect(fs.readFileSync(path.join(res.worktreePath!, "config", "x.secret"), "utf8")).toBe("token\n");
+  });
+
+  it("honors gitignore-style negation lines: later `!pattern` un-matches earlier matches", async () => {
+    const repo = makeRepo();
+    fs.writeFileSync(path.join(repo, ".gitignore"), ".env*\nsecret.txt\n", "utf8");
+    fs.writeFileSync(path.join(repo, ".env.local"), "SECRET=1\n", "utf8");
+    fs.writeFileSync(path.join(repo, ".env.example"), "SECRET=\n", "utf8");
+    fs.writeFileSync(path.join(repo, "secret.txt"), "s\n", "utf8");
+    fs.writeFileSync(path.join(repo, ".worktreeinclude"), ".env*\n!.env.example\n", "utf8");
+
+    const mgr = makeManager(repo);
+    const res = await mgr.enter({ name: "negated" });
+    expect(res.ok).toBe(true);
+    // Old code: picomatch inverted `!.env.example` into a match-everything
+    // pattern, so secret.txt (and every other gitignored file) got seeded too.
+    expect(res.seededFiles).toEqual([".env.local"]);
+    expect(fs.existsSync(path.join(res.worktreePath!, ".env.example"))).toBe(false);
+    expect(fs.existsSync(path.join(res.worktreePath!, "secret.txt"))).toBe(false);
+  });
+
+  it("seeds nothing when .worktreeinclude contains only negation lines", async () => {
+    const repo = makeRepo();
+    fs.writeFileSync(path.join(repo, ".gitignore"), "*.log\n", "utf8");
+    fs.writeFileSync(path.join(repo, "debug.log"), "x\n", "utf8");
+    fs.writeFileSync(path.join(repo, ".worktreeinclude"), "!prod.env\n", "utf8");
+
+    const mgr = makeManager(repo);
+    const res = await mgr.enter({ name: "neg-only" });
+    expect(res.ok).toBe(true);
+    expect(res.seededFiles).toEqual([]);
+    expect(fs.existsSync(path.join(res.worktreePath!, "debug.log"))).toBe(false);
+  });
+
+  it("never seeds from node_modules (pruned from the project walk)", async () => {
+    const repo = makeRepo();
+    fs.writeFileSync(path.join(repo, ".gitignore"), "node_modules/\n*.local\n", "utf8");
+    fs.mkdirSync(path.join(repo, "node_modules", "pkg"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "node_modules", "pkg", "cfg.local"), "dep\n", "utf8");
+    fs.writeFileSync(path.join(repo, "app.local"), "app\n", "utf8");
+    fs.writeFileSync(path.join(repo, ".worktreeinclude"), "*.local\n", "utf8");
+
+    const mgr = makeManager(repo);
+    const res = await mgr.enter({ name: "nm" });
+    expect(res.ok).toBe(true);
+    expect(res.seededFiles).toEqual(["app.local"]);
+    expect(fs.existsSync(path.join(res.worktreePath!, "node_modules"))).toBe(false);
   });
 });
 
@@ -300,6 +428,50 @@ describe("WorktreeManager.exit", () => {
     }
     expect(fs.existsSync(res.worktreePath!)).toBe(false);
   });
+
+  it("refuses to remove the main working tree (containment) and deletes nothing", async () => {
+    const repo = makeRepo();
+    const mgr = makeManager(repo);
+
+    // Old code: `git worktree remove <root>` fails, and the unguarded rmSync
+    // fallback deleted the ENTIRE project including .git.
+    const exit = await mgr.exit({ worktreePath: repo, action: "remove" });
+    expect(exit.ok).toBe(false);
+    expect(exit.removed).toBe(false);
+    expect(exit.orphaned).toBe(false);
+    expect(exit.error).toMatch(/refusing to remove/);
+    expect(fs.existsSync(path.join(repo, "README.md"))).toBe(true);
+    expect(fs.existsSync(path.join(repo, ".git"))).toBe(true);
+    expect(git(repo, "rev-parse", "HEAD")).toBeTruthy();
+  });
+
+  it("refuses to remove paths outside .claude/worktrees (nested repo, plain dir, worktrees root)", async () => {
+    const repo = makeRepo();
+    const mgr = makeManager(repo);
+
+    // Unrelated nested repo — has a .git of its own; old code deleted it wholesale.
+    const nested = path.join(repo, "vendor", "other");
+    fs.mkdirSync(nested, { recursive: true });
+    git(nested, "init");
+    fs.writeFileSync(path.join(nested, "keep.txt"), "keep\n", "utf8");
+    const exitNested = await mgr.exit({ worktreePath: nested, action: "remove" });
+    expect(exitNested.ok).toBe(false);
+    expect(fs.existsSync(path.join(nested, "keep.txt"))).toBe(true);
+
+    // Plain directory.
+    const plain = path.join(repo, "plain");
+    fs.mkdirSync(plain);
+    const exitPlain = await mgr.exit({ worktreePath: plain, action: "remove" });
+    expect(exitPlain.ok).toBe(false);
+    expect(fs.existsSync(plain)).toBe(true);
+
+    // The worktrees root itself is not a worktree either.
+    const root = path.join(repo, ".claude", "worktrees");
+    fs.mkdirSync(root, { recursive: true });
+    const exitRoot = await mgr.exit({ worktreePath: root, action: "remove" });
+    expect(exitRoot.ok).toBe(false);
+    expect(fs.existsSync(root)).toBe(true);
+  });
 });
 
 describe("WorktreeManager.reapOrphans", () => {
@@ -318,6 +490,28 @@ describe("WorktreeManager.reapOrphans", () => {
     expect(fs.existsSync(zombie)).toBe(false);
     expect(fs.existsSync(alive.worktreePath!)).toBe(true);
     expect((await mgr.list()).some((e) => path.resolve(e.path) === path.resolve(alive.worktreePath!))).toBe(true);
+  });
+
+  it("honors cleanupPeriodDays as the default orphan max-age (mtime-based grace period)", async () => {
+    const repo = makeRepo();
+    const mgr = makeManager(repo, { baseRef: "head" }, { cleanupPeriodDays: 30 });
+
+    const fresh = path.join(repo, ".claude", "worktrees", "fresh-orphan");
+    fs.mkdirSync(fresh, { recursive: true });
+    const stale = path.join(repo, ".claude", "worktrees", "stale-orphan");
+    fs.mkdirSync(stale, { recursive: true });
+    const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(stale, old, old);
+
+    // Default max-age = cleanupPeriodDays: only the stale orphan is reaped.
+    const reap = await mgr.reapOrphans();
+    expect(reap.reaped.map((p) => path.resolve(p))).toEqual([path.resolve(stale)]);
+    expect(fs.existsSync(fresh)).toBe(true);
+
+    // Explicit override wins over the settings default.
+    const reapNow = await mgr.reapOrphans({ maxAgeDays: 0 });
+    expect(reapNow.reaped.map((p) => path.resolve(p))).toEqual([path.resolve(fresh)]);
+    expect(fs.existsSync(fresh)).toBe(false);
   });
 });
 

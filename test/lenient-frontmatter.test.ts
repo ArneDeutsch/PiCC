@@ -50,6 +50,46 @@ describe("lenient frontmatter recovery", () => {
     expect(fm.flag).toBe(true);
   });
 
+  it("parses zero-indent block lists (regression: tools dropped to empty)", () => {
+    // YAML allows sequence items at the SAME indent as the owning key; Claude
+    // agents commonly use this shape. Dropping it degraded an agent to an
+    // empty tools allowlist.
+    const md = [
+      "---",
+      "name: reviewer",
+      "description: Use when: reviewing code",
+      "tools:",
+      "- Read",
+      "- Grep",
+      "paths:",
+      "- src/**",
+      "model: sonnet",
+      "---",
+      "Body.",
+    ].join("\n");
+    const parsed = parseMarkdown(md, "reviewer.md");
+    expect(parsed.frontmatter.tools).toEqual(["Read", "Grep"]);
+    expect(parsed.frontmatter.paths).toEqual(["src/**"]);
+    expect(parsed.frontmatter.model).toBe("sonnet");
+    expect(String(parsed.frontmatter.description)).toContain("reviewing");
+  });
+
+  it("parses zero-indent lists on nested keys", () => {
+    const fm = lenientParseFrontmatter(
+      ["metadata:", "  tools:", "  - Read", "  - Write", "  other: y", "top: z"].join("\n"),
+    );
+    const metadata = fm.metadata as Record<string, unknown>;
+    expect(metadata.tools).toEqual(["Read", "Write"]);
+    expect(metadata.other).toBe("y");
+    expect(fm.top).toBe("z");
+  });
+
+  it("a key line ends a zero-indent list", () => {
+    const fm = lenientParseFrontmatter(["a:", "- 1", "- 2", "b:", "- 3"].join("\n"));
+    expect(fm.a).toEqual(["1", "2"]);
+    expect(fm.b).toEqual(["3"]);
+  });
+
   it("handles block scalars", () => {
     const fm = lenientParseFrontmatter(
       ["name: y", "description: |", "  line one", "  line two"].join("\n"),

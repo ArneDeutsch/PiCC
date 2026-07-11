@@ -92,11 +92,22 @@ export function saveProjectConfigValue(projectRoot: string, key: string, value: 
   }
 }
 
-/** Steering text for the active model: concatenation of all matching patterns. */
+/**
+ * Steering text for the active model: concatenation of all matching patterns.
+ * Patterns match the full "provider/modelId" ref; picomatch's `*` does not cross
+ * `/`, so a pattern without a provider segment ("*", "gpt-5*") additionally
+ * matches the bare modelId — the natural way users write model patterns.
+ */
 export function steeringForModel(config: PiCCConfig, modelRef: string): string | undefined {
   const parts: string[] = [];
+  const modelId = modelRef.includes("/") ? modelRef.slice(modelRef.indexOf("/") + 1) : modelRef;
   for (const [pattern, text] of Object.entries(config.steering)) {
-    if (picomatch(pattern, { nocase: true })(modelRef)) parts.push(text);
+    try {
+      const m = picomatch(pattern, { nocase: true });
+      if (m(modelRef) || (!pattern.includes("/") && m(modelId))) parts.push(text);
+    } catch {
+      // Malformed pattern: skip, never break prompt assembly.
+    }
   }
   return parts.length ? parts.join("\n\n") : undefined;
 }

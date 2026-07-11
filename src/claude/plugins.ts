@@ -61,6 +61,16 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+/**
+ * JSON-controlled keys that collide with `Object.prototype` members
+ * ("__proto__", "toString", ...) must never become keys of plain-object
+ * accumulators (never-throw floor): assigning "__proto__" rewires the
+ * prototype and reading an inherited member corrupts downstream merges.
+ */
+function isUnsafeKey(key: string): boolean {
+  return key in Object.prototype;
+}
+
 /** Coerce a manifest content-path value (string | string[]) into a string list. */
 function asPathList(value: unknown): string[] {
   if (typeof value === "string") return [value];
@@ -79,21 +89,47 @@ function pushUnique(list: string[], entry: string): void {
  *   `<root>/skills`, `<root>/agents`, `<root>/commands`, `<root>/hooks/hooks.json`
  * plus any extra default bases (e.g. `<projectRoot>/.claude-plugin/...` for a
  * project-bundled plugin). The manifest may also point elsewhere via
- * `skills` / `agents` / `commands` / `hooks` keys holding relative paths.
+ * `skills` / `agents` / `commands` / `hooks` keys holding relative paths
+ * (`${CLAUDE_PLUGIN_ROOT}` / `${CLAUDE_PLUGIN_DATA}` are expanded). A declared
+ * path that fails to resolve degrades to a diagnostic, never silently.
  */
 function resolveContent(
   root: string,
+  dataDir: string,
   manifest: Record<string, unknown>,
+  diagnostics: Diagnostic[],
   extraBases: string[] = [],
 ): Pick<InstalledPlugin, "skillDirs" | "agentDirs" | "commandDirs" | "hooksFiles"> {
   const bases = [root, ...extraBases];
+  const expandRel = (rel: string): string =>
+    rel.split("${CLAUDE_PLUGIN_ROOT}").join(root).split("${CLAUDE_PLUGIN_DATA}").join(dataDir);
+
+  const reportUnsupportedShape = (kind: string): void => {
+    const declared = manifest[kind];
+    if (declared !== undefined && asPathList(declared).length === 0) {
+      diagnostics.push({
+        severity: "warning",
+        message: `Plugin manifest "${kind}" is not a path or list of paths; ignored`,
+        source: root,
+      });
+    }
+  };
 
   const collectDirs = (kind: "skills" | "agents" | "commands"): string[] => {
     const dirs: string[] = [];
+    reportUnsupportedShape(kind);
     // Manifest-declared locations take precedence when present.
     for (const rel of asPathList(manifest[kind])) {
-      const abs = path.resolve(root, rel);
-      if (isDirectory(abs)) pushUnique(dirs, abs);
+      const abs = path.resolve(root, expandRel(rel));
+      if (isDirectory(abs)) {
+        pushUnique(dirs, abs);
+      } else {
+        diagnostics.push({
+          severity: "warning",
+          message: `Plugin manifest "${kind}" path does not resolve to a directory (ignored): ${rel}`,
+          source: root,
+        });
+      }
     }
     if (dirs.length === 0) {
       for (const base of bases) {
@@ -105,9 +141,18 @@ function resolveContent(
   };
 
   const hooksFiles: string[] = [];
+  reportUnsupportedShape("hooks");
   for (const rel of asPathList(manifest["hooks"])) {
-    const abs = path.resolve(root, rel);
-    if (isFile(abs)) pushUnique(hooksFiles, abs);
+    const abs = path.resolve(root, expandRel(rel));
+    if (isFile(abs)) {
+      pushUnique(hooksFiles, abs);
+    } else {
+      diagnostics.push({
+        severity: "warning",
+        message: `Plugin manifest "hooks" path does not resolve to a file (ignored): ${rel}`,
+        source: root,
+      });
+    }
   }
   if (hooksFiles.length === 0) {
     for (const base of bases) {
@@ -140,9 +185,9 @@ function marketplaceOf(root: string): string | undefined {
  * marketplace under `plugins/marketplaces/` is a *catalog* of available
  * plugins, not installed content — nothing there loads until the user enables
  * it. Therefore:
- * - object: enabled iff a candidate key (`name` or `name@marketplace`) is
- *   present with a truthy value; a matched-but-falsy value → disabled; no
- *   matching key → **disabled**.
+ * - object: the MOST SPECIFIC matching key decides (`name@marketplace` over
+ *   bare `name` — an explicit qualified `false` beats a bare `true`); a
+ *   matched-but-falsy value → disabled; no matching key → **disabled**.
  * - array: enabled iff a candidate key is a member.
  * - undefined / anything else: **disabled** (nothing enabled).
  */
@@ -156,7 +201,20 @@ function resolveEnabled(name: string, marketplace: string | undefined, enabledPl
     return enabledPlugins.some(isCandidate);
   }
   if (isPlainObject(enabledPlugins)) {
-    return Object.entries(enabledPlugins).some(([key, value]) => isCandidate(key) && Boolean(value));
+    // Most specific key wins (Object.hasOwn guards hostile keys like "__proto__").
+    if (marketplace !== undefined && Object.hasOwn(enabledPlugins, `${name}@${marketplace}`)) {
+      return Boolean(enabledPlugins[`${name}@${marketplace}`]);
+    }
+    if (Object.hasOwn(enabledPlugins, name)) {
+      return Boolean(enabledPlugins[name]);
+    }
+    if (marketplace === undefined) {
+      // Qualified keys for a plugin whose marketplace we could not determine.
+      return Object.entries(enabledPlugins).some(
+        ([key, value]) => key.startsWith(`${name}@`) && Boolean(value),
+      );
+    }
+    return false;
   }
   return false;
 }
@@ -164,14 +222,31 @@ function resolveEnabled(name: string, marketplace: string | undefined, enabledPl
 /**
  * Read `<pluginsRoot>/blocklist.json` into a set of blocked identifiers
  * (`name` and `name@marketplace` forms). Blocked plugins never load.
+ * Never throws: a malformed blocklist degrades to a diagnostic (and blocks
+ * nothing) instead of killing discovery.
  */
-function readBlocklist(pluginsRoot: string): Set<string> {
+function readBlocklist(pluginsRoot: string, diagnostics: Diagnostic[]): Set<string> {
   const blocked = new Set<string>();
-  const parsed = parseJsonSafe<{ plugins?: Array<{ plugin?: unknown }> }>(
-    readTextSafe(path.join(pluginsRoot, "blocklist.json")),
-  );
-  for (const entry of parsed?.plugins ?? []) {
-    if (typeof entry?.plugin === "string") blocked.add(entry.plugin);
+  const blocklistPath = path.join(pluginsRoot, "blocklist.json");
+  const text = readTextSafe(blocklistPath);
+  if (text === undefined) return blocked; // absent — degrade silently
+  const parsed = parseJsonSafe(text);
+  const malformed = (): Set<string> => {
+    diagnostics.push({
+      severity: "warning",
+      message: `Plugin blocklist is not valid (expected {"plugins": [{"plugin": "name"}]}); ignored`,
+      source: blocklistPath,
+    });
+    return blocked;
+  };
+  if (!isPlainObject(parsed)) return malformed();
+  const list = parsed["plugins"];
+  if (list === undefined) return blocked; // no "plugins" key — empty blocklist
+  if (!Array.isArray(list)) return malformed();
+  for (const entry of list) {
+    if (isPlainObject(entry) && typeof entry["plugin"] === "string") {
+      blocked.add(entry["plugin"]);
+    }
   }
   return blocked;
 }
@@ -252,7 +327,7 @@ export function discoverInstalledPlugins(opts: {
   if (!isDirectory(pluginsRoot)) {
     return { plugins, diagnostics };
   }
-  const blocked = readBlocklist(pluginsRoot);
+  const blocked = readBlocklist(pluginsRoot, diagnostics);
 
   for (const root of scanPluginRoots(pluginsRoot)) {
     const manifestPath = path.join(root, ".claude-plugin", "plugin.json");
@@ -267,18 +342,27 @@ export function discoverInstalledPlugins(opts: {
       typeof manifest["name"] === "string" && manifest["name"].length > 0
         ? manifest["name"]
         : path.basename(root);
+    if (isUnsafeKey(name)) {
+      diagnostics.push({
+        severity: "warning",
+        message: `Plugin name "${name}" is not allowed; plugin skipped`,
+        source: manifestPath,
+      });
+      continue;
+    }
     const marketplace = marketplaceOf(root);
     const enabled =
       !isBlocked(name, marketplace, blocked) &&
       resolveEnabled(name, marketplace, opts.enabledPlugins);
+    const dataDir = path.join(pluginsRoot, "data", name);
 
     plugins.push({
       name,
       marketplace,
       root,
-      dataDir: path.join(pluginsRoot, "data", name),
+      dataDir,
       manifest,
-      ...resolveContent(root, manifest),
+      ...resolveContent(root, dataDir, manifest, pluginDiagnostics),
       enabled,
       diagnostics: pluginDiagnostics,
     });
@@ -326,17 +410,26 @@ export function discoverProjectBundledPlugin(
     });
   }
 
-  const name =
+  let name =
     typeof manifest["name"] === "string" && manifest["name"].length > 0
       ? manifest["name"]
       : path.basename(projectRoot);
+  if (isUnsafeKey(name)) {
+    diagnostics.push({
+      severity: "warning",
+      message: `Project-bundled plugin name "${name}" is not allowed; renamed to "bundled-plugin"`,
+      source: bundleDir,
+    });
+    name = "bundled-plugin";
+  }
 
+  const dataDir = path.join(bundleDir, "data");
   return {
     name,
     root: projectRoot,
-    dataDir: path.join(bundleDir, "data"),
+    dataDir,
     manifest,
-    ...resolveContent(projectRoot, manifest, [bundleDir]),
+    ...resolveContent(projectRoot, dataDir, manifest, diagnostics, [bundleDir]),
     enabled: true,
     diagnostics,
   };
@@ -357,7 +450,17 @@ function expandDeep(value: unknown, plugin: InstalledPlugin): unknown {
   if (Array.isArray(value)) return value.map((v) => expandDeep(v, plugin));
   if (isPlainObject(value)) {
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) out[k] = expandDeep(v, plugin);
+    for (const [k, v] of Object.entries(value)) {
+      // defineProperty keeps hostile keys like "__proto__" as OWN properties
+      // (plain assignment would rewire the prototype); callers decide what to
+      // do with them (loadPluginHooks drops them with a diagnostic).
+      Object.defineProperty(out, k, {
+        value: expandDeep(v, plugin),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
     return out;
   }
   return value;
@@ -389,7 +492,15 @@ export function loadPluginHooks(plugin: InstalledPlugin): {
     const eventMap = isPlainObject(parsed["hooks"]) ? parsed["hooks"] : parsed;
     const expanded = expandDeep(eventMap, plugin) as Record<string, unknown>;
     for (const [event, entries] of Object.entries(expanded)) {
-      const existing = config[event];
+      if (isUnsafeKey(event)) {
+        diagnostics.push({
+          severity: "warning",
+          message: `Unsafe hook event key "${event}" ignored`,
+          source: file,
+        });
+        continue;
+      }
+      const existing = Object.hasOwn(config, event) ? config[event] : undefined;
       if (Array.isArray(existing) && Array.isArray(entries)) {
         config[event] = [...existing, ...entries];
       } else {

@@ -61,4 +61,36 @@ export const DEGRADED_TOOLS: Array<{ name: string; note: string }> = [
     name: "computer",
     note: "computer use is out of scope for PiCC (plan §7)",
   },
+  {
+    name: "LSP",
+    note: "language-server integration is out of scope; use Grep/Read to navigate code (plan §7)",
+  },
+  {
+    name: "MultiEdit",
+    note: "batch editing is not implemented; apply the changes as a sequence of Edit calls instead",
+  },
+  {
+    name: "BashOutput",
+    note: "background shells are not implemented; commands run in the foreground, so their output was already returned",
+  },
+  {
+    name: "KillShell",
+    note: "background shells are not implemented; there is no shell to kill",
+  },
+  {
+    name: "KillBash",
+    note: "background shells are not implemented; there is no shell to kill",
+  },
+  {
+    name: "SlashCommand",
+    note: "invoke the skill directly with the Skill tool instead",
+  },
+  {
+    name: "TaskOutput",
+    note: "background tasks are not implemented; subagents run in the foreground and return their result directly",
+  },
+  {
+    name: "TaskStop",
+    note: "background tasks are not implemented; there is no running task to stop",
+  },
 ];

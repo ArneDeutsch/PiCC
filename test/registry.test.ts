@@ -16,6 +16,7 @@ import {
   renderStartupNotice,
   writeSuppression,
 } from "../src/registry/compat-report.js";
+import { DEGRADED_TOOLS } from "../src/runtime/tools/degrade-stubs.js";
 import type {
   ClaudeAgent,
   ClaudeProject,
@@ -184,6 +185,85 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       expect(lookupCapability(`tool.${tool}`)?.tier, tool).toBe("full");
     }
     expect(lookupCapability("tool.TodoWrite")?.tier).toBe("partial");
+  });
+
+  it("stays in sync with the shipped degrade-stub list, in both directions", () => {
+    // Every shipped stub resolves to a dedicated degraded-noop registry entry
+    // (a stub reported "unassessed" would be registry drift, §17).
+    for (const { name } of DEGRADED_TOOLS) {
+      const cap = capabilityForToolName(name);
+      expect(cap.id, name).toBe(`tool.${name}`);
+      expect(cap.tier, name).toBe("degraded-noop");
+      expect(lookupCapability(`tool.${name}`), name).toBeDefined();
+    }
+    // Every degraded-noop tool entry (except the MCP wildcard) describes a stub
+    // that actually ships — no notes about stubs that don't exist.
+    const stubNames = new Set(DEGRADED_TOOLS.map((d) => d.name));
+    for (const entry of CAPABILITY_REGISTRY) {
+      if (entry.kind !== "tool" || entry.tier !== "degraded-noop") continue;
+      if (entry.id === "tool.mcp__*") continue;
+      expect(stubNames.has(entry.id.slice("tool.".length)), entry.id).toBe(true);
+    }
+    // The stale wrong spelling must be gone: the shipped stub is "computer".
+    expect(lookupCapability("tool.computer-use")).toBeUndefined();
+    expect(lookupCapability("tool.computer")?.tier).toBe("degraded-noop");
+  });
+
+  // Registry-accuracy pass: entries that previously claimed "full" for
+  // capabilities with no code consumer (or only boundary-limited consumers).
+  // These encode the CORRECTED expectations — if someone re-upgrades an entry
+  // without wiring a consumer, this fails.
+  it("settings that are parsed but consumed by nothing are not claimed full", () => {
+    for (const id of [
+      "setting.model",
+      "setting.includeCoAuthoredBy",
+      "setting.attribution",
+      "setting.apiKeyHelper",
+      "setting.permissions.additionalDirectories",
+    ]) {
+      const entry = lookupCapability(id);
+      expect(entry, id).toBeDefined();
+      expect(entry?.tier, id).toBe("degraded-noop");
+    }
+  });
+
+  it("settings honored by real consumers stay full", () => {
+    for (const id of [
+      "setting.skillOverrides",
+      "setting.cleanupPeriodDays",
+      "setting.enabledPlugins",
+    ]) {
+      expect(lookupCapability(id)?.tier, id).toBe("full");
+    }
+  });
+
+  it("agent permissionMode is a safety-relevant no-op, consistent with permissions.defaultMode", () => {
+    const mode = lookupCapability("agent.frontmatter.permissionMode");
+    expect(mode?.tier).toBe("degraded-noop");
+    expect(mode?.safetyRelevant).toBe(true);
+  });
+
+  it("agent color is cosmetic-parsed-only and maxTurns a best-effort partial", () => {
+    expect(lookupCapability("agent.frontmatter.color")?.tier).toBe("degraded-noop");
+    const maxTurns = lookupCapability("agent.frontmatter.maxTurns");
+    expect(maxTurns?.tier).toBe("partial");
+    expect(maxTurns?.note).toContain("best-effort");
+  });
+
+  it("skill tool gating / model / effort / paths carry their enforcement boundaries", () => {
+    // disallowed-tools deny via the guard for resident skills: full.
+    expect(lookupCapability("skill.frontmatter.disallowed-tools")?.tier).toBe("full");
+    // allowed-tools only gates fork dispatch — trivially satisfied in-session.
+    const allowed = lookupCapability("skill.frontmatter.allowed-tools");
+    expect(allowed?.tier).toBe("partial");
+    expect(allowed?.safetyRelevant).toBe(true);
+    // model/effort honored for fork dispatch; cannot re-model the parent session.
+    expect(lookupCapability("skill.frontmatter.model")?.tier).toBe("partial");
+    expect(lookupCapability("skill.frontmatter.effort")?.tier).toBe("partial");
+    // paths: surfaced on matching file access, activation stays explicit.
+    const paths = lookupCapability("skill.frontmatter.paths");
+    expect(paths?.tier).toBe("full");
+    expect(paths?.note).toContain("surfaced");
   });
 });
 
@@ -369,6 +449,143 @@ describe("buildCompatReport", () => {
       report.unassessed.some((u) => u.includes('agent "oddball"') && u.includes('"quux"')),
     ).toBe(true);
     expect(report.findings).toEqual([]);
+  });
+
+  it("reports permissions.defaultMode exactly once even though settings also defer the key", () => {
+    // settings.ts records defaultMode BOTH as permissions.defaultMode and as a
+    // deferredKeys entry; the report must not double-count one divergence.
+    const project = makeProject({
+      settings: makeSettings({
+        permissions: {
+          allow: [],
+          deny: [],
+          ask: [],
+          additionalDirectories: [],
+          defaultMode: "acceptEdits",
+        },
+        deferredKeys: [{ key: "permissions.defaultMode", scope: "project" }],
+      }),
+    });
+    const report = buildCompatReport(project);
+    const findings = [...report.safetyFindings, ...report.findings].filter(
+      (f) => f.capability.id === "setting.permissions.defaultMode",
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.evidence).toContain("acceptEdits");
+  });
+
+  it("surfaces the parsed-but-unhonored settings when a project declares them", () => {
+    const project = makeProject({
+      settings: makeSettings({
+        model: "opus",
+        includeCoAuthoredBy: false,
+        attribution: { coAuthoredBy: false },
+        apiKeyHelper: "/bin/key-helper.sh",
+        permissions: {
+          allow: [],
+          deny: [],
+          ask: [],
+          additionalDirectories: ["../shared"],
+        },
+      }),
+    });
+    const report = buildCompatReport(project);
+    const all = [...report.safetyFindings, ...report.findings];
+    for (const id of [
+      "setting.model",
+      "setting.includeCoAuthoredBy",
+      "setting.attribution",
+      "setting.apiKeyHelper",
+      "setting.permissions.additionalDirectories",
+    ]) {
+      const finding = all.find((f) => f.capability.id === id);
+      expect(finding, id).toBeDefined();
+      expect(finding?.capability.tier, id).toBe("degraded-noop");
+    }
+    expect(all.find((f) => f.capability.id === "setting.model")?.evidence).toContain("opus");
+  });
+
+  it("flags an agent permissionMode as a safety finding", () => {
+    const project = makeProject({
+      agents: [makeAgent({ name: "restricted", permissionMode: "plan" })],
+    });
+    const report = buildCompatReport(project);
+    const mode = report.safetyFindings.find(
+      (f) => f.capability.id === "agent.frontmatter.permissionMode",
+    );
+    expect(mode).toBeDefined();
+    expect(mode?.evidence).toContain('agent "restricted"');
+    expect(mode?.evidence).toContain("plan");
+  });
+
+  it("scans skill allowed-tools like agent tools: — degraded flagged, unknown unassessed, specifiers stripped", () => {
+    const project = makeProject({
+      skills: [
+        makeSkill({
+          name: "gated-skill",
+          allowedTools: ["Read", "Bash(git *)", "NotebookEdit", "mcp__srv__x", "TotallyNewTool"],
+          disallowedTools: ["NotebookRead"],
+        }),
+      ],
+    });
+    const report = buildCompatReport(project);
+    const notebook = report.findings.find((f) => f.capability.id === "tool.NotebookEdit");
+    expect(notebook).toBeDefined();
+    expect(notebook?.evidence).toContain('skill "gated-skill"');
+    expect(notebook?.evidence).toContain("allowed-tools:");
+    expect(report.findings.some((f) => f.capability.id === "tool.mcp__*")).toBe(true);
+    expect(report.unassessed.some((u) => u.includes('"TotallyNewTool"'))).toBe(true);
+    // Fully-honored grants and specifier entries produce no finding/unassessed noise.
+    expect(report.findings.some((f) => f.capability.id === "tool.Read")).toBe(false);
+    expect(report.findings.some((f) => f.capability.id === "tool.Bash")).toBe(false);
+    expect(report.unassessed.some((u) => u.includes("Bash"))).toBe(false);
+    // disallowed-tools denying a degraded tool is trivially satisfied — no finding.
+    expect(report.findings.some((f) => f.capability.id === "tool.NotebookRead")).toBe(false);
+  });
+
+  it("scans installed-plugin hook configs for degraded events and handler types", () => {
+    const pluginRoot = makeTempDir();
+    const hooksFile = path.join(pluginRoot, "hooks", "hooks.json");
+    fs.mkdirSync(path.dirname(hooksFile), { recursive: true });
+    fs.writeFileSync(
+      hooksFile,
+      JSON.stringify({
+        Notification: [{ hooks: [{ type: "command", command: "notify.sh" }] }],
+        PreToolUse: { hooks: [{ type: "prompt", prompt: "degraded handler" }] },
+      }),
+      "utf8",
+    );
+    const plugin = {
+      name: "hooky",
+      root: pluginRoot,
+      dataDir: pluginRoot,
+      manifest: {},
+      skillDirs: [],
+      agentDirs: [],
+      commandDirs: [],
+      hooksFiles: [hooksFile],
+      enabled: true,
+      diagnostics: [],
+    };
+    const project = { ...makeProject(), plugins: [plugin] };
+    const report = buildCompatReport(project);
+    const event = report.findings.find((f) => f.capability.id === "hook.event.Notification");
+    expect(event).toBeDefined();
+    expect(event?.evidence).toContain('plugin "hooky"');
+    const handler = report.findings.find(
+      (f) => f.capability.id === "feature.hook-handler.prompt",
+    );
+    expect(handler).toBeDefined();
+    expect(handler?.evidence).toContain('plugin "hooky"');
+  });
+
+  it("tolerates malformed plugins entries without crashing the scan", () => {
+    const project = {
+      ...makeProject(),
+      plugins: [null, 42, "junk", { name: "no-hooks" }, { hooksFiles: "not-an-array" }],
+    } as unknown as ClaudeProject;
+    expect(() => buildCompatReport(project)).not.toThrow();
+    expect(buildCompatReport(project).findings).toEqual([]);
   });
 
   it("flags a committed .mcp.json at the project root", () => {

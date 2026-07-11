@@ -30,6 +30,26 @@ const PLAIN_STDOUT_IGNORED_EVENTS: ReadonlySet<string> = new Set([
   "PostToolUseFailure",
 ]);
 
+/**
+ * Payload key(s) the `matcher` is compared against, per event (research 02
+ * §3.2): tool events match the tool name; SessionStart the source
+ * (startup|resume|clear|compact); PreCompact the trigger (manual|auto) —
+ * PiCC call sites currently deliver it as `reason`, so that is accepted as a
+ * fallback; Subagent* the agent type; SessionEnd the reason. Events not
+ * listed here document no matcher subject and Claude ignores `matcher` there
+ * (entries fire unconditionally).
+ */
+const MATCHER_SUBJECT_KEYS: Readonly<Record<string, readonly string[]>> = {
+  PreToolUse: ["tool_name"],
+  PostToolUse: ["tool_name"],
+  PostToolUseFailure: ["tool_name"],
+  SessionStart: ["source"],
+  PreCompact: ["trigger", "reason"],
+  SubagentStart: ["subagent_type", "agent_type"],
+  SubagentStop: ["subagent_type", "agent_type"],
+  SessionEnd: ["reason"],
+};
+
 const DEFAULT_TIMEOUT_SECONDS = 60;
 const HTTP_TIMEOUT_MS = 10_000;
 /** Grace period after a kill before we stop waiting for the process to close. */
@@ -94,7 +114,9 @@ export class HookRunner {
 
       for (const entry of entries) {
         if (!entry || !Array.isArray(entry.hooks)) continue;
-        if (!this.matcherMatches(entry.matcher, fullPayload, outcome.diagnostics)) continue;
+        if (!this.matcherMatches(entry.matcher, eventName, fullPayload, outcome.diagnostics)) {
+          continue;
+        }
         if (entry.if !== undefined && entry.if !== "") {
           // `if:` needs a tool call to evaluate against; without one the
           // entry is skipped (conservative: an unevaluable condition is
@@ -154,15 +176,34 @@ export class HookRunner {
 
   private matcherMatches(
     matcher: string | undefined,
+    eventName: string,
     payload: HookPayload,
     diagnostics: Diagnostic[],
   ): boolean {
-    if (matcher === undefined || matcher === "" || matcher === "*") return true;
-    const toolName = typeof payload.tool_name === "string" ? payload.tool_name : undefined;
-    if (toolName === undefined) return false;
+    if (matcher === undefined || matcher === "" || matcher === "*" || matcher === ".*") {
+      return true;
+    }
+    const subjectKeys = MATCHER_SUBJECT_KEYS[eventName];
+    // Events without a documented matcher subject (Stop, UserPromptSubmit,
+    // Worktree*, ...): Claude ignores `matcher` there — treat as match-all.
+    if (!subjectKeys) return true;
+    let subject: string | undefined;
+    for (const key of subjectKeys) {
+      const value = payload[key];
+      if (typeof value === "string" && value.length > 0) {
+        subject = value;
+        break;
+      }
+    }
+    // The event documents a subject but the payload lacks it: conservative
+    // no-match (an unevaluable matcher is treated as not met).
+    if (subject === undefined) return false;
     try {
-      // Claude matchers are unanchored regexes ("Bash", "Edit|Write", "^Edit$").
-      return new RegExp(matcher).test(toolName);
+      // Claude full-matches the pattern against the subject: "Write" matches
+      // only the Write tool (not superstrings like NotebookEdit for "Edit"),
+      // while alternation ("Edit|Write") and regexes still work inside the
+      // anchored group.
+      return new RegExp(`^(?:${matcher})$`).test(subject);
     } catch {
       diagnostics.push({
         severity: "warning",
@@ -193,7 +234,15 @@ export class HookRunner {
     let commandStr = this.expandPlaceholders(handler.command, handler, eventName, diagnostics);
     const shellKind = handler.shell === "powershell" ? "powershell" : "bash";
     if (handler.args && handler.args.length > 0) {
-      commandStr += " " + handler.args.map((a) => quoteArg(a, shellKind)).join(" ");
+      // Placeholders are expanded in args too — quoting (single quotes for
+      // bash) would otherwise also block env-var expansion at runtime.
+      commandStr +=
+        " " +
+        handler.args
+          .map((a) =>
+            quoteArg(this.expandPlaceholders(a, handler, eventName, diagnostics), shellKind),
+          )
+          .join(" ");
     }
 
     let file: string;
@@ -286,8 +335,8 @@ export class HookRunner {
   /**
    * Expand `${CLAUDE_PROJECT_DIR}` / `$CLAUDE_PROJECT_DIR` and (for
    * plugin-contributed handlers) `${CLAUDE_PLUGIN_ROOT}` in a command string
-   * before spawning. Replacement values are inserted verbatim (no `$&`
-   * pitfalls) via replacer functions.
+   * or argument before spawning. Replacement values are inserted verbatim
+   * (no `$&` pitfalls) via replacer functions.
    */
   private expandPlaceholders(
     command: string,
@@ -332,6 +381,16 @@ export class HookRunner {
     for (const dir of (process.env["PATH"] ?? "").split(path.delimiter)) {
       if (!dir || /system32/i.test(dir)) continue;
       candidates.push(path.join(dir, "bash.exe"));
+      // Git installs put <root>\cmd\git.exe on PATH but keep bash.exe in
+      // <root>\bin / <root>\usr\bin — derive the siblings so user-local
+      // installs (e.g. %LOCALAPPDATA%\Programs\Git) are found too.
+      if (/[\\/]cmd[\\/]?$/i.test(dir)) {
+        const root = path.dirname(dir.replace(/[\\/]+$/, ""));
+        candidates.push(
+          path.join(root, "bin", "bash.exe"),
+          path.join(root, "usr", "bin", "bash.exe"),
+        );
+      }
     }
     const programFiles = process.env["ProgramFiles"] ?? "C:\\Program Files";
     candidates.push(
@@ -339,6 +398,10 @@ export class HookRunner {
       path.join(programFiles, "Git", "usr", "bin", "bash.exe"),
       "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
     );
+    const localAppData = process.env["LOCALAPPDATA"];
+    if (localAppData) {
+      candidates.push(path.join(localAppData, "Programs", "Git", "bin", "bash.exe"));
+    }
     for (const candidate of candidates) {
       try {
         if (fs.statSync(candidate).isFile()) {

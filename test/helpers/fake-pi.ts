@@ -7,6 +7,7 @@ export interface FakePi {
   messages: Array<{ message: any; options?: any }>;
   userMessages: Array<{ content: any; options?: any }>;
   entries: Array<{ customType: string; data: any }>;
+  entryRenderers: Map<string, (entry: any, options: any, theme: any) => any>;
   notifications: Array<{ text: string; severity?: string }>;
   modelSets: unknown[];
   thinkingLevels: string[];
@@ -21,6 +22,7 @@ export function fakePi(): FakePi {
   const messages: Array<{ message: any; options?: any }> = [];
   const userMessages: Array<{ content: any; options?: any }> = [];
   const entries: Array<{ customType: string; data: any }> = [];
+  const entryRenderers = new Map<string, (entry: any, options: any, theme: any) => any>();
   const notifications: Array<{ text: string; severity?: string }> = [];
   const modelSets: unknown[] = [];
   const thinkingLevels: string[] = [];
@@ -32,6 +34,7 @@ export function fakePi(): FakePi {
     messages,
     userMessages,
     entries,
+    entryRenderers,
     notifications,
     modelSets,
     thinkingLevels,
@@ -44,7 +47,8 @@ export function fakePi(): FakePi {
       sendMessage: (message: any, options?: any) => messages.push({ message, options }),
       sendUserMessage: (content: any, options?: any) => userMessages.push({ content, options }),
       appendEntry: (customType: string, data: any) => entries.push({ customType, data }),
-      registerEntryRenderer: () => undefined,
+      registerEntryRenderer: (customType: string, renderer: any) =>
+        entryRenderers.set(customType, renderer),
       registerMessageRenderer: () => undefined,
       setModel: async (model: unknown) => {
         modelSets.push(model);

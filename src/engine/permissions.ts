@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { createGlobMatcher, normalizeSlashes } from "../util/globs.js";
 import type { PermissionRule, PermissionRules, ToolCallDescriptor } from "../types.js";
@@ -87,6 +88,20 @@ function toolNameMatches(ruleTool: string, callTool: string): boolean {
   return false;
 }
 
+/** The tools an `Edit` rule gates: ALL file-modification tools (research 02 §7.2). */
+const FILE_EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+
+/**
+ * Rule-level tool matching: {@link toolNameMatches} plus Claude's documented
+ * expansion "`Edit` = all file-editing tools" — a deny `Edit(glob)` must not
+ * be bypassable by calling Write/MultiEdit/NotebookEdit on the same path.
+ * (One-directional: a `Write` rule does NOT gate Edit calls.)
+ */
+function ruleToolMatches(ruleTool: string, callTool: string): boolean {
+  if (toolNameMatches(ruleTool, callTool)) return true;
+  return ruleTool === "Edit" && FILE_EDIT_TOOLS.has(callTool);
+}
+
 // ---------------------------------------------------------------------------
 // Bash specifier matching (shell-operator aware)
 // ---------------------------------------------------------------------------
@@ -158,13 +173,116 @@ function splitShellCommand(command: string): string[] {
   return segments.map((s) => s.trim()).filter((s) => s.length > 0);
 }
 
+// --- Process-wrapper stripping (research 02 §7.2) --------------------------
+
+/** Take the first whitespace-delimited token; `[token, rest]` or null. */
+function takeToken(text: string): [string, string] | null {
+  const m = /^(\S+)\s*/.exec(text);
+  if (!m || m[1] === undefined) return null;
+  return [m[1], text.slice(m[0].length)];
+}
+
+/** Consume leading `-`/`--` option tokens; options in `valueOpts` also consume a value token. */
+function consumeOptions(text: string, valueOpts: ReadonlySet<string>): string {
+  let rest = text;
+  for (;;) {
+    const t = takeToken(rest);
+    if (!t || !t[0].startsWith("-")) return rest;
+    rest = t[1];
+    if (valueOpts.has(t[0])) {
+      const v = takeToken(rest);
+      if (v) rest = v[1];
+    }
+  }
+}
+
+/**
+ * Strip ONE leading process wrapper — `timeout [opts] <dur>`, `time`,
+ * `nice [-n N]`, `nohup`, `stdbuf <opts>`, bare `xargs`, `env [assignments]` —
+ * the wrappers Claude strips before Bash pattern matching (research 02 §7.2),
+ * so a deny `Bash(curl *)` cannot be evaded via `nohup curl …`. Returns the
+ * unwrapped remainder, or null when the segment does not start with a wrapper.
+ */
+function stripOneWrapper(segment: string): string | null {
+  const t = takeToken(segment);
+  if (!t) return null;
+  const [word, rest] = t;
+  switch (word) {
+    case "nohup":
+    case "time":
+      return rest;
+    case "xargs":
+      // Only bare `xargs cmd …` (no options) is stripped, per the reference.
+      return rest.startsWith("-") ? null : rest;
+    case "nice":
+      return consumeOptions(rest, new Set(["-n", "--adjustment"]));
+    case "stdbuf":
+      return consumeOptions(rest, new Set(["-i", "-o", "-e"]));
+    case "timeout": {
+      const afterOpts = consumeOptions(rest, new Set(["-k", "--kill-after", "-s", "--signal"]));
+      const duration = takeToken(afterOpts);
+      return duration ? duration[1] : null; // duration, then the wrapped command
+    }
+    case "env": {
+      // `env [-i] [-u NAME] [VAR=val …] cmd` — skip flags and assignments.
+      let cur = rest;
+      for (;;) {
+        const tok = takeToken(cur);
+        if (!tok) return null; // `env` alone / only assignments: nothing wrapped
+        const [envWord, envRest] = tok;
+        if (
+          envWord === "-i" ||
+          envWord === "-0" ||
+          envWord === "--ignore-environment" ||
+          /^--unset=/.test(envWord) ||
+          /^[A-Za-z_][A-Za-z0-9_]*=/.test(envWord)
+        ) {
+          cur = envRest;
+          continue;
+        }
+        if (envWord === "-u" || envWord === "--unset") {
+          const v = takeToken(envRest);
+          if (!v) return null;
+          cur = v[1];
+          continue;
+        }
+        if (envWord.startsWith("-")) return null; // unknown env option: don't guess
+        return cur;
+      }
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * All progressively-unwrapped forms of a segment, e.g.
+ * `nohup timeout 5 curl x` → [`timeout 5 curl x`, `curl x`]. Bounded, never throws.
+ */
+function wrapperStrippedVariants(segment: string): string[] {
+  const variants: string[] = [];
+  let current = segment.trim();
+  for (let i = 0; i < 8; i++) {
+    const next = stripOneWrapper(current);
+    if (next === null) break;
+    const trimmed = next.trim();
+    if (trimmed.length === 0 || trimmed === current) break;
+    variants.push(trimmed);
+    current = trimmed;
+  }
+  return variants;
+}
+
 /**
  * Bash pattern semantics (research 02 §7.2):
  * - exact command: `Bash(git status)` — matches only that command;
  * - prefix wildcard: `Bash(git *)` — requires `git ` + anything (bare `git`
  *   does NOT match); `Bash(ls*)` matches `lsof` too (no word boundary);
  * - legacy `Bash(git:*)` is identical to `Bash(git *)`;
- * - `*` matches any sequence including spaces at any position.
+ * - `*` matches any sequence including spaces at any position;
+ * - process wrappers (timeout/time/nice/nohup/stdbuf/xargs/env) are stripped
+ *   before matching: a segment matches when the raw text OR any unwrapped
+ *   variant matches the pattern.
  * Shell-operator conservatism is POLARITY-aware:
  * - allow/ask direction (`anySegment: false`, default): a chained command only
  *   matches when EVERY chained segment independently matches the same pattern —
@@ -184,9 +302,11 @@ function bashSpecifierMatches(
   const rx = wildcardRegExp(pattern);
   const segments = splitShellCommand(command);
   if (segments.length === 0) return false;
+  const segmentMatches = (segment: string): boolean =>
+    rx.test(segment) || wrapperStrippedVariants(segment).some((variant) => rx.test(variant));
   return opts.anySegment
-    ? segments.some((segment) => rx.test(segment))
-    : segments.every((segment) => rx.test(segment));
+    ? segments.some(segmentMatches)
+    : segments.every(segmentMatches);
 }
 
 // ---------------------------------------------------------------------------
@@ -194,23 +314,62 @@ function bashSpecifierMatches(
 // ---------------------------------------------------------------------------
 
 /**
- * Claude anchor semantics: `path` / `./path` relative to the project dir
- * (here: call.cwd), `/path` anchored to the settings-source dir (also cwd
- * for us — NOT filesystem root), `//path` true absolute, `~/path` home.
- * A bare filename (no slash) matches at any depth (`.env` ≡ `**\/.env`).
+ * Claude anchor semantics: `path` / `./path` relative to the project dir,
+ * `/path` anchored to the settings-source dir (NOT filesystem root),
+ * `//path` true absolute, `~/path` home. A bare filename (no slash) matches
+ * at any depth (`.env` ≡ `**\/.env`).
+ *
+ * Anchoring is STABLE: patterns anchor to `opts.anchor` (the engine's fixed
+ * settings-source/project root) when provided, never to the drifting live
+ * session cwd — otherwise a deny `Read(/secrets/**)` would stop covering the
+ * real secrets dir after EnterWorktree moved the session cwd. `call.cwd` is
+ * used only to resolve relative *input* paths (the file actually touched).
+ *
+ * Deny direction (`opts.deny`) is deliberately broader, per Claude:
+ * - patterns additionally match when anchored at the live call cwd (so a
+ *   relative deny keeps covering the directory the session works in), and
+ * - symlinks are resolved (realpath, existing paths only, graceful failure) —
+ *   "deny rules fire if either the symlink or its target matches" (§7.2).
  */
-function pathSpecifierMatches(specifier: string, call: ToolCallDescriptor): boolean {
+function pathSpecifierMatches(
+  specifier: string,
+  call: ToolCallDescriptor,
+  opts: { deny?: boolean; anchor?: string } = {},
+): boolean {
   const rawPath =
     call.input["file_path"] ?? call.input["path"] ?? call.input["notebook_path"];
   if (typeof rawPath !== "string" || rawPath.length === 0) return false;
-  const cwd = call.cwd || ".";
-  let pattern = specifier;
-  // `/path` (single leading slash, not `//`): anchor to cwd, per Claude.
-  if (/^\/(?!\/)/.test(pattern)) {
-    pattern = normalizeSlashes(path.resolve(cwd)).replace(/\/$/, "") + pattern;
+  const cwd = call.cwd || opts.anchor || ".";
+  const primaryAnchor = opts.anchor || cwd;
+  const anchors = [primaryAnchor];
+  if (
+    opts.deny &&
+    normalizeSlashes(path.resolve(cwd)) !== normalizeSlashes(path.resolve(primaryAnchor))
+  ) {
+    anchors.push(cwd);
   }
   const abs = path.resolve(cwd, rawPath);
-  return createGlobMatcher([pattern], { base: cwd })(normalizeSlashes(abs));
+  const candidates = [abs];
+  if (opts.deny) {
+    try {
+      const real = fs.realpathSync(abs);
+      if (real && normalizeSlashes(real) !== normalizeSlashes(abs)) candidates.push(real);
+    } catch {
+      // Nonexistent path / unresolvable symlink: degrade to literal-only.
+    }
+  }
+  for (const anchorDir of anchors) {
+    let pattern = specifier;
+    // `/path` (single leading slash, not `//`): anchor to the settings dir.
+    if (/^\/(?!\/)/.test(pattern)) {
+      pattern = normalizeSlashes(path.resolve(anchorDir)).replace(/\/$/, "") + pattern;
+    }
+    const matches = createGlobMatcher([pattern], { base: anchorDir });
+    for (const candidate of candidates) {
+      if (matches(normalizeSlashes(candidate))) return true;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -254,7 +413,29 @@ function webFetchSpecifierMatches(specifier: string, call: ToolCallDescriptor): 
 // ---------------------------------------------------------------------------
 
 /**
+ * Canonicalized input fields that the specifier grammar already consumes —
+ * per research 02 §7.2 these are NOT matchable via the `Tool(key:value)`
+ * parameter form.
+ */
+const CANONICAL_INPUT_FIELDS = new Set([
+  "command",
+  "file_path",
+  "path",
+  "notebook_path",
+  "url",
+  "query",
+  "subagent_type",
+  "skill",
+  "name",
+]);
+
+/**
  * Does a single rule text match a concrete tool call? Never throws.
+ *
+ * `opts.anchor` is the stable settings-source/project dir used to anchor
+ * Read/Edit path patterns (defaults to `call.cwd` when absent); `opts.deny`
+ * marks the deny direction (broader path matching: live-cwd fallback anchor +
+ * symlink resolution); `opts.anySegment` is the deny-direction Bash mode.
  *
  * Unknown tools degrade predictably: the tool name must match by string
  * identity, and when the rule carries a specifier it is wildcard-matched
@@ -265,18 +446,37 @@ function webFetchSpecifierMatches(specifier: string, call: ToolCallDescriptor): 
 export function matchesRule(
   ruleText: string,
   call: ToolCallDescriptor,
-  opts: { anySegment?: boolean } = {},
+  opts: { anySegment?: boolean; deny?: boolean; anchor?: string } = {},
 ): boolean {
   try {
     if (!call || typeof call.tool !== "string") return false;
     const rule = parseRule(ruleText);
     if (!rule.tool) return false;
-    if (!toolNameMatches(rule.tool, call.tool)) return false;
+    if (!ruleToolMatches(rule.tool, call.tool)) return false;
     const specifier = rule.specifier;
     if (specifier === undefined || specifier === "") return true; // bare rule
 
     const input = call.input ?? {};
     const safeCall: ToolCallDescriptor = { ...call, input };
+    const pathOpts = { deny: opts.deny, anchor: opts.anchor };
+
+    // Parameter-matching form `Tool(key:value)` (research 02 §7.2): one param
+    // per rule, `*` wildcard allowed, e.g. Agent(model:opus),
+    // Agent(isolation:worktree), Bash(run_in_background:true). Applies only to
+    // non-canonical keys actually present on the call input, so the canonical
+    // forms (WebFetch(domain:…), legacy Bash(git:*)) are unaffected.
+    if (rule.tool !== "*") {
+      const param = /^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([\s\S]*)$/.exec(specifier);
+      const key = param?.[1];
+      if (
+        key !== undefined &&
+        param?.[2] !== undefined &&
+        !CANONICAL_INPUT_FIELDS.has(key) &&
+        Object.prototype.hasOwnProperty.call(input, key)
+      ) {
+        return wildcardMatch(param[2].trim(), inputString(input[key]));
+      }
+    }
 
     switch (rule.tool) {
       case "*":
@@ -286,9 +486,11 @@ export function matchesRule(
       case "Read":
       case "Edit":
       case "Write":
+      case "MultiEdit":
+      case "NotebookEdit":
       case "Glob":
       case "Grep":
-        return pathSpecifierMatches(specifier, safeCall);
+        return pathSpecifierMatches(specifier, safeCall, pathOpts);
       case "WebFetch":
         return webFetchSpecifierMatches(specifier, safeCall);
       case "WebSearch":
@@ -324,10 +526,21 @@ export interface PermissionEvaluation {
 export class PermissionEngine {
   private readonly rules: PermissionRules;
   private readonly cwd: string;
+  private readonly anchor: string;
 
-  constructor(rules: PermissionRules, opts: { cwd: string }) {
+  /**
+   * `cwd` — the session launch dir; used only as the fallback for resolving
+   * relative input paths when a call carries no cwd of its own.
+   * `root` — the STABLE anchor for path-rule matching: the settings-source /
+   * project root that declared the rules (defaults to `cwd`). Both are fixed
+   * at construction; rule anchoring never follows the live per-call cwd, so
+   * EnterWorktree / cwd drift cannot move a deny rule off the paths it was
+   * written to protect (research 02 §7.2 anchor table).
+   */
+  constructor(rules: PermissionRules, opts: { cwd: string; root?: string }) {
     this.rules = rules;
     this.cwd = opts.cwd;
+    this.anchor = opts.root ?? opts.cwd;
   }
 
   /**
@@ -339,19 +552,22 @@ export class PermissionEngine {
   evaluate(call: ToolCallDescriptor): PermissionEvaluation {
     const effective: ToolCallDescriptor = { ...call, cwd: call?.cwd || this.cwd };
     for (const rule of this.ruleList("deny")) {
-      // anySegment: a deny must hit even when the denied command hides inside
-      // a chain (`git status && curl evil` vs deny `Bash(curl *)`).
-      if (matchesRule(rule, effective, { anySegment: true })) {
+      // anySegment/deny: a deny must hit even when the denied command hides
+      // inside a chain (`git status && curl evil` vs deny `Bash(curl *)`) or
+      // behind a symlink / drifted cwd (path rules).
+      if (matchesRule(rule, effective, { anySegment: true, deny: true, anchor: this.anchor })) {
         return { decision: "deny", rule };
       }
     }
     for (const rule of this.ruleList("ask")) {
-      if (matchesRule(rule, effective)) {
+      if (matchesRule(rule, effective, { anchor: this.anchor })) {
         return { decision: "allow", rule, askDowngraded: true };
       }
     }
     for (const rule of this.ruleList("allow")) {
-      if (matchesRule(rule, effective)) return { decision: "allow", rule };
+      if (matchesRule(rule, effective, { anchor: this.anchor })) {
+        return { decision: "allow", rule };
+      }
     }
     return { decision: "default" };
   }
@@ -364,6 +580,11 @@ export class PermissionEngine {
    * every `mcp__server__*` tool. Entries with a specifier (e.g.
    * `Bash(rm *)`) grant the tool but never REMOVE it — a scoped deny leaves
    * the tool in context and blocks per-call instead (research 02 §7.1).
+   *
+   * Settings `deny` rules with a BARE tool name also remove the tool from
+   * context entirely (research 02 §7.1: "a bare tool name deny removes the
+   * tool from context"); a bare `Edit` deny removes all file-editing tools,
+   * matching the call-time rule expansion.
    */
   gateTools(
     granted: string[] | undefined,
@@ -377,6 +598,11 @@ export class PermissionEngine {
       if (rule.specifier !== undefined && rule.specifier !== "") return false;
       return toolNameMatches(rule.tool, tool);
     };
+    const denyRemoves = (entry: string, tool: string): boolean => {
+      const rule = parseRule(entry);
+      if (rule.specifier !== undefined && rule.specifier !== "") return false;
+      return ruleToolMatches(rule.tool, tool);
+    };
 
     let result =
       granted === undefined
@@ -384,6 +610,10 @@ export class PermissionEngine {
         : allKnown.filter((tool) => granted.some((g) => grantMatches(g, tool)));
     if (disallowed && disallowed.length > 0) {
       result = result.filter((tool) => !disallowed.some((d) => removeMatches(d, tool)));
+    }
+    const deny = this.ruleList("deny");
+    if (deny.length > 0) {
+      result = result.filter((tool) => !deny.some((d) => denyRemoves(d, tool)));
     }
     return result;
   }

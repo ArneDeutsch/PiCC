@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import type { ClaudeProject, Diagnostic, HookConfig } from "./types.js";
+import type { ClaudeProject, ClaudeSkill, Diagnostic, HookConfig } from "./types.js";
 import { discoverArtifactDirs, resolveProjectRoot, dedupeByName } from "./discovery/locations.js";
 import { loadSettings } from "./discovery/settings.js";
 import { loadSkills } from "./claude/skills.js";
@@ -30,14 +30,28 @@ export interface LoadedProject extends ClaudeProject {
 export function loadClaudeProject(opts: {
   cwd: string;
   userDir?: string;
+  /** Override managed/policy settings file locations (used by tests). */
+  managedSettingsPaths?: string[];
+  /** Override managed/policy artifact base directories (used by tests). */
+  managedArtifactDirs?: string[];
 }): LoadedProject {
   const diagnostics: Diagnostic[] = [];
   const cwd = path.resolve(opts.cwd);
   const userDir = opts.userDir ?? path.join(os.homedir(), ".claude");
   const root = resolveProjectRoot(cwd);
 
-  const settings = loadSettings({ cwd, projectRoot: root, userDir });
-  const dirs = discoverArtifactDirs({ cwd, projectRoot: root, userDir });
+  const settings = loadSettings({
+    cwd,
+    projectRoot: root,
+    userDir,
+    managedPaths: opts.managedSettingsPaths,
+  });
+  const dirs = discoverArtifactDirs({
+    cwd,
+    projectRoot: root,
+    userDir,
+    managedDirs: opts.managedArtifactDirs,
+  });
 
   // Plugins: user-installed + project-bundled.
   const pluginResult = discoverInstalledPlugins({
@@ -48,10 +62,16 @@ export function loadClaudeProject(opts: {
   const plugins = pluginResult.plugins.filter((p) => p.enabled);
   const bundled = discoverProjectBundledPlugin(root);
   if (bundled) plugins.push(bundled);
+  // Per-plugin diagnostics (malformed manifests, dangling manifest paths, …)
+  // must surface into the project diagnostics for /doctor and the compat report.
+  for (const p of plugins) diagnostics.push(...p.diagnostics);
   const pluginRoots: Record<string, string> = {};
   for (const p of plugins) pluginRoots[p.name] = p.root;
 
-  // Skills & commands (project/user scope first, then plugin content; first-wins dedupe).
+  // Skills & commands (project/user scope first, then plugin content; first-wins
+  // dedupe). Plugin content is namespaced `<plugin>:<name>` exactly like Claude
+  // Code (research doc §1.5/§1.6: plugin skills "never collide"), so a plugin
+  // skill is never silently shadowed by a same-named project/user skill.
   const skillsResult = loadSkills(dirs.skillDirs, dirs.commandDirs);
   diagnostics.push(...skillsResult.diagnostics);
   let skills = skillsResult.skills;
@@ -62,10 +82,10 @@ export function loadClaudeProject(opts: {
       { pluginName: plugin.name },
     );
     diagnostics.push(...pluginSkills.diagnostics);
-    skills = dedupeByName([...skills, ...pluginSkills.skills]);
+    skills = dedupeByName([...skills, ...namespacePluginContent(pluginSkills.skills, plugin.name)]);
   }
 
-  // Agents.
+  // Agents (plugin agents get the same `<plugin>:<name>` scoped ids, research doc §2.3).
   const agentsResult = loadAgents(dirs.agentDirs);
   diagnostics.push(...agentsResult.diagnostics);
   let agents = agentsResult.agents;
@@ -75,8 +95,11 @@ export function loadClaudeProject(opts: {
       { pluginName: plugin.name },
     );
     diagnostics.push(...pluginAgents.diagnostics);
-    agents = dedupeByName([...agents, ...pluginAgents.agents]);
+    agents = dedupeByName([...agents, ...namespacePluginContent(pluginAgents.agents, plugin.name)]);
   }
+
+  // skillOverrides (settings, any scope): per-skill disable/downgrade.
+  skills = applySkillOverrides(skills, settings.skillOverrides, diagnostics);
 
   // Rules.
   const rulesResult = loadRules(dirs.ruleDirs, {
@@ -120,4 +143,75 @@ export function loadClaudeProject(opts: {
     plugins,
     pluginRoots,
   };
+}
+
+/**
+ * Claude Code namespaces plugin skills/agents/commands as `plugin-name:name`
+ * (research doc §1.6 "Plugin `my-plugin/skills/review/` → `/my-plugin:review`").
+ * The bare name stays reachable via {@link findByName} when unambiguous.
+ */
+function namespacePluginContent<T extends { name: string }>(items: T[], pluginName: string): T[] {
+  return items.map((item) =>
+    item.name.startsWith(`${pluginName}:`) ? item : { ...item, name: `${pluginName}:${item.name}` },
+  );
+}
+
+/**
+ * Resolve a skill or agent by name: exact match first; for a bare (colon-free)
+ * name, a UNIQUE `…:<name>` suffix match resolves plugin-namespaced content.
+ */
+export function findByName<T extends { name: string }>(items: T[], name: string): T | undefined {
+  const exact = items.find((item) => item.name === name);
+  if (exact) return exact;
+  if (name.includes(":")) return undefined;
+  const suffixMatches = items.filter((item) => item.name.endsWith(`:${name}`));
+  return suffixMatches.length === 1 ? suffixMatches[0] : undefined;
+}
+
+/**
+ * Apply the settings `skillOverrides` map (research doc §1.7): per skill name,
+ * `"off"` removes the skill, `"user-invocable-only"` hides it from the model
+ * listing, `"name-only"` lists it without a description, `"on"` is a no-op.
+ * Unknown values degrade to a diagnostic (never throw).
+ */
+function applySkillOverrides(
+  skills: ClaudeSkill[],
+  overrides: Record<string, unknown>,
+  diagnostics: Diagnostic[],
+): ClaudeSkill[] {
+  const out: ClaudeSkill[] = [];
+  for (const skill of skills) {
+    // Object.hasOwn: override keys come from project JSON — never read inherited members.
+    const value = Object.hasOwn(overrides, skill.name) ? overrides[skill.name] : undefined;
+    if (value === undefined) {
+      out.push(skill);
+      continue;
+    }
+    const mode = typeof value === "string" ? value.trim().toLowerCase() : value;
+    if (mode === "off" || mode === false) {
+      diagnostics.push({
+        severity: "info",
+        message: `Skill "${skill.name}" disabled by skillOverrides`,
+        source: skill.source.path,
+      });
+      continue;
+    }
+    if (mode === "user-invocable-only") {
+      out.push({ ...skill, disableModelInvocation: true });
+      continue;
+    }
+    if (mode === "name-only") {
+      out.push({ ...skill, description: "", whenToUse: undefined });
+      continue;
+    }
+    if (mode !== "on" && mode !== true) {
+      diagnostics.push({
+        severity: "warning",
+        message: `Unknown skillOverrides value ${JSON.stringify(value)} for skill "${skill.name}"; ignored`,
+        source: skill.source.path,
+      });
+    }
+    out.push(skill);
+  }
+  return out;
 }

@@ -162,6 +162,106 @@ describe("discoverInstalledPlugins", () => {
     expect(byName.get("baz")!.enabled).toBe(false);
   });
 
+  it("prefers the most specific enabledPlugins key: an explicit qualified false beats a bare true", () => {
+    const userDir = path.join(tmpRoot, ".claude");
+    makePlugin(path.join(userDir, "plugins", "marketplaces", "official", "plugins", "foo"), { name: "foo" });
+
+    const disabled = discoverInstalledPlugins({
+      userDir,
+      enabledPlugins: { foo: true, "foo@official": false },
+    });
+    expect(disabled.plugins[0]!.enabled).toBe(false);
+
+    const enabled = discoverInstalledPlugins({
+      userDir,
+      enabledPlugins: { foo: false, "foo@official": true },
+    });
+    expect(enabled.plugins[0]!.enabled).toBe(true);
+  });
+
+  it("degrades a malformed blocklist.json to a diagnostic instead of throwing", () => {
+    const userDir = path.join(tmpRoot, ".claude");
+    const pluginsRoot = path.join(userDir, "plugins");
+    makePlugin(path.join(pluginsRoot, "repos", "o", "r", "mytool"), { name: "mytool" });
+
+    for (const bad of ['{"plugins": {}}', '{"plugins": 5}', "[1,2]", "{{{ garbage"]) {
+      write(path.join(pluginsRoot, "blocklist.json"), bad);
+      const result = discoverInstalledPlugins({ userDir, enabledPlugins: { mytool: true } });
+      // Discovery survives, the plugin still loads, and the problem is visible.
+      expect(result.plugins).toHaveLength(1);
+      expect(result.plugins[0]!.enabled).toBe(true);
+      expect(
+        result.diagnostics.some((d) => d.severity === "warning" && /blocklist/i.test(d.message)),
+      ).toBe(true);
+    }
+
+    // An object without a "plugins" key is just an empty blocklist — no diagnostic.
+    write(path.join(pluginsRoot, "blocklist.json"), "{}");
+    const empty = discoverInstalledPlugins({ userDir, enabledPlugins: { mytool: true } });
+    expect(empty.diagnostics.filter((d) => /blocklist/i.test(d.message))).toEqual([]);
+  });
+
+  it('skips a plugin whose name collides with Object.prototype (e.g. "__proto__")', () => {
+    const userDir = path.join(tmpRoot, ".claude");
+    makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "evil"), { name: "__proto__" });
+    makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "fine"), { name: "fine" });
+
+    const { plugins, diagnostics } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
+    expect(plugins.map((p) => p.name)).toEqual(["fine"]);
+    expect(diagnostics.some((d) => d.message.includes("not allowed"))).toBe(true);
+  });
+
+  it("honors a manifest hooks-path override (with ${CLAUDE_PLUGIN_ROOT}) over the default hooks/hooks.json", () => {
+    const userDir = path.join(tmpRoot, ".claude");
+    const root = path.join(userDir, "plugins", "repos", "o", "r", "hooked");
+    makePlugin(
+      root,
+      { name: "hooked", hooks: "${CLAUDE_PLUGIN_ROOT}/custom/h.json" },
+      { hooks: JSON.stringify({ SessionStart: [] }) }, // default file that must be ignored
+    );
+    write(path.join(root, "custom", "h.json"), JSON.stringify({ PreToolUse: [] }));
+
+    const { plugins } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
+    expect(plugins[0]!.hooksFiles).toEqual([path.join(root, "custom", "h.json")]);
+  });
+
+  it("honors installed-plugin manifest content-path overrides (skills)", () => {
+    const userDir = path.join(tmpRoot, ".claude");
+    const root = path.join(userDir, "plugins", "repos", "o", "r", "custom");
+    makePlugin(root, { name: "custom", skills: "./my-skills" }, { skills: true });
+    write(path.join(root, "my-skills", "s", "SKILL.md"), "---\ndescription: d\n---\nbody");
+
+    const { plugins } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
+    // Manifest override wins; the default skills/ dir is not used.
+    expect(plugins[0]!.skillDirs).toEqual([path.join(root, "my-skills")]);
+  });
+
+  it("records a diagnostic when a manifest-declared content path fails to resolve (and falls back)", () => {
+    const userDir = path.join(tmpRoot, ".claude");
+    const root = path.join(userDir, "plugins", "repos", "o", "r", "dangling");
+    makePlugin(root, { name: "dangling", skills: "./no-such-dir", hooks: "./no-such.json" }, { skills: true });
+
+    const { plugins } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
+    const plugin = plugins[0]!;
+    // Falls back to the default dir…
+    expect(plugin.skillDirs).toEqual([path.join(root, "skills")]);
+    // …and both dangling paths are visible.
+    expect(
+      plugin.diagnostics.filter((d) => d.message.includes("does not resolve")),
+    ).toHaveLength(2);
+  });
+
+  it("records a diagnostic for a non-string manifest hooks value (unsupported shape)", () => {
+    const userDir = path.join(tmpRoot, ".claude");
+    const root = path.join(userDir, "plugins", "repos", "o", "r", "inline");
+    makePlugin(root, { name: "inline", hooks: { PreToolUse: [] } });
+
+    const { plugins } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
+    expect(
+      plugins[0]!.diagnostics.some((d) => d.message.includes('"hooks" is not a path')),
+    ).toBe(true);
+  });
+
   it("never enables a blocklisted plugin, even if explicitly enabled", () => {
     const userDir = path.join(tmpRoot, ".claude");
     const pluginsRoot = path.join(userDir, "plugins");
@@ -336,6 +436,51 @@ describe("expandPluginVariables / loadPluginHooks", () => {
     expect(entries[0]!.hooks[0]!.command).toBe(
       `${plugin.root}/scripts/check.sh --data ${path.join(userDir, "plugins", "data", "hooky")}`,
     );
+  });
+
+  it("merges multiple hooks files, concatenating entries per event", () => {
+    const fileA = path.join(tmpRoot, "hooks-a.json");
+    const fileB = path.join(tmpRoot, "hooks-b.json");
+    write(fileA, JSON.stringify({ PreToolUse: [{ matcher: "Bash", hooks: [] }] }));
+    write(
+      fileB,
+      JSON.stringify({
+        PreToolUse: [{ matcher: "Write", hooks: [] }],
+        SessionStart: [{ hooks: [] }],
+      }),
+    );
+    const plugin = stubPlugin({ hooksFiles: [fileA, fileB] });
+
+    const { config, diagnostics } = loadPluginHooks(plugin);
+    expect(diagnostics).toEqual([]);
+    expect(config["PreToolUse"]).toHaveLength(2);
+    expect((config["PreToolUse"] as Array<{ matcher: string }>).map((e) => e.matcher)).toEqual([
+      "Bash",
+      "Write",
+    ]);
+    expect(config["SessionStart"]).toHaveLength(1);
+  });
+
+  it('unwraps a top-level "hooks" wrapper key in a hooks file', () => {
+    const file = path.join(tmpRoot, "wrapped-hooks.json");
+    write(file, JSON.stringify({ hooks: { PreToolUse: [{ matcher: "Bash", hooks: [] }] } }));
+    const plugin = stubPlugin({ hooksFiles: [file] });
+
+    const { config } = loadPluginHooks(plugin);
+    expect(config["PreToolUse"]).toHaveLength(1);
+    expect(config["hooks"]).toBeUndefined();
+  });
+
+  it('drops a hostile "__proto__" event key in a plugin hooks file with a diagnostic', () => {
+    const file = path.join(tmpRoot, "hostile-hooks.json");
+    // Raw JSON — a JS object literal would interpret __proto__ itself.
+    write(file, '{"__proto__": [{"hooks": []}], "PreToolUse": [{"matcher": "Bash", "hooks": []}]}');
+    const plugin = stubPlugin({ hooksFiles: [file] });
+
+    const { config, diagnostics } = loadPluginHooks(plugin);
+    expect(config["PreToolUse"]).toHaveLength(1);
+    expect(Object.getPrototypeOf(config)).toBe(Object.prototype);
+    expect(diagnostics.some((d) => d.message.includes("Unsafe hook event key"))).toBe(true);
   });
 
   it("reports a diagnostic for a malformed hooks file instead of throwing", () => {

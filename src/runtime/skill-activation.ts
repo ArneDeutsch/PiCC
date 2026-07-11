@@ -44,6 +44,8 @@ export async function renderSkillForActivation(opts: {
   const injected = await preprocessShellInjection(withVars, {
     shell: opts.skill.shell,
     cwd: opts.cwd,
+    // Overlay only: the spawned shell inherits the full process.env (PATH,
+    // HOME, SystemRoot, …) with these Claude-specific vars layered on top.
     env: { ...opts.settings.env, CLAUDE_PROJECT_DIR: opts.projectRoot },
     disabled: opts.settings.disableSkillShellExecution,
   });

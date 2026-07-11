@@ -22,6 +22,10 @@ import { unicodeSafeSubprocessEnv } from "../util/env.js";
 export interface ShellInjectionOptions {
   shell: "bash" | "powershell";
   cwd: string;
+  /**
+   * Claude-specific overlay (settings `env`, `CLAUDE_*` vars) layered ON TOP of
+   * the inherited `process.env` — commands must still see PATH/HOME/SystemRoot.
+   */
   env: Record<string, string>;
   disabled: boolean;
   timeoutMs?: number;
@@ -126,6 +130,50 @@ function parseBody(body: string): Part[] {
 }
 
 let cachedBash: string | undefined;
+let cachedPowershell: string | undefined;
+
+/** First existing file among candidate paths, else undefined. */
+function firstExistingFile(candidates: string[]): string | undefined {
+  for (const c of candidates) {
+    try {
+      if (fs.statSync(c).isFile()) return c;
+    } catch {
+      // keep probing
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolve the PowerShell binary: `pwsh` (PowerShell Core — the only variant on
+ * POSIX) first, then Windows PowerShell's powershell.exe on Windows. When
+ * neither exists we degrade to the bare platform name so the spawn fails with
+ * ENOENT and preprocessShellInjection reports a clear diagnostic (never-crash
+ * floor).
+ */
+function resolvePowershellBinary(env?: Record<string, string>): string {
+  if (cachedPowershell !== undefined && env === undefined) return cachedPowershell;
+  const get = (key: string): string | undefined =>
+    env?.[key] ?? (process.env[key] as string | undefined);
+  const isWin = process.platform === "win32";
+  const pathDirs = (get("PATH") ?? get("Path") ?? "")
+    .split(isWin ? ";" : ":")
+    .map((d) => d.trim())
+    .filter(Boolean);
+
+  const pwshName = isWin ? "pwsh.exe" : "pwsh";
+  const candidates: string[] = pathDirs.map((d) => path.join(d, pwshName));
+  if (isWin) {
+    const programFiles = get("ProgramFiles") ?? "C:\\Program Files";
+    candidates.push(path.join(programFiles, "PowerShell", "7", "pwsh.exe"));
+    for (const d of pathDirs) candidates.push(path.join(d, "powershell.exe"));
+    const systemRoot = get("SystemRoot") ?? get("SYSTEMROOT") ?? "C:\\Windows";
+    candidates.push(path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"));
+  }
+  const resolved = firstExistingFile(candidates) ?? (isWin ? "powershell" : "pwsh");
+  if (env === undefined) cachedPowershell = resolved;
+  return resolved;
+}
 
 /**
  * Resolve the binary to spawn for a given shell (exported for tests/engine).
@@ -134,12 +182,15 @@ let cachedBash: string | undefined;
  * usually resolves to the System32 WSL stub, which fails when no WSL distro
  * is installed. Prefer Git Bash's bash.exe when it can be located; otherwise
  * fall back to plain `bash`.
+ *
+ * "powershell" prefers pwsh (PowerShell Core) and falls back to Windows
+ * PowerShell — see resolvePowershellBinary.
  */
 export function resolveShellBinary(
   shell: "bash" | "powershell",
   env?: Record<string, string>,
 ): string {
-  if (shell === "powershell") return "powershell";
+  if (shell === "powershell") return resolvePowershellBinary(env);
   if (process.platform !== "win32") return "bash";
   if (cachedBash !== undefined && env === undefined) return cachedBash;
 
@@ -161,17 +212,7 @@ export function resolveShellBinary(
     if (lower.includes("system32") || lower.includes("windowsapps")) continue;
     candidates.push(path.join(d, "bash.exe"));
   }
-  let resolved = "bash";
-  for (const c of candidates) {
-    try {
-      if (fs.statSync(c).isFile()) {
-        resolved = c;
-        break;
-      }
-    } catch {
-      // keep probing
-    }
-  }
+  const resolved = firstExistingFile(candidates) ?? "bash";
   if (env === undefined) cachedBash = resolved;
   return resolved;
 }
@@ -208,7 +249,8 @@ function runCommand(cmd: string, opts: ShellInjectionOptions): Promise<RunResult
         args,
         {
           cwd: opts.cwd,
-          env: unicodeSafeSubprocessEnv(opts.env),
+          // Inherit the full harness env; opts.env is only the Claude overlay.
+          env: unicodeSafeSubprocessEnv({ ...process.env, ...opts.env }),
           timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
           maxBuffer: MAX_OUTPUT_BYTES,
           windowsHide: true,
@@ -293,9 +335,11 @@ export async function preprocessShellInjection(
         ? String(result.code)
         : (result.code ?? "?").toString();
     const note =
-      firstLine(result.stderr) ||
-      (result.spawnError ? firstLine(result.spawnError) : "") ||
-      (result.timedOut ? `timed out after ${opts.timeoutMs ?? DEFAULT_TIMEOUT_MS}ms` : "no stderr output");
+      result.code === "ENOENT" && opts.shell === "powershell"
+        ? "PowerShell not found (tried pwsh and powershell); install PowerShell or use shell: bash"
+        : firstLine(result.stderr) ||
+          (result.spawnError ? firstLine(result.spawnError) : "") ||
+          (result.timedOut ? `timed out after ${opts.timeoutMs ?? DEFAULT_TIMEOUT_MS}ms` : "no stderr output");
     out.push(`[command failed (exit ${codeStr}): ${note}]`);
     diagnostics.push({
       severity: "warning",

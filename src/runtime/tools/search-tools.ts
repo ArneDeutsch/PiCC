@@ -16,9 +16,14 @@ import {
  * Search tools (plan §4.8): Claude-named `Grep` and `Glob`.
  *
  * `Grep` prefers the ripgrep binary when present on PATH and falls back to a
- * pure-JS walker otherwise (or when forced for tests). `Glob` is a pure-JS
- * walker sorted by mtime. Both resolve relative paths through `getCwd()` at
- * execute time so worktree cwd swaps are honored.
+ * pure-JS walker otherwise (or when forced for tests). The two engines are
+ * kept aligned on ripgrep's defaults: hidden files and `.git` are skipped,
+ * `.gitignore` is honored when the search path is inside a git repository,
+ * explicitly named files are always searched (no glob/type filtering), and
+ * output shapes match exactly (`path:line:content`, `path:count`, plain
+ * paths, `--` chunk separators in context mode). `Glob` is a pure-JS walker
+ * sorted by mtime. Both resolve relative paths through `getCwd()` at execute
+ * time so worktree cwd swaps are honored.
  */
 
 const MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB — skip larger files in the JS walker
@@ -48,6 +53,90 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 }
 
 // ---------------------------------------------------------------------------
+// Gitignore handling (best effort, mirrors ripgrep defaults)
+// ---------------------------------------------------------------------------
+
+interface IgnoreRule {
+  negated: boolean;
+  dirOnly: boolean;
+  matches: (rel: string) => boolean;
+}
+
+interface IgnoreScope {
+  /** Directory containing the .gitignore, absolute with forward slashes. */
+  dir: string;
+  rules: IgnoreRule[];
+}
+
+function parseGitignore(content: string): IgnoreRule[] {
+  const rules: IgnoreRule[] = [];
+  for (const raw of content.split(/\r?\n/)) {
+    let line = raw.trimEnd();
+    if (line.length === 0 || line.startsWith("#")) continue;
+    let negated = false;
+    if (line.startsWith("!")) {
+      negated = true;
+      line = line.slice(1);
+    }
+    let dirOnly = false;
+    if (line.endsWith("/")) {
+      dirOnly = true;
+      line = line.slice(0, -1);
+    }
+    if (line.length === 0) continue;
+    // A slash (other than a trailing one) anchors the pattern to the
+    // .gitignore's directory; otherwise it matches at any depth.
+    const anchored = line.includes("/");
+    if (line.startsWith("/")) line = line.slice(1);
+    const glob = anchored ? line : `**/${line}`;
+    try {
+      const isMatch = picomatch(glob, { dot: true, windows: false });
+      rules.push({ negated, dirOnly, matches: isMatch });
+    } catch {
+      /* unparseable pattern — skip it, best effort */
+    }
+  }
+  return rules;
+}
+
+function loadIgnoreScope(dirAbs: string): IgnoreScope | undefined {
+  let content: string;
+  try {
+    content = fs.readFileSync(path.join(dirAbs, ".gitignore"), "utf8");
+  } catch {
+    return undefined;
+  }
+  const rules = parseGitignore(content);
+  if (rules.length === 0) return undefined;
+  return { dir: toForwardSlashes(dirAbs), rules };
+}
+
+/** Last matching rule wins; scopes are ordered shallow→deep so deeper .gitignore files take precedence. */
+function isIgnored(scopes: IgnoreScope[], absForward: string, isDir: boolean): boolean {
+  let ignored = false;
+  for (const scope of scopes) {
+    if (!absForward.startsWith(`${scope.dir}/`)) continue;
+    const rel = absForward.slice(scope.dir.length + 1);
+    for (const rule of scope.rules) {
+      if (rule.dirOnly && !isDir) continue;
+      if (rule.matches(rel)) ignored = !rule.negated;
+    }
+  }
+  return ignored;
+}
+
+/** Like ripgrep, .gitignore is only honored inside a git repository. */
+function findGitRoot(startDir: string): string | undefined {
+  let dir = path.resolve(startDir);
+  for (;;) {
+    if (fs.existsSync(path.join(dir, ".git"))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Shared file walker
 // ---------------------------------------------------------------------------
 
@@ -58,24 +147,71 @@ interface WalkedFile {
   rel: string;
 }
 
-function walkFiles(base: string, signal: AbortSignal | undefined): WalkedFile[] {
+interface WalkOptions {
+  /** Skip dot-files and dot-directories (ripgrep default). */
+  skipHidden?: boolean;
+  /** Honor .gitignore files when the base is inside a git repository (ripgrep default). */
+  gitignore?: boolean;
+}
+
+interface WalkItem {
+  dir: string;
+  scopes: IgnoreScope[] | undefined;
+}
+
+function walkFiles(
+  base: string,
+  signal: AbortSignal | undefined,
+  opts: WalkOptions = {},
+): WalkedFile[] {
+  const skipHidden = opts.skipHidden === true;
+  let rootScopes: IgnoreScope[] | undefined;
+  if (opts.gitignore === true) {
+    const gitRoot = findGitRoot(base);
+    if (gitRoot !== undefined) {
+      rootScopes = [];
+      // .gitignore files between the repo root and the search base apply too.
+      const ancestors: string[] = [];
+      let cur = path.resolve(base);
+      while (cur !== gitRoot) {
+        const parent = path.dirname(cur);
+        if (parent === cur) break;
+        cur = parent;
+        ancestors.unshift(cur);
+      }
+      for (const dir of ancestors) {
+        const scope = loadIgnoreScope(dir);
+        if (scope) rootScopes.push(scope);
+      }
+    }
+  }
+
   const out: WalkedFile[] = [];
-  const stack: string[] = [base];
+  const stack: WalkItem[] = [{ dir: base, scopes: rootScopes }];
   while (stack.length > 0) {
     throwIfAborted(signal);
-    const dir = stack.pop() as string;
+    const item = stack.pop() as WalkItem;
     let entries: fs.Dirent[];
     try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
+      entries = fs.readdirSync(item.dir, { withFileTypes: true });
     } catch {
       continue; // unreadable directory — skip, never crash
     }
+    let scopes = item.scopes;
+    if (scopes !== undefined) {
+      const scope = loadIgnoreScope(item.dir);
+      if (scope) scopes = [...scopes, scope];
+    }
     for (const entry of entries) {
       if (entry.isSymbolicLink()) continue; // avoid cycles
-      const abs = path.join(dir, entry.name);
+      if (skipHidden && entry.name.startsWith(".")) continue;
+      const abs = path.join(item.dir, entry.name);
       if (entry.isDirectory()) {
-        if (!SKIP_DIRS.has(entry.name)) stack.push(abs);
+        if (SKIP_DIRS.has(entry.name)) continue;
+        if (scopes !== undefined && isIgnored(scopes, toForwardSlashes(abs), true)) continue;
+        stack.push({ dir: abs, scopes });
       } else if (entry.isFile()) {
+        if (scopes !== undefined && isIgnored(scopes, toForwardSlashes(abs), false)) continue;
         out.push({ abs, rel: toForwardSlashes(path.relative(base, abs)) });
       }
     }
@@ -109,6 +245,106 @@ function readTextFile(abs: string): string | undefined {
 // ---------------------------------------------------------------------------
 
 type GrepMode = "content" | "files_with_matches" | "count";
+
+/** Fully resolved query shared by both engines. */
+interface GrepQuery {
+  pattern: string;
+  mode: GrepMode;
+  ignoreCase: boolean;
+  /** Show line numbers in content mode (-n, default true). */
+  lineNumbers: boolean;
+  /** Context lines before/after each match (content mode only). */
+  before: number;
+  after: number;
+  /** Print only the matched parts of matching lines (-o, content mode only). */
+  onlyMatching: boolean;
+  /** Multiline mode: . matches newlines, patterns can span lines. */
+  multiline: boolean;
+  glob?: string;
+  type?: string;
+}
+
+/**
+ * File-type filter for the JS engine, mirroring ripgrep's built-in type
+ * definitions (`rg --type-list`) for common types, extensions only.
+ */
+const JS_FILE_TYPES: Record<string, readonly string[]> = {
+  c: ["c", "h"],
+  cpp: ["cpp", "hpp", "cc", "hh", "cxx", "hxx", "inl"],
+  cs: ["cs"],
+  css: ["css", "scss"],
+  go: ["go"],
+  html: ["html", "htm", "ejs"],
+  java: ["java", "jsp", "jspx", "properties"],
+  js: ["js", "jsx", "mjs", "cjs", "vue"],
+  json: ["json", "sarif"],
+  kotlin: ["kt", "kts"],
+  lua: ["lua"],
+  markdown: ["md", "markdown", "mdown", "mdwn", "mdx", "mkd", "mkdn"],
+  md: ["md", "markdown", "mdown", "mdwn", "mdx", "mkd", "mkdn"],
+  php: ["php", "php3", "php4", "php5", "php7", "php8", "pht", "phtml"],
+  py: ["py", "pyi"],
+  rb: ["rb", "rbw", "gemspec"],
+  ruby: ["rb", "rbw", "gemspec"],
+  rust: ["rs"],
+  sh: ["sh", "bash", "bashrc", "zsh", "csh", "cshrc", "ksh", "kshrc", "tcsh"],
+  sql: ["sql", "psql"],
+  swift: ["swift"],
+  toml: ["toml"],
+  ts: ["ts", "tsx", "cts", "mts"],
+  txt: ["txt"],
+  xml: ["xml", "xsd", "xsl", "xslt", "dtd", "rng", "sch", "xhtml"],
+  yaml: ["yaml", "yml"],
+};
+
+function fileExtension(relPath: string): string {
+  const base = relPath.slice(relPath.lastIndexOf("/") + 1);
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(dot + 1).toLowerCase() : "";
+}
+
+function uniqueFlags(flags: string): string {
+  return Array.from(new Set(flags.split(""))).join("");
+}
+
+function withGlobalFlag(re: RegExp): RegExp {
+  return re.flags.includes("g") ? re : new RegExp(re.source, `${re.flags}g`);
+}
+
+/**
+ * Compile the pattern for the JS engine. Ripgrep's Rust regex accepts some
+ * syntax JS does not; translate the common cases (leading inline flags like
+ * `(?i)`, `(?P<name>` groups). Untranslatable regex syntax produces a clear
+ * error rather than a silent literal search; patterns that are not regex
+ * syntax in either engine fall back to a literal text search.
+ */
+function compileGrepRegex(pattern: string, flags: string): RegExp {
+  try {
+    return new RegExp(pattern, flags);
+  } catch {
+    /* try ripgrep→JS translations below */
+  }
+  let translated = pattern.replace(/\(\?P</g, "(?<");
+  const inline = /^\(\?([ims]+)\)/.exec(translated);
+  let extraFlags = "";
+  if (inline !== null) {
+    extraFlags = inline[1] as string;
+    translated = translated.slice(inline[0].length);
+  }
+  try {
+    return new RegExp(translated, uniqueFlags(flags + extraFlags));
+  } catch {
+    /* fall through */
+  }
+  if (/\(\?[a-zA-Z][a-zA-Z-]*[):]/.test(pattern) || pattern.includes("(?P<")) {
+    throw new Error(
+      `Grep: pattern uses ripgrep regex syntax the JS fallback engine cannot run: ${pattern}. ` +
+        "Rewrite it as a JS-compatible regex (e.g. use the -i parameter instead of an inline (?i) flag).",
+    );
+  }
+  // Not valid regex syntax in either engine — search for the literal text.
+  return new RegExp(escapeRegExp(pattern), flags);
+}
 
 interface RgOutcome {
   code: number;
@@ -160,108 +396,219 @@ function runRipgrep(
   });
 }
 
-/** Normalize an rg-printed path prefix: strip "./"/".\" and use forward slashes. */
-function normalizeRgPath(p: string): string {
-  return toForwardSlashes(p.replace(/^\.[\\/]/, ""));
-}
-
 interface GrepResult {
   entries: string[];
   engine: "rg" | "js";
 }
 
 async function grepWithRipgrep(
-  pattern: string,
-  literal: boolean,
+  q: GrepQuery,
   searchPath: string,
-  mode: GrepMode,
-  ignoreCase: boolean,
-  glob: string | undefined,
   signal: AbortSignal | undefined,
 ): Promise<GrepResult | null> {
   const stat = fs.statSync(searchPath);
   const baseDir = stat.isDirectory() ? searchPath : path.dirname(searchPath);
   const target = stat.isDirectory() ? "." : path.basename(searchPath);
 
-  const args = ["--no-config", "--color", "never", "--no-messages"];
-  if (ignoreCase) args.push("-i");
-  if (glob !== undefined) args.push("--glob", glob);
-  if (mode === "content") args.push("-n");
-  else if (mode === "files_with_matches") args.push("-l");
-  else args.push("-c");
-  if (literal) args.push("-F");
-  args.push("-e", pattern, target);
+  const args = [
+    "--no-config",
+    "--color",
+    "never",
+    "--no-messages",
+    "--sort",
+    "path", // deterministic output, aligned with the JS engine's sorted walk
+    "--path-separator",
+    "/",
+  ];
+  if (q.ignoreCase) args.push("-i");
+  if (q.glob !== undefined) args.push("--glob", q.glob);
+  if (q.type !== undefined) args.push("--type", q.type);
+  if (q.multiline) args.push("-U", "--multiline-dotall");
+  if (q.mode === "content") {
+    args.push("-H", q.lineNumbers ? "-n" : "--no-line-number");
+    if (q.onlyMatching) {
+      args.push("-o");
+    } else {
+      if (q.before > 0) args.push("-B", String(q.before));
+      if (q.after > 0) args.push("-A", String(q.after));
+    }
+  } else if (q.mode === "files_with_matches") {
+    args.push("-l");
+  } else {
+    args.push("-H", "-c"); // -H so single-file searches keep the "path:count" shape
+  }
+  args.push("-e", q.pattern, target);
 
   const outcome = await runRipgrep(args, baseDir, signal);
   if (outcome === null) return null; // rg not installed
   if (outcome.code !== 0 && outcome.code !== 1) return null; // rg rejected pattern/args — JS fallback
-  const lines = outcome.stdout.split(/\r?\n/).filter((l) => l.length > 0);
-  let entries: string[];
-  if (mode === "content") {
-    entries = lines.map((l) => {
-      const m = /^(.*?):(\d+):([\s\S]*)$/.exec(l);
-      return m ? `${normalizeRgPath(m[1] as string)}:${m[2]}:${m[3]}` : l;
-    });
-  } else if (mode === "count") {
-    entries = lines
-      .map((l) => {
-        const m = /^(.*?):(\d+)$/.exec(l);
-        return m ? `${normalizeRgPath(m[1] as string)}:${m[2]}` : l;
-      })
-      .filter((l) => !/:0$/.test(l));
-  } else {
-    entries = lines.map(normalizeRgPath);
-  }
+  let entries = outcome.stdout
+    .split(/\r?\n/)
+    .filter((l) => l.length > 0)
+    .map((l) => (l.startsWith("./") ? l.slice(2) : l));
+  if (q.mode === "count") entries = entries.filter((l) => !/:0$/.test(l));
   return { entries, engine: "rg" };
 }
 
+interface MultilineMatches {
+  /** 0-based indices of all lines covered by at least one match, sorted. */
+  matchLines: number[];
+  /** Number of matches (ripgrep counts multiline matches, not lines). */
+  count: number;
+  /** Per-line matched segments, for -o output. */
+  segments: Array<{ line: number; text: string }>;
+}
+
+function findMultilineMatches(text: string, re: RegExp, wantSegments: boolean): MultilineMatches {
+  const g = withGlobalFlag(re);
+  const lineStarts = [0];
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) lineStarts.push(i + 1);
+  }
+  const lineAt = (offset: number): number => {
+    let lo = 0;
+    let hi = lineStarts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if ((lineStarts[mid] as number) <= offset) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
+  };
+  const lineSet = new Set<number>();
+  const segments: MultilineMatches["segments"] = [];
+  let count = 0;
+  for (const m of text.matchAll(g)) {
+    if (m[0] === "") continue; // ignore empty matches
+    count++;
+    const startLine = lineAt(m.index);
+    const parts = m[0].split("\n");
+    if (parts.length > 1 && parts[parts.length - 1] === "") parts.pop();
+    for (let k = 0; k < parts.length; k++) {
+      lineSet.add(startLine + k);
+      if (wantSegments) {
+        segments.push({ line: startLine + k, text: (parts[k] as string).replace(/\r$/, "") });
+      }
+    }
+  }
+  return { matchLines: Array.from(lineSet).sort((a, b) => a - b), count, segments };
+}
+
+/** Merge per-match context ranges into ripgrep-style chunks (adjacent/overlapping ranges coalesce). */
+function mergeContextRanges(
+  matchIdx: number[],
+  before: number,
+  after: number,
+  lineCount: number,
+): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  for (const i of matchIdx) {
+    const start = Math.max(0, i - before);
+    const end = Math.min(lineCount - 1, i + after);
+    const last = out[out.length - 1];
+    if (last !== undefined && start <= last[1] + 1) last[1] = Math.max(last[1], end);
+    else out.push([start, end]);
+  }
+  return out;
+}
+
 function grepWithJs(
-  pattern: string,
+  q: GrepQuery,
   searchPath: string,
-  mode: GrepMode,
-  ignoreCase: boolean,
-  glob: string | undefined,
   signal: AbortSignal | undefined,
 ): GrepResult {
-  const flags = ignoreCase ? "i" : "";
-  let re: RegExp;
-  try {
-    re = new RegExp(pattern, flags);
-  } catch {
-    // Invalid regex → search for the literal text instead.
-    re = new RegExp(escapeRegExp(pattern), flags);
-  }
+  const baseFlags = (q.ignoreCase ? "i" : "") + (q.multiline ? "ms" : "");
+  const re = compileGrepRegex(q.pattern, baseFlags);
 
   const stat = fs.statSync(searchPath);
+  const explicitFile = stat.isFile();
   let files: WalkedFile[];
-  if (stat.isFile()) {
+  if (explicitFile) {
     files = [{ abs: searchPath, rel: toForwardSlashes(path.basename(searchPath)) }];
   } else {
-    files = walkFiles(searchPath, signal);
+    files = walkFiles(searchPath, signal, { skipHidden: true, gitignore: true });
   }
 
-  if (glob !== undefined) {
-    const isMatch = picomatch(glob, { dot: true, basename: !glob.includes("/") });
+  if (q.type !== undefined) {
+    const extensions = JS_FILE_TYPES[q.type];
+    if (extensions === undefined) {
+      throw new Error(`Grep: unrecognized file type: ${q.type}`);
+    }
+    // Like ripgrep, --type/--glob filters do not apply to explicitly named files.
+    if (!explicitFile) files = files.filter((f) => extensions.includes(fileExtension(f.rel)));
+  }
+  if (q.glob !== undefined && !explicitFile) {
+    const isMatch = picomatch(q.glob, { dot: true, basename: !q.glob.includes("/") });
     files = files.filter((f) => isMatch(f.rel));
   }
 
   const entries: string[] = [];
+  let firstChunk = true; // "--" separators go between context chunks, across files too
   for (const file of files) {
     throwIfAborted(signal);
     const text = readTextFile(file.abs);
     if (text === undefined) continue;
     const lines = text.split(/\r?\n/);
-    let count = 0;
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i] as string;
-      if (!re.test(line)) continue;
-      count++;
-      if (mode === "content") entries.push(`${file.rel}:${i + 1}:${line}`);
-      else if (mode === "files_with_matches") break;
+    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop(); // no phantom line after a trailing newline
+
+    let matchIdx: number[];
+    let count: number;
+    let onlySegments: MultilineMatches["segments"] = [];
+    if (q.multiline) {
+      const found = findMultilineMatches(text, re, q.onlyMatching);
+      matchIdx = found.matchLines;
+      count = found.count;
+      onlySegments = found.segments;
+    } else {
+      matchIdx = [];
+      for (let i = 0; i < lines.length; i++) {
+        if (!re.test(lines[i] as string)) continue;
+        matchIdx.push(i);
+        if (q.mode === "files_with_matches") break;
+      }
+      count = matchIdx.length;
     }
-    if (count > 0) {
-      if (mode === "files_with_matches") entries.push(file.rel);
-      else if (mode === "count") entries.push(`${file.rel}:${count}`);
+    if (matchIdx.length === 0) continue;
+
+    if (q.mode === "files_with_matches") {
+      entries.push(file.rel);
+      continue;
+    }
+    if (q.mode === "count") {
+      entries.push(`${file.rel}:${count}`);
+      continue;
+    }
+
+    const rel = file.rel;
+    if (q.onlyMatching) {
+      if (q.multiline) {
+        for (const seg of onlySegments) {
+          entries.push(q.lineNumbers ? `${rel}:${seg.line + 1}:${seg.text}` : `${rel}:${seg.text}`);
+        }
+      } else {
+        const g = withGlobalFlag(re);
+        for (const i of matchIdx) {
+          for (const m of (lines[i] as string).matchAll(g)) {
+            if (m[0] === "") continue; // only non-empty matched parts
+            entries.push(q.lineNumbers ? `${rel}:${i + 1}:${m[0]}` : `${rel}:${m[0]}`);
+          }
+        }
+      }
+    } else if (q.before > 0 || q.after > 0) {
+      const matchSet = new Set(matchIdx);
+      for (const [start, end] of mergeContextRanges(matchIdx, q.before, q.after, lines.length)) {
+        if (!firstChunk) entries.push("--");
+        firstChunk = false;
+        for (let ln = start; ln <= end; ln++) {
+          const sep = matchSet.has(ln) ? ":" : "-";
+          const content = lines[ln] as string;
+          entries.push(q.lineNumbers ? `${rel}${sep}${ln + 1}${sep}${content}` : `${rel}${sep}${content}`);
+        }
+      }
+    } else {
+      for (const i of matchIdx) {
+        entries.push(q.lineNumbers ? `${rel}:${i + 1}:${lines[i]}` : `${rel}:${lines[i]}`);
+      }
     }
   }
   return { entries, engine: "js" };
@@ -273,11 +620,13 @@ export function createGrepTool(getCwd: () => string, opts: GrepToolOptions = {})
     label: "Grep",
     description:
       "Search file contents with a regular expression (ripgrep when available, pure-JS " +
-      "fallback otherwise). Supports case-insensitive search, a glob file filter, and " +
-      "content / files_with_matches / count output modes. Invalid regexes are searched " +
-      "as literal text.",
+      "fallback otherwise; both skip hidden files and honor .gitignore inside git repos). " +
+      "Supports case-insensitive search, glob and file-type filters, context lines " +
+      "(-A/-B/-C), multiline mode, and content / files_with_matches / count output modes.",
     parameters: Type.Object({
-      pattern: Type.String({ description: "The regular expression to search for" }),
+      pattern: Type.String({
+        description: "The regular expression pattern to search for in file contents",
+      }),
       path: Type.Optional(
         Type.String({
           description: "File or directory to search in (default: current working directory)",
@@ -286,7 +635,51 @@ export function createGrepTool(getCwd: () => string, opts: GrepToolOptions = {})
       glob: Type.Optional(
         Type.String({ description: 'Glob to filter files, e.g. "*.ts" or "src/**/*.md"' }),
       ),
+      type: Type.Optional(
+        Type.String({
+          description:
+            'File type to search, e.g. "js", "py", "rust" (more efficient than glob for standard types)',
+        }),
+      ),
       "-i": Type.Optional(Type.Boolean({ description: "Case-insensitive search" })),
+      "-n": Type.Optional(
+        Type.Boolean({
+          description:
+            'Show line numbers in output (default true). Requires output_mode: "content", ignored otherwise.',
+        }),
+      ),
+      "-A": Type.Optional(
+        Type.Number({
+          description:
+            'Number of lines to show after each match. Requires output_mode: "content", ignored otherwise.',
+        }),
+      ),
+      "-B": Type.Optional(
+        Type.Number({
+          description:
+            'Number of lines to show before each match. Requires output_mode: "content", ignored otherwise.',
+        }),
+      ),
+      "-C": Type.Optional(
+        Type.Number({
+          description:
+            'Number of lines to show before and after each match. Requires output_mode: "content", ignored otherwise.',
+        }),
+      ),
+      context: Type.Optional(Type.Number({ description: "Alias for -C." })),
+      "-o": Type.Optional(
+        Type.Boolean({
+          description:
+            "Print only the matched (non-empty) parts of each matching line, one match per " +
+            'output line. Requires output_mode: "content", ignored otherwise.',
+        }),
+      ),
+      multiline: Type.Optional(
+        Type.Boolean({
+          description:
+            "Enable multiline mode where . matches newlines and patterns can span lines (default false).",
+        }),
+      ),
       output_mode: Type.Optional(
         StringEnum(["content", "files_with_matches", "count"] as const, {
           description:
@@ -295,7 +688,14 @@ export function createGrepTool(getCwd: () => string, opts: GrepToolOptions = {})
         }),
       ),
       head_limit: Type.Optional(
-        Type.Number({ description: "Maximum number of entries to return (default 100)" }),
+        Type.Number({
+          description: "Maximum number of entries to return (default 100). Pass 0 for unlimited.",
+        }),
+      ),
+      offset: Type.Optional(
+        Type.Number({
+          description: "Skip the first N entries before applying head_limit (default 0).",
+        }),
       ),
     }),
     async execute(_toolCallId, params, signal) {
@@ -304,49 +704,56 @@ export function createGrepTool(getCwd: () => string, opts: GrepToolOptions = {})
         throw new Error(`Grep: path does not exist: ${searchPath}`);
       }
       const mode: GrepMode = params.output_mode ?? "files_with_matches";
-      const ignoreCase = params["-i"] === true;
+      const contextBoth = params["-C"] ?? params.context;
+      const clampContext = (v: number | undefined): number =>
+        mode === "content" && v !== undefined ? Math.max(0, Math.floor(v)) : 0;
+      const query: GrepQuery = {
+        pattern: params.pattern,
+        mode,
+        ignoreCase: params["-i"] === true,
+        lineNumbers: params["-n"] !== false,
+        before: clampContext(params["-B"] ?? contextBoth),
+        after: clampContext(params["-A"] ?? contextBoth),
+        onlyMatching: mode === "content" && params["-o"] === true,
+        multiline: params.multiline === true,
+        glob: params.glob,
+        type: params.type,
+      };
       const headLimit =
-        params.head_limit !== undefined && params.head_limit > 0
-          ? Math.floor(params.head_limit)
-          : DEFAULT_HEAD_LIMIT;
-
-      // Pre-validate the pattern so both engines agree on literal fallback.
-      let literal = false;
-      try {
-        new RegExp(params.pattern);
-      } catch {
-        literal = true;
-      }
+        params.head_limit === undefined
+          ? DEFAULT_HEAD_LIMIT
+          : params.head_limit <= 0
+            ? Number.POSITIVE_INFINITY // 0 = unlimited
+            : Math.floor(params.head_limit);
+      const offset = Math.max(0, Math.floor(params.offset ?? 0));
 
       let result: GrepResult | null = null;
       if (!opts.forceJs) {
         try {
-          result = await grepWithRipgrep(
-            params.pattern,
-            literal,
-            searchPath,
-            mode,
-            ignoreCase,
-            params.glob,
-            signal,
-          );
+          result = await grepWithRipgrep(query, searchPath, signal);
         } catch (err) {
           if (signal?.aborted) throw err;
           result = null; // any rg failure falls back to the JS engine
         }
       }
       if (result === null) {
-        result = grepWithJs(params.pattern, searchPath, mode, ignoreCase, params.glob, signal);
+        result = grepWithJs(query, searchPath, signal);
       }
 
       const total = result.entries.length;
-      const limited = result.entries.slice(0, headLimit);
+      const limited = Number.isFinite(headLimit)
+        ? result.entries.slice(offset, offset + headLimit)
+        : result.entries.slice(offset);
       let text: string;
       if (total === 0) {
         text = "No matches found";
+      } else if (limited.length === 0) {
+        text = `No entries at offset ${offset} (${total} total)`;
       } else {
         text = limited.join("\n");
-        if (total > limited.length) {
+        if (offset > 0) {
+          text += `\n[Showing entries ${offset + 1}-${offset + limited.length} of ${total}]`;
+        } else if (total > limited.length) {
           text += `\n[Results limited to first ${limited.length} of ${total} entries]`;
         }
       }

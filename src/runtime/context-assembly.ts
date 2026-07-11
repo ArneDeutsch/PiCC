@@ -16,8 +16,13 @@ export interface SessionContextState {
   activeSkills: Map<string, string>;
   /** Absolute paths of CLAUDE.md files already in context (root set + injected nested). */
   loadedClaudeMd: Set<string>;
-  /** Rule ids already injected (path-scoped ones inject once). */
+  /**
+   * Path-scoped rules already injected, keyed by the rule's absolute source path —
+   * same-named rules from different scopes/dirs are distinct rules and must all inject.
+   */
   injectedRules: Set<string>;
+  /** Path-scoped skills already surfaced on file touch (suggest once). */
+  suggestedSkills: Set<string>;
 }
 
 export function newSessionContextState(claudeMd: ClaudeMdFile[]): SessionContextState {
@@ -25,7 +30,20 @@ export function newSessionContextState(claudeMd: ClaudeMdFile[]): SessionContext
     activeSkills: new Map(),
     loadedClaudeMd: new Set(claudeMd.map((f) => f.path)),
     injectedRules: new Set(),
+    suggestedSkills: new Set(),
   };
+}
+
+/**
+ * Reset the once-only injection markers after compaction (plan §9): nested
+ * CLAUDE.md and path-scoped rules/skills were delivered as ordinary transcript
+ * messages that compaction summarizes away, so they must re-inject on the next
+ * relevant access. Active skills survive via the system-prompt suffix and stay.
+ */
+export function resetInjectionState(state: SessionContextState, claudeMd: ClaudeMdFile[]): void {
+  state.loadedClaudeMd = new Set(claudeMd.map((f) => f.path));
+  state.injectedRules.clear();
+  state.suggestedSkills.clear();
 }
 
 export interface AssemblyInputs {
@@ -121,6 +139,8 @@ export function contextForTouchedFile(opts: {
   rules: ClaudeRule[];
   settings: ClaudeSettings;
   state: SessionContextState;
+  /** Skills with `paths:` scoping are surfaced (once) when a matching file is touched. */
+  skills?: ClaudeSkill[];
 }): string | undefined {
   const parts: string[] = [];
 
@@ -137,10 +157,34 @@ export function contextForTouchedFile(opts: {
 
   for (const rule of opts.rules) {
     if (!rule.paths || rule.paths.length === 0) continue;
-    if (opts.state.injectedRules.has(rule.id)) continue;
-    if (ruleAppliesTo(rule, opts.filePath, opts.projectRoot)) {
-      opts.state.injectedRules.add(rule.id);
+    if (opts.state.injectedRules.has(rule.source.path)) continue;
+    if (ruleAppliesTo(rule, opts.filePath, opts.projectRoot, opts.cwd)) {
+      opts.state.injectedRules.add(rule.source.path);
       parts.push(`Project rule (${rule.id}) — applies to files you are touching:\n\n${rule.body.trim()}`);
+    }
+  }
+
+  // Path-scoped skills (plan §4.1/§4.2 shared glob engine): surface the skill
+  // when the model first touches a matching file. Suggestion only — activation
+  // stays explicit via the Skill tool, mirroring the startup listing.
+  for (const skill of opts.skills ?? []) {
+    if (!skill.paths || skill.paths.length === 0) continue;
+    if (skill.disableModelInvocation) continue;
+    if (opts.state.activeSkills.has(skill.name)) continue;
+    if (opts.state.suggestedSkills.has(skill.name)) continue;
+    const applies = skill.paths.some((p) =>
+      ruleAppliesTo(
+        { id: skill.name, paths: [p], body: "", source: skill.source, unknownKeys: [], diagnostics: [] },
+        opts.filePath,
+        opts.projectRoot,
+        opts.cwd,
+      ),
+    );
+    if (applies) {
+      opts.state.suggestedSkills.add(skill.name);
+      parts.push(
+        `Skill for the files you are touching: "${skill.name}" — ${skill.description} (activate with the Skill tool if relevant)`,
+      );
     }
   }
 

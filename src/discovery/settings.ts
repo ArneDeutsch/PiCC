@@ -1,6 +1,5 @@
 import path from "node:path";
 import { isFile, readTextSafe } from "../util/fs.js";
-import { toBool } from "../util/markdown.js";
 import type {
   ClaudeSettings,
   Diagnostic,
@@ -15,16 +14,18 @@ import type {
  *
  * Reads the standard settings hierarchy in ascending precedence:
  *   user (`<userDir>/settings.json`)
- *   → project (`<projectRoot>/.claude/settings.json`)
- *   → local (`<projectRoot>/.claude/settings.local.json`)
+ *   → project (`.claude/settings.json` + `.claude/settings.local.json` at every
+ *     directory from the repo root down to cwd — monorepo walk-up, nearest wins)
  *   → managed policy (platform-specific, highest; degrade-silent when absent)
  *
  * Merge semantics:
  * - `permissions.allow/deny/ask/additionalDirectories` ACCUMULATE across scopes (deduped).
  * - `hooks` accumulate per event (matcher entries concatenated).
  * - `env` merges key-wise, higher precedence wins.
+ * - `enabledPlugins` merges key-wise, higher precedence wins per plugin key.
  * - `claudeMdExcludes` accumulates (arrays merge across layers, per Claude docs).
- * - Scalar settings follow precedence (higher scope wins).
+ * - Scalar settings follow precedence (higher scope wins; a malformed value at a
+ *   higher scope is ignored with a diagnostic, keeping the lower-scope value).
  *
  * Completeness floor: NO input throws. Malformed files degrade to a diagnostic and are
  * skipped; unrecognized keys land in `unknownKeys`; recognized-but-deferred keys land in
@@ -33,6 +34,7 @@ import type {
  */
 
 export interface LoadSettingsOptions {
+  /** Launch directory; nested `.claude/settings*.json` between here and projectRoot load too. */
   cwd: string;
   projectRoot: string;
   userDir: string;
@@ -95,6 +97,10 @@ function createDefaultSettings(): ClaudeSettings {
  * JSONC-ish text, string-aware (never touches content inside string literals).
  */
 export function stripJsonc(text: string): string {
+  // A UTF-8 BOM (written by Notepad / PowerShell 5.1 by default) must not
+  // reject the file — JSON.parse chokes on it, and losing a settings file
+  // silently drops its deny rules.
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
   // Pass 1: remove comments.
   let noComments = "";
   let inString = false;
@@ -166,6 +172,27 @@ export function expandEnvVars(value: string, env: NodeJS.ProcessEnv = process.en
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * JSON-controlled keys that collide with `Object.prototype` members ("__proto__",
+ * "constructor", "toString", ...) must never become keys of plain-object
+ * accumulators: assigning "__proto__" rewires the prototype and reading an
+ * inherited member instead of an own entry crashes or corrupts downstream
+ * merges (never-throw floor). Such keys are dropped with a diagnostic.
+ */
+function isUnsafeKey(key: string): boolean {
+  return key in Object.prototype;
+}
+
+function skipUnsafeKey(key: string, keyLabel: string, source: string, diagnostics: Diagnostic[]): boolean {
+  if (!isUnsafeKey(key)) return false;
+  diagnostics.push({
+    severity: "warning",
+    message: `Unsafe key "${key}" in "${keyLabel}" ignored`,
+    source,
+  });
+  return true;
 }
 
 function asString(value: unknown): string | undefined {
@@ -246,6 +273,39 @@ function expectNumber(
   return n;
 }
 
+function asBool(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const s = value.trim().toLowerCase();
+    if (["true", "yes", "on", "1"].includes(s)) return true;
+    if (["false", "no", "off", "0"].includes(s)) return false;
+  }
+  return undefined;
+}
+
+/**
+ * Boolean coercion mirroring expectNumber/expectString: an unrecognized value
+ * is IGNORED with a diagnostic (returns undefined), so a malformed value at a
+ * higher scope never resets a lower scope's explicit setting.
+ */
+function expectBool(
+  value: unknown,
+  keyLabel: string,
+  source: string,
+  diagnostics: Diagnostic[],
+): boolean | undefined {
+  const b = asBool(value);
+  if (b === undefined) {
+    diagnostics.push({
+      severity: "warning",
+      message: `Setting "${keyLabel}" is not a boolean; ignored`,
+      source,
+    });
+  }
+  return b;
+}
+
 function normalizeHookHandler(
   raw: Record<string, unknown>,
   source: string,
@@ -284,6 +344,7 @@ function applyHooks(value: unknown, source: string, out: ClaudeSettings): void {
     return;
   }
   for (const [event, entriesRaw] of Object.entries(value)) {
+    if (skipUnsafeKey(event, "hooks", source, out.diagnostics)) continue;
     if (!Array.isArray(entriesRaw)) {
       out.diagnostics.push({
         severity: "warning",
@@ -329,7 +390,8 @@ function applyHooks(value: unknown, source: string, out: ClaudeSettings): void {
       });
     }
     if (entries.length > 0) {
-      out.hooks[event] = [...(out.hooks[event] ?? []), ...entries];
+      const existing = Object.hasOwn(out.hooks, event) ? out.hooks[event]! : [];
+      out.hooks[event] = [...existing, ...entries];
     }
   }
 }
@@ -409,9 +471,11 @@ function applySubagents(value: unknown, scope: Scope, source: string, out: Claud
   }
   for (const [key, sub] of Object.entries(value)) {
     switch (key) {
-      case "enabled":
-        out.subagentsEnabled = toBool(sub, out.subagentsEnabled);
+      case "enabled": {
+        const b = expectBool(sub, "subagents.enabled", source, out.diagnostics);
+        if (b !== undefined) out.subagentsEnabled = b;
         break;
+      }
       case "maxDepth": {
         const n = expectNumber(sub, "subagents.maxDepth", source, out.diagnostics);
         if (n !== undefined) out.subagentMaxDepth = n;
@@ -456,6 +520,7 @@ function applySettingsFile(
           break;
         }
         for (const [envKey, envVal] of Object.entries(value)) {
+          if (skipUnsafeKey(envKey, "env", source, out.diagnostics)) continue;
           out.env[envKey] = expandEnvVars(String(envVal));
         }
         break;
@@ -465,9 +530,11 @@ function applySettingsFile(
         if (s !== undefined) out.model = expandEnvVars(s);
         break;
       }
-      case "includeCoAuthoredBy":
-        out.includeCoAuthoredBy = toBool(value, true);
+      case "includeCoAuthoredBy": {
+        const b = expectBool(value, "includeCoAuthoredBy", source, out.diagnostics);
+        if (b !== undefined) out.includeCoAuthoredBy = b;
         break;
+      }
       case "attribution": {
         if (isPlainObject(value)) {
           out.attribution = value;
@@ -480,12 +547,16 @@ function applySettingsFile(
         }
         break;
       }
-      case "disableAllHooks":
-        out.disableAllHooks = toBool(value, false);
+      case "disableAllHooks": {
+        const b = expectBool(value, "disableAllHooks", source, out.diagnostics);
+        if (b !== undefined) out.disableAllHooks = b;
         break;
-      case "disableSkillShellExecution":
-        out.disableSkillShellExecution = toBool(value, false);
+      }
+      case "disableSkillShellExecution": {
+        const b = expectBool(value, "disableSkillShellExecution", source, out.diagnostics);
+        if (b !== undefined) out.disableSkillShellExecution = b;
         break;
+      }
       case "skillListingBudgetFraction": {
         const n = expectNumber(value, "skillListingBudgetFraction", source, out.diagnostics);
         if (n !== undefined) out.skillListingBudgetFraction = n;
@@ -498,7 +569,10 @@ function applySettingsFile(
       }
       case "skillOverrides": {
         if (isPlainObject(value)) {
-          Object.assign(out.skillOverrides, value);
+          for (const [skillKey, mode] of Object.entries(value)) {
+            if (skipUnsafeKey(skillKey, "skillOverrides", source, out.diagnostics)) continue;
+            out.skillOverrides[skillKey] = mode;
+          }
         } else {
           out.diagnostics.push({
             severity: "warning",
@@ -528,25 +602,41 @@ function applySettingsFile(
         break;
       }
       case "enabledPlugins": {
+        // Key-wise merge across scopes (like `env`): the nearer scope wins PER
+        // PLUGIN KEY — a project file enabling its own plugins must not wipe the
+        // user's enabled set. Array form normalizes to `{ name: true }`.
+        let entries: Array<[string, boolean]> | undefined;
         if (isPlainObject(value)) {
-          out.enabledPlugins = value as Record<string, boolean>;
+          entries = Object.entries(value).map(([k, v]) => [k, Boolean(v)]);
         } else if (Array.isArray(value)) {
-          out.enabledPlugins = value.map((v) => String(v));
-        } else {
+          entries = value.map((v) => [String(v), true]);
+        }
+        if (entries === undefined) {
           out.diagnostics.push({
             severity: "warning",
             message: `Setting "enabledPlugins" is not an object or array; ignored`,
             source,
           });
+          break;
         }
+        const merged: Record<string, boolean> = isPlainObject(out.enabledPlugins)
+          ? out.enabledPlugins
+          : {};
+        for (const [pluginKey, enabled] of entries) {
+          if (skipUnsafeKey(pluginKey, "enabledPlugins", source, out.diagnostics)) continue;
+          merged[pluginKey] = enabled;
+        }
+        out.enabledPlugins = merged;
         break;
       }
       case "subagents":
         applySubagents(value, scope, source, out);
         break;
-      case "disableSubagents":
-        out.subagentsEnabled = !toBool(value, false);
+      case "disableSubagents": {
+        const b = expectBool(value, "disableSubagents", source, out.diagnostics);
+        if (b !== undefined) out.subagentsEnabled = !b;
         break;
+      }
       default:
         if (DEFERRED_TOP_KEYS.has(key)) {
           out.deferredKeys.push({ key, scope });
@@ -562,17 +652,48 @@ function applySettingsFile(
  * Load and merge the full settings hierarchy for a project.
  * Never throws — every problem degrades to a Diagnostic on the result.
  */
+/** Path equality that tolerates Windows case-insensitivity. */
+function samePath(a: string, b: string): boolean {
+  const ra = path.resolve(a);
+  const rb = path.resolve(b);
+  if (process.platform === "win32") return ra.toLowerCase() === rb.toLowerCase();
+  return ra === rb;
+}
+
+/**
+ * Directories contributing project-scope settings, ordered ROOT-FIRST so the
+ * nearest directory is applied last (= wins on scalar conflicts). Mirrors the
+ * monorepo walk-up of discoverArtifactDirs (plan §3): cwd up to projectRoot.
+ */
+function settingsDirChain(cwd: string, projectRoot: string): string[] {
+  const chain: string[] = [];
+  const root = path.resolve(projectRoot);
+  let dir = path.resolve(cwd);
+  for (;;) {
+    chain.push(dir);
+    if (samePath(dir, root)) break;
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // reached filesystem root without meeting projectRoot
+    dir = parent;
+  }
+  return chain.reverse();
+}
+
 export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
   const settings = createDefaultSettings();
   const managed = opts.managedPaths ?? defaultManagedPaths();
 
-  // Ascending precedence: later files win on scalar conflicts.
+  // Ascending precedence: later files win on scalar conflicts. Project scope
+  // walks repo root → cwd so nested/monorepo .claude/settings.json files load
+  // too, nearest directory last (highest of the project layers).
   const files: Array<{ path: string; scope: Scope }> = [
     { path: path.join(opts.userDir, "settings.json"), scope: "user" },
-    { path: path.join(opts.projectRoot, ".claude", "settings.json"), scope: "project" },
-    { path: path.join(opts.projectRoot, ".claude", "settings.local.json"), scope: "local" },
-    ...managed.map((p) => ({ path: p, scope: "managed" as Scope })),
   ];
+  for (const dir of settingsDirChain(opts.cwd, opts.projectRoot)) {
+    files.push({ path: path.join(dir, ".claude", "settings.json"), scope: "project" });
+    files.push({ path: path.join(dir, ".claude", "settings.local.json"), scope: "local" });
+  }
+  files.push(...managed.map((p) => ({ path: p, scope: "managed" as Scope })));
 
   for (const file of files) {
     if (!isFile(file.path)) continue; // absent — degrade silently (incl. managed/policy)

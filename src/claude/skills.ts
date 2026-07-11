@@ -70,6 +70,32 @@ function parseShell(
   return "bash";
 }
 
+/**
+ * Coerce `allowed-tools:` / `disallowed-tools:` / `paths:` frontmatter (Claude
+ * Code convention: a YAML list, or a single comma-separated string) into a
+ * string list. Unlike a naive comma split, commas nested inside (), [] or {}
+ * do not separate items — permission rules like `Bash(echo a,b)` and globs
+ * like `src/**\/*.{ts,tsx}` stay intact.
+ */
+function toRuleList(value: unknown): string[] | undefined {
+  if (typeof value !== "string") return toStringList(value);
+  const items: string[] = [];
+  let depth = 0;
+  let cur = "";
+  for (const c of value) {
+    if (c === "," && depth === 0) {
+      items.push(cur);
+      cur = "";
+      continue;
+    }
+    if (c === "(" || c === "[" || c === "{") depth++;
+    else if ((c === ")" || c === "]" || c === "}") && depth > 0) depth--;
+    cur += c;
+  }
+  items.push(cur);
+  return items.map((s) => s.trim()).filter(Boolean);
+}
+
 /** Coerce the `arguments:` frontmatter (string, string list, or object list) into specs. */
 function toArgumentSpecs(
   value: unknown,
@@ -227,14 +253,14 @@ function parseSkillFile(
     disableModelInvocation: toBool(fm["disable-model-invocation"], false),
     argumentHint: toOptString(fm["argument-hint"]),
     arguments: toArgumentSpecs(fm["arguments"], skillDiagnostics, file),
-    allowedTools: toStringList(fm["allowed-tools"]),
-    disallowedTools: toStringList(fm["disallowed-tools"]),
+    allowedTools: toRuleList(fm["allowed-tools"]),
+    disallowedTools: toRuleList(fm["disallowed-tools"]),
     model: toOptString(fm["model"]),
     effort: toOptString(fm["effort"]),
     contextFork: toOptString(fm["context"])?.toLowerCase() === "fork",
     forkAgentType: toOptString(fm["agent"]),
     hooks: toHookConfig(fm["hooks"], skillDiagnostics, file),
-    paths: toStringList(fm["paths"]),
+    paths: toRuleList(fm["paths"]),
     shell: parseShell(fm["shell"], skillDiagnostics, file),
     metadata: isPlainObject(fm["metadata"]) ? fm["metadata"] : {},
     baseDir,
@@ -288,14 +314,14 @@ function parseCommandFile(
     disableModelInvocation: toBool(fm["disable-model-invocation"], false),
     argumentHint: toOptString(fm["argument-hint"]),
     arguments: toArgumentSpecs(fm["arguments"], skillDiagnostics, file),
-    allowedTools: toStringList(fm["allowed-tools"]),
-    disallowedTools: toStringList(fm["disallowed-tools"]),
+    allowedTools: toRuleList(fm["allowed-tools"]),
+    disallowedTools: toRuleList(fm["disallowed-tools"]),
     model: toOptString(fm["model"]),
     effort: toOptString(fm["effort"]),
     contextFork: toOptString(fm["context"])?.toLowerCase() === "fork",
     forkAgentType: toOptString(fm["agent"]),
     hooks: toHookConfig(fm["hooks"], skillDiagnostics, file),
-    paths: toStringList(fm["paths"]),
+    paths: toRuleList(fm["paths"]),
     shell: parseShell(fm["shell"], skillDiagnostics, file),
     metadata: isPlainObject(fm["metadata"]) ? fm["metadata"] : {},
     baseDir: commandDir,

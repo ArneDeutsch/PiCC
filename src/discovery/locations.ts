@@ -34,17 +34,32 @@ function samePath(a: string, b: string): boolean {
 }
 
 /**
+ * Default managed/policy artifact base directories (research doc §4.1). Mirrors
+ * the managed settings locations in settings.ts; degrade-silent when absent.
+ */
+function defaultManagedDirs(): string[] {
+  if (process.platform === "win32") {
+    return [path.join("C:\\", "ProgramData", "ClaudeCode")];
+  }
+  return [path.join("/etc", "claude-code")];
+}
+
+/**
  * Discover every artifact-contributing directory for a session.
  *
- * Monorepo walk-up: from `cwd` up to `projectRoot`, every `.claude/` directory
- * contributes; results are ordered NEAREST-FIRST so callers can apply
- * "nearest definition wins" via {@link dedupeByName}. User-scope directories
- * (`<userDir>/skills` etc.) come last. Only existing directories are returned.
+ * Managed/policy directories come FIRST (highest precedence, per
+ * SCOPE_PRECEDENCE; degrade-safe when absent). Monorepo walk-up: from `cwd` up
+ * to `projectRoot`, every `.claude/` directory contributes; results are ordered
+ * NEAREST-FIRST so callers can apply "nearest definition wins" via
+ * {@link dedupeByName}. User-scope directories (`<userDir>/skills` etc.) come
+ * last. Only existing directories are returned.
  */
 export function discoverArtifactDirs(opts: {
   cwd: string;
   projectRoot: string;
   userDir: string;
+  /** Override managed/policy artifact base directories (used by tests). */
+  managedDirs?: string[];
 }): ArtifactDirs {
   const result: ArtifactDirs = { skillDirs: [], agentDirs: [], ruleDirs: [], commandDirs: [] };
 
@@ -58,6 +73,11 @@ export function discoverArtifactDirs(opts: {
     add(result.ruleDirs, "rules");
     add(result.commandDirs, "commands");
   };
+
+  // Managed/policy scope: highest precedence, absent on most machines.
+  for (const base of opts.managedDirs ?? defaultManagedDirs()) {
+    push(path.resolve(base), "managed");
+  }
 
   // Project scope: walk cwd → projectRoot (inclusive), nearest first.
   const root = path.resolve(opts.projectRoot);

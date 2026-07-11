@@ -152,6 +152,65 @@ describe("loadSettings — precedence & merging", () => {
     }
   });
 
+  it("merges enabledPlugins key-wise across scopes (project must not wipe user-enabled plugins)", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), {
+      enabledPlugins: { "foo@official": true, "baz@official": true },
+    });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+      enabledPlugins: { "bar@acme": true },
+    });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.local.json"), {
+      enabledPlugins: { "baz@official": false },
+    });
+
+    const settings = load(scopes);
+    // User-enabled plugin survives a project file that mentions enabledPlugins…
+    expect(settings.enabledPlugins).toEqual({
+      "foo@official": true,
+      "bar@acme": true,
+      // …while a nearer scope still wins PER KEY (explicit disable).
+      "baz@official": false,
+    });
+  });
+
+  it("normalizes array-form enabledPlugins into the merged object", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), { enabledPlugins: ["foo@official"] });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+      enabledPlugins: { "bar@acme": true },
+    });
+
+    const settings = load(scopes);
+    expect(settings.enabledPlugins).toEqual({ "foo@official": true, "bar@acme": true });
+  });
+
+  it("ignores a malformed boolean at a higher scope instead of resetting the lower scope's value", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), {
+      disableAllHooks: true,
+      disableSkillShellExecution: true,
+      includeCoAuthoredBy: false,
+      disableSubagents: true,
+    });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+      disableAllHooks: "definitely", // garbage — must NOT silently re-enable hooks
+      disableSkillShellExecution: { nested: true },
+      includeCoAuthoredBy: "maybe",
+      disableSubagents: "kinda",
+    });
+
+    const settings = load(scopes);
+    expect(settings.disableAllHooks).toBe(true);
+    expect(settings.disableSkillShellExecution).toBe(true);
+    expect(settings.includeCoAuthoredBy).toBe(false);
+    expect(settings.subagentsEnabled).toBe(false);
+    // Each malformed value is visible, not silent.
+    expect(
+      settings.diagnostics.filter((d) => d.message.includes("is not a boolean")),
+    ).toHaveLength(4);
+  });
+
   it("accumulates claudeMdExcludes across scopes", () => {
     const scopes = makeScopes();
     writeJson(path.join(scopes.userDir, "settings.json"), { claudeMdExcludes: ["**/vendor/CLAUDE.md"] });
@@ -161,6 +220,94 @@ describe("loadSettings — precedence & merging", () => {
 
     const settings = load(scopes);
     expect(settings.claudeMdExcludes).toEqual(["**/vendor/CLAUDE.md", "**/legacy/CLAUDE.md"]);
+  });
+});
+
+describe("loadSettings — nested/monorepo settings (plan §3)", () => {
+  it("loads .claude/settings.json from every dir between cwd and the repo root, nearest wins", () => {
+    const base = makeTmp();
+    const root = path.join(base, "repo");
+    const pkg = path.join(root, "packages", "app");
+    const userDir = path.join(base, "home", ".claude");
+    fs.mkdirSync(userDir, { recursive: true });
+    writeJson(path.join(root, ".claude", "settings.json"), {
+      model: "root-model",
+      permissions: { deny: ["Bash(rm *)"] },
+      hooks: { SessionStart: [{ hooks: [{ type: "command", command: "echo root" }] }] },
+    });
+    writeJson(path.join(pkg, ".claude", "settings.json"), {
+      model: "pkg-model",
+      permissions: { deny: ["Bash(curl *)"] },
+      hooks: { SessionStart: [{ hooks: [{ type: "command", command: "echo pkg" }] }] },
+    });
+
+    const settings = loadSettings({ cwd: pkg, projectRoot: root, userDir, managedPaths: [] });
+    // Nearest dir wins on scalars…
+    expect(settings.model).toBe("pkg-model");
+    // …while rules and hooks accumulate (root layer applied first).
+    expect(settings.permissions.deny).toEqual(["Bash(rm *)", "Bash(curl *)"]);
+    expect(settings.hooks.SessionStart).toHaveLength(2);
+    expect(settings.hooks.SessionStart?.[0]?.hooks[0]?.command).toBe("echo root");
+    expect(settings.hooks.SessionStart?.[1]?.hooks[0]?.command).toBe("echo pkg");
+  });
+
+  it("loads nested settings.local.json too, above the same dir's settings.json", () => {
+    const base = makeTmp();
+    const root = path.join(base, "repo");
+    const pkg = path.join(root, "packages", "app");
+    const userDir = path.join(base, "home", ".claude");
+    fs.mkdirSync(userDir, { recursive: true });
+    writeJson(path.join(root, ".claude", "settings.local.json"), { model: "root-local" });
+    writeJson(path.join(pkg, ".claude", "settings.json"), { model: "pkg-model" });
+    writeJson(path.join(pkg, ".claude", "settings.local.json"), { model: "pkg-local" });
+
+    const settings = loadSettings({ cwd: pkg, projectRoot: root, userDir, managedPaths: [] });
+    expect(settings.model).toBe("pkg-local");
+  });
+});
+
+describe("loadSettings — hostile keys (never-throw floor)", () => {
+  it('does not throw on a hooks block with a "__proto__" event key and does not pollute prototypes', () => {
+    const scopes = makeScopes();
+    // NOTE: raw JSON text — a JS object literal would interpret __proto__ itself.
+    writeText(
+      path.join(scopes.projectRoot, ".claude", "settings.json"),
+      `{
+        "hooks": {
+          "__proto__": [{ "hooks": [{ "type": "command", "command": "evil" }] }],
+          "toString": [{ "hooks": [{ "type": "command", "command": "evil2" }] }],
+          "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "ok" }] }]
+        }
+      }`,
+    );
+
+    const settings = load(scopes);
+    // The legitimate event still loads; the hostile ones degrade to diagnostics.
+    expect(settings.hooks.PreToolUse).toHaveLength(1);
+    expect(settings.diagnostics.filter((d) => d.message.includes("Unsafe key"))).toHaveLength(2);
+    expect(Object.prototype.toString).toBeTypeOf("function"); // untouched
+    expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
+  });
+
+  it('drops "__proto__" keys in env / skillOverrides / enabledPlugins with diagnostics', () => {
+    const scopes = makeScopes();
+    // NOTE: raw JSON text — a JS object literal would interpret __proto__ itself.
+    writeText(
+      path.join(scopes.projectRoot, ".claude", "settings.json"),
+      `{
+        "env": { "__proto__": { "polluted": "yes" }, "GOOD": "v" },
+        "skillOverrides": { "__proto__": "off", "deploy": "off" },
+        "enabledPlugins": { "__proto__": true, "foo@mp": true }
+      }`,
+    );
+
+    const settings = load(scopes);
+    expect(settings.env.GOOD).toBe("v");
+    expect(settings.skillOverrides).toEqual({ deploy: "off" });
+    expect(settings.enabledPlugins).toEqual({ "foo@mp": true });
+    expect(Object.getPrototypeOf(settings.env)).toBe(Object.prototype);
+    expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
+    expect(settings.diagnostics.filter((d) => d.message.includes("Unsafe key"))).toHaveLength(3);
   });
 });
 
@@ -184,6 +331,19 @@ describe("loadSettings — robustness (completeness floor)", () => {
     writeText(path.join(scopes.projectRoot, ".claude", "settings.json"), "[1, 2, 3]");
     const settings = load(scopes);
     expect(settings.diagnostics.some((d) => d.message.includes("not an object"))).toBe(true);
+  });
+
+  it("loads a UTF-8 BOM settings.json instead of skipping it (deny rules must survive)", () => {
+    const scopes = makeScopes();
+    writeText(
+      path.join(scopes.projectRoot, ".claude", "settings.json"),
+      "\uFEFF" + JSON.stringify({ model: "bom-model", permissions: { deny: ["Bash(rm *)"] } }),
+    );
+
+    const settings = load(scopes);
+    expect(settings.model).toBe("bom-model");
+    expect(settings.permissions.deny).toEqual(["Bash(rm *)"]);
+    expect(settings.diagnostics.filter((d) => d.severity === "error")).toEqual([]);
   });
 
   it("tolerates JSONC: // line comments and trailing commas", () => {
@@ -384,7 +544,7 @@ describe("locations — project root & artifact discovery", () => {
     // Rules only at root; commands nowhere.
     fs.mkdirSync(path.join(root, ".claude", "rules"), { recursive: true });
 
-    const dirs = discoverArtifactDirs({ cwd: pkg, projectRoot: root, userDir });
+    const dirs = discoverArtifactDirs({ cwd: pkg, projectRoot: root, userDir, managedDirs: [] });
 
     expect(dirs.skillDirs.map((d) => d.dir)).toEqual([
       path.join(pkg, ".claude", "skills"),
@@ -404,9 +564,41 @@ describe("locations — project root & artifact discovery", () => {
     fs.mkdirSync(root, { recursive: true });
     fs.mkdirSync(path.join(userDir, "commands"), { recursive: true });
 
-    const dirs = discoverArtifactDirs({ cwd: root, projectRoot: root, userDir });
+    const dirs = discoverArtifactDirs({ cwd: root, projectRoot: root, userDir, managedDirs: [] });
     expect(dirs.skillDirs).toEqual([]);
     expect(dirs.commandDirs).toEqual([{ dir: path.join(userDir, "commands"), scope: "user" }]);
+  });
+
+  it("discovers managed/policy artifact dirs first (highest precedence), degrade-safe when absent", () => {
+    const base = makeTmp();
+    const root = path.join(base, "repo");
+    const userDir = path.join(base, "home", ".claude");
+    const managedBase = path.join(base, "managed", "ClaudeCode");
+    fs.mkdirSync(path.join(root, ".claude", "skills"), { recursive: true });
+    fs.mkdirSync(path.join(managedBase, "skills"), { recursive: true });
+    fs.mkdirSync(path.join(managedBase, "agents"), { recursive: true });
+    fs.mkdirSync(userDir, { recursive: true });
+
+    const dirs = discoverArtifactDirs({
+      cwd: root,
+      projectRoot: root,
+      userDir,
+      managedDirs: [managedBase],
+    });
+    expect(dirs.skillDirs).toEqual([
+      { dir: path.join(managedBase, "skills"), scope: "managed" },
+      { dir: path.join(root, ".claude", "skills"), scope: "project" },
+    ]);
+    expect(dirs.agentDirs).toEqual([{ dir: path.join(managedBase, "agents"), scope: "managed" }]);
+
+    // Absent managed dir: nothing contributed, nothing thrown.
+    const absent = discoverArtifactDirs({
+      cwd: root,
+      projectRoot: root,
+      userDir,
+      managedDirs: [path.join(base, "does-not-exist")],
+    });
+    expect(absent.skillDirs).toEqual([{ dir: path.join(root, ".claude", "skills"), scope: "project" }]);
   });
 
   it("dedupeByName keeps the first occurrence per name (nearest/highest scope wins)", () => {

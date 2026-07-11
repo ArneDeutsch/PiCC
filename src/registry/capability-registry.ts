@@ -42,7 +42,7 @@ const TOOL_ENTRIES: CapabilityEntry[] = [
   cap("tool", "tool.Write", "full", "real implementation — file creation/overwrite"),
   cap("tool", "tool.Edit", "full", "real implementation — exact-string replacement edits"),
   cap("tool", "tool.Bash", "full", "real implementation (from Pi) — shell execution, bash + PowerShell aware"),
-  cap("tool", "tool.Grep", "full", "real implementation — content search"),
+  cap("tool", "tool.Grep", "full", "real implementation — Claude-baseline parameter surface (-n, -A/-B/-C/context, -i, -o, type, glob, multiline, content/files_with_matches/count modes, head_limit/offset) with ripgrep/JS engine parity (§4.8)"),
   cap("tool", "tool.Glob", "full", "real implementation — file pattern matching"),
   cap("tool", "tool.WebFetch", "full", "implemented for real — research skills and permission allowlists depend on it (§4.8)"),
   cap("tool", "tool.WebSearch", "full", "implemented for real — research skills and permission allowlists depend on it (§4.8)"),
@@ -56,12 +56,25 @@ const TOOL_ENTRIES: CapabilityEntry[] = [
   cap("tool", "tool.TaskList", "full", "current task-tracking surface (§4.8)"),
   cap("tool", "tool.TaskGet", "full", "current task-tracking surface (§4.8)"),
   cap("tool", "tool.TodoWrite", "partial", "deprecated todo tool — mapped onto the Task* equivalents, not a native implementation (§4.8)"),
-  cap("tool", "tool.NotebookEdit", "degraded-noop", "not implemented — name resolves for gating and degrades with a notice (§4.8)"),
-  cap("tool", "tool.LSP", "degraded-noop", "LSP tooling out of scope — name resolves for gating, degrades with a notice (§7)"),
-  cap("tool", "tool.computer-use", "degraded-noop", "computer use out of scope — name resolves for gating, degrades with a notice (§7)"),
-  cap("tool", "tool.Artifact", "degraded-noop", "Artifacts out of scope — name resolves for gating, degrades with a notice (§7)"),
-  cap("tool", "tool.AskUserQuestion", "degraded-noop", "not provided — explicitly unwanted; human interaction happens in plain chat (§7)"),
-  cap("tool", "tool.ExitPlanMode", "degraded-noop", "plan mode is a no-op — 'use plan mode' instructions are treated as guidance (§7)"),
+  // Degrade stubs — one entry per shipped DEGRADED_TOOLS stub (runtime/tools/
+  // degrade-stubs.ts). Each name is registered as a CALLABLE no-op that returns
+  // a notice, so gating/matching resolve and calls never wedge the session.
+  // test/registry.test.ts asserts this list and DEGRADED_TOOLS stay in sync.
+  cap("tool", "tool.NotebookEdit", "degraded-noop", "callable no-op stub — notebook editing not implemented; the notice directs editing the .ipynb as JSON via Read/Edit (§4.8, §7)"),
+  cap("tool", "tool.NotebookRead", "degraded-noop", "callable no-op stub — notebook reading not implemented; the notice directs Read on the .ipynb JSON (§4.8, §7)"),
+  cap("tool", "tool.AskUserQuestion", "degraded-noop", "callable no-op stub — deliberately not provided; the notice redirects questions to plain chat (§7)"),
+  cap("tool", "tool.ExitPlanMode", "degraded-noop", "callable no-op stub — plan mode is a no-op; 'use plan mode' instructions are treated as guidance (§7)"),
+  cap("tool", "tool.EnterPlanMode", "degraded-noop", "callable no-op stub — plan mode is a no-op; planning guidance is treated as ordinary instructions (§7)"),
+  cap("tool", "tool.Artifact", "degraded-noop", "callable no-op stub — Artifacts out of scope; the notice directs output to a regular file (§7)"),
+  cap("tool", "tool.computer", "degraded-noop", "callable no-op stub — computer use out of scope (§7)"),
+  cap("tool", "tool.LSP", "degraded-noop", "callable no-op stub — LSP tooling out of scope; the notice directs Grep/Read navigation (§7)"),
+  cap("tool", "tool.MultiEdit", "degraded-noop", "callable no-op stub — batch editing not implemented; the notice directs a sequence of Edit calls (§4.8)"),
+  cap("tool", "tool.BashOutput", "degraded-noop", "callable no-op stub — background shells not implemented; commands run in the foreground (§4.8)"),
+  cap("tool", "tool.KillShell", "degraded-noop", "callable no-op stub — background shells not implemented; there is no shell to kill (§4.8)"),
+  cap("tool", "tool.KillBash", "degraded-noop", "callable no-op stub — background shells not implemented; there is no shell to kill (§4.8)"),
+  cap("tool", "tool.SlashCommand", "degraded-noop", "callable no-op stub — the notice directs invoking the skill directly via the Skill tool (§4.8)"),
+  cap("tool", "tool.TaskOutput", "degraded-noop", "callable no-op stub — subagents run in the foreground and return their result directly (§4.8)"),
+  cap("tool", "tool.TaskStop", "degraded-noop", "callable no-op stub — no background tasks exist to stop (§4.8)"),
   cap("tool", MCP_TOOL_WILDCARD_ID, "degraded-noop", "MCP deferred — mcp__* names gate/match predictably, calls degrade with a notice (§7)", false),
 ];
 
@@ -70,16 +83,16 @@ const TOOL_ENTRIES: CapabilityEntry[] = [
 // ---------------------------------------------------------------------------
 
 const SUPPORTED_HOOK_EVENT_NOTES: Record<(typeof SUPPORTED_HOOK_EVENTS)[number], string> = {
-  PreToolUse: "fires before each tool call; full stdin/stdout contract incl. deny + updatedInput (§4.5)",
-  PostToolUse: "fires after successful tool calls; matcher + if: conditions honored (§4.5)",
+  PreToolUse: "fires before each tool call; anchored matcher + full stdin/stdout contract incl. deny + updatedInput (§4.5)",
+  PostToolUse: "fires after successful tool calls; matcher + if: conditions honored; exit-2 block feedback is fed back to the model (§4.5)",
   PostToolUseFailure: "fires after failed tool calls (§4.5)",
-  SessionStart: "fires at session start incl. source=compact re-entry; stdout injected (§4.5, §9)",
+  SessionStart: "fires at session start; anchored matcher matches the source (startup|resume|clear|compact); stdout injected (§4.5, §9)",
   SessionEnd: "fires at session end (§4.5)",
   UserPromptSubmit: "fires on user prompt; stdout injected as context (§4.5)",
   Stop: "fires when the main agent wants to stop; exit 2 blocks stopping (§4.5)",
-  SubagentStart: "fires when a subagent is spawned (§4.5)",
-  SubagentStop: "fires when a subagent wants to stop; exit 2 blocks (§4.5)",
-  PreCompact: "fires before compaction; wired to instruction preservation (§9)",
+  SubagentStart: "fires when a subagent is spawned; a blocking outcome cancels the dispatch (§4.5)",
+  SubagentStop: "fires when a subagent wants to stop; exit 2 blocks and re-prompts the subagent (bounded) (§4.5)",
+  PreCompact: "fires before compaction; anchored matcher matches the trigger (manual|auto); wired to instruction preservation (§9)",
   PostCompact: "fires after compaction; wired to re-injection (§9)",
   WorktreeCreate: "fires on worktree creation — worktree seeding pattern supported (§4.4)",
   WorktreeRemove: "fires on worktree removal (§4.4)",
@@ -104,25 +117,28 @@ const SETTING_ENTRIES: CapabilityEntry[] = [
   // Honored toggles (§5) — full.
   cap("setting", "setting.hooks", "full", "hook config dispatched per §4.5 (command handlers full)"),
   cap("setting", "setting.env", "full", "injected into sessions and hook/skill subprocesses (§5)"),
-  cap("setting", "setting.model", "full", "honored as the default model-selection input (§5, §10)"),
-  cap("setting", "setting.includeCoAuthoredBy", "full", "honored in git commit attribution (§5)"),
-  cap("setting", "setting.attribution", "full", "honored in git commit/PR attribution (§5)"),
   cap("setting", "setting.disableAllHooks", "full", "disables all hook dispatch (§4.5)"),
   cap("setting", "setting.disableSkillShellExecution", "full", "disables !`cmd` skill shell injection (§4.1)"),
   cap("setting", "setting.skillListingBudgetFraction", "full", "caps the startup skill-listing token budget (§4.1, §12.1)"),
   cap("setting", "setting.skillListingMaxDescChars", "full", "caps per-skill description length in the startup listing (§4.1)"),
-  cap("setting", "setting.skillOverrides", "full", "per-skill overrides applied at load (§5)"),
+  cap("setting", "setting.skillOverrides", "full", "per-skill overrides applied at load: off / user-invocable-only / name-only (§5)"),
   cap("setting", "setting.claudeMdExcludes", "full", "excludes CLAUDE.md/rules files from loading (§4.2, §4.6)"),
   cap("setting", "setting.worktree.baseRef", "full", "head|fresh base resolved to a concrete commit before worktree creation (§4.4)"),
-  cap("setting", "setting.cleanupPeriodDays", "full", "honored for worktree/orphan reaping cadence (§4.4)"),
-  cap("setting", "setting.apiKeyHelper", "full", "honored for auth resolution (§5)"),
+  cap("setting", "setting.cleanupPeriodDays", "full", "max-age (days) for orphaned-worktree reaping at startup (§4.4)"),
   cap("setting", "setting.subagentsEnabled", "full", "gates subagent dispatch (§4.3)"),
   cap("setting", "setting.subagentMaxDepth", "full", "caps nested subagent recursion depth (§4.3)"),
   cap("setting", "setting.subagentConcurrency", "full", "caps parallel subagent fan-out (§4.3, §12.2)"),
-  cap("setting", "setting.enabledPlugins", "full", "selects installed-plugin content to load (§4.9)"),
+  cap("setting", "setting.enabledPlugins", "full", "selects installed-plugin content to load; merges key-wise across scopes, nearer scope wins per plugin (§4.9)"),
+  // Parsed but consumed by nothing yet — honest no-ops, surfaced by the compat
+  // report when a project declares them (§5: a toggle that silently doesn't
+  // take effect is a correctness bug).
+  cap("setting", "setting.model", "degraded-noop", "parsed, not consumed — session model selection uses PiCC config (model/effort), not Claude model names; reported when set (§5, §10)"),
+  cap("setting", "setting.includeCoAuthoredBy", "degraded-noop", "parsed, not consumed — PiCC has no commit-attribution machinery either way; reported when set (§5, §7)"),
+  cap("setting", "setting.attribution", "degraded-noop", "parsed, not consumed — no commit/PR attribution machinery; reported when set (§5, §7)"),
+  cap("setting", "setting.apiKeyHelper", "degraded-noop", "parsed, never invoked — auth comes from the harness subscription/provider flow; reported when set (§5, §7)"),
   // Permissions (§6.1 posture).
   cap("setting", "setting.permissions.deny", "full", "hard, non-interactive block — the kept deterministic safety valve (§6.1)"),
-  cap("setting", "setting.permissions.additionalDirectories", "full", "extra directories permitted for file access (§5)"),
+  cap("setting", "setting.permissions.additionalDirectories", "degraded-noop", "parsed, no-op — the default-permissive posture applies no directory sandbox, so extra grants are moot; reported when set (§6.1)"),
   cap("setting", "setting.permissions.allow", "partial", "parsed and matched, but moot under the default-permissive posture — nothing waits on an allow (§6.1)"),
   cap("setting", "setting.permissions.ask", "degraded-noop", "ask rules will NOT prompt — default-permissive posture runs them without asking (§6.1)", true),
   cap("setting", "setting.permissions.defaultMode", "degraded-noop", "permission modes/auto-mode are a no-op — sessions run default-permissive regardless (§6.1)", true),
@@ -142,7 +158,7 @@ const SETTING_ENTRIES: CapabilityEntry[] = [
 // Frontmatter fields (§4.1 skills, §4.3 agents, §4.2 rules)
 // ---------------------------------------------------------------------------
 
-const SKILL_FRONTMATTER_NOTES: Record<string, string> = {
+const SKILL_FRONTMATTER_FULL_NOTES: Record<string, string> = {
   name: "skill identity; nearest-scope wins on clashes (§3, §4.1)",
   description: "enters the startup listing; drives model invocation (§4.1)",
   when_to_use: "appended to the routing/listing surface (§4.1)",
@@ -150,14 +166,11 @@ const SKILL_FRONTMATTER_NOTES: Record<string, string> = {
   "disable-model-invocation": "hides the skill from model-invocation listing (§4.1)",
   "argument-hint": "shown for slash-command argument entry (§4.1)",
   arguments: "named argument specs with required/default handling (§4.1)",
-  "allowed-tools": "tool allowlist enforced during skill execution (§4.1)",
-  "disallowed-tools": "tool denylist enforced during skill execution (§4.1)",
-  model: "per-skill model override honored (§4.1)",
-  effort: "per-skill effort override honored (§4.1, §10)",
+  "disallowed-tools": "denylist enforced — resident-skill denials feed the session deny guard; context:fork dispatch receives them as subagent gating (§4.1, §6.1)",
   context: "context: fork runs the skill as a fresh-context subagent (§4.1)",
   agent: "names the agent context used with context: fork (§4.1)",
   hooks: "skill-scoped hook config dispatched while the skill is active (§4.1, §4.5)",
-  paths: "path globs scoping when the skill's listing/injection applies (§4.1)",
+  paths: "path-scoped skills are surfaced (once) when a matching file is accessed; activation stays explicit via the Skill tool (§4.1, §4.2)",
   shell: "bash (default) | powershell for !`cmd` injection (§4.1, §12.3)",
   metadata: "metadata.* preserved and exposed (§4.1)",
 };
@@ -169,22 +182,27 @@ const AGENT_FRONTMATTER_FULL_NOTES: Record<string, string> = {
   disallowedTools: "tool denylist enforced for the subagent (§4.3)",
   model: "per-agent model override honored (§4.3)",
   effort: "per-agent effort override honored (§4.3, §10)",
-  permissionMode: "parsed and applied within the §6.1 posture (deny + tools gating remain the controls)",
-  maxTurns: "turn cap enforced for the subagent (§4.3)",
   skills: "listed skills preloaded into the agent's context (§4.3)",
-  color: "honored in console rendering where Pi's TUI allows (§4.3, §11)",
   isolation: "isolation: worktree pins the subagent to its own worktree (§4.3, §4.4)",
   initialPrompt: "injected as the subagent's first user message (§4.3)",
   metadata: "metadata.* preserved and exposed (§4.3)",
 };
 
 const FRONTMATTER_ENTRIES: CapabilityEntry[] = [
-  ...Object.entries(SKILL_FRONTMATTER_NOTES).map(([key, note]) =>
+  ...Object.entries(SKILL_FRONTMATTER_FULL_NOTES).map(([key, note]) =>
     cap("frontmatter", `skill.frontmatter.${key}`, "full", note),
   ),
+  // Skill fields honored with a boundary (§4.1): full for context:fork dispatch,
+  // constrained for in-session (resident) activation.
+  cap("frontmatter", "skill.frontmatter.allowed-tools", "partial", "gates tools for context:fork dispatch; trivially satisfied for in-session activation under the default-permissive posture (§4.1, §6.1)", true),
+  cap("frontmatter", "skill.frontmatter.model", "partial", "honored for context:fork dispatch; in-session activation cannot switch the parent session's model (§4.1, §10)"),
+  cap("frontmatter", "skill.frontmatter.effort", "partial", "honored for context:fork dispatch and ${CLAUDE_EFFORT} substitution; does not change the parent session's reasoning effort (§4.1, §10)"),
   ...Object.entries(AGENT_FRONTMATTER_FULL_NOTES).map(([key, note]) =>
     cap("frontmatter", `agent.frontmatter.${key}`, "full", note),
   ),
+  cap("frontmatter", "agent.frontmatter.maxTurns", "partial", "best-effort cap — tool calls past the cap are blocked with an instruction to answer; the model still produces its final message (§4.3)"),
+  cap("frontmatter", "agent.frontmatter.permissionMode", "degraded-noop", "parsed, no-op — subagents run the default-permissive posture regardless; deny rules + tools: gating remain the controls; reported when set (§6.1)", true),
+  cap("frontmatter", "agent.frontmatter.color", "degraded-noop", "parsed only — cosmetic; Pi's TUI does not render agent colors (§4.3, §11)"),
   cap("frontmatter", "agent.frontmatter.memory", "degraded-noop", "parsed; no-op storage — auto-memory deferred (§7)"),
   cap("frontmatter", "agent.frontmatter.mcpServers", "degraded-noop", "parsed; MCP deferred — no servers started for the agent (§7)"),
   cap("frontmatter", "agent.frontmatter.hooks", "degraded-noop", "parsed; agent-scoped hooks are not dispatched in v1"),

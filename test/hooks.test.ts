@@ -172,6 +172,135 @@ describe("HookRunner selection", () => {
     expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toHaveLength(2);
   });
 
+  it("full-matches the matcher against tool_name — no superstring matches", async () => {
+    const dir = makeTempDir();
+    const marker = path.join(dir, "marker.txt");
+    const { runner } = makeRunner(
+      { PreToolUse: [{ matcher: "Task", hooks: [`echo fired >> "$MARKER"`] }] },
+      { projectDir: dir, env: { MARKER: bashPath(marker) } },
+    );
+
+    // Claude semantics: "Task" matches ONLY the Task tool, not TaskCreate etc.
+    await runner.fire("PreToolUse", { tool_name: "TaskCreate", tool_input: {} });
+    await runner.fire("PreToolUse", { tool_name: "TaskUpdate", tool_input: {} });
+    await runner.fire("PreToolUse", { tool_name: "TaskList", tool_input: {} });
+    expect(fs.existsSync(marker)).toBe(false);
+
+    await runner.fire("PreToolUse", { tool_name: "Task", tool_input: {} });
+    expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toHaveLength(1);
+  });
+
+  it("full-matches each alternation branch (Edit|Write does not fire for NotebookEdit)", async () => {
+    const dir = makeTempDir();
+    const marker = path.join(dir, "marker.txt");
+    const { runner } = makeRunner(
+      { PreToolUse: [{ matcher: "Edit|Write", hooks: [`echo fired >> "$MARKER"`] }] },
+      { projectDir: dir, env: { MARKER: bashPath(marker) } },
+    );
+    await runner.fire("PreToolUse", { tool_name: "NotebookEdit", tool_input: {} });
+    await runner.fire("PreToolUse", { tool_name: "WriteFile", tool_input: {} });
+    expect(fs.existsSync(marker)).toBe(false);
+    await runner.fire("PreToolUse", { tool_name: "Edit", tool_input: {} });
+    expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toHaveLength(1);
+  });
+
+  it("degrades an invalid matcher regex to a skipped entry with a warning (never throws)", async () => {
+    const dir = makeTempDir();
+    const marker = path.join(dir, "marker.txt");
+    const { runner } = makeRunner(
+      { PreToolUse: [{ matcher: "(unclosed", hooks: [`echo fired >> "$MARKER"`] }] },
+      { projectDir: dir, env: { MARKER: bashPath(marker) } },
+    );
+    const outcome = await runner.fire("PreToolUse", { tool_name: "Bash", tool_input: {} });
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(outcome.block).toBe(false);
+    expect(
+      outcome.diagnostics.some((d) => d.severity === "warning" && /not a valid regex/.test(d.message)),
+    ).toBe(true);
+  });
+
+  it("matches SessionStart entries against the payload source", async () => {
+    const dir = makeTempDir();
+    const marker = path.join(dir, "marker.txt");
+    const { runner } = makeRunner(
+      {
+        SessionStart: [
+          { matcher: "startup", hooks: [`echo startup-only >> "$MARKER"`] },
+          { matcher: "startup|resume", hooks: [`echo either >> "$MARKER"`] },
+        ],
+      },
+      { projectDir: dir, env: { MARKER: bashPath(marker) } },
+    );
+
+    await runner.fire("SessionStart", { source: "resume" });
+    expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toEqual(["either"]);
+
+    await runner.fire("SessionStart", { source: "startup" });
+    expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toEqual([
+      "either",
+      "startup-only",
+      "either",
+    ]);
+  });
+
+  it("matches PreCompact entries against trigger, accepting reason as fallback key", async () => {
+    const dir = makeTempDir();
+    const marker = path.join(dir, "marker.txt");
+    const { runner } = makeRunner(
+      { PreCompact: [{ matcher: "manual", hooks: [`echo fired >> "$MARKER"`] }] },
+      { projectDir: dir, env: { MARKER: bashPath(marker) } },
+    );
+
+    await runner.fire("PreCompact", { trigger: "auto" });
+    await runner.fire("PreCompact", { reason: "auto" });
+    expect(fs.existsSync(marker)).toBe(false);
+
+    await runner.fire("PreCompact", { trigger: "manual" });
+    // PiCC's extension fires PreCompact with `reason` — the fallback key.
+    await runner.fire("PreCompact", { reason: "manual" });
+    expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toHaveLength(2);
+  });
+
+  it("matches SubagentStop entries against the agent type, exactly", async () => {
+    const dir = makeTempDir();
+    const marker = path.join(dir, "marker.txt");
+    const { runner } = makeRunner(
+      { SubagentStop: [{ matcher: "db-agent", hooks: [`echo fired >> "$MARKER"`] }] },
+      { projectDir: dir, env: { MARKER: bashPath(marker) } },
+    );
+    await runner.fire("SubagentStop", { subagent_type: "db-agent-writer" });
+    expect(fs.existsSync(marker)).toBe(false);
+    await runner.fire("SubagentStop", { subagent_type: "db-agent" });
+    expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toHaveLength(1);
+  });
+
+  it("ignores matcher on events without a documented matcher subject (Stop)", async () => {
+    const dir = makeTempDir();
+    const marker = path.join(dir, "marker.txt");
+    const { runner } = makeRunner(
+      { Stop: [{ matcher: "whatever", hooks: [`echo fired >> "$MARKER"`] }] },
+      { projectDir: dir, env: { MARKER: bashPath(marker) } },
+    );
+    await runner.fire("Stop", {});
+    expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toHaveLength(1);
+  });
+
+  it("does not match when the event's matcher subject is missing from the payload", async () => {
+    const dir = makeTempDir();
+    const marker = path.join(dir, "marker.txt");
+    const { runner } = makeRunner(
+      {
+        SessionStart: [
+          { matcher: "startup", hooks: [`echo specific >> "$MARKER"`] },
+          { matcher: ".*", hooks: [`echo wildcard >> "$MARKER"`] },
+        ],
+      },
+      { projectDir: dir, env: { MARKER: bashPath(marker) } },
+    );
+    await runner.fire("SessionStart", {}); // no `source`
+    expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toEqual(["wildcard"]);
+  });
+
   it('matches all tools for ".*", "*", and no matcher', async () => {
     const dir = makeTempDir();
     const marker = path.join(dir, "marker.txt");
@@ -423,6 +552,45 @@ describe("HookRunner placeholders and environment", () => {
     });
     const outcome = await runner.fire("UserPromptSubmit", {});
     expect(outcome.stdout).toBe("hello world");
+  });
+
+  it("expands ${CLAUDE_PROJECT_DIR} in args (quoting blocks runtime env expansion)", async () => {
+    // Args are single-quoted for bash, so only a pre-spawn textual expansion
+    // can produce the real path here.
+    const { runner, projectDir } = makeRunner({
+      UserPromptSubmit: [
+        {
+          hooks: [
+            { type: "command", command: `printf '%s'`, args: ["${CLAUDE_PROJECT_DIR}/src"] },
+          ],
+        },
+      ],
+    });
+    const outcome = await runner.fire("UserPromptSubmit", {});
+    expect(outcome.stdout).toBe(`${projectDir}/src`);
+  });
+
+  it("expands ${CLAUDE_PLUGIN_ROOT} in args for plugin-contributed handlers", async () => {
+    const pluginRoot = makeTempDir();
+    const { runner } = makeRunner(
+      {
+        UserPromptSubmit: [
+          {
+            hooks: [
+              {
+                type: "command",
+                command: `printf '%s'`,
+                args: ["${CLAUDE_PLUGIN_ROOT}/bin"],
+                __pluginName: "my-plugin",
+              },
+            ],
+          },
+        ],
+      },
+      { pluginRoots: { "my-plugin": pluginRoot } },
+    );
+    const outcome = await runner.fire("UserPromptSubmit", {});
+    expect(outcome.stdout).toBe(`${pluginRoot}/bin`);
   });
 
   it.runIf(process.platform === "win32")("runs powershell hooks when shell is powershell", async () => {

@@ -91,12 +91,30 @@ Body without description.
 `,
   );
 
+  // String-form lists (Claude Code convention: comma-separated single string);
+  // commas inside () / {} must NOT split.
+  write(
+    ".claude/skills/list-forms/SKILL.md",
+    `---
+name: list-forms
+description: Exercises string-form tool and path lists
+allowed-tools: Bash(git add:*), Bash(echo a,b), mcp__srv__tool
+disallowed-tools: Write, Edit
+paths: "src/**/*.{ts,tsx}, test/**"
+model: sonnet
+effort: low
+---
+Body.
+`,
+  );
+
   // Legacy commands.
   write(
     ".claude/commands/deploy.md",
     `---
 description: Deploy the app
 argument-hint: "[env]"
+allowed-tools: Bash(npm run deploy:*), Read
 ---
 Deploy to $ARGUMENTS now.
 `,
@@ -166,6 +184,17 @@ describe("loadSkills", () => {
     expect(s.source.scope).toBe("project");
   });
 
+  it("parses string-form tool/path lists (comma-separated) without splitting inside () or {}", () => {
+    const { skills } = load();
+    const s = skills.find((x) => x.name === "list-forms")!;
+    expect(s).toBeDefined();
+    expect(s.allowedTools).toEqual(["Bash(git add:*)", "Bash(echo a,b)", "mcp__srv__tool"]);
+    expect(s.disallowedTools).toEqual(["Write", "Edit"]);
+    expect(s.paths).toEqual(["src/**/*.{ts,tsx}", "test/**"]);
+    expect(s.model).toBe("sonnet");
+    expect(s.effort).toBe("low");
+  });
+
   it("discovers nested skills recursively and applies defaults", () => {
     const { skills } = load();
     const s = skills.find((x) => x.name === "nested-skill")!;
@@ -212,6 +241,7 @@ describe("loadSkills", () => {
     expect(deploy.userInvocable).toBe(true);
     expect(deploy.description).toBe("Deploy the app");
     expect(deploy.argumentHint).toBe("[env]");
+    expect(deploy.allowedTools).toEqual(["Bash(npm run deploy:*)", "Read"]);
     expect(deploy.baseDir).toBe(commandsDir);
     expect(deploy.body).toBeUndefined();
     expect(loadSkillBody(deploy)).toContain("Deploy to $ARGUMENTS now.");
@@ -400,14 +430,6 @@ describe("substituteVariables", () => {
 // shell injection
 // ---------------------------------------------------------------------------
 
-function shellEnv(): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (typeof v === "string") env[k] = v;
-  }
-  return env;
-}
-
 function binAvailable(bin: string, args: string[]): boolean {
   try {
     execFileSync(bin, args, { stdio: "ignore", timeout: 20_000, windowsHide: true });
@@ -425,7 +447,11 @@ const hasPowershell = binAvailable(resolveShellBinary("powershell"), [
 ]);
 
 describe("preprocessShellInjection", () => {
-  const baseOpts = { cwd: process.cwd(), env: shellEnv(), disabled: false } as const;
+  // env is only the Claude-specific OVERLAY — the spawned shell must inherit
+  // process.env (PATH, HOME, SystemRoot, …) on its own. Passing a full env here
+  // would mask a missing inheritance merge (regression: skill subprocesses ran
+  // without PATH when settings.env was empty).
+  const baseOpts = { cwd: process.cwd(), env: {}, disabled: false } as const;
 
   it.runIf(hasBash)("replaces inline !`cmd` with stdout (bash)", async () => {
     const { text, diagnostics } = await preprocessShellInjection(
@@ -496,5 +522,116 @@ describe("preprocessShellInjection", () => {
       shell: "bash",
     });
     expect(text).toBe("See `docs` then after-span");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// env inheritance: commands see process.env with the overlay layered on top
+// ---------------------------------------------------------------------------
+
+describe("shell injection env inheritance", () => {
+  const baseOpts = { cwd: process.cwd(), disabled: false } as const;
+
+  it.runIf(hasBash)("inherits process.env vars absent from the overlay (bash)", async () => {
+    process.env.PICC_TEST_INHERIT = "inherited-ok";
+    try {
+      const { text, diagnostics } = await preprocessShellInjection(
+        'V: !`echo "$PICC_TEST_INHERIT"`',
+        { ...baseOpts, env: {}, shell: "bash" },
+      );
+      expect(diagnostics).toHaveLength(0);
+      expect(text).toBe("V: inherited-ok");
+    } finally {
+      delete process.env.PICC_TEST_INHERIT;
+    }
+  });
+
+  it.runIf(hasBash)("overlay vars win over inherited process.env", async () => {
+    process.env.PICC_TEST_LAYER = "from-process";
+    try {
+      const { text } = await preprocessShellInjection('V: !`echo "$PICC_TEST_LAYER"`', {
+        ...baseOpts,
+        env: { PICC_TEST_LAYER: "from-overlay" },
+        shell: "bash",
+      });
+      expect(text).toBe("V: from-overlay");
+    } finally {
+      delete process.env.PICC_TEST_LAYER;
+    }
+  });
+
+  it.runIf(hasPowershell)("inherits process.env vars under powershell too", async () => {
+    process.env.PICC_TEST_INHERIT_PS = "ps-inherited";
+    try {
+      const { text } = await preprocessShellInjection(
+        "V: !`Write-Output $env:PICC_TEST_INHERIT_PS`",
+        { ...baseOpts, env: {}, shell: "powershell" },
+      );
+      expect(text).toBe("V: ps-inherited");
+    } finally {
+      delete process.env.PICC_TEST_INHERIT_PS;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveShellBinary: powershell → pwsh first, Windows PowerShell fallback
+// ---------------------------------------------------------------------------
+
+describe("resolveShellBinary: powershell", () => {
+  const pwshName = process.platform === "win32" ? "pwsh.exe" : "pwsh";
+  let binRoot: string;
+
+  beforeAll(() => {
+    binRoot = fs.mkdtempSync(path.join(os.tmpdir(), "picc-psbin-"));
+  });
+  afterAll(() => {
+    fs.rmSync(binRoot, { recursive: true, force: true });
+  });
+
+  /** Fresh dir with the given (empty) marker binaries, plus env pinning all probe roots to it. */
+  function fakeInstall(name: string, files: string[]): { dir: string; env: Record<string, string> } {
+    const dir = path.join(binRoot, name);
+    fs.mkdirSync(dir, { recursive: true });
+    for (const f of files) fs.writeFileSync(path.join(dir, f), "");
+    const nowhere = path.join(binRoot, name + "-nowhere");
+    return {
+      dir,
+      env: { PATH: dir, ProgramFiles: nowhere, "ProgramFiles(x86)": nowhere, SystemRoot: nowhere },
+    };
+  }
+
+  it("prefers pwsh (PowerShell Core) from PATH", () => {
+    const { dir, env } = fakeInstall("both", [pwshName, "powershell.exe"]);
+    expect(resolveShellBinary("powershell", env)).toBe(path.join(dir, pwshName));
+  });
+
+  it.runIf(process.platform === "win32")(
+    "falls back to powershell.exe on Windows when pwsh is absent",
+    () => {
+      const { dir, env } = fakeInstall("winps-only", ["powershell.exe"]);
+      expect(resolveShellBinary("powershell", env)).toBe(path.join(dir, "powershell.exe"));
+    },
+  );
+
+  it("degrades to a bare name when no PowerShell exists (never throws)", () => {
+    const { env } = fakeInstall("none", []);
+    expect(resolveShellBinary("powershell", env)).toBe(
+      process.platform === "win32" ? "powershell" : "pwsh",
+    );
+  });
+
+  it("degrades a missing PowerShell to a clear note + diagnostic", async () => {
+    const { env } = fakeInstall("none-run", []);
+    const { text, diagnostics } = await preprocessShellInjection("PS: !`Write-Output x`", {
+      cwd: process.cwd(),
+      env,
+      disabled: false,
+      shell: "powershell",
+    });
+    expect(text).toContain("[command failed");
+    expect(text).toContain("PowerShell not found");
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.severity).toBe("warning");
   });
 });

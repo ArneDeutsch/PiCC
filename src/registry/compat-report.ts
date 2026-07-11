@@ -16,6 +16,7 @@ import type {
   HookConfig,
 } from "../types.js";
 import { SUPPORTED_HOOK_EVENTS } from "../types.js";
+import { loadPluginHooks, type InstalledPlugin } from "../claude/plugins.js";
 import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 import {
   CAPABILITY_REGISTRY,
@@ -110,9 +111,41 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
       addFinding(cap, `${settings.permissions.allow.length} permissions.allow rule(s) declared`);
     }
   }
+  if (settings.permissions.additionalDirectories.length > 0) {
+    const cap = lookupCapability("setting.permissions.additionalDirectories");
+    if (cap) {
+      addFinding(
+        cap,
+        `${settings.permissions.additionalDirectories.length} permissions.additionalDirectories entry(ies) declared`,
+      );
+    }
+  }
+
+  // --- Settings parsed into typed fields but consumed by nothing (§5) ------
+  // These never reach deferredKeys (they parse into ClaudeSettings), so they
+  // need direct checks to appear in the report instead of silently vanishing.
+  if (settings.model !== undefined) {
+    const cap = lookupCapability("setting.model");
+    if (cap) addFinding(cap, `model = "${settings.model}"`);
+  }
+  if (settings.includeCoAuthoredBy !== undefined) {
+    const cap = lookupCapability("setting.includeCoAuthoredBy");
+    if (cap) addFinding(cap, `includeCoAuthoredBy = ${settings.includeCoAuthoredBy}`);
+  }
+  if (settings.attribution !== undefined) {
+    const cap = lookupCapability("setting.attribution");
+    if (cap) addFinding(cap, "attribution configured");
+  }
+  if (settings.apiKeyHelper !== undefined) {
+    const cap = lookupCapability("setting.apiKeyHelper");
+    if (cap) addFinding(cap, `apiKeyHelper = "${settings.apiKeyHelper}"`);
+  }
 
   // --- Settings keys ------------------------------------------------------
   for (const { key, scope } of settings.deferredKeys) {
+    // permissions.defaultMode has a dedicated check above with better evidence;
+    // reporting the deferredKeys entry too would double-report one divergence.
+    if (key === "permissions.defaultMode") continue;
     addFinding(deferredSettingCapability(key), `settings key "${key}" (${scope} scope)`);
   }
   for (const { key, scope } of settings.unknownKeys) {
@@ -120,22 +153,37 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   }
 
   // --- Hook configs (settings + skill-scoped) -----------------------------
+  // Skill hooks arrive as RAW frontmatter (parseHookConfig normalizes them only at
+  // activation), so every shape here is project-controlled input: a single matcher
+  // object instead of an array, missing `hooks`, missing handler `type` (defaults
+  // to "command"). Scanning must never throw (§2.2 floor).
   const scanHooks = (config: HookConfig | undefined, where: string) => {
-    if (!config) return;
-    for (const [event, matchers] of Object.entries(config)) {
+    if (!config || typeof config !== "object") return;
+    for (const [event, rawMatchers] of Object.entries(config)) {
       if (!SUPPORTED_EVENT_SET.has(event)) {
         const cap = degradedHookEventCapability(event);
         if (cap) addFinding(cap, `hook event "${event}" configured in ${where}`);
         else unassessed.push(`hook event "${event}" (${where})`);
       }
-      for (const matcher of matchers ?? []) {
-        for (const handler of matcher.hooks ?? []) {
-          if (handler.type === "command") continue;
-          const cap = lookupCapability(`feature.hook-handler.${handler.type}`);
+      const matchers: unknown[] = Array.isArray(rawMatchers)
+        ? rawMatchers
+        : rawMatchers && typeof rawMatchers === "object"
+          ? [rawMatchers]
+          : [];
+      for (const matcher of matchers) {
+        if (!matcher || typeof matcher !== "object") continue;
+        const handlers = Array.isArray((matcher as { hooks?: unknown }).hooks)
+          ? ((matcher as { hooks: unknown[] }).hooks)
+          : [];
+        for (const handler of handlers) {
+          if (!handler || typeof handler !== "object") continue;
+          const type = (handler as { type?: string }).type ?? "command";
+          if (type === "command") continue;
+          const cap = lookupCapability(`feature.hook-handler.${type}`);
           if (cap) {
-            addFinding(cap, `hook handler type "${handler.type}" on "${event}" in ${where}`);
+            addFinding(cap, `hook handler type "${type}" on "${event}" in ${where}`);
           } else {
-            unassessed.push(`hook handler type "${handler.type}" on "${event}" (${where})`);
+            unassessed.push(`hook handler type "${type}" on "${event}" (${where})`);
           }
         }
       }
@@ -145,6 +193,39 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   for (const skill of project.skills) {
     scanHooks(skill.hooks, `skill "${skill.name}"`);
   }
+  // Installed-plugin hook configs (folded into mergedHooks at load) must be
+  // scanned too — a plugin declaring a Notification event or a prompt/agent
+  // handler degrades exactly like the same config in settings.json. Plugins are
+  // only present on the assembled LoadedProject; scan defensively when given.
+  const plugins = (project as { plugins?: unknown }).plugins;
+  if (Array.isArray(plugins)) {
+    for (const plugin of plugins) {
+      if (!plugin || typeof plugin !== "object") continue;
+      const p = plugin as InstalledPlugin;
+      if (!Array.isArray(p.hooksFiles) || p.hooksFiles.length === 0) continue;
+      const raw = loadPluginHooks(p);
+      scanHooks(raw.config as HookConfig, `plugin "${p.name}"`);
+    }
+  }
+
+  // Tool lists (`tools:` on agents, `allowed-tools:` on skills): flag degraded/
+  // not-supported names, route unknown names to unassessed.
+  const scanToolList = (list: string[] | undefined, where: string, field: string) => {
+    for (const rawTool of list ?? []) {
+      if (rawTool === "*") continue;
+      // `Bash(git *)` gates the Bash tool — assess the tool, not the specifier.
+      const tool = rawTool.replace(/\(.*$/s, "").trim();
+      if (!tool) continue;
+      const known =
+        lookupCapability(`tool.${tool}`) ??
+        (tool.startsWith("mcp__") ? capabilityForToolName(tool) : undefined);
+      if (!known) {
+        unassessed.push(`tool "${tool}" (${where} ${field})`);
+      } else if (known.tier === "degraded-noop" || known.tier === "not-supported") {
+        addFinding(known, `${where} lists tool "${tool}" in ${field}`);
+      }
+    }
+  };
 
   // --- Agents --------------------------------------------------------------
   for (const agent of project.agents) {
@@ -160,24 +241,26 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
       const cap = lookupCapability("agent.frontmatter.hooks");
       if (cap) addFinding(cap, `agent "${agent.name}" sets hooks:`);
     }
-    for (const tool of agent.tools ?? []) {
-      if (tool === "*") continue;
-      const known =
-        lookupCapability(`tool.${tool}`) ??
-        (tool.startsWith("mcp__") ? capabilityForToolName(tool) : undefined);
-      if (!known) {
-        unassessed.push(`tool "${tool}" (agent "${agent.name}" tools:)`);
-      } else if (known.tier === "degraded-noop" || known.tier === "not-supported") {
-        addFinding(known, `agent "${agent.name}" lists tool "${tool}" in tools:`);
+    if (agent.permissionMode !== undefined) {
+      // Safety-relevant no-op (§6.1/§6.2): an agent restricting its permission
+      // mode still runs default-permissive — never silently.
+      const cap = lookupCapability("agent.frontmatter.permissionMode");
+      if (cap) {
+        addFinding(cap, `agent "${agent.name}" sets permissionMode: "${agent.permissionMode}"`);
       }
     }
+    scanToolList(agent.tools, `agent "${agent.name}"`, "tools:");
     for (const key of agent.unknownKeys) {
       unassessed.push(`agent "${agent.name}" frontmatter key "${key}"`);
     }
   }
 
-  // --- Skills (unknown frontmatter) ---------------------------------------
+  // --- Skills (allowed-tools + unknown frontmatter) ------------------------
   for (const skill of project.skills) {
+    // A skill granting a degraded tool won't get real behavior from it — same
+    // check as agent tools:. (disallowed-tools denying a degraded tool is
+    // trivially satisfied and needs no finding.)
+    scanToolList(skill.allowedTools, `skill "${skill.name}"`, "allowed-tools:");
     for (const key of skill.unknownKeys) {
       unassessed.push(`skill "${skill.name}" frontmatter key "${key}"`);
     }

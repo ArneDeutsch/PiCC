@@ -42,6 +42,7 @@ export interface WorktreeExitResult {
   removed: boolean;
   orphaned: boolean;
   diagnostics: Diagnostic[];
+  error?: string;
 }
 
 export interface WorktreeListEntry {
@@ -114,16 +115,26 @@ function readBaseCommitFile(worktreeDir: string): string | undefined {
   return sha ? sha : undefined;
 }
 
+/** One compiled `.worktreeinclude` line: gitignore semantics, `!` un-matches earlier matches. */
+interface IncludeRule {
+  negated: boolean;
+  match: (rel: string) => boolean;
+}
+
 /** Compile one `.worktreeinclude` line (gitignore-flavoured) against project-relative paths. */
-function compileIncludePattern(raw: string): (rel: string) => boolean {
-  let pattern = raw.replace(/\\/g, "/");
+function compileIncludeLine(raw: string): IncludeRule {
+  let pattern = raw;
+  const negated = pattern.startsWith("!");
+  if (negated) pattern = pattern.slice(1);
+  pattern = pattern.replace(/\\/g, "/");
   if (pattern.startsWith("/")) pattern = pattern.slice(1);
   if (pattern.endsWith("/")) pattern += "**";
-  const opts = { dot: true, nocase: process.platform === "win32", windows: false };
+  // nonegate: picomatch must never invert a stray `!` into a match-everything pattern.
+  const opts = { dot: true, nocase: process.platform === "win32", windows: false, nonegate: true };
   const direct = picomatch(pattern, opts);
-  if (pattern.includes("/")) return (rel) => direct(rel);
+  if (pattern.includes("/")) return { negated, match: (rel) => direct(rel) };
   const deep = picomatch(`**/${pattern}`, opts);
-  return (rel) => direct(rel) || deep(rel);
+  return { negated, match: (rel) => direct(rel) || deep(rel) };
 }
 
 function parsePorcelain(stdout: string): WorktreeListEntry[] {
@@ -153,13 +164,21 @@ function parsePorcelain(stdout: string): WorktreeListEntry[] {
 export class WorktreeManager {
   private readonly projectRoot: string;
   private readonly settings: WorktreeSettings;
+  /** Claude settings `cleanupPeriodDays` — default max-age for orphan reaping. */
+  private readonly cleanupPeriodDays: number | undefined;
   private readonly exec: ExecFn;
   /** Construction-time setup (core.longpaths on win32); never rejects. */
   private readonly ready: Promise<void>;
 
-  constructor(opts: { projectRoot: string; settings: WorktreeSettings; exec?: ExecFn }) {
+  constructor(opts: {
+    projectRoot: string;
+    settings: WorktreeSettings;
+    cleanupPeriodDays?: number;
+    exec?: ExecFn;
+  }) {
     this.projectRoot = path.resolve(opts.projectRoot);
     this.settings = opts.settings;
+    this.cleanupPeriodDays = opts.cleanupPeriodDays;
     this.exec = opts.exec ?? defaultExec;
     this.ready =
       process.platform === "win32"
@@ -199,6 +218,16 @@ export class WorktreeManager {
     try {
       await this.ready;
       const dir = path.resolve(opts.worktreePath);
+
+      // HARD CONTAINMENT: destructive removal only ever runs on dirs strictly
+      // inside <root>/.claude/worktrees/ — never the main working tree, never
+      // an arbitrary/nested-repo path (§2.2: must never corrupt state). Refuse
+      // before any mutation (no unlock, no reparse-point stripping, no rmSync).
+      if (opts.action === "remove" && !this.isManagedWorktreePath(dir)) {
+        const error = `ExitWorktree: refusing to remove ${dir} — it is not inside ${this.worktreesRoot()}`;
+        diagnostics.push(diag("error", error));
+        return { ok: false, removed: false, orphaned: false, diagnostics, error };
+      }
 
       // Look up the checked-out branch before unregistering anything.
       let branch = (await this.list()).find((e) => canonical(e.path) === canonical(dir))?.branch;
@@ -259,14 +288,23 @@ export class WorktreeManager {
     }
   }
 
-  async reapOrphans(): Promise<WorktreeReapResult> {
+  /**
+   * Remove orphaned dirs under .claude/worktrees (leftovers of blocked
+   * removals). Active/locked worktrees are registered with git and never
+   * touched; everything reaped passes the same containment gate as exit().
+   * `maxAgeDays` (default: the settings `cleanupPeriodDays`, else 0 = reap
+   * immediately) grants younger orphans a grace period, keyed off dir mtime.
+   */
+  async reapOrphans(options?: { maxAgeDays?: number }): Promise<WorktreeReapResult> {
     const diagnostics: Diagnostic[] = [];
     const reaped: string[] = [];
     try {
       await this.ready;
+      const maxAgeDays = options?.maxAgeDays ?? this.cleanupPeriodDays ?? 0;
+      const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
       await this.git(["worktree", "prune"]);
       const registered = new Set((await this.list()).map((e) => canonical(e.path)));
-      const worktreesRoot = path.join(this.projectRoot, ".claude", "worktrees");
+      const worktreesRoot = this.worktreesRoot();
       let entries: fs.Dirent[] = [];
       try {
         entries = fs.readdirSync(worktreesRoot, { withFileTypes: true });
@@ -276,7 +314,15 @@ export class WorktreeManager {
       for (const entry of entries) {
         if (!entry.isDirectory()) continue;
         const dir = path.join(worktreesRoot, entry.name);
-        if (registered.has(canonical(dir))) continue;
+        if (registered.has(canonical(dir))) continue; // active/locked worktrees stay
+        if (!this.isManagedWorktreePath(dir)) continue; // containment (defense in depth)
+        if (maxAgeDays > 0) {
+          try {
+            if (fs.statSync(dir).mtimeMs > cutoffMs) continue; // within grace period
+          } catch {
+            continue; // cannot stat — leave it for a later pass
+          }
+        }
         if (process.platform === "win32") this.stripReparsePoints(dir, diagnostics);
         try {
           fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
@@ -322,19 +368,39 @@ export class WorktreeManager {
     const dir = path.join(this.projectRoot, ".claude", "worktrees", flat);
 
     if (isDirectory(dir)) {
-      // Reuse the existing worktree dir — create nothing, seed nothing.
       const entry = (await this.list()).find((e) => canonical(e.path) === canonical(dir));
-      await this.ensureWorktreesIgnored(diagnostics);
-      await this.git(["worktree", "lock", "--reason", LOCK_REASON, dir]); // ignore failure
-      return {
-        ok: true,
-        worktreePath: dir,
-        branch: entry?.branch,
-        baseCommit: readBaseCommitFile(dir),
-        created: false,
-        seededFiles: [],
-        diagnostics,
-      };
+      if (entry) {
+        // Reuse the existing REGISTERED worktree — create nothing, seed nothing.
+        await this.ensureWorktreesIgnored(diagnostics);
+        await this.git(["worktree", "lock", "--reason", LOCK_REASON, dir]); // ignore failure
+        return {
+          ok: true,
+          worktreePath: dir,
+          branch: entry.branch,
+          baseCommit: readBaseCommitFile(dir),
+          created: false,
+          seededFiles: [],
+          diagnostics,
+        };
+      }
+      // Unregistered leftover (e.g. a partially removed worktree with its .git
+      // pointer severed): adopting it would run the session against the MAIN
+      // repo's git context. Reap it and fall through to fresh creation.
+      diagnostics.push(
+        diag("info", `${dir} exists but is not a registered worktree; reaping the orphan and recreating`),
+      );
+      if (process.platform === "win32") this.stripReparsePoints(dir, diagnostics);
+      try {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      } catch (e) {
+        diagnostics.push(diag("warning", `orphan removal of ${dir} failed: ${errorMessage(e)}`));
+      }
+      await this.git(["worktree", "prune"]);
+      if (fs.existsSync(dir)) {
+        const error = `EnterWorktree: ${dir} is an orphaned non-worktree directory that could not be removed`;
+        diagnostics.push(diag("error", error));
+        return { ok: false, created: false, seededFiles: [], diagnostics, error };
+      }
     }
 
     // Resolve the base commit FIRST (plan §4.4 / claude-code issue #60588).
@@ -361,11 +427,27 @@ export class WorktreeManager {
       return { ok: false, created: false, seededFiles: [], diagnostics, error };
     }
 
+    // A reused branch is checked out at its OLD tip (never reset — it may
+    // carry unmerged work that a reset would destroy), so the resolved base is
+    // NOT what this worktree sits on. Record where the branch diverged from
+    // the resolved base (merge-base; fallback: the branch tip) so that
+    // `base..HEAD` stays a sane unit-of-work delta.
+    let recordedBase = baseCommit;
+    if (reuseBranch) {
+      const mb = await this.git(["merge-base", branch, baseCommit]);
+      if (mb.code === 0 && mb.stdout.trim() !== "") {
+        recordedBase = mb.stdout.trim();
+      } else {
+        const tip = await this.git(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
+        if (tip.code === 0 && tip.stdout.trim() !== "") recordedBase = tip.stdout.trim();
+      }
+    }
+
     // Record the base commit inside the worktree.
     try {
       const baseFile = path.join(dir, BASE_COMMIT_REL);
       fs.mkdirSync(path.dirname(baseFile), { recursive: true });
-      fs.writeFileSync(baseFile, `${baseCommit}\n`, "utf8");
+      fs.writeFileSync(baseFile, `${recordedBase}\n`, "utf8");
     } catch (e) {
       diagnostics.push(diag("warning", `could not record base commit: ${errorMessage(e)}`));
     }
@@ -374,7 +456,7 @@ export class WorktreeManager {
     const seededFiles = await this.seedWorktree(dir, diagnostics);
     await this.git(["worktree", "lock", "--reason", LOCK_REASON, dir]); // ignore failure
 
-    return { ok: true, worktreePath: dir, branch, baseCommit, created: true, seededFiles, diagnostics };
+    return { ok: true, worktreePath: dir, branch, baseCommit: recordedBase, created: true, seededFiles, diagnostics };
   }
 
   // -------------------------------------------------------------------------
@@ -385,6 +467,19 @@ export class WorktreeManager {
     const dir = path.resolve(rawPath);
     if (!isDirectory(dir)) {
       const error = `EnterWorktree: path ${dir} is not an existing directory`;
+      diagnostics.push(diag("error", error));
+      return { ok: false, created: false, seededFiles: [], diagnostics, error };
+    }
+    // The main working tree IS listed by `git worktree list` — never accept it
+    // (an ExitWorktree(remove) on it would be catastrophic), and never accept
+    // anything outside the managed .claude/worktrees/ root.
+    if (canonical(dir) === canonical(this.projectRoot)) {
+      const error = `EnterWorktree: path ${dir} is the main working tree, not a worktree`;
+      diagnostics.push(diag("error", error));
+      return { ok: false, created: false, seededFiles: [], diagnostics, error };
+    }
+    if (!this.isManagedWorktreePath(dir)) {
+      const error = `EnterWorktree: path ${dir} is outside ${this.worktreesRoot()}; only managed worktrees can be re-entered`;
       diagnostics.push(diag("error", error));
       return { ok: false, created: false, seededFiles: [], diagnostics, error };
     }
@@ -410,6 +505,22 @@ export class WorktreeManager {
   // -------------------------------------------------------------------------
   // Internals
   // -------------------------------------------------------------------------
+
+  /** Root that owns every managed worktree: `<projectRoot>/.claude/worktrees`. */
+  private worktreesRoot(): string {
+    return path.join(this.projectRoot, ".claude", "worktrees");
+  }
+
+  /**
+   * True only for paths STRICTLY inside .claude/worktrees/ — the containment
+   * gate every destructive operation (and path re-entry) must pass. The main
+   * working tree, nested repos, and the worktrees root itself all fail it.
+   */
+  private isManagedWorktreePath(p: string): boolean {
+    const root = canonical(this.worktreesRoot());
+    const c = canonical(p);
+    return c !== root && c.startsWith(`${root}/`);
+  }
 
   private async git(args: string[], cwd = this.projectRoot): Promise<{ stdout: string; stderr: string; code: number }> {
     try {
@@ -497,11 +608,19 @@ export class WorktreeManager {
     const patterns = includeText
       .split(/\r?\n/)
       .map((l) => l.trim())
-      .filter((l) => l !== "" && !l.startsWith("#"));
+      .filter((l) => l !== "" && l !== "!" && !l.startsWith("#"));
     if (patterns.length === 0) return [];
 
-    const matchers = patterns.map(compileIncludePattern);
-    const candidates = this.walkProjectFiles().filter((rel) => matchers.some((m) => m(rel)));
+    const rules = patterns.map(compileIncludeLine);
+    // Only negations -> nothing can ever be included; skip the project walk.
+    if (!rules.some((r) => !r.negated)) return [];
+    // gitignore semantics: the LAST matching line decides (a `!` line un-matches).
+    const included = (rel: string): boolean => {
+      let inc = false;
+      for (const rule of rules) if (rule.match(rel)) inc = !rule.negated;
+      return inc;
+    };
+    const candidates = this.walkProjectFiles().filter(included);
     if (candidates.length === 0) return [];
 
     const ignored = await this.filterGitIgnored(candidates, diagnostics);
@@ -520,7 +639,7 @@ export class WorktreeManager {
     return seeded;
   }
 
-  /** Recursive walk of projectRoot -> relative forward-slash file paths (skips .git, worktrees, links). */
+  /** Recursive walk of projectRoot -> relative forward-slash file paths (skips .git, node_modules, worktrees, links). */
   private walkProjectFiles(): string[] {
     const out: string[] = [];
     const walk = (abs: string, rel: string, depth: number): void => {
@@ -532,7 +651,9 @@ export class WorktreeManager {
         return;
       }
       for (const entry of entries) {
-        if (entry.name === ".git") continue;
+        // node_modules is never a seeding source; walking it costs O(10^5) fs
+        // entries per worktree creation (plan §12.2: bounded creation latency).
+        if (entry.name === ".git" || entry.name === "node_modules") continue;
         const childRel = rel === "" ? entry.name : `${rel}/${entry.name}`;
         if (childRel === ".claude/worktrees") continue;
         if (entry.isSymbolicLink()) continue; // never follow links while seeding

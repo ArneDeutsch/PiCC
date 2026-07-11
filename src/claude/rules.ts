@@ -82,9 +82,26 @@ export function loadRules(
 
 /**
  * Whether a rule applies to a touched file. Unconditional rules (no `paths:`) always
- * apply; path-scoped rules use the shared glob engine anchored at projectRoot.
+ * apply; path-scoped rules use the shared glob engine.
+ *
+ * Mirrors findNestedClaudeMd's resolution: the touched path resolves against the
+ * session `cwd` (the model passes cwd-relative paths, and after EnterWorktree the
+ * cwd is the worktree), and a file inside `<projectRoot>/.claude/worktrees/<name>/`
+ * matches the globs relative to that worktree root — a worktree is its own checkout,
+ * so `src/**` rules must fire for `<worktree>/src/main.rs` exactly as on main.
  */
-export function ruleAppliesTo(rule: ClaudeRule, filePath: string, projectRoot: string): boolean {
+export function ruleAppliesTo(
+  rule: ClaudeRule,
+  filePath: string,
+  projectRoot: string,
+  cwd?: string,
+): boolean {
   if (!rule.paths || rule.paths.length === 0) return true;
-  return matchesAny(filePath, rule.paths, projectRoot);
+  const root = path.resolve(projectRoot);
+  const abs = path.resolve(cwd ?? root, filePath);
+  let effectiveRoot = root;
+  const rel = normalizeSlashes(path.relative(root, abs));
+  const wt = /^\.claude\/worktrees\/([^/]+)(?:\/|$)/i.exec(rel);
+  if (wt) effectiveRoot = path.join(root, ".claude", "worktrees", wt[1]!);
+  return matchesAny(abs, rule.paths, effectiveRoot);
 }

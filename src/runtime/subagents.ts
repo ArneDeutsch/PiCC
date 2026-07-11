@@ -1,9 +1,12 @@
+import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import type { ClaudeAgent, Diagnostic } from "../types.js";
 import type { HookRunner } from "../engine/hook-runner.js";
 import { PermissionEngine } from "../engine/permissions.js";
 import { claudeToolsToPiBuiltins } from "./tool-map.js";
 import { createGuardExtension } from "./guard.js";
+import { CwdState } from "./cwd-state.js";
+import { findByName } from "../project.js";
 
 /**
  * Subagent dispatch runtime (plan §4.3): spawns fresh-context Pi sessions per dispatch,
@@ -27,14 +30,30 @@ export interface WorktreeManagerLike {
 export interface SubagentRuntimeDeps {
   getAgents: () => ClaudeAgent[];
   /** Assemble the subagent's system prompt: agent body + CLAUDE.md/rules hierarchy + env. */
-  buildSystemPrompt: (agent: ClaudeAgent) => string;
-  /** Claude-named custom tool definitions granted to an agent (WebFetch, Task*, ...). */
-  customToolsFor: (agent: ClaudeAgent, grantedClaudeNames: string[], depth: number) => unknown[];
+  buildSystemPrompt: (agent: ClaudeAgent, depth?: number) => string;
+  /**
+   * Claude-named custom tool definitions granted to an agent (WebFetch, Task*, ...).
+   * `subCwd` is the dispatch-local cwd state — tools must resolve against it, not the
+   * orchestrator's cwd, or worktree-isolated agents search the wrong checkout.
+   */
+  customToolsFor: (
+    agent: ClaudeAgent,
+    grantedClaudeNames: string[],
+    depth: number,
+    subCwd?: CwdState,
+  ) => unknown[];
   /** All Claude tool names the harness knows (for gateTools' allKnown). */
   allKnownToolNames: () => string[];
   permissionEngine: PermissionEngine;
   hookRunner: HookRunner;
   getCwd: () => string;
+  /**
+   * Preferred: builds a PER-DISPATCH context injector with its own fresh injection
+   * state. Sharing the parent's injector would let a subagent's file touches consume
+   * the orchestrator's one-shot nested-CLAUDE.md/path-rule injections (and vice versa).
+   */
+  makeContextInjector?: (getCwd: () => string) => (filePath: string) => string | undefined;
+  /** Legacy shared injector — used only when makeContextInjector is absent. */
   contextForTouchedFile?: (filePath: string) => string | undefined;
   /** Resolve "provider/model" (or undefined) to a Pi Model object, or undefined to inherit. */
   resolveModel: (spec: string | undefined) => unknown | undefined;
@@ -144,12 +163,20 @@ export class SubagentRuntime {
     subagentType: string;
     prompt: string;
     model?: string;
+    /** Effort override (e.g. a context:fork skill's `effort:`); defaults to the agent's. */
+    effort?: string;
     depth: number;
+    /**
+     * Dispatch this agent definition directly instead of looking subagentType up —
+     * used for the synthetic general-purpose target of agent-less context:fork skills.
+     */
+    agentOverride?: ClaudeAgent;
   }): Promise<DispatchResult> {
     const diagnostics: Diagnostic[] = [];
     const agents = this.deps.getAgents();
     const agent =
-      agents.find((a) => a.name === opts.subagentType) ??
+      opts.agentOverride ??
+      findByName(agents, opts.subagentType) ??
       agents.find((a) => a.name.toLowerCase() === opts.subagentType.toLowerCase());
     if (!agent) {
       const known = agents.map((a) => a.name).join(", ");
@@ -170,20 +197,40 @@ export class SubagentRuntime {
       };
     }
 
-    const release = await this.semaphore.acquire();
+    // Only root-level dispatches count against the concurrency cap. An ancestor
+    // holds its slot while awaiting its descendants, so counting nested dispatches
+    // too would deadlock the moment `concurrency` ancestors each await a queued
+    // child (guaranteed at concurrency 1 for ANY depth-2 nesting).
+    const release = opts.depth > 1 ? () => {} : await this.semaphore.acquire();
     let worktreePath: string | undefined;
     let session: PiSession | undefined;
+    let started = false;
+    let stopFired = false;
     try {
-      await this.deps.hookRunner.fire("SubagentStart", {
-        subagent_type: agent.name,
-        prompt: opts.prompt,
-        cwd: this.deps.getCwd(),
-      });
+      const startOutcome = await this.deps.hookRunner
+        .fire("SubagentStart", {
+          subagent_type: agent.name,
+          prompt: opts.prompt,
+          cwd: this.deps.getCwd(),
+        })
+        .catch(() => undefined);
+      if (startOutcome?.block) {
+        return {
+          ok: false,
+          finalMessage: "",
+          agentName: agent.name,
+          error: `SubagentStart hook blocked dispatch${startOutcome.blockReason ? `: ${startOutcome.blockReason}` : ""}`,
+          diagnostics,
+        };
+      }
+      started = true;
 
       let cwd = this.deps.getCwd();
       if (agent.isolation === "worktree" && this.deps.worktrees) {
+        // Collision-free name: parallel fan-out of one agent must never share a
+        // worktree (Date.now()-based names collide within the same millisecond).
         const enter = await this.deps.worktrees.enter({
-          name: `agent-${agent.name}-${Date.now().toString(36)}`,
+          name: `agent-${agent.name}-${randomUUID().slice(0, 8)}`,
         });
         if (enter.ok && enter.worktreePath) {
           worktreePath = enter.worktreePath;
@@ -196,6 +243,9 @@ export class SubagentRuntime {
           });
         }
       }
+      // Dispatch-local cwd state: the subagent's tools (and its own EnterWorktree
+      // use) must never swap the ORCHESTRATOR's cwd.
+      const subCwd = new CwdState(cwd);
 
       const granted = this.deps.permissionEngine.gateTools(
         agent.tools,
@@ -203,29 +253,51 @@ export class SubagentRuntime {
         this.deps.allKnownToolNames(),
       );
       const piBuiltins = claudeToolsToPiBuiltins(granted);
-      const customTools = this.deps.customToolsFor(agent, granted, opts.depth);
+      const customTools = this.deps.customToolsFor(agent, granted, opts.depth, subCwd);
 
       const sdk = await this.sdk();
+      const injector = this.deps.makeContextInjector
+        ? this.deps.makeContextInjector(() => subCwd.get())
+        : this.deps.contextForTouchedFile;
       const guard = createGuardExtension({
         engine: this.deps.permissionEngine,
         hooks: this.deps.hookRunner,
-        getCwd: () => cwd,
-        contextForTouchedFile: this.deps.contextForTouchedFile,
+        getCwd: () => subCwd.get(),
+        contextForTouchedFile: injector,
         label: `subagent:${agent.name}`,
       });
+      const extensionFactories: Array<{ name: string; factory: (pi: unknown) => unknown }> = [
+        { name: `picc-guard-${agent.name}`, factory: guard as (pi: unknown) => unknown },
+      ];
+      if (agent.maxTurns && agent.maxTurns > 0) {
+        extensionFactories.push({
+          name: `picc-maxturns-${agent.name}`,
+          factory: createMaxTurnsExtension(agent.maxTurns, diagnostics) as (pi: unknown) => unknown,
+        });
+      }
       const loader = new sdk.DefaultResourceLoader({
         cwd,
         agentDir: sdk.agentDir(),
-        systemPromptOverride: () => this.deps.buildSystemPrompt(agent),
+        systemPromptOverride: () => this.deps.buildSystemPrompt(agent, opts.depth),
         skillsOverride: () => ({ skills: [], diagnostics: [] }),
         agentsFilesOverride: () => ({ agentsFiles: [] }),
         promptsOverride: () => ({ prompts: [], diagnostics: [] }),
-        extensionFactories: [{ name: `picc-guard-${agent.name}`, factory: guard }],
+        extensionFactories,
       });
       await loader.reload();
 
-      const model = this.deps.resolveModel(opts.model ?? agent.model);
-      const thinking = this.deps.mapEffort(agent.effort);
+      const modelSpec = opts.model ?? agent.model;
+      let model = this.deps.resolveModel(modelSpec);
+      if (modelSpec && model === undefined) {
+        // Visible degrade (§2.2): inherit the session model rather than silently
+        // falling through to Pi's default model.
+        diagnostics.push({
+          severity: "warning",
+          message: `agent model "${modelSpec}" is not resolvable; inheriting the session model`,
+        });
+        model = this.deps.resolveModel(undefined);
+      }
+      const thinking = this.deps.mapEffort(opts.effort ?? agent.effort);
       const toolNames = [
         ...piBuiltins,
         ...customTools.map((t) => (t as { name: string }).name),
@@ -253,19 +325,41 @@ export class SubagentRuntime {
       await session.prompt(fullPrompt);
 
       // Verbatim final assistant message (hard contract — no wrapping/summarizing).
-      const assistants = session.messages.filter((m) => m.role === "assistant");
-      const last = assistants[assistants.length - 1];
-      let finalMessage = last ? extractText(last.content) : "";
+      let finalMessage = lastAssistantText(session);
 
       // One-retry-on-empty convention (plan §4.3): a single re-prompt when nothing came back.
       if (!finalMessage.trim()) {
         await session.prompt(
           "Your previous reply was empty. Reply now with your final answer in the requested format.",
         );
-        const retryAssistants = session.messages.filter((m) => m.role === "assistant");
-        const retryLast = retryAssistants[retryAssistants.length - 1];
-        finalMessage = retryLast ? extractText(retryLast.content) : "";
+        finalMessage = lastAssistantText(session);
         diagnostics.push({ severity: "info", message: "subagent returned empty; retried once" });
+      }
+
+      // SubagentStop validation loop (plan §4.5 "don't stop until validated"):
+      // a blocking hook re-prompts the subagent with its reason, bounded like the
+      // main-session Stop loop.
+      for (let iteration = 0; ; iteration++) {
+        const stopOutcome = await this.deps.hookRunner
+          .fire("SubagentStop", {
+            subagent_type: agent.name,
+            cwd: subCwd.get(),
+            stop_hook_active: iteration > 0,
+          })
+          .catch(() => undefined);
+        stopFired = true;
+        if (!stopOutcome?.block) break;
+        if (iteration >= 3) {
+          diagnostics.push({
+            severity: "warning",
+            message: `SubagentStop hook still blocking after ${iteration} continuation(s): ${stopOutcome.blockReason ?? "(no reason)"}`,
+          });
+          break;
+        }
+        await session.prompt(
+          `[SubagentStop hook] Continue working: ${stopOutcome.blockReason ?? "the stop condition is not met yet"}`,
+        );
+        finalMessage = lastAssistantText(session);
       }
 
       return { ok: true, finalMessage, agentName: agent.name, worktreePath, diagnostics };
@@ -288,15 +382,53 @@ export class SubagentRuntime {
         // Keep the worktree (the project's own merge flow owns its lifecycle); just unlock.
         await this.deps.worktrees.exit({ worktreePath, action: "keep" }).catch(() => undefined);
       }
-      await this.deps.hookRunner
-        .fire("SubagentStop", {
-          subagent_type: agent.name,
-          cwd: this.deps.getCwd(),
-        })
-        .catch(() => undefined);
+      if (started && !stopFired) {
+        // Error paths still fire SubagentStop once (informational; block is moot here).
+        await this.deps.hookRunner
+          .fire("SubagentStop", {
+            subagent_type: agent.name,
+            cwd: this.deps.getCwd(),
+          })
+          .catch(() => undefined);
+      }
       release();
     }
   }
+}
+
+function lastAssistantText(session: PiSession): string {
+  const assistants = session.messages.filter((m) => m.role === "assistant");
+  const last = assistants[assistants.length - 1];
+  return last ? extractText(last.content) : "";
+}
+
+/**
+ * Best-effort `maxTurns` enforcement (plan §4.3 tier-up): Pi sessions have no
+ * turn-cap option, so past the cap every further tool call is blocked with an
+ * instruction to answer — the subagent can still produce its final message.
+ */
+function createMaxTurnsExtension(maxTurns: number, diagnostics: Diagnostic[]) {
+  return (pi: { on(event: string, handler: (event: any, ctx: any) => unknown): void }) => {
+    let turns = 0;
+    let reported = false;
+    pi.on("turn_start", () => {
+      turns++;
+    });
+    pi.on("tool_call", () => {
+      if (turns <= maxTurns) return undefined;
+      if (!reported) {
+        reported = true;
+        diagnostics.push({
+          severity: "warning",
+          message: `maxTurns (${maxTurns}) reached; further tool calls blocked`,
+        });
+      }
+      return {
+        block: true,
+        reason: `maxTurns (${maxTurns}) reached — stop using tools and reply now with your final answer.`,
+      };
+    });
+  };
 }
 
 /** The `Agent` dispatch tool definition (Claude-compatible; also registered as `Task`). */
@@ -330,16 +462,17 @@ export function createAgentToolDefinition(
       if (!result.ok) {
         throw new Error(result.error ?? "subagent failed");
       }
-      let text = result.finalMessage;
-      if (params.run_in_background) {
-        text = `[note: run_in_background is not supported in PiCC v1; ran in foreground]\n${text}`;
-      }
+      // Verbatim-return contract (plan §4.3): callers parse finalMessage directly
+      // (often a locked YAML block) — compatibility notes belong in details only.
       return {
-        content: [{ type: "text", text }],
+        content: [{ type: "text", text: result.finalMessage }],
         details: {
           agent: result.agentName,
           worktreePath: result.worktreePath,
           diagnostics: result.diagnostics,
+          ...(params.run_in_background
+            ? { note: "run_in_background is not supported in PiCC v1; ran in foreground" }
+            : {}),
         },
       };
     },

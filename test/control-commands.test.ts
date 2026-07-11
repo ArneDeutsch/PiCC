@@ -6,14 +6,20 @@ import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 
 /**
- * Control commands must NEVER leak to the model. In non-interactive modes Pi's
- * own command router does not intercept `/skills` `/agents` etc. before the input
- * event, so the extension's `input` handler has to catch them, render output, and
- * short-circuit with { action: "handled" } — never producing a turn.
+ * Control commands must display their output IMMEDIATELY and must NEVER leak
+ * to the model.
  *
- * This is the deterministic offline form of e2e scenario 10 (print-mode arg
- * mangling makes the live-CLI form flaky): it fires the input event directly
- * through a fake Pi API and asserts the handler answers without reaching a model.
+ * Regression guard: the first implementation delivered control output via
+ * pi.sendMessage({...}, { deliverAs: "nextTurn" }) — Pi queues such messages
+ * for the NEXT user prompt, so running /doctor appeared to do nothing (and the
+ * report was silently injected into the model's context one turn later). The
+ * fix renders a TUI-only custom entry (pi.appendEntry + registerEntryRenderer),
+ * which shows up in the transcript right away and never enters LLM context.
+ *
+ * Two paths produce the output and must behave identically:
+ *  - interactive mode: Pi's command router calls the registered command handler
+ *  - all other modes: the `input` event handler catches the command and
+ *    short-circuits with { action: "handled" } — never producing a turn.
  */
 
 let dir: string;
@@ -41,29 +47,93 @@ afterAll(() => {
   cleanupFixture(dir);
 });
 
-describe("control commands never leak to the model", () => {
-  it("/skills is handled by the input event and emits a picc-skills message", async () => {
-    pi.messages.length = 0;
+function reset() {
+  pi.messages.length = 0;
+  pi.entries.length = 0;
+}
+
+function controlEntry(command: string) {
+  return pi.entries.find((e) => e.customType === "picc-control" && e.data?.command === command);
+}
+
+describe("control commands display immediately and never leak to the model", () => {
+  it("/skills via the input event renders a picc-control entry and short-circuits", async () => {
+    reset();
     const outcome = await pi.fire("input", { text: "/skills", source: "interactive" });
 
     // Short-circuited: the handler answered instead of producing a model turn.
     expect(outcome).toEqual({ action: "handled" });
 
-    const skillsMsg = pi.messages.find((m) => m.message?.customType === "picc-skills");
-    expect(skillsMsg, "expected a picc-skills message").toBeDefined();
-    const content = String(skillsMsg?.message?.content ?? "");
-    expect(content).toContain("skill(s) loaded");
-    expect(content).toContain("/deploy");
+    const entry = controlEntry("skills");
+    expect(entry, "expected a picc-control entry for /skills").toBeDefined();
+    const output = String(entry?.data?.output ?? "");
+    expect(output).toContain("skill(s) loaded");
+    expect(output).toContain("/deploy");
+
+    // Control output is user-facing status — it must never enter LLM context.
+    expect(pi.messages).toHaveLength(0);
   });
 
-  it("/agents is handled and emits a picc-agents message", async () => {
-    pi.messages.length = 0;
+  it("/agents via the input event renders a picc-control entry", async () => {
+    reset();
     const outcome = await pi.fire("input", { text: "/agents", source: "interactive" });
 
     expect(outcome).toEqual({ action: "handled" });
-    const agentsMsg = pi.messages.find((m) => m.message?.customType === "picc-agents");
-    expect(agentsMsg, "expected a picc-agents message").toBeDefined();
-    expect(String(agentsMsg?.message?.content ?? "")).toContain("reviewer");
+    const entry = controlEntry("agents");
+    expect(entry, "expected a picc-control entry for /agents").toBeDefined();
+    expect(String(entry?.data?.output ?? "")).toContain("reviewer");
+    expect(pi.messages).toHaveLength(0);
+  });
+
+  it("/doctor via the registered command handler displays immediately (regression: was queued for the next turn)", async () => {
+    reset();
+    const command = pi.commands.get("doctor");
+    expect(command, "expected a registered /doctor command").toBeDefined();
+
+    await command.handler("", pi.ctx());
+
+    const entry = controlEntry("doctor");
+    expect(entry, "expected a picc-control entry appended synchronously").toBeDefined();
+    expect(String(entry?.data?.output ?? "")).toContain("PiCC compatibility report");
+    // Nothing queued as a (deferred) LLM message.
+    expect(pi.messages).toHaveLength(0);
+  });
+
+  it("every control command is registered and produces immediate entry output", async () => {
+    for (const name of ["doctor", "compat", "quota", "skills", "agents"]) {
+      reset();
+      const command = pi.commands.get(name);
+      expect(command, `expected /${name} to be registered`).toBeDefined();
+      await command.handler("", pi.ctx());
+      expect(controlEntry(name), `expected /${name} to append a picc-control entry`).toBeDefined();
+      expect(pi.messages, `/${name} must not send LLM-context messages`).toHaveLength(0);
+    }
+  });
+
+  it("the picc-control entry renderer turns an entry into visible lines", () => {
+    const renderer = pi.entryRenderers.get("picc-control");
+    expect(renderer, "expected an entry renderer for picc-control").toBeDefined();
+
+    const theme = { fg: (_color: string, text: string) => text };
+    const component = renderer!(
+      { data: { command: "doctor", output: "first line\nsecond line" } },
+      { expanded: false },
+      theme,
+    );
+    const lines: string[] = component.render(80);
+    expect(lines[0]).toContain("/doctor");
+    expect(lines).toContain("first line");
+    expect(lines).toContain("second line");
+  });
+
+  it("the picc-compat entry renderer renders the startup notice", () => {
+    const renderer = pi.entryRenderers.get("picc-compat");
+    expect(renderer, "expected an entry renderer for picc-compat").toBeDefined();
+
+    const theme = { fg: (_color: string, text: string) => text };
+    const component = renderer!({ data: { notice: "4 feature(s) degraded" } }, { expanded: false }, theme);
+    const lines: string[] = component.render(80);
+    expect(lines.join("\n")).toContain("4 feature(s) degraded");
   });
 
   it("does not treat a real skill slash command as a control command (it transforms)", async () => {
