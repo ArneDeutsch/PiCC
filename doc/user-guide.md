@@ -7,6 +7,27 @@ model abstraction, and the subscription auth; PiClauDex supplies Claude Code com
 `CLAUDE.md` hierarchies, `.claude/` skills/agents/rules/commands, `settings.json` permissions
 and hooks, worktree isolation, subagent fan-out, and plugin content.
 
+## How it works (in one minute)
+
+At startup PiClauDex reads your project's `.claude/` corpus and `CLAUDE.md` hierarchy into one
+in-memory model. From then on, on Pi's own agent loop:
+
+- **Every turn** it appends the assembled instruction set — root `CLAUDE.md`, unconditional rules,
+  the budgeted skill listing, and the subagent catalog — to the system prompt. Because the system
+  prompt is rebuilt each turn, this is also what survives compaction.
+- **Every tool call** passes through a guard that enforces `deny` rules and fires the project's
+  hooks, and injects nested `CLAUDE.md` / path-scoped rules when you touch a matching file.
+- **Skills** run either as `/slash` commands or via the model's `Skill` tool, with full argument,
+  variable, and shell-injection processing — the body loads only on activation (progressive
+  disclosure).
+- **Subagents** dispatch via the `Agent` tool into fresh, isolated sessions and return their final
+  message verbatim; **worktrees** swap the session's working directory so the project's own git
+  tooling detects worktree mode.
+
+Nothing is written to your project's tracked files. For the full design see
+[`doc/architecture.md`](architecture.md); for the exact compatibility matrix see
+[`doc/supported-features.md`](supported-features.md).
+
 ## 1. Requirements
 
 - **Node.js ≥ 20** and npm
@@ -190,7 +211,10 @@ Deliberately partial, by design (see the plan §6):
 ## 7. What is and isn't supported
 
 Generated truth lives in the capability registry (`src/registry/capability-registry.ts`, baseline
-**Claude Code ~2.1.x, mid-2026**) and is what `/doctor` renders. Summary:
+**Claude Code ~2.1.x, mid-2026**) and is what `/doctor` renders. The full table — every tool, hook
+event, setting, frontmatter field, and feature with its tier — is in
+[`doc/supported-features.md`](supported-features.md) (generated from that same registry, so it
+cannot drift). Summary:
 
 **Full:** skills (entire frontmatter set incl. `context: fork`, `paths:`, shell injection under
 bash+powershell, argument substitution), rules, agents & nested subagent dispatch with depth caps,
@@ -208,13 +232,30 @@ unassessed.
 harnesses (worktrees/git are fully interoperable — a worktree created under Claude Code can be
 re-entered here and vice versa).
 
-## 8. Windows notes
+## 8. Windows specifics
 
-- Git Bash is found automatically (the WSL `bash.exe` stub in System32 is skipped).
-- `core.longpaths` is enabled on the repo automatically.
-- Worktree removal is best-effort: a file-lock failure never fails your merge; the orphan is
-  reaped later (`git worktree prune` + directory sweep on the next session).
-- Hook payloads deliver Windows paths with doubled backslashes in JSON, as Claude Code does.
+Everything runs natively on Windows 11 — no WSL required. The points below are Windows-only
+behaviors worth knowing:
+
+- **Git Bash is required, and found automatically.** Pi's `bash` tool and most Claude Code
+  projects' scripts assume bash. PiClauDex locates the real Git Bash (`Program Files\Git\bin\bash.exe`
+  and friends) and **skips the System32 WSL `bash.exe` stub**, which otherwise fails with
+  `WSL_E_DEFAULT_DISTRO_NOT_FOUND` when no WSL distro is installed. The resolved shell is used for
+  both hooks and `` !`cmd` `` skill injection. Install Git for Windows if `bash` isn't on PATH.
+- **UTF-8 subprocess default.** Spawned interpreters (notably Python) default their I/O to the
+  legacy code page (cp1252), which can't encode Unicode the model routinely prints (e.g. `→`),
+  causing `UnicodeEncodeError`. PiClauDex sets UTF-8 defaults (`PYTHONIOENCODING`/`PYTHONUTF8`,
+  `LANG`/`LC_ALL`) for child processes **only when you haven't set them** — an explicit project or
+  user `env` value always wins.
+- **MSYS argument-mangling caveat (slash commands via `-p`).** Under **Git Bash**, MSYS rewrites an
+  argument that looks like a Unix path — so `piclaudex -p "/greet Ada"` gets the leading `/greet`
+  mangled into a Windows path and the skill won't resolve. Run slash-command-as-argument invocations
+  from **PowerShell or cmd**, or just type `/greet Ada` inside the **interactive TUI** (where no
+  MSYS mangling applies). Normal interactive use is unaffected.
+- **Long paths & worktrees.** `core.longpaths` is enabled on the repo automatically. Worktree
+  removal is best-effort: a file-lock failure never fails your merge; the orphan is reaped later
+  (`git worktree prune` + a directory sweep on the next session).
+- **Hook payloads** deliver Windows paths with doubled backslashes in JSON, as Claude Code does.
 
 ## 9. Troubleshooting
 
@@ -229,9 +270,10 @@ re-entered here and vice versa).
 
 ## 10. Verification status
 
-- **Windows 11**: fully verified — 334 automated tests (unit, integration against the fixture
-  projects, NFR assertions, and an end-to-end suite driving the real Pi CLI with a mock
-  OpenAI-compatible model server), plus live validation on a real ChatGPT/Codex subscription
+- **Windows 11**: fully verified — the automated suite runs across three layers (per-subsystem
+  unit tests, an offline whole-extension integration pass against the fixture projects, and an
+  end-to-end suite that drives the **real Pi CLI** with a mock OpenAI-compatible model server; see
+  [`doc/testing.md`](testing.md)) — plus live validation on a real ChatGPT/Codex subscription
   (skill slash command with argument substitution, description-routed subagent dispatch
   returning a locked-YAML verdict verbatim, worktree entry detected as `mode=worktree` by the
   project's own git-plumbing probe, `.worktreeinclude` seeding, `WorktreeCreate` hook).

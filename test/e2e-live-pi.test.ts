@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -99,12 +99,16 @@ interface RunResult {
   fixture: string;
 }
 
+type FixtureName = "hello-claude" | "full-surface";
+
 async function runPi(opts: {
   script: Turn[];
   prompt: string;
+  fixture?: FixtureName;
+  extraEnv?: Record<string, string>;
   setup?: (fixtureDir: string) => void;
 }): Promise<RunResult> {
-  const fixture = materializeFixture("hello-claude");
+  const fixture = materializeFixture(opts.fixture ?? "hello-claude");
   fixtures.push(fixture);
   opts.setup?.(fixture);
 
@@ -128,6 +132,7 @@ async function runPi(opts: {
           PI_SKIP_VERSION_CHECK: "1",
           PICLAUDEX_CLAUDE_USER_DIR: emptyUserDir,
           NO_COLOR: "1",
+          ...opts.extraEnv,
         },
         // stdin must be closed: Pi's print mode waits on piped stdin otherwise.
         stdio: ["ignore", "pipe", "pipe"],
@@ -167,6 +172,47 @@ function toolResultText(request: CapturedRequest): string {
     .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
     .join("\n");
 }
+
+/** Concatenated role:"user" message content of a request. */
+function userText(request: CapturedRequest): string {
+  return request.messages
+    .filter((m) => m.role === "user")
+    .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
+    .join("\n");
+}
+
+/** Names of tools advertised in a request. */
+function toolNames(request: CapturedRequest): string[] {
+  return (request.tools ?? [])
+    .map((t) => (t as { function?: { name?: string } }).function?.name)
+    .filter((n): n is string => typeof n === "string");
+}
+
+/** Detect a usable `bash` (Git Bash on Windows), skip cleanly if absent. */
+const BASH_AVAILABLE = (() => {
+  for (const cand of ["bash", "C:\\Program Files\\Git\\bin\\bash.exe"]) {
+    try {
+      execFileSync(cand, ["--version"], { stdio: "ignore" });
+      return true;
+    } catch {
+      /* try next */
+    }
+  }
+  return false;
+})();
+
+/** Detect a python interpreter name on PATH, or undefined. */
+const PYTHON_BIN = (() => {
+  for (const cand of ["python", "python3", "py"]) {
+    try {
+      execFileSync(cand, ["--version"], { stdio: "ignore" });
+      return cand;
+    } catch {
+      /* try next */
+    }
+  }
+  return undefined;
+})();
 
 describe.skipIf(cliMissing)(
   "e2e: real Pi CLI + PiClauDex extension + mock OpenAI model",
@@ -307,6 +353,242 @@ describe.skipIf(cliMissing)(
         // The tool result confirms the cwd swap to the model.
         expect(result.requests.length).toBeGreaterThanOrEqual(2);
         expect(toolResultText(result.requests[1]!)).toMatch(/entered worktree/i);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario 1: bash tool runs a real project script (Git Bash, not WSL stub) ---
+    it.skipIf(!BASH_AVAILABLE)(
+      "runs a bash tool call through Git Bash and round-trips real stdout",
+      async () => {
+        const result = await runPi({
+          script: [
+            {
+              toolCalls: [
+                {
+                  name: "bash",
+                  args: { command: "echo PCD_BASH_OK && node -e \"console.log('node-'+(1+1))\"" },
+                },
+              ],
+            },
+            { text: "ran it" },
+          ],
+          prompt: "run the probe",
+        });
+
+        expect(result.code).toBe(0);
+        expect(result.requests.length).toBeGreaterThanOrEqual(2);
+        const toolResult = toolResultText(result.requests[1]!);
+        expect(toolResult).toContain("PCD_BASH_OK");
+        expect(toolResult).toContain("node-2");
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario 2: Python UTF-8 subprocess prints U+2192 without UnicodeEncodeError ---
+    it.skipIf(!BASH_AVAILABLE || !PYTHON_BIN)(
+      "runs a python subprocess that prints an arrow with no cp1252 UnicodeEncodeError",
+      async () => {
+        // chr(0x2192) keeps the literal arrow out of the command string.
+        const command = `${PYTHON_BIN} -c "print('arrow-' + chr(0x2192) + '-end')"`;
+        const arrow = String.fromCharCode(0x2192); // U+2192 RIGHTWARDS ARROW
+        const result = await runPi({
+          script: [{ toolCalls: [{ name: "bash", args: { command } }] }, { text: "done" }],
+          prompt: "print an arrow",
+        });
+
+        expect(result.code).toBe(0);
+        expect(result.requests.length).toBeGreaterThanOrEqual(2);
+        const toolResult = toolResultText(result.requests[1]!);
+        expect(toolResult).toContain(`arrow-${arrow}-end`);
+        expect(toolResult).not.toMatch(/UnicodeEncodeError|charmap/i);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario 3: slash-skill expansion end-to-end via the input event ---
+    it(
+      "expands a /deploy slash skill into the user turn with positional args (full-surface)",
+      async () => {
+        const result = await runPi({
+          fixture: "full-surface",
+          script: [{ text: "done" }],
+          prompt: "/deploy staging 7.7",
+        });
+
+        expect(result.code).toBe(0);
+        expect(result.requests.length).toBeGreaterThanOrEqual(1);
+        const user = userText(result.requests[0]!);
+        expect(user).toContain("FS-SKILL-ARGS-BODY");
+        expect(user).toContain("Deploy to environment **staging** at version **7.7**");
+        // It expanded — the raw slash command is not what reached the model verbatim.
+        expect(user).not.toMatch(/^\s*"?\/deploy staging 7\.7"?\s*$/);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario 4: shell-injection skill runs at activation (full-surface) ---
+    it.skipIf(!BASH_AVAILABLE)(
+      "runs a /repo-info shell-injection skill at activation and injects live git output",
+      async () => {
+        const result = await runPi({
+          fixture: "full-surface",
+          script: [{ text: "ok" }],
+          prompt: "/repo-info",
+        });
+
+        expect(result.code).toBe(0);
+        const user = userText(result.requests[0]!);
+        expect(user).toContain("FS-SKILL-SHELL-BODY");
+        // materializeFixture puts the repo on `main`; the injected branch name lands in the turn.
+        expect(user).toContain("main");
+        // The inline injection marker was executed, not passed through verbatim.
+        expect(user).not.toContain("!`git");
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario 5: subagent dispatch returns the verbatim final message (full-surface) ---
+    it(
+      "dispatches the reviewer subagent (fresh session) and returns its locked YAML verbatim",
+      async () => {
+        const result = await runPi({
+          fixture: "full-surface",
+          script: [
+            // 0) orchestrator dispatches the reviewer
+            {
+              toolCalls: [
+                { name: "Agent", args: { subagent_type: "reviewer", prompt: "review src/lib.rs" } },
+              ],
+            },
+            // 1) the reviewer's OWN Pi session (separate request to the same mock)
+            { text: "```yaml\nverdict: approve\nfindings: []\n```" },
+            // 2) orchestrator's follow-up turn once it has the subagent result
+            { text: "review complete" },
+          ],
+          prompt: "have the reviewer look at src/lib.rs",
+        });
+
+        expect(result.code).toBe(0);
+        // Agent tool is advertised on the orchestrator's first request.
+        expect(toolNames(result.requests[0]!)).toContain("Agent");
+        // A fresh subagent session hit the same mock, so there is a middle request.
+        expect(result.requests.length).toBeGreaterThanOrEqual(3);
+        // The verbatim locked YAML comes back to the orchestrator as a tool result.
+        const anyToolResultHasVerdict = result.requests.some((r) =>
+          toolResultText(r).includes("verdict: approve"),
+        );
+        expect(anyToolResultHasVerdict).toBe(true);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario 6: deny rule hard-blocks a tool call (full-surface) ---
+    it(
+      "hard-blocks Read(secrets/**) and never leaks the secret to the model (full-surface)",
+      async () => {
+        const result = await runPi({
+          fixture: "full-surface",
+          script: [
+            { toolCalls: [{ name: "read", args: { path: "secrets/key.txt" } }] },
+            { text: "ok" },
+          ],
+          prompt: "read the secret",
+          setup: (dir) => {
+            fs.mkdirSync(path.join(dir, "secrets"), { recursive: true });
+            fs.writeFileSync(path.join(dir, "secrets", "key.txt"), "TOPSECRET\n");
+          },
+        });
+
+        expect(result.code).toBe(0);
+        expect(result.requests.length).toBeGreaterThanOrEqual(2);
+        expect(toolResultText(result.requests[1]!)).toMatch(/deny|blocked|not permitted/i);
+        for (const [i, request] of result.requests.entries()) {
+          expect(allText(request), `request ${i} must not leak the secret`).not.toContain(
+            "TOPSECRET",
+          );
+        }
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario 7: PreToolUse warn-hook additionalContext reaches the model (full-surface) ---
+    it.skipIf(!BASH_AVAILABLE)(
+      "runs the PreToolUse write-guard and steers FS-WRITE-GUARD into the model (full-surface)",
+      async () => {
+        const result = await runPi({
+          fixture: "full-surface",
+          script: [
+            { toolCalls: [{ name: "write", args: { path: "docs/probe.txt", content: "x" } }] },
+            { text: "written" },
+          ],
+          prompt: "write docs/probe.txt",
+        });
+
+        expect(result.code).toBe(0);
+        const outPath = path.join(result.fixture, "docs", "probe.txt");
+        expect(fs.existsSync(outPath), `expected ${outPath} to exist`).toBe(true);
+        expect(result.requests.length).toBeGreaterThanOrEqual(2);
+        expect(allText(result.requests[1]!)).toContain("FS-WRITE-GUARD");
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario 8: EnterWorktree creates an isolated worktree (full-surface) ---
+    it(
+      "creates an isolated git worktree via EnterWorktree (full-surface)",
+      async () => {
+        const result = await runPi({
+          fixture: "full-surface",
+          script: [
+            { toolCalls: [{ name: "EnterWorktree", args: { name: "e2e-wt" } }] },
+            { text: "in" },
+          ],
+          prompt: "enter a worktree named e2e-wt",
+        });
+
+        expect(result.code).toBe(0);
+        const worktreeDir = path.join(result.fixture, ".claude", "worktrees", "e2e-wt");
+        expect(fs.existsSync(worktreeDir), `expected worktree at ${worktreeDir}`).toBe(true);
+        const gitPointer = path.join(worktreeDir, ".git");
+        expect(fs.existsSync(gitPointer)).toBe(true);
+        expect(fs.statSync(gitPointer).isFile()).toBe(true);
+        expect(fs.readFileSync(gitPointer, "utf8")).toContain("gitdir:");
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario 9: lenient-frontmatter agents reach the routing catalog (full-surface) ---
+    it(
+      "recovers a strict-YAML-breaking agent frontmatter and routes it into the subagent catalog",
+      async () => {
+        const result = await runPi({
+          fixture: "full-surface",
+          script: [{ text: "hi" }],
+          prompt: "say hi",
+          setup: (dir) => {
+            // description contains ": " which breaks a strict YAML parse; lenient
+            // frontmatter must still recover it into the routing catalog.
+            fs.writeFileSync(
+              path.join(dir, ".claude", "agents", "tricky-agent.md"),
+              [
+                "---",
+                "name: tricky-agent",
+                "description: Handles X: Y and Z.",
+                "tools: Read",
+                "---",
+                "",
+                "Tricky agent body.",
+                "",
+              ].join("\n"),
+            );
+          },
+        });
+
+        expect(result.code).toBe(0);
+        const system = systemText(result.requests[0]!);
+        expect(system).toContain("Available subagents");
+        expect(system).toContain("tricky-agent");
       },
       TEST_TIMEOUT_MS,
     );

@@ -1,6 +1,8 @@
 node_modules/
 dist/
 *.tsbuildinfo
+*.tgz
 .claude/worktrees/
 examples/**/.claude/worktrees/
+examples/**/.claude/.piclaudex/
 test-output/

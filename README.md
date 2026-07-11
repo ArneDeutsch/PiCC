@@ -1,5 +1,8 @@
 # PiClauDex
 
+[![CI](https://github.com/arne/piclaudex/actions/workflows/ci.yml/badge.svg)](https://github.com/arne/piclaudex/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Run projects built for Claude Code — unchanged — on GPT/Codex models, from your ChatGPT
 subscription.**
 
@@ -33,7 +36,13 @@ Windows notes: Git Bash (from Git for Windows) must be installed; if PowerShell 
 `piclaudex` script shim, use `piclaudex.cmd` or `Set-ExecutionPolicy -Scope CurrentUser
 RemoteSigned`. Details per shell/OS in the guide.
 
-**→ Full documentation: [doc/user-guide.md](doc/user-guide.md)**
+Prefer a package install? Once published, `npm install -g piclaudex` gives you the same
+`piclaudex` command; or install a release tarball with `npm install -g piclaudex-0.1.0.tgz`.
+PiClauDex ships as TypeScript source that Pi loads via jiti — there is no build step.
+
+**→ Full documentation: [doc/user-guide.md](doc/user-guide.md)** ·
+[Architecture](doc/architecture.md) · [Supported features](doc/supported-features.md) ·
+[Testing](doc/testing.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 
 ## What it does
 
@@ -57,6 +66,15 @@ RemoteSigned`. Details per shell/OS in the guide.
 - **Plugins** — content from already-installed plugins and project-bundled `.claude-plugin/`.
 
 Everything unrecognized degrades safely and is surfaced — never a crash (the completeness floor).
+The full, always-current compatibility matrix is in
+[doc/supported-features.md](doc/supported-features.md).
+
+## Control surface
+
+Inside a session: `/skills` and `/agents` list the loaded corpus; `/doctor` gives the full
+compatibility breakdown; `/compat` shows/suppresses the startup notice; `/quota` reports usage.
+Every user-invocable skill appears in the `/` autocomplete menu. Model and per-model steering are
+configured outside the project — see the [user guide](doc/user-guide.md#5-control-surface-project-external).
 
 ## Repository layout
 
@@ -66,21 +84,23 @@ Everything unrecognized degrades safely and is surfaced — never a crash (the c
 | `bin/piclaudex.mjs` | Launcher (Pi + extension preloaded) |
 | `examples/hello-claude` | Minimal demo project |
 | `examples/full-surface` | Conformance fixture exercising the whole feature surface |
-| `test/` | Unit + integration + NFR tests (vitest) |
-| `doc/user-guide.md` | User documentation |
-| `doc/plan/`, `doc/research/`, `doc/design/` | The feature plan (WHAT/WHY), research corpus, pinned Pi integration contracts |
+| `test/` | Unit, offline-integration, and live e2e tests (vitest) — see [doc/testing.md](doc/testing.md) |
+| `doc/` | [User guide](doc/user-guide.md), [architecture](doc/architecture.md), [supported features](doc/supported-features.md), [testing](doc/testing.md); plus the plan, research corpus, and pinned Pi contracts |
 
 ## Development
 
 ```bash
-npm run typecheck   # strict TS
-npm test            # full suite (creates real git repos in temp dirs)
+npm run typecheck        # strict TS
+npm run test:unit        # fast: unit + offline integration
+npm run test:e2e         # drives the real Pi CLI against a mock model
+npm test                 # everything
+npm run gen:capabilities # regenerate doc/supported-features.md from the registry
 ```
 
 Support claims are pinned to a **Claude Code ~2.1.x (mid-2026)** baseline in the capability
 registry (`src/registry/capability-registry.ts`); the runtime compatibility report is generated
-from it, so docs and behavior cannot drift.
+from it, so docs and behavior cannot drift. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT
+[MIT](LICENSE)
