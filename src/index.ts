@@ -26,6 +26,7 @@ import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression } from "./registry/compat-report.js";
 import { loadSkillBody, substituteVariables } from "./claude/skills.js";
 import { resolveGitBashPath } from "./engine/shell-inject.js";
+import { applyUnicodeSafeProcessEnv, unicodeSafeSubprocessEnv } from "./util/env.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
 
 /**
@@ -85,6 +86,10 @@ function debug(...args: unknown[]): void {
 }
 
 export default function piclaudex(pi: any) {
+  // UTF-8 stdio for any child process (fixes Windows cp1252 UnicodeEncodeError,
+  // e.g. Python printing `→`). Set before any subprocess can be spawned.
+  applyUnicodeSafeProcessEnv();
+
   let project: LoadedProject;
   try {
     // PICLAUDEX_CLAUDE_USER_DIR overrides ~/.claude (tests, multi-profile setups).
@@ -374,7 +379,11 @@ export default function piclaudex(pi: any) {
           spawnHook: ({ command, cwd, env }: any) => ({
             command,
             cwd,
-            env: { ...env, ...project.settings.env, CLAUDE_PROJECT_DIR: project.root },
+            env: unicodeSafeSubprocessEnv({
+              ...env,
+              ...project.settings.env,
+              CLAUDE_PROJECT_DIR: project.root,
+            }),
           }),
         })],
         ["read", (c) => sdk.createReadTool(c)],

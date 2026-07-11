@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { Diagnostic } from "../types.js";
+import { unicodeSafeSubprocessEnv } from "../util/env.js";
 
 /**
  * Dynamic context injection for skill bodies (plan §4.1):
@@ -207,7 +208,7 @@ function runCommand(cmd: string, opts: ShellInjectionOptions): Promise<RunResult
         args,
         {
           cwd: opts.cwd,
-          env: opts.env,
+          env: unicodeSafeSubprocessEnv(opts.env),
           timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
           maxBuffer: MAX_OUTPUT_BYTES,
           windowsHide: true,

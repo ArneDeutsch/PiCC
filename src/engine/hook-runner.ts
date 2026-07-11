@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { evaluateIfCondition } from "./permissions.js";
 import { isDirectory } from "../util/fs.js";
+import { unicodeSafeSubprocessEnv } from "../util/env.js";
 import type {
   Diagnostic,
   HookConfig,
@@ -213,13 +214,13 @@ export class HookRunner {
       argv = ["-c", commandStr];
     }
 
-    const env: NodeJS.ProcessEnv = {
+    const env: NodeJS.ProcessEnv = unicodeSafeSubprocessEnv({
       ...process.env,
       ...this.opts.env,
       CLAUDE_PROJECT_DIR: this.opts.projectDir,
       CLAUDE_SESSION_ID: this.opts.sessionId,
       CLAUDE_HOOK_EVENT: eventName,
-    };
+    });
     const timeoutSec =
       typeof handler.timeout === "number" && handler.timeout > 0
         ? handler.timeout
