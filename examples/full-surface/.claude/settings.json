@@ -1,0 +1,86 @@
+{
+  "env": {
+    "FS_FIXTURE": "full-surface"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(tools/*.sh:*)",
+      "Bash(git *)",
+      "Read(src/**)",
+      "WebFetch(domain:docs.example.com)"
+    ],
+    "deny": [
+      "Read(secrets/**)",
+      "Bash(curl *)",
+      "WebFetch(domain:evil.example.com)"
+    ],
+    "ask": ["Bash(git push *)"],
+    "defaultMode": "acceptEdits"
+  },
+  "worktree": {
+    "baseRef": "head"
+  },
+  "subagents": {
+    "maxDepth": 2,
+    "concurrency": 3
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "echo 'FS-SESSION-START-HOOK-CONTEXT'" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "echo 'FS-PROMPT-HOOK-CONTEXT'" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/tools/write-guard.sh\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "if": "Bash(git *)",
+        "hooks": [
+          { "type": "command", "command": "echo 'FS-POST-GIT-HOOK' >> \"$CLAUDE_PROJECT_DIR/.claude/.hook-log\"" }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          { "type": "command", "command": "echo seeded > .worktree-seeded" }
+        ]
+      }
+    ],
+    "FuturisticUnknownEvent": [
+      {
+        "hooks": [
+          { "type": "command", "command": "echo never-fires" }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          { "type": "prompt", "prompt": "This handler type is degraded in v1" }
+        ]
+      }
+    ]
+  },
+  "futureUnknownSetting": { "nested": true },
+  "outputStyle": "concise"
+}

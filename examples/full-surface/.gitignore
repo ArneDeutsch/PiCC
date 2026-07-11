@@ -1,0 +1,6 @@
+.claude/worktrees/
+.claude/.piclaudex/
+.claude/.hook-log
+.env.local
+config/*.secret
+greetings.log

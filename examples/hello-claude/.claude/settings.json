@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": ["Bash(node *)", "Read(src/**)"],
+    "deny": ["Read(.env)", "Bash(rm -rf *)"]
+  },
+  "env": {
+    "HELLO_CLAUDE": "1"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\",\"additionalContext\":\"warn-only-guard: writing files is being watched\"}}'"
+          }
+        ]
+      }
+    ]
+  }
+}

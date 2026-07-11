@@ -1,0 +1,5 @@
+{
+  "name": "bundled-fixture-plugin",
+  "description": "Project-bundled plugin structure that must load without error.",
+  "version": "1.0.0"
+}

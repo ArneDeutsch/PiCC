@@ -1,0 +1,3 @@
+# Gitignored files to copy into each new worktree so builds/tests work on entry.
+.env.local
+config/*.secret
