@@ -4,17 +4,52 @@
   "description": "Agentic harness that runs Claude Code projects unchanged on GPT/Codex models, built as an extension bundle on Pi.",
   "type": "module",
   "license": "MIT",
+  "author": "Arne <arne@idedeluxe.com>",
+  "homepage": "https://github.com/arne/piclaudex#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arne/piclaudex.git"
+  },
+  "bugs": {
+    "url": "https://github.com/arne/piclaudex/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "claude",
+    "codex",
+    "gpt",
+    "chatgpt",
+    "agent",
+    "coding-agent",
+    "harness",
+    "pi",
+    "skills",
+    "subagents",
+    "worktree"
+  ],
   "bin": {
     "piclaudex": "bin/piclaudex.mjs"
   },
+  "files": [
+    "src",
+    "bin",
+    "examples",
+    "doc/*.md",
+    "LICENSE",
+    "README.md"
+  ],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "test:unit": "vitest run --exclude \"**/e2e-*.test.ts\"",
+    "test:e2e": "vitest run test/e2e-live-pi.test.ts",
+    "gen:capabilities": "node scripts/gen-capability-matrix.mjs",
+    "prepublishOnly": "npm run typecheck"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "^0.80.6",
