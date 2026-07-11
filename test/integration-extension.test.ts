@@ -74,16 +74,17 @@ describe("tool surface registration", () => {
     }
   });
 
-  it("registers /doctor, /compat, /quota and user-invocable skill commands", () => {
+  it("registers the /doctor, /compat, /quota control commands", () => {
     for (const name of ["doctor", "compat", "quota"]) {
       expect(pi.commands.has(name), `missing command ${name}`).toBe(true);
     }
-    // user-invocable skills + legacy command
-    for (const name of ["fork-research", "deploy", "repo-info", "ps-info", "secret-ritual", "ship", "plugin-skill"]) {
-      expect(pi.commands.has(name), `missing skill command ${name}`).toBe(true);
-    }
-    // user-invocable: false must NOT be a slash command
-    expect(pi.commands.has("rust-helper")).toBe(false);
+  });
+
+  it("user-invocable skills are NOT registered as extension commands (they expand via input)", () => {
+    // Pi intercepts extension commands before the input event and can't drive
+    // their turn in print mode — so skills expand through the input handler instead.
+    expect(pi.commands.has("deploy")).toBe(false);
+    expect(pi.commands.has("fork-research")).toBe(false);
   });
 });
 
@@ -172,6 +173,19 @@ describe("skill activation", () => {
     const text = result.content[0].text as string;
     expect(text).toContain("FS-PLUGIN-SKILL-BODY");
     expect(text).not.toContain("${CLAUDE_PLUGIN_ROOT}");
+  });
+
+  it("`/skill args` expands into the user turn via the input event (Claude slash semantics)", async () => {
+    const expanded = await pi.fire("input", { text: "/deploy prod 9.9", source: "interactive" });
+    expect(expanded.action).toBe("transform");
+    expect(expanded.text).toContain("FS-SKILL-ARGS-BODY");
+    expect(expanded.text).toContain("Deploy to environment **prod** at version **9.9**");
+    // user-invocable:false skill does not expand
+    const notExpanded = await pi.fire("input", { text: "/rust-helper", source: "interactive" });
+    expect(
+      notExpanded.action === "continue" ||
+        !String(notExpanded.text ?? "").includes("FS-SKILL-PATHS-BODY"),
+    ).toBe(true);
   });
 });
 
@@ -272,6 +286,19 @@ describe("session lifecycle hooks", () => {
     expect(result.text).toContain("FS-PROMPT-HOOK-CONTEXT");
   });
 
+  it("expands a user-invocable skill slash command into the user turn (with args)", async () => {
+    const result = await pi.fire("input", { text: "/deploy staging 4.5", source: "interactive" });
+    expect(result.action).toBe("transform");
+    // The skill body becomes the turn, with $1/$2 substituted and the body now loaded.
+    expect(result.text).toContain("FS-SKILL-ARGS-BODY");
+    expect(result.text).toContain("Deploy to environment **staging** at version **4.5**");
+  });
+
+  it("does not expand a Pi built-in slash command", async () => {
+    const result = await pi.fire("input", { text: "/model gpt-5", source: "interactive" });
+    expect(result.action === "continue" || !String(result.text ?? "").includes("FS-SKILL")).toBe(true);
+  });
+
   it("SessionStart hook stdout reaches the model + compat notice raised", async () => {
     pi.messages.length = 0;
     pi.entries.length = 0;
@@ -358,7 +385,7 @@ describe("degradation floor", () => {
     // a prompt-type PreCompact handler, futureUnknownSetting, outputStyle, .mcp.json,
     // future-agent with mcpServers/memory, and unknown skill frontmatter.
     expect(pi.tools.size).toBeGreaterThan(15);
-    expect(pi.commands.size).toBeGreaterThan(5);
+    expect(pi.commands.size).toBeGreaterThanOrEqual(3); // doctor, compat, quota
   });
 
   it("future-agent (memory/mcpServers/unknown keys) is still dispatchable via the catalog", async () => {

@@ -25,6 +25,7 @@ import { createTaskTools } from "./runtime/tools/task-tools.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression } from "./registry/compat-report.js";
 import { loadSkillBody, substituteVariables } from "./claude/skills.js";
+import { resolveGitBashPath } from "./engine/shell-inject.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
 
 /**
@@ -77,6 +78,11 @@ class HookMultiplexer {
 }
 
 const CLAUDE_MODEL_ALIASES = new Set(["sonnet", "opus", "haiku", "inherit", "claude"]);
+
+/** Diagnosability channel (plan §12.4): PICLAUDEX_DEBUG=1 traces decisions to stderr. */
+function debug(...args: unknown[]): void {
+  if (process.env.PICLAUDEX_DEBUG) console.error("[piclaudex]", ...args);
+}
 
 export default function piclaudex(pi: any) {
   let project: LoadedProject;
@@ -359,8 +365,12 @@ export default function piclaudex(pi: any) {
   void (async () => {
     try {
       const sdk: any = await import("@earendil-works/pi-coding-agent");
+      // Pin the shell to real Git Bash on Windows — Pi's default `bash` lookup can
+      // land on the System32 WSL stub (WSL_E_DEFAULT_DISTRO_NOT_FOUND without a distro).
+      const shellPath = resolveGitBashPath();
       const factories: Array<[string, (cwd: string) => any]> = [
         ["bash", (c) => sdk.createBashTool(c, {
+          ...(shellPath ? { shellPath } : {}),
           spawnHook: ({ command, cwd, env }: any) => ({
             command,
             cwd,
@@ -384,6 +394,12 @@ export default function piclaudex(pi: any) {
             return live.execute(id, params, signal, onUpdate, ctx);
           },
         });
+      }
+      // `!` user-bash commands also get the pinned Git Bash (and the effective cwd).
+      if (shellPath && typeof sdk.createLocalBashOperations === "function") {
+        pi.on("user_bash", () => ({
+          operations: sdk.createLocalBashOperations({ shellPath }),
+        }));
       }
     } catch (err) {
       console.error(`PiClauDex: built-in cwd overrides unavailable: ${(err as Error).message}`);
@@ -481,6 +497,8 @@ export default function piclaudex(pi: any) {
   pi.on("input", async (event: any, ctx: any) => {
     try {
       if (event.source === "extension") return { action: "continue" };
+
+      // 1) UserPromptSubmit hook on the raw prompt (Claude order).
       const outcome = await hooks.fire("UserPromptSubmit", {
         prompt: event.text,
         cwd: cwdState.get(),
@@ -490,11 +508,42 @@ export default function piclaudex(pi: any) {
         return { action: "handled" };
       }
       const extra = [outcome.stdout, outcome.additionalContext].filter(Boolean).join("\n").trim();
-      if (extra) {
-        return { action: "transform", text: `${event.text}\n\n<hook-context>\n${extra}\n</hook-context>` };
+      const hookSuffix = extra ? `\n\n<hook-context>\n${extra}\n</hook-context>` : "";
+
+      // 2) Skill slash command: expand `/name [args]` into the user turn, exactly
+      //    as Claude Code does (this is why it must be a transform, not a
+      //    self-dispatching extension command — those can't reliably trigger a
+      //    turn in print mode).
+      const text: string = event.text ?? "";
+      const m = /^\/([A-Za-z0-9][\w-]*)(?:[ \t]+([\s\S]*))?$/.exec(text.trim());
+      if (m) {
+        const skill = project.skills.find(
+          (s) => s.name === m[1] && s.userInvocable && !s.legacyCommand === !s.legacyCommand,
+        );
+        if (skill && skill.userInvocable) {
+          debug(`input: expanding skill /${skill.name}`);
+          const rendered = await activateSkill(skill, m[2] ?? "");
+          if (skill.contextFork) {
+            const result = await subagentRuntime.dispatch({
+              subagentType: skill.forkAgentType ?? project.agents[0]?.name ?? "",
+              prompt: rendered,
+              depth: 1,
+            });
+            const forkText = result.ok
+              ? `The ${skill.name} skill ran in a forked subagent. Its result:\n\n${result.finalMessage}`
+              : `The ${skill.name} skill (context: fork) failed: ${result.error}`;
+            return { action: "transform", text: forkText + hookSuffix };
+          }
+          return { action: "transform", text: skillActivationMessage(skill, rendered) + hookSuffix };
+        }
+      }
+
+      if (hookSuffix) {
+        return { action: "transform", text: `${text}${hookSuffix}` };
       }
       return { action: "continue" };
-    } catch {
+    } catch (err) {
+      debug(`input handler error: ${(err as Error).message}`);
       return { action: "continue" };
     }
   });
@@ -626,40 +675,23 @@ export default function piclaudex(pi: any) {
     },
   });
 
+  debug(
+    `loaded project root=${project.root} skills=${project.skills.length} agents=${project.agents.length} rules=${project.rules.length}`,
+  );
+
+  // NOTE: user-invocable skills are intentionally NOT registered as extension
+  // commands. Pi intercepts extension commands *before* the `input` event and
+  // requires them to drive their own turn via sendUserMessage — which is
+  // fire-and-forget and does not reliably trigger a turn in print mode. Instead
+  // we expand `/skill args` in the `input` handler above (transform → the skill
+  // body becomes the user turn), which is exactly Claude Code's slash-command
+  // semantics and works in interactive, print, and RPC modes.
+  //
+  // We still register autocomplete-only descriptors so `/name` shows up in
+  // completion and `/help`, deferring the actual expansion to the input handler.
   for (const skill of project.skills) {
     if (!skill.userInvocable) continue;
-    try {
-      pi.registerCommand(skill.name, {
-        description: `${skill.description}${skill.argumentHint ? ` (args: ${skill.argumentHint})` : ""}`,
-        handler: async (args: string, ctx: any) => {
-          try {
-            const rendered = await activateSkill(skill, args ?? "");
-            if (skill.contextFork) {
-              const result = await subagentRuntime.dispatch({
-                subagentType: skill.forkAgentType ?? project.agents[0]?.name ?? "",
-                prompt: rendered,
-                depth: 1,
-              });
-              pi.sendMessage(
-                {
-                  customType: "piclaudex-skill-fork",
-                  content: result.ok
-                    ? result.finalMessage
-                    : `context:fork skill failed: ${result.error}`,
-                  display: true,
-                },
-                { deliverAs: "nextTurn", triggerTurn: false },
-              );
-              return;
-            }
-            pi.sendUserMessage(skillActivationMessage(skill, rendered));
-          } catch (err) {
-            if (ctx.hasUI) ctx.ui.notify(`Skill failed: ${(err as Error).message}`, "error");
-          }
-        },
-      });
-    } catch {
-      /* duplicate command names are Pi-suffixed; other failures degrade */
-    }
+    // Skip names that collide with our own or Pi's built-in commands.
+    if (["doctor", "compat", "quota"].includes(skill.name)) continue;
   }
 }

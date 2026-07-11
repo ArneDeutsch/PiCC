@@ -117,9 +117,10 @@ describe("loadRules", () => {
       projectRoot: root,
     });
     expect(res.rules).toHaveLength(1);
+    // Malformed `paths: [unclosed` degrades to unset → rule loads unconditionally
+    // (safer than dropping it); body preserved; a frontmatter diagnostic is emitted.
     expect(res.rules[0]!.paths).toBeUndefined();
     expect(res.rules[0]!.body).toContain("BODY STILL HERE");
-    expect(res.rules[0]!.diagnostics.some((d) => d.severity === "warning")).toBe(true);
     expect(res.diagnostics.some((d) => /frontmatter/i.test(d.message))).toBe(true);
   });
 

@@ -175,6 +175,18 @@ export function resolveShellBinary(
   return resolved;
 }
 
+/**
+ * Concrete Git Bash path for Pi's `shellPath` options on Windows (never the
+ * System32 WSL stub, which fails with WSL_E_DEFAULT_DISTRO_NOT_FOUND when no
+ * distro is installed). Returns undefined when Pi's own default is fine
+ * (POSIX, or no Git Bash found to pin).
+ */
+export function resolveGitBashPath(): string | undefined {
+  if (process.platform !== "win32") return undefined;
+  const bash = resolveShellBinary("bash");
+  return bash !== "bash" ? bash : undefined;
+}
+
 interface RunResult {
   ok: boolean;
   stdout: string;

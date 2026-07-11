@@ -75,12 +75,19 @@ export interface DispatchResult {
 
 async function loadRealSdk(): Promise<PiSdk> {
   const mod = await import("@earendil-works/pi-coding-agent");
+  const { resolveGitBashPath } = await import("../engine/shell-inject.js");
   const m = mod as unknown as Record<string, any>;
+  const shellPath = resolveGitBashPath();
   return {
     createAgentSession: (options) => m.createAgentSession(options),
     DefaultResourceLoader: m.DefaultResourceLoader,
     inMemorySessionManager: (cwd: string) => m.SessionManager.inMemory(cwd),
-    inMemorySettingsManager: () => m.SettingsManager.inMemory({ compaction: { enabled: true } }),
+    // shellPath pins subagent bash to Git Bash on Windows (see resolveGitBashPath).
+    inMemorySettingsManager: () =>
+      m.SettingsManager.inMemory({
+        compaction: { enabled: true },
+        ...(shellPath ? { shellPath } : {}),
+      }),
     agentDir: () => m.getAgentDir(),
   };
 }

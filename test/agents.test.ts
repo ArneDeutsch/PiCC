@@ -224,15 +224,26 @@ describe("loadAgents", () => {
     expect(a.tools).toBeUndefined();
   });
 
-  it("never throws on malformed frontmatter; agent degrades to body-only and is skipped", () => {
+  it("never throws on malformed frontmatter; recoverable fields are parsed leniently", () => {
     writeAgent(
       "broken.md",
       ["---", "tools: [unclosed", "description: d", "---", "Body"].join("\n"),
     );
+    const { agents } = load();
+    // Lenient recovery (plan §2.1 mechanical fidelity — Claude Code accepts these):
+    // the description is recovered so the agent loads; the malformed inline
+    // collection `[unclosed` is dropped rather than turned into a bogus tool.
+    expect(agents).toHaveLength(1);
+    expect(agents[0]?.name).toBe("broken");
+    expect(agents[0]?.description).toBe("d");
+    expect(agents[0]?.tools).toBeUndefined();
+  });
+
+  it("skips a truly description-less agent even after lenient recovery", () => {
+    writeAgent("nodesc.md", ["---", "tools: Read", "---", "Body"].join("\n"));
     const { agents, diagnostics } = load();
-    expect(agents).toHaveLength(0); // frontmatter degraded to {}, so no description
-    expect(diagnostics.some((d) => d.message.includes("Malformed frontmatter"))).toBe(true);
-    expect(diagnostics.some((d) => d.message.includes("no description"))).toBe(true);
+    expect(agents.find((a) => a.source.path.endsWith("nodesc.md"))).toBeUndefined();
+    expect(diagnostics.some((d) => /no description/i.test(d.message))).toBe(true);
   });
 
   it("scans one level of subdirectories, but not deeper", () => {
