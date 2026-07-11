@@ -19,7 +19,7 @@ function makeRepo(): string {
   tempDirs.push(dir);
   git(dir, "init");
   git(dir, "config", "user.email", "test@example.com");
-  git(dir, "config", "user.name", "PiClauDex Test");
+  git(dir, "config", "user.name", "PiCC Test");
   git(dir, "config", "commit.gpgsign", "false");
   git(dir, "config", "core.autocrlf", "false");
   fs.writeFileSync(path.join(dir, "README.md"), "hello\n", "utf8");
@@ -90,7 +90,7 @@ describe("WorktreeManager.enter (name mode)", () => {
     expect(git(expectedDir, "rev-parse", "--abbrev-ref", "HEAD")).toBe("worktree-feat1");
 
     // base-commit file records the pre-create HEAD, newline-terminated.
-    const baseFile = path.join(expectedDir, ".claude", ".piclaudex", "base-commit");
+    const baseFile = path.join(expectedDir, ".claude", ".picc", "base-commit");
     expect(fs.readFileSync(baseFile, "utf8")).toBe(`${headBefore}\n`);
 
     // Active worktree is locked against concurrent cleanup.

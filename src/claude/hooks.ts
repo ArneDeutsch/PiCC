@@ -51,7 +51,7 @@ export function parseHookConfig(raw: unknown, sourcePath: string): ParsedHookCon
       if (!SUPPORTED_EVENT_SET.has(eventName)) {
         diagnostics.push({
           severity: "info",
-          message: `hook event "${eventName}" is not supported by PiClauDex; entries are kept but will never fire`,
+          message: `hook event "${eventName}" is not supported by PiCC; entries are kept but will never fire`,
           source: sourcePath,
         });
       }
@@ -189,7 +189,7 @@ function parseHandler(
   if (!EXECUTABLE_HANDLER_TYPES.has(typeText)) {
     diagnostics.push({
       severity: "info",
-      message: `hook event "${eventName}": handler type "${typeText}" is not executable in PiClauDex; kept but degraded to a no-op`,
+      message: `hook event "${eventName}": handler type "${typeText}" is not executable in PiCC; kept but degraded to a no-op`,
       source: sourcePath,
     });
   } else if (typeText === "command" && handler.command === undefined) {

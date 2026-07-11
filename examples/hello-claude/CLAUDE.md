@@ -1,6 +1,6 @@
 # hello-claude
 
-This project is authored for Claude Code and runs unchanged under PiClauDex.
+This project is authored for Claude Code and runs unchanged under PiCC.
 
 @AGENTS.md
 

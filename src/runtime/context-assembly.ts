@@ -5,7 +5,7 @@ import { findNestedClaudeMd } from "../claude/claude-md.js";
 import { ruleAppliesTo } from "../claude/rules.js";
 
 /**
- * Assembles the PiClauDex system-prompt suffix appended to Pi's prompt each turn
+ * Assembles the PiCC system-prompt suffix appended to Pi's prompt each turn
  * (design doc §2: before_agent_start). Because the system prompt is rebuilt every
  * turn and never compacted away, this is ALSO the primary compaction-preservation
  * mechanism (plan §9): root CLAUDE.md, unconditional rules, the skill listing, the
@@ -41,7 +41,7 @@ export interface AssemblyInputs {
   contextWindowChars?: number;
 }
 
-const HARNESS_CONVENTIONS = `## Claude Code compatibility conventions (PiClauDex)
+const HARNESS_CONVENTIONS = `## Claude Code compatibility conventions (PiCC)
 
 You are running a project authored for Claude Code. Honor its conventions:
 - Claude tool names map onto your tools: Read/Write/Edit/Bash are read/write/edit/bash; use Grep/Glob/WebFetch/WebSearch/Agent/Task tools by their listed names.

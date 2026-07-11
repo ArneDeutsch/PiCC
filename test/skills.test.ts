@@ -27,7 +27,7 @@ function write(rel: string, content: string): string {
 }
 
 beforeAll(() => {
-  root = fs.mkdtempSync(path.join(os.tmpdir(), "piclaudex-skills-"));
+  root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-skills-"));
   skillsDir = path.join(root, ".claude", "skills");
   commandsDir = path.join(root, ".claude", "commands");
 

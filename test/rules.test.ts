@@ -8,7 +8,7 @@ import type { ClaudeRule } from "../src/types.js";
 let tmp: string;
 
 beforeEach(() => {
-  tmp = fs.mkdtempSync(path.join(os.tmpdir(), "piclaudex-rules-"));
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), "picc-rules-"));
 });
 
 afterEach(() => {

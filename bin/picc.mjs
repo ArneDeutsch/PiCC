@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * PiClauDex launcher: runs Pi with the PiClauDex extension preloaded, in the
+ * PiCC launcher: runs Pi with the PiCC extension preloaded, in the
  * current directory (the target Claude Code project). All arguments pass through
- * to pi (e.g. `piclaudex -p "..."`, `piclaudex --model openai/gpt-5.5`).
+ * to pi (e.g. `picc -p "..."`, `picc --model openai/gpt-5.5`).
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -10,7 +10,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const extension = path.join(here, "..", "src", "index.ts");
+// Load via the picc/ entry (thin re-export of src/index.ts) so Pi's startup
+// banner labels the extension `picc` rather than `src`.
+const extension = path.join(here, "..", "picc", "index.ts");
 
 /**
  * Resolve Pi's CLI (dist/cli.js). The package's `exports` map exposes only an
@@ -58,8 +60,8 @@ function resolvePiCli() {
 const piCli = resolvePiCli();
 if (!piCli) {
   console.error(
-    "PiClauDex: could not find the Pi CLI (@earendil-works/pi-coding-agent).\n" +
-      "Run `npm install` (or `npm install -g piclaudex`) so the dependency is present.",
+    "PiCC: could not find the Pi CLI (@earendil-works/pi-coding-agent).\n" +
+      "Run `npm install` (or `npm install -g picc`) so the dependency is present.",
   );
   process.exit(1);
 }

@@ -43,7 +43,7 @@ const child = spawnSync(process.execPath, ["--import", "tsx", "-e", extractor], 
 if (child.status !== 0) {
   console.error("Failed to load the capability registry via tsx.");
   if (child.stderr) console.error(child.stderr);
-  console.error("Is tsx installed? Run `npm install` in the PiClauDex checkout.");
+  console.error("Is tsx installed? Run `npm install` in the PiCC checkout.");
   process.exit(1);
 }
 
@@ -117,7 +117,7 @@ lines.push("");
 lines.push(
   `> **Generated file — do not edit by hand.** This matrix is generated from the living ` +
     `capability registry (\`src/registry/capability-registry.ts\`), the single source of truth ` +
-    `for what PiClauDex supports (plan §17). The same registry drives the runtime \`/doctor\` ` +
+    `for what PiCC supports (plan §17). The same registry drives the runtime \`/doctor\` ` +
     `report and the startup compatibility notice, so this document cannot drift from actual behavior.`,
 );
 lines.push(">");

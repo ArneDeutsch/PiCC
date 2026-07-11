@@ -1,6 +1,6 @@
-# PiClauDex
+# PiCC
 
-PiClauDex is an agentic harness that lets **GPT/Codex models run on projects built for Claude Code — unchanged**.
+PiCC is an agentic harness that lets **GPT/Codex models run on projects built for Claude Code — unchanged**.
 
 ## The vision
 

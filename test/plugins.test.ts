@@ -13,7 +13,7 @@ import {
 let tmpRoot: string;
 
 beforeEach(() => {
-  tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "piclaudex-plugins-"));
+  tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "picc-plugins-"));
 });
 
 afterEach(() => {

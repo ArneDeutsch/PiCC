@@ -1,6 +1,6 @@
-# 00 — Overview: A GPT/Codex Harness for Claude Code Projects (PiClauDex)
+# 00 — Overview: A GPT/Codex Harness for Claude Code Projects (PiCC)
 
-> **Goal.** Build a harness ("PiClauDex") that lets GPT/Codex models — run on a personal
+> **Goal.** Build a harness ("PiCC") that lets GPT/Codex models — run on a personal
 > ChatGPT subscription — work on projects authored and tuned for **Claude Code**, with **no changes
 > to those projects**. The GPT models should read and use the project's Claude-format skills,
 > subagents, hooks, `settings.json` permissions, `CLAUDE.md` hierarchy, and the worktree-based
@@ -107,7 +107,7 @@ stopgap). See `06 §2–3`.
 
 ## Recommendation in one paragraph
 
-Build PiClauDex as a thin **extension bundle on Pi**: a `.claude/skills` loader, a `.claude/agents`
+Build PiCC as a thin **extension bundle on Pi**: a `.claude/skills` loader, a `.claude/agents`
 loader + flat parallel subagent runtime returning verbatim locked-YAML, `EnterWorktree`/`ExitWorktree`
 (git worktree + cwd swap + `CLAUDE_BASE` + Windows best-effort-remove/reap), a `settings.json`
 allow-list permission engine on Pi's `tool_call` hook, a `PreToolUse`/`PostToolUse` shell-hook shim

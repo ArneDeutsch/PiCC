@@ -38,7 +38,7 @@ export async function renderSkillForActivation(opts: {
     CLAUDE_SESSION_ID: opts.sessionId,
     CLAUDE_EFFORT: opts.effort ?? "",
     CLAUDE_PLUGIN_ROOT: opts.pluginRoot ?? opts.skill.baseDir,
-    CLAUDE_PLUGIN_DATA: opts.pluginData ?? path.join(opts.projectRoot, ".claude", ".piclaudex", "plugin-data"),
+    CLAUDE_PLUGIN_DATA: opts.pluginData ?? path.join(opts.projectRoot, ".claude", ".picc", "plugin-data"),
   });
 
   const injected = await preprocessShellInjection(withVars, {

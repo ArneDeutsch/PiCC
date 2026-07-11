@@ -11,7 +11,7 @@ import {
 let tmp: string;
 
 beforeEach(() => {
-  tmp = fs.mkdtempSync(path.join(os.tmpdir(), "piclaudex-claudemd-"));
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), "picc-claudemd-"));
 });
 
 afterEach(() => {

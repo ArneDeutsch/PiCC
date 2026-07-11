@@ -1,4 +1,4 @@
-/** A fake Pi ExtensionAPI capturing everything the PiClauDex extension registers. */
+/** A fake Pi ExtensionAPI capturing everything the PiCC extension registers. */
 export interface FakePi {
   api: Record<string, unknown>;
   tools: Map<string, any>;

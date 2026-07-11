@@ -9,7 +9,7 @@ import { startMockModel, type CapturedRequest, type Turn } from "./helpers/mock-
 
 /**
  * Live end-to-end tests: the REAL Pi CLI (dist/cli.js) runs the assembled
- * PiClauDex extension against the hello-claude fixture, driven by a local mock
+ * PiCC extension against the hello-claude fixture, driven by a local mock
  * OpenAI-compatible model server — no real network, no subscription.
  *
  * Each scenario scripts the model's turns, spawns `pi -p`, and asserts on the
@@ -130,7 +130,7 @@ async function runPi(opts: {
           // telemetry) only — provider requests to the local mock still flow.
           PI_OFFLINE: "1",
           PI_SKIP_VERSION_CHECK: "1",
-          PICLAUDEX_CLAUDE_USER_DIR: emptyUserDir,
+          PICC_CLAUDE_USER_DIR: emptyUserDir,
           NO_COLOR: "1",
           ...opts.extraEnv,
         },
@@ -215,7 +215,7 @@ const PYTHON_BIN = (() => {
 })();
 
 describe.skipIf(cliMissing)(
-  "e2e: real Pi CLI + PiClauDex extension + mock OpenAI model",
+  "e2e: real Pi CLI + PiCC extension + mock OpenAI model",
   () => {
     if (cliMissing) {
       // eslint-disable-next-line no-console

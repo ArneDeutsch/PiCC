@@ -13,7 +13,7 @@ import { isDirectory, readTextSafe } from "../util/fs.js";
  * - Worktree dir:   <projectRoot>/.claude/worktrees/<flat-name>/
  * - Branch:         worktree-<flat-name> (the "leftover base branch")
  * - Base commit:    resolved to a concrete SHA BEFORE `git worktree add`, and
- *                   recorded in <dir>/.claude/.piclaudex/base-commit
+ *                   recorded in <dir>/.claude/.picc/base-commit
  *
  * Windows posture: best-effort removal (strip reparse points, tolerate stuck
  * `worktree remove`, reap orphans later), core.longpaths, never hard-fail.
@@ -56,9 +56,9 @@ export interface WorktreeReapResult {
 }
 
 const SOURCE = "worktrees";
-const LOCK_REASON = "piclaudex-active";
+const LOCK_REASON = "picc-active";
 const IGNORE_LINE = ".claude/worktrees/";
-const BASE_COMMIT_REL = path.join(".claude", ".piclaudex", "base-commit");
+const BASE_COMMIT_REL = path.join(".claude", ".picc", "base-commit");
 
 function diag(severity: Diagnostic["severity"], message: string): Diagnostic {
   return { severity, message, source: SOURCE };
@@ -463,7 +463,7 @@ export class WorktreeManager {
    * harness-owned, never touches tracked files (plan §2.3).
    */
   private async ensureWorktreesIgnored(diagnostics: Diagnostic[]): Promise<void> {
-    const probe = ".claude/worktrees/__piclaudex_probe__";
+    const probe = ".claude/worktrees/__picc_probe__";
     const check = await this.git(["check-ignore", "-q", "--", probe]);
     if (check.code === 0) return; // already ignored (via .gitignore or info/exclude)
 

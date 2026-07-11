@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import piclaudex from "../src/index.js";
+import picc from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 
@@ -25,10 +25,10 @@ beforeAll(async () => {
   // Hermetic user scope: don't absorb the developer's real ~/.claude.
   const userDir = path.join(dir, ".claude-user");
   fs.mkdirSync(userDir, { recursive: true });
-  process.env.PICLAUDEX_CLAUDE_USER_DIR = userDir;
+  process.env.PICC_CLAUDE_USER_DIR = userDir;
   process.chdir(dir);
   pi = fakePi();
-  piclaudex(pi.api as never);
+  picc(pi.api as never);
   // built-in overrides register via an async IIFE — give it a beat
   await new Promise((r) => setTimeout(r, 500));
 });
@@ -64,7 +64,7 @@ describe("tool surface registration", () => {
     expect(pi.tools.has("AskUserQuestion")).toBe(true);
     const stub = pi.tools.get("AskUserQuestion");
     const result = await stub.execute("t", { anything: true });
-    expect(result.content[0].text).toContain("not available in PiClauDex");
+    expect(result.content[0].text).toContain("not available in PiCC");
     expect(result.details.degraded).toBe(true);
   });
 
@@ -344,7 +344,7 @@ describe("session lifecycle hooks", () => {
     const sent = pi.messages.map((m) => String(m.message.content)).join("\n");
     expect(sent).toContain("FS-SESSION-START-HOOK-CONTEXT");
     // compat: fixture declares ask rules, defaultMode, .mcp.json, unknown settings → one notice
-    const noticeEntry = pi.entries.find((e) => e.customType === "piclaudex-compat");
+    const noticeEntry = pi.entries.find((e) => e.customType === "picc-compat");
     expect(noticeEntry).toBeDefined();
     const notice = String(noticeEntry?.data?.notice ?? "");
     expect(notice).toContain("SAFETY");

@@ -250,7 +250,7 @@ export function renderStartupNotice(
   if (degradedCount === 0) return undefined;
 
   const lines: string[] = [
-    `PiClauDex compatibility: ${degradedCount} feature(s) degraded for this project`,
+    `PiCC compatibility: ${degradedCount} feature(s) degraded for this project`,
   ];
   if (safety.length > 0) {
     lines.push("SAFETY:");
@@ -275,7 +275,7 @@ const TIER_ORDER = ["partial", "degraded-noop", "not-supported", "na", "full"] a
 /** Full /doctor breakdown (§6.2), generated from the registry (§17). */
 export function renderDoctorReport(project: ClaudeProject, report: CompatReport): string {
   const lines: string[] = [
-    `PiClauDex compatibility report — baseline ${CLAUDE_BASELINE}`,
+    `PiCC compatibility report — baseline ${CLAUDE_BASELINE}`,
     `Project: ${project.root}`,
     "",
   ];
@@ -324,11 +324,11 @@ export function renderDoctorReport(project: ClaudeProject, report: CompatReport)
 // ---------------------------------------------------------------------------
 
 /**
- * Harness-owned, non-tracked location per §2.3: `.claude/.piclaudex/` is
- * PiClauDex state, never a tracked project file.
+ * Harness-owned, non-tracked location per §2.3: `.claude/.picc/` is
+ * PiCC state, never a tracked project file.
  */
 function suppressionPath(projectRoot: string): string {
-  return path.join(projectRoot, ".claude", ".piclaudex", "compat-ack.json");
+  return path.join(projectRoot, ".claude", ".picc", "compat-ack.json");
 }
 
 /** True when the startup notice has been acknowledged/suppressed for this project. */
@@ -339,7 +339,7 @@ export function readSuppression(projectRoot: string): boolean {
   return data?.suppressed === true;
 }
 
-/** Persist the suppression flag (creates `.claude/.piclaudex/` as needed). Never throws. */
+/** Persist the suppression flag (creates `.claude/.picc/` as needed). Never throws. */
 export function writeSuppression(projectRoot: string, v: boolean): void {
   const file = suppressionPath(projectRoot);
   try {

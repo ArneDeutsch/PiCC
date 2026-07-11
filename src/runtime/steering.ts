@@ -8,11 +8,11 @@ import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 /**
  * Harness control surface config (plan §10, §13.2) — lives OUTSIDE the target project
  * (user level) or in a harness-owned gitignored location inside it (never tracked files):
- *   - user:    ~/.piclaudex/config.json
- *   - project: <projectRoot>/.claude/.piclaudex/config.json   (harness-owned, gitignored)
+ *   - user:    ~/.picc/config.json
+ *   - project: <projectRoot>/.claude/.picc/config.json   (harness-owned, gitignored)
  * Project overrides user, key-wise.
  */
-export interface PiClauDexConfig {
+export interface PiCCConfig {
   /** Model override, e.g. "openai/gpt-5.5". */
   model?: string;
   /** Default effort/thinking level: off|minimal|low|medium|high|xhigh|max. */
@@ -41,16 +41,16 @@ const DEFAULT_EFFORT_MAP: Record<string, string> = {
 };
 
 export function userConfigPath(): string {
-  return path.join(os.homedir(), ".piclaudex", "config.json");
+  return path.join(os.homedir(), ".picc", "config.json");
 }
 
 export function projectConfigPath(projectRoot: string): string {
-  return path.join(projectRoot, ".claude", ".piclaudex", "config.json");
+  return path.join(projectRoot, ".claude", ".picc", "config.json");
 }
 
-export function loadPiClauDexConfig(projectRoot: string): PiClauDexConfig {
+export function loadPiCCConfig(projectRoot: string): PiCCConfig {
   const diagnostics: Diagnostic[] = [];
-  const result: PiClauDexConfig = {
+  const result: PiCCConfig = {
     steering: {},
     effortMap: { ...DEFAULT_EFFORT_MAP },
     diagnostics,
@@ -60,7 +60,7 @@ export function loadPiClauDexConfig(projectRoot: string): PiClauDexConfig {
     if (text === undefined) continue;
     const parsed = parseJsonSafe<Record<string, unknown>>(text);
     if (!parsed || typeof parsed !== "object") {
-      diagnostics.push({ severity: "warning", message: `Malformed PiClauDex config ignored: ${file}` });
+      diagnostics.push({ severity: "warning", message: `Malformed PiCC config ignored: ${file}` });
       continue;
     }
     if (typeof parsed.model === "string") result.model = parsed.model;
@@ -93,7 +93,7 @@ export function saveProjectConfigValue(projectRoot: string, key: string, value: 
 }
 
 /** Steering text for the active model: concatenation of all matching patterns. */
-export function steeringForModel(config: PiClauDexConfig, modelRef: string): string | undefined {
+export function steeringForModel(config: PiCCConfig, modelRef: string): string | undefined {
   const parts: string[] = [];
   for (const [pattern, text] of Object.entries(config.steering)) {
     if (picomatch(pattern, { nocase: true })(modelRef)) parts.push(text);
@@ -105,7 +105,7 @@ export function steeringForModel(config: PiClauDexConfig, modelRef: string): str
  * Map a Claude `effort:` value (or prose like "apply maximum reasoning effort")
  * onto a Pi thinking level. Pass-through undefined when unmappable.
  */
-export function mapEffort(config: PiClauDexConfig, effort: string | undefined): string | undefined {
+export function mapEffort(config: PiCCConfig, effort: string | undefined): string | undefined {
   if (!effort) return undefined;
   const key = effort.trim().toLowerCase();
   if (config.effortMap[key]) return config.effortMap[key];

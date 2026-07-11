@@ -1,6 +1,6 @@
-# PiClauDex
+# PiCC
 
-[![CI](https://github.com/arne/piclaudex/actions/workflows/ci.yml/badge.svg)](https://github.com/arne/piclaudex/actions/workflows/ci.yml)
+[![CI](https://github.com/arne/picc/actions/workflows/ci.yml/badge.svg)](https://github.com/arne/picc/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Run projects built for Claude Code — unchanged — on GPT/Codex models, from your ChatGPT
@@ -8,37 +8,37 @@ subscription.**
 
 Many projects carry a `.claude/` corpus: `CLAUDE.md` hierarchies, skills, subagents,
 `settings.json` permissions and hooks, rules, and workflows that rely on worktree isolation and
-parallel sessions. PiClauDex is an agentic harness that reads and honors those Claude-format
+parallel sessions. PiCC is an agentic harness that reads and honors those Claude-format
 artifacts natively on GPT models, with **no changes to the target project**.
 
 It is built as an extension bundle on [Pi](https://github.com/earendil-works/pi) (MIT), which
 already solves the two hardest problems — spending a ChatGPT/Codex subscription and abstracting
-the model provider. PiClauDex adds the Claude Code compatibility layer on top.
+the model provider. PiCC adds the Claude Code compatibility layer on top.
 
 ## Quick start
 
 One command per line — works the same in PowerShell, cmd, and bash:
 
 ```powershell
-git clone <this-repo> piclaudex
-cd piclaudex
+git clone <this-repo> picc
+cd picc
 npm install --ignore-scripts
 npm link
 
 cd \path\to\your-claude-code-project
-piclaudex
+picc
 # /login  → ChatGPT Plus/Pro (Codex subscription)   (one-time)
 # /model  → pick a GPT model
 # work as you would in Claude Code: /your-skill, subagent fan-outs, worktrees…
 ```
 
 Windows notes: Git Bash (from Git for Windows) must be installed; if PowerShell blocks the
-`piclaudex` script shim, use `piclaudex.cmd` or `Set-ExecutionPolicy -Scope CurrentUser
+`picc` script shim, use `picc.cmd` or `Set-ExecutionPolicy -Scope CurrentUser
 RemoteSigned`. Details per shell/OS in the guide.
 
-Prefer a package install? Once published, `npm install -g piclaudex` gives you the same
-`piclaudex` command; or install a release tarball with `npm install -g piclaudex-0.1.0.tgz`.
-PiClauDex ships as TypeScript source that Pi loads via jiti — there is no build step.
+Prefer a package install? Once published, `npm install -g picc` gives you the same
+`picc` command; or install a release tarball with `npm install -g picc-0.1.0.tgz`.
+PiCC ships as TypeScript source that Pi loads via jiti — there is no build step.
 
 **→ Full documentation: [doc/user-guide.md](doc/user-guide.md)** ·
 [Architecture](doc/architecture.md) · [Supported features](doc/supported-features.md) ·
@@ -81,7 +81,7 @@ configured outside the project — see the [user guide](doc/user-guide.md#5-cont
 | Path | Contents |
 |---|---|
 | `src/` | The harness: loaders (`claude/`), engines (`engine/`), Pi runtime layer (`runtime/`), capability registry (`registry/`), extension entry (`index.ts`) |
-| `bin/piclaudex.mjs` | Launcher (Pi + extension preloaded) |
+| `bin/picc.mjs` | Launcher (Pi + extension preloaded) |
 | `examples/hello-claude` | Minimal demo project |
 | `examples/full-surface` | Conformance fixture exercising the whole feature surface |
 | `test/` | Unit, offline-integration, and live e2e tests (vitest) — see [doc/testing.md](doc/testing.md) |

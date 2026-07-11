@@ -1,6 +1,6 @@
-# PiClauDex — Feature Plan (WHAT & WHY)
+# PiCC — Feature Plan (WHAT & WHY)
 
-> **Status:** Target definition. This document states **what** PiClauDex will do and **why**,
+> **Status:** Target definition. This document states **what** PiCC will do and **why**,
 > and — equally — **what it deliberately will not do** and why. It is written as an
 > acceptance target: when the behaviors and criteria below hold, the harness is "done" for
 > its first complete version. It intentionally omits **how** (architecture, module layout,
@@ -18,7 +18,7 @@
 
 ## 1. Purpose
 
-PiClauDex is an agentic harness that lets **GPT/Codex models — driven from a personal
+PiCC is an agentic harness that lets **GPT/Codex models — driven from a personal
 ChatGPT/Codex subscription — run projects authored and tuned for Claude Code, unchanged.**
 
 Many projects carry a `.claude/` corpus: `CLAUDE.md` hierarchies, skills, subagents,
@@ -35,7 +35,7 @@ Claude Code project compatibility**, not a bespoke DemonMatrix runner.
 We do not need 100% Claude Code parity. We need enough fidelity that real Claude Code projects
 run on GPT models without friction or adaptation.
 
-**Base harness.** PiClauDex is built as an extension bundle on **Pi** (`earendil-works/pi`, MIT,
+**Base harness.** PiCC is built as an extension bundle on **Pi** (`earendil-works/pi`, MIT,
 TypeScript), which already solves the two hardest problems: spending a ChatGPT/Codex
 subscription and abstracting the model provider. The Pi choice is an assumption of this plan;
 fork-vs-depend is a HOW question deferred to a design document (§18).
@@ -53,7 +53,7 @@ These principles decide the hard cases throughout the rest of the document.
   progressive disclosure — must behave the way the **unchanged project expects**. The fidelity
   bar is defined by **what the project's own tooling and skills assume**, not by matching Claude
   Code's private internal file formats. This is what makes a project usable interchangeably
-  across Claude Code and PiClauDex.
+  across Claude Code and PiCC.
 - **Behavioral fidelity — best-effort and steerable.** GPT models are not Claude and will never
   behave identically. That is acceptable and unavoidable. We narrow the gap with a **harness-side
   model-steering layer** (§13.2), and accept that occasional project-side wording changes may be
@@ -77,7 +77,7 @@ These principles decide the hard cases throughout the rest of the document.
 The harness never writes to a project's tracked files to make it run. Harness configuration
 (model choice, effort, steering text, auth) lives **outside** the project or in
 harness-owned/ignored locations. The one project-level convention we rely on — `.claude/worktrees/`
-being gitignored — is a standard Claude Code expectation, not a PiClauDex-specific edit.
+being gitignored — is a standard Claude Code expectation, not a PiCC-specific edit.
 
 ### 2.4 Forward-compatible by default
 
@@ -480,7 +480,7 @@ calls — and a reasonable, familiar-feeling set of message-history navigation f
 **What we do NOT do.** Rebuild Claude Code's console wholesale or chase 1:1 parity. We inherit and
 extend Pi's TUI rather than fight or replace it.
 
-**Why.** Familiarity reduces friction when switching between Claude Code and PiClauDex, but UX
+**Why.** Familiarity reduces friction when switching between Claude Code and PiCC, but UX
 parity is an open-ended sink; bounding it as best-effort keeps it from consuming the project.
 
 ---
@@ -568,7 +568,7 @@ independently of the one reference project and guard against regressions as Clau
    (Win + Linux) execution.
 5. **Compatibility report** correctly names degraded/deferred features for a project that uses
    them.
-6. **Dogfood (secondary signal):** PiClauDex's own growing `.claude/` corpus runs under PiClauDex
+6. **Dogfood (secondary signal):** PiCC's own growing `.claude/` corpus runs under PiCC
    with a GPT model, unchanged.
 
 ---
@@ -582,7 +582,7 @@ independently of the one reference project and guard against regressions as Clau
   Artifacts (§7).
 - Plugin **installation** and marketplace machinery (we load installed plugins' content — §4.9).
 - Auto-memory/persistent agent memory as a functional store (§7).
-- Mid-flight handoff of a live worktree/session between Claude Code and PiClauDex (compatible-but-
+- Mid-flight handoff of a live worktree/session between Claude Code and PiCC (compatible-but-
   independent only — §2.5).
 - Changing the target project to make it run (§2.3).
 - Deciding or capping a project's fan-out/subscription economics (author's concern — §8).
@@ -623,7 +623,7 @@ unassessed; the registry is updatable as a data change.
 
 ## 18. Base-harness assumption
 
-PiClauDex is built on **Pi** (`earendil-works/pi`, MIT, TypeScript). Whether we **fork** Pi or
+PiCC is built on **Pi** (`earendil-works/pi`, MIT, TypeScript). Whether we **fork** Pi or
 **depend on the published package + ship extensions** is a HOW decision deferred to a design
 document; the recommendation to start with depend-plus-extensions (and fork only if we hit a wall)
 is noted but not settled here.

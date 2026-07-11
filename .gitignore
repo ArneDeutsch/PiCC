@@ -4,5 +4,5 @@ dist/
 *.tgz
 .claude/worktrees/
 examples/**/.claude/worktrees/
-examples/**/.claude/.piclaudex/
+examples/**/.claude/.picc/
 test-output/

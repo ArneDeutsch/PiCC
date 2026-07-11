@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import piclaudex from "../src/index.js";
+import picc from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 
@@ -19,50 +19,50 @@ import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 let dir: string;
 let pi: FakePi;
 const originalCwd = process.cwd();
-const savedUserDir = process.env.PICLAUDEX_CLAUDE_USER_DIR;
+const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
 
 beforeAll(async () => {
   dir = materializeFixture("full-surface");
   // Hermetic user scope: don't absorb the developer's real ~/.claude.
   const userDir = path.join(dir, ".claude-user");
   fs.mkdirSync(userDir, { recursive: true });
-  process.env.PICLAUDEX_CLAUDE_USER_DIR = userDir;
+  process.env.PICC_CLAUDE_USER_DIR = userDir;
   process.chdir(dir);
   pi = fakePi();
-  piclaudex(pi.api as never);
+  picc(pi.api as never);
   // built-in overrides register via an async IIFE — give it a beat
   await new Promise((r) => setTimeout(r, 500));
 });
 
 afterAll(() => {
   process.chdir(originalCwd);
-  if (savedUserDir === undefined) delete process.env.PICLAUDEX_CLAUDE_USER_DIR;
-  else process.env.PICLAUDEX_CLAUDE_USER_DIR = savedUserDir;
+  if (savedUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+  else process.env.PICC_CLAUDE_USER_DIR = savedUserDir;
   cleanupFixture(dir);
 });
 
 describe("control commands never leak to the model", () => {
-  it("/skills is handled by the input event and emits a piclaudex-skills message", async () => {
+  it("/skills is handled by the input event and emits a picc-skills message", async () => {
     pi.messages.length = 0;
     const outcome = await pi.fire("input", { text: "/skills", source: "interactive" });
 
     // Short-circuited: the handler answered instead of producing a model turn.
     expect(outcome).toEqual({ action: "handled" });
 
-    const skillsMsg = pi.messages.find((m) => m.message?.customType === "piclaudex-skills");
-    expect(skillsMsg, "expected a piclaudex-skills message").toBeDefined();
+    const skillsMsg = pi.messages.find((m) => m.message?.customType === "picc-skills");
+    expect(skillsMsg, "expected a picc-skills message").toBeDefined();
     const content = String(skillsMsg?.message?.content ?? "");
     expect(content).toContain("skill(s) loaded");
     expect(content).toContain("/deploy");
   });
 
-  it("/agents is handled and emits a piclaudex-agents message", async () => {
+  it("/agents is handled and emits a picc-agents message", async () => {
     pi.messages.length = 0;
     const outcome = await pi.fire("input", { text: "/agents", source: "interactive" });
 
     expect(outcome).toEqual({ action: "handled" });
-    const agentsMsg = pi.messages.find((m) => m.message?.customType === "piclaudex-agents");
-    expect(agentsMsg, "expected a piclaudex-agents message").toBeDefined();
+    const agentsMsg = pi.messages.find((m) => m.message?.customType === "picc-agents");
+    expect(agentsMsg, "expected a picc-agents message").toBeDefined();
     expect(String(agentsMsg?.message?.content ?? "")).toContain("reviewer");
   });
 

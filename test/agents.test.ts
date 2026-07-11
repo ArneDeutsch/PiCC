@@ -8,7 +8,7 @@ import type { ClaudeAgent } from "../src/types.js";
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "piclaudex-agents-"));
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-agents-"));
 });
 
 afterEach(() => {

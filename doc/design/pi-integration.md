@@ -1,27 +1,27 @@
-# PiClauDex ↔ Pi integration contracts
+# PiCC ↔ Pi integration contracts
 
 > **Status:** Working design record. Pinned against **Pi v0.80.6** (`@earendil-works/pi-coding-agent`,
 > `pi-agent-core`, `pi-ai` — all 0.80.6, verified on npm 2026-07-11). Node ≥ 20 (we develop on 24).
-> Source of truth for every Pi API PiClauDex builds on. If Pi churns, update here first.
+> Source of truth for every Pi API PiCC builds on. If Pi churns, update here first.
 >
 > Decision Q1 (fork vs depend): **depend + extension bundle**. Pi is a regular npm dependency;
-> PiClauDex ships as an extension (loaded via `settings.json "extensions"` array, `.pi/extensions/`,
+> PiCC ships as an extension (loaded via `settings.json "extensions"` array, `.pi/extensions/`,
 > or `pi -e`) plus a launcher. No fork.
 
-## 1. How PiClauDex attaches to Pi
+## 1. How PiCC attaches to Pi
 
 Pi extensions are TS modules (loaded via jiti, no compilation) exporting
 `default function (pi: ExtensionAPI)` (async allowed; awaited before startup completes).
-PiClauDex is **one extension bundle** with an entry `src/index.ts` that registers everything.
+PiCC is **one extension bundle** with an entry `src/index.ts` that registers everything.
 
 Launch modes we support:
-- `pi -e <path-to-piclaudex>` in the target project (dev/test).
+- `pi -e <path-to-picc>` in the target project (dev/test).
 - `"extensions": ["<path>"]` in `~/.pi/agent/settings.json` or `.pi/settings.json` (persistent).
-- A `piclaudex` launcher (thin wrapper) that runs Pi with the extension preloaded.
+- A `picc` launcher (thin wrapper) that runs Pi with the extension preloaded.
 
 ## 2. Pi API surface we use (pinned)
 
-| PiClauDex subsystem | Pi API used |
+| PiCC subsystem | Pi API used |
 |---|---|
 | System-prompt assembly (CLAUDE.md hierarchy, rules, agent-description catalog, skill listing, steering layer, compat notice) | `pi.on("before_agent_start")` → return `{ systemPrompt }` (chained); `event.systemPromptOptions` for Pi's own context-file/skill view |
 | Context injection mid-session (nested CLAUDE.md, path-scoped rules on file touch, skill activation, hook `additionalContext`) | `pi.sendMessage({ customType, content, display }, { deliverAs: "steer" })`; for tool-triggered injection return extra text in `tool_result` patches |
@@ -39,7 +39,7 @@ Launch modes we support:
 | Env & exec | `pi.exec(cmd, args, { signal, timeout })` for git/hook commands; hooks additionally need shell execution via `node:child_process` (stdin JSON contract Pi's exec doesn't cover: we use `spawn` directly) |
 | Quota | `ctx.getContextUsage()`; subscription quota via provider headers on `after_provider_response` (rate-limit headers) + `/login`-stored auth; degrade gracefully if absent |
 | Compat notices / UX | `ctx.ui.notify`, `pi.appendEntry` + `pi.registerEntryRenderer` (TUI-only), `ctx.ui.setStatus` |
-| Skill listing into system prompt | We do **not** feed `.claude/skills` through Pi's own skill discovery (Pi's XML listing + `/skill:` semantics differ from Claude's budgeted listing, `$ARGUMENTS`, shell-injection, `context: fork`). PiClauDex owns the Claude skill pipeline end-to-end: listing text appended in `before_agent_start`, activation via our own `Skill` tool + slash commands. Pi's native skill/command discovery of `.pi/`/`.agents/` stays untouched. |
+| Skill listing into system prompt | We do **not** feed `.claude/skills` through Pi's own skill discovery (Pi's XML listing + `/skill:` semantics differ from Claude's budgeted listing, `$ARGUMENTS`, shell-injection, `context: fork`). PiCC owns the Claude skill pipeline end-to-end: listing text appended in `before_agent_start`, activation via our own `Skill` tool + slash commands. Pi's native skill/command discovery of `.pi/`/`.agents/` stays untouched. |
 
 ## 3. Key mechanics decisions
 

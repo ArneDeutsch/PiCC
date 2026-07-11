@@ -1,6 +1,6 @@
 /**
  * The living capability registry (plan §17) — the single source of truth for
- * what PiClauDex supports relative to the named Claude Code baseline.
+ * what PiCC supports relative to the named Claude Code baseline.
  *
  * Every known Claude Code tool, hook event, setting, frontmatter field, and
  * runtime feature is enumerated here with a support tier and a one-line note.

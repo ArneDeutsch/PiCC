@@ -14,8 +14,8 @@ export function materializeFixture(name: string): string {
   const git = (...args: string[]) =>
     execFileSync("git", args, { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
   git("init", "-b", "main");
-  git("config", "user.email", "test@piclaudex.local");
-  git("config", "user.name", "PiClauDex Test");
+  git("config", "user.email", "test@picc.local");
+  git("config", "user.name", "PiCC Test");
   git("config", "core.autocrlf", "false");
   git("add", "-A");
   git("commit", "-m", "fixture baseline", "--no-gpg-sign");

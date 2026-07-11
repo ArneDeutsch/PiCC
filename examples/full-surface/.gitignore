@@ -1,5 +1,5 @@
 .claude/worktrees/
-.claude/.piclaudex/
+.claude/.picc/
 .claude/.hook-log
 .env.local
 config/*.secret

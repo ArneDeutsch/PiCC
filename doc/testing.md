@@ -1,6 +1,6 @@
 # Testing
 
-PiClauDex is tested in three layers, from isolated units up to the **real Pi CLI driven by a mock
+PiCC is tested in three layers, from isolated units up to the **real Pi CLI driven by a mock
 model** — no live subscription and no real network are needed for the full suite (plan §14).
 
 ## Running the tests
@@ -43,7 +43,7 @@ have no process/network dependencies.
 
 ## Layer 2 — offline integration (fakePi)
 
-`test/integration-extension.test.ts` loads the **whole extension** (`piclaudex(pi)`) against the
+`test/integration-extension.test.ts` loads the **whole extension** (`picc(pi)`) against the
 `examples/full-surface` conformance fixture through `test/helpers/fake-pi.ts` — a hand-written stand-in
 for Pi's `ExtensionAPI` that records every tool, command, event handler, message, and model/thinking
 call the extension makes. `test/helpers/fixture.ts` copies a fixture from `examples/` into a temp dir
@@ -67,7 +67,7 @@ Pi actually sent**. A test therefore asserts on both sides of the loop — the r
 "model" (system prompt, advertised tools, tool results, absence of leaked secrets) and the real
 on-disk side effects (files written, git worktrees created).
 
-**What the mock-model harness proves:** that PiClauDex works as a real Pi extension through Pi's
+**What the mock-model harness proves:** that PiCC works as a real Pi extension through Pi's
 genuine agent loop, tool dispatch, streaming, and print mode — not just against the fake API. Current
 scenarios cover: full context assembly into the system prompt (with the skill body staying
 lazy-loaded), a scripted `write` tool call round-tripping its result plus a PreToolUse warn hook's
@@ -93,6 +93,6 @@ lazy-loaded), a scripted `write` tool call round-tripping its result plus a PreT
 
 Everything above runs offline in CI. What CI **cannot** do is validate a real ChatGPT/Codex
 subscription, because that requires an interactive `/login` OAuth flow and a paid account. That step
-is manual: run `piclaudex` against a project, `/login`, pick a GPT/Codex model, and confirm a live
+is manual: run `picc` against a project, `/login`, pick a GPT/Codex model, and confirm a live
 turn (see the user guide's verification status). The mock-model e2e layer exercises every code path
-*except* the provider auth/transport, which is Pi's, not PiClauDex's.
+*except* the provider auth/transport, which is Pi's, not PiCC's.

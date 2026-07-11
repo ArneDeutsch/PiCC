@@ -4,7 +4,7 @@ import path from "node:path";
 import { Type } from "typebox";
 import type { HookOutcome, HookPayload, ToolCallDescriptor } from "./types.js";
 import { loadClaudeProject, type LoadedProject } from "./project.js";
-import { loadPiClauDexConfig, mapEffort, steeringForModel } from "./runtime/steering.js";
+import { loadPiCCConfig, mapEffort, steeringForModel } from "./runtime/steering.js";
 import { CwdState } from "./runtime/cwd-state.js";
 import { HookRunner } from "./engine/hook-runner.js";
 import { PermissionEngine } from "./engine/permissions.js";
@@ -30,7 +30,7 @@ import { applyUnicodeSafeProcessEnv, unicodeSafeSubprocessEnv } from "./util/env
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
 
 /**
- * PiClauDex — the Pi extension entry.
+ * PiCC — the Pi extension entry.
  *
  * Loads the target project's Claude Code artifact corpus and wires it into Pi:
  * system-prompt assembly each turn (also the compaction-preservation mechanism),
@@ -80,30 +80,30 @@ class HookMultiplexer {
 
 const CLAUDE_MODEL_ALIASES = new Set(["sonnet", "opus", "haiku", "inherit", "claude"]);
 
-/** Diagnosability channel (plan §12.4): PICLAUDEX_DEBUG=1 traces decisions to stderr. */
+/** Diagnosability channel (plan §12.4): PICC_DEBUG=1 traces decisions to stderr. */
 function debug(...args: unknown[]): void {
-  if (process.env.PICLAUDEX_DEBUG) console.error("[piclaudex]", ...args);
+  if (process.env.PICC_DEBUG) console.error("[picc]", ...args);
 }
 
-export default function piclaudex(pi: any) {
+export default function picc(pi: any) {
   // UTF-8 stdio for any child process (fixes Windows cp1252 UnicodeEncodeError,
   // e.g. Python printing `→`). Set before any subprocess can be spawned.
   applyUnicodeSafeProcessEnv();
 
   let project: LoadedProject;
   try {
-    // PICLAUDEX_CLAUDE_USER_DIR overrides ~/.claude (tests, multi-profile setups).
+    // PICC_CLAUDE_USER_DIR overrides ~/.claude (tests, multi-profile setups).
     project = loadClaudeProject({
       cwd: process.cwd(),
-      userDir: process.env.PICLAUDEX_CLAUDE_USER_DIR || undefined,
+      userDir: process.env.PICC_CLAUDE_USER_DIR || undefined,
     });
   } catch (err) {
     // Completeness floor: a broken project must never crash the harness.
-    console.error(`PiClauDex failed to load project artifacts: ${(err as Error).message}`);
+    console.error(`PiCC failed to load project artifacts: ${(err as Error).message}`);
     return;
   }
 
-  const config = loadPiClauDexConfig(project.root);
+  const config = loadPiCCConfig(project.root);
   const sessionId = randomUUID();
   const cwdState = new CwdState(project.cwd);
   const baseHooks = new HookRunner({
@@ -362,7 +362,7 @@ export default function piclaudex(pi: any) {
     try {
       pi.registerTool(tool);
     } catch (err) {
-      console.error(`PiClauDex: failed to register tool: ${(err as Error).message}`);
+      console.error(`PiCC: failed to register tool: ${(err as Error).message}`);
     }
   }
 
@@ -411,7 +411,7 @@ export default function piclaudex(pi: any) {
         }));
       }
     } catch (err) {
-      console.error(`PiClauDex: built-in cwd overrides unavailable: ${(err as Error).message}`);
+      console.error(`PiCC: built-in cwd overrides unavailable: ${(err as Error).message}`);
     }
   })();
 
@@ -441,7 +441,7 @@ export default function piclaudex(pi: any) {
       });
       return { systemPrompt: `${event.systemPrompt}\n\n${suffix}` };
     } catch (err) {
-      console.error(`PiClauDex prompt assembly failed: ${(err as Error).message}`);
+      console.error(`PiCC prompt assembly failed: ${(err as Error).message}`);
       return undefined;
     }
   });
@@ -479,7 +479,7 @@ export default function piclaudex(pi: any) {
       const hookContext = [outcome.stdout, outcome.additionalContext].filter(Boolean).join("\n");
       if (hookContext.trim()) {
         pi.sendMessage(
-          { customType: "piclaudex-hook-context", content: hookContext.trim(), display: true },
+          { customType: "picc-hook-context", content: hookContext.trim(), display: true },
           { deliverAs: "nextTurn" },
         );
       }
@@ -487,11 +487,11 @@ export default function piclaudex(pi: any) {
         const notice = renderStartupNotice(compat, { suppressed: false });
         if (notice && ctx.hasUI) ctx.ui.notify(notice.split("\n")[0] + " — run /doctor", "warning");
         if (notice) {
-          pi.appendEntry("piclaudex-compat", { notice });
+          pi.appendEntry("picc-compat", { notice });
         }
       }
     } catch (err) {
-      console.error(`PiClauDex session_start failed: ${(err as Error).message}`);
+      console.error(`PiCC session_start failed: ${(err as Error).message}`);
     }
   });
 
@@ -507,7 +507,7 @@ export default function piclaudex(pi: any) {
     try {
       if (event.source === "extension") return { action: "continue" };
 
-      // 0) PiClauDex control commands (/doctor /compat /quota /skills /agents).
+      // 0) PiCC control commands (/doctor /compat /quota /skills /agents).
       //    In interactive mode Pi's own command router intercepts these before
       //    the input event; this branch covers the other modes so a control
       //    command is never sent to the model.
@@ -518,7 +518,7 @@ export default function piclaudex(pi: any) {
         const output = runControlCommand(cmd[1]!, cmd[2] ?? "", ctx);
         if (output !== undefined) {
           pi.sendMessage(
-            { customType: `piclaudex-${cmd[1]}`, content: output, display: true },
+            { customType: `picc-${cmd[1]}`, content: output, display: true },
             { deliverAs: "nextTurn" },
           );
           return { action: "handled" };
@@ -613,8 +613,8 @@ export default function piclaudex(pi: any) {
           .join("\n\n");
         pi.sendMessage(
           {
-            customType: "piclaudex-preserved",
-            content: `Context preserved across compaction (PiClauDex):\n\n${preserved}`,
+            customType: "picc-preserved",
+            content: `Context preserved across compaction (PiCC):\n\n${preserved}`,
             display: false,
           },
           { deliverAs: "nextTurn" },
@@ -663,7 +663,7 @@ export default function piclaudex(pi: any) {
       `  /${s.name}${s.argumentHint ? ` ${s.argumentHint}` : ""} — ${s.description}` +
       (s.source.pluginName ? ` [plugin: ${s.source.pluginName}]` : ` [${s.source.scope}]`);
     const lines = [
-      `PiClauDex — ${project.skills.length} skill(s) loaded`,
+      `PiCC — ${project.skills.length} skill(s) loaded`,
       "",
       `Invocable as slash commands (${invocable.length}):`,
       ...invocable.map(fmt),
@@ -682,7 +682,7 @@ export default function piclaudex(pi: any) {
   function renderAgentsList(): string {
     if (!project.agents.length) return "No subagents are defined for this project.";
     const lines = [
-      `PiClauDex — ${project.agents.length} subagent(s) available (dispatch with the Agent tool):`,
+      `PiCC — ${project.agents.length} subagent(s) available (dispatch with the Agent tool):`,
       "",
     ];
     for (const a of project.agents) {
@@ -746,11 +746,11 @@ export default function piclaudex(pi: any) {
   }
 
   const CONTROL_COMMANDS: Record<string, string> = {
-    doctor: "PiClauDex: full compatibility breakdown for this project",
-    compat: "PiClauDex: show or suppress the compatibility notice (usage: /compat [suppress|show])",
-    quota: "PiClauDex: subscription/rate-limit info from the last provider response",
-    skills: "PiClauDex: list the project's Claude skills (invocable + model-only)",
-    agents: "PiClauDex: list the subagents available for dispatch",
+    doctor: "PiCC: full compatibility breakdown for this project",
+    compat: "PiCC: show or suppress the compatibility notice (usage: /compat [suppress|show])",
+    quota: "PiCC: subscription/rate-limit info from the last provider response",
+    skills: "PiCC: list the project's Claude skills (invocable + model-only)",
+    agents: "PiCC: list the subagents available for dispatch",
   };
   for (const [name, description] of Object.entries(CONTROL_COMMANDS)) {
     pi.registerCommand(name, {
@@ -759,7 +759,7 @@ export default function piclaudex(pi: any) {
         const output = runControlCommand(name, args, ctx);
         if (output !== undefined) {
           pi.sendMessage(
-            { customType: `piclaudex-${name}`, content: output, display: true },
+            { customType: `picc-${name}`, content: output, display: true },
             { deliverAs: "nextTurn" },
           );
         }
@@ -788,10 +788,10 @@ export default function piclaudex(pi: any) {
     if (fs.existsSync(gitInfo)) {
       const excludeFile = path.join(gitInfo, "exclude");
       const existing = fs.existsSync(excludeFile) ? fs.readFileSync(excludeFile, "utf8") : "";
-      if (!existing.includes(".claude/.piclaudex/")) {
+      if (!existing.includes(".claude/.picc/")) {
         fs.appendFileSync(
           excludeFile,
-          `${existing.endsWith("\n") || existing === "" ? "" : "\n"}.claude/.piclaudex/\n`,
+          `${existing.endsWith("\n") || existing === "" ? "" : "\n"}.claude/.picc/\n`,
         );
       }
     }
@@ -799,7 +799,7 @@ export default function piclaudex(pi: any) {
     /* best-effort — never fail startup over gitignore hygiene */
   }
 
-  const promptStubDir = path.join(project.root, ".claude", ".piclaudex", "prompts");
+  const promptStubDir = path.join(project.root, ".claude", ".picc", "prompts");
   // Our own commands + Pi built-in slash commands — don't advertise stubs that
   // would duplicate or be shadowed by these (the skill still executes via the
   // input handler if the name is typed and not intercepted as a built-in).
@@ -823,7 +823,7 @@ export default function piclaudex(pi: any) {
         "---",
         `Run the project skill "${skill.name}"${skill.argumentHint ? ` with arguments: $ARGUMENTS` : ""}.`,
         "",
-        `(PiClauDex expands this skill in full — including argument, variable and`,
+        `(PiCC expands this skill in full — including argument, variable and`,
         `shell-injection processing — when you invoke /${skill.name}.)`,
       ].join("\n");
       fs.writeFileSync(path.join(promptStubDir, `${skill.name}.md`), fm, "utf8");

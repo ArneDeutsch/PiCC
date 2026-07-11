@@ -4,7 +4,7 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 /**
  * Graceful-degradation stubs (plan §4.8, §7): tool names a project can
  * reference in `tools:`, permission rules, or hook `if:` conditions must
- * resolve predictably even when PiClauDex does not implement them.
+ * resolve predictably even when PiCC does not implement them.
  *
  * Each stub is a callable no-op: it accepts arbitrary parameters and
  * RETURNS (never throws) a notice telling the model to proceed without the
@@ -15,14 +15,14 @@ export function createDegradeStub(toolName: string, note: string): ToolDefinitio
   return defineTool({
     name: toolName,
     label: toolName,
-    description: `Not available in PiClauDex (degraded no-op): ${note}`,
+    description: `Not available in PiCC (degraded no-op): ${note}`,
     parameters: Type.Object({}, { additionalProperties: true }),
     async execute() {
       return {
         content: [
           {
             type: "text" as const,
-            text: `The ${toolName} tool is not available in PiClauDex: ${note}. Proceed without it.`,
+            text: `The ${toolName} tool is not available in PiCC: ${note}. Proceed without it.`,
           },
         ],
         details: { degraded: true },
@@ -47,11 +47,11 @@ export const DEGRADED_TOOLS: Array<{ name: string; note: string }> = [
   },
   {
     name: "ExitPlanMode",
-    note: "plan mode is a no-op in PiClauDex; simply continue with the work (plan §7)",
+    note: "plan mode is a no-op in PiCC; simply continue with the work (plan §7)",
   },
   {
     name: "EnterPlanMode",
-    note: "plan mode is a no-op in PiClauDex; treat planning guidance as ordinary instructions (plan §7)",
+    note: "plan mode is a no-op in PiCC; treat planning guidance as ordinary instructions (plan §7)",
   },
   {
     name: "Artifact",
@@ -59,6 +59,6 @@ export const DEGRADED_TOOLS: Array<{ name: string; note: string }> = [
   },
   {
     name: "computer",
-    note: "computer use is out of scope for PiClauDex (plan §7)",
+    note: "computer use is out of scope for PiCC (plan §7)",
   },
 ];

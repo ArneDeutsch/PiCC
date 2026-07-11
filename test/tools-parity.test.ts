@@ -44,7 +44,7 @@ describe("Grep tool (JS fallback)", () => {
   let grep: ToolDefinition;
 
   beforeAll(() => {
-    dir = mkTmpDir("piclaudex-grep-");
+    dir = mkTmpDir("picc-grep-");
     fs.writeFileSync(path.join(dir, "a.txt"), "hello world\nfoo bar\nHello Again\nfoo (paren\n");
     fs.mkdirSync(path.join(dir, "sub"));
     fs.writeFileSync(path.join(dir, "sub", "b.js"), "const foo = 1;\nfunction hello() {}\n");
@@ -152,7 +152,7 @@ describe("Glob tool", () => {
   let glob: ToolDefinition;
 
   beforeAll(() => {
-    dir = mkTmpDir("piclaudex-glob-");
+    dir = mkTmpDir("picc-glob-");
     fs.writeFileSync(path.join(dir, "old.txt"), "old");
     fs.writeFileSync(path.join(dir, "new.txt"), "new");
     fs.mkdirSync(path.join(dir, "sub"));
@@ -292,7 +292,7 @@ describe("degrade stubs", () => {
   it("return non-error content and are callable with arbitrary params", async () => {
     const stub = createDegradeStub("NotebookEdit", "notebook editing is not implemented");
     const res = await run(stub, { anything: 123, nested: { deep: true }, cells: ["x"] });
-    expect(res.text).toContain("The NotebookEdit tool is not available in PiClauDex");
+    expect(res.text).toContain("The NotebookEdit tool is not available in PiCC");
     expect(res.text).toContain("Proceed without it.");
     expect(res.details.degraded).toBe(true);
   });

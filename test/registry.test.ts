@@ -91,9 +91,9 @@ function makeAgent(overrides: Partial<ClaudeAgent> = {}): ClaudeAgent {
 
 function makeProject(overrides: Partial<ClaudeProject> = {}): ClaudeProject {
   return {
-    root: path.join(os.tmpdir(), "piclaudex-nonexistent-root"),
-    cwd: path.join(os.tmpdir(), "piclaudex-nonexistent-root"),
-    userDir: path.join(os.tmpdir(), "piclaudex-nonexistent-home", ".claude"),
+    root: path.join(os.tmpdir(), "picc-nonexistent-root"),
+    cwd: path.join(os.tmpdir(), "picc-nonexistent-root"),
+    userDir: path.join(os.tmpdir(), "picc-nonexistent-home", ".claude"),
     settings: makeSettings(),
     skills: [],
     agents: [],
@@ -106,7 +106,7 @@ function makeProject(overrides: Partial<ClaudeProject> = {}): ClaudeProject {
 
 const tempDirs: string[] = [];
 function makeTempDir(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "piclaudex-registry-test-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-registry-test-"));
   tempDirs.push(dir);
   return dir;
 }
@@ -406,9 +406,9 @@ describe("renderStartupNotice", () => {
     const text = notice as string;
 
     // Exactly one notice header.
-    const headers = text.match(/PiClauDex compatibility: \d+ feature\(s\) degraded for this project/g);
+    const headers = text.match(/PiCC compatibility: \d+ feature\(s\) degraded for this project/g);
     expect(headers).toHaveLength(1);
-    expect(text.startsWith("PiClauDex compatibility:")).toBe(true);
+    expect(text.startsWith("PiCC compatibility:")).toBe(true);
 
     // SAFETY block precedes functionality lines; ask divergence is called out.
     const safetyIdx = text.indexOf("SAFETY:");
@@ -478,13 +478,13 @@ describe("renderDoctorReport", () => {
 // ---------------------------------------------------------------------------
 
 describe("suppression persistence", () => {
-  it("round-trips through .claude/.piclaudex/compat-ack.json", () => {
+  it("round-trips through .claude/.picc/compat-ack.json", () => {
     const root = makeTempDir();
     expect(readSuppression(root)).toBe(false);
 
     writeSuppression(root, true);
     expect(readSuppression(root)).toBe(true);
-    expect(fs.existsSync(path.join(root, ".claude", ".piclaudex", "compat-ack.json"))).toBe(true);
+    expect(fs.existsSync(path.join(root, ".claude", ".picc", "compat-ack.json"))).toBe(true);
 
     writeSuppression(root, false);
     expect(readSuppression(root)).toBe(false);
@@ -493,7 +493,7 @@ describe("suppression persistence", () => {
   it("treats a missing or malformed file as not suppressed", () => {
     const root = makeTempDir();
     expect(readSuppression(root)).toBe(false);
-    const file = path.join(root, ".claude", ".piclaudex", "compat-ack.json");
+    const file = path.join(root, ".claude", ".picc", "compat-ack.json");
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, "not json at all", "utf8");
     expect(readSuppression(root)).toBe(false);

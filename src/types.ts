@@ -1,7 +1,7 @@
 /**
- * Shared types for all PiClauDex subsystems.
+ * Shared types for all PiCC subsystems.
  *
- * Terminology follows the plan (doc/plan/piclaudex-plan.md):
+ * Terminology follows the plan (doc/plan/picc-plan.md):
  * - "artifact": any Claude-format input (skill, agent, rule, CLAUDE.md, settings, hook, plugin content)
  * - "scope": where an artifact was discovered; precedence flows managed > local > project > user.
  */

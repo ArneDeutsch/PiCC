@@ -220,7 +220,7 @@ export class SubagentRuntime {
         skillsOverride: () => ({ skills: [], diagnostics: [] }),
         agentsFilesOverride: () => ({ agentsFiles: [] }),
         promptsOverride: () => ({ prompts: [], diagnostics: [] }),
-        extensionFactories: [{ name: `piclaudex-guard-${agent.name}`, factory: guard }],
+        extensionFactories: [{ name: `picc-guard-${agent.name}`, factory: guard }],
       });
       await loader.reload();
 
@@ -332,7 +332,7 @@ export function createAgentToolDefinition(
       }
       let text = result.finalMessage;
       if (params.run_in_background) {
-        text = `[note: run_in_background is not supported in PiClauDex v1; ran in foreground]\n${text}`;
+        text = `[note: run_in_background is not supported in PiCC v1; ran in foreground]\n${text}`;
       }
       return {
         content: [{ type: "text", text }],

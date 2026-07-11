@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to PiClauDex are documented here. The format is based on
+All notable changes to PiCC are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/).
 
@@ -52,7 +52,7 @@ personal ChatGPT/Codex subscription, built as an extension bundle on
 ### Distribution
 
 - Ships as TypeScript source loaded by Pi via jiti (no build step). Installable by
-  `git clone && npm install && npm link`, or as an npm tarball / package (`piclaudex` bin).
+  `git clone && npm install && npm link`, or as an npm tarball / package (`picc` bin).
 - GitHub Actions CI across Windows + Linux on Node 20 and 22, plus a tag-triggered release that
   packs the tarball and (optionally) publishes to npm.
 

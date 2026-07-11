@@ -1,7 +1,7 @@
-# hello-claude — minimal PiClauDex example project
+# hello-claude — minimal PiCC example project
 
 A tiny project authored **for Claude Code** (CLAUDE.md, `.claude/` skills/agents/rules/settings)
-that PiClauDex runs unchanged on GPT/Codex models.
+that PiCC runs unchanged on GPT/Codex models.
 
 What it exercises:
 
@@ -15,10 +15,10 @@ What it exercises:
 | Permissions | `.claude/settings.json` | `Read(.env)` and `rm -rf` are hard-denied |
 | Hooks | `.claude/settings.json` | Warn-only PreToolUse guard injects context on Write/Edit |
 
-Try it (from this directory, with PiClauDex installed — see the user guide):
+Try it (from this directory, with PiCC installed — see the user guide):
 
 ```bash
-piclaudex            # or: pi -e <path-to-piclaudex>/src/index.ts
+picc            # or: pi -e <path-to-picc>/src/index.ts
 > /greet Ada
 > ask the reviewer agent to review src/hello.js
 ```

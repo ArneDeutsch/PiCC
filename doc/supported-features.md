@@ -1,6 +1,6 @@
 # Supported features
 
-> **Generated file — do not edit by hand.** This matrix is generated from the living capability registry (`src/registry/capability-registry.ts`), the single source of truth for what PiClauDex supports (plan §17). The same registry drives the runtime `/doctor` report and the startup compatibility notice, so this document cannot drift from actual behavior.
+> **Generated file — do not edit by hand.** This matrix is generated from the living capability registry (`src/registry/capability-registry.ts`), the single source of truth for what PiCC supports (plan §17). The same registry drives the runtime `/doctor` report and the startup compatibility notice, so this document cannot drift from actual behavior.
 >
 > **Claude Code baseline:** `claude-code-2.1.x (mid-2026)`. Every support claim is stated relative to this
 > baseline; anything upstream added after it is treated as *unassessed* and degrades safely.

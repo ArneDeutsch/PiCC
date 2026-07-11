@@ -1,7 +1,7 @@
-# PiClauDex architecture
+# PiCC architecture
 
-A contributor's map of how PiClauDex runs a Claude Code project on a GPT/Codex model. It is
-factual and cites file paths; for *what* and *why* see [`doc/plan/piclaudex-plan.md`](plan/piclaudex-plan.md),
+A contributor's map of how PiCC runs a Claude Code project on a GPT/Codex model. It is
+factual and cites file paths; for *what* and *why* see [`doc/plan/picc-plan.md`](plan/picc-plan.md),
 and for the exact Pi API contracts see [`doc/design/pi-integration.md`](design/pi-integration.md).
 
 ## 1. Layered design
@@ -13,9 +13,9 @@ and for the exact Pi API contracts see [`doc/design/pi-integration.md`](design/p
 │  TUI · session persistence · built-in tools (read/write/edit/bash/  │
 │  grep/find/ls) · extension event bus                                │
 └───────────────▲──────────────────────────────── loads as extension ─┘
-                │ default export piclaudex(pi)  (src/index.ts)
+                │ default export picc(pi)  (src/index.ts)
 ┌───────────────┴─────────────────────────────────────────────────────┐
-│  PiClauDex (this repo) — one Pi extension bundle                     │
+│  PiCC (this repo) — one Pi extension bundle                     │
 │                                                                      │
 │  discovery → claude loaders → project model                         │
 │                    │                                                 │
@@ -28,10 +28,10 @@ and for the exact Pi API contracts see [`doc/design/pi-integration.md`](design/p
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-PiClauDex is **not a fork** of Pi (design §Q1): Pi is an ordinary npm dependency
-(`@earendil-works/pi-coding-agent`, `-agent-core`, `-ai`, all pinned `0.80.x`), and PiClauDex
+PiCC is **not a fork** of Pi (design §Q1): Pi is an ordinary npm dependency
+(`@earendil-works/pi-coding-agent`, `-agent-core`, `-ai`, all pinned `0.80.x`), and PiCC
 attaches as a single extension whose entry is `src/index.ts`. Pi supplies everything model- and
-UI-related; PiClauDex supplies Claude Code compatibility and never reimplements auth, the provider
+UI-related; PiCC supplies Claude Code compatibility and never reimplements auth, the provider
 layer, or the TUI (design §3.6).
 
 ## 2. Module map (`src/`)
@@ -107,8 +107,8 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
 - `skill-activation.ts` — the activation pipeline: lazy body load → argument substitution
   (`$ARGUMENTS`, `$N`, named) → `${CLAUDE_*}` variable substitution → `!`-injection. Shared by the
   `Skill` tool, slash commands, and `context: fork` dispatch.
-- `steering.ts` — loads the project-external `PiClauDexConfig` (`~/.piclaudex/config.json` or the
-  gitignored `.claude/.piclaudex/config.json`); provides per-model steering text and the
+- `steering.ts` — loads the project-external `PiCCConfig` (`~/.picc/config.json` or the
+  gitignored `.claude/.picc/config.json`); provides per-model steering text and the
   effort→thinking-level mapping (plan §10, §13.2).
 - `tools/` — the registered Claude-named tools: `web-tools.ts` (`WebFetch`/`WebSearch`, real),
   `search-tools.ts` (`Grep`/`Glob`), `task-tools.ts` (`Task*` tracking), `worktree-tools.ts`
@@ -157,7 +157,7 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers:
    system prompt. This re-asserts the full instruction set each turn — the primary
    compaction-preservation path.
 
-4. **`input`.** In order: intercept PiClauDex control commands so they never reach the model; fire
+4. **`input`.** In order: intercept PiCC control commands so they never reach the model; fire
    the `UserPromptSubmit` hook (block or inject context); expand a `/skill [args]` slash command by
    activating the skill and **transforming the user turn** into the rendered body (Claude Code's
    slash semantics; a transform works in every Pi mode, unlike a self-dispatching command).
@@ -183,7 +183,7 @@ principle in the plan (§2.1 mechanical fidelity).
 
 - **The cwd swap is load-bearing.** A project's own scripts detect worktree vs. main via standard
   git plumbing, which only works if *every* subsequent tool call runs inside the worktree
-  directory. Pi has no session-cwd API, so PiClauDex re-registers the built-in
+  directory. Pi has no session-cwd API, so PiCC re-registers the built-in
   `bash/read/write/edit/grep/find/ls` tools as thin wrappers that rebuild the real tool per call
   against `CwdState.get()` (`src/index.ts`, `cwd-state.ts`, design §3.1). Subagents get their cwd
   natively via `createAgentSession({ cwd })`.

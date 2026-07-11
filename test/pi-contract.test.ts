@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 /**
- * Pi upstream contract smoke test (design doc §4): asserts every Pi API PiClauDex
+ * Pi upstream contract smoke test (design doc §4): asserts every Pi API PiCC
  * builds on exists in the pinned version. If Pi churns, this fails first and loudly.
  */
 describe("pi 0.80.x API contract", () => {
-  it("exports the SDK surface PiClauDex uses", async () => {
+  it("exports the SDK surface PiCC uses", async () => {
     const sdk: Record<string, unknown> = await import("@earendil-works/pi-coding-agent");
     for (const name of [
       "createAgentSession",

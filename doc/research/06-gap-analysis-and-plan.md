@@ -11,7 +11,7 @@
 
 ## 1. Executive recommendation
 
-**Build PiClauDex as a set of extensions on top of Pi (`earendil-works/pi`, MIT, TypeScript).**
+**Build PiCC as a set of extensions on top of Pi (`earendil-works/pi`, MIT, TypeScript).**
 
 The three hardest problems for "run GPT/Codex on my ChatGPT subscription" are **already
 solved and shipped in Pi**:
@@ -39,7 +39,7 @@ Two credible alternatives, and why they lose to Pi for *this* goal, are in §3.
 > `badlogic/pi-mono`); issue #1828 lives in *that* repo, not necessarily a fork you own. It does not
 > change the recommendation — it strengthens it (the auth work is upstream and maintained) — but
 > confirm whether you intend to **fork** Pi or **depend on it + ship extensions**. This is Open
-> Question Q1 (§7). The project name "PiClauDex" (Pi + Claude + Codex) reads as a deliberate choice
+> Question Q1 (§7). The project name "PiCC" (Pi + Claude + Codex) reads as a deliberate choice
 > to build on Pi.
 
 ---
@@ -55,7 +55,7 @@ There are exactly two ways to spend it (`05 §A.5`):
 | **(A) Direct-backend** *(what Pi does)* | Read `~/.codex/auth.json`, call `chatgpt.com/backend-api/codex/responses` with `originator: codex_cli_rs` + versioned UA + `ChatGPT-Account-Id` | Full control of the loop, tools, context; native to Pi | Undocumented endpoint; gray-area ToS; must track originator/UA changes; edge-fragile (403/Cloudflare) | **Working in Pi today** |
 | **(B) Subprocess** | Drive the user's signed-in `codex` as a child process (`codex mcp-server`, `codex exec --json`, or `@openai/codex-sdk`) | Officially supported; no ToS risk; inherits `auth.json` | You inherit Codex's tool loop + sandbox; less control; harder to graft our worktree/subagent semantics on | Supported by OpenAI |
 
-**Recommendation: default to (A) via Pi**, because the whole point of PiClauDex is fine control over
+**Recommendation: default to (A) via Pi**, because the whole point of PiCC is fine control over
 tools/worktrees/subagents that mode (B) would take away. Keep (B) in mind as a fallback if OpenAI
 tightens edge enforcement or bans personal third-party OAuth reuse (Anthropic set that precedent in
 Apr 2026; OpenAI had not, as of mid-2026 — `05 §A.5`). **Personal single-account use is tolerated and
@@ -173,14 +173,14 @@ These absences meaningfully shrink the build.
 
 ---
 
-## 5. Proposed PiClauDex architecture
+## 5. Proposed PiCC architecture
 
 A thin **extension bundle** on Pi (one Pi extension, or a small set), plus a compatibility layer:
 
 ```
 pi (earendil-works/pi)  ──►  runtime: agent loop, pi-ai (Codex subscription auth), bash/read/write/edit
         │
-        └── PiClauDex extension bundle (.ts, registered via settings.json "extensions")
+        └── PiCC extension bundle (.ts, registered via settings.json "extensions")
               ├── claude-skills-loader     → point skill discovery at .claude/skills/ (or junction), map frontmatter
               ├── claude-agents-loader     → parse .claude/agents/*.md → subagent registry; inject descriptions
               ├── subagent-runtime         → Agent/Task tool (adapt pi-subagents): fresh ctx, parallel, verbatim return, per-agent tools:
@@ -273,7 +273,7 @@ worktrees. Harden Windows path/canonicalization edge cases (`03 §d`). Track Pi 
 5. **Windows hardening list** — reparse-point stripping before `worktree remove`, `cygpath -m`
    canonicalization in the hook shim, `core.longpaths` (`03 §d`).
 6. **Decide the DemonMatrix `.codex-home`/`codex.ps1` disposition** — the old scaffolding is
-   inadequate (`01` scope note) but shows the junction pattern; decide whether PiClauDex replaces it
+   inadequate (`01` scope note) but shows the junction pattern; decide whether PiCC replaces it
    entirely.
 
 ---

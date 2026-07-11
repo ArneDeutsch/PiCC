@@ -36,7 +36,7 @@ export function createGuardExtension(deps: GuardDeps) {
       if (decision.decision === "deny") {
         return {
           block: true,
-          reason: `PiClauDex: blocked by permission deny rule ${decision.rule ?? ""}`.trim(),
+          reason: `PiCC: blocked by permission deny rule ${decision.rule ?? ""}`.trim(),
         };
       }
 
@@ -48,7 +48,7 @@ export function createGuardExtension(deps: GuardDeps) {
       if (outcome.block) {
         return {
           block: true,
-          reason: `PiClauDex: blocked by PreToolUse hook${outcome.blockReason ? `: ${outcome.blockReason}` : ""}`,
+          reason: `PiCC: blocked by PreToolUse hook${outcome.blockReason ? `: ${outcome.blockReason}` : ""}`,
         };
       }
       if (outcome.updatedInput) {
@@ -65,7 +65,7 @@ export function createGuardExtension(deps: GuardDeps) {
       if (contextParts.length) {
         pi.sendMessage(
           {
-            customType: "piclaudex-context",
+            customType: "picc-context",
             content: contextParts.join("\n\n"),
             display: true,
           },

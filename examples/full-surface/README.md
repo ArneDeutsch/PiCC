@@ -1,4 +1,4 @@
-# full-surface — PiClauDex conformance fixture
+# full-surface — PiCC conformance fixture
 
 A purpose-built Claude Code project exercising the **entire supported feature surface**,
 including fields and paths a typical project never touches. Integration tests copy this

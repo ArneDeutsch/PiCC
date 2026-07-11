@@ -17,7 +17,7 @@ import {
  */
 
 const FETCH_TIMEOUT_MS = 30_000;
-const USER_AGENT = "PiClauDex/0.1";
+const USER_AGENT = "PiCC/0.1";
 const MAX_REDIRECTS = 5;
 const MAX_SEARCH_RESULTS = 8;
 

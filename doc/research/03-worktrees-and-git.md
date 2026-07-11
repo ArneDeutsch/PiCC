@@ -6,7 +6,7 @@ drive the DemonMatrix skill corpus unchanged.
 
 Reference project: `F:/Arne/Projekte/DemonMatrix` (a Rust game project already
 run through a Codex harness via `codex.ps1`).
-Target project: `F:/Arne/Projekte/PiClauDex` (the new harness).
+Target project: `F:/Arne/Projekte/PiCC` (the new harness).
 
 The tools are named **`EnterWorktree`** and **`ExitWorktree`** (not
 Enter/LeaveWorkspace — that is the user's informal name). This doc uses the
@@ -107,7 +107,7 @@ So the **fresh-create path** does two things the skills depend on:
 no `worktree-*` branches existed (`git branch --list "worktree-*"` empty) — they
 had already been reaped, confirming the reap path runs.
 
-> Note: the current PiClauDex `EnterWorktree` (see section (e)) names the branch
+> Note: the current PiCC `EnterWorktree` (see section (e)) names the branch
 > `worktree-<name>` — matching this exactly. The DemonMatrix contract is already
 > satisfied by that naming.
 
@@ -230,7 +230,7 @@ dots, underscores, dashes; DemonMatrix only ever passes flat dashed names.
 ### a.10 The Codex harness bridge (already in the reference project)
 
 `codex.ps1` at the DemonMatrix root shows how the project is already run under a
-GPT/Codex harness — directly relevant to PiClauDex:
+GPT/Codex harness — directly relevant to PiCC:
 - Sets `$env:CODEX_HOME = <repo>/.codex-home`.
 - Creates `<repo>/.codex-home/skills/` and **junctions** each
   `.claude/skills/<dir>` into it (`New-Item -ItemType Junction`), plus junctions
@@ -238,7 +238,7 @@ GPT/Codex harness — directly relevant to PiClauDex:
   skill discovery path without copying.
 - Invokes `codex -C $repoRoot @CodexArgs`.
 
-Implication: PiClauDex can present `.claude/skills` to a GPT model via junctions,
+Implication: PiCC can present `.claude/skills` to a GPT model via junctions,
 and must add native `EnterWorktree`/`ExitWorktree` tools + the `worktree.baseRef`
 setting + the two hooks, since Codex itself does not provide worktree isolation.
 
@@ -402,7 +402,7 @@ straddle both.
 
 ## (e) Spec for the new harness's EnterWorktree / ExitWorktree + git setup
 
-This is the concrete contract PiClauDex must implement to run the DemonMatrix
+This is the concrete contract PiCC must implement to run the DemonMatrix
 corpus unchanged. (The Claude Code tool schemas already match; this restates
 them as an implementation target.)
 

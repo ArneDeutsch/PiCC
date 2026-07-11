@@ -15,7 +15,7 @@ import {
   contextForTouchedFile,
   newSessionContextState,
 } from "../src/runtime/context-assembly.js";
-import { mapEffort, steeringForModel, type PiClauDexConfig } from "../src/runtime/steering.js";
+import { mapEffort, steeringForModel, type PiCCConfig } from "../src/runtime/steering.js";
 import { SubagentRuntime, createAgentToolDefinition, extractText, type PiSdk } from "../src/runtime/subagents.js";
 import { PermissionEngine } from "../src/engine/permissions.js";
 import { HookRunner } from "../src/engine/hook-runner.js";
@@ -103,7 +103,7 @@ describe("tool-map", () => {
 });
 
 describe("steering", () => {
-  const config: PiClauDexConfig = {
+  const config: PiCCConfig = {
     steering: { "openai/*": "Be terse.", "*/gpt-5*": "Use locked YAML faithfully." },
     effortMap: { low: "low", medium: "medium", high: "high", max: "max", maximum: "max" },
     diagnostics: [],

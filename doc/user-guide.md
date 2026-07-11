@@ -1,15 +1,15 @@
-# PiClauDex user guide
+# PiCC user guide
 
-PiClauDex runs projects **authored for Claude Code — unchanged — on GPT/Codex models**, driven
+PiCC runs projects **authored for Claude Code — unchanged — on GPT/Codex models**, driven
 from a personal ChatGPT/Codex subscription. It is an extension bundle on
 [Pi](https://github.com/earendil-works/pi) (MIT, TypeScript): Pi supplies the agent loop, the
-model abstraction, and the subscription auth; PiClauDex supplies Claude Code compatibility —
+model abstraction, and the subscription auth; PiCC supplies Claude Code compatibility —
 `CLAUDE.md` hierarchies, `.claude/` skills/agents/rules/commands, `settings.json` permissions
 and hooks, worktree isolation, subagent fan-out, and plugin content.
 
 ## How it works (in one minute)
 
-At startup PiClauDex reads your project's `.claude/` corpus and `CLAUDE.md` hierarchy into one
+At startup PiCC reads your project's `.claude/` corpus and `CLAUDE.md` hierarchy into one
 in-memory model. From then on, on Pi's own agent loop:
 
 - **Every turn** it appends the assembled instruction set — root `CLAUDE.md`, unconditional rules,
@@ -45,28 +45,28 @@ Windows PowerShell 5.1 does not support it).
 ### Windows (PowerShell or cmd)
 
 ```powershell
-git clone <this-repo> piclaudex
-cd piclaudex
+git clone <this-repo> picc
+cd picc
 npm install --ignore-scripts
 npm link
 ```
 
-`npm link` makes the global `piclaudex` command available. Notes for Windows:
+`npm link` makes the global `picc` command available. Notes for Windows:
 
-- If running `piclaudex` in PowerShell fails with *"running scripts is disabled on this
-  system"*, either call the cmd shim `piclaudex.cmd` instead, or allow local scripts once:
+- If running `picc` in PowerShell fails with *"running scripts is disabled on this
+  system"*, either call the cmd shim `picc.cmd` instead, or allow local scripts once:
   ```powershell
   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
   ```
 - **Git Bash must be installed** (it comes with Git for Windows). Pi's `bash` tool and most
-  Claude Code projects' scripts assume bash; PiClauDex finds Git Bash automatically and never
+  Claude Code projects' scripts assume bash; PiCC finds Git Bash automatically and never
   uses the WSL `bash.exe` stub in System32.
 
 ### Linux / macOS (bash or zsh)
 
 ```bash
-git clone <this-repo> piclaudex
-cd piclaudex
+git clone <this-repo> picc
+cd picc
 npm install --ignore-scripts
 npm link    # may need: sudo npm link — or configure a user-level npm prefix
 ```
@@ -75,14 +75,14 @@ npm link    # may need: sudo npm link — or configure a user-level npm prefix
 
 - Run without installing anything globally — from your target project directory:
   ```powershell
-  node <path-to-piclaudex>\bin\piclaudex.mjs
+  node <path-to-picc>\bin\picc.mjs
   ```
   (forward slashes work too, in every shell)
 - Or, if you already use Pi, load the extension directly:
-  `pi -e <path-to-piclaudex>/src/index.ts`
+  `pi -e <path-to-picc>/src/index.ts`
 - Or add it permanently to Pi's config (`~/.pi/agent/settings.json`):
   ```json
-  { "extensions": ["<path-to-piclaudex>/src/index.ts"] }
+  { "extensions": ["<path-to-picc>/src/index.ts"] }
   ```
 
 ## 3. Authenticate (spend your subscription)
@@ -91,9 +91,9 @@ Auth is Pi's, not ours, and is a one-time interactive step. Step by step (any sh
 
 1. Open a terminal in any directory and start the harness:
    ```powershell
-   piclaudex
+   picc
    ```
-   (or `node <path-to-piclaudex>/bin/piclaudex.mjs` if you skipped `npm link`)
+   (or `node <path-to-picc>/bin/picc.mjs` if you skipped `npm link`)
 2. In the input box at the bottom, type `/login` and press Enter.
 3. Select **"ChatGPT Plus/Pro (Codex Subscription)"** with the arrow keys and press Enter.
 4. Your browser opens an OpenAI login page (if not, Pi prints a URL to copy). Log in with the
@@ -103,14 +103,14 @@ Auth is Pi's, not ours, and is a one-time interactive step. Step by step (any sh
 6. Quit with Ctrl+C pressed twice.
 
 Credentials are stored in `~/.pi/agent/auth.json` (`C:\Users\<you>\.pi\agent\auth.json` on
-Windows) — in your user profile, **never inside any project repository**, and PiClauDex never
+Windows) — in your user profile, **never inside any project repository**, and PiCC never
 reads or copies them.
 
 Notes:
 - **Single account only.** Account pooling/credential sharing violates OpenAI ToS; personal
   single-account use is the supported mode.
 - If the direct-backend path breaks (endpoint enforcement changes), the documented fallback is
-  driving a signed-in `codex` CLI as a subprocess — see Pi's provider docs; PiClauDex works with
+  driving a signed-in `codex` CLI as a subprocess — see Pi's provider docs; PiCC works with
   any provider Pi can talk to.
 - API keys also work: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.
 
@@ -118,10 +118,10 @@ Notes:
 
 ```bash
 cd /path/to/your-claude-project     # the one with CLAUDE.md and .claude/
-piclaudex
+picc
 ```
 
-On startup PiClauDex loads, with standard Claude Code precedence (user → project → local →
+On startup PiCC loads, with standard Claude Code precedence (user → project → local →
 managed):
 
 | Artifact | Source |
@@ -141,7 +141,7 @@ Then use it like Claude Code:
 - the model dispatches subagents via the `Agent` tool (description-driven routing)
 - `EnterWorktree`/`ExitWorktree` isolate work in `.claude/worktrees/<name>/` — the session's
   working directory really moves, so project scripts detect worktree mode via git plumbing
-- parallel sessions: open a second terminal, `piclaudex` again, enter a different worktree
+- parallel sessions: open a second terminal, `picc` again, enter a different worktree
 
 ## 5. Control surface (project-external)
 
@@ -164,8 +164,8 @@ menu stays fast even with dozens of skills.
 
 ### Harness configuration
 
-Lives **outside the project** (`~/.piclaudex/config.json`) or in the harness-owned, gitignored
-`<project>/.claude/.piclaudex/config.json` (project overrides user; the harness never touches
+Lives **outside the project** (`~/.picc/config.json`) or in the harness-owned, gitignored
+`<project>/.claude/.picc/config.json` (project overrides user; the harness never touches
 tracked project files):
 
 ```json
@@ -191,7 +191,7 @@ tracked project files):
 
 | Variable | Effect |
 |---|---|
-| `PICLAUDEX_CLAUDE_USER_DIR` | Override the user-scope Claude dir (default `~/.claude`) — useful for isolated profiles or CI |
+| `PICC_CLAUDE_USER_DIR` | Override the user-scope Claude dir (default `~/.claude`) — useful for isolated profiles or CI |
 | `BRAVE_API_KEY` | Use the Brave Search API for `WebSearch` (otherwise a keyless DuckDuckGo fallback is used) |
 | `PI_CODING_AGENT_DIR` | Pi's own config dir override (auth, models, Pi settings) |
 
@@ -238,17 +238,17 @@ Everything runs natively on Windows 11 — no WSL required. The points below are
 behaviors worth knowing:
 
 - **Git Bash is required, and found automatically.** Pi's `bash` tool and most Claude Code
-  projects' scripts assume bash. PiClauDex locates the real Git Bash (`Program Files\Git\bin\bash.exe`
+  projects' scripts assume bash. PiCC locates the real Git Bash (`Program Files\Git\bin\bash.exe`
   and friends) and **skips the System32 WSL `bash.exe` stub**, which otherwise fails with
   `WSL_E_DEFAULT_DISTRO_NOT_FOUND` when no WSL distro is installed. The resolved shell is used for
   both hooks and `` !`cmd` `` skill injection. Install Git for Windows if `bash` isn't on PATH.
 - **UTF-8 subprocess default.** Spawned interpreters (notably Python) default their I/O to the
   legacy code page (cp1252), which can't encode Unicode the model routinely prints (e.g. `→`),
-  causing `UnicodeEncodeError`. PiClauDex sets UTF-8 defaults (`PYTHONIOENCODING`/`PYTHONUTF8`,
+  causing `UnicodeEncodeError`. PiCC sets UTF-8 defaults (`PYTHONIOENCODING`/`PYTHONUTF8`,
   `LANG`/`LC_ALL`) for child processes **only when you haven't set them** — an explicit project or
   user `env` value always wins.
 - **MSYS argument-mangling caveat (slash commands via `-p`).** Under **Git Bash**, MSYS rewrites an
-  argument that looks like a Unix path — so `piclaudex -p "/greet Ada"` gets the leading `/greet`
+  argument that looks like a Unix path — so `picc -p "/greet Ada"` gets the leading `/greet`
   mangled into a Windows path and the skill won't resolve. Run slash-command-as-argument invocations
   from **PowerShell or cmd**, or just type `/greet Ada` inside the **interactive TUI** (where no
   MSYS mangling applies). Normal interactive use is unaffected.
@@ -261,12 +261,12 @@ behaviors worth knowing:
 
 | Symptom | Fix |
 |---|---|
-| "could not resolve the Pi CLI" | `npm install` inside the PiClauDex checkout |
+| "could not resolve the Pi CLI" | `npm install` inside the PiCC checkout |
 | Skill shell injection prints `[shell execution disabled: …]` | project set `disableSkillShellExecution`; that's the project's intent |
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
-| Startup notice keeps appearing | `/compat suppress` (per-project, stored in `.claude/.piclaudex/`) |
-| Unexpected skills/agents from plugins | PiClauDex loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. `/doctor` and the startup info notice report how many are available but disabled. |
+| Startup notice keeps appearing | `/compat suppress` (per-project, stored in `.claude/.picc/`) |
+| Unexpected skills/agents from plugins | PiCC loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. `/doctor` and the startup info notice report how many are available but disabled. |
 | A plugin you enabled isn't loading | Confirm it's listed truthy in `enabledPlugins` as `name@marketplace`, and that it isn't in `~/.claude/plugins/blocklist.json`. |
 | Want to see why a fan-out routed the way it did | agent descriptions are the routing surface — inspect the "Available subagents" catalog in the session, and the dispatch tool calls in the transcript |
 
@@ -296,7 +296,7 @@ Two runnable fixtures ship in `examples/`:
 
 ```bash
 cd examples/hello-claude
-piclaudex
+picc
 > /greet Ada
 > have the reviewer agent review src/hello.js
 ```
