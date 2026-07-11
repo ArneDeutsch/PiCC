@@ -64,7 +64,8 @@ describe("discoverInstalledPlugins", () => {
       enabledPlugins: undefined,
     });
 
-    expect(diagnostics).toEqual([]);
+    // (an info diagnostic about "none enabled" is expected here — filter it out)
+    expect(diagnostics.filter((d) => d.severity !== "info")).toEqual([]);
     expect(plugins).toHaveLength(1);
     const plugin = plugins[0]!;
     expect(plugin.name).toBe("mytool");
@@ -100,7 +101,7 @@ describe("discoverInstalledPlugins", () => {
     expect(plugins.map((p) => p.name)).toEqual(["shallow"]);
   });
 
-  it("resolves enabled from object form: name@marketplace true / explicit false / unmentioned", () => {
+  it("resolves enabled from object form: explicit true enables, false / unmentioned disable", () => {
     const userDir = path.join(tmpRoot, ".claude");
     makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "mytool"), { name: "mytool" });
     makePlugin(path.join(userDir, "plugins", "repos", "o", "r", "offtool"), { name: "offtool" });
@@ -114,8 +115,8 @@ describe("discoverInstalledPlugins", () => {
     const byName = new Map(plugins.map((p) => [p.name, p]));
     expect(byName.get("mytool")!.enabled).toBe(true);
     expect(byName.get("offtool")!.enabled).toBe(false);
-    // Not mentioned → Claude default is enabled-on-install.
-    expect(byName.get("unlisted")!.enabled).toBe(true);
+    // Not mentioned → NOT enabled (a plugin loads only when explicitly enabled).
+    expect(byName.get("unlisted")!.enabled).toBe(false);
   });
 
   it("resolves enabled from array form by membership", () => {
@@ -133,13 +134,48 @@ describe("discoverInstalledPlugins", () => {
     expect(byName.get("no")!.enabled).toBe(false);
   });
 
-  it("treats all plugins as enabled when enabledPlugins is undefined", () => {
+  it("enables NOTHING when enabledPlugins is undefined (a marketplace catalog is not auto-enabled)", () => {
     const userDir = path.join(tmpRoot, ".claude");
-    makePlugin(path.join(userDir, "plugins", "flat"), { name: "flat" });
+    // Simulate a cloned marketplace: several plugins available under marketplaces/.
+    makePlugin(path.join(userDir, "plugins", "marketplaces", "official", "plugins", "foo"), { name: "foo" }, { skills: true });
+    makePlugin(path.join(userDir, "plugins", "marketplaces", "official", "external_plugins", "bar"), { name: "bar" }, { skills: true });
 
-    const { plugins } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
-    expect(plugins).toHaveLength(1);
-    expect(plugins[0]!.enabled).toBe(true);
+    const { plugins, diagnostics } = discoverInstalledPlugins({ userDir, enabledPlugins: undefined });
+    expect(plugins).toHaveLength(2);
+    expect(plugins.every((p) => p.enabled)).toBe(false);
+    expect(plugins.find((p) => p.name === "foo")!.marketplace).toBe("official");
+    // Surfaces a helpful info diagnostic so the user understands why nothing loads.
+    expect(diagnostics.some((d) => d.severity === "info" && /none are enabled/.test(d.message))).toBe(true);
+  });
+
+  it("enables a marketplace plugin only when explicitly listed as name@marketplace", () => {
+    const userDir = path.join(tmpRoot, ".claude");
+    makePlugin(path.join(userDir, "plugins", "marketplaces", "official", "plugins", "foo"), { name: "foo" }, { skills: true });
+    makePlugin(path.join(userDir, "plugins", "marketplaces", "official", "plugins", "baz"), { name: "baz" }, { skills: true });
+
+    const { plugins } = discoverInstalledPlugins({
+      userDir,
+      enabledPlugins: { "foo@official": true },
+    });
+    const byName = new Map(plugins.map((p) => [p.name, p]));
+    expect(byName.get("foo")!.enabled).toBe(true);
+    expect(byName.get("baz")!.enabled).toBe(false);
+  });
+
+  it("never enables a blocklisted plugin, even if explicitly enabled", () => {
+    const userDir = path.join(tmpRoot, ".claude");
+    const pluginsRoot = path.join(userDir, "plugins");
+    makePlugin(path.join(pluginsRoot, "marketplaces", "official", "plugins", "danger"), { name: "danger" });
+    write(
+      path.join(pluginsRoot, "blocklist.json"),
+      JSON.stringify({ plugins: [{ plugin: "danger@official", reason: "security" }] }),
+    );
+
+    const { plugins } = discoverInstalledPlugins({
+      userDir,
+      enabledPlugins: { "danger@official": true },
+    });
+    expect(plugins[0]!.enabled).toBe(false);
   });
 
   it("skips a plugin with a malformed manifest and records a diagnostic", () => {
@@ -153,9 +189,9 @@ describe("discoverInstalledPlugins", () => {
     });
 
     expect(plugins.map((p) => p.name)).toEqual(["fine"]);
-    expect(diagnostics).toHaveLength(1);
-    expect(diagnostics[0]!.severity).toBe("warning");
-    expect(diagnostics[0]!.message).toContain("not valid JSON");
+    const warnings = diagnostics.filter((d) => d.severity === "warning");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]!.message).toContain("not valid JSON");
   });
 
   it("falls back to the directory name when the manifest has no name", () => {

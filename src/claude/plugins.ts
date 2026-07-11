@@ -32,6 +32,8 @@ import {
 
 export interface InstalledPlugin {
   name: string;
+  /** Marketplace this plugin was cloned from (dir under `plugins/marketplaces/`), if any. */
+  marketplace?: string;
   /** Plugin root directory (base for ${CLAUDE_PLUGIN_ROOT}). */
   root: string;
   /** Writable data directory (base for ${CLAUDE_PLUGIN_DATA}). */
@@ -122,28 +124,62 @@ function resolveContent(
   };
 }
 
+/** The marketplace name for a plugin root under `plugins/marketplaces/<mp>/…`, else undefined. */
+function marketplaceOf(root: string): string | undefined {
+  const parts = root.split(/[\\/]+/);
+  const idx = parts.lastIndexOf("marketplaces");
+  if (idx >= 0 && idx + 1 < parts.length) return parts[idx + 1];
+  return undefined;
+}
+
 /**
  * Resolve enabled state against the settings `enabledPlugins` value.
  *
- * - object: keys match `name` or `name@<anything>`; truthy value → enabled,
- *   matched-but-falsy (explicit false etc.) → disabled; no matching key →
- *   enabled (Claude default is enabled-on-install).
- * - array: membership by `name` or `name@<anything>`.
- * - undefined / anything else: enabled.
+ * Claude Code semantics (plan §4.9 — "from the enabled-plugins configuration"):
+ * a plugin is loaded ONLY when it is **explicitly enabled**. A cloned
+ * marketplace under `plugins/marketplaces/` is a *catalog* of available
+ * plugins, not installed content — nothing there loads until the user enables
+ * it. Therefore:
+ * - object: enabled iff a candidate key (`name` or `name@marketplace`) is
+ *   present with a truthy value; a matched-but-falsy value → disabled; no
+ *   matching key → **disabled**.
+ * - array: enabled iff a candidate key is a member.
+ * - undefined / anything else: **disabled** (nothing enabled).
  */
-function resolveEnabled(name: string, enabledPlugins: unknown): boolean {
-  const matches = (key: unknown): boolean =>
-    typeof key === "string" && (key === name || key.startsWith(`${name}@`));
+function resolveEnabled(name: string, marketplace: string | undefined, enabledPlugins: unknown): boolean {
+  const candidates = [name, ...(marketplace ? [`${name}@${marketplace}`] : [])];
+  const isCandidate = (key: unknown): boolean =>
+    typeof key === "string" &&
+    (candidates.includes(key) || (marketplace === undefined && key.startsWith(`${name}@`)));
 
   if (Array.isArray(enabledPlugins)) {
-    return enabledPlugins.some(matches);
+    return enabledPlugins.some(isCandidate);
   }
   if (isPlainObject(enabledPlugins)) {
-    const matched = Object.entries(enabledPlugins).filter(([key]) => matches(key));
-    if (matched.length === 0) return true;
-    return matched.some(([, value]) => Boolean(value));
+    return Object.entries(enabledPlugins).some(([key, value]) => isCandidate(key) && Boolean(value));
   }
-  return true;
+  return false;
+}
+
+/**
+ * Read `<pluginsRoot>/blocklist.json` into a set of blocked identifiers
+ * (`name` and `name@marketplace` forms). Blocked plugins never load.
+ */
+function readBlocklist(pluginsRoot: string): Set<string> {
+  const blocked = new Set<string>();
+  const parsed = parseJsonSafe<{ plugins?: Array<{ plugin?: unknown }> }>(
+    readTextSafe(path.join(pluginsRoot, "blocklist.json")),
+  );
+  for (const entry of parsed?.plugins ?? []) {
+    if (typeof entry?.plugin === "string") blocked.add(entry.plugin);
+  }
+  return blocked;
+}
+
+function isBlocked(name: string, marketplace: string | undefined, blocked: Set<string>): boolean {
+  if (blocked.has(name)) return true;
+  if (marketplace && blocked.has(`${name}@${marketplace}`)) return true;
+  return false;
 }
 
 /** Read + parse a plugin.json manifest. Returns undefined (with diagnostic) when malformed. */
@@ -216,6 +252,7 @@ export function discoverInstalledPlugins(opts: {
   if (!isDirectory(pluginsRoot)) {
     return { plugins, diagnostics };
   }
+  const blocked = readBlocklist(pluginsRoot);
 
   for (const root of scanPluginRoots(pluginsRoot)) {
     const manifestPath = path.join(root, ".claude-plugin", "plugin.json");
@@ -230,15 +267,32 @@ export function discoverInstalledPlugins(opts: {
       typeof manifest["name"] === "string" && manifest["name"].length > 0
         ? manifest["name"]
         : path.basename(root);
+    const marketplace = marketplaceOf(root);
+    const enabled =
+      !isBlocked(name, marketplace, blocked) &&
+      resolveEnabled(name, marketplace, opts.enabledPlugins);
 
     plugins.push({
       name,
+      marketplace,
       root,
       dataDir: path.join(pluginsRoot, "data", name),
       manifest,
       ...resolveContent(root, manifest),
-      enabled: resolveEnabled(name, opts.enabledPlugins),
+      enabled,
       diagnostics: pluginDiagnostics,
+    });
+  }
+
+  // Help the user understand why plugin content is (not) loading: a cloned
+  // marketplace surfaces many plugins, but only explicitly-enabled ones load.
+  const enabledCount = plugins.filter((p) => p.enabled).length;
+  if (plugins.length > 0 && enabledCount === 0) {
+    diagnostics.push({
+      severity: "info",
+      message:
+        `${plugins.length} plugin(s) available under ~/.claude/plugins but none are enabled — ` +
+        `enable specific ones in Claude Code (settings "enabledPlugins") to load their skills/agents/commands.`,
     });
   }
 

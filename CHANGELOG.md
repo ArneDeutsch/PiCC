@@ -31,7 +31,11 @@ personal ChatGPT/Codex subscription, built as an extension bundle on
 - **Compatibility report** — a living capability registry drives a consolidated startup notice and
   `/doctor`, so documentation can't drift from behavior.
 - **Compaction preservation** — project instructions, rules, and active skills survive compaction.
-- **Installed-plugin content** and project-bundled `.claude-plugin/`.
+- **Installed-plugin content** and project-bundled `.claude-plugin/`. Plugins load only when
+  **explicitly enabled** (settings `enabledPlugins`, matched by `name@marketplace`) and never when
+  blocklisted — a cloned marketplace is a catalog, not installed content, so its plugins stay
+  dormant until you enable them (matching Claude Code). A one-line info notice reports how many
+  plugins are available but disabled.
 - **Control surface** — `/skills`, `/agents`, `/doctor`, `/compat`, `/quota`; project-external
   model/effort/steering config; quota introspection.
 
