@@ -14,16 +14,24 @@ the model provider. PiClauDex adds the Claude Code compatibility layer on top.
 
 ## Quick start
 
-```bash
-git clone <this-repo> piclaudex && cd piclaudex
-npm install --ignore-scripts && npm link
+One command per line — works the same in PowerShell, cmd, and bash:
 
-cd /path/to/your-claude-code-project
+```powershell
+git clone <this-repo> piclaudex
+cd piclaudex
+npm install --ignore-scripts
+npm link
+
+cd \path\to\your-claude-code-project
 piclaudex
-# /login  → ChatGPT Plus/Pro (Codex subscription)
+# /login  → ChatGPT Plus/Pro (Codex subscription)   (one-time)
 # /model  → pick a GPT model
 # work as you would in Claude Code: /your-skill, subagent fan-outs, worktrees…
 ```
+
+Windows notes: Git Bash (from Git for Windows) must be installed; if PowerShell blocks the
+`piclaudex` script shim, use `piclaudex.cmd` or `Set-ExecutionPolicy -Scope CurrentUser
+RemoteSigned`. Details per shell/OS in the guide.
 
 **→ Full documentation: [doc/user-guide.md](doc/user-guide.md)**
 

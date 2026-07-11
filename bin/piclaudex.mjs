@@ -15,12 +15,26 @@ const require = createRequire(import.meta.url);
 
 let piCli;
 try {
-  piCli = require.resolve("@earendil-works/pi-coding-agent/dist/cli.js", {
+  // The package's exports map hides dist/cli.js, so resolve the main export
+  // (dist/index.js) and take cli.js from the same directory.
+  const mainEntry = require.resolve("@earendil-works/pi-coding-agent", {
     paths: [path.join(here, ".."), process.cwd()],
   });
+  piCli = path.join(path.dirname(mainEntry), "cli.js");
 } catch {
+  piCli = path.join(
+    here,
+    "..",
+    "node_modules",
+    "@earendil-works",
+    "pi-coding-agent",
+    "dist",
+    "cli.js",
+  );
+}
+if (!(await import("node:fs")).existsSync(piCli)) {
   console.error(
-    "PiClauDex: could not resolve the Pi CLI (@earendil-works/pi-coding-agent). Run `npm install` in the PiClauDex directory.",
+    "PiClauDex: could not find the Pi CLI (@earendil-works/pi-coding-agent). Run `npm install` in the PiClauDex directory.",
   );
   process.exit(1);
 }

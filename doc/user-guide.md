@@ -17,29 +17,73 @@ and hooks, worktree isolation, subagent fan-out, and plugin content.
 
 ## 2. Install
 
+Every command below is one line per step — paste them one at a time. They work identically in
+**PowerShell**, **cmd**, and **bash** (no `&&` chaining is used anywhere in this guide, because
+Windows PowerShell 5.1 does not support it).
+
+### Windows (PowerShell or cmd)
+
+```powershell
+git clone <this-repo> piclaudex
+cd piclaudex
+npm install --ignore-scripts
+npm link
+```
+
+`npm link` makes the global `piclaudex` command available. Notes for Windows:
+
+- If running `piclaudex` in PowerShell fails with *"running scripts is disabled on this
+  system"*, either call the cmd shim `piclaudex.cmd` instead, or allow local scripts once:
+  ```powershell
+  Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+  ```
+- **Git Bash must be installed** (it comes with Git for Windows). Pi's `bash` tool and most
+  Claude Code projects' scripts assume bash; PiClauDex finds Git Bash automatically and never
+  uses the WSL `bash.exe` stub in System32.
+
+### Linux / macOS (bash or zsh)
+
 ```bash
 git clone <this-repo> piclaudex
 cd piclaudex
 npm install --ignore-scripts
-npm link          # makes the `piclaudex` command available globally (optional)
+npm link    # may need: sudo npm link — or configure a user-level npm prefix
 ```
 
-Alternatives to `npm link`:
+### Alternatives to `npm link` (any OS)
 
-- run Pi directly with the extension: `pi -e /path/to/piclaudex/src/index.ts`
-- or add it permanently to Pi's config (`~/.pi/agent/settings.json`):
+- Run without installing anything globally — from your target project directory:
+  ```powershell
+  node <path-to-piclaudex>\bin\piclaudex.mjs
+  ```
+  (forward slashes work too, in every shell)
+- Or, if you already use Pi, load the extension directly:
+  `pi -e <path-to-piclaudex>/src/index.ts`
+- Or add it permanently to Pi's config (`~/.pi/agent/settings.json`):
   ```json
-  { "extensions": ["/path/to/piclaudex/src/index.ts"] }
+  { "extensions": ["<path-to-piclaudex>/src/index.ts"] }
   ```
 
 ## 3. Authenticate (spend your subscription)
 
-Auth is Pi's, not ours. In any session:
+Auth is Pi's, not ours, and is a one-time interactive step. Step by step (any shell):
 
-```
-/login        → choose "ChatGPT Plus/Pro (Codex Subscription)" and follow the browser flow
-/model        → pick a GPT/Codex model (e.g. openai/gpt-5.5)
-```
+1. Open a terminal in any directory and start the harness:
+   ```powershell
+   piclaudex
+   ```
+   (or `node <path-to-piclaudex>/bin/piclaudex.mjs` if you skipped `npm link`)
+2. In the input box at the bottom, type `/login` and press Enter.
+3. Select **"ChatGPT Plus/Pro (Codex Subscription)"** with the arrow keys and press Enter.
+4. Your browser opens an OpenAI login page (if not, Pi prints a URL to copy). Log in with the
+   account holding your subscription and approve.
+5. Back in the terminal, type `/model`, press Enter, and pick a GPT/Codex model
+   (e.g. `openai-codex/gpt-5.5`).
+6. Quit with Ctrl+C pressed twice.
+
+Credentials are stored in `~/.pi/agent/auth.json` (`C:\Users\<you>\.pi\agent\auth.json` on
+Windows) — in your user profile, **never inside any project repository**, and PiClauDex never
+reads or copies them.
 
 Notes:
 - **Single account only.** Account pooling/credential sharing violates OpenAI ToS; personal
