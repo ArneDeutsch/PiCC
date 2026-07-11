@@ -74,10 +74,48 @@ describe("tool surface registration", () => {
     }
   });
 
-  it("registers the /doctor, /compat, /quota control commands", () => {
-    for (const name of ["doctor", "compat", "quota"]) {
+  it("registers the /doctor, /compat, /quota, /skills, /agents control commands", () => {
+    for (const name of ["doctor", "compat", "quota", "skills", "agents"]) {
       expect(pi.commands.has(name), `missing command ${name}`).toBe(true);
     }
+  });
+
+  it("exposes user-invocable skills in the / palette via prompt-template stubs (resources_discover)", async () => {
+    const rd = await pi.fire("resources_discover", { reason: "startup" });
+    expect(rd?.promptPaths?.length).toBeGreaterThan(0);
+    const dir = rd.promptPaths[0] as string;
+    const stubs = fs.readdirSync(dir).map((f) => f.replace(/\.md$/, ""));
+    // user-invocable skills appear...
+    expect(stubs).toContain("deploy");
+    expect(stubs).toContain("fork-research");
+    // ...user-invocable:false skills do not...
+    expect(stubs).not.toContain("rust-helper");
+    // ...and neither do reserved/built-in names.
+    expect(stubs).not.toContain("model");
+    expect(stubs).not.toContain("doctor");
+    // A stub carries the description and argument hint for the palette.
+    const deployStub = fs.readFileSync(path.join(dir, "deploy.md"), "utf8");
+    expect(deployStub).toContain("argument-hint:");
+    expect(deployStub).toContain("Deploy the app");
+  });
+
+  it("/skills lists the loaded corpus grouped by invocability", async () => {
+    pi.messages.length = 0;
+    await pi.commands.get("skills").handler("", pi.ctx());
+    const out = pi.messages.map((m) => String(m.message.content)).join("\n");
+    expect(out).toContain("Invocable as slash commands");
+    expect(out).toContain("/deploy");
+    expect(out).toMatch(/Model-invocable only|User-only/);
+  });
+
+  it("/agents lists subagents with tools and read-only markers", async () => {
+    pi.messages.length = 0;
+    await pi.commands.get("agents").handler("", pi.ctx());
+    const out = pi.messages.map((m) => String(m.message.content)).join("\n");
+    expect(out).toContain("subagent(s) available");
+    expect(out).toContain("reviewer");
+    expect(out).toMatch(/reviewer[^\n]*read-only/);
+    expect(out).toContain("tools:");
   });
 
   it("user-invocable skills are NOT registered as extension commands (they expand via input)", () => {

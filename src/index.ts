@@ -507,6 +507,24 @@ export default function piclaudex(pi: any) {
     try {
       if (event.source === "extension") return { action: "continue" };
 
+      // 0) PiClauDex control commands (/doctor /compat /quota /skills /agents).
+      //    In interactive mode Pi's own command router intercepts these before
+      //    the input event; this branch covers the other modes so a control
+      //    command is never sent to the model.
+      const cmd = /^\/(doctor|compat|quota|skills|agents)(?:[ \t]+([\s\S]*))?$/.exec(
+        (event.text ?? "").trim(),
+      );
+      if (cmd) {
+        const output = runControlCommand(cmd[1]!, cmd[2] ?? "", ctx);
+        if (output !== undefined) {
+          pi.sendMessage(
+            { customType: `piclaudex-${cmd[1]}`, content: output, display: true },
+            { deliverAs: "nextTurn" },
+          );
+          return { action: "handled" };
+        }
+      }
+
       // 1) UserPromptSubmit hook on the raw prompt (Claude order).
       const outcome = await hooks.fire("UserPromptSubmit", {
         prompt: event.text,
@@ -630,77 +648,190 @@ export default function piclaudex(pi: any) {
   });
 
   // ---------------------------------------------------------------------------
-  // Commands: /doctor, /compat, /quota + user-invocable skills
+  // Control commands: /doctor /compat /quota /skills /agents.
+  //
+  // Rendered by shared functions so BOTH the registered command (interactive
+  // path, where Pi intercepts extension commands before the model) and the
+  // `input` handler (all other modes, so a control command never leaks to the
+  // model) produce identical output.
   // ---------------------------------------------------------------------------
-  pi.registerCommand("doctor", {
-    description: "PiClauDex: full compatibility breakdown for this project",
-    handler: async () => {
-      pi.sendMessage(
-        { customType: "piclaudex-doctor", content: renderDoctorReport(project, compat), display: true },
-        { deliverAs: "nextTurn" },
-      );
-    },
-  });
+  function renderSkillsList(): string {
+    const invocable = project.skills.filter((s) => s.userInvocable);
+    const modelOnly = project.skills.filter((s) => !s.userInvocable && !s.disableModelInvocation);
+    const userOnly = project.skills.filter((s) => s.disableModelInvocation);
+    const fmt = (s: ClaudeSkill) =>
+      `  /${s.name}${s.argumentHint ? ` ${s.argumentHint}` : ""} — ${s.description}` +
+      (s.source.pluginName ? ` [plugin: ${s.source.pluginName}]` : ` [${s.source.scope}]`);
+    const lines = [
+      `PiClauDex — ${project.skills.length} skill(s) loaded`,
+      "",
+      `Invocable as slash commands (${invocable.length}):`,
+      ...invocable.map(fmt),
+    ];
+    if (modelOnly.length) {
+      lines.push("", `Model-invocable only (${modelOnly.length}) — the model activates these via the Skill tool:`);
+      lines.push(...modelOnly.map((s) => `  ${s.name} — ${s.description}`));
+    }
+    if (userOnly.length) {
+      lines.push("", `User-only, model cannot self-invoke (${userOnly.length}):`);
+      lines.push(...userOnly.map((s) => `  /${s.name} — ${s.description}`));
+    }
+    return lines.join("\n");
+  }
 
-  pi.registerCommand("compat", {
-    description: "PiClauDex: show or suppress the compatibility notice (usage: /compat [suppress|show])",
-    handler: async (args: string, ctx: any) => {
-      const arg = (args ?? "").trim();
-      if (arg === "suppress") {
-        writeSuppression(project.root, true);
-        compatSuppressed = true;
-        if (ctx.hasUI) ctx.ui.notify("Compatibility notice suppressed for this project", "info");
-        return;
-      }
-      if (arg === "show") {
-        writeSuppression(project.root, false);
-        compatSuppressed = false;
-      }
-      const notice = renderStartupNotice(compat, { suppressed: false }) ?? "No compatibility findings for this project.";
-      pi.sendMessage(
-        { customType: "piclaudex-compat", content: notice, display: true },
-        { deliverAs: "nextTurn" },
-      );
-    },
-  });
-
-  pi.registerCommand("quota", {
-    description: "PiClauDex: subscription/rate-limit info from the last provider response",
-    handler: async (_args: string, ctx: any) => {
-      const usage = ctx.getContextUsage?.();
-      const lines = [
-        `Model: ${currentModelRef || "(not selected yet)"}`,
-        usage ? `Context: ~${usage.tokens} tokens used` : undefined,
-        Object.keys(quotaHeaders).length
-          ? `Provider quota headers:\n${Object.entries(quotaHeaders)
-              .map(([k, v]) => `  ${k}: ${v}`)
-              .join("\n")}`
-          : "No quota headers observed yet (best-effort feature — send a prompt first).",
+  function renderAgentsList(): string {
+    if (!project.agents.length) return "No subagents are defined for this project.";
+    const lines = [
+      `PiClauDex — ${project.agents.length} subagent(s) available (dispatch with the Agent tool):`,
+      "",
+    ];
+    for (const a of project.agents) {
+      const gated = permissionEngine.gateTools(a.tools, a.disallowedTools, allKnownToolNames());
+      const readOnly = a.tools && !["Write", "Edit", "Bash"].some((t) => gated.includes(t));
+      const tags = [
+        a.source.pluginName ? `plugin: ${a.source.pluginName}` : a.source.scope,
+        readOnly ? "read-only" : undefined,
+        a.model ? `model: ${a.model}` : undefined,
+        a.isolation === "worktree" ? "worktree-isolated" : undefined,
       ].filter(Boolean);
-      pi.sendMessage(
-        { customType: "piclaudex-quota", content: lines.join("\n"), display: true },
-        { deliverAs: "nextTurn" },
-      );
-    },
-  });
+      lines.push(`  ${a.name} [${tags.join(", ")}]`);
+      lines.push(`    ${a.description.split("\n")[0]}`);
+      lines.push(`    tools: ${gated.length ? gated.join(", ") : "(all)"}`);
+    }
+    return lines.join("\n");
+  }
+
+  function renderQuota(ctx: any): string {
+    const usage = ctx?.getContextUsage?.();
+    return [
+      `Model: ${currentModelRef || "(not selected yet)"}`,
+      usage ? `Context: ~${usage.tokens} tokens used` : undefined,
+      Object.keys(quotaHeaders).length
+        ? `Provider quota headers:\n${Object.entries(quotaHeaders)
+            .map(([k, v]) => `  ${k}: ${v}`)
+            .join("\n")}`
+        : "No quota headers observed yet (best-effort feature — send a prompt first).",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  /** Runs a control command by name; returns its output text, or undefined if not one. */
+  function runControlCommand(name: string, args: string, ctx: any): string | undefined {
+    switch (name) {
+      case "doctor":
+        return renderDoctorReport(project, compat);
+      case "skills":
+        return renderSkillsList();
+      case "agents":
+        return renderAgentsList();
+      case "quota":
+        return renderQuota(ctx);
+      case "compat": {
+        const arg = (args ?? "").trim();
+        if (arg === "suppress") {
+          writeSuppression(project.root, true);
+          compatSuppressed = true;
+          return "Compatibility notice suppressed for this project.";
+        }
+        if (arg === "show") {
+          writeSuppression(project.root, false);
+          compatSuppressed = false;
+        }
+        return renderStartupNotice(compat, { suppressed: false }) ?? "No compatibility findings for this project.";
+      }
+      default:
+        return undefined;
+    }
+  }
+
+  const CONTROL_COMMANDS: Record<string, string> = {
+    doctor: "PiClauDex: full compatibility breakdown for this project",
+    compat: "PiClauDex: show or suppress the compatibility notice (usage: /compat [suppress|show])",
+    quota: "PiClauDex: subscription/rate-limit info from the last provider response",
+    skills: "PiClauDex: list the project's Claude skills (invocable + model-only)",
+    agents: "PiClauDex: list the subagents available for dispatch",
+  };
+  for (const [name, description] of Object.entries(CONTROL_COMMANDS)) {
+    pi.registerCommand(name, {
+      description,
+      handler: async (args: string, ctx: any) => {
+        const output = runControlCommand(name, args, ctx);
+        if (output !== undefined) {
+          pi.sendMessage(
+            { customType: `piclaudex-${name}`, content: output, display: true },
+            { deliverAs: "nextTurn" },
+          );
+        }
+      },
+    });
+  }
 
   debug(
     `loaded project root=${project.root} skills=${project.skills.length} agents=${project.agents.length} rules=${project.rules.length}`,
   );
 
-  // NOTE: user-invocable skills are intentionally NOT registered as extension
-  // commands. Pi intercepts extension commands *before* the `input` event and
-  // requires them to drive their own turn via sendUserMessage — which is
-  // fire-and-forget and does not reliably trigger a turn in print mode. Instead
-  // we expand `/skill args` in the `input` handler above (transform → the skill
-  // body becomes the user turn), which is exactly Claude Code's slash-command
-  // semantics and works in interactive, print, and RPC modes.
+  // ---------------------------------------------------------------------------
+  // Slash-command visibility for user-invocable skills.
   //
-  // We still register autocomplete-only descriptors so `/name` shows up in
-  // completion and `/help`, deferring the actual expansion to the input handler.
-  for (const skill of project.skills) {
-    if (!skill.userInvocable) continue;
-    // Skip names that collide with our own or Pi's built-in commands.
-    if (["doctor", "compat", "quota"].includes(skill.name)) continue;
+  // Skills are EXECUTED by the `input` handler above (transform → the skill body
+  // becomes the user turn — Claude Code's slash semantics, works in every mode,
+  // and lets a project skill win over a same-named plugin command). They are made
+  // VISIBLE in the `/` palette by contributing one Pi prompt-template stub per
+  // skill via `resources_discover`. The `input` transform runs before prompt-
+  // template expansion, so the stub body is only a fallback and never normally
+  // used — it exists purely so `/name` shows up with its description and hint.
+  // ---------------------------------------------------------------------------
+  // Ensure the harness-owned dir never appears as untracked in the project.
+  try {
+    const gitInfo = path.join(project.root, ".git", "info");
+    if (fs.existsSync(gitInfo)) {
+      const excludeFile = path.join(gitInfo, "exclude");
+      const existing = fs.existsSync(excludeFile) ? fs.readFileSync(excludeFile, "utf8") : "";
+      if (!existing.includes(".claude/.piclaudex/")) {
+        fs.appendFileSync(
+          excludeFile,
+          `${existing.endsWith("\n") || existing === "" ? "" : "\n"}.claude/.piclaudex/\n`,
+        );
+      }
+    }
+  } catch {
+    /* best-effort — never fail startup over gitignore hygiene */
   }
+
+  const promptStubDir = path.join(project.root, ".claude", ".piclaudex", "prompts");
+  // Our own commands + Pi built-in slash commands — don't advertise stubs that
+  // would duplicate or be shadowed by these (the skill still executes via the
+  // input handler if the name is typed and not intercepted as a built-in).
+  const RESERVED_NAMES = new Set([
+    "doctor", "compat", "quota", "skills", "agents",
+    "changelog", "clone", "compact", "copy", "export", "fork", "hotkeys", "import",
+    "login", "logout", "model", "name", "new", "quit", "reload", "resume",
+    "scoped-models", "session", "settings", "share", "tree", "trust", "help",
+  ]);
+  try {
+    fs.rmSync(promptStubDir, { recursive: true, force: true });
+    fs.mkdirSync(promptStubDir, { recursive: true });
+    for (const skill of project.skills) {
+      if (!skill.userInvocable) continue;
+      if (RESERVED_NAMES.has(skill.name)) continue;
+      if (!/^[A-Za-z0-9][\w-]*$/.test(skill.name)) continue;
+      const fm = [
+        "---",
+        `description: ${JSON.stringify(skill.description || `Run the ${skill.name} skill`)}`,
+        ...(skill.argumentHint ? [`argument-hint: ${JSON.stringify(skill.argumentHint)}`] : []),
+        "---",
+        `Run the project skill "${skill.name}"${skill.argumentHint ? ` with arguments: $ARGUMENTS` : ""}.`,
+        "",
+        `(PiClauDex expands this skill in full — including argument, variable and`,
+        `shell-injection processing — when you invoke /${skill.name}.)`,
+      ].join("\n");
+      fs.writeFileSync(path.join(promptStubDir, `${skill.name}.md`), fm, "utf8");
+    }
+    debug(`wrote ${fs.readdirSync(promptStubDir).length} prompt stubs to ${promptStubDir}`);
+  } catch (err) {
+    debug(`prompt-stub generation failed (skills still work via input): ${(err as Error).message}`);
+  }
+
+  pi.on("resources_discover", () => ({ promptPaths: [promptStubDir] }));
 }

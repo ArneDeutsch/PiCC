@@ -128,10 +128,18 @@ Then use it like Claude Code:
 
 | Command | What it does |
 |---|---|
+| `/skills` | List every loaded skill — invocable-as-slash-command, model-invocable-only, and user-only — with descriptions and source (project / user / plugin) |
+| `/agents` | List every subagent available for dispatch, with its tools, read-only marker, model, and worktree-isolation |
 | `/doctor` | Full compatibility breakdown for this project (generated from the capability registry) |
 | `/compat [suppress\|show]` | Show the consolidated compatibility notice; suppress/unsuppress it |
 | `/quota` | Context usage + provider rate-limit/quota headers from the last response (best-effort) |
 | `/model`, `/login`, `/settings` | Pi built-ins: model switching, auth, Pi settings |
+
+**Slash autocomplete.** Every user-invocable skill appears in the `/` menu with its description and
+argument hint — type `/` to browse, or start typing a name to filter. Selecting one expands the
+skill into your turn (with argument, variable, and shell-injection processing) exactly as Claude
+Code does. The full instruction body is loaded only on invocation (progressive disclosure), so the
+menu stays fast even with dozens of skills.
 
 ### Harness configuration
 
