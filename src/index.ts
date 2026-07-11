@@ -25,7 +25,6 @@ import { createTaskTools } from "./runtime/tools/task-tools.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression } from "./registry/compat-report.js";
 import { loadSkillBody, substituteVariables } from "./claude/skills.js";
-import { resolveAgent } from "./claude/agents.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
 
 /**
@@ -117,6 +116,7 @@ export default function piclaudex(pi: any) {
   let compatSuppressed = readSuppression(project.root) || config.suppressCompatNotice === true;
 
   let currentModelRef = "";
+  let currentModel: unknown; // the orchestrator's active model — inherited by subagents
   let steeringText: string | undefined;
   let stopHookIterations = 0;
   const quotaHeaders: Record<string, string> = {};
@@ -183,11 +183,11 @@ export default function piclaudex(pi: any) {
   const claudeNamedTools: Record<string, unknown>[] = [];
 
   function resolveModelSpec(spec: string | undefined): unknown | undefined {
-    if (!spec) return undefined;
+    if (!spec) return currentModel;
     const lower = spec.toLowerCase();
-    if (CLAUDE_MODEL_ALIASES.has(lower)) return undefined; // inherit session model
+    if (CLAUDE_MODEL_ALIASES.has(lower)) return currentModel; // inherit session model
     try {
-      if (!modelRegistryRef) return undefined;
+      if (!modelRegistryRef) return currentModel;
       if (spec.includes("/")) {
         const [provider, ...rest] = spec.split("/");
         return modelRegistryRef.find(provider, rest.join("/")) ?? undefined;
@@ -428,6 +428,7 @@ export default function piclaudex(pi: any) {
     try {
       modelRegistryRef = ctx.modelRegistry;
       if (ctx.model) {
+        currentModel = ctx.model;
         currentModelRef = `${ctx.model.provider}/${ctx.model.id}`;
         steeringText = steeringForModel(config, currentModelRef);
       }
@@ -550,6 +551,7 @@ export default function piclaudex(pi: any) {
 
   pi.on("model_select", (event: any) => {
     try {
+      currentModel = event.model;
       currentModelRef = `${event.model.provider}/${event.model.id}`;
       steeringText = steeringForModel(config, currentModelRef);
     } catch {

@@ -254,6 +254,7 @@ describe("SubagentRuntime (fake SDK)", () => {
       },
       inMemorySessionManager: () => ({}),
       inMemorySettingsManager: () => ({}),
+      agentDir: () => "/fake/agent-dir",
     };
     return { sdk, created };
   }

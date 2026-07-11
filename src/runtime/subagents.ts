@@ -53,6 +53,7 @@ export interface PiSdk {
   DefaultResourceLoader: new (options: Record<string, unknown>) => { reload(): Promise<void> };
   inMemorySessionManager(cwd: string): unknown;
   inMemorySettingsManager(): unknown;
+  agentDir(): string;
 }
 
 interface PiSession {
@@ -80,6 +81,7 @@ async function loadRealSdk(): Promise<PiSdk> {
     DefaultResourceLoader: m.DefaultResourceLoader,
     inMemorySessionManager: (cwd: string) => m.SessionManager.inMemory(cwd),
     inMemorySettingsManager: () => m.SettingsManager.inMemory({ compaction: { enabled: true } }),
+    agentDir: () => m.getAgentDir(),
   };
 }
 
@@ -206,6 +208,7 @@ export class SubagentRuntime {
       });
       const loader = new sdk.DefaultResourceLoader({
         cwd,
+        agentDir: sdk.agentDir(),
         systemPromptOverride: () => this.deps.buildSystemPrompt(agent),
         skillsOverride: () => ({ skills: [], diagnostics: [] }),
         agentsFilesOverride: () => ({ agentsFiles: [] }),

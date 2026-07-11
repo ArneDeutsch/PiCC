@@ -114,6 +114,14 @@ tracked project files):
 - `effortMap` — extends the mapping from Claude `effort:` values / prose ("apply maximum
   reasoning effort") to thinking levels.
 
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `PICLAUDEX_CLAUDE_USER_DIR` | Override the user-scope Claude dir (default `~/.claude`) — useful for isolated profiles or CI |
+| `BRAVE_API_KEY` | Use the Brave Search API for `WebSearch` (otherwise a keyless DuckDuckGo fallback is used) |
+| `PI_CODING_AGENT_DIR` | Pi's own config dir override (auth, models, Pi settings) |
+
 ## 6. Security & permission posture
 
 Deliberately partial, by design (see the plan §6):
@@ -167,7 +175,19 @@ re-entered here and vice versa).
 | Startup notice keeps appearing | `/compat suppress` (per-project, stored in `.claude/.piclaudex/`) |
 | Want to see why a fan-out routed the way it did | agent descriptions are the routing surface — inspect the "Available subagents" catalog in the session, and the dispatch tool calls in the transcript |
 
-## 10. Example projects
+## 10. Verification status
+
+- **Windows 11**: fully verified — 334 automated tests (unit, integration against the fixture
+  projects, NFR assertions, and an end-to-end suite driving the real Pi CLI with a mock
+  OpenAI-compatible model server), plus live validation on a real ChatGPT/Codex subscription
+  (skill slash command with argument substitution, description-routed subagent dispatch
+  returning a locked-YAML verdict verbatim, worktree entry detected as `mode=worktree` by the
+  project's own git-plumbing probe, `.worktreeinclude` seeding, `WorktreeCreate` hook).
+- **Linux**: the code is platform-guarded and expected to work (POSIX is the simpler path for
+  every Windows-special case), but has not yet been exercised in CI — run `npm test` on your
+  Linux machine before relying on it there.
+
+## 11. Example projects
 
 Two runnable fixtures ship in `examples/`:
 
