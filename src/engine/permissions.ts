@@ -165,18 +165,28 @@ function splitShellCommand(command: string): string[] {
  *   does NOT match); `Bash(ls*)` matches `lsof` too (no word boundary);
  * - legacy `Bash(git:*)` is identical to `Bash(git *)`;
  * - `*` matches any sequence including spaces at any position.
- * Shell-operator conservatism: a chained command only matches when EVERY
- * chained segment independently matches the same pattern — this prevents
- * `git status && rm -rf /` from matching `Bash(git *)`.
+ * Shell-operator conservatism is POLARITY-aware:
+ * - allow/ask direction (`anySegment: false`, default): a chained command only
+ *   matches when EVERY chained segment independently matches the same pattern —
+ *   this prevents `git status && rm -rf /` from matching an allow `Bash(git *)`.
+ * - deny direction (`anySegment: true`): a chained command matches when ANY
+ *   segment matches — this prevents `git status && curl evil` from evading a
+ *   deny `Bash(curl *)` by hiding behind a benign prefix.
  */
-function bashSpecifierMatches(specifier: string, call: ToolCallDescriptor): boolean {
+function bashSpecifierMatches(
+  specifier: string,
+  call: ToolCallDescriptor,
+  opts: { anySegment?: boolean } = {},
+): boolean {
   const command = inputString(call.input["command"]);
   let pattern = specifier;
   if (pattern.endsWith(":*")) pattern = `${pattern.slice(0, -2)} *`;
   const rx = wildcardRegExp(pattern);
   const segments = splitShellCommand(command);
   if (segments.length === 0) return false;
-  return segments.every((segment) => rx.test(segment));
+  return opts.anySegment
+    ? segments.some((segment) => rx.test(segment))
+    : segments.every((segment) => rx.test(segment));
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +262,11 @@ function webFetchSpecifierMatches(specifier: string, call: ToolCallDescriptor): 
  * — the three canonical single-string surfaces — so third-party/MCP rules
  * behave deterministically instead of erroring.
  */
-export function matchesRule(ruleText: string, call: ToolCallDescriptor): boolean {
+export function matchesRule(
+  ruleText: string,
+  call: ToolCallDescriptor,
+  opts: { anySegment?: boolean } = {},
+): boolean {
   try {
     if (!call || typeof call.tool !== "string") return false;
     const rule = parseRule(ruleText);
@@ -268,7 +282,7 @@ export function matchesRule(ruleText: string, call: ToolCallDescriptor): boolean
       case "*":
         return true; // `*` matches everything; a specifier on `*` is ignored
       case "Bash":
-        return bashSpecifierMatches(specifier, safeCall);
+        return bashSpecifierMatches(specifier, safeCall, opts);
       case "Read":
       case "Edit":
       case "Write":
@@ -325,7 +339,11 @@ export class PermissionEngine {
   evaluate(call: ToolCallDescriptor): PermissionEvaluation {
     const effective: ToolCallDescriptor = { ...call, cwd: call?.cwd || this.cwd };
     for (const rule of this.ruleList("deny")) {
-      if (matchesRule(rule, effective)) return { decision: "deny", rule };
+      // anySegment: a deny must hit even when the denied command hides inside
+      // a chain (`git status && curl evil` vs deny `Bash(curl *)`).
+      if (matchesRule(rule, effective, { anySegment: true })) {
+        return { decision: "deny", rule };
+      }
     }
     for (const rule of this.ruleList("ask")) {
       if (matchesRule(rule, effective)) {

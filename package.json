@@ -4,6 +4,9 @@
   "description": "Agentic harness that runs Claude Code projects unchanged on GPT/Codex models, built as an extension bundle on Pi.",
   "type": "module",
   "license": "MIT",
+  "bin": {
+    "piclaudex": "bin/piclaudex.mjs"
+  },
   "engines": {
     "node": ">=20"
   },
@@ -18,6 +21,7 @@
     "@earendil-works/pi-ai": "^0.80.6",
     "@earendil-works/pi-coding-agent": "^0.80.6",
     "picomatch": "^4.0.5",
+    "typebox": "1.1.38",
     "yaml": "^2.9.0"
   },
   "devDependencies": {
