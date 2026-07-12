@@ -85,12 +85,5 @@ export const DEGRADED_TOOLS: Array<{ name: string; note: string }> = [
     name: "SlashCommand",
     note: "invoke the skill directly with the Skill tool instead",
   },
-  {
-    name: "TaskOutput",
-    note: "background tasks are not implemented; subagents run in the foreground and return their result directly",
-  },
-  {
-    name: "TaskStop",
-    note: "background tasks are not implemented; there is no running task to stop",
-  },
+  // TaskOutput/TaskStop are REAL tools now (audit E4, src/runtime/background-tasks.ts).
 ];

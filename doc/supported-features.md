@@ -25,7 +25,7 @@ Built-in tool names a project can reference in `tools:`, `permissions.*`, or a h
 
 | ID | Tier | Note |
 |---|---|---|
-| `tool.Agent` | full | subagent dispatch — fresh-context spawn by subagent_type, verbatim final message (§4.3) |
+| `tool.Agent` | full | subagent dispatch — built-in general-purpose/Explore/Plan + project agents, omitted type defaults to general-purpose, run_in_background supported, verbatim final message (§4.3) |
 | `tool.Bash` | full | real implementation (from Pi) — shell execution, bash + PowerShell aware |
 | `tool.Edit` | full | real implementation — exact-string replacement edits |
 | `tool.EnterWorktree` | full | creates/re-enters .claude/worktrees/<flat>/ and swaps the session cwd (§4.4) |
@@ -38,10 +38,12 @@ Built-in tool names a project can reference in `tools:`, `permissions.*`, or a h
 | `tool.TaskCreate` | full | current task-tracking surface (§4.8) |
 | `tool.TaskGet` | full | current task-tracking surface (§4.8) |
 | `tool.TaskList` | full | current task-tracking surface (§4.8) |
+| `tool.TaskOutput` | full | retrieves background subagent results (wait or poll) from the background-task registry (§4.3, §4.8) |
 | `tool.TaskUpdate` | full | current task-tracking surface (§4.8) |
 | `tool.WebFetch` | full | implemented for real — research skills and permission allowlists depend on it (§4.8) |
 | `tool.WebSearch` | full | implemented for real — research skills and permission allowlists depend on it (§4.8) |
 | `tool.Write` | full | real implementation — file creation/overwrite |
+| `tool.TaskStop` | partial | stops a background subagent — cooperative via session abort; otherwise the result is discarded and reported as such (§4.3, §4.8) |
 | `tool.TodoWrite` | partial | deprecated todo tool — mapped onto the Task* equivalents, not a native implementation (§4.8) |
 | `tool.Artifact` | degraded-noop | callable no-op stub — Artifacts out of scope; the notice directs output to a regular file (§7) |
 | `tool.AskUserQuestion` | degraded-noop | callable no-op stub — deliberately not provided; the notice redirects questions to plain chat (§7) |
@@ -57,8 +59,6 @@ Built-in tool names a project can reference in `tools:`, `permissions.*`, or a h
 | `tool.NotebookEdit` | degraded-noop | callable no-op stub — notebook editing not implemented; the notice directs editing the .ipynb as JSON via Read/Edit (§4.8, §7) |
 | `tool.NotebookRead` | degraded-noop | callable no-op stub — notebook reading not implemented; the notice directs Read on the .ipynb JSON (§4.8, §7) |
 | `tool.SlashCommand` | degraded-noop | callable no-op stub — the notice directs invoking the skill directly via the Skill tool (§4.8) |
-| `tool.TaskOutput` | degraded-noop | callable no-op stub — subagents run in the foreground and return their result directly (§4.8) |
-| `tool.TaskStop` | degraded-noop | callable no-op stub — no background tasks exist to stop (§4.8) |
 
 ## Hook events (18)
 
@@ -69,10 +69,10 @@ Lifecycle events the hooks engine can fire (`settings.json` `hooks`, plus skill/
 | `hook.event.PostCompact` | full | fires after compaction; wired to re-injection (§9) |
 | `hook.event.PostToolUse` | full | fires after successful tool calls; matcher + if: conditions honored; exit-2 block feedback is fed back to the model (§4.5) |
 | `hook.event.PostToolUseFailure` | full | fires after failed tool calls (§4.5) |
-| `hook.event.PreCompact` | full | fires before compaction; anchored matcher matches the trigger (manual\|auto); wired to instruction preservation (§9) |
-| `hook.event.PreToolUse` | full | fires before each tool call; anchored matcher + full stdin/stdout contract incl. deny + updatedInput (§4.5) |
+| `hook.event.PreCompact` | full | fires before compaction; matcher matches the trigger exactly (manual\|auto); wired to instruction preservation (§9) |
+| `hook.event.PreToolUse` | full | fires before each tool call; Claude matcher semantics (exact/list/unanchored-regex) + full stdin/stdout contract incl. deny + updatedInput (§4.5) |
 | `hook.event.SessionEnd` | full | fires at session end (§4.5) |
-| `hook.event.SessionStart` | full | fires at session start; anchored matcher matches the source (startup\|resume\|clear\|compact); stdout injected (§4.5, §9) |
+| `hook.event.SessionStart` | full | fires at session start; matcher matches the source exactly (startup\|resume\|clear\|compact); stdout injected (§4.5, §9) |
 | `hook.event.Stop` | full | fires when the main agent wants to stop; exit 2 blocks stopping (§4.5) |
 | `hook.event.SubagentStart` | full | fires when a subagent is spawned; a blocking outcome cancels the dispatch (§4.5) |
 | `hook.event.SubagentStop` | full | fires when a subagent wants to stop; exit 2 blocks and re-prompts the subagent (bounded) (§4.5) |
@@ -85,25 +85,29 @@ Lifecycle events the hooks engine can fire (`settings.json` `hooks`, plus skill/
 | `hook.event.TaskCompleted` | degraded-noop | task-list event — parsed, never fired in v1 |
 | `hook.event.TeammateIdle` | degraded-noop | agent-teams event — teams out of scope, parsed and never fired (§7) |
 
-## Settings (32)
+## Settings (35)
 
 `settings.json` / `settings.local.json` keys.
 
 | ID | Tier | Note |
 |---|---|---|
+| `setting.autoMemoryDirectory` | full | overrides the auto-memory storage directory (~ and env expanded) (§4.6) |
+| `setting.autoMemoryEnabled` | full | gates auto-memory loading (default true; CLAUDE_CODE_DISABLE_AUTO_MEMORY also honored) (§4.6) |
+| `setting.claudeMd` | full | managed-scope inline CLAUDE.md content injected at highest priority; ignored with a diagnostic in other scopes (§4.6) |
 | `setting.claudeMdExcludes` | full | excludes CLAUDE.md/rules files from loading (§4.2, §4.6) |
 | `setting.cleanupPeriodDays` | full | max-age (days) for orphaned-worktree reaping at startup (§4.4) |
 | `setting.disableAllHooks` | full | disables all hook dispatch (§4.5) |
 | `setting.disableSkillShellExecution` | full | disables !`cmd` skill shell injection (§4.1) |
 | `setting.enabledPlugins` | full | selects installed-plugin content to load; merges key-wise across scopes, nearer scope wins per plugin (§4.9) |
 | `setting.env` | full | injected into sessions and hook/skill subprocesses (§5) |
-| `setting.hooks` | full | hook config dispatched per §4.5 (command handlers full) |
+| `setting.hooks` | full | hook config dispatched per §4.5 — Claude matcher semantics (exact/list/unanchored-regex), parallel execution with dedup, async handlers, systemMessage/suppressOutput honored (command handlers full) |
+| `setting.memory` | full | auto memory: MEMORY.md (first 200 lines / 25 KB) loads at session start with write-back conventions injected; autoMemoryEnabled/autoMemoryDirectory + CLAUDE_CODE_DISABLE_AUTO_MEMORY honored (§4.6) |
 | `setting.permissions.deny` | full | hard, non-interactive block — the kept deterministic safety valve (§6.1) |
 | `setting.skillListingBudgetFraction` | full | caps the startup skill-listing token budget (§4.1, §12.1) |
-| `setting.skillListingMaxDescChars` | full | caps per-skill description length in the startup listing (§4.1) |
+| `setting.skillListingMaxDescChars` | full | caps per-skill description length in the startup listing (default 1536, Claude parity; tiered degradation, never omits a skill) (§4.1) |
 | `setting.skillOverrides` | full | per-skill overrides applied at load: off / user-invocable-only / name-only (§5) |
 | `setting.subagentConcurrency` | full | caps parallel subagent fan-out (§4.3, §12.2) |
-| `setting.subagentMaxDepth` | full | caps nested subagent recursion depth (§4.3) |
+| `setting.subagentMaxDepth` | full | caps nested subagent recursion depth (default 5, Claude parity) (§4.3) |
 | `setting.subagentsEnabled` | full | gates subagent dispatch (§4.3) |
 | `setting.worktree.baseRef` | full | head\|fresh base resolved to a concrete commit before worktree creation (§4.4) |
 | `setting.permissions.allow` | partial | parsed and matched, but moot under the default-permissive posture — nothing waits on an allow (§6.1) |
@@ -115,7 +119,6 @@ Lifecycle events the hooks engine can fire (`settings.json` `hooks`, plus skill/
 | `setting.enabledMcpjsonServers` | degraded-noop | MCP deferred — parsed, no servers started (§7) |
 | `setting.includeCoAuthoredBy` | degraded-noop | parsed, not consumed — PiCC has no commit-attribution machinery either way; reported when set (§5, §7) |
 | `setting.mcpServers` | degraded-noop | MCP deferred — parsed, no servers started (§7) |
-| `setting.memory` | degraded-noop | auto-memory deferred — parsed, no-op storage (§7) |
 | `setting.model` | degraded-noop | parsed, not consumed — session model selection uses PiCC config (model/effort), not Claude model names; reported when set (§5, §10) |
 | `setting.outputStyle` | degraded-noop | cosmetic output styles not honored beyond Pi defaults (§7) |
 | `setting.permissions.additionalDirectories` | degraded-noop | parsed, no-op — the default-permissive posture applies no directory sandbox, so extra grants are moot; reported when set (§6.1) |
@@ -133,8 +136,10 @@ Skill (`SKILL.md`), agent (`.claude/agents/*.md`), and rule frontmatter keys.
 | `agent.frontmatter.description` | full | auto-injected routing surface for description-driven selection (§4.3) |
 | `agent.frontmatter.disallowedTools` | full | tool denylist enforced for the subagent (§4.3) |
 | `agent.frontmatter.effort` | full | per-agent effort override honored (§4.3, §10) |
+| `agent.frontmatter.hooks` | full | scoped hook runner active for the subagent's dispatch; Stop maps to SubagentStop (§4.3, §4.5) |
 | `agent.frontmatter.initialPrompt` | full | injected as the subagent's first user message (§4.3) |
 | `agent.frontmatter.isolation` | full | isolation: worktree pins the subagent to its own worktree (§4.3, §4.4) |
+| `agent.frontmatter.memory` | full | user\|project\|local scopes resolve to Claude's agent-memory dirs; MEMORY.md (200 lines / 25 KB) injected with persistence guidance (§4.3, §4.6) |
 | `agent.frontmatter.metadata` | full | metadata.* preserved and exposed (§4.3) |
 | `agent.frontmatter.model` | full | per-agent model override honored (§4.3) |
 | `agent.frontmatter.name` | full | agent identity for subagent_type dispatch (§4.3) |
@@ -160,9 +165,7 @@ Skill (`SKILL.md`), agent (`.claude/agents/*.md`), and rule frontmatter keys.
 | `skill.frontmatter.effort` | partial | honored for context:fork dispatch and ${CLAUDE_EFFORT} substitution; does not change the parent session's reasoning effort (§4.1, §10) |
 | `skill.frontmatter.model` | partial | honored for context:fork dispatch; in-session activation cannot switch the parent session's model (§4.1, §10) |
 | `agent.frontmatter.color` | degraded-noop | parsed only — cosmetic; Pi's TUI does not render agent colors (§4.3, §11) |
-| `agent.frontmatter.hooks` | degraded-noop | parsed; agent-scoped hooks are not dispatched in v1 |
 | `agent.frontmatter.mcpServers` | degraded-noop | parsed; MCP deferred — no servers started for the agent (§7) |
-| `agent.frontmatter.memory` | degraded-noop | parsed; no-op storage — auto-memory deferred (§7) |
 | `agent.frontmatter.permissionMode` ⚠ | degraded-noop | parsed, no-op — subagents run the default-permissive posture regardless; deny rules + tools: gating remain the controls; reported when set (§6.1) |
 
 ## Runtime features (25)
@@ -171,15 +174,16 @@ Cross-cutting runtime subsystems and behaviors.
 
 | ID | Tier | Note |
 |---|---|---|
+| `feature.agent-memory` | full | auto memory (project MEMORY.md) + per-agent memory scopes loaded and injected with write-back conventions (§4.6) |
 | `feature.claude-md-import` | full | @import expansion, recursive up to 4 hops, incl. the AGENTS.md bridge (§4.6) |
-| `feature.compaction-preservation` | full | root CLAUDE.md + active skills + unconditional rules survive compaction (§9) |
-| `feature.nested-claude-md` | full | nearest-ancestor CLAUDE.md injected on subdir file access, incl. worktrees (§4.6) |
+| `feature.compaction-preservation` | full | root CLAUDE.md + active skills (Claude-parity 20k/100k char budgets, most-recent-first) + unconditional rules survive compaction (§9) |
+| `feature.nested-claude-md` | full | full ancestor-chain CLAUDE.md/CLAUDE.local.md load (to filesystem root) + nearest-ancestor injection on subdir file access, incl. worktrees (§4.6) |
 | `feature.plugins-content` | full | installed-plugin skills/agents/hooks/commands folded into the registries (§4.9) |
 | `feature.rules` | full | .claude/rules/ unconditional load + path-scoped injection at project and user scope (§4.2) |
 | `feature.worktrees` | full | EnterWorktree/ExitWorktree lifecycle incl. .worktreeinclude, parallel sessions, Windows tolerance (§4.4) |
+| `feature.background-agents` | partial | run_in_background subagents with TaskOutput/TaskStop lifecycle; no remote/cloud agents, stop is cooperative (§4.3) |
 | `feature.hook-handler.http` | partial | http hook handlers dispatched best-effort (§4.5) |
 | `feature.managed-policy` | partial | managed/enterprise policy honored where trivially present; otherwise degrade-safe (§7) |
-| `feature.agent-memory` | degraded-noop | auto-memory parsed with no-op storage (§7) |
 | `feature.hook-handler.agent` | degraded-noop | agent hook handlers degrade with a notice (§4.5) |
 | `feature.hook-handler.mcp_tool` | degraded-noop | mcp_tool hook handlers degrade with a notice — MCP deferred (§4.5, §7) |
 | `feature.hook-handler.prompt` | degraded-noop | prompt hook handlers degrade with a notice (§4.5) |
@@ -188,7 +192,6 @@ Cross-cutting runtime subsystems and behaviors.
 | `feature.telemetry-otel` | degraded-noop | telemetry/OTEL settings parsed, nothing exported (§7) |
 | `feature.agent-teams` | not-supported | agent teams out of scope; names degrade safely (§7) |
 | `feature.artifacts` | not-supported | Artifacts out of scope; names degrade safely (§7) |
-| `feature.background-agents` | not-supported | background agents out of scope; names degrade safely (§7) |
 | `feature.checkpointing-rewind` | not-supported | no rewind parity — relies on Pi's session model (§7) |
 | `feature.computer-use` | not-supported | computer use out of scope; names degrade safely (§7) |
 | `feature.cron` | not-supported | scheduled tasks out of scope; names degrade safely (§7) |
@@ -199,4 +202,4 @@ Cross-cutting runtime subsystems and behaviors.
 
 ## Summary
 
-The registry enumerates **143 capabilities** against baseline `claude-code-2.1.x (mid-2026)`: **76 full**, **8 partial**, **49 degraded-noop**, **10 not-supported**. 5 entries are safety-relevant (marked ⚠) — a divergence where a project's restriction is not enforced and is therefore reported prominently. Unknown inputs outside this registry are not counted here: they are unassessed by definition and degrade safely at runtime (plan §2.4).
+The registry enumerates **146 capabilities** against baseline `claude-code-2.1.x (mid-2026)`: **84 full**, **10 partial**, **43 degraded-noop**, **9 not-supported**. 5 entries are safety-relevant (marked ⚠) — a divergence where a project's restriction is not enforced and is therefore reported prominently. Unknown inputs outside this registry are not counted here: they are unassessed by definition and degrade safely at runtime (plan §2.4).

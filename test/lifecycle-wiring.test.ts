@@ -108,13 +108,13 @@ describe("lifecycle wiring", () => {
     expect(without).not.toContain("LW-STEERING-ACTIVE");
   });
 
-  it("blocking Stop hook re-prompts via sendUserMessage, capped at 5 continuations", async () => {
+  it("blocking Stop hook re-prompts via sendUserMessage, capped at 8 continuations", async () => {
     pi.userMessages.length = 0;
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 9; i++) {
       await pi.fire("agent_settled", {}, pi.ctx());
     }
     const continuations = pi.userMessages.filter((m) => String(m.content).includes("[Stop hook]"));
-    expect(continuations.length).toBe(5);
+    expect(continuations.length).toBe(8);
     expect(String(continuations[0]?.content)).toContain("LW-not-done");
   });
 

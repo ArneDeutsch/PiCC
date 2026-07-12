@@ -184,6 +184,7 @@ function parseHandler(
     handler.timeout = h["timeout"];
   }
   if (typeof h["once"] === "boolean") handler.once = h["once"];
+  if (typeof h["async"] === "boolean") handler.async = h["async"];
   if (typeof h["url"] === "string") handler.url = h["url"];
 
   if (!EXECUTABLE_HANDLER_TYPES.has(typeText)) {

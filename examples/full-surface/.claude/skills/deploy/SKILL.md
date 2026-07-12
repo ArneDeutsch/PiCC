@@ -11,7 +11,7 @@ arguments:
     default: latest
 ---
 
-Deploy to environment **$1** at version **$2**.
+Deploy to environment **$0** at version **$1**.
 
 Named form: environment=$environment version=$version
 

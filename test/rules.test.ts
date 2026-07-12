@@ -75,24 +75,29 @@ describe("loadRules", () => {
     expect(res.rules[0]!.paths).toEqual(["src/**", "lib/**"]);
   });
 
-  it("preserves input dir order (project before user) and sorts files within a dir", () => {
+  it("preserves ascending-priority input dir order (user before project, managed last — B6) and sorts files within a dir", () => {
     const root = path.join(tmp, "proj");
     const userRules = path.join(tmp, "userhome", "rules");
+    const managedRules = path.join(tmp, "managed", "rules");
     write("proj/rules/z.md", "project z");
     write("proj/rules/a.md", "project a");
     write("userhome/rules/m.md", "user m");
+    write("managed/rules/policy.md", "managed policy");
 
     const res = loadRules(
       [
-        { dir: path.join(root, "rules"), scope: "project" },
         { dir: userRules, scope: "user" },
+        { dir: path.join(root, "rules"), scope: "project" },
+        { dir: managedRules, scope: "managed" },
       ],
       { excludes: [], projectRoot: root },
     );
+    // User rules load first (lowest priority); managed text appears last (closest).
     expect(res.rules.map((r) => `${r.source.scope}:${r.id}`)).toEqual([
+      "user:m.md",
       "project:a.md",
       "project:z.md",
-      "user:m.md",
+      "managed:policy.md",
     ]);
   });
 

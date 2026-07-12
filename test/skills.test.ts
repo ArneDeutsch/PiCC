@@ -108,6 +108,55 @@ Body.
 `,
   );
 
+  // Colliding nested skill (same leaf dir name as group/nested-skill) →
+  // registered under the colon-qualified name "other:nested-skill".
+  write(
+    ".claude/skills/other/nested-skill/SKILL.md",
+    `---
+description: Colliding nested skill (qualified)
+---
+Other nested body.
+`,
+  );
+
+  // Informational frontmatter keys (v2.1.186): known, no unknown-key warnings.
+  write(
+    ".claude/skills/meta-rich/SKILL.md",
+    `---
+name: meta-rich
+description: Has informational keys
+license: MIT
+display-name: Meta Rich
+default-enabled: true
+fallback: unused fallback
+---
+Body.
+`,
+  );
+
+  // No description, but a fallback: → loads with the fallback as description.
+  write(
+    ".claude/skills/fallback-desc/SKILL.md",
+    `---
+name: fallback-desc
+fallback: Description from fallback key
+---
+Body of fallback-desc.
+`,
+  );
+
+  // Broken strict YAML (unclosed flow sequence) → lenient parse; fallback still
+  // provides the description so the skill loads with its body.
+  write(
+    ".claude/skills/broken-yaml/SKILL.md",
+    `---
+fallback: Recovered description via fallback
+weird: [unclosed
+---
+Body of broken-yaml skill.
+`,
+  );
+
   // Legacy commands.
   write(
     ".claude/commands/deploy.md",
@@ -117,6 +166,24 @@ argument-hint: "[env]"
 allowed-tools: Bash(npm run deploy:*), Read
 ---
 Deploy to $ARGUMENTS now.
+`,
+  );
+  // Nested command colliding with the top-level deploy.md → "frontend:deploy".
+  write(
+    ".claude/commands/frontend/deploy.md",
+    `---
+description: Frontend deploy (nested)
+---
+Nested frontend deploy body.
+`,
+  );
+  // Nested command without a collision → keeps its plain stem.
+  write(
+    ".claude/commands/ops/status.md",
+    `---
+description: Ops status (nested, no collision)
+---
+Status body.
 `,
   );
   write(
@@ -260,6 +327,91 @@ describe("loadSkills", () => {
     const shadow = diagnostics.find((d) => d.message.includes("shadowed"));
     expect(shadow).toBeDefined();
   });
+
+  it("discovers legacy commands recursively; nested non-colliding stems stay plain", () => {
+    const { skills } = load();
+    const status = skills.find((x) => x.name === "status")!;
+    expect(status).toBeDefined();
+    expect(status.legacyCommand).toBe(true);
+    expect(status.description).toBe("Ops status (nested, no collision)");
+    expect(status.baseDir).toBe(path.join(commandsDir, "ops"));
+  });
+
+  it("ALWAYS registers a qualified alias for nested entries, not only on collision (G4)", () => {
+    const { skills, diagnostics } = load();
+    // Non-colliding nested command: plain stem AND colon-qualified alias.
+    const alias = skills.find((x) => x.name === "ops:status")!;
+    expect(alias).toBeDefined();
+    expect(alias.description).toBe("Ops status (nested, no collision)");
+    expect(alias.legacyCommand).toBe(true);
+    expect(alias.userInvocable).toBe(true); // still a slash command
+    expect(alias.disableModelInvocation).toBe(true); // hidden from the listing — the plain stem lists
+    // Non-colliding nested skill gets one too.
+    const skillAlias = skills.find((x) => x.name === "group:nested-skill")!;
+    expect(skillAlias).toBeDefined();
+    expect(skillAlias.description).toBe("A nested skill relying on defaults");
+    // No collision diagnostic for the always-on alias registrations.
+    expect(
+      diagnostics.some((d) => d.message.includes(`"ops:status"`) || d.message.includes(`"group:nested-skill"`)),
+    ).toBe(false);
+  });
+
+  it("qualifies a colliding nested command as <subdir>:<stem> instead of dropping it", () => {
+    const { skills, diagnostics } = load();
+    // Top-level deploy.md wins the plain name.
+    const deploy = skills.find((x) => x.name === "deploy")!;
+    expect(deploy.description).toBe("Deploy the app");
+    // Nested collision is registered under the colon-qualified name.
+    const qualified = skills.find((x) => x.name === "frontend:deploy")!;
+    expect(qualified).toBeDefined();
+    expect(qualified.legacyCommand).toBe(true);
+    expect(qualified.description).toBe("Frontend deploy (nested)");
+    const info = diagnostics.find(
+      (d) => d.severity === "info" && d.message.includes(`registered as "frontend:deploy"`),
+    );
+    expect(info).toBeDefined();
+  });
+
+  it("qualifies a colliding nested skill as <group>:<name>; first occurrence keeps the plain name", () => {
+    const { skills, diagnostics } = load();
+    const plain = skills.find((x) => x.name === "nested-skill")!;
+    expect(plain.description).toBe("A nested skill relying on defaults");
+    const qualified = skills.find((x) => x.name === "other:nested-skill")!;
+    expect(qualified).toBeDefined();
+    expect(qualified.description).toBe("Colliding nested skill (qualified)");
+    const info = diagnostics.find(
+      (d) => d.severity === "info" && d.message.includes(`registered as "other:nested-skill"`),
+    );
+    expect(info).toBeDefined();
+  });
+
+  it("recognizes license/display-name/default-enabled/fallback keys (no unknown-key warnings)", () => {
+    const { skills } = load();
+    const s = skills.find((x) => x.name === "meta-rich")!;
+    expect(s).toBeDefined();
+    expect(s.unknownKeys).toEqual([]);
+    expect(s.metadata["license"]).toBe("MIT");
+    expect(s.metadata["display-name"]).toBe("Meta Rich");
+    // description present → fallback unused
+    expect(s.description).toBe("Has informational keys");
+  });
+
+  it("uses fallback: as the description default before the description-required skip", () => {
+    const { skills } = load();
+    const s = skills.find((x) => x.name === "fallback-desc")!;
+    expect(s).toBeDefined();
+    expect(s.description).toBe("Description from fallback key");
+    expect(loadSkillBody(s)).toContain("Body of fallback-desc.");
+  });
+
+  it("loads a skill with broken strict YAML via the lenient parser + fallback description", () => {
+    const { skills } = load();
+    const s = skills.find((x) => x.name === "broken-yaml")!;
+    expect(s).toBeDefined();
+    expect(s.description).toBe("Recovered description via fallback");
+    expect(s.diagnostics.some((d) => d.message.includes("leniently"))).toBe(true);
+    expect(loadSkillBody(s)).toContain("Body of broken-yaml skill.");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -307,17 +459,16 @@ describe("renderSkillListing", () => {
     expect(listing).not.toContain("hidden");
   });
 
-  it("honors the character budget and appends (+N more skills)", () => {
+  it("degrades in tiers over budget instead of omitting skills", () => {
     const skills = [
-      mkSkill("one", "first description"),
-      mkSkill("two", "second description"),
-      mkSkill("three", "third description"),
+      mkSkill("one", "first description", { whenToUse: "when one" }),
+      mkSkill("two", "second description", { whenToUse: "when two" }),
+      mkSkill("three", "third description", { whenToUse: "when three" }),
     ];
-    const firstLine = "- one: first description";
-    const listing = renderSkillListing(skills, { budgetChars: firstLine.length + 3 });
-    expect(listing.split("\n")[0]).toBe(firstLine);
-    expect(listing).toContain("… (+2 more skills)");
-    expect(listing).not.toContain("second");
+    // Budget forces the names-only tier — every skill still appears.
+    const listing = renderSkillListing(skills, { budgetChars: 25 });
+    expect(listing.split("\n")).toEqual(["- one", "- two", "- three"]);
+    expect(listing).not.toContain("+2 more skills");
   });
 });
 
@@ -332,9 +483,9 @@ describe("substituteArguments", () => {
     expect(diagnostics).toHaveLength(0);
   });
 
-  it("replaces positional $1 and $ARGUMENTS[0] with quoted-token support", () => {
+  it("replaces 0-based positional $0/$1 and $ARGUMENTS[0] with quoted-token support", () => {
     const { text } = substituteArguments(
-      "first=$ARGUMENTS[0] second=$2 also-first=$1",
+      "first=$ARGUMENTS[0] second=$1 also-first=$0",
       `"two words" 'single quoted'`,
     );
     expect(text).toBe("first=two words second=single quoted also-first=two words");
@@ -363,9 +514,10 @@ describe("substituteArguments", () => {
     expect(text).toBe("file=a.txt format=xml mode=fast");
   });
 
-  it("escapes $$ to a literal dollar", () => {
-    const { text } = substituteArguments("Costs $$5 and arg $1", "ten");
-    expect(text).toBe("Costs $5 and arg ten");
+  it("escapes tokens with a single backslash (\\$N stays literal)", () => {
+    const { text, diagnostics } = substituteArguments("Literal \\$0 and arg $0", "ten");
+    expect(text).toBe("Literal $0 and arg ten");
+    expect(diagnostics).toHaveLength(0);
   });
 
   it("substitutes empty string + info diagnostic for unmatched markers", () => {
@@ -478,14 +630,36 @@ describe("preprocessShellInjection", () => {
     expect(diagnostics).toHaveLength(1);
   });
 
-  it.runIf(hasBash)("degrades a failing command to a note + diagnostic (never throws)", async () => {
-    const { text, diagnostics } = await preprocessShellInjection(
-      "Status: !`echo boom >&2; exit 3`",
-      { ...baseOpts, shell: "bash" },
-    );
-    expect(text).toBe("Status: [command failed (exit 3): boom]");
+  it.runIf(hasBash)("preserves the literal text of a failing command + diagnostic (never throws)", async () => {
+    const body = "Status: !`echo boom >&2; exit 3`";
+    const { text, diagnostics } = await preprocessShellInjection(body, {
+      ...baseOpts,
+      shell: "bash",
+    });
+    expect(text).toBe(body); // Claude behavior: the literal placeholder stays
     expect(diagnostics).toHaveLength(1);
     expect(diagnostics[0]!.severity).toBe("warning");
+    expect(diagnostics[0]!.message).toContain("exit 3");
+    expect(diagnostics[0]!.message).toContain("boom");
+  });
+
+  it.runIf(hasBash)("preserves a failing ```! fenced block verbatim", async () => {
+    const body = "Before\n```!\necho fen >&2\nexit 7\n```\nAfter";
+    const { text, diagnostics } = await preprocessShellInjection(body, {
+      ...baseOpts,
+      shell: "bash",
+    });
+    expect(text).toBe(body);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.severity).toBe("warning");
+  });
+
+  it.runIf(hasBash)("mixes preserved failures with successful injections single-pass", async () => {
+    const { text } = await preprocessShellInjection(
+      "ok: !`echo fine` bad: !`exit 2`",
+      { ...baseOpts, shell: "bash" },
+    );
+    expect(text).toBe("ok: fine bad: !`exit 2`");
   });
 
   it.runIf(hasPowershell)("runs powershell when shell: powershell", async () => {
@@ -621,17 +795,18 @@ describe("resolveShellBinary: powershell", () => {
     );
   });
 
-  it("degrades a missing PowerShell to a clear note + diagnostic", async () => {
+  it("degrades a missing PowerShell to preserved literal text + a clear diagnostic", async () => {
     const { env } = fakeInstall("none-run", []);
-    const { text, diagnostics } = await preprocessShellInjection("PS: !`Write-Output x`", {
+    const body = "PS: !`Write-Output x`";
+    const { text, diagnostics } = await preprocessShellInjection(body, {
       cwd: process.cwd(),
       env,
       disabled: false,
       shell: "powershell",
     });
-    expect(text).toContain("[command failed");
-    expect(text).toContain("PowerShell not found");
+    expect(text).toBe(body); // literal preserved on spawn failure
     expect(diagnostics).toHaveLength(1);
     expect(diagnostics[0]!.severity).toBe("warning");
+    expect(diagnostics[0]!.message).toContain("PowerShell not found");
   });
 });

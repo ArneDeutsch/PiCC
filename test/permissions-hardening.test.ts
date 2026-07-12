@@ -187,6 +187,50 @@ describe("Bash process-wrapper stripping", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 3b. Leading env-assignment stripping (deny direction only, D3)
+// ---------------------------------------------------------------------------
+
+describe("Bash leading env-assignment stripping (deny only)", () => {
+  it.each([
+    "FOO=bar rm -rf /",
+    "FOO=bar BAZ=1 rm -rf /",
+    "FOO='a b' rm -rf /",
+    'FOO="a && b" rm -rf /',
+    "EMPTY= rm -rf /",
+    "git status && FOO=bar rm -rf /",
+  ])("deny Bash(rm *) blocks %j", (command) => {
+    expect(denyEngine(["Bash(rm *)"]).evaluate(bash(command)).decision).toBe("deny");
+  });
+
+  it("assignments compose with wrapper stripping in either order", () => {
+    const engine = denyEngine(["Bash(curl *)"]);
+    expect(engine.evaluate(bash("FOO=1 nohup curl http://evil")).decision).toBe("deny");
+    expect(engine.evaluate(bash("nohup FOO=1 curl http://evil")).decision).toBe("deny");
+  });
+
+  it("allow direction does NOT strip bare assignments", () => {
+    expect(matchesRule("Bash(rm *)", bash("FOO=bar rm -rf /"))).toBe(false);
+    const engine = new PermissionEngine(rules({ allow: ["Bash(git *)"] }), { cwd: ROOT });
+    expect(engine.evaluate(bash("FOO=1 git status")).decision).toBe("default");
+    expect(engine.evaluate(bash("git status")).decision).toBe("allow");
+  });
+
+  it("a pure assignment (no command) matches nothing", () => {
+    expect(denyEngine(["Bash(rm *)"]).evaluate(bash("FOO=bar")).decision).toBe("default");
+  });
+
+  it("assignment-shaped text mid-command is left alone", () => {
+    expect(denyEngine(["Bash(rm *)"]).evaluate(bash("echo FOO=bar rm -rf /")).decision).toBe(
+      "default",
+    );
+  });
+
+  it("rules that name the assignment still match the raw form", () => {
+    expect(denyEngine(["Bash(FOO=*)"]).evaluate(bash("FOO=bar rm -rf /")).decision).toBe("deny");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 4. Parameter-matching rule forms
 // ---------------------------------------------------------------------------
 
@@ -362,6 +406,36 @@ describe("anchor forms", () => {
     expect(matchesRule("Read(other/**)", call("Read", { file_path: "src\\deep\\y.ts" }))).toBe(
       false,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. UNC inputs skip realpath (no network-stack stall)
+// ---------------------------------------------------------------------------
+
+describe("UNC path inputs", () => {
+  // fs.realpathSync on a nonexistent \\host can block for seconds probing the
+  // network stack — deny-direction matching must skip it for UNC inputs and
+  // stay on the literal form.
+  it("deny evaluation against a \\\\server\\share input returns quickly and never throws", () => {
+    const engine = denyEngine(["Read(//secrets/**)", "Edit(secrets/**)"]);
+    const unc = "\\\\no-such-host-9f3a\\share\\secrets\\key.pem";
+    const start = Date.now();
+    expect(() => engine.evaluate(call("Read", { file_path: unc }))).not.toThrow();
+    expect(() => engine.evaluate(call("Edit", { file_path: unc }))).not.toThrow();
+    expect(Date.now() - start).toBeLessThan(500);
+  });
+
+  it("forward-slash UNC form (//server/share/...) is skipped too", () => {
+    const start = Date.now();
+    expect(() =>
+      matchesRule(
+        "Read(//no-such-host-9f3a/**)",
+        call("Read", { file_path: "//no-such-host-9f3a/share/secrets/key.pem" }),
+        { deny: true, anySegment: true, anchor: ROOT },
+      ),
+    ).not.toThrow();
+    expect(Date.now() - start).toBeLessThan(500);
   });
 });
 

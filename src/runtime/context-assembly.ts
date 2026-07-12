@@ -1,8 +1,20 @@
-import type { ClaudeAgent, ClaudeMdFile, ClaudeRule, ClaudeSettings, ClaudeSkill } from "../types.js";
+import type {
+  ClaudeAgent,
+  ClaudeMdFile,
+  ClaudeRule,
+  ClaudeSettings,
+  ClaudeSkill,
+  Diagnostic,
+} from "../types.js";
 import { renderSkillListing } from "../claude/skills.js";
 import { renderAgentCatalog } from "../claude/agents.js";
 import { findNestedClaudeMd } from "../claude/claude-md.js";
+import type { MemorySnapshot } from "../claude/memory.js";
 import { ruleAppliesTo } from "../claude/rules.js";
+import {
+  budgetSkillReinjection,
+  REINJECT_PER_SKILL_MAX_CHARS,
+} from "./skill-activation.js";
 
 /**
  * Assembles the PiCC system-prompt suffix appended to Pi's prompt each turn
@@ -55,8 +67,33 @@ export interface AssemblyInputs {
   state: SessionContextState;
   steeringText?: string;
   compatNotice?: string;
+  /** Auto memory (audit B4): injected as its own section when present (= enabled). */
+  autoMemory?: MemorySnapshot;
   /** Approximate model context-window budget in chars for the skill listing. */
   contextWindowChars?: number;
+  /**
+   * Sink for assembly diagnostics — currently the skill-listing tier
+   * degradation (G5). Called once per diagnostic per render; wrap it with
+   * {@link createTierChangeReporter} to surface each tier change only once.
+   */
+  onDiagnostic?: (diagnostic: Diagnostic) => void;
+}
+
+/**
+ * Wrap a report callback so skill-listing tier-degradation diagnostics (G5)
+ * surface once per TIER CHANGE, not once per render — the system-prompt suffix
+ * is rebuilt every turn and would otherwise repeat the same message forever.
+ */
+export function createTierChangeReporter(
+  report: (message: string) => void,
+): (diagnostic: Diagnostic) => void {
+  let lastKey: string | undefined;
+  return (diagnostic: Diagnostic) => {
+    const key = /tier (\d+)/.exec(diagnostic.message)?.[1] ?? diagnostic.message;
+    if (key === lastKey) return;
+    lastKey = key;
+    report(diagnostic.message);
+  };
 }
 
 const HARNESS_CONVENTIONS = `## Claude Code compatibility conventions (PiCC)
@@ -68,6 +105,8 @@ You are running a project authored for Claude Code. Honor its conventions:
 - When a skill or instruction specifies an output format (e.g. a locked YAML block), reproduce it EXACTLY — downstream tooling parses it.
 - Worktrees: EnterWorktree/ExitWorktree isolate work; while inside one, all relative paths and shell commands run there.
 - Never use git commit --no-verify; project hooks must run.`;
+
+const AUTO_MEMORY_INSTRUCTIONS = `As you work, record durable project facts in the memory directory: one topic per file, with MEMORY.md as the index (keep it under ~200 lines — only MEMORY.md is loaded automatically). Update memory via the Write/Edit tools whenever you learn something worth keeping across sessions; prune entries that turn out to be wrong or obsolete.`;
 
 export function buildSystemPromptSuffix(inputs: AssemblyInputs): string {
   const sections: string[] = [];
@@ -82,6 +121,14 @@ export function buildSystemPromptSuffix(inputs: AssemblyInputs): string {
     sections.push(`## Project instructions (CLAUDE.md)\n\n${claudeMdParts.join("\n\n---\n\n")}`);
   }
 
+  if (inputs.autoMemory) {
+    const parts = [`Memory directory: ${inputs.autoMemory.dir}`];
+    const memContent = inputs.autoMemory.content?.trim();
+    if (memContent) parts.push(memContent);
+    parts.push(AUTO_MEMORY_INSTRUCTIONS);
+    sections.push(`# Auto memory\n\n${parts.join("\n\n")}`);
+  }
+
   const unconditionalRules = inputs.rules.filter((r) => !r.paths || r.paths.length === 0);
   if (unconditionalRules.length) {
     sections.push(
@@ -89,10 +136,13 @@ export function buildSystemPromptSuffix(inputs: AssemblyInputs): string {
     );
   }
 
+  const listingDiagnostics: Diagnostic[] = [];
   const listing = renderSkillListing(inputs.skills, {
     budgetChars: skillListingBudget(inputs),
     maxDescChars: inputs.settings.skillListingMaxDescChars,
+    diagnostics: listingDiagnostics,
   });
+  if (inputs.onDiagnostic) for (const d of listingDiagnostics) inputs.onDiagnostic(d);
   if (listing.trim()) {
     sections.push(
       `## Available skills\n\nActivate a skill with the Skill tool when a task matches its description.\n\n${listing}`,
@@ -104,10 +154,21 @@ export function buildSystemPromptSuffix(inputs: AssemblyInputs): string {
   }
 
   if (inputs.state.activeSkills.size) {
-    const active = [...inputs.state.activeSkills.entries()]
-      .map(([name, body]) => `### Skill: ${name} (active)\n${body.trim()}`)
-      .join("\n\n");
-    sections.push(`## Active skills\n\n${active}`);
+    // The resident section re-sends every active body each turn, so it gets
+    // the same ~20k-per-skill / ~100k-combined budget as compaction
+    // re-injection (G7), most recently activated first (Map insertion order
+    // reflects activation order).
+    const active = [...inputs.state.activeSkills.entries()];
+    const { text, dropped } = budgetSkillReinjection(active);
+    const truncated = active.filter(
+      ([name, body]) => !dropped.includes(name) && body.length > REINJECT_PER_SKILL_MAX_CHARS,
+    ).length;
+    const affected = truncated + dropped.length;
+    const note =
+      affected > 0
+        ? `\n\n(${affected} older skill ${affected === 1 ? "body" : "bodies"} truncated/dropped for context budget)`
+        : "";
+    sections.push(`## Active skills\n\n${text}${note}`);
   }
 
   if (inputs.steeringText) {

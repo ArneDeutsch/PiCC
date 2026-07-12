@@ -12,9 +12,9 @@ and hooks, worktree isolation, subagent fan-out, and plugin content.
 At startup PiCC reads your project's `.claude/` corpus and `CLAUDE.md` hierarchy into one
 in-memory model. From then on, on Pi's own agent loop:
 
-- **Every turn** it appends the assembled instruction set — root `CLAUDE.md`, unconditional rules,
-  the budgeted skill listing, and the subagent catalog — to the system prompt. Because the system
-  prompt is rebuilt each turn, this is also what survives compaction.
+- **Every turn** it appends the assembled instruction set — root `CLAUDE.md`, auto memory,
+  unconditional rules, the budgeted skill listing, and the subagent catalog — to the system
+  prompt. Because the system prompt is rebuilt each turn, this is also what survives compaction.
 - **Every tool call** passes through a guard that enforces `deny` rules and fires the project's
   hooks, and injects nested `CLAUDE.md` / path-scoped rules when you touch a matching file.
 - **Skills** run either as `/slash` commands or via the model's `Skill` tool, with full argument,
@@ -126,19 +126,28 @@ managed):
 
 | Artifact | Source |
 |---|---|
-| Instructions | `CLAUDE.md` (root→cwd, nested per-directory, `@import` expansion, `CLAUDE.local.md`), `~/.claude/CLAUDE.md` |
+| Instructions | `CLAUDE.md` (cwd ancestors up to the filesystem root, nested per-directory, `@import` expansion, `CLAUDE.local.md` siblings), `~/.claude/CLAUDE.md`, managed-policy CLAUDE.md (file or inline `claudeMd` settings key) |
+| Memory | auto memory: `MEMORY.md` (first 200 lines / 25 KB) from the per-project memory dir under `~/.claude/projects/…/memory`, with write-back conventions — gated by `autoMemoryEnabled` / `autoMemoryDirectory` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY`; agent `memory:` frontmatter scopes likewise |
 | Rules | `.claude/rules/**/*.md` (unconditional at start; `paths:`-scoped inject when you touch matching files) |
-| Skills | `.claude/skills/*/SKILL.md` (+ `~/.claude/skills`), lazy-loaded; `.claude/commands/*.md` legacy commands |
-| Agents | `.claude/agents/*.md` (+ user scope) — dispatchable via the `Agent` tool |
+| Skills | `.claude/skills/**/SKILL.md` (+ `~/.claude/skills`), lazy-loaded; `.claude/commands/**/*.md` legacy commands (recursive, `sub:name`-qualified on collisions) |
+| Agents | `.claude/agents/*.md` (+ user scope) plus the built-in `general-purpose`, `Explore`, and `Plan` types — dispatchable via the `Agent` tool |
 | Settings | `.claude/settings.json`, `settings.local.json`, `~/.claude/settings.json`, managed policy |
-| Hooks | `settings.json` `hooks` (+ plugin hooks, + skill-scoped hooks) |
+| Hooks | `settings.json` `hooks` (+ plugin hooks, + skill- and agent-scoped `hooks:`) |
 | Plugins | already-installed plugins from `~/.claude/plugins` + project-bundled `.claude-plugin/` |
 
 Then use it like Claude Code:
 
-- `/skill-name args` — run a user-invocable skill (slash command)
+- `/skill-name args` — run a user-invocable skill (slash command). Arguments substitute as
+  `$ARGUMENTS`, 0-based positionals (`$0` is the first argument, `$ARGUMENTS[N]` equivalent),
+  and named `$name`; `\$` escapes a literal dollar. Up to 5 leading `/skill` tokens stack in one
+  message (`/skill-a /skill-b do XYZ` activates both; the trailing text becomes the last skill's
+  arguments and stays as your request).
 - the model activates skills itself via the `Skill` tool when a task matches a description
-- the model dispatches subagents via the `Agent` tool (description-driven routing)
+- the model dispatches subagents via the `Agent` tool (description-driven routing; the built-in
+  `general-purpose`/`Explore`/`Plan` types complement project agents, a same-named project agent
+  overrides a built-in, and an omitted `subagent_type` defaults to general-purpose).
+  `run_in_background: true` returns a task id immediately — results are polled/awaited via
+  `TaskOutput` and stopped via `TaskStop`.
 - `EnterWorktree`/`ExitWorktree` isolate work in `.claude/worktrees/<name>/` — the session's
   working directory really moves, so project scripts detect worktree mode via git plumbing
 - parallel sessions: open a second terminal, `picc` again, enter a different worktree
@@ -150,7 +159,7 @@ Then use it like Claude Code:
 | Command | What it does |
 |---|---|
 | `/skills` | List every loaded skill — invocable-as-slash-command, model-invocable-only, and user-only — with descriptions and source (project / user / plugin) |
-| `/agents` | List every subagent available for dispatch, with its tools, read-only marker, model, and worktree-isolation |
+| `/agents` | List every subagent available for dispatch — project/user agents and the built-in `general-purpose`/`Explore`/`Plan` types — with tools, read-only marker, model, and worktree-isolation |
 | `/doctor` | Full compatibility breakdown for this project (generated from the capability registry) |
 | `/compat [suppress\|show]` | Show the consolidated compatibility notice; suppress/unsuppress it |
 | `/quota` | Context usage + provider rate-limit/quota headers from the last response (best-effort) |
@@ -194,6 +203,11 @@ tracked project files):
 | `PICC_CLAUDE_USER_DIR` | Override the user-scope Claude dir (default `~/.claude`) — useful for isolated profiles or CI |
 | `BRAVE_API_KEY` | Use the Brave Search API for `WebSearch` (otherwise a keyless DuckDuckGo fallback is used) |
 | `PI_CODING_AGENT_DIR` | Pi's own config dir override (auth, models, Pi settings) |
+| `CLAUDE_CODE_SUBAGENT_MODEL` | Highest-priority model override for every subagent dispatch (`inherit` = unset) |
+| `CLAUDE_CODE_DISABLE_AUTO_MEMORY` | Disable auto-memory loading (also: `autoMemoryEnabled: false` in settings) |
+| `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | `run_in_background` dispatches run in the foreground instead |
+| `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` | Remove the built-in `Explore`/`Plan` agent types (`general-purpose` always stays) |
+| `SLASH_COMMAND_TOOL_CHAR_BUDGET` | Override the startup skill-listing character budget |
 
 ## 6. Security & permission posture
 
@@ -201,8 +215,10 @@ Deliberately partial, by design (see the plan §6):
 
 - **Default permissive** — no per-command prompts (matches auto-mode usage).
 - **`permissions.deny` is a hard, non-interactive block** — the real safety valve. Full matcher
-  grammar: `Bash(git *)` (shell-operator aware — `git status && rm -rf /` does **not** match),
-  `Read/Edit(glob)`, `WebFetch(domain:*)`, `Agent(type)`, `Skill(name)`, `mcp__server__tool`.
+  grammar: `Bash(git *)` (shell-operator aware — `git status && rm -rf /` does **not** match;
+  space-before-`*` is a word boundary, so bare `git` matches but `github` never does),
+  `Read/Edit(glob)` (Windows paths normalized — `//c/**` covers `C:\…`, case-insensitively),
+  `WebFetch(domain:*)`, `Agent(type)`, `Skill(name)`, `mcp__server__tool`.
 - **Agent `tools:` gating is fully enforced** — a read-only reviewer cannot write; an agent
   without web tools cannot fetch.
 - `allow` / `ask` rules and permission modes are parsed and **reported, not enforced** — the
@@ -217,16 +233,20 @@ event, setting, frontmatter field, and feature with its tier — is in
 cannot drift). Summary:
 
 **Full:** skills (entire frontmatter set incl. `context: fork`, `paths:`, shell injection under
-bash+powershell, argument substitution), rules, agents & nested subagent dispatch with depth caps,
+bash+powershell, argument substitution with 0-based `$N` and `\$` escaping, stacked slash
+invocations), rules, agents — built-in `general-purpose`/`Explore`/`Plan` plus project/user agents
+— with nested subagent dispatch (default depth cap 5), background dispatch (`run_in_background` +
+`TaskOutput`/`TaskStop`), agent-scoped hooks and `memory:` scopes, auto memory (`MEMORY.md`),
 worktrees (incl. `.worktreeinclude`, Windows-tolerant removal), 13 hook events with the full
-stdin/stdout contract, CLAUDE.md hierarchy + `@import`, settings toggles, deny rules, tool gating,
-`WebFetch`/`WebSearch`/`Grep`/`Glob`/`Task*` tools, installed-plugin content, compaction
-preservation.
+stdin/stdout contract (Claude matcher semantics, parallel dispatch, async handlers), CLAUDE.md
+hierarchy to the filesystem root + `@import` + managed policy, settings toggles, deny rules (incl.
+Windows path normalization), tool gating, `WebFetch`/`WebSearch`/`Grep`/`Glob`/`Task*` tools,
+installed-plugin content, compaction preservation under Claude's carryover budgets.
 
 **Degraded no-op (visible, never crashing):** MCP servers/tools, `ask`/`allow`/permission modes,
-plan mode, `AskUserQuestion`, agent `memory:`, checkpointing/rewind, output styles, agent teams,
-background tasks, LSP, computer use. Unknown/future fields degrade safely and are reported as
-unassessed.
+plan mode, `AskUserQuestion`, checkpointing/rewind, output styles, agent teams, background
+*shells* (`BashOutput`/`KillShell`), LSP, computer use. Unknown/future fields degrade safely and
+are reported as unassessed.
 
 **Not built:** plugin install/marketplace machinery; mid-flight live-session handoff between
 harnesses (worktrees/git are fully interoperable — a worktree created under Claude Code can be

@@ -32,14 +32,37 @@ type PiApi = {
   sendMessage(message: Record<string, unknown>, options?: Record<string, unknown>): void;
 };
 
+/** Cap on the serialized structured tool_response delivered to PostToolUse hooks. */
+const TOOL_RESPONSE_MAX_CHARS = 50_000;
+
+/** Claude payload `tool_use_id`, when the Pi event carries a tool-call id. */
+function toolUseIdField(event: any): { tool_use_id?: string } {
+  return typeof event?.toolCallId === "string" && event.toolCallId.length > 0
+    ? { tool_use_id: event.toolCallId }
+    : {};
+}
+
 export function createGuardExtension(deps: GuardDeps) {
   // Ask downgrades are a graceful no-op (posture §6.1) but must be VISIBLE — once per rule.
   const reportedAskRules = new Set<string>();
   const where = deps.label ? ` [${deps.label}]` : "";
 
   const denyByExtraRules = (call: ReturnType<typeof toClaudeCall>): string | undefined => {
+    // Skill `disallowed-tools` are DENY rules: match with the same
+    // deny-direction options PermissionEngine.evaluate uses (any-segment Bash
+    // matching, env-assignment stripping, stable anchor) — allow-polarity
+    // matching would let `echo hi && rm -rf x` or `FOO=1 rm -rf x` evade a
+    // `Bash(rm *)` rule. The anchor is the engine's stable settings-source/
+    // project root; a facade without one degrades to the live cwd.
+    let anchor: string | undefined;
+    try {
+      anchor = typeof deps.engine.pathAnchor === "string" ? deps.engine.pathAnchor : undefined;
+    } catch {
+      anchor = undefined;
+    }
+    const denyOpts = { anySegment: true, deny: true, anchor: anchor ?? deps.getCwd() };
     for (const rule of deps.extraDenyRules?.() ?? []) {
-      if (matchesRule(rule, call)) return rule;
+      if (matchesRule(rule, call, denyOpts)) return rule;
     }
     return undefined;
   };
@@ -72,7 +95,12 @@ export function createGuardExtension(deps: GuardDeps) {
 
       const outcome = await deps.hooks.fire(
         "PreToolUse",
-        { tool_name: call.tool, tool_input: call.input, cwd: deps.getCwd() },
+        {
+          tool_name: call.tool,
+          tool_input: call.input,
+          ...toolUseIdField(event),
+          cwd: deps.getCwd(),
+        },
         call,
       );
       if (outcome.block) {
@@ -117,20 +145,44 @@ export function createGuardExtension(deps: GuardDeps) {
     });
 
     pi.on("tool_result", async (event: any) => {
+      const eventName = event.isError ? "PostToolUseFailure" : "PostToolUse";
+      // No hooks configured for this event: skip the payload construction
+      // (including the serializability probe over a possibly huge result) and
+      // the fire() entirely. Facades without hasHooks degrade to always-fire.
+      if (typeof deps.hooks.hasHooks === "function" && !deps.hooks.hasHooks(eventName)) {
+        return undefined;
+      }
       const input = (event.input ?? {}) as Record<string, unknown>;
       const call = toClaudeCall(event.toolName, input, deps.getCwd());
-      const responseText = Array.isArray(event.content)
-        ? event.content
-            .filter((c: any) => c?.type === "text")
-            .map((c: any) => c.text)
-            .join("\n")
-        : undefined;
+      // Claude sends `tool_response` STRUCTURED — the tool result content
+      // array/object as-is, capped so a huge result cannot flood hook stdin.
+      // Fall back to flattened text only when the value is not
+      // JSON-serializable (never-throw floor).
+      let toolResponse: unknown = event.content;
+      try {
+        const json = JSON.stringify(toolResponse);
+        if (typeof json === "string" && json.length > TOOL_RESPONSE_MAX_CHARS) {
+          toolResponse = {
+            truncated: true,
+            note: `tool_response truncated by picc (${json.length} chars)`,
+            head: json.slice(0, TOOL_RESPONSE_MAX_CHARS),
+          };
+        }
+      } catch {
+        toolResponse = Array.isArray(event.content)
+          ? event.content
+              .filter((c: any) => c?.type === "text")
+              .map((c: any) => String(c.text ?? ""))
+              .join("\n")
+          : undefined;
+      }
       const outcome = await deps.hooks.fire(
-        event.isError ? "PostToolUseFailure" : "PostToolUse",
+        eventName,
         {
           tool_name: call.tool,
           tool_input: call.input,
-          tool_response: responseText,
+          ...(toolResponse !== undefined ? { tool_response: toolResponse } : {}),
+          ...toolUseIdField(event),
           cwd: deps.getCwd(),
         },
         call,

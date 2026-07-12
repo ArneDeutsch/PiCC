@@ -122,6 +122,13 @@ export interface ClaudeAgent {
   /** System prompt body. Loaded eagerly (agent bodies are the routing/system surface). */
   body: string;
   source: SourceRef;
+  /** True for the code-constructed built-in agents (general-purpose, Explore, Plan). */
+  builtin?: boolean;
+  /**
+   * Skip CLAUDE.md/project-instructions and rules in the subagent system prompt
+   * (Claude's Explore/Plan context trimming — audit E6).
+   */
+  skipProjectContext?: boolean;
   unknownKeys: string[];
   diagnostics: Diagnostic[];
 }
@@ -189,6 +196,8 @@ export interface HookHandler {
   shell?: "bash" | "powershell";
   timeout?: number; // seconds (Claude convention)
   once?: boolean;
+  /** Fire-and-forget: never awaited, output/exit code ignored (Claude `async: true`). */
+  async?: boolean;
   /** http handler (best-effort) */
   url?: string;
   /** Raw definition for degraded handler types. */
@@ -212,10 +221,17 @@ export interface HookPayload {
   transcript_path?: string;
   cwd: string;
   hook_event_name: string;
+  /** Constant "default" — PiCC runs a single (default-permissive) posture. */
+  permission_mode?: string;
   tool_name?: string;
   tool_input?: Record<string, unknown>;
+  /** PostToolUse: the STRUCTURED tool result (content array/object), as Claude sends it. */
   tool_response?: unknown;
+  /** Pre/PostToolUse(-Failure): the provider tool-call id, when the host exposes one. */
+  tool_use_id?: string;
   prompt?: string;
+  /** Stop: text of the last assistant message, when the host exposes it. */
+  last_assistant_message?: string;
   [key: string]: unknown;
 }
 
@@ -231,6 +247,8 @@ export interface HookOutcome {
   updatedInput?: Record<string, unknown>;
   /** Plain stdout for context-injecting events (UserPromptSubmit, SessionStart, ...). */
   stdout?: string;
+  /** Top-level `systemMessage` strings — user-facing, shown once by call sites. */
+  systemMessages?: string[];
   diagnostics: Diagnostic[];
 }
 
@@ -264,6 +282,12 @@ export interface ClaudeSettings {
   skillListingMaxDescChars?: number;
   skillOverrides: Record<string, unknown>;
   claudeMdExcludes: string[];
+  /** Auto memory read side (B4): default true; env CLAUDE_CODE_DISABLE_AUTO_MEMORY overrides. */
+  autoMemoryEnabled?: boolean;
+  /** Overrides the default `<userDir>/projects/<flattened>/memory` auto-memory directory. */
+  autoMemoryDirectory?: string;
+  /** Managed-settings `claudeMd` key: inline CLAUDE.md content (managed scope only). */
+  managedClaudeMd?: { content: string; source: string };
   worktree: WorktreeSettings;
   cleanupPeriodDays?: number;
   apiKeyHelper?: string;

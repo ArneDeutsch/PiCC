@@ -81,9 +81,11 @@ function createDefaultSettings(): ClaudeSettings {
     disableSkillShellExecution: false,
     skillOverrides: {},
     claudeMdExcludes: [],
+    autoMemoryEnabled: true,
     worktree: { baseRef: "head" },
     subagentsEnabled: true,
-    subagentMaxDepth: 2,
+    // Claude Code allows up to 5 nesting levels below the main conversation (audit E3).
+    subagentMaxDepth: 5,
     subagentConcurrency: 4,
     enabledPlugins: undefined,
     unknownKeys: [],
@@ -328,6 +330,7 @@ function normalizeHookHandler(
     shell: raw.shell === "powershell" ? "powershell" : raw.shell === "bash" ? "bash" : undefined,
     timeout: asFiniteNumber(raw.timeout),
     once: typeof raw.once === "boolean" ? raw.once : undefined,
+    async: typeof raw.async === "boolean" ? raw.async : undefined,
     url: asString(raw.url),
     raw,
   };
@@ -588,6 +591,31 @@ function applySettingsFile(
           ...toStringArray(value, "claudeMdExcludes", source, out.diagnostics),
         );
         break;
+      case "autoMemoryEnabled": {
+        const b = expectBool(value, "autoMemoryEnabled", source, out.diagnostics);
+        if (b !== undefined) out.autoMemoryEnabled = b;
+        break;
+      }
+      case "autoMemoryDirectory": {
+        const s = expectString(value, "autoMemoryDirectory", source, out.diagnostics);
+        if (s !== undefined) out.autoMemoryDirectory = expandEnvVars(s);
+        break;
+      }
+      case "claudeMd": {
+        // Inline CLAUDE.md content is a managed-policy mechanism (audit B3): only
+        // the managed scope may inject it; elsewhere it is ignored with a diagnostic.
+        if (scope !== "managed") {
+          out.diagnostics.push({
+            severity: "warning",
+            message: `Setting "claudeMd" is only honored in managed settings; ignored`,
+            source,
+          });
+          break;
+        }
+        const s = expectString(value, "claudeMd", source, out.diagnostics);
+        if (s !== undefined) out.managedClaudeMd = { content: s, source };
+        break;
+      }
       case "worktree":
         applyWorktree(value, scope, source, out);
         break;

@@ -46,7 +46,7 @@ const TOOL_ENTRIES: CapabilityEntry[] = [
   cap("tool", "tool.Glob", "full", "real implementation — file pattern matching"),
   cap("tool", "tool.WebFetch", "full", "implemented for real — research skills and permission allowlists depend on it (§4.8)"),
   cap("tool", "tool.WebSearch", "full", "implemented for real — research skills and permission allowlists depend on it (§4.8)"),
-  cap("tool", "tool.Agent", "full", "subagent dispatch — fresh-context spawn by subagent_type, verbatim final message (§4.3)"),
+  cap("tool", "tool.Agent", "full", "subagent dispatch — built-in general-purpose/Explore/Plan + project agents, omitted type defaults to general-purpose, run_in_background supported, verbatim final message (§4.3)"),
   cap("tool", "tool.Task", "full", "alias of the Agent subagent-dispatch tool (§4.3)"),
   cap("tool", "tool.Skill", "full", "skill activation by name with argument substitution (§4.1)"),
   cap("tool", "tool.EnterWorktree", "full", "creates/re-enters .claude/worktrees/<flat>/ and swaps the session cwd (§4.4)"),
@@ -73,8 +73,8 @@ const TOOL_ENTRIES: CapabilityEntry[] = [
   cap("tool", "tool.KillShell", "degraded-noop", "callable no-op stub — background shells not implemented; there is no shell to kill (§4.8)"),
   cap("tool", "tool.KillBash", "degraded-noop", "callable no-op stub — background shells not implemented; there is no shell to kill (§4.8)"),
   cap("tool", "tool.SlashCommand", "degraded-noop", "callable no-op stub — the notice directs invoking the skill directly via the Skill tool (§4.8)"),
-  cap("tool", "tool.TaskOutput", "degraded-noop", "callable no-op stub — subagents run in the foreground and return their result directly (§4.8)"),
-  cap("tool", "tool.TaskStop", "degraded-noop", "callable no-op stub — no background tasks exist to stop (§4.8)"),
+  cap("tool", "tool.TaskOutput", "full", "retrieves background subagent results (wait or poll) from the background-task registry (§4.3, §4.8)"),
+  cap("tool", "tool.TaskStop", "partial", "stops a background subagent — cooperative via session abort; otherwise the result is discarded and reported as such (§4.3, §4.8)"),
   cap("tool", MCP_TOOL_WILDCARD_ID, "degraded-noop", "MCP deferred — mcp__* names gate/match predictably, calls degrade with a notice (§7)", false),
 ];
 
@@ -83,16 +83,16 @@ const TOOL_ENTRIES: CapabilityEntry[] = [
 // ---------------------------------------------------------------------------
 
 const SUPPORTED_HOOK_EVENT_NOTES: Record<(typeof SUPPORTED_HOOK_EVENTS)[number], string> = {
-  PreToolUse: "fires before each tool call; anchored matcher + full stdin/stdout contract incl. deny + updatedInput (§4.5)",
+  PreToolUse: "fires before each tool call; Claude matcher semantics (exact/list/unanchored-regex) + full stdin/stdout contract incl. deny + updatedInput (§4.5)",
   PostToolUse: "fires after successful tool calls; matcher + if: conditions honored; exit-2 block feedback is fed back to the model (§4.5)",
   PostToolUseFailure: "fires after failed tool calls (§4.5)",
-  SessionStart: "fires at session start; anchored matcher matches the source (startup|resume|clear|compact); stdout injected (§4.5, §9)",
+  SessionStart: "fires at session start; matcher matches the source exactly (startup|resume|clear|compact); stdout injected (§4.5, §9)",
   SessionEnd: "fires at session end (§4.5)",
   UserPromptSubmit: "fires on user prompt; stdout injected as context (§4.5)",
   Stop: "fires when the main agent wants to stop; exit 2 blocks stopping (§4.5)",
   SubagentStart: "fires when a subagent is spawned; a blocking outcome cancels the dispatch (§4.5)",
   SubagentStop: "fires when a subagent wants to stop; exit 2 blocks and re-prompts the subagent (bounded) (§4.5)",
-  PreCompact: "fires before compaction; anchored matcher matches the trigger (manual|auto); wired to instruction preservation (§9)",
+  PreCompact: "fires before compaction; matcher matches the trigger exactly (manual|auto); wired to instruction preservation (§9)",
   PostCompact: "fires after compaction; wired to re-injection (§9)",
   WorktreeCreate: "fires on worktree creation — worktree seeding pattern supported (§4.4)",
   WorktreeRemove: "fires on worktree removal (§4.4)",
@@ -115,18 +115,21 @@ const HOOK_EVENT_ENTRIES: CapabilityEntry[] = [
 
 const SETTING_ENTRIES: CapabilityEntry[] = [
   // Honored toggles (§5) — full.
-  cap("setting", "setting.hooks", "full", "hook config dispatched per §4.5 (command handlers full)"),
+  cap("setting", "setting.hooks", "full", "hook config dispatched per §4.5 — Claude matcher semantics (exact/list/unanchored-regex), parallel execution with dedup, async handlers, systemMessage/suppressOutput honored (command handlers full)"),
   cap("setting", "setting.env", "full", "injected into sessions and hook/skill subprocesses (§5)"),
   cap("setting", "setting.disableAllHooks", "full", "disables all hook dispatch (§4.5)"),
   cap("setting", "setting.disableSkillShellExecution", "full", "disables !`cmd` skill shell injection (§4.1)"),
   cap("setting", "setting.skillListingBudgetFraction", "full", "caps the startup skill-listing token budget (§4.1, §12.1)"),
-  cap("setting", "setting.skillListingMaxDescChars", "full", "caps per-skill description length in the startup listing (§4.1)"),
+  cap("setting", "setting.skillListingMaxDescChars", "full", "caps per-skill description length in the startup listing (default 1536, Claude parity; tiered degradation, never omits a skill) (§4.1)"),
+  cap("setting", "setting.autoMemoryEnabled", "full", "gates auto-memory loading (default true; CLAUDE_CODE_DISABLE_AUTO_MEMORY also honored) (§4.6)"),
+  cap("setting", "setting.autoMemoryDirectory", "full", "overrides the auto-memory storage directory (~ and env expanded) (§4.6)"),
+  cap("setting", "setting.claudeMd", "full", "managed-scope inline CLAUDE.md content injected at highest priority; ignored with a diagnostic in other scopes (§4.6)"),
   cap("setting", "setting.skillOverrides", "full", "per-skill overrides applied at load: off / user-invocable-only / name-only (§5)"),
   cap("setting", "setting.claudeMdExcludes", "full", "excludes CLAUDE.md/rules files from loading (§4.2, §4.6)"),
   cap("setting", "setting.worktree.baseRef", "full", "head|fresh base resolved to a concrete commit before worktree creation (§4.4)"),
   cap("setting", "setting.cleanupPeriodDays", "full", "max-age (days) for orphaned-worktree reaping at startup (§4.4)"),
   cap("setting", "setting.subagentsEnabled", "full", "gates subagent dispatch (§4.3)"),
-  cap("setting", "setting.subagentMaxDepth", "full", "caps nested subagent recursion depth (§4.3)"),
+  cap("setting", "setting.subagentMaxDepth", "full", "caps nested subagent recursion depth (default 5, Claude parity) (§4.3)"),
   cap("setting", "setting.subagentConcurrency", "full", "caps parallel subagent fan-out (§4.3, §12.2)"),
   cap("setting", "setting.enabledPlugins", "full", "selects installed-plugin content to load; merges key-wise across scopes, nearer scope wins per plugin (§4.9)"),
   // Parsed but consumed by nothing yet — honest no-ops, surfaced by the compat
@@ -150,7 +153,7 @@ const SETTING_ENTRIES: CapabilityEntry[] = [
   cap("setting", "setting.outputStyle", "degraded-noop", "cosmetic output styles not honored beyond Pi defaults (§7)"),
   cap("setting", "setting.statusLine", "degraded-noop", "cosmetic statusline not honored beyond Pi defaults (§7)"),
   cap("setting", "setting.checkpointing", "degraded-noop", "checkpointing/rewind deferred — Pi's session model instead (§7)"),
-  cap("setting", "setting.memory", "degraded-noop", "auto-memory deferred — parsed, no-op storage (§7)"),
+  cap("setting", "setting.memory", "full", "auto memory: MEMORY.md (first 200 lines / 25 KB) loads at session start with write-back conventions injected; autoMemoryEnabled/autoMemoryDirectory + CLAUDE_CODE_DISABLE_AUTO_MEMORY honored (§4.6)"),
   cap("setting", "setting.planMode", "degraded-noop", "plan mode is a no-op — treated as guidance (§7)"),
 ];
 
@@ -203,9 +206,9 @@ const FRONTMATTER_ENTRIES: CapabilityEntry[] = [
   cap("frontmatter", "agent.frontmatter.maxTurns", "partial", "best-effort cap — tool calls past the cap are blocked with an instruction to answer; the model still produces its final message (§4.3)"),
   cap("frontmatter", "agent.frontmatter.permissionMode", "degraded-noop", "parsed, no-op — subagents run the default-permissive posture regardless; deny rules + tools: gating remain the controls; reported when set (§6.1)", true),
   cap("frontmatter", "agent.frontmatter.color", "degraded-noop", "parsed only — cosmetic; Pi's TUI does not render agent colors (§4.3, §11)"),
-  cap("frontmatter", "agent.frontmatter.memory", "degraded-noop", "parsed; no-op storage — auto-memory deferred (§7)"),
+  cap("frontmatter", "agent.frontmatter.memory", "full", "user|project|local scopes resolve to Claude's agent-memory dirs; MEMORY.md (200 lines / 25 KB) injected with persistence guidance (§4.3, §4.6)"),
   cap("frontmatter", "agent.frontmatter.mcpServers", "degraded-noop", "parsed; MCP deferred — no servers started for the agent (§7)"),
-  cap("frontmatter", "agent.frontmatter.hooks", "degraded-noop", "parsed; agent-scoped hooks are not dispatched in v1"),
+  cap("frontmatter", "agent.frontmatter.hooks", "full", "scoped hook runner active for the subagent's dispatch; Stop maps to SubagentStop (§4.3, §4.5)"),
   cap("frontmatter", "rule.frontmatter.paths", "full", "path-scoped rule injection on matching file access (§4.2)"),
 ];
 
@@ -216,15 +219,15 @@ const FRONTMATTER_ENTRIES: CapabilityEntry[] = [
 const FEATURE_ENTRIES: CapabilityEntry[] = [
   cap("feature", "feature.worktrees", "full", "EnterWorktree/ExitWorktree lifecycle incl. .worktreeinclude, parallel sessions, Windows tolerance (§4.4)"),
   cap("feature", "feature.claude-md-import", "full", "@import expansion, recursive up to 4 hops, incl. the AGENTS.md bridge (§4.6)"),
-  cap("feature", "feature.nested-claude-md", "full", "nearest-ancestor CLAUDE.md injected on subdir file access, incl. worktrees (§4.6)"),
+  cap("feature", "feature.nested-claude-md", "full", "full ancestor-chain CLAUDE.md/CLAUDE.local.md load (to filesystem root) + nearest-ancestor injection on subdir file access, incl. worktrees (§4.6)"),
   cap("feature", "feature.rules", "full", ".claude/rules/ unconditional load + path-scoped injection at project and user scope (§4.2)"),
   cap("feature", "feature.plugins-content", "full", "installed-plugin skills/agents/hooks/commands folded into the registries (§4.9)"),
-  cap("feature", "feature.compaction-preservation", "full", "root CLAUDE.md + active skills + unconditional rules survive compaction (§9)"),
+  cap("feature", "feature.compaction-preservation", "full", "root CLAUDE.md + active skills (Claude-parity 20k/100k char budgets, most-recent-first) + unconditional rules survive compaction (§9)"),
   cap("feature", "feature.plugin-install", "not-supported", "plugin installation machinery out of scope — install plugins via Claude Code (§4.9)"),
   cap("feature", "feature.plugin-marketplace", "not-supported", "marketplace add/registration/release channels out of scope (§4.9)"),
   cap("feature", "feature.checkpointing-rewind", "not-supported", "no rewind parity — relies on Pi's session model (§7)"),
   cap("feature", "feature.agent-teams", "not-supported", "agent teams out of scope; names degrade safely (§7)"),
-  cap("feature", "feature.background-agents", "not-supported", "background agents out of scope; names degrade safely (§7)"),
+  cap("feature", "feature.background-agents", "partial", "run_in_background subagents with TaskOutput/TaskStop lifecycle; no remote/cloud agents, stop is cooperative (§4.3)"),
   cap("feature", "feature.cron", "not-supported", "scheduled tasks out of scope; names degrade safely (§7)"),
   cap("feature", "feature.remote-control", "not-supported", "remote control out of scope; names degrade safely (§7)"),
   cap("feature", "feature.lsp", "not-supported", "LSP integration out of scope; names degrade safely (§7)"),
@@ -233,7 +236,7 @@ const FEATURE_ENTRIES: CapabilityEntry[] = [
   cap("feature", "feature.telemetry-otel", "degraded-noop", "telemetry/OTEL settings parsed, nothing exported (§7)"),
   cap("feature", "feature.mcp", "degraded-noop", "MCP subsystem deferred — committed .mcp.json parsed without crashing, no servers started (§7)"),
   cap("feature", "feature.plan-mode", "degraded-noop", "plan mode treated as guidance; no mode switch, no ExitPlanMode gate (§7)"),
-  cap("feature", "feature.agent-memory", "degraded-noop", "auto-memory parsed with no-op storage (§7)"),
+  cap("feature", "feature.agent-memory", "full", "auto memory (project MEMORY.md) + per-agent memory scopes loaded and injected with write-back conventions (§4.6)"),
   cap("feature", "feature.managed-policy", "partial", "managed/enterprise policy honored where trivially present; otherwise degrade-safe (§7)"),
   cap("feature", "feature.hook-handler.http", "partial", "http hook handlers dispatched best-effort (§4.5)"),
   cap("feature", "feature.hook-handler.prompt", "degraded-noop", "prompt hook handlers degrade with a notice (§4.5)"),

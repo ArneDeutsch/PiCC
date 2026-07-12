@@ -51,9 +51,29 @@ const MATCHER_SUBJECT_KEYS: Readonly<Record<string, readonly string[]>> = {
 };
 
 const DEFAULT_TIMEOUT_SECONDS = 60;
+/** UserPromptSubmit hooks get a tighter default (Claude caps them at 30 s). */
+const USER_PROMPT_SUBMIT_TIMEOUT_SECONDS = 30;
 const HTTP_TIMEOUT_MS = 10_000;
 /** Grace period after a kill before we stop waiting for the process to close. */
 const KILL_GRACE_MS = 5_000;
+/** Cap per collected context value (stdout / additionalContext), issue #64626. */
+const CONTEXT_VALUE_MAX_CHARS = 10_000;
+
+/**
+ * Events where exit code 2 is a BLOCK (Claude "blockable" events). Everywhere
+ * else (SessionStart, PostCompact, SessionEnd, Worktree*, ...) exit 2 degrades
+ * to a non-blocking warning that includes the hook's stderr.
+ */
+const EXIT2_BLOCKABLE_EVENTS: ReadonlySet<string> = new Set([
+  "PreToolUse",
+  "PostToolUse",
+  "PostToolUseFailure",
+  "UserPromptSubmit",
+  "Stop",
+  "SubagentStart",
+  "SubagentStop",
+  "PreCompact",
+]);
 
 export interface HookRunnerOptions {
   config: HookConfig;
@@ -64,6 +84,37 @@ export interface HookRunnerOptions {
   disableAllHooks: boolean;
   /** plugin name -> plugin root dir, for ${CLAUDE_PLUGIN_ROOT} expansion. */
   pluginRoots?: Record<string, string>;
+  /** plugin name -> plugin data dir, for ${CLAUDE_PLUGIN_DATA} expansion. */
+  pluginDataDirs?: Record<string, string>;
+  /** Session transcript file, when the host exposes one (payload `transcript_path`). */
+  transcriptPath?: () => string | undefined;
+}
+
+/**
+ * Effective timeout for one handler: per-hook `timeout` (seconds) wins over
+ * the 60 s default. The 30 s UserPromptSubmit value is a HARD ceiling (Claude
+ * caps these hooks): per-hook values below it win, above it they clamp.
+ */
+export function effectiveTimeoutSeconds(handler: HookHandler, eventName: string): number {
+  const perHook =
+    typeof handler.timeout === "number" && handler.timeout > 0 ? handler.timeout : undefined;
+  if (eventName === "UserPromptSubmit") {
+    return Math.min(perHook ?? USER_PROMPT_SUBMIT_TIMEOUT_SECONDS, USER_PROMPT_SUBMIT_TIMEOUT_SECONDS);
+  }
+  return perHook ?? DEFAULT_TIMEOUT_SECONDS;
+}
+
+/**
+ * Async-hook setup failures already reported (once per distinct message per
+ * process): async handlers run detached with no outcome to attach diagnostics
+ * to, so spawn/setup problems are surfaced via console.error instead.
+ */
+const reportedAsyncHookFailures = new Set<string>();
+
+function reportAsyncHookFailure(message: string): void {
+  if (reportedAsyncHookFailures.has(message)) return;
+  reportedAsyncHookFailures.add(message);
+  console.error(`[picc] async hook: ${message}`);
 }
 
 type HandlerResult =
@@ -80,6 +131,21 @@ export class HookRunner {
 
   constructor(opts: HookRunnerOptions) {
     this.opts = opts;
+  }
+
+  /**
+   * Cheap config probe: does `eventName` have any configured entries at all?
+   * Lets callers skip expensive payload construction (e.g. the guard's
+   * structured tool_response) when a fire() would be a no-op anyway.
+   */
+  hasHooks(eventName: string): boolean {
+    try {
+      if (this.opts.disableAllHooks) return false;
+      const entries = this.opts.config?.[eventName];
+      return Array.isArray(entries) && entries.length > 0;
+    } catch {
+      return false;
+    }
   }
 
   async fire(
@@ -107,11 +173,24 @@ export class HookRunner {
             ? payload.cwd
             : this.opts.projectDir,
         hook_event_name: eventName,
+        // The harness runs one (default-permissive) posture — the field is
+        // constant, but real Claude hooks read it.
+        permission_mode:
+          typeof payload.permission_mode === "string" && payload.permission_mode.length > 0
+            ? payload.permission_mode
+            : "default",
       };
+      const transcriptPath =
+        typeof payload.transcript_path === "string" && payload.transcript_path.length > 0
+          ? payload.transcript_path
+          : this.safeTranscriptPath();
+      if (transcriptPath !== undefined) fullPayload.transcript_path = transcriptPath;
 
-      const contextPieces: string[] = [];
-      const stdoutPieces: string[] = [];
-
+      // Selection first (config order): matcher/if/once gates, then handlers
+      // whose (type, command, args, shell, url) are identical are deduplicated
+      // — Claude runs identical commands once per event firing.
+      const selected: HookHandler[] = [];
+      const seenKeys = new Set<string>();
       for (const entry of entries) {
         if (!entry || !Array.isArray(entry.hooks)) continue;
         if (!this.matcherMatches(entry.matcher, eventName, fullPayload, outcome.diagnostics)) {
@@ -136,26 +215,35 @@ export class HookRunner {
 
         for (const handler of entry.hooks) {
           if (!handler) continue;
-          if (handler.once) {
-            if (this.firedOnce.has(handler)) continue;
-            this.firedOnce.add(handler);
-          }
-
-          let result: HandlerResult | undefined;
-          if (handler.type === "command") {
-            result = await this.runCommand(handler, eventName, fullPayload, outcome.diagnostics);
-          } else if (handler.type === "http") {
-            result = await this.runHttp(handler, eventName, fullPayload, outcome.diagnostics);
-          } else {
-            outcome.diagnostics.push({
-              severity: "info",
-              message: `hook (${eventName}): handler type "${handler.type}" degraded to no-op`,
-            });
+          if (handler.once && this.firedOnce.has(handler)) continue;
+          const key = dedupKey(handler);
+          if (seenKeys.has(key)) {
+            // A deduped-away duplicate counts as fired too, or its own
+            // `once: true` identity would fire on the NEXT fire().
+            if (handler.once) this.firedOnce.add(handler);
             continue;
           }
-          if (result) {
-            this.applyResult(result, eventName, outcome, contextPieces, stdoutPieces);
-          }
+          seenKeys.add(key);
+          // The first occurrence's object identity carries the once-tracking.
+          if (handler.once) this.firedOnce.add(handler);
+          selected.push(handler);
+        }
+      }
+
+      const contextPieces: string[] = [];
+      const stdoutPieces: string[] = [];
+
+      // All selected handlers run concurrently (Claude parallel execution);
+      // outcomes merge in CONFIG order — first block wins, contexts/stdout
+      // concatenate, updatedInput shallow-merges — so results stay
+      // deterministic regardless of completion order.
+      const runs = await Promise.all(
+        selected.map((handler) => this.runHandler(handler, eventName, fullPayload)),
+      );
+      for (const run of runs) {
+        outcome.diagnostics.push(...run.diagnostics);
+        if (run.result) {
+          this.applyResult(run.result, eventName, outcome, contextPieces, stdoutPieces);
         }
       }
 
@@ -168,6 +256,75 @@ export class HookRunner {
       });
     }
     return outcome;
+  }
+
+  /**
+   * Runs one selected handler with its own diagnostics list (results merge in
+   * config order, so diagnostics must not interleave across parallel runs).
+   * `async: true` handlers are fire-and-forget: spawned, never awaited, output
+   * and exit code ignored (debug-only trace) and excluded from outcome merging.
+   */
+  private async runHandler(
+    handler: HookHandler,
+    eventName: string,
+    fullPayload: HookPayload,
+  ): Promise<{ result: HandlerResult | undefined; diagnostics: Diagnostic[] }> {
+    const diagnostics: Diagnostic[] = [];
+    if (handler.type !== "command" && handler.type !== "http") {
+      diagnostics.push({
+        severity: "info",
+        message: `hook (${eventName}): handler type "${handler.type}" degraded to no-op`,
+      });
+      return { result: undefined, diagnostics };
+    }
+    if (handler.async === true) {
+      // runCommand/runHttp never reject (resolve-only promises), so nothing
+      // can escape this detached chain; completion is traced at debug level.
+      // Setup failures (bash missing, unreachable http hook, ...) land in
+      // asyncDiagnostics and are surfaced once per distinct message — an
+      // async hook that can never run must not fail silently.
+      const asyncDiagnostics: Diagnostic[] = [];
+      const detached =
+        handler.type === "command"
+          ? this.runCommand(handler, eventName, fullPayload, asyncDiagnostics)
+          : this.runHttp(handler, eventName, fullPayload, asyncDiagnostics);
+      void detached.then((result) => {
+        for (const d of asyncDiagnostics) {
+          if (d.severity === "warning" || d.severity === "error") {
+            reportAsyncHookFailure(d.message);
+          }
+        }
+        if (result?.kind === "error") {
+          reportAsyncHookFailure(`hook (${eventName}) failed to run: ${result.message}`);
+        }
+        if (!process.env["PICC_DEBUG"] || !result) return;
+        if (result.kind === "exit" && result.code !== 0) {
+          console.error(
+            `[picc] async hook (${eventName}) exited with code ${result.code} (ignored)`,
+          );
+        } else if (result.kind === "timeout") {
+          console.error(
+            `[picc] async hook (${eventName}) timed out after ${result.timeoutSec}s (ignored)`,
+          );
+        }
+      });
+      return { result: undefined, diagnostics };
+    }
+    const result =
+      handler.type === "command"
+        ? await this.runCommand(handler, eventName, fullPayload, diagnostics)
+        : await this.runHttp(handler, eventName, fullPayload, diagnostics);
+    return { result, diagnostics };
+  }
+
+  /** Transcript path from the host, or undefined — the getter must never throw into fire(). */
+  private safeTranscriptPath(): string | undefined {
+    try {
+      const value = this.opts.transcriptPath?.();
+      return typeof value === "string" && value.length > 0 ? value : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -198,12 +355,19 @@ export class HookRunner {
     // The event documents a subject but the payload lacks it: conservative
     // no-match (an unevaluable matcher is treated as not met).
     if (subject === undefined) return false;
+    // Claude semantics: a matcher of plain names is an EXACT-match alternative
+    // list — `|` and `,` (v2.1.191) separate alternatives, so "Edit" never
+    // matches NotebookEdit. Anything containing regex metacharacters is a JS
+    // regex tested UNANCHORED (substring), case-sensitive.
+    if (/^[A-Za-z0-9_\- |,]*$/.test(matcher)) {
+      return matcher
+        .split(/[|,]/)
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0)
+        .some((part) => part === subject);
+    }
     try {
-      // Claude full-matches the pattern against the subject: "Write" matches
-      // only the Write tool (not superstrings like NotebookEdit for "Edit"),
-      // while alternation ("Edit|Write") and regexes still work inside the
-      // anchored group.
-      return new RegExp(`^(?:${matcher})$`).test(subject);
+      return new RegExp(matcher).test(subject);
     } catch {
       diagnostics.push({
         severity: "warning",
@@ -270,10 +434,7 @@ export class HookRunner {
       CLAUDE_SESSION_ID: this.opts.sessionId,
       CLAUDE_HOOK_EVENT: eventName,
     });
-    const timeoutSec =
-      typeof handler.timeout === "number" && handler.timeout > 0
-        ? handler.timeout
-        : DEFAULT_TIMEOUT_SECONDS;
+    const timeoutSec = effectiveTimeoutSeconds(handler, eventName);
 
     // Hooks run in the payload's cwd (Claude semantics): a WorktreeCreate hook
     // must execute inside the new worktree, not the main checkout.
@@ -334,9 +495,9 @@ export class HookRunner {
 
   /**
    * Expand `${CLAUDE_PROJECT_DIR}` / `$CLAUDE_PROJECT_DIR` and (for
-   * plugin-contributed handlers) `${CLAUDE_PLUGIN_ROOT}` in a command string
-   * or argument before spawning. Replacement values are inserted verbatim
-   * (no `$&` pitfalls) via replacer functions.
+   * plugin-contributed handlers) `${CLAUDE_PLUGIN_ROOT}` / `${CLAUDE_PLUGIN_DATA}`
+   * in a command string or argument before spawning. Replacement values are
+   * inserted verbatim (no `$&` pitfalls) via replacer functions.
    */
   private expandPlaceholders(
     command: string,
@@ -349,24 +510,38 @@ export class HookRunner {
       .replace(/\$\{CLAUDE_PROJECT_DIR\}/g, () => project)
       .replace(/\$CLAUDE_PROJECT_DIR(?![A-Za-z0-9_])/g, () => project);
 
-    const pluginRe = /\$\{CLAUDE_PLUGIN_ROOT\}|\$CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])/g;
-    if (pluginRe.test(out)) {
-      const pluginName =
-        typeof handler.raw?.["__pluginName"] === "string"
-          ? (handler.raw["__pluginName"] as string)
-          : undefined;
-      const root = pluginName ? this.opts.pluginRoots?.[pluginName] : undefined;
-      if (root !== undefined) {
-        out = out.replace(pluginRe, () => root);
+    const pluginName =
+      typeof handler.raw?.["__pluginName"] === "string"
+        ? (handler.raw["__pluginName"] as string)
+        : undefined;
+    const expandPluginVar = (
+      varName: string,
+      value: string | undefined,
+      description: string,
+    ): void => {
+      const re = new RegExp(`\\$\\{${varName}\\}|\\$${varName}(?![A-Za-z0-9_])`, "g");
+      if (!re.test(out)) return;
+      if (value !== undefined) {
+        out = out.replace(re, () => value);
       } else {
         diagnostics.push({
           severity: "warning",
-          message: `hook (${eventName}): command references \${CLAUDE_PLUGIN_ROOT} but no plugin root is known${
+          message: `hook (${eventName}): command references \${${varName}} but no plugin ${description} is known${
             pluginName ? ` for plugin "${pluginName}"` : ""
           }; left unexpanded`,
         });
       }
-    }
+    };
+    expandPluginVar(
+      "CLAUDE_PLUGIN_ROOT",
+      pluginName ? this.opts.pluginRoots?.[pluginName] : undefined,
+      "root",
+    );
+    expandPluginVar(
+      "CLAUDE_PLUGIN_DATA",
+      pluginName ? this.opts.pluginDataDirs?.[pluginName] : undefined,
+      "data dir",
+    );
     return out;
   }
 
@@ -489,9 +664,20 @@ export class HookRunner {
     const { code, stdout, stderr } = result;
 
     if (code === 2) {
-      // Blocking error: stderr (falling back to stdout) is the reason.
-      const reason = stderr.trim() || stdout.trim();
-      this.setBlock(outcome, reason || undefined);
+      if (EXIT2_BLOCKABLE_EVENTS.has(eventName)) {
+        // Blocking error: stderr (falling back to stdout) is the reason.
+        const reason = stderr.trim() || stdout.trim();
+        this.setBlock(outcome, reason || undefined);
+      } else {
+        // Claude: exit 2 on non-blockable events (SessionStart, PostCompact,
+        // ...) shows stderr and continues.
+        outcome.diagnostics.push({
+          severity: "warning",
+          message: `hook (${eventName}) exited with code 2, but ${eventName} is not blockable; continuing${
+            stderr.trim() ? `: ${stderr.trim()}` : ""
+          }`,
+        });
+      }
       return;
     }
     if (code !== 0) {
@@ -523,12 +709,33 @@ export class HookRunner {
       // (UserPromptSubmit, SessionStart, PreCompact, Stop, ...); ignored for
       // PreToolUse/PostToolUse (matches Claude).
       if (trimmed && !PLAIN_STDOUT_IGNORED_EVENTS.has(eventName)) {
-        stdoutPieces.push(trimmed);
+        stdoutPieces.push(truncateContextValue(trimmed));
       }
       return;
     }
 
+    // `systemMessage`: user-facing text, surfaced once by the call sites
+    // (info-level notice, not model context).
+    const systemMessage = json["systemMessage"];
+    if (typeof systemMessage === "string" && systemMessage.length > 0) {
+      (outcome.systemMessages ??= []).push(systemMessage);
+    }
+    // `suppressOutput: true` hides the hook's plain stdout from context. On the
+    // JSON path the raw stdout IS the JSON document and is never injected, so
+    // the flag is inherently honored; structured fields (additionalContext,
+    // decisions, ...) below stay in effect regardless.
+
     const hso = asRecord(json["hookSpecificOutput"]);
+    // Schema requires hookSpecificOutput.hookEventName (issue #55172); a
+    // mismatch is worth a warning but the fields are honored anyway
+    // (graceful superset).
+    const hsoEventName = hso?.["hookEventName"];
+    if (typeof hsoEventName === "string" && hsoEventName !== eventName) {
+      outcome.diagnostics.push({
+        severity: "warning",
+        message: `hook (${eventName}): hookSpecificOutput.hookEventName is "${hsoEventName}" but the firing event is "${eventName}"; fields honored anyway`,
+      });
+    }
 
     const decision = hso?.["permissionDecision"];
     if (decision === "deny") {
@@ -541,7 +748,7 @@ export class HookRunner {
     // "allow" / "defer" → proceed.
 
     for (const ctx of [hso?.["additionalContext"], json["additionalContext"]]) {
-      if (typeof ctx === "string" && ctx.length > 0) contextPieces.push(ctx);
+      if (typeof ctx === "string" && ctx.length > 0) contextPieces.push(truncateContextValue(ctx));
     }
 
     const updated = asRecord(hso?.["updatedInput"]) ?? asRecord(json["updatedInput"]);
@@ -569,6 +776,23 @@ export class HookRunner {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Dedup identity within one fire(): identical commands/urls run once (Claude). */
+function dedupKey(handler: HookHandler): string {
+  return JSON.stringify([
+    handler.type,
+    handler.command ?? null,
+    handler.args ?? null,
+    handler.shell ?? null,
+    handler.url ?? null,
+  ]);
+}
+
+/** Each context value is capped at ~10,000 chars, silently truncated (issue #64626). */
+function truncateContextValue(value: string): string {
+  if (value.length <= CONTEXT_VALUE_MAX_CHARS) return value;
+  return `${value.slice(0, CONTEXT_VALUE_MAX_CHARS)}…[truncated]`;
+}
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (value && typeof value === "object" && !Array.isArray(value)) {

@@ -49,15 +49,18 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
 - **Skills** — full `SKILL.md` frontmatter, progressive disclosure (bodies lazy-load),
   `$ARGUMENTS`/positional/named substitution, `` !`cmd` `` shell injection (bash + PowerShell),
   `context: fork`, legacy `.claude/commands`.
-- **Subagents** — `.claude/agents/*.md`, description-driven routing, parallel fan-out with
-  verbatim final-message return, per-agent `tools:` capability gating, nested dispatch with a
-  configurable depth cap, `isolation: worktree`.
+- **Subagents** — `.claude/agents/*.md` plus the built-in `general-purpose`/`Explore`/`Plan`
+  agent types, description-driven routing, parallel fan-out with verbatim final-message return,
+  background dispatch (`run_in_background` + `TaskOutput`/`TaskStop`), per-agent `tools:`
+  capability gating, nested dispatch with a configurable depth cap, `isolation: worktree`.
 - **Worktrees** — `EnterWorktree`/`ExitWorktree` with a real session-cwd swap, `.worktreeinclude`
   seeding, Windows-tolerant lifecycle, parallel sessions on one repo.
-- **Hooks** — 13 events (`PreToolUse` … `WorktreeCreate`), full stdin-JSON/stdout-decision
-  contract, `matcher` + `if:` conditions, plugin and skill-scoped hooks.
-- **CLAUDE.md & rules** — root→cwd hierarchy, nested on-demand injection, recursive `@import`
-  (the AGENTS.md bridge), `.claude/rules/` with `paths:` scoping.
+- **Hooks** — 13 events (`PreToolUse` … `WorktreeRemove`), full stdin-JSON/stdout-decision
+  contract, Claude matcher semantics with parallel dispatch, `if:` conditions, async handlers,
+  plugin-, skill-, and agent-scoped hooks.
+- **CLAUDE.md, memory & rules** — ancestor hierarchy up to the filesystem root, nested on-demand
+  injection, recursive `@import` (the AGENTS.md bridge), managed-policy CLAUDE.md, auto memory
+  (`MEMORY.md`) and agent `memory:` scopes, `.claude/rules/` with `paths:` scoping.
 - **Settings & permissions** — full precedence/merge semantics, honored toggles, `deny` rules as
   a hard block with the complete matcher grammar; a consolidated compatibility report (`/doctor`)
   for everything that degrades.

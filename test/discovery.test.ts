@@ -131,6 +131,47 @@ describe("loadSettings — precedence & merging", () => {
     expect(settings.hooks.SessionStart).toHaveLength(1);
   });
 
+  it("preserves hook handler execution fields (async/once/timeout/shell/args) and entry if:", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+      hooks: {
+        PostToolUse: [
+          {
+            matcher: "Bash",
+            if: "Bash(git *)",
+            hooks: [
+              {
+                type: "command",
+                command: "notify.sh",
+                args: ["done"],
+                shell: "powershell",
+                timeout: 9,
+                once: true,
+                async: true,
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    const settings = load(scopes);
+    const entry = settings.hooks.PostToolUse?.[0];
+    expect(entry?.matcher).toBe("Bash");
+    expect(entry?.if).toBe("Bash(git *)");
+    // `async: true` in particular: dropping it would silently turn a
+    // fire-and-forget hook into a BLOCKING one.
+    expect(entry?.hooks[0]).toMatchObject({
+      type: "command",
+      command: "notify.sh",
+      args: ["done"],
+      shell: "powershell",
+      timeout: 9,
+      once: true,
+      async: true,
+    });
+  });
+
   it("merges env key-wise with higher precedence winning, and expands ${VAR}", () => {
     const scopes = makeScopes();
     process.env.PCD_TEST_VALUE = "expanded-value";
@@ -209,6 +250,42 @@ describe("loadSettings — precedence & merging", () => {
     expect(
       settings.diagnostics.filter((d) => d.message.includes("is not a boolean")),
     ).toHaveLength(4);
+  });
+
+  it("recognizes autoMemoryEnabled and autoMemoryDirectory (B4)", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), {
+      autoMemoryEnabled: false,
+      autoMemoryDirectory: "/custom/memory",
+    });
+
+    const settings = load(scopes);
+    expect(settings.autoMemoryEnabled).toBe(false);
+    expect(settings.autoMemoryDirectory).toBe("/custom/memory");
+    expect(settings.unknownKeys).toHaveLength(0);
+
+    // Default: enabled.
+    expect(load(makeScopes()).autoMemoryEnabled).toBe(true);
+  });
+
+  it("honors the claudeMd inline key ONLY in managed settings (B3)", () => {
+    const scopes = makeScopes();
+    const managedFile = scopes.absentManaged[0]!;
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+      claudeMd: "PROJECT INLINE — must be ignored",
+    });
+    writeJson(managedFile, { claudeMd: "MANAGED INLINE" });
+
+    const settings = load(scopes, [managedFile]);
+    expect(settings.managedClaudeMd).toEqual({ content: "MANAGED INLINE", source: managedFile });
+    // The project-scope attempt degrades to a diagnostic, not silence.
+    expect(
+      settings.diagnostics.some((d) => d.message.includes('"claudeMd" is only honored in managed')),
+    ).toBe(true);
+
+    // Without a managed file, a project claudeMd never lands anywhere.
+    const noManaged = load(scopes, [path.join(scopes.projectRoot, "absent-managed.json")]);
+    expect(noManaged.managedClaudeMd).toBeUndefined();
   });
 
   it("accumulates claudeMdExcludes across scopes", () => {
@@ -424,7 +501,8 @@ describe("loadSettings — robustness (completeness floor)", () => {
     expect(settings.hooks).toEqual({});
     expect(settings.worktree.baseRef).toBe("head");
     expect(settings.subagentsEnabled).toBe(true);
-    expect(settings.subagentMaxDepth).toBe(2);
+    // Claude Code allows up to 5 nesting levels (audit E3).
+    expect(settings.subagentMaxDepth).toBe(5);
     expect(settings.subagentConcurrency).toBe(4);
     expect(settings.disableAllHooks).toBe(false);
     expect(settings.disableSkillShellExecution).toBe(false);
@@ -599,6 +677,35 @@ describe("locations — project root & artifact discovery", () => {
       managedDirs: [path.join(base, "does-not-exist")],
     });
     expect(absent.skillDirs).toEqual([{ dir: path.join(root, ".claude", "skills"), scope: "project" }]);
+  });
+
+  it("orders ruleDirs by ascending priority: user, project root→cwd, managed last (B6)", () => {
+    const base = makeTmp();
+    const root = path.join(base, "repo");
+    const pkg = path.join(root, "packages", "app");
+    const userDir = path.join(base, "home", ".claude");
+    const managedBase = path.join(base, "managed", "ClaudeCode");
+    for (const rulesDir of [
+      path.join(root, ".claude", "rules"),
+      path.join(pkg, ".claude", "rules"),
+      path.join(userDir, "rules"),
+      path.join(managedBase, "rules"),
+    ]) {
+      fs.mkdirSync(rulesDir, { recursive: true });
+    }
+
+    const dirs = discoverArtifactDirs({
+      cwd: pkg,
+      projectRoot: root,
+      userDir,
+      managedDirs: [managedBase],
+    });
+    expect(dirs.ruleDirs).toEqual([
+      { dir: path.join(userDir, "rules"), scope: "user" },
+      { dir: path.join(root, ".claude", "rules"), scope: "project" },
+      { dir: path.join(pkg, ".claude", "rules"), scope: "project" },
+      { dir: path.join(managedBase, "rules"), scope: "managed" },
+    ]);
   });
 
   it("dedupeByName keeps the first occurrence per name (nearest/highest scope wins)", () => {

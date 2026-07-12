@@ -15,17 +15,30 @@ import { createGuardExtension } from "./runtime/guard.js";
 import {
   buildSystemPromptSuffix,
   contextForTouchedFile,
+  createTierChangeReporter,
   newSessionContextState,
   resetInjectionState,
 } from "./runtime/context-assembly.js";
-import { renderSkillForActivation, skillActivationMessage } from "./runtime/skill-activation.js";
+import {
+  budgetSkillReinjection,
+  renderSkillForActivation,
+  skillActivationMessage,
+  skillActivationVars,
+} from "./runtime/skill-activation.js";
 import { createWorktreeTools } from "./runtime/tools/worktree-tools.js";
 import { createWebFetchTool, createWebSearchTool } from "./runtime/tools/web-tools.js";
 import { createGrepTool as createClaudeGrepTool, createGlobTool } from "./runtime/tools/search-tools.js";
 import { createTaskTools } from "./runtime/tools/task-tools.js";
+import {
+  BackgroundTaskRegistry,
+  createTaskOutputTool,
+  createTaskStopTool,
+} from "./runtime/background-tasks.js";
+import { builtinAgents } from "./claude/agents.js";
+import { loadAgentMemory } from "./claude/memory.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
-import { loadSkillBody, substituteVariables } from "./claude/skills.js";
+import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
 import { resolveGitBashPath } from "./engine/shell-inject.js";
 import { applyUnicodeSafeProcessEnv, unicodeSafeSubprocessEnv } from "./util/env.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
@@ -48,6 +61,10 @@ class HookMultiplexer {
   ) {}
   addScoped(runner: HookRunner): void {
     this.extras.push(runner);
+  }
+  /** True when any delegate has handlers for the event (guard payload-skip, F5). */
+  hasHooks(eventName: string): boolean {
+    return this.base.hasHooks(eventName) || this.extras.some((r) => r.hasHooks(eventName));
   }
   private readonly reportedDiagnostics = new Set<string>();
   private askDowngradeReported = false;
@@ -76,6 +93,9 @@ class HookMultiplexer {
       }
       if (o.updatedInput) merged.updatedInput = { ...merged.updatedInput, ...o.updatedInput };
       if (o.stdout) merged.stdout = merged.stdout ? `${merged.stdout}\n${o.stdout}` : o.stdout;
+      if (o.systemMessages?.length) {
+        merged.systemMessages = [...(merged.systemMessages ?? []), ...o.systemMessages];
+      }
       merged.diagnostics.push(...o.diagnostics);
     }
     this.surface(eventName, merged);
@@ -99,6 +119,14 @@ class HookMultiplexer {
       } else {
         debug(`hook ${eventName}: ${d.message}`);
       }
+    }
+    // `systemMessage` is user-facing (Claude shows it in the UI) — info-level
+    // notice on stderr, shown once per distinct message.
+    for (const msg of merged.systemMessages ?? []) {
+      const key = `systemMessage:${msg}`;
+      if (this.reportedDiagnostics.has(key)) continue;
+      this.reportedDiagnostics.add(key);
+      console.error(`[picc] hook ${eventName}: ${msg}`);
     }
     if (merged.askDowngraded && !this.askDowngradeReported) {
       this.askDowngradeReported = true;
@@ -137,6 +165,20 @@ export default function picc(pi: any) {
   const config = loadPiCCConfig(project.root);
   const sessionId = randomUUID();
   const cwdState = new CwdState(project.cwd);
+  // Hook payload `transcript_path`: Pi's session manager (captured on
+  // session_start) exposes the session file — the closest analog to Claude's
+  // transcript. Live getter so session switches stay accurate.
+  let sessionManagerRef: { getSessionFile?: () => string | undefined } | undefined;
+  const transcriptPath = () => {
+    try {
+      return sessionManagerRef?.getSessionFile?.() ?? undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  // ${CLAUDE_PLUGIN_DATA} expansion mirrors ${CLAUDE_PLUGIN_ROOT} (C12).
+  const pluginDataDirs: Record<string, string> = {};
+  for (const p of project.plugins) pluginDataDirs[p.name] = p.dataDir;
   const baseHooks = new HookRunner({
     config: project.mergedHooks,
     projectDir: project.root,
@@ -144,6 +186,8 @@ export default function picc(pi: any) {
     env: project.settings.env,
     disableAllHooks: project.settings.disableAllHooks,
     pluginRoots: project.pluginRoots,
+    pluginDataDirs,
+    transcriptPath,
   });
   const hooks = new HookMultiplexer(baseHooks);
   const permissionEngine = new PermissionEngine(project.settings.permissions, {
@@ -152,6 +196,11 @@ export default function picc(pi: any) {
     // (subdir launch, EnterWorktree).
     root: project.root,
   });
+  // Rule-validation findings (e.g. unanchored mcp__* allow globs, audit D4)
+  // surface once at startup — never silent, never fatal.
+  for (const d of permissionEngine.diagnostics) {
+    console.error(`PiCC permissions: ${d.message}`);
+  }
   const worktrees = new WorktreeManager({
     projectRoot: project.root,
     settings: project.settings.worktree,
@@ -179,6 +228,7 @@ export default function picc(pi: any) {
   const hookRunnerFacade = {
     fire: (event: string, payload: Partial<HookPayload>, call?: ToolCallDescriptor) =>
       hooks.fire(event, payload, call),
+    hasHooks: (event: string) => hooks.hasHooks(event),
   } as unknown as HookRunner;
 
   const injectForFile = (filePath: string) =>
@@ -251,6 +301,8 @@ export default function picc(pi: any) {
             env: project.settings.env,
             disableAllHooks: project.settings.disableAllHooks,
             pluginRoots: project.pluginRoots,
+            pluginDataDirs,
+            transcriptPath,
           }),
         );
       }
@@ -271,18 +323,57 @@ export default function picc(pi: any) {
     // parent would defeat the fork's purpose (§12.1 token-efficiency contract).
     if (record && !opts.fork) {
       state.activeSkills.set(skill.name, rendered.text);
-      for (const rule of skill.disallowedTools ?? []) activeSkillDenyRules.add(rule);
+      // Use the per-activation substituted copies (${CLAUDE_*}/$ARGUMENTS, audit
+      // A3) so deny rules like Bash(${CLAUDE_SKILL_DIR}/*) gate the real path.
+      for (const rule of rendered.disallowedTools ?? skill.disallowedTools ?? []) {
+        activeSkillDenyRules.add(rule);
+      }
     }
     return rendered.text;
   }
 
   /**
+   * Re-invocation dedup (audit A8): fingerprint of the last rendered body per
+   * skill name. A re-invocation whose rendering is byte-identical substitutes a
+   * short note instead of a second full copy. FNV-1a 32-bit + length — cheap,
+   * dependency-free, and sufficient for change detection.
+   */
+  const lastSkillRenderHash = new Map<string, string>();
+  function skillRenderFingerprint(text: string): string {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < text.length; i++) {
+      h ^= text.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return `${text.length}:${(h >>> 0).toString(16)}`;
+  }
+  /** Returns the dedup note when `rendered` is byte-identical to the last copy, else records it. */
+  function skillDedupNote(skill: ClaudeSkill, rendered: string): string | undefined {
+    const fp = skillRenderFingerprint(rendered);
+    if (lastSkillRenderHash.get(skill.name) === fp) {
+      return `Skill "${skill.name}" was invoked again; its content is unchanged from the earlier copy above.`;
+    }
+    lastSkillRenderHash.set(skill.name, fp);
+    return undefined;
+  }
+
+  /**
    * Dispatches a context:fork skill. A fork without `agent:` runs in a synthetic
    * general-purpose context — fresh CLAUDE.md/rules hierarchy, the skill's own
-   * tool gating, no agent persona (and no dependency on whatever agent happens
-   * to sort first, or on any agent existing at all).
+   * tool gating (with ${CLAUDE_*}/$ARGUMENTS substituted per activation, audit
+   * A3), no agent persona (and no dependency on whatever agent happens to sort
+   * first, or on any agent existing at all).
    */
-  function forkDispatch(skill: ClaudeSkill, rendered: string, depth: number) {
+  function forkDispatch(skill: ClaudeSkill, rendered: string, depth: number, argsText = "") {
+    const plugin = pluginContextFor(skill);
+    const vars = skillActivationVars({
+      skill,
+      projectRoot: project.root,
+      sessionId,
+      effort: skill.effort ?? config.effort,
+      pluginRoot: plugin.root,
+      pluginData: plugin.data,
+    });
     const agentOverride: ClaudeAgent | undefined = skill.forkAgentType
       ? undefined
       : {
@@ -290,8 +381,8 @@ export default function picc(pi: any) {
           description: `Forked general-purpose context for skill "${skill.name}"`,
           body:
             "You are executing a skill in a fresh forked context. Follow the skill instructions in the task exactly and reply with the skill's final result.",
-          tools: skill.allowedTools,
-          disallowedTools: skill.disallowedTools,
+          tools: substituteToolRules(skill.allowedTools, argsText, vars, skill.arguments),
+          disallowedTools: substituteToolRules(skill.disallowedTools, argsText, vars, skill.arguments),
           model: skill.model,
           effort: skill.effort,
           metadata: {},
@@ -314,6 +405,18 @@ export default function picc(pi: any) {
   // ---------------------------------------------------------------------------
   const taskToolBundle = createTaskTools();
   const claudeNamedTools: Record<string, unknown>[] = [];
+  // Background tasks (audit E4): one registry per session — run_in_background
+  // dispatches register here; TaskOutput/TaskStop operate on it.
+  const backgroundTasks = new BackgroundTaskRegistry();
+  // Built-in agent types (audit E1): general-purpose/Explore/Plan, appended
+  // AFTER project/user/plugin agents so a same-named project agent wins (an
+  // overridden built-in is dropped from the catalog — dispatch resolves the
+  // project agent anyway).
+  const builtins = builtinAgents();
+  const agentsWithBuiltins = () => {
+    const taken = new Set(project.agents.map((a) => a.name.toLowerCase()));
+    return [...project.agents, ...builtins.filter((b) => !taken.has(b.name.toLowerCase()))];
+  };
 
   /**
    * Claude-named tool instances bound to a cwd state. Built once for the main
@@ -381,6 +484,26 @@ export default function picc(pi: any) {
       });
       sections.push(`## Preloaded skill: ${name}\n\n${body.trim()}`);
     }
+    // Agent memory (audit B5): `memory:` frontmatter scope loads the agent's
+    // MEMORY.md and points the agent at its durable-knowledge directory.
+    if (agent.memory !== undefined && agent.memory !== null) {
+      const memoryScope = typeof agent.memory === "string" ? agent.memory.trim().toLowerCase() : "";
+      if (memoryScope === "user" || memoryScope === "project" || memoryScope === "local") {
+        const memory = loadAgentMemory(agent.name, memoryScope, project.root, project.userDir);
+        if (memory) {
+          const parts = [`Memory directory: ${memory.dir}`];
+          const memContent = memory.content?.trim();
+          if (memContent) parts.push(memContent);
+          parts.push(
+            "You may persist durable knowledge for future runs in this directory via the Write/Edit tools, with MEMORY.md as the index (only MEMORY.md is loaded automatically — keep it under ~200 lines). Prune entries that prove wrong or obsolete.",
+          );
+          sections.push(`# Agent memory\n\n${parts.join("\n\n")}`);
+        }
+      } else {
+        // Visible degrade (§2.2): an unknown memory scope must not vanish silently.
+        debug(`agent ${agent.name}: unknown memory scope "${String(agent.memory)}"; no memory loaded`);
+      }
+    }
     const granted = permissionEngine.gateTools(agent.tools, agent.disallowedTools, allKnownToolNames());
     // The catalog must mirror tool provisioning: at max depth the nested Agent tool
     // is not provided, so advertising subagents would only produce unknown-tool calls.
@@ -392,13 +515,20 @@ export default function picc(pi: any) {
     const agentModel = agent.model ? (resolveModelSpec(agent.model) as { provider?: string; id?: string } | undefined) : undefined;
     const agentModelRef =
       agentModel?.provider && agentModel?.id ? `${agentModel.provider}/${agentModel.id}` : currentModelRef;
+    // Explore/Plan context trimming (audit E6): agents marked skipProjectContext
+    // omit the CLAUDE.md/project-instructions and rules sections (harness
+    // conventions, skill listing, and steering stay).
+    const skipProject = agent.skipProjectContext === true;
     const suffix = buildSystemPromptSuffix({
-      claudeMd: project.claudeMd,
-      rules: project.rules,
+      claudeMd: skipProject ? [] : project.claudeMd,
+      rules: skipProject ? [] : project.rules,
+      // Auto memory reaches subagents too (review H2) — except Explore/Plan,
+      // whose skipProjectContext trims all project-level context.
+      autoMemory: skipProject ? undefined : project.autoMemory,
       skills: project.skills,
-      agents: nestedDispatchAvailable ? project.agents : [],
+      agents: nestedDispatchAvailable ? agentsWithBuiltins() : [],
       settings: project.settings,
-      state: newSessionContextState(project.claudeMd),
+      state: newSessionContextState(skipProject ? [] : project.claudeMd),
       steeringText: agentModelRef ? steeringForModel(config, agentModelRef) : steeringText,
     });
     sections.push(suffix);
@@ -425,6 +555,8 @@ export default function picc(pi: any) {
       "TaskList",
       "TaskGet",
       "TodoWrite",
+      "TaskOutput",
+      "TaskStop",
       ...DEGRADED_TOOLS.map((d) => d.name),
     ];
   }
@@ -444,14 +576,22 @@ export default function picc(pi: any) {
         // dispatches (depth cap holds) and never mutates the parent session state.
         tools.push(createSkillTool({ depth, forSubagent: true }) as Record<string, unknown>);
       }
+      // Background-task tools share the session registry (audit E4), so a
+      // subagent can poll/stop the tasks it started itself.
+      if (granted.includes("TaskOutput")) {
+        tools.push(createTaskOutputTool(backgroundTasks) as Record<string, unknown>);
+      }
+      if (granted.includes("TaskStop")) {
+        tools.push(createTaskStopTool(backgroundTasks) as Record<string, unknown>);
+      }
       if (
         project.settings.subagentsEnabled &&
         depth + 1 <= project.settings.subagentMaxDepth &&
         (granted.includes("Agent") || granted.includes("Task"))
       ) {
         // Both Claude names: projects grant and reference the dispatch tool as Task.
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent" }));
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task" }));
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks }));
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks }));
       }
       return tools;
     },
@@ -460,6 +600,19 @@ export default function picc(pi: any) {
     hookRunner: hookRunnerFacade,
     getCwd: () => cwdState.get(),
     makeContextInjector,
+    // Agent-scoped hooks (audit C10): per-dispatch runner with the SAME deps as
+    // the session's base runner; the runtime multiplexes and discards it.
+    makeScopedHookRunner: (config) =>
+      new HookRunner({
+        config,
+        projectDir: project.root,
+        sessionId,
+        env: project.settings.env,
+        disableAllHooks: project.settings.disableAllHooks,
+        pluginRoots: project.pluginRoots,
+        pluginDataDirs,
+        transcriptPath,
+      }),
     resolveModel: resolveModelSpec,
     mapEffort: (effort) => mapEffort(config, effort),
     worktrees,
@@ -501,7 +654,7 @@ export default function picc(pi: any) {
             fork: true,
             recordActivation: !opts.forSubagent,
           });
-          const result = await forkDispatch(skill, rendered, opts.depth + 1);
+          const result = await forkDispatch(skill, rendered, opts.depth + 1, params.arguments ?? "");
           if (!result.ok) throw new Error(result.error ?? "context:fork dispatch failed");
           return {
             content: [{ type: "text", text: result.finalMessage }],
@@ -511,6 +664,16 @@ export default function picc(pi: any) {
         const rendered = await activateSkill(skill, params.arguments ?? "", {
           recordActivation: !opts.forSubagent,
         });
+        // Re-invocation with byte-identical content → short note instead of a
+        // second copy (audit A8). Subagent instances keep their own context and
+        // never consult the parent-session fingerprints.
+        const note = opts.forSubagent ? undefined : skillDedupNote(skill, rendered);
+        if (note) {
+          return {
+            content: [{ type: "text", text: note }],
+            details: { skill: skill.name, deduplicated: true },
+          };
+        }
         return {
           content: [{ type: "text", text: skillActivationMessage(skill, rendered) }],
           details: { skill: skill.name },
@@ -521,12 +684,20 @@ export default function picc(pi: any) {
   const skillTool = createSkillTool({ depth: 0, forSubagent: false });
   claudeNamedTools.push(skillTool as Record<string, unknown>);
 
-  if (project.settings.subagentsEnabled && project.agents.length) {
+  if (project.settings.subagentsEnabled) {
+    // The built-in agent types (E1) guarantee dispatchable agents even when the
+    // project defines none — so Agent/Task always register when subagents are on.
     claudeNamedTools.push(
-      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Agent" }),
-      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Task" }),
+      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Agent", backgroundTasks }),
+      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Task", backgroundTasks }),
     );
   }
+  // Real TaskOutput/TaskStop (audit E4) — formerly degrade stubs; they answer
+  // helpfully even when no background task was ever started.
+  claudeNamedTools.push(
+    createTaskOutputTool(backgroundTasks) as Record<string, unknown>,
+    createTaskStopTool(backgroundTasks) as Record<string, unknown>,
+  );
 
   for (const tool of claudeNamedTools) {
     try {
@@ -600,16 +771,24 @@ export default function picc(pi: any) {
   // ---------------------------------------------------------------------------
   // System prompt assembly (every turn — also compaction preservation, plan §9)
   // ---------------------------------------------------------------------------
+  // Skill-listing tier degradation (G5): surfaced once per tier CHANGE — the
+  // suffix renders every turn, so a per-render report would spam stderr.
+  const reportListingDegradation = createTierChangeReporter((message) =>
+    console.error(`PiCC: ${message}`),
+  );
   pi.on("before_agent_start", async (event: any) => {
     try {
       const suffix = buildSystemPromptSuffix({
         claudeMd: project.claudeMd,
         rules: project.rules,
         skills: project.skills,
-        agents: project.settings.subagentsEnabled ? project.agents : [],
+        // Built-ins appear in the routing catalog after the project's agents (E1).
+        agents: project.settings.subagentsEnabled ? agentsWithBuiltins() : [],
         settings: project.settings,
         state,
         steeringText,
+        autoMemory: project.autoMemory,
+        onDiagnostic: reportListingDegradation,
       });
       return { systemPrompt: `${event.systemPrompt}\n\n${suffix}` };
     } catch (err) {
@@ -624,6 +803,7 @@ export default function picc(pi: any) {
   pi.on("session_start", async (event: any, ctx: any) => {
     try {
       modelRegistryRef = ctx.modelRegistry;
+      sessionManagerRef = ctx.sessionManager;
       if (ctx.model) {
         currentModel = ctx.model;
         currentModelRef = `${ctx.model.provider}/${ctx.model.id}`;
@@ -707,28 +887,52 @@ export default function picc(pi: any) {
       const extra = [outcome.stdout, outcome.additionalContext].filter(Boolean).join("\n").trim();
       const hookSuffix = extra ? `\n\n<hook-context>\n${extra}\n</hook-context>` : "";
 
-      // 2) Skill slash command: expand `/name [args]` into the user turn, exactly
-      //    as Claude Code does (this is why it must be a transform, not a
-      //    self-dispatching extension command — those can't reliably trigger a
-      //    turn in print mode).
+      // 2) Skill slash command(s): expand `/name [args]` into the user turn,
+      //    exactly as Claude Code does (this is why it must be a transform, not
+      //    a self-dispatching extension command — those can't reliably trigger
+      //    a turn in print mode). Up to 5 LEADING skill tokens stack
+      //    (`/skill-a /skill-b remaining text`, Claude v2.1.199): all activate
+      //    in order and the remaining text is the LAST skill's arguments — its
+      //    rendered activation carries the text (via $ARGUMENTS/$N markers, or
+      //    the ARGUMENTS: fallback when the body has none).
       const text: string = event.text ?? "";
       // Colons allowed: plugin-namespaced invocations (`/my-plugin:review`) are CC syntax.
-      const m = /^\/([A-Za-z0-9][\w-]*(?::[\w-]+)*)(?:[ \t]+([\s\S]*))?$/.exec(text.trim());
-      if (m) {
+      const skillTokenRe = /^\/([A-Za-z0-9][\w-]*(?::[\w-]+)*)(?=[ \t]|$)/;
+      let rest = text.trim();
+      const stacked: ClaudeSkill[] = [];
+      while (stacked.length < 5) {
+        const m = skillTokenRe.exec(rest);
+        if (!m) break;
         const found = findByName(project.skills, m[1]!);
-        const skill = found?.userInvocable ? found : undefined;
-        if (skill) {
+        // Stop at the first token that doesn't resolve to a user-invocable skill.
+        if (!found?.userInvocable) break;
+        stacked.push(found);
+        rest = rest.slice(m[0].length).replace(/^[ \t]+/, "");
+      }
+      if (stacked.length) {
+        const parts: string[] = [];
+        for (let i = 0; i < stacked.length; i++) {
+          const skill = stacked[i]!;
+          const argsText = i === stacked.length - 1 ? rest : "";
           debug(`input: expanding skill /${skill.name}`);
-          const rendered = await activateSkill(skill, m[2] ?? "", { fork: skill.contextFork });
+          const rendered = await activateSkill(skill, argsText, { fork: skill.contextFork });
           if (skill.contextFork) {
-            const result = await forkDispatch(skill, rendered, 1);
-            const forkText = result.ok
-              ? `The ${skill.name} skill ran in a forked subagent. Its result:\n\n${result.finalMessage}`
-              : `The ${skill.name} skill (context: fork) failed: ${result.error}`;
-            return { action: "transform", text: forkText + hookSuffix };
+            const result = await forkDispatch(skill, rendered, 1, argsText);
+            parts.push(
+              result.ok
+                ? `The ${skill.name} skill ran in a forked subagent. Its result:\n\n${result.finalMessage}`
+                : `The ${skill.name} skill (context: fork) failed: ${result.error}`,
+            );
+            continue;
           }
-          return { action: "transform", text: skillActivationMessage(skill, rendered) + hookSuffix };
+          // Byte-identical re-invocation → short note instead of a second copy (audit A8).
+          const note = skillDedupNote(skill, rendered);
+          parts.push(note ?? skillActivationMessage(skill, rendered));
         }
+        // The trailing text is NOT re-appended as its own part (G6): the last
+        // skill's rendered activation already carries it as $ARGUMENTS (or via
+        // the ARGUMENTS: fallback), so a second copy would duplicate the request.
+        return { action: "transform", text: parts.join("\n\n") + hookSuffix };
       }
 
       if (hookSuffix) {
@@ -743,11 +947,40 @@ export default function picc(pi: any) {
 
   pi.on("agent_settled", async (_event: any, ctx: any) => {
     try {
+      // Stop payload `last_assistant_message` (Claude wire contract): the
+      // settled event carries no messages, so read the session branch via ctx
+      // (best-effort — the field is simply absent when the host exposes none).
+      let lastAssistantMessage: string | undefined;
+      try {
+        const sm = ctx?.sessionManager;
+        const entries: any[] = sm?.getBranch?.() ?? sm?.getEntries?.() ?? [];
+        for (let i = entries.length - 1; i >= 0; i--) {
+          const entry = entries[i];
+          if (entry?.type !== "message" || entry.message?.role !== "assistant") continue;
+          const content = entry.message.content;
+          lastAssistantMessage =
+            typeof content === "string"
+              ? content
+              : Array.isArray(content)
+                ? content
+                    .filter((c: any) => c?.type === "text")
+                    .map((c: any) => String(c.text ?? ""))
+                    .join("")
+                : undefined;
+          break;
+        }
+      } catch {
+        /* best-effort field */
+      }
       const outcome = await hooks.fire("Stop", {
         cwd: cwdState.get(),
         stop_hook_active: stopHookIterations > 0,
+        ...(lastAssistantMessage !== undefined
+          ? { last_assistant_message: lastAssistantMessage }
+          : {}),
       });
-      if (outcome.block && stopHookIterations < 5) {
+      // Claude caps consecutive Stop-hook blocks at 8, then stops anyway.
+      if (outcome.block && stopHookIterations < 8) {
         stopHookIterations++;
         pi.sendUserMessage(
           `[Stop hook] Continue working: ${outcome.blockReason ?? "the stop condition is not met yet"}`,
@@ -784,18 +1017,25 @@ export default function picc(pi: any) {
       // compaction happens MID-RUN and the aborted turn is retried immediately, so
       // this must deliver before the next LLM call ("steer") — "nextTurn" would sit
       // queued until the next user prompt, exactly the /doctor-class bug.
+      // Budgeted like Claude's carryover (audit A9): ~5k tokens per skill,
+      // ~25k combined, most recently activated first.
       if (state.activeSkills.size) {
-        const preserved = [...state.activeSkills.entries()]
-          .map(([name, body]) => `### Active skill: ${name}\n${body}`)
-          .join("\n\n");
-        pi.sendMessage(
-          {
-            customType: "picc-preserved",
-            content: `Context preserved across compaction (PiCC):\n\n${preserved}`,
-            display: false,
-          },
-          { deliverAs: "steer" },
-        );
+        const budgeted = budgetSkillReinjection([...state.activeSkills.entries()]);
+        for (const name of budgeted.dropped) {
+          debug(
+            `compaction: active skill "${name}" dropped from re-injection (combined budget exceeded)`,
+          );
+        }
+        if (budgeted.text) {
+          pi.sendMessage(
+            {
+              customType: "picc-preserved",
+              content: `Context preserved across compaction (PiCC):\n\n${budgeted.text}`,
+              display: false,
+            },
+            { deliverAs: "steer" },
+          );
+        }
       }
     } catch {
       /* floor */
@@ -857,12 +1097,15 @@ export default function picc(pi: any) {
   }
 
   function renderAgentsList(): string {
-    if (!project.agents.length) return "No subagents are defined for this project.";
+    // Same catalog the model sees: project/user/plugin agents plus the
+    // non-overridden built-ins (general-purpose/Explore/Plan).
+    const agents = agentsWithBuiltins();
+    if (!agents.length) return "No subagents are available.";
     const lines = [
-      `PiCC — ${project.agents.length} subagent(s) available (dispatch with the Agent tool):`,
+      `PiCC — ${agents.length} subagent(s) available (dispatch with the Agent tool):`,
       "",
     ];
-    for (const a of project.agents) {
+    for (const a of agents) {
       const gated = permissionEngine.gateTools(a.tools, a.disallowedTools, allKnownToolNames());
       const readOnly = a.tools && !["Write", "Edit", "Bash"].some((t) => gated.includes(t));
       const tags = [

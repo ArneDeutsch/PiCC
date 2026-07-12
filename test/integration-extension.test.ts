@@ -334,7 +334,7 @@ describe("session lifecycle hooks", () => {
   it("expands a user-invocable skill slash command into the user turn (with args)", async () => {
     const result = await pi.fire("input", { text: "/deploy staging 4.5", source: "interactive" });
     expect(result.action).toBe("transform");
-    // The skill body becomes the turn, with $1/$2 substituted and the body now loaded.
+    // The skill body becomes the turn, with $0/$1 substituted and the body now loaded.
     expect(result.text).toContain("FS-SKILL-ARGS-BODY");
     expect(result.text).toContain("Deploy to environment **staging** at version **4.5**");
   });

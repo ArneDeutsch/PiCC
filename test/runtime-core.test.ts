@@ -457,11 +457,32 @@ describe("SubagentRuntime (fake SDK)", () => {
     expect(result.finalMessage).toBe("```yaml\nverdict: approve\n```");
   });
 
-  it("rejects unknown agents with the available list", async () => {
-    const { runtime } = makeRuntime([makeAgent()], ["x"]);
-    const result = await runtime.dispatch({ subagentType: "nope", prompt: "p", depth: 1 });
-    expect(result.ok).toBe(false);
-    expect(result.error).toContain("reviewer");
+  it("unknown subagent_type falls back to general-purpose with a visible note (H1)", async () => {
+    const startPrompts: string[] = [];
+    const hookRunner = {
+      fire: async (event: string, payload: Record<string, unknown>) => {
+        if (event === "SubagentStart") startPrompts.push(String(payload.prompt ?? ""));
+        return { block: false, askDowngraded: false, diagnostics: [] };
+      },
+    };
+    const { runtime, created } = makeRuntime([makeAgent()], ["fallback-done"], { hookRunner });
+    const result = await runtime.dispatch({ subagentType: "nope", prompt: "real task", depth: 1 });
+    expect(result.ok).toBe(true);
+    expect(result.agentName).toBe("general-purpose");
+    expect(result.finalMessage).toBe("fallback-done");
+    expect(created).toHaveLength(1);
+    // Visible degrade: diagnostic note AND a notice line prepended to the prompt.
+    expect(
+      result.diagnostics.some((d) =>
+        d.message.includes('unknown subagent_type "nope"; ran as general-purpose'),
+      ),
+    ).toBe(true);
+    expect(
+      startPrompts[0]?.startsWith(
+        '(You were dispatched as subagent type "nope", which is not defined in this project; you are running as a general-purpose agent.)',
+      ),
+    ).toBe(true);
+    expect(startPrompts[0]).toContain("real task");
   });
 
   it("enforces the depth cap", async () => {
@@ -512,11 +533,21 @@ describe("SubagentRuntime (fake SDK)", () => {
   it("Agent tool definition dispatches at depth+1 and throws on failure", async () => {
     const { runtime } = makeRuntime([makeAgent()], ["fine"]);
     const tool = createAgentToolDefinition(runtime, { depth: 0 }) as {
-      execute: (id: string, params: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>;
+      execute: (
+        id: string,
+        params: Record<string, unknown>,
+      ) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
     };
     const res = await tool.execute("t1", { subagent_type: "reviewer", prompt: "go" });
     expect(res.content[0]?.text).toBe("fine");
-    await expect(tool.execute("t2", { subagent_type: "ghost", prompt: "go" })).rejects.toThrow(/Unknown subagent_type/);
+    // Unknown types fall back to general-purpose (H1) rather than throwing.
+    const fallback = await tool.execute("t2", { subagent_type: "ghost", prompt: "go" });
+    expect(fallback.details.agent).toBe("general-purpose");
+    // Genuine failures (depth cap) still throw.
+    const deep = createAgentToolDefinition(runtime, { depth: 5 }) as {
+      execute: (id: string, params: Record<string, unknown>) => Promise<unknown>;
+    };
+    await expect(deep.execute("t3", { subagent_type: "reviewer", prompt: "go" })).rejects.toThrow(/depth/);
   });
 
   it("extractText joins text blocks only", () => {
@@ -735,5 +766,237 @@ describe("SubagentRuntime (fake SDK)", () => {
     const blocked = fire("tool_call")?.[0] as { block?: boolean; reason?: string };
     expect(blocked?.block).toBe(true);
     expect(blocked?.reason).toContain("maxTurns");
+  });
+
+  // -------------------------------------------------------------------------
+  // Built-in agent types (audit E1/E2)
+  // -------------------------------------------------------------------------
+
+  it("empty subagent_type defaults to the built-in general-purpose agent (E2)", async () => {
+    const seen: ClaudeAgent[] = [];
+    // customToolsFor sees the RESOLVED agent on every dispatch (the fake loader
+    // never calls the lazy systemPromptOverride).
+    const { runtime } = makeRuntime([makeAgent()], ["gp-done"], {
+      customToolsFor: (a: ClaudeAgent) => {
+        seen.push(a);
+        return [];
+      },
+    });
+    const result = await runtime.dispatch({ subagentType: "", prompt: "p", depth: 1 });
+    expect(result.ok).toBe(true);
+    expect(result.agentName).toBe("general-purpose");
+    expect(result.finalMessage).toBe("gp-done");
+    expect(seen[0]?.builtin).toBe(true);
+  });
+
+  it("built-ins resolve AFTER project agents: a project Explore overrides the built-in (E1)", async () => {
+    const seen: ClaudeAgent[] = [];
+    const capture = {
+      customToolsFor: (a: ClaudeAgent) => {
+        seen.push(a);
+        return [];
+      },
+    };
+    const { runtime } = makeRuntime(
+      [makeAgent({ name: "Explore", description: "project explorer" })],
+      ["ok"],
+      capture,
+    );
+    await runtime.dispatch({ subagentType: "Explore", prompt: "p", depth: 1 });
+    expect(seen[0]?.source.scope).toBe("project");
+
+    // Without a project override, the built-in resolves.
+    seen.length = 0;
+    const { runtime: rt2 } = makeRuntime([makeAgent()], ["ok"], capture);
+    const result = await rt2.dispatch({ subagentType: "Plan", prompt: "p", depth: 1 });
+    expect(result.ok).toBe(true);
+    expect(seen[0]?.builtin).toBe(true);
+    expect(seen[0]?.name).toBe("Plan");
+  });
+
+  it("CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS removes Explore/Plan from dispatch (H1: they fall back to general-purpose); general-purpose stays", async () => {
+    const prev = process.env.CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS;
+    process.env.CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS = "1";
+    try {
+      const { runtime } = makeRuntime([makeAgent()], ["ok"]);
+      const explore = await runtime.dispatch({ subagentType: "Explore", prompt: "p", depth: 1 });
+      expect(explore.ok).toBe(true);
+      expect(explore.agentName).toBe("general-purpose");
+      expect(
+        explore.diagnostics.some((d) =>
+          d.message.includes('unknown subagent_type "Explore"; ran as general-purpose'),
+        ),
+      ).toBe(true);
+      const gp = await runtime.dispatch({ subagentType: "general-purpose", prompt: "p", depth: 1 });
+      expect(gp.ok).toBe(true);
+      expect(gp.diagnostics.some((d) => d.message.includes("unknown subagent_type"))).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS;
+      else process.env.CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS = prev;
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Model resolution order (audit E5): env > param > frontmatter > session
+  // -------------------------------------------------------------------------
+
+  it("CLAUDE_CODE_SUBAGENT_MODEL beats the model param, which beats frontmatter, which beats session", async () => {
+    const specs: Array<string | undefined> = [];
+    const { runtime } = makeRuntime([makeAgent({ model: "fm-model" })], ["ok"], {
+      resolveModel: (spec: string | undefined) => {
+        specs.push(spec);
+        return { spec };
+      },
+    });
+    const prev = process.env.CLAUDE_CODE_SUBAGENT_MODEL;
+    try {
+      process.env.CLAUDE_CODE_SUBAGENT_MODEL = "env-model";
+      await runtime.dispatch({ subagentType: "reviewer", prompt: "p", model: "param-model", depth: 1 });
+      expect(specs).toEqual(["env-model"]);
+
+      // "inherit" (and empty) mean the env var is unset → the param wins.
+      specs.length = 0;
+      process.env.CLAUDE_CODE_SUBAGENT_MODEL = "inherit";
+      await runtime.dispatch({ subagentType: "reviewer", prompt: "p", model: "param-model", depth: 1 });
+      expect(specs).toEqual(["param-model"]);
+
+      specs.length = 0;
+      process.env.CLAUDE_CODE_SUBAGENT_MODEL = "";
+      await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+      expect(specs).toEqual(["fm-model"]);
+
+      // No env, no param, no frontmatter → session model (undefined spec).
+      specs.length = 0;
+      delete process.env.CLAUDE_CODE_SUBAGENT_MODEL;
+      const { runtime: plain } = makeRuntime([makeAgent()], ["ok"], {
+        resolveModel: (spec: string | undefined) => {
+          specs.push(spec);
+          return undefined;
+        },
+      });
+      await plain.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+      expect(specs).toEqual([undefined]);
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CODE_SUBAGENT_MODEL;
+      else process.env.CLAUDE_CODE_SUBAGENT_MODEL = prev;
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Agent-scoped hooks (audit C10)
+  // -------------------------------------------------------------------------
+
+  it("agent frontmatter hooks dispatch scoped to the subagent: guard wiring + Stop→SubagentStop mapping", async () => {
+    const scopedEvents: Array<{ event: string; payload: Record<string, unknown> }> = [];
+    const scopedConfigs: Array<Record<string, unknown>> = [];
+    const makeScopedHookRunner = (config: Record<string, unknown>) => {
+      scopedConfigs.push(config);
+      return {
+        fire: async (event: string, payload: Record<string, unknown>) => {
+          scopedEvents.push({ event, payload });
+          return { block: false, askDowngraded: false, diagnostics: [] };
+        },
+      };
+    };
+    const agent = makeAgent({
+      hooks: {
+        PreToolUse: [
+          { matcher: "Read", hooks: [{ type: "command", command: "echo pre", raw: {} }] },
+        ],
+        Stop: [{ hooks: [{ type: "command", command: "echo stop", raw: {} }] }],
+      },
+    });
+    const { runtime, created } = makeRuntime([agent], ["ok"], { makeScopedHookRunner });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    expect(result.ok).toBe(true);
+
+    // parseHookConfig ran on the frontmatter and the scoped runner announces itself.
+    expect(Object.keys(scopedConfigs[0] ?? {})).toEqual(["PreToolUse", "Stop"]);
+    expect(
+      result.diagnostics.some((d) => d.severity === "info" && d.message.includes("agent-scoped hooks")),
+    ).toBe(true);
+
+    // The multiplexed runner fired the Subagent* lifecycle for the scoped runner
+    // and mapped the agent's Stop hooks to SubagentStop time.
+    const events = scopedEvents.map((e) => e.event);
+    expect(events).toContain("SubagentStart");
+    expect(events).toContain("SubagentStop");
+    expect(events).toContain("Stop");
+
+    // Guard wiring: this dispatch's tool events reach the scoped runner too.
+    const loader = created[0]?.resourceLoader as { options: Record<string, unknown> };
+    const factories = loader.options.extensionFactories as Array<{
+      name: string;
+      factory: (pi: unknown) => unknown;
+    }>;
+    const guardFactory = factories.find((f) => f.name.includes("guard"));
+    expect(guardFactory).toBeDefined();
+    const handlers = new Map<string, (e: unknown, c: unknown) => unknown>();
+    guardFactory!.factory({
+      on: (event: string, handler: (e: unknown, c: unknown) => unknown) => handlers.set(event, handler),
+      sendMessage: () => undefined,
+    });
+    scopedEvents.length = 0;
+    await handlers.get("tool_call")!({ toolName: "read", toolCallId: "t", input: { path: "a.ts" } }, {});
+    expect(scopedEvents.map((e) => e.event)).toContain("PreToolUse");
+  });
+
+  it("a blocking agent Stop hook re-prompts the subagent at SubagentStop time", async () => {
+    let stops = 0;
+    const makeScopedHookRunner = () => ({
+      fire: async (event: string) => {
+        if (event === "Stop" && stops++ === 0) {
+          return {
+            block: true,
+            blockReason: "agent stop hook says continue",
+            askDowngraded: false,
+            diagnostics: [],
+          };
+        }
+        return { block: false, askDowngraded: false, diagnostics: [] };
+      },
+    });
+    const agent = makeAgent({
+      hooks: { Stop: [{ hooks: [{ type: "command", command: "check", raw: {} }] }] },
+    });
+    const { runtime } = makeRuntime([agent], ["first answer", "revised answer"], {
+      makeScopedHookRunner,
+    });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    expect(result.ok).toBe(true);
+    expect(result.finalMessage).toBe("revised answer");
+  });
+
+  it("agent hook systemMessages surface in the dispatch diagnostics, once per distinct message (H4)", async () => {
+    const makeScopedHookRunner = () => ({
+      fire: async () => ({
+        block: false,
+        askDowngraded: false,
+        diagnostics: [],
+        systemMessages: ["deploy checklist incomplete"],
+      }),
+    });
+    const agent = makeAgent({
+      hooks: { Stop: [{ hooks: [{ type: "command", command: "check", raw: {} }] }] },
+    });
+    const { runtime } = makeRuntime([agent], ["ok"], { makeScopedHookRunner });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    expect(result.ok).toBe(true);
+    const surfaced = result.diagnostics.filter((d) =>
+      d.message.includes("deploy checklist incomplete"),
+    );
+    expect(surfaced).toHaveLength(1); // every fire returned it; surfaced once
+    expect(surfaced[0]?.message).toContain("systemMessage");
+  });
+
+  it("an agent without hooks never constructs a scoped runner", async () => {
+    let calls = 0;
+    const makeScopedHookRunner = () => {
+      calls++;
+      return { fire: async () => ({ block: false, askDowngraded: false, diagnostics: [] }) };
+    };
+    const { runtime } = makeRuntime([makeAgent()], ["ok"], { makeScopedHookRunner });
+    await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    expect(calls).toBe(0);
   });
 });

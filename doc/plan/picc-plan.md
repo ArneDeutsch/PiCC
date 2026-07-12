@@ -404,7 +404,7 @@ Each is **parsed, a documented no-op, and a clean seam** for later — never a c
 | Subsystem | v1 disposition | Why deferred |
 |---|---|---|
 | **MCP** (servers, agent `mcpServers:`, `.mcp.json`, MCP tools, Elicitation hooks) | Parse (incl. committed `.mcp.json`) without crashing; MCP tool-name gating degrades predictably | Not used by the reference corpus; Pi is MCP-averse by design; large surface. Clean seam. |
-| **Agent `memory:` + auto-memory** | Parse the field; no-op storage | Machine-local, not a committed project artifact; not load-bearing to run a project. |
+| **Agent `memory:` + auto-memory** | ~~Parse the field; no-op storage~~ **Implemented post-v1** (2026-07-12 completeness audit): MEMORY.md read-side + write conventions for both project auto memory and agent `memory:` scopes. | ~~Machine-local, not load-bearing~~ — promoted for Claude parity. |
 | **Plan mode / `ExitPlanMode`** | No-op; treat CLAUDE.md "use plan mode" as guidance | User implements planning via own skills with review cycles; not wanted. |
 | **`AskUserQuestion`** | Not provided; human interaction happens in plain chat | Explicitly unwanted; chat discussion suffices. |
 | **Interactive permission machinery** (`allow`/`ask`/modes/auto-mode) | No-op per §6.1 | Partly server-side; fragile; not how the user works. |

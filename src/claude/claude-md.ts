@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import type { ClaudeMdFile, Diagnostic, Scope } from "../types.js";
+import { defaultManagedDirs } from "../discovery/locations.js";
 import { isFile, readTextSafe } from "../util/fs.js";
 import { matchesAny, normalizeSlashes } from "../util/globs.js";
 import { stripBlockHtmlComments } from "../util/markdown.js";
@@ -9,8 +10,8 @@ import { stripBlockHtmlComments } from "../util/markdown.js";
  * CLAUDE.md hierarchy subsystem (plan §4.6).
  *
  * - `expandImports`: `@path` import expansion (recursive, hop-limited, code-span aware).
- * - `loadClaudeMdHierarchy`: session-start collection (user → root→cwd → .claude, with
- *   CLAUDE.local.md siblings).
+ * - `loadClaudeMdHierarchy`: session-start collection (managed → user → filesystem
+ *   root→cwd ancestors → .claude, with CLAUDE.local.md siblings in ancestor dirs).
  * - `findNestedClaudeMd`: on-demand nearest-ancestor lookup when the model touches a file,
  *   worktree-aware.
  *
@@ -236,35 +237,52 @@ function loadOne(
   return { path: filePath, dir, content, scope, loadAtStart, diagnostics: expanded.diagnostics };
 }
 
-/** Directories from projectRoot down to cwd (both inclusive, root first). */
-function dirChain(projectRoot: string, cwd: string): string[] {
-  const root = path.resolve(projectRoot);
-  const target = path.resolve(cwd);
-  const rel = path.relative(root, target);
-  if (rel === "") return [root];
-  if (rel.startsWith("..") || path.isAbsolute(rel)) return [root]; // cwd outside root: root only
-  const chain = [root];
-  let acc = root;
-  for (const seg of rel.split(path.sep).filter(Boolean)) {
-    acc = path.join(acc, seg);
-    chain.push(acc);
+/**
+ * Ancestor directories of cwd, from the filesystem root (or `stopDir`, when given)
+ * down to cwd — both inclusive, root first, so more specific files load later.
+ * Claude walks the FULL ancestor chain, including dirs above the git root
+ * (audit B1; issues #26944/#20880).
+ */
+function dirChain(cwd: string, stopDir?: string): string[] {
+  const chain: string[] = [];
+  const stop = stopDir === undefined ? undefined : pathKey(stopDir);
+  let dir = path.resolve(cwd);
+  for (;;) {
+    chain.push(dir);
+    if (stop !== undefined && pathKey(dir) === stop) break;
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // filesystem/drive root reached (e.g. F:\ on Windows)
+    dir = parent;
   }
-  return chain;
+  return chain.reverse();
 }
 
 /**
  * Collect the CLAUDE.md hierarchy loaded at session start, in load order:
- * 1. `<userDir>/CLAUDE.md` (scope "user")
- * 2. every `CLAUDE.md` from projectRoot down to cwd (root→cwd, scope "project")
- * 3. `<projectRoot>/.claude/CLAUDE.md` if present (scope "project")
- * With `CLAUDE.local.md` (scope "local") immediately after its sibling in each directory.
- * `excludes` glob patterns (base = projectRoot) skip matching files.
+ * 1. managed `<managedBase>/CLAUDE.md` + managed-settings inline `claudeMd`
+ *    (scope "managed", highest priority, EXEMPT from `excludes` — audit B3)
+ * 2. `<userDir>/CLAUDE.md` (scope "user")
+ * 3. every `CLAUDE.md` from the filesystem root down to cwd (root→cwd,
+ *    scope "project") — ancestors above the git root included (audit B1)
+ * 4. `<projectRoot>/.claude/CLAUDE.md` if present (scope "project")
+ * `CLAUDE.local.md` (scope "local") loads immediately after its sibling slot in the
+ * ancestor-chain dirs of step 3 ONLY — never in `.claude/` or the user dir, and even
+ * when the sibling CLAUDE.md is absent (audit B2; issues #54425/#22652).
+ * `excludes` glob patterns (base = projectRoot) skip matching non-managed files;
+ * candidates OUTSIDE the project root are additionally matched with the globs
+ * anchored at their own directory (see {@link isExcluded}).
  */
 export function loadClaudeMdHierarchy(opts: {
   cwd: string;
   projectRoot: string;
   userDir: string;
   excludes: string[];
+  /** Override managed/policy base dirs probed for CLAUDE.md (used by tests). */
+  managedDirs?: string[];
+  /** Managed-settings inline `claudeMd` content (source = the managed settings file). */
+  managedInline?: { content: string; source: string };
+  /** Test hook: topmost ancestor included in the cwd walk (default: filesystem root). */
+  stopDir?: string;
   /** Test hook: overrides the home dir used for `@~/` imports. */
   home?: string;
 }): ClaudeMdHierarchyResult {
@@ -273,23 +291,50 @@ export function loadClaudeMdHierarchy(opts: {
   const projectRoot = path.resolve(opts.projectRoot);
   const seen = new Set<string>();
 
-  const candidates: Array<{ dir: string; scope: Scope }> = [
-    { dir: path.resolve(opts.userDir), scope: "user" },
-    ...dirChain(projectRoot, opts.cwd).map((dir) => ({ dir, scope: "project" as Scope })),
-    { dir: path.join(projectRoot, ".claude"), scope: "project" },
+  // Managed CLAUDE.md first (highest priority; exempt from claudeMdExcludes — B3).
+  for (const base of opts.managedDirs ?? defaultManagedDirs()) {
+    const full = path.join(path.resolve(base), "CLAUDE.md");
+    const key = pathKey(full);
+    if (seen.has(key) || !isFile(full)) continue;
+    seen.add(key);
+    const file = loadOne(full, "managed", true, opts.home);
+    files.push(file);
+    diagnostics.push(...file.diagnostics);
+  }
+  // Managed-settings inline `claudeMd` content: injected literally (no @import
+  // expansion — the string comes from policy JSON, not a markdown file on disk).
+  if (opts.managedInline !== undefined && opts.managedInline.content.trim() !== "") {
+    files.push({
+      path: opts.managedInline.source,
+      dir: path.dirname(opts.managedInline.source),
+      content: opts.managedInline.content,
+      scope: "managed",
+      loadAtStart: true,
+      diagnostics: [],
+    });
+  }
+
+  const candidates: Array<{ dir: string; scope: Scope; withLocal: boolean }> = [
+    { dir: path.resolve(opts.userDir), scope: "user", withLocal: false },
+    ...dirChain(opts.cwd, opts.stopDir).map((dir) => ({
+      dir,
+      scope: "project" as Scope,
+      withLocal: true,
+    })),
+    // `.claude/CLAUDE.local.md` must NOT auto-load (issue #54425).
+    { dir: path.join(projectRoot, ".claude"), scope: "project", withLocal: false },
   ];
 
-  for (const { dir, scope } of candidates) {
-    for (const { name, fileScope } of [
-      { name: "CLAUDE.md", fileScope: scope },
-      { name: "CLAUDE.local.md", fileScope: "local" as Scope },
-    ]) {
+  for (const { dir, scope, withLocal } of candidates) {
+    const names: Array<{ name: string; fileScope: Scope }> = [{ name: "CLAUDE.md", fileScope: scope }];
+    if (withLocal) names.push({ name: "CLAUDE.local.md", fileScope: "local" });
+    for (const { name, fileScope } of names) {
       const full = path.join(dir, name);
       const key = pathKey(full);
       if (seen.has(key)) continue;
       if (!isFile(full)) continue;
       seen.add(key);
-      if (opts.excludes.length > 0 && matchesAny(full, opts.excludes, projectRoot)) {
+      if (isExcluded(full, dir, opts.excludes, projectRoot)) {
         diagnostics.push({
           severity: "info",
           message: `Skipped by claudeMdExcludes: ${full}`,
@@ -303,6 +348,20 @@ export function loadClaudeMdHierarchy(opts: {
     }
   }
   return { files, diagnostics };
+}
+
+/**
+ * `claudeMdExcludes` check (base = projectRoot). Candidate files OUTSIDE the
+ * project root — the ancestor-chain dirs above the git root (audit B1) and the
+ * user dir — can never match root-anchored globs like `**\/CLAUDE.md`, so they
+ * are ADDITIONALLY evaluated with the exclude globs anchored at the candidate
+ * file's own directory, making `**\/CLAUDE.md` and bare `CLAUDE.md` behave
+ * alike for ancestors. Managed scope never reaches this check (exempt — B3).
+ */
+function isExcluded(file: string, dir: string, excludes: string[], projectRoot: string): boolean {
+  if (excludes.length === 0) return false;
+  if (matchesAny(file, excludes, projectRoot)) return true;
+  return !isWithin(projectRoot, dir) && matchesAny(file, excludes, dir);
 }
 
 // ---------------------------------------------------------------------------

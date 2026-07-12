@@ -15,7 +15,7 @@ and for the exact Pi API contracts see [`doc/design/pi-integration.md`](design/p
 └───────────────▲──────────────────────────────── loads as extension ─┘
                 │ default export picc(pi)  (src/index.ts)
 ┌───────────────┴─────────────────────────────────────────────────────┐
-│  PiCC (this repo) — one Pi extension bundle                     │
+│  PiCC (this repo) — one Pi extension bundle                          │
 │                                                                      │
 │  discovery → claude loaders → project model                         │
 │                    │                                                 │
@@ -45,17 +45,27 @@ layer, or the TUI (design §3.6).
   for the compatibility report (plan §5).
 
 ### `claude/` — parse each artifact format (loaders only, no runtime)
-- `skills.ts` — `.claude/skills/*/SKILL.md` + `.claude/commands/*.md`. Parses **frontmatter only**;
-  the body is never stored on the returned object (`body: undefined`) — progressive disclosure is a
-  hard NFR (plan §12.1). `loadSkillBody` re-reads on activation. Also renders the budgeted startup
-  skill listing.
-- `agents.ts` — `.claude/agents/*.md` into `ClaudeAgent` records; renders the description-driven
+- `skills.ts` — `.claude/skills/**/SKILL.md` + `.claude/commands/**/*.md` (recursive; a nested
+  entry whose name collides is qualified as `sub:name`). Parses **frontmatter only**; the body is
+  never stored on the returned object (`body: undefined`) — progressive disclosure is a hard NFR
+  (plan §12.1). `loadSkillBody` re-reads on activation. Also renders the budgeted startup skill
+  listing (per-entry cap 1536 chars, tiered degradation down to names-only — a skill is never
+  omitted) and hosts argument substitution (`$ARGUMENTS`, 0-based `$N`, named, `\$` escaping).
+- `agents.ts` — `.claude/agents/*.md` into `ClaudeAgent` records, plus `builtinAgents()` — the
+  built-in `general-purpose`/`Explore`/`Plan` types (project agents with the same name override;
+  `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` removes Explore/Plan); renders the description-driven
   routing catalog injected into the orchestrator context.
 - `rules.ts` — `.claude/rules/**/*.md`; files without `paths:` load unconditionally, files with
   `paths:` inject on matching-file access (plan §4.2).
 - `claude-md.ts` — CLAUDE.md hierarchy: `@import` expansion (recursive, hop-limited, code-span
-  aware — also the `@AGENTS.md` bridge), session-start collection, and `findNestedClaudeMd` for
+  aware — also the `@AGENTS.md` bridge), session-start collection (managed-policy CLAUDE.md and
+  the inline `claudeMd` settings key first, then user, then every ancestor from the **filesystem
+  root** down to cwd with `CLAUDE.local.md` siblings), and `findNestedClaudeMd` for
   nearest-ancestor injection on file touch (plan §4.6).
+- `memory.ts` — the memory read side: `loadAutoMemory` (per-project `MEMORY.md` under
+  `<userDir>/projects/<flattened-path>/memory`, first 200 lines / 25 KB, gated by
+  `autoMemoryEnabled`/`autoMemoryDirectory`/`CLAUDE_CODE_DISABLE_AUTO_MEMORY`) and
+  `loadAgentMemory` for the agent `memory: user|project|local` frontmatter scopes.
 - `hooks.ts` — normalizes the settings `hooks` value into `HookConfig`; keeps unknown event names
   and non-command handler types (they degrade, never throw).
 - `plugins.ts` — discovers already-installed plugins under `<userDir>/plugins` and a project
@@ -71,25 +81,38 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
   `WebFetch(domain:*)`, `Agent(type)`, `Skill(name)`, `mcp__server__tool`) and the `deny` engine.
   The grammar is fully implemented even though `allow`/`ask` are a no-op, because three subsystems
   reuse it: `deny` enforcement, `tools:` gating, and hook `if:` conditions. Matching is
-  **shell-operator aware** — `git status && rm -rf /` does not match `Bash(git *)`. Never throws.
+  **shell-operator aware** — `git status && rm -rf /` does not match `Bash(git *)`. Space-before-`*`
+  is a word boundary (`Bash(git *)` matches bare `git` too, never `github`), and file-rule paths
+  are normalized to POSIX form on Windows (`C:\Users` ↔ `//c/**`, case-insensitive). Never throws.
 - `hook-runner.ts` — spawns `type: command` hooks via `node:child_process.spawn`, delivers the
-  Claude Code JSON payload on **stdin**, and aggregates the exit-code / stdout-JSON contract
-  (exit 2 = block; `permissionDecision`; `additionalContext`; `updatedInput`) into a `HookOutcome`.
-  `fire()` never throws.
+  Claude Code JSON payload on **stdin** (incl. `permission_mode`, `transcript_path`,
+  `tool_use_id`, `last_assistant_message`, structured `tool_response`), and aggregates the
+  exit-code / stdout-JSON contract (exit 2 = block; `permissionDecision`; `additionalContext`;
+  `updatedInput`; `systemMessage`/`suppressOutput`) into a `HookOutcome`. Matching handlers run
+  in **parallel** with identical-command dedup and most-restrictive merge; `async: true` handlers
+  are fire-and-forget; matchers follow Claude semantics (exact names / `|`,`,` alternation /
+  unanchored regex). `fire()` never throws.
 - `shell-inject.ts` — preprocesses skill bodies: inline `` !`cmd` `` and `` ```! `` fenced blocks are
   replaced with command stdout before the model sees the content, honoring `shell:` (bash default /
   powershell) and `disableSkillShellExecution`. Also hosts `resolveGitBashPath()` (see §4).
 
 ### `runtime/` — wiring the parsed model into a live Pi session
 - `context-assembly.ts` — builds the system-prompt suffix appended every turn in
-  `before_agent_start`: root CLAUDE.md, unconditional rules, budgeted skill listing, agent catalog,
-  steering text, and rendered active-skill bodies. Because the system prompt is rebuilt each turn
-  and never compacted away, **this is also the primary compaction-preservation mechanism** (plan §9).
+  `before_agent_start`: root CLAUDE.md, auto memory, unconditional rules, budgeted skill listing,
+  agent catalog, steering text, and rendered active-skill bodies. Because the system prompt is
+  rebuilt each turn and never compacted away, **this is also the primary compaction-preservation
+  mechanism** (plan §9).
 - `subagents.ts` — `SubagentRuntime`: spawns a fresh in-memory Pi session per dispatch (agent body
-  as system prompt + CLAUDE.md/rules, **not** the parent conversation), fans out under a
-  concurrency cap, applies per-agent `tools:`/`model`/`effort`, enforces the depth cap, supports
-  `isolation: worktree`, and returns the subagent's final message **verbatim** (skills parse locked
-  YAML from it — a hard contract, plan §4.3).
+  as system prompt + CLAUDE.md/rules, **not** the parent conversation; the built-in Explore/Plan
+  types skip the project context), fans out under a concurrency cap, applies per-agent
+  `tools:`/`model`/`effort` (with `CLAUDE_CODE_SUBAGENT_MODEL` as the highest-priority model
+  override), enforces the depth cap (default 5), runs agent-scoped `hooks:`, supports
+  `isolation: worktree` and `run_in_background`, and returns the subagent's final message
+  **verbatim** (skills parse locked YAML from it — a hard contract, plan §4.3).
+- `background-tasks.ts` — `BackgroundTaskRegistry` plus the real `TaskOutput`/`TaskStop` tools:
+  `run_in_background: true` registers the un-awaited dispatch under a task id; `TaskOutput`
+  waits/polls for the result, `TaskStop` requests a cooperative abort
+  (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` falls back to foreground).
 - `worktrees.ts` — `WorktreeManager` for `EnterWorktree`/`ExitWorktree`: creates
   `.claude/worktrees/<flat>/` on `worktree-<flat>` off a base ref resolved to a concrete SHA
   *before* creation, seeds `.worktreeinclude` files, and does Windows-tolerant removal (best-effort,
@@ -158,9 +181,10 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers:
    compaction-preservation path.
 
 4. **`input`.** In order: intercept PiCC control commands so they never reach the model; fire
-   the `UserPromptSubmit` hook (block or inject context); expand a `/skill [args]` slash command by
-   activating the skill and **transforming the user turn** into the rendered body (Claude Code's
-   slash semantics; a transform works in every Pi mode, unlike a self-dispatching command).
+   the `UserPromptSubmit` hook (block or inject context); expand `/skill [args]` slash commands by
+   activating the skill(s) and **transforming the user turn** into the rendered bodies (Claude
+   Code's slash semantics — up to 5 leading `/skill` tokens stack, the trailing text feeding the
+   last skill's arguments; a transform works in every Pi mode, unlike a self-dispatching command).
 
 5. **Tool calls → `guard`.** Each tool call is translated to its Claude name, checked against deny
    rules (hard block), run through PreToolUse hooks (`updatedInput`/`additionalContext`/block), and
@@ -169,12 +193,15 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers:
 
 6. **Subagent dispatch.** The `Agent`/`Task` tool calls `SubagentRuntime.dispatch`, which spawns a
    fresh Pi session with the gated tool set and returns the final message verbatim. Nested dispatch
-   is depth-capped; the same guard runs inside every subagent session.
+   is depth-capped; the same guard runs inside every subagent session. With
+   `run_in_background: true` the dispatch registers in the `BackgroundTaskRegistry` and returns a
+   task id; `TaskOutput`/`TaskStop` manage its lifecycle.
 
 7. **`agent_settled` / compaction.** `agent_settled` fires the `Stop` hook (exit 2 re-prompts the
-   agent to continue, bounded). `session_before_compact`/`session_compact` fire `PreCompact`/
-   `PostCompact` and re-inject active skill bodies for mid-turn continuity; the system-prompt suffix
-   already preserves the instruction set.
+   agent to continue, capped at 8 consecutive blocks). `session_before_compact`/`session_compact`
+   fire `PreCompact`/`PostCompact` and re-inject active skill bodies for mid-turn continuity under
+   Claude's carryover budgets (~5k tokens per skill / ~25k combined, most-recent-first); the
+   system-prompt suffix already preserves the instruction set.
 
 ## 4. Mechanical-fidelity decisions (load-bearing)
 

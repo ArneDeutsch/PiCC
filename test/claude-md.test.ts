@@ -144,6 +144,8 @@ describe("expandImports", () => {
 });
 
 describe("loadClaudeMdHierarchy", () => {
+  // All hierarchy tests pass stopDir (and managedDirs: []) so the ancestor walk —
+  // which reaches the filesystem root in production (audit B1) — stays inside tmp.
   it("loads user, then root→cwd chain, then .claude, in order with correct scopes", () => {
     const userDir = path.join(tmp, "userhome");
     const root = path.join(tmp, "proj");
@@ -154,7 +156,14 @@ describe("loadClaudeMdHierarchy", () => {
     write("proj/pkg/app/CLAUDE.md", "APP");
     write("proj/.claude/CLAUDE.md", "DOTCLAUDE");
 
-    const res = loadClaudeMdHierarchy({ cwd, projectRoot: root, userDir, excludes: [] });
+    const res = loadClaudeMdHierarchy({
+      cwd,
+      projectRoot: root,
+      userDir,
+      excludes: [],
+      managedDirs: [],
+      stopDir: tmp,
+    });
     expect(res.files.map((f) => f.content)).toEqual(["USER", "ROOT", "PKG", "APP", "DOTCLAUDE"]);
     expect(res.files.map((f) => f.scope)).toEqual([
       "user",
@@ -184,9 +193,184 @@ describe("loadClaudeMdHierarchy", () => {
       projectRoot: root,
       userDir: path.join(tmp, "nouser"),
       excludes: [],
+      managedDirs: [],
+      stopDir: tmp,
     });
     expect(res.files.map((f) => f.content)).toEqual(["ROOT", "ROOT LOCAL", "SUB"]);
     expect(res.files[1]!.scope).toBe("local");
+  });
+
+  it("loads ancestor CLAUDE.md files above the git root, root-first (B1)", () => {
+    const root = path.join(tmp, "above", "repo");
+    write("above/CLAUDE.md", "ABOVE");
+    write("above/repo/CLAUDE.md", "ROOT");
+    write("above/repo/sub/CLAUDE.md", "SUB");
+
+    const res = loadClaudeMdHierarchy({
+      cwd: path.join(root, "sub"),
+      projectRoot: root,
+      userDir: path.join(tmp, "nouser"),
+      excludes: [],
+      managedDirs: [],
+      stopDir: tmp,
+    });
+    // Root-first order: the dir above the repo loads BEFORE the repo root,
+    // so more specific files land later (closer) in the prompt.
+    expect(res.files.map((f) => f.content)).toEqual(["ABOVE", "ROOT", "SUB"]);
+    expect(res.files.map((f) => f.scope)).toEqual(["project", "project", "project"]);
+  });
+
+  it("defaults the ancestor walk to the filesystem root without throwing", () => {
+    const root = path.join(tmp, "proj");
+    write("proj/CLAUDE.md", "ROOT");
+    expect(() =>
+      loadClaudeMdHierarchy({
+        cwd: root,
+        projectRoot: root,
+        userDir: path.join(tmp, "nouser"),
+        excludes: [],
+        managedDirs: [],
+      }),
+    ).not.toThrow();
+  });
+
+  it("does NOT auto-load .claude/CLAUDE.local.md or a user-dir CLAUDE.local.md (B2)", () => {
+    const userDir = path.join(tmp, "userhome");
+    const root = path.join(tmp, "proj");
+    write("userhome/CLAUDE.md", "USER");
+    write("userhome/CLAUDE.local.md", "USER LOCAL");
+    write("proj/CLAUDE.md", "ROOT");
+    write("proj/.claude/CLAUDE.md", "DOTCLAUDE");
+    write("proj/.claude/CLAUDE.local.md", "DOT LOCAL");
+
+    const res = loadClaudeMdHierarchy({
+      cwd: root,
+      projectRoot: root,
+      userDir,
+      excludes: [],
+      managedDirs: [],
+      stopDir: tmp,
+    });
+    expect(res.files.map((f) => f.content)).toEqual(["USER", "ROOT", "DOTCLAUDE"]);
+  });
+
+  it("loads a standalone CLAUDE.local.md in an ancestor dir even without a sibling CLAUDE.md (B2)", () => {
+    const root = path.join(tmp, "proj");
+    write("proj/CLAUDE.md", "ROOT");
+    write("proj/sub/CLAUDE.local.md", "SUB LOCAL");
+
+    const res = loadClaudeMdHierarchy({
+      cwd: path.join(root, "sub"),
+      projectRoot: root,
+      userDir: path.join(tmp, "nouser"),
+      excludes: [],
+      managedDirs: [],
+      stopDir: tmp,
+    });
+    expect(res.files.map((f) => f.content)).toEqual(["ROOT", "SUB LOCAL"]);
+    expect(res.files[1]!.scope).toBe("local");
+  });
+
+  it("loads the managed CLAUDE.md first and exempts it from claudeMdExcludes (B3)", () => {
+    const managedBase = path.join(tmp, "managed");
+    const root = path.join(tmp, "proj");
+    write("managed/CLAUDE.md", "MANAGED POLICY");
+    write("proj/CLAUDE.md", "ROOT");
+
+    const res = loadClaudeMdHierarchy({
+      cwd: root,
+      projectRoot: root,
+      userDir: path.join(tmp, "nouser"),
+      // A blanket exclude kills the project file but must NOT touch managed.
+      excludes: ["**/CLAUDE.md"],
+      managedDirs: [managedBase],
+      stopDir: tmp,
+    });
+    expect(res.files.map((f) => f.content)).toEqual(["MANAGED POLICY"]);
+    expect(res.files[0]!.scope).toBe("managed");
+    expect(res.diagnostics.some((d) => /claudeMdExcludes/.test(d.message))).toBe(true);
+  });
+
+  it("injects managed-settings inline claudeMd content after the managed file, before user scope (B3)", () => {
+    const managedBase = path.join(tmp, "managed");
+    const managedSettings = path.join(managedBase, "managed-settings.json");
+    const userDir = path.join(tmp, "userhome");
+    const root = path.join(tmp, "proj");
+    write("managed/CLAUDE.md", "MANAGED FILE");
+    write("userhome/CLAUDE.md", "USER");
+    write("proj/CLAUDE.md", "ROOT");
+
+    const res = loadClaudeMdHierarchy({
+      cwd: root,
+      projectRoot: root,
+      userDir,
+      excludes: [],
+      managedDirs: [managedBase],
+      managedInline: { content: "INLINE POLICY", source: managedSettings },
+      stopDir: tmp,
+    });
+    expect(res.files.map((f) => f.content)).toEqual([
+      "MANAGED FILE",
+      "INLINE POLICY",
+      "USER",
+      "ROOT",
+    ]);
+    expect(res.files[1]!.scope).toBe("managed");
+    expect(res.files[1]!.path).toBe(managedSettings);
+    expect(res.files[1]!.loadAtStart).toBe(true);
+  });
+
+  it("**/CLAUDE.md exclude reaches ancestor files ABOVE the project root (G3)", () => {
+    const root = path.join(tmp, "above", "repo");
+    write("above/CLAUDE.md", "ABOVE");
+    write("above/repo/CLAUDE.md", "ROOT");
+
+    const res = loadClaudeMdHierarchy({
+      cwd: root,
+      projectRoot: root,
+      userDir: path.join(tmp, "nouser"),
+      excludes: ["**/CLAUDE.md"],
+      managedDirs: [],
+      stopDir: tmp,
+    });
+    // The root-anchored glob excludes the in-root file AND (anchored at the
+    // ancestor's own dir) the ancestor file above the git root.
+    expect(res.files).toEqual([]);
+    expect(res.diagnostics.filter((d) => /claudeMdExcludes/.test(d.message))).toHaveLength(2);
+  });
+
+  it("bare-name exclude also reaches ancestor files above the project root (G3)", () => {
+    const root = path.join(tmp, "above", "repo");
+    write("above/CLAUDE.md", "ABOVE");
+    write("above/repo/CLAUDE.md", "ROOT");
+
+    const res = loadClaudeMdHierarchy({
+      cwd: root,
+      projectRoot: root,
+      userDir: path.join(tmp, "nouser"),
+      excludes: ["CLAUDE.md"],
+      managedDirs: [],
+      stopDir: tmp,
+    });
+    expect(res.files).toEqual([]);
+    expect(res.diagnostics.filter((d) => /claudeMdExcludes/.test(d.message))).toHaveLength(2);
+  });
+
+  it("a scoped exclude that does not name the ancestor still loads it (G3 stays targeted)", () => {
+    const root = path.join(tmp, "above", "repo");
+    write("above/CLAUDE.md", "ABOVE");
+    write("above/repo/CLAUDE.md", "ROOT");
+    write("above/repo/vendor/CLAUDE.md", "VENDOR"); // not in the cwd chain anyway
+
+    const res = loadClaudeMdHierarchy({
+      cwd: root,
+      projectRoot: root,
+      userDir: path.join(tmp, "nouser"),
+      excludes: ["vendor/**"],
+      managedDirs: [],
+      stopDir: tmp,
+    });
+    expect(res.files.map((f) => f.content)).toEqual(["ABOVE", "ROOT"]);
   });
 
   it("honors excludes (glob against absolute path, base projectRoot)", () => {
@@ -350,6 +534,19 @@ describe("findNestedClaudeMd", () => {
       cwd: root,
       projectRoot: root,
       excludes: ["pkg/CLAUDE.md"],
+      loaded: new Set(),
+    });
+    expect(found).toBeUndefined();
+  });
+
+  it("never lazily loads CLAUDE.local.md in subtrees (CLAUDE.md-only — B2)", () => {
+    const root = path.join(tmp, "proj");
+    write("proj/pkg/CLAUDE.local.md", "PKG LOCAL");
+    write("proj/pkg/file.ts", "code");
+    const found = findNestedClaudeMd(path.join(root, "pkg", "file.ts"), {
+      cwd: root,
+      projectRoot: root,
+      excludes: [],
       loaded: new Set(),
     });
     expect(found).toBeUndefined();

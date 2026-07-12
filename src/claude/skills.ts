@@ -7,7 +7,7 @@ import type {
   SkillArgumentSpec,
 } from "../types.js";
 import { parseMarkdown, toBool, toStringList } from "../util/markdown.js";
-import { isDirectory, listDirSafe, readTextSafe, walkFiles } from "../util/fs.js";
+import { isDirectory, readTextSafe, walkFiles } from "../util/fs.js";
 
 /**
  * Skills subsystem core (plan §4.1).
@@ -41,6 +41,10 @@ const KNOWN_KEYS = new Set([
   "paths",
   "shell",
   "metadata",
+  "license",
+  "display-name",
+  "default-enabled",
+  "fallback",
 ]);
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -135,6 +139,19 @@ function toArgumentSpecs(
   return specs.length ? specs : undefined;
 }
 
+/**
+ * Skill metadata mapping: the `metadata:` block plus the dedicated informational
+ * keys Claude Code parses since v2.1.186 (`license`, `display-name`) folded in.
+ */
+function toSkillMetadata(fm: Record<string, unknown>): Record<string, unknown> {
+  const metadata: Record<string, unknown> = isPlainObject(fm["metadata"]) ? { ...fm["metadata"] } : {};
+  const license = toOptString(fm["license"]);
+  if (license && metadata["license"] === undefined) metadata["license"] = license;
+  const displayName = toOptString(fm["display-name"]);
+  if (displayName && metadata["display-name"] === undefined) metadata["display-name"] = displayName;
+  return metadata;
+}
+
 function toHookConfig(
   value: unknown,
   diagnostics: Diagnostic[],
@@ -162,12 +179,31 @@ export interface LoadSkillsResult {
 }
 
 /**
+ * Colon-qualified fallback name for an entry nested under intermediate
+ * directories (Claude v2.1.203 nested-name qualification): the subdir path
+ * relative to `rootDir` with separators turned into colons, prefixing the
+ * entry's plain name (e.g. commands/frontend/deploy.md → `frontend:deploy`,
+ * skills/group/foo/SKILL.md → `group:foo`). Undefined for top-level entries.
+ */
+function qualifiedNameFor(rootDir: string, containerDir: string, name: string): string | undefined {
+  const rel = path.relative(rootDir, containerDir);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return undefined;
+  const segments = rel.split(/[\\/]/).filter(Boolean);
+  if (!segments.length) return undefined;
+  return [...segments, name].join(":");
+}
+
+/**
  * Discover and parse skills (recursive `SKILL.md` under each skill dir) and
- * legacy commands (`*.md` directly inside each command dir).
+ * legacy commands (recursive `*.md` under each command dir).
  *
  * Dedupe by name: skills win over legacy commands; within each group the
- * first occurrence wins (callers encode scope precedence via input order).
- * Never throws (completeness floor).
+ * first occurrence wins the plain name (callers encode scope precedence via
+ * input order). An entry nested under intermediate directories is ALWAYS also
+ * reachable under its colon-qualified name (`<subdirs>:<name>`): a listing-
+ * hidden alias entry is registered alongside the plain stem, and when the
+ * plain name collides the entry is registered under the qualified name
+ * instead of being dropped. Never throws (completeness floor).
  */
 export function loadSkills(
   skillDirs: Array<{ dir: string; scope: Scope }>,
@@ -175,41 +211,61 @@ export function loadSkills(
   opts: { pluginName?: string } = {},
 ): LoadSkillsResult {
   const diagnostics: Diagnostic[] = [];
-  const skills: ClaudeSkill[] = [];
+  type Entry = { skill: ClaudeSkill; qualified?: string };
+  const skills: Entry[] = [];
   for (const { dir, scope } of skillDirs) {
     if (!isDirectory(dir)) continue;
     const files = walkFiles(dir, (name) => name === "SKILL.md").sort();
     for (const file of files) {
       const skill = parseSkillFile(file, scope, opts.pluginName, diagnostics);
-      if (skill) skills.push(skill);
+      if (!skill) continue;
+      // Intermediate dirs only: the skill's OWN directory is its identity, not a namespace.
+      const qualified = qualifiedNameFor(dir, path.dirname(skill.baseDir), skill.name);
+      skills.push({ skill, qualified });
     }
   }
 
-  const commands: ClaudeSkill[] = [];
+  const commands: Entry[] = [];
   for (const { dir, scope } of commandDirs) {
     if (!isDirectory(dir)) continue;
-    const names = listDirSafe(dir)
-      .filter((e) => e.isFile() && e.name.toLowerCase().endsWith(".md"))
-      .map((e) => e.name)
-      .sort();
-    for (const name of names) {
-      const cmd = parseCommandFile(path.join(dir, name), dir, scope, opts.pluginName, diagnostics);
-      if (cmd) commands.push(cmd);
+    const files = walkFiles(dir, (name) => name.toLowerCase().endsWith(".md")).sort();
+    for (const file of files) {
+      const cmd = parseCommandFile(file, path.dirname(file), scope, opts.pluginName, diagnostics);
+      if (!cmd) continue;
+      const qualified = qualifiedNameFor(dir, path.dirname(file), cmd.name);
+      commands.push({ skill: cmd, qualified });
     }
   }
 
   const byName = new Map<string, ClaudeSkill>();
-  for (const entry of [...skills, ...commands]) {
+  for (const { skill: entry, qualified } of [...skills, ...commands]) {
     const existing = byName.get(entry.name);
-    if (existing) {
-      diagnostics.push({
-        severity: "info",
-        message: `${entry.legacyCommand ? "Legacy command" : "Skill"} "${entry.name}" at ${entry.source.path} shadowed by ${existing.legacyCommand ? "legacy command" : "skill"} at ${existing.source.path}`,
-        source: entry.source.path,
-      });
+    if (!existing) {
+      byName.set(entry.name, entry);
+      // Nested entries are ALWAYS reachable under their colon-qualified name
+      // too (not only on collision): register a lightweight alias entry that
+      // is hidden from the model listing (the plain stem already lists) but
+      // keeps the entry's own user-invocability for `/sub:name` slash calls.
+      if (qualified && !byName.has(qualified)) {
+        byName.set(qualified, { ...entry, name: qualified, disableModelInvocation: true });
+      }
       continue;
     }
-    byName.set(entry.name, entry);
+    if (qualified && !byName.has(qualified)) {
+      diagnostics.push({
+        severity: "info",
+        message: `${entry.legacyCommand ? "Legacy command" : "Skill"} "${entry.name}" at ${entry.source.path} collides with ${existing.source.path}; registered as "${qualified}"`,
+        source: entry.source.path,
+      });
+      entry.name = qualified;
+      byName.set(qualified, entry);
+      continue;
+    }
+    diagnostics.push({
+      severity: "info",
+      message: `${entry.legacyCommand ? "Legacy command" : "Skill"} "${entry.name}" at ${entry.source.path} shadowed by ${existing.legacyCommand ? "legacy command" : "skill"} at ${existing.source.path}`,
+      source: entry.source.path,
+    });
   }
   return { skills: [...byName.values()], diagnostics };
 }
@@ -235,7 +291,9 @@ function parseSkillFile(
   const baseDir = path.dirname(file);
   const name = toOptString(fm["name"]) ?? path.basename(baseDir);
 
-  const description = toOptString(fm["description"]);
+  // `fallback:` is the description default (v2.1.186) — it keeps a skill loadable
+  // when the frontmatter degraded (lenient parse) or omits `description`.
+  const description = toOptString(fm["description"]) ?? toOptString(fm["fallback"]);
   if (!description) {
     outDiagnostics.push({
       severity: "warning",
@@ -262,7 +320,7 @@ function parseSkillFile(
     hooks: toHookConfig(fm["hooks"], skillDiagnostics, file),
     paths: toRuleList(fm["paths"]),
     shell: parseShell(fm["shell"], skillDiagnostics, file),
-    metadata: isPlainObject(fm["metadata"]) ? fm["metadata"] : {},
+    metadata: toSkillMetadata(fm),
     baseDir,
     source: { path: file, scope, ...(pluginName ? { pluginName } : {}) },
     body: undefined, // progressive disclosure — loaded only via loadSkillBody
@@ -304,7 +362,10 @@ function parseCommandFile(
   const skillDiagnostics: Diagnostic[] = [...parsed.diagnostics];
   const name = path.basename(file).replace(/\.md$/i, "");
   const description =
-    toOptString(fm["description"]) ?? firstHeadingOrLine(parsed.body) ?? name;
+    toOptString(fm["description"]) ??
+    toOptString(fm["fallback"]) ??
+    firstHeadingOrLine(parsed.body) ??
+    name;
 
   return {
     name,
@@ -323,7 +384,7 @@ function parseCommandFile(
     hooks: toHookConfig(fm["hooks"], skillDiagnostics, file),
     paths: toRuleList(fm["paths"]),
     shell: parseShell(fm["shell"], skillDiagnostics, file),
-    metadata: isPlainObject(fm["metadata"]) ? fm["metadata"] : {},
+    metadata: toSkillMetadata(fm),
     baseDir: commandDir,
     source: { path: file, scope, ...(pluginName ? { pluginName } : {}) },
     body: undefined,
@@ -356,37 +417,75 @@ function trimTo(s: string, max: number): string {
   return one.slice(0, Math.max(1, max - 1)).trimEnd() + "…";
 }
 
+/** Claude's per-entry description cap for the skill listing. */
+const LISTING_DEFAULT_MAX_DESC_CHARS = 1536;
+/** Default listing budget: context window (~200k tokens × 4 chars) × 0.01. */
+const LISTING_DEFAULT_BUDGET_CHARS = Math.max(500, Math.floor(200_000 * 4 * 0.01));
+/** Tier-3 floor for the progressively halved per-entry description cap. */
+const LISTING_MIN_DESC_CHARS = 64;
+
 /**
  * Render the startup context listing: one line per model-invocable skill.
- * Deterministic (input order); stops when `budgetChars` would be exceeded and
- * appends "… (+N more skills)".
+ * Deterministic (input order). When the listing exceeds the budget it degrades
+ * in tiers like Claude Code rather than cutting skills off: tier 1 full entries,
+ * tier 2 drops `when:` clauses, tier 3 progressively halves the description cap
+ * (floor 64 chars), tier 4 lists names only. Every skill always appears.
+ * `SLASH_COMMAND_TOOL_CHAR_BUDGET` (env, integer chars) overrides the budget.
+ * The tier applied is reported as an info diagnostic via `opts.diagnostics`.
  */
 export function renderSkillListing(
   skills: ClaudeSkill[],
-  opts: { budgetChars?: number; maxDescChars?: number },
+  opts: { budgetChars?: number; maxDescChars?: number; diagnostics?: Diagnostic[] },
 ): string {
-  const maxDesc = opts.maxDescChars ?? 200;
-  const budget = opts.budgetChars ?? Number.POSITIVE_INFINITY;
+  const maxDesc = opts.maxDescChars ?? LISTING_DEFAULT_MAX_DESC_CHARS;
+  const envRaw = process.env.SLASH_COMMAND_TOOL_CHAR_BUDGET;
+  const envBudget = envRaw === undefined ? Number.NaN : Number.parseInt(envRaw, 10);
+  const budget =
+    Number.isFinite(envBudget) && envBudget > 0
+      ? envBudget
+      : (opts.budgetChars ?? LISTING_DEFAULT_BUDGET_CHARS);
   const visible = skills.filter((s) => !s.disableModelInvocation);
-  const lines: string[] = [];
-  let total = 0;
-  let included = 0;
-  for (const s of visible) {
-    let line = `- ${s.name}: ${trimTo(s.description, maxDesc)}`;
-    if (s.whenToUse) line += ` (when: ${trimTo(s.whenToUse, maxDesc)})`;
-    const cost = line.length + (lines.length > 0 ? 1 : 0); // +1 for the joining newline
-    if (total + cost > budget) break;
-    lines.push(line);
-    total += cost;
-    included++;
+  if (!visible.length) return "";
+
+  const render = (descCap: number, withWhen: boolean): string =>
+    visible
+      .map((s) => {
+        let line = `- ${s.name}: ${trimTo(s.description, descCap)}`;
+        if (withWhen && s.whenToUse) line += ` (when: ${trimTo(s.whenToUse, descCap)})`;
+        return line;
+      })
+      .join("\n");
+  const degraded = (tier: number, text: string, detail: string): string => {
+    opts.diagnostics?.push({
+      severity: "info",
+      message: `Skill listing over budget (${budget} chars); degraded to tier ${tier} (${detail})`,
+    });
+    return text;
+  };
+
+  // Tier 1: full entries.
+  let text = render(maxDesc, true);
+  if (text.length <= budget) return text;
+  // Tier 2: drop when: clauses.
+  text = render(maxDesc, false);
+  if (text.length <= budget) return degraded(2, text, "dropped when: clauses");
+  // Tier 3: progressively halve the per-entry description cap (floor 64).
+  const capFloor = Math.min(LISTING_MIN_DESC_CHARS, maxDesc);
+  let cap = Math.max(capFloor, Math.floor(maxDesc / 2));
+  for (;;) {
+    text = render(cap, false);
+    if (text.length <= budget) {
+      return degraded(3, text, `descriptions truncated to ${cap} chars`);
+    }
+    if (cap <= capFloor) break;
+    cap = Math.max(capFloor, Math.floor(cap / 2));
   }
-  const remaining = visible.length - included;
-  if (remaining > 0) lines.push(`… (+${remaining} more skills)`);
-  return lines.join("\n");
+  // Tier 4: names only — never silently omit a skill.
+  return degraded(4, visible.map((s) => `- ${s.name}`).join("\n"), "names only");
 }
 
 // ---------------------------------------------------------------------------
-// Argument substitution ($ARGUMENTS / $N / $ARGUMENTS[N] / $name / $$)
+// Argument substitution ($ARGUMENTS / $N / $ARGUMENTS[N] / $name / \$ escaping)
 // ---------------------------------------------------------------------------
 
 /** Shell-like tokenizer: whitespace-separated, double/single quotes group words. */
@@ -424,17 +523,26 @@ function tokenizeArgs(s: string): string[] {
 /**
  * Claude argument substitution semantics:
  * - `$ARGUMENTS` → full args string as typed
- * - `$ARGUMENTS[N]` (0-based) / `$1`..`$9` (1-based) → positional token
+ * - `$N` ≡ `$ARGUMENTS[N]`: 0-based positional token (`$0` = first argument),
+ *   greedy multi-digit (`$100` is ONE token = argument index 100)
  * - `$name` → named argument when `spec` defines it (`--name value`,
  *   `name=value`, or positional by spec order; falls back to spec default)
- * - `$$` → literal `$`
+ * - a single `\` immediately before a recognizable token emits the literal
+ *   token without that backslash and without substitution. Backslash PAIRS are
+ *   NOT collapsed (Claude's rule, audit A2): `\\$1` keeps BOTH backslashes and
+ *   the token still expands; only the odd trailing backslash of a run escapes
+ *   (`\\\$1` → two backslashes + literal `$1`). A backslash before anything
+ *   else is left untouched.
+ * - `$$` has no special meaning (each `$` is scanned on its own)
  * - unmatched positional/named → "" + info diagnostic
  * - args given but body has no marker → append `\n\nARGUMENTS: <argsText>`
+ *   (suppress via `opts.appendFallback: false` — used for tool-rule entries)
  */
 export function substituteArguments(
   body: string,
   argsText: string,
   spec?: SkillArgumentSpec[],
+  opts: { appendFallback?: boolean } = {},
 ): { text: string; diagnostics: Diagnostic[] } {
   const diagnostics: Diagnostic[] = [];
   const tokens = tokenizeArgs(argsText);
@@ -494,33 +602,39 @@ export function substituteArguments(
     return "";
   };
 
-  const re = /\$\$|\$ARGUMENTS\[(\d+)\]|\$ARGUMENTS\b|\$([1-9])(?![0-9])|\$([A-Za-z_][A-Za-z0-9_-]*)/g;
-  const text = body.replace(re, (m, bracketIdx?: string, posDigit?: string, name?: string) => {
-    if (m === "$$") return "$";
-    if (bracketIdx !== undefined) {
+  // A leading backslash run is captured so `\` can escape the token it precedes.
+  const re =
+    /(\\*)(\$ARGUMENTS\[(\d+)\]|\$ARGUMENTS\b|\$(\d+)|\$([A-Za-z_][A-Za-z0-9_-]*))/g;
+  const text = body.replace(
+    re,
+    (m, backslashes: string, token: string, bracketIdx?: string, posDigits?: string, name?: string) => {
+      // $SOMETHING that is not a known argument name stays verbatim (incl. any backslashes).
+      if (name !== undefined && !names.has(name)) return m;
+      // Claude's rule (audit A2): only the single odd trailing backslash of a
+      // run escapes the token; backslash pairs stay VERBATIM (no bash-style
+      // collapsing) and an even run still expands the token.
+      if (backslashes.length % 2 === 1) return backslashes.slice(1) + token;
+      const literalPrefix = backslashes;
       markerCount++;
-      const v = positionals[Number(bracketIdx)];
-      return v === undefined ? unmatched(m) : v;
-    }
-    if (m === "$ARGUMENTS") {
-      markerCount++;
-      return argsText;
-    }
-    if (posDigit !== undefined) {
-      markerCount++;
-      const v = positionals[Number(posDigit) - 1];
-      return v === undefined ? unmatched(m) : v;
-    }
-    if (name !== undefined && names.has(name)) {
-      markerCount++;
-      const v = resolved.get(name);
-      return v === undefined ? unmatched(m) : v;
-    }
-    return m; // $SOMETHING that is not a known argument name stays verbatim
-  });
+      let value: string;
+      if (bracketIdx !== undefined) {
+        const v = positionals[Number(bracketIdx)];
+        value = v === undefined ? unmatched(token) : v;
+      } else if (token === "$ARGUMENTS") {
+        value = argsText;
+      } else if (posDigits !== undefined) {
+        const v = positionals[Number(posDigits)];
+        value = v === undefined ? unmatched(token) : v;
+      } else {
+        const v = resolved.get(name!);
+        value = v === undefined ? unmatched(token) : v;
+      }
+      return literalPrefix + value;
+    },
+  );
 
   let out = text;
-  if (argsText.trim() !== "" && markerCount === 0) {
+  if ((opts.appendFallback ?? true) && argsText.trim() !== "" && markerCount === 0) {
     out += `\n\nARGUMENTS: ${argsText}`;
   }
   return { text: out, diagnostics };
@@ -544,4 +658,26 @@ export function substituteVariables(
     const value = vars[key];
     return value === undefined ? match : value;
   });
+}
+
+/**
+ * Apply the SAME `${CLAUDE_*}` and `$ARGUMENTS`/`$N`/`$name` substitution the
+ * skill body gets to `allowed-tools` / `disallowed-tools` entries (Claude Code
+ * substitutes both — docs; issue #67652). Returns a per-activation copy; the
+ * loaded skill object is never mutated. The no-marker `ARGUMENTS:` fallback is
+ * suppressed (tool rules are patterns, not prose). Never throws.
+ */
+export function substituteToolRules(
+  rules: string[] | undefined,
+  argsText: string,
+  vars: Record<string, string | undefined>,
+  spec?: SkillArgumentSpec[],
+): string[] | undefined {
+  if (!rules || rules.length === 0) return rules;
+  return rules.map(
+    (rule) =>
+      substituteArguments(substituteVariables(rule, vars), argsText, spec, {
+        appendFallback: false,
+      }).text,
+  );
 }

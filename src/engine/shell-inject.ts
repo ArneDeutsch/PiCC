@@ -15,8 +15,10 @@ import { unicodeSafeSubprocessEnv } from "../util/env.js";
  * Immunity rules: inline `` !`cmd` `` does NOT trigger inside inline code
  * spans or inside fenced code blocks other than ```! fences.
  *
- * Never throws (completeness floor): disabled execution, spawn failures,
- * non-zero exits and timeouts all degrade to a bracketed note + diagnostic.
+ * Never throws (completeness floor): disabled execution degrades to a bracketed
+ * note + diagnostic; spawn failures, non-zero exits and timeouts leave the
+ * ORIGINAL literal text in place (Claude behavior) + a warning diagnostic.
+ * Output is single-pass — preserved literals are never re-scanned.
  */
 
 export interface ShellInjectionOptions {
@@ -34,7 +36,8 @@ export interface ShellInjectionOptions {
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 
-type Part = string | { cmd: string };
+/** `original` is the exact literal source text, restored verbatim on failure. */
+type Part = string | { cmd: string; original: string };
 
 /** Scan a single line (outside fenced blocks) for inline !`cmd`, skipping code spans. */
 function scanInlineLine(line: string, parts: Part[]): void {
@@ -47,7 +50,7 @@ function scanInlineLine(line: string, parts: Part[]): void {
       const close = line.indexOf("`", i + 2);
       if (close !== -1) {
         if (i > textStart) parts.push(line.slice(textStart, i));
-        parts.push({ cmd: line.slice(i + 2, close) });
+        parts.push({ cmd: line.slice(i + 2, close), original: line.slice(i, close + 1) });
         i = close + 1;
         textStart = i;
         continue;
@@ -110,7 +113,7 @@ function parseBody(body: string): Part[] {
         const inner = lines.slice(i + 1, close === -1 ? lines.length : close);
         const extra = info.slice(1).trim(); // tolerate ```!cmd on the fence line
         const script = (extra ? extra + "\n" : "") + inner.join("\n");
-        parts.push({ cmd: script });
+        parts.push({ cmd: script, original: lines.slice(i, end + 1).join("\n") });
         if (end < lines.length - 1) parts.push("\n");
       } else {
         // Ordinary fenced block: verbatim, no inline scanning inside.
@@ -340,10 +343,12 @@ export async function preprocessShellInjection(
         : firstLine(result.stderr) ||
           (result.spawnError ? firstLine(result.spawnError) : "") ||
           (result.timedOut ? `timed out after ${opts.timeoutMs ?? DEFAULT_TIMEOUT_MS}ms` : "no stderr output");
-    out.push(`[command failed (exit ${codeStr}): ${note}]`);
+    // Claude behavior (audit A5): a failed/timed-out command leaves the literal
+    // placeholder text in place. Single-pass output — it is never re-scanned.
+    out.push(part.original);
     diagnostics.push({
       severity: "warning",
-      message: `Shell injection command failed (exit ${codeStr}): ${shown} — ${note}`,
+      message: `Shell injection command failed (exit ${codeStr}): ${shown} — ${note}; literal text preserved`,
     });
   }
   return { text: out.join(""), diagnostics };

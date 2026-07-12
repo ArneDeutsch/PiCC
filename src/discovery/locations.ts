@@ -36,8 +36,9 @@ function samePath(a: string, b: string): boolean {
 /**
  * Default managed/policy artifact base directories (research doc §4.1). Mirrors
  * the managed settings locations in settings.ts; degrade-silent when absent.
+ * Also the base for the managed CLAUDE.md (audit B3, claude-md.ts).
  */
-function defaultManagedDirs(): string[] {
+export function defaultManagedDirs(): string[] {
   if (process.platform === "win32") {
     return [path.join("C:\\", "ProgramData", "ClaudeCode")];
   }
@@ -47,12 +48,17 @@ function defaultManagedDirs(): string[] {
 /**
  * Discover every artifact-contributing directory for a session.
  *
- * Managed/policy directories come FIRST (highest precedence, per
- * SCOPE_PRECEDENCE; degrade-safe when absent). Monorepo walk-up: from `cwd` up
- * to `projectRoot`, every `.claude/` directory contributes; results are ordered
- * NEAREST-FIRST so callers can apply "nearest definition wins" via
- * {@link dedupeByName}. User-scope directories (`<userDir>/skills` etc.) come
- * last. Only existing directories are returned.
+ * Named artifacts (skills/agents/commands): managed/policy directories come
+ * FIRST (highest precedence, per SCOPE_PRECEDENCE; degrade-safe when absent).
+ * Monorepo walk-up: from `cwd` up to `projectRoot`, every `.claude/` directory
+ * contributes; results are ordered NEAREST-FIRST so callers can apply "nearest
+ * definition wins" via {@link dedupeByName}. User-scope directories
+ * (`<userDir>/skills` etc.) come last. Only existing directories are returned.
+ *
+ * Rules are guidance text, not name-deduped artifacts, so `ruleDirs` is ordered
+ * by ASCENDING priority instead (audit B6): user first (lowest — appears
+ * furthest from the end of the prompt), then project root→cwd, then managed
+ * LAST so managed text lands closest and wins on conflicts.
  */
 export function discoverArtifactDirs(opts: {
   cwd: string;
@@ -63,28 +69,32 @@ export function discoverArtifactDirs(opts: {
 }): ArtifactDirs {
   const result: ArtifactDirs = { skillDirs: [], agentDirs: [], ruleDirs: [], commandDirs: [] };
 
+  const addIf = (bucket: SourceDirs[], baseDir: string, sub: string, scope: Scope): void => {
+    const dir = path.join(baseDir, sub);
+    if (isDirectory(dir)) bucket.push({ dir, scope });
+  };
   const push = (baseDir: string, scope: Scope): void => {
-    const add = (bucket: SourceDirs[], sub: string): void => {
-      const dir = path.join(baseDir, sub);
-      if (isDirectory(dir)) bucket.push({ dir, scope });
-    };
-    add(result.skillDirs, "skills");
-    add(result.agentDirs, "agents");
-    add(result.ruleDirs, "rules");
-    add(result.commandDirs, "commands");
+    addIf(result.skillDirs, baseDir, "skills", scope);
+    addIf(result.agentDirs, baseDir, "agents", scope);
+    addIf(result.commandDirs, baseDir, "commands", scope);
   };
 
+  const managedBases = (opts.managedDirs ?? defaultManagedDirs()).map((b) => path.resolve(b));
+  const userBase = path.resolve(opts.userDir);
+
   // Managed/policy scope: highest precedence, absent on most machines.
-  for (const base of opts.managedDirs ?? defaultManagedDirs()) {
-    push(path.resolve(base), "managed");
-  }
+  for (const base of managedBases) push(base, "managed");
 
   // Project scope: walk cwd → projectRoot (inclusive), nearest first.
+  const projectClaudeDirs: string[] = [];
   const root = path.resolve(opts.projectRoot);
   let dir = path.resolve(opts.cwd);
   for (;;) {
     const claudeDir = path.join(dir, ".claude");
-    if (isDirectory(claudeDir)) push(claudeDir, "project");
+    if (isDirectory(claudeDir)) {
+      push(claudeDir, "project");
+      projectClaudeDirs.push(claudeDir);
+    }
     if (samePath(dir, root)) break;
     const parent = path.dirname(dir);
     if (parent === dir) break; // reached filesystem root without meeting projectRoot
@@ -92,7 +102,14 @@ export function discoverArtifactDirs(opts: {
   }
 
   // User scope, lowest precedence of the discovered set.
-  push(path.resolve(opts.userDir), "user");
+  push(userBase, "user");
+
+  // Rules: ascending priority — user, project root→cwd, managed last (B6).
+  addIf(result.ruleDirs, userBase, "rules", "user");
+  for (let i = projectClaudeDirs.length - 1; i >= 0; i--) {
+    addIf(result.ruleDirs, projectClaudeDirs[i]!, "rules", "project");
+  }
+  for (const base of managedBases) addIf(result.ruleDirs, base, "rules", "managed");
 
   return result;
 }

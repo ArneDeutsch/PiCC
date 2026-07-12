@@ -1,12 +1,22 @@
 import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
-import type { ClaudeAgent, Diagnostic } from "../types.js";
+import type {
+  ClaudeAgent,
+  Diagnostic,
+  HookConfig,
+  HookOutcome,
+  HookPayload,
+  ToolCallDescriptor,
+} from "../types.js";
 import type { HookRunner } from "../engine/hook-runner.js";
 import { PermissionEngine } from "../engine/permissions.js";
+import { builtinAgents, resolveAgent } from "../claude/agents.js";
+import { parseHookConfig } from "../claude/hooks.js";
 import { claudeToolsToPiBuiltins } from "./tool-map.js";
 import { createGuardExtension } from "./guard.js";
 import { CwdState } from "./cwd-state.js";
 import { findByName } from "../project.js";
+import type { BackgroundTaskRegistry } from "./background-tasks.js";
 
 /**
  * Subagent dispatch runtime (plan §4.3): spawns fresh-context Pi sessions per dispatch,
@@ -58,6 +68,12 @@ export interface SubagentRuntimeDeps {
   /** Resolve "provider/model" (or undefined) to a Pi Model object, or undefined to inherit. */
   resolveModel: (spec: string | undefined) => unknown | undefined;
   mapEffort: (effort: string | undefined) => string | undefined;
+  /**
+   * Builds a per-dispatch HookRunner for an agent's frontmatter `hooks:`
+   * (audit C10) — same deps as the session's main runner. The scoped runner
+   * fires only for that subagent's dispatch and is discarded when it ends.
+   */
+  makeScopedHookRunner?: (config: HookConfig) => HookRunner;
   worktrees?: WorktreeManagerLike;
   maxDepth: number;
   concurrency: number;
@@ -80,6 +96,8 @@ interface PiSession {
   messages: Array<{ role: string; content: unknown }>;
   dispose(): void;
   setThinkingLevel?(level: string): void;
+  /** Cooperative abort (real Pi sessions expose it; TaskStop uses it best-effort). */
+  abort?(): Promise<void> | void;
 }
 
 export interface DispatchResult {
@@ -134,6 +152,57 @@ class Semaphore {
   }
 }
 
+/** Truthy env-flag semantics: set and not an explicit "off" value. */
+function isEnvTruthy(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const v = value.trim().toLowerCase();
+  return v !== "" && v !== "0" && v !== "false" && v !== "no" && v !== "off";
+}
+
+/** Merge hook outcomes: any block wins (first reason), context/diagnostics accumulate. */
+function mergeHookOutcomes(outcomes: Array<HookOutcome | undefined>): HookOutcome {
+  const merged: HookOutcome = { block: false, askDowngraded: false, diagnostics: [] };
+  for (const o of outcomes) {
+    if (!o) continue;
+    if (o.block && !merged.block) {
+      merged.block = true;
+      merged.blockReason = o.blockReason;
+    }
+    merged.askDowngraded = merged.askDowngraded || o.askDowngraded;
+    if (o.additionalContext) {
+      merged.additionalContext = merged.additionalContext
+        ? `${merged.additionalContext}\n${o.additionalContext}`
+        : o.additionalContext;
+    }
+    if (o.updatedInput) merged.updatedInput = { ...merged.updatedInput, ...o.updatedInput };
+    if (o.stdout) merged.stdout = merged.stdout ? `${merged.stdout}\n${o.stdout}` : o.stdout;
+    if (o.systemMessages?.length) {
+      merged.systemMessages = [...(merged.systemMessages ?? []), ...o.systemMessages];
+    }
+    merged.diagnostics.push(...o.diagnostics);
+  }
+  return merged;
+}
+
+/**
+ * HookRunner-shaped facade multiplexing the session runner with an agent's
+ * scoped runner (audit C10) — same pattern as index.ts's HookMultiplexer,
+ * but per-dispatch and discarded with it.
+ */
+function multiplexHookRunners(base: HookRunner, scoped: HookRunner): HookRunner {
+  return {
+    fire: async (
+      eventName: string,
+      payload: Partial<HookPayload>,
+      toolCall?: ToolCallDescriptor,
+    ): Promise<HookOutcome> =>
+      mergeHookOutcomes([
+        await base.fire(eventName, payload, toolCall),
+        await scoped.fire(eventName, payload, toolCall),
+      ]),
+  } as unknown as HookRunner;
+}
+
 export function extractText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -171,15 +240,37 @@ export class SubagentRuntime {
      * used for the synthetic general-purpose target of agent-less context:fork skills.
      */
     agentOverride?: ClaudeAgent;
+    /** Cooperative abort (TaskStop, audit E4): best-effort session.abort() when signaled. */
+    abortSignal?: AbortSignal;
   }): Promise<DispatchResult> {
     const diagnostics: Diagnostic[] = [];
     const agents = this.deps.getAgents();
-    const agent =
+    // Built-ins resolve AFTER project/user/plugin agents (audit E1): a project
+    // agent named Explore overrides the built-in. Empty/omitted subagent_type
+    // defaults to general-purpose (audit E2).
+    const builtins = builtinAgents();
+    const requested = opts.subagentType.trim() || "general-purpose";
+    const resolved =
       opts.agentOverride ??
-      findByName(agents, opts.subagentType) ??
-      agents.find((a) => a.name.toLowerCase() === opts.subagentType.toLowerCase());
+      findByName(agents, requested) ??
+      agents.find((a) => a.name.toLowerCase() === requested.toLowerCase()) ??
+      resolveAgent(builtins, requested);
+    // Claude fallback (review H1): an unknown subagent_type runs as
+    // general-purpose instead of hard-erroring — with a VISIBLE degrade in
+    // both the diagnostics and the subagent's own prompt.
+    const agent = resolved ?? resolveAgent(builtins, "general-purpose");
+    let prompt = opts.prompt;
+    if (!resolved && agent) {
+      diagnostics.push({
+        severity: "warning",
+        message: `unknown subagent_type "${requested}"; ran as general-purpose`,
+      });
+      prompt = `(You were dispatched as subagent type "${requested}", which is not defined in this project; you are running as a general-purpose agent.)\n\n${opts.prompt}`;
+    }
     if (!agent) {
-      const known = agents.map((a) => a.name).join(", ");
+      // Genuinely unusable (general-purpose itself unavailable): keep the
+      // catalog-listing error so the model can pick a real agent.
+      const known = [...agents, ...builtins].map((a) => a.name).join(", ");
       return {
         ok: false,
         finalMessage: "",
@@ -196,6 +287,75 @@ export class SubagentRuntime {
         diagnostics,
       };
     }
+    if (opts.abortSignal?.aborted) {
+      return {
+        ok: false,
+        finalMessage: "",
+        agentName: agent.name,
+        error: `Subagent "${agent.name}" was stopped before it started.`,
+        diagnostics,
+      };
+    }
+
+    // Agent-scoped hooks (audit C10): frontmatter `hooks:` dispatch while THIS
+    // subagent runs. The scoped runner is multiplexed with the session runner
+    // for the dispatch's guard and Subagent* events and discarded when it ends.
+    let scopedHooks: HookRunner | undefined;
+    if (
+      this.deps.makeScopedHookRunner &&
+      agent.hooks &&
+      Object.values(agent.hooks).some((entries) => entries?.length)
+    ) {
+      const parsed = parseHookConfig(agent.hooks, agent.source.path);
+      diagnostics.push(...parsed.diagnostics);
+      if (Object.keys(parsed.config).length > 0) {
+        scopedHooks = this.deps.makeScopedHookRunner(parsed.config);
+        diagnostics.push({
+          severity: "info",
+          message: `agent-scoped hooks active for "${agent.name}" (${Object.keys(parsed.config).join(", ")})`,
+        });
+      }
+    }
+    if (scopedHooks) {
+      // Agent-hook `systemMessage`s are user-facing (review H4): surface each
+      // distinct message through the dispatch diagnostics (the same channel the
+      // Agent tool result / console reports).
+      const inner = scopedHooks;
+      const seenSystemMessages = new Set<string>();
+      scopedHooks = {
+        fire: async (
+          eventName: string,
+          payload: Partial<HookPayload>,
+          toolCall?: ToolCallDescriptor,
+        ): Promise<HookOutcome> => {
+          const outcome = await inner.fire(eventName, payload, toolCall);
+          for (const msg of outcome?.systemMessages ?? []) {
+            if (seenSystemMessages.has(msg)) continue;
+            seenSystemMessages.add(msg);
+            diagnostics.push({
+              severity: "info",
+              message: `agent hook systemMessage: ${msg}`,
+            });
+          }
+          return outcome;
+        },
+      } as unknown as HookRunner;
+    }
+    const hookRunner = scopedHooks
+      ? multiplexHookRunners(this.deps.hookRunner, scopedHooks)
+      : this.deps.hookRunner;
+    // Agent frontmatter `Stop` hooks map to SubagentStop time for this dispatch.
+    const fireSubagentStop = async (
+      payload: Partial<HookPayload>,
+    ): Promise<HookOutcome | undefined> => {
+      const outcomes: Array<HookOutcome | undefined> = [
+        await hookRunner.fire("SubagentStop", payload).catch(() => undefined),
+      ];
+      if (scopedHooks) {
+        outcomes.push(await scopedHooks.fire("Stop", payload).catch(() => undefined));
+      }
+      return mergeHookOutcomes(outcomes);
+    };
 
     // Only root-level dispatches count against the concurrency cap. An ancestor
     // holds its slot while awaiting its descendants, so counting nested dispatches
@@ -206,11 +366,29 @@ export class SubagentRuntime {
     let session: PiSession | undefined;
     let started = false;
     let stopFired = false;
+    let abortListener: (() => void) | undefined;
     try {
-      const startOutcome = await this.deps.hookRunner
+      if (opts.abortSignal?.aborted) {
+        // Re-check after the semaphore wait (review H3): a TaskStop issued while
+        // the dispatch was queued must not burn a full session. Informational
+        // SubagentStop matches the error-path pattern; finally releases the slot.
+        stopFired = true;
+        await fireSubagentStop({
+          subagent_type: agent.name,
+          cwd: this.deps.getCwd(),
+        }).catch(() => undefined);
+        return {
+          ok: false,
+          finalMessage: "",
+          agentName: agent.name,
+          error: `Subagent "${agent.name}" was stopped before it started.`,
+          diagnostics,
+        };
+      }
+      const startOutcome = await hookRunner
         .fire("SubagentStart", {
           subagent_type: agent.name,
-          prompt: opts.prompt,
+          prompt,
           cwd: this.deps.getCwd(),
         })
         .catch(() => undefined);
@@ -243,6 +421,23 @@ export class SubagentRuntime {
           });
         }
       }
+      if (opts.abortSignal?.aborted) {
+        // Re-check after worktree entry (review H3): a stop during enter() must
+        // not spin up the session. The finally keep-exits the worktree.
+        stopFired = true;
+        await fireSubagentStop({
+          subagent_type: agent.name,
+          cwd: this.deps.getCwd(),
+        }).catch(() => undefined);
+        return {
+          ok: false,
+          finalMessage: "",
+          agentName: agent.name,
+          worktreePath,
+          error: `Subagent "${agent.name}" was stopped before it started.`,
+          diagnostics,
+        };
+      }
       // Dispatch-local cwd state: the subagent's tools (and its own EnterWorktree
       // use) must never swap the ORCHESTRATOR's cwd.
       const subCwd = new CwdState(cwd);
@@ -261,7 +456,10 @@ export class SubagentRuntime {
         : this.deps.contextForTouchedFile;
       const guard = createGuardExtension({
         engine: this.deps.permissionEngine,
-        hooks: this.deps.hookRunner,
+        // Multiplexed runner (C10): the agent's scoped PreToolUse/PostToolUse/
+        // PostToolUseFailure hooks fire alongside the session hooks — for this
+        // dispatch's tool calls only.
+        hooks: hookRunner,
         getCwd: () => subCwd.get(),
         contextForTouchedFile: injector,
         label: `subagent:${agent.name}`,
@@ -286,7 +484,13 @@ export class SubagentRuntime {
       });
       await loader.reload();
 
-      const modelSpec = opts.model ?? agent.model;
+      // Model resolution order (audit E5): CLAUDE_CODE_SUBAGENT_MODEL env beats
+      // the per-invocation `model` param, which beats agent frontmatter `model:`,
+      // which beats the session model. "inherit"/empty env value = unset.
+      const envModelRaw = process.env.CLAUDE_CODE_SUBAGENT_MODEL?.trim();
+      const envModel =
+        envModelRaw && envModelRaw.toLowerCase() !== "inherit" ? envModelRaw : undefined;
+      const modelSpec = envModel ?? opts.model ?? agent.model;
       let model = this.deps.resolveModel(modelSpec);
       if (modelSpec && model === undefined) {
         // Visible degrade (§2.2): inherit the session model rather than silently
@@ -318,17 +522,33 @@ export class SubagentRuntime {
       session = created.session;
       if (thinking && session.setThinkingLevel) session.setThinkingLevel(thinking);
 
+      // Cooperative stop (audit E4): a TaskStop-triggered signal aborts the
+      // live session best-effort (real Pi sessions expose abort()).
+      if (opts.abortSignal) {
+        const live = session;
+        abortListener = () => {
+          try {
+            void live.abort?.();
+          } catch {
+            // best-effort — an abort failure must not corrupt the dispatch
+          }
+        };
+        if (opts.abortSignal.aborted) abortListener();
+        else opts.abortSignal.addEventListener("abort", abortListener, { once: true });
+      }
+
       this.deps.log?.(`dispatch ${agent.name} (depth ${opts.depth})`);
       const fullPrompt = agent.initialPrompt
-        ? `${agent.initialPrompt}\n\n${opts.prompt}`
-        : opts.prompt;
+        ? `${agent.initialPrompt}\n\n${prompt}`
+        : prompt;
       await session.prompt(fullPrompt);
 
       // Verbatim final assistant message (hard contract — no wrapping/summarizing).
       let finalMessage = lastAssistantText(session);
 
-      // One-retry-on-empty convention (plan §4.3): a single re-prompt when nothing came back.
-      if (!finalMessage.trim()) {
+      // One-retry-on-empty convention (plan §4.3): a single re-prompt when nothing
+      // came back — skipped for aborted dispatches (their result is discarded anyway).
+      if (!finalMessage.trim() && !opts.abortSignal?.aborted) {
         await session.prompt(
           "Your previous reply was empty. Reply now with your final answer in the requested format.",
         );
@@ -340,15 +560,14 @@ export class SubagentRuntime {
       // a blocking hook re-prompts the subagent with its reason, bounded like the
       // main-session Stop loop.
       for (let iteration = 0; ; iteration++) {
-        const stopOutcome = await this.deps.hookRunner
-          .fire("SubagentStop", {
-            subagent_type: agent.name,
-            cwd: subCwd.get(),
-            stop_hook_active: iteration > 0,
-          })
-          .catch(() => undefined);
+        const stopOutcome = await fireSubagentStop({
+          subagent_type: agent.name,
+          cwd: subCwd.get(),
+          stop_hook_active: iteration > 0,
+        });
         stopFired = true;
         if (!stopOutcome?.block) break;
+        if (opts.abortSignal?.aborted) break;
         if (iteration >= 3) {
           diagnostics.push({
             severity: "warning",
@@ -373,6 +592,13 @@ export class SubagentRuntime {
         diagnostics,
       };
     } finally {
+      if (abortListener && opts.abortSignal) {
+        try {
+          opts.abortSignal.removeEventListener("abort", abortListener);
+        } catch {
+          // floor
+        }
+      }
       try {
         session?.dispose();
       } catch {
@@ -384,12 +610,10 @@ export class SubagentRuntime {
       }
       if (started && !stopFired) {
         // Error paths still fire SubagentStop once (informational; block is moot here).
-        await this.deps.hookRunner
-          .fire("SubagentStop", {
-            subagent_type: agent.name,
-            cwd: this.deps.getCwd(),
-          })
-          .catch(() => undefined);
+        await fireSubagentStop({
+          subagent_type: agent.name,
+          cwd: this.deps.getCwd(),
+        }).catch(() => undefined);
       }
       release();
     }
@@ -434,13 +658,13 @@ function createMaxTurnsExtension(maxTurns: number, diagnostics: Diagnostic[]) {
 /** The `Agent` dispatch tool definition (Claude-compatible; also registered as `Task`). */
 export function createAgentToolDefinition(
   runtime: SubagentRuntime,
-  opts: { depth: number; name?: string },
+  opts: { depth: number; name?: string; backgroundTasks?: BackgroundTaskRegistry },
 ): Record<string, unknown> {
   return {
     name: opts.name ?? "Agent",
     label: "Agent",
     description:
-      "Launch a subagent to handle a task. Pick subagent_type from the 'Available subagents' catalog by matching the task to the agent descriptions. Returns the subagent's final message verbatim.",
+      "Launch a subagent to handle a task. Pick subagent_type from the 'Available subagents' catalog by matching the task to the agent descriptions (omit it for a general-purpose agent). Returns the subagent's final message verbatim.",
     parameters: Type.Object({
       subagent_type: Type.String({ description: "Name of the agent to dispatch" }),
       prompt: Type.String({ description: "The task for the subagent" }),
@@ -448,17 +672,44 @@ export function createAgentToolDefinition(
         Type.String({ description: "Model override as provider/model (rarely needed)" }),
       ),
       run_in_background: Type.Optional(
-        Type.Boolean({ description: "Accepted for compatibility; runs foreground in v1" }),
+        Type.Boolean({
+          description:
+            "Run the dispatch in the background; returns a task id immediately — retrieve the result with TaskOutput",
+        }),
       ),
       description: Type.Optional(Type.String({ description: "Short task label (ignored)" })),
     }),
     async execute(_toolCallId: string, params: Record<string, unknown>) {
-      const result = await runtime.dispatch({
-        subagentType: String(params.subagent_type ?? ""),
+      const subagentType = String(params.subagent_type ?? "");
+      const dispatchOpts = {
+        subagentType,
         prompt: String(params.prompt ?? ""),
         model: params.model ? String(params.model) : undefined,
         depth: opts.depth + 1,
-      });
+      };
+      const backgroundDisabled = isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS);
+      if (params.run_in_background === true && !backgroundDisabled && opts.backgroundTasks) {
+        // Real background execution (audit E4): the un-awaited dispatch still
+        // takes its concurrency slot and fires SubagentStart/Stop hooks; the
+        // registry owns its settlement (never an unhandled rejection).
+        const controller = new AbortController();
+        const label = subagentType.trim() || "general-purpose";
+        const id = opts.backgroundTasks.start(
+          `agent:${label}`,
+          runtime.dispatch({ ...dispatchOpts, abortSignal: controller.signal }),
+          () => controller.abort(),
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Background task ${id} started (agent: ${label}). Use TaskOutput with task_id "${id}" to retrieve the result.`,
+            },
+          ],
+          details: { background: true, taskId: id, agent: label },
+        };
+      }
+      const result = await runtime.dispatch(dispatchOpts);
       if (!result.ok) {
         throw new Error(result.error ?? "subagent failed");
       }
@@ -471,7 +722,11 @@ export function createAgentToolDefinition(
           worktreePath: result.worktreePath,
           diagnostics: result.diagnostics,
           ...(params.run_in_background
-            ? { note: "run_in_background is not supported in PiCC v1; ran in foreground" }
+            ? {
+                note: backgroundDisabled
+                  ? "background tasks are disabled (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS); run_in_background ran in foreground"
+                  : "run_in_background requested but no background task registry is wired; ran in foreground",
+              }
             : {}),
         },
       };

@@ -72,7 +72,8 @@ genuine agent loop, tool dispatch, streaming, and print mode — not just agains
 scenarios cover: full context assembly into the system prompt (with the skill body staying
 lazy-loaded), a scripted `write` tool call round-tripping its result plus a PreToolUse warn hook's
 `additionalContext`, a `Read(.env)` deny rule enforced live with the secret never reaching the model,
-`Skill` activation with `$1` substitution, and a real `EnterWorktree` creating a linked git worktree.
+`Skill` activation with `$0` substitution (0-based positionals), and a real `EnterWorktree` creating
+a linked git worktree.
 
 ### Adding a new e2e scenario
 

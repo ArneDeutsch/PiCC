@@ -9,8 +9,8 @@ argument-hint: "<name>"
 
 The skill body canary is: GREET-SKILL-BODY
 
-Greet the person named **$1** (full arguments were: $ARGUMENTS).
+Greet the person named **$0** (full arguments were: $ARGUMENTS).
 
 Steps:
-1. Say hello to $1 in one friendly sentence.
-2. Append the line `greeted: $1` to `greetings.log` in the project root.
+1. Say hello to $0 in one friendly sentence.
+2. Append the line `greeted: $0` to `greetings.log` in the project root.

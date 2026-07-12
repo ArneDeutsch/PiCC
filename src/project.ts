@@ -7,6 +7,7 @@ import { loadSkills } from "./claude/skills.js";
 import { loadAgents } from "./claude/agents.js";
 import { loadRules } from "./claude/rules.js";
 import { loadClaudeMdHierarchy } from "./claude/claude-md.js";
+import { loadAutoMemory, type MemorySnapshot } from "./claude/memory.js";
 import { parseHookConfig, mergeHookConfigs } from "./claude/hooks.js";
 import {
   discoverInstalledPlugins,
@@ -25,6 +26,8 @@ export interface LoadedProject extends ClaudeProject {
   mergedHooks: HookConfig;
   plugins: InstalledPlugin[];
   pluginRoots: Record<string, string>;
+  /** Auto memory (audit B4): dir + truncated MEMORY.md; undefined when disabled. */
+  autoMemory?: MemorySnapshot;
 }
 
 export function loadClaudeProject(opts: {
@@ -108,14 +111,19 @@ export function loadClaudeProject(opts: {
   });
   diagnostics.push(...rulesResult.diagnostics);
 
-  // CLAUDE.md hierarchy.
+  // CLAUDE.md hierarchy (managed CLAUDE.md + inline managed `claudeMd` first — B3).
   const claudeMdResult = loadClaudeMdHierarchy({
     cwd,
     projectRoot: root,
     userDir,
     excludes: settings.claudeMdExcludes,
+    managedDirs: opts.managedArtifactDirs,
+    managedInline: settings.managedClaudeMd,
   });
   diagnostics.push(...claudeMdResult.diagnostics);
+
+  // Auto memory, read side (B4): undefined when disabled by setting or env.
+  const autoMemory = loadAutoMemory(root, userDir, settings);
 
   // Hooks: settings hooks + plugin hooks.
   const hookConfigs: HookConfig[] = [settings.hooks];
@@ -142,6 +150,7 @@ export function loadClaudeProject(opts: {
     mergedHooks: mergeHookConfigs(...hookConfigs),
     plugins,
     pluginRoots,
+    autoMemory,
   };
 }
 

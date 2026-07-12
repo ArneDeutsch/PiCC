@@ -8,7 +8,7 @@ What it exercises:
 | Artifact | File | Behavior to observe |
 |---|---|---|
 | CLAUDE.md + `@import` | `CLAUDE.md` → `AGENTS.md` | Both canary words reach the model context |
-| Skill + slash command | `.claude/skills/greet/` | `/greet Ada` substitutes `$1`/`$ARGUMENTS`; body lazy-loads |
+| Skill + slash command | `.claude/skills/greet/` | `/greet Ada` substitutes `$0`/`$ARGUMENTS`; body lazy-loads |
 | Legacy command | `.claude/commands/status.md` | `/status` works |
 | Subagent | `.claude/agents/reviewer.md` | `reviewer` is dispatchable, read-only (tools gated) |
 | Rules | `.claude/rules/style.md` | Loaded at session start |

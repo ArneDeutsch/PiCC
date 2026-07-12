@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import { startMockModel, type CapturedRequest, type Turn } from "./helpers/mock-openai.js";
+import { flattenProjectPath } from "../src/claude/memory.js";
+import { resolveShellBinary } from "../src/engine/shell-inject.js";
 
 /**
  * Live end-to-end tests: the REAL Pi CLI (dist/cli.js) runs the assembled
@@ -188,9 +190,14 @@ function toolNames(request: CapturedRequest): string[] {
     .filter((n): n is string => typeof n === "string");
 }
 
-/** Detect a usable `bash` (Git Bash on Windows), skip cleanly if absent. */
+/**
+ * Detect a usable `bash`, skip cleanly if absent. Uses the extension's OWN
+ * Git Bash resolution (resolveShellBinary skips the System32 WSL stub and
+ * also finds per-user Git installs under LOCALAPPDATA), so the tests probe
+ * exactly the binary the extension will spawn.
+ */
 const BASH_AVAILABLE = (() => {
-  for (const cand of ["bash", "C:\\Program Files\\Git\\bin\\bash.exe"]) {
+  for (const cand of [resolveShellBinary("bash"), "C:\\Program Files\\Git\\bin\\bash.exe"]) {
     try {
       execFileSync(cand, ["--version"], { stdio: "ignore" });
       return true;
@@ -313,7 +320,7 @@ describe.skipIf(cliMissing)(
     );
 
     it(
-      "activates the greet skill via the Skill tool with $1 substitution",
+      "activates the greet skill via the Skill tool with $0 substitution",
       async () => {
         const result = await runPi({
           script: [
@@ -589,6 +596,237 @@ describe.skipIf(cliMissing)(
         const system = systemText(result.requests[0]!);
         expect(system).toContain("Available subagents");
         expect(system).toContain("tricky-agent");
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario 10 (E2E-1): built-in agent types on a project that defines NO agents ---
+    it(
+      "advertises the built-in agents and dispatches Explore without project CLAUDE.md context",
+      async () => {
+        const result = await runPi({
+          // hello-claude defines no .claude/agents — the catalog is built-ins only.
+          script: [
+            // 0) orchestrator dispatches the built-in Explore agent
+            {
+              toolCalls: [
+                { name: "Agent", args: { subagent_type: "Explore", prompt: "find the hello script" } },
+              ],
+            },
+            // 1) the Explore subagent's OWN session answers (foreground dispatch is sequential)
+            { text: "EXPLORE-FINDING-CANARY: src/hello.js prints the greeting" },
+            // 2) orchestrator's follow-up once the subagent result is in
+            { text: "explored" },
+          ],
+          prompt: "explore the project",
+        });
+
+        expect(result.code).toBe(0);
+        const first = result.requests[0]!;
+        expect(toolNames(first)).toContain("Agent");
+        const parentSystem = systemText(first);
+        expect(parentSystem).toContain("Available subagents");
+        // Built-in agent types (audit E1) are in the catalog even with no project agents.
+        expect(parentSystem).toContain("- general-purpose: ");
+        expect(parentSystem).toContain("- Explore: ");
+        expect(parentSystem).toContain("- Plan: ");
+        // The PARENT sees the project CLAUDE.md.
+        expect(parentSystem).toContain("ROOT-CLAUDE-MD-LOADED");
+
+        // The Explore subagent hit the same mock with its own conversation:
+        // identified by its read-only persona in the system prompt.
+        expect(result.requests.length).toBeGreaterThanOrEqual(3);
+        const subRequests = result.requests.filter((r) =>
+          systemText(r).includes("read-only exploration agent"),
+        );
+        expect(subRequests.length, "expected the Explore subagent session to hit the mock").toBeGreaterThanOrEqual(1);
+        // Explore skips project context (audit E6): no CLAUDE.md in ITS system text.
+        for (const [i, sub] of subRequests.entries()) {
+          expect(
+            systemText(sub),
+            `Explore subagent request ${i} must not carry the project CLAUDE.md`,
+          ).not.toContain("ROOT-CLAUDE-MD-LOADED");
+        }
+
+        // Verbatim-return contract: the subagent's final answer lands in a parent tool result.
+        const verbatim = result.requests.some((r) =>
+          toolResultText(r).includes("EXPLORE-FINDING-CANARY: src/hello.js prints the greeting"),
+        );
+        expect(verbatim, "subagent answer must reach the parent verbatim").toBe(true);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario 11 (E2E-2): run_in_background + TaskOutput retrieval (audit E4) ---
+    it(
+      "runs a background subagent and retrieves its verbatim result via TaskOutput",
+      async () => {
+        // The background dispatch's session and the parent's next turn hit the
+        // mock CONCURRENTLY (order nondeterministic), so the subagent/parent
+        // turns are pinned with `when` predicates instead of sequence position.
+        // Explore is used because its persona is trivially detectable.
+        const isExplore = (r: CapturedRequest) =>
+          systemText(r).includes("read-only exploration agent");
+        const isParent = (r: CapturedRequest) => !isExplore(r);
+        const result = await runPi({
+          script: [
+            // 0) parent starts the background task (first request is always the parent)
+            {
+              toolCalls: [
+                {
+                  name: "Agent",
+                  args: {
+                    subagent_type: "Explore",
+                    prompt: "look around",
+                    run_in_background: true,
+                  },
+                },
+              ],
+            },
+            // background subagent's single immediate final answer
+            { when: isExplore, text: "BG-TASK-ANSWER-E2E" },
+            // parent's next turn: retrieve the result (first background task id is task-1)
+            { when: isParent, toolCalls: [{ name: "TaskOutput", args: { task_id: "task-1" } }] },
+            // parent's final turn
+            { when: isParent, text: "background retrieved" },
+          ],
+          prompt: "explore in the background",
+        });
+
+        expect(result.code).toBe(0);
+        // The Agent call returned immediately with a task id.
+        const startResult = result.requests.find((r) =>
+          /Background task task-\d+ started/.test(toolResultText(r)),
+        );
+        expect(startResult, "expected the immediate background-start tool result").toBeDefined();
+        // TaskOutput returned the subagent's final message verbatim as its tool result.
+        const retrieved = result.requests.some((r) =>
+          toolResultText(r).includes("BG-TASK-ANSWER-E2E"),
+        );
+        expect(retrieved, "TaskOutput must return the background result verbatim").toBe(true);
+        expect(result.stdout).toContain("background retrieved");
+        // No crash noise from the un-awaited dispatch (completeness floor).
+        expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|unhandledRejection|FATAL/i);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario 12 (E2E-3): auto memory (audit B4) loads MEMORY.md into the system prompt ---
+    it(
+      "loads per-project auto memory (MEMORY.md) from the Claude user dir into the system prompt",
+      async () => {
+        const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-memory-user-"));
+        tempDirs.push(userDir);
+        const memoryLine =
+          "AUTO-MEMORY-CANARY-E2E: the flux capacitor lives in src/flux.js";
+        const result = await runPi({
+          script: [{ text: "hello" }],
+          prompt: "say hello",
+          extraEnv: { PICC_CLAUDE_USER_DIR: userDir },
+          setup: (fixtureDir) => {
+            // Same flattening rule as the extension (src/claude/memory.ts):
+            // <userDir>/projects/<flattened-project-path>/memory/MEMORY.md
+            const memDir = path.join(
+              userDir,
+              "projects",
+              flattenProjectPath(fixtureDir),
+              "memory",
+            );
+            fs.mkdirSync(memDir, { recursive: true });
+            fs.writeFileSync(
+              path.join(memDir, "MEMORY.md"),
+              `# Memory index\n\n- ${memoryLine}\n`,
+            );
+          },
+        });
+
+        expect(result.code).toBe(0);
+        const system = systemText(result.requests[0]!);
+        expect(system).toContain("# Auto memory");
+        expect(system).toContain(memoryLine);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario 13 (E2E-4): subagent with isolation: worktree writes only in ITS worktree ---
+    it.skipIf(!BASH_AVAILABLE)(
+      "dispatches the iso-writer agent into its own worktree and keeps the main tree clean",
+      async () => {
+        const result = await runPi({
+          fixture: "full-surface",
+          script: [
+            // 0) orchestrator dispatches the worktree-isolated agent
+            {
+              toolCalls: [
+                {
+                  name: "Agent",
+                  args: { subagent_type: "iso-writer", prompt: "create out.txt with the canary" },
+                },
+              ],
+            },
+            // 1) the subagent (own session, cwd = its worktree) writes the file
+            { toolCalls: [{ name: "write", args: { path: "out.txt", content: "ISO-WT-CONTENT" } }] },
+            // 2) the subagent's final answer
+            { text: "DONE-ISO" },
+            // 3) orchestrator's follow-up
+            { text: "isolation verified" },
+          ],
+          prompt: "have iso-writer create out.txt",
+        });
+
+        expect(result.code).toBe(0);
+        // The file exists inside the agent's worktree...
+        const worktreesRoot = path.join(result.fixture, ".claude", "worktrees");
+        const isoDirs = fs.existsSync(worktreesRoot)
+          ? fs.readdirSync(worktreesRoot).filter((n) => n.startsWith("agent-iso-writer-"))
+          : [];
+        expect(isoDirs.length, `expected an agent-iso-writer-* worktree under ${worktreesRoot}`).toBeGreaterThanOrEqual(1);
+        const outInWorktree = isoDirs
+          .map((n) => path.join(worktreesRoot, n, "out.txt"))
+          .filter((p) => fs.existsSync(p));
+        expect(outInWorktree.length, "out.txt must exist in the iso-writer worktree").toBeGreaterThanOrEqual(1);
+        expect(fs.readFileSync(outInWorktree[0]!, "utf8")).toBe("ISO-WT-CONTENT");
+        // ...and NOT at the fixture root (isolation held).
+        expect(fs.existsSync(path.join(result.fixture, "out.txt"))).toBe(false);
+
+        // The worktree is registered with git (kept after the dispatch).
+        const worktreeList = execFileSync("git", ["-C", result.fixture, "worktree", "list"], {
+          encoding: "utf8",
+        });
+        expect(worktreeList).toContain("agent-iso-writer-");
+
+        // The subagent's final message came back to the orchestrator verbatim.
+        const done = result.requests.some((r) => toolResultText(r).includes("DONE-ISO"));
+        expect(done, "parent tool result must contain DONE-ISO").toBe(true);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario 14 (E2E-5): stacked slash skills — /deploy /repo-info now (audit A7) ---
+    it.skipIf(!BASH_AVAILABLE)(
+      "stacks two leading slash skills in one prompt with args going to the last skill",
+      async () => {
+        const result = await runPi({
+          fixture: "full-surface",
+          script: [{ text: "stacked ok" }],
+          prompt: "/deploy /repo-info now",
+        });
+
+        expect(result.code).toBe(0);
+        const user = userText(result.requests[0]!);
+        const count = (needle: string) => user.split(needle).length - 1;
+        // Both skill bodies expanded, each exactly once.
+        expect(count("FS-SKILL-ARGS-BODY"), "deploy body exactly once").toBe(1);
+        expect(count("FS-SKILL-SHELL-BODY"), "repo-info body exactly once").toBe(1);
+        // Skills activate in prompt order: deploy first, repo-info second.
+        expect(user.indexOf("FS-SKILL-ARGS-BODY")).toBeLessThan(user.indexOf("FS-SKILL-SHELL-BODY"));
+        // The trailing text is the LAST skill's arguments: repo-info has no
+        // $ARGUMENTS/$N marker, so it lands via the ARGUMENTS: fallback...
+        expect(user).toContain("ARGUMENTS: now");
+        // ...and did NOT go to the first skill's positional markers.
+        expect(user).not.toContain("**now**");
+        // The shell injection in repo-info still ran (not passed through verbatim).
+        expect(user).not.toContain("!`git");
       },
       TEST_TIMEOUT_MS,
     );

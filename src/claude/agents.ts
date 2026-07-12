@@ -305,6 +305,7 @@ function normalizeHooks(
             hr["shell"] === "powershell" ? "powershell" : hr["shell"] === "bash" ? "bash" : undefined,
           timeout: typeof hr["timeout"] === "number" ? hr["timeout"] : undefined,
           once: typeof hr["once"] === "boolean" ? hr["once"] : undefined,
+          async: typeof hr["async"] === "boolean" ? hr["async"] : undefined,
           url: typeof hr["url"] === "string" ? hr["url"] : undefined,
           raw: hr,
         });
@@ -318,6 +319,77 @@ function normalizeHooks(
     out[event] = entries;
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Built-in agent types (audit E1/E6)
+// ---------------------------------------------------------------------------
+
+/** Truthy env-flag semantics: set and not an explicit "off" value. */
+function isEnvTruthy(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const v = value.trim().toLowerCase();
+  return v !== "" && v !== "0" && v !== "false" && v !== "no" && v !== "off";
+}
+
+/** Tools the read-only built-ins (Explore/Plan) must never receive. */
+const READONLY_BUILTIN_DISALLOWED = [
+  "Edit",
+  "Write",
+  "MultiEdit",
+  "NotebookEdit",
+  "Agent",
+  "Task",
+];
+
+/**
+ * The Claude Code built-in agent types, constructed in code (audit E1):
+ * `general-purpose` (all tools), `Explore` and `Plan` (read-only, skip
+ * CLAUDE.md/rules — audit E6). Callers resolve project/user/plugin agents
+ * FIRST so a same-named project agent overrides a built-in.
+ * `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS=1` removes Explore and Plan
+ * (general-purpose always stays).
+ */
+export function builtinAgents(env: NodeJS.ProcessEnv = process.env): ClaudeAgent[] {
+  const base = {
+    metadata: {},
+    source: { path: "<builtin>", scope: "builtin" as Scope },
+    builtin: true,
+    unknownKeys: [],
+    diagnostics: [],
+  };
+  const agents: ClaudeAgent[] = [
+    {
+      ...base,
+      name: "general-purpose",
+      description:
+        "General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks",
+      body: "You are a general-purpose agent. Research the question or execute the task you are given thoroughly and autonomously, then reply with a concise, complete report of your findings and actions — the caller sees only your final message.",
+    },
+  ];
+  if (!isEnvTruthy(env.CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS)) {
+    agents.push(
+      {
+        ...base,
+        name: "Explore",
+        description:
+          "Fast read-only agent for exploring the codebase: locating files, code, and answering questions by searching. Cannot edit files or dispatch further agents. Specify the desired thoroughness in the prompt (e.g. quick look vs. very thorough search across naming conventions).",
+        disallowedTools: [...READONLY_BUILTIN_DISALLOWED],
+        skipProjectContext: true,
+        body: "You are a read-only exploration agent. Search and read the codebase to answer the question you were given — honor the thoroughness the caller asked for. Do not modify anything. Reply with your findings, citing absolute file paths (and line numbers where useful).",
+      },
+      {
+        ...base,
+        name: "Plan",
+        description:
+          "Software-architect agent for designing implementation plans: analyzes the codebase read-only and returns a step-by-step plan, the critical files involved, and the architectural trade-offs. Cannot edit files or dispatch further agents.",
+        disallowedTools: [...READONLY_BUILTIN_DISALLOWED],
+        skipProjectContext: true,
+        body: "You are a software architect. Study the codebase read-only and design an implementation plan for the task you were given: concrete steps in order, the critical files to touch, and the trade-offs considered. Do not modify anything. Reply with the plan itself — the caller sees only your final message.",
+      },
+    );
+  }
+  return agents;
 }
 
 // ---------------------------------------------------------------------------

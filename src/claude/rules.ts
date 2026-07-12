@@ -25,9 +25,11 @@ export interface LoadRulesResult {
 /**
  * Recursively load `**\/*.md` under each rules dir.
  *
- * Order: input dir order preserved (caller passes project-before-user); files within a
- * dir sorted lexicographically by their forward-slash relative id. `excludes` glob
- * patterns (base = projectRoot) skip matching files.
+ * Order: input dir order preserved. The caller passes dirs in ASCENDING priority
+ * (audit B6: user, then project root→cwd, then managed last) so higher-priority
+ * guidance renders later/closer in the prompt; files within a dir sort
+ * lexicographically by their forward-slash relative id. `excludes` glob patterns
+ * (base = projectRoot) skip matching files.
  */
 export function loadRules(
   dirs: Array<{ dir: string; scope: Scope }>,

@@ -204,6 +204,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       if (entry.id === "tool.mcp__*") continue;
       expect(stubNames.has(entry.id.slice("tool.".length)), entry.id).toBe(true);
     }
+    // TaskOutput/TaskStop are REAL tools now (audit E4) — registry must agree
+    // and they must no longer ship as stubs.
+    expect(lookupCapability("tool.TaskOutput")?.tier).toBe("full");
+    expect(lookupCapability("tool.TaskStop")?.tier).toBe("partial");
+    expect(stubNames.has("TaskOutput")).toBe(false);
+    expect(stubNames.has("TaskStop")).toBe(false);
     // The stale wrong spelling must be gone: the shipped stub is "computer".
     expect(lookupCapability("tool.computer-use")).toBeUndefined();
     expect(lookupCapability("tool.computer")?.tier).toBe("degraded-noop");

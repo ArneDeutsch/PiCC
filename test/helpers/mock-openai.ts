@@ -19,6 +19,13 @@ export interface MockToolCall {
 export interface Turn {
   toolCalls?: MockToolCall[];
   text?: string;
+  /**
+   * Optional gate for concurrent-session scripts: the turn is only served to a
+   * request this predicate accepts. On each request the server picks the FIRST
+   * unconsumed turn whose predicate matches (turns without `when` match any
+   * request), so scripts without predicates keep the strict sequential order.
+   */
+  when?: (request: CapturedRequest) => boolean;
 }
 
 export interface CapturedRequest {
@@ -148,7 +155,19 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 
 export async function startMockModel(script: Turn[]): Promise<MockModelServer> {
   const requests: CapturedRequest[] = [];
-  let cursor = 0;
+  const consumed = script.map(() => false);
+
+  /** First unconsumed turn whose `when` accepts this request (none → fallback "done"). */
+  function nextTurn(request: CapturedRequest): Turn {
+    for (let i = 0; i < script.length; i++) {
+      if (consumed[i]) continue;
+      const candidate = script[i]!;
+      if (candidate.when && !candidate.when(request)) continue;
+      consumed[i] = true;
+      return candidate;
+    }
+    return { text: "done" };
+  }
 
   const server = http.createServer(async (req, res) => {
     const path = (req.url ?? "").split("?")[0];
@@ -168,15 +187,16 @@ export async function startMockModel(script: Turn[]): Promise<MockModelServer> {
     }
 
     const requestIndex = requests.length;
-    requests.push({
+    const captured: CapturedRequest = {
       path,
       model: typeof body.model === "string" ? body.model : undefined,
       messages: Array.isArray(body.messages) ? (body.messages as Array<Record<string, unknown>>) : [],
       tools: Array.isArray(body.tools) ? (body.tools as Array<Record<string, unknown>>) : undefined,
       body,
-    });
+    };
+    requests.push(captured);
 
-    const turn: Turn = cursor < script.length ? script[cursor++] : { text: "done" };
+    const turn = nextTurn(captured);
     const model = typeof body.model === "string" ? body.model : "mock-1";
 
     if (body.stream === false) {

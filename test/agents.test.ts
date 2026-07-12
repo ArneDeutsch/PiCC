@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { loadAgents, renderAgentCatalog, resolveAgent } from "../src/claude/agents.js";
+import { builtinAgents, loadAgents, renderAgentCatalog, resolveAgent } from "../src/claude/agents.js";
 import type { ClaudeAgent } from "../src/types.js";
 
 let tmpDir: string;
@@ -346,6 +346,53 @@ describe("renderAgentCatalog", () => {
     expect(renderAgentCatalog([])).toBe(
       "Available subagents (dispatch with the Agent tool, subagent_type = name):",
     );
+  });
+});
+
+describe("builtinAgents (audit E1/E6)", () => {
+  it("defines general-purpose, Explore, and Plan with the built-in markers", () => {
+    const agents = builtinAgents({});
+    expect(agents.map((a) => a.name)).toEqual(["general-purpose", "Explore", "Plan"]);
+    for (const a of agents) {
+      expect(a.builtin).toBe(true);
+      expect(a.source.scope).toBe("builtin");
+      expect(a.description.trim().length).toBeGreaterThan(0);
+      expect(a.body.trim().length).toBeGreaterThan(0);
+    }
+    const gp = agents[0]!;
+    expect(gp.description).toBe(
+      "General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks",
+    );
+    expect(gp.tools).toBeUndefined(); // all tools
+    expect(gp.skipProjectContext).toBeUndefined();
+    for (const name of ["Explore", "Plan"]) {
+      const a = agents.find((x) => x.name === name)!;
+      // Read-only restriction + Claude's CLAUDE.md skipping (E6).
+      expect(a.disallowedTools).toEqual([
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "NotebookEdit",
+        "Agent",
+        "Task",
+      ]);
+      expect(a.skipProjectContext).toBe(true);
+    }
+  });
+
+  it("CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS removes Explore/Plan but keeps general-purpose", () => {
+    const disabled = builtinAgents({ CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS: "1" });
+    expect(disabled.map((a) => a.name)).toEqual(["general-purpose"]);
+    // Explicit "off" values do not disable.
+    const kept = builtinAgents({ CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS: "0" });
+    expect(kept.map((a) => a.name)).toEqual(["general-purpose", "Explore", "Plan"]);
+  });
+
+  it("appears in the routing catalog like any other agent", () => {
+    const catalog = renderAgentCatalog(builtinAgents({}));
+    expect(catalog).toContain("- general-purpose: General-purpose agent");
+    expect(catalog).toContain("- Explore: ");
+    expect(catalog).toContain("- Plan: ");
   });
 });
 

@@ -92,17 +92,20 @@ describe("matchesRule — Bash", () => {
     expect(matchesRule("Bash(git status)", bash("git"))).toBe(false);
   });
 
-  it("prefix wildcard requires the prefix + space (bare prefix does not match)", () => {
+  it("trailing space-star is a word boundary: bare prefix matches, merged words do not", () => {
     expect(matchesRule("Bash(git *)", bash("git status"))).toBe(true);
-    expect(matchesRule("Bash(git *)", bash("git"))).toBe(false);
+    expect(matchesRule("Bash(git *)", bash("git push"))).toBe(true);
+    expect(matchesRule("Bash(git *)", bash("git"))).toBe(true); // space-or-end boundary
+    expect(matchesRule("Bash(git *)", bash("gitk"))).toBe(false);
     expect(matchesRule("Bash(ls *)", bash("ls -la"))).toBe(true);
+    expect(matchesRule("Bash(ls *)", bash("ls"))).toBe(true);
     expect(matchesRule("Bash(ls *)", bash("lsof"))).toBe(false);
-    expect(matchesRule("Bash(ls*)", bash("lsof"))).toBe(true);
+    expect(matchesRule("Bash(ls*)", bash("lsof"))).toBe(true); // no space, no boundary
   });
 
   it("legacy Bash(git:*) is identical to Bash(git *)", () => {
     expect(matchesRule("Bash(git:*)", bash("git push origin"))).toBe(true);
-    expect(matchesRule("Bash(git:*)", bash("git"))).toBe(false);
+    expect(matchesRule("Bash(git:*)", bash("git"))).toBe(true);
     expect(matchesRule("Bash(git:*)", bash("gitk"))).toBe(false);
   });
 
@@ -112,9 +115,19 @@ describe("matchesRule — Bash", () => {
     expect(matchesRule("Bash(git * --dry-run)", bash("git push"))).toBe(false);
   });
 
+  it("interior space-star keeps mandatory-space semantics (no boundary broadening)", () => {
+    expect(matchesRule("Bash(git * main)", bash("git push origin main"))).toBe(true);
+    expect(matchesRule("Bash(git * main)", bash("git main"))).toBe(false);
+    // The boundary applies only to the trailing star, not the interior one:
+    // the interior `*` still needs surrounding spaces to be real.
+    expect(matchesRule("Bash(git * --dry-run *)", bash("git push --dry-run"))).toBe(true);
+    expect(matchesRule("Bash(git * --dry-run *)", bash("git --dry-run"))).toBe(false);
+  });
+
   it("chained commands only match when every segment matches", () => {
     expect(matchesRule("Bash(git *)", bash("git status && rm -rf /"))).toBe(false);
     expect(matchesRule("Bash(git *)", bash("git status && git push"))).toBe(true);
+    expect(matchesRule("Bash(git *)", bash("git status && git"))).toBe(true); // boundary in chains
     expect(matchesRule("Bash(git *)", bash("git log | head"))).toBe(false);
     expect(matchesRule("Bash(git *)", bash("git fetch; git rebase"))).toBe(true);
     expect(matchesRule("Bash(git *)", bash("git fetch; rm x"))).toBe(false);
@@ -180,6 +193,52 @@ describe("matchesRule — path tools (Read/Edit/Write/Glob/Grep)", () => {
     expect(matchesRule("Read(src/**)", c)).toBe(true);
     expect(matchesRule("Read(C:/x/src/**)", c)).toBe(true);
     expect(matchesRule("Read(other/**)", c)).toBe(false);
+  });
+});
+
+describe("matchesRule — Windows path normalization (D2, platform-independent)", () => {
+  // Drive-lettered inputs/patterns take the normalized `/c/…` code path on
+  // every platform, so these run identically on POSIX and win32 runners.
+  it("//c/** drive patterns match drive-lettered inputs in any flavor", () => {
+    expect(matchesRule("Read(//c/**/.env)", call("Read", { file_path: "C:\\proj\\.env" }))).toBe(true);
+    expect(matchesRule("Read(//c/**/.env)", call("Read", { file_path: "C:/proj/.env" }))).toBe(true);
+    expect(matchesRule("Read(//c/**/.env)", call("Read", { file_path: "D:\\proj\\.env" }))).toBe(false);
+    expect(matchesRule("Read(//c/**/.env)", call("Read", { file_path: "C:\\proj\\.envrc" }))).toBe(false);
+  });
+
+  it("forward-slash drive rules match backslash inputs (and vice versa)", () => {
+    expect(matchesRule("Read(C:/proj/**)", call("Read", { file_path: "C:\\proj\\x.txt" }))).toBe(true);
+    expect(matchesRule("Read(C:\\proj\\**)", call("Read", { file_path: "C:/proj/x.txt" }))).toBe(true);
+    expect(matchesRule("Read(C:/proj/**)", call("Read", { file_path: "D:\\proj\\x.txt" }))).toBe(false);
+  });
+
+  it("drive-lettered matching is case-insensitive (Windows filesystem semantics)", () => {
+    expect(matchesRule("Read(//c/**/.env)", call("Read", { file_path: "C:\\PROJ\\.ENV" }))).toBe(true);
+    expect(matchesRule("Read(c:/proj/**)", call("Read", { file_path: "C:\\Proj\\X.TXT" }))).toBe(true);
+  });
+
+  it("//**/pattern matches any absolute path", () => {
+    expect(matchesRule("Read(//**/.env)", call("Read", { file_path: "C:\\proj\\.env" }))).toBe(true);
+    expect(matchesRule("Read(//**/.env)", call("Read", { file_path: "/srv/app/.env" }))).toBe(true);
+    expect(matchesRule("Read(//**/.env)", call("Read", { file_path: "a/b/.envrc" }))).toBe(false);
+  });
+
+  it("drive patterns anchor to the drive root, never to a relative dir of that name", () => {
+    // `q` rather than `c` so the negative holds even on runners whose cwd
+    // lives on C: (where /x/q/y resolves to /c/x/q/y — still not under /q).
+    expect(matchesRule("Read(//q/**)", call("Read", { file_path: "/x/q/y" }))).toBe(false);
+    expect(matchesRule("Read(//q/**)", call("Read", { file_path: "q/y" }))).toBe(false);
+  });
+
+  it("deny direction: engine blocks drive-lettered reads via //c rules", () => {
+    const engine = new PermissionEngine(rules({ deny: ["Read(//c/**/.env)"] }), { cwd: CWD });
+    expect(engine.evaluate(call("Read", { file_path: "C:\\anywhere\\deep\\.env" }))).toEqual({
+      decision: "deny",
+      rule: "Read(//c/**/.env)",
+    });
+    expect(engine.evaluate(call("Read", { file_path: "C:\\anywhere\\deep\\ok.txt" })).decision).toBe(
+      "default",
+    );
   });
 });
 
@@ -305,6 +364,60 @@ describe("PermissionEngine.evaluate", () => {
     const engine = new PermissionEngine(rules({ deny: ["Read(secrets/**)"] }), { cwd: CWD });
     const c = { tool: "Read", input: { file_path: "secrets/key.pem" }, cwd: "" };
     expect(engine.evaluate(c).decision).toBe("deny");
+  });
+});
+
+describe("PermissionEngine — MCP allow-rule glob validation (D4)", () => {
+  const mcpCall = call("mcp__github__create_issue");
+
+  it("an unanchored mcp__* allow rule is ignored and reported as a warning", () => {
+    const engine = new PermissionEngine(rules({ allow: ["mcp__*"] }), { cwd: CWD });
+    expect(engine.evaluate(mcpCall).decision).toBe("default");
+    expect(engine.diagnostics).toHaveLength(1);
+    expect(engine.diagnostics[0]).toMatchObject({ severity: "warning" });
+    expect(engine.diagnostics[0]?.message).toContain('"mcp__*"');
+  });
+
+  it("mcp__foo* (wildcard before the __ tool separator) is also unanchored", () => {
+    const engine = new PermissionEngine(rules({ allow: ["mcp__git*"] }), { cwd: CWD });
+    expect(engine.evaluate(mcpCall).decision).toBe("default");
+    expect(engine.diagnostics).toHaveLength(1);
+  });
+
+  it("anchored MCP globs stay valid allow rules (no diagnostics)", () => {
+    const engine = new PermissionEngine(
+      rules({ allow: ["mcp__github__*", "mcp__github__create_*"] }),
+      { cwd: CWD },
+    );
+    expect(engine.evaluate(mcpCall).decision).toBe("allow");
+    expect(engine.diagnostics).toEqual([]);
+  });
+
+  it("bare mcp__server (no glob) remains a valid allow rule", () => {
+    const engine = new PermissionEngine(rules({ allow: ["mcp__github"] }), { cwd: CWD });
+    expect(engine.evaluate(mcpCall).decision).toBe("allow");
+    expect(engine.diagnostics).toEqual([]);
+  });
+
+  it("deny and ask directions keep accepting unanchored globs", () => {
+    const denyEngine = new PermissionEngine(rules({ deny: ["mcp__*"] }), { cwd: CWD });
+    expect(denyEngine.evaluate(mcpCall).decision).toBe("deny");
+    expect(denyEngine.diagnostics).toEqual([]);
+    const askEngine = new PermissionEngine(rules({ ask: ["mcp__*"] }), { cwd: CWD });
+    expect(askEngine.evaluate(mcpCall)).toMatchObject({ decision: "allow", askDowngraded: true });
+    expect(askEngine.diagnostics).toEqual([]);
+  });
+
+  it("a wildcard inside the server segment is unanchored too", () => {
+    const engine = new PermissionEngine(rules({ allow: ["mcp__git*__create_issue"] }), { cwd: CWD });
+    expect(engine.evaluate(mcpCall).decision).toBe("default");
+    expect(engine.diagnostics).toHaveLength(1);
+  });
+
+  it("non-MCP wildcard rules are unaffected", () => {
+    const engine = new PermissionEngine(rules({ allow: ["Bash(git *)", "*"] }), { cwd: CWD });
+    expect(engine.diagnostics).toEqual([]);
+    expect(engine.evaluate(bash("git status")).decision).toBe("allow");
   });
 });
 

@@ -1,7 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-import { createGlobMatcher, normalizeSlashes } from "../util/globs.js";
-import type { PermissionRule, PermissionRules, ToolCallDescriptor } from "../types.js";
+import {
+  createGlobMatcher,
+  isAbsoluteLike,
+  normalizeDrivePath,
+  normalizeSlashes,
+} from "../util/globs.js";
+import type { Diagnostic, PermissionRule, PermissionRules, ToolCallDescriptor } from "../types.js";
 
 /**
  * Permission matcher grammar + deny engine (plan §6, research 02 §7).
@@ -48,9 +53,24 @@ function escapeRegExp(s: string): string {
 /**
  * Claude-style text wildcard: `*` matches any character sequence (including
  * spaces, slashes, newlines); everything else is literal. Anchored both ends.
+ *
+ * `trailingSpaceStar` (Bash rules): Claude's word-boundary rule — a `*`
+ * immediately preceded by a literal space means "space or end of string", so
+ * `Bash(git *)` matches bare `git` AND `git push`, but never `gitk`, while
+ * `Bash(ls*)` (no space) still matches `lsof`. The docs specify this for the
+ * TRAILING space-star only; an interior space-star (`Bash(git * main)`) keeps
+ * mandatory-space semantics, because compiling it to the optional form
+ * `(?: [\s\S]*)?` would let the star swallow the following literal text
+ * (` main`) and silently broaden the rule.
  */
-function wildcardRegExp(pattern: string): RegExp {
-  return new RegExp(`^${pattern.split("*").map(escapeRegExp).join("[\\s\\S]*")}$`);
+function wildcardRegExp(pattern: string, opts: { trailingSpaceStar?: boolean } = {}): RegExp {
+  let body = pattern;
+  let suffix = "";
+  if (opts.trailingSpaceStar && body.endsWith(" *")) {
+    body = body.slice(0, -2);
+    suffix = "(?: [\\s\\S]*)?";
+  }
+  return new RegExp(`^${body.split("*").map(escapeRegExp).join("[\\s\\S]*")}${suffix}$`);
 }
 
 function wildcardMatch(pattern: string, value: string): boolean {
@@ -273,16 +293,39 @@ function wrapperStrippedVariants(segment: string): string[] {
   return variants;
 }
 
+// --- Leading env-assignment stripping (deny direction only) ----------------
+
+/** One `VAR=value` shell assignment token (value optionally quoted). */
+const ENV_ASSIGNMENT_RE = /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|[^\s]*)\s+)+/;
+
 /**
- * Bash pattern semantics (research 02 §7.2):
+ * Strip leading `VAR=value` env assignments (`FOO=bar rm -rf /` → `rm -rf /`).
+ * Returns null when the segment has no assignments or is ONLY assignments.
+ * Used in the DENY direction only, so a deny `Bash(rm *)` cannot be evaded by
+ * an env prefix; in the allow direction assignments are NOT stripped — per
+ * Claude, a rule naming the bare command does not auto-approve env-prefixed
+ * invocations. (`env X=1 cmd` is separately handled by the `env` wrapper.)
+ */
+function stripLeadingAssignments(segment: string): string | null {
+  const m = ENV_ASSIGNMENT_RE.exec(segment);
+  if (!m) return null;
+  const rest = segment.slice(m[0].length).trim();
+  return rest.length > 0 ? rest : null;
+}
+
+/**
+ * Bash pattern semantics (research 02 §7.2 + official permissions docs):
  * - exact command: `Bash(git status)` — matches only that command;
- * - prefix wildcard: `Bash(git *)` — requires `git ` + anything (bare `git`
- *   does NOT match); `Bash(ls*)` matches `lsof` too (no word boundary);
+ * - prefix wildcard: `Bash(git *)` — space-before-`*` is a word boundary
+ *   meaning "space or end of string": matches bare `git` and `git push`,
+ *   never `gitk`; `Bash(ls*)` (no space) matches `lsof` too;
  * - legacy `Bash(git:*)` is identical to `Bash(git *)`;
  * - `*` matches any sequence including spaces at any position;
  * - process wrappers (timeout/time/nice/nohup/stdbuf/xargs/env) are stripped
  *   before matching: a segment matches when the raw text OR any unwrapped
- *   variant matches the pattern.
+ *   variant matches the pattern;
+ * - deny direction only: leading `VAR=value` assignments are also stripped
+ *   (see {@link stripLeadingAssignments}).
  * Shell-operator conservatism is POLARITY-aware:
  * - allow/ask direction (`anySegment: false`, default): a chained command only
  *   matches when EVERY chained segment independently matches the same pattern —
@@ -294,16 +337,29 @@ function wrapperStrippedVariants(segment: string): string[] {
 function bashSpecifierMatches(
   specifier: string,
   call: ToolCallDescriptor,
-  opts: { anySegment?: boolean } = {},
+  opts: { anySegment?: boolean; deny?: boolean } = {},
 ): boolean {
   const command = inputString(call.input["command"]);
   let pattern = specifier;
   if (pattern.endsWith(":*")) pattern = `${pattern.slice(0, -2)} *`;
-  const rx = wildcardRegExp(pattern);
+  const rx = wildcardRegExp(pattern, { trailingSpaceStar: true });
   const segments = splitShellCommand(command);
   if (segments.length === 0) return false;
-  const segmentMatches = (segment: string): boolean =>
-    rx.test(segment) || wrapperStrippedVariants(segment).some((variant) => rx.test(variant));
+  const denyDirection = opts.anySegment === true || opts.deny === true;
+  const segmentMatches = (segment: string): boolean => {
+    const variants = [segment, ...wrapperStrippedVariants(segment)];
+    if (denyDirection) {
+      // Also try each variant with leading env assignments stripped (and
+      // re-unwrapped: `FOO=1 nohup curl x` → `nohup curl x` → `curl x`).
+      for (const variant of [...variants]) {
+        const bare = stripLeadingAssignments(variant);
+        if (bare !== null && !variants.includes(bare)) {
+          variants.push(bare, ...wrapperStrippedVariants(bare));
+        }
+      }
+    }
+    return variants.some((variant) => rx.test(variant));
+  };
   return opts.anySegment
     ? segments.some(segmentMatches)
     : segments.every(segmentMatches);
@@ -316,8 +372,15 @@ function bashSpecifierMatches(
 /**
  * Claude anchor semantics: `path` / `./path` relative to the project dir,
  * `/path` anchored to the settings-source dir (NOT filesystem root),
- * `//path` true absolute, `~/path` home. A bare filename (no slash) matches
- * at any depth (`.env` ≡ `**\/.env`).
+ * `//path` true absolute (incl. drive form `//c/**` and any-absolute
+ * `//**\/x`), `~/path` home. A bare filename (no slash) matches at any depth
+ * (`.env` ≡ `**\/.env`).
+ *
+ * Windows normalization (D2, v2.1.166): patterns and input paths are
+ * canonicalized (backslashes → `/`, `C:/x` → `/c/x`, case-insensitive for
+ * Windows/drive-lettered paths) by the shared glob engine before matching, so
+ * a deny `Read(//c/**\/.env)` covers `C:\proj\.env` in any input flavor.
+ * POSIX behavior is byte-identical.
  *
  * Anchoring is STABLE: patterns anchor to `opts.anchor` (the engine's fixed
  * settings-source/project root) when provided, never to the drifting live
@@ -344,22 +407,34 @@ function pathSpecifierMatches(
   const anchors = [primaryAnchor];
   if (
     opts.deny &&
-    normalizeSlashes(path.resolve(cwd)) !== normalizeSlashes(path.resolve(primaryAnchor))
+    normalizeDrivePath(path.resolve(cwd)) !== normalizeDrivePath(path.resolve(primaryAnchor))
   ) {
     anchors.push(cwd);
   }
-  const abs = path.resolve(cwd, rawPath);
+  // A drive-lettered input is absolute even when evaluated off-Windows: pass
+  // it through untouched so the glob engine's drive normalization applies
+  // instead of resolving it against a POSIX cwd.
+  const abs = path.isAbsolute(rawPath)
+    ? path.resolve(rawPath)
+    : isAbsoluteLike(rawPath)
+      ? rawPath
+      : path.resolve(cwd, rawPath);
   const candidates = [abs];
-  if (opts.deny) {
+  // UNC inputs skip realpath: probing a nonexistent `\\host\...` can stall for
+  // seconds in the Windows network stack — match on the literal form only.
+  if (opts.deny && !/^(\\\\|\/\/)/.test(abs)) {
     try {
       const real = fs.realpathSync(abs);
-      if (real && normalizeSlashes(real) !== normalizeSlashes(abs)) candidates.push(real);
+      // Symlink targets participate in matching in NORMALIZED form too.
+      if (real && normalizeDrivePath(real) !== normalizeDrivePath(abs)) candidates.push(real);
     } catch {
       // Nonexistent path / unresolvable symlink: degrade to literal-only.
     }
   }
   for (const anchorDir of anchors) {
-    let pattern = specifier;
+    // Normalize pattern separators first so `\`-flavored rules behave like
+    // their `/` forms (drive normalization happens in the glob engine).
+    let pattern = normalizeSlashes(specifier);
     // `/path` (single leading slash, not `//`): anchor to the settings dir.
     if (/^\/(?!\/)/.test(pattern)) {
       pattern = normalizeSlashes(path.resolve(anchorDir)).replace(/\/$/, "") + pattern;
@@ -523,10 +598,34 @@ export interface PermissionEvaluation {
   askDowngraded?: boolean;
 }
 
+/**
+ * Is an MCP rule's tool part an UNANCHORED glob — a wildcard in or before the
+ * server segment (`mcp__*`, `mcp__foo*`, `mcp__f*__bar`)? Claude Code rejects
+ * these in the ALLOW direction (they would pre-approve arbitrary servers);
+ * anchored tool globs (`mcp__server__*`, `mcp__server__get_*`) stay valid.
+ * Deny/ask direction keeps accepting all globs (a broad deny is safe).
+ */
+function isUnanchoredMcpGlob(ruleTool: string): boolean {
+  if (!ruleTool.startsWith("mcp__") || !ruleTool.includes("*")) return false;
+  const rest = ruleTool.slice("mcp__".length);
+  const sep = rest.indexOf("__");
+  // No `__` separator before a tool part, or a wildcard inside the server name.
+  return sep < 0 || rest.slice(0, sep).includes("*");
+}
+
 export class PermissionEngine {
   private readonly rules: PermissionRules;
   private readonly cwd: string;
   private readonly anchor: string;
+  /** Allow rules ignored by construction-time validation (unanchored MCP globs). */
+  private readonly ignoredAllowRules: ReadonlySet<string>;
+  /**
+   * Construction-time rule-validation warnings (currently: unanchored MCP
+   * globs in `allow`). The engine has no other diagnostics channel, so they
+   * are exposed here for the embedder to surface like other permission
+   * diagnostics; collecting them never throws.
+   */
+  readonly diagnostics: Diagnostic[] = [];
 
   /**
    * `cwd` — the session launch dir; used only as the fallback for resolving
@@ -541,6 +640,31 @@ export class PermissionEngine {
     this.rules = rules;
     this.cwd = opts.cwd;
     this.anchor = opts.root ?? opts.cwd;
+    // D4: Claude rejects allow rules whose MCP tool part is an unanchored
+    // glob. PiCC ignores them for allow matching and reports a warning.
+    const ignored = new Set<string>();
+    for (const rule of this.ruleList("allow")) {
+      if (!isUnanchoredMcpGlob(parseRule(rule).tool)) continue;
+      ignored.add(rule);
+      this.diagnostics.push({
+        severity: "warning",
+        message:
+          `permissions.allow rule "${rule}" ignored: MCP allow rules must anchor the ` +
+          `server name (use "mcp__server" or "mcp__server__*"); Claude Code rejects ` +
+          `unanchored globs like "mcp__*"`,
+        source: "permissions",
+      });
+    }
+    this.ignoredAllowRules = ignored;
+  }
+
+  /**
+   * The STABLE settings-source/project anchor used for path-rule matching —
+   * exposed so co-enforcers (the guard's active-skill deny rules) can match
+   * with the exact same deny-direction anchoring as {@link evaluate}.
+   */
+  get pathAnchor(): string {
+    return this.anchor;
   }
 
   /**
@@ -565,6 +689,7 @@ export class PermissionEngine {
       }
     }
     for (const rule of this.ruleList("allow")) {
+      if (this.ignoredAllowRules.has(rule)) continue; // D4: unanchored MCP glob
       if (matchesRule(rule, effective, { anchor: this.anchor })) {
         return { decision: "allow", rule };
       }
