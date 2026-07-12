@@ -6,6 +6,14 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — commit and CI gates (2026-07-12)
+
+- **Pre-commit hook** (`.githooks/pre-commit`): runs `npm run test:unit` before every commit;
+  wired automatically by the `prepare` script on `npm install`/`npm ci`, manually via
+  `git config core.hooksPath .githooks` after an `--ignore-scripts` install.
+- The `implement-feature` skill now expects the hook (never `--no-verify`) and, when the
+  `gh` CLI is available, verifies the pushed branch's CI run is green before hand-off.
+
 ### Changed — first CI run on GitHub (2026-07-12)
 
 - **Node floor raised to ≥ 22.19** (`engines`, CI matrix now 22/24, docs): Pi's bundled

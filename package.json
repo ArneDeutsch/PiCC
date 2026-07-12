@@ -52,6 +52,7 @@
     "test:unit": "vitest run --exclude \"**/e2e-*.test.ts\"",
     "test:e2e": "vitest run test/e2e-live-pi.test.ts",
     "gen:capabilities": "node scripts/gen-capability-matrix.mjs",
+    "prepare": "git config core.hooksPath .githooks || exit 0",
     "prepublishOnly": "npm run typecheck"
   },
   "dependencies": {

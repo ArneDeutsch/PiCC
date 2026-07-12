@@ -13,6 +13,14 @@ npm install --ignore-scripts
 
 Node ≥ 22.19 and git are required (Pi's bundled undici 8.x does not run on Node 20). On Windows, Git Bash must be on PATH (see the user guide).
 
+A pre-commit hook (`.githooks/pre-commit`) runs `npm run test:unit` before every commit. A plain
+`npm install`/`npm ci` wires it automatically (prepare script); after an `--ignore-scripts`
+install, wire it manually:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Develop
 
 The harness is TypeScript source loaded by Pi via jiti — there is **no build step**. Run it against

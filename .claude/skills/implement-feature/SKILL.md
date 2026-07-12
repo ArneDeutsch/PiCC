@@ -119,8 +119,9 @@ Then write the feature's `review.md` (template below) by distilling `observation
 
 1. If a remote exists: `git fetch`. If `origin/<default>` moved, merge it into the feature branch, resolve conflicts, and verify typecheck + full suite are green again. Then push: `git push -u origin feature/<NN>-<slug>`.
    If there is **no remote**: merge the local default branch if it moved, verify green — the hand-off is the local branch itself.
-2. ExitWorktree with `action: keep` — the worktree must survive until the user has merged.
-3. Final summary to the user: what was implemented (per feature.md), notable decisions and deviations, test status, and next steps — review the branch, open a Pull Request on GitHub (or merge locally if no remote), use "Delete branch" there after merging, and clean up locally afterwards with:
+2. **CI check (when possible).** Local green isn't the same as CI green — CI runs on Linux too and has caught environment-only failures before. If the `gh` CLI is available and authenticated (`gh auth status`), watch the pushed branch's run (`gh run list --branch feature/<NN>-<slug>`, then `gh run watch <id> --exit-status`) and treat a red run like any test failure: investigate the logs (`gh run view <id> --log-failed`), fix, push again. If `gh` is not available, don't block — note prominently in the final summary that CI on the Actions tab must be green before merging.
+3. ExitWorktree with `action: keep` — the worktree must survive until the user has merged.
+4. Final summary to the user: what was implemented (per feature.md), notable decisions and deviations, test status, and next steps — review the branch, open a Pull Request on GitHub (or merge locally if no remote), use "Delete branch" there after merging, and clean up locally afterwards with:
    - `git worktree remove <worktree-path>`
    - `git branch -d feature/<NN>-<slug>` (plus the harness-created `worktree-*` branch for that worktree, if one lingers)
 
@@ -232,3 +233,5 @@ cross-platform concerns (Windows + Linux).>
 - Merge commits keep git's default subject.
 
 The git log doubles as the progress record — write subjects so that reading them tells the story of the feature.
+
+Every commit triggers the repo's **pre-commit hook** (`.githooks/pre-commit`), which runs the unit + offline-integration suite — expect a commit to take a couple of minutes. A hook failure is a real test failure: investigate and fix, then commit again. Never bypass it with `--no-verify`. If the hook doesn't fire at all (fresh clone where `npm install` ran with `--ignore-scripts`), wire it with `git config core.hooksPath .githooks`.
