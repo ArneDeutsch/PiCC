@@ -17,6 +17,13 @@ import { createGuardExtension } from "./guard.js";
 import { CwdState } from "./cwd-state.js";
 import { findByName } from "../project.js";
 import type { BackgroundTaskRegistry } from "./background-tasks.js";
+import {
+  agentTrailerFrame,
+  agentTrailerLine,
+  isAgentId,
+  mintAgentId,
+  subagentSessionDir,
+} from "../util/subagent-transcripts.js";
 
 /**
  * Subagent dispatch runtime (plan §4.3): spawns fresh-context Pi sessions per dispatch,
@@ -72,8 +79,17 @@ export interface SubagentRuntimeDeps {
    * Builds a per-dispatch HookRunner for an agent's frontmatter `hooks:`
    * (audit C10) — same deps as the session's main runner. The scoped runner
    * fires only for that subagent's dispatch and is discarded when it ends.
+   * Its `transcript_path` stays the MAIN session transcript (Claude Code
+   * parity, t02 review round 2): PiCC does NOT re-point subagent hook events
+   * at the subagent's own transcript.
    */
   makeScopedHookRunner?: (config: HookConfig) => HookRunner;
+  /**
+   * MAIN session transcript file (late-bound; undefined in print/no-session
+   * modes and tests). Subagent transcripts persist in a sibling directory
+   * derived from it (t02); without it, dispatch degrades to in-memory.
+   */
+  getMainSessionFile?: () => string | undefined;
   worktrees?: WorktreeManagerLike;
   maxDepth: number;
   concurrency: number;
@@ -83,10 +99,21 @@ export interface SubagentRuntimeDeps {
   log?: (message: string) => void;
 }
 
+/** Structural view of a Pi SessionManager (only what dispatch reads). */
+export interface PiSessionManagerLike {
+  getSessionFile(): string | undefined;
+}
+
 export interface PiSdk {
   createAgentSession(options: Record<string, unknown>): Promise<{ session: PiSession }>;
   DefaultResourceLoader: new (options: Record<string, unknown>) => { reload(): Promise<void> };
   inMemorySessionManager(cwd: string): unknown;
+  /**
+   * Persisted session manager in a custom directory with a pinned session id
+   * (t02: subagent transcripts — Pi names the file `<stamp>_<id>.jsonl`).
+   * Optional: when absent, dispatch degrades to in-memory (non-resumable).
+   */
+  persistedSessionManager?(cwd: string, sessionDir: string, id: string): PiSessionManagerLike;
   inMemorySettingsManager(): unknown;
   agentDir(): string;
 }
@@ -127,6 +154,25 @@ export interface DispatchResult {
    * content — compaction inside prompt() may have rewritten earlier turns), or "".
    */
   finalMessage: string;
+  /**
+   * Opaque dispatch identity (t02): unique per agent, stable across resumes —
+   * a resume (t04) reuses the ID and appends to the same transcript.
+   */
+  agentId: string;
+  /** On-disk JSONL transcript of the subagent's session, when persisted. */
+  transcriptPath?: string;
+  /**
+   * True when this agent can be continued under `agentId` (persisted
+   * transcript; not a one-shot builtin like Explore/Plan; not the in-memory
+   * fallback). t04's SendMessage refuses non-resumable IDs cleanly.
+   */
+  resumable: boolean;
+  /**
+   * True when `finalMessage` was cut at the model's output token limit (stop
+   * reason "length") and already carries the t01 cut-off frame. The model-visible
+   * trailer then rides INSIDE that existing frame instead of opening a second one.
+   */
+  truncated?: boolean;
   agentName?: string;
   worktreePath?: string;
   /** The single error channel: present iff `outcome !== "completed"`, names the cause. */
@@ -143,6 +189,10 @@ async function loadRealSdk(): Promise<PiSdk> {
     createAgentSession: (options) => m.createAgentSession(options),
     DefaultResourceLoader: m.DefaultResourceLoader,
     inMemorySessionManager: (cwd: string) => m.SessionManager.inMemory(cwd),
+    // Persisted subagent transcript (t02): Pi validates the id and names the
+    // file `<stamp>_<id>.jsonl` in the custom directory (created on demand).
+    persistedSessionManager: (cwd: string, sessionDir: string, id: string) =>
+      m.SessionManager.create(cwd, sessionDir, { id }),
     // shellPath pins subagent bash to Git Bash on Windows (see resolveGitBashPath).
     inMemorySettingsManager: () =>
       m.SettingsManager.inMemory({
@@ -252,6 +302,45 @@ export class SubagentRuntime {
     return this.sdkPromise;
   }
 
+  /**
+   * Resolve a requested subagent name to its definition via the shared 3-step
+   * chain: project/user/plugin agents by exact name, then case-insensitive
+   * name, then built-ins. `dispatch()` prepends its `agentOverride`;
+   * `isOneShotBuiltin()` uses the bare chain — both route through here so the
+   * resolution order can never desync between them (t02 review round 2).
+   */
+  private resolveAgentDefinition(requested: string): ClaudeAgent | undefined {
+    const agents = this.deps.getAgents();
+    return (
+      findByName(agents, requested) ??
+      agents.find((a) => a.name.toLowerCase() === requested.toLowerCase()) ??
+      resolveAgent(builtinAgents(), requested)
+    );
+  }
+
+  /**
+   * The one-shot-builtin predicate (Explore/Plan): shared by dispatch()'s
+   * `resumable` flag and the background start message's id suppression, so a
+   * future third one-shot builtin can't desync them (t02 review round 2).
+   */
+  private isOneShot(agent: ClaudeAgent | undefined): boolean {
+    return agent?.builtin === true && (agent.name === "Explore" || agent.name === "Plan");
+  }
+
+  /**
+   * True iff `subagentType` resolves to a one-shot BUILTIN (Explore/Plan) —
+   * i.e. a definitely non-resumable dispatch. Mirrors dispatch()'s resolution
+   * order (shared resolver) so a same-named PROJECT agent (which resolves first
+   * and lacks the builtin marker) is NOT treated as one-shot. Used by the
+   * background Agent tool to decide whether the start message should advertise
+   * an agent id (t02): one-shot builtins get no id segment (t04 would refuse a
+   * follow-up).
+   */
+  isOneShotBuiltin(subagentType: string): boolean {
+    const requested = subagentType.trim() || "general-purpose";
+    return this.isOneShot(this.resolveAgentDefinition(requested));
+  }
+
   async dispatch(opts: {
     subagentType: string;
     prompt: string;
@@ -266,19 +355,42 @@ export class SubagentRuntime {
     agentOverride?: ClaudeAgent;
     /** Cooperative abort (TaskStop, audit E4): best-effort session.abort() when signaled. */
     abortSignal?: AbortSignal;
+    /**
+     * Pre-minted agent ID (t02): the background Agent tool mints it up front so
+     * the start message can carry it; t04 passes an existing ID on resume.
+     */
+    agentId?: string;
   }): Promise<DispatchResult> {
     const diagnostics: Diagnostic[] = [];
+    // Caller-provided agent ID hardening (t02, pre-t04): a resume/model-derived
+    // ID (t04 feeds these) MUST be the minted `agent-<12 hex>` form. A hostile or
+    // malformed value fails the dispatch loudly (t01 semantics) — never silently
+    // minted-over or passed through to the session/filesystem path.
+    if (opts.agentId !== undefined && !isAgentId(opts.agentId)) {
+      return {
+        ok: false,
+        outcome: "failed",
+        finalMessage: "",
+        agentId: mintAgentId(),
+        resumable: false,
+        error: `Refusing to dispatch: caller-provided agent id ${JSON.stringify(
+          opts.agentId,
+        )} is not the minted "agent-<12 hex>" form.`,
+        diagnostics,
+      };
+    }
+    // Agent identity (t02): minted here unless the caller pre-minted/reuses one.
+    // Every exit path carries it, so mirrors (background records) stay keyed.
+    const agentId = opts.agentId ?? mintAgentId();
     const agents = this.deps.getAgents();
     // Built-ins resolve AFTER project/user/plugin agents (audit E1): a project
     // agent named Explore overrides the built-in. Empty/omitted subagent_type
     // defaults to general-purpose (audit E2).
     const builtins = builtinAgents();
     const requested = opts.subagentType.trim() || "general-purpose";
-    const resolved =
-      opts.agentOverride ??
-      findByName(agents, requested) ??
-      agents.find((a) => a.name.toLowerCase() === requested.toLowerCase()) ??
-      resolveAgent(builtins, requested);
+    // Shared resolver (t02 review round 2): one home for the resolution order so
+    // isOneShotBuiltin() can't desync from this dispatch's settled resumability.
+    const resolved = opts.agentOverride ?? this.resolveAgentDefinition(requested);
     // Claude fallback (review H1): an unknown subagent_type runs as
     // general-purpose instead of hard-erroring — with a VISIBLE degrade in
     // both the diagnostics and the subagent's own prompt.
@@ -299,6 +411,8 @@ export class SubagentRuntime {
         ok: false,
         outcome: "failed",
         finalMessage: "",
+        agentId,
+        resumable: false,
         error: `Unknown subagent_type "${opts.subagentType}". Available: ${known || "(none)"}`,
         diagnostics,
       };
@@ -308,6 +422,8 @@ export class SubagentRuntime {
         ok: false,
         outcome: "failed",
         finalMessage: "",
+        agentId,
+        resumable: false,
         agentName: agent.name,
         error: `Subagent nesting depth ${opts.depth} exceeds the configured maximum of ${this.deps.maxDepth}.`,
         diagnostics,
@@ -318,11 +434,24 @@ export class SubagentRuntime {
         ok: false,
         outcome: "aborted",
         finalMessage: "",
+        agentId,
+        resumable: false,
         agentName: agent.name,
         error: `Subagent "${agent.name}" was stopped before it started.`,
         diagnostics,
       };
     }
+
+    // Transcript persistence state (t02): the transcript path only exists once
+    // the session manager is created (below); it is carried on the
+    // DispatchResult and drives `resumable`. Parity (review round 2): subagent
+    // hook events are NOT re-pointed to it — they keep the main transcript_path.
+    let transcriptPath: string | undefined;
+    let resumable = false;
+    // Built-in one-shot agents (Explore/Plan) are never resumable — the flag
+    // travels with the ID so t04 can refuse. A same-named PROJECT agent is a
+    // normal agent (it resolves first and lacks the builtin marker).
+    const oneShot = this.isOneShot(agent);
 
     // Agent-scoped hooks (audit C10): frontmatter `hooks:` dispatch while THIS
     // subagent runs. The scoped runner is multiplexed with the session runner
@@ -336,6 +465,9 @@ export class SubagentRuntime {
       const parsed = parseHookConfig(agent.hooks, agent.source.path);
       diagnostics.push(...parsed.diagnostics);
       if (Object.keys(parsed.config).length > 0) {
+        // Parity (t02 review round 2): the scoped runner keeps the MAIN session
+        // transcript_path — subagent hook events must NOT be re-pointed at the
+        // subagent's own transcript (Claude Code behavior).
         scopedHooks = this.deps.makeScopedHookRunner(parsed.config);
         diagnostics.push({
           severity: "info",
@@ -368,13 +500,41 @@ export class SubagentRuntime {
         },
       } as unknown as HookRunner;
     }
+    // Central identity injection (t02): agent_id AND agent_type (the agent's
+    // name) ride on EVERY hook payload fired within this dispatch — the guard's
+    // PreToolUse/PostToolUse fired from inside the subagent, SubagentStart, and
+    // SubagentStop/Stop — so the subagent identity can't drift per fire site
+    // (Claude Code hook input carries both). One choke point wrapping each raw
+    // runner. transcript_path is deliberately NOT injected — parity (review
+    // round 2): subagent hook events keep the MAIN session transcript_path (the
+    // runner's own constructed default), never the subagent's own file.
+    const injectIdentity = (runner: HookRunner): HookRunner =>
+      ({
+        fire: (
+          eventName: string,
+          payload: Partial<HookPayload>,
+          toolCall?: ToolCallDescriptor,
+        ): Promise<HookOutcome> =>
+          runner.fire(
+            eventName,
+            { ...payload, agent_id: agentId, agent_type: agent.name },
+            toolCall,
+          ),
+      }) as unknown as HookRunner;
+    const baseRunner = injectIdentity(this.deps.hookRunner);
+    if (scopedHooks) scopedHooks = injectIdentity(scopedHooks);
     const hookRunner = scopedHooks
-      ? multiplexHookRunners(this.deps.hookRunner, scopedHooks)
-      : this.deps.hookRunner;
+      ? multiplexHookRunners(baseRunner, scopedHooks)
+      : baseRunner;
     // Agent frontmatter `Stop` hooks map to SubagentStop time for this dispatch.
     const fireSubagentStop = async (
       payload: Partial<HookPayload>,
     ): Promise<HookOutcome | undefined> => {
+      // Parity (t02 review round 2): the Stop payload carries NO transcript_path.
+      // Inside a subagent Claude Code keeps transcript_path pointing at the MAIN
+      // session transcript, which the HookRunner supplies from its own
+      // constructed default — PiCC must not clobber it with the subagent's own
+      // file. agent_id/agent_type come from the central injection above.
       const outcomes: Array<HookOutcome | undefined> = [
         await hookRunner.fire("SubagentStop", payload).catch(() => undefined),
       ];
@@ -408,6 +568,8 @@ export class SubagentRuntime {
           ok: false,
           outcome: "aborted",
           finalMessage: "",
+          agentId,
+          resumable: false,
           agentName: agent.name,
           error: `Subagent "${agent.name}" was stopped before it started.`,
           diagnostics,
@@ -415,6 +577,9 @@ export class SubagentRuntime {
       }
       const startOutcome = await hookRunner
         .fire("SubagentStart", {
+          // agent_id + agent_type are added centrally (injectIdentity); a
+          // SubagentStart payload carries NO transcript_path (the session/
+          // transcript may not exist yet — item 6).
           subagent_type: agent.name,
           prompt,
           cwd: this.deps.getCwd(),
@@ -425,6 +590,8 @@ export class SubagentRuntime {
           ok: false,
           outcome: "failed",
           finalMessage: "",
+          agentId,
+          resumable: false,
           agentName: agent.name,
           error: `SubagentStart hook blocked dispatch${startOutcome.blockReason ? `: ${startOutcome.blockReason}` : ""}`,
           diagnostics,
@@ -462,6 +629,8 @@ export class SubagentRuntime {
           ok: false,
           outcome: "aborted",
           finalMessage: "",
+          agentId,
+          resumable: false,
           agentName: agent.name,
           worktreePath,
           error: `Subagent "${agent.name}" was stopped before it started.`,
@@ -537,12 +706,52 @@ export class SubagentRuntime {
         ...customTools.map((t) => (t as { name: string }).name),
       ];
 
+      // Persisted subagent transcript (t02): one JSONL per dispatch, named by
+      // the agent ID, in a sibling directory of the MAIN session's transcript.
+      // Degrade, never crash: unknown main file (print/no-session modes,
+      // tests), an SDK without the factory, or a failing create all fall back
+      // to in-memory with a diagnostic — such agents are non-resumable.
+      let sessionManager: unknown;
+      let mainSessionFile: string | undefined;
+      try {
+        mainSessionFile = this.deps.getMainSessionFile?.();
+      } catch {
+        mainSessionFile = undefined;
+      }
+      if (mainSessionFile && sdk.persistedSessionManager) {
+        try {
+          const persisted = sdk.persistedSessionManager(
+            cwd,
+            subagentSessionDir(mainSessionFile),
+            agentId,
+          );
+          transcriptPath = persisted.getSessionFile() ?? undefined;
+          sessionManager = persisted;
+          resumable = !oneShot && transcriptPath !== undefined;
+        } catch (err) {
+          diagnostics.push({
+            severity: "warning",
+            message: `subagent transcript persistence failed (${capErrorText(
+              (err as Error)?.message ?? String(err),
+            )}); running in-memory — this agent will not be resumable`,
+          });
+        }
+      } else {
+        diagnostics.push({
+          severity: "info",
+          message: mainSessionFile
+            ? "subagent transcript persistence is unavailable in this SDK; running in-memory — this agent will not be resumable"
+            : "main session has no transcript file (print/no-session mode?); subagent transcript not persisted — this agent will not be resumable",
+        });
+      }
+      sessionManager ??= sdk.inMemorySessionManager(cwd);
+
       const sessionOptions: Record<string, unknown> = {
         cwd,
         tools: toolNames,
         customTools,
         resourceLoader: loader,
-        sessionManager: sdk.inMemorySessionManager(cwd),
+        sessionManager,
         settingsManager: sdk.inMemorySettingsManager(),
       };
       if (model) sessionOptions.model = model;
@@ -590,6 +799,11 @@ export class SubagentRuntime {
             // Best-effort partial output: whatever assistant text exists post-run
             // (compaction inside prompt() may have rewritten earlier turns).
             finalMessage: assistantTextSoFar(live),
+            agentId,
+            transcriptPath,
+            // A failed-but-persisted agent stays resumable: the coordinator may
+            // follow up / retry it with its prior context (t04 decides).
+            resumable,
             agentName: agent.name,
             worktreePath,
             error: `Agent terminated early due to an API error: ${capErrorText(last.errorMessage ?? "unknown error")}`,
@@ -601,6 +815,9 @@ export class SubagentRuntime {
             ok: false,
             outcome: "aborted",
             finalMessage: "",
+            agentId,
+            transcriptPath,
+            resumable,
             agentName: agent.name,
             worktreePath,
             error: `Subagent "${agent.name}" was aborted before completing its task.`,
@@ -662,6 +879,9 @@ export class SubagentRuntime {
             ok: false,
             outcome: "aborted",
             finalMessage: "",
+            agentId,
+            transcriptPath,
+            resumable,
             agentName: agent.name,
             worktreePath,
             error: `Subagent "${agent.name}" was aborted before completing its task.`,
@@ -684,7 +904,11 @@ export class SubagentRuntime {
         finalMessage = lastAssistantText(session);
       }
 
-      if (truncated && finalMessage.trim()) {
+      // A truncated completion ends with the t01 cut-off frame; `cutOff` records
+      // that so the model-visible ID trailer rides INSIDE that frame instead of
+      // opening a second `---` frame (t02 review item 4).
+      const cutOff = truncated && finalMessage.trim() !== "";
+      if (cutOff) {
         finalMessage = appendCutOffNote(
           finalMessage,
           `The reply was truncated at the model's output token limit (stop reason "length"); the output above may be incomplete.`,
@@ -694,6 +918,10 @@ export class SubagentRuntime {
         ok: true,
         outcome: "completed",
         finalMessage,
+        agentId,
+        transcriptPath,
+        resumable,
+        truncated: cutOff,
         agentName: agent.name,
         worktreePath,
         diagnostics,
@@ -701,10 +929,15 @@ export class SubagentRuntime {
     } catch (err) {
       // Catch-all: covers createAgentSession itself throwing — the "API dead
       // before the session exists" case — and any other dispatch-internal error.
+      // Conservative: not resumable (the session may never have run), but the
+      // transcript path (when one was allocated) stays visible for diagnosis.
       return {
         ok: false,
         outcome: "failed",
         finalMessage: "",
+        agentId,
+        transcriptPath,
+        resumable: false,
         agentName: agent.name,
         worktreePath,
         error: `Subagent "${agent.name}" failed: ${capErrorText((err as Error)?.message ?? String(err))}`,
@@ -858,35 +1091,59 @@ export function createAgentToolDefinition(
         // registry owns its settlement (never an unhandled rejection).
         const controller = new AbortController();
         const label = subagentType.trim() || "general-purpose";
+        // Pre-minted agent ID (t02): the start message is the background
+        // channel's guaranteed model-visible ID delivery, so it must exist
+        // BEFORE the un-awaited dispatch settles.
+        const agentId = mintAgentId();
         const id = opts.backgroundTasks.start(
           `agent:${label}`,
-          runtime.dispatch({ ...dispatchOpts, abortSignal: controller.signal }),
+          runtime.dispatch({ ...dispatchOpts, agentId, abortSignal: controller.signal }),
           () => controller.abort(),
+          agentId,
+        );
+        // One-shot builtins (Explore/Plan) are non-resumable — advertising an
+        // agent id in the start message would falsely invite a SendMessage
+        // follow-up (t04 would refuse it). Resumable/non-builtin dispatches keep
+        // the id segment. `details.agentId` stays for logs/UI regardless.
+        const idSegment = runtime.isOneShotBuiltin(subagentType)
+          ? ""
+          : `, agent id: ${agentId}`;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Background task ${id} started (agent: ${label}${idSegment}). Use TaskOutput with task_id "${id}" to retrieve the result.`,
+            },
+          ],
+          details: { background: true, taskId: id, agent: label, agentId },
+        };
+      }
+      // Foreground: Pi's per-call signal (parent Esc) aborts the dispatch.
+      const result = await runtime.dispatch({ ...dispatchOpts, abortSignal: signal });
+      // Structured copy of the identity fields for every content-returning path
+      // (details is logs/UI-only — the model never sees it, hence the trailer).
+      const identityDetails = {
+        agentId: result.agentId,
+        transcriptPath: result.transcriptPath,
+        resumable: result.resumable,
+      };
+      if (result.outcome === "failed" && result.finalMessage.trim()) {
+        // Claude 2.1.200 semantics: real work done before an API death comes back
+        // as a SUCCESS result — the partial output plus a clearly separated
+        // cut-off note naming the error. Never a normal-looking success.
+        // A resumable agent's ID rides in the same delimited frame (t02): the
+        // coordinator can follow up on the cut-off run via SendMessage (t04).
+        const cut = appendCutOffNote(
+          result.finalMessage,
+          result.error ?? "The run ended on an API error before completing.",
         );
         return {
           content: [
             {
               type: "text",
-              text: `Background task ${id} started (agent: ${label}). Use TaskOutput with task_id "${id}" to retrieve the result.`,
-            },
-          ],
-          details: { background: true, taskId: id, agent: label },
-        };
-      }
-      // Foreground: Pi's per-call signal (parent Esc) aborts the dispatch.
-      const result = await runtime.dispatch({ ...dispatchOpts, abortSignal: signal });
-      if (result.outcome === "failed" && result.finalMessage.trim()) {
-        // Claude 2.1.200 semantics: real work done before an API death comes back
-        // as a SUCCESS result — the partial output plus a clearly separated
-        // cut-off note naming the error. Never a normal-looking success.
-        return {
-          content: [
-            {
-              type: "text",
-              text: appendCutOffNote(
-                result.finalMessage,
-                result.error ?? "The run ended on an API error before completing.",
-              ),
+              text: result.resumable
+                ? `${cut}\n${agentTrailerLine(result.agentId, { completed: false })}`
+                : cut,
             },
           ],
           details: {
@@ -896,6 +1153,7 @@ export function createAgentToolDefinition(
             outcome: result.outcome,
             cutOff: true,
             error: result.error,
+            ...identityDetails,
           },
         };
       }
@@ -903,17 +1161,41 @@ export function createAgentToolDefinition(
         // Failed with no output ("Agent terminated early due to an API error: ...",
         // or a pre-start failure naming its cause) and aborted runs (distinct
         // wording naming the abort) both surface on the isError channel.
-        throw new Error(result.error ?? "subagent failed");
+        // A resumable FAILED-with-no-partial run still delivers its agent ID —
+        // the coordinator gets no other channel to it (the background path
+        // already delivers the ID on failure; parity here, t02 review item 3).
+        // Aborted and non-resumable failures carry no trailer.
+        const base = result.error ?? "subagent failed";
+        throw new Error(
+          result.outcome === "failed" && result.resumable
+            ? `${base}${agentTrailerFrame(result.agentId, { completed: false })}`
+            : base,
+        );
       }
       // Verbatim-return contract (plan §4.3): callers parse finalMessage directly
       // (often a locked YAML block) — compatibility notes belong in details only.
+      // Exception (t02 plan-review MUST-FIX): resumable agents get a clearly
+      // delimited agent-ID trailer OUTSIDE the verbatim message, in the content
+      // the model actually reads — `details` never reaches it. When the
+      // completion was truncated it already ends with a `---` cut-off frame, so
+      // the trailer rides INSIDE that frame (single `\n`, non-"completed"
+      // wording) rather than stacking a second frame (t02 review item 4).
+      let text: string;
+      if (!result.resumable) {
+        text = result.finalMessage;
+      } else if (result.truncated) {
+        text = `${result.finalMessage}\n${agentTrailerLine(result.agentId, { completed: false })}`;
+      } else {
+        text = `${result.finalMessage}${agentTrailerFrame(result.agentId, { completed: true })}`;
+      }
       return {
-        content: [{ type: "text", text: result.finalMessage }],
+        content: [{ type: "text", text }],
         details: {
           agent: result.agentName,
           worktreePath: result.worktreePath,
           diagnostics: result.diagnostics,
           outcome: result.outcome,
+          ...identityDetails,
           ...(params.run_in_background
             ? {
                 note: backgroundDisabled

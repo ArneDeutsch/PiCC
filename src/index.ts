@@ -601,7 +601,10 @@ export default function picc(pi: any) {
     getCwd: () => cwdState.get(),
     makeContextInjector,
     // Agent-scoped hooks (audit C10): per-dispatch runner with the SAME deps as
-    // the session's base runner; the runtime multiplexes and discards it.
+    // the session's base runner; the runtime multiplexes and discards it. Its
+    // transcript_path stays the MAIN session transcript (t02 review round 2):
+    // Claude Code does not re-point subagent hook events at the subagent's own
+    // transcript.
     makeScopedHookRunner: (config) =>
       new HookRunner({
         config,
@@ -613,6 +616,8 @@ export default function picc(pi: any) {
         pluginDataDirs,
         transcriptPath,
       }),
+    // Subagent transcripts (t02) persist next to the MAIN session's transcript.
+    getMainSessionFile: transcriptPath,
     resolveModel: resolveModelSpec,
     mapEffort: (effort) => mapEffort(config, effort),
     worktrees,

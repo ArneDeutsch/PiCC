@@ -105,6 +105,40 @@ describe("BackgroundTaskRegistry", () => {
     expect(registry.get(id)?.result).toBeUndefined();
   });
 
+  it("a stopped resumable task reports stopped via TaskOutput with NO resume trailer (t02)", async () => {
+    // An aborted/stopped run is never offered for resume: even a persisted,
+    // resumable background dispatch, once TaskStop-ped, must report as stopped
+    // with its result discarded and NO "resumable via SendMessage" trailer.
+    const registry = new BackgroundTaskRegistry();
+    let resolve!: (v: ReturnType<typeof result>) => void;
+    const id = registry.start(
+      "agent:worker",
+      new Promise<ReturnType<typeof result>>((r) => (resolve = r)),
+      () => {},
+      "agent-aabbccddeeff",
+    );
+    expect(registry.stop(id).abortRequested).toBe(true);
+    // The dispatch settles LATE as an aborted-but-resumable (persisted) run.
+    resolve(
+      result({
+        outcome: "aborted",
+        resumable: true,
+        agentId: "agent-aabbccddeeff",
+        transcriptPath: "/sessions/main.subagents/2026-01-01T00-00-00-000Z_agent-aabbccddeeff.jsonl",
+        error: "subagent dispatch was aborted",
+        finalMessage: "discard me",
+      }),
+    );
+    await registry.wait(id);
+    expect(registry.get(id)?.status).toBe("stopped");
+    expect(registry.get(id)?.resumable).toBe(true); // capability flag is honest…
+    const taskOutput = createTaskOutputTool(registry) as unknown as ToolLike;
+    const out = await taskOutput.execute("t", { task_id: id });
+    expect(out.details.status).toBe("stopped");
+    expect(out.content[0]!.text).toContain("was stopped");
+    expect(out.content[0]!.text).not.toContain("resumable via SendMessage"); // …but not advertised
+  });
+
   it("stop on a settled task reports alreadySettled; unknown ids report not found", async () => {
     const registry = new BackgroundTaskRegistry();
     const id = registry.start("agent:a", Promise.resolve(result()));
@@ -129,9 +163,13 @@ describe("Agent tool run_in_background (audit E4)", () => {
       prompt: "go",
       run_in_background: true,
     });
-    // Immediate return while the dispatch is still gated.
-    expect(started.content[0]!.text).toMatch(/Background task task-\d+ started \(agent: worker\)/);
+    // Immediate return while the dispatch is still gated. The start message is
+    // the background channel's model-visible agent-ID delivery (t02).
+    expect(started.content[0]!.text).toMatch(
+      /Background task task-\d+ started \(agent: worker, agent id: agent-[0-9a-f]{12}\)/,
+    );
     expect(started.content[0]!.text).toContain("TaskOutput");
+    expect(String(started.details.agentId)).toMatch(/^agent-[0-9a-f]{12}$/);
     const taskId = String(started.details.taskId);
     expect(registry.get(taskId)?.status).toBe("running");
 

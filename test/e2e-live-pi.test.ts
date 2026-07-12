@@ -4,10 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import { startMockModel, type CapturedRequest, type Turn } from "./helpers/mock-openai.js";
 import { flattenProjectPath } from "../src/claude/memory.js";
 import { resolveShellBinary } from "../src/engine/shell-inject.js";
+import { resolveSubagentTranscript } from "../src/util/subagent-transcripts.js";
 
 /**
  * Live end-to-end tests: the REAL Pi CLI (dist/cli.js) runs the assembled
@@ -99,6 +101,8 @@ interface RunResult {
   stderr: string;
   requests: CapturedRequest[];
   fixture: string;
+  /** The per-run PI_CODING_AGENT_DIR (sessions land under <agentDir>/sessions). */
+  agentDir: string;
 }
 
 type FixtureName = "hello-claude" | "full-surface";
@@ -109,6 +113,8 @@ async function runPi(opts: {
   fixture?: FixtureName;
   extraEnv?: Record<string, string>;
   setup?: (fixtureDir: string) => void;
+  /** Keep session persistence ON (drops --no-session) — transcript scenarios (t02). */
+  persistSession?: boolean;
 }): Promise<RunResult> {
   const fixture = materializeFixture(opts.fixture ?? "hello-claude");
   fixtures.push(fixture);
@@ -122,7 +128,14 @@ async function runPi(opts: {
 
     const child = spawn(
       process.execPath,
-      [CLI_PATH, "-e", EXTENSION_PATH, "--no-session", "-p", opts.prompt],
+      [
+        CLI_PATH,
+        "-e",
+        EXTENSION_PATH,
+        ...(opts.persistSession ? [] : ["--no-session"]),
+        "-p",
+        opts.prompt,
+      ],
       {
         cwd: fixture,
         env: {
@@ -148,7 +161,7 @@ async function runPi(opts: {
     const killTimer = setTimeout(() => child.kill(), RUN_TIMEOUT_MS);
     const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
     clearTimeout(killTimer);
-    return { code, stdout, stderr, requests: mock.requests, fixture };
+    return { code, stdout, stderr, requests: mock.requests, fixture, agentDir };
   } finally {
     await mock.close();
   }
@@ -847,6 +860,78 @@ describe.skipIf(cliMissing)(
         expect(result.stdout).toContain("saw the failure");
         // No crash noise from the failed dispatch.
         expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|unhandledRejection|FATAL/i);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario t02: persisted subagent transcript + model-visible agent ID (real stack) ---
+    it(
+      "persists the subagent transcript next to the main session and delivers the agent ID trailer to the parent",
+      async () => {
+        // The child is the general-purpose builtin — its PERSONA body appears
+        // only in the child's system prompt (the parent catalog carries just
+        // the description).
+        const isChild = (r: CapturedRequest) =>
+          systemText(r).includes("You are a general-purpose agent");
+        const isParent = (r: CapturedRequest) => !isChild(r);
+        const result = await runPi({
+          persistSession: true, // NOT --no-session: the main session file must exist (t02)
+          script: [
+            {
+              when: isParent,
+              toolCalls: [
+                {
+                  name: "Agent",
+                  args: { subagent_type: "general-purpose", prompt: "summarize the project" },
+                },
+              ],
+            },
+            { when: isChild, text: "SUBAGENT-TRANSCRIPT-CANARY: summary done" },
+            { when: isParent, text: "delegated fine" },
+          ],
+          prompt: "delegate a summary to a general-purpose agent",
+        });
+
+        expect(result.code).toBe(0);
+
+        // 1) The parent MODEL received the delimited agent-ID trailer in the
+        //    tool result content (details would never reach it).
+        const trailerRe = /\[agent (agent-[0-9a-f]{12}) completed — resumable via SendMessage\]/;
+        const withTrailer = result.requests.find((r) => trailerRe.test(toolResultText(r)));
+        expect(withTrailer, "parent must receive the agent-ID trailer").toBeDefined();
+        const trailerText = toolResultText(withTrailer!);
+        expect(trailerText).toContain("SUBAGENT-TRANSCRIPT-CANARY: summary done");
+        const agentId = trailerRe.exec(trailerText)![1]!;
+
+        // 2) The subagent transcript exists in the <mainBase>.subagents sibling
+        //    directory of the REAL main session transcript, written by the REAL
+        //    Pi AgentSession, and the exported resolver maps the ID to it.
+        const sessionsRoot = path.join(result.agentDir, "sessions");
+        const mainFiles: string[] = [];
+        const walk = (dir: string) => {
+          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) walk(full);
+            else if (entry.name.endsWith(".jsonl") && !dir.endsWith(".subagents")) {
+              mainFiles.push(full);
+            }
+          }
+        };
+        walk(sessionsRoot);
+        expect(mainFiles.length, `expected a main session transcript under ${sessionsRoot}`).toBeGreaterThanOrEqual(1);
+        const resolved = mainFiles
+          .map((main) => resolveSubagentTranscript(main, agentId))
+          .find((p): p is string => p !== undefined);
+        expect(resolved, "resolver must locate the subagent transcript from the main session").toBeDefined();
+        expect(fs.readFileSync(resolved!, "utf8")).toContain("SUBAGENT-TRANSCRIPT-CANARY");
+
+        // 3) Dispose→reopen round-trip on the real file: the session reopens
+        //    under the same ID with the run's messages intact.
+        const reopened = SessionManager.open(resolved!);
+        expect(reopened.getSessionId()).toBe(agentId);
+        const restored = JSON.stringify(reopened.buildSessionContext().messages);
+        expect(restored).toContain("summarize the project");
+        expect(restored).toContain("SUBAGENT-TRANSCRIPT-CANARY: summary done");
       },
       TEST_TIMEOUT_MS,
     );

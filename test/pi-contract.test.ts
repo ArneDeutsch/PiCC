@@ -36,6 +36,12 @@ describe("pi 0.80.x API contract", () => {
     expect(typeof sdk.SettingsManager.inMemory).toBe("function");
   });
 
+  it("SessionManager exposes create/open for persisted subagent transcripts (t02)", async () => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    expect(typeof sdk.SessionManager.create).toBe("function");
+    expect(typeof sdk.SessionManager.open).toBe("function");
+  });
+
   it("typebox + StringEnum are importable the way our tools use them", async () => {
     const { Type } = await import("typebox");
     const { StringEnum } = await import("@earendil-works/pi-ai");

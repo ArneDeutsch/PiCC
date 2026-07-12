@@ -916,6 +916,34 @@ describe("HookRunner stdin payload", () => {
     expect("transcript_path" in payload2).toBe(false);
   });
 
+  it("SubagentStop with NO transcript_path in the payload gets the runner's default (main) — subagent parity (t02)", async () => {
+    // t02 review round 2: PiCC fires SubagentStop inside a dispatch WITHOUT a
+    // payload transcript_path, so the HookRunner's own default getter (the MAIN
+    // session transcript) is what reaches the hook — never the subagent's file.
+    const dir = makeTempDir();
+    const outFile = path.join(dir, "payload.json");
+    const mainTranscript = "C:\\sessions\\main-session.jsonl";
+    const { runner } = makeRunner(
+      { SubagentStop: [{ hooks: [`cat > "$OUT_FILE"`] }] },
+      {
+        projectDir: dir,
+        env: { OUT_FILE: bashPath(outFile) },
+        transcriptPath: () => mainTranscript,
+      },
+    );
+    // Payload as PiCC's fireSubagentStop now sends it: identity fields, no
+    // transcript_path.
+    await runner.fire("SubagentStop", {
+      subagent_type: "reviewer",
+      agent_id: "agent-aabbccddeeff",
+      agent_type: "reviewer",
+    });
+    const payload = JSON.parse(fs.readFileSync(outFile, "utf8")) as Record<string, unknown>;
+    expect(payload["transcript_path"]).toBe(mainTranscript);
+    expect(payload["agent_id"]).toBe("agent-aabbccddeeff");
+    expect(payload["agent_type"]).toBe("reviewer");
+  });
+
   it("delivers structured tool_response and tool_use_id verbatim (PostToolUse)", async () => {
     const dir = makeTempDir();
     const outFile = path.join(dir, "payload.json");

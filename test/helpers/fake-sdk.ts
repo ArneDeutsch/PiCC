@@ -1,6 +1,7 @@
 import {
   SubagentRuntime,
   type PiSdk,
+  type PiSessionManagerLike,
   type PiSessionMessage,
   type SubagentRuntimeDeps,
 } from "../../src/runtime/subagents.js";
@@ -19,6 +20,24 @@ import type { ClaudeAgent, HookOutcome } from "../../src/types.js";
  * normally — terminal failures live on the last assistant message, never as a
  * rejection (pi-agent-core agent-loop semantics).
  */
+
+/**
+ * The REAL Pi SessionManager, injected (not statically imported) so that
+ * vi.mock factories which `await import` this helper — e.g. builtin-agents.test,
+ * whose factory mocks the very `@earendil-works/pi-coding-agent` module this used
+ * to import at eval time — cannot deadlock on the circular module load. Persisted-
+ * transcript tests call `useRealSessionManager(SessionManager)` once at module
+ * scope; every other test leaves it unset and dispatches stay in-memory.
+ */
+type RealSessionManager = {
+  create(cwd: string, sessionDir: string, opts: { id: string }): PiSessionManagerLike;
+};
+let realSessionManager: RealSessionManager | undefined;
+
+/** Inject the real Pi SessionManager for persisted-transcript tests (see above). */
+export function useRealSessionManager(sm: RealSessionManager): void {
+  realSessionManager = sm;
+}
 
 /** One scripted assistant reply. Strings are shorthand for `{ text }`. */
 export interface FakeReply {
@@ -93,6 +112,17 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
         customTools: (sessionOptions.customTools as FakeCustomTool[]) ?? [],
       };
       sessions.push(state);
+      // Persistence mirror (t02): real AgentSessions write every message
+      // through their SessionManager — fake sessions do the same when the
+      // dispatch handed them one with appendMessage (the real SessionManager
+      // from persistedSessionManager below; the in-memory `{}` is a no-op).
+      const manager = sessionOptions.sessionManager as
+        | { appendMessage?: (message: unknown) => unknown }
+        | undefined;
+      const record = (message: PiSessionMessage) => {
+        state.messages.push(message);
+        manager?.appendMessage?.(message);
+      };
       let signalAbort: () => void = () => {};
       const abortedGate = new Promise<void>((resolve) => (signalAbort = resolve));
       return {
@@ -100,11 +130,18 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
           messages: state.messages,
           async prompt(text: string) {
             promptCalls++;
-            state.messages.push({ role: "user", content: text });
+            record({ role: "user", content: text });
             let reply: FakeReply;
             if (options.onPrompt) {
+              const before = state.messages.length;
               const scripted = await options.onPrompt(text, state);
-              if (scripted === undefined) return; // hook appended its own messages
+              if (scripted === undefined) {
+                // The hook appended its own messages — mirror them too.
+                for (const message of state.messages.slice(before)) {
+                  manager?.appendMessage?.(message);
+                }
+                return;
+              }
               reply = normalize(scripted);
             } else {
               reply = normalize(replies[Math.min(replyIndex, replies.length - 1)]);
@@ -113,7 +150,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
             if (reply.gate) await Promise.race([reply.gate, abortedGate]);
             if (state.aborted) {
               // Real Pi: an aborted run ends on a stopReason "aborted" assistant message.
-              state.messages.push({
+              record({
                 role: "assistant",
                 content: [],
                 stopReason: "aborted",
@@ -121,7 +158,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
               });
               return;
             }
-            state.messages.push({
+            record({
               role: "assistant",
               content: [{ type: "text", text: reply.text ?? "" }],
               stopReason: reply.stopReason ?? "stop",
@@ -142,6 +179,15 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
       async reload() {}
     },
     inMemorySessionManager: () => ({}),
+    // The REAL Pi SessionManager (t02): transcript tests exercise the actual
+    // create/flush/open surface. Only reached when a dispatch knows the main
+    // session file (deps.getMainSessionFile) AND a test injected the real
+    // manager via useRealSessionManager(); otherwise absent, so unit tests stay
+    // fully in-memory (and the "SDK lacks persistedSessionManager" path is real).
+    persistedSessionManager: realSessionManager
+      ? (cwd: string, sessionDir: string, id: string) =>
+          realSessionManager!.create(cwd, sessionDir, { id })
+      : undefined,
     inMemorySettingsManager: () => ({}),
     agentDir: () => "/fake-agent-dir",
   };

@@ -39,12 +39,19 @@ discovered impossible in t04).
   (`subagents.ts:706`) already reaches the model — include the agent ID there, and in
   TaskOutput text and t05's settlement notice. `details` additionally carries the
   structured copy (`agentId`, `transcriptPath`).
-- Subagent-scoped hooks currently receive the *parent's* transcript path
-  (`makeScopedHookRunner`, `src/index.ts:605-615`) and are constructed **before** the
-  subagent session exists (`subagents.ts:303-318` vs `:521`) — a late-bound getter is
-  needed to hand hooks the subagent's own transcript path. While here, add `agent_id`
-  (alongside the existing agent type) to SubagentStart/SubagentStop hook payloads —
-  Claude Code hook input carries both (`doc/research/02-claude-code-internals.md:336-342`).
+- Subagent hooks: add `agent_id` **and** `agent_type` to every hook event fired inside
+  a dispatch (SubagentStart/SubagentStop and PreToolUse/PostToolUse fired from within
+  the subagent) — Claude Code hook input carries both as subagent-only fields
+  (`doc/research/02-claude-code-internals.md:341-342`).
+  **PARITY CORRECTION (t02 review round 2):** an earlier draft of this seam called for
+  re-pointing the hooks' `transcript_path` to the subagent's *own* transcript. That is
+  **wrong** for Claude Code — verified against the hooks reference: inside a subagent,
+  `transcript_path` still points at the **main/parent** session transcript
+  (`doc/research/02-claude-code-internals.md:336`, common payload). PiCC must NOT clobber
+  `transcript_path` on subagent hook payloads; it stays = main. The subagent's own
+  transcript is discovered via the exported resolver + the ID trailer (feature.md's
+  promised channel), not via hooks. (Our pinned baseline documents no separate
+  `agent_transcript_path` field, so we do not emit one.)
 - **Resume-feasibility verification (moved here from t04):** an offline test proving
   dispatch → dispose → reopen (via `SessionManager.open` or
   `createAgentSession({sessionManager})`) yields the prior messages intact — on
@@ -96,7 +103,8 @@ scoped hooks receive the subagent's transcript path and `agent_id` in payloads.
 - [ ] After any dispatch a transcript exists, discoverable via the hardened resolver.
 - [ ] The coordinator model can read the agent ID from the tool result / start message.
 - [ ] Dispose→reopen round-trip proven on both platforms (or escalated).
-- [ ] Subagent hooks get their own transcript path + agent_id.
+- [ ] Subagent hooks carry `agent_id` + `agent_type`; `transcript_path` stays = the
+      main session transcript (Claude Code parity — NOT re-pointed to the subagent's).
 - [ ] New Pi surfaces pinned in pi-contract tests.
 - [ ] typecheck and full test suite green (flake policy per feature.md).
 

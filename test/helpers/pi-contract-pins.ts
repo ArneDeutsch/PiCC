@@ -6,7 +6,10 @@
  * loudly with the tsc message.
  */
 import type { AssistantMessage, StopReason } from "@earendil-works/pi-ai";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { NewSessionOptions, ToolDefinition } from "@earendil-works/pi-coding-agent";
+// Value import of the CLASS (for its static side); still never executed —
+// this file is only ever compiled.
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 // Exact StopReason vocabulary — a missing or extra member fails to compile.
 // PiCC's outcome classification keys off "error" / "aborted" / "length".
@@ -33,3 +36,30 @@ type Exec = ToolDefinition["execute"];
 export const executeArity: Parameters<Exec>["length"] = 5;
 export const executeSignal: Parameters<Exec>[2] = new AbortController().signal;
 export const executeSignalOptional: Parameters<Exec>[2] = undefined;
+
+// --- t02: subagent transcript persistence surface ---
+
+// SessionManager.create(cwd, sessionDir?, options?) — the custom sessionDir +
+// pinned-id form PiCC uses for subagent transcripts — returns a SessionManager.
+export const createArgs: Parameters<typeof SessionManager.create> = [
+  "/cwd",
+  "/custom/session/dir",
+  { id: "agent-0123456789ab" },
+];
+export const createReturns: ReturnType<typeof SessionManager.create> extends SessionManager
+  ? "ok"
+  : "PIN BROKEN: SessionManager.create no longer returns a SessionManager" = "ok";
+
+// NewSessionOptions.id is the optional string pinning the session/file identity.
+export const newSessionId: NewSessionOptions["id"] = "agent-0123456789ab";
+export const newSessionIdOptional: NewSessionOptions["id"] = undefined;
+
+// SessionManager.open(path, sessionDir?, cwdOverride?) reopens a transcript…
+export const openArgs: Parameters<typeof SessionManager.open> = ["/file.jsonl", "/dir", "/cwd"];
+export const openReturns: ReturnType<typeof SessionManager.open> extends SessionManager
+  ? "ok"
+  : "PIN BROKEN: SessionManager.open no longer returns a SessionManager" = "ok";
+
+// …and the reopened manager exposes the restore/read surface dispatch relies on.
+export const sessionFileGetter: ReturnType<SessionManager["getSessionFile"]> = undefined;
+export const restoreSurface: keyof SessionManager = "buildSessionContext";

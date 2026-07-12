@@ -1,5 +1,6 @@
 import { Type } from "typebox";
 import type { Diagnostic } from "../types.js";
+import { agentTrailerFrame, agentTrailerLine } from "../util/subagent-transcripts.js";
 
 /**
  * Background task runtime (audit E4): `run_in_background: true` on the Agent
@@ -20,6 +21,14 @@ export interface BackgroundResultLike {
   outcome: "completed" | "failed" | "aborted";
   /** The subagent's final message, verbatim (on failure: best-effort partial output). */
   finalMessage: string;
+  /** Agent identity (t02 contract): unique per agent, stable across resumes. */
+  agentId?: string;
+  /** On-disk JSONL transcript of the subagent's session, when persisted. */
+  transcriptPath?: string;
+  /** True when the agent can be continued under `agentId` (t04). */
+  resumable?: boolean;
+  /** True when `finalMessage` was truncated and already carries a cut-off frame (t02). */
+  truncated?: boolean;
   agentName?: string;
   /** The single error channel: present iff `outcome !== "completed"`. */
   error?: string;
@@ -37,6 +46,17 @@ export interface BackgroundTaskRecord {
   result?: string;
   error?: string;
   agentName?: string;
+  /**
+   * Agent identity (t02): set eagerly at start() when the dispatcher pre-mints
+   * it (the Agent tool does), confirmed/overwritten from the settled result.
+   */
+  agentId?: string;
+  /** On-disk JSONL transcript of the subagent's session, when persisted. */
+  transcriptPath?: string;
+  /** True when the settled agent can be continued under `agentId` (t04). */
+  resumable?: boolean;
+  /** True when `result` was truncated and already carries a cut-off frame (t02). */
+  truncated?: boolean;
   diagnostics: Diagnostic[];
   /** Settles when the underlying dispatch ends (never rejects). */
   settled: Promise<void>;
@@ -54,12 +74,18 @@ export class BackgroundTaskRegistry {
    * attached in BOTH directions, so a failing background dispatch can never
    * become an unhandled rejection.
    */
-  start(label: string, promise: Promise<BackgroundResultLike>, abort?: () => void): string {
+  start(
+    label: string,
+    promise: Promise<BackgroundResultLike>,
+    abort?: () => void,
+    agentId?: string,
+  ): string {
     const id = `task-${++this.counter}`;
     const record: BackgroundTaskRecord = {
       id,
       label,
       status: "running",
+      agentId,
       diagnostics: [],
       settled: Promise.resolve(),
       abort,
@@ -67,6 +93,12 @@ export class BackgroundTaskRegistry {
     record.settled = promise.then(
       (result) => {
         record.agentName = result.agentName;
+        // Identity mirror (t02): the settled result is authoritative (the
+        // pre-minted id matches it when the Agent tool passed one through).
+        record.agentId = result.agentId ?? record.agentId;
+        record.transcriptPath = result.transcriptPath;
+        record.resumable = result.resumable === true;
+        record.truncated = result.truncated === true;
         record.diagnostics.push(...(result.diagnostics ?? []));
         if (record.status === "stopped") {
           // TaskStop contract: a stopped task's result is discarded.
@@ -185,12 +217,25 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
       switch (task.status) {
         case "completed":
           // Verbatim-return contract (plan §4.3): the final message unwrapped.
+          // Resumable agents additionally get the delimited agent-ID trailer
+          // (t02) — same framing as the foreground Agent tool result. A
+          // truncated result already ends with a `---` cut-off frame, so the
+          // trailer rides INSIDE it (single `\n`, non-"completed" wording)
+          // rather than stacking a second frame (t02 review item 4).
           text = task.result ?? "";
+          if (task.resumable && task.agentId) {
+            text += task.truncated
+              ? `\n${agentTrailerLine(task.agentId, { completed: false })}`
+              : agentTrailerFrame(task.agentId, { completed: true });
+          }
           break;
         case "failed":
           text = `Background task ${id} (${task.label}) failed: ${task.error ?? "unknown error"}`;
           if (task.result?.trim()) {
             text += `\n\nPartial output before the failure:\n${task.result}`;
+          }
+          if (task.resumable && task.agentId) {
+            text += agentTrailerFrame(task.agentId, { completed: false });
           }
           break;
         case "stopped":
@@ -206,6 +251,9 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
           taskId: id,
           status: task.status,
           agent: task.agentName,
+          agentId: task.agentId,
+          transcriptPath: task.transcriptPath,
+          resumable: task.resumable,
           diagnostics: task.diagnostics,
         },
       };
