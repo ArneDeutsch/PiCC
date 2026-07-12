@@ -1,7 +1,9 @@
 # PiCC ↔ Pi integration contracts
 
 > **Status:** Working design record. Pinned against **Pi v0.80.6** (`@earendil-works/pi-coding-agent`,
-> `pi-agent-core`, `pi-ai` — all 0.80.6, verified on npm 2026-07-11). Node ≥ 20 (we develop on 24).
+> `pi-agent-core`, `pi-ai` — all 0.80.6, verified on npm 2026-07-11). Effective Node floor ≥ 22.19:
+> Pi declares ≥ 20, but its bundled undici 8.x (engines ≥ 22.19) crashes on Node 20 at import
+> (`worker_threads.markAsUncloneable` missing). We develop on 24.
 > Source of truth for every Pi API PiCC builds on. If Pi churns, update here first.
 >
 > Decision Q1 (fork vs depend): **depend + extension bundle**. Pi is a regular npm dependency;

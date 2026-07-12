@@ -11,7 +11,7 @@ cd picc
 npm install --ignore-scripts
 ```
 
-Node ≥ 20 and git are required. On Windows, Git Bash must be on PATH (see the user guide).
+Node ≥ 22.19 and git are required (Pi's bundled undici 8.x does not run on Node 20). On Windows, Git Bash must be on PATH (see the user guide).
 
 ## Develop
 
@@ -58,7 +58,7 @@ with `it.skipIf`.
 - Add or update tests for behavior changes — prefer an end-to-end scenario for anything a user
   would observe.
 - Run `npm run typecheck` and `npm test` before opening the PR. CI runs the same across
-  Windows/Linux on Node 20 and 22.
+  Windows/Linux on Node 22 and 24.
 - Note any capability-registry or documentation updates in the PR description.
 
 ## Reporting issues

@@ -6,6 +6,16 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed — first CI run on GitHub (2026-07-12)
+
+- **Node floor raised to ≥ 22.19** (`engines`, CI matrix now 22/24, docs): Pi's bundled
+  undici 8.x requires `worker_threads.markAsUncloneable`, which does not exist on Node 20 —
+  the harness (and the e2e-driven Pi CLI) crashes at import there.
+- **Fixed Linux-only test failures**: `rules.test.ts` used a hardcoded `F:\` Windows root
+  (invalid absolute path on POSIX); the `full-surface` example hook scripts (`write-guard.sh`,
+  `preflight.sh`) were committed without the executable bit, so hooks silently produced no
+  output on Linux.
+
 Deep completeness audit against Claude Code 2.1.x (official docs, changelog, and the
 `anthropics/claude-code` issue tracker) — see `doc/review/2026-07-12-completeness-audit.md`
 for the full gap analysis. All P1/P2 gaps fixed with tests.

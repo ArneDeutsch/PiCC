@@ -30,7 +30,7 @@ Nothing is written to your project's tracked files. For the full design see
 
 ## 1. Requirements
 
-- **Node.js ≥ 20** and npm
+- **Node.js ≥ 22.19** and npm (Node 20 does not work: Pi's bundled undici 8.x requires ≥ 22.19)
 - **git** (2.40+ recommended)
 - **Windows:** Git Bash on PATH (Pi's `bash` tool and most Claude projects' scripts assume bash;
   PowerShell is used where artifacts declare `shell: powershell`)

@@ -14,7 +14,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        node: [20, 22]
+        # Node 20 is not supported: Pi bundles undici 8.x (engines >=22.19),
+        # whose worker_threads.markAsUncloneable dependency does not exist on 20.
+        node: [22, 24]
     steps:
       - uses: actions/checkout@v4
 
@@ -45,7 +47,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install

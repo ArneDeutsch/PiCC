@@ -157,7 +157,9 @@ describe("loadRules", () => {
 });
 
 describe("ruleAppliesTo", () => {
-  const root = "F:\\some\\project";
+  // Platform-valid absolute root: resolves to <cwd-drive>:\some\project on
+  // Windows and /some/project on POSIX (a literal "F:\..." is not absolute on Linux).
+  const root = path.resolve("/some/project");
 
   it("unconditional rules always apply", () => {
     expect(ruleAppliesTo(rule({}), path.join(root, "doc", "x.md"), root)).toBe(true);
