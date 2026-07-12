@@ -17,9 +17,14 @@ import {
   resetInjectionState,
 } from "../src/runtime/context-assembly.js";
 import { mapEffort, steeringForModel, type PiCCConfig } from "../src/runtime/steering.js";
-import { SubagentRuntime, createAgentToolDefinition, extractText, type PiSdk } from "../src/runtime/subagents.js";
-import { PermissionEngine } from "../src/engine/permissions.js";
-import { HookRunner } from "../src/engine/hook-runner.js";
+import { createAgentToolDefinition, extractText, type SubagentRuntime } from "../src/runtime/subagents.js";
+import {
+  fakeSdk,
+  makeAgent,
+  makeSubagentRuntime,
+  type FakeReply,
+  type SubagentRuntimeOverrides,
+} from "./helpers/fake-sdk.js";
 import type { ClaudeAgent, ClaudeSettings } from "../src/types.js";
 
 function baseSettings(): ClaudeSettings {
@@ -39,19 +44,6 @@ function baseSettings(): ClaudeSettings {
     unknownKeys: [],
     deferredKeys: [],
     diagnostics: [],
-  };
-}
-
-function makeAgent(overrides: Partial<ClaudeAgent> = {}): ClaudeAgent {
-  return {
-    name: "reviewer",
-    description: "Reviews things",
-    metadata: {},
-    body: "You are the reviewer.",
-    source: { path: "<test>", scope: "project" },
-    unknownKeys: [],
-    diagnostics: [],
-    ...overrides,
   };
 }
 
@@ -387,66 +379,13 @@ describe("context assembly", () => {
 });
 
 describe("SubagentRuntime (fake SDK)", () => {
-  function fakeSdk(replies: string[]): { sdk: PiSdk; created: Array<Record<string, unknown>> } {
-    const created: Array<Record<string, unknown>> = [];
-    let i = 0;
-    const sdk: PiSdk = {
-      async createAgentSession(options) {
-        created.push(options);
-        const messages: Array<{ role: string; content: unknown }> = [];
-        return {
-          session: {
-            async prompt(text: string) {
-              messages.push({ role: "user", content: text });
-              const reply = replies[Math.min(i, replies.length - 1)];
-              i++;
-              messages.push({ role: "assistant", content: [{ type: "text", text: reply }] });
-            },
-            messages,
-            dispose() {},
-          },
-        };
-      },
-      DefaultResourceLoader: class {
-        constructor(public options: Record<string, unknown>) {}
-        async reload() {}
-      },
-      inMemorySessionManager: () => ({}),
-      inMemorySettingsManager: () => ({}),
-      agentDir: () => "/fake/agent-dir",
-    };
-    return { sdk, created };
-  }
-
-  function makeRuntime(agents: ClaudeAgent[], replies: string[], overrides: Record<string, unknown> = {}) {
-    const { sdk, created } = fakeSdk(replies);
-    const engine = new PermissionEngine(
-      { allow: [], deny: [], ask: [], additionalDirectories: [] },
-      { cwd: process.cwd() },
-    );
-    const hookRunner = new HookRunner({
-      config: {},
-      projectDir: process.cwd(),
-      sessionId: "t",
-      env: {},
-      disableAllHooks: true,
-    });
-    const runtime = new SubagentRuntime({
-      getAgents: () => agents,
-      buildSystemPrompt: (a) => `SYSTEM:${a.name}`,
-      customToolsFor: () => [],
-      allKnownToolNames: () => ["Read", "Write", "Edit", "Bash", "Grep", "Glob"],
-      permissionEngine: engine,
-      hookRunner,
-      getCwd: () => process.cwd(),
-      resolveModel: () => undefined,
-      mapEffort: () => undefined,
-      maxDepth: 2,
-      concurrency: 2,
-      sessionId: "t",
-      sdk,
-      ...overrides,
-    } as never);
+  function makeRuntime(
+    agents: ClaudeAgent[],
+    replies: Array<string | FakeReply>,
+    overrides: SubagentRuntimeOverrides = {},
+  ) {
+    const { sdk, created } = fakeSdk({ replies });
+    const runtime = makeSubagentRuntime(agents, sdk, overrides);
     return { runtime, created };
   }
 
@@ -574,63 +513,23 @@ describe("SubagentRuntime (fake SDK)", () => {
 
   it("depth-2 nested dispatch completes at concurrency 1 (regression: semaphore deadlock)", async () => {
     const agents = [makeAgent({ name: "outer" }), makeAgent({ name: "inner" })];
-    const engine = new PermissionEngine(
-      { allow: [], deny: [], ask: [], additionalDirectories: [] },
-      { cwd: process.cwd() },
-    );
-    const hookRunner = new HookRunner({
-      config: {},
-      projectDir: process.cwd(),
-      sessionId: "t",
-      env: {},
-      disableAllHooks: true,
-    });
     // A fake model: the outer session "calls" the nested Agent tool, the inner replies.
-    const sdk: PiSdk = {
-      async createAgentSession(options) {
-        const messages: Array<{ role: string; content: unknown }> = [];
-        const customTools = (options.customTools as Array<Record<string, any>>) ?? [];
-        return {
-          session: {
-            async prompt(text: string) {
-              messages.push({ role: "user", content: text });
-              const agentTool = customTools.find((t) => t.name === "Agent");
-              if (agentTool && text.includes("delegate")) {
-                const res = await agentTool.execute("id", { subagent_type: "inner", prompt: "leaf work" });
-                messages.push({ role: "assistant", content: [{ type: "text", text: `nested:${res.content[0].text}` }] });
-              } else {
-                messages.push({ role: "assistant", content: [{ type: "text", text: "leaf-done" }] });
-              }
-            },
-            messages,
-            dispose() {},
-          },
-        };
+    const { sdk } = fakeSdk({
+      onPrompt: async (text, session) => {
+        const agentTool = session.customTools.find((t) => t.name === "Agent");
+        if (agentTool && text.includes("delegate")) {
+          const res = await agentTool.execute("id", { subagent_type: "inner", prompt: "leaf work" });
+          return `nested:${res.content[0].text}`;
+        }
+        return "leaf-done";
       },
-      DefaultResourceLoader: class {
-        constructor(public options: Record<string, unknown>) {}
-        async reload() {}
-      },
-      inMemorySessionManager: () => ({}),
-      inMemorySettingsManager: () => ({}),
-      agentDir: () => "/fake",
-    };
-    const runtime: SubagentRuntime = new SubagentRuntime({
-      getAgents: () => agents,
-      buildSystemPrompt: (a: ClaudeAgent) => `S:${a.name}`,
+    });
+    const runtime: SubagentRuntime = makeSubagentRuntime(agents, sdk, {
       customToolsFor: (_a: ClaudeAgent, _g: string[], depth: number) =>
         depth + 1 <= 2 ? [createAgentToolDefinition(runtime, { depth, name: "Agent" })] : [],
       allKnownToolNames: () => ["Read"],
-      permissionEngine: engine,
-      hookRunner,
-      getCwd: () => process.cwd(),
-      resolveModel: () => undefined,
-      mapEffort: () => undefined,
-      maxDepth: 2,
       concurrency: 1, // old code: guaranteed deadlock for ANY depth-2 nesting
-      sessionId: "t",
-      sdk,
-    } as never);
+    });
     const result = await runtime.dispatch({ subagentType: "outer", prompt: "please delegate", depth: 1 });
     expect(result.ok).toBe(true);
     expect(result.finalMessage).toBe("nested:leaf-done");

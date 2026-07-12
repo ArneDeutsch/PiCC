@@ -16,9 +16,27 @@ export interface MockToolCall {
   args: Record<string, unknown>;
 }
 
+/** Scripted HTTP error response (t01: error-path e2e). */
+export interface MockErrorSpec {
+  /** HTTP status to answer with (e.g. 429, 500). */
+  status: number;
+  /** Message for the OpenAI-style error body. */
+  message?: string;
+  /**
+   * Sticky (the default): the turn is NEVER consumed, so Pi's automatic retries
+   * — and any later request matching `when` — keep hitting the same error
+   * instead of falling through to the script-exhaustion `{text: "done"}`
+   * fallback (which would convert a retried failure into a success).
+   * Set `sticky: false` for a one-shot error.
+   */
+  sticky?: boolean;
+}
+
 export interface Turn {
   toolCalls?: MockToolCall[];
   text?: string;
+  /** Serve an HTTP error instead of a completion (takes precedence). */
+  error?: MockErrorSpec;
   /**
    * Optional gate for concurrent-session scripts: the turn is only served to a
    * request this predicate accepts. On each request the server picks the FIRST
@@ -163,7 +181,8 @@ export async function startMockModel(script: Turn[]): Promise<MockModelServer> {
       if (consumed[i]) continue;
       const candidate = script[i]!;
       if (candidate.when && !candidate.when(request)) continue;
-      consumed[i] = true;
+      // Sticky error turns are never consumed: Pi's retries keep hitting them.
+      if (!(candidate.error && candidate.error.sticky !== false)) consumed[i] = true;
       return candidate;
     }
     return { text: "done" };
@@ -198,6 +217,22 @@ export async function startMockModel(script: Turn[]): Promise<MockModelServer> {
 
     const turn = nextTurn(captured);
     const model = typeof body.model === "string" ? body.model : "mock-1";
+
+    if (turn.error) {
+      // OpenAI-style error body; applies to streaming and non-streaming requests
+      // alike (clients check the HTTP status before consuming any stream).
+      res.writeHead(turn.error.status, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: {
+            message: turn.error.message ?? `mock: scripted error (${turn.error.status})`,
+            type: "mock_scripted_error",
+            code: turn.error.status,
+          },
+        }),
+      );
+      return;
+    }
 
     if (body.stream === false) {
       res.writeHead(200, { "content-type": "application/json" });

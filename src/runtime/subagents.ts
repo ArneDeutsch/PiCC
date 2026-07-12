@@ -91,21 +91,45 @@ export interface PiSdk {
   agentDir(): string;
 }
 
+/**
+ * Structural view of a Pi session message. Real assistant messages carry a
+ * required `stopReason` (pi-ai `AssistantMessage`) and an `errorMessage` when
+ * the run ended on a terminal LLM failure — optional here so simple fakes and
+ * non-assistant roles stay assignable.
+ */
+export interface PiSessionMessage {
+  role: string;
+  content: unknown;
+  stopReason?: string;
+  errorMessage?: string;
+}
+
 interface PiSession {
   prompt(text: string): Promise<void>;
-  messages: Array<{ role: string; content: unknown }>;
+  messages: PiSessionMessage[];
   dispose(): void;
   setThinkingLevel?(level: string): void;
   /** Cooperative abort (real Pi sessions expose it; TaskStop uses it best-effort). */
   abort?(): Promise<void> | void;
 }
 
+/** Classified fate of a dispatch. Mirrored by `BackgroundResultLike` (t01 contract). */
+export type DispatchOutcome = "completed" | "failed" | "aborted";
+
 export interface DispatchResult {
+  /** True iff `outcome === "completed"`. */
   ok: boolean;
-  /** The subagent's final assistant message, verbatim. */
+  /** Every exit path classifies: completed, failed (terminal error), or aborted (deliberate stop). */
+  outcome: DispatchOutcome;
+  /**
+   * The subagent's final assistant message, verbatim. On a failed run this is
+   * the best-effort partial output produced before the failure (post-compaction
+   * content — compaction inside prompt() may have rewritten earlier turns), or "".
+   */
   finalMessage: string;
   agentName?: string;
   worktreePath?: string;
+  /** The single error channel: present iff `outcome !== "completed"`, names the cause. */
   error?: string;
   diagnostics: Diagnostic[];
 }
@@ -273,6 +297,7 @@ export class SubagentRuntime {
       const known = [...agents, ...builtins].map((a) => a.name).join(", ");
       return {
         ok: false,
+        outcome: "failed",
         finalMessage: "",
         error: `Unknown subagent_type "${opts.subagentType}". Available: ${known || "(none)"}`,
         diagnostics,
@@ -281,6 +306,7 @@ export class SubagentRuntime {
     if (opts.depth > this.deps.maxDepth) {
       return {
         ok: false,
+        outcome: "failed",
         finalMessage: "",
         agentName: agent.name,
         error: `Subagent nesting depth ${opts.depth} exceeds the configured maximum of ${this.deps.maxDepth}.`,
@@ -290,6 +316,7 @@ export class SubagentRuntime {
     if (opts.abortSignal?.aborted) {
       return {
         ok: false,
+        outcome: "aborted",
         finalMessage: "",
         agentName: agent.name,
         error: `Subagent "${agent.name}" was stopped before it started.`,
@@ -379,6 +406,7 @@ export class SubagentRuntime {
         }).catch(() => undefined);
         return {
           ok: false,
+          outcome: "aborted",
           finalMessage: "",
           agentName: agent.name,
           error: `Subagent "${agent.name}" was stopped before it started.`,
@@ -395,6 +423,7 @@ export class SubagentRuntime {
       if (startOutcome?.block) {
         return {
           ok: false,
+          outcome: "failed",
           finalMessage: "",
           agentName: agent.name,
           error: `SubagentStart hook blocked dispatch${startOutcome.blockReason ? `: ${startOutcome.blockReason}` : ""}`,
@@ -431,6 +460,7 @@ export class SubagentRuntime {
         }).catch(() => undefined);
         return {
           ok: false,
+          outcome: "aborted",
           finalMessage: "",
           agentName: agent.name,
           worktreePath,
@@ -528,7 +558,9 @@ export class SubagentRuntime {
         const live = session;
         abortListener = () => {
           try {
-            void live.abort?.();
+            // Promise.resolve absorbs both sync returns and promises; the catch
+            // keeps a rejecting abort() from becoming an unhandled rejection.
+            Promise.resolve(live.abort?.()).catch(() => {});
           } catch {
             // best-effort — an abort failure must not corrupt the dispatch
           }
@@ -541,17 +573,71 @@ export class SubagentRuntime {
       const fullPrompt = agent.initialPrompt
         ? `${agent.initialPrompt}\n\n${prompt}`
         : prompt;
+
+      // Post-prompt() classification (t01): Pi's prompt() resolves NORMALLY on a
+      // terminal LLM failure — the failure lives on the last assistant message as
+      // stopReason "error"/"aborted". Called after every prompt() so the retry and
+      // SubagentStop-loop re-prompts are classified too.
+      const live = session;
+      let truncated = false;
+      let truncationDiagnosed = false;
+      const terminalOutcome = (): DispatchResult | undefined => {
+        const last = lastAssistantMessage(live);
+        if (last?.stopReason === "error") {
+          return {
+            ok: false,
+            outcome: "failed",
+            // Best-effort partial output: whatever assistant text exists post-run
+            // (compaction inside prompt() may have rewritten earlier turns).
+            finalMessage: assistantTextSoFar(live),
+            agentName: agent.name,
+            worktreePath,
+            error: `Agent terminated early due to an API error: ${capErrorText(last.errorMessage ?? "unknown error")}`,
+            diagnostics,
+          };
+        }
+        if (last?.stopReason === "aborted" || opts.abortSignal?.aborted) {
+          return {
+            ok: false,
+            outcome: "aborted",
+            finalMessage: "",
+            agentName: agent.name,
+            worktreePath,
+            error: `Subagent "${agent.name}" was aborted before completing its task.`,
+            diagnostics,
+          };
+        }
+        // A token-limit stop still completes, but never silently: the truncation
+        // is marked on the final message (below) and in the diagnostics.
+        truncated = last?.stopReason === "length";
+        if (truncated && !truncationDiagnosed) {
+          truncationDiagnosed = true;
+          diagnostics.push({
+            severity: "warning",
+            message: `subagent reply hit the model's output token limit (stop reason "length"); the returned message is truncated`,
+          });
+        }
+        return undefined;
+      };
+
       await session.prompt(fullPrompt);
+      {
+        const terminal = terminalOutcome();
+        if (terminal) return terminal;
+      }
 
       // Verbatim final assistant message (hard contract — no wrapping/summarizing).
       let finalMessage = lastAssistantText(session);
 
       // One-retry-on-empty convention (plan §4.3): a single re-prompt when nothing
-      // came back — skipped for aborted dispatches (their result is discarded anyway).
-      if (!finalMessage.trim() && !opts.abortSignal?.aborted) {
+      // came back — only for genuinely successful empty stops. Error/abort stops
+      // returned above (retrying them just repeated the failure and doubled latency).
+      if (!finalMessage.trim()) {
         await session.prompt(
           "Your previous reply was empty. Reply now with your final answer in the requested format.",
         );
+        const terminal = terminalOutcome();
+        if (terminal) return terminal;
         finalMessage = lastAssistantText(session);
         diagnostics.push({ severity: "info", message: "subagent returned empty; retried once" });
       }
@@ -566,8 +652,23 @@ export class SubagentRuntime {
           stop_hook_active: iteration > 0,
         });
         stopFired = true;
+        if (opts.abortSignal?.aborted) {
+          // Abort-race consistency (t01 review): a signal firing during
+          // SubagentStop-hook evaluation classifies aborted — the same way a
+          // signal firing while prompt() settles does (terminalOutcome). Aborted
+          // results are discarded by contract, so breaking out to a
+          // completed-looking result here would leak past the abort.
+          return {
+            ok: false,
+            outcome: "aborted",
+            finalMessage: "",
+            agentName: agent.name,
+            worktreePath,
+            error: `Subagent "${agent.name}" was aborted before completing its task.`,
+            diagnostics,
+          };
+        }
         if (!stopOutcome?.block) break;
-        if (opts.abortSignal?.aborted) break;
         if (iteration >= 3) {
           diagnostics.push({
             severity: "warning",
@@ -578,17 +679,35 @@ export class SubagentRuntime {
         await session.prompt(
           `[SubagentStop hook] Continue working: ${stopOutcome.blockReason ?? "the stop condition is not met yet"}`,
         );
+        const terminal = terminalOutcome();
+        if (terminal) return terminal;
         finalMessage = lastAssistantText(session);
       }
 
-      return { ok: true, finalMessage, agentName: agent.name, worktreePath, diagnostics };
+      if (truncated && finalMessage.trim()) {
+        finalMessage = appendCutOffNote(
+          finalMessage,
+          `The reply was truncated at the model's output token limit (stop reason "length"); the output above may be incomplete.`,
+        );
+      }
+      return {
+        ok: true,
+        outcome: "completed",
+        finalMessage,
+        agentName: agent.name,
+        worktreePath,
+        diagnostics,
+      };
     } catch (err) {
+      // Catch-all: covers createAgentSession itself throwing — the "API dead
+      // before the session exists" case — and any other dispatch-internal error.
       return {
         ok: false,
+        outcome: "failed",
         finalMessage: "",
         agentName: agent.name,
         worktreePath,
-        error: `Subagent "${agent.name}" failed: ${(err as Error).message}`,
+        error: `Subagent "${agent.name}" failed: ${capErrorText((err as Error)?.message ?? String(err))}`,
         diagnostics,
       };
     } finally {
@@ -621,9 +740,54 @@ export class SubagentRuntime {
 }
 
 function lastAssistantText(session: PiSession): string {
-  const assistants = session.messages.filter((m) => m.role === "assistant");
-  const last = assistants[assistants.length - 1];
+  const last = lastAssistantMessage(session);
   return last ? extractText(last.content) : "";
+}
+
+function lastAssistantMessage(session: PiSession): PiSessionMessage | undefined {
+  for (let i = session.messages.length - 1; i >= 0; i--) {
+    if (session.messages[i]!.role === "assistant") return session.messages[i];
+  }
+  return undefined;
+}
+
+/**
+ * Best-effort partial output of a failed run: the concatenated text of all
+ * assistant turns (blank-line separated). The dying turn usually has no text;
+ * when it does, that partial streamed text is preserved too.
+ */
+function assistantTextSoFar(session: PiSession): string {
+  return session.messages
+    .filter((m) => m.role === "assistant")
+    .map((m) => extractText(m.content))
+    .filter((t) => t.trim())
+    .join("\n\n");
+}
+
+/** Model-visible error text stays short: capped ~500 chars, never enriched. */
+const ERROR_TEXT_CAP = 500;
+
+/**
+ * Single-line, capped error text for the model-visible channel. Control
+ * characters and whitespace runs collapse to single spaces so a
+ * provider-controlled errorMessage cannot fabricate a multi-line fake
+ * cut-off frame. Mirrored in background-tasks.ts (kept local there to avoid
+ * a value-level import of this module).
+ */
+function capErrorText(message: string): string {
+  const flat = message.replace(/[\s\p{Cc}]+/gu, " ").trim();
+  return flat.length > ERROR_TEXT_CAP
+    ? `${flat.slice(0, ERROR_TEXT_CAP)} [truncated]`
+    : flat;
+}
+
+/**
+ * The cut-off-note mechanism (t01): partial/truncated subagent output followed
+ * by a clearly separated note naming the cause. The note is the ONLY error text
+ * ever mixed into the otherwise-verbatim message channel.
+ */
+function appendCutOffNote(text: string, note: string): string {
+  return `${text.replace(/\s+$/, "")}\n\n---\n[subagent cut off] ${note}`;
 }
 
 /**
@@ -679,7 +843,7 @@ export function createAgentToolDefinition(
       ),
       description: Type.Optional(Type.String({ description: "Short task label (ignored)" })),
     }),
-    async execute(_toolCallId: string, params: Record<string, unknown>) {
+    async execute(_toolCallId: string, params: Record<string, unknown>, signal?: AbortSignal) {
       const subagentType = String(params.subagent_type ?? "");
       const dispatchOpts = {
         subagentType,
@@ -709,8 +873,36 @@ export function createAgentToolDefinition(
           details: { background: true, taskId: id, agent: label },
         };
       }
-      const result = await runtime.dispatch(dispatchOpts);
+      // Foreground: Pi's per-call signal (parent Esc) aborts the dispatch.
+      const result = await runtime.dispatch({ ...dispatchOpts, abortSignal: signal });
+      if (result.outcome === "failed" && result.finalMessage.trim()) {
+        // Claude 2.1.200 semantics: real work done before an API death comes back
+        // as a SUCCESS result — the partial output plus a clearly separated
+        // cut-off note naming the error. Never a normal-looking success.
+        return {
+          content: [
+            {
+              type: "text",
+              text: appendCutOffNote(
+                result.finalMessage,
+                result.error ?? "The run ended on an API error before completing.",
+              ),
+            },
+          ],
+          details: {
+            agent: result.agentName,
+            worktreePath: result.worktreePath,
+            diagnostics: result.diagnostics,
+            outcome: result.outcome,
+            cutOff: true,
+            error: result.error,
+          },
+        };
+      }
       if (!result.ok) {
+        // Failed with no output ("Agent terminated early due to an API error: ...",
+        // or a pre-start failure naming its cause) and aborted runs (distinct
+        // wording naming the abort) both surface on the isError channel.
         throw new Error(result.error ?? "subagent failed");
       }
       // Verbatim-return contract (plan §4.3): callers parse finalMessage directly
@@ -721,6 +913,7 @@ export function createAgentToolDefinition(
           agent: result.agentName,
           worktreePath: result.worktreePath,
           diagnostics: result.diagnostics,
+          outcome: result.outcome,
           ...(params.run_in_background
             ? {
                 note: backgroundDisabled

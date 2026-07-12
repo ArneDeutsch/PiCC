@@ -18,26 +18,13 @@ const h = vi.hoisted(() => ({
 
 vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   const real = await importOriginal<Record<string, unknown>>();
+  // Shared fake-SDK builder (t01): the session/loader fakes live in one place.
+  const { fakeSdk } = await import("./helpers/fake-sdk.js");
+  const { sdk } = fakeSdk({ replies: ["bi-done"], created: h.created });
   return {
     ...real,
-    createAgentSession: async (options: Record<string, unknown>) => {
-      h.created.push(options);
-      const messages: Array<{ role: string; content: unknown }> = [];
-      return {
-        session: {
-          async prompt(text: string) {
-            messages.push({ role: "user", content: text });
-            messages.push({ role: "assistant", content: [{ type: "text", text: "bi-done" }] });
-          },
-          messages,
-          dispose() {},
-        },
-      };
-    },
-    DefaultResourceLoader: class {
-      constructor(public options: Record<string, unknown>) {}
-      async reload() {}
-    },
+    createAgentSession: (options: Record<string, unknown>) => sdk.createAgentSession(options),
+    DefaultResourceLoader: sdk.DefaultResourceLoader,
     SessionManager: { inMemory: () => ({}) },
     SettingsManager: { inMemory: () => ({}) },
     getAgentDir: () => "/fake-agent-dir",
@@ -115,7 +102,14 @@ afterAll(() => {
   process.chdir(originalCwd);
   if (savedUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
   else process.env.PICC_CLAUDE_USER_DIR = savedUserDir;
-  fs.rmSync(dir, { recursive: true, force: true });
+  // Windows: the just-vacated cwd can stay locked beyond any reasonable retry
+  // (external scanners) — same phenomenon as the inner `bare` dir below. Never
+  // fail the whole file over temp-dir cleanup; leave stragglers to OS tmp cleanup.
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  } catch {
+    // Transiently locked — intentionally ignored.
+  }
 });
 
 describe("built-in agents through the extension (E1/E2/E6)", () => {

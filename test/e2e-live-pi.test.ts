@@ -802,6 +802,55 @@ describe.skipIf(cliMissing)(
       TEST_TIMEOUT_MS,
     );
 
+    // --- Scenario t01: a subagent dying on a terminal API error surfaces as a NAMED failure ---
+    it(
+      "reports a subagent killed by a sticky API error as a named failure — never an empty success",
+      async () => {
+        // The child (Explore) session is identified by its read-only persona;
+        // every one of ITS requests — including any Pi auto-retries — hits the
+        // same sticky 429. The insufficient_quota message is non-retryable for
+        // Pi (pi-ai utils/retry.js), mirroring the drained-limit incident that
+        // motivated t01, so the child dies on its first request.
+        const isExplore = (r: CapturedRequest) =>
+          systemText(r).includes("read-only exploration agent");
+        const isParent = (r: CapturedRequest) => !isExplore(r);
+        const result = await runPi({
+          script: [
+            // 0) parent dispatches the Explore subagent (first request is the parent)
+            {
+              when: isParent,
+              toolCalls: [
+                { name: "Agent", args: { subagent_type: "Explore", prompt: "look around" } },
+              ],
+            },
+            // sticky terminal error for the child session (never consumed)
+            {
+              when: isExplore,
+              error: {
+                status: 429,
+                message: "insufficient_quota: mock usage limit drained (E2E-API-DEATH)",
+              },
+            },
+            // parent's follow-up once the failed tool result is in
+            { when: isParent, text: "saw the failure" },
+          ],
+          prompt: "explore the project (the subagent is doomed)",
+        });
+
+        expect(result.code).toBe(0);
+        // The parent's follow-up request carries a tool result NAMING the API error.
+        const failed = result.requests.find((r) =>
+          toolResultText(r).includes("Agent terminated early due to an API error"),
+        );
+        expect(failed, "parent must receive the named API failure as a tool result").toBeDefined();
+        expect(toolResultText(failed!)).toContain("E2E-API-DEATH");
+        expect(result.stdout).toContain("saw the failure");
+        // No crash noise from the failed dispatch.
+        expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|unhandledRejection|FATAL/i);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
     // --- Scenario 14 (E2E-5): stacked slash skills — /deploy /repo-info now (audit A7) ---
     it.skipIf(!BASH_AVAILABLE)(
       "stacks two leading slash skills in one prompt with args going to the last skill",

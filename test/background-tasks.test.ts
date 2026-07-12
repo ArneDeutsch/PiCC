@@ -3,94 +3,31 @@ import {
   BackgroundTaskRegistry,
   createTaskOutputTool,
   createTaskStopTool,
+  type BackgroundResultLike,
 } from "../src/runtime/background-tasks.js";
-import { SubagentRuntime, createAgentToolDefinition, type PiSdk } from "../src/runtime/subagents.js";
-import { PermissionEngine } from "../src/engine/permissions.js";
-import { HookRunner } from "../src/engine/hook-runner.js";
-import type { ClaudeAgent, Diagnostic } from "../src/types.js";
+import { createAgentToolDefinition } from "../src/runtime/subagents.js";
+import {
+  fakeSdk,
+  makeAgent as makeBaseAgent,
+  makeSubagentRuntime as makeRuntime,
+} from "./helpers/fake-sdk.js";
+import type { ClaudeAgent } from "../src/types.js";
 
 /**
  * Background task runtime (audit E4): registry lifecycle, the Agent tool's
  * run_in_background path, and the real TaskOutput/TaskStop tools (formerly
- * degrade stubs). Uses the fake-Pi-SDK harness pattern from runtime-core.
+ * degrade stubs). Uses the shared fake-Pi-SDK builder from test/helpers.
  */
 
-function makeAgent(overrides: Partial<ClaudeAgent> = {}): ClaudeAgent {
-  return {
-    name: "worker",
-    description: "Does work",
-    metadata: {},
-    body: "You are the worker.",
-    source: { path: "<test>", scope: "project" },
-    unknownKeys: [],
-    diagnostics: [],
-    ...overrides,
-  };
-}
+const makeAgent = (overrides: Partial<ClaudeAgent> = {}): ClaudeAgent =>
+  makeBaseAgent({ name: "worker", description: "Does work", body: "You are the worker.", ...overrides });
 
 /** Fake SDK whose sessions block on a gate until released (or aborted). */
 function gatedSdk(finalText: string) {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
-  let abortCalls = 0;
-  const sdk: PiSdk = {
-    async createAgentSession() {
-      const messages: Array<{ role: string; content: unknown }> = [];
-      return {
-        session: {
-          async prompt(text: string) {
-            messages.push({ role: "user", content: text });
-            await gate;
-            messages.push({ role: "assistant", content: [{ type: "text", text: finalText }] });
-          },
-          messages,
-          dispose() {},
-          abort() {
-            abortCalls++;
-            release();
-          },
-        },
-      };
-    },
-    DefaultResourceLoader: class {
-      constructor(public options: Record<string, unknown>) {}
-      async reload() {}
-    },
-    inMemorySessionManager: () => ({}),
-    inMemorySettingsManager: () => ({}),
-    agentDir: () => "/fake",
-  };
-  return { sdk, release: () => release(), abortCalls: () => abortCalls };
-}
-
-function makeRuntime(agents: ClaudeAgent[], sdk: PiSdk, overrides: Record<string, unknown> = {}) {
-  const engine = new PermissionEngine(
-    { allow: [], deny: [], ask: [], additionalDirectories: [] },
-    { cwd: process.cwd() },
-  );
-  const hookRunner = new HookRunner({
-    config: {},
-    projectDir: process.cwd(),
-    sessionId: "t",
-    env: {},
-    disableAllHooks: true,
-  });
-  return new SubagentRuntime({
-    getAgents: () => agents,
-    buildSystemPrompt: (a) => `SYSTEM:${a.name}`,
-    customToolsFor: () => [],
-    allKnownToolNames: () => ["Read", "Write", "Edit", "Bash", "Grep", "Glob"],
-    permissionEngine: engine,
-    hookRunner,
-    getCwd: () => process.cwd(),
-    resolveModel: () => undefined,
-    mapEffort: () => undefined,
-    maxDepth: 2,
-    concurrency: 2,
-    sessionId: "t",
-    sdk,
-    ...overrides,
-  } as never);
+  const handle = fakeSdk({ replies: [{ text: finalText, gate }] });
+  return { sdk: handle.sdk, release: () => release(), abortCalls: handle.abortCalls };
 }
 
 type ToolLike = {
@@ -107,13 +44,15 @@ afterEach(() => {
   else process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = savedDisable;
 });
 
+const result = (over: Partial<BackgroundResultLike> = {}): BackgroundResultLike => ({
+  ok: over.outcome === undefined ? over.ok !== false : over.outcome === "completed",
+  outcome: over.outcome ?? (over.ok === false ? "failed" : "completed"),
+  finalMessage: "done",
+  diagnostics: [],
+  ...over,
+});
+
 describe("BackgroundTaskRegistry", () => {
-  const result = (over: Partial<{ ok: boolean; finalMessage: string; error?: string; diagnostics: Diagnostic[] }> = {}) => ({
-    ok: true,
-    finalMessage: "done",
-    diagnostics: [],
-    ...over,
-  });
 
   it("assigns sequential ids and tracks completion with the result text", async () => {
     const registry = new BackgroundTaskRegistry();
@@ -230,7 +169,7 @@ describe("Agent tool run_in_background (audit E4)", () => {
 
   it("TaskOutput on an unknown id errors helpfully, listing known ids", async () => {
     const registry = new BackgroundTaskRegistry();
-    registry.start("agent:a", Promise.resolve({ ok: true, finalMessage: "x", diagnostics: [] }));
+    registry.start("agent:a", Promise.resolve(result({ finalMessage: "x" })));
     const taskOutput = createTaskOutputTool(registry) as unknown as ToolLike;
     await expect(taskOutput.execute("t", { task_id: "task-42" })).rejects.toThrow(
       /Unknown task_id "task-42".*task-1/,
@@ -314,35 +253,12 @@ describe("Agent tool run_in_background (audit E4)", () => {
   });
 
   it("TaskStop while queued behind the concurrency cap prevents the session from ever starting (H3)", async () => {
-    let sessions = 0;
     let releaseGate!: () => void;
     const gate = new Promise<void>((resolve) => (releaseGate = resolve));
-    const sdk: PiSdk = {
-      async createAgentSession() {
-        sessions++;
-        const messages: Array<{ role: string; content: unknown }> = [];
-        return {
-          session: {
-            async prompt(text: string) {
-              messages.push({ role: "user", content: text });
-              await gate;
-              messages.push({ role: "assistant", content: [{ type: "text", text: "gate-done" }] });
-            },
-            messages,
-            dispose() {},
-          },
-        };
-      },
-      DefaultResourceLoader: class {
-        constructor(public options: Record<string, unknown>) {}
-        async reload() {}
-      },
-      inMemorySessionManager: () => ({}),
-      inMemorySettingsManager: () => ({}),
-      agentDir: () => "/fake",
-    };
+    const handle = fakeSdk({ replies: [{ text: "gate-done", gate }] });
+    const sessions = () => handle.created.length;
     const registry = new BackgroundTaskRegistry();
-    const runtime = makeRuntime([makeAgent()], sdk, { concurrency: 1 });
+    const runtime = makeRuntime([makeAgent()], handle.sdk, { concurrency: 1 });
     const agentTool = createAgentToolDefinition(runtime, {
       depth: 0,
       backgroundTasks: registry,
@@ -362,7 +278,7 @@ describe("Agent tool run_in_background (audit E4)", () => {
     });
     const secondId = String(second.details.taskId);
     await new Promise((r) => setTimeout(r, 20));
-    expect(sessions).toBe(1); // only the gated task created a session
+    expect(sessions()).toBe(1); // only the gated task created a session
 
     // Stop the QUEUED task, then release the gate so it dequeues.
     const taskStop = createTaskStopTool(registry) as unknown as ToolLike;
@@ -371,7 +287,7 @@ describe("Agent tool run_in_background (audit E4)", () => {
     await registry.wait(String(first.details.taskId));
     await registry.wait(secondId);
 
-    expect(sessions).toBe(1); // the stopped dispatch never created a session
+    expect(sessions()).toBe(1); // the stopped dispatch never created a session
     const taskOutput = createTaskOutputTool(registry) as unknown as ToolLike;
     const out = await taskOutput.execute("t4", { task_id: secondId });
     expect(out.details.status).toBe("stopped");

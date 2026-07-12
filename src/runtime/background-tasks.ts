@@ -14,10 +14,14 @@ export type BackgroundTaskStatus = "running" | "completed" | "failed" | "stopped
 
 /** Structural view of a DispatchResult (avoids an import cycle with subagents.ts). */
 export interface BackgroundResultLike {
+  /** True iff `outcome === "completed"`. */
   ok: boolean;
-  /** The subagent's final message, verbatim. */
+  /** Classified fate of the dispatch (t01 contract, mirrors DispatchResult exactly). */
+  outcome: "completed" | "failed" | "aborted";
+  /** The subagent's final message, verbatim (on failure: best-effort partial output). */
   finalMessage: string;
   agentName?: string;
+  /** The single error channel: present iff `outcome !== "completed"`. */
   error?: string;
   diagnostics?: Diagnostic[];
 }
@@ -26,7 +30,10 @@ export interface BackgroundTaskRecord {
   id: string;
   label: string;
   status: BackgroundTaskStatus;
-  /** Final text (verbatim subagent message) once completed. */
+  /**
+   * Final text (verbatim subagent message) once completed; for failed tasks the
+   * best-effort partial output produced before the failure, when any exists.
+   */
   result?: string;
   error?: string;
   agentName?: string;
@@ -69,18 +76,25 @@ export class BackgroundTaskRegistry {
           });
           return;
         }
-        if (result.ok) {
+        if (result.outcome === "completed") {
           record.status = "completed";
           record.result = result.finalMessage;
+        } else if (result.outcome === "aborted") {
+          // Deliberate stop (abort/TaskStop inside the dispatch): reported as
+          // stopped — never as failed, and NEVER as completed.
+          record.status = "stopped";
+          record.error = result.error ?? "subagent dispatch was aborted";
         } else {
           record.status = "failed";
           record.error = result.error ?? "subagent dispatch failed";
+          // Preserve best-effort partial output for TaskOutput to surface.
+          if (result.finalMessage.trim()) record.result = result.finalMessage;
         }
       },
       (err) => {
         if (record.status !== "stopped") {
           record.status = "failed";
-          record.error = err instanceof Error ? err.message : String(err);
+          record.error = capErrorText(err instanceof Error ? err.message : String(err));
         }
       },
     );
@@ -127,6 +141,19 @@ export class BackgroundTaskRegistry {
   }
 }
 
+/**
+ * Mirror of subagents.ts `capErrorText` (deliberately duplicated: this module
+ * stays free of value-level imports from subagents.ts, matching the structural
+ * BackgroundResultLike mirror): model-visible error text is single-line —
+ * control characters and whitespace runs collapse to spaces — and capped.
+ */
+const ERROR_TEXT_CAP = 500;
+
+function capErrorText(message: string): string {
+  const flat = message.replace(/[\s\p{Cc}]+/gu, " ").trim();
+  return flat.length > ERROR_TEXT_CAP ? `${flat.slice(0, ERROR_TEXT_CAP)} [truncated]` : flat;
+}
+
 function unknownIdError(registry: BackgroundTaskRegistry, id: string): Error {
   const known = registry.ids();
   return new Error(
@@ -162,6 +189,9 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
           break;
         case "failed":
           text = `Background task ${id} (${task.label}) failed: ${task.error ?? "unknown error"}`;
+          if (task.result?.trim()) {
+            text += `\n\nPartial output before the failure:\n${task.result}`;
+          }
           break;
         case "stopped":
           text = `Background task ${id} (${task.label}) was stopped; its result was discarded.`;
