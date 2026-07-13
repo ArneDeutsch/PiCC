@@ -10,7 +10,14 @@ import { HookRunner } from "./engine/hook-runner.js";
 import { PermissionEngine } from "./engine/permissions.js";
 import { parseHookConfig } from "./claude/hooks.js";
 import { WorktreeManager } from "./runtime/worktrees.js";
-import { SubagentRuntime, createAgentToolDefinition } from "./runtime/subagents.js";
+import {
+  SubagentRuntime,
+  createAgentToolDefinition,
+  createSendMessageToolDefinition,
+} from "./runtime/subagents.js";
+import { SubagentRegistry } from "./runtime/subagent-registry.js";
+import type { SubagentRegistryRecord } from "./runtime/subagent-registry.js";
+import { formatUsageCompact, sanitizeLine } from "./runtime/subagent-progress.js";
 import { createGuardExtension } from "./runtime/guard.js";
 import {
   buildSystemPromptSuffix,
@@ -33,6 +40,7 @@ import {
   BackgroundTaskRegistry,
   createTaskOutputTool,
   createTaskStopTool,
+  type SettlementNotice,
 } from "./runtime/background-tasks.js";
 import { builtinAgents } from "./claude/agents.js";
 import { loadAgentMemory } from "./claude/memory.js";
@@ -144,7 +152,29 @@ function debug(...args: unknown[]): void {
   if (process.env.PICC_DEBUG) console.error("[picc]", ...args);
 }
 
-export default function picc(pi: any) {
+/**
+ * TEST-ONLY injection point (t05 plan-review MUST-FIX). The fake-Pi harness
+ * cannot reach the closure-local registries/runtime, so the offline-integration
+ * test for the settlement-notice delivery path needs a named seam. `onWired` is
+ * invoked synchronously during construction with the real, in-process registry
+ * instances the session built, so a test can seed a settled background task and
+ * then drive the REAL `before_agent_start` drain handler.
+ *
+ * SECURITY: this seam is reachable ONLY through this in-process second argument.
+ * Nothing in the project-loading path (CLAUDE.md, settings, env vars, files)
+ * ever supplies it — Pi invokes the extension entry as `picc(pi)` with a single
+ * argument — so a loaded project can never use it to swap runtime internals. An
+ * env/settings/file-gated seam would be a project-reachable runtime-swap bypass;
+ * an in-process argument is not.
+ */
+export interface PiccTestSeam {
+  onWired?: (internals: {
+    backgroundTasks: BackgroundTaskRegistry;
+    subagentRegistry: SubagentRegistry;
+  }) => void;
+}
+
+export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // UTF-8 stdio for any child process (fixes Windows cp1252 UnicodeEncodeError,
   // e.g. Python printing `→`). Set before any subprocess can be spawned.
   applyUnicodeSafeProcessEnv();
@@ -408,6 +438,19 @@ export default function picc(pi: any) {
   // Background tasks (audit E4): one registry per session — run_in_background
   // dispatches register here; TaskOutput/TaskStop operate on it.
   const backgroundTasks = new BackgroundTaskRegistry();
+  // Dispatch registry (t04): one per session — every session-creating dispatch
+  // registers here so SendMessage can steer a running background subagent or
+  // resume a finished one. Registry-only resolution keeps a hostile `to` off the
+  // filesystem (SECURITY MUST-FIX #2).
+  const subagentRegistry = new SubagentRegistry();
+  // TEST-ONLY seam (t05): hand the real in-process registries to a test that
+  // drives the settlement-notice delivery path. See PiccTestSeam — reachable
+  // only via this in-process argument, never via project/env/settings/files.
+  try {
+    testSeam?.onWired?.({ backgroundTasks, subagentRegistry });
+  } catch (err) {
+    console.error(`PiCC test seam onWired failed: ${(err as Error).message}`);
+  }
   // Built-in agent types (audit E1): general-purpose/Explore/Plan, appended
   // AFTER project/user/plugin agents so a same-named project agent wins (an
   // overridden built-in is dropped from the catalog — dispatch resolves the
@@ -547,6 +590,7 @@ export default function picc(pi: any) {
       "WebSearch",
       "Agent",
       "Task",
+      "SendMessage",
       "Skill",
       "EnterWorktree",
       "ExitWorktree",
@@ -566,6 +610,9 @@ export default function picc(pi: any) {
     buildSystemPrompt: buildSubagentSystemPrompt,
     customToolsFor: (agent, granted, depth, subCwd) => {
       // Per-dispatch instances (fresh TaskStore, dispatch-local cwd binding).
+      // NOTE (t04): SendMessage is deliberately NEVER built here — it is
+      // parent-initiated only (no subagent→subagent or subagent→parent channel).
+      // Even a future "inherit all tools" change must not add it to this set.
       const tools: Record<string, unknown>[] = [];
       for (const tool of buildCwdBoundTools(subCwd ?? cwdState, createTaskTools())) {
         const name = (tool as { name: string }).name;
@@ -576,8 +623,12 @@ export default function picc(pi: any) {
         // dispatches (depth cap holds) and never mutates the parent session state.
         tools.push(createSkillTool({ depth, forSubagent: true }) as Record<string, unknown>);
       }
-      // Background-task tools share the session registry (audit E4), so a
-      // subagent can poll/stop the tasks it started itself.
+      // Background-task tools share the ONE session-wide registry (audit E4). A
+      // subagent that is granted TaskOutput/TaskStop can therefore reach ANY task
+      // in the session — its own AND its siblings'/parent's — not only the tasks
+      // it started. (Claude Code hides TaskOutput from subagents entirely; PiCC's
+      // shared-registry exposure is a known divergence — candidate follow-up to
+      // scope task visibility per dispatcher. See observations.md 2026-07-12.)
       if (granted.includes("TaskOutput")) {
         tools.push(createTaskOutputTool(backgroundTasks) as Record<string, unknown>);
       }
@@ -601,7 +652,10 @@ export default function picc(pi: any) {
     getCwd: () => cwdState.get(),
     makeContextInjector,
     // Agent-scoped hooks (audit C10): per-dispatch runner with the SAME deps as
-    // the session's base runner; the runtime multiplexes and discards it.
+    // the session's base runner; the runtime multiplexes and discards it. Its
+    // transcript_path stays the MAIN session transcript (t02 review round 2):
+    // Claude Code does not re-point subagent hook events at the subagent's own
+    // transcript.
     makeScopedHookRunner: (config) =>
       new HookRunner({
         config,
@@ -613,12 +667,15 @@ export default function picc(pi: any) {
         pluginDataDirs,
         transcriptPath,
       }),
+    // Subagent transcripts (t02) persist next to the MAIN session's transcript.
+    getMainSessionFile: transcriptPath,
     resolveModel: resolveModelSpec,
     mapEffort: (effort) => mapEffort(config, effort),
     worktrees,
     maxDepth: project.settings.subagentMaxDepth,
     concurrency: project.settings.subagentConcurrency,
     sessionId,
+    subagentRegistry,
   });
 
   // ---------------------------------------------------------------------------
@@ -690,6 +747,13 @@ export default function picc(pi: any) {
     claudeNamedTools.push(
       createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Agent", backgroundTasks }),
       createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Task", backgroundTasks }),
+      // SendMessage (t04): the coordinator's channel back into its subagents —
+      // resume a finished one (same id, full context, background) or steer a
+      // running background one. Parent-session only (never in customToolsFor).
+      createSendMessageToolDefinition(subagentRuntime, {
+        registry: subagentRegistry,
+        backgroundTasks,
+      }),
     );
   }
   // Real TaskOutput/TaskStop (audit E4) — formerly degrade stubs; they answer
@@ -777,6 +841,7 @@ export default function picc(pi: any) {
     console.error(`PiCC: ${message}`),
   );
   pi.on("before_agent_start", async (event: any) => {
+    deliverSettlementNotices();
     try {
       const suffix = buildSystemPromptSuffix({
         claudeMd: project.claudeMd,
@@ -796,6 +861,63 @@ export default function picc(pi: any) {
       return undefined;
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // Background settlement notices (t05) — visible without polling
+  // ---------------------------------------------------------------------------
+  // At the parent's NEXT turn (before_agent_start, above), deliver a one-time,
+  // transcript-visible notice for every background subagent that has settled
+  // since the last turn: outcome (t01 vocabulary — a stopped task reads
+  // "aborted"), the capped error when failed, the agent id, and a bounded,
+  // explicitly-framed UNTRUSTED excerpt of its output. The coordinator thus
+  // learns of settlement WITHOUT calling TaskOutput. Delivered via the
+  // message-level channel PiCC already uses (pi.sendMessage + deliverAs "steer")
+  // so it lands in the transcript like Claude Code's settlement message.
+  // Exactly-once per settlement: the drain consumes the registry's per-agent
+  // settled-notice gate (a resume re-arms it). Folded into the single
+  // before_agent_start handler (own try/catch) rather than a second listener, so
+  // it can never depend on multi-handler ordering and a drain failure can never
+  // break prompt assembly.
+  //
+  // Honest limitation (v1, documented — flagged for the t07 user guide + registry
+  // note): before_agent_start fires when the user continues the conversation, so
+  // an IDLE coordinator (turn ended, awaiting input) learns of settlement only
+  // when the conversation continues — PiCC does NOT re-invoke an idle agent. No
+  // wake-an-idle-parent machinery is built here.
+  function deliverSettlementNotices(): void {
+    let notices: SettlementNotice[];
+    try {
+      notices = backgroundTasks.drainSettlementNotices(
+        // PEEK the dedup gate (FIX 1) — do not flip it while selecting.
+        (agentId) => subagentRegistry.isSettledNoticeArmed(agentId),
+        // COMMIT the gate — called by the loop below ONLY after a successful send.
+        (agentId) => subagentRegistry.consumeSettledNotice(agentId),
+        // Drain-fallback gate (SHOULD-3): a true registry MISS means the dispatch
+        // failed at an early guard before it ever registered — the notice is then
+        // emitted from the background record itself, exactly once. A registered
+        // task always has a record here, so it stays on the consume path above.
+        (agentId) => subagentRegistry.get(agentId) !== undefined,
+      );
+    } catch (err) {
+      console.error(`PiCC settlement-notice drain failed: ${(err as Error).message}`);
+      return;
+    }
+    // Deliver each notice in ITS OWN try/catch and commit the dedup gate only
+    // after pi.sendMessage returns (FIX 1): a throw on one notice must neither
+    // drop the remaining in-batch notices nor consume the throwing one — an
+    // un-committed notice re-fires on the next drain instead of being lost.
+    for (const notice of notices) {
+      try {
+        pi.sendMessage(
+          { customType: "picc-settlement", content: notice.content, display: true },
+          { deliverAs: "steer" },
+        );
+        notice.commit();
+      } catch (err) {
+        console.error(`PiCC settlement-notice delivery failed: ${(err as Error).message}`);
+      }
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Session lifecycle
@@ -860,11 +982,11 @@ export default function picc(pi: any) {
     try {
       if (event.source === "extension") return { action: "continue" };
 
-      // 0) PiCC control commands (/doctor /compat /quota /skills /agents).
+      // 0) PiCC control commands (/doctor /compat /quota /skills /agents /usage).
       //    In interactive mode Pi's own command router intercepts these before
       //    the input event; this branch covers the other modes so a control
       //    command is never sent to the model.
-      const cmd = /^\/(doctor|compat|quota|skills|agents)(?:[ \t]+([\s\S]*))?$/.exec(
+      const cmd = /^\/(doctor|compat|quota|skills|agents|usage)(?:[ \t]+([\s\S]*))?$/.exec(
         (event.text ?? "").trim(),
       );
       if (cmd) {
@@ -1065,7 +1187,7 @@ export default function picc(pi: any) {
   });
 
   // ---------------------------------------------------------------------------
-  // Control commands: /doctor /compat /quota /skills /agents.
+  // Control commands: /doctor /compat /quota /skills /agents /usage.
   //
   // Rendered by shared functions so BOTH the registered command (interactive
   // path, where Pi intercepts extension commands before the model) and the
@@ -1118,6 +1240,61 @@ export default function picc(pi: any) {
       lines.push(`    ${a.description.split("\n")[0]}`);
       lines.push(`    tools: ${gated.length ? gated.join(", ") : "(all)"}`);
     }
+    return lines.join("\n");
+  }
+
+  /**
+   * `/usage` (t06): per-subagent token/cost breakdown for THIS session, plus a
+   * session total — aggregated from the dispatch registry (t04). The user noted
+   * Pi's own usage surface is unhelpful; this is the per-subagent view. Lists
+   * each dispatched agent's id, type, outcome, usage, and transcript path — the
+   * one place a human can look for what their fan-out cost.
+   */
+  function renderUsageReport(): string {
+    const records = subagentRegistry.list();
+    if (!records.length) {
+      return "No subagents have been dispatched this session (nothing to account for yet).";
+    }
+    const lines = [
+      `PiCC — per-subagent token/cost this session (${records.length} dispatched) — does NOT include the main agent's own usage:`,
+      "  Note: the main-agent / whole-session total is not shown here — the Pi extension API doesn't expose it, so this covers subagents only.",
+      "",
+    ];
+    // Session total: sum each field only across records that reported it, so a
+    // field absent everywhere stays absent (never invented as a zero).
+    const total: Record<string, number> = {};
+    const usageKeys = [
+      "inputTokens",
+      "outputTokens",
+      "cacheReadTokens",
+      "cacheWriteTokens",
+      "costUsd",
+    ] as const;
+    const addToTotal = (record: SubagentRegistryRecord) => {
+      const usage = record.usage;
+      if (!usage) return;
+      for (const key of usageKeys) {
+        const value = usage[key];
+        if (typeof value === "number" && Number.isFinite(value)) {
+          total[key] = (total[key] ?? 0) + value;
+        }
+      }
+    };
+    for (const record of records) {
+      const state = record.state === "running" ? "running" : record.outcome ?? "settled";
+      // SECURITY (FIX 4, defense-in-depth): agentName comes from agent frontmatter
+      // `name`/basename (only `.trim()`ed upstream — control bytes survive) and is
+      // printed to the human terminal; single-line-sanitize it so an ANSI/OSC/
+      // control-byte agent name cannot inject into the terminal on /usage.
+      const agentName = sanitizeLine(record.agentName, 120);
+      lines.push(`  ${record.agentId} (${agentName}) — ${state}`);
+      const usageLine = formatUsageCompact(record.usage);
+      lines.push(`    usage: ${usageLine ?? "(none recorded)"}`);
+      if (record.transcriptPath) lines.push(`    transcript: ${record.transcriptPath}`);
+      addToTotal(record);
+    }
+    const totalLine = formatUsageCompact(total);
+    lines.push("", `  Subagents total: ${totalLine ?? "(no usage recorded)"}`);
     return lines.join("\n");
   }
 
@@ -1182,6 +1359,8 @@ export default function picc(pi: any) {
         return renderSkillsList();
       case "agents":
         return renderAgentsList();
+      case "usage":
+        return renderUsageReport();
       case "quota":
         return renderQuota(ctx);
       case "compat": {
@@ -1208,6 +1387,7 @@ export default function picc(pi: any) {
     quota: "PiCC: subscription/rate-limit info from the last provider response",
     skills: "PiCC: list the project's Claude skills (invocable + model-only)",
     agents: "PiCC: list the subagents available for dispatch",
+    usage: "PiCC: per-subagent token/cost this session (subagents only — not the main agent's own usage), with a total",
   };
   for (const [name, description] of Object.entries(CONTROL_COMMANDS)) {
     pi.registerCommand(name, {
@@ -1256,7 +1436,7 @@ export default function picc(pi: any) {
   // would duplicate or be shadowed by these (the skill still executes via the
   // input handler if the name is typed and not intercepted as a built-in).
   const RESERVED_NAMES = new Set([
-    "doctor", "compat", "quota", "skills", "agents",
+    "doctor", "compat", "quota", "skills", "agents", "usage",
     "changelog", "clone", "compact", "copy", "export", "fork", "hotkeys", "import",
     "login", "logout", "model", "name", "new", "quit", "reload", "resume",
     "scoped-models", "session", "settings", "share", "tree", "trust", "help",

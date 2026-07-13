@@ -107,12 +107,27 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
   types skip the project context), fans out under a concurrency cap, applies per-agent
   `tools:`/`model`/`effort` (with `CLAUDE_CODE_SUBAGENT_MODEL` as the highest-priority model
   override), enforces the depth cap (default 5), runs agent-scoped `hooks:`, supports
-  `isolation: worktree` and `run_in_background`, and returns the subagent's final message
-  **verbatim** (skills parse locked YAML from it — a hard contract, plan §4.3).
+  `isolation: worktree`, `run_in_background`, and `background: true` frontmatter, and returns the
+  subagent's final message **verbatim** (skills parse locked YAML from it — a hard contract,
+  plan §4.3). It also classifies every dispatch outcome (see *Subagent error contract* in §4),
+  mints a stable **agent id**, persists a **transcript** discoverable next to the main session's,
+  streams **live progress** to the UI via `subagent-progress.ts`, captures **per-subagent usage**,
+  and — through `subagent-registry.ts` — backs the `SendMessage` resume/steer channel (F02).
+- `subagent-registry.ts` — the process-lifetime dispatch registry (agent-id keyed, name→id index
+  with rebinding detection): records every dispatch's transcript path, resumability, outcome, and
+  usage so `SendMessage` can resolve an address registry-only and the `/usage` command can report a
+  per-subagent breakdown.
+- `subagent-progress.ts` — `SubagentProgressCondenser`: a bounded, sanitized rolling tail of a
+  running subagent's tool/assistant activity (incl. silent API-retry waits), plus the shared
+  display formatters (`sanitizeLine`, `formatUsageCompact`).
+- `subagent-transcripts.ts` (in `util/`) — agent-id mint/validate, the `<base>.subagents/` dir
+  derivation + resolver, and the agent-id result trailer.
 - `background-tasks.ts` — `BackgroundTaskRegistry` plus the real `TaskOutput`/`TaskStop` tools:
   `run_in_background: true` registers the un-awaited dispatch under a task id; `TaskOutput`
-  waits/polls for the result, `TaskStop` requests a cooperative abort
-  (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` falls back to foreground).
+  waits/polls for the result (a failed task reports its cause, never an empty success),
+  `TaskStop` requests a cooperative abort (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` falls back to
+  foreground). Settlement of a background dispatch is **pushed** to the coordinator at its next
+  turn (a bounded, untrusted-framed notice) so it learns the outcome without polling `TaskOutput`.
 - `worktrees.ts` — `WorktreeManager` for `EnterWorktree`/`ExitWorktree`: creates
   `.claude/worktrees/<flat>/` on `worktree-<flat>` off a base ref resolved to a concrete SHA
   *before* creation, seeds `.worktreeinclude` files, and does Windows-tolerant removal (best-effort,
@@ -192,10 +207,13 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers:
    PostToolUse / PostToolUseFailure hooks fire on the result.
 
 6. **Subagent dispatch.** The `Agent`/`Task` tool calls `SubagentRuntime.dispatch`, which spawns a
-   fresh Pi session with the gated tool set and returns the final message verbatim. Nested dispatch
-   is depth-capped; the same guard runs inside every subagent session. With
-   `run_in_background: true` the dispatch registers in the `BackgroundTaskRegistry` and returns a
-   task id; `TaskOutput`/`TaskStop` manage its lifecycle.
+   fresh Pi session with the gated tool set and returns the final message verbatim (or a loud,
+   classified failure — see the *Subagent error contract* in §4). Nested dispatch is depth-capped;
+   the same guard runs inside every subagent session. With `run_in_background: true` (or an agent's
+   `background: true` frontmatter) the dispatch registers in the `BackgroundTaskRegistry` and
+   returns a task id; `TaskOutput`/`TaskStop` manage its lifecycle, and settlement is pushed to the
+   coordinator at its next `before_agent_start`. `SendMessage` (parent-only) resumes a finished
+   subagent by its agent id or steers a running background one.
 
 7. **`agent_settled` / compaction.** `agent_settled` fires the `Stop` hook (exit 2 re-prompts the
    agent to continue, capped at 8 consecutive blocks). `session_before_compact`/`session_compact`
@@ -218,6 +236,31 @@ principle in the plan (§2.1 mechanical fidelity).
 - **Verbatim subagent return.** A subagent's final message is returned exactly as produced — no
   summarizing or wrapping — because skills parse it directly, often a locked-YAML verdict block
   (`subagents.ts`, plan §4.3).
+
+- **Subagent error contract (F02 — the failure class this feature closes).** Every dispatch is
+  classified into exactly one outcome, and the classification — not a normal-looking success — is
+  what reaches the coordinator:
+  - **completed** — the run finished; its verbatim final message is returned.
+  - **failed** — the run ended on a terminal API error (e.g. a drained usage limit). The tool
+    reports a **loud failure naming the cause** (`Agent terminated early due to an API error: …`),
+    never an empty or normal-looking success. This is the exact regression that, before F02,
+    returned an empty success and let a coordinator commit under-reviewed work.
+  - **aborted** — the run was stopped on purpose (Esc/user abort, `TaskStop`). Reported as
+    **aborted**, distinct from a failure; a signal wins on every settle path, and a deliberately
+    stopped background result is discarded.
+  - **Partial-output preservation.** If a failed or turn-capped run produced output before dying,
+    that partial text is preserved and delivered inside an explicit cut-off frame
+    (`\n\n---\n[subagent cut off] …`) rather than dropped. A turn-cap (`length`) truncation also
+    pushes a warning diagnostic — never silent.
+  - **Foreground vs background.** The contract holds on both paths: a foreground dispatch throws
+    the loud error (Pi renders it in its own error box) while a background dispatch lands a
+    `failed`/`stopped` status that `TaskOutput` reports with the same named cause and partial
+    output. A background failure is **never** shown as completed. Retry behavior stays exactly
+    Pi's own — no extra recovery logic (`subagents.ts`/`background-tasks.ts`, feature.md §1).
+    Note the **default direction diverges**: PiCC dispatches to the **foreground** by default,
+    whereas Claude Code 2.1.198 runs subagents background-by-default, so an implicit-concurrency
+    fan-out runs serially under PiCC unless `run_in_background`/`background: true` is set — the
+    single most consequential subagent parity gap of this feature (see `feature.background-agents`).
 
 - **Deny matches any command segment.** The permission matcher is shell-operator aware, so a deny
   like `Bash(rm *)` cannot be evaded by chaining (`git status && rm -rf /`) — every segment is

@@ -113,6 +113,11 @@ export interface ClaudeAgent {
   skills?: string[];
   color?: string;
   isolation?: "worktree";
+  /**
+   * `background: true` (Claude Code 2.1.198): forces the dispatch to run in the
+   * background even when the Agent tool call omits `run_in_background` (t05).
+   */
+  background?: boolean;
   initialPrompt?: string;
   metadata: Record<string, unknown>;
   /** Parsed but deferred (§7): memory, mcpServers, hooks. */

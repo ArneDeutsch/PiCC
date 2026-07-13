@@ -19,13 +19,12 @@
 
 A ⚠ marker on an ID means the divergence is **safety-relevant**: something a project intended to restrict now runs freely. These are always surfaced at startup and in `/doctor`, never silent (plan §6.2).
 
-## Tools (34)
+## Tools (35)
 
 Built-in tool names a project can reference in `tools:`, `permissions.*`, or a hook `if:`.
 
 | ID | Tier | Note |
 |---|---|---|
-| `tool.Agent` | full | subagent dispatch — built-in general-purpose/Explore/Plan + project agents, omitted type defaults to general-purpose, run_in_background supported, verbatim final message (§4.3) |
 | `tool.Bash` | full | real implementation (from Pi) — shell execution, bash + PowerShell aware |
 | `tool.Edit` | full | real implementation — exact-string replacement edits |
 | `tool.EnterWorktree` | full | creates/re-enters .claude/worktrees/<flat>/ and swaps the session cwd (§4.4) |
@@ -34,16 +33,18 @@ Built-in tool names a project can reference in `tools:`, `permissions.*`, or a h
 | `tool.Grep` | full | real implementation — Claude-baseline parameter surface (-n, -A/-B/-C/context, -i, -o, type, glob, multiline, content/files_with_matches/count modes, head_limit/offset) with ripgrep/JS engine parity (§4.8) |
 | `tool.Read` | full | real implementation — file reads with Claude-shaped input |
 | `tool.Skill` | full | skill activation by name with argument substitution (§4.1) |
-| `tool.Task` | full | alias of the Agent subagent-dispatch tool (§4.3) |
 | `tool.TaskCreate` | full | current task-tracking surface (§4.8) |
 | `tool.TaskGet` | full | current task-tracking surface (§4.8) |
 | `tool.TaskList` | full | current task-tracking surface (§4.8) |
-| `tool.TaskOutput` | full | retrieves background subagent results (wait or poll) from the background-task registry (§4.3, §4.8) |
+| `tool.TaskOutput` | full | retrieves background subagent results (wait or poll) from the background-task registry; a failed task reports failed status naming the API error plus any partial output (never an empty success), with the agent-id trailer + per-subagent usage line outside the verbatim body; the background-task registry is session-wide, so a subagent granted TaskOutput can reach ANY session task — its own and its siblings'/parent's — whereas Claude Code hides TaskOutput from subagents entirely (a project-intended restriction PiCC does not enforce when TaskOutput is granted to a subagent) (§4.3, §4.8) |
 | `tool.TaskUpdate` | full | current task-tracking surface (§4.8) |
 | `tool.WebFetch` | full | implemented for real — research skills and permission allowlists depend on it (§4.8) |
 | `tool.WebSearch` | full | implemented for real — research skills and permission allowlists depend on it (§4.8) |
 | `tool.Write` | full | real implementation — file creation/overwrite |
-| `tool.TaskStop` | partial | stops a background subagent — cooperative via session abort; otherwise the result is discarded and reported as such (§4.3, §4.8) |
+| `tool.Agent` | partial | subagent dispatch — built-in general-purpose/Explore/Plan + project agents, omitted type defaults to general-purpose, verbatim final message; a terminal API error is a LOUD failure naming the cause (never an empty success), partial output preserved with a cut-off note (2.1.199/2.1.200); every resumable dispatch gets a stable agent id and live progress rendering; PARTIAL: PiCC defaults FOREGROUND whereas Claude 2.1.198 runs subagents background-by-default, so an implicit-concurrency fan-out runs serially unless run_in_background/background:true is set (see feature.background-agents) (§4.3) |
+| `tool.SendMessage` | partial | coordinator's channel back into its subagents (Claude 2.1.x): resume a completed or failed-with-partial subagent by agent id (re-dispatched in the background with full prior context; a resumed failed/completed agent flips back to a running status, 2.1.205) or steer a running background one; GAPS: no cross-restart resume (the dispatch registry is process-lifetime), steering reaches only BACKGROUND dispatches (a foreground Agent call blocks the parent's turn), an idle coordinator learns of a settlement only at its next turn, fork/agentOverride dispatches are non-resumable; subagent-to-subagent / agent-teams messaging stays out of scope (§4.3, §7) |
+| `tool.Task` | partial | alias of the Agent subagent-dispatch tool — same loud-failure/agent-id/progress semantics and the same default-foreground divergence from Claude 2.1.198 background-by-default (§4.3) |
+| `tool.TaskStop` | partial | stops a background subagent — cooperative via session abort; a stopped run reports a stopped status and its late result is discarded — a PiCC-defined contract (Claude Code leaves TaskStop's post-stop result semantics undocumented) (§4.3, §4.8) |
 | `tool.TodoWrite` | partial | deprecated todo tool — mapped onto the Task* equivalents, not a native implementation (§4.8) |
 | `tool.Artifact` | degraded-noop | callable no-op stub — Artifacts out of scope; the notice directs output to a regular file (§7) |
 | `tool.AskUserQuestion` | degraded-noop | callable no-op stub — deliberately not provided; the notice redirects questions to plain chat (§7) |
@@ -74,13 +75,13 @@ Lifecycle events the hooks engine can fire (`settings.json` `hooks`, plus skill/
 | `hook.event.SessionEnd` | full | fires at session end (§4.5) |
 | `hook.event.SessionStart` | full | fires at session start; matcher matches the source exactly (startup\|resume\|clear\|compact); stdout injected (§4.5, §9) |
 | `hook.event.Stop` | full | fires when the main agent wants to stop; exit 2 blocks stopping (§4.5) |
-| `hook.event.SubagentStart` | full | fires when a subagent is spawned; a blocking outcome cancels the dispatch (§4.5) |
-| `hook.event.SubagentStop` | full | fires when a subagent wants to stop; exit 2 blocks and re-prompts the subagent (bounded) (§4.5) |
+| `hook.event.SubagentStart` | full | fires when a subagent is spawned; payload carries agent_id + agent_type (subagent-only additions) while transcript_path stays the MAIN session transcript (Claude Code parity); NUANCE: agent_type is the agent's bare frontmatter/definition name — PiCC does NOT apply plugin-scoped naming, so a plugin subagent's agent_type is its plain name (Claude's exact plugin-scoped id here is unverified); a blocking outcome cancels the dispatch (§4.3, §4.5) |
+| `hook.event.SubagentStop` | full | fires when a subagent wants to stop; payload carries agent_id + agent_type while transcript_path stays the MAIN session transcript (Claude Code parity); NUANCE: agent_type is the agent's bare frontmatter/definition name, not a plugin-scoped id (Claude's exact plugin-scoped id here is unverified); exit 2 blocks and re-prompts the subagent (bounded) (§4.3, §4.5) |
 | `hook.event.UserPromptSubmit` | full | fires on user prompt; stdout injected as context (§4.5) |
 | `hook.event.WorktreeCreate` | full | fires on worktree creation — worktree seeding pattern supported (§4.4) |
 | `hook.event.WorktreeRemove` | full | fires on worktree removal (§4.4) |
 | `hook.event.mcp__elicitation` | degraded-noop | MCP elicitation hook events — MCP deferred, parsed and never fired (§7) |
-| `hook.event.Notification` | degraded-noop | UI-notification event — parsed, never fired (no equivalent harness surface) |
+| `hook.event.Notification` | degraded-noop | UI-notification event — parsed, never fired (no equivalent harness surface); background-subagent settlement does NOT fire an agent_completed Notification (t05 left it unwired) — the coordinator learns of a settlement via the pushed settlement message and the SubagentStop hook instead |
 | `hook.event.PermissionRequest` ⚠ | degraded-noop | tied to interactive permission machinery — never fired under the default-permissive posture (§6.1) |
 | `hook.event.TaskCompleted` | degraded-noop | task-list event — parsed, never fired in v1 |
 | `hook.event.TeammateIdle` | degraded-noop | agent-teams event — teams out of scope, parsed and never fired (§7) |
@@ -95,7 +96,6 @@ Lifecycle events the hooks engine can fire (`settings.json` `hooks`, plus skill/
 | `setting.autoMemoryEnabled` | full | gates auto-memory loading (default true; CLAUDE_CODE_DISABLE_AUTO_MEMORY also honored) (§4.6) |
 | `setting.claudeMd` | full | managed-scope inline CLAUDE.md content injected at highest priority; ignored with a diagnostic in other scopes (§4.6) |
 | `setting.claudeMdExcludes` | full | excludes CLAUDE.md/rules files from loading (§4.2, §4.6) |
-| `setting.cleanupPeriodDays` | full | max-age (days) for orphaned-worktree reaping at startup (§4.4) |
 | `setting.disableAllHooks` | full | disables all hook dispatch (§4.5) |
 | `setting.disableSkillShellExecution` | full | disables !`cmd` skill shell injection (§4.1) |
 | `setting.enabledPlugins` | full | selects installed-plugin content to load; merges key-wise across scopes, nearer scope wins per plugin (§4.9) |
@@ -110,6 +110,7 @@ Lifecycle events the hooks engine can fire (`settings.json` `hooks`, plus skill/
 | `setting.subagentMaxDepth` | full | caps nested subagent recursion depth (default 5, Claude parity) (§4.3) |
 | `setting.subagentsEnabled` | full | gates subagent dispatch (§4.3) |
 | `setting.worktree.baseRef` | full | head\|fresh base resolved to a concrete commit before worktree creation (§4.4) |
+| `setting.cleanupPeriodDays` | partial | max-age (days) for orphaned-WORKTREE reaping at startup; subagent transcript dirs (<base>.subagents/) are NOT reaped — worktrees-only cleanup (t02 shipped no transcript reaper), same accumulation class as Pi's own session files (§4.4) |
 | `setting.permissions.allow` | partial | parsed and matched, but moot under the default-permissive posture — nothing waits on an allow (§6.1) |
 | `setting.apiKeyHelper` | degraded-noop | parsed, never invoked — auth comes from the harness subscription/provider flow; reported when set (§5, §7) |
 | `setting.attribution` | degraded-noop | parsed, not consumed — no commit/PR attribution machinery; reported when set (§5, §7) |
@@ -127,12 +128,13 @@ Lifecycle events the hooks engine can fire (`settings.json` `hooks`, plus skill/
 | `setting.planMode` | degraded-noop | plan mode is a no-op — treated as guidance (§7) |
 | `setting.statusLine` | degraded-noop | cosmetic statusline not honored beyond Pi defaults (§7) |
 
-## Frontmatter fields (34)
+## Frontmatter fields (35)
 
 Skill (`SKILL.md`), agent (`.claude/agents/*.md`), and rule frontmatter keys.
 
 | ID | Tier | Note |
 |---|---|---|
+| `agent.frontmatter.background` | full | background: true dispatches the subagent in the background without run_in_background (Claude 2.1.198); routed through the same background-task lifecycle and degrades to foreground under CLAUDE_CODE_DISABLE_BACKGROUND_TASKS (§4.3) |
 | `agent.frontmatter.description` | full | auto-injected routing surface for description-driven selection (§4.3) |
 | `agent.frontmatter.disallowedTools` | full | tool denylist enforced for the subagent (§4.3) |
 | `agent.frontmatter.effort` | full | per-agent effort override honored (§4.3, §10) |
@@ -181,7 +183,7 @@ Cross-cutting runtime subsystems and behaviors.
 | `feature.plugins-content` | full | installed-plugin skills/agents/hooks/commands folded into the registries (§4.9) |
 | `feature.rules` | full | .claude/rules/ unconditional load + path-scoped injection at project and user scope (§4.2) |
 | `feature.worktrees` | full | EnterWorktree/ExitWorktree lifecycle incl. .worktreeinclude, parallel sessions, Windows tolerance (§4.4) |
-| `feature.background-agents` | partial | run_in_background subagents with TaskOutput/TaskStop lifecycle; no remote/cloud agents, stop is cooperative (§4.3) |
+| `feature.background-agents` | partial | run_in_background / background:true dispatches with the TaskOutput/TaskStop lifecycle; a failed background task is reported as failed with its cause (never an empty success, t01) and settlement (success or failure) is PUSHED to the coordinator at its next turn without polling (t05); GAPS: PiCC defaults FOREGROUND whereas Claude 2.1.198 runs subagents background-by-default, an idle coordinator is not re-invoked (it learns of settlement only when the conversation continues), settlement notices are bounded/excerpted, no remote/cloud agents, stop is cooperative (§4.3) |
 | `feature.hook-handler.http` | partial | http hook handlers dispatched best-effort (§4.5) |
 | `feature.managed-policy` | partial | managed/enterprise policy honored where trivially present; otherwise degrade-safe (§7) |
 | `feature.hook-handler.agent` | degraded-noop | agent hook handlers degrade with a notice (§4.5) |
@@ -202,4 +204,4 @@ Cross-cutting runtime subsystems and behaviors.
 
 ## Summary
 
-The registry enumerates **146 capabilities** against baseline `claude-code-2.1.x (mid-2026)`: **84 full**, **10 partial**, **43 degraded-noop**, **9 not-supported**. 5 entries are safety-relevant (marked ⚠) — a divergence where a project's restriction is not enforced and is therefore reported prominently. Unknown inputs outside this registry are not counted here: they are unassessed by definition and degrade safely at runtime (plan §2.4).
+The registry enumerates **148 capabilities** against baseline `claude-code-2.1.x (mid-2026)`: **82 full**, **14 partial**, **43 degraded-noop**, **9 not-supported**. 5 entries are safety-relevant (marked ⚠) — a divergence where a project's restriction is not enforced and is therefore reported prominently. Unknown inputs outside this registry are not counted here: they are unassessed by definition and degrade safely at runtime (plan §2.4).

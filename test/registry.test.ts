@@ -1,7 +1,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
+// In-process matrix renderer (FIX 9): importing this does NOT spawn or write —
+// the .mjs runs its CLI only when executed directly. Lets the freshness guard
+// regenerate the matrix deterministically without a child process / CRLF flake.
+import { renderCapabilityMatrix } from "../scripts/gen-capability-matrix.mjs";
 
 import {
   CAPABILITY_REGISTRY,
@@ -178,13 +183,94 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   it("covers the core tool surface as full and TodoWrite as partial", () => {
     for (const tool of [
       "Read", "Write", "Edit", "Bash", "Grep", "Glob",
-      "WebFetch", "WebSearch", "Agent", "Task", "Skill",
+      "WebFetch", "WebSearch", "Skill",
       "EnterWorktree", "ExitWorktree",
       "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
     ]) {
       expect(lookupCapability(`tool.${tool}`)?.tier, tool).toBe("full");
     }
     expect(lookupCapability("tool.TodoWrite")?.tier).toBe("partial");
+  });
+
+  // F02 subagent-lifecycle: the dispatch tools carry a real parity divergence
+  // (PiCC defaults FOREGROUND; Claude 2.1.198 runs subagents background-by-default),
+  // so Agent/Task are partial, not full. The note must name the default-direction gap.
+  it("marks the subagent dispatch tools partial and names the failure + default-direction semantics", () => {
+    const agent = lookupCapability("tool.Agent");
+    expect(agent?.tier).toBe("partial");
+    expect(agent?.note).toContain("LOUD failure");
+    expect(agent?.note).toContain("agent id");
+    expect(agent?.note.toLowerCase()).toContain("foreground");
+    expect(agent?.note).toContain("2.1.198");
+    const task = lookupCapability("tool.Task");
+    expect(task?.tier).toBe("partial");
+    expect(task?.note).toContain("alias");
+  });
+
+  // SendMessage is a NEW entry (its absence was untruthful by omission). Partial:
+  // no cross-restart resume, steer background-only, idle-parent next-turn delivery.
+  it("carries a SendMessage entry as partial naming its gaps", () => {
+    const sm = lookupCapability("tool.SendMessage");
+    expect(sm, "tool.SendMessage must exist").toBeDefined();
+    expect(sm?.tier).toBe("partial");
+    expect(sm?.note).toContain("cross-restart");
+    expect(sm?.note.toLowerCase()).toContain("background");
+    expect(sm?.note).toContain("non-resumable");
+  });
+
+  // TaskOutput reports failed status (never empty success); TaskStop's discard
+  // contract is PiCC-defined.
+  it("keeps TaskOutput full (failed-status reporting) and TaskStop partial (PiCC-defined discard)", () => {
+    const out = lookupCapability("tool.TaskOutput");
+    expect(out?.tier).toBe("full");
+    expect(out?.note).toContain("failed status");
+    // t07 FIX 2: the note must name the shared-registry cross-visibility divergence
+    // (Claude hides TaskOutput from subagents; PiCC's session-wide registry does not).
+    expect(out?.note).toContain("session-wide");
+    expect(out?.note).toContain("hides TaskOutput from subagents");
+    const stop = lookupCapability("tool.TaskStop");
+    expect(stop?.tier).toBe("partial");
+    expect(stop?.note).toContain("PiCC-defined");
+  });
+
+  // Subagent hook payloads carry agent_id + agent_type; transcript_path stays MAIN
+  // (Claude Code parity — verified against src/runtime/subagents.ts fireSubagentStop).
+  it("documents SubagentStart/SubagentStop carrying agent_id/agent_type with transcript_path = MAIN", () => {
+    for (const ev of ["SubagentStart", "SubagentStop"]) {
+      const entry = lookupCapability(`hook.event.${ev}`);
+      expect(entry?.tier, ev).toBe("full");
+      expect(entry?.note, ev).toContain("agent_id + agent_type");
+      expect(entry?.note, ev).toContain("MAIN session transcript");
+      // t07 FIX 5: the parity claim is softened re plugin agent_type — the note
+      // must state agent_type is the bare frontmatter name (no plugin-scoped id),
+      // so "full"/"parity" no longer rests on an unverified plugin assumption.
+      expect(entry?.note.toLowerCase(), ev).toContain("plugin");
+    }
+  });
+
+  // Notification stays a degraded no-op; the note must record that settlement does
+  // NOT fire an agent_completed Notification (t05 left it unwired).
+  it("records that background settlement does not fire an agent_completed Notification", () => {
+    const n = lookupCapability("hook.event.Notification");
+    expect(n?.tier).toBe("degraded-noop");
+    expect(n?.note).toContain("agent_completed");
+  });
+
+  // agent frontmatter `background: true` is honored (since t05) — a NEW full entry.
+  it("carries an agent.frontmatter.background entry as full", () => {
+    const bg = lookupCapability("agent.frontmatter.background");
+    expect(bg, "agent.frontmatter.background must exist").toBeDefined();
+    expect(bg?.tier).toBe("full");
+    expect(bg?.note).toContain("background: true");
+  });
+
+  // background-agents carries settlement PUSH + the default-foreground gap.
+  it("keeps feature.background-agents partial with settlement-push and default-foreground gaps named", () => {
+    const bg = lookupCapability("feature.background-agents");
+    expect(bg?.tier).toBe("partial");
+    expect(bg?.note).toContain("PUSHED");
+    expect(bg?.note).toContain("2.1.198");
+    expect(bg?.note.toLowerCase()).toContain("idle");
   });
 
   it("stays in sync with the shipped degrade-stub list, in both directions", () => {
@@ -236,11 +322,18 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   it("settings honored by real consumers stay full", () => {
     for (const id of [
       "setting.skillOverrides",
-      "setting.cleanupPeriodDays",
       "setting.enabledPlugins",
     ]) {
       expect(lookupCapability(id)?.tier, id).toBe("full");
     }
+  });
+
+  // cleanupPeriodDays reaps orphaned WORKTREES only — t02 shipped no subagent
+  // transcript reaper, so the claim is downgraded from full to partial (undersell).
+  it("marks cleanupPeriodDays partial — worktrees only, no subagent-transcript cleanup", () => {
+    const c = lookupCapability("setting.cleanupPeriodDays");
+    expect(c?.tier).toBe("partial");
+    expect(c?.note).toContain(".subagents/");
   });
 
   it("agent permissionMode is a safety-relevant no-op, consistent with permissions.defaultMode", () => {
@@ -276,6 +369,24 @@ describe("CAPABILITY_REGISTRY invariants", () => {
 // ---------------------------------------------------------------------------
 // Tool-name resolution
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Matrix freshness (t07 FIX 9) — the un-fakeable guard
+// ---------------------------------------------------------------------------
+
+describe("capability matrix freshness", () => {
+  it("committed doc/supported-features.md is in sync with the registry (regenerated in-process)", () => {
+    // Regenerate from the SAME registry + baseline the runtime uses and diff
+    // against the committed doc. Both sides CRLF-normalized so a Windows checkout
+    // can't false-fail. The first t07 pass shipped a stale matrix; this makes
+    // that un-fakeable — a registry edit without `npm run gen:capabilities` fails.
+    const regenerated = renderCapabilityMatrix(CAPABILITY_REGISTRY, CLAUDE_BASELINE);
+    const committedPath = fileURLToPath(new URL("../doc/supported-features.md", import.meta.url));
+    const committed = fs.readFileSync(committedPath, "utf8");
+    const norm = (s: string) => s.replace(/\r\n/g, "\n");
+    expect(norm(committed)).toBe(norm(regenerated));
+  });
+});
 
 describe("capabilityForToolName", () => {
   it("resolves known tools from the registry", () => {

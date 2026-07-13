@@ -21,8 +21,10 @@ in-memory model. From then on, on Pi's own agent loop:
   variable, and shell-injection processing — the body loads only on activation (progressive
   disclosure).
 - **Subagents** dispatch via the `Agent` tool into fresh, isolated sessions and return their final
-  message verbatim; **worktrees** swap the session's working directory so the project's own git
-  tooling detects worktree mode.
+  message verbatim. A failed dispatch is reported as a loud failure naming the cause — never a
+  silent empty success — and every run leaves a transcript on disk, shows live progress while it
+  runs, records its token/cost, and can be resumed or steered via `SendMessage`. **Worktrees** swap
+  the session's working directory so the project's own git tooling detects worktree mode.
 
 Nothing is written to your project's tracked files. For the full design see
 [`doc/architecture.md`](architecture.md); for the exact compatibility matrix see
@@ -146,11 +148,48 @@ Then use it like Claude Code:
 - the model dispatches subagents via the `Agent` tool (description-driven routing; the built-in
   `general-purpose`/`Explore`/`Plan` types complement project agents, a same-named project agent
   overrides a built-in, and an omitted `subagent_type` defaults to general-purpose).
-  `run_in_background: true` returns a task id immediately — results are polled/awaited via
-  `TaskOutput` and stopped via `TaskStop`.
+  `run_in_background: true` (or an agent's `background: true` frontmatter) returns a task id
+  immediately — results are polled/awaited via `TaskOutput` and stopped via `TaskStop`, and a
+  background settlement is announced to the coordinator at its next turn without polling. A
+  dispatch that dies on an API error is reported as a **loud, named failure** (with any partial
+  output), not an empty success; a run stopped on purpose reports as **aborted**. The coordinator
+  can address a finished subagent by its agent id with **`SendMessage`** to continue it (full prior
+  context) or redirect a still-running background one. See *Observing subagents* below.
 - `EnterWorktree`/`ExitWorktree` isolate work in `.claude/worktrees/<name>/` — the session's
   working directory really moves, so project scripts detect worktree mode via git plumbing
 - parallel sessions: open a second terminal, `picc` again, enter a different worktree
+
+### Observing subagents
+
+Every subagent is now visible, both to you and to the coordinating model:
+
+- **Transcript on disk.** Each dispatch leaves a JSONL transcript beside the main session's, under
+  `<mainSessionFileBase>.subagents/<stamp>_<agentId>.jsonl` (in Pi's sessions dir,
+  `~/.pi/agent/sessions/…`). The agent id is embedded in the filename and appears in the dispatch
+  result, so you can locate a subagent's full turn-by-turn record without guessing. (These files
+  accumulate like Pi's own session files — `cleanupPeriodDays` reaps orphaned *worktrees* but does
+  not yet reap subagent transcripts.)
+- **Live progress.** While a subagent runs, the UI shows which agent it is and what it is doing —
+  the agent type and your dispatch description instead of a bare "Agent" box, a rolling tail of its
+  recent tool calls / output lines, and explicit visibility of silent waits (API auto-retry).
+  Pressing **Esc** cancels a running foreground dispatch (it reports as aborted — rendered in an
+  error frame worded as aborted, not a distinct abort badge; the dedicated aborted badge is a
+  background/next-turn surface).
+- **`/usage`.** A per-subagent token/cost breakdown for the session: each dispatched agent's id,
+  type, outcome, usage line, and transcript path, plus a subagents total. This is **subagent-scoped
+  only** — a PiCC-additive view, not Claude Code's whole-session `/usage`/`/cost` (the Pi extension
+  API exposes no parent-session cost, so the main agent's own spend is not shown).
+- **`SendMessage` (resume / steer).** The coordinator can address a finished subagent by its agent
+  id and continue it with its context intact (it resumes in the background under the same id), or
+  redirect a still-running background one. Honest limitations, by design:
+  - **No cross-restart resume** — the dispatch registry is process-lifetime; after you quit and
+    relaunch `picc`, a prior agent id no longer resolves.
+  - **Steering reaches only background dispatches** — a foreground `Agent` call blocks the
+    coordinator's turn, so there is no moment to steer it; resume works once any dispatch settles.
+  - **Idle-parent delivery is next-turn** — an idle coordinator learns of a background settlement
+    when the conversation next continues; PiCC v1 does not re-invoke an idle agent.
+  - **`context: fork` / override dispatches are not resumable** — their restricted definition can't
+    be re-derived by name, so they are deliberately refused.
 
 ## 5. Control surface (project-external)
 
@@ -162,6 +201,7 @@ Then use it like Claude Code:
 | `/agents` | List every subagent available for dispatch — project/user agents and the built-in `general-purpose`/`Explore`/`Plan` types — with tools, read-only marker, model, and worktree-isolation |
 | `/doctor` | Full compatibility breakdown for this project (generated from the capability registry) |
 | `/compat [suppress\|show]` | Show the consolidated compatibility notice; suppress/unsuppress it |
+| `/usage` | Per-subagent token/cost breakdown for this session (each dispatch's id, type, outcome, usage, transcript path) plus a subagents total. **Subagent-scoped only** — a PiCC-additive surface, *not* Claude Code's whole-session `/usage`/`/cost`: the Pi extension API exposes no parent-session cost, so the main agent's own spend is not included |
 | `/quota` | Context usage + provider rate-limit/quota headers from the last response (best-effort) |
 | `/model`, `/login`, `/settings` | Pi built-ins: model switching, auth, Pi settings |
 
@@ -235,13 +275,23 @@ cannot drift). Summary:
 **Full:** skills (entire frontmatter set incl. `context: fork`, `paths:`, shell injection under
 bash+powershell, argument substitution with 0-based `$N` and `\$` escaping, stacked slash
 invocations), rules, agents — built-in `general-purpose`/`Explore`/`Plan` plus project/user agents
-— with nested subagent dispatch (default depth cap 5), background dispatch (`run_in_background` +
-`TaskOutput`/`TaskStop`), agent-scoped hooks and `memory:` scopes, auto memory (`MEMORY.md`),
-worktrees (incl. `.worktreeinclude`, Windows-tolerant removal), 13 hook events with the full
-stdin/stdout contract (Claude matcher semantics, parallel dispatch, async handlers), CLAUDE.md
-hierarchy to the filesystem root + `@import` + managed policy, settings toggles, deny rules (incl.
-Windows path normalization), tool gating, `WebFetch`/`WebSearch`/`Grep`/`Glob`/`Task*` tools,
-installed-plugin content, compaction preservation under Claude's carryover budgets.
+— with nested subagent dispatch (default depth cap 5), loud classified failure semantics
+(failed/aborted, never an empty success) with partial-output preservation, on-disk subagent
+transcripts, live progress rendering, and per-subagent usage accounting, agent-scoped hooks and
+`memory:` scopes, auto memory (`MEMORY.md`), worktrees (incl. `.worktreeinclude`, Windows-tolerant
+removal), 13 hook events with the full stdin/stdout contract (Claude matcher semantics, parallel
+dispatch, async handlers), CLAUDE.md hierarchy to the filesystem root + `@import` + managed policy,
+settings toggles, deny rules (incl. Windows path normalization), tool gating,
+`WebFetch`/`WebSearch`/`Grep`/`Glob`/`Task*` tools, installed-plugin content, compaction
+preservation under Claude's carryover budgets.
+
+**Partial (works within a named limit):** background subagent dispatch (`run_in_background` /
+`background: true` + `TaskOutput`/`TaskStop`, with settlement pushed to the coordinator at its next
+turn) — but PiCC defaults dispatches to the **foreground**, whereas Claude Code 2.1.198 runs
+subagents background-by-default, so an implicit-concurrency fan-out runs serially unless background
+is requested; and `SendMessage` resume/steer — no cross-restart resume, steering reaches only
+background dispatches, idle-parent delivery is next-turn, and `context: fork`/override dispatches
+are non-resumable. `maxTurns` is a best-effort cap.
 
 **Degraded no-op (visible, never crashing):** MCP servers/tools, `ask`/`allow`/permission modes,
 plan mode, `AskUserQuestion`, checkpointing/rewind, output styles, agent teams, background

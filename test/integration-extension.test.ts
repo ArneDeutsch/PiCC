@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import picc from "../src/index.js";
+import picc, { type PiccTestSeam } from "../src/index.js";
 import { resolveGitBashPath } from "../src/engine/shell-inject.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
@@ -434,6 +434,301 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     await exit.execute("w6", { action: "keep" });
     expect(fs.existsSync(a.details.worktreePath)).toBe(true);
     expect(fs.existsSync(b.details.worktreePath)).toBe(true);
+  });
+});
+
+describe("background settlement notices without polling (t05, offline-integration via the seam)", () => {
+  // The fake-Pi harness cannot reach the closure-local registries, so a fresh
+  // extension instance is wired with the test-only `onWired` seam (reachable
+  // ONLY via this in-process argument — never env/settings/files). Each test
+  // seeds a settled background task exactly as a real dispatch would (register →
+  // start → settle → markSettled) and then drives the REAL before_agent_start
+  // drain handler, asserting the notice reaches the model without any TaskOutput
+  // call. Reuses the fixture cwd from the outer beforeAll.
+  type Internals = Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
+
+  function wire(): { p: FakePi; internals: Internals } {
+    const p = fakePi();
+    let internals!: Internals;
+    picc(p.api as never, { onWired: (i) => (internals = i) });
+    return { p, internals };
+  }
+
+  const reg = (internals: Internals, agentId: string) =>
+    internals.subagentRegistry.register({
+      agentId,
+      agentName: "reviewer",
+      depth: 1,
+      cwd: process.cwd(),
+      resumable: true,
+      oneShot: false,
+    });
+
+  function settlements(
+    p: FakePi,
+  ): Array<{ content: string; deliverAs?: string; display?: unknown }> {
+    return p.messages
+      .filter((m) => m.message?.customType === "picc-settlement")
+      .map((m) => ({
+        content: String(m.message.content),
+        deliverAs: m.options?.deliverAs,
+        display: m.message.display,
+      }));
+  }
+
+  it("announces a settled background task at the next turn (outcome, agent id, framed output) — no TaskOutput needed", async () => {
+    const { p, internals } = wire();
+    const agentId = "agent-0011aa22bb33";
+    reg(internals, agentId);
+    const taskId = internals.backgroundTasks.start(
+      "agent:reviewer",
+      Promise.resolve({
+        ok: true,
+        outcome: "completed" as const,
+        finalMessage: "LGTM - no blocking issues",
+        agentId,
+        diagnostics: [],
+      }),
+      undefined,
+      agentId,
+    );
+    await internals.backgroundTasks.wait(taskId);
+    internals.subagentRegistry.markSettled(agentId);
+
+    // The next parent turn begins — the drain delivers the notice.
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    const notices = settlements(p);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.deliverAs).toBe("steer"); // message-level channel, transcript-visible
+    expect(notices[0]!.display).toBe(true); // transcript-visible acceptance (rendered to the user)
+    expect(notices[0]!.content).toContain(taskId);
+    expect(notices[0]!.content).toContain(agentId);
+    expect(notices[0]!.content).toContain("settled: completed");
+    expect(notices[0]!.content).toContain("LGTM - no blocking issues");
+    expect(notices[0]!.content).toContain("UNTRUSTED SUBAGENT OUTPUT"); // untrusted framing
+    expect(notices[0]!.content).toContain("not an instruction");
+
+    // Exactly-once across turns: the following turn delivers nothing new.
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    expect(settlements(p)).toHaveLength(0);
+  });
+
+  it("a pi.sendMessage throw on one notice still delivers the others and re-fires the throwing one next turn (FIX 1)", async () => {
+    // The real delivery path (deliverSettlementNotices): each notice is delivered
+    // in its own try/catch and the dedup gate is committed ONLY after a successful
+    // send. A throw on one notice must neither drop the others nor consume the
+    // thrower — it re-fires next turn. Nothing is silently lost.
+    const { p, internals } = wire();
+    const agentA = "agent-1a2b3c4d5e6f";
+    const agentB = "agent-6f5e4d3c2b1a";
+    for (const [aid, text] of [
+      [agentA, "A-report"],
+      [agentB, "B-report"],
+    ] as const) {
+      reg(internals, aid);
+      const t = internals.backgroundTasks.start(
+        "agent:reviewer",
+        Promise.resolve({
+          ok: true,
+          outcome: "completed" as const,
+          finalMessage: text,
+          agentId: aid,
+          diagnostics: [],
+        }),
+        undefined,
+        aid,
+      );
+      await internals.backgroundTasks.wait(t);
+      internals.subagentRegistry.markSettled(aid);
+    }
+
+    // Make the FIRST send of the batch throw (before its commit).
+    const realSend = p.api.sendMessage as (m: unknown, o?: unknown) => unknown;
+    let calls = 0;
+    (p.api as Record<string, unknown>).sendMessage = (m: unknown, o?: unknown) => {
+      calls++;
+      if (calls === 1) throw new Error("sendMessage boom");
+      return realSend(m, o);
+    };
+
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    const turn1 = settlements(p);
+    expect(turn1).toHaveLength(1); // the non-throwing notice still landed
+
+    // Restore normal delivery; the un-committed (throwing) notice re-fires.
+    (p.api as Record<string, unknown>).sendMessage = realSend;
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    const turn2 = settlements(p);
+    expect(turn2).toHaveLength(1); // the previously-thrown notice, not lost
+
+    // Across both turns each agent was delivered exactly once — nothing dropped,
+    // nothing duplicated.
+    const joined = [...turn1, ...turn2].map((n) => n.content).join("\n===\n");
+    expect(joined).toContain(agentA);
+    expect(joined).toContain(agentB);
+    expect(joined).toContain("A-report");
+    expect(joined).toContain("B-report");
+
+    // A third turn delivers nothing more.
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    expect(settlements(p)).toHaveLength(0);
+  });
+
+  it("/usage aggregates per-subagent usage, transcript paths, outcome, and a session total (t06)", async () => {
+    const { p, internals } = wire();
+    // Two settled dispatches with usage, exactly as the runtime would record:
+    // register (running) then markSettled with outcome + usage.
+    internals.subagentRegistry.register({
+      agentId: "agent-1111aaaa2222",
+      agentName: "reviewer",
+      depth: 1,
+      cwd: process.cwd(),
+      transcriptPath: "/sessions/main.subagents/x_agent-1111aaaa2222.jsonl",
+      resumable: true,
+      oneShot: false,
+    });
+    internals.subagentRegistry.markSettled("agent-1111aaaa2222", {
+      outcome: "completed",
+      usage: { inputTokens: 100, outputTokens: 50, costUsd: 0.02 },
+    });
+    internals.subagentRegistry.register({
+      agentId: "agent-3333bbbb4444",
+      agentName: "planner",
+      depth: 1,
+      cwd: process.cwd(),
+      transcriptPath: "/sessions/main.subagents/y_agent-3333bbbb4444.jsonl",
+      resumable: true,
+      oneShot: false,
+    });
+    internals.subagentRegistry.markSettled("agent-3333bbbb4444", {
+      outcome: "failed",
+      usage: { inputTokens: 10, outputTokens: 5, costUsd: 0.01 },
+    });
+
+    p.entries.length = 0;
+    await p.commands.get("usage").handler("", p.ctx());
+    const out = p.entries
+      .filter((e) => e.customType === "picc-control")
+      .map((e) => String(e.data?.output ?? ""))
+      .join("\n");
+    // Per-subagent lines: id, type, outcome, usage, transcript path.
+    expect(out).toContain("agent-1111aaaa2222 (reviewer) — completed");
+    expect(out).toContain("agent-3333bbbb4444 (planner) — failed");
+    expect(out).toContain("in 100 · out 50 · $0.02");
+    expect(out).toContain("x_agent-1111aaaa2222.jsonl");
+    expect(out).toContain("y_agent-3333bbbb4444.jsonl");
+    // Subagents total sums each present field across records. The label and
+    // header must make clear this is SUBAGENT usage, not whole-session/main-agent.
+    expect(out).toContain("Subagents total: in 110 · out 55 · $0.03");
+    expect(out).not.toContain("Session total:");
+    expect(out).toContain("does NOT include the main agent's own usage");
+    expect(out).toContain("the main-agent / whole-session total is not shown");
+  });
+
+  it("/usage is registered and reports nothing before any dispatch", async () => {
+    const { p } = wire();
+    expect(p.commands.has("usage")).toBe(true);
+    p.entries.length = 0;
+    await p.commands.get("usage").handler("", p.ctx());
+    const out = p.entries
+      .filter((e) => e.customType === "picc-control")
+      .map((e) => String(e.data?.output ?? ""))
+      .join("\n");
+    expect(out).toContain("No subagents have been dispatched this session");
+  });
+
+  it("sanitizes a control-byte agent name in the /usage report (FIX 4 security)", async () => {
+    // agentName derives from agent frontmatter `name`/basename (only trimmed
+    // upstream); a hostile ANSI/OSC/control-byte name must not reach the terminal
+    // on /usage. Control bytes from code points so this source stays pure ASCII.
+    const { p, internals } = wire();
+    const ESC = String.fromCharCode(27);
+    const BEL = String.fromCharCode(7);
+    const NUL = String.fromCharCode(0);
+    internals.subagentRegistry.register({
+      agentId: "agent-abcabcabcabc",
+      agentName: `rev${ESC}[31miewer${BEL}${ESC}]0;pwn${BEL}${NUL}`,
+      depth: 1,
+      cwd: process.cwd(),
+      resumable: true,
+      oneShot: false,
+    });
+    internals.subagentRegistry.markSettled("agent-abcabcabcabc", {
+      outcome: "completed",
+      usage: { inputTokens: 1 },
+    });
+    p.entries.length = 0;
+    await p.commands.get("usage").handler("", p.ctx());
+    const out = p.entries
+      .filter((e) => e.customType === "picc-control")
+      .map((e) => String(e.data?.output ?? ""))
+      .join("\n");
+    expect(out).not.toContain(ESC);
+    expect(out).not.toContain(BEL);
+    expect(out).not.toContain(NUL);
+    expect(out).toContain("reviewer"); // visible name text preserved
+    expect(out).toContain("agent-abcabcabcabc");
+  });
+
+  it("delivers completed / failed / stopped shapes together (rate-limit → failed; TaskStop → aborted)", async () => {
+    const { p, internals } = wire();
+
+    const okId = "agent-cc33dd44ee55";
+    reg(internals, okId);
+    const okTask = internals.backgroundTasks.start(
+      "agent:reviewer",
+      Promise.resolve({ ok: true, outcome: "completed" as const, finalMessage: "done", agentId: okId, diagnostics: [] }),
+      undefined,
+      okId,
+    );
+    await internals.backgroundTasks.wait(okTask);
+    internals.subagentRegistry.markSettled(okId);
+
+    const failId = "agent-ff00ee11dd22";
+    reg(internals, failId);
+    const failTask = internals.backgroundTasks.start(
+      "agent:reviewer",
+      Promise.resolve({
+        ok: false,
+        outcome: "failed" as const,
+        finalMessage: "",
+        agentId: failId,
+        error: "Agent terminated early due to an API error: insufficient_quota",
+        diagnostics: [],
+      }),
+      undefined,
+      failId,
+    );
+    await internals.backgroundTasks.wait(failTask);
+    internals.subagentRegistry.markSettled(failId);
+
+    const stopId = "agent-aa11bb22cc33";
+    reg(internals, stopId);
+    let resolveStop!: (v: unknown) => void;
+    const stopTask = internals.backgroundTasks.start(
+      "agent:reviewer",
+      new Promise((r) => (resolveStop = r)),
+      () => {},
+      stopId,
+    );
+    internals.backgroundTasks.stop(stopTask); // status → stopped; notice reads "aborted"
+    resolveStop({ ok: false, outcome: "aborted", finalMessage: "discard", agentId: stopId, error: "aborted", diagnostics: [] });
+    await internals.backgroundTasks.wait(stopTask);
+    internals.subagentRegistry.markSettled(stopId);
+
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    const joined = settlements(p).map((n) => n.content).join("\n===\n");
+    expect(settlements(p)).toHaveLength(3);
+    expect(joined).toContain("settled: completed");
+    expect(joined).toContain("settled: failed");
+    expect(joined).toContain("insufficient_quota"); // t01 regression: never a silent success
+    expect(joined).toContain("settled: aborted"); // outcome vocabulary (status is "stopped")
   });
 });
 

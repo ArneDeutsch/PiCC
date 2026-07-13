@@ -4,10 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import { startMockModel, type CapturedRequest, type Turn } from "./helpers/mock-openai.js";
 import { flattenProjectPath } from "../src/claude/memory.js";
 import { resolveShellBinary } from "../src/engine/shell-inject.js";
+import { resolveSubagentTranscript } from "../src/util/subagent-transcripts.js";
 
 /**
  * Live end-to-end tests: the REAL Pi CLI (dist/cli.js) runs the assembled
@@ -99,6 +101,8 @@ interface RunResult {
   stderr: string;
   requests: CapturedRequest[];
   fixture: string;
+  /** The per-run PI_CODING_AGENT_DIR (sessions land under <agentDir>/sessions). */
+  agentDir: string;
 }
 
 type FixtureName = "hello-claude" | "full-surface";
@@ -109,6 +113,8 @@ async function runPi(opts: {
   fixture?: FixtureName;
   extraEnv?: Record<string, string>;
   setup?: (fixtureDir: string) => void;
+  /** Keep session persistence ON (drops --no-session) — transcript scenarios (t02). */
+  persistSession?: boolean;
 }): Promise<RunResult> {
   const fixture = materializeFixture(opts.fixture ?? "hello-claude");
   fixtures.push(fixture);
@@ -122,7 +128,14 @@ async function runPi(opts: {
 
     const child = spawn(
       process.execPath,
-      [CLI_PATH, "-e", EXTENSION_PATH, "--no-session", "-p", opts.prompt],
+      [
+        CLI_PATH,
+        "-e",
+        EXTENSION_PATH,
+        ...(opts.persistSession ? [] : ["--no-session"]),
+        "-p",
+        opts.prompt,
+      ],
       {
         cwd: fixture,
         env: {
@@ -148,7 +161,7 @@ async function runPi(opts: {
     const killTimer = setTimeout(() => child.kill(), RUN_TIMEOUT_MS);
     const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
     clearTimeout(killTimer);
-    return { code, stdout, stderr, requests: mock.requests, fixture };
+    return { code, stdout, stderr, requests: mock.requests, fixture, agentDir };
   } finally {
     await mock.close();
   }
@@ -798,6 +811,127 @@ describe.skipIf(cliMissing)(
         // The subagent's final message came back to the orchestrator verbatim.
         const done = result.requests.some((r) => toolResultText(r).includes("DONE-ISO"));
         expect(done, "parent tool result must contain DONE-ISO").toBe(true);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario t01: a subagent dying on a terminal API error surfaces as a NAMED failure ---
+    it(
+      "reports a subagent killed by a sticky API error as a named failure — never an empty success",
+      async () => {
+        // The child (Explore) session is identified by its read-only persona;
+        // every one of ITS requests — including any Pi auto-retries — hits the
+        // same sticky 429. The insufficient_quota message is non-retryable for
+        // Pi (pi-ai utils/retry.js), mirroring the drained-limit incident that
+        // motivated t01, so the child dies on its first request.
+        const isExplore = (r: CapturedRequest) =>
+          systemText(r).includes("read-only exploration agent");
+        const isParent = (r: CapturedRequest) => !isExplore(r);
+        const result = await runPi({
+          script: [
+            // 0) parent dispatches the Explore subagent (first request is the parent)
+            {
+              when: isParent,
+              toolCalls: [
+                { name: "Agent", args: { subagent_type: "Explore", prompt: "look around" } },
+              ],
+            },
+            // sticky terminal error for the child session (never consumed)
+            {
+              when: isExplore,
+              error: {
+                status: 429,
+                message: "insufficient_quota: mock usage limit drained (E2E-API-DEATH)",
+              },
+            },
+            // parent's follow-up once the failed tool result is in
+            { when: isParent, text: "saw the failure" },
+          ],
+          prompt: "explore the project (the subagent is doomed)",
+        });
+
+        expect(result.code).toBe(0);
+        // The parent's follow-up request carries a tool result NAMING the API error.
+        const failed = result.requests.find((r) =>
+          toolResultText(r).includes("Agent terminated early due to an API error"),
+        );
+        expect(failed, "parent must receive the named API failure as a tool result").toBeDefined();
+        expect(toolResultText(failed!)).toContain("E2E-API-DEATH");
+        expect(result.stdout).toContain("saw the failure");
+        // No crash noise from the failed dispatch.
+        expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|unhandledRejection|FATAL/i);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario t02: persisted subagent transcript + model-visible agent ID (real stack) ---
+    it(
+      "persists the subagent transcript next to the main session and delivers the agent ID trailer to the parent",
+      async () => {
+        // The child is the general-purpose builtin — its PERSONA body appears
+        // only in the child's system prompt (the parent catalog carries just
+        // the description).
+        const isChild = (r: CapturedRequest) =>
+          systemText(r).includes("You are a general-purpose agent");
+        const isParent = (r: CapturedRequest) => !isChild(r);
+        const result = await runPi({
+          persistSession: true, // NOT --no-session: the main session file must exist (t02)
+          script: [
+            {
+              when: isParent,
+              toolCalls: [
+                {
+                  name: "Agent",
+                  args: { subagent_type: "general-purpose", prompt: "summarize the project" },
+                },
+              ],
+            },
+            { when: isChild, text: "SUBAGENT-TRANSCRIPT-CANARY: summary done" },
+            { when: isParent, text: "delegated fine" },
+          ],
+          prompt: "delegate a summary to a general-purpose agent",
+        });
+
+        expect(result.code).toBe(0);
+
+        // 1) The parent MODEL received the delimited agent-ID trailer in the
+        //    tool result content (details would never reach it).
+        const trailerRe = /\[agent (agent-[0-9a-f]{12}) completed — resumable via SendMessage\]/;
+        const withTrailer = result.requests.find((r) => trailerRe.test(toolResultText(r)));
+        expect(withTrailer, "parent must receive the agent-ID trailer").toBeDefined();
+        const trailerText = toolResultText(withTrailer!);
+        expect(trailerText).toContain("SUBAGENT-TRANSCRIPT-CANARY: summary done");
+        const agentId = trailerRe.exec(trailerText)![1]!;
+
+        // 2) The subagent transcript exists in the <mainBase>.subagents sibling
+        //    directory of the REAL main session transcript, written by the REAL
+        //    Pi AgentSession, and the exported resolver maps the ID to it.
+        const sessionsRoot = path.join(result.agentDir, "sessions");
+        const mainFiles: string[] = [];
+        const walk = (dir: string) => {
+          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) walk(full);
+            else if (entry.name.endsWith(".jsonl") && !dir.endsWith(".subagents")) {
+              mainFiles.push(full);
+            }
+          }
+        };
+        walk(sessionsRoot);
+        expect(mainFiles.length, `expected a main session transcript under ${sessionsRoot}`).toBeGreaterThanOrEqual(1);
+        const resolved = mainFiles
+          .map((main) => resolveSubagentTranscript(main, agentId))
+          .find((p): p is string => p !== undefined);
+        expect(resolved, "resolver must locate the subagent transcript from the main session").toBeDefined();
+        expect(fs.readFileSync(resolved!, "utf8")).toContain("SUBAGENT-TRANSCRIPT-CANARY");
+
+        // 3) Dispose→reopen round-trip on the real file: the session reopens
+        //    under the same ID with the run's messages intact.
+        const reopened = SessionManager.open(resolved!);
+        expect(reopened.getSessionId()).toBe(agentId);
+        const restored = JSON.stringify(reopened.buildSessionContext().messages);
+        expect(restored).toContain("summarize the project");
+        expect(restored).toContain("SUBAGENT-TRANSCRIPT-CANARY: summary done");
       },
       TEST_TIMEOUT_MS,
     );

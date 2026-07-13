@@ -85,6 +85,20 @@ describe("control commands display immediately and never leak to the model", () 
     expect(pi.messages).toHaveLength(0);
   });
 
+  it("/usage via the input event is intercepted (print/non-interactive mode) and never leaks to the model", async () => {
+    // Regression guard (t07 FIX 3): /usage was registered as a command but MISSING
+    // from the input-handler control-command interceptor, so in print mode it fell
+    // through to the model instead of being short-circuited.
+    reset();
+    const outcome = await pi.fire("input", { text: "/usage", source: "print" });
+
+    expect(outcome).toEqual({ action: "handled" });
+    const entry = controlEntry("usage");
+    expect(entry, "expected a picc-control entry for /usage").toBeDefined();
+    expect(String(entry?.data?.output ?? "")).toContain("subagent");
+    expect(pi.messages, "/usage must not leak to the model").toHaveLength(0);
+  });
+
   it("/doctor via the registered command handler displays immediately (regression: was queued for the next turn)", async () => {
     reset();
     const command = pi.commands.get("doctor");
@@ -100,7 +114,7 @@ describe("control commands display immediately and never leak to the model", () 
   });
 
   it("every control command is registered and produces immediate entry output", async () => {
-    for (const name of ["doctor", "compat", "quota", "skills", "agents"]) {
+    for (const name of ["doctor", "compat", "quota", "skills", "agents", "usage"]) {
       reset();
       const command = pi.commands.get(name);
       expect(command, `expected /${name} to be registered`).toBeDefined();

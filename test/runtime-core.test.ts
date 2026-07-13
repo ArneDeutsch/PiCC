@@ -1,7 +1,30 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
+
+// Parent-only guard (tester NIT-2): the last test boots the REAL picc harness
+// with only the Pi SDK's session creation faked, so it can dispatch a real
+// subagent and inspect the tool list that subagent's session actually receives.
+// This file has no static import of the Pi module, so this mock cleanly
+// intercepts subagents.ts's dynamic `loadRealSdk` import (unlike sendmessage.test,
+// whose top-level SessionManager import defeats interception).
+const rcMock = vi.hoisted(() => ({ created: [] as Array<Record<string, unknown>> }));
+vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
+  const real = await importOriginal<Record<string, unknown>>();
+  const { fakeSdk: makeFakeSdk } = await import("./helpers/fake-sdk.js");
+  const { sdk } = makeFakeSdk({ replies: ["rc-nit2-done"], created: rcMock.created });
+  return {
+    ...real,
+    createAgentSession: (options: Record<string, unknown>) => sdk.createAgentSession(options),
+    DefaultResourceLoader: sdk.DefaultResourceLoader,
+    SessionManager: { inMemory: () => ({}) },
+    SettingsManager: { inMemory: () => ({}) },
+    getAgentDir: () => "/fake-agent-dir",
+  };
+});
+import piccExtension from "../src/index.js";
+import { fakePi } from "./helpers/fake-pi.js";
 import { CwdState } from "../src/runtime/cwd-state.js";
 import {
   applyUpdatedInput,
@@ -17,9 +40,16 @@ import {
   resetInjectionState,
 } from "../src/runtime/context-assembly.js";
 import { mapEffort, steeringForModel, type PiCCConfig } from "../src/runtime/steering.js";
-import { SubagentRuntime, createAgentToolDefinition, extractText, type PiSdk } from "../src/runtime/subagents.js";
-import { PermissionEngine } from "../src/engine/permissions.js";
-import { HookRunner } from "../src/engine/hook-runner.js";
+import { createAgentToolDefinition, extractText, type SubagentRuntime } from "../src/runtime/subagents.js";
+import type { ProgressSnapshot } from "../src/runtime/subagent-progress.js";
+import { agentTrailerFrame } from "../src/util/subagent-transcripts.js";
+import {
+  fakeSdk,
+  makeAgent,
+  makeSubagentRuntime,
+  type FakeReply,
+  type SubagentRuntimeOverrides,
+} from "./helpers/fake-sdk.js";
 import type { ClaudeAgent, ClaudeSettings } from "../src/types.js";
 
 function baseSettings(): ClaudeSettings {
@@ -39,19 +69,6 @@ function baseSettings(): ClaudeSettings {
     unknownKeys: [],
     deferredKeys: [],
     diagnostics: [],
-  };
-}
-
-function makeAgent(overrides: Partial<ClaudeAgent> = {}): ClaudeAgent {
-  return {
-    name: "reviewer",
-    description: "Reviews things",
-    metadata: {},
-    body: "You are the reviewer.",
-    source: { path: "<test>", scope: "project" },
-    unknownKeys: [],
-    diagnostics: [],
-    ...overrides,
   };
 }
 
@@ -387,66 +404,13 @@ describe("context assembly", () => {
 });
 
 describe("SubagentRuntime (fake SDK)", () => {
-  function fakeSdk(replies: string[]): { sdk: PiSdk; created: Array<Record<string, unknown>> } {
-    const created: Array<Record<string, unknown>> = [];
-    let i = 0;
-    const sdk: PiSdk = {
-      async createAgentSession(options) {
-        created.push(options);
-        const messages: Array<{ role: string; content: unknown }> = [];
-        return {
-          session: {
-            async prompt(text: string) {
-              messages.push({ role: "user", content: text });
-              const reply = replies[Math.min(i, replies.length - 1)];
-              i++;
-              messages.push({ role: "assistant", content: [{ type: "text", text: reply }] });
-            },
-            messages,
-            dispose() {},
-          },
-        };
-      },
-      DefaultResourceLoader: class {
-        constructor(public options: Record<string, unknown>) {}
-        async reload() {}
-      },
-      inMemorySessionManager: () => ({}),
-      inMemorySettingsManager: () => ({}),
-      agentDir: () => "/fake/agent-dir",
-    };
-    return { sdk, created };
-  }
-
-  function makeRuntime(agents: ClaudeAgent[], replies: string[], overrides: Record<string, unknown> = {}) {
-    const { sdk, created } = fakeSdk(replies);
-    const engine = new PermissionEngine(
-      { allow: [], deny: [], ask: [], additionalDirectories: [] },
-      { cwd: process.cwd() },
-    );
-    const hookRunner = new HookRunner({
-      config: {},
-      projectDir: process.cwd(),
-      sessionId: "t",
-      env: {},
-      disableAllHooks: true,
-    });
-    const runtime = new SubagentRuntime({
-      getAgents: () => agents,
-      buildSystemPrompt: (a) => `SYSTEM:${a.name}`,
-      customToolsFor: () => [],
-      allKnownToolNames: () => ["Read", "Write", "Edit", "Bash", "Grep", "Glob"],
-      permissionEngine: engine,
-      hookRunner,
-      getCwd: () => process.cwd(),
-      resolveModel: () => undefined,
-      mapEffort: () => undefined,
-      maxDepth: 2,
-      concurrency: 2,
-      sessionId: "t",
-      sdk,
-      ...overrides,
-    } as never);
+  function makeRuntime(
+    agents: ClaudeAgent[],
+    replies: Array<string | FakeReply>,
+    overrides: SubagentRuntimeOverrides = {},
+  ) {
+    const { sdk, created } = fakeSdk({ replies });
+    const runtime = makeSubagentRuntime(agents, sdk, overrides);
     return { runtime, created };
   }
 
@@ -574,63 +538,23 @@ describe("SubagentRuntime (fake SDK)", () => {
 
   it("depth-2 nested dispatch completes at concurrency 1 (regression: semaphore deadlock)", async () => {
     const agents = [makeAgent({ name: "outer" }), makeAgent({ name: "inner" })];
-    const engine = new PermissionEngine(
-      { allow: [], deny: [], ask: [], additionalDirectories: [] },
-      { cwd: process.cwd() },
-    );
-    const hookRunner = new HookRunner({
-      config: {},
-      projectDir: process.cwd(),
-      sessionId: "t",
-      env: {},
-      disableAllHooks: true,
-    });
     // A fake model: the outer session "calls" the nested Agent tool, the inner replies.
-    const sdk: PiSdk = {
-      async createAgentSession(options) {
-        const messages: Array<{ role: string; content: unknown }> = [];
-        const customTools = (options.customTools as Array<Record<string, any>>) ?? [];
-        return {
-          session: {
-            async prompt(text: string) {
-              messages.push({ role: "user", content: text });
-              const agentTool = customTools.find((t) => t.name === "Agent");
-              if (agentTool && text.includes("delegate")) {
-                const res = await agentTool.execute("id", { subagent_type: "inner", prompt: "leaf work" });
-                messages.push({ role: "assistant", content: [{ type: "text", text: `nested:${res.content[0].text}` }] });
-              } else {
-                messages.push({ role: "assistant", content: [{ type: "text", text: "leaf-done" }] });
-              }
-            },
-            messages,
-            dispose() {},
-          },
-        };
+    const { sdk } = fakeSdk({
+      onPrompt: async (text, session) => {
+        const agentTool = session.customTools.find((t) => t.name === "Agent");
+        if (agentTool && text.includes("delegate")) {
+          const res = await agentTool.execute("id", { subagent_type: "inner", prompt: "leaf work" });
+          return `nested:${res.content[0].text}`;
+        }
+        return "leaf-done";
       },
-      DefaultResourceLoader: class {
-        constructor(public options: Record<string, unknown>) {}
-        async reload() {}
-      },
-      inMemorySessionManager: () => ({}),
-      inMemorySettingsManager: () => ({}),
-      agentDir: () => "/fake",
-    };
-    const runtime: SubagentRuntime = new SubagentRuntime({
-      getAgents: () => agents,
-      buildSystemPrompt: (a: ClaudeAgent) => `S:${a.name}`,
+    });
+    const runtime: SubagentRuntime = makeSubagentRuntime(agents, sdk, {
       customToolsFor: (_a: ClaudeAgent, _g: string[], depth: number) =>
         depth + 1 <= 2 ? [createAgentToolDefinition(runtime, { depth, name: "Agent" })] : [],
       allKnownToolNames: () => ["Read"],
-      permissionEngine: engine,
-      hookRunner,
-      getCwd: () => process.cwd(),
-      resolveModel: () => undefined,
-      mapEffort: () => undefined,
-      maxDepth: 2,
       concurrency: 1, // old code: guaranteed deadlock for ANY depth-2 nesting
-      sessionId: "t",
-      sdk,
-    } as never);
+    });
     const result = await runtime.dispatch({ subagentType: "outer", prompt: "please delegate", depth: 1 });
     expect(result.ok).toBe(true);
     expect(result.finalMessage).toBe("nested:leaf-done");
@@ -998,5 +922,415 @@ describe("SubagentRuntime (fake SDK)", () => {
     const { runtime } = makeRuntime([makeAgent()], ["ok"], { makeScopedHookRunner });
     await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
     expect(calls).toBe(0);
+  });
+});
+
+describe("Subagent live progress (t03)", () => {
+  const streamReply = {
+    text: "done",
+    events: [
+      { type: "turn_start", turnIndex: 0 },
+      { type: "tool_execution_start", toolName: "Grep", args: { pattern: "foo" } },
+      { type: "tool_execution_end", toolName: "Grep", result: "match", isError: false },
+      {
+        type: "turn_end",
+        message: { role: "assistant", content: [{ type: "text", text: "final line" }] },
+      },
+    ],
+  };
+
+  it("dispatch streams condensed progress when the session supports subscribe", async () => {
+    const { sdk } = fakeSdk({ replies: [streamReply] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    const snapshots: ProgressSnapshot[] = [];
+    const result = await runtime.dispatch({
+      subagentType: "reviewer",
+      prompt: "p",
+      depth: 1,
+      onProgress: (s) => snapshots.push(s),
+    });
+    expect(result.ok).toBe(true);
+    // Progress is display-only: the verbatim final message is untouched.
+    expect(result.finalMessage).toBe("done");
+    expect(snapshots.length).toBeGreaterThan(0);
+    expect(snapshots.some((s) => s.activity === "running Grep…")).toBe(true);
+    expect(snapshots.some((s) => s.tail.some((l) => l.includes("Grep")))).toBe(true);
+  });
+
+  it("dispatch works unchanged when the session lacks subscribe", async () => {
+    const { sdk } = fakeSdk({ replies: ["ok"], noSubscribe: true });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    const snapshots: ProgressSnapshot[] = [];
+    const result = await runtime.dispatch({
+      subagentType: "reviewer",
+      prompt: "p",
+      depth: 1,
+      onProgress: (s) => snapshots.push(s),
+    });
+    expect(result.ok).toBe(true);
+    expect(result.finalMessage).toBe("ok");
+    expect(snapshots.length).toBe(0);
+  });
+
+  it("Agent tool forwards live progress through onUpdate with the expected shape", async () => {
+    const { sdk } = fakeSdk({
+      replies: [
+        {
+          text: "ok",
+          events: [{ type: "tool_execution_start", toolName: "Read", args: { file_path: "a.ts" } }],
+        },
+      ],
+    });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    const tool = createAgentToolDefinition(runtime, { depth: 0 }) as {
+      execute: (
+        id: string,
+        params: Record<string, unknown>,
+        signal: AbortSignal | undefined,
+        onUpdate: (u: {
+          content: Array<{ type: string; text: string }>;
+          details?: Record<string, unknown>;
+        }) => void,
+      ) => Promise<{ content: Array<{ text: string }> }>;
+    };
+    const updates: Array<{
+      content: Array<{ type: string; text: string }>;
+      details?: Record<string, unknown>;
+    }> = [];
+    const res = await tool.execute(
+      "t1",
+      { subagent_type: "reviewer", prompt: "go" },
+      undefined,
+      (u) => updates.push(u),
+    );
+    expect(res.content[0]?.text).toBe("ok"); // verbatim, unaffected by progress
+    expect(updates.length).toBeGreaterThan(0);
+    const last = updates[updates.length - 1]!;
+    expect(last.content[0]?.type).toBe("text");
+    expect(typeof last.content[0]?.text).toBe("string");
+    expect((last.details?.subagentProgress as ProgressSnapshot | undefined)?.activity).toContain(
+      "Read",
+    );
+    expect(last.details?.live).toBe(true);
+  });
+
+  it("renderCall shows the agent type and description / prompt head", () => {
+    const { sdk } = fakeSdk({ replies: ["x"] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    const tool = createAgentToolDefinition(runtime, { depth: 0 }) as {
+      renderCall: (
+        args: Record<string, unknown>,
+        theme: unknown,
+      ) => { render: (w: number) => string[] };
+    };
+    const withDesc = tool
+      .renderCall({ subagent_type: "reviewer", description: "Review auth" }, undefined)
+      .render(80)
+      .join("\n");
+    expect(withDesc).toContain("Agent(reviewer)");
+    expect(withDesc).toContain("Review auth");
+
+    const withPrompt = tool
+      .renderCall({ subagent_type: "reviewer", prompt: "Do the thing please" }, undefined)
+      .render(80)
+      .join("\n");
+    expect(withPrompt).toContain("Do the thing");
+
+    const empty = tool.renderCall({}, undefined).render(80).join("\n");
+    expect(empty).toContain("Agent(general-purpose)");
+  });
+
+  it("renderResult renders outcome, transcript, usage slot, and degrades on missing fields", () => {
+    const { sdk } = fakeSdk({ replies: ["x"] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    const tool = createAgentToolDefinition(runtime, { depth: 0 }) as {
+      renderResult: (
+        r: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+        o: { isPartial?: boolean; expanded?: boolean },
+        theme: unknown,
+      ) => { render: (w: number) => string[] };
+    };
+    const render = (
+      r: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+      isPartial = false,
+    ) => tool.renderResult(r, { isPartial }, undefined).render(120).join("\n");
+
+    // Final, completed + resumable + transcript, no usage yet (t06).
+    const completed = render({
+      content: [{ type: "text", text: "the answer" }],
+      details: {
+        outcome: "completed",
+        agent: "reviewer",
+        transcriptPath: "/x/agent-abc.jsonl",
+        resumable: true,
+      },
+    });
+    expect(completed).toContain("completed");
+    expect(completed).toContain("the answer");
+    expect(completed).toContain("/x/agent-abc.jsonl");
+    expect(completed).toContain("resumable");
+    expect(completed).not.toContain("usage:");
+
+    // Usage slot renders defensively when t06's field is present.
+    const withUsage = render({
+      content: [{ type: "text", text: "x" }],
+      details: { outcome: "completed", usage: { totalTokens: 1200, costUsd: 0.03 } },
+    });
+    expect(withUsage).toContain("usage:");
+    expect(withUsage).toContain("1200 tokens");
+
+    // Failed-with-partial shows a failed badge and preserves the partial body.
+    const failed = render({
+      content: [{ type: "text", text: "partial work" }],
+      details: { outcome: "failed", cutOff: true, agent: "reviewer" },
+    });
+    expect(failed).toContain("failed");
+    expect(failed).toContain("partial work");
+
+    // Partial/streaming shows the live tail + activity.
+    const partial = render(
+      {
+        content: [],
+        details: {
+          subagentProgress: { tail: ["> Grep"], activity: "running Grep…" },
+          agent: "reviewer",
+          live: true,
+        },
+      },
+      true,
+    );
+    expect(partial).toContain("running Grep…");
+    expect(partial).toContain("Grep");
+
+    // Empty details: never throws, falls back to the content text.
+    const bare = render({ content: [{ type: "text", text: "hi" }], details: {} });
+    expect(bare).toContain("hi");
+  });
+
+  const ESC = String.fromCharCode(27);
+  const BEL = String.fromCharCode(7);
+
+  const renderTool = () => {
+    const { sdk } = fakeSdk({ replies: ["x"] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    return createAgentToolDefinition(runtime, { depth: 0 }) as {
+      renderCall: (args: Record<string, unknown>, theme: unknown) => { render: (w: number) => string[] };
+      renderResult: (
+        r: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+        o: { isPartial?: boolean; expanded?: boolean },
+        theme: unknown,
+      ) => { render: (w: number) => string[] };
+    };
+  };
+
+  it("sanitizes model-supplied text in renderCall and renderResult display (SEC-2)", () => {
+    const tool = renderTool();
+    const call = tool
+      .renderCall(
+        { subagent_type: `${ESC}[31mreviewer${ESC}[0m`, description: `${ESC}]0;pwned${BEL}Review auth` },
+        undefined,
+      )
+      .render(80)
+      .join("\n");
+    expect(call.includes(ESC)).toBe(false);
+    expect(call.includes(BEL)).toBe(false);
+    expect(call).toContain("reviewer");
+    expect(call).toContain("Review auth");
+
+    const result = tool
+      .renderResult(
+        {
+          content: [{ type: "text", text: `${ESC}[2Jclean body${BEL}` }],
+          details: { outcome: "completed", agent: "reviewer" },
+        },
+        { isPartial: false },
+        undefined,
+      )
+      .render(120)
+      .join("\n");
+    expect(result.includes(ESC)).toBe(false);
+    expect(result.includes(BEL)).toBe(false);
+    expect(result).toContain("clean body");
+  });
+
+  it("strips the t02 trailer frame from the human view, one resumable hint with the id (UX-2)", () => {
+    const tool = renderTool();
+    const agentId = "agent-0123456789ab";
+    const rendered = tool
+      .renderResult(
+        {
+          content: [
+            { type: "text", text: `the answer${agentTrailerFrame(agentId, { completed: true })}` },
+          ],
+          details: {
+            outcome: "completed",
+            agent: "reviewer",
+            resumable: true,
+            agentId,
+            transcriptPath: "/x/agent.jsonl",
+          },
+        },
+        { isPartial: false },
+        undefined,
+      )
+      .render(120)
+      .join("\n");
+    expect(rendered).toContain("the answer");
+    // The raw model-plumbing frame is gone from the human view.
+    expect(rendered).not.toContain("---");
+    expect(rendered).not.toMatch(/\[agent /);
+    // "resumable via SendMessage" appears exactly once and carries the id.
+    expect(rendered.match(/resumable via SendMessage/g)?.length).toBe(1);
+    expect(rendered).toContain(agentId);
+  });
+
+  it("renders the (truncated) badge for a turn-capped (length-stop) success (UX-3)", async () => {
+    const { sdk } = fakeSdk({ replies: [{ text: "partial answer", stopReason: "length" }] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    const tool = createAgentToolDefinition(runtime, { depth: 0 }) as {
+      execute: (
+        id: string,
+        params: Record<string, unknown>,
+        signal: AbortSignal | undefined,
+      ) => Promise<{
+        content: Array<{ type: string; text: string }>;
+        details?: Record<string, unknown>;
+      }>;
+      renderResult: (
+        r: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+        o: { isPartial?: boolean },
+        theme: unknown,
+      ) => { render: (w: number) => string[] };
+    };
+    const res = await tool.execute("t", { subagent_type: "reviewer", prompt: "go" }, undefined);
+    // UX-3 wiring: the truncated success marks cutOff so the badge can differ.
+    expect(res.details?.cutOff).toBe(true);
+    const rendered = tool.renderResult(res, { isPartial: false }, undefined).render(120).join("\n");
+    expect(rendered).toContain("completed (truncated)");
+  });
+
+  it("renders the ■ aborted badge when details.outcome is aborted (UX-1)", () => {
+    const tool = renderTool();
+    const rendered = tool
+      .renderResult(
+        { content: [{ type: "text", text: "" }], details: { outcome: "aborted", agent: "reviewer" } },
+        { isPartial: false },
+        undefined,
+      )
+      .render(120)
+      .join("\n");
+    expect(rendered).toContain("■");
+    expect(rendered).toContain("aborted");
+  });
+
+  it("renderCall flags background and renderResult shows the background header (FIX-B)", () => {
+    const tool = renderTool();
+    const call = tool
+      .renderCall({ subagent_type: "reviewer", run_in_background: true }, undefined)
+      .render(80)
+      .join("\n");
+    expect(call).toContain("[background]");
+    const result = tool
+      .renderResult(
+        {
+          content: [{ type: "text", text: "Background task task-1 started" }],
+          details: { background: true, agent: "reviewer" },
+        },
+        { isPartial: false },
+        undefined,
+      )
+      .render(120)
+      .join("\n");
+    expect(result).toContain("Agent → background");
+    expect(result).toContain("Background task task-1 started");
+  });
+
+  it("unsubscribes from the session event stream after dispatch settles (FIX-B)", async () => {
+    // Success path: finally runs on the normal return.
+    const ok = fakeSdk({
+      replies: [
+        { text: "done", events: [{ type: "tool_execution_start", toolName: "Grep", args: {} }] },
+      ],
+    });
+    const okRuntime = makeSubagentRuntime([makeAgent()], ok.sdk);
+    const okResult = await okRuntime.dispatch({
+      subagentType: "reviewer",
+      prompt: "p",
+      depth: 1,
+      onProgress: () => {},
+    });
+    expect(okResult.ok).toBe(true);
+    expect(ok.sessions[0]!.listenerCount()).toBe(0);
+
+    // Throwing path: prompt() throws → dispatch catch-all → finally still unsubscribes.
+    const boom = fakeSdk({
+      onPrompt: () => {
+        throw new Error("boom");
+      },
+    });
+    const boomRuntime = makeSubagentRuntime([makeAgent()], boom.sdk);
+    const boomResult = await boomRuntime.dispatch({
+      subagentType: "reviewer",
+      prompt: "p",
+      depth: 1,
+      onProgress: () => {},
+    });
+    expect(boomResult.ok).toBe(false);
+    expect(boom.sessions[0]!.listenerCount()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Parent-only guard (tester NIT-2) — SendMessage never reaches a subagent
+// ---------------------------------------------------------------------------
+
+describe("SendMessage parent-only guard through the real harness (tester NIT-2)", () => {
+  it("a subagent's constructed toolset EXCLUDES SendMessage even under inherit-all", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-rc-nit2-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "nit2-project\n");
+    const userDir = path.join(dir, ".claude-user");
+    fs.mkdirSync(userDir, { recursive: true });
+    const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const originalCwd = process.cwd();
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    process.chdir(dir);
+    try {
+      const pi = fakePi();
+      piccExtension(pi.api as never);
+      // Boot is async (project/agents load); give it a beat to register tools.
+      await new Promise((r) => setTimeout(r, 200));
+      const agentTool = pi.tools.get("Agent") as {
+        execute: (
+          id: string,
+          params: Record<string, unknown>,
+        ) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
+      };
+      expect(agentTool, "Agent tool must be registered").toBeDefined();
+
+      // general-purpose inherits ALL tools (tools: undefined) → gateTools grants
+      // every known Claude name INCLUDING SendMessage. The subagent's session must
+      // still never receive a SendMessage tool: the one-line guard in index.ts's
+      // customToolsFor must hold under inherit-all (and claudeToolsToPiBuiltins
+      // never maps SendMessage to a Pi builtin).
+      const before = rcMock.created.length;
+      await agentTool.execute("t", { subagent_type: "general-purpose", prompt: "go" });
+      expect(rcMock.created.length).toBeGreaterThan(before);
+      const options = rcMock.created[rcMock.created.length - 1]!;
+      const toolNames = (options.tools as string[]) ?? [];
+      const customToolNames = ((options.customTools as Array<{ name: string }>) ?? []).map(
+        (t) => t.name,
+      );
+      expect(toolNames).not.toContain("SendMessage");
+      expect(customToolNames).not.toContain("SendMessage");
+    } finally {
+      process.chdir(originalCwd);
+      if (savedUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = savedUserDir;
+      try {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      } catch {
+        /* OS reaps temp dirs eventually */
+      }
+    }
   });
 });
