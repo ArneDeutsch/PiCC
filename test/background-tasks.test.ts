@@ -721,29 +721,6 @@ describe("Agent tool run_in_background (audit E4)", () => {
     await registry.wait(String(started.details.taskId));
   });
 
-  it("noteActivity surfaces live activity in the running TaskOutput text (t03)", async () => {
-    const registry = new BackgroundTaskRegistry();
-    let release!: () => void;
-    const gate = new Promise<void>((r) => (release = r));
-    const id = registry.start(
-      "agent:a",
-      (async () => {
-        await gate;
-        return result();
-      })(),
-    );
-    registry.noteActivity(id, "running Grep…");
-    const taskOutput = createTaskOutputTool(registry) as unknown as ToolLike;
-    const polled = await taskOutput.execute("t", { task_id: id, wait: false });
-    expect(polled.content[0]!.text).toContain("running Grep…");
-    expect(polled.details.lastActivity).toBe("running Grep…");
-    // Ignored once the task has settled (status/result stay authoritative).
-    release();
-    await registry.wait(id);
-    registry.noteActivity(id, "too late");
-    expect(registry.get(id)?.lastActivity).toBe("running Grep…");
-  });
-
   it("noteProgress stores the full snapshot + derives lastActivity; fans out to all subscribers; post-settle no-op (F04 t02)", async () => {
     const registry = new BackgroundTaskRegistry();
     let release!: () => void;

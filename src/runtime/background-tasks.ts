@@ -230,16 +230,6 @@ export class BackgroundTaskRegistry {
   }
 
   /**
-   * Record the latest live activity of a RUNNING task (t03). Best-effort and
-   * lightweight: ignored for unknown ids and settled tasks (a settled task's
-   * status/result is authoritative). Never affects settlement or the result.
-   */
-  noteActivity(id: string, activity: string): void {
-    const task = this.tasks.get(id);
-    if (task && task.status === "running" && activity) task.lastActivity = activity;
-  }
-
-  /**
    * Record the latest full live progress SNAPSHOT of a RUNNING task (F04 t02)
    * and fan it out to subscribers. Stores the (already sanitized/bounded)
    * snapshot on `record.progress`, derives the model-facing `lastActivity`/poll
