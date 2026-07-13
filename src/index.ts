@@ -622,8 +622,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // dispatches (depth cap holds) and never mutates the parent session state.
         tools.push(createSkillTool({ depth, forSubagent: true }) as Record<string, unknown>);
       }
-      // Background-task tools share the session registry (audit E4), so a
-      // subagent can poll/stop the tasks it started itself.
+      // Background-task tools share the ONE session-wide registry (audit E4). A
+      // subagent that is granted TaskOutput/TaskStop can therefore reach ANY task
+      // in the session — its own AND its siblings'/parent's — not only the tasks
+      // it started. (Claude Code hides TaskOutput from subagents entirely; PiCC's
+      // shared-registry exposure is a known divergence — candidate follow-up to
+      // scope task visibility per dispatcher. See observations.md 2026-07-12.)
       if (granted.includes("TaskOutput")) {
         tools.push(createTaskOutputTool(backgroundTasks) as Record<string, unknown>);
       }
@@ -963,11 +967,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     try {
       if (event.source === "extension") return { action: "continue" };
 
-      // 0) PiCC control commands (/doctor /compat /quota /skills /agents).
+      // 0) PiCC control commands (/doctor /compat /quota /skills /agents /usage).
       //    In interactive mode Pi's own command router intercepts these before
       //    the input event; this branch covers the other modes so a control
       //    command is never sent to the model.
-      const cmd = /^\/(doctor|compat|quota|skills|agents)(?:[ \t]+([\s\S]*))?$/.exec(
+      const cmd = /^\/(doctor|compat|quota|skills|agents|usage)(?:[ \t]+([\s\S]*))?$/.exec(
         (event.text ?? "").trim(),
       );
       if (cmd) {
@@ -1168,7 +1172,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   // ---------------------------------------------------------------------------
-  // Control commands: /doctor /compat /quota /skills /agents.
+  // Control commands: /doctor /compat /quota /skills /agents /usage.
   //
   // Rendered by shared functions so BOTH the registered command (interactive
   // path, where Pi intercepts extension commands before the model) and the

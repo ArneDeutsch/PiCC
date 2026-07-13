@@ -51,8 +51,12 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
   `context: fork`, legacy `.claude/commands`.
 - **Subagents** — `.claude/agents/*.md` plus the built-in `general-purpose`/`Explore`/`Plan`
   agent types, description-driven routing, parallel fan-out with verbatim final-message return,
-  background dispatch (`run_in_background` + `TaskOutput`/`TaskStop`), per-agent `tools:`
-  capability gating, nested dispatch with a configurable depth cap, `isolation: worktree`.
+  per-agent `tools:` capability gating, nested dispatch with a configurable depth cap,
+  `isolation: worktree`. **Observable and trustworthy:** a dead dispatch is a loud, named failure
+  (never an empty success) with partial output preserved; every run leaves an on-disk transcript,
+  streams live progress, and records its token/cost (`/usage`). Background dispatch
+  (`run_in_background` / `background: true` + `TaskOutput`/`TaskStop`) pushes its settlement to the
+  coordinator without polling; `SendMessage` resumes a finished subagent or steers a running one.
 - **Worktrees** — `EnterWorktree`/`ExitWorktree` with a real session-cwd swap, `.worktreeinclude`
   seeding, Windows-tolerant lifecycle, parallel sessions on one repo.
 - **Hooks** — 13 events (`PreToolUse` … `WorktreeRemove`), full stdin-JSON/stdout-decision
@@ -75,7 +79,8 @@ The full, always-current compatibility matrix is in
 ## Control surface
 
 Inside a session: `/skills` and `/agents` list the loaded corpus; `/doctor` gives the full
-compatibility breakdown; `/compat` shows/suppresses the startup notice; `/quota` reports usage.
+compatibility breakdown; `/compat` shows/suppresses the startup notice; `/usage` reports a
+per-subagent token/cost breakdown; `/quota` reports provider quota headers.
 Every user-invocable skill appears in the `/` autocomplete menu. Model and per-model steering are
 configured outside the project — see the [user guide](doc/user-guide.md#5-control-surface-project-external).
 

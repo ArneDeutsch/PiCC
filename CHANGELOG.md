@@ -6,6 +6,57 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — subagent lifecycle: loud failures (2026-07-13)
+
+- **Subagent dispatches no longer return an empty success on failure.** A dispatch that ends on a
+  terminal API error is now reported as a **loud failure naming the cause** — in the foreground
+  tool result, and in the background task's status and its `TaskOutput` retrieval. This closes the
+  regression from the **2026-07-12 dogfooding incident**, where a drained usage limit made every
+  subagent dispatch fail instantly, PiCC returned those failures as empty successes, and the
+  coordinator — unable to tell "reviewer found nothing" from "reviewer never ran" — committed
+  under-reviewed work and silently absorbed the implementation into its own context. Retry
+  behavior is unchanged (Pi's own; no extra recovery logic). Matches Claude Code's 2.1.199/2.1.200
+  failure semantics.
+- **Partial output is preserved.** A subagent that produced output before dying (or that hit its
+  turn cap) delivers that output inside an explicit `[subagent cut off]` frame rather than dropping
+  it; a truncation also emits a warning diagnostic.
+- **Deliberate stops are distinct from failures.** A run stopped on purpose (Esc / `TaskStop`)
+  reports as **aborted**, not failed; Esc now actually cancels a running foreground dispatch.
+
+### Added — subagent observability, channel & usage (2026-07-13)
+
+- **On-disk transcripts.** Every dispatch leaves a JSONL transcript beside the main session's, at
+  `<mainSessionFileBase>.subagents/<stamp>_<agentId>.jsonl`, discoverable from the session and
+  readable during and after the run.
+- **Stable agent IDs + live progress.** Each resumable dispatch gets a stable `agent-<12 hex>` id
+  surfaced to the model in text; the UI shows the agent type + dispatch description (not a bare
+  "Agent" box), a bounded rolling tail of recent activity, and silent API-retry waits.
+- **`SendMessage` channel.** The coordinator can resume a finished subagent by its agent id (it
+  continues in the background with full prior context) or steer a running background one (Claude
+  Code 2.1.x semantics). Honest limits: no cross-restart resume (the registry is process-lifetime),
+  steering reaches only background dispatches, idle-parent delivery is next-turn, and
+  `context: fork`/override dispatches are non-resumable.
+- **Background settlement push.** When a background dispatch settles (success or failure), the
+  coordinator is notified at its next turn without calling `TaskOutput` (a bounded, untrusted-framed
+  notice). `background: true` agent frontmatter (Claude 2.1.198) is honored, routing through the
+  same background lifecycle.
+- **Per-subagent usage accounting.** Token/cost usage is recorded with each dispatch result, in the
+  transcript, and in a new **`/usage`** control command (per-subagent breakdown + a subagents
+  total). `/usage` is **subagent-scoped only** — a PiCC-additive surface, not Claude Code's
+  whole-session `/usage`/`/cost` (the Pi extension API exposes no parent-session cost).
+
+### Changed — registry truthfulness (2026-07-13)
+
+- Capability registry updated to match shipped behavior: `tool.Agent`/`tool.Task` downgraded to
+  **partial** (PiCC defaults dispatches to the foreground; Claude 2.1.198 runs subagents
+  background-by-default, so an implicit-concurrency fan-out runs serially); **new** `tool.SendMessage`
+  (partial) and `agent.frontmatter.background` (full) entries; `feature.background-agents` now
+  documents settlement push and the default-foreground gap; `tool.TaskOutput`/`tool.TaskStop`,
+  `hook.event.SubagentStart`/`SubagentStop` (agent_id + agent_type; `transcript_path` stays MAIN),
+  and `hook.event.Notification` (settlement fires no `agent_completed`) notes corrected;
+  `setting.cleanupPeriodDays` downgraded to **partial** (worktrees only — no subagent-transcript
+  reaper). `doc/supported-features.md` regenerated from the registry.
+
 ### Added — commit and CI gates (2026-07-12)
 
 - **Pre-commit hook** (`.githooks/pre-commit`): runs `npm run test:unit` before every commit;
