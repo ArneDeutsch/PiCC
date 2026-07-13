@@ -23,3 +23,9 @@ material for review.md.
   *resolve* path stores `record.error = result.error ?? …` WITHOUT `capErrorText`, unlike the *reject*
   path which caps it; `task.error` is then interpolated into failed-content. Not introduced by F04.
   Candidate follow-up: cap/sanitize `result.error` on the resolve path for parity with the reject path.
+- 2026-07-13 t04: planning miss — the docs task's writable surface omitted `doc/user-guide.md`, but the
+  feature is user-observable and the guide's "Observing subagents" section only covered foreground.
+  Expanded t04 scope to update it. Lesson: a docs task for a user-facing behavior must include the
+  user-guide, not just the capability registry + CHANGELOG. Also: the full-surface fixture README
+  claims "each canary is asserted by tests" but new canaries were added unasserted (pre-existing
+  looseness — FS-LEGACY-SHIP too); added an assertion for the new one to keep the claim honest.

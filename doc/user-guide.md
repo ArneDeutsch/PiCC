@@ -175,6 +175,18 @@ Every subagent is now visible, both to you and to the coordinating model:
   Pressing **Esc** cancels a running foreground dispatch (it reports as aborted — rendered in an
   error frame worded as aborted, not a distinct abort badge; the dedicated aborted badge is a
   background/next-turn surface).
+- **Background tasks are observable too.** A `TaskOutput` call awaiting a still-running background
+  dispatch now streams that same live view — a rolling activity tail and a current-activity line,
+  updating as the background subagent works — then settles, *in the same call*, to a finished view:
+  an outcome badge (completed / failed / aborted), the transcript path, and a per-subagent usage
+  footer, matching what a completed foreground dispatch shows. A poll (`TaskOutput` with
+  `wait: false`) shows the task's current status and last activity inside the same identifying frame.
+  Every background surface — the "task started" message, the awaiting/live `TaskOutput`, the poll,
+  and the settled result — names the task and its agent as `Task(task-N) · Agent(<type>) ·
+  agent-<id>`, shown even for non-resumable one-shot builtins (the "resumable via `SendMessage`"
+  hint appears only when the task actually is resumable). This is display-only: the verbatim result
+  text the coordinator receives is unchanged. The one boundary: a background task streams live only
+  *while a `TaskOutput` call is awaiting it* — there is no always-on background dashboard.
 - **`/usage`.** A per-subagent token/cost breakdown for the session: each dispatched agent's id,
   type, outcome, usage line, and transcript path, plus a subagents total. This is **subagent-scoped
   only** — a PiCC-additive view, not Claude Code's whole-session `/usage`/`/cost` (the Pi extension

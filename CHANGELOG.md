@@ -6,6 +6,25 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — background-task observability (2026-07-13)
+
+- **`TaskOutput` streams like a foreground agent.** A `TaskOutput` call awaiting a still-running
+  background dispatch now renders a live view like a running foreground subagent — a self-identifying
+  header, a rolling tail of recent activity, and a current-activity line that updates as the subagent
+  works — instead of a bare unlabelled chip. When the task settles, the *same* call resolves to a
+  finished view: an outcome badge (completed / failed / aborted), the agent's transcript path, and
+  per-subagent usage — matching a completed foreground dispatch. A poll (`wait: false`) shows the
+  task's current status and last activity inside that same identifying frame.
+- **Every background surface names its agent.** The "background task started" message, the awaiting/
+  live `TaskOutput` render, the poll, and the settled result all name the **dispatched agent** — its
+  type and its stable `agent-<id>` — so a `task-N` id is never anonymous and traces to its agent and
+  on-disk transcript. The `agent-<id>` identity is shown even for **non-resumable one-shot builtins**;
+  the "resumable via `SendMessage`" invite still appears only when the task is actually resumable.
+- **Display-only — the model contract is preserved.** This is an observability change: the completed
+  verbatim result text `TaskOutput` returns to the model is **byte-identical**, and the settlement-push
+  mechanism is untouched. Only PiCC-authored running/poll/failed/stopped metadata gained the identity.
+  The new rendering honors the same width-clamp and sanitize guarantees as foreground rendering.
+
 ### Fixed — subagent render crash on over-wide lines (2026-07-13)
 
 - **A running or finished `Agent(...)` block no longer crashes the whole app.** The subagent
