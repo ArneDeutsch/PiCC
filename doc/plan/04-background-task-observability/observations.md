@@ -12,3 +12,14 @@ material for review.md.
   that test as intentionally-changed. coder/security review PASS; tester caught two shallow tests (an
   empty-activity guard that wasn't actually exercised, and an untested throwing-subscriber try/catch) —
   both added. Lesson: a `try/catch` or guard clause needs a test that fails when it's deleted.
+- 2026-07-13 t03: strong catch by adversarial review — the double-render usage-strip was gated on
+  `details.usage` instead of `details.taskId`, so it ran on the SHARED renderer's foreground path and
+  would silently delete a legitimate trailing `usage:` line from a foreground agent's message. A
+  foreground regression that the per-aspect reviewers rated only a NIT; the adversarial lens made it
+  concrete. Lesson: when a task extends a shared component, every new branch needs an explicit
+  "foreground unchanged" gate AND a foreground-path regression test. Also: initial-paint subscribe was
+  outside the try/finally (leak on throw). Both fixed pre-commit.
+- 2026-07-13 t03 (pre-existing, OUT OF SCOPE — follow-up): in background-tasks.ts the dispatch
+  *resolve* path stores `record.error = result.error ?? …` WITHOUT `capErrorText`, unlike the *reject*
+  path which caps it; `task.error` is then interpolated into failed-content. Not introduced by F04.
+  Candidate follow-up: cap/sanitize `result.error` on the resolve path for parity with the reject path.

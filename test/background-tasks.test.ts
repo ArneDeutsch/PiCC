@@ -9,12 +9,43 @@ import {
 } from "../src/runtime/background-tasks.js";
 import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import { createAgentToolDefinition } from "../src/runtime/subagents.js";
+import { renderAgentResult } from "../src/runtime/subagent-render.js";
+import {
+  formatUsageCompact,
+  renderProgressText,
+  type ProgressSnapshot,
+} from "../src/runtime/subagent-progress.js";
+import { agentTrailerFrame } from "../src/util/subagent-transcripts.js";
+import { visibleWidth as tuiVisibleWidth } from "@earendil-works/pi-tui";
 import {
   fakeSdk,
   makeAgent as makeBaseAgent,
   makeSubagentRuntime as makeRuntime,
 } from "./helpers/fake-sdk.js";
 import type { ClaudeAgent } from "../src/types.js";
+
+/** onUpdate payload shape + streaming-capable tool view (F04 t03). */
+type ToolUpdate = {
+  content: Array<{ type: string; text: string }>;
+  details?: Record<string, unknown>;
+};
+type StreamTool = {
+  execute: (
+    id: string,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+    onUpdate?: (u: ToolUpdate) => void,
+  ) => Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }>;
+  renderCall: (args: Record<string, unknown>, theme: unknown) => { render: (w: number) => string[] };
+  renderResult: (
+    r: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+    o: { isPartial?: boolean },
+    theme: unknown,
+  ) => { render: (w: number) => string[] };
+};
+/** Render a captured partial/final the way Pi would, and flatten to one string. */
+const renderUpdate = (u: ToolUpdate, isPartial = true) =>
+  renderAgentResult(u, { isPartial }, undefined).render(120).join("\n");
 
 /**
  * Background task runtime (audit E4): registry lifecycle, the Agent tool's
@@ -1070,5 +1101,346 @@ describe("Agent tool run_in_background (audit E4)", () => {
     const out = await taskOutput.execute("t4", { task_id: secondId });
     expect(out.details.status).toBe("stopped");
     expect(out.content[0]!.text).toContain("was aborted"); // FIX 3: aborted vocabulary
+  });
+});
+
+describe("TaskOutput live streaming (F04 t03)", () => {
+  const AGENT_ID = "agent-aabbccddeeff";
+  const USAGE = { inputTokens: 100, outputTokens: 50, costUsd: 0.0123 };
+
+  /** A running task backed by a manually-resolvable settlement, plus its resolver. */
+  function runningTask(over: Partial<BackgroundResultLike> = {}) {
+    const registry = new BackgroundTaskRegistry();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const id = registry.start(
+      "agent:coder",
+      (async () => {
+        await gate;
+        return result({ finalMessage: "final answer", agentId: AGENT_ID, ...over });
+      })(),
+      () => {},
+      AGENT_ID,
+      "coder",
+    );
+    return { registry, id, release };
+  }
+
+  it("awaiting a running task streams ≥1 self-identifying partial, then resolves to the final; empties the listener set", async () => {
+    const { registry, id, release } = runningTask({
+      resumable: true,
+      transcriptPath: "/x/agent-aabbccddeeff.jsonl",
+      usage: USAGE,
+    });
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    const partials: ToolUpdate[] = [];
+    const pending = taskOutput.execute("t", { task_id: id }, undefined, (u) => partials.push(u));
+    // Subscription + initial paint happen synchronously before the first await.
+    expect(registry.subscriberCount(id)).toBe(1);
+    const snap: ProgressSnapshot = { tail: ["> Grep (x)"], activity: "running Grep…" };
+    registry.noteProgress(id, snap);
+    release();
+    const final = await pending;
+
+    expect(partials.length).toBeGreaterThanOrEqual(1);
+    // At least one partial renders the tail + activity AND is self-identifying.
+    const identified = partials.some((p) => {
+      const r = renderUpdate(p);
+      return (
+        r.includes("Task(" + id + ")") &&
+        r.includes("Agent(coder)") &&
+        r.includes(AGENT_ID) &&
+        r.includes("running Grep…") &&
+        r.includes("> Grep (x)")
+      );
+    });
+    expect(identified).toBe(true);
+    // Resolves to the final verbatim result.
+    expect(final.content[0]!.text).toBe(
+      `final answer${agentTrailerFrame(AGENT_ID, { completed: true })}\nusage: ${formatUsageCompact(USAGE)}`,
+    );
+    expect(final.details.status).toBe("completed");
+    expect(final.details.outcome).toBe("completed");
+    // Leak guard (deterministic hook, no sleep): the set is empty after settle.
+    expect(registry.subscriberCount(id)).toBe(0);
+  });
+
+  it("an already-settled task emits NO partial and never subscribes", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const id = registry.start(
+      "agent:coder",
+      Promise.resolve(result({ finalMessage: "done", agentId: AGENT_ID })),
+      undefined,
+      AGENT_ID,
+      "coder",
+    );
+    await registry.wait(id);
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    const partials: ToolUpdate[] = [];
+    const out = await taskOutput.execute("t", { task_id: id }, undefined, (u) => partials.push(u));
+    expect(partials).toEqual([]);
+    expect(registry.subscriberCount(id)).toBe(0);
+    expect(out.content[0]!.text).toBe("done");
+  });
+
+  it("wait:false starts NO subscription (no stream)", async () => {
+    const { registry, id, release } = runningTask();
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    const partials: ToolUpdate[] = [];
+    const polled = await taskOutput.execute(
+      "t",
+      { task_id: id, wait: false },
+      undefined,
+      (u) => partials.push(u),
+    );
+    expect(partials).toEqual([]);
+    expect(registry.subscriberCount(id)).toBe(0);
+    expect(polled.details.status).toBe("running");
+    release();
+    await registry.wait(id);
+  });
+
+  it("offline-integration: onProgress → noteProgress → subscribeProgress → onUpdate end-to-end", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const { sdk } = fakeSdk({
+      replies: [
+        {
+          text: "bg-final",
+          gate,
+          events: [{ type: "tool_execution_start", toolName: "Grep", args: { pattern: "x" } }],
+        },
+      ],
+    });
+    const registry = new BackgroundTaskRegistry();
+    const runtime = makeRuntime([makeAgent()], sdk);
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: registry,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t1", {
+      subagent_type: "worker",
+      prompt: "go",
+      run_in_background: true,
+    });
+    const taskId = String(started.details.taskId);
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    const partials: ToolUpdate[] = [];
+    const pending = taskOutput.execute("t2", { task_id: taskId }, undefined, (u) => partials.push(u));
+    // Streaming started before release (an initial paint), but no Grep yet.
+    expect(partials.length).toBeGreaterThanOrEqual(1);
+    const hasGrep = (ps: ToolUpdate[]) =>
+      ps.some((p) => {
+        const snap = p.details?.subagentProgress as ProgressSnapshot | undefined;
+        return !!snap && (snap.activity.includes("Grep") || snap.tail.some((l) => l.includes("Grep")));
+      });
+    expect(hasGrep(partials)).toBe(false);
+    release();
+    const final = await pending;
+    // The Grep activity streamed through before the final verbatim result landed.
+    expect(hasGrep(partials)).toBe(true);
+    expect(final.content[0]!.text).toBe("bg-final");
+    expect(registry.subscriberCount(taskId)).toBe(0);
+  });
+
+  it("abort mid-wait tears down the subscription and returns the current-status result (no throw)", async () => {
+    const { registry, id, release } = runningTask();
+    const controller = new AbortController();
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    const partials: ToolUpdate[] = [];
+    const pending = taskOutput.execute("t", { task_id: id }, controller.signal, (u) =>
+      partials.push(u),
+    );
+    expect(registry.subscriberCount(id)).toBe(1); // subscribed while waiting
+    controller.abort();
+    const res = await pending; // resolves cleanly — settled never rejects
+    expect(res.details.status).toBe("running"); // current status, still running
+    expect(registry.subscriberCount(id)).toBe(0); // torn down in finally
+    // The task itself keeps running (abort only stops the stream) — clean it up.
+    release();
+    await registry.wait(id);
+    expect(registry.get(id)?.status).toBe("completed");
+  });
+
+  it("verbatim + double-render: completed content is byte-identical; the human view shows no raw trailer / duplicate usage", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const id = registry.start(
+      "agent:worker",
+      Promise.resolve(
+        result({
+          finalMessage: "the answer",
+          agentId: AGENT_ID,
+          resumable: true,
+          transcriptPath: "/x/agent-aabbccddeeff.jsonl",
+          usage: USAGE,
+        }),
+      ),
+      undefined,
+      AGENT_ID,
+      "worker",
+    );
+    await registry.wait(id);
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    const out = await taskOutput.execute("t", { task_id: id });
+    // Model-facing content byte-identical to today (verbatim + trailer + usage).
+    expect(out.content[0]!.text).toBe(
+      `the answer${agentTrailerFrame(AGENT_ID, { completed: true })}\nusage: ${formatUsageCompact(USAGE)}`,
+    );
+    // No live tail leaked into the settled content.
+    expect(out.content[0]!.text).not.toContain("Grep");
+    // Human render: neither the raw agent-ID trailer nor a duplicated usage line.
+    const human = taskOutput.renderResult(out, { isPartial: false }, undefined).render(120).join("\n");
+    expect(human).toContain("the answer");
+    expect(human).not.toContain("---");
+    expect(human).not.toMatch(/\[agent /);
+    expect(human.match(/usage:/g)?.length).toBe(1);
+    expect(human).toContain(AGENT_ID); // identity still shown
+  });
+
+  it("poll content is self-identifying (type + agent-<id>) and carries no control bytes for a hostile agent type", async () => {
+    const ESC = String.fromCharCode(27);
+    const BEL = String.fromCharCode(7);
+    const NUL = String.fromCharCode(0);
+    const registry = new BackgroundTaskRegistry();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const id = registry.start(
+      "agent:worker",
+      (async () => {
+        await gate;
+        return result({ agentId: AGENT_ID });
+      })(),
+      () => {},
+      AGENT_ID,
+      // A control-byte-laden agent TYPE reaches the model-facing poll content.
+      `co${ESC}[31mder${BEL}${ESC}]0;x${BEL}${NUL}`,
+    );
+    registry.noteProgress(id, { tail: ["> Grep (x)"], activity: "running Grep…" });
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    const polled = await taskOutput.execute("t", { task_id: id, wait: false });
+    const text = polled.content[0]!.text;
+    expect(text).toContain("still running");
+    expect(text).toContain("running Grep…"); // last activity
+    expect(text).toContain(AGENT_ID); // agent-<id> for print-mode legibility
+    expect(text).toContain("coder"); // sanitized type preserved
+    expect(text).not.toContain(ESC); // sanitizeLine stripped the control bytes
+    expect(text).not.toContain(BEL);
+    expect(text).not.toContain(NUL);
+    // The rendered poll frame (renderer sanitizes the raw details.agent) is clean.
+    const rendered = taskOutput.renderResult(polled, { isPartial: false }, undefined).render(120).join("\n");
+    expect(rendered).toContain("coder");
+    expect(rendered.includes(ESC)).toBe(false);
+    expect(rendered.includes(BEL)).toBe(false);
+    // renderCall is self-identifying too.
+    const call = taskOutput.renderCall({ task_id: id }, undefined).render(120).join("\n");
+    expect(call).toContain("TaskOutput(" + id + ")");
+    expect(call).toContain("coder");
+    expect(call.includes(ESC)).toBe(false);
+    release();
+    await registry.wait(id);
+  });
+
+  it("the rendered poll frame never overflows the terminal at any width (F04 t03)", async () => {
+    const { registry, id, release } = runningTask();
+    registry.noteProgress(id, { tail: ["> Grep"], activity: "字".repeat(60) }); // 字×60
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    const polled = await taskOutput.execute("t", { task_id: id, wait: false });
+    for (const width of [1, 2, 3, 20, 40, 138]) {
+      const lines = taskOutput.renderResult(polled, { isPartial: false }, undefined).render(width);
+      for (const l of lines) expect(tuiVisibleWidth(l)).toBeLessThanOrEqual(width);
+    }
+    release();
+    await registry.wait(id);
+  });
+
+  it("a streaming partial's content[0].text equals renderProgressText(snap) (print/RPC legibility, tester NIT)", async () => {
+    const { registry, id, release } = runningTask();
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    const partials: ToolUpdate[] = [];
+    const pending = taskOutput.execute("t", { task_id: id }, undefined, (u) => partials.push(u));
+    const snap: ProgressSnapshot = { tail: ["> Grep (x)"], activity: "running Grep…" };
+    registry.noteProgress(id, snap);
+    release();
+    await pending;
+    const withSnap = partials.find((p) => p.details?.subagentProgress);
+    expect(withSnap).toBeDefined();
+    expect(withSnap!.content[0]!.text).toBe(renderProgressText(snap));
+  });
+
+  it("two concurrent execute() awaits on ONE running task each own a subscription (fan-out), torn down after settle (tester)", async () => {
+    const { registry, id, release } = runningTask();
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    const p1 = taskOutput.execute("a", { task_id: id }, undefined, () => {});
+    const p2 = taskOutput.execute("b", { task_id: id }, undefined, () => {});
+    // Shared-Set fan-out: each call owns its own subscription; neither clobbers.
+    expect(registry.subscriberCount(id)).toBe(2);
+    release();
+    await Promise.all([p1, p2]);
+    expect(registry.subscriberCount(id)).toBe(0);
+  });
+
+  it("wait:false on an already-settled completed task → outcome completed; human render shows the badge, not the running frame (tester)", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const id = registry.start(
+      "agent:coder",
+      Promise.resolve(result({ finalMessage: "done", agentId: AGENT_ID })),
+      undefined,
+      AGENT_ID,
+      "coder",
+    );
+    await registry.wait(id);
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    const out = await taskOutput.execute("t", { task_id: id, wait: false });
+    expect(out.details.status).toBe("completed");
+    expect(out.details.outcome).toBe("completed");
+    const human = taskOutput.renderResult(out, { isPartial: false }, undefined).render(120).join("\n");
+    expect(human).toContain("completed"); // settled badge
+    expect(human).not.toContain("still running"); // not the running poll frame
+    expect(human).not.toContain("… starting…");
+  });
+
+  it("failed / aborted human render does not restate the identity in the body; the reason is kept (F04 t03 SHOULD-FIX 3)", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+
+    // Failed (non-resumable): body reason kept, identity not restated.
+    const failedId = registry.start(
+      "agent:coder",
+      Promise.resolve(
+        result({ ok: false, outcome: "failed", error: "connection reset", finalMessage: "", agentId: AGENT_ID }),
+      ),
+      undefined,
+      AGENT_ID,
+      "coder",
+    );
+    await registry.wait(failedId);
+    const failed = await taskOutput.execute("t", { task_id: failedId });
+    // Model-facing content stays self-identifying (print/RPC).
+    expect(failed.content[0]!.text).toBe(
+      `Background task ${failedId} (coder, ${AGENT_ID}) failed: connection reset`,
+    );
+    const failedHuman = taskOutput.renderResult(failed, { isPartial: false }, undefined).render(120).join("\n");
+    expect(failedHuman).not.toContain(`Background task ${failedId}`); // not restated in the body
+    expect(failedHuman).toContain("connection reset"); // reason kept
+    expect(failedHuman).toContain(`Task(${failedId})`); // badge chip
+    expect(failedHuman).toContain(AGENT_ID); // identity subline (non-resumable)
+
+    // Aborted (stopped): the "stopped before completing" clause is kept.
+    let resolve!: (v: ReturnType<typeof result>) => void;
+    const abId = registry.start(
+      "agent:coder",
+      new Promise<ReturnType<typeof result>>((r) => (resolve = r)),
+      () => {},
+      "agent-ccddeeff0011",
+      "coder",
+    );
+    registry.stop(abId);
+    resolve(result({ outcome: "aborted", finalMessage: "discard me", agentId: "agent-ccddeeff0011" }));
+    await registry.wait(abId);
+    const aborted = await taskOutput.execute("t2", { task_id: abId });
+    const abHuman = taskOutput.renderResult(aborted, { isPartial: false }, undefined).render(120).join("\n");
+    expect(abHuman).not.toContain(`Background task ${abId}`); // not restated in the body
+    expect(abHuman).toContain("it was stopped before completing"); // reason clause kept
+    expect(abHuman).toContain(`Task(${abId})`); // badge chip
   });
 });
