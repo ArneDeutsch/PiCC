@@ -6,6 +6,21 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — subagent render crash on over-wide lines (2026-07-13)
+
+- **A running or finished `Agent(...)` block no longer crashes the whole app.** The subagent
+  renderer could emit a line wider than the terminal — a long live-activity line, a long
+  `transcript:` session path in the footer, or any CJK/wide/tab content — which tripped pi-tui's
+  render invariant and exited the process with an uncaughtException. Every rendered line is now
+  clamped to the terminal width using pi-tui's own column measure (`@earendil-works/pi-tui`, now a
+  direct dependency), so wrapping/truncation agrees exactly with the check pi-tui enforces.
+- **The footer stays readable.** A transcript path too wide to fit degrades to its basename
+  (`transcript: …/agent-….jsonl`) instead of wrapping into unreadable fragments; the full path is
+  still shown when it fits and always reaches the model verbatim.
+- **The agent name is sanitized on the display path.** A model-supplied `subagent_type` or a
+  project agent file's `name:` frontmatter can no longer replay terminal-control sequences into the
+  parent terminal via the title/outcome badge.
+
 ### Fixed — subagent lifecycle: loud failures (2026-07-13)
 
 - **Subagent dispatches no longer return an empty success on failure.** A dispatch that ends on a

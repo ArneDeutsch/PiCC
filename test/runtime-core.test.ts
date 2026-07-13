@@ -41,6 +41,7 @@ import {
 } from "../src/runtime/context-assembly.js";
 import { mapEffort, steeringForModel, type PiCCConfig } from "../src/runtime/steering.js";
 import { createAgentToolDefinition, extractText, type SubagentRuntime } from "../src/runtime/subagents.js";
+import { visibleWidth as tuiVisibleWidth } from "@earendil-works/pi-tui";
 import type { ProgressSnapshot } from "../src/runtime/subagent-progress.js";
 import { agentTrailerFrame } from "../src/util/subagent-transcripts.js";
 import {
@@ -1105,6 +1106,138 @@ describe("Subagent live progress (t03)", () => {
     // Empty details: never throws, falls back to the content text.
     const bare = render({ content: [{ type: "text", text: "hi" }], details: {} });
     expect(bare).toContain("hi");
+  });
+
+  it("render never emits a line wider than the terminal — no overflow (crash regression)", () => {
+    const { sdk } = fakeSdk({ replies: ["x"] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    const tool = createAgentToolDefinition(runtime, { depth: 0 }) as {
+      renderCall: (a: Record<string, unknown>, theme: unknown) => { render: (w: number) => string[] };
+      renderResult: (
+        r: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+        o: { isPartial?: boolean },
+        theme: unknown,
+      ) => { render: (w: number) => string[] };
+    };
+    // A theme whose fg/bold wrap text in real ANSI, so the escape-aware truncation
+    // path is actually exercised (undefined theme emits plain text — no escapes).
+    // E/B built from code points to keep this source file pure-ASCII (convention).
+    const E = String.fromCharCode(27);
+    const B = String.fromCharCode(7);
+    const theme = {
+      fg: (_c: string, s: string) => `${E}[31m${s}${E}[0m`,
+      bold: (s: string) => `${E}[1m${s}${E}[22m`,
+    };
+    // Measure with pi-tui's OWN column width — the exact function pi-tui throws on
+    // (grapheme + East-Asian-width + tabs=3). A code-unit count would falsely pass.
+    const noOverflow = (lines: string[], width: number) => {
+      for (const l of lines) expect(tuiVisibleWidth(l)).toBeLessThanOrEqual(width);
+    };
+
+    // Wide/tab/emoji content: pi-tui counts CJK/emoji as 2 cols and tabs as 3, so
+    // these overflow the terminal at code-unit lengths that look "safe". Use escaped
+    // code points to keep this source file pure-ASCII (project convention).
+    const cjk = "字".repeat(60); // 字×60 = 120 columns
+    const tabs = "\t".repeat(60); // 60 tabs = 180 columns
+    const emoji = "\u{1F600}".repeat(40); // 😀×40 = 80 columns
+
+    for (const width of [1, 2, 3, 20, 40, 138]) {
+      // 1) Partial (crash #1 surface): long activity + wide tail + long agent name.
+      const partial = tool
+        .renderResult(
+          {
+            content: [],
+            details: {
+              subagentProgress: {
+                tail: ["Read-only scouting covered the feature skill, ".repeat(4).trim(), cjk, emoji],
+                activity: `${cjk} ${tabs}`,
+              },
+              agent: "Explore".repeat(20), // pathologically long → title backstop
+              live: true,
+            },
+          },
+          { isPartial: true },
+          theme,
+        )
+        .render(width);
+      noOverflow(partial, width);
+
+      // 2) Final (crash #2 surface): outcome badge + tabbed body + long transcript footer.
+      const longPath =
+        "C:\\Users\\Arne\\.pi\\agent\\sessions\\--F--Arne-Projekte-picc--\\" +
+        "2026-07-13T09-07-52-253Z_019f5abb.subagents\\agent-3b7caeaf8448.jsonl";
+      const final = tool
+        .renderResult(
+          {
+            content: [{ type: "text", text: `line1\n${tabs}tabbed body\n${cjk}` }],
+            details: {
+              outcome: "completed",
+              agent: "docs",
+              transcriptPath: longPath,
+              resumable: true,
+              agentId: "agent-3b7caeaf8448",
+            },
+          },
+          { isPartial: false },
+          theme,
+        )
+        .render(width);
+      noOverflow(final, width);
+
+      // 3) Background branch + dispatch-time call, both with overflowing content.
+      const bg = tool
+        .renderResult(
+          { content: [{ type: "text", text: cjk }], details: { background: true, agent: "x" } },
+          { isPartial: false },
+          theme,
+        )
+        .render(width);
+      noOverflow(bg, width);
+
+      const call = tool
+        .renderCall({ subagent_type: "x".repeat(200), description: cjk }, theme)
+        .render(width);
+      noOverflow(call, width);
+    }
+
+    // Footer UX: at a narrow width the transcript degrades to a basename (not the
+    // unreadable wrapped full path); at a wide width the full path is shown intact.
+    const longPath =
+      "C:\\Users\\Arne\\.pi\\agent\\sessions\\--F--Arne-Projekte-picc--\\" +
+      "2026-07-13T09-07-52-253Z_019f5abb.subagents\\agent-3b7caeaf8448.jsonl";
+    const narrow = tool
+      .renderResult(
+        { content: [], details: { outcome: "completed", agent: "docs", transcriptPath: longPath } },
+        { isPartial: false },
+        undefined,
+      )
+      .render(40)
+      .join("\n");
+    expect(narrow).toContain("agent-3b7caeaf8448.jsonl"); // basename kept
+    expect(narrow).not.toContain(longPath); // full path not wrapped in
+    const wide = tool
+      .renderResult(
+        { content: [], details: { outcome: "completed", agent: "docs", transcriptPath: longPath } },
+        { isPartial: false },
+        undefined,
+      )
+      .render(200)
+      .join("\n");
+    expect(wide).toContain(longPath); // full path shown when it fits
+
+    // Security: model-/file-supplied agent name with escapes never reaches the
+    // terminal raw — the OSC title-set and CSI payload are stripped before display.
+    const evil = `${E}]0;pwned${B}${E}[31mreviewer`;
+    const badge = tool
+      .renderResult(
+        { content: [], details: { outcome: "completed", agent: evil } },
+        { isPartial: false },
+        undefined,
+      )
+      .render(120)
+      .join("\n");
+    expect(badge).not.toContain(`${E}]0;`); // no OSC injected
+    expect(badge).toContain("reviewer"); // sanitized name still shown
   });
 
   const ESC = String.fromCharCode(27);

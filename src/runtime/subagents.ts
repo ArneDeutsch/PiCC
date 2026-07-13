@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { Type } from "typebox";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type {
   ClaudeAgent,
   Diagnostic,
@@ -1449,15 +1450,50 @@ function themedBold(theme: unknown, text: string): string {
   return typeof t?.bold === "function" ? t.bold(text) : text;
 }
 
-/** Append `text` split into width-wrapped PLAIN lines (safe to slice — unstyled). */
+// Width-aware line helpers, backed by pi-tui's OWN column measure. pi-tui throws
+// an uncaughtException — killing the whole process — if a rendered line's visible
+// width exceeds the terminal, and it decides that with visibleWidth() (grapheme +
+// East-Asian-width + tabs=3). We MUST use the same function so our clamp agrees
+// exactly with the check pi-tui enforces; a code-unit approximation silently
+// disagrees on CJK/wide/tab content and still crashes. See doc/plan review notes.
+
+/** Append `text` wrapped to `width` visible columns (ANSI- and wide-char-aware). */
 function pushWrapped(text: string, width: number, into: string[]): void {
-  for (const raw of String(text ?? "").split("\n")) {
-    if (width > 0 && raw.length > width) {
-      for (let i = 0; i < raw.length; i += width) into.push(raw.slice(i, i + width));
-    } else {
-      into.push(raw);
-    }
+  for (const l of wrapTextWithAnsi(String(text ?? ""), Math.max(1, width))) into.push(l);
+}
+
+/** Wrap `text` to `width`, coloring each segment; every emitted line is <= width columns. */
+function pushColored(
+  theme: unknown,
+  color: string,
+  text: string,
+  width: number,
+  into: string[],
+): void {
+  // Color first, then wrap — wrapTextWithAnsi preserves active ANSI across breaks.
+  for (const l of wrapTextWithAnsi(themedFg(theme, color, String(text ?? "")), Math.max(1, width))) {
+    into.push(l);
   }
+}
+
+/**
+ * FINAL SAFETY PASS before returning from render(): clamp every line to `width`
+ * VISIBLE columns using pi-tui's own measure, so no line a render() returns can
+ * exceed the terminal width and crash the process — even one a push site forgot
+ * to wrap, or that carries wide/CJK/tab content.
+ *
+ * This is a WIDTH clamp, NOT a sanitizer: it preserves ANSI verbatim, so callers
+ * MUST strip control/escape sequences from untrusted (model-/file-supplied) text
+ * BEFORE it reaches here (see sanitizeInline / sanitizeProgressText usages).
+ */
+function clampLines(lines: string[], width: number): string[] {
+  if (width <= 0) return lines.map(() => "");
+  return lines.map((l) => (visibleWidth(l) > width ? truncateToWidth(l, width, "…") : l));
+}
+
+/** Flatten model-/file-supplied label text to a single sanitized display line. */
+function sanitizeInline(text: string): string {
+  return sanitizeProgressText(String(text ?? "")).replace(/\s+/g, " ").trim();
 }
 
 /** First non-empty line of `text`, trimmed and capped for a one-line preview. */
@@ -1499,11 +1535,13 @@ function outcomeBadgeLine(
   cutOff: boolean,
   agentName: unknown,
 ): string {
-  const agent =
-    typeof agentName === "string" && agentName ? `Agent(${agentName})` : "Agent";
+  // SEC-2: agentName is model-supplied (subagent_type) OR project-file-supplied
+  // (agent `name:` frontmatter) — sanitize before it reaches the parent terminal.
+  const safeName = sanitizeInline(typeof agentName === "string" ? agentName : "");
+  const agent = safeName ? `Agent(${safeName})` : "Agent";
   let symbol = "•";
   let color = "muted";
-  let word = outcome ?? "done";
+  let word = sanitizeInline(outcome ?? "") || "done";
   if (outcome === "completed") {
     symbol = "●";
     color = "success";
@@ -1562,7 +1600,7 @@ function renderAgentCall(args: Record<string, unknown>, theme: unknown) {
         pushWrapped(`  ${detail}`, width, wrapped);
         for (const l of wrapped) lines.push(themedFg(theme, "muted", l));
       }
-      return lines;
+      return clampLines(lines, width);
     },
   };
 }
@@ -1590,7 +1628,8 @@ function renderAgentResult(
       const lines: string[] = [];
       if (isPartial) {
         const snap = details.subagentProgress as ProgressSnapshot | undefined;
-        const agent = typeof details.agent === "string" ? details.agent : "subagent";
+        // SEC-2: details.agent originates from the model-supplied subagent_type — sanitize.
+        const agent = sanitizeInline(typeof details.agent === "string" ? details.agent : "") || "subagent";
         lines.push(
           themedFg(theme, "toolTitle", themedBold(theme, `Agent(${agent})`)) +
             themedFg(theme, "muted", " running…"),
@@ -1601,21 +1640,23 @@ function renderAgentResult(
             pushWrapped(raw, width, wrapped);
             for (const l of wrapped) lines.push(l);
           }
-          if (snap.activity) lines.push(themedFg(theme, "accent", `… ${snap.activity}`));
+          // Wrap to `width` before coloring — a long activity line must not
+          // overflow the terminal (pi-tui throws on overflow, crashing the app).
+          if (snap.activity) pushColored(theme, "accent", `… ${snap.activity}`, width, lines);
         } else {
           // SEC-2: defensive fallback — the live partial path always carries a
           // (sanitized) progress snapshot, but keep the sanitize invariant uniform
           // so any future partial emitter can't leak control bytes to the terminal.
           pushWrapped(sanitizeProgressText(contentText), width, lines);
         }
-        return lines.length ? lines : [""];
+        return clampLines(lines.length ? lines : [""], width);
       }
       // Final result.
       if (details.background === true) {
         lines.push(themedFg(theme, "accent", themedBold(theme, "Agent → background")));
         // SEC-2: the start message embeds the model-supplied agent label — sanitize.
         pushWrapped(sanitizeProgressText(contentText), width, lines);
-        return lines;
+        return clampLines(lines, width);
       }
       const outcome = typeof details.outcome === "string" ? details.outcome : undefined;
       if (outcome) {
@@ -1633,7 +1674,20 @@ function renderAgentResult(
       if (body) pushWrapped(body, width, lines);
       const footer: string[] = [];
       if (typeof details.transcriptPath === "string" && details.transcriptPath) {
-        footer.push(`transcript: ${details.transcriptPath}`);
+        // UX: a full session path is often far wider than the terminal and wraps
+        // into unreadable, hard-sliced fragments. Show it whole only when it fits;
+        // otherwise show the basename (the agent id + .jsonl — what a human uses to
+        // find the file), marked with a leading ellipsis. The model still gets the
+        // full path via result.content / the transcript details, so nothing is lost.
+        const tp = sanitizeInline(details.transcriptPath);
+        const full = `transcript: ${tp}`;
+        if (visibleWidth(full) <= width) {
+          footer.push(full);
+        } else {
+          const sep = tp.includes("\\") ? "\\" : "/";
+          const base = tp.split(/[\\/]/).pop() || tp;
+          footer.push(`transcript: …${sep}${base}`);
+        }
       }
       const usage = formatUsageLine(details.usage);
       if (usage) footer.push(`usage: ${usage}`);
@@ -1645,8 +1699,9 @@ function renderAgentResult(
             : undefined;
         footer.push(id ? `resumable via SendMessage — agent ${id}` : "resumable via SendMessage");
       }
-      for (const f of footer) lines.push(themedFg(theme, "muted", f));
-      return lines.length ? lines : [""];
+      // Wrap each footer line to width (word-wrap, ANSI-aware) as a final guard.
+      for (const f of footer) pushColored(theme, "muted", f, width, lines);
+      return clampLines(lines.length ? lines : [""], width);
     },
   };
 }
