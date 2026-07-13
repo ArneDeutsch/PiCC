@@ -1,7 +1,12 @@
 import { Type } from "typebox";
 import type { Diagnostic } from "../types.js";
 import { agentTrailerFrame, agentTrailerLine } from "../util/subagent-transcripts.js";
-import { formatUsageCompact, sanitizeLine } from "./subagent-progress.js";
+import {
+  formatUsageCompact,
+  progressActivityLine,
+  sanitizeLine,
+  type ProgressSnapshot,
+} from "./subagent-progress.js";
 
 /**
  * Background task runtime (audit E4): `run_in_background: true` on the Agent
@@ -99,6 +104,21 @@ export interface BackgroundTaskRecord {
    * Display-only; never part of `result`.
    */
   lastActivity?: string;
+  /**
+   * Latest full live progress snapshot (F04 t02): the sanitized rolling
+   * tail + current-activity line produced by SubagentProgressCondenser, fed via
+   * noteProgress so a waiting TaskOutput can render the running background
+   * subagent live (t03). Display-only; bounded by the condenser; never merged
+   * into `result`.
+   */
+  progress?: ProgressSnapshot;
+  /**
+   * The CLEAN dispatched agent type (F04 t02): e.g. `coder`, `Explore`, set
+   * eagerly at start() — before any progress event fires. Consumers use
+   * `agentType ?? agentName ?? "subagent"` with no `agent:`-prefix stripping
+   * (the `label` still carries the `agent:<type>` form for existing surfaces).
+   */
+  agentType?: string;
   diagnostics: Diagnostic[];
   /** Settles when the underlying dispatch ends (never rejects). */
   settled: Promise<void>;
@@ -117,6 +137,15 @@ export interface BackgroundTaskRecord {
 export class BackgroundTaskRegistry {
   private readonly tasks = new Map<string, BackgroundTaskRecord>();
   private counter = 0;
+  /**
+   * Live progress subscribers per task (F04 t02), fan-out via a Set. Emptied on
+   * EVERY settle path (fulfilled/rejected/stopped) by the shared `.finally`
+   * teardown attached in start(), so no listener can fire or leak after settle.
+   */
+  private readonly progressListeners = new Map<
+    string,
+    Set<(snapshot: ProgressSnapshot) => void>
+  >();
 
   /**
    * Register a running dispatch. The returned id ("task-1", ...) is what the
@@ -129,6 +158,7 @@ export class BackgroundTaskRegistry {
     promise: Promise<BackgroundResultLike>,
     abort?: () => void,
     agentId?: string,
+    agentType?: string,
   ): string {
     const id = `task-${++this.counter}`;
     const record: BackgroundTaskRecord = {
@@ -136,6 +166,9 @@ export class BackgroundTaskRegistry {
       label,
       status: "running",
       agentId,
+      // Clean agent type present from the moment the task starts (F04 t02), so
+      // it is available before the first progress event and at every surface.
+      agentType,
       diagnostics: [],
       settled: Promise.resolve(),
       abort,
@@ -183,6 +216,13 @@ export class BackgroundTaskRegistry {
         }
       },
     );
+    // Listener teardown on EVERY settle path (F04 t02): both handlers above
+    // swallow, so `settled` always fulfills — a single `.finally` empties the
+    // subscriber set for the fulfilled, rejected/throwing, AND stopped paths, so
+    // no held listener can fire or leak once the dispatch has ended.
+    record.settled = record.settled.finally(() => {
+      this.progressListeners.delete(id);
+    });
     this.tasks.set(id, record);
     return id;
   }
@@ -195,6 +235,70 @@ export class BackgroundTaskRegistry {
   noteActivity(id: string, activity: string): void {
     const task = this.tasks.get(id);
     if (task && task.status === "running" && activity) task.lastActivity = activity;
+  }
+
+  /**
+   * Record the latest full live progress SNAPSHOT of a RUNNING task (F04 t02)
+   * and fan it out to subscribers. Stores the (already sanitized/bounded)
+   * snapshot on `record.progress`, derives the model-facing `lastActivity`/poll
+   * string via {@link progressActivityLine} (same string the old
+   * `noteActivity(progressActivityLine(...))` sink produced — semantics
+   * preserved), then notifies every subscriber. Ignored for unknown ids and
+   * settled tasks (mirrors the `noteActivity` post-settle no-op); a settled
+   * task's status/result stays authoritative. A throwing subscriber can neither
+   * break the fan-out nor the dispatch.
+   */
+  noteProgress(id: string, snapshot: ProgressSnapshot): void {
+    const task = this.tasks.get(id);
+    if (!task || task.status !== "running") return;
+    task.progress = snapshot;
+    const activity = progressActivityLine(snapshot);
+    // Guard on non-empty to match the old noteActivity semantics exactly (never
+    // clobber a real last-activity with an empty derived line).
+    if (activity) task.lastActivity = activity;
+    const listeners = this.progressListeners.get(id);
+    if (!listeners) return;
+    for (const listener of [...listeners]) {
+      try {
+        listener(snapshot);
+      } catch {
+        // A hostile/buggy subscriber must not break fan-out or the dispatch.
+      }
+    }
+  }
+
+  /**
+   * Subscribe to a RUNNING task's live progress snapshots (F04 t02). Returns an
+   * unsubscribe function (idempotent). Multiple concurrent subscribers per task
+   * fan out via a Set. Subscribing to an unknown or ALREADY-SETTLED task is a
+   * no-op that returns a no-op unsubscribe (mirrors the post-settle
+   * `noteProgress` no-op), so a subscribe that races settlement can neither fire
+   * nor leak. The whole set is emptied on settle by start()'s `.finally`.
+   */
+  subscribeProgress(id: string, listener: (snapshot: ProgressSnapshot) => void): () => void {
+    const task = this.tasks.get(id);
+    if (!task || task.status !== "running") return () => {};
+    let set = this.progressListeners.get(id);
+    if (!set) {
+      set = new Set();
+      this.progressListeners.set(id, set);
+    }
+    set.add(listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.progressListeners.get(id)?.delete(listener);
+    };
+  }
+
+  /**
+   * Test/diagnostic hook (F04 t02 leak guard): the number of live progress
+   * subscribers held for a task — 0 for an unknown, never-subscribed, or settled
+   * task (whose set is cleared on settle). Deterministic; no timers.
+   */
+  subscriberCount(id: string): number {
+    return this.progressListeners.get(id)?.size ?? 0;
   }
 
   /**

@@ -713,6 +713,189 @@ describe("Agent tool run_in_background (audit E4)", () => {
     expect(registry.get(id)?.lastActivity).toBe("running Grep…");
   });
 
+  it("noteProgress stores the full snapshot + derives lastActivity; fans out to all subscribers; post-settle no-op (F04 t02)", async () => {
+    const registry = new BackgroundTaskRegistry();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const id = registry.start(
+      "agent:a",
+      (async () => {
+        await gate;
+        return result();
+      })(),
+    );
+    const seenA: Array<{ tail: string[]; activity: string }> = [];
+    const seenB: Array<{ tail: string[]; activity: string }> = [];
+    const unsubA = registry.subscribeProgress(id, (s) => seenA.push(s));
+    registry.subscribeProgress(id, (s) => seenB.push(s));
+    expect(registry.subscriberCount(id)).toBe(2);
+
+    const snap1 = { tail: ["> Grep (x)"], activity: "running Grep…" };
+    registry.noteProgress(id, snap1);
+    // Full snapshot stored; lastActivity derived via progressActivityLine (activity wins).
+    expect(registry.get(id)?.progress).toEqual(snap1);
+    expect(registry.get(id)?.lastActivity).toBe("running Grep…");
+    // Fan-out reached both subscribers.
+    expect(seenA).toEqual([snap1]);
+    expect(seenB).toEqual([snap1]);
+
+    // Unsubscribe stops delivery to A only.
+    unsubA();
+    expect(registry.subscriberCount(id)).toBe(1);
+    const snap2 = { tail: ["> Read (f)"], activity: "" }; // empty activity → tail line
+    registry.noteProgress(id, snap2);
+    expect(registry.get(id)?.progress).toEqual(snap2);
+    // Empty derived line must not clobber the prior lastActivity (noteActivity semantics).
+    expect(registry.get(id)?.lastActivity).toBe("> Read (f)");
+    expect(seenA).toEqual([snap1]); // no new delivery
+    expect(seenB).toEqual([snap1, snap2]);
+
+    // Post-settle: noteProgress is a no-op and subscribers are torn down.
+    release();
+    await registry.wait(id);
+    expect(registry.subscriberCount(id)).toBe(0);
+    registry.noteProgress(id, { tail: ["late"], activity: "too late" });
+    expect(registry.get(id)?.lastActivity).toBe("> Read (f)");
+    expect(seenB).toEqual([snap1, snap2]);
+  });
+
+  it("noteProgress with an empty derived line does NOT clobber a prior lastActivity (F04 t02 guard)", async () => {
+    const registry = new BackgroundTaskRegistry();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const id = registry.start(
+      "agent:a",
+      (async () => {
+        await gate;
+        return result();
+      })(),
+    );
+    // A real snapshot establishes a lastActivity.
+    registry.noteProgress(id, { tail: ["> Grep (x)"], activity: "running Grep…" });
+    expect(registry.get(id)?.lastActivity).toBe("running Grep…");
+    // A snapshot whose derived line is EMPTY (no activity, no tail) must leave the
+    // prior lastActivity untouched — exercises the `if (activity)` false-branch
+    // (delete the guard and lastActivity would become "").
+    registry.noteProgress(id, { tail: [], activity: "" });
+    expect(registry.get(id)?.lastActivity).toBe("running Grep…");
+    // The full snapshot is still stored (display-only), even when the derived line is empty.
+    expect(registry.get(id)?.progress).toEqual({ tail: [], activity: "" });
+    release();
+    await registry.wait(id);
+  });
+
+  it("noteProgress fan-out survives a throwing subscriber — the others still receive it (F04 t02)", async () => {
+    const registry = new BackgroundTaskRegistry();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const id = registry.start(
+      "agent:a",
+      (async () => {
+        await gate;
+        return result();
+      })(),
+    );
+    const seen: Array<{ tail: string[]; activity: string }> = [];
+    // FIRST subscriber throws inside its listener.
+    registry.subscribeProgress(id, () => {
+      throw new Error("hostile subscriber");
+    });
+    registry.subscribeProgress(id, (s) => seen.push(s));
+    expect(registry.subscriberCount(id)).toBe(2);
+
+    const snap = { tail: ["> Read (f)"], activity: "working…" };
+    // noteProgress itself must not throw despite the throwing listener…
+    expect(() => registry.noteProgress(id, snap)).not.toThrow();
+    // …and the SECOND subscriber still received the snapshot.
+    expect(seen).toEqual([snap]);
+    release();
+    await registry.wait(id);
+  });
+
+  it("agentType is set on the record from start() — direct and via the Agent tool fresh path (F04 t02)", async () => {
+    const registry = new BackgroundTaskRegistry();
+    // Direct start(): the 5th positional arg lands on the record.
+    const direct = registry.start(
+      "agent:coder",
+      Promise.resolve(result()),
+      undefined,
+      "agent-abc",
+      "coder",
+    );
+    expect(registry.get(direct)?.agentType).toBe("coder");
+    await registry.wait(direct);
+
+    // Fresh Agent-tool dispatch: the clean subagent type is wired at start().
+    const { sdk, release } = gatedSdk("bg");
+    const runtime = makeRuntime([makeAgent()], sdk);
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: registry,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t", {
+      subagent_type: "worker",
+      prompt: "go",
+      run_in_background: true,
+    });
+    const taskId = String(started.details.taskId);
+    // Present BEFORE settlement (eager at start()).
+    expect(registry.get(taskId)?.agentType).toBe("worker");
+    release();
+    await registry.wait(taskId);
+    expect(registry.get(taskId)?.agentType).toBe("worker");
+  });
+
+  it("leak guard: subscriber set is empty after completed / rejected / stopped; subscribe-after-settle is a no-op (F04 t02)", async () => {
+    const registry = new BackgroundTaskRegistry();
+
+    // Completed path.
+    let releaseC!: () => void;
+    const gateC = new Promise<void>((r) => (releaseC = r));
+    const done = registry.start("agent:c", (async () => {
+      await gateC;
+      return result();
+    })());
+    registry.subscribeProgress(done, () => {});
+    expect(registry.subscriberCount(done)).toBe(1);
+    releaseC();
+    await registry.wait(done);
+    expect(registry.subscriberCount(done)).toBe(0);
+
+    // Rejected/throwing path.
+    let rejectR!: (e: unknown) => void;
+    const p = new Promise<BackgroundResultLike>((_, rej) => (rejectR = rej));
+    const failed = registry.start("agent:r", p);
+    registry.subscribeProgress(failed, () => {});
+    expect(registry.subscriberCount(failed)).toBe(1);
+    rejectR(new Error("kaput"));
+    await registry.wait(failed);
+    expect(registry.get(failed)?.status).toBe("failed");
+    expect(registry.subscriberCount(failed)).toBe(0);
+
+    // Stopped path.
+    let releaseS!: () => void;
+    const gateS = new Promise<void>((r) => (releaseS = r));
+    const stopped = registry.start("agent:s", (async () => {
+      await gateS;
+      return result();
+    })());
+    registry.subscribeProgress(stopped, () => {});
+    expect(registry.subscriberCount(stopped)).toBe(1);
+    registry.stop(stopped);
+    releaseS();
+    await registry.wait(stopped);
+    expect(registry.get(stopped)?.status).toBe("stopped");
+    expect(registry.subscriberCount(stopped)).toBe(0);
+
+    // Subscribe AFTER settle: no-op registration, safe no-op unsubscribe.
+    const late: unknown[] = [];
+    const unsub = registry.subscribeProgress(done, (s) => late.push(s));
+    expect(registry.subscriberCount(done)).toBe(0);
+    registry.noteProgress(done, { tail: [], activity: "x" });
+    expect(late).toEqual([]);
+    expect(() => unsub()).not.toThrow();
+  });
+
   it("a live background dispatch records its condensed activity on the record (t03)", async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));

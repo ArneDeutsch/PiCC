@@ -264,6 +264,16 @@ export function renderProgressText(snapshot: ProgressSnapshot): string {
   return lines.join("\n");
 }
 
+/**
+ * A single-line activity label for a background task's last-activity field: the
+ * current activity, else the newest tail line, else empty. Pure — reads only
+ * `snapshot.activity`/`tail`, no `pi-tui`. Shared by `noteProgress`
+ * (background-tasks.ts) to derive the model-facing `lastActivity`/poll string.
+ */
+export function progressActivityLine(snapshot: ProgressSnapshot): string {
+  return snapshot.activity || snapshot.tail[snapshot.tail.length - 1] || "";
+}
+
 // --- t06 per-subagent usage formatting (shared display helper) ---
 //
 // The single home of the compact usage-line format, used by the foreground

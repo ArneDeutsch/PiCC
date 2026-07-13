@@ -1430,11 +1430,6 @@ function createMaxTurnsExtension(maxTurns: number, diagnostics: Diagnostic[]) {
   };
 }
 
-/** A single-line activity label for a background task's last-activity field. */
-function progressActivityLine(snapshot: ProgressSnapshot): string {
-  return snapshot.activity || snapshot.tail[snapshot.tail.length - 1] || "";
-}
-
 /** The `Agent` dispatch tool definition (Claude-compatible; also registered as `Task`). */
 export function createAgentToolDefinition(
   runtime: SubagentRuntime,
@@ -1519,8 +1514,11 @@ export function createAgentToolDefinition(
         // TaskOutput shows the background subagent is alive. `taskId` is assigned
         // synchronously by start() below, long before any event fires.
         let taskId: string | undefined;
+        // Live progress → task record (F04 t02): hand the whole condensed
+        // snapshot to noteProgress, which stores it, derives lastActivity, and
+        // fans out to any waiting TaskOutput subscriber (t03).
         const onProgress = (snapshot: ProgressSnapshot) => {
-          if (taskId) registry.noteActivity(taskId, progressActivityLine(snapshot));
+          if (taskId) registry.noteProgress(taskId, snapshot);
         };
         const id = registry.start(
           `agent:${label}`,
@@ -1532,20 +1530,17 @@ export function createAgentToolDefinition(
           }),
           () => controller.abort(),
           agentId,
+          label,
         );
         taskId = id;
-        // One-shot builtins (Explore/Plan) are non-resumable — advertising an
-        // agent id in the start message would falsely invite a SendMessage
-        // follow-up (t04 would refuse it). Resumable/non-builtin dispatches keep
-        // the id segment. `details.agentId` stays for logs/UI regardless.
-        const idSegment = runtime.isOneShotBuiltin(subagentType)
-          ? ""
-          : `, agent id: ${agentId}`;
+        // Identity-at-start (F04 t02): the agent id appears for EVERY background
+        // task — including one-shot builtins (Explore/Plan) — since the
+        // start-message is the only model-visible id delivery in print/RPC mode.
         return {
           content: [
             {
               type: "text",
-              text: `Background task ${id} started (agent: ${label}${idSegment}). Use TaskOutput with task_id "${id}" to retrieve the result.`,
+              text: `Background task ${id} started (agent: ${label}, agent id: ${agentId}). Use TaskOutput with task_id "${id}" to retrieve the result.`,
             },
           ],
           details: { background: true, taskId: id, agent: label, agentId },
@@ -1789,7 +1784,7 @@ export function createSendMessageToolDefinition(
       const controller = new AbortController();
       let taskId: string | undefined;
       const onProgress = (snapshot: ProgressSnapshot) => {
-        if (taskId) opts.backgroundTasks.noteActivity(taskId, progressActivityLine(snapshot));
+        if (taskId) opts.backgroundTasks.noteProgress(taskId, snapshot);
       };
       const id = opts.backgroundTasks.start(
         `agent:${record.agentName}`,
@@ -1808,6 +1803,7 @@ export function createSendMessageToolDefinition(
         }),
         () => controller.abort(),
         record.agentId,
+        record.agentName,
       );
       taskId = id;
       return {
