@@ -96,6 +96,16 @@ export const toolUpdate: Extract<
 export const toolEnd: Extract<AgentSessionEvent, { type: "tool_execution_end" }>["type"] =
   "tool_execution_end";
 
+// --- t04: resume + steer surface ---
+
+// AgentSession.steer(text, images?) → Promise<void> — the mid-task
+// course-correction seam SendMessage uses for a RUNNING background dispatch.
+export const steerArg: Parameters<AgentSession["steer"]>[0] = "course correct";
+export const steerReturns: ReturnType<AgentSession["steer"]> = Promise.resolve();
+// AgentSession.followUp(text, images?) → Promise<void> — pinned alongside steer.
+export const followUpArg: Parameters<AgentSession["followUp"]>[0] = "follow up";
+export const followUpReturns: ReturnType<AgentSession["followUp"]> = Promise.resolve();
+
 // The silent-wait retry events carry the attempt/max fields the condenser shows.
 export const retryStart: Extract<AgentSessionEvent, { type: "auto_retry_start" }> = {
   type: "auto_retry_start",

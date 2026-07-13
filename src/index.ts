@@ -10,7 +10,12 @@ import { HookRunner } from "./engine/hook-runner.js";
 import { PermissionEngine } from "./engine/permissions.js";
 import { parseHookConfig } from "./claude/hooks.js";
 import { WorktreeManager } from "./runtime/worktrees.js";
-import { SubagentRuntime, createAgentToolDefinition } from "./runtime/subagents.js";
+import {
+  SubagentRuntime,
+  createAgentToolDefinition,
+  createSendMessageToolDefinition,
+} from "./runtime/subagents.js";
+import { SubagentRegistry } from "./runtime/subagent-registry.js";
 import { createGuardExtension } from "./runtime/guard.js";
 import {
   buildSystemPromptSuffix,
@@ -408,6 +413,11 @@ export default function picc(pi: any) {
   // Background tasks (audit E4): one registry per session — run_in_background
   // dispatches register here; TaskOutput/TaskStop operate on it.
   const backgroundTasks = new BackgroundTaskRegistry();
+  // Dispatch registry (t04): one per session — every session-creating dispatch
+  // registers here so SendMessage can steer a running background subagent or
+  // resume a finished one. Registry-only resolution keeps a hostile `to` off the
+  // filesystem (SECURITY MUST-FIX #2).
+  const subagentRegistry = new SubagentRegistry();
   // Built-in agent types (audit E1): general-purpose/Explore/Plan, appended
   // AFTER project/user/plugin agents so a same-named project agent wins (an
   // overridden built-in is dropped from the catalog — dispatch resolves the
@@ -547,6 +557,7 @@ export default function picc(pi: any) {
       "WebSearch",
       "Agent",
       "Task",
+      "SendMessage",
       "Skill",
       "EnterWorktree",
       "ExitWorktree",
@@ -566,6 +577,9 @@ export default function picc(pi: any) {
     buildSystemPrompt: buildSubagentSystemPrompt,
     customToolsFor: (agent, granted, depth, subCwd) => {
       // Per-dispatch instances (fresh TaskStore, dispatch-local cwd binding).
+      // NOTE (t04): SendMessage is deliberately NEVER built here — it is
+      // parent-initiated only (no subagent→subagent or subagent→parent channel).
+      // Even a future "inherit all tools" change must not add it to this set.
       const tools: Record<string, unknown>[] = [];
       for (const tool of buildCwdBoundTools(subCwd ?? cwdState, createTaskTools())) {
         const name = (tool as { name: string }).name;
@@ -624,6 +638,7 @@ export default function picc(pi: any) {
     maxDepth: project.settings.subagentMaxDepth,
     concurrency: project.settings.subagentConcurrency,
     sessionId,
+    subagentRegistry,
   });
 
   // ---------------------------------------------------------------------------
@@ -695,6 +710,13 @@ export default function picc(pi: any) {
     claudeNamedTools.push(
       createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Agent", backgroundTasks }),
       createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Task", backgroundTasks }),
+      // SendMessage (t04): the coordinator's channel back into its subagents —
+      // resume a finished one (same id, full context, background) or steer a
+      // running background one. Parent-session only (never in customToolsFor).
+      createSendMessageToolDefinition(subagentRuntime, {
+        registry: subagentRegistry,
+        backgroundTasks,
+      }),
     );
   }
   // Real TaskOutput/TaskStop (audit E4) — formerly degrade stubs; they answer

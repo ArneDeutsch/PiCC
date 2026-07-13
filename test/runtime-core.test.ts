@@ -1,7 +1,30 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
+
+// Parent-only guard (tester NIT-2): the last test boots the REAL picc harness
+// with only the Pi SDK's session creation faked, so it can dispatch a real
+// subagent and inspect the tool list that subagent's session actually receives.
+// This file has no static import of the Pi module, so this mock cleanly
+// intercepts subagents.ts's dynamic `loadRealSdk` import (unlike sendmessage.test,
+// whose top-level SessionManager import defeats interception).
+const rcMock = vi.hoisted(() => ({ created: [] as Array<Record<string, unknown>> }));
+vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
+  const real = await importOriginal<Record<string, unknown>>();
+  const { fakeSdk: makeFakeSdk } = await import("./helpers/fake-sdk.js");
+  const { sdk } = makeFakeSdk({ replies: ["rc-nit2-done"], created: rcMock.created });
+  return {
+    ...real,
+    createAgentSession: (options: Record<string, unknown>) => sdk.createAgentSession(options),
+    DefaultResourceLoader: sdk.DefaultResourceLoader,
+    SessionManager: { inMemory: () => ({}) },
+    SettingsManager: { inMemory: () => ({}) },
+    getAgentDir: () => "/fake-agent-dir",
+  };
+});
+import piccExtension from "../src/index.js";
+import { fakePi } from "./helpers/fake-pi.js";
 import { CwdState } from "../src/runtime/cwd-state.js";
 import {
   applyUpdatedInput,
@@ -1254,5 +1277,60 @@ describe("Subagent live progress (t03)", () => {
     });
     expect(boomResult.ok).toBe(false);
     expect(boom.sessions[0]!.listenerCount()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Parent-only guard (tester NIT-2) — SendMessage never reaches a subagent
+// ---------------------------------------------------------------------------
+
+describe("SendMessage parent-only guard through the real harness (tester NIT-2)", () => {
+  it("a subagent's constructed toolset EXCLUDES SendMessage even under inherit-all", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-rc-nit2-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "nit2-project\n");
+    const userDir = path.join(dir, ".claude-user");
+    fs.mkdirSync(userDir, { recursive: true });
+    const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const originalCwd = process.cwd();
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    process.chdir(dir);
+    try {
+      const pi = fakePi();
+      piccExtension(pi.api as never);
+      // Boot is async (project/agents load); give it a beat to register tools.
+      await new Promise((r) => setTimeout(r, 200));
+      const agentTool = pi.tools.get("Agent") as {
+        execute: (
+          id: string,
+          params: Record<string, unknown>,
+        ) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
+      };
+      expect(agentTool, "Agent tool must be registered").toBeDefined();
+
+      // general-purpose inherits ALL tools (tools: undefined) → gateTools grants
+      // every known Claude name INCLUDING SendMessage. The subagent's session must
+      // still never receive a SendMessage tool: the one-line guard in index.ts's
+      // customToolsFor must hold under inherit-all (and claudeToolsToPiBuiltins
+      // never maps SendMessage to a Pi builtin).
+      const before = rcMock.created.length;
+      await agentTool.execute("t", { subagent_type: "general-purpose", prompt: "go" });
+      expect(rcMock.created.length).toBeGreaterThan(before);
+      const options = rcMock.created[rcMock.created.length - 1]!;
+      const toolNames = (options.tools as string[]) ?? [];
+      const customToolNames = ((options.customTools as Array<{ name: string }>) ?? []).map(
+        (t) => t.name,
+      );
+      expect(toolNames).not.toContain("SendMessage");
+      expect(customToolNames).not.toContain("SendMessage");
+    } finally {
+      process.chdir(originalCwd);
+      if (savedUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = savedUserDir;
+      try {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      } catch {
+        /* OS reaps temp dirs eventually */
+      }
+    }
   });
 });

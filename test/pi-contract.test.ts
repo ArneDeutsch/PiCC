@@ -49,6 +49,12 @@ describe("pi 0.80.x API contract", () => {
     expect(typeof sdk.AgentSession?.prototype?.subscribe).toBe("function");
   });
 
+  it("AgentSession exposes steer()/followUp() for SendMessage steering (t04)", async () => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    expect(typeof sdk.AgentSession?.prototype?.steer).toBe("function");
+    expect(typeof sdk.AgentSession?.prototype?.followUp).toBe("function");
+  });
+
   it("typebox + StringEnum are importable the way our tools use them", async () => {
     const { Type } = await import("typebox");
     const { StringEnum } = await import("@earendil-works/pi-ai");

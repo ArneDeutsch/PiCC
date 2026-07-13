@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { Type } from "typebox";
 import type {
   ClaudeAgent,
@@ -17,6 +19,7 @@ import { createGuardExtension } from "./guard.js";
 import { CwdState } from "./cwd-state.js";
 import { findByName } from "../project.js";
 import type { BackgroundTaskRegistry } from "./background-tasks.js";
+import type { SteerableSession, SubagentRegistry } from "./subagent-registry.js";
 import {
   agentTrailerFrame,
   agentTrailerLine,
@@ -100,6 +103,13 @@ export interface SubagentRuntimeDeps {
   maxDepth: number;
   concurrency: number;
   sessionId: string;
+  /**
+   * Dispatch registry (t04): every session-creating dispatch registers here so
+   * SendMessage can resolve an agent ID/name to its live session (steer) or its
+   * persisted transcript (resume). Optional — when absent, dispatch runs exactly
+   * as before and SendMessage is simply not wired (print/test paths).
+   */
+  subagentRegistry?: SubagentRegistry;
   /** Injected for testability; defaults to the real Pi SDK. */
   sdk?: PiSdk;
   log?: (message: string) => void;
@@ -120,6 +130,17 @@ export interface PiSdk {
    * Optional: when absent, dispatch degrades to in-memory (non-resumable).
    */
   persistedSessionManager?(cwd: string, sessionDir: string, id: string): PiSessionManagerLike;
+  /**
+   * Reopen a persisted subagent transcript for resume (t04: SendMessage) —
+   * `SessionManager.open(path, sessionDir?, cwdOverride?)`. Restores the prior
+   * messages (t02 dispose→reopen proof) and appends the resumed run to the SAME
+   * file. Optional: when absent, resume fails loudly rather than losing context.
+   */
+  reopenSessionManager?(
+    transcriptPath: string,
+    sessionDir: string,
+    cwd: string,
+  ): PiSessionManagerLike;
   inMemorySettingsManager(): unknown;
   agentDir(): string;
 }
@@ -150,6 +171,15 @@ interface PiSession {
    * progress when absent, never crashing. Returns an unsubscribe function.
    */
   subscribe?(listener: (event: unknown) => void): () => void;
+  /**
+   * Mid-task course correction for a RUNNING dispatch (t04: SendMessage steer).
+   * Real Pi `AgentSession.steer` queues the message, delivered after the current
+   * assistant turn's tool calls, before the next LLM call. Optional so fakes/
+   * older SDKs degrade cleanly — steering a session without it refuses.
+   */
+  steer?(text: string): Promise<void> | void;
+  /** Queue a follow-up processed after the agent finishes (real Pi followUp). */
+  followUp?(text: string): Promise<void> | void;
 }
 
 /** Classified fate of a dispatch. Mirrored by `BackgroundResultLike` (t01 contract). */
@@ -205,6 +235,11 @@ async function loadRealSdk(): Promise<PiSdk> {
     // file `<stamp>_<id>.jsonl` in the custom directory (created on demand).
     persistedSessionManager: (cwd: string, sessionDir: string, id: string) =>
       m.SessionManager.create(cwd, sessionDir, { id }),
+    // Resume (t04): reopen the SAME transcript file to restore prior context and
+    // append the resumed run. `open(path, sessionDir, cwdOverride)` — proven by
+    // t02's dispose→reopen round-trip.
+    reopenSessionManager: (transcriptPath: string, sessionDir: string, cwd: string) =>
+      m.SessionManager.open(transcriptPath, sessionDir, cwd),
     // shellPath pins subagent bash to Git Bash on Windows (see resolveGitBashPath).
     inMemorySettingsManager: () =>
       m.SettingsManager.inMemory({
@@ -379,6 +414,23 @@ export class SubagentRuntime {
      * Requires the session to expose `subscribe`; a no-op when it does not.
      */
     onProgress?: (snapshot: ProgressSnapshot) => void;
+    /**
+     * Resume a finished subagent (t04: SendMessage). When set, dispatch takes the
+     * SAME construction path (gated tools, guard, scoped hooks, system prompt +
+     * lockdown, maxTurns, depth, model) but seeds the session from the persisted
+     * transcript instead of creating a fresh one, and reuses the original cwd/
+     * worktree instead of entering a new one. SECURITY (MUST-FIX #1): there is no
+     * lighter resume path — every enforcement layer is re-applied because it is
+     * the identical dispatch code. The caller passes the SAME `agentId`.
+     */
+    resume?: {
+      /** The persisted transcript to reopen (from the registry record, never `to`). */
+      transcriptPath: string;
+      /** The cwd the original run used (worktree path when isolated) — reused as-is. */
+      cwd: string;
+      /** The original worktree path, when isolated — reused, never re-entered. */
+      worktreePath?: string;
+    };
   }): Promise<DispatchResult> {
     const diagnostics: Diagnostic[] = [];
     // Caller-provided agent ID hardening (t02, pre-t04): a resume/model-derived
@@ -471,6 +523,40 @@ export class SubagentRuntime {
     // travels with the ID so t04 can refuse. A same-named PROJECT agent is a
     // normal agent (it resolves first and lacks the builtin marker).
     const oneShot = this.isOneShot(agent);
+
+    // A fork/`agentOverride` dispatch runs a SYNTHETIC agent definition
+    // (`fork:<skill>`) that is NOT in getAgents()/builtins — it cannot be safely
+    // re-derived by name on resume (a by-name resolve would miss and fall back to
+    // all-tools general-purpose, WIDENING the tool gate). SECURITY (MUST-FIX #1):
+    // such a dispatch is recorded NON-RESUMABLE regardless of transcript, so
+    // SendMessage refuses it via the existing non-resumable path (forks are not
+    // SendMessage-resumable).
+    const overrideDispatch = opts.agentOverride !== undefined;
+
+    // Ack-before-register window (coder SHOULD-2): for a fresh `run_in_background`
+    // dispatch the ack (carrying agentId) is handed out by backgroundTasks.start()
+    // BEFORE this async dispatch reaches the session-creation register() below, so
+    // a coordinator that SendMessages that id in the SAME turn would hit a registry
+    // miss. Register a MINIMAL record synchronously at entry (before the semaphore
+    // await) so the id resolves the instant the ack returns; the session-creation
+    // register() ENRICHES it (session handle, transcriptPath, resumable, worktree).
+    // The record starts running with no session — a SendMessage arriving in this
+    // transient window takes the "running but not yet steerable" refusal (below),
+    // by design. Name-integrity is unchanged: this binds the name exactly as the
+    // enrich would, and the enrich shares the same agentId → updates in place,
+    // never rebinding. Skip on resume — markResuming already re-armed the existing
+    // record; re-registering minimally here would transiently wipe its
+    // transcriptPath/resumable mid-resume.
+    if (!opts.resume) {
+      this.deps.subagentRegistry?.register({
+        agentId,
+        agentName: agent.name,
+        depth: opts.depth,
+        cwd: this.deps.getCwd(),
+        resumable: false,
+        oneShot,
+      });
+    }
 
     // Agent-scoped hooks (audit C10): frontmatter `hooks:` dispatch while THIS
     // subagent runs. The scoped runner is multiplexed with the session runner
@@ -620,7 +706,14 @@ export class SubagentRuntime {
       started = true;
 
       let cwd = this.deps.getCwd();
-      if (agent.isolation === "worktree" && this.deps.worktrees) {
+      if (opts.resume) {
+        // Resume (t04): reuse the ORIGINAL cwd/worktree exactly — never enter a
+        // new worktree (that would branch a fresh, empty checkout and lose the
+        // run's context). Reachability was already checked by SendMessage against
+        // the REGISTRY-stored path before this dispatch was kicked off.
+        cwd = opts.resume.cwd;
+        worktreePath = opts.resume.worktreePath;
+      } else if (agent.isolation === "worktree" && this.deps.worktrees) {
         // Collision-free name: parallel fan-out of one agent must never share a
         // worktree (Date.now()-based names collide within the same millisecond).
         const enter = await this.deps.worktrees.enter({
@@ -738,7 +831,51 @@ export class SubagentRuntime {
       } catch {
         mainSessionFile = undefined;
       }
-      if (mainSessionFile && sdk.persistedSessionManager) {
+      if (opts.resume) {
+        // Resume (t04): REOPEN the same transcript instead of creating a fresh
+        // one, so the reopened session carries the prior context. A resume that
+        // cannot reopen must FAIL LOUDLY — silently degrading to a fresh
+        // in-memory session would run the agent WITHOUT its context (the exact
+        // silent-outcome bug class this feature fixes).
+        if (!sdk.reopenSessionManager) {
+          return {
+            ok: false,
+            outcome: "failed",
+            finalMessage: "",
+            agentId,
+            resumable: false,
+            agentName: agent.name,
+            worktreePath,
+            error: `Cannot resume agent ${agentId}: this runtime cannot reopen persisted transcripts.`,
+            diagnostics,
+          };
+        }
+        try {
+          const reopened = sdk.reopenSessionManager(
+            opts.resume.transcriptPath,
+            path.dirname(opts.resume.transcriptPath),
+            cwd,
+          );
+          transcriptPath = reopened.getSessionFile() ?? opts.resume.transcriptPath;
+          sessionManager = reopened;
+          resumable = !oneShot && transcriptPath !== undefined;
+        } catch (err) {
+          return {
+            ok: false,
+            outcome: "failed",
+            finalMessage: "",
+            agentId,
+            transcriptPath: opts.resume.transcriptPath,
+            resumable: false,
+            agentName: agent.name,
+            worktreePath,
+            error: `Cannot resume agent ${agentId}: reopening its transcript failed (${capErrorText(
+              (err as Error)?.message ?? String(err),
+            )}).`,
+            diagnostics,
+          };
+        }
+      } else if (mainSessionFile && sdk.persistedSessionManager) {
         try {
           const persisted = sdk.persistedSessionManager(
             cwd,
@@ -780,6 +917,27 @@ export class SubagentRuntime {
       const created = await sdk.createAgentSession(sessionOptions);
       session = created.session;
       if (thinking && session.setThinkingLevel) session.setThinkingLevel(thinking);
+
+      // Dispatch registry (t04): record this live run so SendMessage can steer it
+      // (running) or resume it (once settled). Registered with everything a resume
+      // needs — agent name (re-resolved for construction), depth, cwd/worktree,
+      // transcript path — and the live session handle for steering. A resume
+      // re-registers under the same ID: state flips back to running and the t05
+      // settled-notice is re-armed. The finally drops the handle on settlement.
+      this.deps.subagentRegistry?.register({
+        agentId,
+        agentName: agent.name,
+        depth: opts.depth,
+        cwd,
+        worktreePath,
+        transcriptPath,
+        // SECURITY (MUST-FIX #1): a fork/agentOverride dispatch is never
+        // resumable — its synthetic `fork:<skill>` definition cannot be
+        // re-derived by name without weakening the tool gate.
+        resumable: overrideDispatch ? false : resumable,
+        oneShot,
+        session: session as SteerableSession,
+      });
 
       // Cooperative stop (audit E4): a TaskStop-triggered signal aborts the
       // live session best-effort (real Pi sessions expose abort()).
@@ -998,8 +1156,13 @@ export class SubagentRuntime {
       } catch {
         // dispose failures must not mask results
       }
-      if (worktreePath && this.deps.worktrees) {
+      // Dispatch registry (t04): the session is disposed — drop the live handle
+      // and flip the record to settled, keeping name/ID/state/transcript-path so
+      // a later SendMessage can still resume it. No-op for never-registered ids.
+      this.deps.subagentRegistry?.markSettled(agentId);
+      if (worktreePath && this.deps.worktrees && !opts.resume) {
         // Keep the worktree (the project's own merge flow owns its lifecycle); just unlock.
+        // On resume we reused an existing worktree we never entered — leave its lock alone.
         await this.deps.worktrees.exit({ worktreePath, action: "keep" }).catch(() => undefined);
       }
       if (started && !stopFired) {
@@ -1538,4 +1701,171 @@ export function createAgentToolDefinition(
       };
     },
   };
+}
+
+/**
+ * The `SendMessage` tool (t04): the coordinator's channel back into its
+ * subagents. Addressing is by agent ID or name (`to`), resolved EXCLUSIVELY
+ * against the in-memory dispatch registry (SECURITY MUST-FIX #2 — a hostile `to`
+ * never touches the filesystem). Two deliveries:
+ *  - A still-running BACKGROUND subagent → the message is steered in as a
+ *    mid-task course correction (`AgentSession.steer`); an ack is returned. (A
+ *    foreground Agent call blocks the parent's turn, so steering de-facto reaches
+ *    only background dispatches — by design, not a defect.)
+ *  - A FINISHED subagent → it resumes IN THE BACKGROUND under the SAME agent ID
+ *    with its full prior context, via a full re-dispatch through
+ *    `SubagentRuntime.dispatch({ resume })` (SECURITY MUST-FIX #1 — the entire
+ *    enforcement stack is re-applied because it is the identical construction
+ *    path). The tool returns an immediate ack; the run's outcome arrives via
+ *    TaskOutput (and t05's settlement notice).
+ *
+ * Parent-initiated ONLY: this tool is NEVER added to subagent toolsets
+ * (`customToolsFor`) — no subagent→subagent or subagent→parent messaging. The
+ * message content is delivered VERBATIM as user-role task direction; an agent
+ * message is never a permission approval (the permission engine still gates
+ * every tool the resumed/steered agent runs — no parallel approval path here).
+ */
+export function createSendMessageToolDefinition(
+  runtime: SubagentRuntime,
+  opts: { registry: SubagentRegistry; backgroundTasks: BackgroundTaskRegistry },
+): Record<string, unknown> {
+  return {
+    name: "SendMessage",
+    label: "SendMessage",
+    description:
+      "Send a follow-up message to a subagent you previously dispatched. Address it by its agent id (agent-…) or name (`to`). A finished subagent resumes in the background under the same id with its full prior context; a still-running background subagent receives the message as a mid-task course correction. Returns an acknowledgment; a resumed run's result arrives via TaskOutput.",
+    parameters: Type.Object({
+      to: Type.String({
+        description: "Agent id (e.g. agent-3fa9c2d1b4e5) or the agent name from a prior dispatch",
+      }),
+      message: Type.String({
+        description: "The follow-up instruction, delivered to the agent verbatim as a user turn",
+      }),
+    }),
+    async execute(_toolCallId: string, params: Record<string, unknown>) {
+      const to = String(params.to ?? "");
+      const message = String(params.message ?? "");
+      if (!message.trim()) {
+        throw new Error("SendMessage requires a non-empty `message` to deliver.");
+      }
+      // SECURITY (MUST-FIX #2): registry-only resolution — pure in-memory Map
+      // lookups. A hostile `to` (`..`, separators, absolute path) is neither a
+      // minted agent id nor a registered name → clean miss, no filesystem touch.
+      const resolved = opts.registry.resolve(to);
+      if (!resolved.ok) throw new Error(resolved.error);
+      const record = resolved.record;
+
+      // One-shot builtins (Explore/Plan) refuse resume AND steer.
+      if (record.oneShot) {
+        throw new Error(
+          `Agent ${record.agentId} ("${record.agentName}") is a one-shot ${record.agentName} agent — one-shot built-ins (Explore/Plan) cannot be resumed or steered. Dispatch a new agent instead.`,
+        );
+      }
+
+      // Running background dispatch → steer (mid-task course correction).
+      if (record.state === "running") {
+        const session = record.session;
+        if (session && typeof session.steer === "function") {
+          await Promise.resolve(session.steer(message));
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Message delivered to running agent ${record.agentId} ("${record.agentName}") as a mid-task course correction.`,
+              },
+            ],
+            details: { agentId: record.agentId, agent: record.agentName, delivery: "steer" },
+          };
+        }
+        // A running record with no steerable handle: a foreground dispatch (which
+        // blocks the parent turn, so this is unreachable in practice) or one that
+        // just settled. Refuse rather than silently drop the message.
+        throw new Error(
+          `Agent ${record.agentId} ("${record.agentName}") is running but cannot be steered right now — only background dispatches are steerable (a foreground Agent call blocks the parent's turn).`,
+        );
+      }
+
+      // Settled → resume. Refuse the non-resumable (in-memory fallback / no
+      // transcript) cleanly — never silently start a fresh context-less run.
+      if (!record.resumable || !record.transcriptPath) {
+        throw new Error(
+          `Agent ${record.agentId} ("${record.agentName}") is not resumable: it ran without a persisted transcript (print/no-session mode or a one-shot builtin). Dispatch a new agent instead.`,
+        );
+      }
+
+      // Reachability (registry-stored path — NOT the model `to`): the original
+      // working directory / worktree must still exist, or the resumed run would
+      // reopen against a missing checkout.
+      const missing =
+        record.worktreePath && !existsSyncSafe(record.worktreePath)
+          ? record.worktreePath
+          : !existsSyncSafe(record.cwd)
+            ? record.cwd
+            : undefined;
+      if (missing) {
+        throw new Error(
+          `Agent ${record.agentId} ("${record.agentName}") is unreachable: its working directory ${JSON.stringify(
+            missing,
+          )} no longer exists (the worktree may have been merged or removed). Dispatch a new agent instead.`,
+        );
+      }
+
+      // Resume: flip the record to running eagerly (Claude 2.1.205 synchronous
+      // status flip; re-arms the t05 settled notice), then re-dispatch in the
+      // BACKGROUND under the SAME agent id through the shared construction path.
+      // NIT-3: between this markResuming and the re-dispatch's session-creation
+      // register(), the record is running with no live session handle — a second
+      // concurrent SendMessage in that window hits the "running but not yet
+      // steerable" refusal (transient, by design).
+      opts.registry.markResuming(record.agentId);
+      const controller = new AbortController();
+      let taskId: string | undefined;
+      const onProgress = (snapshot: ProgressSnapshot) => {
+        if (taskId) opts.backgroundTasks.noteActivity(taskId, progressActivityLine(snapshot));
+      };
+      const id = opts.backgroundTasks.start(
+        `agent:${record.agentName}`,
+        runtime.dispatch({
+          subagentType: record.agentName,
+          prompt: message,
+          depth: record.depth,
+          agentId: record.agentId,
+          resume: {
+            transcriptPath: record.transcriptPath,
+            cwd: record.cwd,
+            worktreePath: record.worktreePath,
+          },
+          abortSignal: controller.signal,
+          onProgress,
+        }),
+        () => controller.abort(),
+        record.agentId,
+      );
+      taskId = id;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Agent ${record.agentId} ("${record.agentName}") resumed in background as ${id}. Retrieve its result with TaskOutput (task_id "${id}").`,
+          },
+        ],
+        details: {
+          agentId: record.agentId,
+          agent: record.agentName,
+          taskId: id,
+          delivery: "resume",
+          resumed: true,
+        },
+      };
+    },
+  };
+}
+
+/** `fs.existsSync` that never throws (a permission error must not crash the tool). */
+function existsSyncSafe(p: string): boolean {
+  try {
+    return fs.existsSync(p);
+  } catch {
+    return false;
+  }
 }

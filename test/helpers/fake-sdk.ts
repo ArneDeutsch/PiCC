@@ -31,6 +31,8 @@ import type { ClaudeAgent, HookOutcome } from "../../src/types.js";
  */
 type RealSessionManager = {
   create(cwd: string, sessionDir: string, opts: { id: string }): PiSessionManagerLike;
+  /** Reopen a transcript for resume (t04) — SessionManager.open. */
+  open(path: string, sessionDir?: string, cwdOverride?: string): PiSessionManagerLike;
 };
 let realSessionManager: RealSessionManager | undefined;
 
@@ -78,6 +80,10 @@ export interface FakeSessionState {
    * must return to 0 after dispatch settles, on both success and failure paths.
    */
   listenerCount(): number;
+  /** Messages delivered via `steer()` (t04): SendMessage's running-agent path. */
+  steerMessages: string[];
+  /** Messages delivered via `followUp()` (t04). */
+  followUpMessages: string[];
 }
 
 export interface FakeSdkOptions {
@@ -129,6 +135,8 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
         aborted: false,
         customTools: (sessionOptions.customTools as FakeCustomTool[]) ?? [],
         listenerCount: () => 0,
+        steerMessages: [],
+        followUpMessages: [],
       };
       sessions.push(state);
       // Persistence mirror (t02): real AgentSessions write every message
@@ -210,6 +218,14 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
             state.aborted = true;
             signalAbort();
           },
+          // Steering seam (t04): SendMessage delivers a mid-task course
+          // correction to a RUNNING background dispatch through steer().
+          steer(text: string) {
+            state.steerMessages.push(text);
+          },
+          followUp(text: string) {
+            state.followUpMessages.push(text);
+          },
         },
       };
     },
@@ -226,6 +242,12 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
     persistedSessionManager: realSessionManager
       ? (cwd: string, sessionDir: string, id: string) =>
           realSessionManager!.create(cwd, sessionDir, { id })
+      : undefined,
+    // Resume (t04): reopen the SAME transcript with the REAL SessionManager so
+    // offline-integration tests exercise Pi's actual open/restore/append surface.
+    reopenSessionManager: realSessionManager
+      ? (transcriptPath: string, sessionDir: string, cwd: string) =>
+          realSessionManager!.open(transcriptPath, sessionDir, cwd)
       : undefined,
     inMemorySettingsManager: () => ({}),
     agentDir: () => "/fake-agent-dir",
