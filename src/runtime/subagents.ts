@@ -28,6 +28,7 @@ import {
   subagentSessionDir,
 } from "../util/subagent-transcripts.js";
 import {
+  formatUsageCompact,
   renderProgressText,
   sanitizeProgressText,
   SubagentProgressCondenser,
@@ -120,6 +121,52 @@ export interface PiSessionManagerLike {
   getSessionFile(): string | undefined;
 }
 
+/**
+ * Per-subagent token/cost usage (t06). Numbers only, and each field is OMITTED
+ * when Pi doesn't measure it rather than invented as a zero. Mirrored
+ * structurally on `BackgroundResultLike`/`BackgroundTaskRecord` (background-
+ * tasks.ts) and the dispatch registry record (subagent-registry.ts).
+ */
+export interface DispatchUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  costUsd?: number;
+}
+
+/**
+ * Structural view of Pi's `AgentSession.getSessionStats()` return
+ * (`SessionStats`): the subset t06 reads. Pi aggregates over ALL session
+ * entries (incl. compacted-away history), so these totals reflect what was
+ * actually billed for the subagent's whole run.
+ */
+export interface PiSessionStats {
+  tokens?: {
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    total?: number;
+  };
+  cost?: number;
+}
+
+/** Map Pi's SessionStats to the t06 usage shape, omitting fields Pi didn't report. */
+export function usageFromStats(stats: PiSessionStats | undefined): DispatchUsage | undefined {
+  if (!stats || typeof stats !== "object") return undefined;
+  const usage: DispatchUsage = {};
+  const tokens = stats.tokens;
+  if (tokens && typeof tokens === "object") {
+    if (typeof tokens.input === "number") usage.inputTokens = tokens.input;
+    if (typeof tokens.output === "number") usage.outputTokens = tokens.output;
+    if (typeof tokens.cacheRead === "number") usage.cacheReadTokens = tokens.cacheRead;
+    if (typeof tokens.cacheWrite === "number") usage.cacheWriteTokens = tokens.cacheWrite;
+  }
+  if (typeof stats.cost === "number") usage.costUsd = stats.cost;
+  return Object.keys(usage).length ? usage : undefined;
+}
+
 export interface PiSdk {
   createAgentSession(options: Record<string, unknown>): Promise<{ session: PiSession }>;
   DefaultResourceLoader: new (options: Record<string, unknown>) => { reload(): Promise<void> };
@@ -180,6 +227,12 @@ interface PiSession {
   steer?(text: string): Promise<void> | void;
   /** Queue a follow-up processed after the agent finishes (real Pi followUp). */
   followUp?(text: string): Promise<void> | void;
+  /**
+   * Aggregate token/cost stats for the whole session (real Pi
+   * `AgentSession.getSessionStats`; t06 usage accounting). Optional so simple
+   * fakes/older SDKs omit it — dispatch then reports no usage, never crashing.
+   */
+  getSessionStats?(): PiSessionStats;
 }
 
 /** Classified fate of a dispatch. Mirrored by `BackgroundResultLike` (t01 contract). */
@@ -217,6 +270,14 @@ export interface DispatchResult {
   truncated?: boolean;
   agentName?: string;
   worktreePath?: string;
+  /**
+   * Per-subagent token/cost usage (t06), captured from the session's
+   * `getSessionStats()` after the last `prompt()`. Present when the session
+   * provided stats — including failed/aborted runs (their PARTIAL usage answers
+   * "what did the failure cost me"). Metadata only: NEVER mixed into
+   * `finalMessage` (the verbatim-return contract is untouched).
+   */
+  usage?: DispatchUsage;
   /** The single error channel: present iff `outcome !== "completed"`, names the cause. */
   error?: string;
   diagnostics: Diagnostic[];
@@ -671,11 +732,33 @@ export class SubagentRuntime {
     let stopFired = false;
     let abortListener: (() => void) | undefined;
     let progressUnsub: (() => void) | undefined;
+    // Usage accounting (t06): capture the session's aggregate stats AFTER the
+    // last prompt() and BEFORE each result is built — the result literals live
+    // in this try block, so a finally-only capture would have nowhere to attach
+    // to the returned DispatchResult. `captureUsage()` reads the live session's
+    // getSessionStats() (best-effort; a fake/older SDK without it → undefined,
+    // never a crash) into the mutable local, threaded into every session-bearing
+    // result and read once more in the finally for the dispatch registry.
+    // `settledOutcome` records the fate for the registry's per-subagent report.
+    let capturedUsage: DispatchUsage | undefined;
+    let settledOutcome: DispatchOutcome | undefined;
+    const captureUsage = (): DispatchUsage | undefined => {
+      const live = session;
+      if (live && typeof live.getSessionStats === "function") {
+        try {
+          capturedUsage = usageFromStats(live.getSessionStats());
+        } catch {
+          // usage is metadata — a stats failure must never fail the dispatch
+        }
+      }
+      return capturedUsage;
+    };
     try {
       if (opts.abortSignal?.aborted) {
         // Re-check after the semaphore wait (review H3): a TaskStop issued while
         // the dispatch was queued must not burn a full session. Informational
         // SubagentStop matches the error-path pattern; finally releases the slot.
+        settledOutcome = "aborted";
         stopFired = true;
         await fireSubagentStop({
           subagent_type: agent.name,
@@ -703,6 +786,7 @@ export class SubagentRuntime {
         })
         .catch(() => undefined);
       if (startOutcome?.block) {
+        settledOutcome = "failed";
         return {
           ok: false,
           outcome: "failed",
@@ -744,6 +828,7 @@ export class SubagentRuntime {
       if (opts.abortSignal?.aborted) {
         // Re-check after worktree entry (review H3): a stop during enter() must
         // not spin up the session. The finally keep-exits the worktree.
+        settledOutcome = "aborted";
         stopFired = true;
         await fireSubagentStop({
           subagent_type: agent.name,
@@ -849,6 +934,7 @@ export class SubagentRuntime {
         // in-memory session would run the agent WITHOUT its context (the exact
         // silent-outcome bug class this feature fixes).
         if (!sdk.reopenSessionManager) {
+          settledOutcome = "failed";
           return {
             ok: false,
             outcome: "failed",
@@ -871,6 +957,7 @@ export class SubagentRuntime {
           sessionManager = reopened;
           resumable = !oneShot && transcriptPath !== undefined;
         } catch (err) {
+          settledOutcome = "failed";
           return {
             ok: false,
             outcome: "failed",
@@ -999,6 +1086,7 @@ export class SubagentRuntime {
       const terminalOutcome = (): DispatchResult | undefined => {
         const last = lastAssistantMessage(live);
         if (last?.stopReason === "error") {
+          settledOutcome = "failed";
           return {
             ok: false,
             outcome: "failed",
@@ -1012,11 +1100,14 @@ export class SubagentRuntime {
             resumable,
             agentName: agent.name,
             worktreePath,
+            // Partial usage of the failed run (t06): "what did the failure cost me".
+            usage: captureUsage(),
             error: `Agent terminated early due to an API error: ${capErrorText(last.errorMessage ?? "unknown error")}`,
             diagnostics,
           };
         }
         if (last?.stopReason === "aborted" || opts.abortSignal?.aborted) {
+          settledOutcome = "aborted";
           return {
             ok: false,
             outcome: "aborted",
@@ -1026,6 +1117,7 @@ export class SubagentRuntime {
             resumable,
             agentName: agent.name,
             worktreePath,
+            usage: captureUsage(),
             error: `Subagent "${agent.name}" was aborted before completing its task.`,
             diagnostics,
           };
@@ -1081,6 +1173,7 @@ export class SubagentRuntime {
           // signal firing while prompt() settles does (terminalOutcome). Aborted
           // results are discarded by contract, so breaking out to a
           // completed-looking result here would leak past the abort.
+          settledOutcome = "aborted";
           return {
             ok: false,
             outcome: "aborted",
@@ -1090,6 +1183,7 @@ export class SubagentRuntime {
             resumable,
             agentName: agent.name,
             worktreePath,
+            usage: captureUsage(),
             error: `Subagent "${agent.name}" was aborted before completing its task.`,
             diagnostics,
           };
@@ -1120,6 +1214,7 @@ export class SubagentRuntime {
           `The reply was truncated at the model's output token limit (stop reason "length"); the output above may be incomplete.`,
         );
       }
+      settledOutcome = "completed";
       return {
         ok: true,
         outcome: "completed",
@@ -1130,6 +1225,7 @@ export class SubagentRuntime {
         truncated: cutOff,
         agentName: agent.name,
         worktreePath,
+        usage: captureUsage(),
         diagnostics,
       };
     } catch (err) {
@@ -1137,6 +1233,7 @@ export class SubagentRuntime {
       // before the session exists" case — and any other dispatch-internal error.
       // Conservative: not resumable (the session may never have run), but the
       // transcript path (when one was allocated) stays visible for diagnosis.
+      settledOutcome = "failed";
       return {
         ok: false,
         outcome: "failed",
@@ -1146,6 +1243,8 @@ export class SubagentRuntime {
         resumable: false,
         agentName: agent.name,
         worktreePath,
+        // Partial usage when the session ran at all before throwing (t06).
+        usage: captureUsage(),
         error: `Subagent "${agent.name}" failed: ${capErrorText((err as Error)?.message ?? String(err))}`,
         diagnostics,
       };
@@ -1162,15 +1261,25 @@ export class SubagentRuntime {
       } catch {
         // unsubscribe must not mask results
       }
+      // Usage safety-net (t06): capture stats one last time while the session is
+      // still alive (before dispose), so the registry record carries usage even
+      // if some future return path forgets to capture. Idempotent with the
+      // per-return captures above (same session, same value).
+      captureUsage();
       try {
         session?.dispose();
       } catch {
         // dispose failures must not mask results
       }
-      // Dispatch registry (t04): the session is disposed — drop the live handle
-      // and flip the record to settled, keeping name/ID/state/transcript-path so
-      // a later SendMessage can still resume it. No-op for never-registered ids.
-      this.deps.subagentRegistry?.markSettled(agentId);
+      // Dispatch registry (t04/t06): the session is disposed — drop the live
+      // handle and flip the record to settled, keeping name/ID/state/transcript-
+      // path so a later SendMessage can still resume it, and recording the run's
+      // fate + per-subagent usage for the /usage control command. No-op for
+      // never-registered ids.
+      this.deps.subagentRegistry?.markSettled(agentId, {
+        outcome: settledOutcome,
+        usage: capturedUsage,
+      });
       if (worktreePath && this.deps.worktrees && !opts.resume) {
         // Keep the worktree (the project's own merge flow owns its lifecycle); just unlock.
         // On resume we reused an existing worktree we never entered — leave its lock alone.
@@ -1312,10 +1421,11 @@ function progressActivityLine(snapshot: ProgressSnapshot): string {
 }
 
 /**
- * Defensive usage formatter (t06 coordination): the usage field lands in t06.
- * Renders a string as-is, an object via `text`/token/cost fields, and NOTHING
- * (undefined) when absent or an unrecognized shape — so this slot degrades
- * gracefully until t06 pins the concrete shape.
+ * Usage formatter for the renderResult footer (t03 slot, populated by t06).
+ * Renders a string as-is, an explicit `text` override, otherwise delegates to
+ * the shared `formatUsageCompact` (the t06 `{ inputTokens, … costUsd }` shape,
+ * and the legacy `totalTokens`/`cost` shape). Returns NOTHING when absent or an
+ * unrecognized shape, so the footer line drops entirely.
  */
 function formatUsageLine(usage: unknown): string | undefined {
   if (usage == null) return undefined;
@@ -1323,12 +1433,7 @@ function formatUsageLine(usage: unknown): string | undefined {
   if (typeof usage === "object") {
     const u = usage as Record<string, unknown>;
     if (typeof u.text === "string" && u.text.trim()) return u.text.trim();
-    const parts: string[] = [];
-    const tokens = u.totalTokens ?? u.tokens;
-    if (typeof tokens === "number") parts.push(`${tokens} tokens`);
-    const cost = u.costUsd ?? u.cost;
-    if (typeof cost === "number") parts.push(`$${cost}`);
-    return parts.length ? parts.join(" · ") : undefined;
+    return formatUsageCompact(u);
   }
   return undefined;
 }
@@ -1632,6 +1737,10 @@ export function createAgentToolDefinition(
         agentId: result.agentId,
         transcriptPath: result.transcriptPath,
         resumable: result.resumable,
+        // Usage metadata (t06): populates t03's renderResult footer usage line
+        // (formatUsageLine → formatUsageCompact). details is logs/UI-only — never
+        // the model-visible content, so the verbatim-return contract is untouched.
+        usage: result.usage,
       };
       if (result.outcome === "failed" && result.finalMessage.trim()) {
         // Claude 2.1.200 semantics: real work done before an API death comes back

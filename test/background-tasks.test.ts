@@ -142,6 +142,39 @@ describe("BackgroundTaskRegistry", () => {
     expect(out.content[0]!.text).not.toContain("resumable via SendMessage"); // …but not advertised
   });
 
+  it("a stopped task still records its partial usage, and TaskOutput carries the usage line (t06)", async () => {
+    // Guards the deliberate ordering in background-tasks.ts: `record.usage` is
+    // assigned BEFORE the stopped-branch early return, so a stopped/aborted task
+    // still answers "what did the partial run cost me".
+    const registry = new BackgroundTaskRegistry();
+    let resolve!: (v: ReturnType<typeof result>) => void;
+    const id = registry.start(
+      "agent:worker",
+      new Promise<ReturnType<typeof result>>((r) => (resolve = r)),
+      () => {},
+    );
+    expect(registry.stop(id).abortRequested).toBe(true);
+    resolve(
+      result({
+        outcome: "aborted",
+        error: "subagent dispatch was aborted",
+        finalMessage: "discard me",
+        usage: { inputTokens: 100, outputTokens: 50, costUsd: 0.0123 },
+      }),
+    );
+    await registry.wait(id);
+    expect(registry.get(id)?.status).toBe("stopped");
+    // The registry record keeps the partial usage despite the discarded result.
+    expect(registry.get(id)?.usage).toEqual({
+      inputTokens: 100,
+      outputTokens: 50,
+      costUsd: 0.0123,
+    });
+    const taskOutput = createTaskOutputTool(registry) as unknown as ToolLike;
+    const out = await taskOutput.execute("t", { task_id: id });
+    expect(out.content[0]!.text).toContain("usage: in 100 · out 50 · $0.0123");
+  });
+
   it("stop on a settled task reports alreadySettled; unknown ids report not found", async () => {
     const registry = new BackgroundTaskRegistry();
     const id = registry.start("agent:a", Promise.resolve(result()));

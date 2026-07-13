@@ -515,6 +515,69 @@ describe("background settlement notices without polling (t05, offline-integratio
     expect(settlements(p)).toHaveLength(0);
   });
 
+  it("/usage aggregates per-subagent usage, transcript paths, outcome, and a session total (t06)", async () => {
+    const { p, internals } = wire();
+    // Two settled dispatches with usage, exactly as the runtime would record:
+    // register (running) then markSettled with outcome + usage.
+    internals.subagentRegistry.register({
+      agentId: "agent-1111aaaa2222",
+      agentName: "reviewer",
+      depth: 1,
+      cwd: process.cwd(),
+      transcriptPath: "/sessions/main.subagents/x_agent-1111aaaa2222.jsonl",
+      resumable: true,
+      oneShot: false,
+    });
+    internals.subagentRegistry.markSettled("agent-1111aaaa2222", {
+      outcome: "completed",
+      usage: { inputTokens: 100, outputTokens: 50, costUsd: 0.02 },
+    });
+    internals.subagentRegistry.register({
+      agentId: "agent-3333bbbb4444",
+      agentName: "planner",
+      depth: 1,
+      cwd: process.cwd(),
+      transcriptPath: "/sessions/main.subagents/y_agent-3333bbbb4444.jsonl",
+      resumable: true,
+      oneShot: false,
+    });
+    internals.subagentRegistry.markSettled("agent-3333bbbb4444", {
+      outcome: "failed",
+      usage: { inputTokens: 10, outputTokens: 5, costUsd: 0.01 },
+    });
+
+    p.entries.length = 0;
+    await p.commands.get("usage").handler("", p.ctx());
+    const out = p.entries
+      .filter((e) => e.customType === "picc-control")
+      .map((e) => String(e.data?.output ?? ""))
+      .join("\n");
+    // Per-subagent lines: id, type, outcome, usage, transcript path.
+    expect(out).toContain("agent-1111aaaa2222 (reviewer) — completed");
+    expect(out).toContain("agent-3333bbbb4444 (planner) — failed");
+    expect(out).toContain("in 100 · out 50 · $0.02");
+    expect(out).toContain("x_agent-1111aaaa2222.jsonl");
+    expect(out).toContain("y_agent-3333bbbb4444.jsonl");
+    // Subagents total sums each present field across records. The label and
+    // header must make clear this is SUBAGENT usage, not whole-session/main-agent.
+    expect(out).toContain("Subagents total: in 110 · out 55 · $0.03");
+    expect(out).not.toContain("Session total:");
+    expect(out).toContain("does NOT include the main agent's own usage");
+    expect(out).toContain("the main-agent / whole-session total is not shown");
+  });
+
+  it("/usage is registered and reports nothing before any dispatch", async () => {
+    const { p } = wire();
+    expect(p.commands.has("usage")).toBe(true);
+    p.entries.length = 0;
+    await p.commands.get("usage").handler("", p.ctx());
+    const out = p.entries
+      .filter((e) => e.customType === "picc-control")
+      .map((e) => String(e.data?.output ?? ""))
+      .join("\n");
+    expect(out).toContain("No subagents have been dispatched this session");
+  });
+
   it("delivers completed / failed / stopped shapes together (rate-limit → failed; TaskStop → aborted)", async () => {
     const { p, internals } = wire();
 

@@ -16,6 +16,8 @@ import {
   createSendMessageToolDefinition,
 } from "./runtime/subagents.js";
 import { SubagentRegistry } from "./runtime/subagent-registry.js";
+import type { SubagentRegistryRecord } from "./runtime/subagent-registry.js";
+import { formatUsageCompact } from "./runtime/subagent-progress.js";
 import { createGuardExtension } from "./runtime/guard.js";
 import {
   buildSystemPromptSuffix,
@@ -1222,6 +1224,56 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return lines.join("\n");
   }
 
+  /**
+   * `/usage` (t06): per-subagent token/cost breakdown for THIS session, plus a
+   * session total — aggregated from the dispatch registry (t04). The user noted
+   * Pi's own usage surface is unhelpful; this is the per-subagent view. Lists
+   * each dispatched agent's id, type, outcome, usage, and transcript path — the
+   * one place a human can look for what their fan-out cost.
+   */
+  function renderUsageReport(): string {
+    const records = subagentRegistry.list();
+    if (!records.length) {
+      return "No subagents have been dispatched this session (nothing to account for yet).";
+    }
+    const lines = [
+      `PiCC — per-subagent token/cost this session (${records.length} dispatched) — does NOT include the main agent's own usage:`,
+      "  Note: the main-agent / whole-session total is not shown here — the Pi extension API doesn't expose it, so this covers subagents only.",
+      "",
+    ];
+    // Session total: sum each field only across records that reported it, so a
+    // field absent everywhere stays absent (never invented as a zero).
+    const total: Record<string, number> = {};
+    const usageKeys = [
+      "inputTokens",
+      "outputTokens",
+      "cacheReadTokens",
+      "cacheWriteTokens",
+      "costUsd",
+    ] as const;
+    const addToTotal = (record: SubagentRegistryRecord) => {
+      const usage = record.usage;
+      if (!usage) return;
+      for (const key of usageKeys) {
+        const value = usage[key];
+        if (typeof value === "number" && Number.isFinite(value)) {
+          total[key] = (total[key] ?? 0) + value;
+        }
+      }
+    };
+    for (const record of records) {
+      const state = record.state === "running" ? "running" : record.outcome ?? "settled";
+      lines.push(`  ${record.agentId} (${record.agentName}) — ${state}`);
+      const usageLine = formatUsageCompact(record.usage);
+      lines.push(`    usage: ${usageLine ?? "(none recorded)"}`);
+      if (record.transcriptPath) lines.push(`    transcript: ${record.transcriptPath}`);
+      addToTotal(record);
+    }
+    const totalLine = formatUsageCompact(total);
+    lines.push("", `  Subagents total: ${totalLine ?? "(no usage recorded)"}`);
+    return lines.join("\n");
+  }
+
   function renderQuota(ctx: any): string {
     const usage = ctx?.getContextUsage?.();
     return [
@@ -1283,6 +1335,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         return renderSkillsList();
       case "agents":
         return renderAgentsList();
+      case "usage":
+        return renderUsageReport();
       case "quota":
         return renderQuota(ctx);
       case "compat": {
@@ -1309,6 +1363,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     quota: "PiCC: subscription/rate-limit info from the last provider response",
     skills: "PiCC: list the project's Claude skills (invocable + model-only)",
     agents: "PiCC: list the subagents available for dispatch",
+    usage: "PiCC: per-subagent token/cost this session (subagents only — not the main agent's own usage), with a total",
   };
   for (const [name, description] of Object.entries(CONTROL_COMMANDS)) {
     pi.registerCommand(name, {
@@ -1357,7 +1412,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // would duplicate or be shadowed by these (the skill still executes via the
   // input handler if the name is typed and not intercepted as a built-in).
   const RESERVED_NAMES = new Set([
-    "doctor", "compat", "quota", "skills", "agents",
+    "doctor", "compat", "quota", "skills", "agents", "usage",
     "changelog", "clone", "compact", "copy", "export", "fork", "hotkeys", "import",
     "login", "logout", "model", "name", "new", "quit", "reload", "resume",
     "scoped-models", "session", "settings", "share", "tree", "trust", "help",

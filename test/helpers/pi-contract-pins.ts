@@ -11,6 +11,7 @@ import type {
   AgentSessionEvent,
   AgentSessionEventListener,
   NewSessionOptions,
+  SessionStats,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 // Value import of the CLASS (for its static side); still never executed —
@@ -105,6 +106,23 @@ export const steerReturns: ReturnType<AgentSession["steer"]> = Promise.resolve()
 // AgentSession.followUp(text, images?) → Promise<void> — pinned alongside steer.
 export const followUpArg: Parameters<AgentSession["followUp"]>[0] = "follow up";
 export const followUpReturns: ReturnType<AgentSession["followUp"]> = Promise.resolve();
+
+// --- t06: per-subagent usage accounting surface ---
+
+// AgentSession.getSessionStats() returns SessionStats — the aggregate token/cost
+// totals PiCC records per subagent. A signature change fails this pin.
+export const getSessionStatsReturns: ReturnType<AgentSession["getSessionStats"]> extends SessionStats
+  ? "ok"
+  : "PIN BROKEN: AgentSession.getSessionStats no longer returns SessionStats" = "ok";
+// The exact token/cost fields usageFromStats() reads off SessionStats.
+export const statsTokens: SessionStats["tokens"] = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  total: 0,
+};
+export const statsCost: SessionStats["cost"] = 0;
 
 // The silent-wait retry events carry the attempt/max fields the condenser shows.
 export const retryStart: Extract<AgentSessionEvent, { type: "auto_retry_start" }> = {

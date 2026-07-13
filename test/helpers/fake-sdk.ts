@@ -3,6 +3,7 @@ import {
   type PiSdk,
   type PiSessionManagerLike,
   type PiSessionMessage,
+  type PiSessionStats,
   type SubagentRuntimeDeps,
 } from "../../src/runtime/subagents.js";
 import { PermissionEngine } from "../../src/engine/permissions.js";
@@ -104,6 +105,18 @@ export interface FakeSdkOptions {
    * when the session cannot stream events (older SDK / minimal fake).
    */
   noSubscribe?: boolean;
+  /**
+   * Scripted session stats (t06): fake sessions return this from
+   * `getSessionStats()`. A value is returned as-is; a function is evaluated per
+   * call (lets a test vary usage across sessions). When absent, getSessionStats
+   * returns undefined → dispatch reports no usage.
+   */
+  stats?: PiSessionStats | ((session: FakeSessionState) => PiSessionStats | undefined);
+  /**
+   * Omit `getSessionStats` from fake sessions (t06): proves usage stays
+   * undefined with no crash when the SDK/session cannot report stats.
+   */
+  noGetSessionStats?: boolean;
 }
 
 export interface FakeSdkHandle {
@@ -169,10 +182,15 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
         listeners.add(listener);
         return () => listeners.delete(listener);
       };
+      // Scripted usage stats (t06): a real AgentSession exposes getSessionStats();
+      // fakes return the scripted stats (or a per-session function's result).
+      const getSessionStats = (): PiSessionStats | undefined =>
+        typeof options.stats === "function" ? options.stats(state) : options.stats;
       return {
         session: {
           messages: state.messages,
           ...(options.noSubscribe ? {} : { subscribe }),
+          ...(options.noGetSessionStats ? {} : { getSessionStats }),
           async prompt(text: string) {
             promptCalls++;
             record({ role: "user", content: text });

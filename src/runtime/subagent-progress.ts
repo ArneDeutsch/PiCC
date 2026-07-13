@@ -263,3 +263,66 @@ export function renderProgressText(snapshot: ProgressSnapshot): string {
   if (snapshot.activity) lines.push(`… ${snapshot.activity}`);
   return lines.join("\n");
 }
+
+// --- t06 per-subagent usage formatting (shared display helper) ---
+//
+// The single home of the compact usage-line format, used by the foreground
+// Agent tool result, the background TaskOutput text, and the /usage control
+// command — so every human-visible surface reads identically. Lives here (the
+// neutral display-text util already imported by subagents.ts and
+// background-tasks.ts) to stay free of an import cycle between those modules.
+
+/**
+ * `$0.03`, trailing zeros trimmed; `$0.00` for an EXACT zero cost. A nonzero
+ * charge below the 4-decimal resolution renders `<$0.0001` (a floor) rather than
+ * a misleading `$0` — never let a real charge read as free.
+ */
+function formatCostUsd(cost: number): string {
+  if (!Number.isFinite(cost)) return "$0.00";
+  if (cost === 0) return "$0.00";
+  const trimmed = cost.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+  // A nonzero cost that rounds to zero at 4 decimals ("$0") must not read as free.
+  if (trimmed === "0") return "<$0.0001";
+  return `$${trimmed}`;
+}
+
+/** A finite number, or undefined for anything else (NaN/Infinity/non-number). */
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Format a usage object (the t06 `{ inputTokens, outputTokens, cacheReadTokens,
+ * cacheWriteTokens, costUsd }` shape) into one compact line, rendering ONLY the
+ * fields actually present (Pi omits what it doesn't measure — never invented as
+ * zeros). Also accepts the legacy `totalTokens`/`tokens` + `cost` shape (the t03
+ * defensive slot's expectation) so `formatUsageLine` can delegate here. Returns
+ * undefined when nothing renders, so callers can drop the line entirely.
+ */
+export function formatUsageCompact(usage: unknown): string | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const u = usage as Record<string, unknown>;
+  const parts: string[] = [];
+  const input = finiteNumber(u.inputTokens);
+  const output = finiteNumber(u.outputTokens);
+  const cacheRead = finiteNumber(u.cacheReadTokens);
+  const cacheWrite = finiteNumber(u.cacheWriteTokens);
+  if (
+    input !== undefined ||
+    output !== undefined ||
+    cacheRead !== undefined ||
+    cacheWrite !== undefined
+  ) {
+    if (input !== undefined) parts.push(`in ${input}`);
+    if (output !== undefined) parts.push(`out ${output}`);
+    if (cacheRead !== undefined) parts.push(`cache read ${cacheRead}`);
+    if (cacheWrite !== undefined) parts.push(`cache write ${cacheWrite}`);
+  } else {
+    // Legacy shape (t03 defensive slot): a single total-token count.
+    const total = finiteNumber(u.totalTokens) ?? finiteNumber(u.tokens);
+    if (total !== undefined) parts.push(`${total} tokens`);
+  }
+  const cost = finiteNumber(u.costUsd) ?? finiteNumber(u.cost);
+  if (cost !== undefined) parts.push(formatCostUsd(cost));
+  return parts.length ? parts.join(" · ") : undefined;
+}

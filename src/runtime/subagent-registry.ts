@@ -29,6 +29,21 @@ export interface SteerableSession {
   followUp?(text: string): Promise<void> | void;
 }
 
+/**
+ * Per-subagent usage (t06), mirrored structurally from `DispatchUsage`
+ * (subagents.ts) so this module keeps no import coupling with the runtime.
+ */
+export interface SubagentUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  costUsd?: number;
+}
+
+/** Settled fate of a dispatch (t01 vocabulary), recorded for the /usage report. */
+export type SubagentOutcome = "completed" | "failed" | "aborted";
+
 export interface SubagentRegistryRecord {
   /** Opaque, minted `agent-<12 hex>` identity — the primary key. */
   agentId: string;
@@ -48,6 +63,18 @@ export interface SubagentRegistryRecord {
   oneShot: boolean;
   /** Whether the dispatch is currently running (steerable) or has settled. */
   state: "running" | "settled";
+  /**
+   * Settled fate (t06): completed / failed / aborted, recorded at settlement so
+   * the /usage control command can report each subagent's outcome. Undefined
+   * while running (or for a settle that could not classify).
+   */
+  outcome?: SubagentOutcome;
+  /**
+   * Per-subagent token/cost usage (t06), recorded at settlement from the
+   * dispatch's captured session stats. Undefined when the session provided none
+   * (fake/older SDK, or a run that died before any billable turn).
+   */
+  usage?: SubagentUsage;
   /** Live session handle while running (steering target); dropped on settlement. */
   session?: SteerableSession;
   /**
@@ -141,12 +168,20 @@ export class SubagentRegistry {
    * Mark a dispatch settled: drop the live session handle (it is disposed) and
    * flip the state, keeping name/ID/state/transcript-path + everything resume
    * needs. The settled notice stays un-consumed (t05 owes exactly one notice).
+   * `settled.outcome`/`settled.usage` (t06) record the run's fate and per-
+   * subagent usage for the /usage control command; each is stored only when
+   * provided, so a settle that couldn't classify leaves the prior value intact.
    */
-  markSettled(agentId: string): void {
+  markSettled(
+    agentId: string,
+    settled?: { outcome?: SubagentOutcome; usage?: SubagentUsage },
+  ): void {
     const record = this.records.get(agentId);
     if (!record) return;
     record.state = "settled";
     record.session = undefined;
+    if (settled?.outcome !== undefined) record.outcome = settled.outcome;
+    if (settled?.usage !== undefined) record.usage = settled.usage;
   }
 
   /**
@@ -169,6 +204,15 @@ export class SubagentRegistry {
 
   ids(): string[] {
     return [...this.records.keys()];
+  }
+
+  /**
+   * Every dispatch record in registration order (t06): the /usage control
+   * command iterates this to report each subagent's id, name, outcome, usage,
+   * and transcript path, plus a session total.
+   */
+  list(): SubagentRegistryRecord[] {
+    return [...this.records.values()];
   }
 
   /**

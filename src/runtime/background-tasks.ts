@@ -1,7 +1,7 @@
 import { Type } from "typebox";
 import type { Diagnostic } from "../types.js";
 import { agentTrailerFrame, agentTrailerLine } from "../util/subagent-transcripts.js";
-import { sanitizeLine } from "./subagent-progress.js";
+import { formatUsageCompact, sanitizeLine } from "./subagent-progress.js";
 
 /**
  * Background task runtime (audit E4): `run_in_background: true` on the Agent
@@ -13,6 +13,19 @@ import { sanitizeLine } from "./subagent-progress.js";
  */
 
 export type BackgroundTaskStatus = "running" | "completed" | "failed" | "stopped";
+
+/**
+ * Per-subagent token/cost usage (t06), mirrored structurally from
+ * `DispatchUsage` (subagents.ts) so this module keeps its no-value-import
+ * relationship with the runtime.
+ */
+export interface UsageLike {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  costUsd?: number;
+}
 
 /** Structural view of a DispatchResult (avoids an import cycle with subagents.ts). */
 export interface BackgroundResultLike {
@@ -31,6 +44,8 @@ export interface BackgroundResultLike {
   /** True when `finalMessage` was truncated and already carries a cut-off frame (t02). */
   truncated?: boolean;
   agentName?: string;
+  /** Per-subagent token/cost usage (t06); partial on failed/aborted runs. */
+  usage?: UsageLike;
   /** The single error channel: present iff `outcome !== "completed"`. */
   error?: string;
   diagnostics?: Diagnostic[];
@@ -58,6 +73,13 @@ export interface BackgroundTaskRecord {
   resumable?: boolean;
   /** True when `result` was truncated and already carries a cut-off frame (t02). */
   truncated?: boolean;
+  /**
+   * Per-subagent token/cost usage (t06), mirrored from the settled dispatch
+   * result. Set for completed, failed (partial), AND stopped/aborted runs — the
+   * cost of an aborted run is exactly the "what did the failure cost me" answer.
+   * Surfaced in the TaskOutput text + details; never mixed into `result`.
+   */
+  usage?: UsageLike;
   /**
    * Last observed live activity of the running dispatch (t03): a short,
    * sanitized one-liner (current tool / retry wait) fed by the dispatch's
@@ -115,6 +137,9 @@ export class BackgroundTaskRegistry {
         record.transcriptPath = result.transcriptPath;
         record.resumable = result.resumable === true;
         record.truncated = result.truncated === true;
+        // Usage mirror (t06): recorded before the stopped-branch early return
+        // below, so an aborted task still reports what its partial run cost.
+        record.usage = result.usage;
         record.diagnostics.push(...(result.diagnostics ?? []));
         if (record.status === "stopped") {
           // TaskStop contract: a stopped task's result is discarded.
@@ -465,6 +490,14 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
             ". Call TaskOutput again (wait defaults to true) to await its result.";
           break;
       }
+      // Usage line (t06): a compact, clearly-separated metadata line for any
+      // settled task that has usage — including a stopped one (what the aborted
+      // run cost). Rides OUTSIDE the verbatim body, after any t02 agent-ID
+      // trailer, so the verbatim-return contract is untouched (metadata only).
+      const usageLine = formatUsageCompact(task.usage);
+      if (usageLine && task.status !== "running") {
+        text += `\nusage: ${usageLine}`;
+      }
       return {
         content: [{ type: "text", text }],
         details: {
@@ -474,6 +507,7 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
           agentId: task.agentId,
           transcriptPath: task.transcriptPath,
           resumable: task.resumable,
+          usage: task.usage,
           lastActivity: task.lastActivity,
           diagnostics: task.diagnostics,
         },
