@@ -42,6 +42,13 @@ describe("pi 0.80.x API contract", () => {
     expect(typeof sdk.SessionManager.open).toBe("function");
   });
 
+  it("AgentSession exposes subscribe() for live progress (t03)", async () => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    // subscribe is an instance method; assert it's on the prototype (constructing
+    // a real session needs a provider/model, out of scope for a contract smoke).
+    expect(typeof sdk.AgentSession?.prototype?.subscribe).toBe("function");
+  });
+
   it("typebox + StringEnum are importable the way our tools use them", async () => {
     const { Type } = await import("typebox");
     const { StringEnum } = await import("@earendil-works/pi-ai");
@@ -49,7 +56,7 @@ describe("pi 0.80.x API contract", () => {
     expect(typeof StringEnum).toBe("function");
   });
 
-  it("type pins compile against the pinned Pi: stopReason/errorMessage on AssistantMessage, 5-arg execute (t01)", async () => {
+  it("type pins compile against the pinned Pi: stopReason/errorMessage, 5-arg execute (t01), transcript surface (t02), subscribe + event kinds (t03)", async () => {
     // vitest strips types without checking them and the project tsconfig
     // excludes test/, so the pins live in test/helpers/pi-contract-pins.ts and
     // are compiled HERE with the real TypeScript checker — Pi type churn fails

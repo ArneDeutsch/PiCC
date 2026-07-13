@@ -47,6 +47,13 @@ export interface FakeReply {
   errorMessage?: string;
   /** Await this before replying — lets tests hold a prompt open (abort/concurrency). */
   gate?: Promise<void>;
+  /**
+   * Live session events (t03) emitted to `subscribe` listeners while THIS reply
+   * is produced (after the gate resolves, before the assistant message lands) —
+   * lets tests script a `tool_execution_*` / `message_update` / `auto_retry_*`
+   * sequence the progress condenser consumes. Loosely typed on purpose.
+   */
+  events?: Array<Record<string, unknown>>;
 }
 
 /** Structural shape of a dispatched custom tool as fake sessions see it
@@ -65,6 +72,12 @@ export interface FakeSessionState {
   aborted: boolean;
   /** The customTools passed into createAgentSession (for nested-dispatch scripts). */
   customTools: FakeCustomTool[];
+  /**
+   * Live count of event listeners currently subscribed to this session (t03,
+   * FIX-B): lets a test assert dispatch's `finally` unsubscribes — the count
+   * must return to 0 after dispatch settles, on both success and failure paths.
+   */
+  listenerCount(): number;
 }
 
 export interface FakeSdkOptions {
@@ -80,6 +93,11 @@ export interface FakeSdkOptions {
   ) => Promise<FakeReply | string | void> | FakeReply | string | void;
   /** Reuse a caller-owned capture array for session options (vi.hoisted interop). */
   created?: Array<Record<string, unknown>>;
+  /**
+   * Omit `subscribe` from fake sessions (t03): proves dispatch works unchanged
+   * when the session cannot stream events (older SDK / minimal fake).
+   */
+  noSubscribe?: boolean;
 }
 
 export interface FakeSdkHandle {
@@ -110,6 +128,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
         messages: [],
         aborted: false,
         customTools: (sessionOptions.customTools as FakeCustomTool[]) ?? [],
+        listenerCount: () => 0,
       };
       sessions.push(state);
       // Persistence mirror (t02): real AgentSessions write every message
@@ -125,9 +144,27 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
       };
       let signalAbort: () => void = () => {};
       const abortedGate = new Promise<void>((resolve) => (signalAbort = resolve));
+      // Live event listeners (t03): real AgentSessions expose subscribe(); fakes
+      // register listeners here and reply.events are broadcast during prompt().
+      const listeners = new Set<(event: unknown) => void>();
+      state.listenerCount = () => listeners.size;
+      const emit = (event: unknown) => {
+        for (const listener of listeners) {
+          try {
+            listener(event);
+          } catch {
+            // a listener throwing must not break the fake session
+          }
+        }
+      };
+      const subscribe = (listener: (event: unknown) => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      };
       return {
         session: {
           messages: state.messages,
+          ...(options.noSubscribe ? {} : { subscribe }),
           async prompt(text: string) {
             promptCalls++;
             record({ role: "user", content: text });
@@ -148,6 +185,8 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
               replyIndex++;
             }
             if (reply.gate) await Promise.race([reply.gate, abortedGate]);
+            // Broadcast scripted live events (t03) before the reply settles.
+            for (const event of reply.events ?? []) emit(event);
             if (state.aborted) {
               // Real Pi: an aborted run ends on a stopReason "aborted" assistant message.
               record({

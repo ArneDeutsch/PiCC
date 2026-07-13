@@ -6,7 +6,13 @@
  * loudly with the tsc message.
  */
 import type { AssistantMessage, StopReason } from "@earendil-works/pi-ai";
-import type { NewSessionOptions, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentSession,
+  AgentSessionEvent,
+  AgentSessionEventListener,
+  NewSessionOptions,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 // Value import of the CLASS (for its static side); still never executed —
 // this file is only ever compiled.
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -63,3 +69,43 @@ export const openReturns: ReturnType<typeof SessionManager.open> extends Session
 // …and the reopened manager exposes the restore/read surface dispatch relies on.
 export const sessionFileGetter: ReturnType<SessionManager["getSessionFile"]> = undefined;
 export const restoreSurface: keyof SessionManager = "buildSessionContext";
+
+// --- t03: live-progress event stream surface ---
+
+// AgentSession.subscribe(listener) exists and returns an unsubscribe function —
+// the seam dispatch() uses to stream a subagent's activity to the parent UI.
+export const subscribeArg: Parameters<AgentSession["subscribe"]>[0] = (
+  _event: AgentSessionEvent,
+): void => {};
+export const subscribeReturns: ReturnType<AgentSession["subscribe"]> = () => {};
+export const listenerAssignable: AgentSessionEventListener = (_event) => {};
+
+// The event kinds the condenser keys off must all be members of the union.
+export const turnStart: Extract<AgentSessionEvent, { type: "turn_start" }>["type"] = "turn_start";
+export const turnEnd: Extract<AgentSessionEvent, { type: "turn_end" }>["type"] = "turn_end";
+export const messageUpdate: Extract<AgentSessionEvent, { type: "message_update" }>["type"] =
+  "message_update";
+export const toolStart: Extract<
+  AgentSessionEvent,
+  { type: "tool_execution_start" }
+>["type"] = "tool_execution_start";
+export const toolUpdate: Extract<
+  AgentSessionEvent,
+  { type: "tool_execution_update" }
+>["type"] = "tool_execution_update";
+export const toolEnd: Extract<AgentSessionEvent, { type: "tool_execution_end" }>["type"] =
+  "tool_execution_end";
+
+// The silent-wait retry events carry the attempt/max fields the condenser shows.
+export const retryStart: Extract<AgentSessionEvent, { type: "auto_retry_start" }> = {
+  type: "auto_retry_start",
+  attempt: 1,
+  maxAttempts: 3,
+  delayMs: 2000,
+  errorMessage: "rate limited",
+};
+export const retryEnd: Extract<AgentSessionEvent, { type: "auto_retry_end" }> = {
+  type: "auto_retry_end",
+  success: true,
+  attempt: 1,
+};

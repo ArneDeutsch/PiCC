@@ -24,6 +24,12 @@ import {
   mintAgentId,
   subagentSessionDir,
 } from "../util/subagent-transcripts.js";
+import {
+  renderProgressText,
+  sanitizeProgressText,
+  SubagentProgressCondenser,
+  type ProgressSnapshot,
+} from "./subagent-progress.js";
 
 /**
  * Subagent dispatch runtime (plan §4.3): spawns fresh-context Pi sessions per dispatch,
@@ -138,6 +144,12 @@ interface PiSession {
   setThinkingLevel?(level: string): void;
   /** Cooperative abort (real Pi sessions expose it; TaskStop uses it best-effort). */
   abort?(): Promise<void> | void;
+  /**
+   * Live event stream (real Pi `AgentSession.subscribe`; t03 live progress).
+   * Optional so simple test fakes can omit it — dispatch degrades to no live
+   * progress when absent, never crashing. Returns an unsubscribe function.
+   */
+  subscribe?(listener: (event: unknown) => void): () => void;
 }
 
 /** Classified fate of a dispatch. Mirrored by `BackgroundResultLike` (t01 contract). */
@@ -360,6 +372,13 @@ export class SubagentRuntime {
      * the start message can carry it; t04 passes an existing ID on resume.
      */
     agentId?: string;
+    /**
+     * Live-progress sink (t03): fed a bounded, sanitized {@link ProgressSnapshot}
+     * whenever the running subagent's visible activity changes. Display-only —
+     * NEVER part of `finalMessage` (the verbatim-return contract is untouched).
+     * Requires the session to expose `subscribe`; a no-op when it does not.
+     */
+    onProgress?: (snapshot: ProgressSnapshot) => void;
   }): Promise<DispatchResult> {
     const diagnostics: Diagnostic[] = [];
     // Caller-provided agent ID hardening (t02, pre-t04): a resume/model-derived
@@ -554,6 +573,7 @@ export class SubagentRuntime {
     let started = false;
     let stopFired = false;
     let abortListener: (() => void) | undefined;
+    let progressUnsub: (() => void) | undefined;
     try {
       if (opts.abortSignal?.aborted) {
         // Re-check after the semaphore wait (review H3): a TaskStop issued while
@@ -778,6 +798,23 @@ export class SubagentRuntime {
         else opts.abortSignal.addEventListener("abort", abortListener, { once: true });
       }
 
+      // Live progress (t03): subscribe to the child session's event stream and
+      // condense it into a bounded, sanitized snapshot pushed to opts.onProgress
+      // on every visible change. Event-stream only — NEVER poll session.messages
+      // (compaction inside prompt() rewrites that array mid-flight). Degrades to
+      // nothing when the session has no subscribe() (simple fakes, older SDKs).
+      if (opts.onProgress && typeof session.subscribe === "function") {
+        const emit = opts.onProgress;
+        const condenser = new SubagentProgressCondenser();
+        progressUnsub = session.subscribe((event: unknown) => {
+          try {
+            if (condenser.consume(event)) emit(condenser.snapshot());
+          } catch {
+            // progress is best-effort display — never let it break the dispatch
+          }
+        });
+      }
+
       this.deps.log?.(`dispatch ${agent.name} (depth ${opts.depth})`);
       const fullPrompt = agent.initialPrompt
         ? `${agent.initialPrompt}\n\n${prompt}`
@@ -952,6 +989,11 @@ export class SubagentRuntime {
         }
       }
       try {
+        progressUnsub?.();
+      } catch {
+        // unsubscribe must not mask results
+      }
+      try {
         session?.dispose();
       } catch {
         // dispose failures must not mask results
@@ -1052,6 +1094,230 @@ function createMaxTurnsExtension(maxTurns: number, diagnostics: Diagnostic[]) {
   };
 }
 
+// --- t03 live-progress + result rendering helpers ---
+//
+// The Agent tool's renderCall/renderResult return a STRUCTURAL pi-tui Component
+// ({ render(width): string[] }) — the same untyped contract index.ts's control
+// renderers use, so no pi-tui import is needed. `theme` is Pi's Theme (fg/bold);
+// every access is null-guarded so a print-mode/absent theme degrades to plain
+// text and a renderer can never throw into Pi's render loop.
+
+function themedFg(theme: unknown, color: string, text: string): string {
+  const t = theme as { fg?: (c: string, s: string) => string } | undefined;
+  return typeof t?.fg === "function" ? t.fg(color, text) : text;
+}
+
+function themedBold(theme: unknown, text: string): string {
+  const t = theme as { bold?: (s: string) => string } | undefined;
+  return typeof t?.bold === "function" ? t.bold(text) : text;
+}
+
+/** Append `text` split into width-wrapped PLAIN lines (safe to slice — unstyled). */
+function pushWrapped(text: string, width: number, into: string[]): void {
+  for (const raw of String(text ?? "").split("\n")) {
+    if (width > 0 && raw.length > width) {
+      for (let i = 0; i < raw.length; i += width) into.push(raw.slice(i, i + width));
+    } else {
+      into.push(raw);
+    }
+  }
+}
+
+/** First non-empty line of `text`, trimmed and capped for a one-line preview. */
+function firstLine(text: string, max: number): string {
+  for (const line of String(text ?? "").split("\n")) {
+    const t = line.trim();
+    if (t) return t.length > max ? `${t.slice(0, Math.max(0, max - 1))}…` : t;
+  }
+  return "";
+}
+
+/** A single-line activity label for a background task's last-activity field. */
+function progressActivityLine(snapshot: ProgressSnapshot): string {
+  return snapshot.activity || snapshot.tail[snapshot.tail.length - 1] || "";
+}
+
+/**
+ * Defensive usage formatter (t06 coordination): the usage field lands in t06.
+ * Renders a string as-is, an object via `text`/token/cost fields, and NOTHING
+ * (undefined) when absent or an unrecognized shape — so this slot degrades
+ * gracefully until t06 pins the concrete shape.
+ */
+function formatUsageLine(usage: unknown): string | undefined {
+  if (usage == null) return undefined;
+  if (typeof usage === "string") return usage.trim() || undefined;
+  if (typeof usage === "object") {
+    const u = usage as Record<string, unknown>;
+    if (typeof u.text === "string" && u.text.trim()) return u.text.trim();
+    const parts: string[] = [];
+    const tokens = u.totalTokens ?? u.tokens;
+    if (typeof tokens === "number") parts.push(`${tokens} tokens`);
+    const cost = u.costUsd ?? u.cost;
+    if (typeof cost === "number") parts.push(`$${cost}`);
+    return parts.length ? parts.join(" · ") : undefined;
+  }
+  return undefined;
+}
+
+/** The outcome badge line (t01 outcome): colored symbol + agent + fate word. */
+function outcomeBadgeLine(
+  theme: unknown,
+  outcome: string | undefined,
+  cutOff: boolean,
+  agentName: unknown,
+): string {
+  const agent =
+    typeof agentName === "string" && agentName ? `Agent(${agentName})` : "Agent";
+  let symbol = "•";
+  let color = "muted";
+  let word = outcome ?? "done";
+  if (outcome === "completed") {
+    symbol = "●";
+    color = "success";
+    word = cutOff ? "completed (truncated)" : "completed";
+  } else if (outcome === "failed") {
+    symbol = "✗";
+    color = "error";
+    word = cutOff ? "failed (partial output preserved)" : "failed";
+  } else if (outcome === "aborted") {
+    // UX-1: forward-compatible exhaustive branch. Not reached by today's live
+    // foreground path (t01's seam throws aborted/failed-no-output before this
+    // renders) — kept ready for the deferred t01-seam follow-up.
+    symbol = "■";
+    color = "warning";
+    word = "aborted";
+  }
+  return themedFg(theme, color, themedBold(theme, `${symbol} ${agent} ${word}`));
+}
+
+/**
+ * UX-2: strip the model-facing agent-ID trailer (t02) off the HUMAN-rendered
+ * body. The model still reads `result.content` verbatim (trailer included); only
+ * this local display copy drops it, so the footer can present the ID + a single
+ * resumable hint without the raw `---`/`[agent …]` plumbing showing up too.
+ * Case 1: a completed trailer opened its own `\n\n---\n` frame — drop the frame.
+ * Case 2: a truncated/failed trailer rode inside an existing cut-off frame with a
+ * single `\n` prefix — drop only the trailer line, keeping the cut-off frame.
+ */
+function stripAgentTrailerForDisplay(text: string): string {
+  const framed = text.replace(/\n\n---\n\[agent agent-[0-9a-f]{12}[^\]\n]*\]\s*$/, "");
+  if (framed !== text) return framed;
+  return text.replace(/\n\[agent agent-[0-9a-f]{12}[^\]\n]*\]\s*$/, "");
+}
+
+/** renderCall (t03): agent type + description/prompt-head at dispatch time. */
+function renderAgentCall(args: Record<string, unknown>, theme: unknown) {
+  const a = (args ?? {}) as Record<string, unknown>;
+  // SEC-2: subagent_type/description/prompt are model-supplied and reach the
+  // parent terminal — sanitize the DISPLAY strings (Pi does not sanitize
+  // component render output). agentType is additionally flattened to one line.
+  const agentType =
+    sanitizeProgressText(String(a.subagent_type ?? "").trim()).replace(/\s+/g, " ").trim() ||
+    "general-purpose";
+  const detail = sanitizeProgressText(
+    String(a.description ?? "").trim() || firstLine(String(a.prompt ?? ""), 100),
+  );
+  const background = a.run_in_background === true;
+  return {
+    render(width: number): string[] {
+      const title =
+        themedFg(theme, "toolTitle", themedBold(theme, `Agent(${agentType})`)) +
+        (background ? themedFg(theme, "muted", " [background]") : "");
+      const lines = [title];
+      if (detail) {
+        const wrapped: string[] = [];
+        pushWrapped(`  ${detail}`, width, wrapped);
+        for (const l of wrapped) lines.push(themedFg(theme, "muted", l));
+      }
+      return lines;
+    },
+  };
+}
+
+/**
+ * renderResult (t03, REQUIRED). Two modes:
+ *  - PARTIAL (streaming): the live rolling tail + current-activity line.
+ *  - FINAL: outcome badge (t01) + the verbatim message body + a metadata footer
+ *    (transcript path (t02), usage slot (t06), resumable hint). Every field is
+ *    optional and rendered only when present.
+ */
+function renderAgentResult(
+  result: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+  options: { expanded?: boolean; isPartial?: boolean },
+  theme: unknown,
+) {
+  const details = (result?.details ?? {}) as Record<string, unknown>;
+  const contentText = (result?.content ?? [])
+    .filter((c) => c && c.type === "text")
+    .map((c) => String(c.text ?? ""))
+    .join("\n");
+  const isPartial = options?.isPartial === true;
+  return {
+    render(width: number): string[] {
+      const lines: string[] = [];
+      if (isPartial) {
+        const snap = details.subagentProgress as ProgressSnapshot | undefined;
+        const agent = typeof details.agent === "string" ? details.agent : "subagent";
+        lines.push(
+          themedFg(theme, "toolTitle", themedBold(theme, `Agent(${agent})`)) +
+            themedFg(theme, "muted", " running…"),
+        );
+        if (snap) {
+          for (const raw of snap.tail) {
+            const wrapped: string[] = [];
+            pushWrapped(raw, width, wrapped);
+            for (const l of wrapped) lines.push(l);
+          }
+          if (snap.activity) lines.push(themedFg(theme, "accent", `… ${snap.activity}`));
+        } else {
+          // SEC-2: defensive fallback — the live partial path always carries a
+          // (sanitized) progress snapshot, but keep the sanitize invariant uniform
+          // so any future partial emitter can't leak control bytes to the terminal.
+          pushWrapped(sanitizeProgressText(contentText), width, lines);
+        }
+        return lines.length ? lines : [""];
+      }
+      // Final result.
+      if (details.background === true) {
+        lines.push(themedFg(theme, "accent", themedBold(theme, "Agent → background")));
+        // SEC-2: the start message embeds the model-supplied agent label — sanitize.
+        pushWrapped(sanitizeProgressText(contentText), width, lines);
+        return lines;
+      }
+      const outcome = typeof details.outcome === "string" ? details.outcome : undefined;
+      if (outcome) {
+        // UX-1: `aborted` is handled for forward-compat exhaustiveness. The live
+        // foreground path does NOT currently reach `aborted`/failed-no-output here
+        // (t01's foreground seam throws those before renderResult) — tracked as a
+        // t01-seam follow-up; the renderer stays ready for when the seam changes.
+        lines.push(outcomeBadgeLine(theme, outcome, details.cutOff === true, details.agent));
+      }
+      // SEC-2 + UX-2: the model reads result.content verbatim (with the t02
+      // agent-ID trailer); the HUMAN view strips that trailer (the footer carries
+      // the ID + a single resumable hint) and sanitizes control sequences. This
+      // builds a local display string only — result.content is never mutated.
+      const body = sanitizeProgressText(stripAgentTrailerForDisplay(contentText));
+      if (body) pushWrapped(body, width, lines);
+      const footer: string[] = [];
+      if (typeof details.transcriptPath === "string" && details.transcriptPath) {
+        footer.push(`transcript: ${details.transcriptPath}`);
+      }
+      const usage = formatUsageLine(details.usage);
+      if (usage) footer.push(`usage: ${usage}`);
+      if (details.resumable === true) {
+        // UX-2: the ID rides in the footer (not a duplicated raw trailer frame).
+        const id =
+          typeof details.agentId === "string" && isAgentId(details.agentId)
+            ? details.agentId
+            : undefined;
+        footer.push(id ? `resumable via SendMessage — agent ${id}` : "resumable via SendMessage");
+      }
+      for (const f of footer) lines.push(themedFg(theme, "muted", f));
+      return lines.length ? lines : [""];
+    },
+  };
+}
+
 /** The `Agent` dispatch tool definition (Claude-compatible; also registered as `Task`). */
 export function createAgentToolDefinition(
   runtime: SubagentRuntime,
@@ -1074,10 +1340,42 @@ export function createAgentToolDefinition(
             "Run the dispatch in the background; returns a task id immediately — retrieve the result with TaskOutput",
         }),
       ),
-      description: Type.Optional(Type.String({ description: "Short task label (ignored)" })),
+      description: Type.Optional(
+        Type.String({
+          description:
+            "Short (3-5 word) human-readable task label, shown in the UI while the subagent runs (e.g. \"Review auth changes\")",
+        }),
+      ),
     }),
-    async execute(_toolCallId: string, params: Record<string, unknown>, signal?: AbortSignal) {
+    // Dispatch-time display (t03): show WHICH agent and WHAT it was asked, at
+    // call time — replacing Pi's bare bold "Agent" fallback. Cheap and
+    // model-independent. Returns a structural pi-tui Component ({ render });
+    // guarded so it can never throw into the render loop.
+    renderCall(args: Record<string, unknown>, theme: unknown) {
+      return renderAgentCall(args, theme);
+    },
+    // Result display (t03, REQUIRED): Pi's fallback renders only result text, so
+    // without this the outcome badge, agent ID, transcript path (t02), and usage
+    // (t06) would be invisible. Also renders the live rolling tail for partial
+    // (streaming) results. Renders defensively when optional fields are absent.
+    renderResult(
+      result: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+      options: { expanded?: boolean; isPartial?: boolean },
+      theme: unknown,
+    ) {
+      return renderAgentResult(result, options, theme);
+    },
+    async execute(
+      _toolCallId: string,
+      params: Record<string, unknown>,
+      signal?: AbortSignal,
+      onUpdate?: (update: {
+        content: Array<{ type: string; text: string }>;
+        details?: Record<string, unknown>;
+      }) => void,
+    ) {
       const subagentType = String(params.subagent_type ?? "");
+      const label = subagentType.trim() || "general-purpose";
       const dispatchOpts = {
         subagentType,
         prompt: String(params.prompt ?? ""),
@@ -1090,17 +1388,31 @@ export function createAgentToolDefinition(
         // takes its concurrency slot and fires SubagentStart/Stop hooks; the
         // registry owns its settlement (never an unhandled rejection).
         const controller = new AbortController();
-        const label = subagentType.trim() || "general-purpose";
         // Pre-minted agent ID (t02): the start message is the background
         // channel's guaranteed model-visible ID delivery, so it must exist
         // BEFORE the un-awaited dispatch settles.
         const agentId = mintAgentId();
-        const id = opts.backgroundTasks.start(
+        const registry = opts.backgroundTasks;
+        // Live progress → task record (t03): the same condensed activity that
+        // drives the foreground UI updates a lightweight last-activity field so
+        // TaskOutput shows the background subagent is alive. `taskId` is assigned
+        // synchronously by start() below, long before any event fires.
+        let taskId: string | undefined;
+        const onProgress = (snapshot: ProgressSnapshot) => {
+          if (taskId) registry.noteActivity(taskId, progressActivityLine(snapshot));
+        };
+        const id = registry.start(
           `agent:${label}`,
-          runtime.dispatch({ ...dispatchOpts, agentId, abortSignal: controller.signal }),
+          runtime.dispatch({
+            ...dispatchOpts,
+            agentId,
+            abortSignal: controller.signal,
+            onProgress,
+          }),
           () => controller.abort(),
           agentId,
         );
+        taskId = id;
         // One-shot builtins (Explore/Plan) are non-resumable — advertising an
         // agent id in the start message would falsely invite a SendMessage
         // follow-up (t04 would refuse it). Resumable/non-builtin dispatches keep
@@ -1119,7 +1431,23 @@ export function createAgentToolDefinition(
         };
       }
       // Foreground: Pi's per-call signal (parent Esc) aborts the dispatch.
-      const result = await runtime.dispatch({ ...dispatchOpts, abortSignal: signal });
+      // Live progress (t03): stream the child's condensed, sanitized activity
+      // through Pi's onUpdate partial-result channel (works in interactive AND
+      // print/RPC modes — no ctx.ui dependency). Display-only: this text never
+      // enters `finalMessage` (the returned content below is authoritative).
+      const onProgress = onUpdate
+        ? (snapshot: ProgressSnapshot) => {
+            onUpdate({
+              content: [{ type: "text", text: renderProgressText(snapshot) }],
+              details: { subagentProgress: snapshot, agent: label, live: true },
+            });
+          }
+        : undefined;
+      const result = await runtime.dispatch({
+        ...dispatchOpts,
+        abortSignal: signal,
+        onProgress,
+      });
       // Structured copy of the identity fields for every content-returning path
       // (details is logs/UI-only — the model never sees it, hence the trailer).
       const identityDetails = {
@@ -1195,6 +1523,9 @@ export function createAgentToolDefinition(
           worktreePath: result.worktreePath,
           diagnostics: result.diagnostics,
           outcome: result.outcome,
+          // UX-3: a turn-capped SUCCESS is truncated — surface it so the badge
+          // renders `completed (truncated)` instead of a clean `● completed`.
+          cutOff: result.truncated === true,
           ...identityDetails,
           ...(params.run_in_background
             ? {

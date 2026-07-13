@@ -57,6 +57,13 @@ export interface BackgroundTaskRecord {
   resumable?: boolean;
   /** True when `result` was truncated and already carries a cut-off frame (t02). */
   truncated?: boolean;
+  /**
+   * Last observed live activity of the running dispatch (t03): a short,
+   * sanitized one-liner (current tool / retry wait) fed by the dispatch's
+   * progress callback so TaskOutput can show the background subagent is alive.
+   * Display-only; never part of `result`.
+   */
+  lastActivity?: string;
   diagnostics: Diagnostic[];
   /** Settles when the underlying dispatch ends (never rejects). */
   settled: Promise<void>;
@@ -132,6 +139,16 @@ export class BackgroundTaskRegistry {
     );
     this.tasks.set(id, record);
     return id;
+  }
+
+  /**
+   * Record the latest live activity of a RUNNING task (t03). Best-effort and
+   * lightweight: ignored for unknown ids and settled tasks (a settled task's
+   * status/result is authoritative). Never affects settlement or the result.
+   */
+  noteActivity(id: string, activity: string): void {
+    const task = this.tasks.get(id);
+    if (task && task.status === "running" && activity) task.lastActivity = activity;
   }
 
   get(id: string): BackgroundTaskRecord | undefined {
@@ -242,7 +259,12 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
           text = `Background task ${id} (${task.label}) was stopped; its result was discarded.`;
           break;
         default:
-          text = `Background task ${id} (${task.label}) is still running. Call TaskOutput again (wait defaults to true) to await its result.`;
+          // Liveness (t03): surface the last observed activity so a polled
+          // (wait: false) running task doesn't look inert.
+          text =
+            `Background task ${id} (${task.label}) is still running` +
+            (task.lastActivity ? ` — ${task.lastActivity}` : "") +
+            ". Call TaskOutput again (wait defaults to true) to await its result.";
           break;
       }
       return {
@@ -254,6 +276,7 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
           agentId: task.agentId,
           transcriptPath: task.transcriptPath,
           resumable: task.resumable,
+          lastActivity: task.lastActivity,
           diagnostics: task.diagnostics,
         },
       };

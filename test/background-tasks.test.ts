@@ -205,6 +205,58 @@ describe("Agent tool run_in_background (audit E4)", () => {
     await registry.wait(String(started.details.taskId));
   });
 
+  it("noteActivity surfaces live activity in the running TaskOutput text (t03)", async () => {
+    const registry = new BackgroundTaskRegistry();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const id = registry.start(
+      "agent:a",
+      (async () => {
+        await gate;
+        return result();
+      })(),
+    );
+    registry.noteActivity(id, "running Grep…");
+    const taskOutput = createTaskOutputTool(registry) as unknown as ToolLike;
+    const polled = await taskOutput.execute("t", { task_id: id, wait: false });
+    expect(polled.content[0]!.text).toContain("running Grep…");
+    expect(polled.details.lastActivity).toBe("running Grep…");
+    // Ignored once the task has settled (status/result stay authoritative).
+    release();
+    await registry.wait(id);
+    registry.noteActivity(id, "too late");
+    expect(registry.get(id)?.lastActivity).toBe("running Grep…");
+  });
+
+  it("a live background dispatch records its condensed activity on the record (t03)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const { sdk } = fakeSdk({
+      replies: [
+        {
+          text: "bg-final",
+          gate,
+          events: [{ type: "tool_execution_start", toolName: "Grep", args: { pattern: "x" } }],
+        },
+      ],
+    });
+    const registry = new BackgroundTaskRegistry();
+    const runtime = makeRuntime([makeAgent()], sdk);
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: registry,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t1", {
+      subagent_type: "worker",
+      prompt: "go",
+      run_in_background: true,
+    });
+    const taskId = String(started.details.taskId);
+    release();
+    await registry.wait(taskId);
+    expect(registry.get(taskId)?.lastActivity).toContain("Grep");
+  });
+
   it("TaskOutput on an unknown id errors helpfully, listing known ids", async () => {
     const registry = new BackgroundTaskRegistry();
     registry.start("agent:a", Promise.resolve(result({ finalMessage: "x" })));

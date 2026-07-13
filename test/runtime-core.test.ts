@@ -18,6 +18,8 @@ import {
 } from "../src/runtime/context-assembly.js";
 import { mapEffort, steeringForModel, type PiCCConfig } from "../src/runtime/steering.js";
 import { createAgentToolDefinition, extractText, type SubagentRuntime } from "../src/runtime/subagents.js";
+import type { ProgressSnapshot } from "../src/runtime/subagent-progress.js";
+import { agentTrailerFrame } from "../src/util/subagent-transcripts.js";
 import {
   fakeSdk,
   makeAgent,
@@ -897,5 +899,360 @@ describe("SubagentRuntime (fake SDK)", () => {
     const { runtime } = makeRuntime([makeAgent()], ["ok"], { makeScopedHookRunner });
     await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
     expect(calls).toBe(0);
+  });
+});
+
+describe("Subagent live progress (t03)", () => {
+  const streamReply = {
+    text: "done",
+    events: [
+      { type: "turn_start", turnIndex: 0 },
+      { type: "tool_execution_start", toolName: "Grep", args: { pattern: "foo" } },
+      { type: "tool_execution_end", toolName: "Grep", result: "match", isError: false },
+      {
+        type: "turn_end",
+        message: { role: "assistant", content: [{ type: "text", text: "final line" }] },
+      },
+    ],
+  };
+
+  it("dispatch streams condensed progress when the session supports subscribe", async () => {
+    const { sdk } = fakeSdk({ replies: [streamReply] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    const snapshots: ProgressSnapshot[] = [];
+    const result = await runtime.dispatch({
+      subagentType: "reviewer",
+      prompt: "p",
+      depth: 1,
+      onProgress: (s) => snapshots.push(s),
+    });
+    expect(result.ok).toBe(true);
+    // Progress is display-only: the verbatim final message is untouched.
+    expect(result.finalMessage).toBe("done");
+    expect(snapshots.length).toBeGreaterThan(0);
+    expect(snapshots.some((s) => s.activity === "running Grep…")).toBe(true);
+    expect(snapshots.some((s) => s.tail.some((l) => l.includes("Grep")))).toBe(true);
+  });
+
+  it("dispatch works unchanged when the session lacks subscribe", async () => {
+    const { sdk } = fakeSdk({ replies: ["ok"], noSubscribe: true });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    const snapshots: ProgressSnapshot[] = [];
+    const result = await runtime.dispatch({
+      subagentType: "reviewer",
+      prompt: "p",
+      depth: 1,
+      onProgress: (s) => snapshots.push(s),
+    });
+    expect(result.ok).toBe(true);
+    expect(result.finalMessage).toBe("ok");
+    expect(snapshots.length).toBe(0);
+  });
+
+  it("Agent tool forwards live progress through onUpdate with the expected shape", async () => {
+    const { sdk } = fakeSdk({
+      replies: [
+        {
+          text: "ok",
+          events: [{ type: "tool_execution_start", toolName: "Read", args: { file_path: "a.ts" } }],
+        },
+      ],
+    });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    const tool = createAgentToolDefinition(runtime, { depth: 0 }) as {
+      execute: (
+        id: string,
+        params: Record<string, unknown>,
+        signal: AbortSignal | undefined,
+        onUpdate: (u: {
+          content: Array<{ type: string; text: string }>;
+          details?: Record<string, unknown>;
+        }) => void,
+      ) => Promise<{ content: Array<{ text: string }> }>;
+    };
+    const updates: Array<{
+      content: Array<{ type: string; text: string }>;
+      details?: Record<string, unknown>;
+    }> = [];
+    const res = await tool.execute(
+      "t1",
+      { subagent_type: "reviewer", prompt: "go" },
+      undefined,
+      (u) => updates.push(u),
+    );
+    expect(res.content[0]?.text).toBe("ok"); // verbatim, unaffected by progress
+    expect(updates.length).toBeGreaterThan(0);
+    const last = updates[updates.length - 1]!;
+    expect(last.content[0]?.type).toBe("text");
+    expect(typeof last.content[0]?.text).toBe("string");
+    expect((last.details?.subagentProgress as ProgressSnapshot | undefined)?.activity).toContain(
+      "Read",
+    );
+    expect(last.details?.live).toBe(true);
+  });
+
+  it("renderCall shows the agent type and description / prompt head", () => {
+    const { sdk } = fakeSdk({ replies: ["x"] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    const tool = createAgentToolDefinition(runtime, { depth: 0 }) as {
+      renderCall: (
+        args: Record<string, unknown>,
+        theme: unknown,
+      ) => { render: (w: number) => string[] };
+    };
+    const withDesc = tool
+      .renderCall({ subagent_type: "reviewer", description: "Review auth" }, undefined)
+      .render(80)
+      .join("\n");
+    expect(withDesc).toContain("Agent(reviewer)");
+    expect(withDesc).toContain("Review auth");
+
+    const withPrompt = tool
+      .renderCall({ subagent_type: "reviewer", prompt: "Do the thing please" }, undefined)
+      .render(80)
+      .join("\n");
+    expect(withPrompt).toContain("Do the thing");
+
+    const empty = tool.renderCall({}, undefined).render(80).join("\n");
+    expect(empty).toContain("Agent(general-purpose)");
+  });
+
+  it("renderResult renders outcome, transcript, usage slot, and degrades on missing fields", () => {
+    const { sdk } = fakeSdk({ replies: ["x"] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    const tool = createAgentToolDefinition(runtime, { depth: 0 }) as {
+      renderResult: (
+        r: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+        o: { isPartial?: boolean; expanded?: boolean },
+        theme: unknown,
+      ) => { render: (w: number) => string[] };
+    };
+    const render = (
+      r: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+      isPartial = false,
+    ) => tool.renderResult(r, { isPartial }, undefined).render(120).join("\n");
+
+    // Final, completed + resumable + transcript, no usage yet (t06).
+    const completed = render({
+      content: [{ type: "text", text: "the answer" }],
+      details: {
+        outcome: "completed",
+        agent: "reviewer",
+        transcriptPath: "/x/agent-abc.jsonl",
+        resumable: true,
+      },
+    });
+    expect(completed).toContain("completed");
+    expect(completed).toContain("the answer");
+    expect(completed).toContain("/x/agent-abc.jsonl");
+    expect(completed).toContain("resumable");
+    expect(completed).not.toContain("usage:");
+
+    // Usage slot renders defensively when t06's field is present.
+    const withUsage = render({
+      content: [{ type: "text", text: "x" }],
+      details: { outcome: "completed", usage: { totalTokens: 1200, costUsd: 0.03 } },
+    });
+    expect(withUsage).toContain("usage:");
+    expect(withUsage).toContain("1200 tokens");
+
+    // Failed-with-partial shows a failed badge and preserves the partial body.
+    const failed = render({
+      content: [{ type: "text", text: "partial work" }],
+      details: { outcome: "failed", cutOff: true, agent: "reviewer" },
+    });
+    expect(failed).toContain("failed");
+    expect(failed).toContain("partial work");
+
+    // Partial/streaming shows the live tail + activity.
+    const partial = render(
+      {
+        content: [],
+        details: {
+          subagentProgress: { tail: ["> Grep"], activity: "running Grep…" },
+          agent: "reviewer",
+          live: true,
+        },
+      },
+      true,
+    );
+    expect(partial).toContain("running Grep…");
+    expect(partial).toContain("Grep");
+
+    // Empty details: never throws, falls back to the content text.
+    const bare = render({ content: [{ type: "text", text: "hi" }], details: {} });
+    expect(bare).toContain("hi");
+  });
+
+  const ESC = String.fromCharCode(27);
+  const BEL = String.fromCharCode(7);
+
+  const renderTool = () => {
+    const { sdk } = fakeSdk({ replies: ["x"] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    return createAgentToolDefinition(runtime, { depth: 0 }) as {
+      renderCall: (args: Record<string, unknown>, theme: unknown) => { render: (w: number) => string[] };
+      renderResult: (
+        r: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+        o: { isPartial?: boolean; expanded?: boolean },
+        theme: unknown,
+      ) => { render: (w: number) => string[] };
+    };
+  };
+
+  it("sanitizes model-supplied text in renderCall and renderResult display (SEC-2)", () => {
+    const tool = renderTool();
+    const call = tool
+      .renderCall(
+        { subagent_type: `${ESC}[31mreviewer${ESC}[0m`, description: `${ESC}]0;pwned${BEL}Review auth` },
+        undefined,
+      )
+      .render(80)
+      .join("\n");
+    expect(call.includes(ESC)).toBe(false);
+    expect(call.includes(BEL)).toBe(false);
+    expect(call).toContain("reviewer");
+    expect(call).toContain("Review auth");
+
+    const result = tool
+      .renderResult(
+        {
+          content: [{ type: "text", text: `${ESC}[2Jclean body${BEL}` }],
+          details: { outcome: "completed", agent: "reviewer" },
+        },
+        { isPartial: false },
+        undefined,
+      )
+      .render(120)
+      .join("\n");
+    expect(result.includes(ESC)).toBe(false);
+    expect(result.includes(BEL)).toBe(false);
+    expect(result).toContain("clean body");
+  });
+
+  it("strips the t02 trailer frame from the human view, one resumable hint with the id (UX-2)", () => {
+    const tool = renderTool();
+    const agentId = "agent-0123456789ab";
+    const rendered = tool
+      .renderResult(
+        {
+          content: [
+            { type: "text", text: `the answer${agentTrailerFrame(agentId, { completed: true })}` },
+          ],
+          details: {
+            outcome: "completed",
+            agent: "reviewer",
+            resumable: true,
+            agentId,
+            transcriptPath: "/x/agent.jsonl",
+          },
+        },
+        { isPartial: false },
+        undefined,
+      )
+      .render(120)
+      .join("\n");
+    expect(rendered).toContain("the answer");
+    // The raw model-plumbing frame is gone from the human view.
+    expect(rendered).not.toContain("---");
+    expect(rendered).not.toMatch(/\[agent /);
+    // "resumable via SendMessage" appears exactly once and carries the id.
+    expect(rendered.match(/resumable via SendMessage/g)?.length).toBe(1);
+    expect(rendered).toContain(agentId);
+  });
+
+  it("renders the (truncated) badge for a turn-capped (length-stop) success (UX-3)", async () => {
+    const { sdk } = fakeSdk({ replies: [{ text: "partial answer", stopReason: "length" }] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    const tool = createAgentToolDefinition(runtime, { depth: 0 }) as {
+      execute: (
+        id: string,
+        params: Record<string, unknown>,
+        signal: AbortSignal | undefined,
+      ) => Promise<{
+        content: Array<{ type: string; text: string }>;
+        details?: Record<string, unknown>;
+      }>;
+      renderResult: (
+        r: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+        o: { isPartial?: boolean },
+        theme: unknown,
+      ) => { render: (w: number) => string[] };
+    };
+    const res = await tool.execute("t", { subagent_type: "reviewer", prompt: "go" }, undefined);
+    // UX-3 wiring: the truncated success marks cutOff so the badge can differ.
+    expect(res.details?.cutOff).toBe(true);
+    const rendered = tool.renderResult(res, { isPartial: false }, undefined).render(120).join("\n");
+    expect(rendered).toContain("completed (truncated)");
+  });
+
+  it("renders the ■ aborted badge when details.outcome is aborted (UX-1)", () => {
+    const tool = renderTool();
+    const rendered = tool
+      .renderResult(
+        { content: [{ type: "text", text: "" }], details: { outcome: "aborted", agent: "reviewer" } },
+        { isPartial: false },
+        undefined,
+      )
+      .render(120)
+      .join("\n");
+    expect(rendered).toContain("■");
+    expect(rendered).toContain("aborted");
+  });
+
+  it("renderCall flags background and renderResult shows the background header (FIX-B)", () => {
+    const tool = renderTool();
+    const call = tool
+      .renderCall({ subagent_type: "reviewer", run_in_background: true }, undefined)
+      .render(80)
+      .join("\n");
+    expect(call).toContain("[background]");
+    const result = tool
+      .renderResult(
+        {
+          content: [{ type: "text", text: "Background task task-1 started" }],
+          details: { background: true, agent: "reviewer" },
+        },
+        { isPartial: false },
+        undefined,
+      )
+      .render(120)
+      .join("\n");
+    expect(result).toContain("Agent → background");
+    expect(result).toContain("Background task task-1 started");
+  });
+
+  it("unsubscribes from the session event stream after dispatch settles (FIX-B)", async () => {
+    // Success path: finally runs on the normal return.
+    const ok = fakeSdk({
+      replies: [
+        { text: "done", events: [{ type: "tool_execution_start", toolName: "Grep", args: {} }] },
+      ],
+    });
+    const okRuntime = makeSubagentRuntime([makeAgent()], ok.sdk);
+    const okResult = await okRuntime.dispatch({
+      subagentType: "reviewer",
+      prompt: "p",
+      depth: 1,
+      onProgress: () => {},
+    });
+    expect(okResult.ok).toBe(true);
+    expect(ok.sessions[0]!.listenerCount()).toBe(0);
+
+    // Throwing path: prompt() throws → dispatch catch-all → finally still unsubscribes.
+    const boom = fakeSdk({
+      onPrompt: () => {
+        throw new Error("boom");
+      },
+    });
+    const boomRuntime = makeSubagentRuntime([makeAgent()], boom.sdk);
+    const boomResult = await boomRuntime.dispatch({
+      subagentType: "reviewer",
+      prompt: "p",
+      depth: 1,
+      onProgress: () => {},
+    });
+    expect(boomResult.ok).toBe(false);
+    expect(boom.sessions[0]!.listenerCount()).toBe(0);
   });
 });
