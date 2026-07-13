@@ -43,6 +43,7 @@ import { mapEffort, steeringForModel, type PiCCConfig } from "../src/runtime/ste
 import { createAgentToolDefinition, extractText, type SubagentRuntime } from "../src/runtime/subagents.js";
 import { visibleWidth as tuiVisibleWidth } from "@earendil-works/pi-tui";
 import type { ProgressSnapshot } from "../src/runtime/subagent-progress.js";
+import { renderAgentResult } from "../src/runtime/subagent-render.js";
 import { agentTrailerFrame } from "../src/util/subagent-transcripts.js";
 import {
   fakeSdk,
@@ -1410,6 +1411,351 @@ describe("Subagent live progress (t03)", () => {
     });
     expect(boomResult.ok).toBe(false);
     expect(boom.sessions[0]!.listenerCount()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TaskOutput background-identity render (F04 t03) — the taskId-gated additions
+// to the SHARED renderAgentResult: identity header + agent-<id> subline at every
+// surface, badge chips on all outcomes, poll frame, start-block, placeholders,
+// and the width-clamp/sanitize guarantees. Pure renderer unit tests.
+// ---------------------------------------------------------------------------
+
+describe("TaskOutput identity render (F04 t03)", () => {
+  const ESC = String.fromCharCode(27);
+  const BEL = String.fromCharCode(7);
+  const render = (
+    details: Record<string, unknown>,
+    text = "",
+    isPartial = false,
+    width = 120,
+    theme: unknown = undefined,
+  ) =>
+    renderAgentResult(
+      { content: [{ type: "text", text }], details },
+      { isPartial },
+      theme,
+    )
+      .render(width)
+      .join("\n");
+
+  it("completed / failed / aborted badges each carry the Task chip + agent-<id> subline", () => {
+    const agentId = "agent-aabbccddeeff";
+    const completed = render({
+      taskId: "task-3",
+      status: "completed",
+      outcome: "completed",
+      agent: "coder",
+      agentId,
+      transcriptPath: "/x/agent-aabbccddeeff.jsonl",
+      resumable: true,
+      usage: { inputTokens: 10, outputTokens: 5, costUsd: 0.01 },
+    }, "the answer");
+    expect(completed).toContain("Task(task-3)");
+    expect(completed).toContain("Agent(coder)");
+    expect(completed).toContain("completed");
+    expect(completed).toContain(agentId); // identity subline
+    expect(completed).toContain("the answer");
+    expect(completed).toContain("usage:");
+    expect(completed).toContain("resumable via SendMessage");
+
+    const failed = render({
+      taskId: "task-4",
+      status: "failed",
+      outcome: "failed",
+      agent: "coder",
+      agentId,
+    }, "partial");
+    expect(failed).toContain("Task(task-4)");
+    expect(failed).toMatch(/✗|failed/);
+    expect(failed).toContain(agentId);
+
+    const aborted = render({
+      taskId: "task-5",
+      status: "stopped",
+      outcome: "aborted",
+      agent: "coder",
+      agentId,
+    });
+    expect(aborted).toContain("Task(task-5)");
+    expect(aborted).toContain("aborted");
+    expect(aborted).toContain(agentId);
+  });
+
+  it("a non-resumable builtin still shows agent-<id> as identity WITHOUT the SendMessage invite", () => {
+    const agentId = "agent-001122334455";
+    const out = render({
+      taskId: "task-7",
+      status: "completed",
+      outcome: "completed",
+      agent: "Explore",
+      agentId,
+      resumable: false,
+    }, "scouted");
+    expect(out).toContain(agentId); // identity present…
+    expect(out).not.toContain("resumable via SendMessage"); // …but no false invite
+  });
+
+  it("the background start block is self-identifying: task-N + agent type + agent-<id>", () => {
+    const out = render({
+      background: true,
+      taskId: "task-2",
+      agent: "reviewer",
+      agentId: "agent-0123456789ab",
+    }, "Background task task-2 started");
+    expect(out).toContain("Agent(reviewer) → background as task-2");
+    expect(out).toContain("agent-0123456789ab");
+    expect(out).toContain('TaskOutput(task_id "task-2")');
+  });
+
+  it("a live partial with an absent/empty snapshot renders the … starting… placeholder (not a bare header)", () => {
+    const bare = render(
+      { taskId: "task-8", agent: "coder", agentId: "agent-aabbccddeeff", live: true },
+      "",
+      true,
+    );
+    expect(bare).toContain("Task(task-8)");
+    expect(bare).toContain("… starting…");
+
+    const emptySnap = render(
+      {
+        taskId: "task-8",
+        agent: "coder",
+        agentId: "agent-aabbccddeeff",
+        subagentProgress: { tail: [], activity: "" },
+        live: true,
+      },
+      "",
+      true,
+    );
+    expect(emptySnap).toContain("… starting…");
+  });
+
+  it("a live partial with a snapshot is self-identifying (task id + type + agent-<id> + tail + activity)", () => {
+    const out = render(
+      {
+        taskId: "task-1",
+        agent: "coder",
+        agentId: "agent-aabbccddeeff",
+        subagentProgress: { tail: ["> Grep (x)"], activity: "running Grep…" },
+        live: true,
+      },
+      "> Grep (x)\n… running Grep…",
+      true,
+    );
+    expect(out).toContain("Task(task-1)");
+    expect(out).toContain("Agent(coder)");
+    expect(out).toContain("agent-aabbccddeeff");
+    expect(out).toContain("> Grep (x)");
+    expect(out).toContain("running Grep…");
+  });
+
+  it("a wait:false poll renders the identity frame + last activity (not a bare chip); … starting… when idle", () => {
+    const active = render({
+      taskId: "task-6",
+      status: "running",
+      agent: "coder",
+      agentId: "agent-aabbccddeeff",
+      lastActivity: "running Grep…",
+    }, "Background task task-6 (coder) is still running — running Grep…");
+    expect(active).toContain("Task(task-6)");
+    expect(active).toContain("Agent(coder)");
+    expect(active).toContain("agent-aabbccddeeff");
+    expect(active).toContain("running Grep…");
+
+    const idle = render({
+      taskId: "task-6",
+      status: "running",
+      agent: "coder",
+      agentId: "agent-aabbccddeeff",
+    });
+    expect(idle).toContain("Task(task-6)");
+    expect(idle).toContain("… starting…");
+  });
+
+  it("two same-type concurrent tasks render DISTINCT Task(task-N) + agent-<id> frames", () => {
+    const a = render({
+      taskId: "task-1",
+      status: "running",
+      agent: "coder",
+      agentId: "agent-aaaa1111bbbb",
+      lastActivity: "running Grep…",
+    });
+    const b = render({
+      taskId: "task-2",
+      status: "running",
+      agent: "coder",
+      agentId: "agent-cccc2222dddd",
+      lastActivity: "running Read…",
+    });
+    expect(a).toContain("Task(task-1)");
+    expect(a).toContain("agent-aaaa1111bbbb");
+    expect(b).toContain("Task(task-2)");
+    expect(b).toContain("agent-cccc2222dddd");
+    expect(a).not.toContain("task-2");
+    expect(b).not.toContain("task-1");
+  });
+
+  it("width + sanitize: partial, poll, and final gated lines never overflow, and agent-<id> survives at usable widths", () => {
+    const theme = {
+      fg: (_c: string, s: string) => `${ESC}[31m${s}${ESC}[0m`,
+      bold: (s: string) => `${ESC}[1m${s}${ESC}[22m`,
+    };
+    const noOverflow = (lines: string[], width: number) => {
+      for (const l of lines) expect(tuiVisibleWidth(l)).toBeLessThanOrEqual(width);
+    };
+    const cjk = "字".repeat(60); // 120 columns
+    const tabs = "\t".repeat(60); // 180 columns
+    const emoji = "\u{1F600}".repeat(40); // 80 columns
+    // A control-byte-laden agent type / activity — sanitized in the renderer.
+    const evilType = `${ESC}[31mco${BEL}der${ESC}]0;pwned${BEL}`;
+    const agentId = "agent-3b7caeaf8448";
+
+    for (const width of [1, 2, 3, 20, 40, 138]) {
+      const partial = renderAgentResult(
+        {
+          content: [],
+          details: {
+            taskId: "task-9",
+            agent: evilType,
+            agentId,
+            subagentProgress: { tail: [cjk, emoji, "line"], activity: `${cjk} ${tabs}` },
+            live: true,
+          },
+        },
+        { isPartial: true },
+        theme,
+      ).render(width);
+      noOverflow(partial, width);
+
+      const poll = renderAgentResult(
+        {
+          content: [],
+          details: {
+            taskId: "task-9",
+            status: "running",
+            agent: evilType,
+            agentId,
+            lastActivity: `${cjk} ${tabs}`,
+          },
+        },
+        { isPartial: false },
+        theme,
+      ).render(width);
+      noOverflow(poll, width);
+
+      const final = renderAgentResult(
+        {
+          content: [{ type: "text", text: `${cjk}\n${tabs}body` }],
+          details: {
+            taskId: "task-9",
+            status: "completed",
+            outcome: "completed",
+            agent: evilType,
+            agentId,
+            transcriptPath: "/x/agent-3b7caeaf8448.jsonl",
+            // Non-resumable: the standalone agent-<id> subline is present (a
+            // resumable result suppresses it in favour of the footer's "— agent
+            // <id>"), so the id lives on its OWN line and survives the clamp.
+            resumable: false,
+            usage: { inputTokens: 1, costUsd: 0.01 },
+          },
+        },
+        { isPartial: false },
+        theme,
+      ).render(width);
+      noOverflow(final, width);
+
+      // The agent-<id> is on its own line (identity subline / poll subline), so at
+      // any width wide enough to hold it (>= its 18 columns) it is never the
+      // truncated element.
+      if (width >= 20) {
+        expect(final.join("\n")).toContain(agentId);
+        expect(poll.join("\n")).toContain(agentId);
+      }
+    }
+
+    // No control bytes reach the terminal via the identity header (sanitized type).
+    const settled = renderAgentResult(
+      {
+        content: [{ type: "text", text: "done" }],
+        details: { taskId: "task-9", status: "completed", outcome: "completed", agent: evilType, agentId },
+      },
+      { isPartial: false },
+      undefined,
+    )
+      .render(120)
+      .join("\n");
+    expect(settled.includes(ESC)).toBe(false);
+    expect(settled.includes(BEL)).toBe(false);
+    expect(settled).toContain("coder");
+  });
+
+  it("FOREGROUND (no taskId): a completed body ending in a usage: line is KEPT — no background usage-strip (MUST-FIX 1)", () => {
+    // renderAgentResult is SHARED; the usage-line strip must be gated on taskId so
+    // a foreground agent whose final message legitimately ends in "usage: …" is
+    // never mutilated (details.usage IS set on foreground completed dispatches).
+    const out = renderAgentResult(
+      {
+        content: [{ type: "text", text: "Here is the result.\nusage: see the attached breakdown" }],
+        details: { outcome: "completed", agent: "reviewer", usage: { totalTokens: 5 } },
+      },
+      { isPartial: false },
+      undefined,
+    )
+      .render(120)
+      .join("\n");
+    expect(out).toContain("usage: see the attached breakdown"); // the body line survives
+    expect(out).toContain("Here is the result.");
+  });
+
+  it("settled resumable SUPPRESSES the standalone agent-<id> subline; non-resumable keeps it (SHOULD-FIX 4)", () => {
+    const agentId = "agent-aabbccddeeff";
+    const settled = (resumable: boolean) =>
+      renderAgentResult(
+        {
+          content: [{ type: "text", text: "done" }],
+          details: {
+            taskId: "task-1",
+            status: "completed",
+            outcome: "completed",
+            agent: "coder",
+            agentId,
+            resumable,
+          },
+        },
+        { isPartial: false },
+        undefined,
+      ).render(120);
+    // Resumable: the footer already prints "— agent <id>", so the standalone
+    // subline (a line that is EXACTLY the id) is suppressed — id shown once.
+    const res = settled(true);
+    expect(res.filter((l) => l.trim() === agentId)).toHaveLength(0);
+    expect(res.join("\n")).toContain(`resumable via SendMessage — agent ${agentId}`);
+    // Non-resumable: the standalone identity subline is its ONLY occurrence — kept.
+    const nonres = settled(false);
+    expect(nonres.filter((l) => l.trim() === agentId)).toHaveLength(1);
+    expect(nonres.join("\n")).not.toContain("resumable via SendMessage");
+  });
+
+  it("cross-platform: the transcript footer basename is derived for both \\\\ and / separators", () => {
+    const win = render({
+      taskId: "task-1",
+      status: "completed",
+      outcome: "completed",
+      agent: "coder",
+      transcriptPath:
+        "C:\\Users\\a\\.pi\\sessions\\x.subagents\\agent-3b7caeaf8448.jsonl",
+    }, "x", false, 40);
+    expect(win).toContain("agent-3b7caeaf8448.jsonl");
+    const posix = render({
+      taskId: "task-1",
+      status: "completed",
+      outcome: "completed",
+      agent: "coder",
+      transcriptPath: "/home/a/.pi/sessions/x.subagents/agent-3b7caeaf8448.jsonl",
+    }, "x", false, 40);
+    expect(posix).toContain("agent-3b7caeaf8448.jsonl");
   });
 });
 

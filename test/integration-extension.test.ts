@@ -232,6 +232,20 @@ describe("skill activation", () => {
         !String(notExpanded.text ?? "").includes("FS-SKILL-PATHS-BODY"),
     ).toBe(true);
   });
+
+  it("background dispatch + TaskOutput path is exercisable (F04): bg agent loads, /bg-research expands", async () => {
+    // The async-researcher background agent (background: true) reaches the routing catalog…
+    const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" })).systemPrompt as string;
+    expect(prompt).toMatch(/- async-researcher( \(read-only\))?: Researches a question in the background/);
+    // …and the /bg-research command that dispatches it in the background and retrieves
+    // it via TaskOutput expands into the user turn, carrying its canary.
+    const expanded = await pi.fire("input", { text: "/bg-research WASM ABI", source: "interactive" });
+    expect(expanded.action).toBe("transform");
+    expect(expanded.text).toContain("FS-BG-TASKOUTPUT");
+    expect(expanded.text).toContain("run_in_background");
+    expect(expanded.text).toContain("TaskOutput");
+    expect(expanded.text).toContain("WASM ABI"); // $ARGUMENTS substituted
+  });
 });
 
 describe("permission + hook enforcement (guard)", () => {

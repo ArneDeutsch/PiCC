@@ -518,6 +518,8 @@ describe("SendMessage resume — offline integration (real SessionManager) (t04)
     const record = await backgroundTasks.wait(taskId);
     expect(record?.status).toBe("completed");
     expect(record?.agentId).toBe(agentId);
+    // F04 t02: the resume start() site sets the clean agentType eagerly.
+    expect(record?.agentType).toBe("reviewer");
     expect(registry.get(agentId)!.state).toBe("settled");
 
     // FIX 8 (t06 × t04): the RESUMED run's usage is captured — on the background

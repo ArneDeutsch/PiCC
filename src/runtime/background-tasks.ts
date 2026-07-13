@@ -1,7 +1,14 @@
 import { Type } from "typebox";
 import type { Diagnostic } from "../types.js";
-import { agentTrailerFrame, agentTrailerLine } from "../util/subagent-transcripts.js";
-import { formatUsageCompact, sanitizeLine } from "./subagent-progress.js";
+import { agentTrailerFrame, agentTrailerLine, isAgentId } from "../util/subagent-transcripts.js";
+import {
+  formatUsageCompact,
+  progressActivityLine,
+  renderProgressText,
+  sanitizeLine,
+  type ProgressSnapshot,
+} from "./subagent-progress.js";
+import { renderAgentResult, renderTaskOutputCall } from "./subagent-render.js";
 
 /**
  * Background task runtime (audit E4): `run_in_background: true` on the Agent
@@ -99,6 +106,21 @@ export interface BackgroundTaskRecord {
    * Display-only; never part of `result`.
    */
   lastActivity?: string;
+  /**
+   * Latest full live progress snapshot (F04 t02): the sanitized rolling
+   * tail + current-activity line produced by SubagentProgressCondenser, fed via
+   * noteProgress so a waiting TaskOutput can render the running background
+   * subagent live (t03). Display-only; bounded by the condenser; never merged
+   * into `result`.
+   */
+  progress?: ProgressSnapshot;
+  /**
+   * The CLEAN dispatched agent type (F04 t02): e.g. `coder`, `Explore`, set
+   * eagerly at start() — before any progress event fires. Consumers use
+   * `agentType ?? agentName ?? "subagent"` with no `agent:`-prefix stripping
+   * (the `label` still carries the `agent:<type>` form for existing surfaces).
+   */
+  agentType?: string;
   diagnostics: Diagnostic[];
   /** Settles when the underlying dispatch ends (never rejects). */
   settled: Promise<void>;
@@ -117,6 +139,15 @@ export interface BackgroundTaskRecord {
 export class BackgroundTaskRegistry {
   private readonly tasks = new Map<string, BackgroundTaskRecord>();
   private counter = 0;
+  /**
+   * Live progress subscribers per task (F04 t02), fan-out via a Set. Emptied on
+   * EVERY settle path (fulfilled/rejected/stopped) by the shared `.finally`
+   * teardown attached in start(), so no listener can fire or leak after settle.
+   */
+  private readonly progressListeners = new Map<
+    string,
+    Set<(snapshot: ProgressSnapshot) => void>
+  >();
 
   /**
    * Register a running dispatch. The returned id ("task-1", ...) is what the
@@ -129,6 +160,7 @@ export class BackgroundTaskRegistry {
     promise: Promise<BackgroundResultLike>,
     abort?: () => void,
     agentId?: string,
+    agentType?: string,
   ): string {
     const id = `task-${++this.counter}`;
     const record: BackgroundTaskRecord = {
@@ -136,6 +168,9 @@ export class BackgroundTaskRegistry {
       label,
       status: "running",
       agentId,
+      // Clean agent type present from the moment the task starts (F04 t02), so
+      // it is available before the first progress event and at every surface.
+      agentType,
       diagnostics: [],
       settled: Promise.resolve(),
       abort,
@@ -183,18 +218,79 @@ export class BackgroundTaskRegistry {
         }
       },
     );
+    // Listener teardown on EVERY settle path (F04 t02): both handlers above
+    // swallow, so `settled` always fulfills — a single `.finally` empties the
+    // subscriber set for the fulfilled, rejected/throwing, AND stopped paths, so
+    // no held listener can fire or leak once the dispatch has ended.
+    record.settled = record.settled.finally(() => {
+      this.progressListeners.delete(id);
+    });
     this.tasks.set(id, record);
     return id;
   }
 
   /**
-   * Record the latest live activity of a RUNNING task (t03). Best-effort and
-   * lightweight: ignored for unknown ids and settled tasks (a settled task's
-   * status/result is authoritative). Never affects settlement or the result.
+   * Record the latest full live progress SNAPSHOT of a RUNNING task (F04 t02)
+   * and fan it out to subscribers. Stores the (already sanitized/bounded)
+   * snapshot on `record.progress`, derives the model-facing `lastActivity`/poll
+   * string via {@link progressActivityLine} (same string the old
+   * `noteActivity(progressActivityLine(...))` sink produced — semantics
+   * preserved), then notifies every subscriber. Ignored for unknown ids and
+   * settled tasks (mirrors the `noteActivity` post-settle no-op); a settled
+   * task's status/result stays authoritative. A throwing subscriber can neither
+   * break the fan-out nor the dispatch.
    */
-  noteActivity(id: string, activity: string): void {
+  noteProgress(id: string, snapshot: ProgressSnapshot): void {
     const task = this.tasks.get(id);
-    if (task && task.status === "running" && activity) task.lastActivity = activity;
+    if (!task || task.status !== "running") return;
+    task.progress = snapshot;
+    const activity = progressActivityLine(snapshot);
+    // Guard on non-empty to match the old noteActivity semantics exactly (never
+    // clobber a real last-activity with an empty derived line).
+    if (activity) task.lastActivity = activity;
+    const listeners = this.progressListeners.get(id);
+    if (!listeners) return;
+    for (const listener of [...listeners]) {
+      try {
+        listener(snapshot);
+      } catch {
+        // A hostile/buggy subscriber must not break fan-out or the dispatch.
+      }
+    }
+  }
+
+  /**
+   * Subscribe to a RUNNING task's live progress snapshots (F04 t02). Returns an
+   * unsubscribe function (idempotent). Multiple concurrent subscribers per task
+   * fan out via a Set. Subscribing to an unknown or ALREADY-SETTLED task is a
+   * no-op that returns a no-op unsubscribe (mirrors the post-settle
+   * `noteProgress` no-op), so a subscribe that races settlement can neither fire
+   * nor leak. The whole set is emptied on settle by start()'s `.finally`.
+   */
+  subscribeProgress(id: string, listener: (snapshot: ProgressSnapshot) => void): () => void {
+    const task = this.tasks.get(id);
+    if (!task || task.status !== "running") return () => {};
+    let set = this.progressListeners.get(id);
+    if (!set) {
+      set = new Set();
+      this.progressListeners.set(id, set);
+    }
+    set.add(listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.progressListeners.get(id)?.delete(listener);
+    };
+  }
+
+  /**
+   * Test/diagnostic hook (F04 t02 leak guard): the number of live progress
+   * subscribers held for a task — 0 for an unknown, never-subscribed, or settled
+   * task (whose set is cleared on settle). Deterministic; no timers.
+   */
+  subscriberCount(id: string): number {
+    return this.progressListeners.get(id)?.size ?? 0;
   }
 
   /**
@@ -471,6 +567,12 @@ function unknownIdError(registry: BackgroundTaskRegistry, id: string): Error {
   );
 }
 
+/** The onUpdate payload shape Pi re-renders on each streaming partial. */
+type ToolUpdate = {
+  content: Array<{ type: string; text: string }>;
+  details?: Record<string, unknown>;
+};
+
 /** The `TaskOutput` tool: retrieve a background task's result (waits by default). */
 export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<string, unknown> {
   return {
@@ -484,18 +586,94 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
         Type.Boolean({ description: "Wait for completion (default true)" }),
       ),
     }),
-    async execute(_toolCallId: string, params: { task_id: string; wait?: boolean }) {
+    // Dispatch-time display (F04 t03): a self-identifying `TaskOutput(task-N) ·
+    // Agent(<type>)` line. Looks the agent type up from the registry so the chip
+    // is legible before the (possibly still running) result renders.
+    renderCall(args: Record<string, unknown>, theme: unknown) {
+      const rec = registry.get(String((args ?? {}).task_id ?? "").trim());
+      return renderTaskOutputCall(args, rec?.agentType ?? rec?.agentName, theme);
+    },
+    // Result display (F04 t03): delegate to the SHARED subagent renderer so the
+    // live tail, outcome badge, identity subline, transcript + usage footer all
+    // render exactly like a foreground dispatch (no forked renderer). The taskId
+    // in `details` gates the background-identity additions.
+    renderResult(
+      result: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+      options: { expanded?: boolean; isPartial?: boolean },
+      theme: unknown,
+    ) {
+      return renderAgentResult(result, options, theme);
+    },
+    async execute(
+      _toolCallId: string,
+      params: { task_id: string; wait?: boolean },
+      signal?: AbortSignal,
+      onUpdate?: (update: ToolUpdate) => void,
+    ) {
       const id = String(params.task_id ?? "").trim();
       const task = registry.get(id);
       if (!task) throw unknownIdError(registry, id);
+      // The clean dispatched agent type is the identity shown at every surface
+      // (t02 sets agentType eagerly at start; no `agent:`-prefix stripping).
+      const agent = task.agentType ?? task.agentName ?? "subagent";
+      // Live streaming (F04 t03): while AWAITING a still-running task (wait !==
+      // false), subscribe to its progress and repaint via onUpdate — a live view
+      // matching a running foreground subagent. wait:false polls: NO subscription.
       if (task.status === "running" && params.wait !== false) {
-        await registry.wait(id);
+        const partial = (snap: ProgressSnapshot | undefined): ToolUpdate => ({
+          // Mirror the foreground partial: print/RPC legibility rides in content.
+          content: [{ type: "text", text: snap ? renderProgressText(snap) : "" }],
+          details: { subagentProgress: snap, agent, taskId: id, agentId: task.agentId, live: true },
+        });
+        let unsub = () => {};
+        let removeAbort = () => {};
+        try {
+          if (onUpdate) {
+            // Subscribe FIRST — t02 guarantees subscribe-after-settle is a no-op
+            // returning a no-op unsub (no race, no leak) — then emit an initial
+            // paint (… starting… when no snapshot yet) so it is never blank. Both
+            // run INSIDE the try so a throwing initial paint still hits the finally
+            // teardown (no leaked listener).
+            unsub = registry.subscribeProgress(id, (snap) => onUpdate(partial(snap)));
+            onUpdate(partial(task.progress));
+          }
+          // `settled` never rejects; race it against abort so an aborted signal
+          // stops streaming and returns the current-status result (no throw). The
+          // abort listener is removed on EVERY exit (finally) so a reused session
+          // signal never accumulates once-listeners across TaskOutput calls.
+          if (signal?.aborted) {
+            // Already aborted → return current status without waiting.
+          } else if (signal) {
+            await new Promise<void>((resolve) => {
+              const onAbort = () => resolve();
+              signal.addEventListener("abort", onAbort, { once: true });
+              removeAbort = () => signal.removeEventListener("abort", onAbort);
+              void registry.wait(id).then(() => resolve(), () => resolve());
+            });
+          } else {
+            await registry.wait(id);
+          }
+        } finally {
+          unsub();
+          removeAbort();
+        }
+        // On abort mid-wait the task may still be "running": fall through to build
+        // the current-status (poll) result below rather than throwing.
       }
       // SECURITY (FIX 4, defense-in-depth): `task.label` derives from the raw
       // model-supplied `subagent_type` and is interpolated into this terminal-
       // bound text; single-line-sanitize it (control/ANSI bytes → spaces, capped)
       // before use, mirroring the settlement-notice header sanitize.
       const label = sanitizeLine(task.label, 120);
+      // SEC (F04 t03): the agent TYPE flows into the model-facing running/failed/
+      // stopped CONTENT strings (terminal-bound in print/RPC), so single-line-
+      // sanitize it here too — the renderer's sanitize does NOT cover this path.
+      // Fall back to the (already sanitized) label when no clean type is set.
+      const agentLabel = sanitizeLine(task.agentType ?? task.agentName ?? "", 120) || label;
+      // The stable agent id, appended to the metadata strings for print-mode
+      // legibility (gated through isAgentId — never raw model text).
+      const idPart = task.agentId && isAgentId(task.agentId) ? `, ${task.agentId}` : "";
+      const subject = `Background task ${id} (${agentLabel}${idPart})`;
       let text: string;
       switch (task.status) {
         case "completed":
@@ -513,7 +691,9 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
           }
           break;
         case "failed":
-          text = `Background task ${id} (${label}) failed: ${task.error ?? "unknown error"}`;
+          // `subject` (F04 t03) carries the sanitized agent type + agent-<id> so
+          // the failure is self-identifying in print/RPC mode.
+          text = `${subject} failed: ${task.error ?? "unknown error"}`;
           if (task.result?.trim()) {
             text += `\n\nPartial output before the failure:\n${task.result}`;
           }
@@ -525,13 +705,13 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
           // Vocabulary (FIX 3): lead with "aborted" so it matches every other
           // surface (settlement notice, /usage, user guide); the "stopped before
           // completing" clause still names the mechanism (TaskStop/abort).
-          text = `Background task ${id} (${label}) was aborted — it was stopped before completing, so its result was discarded.`;
+          text = `${subject} was aborted — it was stopped before completing, so its result was discarded.`;
           break;
         default:
           // Liveness (t03): surface the last observed activity so a polled
           // (wait: false) running task doesn't look inert.
           text =
-            `Background task ${id} (${label}) is still running` +
+            `${subject} is still running` +
             (task.lastActivity ? ` — ${task.lastActivity}` : "") +
             ". Call TaskOutput again (wait defaults to true) to await its result.";
           break;
@@ -544,13 +724,23 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
       if (usageLine && task.status !== "running") {
         text += `\nusage: ${usageLine}`;
       }
+      // Render outcome (F04 t03): map the background status to the badge outcome
+      // (stopped → aborted) so renderResult shows the outcome chip. Only for a
+      // SETTLED task — a running poll carries no outcome (renderResult keys the
+      // poll frame on status:"running" instead).
+      const outcome = task.status === "running" ? undefined : noticeOutcome(task.status);
       return {
         content: [{ type: "text", text }],
         details: {
           taskId: id,
           status: task.status,
-          agent: task.agentName,
+          ...(outcome ? { outcome } : {}),
+          // The dispatched agent TYPE is the identity shown at every surface
+          // (t02 sets it eagerly); fall back to name/"subagent".
+          agent,
           agentId: task.agentId,
+          // Truncated completed/failed runs carry a cut-off frame → badge suffix.
+          cutOff: task.truncated === true,
           transcriptPath: task.transcriptPath,
           resumable: task.resumable,
           usage: task.usage,

@@ -174,7 +174,24 @@ Every subagent is now visible, both to you and to the coordinating model:
   recent tool calls / output lines, and explicit visibility of silent waits (API auto-retry).
   Pressing **Esc** cancels a running foreground dispatch (it reports as aborted — rendered in an
   error frame worded as aborted, not a distinct abort badge; the dedicated aborted badge is a
-  background/next-turn surface).
+  background/next-turn surface). Pressing **Esc** while *awaiting* a background task only detaches
+  the live view — the background task keeps running (retrieve it again with `TaskOutput`); Esc does
+  not stop a background task.
+- **Background tasks are observable too.** A `TaskOutput` call awaiting a still-running background
+  dispatch now streams that same live view — a rolling activity tail and a current-activity line,
+  updating as the background subagent works — then settles, *in the same call*, to a finished view:
+  an outcome badge (completed / failed / aborted), the transcript path, and a per-subagent usage
+  footer, matching what a completed foreground dispatch shows. A poll (`TaskOutput` with
+  `wait: false`) shows the task's current status and last activity inside the same identifying frame.
+  Every background surface — the "task started" message, the awaiting/live `TaskOutput`, the poll,
+  and the settled result — carries the same identity components: the task id (`task-N`), the agent
+  type, and its `agent-<id>`, shown even for non-resumable one-shot builtins (the "resumable via
+  `SendMessage`" hint appears only when the task actually is resumable). The exact framing varies by
+  surface — the start block leads with `Agent(<type>) → background as task-N` (with the `agent-<id>`
+  on a subline), while the live/poll/settled views render `Task(task-N) · Agent(<type>) ·
+  agent-<id>`. This is display-only: the verbatim result
+  text the coordinator receives is unchanged. The one boundary: a background task streams live only
+  *while a `TaskOutput` call is awaiting it* — there is no always-on background dashboard.
 - **`/usage`.** A per-subagent token/cost breakdown for the session: each dispatched agent's id,
   type, outcome, usage line, and transcript path, plus a subagents total. This is **subagent-scoped
   only** — a PiCC-additive view, not Claude Code's whole-session `/usage`/`/cost` (the Pi extension

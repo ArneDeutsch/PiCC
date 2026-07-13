@@ -714,7 +714,7 @@ describe("model-visible agent-ID delivery (t02)", () => {
     expect(text.endsWith(`\n[agent ${agentId} — resumable via SendMessage]`)).toBe(true);
   });
 
-  it("a one-shot builtin (Explore) background start message omits the agent id; a resumable one keeps it", async () => {
+  it("a one-shot builtin (Explore) background start message NOW includes the agent id (F04 t02); a resumable one keeps it", async () => {
     const main = fakeMainSessionFile();
     const registry = new BackgroundTaskRegistry();
     const runtime = makeSubagentRuntime([], fakeSdk({ replies: ["explored"] }).sdk, {
@@ -729,10 +729,12 @@ describe("model-visible agent-ID delivery (t02)", () => {
       prompt: "look",
       run_in_background: true,
     });
-    expect(started.content[0]!.text).not.toContain("agent id:");
+    // F04 t02: the id is model-visible at the start-message surface for EVERY
+    // background task, one-shot builtins included (the old suppression is gone).
+    const agentId = String(started.details.agentId);
+    expect(started.content[0]!.text).toContain(`agent id: ${agentId}`);
     expect(started.content[0]!.text).toContain("agent: Explore");
-    // details still carries the id for logs/UI even when the message hides it.
-    expect(String(started.details.agentId)).toMatch(AGENT_ID);
+    expect(agentId).toMatch(AGENT_ID);
 
     // A resumable (non-builtin) background dispatch DOES advertise its id.
     const runtime2 = makeSubagentRuntime([makeAgent()], fakeSdk({ replies: ["r"] }).sdk, {
