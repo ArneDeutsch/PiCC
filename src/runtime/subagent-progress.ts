@@ -71,7 +71,7 @@ export function sanitizeProgressText(text: string): string {
 }
 
 /** Sanitize one line: strip escapes/control, collapse whitespace, cap length. */
-function sanitizeLine(text: string, maxLen: number): string {
+export function sanitizeLine(text: string, maxLen: number): string {
   const flat = sanitizeProgressText(text).replace(/\s+/g, " ").trim();
   if (flat.length <= maxLen) return flat;
   return `${flat.slice(0, Math.max(0, maxLen - 1))}…`;

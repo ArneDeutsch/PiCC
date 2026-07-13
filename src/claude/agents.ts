@@ -37,6 +37,7 @@ const KNOWN_KEYS = new Set([
   "effort",
   "color",
   "isolation",
+  "background",
   "initialPrompt",
   "metadata",
   "memory",
@@ -195,6 +196,11 @@ function loadAgentFile(
 
   const hooks = normalizeHooks(fm["hooks"], agentDiagnostics, filePath);
 
+  // background: true (Claude 2.1.198) forces background dispatch (t05). Parsed
+  // here; the runtime routes it through the run_in_background path. Only an
+  // explicit truthy boolean/"true" enables it; everything else leaves it unset.
+  const background = toOptionalBoolean(fm["background"]);
+
   const unknownKeys = Object.keys(fm).filter((k) => !KNOWN_KEYS.has(k));
 
   const agent: ClaudeAgent = {
@@ -209,6 +215,7 @@ function loadAgentFile(
     skills: toStringList(fm["skills"]),
     color: toOptionalString(fm["color"])?.trim() || undefined,
     isolation,
+    background,
     initialPrompt: toOptionalString(fm["initialPrompt"]),
     metadata,
     // Deferred subsystems (§7): parsed and preserved raw, not interpreted here.
@@ -227,6 +234,22 @@ function toOptionalString(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return undefined;
+}
+
+/**
+ * Parse a boolean frontmatter value. YAML parses `true`/`false` to booleans;
+ * a string `"true"`/`"false"` (or `"1"`/`"0"`) is also accepted. Anything else
+ * (or absent) → undefined (unset), so only an explicit truthy value opts in.
+ */
+function toOptionalBoolean(value: unknown): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const v = value.trim().toLowerCase();
+    if (v === "true" || v === "1" || v === "yes") return true;
+    if (v === "false" || v === "0" || v === "no") return false;
+  }
   return undefined;
 }
 

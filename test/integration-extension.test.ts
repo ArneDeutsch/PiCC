@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import picc from "../src/index.js";
+import picc, { type PiccTestSeam } from "../src/index.js";
 import { resolveGitBashPath } from "../src/engine/shell-inject.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
@@ -434,6 +434,141 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     await exit.execute("w6", { action: "keep" });
     expect(fs.existsSync(a.details.worktreePath)).toBe(true);
     expect(fs.existsSync(b.details.worktreePath)).toBe(true);
+  });
+});
+
+describe("background settlement notices without polling (t05, offline-integration via the seam)", () => {
+  // The fake-Pi harness cannot reach the closure-local registries, so a fresh
+  // extension instance is wired with the test-only `onWired` seam (reachable
+  // ONLY via this in-process argument — never env/settings/files). Each test
+  // seeds a settled background task exactly as a real dispatch would (register →
+  // start → settle → markSettled) and then drives the REAL before_agent_start
+  // drain handler, asserting the notice reaches the model without any TaskOutput
+  // call. Reuses the fixture cwd from the outer beforeAll.
+  type Internals = Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
+
+  function wire(): { p: FakePi; internals: Internals } {
+    const p = fakePi();
+    let internals!: Internals;
+    picc(p.api as never, { onWired: (i) => (internals = i) });
+    return { p, internals };
+  }
+
+  const reg = (internals: Internals, agentId: string) =>
+    internals.subagentRegistry.register({
+      agentId,
+      agentName: "reviewer",
+      depth: 1,
+      cwd: process.cwd(),
+      resumable: true,
+      oneShot: false,
+    });
+
+  function settlements(
+    p: FakePi,
+  ): Array<{ content: string; deliverAs?: string; display?: unknown }> {
+    return p.messages
+      .filter((m) => m.message?.customType === "picc-settlement")
+      .map((m) => ({
+        content: String(m.message.content),
+        deliverAs: m.options?.deliverAs,
+        display: m.message.display,
+      }));
+  }
+
+  it("announces a settled background task at the next turn (outcome, agent id, framed output) — no TaskOutput needed", async () => {
+    const { p, internals } = wire();
+    const agentId = "agent-0011aa22bb33";
+    reg(internals, agentId);
+    const taskId = internals.backgroundTasks.start(
+      "agent:reviewer",
+      Promise.resolve({
+        ok: true,
+        outcome: "completed" as const,
+        finalMessage: "LGTM - no blocking issues",
+        agentId,
+        diagnostics: [],
+      }),
+      undefined,
+      agentId,
+    );
+    await internals.backgroundTasks.wait(taskId);
+    internals.subagentRegistry.markSettled(agentId);
+
+    // The next parent turn begins — the drain delivers the notice.
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    const notices = settlements(p);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.deliverAs).toBe("steer"); // message-level channel, transcript-visible
+    expect(notices[0]!.display).toBe(true); // transcript-visible acceptance (rendered to the user)
+    expect(notices[0]!.content).toContain(taskId);
+    expect(notices[0]!.content).toContain(agentId);
+    expect(notices[0]!.content).toContain("settled: completed");
+    expect(notices[0]!.content).toContain("LGTM - no blocking issues");
+    expect(notices[0]!.content).toContain("UNTRUSTED SUBAGENT OUTPUT"); // untrusted framing
+    expect(notices[0]!.content).toContain("not an instruction");
+
+    // Exactly-once across turns: the following turn delivers nothing new.
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    expect(settlements(p)).toHaveLength(0);
+  });
+
+  it("delivers completed / failed / stopped shapes together (rate-limit → failed; TaskStop → aborted)", async () => {
+    const { p, internals } = wire();
+
+    const okId = "agent-cc33dd44ee55";
+    reg(internals, okId);
+    const okTask = internals.backgroundTasks.start(
+      "agent:reviewer",
+      Promise.resolve({ ok: true, outcome: "completed" as const, finalMessage: "done", agentId: okId, diagnostics: [] }),
+      undefined,
+      okId,
+    );
+    await internals.backgroundTasks.wait(okTask);
+    internals.subagentRegistry.markSettled(okId);
+
+    const failId = "agent-ff00ee11dd22";
+    reg(internals, failId);
+    const failTask = internals.backgroundTasks.start(
+      "agent:reviewer",
+      Promise.resolve({
+        ok: false,
+        outcome: "failed" as const,
+        finalMessage: "",
+        agentId: failId,
+        error: "Agent terminated early due to an API error: insufficient_quota",
+        diagnostics: [],
+      }),
+      undefined,
+      failId,
+    );
+    await internals.backgroundTasks.wait(failTask);
+    internals.subagentRegistry.markSettled(failId);
+
+    const stopId = "agent-aa11bb22cc33";
+    reg(internals, stopId);
+    let resolveStop!: (v: unknown) => void;
+    const stopTask = internals.backgroundTasks.start(
+      "agent:reviewer",
+      new Promise((r) => (resolveStop = r)),
+      () => {},
+      stopId,
+    );
+    internals.backgroundTasks.stop(stopTask); // status → stopped; notice reads "aborted"
+    resolveStop({ ok: false, outcome: "aborted", finalMessage: "discard", agentId: stopId, error: "aborted", diagnostics: [] });
+    await internals.backgroundTasks.wait(stopTask);
+    internals.subagentRegistry.markSettled(stopId);
+
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    const joined = settlements(p).map((n) => n.content).join("\n===\n");
+    expect(settlements(p)).toHaveLength(3);
+    expect(joined).toContain("settled: completed");
+    expect(joined).toContain("settled: failed");
+    expect(joined).toContain("insufficient_quota"); // t01 regression: never a silent success
+    expect(joined).toContain("settled: aborted"); // outcome vocabulary (status is "stopped")
   });
 });
 

@@ -388,6 +388,17 @@ export class SubagentRuntime {
     return this.isOneShot(this.resolveAgentDefinition(requested));
   }
 
+  /**
+   * True iff `subagentType` resolves to an agent whose frontmatter sets
+   * `background: true` (Claude 2.1.198): the dispatch must run in the background
+   * even when the Agent tool call omits `run_in_background` (t05). Mirrors
+   * dispatch()'s resolution order via the shared resolver.
+   */
+  isBackgroundAgent(subagentType: string): boolean {
+    const requested = subagentType.trim() || "general-purpose";
+    return this.resolveAgentDefinition(requested)?.background === true;
+  }
+
   async dispatch(opts: {
     subagentType: string;
     prompt: string;
@@ -1546,7 +1557,11 @@ export function createAgentToolDefinition(
         depth: opts.depth + 1,
       };
       const backgroundDisabled = isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS);
-      if (params.run_in_background === true && !backgroundDisabled && opts.backgroundTasks) {
+      // `background: true` agent frontmatter (Claude 2.1.198, t05) forces
+      // background dispatch even without the run_in_background tool param.
+      const wantsBackground =
+        params.run_in_background === true || runtime.isBackgroundAgent(subagentType);
+      if (wantsBackground && !backgroundDisabled && opts.backgroundTasks) {
         // Real background execution (audit E4): the un-awaited dispatch still
         // takes its concurrency slot and fires SubagentStart/Stop hooks; the
         // registry owns its settlement (never an unhandled rejection).

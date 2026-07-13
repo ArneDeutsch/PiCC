@@ -203,6 +203,43 @@ describe("loadAgents", () => {
     expect(a.diagnostics.some((d) => d.message.includes("isolation"))).toBe(true);
   });
 
+  it("parses `background: true` frontmatter (Claude 2.1.198, t05); absent/false stay off", () => {
+    writeAgent(
+      "bg.md",
+      ["---", "description: bg agent", "background: true", "---", "b"].join("\n"),
+    );
+    writeAgent(
+      "bg-false.md",
+      ["---", "description: not bg", "background: false", "---", "b"].join("\n"),
+    );
+    writeAgent("bg-absent.md", ["---", "description: plain", "---", "b"].join("\n"));
+    const { agents, diagnostics } = load();
+    expect(diagnostics).toEqual([]);
+    const byName = Object.fromEntries(agents.map((a) => [a.name, a]));
+    expect(byName["bg"]!.background).toBe(true);
+    expect(byName["bg-false"]!.background).toBe(false);
+    expect(byName["bg-absent"]!.background).toBeUndefined();
+    // `background` is a known key — never surfaced as unknown.
+    expect(byName["bg"]!.unknownKeys).not.toContain("background");
+  });
+
+  it('parses string background values ("true"/"1"/"yes" → true; garbage → undefined) (t05)', () => {
+    // Quoted so YAML keeps them as STRINGS (bare yes/no/1 would coerce in YAML),
+    // exercising toOptionalBoolean's string branch directly.
+    writeAgent("bg-s-true.md", ["---", 'description: d', 'background: "true"', "---", "b"].join("\n"));
+    writeAgent("bg-s-one.md", ["---", 'description: d', 'background: "1"', "---", "b"].join("\n"));
+    writeAgent("bg-s-yes.md", ["---", 'description: d', 'background: "yes"', "---", "b"].join("\n"));
+    writeAgent("bg-s-maybe.md", ["---", 'description: d', 'background: "maybe"', "---", "b"].join("\n"));
+    writeAgent("bg-s-garbage.md", ["---", 'description: d', 'background: "42x"', "---", "b"].join("\n"));
+    const { agents } = load();
+    const byName = Object.fromEntries(agents.map((a) => [a.name, a]));
+    expect(byName["bg-s-true"]!.background).toBe(true);
+    expect(byName["bg-s-one"]!.background).toBe(true);
+    expect(byName["bg-s-yes"]!.background).toBe(true);
+    expect(byName["bg-s-maybe"]!.background).toBeUndefined();
+    expect(byName["bg-s-garbage"]!.background).toBeUndefined();
+  });
+
   it("preserves the body verbatim, never parsing YAML-looking body content", () => {
     const body = [
       "# System prompt",

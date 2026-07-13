@@ -149,7 +149,29 @@ function debug(...args: unknown[]): void {
   if (process.env.PICC_DEBUG) console.error("[picc]", ...args);
 }
 
-export default function picc(pi: any) {
+/**
+ * TEST-ONLY injection point (t05 plan-review MUST-FIX). The fake-Pi harness
+ * cannot reach the closure-local registries/runtime, so the offline-integration
+ * test for the settlement-notice delivery path needs a named seam. `onWired` is
+ * invoked synchronously during construction with the real, in-process registry
+ * instances the session built, so a test can seed a settled background task and
+ * then drive the REAL `before_agent_start` drain handler.
+ *
+ * SECURITY: this seam is reachable ONLY through this in-process second argument.
+ * Nothing in the project-loading path (CLAUDE.md, settings, env vars, files)
+ * ever supplies it — Pi invokes the extension entry as `picc(pi)` with a single
+ * argument — so a loaded project can never use it to swap runtime internals. An
+ * env/settings/file-gated seam would be a project-reachable runtime-swap bypass;
+ * an in-process argument is not.
+ */
+export interface PiccTestSeam {
+  onWired?: (internals: {
+    backgroundTasks: BackgroundTaskRegistry;
+    subagentRegistry: SubagentRegistry;
+  }) => void;
+}
+
+export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // UTF-8 stdio for any child process (fixes Windows cp1252 UnicodeEncodeError,
   // e.g. Python printing `→`). Set before any subprocess can be spawned.
   applyUnicodeSafeProcessEnv();
@@ -418,6 +440,14 @@ export default function picc(pi: any) {
   // resume a finished one. Registry-only resolution keeps a hostile `to` off the
   // filesystem (SECURITY MUST-FIX #2).
   const subagentRegistry = new SubagentRegistry();
+  // TEST-ONLY seam (t05): hand the real in-process registries to a test that
+  // drives the settlement-notice delivery path. See PiccTestSeam — reachable
+  // only via this in-process argument, never via project/env/settings/files.
+  try {
+    testSeam?.onWired?.({ backgroundTasks, subagentRegistry });
+  } catch (err) {
+    console.error(`PiCC test seam onWired failed: ${(err as Error).message}`);
+  }
   // Built-in agent types (audit E1): general-purpose/Explore/Plan, appended
   // AFTER project/user/plugin agents so a same-named project agent wins (an
   // overridden built-in is dropped from the catalog — dispatch resolves the
@@ -804,6 +834,7 @@ export default function picc(pi: any) {
     console.error(`PiCC: ${message}`),
   );
   pi.on("before_agent_start", async (event: any) => {
+    deliverSettlementNotices();
     try {
       const suffix = buildSystemPromptSuffix({
         claudeMd: project.claudeMd,
@@ -823,6 +854,49 @@ export default function picc(pi: any) {
       return undefined;
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // Background settlement notices (t05) — visible without polling
+  // ---------------------------------------------------------------------------
+  // At the parent's NEXT turn (before_agent_start, above), deliver a one-time,
+  // transcript-visible notice for every background subagent that has settled
+  // since the last turn: outcome (t01 vocabulary — a stopped task reads
+  // "aborted"), the capped error when failed, the agent id, and a bounded,
+  // explicitly-framed UNTRUSTED excerpt of its output. The coordinator thus
+  // learns of settlement WITHOUT calling TaskOutput. Delivered via the
+  // message-level channel PiCC already uses (pi.sendMessage + deliverAs "steer")
+  // so it lands in the transcript like Claude Code's settlement message.
+  // Exactly-once per settlement: the drain consumes the registry's per-agent
+  // settled-notice gate (a resume re-arms it). Folded into the single
+  // before_agent_start handler (own try/catch) rather than a second listener, so
+  // it can never depend on multi-handler ordering and a drain failure can never
+  // break prompt assembly.
+  //
+  // Honest limitation (v1, documented — flagged for the t07 user guide + registry
+  // note): before_agent_start fires when the user continues the conversation, so
+  // an IDLE coordinator (turn ended, awaiting input) learns of settlement only
+  // when the conversation continues — PiCC does NOT re-invoke an idle agent. No
+  // wake-an-idle-parent machinery is built here.
+  function deliverSettlementNotices(): void {
+    try {
+      const notices = backgroundTasks.drainSettlementNotices(
+        (agentId) => subagentRegistry.consumeSettledNotice(agentId),
+        // Drain-fallback gate (SHOULD-3): a true registry MISS means the dispatch
+        // failed at an early guard before it ever registered — the notice is then
+        // emitted from the background record itself, exactly once. A registered
+        // task always has a record here, so it stays on the consume path above.
+        (agentId) => subagentRegistry.get(agentId) !== undefined,
+      );
+      for (const content of notices) {
+        pi.sendMessage(
+          { customType: "picc-settlement", content, display: true },
+          { deliverAs: "steer" },
+        );
+      }
+    } catch (err) {
+      console.error(`PiCC settlement-notice delivery failed: ${(err as Error).message}`);
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Session lifecycle
