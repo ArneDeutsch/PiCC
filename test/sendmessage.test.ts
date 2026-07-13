@@ -474,7 +474,13 @@ describe("SendMessage resume — offline integration (real SessionManager) (t04)
     const main = fakeMainSessionFile();
     const registry = new SubagentRegistry();
     const backgroundTasks = new BackgroundTaskRegistry();
-    const h = fakeSdk({ replies: ["FIRST REPLY", "RESUME REPLY"] });
+    // Scripted usage (FIX 8): prove the compound dispatch→persist→settle→RESUME→
+    // usage chain — usage must be captured on the RESUME path, not only fresh
+    // dispatch. Both sessions report the same stats here.
+    const h = fakeSdk({
+      replies: ["FIRST REPLY", "RESUME REPLY"],
+      stats: { tokens: { input: 30, output: 12, cacheRead: 4 }, cost: 0.05 },
+    });
     const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
       subagentRegistry: registry,
       getMainSessionFile: () => main,
@@ -513,6 +519,18 @@ describe("SendMessage resume — offline integration (real SessionManager) (t04)
     expect(record?.status).toBe("completed");
     expect(record?.agentId).toBe(agentId);
     expect(registry.get(agentId)!.state).toBe("settled");
+
+    // FIX 8 (t06 × t04): the RESUMED run's usage is captured — on the background
+    // task record AND the dispatch registry record under the same id — proving
+    // the resume path (not just fresh dispatch) records per-subagent usage.
+    const expectedUsage = {
+      inputTokens: 30,
+      outputTokens: 12,
+      cacheReadTokens: 4,
+      costUsd: 0.05,
+    };
+    expect(record?.usage).toEqual(expectedUsage);
+    expect(registry.get(agentId)!.usage).toEqual(expectedUsage);
 
     // A SECOND createAgentSession happened, seeded from the reopened transcript —
     // prior context is available to the resumed run (SECURITY: from the reopened

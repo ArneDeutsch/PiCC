@@ -138,7 +138,7 @@ describe("BackgroundTaskRegistry", () => {
     const taskOutput = createTaskOutputTool(registry) as unknown as ToolLike;
     const out = await taskOutput.execute("t", { task_id: id });
     expect(out.details.status).toBe("stopped");
-    expect(out.content[0]!.text).toContain("was stopped");
+    expect(out.content[0]!.text).toContain("was aborted"); // FIX 3: aborted vocabulary
     expect(out.content[0]!.text).not.toContain("resumable via SendMessage"); // …but not advertised
   });
 
@@ -175,6 +175,27 @@ describe("BackgroundTaskRegistry", () => {
     expect(out.content[0]!.text).toContain("usage: in 100 · out 50 · $0.0123");
   });
 
+  it("sanitizes a control-byte task label before printing it in TaskOutput text (FIX 4 security)", async () => {
+    // task.label derives from the model-supplied subagent_type; a hostile label
+    // with ANSI/OSC/control bytes must not reach the terminal via TaskOutput.
+    const registry = new BackgroundTaskRegistry();
+    // Control bytes built from code points so this source stays pure ASCII.
+    const ESC = String.fromCharCode(27);
+    const BEL = String.fromCharCode(7);
+    const NUL = String.fromCharCode(0);
+    const hostileLabel = `agent:${ESC}[31mworker${BEL}${ESC}]0;title${BEL}${NUL}`;
+    const id = registry.start(hostileLabel, Promise.resolve(result({ ok: false, error: "boom" })));
+    await registry.wait(id);
+    const taskOutput = createTaskOutputTool(registry) as unknown as ToolLike;
+    const out = await taskOutput.execute("t", { task_id: id });
+    const text = out.content[0]!.text;
+    expect(text).not.toContain(ESC); // ESC (CSI + OSC) stripped
+    expect(text).not.toContain(BEL); // BEL stripped
+    expect(text).not.toContain(NUL); // NUL stripped
+    expect(text).toContain("worker"); // visible label text preserved
+    expect(text).toContain("failed: boom");
+  });
+
   it("stop on a settled task reports alreadySettled; unknown ids report not found", async () => {
     const registry = new BackgroundTaskRegistry();
     const id = registry.start("agent:a", Promise.resolve(result()));
@@ -199,14 +220,28 @@ describe("settlement notices (t05)", () => {
     reg.markSettled(agentId);
     return reg;
   }
-  const drain = (bg: BackgroundTaskRegistry, sub: SubagentRegistry) =>
-    bg.drainSettlementNotices((a) => sub.consumeSettledNotice(a));
-  /** Drain with the registry-miss fallback wired (index.ts's real second arg). */
-  const drainWithFallback = (bg: BackgroundTaskRegistry, sub: SubagentRegistry) =>
-    bg.drainSettlementNotices(
+  // FIX 1: the drain now PEEKS (isSettledNoticeArmed) and returns { content,
+  // commit } notices; the caller commits (consumeSettledNotice) only after a
+  // successful delivery. These helpers mimic the happy path — deliver-then-commit
+  // every notice — and return the content strings so the existing assertions hold.
+  const drain = (bg: BackgroundTaskRegistry, sub: SubagentRegistry) => {
+    const notices = bg.drainSettlementNotices(
+      (a) => sub.isSettledNoticeArmed(a),
+      (a) => sub.consumeSettledNotice(a),
+    );
+    for (const n of notices) n.commit();
+    return notices.map((n) => n.content);
+  };
+  /** Drain with the registry-miss fallback wired (index.ts's real third arg). */
+  const drainWithFallback = (bg: BackgroundTaskRegistry, sub: SubagentRegistry) => {
+    const notices = bg.drainSettlementNotices(
+      (a) => sub.isSettledNoticeArmed(a),
       (a) => sub.consumeSettledNotice(a),
       (a) => sub.get(a) !== undefined,
     );
+    for (const n of notices) n.commit();
+    return notices.map((n) => n.content);
+  };
   const baseTask = (over: Partial<BackgroundTaskRecord> = {}): BackgroundTaskRecord => ({
     id: "task-9",
     label: "agent:worker",
@@ -488,6 +523,81 @@ describe("settlement notices (t05)", () => {
     expect(notices[0]).toContain("NEW-result");
     expect(notices[0]).not.toContain("OLD-result");
   });
+
+  it("a delivery throw on one notice leaves it un-committed → re-fires next drain; the other still delivers (FIX 1)", async () => {
+    // The peek-then-commit contract: the drain must NOT flip the dedup gate while
+    // selecting. A caller that throws before commit() on one notice must still be
+    // able to deliver+commit the others, and the un-committed notice re-fires on
+    // the next drain — never silently lost (the class of bug this feature kills).
+    const bg = new BackgroundTaskRegistry();
+    const agentA = "agent-aaaa1111bbbb";
+    const agentB = "agent-cccc2222dddd";
+    const idA = bg.start(
+      "agent:worker",
+      Promise.resolve(result({ finalMessage: "A-result", agentId: agentA })),
+      undefined,
+      agentA,
+    );
+    const idB = bg.start(
+      "agent:worker",
+      Promise.resolve(result({ finalMessage: "B-result", agentId: agentB })),
+      undefined,
+      agentB,
+    );
+    await bg.wait(idA);
+    await bg.wait(idB);
+    const sub = new SubagentRegistry();
+    for (const aid of [agentA, agentB]) {
+      sub.register({
+        agentId: aid,
+        agentName: "worker",
+        depth: 1,
+        cwd: process.cwd(),
+        resumable: true,
+        oneShot: false,
+      });
+      sub.markSettled(aid);
+    }
+
+    // First drain PEEKS both (nothing consumed yet). Newest-first → [B, A].
+    const isArmed = (a: string) => sub.isSettledNoticeArmed(a);
+    const commit = (a: string) => {
+      sub.consumeSettledNotice(a);
+    };
+    const notices1 = bg.drainSettlementNotices(isArmed, commit, (a) => sub.get(a) !== undefined);
+    expect(notices1).toHaveLength(2);
+
+    // Simulate index.ts's per-notice delivery loop where the FIRST send throws
+    // BEFORE its commit() — the second still delivers + commits.
+    const delivered: string[] = [];
+    let threwOnce = false;
+    for (const n of notices1) {
+      try {
+        if (!threwOnce) {
+          threwOnce = true;
+          throw new Error("sendMessage boom");
+        }
+        delivered.push(n.content);
+        n.commit();
+      } catch {
+        // swallow, exactly like deliverSettlementNotices
+      }
+    }
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toContain("A-result"); // B threw first; A delivered
+
+    // Second drain: only the un-committed notice (B) re-fires — A stays consumed.
+    const notices2 = bg.drainSettlementNotices(isArmed, commit, (a) => sub.get(a) !== undefined);
+    for (const n of notices2) n.commit();
+    expect(notices2).toHaveLength(1);
+    expect(notices2[0]!.content).toContain("B-result");
+    expect(notices2[0]!.content).toContain(agentB);
+    expect(notices2[0]!.content).not.toContain("A-result");
+
+    // Third drain: nothing left.
+    const notices3 = bg.drainSettlementNotices(isArmed, commit, (a) => sub.get(a) !== undefined);
+    expect(notices3).toEqual([]);
+  });
 });
 
 describe("Agent tool run_in_background (audit E4)", () => {
@@ -671,7 +781,7 @@ describe("Agent tool run_in_background (audit E4)", () => {
     expect(registry.get(taskId)?.status).toBe("stopped"); // late result discarded
     const taskOutput = createTaskOutputTool(registry) as unknown as ToolLike;
     const out = await taskOutput.execute("t3", { task_id: taskId });
-    expect(out.content[0]!.text).toContain("was stopped");
+    expect(out.content[0]!.text).toContain("was aborted"); // FIX 3: aborted vocabulary
   });
 
   it("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS forces foreground with a details note", async () => {
@@ -692,6 +802,26 @@ describe("Agent tool run_in_background (audit E4)", () => {
     expect(res.content[0]!.text).toBe("fg-final");
     expect(String(res.details.note ?? "")).toContain("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS");
     expect(registry.ids()).toEqual([]); // nothing registered
+  });
+
+  it("a `background: true` agent forced foreground by CLAUDE_CODE_DISABLE_BACKGROUND_TASKS surfaces the degrade note (FIX 2)", async () => {
+    // The degrade note must key on the EFFECTIVE background request — frontmatter
+    // background:true, NOT just the run_in_background param — so a frontmatter-
+    // background agent forced foreground still surfaces the divergence.
+    process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
+    const { sdk, release } = gatedSdk("fg-final");
+    release();
+    const registry = new BackgroundTaskRegistry();
+    const runtime = makeRuntime([makeAgent({ background: true })], sdk);
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: registry,
+    }) as unknown as ToolLike;
+    // No run_in_background param — only the frontmatter asks for background.
+    const res = await agentTool.execute("t1", { subagent_type: "worker", prompt: "go" });
+    expect(res.content[0]!.text).toBe("fg-final");
+    expect(String(res.details.note ?? "")).toContain("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS");
+    expect(registry.ids()).toEqual([]); // nothing registered as background
   });
 
   it("a failing background dispatch reports the failure via TaskOutput (never an unhandled rejection)", async () => {
@@ -756,6 +886,6 @@ describe("Agent tool run_in_background (audit E4)", () => {
     const taskOutput = createTaskOutputTool(registry) as unknown as ToolLike;
     const out = await taskOutput.execute("t4", { task_id: secondId });
     expect(out.details.status).toBe("stopped");
-    expect(out.content[0]!.text).toContain("was stopped");
+    expect(out.content[0]!.text).toContain("was aborted"); // FIX 3: aborted vocabulary
   });
 });

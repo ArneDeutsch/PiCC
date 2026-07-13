@@ -75,8 +75,8 @@ Lifecycle events the hooks engine can fire (`settings.json` `hooks`, plus skill/
 | `hook.event.SessionEnd` | full | fires at session end (§4.5) |
 | `hook.event.SessionStart` | full | fires at session start; matcher matches the source exactly (startup\|resume\|clear\|compact); stdout injected (§4.5, §9) |
 | `hook.event.Stop` | full | fires when the main agent wants to stop; exit 2 blocks stopping (§4.5) |
-| `hook.event.SubagentStart` | full | fires when a subagent is spawned; payload carries agent_id + agent_type (subagent-only additions) while transcript_path stays the MAIN session transcript (Claude Code parity); a blocking outcome cancels the dispatch (§4.3, §4.5) |
-| `hook.event.SubagentStop` | full | fires when a subagent wants to stop; payload carries agent_id + agent_type while transcript_path stays the MAIN session transcript (Claude Code parity); exit 2 blocks and re-prompts the subagent (bounded) (§4.3, §4.5) |
+| `hook.event.SubagentStart` | full | fires when a subagent is spawned; payload carries agent_id + agent_type (subagent-only additions) while transcript_path stays the MAIN session transcript (Claude Code parity); NUANCE: agent_type is the agent's bare frontmatter/definition name — PiCC does NOT apply plugin-scoped naming, so a plugin subagent's agent_type is its plain name (Claude's exact plugin-scoped id here is unverified); a blocking outcome cancels the dispatch (§4.3, §4.5) |
+| `hook.event.SubagentStop` | full | fires when a subagent wants to stop; payload carries agent_id + agent_type while transcript_path stays the MAIN session transcript (Claude Code parity); NUANCE: agent_type is the agent's bare frontmatter/definition name, not a plugin-scoped id (Claude's exact plugin-scoped id here is unverified); exit 2 blocks and re-prompts the subagent (bounded) (§4.3, §4.5) |
 | `hook.event.UserPromptSubmit` | full | fires on user prompt; stdout injected as context (§4.5) |
 | `hook.event.WorktreeCreate` | full | fires on worktree creation — worktree seeding pattern supported (§4.4) |
 | `hook.event.WorktreeRemove` | full | fires on worktree removal (§4.4) |

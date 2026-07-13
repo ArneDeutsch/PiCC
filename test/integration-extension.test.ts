@@ -515,6 +515,70 @@ describe("background settlement notices without polling (t05, offline-integratio
     expect(settlements(p)).toHaveLength(0);
   });
 
+  it("a pi.sendMessage throw on one notice still delivers the others and re-fires the throwing one next turn (FIX 1)", async () => {
+    // The real delivery path (deliverSettlementNotices): each notice is delivered
+    // in its own try/catch and the dedup gate is committed ONLY after a successful
+    // send. A throw on one notice must neither drop the others nor consume the
+    // thrower — it re-fires next turn. Nothing is silently lost.
+    const { p, internals } = wire();
+    const agentA = "agent-1a2b3c4d5e6f";
+    const agentB = "agent-6f5e4d3c2b1a";
+    for (const [aid, text] of [
+      [agentA, "A-report"],
+      [agentB, "B-report"],
+    ] as const) {
+      reg(internals, aid);
+      const t = internals.backgroundTasks.start(
+        "agent:reviewer",
+        Promise.resolve({
+          ok: true,
+          outcome: "completed" as const,
+          finalMessage: text,
+          agentId: aid,
+          diagnostics: [],
+        }),
+        undefined,
+        aid,
+      );
+      await internals.backgroundTasks.wait(t);
+      internals.subagentRegistry.markSettled(aid);
+    }
+
+    // Make the FIRST send of the batch throw (before its commit).
+    const realSend = p.api.sendMessage as (m: unknown, o?: unknown) => unknown;
+    let calls = 0;
+    (p.api as Record<string, unknown>).sendMessage = (m: unknown, o?: unknown) => {
+      calls++;
+      if (calls === 1) throw new Error("sendMessage boom");
+      return realSend(m, o);
+    };
+
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    const turn1 = settlements(p);
+    expect(turn1).toHaveLength(1); // the non-throwing notice still landed
+
+    // Restore normal delivery; the un-committed (throwing) notice re-fires.
+    (p.api as Record<string, unknown>).sendMessage = realSend;
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    const turn2 = settlements(p);
+    expect(turn2).toHaveLength(1); // the previously-thrown notice, not lost
+
+    // Across both turns each agent was delivered exactly once — nothing dropped,
+    // nothing duplicated.
+    const joined = [...turn1, ...turn2].map((n) => n.content).join("\n===\n");
+    expect(joined).toContain(agentA);
+    expect(joined).toContain(agentB);
+    expect(joined).toContain("A-report");
+    expect(joined).toContain("B-report");
+
+    // A third turn delivers nothing more.
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    expect(settlements(p)).toHaveLength(0);
+  });
+
   it("/usage aggregates per-subagent usage, transcript paths, outcome, and a session total (t06)", async () => {
     const { p, internals } = wire();
     // Two settled dispatches with usage, exactly as the runtime would record:
@@ -576,6 +640,39 @@ describe("background settlement notices without polling (t05, offline-integratio
       .map((e) => String(e.data?.output ?? ""))
       .join("\n");
     expect(out).toContain("No subagents have been dispatched this session");
+  });
+
+  it("sanitizes a control-byte agent name in the /usage report (FIX 4 security)", async () => {
+    // agentName derives from agent frontmatter `name`/basename (only trimmed
+    // upstream); a hostile ANSI/OSC/control-byte name must not reach the terminal
+    // on /usage. Control bytes from code points so this source stays pure ASCII.
+    const { p, internals } = wire();
+    const ESC = String.fromCharCode(27);
+    const BEL = String.fromCharCode(7);
+    const NUL = String.fromCharCode(0);
+    internals.subagentRegistry.register({
+      agentId: "agent-abcabcabcabc",
+      agentName: `rev${ESC}[31miewer${BEL}${ESC}]0;pwn${BEL}${NUL}`,
+      depth: 1,
+      cwd: process.cwd(),
+      resumable: true,
+      oneShot: false,
+    });
+    internals.subagentRegistry.markSettled("agent-abcabcabcabc", {
+      outcome: "completed",
+      usage: { inputTokens: 1 },
+    });
+    p.entries.length = 0;
+    await p.commands.get("usage").handler("", p.ctx());
+    const out = p.entries
+      .filter((e) => e.customType === "picc-control")
+      .map((e) => String(e.data?.output ?? ""))
+      .join("\n");
+    expect(out).not.toContain(ESC);
+    expect(out).not.toContain(BEL);
+    expect(out).not.toContain(NUL);
+    expect(out).toContain("reviewer"); // visible name text preserved
+    expect(out).toContain("agent-abcabcabcabc");
   });
 
   it("delivers completed / failed / stopped shapes together (rate-limit → failed; TaskStop → aborted)", async () => {

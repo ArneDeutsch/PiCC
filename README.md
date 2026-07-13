@@ -54,7 +54,9 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
   per-agent `tools:` capability gating, nested dispatch with a configurable depth cap,
   `isolation: worktree`. **Observable and trustworthy:** a dead dispatch is a loud, named failure
   (never an empty success) with partial output preserved; every run leaves an on-disk transcript,
-  streams live progress, and records its token/cost (`/usage`). Background dispatch
+  streams live progress, and records its token/cost (`/usage`). Dispatch defaults to the
+  **foreground** (Claude 2.1.198 runs subagents background-by-default), so an implicit-concurrency
+  fan-out runs serially unless background is requested. Background dispatch
   (`run_in_background` / `background: true` + `TaskOutput`/`TaskStop`) pushes its settlement to the
   coordinator without polling; `SendMessage` resumes a finished subagent or steers a running one.
 - **Worktrees** — `EnterWorktree`/`ExitWorktree` with a real session-cwd swap, `.worktreeinclude`
@@ -91,7 +93,7 @@ configured outside the project — see the [user guide](doc/user-guide.md#5-cont
 | `src/` | The harness: loaders (`claude/`), engines (`engine/`), Pi runtime layer (`runtime/`), capability registry (`registry/`), extension entry (`index.ts`) |
 | `bin/picc.mjs` | Launcher (Pi + extension preloaded) |
 | `examples/hello-claude` | Minimal demo project |
-| `examples/full-surface` | Conformance fixture exercising the whole feature surface |
+| `examples/full-surface` | Larger fixture exercising a broad slice of the feature surface |
 | `test/` | Unit, offline-integration, and live e2e tests (vitest) — see [doc/testing.md](doc/testing.md) |
 | `doc/` | [User guide](doc/user-guide.md), [architecture](doc/architecture.md), [supported features](doc/supported-features.md), [testing](doc/testing.md); plus the plan, research corpus, and pinned Pi contracts |
 

@@ -15,6 +15,18 @@ import { formatUsageCompact, sanitizeLine } from "./subagent-progress.js";
 export type BackgroundTaskStatus = "running" | "completed" | "failed" | "stopped";
 
 /**
+ * One pending settlement notice returned by `drainSettlementNotices` (FIX 1):
+ * the ready-to-deliver `content`, plus a `commit` the caller invokes ONLY after
+ * a successful `pi.sendMessage` — flipping the dedup gate so the notice never
+ * re-fires. Leaving `commit` un-called (a delivery throw) re-arms it for the
+ * next drain, so no settlement is ever silently dropped.
+ */
+export interface SettlementNotice {
+  content: string;
+  commit: () => void;
+}
+
+/**
  * Per-subagent token/cost usage (t06), mirrored structurally from
  * `DispatchUsage` (subagents.ts) so this module keeps its no-value-import
  * relationship with the runtime.
@@ -186,50 +198,76 @@ export class BackgroundTaskRegistry {
   }
 
   /**
-   * t05: collect one settlement notice for every background task that has
-   * settled (completed / failed / stopped) and not yet been announced. `consume`
-   * is the exactly-once gate — the SubagentRegistry's `consumeSettledNotice`,
-   * keyed by agent id, which returns true the first time per settlement (a
-   * resume re-arms it). Called at the parent's next turn; the caller delivers
-   * each returned notice via `pi.sendMessage`. Iterates NEWEST-first so that
-   * after a resume the FRESH resumed run's record (not the stale prior one that
-   * shares the agent id) wins the single `consume`. Running tasks are skipped;
-   * a task whose agent id has no registry record (or is mid-resume) is left for
-   * a later drain — UNLESS the registry has NO record for it at all (an
-   * early-guard failure that returned before register()), in which case the
-   * `hasRegistryRecord` miss triggers the disjoint drain-fallback below.
+   * t05: SELECT one settlement notice for every background task that has settled
+   * (completed / failed / stopped) and not yet been announced — WITHOUT flipping
+   * any dedup gate (FIX 1: peek, don't consume). Each returned {@link
+   * SettlementNotice} carries the ready-to-send `content` plus a `commit` closure
+   * the caller invokes ONLY after `pi.sendMessage` returns without throwing:
+   *   - `isArmed`/`commit` are the SubagentRegistry's `isSettledNoticeArmed` /
+   *     `consumeSettledNotice`, keyed by agent id — peek then flip;
+   *   - for the disjoint drain-fallback (registry miss), `commit` sets the
+   *     background record's own `settlementNoticeDelivered` flag.
+   * A delivery that throws leaves its notice UN-committed → the next
+   * before_agent_start drain re-fires it (the exact silent-loss the feature
+   * kills), and a throw on one notice never blocks the others.
+   *
+   * Iterates NEWEST-first and de-dups per agent id within the pass (a `selected`
+   * set) so that after a resume the FRESH resumed run's record — not the stale
+   * prior one sharing the agent id — is the one selected (resume-newest-wins),
+   * exactly as the single-consume gate used to enforce implicitly. Running tasks
+   * are skipped; a task whose agent id has no registry record at all (an
+   * early-guard failure that returned before register()) takes the disjoint
+   * drain-fallback below.
    */
   drainSettlementNotices(
-    consume: (agentId: string) => boolean,
+    isArmed: (agentId: string) => boolean,
+    commit: (agentId: string) => void,
     hasRegistryRecord?: (agentId: string) => boolean,
-  ): string[] {
-    const notices: string[] = [];
+  ): SettlementNotice[] {
+    const notices: SettlementNotice[] = [];
+    // Per-drain dedup: with the gate no longer flipped mid-scan, this preserves
+    // "newest record for an agent id wins" (resume-newest-wins) — the first
+    // (newest, reverse order) eligible record claims the id; older ones skip.
+    const selected = new Set<string>();
     for (const task of [...this.tasks.values()].reverse()) {
       if (task.status === "running") continue;
       const agentId = task.agentId;
       if (!agentId) continue;
-      if (consume(agentId)) {
-        notices.push(buildSettlementNotice(task));
+      if (selected.has(agentId)) continue;
+      // Registry consume path — PEEK only; the commit closure flips the gate
+      // after a confirmed delivery.
+      if (isArmed(agentId)) {
+        selected.add(agentId);
+        notices.push({
+          content: buildSettlementNotice(task),
+          commit: () => commit(agentId),
+        });
         continue;
       }
       // Drain-fallback (coder SHOULD-3): a background dispatch that failed at an
       // EARLY guard (bad id / no agent / depth / pre-aborted) returned BEFORE the
-      // subagent registry ever recorded its agent id, so `consume` can never fire
+      // subagent registry ever recorded its agent id, so `isArmed` can never fire
       // for it and its failure would otherwise be retrievable only via TaskOutput
       // ("announced without TaskOutput" violated). When the registry has NO record
       // for this agent id (a true miss — DISJOINT from "armed/consumed/mid-resume",
       // which all HAVE a record and are owned by the consume gate above), emit the
-      // notice from the background record itself, exactly once (its own flag). A
-      // normally-registered task always has a registry record (register() runs
-      // synchronously before the record settles), so it can never reach this path
-      // and can never be double-announced.
+      // notice from the background record itself, exactly once (its own flag, set
+      // by `commit` only after delivery). A normally-registered task always has a
+      // registry record (register() runs synchronously before the record settles),
+      // so it can never reach this path and can never be double-announced.
       if (
         hasRegistryRecord &&
         !hasRegistryRecord(agentId) &&
         !task.settlementNoticeDelivered
       ) {
-        task.settlementNoticeDelivered = true;
-        notices.push(buildSettlementNotice(task));
+        selected.add(agentId);
+        const record = task;
+        notices.push({
+          content: buildSettlementNotice(task),
+          commit: () => {
+            record.settlementNoticeDelivered = true;
+          },
+        });
       }
     }
     return notices;
@@ -453,6 +491,11 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
       if (task.status === "running" && params.wait !== false) {
         await registry.wait(id);
       }
+      // SECURITY (FIX 4, defense-in-depth): `task.label` derives from the raw
+      // model-supplied `subagent_type` and is interpolated into this terminal-
+      // bound text; single-line-sanitize it (control/ANSI bytes → spaces, capped)
+      // before use, mirroring the settlement-notice header sanitize.
+      const label = sanitizeLine(task.label, 120);
       let text: string;
       switch (task.status) {
         case "completed":
@@ -470,7 +513,7 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
           }
           break;
         case "failed":
-          text = `Background task ${id} (${task.label}) failed: ${task.error ?? "unknown error"}`;
+          text = `Background task ${id} (${label}) failed: ${task.error ?? "unknown error"}`;
           if (task.result?.trim()) {
             text += `\n\nPartial output before the failure:\n${task.result}`;
           }
@@ -479,13 +522,16 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
           }
           break;
         case "stopped":
-          text = `Background task ${id} (${task.label}) was stopped; its result was discarded.`;
+          // Vocabulary (FIX 3): lead with "aborted" so it matches every other
+          // surface (settlement notice, /usage, user guide); the "stopped before
+          // completing" clause still names the mechanism (TaskStop/abort).
+          text = `Background task ${id} (${label}) was aborted — it was stopped before completing, so its result was discarded.`;
           break;
         default:
           // Liveness (t03): surface the last observed activity so a polled
           // (wait: false) running task doesn't look inert.
           text =
-            `Background task ${id} (${task.label}) is still running` +
+            `Background task ${id} (${label}) is still running` +
             (task.lastActivity ? ` — ${task.lastActivity}` : "") +
             ". Call TaskOutput again (wait defaults to true) to await its result.";
           break;

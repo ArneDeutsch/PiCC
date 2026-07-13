@@ -67,6 +67,15 @@ export function subagentSessionDir(mainSessionFile: string): string {
  * subagents directory, or undefined when no transcript exists (never ran,
  * never flushed, or in-memory fallback).
  *
+ * This is feature.md's exported "discoverable via the hardened resolver" API:
+ * the ID→transcript discovery entry point for EXTERNAL tooling and humans, and
+ * it is exercised by the e2e/unit tests that prove transcripts are discoverable.
+ * It deliberately has NO `src/` production caller — RESUME (t04/SendMessage)
+ * uses the REGISTRY-STORED path captured at dispatch time, never a fresh on-disk
+ * scan (SECURITY MUST-FIX #2), so a model-supplied `to` can never drive a disk
+ * lookup. Do not "dead-code" delete it; the disk-scan absence in resume is by
+ * design, not a gap.
+ *
  * Hardening (defense in depth — this is exported and IDs land in filenames):
  * throws on anything that is not a minted agent ID, which rejects path
  * separators, `..`, absolute paths, drive/UNC prefixes, and reserved device

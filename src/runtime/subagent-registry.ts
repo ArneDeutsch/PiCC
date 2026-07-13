@@ -25,7 +25,11 @@ import { isAgentId } from "../util/subagent-transcripts.js";
 export interface SteerableSession {
   /** Queue a mid-task course correction (delivered before the next LLM call). */
   steer?(text: string): Promise<void> | void;
-  /** Queue a follow-up processed after the agent finishes its current work. */
+  /**
+   * Queue a follow-up processed after the agent finishes its current work.
+   * Declared for the pi-contract pin; the runtime never calls it — steering
+   * uses steer(), resume uses reopen().
+   */
   followUp?(text: string): Promise<void> | void;
 }
 
@@ -213,6 +217,19 @@ export class SubagentRegistry {
    */
   list(): SubagentRegistryRecord[] {
     return [...this.records.values()];
+  }
+
+  /**
+   * t05 PEEK (FIX 1): is a settlement notice still owed for this agent ID?
+   * Returns true iff the record is settled and its notice is un-consumed —
+   * WITHOUT flipping the gate. The drain uses this to SELECT which notices to
+   * deliver; `consumeSettledNotice` flips the gate only AFTER the caller confirms
+   * a successful delivery, so a delivery throw leaves the notice armed and it
+   * re-fires on the next drain (never silently lost). Pure — no mutation.
+   */
+  isSettledNoticeArmed(agentId: string): boolean {
+    const record = this.records.get(agentId);
+    return !!record && record.state === "settled" && !record.settledNoticeConsumed;
   }
 
   /**

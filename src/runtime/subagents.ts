@@ -18,8 +18,12 @@ import { claudeToolsToPiBuiltins } from "./tool-map.js";
 import { createGuardExtension } from "./guard.js";
 import { CwdState } from "./cwd-state.js";
 import { findByName } from "../project.js";
-import type { BackgroundTaskRegistry } from "./background-tasks.js";
-import type { SteerableSession, SubagentRegistry } from "./subagent-registry.js";
+import type { BackgroundTaskRegistry, UsageLike } from "./background-tasks.js";
+import type {
+  SteerableSession,
+  SubagentRegistry,
+  SubagentUsage,
+} from "./subagent-registry.js";
 import {
   agentTrailerFrame,
   agentTrailerLine,
@@ -136,6 +140,30 @@ export interface DispatchUsage {
 }
 
 /**
+ * Drift guard (FIX 7): `DispatchUsage` (here), `UsageLike` (background-tasks),
+ * and `SubagentUsage` (subagent-registry) are byte-identical by intent but kept
+ * in three files to preserve those modules' no-value-import relationship. This
+ * compile-time assertion breaks `tsc` the moment any of the three gains, loses,
+ * or retypes a field without the others — key drift is caught by the mutual
+ * `keyof` containment, field-type drift by the mutual assignability. Type-only
+ * (the imports above are `import type`, erased at runtime — no cycle).
+ */
+type _SameShape<A, B> = [keyof A] extends [keyof B]
+  ? [keyof B] extends [keyof A]
+    ? A extends B
+      ? B extends A
+        ? true
+        : never
+      : never
+    : never
+  : never;
+type _UsageDriftGuard = _SameShape<DispatchUsage, UsageLike> &
+  _SameShape<DispatchUsage, SubagentUsage>;
+// A `true` here means all three shapes match; `never` (drift) fails this line.
+const _usageDriftOk: _UsageDriftGuard = true;
+void _usageDriftOk;
+
+/**
  * Structural view of Pi's `AgentSession.getSessionStats()` return
  * (`SessionStats`): the subset t06 reads. Pi aggregates over ALL session
  * entries (incl. compacted-away history), so these totals reflect what was
@@ -225,7 +253,11 @@ interface PiSession {
    * older SDKs degrade cleanly — steering a session without it refuses.
    */
   steer?(text: string): Promise<void> | void;
-  /** Queue a follow-up processed after the agent finishes (real Pi followUp). */
+  /**
+   * Queue a follow-up processed after the agent finishes (real Pi followUp).
+   * Declared for the pi-contract pin (kept in sync with Pi's SteerableSession);
+   * the runtime never calls it — steering uses steer(), resume uses reopen().
+   */
   followUp?(text: string): Promise<void> | void;
   /**
    * Aggregate token/cost stats for the whole session (real Pi
@@ -639,17 +671,39 @@ export class SubagentRuntime {
       agent.hooks &&
       Object.values(agent.hooks).some((entries) => entries?.length)
     ) {
-      const parsed = parseHookConfig(agent.hooks, agent.source.path);
-      diagnostics.push(...parsed.diagnostics);
-      if (Object.keys(parsed.config).length > 0) {
-        // Parity (t02 review round 2): the scoped runner keeps the MAIN session
-        // transcript_path — subagent hook events must NOT be re-pointed at the
-        // subagent's own transcript (Claude Code behavior).
-        scopedHooks = this.deps.makeScopedHookRunner(parsed.config);
-        diagnostics.push({
-          severity: "info",
-          message: `agent-scoped hooks active for "${agent.name}" (${Object.keys(parsed.config).join(", ")})`,
-        });
+      try {
+        const parsed = parseHookConfig(agent.hooks, agent.source.path);
+        diagnostics.push(...parsed.diagnostics);
+        if (Object.keys(parsed.config).length > 0) {
+          // Parity (t02 review round 2): the scoped runner keeps the MAIN session
+          // transcript_path — subagent hook events must NOT be re-pointed at the
+          // subagent's own transcript (Claude Code behavior).
+          scopedHooks = this.deps.makeScopedHookRunner(parsed.config);
+          diagnostics.push({
+            severity: "info",
+            message: `agent-scoped hooks active for "${agent.name}" (${Object.keys(parsed.config).join(", ")})`,
+          });
+        }
+      } catch (err) {
+        // coder NIT-3: this hook-config parsing sits BETWEEN the minimal
+        // register() above and the main try/finally that settles the record. A
+        // throw here (before the semaphore is acquired) would otherwise strand the
+        // registry record as "running" forever. Settle it failed and fail the
+        // dispatch loudly (t01 semantics). No slot to release — the semaphore has
+        // not been acquired yet.
+        this.deps.subagentRegistry?.markSettled(agentId, { outcome: "failed" });
+        return {
+          ok: false,
+          outcome: "failed",
+          finalMessage: "",
+          agentId,
+          resumable: false,
+          agentName: agent.name,
+          error: `Subagent "${agent.name}" failed during hook setup: ${capErrorText(
+            (err as Error)?.message ?? String(err),
+          )}`,
+          diagnostics,
+        };
       }
     }
     if (scopedHooks) {
@@ -1814,11 +1868,17 @@ export function createAgentToolDefinition(
           // renders `completed (truncated)` instead of a clean `● completed`.
           cutOff: result.truncated === true,
           ...identityDetails,
-          ...(params.run_in_background
+          // Visible-degrade note (FIX 2): key it on the EFFECTIVE background
+          // request — `run_in_background: true` OR a `background: true` frontmatter
+          // agent (isBackgroundAgent, folded into wantsBackground) — so a
+          // frontmatter-background agent forced foreground (e.g. under
+          // CLAUDE_CODE_DISABLE_BACKGROUND_TASKS) also surfaces the divergence,
+          // matching the registry's "degrades to foreground" claim.
+          ...(wantsBackground
             ? {
                 note: backgroundDisabled
-                  ? "background tasks are disabled (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS); run_in_background ran in foreground"
-                  : "run_in_background requested but no background task registry is wired; ran in foreground",
+                  ? "background tasks are disabled (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS); the background dispatch (run_in_background or a background:true agent) ran in foreground"
+                  : "background dispatch (run_in_background or a background:true agent) requested but no background task registry is wired; ran in foreground",
               }
             : {}),
         },

@@ -1,7 +1,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
+// In-process matrix renderer (FIX 9): importing this does NOT spawn or write —
+// the .mjs runs its CLI only when executed directly. Lets the freshness guard
+// regenerate the matrix deterministically without a child process / CRLF flake.
+import { renderCapabilityMatrix } from "../scripts/gen-capability-matrix.mjs";
 
 import {
   CAPABILITY_REGISTRY,
@@ -236,6 +241,10 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       expect(entry?.tier, ev).toBe("full");
       expect(entry?.note, ev).toContain("agent_id + agent_type");
       expect(entry?.note, ev).toContain("MAIN session transcript");
+      // t07 FIX 5: the parity claim is softened re plugin agent_type — the note
+      // must state agent_type is the bare frontmatter name (no plugin-scoped id),
+      // so "full"/"parity" no longer rests on an unverified plugin assumption.
+      expect(entry?.note.toLowerCase(), ev).toContain("plugin");
     }
   });
 
@@ -360,6 +369,24 @@ describe("CAPABILITY_REGISTRY invariants", () => {
 // ---------------------------------------------------------------------------
 // Tool-name resolution
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Matrix freshness (t07 FIX 9) — the un-fakeable guard
+// ---------------------------------------------------------------------------
+
+describe("capability matrix freshness", () => {
+  it("committed doc/supported-features.md is in sync with the registry (regenerated in-process)", () => {
+    // Regenerate from the SAME registry + baseline the runtime uses and diff
+    // against the committed doc. Both sides CRLF-normalized so a Windows checkout
+    // can't false-fail. The first t07 pass shipped a stale matrix; this makes
+    // that un-fakeable — a registry edit without `npm run gen:capabilities` fails.
+    const regenerated = renderCapabilityMatrix(CAPABILITY_REGISTRY, CLAUDE_BASELINE);
+    const committedPath = fileURLToPath(new URL("../doc/supported-features.md", import.meta.url));
+    const committed = fs.readFileSync(committedPath, "utf8");
+    const norm = (s: string) => s.replace(/\r\n/g, "\n");
+    expect(norm(committed)).toBe(norm(regenerated));
+  });
+});
 
 describe("capabilityForToolName", () => {
   it("resolves known tools from the registry", () => {

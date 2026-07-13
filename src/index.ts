@@ -17,7 +17,7 @@ import {
 } from "./runtime/subagents.js";
 import { SubagentRegistry } from "./runtime/subagent-registry.js";
 import type { SubagentRegistryRecord } from "./runtime/subagent-registry.js";
-import { formatUsageCompact } from "./runtime/subagent-progress.js";
+import { formatUsageCompact, sanitizeLine } from "./runtime/subagent-progress.js";
 import { createGuardExtension } from "./runtime/guard.js";
 import {
   buildSystemPromptSuffix,
@@ -40,6 +40,7 @@ import {
   BackgroundTaskRegistry,
   createTaskOutputTool,
   createTaskStopTool,
+  type SettlementNotice,
 } from "./runtime/background-tasks.js";
 import { builtinAgents } from "./claude/agents.js";
 import { loadAgentMemory } from "./claude/memory.js";
@@ -884,8 +885,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // when the conversation continues — PiCC does NOT re-invoke an idle agent. No
   // wake-an-idle-parent machinery is built here.
   function deliverSettlementNotices(): void {
+    let notices: SettlementNotice[];
     try {
-      const notices = backgroundTasks.drainSettlementNotices(
+      notices = backgroundTasks.drainSettlementNotices(
+        // PEEK the dedup gate (FIX 1) — do not flip it while selecting.
+        (agentId) => subagentRegistry.isSettledNoticeArmed(agentId),
+        // COMMIT the gate — called by the loop below ONLY after a successful send.
         (agentId) => subagentRegistry.consumeSettledNotice(agentId),
         // Drain-fallback gate (SHOULD-3): a true registry MISS means the dispatch
         // failed at an early guard before it ever registered — the notice is then
@@ -893,14 +898,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // task always has a record here, so it stays on the consume path above.
         (agentId) => subagentRegistry.get(agentId) !== undefined,
       );
-      for (const content of notices) {
+    } catch (err) {
+      console.error(`PiCC settlement-notice drain failed: ${(err as Error).message}`);
+      return;
+    }
+    // Deliver each notice in ITS OWN try/catch and commit the dedup gate only
+    // after pi.sendMessage returns (FIX 1): a throw on one notice must neither
+    // drop the remaining in-batch notices nor consume the throwing one — an
+    // un-committed notice re-fires on the next drain instead of being lost.
+    for (const notice of notices) {
+      try {
         pi.sendMessage(
-          { customType: "picc-settlement", content, display: true },
+          { customType: "picc-settlement", content: notice.content, display: true },
           { deliverAs: "steer" },
         );
+        notice.commit();
+      } catch (err) {
+        console.error(`PiCC settlement-notice delivery failed: ${(err as Error).message}`);
       }
-    } catch (err) {
-      console.error(`PiCC settlement-notice delivery failed: ${(err as Error).message}`);
     }
   }
 
@@ -1267,7 +1282,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     };
     for (const record of records) {
       const state = record.state === "running" ? "running" : record.outcome ?? "settled";
-      lines.push(`  ${record.agentId} (${record.agentName}) — ${state}`);
+      // SECURITY (FIX 4, defense-in-depth): agentName comes from agent frontmatter
+      // `name`/basename (only `.trim()`ed upstream — control bytes survive) and is
+      // printed to the human terminal; single-line-sanitize it so an ANSI/OSC/
+      // control-byte agent name cannot inject into the terminal on /usage.
+      const agentName = sanitizeLine(record.agentName, 120);
+      lines.push(`  ${record.agentId} (${agentName}) — ${state}`);
       const usageLine = formatUsageCompact(record.usage);
       lines.push(`    usage: ${usageLine ?? "(none recorded)"}`);
       if (record.transcriptPath) lines.push(`    transcript: ${record.transcriptPath}`);
