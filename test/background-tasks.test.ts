@@ -8,7 +8,7 @@ import {
   type BackgroundTaskRecord,
 } from "../src/runtime/background-tasks.js";
 import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
-import { createAgentToolDefinition } from "../src/runtime/subagents.js";
+import { createAgentToolDefinition, type PiSessionStats } from "../src/runtime/subagents.js";
 import { renderAgentResult } from "../src/runtime/subagent-render.js";
 import {
   formatUsageCompact,
@@ -56,11 +56,13 @@ const renderUpdate = (u: ToolUpdate, isPartial = true) =>
 const makeAgent = (overrides: Partial<ClaudeAgent> = {}): ClaudeAgent =>
   makeBaseAgent({ name: "worker", description: "Does work", body: "You are the worker.", ...overrides });
 
-/** Fake SDK whose sessions block on a gate until released (or aborted). */
-function gatedSdk(finalText: string) {
+/** Fake SDK whose sessions block on a gate until released (or aborted).
+ * `stats` (optional) scripts getSessionStats() so a test can assert per-dispatch
+ * usage capture on the background path. */
+function gatedSdk(finalText: string, stats?: PiSessionStats) {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
-  const handle = fakeSdk({ replies: [{ text: finalText, gate }] });
+  const handle = fakeSdk({ replies: [{ text: finalText, gate }], ...(stats ? { stats } : {}) });
   return { sdk: handle.sdk, release: () => release(), abortCalls: handle.abortCalls };
 }
 
@@ -792,7 +794,10 @@ describe("settlement notices (t05)", () => {
     // notice and the TaskOutput content.
     const ESC = String.fromCharCode(27);
     const hostileType = `worker${ESC}[31m`;
-    const { sdk, release } = gatedSdk("DEFAULT-PATH-VERBATIM");
+    const { sdk, release } = gatedSdk("DEFAULT-PATH-VERBATIM", {
+      tokens: { input: 11, output: 7 },
+      cost: 0.002,
+    });
     const bg = new BackgroundTaskRegistry();
     const runtime = makeRuntime([makeAgent()], sdk);
     const agentTool = createAgentToolDefinition(runtime, {
@@ -819,12 +824,17 @@ describe("settlement notices (t05)", () => {
     // TaskOutput retrieves the verbatim result on the default path, also sanitized.
     const taskOutput = createTaskOutputTool(bg) as unknown as ToolLike;
     const out = await taskOutput.execute("t2", { task_id: taskId });
-    expect(out.content[0]!.text).toBe("DEFAULT-PATH-VERBATIM");
+    // Verbatim body followed only by the appended compact /usage line — so a
+    // DEFAULTED (omitted run_in_background) dispatch's usage is captured and
+    // queryable via TaskOutput after it settles, mirroring the explicit-flag path.
+    expect(out.content[0]!.text).toBe("DEFAULT-PATH-VERBATIM\nusage: in 11 · out 7 · $0.002");
+    expect(out.details.usage).toEqual({ inputTokens: 11, outputTokens: 7, costUsd: 0.002 });
     expect(out.details.status).toBe("completed");
 
     // Real TaskOutput-content sanitization on the default path. The completed
     // path never interpolates the agent type into TaskOutput `content` (the text
-    // IS the verbatim result), so the old `JSON.stringify(out).not.toContain(ESC)`
+    // is the verbatim result plus the appended usage line), so the old
+    // `JSON.stringify(out).not.toContain(ESC)`
     // here was vacuous — JSON.stringify escapes U+001B to  regardless. Drive
     // a FAILED default-path task instead (omitted run_in_background, depth 5 →
     // dispatch depth exceeds maxDepth → ok:false): its hostile subagent_type flows

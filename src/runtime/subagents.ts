@@ -511,8 +511,9 @@ export class SubagentRuntime {
 
   /**
    * True iff `subagentType` resolves to an agent whose frontmatter sets
-   * `background: true` (Claude 2.1.198): the dispatch must run in the background
-   * even when the Agent tool call omits `run_in_background` (t05). Mirrors
+   * `background: true` (Claude 2.1.198): the dispatch runs in the background
+   * even against an explicit `run_in_background: false` (t05) — its remaining
+   * significance now that dispatch is background-by-default. Mirrors
    * dispatch()'s resolution order via the shared resolver.
    */
   isBackgroundAgent(subagentType: string): boolean {

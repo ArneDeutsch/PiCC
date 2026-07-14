@@ -304,6 +304,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     // not the removed "PiCC defaults foreground" gap, and name the residual timing gap.
     expect(bg?.note).toContain("background-by-default");
     expect(bg?.note).not.toContain("PiCC defaults foreground");
+    // F15 t02: the nested-concurrency model is machine-readable — per-depth budgets
+    // bound nested fan-out and diverge from Claude's single global parallel-agent cap.
+    expect(bg?.note).toContain("per-depth budgets");
+    expect(bg?.note).toContain("maxDepth × concurrency");
+    expect(bg?.note).toContain("Claude's single global (~10) parallel-agent cap");
     for (const gap of ["idle parents are not re-invoked", "no always-on Agent View", "no remote/cloud agents", "stop is cooperative"]) {
       expect(bg?.note).toContain(gap);
     }
