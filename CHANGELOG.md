@@ -10,17 +10,22 @@ All notable changes to PiCC are documented here. The format is based on
 
 - **`implement-feature` can now be invoked with a GitHub issue reference (`#5`, `5`, or an issue URL)
   and wire the whole cycle to that ticket.** With a ref present the skill scopes the Phase 1 direction
-  conversation from the issue (title, body, labels, and comments read via `gh`), posts a kickoff
-  comment once the branch exists, opens a ready-for-review pull request linked to the ticket at hand-off
-  (`Closes #N` when the work fully delivers the ticket, a bare `#N` when it only partly does), and posts
-  a reviewer-facing implementation-summary comment. The change is **purely additive**: invoked with no
-  argument the skill behaves exactly as before — no ticket reads, no comments, no auto-PR. Failure
-  handling is **honest** — a missing or unauthenticated `gh`, an unreadable issue, a wrong-repo URL,
-  or a missing `origin` remote stops the ticket path with clear guidance instead of silently dropping
-  the ticket, and a **closed** issue prompts a warning before work starts; a write rejected after
-  successful reads degrades to today's manual
-  hand-off with paste-ready artifacts; and all writes are idempotent on resume (no double kickoff, no
-  duplicate PR). Skill-prose only — no `src/` change.
+  conversation from the issue (title, body, labels, and comments read via `gh`) and, at hand-off, opens
+  a ready-for-review pull request linked to the ticket (`Closes #N` when the work fully delivers the
+  ticket, a bare `#N` when it only partly does) and posts **one** comment on the issue explaining what
+  was built and how the application's behaviour changes. Nothing is posted to the ticket before hand-off.
+  The two hand-off artifacts are written for their audiences: the PR body is a *"Start your review
+  here"* guide to verifying the change in the running app, while the issue comment speaks to the
+  ticket's readers. At close — on either the ticket or the ticketless path — the skill also **offers to
+  file surfaced out-of-scope findings** (unfixed bugs, improvements) as GitHub issues, per-item and only
+  with explicit approval. The change stays **essentially additive**: invoked with no argument the skill
+  does no ticket reads and no auto-PR, and the issue-filing offer is opt-in and appears only when GitHub
+  is reachable. Failure handling is **honest** — a missing or unauthenticated `gh`, an unreadable issue,
+  a wrong-repo URL, or a missing `origin` remote stops the ticket path with clear guidance instead of
+  silently dropping the ticket, and a **closed** issue prompts a warning before work starts; a write
+  rejected after successful reads degrades to a manual hand-off with paste-ready artifacts; and all
+  writes are idempotent on resume (no duplicate comment, PR, or issue). Skill-prose only — no `src/`
+  change.
 
 ### Changed — implement-feature workflow agents (2026-07-14)
 
