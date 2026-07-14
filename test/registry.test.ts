@@ -232,10 +232,14 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     const out = lookupCapability("tool.TaskOutput");
     expect(out?.tier).toBe("full");
     expect(out?.note).toContain("failed status");
-    // t07 FIX 2: the note must name the shared-registry cross-visibility divergence
-    // (Claude hides TaskOutput from subagents; PiCC's session-wide registry does not).
-    expect(out?.note).toContain("session-wide");
-    expect(out?.note).toContain("hides TaskOutput from subagents");
+    // F13 t03: TaskOutput is INHERITED by subagents but SCOPED to the dispatcher's
+    // own tasks — the old inverted "Claude hides TaskOutput; PiCC's session-wide
+    // registry does not" wording is gone. The note must state the scoped behavior
+    // and the honest #15098 hardening (not a blanket "non-divergent" claim).
+    expect(out?.note).toContain("only tasks it dispatched");
+    expect(out?.note).toContain("#15098");
+    expect(out?.note).not.toContain("hides TaskOutput from subagents");
+    expect(out?.note).not.toContain("session-wide, so a subagent");
     const stop = lookupCapability("tool.TaskStop");
     expect(stop?.tier).toBe("partial");
     expect(stop?.note).toContain("PiCC accepts only task_id");
@@ -247,6 +251,10 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(stop?.note).toContain("cooperative");
     expect(stop?.note).toContain("discarded late result");
     expect(stop?.note).toContain("post-stop result semantics are undocumented");
+    // F13 t03: TaskStop is scoped by the identical per-dispatcher guard as
+    // TaskOutput — carry the honest scoped-behavior + #15098 hardening note.
+    expect(stop?.note).toContain("only tasks it dispatched");
+    expect(stop?.note).toContain("#15098");
   });
 
   // Subagent hook payloads carry agent_id + agent_type; transcript_path stays MAIN

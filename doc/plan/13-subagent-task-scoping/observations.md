@@ -53,3 +53,23 @@ material for review.md — dated bullets, one line each.
   own-reach/coordinator-full-reach assertions on that same task, and scoped
   TaskStop own-reach is already covered at the unit layer in t01 (both tools share
   the one `scopedTo` view). Redundant at the integration layer.
+
+## t03 — Capability registry truthfulness
+
+- 2026-07-14 — Planning error the build surfaced and the plan review caught first:
+  a content-assertion test (`test/registry.test.ts:237-238`, added by F02 t07)
+  positively required the exact false strings this feature removes. It was NOT in
+  any task's initial writable surface; the docs plan-reviewer flagged it as a
+  MUST-FIX before implementation, and t03's spec was amended to include it. Lesson:
+  when correcting a registry note, grep the tests for *positive* assertions on the
+  old wording — a truthfulness fix can be blocked by a test that locked the
+  untruth.
+- 2026-07-14 — Parity finding drove a genuine scope refinement: the ticket's
+  premise ("Claude hides TaskOutput from subagents; match that") was refuted in
+  Phase 4 — subagents INHERIT TaskOutput/TaskStop; hiding is a filed Claude bug
+  (#15098/#23154). So F13 keeps both tools and scopes them, and the registry now
+  states an honest hardening (stricter than Claude only on the #15098
+  coordinator-passed-id edge) rather than a blanket "non-divergent" claim.
+- 2026-07-14 — Minor friction: an emphasis-uppercased "ONLY" broke a lowercase
+  `toContain("only tasks it dispatched")` assertion; lowercased the note rather
+  than weakening the test. Trivial.
