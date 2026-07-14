@@ -1423,6 +1423,122 @@ describe("Agent tool run_in_background (audit E4)", () => {
   });
 });
 
+describe("nested background bound — per-depth budgets (F15 t02)", () => {
+  it("a depth-2 background fan-out runs at most `concurrency` concurrently and the excess still completes", async () => {
+    const CONCURRENCY = 2;
+    const N = 5; // more children than the cap → the excess must queue at depth 2
+
+    // Live high-water counter (timer-free): each leaf child increments on entry,
+    // parks on a shared gate, decrements on exit. A semaphore-parked child
+    // physically cannot reach onPrompt, so `maxLive` is the true concurrent peak.
+    let live = 0;
+    let maxLive = 0;
+    let reached = 0;
+    let releaseLeaf!: () => void;
+    const leafGate = new Promise<void>((r) => (releaseLeaf = r));
+    // Barrier resolves the instant CONCURRENCY children are concurrently live —
+    // proves the bound actually ENGAGES (>= C run at once), no timer needed.
+    let resolveBarrier!: () => void;
+    const barrier = new Promise<void>((r) => (resolveBarrier = r));
+    const backgroundFlags: boolean[] = [];
+
+    const { sdk } = fakeSdk({
+      onPrompt: async (text, session) => {
+        if (text.includes("coordinate")) {
+          // Sub-coordinator at depth 1: fan out N depth-2 background children.
+          const agentTool = session.customTools.find((t) => t.name === "Agent")!;
+          for (let i = 0; i < N; i++) {
+            const res = await agentTool.execute(`c${i}`, {
+              subagent_type: "leaf",
+              prompt: `leaf ${i}`,
+            });
+            backgroundFlags.push(res.details?.background === true);
+          }
+          return "fanned-out";
+        }
+        // Leaf child (depth 2): count live concurrency, then park on the gate.
+        reached++;
+        live++;
+        if (live > maxLive) maxLive = live;
+        if (live === CONCURRENCY) resolveBarrier();
+        await leafGate;
+        live--;
+        return "leaf-done";
+      },
+    });
+
+    // Reachability: the nested Agent tool is built WITH a backgroundTasks registry
+    // (as production does via customToolsFor / index.ts) — otherwise the inner
+    // dispatch would take the foreground arm and prove nothing.
+    const nestedRegistry = new BackgroundTaskRegistry();
+    const runtime = makeRuntime([makeAgent({ name: "outer" }), makeAgent({ name: "leaf" })], sdk, {
+      concurrency: CONCURRENCY,
+      maxDepth: 2,
+      customToolsFor: (_a, _g, depth) =>
+        depth === 1
+          ? [createAgentToolDefinition(runtime, { depth, backgroundTasks: nestedRegistry })]
+          : [],
+    });
+
+    const outerDone = runtime.dispatch({ subagentType: "outer", prompt: "coordinate", depth: 1 });
+    await barrier; // C children are concurrently parked at the gate
+    // With the gate still closed, no more than C can have reached onPrompt.
+    expect(live).toBe(CONCURRENCY);
+    releaseLeaf();
+    await outerDone;
+    // Join every child through the nested registry — their presence there is
+    // itself proof the background arm engaged (the foreground arm never start()s).
+    await Promise.all(nestedRegistry.ids().map((id) => nestedRegistry.wait(id)));
+
+    expect(nestedRegistry.ids()).toHaveLength(N);
+    expect(backgroundFlags).toEqual(Array.from({ length: N }, () => true));
+    expect(reached).toBe(N); // the queued excess dequeued and ran
+    expect(maxLive).toBe(CONCURRENCY); // never more than the cap at once
+  }, 10_000);
+
+  it("deadlock regression: a depth-1 parent that TaskOutput(wait)s on its depth-2 background child completes at concurrency 1", async () => {
+    // With a SINGLE shared pool this deadlocks: the depth-1 parent holds the one
+    // slot while blocked in TaskOutput(wait), and the depth-2 child queues for the
+    // same slot forever. Per-depth budgets put the child in its own pool → no cycle.
+    const nestedRegistry = new BackgroundTaskRegistry();
+    let childBackground: unknown;
+    const { sdk } = fakeSdk({
+      onPrompt: async (text, session) => {
+        if (text.includes("parent")) {
+          const agentTool = session.customTools.find((t) => t.name === "Agent")!;
+          const started = await agentTool.execute("c", {
+            subagent_type: "leaf",
+            prompt: "child work",
+          });
+          childBackground = started.details?.background;
+          const taskId = String(started.details?.taskId);
+          const taskOutput = session.customTools.find((t) => t.name === "TaskOutput")!;
+          // wait defaults to true → blocks the parent's turn on the child settling.
+          const out = await taskOutput.execute("o", { task_id: taskId });
+          return `collected:${out.content[0]!.text}`;
+        }
+        return "child-done";
+      },
+    });
+    const runtime = makeRuntime([makeAgent({ name: "parent" }), makeAgent({ name: "leaf" })], sdk, {
+      concurrency: 1,
+      maxDepth: 2,
+      customToolsFor: (_a, _g, depth) =>
+        depth === 1
+          ? [
+              createAgentToolDefinition(runtime, { depth, backgroundTasks: nestedRegistry }),
+              createTaskOutputTool(nestedRegistry),
+            ]
+          : [],
+    });
+
+    const result = await runtime.dispatch({ subagentType: "parent", prompt: "parent go", depth: 1 });
+    expect(childBackground).toBe(true); // child took the background arm at depth 2
+    expect(result.ok).toBe(true);
+    expect(result.finalMessage).toContain("child-done"); // did not hang
+  }, 10_000);
+});
+
 describe("TaskOutput live streaming (F04 t03)", () => {
   const AGENT_ID = "agent-aabbccddeeff";
   const USAGE = { inputTokens: 100, outputTokens: 50, costUsd: 0.0123 };

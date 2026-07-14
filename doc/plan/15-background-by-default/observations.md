@@ -31,6 +31,31 @@ for `review.md`. Dated bullets, one line each.
   cliff remains: same-turn premature finalize, and total result loss in `-p`/print mode
   (no next turn). This is the Option-B/C follow-up we deferred.
 
+## t02 — nested background bound
+
+- 2026-07-14 (design, recorded): per-depth budgets (`Map<number, Semaphore>`, each
+  sized `concurrency`) chosen over a single shared pool because a shared pool
+  deadlocks — a slot-holding parent blocked in `TaskOutput(wait)` and its background
+  child queued for the same pool form a cross-depth cycle. Per-depth keys pools by
+  depth, so every slot edge is intra-depth and every `TaskOutput` edge strictly
+  increases depth → monotone, no cross-depth cycle (security-verified). Total bounded
+  by `maxDepth × concurrency`.
+- 2026-07-14 (divergence from Claude, for t03/review): Claude's parallel-agent cap is a
+  *global* ~10; per-depth budgets allow up to `maxDepth × concurrency` total — a
+  conservative, finite, deadlock-free PiCC choice, not exact parity. Also: nested
+  background is **bounded-wait** (a child may wait for an ancestor turn to release),
+  not infinite parallelism at every depth.
+- 2026-07-14 (test gap caught in review, fixed): acceptance criterion #3
+  (SendMessage-resume at depth ≥ 2 counts against the bound) was enforced by code but
+  unguarded by any test (existing SendMessage tests only use depth 0/1). Added a
+  depth-2 resume test that fails if `background: true` is removed from the resume
+  dispatch.
+- 2026-07-14 (NIT, noted not fixed): with per-depth pools the *foreground* nested
+  bypass is now a behavioural choice (unbounded foreground nested), not a deadlock
+  necessity — a foreground nested acquire would also be deadlock-free. Left as-is
+  (foreground nested is parent-blocking and rare); worth stating in the architecture
+  prose (t03).
+
 ## Pre-existing issues found along the way (out of F15 scope — follow-up candidates)
 
 - 2026-07-14 (security): `unknownIdError` (`src/runtime/background-tasks.ts` ~566-570)
@@ -41,3 +66,10 @@ for `review.md`. Dated bullets, one line each.
   `.trim()`ed `label` (raw `subagent_type`) as the task's `agentType`, surfacing raw in
   `TaskOutput` `details.agent`. Benign today (renderer/notice sanitize at display), but
   the F15 flip makes this the common path — candidate for sanitizing at store time.
+- 2026-07-14 (security, t02): the shared single `BackgroundTaskRegistry` lets a subagent
+  `TaskOutput`-await *any* task (`index.ts` ~660-665) — a pre-existing divergence from
+  Claude (which hides `TaskOutput` from subagents). It enables a residual same-pool
+  peer-await cycle that per-depth budgets cannot break, but it is unreachable through
+  normal id flow (a peer only learns its own id). Scoping `TaskOutput` visibility
+  per-dispatcher would foreclose it — overlaps the already-filed subagent-task-scoping
+  work.
