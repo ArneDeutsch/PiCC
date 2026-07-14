@@ -64,13 +64,19 @@ export interface SubagentRuntimeDeps {
   buildSystemPrompt: (agent: ClaudeAgent, depth?: number) => string;
   /**
    * Claude-named custom tool definitions granted to an agent (WebFetch, Task*, ...).
-   * `subCwd` is the dispatch-local cwd state — tools must resolve against it, not the
-   * orchestrator's cwd, or worktree-isolated agents search the wrong checkout.
+   * `ownerAgentId` is the DISPATCHER's own agent id (this dispatch's minted id,
+   * the `agentId` minted in `dispatch`) — it scopes the agent's TaskOutput/TaskStop to the tasks this
+   * dispatch started AND tags the tasks it starts, so the two line up (F13 t02).
+   * `subCwd` is the dispatch-local cwd state — tools must resolve against it, not
+   * the orchestrator's cwd, or worktree-isolated agents search the wrong checkout.
+   * (`ownerAgentId` is inserted BEFORE the optional `subCwd` because a required
+   * parameter cannot follow an optional one.)
    */
   customToolsFor: (
     agent: ClaudeAgent,
     grantedClaudeNames: string[],
     depth: number,
+    ownerAgentId: string,
     subCwd?: CwdState,
   ) => unknown[];
   /** All Claude tool names the harness knows (for gateTools' allKnown). */
@@ -468,6 +474,18 @@ export class SubagentRuntime {
     if (this.deps.sdk) return Promise.resolve(this.deps.sdk);
     this.sdkPromise ??= loadRealSdk();
     return this.sdkPromise;
+  }
+
+  /**
+   * TEST-ONLY (F13 t02): inject a fake {@link PiSdk} so an offline-integration
+   * test can drive a REAL dispatch through the `picc()`-constructed runtime
+   * (proving the dispatch-mint → customToolsFor → scopedTo / start() owner threading) with
+   * no live model call. Reachable only via the in-process `onWired` seam, never
+   * the project-loading path; call before the first dispatch. Additive: leaves
+   * the production `sdk()` fall-through to `loadRealSdk()` untouched.
+   */
+  setSdkForTest(sdk: PiSdk): void {
+    this.deps.sdk = sdk;
   }
 
   /**
@@ -962,7 +980,10 @@ export class SubagentRuntime {
         this.deps.allKnownToolNames(),
       );
       const piBuiltins = claudeToolsToPiBuiltins(granted);
-      const customTools = this.deps.customToolsFor(agent, granted, opts.depth, subCwd);
+      // `agentId` (the dispatch's own minted id, above) is the OWNER that
+      // scopes this agent's TaskOutput/TaskStop and tags the tasks it starts
+      // (F13 t02). Never derived from a tool param (anti-spoofing).
+      const customTools = this.deps.customToolsFor(agent, granted, opts.depth, agentId, subCwd);
 
       const sdk = await this.sdk();
       const injector = this.deps.makeContextInjector
@@ -1448,10 +1469,95 @@ function capErrorText(message: string): string {
 /**
  * The cut-off-note mechanism (t01): partial/truncated subagent output followed
  * by a clearly separated note naming the cause. The note is the ONLY error text
- * ever mixed into the otherwise-verbatim message channel.
+ * ever mixed into the otherwise-verbatim message channel. Exported (F14 t01) so
+ * the fork presentation path can produce a byte-identical frame.
  */
-function appendCutOffNote(text: string, note: string): string {
+export function appendCutOffNote(text: string, note: string): string {
   return `${text.replace(/\s+$/, "")}\n\n---\n[subagent cut off] ${note}`;
+}
+
+/**
+ * The default cut-off note (F14 t01): used when a failed run carries partial
+ * output but no explicit error string. Reproduces the Agent tool's inline
+ * wording verbatim so the fork path (t02) stays byte-identical.
+ */
+const DEFAULT_CUT_OFF_NOTE = "The run ended on an API error before completing.";
+
+/**
+ * The user-facing presentation of a {@link DispatchResult} (F14 t01). A
+ * `result` is returned/folded into content text (carrying `cutOff`); a
+ * `failure` is thrown or folded into an error channel. The `text`/`message`
+ * already carry any resume trailer and cut-off frame — the consumer owns only
+ * the surrounding `details` (identity/usage/outcome/error) and the actual
+ * throw-vs-return plumbing.
+ */
+export type DispatchPresentation =
+  | { kind: "result"; text: string; cutOff: boolean }
+  | { kind: "failure"; message: string };
+
+/**
+ * Map a {@link DispatchResult} to its user-facing {@link DispatchPresentation}
+ * (F14 t01), reproducing the `Agent` tool's F02 four-branch mapping exactly:
+ * completed / failed-with-partial / failed-no-output / aborted.
+ *
+ * TOTAL & pure: returns a presentation for every result and never throws (reads
+ * `finalMessage` defensively). Does NOT re-apply `capErrorText` — `result.error`
+ * arrives pre-capped from dispatch construction, so re-capping would double-cap
+ * and could corrupt the verbatim channel.
+ *
+ * `allowResumeTrailer` (default `true`) gates the resume trailer on top of
+ * `result.resumable`; passing `false` suppresses every trailer regardless of
+ * resumability (forks are non-resumable — t02 passes `false`).
+ */
+export function presentDispatchResult(
+  result: DispatchResult,
+  opts?: { allowResumeTrailer?: boolean },
+): DispatchPresentation {
+  const withTrailer = result.resumable && opts?.allowResumeTrailer !== false;
+  const finalMessage = result.finalMessage ?? "";
+
+  // failed WITH partial output → SUCCESS-shaped result: the partial output plus
+  // a clearly separated cut-off note naming the error. A resumable agent's ID
+  // rides in the same frame (single `\n`, non-"completed" wording).
+  if (result.outcome === "failed" && finalMessage.trim()) {
+    const cut = appendCutOffNote(finalMessage, result.error ?? DEFAULT_CUT_OFF_NOTE);
+    return {
+      kind: "result",
+      text: withTrailer
+        ? `${cut}\n${agentTrailerLine(result.agentId, { completed: false })}`
+        : cut,
+      cutOff: true,
+    };
+  }
+
+  // failed with no partial output, or aborted → surface as a failure. A
+  // resumable FAILED-with-no-partial run still delivers its agent ID; aborted
+  // and non-resumable failures carry no trailer (aborted's ternary requires
+  // outcome === "failed").
+  if (!result.ok) {
+    const base = result.error ?? "subagent failed";
+    return {
+      kind: "failure",
+      message:
+        result.outcome === "failed" && withTrailer
+          ? `${base}${agentTrailerFrame(result.agentId, { completed: false })}`
+          : base,
+    };
+  }
+
+  // completed → the verbatim final message. Resumable completions append a
+  // trailer OUTSIDE the verbatim channel; a truncated completion already ends
+  // with a `---` cut-off frame, so the trailer rides INSIDE it (single `\n`,
+  // non-"completed" wording) rather than stacking a second frame.
+  let text: string;
+  if (!withTrailer) {
+    text = finalMessage;
+  } else if (result.truncated) {
+    text = `${finalMessage}\n${agentTrailerLine(result.agentId, { completed: false })}`;
+  } else {
+    text = `${finalMessage}${agentTrailerFrame(result.agentId, { completed: true })}`;
+  }
+  return { kind: "result", text, cutOff: result.truncated === true };
 }
 
 /**
@@ -1486,7 +1592,19 @@ function createMaxTurnsExtension(maxTurns: number, diagnostics: Diagnostic[]) {
 /** The `Agent` dispatch tool definition (Claude-compatible; also registered as `Task`). */
 export function createAgentToolDefinition(
   runtime: SubagentRuntime,
-  opts: { depth: number; name?: string; backgroundTasks?: BackgroundTaskRegistry },
+  opts: {
+    depth: number;
+    name?: string;
+    backgroundTasks?: BackgroundTaskRegistry;
+    /**
+     * The DISPATCHER's own agent id (F13 t02): when this Agent tool is handed to
+     * a subagent, tasks it starts in the background are tagged with this owner so
+     * the subagent's scoped TaskOutput/TaskStop can reach them (and nobody else's
+     * can). Undefined for the coordinator instance — its tasks stay
+     * coordinator-owned (`owner: undefined`, reachable only via the full registry).
+     */
+    ownerAgentId?: string;
+  },
 ): Record<string, unknown> {
   return {
     name: opts.name ?? "Agent",
@@ -1602,6 +1720,10 @@ export function createAgentToolDefinition(
           () => controller.abort(),
           agentId,
           label,
+          // Owner tag (F13 t02): the dispatcher's id (a subagent's own id, or
+          // undefined for the coordinator) so scoped TaskOutput/TaskStop reach
+          // exactly the tasks that dispatcher started.
+          opts.ownerAgentId,
         );
         taskId = id;
         // Identity-at-start (F04 t02): the agent id appears for EVERY background
@@ -1646,50 +1768,41 @@ export function createAgentToolDefinition(
         // the model-visible content, so the verbatim-return contract is untouched.
         usage: result.usage,
       };
-      if (result.outcome === "failed" && result.finalMessage.trim()) {
-        // Claude 2.1.200 semantics: real work done before an API death comes back
-        // as a SUCCESS result — the partial output plus a clearly separated
-        // cut-off note naming the error. Never a normal-looking success.
-        // A resumable agent's ID rides in the same delimited frame (t02): the
-        // coordinator can follow up on the cut-off run via SendMessage (t04).
-        const cut = appendCutOffNote(
-          result.finalMessage,
-          result.error ?? "The run ended on an API error before completing.",
-        );
+      // Claude 2.1.200 outcome→presentation mapping (F14 t01): the text, cut-off
+      // frame, resume trailer, and throw-vs-return decision all live in the
+      // shared, pure `presentDispatchResult` helper — the fork path (t02)
+      // consumes the same helper for byte-identical framing. `details`
+      // (identity/usage/outcome/error/note) stays this consumer's job.
+      const presentation = presentDispatchResult(result);
+      if (presentation.kind === "failure") {
+        // Failed with no output ("Agent terminated early due to an API error: ...",
+        // or a pre-start failure naming its cause) and aborted runs (distinct
+        // wording naming the abort) both surface on the isError channel.
+        // A resumable FAILED-with-no-partial run still delivers its agent ID;
+        // aborted and non-resumable failures carry no trailer.
+        throw new Error(presentation.message);
+      }
+      // A `kind:"result"` with outcome "failed" is necessarily the cut-off case:
+      // presentDispatchResult only routes failed-WITH-partial to `result` (aborted
+      // and failed-no-output become `kind:"failure"` above). This mirrors the
+      // helper's own branch guard — keep the two in sync if that guard changes.
+      if (result.outcome === "failed") {
+        // failed WITH partial output → success-shaped cut-off result: the partial
+        // output plus a clearly separated cut-off note. A resumable agent's ID
+        // rides in the same delimited frame (t02): the coordinator can follow up
+        // on the cut-off run via SendMessage (t04).
         return {
-          content: [
-            {
-              type: "text",
-              text: result.resumable
-                ? `${cut}\n${agentTrailerLine(result.agentId, { completed: false })}`
-                : cut,
-            },
-          ],
+          content: [{ type: "text", text: presentation.text }],
           details: {
             agent: result.agentName,
             worktreePath: result.worktreePath,
             diagnostics: result.diagnostics,
             outcome: result.outcome,
-            cutOff: true,
+            cutOff: presentation.cutOff,
             error: result.error,
             ...identityDetails,
           },
         };
-      }
-      if (!result.ok) {
-        // Failed with no output ("Agent terminated early due to an API error: ...",
-        // or a pre-start failure naming its cause) and aborted runs (distinct
-        // wording naming the abort) both surface on the isError channel.
-        // A resumable FAILED-with-no-partial run still delivers its agent ID —
-        // the coordinator gets no other channel to it (the background path
-        // already delivers the ID on failure; parity here, t02 review item 3).
-        // Aborted and non-resumable failures carry no trailer.
-        const base = result.error ?? "subagent failed";
-        throw new Error(
-          result.outcome === "failed" && result.resumable
-            ? `${base}${agentTrailerFrame(result.agentId, { completed: false })}`
-            : base,
-        );
       }
       // Verbatim-return contract (plan §4.3): callers parse finalMessage directly
       // (often a locked YAML block) — compatibility notes belong in details only.
@@ -1699,24 +1812,17 @@ export function createAgentToolDefinition(
       // completion was truncated it already ends with a `---` cut-off frame, so
       // the trailer rides INSIDE that frame (single `\n`, non-"completed"
       // wording) rather than stacking a second frame (t02 review item 4).
-      let text: string;
-      if (!result.resumable) {
-        text = result.finalMessage;
-      } else if (result.truncated) {
-        text = `${result.finalMessage}\n${agentTrailerLine(result.agentId, { completed: false })}`;
-      } else {
-        text = `${result.finalMessage}${agentTrailerFrame(result.agentId, { completed: true })}`;
-      }
       return {
-        content: [{ type: "text", text }],
+        content: [{ type: "text", text: presentation.text }],
         details: {
           agent: result.agentName,
           worktreePath: result.worktreePath,
           diagnostics: result.diagnostics,
           outcome: result.outcome,
           // UX-3: a turn-capped SUCCESS is truncated — surface it so the badge
-          // renders `completed (truncated)` instead of a clean `● completed`.
-          cutOff: result.truncated === true,
+          // renders `completed (truncated)` instead of a clean `● completed`
+          // (`presentation.cutOff === result.truncated === true` on this path).
+          cutOff: presentation.cutOff,
           ...identityDetails,
           // Visible-degrade note (F15 intent-split): key it on EXPLICIT background
           // intent — `run_in_background: true` OR a `background: true` frontmatter

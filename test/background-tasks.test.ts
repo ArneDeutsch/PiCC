@@ -1889,3 +1889,219 @@ describe("TaskOutput live streaming (F04 t03)", () => {
     expect(abHuman).toContain(`Task(${abId})`); // badge chip
   });
 });
+
+/**
+ * F13 t01: owner-scoped registry view. A subagent's TaskOutput/TaskStop reach
+ * ONLY the tasks that same subagent dispatched (`record.owner === ownerId`);
+ * sibling-subagent and coordinator (`owner: undefined`) tasks are unreachable,
+ * with no foreign read, no side effect, and a refusal indistinguishable from a
+ * genuinely-unknown id. All in-memory; foreign "running" tasks use a gate that
+ * is never released, so a leaking delegation would hang the test.
+ */
+describe("BackgroundTaskRegistry.scopedTo — per-dispatcher isolation (F13 t01)", () => {
+  /**
+   * Start a RUNNING task the test controls: its promise blocks on a gate (never
+   * released unless the test releases it), and its abort hook counts calls so we
+   * can assert a foreign task is never aborted.
+   */
+  const gatedTask = (
+    registry: BackgroundTaskRegistry,
+    label: string,
+    opts: { owner?: string; agentId?: string; agentType?: string } = {},
+  ): { id: string; release: () => void; aborts: () => number } => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let aborts = 0;
+    const id = registry.start(
+      label,
+      (async () => {
+        await gate;
+        return result();
+      })(),
+      () => {
+        aborts += 1;
+      },
+      opts.agentId,
+      opts.agentType,
+      opts.owner,
+    );
+    return { id, release, aborts: () => aborts };
+  };
+
+  /** Capture a tool's refusal message (null if the call unexpectedly resolves). */
+  const captureError = async (tool: ToolLike, taskId: string): Promise<string | null> => {
+    try {
+      await tool.execute("t", { task_id: taskId });
+      return null;
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+  };
+
+  /** The "Known background tasks:" list segment of an unknown-id error. */
+  const knownSegment = (msg: string): string => {
+    const i = msg.indexOf("Known background tasks:");
+    return i >= 0 ? msg.slice(i) : msg;
+  };
+
+  it("own task is reachable through the scoped view (TaskOutput resolves, TaskStop stops)", async () => {
+    const registry = new BackgroundTaskRegistry();
+    gatedTask(registry, "agent:coord"); // coordinator, owner: undefined
+    const a = gatedTask(registry, "agent:a", { owner: "subA", agentId: "childA" });
+    gatedTask(registry, "agent:b", { owner: "subB" });
+
+    const scoped = registry.scopedTo("subA");
+    const taskOutput = createTaskOutputTool(scoped) as unknown as ToolLike;
+    const out = await taskOutput.execute("t", { task_id: a.id, wait: false });
+    expect(out.details.taskId).toBe(a.id);
+    expect(out.details.status).toBe("running");
+
+    const taskStop = createTaskStopTool(scoped) as unknown as ToolLike;
+    const stopped = await taskStop.execute("t2", { task_id: a.id });
+    expect(stopped.details.status).toBe("stopped");
+    expect(registry.get(a.id)?.status).toBe("stopped");
+    expect(a.aborts()).toBe(1); // own task's cooperative abort fired
+  });
+
+  it("own task dispatched AFTER the scoped tools were built is still reachable (live delegation)", async () => {
+    const registry = new BackgroundTaskRegistry();
+    gatedTask(registry, "agent:coord"); // seed so the registry is non-empty
+    const scoped = registry.scopedTo("subA");
+    const taskOutput = createTaskOutputTool(scoped) as unknown as ToolLike;
+    const taskStop = createTaskStopTool(scoped) as unknown as ToolLike;
+
+    // subA has no task yet; the scope must delegate LIVE, not off a snapshot.
+    const a = gatedTask(registry, "agent:a", { owner: "subA" });
+
+    const out = await taskOutput.execute("t", { task_id: a.id, wait: false });
+    expect(out.details.taskId).toBe(a.id); // an eager snapshot would 404 here
+    const stopped = await taskStop.execute("t2", { task_id: a.id });
+    expect(stopped.details.status).toBe("stopped");
+    expect(registry.get(a.id)?.status).toBe("stopped");
+  });
+
+  it.each([
+    { who: "a sibling subagent", owner: "subB" as string | undefined, running: true },
+    { who: "the coordinator", owner: undefined as string | undefined, running: false },
+  ])("refuses a $who task on TaskOutput/TaskStop without leaking it", async ({ owner, running }) => {
+    const registry = new BackgroundTaskRegistry();
+    gatedTask(registry, "agent:a", { owner: "subA", agentId: "childA" }); // subA owns one task
+    const foreign = gatedTask(registry, "agent:SECRET-LABEL", {
+      owner,
+      agentId: "SECRET-AGENTID",
+      agentType: "SECRET-TYPE",
+    });
+    if (!running) {
+      foreign.release();
+      await registry.wait(foreign.id);
+    }
+
+    const scoped = registry.scopedTo("subA");
+    const tools: ToolLike[] = [
+      createTaskOutputTool(scoped) as unknown as ToolLike,
+      createTaskStopTool(scoped) as unknown as ToolLike,
+    ];
+    for (const tool of tools) {
+      const message = await captureError(tool, foreign.id);
+      expect(message).not.toBeNull(); // the call was refused (threw)
+      // No foreign field leaks (the echoed requested id is the caller's own input).
+      expect(message).not.toContain("SECRET-LABEL");
+      expect(message).not.toContain("SECRET-AGENTID");
+      expect(message).not.toContain("SECRET-TYPE");
+      // The "Known background tasks" segment is identical to a truly-unknown id —
+      // a foreign-but-existing id is indistinguishable from an unknown one.
+      const unknownMsg = await captureError(tool, "task-does-not-exist");
+      expect(unknownMsg).not.toBeNull();
+      expect(knownSegment(message!)).toBe(knownSegment(unknownMsg!));
+    }
+    // Foreign task untouched by the refused calls.
+    expect(registry.get(foreign.id)?.status).toBe(running ? "running" : "completed");
+    expect(foreign.aborts()).toBe(0);
+  });
+
+  it("the refusal's known-ids list is scoped to the caller's own ids only", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const a = gatedTask(registry, "agent:a", { owner: "subA" });
+    const b = gatedTask(registry, "agent:b", { owner: "subB" });
+    const coord = gatedTask(registry, "agent:coord");
+
+    const taskOutput = createTaskOutputTool(registry.scopedTo("subA")) as unknown as ToolLike;
+    const message = await captureError(taskOutput, "task-does-not-exist");
+    expect(message).not.toBeNull();
+    const segment = knownSegment(message!);
+    expect(segment).toContain(a.id); // own id listed
+    expect(segment).not.toContain(b.id); // sibling id never listed
+    expect(segment).not.toContain(coord.id); // coordinator id never listed
+  });
+
+  it("delivers ZERO progress snapshots for a foreign running task and never subscribes to it", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const subB = gatedTask(registry, "agent:b", { owner: "subB", agentId: "childB" });
+    const scoped = registry.scopedTo("subA");
+
+    // (a) scoped TaskOutput on the foreign running id is refused BEFORE any
+    // subscription — no listener is ever added to the foreign task.
+    const taskOutput = createTaskOutputTool(scoped) as unknown as ToolLike;
+    await expect(taskOutput.execute("t", { task_id: subB.id })).rejects.toThrow();
+    expect(registry.subscriberCount(subB.id)).toBe(0);
+
+    // (b) the scoped view's own subscribeProgress must not reach the foreign task.
+    const snaps: ProgressSnapshot[] = [];
+    const unsub = scoped.subscribeProgress(subB.id, (s) => snaps.push(s));
+    registry.noteProgress(subB.id, { tail: ["> Grep (x)"], activity: "running Grep…" });
+    expect(snaps).toEqual([]); // zero snapshots delivered
+    expect(registry.subscriberCount(subB.id)).toBe(0); // no foreign listener registered
+    expect(typeof unsub).toBe("function"); // a no-op unsubscribe was returned
+    expect(() => unsub()).not.toThrow();
+
+    // A scoped wait must not resolve off the foreign task's settlement — it
+    // returns undefined immediately; delegating would hang (gate never released).
+    await expect(scoped.wait(subB.id)).resolves.toBeUndefined();
+  });
+
+  it("a refused foreign TaskStop has no effect (foreign task not aborted)", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const subB = gatedTask(registry, "agent:b", { owner: "subB" });
+    const taskStop = createTaskStopTool(registry.scopedTo("subA")) as unknown as ToolLike;
+    await expect(taskStop.execute("t", { task_id: subB.id })).rejects.toThrow();
+    expect(registry.get(subB.id)?.status).toBe("running"); // unchanged
+    expect(subB.aborts()).toBe(0); // abort never invoked
+  });
+
+  // Defense-in-depth: the tool short-circuits at get(), so it never reaches the
+  // view's own foreign stop() branch. Exercise that branch DIRECTLY, so a
+  // regression that made scoped stop() delegate to registry.stop(foreignId)
+  // (firing the foreign abort) fails loudly instead of being masked by the tool.
+  it("scoped stop() on a foreign id is a no-op returning the unknown-id shape, no abort", () => {
+    const registry = new BackgroundTaskRegistry();
+    const subB = gatedTask(registry, "agent:b", { owner: "subB" });
+    const result = registry.scopedTo("subA").stop(subB.id);
+    expect(result).toEqual({ found: false, alreadySettled: false, abortRequested: false });
+    expect(subB.aborts()).toBe(0);
+    expect(registry.get(subB.id)?.status).toBe("running");
+  });
+
+  it("the coordinator (full registry, no scopedTo) still reaches every task", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const coord = gatedTask(registry, "agent:coord");
+    const a = gatedTask(registry, "agent:a", { owner: "subA" });
+    const b = gatedTask(registry, "agent:b", { owner: "subB" });
+    const taskOutput = createTaskOutputTool(registry) as unknown as ToolLike;
+    for (const id of [coord.id, a.id, b.id]) {
+      const out = await taskOutput.execute("t", { task_id: id, wait: false });
+      expect(out.details.taskId).toBe(id);
+    }
+    expect(registry.scopedTo("subA").ids()).toEqual([a.id]);
+    expect(registry.scopedTo("subB").ids()).toEqual([b.id]);
+  });
+
+  it("a subB-owned task is unreachable from a subA scope (parent cannot reach grandchild)", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const b = gatedTask(registry, "agent:b", { owner: "subB" });
+    const scoped = registry.scopedTo("subA");
+    expect(scoped.get(b.id)).toBeUndefined();
+    expect(scoped.ids()).toEqual([]);
+    const taskOutput = createTaskOutputTool(scoped) as unknown as ToolLike;
+    await expect(taskOutput.execute("t", { task_id: b.id })).rejects.toThrow();
+  });
+});

@@ -14,8 +14,9 @@ import {
   SubagentRuntime,
   createAgentToolDefinition,
   createSendMessageToolDefinition,
-  type PiSdk,
+  presentDispatchResult,
 } from "./runtime/subagents.js";
+import type { PiSdk } from "./runtime/subagents.js";
 import { SubagentRegistry } from "./runtime/subagent-registry.js";
 import type { SubagentRegistryRecord } from "./runtime/subagent-registry.js";
 import { formatUsageCompact, sanitizeLine } from "./runtime/subagent-progress.js";
@@ -42,6 +43,7 @@ import {
   BackgroundTaskRegistry,
   createTaskOutputTool,
   createTaskStopTool,
+  scopedBackgroundTools,
   type SettlementNotice,
 } from "./runtime/background-tasks.js";
 import { builtinAgents } from "./claude/agents.js";
@@ -185,19 +187,35 @@ function parseSlashCommand(command: string): { name: string; argsText: string } 
  * ever supplies it — Pi invokes the extension entry as `picc(pi)` with a single
  * argument — so a loaded project can never use it to swap runtime internals. An
  * env/settings/file-gated seam would be a project-reachable runtime-swap bypass;
- * an in-process argument is not.
+ * an in-process argument is not. The same invariant binds the `sdk` field below
+ * (F14 t02): the fake Pi SDK it carries is the subagent runtime's execution
+ * substrate — strictly higher privilege than the `onWired` registries — so it is
+ * read ONLY off this in-process argument and plumbed straight into the runtime's
+ * `deps.sdk`; when it is absent the runtime lazy-loads the real Pi SDK. There is
+ * no `process.env` / `project.settings` / file fallback anywhere on that path.
  */
 export interface PiccTestSeam {
   onWired?: (internals: {
     backgroundTasks: BackgroundTaskRegistry;
     subagentRegistry: SubagentRegistry;
+    /**
+     * The session's SubagentRuntime (F13 t02): lets an offline-integration test
+     * inject a fake PiSdk (`setSdkForTest`) and then drive a REAL dispatch through
+     * the coordinator's registered Agent tool, so the dispatcher-owner threading
+     * is exercised end to end (the owner id is minted by the runtime, never
+     * supplied by the test). Reachable only via this in-process seam.
+     */
+    subagentRuntime: SubagentRuntime;
   }) => void;
   /**
    * TEST-ONLY subagent SDK override: replaces the real Pi SDK the session's
-   * SubagentRuntime would otherwise load, so an offline test can drive real
-   * dispatch/fork paths (e.g. a `context: fork` skill invoked through the
-   * SlashCommand or Skill tool) deterministically without an LLM/network. Same
-   * in-process-only reachability guarantee as `onWired` above.
+   * SubagentRuntime would otherwise load, so an offline test can drive the REAL
+   * dispatch/fork paths through a controllable outcome without an LLM/network —
+   * a `context: fork` skill invoked through the Skill tool, the SlashCommand tool
+   * (F11), or the user-typed `/name` input transform (F14). Consumed at
+   * SubagentRuntime construction as `deps.sdk`; unset ⇒ the runtime lazy-loads
+   * the real Pi SDK (`loadRealSdk()`). Same in-process-only reachability
+   * guarantee as `onWired` above (see the SECURITY note).
    */
   sdk?: PiSdk;
 }
@@ -422,7 +440,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    * A3), no agent persona (and no dependency on whatever agent happens to sort
    * first, or on any agent existing at all).
    */
-  function forkDispatch(skill: ClaudeSkill, rendered: string, depth: number, argsText = "") {
+  function forkDispatch(
+    skill: ClaudeSkill,
+    rendered: string,
+    depth: number,
+    argsText = "",
+    abortSignal?: AbortSignal,
+  ) {
     const plugin = pluginContextFor(skill);
     const vars = skillActivationVars({
       skill,
@@ -448,6 +472,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           unknownKeys: [],
           diagnostics: [],
         };
+    // Threads Pi's Esc AbortSignal into the dispatch (F14 t02). dispatch always
+    // resolves a DispatchResult (incl. on abort), so forkDispatch resolves and
+    // never rejects — both callers rely on that (the input hook must never throw).
     return subagentRuntime.dispatch({
       subagentType: skill.forkAgentType ?? agentOverride!.name,
       prompt: rendered,
@@ -455,6 +482,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       effort: skill.effort,
       depth,
       agentOverride,
+      abortSignal,
     });
   }
 
@@ -471,14 +499,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // resume a finished one. Registry-only resolution keeps a hostile `to` off the
   // filesystem (SECURITY MUST-FIX #2).
   const subagentRegistry = new SubagentRegistry();
-  // TEST-ONLY seam (t05): hand the real in-process registries to a test that
-  // drives the settlement-notice delivery path. See PiccTestSeam — reachable
-  // only via this in-process argument, never via project/env/settings/files.
-  try {
-    testSeam?.onWired?.({ backgroundTasks, subagentRegistry });
-  } catch (err) {
-    console.error(`PiCC test seam onWired failed: ${(err as Error).message}`);
-  }
   // Built-in agent types (audit E1): general-purpose/Explore/Plan, appended
   // AFTER project/user/plugin agents so a same-named project agent wins (an
   // overridden built-in is dropped from the catalog — dispatch resolves the
@@ -636,7 +656,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const subagentRuntime = new SubagentRuntime({
     getAgents: () => project.agents,
     buildSystemPrompt: buildSubagentSystemPrompt,
-    customToolsFor: (agent, granted, depth, subCwd) => {
+    customToolsFor: (agent, granted, depth, ownerAgentId, subCwd) => {
       // Per-dispatch instances (fresh TaskStore, dispatch-local cwd binding).
       // NOTE (t04): SendMessage is deliberately NEVER built here — it is
       // parent-initiated only (no subagent→subagent or subagent→parent channel).
@@ -657,17 +677,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // into context:fork dispatches and leaves parent session state alone.
         tools.push(createSlashCommandTool({ depth, forSubagent: true }) as Record<string, unknown>);
       }
-      // Background-task tools share the ONE session-wide registry (audit E4). A
-      // subagent that is granted TaskOutput/TaskStop can therefore reach ANY task
-      // in the session — its own AND its siblings'/parent's — not only the tasks
-      // it started. (Claude Code hides TaskOutput from subagents entirely; PiCC's
-      // shared-registry exposure is a known divergence — candidate follow-up to
-      // scope task visibility per dispatcher. See observations.md 2026-07-12.)
+      // Background-task tools are SCOPED to this dispatcher's own tasks (F13 t02):
+      // built over `backgroundTasks.scopedTo(ownerAgentId)`, so a subagent's
+      // TaskOutput/TaskStop reach only the tasks it itself dispatched — a sibling's
+      // or the coordinator's task is indistinguishable from an unknown id. The
+      // coordinator keeps the full registry (below), retaining reach to every task.
+      const scoped = scopedBackgroundTools(backgroundTasks, ownerAgentId);
       if (granted.includes("TaskOutput")) {
-        tools.push(createTaskOutputTool(backgroundTasks) as Record<string, unknown>);
+        tools.push(scoped.taskOutput);
       }
       if (granted.includes("TaskStop")) {
-        tools.push(createTaskStopTool(backgroundTasks) as Record<string, unknown>);
+        tools.push(scoped.taskStop);
       }
       if (
         project.settings.subagentsEnabled &&
@@ -675,8 +695,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         (granted.includes("Agent") || granted.includes("Task"))
       ) {
         // Both Claude names: projects grant and reference the dispatch tool as Task.
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks }));
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks }));
+        // `ownerAgentId` tags tasks THIS subagent starts, so its own scoped tools
+        // (above) — and nobody else's — can reach them (F13 t02).
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId }));
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId }));
       }
       return tools;
     },
@@ -710,10 +732,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     concurrency: project.settings.subagentConcurrency,
     sessionId,
     subagentRegistry,
-    // TEST-ONLY (PiccTestSeam): an injected fake SDK lets offline tests exercise
-    // real dispatch/fork paths; undefined in every non-test path → loadRealSdk().
-    sdk: testSeam?.sdk,
+    // TEST-ONLY seam (F11/F14): an injected fake SDK reaches every dispatch —
+    // including forks, which close over this one runtime instance. Read ONLY
+    // from the in-process testSeam argument; unset ⇒ the runtime lazy-loads the
+    // real Pi SDK (loadRealSdk). Never sourced from env/settings/files.
+    ...(testSeam?.sdk ? { sdk: testSeam.sdk } : {}),
   });
+
+  // TEST-ONLY seam (t05 settlement drain; F13 t02 dispatcher-owner threading):
+  // hand the real in-process registries AND the runtime to a test that drives the
+  // settlement-notice delivery path or an offline dispatch (fake SDK injected via
+  // subagentRuntime.setSdkForTest). See PiccTestSeam — reachable only via this
+  // in-process argument, never via project/env/settings/files. Invoked after the
+  // runtime is built so the test can inject its fake SDK before the first dispatch.
+  try {
+    testSeam?.onWired?.({ backgroundTasks, subagentRegistry, subagentRuntime });
+  } catch (err) {
+    console.error(`PiCC test seam onWired failed: ${(err as Error).message}`);
+  }
 
   // ---------------------------------------------------------------------------
   // Tool registration
@@ -729,11 +765,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    * model-visible error. `invokedName` is the CALLER-supplied name (which for a
    * bare name resolving to a plugin-namespaced skill differs from `skill.name`);
    * the refusal message is built from it so each tool's wording is preserved.
+   * `signal` is Pi's per-call Esc signal (F14): threaded into the fork dispatch so
+   * an Esc'd model-invoked fork (Skill OR SlashCommand tool) reports as aborted.
    */
   async function runSkillActivation(
     skill: ClaudeSkill,
     argsText: string,
-    opts: { forSubagent: boolean; depth: number; invokedName: string },
+    opts: { forSubagent: boolean; depth: number; invokedName: string; signal?: AbortSignal },
   ): Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }> {
     if (skill.disableModelInvocation) {
       throw new Error(`Skill "${opts.invokedName}" is user-only (disable-model-invocation). Ask the user to run /${opts.invokedName}.`);
@@ -743,11 +781,18 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         fork: true,
         recordActivation: !opts.forSubagent,
       });
-      const result = await forkDispatch(skill, rendered, opts.depth + 1, argsText);
-      if (!result.ok) throw new Error(result.error ?? "context:fork dispatch failed");
+      // Thread Pi's Esc signal so an Esc'd fork cancels (F14).
+      const result = await forkDispatch(skill, rendered, opts.depth + 1, argsText, opts.signal);
+      // Forks are non-resumable (F02): suppress every resume trailer. The shared
+      // t01 helper reproduces the Agent tool's four-branch mapping —
+      // failed-with-partial preserves the partial + names the cause;
+      // failed-no-output and aborted surface as loud failures (distinct wording);
+      // completed stays the verbatim final message.
+      const p = presentDispatchResult(result, { allowResumeTrailer: false });
+      if (p.kind === "failure") throw new Error(p.message);
       return {
-        content: [{ type: "text", text: result.finalMessage }],
-        details: { forked: true, agent: result.agentName },
+        content: [{ type: "text", text: p.text }],
+        details: { forked: true, agent: result.agentName, cutOff: p.cutOff },
       };
     }
     const rendered = await activateSkill(skill, argsText, {
@@ -784,7 +829,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         name: Type.String({ description: "Skill name from the listing" }),
         arguments: Type.Optional(Type.String({ description: "Arguments for the skill, if any" })),
       }),
-      async execute(_id: string, params: { name: string; arguments?: string }) {
+      async execute(
+        _id: string,
+        params: { name: string; arguments?: string },
+        signal?: AbortSignal,
+      ) {
         // findByName resolves plugin-namespaced skills by bare name when unique.
         const skill = findByName(project.skills, params.name);
         if (!skill) throw new Error(`Unknown skill: ${params.name}`);
@@ -792,6 +841,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           forSubagent: opts.forSubagent,
           depth: opts.depth,
           invokedName: params.name,
+          signal,
         });
       },
     };
@@ -818,7 +868,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       parameters: Type.Object({
         command: Type.String({ description: 'A slash command such as "/deploy staging 1.2.3"' }),
       }),
-      async execute(_id: string, params: { command: string }) {
+      async execute(_id: string, params: { command: string }, signal?: AbortSignal) {
         const parsed = parseSlashCommand(params.command);
         if (!parsed) throw new Error(`SlashCommand requires a command like "/name args".`);
         // findByName resolves plugin-namespaced skills by bare name when unique.
@@ -828,6 +878,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           forSubagent: opts.forSubagent,
           depth: opts.depth,
           invokedName: parsed.name,
+          signal,
         });
       },
     };
@@ -1133,11 +1184,63 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           debug(`input: expanding skill /${skill.name}`);
           const rendered = await activateSkill(skill, argsText, { fork: skill.contextFork });
           if (skill.contextFork) {
-            const result = await forkDispatch(skill, rendered, 1, argsText);
+            // A typed `/forked-skill` runs synchronously inside this input hook,
+            // BEFORE the turn streams — so `ctx.signal` is undefined here (there is
+            // no active run to abort). In interactive mode we still make it
+            // Esc-cancellable: watch raw terminal input (`ctx.ui.onTerminalInput`,
+            // interactive-only) and abort our own controller on a bare Esc,
+            // threading that into the fork. Print/RPC modes expose no
+            // `onTerminalInput` and have no Esc, so the fork simply runs to
+            // completion (and `ctx.signal` stays the source of truth if Pi ever
+            // provides one at this stage).
+            let forkSignal: AbortSignal | undefined = ctx.signal;
+            let stopEscWatch: (() => void) | undefined;
+            if (!forkSignal && typeof ctx.ui?.onTerminalInput === "function") {
+              // Subscribing is host (Pi) plumbing — if it throws, degrade to an
+              // uncancellable fork rather than let the throw reach the handler's
+              // catch and leak the raw `/skill` to the model (never-throw, below).
+              try {
+                const escController = new AbortController();
+                stopEscWatch = ctx.ui.onTerminalInput((data: string) => {
+                  // A lone ESC (0x1b) is a cancel; ESC-prefixed sequences (arrow
+                  // keys, etc.) are longer, so match the bare byte only. Consume it
+                  // so Pi doesn't also act on the same keypress.
+                  if (data.length === 1 && data.charCodeAt(0) === 0x1b) {
+                    escController.abort();
+                    return { consume: true };
+                  }
+                  return undefined;
+                });
+                forkSignal = escController.signal;
+              } catch {
+                stopEscWatch = undefined;
+                forkSignal = ctx.signal;
+              }
+            }
+            // Fork non-resumable (allowResumeTrailer:false) and — critically —
+            // EVERY outcome is folded into the transform text, never thrown: a
+            // throw here would hit the handler's catch and send the raw
+            // unexpanded `/skill` to the model, silently dropping the fork's work.
+            let result;
+            try {
+              result = await forkDispatch(skill, rendered, 1, argsText, forkSignal);
+            } finally {
+              // Teardown must never throw over a computed result.
+              try {
+                stopEscWatch?.();
+              } catch {
+                /* ignore terminal-input unsubscribe failure */
+              }
+            }
+            const p = presentDispatchResult(result, { allowResumeTrailer: false });
             parts.push(
-              result.ok
-                ? `The ${skill.name} skill ran in a forked subagent. Its result:\n\n${result.finalMessage}`
-                : `The ${skill.name} skill (context: fork) failed: ${result.error}`,
+              p.kind === "result"
+                ? // completed OR failed-with-partial: p.text already carries the
+                  // partial + cut-off note when the run died mid-flight.
+                  `The ${skill.name} skill ran in a forked subagent. Its result:\n\n${p.text}`
+                : // failed-no-output / aborted: name the cause loudly (no partial
+                  // to preserve); the expansion still happens so the turn proceeds.
+                  `The ${skill.name} skill (context: fork) did not finish: ${p.message}`,
             );
             continue;
           }

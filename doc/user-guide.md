@@ -194,7 +194,11 @@ Every subagent is now visible, both to you and to the coordinating model:
   recent tool calls / output lines, and explicit visibility of silent waits (API auto-retry).
   Pressing **Esc** cancels a running foreground dispatch (it reports as aborted — rendered in an
   error frame worded as aborted, not a distinct abort badge; the dedicated aborted badge is a
-  background/next-turn surface). Pressing **Esc** while *awaiting* a background task only detaches
+  background/next-turn surface) — this covers `Agent`/`Task` dispatches and a model-invoked
+  `context: fork` (the `Skill` or `SlashCommand` tool). A *typed* `/forked-skill` expansion has no
+  per-call signal (it runs before the turn streams), so in interactive mode the input hook watches
+  raw terminal input and cancels the fork on Esc; in print/RPC modes there is no Esc, so a typed
+  fork runs to completion. Pressing **Esc** while *awaiting* a background task only detaches
   the live view — the background task keeps running (retrieve it again with `TaskOutput`); Esc does
   not stop a background task.
 - **Background tasks are observable too.** A `TaskOutput` call awaiting a still-running background

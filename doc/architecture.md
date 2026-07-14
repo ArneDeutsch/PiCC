@@ -129,6 +129,8 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
   (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces every dispatch to the foreground). Settlement of a
   background dispatch is **pushed** to the coordinator at its next turn (a bounded, untrusted-framed
   notice) so it learns the outcome without polling `TaskOutput`.
+  Subagent `TaskOutput`/`TaskStop` are **scoped to the dispatcher's own tasks** (via
+  `registry.scopedTo(ownerId)`, F13); the coordinator retains full session-wide reach.
 - `background-identity.ts` — shared validated and bounded background identity formatter, with fixed
   fallbacks for invalid task ids, agent ids, and display types.
 - `worktrees.ts` — `WorktreeManager` for `EnterWorktree`/`ExitWorktree`: creates
@@ -268,6 +270,20 @@ principle in the plan (§2.1 mechanical fidelity).
     default-direction gap (F15) is **closed**; the residual divergence that keeps
     `feature.background-agents` partial is settlement *timing* — PiCC pushes the notice to an idle
     parent on its next turn where Claude notifies mid-turn (see `feature.background-agents`).
+  - **One presentation for every dispatch (F14).** The `context: fork` path was the last place
+    this contract diverged — a fork that died on a terminal error used to drop its partial output
+    and crash rather than fail loudly. F14 closed that gap, so the fork path now conforms to the
+    contract above. The unification is structural: t01 extracted a shared exported
+    `presentDispatchResult` helper (`subagents.ts`) that renders the completed/failed/aborted
+    outcome, the named cause, and the partial-output cut-off frame from **one** source of truth,
+    and the Agent tool plus **both** fork consumers (the typed top-level-input caller and the
+    model-invoked `Skill`/`SlashCommand`-tool caller — one shared `runSkillActivation` path) route
+    through it. Esc cancels an in-flight fork and reports it aborted on both routes, by different
+    mechanisms: a **model-invoked** fork (the `Skill`/`SlashCommand` tool) rides Pi's per-call
+    abort signal; a **typed top-level `/forked-skill`** has no per-call signal (the input event
+    fires before the turn streams), so in interactive mode the input hook instead watches raw
+    terminal input (`ctx.ui.onTerminalInput`) and aborts on a bare Esc. Print/RPC modes have no
+    Esc, so a typed fork there runs to completion.
 
 - **Nested background fan-out is concurrency-bounded (F15 t02).** Dispatch is background-by-default at
   every depth, but a nested (depth ≥ 2) fan-out does not spawn an unbounded number of concurrent
