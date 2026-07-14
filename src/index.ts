@@ -23,6 +23,7 @@ import {
   buildSystemPromptSuffix,
   contextForTouchedFile,
   createTierChangeReporter,
+  MEMORY_WRITE_POLICY,
   newSessionContextState,
   resetInjectionState,
 } from "./runtime/context-assembly.js";
@@ -537,9 +538,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           const parts = [`Memory directory: ${memory.dir}`];
           const memContent = memory.content?.trim();
           if (memContent) parts.push(memContent);
-          parts.push(
-            "You may persist durable knowledge for future runs in this directory via the Write/Edit tools, with MEMORY.md as the index (only MEMORY.md is loaded automatically — keep it under ~200 lines). Prune entries that prove wrong or obsolete.",
-          );
+          parts.push("Any memory shown above is loaded for you each run — use it.");
+          parts.push(MEMORY_WRITE_POLICY);
           sections.push(`# Agent memory\n\n${parts.join("\n\n")}`);
         }
       } else {

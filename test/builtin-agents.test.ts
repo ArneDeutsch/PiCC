@@ -32,6 +32,7 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
 });
 
 import picc from "../src/index.js";
+import { MEMORY_WRITE_POLICY } from "../src/runtime/context-assembly.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 
 let dir: string;
@@ -194,8 +195,17 @@ describe("agent memory injection (audit B5)", () => {
     expect(prompt).toContain("# Agent memory");
     expect(prompt).toContain(path.join(dir, relDir));
     expect(prompt).toContain(marker);
-    // The persistence instructions point at Write/Edit + MEMORY.md as index.
-    expect(prompt).toContain("MEMORY.md as the index");
+    // The per-agent guidance is now conservative (F10). Assert on a phrase UNIQUE to
+    // the OLD per-agent string — the co-injected "# Auto memory" section would satisfy
+    // a whole-prompt /remember/i even if the per-agent string had not been flipped, so
+    // that is a false green. "You may persist" only ever appeared in the per-agent
+    // string, so its absence proves the per-agent flip specifically.
+    expect(prompt).not.toContain("You may persist");
+    // ...and positively pin that the conservative policy actually reached the per-agent
+    // section: these agents also get the co-injected "# Auto memory" section, so the shared
+    // MEMORY_WRITE_POLICY must appear exactly twice. A dropped per-agent push collapses it
+    // to 1 (no write guidance at that site) and fails — closing the "removal-only" gap.
+    expect(prompt.split(MEMORY_WRITE_POLICY).length - 1).toBe(2);
   });
 
   it("unknown memory scope injects NO memory section (visible degrade)", async () => {

@@ -129,13 +129,30 @@ managed):
 | Artifact | Source |
 |---|---|
 | Instructions | `CLAUDE.md` (cwd ancestors up to the filesystem root, nested per-directory, `@import` expansion, `CLAUDE.local.md` siblings), `~/.claude/CLAUDE.md`, managed-policy CLAUDE.md (file or inline `claudeMd` settings key) |
-| Memory | auto memory: `MEMORY.md` (first 200 lines / 25 KB) from the per-project memory dir under `~/.claude/projects/…/memory`, with write-back conventions — gated by `autoMemoryEnabled` / `autoMemoryDirectory` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY`; agent `memory:` frontmatter scopes likewise |
+| Memory | auto memory: `MEMORY.md` (first 200 lines / 25 KB) from the per-project memory dir under `~/.claude/projects/…/memory`, with conservative write-back — memory is written only when you explicitly ask it to remember something (see note below) — gated by `autoMemoryEnabled` / `autoMemoryDirectory` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY`; agent `memory:` frontmatter scopes likewise |
 | Rules | `.claude/rules/**/*.md` (unconditional at start; `paths:`-scoped inject when you touch matching files) |
 | Skills | `.claude/skills/**/SKILL.md` (+ `~/.claude/skills`), lazy-loaded; `.claude/commands/**/*.md` legacy commands (recursive, `sub:name`-qualified on collisions) |
 | Agents | `.claude/agents/*.md` (+ user scope) plus the built-in `general-purpose`, `Explore`, and `Plan` types — dispatchable via the `Agent` tool |
 | Settings | `.claude/settings.json`, `settings.local.json`, `~/.claude/settings.json`, managed policy |
 | Hooks | `settings.json` `hooks` (+ plugin hooks, + skill- and agent-scoped `hooks:`) |
 | Plugins | already-installed plugins from `~/.claude/plugins` + project-bundled `.claude-plugin/` |
+
+> **Auto memory is conservative by default.** PiCC loads `MEMORY.md` every session but writes
+> to it only when you explicitly ask it to remember something (e.g. "remember to…", "make a note
+> that…"). This is a deliberate divergence from Claude Code, which also writes proactively — the
+> conservative default keeps low-value entries from accreting in the memory that loads into every
+> session. To restore Claude-Code-style eager writes on a project, add to that project's
+> `CLAUDE.md`:
+>
+> ```markdown
+> ## Memory
+> Proactively record durable project facts to auto memory as you work — don't wait for me to
+> ask. Keep MEMORY.md as the index, one topic per file, and prune stale entries.
+> ```
+>
+> To opt in **without modifying the target project** (or across all your projects at once), put
+> the same instruction in your user-scope `~/.claude/CLAUDE.md` instead — it composes into the
+> same prompt and overrides the conservative default the same way.
 
 Then use it like Claude Code:
 
@@ -311,8 +328,8 @@ bash+powershell, argument substitution with 0-based `$N` and `\$` escaping, stac
 invocations), rules, agents — built-in `general-purpose`/`Explore`/`Plan` plus project/user agents
 — with nested subagent dispatch (default depth cap 5), loud classified failure semantics
 (failed/aborted, never an empty success) with partial-output preservation, on-disk subagent
-transcripts, live progress rendering, and per-subagent usage accounting, agent-scoped hooks and
-`memory:` scopes, auto memory (`MEMORY.md`), worktrees (incl. `.worktreeinclude`, Windows-tolerant
+transcripts, live progress rendering, and per-subagent usage accounting, agent-scoped hooks,
+worktrees (incl. `.worktreeinclude`, Windows-tolerant
 removal), 13 hook events with the full stdin/stdout contract (Claude matcher semantics, parallel
 dispatch, async handlers), CLAUDE.md hierarchy to the filesystem root + `@import` + managed policy,
 settings toggles, deny rules (incl. Windows path normalization), tool gating,
@@ -325,7 +342,10 @@ turn) — but PiCC defaults dispatches to the **foreground**, whereas Claude Cod
 subagents background-by-default, so an implicit-concurrency fan-out runs serially unless background
 is requested; and `SendMessage` resume/steer — no cross-restart resume, steering reaches only
 background dispatches, idle-parent delivery is next-turn, and `context: fork`/override dispatches
-are non-resumable. `maxTurns` is a best-effort cap.
+are non-resumable. `maxTurns` is a best-effort cap. Auto memory (`MEMORY.md`) and agent `memory:`
+scopes load with full parity, but writes are conservative by default — memory is written only on
+an explicit request to remember, a deliberate divergence from Claude Code's proactive writes (opt
+into eager writes via `CLAUDE.md`).
 
 **Degraded no-op (visible, never crashing):** MCP servers/tools, `ask`/`allow`/permission modes,
 plan mode, `AskUserQuestion`, checkpointing/rewind, output styles, agent teams, background
