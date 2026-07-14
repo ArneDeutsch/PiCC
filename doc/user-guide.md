@@ -165,9 +165,12 @@ Then use it like Claude Code:
 - the model dispatches subagents via the `Agent` tool (description-driven routing; the built-in
   `general-purpose`/`Explore`/`Plan` types complement project agents, a same-named project agent
   overrides a built-in, and an omitted `subagent_type` defaults to general-purpose).
-  `run_in_background: true` (or an agent's `background: true` frontmatter) returns a task id
-  immediately — results are polled/awaited via `TaskOutput` and stopped via `TaskStop`, and a
-  background settlement is announced to the coordinator at its next turn without polling. A
+  dispatch runs in the **background by default** (matching Claude 2.1.198): an omitted
+  `run_in_background` returns a task id immediately, so multiple dispatches in one turn parallelize —
+  results are polled/awaited via `TaskOutput` and stopped via `TaskStop`, and a background settlement
+  is announced to the coordinator at its next turn without polling. Pass `run_in_background: false`
+  for a synchronous inline result (an agent's `background: true` frontmatter forces background even
+  against that), and `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces every dispatch to the foreground. A
   dispatch that dies on an API error is reported as a **loud, named failure** (with any partial
   output), not an empty success; a run stopped on purpose reports as **aborted**. The coordinator
   can address a finished subagent by its agent id with **`SendMessage`** to continue it (full prior
@@ -296,7 +299,7 @@ tracked project files):
 | `PI_CODING_AGENT_DIR` | Pi's own config dir override (auth, models, Pi settings) |
 | `CLAUDE_CODE_SUBAGENT_MODEL` | Highest-priority model override for every subagent dispatch (`inherit` = unset) |
 | `CLAUDE_CODE_DISABLE_AUTO_MEMORY` | Disable auto-memory loading (also: `autoMemoryEnabled: false` in settings) |
-| `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | `run_in_background` dispatches run in the foreground instead |
+| `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | Force **every** `Agent`/`Task` dispatch to the foreground (background is otherwise the default). `SendMessage` resume is inherently async and is **not** governed by this switch |
 | `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` | Remove the built-in `Explore`/`Plan` agent types (`general-purpose` always stays) |
 | `SLASH_COMMAND_TOOL_CHAR_BUDGET` | Override the startup skill-listing character budget |
 
@@ -336,11 +339,14 @@ settings toggles, deny rules (incl. Windows path normalization), tool gating,
 `WebFetch`/`WebSearch`/`Grep`/`Glob`/`Task*` tools, installed-plugin content, compaction
 preservation under Claude's carryover budgets.
 
-**Partial (works within a named limit):** background subagent dispatch (`run_in_background` /
-`background: true` + `TaskOutput`/`TaskStop`, with settlement pushed to the coordinator at its next
-turn) — but PiCC defaults dispatches to the **foreground**, whereas Claude Code 2.1.198 runs
-subagents background-by-default, so an implicit-concurrency fan-out runs serially unless background
-is requested; and `SendMessage` resume/steer — no cross-restart resume, steering reaches only
+**Partial (works within a named limit):** background subagent dispatch — now the **default** (matching
+Claude Code 2.1.198), with `TaskOutput`/`TaskStop` and settlement pushed to the coordinator at its
+next turn; `run_in_background: false` opts into a synchronous inline result and
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces foreground. The residual gap that keeps it partial is
+that settlement *timing*: PiCC delivers the notice next-turn where Claude notifies mid-turn. Nested
+(depth ≥ 2) background fan-out is concurrency-bounded via per-depth budgets (deadlock-free, total ≤
+`maxDepth × concurrency`) — a conservative PiCC choice, not Claude's single global cap. And
+`SendMessage` resume/steer — no cross-restart resume, steering reaches only
 background dispatches, idle-parent delivery is next-turn, and `context: fork`/override dispatches
 are non-resumable. `maxTurns` is a best-effort cap. Auto memory (`MEMORY.md`) and agent `memory:`
 scopes load with full parity, but writes are conservative by default — memory is written only on

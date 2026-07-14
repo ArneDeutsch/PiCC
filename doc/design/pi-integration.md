@@ -74,8 +74,10 @@ allow/deny/ask (ask ⇒ treated per §6.1 posture: logged, allowed, surfaced); `
 ⇒ injected via `sendMessage`/result patch; `updatedInput` ⇒ mutate `event.input` in place.
 
 ### 3.4 Subagent dispatch
-`Agent` tool params: `{ subagent_type, prompt, model?, run_in_background? }` (background degrades
-to foreground in v1, noted in result). Fan-out: Pi executes sibling tool calls concurrently
+`Agent` tool params: `{ subagent_type, prompt, model?, run_in_background? }` (dispatch is
+**background-by-default** since F15 — an omitted `run_in_background` returns a task id; `false` opts
+into a synchronous foreground run; `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces foreground).
+Fan-out: Pi executes sibling tool calls concurrently
 already (parallel tool mode); our own concurrency limiter (default 4, settings-honored) queues
 `createAgentSession` runs. Each subagent: fresh in-memory session; system prompt = agent body +
 CLAUDE.md/rules hierarchy; tools = intersection of requested `tools:` minus `disallowedTools`,

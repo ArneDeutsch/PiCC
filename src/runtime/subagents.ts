@@ -1724,7 +1724,7 @@ export function createAgentToolDefinition(
           // frontmatter-background agent (or an explicit run_in_background) forced
           // foreground (e.g. under CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, or with no
           // background registry wired) still surfaces the divergence — matching the
-          // registry's "degrades to foreground" claim — while a plain defaulted
+          // registry's forced-to-foreground divergence note — while a plain defaulted
           // dispatch that simply ran foreground does not falsely claim it.
           ...(explicitBackgroundIntent
             ? {

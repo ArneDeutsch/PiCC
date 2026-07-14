@@ -192,19 +192,25 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("tool.TodoWrite")?.tier).toBe("partial");
   });
 
-  // F02 subagent-lifecycle: the dispatch tools carry a real parity divergence
-  // (PiCC defaults FOREGROUND; Claude 2.1.198 runs subagents background-by-default),
-  // so Agent/Task are partial, not full. The note must name the default-direction gap.
-  it("marks the subagent dispatch tools partial and names the failure + default-direction semantics", () => {
+  // F15 background-by-default: the dispatch tools now run background-by-default
+  // (matching Claude 2.1.198). They stay partial because of a real RESIDUAL — the
+  // settlement-timing gap (PiCC pushes the notice next turn; Claude notifies
+  // mid-turn). The assertion checks the NEW default and that residual, not a
+  // surviving "foreground" substring (which the note legitimately still contains).
+  it("marks the subagent dispatch tools partial and names the failure + background-by-default semantics", () => {
     const agent = lookupCapability("tool.Agent");
     expect(agent?.tier).toBe("partial");
     expect(agent?.note).toContain("LOUD failure");
     expect(agent?.note).toContain("agent id");
-    expect(agent?.note.toLowerCase()).toContain("foreground");
+    expect(agent?.note).toContain("BACKGROUND-BY-DEFAULT");
+    expect(agent?.note).toContain("run_in_background:false");
+    // The residual timing gap that keeps it partial must be named.
+    expect(agent?.note).toContain("next turn");
     expect(agent?.note).toContain("2.1.198");
     const task = lookupCapability("tool.Task");
     expect(task?.tier).toBe("partial");
     expect(task?.note).toContain("alias");
+    expect(task?.note).toContain("background-by-default");
   });
 
   // SendMessage is a distinct partial entry: Claude supports resume/steer behavior,
@@ -294,7 +300,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(bg?.note).toContain("Claude 2.1.198+ also accepts agent id/name");
     expect(bg?.note).toContain("resume after TaskStop");
     expect(bg?.note).toContain("Claude Code 2.1.x reference refuses stopped-agent resume");
-    for (const gap of ["PiCC defaults foreground", "idle parents are not re-invoked", "no always-on Agent View", "no remote/cloud agents", "stop is cooperative"]) {
+    // F15: the default is now background — the note must assert the new default,
+    // not the removed "PiCC defaults foreground" gap, and name the residual timing gap.
+    expect(bg?.note).toContain("background-by-default");
+    expect(bg?.note).not.toContain("PiCC defaults foreground");
+    for (const gap of ["idle parents are not re-invoked", "no always-on Agent View", "no remote/cloud agents", "stop is cooperative"]) {
       expect(bg?.note).toContain(gap);
     }
   });

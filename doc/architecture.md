@@ -123,11 +123,12 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
 - `subagent-transcripts.ts` (in `util/`) — agent-id mint/validate, the `<base>.subagents/` dir
   derivation + resolver, and the agent-id result trailer.
 - `background-tasks.ts` — `BackgroundTaskRegistry` plus the real `TaskOutput`/`TaskStop` tools:
-  `run_in_background: true` registers the un-awaited dispatch under a task id; `TaskOutput`
-  waits/polls for the result (a failed task reports its cause, never an empty success),
-  `TaskStop` requests a cooperative abort (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` falls back to
-  foreground). Settlement of a background dispatch is **pushed** to the coordinator at its next
-  turn (a bounded, untrusted-framed notice) so it learns the outcome without polling `TaskOutput`.
+  a dispatch registers the un-awaited run under a task id **by default** (`run_in_background: false`
+  opts back into a blocking foreground run); `TaskOutput` waits/polls for the result (a failed task
+  reports its cause, never an empty success), `TaskStop` requests a cooperative abort
+  (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces every dispatch to the foreground). Settlement of a
+  background dispatch is **pushed** to the coordinator at its next turn (a bounded, untrusted-framed
+  notice) so it learns the outcome without polling `TaskOutput`.
 - `background-identity.ts` — shared validated and bounded background identity formatter, with fixed
   fallbacks for invalid task ids, agent ids, and display types.
 - `worktrees.ts` — `WorktreeManager` for `EnterWorktree`/`ExitWorktree`: creates
@@ -211,9 +212,10 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers:
 6. **Subagent dispatch.** The `Agent`/`Task` tool calls `SubagentRuntime.dispatch`, which spawns a
    fresh Pi session with the gated tool set and returns the final message verbatim (or a loud,
    classified failure — see the *Subagent error contract* in §4). Nested dispatch is depth-capped;
-   the same guard runs inside every subagent session. With `run_in_background: true` (or an agent's
-   `background: true` frontmatter) the dispatch registers in the `BackgroundTaskRegistry` and
-   returns a task id; `TaskOutput`/`TaskStop` manage its lifecycle, and settlement is pushed to the
+   the same guard runs inside every subagent session. By default the dispatch registers in the
+   `BackgroundTaskRegistry` and returns a task id (`run_in_background: false` runs it inline instead;
+   an agent's `background: true` frontmatter forces background; `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`
+   forces foreground); `TaskOutput`/`TaskStop` manage its lifecycle, and settlement is pushed to the
    coordinator at its next `before_agent_start`. `SendMessage` (parent-only) resumes a finished
    subagent by its agent id or steers a running background one.
 
@@ -259,10 +261,27 @@ principle in the plan (§2.1 mechanical fidelity).
     `failed`/`stopped` status that `TaskOutput` reports with the same named cause and partial
     output. A background failure is **never** shown as completed. Retry behavior stays exactly
     Pi's own — no extra recovery logic (`subagents.ts`/`background-tasks.ts`, feature.md §1).
-    Note the **default direction diverges**: PiCC dispatches to the **foreground** by default,
-    whereas Claude Code 2.1.198 runs subagents background-by-default, so an implicit-concurrency
-    fan-out runs serially under PiCC unless `run_in_background`/`background: true` is set — the
-    single most consequential subagent parity gap of this feature (see `feature.background-agents`).
+    Note the **default direction now matches Claude**: PiCC dispatches **background-by-default**
+    (Claude 2.1.198), so an implicit-concurrency fan-out parallelizes — each dispatch returns a task
+    id collected via `TaskOutput`; `run_in_background: false` opts into a synchronous inline run and
+    `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces every dispatch foreground. The formerly-headline
+    default-direction gap (F15) is **closed**; the residual divergence that keeps
+    `feature.background-agents` partial is settlement *timing* — PiCC pushes the notice to an idle
+    parent on its next turn where Claude notifies mid-turn (see `feature.background-agents`).
+
+- **Nested background fan-out is concurrency-bounded (F15 t02).** Dispatch is background-by-default at
+  every depth, but a nested (depth ≥ 2) fan-out does not spawn an unbounded number of concurrent
+  sessions: each depth gets its own `concurrency`-sized budget (a per-depth semaphore keyed by
+  depth), so the total is bounded by `maxDepth × concurrency` and a parent blocked in `TaskOutput`
+  awaiting a child cannot deadlock against it — every slot edge is intra-depth and every `TaskOutput`
+  wait edge strictly increases depth, so no cross-depth cycle can form. This **diverges from Claude**,
+  whose parallel-agent cap is a *single global* (~10): the per-depth budget is a deliberately
+  conservative, finite, deadlock-free PiCC choice, **not** exact parity, and it makes nested
+  background **bounded-wait** (a deep child may wait for an ancestor turn to release a slot), not
+  infinite parallelism at every depth. The *foreground* nested path is left unbounded by behavioural
+  choice, not deadlock necessity — a foreground nested acquire would also be deadlock-free under
+  per-depth pools — because foreground nested dispatch is parent-blocking and rare (`subagents.ts`,
+  feature.md §1).
 
 - **Deny matches any command segment.** The permission matcher is shell-operator aware, so a deny
   like `Bash(rm *)` cannot be evaded by chaining (`git status && rm -rf /`) — every segment is
