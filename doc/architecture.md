@@ -265,6 +265,20 @@ principle in the plan (§2.1 mechanical fidelity).
     whereas Claude Code 2.1.198 runs subagents background-by-default, so an implicit-concurrency
     fan-out runs serially under PiCC unless `run_in_background`/`background: true` is set — the
     single most consequential subagent parity gap of this feature (see `feature.background-agents`).
+  - **One presentation for every dispatch (F14).** The `context: fork` path was the last place
+    this contract diverged — a fork that died on a terminal error used to drop its partial output
+    and crash rather than fail loudly. F14 closed that gap, so the fork path now conforms to the
+    contract above. The unification is structural: t01 extracted a shared exported
+    `presentDispatchResult` helper (`subagents.ts`) that renders the completed/failed/aborted
+    outcome, the named cause, and the partial-output cut-off frame from **one** source of truth,
+    and the Agent tool plus **both** fork consumers (the typed top-level-input caller and the
+    model-invoked `Skill`/`SlashCommand`-tool caller — one shared `runSkillActivation` path) route
+    through it. Esc cancels an in-flight fork and reports it aborted on both routes, by different
+    mechanisms: a **model-invoked** fork (the `Skill`/`SlashCommand` tool) rides Pi's per-call
+    abort signal; a **typed top-level `/forked-skill`** has no per-call signal (the input event
+    fires before the turn streams), so in interactive mode the input hook instead watches raw
+    terminal input (`ctx.ui.onTerminalInput`) and aborts on a bare Esc. Print/RPC modes have no
+    Esc, so a typed fork there runs to completion.
 
 - **Deny matches any command segment.** The permission matcher is shell-operator aware, so a deny
   like `Bash(rm *)` cannot be evaded by chaining (`git status && rm -rf /`) — every segment is

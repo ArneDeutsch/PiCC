@@ -40,6 +40,20 @@ All notable changes to PiCC are documented here. The format is based on
   `disallowed-tools`, but a project that wants to block model-driven skill activation via
   `permissions` must gate **both** tool names, not just `Skill`.
 
+### Fixed — context: fork failure preservation and Esc abort (2026-07-14)
+
+- **A `context: fork` skill that fails partway through no longer silently loses its work or crashes.**
+  A fork that dies on a terminal error is now a **loud failure that names the cause and preserves the
+  partial output** it produced before dying, inside the same cut-off frame the `Agent` tool uses —
+  bringing the fork path to parity with the subagent error contract (Claude 2.1.199). This was the
+  last place the silent-loss/empty-success class of defect survived on the subagent surface. Under the
+  hood the `Agent` tool and every fork consumer now render outcomes through one shared
+  `presentDispatchResult` helper. Pressing **Esc** now cancels an in-flight fork and reports it as
+  **aborted** rather than an empty success or a crash — a model-invoked fork (the `Skill` or
+  `SlashCommand` tool) via Pi's per-call abort signal, and a *typed* top-level `/forked-skill` in
+  interactive mode via the input hook watching raw terminal input for Esc (print/RPC modes have no
+  Esc). Fork dispatches stay non-resumable.
+
 ### Fixed — defensive background-task error storage (2026-07-14)
 
 - Resolved failed and aborted background dispatches now retain only bounded, single-line error text
