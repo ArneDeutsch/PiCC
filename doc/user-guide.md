@@ -183,24 +183,41 @@ Every subagent is now visible, both to you and to the coordinating model:
   an outcome badge (completed / failed / aborted), the transcript path, and a per-subagent usage
   footer, matching what a completed foreground dispatch shows. A poll (`TaskOutput` with
   `wait: false`) shows the task's current status and last activity inside the same identifying frame.
-  Every background surface — the "task started" message, the awaiting/live `TaskOutput`, the poll,
-  and the settled result — carries the same identity components: the task id (`task-N`), the agent
-  type, and its `agent-<id>`, shown even for non-resumable one-shot builtins (the "resumable via
-  `SendMessage`" hint appears only when the task actually is resumable). The exact framing varies by
-  surface — the start block leads with `Agent(<type>) → background as task-N` (with the `agent-<id>`
-  on a subline), while the live/poll/settled views render `Task(task-N) · Agent(<type>) ·
-  agent-<id>`. This is display-only: the verbatim result
-  text the coordinator receives is unchanged. The one boundary: a background task streams live only
-  *while a `TaskOutput` call is awaiting it* — there is no always-on background dashboard.
+  The task-start message and the awaiting/live, poll, and settled `TaskOutput` views carry the same
+  identity components: the task id (`task-N`), displayed agent type, and stable `agent-<id>`, shown
+  even for non-resumable one-shot builtins (the "resumable via `SendMessage`" hint appears only when
+  the task actually is resumable). Their visual framing varies: the start block leads with
+  `Agent(<type>) → background as task-N` (with the `agent-<id>` on a subline), while the
+  live/poll/settled views use the same components in their identifying frame. This TaskOutput
+  rendering is display-only: its completed verbatim result text is unchanged. The one boundary: a
+  background task streams live only *while a `TaskOutput` call is awaiting it* — there is no
+  always-on background dashboard.
 - **`/usage`.** A per-subagent token/cost breakdown for the session: each dispatched agent's id,
   type, outcome, usage line, and transcript path, plus a subagents total. This is **subagent-scoped
   only** — a PiCC-additive view, not Claude Code's whole-session `/usage`/`/cost` (the Pi extension
   API exposes no parent-session cost, so the main agent's own spend is not shown).
+- **Compact lifecycle identity.** A `task-N` identifies one background run; an `agent-<id>`
+  identifies the agent and is the reliable correlation key across resume. Resuming keeps that agent
+  id but creates a new task id. Model-visible `TaskStop` results (for every stop outcome), pushed
+  settlement notices, and `SendMessage` resume acknowledgments identify the work with
+  `Task(task-N) · Agent(<type>) · agent-<id>`, though punctuation and surrounding framing can vary.
+  TaskStop and settlement use the background task record's stored display type. A fresh dispatch
+  record normally stores the requested/display label, which can differ from the resolved registry
+  definition after fallback or case-insensitive matching. A resumed task record and its resume
+  acknowledgment instead use the clean resolved registry name. The stable agent id—not the type
+  text—is therefore the reliable correlation key; broader canonical-type plumbing remains deferred.
+  This concise wording contract is PiCC-defined, not verified as exact Claude Code wording. Tool
+  schemas, lifecycle and stop behavior, settlement delivery, structured results, output framing, and
+  limits are unchanged.
 - **`SendMessage` (resume / steer).** The coordinator can address a finished subagent by its agent
-  id and continue it with its context intact (it resumes in the background under the same id), or
-  redirect a still-running background one. Honest limitations, by design:
+  id and continue it with its context intact (it resumes in the background under the same stable id
+  and a new task id), or redirect a still-running background one. Honest limitations, by design:
   - **No cross-restart resume** — the dispatch registry is process-lifetime; after you quit and
     relaunch `picc`, a prior agent id no longer resolves.
+  - **Stopped agents remain resumable in PiCC** — after `TaskStop`, PiCC currently allows a
+    `SendMessage` resume; the Claude Code 2.1.x reference refuses stopped-agent resume.
+  - **TaskStop addresses tasks only by `task_id`** — current Claude 2.1.198+ also accepts an agent
+    id or name.
   - **Steering reaches only background dispatches** — a foreground `Agent` call blocks the
     coordinator's turn, so there is no moment to steer it; resume works once any dispatch settles.
   - **Idle-parent delivery is next-turn** — an idle coordinator learns of a background settlement
