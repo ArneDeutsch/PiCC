@@ -64,13 +64,19 @@ export interface SubagentRuntimeDeps {
   buildSystemPrompt: (agent: ClaudeAgent, depth?: number) => string;
   /**
    * Claude-named custom tool definitions granted to an agent (WebFetch, Task*, ...).
-   * `subCwd` is the dispatch-local cwd state — tools must resolve against it, not the
-   * orchestrator's cwd, or worktree-isolated agents search the wrong checkout.
+   * `ownerAgentId` is the DISPATCHER's own agent id (this dispatch's minted id,
+   * the `agentId` minted in `dispatch`) — it scopes the agent's TaskOutput/TaskStop to the tasks this
+   * dispatch started AND tags the tasks it starts, so the two line up (F13 t02).
+   * `subCwd` is the dispatch-local cwd state — tools must resolve against it, not
+   * the orchestrator's cwd, or worktree-isolated agents search the wrong checkout.
+   * (`ownerAgentId` is inserted BEFORE the optional `subCwd` because a required
+   * parameter cannot follow an optional one.)
    */
   customToolsFor: (
     agent: ClaudeAgent,
     grantedClaudeNames: string[],
     depth: number,
+    ownerAgentId: string,
     subCwd?: CwdState,
   ) => unknown[];
   /** All Claude tool names the harness knows (for gateTools' allKnown). */
@@ -440,6 +446,18 @@ export class SubagentRuntime {
     if (this.deps.sdk) return Promise.resolve(this.deps.sdk);
     this.sdkPromise ??= loadRealSdk();
     return this.sdkPromise;
+  }
+
+  /**
+   * TEST-ONLY (F13 t02): inject a fake {@link PiSdk} so an offline-integration
+   * test can drive a REAL dispatch through the `picc()`-constructed runtime
+   * (proving the dispatch-mint → customToolsFor → scopedTo / start() owner threading) with
+   * no live model call. Reachable only via the in-process `onWired` seam, never
+   * the project-loading path; call before the first dispatch. Additive: leaves
+   * the production `sdk()` fall-through to `loadRealSdk()` untouched.
+   */
+  setSdkForTest(sdk: PiSdk): void {
+    this.deps.sdk = sdk;
   }
 
   /**
@@ -910,7 +928,10 @@ export class SubagentRuntime {
         this.deps.allKnownToolNames(),
       );
       const piBuiltins = claudeToolsToPiBuiltins(granted);
-      const customTools = this.deps.customToolsFor(agent, granted, opts.depth, subCwd);
+      // `agentId` (the dispatch's own minted id, above) is the OWNER that
+      // scopes this agent's TaskOutput/TaskStop and tags the tasks it starts
+      // (F13 t02). Never derived from a tool param (anti-spoofing).
+      const customTools = this.deps.customToolsFor(agent, granted, opts.depth, agentId, subCwd);
 
       const sdk = await this.sdk();
       const injector = this.deps.makeContextInjector
@@ -1434,7 +1455,19 @@ function createMaxTurnsExtension(maxTurns: number, diagnostics: Diagnostic[]) {
 /** The `Agent` dispatch tool definition (Claude-compatible; also registered as `Task`). */
 export function createAgentToolDefinition(
   runtime: SubagentRuntime,
-  opts: { depth: number; name?: string; backgroundTasks?: BackgroundTaskRegistry },
+  opts: {
+    depth: number;
+    name?: string;
+    backgroundTasks?: BackgroundTaskRegistry;
+    /**
+     * The DISPATCHER's own agent id (F13 t02): when this Agent tool is handed to
+     * a subagent, tasks it starts in the background are tagged with this owner so
+     * the subagent's scoped TaskOutput/TaskStop can reach them (and nobody else's
+     * can). Undefined for the coordinator instance — its tasks stay
+     * coordinator-owned (`owner: undefined`, reachable only via the full registry).
+     */
+    ownerAgentId?: string;
+  },
 ): Record<string, unknown> {
   return {
     name: opts.name ?? "Agent",
@@ -1532,6 +1565,10 @@ export function createAgentToolDefinition(
           () => controller.abort(),
           agentId,
           label,
+          // Owner tag (F13 t02): the dispatcher's id (a subagent's own id, or
+          // undefined for the coordinator) so scoped TaskOutput/TaskStop reach
+          // exactly the tasks that dispatcher started.
+          opts.ownerAgentId,
         );
         taskId = id;
         // Identity-at-start (F04 t02): the agent id appears for EVERY background
