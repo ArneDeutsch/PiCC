@@ -79,6 +79,19 @@ export interface BackgroundTaskRecord {
   label: string;
   status: BackgroundTaskStatus;
   /**
+   * The dispatcher that started this task (F13 t01): the agent id of the
+   * subagent whose Agent-tool dispatch created it, or `undefined` for the
+   * coordinator (owns-all). Distinct from `agentId` — `agentId` is the
+   * *dispatched child's* identity; `owner` is the *dispatcher's*. A scoped view
+   * keyed to owner `X` matches a record iff `record.owner === X` (plain string
+   * compare; `undefined` never matches any scoped owner), so a coordinator task
+   * is reachable only via the full registry, never a scoped view.
+   *
+   * `readonly` (F13 t01 review): set once at start() and never reassigned, so a
+   * foreign task can never be mutated into an own task mid-flight.
+   */
+  readonly owner?: string;
+  /**
    * Final text (verbatim subagent message) once completed; for failed tasks the
    * best-effort partial output produced before the failure, when any exists.
    */
@@ -140,6 +153,23 @@ export interface BackgroundTaskRecord {
   settlementNoticeDelivered?: boolean;
 }
 
+/**
+ * The minimal registry surface the TaskOutput/TaskStop tools consume (F13 t01):
+ * exactly the five members both factories and {@link unknownIdError} call. The
+ * concrete {@link BackgroundTaskRegistry} satisfies it structurally, so the
+ * coordinator keeps passing the full registry unchanged; a subagent instead
+ * receives `registry.scopedTo(ownerId)` — a live-delegating, owner-filtered view
+ * with the identical shape. Widening the tools to this interface makes the scope
+ * the *only* seam: nothing in a tool body can reach a task the view hides.
+ */
+export interface BackgroundTaskView {
+  get(id: string): BackgroundTaskRecord | undefined;
+  ids(): string[];
+  wait(id: string): Promise<BackgroundTaskRecord | undefined>;
+  stop(id: string): { found: boolean; alreadySettled: boolean; abortRequested: boolean };
+  subscribeProgress(id: string, listener: (snapshot: ProgressSnapshot) => void): () => void;
+}
+
 export class BackgroundTaskRegistry {
   private readonly tasks = new Map<string, BackgroundTaskRecord>();
   private counter = 0;
@@ -165,6 +195,7 @@ export class BackgroundTaskRegistry {
     abort?: () => void,
     agentId?: string,
     agentType?: string,
+    owner?: string,
   ): string {
     const id = `task-${++this.counter}`;
     const record: BackgroundTaskRecord = {
@@ -175,6 +206,10 @@ export class BackgroundTaskRegistry {
       // Clean agent type present from the moment the task starts (F04 t02), so
       // it is available before the first progress event and at every surface.
       agentType,
+      // The dispatcher's identity (F13 t01): undefined for the coordinator, the
+      // subagent's own agent id for a subagent dispatch. Left undefined by every
+      // existing caller (t02 threads it), so behavior is unchanged until then.
+      owner,
       diagnostics: [],
       settled: Promise.resolve(),
       abort,
@@ -410,6 +445,37 @@ export class BackgroundTaskRegistry {
     }
     return { found: true, alreadySettled: false, abortRequested };
   }
+
+  /**
+   * A live-delegating, owner-scoped view of this registry (F13 t01): every
+   * member reaches the registry AT CALL TIME (never a construction-time
+   * snapshot) but is filtered to records whose `owner === ownerId`. Live
+   * delegation is load-bearing — a subagent's scoped tools are built before it
+   * dispatches its own task, so a frozen id set would report the subagent's own
+   * later task as unknown and break its legitimate own-work path.
+   *
+   * A record owned by anyone else — including the coordinator's `owner:
+   * undefined`, which never equals a scoped owner — is invisible: `get`/`wait`
+   * return undefined, `ids` omits it, `stop` is a no-op returning the same falsy
+   * shape as an unknown id (it never calls the underlying `stop`, so the foreign
+   * task's `abort` is never invoked), and `subscribeProgress` returns a no-op
+   * unsubscribe WITHOUT registering a listener on the foreign task. This is the
+   * isolation boundary: a foreign id is indistinguishable from a truly-unknown
+   * one, with no foreign read and no side effect.
+   */
+  scopedTo(ownerId: string): BackgroundTaskView {
+    const owns = (id: string): boolean => this.tasks.get(id)?.owner === ownerId;
+    return {
+      get: (id) => (owns(id) ? this.get(id) : undefined),
+      ids: () =>
+        [...this.tasks.values()].filter((task) => task.owner === ownerId).map((task) => task.id),
+      wait: async (id) => (owns(id) ? this.wait(id) : undefined),
+      stop: (id) =>
+        owns(id) ? this.stop(id) : { found: false, alreadySettled: false, abortRequested: false },
+      subscribeProgress: (id, listener) =>
+        owns(id) ? this.subscribeProgress(id, listener) : () => {},
+    };
+  }
 }
 
 /**
@@ -563,8 +629,8 @@ export function buildSettlementNotice(task: BackgroundTaskRecord): string {
   return lines.join("\n");
 }
 
-function unknownIdError(registry: BackgroundTaskRegistry, id: string): Error {
-  const known = registry.ids();
+function unknownIdError(view: BackgroundTaskView, id: string): Error {
+  const known = view.ids();
   return new Error(
     `Unknown task_id "${id}". Known background tasks: ${known.length ? known.join(", ") : "(none — start one with the Agent tool and run_in_background: true)"}`,
   );
@@ -577,7 +643,7 @@ type ToolUpdate = {
 };
 
 /** The `TaskOutput` tool: retrieve a background task's result (waits by default). */
-export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<string, unknown> {
+export function createTaskOutputTool(registry: BackgroundTaskView): Record<string, unknown> {
   return {
     name: "TaskOutput",
     label: "TaskOutput",
@@ -756,7 +822,7 @@ export function createTaskOutputTool(registry: BackgroundTaskRegistry): Record<s
 }
 
 /** The `TaskStop` tool: best-effort cooperative stop of a background task. */
-export function createTaskStopTool(registry: BackgroundTaskRegistry): Record<string, unknown> {
+export function createTaskStopTool(registry: BackgroundTaskView): Record<string, unknown> {
   return {
     name: "TaskStop",
     label: "TaskStop",
