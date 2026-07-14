@@ -302,6 +302,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(bg?.note).toContain("Claude 2.1.198+ also accepts agent id/name");
     expect(bg?.note).toContain("resume after TaskStop");
     expect(bg?.note).toContain("Claude Code 2.1.x reference refuses stopped-agent resume");
+    // F13: the subagent-scoping clause must survive future edits to this entry.
+    expect(bg?.note).toContain("scoped to the subagent's own dispatched tasks");
     for (const gap of ["PiCC defaults foreground", "idle parents are not re-invoked", "no always-on Agent View", "no remote/cloud agents", "stop is cooperative"]) {
       expect(bg?.note).toContain(gap);
     }

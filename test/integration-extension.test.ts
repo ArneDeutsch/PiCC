@@ -756,8 +756,8 @@ describe("background settlement notices without polling (t05, offline-integratio
 describe("subagent background-task scoping (F13 t02, offline-integration via a real dispatch)", () => {
   // A REAL dispatch through the coordinator's registered Agent tool, driven
   // OFFLINE by a fake SDK injected via the onWired seam's subagentRuntime. The
-  // dispatcher-owner id is minted by the RUNTIME (subagents.ts line 559) and
-  // threaded through customToolsFor (:913) into both the subagent's scoped
+  // dispatcher-owner id is minted by the RUNTIME (the `mintAgentId` in dispatch)
+  // and threaded through `customToolsFor` into both the subagent's scoped
   // TaskOutput/TaskStop and the tasks it starts (createAgentToolDefinition →
   // start's owner) — the test never supplies it. We assert the subagent reaches
   // only its OWN task, is refused a coordinator's and a sibling's task (cleanly,

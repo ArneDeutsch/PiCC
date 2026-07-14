@@ -826,8 +826,8 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
  * both tools built over `registry.scopedTo(ownerAgentId)`, so a subagent reaches
  * ONLY the background tasks it itself dispatched — a sibling's or the
  * coordinator's task is indistinguishable from a truly-unknown id (t01 non-leak
- * contract). `ownerAgentId` MUST be the dispatch's own internally-minted agent id
- * (the dispatch's own minted agentId), never a value read from a tool param — the same id
+ * contract). `ownerAgentId` MUST be the dispatch's own internally-minted agent
+ * id, never a value read from a tool param — the same id
  * both scopes these tools and tags the tasks the subagent starts, so they line
  * up. The coordinator keeps building its tools over the full registry directly
  * (unscoped), retaining full reach.
