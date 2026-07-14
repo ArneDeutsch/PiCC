@@ -110,6 +110,82 @@ describe("BackgroundTaskRegistry", () => {
     expect(registry.get(id)?.error).toBe("boom");
   });
 
+  it.each([
+    { outcome: "failed" as const, status: "failed" as const },
+    { outcome: "aborted" as const, status: "stopped" as const },
+  ])(
+    "normalizes and caps a resolved $outcome error on the retained record",
+    async ({ outcome, status }) => {
+      const registry = new BackgroundTaskRegistry();
+      // Build control bytes and line breaks without embedding platform-sensitive
+      // newlines or invisible control bytes in this source file.
+      const mixedWhitespace = String.fromCharCode(9, 10, 13);
+      const controlRun = String.fromCharCode(0, 7, 27, 0x85); // includes non-ASCII C1 Cc
+      const normalized = `${outcome} message ${"x".repeat(600)}`;
+      const raw = `  ${outcome}${mixedWhitespace}${controlRun}message ${"x".repeat(600)}  `;
+      const partial = `partial${String.fromCharCode(10)}output`;
+      const id = registry.start(
+        "agent:a",
+        Promise.resolve(result({ outcome, error: raw, finalMessage: partial })),
+      );
+
+      await registry.wait(id);
+      const retained = registry.get(id);
+      expect(retained?.status).toBe(status);
+      expect(retained?.error).toBe(`${normalized.slice(0, 500)} [truncated]`);
+      if (outcome === "failed") expect(retained?.result).toBe(partial);
+      else expect(retained?.result).toBeUndefined();
+    },
+  );
+
+  it.each(["failed", "aborted"] as const)(
+    "does not truncate a resolved %s error normalized to exactly 500 string units",
+    async (outcome) => {
+      const registry = new BackgroundTaskRegistry();
+      const separator = String.fromCharCode(9, 10, 13, 0, 7, 27);
+      const prefix = `${outcome} boundary `;
+      const normalized = `${prefix}${"y".repeat(500 - prefix.length)}`;
+      const raw = ` ${outcome}${separator}boundary ${"y".repeat(500 - prefix.length)} `;
+      const id = registry.start("agent:a", Promise.resolve(result({ outcome, error: raw })));
+
+      await registry.wait(id);
+      expect(registry.get(id)?.status).toBe(outcome === "failed" ? "failed" : "stopped");
+      expect(registry.get(id)?.error).toBe(normalized);
+      expect(registry.get(id)?.error).toHaveLength(500);
+    },
+  );
+
+  it.each([
+    {
+      outcome: "failed" as const,
+      status: "failed" as const,
+      fallback: "subagent dispatch failed",
+    },
+    {
+      outcome: "aborted" as const,
+      status: "stopped" as const,
+      fallback: "subagent dispatch was aborted",
+    },
+  ])(
+    "preserves the resolved $outcome nullish fallback and an explicit empty error",
+    async ({ outcome, status, fallback }) => {
+      const registry = new BackgroundTaskRegistry();
+      const missingId = registry.start(
+        "agent:a",
+        Promise.resolve(result({ outcome, error: undefined })),
+      );
+      const emptyId = registry.start(
+        "agent:a",
+        Promise.resolve(result({ outcome, error: "" })),
+      );
+
+      await registry.wait(missingId);
+      await registry.wait(emptyId);
+      expect(registry.get(missingId)).toMatchObject({ status, error: fallback });
+      expect(registry.get(emptyId)).toMatchObject({ status, error: "" });
+    },
+  );
+
   it("never lets a rejecting promise escape: records failed instead", async () => {
     const registry = new BackgroundTaskRegistry();
     const id = registry.start("agent:a", Promise.reject(new Error("kaput")));

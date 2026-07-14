@@ -6,6 +6,13 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — defensive background-task error storage (2026-07-14)
+
+- Resolved failed and aborted background dispatches now retain only bounded, single-line error text
+  at the task-registry boundary. Whitespace and Unicode `Cc` control-character runs are normalized and
+  oversized errors are capped, preventing future dispatch callers from bypassing the existing
+  defense-in-depth handling on user-visible and model-facing failure paths.
+
 ### Added — GitHub ticket integration for implement-feature (2026-07-14)
 
 - **`implement-feature` can now be invoked with a GitHub issue reference (`#5`, `5`, or an issue URL)
