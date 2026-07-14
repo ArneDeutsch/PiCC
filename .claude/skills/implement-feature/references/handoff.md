@@ -6,6 +6,14 @@ summary. Before any public GitHub write you must also have read the write discip
 [ticket-integration.md](ticket-integration.md); if either reference cannot be read, refuse all public
 writes and tell the user.
 
+> **Delivery: posted (maintainer) vs. paste-ready (fork).** The PR-body and issue-comment skeletons
+> below are **single-sourced here** and used by both paths. On the **maintainer** path they are
+> *posted* by `gh` as described in this file. On the **fork** path they are handed to the user
+> *paste-ready* (nothing is auto-posted); the fork path also chooses the top linking line by where the
+> resolved issue lives (a plain `Closes #N` is unsafe cross-repo). That fork-specific delivery and
+> linking discipline live in [fork.md](fork.md) (Phase 9 — fork hand-off); this file's maintainer
+> procedure is unchanged.
+
 1. If a remote exists: `git fetch`. If `origin/<default>` moved, merge it into the feature branch, resolve conflicts, and verify typecheck + full suite are green again. Then push: `git push -u origin feature/<NN>-<slug>`.
    If there is **no remote**: merge the local default branch if it moved, verify green — the hand-off is the local branch itself.
 
@@ -52,7 +60,7 @@ writes and tell the user.
    **Write-failure degrade** (reads succeeded but a write is rejected): do **not** stop cold. Lead with "nothing is lost", report which writes already landed (so the user doesn't double-post), then hand over paste-ready artifacts — the PR base/compare/title/body and the issue-comment body, verbatim, with the actual `gh` error. If a PR already exists (Rule 9), the correct degrade is to skip creation and hand over the comment, not to tell the user to open a PR. If the `git push` **itself** is rejected (e.g. `origin` exists but isn't pushable), there is no branch to open a PR against: say so plainly — no hand-off comment has been posted to the ticket at this point (it is the first and only automated ticket write, and it never went out), so there is no premature note to correct. (Any follow-up issues you filed in the Phase 8 offer *do* already stand and were echoed when created — name them so the user knows what is already public.) Hand over the paste-ready PR/comment artifacts for when the branch can be pushed.
 2. **CI check (when possible).** Local green isn't the same as CI green — CI runs on Linux too and has caught environment-only failures before. If the `gh` CLI is available and authenticated (`gh auth status`), watch the pushed branch's run (`gh run list --branch feature/<NN>-<slug>`, then `gh run watch <id> --exit-status`) and treat a red run like any test failure: investigate the logs (`gh run view <id> --log-failed`), fix, push again. If `gh` is not available, don't block — note prominently in the final summary that CI on the Actions tab must be green before merging.
 3. ExitWorktree with `action: keep` — the worktree must survive until the user has merged.
-4. Final summary to the user: what was implemented (per feature.md), notable decisions and deviations, test status, and next steps — which differ by path:
+4. Final summary to the user: what was implemented (per feature.md), notable decisions and deviations, test status, and next steps — which differ by path. **These two next-steps bullets are the maintainer (non-fork) paths only; on the fork path neither is true (a fork run has no auto-opened PR), so [fork.md](fork.md) (Phase 9 — fork hand-off) step 4 replaces them with the compare-URL + paste-ready hand-off.**
    - **Ticketless path (unchanged):** review the branch, open a Pull Request on GitHub (or merge locally if no remote), use "Delete branch" there after merging, and clean up locally afterwards with:
      - `git worktree remove <worktree-path>`
      - `git branch -d feature/<NN>-<slug>` (plus the harness-created `worktree-*` branch for that worktree, if one lingers)

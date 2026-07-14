@@ -78,8 +78,11 @@ path-independent issue-filing offer, on the ticketless path too. Phases 1, 8 and
    default branch — is out and needs explicit per-action user approval. Never merge; GitHub's PR UI
    stays authoritative for merge policy. On the **fork path** the branch push targets the fork
    (`pushRemote`/`push` in [fork.md](fork.md)) — still "our own branch," just not necessarily `origin`;
-   this changes only *where* the push goes, not the allow-list. (The ticket-creation-offer and Phase 8
-   filing target-repo clauses are owned by t04/t05 — not here.)
+   this changes only *where* the push goes, not the allow-list. Moreover, on the fork path the two
+   automated *upstream* writes of the routine three — the PR and the ticket comment — are **not made**:
+   they are replaced by **paste-ready** delivery (the user opens the PR by hand), so the branch push is
+   the **only** automatic GitHub write on a fork run — see [fork.md](fork.md) (Phase 9 — fork hand-off).
+   (The ticket-creation-offer and Phase 8 filing target-repo clauses are owned by t04/t05 — not here.)
 6. **No leakage into public writes.** No tokens (never invoke `gh auth token`), no env, no credential
    or `~/.pi` data, no raw command/test output or diffs, and avoid absolute local paths (they leak the
    OS username). This applies especially when distilling the Phase 9 hand-off texts (PR body and issue

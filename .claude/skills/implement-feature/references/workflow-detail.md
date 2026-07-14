@@ -18,7 +18,7 @@ Converge, then present a **scope mirror** before asking for the go:
 > This feature WILL: …
 > This feature will NOT (deferred/out of scope): …
 
-The user confirms the boundary. Only an explicit "go" moves you to Phase 2. **Write nothing into the repo before Phase 2.** With a ticket present, open Phase 1 from the cached issue and extend the scope mirror with the write-contract — [ticket-integration.md](ticket-integration.md) (Per-phase ticket hooks → Phase 1).
+The user confirms the boundary. Only an explicit "go" moves you to Phase 2. **Write nothing into the repo before Phase 2.** With a ticket present, open Phase 1 from the cached issue and extend the scope mirror with the write-contract — [ticket-integration.md](ticket-integration.md) (Per-phase ticket hooks → Phase 1). On **any fork checkout** — ticketless included — also **disclose the fork nature** in the scope mirror here (a new early moment, independent of and composable with the ticket write-contract): [fork.md](fork.md) (Phase 1 — fork disclosure). This is the fork path's "surfaced early" guarantee — it prevents the compare-URL hand-off from being sprung at Phase 9.
 
 ## Phase 2 — Workspace
 

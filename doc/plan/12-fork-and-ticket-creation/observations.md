@@ -35,3 +35,15 @@ for review.md.
   credential redaction in echoed remote URLs. **Lesson:** gh JSON sub-object field names differ from
   top-level (`parent` ≠ a Repository projection) — verify sub-fields against live gh, and never trust
   bare `gh repo view` for classification. This is why the fork half was split out as the risk-bearing task.
+- 2026-07-14 — **t03 review: the compare URL was the single point of failure.** The whole fork hand-off
+  rides on one string. Initial impl used the three-part head `<forkOwner>:<forkRepo>:<branch>...?expand=1`
+  ("rename-safe" per GitHub docs for the compare *view*) — but that + `?expand=1` renders "There isn't
+  anything to compare" (desktop/desktop#16269), which would dead-end every hand-off *after* the push.
+  Switched to the documented two-part `<forkOwner>:<branch>?expand=1`. Lesson: a load-bearing URL in a
+  prose skill has no test to catch it — verify the exact `?expand=1` PR-creation flow, not just the
+  compare-view docs. Also caught: fork Phase 9 pointed at handoff.md's "the PR is already open" line
+  (true for maintainer ticket path, FALSE on a fork) — fixed to REPLACE, not mirror, those next-steps;
+  push-failure degrade could echo an embedded `user:token@` credential (now redacted, matching Phase 0).
+- 2026-07-14 — **Router headroom watch:** after t03 the router body is 17,370 / 20,000 (2,630 left).
+  Instructed t04/t05 to keep resident additions minimal and relocate into reference files. If t05's grid
+  reconciliation risks the cap, relocate the resident write-discipline checklist elaboration.

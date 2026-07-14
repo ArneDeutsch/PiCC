@@ -14,14 +14,19 @@ PR-body / issue-comment **skeletons authored in `references/handoff.md`** (t01) 
 them; `fork.md` points back to those skeletons and only changes the delivery (paste-ready, not
 posted).
 
-**Compare URL (verified form)** — emit exactly:
+**Compare URL** — emit the **two-part head form** (documented and known to work with `?expand=1`):
 ```
-https://github.com/<target-owner>/<target-repo>/compare/<targetDefault>...<forkOwner>:<forkRepo>:<branch>?expand=1
+https://github.com/<target-owner>/<target-repo>/compare/<targetDefault>...<forkOwner>:<branch>?expand=1
 ```
-Three dots; `?expand=1`; use the extended `<forkOwner>:<forkRepo>:<branch>` head form (rename-safe).
-`forkOwner`/`forkRepo` come from the fork's `nameWithOwner`; `forkOwner` also obtainable via
-`gh api user --jq .login`. All components are ASCII/URL-path-safe given model-authored branch slugs.
-**Confirm the branch is actually pushed to the fork before printing the URL**, or the link 404s.
+Three dots; `?expand=1` (opens the PR-creation form). Use the **two-part** `<forkOwner>:<branch>` head,
+**not** the three-part `<forkOwner>:<forkRepo>:<branch>` form: the three-part head + `?expand=1` is
+reported to render "There isn't anything to compare" (desktop/desktop#16269), which would dead-end the
+hand-off after the branch is already pushed. The two-part form is unambiguous for a freshly-pushed
+branch on the user's fork; only if the fork was renamed such that `<forkOwner>:<branch>` is ambiguous
+does the three-part form help — mention that as an aside, don't emit it by default. `forkOwner` comes
+from the fork's `nameWithOwner` (`push`) — authoritative; do **not** substitute `gh api user --jq
+.login` (wrong for an org-owned fork). All components are ASCII/URL-path-safe given the model-authored
+branch slug. **Confirm the branch is actually pushed to the fork before printing the URL**, or the link 404s.
 
 **Fork hand-off procedure (Phase 9, fork path):**
 1. `git push -u <pushRemote> feature/<NN>-<slug>` (the fork). This is the only automatic write.
@@ -78,9 +83,16 @@ branch and open a PR yourself" hand-off with **no** compare URL — and that deg
 claim an auto-PR was or will be created.
 
 ## Writable surface
-- `.claude/skills/implement-feature/references/fork.md` (append hand-off section)
-- `.claude/skills/implement-feature/SKILL.md` (Phase 9 fork-path routing line; Phase 1 fork write-contract line)
-- `.claude/skills/implement-feature/references/handoff.md` (only if a shared skeleton needs a small "delivery: posted vs paste-ready" note; keep skeletons single-sourced)
+**Post-t01/t02 layout:** the Phase 9 maintainer detail + PR/comment skeletons live in
+`references/handoff.md`; the common Phase 1 procedure lives in `references/workflow-detail.md` (Phase 1);
+`references/fork.md` already has the detection half + a "Phase 9" placeholder line. Put the fork
+hand-off **procedure** and the Phase 1 fork-disclosure **text** in `references/fork.md` (new sections),
+and add the routing lines in the router skeleton + workflow-detail Phase 1 so a fork checkout reads
+them. Files:
+- `.claude/skills/implement-feature/references/fork.md` (append the Phase 9 fork hand-off section + a Phase 1 fork-disclosure section)
+- `.claude/skills/implement-feature/SKILL.md` (Phase 9 skeleton: route to fork.md on the fork path; Phase 1 skeleton: note the fork disclosure)
+- `.claude/skills/implement-feature/references/workflow-detail.md` (Phase 1: route to fork.md's disclosure when a fork is detected; Phase 9 pointer if needed)
+- `.claude/skills/implement-feature/references/handoff.md` (only if a shared skeleton needs a small "delivery: posted vs paste-ready" note; keep skeletons single-sourced there and have fork.md reference them)
 
 ## Approach constraints
 - Single-source the PR/comment skeletons in `references/handoff.md`; `fork.md` references them.
