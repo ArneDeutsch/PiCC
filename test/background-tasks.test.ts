@@ -120,7 +120,7 @@ describe("BackgroundTaskRegistry", () => {
       // Build control bytes and line breaks without embedding platform-sensitive
       // newlines or invisible control bytes in this source file.
       const mixedWhitespace = String.fromCharCode(9, 10, 13);
-      const controlRun = String.fromCharCode(0, 7, 27);
+      const controlRun = String.fromCharCode(0, 7, 27, 0x85); // includes non-ASCII C1 Cc
       const normalized = `${outcome} message ${"x".repeat(600)}`;
       const raw = `  ${outcome}${mixedWhitespace}${controlRun}message ${"x".repeat(600)}  `;
       const partial = `partial${String.fromCharCode(10)}output`;
