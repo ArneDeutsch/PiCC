@@ -6,6 +6,37 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — fork-aware hand-off and on-the-fly ticket creation for implement-feature (2026-07-14)
+
+- **`implement-feature` now offers to open a GitHub issue when it was invoked without a ticket.** After
+  the Phase 1 scope mirror converges, and only when GitHub is reachable, the skill previews a
+  model-authored issue capturing the agreed WHAT/WHY and offers — opt-in, as its own yes/no exchange
+  distinct from the build "go" — to file it. On acceptance the issue is filed (its URL echoed) and the
+  run continues **on the ticket path exactly as if the ticket had been given up front** — branch, plan,
+  build, then a pull request and one hand-off comment. Declining keeps the plain ticketless flow. The
+  **maintainer ticket-path hand-off (auto-PR + hand-off comment) is unchanged**; the **maintainer
+  ticketless run is unchanged up to the new offer** and, only if that offer is accepted, gains ticket
+  reads/writes and an auto-PR. The ticketless path now carries **two** opt-in GitHub offers:
+  create-ticket after the scope mirror, and file-findings at close.
+- **`implement-feature` now works from a fork the contributor cannot push to.** The coordinator
+  resolves the upstream *target* repo (where issues live and the PR is based) separately from the
+  *fork* it can push to; every ticket read/write targets the upstream, only the branch push targets the
+  fork. At hand-off on a fork it pushes the branch to the fork and hands over a ready-to-click compare
+  URL plus a paste-ready PR title and body (and an optional paste-ready comment), so the user opens the
+  PR against the upstream through GitHub's web UI — where the upstream's PR template, CONTRIBUTING
+  checklist, and any CLA/DCO gate surface. **No PR or comment is auto-created on a repo the user does
+  not own**; the only automatic GitHub write on a fork run is the branch push. Cross-repo linking is
+  kept safe: a closing keyword is emitted only when the resolved issue lives in the repo the PR targets,
+  otherwise a bare cross-repo reference — so an upstream PR never wrongly closes the target's own
+  same-numbered issue.
+- **The skill was reorganized on disk into a slim always-loaded router plus on-demand reference files**
+  (prose only — no `src/` change). Beyond trimming per-run context, this **fixes silent
+  post-compaction truncation**: the pre-split body exceeded PiCC's 20,000-character per-skill
+  re-injection cap, so after a compaction the later phases and templates were dropped from the resident
+  copy and the workflow proceeded without them. The slim router now stays under the cap and survives
+  intact, with the detail re-read on demand; the write-discipline floor stays resident so public writes
+  are never made with the rules unloaded.
+
 ### Fixed — subagent TaskOutput/TaskStop scoped to the dispatcher's own tasks (2026-07-14)
 
 - **A subagent's `TaskOutput` and `TaskStop` now reach only the background tasks that same subagent
@@ -66,16 +97,17 @@ All notable changes to PiCC are documented here. The format is based on
 - **`implement-feature` can now be invoked with a GitHub issue reference (`#5`, `5`, or an issue URL)
   and wire the whole cycle to that ticket.** With a ref present the skill scopes the Phase 1 direction
   conversation from the issue (title, body, labels, and comments read via `gh`) and, at hand-off, opens
-  a ready-for-review pull request linked to the ticket (`Closes #N` when the work fully delivers the
-  ticket, a bare `#N` when it only partly does) and posts **one** comment on the issue explaining what
-  was built and how the application's behaviour changes. Nothing is posted to the ticket before hand-off.
+  a ready-for-review pull request linked to the ticket (on a pushable target — F12 makes this
+  fork-conditional; `Closes #N` when the work fully delivers the ticket, a bare `#N` when it only partly
+  does) and posts **one** comment on the issue explaining what was built and how the application's
+  behaviour changes. Nothing is posted to the ticket before hand-off.
   The two hand-off artifacts are written for their audiences: the PR body is a *"Start your review
   here"* guide to verifying the change in the running app, while the issue comment speaks to the
   ticket's readers. At close — on either the ticket or the ticketless path — the skill also **offers to
   file surfaced out-of-scope findings** (unfixed bugs, improvements) as GitHub issues, per-item and only
   with explicit approval. The change stays **essentially additive**: invoked with no argument the skill
-  does no ticket reads and no auto-PR, and the issue-filing offer is opt-in and appears only when GitHub
-  is reachable. Failure handling is **honest** — a missing or unauthenticated `gh`, an unreadable issue,
+  does no ticket reads and no auto-PR (unless the create-ticket offer added in F12 above is accepted),
+  and the issue-filing offer is opt-in and appears only when GitHub is reachable. Failure handling is **honest** — a missing or unauthenticated `gh`, an unreadable issue,
   a wrong-repo URL, or a missing `origin` remote stops the ticket path with clear guidance instead of
   silently dropping the ticket, and a **closed** issue prompts a warning before work starts; a write
   rejected after successful reads degrades to a manual hand-off with paste-ready artifacts; and all
