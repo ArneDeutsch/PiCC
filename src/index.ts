@@ -43,6 +43,7 @@ import {
   BackgroundTaskRegistry,
   createTaskOutputTool,
   createTaskStopTool,
+  scopedBackgroundTools,
   type SettlementNotice,
 } from "./runtime/background-tasks.js";
 import { builtinAgents } from "./claude/agents.js";
@@ -197,6 +198,14 @@ export interface PiccTestSeam {
   onWired?: (internals: {
     backgroundTasks: BackgroundTaskRegistry;
     subagentRegistry: SubagentRegistry;
+    /**
+     * The session's SubagentRuntime (F13 t02): lets an offline-integration test
+     * inject a fake PiSdk (`setSdkForTest`) and then drive a REAL dispatch through
+     * the coordinator's registered Agent tool, so the dispatcher-owner threading
+     * is exercised end to end (the owner id is minted by the runtime, never
+     * supplied by the test). Reachable only via this in-process seam.
+     */
+    subagentRuntime: SubagentRuntime;
   }) => void;
   /**
    * TEST-ONLY subagent SDK override: replaces the real Pi SDK the session's
@@ -490,14 +499,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // resume a finished one. Registry-only resolution keeps a hostile `to` off the
   // filesystem (SECURITY MUST-FIX #2).
   const subagentRegistry = new SubagentRegistry();
-  // TEST-ONLY seam (t05): hand the real in-process registries to a test that
-  // drives the settlement-notice delivery path. See PiccTestSeam — reachable
-  // only via this in-process argument, never via project/env/settings/files.
-  try {
-    testSeam?.onWired?.({ backgroundTasks, subagentRegistry });
-  } catch (err) {
-    console.error(`PiCC test seam onWired failed: ${(err as Error).message}`);
-  }
   // Built-in agent types (audit E1): general-purpose/Explore/Plan, appended
   // AFTER project/user/plugin agents so a same-named project agent wins (an
   // overridden built-in is dropped from the catalog — dispatch resolves the
@@ -655,7 +656,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const subagentRuntime = new SubagentRuntime({
     getAgents: () => project.agents,
     buildSystemPrompt: buildSubagentSystemPrompt,
-    customToolsFor: (agent, granted, depth, subCwd) => {
+    customToolsFor: (agent, granted, depth, ownerAgentId, subCwd) => {
       // Per-dispatch instances (fresh TaskStore, dispatch-local cwd binding).
       // NOTE (t04): SendMessage is deliberately NEVER built here — it is
       // parent-initiated only (no subagent→subagent or subagent→parent channel).
@@ -676,17 +677,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // into context:fork dispatches and leaves parent session state alone.
         tools.push(createSlashCommandTool({ depth, forSubagent: true }) as Record<string, unknown>);
       }
-      // Background-task tools share the ONE session-wide registry (audit E4). A
-      // subagent that is granted TaskOutput/TaskStop can therefore reach ANY task
-      // in the session — its own AND its siblings'/parent's — not only the tasks
-      // it started. (Claude Code hides TaskOutput from subagents entirely; PiCC's
-      // shared-registry exposure is a known divergence — candidate follow-up to
-      // scope task visibility per dispatcher. See observations.md 2026-07-12.)
+      // Background-task tools are SCOPED to this dispatcher's own tasks (F13 t02):
+      // built over `backgroundTasks.scopedTo(ownerAgentId)`, so a subagent's
+      // TaskOutput/TaskStop reach only the tasks it itself dispatched — a sibling's
+      // or the coordinator's task is indistinguishable from an unknown id. The
+      // coordinator keeps the full registry (below), retaining reach to every task.
+      const scoped = scopedBackgroundTools(backgroundTasks, ownerAgentId);
       if (granted.includes("TaskOutput")) {
-        tools.push(createTaskOutputTool(backgroundTasks) as Record<string, unknown>);
+        tools.push(scoped.taskOutput);
       }
       if (granted.includes("TaskStop")) {
-        tools.push(createTaskStopTool(backgroundTasks) as Record<string, unknown>);
+        tools.push(scoped.taskStop);
       }
       if (
         project.settings.subagentsEnabled &&
@@ -694,8 +695,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         (granted.includes("Agent") || granted.includes("Task"))
       ) {
         // Both Claude names: projects grant and reference the dispatch tool as Task.
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks }));
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks }));
+        // `ownerAgentId` tags tasks THIS subagent starts, so its own scoped tools
+        // (above) — and nobody else's — can reach them (F13 t02).
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId }));
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId }));
       }
       return tools;
     },
@@ -735,6 +738,18 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // real Pi SDK (loadRealSdk). Never sourced from env/settings/files.
     ...(testSeam?.sdk ? { sdk: testSeam.sdk } : {}),
   });
+
+  // TEST-ONLY seam (t05 settlement drain; F13 t02 dispatcher-owner threading):
+  // hand the real in-process registries AND the runtime to a test that drives the
+  // settlement-notice delivery path or an offline dispatch (fake SDK injected via
+  // subagentRuntime.setSdkForTest). See PiccTestSeam — reachable only via this
+  // in-process argument, never via project/env/settings/files. Invoked after the
+  // runtime is built so the test can inject its fake SDK before the first dispatch.
+  try {
+    testSeam?.onWired?.({ backgroundTasks, subagentRegistry, subagentRuntime });
+  } catch (err) {
+    console.error(`PiCC test seam onWired failed: ${(err as Error).message}`);
+  }
 
   // ---------------------------------------------------------------------------
   // Tool registration
