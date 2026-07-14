@@ -5,6 +5,7 @@ import path from "node:path";
 import picc, { type PiccTestSeam } from "../src/index.js";
 import { resolveGitBashPath } from "../src/engine/shell-inject.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
+import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/fake-sdk.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 
 /**
@@ -749,6 +750,150 @@ describe("background settlement notices without polling (t05, offline-integratio
     expect(joined).toContain("settled: failed");
     expect(joined).toContain("insufficient_quota"); // t01 regression: never a silent success
     expect(joined).toContain("settled: aborted"); // outcome vocabulary (status is "stopped")
+  });
+});
+
+describe("subagent background-task scoping (F13 t02, offline-integration via a real dispatch)", () => {
+  // A REAL dispatch through the coordinator's registered Agent tool, driven
+  // OFFLINE by a fake SDK injected via the onWired seam's subagentRuntime. The
+  // dispatcher-owner id is minted by the RUNTIME (subagents.ts line 559) and
+  // threaded through customToolsFor (:913) into both the subagent's scoped
+  // TaskOutput/TaskStop and the tasks it starts (createAgentToolDefinition →
+  // start's owner) — the test never supplies it. We assert the subagent reaches
+  // only its OWN task, is refused a coordinator's and a sibling's task (cleanly,
+  // no leak), and that the coordinator reaches every task.
+  type Internals = Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
+
+  const findTool = (tools: FakeCustomTool[] | undefined, name: string): FakeCustomTool => {
+    const t = tools?.find((x) => x.name === name);
+    if (!t) throw new Error(`tool ${name} was not injected into the subagent's session`);
+    return t;
+  };
+
+  it("scopes a subagent's TaskOutput/TaskStop to its own dispatched tasks; coordinator keeps full reach", async () => {
+    // Gates so the nested background dispatches settle deterministically — no
+    // setTimeout "let the dispatch create its session" smell.
+    let releaseInner1!: () => void;
+    let releaseInner2!: () => void;
+    const innerGate1 = new Promise<void>((r) => (releaseInner1 = r));
+    const innerGate2 = new Promise<void>((r) => (releaseInner2 = r));
+
+    // Captured FROM THE RUNTIME during dispatch: the exact tools the runtime
+    // handed each subagent, plus the ids of the tasks they started.
+    let subagent1Tools: FakeCustomTool[] | undefined;
+    let subagent2Tools: FakeCustomTool[] | undefined;
+    let ownTaskId1: string | undefined;
+    let siblingTaskId: string | undefined;
+
+    const handle = fakeSdk({
+      onPrompt: async (text, session: FakeSessionState) => {
+        if (text.includes("OUTER1")) {
+          // The subagent uses its OWN injected Agent tool to background a nested
+          // dispatch — the only way a subagent starts a background task.
+          subagent1Tools = session.customTools;
+          const res = await findTool(session.customTools, "Agent").execute("n1", {
+            subagent_type: "general-purpose",
+            prompt: "INNER1",
+            run_in_background: true,
+          });
+          ownTaskId1 = res.details?.taskId as string;
+          return "outer1 done";
+        }
+        if (text.includes("OUTER2")) {
+          subagent2Tools = session.customTools;
+          const res = await findTool(session.customTools, "Agent").execute("n2", {
+            subagent_type: "general-purpose",
+            prompt: "INNER2",
+            run_in_background: true,
+          });
+          siblingTaskId = res.details?.taskId as string;
+          return "outer2 done";
+        }
+        if (text.includes("INNER1")) return { text: "inner1 result", gate: innerGate1 };
+        if (text.includes("INNER2")) return { text: "inner2 result", gate: innerGate2 };
+        return "coord done";
+      },
+    });
+
+    const p = fakePi();
+    let internals!: Internals;
+    picc(p.api as never, { onWired: (i) => (internals = i) });
+    // Inject the fake SDK into the real runtime BEFORE any dispatch, so the
+    // coordinator's registered Agent tool dispatches offline.
+    internals.subagentRuntime.setSdkForTest(handle.sdk);
+
+    const coordAgent = p.tools.get("Agent");
+    // Two foreground subagent dispatches: each starts ITS OWN nested background
+    // task (owner = that subagent's runtime-minted id).
+    await coordAgent.execute("c1", { subagent_type: "general-purpose", prompt: "OUTER1" });
+    await coordAgent.execute("c2", { subagent_type: "general-purpose", prompt: "OUTER2" });
+    // A coordinator-owned background task (owner: undefined).
+    const coordRes = await coordAgent.execute("c3", {
+      subagent_type: "general-purpose",
+      prompt: "COORD",
+      run_in_background: true,
+    });
+    const coordTaskId = coordRes.details.taskId as string;
+
+    expect(ownTaskId1, "subagent1 started its own task").toBeTruthy();
+    expect(siblingTaskId, "subagent2 started its own task").toBeTruthy();
+    expect(coordTaskId).toBeTruthy();
+    // Three distinct ids off the single session-wide counter.
+    expect(new Set([ownTaskId1, siblingTaskId, coordTaskId]).size).toBe(3);
+
+    const sub1Output = findTool(subagent1Tools, "TaskOutput");
+    const sub1Stop = findTool(subagent1Tools, "TaskStop");
+    // Sanity: subagent2 also received its own scoped tools (used implicitly via
+    // the sibling id below; assert it was wired).
+    expect(findTool(subagent2Tools, "TaskOutput").name).toBe("TaskOutput");
+
+    // FOREIGN-REFUSED (before any gate is released — refusal needs no settlement):
+    // the coordinator's and the sibling's tasks are indistinguishable from an
+    // unknown id — a clean throw, no read, no side effect.
+    await expect(sub1Output.execute("r1", { task_id: coordTaskId, wait: false })).rejects.toThrow(
+      /Unknown task_id/,
+    );
+    await expect(
+      sub1Output.execute("r2", { task_id: siblingTaskId!, wait: false }),
+    ).rejects.toThrow(/Unknown task_id/);
+    await expect(sub1Stop.execute("r3", { task_id: coordTaskId })).rejects.toThrow(/Unknown task_id/);
+
+    // Non-leak: an "unknown id" message echoes the QUERIED id back (the caller's
+    // own input — no leak) but its "Known background tasks" list must reveal only
+    // subagent1's OWN task, never the coordinator's or the sibling's id.
+    const errMsg = (r: Promise<unknown>) => r.then(() => "", (e: Error) => e.message);
+    const foreignRefusal = await errMsg(
+      sub1Output.execute("r4", { task_id: coordTaskId, wait: false }),
+    );
+    const knownList = foreignRefusal.split("Known background tasks:")[1] ?? "";
+    expect(knownList).toContain(ownTaskId1!);
+    expect(knownList).not.toContain(coordTaskId);
+    expect(knownList).not.toContain(siblingTaskId!);
+    // Indistinguishable from a genuinely-unknown id: querying a never-issued id
+    // yields the same "known" list (only own tasks) — a foreign task's existence
+    // is unobservable through the refusal.
+    const unknownRefusal = await errMsg(
+      sub1Output.execute("r4b", { task_id: "task-99999", wait: false }),
+    );
+    expect(unknownRefusal.split("Known background tasks:")[1] ?? "").toBe(knownList);
+
+    // No side effect: the refused TaskStop did not stop the coordinator's task.
+    expect(internals.backgroundTasks.get(coordTaskId)?.status).not.toBe("stopped");
+
+    // OWN-REACHABLE: subagent1 retrieves its own task, awaited deterministically.
+    releaseInner1();
+    const ownOut = await sub1Output.execute("r5", { task_id: ownTaskId1!, wait: true });
+    expect(ownOut.content[0].text).toContain("inner1 result");
+
+    // COORDINATOR FULL REACH: every task, through the coordinator's own tools.
+    releaseInner2();
+    const coordOutput = p.tools.get("TaskOutput");
+    const a = await coordOutput.execute("k1", { task_id: ownTaskId1!, wait: true });
+    const b = await coordOutput.execute("k2", { task_id: siblingTaskId!, wait: true });
+    const c = await coordOutput.execute("k3", { task_id: coordTaskId, wait: true });
+    expect(a.content[0].text).toContain("inner1 result");
+    expect(b.content[0].text).toContain("inner2 result");
+    expect(c.content[0].text).toContain("coord done");
   });
 });
 
