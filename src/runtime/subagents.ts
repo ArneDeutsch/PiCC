@@ -1440,7 +1440,7 @@ export function createAgentToolDefinition(
     name: opts.name ?? "Agent",
     label: "Agent",
     description:
-      "Launch a subagent to handle a task. Pick subagent_type from the 'Available subagents' catalog by matching the task to the agent descriptions (omit it for a general-purpose agent). Returns the subagent's final message verbatim.",
+      "Launch a subagent to handle a task. Pick subagent_type from the 'Available subagents' catalog by matching the task to the agent descriptions (omit it for a general-purpose agent). Subagents run in the background by default: the call returns a task id immediately and runs concurrently with any other dispatch in this turn, so collect the result with TaskOutput before you rely on it or finalize an answer (a settlement notice also arrives on a later turn). Pass run_in_background: false for a synchronous run that blocks this turn and returns the subagent's final message verbatim inline.",
     parameters: Type.Object({
       subagent_type: Type.String({ description: "Name of the agent to dispatch" }),
       prompt: Type.String({ description: "The task for the subagent" }),
@@ -1450,7 +1450,7 @@ export function createAgentToolDefinition(
       run_in_background: Type.Optional(
         Type.Boolean({
           description:
-            "Run the dispatch in the background; returns a task id immediately — retrieve the result with TaskOutput",
+            "Background is the default: omit (or pass true) to background the dispatch — it returns a task id immediately, to be collected with TaskOutput. Pass false for a synchronous run that blocks this turn and returns the final message inline.",
         }),
       ),
       description: Type.Optional(
@@ -1496,10 +1496,24 @@ export function createAgentToolDefinition(
         depth: opts.depth + 1,
       };
       const backgroundDisabled = isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS);
-      // `background: true` agent frontmatter (Claude 2.1.198, t05) forces
-      // background dispatch even without the run_in_background tool param.
-      const wantsBackground =
-        params.run_in_background === true || runtime.isBackgroundAgent(subagentType);
+      // Background-by-default (F15, Claude 2.1.198+): a dispatch backgrounds
+      // unless it explicitly opts out with `run_in_background: false`. Precedence
+      // ladder (with the env gate below): CLAUDE_CODE_DISABLE_BACKGROUND_TASKS >
+      // `background: true` frontmatter > explicit `run_in_background` > default
+      // (background). Only the frontmatter-beats-explicit-false rung is
+      // Claude-parity-verified (`background: true` = "always run in the
+      // background even when Claude needs the result"); the env-over-everything
+      // top rung is pre-existing PiCC behaviour this feature preserves, not a
+      // documented Claude semantic. `isBg` is hoisted because the intent-split
+      // note below reuses it.
+      const isBg = runtime.isBackgroundAgent(subagentType);
+      const wantsBackground = isBg || params.run_in_background !== false;
+      // Degrade-note intent (F15): the "background requested but ran foreground"
+      // note keys on EXPLICIT background intent only — the OLD routing predicate —
+      // so a merely-defaulted dispatch that ends up foreground (disable-env, or a
+      // caller with no background registry wired) never falsely claims background
+      // was requested. `wantsBackground` drives routing; this drives the note.
+      const explicitBackgroundIntent = params.run_in_background === true || isBg;
       if (wantsBackground && !backgroundDisabled && opts.backgroundTasks) {
         // Real background execution (audit E4): the un-awaited dispatch still
         // takes its concurrency slot and fires SubagentStart/Stop hooks; the
@@ -1541,7 +1555,7 @@ export function createAgentToolDefinition(
           content: [
             {
               type: "text",
-              text: `Background task ${id} started (agent: ${label}, agent id: ${agentId}). Use TaskOutput with task_id "${id}" to retrieve the result.`,
+              text: `Background task ${id} started (agent: ${label}, agent id: ${agentId}). Use TaskOutput with task_id "${id}" to retrieve the result before finalizing.`,
             },
           ],
           details: { background: true, taskId: id, agent: label, agentId },
@@ -1648,13 +1662,16 @@ export function createAgentToolDefinition(
           // renders `completed (truncated)` instead of a clean `● completed`.
           cutOff: result.truncated === true,
           ...identityDetails,
-          // Visible-degrade note (FIX 2): key it on the EFFECTIVE background
-          // request — `run_in_background: true` OR a `background: true` frontmatter
-          // agent (isBackgroundAgent, folded into wantsBackground) — so a
-          // frontmatter-background agent forced foreground (e.g. under
-          // CLAUDE_CODE_DISABLE_BACKGROUND_TASKS) also surfaces the divergence,
-          // matching the registry's "degrades to foreground" claim.
-          ...(wantsBackground
+          // Visible-degrade note (F15 intent-split): key it on EXPLICIT background
+          // intent — `run_in_background: true` OR a `background: true` frontmatter
+          // agent (isBackgroundAgent) — NOT on wantsBackground, which since the
+          // background-by-default flip is true for every defaulted dispatch. So a
+          // frontmatter-background agent (or an explicit run_in_background) forced
+          // foreground (e.g. under CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, or with no
+          // background registry wired) still surfaces the divergence — matching the
+          // registry's "degrades to foreground" claim — while a plain defaulted
+          // dispatch that simply ran foreground does not falsely claim it.
+          ...(explicitBackgroundIntent
             ? {
                 note: backgroundDisabled
                   ? "background tasks are disabled (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS); the background dispatch (run_in_background or a background:true agent) ran in foreground"

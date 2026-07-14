@@ -205,6 +205,12 @@ describe("context assembly", () => {
     expect(suffix).toContain("reviewer: Reviews things");
     expect(suffix).toContain("STEER-TEXT");
     expect(suffix).toContain("Claude Code compatibility conventions");
+    // F15 anti-regression: the highest-leverage nudge — the HARNESS_CONVENTIONS
+    // subagent line (emitted every turn to every dispatching context) — must carry
+    // the background-by-default framing and the collect-with-TaskOutput directive,
+    // so a silent revert to opt-in framing fails here rather than only in prose.
+    expect(suffix).toMatch(/background by default/i);
+    expect(suffix).toMatch(/collect each result with TaskOutput/i);
   });
 
   it("keeps activated skill bodies resident", () => {
@@ -1792,7 +1798,14 @@ describe("SendMessage parent-only guard through the real harness (tester NIT-2)"
       // customToolsFor must hold under inherit-all (and claudeToolsToPiBuiltins
       // never maps SendMessage to a Pi builtin).
       const before = rcMock.created.length;
-      await agentTool.execute("t", { subagent_type: "general-purpose", prompt: "go" });
+      // F15: pin run_in_background: false so the dispatch runs foreground and the
+      // subagent session is created synchronously within execute() — this test
+      // inspects the constructed toolset, background-vs-foreground is incidental.
+      await agentTool.execute("t", {
+        subagent_type: "general-purpose",
+        prompt: "go",
+        run_in_background: false,
+      });
       expect(rcMock.created.length).toBeGreaterThan(before);
       const options = rcMock.created[rcMock.created.length - 1]!;
       const toolNames = (options.tools as string[]) ?? [];

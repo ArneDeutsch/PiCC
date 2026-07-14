@@ -475,10 +475,19 @@ describe.skipIf(cliMissing)(
         const result = await runPi({
           fixture: "full-surface",
           script: [
-            // 0) orchestrator dispatches the reviewer
+            // 0) orchestrator dispatches the reviewer synchronously (F15: background
+            //    is the default, so pin run_in_background: false — this scenario
+            //    tests the verbatim inline return, foreground is incidental).
             {
               toolCalls: [
-                { name: "Agent", args: { subagent_type: "reviewer", prompt: "review src/lib.rs" } },
+                {
+                  name: "Agent",
+                  args: {
+                    subagent_type: "reviewer",
+                    prompt: "review src/lib.rs",
+                    run_in_background: false,
+                  },
+                },
               ],
             },
             // 1) the reviewer's OWN Pi session (separate request to the same mock)
@@ -615,21 +624,34 @@ describe.skipIf(cliMissing)(
 
     // --- Scenario 10 (E2E-1): built-in agent types on a project that defines NO agents ---
     it(
-      "advertises the built-in agents and dispatches Explore without project CLAUDE.md context",
+      "advertises the built-in agents and default-backgrounds Explore, collected via TaskOutput",
       async () => {
+        // F15: an Explore dispatch with NO run_in_background flag now backgrounds
+        // by default (was foreground). Modelled on Scenario 11 but WITHOUT the
+        // explicit flag, so the new default gets real-stack coverage. The
+        // background subagent session and the parent's next turn hit the mock
+        // CONCURRENTLY, so turns are pinned with `when` predicates, never by
+        // sequence position (positional replies flake under concurrency).
+        const isExplore = (r: CapturedRequest) =>
+          systemText(r).includes("read-only exploration agent");
+        const isParent = (r: CapturedRequest) => !isExplore(r);
         const result = await runPi({
           // hello-claude defines no .claude/agents — the catalog is built-ins only.
           script: [
-            // 0) orchestrator dispatches the built-in Explore agent
+            // 0) orchestrator dispatches the built-in Explore agent WITH NO flag
+            //    (first request is always the parent) → default-background task id.
             {
+              when: isParent,
               toolCalls: [
                 { name: "Agent", args: { subagent_type: "Explore", prompt: "find the hello script" } },
               ],
             },
-            // 1) the Explore subagent's OWN session answers (foreground dispatch is sequential)
-            { text: "EXPLORE-FINDING-CANARY: src/hello.js prints the greeting" },
-            // 2) orchestrator's follow-up once the subagent result is in
-            { text: "explored" },
+            // background Explore subagent's single immediate final answer
+            { when: isExplore, text: "EXPLORE-FINDING-CANARY: src/hello.js prints the greeting" },
+            // parent's next turn: collect the default-background result (task-1)
+            { when: isParent, toolCalls: [{ name: "TaskOutput", args: { task_id: "task-1" } }] },
+            // orchestrator's follow-up once the subagent result is in
+            { when: isParent, text: "explored" },
           ],
           prompt: "explore the project",
         });
@@ -646,6 +668,12 @@ describe.skipIf(cliMissing)(
         // The PARENT sees the project CLAUDE.md.
         expect(parentSystem).toContain("ROOT-CLAUDE-MD-LOADED");
 
+        // The default dispatch backgrounded: the Agent call returned a task id.
+        const startResult = result.requests.find((r) =>
+          /Background task task-\d+ started/.test(toolResultText(r)),
+        );
+        expect(startResult, "default Explore dispatch must background and return a task id").toBeDefined();
+
         // The Explore subagent hit the same mock with its own conversation:
         // identified by its read-only persona in the system prompt.
         expect(result.requests.length).toBeGreaterThanOrEqual(3);
@@ -661,11 +689,15 @@ describe.skipIf(cliMissing)(
           ).not.toContain("ROOT-CLAUDE-MD-LOADED");
         }
 
-        // Verbatim-return contract: the subagent's final answer lands in a parent tool result.
+        // Verbatim-return contract: TaskOutput returns the subagent's final answer
+        // to the parent verbatim.
         const verbatim = result.requests.some((r) =>
           toolResultText(r).includes("EXPLORE-FINDING-CANARY: src/hello.js prints the greeting"),
         );
-        expect(verbatim, "subagent answer must reach the parent verbatim").toBe(true);
+        expect(verbatim, "subagent answer must reach the parent verbatim via TaskOutput").toBe(true);
+        expect(result.stdout).toContain("explored");
+        // No crash noise from the un-awaited dispatch (completeness floor).
+        expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|unhandledRejection|FATAL/i);
       },
       TEST_TIMEOUT_MS,
     );
@@ -768,12 +800,18 @@ describe.skipIf(cliMissing)(
         const result = await runPi({
           fixture: "full-surface",
           script: [
-            // 0) orchestrator dispatches the worktree-isolated agent
+            // 0) orchestrator dispatches the worktree-isolated agent synchronously
+            //    (F15: pin run_in_background: false — this scenario tests worktree
+            //    isolation, foreground is incidental).
             {
               toolCalls: [
                 {
                   name: "Agent",
-                  args: { subagent_type: "iso-writer", prompt: "create out.txt with the canary" },
+                  args: {
+                    subagent_type: "iso-writer",
+                    prompt: "create out.txt with the canary",
+                    run_in_background: false,
+                  },
                 },
               ],
             },
@@ -829,11 +867,20 @@ describe.skipIf(cliMissing)(
         const isParent = (r: CapturedRequest) => !isExplore(r);
         const result = await runPi({
           script: [
-            // 0) parent dispatches the Explore subagent (first request is the parent)
+            // 0) parent dispatches the Explore subagent synchronously (first request
+            //    is the parent). F15: pin run_in_background: false — this scenario
+            //    tests the inline named-failure surface, foreground is incidental.
             {
               when: isParent,
               toolCalls: [
-                { name: "Agent", args: { subagent_type: "Explore", prompt: "look around" } },
+                {
+                  name: "Agent",
+                  args: {
+                    subagent_type: "Explore",
+                    prompt: "look around",
+                    run_in_background: false,
+                  },
+                },
               ],
             },
             // sticky terminal error for the child session (never consumed)
@@ -882,7 +929,13 @@ describe.skipIf(cliMissing)(
               toolCalls: [
                 {
                   name: "Agent",
-                  args: { subagent_type: "general-purpose", prompt: "summarize the project" },
+                  args: {
+                    subagent_type: "general-purpose",
+                    prompt: "summarize the project",
+                    // F15: pin run_in_background: false — this scenario tests the
+                    // inline agent-ID trailer delivery, foreground is incidental.
+                    run_in_background: false,
+                  },
                 },
               ],
             },

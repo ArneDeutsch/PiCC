@@ -101,7 +101,7 @@ const HARNESS_CONVENTIONS = `## Claude Code compatibility conventions (PiCC)
 You are running a project authored for Claude Code. Honor its conventions:
 - Claude tool names map onto your tools: Read/Write/Edit/Bash are read/write/edit/bash; use Grep/Glob/WebFetch/WebSearch/Agent/Task tools by their listed names.
 - To use a skill from the listing below, call the Skill tool with its name (or the user invokes /name). Follow the skill's instructions exactly once loaded; bundled files are referenced relative to the skill directory.
-- Subagents: dispatch with the Agent tool; choose subagent_type by matching the task against the agent descriptions in the catalog. Return values are the subagent's final message verbatim — parse them as the calling skill specifies.
+- Subagents: dispatch with the Agent tool; choose subagent_type by matching the task against the agent descriptions in the catalog. Subagents run in the background by default — a dispatch returns a task id, not the result — so several dispatched in one turn run concurrently; collect each result with TaskOutput before you rely on it or finalize an answer — otherwise its result is lost (or pass run_in_background: false for a synchronous inline result). The collected result is the subagent's final message verbatim — parse it as the calling skill specifies.
 - When a skill or instruction specifies an output format (e.g. a locked YAML block), reproduce it EXACTLY — downstream tooling parses it.
 - Worktrees: EnterWorktree/ExitWorktree isolate work; while inside one, all relative paths and shell commands run there.
 - Never use git commit --no-verify; project hooks must run.`;

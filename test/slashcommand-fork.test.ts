@@ -81,7 +81,14 @@ describe("SlashCommand context:fork dispatch (F11)", () => {
     // future-agent inherits ALL tools (no `tools:` frontmatter) → it is granted
     // SlashCommand. This exercises the allKnownToolNames MUST-FIX + the subagent
     // grant block: without either, the subagent could never receive the tool.
-    const res = await agentTool.execute("a1", { subagent_type: "future-agent", prompt: "go" });
+    // F15: pin run_in_background: false so the dispatch runs foreground — this
+    // test reads the foreground `outcome` detail and inspects the synchronously
+    // created subagent session; background-vs-foreground is incidental here.
+    const res = await agentTool.execute("a1", {
+      subagent_type: "future-agent",
+      prompt: "go",
+      run_in_background: false,
+    });
     expect(res.details.outcome).toBe("completed");
 
     // The subagent's session was created with a working SlashCommand customTool.

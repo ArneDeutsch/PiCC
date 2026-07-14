@@ -43,7 +43,14 @@ const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
 /** Dispatch through the registered Agent tool and return the captured loader's system prompt. */
 async function dispatchAndGetPrompt(subagentType: string): Promise<string> {
   const agentTool = pi.tools.get("Agent");
-  await agentTool.execute("t", { subagent_type: subagentType, prompt: "task" });
+  // F15: background is the default, but this helper inspects the subagent session
+  // created synchronously during dispatch — pin run_in_background: false so the
+  // dispatch runs foreground and h.created is populated before execute() returns.
+  await agentTool.execute("t", {
+    subagent_type: subagentType,
+    prompt: "task",
+    run_in_background: false,
+  });
   const options = h.created[h.created.length - 1]!;
   const loader = options.resourceLoader as { options: Record<string, unknown> };
   return (loader.options.systemPromptOverride as () => string)();
@@ -173,7 +180,9 @@ describe("built-in agents through the extension (E1/E2/E6)", () => {
 
   it("omitted subagent_type dispatches general-purpose (E2)", async () => {
     const agentTool = pi.tools.get("Agent");
-    const res = await agentTool.execute("t", { prompt: "just do it" });
+    // F15: pin run_in_background: false so the foreground verbatim result + agent
+    // detail are asserted directly (background is the default otherwise).
+    const res = await agentTool.execute("t", { prompt: "just do it", run_in_background: false });
     expect(res.content[0].text).toBe("bi-done");
     expect(res.details.agent).toBe("general-purpose");
   });
