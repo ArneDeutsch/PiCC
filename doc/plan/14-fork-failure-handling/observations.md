@@ -27,6 +27,16 @@ Running record of friction, bugs, and opportunities. Dated bullets; raw material
   (`index.ts:1046`, kept in the F14 rewording). If the skill loader does not strip
   newlines/control chars from a frontmatter `name`, a malicious project skill could inject
   lines into the user turn. Loader-side check, out of F14 scope. (security NIT.)
+## 2026-07-14 — t01 (dispatch-presentation helper)
+
+- Refactor was byte-identical; both reviewers (coder, tester) confirmed behaviour-preservation
+  via the unchanged Agent-tool regression suites. +21 unit tests.
+- Coupling NIT taken: the Agent-tool consumer re-derives the cut-off case via
+  `result.outcome === "failed"`, an invariant the helper owns. Added an explicit comment tying
+  the two together so a future change to the helper's branch guard won't silently misroute.
+
+## Phase-6 deferred (continued)
+
 - **[note] `capErrorText` is duplicated on purpose** in `background-tasks.ts:416-423` to avoid
   a value-level import cycle. t01's "one source of truth" is scoped to the presentation path
   and must not touch that mirror. (generalist SHOULD2.)
