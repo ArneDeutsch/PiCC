@@ -8,7 +8,7 @@ import {
   type BackgroundTaskRecord,
 } from "../src/runtime/background-tasks.js";
 import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
-import { createAgentToolDefinition } from "../src/runtime/subagents.js";
+import { createAgentToolDefinition, type PiSessionStats } from "../src/runtime/subagents.js";
 import { renderAgentResult } from "../src/runtime/subagent-render.js";
 import {
   formatUsageCompact,
@@ -56,11 +56,13 @@ const renderUpdate = (u: ToolUpdate, isPartial = true) =>
 const makeAgent = (overrides: Partial<ClaudeAgent> = {}): ClaudeAgent =>
   makeBaseAgent({ name: "worker", description: "Does work", body: "You are the worker.", ...overrides });
 
-/** Fake SDK whose sessions block on a gate until released (or aborted). */
-function gatedSdk(finalText: string) {
+/** Fake SDK whose sessions block on a gate until released (or aborted).
+ * `stats` (optional) scripts getSessionStats() so a test can assert per-dispatch
+ * usage capture on the background path. */
+function gatedSdk(finalText: string, stats?: PiSessionStats) {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
-  const handle = fakeSdk({ replies: [{ text: finalText, gate }] });
+  const handle = fakeSdk({ replies: [{ text: finalText, gate }], ...(stats ? { stats } : {}) });
   return { sdk: handle.sdk, release: () => release(), abortCalls: handle.abortCalls };
 }
 
@@ -784,6 +786,73 @@ describe("settlement notices (t05)", () => {
     const notices3 = bg.drainSettlementNotices(isArmed, commit, (a) => sub.get(a) !== undefined);
     expect(notices3).toEqual([]);
   });
+
+  it("the DEFAULT (no run_in_background) dispatch path settles + drains a sanitized notice and TaskOutput returns verbatim (F15)", async () => {
+    // Post-flip the default path IS the common background path — drive it through
+    // the real Agent tool (no run_in_background). A hostile subagent_type flows
+    // into the task's agentType, which must be sanitized in BOTH the settlement
+    // notice and the TaskOutput content.
+    const ESC = String.fromCharCode(27);
+    const hostileType = `worker${ESC}[31m`;
+    const { sdk, release } = gatedSdk("DEFAULT-PATH-VERBATIM", {
+      tokens: { input: 11, output: 7 },
+      cost: 0.002,
+    });
+    const bg = new BackgroundTaskRegistry();
+    const runtime = makeRuntime([makeAgent()], sdk);
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: bg,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t1", { subagent_type: hostileType, prompt: "go" });
+    // Default → background: returns a task id immediately.
+    expect(started.content[0]!.text).toMatch(/Background task task-\d+ started/);
+    const taskId = String(started.details.taskId);
+    const agentId = String(started.details.agentId);
+    expect(bg.get(taskId)?.status).toBe("running");
+    release();
+    await bg.wait(taskId);
+
+    // Settlement notice on the default path drains exactly once and is sanitized.
+    const sub = settledSubRegistry(agentId);
+    const notices = drain(bg, sub);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("DEFAULT-PATH-VERBATIM");
+    expect(notices[0]).not.toContain(ESC); // hostile agentType sanitized in the notice
+    expect(drain(bg, sub)).toEqual([]); // exactly-once
+
+    // TaskOutput retrieves the verbatim result on the default path, also sanitized.
+    const taskOutput = createTaskOutputTool(bg) as unknown as ToolLike;
+    const out = await taskOutput.execute("t2", { task_id: taskId });
+    // Verbatim body followed only by the appended compact /usage line — so a
+    // DEFAULTED (omitted run_in_background) dispatch's usage is captured and
+    // queryable via TaskOutput after it settles, mirroring the explicit-flag path.
+    expect(out.content[0]!.text).toBe("DEFAULT-PATH-VERBATIM\nusage: in 11 · out 7 · $0.002");
+    expect(out.details.usage).toEqual({ inputTokens: 11, outputTokens: 7, costUsd: 0.002 });
+    expect(out.details.status).toBe("completed");
+
+    // Real TaskOutput-content sanitization on the default path. The completed
+    // path never interpolates the agent type into TaskOutput `content` (the text
+    // is the verbatim result plus the appended usage line), so the old
+    // `JSON.stringify(out).not.toContain(ESC)`
+    // here was vacuous — JSON.stringify escapes U+001B to  regardless. Drive
+    // a FAILED default-path task instead (omitted run_in_background, depth 5 →
+    // dispatch depth exceeds maxDepth → ok:false): its hostile subagent_type flows
+    // into agentType, which the FAILED-path TaskOutput `content` interpolates into
+    // the subject, so `content[0].text` genuinely exercises label sanitization.
+    const failTool = createAgentToolDefinition(runtime, {
+      depth: 5,
+      backgroundTasks: bg,
+    }) as unknown as ToolLike;
+    const failStarted = await failTool.execute("t3", { subagent_type: hostileType, prompt: "go" });
+    expect(failStarted.content[0]!.text).toMatch(/Background task task-\d+ started/); // defaulted → background
+    const failId = String(failStarted.details.taskId);
+    await bg.wait(failId);
+    const failOut = await taskOutput.execute("t4", { task_id: failId });
+    expect(failOut.details.status).toBe("failed");
+    expect(failOut.content[0]!.text).toContain("failed"); // subject + failure reason
+    expect(failOut.content[0]!.text).not.toContain(ESC); // hostile agentType sanitized in TaskOutput content
+  });
 });
 
 describe("Agent tool run_in_background (audit E4)", () => {
@@ -838,7 +907,27 @@ describe("Agent tool run_in_background (audit E4)", () => {
     expect(registry.get(taskId)?.status).toBe("completed");
   });
 
-  it("a plain agent (no background frontmatter) still runs in the FOREGROUND without run_in_background", async () => {
+  it("a plain agent (no background frontmatter, no flag) backgrounds by DEFAULT (F15)", async () => {
+    // Background-by-default flip: a dispatch with a wired registry, no frontmatter
+    // and no run_in_background param now backgrounds (was foreground pre-F15).
+    const { sdk, release } = gatedSdk("bg-default-final");
+    const registry = new BackgroundTaskRegistry();
+    const runtime = makeRuntime([makeAgent()], sdk);
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: registry,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t1", { subagent_type: "worker", prompt: "go" });
+    expect(started.content[0]!.text).toMatch(/Background task task-\d+ started/);
+    expect(started.details.background).toBe(true);
+    const taskId = String(started.details.taskId);
+    expect(registry.get(taskId)?.status).toBe("running"); // still gated → running
+    release();
+    await registry.wait(taskId);
+    expect(registry.get(taskId)?.status).toBe("completed");
+  });
+
+  it("run_in_background: false blocks the turn and returns the final message inline (F15 opt-out)", async () => {
     const { sdk } = fakeSdk({ replies: [{ text: "fg-final" }] });
     const registry = new BackgroundTaskRegistry();
     const runtime = makeRuntime([makeAgent()], sdk);
@@ -846,10 +935,117 @@ describe("Agent tool run_in_background (audit E4)", () => {
       depth: 0,
       backgroundTasks: registry,
     }) as unknown as ToolLike;
-    const res = await agentTool.execute("t1", { subagent_type: "worker", prompt: "go" });
-    expect(res.content[0]!.text).toBe("fg-final"); // verbatim foreground result
+    const res = await agentTool.execute("t1", {
+      subagent_type: "worker",
+      prompt: "go",
+      run_in_background: false,
+    });
+    expect(res.content[0]!.text).toBe("fg-final"); // verbatim inline foreground result
     expect(res.details.background).toBeUndefined();
     expect(registry.ids()).toEqual([]); // nothing registered as background
+    expect(res.details.note).toBeUndefined(); // no degrade note on an explicit opt-out
+  });
+
+  it("two defaulted dispatches in one turn run CONCURRENTLY, not serially (F15, timer-free)", async () => {
+    // A closed gate holds BOTH subagent sessions open. A serial/foreground impl
+    // would block the first execute() on the gate and never reach the second;
+    // background-by-default returns a task id from each immediately, so both
+    // records are running while the gate is still shut. No setTimeout.
+    const { sdk, release } = gatedSdk("both-final");
+    const registry = new BackgroundTaskRegistry();
+    const runtime = makeRuntime([makeAgent()], sdk);
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: registry,
+    }) as unknown as ToolLike;
+    const first = await agentTool.execute("t1", { subagent_type: "worker", prompt: "one" });
+    const second = await agentTool.execute("t2", { subagent_type: "worker", prompt: "two" });
+    const id1 = String(first.details.taskId);
+    const id2 = String(second.details.taskId);
+    expect(id1).not.toBe(id2);
+    expect(registry.get(id1)?.status).toBe("running");
+    expect(registry.get(id2)?.status).toBe("running");
+    release();
+    await registry.wait(id1);
+    await registry.wait(id2);
+    expect(registry.get(id1)?.status).toBe("completed");
+    expect(registry.get(id2)?.status).toBe("completed");
+  });
+
+  it("frontmatter background: true beats an explicit run_in_background: false (F15 precedence)", async () => {
+    const { sdk, release } = gatedSdk("frontmatter-wins");
+    const registry = new BackgroundTaskRegistry();
+    const runtime = makeRuntime([makeAgent({ background: true })], sdk);
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: registry,
+    }) as unknown as ToolLike;
+    // Explicit foreground opt-out, but the frontmatter forces background anyway.
+    const started = await agentTool.execute("t1", {
+      subagent_type: "worker",
+      prompt: "go",
+      run_in_background: false,
+    });
+    expect(started.content[0]!.text).toMatch(/Background task task-\d+ started/);
+    expect(started.details.background).toBe(true);
+    const taskId = String(started.details.taskId);
+    expect(registry.get(taskId)?.status).toBe("running");
+    release();
+    await registry.wait(taskId);
+    expect(registry.get(taskId)?.status).toBe("completed");
+  });
+
+  it("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS forces a PLAIN default dispatch to foreground with NO degrade note (F15)", async () => {
+    // Disable-env over the new default: a plain dispatch (no flag, no frontmatter)
+    // runs foreground and — because background was never explicitly requested —
+    // carries no degrade note.
+    process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
+    const { sdk, release } = gatedSdk("fg-final");
+    release();
+    const registry = new BackgroundTaskRegistry();
+    const runtime = makeRuntime([makeAgent()], sdk);
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: registry,
+    }) as unknown as ToolLike;
+    const res = await agentTool.execute("t1", { subagent_type: "worker", prompt: "go" });
+    expect(res.content[0]!.text).toBe("fg-final");
+    expect(res.details.note).toBeUndefined(); // intent-split: no false "requested background" note
+    expect(registry.ids()).toEqual([]); // nothing registered as background
+  });
+
+  it("a one-shot builtin (Explore) default-backgrounds (F15)", async () => {
+    // Verified against Claude 2.1.198: a plain one-shot builtin dispatch now
+    // backgrounds. The start message still carries the agent id (no false
+    // resumable invite for a one-shot).
+    const { sdk, release } = gatedSdk("explore-final");
+    const registry = new BackgroundTaskRegistry();
+    // A builtin Explore is resolved by the runtime even with no project agents.
+    const runtime = makeRuntime([], sdk);
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: registry,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t1", { subagent_type: "Explore", prompt: "look" });
+    expect(started.content[0]!.text).toMatch(/Background task task-\d+ started \(agent: Explore/);
+    const taskId = String(started.details.taskId);
+    expect(registry.get(taskId)?.status).toBe("running");
+    release();
+    await registry.wait(taskId);
+    expect(registry.get(taskId)?.status).toBe("completed");
+  });
+
+  it("Agent tool description states the new default and the run_in_background: false opt-out (F15 anti-regression)", () => {
+    const runtime = makeRuntime([makeAgent()], fakeSdk({ replies: [{ text: "x" }] }).sdk);
+    const agentTool = createAgentToolDefinition(runtime, { depth: 0 }) as unknown as {
+      description: string;
+    };
+    const desc = agentTool.description;
+    // No opt-in framing left ("Run the dispatch in the background" / bare "Returns
+    // the subagent's final message verbatim." as the whole contract).
+    expect(desc).toMatch(/background by default/i);
+    expect(desc).toContain("run_in_background: false");
+    expect(desc).toContain("TaskOutput");
   });
 
   it("TaskOutput with wait:false polls the running status without blocking", async () => {
@@ -1150,10 +1346,11 @@ describe("Agent tool run_in_background (audit E4)", () => {
     expect(registry.ids()).toEqual([]); // nothing registered
   });
 
-  it("a `background: true` agent forced foreground by CLAUDE_CODE_DISABLE_BACKGROUND_TASKS surfaces the degrade note (FIX 2)", async () => {
-    // The degrade note must key on the EFFECTIVE background request — frontmatter
-    // background:true, NOT just the run_in_background param — so a frontmatter-
-    // background agent forced foreground still surfaces the divergence.
+  it("a `background: true` agent forced foreground by CLAUDE_CODE_DISABLE_BACKGROUND_TASKS surfaces the degrade note (F15 intent-split)", async () => {
+    // The degrade note keys on EXPLICIT background intent — a `background: true`
+    // frontmatter agent (or an explicit run_in_background), NOT the new plain
+    // default — so a frontmatter-background agent forced foreground still surfaces
+    // the divergence, while a merely-defaulted foreground dispatch would not.
     process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
     const { sdk, release } = gatedSdk("fg-final");
     release();
@@ -1234,6 +1431,122 @@ describe("Agent tool run_in_background (audit E4)", () => {
     expect(out.details.status).toBe("stopped");
     expect(out.content[0]!.text).toContain("was aborted"); // FIX 3: aborted vocabulary
   });
+});
+
+describe("nested background bound — per-depth budgets (F15 t02)", () => {
+  it("a depth-2 background fan-out runs at most `concurrency` concurrently and the excess still completes", async () => {
+    const CONCURRENCY = 2;
+    const N = 5; // more children than the cap → the excess must queue at depth 2
+
+    // Live high-water counter (timer-free): each leaf child increments on entry,
+    // parks on a shared gate, decrements on exit. A semaphore-parked child
+    // physically cannot reach onPrompt, so `maxLive` is the true concurrent peak.
+    let live = 0;
+    let maxLive = 0;
+    let reached = 0;
+    let releaseLeaf!: () => void;
+    const leafGate = new Promise<void>((r) => (releaseLeaf = r));
+    // Barrier resolves the instant CONCURRENCY children are concurrently live —
+    // proves the bound actually ENGAGES (>= C run at once), no timer needed.
+    let resolveBarrier!: () => void;
+    const barrier = new Promise<void>((r) => (resolveBarrier = r));
+    const backgroundFlags: boolean[] = [];
+
+    const { sdk } = fakeSdk({
+      onPrompt: async (text, session) => {
+        if (text.includes("coordinate")) {
+          // Sub-coordinator at depth 1: fan out N depth-2 background children.
+          const agentTool = session.customTools.find((t) => t.name === "Agent")!;
+          for (let i = 0; i < N; i++) {
+            const res = await agentTool.execute(`c${i}`, {
+              subagent_type: "leaf",
+              prompt: `leaf ${i}`,
+            });
+            backgroundFlags.push(res.details?.background === true);
+          }
+          return "fanned-out";
+        }
+        // Leaf child (depth 2): count live concurrency, then park on the gate.
+        reached++;
+        live++;
+        if (live > maxLive) maxLive = live;
+        if (live === CONCURRENCY) resolveBarrier();
+        await leafGate;
+        live--;
+        return "leaf-done";
+      },
+    });
+
+    // Reachability: the nested Agent tool is built WITH a backgroundTasks registry
+    // (as production does via customToolsFor / index.ts) — otherwise the inner
+    // dispatch would take the foreground arm and prove nothing.
+    const nestedRegistry = new BackgroundTaskRegistry();
+    const runtime = makeRuntime([makeAgent({ name: "outer" }), makeAgent({ name: "leaf" })], sdk, {
+      concurrency: CONCURRENCY,
+      maxDepth: 2,
+      customToolsFor: (_a, _g, depth) =>
+        depth === 1
+          ? [createAgentToolDefinition(runtime, { depth, backgroundTasks: nestedRegistry })]
+          : [],
+    });
+
+    const outerDone = runtime.dispatch({ subagentType: "outer", prompt: "coordinate", depth: 1 });
+    await barrier; // C children are concurrently parked at the gate
+    // With the gate still closed, no more than C can have reached onPrompt.
+    expect(live).toBe(CONCURRENCY);
+    releaseLeaf();
+    await outerDone;
+    // Join every child through the nested registry — their presence there is
+    // itself proof the background arm engaged (the foreground arm never start()s).
+    await Promise.all(nestedRegistry.ids().map((id) => nestedRegistry.wait(id)));
+
+    expect(nestedRegistry.ids()).toHaveLength(N);
+    expect(backgroundFlags).toEqual(Array.from({ length: N }, () => true));
+    expect(reached).toBe(N); // the queued excess dequeued and ran
+    expect(maxLive).toBe(CONCURRENCY); // never more than the cap at once
+  }, 10_000);
+
+  it("deadlock regression: a depth-1 parent that TaskOutput(wait)s on its depth-2 background child completes at concurrency 1", async () => {
+    // With a SINGLE shared pool this deadlocks: the depth-1 parent holds the one
+    // slot while blocked in TaskOutput(wait), and the depth-2 child queues for the
+    // same slot forever. Per-depth budgets put the child in its own pool → no cycle.
+    const nestedRegistry = new BackgroundTaskRegistry();
+    let childBackground: unknown;
+    const { sdk } = fakeSdk({
+      onPrompt: async (text, session) => {
+        if (text.includes("parent")) {
+          const agentTool = session.customTools.find((t) => t.name === "Agent")!;
+          const started = await agentTool.execute("c", {
+            subagent_type: "leaf",
+            prompt: "child work",
+          });
+          childBackground = started.details?.background;
+          const taskId = String(started.details?.taskId);
+          const taskOutput = session.customTools.find((t) => t.name === "TaskOutput")!;
+          // wait defaults to true → blocks the parent's turn on the child settling.
+          const out = await taskOutput.execute("o", { task_id: taskId });
+          return `collected:${out.content[0]!.text}`;
+        }
+        return "child-done";
+      },
+    });
+    const runtime = makeRuntime([makeAgent({ name: "parent" }), makeAgent({ name: "leaf" })], sdk, {
+      concurrency: 1,
+      maxDepth: 2,
+      customToolsFor: (_a, _g, depth) =>
+        depth === 1
+          ? [
+              createAgentToolDefinition(runtime, { depth, backgroundTasks: nestedRegistry }),
+              createTaskOutputTool(nestedRegistry),
+            ]
+          : [],
+    });
+
+    const result = await runtime.dispatch({ subagentType: "parent", prompt: "parent go", depth: 1 });
+    expect(childBackground).toBe(true); // child took the background arm at depth 2
+    expect(result.ok).toBe(true);
+    expect(result.finalMessage).toContain("child-done"); // did not hang
+  }, 10_000);
 });
 
 describe("TaskOutput live streaming (F04 t03)", () => {

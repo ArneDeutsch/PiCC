@@ -436,10 +436,38 @@ export function extractText(content: unknown): string {
 
 export class SubagentRuntime {
   private readonly semaphore: Semaphore;
+  /**
+   * Per-depth budgets for nested BACKGROUND dispatches (F15 t02). Each `depth ≥ 2`
+   * gets its own `Semaphore` sized like the root, created lazily. A dispatch
+   * acquires from the pool for ITS OWN depth, so an ancestor at depth `d` (holding
+   * a slot in pool `d`, e.g. while blocked in a `TaskOutput(wait)` on a child)
+   * never holds the slot a descendant at depth `d+1` is waiting on — no cross-depth
+   * wait-for cycle, hence deadlock-free even at `concurrency = 1`. A single shared
+   * pool would deadlock exactly there (see the acquire gate comment). Total nested
+   * concurrency is bounded by `maxDepth × concurrency`, both finite. Depth ≤ 1
+   * stays on the existing root `semaphore` so root behaviour/tests are unchanged.
+   */
+  private readonly nestedBudgets = new Map<number, Semaphore>();
   private sdkPromise: Promise<PiSdk> | undefined;
 
   constructor(private readonly deps: SubagentRuntimeDeps) {
     this.semaphore = new Semaphore(Math.max(1, deps.concurrency));
+  }
+
+  /**
+   * The concurrency pool a dispatch at `depth` acquires from. Root (`depth ≤ 1`)
+   * uses the existing root semaphore; each nested depth gets its own lazily-created
+   * budget of the same size. Per-depth (not shared) is what keeps nested background
+   * fan-out deadlock-free — see {@link nestedBudgets}.
+   */
+  private budgetForDepth(depth: number): Semaphore {
+    if (depth <= 1) return this.semaphore;
+    let budget = this.nestedBudgets.get(depth);
+    if (!budget) {
+      budget = new Semaphore(Math.max(1, this.deps.concurrency));
+      this.nestedBudgets.set(depth, budget);
+    }
+    return budget;
   }
 
   private sdk(): Promise<PiSdk> {
@@ -501,8 +529,9 @@ export class SubagentRuntime {
 
   /**
    * True iff `subagentType` resolves to an agent whose frontmatter sets
-   * `background: true` (Claude 2.1.198): the dispatch must run in the background
-   * even when the Agent tool call omits `run_in_background` (t05). Mirrors
+   * `background: true` (Claude 2.1.198): the dispatch runs in the background
+   * even against an explicit `run_in_background: false` (t05) — its remaining
+   * significance now that dispatch is background-by-default. Mirrors
    * dispatch()'s resolution order via the shared resolver.
    */
   isBackgroundAgent(subagentType: string): boolean {
@@ -517,6 +546,16 @@ export class SubagentRuntime {
     /** Effort override (e.g. a context:fork skill's `effort:`); defaults to the agent's. */
     effort?: string;
     depth: number;
+    /**
+     * Nested background bound (F15 t02): when a `depth > 1` dispatch is issued on
+     * the BACKGROUND arm (un-awaited via `backgroundTasks.start`, or a
+     * `SendMessage` resume that landed at `record.depth ≥ 2`), it must count
+     * against the concurrency bound instead of taking the foreground nested
+     * bypass. Set `true` on those arms only; the foreground arm and `forkDispatch`
+     * leave it unset so they keep the `() => {}` bypass. Ignored at `depth ≤ 1`
+     * (root always acquires its own pool regardless). See the acquire gate below.
+     */
+    background?: boolean;
     /**
      * Dispatch this agent definition directly instead of looking subagentType up —
      * used for the synthetic general-purpose target of agent-less context:fork skills.
@@ -793,11 +832,24 @@ export class SubagentRuntime {
       return mergeHookOutcomes(outcomes);
     };
 
-    // Only root-level dispatches count against the concurrency cap. An ancestor
-    // holds its slot while awaiting its descendants, so counting nested dispatches
-    // too would deadlock the moment `concurrency` ancestors each await a queued
-    // child (guaranteed at concurrency 1 for ANY depth-2 nesting).
-    const release = opts.depth > 1 ? () => {} : await this.semaphore.acquire();
+    // Concurrency gate (F15 t02). Two nested-deadlock hazards, handled distinctly:
+    //   * FOREGROUND nested (`depth > 1`, no `background`): keeps its `() => {}`
+    //     bypass. A foreground parent BLOCKS its turn awaiting the child, holding
+    //     its slot; if the child had to acquire the SAME pool the parent holds, C
+    //     such parents would deadlock C queued children. Foreground children never
+    //     acquire, so no slot-holder ever waits on a slot-waiter.
+    //   * BACKGROUND nested (`depth > 1`, `background: true`): must be BOUNDED, but
+    //     a single shared pool would deadlock too — a parent blocked in
+    //     TaskOutput(wait) on its background child holds a slot while the child
+    //     queues for the same pool (guaranteed at C = 1). So it acquires from a
+    //     PER-DEPTH budget: an ancestor's held slot lives in pool `depth-1`, the
+    //     descendant waits in pool `depth`, never the same slot → no cross-depth
+    //     cycle → deadlock-free even at concurrency 1.
+    // Root (`depth ≤ 1`) always acquires its own (root) pool, exactly as before.
+    const foregroundNested = opts.depth > 1 && !opts.background;
+    const release = foregroundNested
+      ? () => {}
+      : await this.budgetForDepth(opts.depth).acquire();
     let worktreePath: string | undefined;
     let session: PiSession | undefined;
     let started = false;
@@ -1558,7 +1610,7 @@ export function createAgentToolDefinition(
     name: opts.name ?? "Agent",
     label: "Agent",
     description:
-      "Launch a subagent to handle a task. Pick subagent_type from the 'Available subagents' catalog by matching the task to the agent descriptions (omit it for a general-purpose agent). Returns the subagent's final message verbatim.",
+      "Launch a subagent to handle a task. Pick subagent_type from the 'Available subagents' catalog by matching the task to the agent descriptions (omit it for a general-purpose agent). Subagents run in the background by default: the call returns a task id immediately and runs concurrently with any other dispatch in this turn, so collect the result with TaskOutput before you rely on it or finalize an answer (a settlement notice also arrives on a later turn). Pass run_in_background: false for a synchronous run that blocks this turn and returns the subagent's final message verbatim inline.",
     parameters: Type.Object({
       subagent_type: Type.String({ description: "Name of the agent to dispatch" }),
       prompt: Type.String({ description: "The task for the subagent" }),
@@ -1568,7 +1620,7 @@ export function createAgentToolDefinition(
       run_in_background: Type.Optional(
         Type.Boolean({
           description:
-            "Run the dispatch in the background; returns a task id immediately — retrieve the result with TaskOutput",
+            "Background is the default: omit (or pass true) to background the dispatch — it returns a task id immediately, to be collected with TaskOutput. Pass false for a synchronous run that blocks this turn and returns the final message inline.",
         }),
       ),
       description: Type.Optional(
@@ -1614,10 +1666,24 @@ export function createAgentToolDefinition(
         depth: opts.depth + 1,
       };
       const backgroundDisabled = isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS);
-      // `background: true` agent frontmatter (Claude 2.1.198, t05) forces
-      // background dispatch even without the run_in_background tool param.
-      const wantsBackground =
-        params.run_in_background === true || runtime.isBackgroundAgent(subagentType);
+      // Background-by-default (F15, Claude 2.1.198+): a dispatch backgrounds
+      // unless it explicitly opts out with `run_in_background: false`. Precedence
+      // ladder (with the env gate below): CLAUDE_CODE_DISABLE_BACKGROUND_TASKS >
+      // `background: true` frontmatter > explicit `run_in_background` > default
+      // (background). Only the frontmatter-beats-explicit-false rung is
+      // Claude-parity-verified (`background: true` = "always run in the
+      // background even when Claude needs the result"); the env-over-everything
+      // top rung is pre-existing PiCC behaviour this feature preserves, not a
+      // documented Claude semantic. `isBg` is hoisted because the intent-split
+      // note below reuses it.
+      const isBg = runtime.isBackgroundAgent(subagentType);
+      const wantsBackground = isBg || params.run_in_background !== false;
+      // Degrade-note intent (F15): the "background requested but ran foreground"
+      // note keys on EXPLICIT background intent only — the OLD routing predicate —
+      // so a merely-defaulted dispatch that ends up foreground (disable-env, or a
+      // caller with no background registry wired) never falsely claims background
+      // was requested. `wantsBackground` drives routing; this drives the note.
+      const explicitBackgroundIntent = params.run_in_background === true || isBg;
       if (wantsBackground && !backgroundDisabled && opts.backgroundTasks) {
         // Real background execution (audit E4): the un-awaited dispatch still
         // takes its concurrency slot and fires SubagentStart/Stop hooks; the
@@ -1643,6 +1709,10 @@ export function createAgentToolDefinition(
           `agent:${label}`,
           runtime.dispatch({
             ...dispatchOpts,
+            // Nested background bound (F15 t02): mark this un-awaited dispatch as
+            // background so a `depth > 1` fan-out acquires its per-depth budget
+            // instead of taking the foreground bypass (which would be unbounded).
+            background: true,
             agentId,
             abortSignal: controller.signal,
             onProgress,
@@ -1663,7 +1733,7 @@ export function createAgentToolDefinition(
           content: [
             {
               type: "text",
-              text: `Background task ${id} started (agent: ${label}, agent id: ${agentId}). Use TaskOutput with task_id "${id}" to retrieve the result.`,
+              text: `Background task ${id} started (agent: ${label}, agent id: ${agentId}). Use TaskOutput with task_id "${id}" to retrieve the result before finalizing.`,
             },
           ],
           details: { background: true, taskId: id, agent: label, agentId },
@@ -1754,13 +1824,16 @@ export function createAgentToolDefinition(
           // (`presentation.cutOff === result.truncated === true` on this path).
           cutOff: presentation.cutOff,
           ...identityDetails,
-          // Visible-degrade note (FIX 2): key it on the EFFECTIVE background
-          // request — `run_in_background: true` OR a `background: true` frontmatter
-          // agent (isBackgroundAgent, folded into wantsBackground) — so a
-          // frontmatter-background agent forced foreground (e.g. under
-          // CLAUDE_CODE_DISABLE_BACKGROUND_TASKS) also surfaces the divergence,
-          // matching the registry's "degrades to foreground" claim.
-          ...(wantsBackground
+          // Visible-degrade note (F15 intent-split): key it on EXPLICIT background
+          // intent — `run_in_background: true` OR a `background: true` frontmatter
+          // agent (isBackgroundAgent) — NOT on wantsBackground, which since the
+          // background-by-default flip is true for every defaulted dispatch. So a
+          // frontmatter-background agent (or an explicit run_in_background) forced
+          // foreground (e.g. under CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, or with no
+          // background registry wired) still surfaces the divergence — matching the
+          // registry's forced-to-foreground divergence note — while a plain defaulted
+          // dispatch that simply ran foreground does not falsely claim it.
+          ...(explicitBackgroundIntent
             ? {
                 note: backgroundDisabled
                   ? "background tasks are disabled (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS); the background dispatch (run_in_background or a background:true agent) ran in foreground"
@@ -1899,6 +1972,15 @@ export function createSendMessageToolDefinition(
           subagentType: record.agentName,
           prompt: message,
           depth: record.depth,
+          // Nested background bound (F15 t02): a SendMessage resume is always
+          // background. It is REQUIRED here, not optional — SendMessage is
+          // parent-initiated only, so the common resumable agent is depth-1
+          // (acquires its root pool regardless), but a grandchild id that bubbled
+          // to the root is resumable at `record.depth ≥ 2` and would otherwise hit
+          // `depth > 1 && !background` → the foreground bypass → an unbounded
+          // escape from the nested bound. Deadlock-free: the only waiter is root,
+          // which holds no slot.
+          background: true,
           agentId: record.agentId,
           resume: {
             transcriptPath: record.transcriptPath,

@@ -6,6 +6,30 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed — background-by-default subagent dispatch (2026-07-14)
+
+- **Subagent dispatch (`Agent`/`Task`) now runs in the background by default, matching Claude Code
+  2.1.198+.** A dispatch that omits `run_in_background` returns a task id immediately and runs
+  concurrently with any other dispatch issued in the same turn, so a Claude-authored implicit-concurrency
+  fan-out (dispatch N reviewers in one turn, collect the results) **parallelizes** instead of silently
+  serializing; results are collected via `TaskOutput`/`TaskStop` or pushed to the coordinator as a
+  settlement notice on its next turn. Pass **`run_in_background: false`** to run a dispatch synchronously
+  and return its result inline in the same turn. An agent's `background: true` frontmatter still forces
+  background (even against an explicit `run_in_background: false`), and
+  `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` still forces **every** `Agent`/`Task` dispatch to the
+  foreground (the serial-again escape hatch); `SendMessage` resume is inherently async and is not
+  governed by that switch.
+- **Nested (depth ≥ 2) background fan-out is now concurrency-bounded.** A sub-coordinator dispatching
+  many agents in one turn no longer spawns an unbounded number of concurrent sessions: each depth has
+  its own `concurrency`-sized budget (total ≤ `maxDepth × concurrency`), and a parent blocked collecting
+  a child does not deadlock. This is a deliberately conservative, finite, deadlock-free PiCC choice that
+  diverges from Claude's single global (~10) parallel-agent cap — not exact parity.
+- **Registry + docs re-tiered to tell the truth.** `tool.Agent`/`tool.Task` stay **partial**, but the
+  divergence is no longer "PiCC defaults foreground" — it is the residual settlement *timing* gap (PiCC
+  pushes the notice next turn where Claude notifies mid-turn); the `feature.background-agents` "defaults
+  foreground" gap is removed and `agent.frontmatter.background` is reworded to "forces background". The
+  README, user-guide, architecture, and design docs were corrected, and `doc/supported-features.md` was
+  regenerated from the registry.
 ### Added — fork-aware hand-off and on-the-fly ticket creation for implement-feature (2026-07-14)
 
 - **`implement-feature` now offers to open a GitHub issue when it was invoked without a ticket.** After

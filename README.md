@@ -54,11 +54,12 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
   per-agent `tools:` capability gating, nested dispatch with a configurable depth cap,
   `isolation: worktree`. **Observable and trustworthy:** a dead dispatch is a loud, named failure
   (never an empty success) with partial output preserved; every run leaves an on-disk transcript,
-  streams live progress, and records its token/cost (`/usage`). Dispatch defaults to the
-  **foreground** (Claude 2.1.198 runs subagents background-by-default), so an implicit-concurrency
-  fan-out runs serially unless background is requested. Background dispatch
-  (`run_in_background` / `background: true` + `TaskOutput`/`TaskStop`) pushes its settlement to the
-  coordinator without polling; `SendMessage` resumes a finished subagent or steers a running one.
+  streams live progress, and records its token/cost (`/usage`). Dispatch runs in the **background by
+  default** (matching Claude 2.1.198), so an implicit-concurrency fan-out parallelizes — each dispatch
+  returns a task id, collected via `TaskOutput`/`TaskStop`, and its settlement is pushed to the
+  coordinator without polling; pass `run_in_background: false` for a synchronous inline result, or set
+  `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` to force every dispatch to the foreground. `SendMessage`
+  resumes a finished subagent or steers a running one.
 - **Worktrees** — `EnterWorktree`/`ExitWorktree` with a real session-cwd swap, `.worktreeinclude`
   seeding, Windows-tolerant lifecycle, parallel sessions on one repo.
 - **Hooks** — 13 events (`PreToolUse` … `WorktreeRemove`), full stdin-JSON/stdout-decision

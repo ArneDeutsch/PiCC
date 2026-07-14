@@ -714,3 +714,126 @@ describe("SendMessage resume — offline integration (real SessionManager) (t04)
     expect(scopedFired.length).toBeGreaterThan(firedAfterOriginal);
   });
 });
+
+// ---------------------------------------------------------------------------
+// SendMessage resume counts against the nested per-depth bound (F15 t02, AC #3)
+// ---------------------------------------------------------------------------
+
+describe("SendMessage resume — nested background bound (F15 t02, AC #3)", () => {
+  it("a depth-2 resume ACQUIRES its per-depth budget: it queues behind a held slot and only runs once freed (guards `background: true` on the resume dispatch)", async () => {
+    // The narrow-but-real case AC #3 protects: a grandchild id resumable at
+    // `record.depth >= 2`. The resume dispatch sets `background: true` so it is
+    // routed through the per-depth budget instead of the foreground bypass. Remove
+    // that flag and `foregroundNested = depth > 1 && !background` becomes true → the
+    // dispatch bypasses acquisition and runs immediately, escaping the bound.
+    //
+    // Deterministic, timer-free signal: dispatch() runs SYNCHRONOUSLY from entry to
+    // `await budgetForDepth(depth).acquire()` (no inline await before it). Fire the
+    // resume against a depth-2 pool whose only slot is already held → the bounded
+    // resume SUSPENDS at that acquire and never reaches the `SubagentStart` hook
+    // (which fires only AFTER acquisition). Without the flag it bypasses acquisition
+    // and fires `SubagentStart` synchronously during the dispatch call. So a
+    // recording `SubagentStart` hook distinguishes the two race-free — no gate-timing
+    // guess, no setTimeout.
+    const main = fakeMainSessionFile();
+    const registry = new SubagentRegistry();
+    const backgroundTasks = new BackgroundTaskRegistry();
+
+    // A SubagentStart fired for the resume dispatch === "the resume acquired its slot
+    // and started". Keyed by the resume's verbatim prompt so the seed/holder starts
+    // (distinct prompts) never count.
+    const subagentStartPrompts: string[] = [];
+    const resumeStarted = () => subagentStartPrompts.some((p) => p.includes("RESUME-WORK"));
+    const recordingHooks = {
+      async fire(eventName: string, payload: Record<string, unknown>) {
+        if (eventName === "SubagentStart") subagentStartPrompts.push(String(payload.prompt ?? ""));
+        return undefined;
+      },
+    };
+
+    // The holder parks in onPrompt (still holding its depth-2 slot) until released;
+    // the resume records that it reached onPrompt (a second proof it ran).
+    let holderLive = false;
+    let releaseHolder!: () => void;
+    const holderGate = new Promise<void>((r) => (releaseHolder = r));
+    let resumeReachedOnPrompt = false;
+    const h = fakeSdk({
+      onPrompt: async (text) => {
+        if (text.includes("HOLD-TASK")) {
+          holderLive = true;
+          await holderGate;
+          return "held";
+        }
+        if (text.includes("RESUME-WORK")) {
+          resumeReachedOnPrompt = true;
+          return "resumed";
+        }
+        return "seeded";
+      },
+    });
+
+    // concurrency 1 → the depth-2 budget has exactly ONE slot, so a single held
+    // dispatch is enough to force the resume to queue.
+    const runtime = makeSubagentRuntime(
+      [makeAgent({ name: "resumable" }), makeAgent({ name: "holder" })],
+      h.sdk,
+      {
+        subagentRegistry: registry,
+        getMainSessionFile: () => main,
+        concurrency: 1,
+        maxDepth: 2,
+        hookRunner: recordingHooks,
+      },
+    );
+
+    // Seed a RESUMABLE record at depth 2 (foreground → takes the bypass, so it does
+    // not consume the depth-2 slot; persists a real transcript → resumable).
+    const seed = await runtime.dispatch({
+      subagentType: "resumable",
+      prompt: "SEED-TASK",
+      depth: 2,
+    });
+    expect(seed.resumable).toBe(true);
+    const agentId = seed.agentId;
+    expect(registry.get(agentId)!.depth).toBe(2); // the record the resume runs at
+    expect(registry.get(agentId)!.state).toBe("settled");
+
+    // Hold the single depth-2 slot with a gated BACKGROUND sibling (it acquires
+    // budgetForDepth(2) and parks in onPrompt).
+    const holderDispatch = runtime.dispatch({
+      subagentType: "holder",
+      prompt: "HOLD-TASK",
+      depth: 2,
+      background: true,
+    });
+    await waitUntil(() => holderLive);
+
+    // Resume the depth-2 record. The ack is synchronous; the resumed dispatch runs
+    // in the background under the same id at `record.depth` (= 2) with background: true.
+    const sm = createSendMessageToolDefinition(runtime, {
+      registry,
+      backgroundTasks,
+    }) as unknown as ToolLike;
+    const ack = await sm.execute("s", { to: agentId, message: "RESUME-WORK" });
+    const taskId = String(ack.details.taskId);
+
+    // GUARD: the resume is QUEUED behind the holder in the depth-2 budget — it has
+    // NOT acquired, so it never fired SubagentStart nor reached onPrompt, and its
+    // record (flipped to running eagerly by markResuming) has no live session yet.
+    // Delete `background: true` from the resume dispatch and this flips: the bypass
+    // fires SubagentStart synchronously during the dispatch → resumeStarted() true here.
+    expect(resumeStarted()).toBe(false);
+    expect(resumeReachedOnPrompt).toBe(false);
+    expect(registry.get(agentId)!.session).toBeUndefined();
+    expect(registry.get(agentId)!.state).toBe("running");
+
+    // Free the slot → the queued resume acquires, starts, runs to completion.
+    releaseHolder();
+    await holderDispatch;
+    const rec = await backgroundTasks.wait(taskId);
+    expect(rec?.status).toBe("completed");
+    expect(resumeStarted()).toBe(true); // it ran only AFTER the slot freed
+    expect(resumeReachedOnPrompt).toBe(true);
+    expect(registry.get(agentId)!.state).toBe("settled");
+  });
+});

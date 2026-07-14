@@ -15,9 +15,11 @@ import {
 } from "./background-identity.js";
 
 /**
- * Background task runtime (audit E4): `run_in_background: true` on the Agent
- * tool registers the (un-awaited) dispatch here; TaskOutput retrieves the
- * result, TaskStop requests a best-effort cooperative abort.
+ * Background task runtime (audit E4): a background dispatch from the Agent tool
+ * registers the (un-awaited) dispatch here. Post-F15 background is the default,
+ * so the common path is an Agent call that omits `run_in_background` (an explicit
+ * `run_in_background: true` routes here too); TaskOutput retrieves the result,
+ * TaskStop requests a best-effort cooperative abort.
  *
  * Completeness floor: registered promises never reject unhandled — settlement
  * is folded into the task record (status/result/error) in both directions.
@@ -632,7 +634,7 @@ export function buildSettlementNotice(task: BackgroundTaskRecord): string {
 function unknownIdError(view: BackgroundTaskView, id: string): Error {
   const known = view.ids();
   return new Error(
-    `Unknown task_id "${id}". Known background tasks: ${known.length ? known.join(", ") : "(none — start one with the Agent tool and run_in_background: true)"}`,
+    `Unknown task_id "${id}". Known background tasks: ${known.length ? known.join(", ") : "(none — dispatch one with the Agent tool; dispatches run in the background by default)"}`,
   );
 }
 
@@ -648,7 +650,7 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
     name: "TaskOutput",
     label: "TaskOutput",
     description:
-      "Retrieve the result of a background task started with the Agent tool's run_in_background. Waits for completion by default; pass wait: false to poll the current status instead.",
+      "Retrieve the result of a background task dispatched with the Agent tool (background is the default). Waits for completion by default; pass wait: false to poll the current status instead.",
     parameters: Type.Object({
       task_id: Type.String({ description: 'Task id returned at start, e.g. "task-1"' }),
       wait: Type.Optional(

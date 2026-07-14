@@ -908,9 +908,20 @@ describe("subagent background-task scoping (F13 t02, offline-integration via a r
 
     const coordAgent = p.tools.get("Agent");
     // Two foreground subagent dispatches: each starts ITS OWN nested background
-    // task (owner = that subagent's runtime-minted id).
-    await coordAgent.execute("c1", { subagent_type: "general-purpose", prompt: "OUTER1" });
-    await coordAgent.execute("c2", { subagent_type: "general-purpose", prompt: "OUTER2" });
+    // task (owner = that subagent's runtime-minted id). run_in_background: false
+    // pins them foreground (F15 made dispatch background-by-default) so each outer
+    // subagent runs synchronously and its nested task id is captured before the
+    // scoping assertions below.
+    await coordAgent.execute("c1", {
+      subagent_type: "general-purpose",
+      prompt: "OUTER1",
+      run_in_background: false,
+    });
+    await coordAgent.execute("c2", {
+      subagent_type: "general-purpose",
+      prompt: "OUTER2",
+      run_in_background: false,
+    });
     // A coordinator-owned background task (owner: undefined).
     const coordRes = await coordAgent.execute("c3", {
       subagent_type: "general-purpose",
