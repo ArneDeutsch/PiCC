@@ -6,6 +6,22 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — GitHub ticket integration for implement-feature (2026-07-14)
+
+- **`implement-feature` can now be invoked with a GitHub issue reference (`#5`, `5`, or an issue URL)
+  and wire the whole cycle to that ticket.** With a ref present the skill scopes the Phase 1 direction
+  conversation from the issue (title, body, labels, and comments read via `gh`), posts a kickoff
+  comment once the branch exists, opens a ready-for-review pull request linked to the ticket at hand-off
+  (`Closes #N` when the work fully delivers the ticket, a bare `#N` when it only partly does), and posts
+  a reviewer-facing implementation-summary comment. The change is **purely additive**: invoked with no
+  argument the skill behaves exactly as before — no ticket reads, no comments, no auto-PR. Failure
+  handling is **honest** — a missing or unauthenticated `gh`, an unreadable issue, a wrong-repo URL,
+  or a missing `origin` remote stops the ticket path with clear guidance instead of silently dropping
+  the ticket, and a **closed** issue prompts a warning before work starts; a write rejected after
+  successful reads degrades to today's manual
+  hand-off with paste-ready artifacts; and all writes are idempotent on resume (no double kickoff, no
+  duplicate PR). Skill-prose only — no `src/` change.
+
 ### Changed — implement-feature workflow agents (2026-07-14)
 
 - **The `implement-feature` skill no longer routes work to `general-purpose`.** Two dedicated,
