@@ -117,7 +117,8 @@ passages are loading/support claims and remain accurate.
 - [ ] `doc/supported-features.md` regenerated from the registry and committed unedited.
 - [ ] user-guide reworded row + opt-in callout (with CLAUDE.md snippet) + §7 divergence note;
       loading-only lines untouched.
-- [ ] CHANGELOG `Changed` entry added.
+- [ ] CHANGELOG: the existing `[Unreleased]` Added memory bullet reworded to conservative
+      (NOT a separate `Changed` entry); no `[Unreleased]` bullet still says "write-back conventions".
 - [ ] typecheck and full test suite green (incl. matrix-sync and tier-count tests).
 
 ## Depends on

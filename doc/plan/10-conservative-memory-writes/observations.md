@@ -42,3 +42,17 @@ Running record of friction, bugs, and opportunities. Dated bullets; distilled in
   contradicted the later-added deference clause. Reconciled. Lesson: when review adds a
   MUST (the deference clause) mid-plan, re-scan the earlier constraints in the same spec for
   contradictions before dispatch.
+
+## 2026-07-14 — t02 implementation & review
+
+- t02 implemented cleanly, first pass; docs + claude-parity both PASS. Three registry memory
+  entries → partial with coherent PARTIAL: notes; matrix regenerated (79 full / 17 partial);
+  CHANGELOG Added bullet reworded; user-guide row + callout + §7 Full→Partial move.
+- Spec-doc friction again: t02's acceptance CHECKLIST said "CHANGELOG Changed entry added"
+  while its detailed guidance said reword the existing Added bullet — implementer correctly
+  followed the detailed guidance and flagged the mismatch. Reconciled the checklist. Same lesson
+  as t01: mid-plan review edits must be propagated to a task's acceptance checklist, not just its
+  prose.
+- The "no note implies proactive writes" acceptance has no automated guard (matrix-sync only
+  checks committed==rendered; tier-count only counts) — verified by grep at review, both by the
+  implementer and independently. Worth noting a registry-note lint could catch this class.
