@@ -14,6 +14,7 @@ import {
   SubagentRuntime,
   createAgentToolDefinition,
   createSendMessageToolDefinition,
+  type PiSdk,
 } from "./runtime/subagents.js";
 import { SubagentRegistry } from "./runtime/subagent-registry.js";
 import type { SubagentRegistryRecord } from "./runtime/subagent-registry.js";
@@ -155,6 +156,24 @@ function debug(...args: unknown[]): void {
 }
 
 /**
+ * Parse a `SlashCommand` string into a `(name, argsText)` pair. Single command,
+ * NO stacking (unlike the user-typed transform): only the first `/name` token is
+ * taken and the rest is the args string. Tolerant of a missing leading slash
+ * (`deploy x` resolves like `/deploy x`). The name token shape matches the
+ * transform (`[A-Za-z0-9][\w-]*(?::[\w-]+)*`) so plugin-namespaced `/plugin:name`
+ * and `findByName`'s bare-name resolution behave identically. Whitespace between
+ * name and args is `[ \t]` (cross-platform, matching the transform). Returns
+ * undefined for empty / whitespace-only / bare `/` input (no name token).
+ */
+function parseSlashCommand(command: string): { name: string; argsText: string } | undefined {
+  const trimmed = command.trim();
+  const m = /^\/?([A-Za-z0-9][\w-]*(?::[\w-]+)*)(?=[ \t]|$)/.exec(trimmed);
+  if (!m) return undefined;
+  const argsText = trimmed.slice(m[0].length).replace(/^[ \t]+/, "");
+  return { name: m[1]!, argsText };
+}
+
+/**
  * TEST-ONLY injection point (t05 plan-review MUST-FIX). The fake-Pi harness
  * cannot reach the closure-local registries/runtime, so the offline-integration
  * test for the settlement-notice delivery path needs a named seam. `onWired` is
@@ -182,6 +201,14 @@ export interface PiccTestSeam {
      */
     subagentRuntime: SubagentRuntime;
   }) => void;
+  /**
+   * TEST-ONLY subagent SDK override: replaces the real Pi SDK the session's
+   * SubagentRuntime would otherwise load, so an offline test can drive real
+   * dispatch/fork paths (e.g. a `context: fork` skill invoked through the
+   * SlashCommand or Skill tool) deterministically without an LLM/network. Same
+   * in-process-only reachability guarantee as `onWired` above.
+   */
+  sdk?: PiSdk;
 }
 
 export default function picc(pi: any, testSeam?: PiccTestSeam) {
@@ -593,6 +620,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       "Task",
       "SendMessage",
       "Skill",
+      "SlashCommand",
       "EnterWorktree",
       "ExitWorktree",
       "TaskCreate",
@@ -623,6 +651,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // Per-dispatch Skill tool: carries the caller's depth into context:fork
         // dispatches (depth cap holds) and never mutates the parent session state.
         tools.push(createSkillTool({ depth, forSubagent: true }) as Record<string, unknown>);
+      }
+      if (granted.includes("SlashCommand")) {
+        // Per-dispatch SlashCommand tool: a thin alias over the same shared
+        // skill-activation path as the Skill tool — carries the caller's depth
+        // into context:fork dispatches and leaves parent session state alone.
+        tools.push(createSlashCommandTool({ depth, forSubagent: true }) as Record<string, unknown>);
       }
       // Background-task tools are SCOPED to this dispatcher's own tasks (F13 t02):
       // built over `backgroundTasks.scopedTo(ownerAgentId)`, so a subagent's
@@ -679,6 +713,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     concurrency: project.settings.subagentConcurrency,
     sessionId,
     subagentRegistry,
+    // TEST-ONLY (PiccTestSeam): an injected fake SDK lets offline tests exercise
+    // real dispatch/fork paths; undefined in every non-test path → loadRealSdk().
+    sdk: testSeam?.sdk,
   });
 
   // TEST-ONLY seam (t05 settlement drain; F13 t02 dispatcher-owner threading):
@@ -700,6 +737,54 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   claudeNamedTools.push(...buildCwdBoundTools(cwdState, taskToolBundle));
 
   /**
+   * The single skill-activation path shared by the Skill and SlashCommand tools
+   * (and mirroring the user-typed `/name` transform): given a RESOLVED skill and
+   * its args, honor `disable-model-invocation` refusal, `context: fork` dispatch,
+   * and byte-identical re-invocation dedup. Returns the tool result or throws a
+   * model-visible error. `invokedName` is the CALLER-supplied name (which for a
+   * bare name resolving to a plugin-namespaced skill differs from `skill.name`);
+   * the refusal message is built from it so each tool's wording is preserved.
+   */
+  async function runSkillActivation(
+    skill: ClaudeSkill,
+    argsText: string,
+    opts: { forSubagent: boolean; depth: number; invokedName: string },
+  ): Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }> {
+    if (skill.disableModelInvocation) {
+      throw new Error(`Skill "${opts.invokedName}" is user-only (disable-model-invocation). Ask the user to run /${opts.invokedName}.`);
+    }
+    if (skill.contextFork) {
+      const rendered = await activateSkill(skill, argsText, {
+        fork: true,
+        recordActivation: !opts.forSubagent,
+      });
+      const result = await forkDispatch(skill, rendered, opts.depth + 1, argsText);
+      if (!result.ok) throw new Error(result.error ?? "context:fork dispatch failed");
+      return {
+        content: [{ type: "text", text: result.finalMessage }],
+        details: { forked: true, agent: result.agentName },
+      };
+    }
+    const rendered = await activateSkill(skill, argsText, {
+      recordActivation: !opts.forSubagent,
+    });
+    // Re-invocation with byte-identical content → short note instead of a
+    // second copy (audit A8). Subagent instances keep their own context and
+    // never consult the parent-session fingerprints.
+    const note = opts.forSubagent ? undefined : skillDedupNote(skill, rendered);
+    if (note) {
+      return {
+        content: [{ type: "text", text: note }],
+        details: { skill: skill.name, deduplicated: true },
+      };
+    }
+    return {
+      content: [{ type: "text", text: skillActivationMessage(skill, rendered) }],
+      details: { skill: skill.name },
+    };
+  }
+
+  /**
    * The Skill tool, per session scope: the orchestrator's instance records
    * activations (resident body, disallowed-tools gate, scoped hooks); subagent
    * instances carry their dispatch depth into forks and leave parent state alone.
@@ -718,43 +803,52 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // findByName resolves plugin-namespaced skills by bare name when unique.
         const skill = findByName(project.skills, params.name);
         if (!skill) throw new Error(`Unknown skill: ${params.name}`);
-        if (skill.disableModelInvocation) {
-          throw new Error(`Skill "${params.name}" is user-only (disable-model-invocation). Ask the user to run /${params.name}.`);
-        }
-        if (skill.contextFork) {
-          const rendered = await activateSkill(skill, params.arguments ?? "", {
-            fork: true,
-            recordActivation: !opts.forSubagent,
-          });
-          const result = await forkDispatch(skill, rendered, opts.depth + 1, params.arguments ?? "");
-          if (!result.ok) throw new Error(result.error ?? "context:fork dispatch failed");
-          return {
-            content: [{ type: "text", text: result.finalMessage }],
-            details: { forked: true, agent: result.agentName },
-          };
-        }
-        const rendered = await activateSkill(skill, params.arguments ?? "", {
-          recordActivation: !opts.forSubagent,
+        return runSkillActivation(skill, params.arguments ?? "", {
+          forSubagent: opts.forSubagent,
+          depth: opts.depth,
+          invokedName: params.name,
         });
-        // Re-invocation with byte-identical content → short note instead of a
-        // second copy (audit A8). Subagent instances keep their own context and
-        // never consult the parent-session fingerprints.
-        const note = opts.forSubagent ? undefined : skillDedupNote(skill, rendered);
-        if (note) {
-          return {
-            content: [{ type: "text", text: note }],
-            details: { skill: skill.name, deduplicated: true },
-          };
-        }
-        return {
-          content: [{ type: "text", text: skillActivationMessage(skill, rendered) }],
-          details: { skill: skill.name },
-        };
       },
     };
   }
   const skillTool = createSkillTool({ depth: 0, forSubagent: false });
   claudeNamedTools.push(skillTool as Record<string, unknown>);
+
+  /**
+   * The SlashCommand tool, per session scope: Claude's mechanism for a MODEL to
+   * run a custom `/name args` command mid-conversation. A thin alias over the
+   * shared skill-activation path — parse the leading `/name` (optional slash;
+   * plugin-namespaced `/plugin:name` allowed), treat the rest as the skill's
+   * arguments, resolve, and activate. Model-invocability matches the Skill tool
+   * (only `disable-model-invocation` blocks; `user-invocable: false` model-only
+   * skills still activate) — the NON-stacking single-command counterpart of the
+   * user-typed `/name` prompt transform.
+   */
+  function createSlashCommandTool(opts: { depth: number; forSubagent: boolean }) {
+    return {
+      name: "SlashCommand",
+      label: "SlashCommand",
+      description:
+        'Run a slash command like "/name args". The name must be one from the "Available skills" listing (plugin-namespaced "/plugin:name" also works); the trailing text is passed to the skill as its arguments. Equivalent to the Skill tool for "/name args" command strings.',
+      parameters: Type.Object({
+        command: Type.String({ description: 'A slash command such as "/deploy staging 1.2.3"' }),
+      }),
+      async execute(_id: string, params: { command: string }) {
+        const parsed = parseSlashCommand(params.command);
+        if (!parsed) throw new Error(`SlashCommand requires a command like "/name args".`);
+        // findByName resolves plugin-namespaced skills by bare name when unique.
+        const skill = findByName(project.skills, parsed.name);
+        if (!skill) throw new Error(`Unknown slash command: /${parsed.name}`);
+        return runSkillActivation(skill, parsed.argsText, {
+          forSubagent: opts.forSubagent,
+          depth: opts.depth,
+          invokedName: parsed.name,
+        });
+      },
+    };
+  }
+  const slashCommandTool = createSlashCommandTool({ depth: 0, forSubagent: false });
+  claudeNamedTools.push(slashCommandTool as Record<string, unknown>);
 
   if (project.settings.subagentsEnabled) {
     // The built-in agent types (E1) guarantee dispatchable agents even when the

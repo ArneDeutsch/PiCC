@@ -46,6 +46,7 @@ describe("tool surface registration", () => {
       "Agent",
       "Task",
       "Skill",
+      "SlashCommand",
       "WebFetch",
       "WebSearch",
       "Grep",
@@ -246,6 +247,89 @@ describe("skill activation", () => {
     expect(expanded.text).toContain("run_in_background");
     expect(expanded.text).toContain("TaskOutput");
     expect(expanded.text).toContain("WASM ABI"); // $ARGUMENTS substituted
+  });
+});
+
+describe("SlashCommand tool (F11)", () => {
+  it("activates the resolved skill with args, byte-identical to the Skill tool for the same input", async () => {
+    const skillTool = pi.tools.get("Skill");
+    const slash = pi.tools.get("SlashCommand");
+    // Unique args so `expected` renders full (never seen before), then a bump so
+    // the SlashCommand re-render of the SAME content is not collapsed by the
+    // session-wide dedup fingerprint (which Skill and SlashCommand share).
+    const expected = await skillTool.execute("eq1", { name: "deploy", arguments: "eqenv 5.5.5" });
+    await skillTool.execute("eq2", { name: "deploy", arguments: "eqbump 5.5.5" });
+    const viaSlash = await slash.execute("eq3", { command: "/deploy eqenv 5.5.5" });
+    expect(viaSlash).toEqual(expected);
+    const text = viaSlash.content[0].text as string;
+    expect(text).toContain("FS-SKILL-ARGS-BODY");
+    expect(text).toContain("Deploy to environment **eqenv** at version **5.5.5**");
+  });
+
+  it("resolves a plugin skill by bare name and by :-form (findByName parity)", async () => {
+    // Asserts parse+resolution of both name forms. ${CLAUDE_PLUGIN_ROOT} substitution
+    // is NOT re-checked here (plugin-skill is fixed-content/no-args, so a full render
+    // always dedups by this point); it is proven on the shared runSkillActivation
+    // render path by the Skill-tool plugin test earlier in this file.
+    const slash = pi.tools.get("SlashCommand");
+    const bare = await slash.execute("p1", { command: "/plugin-skill" });
+    expect(bare.details.skill).toBe("bundled-fixture-plugin:plugin-skill");
+    const colon = await slash.execute("p2", { command: "/bundled-fixture-plugin:plugin-skill" });
+    expect(colon.details.skill).toBe("bundled-fixture-plugin:plugin-skill");
+  });
+
+  it("tolerates a missing leading slash (deploy staging → /deploy staging)", async () => {
+    const slash = pi.tools.get("SlashCommand");
+    // Bump the shared fingerprint first so this render is not deduped.
+    await pi.tools.get("Skill").execute("noslash-bump", { name: "deploy", arguments: "bump 0.1" });
+    const res = await slash.execute("ns1", { command: "deploy noslash 8.8.8" });
+    const text = res.content[0].text as string;
+    expect(text).toContain("FS-SKILL-ARGS-BODY");
+    expect(text).toContain("Deploy to environment **noslash** at version **8.8.8**");
+  });
+
+  it("activates a model-only (user-invocable:false) skill — gated on disable-model-invocation ONLY", async () => {
+    const slash = pi.tools.get("SlashCommand");
+    // rust-helper is user-invocable:false but model-invocable — it must RUN.
+    const res = await slash.execute("mo1", { command: "/rust-helper" });
+    expect(res.details.skill).toBe("rust-helper");
+    // Either the full body or (if a prior render exists) the dedup note for it —
+    // both prove it activated rather than being refused.
+    expect(res.details.deduplicated ? true : String(res.content[0].text).includes("FS-SKILL-PATHS-BODY")).toBe(true);
+  });
+
+  it("refuses a disable-model-invocation skill (throws, naming user-only)", async () => {
+    const slash = pi.tools.get("SlashCommand");
+    await expect(slash.execute("dmi1", { command: "/secret-ritual now" })).rejects.toThrow(/user-only/);
+  });
+
+  it("dedups a byte-identical re-invocation, and shares the fingerprint set with the Skill tool", async () => {
+    const skillTool = pi.tools.get("Skill");
+    const slash = pi.tools.get("SlashCommand");
+    // First SlashCommand render records the fingerprint; the identical second dedups.
+    await slash.execute("dd1", { command: "/deploy dedupenv 1.1.1" });
+    const second = await slash.execute("dd2", { command: "/deploy dedupenv 1.1.1" });
+    expect(second.details.deduplicated).toBe(true);
+    // Cross-tool: Skill-tool render then identical SlashCommand collapses too.
+    await skillTool.execute("dd3", { name: "deploy", arguments: "shared 2.2.2" });
+    const cross = await slash.execute("dd4", { command: "/deploy shared 2.2.2" });
+    expect(cross.details.deduplicated).toBe(true);
+  });
+
+  it("throws a naming error for an unknown command (not a crash, not a silent success)", async () => {
+    const slash = pi.tools.get("SlashCommand");
+    await expect(slash.execute("u1", { command: "/no-such-skill foo" })).rejects.toThrow(
+      /Unknown slash command: \/no-such-skill/,
+    );
+  });
+
+  it("throws the dedicated 'requires a command' message for empty / whitespace / bare-slash input", async () => {
+    const slash = pi.tools.get("SlashCommand");
+    for (const command of ["", "   ", "/"]) {
+      await expect(slash.execute("e", { command })).rejects.toThrow(
+        /SlashCommand requires a command like "\/name args"\./,
+      );
+    }
   });
 });
 

@@ -19,6 +19,27 @@ All notable changes to PiCC are documented here. The format is based on
   "hidden TaskOutput" behavior is a filed Claude bug (#15098, #23154), and PiCC's explicit per-dispatcher
   guard is an honest hardening that is stricter than Claude only on the #15098 coordinator-passed-id edge.
 
+### Added — SlashCommand tool (2026-07-14)
+
+- **`SlashCommand` is now a real, working tool instead of a degraded no-op.** A model can call
+  `SlashCommand({ command: "/name args" })` to run a custom command mid-conversation: PiCC parses the
+  leading `/name` (optional slash; plugin-namespaced `/plugin:name` allowed), resolves the skill, and
+  activates it with the trailing text as its arguments — identical to the `Skill` tool for the same
+  skill+args. Skill semantics are honored the same way (a `disable-model-invocation` skill is refused,
+  a `context: fork` skill runs forked and returns its result, a byte-identical re-invocation dedups),
+  model-invocability matches the `Skill` tool (a `user-invocable: false` model-only skill still
+  activates; only `disable-model-invocation` blocks), and the tool is grantable to subagents, carrying
+  dispatch depth into forked skills. Both tools now delegate to one shared skill-activation closure, so
+  the `Skill` tool's behavior is unchanged. The capability registry retiers `tool.SlashCommand` from
+  **degraded-noop** to **partial** (it covers all user-defined skills/commands but not the built-in
+  commands Claude 2.1.x also exposes on the Skill/SlashCommand skill-activation path — `/init`,
+  `/review`, `/security-review` — which PiCC does not ship); `doc/supported-features.md` was
+  regenerated from the registry.
+- **Operator note:** `SlashCommand` is a second, independently-gateable route to model-driven skill
+  activation alongside `Skill`. Both honor each skill's `disable-model-invocation` and
+  `disallowed-tools`, but a project that wants to block model-driven skill activation via
+  `permissions` must gate **both** tool names, not just `Skill`.
+
 ### Fixed — defensive background-task error storage (2026-07-14)
 
 - Resolved failed and aborted background dispatches now retain only bounded, single-line error text
