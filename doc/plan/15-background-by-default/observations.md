@@ -56,6 +56,28 @@ for `review.md`. Dated bullets, one line each.
   (foreground nested is parent-blocking and rare); worth stating in the architecture
   prose (t03).
 
+## Feature-close review (whole-feature pass)
+
+- 2026-07-14 (all four close reviewers PASS): coder — three tasks compose cleanly, no
+  leak/double-release, routing decoupled from acquire; security — both invariants
+  (env hatch, bounded deadlock-free nesting) hold together, "safe to hand off";
+  generalist — every acceptance bullet delivered AND test-guarded; parity — faithful,
+  registry truthful, divergence honestly named.
+- 2026-07-14 (parity SHOULD, deferred to follow-up): **background-mode permission
+  posture** — Claude runs background subagents auto-denying anything that would
+  prompt; PiCC downgrades `ask`→allow the same in fore/background
+  (`permissions.ts:672,688`). Pre-existing posture, but F15 makes background the
+  *default* so it now applies to every dispatch. Out of F15's routing scope and the
+  claim needs the permission specialist to verify precisely before documenting — filed
+  as a follow-up rather than a hasty registry line.
+- 2026-07-14 (parity SHOULD, deferred): `examples/full-surface` only exercises
+  *explicit* background (`bg-research.md`); no fixture for the plain multi-dispatch
+  default that F15 makes headline. Overlaps the F02 "full-surface conformance fixture"
+  follow-up — offer to file.
+- 2026-07-14 (close NITs, fixed): registry lacked the per-depth nested-bound divergence
+  (added to `feature.background-agents`); stale JSDoc on `isBackgroundAgent`
+  (reworded); `/usage`-on-default-path had no dedicated assertion (added).
+
 ## Pre-existing issues found along the way (out of F15 scope — follow-up candidates)
 
 - 2026-07-14 (security): `unknownIdError` (`src/runtime/background-tasks.ts` ~566-570)
