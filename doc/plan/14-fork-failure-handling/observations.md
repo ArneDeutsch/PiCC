@@ -52,6 +52,29 @@ Running record of friction, bugs, and opportunities. Dated bullets; raw material
   signal to the Skill-tool fork (verified), NOT that "Esc cancels a nested fork" (cross-session
   delivery is Pi's, unverified); typed /forked-skill stays non-cancellable (harness limit).
 
+## 2026-07-14 — t03 (registry/docs truthfulness)
+
+- Both reviewers (docs, claude-parity) confirmed the registry note claims exactly what shipped:
+  "threads the Esc signal" (not "cancels a nested fork"), typed /forked-skill non-cancel framed
+  as a PiCC/Pi harness limitation (not Claude scoping Esc), 2.1.199 attribution, no unqualified
+  "Esc → aborted". Generated matrix is a clean regeneration (freshness guard green).
+- Fixed a cross-surface inconsistency: architecture.md called the second consumer the
+  "Skill-tool-from-subagent caller", but the Skill tool is model-invoked at top level too (depth
+  0) — the shipped registry/user-guide/CHANGELOG correctly say "model-invoked Skill-tool caller".
+  Aligned architecture.md to match.
+- **DECISION (coordinator): kept `skill.frontmatter.context` tagged `full`, not `partial`.**
+  F14 fixed the actual broken failure/abort semantics; the residual Esc-on-typed-route gap is a
+  narrow harness-interruption limitation on one invocation route, orthogonal to whether the
+  frontmatter key is parsed/honoured with Claude dispatch semantics (it is). The note documents
+  the gap transparently. Downgrading as we close the main gap would misrepresent the surface.
+- **[follow-up]** No documented convention for whether a *documented harness-limitation
+  divergence* should nudge a registry entry from `full` to `partial` (tool.Agent is `partial`
+  for its foreground-default divergence; this entry stays `full` with a divergence note). Worth
+  a one-line tagging-policy note somewhere authoritative so future entries are consistent.
+- **[note]** "not Claude Code scoping Esc" asserts a mild negative about Claude's behaviour that
+  is *inferred* (F14 verified only PiCC's side). Acceptable as written (self-deprecating /
+  truthful-safe framing); keep labelled inferred if ever promoted to a stronger claim.
+
 ## Phase-6 deferred (continued)
 
 - **[note] `capErrorText` is duplicated on purpose** in `background-tasks.ts:416-423` to avoid

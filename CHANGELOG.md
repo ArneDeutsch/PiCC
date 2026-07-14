@@ -6,6 +6,19 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — context: fork failure preservation and Esc abort (2026-07-14)
+
+- **A `context: fork` skill that fails partway through no longer silently loses its work or crashes.**
+  A fork that dies on a terminal error is now a **loud failure that names the cause and preserves the
+  partial output** it produced before dying, inside the same cut-off frame the `Agent` tool uses —
+  bringing the fork path to parity with the subagent error contract (Claude 2.1.199). This was the
+  last place the silent-loss/empty-success class of defect survived on the subagent surface. Under the
+  hood the `Agent` tool and both fork consumers now render outcomes through one shared
+  `presentDispatchResult` helper. Pressing **Esc** during a **model-invoked** fork (the `Skill`-tool
+  path) now reports the run as **aborted** rather than an empty success or a crash. A *typed* top-level
+  `/forked-skill` expansion remains not Esc-cancellable — a PiCC/Pi harness limitation (no abort signal
+  reaches the input-hook stage), not Claude Code scoping Esc. Fork dispatches stay non-resumable.
+
 ### Fixed — defensive background-task error storage (2026-07-14)
 
 - Resolved failed and aborted background dispatches now retain only bounded, single-line error text

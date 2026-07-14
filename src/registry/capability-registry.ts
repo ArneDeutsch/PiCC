@@ -171,7 +171,7 @@ const SKILL_FRONTMATTER_FULL_NOTES: Record<string, string> = {
   "argument-hint": "shown for slash-command argument entry (§4.1)",
   arguments: "named argument specs with required/default handling (§4.1)",
   "disallowed-tools": "denylist enforced — resident-skill denials feed the session deny guard; context:fork dispatch receives them as subagent gating (§4.1, §6.1)",
-  context: "context: fork runs the skill as a fresh-context subagent (§4.1)",
+  context: "context: fork runs the skill as a fresh-context subagent; a fork that fails on a terminal error is a LOUD failure naming the cause with partial output preserved (parity with the Agent tool, 2.1.199); F14 threads the Esc signal to a model-invoked context: fork (the Skill-tool path) so it reports aborted, but a typed top-level /forked-skill expansion is NOT Esc-cancellable — a PiCC/Pi harness limitation (no abort signal at the input-hook stage), not Claude Code scoping Esc; fork dispatches are non-resumable (§4.1)",
   agent: "names the agent context used with context: fork (§4.1)",
   hooks: "skill-scoped hook config dispatched while the skill is active (§4.1, §4.5)",
   paths: "path-scoped skills are surfaced (once) when a matching file is accessed; activation stays explicit via the Skill tool (§4.1, §4.2)",
