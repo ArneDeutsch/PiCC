@@ -207,10 +207,10 @@ export class BackgroundTaskRegistry {
           // Deliberate stop (abort/TaskStop inside the dispatch): reported as
           // stopped — never as failed, and NEVER as completed.
           record.status = "stopped";
-          record.error = result.error ?? "subagent dispatch was aborted";
+          record.error = capErrorText(result.error ?? "subagent dispatch was aborted");
         } else {
           record.status = "failed";
-          record.error = result.error ?? "subagent dispatch failed";
+          record.error = capErrorText(result.error ?? "subagent dispatch failed");
           // Preserve best-effort partial output for TaskOutput to surface.
           if (result.finalMessage.trim()) record.result = result.finalMessage;
         }
