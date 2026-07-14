@@ -18,12 +18,16 @@ Two-part delivery, honestly asymmetric:
   caller). The old `throw` that dropped partial output (`index.ts:715`) and the input-hook
   branch that dropped it (`index.ts:1046`) are both fixed. Byte-identical cut-off framing via
   the shared helper (no re-implementation, no delimiter drift).
-- **Esc cancellation — delivered as mapping + signal threading, reachable for one route.**
-  The abort→"aborted" mapping and the signal threading (`forkDispatch → dispatch({abortSignal})`)
-  are in place and tested. It is genuinely Esc-reachable for the **model-invoked Skill-tool
-  fork** (the same foreground-turn signal mechanism the Agent tool already uses). It is **not**
-  reachable for a **typed `/forked-skill`** expansion — Pi exposes no abort signal at the
-  input-hook stage — which is documented as a PiCC/Pi harness limitation, not hidden.
+- **Esc cancellation — delivered on both routes (different mechanisms).** Model-invoked forks
+  (`Skill`/`SlashCommand` tool) ride Pi's per-call abort signal (the same mechanism the Agent
+  tool uses). A typed `/forked-skill` has no per-call signal (it runs before the turn streams),
+  so t04 makes it Esc-cancellable **in interactive mode** by watching raw terminal input
+  (`ctx.ui.onTerminalInput`) and aborting on a lone Esc; print/RPC modes have no Esc. The
+  abort→"aborted" mapping and signal threading are tested offline on every route.
+  **Residual:** live end-to-end Esc *delivery* to the terminal-input watcher during the awaited
+  input hook is the documented purpose of the API but is not verified against a live terminal
+  (unscriptable in the suite) — a one-time manual smoke test is recommended before fully
+  trusting the live typed-route path.
 
 ## Planning errors & spec gaps
 
@@ -81,10 +85,12 @@ Two-part delivery, honestly asymmetric:
 
 ## Proposed follow-ups
 
-1. **Typed `/forked-skill` Esc cancellation (the remaining scope of #11).** Needs a Pi-base
-   capability — surface an abort signal to input hooks, or move fork expansion into the turn —
-   so a typed forked-slash is cancellable like a model-invoked one. This is why #11 should
-   stay open.
+1. **Live smoke-test of typed `/forked-skill` Esc (was the remaining scope of #11 — now
+   implemented in t04).** The typed route is now Esc-cancellable in interactive mode via
+   `ctx.ui.onTerminalInput`; the wiring is proven offline. What remains is a one-time manual
+   smoke test in a live interactive terminal to confirm Pi delivers the Esc keypress to the
+   watcher while the input hook is awaited. Only if that fails would the original Pi-base
+   approach (surface a per-call signal to input hooks) be needed.
 2. **Verify cross-session Esc *delivery* to a nested from-subagent Skill `execute`.** F14
    threads the signal at each hop; whether a real top-level Esc reaches a nested tool execute
    is Pi's abort-propagation behaviour, unverified. Add a propagation test / confirm Pi's

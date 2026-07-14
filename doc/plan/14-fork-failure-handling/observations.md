@@ -75,6 +75,25 @@ Running record of friction, bugs, and opportunities. Dated bullets; raw material
   is *inferred* (F14 verified only PiCC's side). Acceptable as written (self-deprecating /
   truthful-safe framing); keep labelled inferred if ever promoted to a stronger claim.
 
+## 2026-07-14 — t04 (typed /forked-skill Esc, post-close, user-requested)
+
+- User asked to implement former follow-up 1 (the remaining scope of #11) directly rather than
+  file it. Done via `ctx.ui.onTerminalInput` — the input hook watches raw terminal input and
+  aborts the fork on a lone Esc in interactive mode. Wiring proven offline (case 8). Also
+  broadens the earlier "harness limitation" framing in registry/architecture/user-guide/CHANGELOG.
+- **RESIDUAL (honest, flagged to user):** live end-to-end Esc *delivery* to the listener during
+  the awaited input hook is the documented purpose of the API but NOT verified against a live
+  terminal (can't script a live Esc; couldn't confirm from Pi's minified bundle). Needs a manual
+  smoke test before fully trusting the live path / closing #11 on this basis.
+- Now BOTH #11 acceptance criteria are met at the mechanism/wiring level → close-vs-keep-open
+  for #11 shifts toward closeable, pending the smoke test. Re-decide with the user.
+- Review (coder + security): PASS after two hardening fixes both flagged — (1) wrap the
+  `onTerminalInput` subscribe + the `finally` teardown in try/catch so a Pi listener-plumbing
+  throw degrades to "uncancellable fork" instead of hitting the outer catch and leaking the raw
+  `/skill` (protects the never-throw invariant); (2) the test now asserts an ESC-prefixed arrow
+  sequence does NOT abort (previously the arrow line was a no-op assertion). Security confirmed
+  the intercept is Esc-only, raw input never logged/forwarded, listener can't leak.
+
 ## 2026-07-14 — hand-off merge with origin/main (F11 SlashCommand)
 
 - origin/main advanced by 5 commits (F11 "Real SlashCommand tool") while F14 was in flight.

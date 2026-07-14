@@ -1169,16 +1169,54 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           debug(`input: expanding skill /${skill.name}`);
           const rendered = await activateSkill(skill, argsText, { fork: skill.contextFork });
           if (skill.contextFork) {
-            // Pass ctx.signal through (correct when defined, harmless when
-            // undefined). NOTE: at the input-hook stage ctx.signal is undefined
-            // for a typed `/forked-skill` (the event fires before the turn
-            // streams), so this does NOT make a typed expansion Esc-cancellable —
-            // a Pi harness limitation documented in t03, not hidden here.
-            const result = await forkDispatch(skill, rendered, 1, argsText, ctx.signal);
+            // A typed `/forked-skill` runs synchronously inside this input hook,
+            // BEFORE the turn streams — so `ctx.signal` is undefined here (there is
+            // no active run to abort). In interactive mode we still make it
+            // Esc-cancellable: watch raw terminal input (`ctx.ui.onTerminalInput`,
+            // interactive-only) and abort our own controller on a bare Esc,
+            // threading that into the fork. Print/RPC modes expose no
+            // `onTerminalInput` and have no Esc, so the fork simply runs to
+            // completion (and `ctx.signal` stays the source of truth if Pi ever
+            // provides one at this stage).
+            let forkSignal: AbortSignal | undefined = ctx.signal;
+            let stopEscWatch: (() => void) | undefined;
+            if (!forkSignal && typeof ctx.ui?.onTerminalInput === "function") {
+              // Subscribing is host (Pi) plumbing — if it throws, degrade to an
+              // uncancellable fork rather than let the throw reach the handler's
+              // catch and leak the raw `/skill` to the model (never-throw, below).
+              try {
+                const escController = new AbortController();
+                stopEscWatch = ctx.ui.onTerminalInput((data: string) => {
+                  // A lone ESC (0x1b) is a cancel; ESC-prefixed sequences (arrow
+                  // keys, etc.) are longer, so match the bare byte only. Consume it
+                  // so Pi doesn't also act on the same keypress.
+                  if (data.length === 1 && data.charCodeAt(0) === 0x1b) {
+                    escController.abort();
+                    return { consume: true };
+                  }
+                  return undefined;
+                });
+                forkSignal = escController.signal;
+              } catch {
+                stopEscWatch = undefined;
+                forkSignal = ctx.signal;
+              }
+            }
             // Fork non-resumable (allowResumeTrailer:false) and — critically —
             // EVERY outcome is folded into the transform text, never thrown: a
             // throw here would hit the handler's catch and send the raw
             // unexpanded `/skill` to the model, silently dropping the fork's work.
+            let result;
+            try {
+              result = await forkDispatch(skill, rendered, 1, argsText, forkSignal);
+            } finally {
+              // Teardown must never throw over a computed result.
+              try {
+                stopEscWatch?.();
+              } catch {
+                /* ignore terminal-input unsubscribe failure */
+              }
+            }
             const p = presentDispatchResult(result, { allowResumeTrailer: false });
             parts.push(
               p.kind === "result"

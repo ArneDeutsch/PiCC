@@ -271,10 +271,12 @@ principle in the plan (§2.1 mechanical fidelity).
     outcome, the named cause, and the partial-output cut-off frame from **one** source of truth,
     and the Agent tool plus **both** fork consumers (the typed top-level-input caller and the
     model-invoked `Skill`/`SlashCommand`-tool caller — one shared `runSkillActivation` path) route
-    through it. The Esc caveat is scoped: F14 threads the abort signal to a **model-invoked** fork
-    (the `Skill` or `SlashCommand` tool) so it reports aborted, but a **typed top-level
-    `/forked-skill`** expansion is not Esc-cancellable — a PiCC/Pi harness limitation (no abort
-    signal at the input-hook stage), not Claude Code scoping Esc.
+    through it. Esc cancels an in-flight fork and reports it aborted on both routes, by different
+    mechanisms: a **model-invoked** fork (the `Skill`/`SlashCommand` tool) rides Pi's per-call
+    abort signal; a **typed top-level `/forked-skill`** has no per-call signal (the input event
+    fires before the turn streams), so in interactive mode the input hook instead watches raw
+    terminal input (`ctx.ui.onTerminalInput`) and aborts on a bare Esc. Print/RPC modes have no
+    Esc, so a typed fork there runs to completion.
 
 - **Deny matches any command segment.** The permission matcher is shell-operator aware, so a deny
   like `Bash(rm *)` cannot be evaded by chaining (`git status && rm -rf /`) — every segment is

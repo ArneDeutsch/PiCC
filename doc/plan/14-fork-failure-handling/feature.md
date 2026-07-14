@@ -58,8 +58,10 @@ surface that F02 set out to eliminate.
   surfaces a failure message that both names the cause and includes the partial output —
   from **both** the top-level-input caller and the `Skill`-tool-from-subagent caller.
 - Pressing Esc while a `context: fork` skill is running cancels it, and the caller reports
-  the run as **aborted** rather than as an empty success or a crash — from both callers
-  where the Esc signal is reachable (any caller where the signal is *not* reachable is
+  the run as **aborted** rather than as an empty success or a crash. Model-invoked forks
+  (`Skill`/`SlashCommand` tool) ride Pi's per-call signal; a typed top-level `/forked-skill`
+  has no per-call signal, so in interactive mode the input hook watches raw terminal input
+  and aborts on Esc (print/RPC modes have no Esc — a typed fork there runs to completion,
   named explicitly rather than silently degraded).
 - Behaviour on the `Agent`-tool path, on non-forked skills, and on successful forks is
   unchanged.
@@ -74,3 +76,6 @@ surface that F02 set out to eliminate.
   consumers through the t01 helper (depends on: t01)
 - t03 Make the capability registry, generated docs, and CHANGELOG truthful about fork
   failure/abort handling, with the scoped-Esc caveat (depends on: t02)
+- t04 Make a typed top-level `/forked-skill` Esc-cancellable in interactive mode — the
+  input hook watches raw terminal input (`ctx.ui.onTerminalInput`) and aborts on Esc;
+  update docs to match (depends on: t02)

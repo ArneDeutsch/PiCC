@@ -35,11 +35,11 @@ All notable changes to PiCC are documented here. The format is based on
   bringing the fork path to parity with the subagent error contract (Claude 2.1.199). This was the
   last place the silent-loss/empty-success class of defect survived on the subagent surface. Under the
   hood the `Agent` tool and every fork consumer now render outcomes through one shared
-  `presentDispatchResult` helper. Pressing **Esc** during a **model-invoked** fork (the `Skill` or
-  `SlashCommand` tool) now reports the run as **aborted** rather than an empty success or a crash. A
-  *typed* top-level `/forked-skill` expansion remains not Esc-cancellable — a PiCC/Pi harness
-  limitation (no abort signal reaches the input-hook stage), not Claude Code scoping Esc. Fork
-  dispatches stay non-resumable.
+  `presentDispatchResult` helper. Pressing **Esc** now cancels an in-flight fork and reports it as
+  **aborted** rather than an empty success or a crash — a model-invoked fork (the `Skill` or
+  `SlashCommand` tool) via Pi's per-call abort signal, and a *typed* top-level `/forked-skill` in
+  interactive mode via the input hook watching raw terminal input for Esc (print/RPC modes have no
+  Esc). Fork dispatches stay non-resumable.
 
 ### Fixed — defensive background-task error storage (2026-07-14)
 

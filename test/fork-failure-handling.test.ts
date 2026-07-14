@@ -193,4 +193,50 @@ describe("F14 t02 — input-hook fork consumer (/fork-research …)", () => {
     expect(out.text).toContain("The fork-research skill ran in a forked subagent. Its result:");
     expect(out.text).toContain("- a\n- b\n- c");
   });
+
+  it("(8) Esc during a typed /forked-skill aborts it (interactive onTerminalInput watch)", async () => {
+    // The typed route has no ctx.signal (fires before the turn streams); in TUI
+    // mode the input hook subscribes to raw terminal input and aborts its own
+    // controller on a bare Esc byte. This proves that wiring end-to-end: a
+    // simulated Esc cancels the in-flight fork and the turn still expands (aborted),
+    // never leaking the raw /fork-research to the model.
+    const ESC = String.fromCharCode(0x1b);
+    const gate = new Promise<void>(() => {}); // never resolves — only abort ends it
+    const h = fakeSdk({ replies: [{ text: "never delivered", gate }] });
+    const p = wire(h.sdk);
+    let escHandler: ((data: string) => unknown) | undefined;
+    let unsubscribed = false;
+    const ctx = p.ctx({
+      mode: "tui",
+      signal: undefined,
+      ui: {
+        notify: () => {},
+        setStatus: () => {},
+        onTerminalInput: (handler: (data: string) => unknown) => {
+          escHandler = handler;
+          return () => {
+            unsubscribed = true;
+          };
+        },
+      },
+    });
+    const pending = p.fire("input", { text: "/fork-research x", source: "interactive" }, ctx);
+    pending.catch(() => {}); // avoid an unhandled-rejection warning while we poll
+    // Poll until the hook subscribes (the input-hook path has more awaits before
+    // the fork than the direct execute path, so a fixed short sleep is flaky).
+    for (let i = 0; i < 200 && !escHandler; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(escHandler).toBeDefined();
+    // An arrow key (ESC-prefixed sequence) must NOT cancel — only a lone Esc.
+    expect(escHandler!(`${ESC}[A`)).toBeUndefined(); // not consumed, no abort
+    expect(h.abortCalls()).toBe(0); // the arrow sequence did not abort the fork
+    const consumed = escHandler!(ESC); // user presses Esc
+    expect(consumed).toEqual({ consume: true });
+    const out = await pending;
+    expect(out.action).toBe("transform");
+    expect(out.text).toContain("did not finish");
+    expect(out.text).toContain("aborted");
+    expect(out.text).not.toContain("/fork-research"); // no raw-input fallback
+    expect(h.abortCalls()).toBeGreaterThan(0);
+    expect(unsubscribed).toBe(true); // watcher cleaned up in finally
+  });
 });
