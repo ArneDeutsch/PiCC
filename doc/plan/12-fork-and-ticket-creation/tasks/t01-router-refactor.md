@@ -19,20 +19,29 @@ backtracking → Plan folder layout → Templates (feature/task/review) → Comm
 recursively, so **no reference file may be named `SKILL.md`** (it would register as a second skill).
 Reference files are inert to the loader; they enter context only when the router instructs a `Read`.
 
-**The partition (create exactly these files under `.claude/skills/implement-feature/references/`):**
+**The partition (create these files under `.claude/skills/implement-feature/references/`; you MAY add
+more — see the size note):**
 
 | File | Receives | 
 |---|---|
 | `references/templates.md` | the three templates (`feature.md`, `tasks/t<NN>-<slug>.md`, `review.md`) verbatim. |
-| `references/ticket-integration.md` | the **full** text of the nine discipline rules verbatim, plus the "Non-negotiable discipline" preamble. |
-| `references/handoff.md` | the Phase 9 **maintainer** hand-off detail: the `gh pr create` invocation, the PR-body and issue-comment skeletons, the raw-material notes, and the write-failure degrade text. |
+| `references/ticket-integration.md` | the **full** text of the nine discipline rules verbatim, plus the "Non-negotiable discipline" preamble, the reachability-gate failure-draft message, and the ticket-path per-phase hooks (Phase 1 scope-from-issue + write-contract, Phase 8 close-vs-keep-open + write preview + issue-filing offer). |
+| `references/handoff.md` | the **whole** Phase 9 hand-off detail: the `gh pr create` invocation, the PR-body and issue-comment skeletons, the raw-material notes, the write-failure degrade text, the ticket-path final summary. |
+| `references/workflow-detail.md` (add) | the path-independent **deep phase procedure** that doesn't fit the resident budget — at least Phase 2 (workspace bootstrap), Phase 6 (plan-review fan-out), Phase 7 (implementation loop). Split into more than one file if cleaner. This is what makes the size target reachable. |
+
+**Size reality (measured).** The resident directive floor (Principles, roster, gate, checklist,
+aborting, layout, grammar) plus the phase-procedure trunk is ~24k in a 3-file partition — over the
+cap. So the router must become a **skeleton**: each of Phases 0–9 is a short paragraph (what the phase
+achieves + when to route out) with the deep procedure in a reference file. Move whatever phase
+procedure is needed into `references/` to hit the target; **never cut content**.
 
 **What stays resident in the router** (always loaded): frontmatter; a trimmed intro + one-paragraph
-ticket-reference pointer; Principles; Subagent roster; the **reachability gate** (keep it resident —
-it is an entry precondition that must run before any worktree/write); a new **resident discipline
-checklist** (see below); the **phase spine Phases 0–9** rewritten as a lean trunk describing the
-common (maintainer, non-fork) flow, each phase carrying routing lines to the reference files for
-path-specific depth; Aborting and backtracking; Plan folder layout; Commit grammar.
+ticket-reference pointer; Principles; Subagent roster (consulted at every fan-out — keep it resident);
+the **reachability gate** (entry precondition that must run before any worktree/write); the new
+**resident discipline checklist** (see below); the **phase spine Phases 0–9 as a lean skeleton**, each
+phase a short paragraph + routing line to its detail; Aborting and backtracking; Plan folder layout;
+Commit grammar. The full procedural depth of the common-flow phases lives in `references/` and is read
+when the coordinator enters that phase.
 
 **Resident discipline checklist** — add a short, always-loaded block (compact, ~8 one-line bullets)
 naming the non-negotiable write rules so they are present even if a reference read fails: bodies via
@@ -66,9 +75,9 @@ at each write site.
   workflow does. Slimming the trunk means relocating detail into references and pointing at it, not
   dropping it. When in doubt, move text verbatim rather than paraphrase.
 - Router body (everything after the frontmatter, as `loadSkillBody` returns it) must be
-  **< 20,000 chars**; **target ~14,000** — t02–t05 each add resident prose under the same hard guard,
-  so leave real headroom. If extraction alone doesn't reach it, move more path-specific phase detail
-  into the reference files — never by cutting content.
+  **≤ 16,000 chars** (hard ceiling 18,000, leaving ≥2,000 under the 20,000 cap) — t02–t05 each add a
+  little resident prose under the same hard guard, so leave headroom. Reach it by moving phase
+  procedure into `references/` (add files as needed) — never by cutting content.
 - Do the work in two internal passes so the coordinator can review faithfulness: **Pass A** —
   relocate the three blocks verbatim into `references/` and replace them with routing lines (pure
   move); **Pass B** — slim the Phase spine trunk and author the resident discipline checklist to
@@ -104,12 +113,14 @@ cross-platform — do **not** substitute `fs.readFileSync`. Assertions:
 - **Size, tied to the runtime constant:** `import { REINJECT_PER_SKILL_MAX_CHARS } from
   "../src/runtime/skill-activation.js"` and assert `loadSkillBody(skill).length <=
   REINJECT_PER_SKILL_MAX_CHARS` — prove the actual contract, not a hardcoded 20000.
-- **Reference reachability, bidirectional:** for each reference file this task creates
-  (`templates`, `ticket-integration`, `handoff`), assert it is **both** mentioned in the router body
-  **and** exists on disk (a one-way "mentioned→exists" check misses a *dropped routing line*, a real
-  regression). Extract mentions by path token — `/references\/[A-Za-z0-9_-]+\.md/g` over the body,
-  deduped — so it matches whether written as a markdown link, a bare path, or a `${CLAUDE_SKILL_DIR}/`
-  prefix. Also assert every extracted token resolves on disk (catches a link to a mistyped sixth file).
+- **Reference reachability, bidirectional:** for each reference file this task creates (`templates`,
+  `ticket-integration`, `handoff`, and the added `workflow-detail`/split), assert it is **both**
+  mentioned in the router body **and** exists on disk (a one-way "mentioned→exists" check misses a
+  *dropped routing line*, a real regression). Extract mentions by path token —
+  `/references\/[A-Za-z0-9_-]+\.md/g` over the body, deduped — so it matches whether written as a
+  markdown link, a bare path, or a `${CLAUDE_SKILL_DIR}/` prefix. Also assert every extracted token
+  resolves on disk (catches a link to a mistyped file). Keep the assertion count-agnostic — glob the
+  actual `references/*.md` files and require each is linked, rather than hardcoding a file count.
 - **No second skill:** reuse the loader's own primitive — `walkFiles(skillDir, n => n === "SKILL.md")`
   from `src/util/fs.js` — and assert exactly one hit, the top-level file. Keep it **scoped to the skill
   dir**; a repo-wide walk would fail (many `examples/**` fixtures ship their own `SKILL.md`).
@@ -117,10 +128,11 @@ t05 extends this test to all five reference files. Cross-platform: `fs`/`path` o
 comparing a `walkFiles` result to an expected path, normalize separators (`\\`→`/`).
 
 ## Acceptance criteria
-- [ ] `references/templates.md`, `references/ticket-integration.md`, `references/handoff.md` exist and
-      contain the relocated content; the router links each with a when-to-read + fail-closed line.
-- [ ] Router body ≤ `REINJECT_PER_SKILL_MAX_CHARS` (target ~14,000); frontmatter unchanged; resident
-      discipline checklist present.
+- [ ] `references/templates.md`, `references/ticket-integration.md`, `references/handoff.md`, and the
+      added `references/workflow-detail.md` (or split) exist with the relocated content; the router
+      links each bidirectionally with a when-to-read + fail-closed line.
+- [ ] Router body ≤ 16,000 chars (hard ceiling 18,000, well under `REINJECT_PER_SKILL_MAX_CHARS`);
+      frontmatter unchanged; resident discipline checklist present.
 - [ ] No behavior change: every instruction in the original is still reachable (resident or via a
       routing line).
 - [ ] New guard test added and green.

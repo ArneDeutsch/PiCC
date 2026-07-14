@@ -77,9 +77,11 @@ default, not the fork's (t02 — verify it's stated as a named seam). Assign any
   clause (pick the lighter touch that removes the contradiction).
 
 ## Testing
-Extend the t01 guard test so its bidirectional "linked ⇔ exists" check covers **all five** reference
-files (`templates`, `ticket-integration`, `handoff`, `fork`, `ticket-creation`), and keep the
-`loadSkillBody(skill).length <= REINJECT_PER_SKILL_MAX_CHARS` and single-`SKILL.md` assertions. Add a
+Confirm the t01 guard test's bidirectional "linked ⇔ exists" check is **count-agnostic** (globs the
+actual `references/*.md` and requires each is linked from the router), so it automatically covers the
+files t02/t04 added (`fork`, `ticket-creation`) on top of t01's set — no hardcoded count to update.
+Keep the `loadSkillBody(skill).length <= REINJECT_PER_SKILL_MAX_CHARS` and single-`SKILL.md`
+assertions. Add a
 **loose** structural check that the resident discipline checklist is present — e.g. the body contains
 `--body-file` and `allow-list` (case-insensitive) — proving the fail-closed floor exists without
 pinning its exact prose (which would turn the gate into a wording change-detector). Cross-platform
@@ -95,8 +97,8 @@ pinning its exact prose (which would turn the gate into a wording change-detecto
       closing-keyword-only-when-same-repo rule generalized; wrongful-close rationale corrected.
 - [ ] CHANGELOG entry added with precise "unchanged" scoping + truncation-fix note; the exact stale F06
       clause qualified in place; capability matrix confirmed unchanged.
-- [ ] Guard test covers all five reference files + resident-checklist structural check; typecheck and
-      full test suite green.
+- [ ] Guard test is count-agnostic (covers every `references/*.md` bidirectionally) + resident-checklist
+      structural check; typecheck and full test suite green.
 
 ## Depends on
 t01, t02, t03, t04
