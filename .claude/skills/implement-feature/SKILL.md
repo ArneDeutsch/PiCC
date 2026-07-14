@@ -8,7 +8,7 @@ argument-hint: "[#N | N | issue-url]"
 
 You are the **coordinator** of a full feature cycle: converge with the user on WHAT and WHY, plan the HOW, break it into tasks, and drive subagents through implementation and review — all in this session, inside a dedicated worktree so parallel sessions on this repo never collide.
 
-This router is the always-loaded trunk: principles, roster, reachability gate, the resident write-discipline checklist, and a **skeleton** of Phases 0–9 — each phase points to its full procedure in a sibling reference file, read on demand: [references/templates.md](references/templates.md) (the three plan-folder templates), [references/workflow-detail.md](references/workflow-detail.md) (common-flow procedure for Phases 1–8), [references/ticket-integration.md](references/ticket-integration.md) (the nine write-discipline rules, per-phase ticket hooks, gate failure draft), [references/handoff.md](references/handoff.md) (the whole Phase 9 hand-off).
+This router is the always-loaded trunk: principles, roster, reachability gate, the resident write-discipline checklist, and a **skeleton** of Phases 0–9 — each phase points to its full procedure in a sibling reference file, read on demand: [references/templates.md](references/templates.md) (the three plan-folder templates), [references/workflow-detail.md](references/workflow-detail.md) (common-flow procedure for Phases 1–8), [references/ticket-integration.md](references/ticket-integration.md) (the nine write-discipline rules, per-phase ticket hooks, gate failure draft), [references/fork.md](references/fork.md) (fork detection + remote-agnostic target/push repo resolution), [references/handoff.md](references/handoff.md) (the whole Phase 9 hand-off).
 
 > **Ticket reference (optional).** `$ARGUMENTS` is **empty** (the ticketless flow — no ticket reads,
 > no auto-PR; only optional write is the Phase 8 issue-filing offer) or a ticket ref `#5` / `5` / a
@@ -53,14 +53,14 @@ Two more do the non-specialist work. Both are **non-dispatching** — no roster 
 
 ## GitHub ticket integration — reachability gate (Phase 0)
 
-With a ticket ref, the ticket-linked hooks engage (Phase 1 scoped direction + write-contract, Phase 8 close-vs-keep-open + write preview, Phase 9 auto-PR + issue comment); with an empty `$ARGUMENTS` every phase runs the ticketless flow — except the optional Phase 8 issue-filing offer, which may run on either path whenever GitHub is reachable. All defer to this gate and [references/ticket-integration.md](references/ticket-integration.md), which resolves `<owner/repo>` from `origin` (pass `--repo <owner/repo>` on every `gh` call; a full URL already encodes it). `<default>` is the default branch Phase 2 resolves; `<N>` the validated issue number.
+With a ticket ref, the ticket-linked hooks engage (Phase 1 scoped direction + write-contract, Phase 8 close-vs-keep-open + write preview, Phase 9 auto-PR + issue comment); with an empty `$ARGUMENTS` every phase runs the ticketless flow — except the optional Phase 8 issue-filing offer, which may run on either path whenever GitHub is reachable. All defer to this gate and [references/ticket-integration.md](references/ticket-integration.md). **When a git remote exists, first resolve target vs. push repo per [references/fork.md](references/fork.md)** — issue reads/writes and the PR base use `--repo <target>`, the branch push uses the resolved `pushRemote`; on a maintainer checkout these collapse to `origin`'s repo. Pass `--repo <owner/repo>` on every `gh` call (a full URL already encodes it). `<default>` is `targetDefault`, the default branch Phase 2 resolves; `<N>` the validated issue number.
 
 Run the gate **as Phase 0 — at ref-parse time, before Phase 1 uses the reads and before any worktree is created.** If a ticket ref is present, verify all of the following and **STOP** (build no worktree, write nothing) on the first that fails:
 
 - `gh` is installed and on PATH; `gh auth status` reports an authenticated account;
-- an `origin` remote exists (to resolve `<owner/repo>` and push a PR against) — **the ticket path requires a remote**, even for a URL ref; a remoteless checkout with a ticket ref stops here (the ticketless flow still works remote-free);
-- for a URL ref, its host is `github.com` and owner/repo **matches `origin`** (else stop and ask);
-- `gh issue view <N> --repo <owner/repo> --json number,title,body,labels,state,url,comments` returns the issue — a `#N` that is really a PR, or any 404, fails here. **Cache this JSON** and reuse it in Phase 1; don't fetch it twice.
+- a pushable github remote exists — `pushRemote`, the fork on the fork path — to push the branch, and `target` resolves so the issue can be read and the PR based; **the ticket path requires a remote**, even for a URL ref; a remoteless checkout with a ticket ref stops here (the ticketless flow still works remote-free);
+- for a URL ref, its host is `github.com` and owner/repo **matches the resolved `target`** (else stop and ask; the URL-points-at-the-fork nuance is a `TODO t05` in [references/fork.md](references/fork.md));
+- `gh issue view <N> --repo <target> --json number,title,body,labels,state,url,comments` returns the issue — a `#N` that is really a PR, or any 404, fails here. **Cache this JSON** and reuse it in Phase 1; don't fetch it twice.
 
 Then read `state`: if the issue is **closed**, warn and ask before proceeding — never silently start work on a closed ticket. On any failure, tell the user with the failure draft in [references/ticket-integration.md](references/ticket-integration.md) (Reachability gate — failure draft message), echoing the **actual** ref the user typed, not a hardcoded example.
 
@@ -84,7 +84,7 @@ Converge with the user on WHAT and WHY in prose (user value, scope, non-goals; s
 
 ## Phase 2 — Workspace
 
-Set up the isolated workspace: resolve the default branch, pick the next free id `<NN>` + a model-authored slug, **EnterWorktree first, then `git switch -c feature/<NN>-<slug>` inside the worktree** (never branch in the main checkout), and run `npm ci` if needed + the `npm run typecheck` / `npm test` baseline. Nothing is posted to a linked ticket here. Full procedure (exact commands, id-numbering incl. the `git branch --list` collision check, no-remote handling, baseline gating on "no *new* failures"): [references/workflow-detail.md](references/workflow-detail.md) (Phase 2) — read before running it.
+Set up the isolated workspace: resolve the default branch — `targetDefault`, the **target's** default (on a fork, fetched from the target, not the fork — see [references/fork.md](references/fork.md)) — pick the next free id `<NN>` + a model-authored slug, **EnterWorktree first, then `git switch -c feature/<NN>-<slug>` inside the worktree** (never branch in the main checkout), and run `npm ci` if needed + the `npm run typecheck` / `npm test` baseline. Nothing is posted to a linked ticket here. Full procedure (exact commands, id-numbering incl. the `git branch --list` collision check, no-remote handling, baseline gating on "no *new* failures"): [references/workflow-detail.md](references/workflow-detail.md) (Phase 2) — read before running it.
 
 ## Phase 3 — Feature spec
 

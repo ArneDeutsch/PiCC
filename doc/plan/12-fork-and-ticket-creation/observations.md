@@ -22,3 +22,16 @@ for review.md.
   by security + generalist: the always-loaded resident discipline floor is a defense-in-depth
   improvement — a compaction can no longer evict the rules entirely, which the monolith allowed.
   Coordinator applied 2 trivial NIT fixes (stale "Templates below" cross-ref; test comment precision).
+- 2026-07-14 — **t02 review caught two real fork-path bugs (live-verified against gh 2.96.0).** (1)
+  `gh`'s `parent` object has **no `nameWithOwner`** field (only id/name/owner.login) — the spec and
+  first implementation used `target = parent.nameWithOwner`, which returns null and would have broken
+  the entire fork path (every `--repo <target>` call 404s). Fixed to `parent.owner.login + "/" +
+  parent.name`. (2) Bare `gh repo view` (no arg) uses gh's base-repo heuristic, which with multiple
+  remotes resolves to the **upstream** and returns isFork:false — silently misclassifying a fork as a
+  maintainer checkout (cli/cli#6792), the dangerous fork→maintainer direction. Fixed by enumerating
+  remotes first and pinning `gh repo view <owner/repo>` per remote. Plus SHOULDs: viewerPermission must
+  be read on the *target* (a fork you own is ADMIN); enum has no NONE + needs TRIAGE + nullable;
+  fork fetch must not use per-worktree FETCH_HEAD (temp named remote); no-gh maintainer degrade;
+  credential redaction in echoed remote URLs. **Lesson:** gh JSON sub-object field names differ from
+  top-level (`parent` ≠ a Repository projection) — verify sub-fields against live gh, and never trust
+  bare `gh repo view` for classification. This is why the fork half was split out as the risk-bearing task.
