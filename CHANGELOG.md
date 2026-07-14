@@ -22,6 +22,17 @@ All notable changes to PiCC are documented here. The format is based on
   hand-off with paste-ready artifacts; and all writes are idempotent on resume (no double kickoff, no
   duplicate PR). Skill-prose only — no `src/` change.
 
+### Changed — consistent background-task identity (2026-07-14)
+
+- **Background lifecycle messages now use one compact identity vocabulary.** A task id identifies
+  one background run; the stable agent id correlates the agent across resume, when a new task id is
+  created. `TaskStop` results and pushed settlement notices use the requested/display agent label,
+  while a `SendMessage` resume acknowledgment uses the clean resolved registry name. All identify
+  `Task(task-N) · Agent(<type>) · agent-<id>`. These model-visible wording changes are PiCC-defined,
+  not verified as exact Claude Code wording; tool schemas, lifecycle and stop behavior, settlement
+  delivery, structured results, output framing, and limits are unchanged. TaskStop's post-stop
+  behavior also remains PiCC-defined.
+
 ### Changed — implement-feature workflow agents (2026-07-14)
 
 - **The `implement-feature` skill no longer routes work to `general-purpose`.** Two dedicated,

@@ -6,3 +6,5 @@
 - 2026-07-14 — Implementation friction: initial sanitizer and length assertions assumed BEL disappeared without spacing and counted Unicode length incorrectly; focused tests corrected the expectations.
 - 2026-07-14 — Review-process weakness: `git diff HEAD` omitted new untracked formatter/test/log files until the coordinator staged them; future review dispatches should require `git status --short` or stage complete task diffs first.
 - 2026-07-14 — Security review proposed lexical filtering of natural-language agent names; rejected because arbitrary project names are supported and structural encoding provides a testable boundary without unreliable semantic classification.
+- 2026-07-14 — Documentation review caught an easy-to-miss source distinction: TaskStop/settlement use the requested/display label, while resume uses the resolved registry name; stable agent id is the reliable cross-resume key.
+- 2026-07-14 — Capability review required separating Claude-supported resume behavior from PiCC-defined exact wording to avoid overstating parity.
