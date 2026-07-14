@@ -211,10 +211,12 @@ for the full gap analysis. All P1/P2 gaps fixed with tests.
   general-purpose; `CLAUDE_CODE_SUBAGENT_MODEL` model-resolution order.
 - **Background subagents**: `run_in_background: true` runs dispatches concurrently; **TaskOutput**
   and **TaskStop** are now real tools (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` honored).
-- **Auto memory**: project `MEMORY.md` (first 200 lines / 25 KB) loads at session start with
-  write-back conventions; `autoMemoryEnabled`, `autoMemoryDirectory`,
-  `CLAUDE_CODE_DISABLE_AUTO_MEMORY`. Agent `memory: user|project|local` frontmatter now injects
-  per-agent memory.
+- **Auto memory**: project `MEMORY.md` (first 200 lines / 25 KB) loads at session start;
+  `autoMemoryEnabled`, `autoMemoryDirectory`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY`. Agent
+  `memory: user|project|local` frontmatter also injects per-agent memory. Writes are conservative
+  by default — memory is written or updated only when you explicitly ask it to remember something,
+  a deliberate divergence from Claude Code's proactive write-back; loading is unchanged and no
+  setting was added. Opt into eager, Claude-Code-style writes per project via `CLAUDE.md`.
 - **Agent-scoped hooks** (`hooks:` in agent frontmatter) dispatch while the subagent runs.
 - **Hook contract depth**: `permission_mode`, `transcript_path`, `tool_use_id`,
   `last_assistant_message`, structured `tool_response` stdin fields; `systemMessage`,

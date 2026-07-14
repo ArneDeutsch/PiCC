@@ -222,20 +222,31 @@ describe("buildSystemPromptSuffix — Auto memory section (B4)", () => {
     });
   }
 
-  it("injects dir, content, and update instructions when memory exists", () => {
+  it("injects dir, content, and conservative write guidance when memory exists", () => {
     const out = suffix({ dir: "F:\\mem\\dir", content: "# Memory index\n- durable fact" });
     expect(out).toContain("# Auto memory");
     expect(out).toContain("Memory directory: F:\\mem\\dir");
     expect(out).toContain("- durable fact");
-    expect(out).toContain("MEMORY.md as the index");
+    // Intent-not-prose: conservative, explicit-request-only writing (F10).
+    // Positive trigger for the explicit-request path.
+    expect(out).toMatch(/remember/i);
+    // Deference carve-out so a project's CLAUDE.md eager-write opt-in wins.
+    expect(out).toMatch(/unless[^.]*instructions/i);
+    // Regression guard for the flip: the old eager string said "whenever you learn".
+    expect(out).not.toMatch(/whenever you learn/i);
+    // Index convention preserved (loosened from the old exact phrase).
+    expect(out).toMatch(/MEMORY\.md/);
+    expect(out).toMatch(/index/i);
+    // Mechanism preserved.
     expect(out).toContain("Write/Edit");
   });
 
-  it("injects the section with path + instructions but no content when MEMORY.md is absent", () => {
+  it("injects the section with path + guidance but no content when MEMORY.md is absent", () => {
     const out = suffix({ dir: "F:\\mem\\dir" });
     expect(out).toContain("# Auto memory");
     expect(out).toContain("Memory directory: F:\\mem\\dir");
-    expect(out).toContain("one topic per file");
+    expect(out).toMatch(/remember/i);
+    expect(out).not.toMatch(/whenever you learn/i);
   });
 
   it("omits the section entirely when auto memory is disabled (undefined)", () => {

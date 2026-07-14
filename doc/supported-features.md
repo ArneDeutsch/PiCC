@@ -101,7 +101,6 @@ Lifecycle events the hooks engine can fire (`settings.json` `hooks`, plus skill/
 | `setting.enabledPlugins` | full | selects installed-plugin content to load; merges key-wise across scopes, nearer scope wins per plugin (§4.9) |
 | `setting.env` | full | injected into sessions and hook/skill subprocesses (§5) |
 | `setting.hooks` | full | hook config dispatched per §4.5 — Claude matcher semantics (exact/list/unanchored-regex), parallel execution with dedup, async handlers, systemMessage/suppressOutput honored (command handlers full) |
-| `setting.memory` | full | auto memory: MEMORY.md (first 200 lines / 25 KB) loads at session start with write-back conventions injected; autoMemoryEnabled/autoMemoryDirectory + CLAUDE_CODE_DISABLE_AUTO_MEMORY honored (§4.6) |
 | `setting.permissions.deny` | full | hard, non-interactive block — the kept deterministic safety valve (§6.1) |
 | `setting.skillListingBudgetFraction` | full | caps the startup skill-listing token budget (§4.1, §12.1) |
 | `setting.skillListingMaxDescChars` | full | caps per-skill description length in the startup listing (default 1536, Claude parity; tiered degradation, never omits a skill) (§4.1) |
@@ -111,6 +110,7 @@ Lifecycle events the hooks engine can fire (`settings.json` `hooks`, plus skill/
 | `setting.subagentsEnabled` | full | gates subagent dispatch (§4.3) |
 | `setting.worktree.baseRef` | full | head\|fresh base resolved to a concrete commit before worktree creation (§4.4) |
 | `setting.cleanupPeriodDays` | partial | max-age (days) for orphaned-WORKTREE reaping at startup; subagent transcript dirs (<base>.subagents/) are NOT reaped — worktrees-only cleanup (t02 shipped no transcript reaper), same accumulation class as Pi's own session files (§4.4) |
+| `setting.memory` | partial | auto memory: MEMORY.md (first 200 lines / 25 KB) loads at session start with full parity; autoMemoryEnabled/autoMemoryDirectory + CLAUDE_CODE_DISABLE_AUTO_MEMORY honored. PARTIAL: injected write guidance is conservative by default — the model writes/updates memory only on an explicit user request to remember, whereas Claude Code also writes proactively; opt into eager writes via CLAUDE.md (§4.6) |
 | `setting.permissions.allow` | partial | parsed and matched, but moot under the default-permissive posture — nothing waits on an allow (§6.1) |
 | `setting.apiKeyHelper` | degraded-noop | parsed, never invoked — auth comes from the harness subscription/provider flow; reported when set (§5, §7) |
 | `setting.attribution` | degraded-noop | parsed, not consumed — no commit/PR attribution machinery; reported when set (§5, §7) |
@@ -141,7 +141,6 @@ Skill (`SKILL.md`), agent (`.claude/agents/*.md`), and rule frontmatter keys.
 | `agent.frontmatter.hooks` | full | scoped hook runner active for the subagent's dispatch; Stop maps to SubagentStop (§4.3, §4.5) |
 | `agent.frontmatter.initialPrompt` | full | injected as the subagent's first user message (§4.3) |
 | `agent.frontmatter.isolation` | full | isolation: worktree pins the subagent to its own worktree (§4.3, §4.4) |
-| `agent.frontmatter.memory` | full | user\|project\|local scopes resolve to Claude's agent-memory dirs; MEMORY.md (200 lines / 25 KB) injected with persistence guidance (§4.3, §4.6) |
 | `agent.frontmatter.metadata` | full | metadata.* preserved and exposed (§4.3) |
 | `agent.frontmatter.model` | full | per-agent model override honored (§4.3) |
 | `agent.frontmatter.name` | full | agent identity for subagent_type dispatch (§4.3) |
@@ -163,6 +162,7 @@ Skill (`SKILL.md`), agent (`.claude/agents/*.md`), and rule frontmatter keys.
 | `skill.frontmatter.user-invocable` | full | true (default) creates the slash command (§4.1) |
 | `skill.frontmatter.when_to_use` | full | appended to the routing/listing surface (§4.1) |
 | `agent.frontmatter.maxTurns` | partial | best-effort cap — tool calls past the cap are blocked with an instruction to answer; the model still produces its final message (§4.3) |
+| `agent.frontmatter.memory` | partial | user\|project\|local scopes resolve to Claude's agent-memory dirs; MEMORY.md (200 lines / 25 KB) loads with full parity. PARTIAL: injected write guidance is conservative by default — the subagent writes/updates memory only on an explicit user request to remember, whereas Claude Code also writes proactively; opt into eager writes via CLAUDE.md (§4.3, §4.6) |
 | `skill.frontmatter.allowed-tools` ⚠ | partial | gates tools for context:fork dispatch; trivially satisfied for in-session activation under the default-permissive posture (§4.1, §6.1) |
 | `skill.frontmatter.effort` | partial | honored for context:fork dispatch and ${CLAUDE_EFFORT} substitution; does not change the parent session's reasoning effort (§4.1, §10) |
 | `skill.frontmatter.model` | partial | honored for context:fork dispatch; in-session activation cannot switch the parent session's model (§4.1, §10) |
@@ -176,13 +176,13 @@ Cross-cutting runtime subsystems and behaviors.
 
 | ID | Tier | Note |
 |---|---|---|
-| `feature.agent-memory` | full | auto memory (project MEMORY.md) + per-agent memory scopes loaded and injected with write-back conventions (§4.6) |
 | `feature.claude-md-import` | full | @import expansion, recursive up to 4 hops, incl. the AGENTS.md bridge (§4.6) |
 | `feature.compaction-preservation` | full | root CLAUDE.md + active skills (Claude-parity 20k/100k char budgets, most-recent-first) + unconditional rules survive compaction (§9) |
 | `feature.nested-claude-md` | full | full ancestor-chain CLAUDE.md/CLAUDE.local.md load (to filesystem root) + nearest-ancestor injection on subdir file access, incl. worktrees (§4.6) |
 | `feature.plugins-content` | full | installed-plugin skills/agents/hooks/commands folded into the registries (§4.9) |
 | `feature.rules` | full | .claude/rules/ unconditional load + path-scoped injection at project and user scope (§4.2) |
 | `feature.worktrees` | full | EnterWorktree/ExitWorktree lifecycle incl. .worktreeinclude, parallel sessions, Windows tolerance (§4.4) |
+| `feature.agent-memory` | partial | auto memory (project MEMORY.md) + per-agent memory scopes load and inject with full parity. PARTIAL: injected write guidance is conservative by default — the model writes/updates memory only on an explicit user request to remember, whereas Claude Code also writes proactively; opt into eager writes via CLAUDE.md (§4.6) |
 | `feature.background-agents` | partial | background dispatch, TaskOutput/TaskStop, loud failures, next-turn settlement push, and live progress while TaskOutput awaits. GAPS: PiCC defaults foreground unlike Claude 2.1.198; TaskStop accepts only task_id (Claude 2.1.198+ also accepts agent id/name); PiCC allows SendMessage resume after TaskStop while the Claude Code 2.1.x reference refuses stopped-agent resume; idle parents are not re-invoked; notices are bounded; no always-on Agent View; no remote/cloud agents; stop is cooperative. Lifecycle identity uses the task record's stored display type and stable agent id; resume uses a new task id and resolved registry name. Wording is model-visible and PiCC-defined, not verified as exact Claude wording (§4.3) |
 | `feature.hook-handler.http` | partial | http hook handlers dispatched best-effort (§4.5) |
 | `feature.managed-policy` | partial | managed/enterprise policy honored where trivially present; otherwise degrade-safe (§7) |
@@ -204,4 +204,4 @@ Cross-cutting runtime subsystems and behaviors.
 
 ## Summary
 
-The registry enumerates **148 capabilities** against baseline `claude-code-2.1.x (mid-2026)`: **82 full**, **15 partial**, **42 degraded-noop**, **9 not-supported**. 5 entries are safety-relevant (marked ⚠) — a divergence where a project's restriction is not enforced and is therefore reported prominently. Unknown inputs outside this registry are not counted here: they are unassessed by definition and degrade safely at runtime (plan §2.4).
+The registry enumerates **148 capabilities** against baseline `claude-code-2.1.x (mid-2026)`: **79 full**, **18 partial**, **42 degraded-noop**, **9 not-supported**. 5 entries are safety-relevant (marked ⚠) — a divergence where a project's restriction is not enforced and is therefore reported prominently. Unknown inputs outside this registry are not counted here: they are unassessed by definition and degrade safely at runtime (plan §2.4).
