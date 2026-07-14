@@ -15,9 +15,10 @@ All notable changes to PiCC are documented here. The format is based on
   (`Closes #N` when the work fully delivers the ticket, a bare `#N` when it only partly does), and posts
   a reviewer-facing implementation-summary comment. The change is **purely additive**: invoked with no
   argument the skill behaves exactly as before — no ticket reads, no comments, no auto-PR. Failure
-  handling is **honest** — a missing or unauthenticated `gh`, an unreadable or closed issue, a
-  wrong-repo URL, or a missing `origin` remote stops the ticket path with clear setup guidance instead
-  of silently dropping the ticket; a write rejected after successful reads degrades to today's manual
+  handling is **honest** — a missing or unauthenticated `gh`, an unreadable issue, a wrong-repo URL,
+  or a missing `origin` remote stops the ticket path with clear guidance instead of silently dropping
+  the ticket, and a **closed** issue prompts a warning before work starts; a write rejected after
+  successful reads degrades to today's manual
   hand-off with paste-ready artifacts; and all writes are idempotent on resume (no double kickoff, no
   duplicate PR). Skill-prose only — no `src/` change.
 

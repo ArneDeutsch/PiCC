@@ -69,8 +69,8 @@ costing nothing for the ticketless flow that already works.
 - After scope confirmation and branch creation, a kickoff comment appears on the ticket naming the
   scope and branch.
 - At hand-off a ready-for-review PR exists, linked to the ticket, whose body closes the ticket
-  (`Closes #N`) when the feature fully delivers it or references it (`Refs #N`, ticket open) when it
-  only partly does — with the coordinator's judgement and the remaining scope stated.
+  (`Closes #N`) when the feature fully delivers it or references it (a bare `#N` — ticket stays open)
+  when it only partly does — with the coordinator's judgement and the remaining scope stated.
 - The ticket carries a final summary comment that a reviewer can act on: what to look for, known
   limitations, bugs surfaced, and possible gaps.
 - A missing/unauthenticated `gh` with a ticket reference stops the skill with clear setup guidance;

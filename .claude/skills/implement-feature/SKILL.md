@@ -70,7 +70,7 @@ default branch Phase 2 resolves; `<N>` is the validated issue number.
 
 ### Reachability & preconditions gate
 
-Run this **as Phase 0 — at ref-parse time, before the Phase 1 reads and before any worktree is
+Run this **as Phase 0 — at ref-parse time, before Phase 1 uses the reads and before any worktree is
 created.** If a
 ticket ref is present, verify all of the following and **STOP** (build no worktree, write nothing) on
 the first that fails:
@@ -144,7 +144,9 @@ refer back here.
 9. **Idempotent on resume.** The "No status bookkeeping" principle means a resumed/compacted run
    reconstructs from git — which has no record of GitHub writes. So guard **every** public write
    against a prior run: before posting the kickoff comment *or* the Phase 9 summary comment, scan the
-   cached issue `comments` for a prior machine-trailered comment of that kind and **skip** if present;
+   cached issue `comments` for a prior machine-trailered comment of that kind — kickoff opens with
+   "**Work started via implement-feature.**", the summary with "## Implementation summary" — and
+   **skip** if present;
    before `gh pr create`, run `gh pr list --repo <owner/repo> --head feature/<NN>-<slug> --state open
    --json number,url` and **reuse** any existing PR (link it and post the summary as the ticket
    comment; leave the existing PR body untouched — editing it is outside the Rule 5 allow-list)
