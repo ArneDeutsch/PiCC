@@ -156,6 +156,24 @@ function debug(...args: unknown[]): void {
 }
 
 /**
+ * Parse a `SlashCommand` string into a `(name, argsText)` pair. Single command,
+ * NO stacking (unlike the user-typed transform): only the first `/name` token is
+ * taken and the rest is the args string. Tolerant of a missing leading slash
+ * (`deploy x` resolves like `/deploy x`). The name token shape matches the
+ * transform (`[A-Za-z0-9][\w-]*(?::[\w-]+)*`) so plugin-namespaced `/plugin:name`
+ * and `findByName`'s bare-name resolution behave identically. Whitespace between
+ * name and args is `[ \t]` (cross-platform, matching the transform). Returns
+ * undefined for empty / whitespace-only / bare `/` input (no name token).
+ */
+function parseSlashCommand(command: string): { name: string; argsText: string } | undefined {
+  const trimmed = command.trim();
+  const m = /^\/?([A-Za-z0-9][\w-]*(?::[\w-]+)*)(?=[ \t]|$)/.exec(trimmed);
+  if (!m) return undefined;
+  const argsText = trimmed.slice(m[0].length).replace(/^[ \t]+/, "");
+  return { name: m[1]!, argsText };
+}
+
+/**
  * TEST-ONLY injection point (t05 plan-review MUST-FIX). The fake-Pi harness
  * cannot reach the closure-local registries/runtime, so the offline-integration
  * test for the settlement-notice delivery path needs a named seam. `onWired` is
@@ -181,11 +199,14 @@ export interface PiccTestSeam {
     subagentRegistry: SubagentRegistry;
   }) => void;
   /**
-   * TEST-ONLY (F14 t02): inject a fake Pi SDK so an offline-integration test can
-   * drive the REAL fork consumers (Skill tool + input hook) through a controllable
-   * dispatch outcome. Consumed at SubagentRuntime construction as `deps.sdk`;
-   * unset ⇒ the runtime calls `loadRealSdk()`. In-process only — never sourced
-   * from env/settings/files (see the SECURITY note above).
+   * TEST-ONLY subagent SDK override: replaces the real Pi SDK the session's
+   * SubagentRuntime would otherwise load, so an offline test can drive the REAL
+   * dispatch/fork paths through a controllable outcome without an LLM/network —
+   * a `context: fork` skill invoked through the Skill tool, the SlashCommand tool
+   * (F11), or the user-typed `/name` input transform (F14). Consumed at
+   * SubagentRuntime construction as `deps.sdk`; unset ⇒ the runtime lazy-loads
+   * the real Pi SDK (`loadRealSdk()`). Same in-process-only reachability
+   * guarantee as `onWired` above (see the SECURITY note).
    */
   sdk?: PiSdk;
 }
@@ -617,6 +638,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       "Task",
       "SendMessage",
       "Skill",
+      "SlashCommand",
       "EnterWorktree",
       "ExitWorktree",
       "TaskCreate",
@@ -647,6 +669,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // Per-dispatch Skill tool: carries the caller's depth into context:fork
         // dispatches (depth cap holds) and never mutates the parent session state.
         tools.push(createSkillTool({ depth, forSubagent: true }) as Record<string, unknown>);
+      }
+      if (granted.includes("SlashCommand")) {
+        // Per-dispatch SlashCommand tool: a thin alias over the same shared
+        // skill-activation path as the Skill tool — carries the caller's depth
+        // into context:fork dispatches and leaves parent session state alone.
+        tools.push(createSlashCommandTool({ depth, forSubagent: true }) as Record<string, unknown>);
       }
       // Background-task tools share the ONE session-wide registry (audit E4). A
       // subagent that is granted TaskOutput/TaskStop can therefore reach ANY task
@@ -701,7 +729,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     concurrency: project.settings.subagentConcurrency,
     sessionId,
     subagentRegistry,
-    // TEST-ONLY seam (F14 t02): an injected fake SDK reaches every dispatch —
+    // TEST-ONLY seam (F11/F14): an injected fake SDK reaches every dispatch —
     // including forks, which close over this one runtime instance. Read ONLY
     // from the in-process testSeam argument; unset ⇒ the runtime lazy-loads the
     // real Pi SDK (loadRealSdk). Never sourced from env/settings/files.
@@ -713,6 +741,63 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // ---------------------------------------------------------------------------
   const getCwd = () => cwdState.get();
   claudeNamedTools.push(...buildCwdBoundTools(cwdState, taskToolBundle));
+
+  /**
+   * The single skill-activation path shared by the Skill and SlashCommand tools
+   * (and mirroring the user-typed `/name` transform): given a RESOLVED skill and
+   * its args, honor `disable-model-invocation` refusal, `context: fork` dispatch,
+   * and byte-identical re-invocation dedup. Returns the tool result or throws a
+   * model-visible error. `invokedName` is the CALLER-supplied name (which for a
+   * bare name resolving to a plugin-namespaced skill differs from `skill.name`);
+   * the refusal message is built from it so each tool's wording is preserved.
+   * `signal` is Pi's per-call Esc signal (F14): threaded into the fork dispatch so
+   * an Esc'd model-invoked fork (Skill OR SlashCommand tool) reports as aborted.
+   */
+  async function runSkillActivation(
+    skill: ClaudeSkill,
+    argsText: string,
+    opts: { forSubagent: boolean; depth: number; invokedName: string; signal?: AbortSignal },
+  ): Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }> {
+    if (skill.disableModelInvocation) {
+      throw new Error(`Skill "${opts.invokedName}" is user-only (disable-model-invocation). Ask the user to run /${opts.invokedName}.`);
+    }
+    if (skill.contextFork) {
+      const rendered = await activateSkill(skill, argsText, {
+        fork: true,
+        recordActivation: !opts.forSubagent,
+      });
+      // Thread Pi's Esc signal so an Esc'd fork cancels (F14).
+      const result = await forkDispatch(skill, rendered, opts.depth + 1, argsText, opts.signal);
+      // Forks are non-resumable (F02): suppress every resume trailer. The shared
+      // t01 helper reproduces the Agent tool's four-branch mapping —
+      // failed-with-partial preserves the partial + names the cause;
+      // failed-no-output and aborted surface as loud failures (distinct wording);
+      // completed stays the verbatim final message.
+      const p = presentDispatchResult(result, { allowResumeTrailer: false });
+      if (p.kind === "failure") throw new Error(p.message);
+      return {
+        content: [{ type: "text", text: p.text }],
+        details: { forked: true, agent: result.agentName, cutOff: p.cutOff },
+      };
+    }
+    const rendered = await activateSkill(skill, argsText, {
+      recordActivation: !opts.forSubagent,
+    });
+    // Re-invocation with byte-identical content → short note instead of a
+    // second copy (audit A8). Subagent instances keep their own context and
+    // never consult the parent-session fingerprints.
+    const note = opts.forSubagent ? undefined : skillDedupNote(skill, rendered);
+    if (note) {
+      return {
+        content: [{ type: "text", text: note }],
+        details: { skill: skill.name, deduplicated: true },
+      };
+    }
+    return {
+      content: [{ type: "text", text: skillActivationMessage(skill, rendered) }],
+      details: { skill: skill.name },
+    };
+  }
 
   /**
    * The Skill tool, per session scope: the orchestrator's instance records
@@ -737,56 +822,54 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // findByName resolves plugin-namespaced skills by bare name when unique.
         const skill = findByName(project.skills, params.name);
         if (!skill) throw new Error(`Unknown skill: ${params.name}`);
-        if (skill.disableModelInvocation) {
-          throw new Error(`Skill "${params.name}" is user-only (disable-model-invocation). Ask the user to run /${params.name}.`);
-        }
-        if (skill.contextFork) {
-          const rendered = await activateSkill(skill, params.arguments ?? "", {
-            fork: true,
-            recordActivation: !opts.forSubagent,
-          });
-          // Thread Pi's Esc signal (positional 3rd arg) so an Esc'd fork cancels.
-          const result = await forkDispatch(
-            skill,
-            rendered,
-            opts.depth + 1,
-            params.arguments ?? "",
-            signal,
-          );
-          // Forks are non-resumable (F02): suppress every resume trailer. The
-          // shared t01 helper reproduces the Agent tool's four-branch mapping —
-          // failed-with-partial preserves the partial + names the cause;
-          // failed-no-output and aborted surface as loud failures (distinct
-          // wording); completed stays the verbatim final message.
-          const p = presentDispatchResult(result, { allowResumeTrailer: false });
-          if (p.kind === "failure") throw new Error(p.message);
-          return {
-            content: [{ type: "text", text: p.text }],
-            details: { forked: true, agent: result.agentName, cutOff: p.cutOff },
-          };
-        }
-        const rendered = await activateSkill(skill, params.arguments ?? "", {
-          recordActivation: !opts.forSubagent,
+        return runSkillActivation(skill, params.arguments ?? "", {
+          forSubagent: opts.forSubagent,
+          depth: opts.depth,
+          invokedName: params.name,
+          signal,
         });
-        // Re-invocation with byte-identical content → short note instead of a
-        // second copy (audit A8). Subagent instances keep their own context and
-        // never consult the parent-session fingerprints.
-        const note = opts.forSubagent ? undefined : skillDedupNote(skill, rendered);
-        if (note) {
-          return {
-            content: [{ type: "text", text: note }],
-            details: { skill: skill.name, deduplicated: true },
-          };
-        }
-        return {
-          content: [{ type: "text", text: skillActivationMessage(skill, rendered) }],
-          details: { skill: skill.name },
-        };
       },
     };
   }
   const skillTool = createSkillTool({ depth: 0, forSubagent: false });
   claudeNamedTools.push(skillTool as Record<string, unknown>);
+
+  /**
+   * The SlashCommand tool, per session scope: Claude's mechanism for a MODEL to
+   * run a custom `/name args` command mid-conversation. A thin alias over the
+   * shared skill-activation path — parse the leading `/name` (optional slash;
+   * plugin-namespaced `/plugin:name` allowed), treat the rest as the skill's
+   * arguments, resolve, and activate. Model-invocability matches the Skill tool
+   * (only `disable-model-invocation` blocks; `user-invocable: false` model-only
+   * skills still activate) — the NON-stacking single-command counterpart of the
+   * user-typed `/name` prompt transform.
+   */
+  function createSlashCommandTool(opts: { depth: number; forSubagent: boolean }) {
+    return {
+      name: "SlashCommand",
+      label: "SlashCommand",
+      description:
+        'Run a slash command like "/name args". The name must be one from the "Available skills" listing (plugin-namespaced "/plugin:name" also works); the trailing text is passed to the skill as its arguments. Equivalent to the Skill tool for "/name args" command strings.',
+      parameters: Type.Object({
+        command: Type.String({ description: 'A slash command such as "/deploy staging 1.2.3"' }),
+      }),
+      async execute(_id: string, params: { command: string }, signal?: AbortSignal) {
+        const parsed = parseSlashCommand(params.command);
+        if (!parsed) throw new Error(`SlashCommand requires a command like "/name args".`);
+        // findByName resolves plugin-namespaced skills by bare name when unique.
+        const skill = findByName(project.skills, parsed.name);
+        if (!skill) throw new Error(`Unknown slash command: /${parsed.name}`);
+        return runSkillActivation(skill, parsed.argsText, {
+          forSubagent: opts.forSubagent,
+          depth: opts.depth,
+          invokedName: parsed.name,
+          signal,
+        });
+      },
+    };
+  }
+  const slashCommandTool = createSlashCommandTool({ depth: 0, forSubagent: false });
+  claudeNamedTools.push(slashCommandTool as Record<string, unknown>);
 
   if (project.settings.subagentsEnabled) {
     // The built-in agent types (E1) guarantee dispatchable agents even when the

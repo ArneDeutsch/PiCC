@@ -270,10 +270,11 @@ principle in the plan (§2.1 mechanical fidelity).
     `presentDispatchResult` helper (`subagents.ts`) that renders the completed/failed/aborted
     outcome, the named cause, and the partial-output cut-off frame from **one** source of truth,
     and the Agent tool plus **both** fork consumers (the typed top-level-input caller and the
-    model-invoked `Skill`-tool caller) route through it. The Esc caveat is scoped: F14 threads the
-    abort signal to a **model-invoked** fork (the `Skill`-tool path) so it reports aborted, but a
-    **typed top-level `/forked-skill`** expansion is not Esc-cancellable — a PiCC/Pi harness
-    limitation (no abort signal at the input-hook stage), not Claude Code scoping Esc.
+    model-invoked `Skill`/`SlashCommand`-tool caller — one shared `runSkillActivation` path) route
+    through it. The Esc caveat is scoped: F14 threads the abort signal to a **model-invoked** fork
+    (the `Skill` or `SlashCommand` tool) so it reports aborted, but a **typed top-level
+    `/forked-skill`** expansion is not Esc-cancellable — a PiCC/Pi harness limitation (no abort
+    signal at the input-hook stage), not Claude Code scoping Esc.
 
 - **Deny matches any command segment.** The permission matcher is shell-operator aware, so a deny
   like `Bash(rm *)` cannot be evaded by chaining (`git status && rm -rf /`) — every segment is

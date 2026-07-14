@@ -75,6 +75,22 @@ Running record of friction, bugs, and opportunities. Dated bullets; raw material
   is *inferred* (F14 verified only PiCC's side). Acceptable as written (self-deprecating /
   truthful-safe framing); keep labelled inferred if ever promoted to a stronger claim.
 
+## 2026-07-14 — hand-off merge with origin/main (F11 SlashCommand)
+
+- origin/main advanced by 5 commits (F11 "Real SlashCommand tool") while F14 was in flight.
+  F11 had refactored the Skill-tool body into a shared `runSkillActivation` helper used by both
+  the Skill tool AND the new SlashCommand tool, and independently added the same
+  `PiccTestSeam.sdk` injection field F14 added. Conflicts in CHANGELOG.md + src/index.ts.
+- Resolved by moving F14's fork mapping INTO `runSkillActivation` and threading the Esc signal
+  through it → **the SlashCommand tool is now also a model-invoked fork route** carrying
+  failure-preservation + Esc-abort. Broadened the registry/architecture/user-guide wording from
+  "the Skill-tool path" to "the Skill or SlashCommand tool", regenerated the matrix, kept both
+  CHANGELOG entries. Added 2 SlashCommand fork tests (partial-preservation + abort).
+- Coder review of the integration: PASS (no F11 behaviour dropped, no unthreaded signal, input
+  hook still never-throws). Full suite green after merge (1057 + 2 new).
+- **[write-preview impact]** the approved PR/comment texts predate this merge and say only
+  "Skill-tool caller" — must be re-confirmed with the SlashCommand broadening before posting.
+
 ## Phase-6 deferred (continued)
 
 - **[note] `capErrorText` is duplicated on purpose** in `background-tasks.ts:416-423` to avoid

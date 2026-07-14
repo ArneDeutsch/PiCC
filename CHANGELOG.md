@@ -6,6 +6,27 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — SlashCommand tool (2026-07-14)
+
+- **`SlashCommand` is now a real, working tool instead of a degraded no-op.** A model can call
+  `SlashCommand({ command: "/name args" })` to run a custom command mid-conversation: PiCC parses the
+  leading `/name` (optional slash; plugin-namespaced `/plugin:name` allowed), resolves the skill, and
+  activates it with the trailing text as its arguments — identical to the `Skill` tool for the same
+  skill+args. Skill semantics are honored the same way (a `disable-model-invocation` skill is refused,
+  a `context: fork` skill runs forked and returns its result, a byte-identical re-invocation dedups),
+  model-invocability matches the `Skill` tool (a `user-invocable: false` model-only skill still
+  activates; only `disable-model-invocation` blocks), and the tool is grantable to subagents, carrying
+  dispatch depth into forked skills. Both tools now delegate to one shared skill-activation closure, so
+  the `Skill` tool's behavior is unchanged. The capability registry retiers `tool.SlashCommand` from
+  **degraded-noop** to **partial** (it covers all user-defined skills/commands but not the built-in
+  commands Claude 2.1.x also exposes on the Skill/SlashCommand skill-activation path — `/init`,
+  `/review`, `/security-review` — which PiCC does not ship); `doc/supported-features.md` was
+  regenerated from the registry.
+- **Operator note:** `SlashCommand` is a second, independently-gateable route to model-driven skill
+  activation alongside `Skill`. Both honor each skill's `disable-model-invocation` and
+  `disallowed-tools`, but a project that wants to block model-driven skill activation via
+  `permissions` must gate **both** tool names, not just `Skill`.
+
 ### Fixed — context: fork failure preservation and Esc abort (2026-07-14)
 
 - **A `context: fork` skill that fails partway through no longer silently loses its work or crashes.**
@@ -13,11 +34,12 @@ All notable changes to PiCC are documented here. The format is based on
   partial output** it produced before dying, inside the same cut-off frame the `Agent` tool uses —
   bringing the fork path to parity with the subagent error contract (Claude 2.1.199). This was the
   last place the silent-loss/empty-success class of defect survived on the subagent surface. Under the
-  hood the `Agent` tool and both fork consumers now render outcomes through one shared
-  `presentDispatchResult` helper. Pressing **Esc** during a **model-invoked** fork (the `Skill`-tool
-  path) now reports the run as **aborted** rather than an empty success or a crash. A *typed* top-level
-  `/forked-skill` expansion remains not Esc-cancellable — a PiCC/Pi harness limitation (no abort signal
-  reaches the input-hook stage), not Claude Code scoping Esc. Fork dispatches stay non-resumable.
+  hood the `Agent` tool and every fork consumer now render outcomes through one shared
+  `presentDispatchResult` helper. Pressing **Esc** during a **model-invoked** fork (the `Skill` or
+  `SlashCommand` tool) now reports the run as **aborted** rather than an empty success or a crash. A
+  *typed* top-level `/forked-skill` expansion remains not Esc-cancellable — a PiCC/Pi harness
+  limitation (no abort signal reaches the input-hook stage), not Claude Code scoping Esc. Fork
+  dispatches stay non-resumable.
 
 ### Fixed — defensive background-task error storage (2026-07-14)
 

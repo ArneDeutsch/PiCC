@@ -81,9 +81,7 @@ export const DEGRADED_TOOLS: Array<{ name: string; note: string }> = [
     name: "KillBash",
     note: "background shells are not implemented; there is no shell to kill",
   },
-  {
-    name: "SlashCommand",
-    note: "invoke the skill directly with the Skill tool instead",
-  },
+  // SlashCommand is a REAL tool now (F11, src/index.ts createSlashCommandTool) —
+  // a thin alias over the shared skill-activation path, no longer a degraded no-op.
   // TaskOutput/TaskStop are REAL tools now (audit E4, src/runtime/background-tasks.ts).
 ];

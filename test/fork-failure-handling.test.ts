@@ -130,6 +130,37 @@ describe("F14 t02 — Skill-tool fork consumer", () => {
   });
 });
 
+describe("F14 — SlashCommand-tool fork consumer (shares runSkillActivation with the Skill tool)", () => {
+  it("(8) failed WITH partial output → partial preserved + cause named", async () => {
+    const h = fakeSdk({ onPrompt: partialThenApiDeath("503 upstream unavailable") });
+    const slashTool = wire(h.sdk).tools.get("SlashCommand");
+    const res = await slashTool.execute("c1", { command: "/fork-research wasm abi" });
+    const text = res.content[0].text as string;
+    expect(text.startsWith("partial research findings")).toBe(true);
+    expect(text).toMatch(API_DEATH);
+    expect(text).toContain("503 upstream unavailable");
+    expect(res.details.cutOff).toBe(true);
+    expect(res.details.forked).toBe(true);
+  });
+
+  it("(9) Esc aborts the fork → abort wording (signal threads SlashCommand→runSkillActivation→dispatch)", async () => {
+    const gate = new Promise<void>(() => {}); // never resolves — only abort ends it
+    const h = fakeSdk({ replies: [{ text: "never delivered", gate }] });
+    const slashTool = wire(h.sdk).tools.get("SlashCommand");
+    const controller = new AbortController();
+    const guarded = slashTool
+      .execute("c2", { command: "/fork-research x" }, controller.signal)
+      .catch((e: Error) => e);
+    await new Promise((r) => setTimeout(r, 10));
+    controller.abort();
+    const err = await guarded;
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain("aborted");
+    expect((err as Error).message).not.toMatch(API_DEATH);
+    expect(h.abortCalls()).toBeGreaterThan(0);
+  });
+});
+
 describe("F14 t02 — input-hook fork consumer (/fork-research …)", () => {
   it("(5) failed WITH partial output → transform text folds the partial AND the cause (success envelope kept)", async () => {
     const h = fakeSdk({ onPrompt: partialThenApiDeath("503 upstream unavailable") });
