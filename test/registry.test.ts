@@ -299,6 +299,20 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     }
   });
 
+  // F11: SlashCommand is a real thin-alias tool at partial tier; the note must
+  // name the shared skill-activation path and the built-in-command gap.
+  it("carries a SlashCommand entry as partial naming the alias path and the built-in gap", () => {
+    const sc = lookupCapability("tool.SlashCommand");
+    expect(sc, "tool.SlashCommand must exist").toBeDefined();
+    expect(sc?.tier).toBe("partial");
+    expect(sc?.note).toContain("thin alias over the skill-activation path");
+    expect(sc?.note).toContain("/plugin:name");
+    expect(sc?.note).toContain("PARTIAL:");
+    expect(sc?.note).toContain("built-in commands");
+    // Must NOT lead with the degraded-noop em-dash pattern.
+    expect(sc?.note.startsWith("—")).toBe(false);
+  });
+
   it("stays in sync with the shipped degrade-stub list, in both directions", () => {
     // Every shipped stub resolves to a dedicated degraded-noop registry entry
     // (a stub reported "unassessed" would be registry drift, §17).
@@ -322,6 +336,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("tool.TaskStop")?.tier).toBe("partial");
     expect(stubNames.has("TaskOutput")).toBe(false);
     expect(stubNames.has("TaskStop")).toBe(false);
+    // SlashCommand is a REAL tool now (F11) — retiered to partial and no longer a stub.
+    expect(lookupCapability("tool.SlashCommand")?.tier).toBe("partial");
+    expect(stubNames.has("SlashCommand")).toBe(false);
     // The stale wrong spelling must be gone: the shipped stub is "computer".
     expect(lookupCapability("tool.computer-use")).toBeUndefined();
     expect(lookupCapability("tool.computer")?.tier).toBe("degraded-noop");
