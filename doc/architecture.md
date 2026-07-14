@@ -128,6 +128,8 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
   `TaskStop` requests a cooperative abort (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` falls back to
   foreground). Settlement of a background dispatch is **pushed** to the coordinator at its next
   turn (a bounded, untrusted-framed notice) so it learns the outcome without polling `TaskOutput`.
+- `background-identity.ts` — shared validated and bounded background identity formatter, with fixed
+  fallbacks for invalid task ids, agent ids, and display types.
 - `worktrees.ts` — `WorktreeManager` for `EnterWorktree`/`ExitWorktree`: creates
   `.claude/worktrees/<flat>/` on `worktree-<flat>` off a base ref resolved to a concrete SHA
   *before* creation, seeds `.worktreeinclude` files, and does Windows-tolerant removal (best-effort,

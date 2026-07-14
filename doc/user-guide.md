@@ -201,17 +201,23 @@ Every subagent is now visible, both to you and to the coordinating model:
   id but creates a new task id. Model-visible `TaskStop` results (for every stop outcome), pushed
   settlement notices, and `SendMessage` resume acknowledgments identify the work with
   `Task(task-N) · Agent(<type>) · agent-<id>`, though punctuation and surrounding framing can vary.
-  TaskStop and settlement use the requested/display agent label, which can differ from the resolved
-  registry definition after fallback or case-insensitive matching. The resume acknowledgment instead
-  uses the clean resolved registry name. This concise wording contract is PiCC-defined, not verified
-  as exact Claude Code wording. Tool schemas, lifecycle and stop behavior, settlement delivery,
-  structured results, output framing, and limits are unchanged; TaskStop's post-stop behavior also
-  remains PiCC-defined.
+  TaskStop and settlement use the background task record's stored display type. A fresh dispatch
+  record normally stores the requested/display label, which can differ from the resolved registry
+  definition after fallback or case-insensitive matching. A resumed task record and its resume
+  acknowledgment instead use the clean resolved registry name. The stable agent id—not the type
+  text—is therefore the reliable correlation key; broader canonical-type plumbing remains deferred.
+  This concise wording contract is PiCC-defined, not verified as exact Claude Code wording. Tool
+  schemas, lifecycle and stop behavior, settlement delivery, structured results, output framing, and
+  limits are unchanged.
 - **`SendMessage` (resume / steer).** The coordinator can address a finished subagent by its agent
   id and continue it with its context intact (it resumes in the background under the same stable id
   and a new task id), or redirect a still-running background one. Honest limitations, by design:
   - **No cross-restart resume** — the dispatch registry is process-lifetime; after you quit and
     relaunch `picc`, a prior agent id no longer resolves.
+  - **Stopped agents remain resumable in PiCC** — after `TaskStop`, PiCC currently allows a
+    `SendMessage` resume; the Claude Code 2.1.x reference refuses stopped-agent resume.
+  - **TaskStop addresses tasks only by `task_id`** — current Claude 2.1.198+ also accepts an agent
+    id or name.
   - **Steering reaches only background dispatches** — a foreground `Agent` call blocks the
     coordinator's turn, so there is no moment to steer it; resume works once any dispatch settles.
   - **Idle-parent delivery is next-turn** — an idle coordinator learns of a background settlement

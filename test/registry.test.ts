@@ -214,18 +214,16 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(sm, "tool.SendMessage must exist").toBeDefined();
     expect(sm?.tier).toBe("partial");
     expect(sm?.note).toContain("Claude 2.1.x");
-    expect(sm?.note).toContain("supports resuming");
-    expect(sm?.note).toContain("PiCC's model-visible resume acknowledgment wording");
+    expect(sm?.note).toContain("resume after TaskStop");
+    expect(sm?.note).toContain("Claude Code 2.1.x reference refuses stopped-agent resume");
+    expect(sm?.note).toContain("new task id");
+    expect(sm?.note).toContain("resolved registry name");
+    expect(sm?.note).toContain("stable agent id");
+    expect(sm?.note).toContain("PiCC-defined model-visible wording");
     expect(sm?.note).toContain("not verified as exact Claude wording");
-    expect(sm?.note).toContain("new Task(task-N)");
-    expect(sm?.note).toContain("clean resolved-registry Agent(<type>)");
-    expect(sm?.note).toContain("stable agent-<id>");
-    expect(sm?.note).toContain("unlike TaskStop/settlement's requested/displayed type");
-    expect(sm?.note).toContain("no cross-restart resume");
-    expect(sm?.note).toContain("steering reaches only background dispatches");
-    expect(sm?.note).toContain("idle coordinator learns of a settlement only at its next turn");
-    expect(sm?.note).toContain("fork/agentOverride dispatches are non-resumable");
-    expect(sm?.note).toContain("no subagent-to-subagent / agent-teams messaging");
+    for (const gap of ["no cross-restart resume", "steering is background-only", "next-turn", "fork/agentOverride"]) {
+      expect(sm?.note).toContain(gap);
+    }
   });
 
   // TaskOutput reports failed status (never empty success); TaskStop's discard
@@ -240,17 +238,15 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(out?.note).toContain("hides TaskOutput from subagents");
     const stop = lookupCapability("tool.TaskStop");
     expect(stop?.tier).toBe("partial");
-    expect(stop?.note).toContain("every model-visible stop result");
-    expect(stop?.note).toContain("PiCC-defined wording");
+    expect(stop?.note).toContain("PiCC accepts only task_id");
+    expect(stop?.note).toContain("Claude 2.1.198+ also accepts agent id/name");
+    expect(stop?.note).toContain("task record's stored display type");
+    expect(stop?.note).toContain("stable agent id");
+    expect(stop?.note).toContain("PiCC-defined model-visible wording");
     expect(stop?.note).toContain("not verified as exact Claude wording");
-    expect(stop?.note).toContain("Task(task-N)");
-    expect(stop?.note).toContain("requested/displayed Agent(<type>)");
-    expect(stop?.note).toContain("SendMessage resume acknowledgment uses the clean resolved registry name");
-    expect(stop?.note).toContain("stable agent-<id>");
-    expect(stop?.note).toContain("cooperative via session abort");
-    expect(stop?.note).toContain("reports a stopped status");
-    expect(stop?.note).toContain("late result is discarded");
-    expect(stop?.note).toContain("Claude Code leaves TaskStop");
+    expect(stop?.note).toContain("cooperative");
+    expect(stop?.note).toContain("discarded late result");
+    expect(stop?.note).toContain("post-stop result semantics are undocumented");
   });
 
   // Subagent hook payloads carry agent_id + agent_type; transcript_path stays MAIN
@@ -289,21 +285,18 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   it("keeps feature.background-agents partial with identity and established gaps named", () => {
     const bg = lookupCapability("feature.background-agents");
     expect(bg?.tier).toBe("partial");
-    expect(bg?.note).toContain("PiCC-defined model-visible wording");
+    expect(bg?.note).toContain("task record's stored display type");
+    expect(bg?.note).toContain("stable agent id");
+    expect(bg?.note).toContain("new task id and resolved registry name");
+    expect(bg?.note).toContain("PiCC-defined");
     expect(bg?.note).toContain("not verified as exact Claude wording");
-    expect(bg?.note).toContain("Task(task-N)");
-    expect(bg?.note).toContain("Agent(<type>)");
-    expect(bg?.note).toContain("stable agent-<id>");
-    expect(bg?.note).toContain("TaskStop results and pushed settlement notices use the requested/displayed type");
-    expect(bg?.note).toContain("SendMessage resume acknowledgment uses the clean resolved registry name");
-    expect(bg?.note).toContain("new task id with the same stable agent id");
-    expect(bg?.note).toContain("settlement notices are bounded/excerpted");
-    expect(bg?.note).toContain("no always-on Agent View dashboard");
-    expect(bg?.note).toContain("no remote/cloud agents");
-    expect(bg?.note).toContain("stop is cooperative");
-    expect(bg?.note).toContain("PiCC defaults foreground");
-    expect(bg?.note).toContain("idle coordinator is not re-invoked");
-    expect(bg?.note).toContain("2.1.198");
+    expect(bg?.note).toContain("TaskStop accepts only task_id");
+    expect(bg?.note).toContain("Claude 2.1.198+ also accepts agent id/name");
+    expect(bg?.note).toContain("resume after TaskStop");
+    expect(bg?.note).toContain("Claude Code 2.1.x reference refuses stopped-agent resume");
+    for (const gap of ["PiCC defaults foreground", "idle parents are not re-invoked", "no always-on Agent View", "no remote/cloud agents", "stop is cooperative"]) {
+      expect(bg?.note).toContain(gap);
+    }
   });
 
   it("stays in sync with the shipped degrade-stub list, in both directions", () => {

@@ -6,7 +6,7 @@ PiCC presents background-task identity consistently when a task is stopped, when
 
 The feature changes model-visible wording but not structured or behavioral contracts. It does not change task lifecycle behavior, stopping semantics, settlement delivery, agent resume behavior, tool schemas or structured results, output framing or limits, or deliberately channel-specific identity forms elsewhere in the product. The revised messages stay concise: they include only the task-to-agent identity needed to correlate work and the existing action or outcome information needed to act on it.
 
-The established displayed type is the requested/display label. It can differ from the resolved agent name after fallback or case-insensitive resolution; correcting that existing mismatch would require broader identity plumbing and is explicitly deferred.
+TaskStop and settlement format the background task record's stored display type. A fresh dispatch record normally stores the requested/display label; a resumed task record, and its resume acknowledgment, use the clean resolved registry name. The stable agent id is therefore the reliable correlation key across runs. Making one canonical type value flow through every record and surface would require broader identity plumbing and is explicitly deferred by maintainer decision.
 
 ## Why
 
