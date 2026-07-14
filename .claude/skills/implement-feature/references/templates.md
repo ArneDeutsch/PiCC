@@ -7,6 +7,10 @@ The three plan-folder templates the router refers to. Copy the relevant one when
 ```markdown
 # F<NN>: <Title>
 
+Ticket: <the linked issue as `<target>#N` — a given ref, or one created via the
+Phase 1 ticket-creation offer (written at Phase 3); `–` when ticketless. Kept
+machine-greppable and stable: the resident anchor reader greps this line on resume.>
+
 ## What
 <What the feature does, as observable behavior. Include explicit non-goals.>
 

@@ -1,5 +1,7 @@
 # F12: Fork-aware workflow & on-the-fly ticket creation for implement-feature
 
+Ticket: –
+
 ## What
 
 Extend the `implement-feature` skill so it lowers the friction of contributing, in three

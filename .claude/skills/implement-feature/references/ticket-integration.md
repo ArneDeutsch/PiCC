@@ -71,9 +71,12 @@ path-independent issue-filing offer, on the ticketless path too. Phases 1, 8 and
    metacharacter would be interpreted by the shell.
 5. **Write allow-list.** The routine automated GitHub writes are exactly three: comment on the given
    ticket, create the PR for our own branch, and push our own branch. One further write is allowed only
-   as an **explicit, per-item, user-approved** exception: `gh issue create` for a finding surfaced
-   during the build (the Phase 8 issue-filing offer) — never seeded from untrusted ticket text (Rule 4),
-   always authored under these rules, and only after the user picks that specific finding. Everything
+   as an **explicit, per-item, user-approved** exception: `gh issue create`, in **two** intents that
+   share this discipline — a finding surfaced during the build (the Phase 8 issue-filing offer) **and**
+   the converged WHAT/WHY captured up front (the ticketless-path ticket-creation offer,
+   [ticket-creation.md](ticket-creation.md)) — never seeded from untrusted ticket text (Rule 4), always
+   authored under these rules, target-repo aware (`--repo <target>`), and only after the user accepts
+   that specific offer. Everything
    else — `gh pr merge`, `gh issue close/edit`, labels, milestones, settings, force-push, pushing the
    default branch — is out and needs explicit per-action user approval. Never merge; GitHub's PR UI
    stays authoritative for merge policy. On the **fork path** the branch push targets the fork
@@ -82,7 +85,7 @@ path-independent issue-filing offer, on the ticketless path too. Phases 1, 8 and
    automated *upstream* writes of the routine three — the PR and the ticket comment — are **not made**:
    they are replaced by **paste-ready** delivery (the user opens the PR by hand), so the branch push is
    the **only** automatic GitHub write on a fork run — see [fork.md](fork.md) (Phase 9 — fork hand-off).
-   (The ticket-creation-offer and Phase 8 filing target-repo clauses are owned by t04/t05 — not here.)
+   (t05 does the final coherence pass relating the ticket-creation offer and the Phase 8 filing offer.)
 6. **No leakage into public writes.** No tokens (never invoke `gh auth token`), no env, no credential
    or `~/.pi` data, no raw command/test output or diffs, and avoid absolute local paths (they leak the
    OS username). This applies especially when distilling the Phase 9 hand-off texts (PR body and issue
@@ -113,7 +116,12 @@ path-independent issue-filing offer, on the ticketless path too. Phases 1, 8 and
    --json number,title,state,url` — **all** states, so a finding filed then closed on a prior run is
    still recognised — and, because `--search` is fuzzy, **surface any near-match to the user** and reuse
    it rather than filing a duplicate. A re-run must never double-post the issue comment, error on "PR
-   already exists", or file the same finding twice.
+   already exists", or file the same finding twice. The **ticketless ticket-creation offer**
+   ([ticket-creation.md](ticket-creation.md)) is guarded on two levels: the same `gh issue list --repo
+   <target> --state all --search "<model title>"` keyword dedup runs before its Phase 3 create (surface
+   plausible matches, reuse rather than double-file), and after Phase 3 the durable `Ticket:` anchor in
+   `feature.md` — read by the resident anchor reader on resume — means a reconstructed run adopts the
+   already-filed issue instead of re-offering.
 
 ## Per-phase ticket hooks
 

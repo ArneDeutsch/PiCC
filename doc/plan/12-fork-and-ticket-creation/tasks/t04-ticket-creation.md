@@ -59,9 +59,20 @@ nothing (re-offer is correct), and a resume after Phase 3 finds the anchor (belo
 
 **Resident anchor READER (the missing consumer).** Add to the **always-loaded router** a resume/entry
 rule: when reconstructing a resumed/compacted run that re-enters with empty `$ARGUMENTS`, before making
-the Phase 1 offer, read the in-progress feature's `feature.md`; if it carries a `Ticket: <ref>` line,
-**adopt that ticket path and target repo instead of re-offering**. Without this reader the persisted
-anchor has no effect and the resume-idempotency acceptance is not delivered.
+the Phase 1 offer, read the in-progress feature's `feature.md` and inspect its `Ticket:` line:
+- **Ticketless test by ref SHAPE, not by a sentinel glyph.** Treat the run as ticketless (→ make the
+  offer as normal) unless the value is a **valid ref** — `<owner/repo>#<int>`, `#<int>`, or a GitHub
+  issue URL. Any placeholder or blank (`–`, `-`, `—`, empty, missing) is *not* a ref and falls through
+  to the offer. Do **not** key on "not exactly `–`": a hand-typed hyphen/em-dash would otherwise be
+  misread as a real ref and hijack every ticketless resume.
+- **On a valid ref, adopt the ticket path AND re-hydrate the cache.** Adopt that ticket path + target
+  repo, and **re-run the gate's read** — `gh issue view <N> --repo <target> --json
+  number,title,body,labels,state,url,comments` — to rebuild the issue cache in this session. The
+  synthesized `comments: []` from the filing session is stale on resume; Phase 9's comment-idempotency
+  scan and Phase 8's close-vs-keep-open both read this cache, so without the re-read a resumed run could
+  double-post the hand-off comment. (This applies to given-ticket resumes too, but t04 owns the reader.)
+Without this reader the persisted anchor has no effect and the resume-idempotency acceptance is not
+delivered.
 
 **Write-contract, routed BY CHECKOUT KIND at the accept step (not a downstream note).** On accept, the
 user (who started ticketless) must see the contract that actually applies — decide it at the accept
@@ -90,10 +101,20 @@ write — explicit per-offer user acceptance, authored under Rules 1/4/6/8, targ
 the final coherence pass relating this to the Phase 8 filing offer.
 
 ## Writable surface
-- `.claude/skills/implement-feature/references/ticket-creation.md` (new)
-- `.claude/skills/implement-feature/SKILL.md` (Phase 1 routing line; resident anchor-reader rule;
-  accept-step write-contract routing; the three "nothing posted" sites + Aborting text)
-- `.claude/skills/implement-feature/references/ticket-integration.md` (Rule 5 create-offer clause; Rule 9 note for the create case)
+**Post-refactor layout + tight headroom.** The router (`SKILL.md`) is at ~17,370/20,000 chars — only
+~2,630 left, shared with t05. Keep resident (router) additions **minimal**: only the small Phase 1
+routing line, the resident anchor-**reader** rule, and the one-clause Aborting qualification go
+resident; the offer/accept/decline procedure, the checkout-aware write-contract variants, and the
+synthesized-cache detail all go in the new `references/ticket-creation.md`. The common Phase 1/Phase 2
+procedure lives in `references/workflow-detail.md`; the ticket-path write-contract + per-phase hooks in
+`references/ticket-integration.md`. Files:
+- `.claude/skills/implement-feature/references/ticket-creation.md` (new — the whole offer flow)
+- `.claude/skills/implement-feature/SKILL.md` (resident, minimal: Phase 1 skeleton routing line to
+  ticket-creation.md; the resident anchor-**reader** rule in the resume/reconstruction area; the
+  one-clause Aborting qualification naming an already-filed created ticket)
+- `.claude/skills/implement-feature/references/workflow-detail.md` (Phase 1/Phase 2 "nothing posted
+  before hand-off" wording qualified for the created-ticket exception; the Phase 3 FILE step)
+- `.claude/skills/implement-feature/references/ticket-integration.md` (Rule 5 create-offer clause; Rule 9 note for the create case; relate to the Phase 8 filing offer)
 - `.claude/skills/implement-feature/references/templates.md` (`Ticket:` field in the feature.md template)
 - `doc/plan/12-fork-and-ticket-creation/feature.md` (add a `Ticket: –` line to this feature's own spec, for consistency with the new template)
 

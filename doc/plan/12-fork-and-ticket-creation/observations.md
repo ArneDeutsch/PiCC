@@ -47,3 +47,13 @@ for review.md.
 - 2026-07-14 — **Router headroom watch:** after t03 the router body is 17,370 / 20,000 (2,630 left).
   Instructed t04/t05 to keep resident additions minimal and relocate into reference files. If t05's grid
   reconciliation risks the cap, relocate the resident write-discipline checklist elaboration.
+- 2026-07-14 — **t04 review: the resume path (the feature's own headline) had two holes.** (1) The
+  anchor reader restored the ref but not the issue *cache* — on a post-Phase-3 resume the gate never
+  re-runs (empty $ARGUMENTS), so Phase 9's comment-idempotency scan would read a stale `comments: []`
+  and **double-post** the hand-off comment. Fixed: the reader re-runs `gh issue view … --json …` to
+  re-hydrate. (2) The ticketless sentinel matched an exact en-dash `–`; a hand-typed hyphen/em-dash
+  would be read as a real ref and hijack every ticketless resume. Fixed: match ref *shape*, not the
+  glyph. **Lesson:** when a durable anchor replaces an in-context cache, the reader must restore
+  *everything* the cache fed (ref AND content), and any sentinel must be defined by what it is (a valid
+  ref) not by one spelling of what it isn't. Both are classic resume/idempotency traps the No-status-
+  bookkeeping principle invites. Router after t04: 18,405/20,000 (1,595 for t05 — kept terse).
