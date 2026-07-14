@@ -14,7 +14,9 @@ import {
   SubagentRuntime,
   createAgentToolDefinition,
   createSendMessageToolDefinition,
+  presentDispatchResult,
 } from "./runtime/subagents.js";
+import type { PiSdk } from "./runtime/subagents.js";
 import { SubagentRegistry } from "./runtime/subagent-registry.js";
 import type { SubagentRegistryRecord } from "./runtime/subagent-registry.js";
 import { formatUsageCompact, sanitizeLine } from "./runtime/subagent-progress.js";
@@ -166,13 +168,26 @@ function debug(...args: unknown[]): void {
  * ever supplies it — Pi invokes the extension entry as `picc(pi)` with a single
  * argument — so a loaded project can never use it to swap runtime internals. An
  * env/settings/file-gated seam would be a project-reachable runtime-swap bypass;
- * an in-process argument is not.
+ * an in-process argument is not. The same invariant binds the `sdk` field below
+ * (F14 t02): the fake Pi SDK it carries is the subagent runtime's execution
+ * substrate — strictly higher privilege than the `onWired` registries — so it is
+ * read ONLY off this in-process argument and plumbed straight into the runtime's
+ * `deps.sdk`; when it is absent the runtime lazy-loads the real Pi SDK. There is
+ * no `process.env` / `project.settings` / file fallback anywhere on that path.
  */
 export interface PiccTestSeam {
   onWired?: (internals: {
     backgroundTasks: BackgroundTaskRegistry;
     subagentRegistry: SubagentRegistry;
   }) => void;
+  /**
+   * TEST-ONLY (F14 t02): inject a fake Pi SDK so an offline-integration test can
+   * drive the REAL fork consumers (Skill tool + input hook) through a controllable
+   * dispatch outcome. Consumed at SubagentRuntime construction as `deps.sdk`;
+   * unset ⇒ the runtime calls `loadRealSdk()`. In-process only — never sourced
+   * from env/settings/files (see the SECURITY note above).
+   */
+  sdk?: PiSdk;
 }
 
 export default function picc(pi: any, testSeam?: PiccTestSeam) {
@@ -395,7 +410,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    * A3), no agent persona (and no dependency on whatever agent happens to sort
    * first, or on any agent existing at all).
    */
-  function forkDispatch(skill: ClaudeSkill, rendered: string, depth: number, argsText = "") {
+  function forkDispatch(
+    skill: ClaudeSkill,
+    rendered: string,
+    depth: number,
+    argsText = "",
+    abortSignal?: AbortSignal,
+  ) {
     const plugin = pluginContextFor(skill);
     const vars = skillActivationVars({
       skill,
@@ -421,6 +442,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           unknownKeys: [],
           diagnostics: [],
         };
+    // Threads Pi's Esc AbortSignal into the dispatch (F14 t02). dispatch always
+    // resolves a DispatchResult (incl. on abort), so forkDispatch resolves and
+    // never rejects — both callers rely on that (the input hook must never throw).
     return subagentRuntime.dispatch({
       subagentType: skill.forkAgentType ?? agentOverride!.name,
       prompt: rendered,
@@ -428,6 +452,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       effort: skill.effort,
       depth,
       agentOverride,
+      abortSignal,
     });
   }
 
@@ -676,6 +701,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     concurrency: project.settings.subagentConcurrency,
     sessionId,
     subagentRegistry,
+    // TEST-ONLY seam (F14 t02): an injected fake SDK reaches every dispatch —
+    // including forks, which close over this one runtime instance. Read ONLY
+    // from the in-process testSeam argument; unset ⇒ the runtime lazy-loads the
+    // real Pi SDK (loadRealSdk). Never sourced from env/settings/files.
+    ...(testSeam?.sdk ? { sdk: testSeam.sdk } : {}),
   });
 
   // ---------------------------------------------------------------------------
@@ -699,7 +729,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         name: Type.String({ description: "Skill name from the listing" }),
         arguments: Type.Optional(Type.String({ description: "Arguments for the skill, if any" })),
       }),
-      async execute(_id: string, params: { name: string; arguments?: string }) {
+      async execute(
+        _id: string,
+        params: { name: string; arguments?: string },
+        signal?: AbortSignal,
+      ) {
         // findByName resolves plugin-namespaced skills by bare name when unique.
         const skill = findByName(project.skills, params.name);
         if (!skill) throw new Error(`Unknown skill: ${params.name}`);
@@ -711,11 +745,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
             fork: true,
             recordActivation: !opts.forSubagent,
           });
-          const result = await forkDispatch(skill, rendered, opts.depth + 1, params.arguments ?? "");
-          if (!result.ok) throw new Error(result.error ?? "context:fork dispatch failed");
+          // Thread Pi's Esc signal (positional 3rd arg) so an Esc'd fork cancels.
+          const result = await forkDispatch(
+            skill,
+            rendered,
+            opts.depth + 1,
+            params.arguments ?? "",
+            signal,
+          );
+          // Forks are non-resumable (F02): suppress every resume trailer. The
+          // shared t01 helper reproduces the Agent tool's four-branch mapping —
+          // failed-with-partial preserves the partial + names the cause;
+          // failed-no-output and aborted surface as loud failures (distinct
+          // wording); completed stays the verbatim final message.
+          const p = presentDispatchResult(result, { allowResumeTrailer: false });
+          if (p.kind === "failure") throw new Error(p.message);
           return {
-            content: [{ type: "text", text: result.finalMessage }],
-            details: { forked: true, agent: result.agentName },
+            content: [{ type: "text", text: p.text }],
+            details: { forked: true, agent: result.agentName, cutOff: p.cutOff },
           };
         }
         const rendered = await activateSkill(skill, params.arguments ?? "", {
@@ -1039,11 +1086,25 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           debug(`input: expanding skill /${skill.name}`);
           const rendered = await activateSkill(skill, argsText, { fork: skill.contextFork });
           if (skill.contextFork) {
-            const result = await forkDispatch(skill, rendered, 1, argsText);
+            // Pass ctx.signal through (correct when defined, harmless when
+            // undefined). NOTE: at the input-hook stage ctx.signal is undefined
+            // for a typed `/forked-skill` (the event fires before the turn
+            // streams), so this does NOT make a typed expansion Esc-cancellable —
+            // a Pi harness limitation documented in t03, not hidden here.
+            const result = await forkDispatch(skill, rendered, 1, argsText, ctx.signal);
+            // Fork non-resumable (allowResumeTrailer:false) and — critically —
+            // EVERY outcome is folded into the transform text, never thrown: a
+            // throw here would hit the handler's catch and send the raw
+            // unexpanded `/skill` to the model, silently dropping the fork's work.
+            const p = presentDispatchResult(result, { allowResumeTrailer: false });
             parts.push(
-              result.ok
-                ? `The ${skill.name} skill ran in a forked subagent. Its result:\n\n${result.finalMessage}`
-                : `The ${skill.name} skill (context: fork) failed: ${result.error}`,
+              p.kind === "result"
+                ? // completed OR failed-with-partial: p.text already carries the
+                  // partial + cut-off note when the run died mid-flight.
+                  `The ${skill.name} skill ran in a forked subagent. Its result:\n\n${p.text}`
+                : // failed-no-output / aborted: name the cause loudly (no partial
+                  // to preserve); the expansion still happens so the turn proceeds.
+                  `The ${skill.name} skill (context: fork) did not finish: ${p.message}`,
             );
             continue;
           }

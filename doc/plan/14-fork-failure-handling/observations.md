@@ -35,6 +35,23 @@ Running record of friction, bugs, and opportunities. Dated bullets; raw material
   `result.outcome === "failed"`, an invariant the helper owns. Added an explicit comment tying
   the two together so a future change to the helper's branch guard won't silently misroute.
 
+## 2026-07-14 — t02 (wire fork path)
+
+- All four reviewers (coder, security, claude-parity, tester) PASS, no MUST/SHOULD fixes.
+  Security confirmed the sdk-seam has no env/settings/file fallback and the abort threading
+  adds no listener surface; tester confirmed the abort test genuinely proves signal threading
+  (never-resolving gate would hang, not pass, if threading were dropped).
+- sdk-seam shape: `PiccTestSeam.sdk?: PiSdk`, conditional-spread into `new SubagentRuntime`
+  deps at construction (NOT onWired). Guarded by test/fork-sdk-seam.test.ts (single-arg
+  picc(pi) ⇒ loadRealSdk, via a partial vi.mock of the real module).
+- Took two tester NITs: assert `details.agent` presence on success + partial paths; clarifying
+  comment on why fork cutOff is always false (non-resumable). Skipped: adding
+  `details.outcome`/`details.error` to Skill-fork failed-partial details (logs-only, never
+  model-visible, no consumer needs it — model-visible content is byte-identical to Agent tool).
+- **[for t03]** parity reviewer confirmed the registry note must say F14 *threads* the Esc
+  signal to the Skill-tool fork (verified), NOT that "Esc cancels a nested fork" (cross-session
+  delivery is Pi's, unverified); typed /forked-skill stays non-cancellable (harness limit).
+
 ## Phase-6 deferred (continued)
 
 - **[note] `capErrorText` is duplicated on purpose** in `background-tasks.ts:416-423` to avoid
