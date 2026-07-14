@@ -6,6 +6,18 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed — implement-feature workflow agents (2026-07-14)
+
+- **The `implement-feature` skill no longer routes work to `general-purpose`.** Two dedicated,
+  **non-dispatching** project agents now do the non-specialist work: `implementer` (write access —
+  builds task specs and applies fixes) and `generalist` (read-only — adversarial whole-plan/whole-diff
+  review and broad cross-surface investigation). Neither carries the `Agent`/`Task`/`Skill` tool, so
+  the coordinator is the sole orchestrator: a dispatched agent can no longer spontaneously spawn its
+  own review roster (previously observed when `general-purpose` implementers fanned out a level down).
+  A regression test locks the no-dispatch invariant on the shipped agent files. No harness change —
+  nested subagents and their depth cap remain Claude-faithful; this only changes which agents the
+  skill hands work to.
+
 ### Added — background-task observability (2026-07-13)
 
 - **`TaskOutput` streams like a foreground agent.** A `TaskOutput` call awaiting a still-running

@@ -21,7 +21,7 @@ You are the **coordinator** of a full feature cycle: converge with the user on W
 
 ## Subagent roster
 
-Six specialist agents exist in `.claude/agents/`. They are **read-only**: they investigate and review, they never implement. Each works in two modes: **investigate** (answer a planning question) and **review** (judge a plan or diff). Pick per fan-out who is relevant; don't always send everyone.
+Six of the agents in `.claude/agents/` are **read-only specialists**. They investigate and review; they never implement. Each works in two modes: **investigate** (answer a planning question) and **review** (judge a plan or diff). Pick per fan-out who is relevant; don't always send everyone.
 
 | Agent | Perspective | Involve when… |
 |---|---|---|
@@ -32,7 +32,14 @@ Six specialist agents exist in `.claude/agents/`. They are **read-only**: they i
 | `user-experience` | DX of the person running picc: setup, errors, output, docs-as-experienced | user-facing behavior or messages change |
 | `claude-parity` | does it behave as Claude Code would; capability registry truthfulness | any Claude-compat surface (loaders, tools, hooks, settings semantics) |
 
-**Writing work — implementation, fixes, doc edits — is always done by generic (general-purpose) subagents** with full write access, or by you directly for trivial changes. Never dispatch a roster agent to implement.
+Two more agents in `.claude/agents/` do the non-specialist work. Like the six specialists, both are **non-dispatching** — no agent in the roster carries the `Agent` tool, which is the point: only you, the coordinator, can spawn subagents, so nothing ever fans out a level below you.
+
+| Agent | Role | Involve when… |
+|---|---|---|
+| `implementer` | the **sole builder** — write access; runs the build and tests | executing a task spec (Phase 7), or applying an accepted fix |
+| `generalist` | read-only, lens-free reviewer/investigator | the adversarial whole-plan/whole-diff pass, or a broad cross-surface question no single specialist owns |
+
+**Only `implementer` writes.** The six specialists — *including `coder`* — only ever review; never dispatch one to implement (`coder` reviews code, `implementer` builds it). Substantive writing — implementation, fixes, and non-trivial doc/CHANGELOG work — goes to `implementer`; you may still make *trivial* one-off edits directly rather than dispatching. And because every agent you dispatch is non-dispatching, **you run every review and every fix yourself** — an `implementer` cannot arrange its own review.
 
 When spawning any agent, state the mode, the question or review target, and what you want back. Subagent reports are input, not truth — weigh them, spot-check load-bearing claims, and when two specialists pull in different directions, decide which concern dominates here (or escalate if it shifts the WHAT/WHY).
 
@@ -40,7 +47,7 @@ When spawning any agent, state the mode, the question or review target, and what
 
 Ask the user for initial direction in prose. Discuss what the feature should do and why it's worth building — user value, scope, non-goals. Stay off implementation details.
 
-In the background you may scout to keep the dialog grounded: read code, check `doc/architecture.md`, `doc/supported-features.md`, existing plans in `doc/plan/` — especially earlier features' `review.md` files, which record known friction, discovered bugs, and deferred opportunities that may intersect with this feature; spawn specialists in investigate mode or search the web for anything unclear. Use what you learn to ask better questions, not to steer into HOW.
+In the background you may scout to keep the dialog grounded: read code, check `doc/architecture.md`, `doc/supported-features.md`, existing plans in `doc/plan/` — especially earlier features' `review.md` files, which record known friction, discovered bugs, and deferred opportunities that may intersect with this feature; spawn specialists (or `generalist` for a broad cross-surface question) in investigate mode, or search the web for anything unclear. Use what you learn to ask better questions, not to steer into HOW.
 
 Converge, then present a **scope mirror** before asking for the go:
 
@@ -63,7 +70,7 @@ Create `doc/plan/<NN>-<slug>/` and write `feature.md` (template below): the WHAT
 
 ## Phase 4 — HOW investigation
 
-Now work out how to build it. Fan out to the relevant specialists in investigate mode with concrete questions (where does this hook into the code? what are the risks? what does Claude Code do here? what must tests cover?). Search the web where external behavior matters (Claude Code semantics, library APIs). Integrate the reports into one coherent technical picture: chosen approach, seams to existing code, risks, open questions.
+Now work out how to build it. Fan out to the relevant specialists — and `generalist` for cross-surface questions no single specialist owns — in investigate mode with concrete questions (where does this hook into the code? what are the risks? what does Claude Code do here? what must tests cover?). Search the web where external behavior matters (Claude Code semantics, library APIs). Integrate the reports into one coherent technical picture: chosen approach, seams to existing code, risks, open questions.
 
 Decide what you can; escalate to the user only what is direction-deciding. Small technical questions: batch them rather than interrupting repeatedly.
 
@@ -78,8 +85,8 @@ A task spec must be **self-contained**: task spec + feature.md is all the *featu
 Fan out reviewers over the whole plan folder (feature.md + all task specs), in parallel, in review mode:
 
 - Each **relevant specialist**: "Is your aspect completely covered by this plan? What's missing?"
-- An **adversarial reviewer** (generic subagent): find holes, contradictions, unstated assumptions, seam mismatches between task specs, missed edge cases in the WHAT/WHY/HOW.
-- An **end-user walkthrough** (`user-experience` or generic): walk through the feature as the person using it, start to finish — does the plan actually deliver the promised experience?
+- An **adversarial reviewer** (`generalist`): find holes, contradictions, unstated assumptions, seam mismatches between task specs, missed edge cases in the WHAT/WHY/HOW.
+- An **end-user walkthrough** (`user-experience`): walk through the feature as the person using it, start to finish — does the plan actually deliver the promised experience?
 
 Integrate the findings. Fix what's clearly right directly in the plan files. Escalate to the user: anything changing the WHAT/WHY, and any major HOW concern with real tradeoffs. Iterate (further review rounds only for substantial changes) until you and the user both accept — re-show the scope mirror if scope moved. Then commit the plan folder: `f<NN>: plan — <title>`.
 
@@ -87,7 +94,7 @@ Integrate the findings. Fix what's clearly right directly in the plan files. Esc
 
 For each task, in planned order:
 
-1. **Dispatch** a fresh generic implementer subagent with the paths to feature.md and its task spec, and these standing rules (relay them into the dispatch prompt):
+1. **Dispatch** a fresh `implementer` subagent with the paths to feature.md and its task spec, and these standing rules (relay them into the dispatch prompt):
    - Read both files first; work in the worktree at `<path>`.
    - Stay inside the writable surface. No workarounds, no mocking-away of problems, no scope creep.
    - Never run `git commit` or `git push` — the coordinator owns all commits.
@@ -98,7 +105,7 @@ For each task, in planned order:
    It reports what it did, test results, and any deviations. Fix subagents get the same rules plus the accepted findings, and append to the same log.
 2. **On escalation**, apply the boundary: fixable within this task's own spec → update the spec and re-dispatch a fresh subagent. Touches other tasks' contracts or the feature scope → stop, discuss with the user, update the plan, then continue. Before any re-dispatch, deal with the aborted attempt's leftovers: either reset the working tree to the last commit (keep the log file), or tell the new subagent exactly what partial work exists and whether to build on it.
 3. **Review fan-out**: pick reviewers by surface touched (see roster; `coder` for any code, `security` whenever execution/permissions/paths are involved, `tester` when coverage might be thin, `docs`/`user-experience`/`claude-parity` when their surfaces moved). Give each the worktree path and have it run `git diff HEAD` there itself, plus the task spec and execution log: is the task *fully* done per spec? What must be fixed? What should be refactored (duplication, extraction, dead code, missing tests, unclear docs)? Also ask them to flag friction with the spec or process itself — that feeds `observations.md`.
-4. **Triage and fix**: weigh the findings; drop what's wrong, apply trivial fixes yourself, dispatch a generic fix subagent for larger ones. Re-review only what a fix meaningfully changed. Don't loop forever — after ~3 non-converging rounds, take it to the user.
+4. **Triage and fix**: weigh the findings; drop what's wrong, apply trivial fixes yourself, dispatch an `implementer` (fix mode) for larger ones. Re-review only what a fix meaningfully changed. Don't loop forever — after ~3 non-converging rounds, take it to the user.
 5. **Distill observations**: skim the execution log and review reports and append what matters to `observations.md` in the plan folder — friction, planning errors, bugs discovered in existing code, refactoring opportunities, process weaknesses. Dated bullets, one line each; this is raw material for `review.md`, not prose. Surface anything major (a real bug, a plan built on a wrong assumption, a systemic process problem) to the user right away rather than sitting on it until close.
 6. **Gate and commit**: verify yourself that typecheck and the full suite are green, then commit everything of the task — including its log and the observations update: `f<NN>: t<NN> — <description>`.
 
@@ -107,7 +114,7 @@ For each task, in planned order:
 When all tasks are committed, review the whole feature against feature.md:
 
 - Fan out the full relevant roster over the complete feature diff (`git diff <default-branch>...HEAD`) + feature.md: is the WHAT fully delivered? Anything half-done, inconsistent, undocumented?
-- Add one adversarial completeness check: "what would a skeptical reviewer of the PR find missing?"
+- Add one adversarial completeness check (`generalist`): "what would a skeptical reviewer of the PR find missing?"
 
 Integrate. Small fixes: do them (with review as in Phase 7, proportionate). Real gaps: define new task specs (continue the task numbering, update feature.md's `## Tasks`) and run them through Phase 7. If the gap questions the WHAT/WHY, talk to the user. Done when you judge the feature complete and the user has been shown a short completion summary and agrees.
 
