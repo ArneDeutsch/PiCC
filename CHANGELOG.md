@@ -37,6 +37,19 @@ All notable changes to PiCC are documented here. The format is based on
   intact, with the detail re-read on demand; the write-discipline floor stays resident so public writes
   are never made with the rules unloaded.
 
+### Fixed — subagent TaskOutput/TaskStop scoped to the dispatcher's own tasks (2026-07-14)
+
+- **A subagent's `TaskOutput` and `TaskStop` now reach only the background tasks that same subagent
+  dispatched.** A task dispatched by a sibling subagent or by the coordinator is unreachable: the
+  subagent is refused cleanly, with no read of, or effect on, the foreign task's result or status, and
+  the refusal does not reveal that the id exists elsewhere in the session. The coordinator is
+  unaffected and retains full access to every task. This closes a cross-dispatcher isolation gap in the
+  session-wide background-task registry. The capability registry's inverted parity note — which wrongly
+  claimed Claude hides `TaskOutput` from subagents while PiCC's session-wide registry exposes every task
+  — is corrected: subagents *inherit* `TaskOutput`/`TaskStop` per Claude's sub-agents documentation, the
+  "hidden TaskOutput" behavior is a filed Claude bug (#15098, #23154), and PiCC's explicit per-dispatcher
+  guard is an honest hardening that is stricter than Claude only on the #15098 coordinator-passed-id edge.
+
 ### Added — SlashCommand tool (2026-07-14)
 
 - **`SlashCommand` is now a real, working tool instead of a degraded no-op.** A model can call
