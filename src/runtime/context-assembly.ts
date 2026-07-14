@@ -106,7 +106,17 @@ You are running a project authored for Claude Code. Honor its conventions:
 - Worktrees: EnterWorktree/ExitWorktree isolate work; while inside one, all relative paths and shell commands run there.
 - Never use git commit --no-verify; project hooks must run.`;
 
-const AUTO_MEMORY_INSTRUCTIONS = `As you work, record durable project facts in the memory directory: one topic per file, with MEMORY.md as the index (keep it under ~200 lines — only MEMORY.md is loaded automatically). Update memory via the Write/Edit tools whenever you learn something worth keeping across sessions; prune entries that turn out to be wrong or obsolete.`;
+/**
+ * Conservative memory-write policy (F10). Single-line string, shared verbatim by the
+ * main-session auto-memory guidance below and the per-agent `memory:` guidance in
+ * index.ts so the two can never drift. It opens with a deference clause so a project's
+ * own CLAUDE.md eager-write opt-in overrides the conservative default — that section is
+ * emitted earlier and would otherwise lose to a bare conservative directive.
+ */
+export const MEMORY_WRITE_POLICY = `Unless this project's own instructions tell you to record memory proactively, do not write to memory on your own initiative — routine facts you pick up while working do not belong here, and low-value entries only crowd out what matters. Add or update an entry only when you are explicitly asked to remember something for the future (for example "remember to…", "from now on…", "in future don't…", or "make a note that…"). When you do, use the Write/Edit tools with one topic per file and MEMORY.md as the index (only MEMORY.md is loaded automatically — keep it under ~200 lines). Remove or correct an entry only when you are told it is wrong or obsolete.`;
+
+/** Main-session framing lead-in; the shared policy is pushed as a separate part after it. */
+const AUTO_MEMORY_LEAD_IN = `The memory above is loaded every session — treat it as durable project knowledge and use it.`;
 
 export function buildSystemPromptSuffix(inputs: AssemblyInputs): string {
   const sections: string[] = [];
@@ -125,7 +135,8 @@ export function buildSystemPromptSuffix(inputs: AssemblyInputs): string {
     const parts = [`Memory directory: ${inputs.autoMemory.dir}`];
     const memContent = inputs.autoMemory.content?.trim();
     if (memContent) parts.push(memContent);
-    parts.push(AUTO_MEMORY_INSTRUCTIONS);
+    parts.push(AUTO_MEMORY_LEAD_IN);
+    parts.push(MEMORY_WRITE_POLICY);
     sections.push(`# Auto memory\n\n${parts.join("\n\n")}`);
   }
 

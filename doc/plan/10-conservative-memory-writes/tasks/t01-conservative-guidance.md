@@ -66,8 +66,10 @@ it." + the shared policy.
 Agent framing (`index.ts`): "The memory above is loaded for you each run — use it." + the
 shared policy.
 
-Do NOT use the word "proactively" anywhere in the new guidance, and do NOT retain the phrase
-"whenever you learn" — the negative tests assert both are gone.
+Do NOT retain the phrase "whenever you learn" — the negative test asserts it is gone. (The
+word "proactively" MAY appear, but only inside the deference clause — "record proactively"; it
+must not describe the default write behaviour. Accordingly the auto-memory test does NOT assert
+`not.toMatch(/proactively/i)`.)
 
 ## Writable surface
 - `src/runtime/context-assembly.ts`

@@ -30,3 +30,15 @@ Running record of friction, bugs, and opportunities. Dated bullets; distilled in
   out. The deference-clause unit assertion is the deterministic proxy instead.
 - Internal stale claim (out of scope): doc/plan/picc-plan.md:407 still describes memory as
   "write conventions"; historical planning artifact, not a user-facing truthfulness surface.
+
+## 2026-07-14 — t01 implementation & review
+
+- t01 implemented cleanly, first pass, no deviations; coder + tester both PASS.
+- Test-design lesson (tester): when two prompt sections share wording via a common constant,
+  a positive substring assertion on the whole prompt is contaminated (false green). Proving a
+  specific site carries the constant needs either a section-scoped slice or an
+  occurrence-COUNT assertion. Applied the count==2 approach.
+- Spec-doc friction (coder): t01 carried a stale blanket "don't use 'proactively'" line that
+  contradicted the later-added deference clause. Reconciled. Lesson: when review adds a
+  MUST (the deference clause) mid-plan, re-scan the earlier constraints in the same spec for
+  contradictions before dispatch.
