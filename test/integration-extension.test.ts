@@ -505,6 +505,7 @@ describe("background settlement notices without polling (t05, offline-integratio
       }),
       undefined,
       agentId,
+      "reviewer",
     );
     await internals.backgroundTasks.wait(taskId);
     internals.subagentRegistry.markSettled(agentId);
@@ -516,8 +517,9 @@ describe("background settlement notices without polling (t05, offline-integratio
     expect(notices).toHaveLength(1);
     expect(notices[0]!.deliverAs).toBe("steer"); // message-level channel, transcript-visible
     expect(notices[0]!.display).toBe(true); // transcript-visible acceptance (rendered to the user)
-    expect(notices[0]!.content).toContain(taskId);
-    expect(notices[0]!.content).toContain(agentId);
+    const identity = `Task(${taskId}) · Agent(reviewer) · ${agentId}`;
+    expect(notices[0]!.content.split(identity)).toHaveLength(2);
+    expect(notices[0]!.content).not.toContain("agent:reviewer");
     expect(notices[0]!.content).toContain("settled: completed");
     expect(notices[0]!.content).toContain("LGTM - no blocking issues");
     expect(notices[0]!.content).toContain("UNTRUSTED SUBAGENT OUTPUT"); // untrusted framing
@@ -553,6 +555,7 @@ describe("background settlement notices without polling (t05, offline-integratio
         }),
         undefined,
         aid,
+        "reviewer",
       );
       await internals.backgroundTasks.wait(t);
       internals.subagentRegistry.markSettled(aid);
@@ -699,6 +702,7 @@ describe("background settlement notices without polling (t05, offline-integratio
       Promise.resolve({ ok: true, outcome: "completed" as const, finalMessage: "done", agentId: okId, diagnostics: [] }),
       undefined,
       okId,
+      "reviewer",
     );
     await internals.backgroundTasks.wait(okTask);
     internals.subagentRegistry.markSettled(okId);
@@ -717,6 +721,7 @@ describe("background settlement notices without polling (t05, offline-integratio
       }),
       undefined,
       failId,
+      "reviewer",
     );
     await internals.backgroundTasks.wait(failTask);
     internals.subagentRegistry.markSettled(failId);
@@ -729,6 +734,7 @@ describe("background settlement notices without polling (t05, offline-integratio
       new Promise((r) => (resolveStop = r)),
       () => {},
       stopId,
+      "reviewer",
     );
     internals.backgroundTasks.stop(stopTask); // status → stopped; notice reads "aborted"
     resolveStop({ ok: false, outcome: "aborted", finalMessage: "discard", agentId: stopId, error: "aborted", diagnostics: [] });

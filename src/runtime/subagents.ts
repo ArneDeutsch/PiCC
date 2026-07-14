@@ -37,6 +37,7 @@ import {
   type ProgressSnapshot,
 } from "./subagent-progress.js";
 import { renderAgentCall, renderAgentResult } from "./subagent-render.js";
+import { formatBackgroundTaskIdentity } from "./background-identity.js";
 
 /**
  * Subagent dispatch runtime (plan §4.3): spawns fresh-context Pi sessions per dispatch,
@@ -1806,11 +1807,12 @@ export function createSendMessageToolDefinition(
         record.agentName,
       );
       taskId = id;
+      const identity = formatBackgroundTaskIdentity(id, record.agentName, record.agentId);
       return {
         content: [
           {
             type: "text",
-            text: `Agent ${record.agentId} ("${record.agentName}") resumed in background as ${id}. Retrieve its result with TaskOutput (task_id "${id}").`,
+            text: `${identity} — resume started in background with prior context; result pending. Retrieve it with TaskOutput (task_id "${id}").`,
           },
         ],
         details: {

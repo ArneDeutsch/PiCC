@@ -8,7 +8,11 @@ import {
   createAgentToolDefinition,
   createSendMessageToolDefinition,
 } from "../src/runtime/subagents.js";
-import { BackgroundTaskRegistry } from "../src/runtime/background-tasks.js";
+import {
+  BackgroundTaskRegistry,
+  buildSettlementNotice,
+  createTaskStopTool,
+} from "../src/runtime/background-tasks.js";
 import { mintAgentId } from "../src/util/subagent-transcripts.js";
 import {
   fakeSdk,
@@ -500,17 +504,76 @@ describe("SendMessage resume — offline integration (real SessionManager) (t04)
     expect(registry.consumeSettledNotice(agentId)).toBe(true);
     expect(registry.consumeSettledNotice(agentId)).toBe(false);
 
+    // Focused lifecycle correlation fixture: an exact-case `reviewer` background
+    // record exposes the same displayed type/stable id through targeted TaskStop
+    // and settlement. Its unrelated metadata also supplies non-disclosure sentinels.
+    const OUTPUT_SENTINEL = "OUTPUT-SENTINEL-7f94";
+    const TRANSCRIPT_SENTINEL = "/transcripts/TRANSCRIPT-SENTINEL-7f94.jsonl";
+    const PATH_SENTINEL = "/private/UNRELATED-PATH-SENTINEL-7f94";
+    const DIAGNOSTIC_SENTINEL = "DIAGNOSTIC-SENTINEL-7f94";
+    const lifecycleTaskId = backgroundTasks.start(
+      "agent:reviewer",
+      Promise.resolve({
+        ok: true,
+        outcome: "completed" as const,
+        finalMessage: OUTPUT_SENTINEL,
+        agentId,
+        agentName: "reviewer",
+        transcriptPath: TRANSCRIPT_SENTINEL,
+        diagnostics: [
+          { severity: "warning" as const, message: DIAGNOSTIC_SENTINEL },
+          { severity: "info" as const, message: PATH_SENTINEL },
+        ],
+      }),
+      undefined,
+      agentId,
+      "reviewer",
+    );
+    const lifecycleRecord = await backgroundTasks.wait(lifecycleTaskId);
+    expect(lifecycleRecord).toBeDefined();
+    const lifecycleIdentity = `Task(${lifecycleTaskId}) · Agent(reviewer) · ${agentId}`;
+    const taskStop = createTaskStopTool(backgroundTasks) as unknown as ToolLike;
+    const stopAck = await taskStop.execute("stop", { task_id: lifecycleTaskId });
+    expect(stopAck.content[0]!.text.split(lifecycleIdentity)).toHaveLength(2);
+    for (const sentinel of [OUTPUT_SENTINEL, TRANSCRIPT_SENTINEL, PATH_SENTINEL, DIAGNOSTIC_SENTINEL]) {
+      expect(stopAck.content[0]!.text).not.toContain(sentinel);
+    }
+    const settlement = buildSettlementNotice(lifecycleRecord!);
+    expect(settlement.split(lifecycleIdentity)).toHaveLength(2);
+    expect(settlement).toContain(OUTPUT_SENTINEL);
+    expect(settlement).toContain(TRANSCRIPT_SENTINEL);
+    expect(settlement).not.toContain(PATH_SENTINEL);
+    expect(settlement).not.toContain(DIAGNOSTIC_SENTINEL);
+
     // SendMessage resume → immediate ack, same ID, flipped back to running.
     const sm = createSendMessageToolDefinition(runtime, {
       registry,
       backgroundTasks,
     }) as unknown as ToolLike;
     const ack = await sm.execute("s", { to: agentId, message: "FOLLOW-UP WORK" });
-    expect(ack.details.agentId).toBe(agentId);
-    expect(ack.details.delivery).toBe("resume");
     const taskId = String(ack.details.taskId);
-    expect(ack.content[0]!.text).toContain("resumed in background");
-    expect(ack.content[0]!.text).toContain(taskId);
+    expect(taskId).not.toBe(lifecycleTaskId);
+    const identity = `Task(${taskId}) · Agent(reviewer) · ${agentId}`;
+    expect(ack.content[0]!.text.split(identity)).toHaveLength(2);
+    expect(ack.content[0]!.text).toContain("resume started in background with prior context");
+    expect(ack.content[0]!.text).toContain("result pending");
+    expect(ack.content[0]!.text).toContain(`TaskOutput (task_id "${taskId}")`);
+    expect(ack.content[0]!.text).not.toContain("FOLLOW-UP WORK");
+    expect(ack.content[0]!.text).not.toContain("ORIGINAL TASK");
+    expect(ack.content[0]!.text).not.toContain("FIRST REPLY");
+    expect(ack.content[0]!.text).not.toContain("agent:reviewer");
+    for (const sentinel of [OUTPUT_SENTINEL, TRANSCRIPT_SENTINEL, PATH_SENTINEL, DIAGNOSTIC_SENTINEL]) {
+      expect(ack.content[0]!.text).not.toContain(sentinel);
+    }
+    expect(ack.content[0]!.text).not.toContain(original.transcriptPath!);
+    expect(ack.content[0]!.text).not.toContain(registry.get(agentId)!.cwd);
+    expect(ack.details).toEqual({
+      agentId,
+      agent: "reviewer",
+      taskId,
+      delivery: "resume",
+      resumed: true,
+    });
     // Status flipped back to running synchronously (Claude 2.1.205).
     expect(registry.get(agentId)!.state).toBe("running");
 
