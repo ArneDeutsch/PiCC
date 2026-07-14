@@ -60,13 +60,22 @@ compresses:
   GitHub issue URL. Any placeholder or blank (`–`, `-`, `—`, empty, missing) is *not* a ref and falls
   through to the offer. Do **not** key on "not exactly `–`": a hand-typed hyphen/em-dash would then be
   misread as a real ref and hijack every ticketless resume.
-- **On a valid ref, adopt the ticket path AND re-hydrate the cache.** A post-Phase-3 resume re-enters
-  with empty `$ARGUMENTS`, so the Phase 0 gate never re-runs and the synthesized `comments: []` from
-  the filing session is **stale**. Re-run the gate's read — `gh issue view <N> --repo <target> --json
-  number,title,body,labels,state,url,comments` — to rebuild the cache this session, because Phase 9's
-  comment-idempotency scan and Phase 8's close-vs-keep-open both read it; without the re-read a resumed
-  run could double-post the hand-off comment. (This applies to **given-ticket** resumes too — t04 owns
-  the reader.)
+- **Sanitize the adopted ref before it touches a shell — this is a security gate, not just routing.**
+  `feature.md` is a repo-controlled file, so a resumed run must treat its `Ticket:` line as untrusted
+  data (Rule 2). Before interpolating the adopted values into any `gh --repo <target>` /
+  `gh issue view <N>` command, validate `<target>` against `^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$` (a clean
+  `owner/repo`) and `<N>` against `^[0-9]+$` (a bare positive integer) — no shell metacharacters
+  (`` ` `` `$` `"` `\` `;` `|` `&` `(` `)`). A value that fails either check is **not adopted**: stop
+  and ask the user rather than passing a tampered ref to the shell.
+- **On a valid, sanitized ref, adopt the ticket path AND re-hydrate — the cache *and* the fork
+  identities.** A post-Phase-3 resume re-enters with no ticket argument, so the Phase 0 gate never
+  re-runs: both the cached issue JSON and the resolved fork identities are gone this session.
+  **Re-resolve the Phase 0 fork identities** (`target`/`push`/`pushRemote`/`targetDefault` —
+  [fork.md](fork.md)) so the hand-off still routes to the right repo/remote, **and** re-run the gate's
+  read — `gh issue view <N> --repo <target> --json number,title,body,labels,state,url,comments` — to
+  rebuild the cache (the synthesized `comments: []` from the filing session is **stale**), because
+  Phase 9's comment-idempotency scan and Phase 8's close-vs-keep-open both read it; without the re-read
+  a resumed run could double-post the hand-off comment. (This applies to **given-ticket** resumes too.)
 
 ## Accept-step write-contract — routed BY CHECKOUT KIND (decide it at the accept step)
 
@@ -81,15 +90,16 @@ surprise:
 
 - **Maintainer accept:** "I'll file the issue as I set up the branch and plan — you'll get its URL, and
   if I spot an existing matching issue first I'll check with you before filing. Then at hand-off I'll
-  open a ready-for-review PR that closes the issue and post one comment on it explaining what was built
-  and how behaviour changes."
+  open a ready-for-review PR that links/closes the issue per the Phase 8 judgement (a full delivery
+  closes it, a partial one leaves it open) and post one comment on it explaining what was built and how
+  behaviour changes."
 - **Fork accept:** "I'll file the issue on `<target>` as I set up the branch and plan — you'll get its
   URL, and if I spot an existing matching issue first I'll check with you before filing. Then at hand-off
   I'll push to your fork and hand you a compare URL plus a paste-ready PR (and an optional paste-ready
   comment). I will post nothing *further* to `<target>` automatically."
   **Reconcile the apparent contradiction explicitly:** the feature issue is the *one consented public
   write* on `<target>`; nothing *else* is auto-posted there, and the PR is opened **by the user** via
-  the compare URL (t03's fork hand-off — [fork.md](fork.md) Phase 9), **never** an auto-PR.
+  the compare URL (the fork hand-off — [fork.md](fork.md) Phase 9), **never** an auto-PR.
 
 ## Phase 3 FILE step (on accept)
 
@@ -137,5 +147,6 @@ in the run; the Phase 8 findings offer is the remaining tracking opportunity.
 This create-offer write is permitted under the **same** exception the Phase 8 filing offer uses (Rule 5
 in [ticket-integration.md](ticket-integration.md)): `gh issue create` with **explicit per-offer user
 acceptance**, authored under Rules 1/4/6/8, target-repo aware (`--repo <target>`). Same discipline,
-different intent (agreed scope up front vs. a surfaced finding at close); t05 finalizes their shared
-wording.
+different intent (agreed scope up front vs. a surfaced finding at close). Rule 5 now names both offers
+as the allow-list's two per-item `gh issue create` exceptions — this offer and the Phase 8 filing
+offer are the whole of that exception, nothing else.

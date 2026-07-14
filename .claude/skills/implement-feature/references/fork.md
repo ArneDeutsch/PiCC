@@ -5,7 +5,7 @@ repo and before Phase 2 picks a base branch. It resolves, remote-name-agnostical
 checkout is a **maintainer** clone (the checkout *is* the target repo) or a **fork** clone, and
 produces the resolved-identities set that every later ticket read/write and the branch push depend
 on. The hand-off half — pushing to the fork, the compare URL, the paste-ready PR — is this file's
-Phase 9 section, added by t03.
+Phase 9 section.
 
 **Key distinction — repos vs. remotes.** `gh` addresses a repository by `--repo <owner/repo>`, never
 by a git-remote name: every issue read/write and the PR base are keyed on an `owner/repo`, so they
@@ -15,8 +15,8 @@ matching its URL — never assume the name `origin` or `upstream`.
 
 ## Resolved identities
 
-Resolve these four once at Phase 0 and carry them through the run; t03 and t04 consume them by these
-**exact** names:
+Resolve these four once at Phase 0 and carry them through the run; the fork hand-off and the
+ticket-creation offer consume them by these **exact** names:
 
 - **`target`** — the upstream `owner/repo` where issues live and any PR is based. Every `gh
   issue`/`gh pr` call uses `--repo <target>`.
@@ -82,16 +82,23 @@ about the maintainer path changes — it stays byte-for-byte what it was.
    maintainer + ticketless + no-gh cell byte-for-byte as it was before F12. (A ticket ref *does* force
    the gate, which already requires `gh`, so this degrade only applies to the ticketless path.)
 
-> **TODO (t05, Hole D):** the URL-ref-points-at-the-fork nuance — a ticket given as a full GitHub URL
-> whose owner/repo is the *fork* rather than the resolved `target` — is deferred. For now the Phase 0
-> rule is: **a URL ref's owner/repo must match the resolved `target`.** t05 finalizes the fork-issue
-> case.
+> **The fork-only URL-ref rule.** A URL ref must match host `github.com` and
+> **either** resolved repo. Matching `target` → proceed normally. Matching the **fork only** → adopt
+> the fork-hosted issue (the PR still targets `target`), but note two hazards: GitHub won't cross-link
+> a fork issue to an upstream PR, and — the dangerous half — a plain `Closes #N` on the upstream PR
+> would **not** close the fork issue and **would wrongly close `target`'s own same-numbered issue** if
+> one exists (fork and upstream share a number sequence). So warn the user, emit a **bare cross-repo
+> `<fork-owner>/<fork-repo>#N`** (no closing keyword — Phase 9 step 5 below), and close the fork issue
+> by hand. Matching **neither** → STOP and ask. This is the detail home for the rule the resident
+> Phase 0 gate (`SKILL.md`) and Rule 3 ([ticket-integration.md](ticket-integration.md)) state
+> identically (those two are the single-sourced pair; this block only expands the rationale).
 
 ## How the identities thread into the phases
 
 - **Phase 0 reachability gate** (resident in the router): the required pushable github remote is
   `pushRemote` (the fork on the fork path); a remoteless checkout still stops. Issue reads use
-  `--repo <target>`. A URL ref's owner/repo must match `target` (see the t05 TODO above).
+  `--repo <target>`. A URL ref's owner/repo must match `target` **or the fork** (fork-only → adopt the
+  fork issue + bare cross-repo link, never a closing keyword; see the fork-only URL-ref rule above and Phase 9 step 5).
 - **Phase 2 default branch** ([workflow-detail.md](workflow-detail.md)): base the feature branch on
   **`targetDefault`**, fetched from the **target** — on the fork path the target's freshest default may
   be absent or stale in the fork's tracking refs, so fetch it from the target, not the fork. But **do
@@ -100,8 +107,9 @@ about the maintainer path changes — it stays byte-for-byte what it was.
   from the shared `refs/remotes/<tmp>/<targetDefault>`, then remove the temp remote (or fetch inside the
   worktree). Branch from the *target's* default, not the fork's.
 - **Rule 3 & Rule 5** ([ticket-integration.md](ticket-integration.md)): a URL ref must match
-  `target`; the branch push (Rule 5's allow-list) targets `pushRemote`/`push` — still "our own
-  branch," just not necessarily `origin`.
+  `target` **or the fork** (fork-only → bare cross-repo link, per the fork-only URL-ref rule above); the branch
+  push (Rule 5's allow-list) targets `pushRemote`/`push` — still "our own branch," just not
+  necessarily `origin`.
 - **Phase 1 disclosure** (below): surface the fork nature the moment it's resolved, on **any** fork
   checkout — ticketless included — so the manual-PR hand-off is expected, never sprung at Phase 9.
 - **Phase 9 hand-off** (below): push the branch to the fork and hand the user a compare URL +
@@ -128,9 +136,11 @@ before "go", so the manual-PR hand-off is expected. Present it as prose to the u
 Substitute the resolved `push`/`target` `owner/repo` names. On the **ticket** path this composes
 with — does not replace — the ticket write-contract from
 [ticket-integration.md](ticket-integration.md) (Per-phase ticket hooks → Phase 1): show both, so the
-maintainer sees the ticket writes *and* that the PR is opened by hand against the upstream. On the
-**ticketless** fork path this is the *only* Phase 1 write-contract moment. (The ticket-creation
-offer's own contract lines are owned by t04; t05 reconciles both into the grid.)
+maintainer sees the ticket writes *and* that the PR is opened by hand against the upstream. When the
+ticketless fork run **declines** the create-offer (staying ticketless), this disclosure is the *only*
+Phase 1 write-contract moment; when it **accepts**, the create-offer adds its own accept contract
+([ticket-creation.md](ticket-creation.md)) and this disclosure composes with it. Either way the
+router's four-cell grid ties the two together.
 
 If `gh` was unavailable so `target`/`push` could not be resolved (the no-gh degrade), there is no
 fork disclosure to make — the run is on the git-only maintainer resolution and hands off generically
@@ -203,9 +213,9 @@ the body until the rules are available** — do not distill a body with the rule
    issue lives in the same repo the PR targets** — i.e. the issue is on `target`. Never hard-code
    `Closes #N`; pick the top linking line from where the issue lives:
    - **Issue on `target`** (the given ticket whose URL matched `target`, or a ticket created on the
-     upstream in the t04 offer): use [handoff.md](handoff.md)'s skeleton top line as-is — `Closes #N`
+     upstream via the create-offer): use [handoff.md](handoff.md)'s skeleton top line as-is — `Closes #N`
      if Phase 8 judged the feature to **fully** deliver #N, else a bare `#N` (ticket stays open).
-   - **Issue on the fork** (a URL ref pointing at a fork-hosted issue — the t05/Hole D case): a plain
+   - **Issue on the fork** (a URL ref pointing at a fork-hosted issue — the fork-only URL-ref case): a plain
      `Closes #N` on a PR that targets `target` does **not** close the fork issue and **would wrongly
      close `target`'s own same-numbered issue** (fork and upstream share a number sequence). Emit a
      **bare cross-repo reference** `<fork-owner>/<fork-repo>#N` (no closing keyword) and tell the user
@@ -228,7 +238,7 @@ on the branch in the worktree), give the actual `git`/`gh` error — but **redac
 credential first**: a raw `git push` error can echo a remote URL like
 `https://x-access-token:TOKEN@github.com/…`, so strip the `user:token@` before showing it, the same
 redaction the Phase 0 STOP-and-ask rule applies (keep the two in lockstep). State that **nothing was posted
-upstream** (name any issue the user filed earlier — e.g. via the t04 create-offer — that already
+upstream** (name any issue the user filed earlier — e.g. via the create-offer — that already
 stands and was echoed when created, so they know what is already public), give the fix + the re-push
 command, then hand the paste-ready PR **title**/**body** and the compare-URL **template** (to fill in
 once the push succeeds). No compare URL is shown until a real push lands.

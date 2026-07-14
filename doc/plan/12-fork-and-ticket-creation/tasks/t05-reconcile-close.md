@@ -61,16 +61,27 @@ default, not the fork's (t02 — verify it's stated as a named seam). Assign any
    not touch.
 
 ## Writable surface
-- `.claude/skills/implement-feature/SKILL.md`
-- `.claude/skills/implement-feature/references/ticket-integration.md`
-- `.claude/skills/implement-feature/references/fork.md`
-- `.claude/skills/implement-feature/references/ticket-creation.md`
+**Post-refactor layout + very tight headroom.** The router (`SKILL.md`) is at **18,405/20,000** — only
+**~1,595 chars** left. The four-cell grid naming is the main resident add; keep it **terse** and put any
+elaboration in a reference file. If it doesn't fit, relocate a donor first (the generalist flagged: the
+anchor-reader parenthetical and part of the Phase 1 offer sentence in `SKILL.md` can move into
+`references/ticket-creation.md`; the resident write-discipline checklist elaboration can move into
+`references/ticket-integration.md`) — **never cut content**. The Phase 8 filing offer lives in
+`references/ticket-integration.md` (Per-phase ticket hooks → Phase 8); the gate is resident in `SKILL.md`;
+Rule 3 is in `references/ticket-integration.md`. Files:
+- `.claude/skills/implement-feature/SKILL.md` (four-cell grid, terse; Phase 0 gate URL-match reconcile)
+- `.claude/skills/implement-feature/references/ticket-integration.md` (Rule 3 URL-match + Hole D; Phase 8 filing → `<target>`; final Rule 5 coherence)
+- `.claude/skills/implement-feature/references/fork.md` (finalize the t05/Hole D TODO; the grid may reference it)
+- `.claude/skills/implement-feature/references/ticket-creation.md` (relate the two create-issue flows; absorb any relocated router prose)
+- `.claude/skills/implement-feature/references/workflow-detail.md` (if the grid detail lands here)
 - `CHANGELOG.md`
 - the guard test under `test/` (extend per Testing)
 
 ## Approach constraints
 - Editing only — resolve inconsistencies and holes; do not re-open settled decisions from t01–t04.
-- The two maintainer cells must remain byte-for-byte behavior-equivalent to today.
+- The maintainer ticket-path hand-off and the post-decline maintainer ticketless flow must remain
+  behavior-equivalent to today (the pre-offer point is the only maintainer-ticketless change, from t04).
+- Watch the guard test's hard router cap; relocate, never cut.
 
 ## Left open
 - Exact CHANGELOG wording and whether the F06 reconciliation edits the old line or adds a clarifying

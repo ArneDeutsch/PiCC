@@ -90,3 +90,22 @@ Also make sure the repo's own records are current before closing: CHANGELOG entr
 Then write the feature's `review.md` (template in [templates.md](templates.md)) by distilling `observations.md`, the task logs, and your own judgment of the cycle. This is the learning record: planning errors, friction, bugs found along the way, refactoring and improvement opportunities, and concrete follow-up proposals — future planning sessions read it, and process/system weaknesses it records are how this workflow itself gets improved. Present the major findings and proposed follow-ups to the user (they may become the next features). Commit: `f<NN>: review — <title>`.
 
 The ticket-path close hooks (close-vs-keep-open judgement + write preview) and the either-path issue-filing offer run inside this same close gate; their full text is in [ticket-integration.md](ticket-integration.md) (Per-phase ticket hooks → Phase 8). **Read it before any such write, and refuse the write if it cannot be read.**
+
+## Aborting and backtracking
+
+- User rejects the plan in Phase 6 → take the feedback back to Phase 4 (or Phase 1, if the WHAT/WHY itself fell).
+- Feature abandoned any time after Phase 2 → ExitWorktree (`action: keep`), then tell the user exactly what exists (branch, worktree path, commits so far) and the commands to delete it all. Never delete their work yourself. Nothing is posted to a linked ticket before hand-off, so an abandoned run leaves the ticket untouched — **except a ticket you created via the Phase 1 offer: it is filed at Phase 3 and is already public/open, so name it with its URL** so the user can keep or close it. Likewise, if you had already filed follow-up issues (Phase 8 offer), name them so the user can decide whether to keep or close them; never close either yourself (Rule 5).
+
+## Commit grammar & the pre-commit hook
+
+The commit grammar (also summarized resident in the router):
+
+- Plan: `f<NN>: plan — <title>`
+- Task: `f<NN>: t<NN> — <description>`
+- Review: `f<NN>: review — <title>`
+- Fixes/close work: `f<NN>: <description>`
+- Merge commits keep git's default subject.
+
+The git log doubles as the progress record — write subjects so that reading them tells the story of the feature.
+
+Every commit triggers the **pre-commit hook** (`.githooks/pre-commit`) — the unit + offline-integration suite (a couple of minutes). A hook failure is a real test failure: fix and commit again; never bypass with `--no-verify`. If it doesn't fire (fresh clone, `--ignore-scripts`), wire it: `git config core.hooksPath .githooks`.

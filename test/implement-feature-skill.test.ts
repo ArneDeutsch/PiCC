@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { loadSkillBody, loadSkills } from "../src/claude/skills.js";
+import { loadSkillBody, loadSkills, substituteArguments } from "../src/claude/skills.js";
 import { REINJECT_PER_SKILL_MAX_CHARS } from "../src/runtime/skill-activation.js";
 import { walkFiles } from "../src/util/fs.js";
 
@@ -40,6 +40,25 @@ describe("implement-feature router (F12 t01)", () => {
     expect(body.length).toBeLessThanOrEqual(REINJECT_PER_SKILL_MAX_CHARS);
   });
 
+  it("rendered body stays within the cap even under a long invocation argument", () => {
+    // Guards the substitution-inflation regression: the router must carry NO literal `$ARGUMENTS`
+    // token (each mention is globally substituted at activation, which both garbles the prose and,
+    // under a long documented invocation like `#5 also add …`, multiplies the args text into the
+    // resident body and can push it past the cap). With no marker, the ref reaches the coordinator
+    // once via the append-fallback instead. Render with a representative ~150-char invocation and
+    // assert the rendered body still fits.
+    const body = loadSkillBody(skill!);
+    const argsText =
+      "#5 also add structured logging around the dispatch loop and make sure the retry path is " +
+      "covered by an offline integration test in the tester layer please";
+    expect(argsText.length).toBeGreaterThanOrEqual(140);
+    const rendered = substituteArguments(body, argsText, skill!.arguments);
+    expect(rendered.text.length).toBeLessThanOrEqual(REINJECT_PER_SKILL_MAX_CHARS);
+    // The ref still reaches the coordinator — via the no-marker append fallback, since the router
+    // body carries no literal `$ARGUMENTS`/`$N`/`$name` marker to substitute in place.
+    expect(rendered.text).toContain(`ARGUMENTS: ${argsText}`);
+  });
+
   it("every linked reference resolves, and every reference file is linked (bidirectional, count-agnostic)", () => {
     const body = loadSkillBody(skill!);
 
@@ -62,6 +81,16 @@ describe("implement-feature router (F12 t01)", () => {
     for (const ref of onDisk) {
       expect(mentionedSet.has(ref)).toBe(true);
     }
+  });
+
+  it("keeps the write-discipline floor resident in the router (loose structural check)", () => {
+    // The fail-closed floor must survive in the always-loaded router even after compaction — so the
+    // resident checklist keeps its two load-bearing markers. Loose on purpose: assert the markers are
+    // present (case-insensitive), not their exact prose, so this stays a floor check, not a
+    // wording change-detector.
+    const body = loadSkillBody(skill!).toLowerCase();
+    expect(body).toContain("--body-file");
+    expect(body).toContain("allow-list");
   });
 
   it("registers exactly one SKILL.md (no second skill), scoped to the skill dir", () => {

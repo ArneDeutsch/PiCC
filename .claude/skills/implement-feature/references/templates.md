@@ -2,6 +2,17 @@
 
 The three plan-folder templates the router refers to. Copy the relevant one when a phase says to write `feature.md`, a task spec, or `review.md`.
 
+## Plan folder layout
+
+```
+doc/plan/<NN>-<slug>/
+  feature.md          WHAT/WHY spec (Phase 3; Tasks section backfilled in Phase 5)
+  tasks/t<NN>-<slug>.md   task specs (Phase 5)
+  log/t<NN>.md        execution logs, written by implementer/fix subagents (Phase 7)
+  observations.md     coordinator's running record of friction/bugs/opportunities (Phase 7)
+  review.md           distilled close record (Phase 8)
+```
+
 ### `feature.md`
 
 ```markdown

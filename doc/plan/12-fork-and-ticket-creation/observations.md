@@ -47,6 +47,25 @@ for review.md.
 - 2026-07-14 — **Router headroom watch:** after t03 the router body is 17,370 / 20,000 (2,630 left).
   Instructed t04/t05 to keep resident additions minimal and relocate into reference files. If t05's grid
   reconciliation risks the cap, relocate the resident write-discipline checklist elaboration.
+- 2026-07-14 — **Phase 8 close review (5 reviewers, all PASS) caught a subtle cap bug + process residue.**
+  (1) The guard test measured the RAW skill body, but the runtime truncates the SUBSTITUTED body — and
+  the router used the literal `$ARGUMENTS` token 3× in prose, which the harness replaces globally. Under
+  a documented long-direction invocation (`#5 also add logging …`) that multiplied the args into the
+  resident body and could truncate the tail — partially reintroducing the very truncation bug F12 fixes.
+  Fixed by removing all literal `$ARGUMENTS` from the router (ref now reaches via the no-marker
+  append-fallback) and adding a **rendered-body** guard-test assertion. **Lesson:** for a resident skill,
+  guard the *rendered* size (post-substitution), not the file size; and literal `$ARGUMENTS` in prose is
+  a latent substitution/garbling bug. (2) Task-ID/"Hole D" planning scaffolding had leaked into the
+  shipped reference files — scrubbed; the hole-sweep verified holes were *closed* but was never asked to
+  *scrub the labels*, so it was structurally unassigned. (3) Hardened the resume anchor into an explicit
+  sanitization gate (owner/repo + integer, no metacharacters) since `feature.md` is a repo-controlled
+  file feeding a `gh` command line. Final router: raw 18,741 / rendered 18,907, both under 20,000.
+- 2026-07-14 — **Standing constraint for future editors:** the router has ~1,100–1,300 chars of headroom
+  under the 20,000-char re-injection cap. Any new resident prose must relocate an equal-or-greater donor
+  into a `references/*.md` file — never cut content. The guard test (raw + rendered) enforces the cap.
+- 2026-07-14 — **Phase 9 to-do (branch staleness):** this branch forked pre-F11; `origin/main` now
+  carries F11 (slashcommand-tool). The Phase 9 merge of `origin/main` must preserve F11's CHANGELOG and
+  `doc/supported-features.md` entries (F12 touches neither, so no conflict expected).
 - 2026-07-14 — **t04 review: the resume path (the feature's own headline) had two holes.** (1) The
   anchor reader restored the ref but not the issue *cache* — on a post-Phase-3 resume the gate never
   re-runs (empty $ARGUMENTS), so Phase 9's comment-idempotency scan would read a stale `comments: []`
