@@ -538,7 +538,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           const parts = [`Memory directory: ${memory.dir}`];
           const memContent = memory.content?.trim();
           if (memContent) parts.push(memContent);
-          parts.push("The memory above is loaded for you each run — use it.");
+          parts.push("Any memory shown above is loaded for you each run — use it.");
           parts.push(MEMORY_WRITE_POLICY);
           sections.push(`# Agent memory\n\n${parts.join("\n\n")}`);
         }

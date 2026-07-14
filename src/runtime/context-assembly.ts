@@ -116,7 +116,7 @@ You are running a project authored for Claude Code. Honor its conventions:
 export const MEMORY_WRITE_POLICY = `Unless this project's own instructions tell you to record memory proactively, do not write to memory on your own initiative — routine facts you pick up while working do not belong here, and low-value entries only crowd out what matters. Add or update an entry only when you are explicitly asked to remember something for the future (for example "remember to…", "from now on…", "in future don't…", or "make a note that…"). When you do, use the Write/Edit tools with one topic per file and MEMORY.md as the index (only MEMORY.md is loaded automatically — keep it under ~200 lines). Remove or correct an entry only when you are told it is wrong or obsolete.`;
 
 /** Main-session framing lead-in; the shared policy is pushed as a separate part after it. */
-const AUTO_MEMORY_LEAD_IN = `The memory above is loaded every session — treat it as durable project knowledge and use it.`;
+const AUTO_MEMORY_LEAD_IN = `Any memory shown above is loaded every session — treat it as durable project knowledge and use it.`;
 
 export function buildSystemPromptSuffix(inputs: AssemblyInputs): string {
   const sections: string[] = [];

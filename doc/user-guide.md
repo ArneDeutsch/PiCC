@@ -149,6 +149,10 @@ managed):
 > Proactively record durable project facts to auto memory as you work — don't wait for me to
 > ask. Keep MEMORY.md as the index, one topic per file, and prune stale entries.
 > ```
+>
+> To opt in **without modifying the target project** (or across all your projects at once), put
+> the same instruction in your user-scope `~/.claude/CLAUDE.md` instead — it composes into the
+> same prompt and overrides the conservative default the same way.
 
 Then use it like Claude Code:
 
