@@ -6,6 +6,71 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — evaluate skill (2026-07-15)
+
+- **A new `evaluate` skill rates a GitHub issue, a proposed (not-yet-filed) issue, or a pull request
+  and drives a disposition — invocable by a human (`/evaluate <target>`) or by another agent.** One
+  shared evaluation engine backs **three modes**, auto-routed (the human never picks): **issue-eval**
+  (understand an open issue and act — a confidence-gated close of clear slop with a canned comment, or
+  a keep-open rating comment, biased to keep-open when uncertain), **proposal-gate** (score a would-be
+  issue with **no GitHub write** at all), and **pr-eval** (assess a PR's diff, whether it fulfils its
+  ticket and whether the ticket was worth doing, and the verification evidence, then post an advisory
+  assessment comment — **it never merges**). Every mode weighs the target against named criteria (user
+  value, reach, legitimacy incl. a slop/malicious screen, clarity, blast radius, conflict,
+  cost-vs-benefit) and shows its reasoning in the posted comment.
+- **A fixed action envelope, previewed and confirmed before every public write.** The skill's entire
+  set of GitHub writes is: confidence-gated close + canned comment, keep-open rating comment, PR
+  assessment comment, and verification-request comment — it never merges, edits, labels, reopens, or
+  locks. It always previews the rating and the exact write and asks for the human's explicit go before
+  any close or comment; there is **no unattended/autonomous mode and no `--yes` token**. Honest scope:
+  on the structural surfaces the no-write guarantee is absolute (a tool-gated agent *cannot* perform
+  the write); on the coordinator's own path it rests on a defence-in-depth `settings.json` deny floor
+  plus the text-is-data discipline, because in PiCC `allow`/`ask` rules are no-ops (only `deny` and
+  per-agent tool-gating are hard).
+- **Every agent that ingests attacker-controlled target content is a shell-free, read-only sandbox.**
+  The maliciousness screen, proposal-gate, and all roaster/pro-con/lens reviewers run as one dedicated
+  `evaluator` agent with no shell, write, fetch, or dispatch tools, so they *cannot* post, close, run a
+  reproducer, fetch a link, or fan out. The Bash-capable coordinator does all `gh` work but **redirects
+  raw issue/PR body, comments, and diff to a temp file it does not read**, resolving only bounded
+  non-body metadata (issue-vs-PR, open/closed, changed-file list, CI status) via targeted `--jq`
+  queries — so no attacker text reaches a shell-capable agent, and the coordinator operates on the
+  evaluator's constrained outputs, not raw bytes. **Honest limit:** the coordinator's non-ingestion is
+  a *disciplined redirect* (behavioral), not a tool-enforced block, and rests on `gh … > file`
+  returning empty stdout — pending one live smoke test before the "quarantine" framing is fully relied
+  on.
+- **Malicious input is contained, and re-runs are idempotent.** The screen classifies the target into
+  a fixed category set and nothing else, so an injection can at most flip the category, never smuggle
+  an instruction; parsing fails safe to keep-open. **Invariant: a close always carries the canned,
+  category-selected comment (which contains none of the target's text); only a keep-open ever carries
+  a model-authored rating** — so attacker text can never ride a destructive action. A second
+  evaluation of the same target does not double-post or double-close (already-closed/already-commented
+  targets short-circuit via a metadata-only scan). Prose-only — no `src/` change; a defence-in-depth
+  `.claude/settings.json` deny floor is added.
+
+### Changed — implement-feature proposal-gating & verification guidance (2026-07-15)
+
+- **`implement-feature`'s Phase 8 issue-filing offer now runs the `evaluate` proposal-gate on each
+  machine-surfaced finding.** Clear slop is dropped with a one-line tally (so nothing vanishes
+  invisibly), and the rest are surfaced with the assessment embedded and **per-item user choice
+  preserved** — the gate subtracts clear slop, never the user's own call.
+- **The Phase 1 ticket-creation offer is annotated, never gated.** When the skill offers to file the
+  human's own just-converged feature, proposal-gate gives an **in-session value advisory** before
+  filing; it is **never** baked into the public issue body and **never** suppresses the human's offer.
+- **The PR hand-off now produces concrete, applicability-aware verification guidance** instead of a
+  generic "verify in the running app" prompt. The coordinator first judges whether the change warrants
+  manual verification (docs-only or fully-auto-tested → "no manual verification needed: `<reason>`";
+  but a skill/harness/prose change **is not** exempt — picc executes it) and, where it does, gives
+  concrete branch/launch/in-app steps and the observable outcome. This threads with `handoff.md`'s
+  existing "no runnable UI → picc executing the changed behaviour" doctrine rather than contradicting
+  it.
+- **`CONTRIBUTING.md` and a new `.github/pull_request_template.md` now demand and explain the same
+  verification contract.** Both name the **two artifacts** (verification *guidance* in the PR
+  description; a **manual-verification comment** as the author's evidence), carry the applicability
+  escape prominently so docs-only / fully-auto-tested changes are never nagged, and CONTRIBUTING adds a
+  worked cross-platform example (Windows Git Bash + Linux) launching picc against an `examples/`
+  fixture. The same concrete + applicability-aware standard governs pr-eval's enforcement and
+  implement-feature's own creation-side guidance, so all three surfaces tell one consistent story.
+
 ### Changed — background-by-default subagent dispatch (2026-07-14)
 
 - **Subagent dispatch (`Agent`/`Task`) now runs in the background by default, matching Claude Code

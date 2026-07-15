@@ -85,3 +85,21 @@ Running record of friction, bugs, and opportunities. Dated bullets, one line eac
 - **Deviation from decision C (flagged to user):** the user asked to "add an assessment about the
   feature proposal" at Phase 1; delivered as an in-session advisory rather than a public body embed.
   One line reverts it if the maintainer prefers the embed.
+
+## t05 — CONTRIBUTING + PR template + creation-side guidance + CHANGELOG (2026-07-15)
+
+- **A copy-paste-broken worked example is worse than none.** The first draft told a first-time
+  contributor to type `/hello`, but the named `examples/hello-claude` fixture's skill is `/greet <name>`
+  (the fixture/command-name collision made the wrong command look plausible). Fixed to `/greet Ada` with
+  a real observable outcome (greeting reply + `greeted:` line in `greetings.log`). Lesson: verify every
+  example command against the actual fixture, not the fixture's name.
+- **A cross-surface literal must be byte-identical.** The escape phrase "no manual verification needed:
+  <reason>" drifted to "No…" in the PR template; aligned. When four surfaces (pr-eval, CONTRIBUTING,
+  template, handoff) restate one contract, casing/wording drift creeps in and undercuts the "one story"
+  goal.
+- **A template section with no gate ships blank.** Added a light checkbox gating the verification
+  guidance so an author can't tick the boxes and submit with empty steps (pr-eval backstops it, but the
+  template is the place to prevent it).
+- **Two-artifact verification contract confirmed sound** by the contributor walkthrough: guidance
+  (before, in the description, for the reviewer) vs. the manual-verification comment (after, as
+  evidence) is additive, not busywork, with a genuine stated rationale.

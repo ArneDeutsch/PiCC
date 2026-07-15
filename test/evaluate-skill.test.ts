@@ -262,6 +262,54 @@ describe("proposal-gate mode floor markers (evaluate-skill t04)", () => {
   });
 });
 
+describe("verification-contract repo artifacts (evaluate-skill t05)", () => {
+  // These files are read RAW (not via loadSkillBody), and `.gitattributes` does not
+  // force LF on `.md`, so on Windows they check out CRLF. Normalize \r\n → \n before
+  // any substring/line assertion, or the checks would flake cross-platform.
+  const readNorm = (p: string): string => fs.readFileSync(p, "utf8").replace(/\r\n/g, "\n");
+
+  const CONTRIBUTING_PATH = path.join(ROOT, "CONTRIBUTING.md");
+  const PR_TEMPLATE_PATH = path.join(ROOT, ".github", "pull_request_template.md");
+
+  it("the PR template exists", () => {
+    expect(fs.existsSync(PR_TEMPLATE_PATH)).toBe(true);
+  });
+
+  it("the PR template surfaces concrete verification guidance + the applicability escape + the comment acknowledgement", () => {
+    const raw = readNorm(PR_TEMPLATE_PATH);
+    const low = raw.toLowerCase();
+    // The automated-checks legs match CONTRIBUTING and the CI workflow.
+    expect(low).toContain("npm run typecheck");
+    expect(low).toContain("npm test");
+    // Concrete verification-guidance requirement (the plan a reviewer follows).
+    expect(low).toContain("manual verification guidance");
+    expect(low).toContain("start your review here");
+    expect(low).toContain("observable outcome");
+    // The applicability escape must be prominent so docs-only / fully-auto-tested
+    // changes are never nagged — AND the skill/prose-is-not-exempt distinction.
+    expect(low).toContain("no manual verification needed");
+    expect(low).toContain("not exempt");
+    // The author acknowledges they will post the evidence as a comment — canonical noun.
+    expect(raw).toContain("manual-verification comment");
+  });
+
+  it("CONTRIBUTING carries both artifacts (description guidance + manual-verification comment) and the applicability escape", () => {
+    const raw = readNorm(CONTRIBUTING_PATH);
+    const low = raw.toLowerCase();
+    // Artifact 1 — verification guidance in the PR description.
+    expect(low).toContain("verification _guidance_");
+    // Artifact 2 — the manual-verification comment as the author's evidence (canonical noun).
+    expect(raw).toContain("manual-verification comment");
+    // The applicability escape + the skill/harness/prose-is-not-docs distinction.
+    expect(low).toContain("no manual verification needed");
+    expect(low).toContain("docs-only");
+    expect(low).toContain("runtime surface");
+    // A concrete, cross-platform worked example launching picc against an examples/ fixture.
+    expect(low).toContain("node ../../bin/picc.mjs");
+    expect(low).toContain("examples/hello-claude");
+  });
+});
+
 describe("evaluator sandbox agent (evaluate-skill t01)", () => {
   const { agents, diagnostics } = loadAgents([{ dir: AGENTS_DIR, scope: "project" }]);
 

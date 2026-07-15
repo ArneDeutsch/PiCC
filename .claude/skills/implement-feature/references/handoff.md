@@ -24,7 +24,7 @@ writes and tell the user.
    ```
    Author **two distinct texts** — the audiences differ, so don't post one summary twice. Write each to its own temp file **outside the worktree**, each ending with the `<attribution trailer>`; apply **Rule 6** to both while distilling (no absolute paths, no raw output/diffs, no leakage). Echo both URLs in-session (Rule 7).
 
-   - **PR body — for the reviewer, who verifies the change in the running application.** Agents have already reviewed the code and GitHub's UI already shows the diff, so this is *not* a code tour; it is a semantic verification guide. For a change with no runnable UI — skill/harness/prose-only — "the running app" is **picc executing the changed behaviour**: give the steps to invoke that flow and the observable outcome to confirm (run the command, watch for the changed message/artifact — or its deliberate absence). Open with the linking line — `Closes #N` if Phase 8 judged the feature to **fully** deliver the ticket, else a bare `#N` (ticket stays open); **only that top line may carry a closing keyword — per Rule 3, strip any stray keyword+`#N` from the distilled "what was built"/verification sections** — then a short "what was built" (mild overlap with the comment is fine), then **"Start your review here"**: concrete, ordered steps to exercise the change and the behaviour to confirm at each step. Skeleton — answer every heading (an empty one reads "None"; never omit a heading):
+   - **PR body — for the reviewer, who verifies the change in the running application.** Agents have already reviewed the code and GitHub's UI already shows the diff, so this is *not* a code tour; it is a semantic verification guide. **First judge whether the change even warrants manual verification** (the same applicability rule `CONTRIBUTING.md` and the PR template state): a change with **no runtime surface to drive** — docs, comments — or one **fully and genuinely covered by automated tests** has nothing left to check by hand; write **"no manual verification needed: `<reason>`"** (naming the covering tests, if that is the reason) rather than inventing a step. For a change with no runnable UI — skill/harness/prose-only — **"the running app" is picc executing the changed behaviour**, so it **is not** exempt: give concrete, ordered steps to invoke that flow (which branch, how to launch picc — e.g. against an `examples/` project — the in-app actions) and the observable outcome to confirm (run the command, watch for the changed message/artifact — or its deliberate absence). Open with the linking line — `Closes #N` if Phase 8 judged the feature to **fully** deliver the ticket, else a bare `#N` (ticket stays open); **only that top line may carry a closing keyword — per Rule 3, strip any stray keyword+`#N` from the distilled "what was built"/verification sections** — then a short "what was built" (mild overlap with the comment is fine), then **"Start your review here"**: concrete, ordered steps to exercise the change and the behaviour to confirm at each step. Skeleton — answer every heading (an empty one reads "None"; never omit a heading):
      ```
      Closes #N            (or a bare  #N  when the ticket stays open)
 
@@ -34,7 +34,9 @@ writes and tell the user.
      ## Start your review here — verify in the running app
      <ordered steps: how to run/trigger the change and the behaviour to confirm at
      each step; call out edge cases and how to reach them. A semantic verification
-     guide, not a code tour.>
+     guide, not a code tour. If the change has no runtime surface (docs) or is fully
+     covered by automated tests, write "no manual verification needed: <reason>"
+     instead — but a skill/harness/prose change is NOT exempt (picc executes it).>
 
      ## Known limitations & test status
      <deliberate cuts / "Left open" in one line; then typecheck + suite green

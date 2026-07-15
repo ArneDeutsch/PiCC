@@ -69,6 +69,48 @@ with `it.skipIf`.
   Windows/Linux on Node 22 and 24.
 - Note any capability-registry or documentation updates in the PR description.
 
+### Manual verification
+
+Automated checks prove the code type-checks and the suite is green; they do **not** prove the
+change behaves as intended when picc actually runs it. So a change with a runtime surface carries a
+**manual-verification** expectation, split across **two distinct artifacts**:
+
+- **In the PR description — verification _guidance_** (the plan a reviewer follows). Be concrete, not
+  a vague "try it out": name the branch to check out, how to launch picc against a named `examples/`
+  project, exactly what to do inside the app to exercise the change (or confirm the bug is fixed),
+  and the **observable outcome** to expect. The `.github/pull_request_template.md` prompts for this.
+- **A manual-verification comment — the author's _evidence_** (posted as a PR comment). State what
+  you actually ran by hand and observed, on which OS/shell, and anything you could not verify.
+
+They are separate on purpose: the **guidance is written _before_ you verify**, so a reviewer can
+follow it independently; the **manual-verification comment is written _after_**, as evidence you
+actually ran it (the template body cannot hold it, so it is a comment).
+
+**When it applies — and the escape.** Manual verification is required only where the change has a
+runtime surface to drive. A **docs-only change** (or one **fully and genuinely covered by automated
+tests**) has nothing left to check by hand: write **"no manual verification needed: `<reason>`"** in
+the PR (naming the covering tests, if that is the reason) instead of inventing a step. **Do not
+mistake a skill / harness / prose change for docs** — picc *executes* it, so it **has** a runtime
+surface and is **not** exempt: "the running app" for such a change is picc running the changed flow,
+and you verify by driving that flow and observing the changed message or artifact (or its deliberate
+absence).
+
+**Worked example** (cross-platform — Windows Git Bash and Linux). Say you changed how a skill greets
+the user. Launch picc against the bundled `examples/hello-claude` fixture:
+
+```bash
+git checkout feature/<NN>-<slug>
+cd examples/hello-claude
+node ../../bin/picc.mjs        # runs picc in this directory (the target project)
+```
+
+Then, in the PR description under **Start your review here**, spell out the in-app steps and the
+outcome — e.g. "at the prompt type `/greet Ada`; the reply now opens with `<the new greeting>` instead
+of `<the old one>`, and a `greeted: Ada` line is appended to `greetings.log`." After you run those same
+steps yourself, post the manual-verification comment: e.g. "Ran the steps above on Windows 11 / Git
+Bash and on Ubuntu; saw the new greeting and the `greetings.log` entry on both; did not test the
+`--model` override."
+
 ## Reporting issues
 
 Include: your OS and shell, Node version, the project's relevant `.claude/` artifact (minimized if
