@@ -30,9 +30,10 @@ export type BackgroundTaskStatus = "running" | "completed" | "failed" | "stopped
 /**
  * One pending settlement notice returned by `drainSettlementNotices` (FIX 1):
  * the ready-to-deliver `content`, plus a `commit` the caller invokes ONLY after
- * a successful `pi.sendMessage` — flipping the dedup gate so the notice never
- * re-fires. Leaving `commit` un-called (a delivery throw) re-arms it for the
- * next drain, so no settlement is ever silently dropped.
+ * a successful `pi.sendMessage` — flipping the dedup gate so that eligible
+ * notice does not re-fire. Leaving `commit` uncalled after a delivery throw
+ * keeps it pending for the next drain; collected or superseded tasks remain
+ * intentionally ineligible.
  */
 export interface SettlementNotice {
   content: string;
@@ -654,7 +655,7 @@ function boundExcerpt(text: string): { excerpt: string; truncated: boolean } {
 }
 
 /**
- * Build the exactly-once settlement notice for a settled background task (t05):
+ * Build the bounded notice for an eligible current uncollected task (t05/F21):
  * the canonical validated identity, OUTCOME (vocabulary above), the capped
  * error when failed, and a bounded, clearly-framed UNTRUSTED excerpt of the
  * final/partial output. Pure — the caller owns dedup (via the registry) and

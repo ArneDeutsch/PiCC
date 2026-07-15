@@ -1475,6 +1475,7 @@ describe("Agent tool run_in_background (audit E4)", () => {
     const runtime = makeRuntime([makeAgent()], fakeSdk({ replies: [{ text: "x" }] }).sdk);
     const agentTool = createAgentToolDefinition(runtime, { depth: 0 }) as unknown as {
       description: string;
+      parameters: { properties?: Record<string, { description?: string }> };
     };
     const desc = agentTool.description;
     // No opt-in framing left ("Run the dispatch in the background" / bare "Returns
@@ -1482,6 +1483,21 @@ describe("Agent tool run_in_background (audit E4)", () => {
     expect(desc).toMatch(/background by default/i);
     expect(desc).toContain("run_in_background: false");
     expect(desc).toContain("TaskOutput");
+    // F21: a later notice is conditional, not promised after terminal collection.
+    expect(desc).toContain("latest task generation for an agent");
+    expect(desc).toContain("remains uncollected and unnotified");
+    expect(desc).toContain("later interactive turn starts");
+    expect(desc).toContain("one bounded notice");
+    expect(desc).toContain("running TaskOutput poll preserves eligibility");
+    expect(desc).toContain("terminal collection suppresses a not-yet-sent notice");
+    expect(desc).not.toContain("a settlement notice also arrives");
+
+    const runInBackground = agentTool.parameters.properties?.run_in_background?.description ?? "";
+    expect(runInBackground).toContain("latest generation gets one bounded");
+    expect(runInBackground).toContain("later-interactive-turn notice");
+    expect(runInBackground).toContain("only if it settles and remains uncollected and unnotified");
+    expect(runInBackground).toContain("running poll preserves eligibility");
+    expect(runInBackground).toContain("terminal collection suppresses a not-yet-sent notice");
   });
 
   it("TaskOutput with wait:false polls the running status without blocking", async () => {

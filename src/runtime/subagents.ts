@@ -1930,7 +1930,7 @@ export function createAgentToolDefinition(
     name: opts.name ?? "Agent",
     label: "Agent",
     description:
-      "Launch a subagent to handle a task. Pick subagent_type from the 'Available subagents' catalog by matching the task to the agent descriptions (omit it for a general-purpose agent). Subagents run in the background by default: the call returns a task id immediately and runs concurrently with any other dispatch in this turn, so collect the result with TaskOutput before you rely on it or finalize an answer (a settlement notice also arrives on a later turn). Pass run_in_background: false for a synchronous run that blocks this turn and returns the subagent's final message verbatim inline.",
+      "Launch a subagent to handle a task. Pick subagent_type from the 'Available subagents' catalog by matching the task to the agent descriptions (omit it for a general-purpose agent). Subagents run in the background by default: the call returns a task id immediately and runs concurrently with any other dispatch in this turn, so collect the result with TaskOutput before you rely on it or finalize an answer. If the latest task generation for an agent settles and remains uncollected and unnotified when a later interactive turn starts, it gets one bounded notice; a running TaskOutput poll preserves eligibility, while terminal collection suppresses a not-yet-sent notice. Pass run_in_background: false for a synchronous run that blocks this turn and returns the subagent's final message verbatim inline.",
     parameters: Type.Object({
       subagent_type: Type.String({ description: "Name of the agent to dispatch" }),
       prompt: Type.String({ description: "The task for the subagent" }),
@@ -1940,7 +1940,7 @@ export function createAgentToolDefinition(
       run_in_background: Type.Optional(
         Type.Boolean({
           description:
-            "Background is the default: omit (or pass true) to background the dispatch — it returns a task id immediately, to be collected with TaskOutput. Pass false for a synchronous run that blocks this turn and returns the final message inline.",
+            "Background is the default: omit (or pass true) to background the dispatch — it returns a task id immediately, to be collected with TaskOutput. The latest generation gets one bounded later-interactive-turn notice only if it settles and remains uncollected and unnotified; a running poll preserves eligibility, while terminal collection suppresses a not-yet-sent notice. Pass false for a synchronous run that blocks this turn and returns the final message inline.",
         }),
       ),
       description: Type.Optional(
@@ -2183,8 +2183,8 @@ export function createAgentToolDefinition(
  *    with its full prior context, via a full re-dispatch through
  *    `SubagentRuntime.dispatch({ resume })` (SECURITY MUST-FIX #1 — the entire
  *    enforcement stack is re-applied because it is the identical construction
- *    path). The tool returns an immediate ack; the run's outcome arrives via
- *    TaskOutput (and t05's settlement notice).
+ *    path). The tool returns an immediate ack; the run's outcome is available
+ *    via TaskOutput (and, while eligible/current/uncollected, a bounded notice).
  *
  * Parent-initiated ONLY: this tool is NEVER added to subagent toolsets
  * (`customToolsFor`) — no subagent→subagent or subagent→parent messaging. The
@@ -2285,7 +2285,8 @@ export function createSendMessageToolDefinition(
       }
 
       // Resume: flip the record to running eagerly (Claude 2.1.205 synchronous
-      // status flip; re-arms the t05 settled notice), then re-dispatch in the
+      // status flip; re-arms notice eligibility, subject to F21 collection and
+      // newest-generation checks), then re-dispatch in the
       // BACKGROUND under the SAME agent id through the shared construction path.
       // NIT-3: between this markResuming and the re-dispatch's session-creation
       // register(), the record is running with no live session handle — a second

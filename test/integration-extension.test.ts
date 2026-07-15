@@ -241,13 +241,18 @@ describe("skill activation", () => {
     // The async-researcher background agent (background: true) reaches the routing catalog…
     const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" })).systemPrompt as string;
     expect(prompt).toMatch(/- async-researcher( \(read-only\))?: Researches a question in the background/);
-    // …and the /bg-research command that dispatches it in the background and retrieves
-    // it via TaskOutput expands into the user turn, carrying its canary.
+    // …and the /bg-research command expands into the user turn with full-surface
+    // guidance. These assertions pin fixture text; focused lifecycle tests prove the
+    // terminal-suppression and running-poll branches behaviorally.
     const expanded = await pi.fire("input", { text: "/bg-research WASM ABI", source: "interactive" });
     expect(expanded.action).toBe("transform");
     expect(expanded.text).toContain("FS-BG-TASKOUTPUT");
     expect(expanded.text).toContain("run_in_background");
     expect(expanded.text).toContain("TaskOutput");
+    expect(expanded.text).toContain("running poll keeps the task eligible");
+    expect(expanded.text).toContain("one bounded next-turn settlement notice");
+    expect(expanded.text).toContain("terminal return is already delivery and suppresses");
+    expect(expanded.text).toContain("do not call TaskOutput again");
     expect(expanded.text).toContain("WASM ABI"); // $ARGUMENTS substituted
   });
 });

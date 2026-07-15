@@ -128,9 +128,12 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
   a dispatch registers the un-awaited run under a task id **by default** (`run_in_background: false`
   opts back into a blocking foreground run); `TaskOutput` waits/polls for the result (a failed task
   reports its cause, never an empty success), `TaskStop` requests a cooperative abort
-  (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces every dispatch to the foreground). Settlement of a
-  background dispatch is **pushed** to the coordinator at its next turn (a bounded, untrusted-framed
-  notice) so it learns the outcome without polling `TaskOutput`.
+  (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces every dispatch to the foreground). An eligible
+  uncollected current background task is **pushed** once to the coordinator at its next turn as a
+  bounded, untrusted-framed notice. A running `TaskOutput` poll preserves eligibility; successfully
+  returning a terminal record atomically counts as delivery and invalidates a not-yet-sent notice.
+  Retrieval after a delivered notice remains available and does not re-arm it. Resume generations
+  keep the existing newest-generation-wins supersession rule.
   Subagent `TaskOutput`/`TaskStop` are **scoped to the dispatcher's own tasks** (via
   `registry.scopedTo(ownerId)`, F13); the coordinator retains full session-wide reach.
 - `background-identity.ts` — shared validated and bounded background identity formatter, with fixed
@@ -231,9 +234,10 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers:
    the same guard runs inside every subagent session. By default the dispatch registers in the
    `BackgroundTaskRegistry` and returns a task id (`run_in_background: false` runs it inline instead;
    an agent's `background: true` frontmatter forces background; `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`
-   forces foreground); `TaskOutput`/`TaskStop` manage its lifecycle, and settlement is pushed to the
-   coordinator at its next `before_agent_start`. `SendMessage` (parent-only) resumes a finished
-   subagent by its agent id or steers a running background one.
+   forces foreground); `TaskOutput`/`TaskStop` manage its lifecycle, and an eligible uncollected
+   current settlement is pushed once at the coordinator's next `before_agent_start` (terminal
+   collection suppresses that pending push; a running poll does not). `SendMessage` (parent-only)
+   resumes a finished subagent by its agent id or steers a running background one.
 
 7. **`agent_settled` / compaction.** `agent_settled` fires the `Stop` hook (exit 2 re-prompts the
    agent to continue, capped at 8 consecutive blocks). `session_before_compact`/`session_compact`
@@ -275,15 +279,26 @@ principle in the plan (§2.1 mechanical fidelity).
   - **Foreground vs background.** The contract holds on both paths: a foreground dispatch throws
     the loud error (Pi renders it in its own error box) while a background dispatch lands a
     `failed`/`stopped` status that `TaskOutput` reports with the same named cause and partial
-    output. A background failure is **never** shown as completed. Retry behavior stays exactly
+    output. A terminal return delivers all output available for that run, including a cut-off
+    result; it is not a promise that another retrieval can recover a continuation. A stopped task
+    retains its outcome but deliberately discards final output, so its uncollected settlement notice
+    is outcome-only. A background failure is **never** shown as completed. Retry behavior stays exactly
     Pi's own — no extra recovery logic (`subagents.ts`/`background-tasks.ts`, feature.md §1).
     Note the **default direction now matches Claude**: PiCC dispatches **background-by-default**
     (Claude 2.1.198), so an implicit-concurrency fan-out parallelizes — each dispatch returns a task
     id collected via `TaskOutput`; `run_in_background: false` opts into a synchronous inline run and
     `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces every dispatch foreground. The formerly-headline
     default-direction gap (F15) is **closed**; the residual divergence that keeps
-    `feature.background-agents` partial is settlement *timing* — PiCC pushes the notice to an idle
-    parent on its next turn where Claude notifies mid-turn (see `feature.background-agents`).
+    `feature.background-agents` partial includes settlement *timing* — PiCC pushes an eligible
+    uncollected current task's notice to an idle parent on its next turn. Reporter observations
+    anthropics/claude-code#21343 (Claude Code 2.1.20 background agents) and
+    anthropics/claude-code#24752 describe late notification during an
+    active conversation, but official docs establish no exact mid-turn/next-turn timing. One-shot
+    print mode may finish before uncollected work can be surfaced. PiCC also intentionally suppresses
+    a not-yet-sent notice after terminal `TaskOutput` collection; reporter-observed Claude Code 2.1.x
+    can enqueue a redundant notification after retrieval, but public docs define no
+    notification-consumption semantics and reports establish no normative contract, so this is UX
+    hardening rather than verified parity (see `feature.background-agents`).
   - **One presentation for every dispatch (F14).** The `context: fork` path was the last place
     this contract diverged — a fork that died on a terminal error used to drop its partial output
     and crash rather than fail loudly. F14 closed that gap, so the fork path now conforms to the

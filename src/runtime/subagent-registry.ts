@@ -82,9 +82,9 @@ export interface SubagentRegistryRecord {
   /** Live session handle while running (steering target); dropped on settlement. */
   session?: SteerableSession;
   /**
-   * t05 settled-notice dedup: false = a settlement notice is still owed. Set
-   * false on every (re)dispatch so a resume RE-ARMS the notice (exactly one
-   * notice per settlement of the same ID — original or resumed).
+   * t05 settled-notice readiness gate. A (re)dispatch re-arms the agent-level
+   * gate, but F21 task-generation collection and newest-generation checks can
+   * suppress delivery; only an eligible current uncollected run is noticed.
    */
   settledNoticeConsumed: boolean;
 }
@@ -171,7 +171,8 @@ export class SubagentRegistry {
   /**
    * Mark a dispatch settled: drop the live session handle (it is disposed) and
    * flip the state, keeping name/ID/state/transcript-path + everything resume
-   * needs. The settled notice stays un-consumed (t05 owes exactly one notice).
+   * needs. The agent-level notice gate stays unconsumed; F21 may still suppress
+   * a notice after terminal collection or newest-generation supersession.
    * `settled.outcome`/`settled.usage` (t06) record the run's fate and per-
    * subagent usage for the /usage control command; each is stored only when
    * provided, so a settle that couldn't classify leaves the prior value intact.
@@ -220,12 +221,11 @@ export class SubagentRegistry {
   }
 
   /**
-   * t05 PEEK (FIX 1): is a settlement notice still owed for this agent ID?
-   * Returns true iff the record is settled and its notice is un-consumed —
-   * WITHOUT flipping the gate. The drain uses this to SELECT which notices to
-   * deliver; `consumeSettledNotice` flips the gate only AFTER the caller confirms
-   * a successful delivery, so a delivery throw leaves the notice armed and it
-   * re-fires on the next drain (never silently lost). Pure — no mutation.
+   * t05 PEEK (FIX 1): is the agent-level readiness gate armed for this ID?
+   * Returns true iff the record is settled and its gate is unconsumed, WITHOUT
+   * flipping it. The task registry separately checks F21 collection/current-
+   * generation eligibility. A delivery throw keeps an otherwise eligible notice
+   * armed for the next drain. Pure — no mutation.
    */
   isSettledNoticeArmed(agentId: string): boolean {
     const record = this.records.get(agentId);
@@ -233,10 +233,10 @@ export class SubagentRegistry {
   }
 
   /**
-   * t05 hand-off: consume the settled notice for an agent ID exactly once per
-   * settlement. Returns true the first time it is called after a settlement (or
-   * a resume's re-settlement), false thereafter — a resume re-arms it via
-   * `register()`. Returns false for unknown/still-running IDs.
+   * t05 agent-level hand-off: consume readiness once for the eligible current
+   * settlement selected by the background-task registry. Returns true on the
+   * first eligible hand-off after arming and false thereafter; terminal
+   * collection/newest-generation filtering happens before this gate.
    */
   consumeSettledNotice(agentId: string): boolean {
     const record = this.records.get(agentId);

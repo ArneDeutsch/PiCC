@@ -7,3 +7,7 @@
 - 2026-07-15 — A headline integration can traverse real registered tools yet still miss the intended runtime injection seam; the regression now injects through `onWired().subagentRuntime.setSdkForTest()` explicitly.
 - 2026-07-15 — Parameterized empty-output checks need exact equality because `toContain("")` is vacuous.
 - 2026-07-15 — Stopped tasks discard the final result but may retain a useful transcript, so outcome-only notices must distinguish unrecoverable final output from surviving session history.
+- 2026-07-15 — Plan review initially preserved `tool.TaskOutput: full`, but external reporter evidence showed Claude `block`/`timeout` inputs versus PiCC `wait`; truthful capability review must verify the whole existing schema, not only the feature's changed behavior.
+- 2026-07-15 — Settlement promises existed in always-injected model guidance and contributor comments beyond the obvious user docs/registry rows; contract audits need source-wide wording searches.
+- 2026-07-15 — Bare `#N` references to external-repository evidence are ambiguous in repository Markdown; use `owner/repo#N` for cross-repo provenance.
+- 2026-07-15 — Older entries under a still-Unreleased CHANGELOG can contradict current behavior even when the newest entry is correct; historical states need explicit supersession wording.

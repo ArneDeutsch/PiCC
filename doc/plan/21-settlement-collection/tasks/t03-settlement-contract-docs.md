@@ -12,14 +12,16 @@ The shipped contract is directional: PiCC intentionally treats a successfully re
 
 Reporter-observed Claude Code 2.1.x background-task behavior can enqueue a redundant notification after TaskOutput retrieval. Public documentation does not specify notification-consumption semantics, and available reports do not establish an exact normative background-subagent contract. PiCC suppression is therefore an intentional UX hardening, not verified parity; do not say Claude consumes notifications or that this matches Claude's intended behavior.
 
-Keep `tool.TaskOutput` at `full`: every documented input and terminal return remains functional, and collection-aware suppression is an explicitly disclosed PiCC-defined lifecycle hardening rather than a missing tool field. Keep `feature.background-agents` at `partial`, documenting both next-turn timing divergence and collection-aware suppression. Audit every settlement-push registry entry (`tool.Agent`, `tool.Task`, `tool.TaskOutput`, `tool.SendMessage`, `hook.event.Notification`, and `feature.background-agents`) so no unconditional or contradictory promise remains.
+Keep `tool.TaskOutput` truthful by changing it to `partial`: reporter evidence from Claude Code 2.1.20 and 2.1.206 shows `block` and `timeout` inputs, while PiCC exposes `wait` instead. This pre-existing schema-parity gap was discovered during t03 review; document it separately from F21's collection-aware suppression, which remains an explicitly disclosed PiCC-defined lifecycle hardening. Keep `feature.background-agents` at `partial`, documenting qualified reporter-observed timing behavior and collection-aware suppression. Audit every settlement-push registry entry (`tool.Agent`, `tool.Task`, `tool.TaskOutput`, `tool.SendMessage`, `hook.event.Notification`, and `feature.background-agents`) so no unconditional or contradictory promise remains.
 
 ## Writable surface
 
 - `README.md`
 - `src/runtime/subagents.ts`
+- `src/runtime/context-assembly.ts`
+- Contributor lifecycle comments in `src/runtime/subagent-registry.ts` and `src/runtime/background-tasks.ts`
 - `src/registry/capability-registry.ts`
-- `test/background-tasks.test.ts` and/or the existing tool-description assertion file
+- `test/background-tasks.test.ts`, `test/runtime-core.test.ts`, and/or existing guidance assertion files
 - `test/registry.test.ts`
 - `doc/supported-features.md` through `npm run gen:capabilities`
 - `doc/user-guide.md`
@@ -33,11 +35,12 @@ Keep `tool.TaskOutput` at `full`: every documented input and terminal return rem
 - Describe observable directional ordering, not internal flags or impossible global single-delivery claims.
 - Qualify settlement pushes as applying to eligible/uncollected current tasks; do not promise every historical generation is pushed.
 - Preserve and clearly distinguish the documented next-turn timing limitation, print-mode loss tracked separately, newest-generation supersession, bounded/untrusted notice framing, no idle-parent wake-up, and no `agent_completed` Notification hook.
-- Update model-facing Agent/Task descriptions so they no longer promise a later notice after terminal collection; pin that conditional wording in tests.
+- Update model-facing Agent/Task descriptions and always-injected harness guidance so they no longer promise a later notice after terminal collection or claim every uncollected result is lost; pin the conditional wording and print-mode reason in tests.
 - Treat cut-off terminal TaskOutput as delivery of all output available for that run; do not direct the model to repeat TaskOutput as though it could recover missing continuation. Likewise, describe uncollected stopped notices as outcome-only because no result is retained.
 - Regenerate, never hand-edit, `doc/supported-features.md`.
 - Add a concise `[Unreleased]` **Fixed** entry covering suppression plus preserved notices for running polls and eligible uncollected tasks.
-- Update both full-surface background-task artifacts; deterministic behavioral proof remains in tests.
+- Update both full-surface background-task artifacts and pin their new guidance in integration tests; deterministic lifecycle proof remains in focused runtime tests.
+- Audit older entries within the still-Unreleased CHANGELOG so historical wording does not contradict the new current contract.
 
 ## Left open
 
@@ -47,7 +50,7 @@ Keep `tool.TaskOutput` at `full`: every documented input and terminal return rem
 ## Testing
 
 - Update tool-description assertions to require conditional settlement-notice wording.
-- Update registry assertions to pin `tool.TaskOutput: full`, `feature.background-agents: partial`, collection-aware hardening language, truthful Claude-evidence scope, unchanged next-turn/print-mode limitations, and unchanged Notification-hook status.
+- Update registry assertions to pin `tool.TaskOutput: partial` with the `wait` versus reporter-observed Claude `block`/`timeout` schema gap, `feature.background-agents: partial`, collection-aware hardening language, qualified reporter-observed timing/evidence scope, unchanged next-turn/print-mode limitations, and unchanged Notification-hook status.
 - Grep/audit all registry settlement-notice claims for consistency.
 - Run `npm run gen:capabilities` twice and verify the second run is clean.
 - Run typecheck and the full test suite.
@@ -55,7 +58,7 @@ Keep `tool.TaskOutput` at `full`: every documented input and terminal return rem
 ## Acceptance criteria
 
 - [ ] Users and coordinating models can tell when terminal TaskOutput suppresses a later notice and when it does not.
-- [ ] Capability records identify PiCC's intentional hardening without overstating Claude parity; `tool.TaskOutput` remains full and background agents remain partial.
+- [ ] Capability records identify PiCC's intentional hardening without overstating Claude parity; `tool.TaskOutput` and background agents are both truthfully partial for their separately documented gaps.
 - [ ] README, runtime tool guidance, architecture, user guide, examples, CHANGELOG, registry tests, and generated matrix are consistent.
 - [ ] Next-turn, print-mode, newest-generation, cut-off, stopped-result, and Notification-hook limitations remain truthful.
 - [ ] Generated capability documentation is fresh and deterministic.
