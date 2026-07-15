@@ -24,10 +24,15 @@ The **entire** set of GitHub writes this skill may perform:
 **Nothing else.** Never merge, edit, label, reopen, lock, delete, or push; never open a PR; never
 touch anything outside this list. The `settings.json` deny floor is **defence-in-depth** for the write
 verbs this list omits: it denies the *common* `gh api` write forms (`-X`/`--method`/`-f`/`-F`/
-`--field`/`--raw-field`/`--input`, in the usual flag orderings), but a `*`-anywhere matcher **cannot**
-express "a write flag in any position", so the floor is best-effort, not a complete block. The real
-controls are the shell-free `evaluator` **sandbox** (structural) and this **envelope discipline** +
-the **close-invariant** (behavioral, trusted-coordinator) — not the floor.
+`--field`/`--raw-field`/`--input`, in the usual flag orderings — plus the space-separated and
+`=`-glued long-flag forms `--method=`/`--field=`/`--raw-field=`), but a `*`-anywhere matcher **cannot**
+express "a write flag in any position", so the floor is best-effort, not a complete block.
+**Documented residual:** the single-dash **shorthand-glued** forms (`-fname=…`, `-XPATCH`) are
+deliberately **not** on the floor — a matcher for them would false-positive on a repo/branch/path
+containing `-f`/`-x` and wrongly deny a legitimate *read*, the exact failure the floor must avoid; so
+they remain an accepted gap, consistent with the best-effort framing. The real controls are the
+shell-free `evaluator` **sandbox** (structural) and this **envelope discipline** + the
+**close-invariant** (behavioral, trusted-coordinator) — not the floor.
 
 **Close-invariant.** A close **always** carries the canned, category-selected comment (which contains
 **none** of the target's text); only a **keep-open** ever carries model-authored rating prose. So
@@ -82,6 +87,7 @@ The resolution `gh api` call is where a raw, free-form-parsed ref first reaches 
 
 ## Target-repo resolution
 
-Reuse `fork.md`'s `target` (the repo you read/comment/close on). Read, comment, and close all happen
-on `target`. The `push` / `pushRemote` half of fork resolution is **explicitly unused** — `evaluate`
-never pushes, opens a PR, or performs any worktree- or filesystem-mutating operation.
+Reuse [`fork.md`](../../implement-feature/references/fork.md)'s `target` (the repo you
+read/comment/close on). Read, comment, and close all happen on `target`. The `push` / `pushRemote`
+half of fork resolution is **explicitly unused** — `evaluate` never pushes, opens a PR, or performs
+any worktree- or filesystem-mutating operation.

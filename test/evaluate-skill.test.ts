@@ -417,6 +417,10 @@ describe("evaluate deny floor (evaluate-skill t01)", () => {
       "Bash(gh api * --field *)",
       "Bash(gh api * --raw-field *)",
       "Bash(gh api * --input *)",
+      // `=`-glued long-flag write forms (the `=` never appears in a GET path/--jq).
+      "Bash(gh api *--method=*)",
+      "Bash(gh api *--field=*)",
+      "Bash(gh api *--raw-field=*)",
     ];
     for (const matcher of expected) {
       expect(deny).toContain(matcher);
@@ -444,6 +448,10 @@ describe("evaluate deny floor (evaluate-skill t01)", () => {
     // gh api write bypass — long-form field flags.
     expect(isDenied("gh api repos/o/r/labels --field name=bug")).toBe(true);
     expect(isDenied("gh api repos/o/r/issues/5 --raw-field body=x")).toBe(true);
+    // gh api write bypass — `=`-glued long-flag forms.
+    expect(isDenied("gh api repos/o/r --method=PATCH")).toBe(true);
+    expect(isDenied("gh api repos/o/r/labels --field=name=bug")).toBe(true);
+    expect(isDenied("gh api repos/o/r/issues/5 --raw-field=body=x")).toBe(true);
   });
 
   it("does NOT deny the reads/writes both skills legitimately need", () => {
@@ -458,6 +466,10 @@ describe("evaluate deny floor (evaluate-skill t01)", () => {
     // A plain `--jq` GET read must survive the broadened write matchers — no
     // `-X`/`--method`/`-f`/`-F`/`--field`/`--raw-field`/`--input` flag present.
     expect(isDenied("gh api repos/o/r/issues/5 --jq '.state'")).toBe(false);
+    // Negative control for the `=`-glued matchers: a GET on a repo path containing a
+    // dash-letter sequence (`some-foo-repo`) must NOT be swept up — the `=`-glued
+    // long-flag forms only match a literal `--method=`/`--field=`/`--raw-field=`.
+    expect(isDenied("gh api repos/o/some-foo-repo/issues/5 --jq '.state'")).toBe(false);
     // Our comment writes and PR-diff read.
     expect(isDenied("gh issue comment 5 --body-file /tmp/body.md")).toBe(false);
     expect(isDenied("gh pr comment 5 --body-file /tmp/body.md")).toBe(false);

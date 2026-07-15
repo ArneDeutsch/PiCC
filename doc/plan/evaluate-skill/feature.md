@@ -131,9 +131,11 @@ raises PR-merge decisions to an evidence-backed assessment — so the maintainer
 - A human runs `/evaluate` on a PR and gets an assessment comment (never a merge), with a
   verification-request comment only when the change warrants manual verification and the author's
   manual-verification comment is absent.
-- A crafted malicious issue/PR cannot make the skill perform any write outside the fixed action
-  envelope; the coordinator never ingests its raw content (only the shell-free evaluator does), and its
-  text is never reflected into a public comment.
+- A crafted malicious issue/PR cannot reach the structural surfaces (the tool-gated evaluator cannot
+  write/fetch/run); on the coordinator path, writes are held to the fixed action envelope by the deny
+  floor + the text-is-data discipline + the close-invariant (behavioral controls, honestly not an
+  absolute block — see Safety). The coordinator does not ingest raw target content (redirect-to-file +
+  metadata-only queries), and no target-derived text is reflected verbatim into a public comment.
 - `CONTRIBUTING.md` and a PR template require and explain the manual-verification expectation.
 - typecheck and the full test suite are green.
 

@@ -115,6 +115,17 @@ URL ref, parse owner/repo/number and compare the parsed owner/repo against the t
 `target` rather than interpolating it — full gate in
 [references/write-discipline.md](references/write-discipline.md).
 
+**Resolving `<target>` for a bare ref.** For a bare `#N`/`N` ref, resolve `<target>` from the current
+checkout **before the first `gh` touch** — the **target-only** half of fork resolution: `origin`'s
+repo on a maintainer checkout, the **upstream `parent`** on a fork (`fork.md`'s `target`; the
+resolvable link lives in [references/write-discipline.md](references/write-discipline.md) under
+Target-repo resolution). `evaluate` uses **only** that `target` — the `push`/`pushRemote` half is
+unused, because it never pushes. A URL ref carries its own owner/repo, so its `<target>` is that
+validated owner/repo (no checkout resolution needed). **Remoteless reconcile:** unlike
+implement-feature, evaluate needs no *pushable* remote — but it still needs a *resolvable* `target` to
+read/comment on, so a **remoteless checkout with a bare ref** cannot resolve one and **stops with the
+usage/reachability message** below (a URL ref, which names its own repo, is unaffected).
+
 Then resolve type with a metadata-only query that returns no free text:
 
 ```
@@ -131,7 +142,7 @@ and route internally.
 **Reachability.** `evaluate` needs only **read + comment auth** — `gh` installed and on PATH, an
 authenticated `gh auth status`, and read/comment access to `<target>`. It does **not** require a
 pushable remote (do not inherit implement-feature's push-remote-demanding draft). On a no-arg,
-unparseable, wrong-host (not `github.com`), foreign-repo (owner/repo matches neither the resolved
+unparseable, wrong-host (not `github.com`), foreign-repo (owner/repo does not match the resolved
 `target`), or 404 ref, stop with a distinct, evaluate-authored usage/reachability message that names
 `/evaluate`, states the read+comment requirement, and **echoes the actual ref the user typed** (never
 a hardcoded example).

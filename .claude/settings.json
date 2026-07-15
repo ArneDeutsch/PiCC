@@ -33,7 +33,10 @@
       "Bash(gh api --input *)",
       "Bash(gh api * --field *)",
       "Bash(gh api * --raw-field *)",
-      "Bash(gh api * --input *)"
+      "Bash(gh api * --input *)",
+      "Bash(gh api *--method=*)",
+      "Bash(gh api *--field=*)",
+      "Bash(gh api *--raw-field=*)"
     ]
   }
 }
