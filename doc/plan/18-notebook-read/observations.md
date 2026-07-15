@@ -53,7 +53,27 @@ Raw running record (friction / bugs / opportunities). Distilled into `review.md`
     (unknown output_type / null cell) had no test. Both added. Lesson: an assertion that
     still passes under the exact bug it names is not coverage.
 
+## 2026-07-15 — Phase 7 t02 (wire-in + retier) review
+
+- t02 delivered clean; review fan-out (coder/security/tester/parity) all PASS.
+- Security confirmed the new `matchesRule` `NotebookRead` case routes to
+  `pathSpecifierMatches` with the read-only boundary intact and no subagent escalation;
+  the positive+negative permission test genuinely guards it. Tester confirmed the
+  dispatch-wiring test actually fails if the `allKnownToolNames` literal is removed (the
+  one real wiring risk is now covered).
+- Parity NIT folded in: registry note said "image outputs are noted by mime-type +
+  approximate size" but `image/svg+xml` is elided size-free → tightened to "image/binary
+  outputs … (raster images with an approximate base64 size)"; matrix regenerated.
+
 ## Deferred / out-of-scope opportunities (candidate follow-ups)
+
+- **No Read-family permission expansion (security, pre-existing).** Claude best-effort
+  applies a `Read(glob)` deny across read surfaces (Grep/Glob/@file). PiCC has no such
+  expansion — a `deny: Read(secrets/**)` covers only the `Read` tool, not Grep/Glob, and
+  now not NotebookRead either. Consistent with existing Grep/Glob behaviour, NOT a bug
+  introduced here, but making NotebookRead a real reader slightly widens the gap. Candidate
+  follow-up: implement a Read-family deny expansion (Grep/Glob/NotebookRead) — verify
+  against live Claude first whether `Read()` deny is meant to cover them.
 
 - **`Read` on a `.ipynb` still dumps raw JSON.** In Claude Code 2.1.x notebook reading
   lives in `Read` itself; PiCC's inherited `Read` has no notebook path. A project that

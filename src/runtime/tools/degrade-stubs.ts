@@ -38,10 +38,6 @@ export const DEGRADED_TOOLS: Array<{ name: string; note: string }> = [
     note: "notebook editing is not implemented; edit the .ipynb file as JSON with Read/Edit instead",
   },
   {
-    name: "NotebookRead",
-    note: "notebook reading is not implemented; Read the .ipynb file as JSON instead",
-  },
-  {
     name: "AskUserQuestion",
     note: "interactive question prompts are deliberately not provided; ask the user in plain chat instead (plan §7)",
   },
