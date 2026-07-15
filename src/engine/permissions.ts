@@ -563,6 +563,7 @@ export function matchesRule(
       case "Write":
       case "MultiEdit":
       case "NotebookEdit":
+      case "NotebookRead":
       case "Glob":
       case "Grep":
         return pathSpecifierMatches(specifier, safeCall, pathOpts);

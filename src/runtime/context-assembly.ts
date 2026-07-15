@@ -104,7 +104,7 @@ You are running a project authored for Claude Code. Honor its conventions:
 - Subagents: dispatch with the Agent tool; choose subagent_type by matching the task against the agent descriptions in the catalog. Subagents run in the background by default — a dispatch returns a task id, not the result — so several dispatched in one turn run concurrently; collect each result with TaskOutput before you rely on it or finalize an answer — otherwise its result is lost (or pass run_in_background: false for a synchronous inline result). The collected result is the subagent's final message verbatim — parse it as the calling skill specifies.
 - When a skill or instruction specifies an output format (e.g. a locked YAML block), reproduce it EXACTLY — downstream tooling parses it.
 - Worktrees: EnterWorktree/ExitWorktree isolate work; while inside one, all relative paths and shell commands run there.
-- Never use git commit --no-verify; project hooks must run.`;
+- Commits: when you're asked to commit — by the user, or by a skill or project instruction — first read the changes (git status/diff) and recent git log, and match this repository's commit-message style where it is richer; for a non-trivial change, still write a short body explaining why the change was made, not just what. Never use git commit --no-verify; project hooks must run.`;
 
 /**
  * Conservative memory-write policy (F10). Single-line string, shared verbatim by the

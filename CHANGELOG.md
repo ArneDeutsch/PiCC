@@ -72,6 +72,64 @@ All notable changes to PiCC are documented here. The format is based on
   fixture. The same concrete + applicability-aware standard governs pr-eval's enforcement and
   implement-feature's own creation-side guidance, so all three surfaces tell one consistent story.
 
+### Added — real cell-based `NotebookRead` (2026-07-15)
+
+- **`NotebookRead` is now a real tool that reads a Jupyter notebook (`.ipynb`) cell by cell**,
+  replacing the old degraded no-op that just pointed the model at the raw notebook JSON. Each cell is
+  presented with its index, type (code / markdown / raw), source, and — for code cells — its outputs
+  (stream text, `text/plain` and other text reprs, and error tracebacks), so a Claude-authored project
+  that touches notebooks gets usable structure instead of a wall of base64/metadata cruft. This closes
+  the **reading** half of the notebook parity gap.
+- **Tier is `partial`.** Image outputs are **noted, not rendered** visually — raster images
+  (`image/png`/`jpeg`/…) by mime-type with an approximate (base64-length) size, and other binary or
+  structured outputs (SVG, `application/json`) by mime-type only. This is a permanent design choice
+  (PiCC targets text-oriented GPT/Codex models). Oversized text outputs are head-truncated rather than
+  dumped into context. Single-cell selection (`cell_id`) is not currently supported — a scope cut, not
+  a permanent non-goal.
+- **Reach for `NotebookRead`, not `Read`, on a `.ipynb`.** PiCC's inherited `Read` tool does not
+  special-case notebooks, so `Read` on a `.ipynb` still returns the noisy raw JSON; `NotebookRead` is the
+  cell-based path. Worth knowing when debugging why a notebook read looks noisy.
+- **`NotebookEdit` remains a separate, larger follow-up** — it stays a degraded no-op (cell insert /
+  replace / delete and execution-count handling are out of scope here).
+
+### Added — real MultiEdit tool (2026-07-15)
+
+- **`MultiEdit` is now a real tool instead of a degraded no-op.** It takes a `file_path` and an array
+  of `{ old_string, new_string, replace_all? }` edits and applies them **sequentially and atomically**
+  to one file: each edit operates on the result of the previous one, matching is exact-string (an
+  `old_string` that is absent — or ambiguous without `replace_all` — is an error), an empty `old_string`
+  on the first edit of a new file creates it, and if **any** edit fails the whole batch is rejected and
+  the file is left untouched. Previously every `MultiEdit` call returned a notice telling the model to
+  fall back to a sequence of `Edit` calls, losing the all-or-nothing guarantee. It routes through the
+  same permission, hook, and path-scoped-injection machinery as `Edit`, and is grantable to subagents.
+- **Note — posture change:** because `MultiEdit` graduated from a no-op to a *real writer*, a project
+  can no longer treat MultiEdit-degradation as an implicit safety net. Its `Edit`/`MultiEdit` deny rules
+  are what hold — and an `Edit(…)` deny rule already covers `MultiEdit` (the file-edit family), so no
+  settings change is needed to keep an existing `Edit(…)` restriction effective.
+- **Registry + docs re-tiered.** `tool.MultiEdit` moves from `degraded-noop` to **full**, with an honest
+  note that the pinned Claude Code 2.1.x baseline itself no longer ships MultiEdit (removed in the 2.0
+  line) — so `full` means faithful to the pre-removal contract, kept as an older-project compatibility
+  courtesy. `doc/supported-features.md` was regenerated from the registry.
+
+### Added — richer git commit messages by default (2026-07-15)
+
+- **PiCC's always-on conventions block now carries a short commit-message nudge, so a
+  GPT/Codex model writes richer commit messages by default.** When the model is asked to
+  commit, it is nudged to first read the changes (`git status`/`diff`) and the recent
+  `git log`, match the repository's established commit-message style where that style is
+  richer, and — for a non-trivial change — include a short body explaining *why* the change
+  was made, not just what. **Why you'd care:** it narrows the visible quality gap between
+  Claude Code-authored and PiCC-authored commits on the same repo, so a repo's history stays
+  more consistent no matter which harness drafted the commit. This is a best-effort prompt nudge
+  that *approximates* Claude Code's commit quality — outcome is model-dependent, it does not
+  reproduce Claude Code's full commit ceremony (no HEREDOC commit form, no attribution
+  trailer, no parallel git batching), and it changes nothing about attribution
+  (`includeCoAuthoredBy`). The existing `git commit --no-verify` prohibition is preserved.
+  It applies to every project run under PiCC, not just this one. The lever if you want
+  different behavior is the existing per-model `steering` config, which layers on top of the
+  built-in default (see the user guide) — a contrary steering entry can, for example, tone a
+  commit message back down to a terse subject-only line.
+
 ### Changed — background-by-default subagent dispatch (2026-07-14)
 
 - **Subagent dispatch (`Agent`/`Task`) now runs in the background by default, matching Claude Code

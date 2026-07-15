@@ -84,6 +84,14 @@ describe("Edit rules gate all file-modification tools", () => {
     expect(matchesRule("NotebookEdit(nb/**)", call("NotebookEdit", { notebook_path: "nb/a.ipynb" }))).toBe(true);
     expect(matchesRule("MultiEdit(src/**)", call("MultiEdit", { file_path: "src/a.ts" }))).toBe(true);
   });
+
+  it("a path-scoped NotebookRead rule routes through pathSpecifierMatches (F18)", () => {
+    // The real NotebookRead reader shares Read's trust boundary, so a
+    // NotebookRead(<glob>) rule must match on notebook_path (in the glob) and
+    // NOT match one outside it — proving the new matchesRule switch case.
+    expect(matchesRule("NotebookRead(nb/**)", call("NotebookRead", { notebook_path: "nb/a.ipynb" }))).toBe(true);
+    expect(matchesRule("NotebookRead(nb/**)", call("NotebookRead", { notebook_path: "other/a.ipynb" }))).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
