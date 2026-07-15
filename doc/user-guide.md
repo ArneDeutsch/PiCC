@@ -355,7 +355,12 @@ background dispatches, idle-parent delivery is next-turn, and `context: fork`/ov
 are non-resumable. `maxTurns` is a best-effort cap. Auto memory (`MEMORY.md`) and agent `memory:`
 scopes load with full parity, but writes are conservative by default — memory is written only on
 an explicit request to remember, a deliberate divergence from Claude Code's proactive writes (opt
-into eager writes via `CLAUDE.md`).
+into eager writes via `CLAUDE.md`). `NotebookRead` reads a `.ipynb` cell by cell (source plus
+stream / `text/plain` / error outputs); it is partial because image and other binary outputs are
+noted by mime-type and approximate size rather than rendered visually, and oversized text outputs are
+head-truncated. Reach for `NotebookRead` (not the inherited `Read`, which does not special-case
+notebooks) when you want cell structure instead of raw notebook JSON; `NotebookEdit` remains a
+degraded no-op.
 
 **Degraded no-op (visible, never crashing):** MCP servers/tools, `ask`/`allow`/permission modes,
 plan mode, `AskUserQuestion`, checkpointing/rewind, output styles, agent teams, background

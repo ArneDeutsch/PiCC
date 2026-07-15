@@ -155,7 +155,8 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
   effort→thinking-level mapping (plan §10, §13.2).
 - `tools/` — the registered Claude-named tools: `web-tools.ts` (`WebFetch`/`WebSearch`, real),
   `search-tools.ts` (`Grep`/`Glob`), `task-tools.ts` (`Task*` tracking), `worktree-tools.ts`
-  (`EnterWorktree`/`ExitWorktree`), and `degrade-stubs.ts` (names that resolve for gating but no-op
+  (`EnterWorktree`/`ExitWorktree`), `notebook-tools.ts` (`NotebookRead`, real — parses a `.ipynb`
+  cell by cell into source + outputs), and `degrade-stubs.ts` (names that resolve for gating but no-op
   with a notice — `NotebookEdit`, `LSP`, `AskUserQuestion`, `ExitPlanMode`, …).
 
 ### `registry/` — the single source of truth for "what's supported"

@@ -6,6 +6,24 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — real cell-based `NotebookRead` (2026-07-15)
+
+- **`NotebookRead` is now a real tool that reads a Jupyter notebook (`.ipynb`) cell by cell**,
+  replacing the old degraded no-op that just pointed the model at the raw notebook JSON. Each cell is
+  presented with its index, type (code / markdown / raw), source, and — for code cells — its outputs
+  (stream text, `text/plain` results, and error tracebacks), so a Claude-authored project that touches
+  notebooks gets usable structure instead of a wall of base64/metadata cruft. This closes the **reading**
+  half of the notebook parity gap.
+- **Tier is `partial`, by a permanent design choice.** Image and other binary outputs are **noted** by
+  mime-type and approximate size, **not rendered** visually — PiCC targets text-oriented GPT/Codex
+  models — and oversized text outputs are head-truncated to a short placeholder rather than dumped into
+  context. Single-cell selection (`cell_id`) is not supported.
+- **Reach for `NotebookRead`, not `Read`, on a `.ipynb`.** PiCC's inherited `Read` tool does not
+  special-case notebooks, so `Read` on a `.ipynb` still returns the noisy raw JSON; `NotebookRead` is the
+  cell-based path. Worth knowing when debugging why a notebook read looks noisy.
+- **`NotebookEdit` remains a separate, larger follow-up** — it stays a degraded no-op (cell insert /
+  replace / delete and execution-count handling are out of scope here).
+
 ### Changed — background-by-default subagent dispatch (2026-07-14)
 
 - **Subagent dispatch (`Agent`/`Task`) now runs in the background by default, matching Claude Code
