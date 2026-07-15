@@ -36,6 +36,13 @@ export type BackgroundTaskStatus = "running" | "completed" | "failed" | "stopped
  */
 export interface SettlementNotice {
   content: string;
+  /**
+   * Final synchronous check immediately before delivery. A notice selected by a
+   * prior drain can become stale when its task is collected or a newer resume
+   * generation claims the same agent id.
+   */
+  isValid: () => boolean;
+  /** Commit only after a successful synchronous send. Idempotent. */
   commit: () => void;
 }
 
@@ -146,18 +153,17 @@ export interface BackgroundTaskRecord {
   /** Cooperative abort hook (wired to the dispatch's AbortController), if any. */
   abort?: () => void;
   /**
-   * t05 drain-fallback dedup (coder SHOULD-3): set once a settlement notice has
-   * been emitted for THIS record from the background record itself — the fallback
-   * path used ONLY when the agent id was never recorded in the subagent registry
-   * (an EARLY-guard failure that returned before register()). Disjoint from the
-   * registry's per-agent consume gate; ensures the fallback fires exactly once.
+   * Authoritative, task-generation-local settlement delivery state (F21). It is
+   * initialized to pending for every start() record. Optional only so structural
+   * test/diagnostic records created outside the registry retain compatibility;
+   * absence is interpreted as pending.
    */
-  settlementNoticeDelivered?: boolean;
+  settlementDelivery?: "pending" | "collected" | "notified";
 }
 
 /**
  * The minimal registry surface the TaskOutput/TaskStop tools consume (F13 t01):
- * exactly the five members both factories and {@link unknownIdError} call. The
+ * exactly the six members both factories and {@link unknownIdError} call. The
  * concrete {@link BackgroundTaskRegistry} satisfies it structurally, so the
  * coordinator keeps passing the full registry unchanged; a subagent instead
  * receives `registry.scopedTo(ownerId)` — a live-delegating, owner-filtered view
@@ -169,11 +175,29 @@ export interface BackgroundTaskView {
   ids(): string[];
   wait(id: string): Promise<BackgroundTaskRecord | undefined>;
   stop(id: string): { found: boolean; alreadySettled: boolean; abortRequested: boolean };
+  /** Mark a terminal task result as collected through TaskOutput. */
+  markCollected(id: string): boolean;
   subscribeProgress(id: string, listener: (snapshot: ProgressSnapshot) => void): () => void;
 }
 
 export class BackgroundTaskRegistry {
   private readonly tasks = new Map<string, BackgroundTaskRecord>();
+  /** O(1) authoritative newest-generation lookup by stable agent identity. */
+  private readonly newestTaskByAgent = new Map<string, BackgroundTaskRecord>();
+  /**
+   * Per-identity generation links keep the newest index authoritative when a
+   * settled result changes agent id, restoring the prior owner of the old id in
+   * O(1) while preserving task-start ordering on the corrected id.
+   */
+  private readonly identityLinks = new Map<
+    string,
+    {
+      agentId: string;
+      previous?: BackgroundTaskRecord;
+      next?: BackgroundTaskRecord;
+    }
+  >();
+  private readonly taskGeneration = new Map<string, number>();
   private counter = 0;
   /**
    * Live progress subscribers per task (F04 t02), fan-out via a Set. Emptied on
@@ -184,6 +208,53 @@ export class BackgroundTaskRegistry {
     string,
     Set<(snapshot: ProgressSnapshot) => void>
   >();
+
+  private setAgentIdentity(record: BackgroundTaskRecord, agentId: string | undefined): void {
+    const oldLink = this.identityLinks.get(record.id);
+    if (oldLink?.agentId === agentId) {
+      record.agentId = agentId;
+      return;
+    }
+
+    if (oldLink) {
+      const previousLink = oldLink.previous
+        ? this.identityLinks.get(oldLink.previous.id)
+        : undefined;
+      const nextLink = oldLink.next ? this.identityLinks.get(oldLink.next.id) : undefined;
+      if (previousLink) previousLink.next = oldLink.next;
+      if (nextLink) nextLink.previous = oldLink.previous;
+      if (this.newestTaskByAgent.get(oldLink.agentId) === record) {
+        if (oldLink.previous) this.newestTaskByAgent.set(oldLink.agentId, oldLink.previous);
+        else this.newestTaskByAgent.delete(oldLink.agentId);
+      }
+      this.identityLinks.delete(record.id);
+    }
+
+    record.agentId = agentId;
+    if (!agentId) return;
+
+    // Initial identities append in generation order. A corrected settled id can
+    // move an older task into an existing chain, so insert it by task generation
+    // rather than by settlement timing. This update is rare and may walk that
+    // identity's chain; every delivery-time newest check remains O(1).
+    const generation = this.taskGeneration.get(record.id) ?? 0;
+    let previous = this.newestTaskByAgent.get(agentId);
+    let next: BackgroundTaskRecord | undefined;
+    while (previous && (this.taskGeneration.get(previous.id) ?? 0) > generation) {
+      next = previous;
+      previous = this.identityLinks.get(previous.id)?.previous;
+    }
+    if (previous) {
+      const previousLink = this.identityLinks.get(previous.id);
+      if (previousLink) previousLink.next = record;
+    }
+    if (next) {
+      const nextLink = this.identityLinks.get(next.id);
+      if (nextLink) nextLink.previous = record;
+    }
+    this.identityLinks.set(record.id, { agentId, previous, next });
+    if (!next) this.newestTaskByAgent.set(agentId, record);
+  }
 
   /**
    * Register a running dispatch. The returned id ("task-1", ...) is what the
@@ -199,7 +270,9 @@ export class BackgroundTaskRegistry {
     agentType?: string,
     owner?: string,
   ): string {
-    const id = `task-${++this.counter}`;
+    const generation = ++this.counter;
+    const id = `task-${generation}`;
+    this.taskGeneration.set(id, generation);
     const record: BackgroundTaskRecord = {
       id,
       label,
@@ -215,13 +288,15 @@ export class BackgroundTaskRegistry {
       diagnostics: [],
       settled: Promise.resolve(),
       abort,
+      settlementDelivery: "pending",
     };
     record.settled = promise.then(
       (result) => {
         record.agentName = result.agentName;
         // Identity mirror (t02): the settled result is authoritative (the
-        // pre-minted id matches it when the Agent tool passed one through).
-        record.agentId = result.agentId ?? record.agentId;
+        // pre-minted id normally matches it). Update the generation index too:
+        // an early record may first acquire or may correct its stable id here.
+        this.setAgentIdentity(record, result.agentId ?? record.agentId);
         record.transcriptPath = result.transcriptPath;
         record.resumable = result.resumable === true;
         record.truncated = result.truncated === true;
@@ -267,6 +342,7 @@ export class BackgroundTaskRegistry {
       this.progressListeners.delete(id);
     });
     this.tasks.set(id, record);
+    this.setAgentIdentity(record, agentId);
     return id;
   }
 
@@ -335,26 +411,17 @@ export class BackgroundTaskRegistry {
   }
 
   /**
-   * t05: SELECT one settlement notice for every background task that has settled
-   * (completed / failed / stopped) and not yet been announced — WITHOUT flipping
-   * any dedup gate (FIX 1: peek, don't consume). Each returned {@link
-   * SettlementNotice} carries the ready-to-send `content` plus a `commit` closure
-   * the caller invokes ONLY after `pi.sendMessage` returns without throwing:
-   *   - `isArmed`/`commit` are the SubagentRegistry's `isSettledNoticeArmed` /
-   *     `consumeSettledNotice`, keyed by agent id — peek then flip;
-   *   - for the disjoint drain-fallback (registry miss), `commit` sets the
-   *     background record's own `settlementNoticeDelivered` flag.
-   * A delivery that throws leaves its notice UN-committed → the next
-   * before_agent_start drain re-fires it (the exact silent-loss the feature
-   * kills), and a throw on one notice never blocks the others.
+   * Select pending settlement notices without consuming them. Every newest task
+   * record claims its stable agent id before eligibility checks, including a
+   * running, collected, or already-notified resume generation; this prevents an
+   * older generation from falling through the newest-generation policy.
    *
-   * Iterates NEWEST-first and de-dups per agent id within the pass (a `selected`
-   * set) so that after a resume the FRESH resumed run's record — not the stale
-   * prior one sharing the agent id — is the one selected (resume-newest-wins),
-   * exactly as the single-consume gate used to enforce implicitly. Running tasks
-   * are skipped; a task whose agent id has no registry record at all (an
-   * early-guard failure that returned before register()) takes the disjoint
-   * drain-fallback below.
+   * `isValid` is the final synchronous compare-and-set seam for the production
+   * delivery loop. It checks task-local pending state, continued newest ownership,
+   * and (for registered tasks) the external readiness gate. There must be no
+   * await between that check, synchronous send, and `commit`. A failed send leaves
+   * the record pending; commit after a successful send marks this exact task run
+   * notified and consumes the agent-level readiness gate.
    */
   drainSettlementNotices(
     isArmed: (agentId: string) => boolean,
@@ -362,50 +429,37 @@ export class BackgroundTaskRegistry {
     hasRegistryRecord?: (agentId: string) => boolean,
   ): SettlementNotice[] {
     const notices: SettlementNotice[] = [];
-    // Per-drain dedup: with the gate no longer flipped mid-scan, this preserves
-    // "newest record for an agent id wins" (resume-newest-wins) — the first
-    // (newest, reverse order) eligible record claims the id; older ones skip.
     const selected = new Set<string>();
+
     for (const task of [...this.tasks.values()].reverse()) {
-      if (task.status === "running") continue;
       const agentId = task.agentId;
-      if (!agentId) continue;
-      if (selected.has(agentId)) continue;
-      // Registry consume path — PEEK only; the commit closure flips the gate
-      // after a confirmed delivery.
-      if (isArmed(agentId)) {
-        selected.add(agentId);
-        notices.push({
-          content: buildSettlementNotice(task),
-          commit: () => commit(agentId),
-        });
-        continue;
-      }
-      // Drain-fallback (coder SHOULD-3): a background dispatch that failed at an
-      // EARLY guard (bad id / no agent / depth / pre-aborted) returned BEFORE the
-      // subagent registry ever recorded its agent id, so `isArmed` can never fire
-      // for it and its failure would otherwise be retrievable only via TaskOutput
-      // ("announced without TaskOutput" violated). When the registry has NO record
-      // for this agent id (a true miss — DISJOINT from "armed/consumed/mid-resume",
-      // which all HAVE a record and are owned by the consume gate above), emit the
-      // notice from the background record itself, exactly once (its own flag, set
-      // by `commit` only after delivery). A normally-registered task always has a
-      // registry record (register() runs synchronously before the record settles),
-      // so it can never reach this path and can never be double-announced.
+      if (!agentId || selected.has(agentId)) continue;
+      // Claim first: an ineligible newest generation permanently supersedes old
+      // records sharing this stable agent identity.
+      selected.add(agentId);
       if (
-        hasRegistryRecord &&
-        !hasRegistryRecord(agentId) &&
-        !task.settlementNoticeDelivered
-      ) {
-        selected.add(agentId);
-        const record = task;
-        notices.push({
-          content: buildSettlementNotice(task),
-          commit: () => {
-            record.settlementNoticeDelivered = true;
-          },
-        });
-      }
+        task.status === "running" ||
+        (task.settlementDelivery ?? "pending") !== "pending"
+      ) continue;
+
+      const registered = hasRegistryRecord?.(agentId) !== false;
+      const fallback = hasRegistryRecord !== undefined && !registered;
+      if (!fallback && !isArmed(agentId)) continue;
+
+      const isValid = (): boolean =>
+        (task.settlementDelivery ?? "pending") === "pending" &&
+        task.status !== "running" &&
+        this.newestTaskByAgent.get(agentId) === task &&
+        (fallback || isArmed(agentId));
+      notices.push({
+        content: buildSettlementNotice(task),
+        isValid,
+        commit: () => {
+          if (!isValid()) return;
+          task.settlementDelivery = "notified";
+          if (!fallback) commit(agentId);
+        },
+      });
     }
     return notices;
   }
@@ -423,6 +477,20 @@ export class BackgroundTaskRegistry {
     const task = this.tasks.get(id);
     if (task) await task.settled;
     return task;
+  }
+
+  /**
+   * Mark terminal TaskOutput retrieval for this concrete task generation. The
+   * transition is idempotent; retrieval after notification remains notified and
+   * a running poll cannot suppress its eventual notice.
+   */
+  markCollected(id: string): boolean {
+    const task = this.tasks.get(id);
+    if (!task || task.status === "running") return false;
+    if ((task.settlementDelivery ?? "pending") === "pending") {
+      task.settlementDelivery = "collected";
+    }
+    return true;
   }
 
   /**
@@ -474,6 +542,7 @@ export class BackgroundTaskRegistry {
       wait: async (id) => (owns(id) ? this.wait(id) : undefined),
       stop: (id) =>
         owns(id) ? this.stop(id) : { found: false, alreadySettled: false, abortRequested: false },
+      markCollected: (id) => (owns(id) ? this.markCollected(id) : false),
       subscribeProgress: (id, listener) =>
         owns(id) ? this.subscribeProgress(id, listener) : () => {},
     };
