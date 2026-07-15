@@ -118,6 +118,7 @@ describe("tool-map", () => {
   it("reports touched files only for file tools", () => {
     expect(touchedFilePath("read", { path: "a.ts" })).toBe("a.ts");
     expect(touchedFilePath("edit", { file_path: "b.ts" })).toBe("b.ts");
+    expect(touchedFilePath("MultiEdit", { file_path: "x.ts" })).toBe("x.ts");
     expect(touchedFilePath("bash", { command: "cat a.ts" })).toBeUndefined();
   });
 });

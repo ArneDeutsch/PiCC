@@ -52,6 +52,7 @@ describe("tool surface registration", () => {
       "Grep",
       "Glob",
       "NotebookRead",
+      "MultiEdit",
       "EnterWorktree",
       "ExitWorktree",
       "TaskCreate",
@@ -396,6 +397,31 @@ describe("permission + hook enforcement (guard)", () => {
     const second = pi.messages.map((m) => String(m.message.content)).join("\n");
     expect(second).not.toContain("FS-NESTED-SRC-CLAUDE-MD");
     expect(second).not.toContain("FS-RULE-RUST-PATHSCOPED");
+  });
+
+  it("injects nested CLAUDE.md + path-scoped rule on a MultiEdit's first src/ touch", async () => {
+    // Do NOT reuse the shared `pi`: its once-per-session src/ injection is already
+    // consumed by the first-touch read test above. A freshly-wired instance has
+    // pristine injection-dedup state, so this proves MultiEdit specifically flows
+    // through on-touch nested-CLAUDE.md / path-scoped-rule injection, end-to-end,
+    // as its first `src/` touch — with no fixture edit.
+    const freshPi = fakePi();
+    picc(freshPi.api as never);
+    // built-in overrides register via an async IIFE — give it a beat (parity with beforeAll)
+    await new Promise((r) => setTimeout(r, 500));
+
+    freshPi.messages.length = 0;
+    await freshPi.fire("tool_call", {
+      toolName: "MultiEdit",
+      toolCallId: "me1",
+      input: {
+        file_path: path.join(dir, "src", "main.rs"),
+        edits: [{ old_string: "fn main", new_string: "fn main" }],
+      },
+    });
+    const injected = freshPi.messages.map((m) => String(m.message.content)).join("\n");
+    expect(injected).toContain("FS-NESTED-SRC-CLAUDE-MD");
+    expect(injected).toContain("FS-RULE-RUST-PATHSCOPED");
   });
 
   it("fires PostToolUse hooks gated by if: Bash(git *) only for git commands", async () => {

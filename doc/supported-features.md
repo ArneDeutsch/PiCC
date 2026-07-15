@@ -31,6 +31,7 @@ Built-in tool names a project can reference in `tools:`, `permissions.*`, or a h
 | `tool.ExitWorktree` | full | keep\|remove lifecycle with cwd restore, Windows-tolerant removal (§4.4) |
 | `tool.Glob` | full | real implementation — file pattern matching |
 | `tool.Grep` | full | real implementation — Claude-baseline parameter surface (-n, -A/-B/-C/context, -i, -o, type, glob, multiline, content/files_with_matches/count modes, head_limit/offset) with ripgrep/JS engine parity (§4.8) |
+| `tool.MultiEdit` | full | real implementation of the historical Claude Code MultiEdit — NOTE the pinned Claude Code baseline no longer ships MultiEdit — removed in the 2.0 line, confirmed gone by v2.0.8 — so `full` means faithful to the pre-removal contract, a superset of the pinned baseline kept as an older-project compatibility courtesy, NOT 'matches current Claude Code': batched, strictly exact-string edits (no fuzzy fallback, unlike PiCC's Edit) applied sequentially to one running buffer (each edit sees the prior edit's result), atomic (any miss rejects the whole batch, file left untouched), per-edit replace_all with unique-else-error, and an empty old_string on the first edit of a new file creates it (§4.8) |
 | `tool.Read` | full | real implementation — file reads with Claude-shaped input |
 | `tool.Skill` | full | skill activation by name with argument substitution (§4.1) |
 | `tool.TaskCreate` | full | current task-tracking surface (§4.8) |
@@ -58,7 +59,6 @@ Built-in tool names a project can reference in `tools:`, `permissions.*`, or a h
 | `tool.KillShell` | degraded-noop | callable no-op stub — background shells not implemented; there is no shell to kill (§4.8) |
 | `tool.LSP` | degraded-noop | callable no-op stub — LSP tooling out of scope; the notice directs Grep/Read navigation (§7) |
 | `tool.mcp__*` | degraded-noop | MCP deferred — mcp__* names gate/match predictably, calls degrade with a notice (§7) |
-| `tool.MultiEdit` | degraded-noop | callable no-op stub — batch editing not implemented; the notice directs a sequence of Edit calls (§4.8) |
 | `tool.NotebookEdit` | degraded-noop | callable no-op stub — notebook editing not implemented; the notice directs editing the .ipynb as JSON via Read/Edit (§4.8, §7) |
 
 ## Hook events (18)
@@ -205,4 +205,4 @@ Cross-cutting runtime subsystems and behaviors.
 
 ## Summary
 
-The registry enumerates **149 capabilities** against baseline `claude-code-2.1.x (mid-2026)`: **79 full**, **20 partial**, **41 degraded-noop**, **9 not-supported**. 5 entries are safety-relevant (marked ⚠) — a divergence where a project's restriction is not enforced and is therefore reported prominently. Unknown inputs outside this registry are not counted here: they are unassessed by definition and degrade safely at runtime (plan §2.4).
+The registry enumerates **149 capabilities** against baseline `claude-code-2.1.x (mid-2026)`: **80 full**, **20 partial**, **40 degraded-noop**, **9 not-supported**. 5 entries are safety-relevant (marked ⚠) — a divergence where a project's restriction is not enforced and is therefore reported prominently. Unknown inputs outside this registry are not counted here: they are unassessed by definition and degrade safely at runtime (plan §2.4).
