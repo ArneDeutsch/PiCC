@@ -240,7 +240,7 @@ Disable built-ins: `permissions.deny: ["Agent(Explore)"]`; disable all delegatio
 
 ### 2.6 What loads into a subagent + what returns
 
-**Fresh isolated context** contains: the agent's own system prompt + env; the delegation/task message Claude writes; the full CLAUDE.md/memory hierarchy (except Explore/Plan); a git-status snapshot (except Explore/Plan, or when `includeGitInstructions:false`); preloaded skills. It does **not** see conversation history, previously invoked skills, or files already read. **Returns:** only its final text summary. (Nested subagents up to depth 5; only the top-level summary reaches the user.)
+**Fresh isolated context** contains: the agent's own system prompt + env; the delegation/task message Claude writes; the full CLAUDE.md/memory hierarchy (except Explore/Plan); a git-status snapshot (except Explore/Plan, or when `includeGitInstructions:false`); preloaded skills. It does **not** see conversation history (except a fork — see §2.9), previously invoked skills, or files already read. **Returns:** only its final text summary. (Nested subagents up to depth 5; only the top-level summary reaches the user.)
 
 **Resume:** on completion Claude gets an `agentId`; Claude resumes via the `SendMessage` tool (`to` = id or name) with full prior context. Transcripts persist at `~/.claude/projects/{project}/{sessionId}/subagents/agent-{agentId}.jsonl`.
 
@@ -259,6 +259,29 @@ When enabled, the system prompt gets memory read/write instructions + the first 
 ### 2.8 Skills vs subagents
 
 Use a **subagent** when work is verbose/self-contained and returns a summary, or to enforce tool restrictions. Use a **skill** (runs in the *main* conversation context) for reusable prompts/workflows. They compose: a skill with `context: fork` runs in a subagent; a subagent with `skills:` preloads skill content.
+
+### 2.9 Fork the current conversation (`subagent_type: "fork"`)
+
+`subagent_type: "fork"` is the one subagent type that does **not** start fresh: it **inherits the parent conversation**. Documented Claude semantics (Claude sub-agents docs; PiCC ticket [#28](https://github.com/ArneDeutsch/PiCC/issues/28)):
+
+- The fork starts with the **parent session's full message history** already in context, so it can answer about and act on what the parent was doing without being re-told.
+- It runs with the **same system prompt, tools, and model** as the parent, and — because it is byte-identical to the parent up to the fork point — **shares the prompt cache** (a cost saving over a fresh subagent).
+- **Output isolation is kept**: only the fork's final summary returns to the parent; its intermediate steps do not leak back.
+- Gated by the **`CLAUDE_CODE_FORK_SUBAGENT`** environment variable; introduced behind a version gate (~v2.1.117+) as a staged rollout.
+- A **fork cannot spawn another fork** (no recursive fork inheritance).
+- Fork mode also **strips the Agent tool's `run_in_background` parameter** and forces every spawn to background.
+
+**PiCC's implementation (F16) and its disclosed limits:**
+
+- **Main-session dispatch only.** Fork inheritance is honored only for a dispatch made *by the main/root session* (`opts.depth === 1`). A `"fork"` requested from within a nested subagent cannot reach its own dispatcher's conversation — the runtime only exposes the root transcript — so it **visibly degrades** to fresh context rather than seed the *wrong* (root) conversation into it. This is a security boundary as much as a fidelity one: it stops a tool-restricted subagent from forking the root conversation into itself.
+- **System prompt is a same-context *reconstruction*, not byte-identical.** PiCC is an extension *on* a Pi-created session and does not own Pi's assembled base prompt, so the fork reuses the parent's project rules/skills/memory/steering reconstruction. Consequence: the fork **loses the prompt-cache cost saving** a byte-identical fork would get.
+- **File-based seeding via `SessionManager.forkFrom`.** The fork seeds a **brand-new persisted child transcript** from the parent's on-disk transcript file (the parent file is never touched). It is forced **non-resumable** — the inherited context is the parent conversation *at fork time* and cannot be safely re-derived, so `SendMessage` refuses it. Staleness caveat: the seed is a point-in-time copy of the parent transcript file.
+- **Unset ⇒ enabled.** PiCC treats `CLAUDE_CODE_FORK_SUBAGENT` unset as **on** (a deliberate parity choice, since Claude's unset default is an under-specified staged rollout); `=1` forces on, a present-but-off value (`=0`/`false`/…) forces an explicit visible degrade. This divergence is *directional*: PiCC may inherit where a staged-rollout Claude with fork unset would run fresh.
+- **Model overrides stay honored.** The inherited parent model is still overridden by an operator `CLAUDE_CODE_SUBAGENT_MODEL` env and by a per-call `model` argument on the fork dispatch.
+- **Fork-cannot-spawn-fork** is enforced via a runtime-set dispatcher marker (a fork's granted Agent/Task tools carry it); a nested fork request is a visible refusal, not a silent no-op. (The exact Claude enforcement mechanism is undocumented — this is INFERRED.)
+- **Reserved-name edge — `context: fork` skill named `fork`.** `"fork"` is a reserved subagent type, so a *skill* with `context: fork` whose frontmatter also names its agent literally `fork` dispatches with `subagent_type: "fork"` and is therefore honored as a **conversation-inheriting** fork (not the skill-`context:fork` max-isolation path). Ordinary `context: fork` skills dispatch under a `fork:<skill>` type and are unaffected. This is a pathological naming collision; PiCC treats it as reserved-name-wins (consistent with a project agent named `fork` being shadowed by the reserved type). Whether Claude reserves `agent: fork` *inside* a skill is unverified against its docs — flagged as a potential follow-up.
+- **Every non-inheriting case degrades *visibly*.** Env-off, nested dispatcher, no parent transcript (print/headless/no-session), fork-spawns-fork, SDK cannot fork, or a `forkFrom` throw all run with fresh context **and** surface a specific footer notice (never the generic "unknown subagent_type" warning). By-design cases (env off, fork-spawns-fork) are toned calmly; genuine can't-do cases are warnings.
+- **Deferred / not adopted:** print/headless/no-session support; the `run_in_background`-removal side effect (PiCC keeps F15 background-by-default and **retains** `run_in_background:false` as a synchronous selector); `isolation:"worktree"` on a fork (the fork shares the parent cwd); the version gate is not mirrored. PiCC also deliberately does **not** reproduce Claude's interactive named-fork zero-context regression ([anthropics/claude-code#76019](https://github.com/anthropics/claude-code/issues/76019)).
 
 ---
 

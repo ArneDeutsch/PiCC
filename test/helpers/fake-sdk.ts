@@ -34,6 +34,13 @@ type RealSessionManager = {
   create(cwd: string, sessionDir: string, opts: { id: string }): PiSessionManagerLike;
   /** Reopen a transcript for resume (t04) — SessionManager.open. */
   open(path: string, sessionDir?: string, cwdOverride?: string): PiSessionManagerLike;
+  /** Fork a NEW transcript seeded from a source's full history (F16) — SessionManager.forkFrom. */
+  forkFrom(
+    sourcePath: string,
+    targetCwd: string,
+    sessionDir: string,
+    opts: { id: string },
+  ): PiSessionManagerLike;
 };
 let realSessionManager: RealSessionManager | undefined;
 
@@ -85,6 +92,13 @@ export interface FakeSessionState {
   steerMessages: string[];
   /** Messages delivered via `followUp()` (t04). */
   followUpMessages: string[];
+  /**
+   * Count of messages this session INHERITED from a fork seed (F16) — pre-loaded
+   * into `messages` before the first prompt(), mirroring real Pi's forkFrom which
+   * seeds the child session with the parent's history. `0` for a fresh (non-fork
+   * or degraded-fork) session, so "fresh vs fork" is a one-line differential.
+   */
+  inheritedMessageCount: number;
 }
 
 export interface FakeSdkOptions {
@@ -117,6 +131,20 @@ export interface FakeSdkOptions {
    * undefined with no crash when the SDK/session cannot report stats.
    */
   noGetSessionStats?: boolean;
+  /**
+   * Seed the parent history a `subagent_type: "fork"` inherits (F16). The fake
+   * `forkSessionManager` captures these; `createAgentSession` pre-populates the
+   * child session's `messages` from them (real Pi's forkFrom pre-loads the same
+   * history from the source transcript FILE). Undefined ⇒ an empty inherited
+   * history. Ignored when the real SessionManager seam is injected (that path
+   * exercises the genuine on-disk forkFrom).
+   */
+  forkSeed?: PiSessionMessage[];
+  /**
+   * Omit `forkSessionManager` from the fake SDK (F16): proves the "SDK cannot
+   * fork" degrade path (a `"fork"` dispatch then runs fresh with a notice).
+   */
+  noForkSessionManager?: boolean;
 }
 
 export interface FakeSdkHandle {
@@ -127,6 +155,8 @@ export interface FakeSdkHandle {
   sessions: FakeSessionState[];
   abortCalls: () => number;
   promptCalls: () => number;
+  /** Args of every forkSessionManager call, in order (F16 wiring assertions). */
+  forkCalls: () => Array<{ sourcePath: string; cwd: string; sessionDir: string; id: string }>;
 }
 
 export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
@@ -136,6 +166,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
   let abortCalls = 0;
   let promptCalls = 0;
   let replyIndex = 0;
+  const forkCalls: Array<{ sourcePath: string; cwd: string; sessionDir: string; id: string }> = [];
 
   const normalize = (reply: string | FakeReply | undefined): FakeReply =>
     typeof reply === "string" ? { text: reply } : (reply ?? { text: "" });
@@ -150,6 +181,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
         listenerCount: () => 0,
         steerMessages: [],
         followUpMessages: [],
+        inheritedMessageCount: 0,
       };
       sessions.push(state);
       // Persistence mirror (t02): real AgentSessions write every message
@@ -157,8 +189,17 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
       // dispatch handed them one with appendMessage (the real SessionManager
       // from persistedSessionManager below; the in-memory `{}` is a no-op).
       const manager = sessionOptions.sessionManager as
-        | { appendMessage?: (message: unknown) => unknown }
+        | { appendMessage?: (message: unknown) => unknown; __forkSeed?: PiSessionMessage[] }
         | undefined;
+      // Fork inheritance (F16): a fork's fake session manager carries a captured
+      // seed of the parent history (`__forkSeed`) — pre-load it into the child
+      // session's messages, exactly as real Pi's forkFrom pre-loads the parent's
+      // history from the source transcript. Gated on the marker so ordinary
+      // persisted/reopened managers (t02/t04) are untouched.
+      if (manager?.__forkSeed?.length) {
+        for (const seeded of manager.__forkSeed) state.messages.push(seeded);
+        state.inheritedMessageCount = manager.__forkSeed.length;
+      }
       const record = (message: PiSessionMessage) => {
         state.messages.push(message);
         manager?.appendMessage?.(message);
@@ -267,6 +308,31 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
       ? (transcriptPath: string, sessionDir: string, cwd: string) =>
           realSessionManager!.open(transcriptPath, sessionDir, cwd)
       : undefined,
+    // Fork (F16): seed a NEW subagent transcript from a source session's history.
+    // With the real SessionManager injected, exercise the genuine on-disk
+    // forkFrom; otherwise return a fake manager carrying a captured `__forkSeed`
+    // (createAgentSession pre-loads it). Omitted entirely under noForkSessionManager
+    // so the "SDK cannot fork" degrade path is real. Every call is recorded.
+    forkSessionManager: options.noForkSessionManager
+      ? undefined
+      : realSessionManager
+        ? (sourcePath: string, cwd: string, sessionDir: string, id: string) => {
+            forkCalls.push({ sourcePath, cwd, sessionDir, id });
+            return realSessionManager!.forkFrom(sourcePath, cwd, sessionDir, { id });
+          }
+        : (sourcePath: string, cwd: string, sessionDir: string, id: string) => {
+            forkCalls.push({ sourcePath, cwd, sessionDir, id });
+            const messages: PiSessionMessage[] = [...(options.forkSeed ?? [])];
+            return {
+              __forkSeed: messages,
+              getSessionFile: () => `/fake-fork/${id}.jsonl`,
+              buildSessionContext: () => ({ messages }),
+              appendMessage: (message: unknown) => {
+                messages.push(message as PiSessionMessage);
+                return "entry";
+              },
+            } as unknown as PiSessionManagerLike;
+          },
     inMemorySettingsManager: () => ({}),
     agentDir: () => "/fake-agent-dir",
   };
@@ -277,6 +343,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
     sessions,
     abortCalls: () => abortCalls,
     promptCalls: () => promptCalls,
+    forkCalls: () => forkCalls,
   };
 }
 

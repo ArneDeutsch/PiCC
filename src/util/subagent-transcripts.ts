@@ -30,6 +30,18 @@ import path from "node:path";
  */
 const AGENT_ID_RE = /^agent-[0-9a-f]{12}$/;
 
+/**
+ * Prefix marking the developer-/model-facing fork-degrade line (F16). A
+ * `subagent_type: "fork"` dispatch that could not inherit the parent
+ * conversation runs fresh and records a fork-SPECIFIC diagnostic whose message
+ * starts with this sentinel. It is the SHARED home for the prefix so the emitter
+ * (subagents.ts) and the result renderer (subagent-render.ts) match without a
+ * hand-written "MUST match" comment that could silently drift — both import it
+ * here (this util is the shared low-level module both already depend on, and
+ * subagent-render.ts must not import from subagents.ts, which imports render).
+ */
+export const FORK_DEGRADE_PREFIX = "fork ran with fresh context: ";
+
 /** Mint a new opaque agent ID (unique per agent, stable across resumes — t04). */
 export function mintAgentId(): string {
   return `agent-${crypto.randomBytes(6).toString("hex")}`;

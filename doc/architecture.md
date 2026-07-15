@@ -103,8 +103,10 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
   rebuilt each turn and never compacted away, **this is also the primary compaction-preservation
   mechanism** (plan §9).
 - `subagents.ts` — `SubagentRuntime`: spawns a fresh in-memory Pi session per dispatch (agent body
-  as system prompt + CLAUDE.md/rules, **not** the parent conversation; the built-in Explore/Plan
-  types skip the project context), fans out under a concurrency cap, applies per-agent
+  as system prompt + CLAUDE.md/rules, **not** the parent conversation — *except* a
+  `subagent_type: "fork"` dispatch, which inherits the parent conversation via
+  `SessionManager.forkFrom` (F16, main-session only, env-gated by `CLAUDE_CODE_FORK_SUBAGENT`); the
+  built-in Explore/Plan types skip the project context), fans out under a concurrency cap, applies per-agent
   `tools:`/`model`/`effort` (with `CLAUDE_CODE_SUBAGENT_MODEL` as the highest-priority model
   override), enforces the depth cap (default 5), runs agent-scoped `hooks:`, supports
   `isolation: worktree`, `run_in_background`, and `background: true` frontmatter, and returns the
@@ -220,7 +222,12 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers:
 
 6. **Subagent dispatch.** The `Agent`/`Task` tool calls `SubagentRuntime.dispatch`, which spawns a
    fresh Pi session with the gated tool set and returns the final message verbatim (or a loud,
-   classified failure — see the *Subagent error contract* in §4). Nested dispatch is depth-capped;
+   classified failure — see the *Subagent error contract* in §4). One exception to "fresh": a
+   `subagent_type: "fork"` dispatch (F16) **inherits the parent conversation** — a main-session-only,
+   env-gated (`CLAUDE_CODE_FORK_SUBAGENT`) fork seeded from the parent transcript via
+   `SessionManager.forkFrom`, non-resumable, with output isolation still kept; every case that can't
+   inherit (env off, nested dispatcher, no transcript, fork-spawns-fork, SDK can't fork) degrades to
+   fresh context with a visible footer notice. Nested dispatch is depth-capped;
    the same guard runs inside every subagent session. By default the dispatch registers in the
    `BackgroundTaskRegistry` and returns a task id (`run_in_background: false` runs it inline instead;
    an agent's `background: true` frontmatter forces background; `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`

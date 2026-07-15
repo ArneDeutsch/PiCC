@@ -6,6 +6,38 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — `subagent_type: "fork"` parent-conversation inheritance (2026-07-15)
+
+- **The `Agent`/`Task` tool now supports `subagent_type: "fork"` — a subagent that inherits the
+  parent conversation instead of starting fresh.** A fork starts with the parent (main-session)
+  message history already in context and runs with the parent's model and tools, so a Claude-authored
+  project that hands a side task to a fork *expecting it to already know the whole situation* now
+  behaves faithfully. **Output isolation is kept** — only the fork's final result returns; its
+  intermediate steps stay out of the parent conversation. Previously a `"fork"` dispatch fell through
+  the unknown-type fallback and ran as a fresh-context `general-purpose` agent — with only a generic
+  "unknown subagent_type" warning, so the loss of fork semantics itself went unsignalled (the opposite
+  of fork semantics, and subtly wrong rather than an error).
+- **Gated by `CLAUDE_CODE_FORK_SUBAGENT`** — `1` forces inheritance on, `0` (or any off value) forces
+  an explicit visible degrade, and **unset ⇒ enabled** (a deliberate PiCC parity choice over Claude's
+  under-specified staged-rollout default). The inherited parent model is still overridden by an
+  operator `CLAUDE_CODE_SUBAGENT_MODEL` env and by a per-call `model` argument.
+- **Honest, visible degrades instead of a silent semantic inversion.** Fork inheritance is honored
+  only for a **main-session** dispatch; when a `"fork"` can't inherit — env off, a nested (non-main)
+  dispatcher, print/headless/no-session (no parent transcript), a fork trying to spawn another fork,
+  or an SDK that can't fork — it runs with fresh context **and** surfaces a specific footer notice
+  (never the generic "unknown subagent_type" warning), toned calmly for by-design cases and as a
+  warning for genuine can't-do cases. A fork is **non-resumable** (`SendMessage` refuses it) and a
+  fork **cannot spawn another fork**.
+- **Disclosed limits (advertised truthfully at registry tier `partial`, `tool.Agent.fork`):** the
+  fork's system prompt is a same-context **reconstruction**, not a byte-identical copy (PiCC is an
+  extension on a Pi-assembled base prompt), so a fork forgoes the prompt-cache cost saving a real fork
+  gets; print/headless support, the fork-mode `run_in_background` removal, and `isolation: "worktree"`
+  on a fork are not adopted (PiCC keeps `run_in_background: false` as a synchronous selector and relies
+  on background-by-default for the rest); PiCC deliberately does not reproduce Claude's interactive
+  named-fork zero-context regression (anthropics/claude-code#76019). The capability matrix, research
+  internals doc (§2.9), README, user-guide, architecture, and design docs were updated, and
+  `doc/supported-features.md` was regenerated from the registry. Closes #28.
+
 ### Added — real cell-based `NotebookRead` (2026-07-15)
 
 - **`NotebookRead` is now a real tool that reads a Jupyter notebook (`.ipynb`) cell by cell**,
