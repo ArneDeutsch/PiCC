@@ -22,3 +22,11 @@ Running record of friction, planning errors, bugs, and opportunities. Raw materi
   Commits bullet, was unguarded by any test (pre-existing gap, not a regression). Added a cheap
   `toMatch(/--no-verify/)` durability guard. Good instance of a review turning a pre-existing
   latent gap into a one-line hardening.
+- 2026-07-15 (t02 review) — `claude-parity` caught a subtle self-contradiction: the registry note
+  said commit attribution "stays governed by setting.includeCoAuthoredBy", but that setting's own
+  entry is degraded-noop ("no attribution machinery either way"). "Governed by" implies it's
+  functional. Reworded to "attribution is unchanged — still no trailer either way (see …)".
+  Lesson: cross-entry consistency in the registry matters; a note that references another
+  capability must not imply a stronger status than that capability claims. Also softened a
+  CHANGELOG "closes the gap" → "narrows the gap" to keep one honesty register. `docs` review
+  passed clean.

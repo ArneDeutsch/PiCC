@@ -170,7 +170,7 @@ Skill (`SKILL.md`), agent (`.claude/agents/*.md`), and rule frontmatter keys.
 | `agent.frontmatter.mcpServers` | degraded-noop | parsed; MCP deferred — no servers started for the agent (§7) |
 | `agent.frontmatter.permissionMode` ⚠ | degraded-noop | parsed, no-op — subagents run the default-permissive posture regardless; deny rules + tools: gating remain the controls; reported when set (§6.1) |
 
-## Runtime features (25)
+## Runtime features (26)
 
 Cross-cutting runtime subsystems and behaviors.
 
@@ -184,6 +184,7 @@ Cross-cutting runtime subsystems and behaviors.
 | `feature.worktrees` | full | EnterWorktree/ExitWorktree lifecycle incl. .worktreeinclude, parallel sessions, Windows tolerance (§4.4) |
 | `feature.agent-memory` | partial | auto memory (project MEMORY.md) + per-agent memory scopes load and inject with full parity. PARTIAL: injected write guidance is conservative by default — the model writes/updates memory only on an explicit user request to remember, whereas Claude Code also writes proactively; opt into eager writes via CLAUDE.md (§4.6) |
 | `feature.background-agents` | partial | background-by-default dispatch (Claude 2.1.198), TaskOutput/TaskStop, loud failures, next-turn settlement push, and live progress while TaskOutput awaits. Subagent TaskOutput/TaskStop are scoped to the subagent's own dispatched tasks while the coordinator retains full session-wide reach (F13; see tool.TaskOutput for the #15098 hardening note). GAPS: the settlement notice reaches an idle parent on its NEXT turn whereas Claude notifies mid-turn (the residual timing divergence); TaskStop accepts only task_id (Claude 2.1.198+ also accepts agent id/name); PiCC allows SendMessage resume after TaskStop while the Claude Code 2.1.x reference refuses stopped-agent resume; idle parents are not re-invoked; notices are bounded; no always-on Agent View; no remote/cloud agents; stop is cooperative. Nested (depth ≥ 2) background fan-out is bounded by per-depth budgets (total ≤ maxDepth × concurrency, deadlock-free), a deliberate conservative PiCC choice that diverges from Claude's single global (~10) parallel-agent cap — not parity. Lifecycle identity uses the task record's stored display type and stable agent id; resume uses a new task id and resolved registry name. Wording is model-visible and PiCC-defined, not verified as exact Claude wording (§4.3) |
+| `feature.commit-message-guidance` | partial | always-on, every-turn nudge in the conventions block (rebuilt each turn, survives compaction): when asked to commit, first read the changes (git status/diff) and recent git log, match this repo's commit-message style where it is richer, and — for a non-trivial change — write a short why-over-what body; the --no-verify prohibition is preserved. PARTIAL: guidance only, outcome model-dependent (a prompt nudge, not a deterministic output shape); NOT full Claude Code commit parity — omits the HEREDOC commit form, the attribution trailer, and parallel git status/diff/log batching; commit attribution is unchanged — still no attribution trailer either way (see setting.includeCoAuthoredBy) |
 | `feature.hook-handler.http` | partial | http hook handlers dispatched best-effort (§4.5) |
 | `feature.managed-policy` | partial | managed/enterprise policy honored where trivially present; otherwise degrade-safe (§7) |
 | `feature.hook-handler.agent` | degraded-noop | agent hook handlers degrade with a notice (§4.5) |
@@ -204,4 +205,4 @@ Cross-cutting runtime subsystems and behaviors.
 
 ## Summary
 
-The registry enumerates **148 capabilities** against baseline `claude-code-2.1.x (mid-2026)`: **79 full**, **18 partial**, **42 degraded-noop**, **9 not-supported**. 5 entries are safety-relevant (marked ⚠) — a divergence where a project's restriction is not enforced and is therefore reported prominently. Unknown inputs outside this registry are not counted here: they are unassessed by definition and degrade safely at runtime (plan §2.4).
+The registry enumerates **149 capabilities** against baseline `claude-code-2.1.x (mid-2026)`: **79 full**, **19 partial**, **42 degraded-noop**, **9 not-supported**. 5 entries are safety-relevant (marked ⚠) — a divergence where a project's restriction is not enforced and is therefore reported prominently. Unknown inputs outside this registry are not counted here: they are unassessed by definition and degrade safely at runtime (plan §2.4).

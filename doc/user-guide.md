@@ -290,7 +290,17 @@ tracked project files):
 - `model` / `effort` — defaults applied at session start (effort maps onto Pi thinking levels).
 - `steering` — the **model-steering layer**: per-model-pattern system-prompt guidance nudging
   GPT toward Claude-like behavior, without editing the project. Patterns are globs over
-  `provider/modelId`; all matching entries are appended.
+  `provider/modelId`; all matching entries are appended. Because steering is appended *after*
+  PiCC's built-in conventions block, it is also your lever over those built-ins: you cannot
+  delete their text, but a contrary steering entry (or a project's own commit rule) overrides
+  the behavior. For example, PiCC nudges richer, repo-style-matching commit messages by
+  default — to tone that back down to terse one-liners, add a steering entry such as:
+
+  ```json
+  "steering": {
+    "openai/*": "Keep commit messages to a one-line subject; no body unless I ask."
+  }
+  ```
 - `effortMap` — extends the mapping from Claude `effort:` values / prose ("apply maximum
   reasoning effort") to thinking levels.
 
