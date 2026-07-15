@@ -464,6 +464,30 @@ describe("SubagentRuntime (fake SDK)", () => {
     expect(result.error).toContain("depth");
   });
 
+  it('subagent_type "fork" is RESERVED — it never hits the generic unknown-type fallback (F16)', async () => {
+    // makeRuntime wires no getMainSessionFile → a fork degrades (no transcript),
+    // but it must NEVER surface the generic unknown-type warning: the interception
+    // always sets `resolved`, so the fork-specific notice fires instead.
+    const prev = process.env.CLAUDE_CODE_FORK_SUBAGENT;
+    delete process.env.CLAUDE_CODE_FORK_SUBAGENT; // unset ⇒ enabled
+    try {
+      const { runtime } = makeRuntime([makeAgent()], ["fresh-fork-run"]);
+      const result = await runtime.dispatch({ subagentType: "fork", prompt: "task", depth: 1 });
+      expect(result.ok).toBe(true);
+      expect(result.isFork).toBeFalsy(); // degraded (no parent transcript here)
+      expect(result.agentName).toBe("general-purpose");
+      expect(
+        result.diagnostics.some((d) => d.message.includes('unknown subagent_type "fork"')),
+      ).toBe(false);
+      expect(
+        result.diagnostics.some((d) => d.message.startsWith("fork ran with fresh context:")),
+      ).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CODE_FORK_SUBAGENT;
+      else process.env.CLAUDE_CODE_FORK_SUBAGENT = prev;
+    }
+  });
+
   it("gates tools per agent (read-only agent gets no write/edit/bash builtins)", async () => {
     const { runtime, created } = makeRuntime(
       [makeAgent({ tools: ["Read", "Grep", "Glob"] })],
