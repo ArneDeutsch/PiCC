@@ -364,6 +364,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     // SlashCommand is a REAL tool now (F11) — retiered to partial and no longer a stub.
     expect(lookupCapability("tool.SlashCommand")?.tier).toBe("partial");
     expect(stubNames.has("SlashCommand")).toBe(false);
+    // NotebookRead is a REAL tool now (F18) — retiered to partial and no longer a stub.
+    expect(lookupCapability("tool.NotebookRead")?.tier).toBe("partial");
+    expect(stubNames.has("NotebookRead")).toBe(false);
     // MultiEdit is a REAL tool now (F17) — retiered to full and no longer a stub.
     expect(lookupCapability("tool.MultiEdit")?.tier).toBe("full");
     expect(stubNames.has("MultiEdit")).toBe(false);
@@ -727,7 +730,8 @@ describe("buildCompatReport", () => {
     expect(report.findings.some((f) => f.capability.id === "tool.Read")).toBe(false);
     expect(report.findings.some((f) => f.capability.id === "tool.Bash")).toBe(false);
     expect(report.unassessed.some((u) => u.includes("Bash"))).toBe(false);
-    // disallowed-tools denying a degraded tool is trivially satisfied — no finding.
+    // disallowed-tools denying a tool is trivially satisfied — no finding. NotebookRead
+    // is now a real `partial` tool (F18), and denying a real tool is equally legitimate.
     expect(report.findings.some((f) => f.capability.id === "tool.NotebookRead")).toBe(false);
   });
 

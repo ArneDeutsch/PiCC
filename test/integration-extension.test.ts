@@ -51,6 +51,7 @@ describe("tool surface registration", () => {
       "WebSearch",
       "Grep",
       "Glob",
+      "NotebookRead",
       "MultiEdit",
       "EnterWorktree",
       "ExitWorktree",
