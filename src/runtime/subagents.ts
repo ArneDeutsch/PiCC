@@ -71,12 +71,19 @@ export interface SubagentRuntimeDeps {
    * the orchestrator's cwd, or worktree-isolated agents search the wrong checkout.
    * (`ownerAgentId` is inserted BEFORE the optional `subCwd` because a required
    * parameter cannot follow an optional one.)
+   * `dispatcherIsFork` (F16 t02) is the runtime-set marker: true iff THIS dispatch
+   * is a genuinely-inheriting fork, so the Agent/Task tools it grants know their
+   * dispatcher was a fork and can refuse a fork-spawns-fork. Never derived from a
+   * tool parameter (same anti-spoofing discipline as `ownerAgentId`); called
+   * per-dispatch, so it scopes to THIS fork's tools and does not leak to the fork's
+   * normal (non-fork) grandchildren.
    */
   customToolsFor: (
     agent: ClaudeAgent,
     grantedClaudeNames: string[],
     depth: number,
     ownerAgentId: string,
+    dispatcherIsFork: boolean,
     subCwd?: CwdState,
   ) => unknown[];
   /** All Claude tool names the harness knows (for gateTools' allKnown). */
@@ -622,6 +629,16 @@ export class SubagentRuntime {
      */
     background?: boolean;
     /**
+     * Runtime-set fork-spawns-fork marker (F16 t02): true iff this dispatch's
+     * DISPATCHER is a genuinely-inheriting fork. Set ONLY by the runtime (threaded
+     * from a fork's `isFork` into its granted Agent/Task tool definitions), NEVER
+     * derived from a tool parameter — same anti-spoofing discipline as `ownerAgentId`.
+     * When true, a `subagent_type: "fork"` request is refused (visible degrade to
+     * fresh general-purpose with a fork-specific "a fork cannot spawn another fork"
+     * notice); normal subagent types are unaffected.
+     */
+    dispatcherIsFork?: boolean;
+    /**
      * Dispatch this agent definition directly instead of looking subagentType up —
      * used for the synthetic general-purpose target of agent-less context:fork skills.
      */
@@ -696,10 +713,29 @@ export class SubagentRuntime {
     // Agent/Task tools). A degraded fork keeps `isFork === false` — it is a plain
     // fresh general-purpose run and must not carry the fork marker.
     let isFork = false;
+    // t02: an inheriting fork's child session-manager. It is REUSED by the later
+    // session-manager stage (never re-forked). `forkFrom` is EAGER + SYNCHRONOUS —
+    // it writes a full copy of the parent conversation to disk the instant it is
+    // called — so the actual construction is DEFERRED (via `attemptForkSession`
+    // below) to just before `customToolsFor`, AFTER the abort-before-start,
+    // SubagentStart-block, and abort-after-worktree gates: an aborted or hook-blocked
+    // fork must never leave an on-disk copy behind. It still runs BEFORE customTools/
+    // identity are finalized, so a `forkFrom` throw resolves to a plain
+    // general-purpose (isFork=false, unmarked tools, honest badge) before either is
+    // fixed. Undefined ⇒ this dispatch is not (or no longer) an inheriting fork.
+    let forkSession: PiSessionManagerLike | undefined;
+    // t02 review: the deferred `forkFrom` call. Set (in the interception below) ONLY
+    // for a fork that passed every degrade check; invoked once, immediately before
+    // `customToolsFor`. A fork shares the parent cwd (isolation undefined) and is
+    // never a resume, so the cwd known at interception equals the dispatch cwd passed
+    // here. Undefined ⇒ nothing to fork (degraded at interception, or not a fork).
+    let attemptForkSession: ((cwd: string) => PiSessionManagerLike) | undefined;
     // The developer-/model-facing degrade reason + tone (calm `info` for a chosen/
     // expected opt-out, `warning` for a genuine can't-do). Surfaced as a fork-
-    // specific notice — never the generic unknown-type warning, never silent.
-    let forkDegrade: { reason: string; tone: "info" | "warning" } | undefined;
+    // specific notice — never the generic unknown-type warning, never silent. The
+    // MODEL sees `modelReason` only; `devReason` (optional) may carry capped error
+    // detail for the developer diagnostic (forkFrom-throw case).
+    let forkDegrade: { modelReason: string; devReason?: string; tone: "info" | "warning" } | undefined;
     let resolved: ClaudeAgent | undefined;
     // F16: emit a fork-degrade in ONE place so the model-facing prompt prefix and
     // the developer-facing diagnostic sentinel can't drift across the (3) degrade
@@ -713,7 +749,7 @@ export class SubagentRuntime {
       modelReason: string,
       devReason: string = modelReason,
     ): void => {
-      forkDegrade = { reason: devReason, tone };
+      forkDegrade = { modelReason, devReason, tone };
       prompt = `(PiCC: this "fork" dispatch ran with FRESH context — it did NOT inherit the parent conversation. Reason: ${modelReason}.)\n\n${prompt}`;
       diagnostics.push({ severity: tone, message: `${FORK_DEGRADE_PREFIX}${devReason}` });
     };
@@ -749,30 +785,65 @@ export class SubagentRuntime {
       }
       const canForkSdk = typeof forkSdk?.forkSessionManager === "function";
 
-      if (gateOff) {
+      if (opts.dispatcherIsFork) {
+        // t02 fork-spawns-fork guard: this dispatch's DISPATCHER is itself a
+        // genuinely-inheriting fork (the runtime-set `dispatcherIsFork` marker,
+        // threaded into a fork's Agent/Task tools — NEVER a tool parameter). A
+        // fork cannot spawn another fork (Claude's documented rule), so refuse it:
+        // a VISIBLE degrade to fresh general-purpose with a fork-SPECIFIC, calm
+        // (by-design) notice — distinct from t01's gate/nested wording. Enforced
+        // via the marker, not the depth guard (which stays the untouched outer
+        // backstop). Checked FIRST so a nested fork (depth ≠ 1) gets this precise
+        // reason rather than the generic "nested fork" one.
         forkDegrade = {
-          reason: `fork inheritance is disabled via CLAUDE_CODE_FORK_SUBAGENT; unset it to enable`,
+          modelReason: `a fork cannot spawn another fork`,
+          tone: "info",
+        };
+      } else if (gateOff) {
+        forkDegrade = {
+          modelReason: `fork inheritance is disabled via CLAUDE_CODE_FORK_SUBAGENT; unset it to enable`,
           tone: "info",
         };
       } else if (opts.depth !== 1) {
         forkDegrade = {
-          reason: `the parent conversation is not available for a nested fork (only the main session can fork)`,
+          modelReason: `the parent conversation is not available for a nested fork (only the main session can fork)`,
           tone: "warning",
         };
       } else if (!forkMainFile) {
         forkDegrade = {
-          reason: `no parent transcript is available to fork (print/headless/no-session mode)`,
+          modelReason: `no parent transcript is available to fork (print/headless/no-session mode)`,
           tone: "warning",
         };
       } else if (!canForkSdk) {
         forkDegrade = {
-          reason: forkSdkLoadFailed
+          modelReason: forkSdkLoadFailed
             ? `the fork runtime could not be loaded`
             : `this runtime cannot fork a session (the SDK lacks forkSessionManager)`,
           tone: "warning",
         };
       } else {
+        // Genuinely inheriting fork — every degrade check passed. DEFER the actual
+        // `forkFrom` call (it is eager + synchronous and writes the parent
+        // conversation to disk) to just before `customToolsFor`, AFTER the abort/
+        // SubagentStart-block gates, so an aborted or hook-blocked dispatch never
+        // creates the on-disk copy. Tentatively mark isFork so the gates + the
+        // SubagentStart payload use the fork identity; the deferred attempt settles
+        // the FINAL isFork/identity/badge (a throw there re-resolves to
+        // general-purpose) BEFORE the child tools + identity are built (trap fix).
+        // The env=0 / nested / no-transcript / SDK-can't-fork / fork-spawns-fork
+        // degrades stay resolved at interception — none of them need `forkFrom`.
         isFork = true;
+        // Capture the fork inputs (SDK + narrowed main-session file) for the thunk;
+        // the dispatch cwd is passed in at the call site.
+        const forkSdkRef = forkSdk!;
+        const forkMainFileRef = forkMainFile;
+        attemptForkSession = (cwd: string) =>
+          forkSdkRef.forkSessionManager!(
+            forkMainFileRef,
+            cwd,
+            subagentSessionDir(forkMainFileRef),
+            agentId,
+          );
       }
 
       if (isFork) {
@@ -783,7 +854,7 @@ export class SubagentRuntime {
         // degrade are distinguishable in the rendered badge) with a fork-SPECIFIC
         // notice — never the generic unknown-type warning, never inheriting.
         resolved = resolveAgent(builtins, "general-purpose");
-        emitForkDegrade(forkDegrade!.tone, forkDegrade!.reason);
+        emitForkDegrade(forkDegrade!.tone, forkDegrade!.modelReason, forkDegrade!.devReason);
       }
     } else {
       // Shared resolver (t02 review round 2): one home for the resolution order so
@@ -794,15 +865,15 @@ export class SubagentRuntime {
     // general-purpose instead of hard-erroring — with a VISIBLE degrade in
     // both the diagnostics and the subagent's own prompt. (A fork always set
     // `resolved` above, so this generic warning can never fire for it.)
-    const agent = resolved ?? resolveAgent(builtins, "general-purpose");
-    if (!resolved && agent) {
+    const resolvedAgent = resolved ?? resolveAgent(builtins, "general-purpose");
+    if (!resolved && resolvedAgent) {
       diagnostics.push({
         severity: "warning",
         message: `unknown subagent_type "${requested}"; ran as general-purpose`,
       });
       prompt = `(You were dispatched as subagent type "${requested}", which is not defined in this project; you are running as a general-purpose agent.)\n\n${opts.prompt}`;
     }
-    if (!agent) {
+    if (!resolvedAgent) {
       // Genuinely unusable (general-purpose itself unavailable): keep the
       // catalog-listing error so the model can pick a real agent.
       const known = [...agents, ...builtins].map((a) => a.name).join(", ");
@@ -816,6 +887,12 @@ export class SubagentRuntime {
         diagnostics,
       };
     }
+    // `let` (not `const`): a DEFERRED forkFrom throw (just before customToolsFor,
+    // after the gates) re-resolves this to general-purpose so the RESULT badge and
+    // the post-gate hook identity are honest (`Agent(general-purpose)`). Typed
+    // explicitly (ClaudeAgent, not `| undefined`) off the guarded `resolvedAgent` so
+    // control-flow narrowing survives the reassignment across the later awaits.
+    let agent: ClaudeAgent = resolvedAgent;
     if (opts.depth > this.deps.maxDepth) {
       return {
         ok: false,
@@ -1137,6 +1214,40 @@ export class SubagentRuntime {
           diagnostics,
         };
       }
+      // t02 review: the DEFERRED forkFrom call. `forkFrom` is eager + synchronous —
+      // it immediately writes a full copy of the parent conversation to disk — so it
+      // runs HERE, AFTER the abort-before-start, SubagentStart-block, and
+      // abort-after-worktree gates: an aborted or hook-blocked fork never leaves an
+      // on-disk copy behind (the env=0/nested/no-transcript/SDK-can't-fork/
+      // fork-spawns-fork degrades were already resolved at interception — they don't
+      // need `forkFrom`). It still runs BEFORE `customToolsFor` so the FINAL isFork +
+      // resolved identity/badge are settled before the child tools + identity are
+      // built (the trap fix). The constructed manager is reused by the session-manager
+      // stage (never re-forked), keeping `forkCalls()` at 1.
+      if (attemptForkSession) {
+        try {
+          forkSession = attemptForkSession(cwd);
+          // Success: isFork stays true; the fork identity/badge stand.
+        } catch (err) {
+          // Degrade to a plain general-purpose run: flip isFork false so
+          // `customToolsFor` builds UNMARKED tools, re-resolve the identity so the
+          // RESULT badge is honest (`Agent(general-purpose)`), and emit the generic
+          // model reason. SECURITY: the raw error can embed the main session's
+          // ABSOLUTE PATH, so the capped detail rides the developer diagnostic only.
+          // Accepted cosmetic: the SubagentStart hook already fired with the "fork"
+          // subagent_type (before this throw was known); the badge stays honest.
+          isFork = false;
+          agent = resolveAgent(builtins, "general-purpose") ?? agent;
+          emitForkDegrade(
+            "warning",
+            `forking the parent session failed`,
+            `forking the parent session failed (${capErrorText(
+              (err as Error)?.message ?? String(err),
+            )})`,
+          );
+        }
+      }
+
       // Dispatch-local cwd state: the subagent's tools (and its own EnterWorktree
       // use) must never swap the ORCHESTRATOR's cwd.
       const subCwd = new CwdState(cwd);
@@ -1150,11 +1261,13 @@ export class SubagentRuntime {
       // `agentId` (the dispatch's own minted id, above) is the OWNER that
       // scopes this agent's TaskOutput/TaskStop and tags the tasks it starts
       // (F13 t02). Never derived from a tool param (anti-spoofing).
-      // F16: `isFork` is in scope here (true ONLY for a fork that actually
-      // inherits) — t02 threads it into the fork's Agent/Task tools to refuse a
-      // fork-spawns-fork. A degraded fork is `isFork === false`, so it is a plain
-      // fresh general-purpose run whose own nested dispatches are not mis-refused.
-      const customTools = this.deps.customToolsFor(agent, granted, opts.depth, agentId, subCwd);
+      // F16 t02: `isFork` is in scope here (true ONLY for a fork that ACTUALLY
+      // inherits — the DEFERRED forkFrom attempt just above has already flipped it
+      // false on throw) — thread it as the runtime-set `dispatcherIsFork` marker so
+      // the fork's granted Agent/Task tools refuse a fork-spawns-fork. A degraded
+      // fork is `isFork === false`, so its tools stay unmarked and its own nested
+      // dispatches are not mis-refused.
+      const customTools = this.deps.customToolsFor(agent, granted, opts.depth, agentId, isFork, subCwd);
 
       const sdk = await this.sdk();
       const injector = this.deps.makeContextInjector
@@ -1272,47 +1385,24 @@ export class SubagentRuntime {
           };
         }
       } else if (isFork) {
-        // F16 fork branch (third session-manager branch): SEED the child session
-        // with the parent (main-session) conversation via forkFrom, which writes a
-        // BRAND-NEW file — the parent transcript is never touched. Entered only
-        // when the fork will actually inherit (isFork gated on: main-session
-        // dispatcher, gate on, transcript present, forkSessionManager present).
-        if (mainSessionFile && sdk.forkSessionManager) {
-          try {
-            const forked = sdk.forkSessionManager(
-              mainSessionFile,
-              cwd,
-              subagentSessionDir(mainSessionFile),
-              agentId,
-            );
-            // Read the real path back for transcriptPath ONLY — a fork is forced
-            // non-resumable regardless (its inherited context is the parent
-            // conversation at fork time and cannot be safely re-derived).
-            transcriptPath = forked.getSessionFile() ?? undefined;
-            sessionManager = forked;
-            resumable = false;
-          } catch (err) {
-            // Degrade (forkFrom threw): run FRESH (in-memory below), never
-            // inheriting. Fork-SPECIFIC notice (warning tone), never the generic
-            // warning. `prompt` is still consumed downstream (fullPrompt), so the
-            // model-facing note lands; SubagentStart already fired with the task
-            // text only (no inherited history leaks into hook payloads).
-            isFork = false;
-            resumable = false;
-            // SECURITY: the raw error can embed the main-session ABSOLUTE PATH, so
-            // the MODEL-facing prefix uses a GENERIC reason with no error detail;
-            // the capped detail rides the developer-facing diagnostic ONLY.
-            emitForkDegrade(
-              "warning",
-              `forking the parent session failed`,
-              `forking the parent session failed (${capErrorText(
-                (err as Error)?.message ?? String(err),
-              )})`,
-            );
-          }
+        // F16 fork branch (third session-manager branch): the child session was
+        // ALREADY forkFrom-seeded just before `customToolsFor` (t02 trap fix +
+        // review relocation) — `isFork` here therefore reflects the FINAL
+        // post-fork-attempt state, so a forkFrom throw already degraded to fresh
+        // (isFork=false, unmarked tools, general-purpose badge) and never reaches
+        // this branch. REUSE the constructed manager (a BRAND-NEW file seeded with
+        // the parent history; the parent transcript is untouched); never re-fork.
+        if (forkSession) {
+          // Read the real path back for transcriptPath ONLY — a fork is forced
+          // non-resumable regardless (its inherited context is the parent
+          // conversation at fork time and cannot be safely re-derived).
+          transcriptPath = forkSession.getSessionFile() ?? undefined;
+          sessionManager = forkSession;
+          resumable = false;
         } else {
-          // Defensive degrade: the honor conditions changed between interception
-          // and here (extremely unlikely). Run fresh rather than un-forked silently.
+          // Defensive degrade: `isFork` is only set true alongside a constructed
+          // `forkSession`, so this is unreachable — run fresh rather than un-forked
+          // silently if that invariant is ever violated.
           isFork = false;
           resumable = false;
           emitForkDegrade("warning", `the parent transcript became unavailable before forking`);
@@ -1830,6 +1920,14 @@ export function createAgentToolDefinition(
      * coordinator-owned (`owner: undefined`, reachable only via the full registry).
      */
     ownerAgentId?: string;
+    /**
+     * Runtime-set fork-spawns-fork marker (F16 t02): true iff the dispatcher that
+     * was granted THIS Agent/Task tool is a genuinely-inheriting fork. Carried onto
+     * every dispatch this tool makes (both background and foreground arms) so a
+     * nested `subagent_type: "fork"` is refused. Undefined for the coordinator and
+     * for normal (non-fork) subagents. Never sourced from a tool parameter.
+     */
+    dispatcherIsFork?: boolean;
   },
 ): Record<string, unknown> {
   return {
@@ -1890,6 +1988,10 @@ export function createAgentToolDefinition(
         prompt: String(params.prompt ?? ""),
         model: params.model ? String(params.model) : undefined,
         depth: opts.depth + 1,
+        // F16 t02: propagate the runtime-set marker onto EVERY dispatch this tool
+        // makes (spread into both the background and foreground arms below), so a
+        // fork's own Agent/Task tool refuses a nested `subagent_type: "fork"`.
+        dispatcherIsFork: opts.dispatcherIsFork,
       };
       const backgroundDisabled = isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS);
       // Background-by-default (F15, Claude 2.1.198+): a dispatch backgrounds
