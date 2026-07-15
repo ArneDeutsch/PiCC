@@ -89,8 +89,9 @@ describe("evaluate router (evaluate-skill t01)", () => {
     expect(body).toContain("fixed action envelope");
     // Target auto-detection (no user mode pick).
     expect(body).toContain("auto-detect");
-    // Confirm-before-close (no autonomous mode).
-    expect(body).toContain("before any close");
+    // Confirm-before-every-public-write (no autonomous mode) — broadened from
+    // "before any close" to the safe posture: every close AND every comment is confirmed.
+    expect(body).toContain("before any public write");
     // Coordinator redirects content to a file it does not read.
     expect(body).toContain("without reading");
     // Write-discipline floor markers (mirrors implement-feature's floor check).
@@ -102,6 +103,63 @@ describe("evaluate router (evaluate-skill t01)", () => {
     const hits = walkFiles(SKILL_DIR, (n) => n === "SKILL.md").map(norm);
     expect(hits).toHaveLength(1);
     expect(hits[0]).toBe(norm(path.join(SKILL_DIR, "SKILL.md")));
+  });
+});
+
+describe("issue-eval mode floor markers (evaluate-skill t02)", () => {
+  // Loose, case-insensitive, whitespace-collapsed structural checks: assert the
+  // load-bearing close-invariant + canned-comment-by-category language survives,
+  // NOT exact prose. We do NOT test LLM judgment or the gh writes themselves.
+  const collapse = (p: string): string =>
+    fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
+
+  const { skills } = loadSkills([{ dir: SKILLS_DIR, scope: "project" }], []);
+  const skill = skills.find((s) => s.name === "evaluate");
+
+  const ISSUE_EVAL_PATH = path.join(REFERENCES_DIR, "issue-eval.md");
+
+  it("issue-eval.md exists (linked from the router — bidirectional integrity above)", () => {
+    expect(fs.existsSync(ISSUE_EVAL_PATH)).toBe(true);
+  });
+
+  it("issue-eval.md carries the close-invariant (close⟹canned, keep-open⟹authored, keep-open never closes)", () => {
+    const body = collapse(ISSUE_EVAL_PATH);
+    // A close always carries a canned, category-selected comment.
+    expect(body).toContain("close always carries a canned comment selected by category");
+    // The canned comment contains none of the target's text.
+    expect(body).toContain("of the target's text");
+    // A keep-open carries a model-authored rating and never closes.
+    expect(body).toContain("keep-open always carries a model-authored rating");
+    expect(body).toContain("keep-open never closes");
+  });
+
+  it("issue-eval.md pins the canned-comment-selected-by-category language", () => {
+    const body = collapse(ISSUE_EVAL_PATH);
+    expect(body).toContain("canned template selected by category");
+    // One template per L1 category, keyed off the category alone (never target bytes).
+    expect(body).toContain("malicious_spam");
+    expect(body).toContain("malicious_abuse");
+    expect(body).toContain("malicious_injection");
+  });
+
+  it("issue-eval.md fixes the close mechanics (not-planned reason, invocation-N target, confirm-first, no --yes)", () => {
+    const body = collapse(ISSUE_EVAL_PATH);
+    // Fixed literal close reason.
+    expect(body).toContain('--reason "not planned"');
+    // Close target is the invocation <N>, never a #N seen in content.
+    expect(body).toContain("close target is the invocation");
+    // Always confirm before a close; no autonomous mode / no --yes token.
+    expect(body).toContain("confirm before a close");
+    expect(body).toContain("--yes");
+    // Coordinator never reads the raw content (the evaluator does).
+    expect(body).toContain("without reading it");
+  });
+
+  it("router carries the resident issue-eval close-invariant + canned-by-category markers", () => {
+    const routerBody = loadSkillBody(skill!).toLowerCase().replace(/\s+/g, " ");
+    expect(routerBody).toContain("canned template selected by category");
+    expect(routerBody).toContain("close always carries the canned category comment");
+    expect(routerBody).toContain("keep-open always carries the authored rating and never closes");
   });
 });
 

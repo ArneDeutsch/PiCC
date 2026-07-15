@@ -50,8 +50,22 @@ attacker-influenced text can never ride along with a destructive action.
 
    (matching the repo's `Co-Authored-By` / "🤖 Generated with Claude Code" convention.)
 6. **Idempotent on resume.** A second evaluation of the same target must not double-post or
-   double-close: an already-closed issue short-circuits the close; before commenting, scan existing
-   comments for a prior attribution-trailered `evaluate` comment and skip if present.
+   double-close. An **already-closed issue is written to not at all** — no close **and no comment**;
+   the maintainer gets the read/rating **on-screen only**, nothing posted. Before commenting on an
+   **open** issue, check for a prior attribution-trailered `evaluate` comment with a **metadata-only**
+   query that returns **only** the matching comment URL for the fixed trailer literal — it must
+   **never** pull comment bodies into the coordinator's context (that would defeat the redirect
+   isolation). The `--jq` filter reduces the response to just the matching `html_url` before it reaches
+   the coordinator's context; the bodies are never surfaced:
+
+   ```
+   gh api repos/<target>/issues/<N>/comments \
+     --jq 'map(select(.body|contains("Generated with the `evaluate` skill")))|.[0].html_url'
+   ```
+
+   On a hit, report that URL and ask before re-evaluating (skip on confirm). The marker is
+   attacker-forgeable, so a forged/ambiguous hit may only cause a conservative skip/ask, never a
+   destructive action.
 
 ## `#N` / `<target>` sanitization gate — applied at the FIRST `gh` touch
 

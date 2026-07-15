@@ -22,3 +22,23 @@ Running record of friction, bugs, and opportunities. Dated bullets, one line eac
   so its return must be a bounded *structured* rating the coordinator *composes* the comment from —
   never pasted verbatim — else a successful injection could exfiltrate a secret into a public comment.
   Folded into t02's keep-open-comment spec.
+
+## t02 — issue-eval (2026-07-15)
+
+- **"Scan comments" is a hidden isolation leak.** A spec that says "scan existing comments for our
+  trailer" invites a naive implementer to read comment bodies into the coordinator — defeating the
+  redirect isolation. Fixed by pinning it to a metadata-only `--jq` query returning just the matching
+  comment URL. Lesson: every coordinator-side "look at the content" step must be spelled out as
+  metadata-only, or it silently re-ingests attacker bytes.
+- **Decision — already-closed issue = no write of any kind** (on-screen read/rating only). Resolved a
+  disagreement between issue-eval.md and write-discipline.md.
+- **Override safety:** a human-forced close of an issue the agent rated *keep-open* must NOT carry the
+  slop "cost/risk outweighs value" canned template (it would contradict the shown rating) — it carries
+  a neutral "closed by the maintainer after review" note, re-previewed. Canned slop/malicious templates
+  are only for the agent's own clear-cut close dispositions.
+- **Posture note (flag to user):** the build confirms before **every** public write (keep-open comments
+  too), not only closes — safe, but when pointing the agent at many issues the maintainer confirms each
+  keep-open comment as well. Tagline aligned to "confirms before any public write". Revisit if too heavy.
+- **Accepted residual:** the evaluator's "short justification" fields are a free-text channel; a
+  base64-encoded secret could survive an English paraphrase. Owned by feature.md's dual-LLM non-goal;
+  optional future hardening is to restrict the composed comment to rubric vocabulary + scores.

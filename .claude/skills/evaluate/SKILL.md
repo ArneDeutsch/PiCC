@@ -1,6 +1,6 @@
 ---
 name: evaluate
-description: Rate a GitHub issue, a proposed (not-yet-filed) issue, or a pull request against a value rubric and drive a disposition — confidence-gated close of clear slop, keep-open with a rating, a PR assessment, or a proposal score. Invocable directly by a human (`/evaluate <target>`) or by another agent. Auto-detects issue vs PR and routes internally; always previews its rating and confirms before any close; never merges, edits, labels, reopens, or locks. Use to triage whether a ticket or PR is worth acting on. Not for planning or building a feature (that is implement-feature) and not for arbitrary code questions.
+description: Rate a GitHub issue, a proposed (not-yet-filed) issue, or a pull request against a value rubric and drive a disposition — confidence-gated close of clear slop, keep-open with a rating, a PR assessment, or a proposal score. Invocable directly by a human (`/evaluate <target>`) or by another agent. Auto-detects issue vs PR and routes internally; always previews its rating and confirms before any public write (close or comment); never merges, edits, labels, reopens, or locks. Use to triage whether a ticket or PR is worth acting on. Not for planning or building a feature (that is implement-feature) and not for arbitrary code questions.
 argument-hint: "[#N | N | issue-url | pr-url]"
 ---
 
@@ -17,16 +17,20 @@ write-discipline floor). The two sibling references, read on demand:
 [references/evaluation-engine.md](references/evaluation-engine.md) (the rubric, the L1 maliciousness
 screen, the investigation wave, the canonical rating block) and
 [references/write-discipline.md](references/write-discipline.md) (the closed action allow-list, the
-six write mechanics, the `#N`/`<target>` sanitization gate). The three per-mode references
-(issue-eval, pr-eval, proposal-gate) are added by later tasks; when a mode is not yet documented, say
-so plainly rather than inventing behaviour.
+six write mechanics, the `#N`/`<target>` sanitization gate). Per-mode references, read on demand once
+the router has routed: [references/issue-eval.md](references/issue-eval.md) (the issue mode — screen,
+rate, and drive a confidence-gated close-or-keep-open). The remaining per-mode references (pr-eval,
+proposal-gate) are added by later tasks; when a mode is not yet documented, say so plainly rather than
+inventing behaviour.
 
 ## The three modes
 
-- **issue-eval** — given an open issue: screen it, rate it, and act. Clear-cut slop/abuse ⇒ a
-  **confidence-gated close** with a canned, category-selected comment; everything else ⇒ **keep-open**
-  with a rating/importance comment. **Biased to keep-open when uncertain** — a borderline case is never
-  closed.
+- **issue-eval** — given an open issue: screen it, rate it, and act (full mode:
+  [references/issue-eval.md](references/issue-eval.md)). Clear-cut slop/abuse ⇒ a **confidence-gated
+  close** whose comment is a **canned template selected by category** (containing none of the target's
+  text); everything else ⇒ **keep-open** with a model-authored rating/importance comment. **A close
+  always carries the canned category comment; a keep-open always carries the authored rating and never
+  closes.** **Biased to keep-open when uncertain** — a borderline case is never closed.
 - **proposal-gate** — given a would-be issue (agent-invoked). Structurally **no GitHub writes**: score
   it against the rubric and return the score. Used by `implement-feature` in two ways — it **gates**
   Phase 8 machine-surfaced findings (clear slop dropped with a one-line tally, the rest surfaced with
@@ -109,8 +113,10 @@ Then resolve type with a metadata-only query that returns no free text:
 gh api repos/<target>/issues/<N> --jq '{isPR:(.pull_request!=null), state:.state}'
 ```
 
-A `pull_request` present ⇒ route to **pr-eval**; otherwise **issue-eval**. **Announce the detection**
-("detected a pull request — evaluating as a PR"); never hand the user off to a non-existent command.
+A `pull_request` present ⇒ route to **pr-eval**; otherwise **issue-eval**. **Announce the detection.**
+pr-eval is added by t03; until it exists, say so plainly for the current state — "detected a pull
+request; PR evaluation isn't available yet" — rather than a present-tense "evaluating as a PR". Never
+hand the user off to a non-existent command.
 (In GitHub's API a PR *is* an issue, so this one call resolves both type and open/closed state.)
 
 **Reachability.** `evaluate` needs only **read + comment auth** — `gh` installed and on PATH, an
@@ -121,14 +127,15 @@ unparseable, wrong-host (not `github.com`), foreign-repo (owner/repo matches nei
 `/evaluate`, states the read+comment requirement, and **echoes the actual ref the user typed** (never
 a hardcoded example).
 
-## Consent gate — always confirm before a close
+## Consent gate — always confirm before any public write
 
 The skill **always previews its rating and the exact write it proposes, and confirms with the human
-before any close.** There is **no unattended or autonomous mode** and no opt-in token: the human is
-always in the loop — pointing the agent at a pile of issues is just re-prompting — and you **ask back
-whenever something is off**. Preview the rating, show the exact comment/close you propose, and proceed
-only on the human's explicit go. proposal-gate performs no GitHub write at all, so it needs no close
-confirmation.
+before any public write (close or comment)** — not only before a close: every keep-open comment is
+previewed and confirmed too. There is **no unattended or autonomous mode** and no opt-in token: the
+human is always in the loop — pointing the agent at a pile of issues is just re-prompting — and you
+**ask back whenever something is off**. Preview the rating, show the exact comment/close you propose,
+and proceed only on the human's explicit go. proposal-gate performs no GitHub write at all, so it needs
+no write confirmation.
 
 ## Write-discipline floor — non-negotiable
 
@@ -145,5 +152,6 @@ fail-closed floor (full rules in that file):
 - **Closed action allow-list:** the four envelope writes and nothing else; never merge/edit/label/
   reopen/lock/delete/push, never open a PR.
 - **No leakage** (no tokens/env/`~/.pi`/raw output/absolute local paths); **echo every write with its
-  URL**; **append the attribution trailer**; **idempotent on resume** (already-closed / already-
-  commented targets short-circuit — no double-close, no double-post).
+  URL**; **append the attribution trailer**; **idempotent on resume** (an already-closed issue gets an
+  on-screen read only — **no write at all**; an already-commented target short-circuits — no
+  double-post; the prior-comment check is **metadata-only**, never ingesting comment bodies).

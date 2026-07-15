@@ -11,7 +11,8 @@ disposition. One shared evaluation engine, three modes:
 - **issue-eval** — given an open issue, understand it and act: **confidence-gated close** of clear
   slop (with a canned comment), **keep-open** of everything else with a rating/importance comment,
   biased to keep-open when uncertain. **Consent: it always previews the rating and the exact write it
-  proposes, and confirms with the human before any close.** There is no unattended/autonomous mode and
+  proposes, and confirms with the human before any public write (close or comment).** There is no
+  unattended/autonomous mode and
   no opt-in token — the human is always in the loop (even when pointing the agent at a pile of issues,
   which is just re-prompting), and the agent asks back whenever something is off.
 - **proposal-gate** — given a would-be issue (agent-invoked, structurally **no GitHub writes**),
@@ -121,7 +122,8 @@ raises PR-merge decisions to an evidence-backed assessment — so the maintainer
 
 - A human runs `/evaluate <target>`; the skill auto-detects issue vs PR and routes accordingly — the
   human never picks a mode. It always previews its rating and proposed write and confirms before any
-  close; only clear-cut slop/abuse is ever closed; borderline cases are never closed.
+  public write (close or comment); only clear-cut slop/abuse is ever closed; borderline cases are never
+  closed.
 - An agent can run `evaluate` in proposal-gate mode and get a score with no GitHub write; on
   `implement-feature`, Phase 8 stops surfacing low-value findings (with a tally) while Phase 1
   annotates the human's own converged feature without ever suppressing the offer.
