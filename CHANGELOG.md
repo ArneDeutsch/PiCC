@@ -12,7 +12,7 @@ All notable changes to PiCC are documented here. The format is based on
   feature number.** The slug consistently names the worktree, `feature/<feature-slug>` branch, plan
   folder, headings, and commit prefix, with portable validation and collision checks. A linked GitHub
   issue number remains the canonical numeric reference; task ordering remains local (`t01`, `t02`, …).
-  Existing numbered feature runs and historical artifacts keep their established identities unchanged.
+  Legacy numbered feature runs and historical artifacts keep their established identities unchanged.
 
 ### Added — evaluate skill (2026-07-15)
 

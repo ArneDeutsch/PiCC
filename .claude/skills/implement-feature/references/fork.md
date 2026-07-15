@@ -179,8 +179,11 @@ the body until the rules are available** — do not distill a body with the rule
    `<pushRemote>/feature/<feature-slug>`; no case-fold sibling exists; and the fetched remote tip must
    equal local `HEAD` or be an ancestor of it. Only then make an ordinary non-forcing equal/fast-forward push, including
    resumed handoffs and CI-fix repushes. A foreign/ambiguous ref, wrong or absent upstream for an existing
-   ref, sibling, or diverged tip stops before push and later writes. Never force. This is the single
-   automatic write. The recheck is not atomic: a same-name branch created in the remaining check-to-push
+   ref, sibling, or diverged tip stops before push and later writes. Lead with **"nothing is lost"**;
+   name the conflicting ref and relationship, state that the local branch, worktree, and commits remain
+   intact and nothing new was posted, and offer safe choices to inspect/reconcile ownership or restart
+   under a new descriptive identity. Never force or suggest force, deletion, overwrite, or adoption. This is the
+   single automatic write. The recheck is not atomic: a same-name branch created in the remaining check-to-push
    race may still be attached by ordinary push when histories permit; never claim complete race elimination.
 2. **Confirm the push landed before printing the compare URL** — a URL for a branch that isn't on the
    fork 404s. Only after the push succeeds, build the URL.

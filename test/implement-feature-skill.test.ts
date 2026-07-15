@@ -160,9 +160,12 @@ describe("description-based naming contract", () => {
     expect(body).toContain("worktree basename and exact current `feature/<feature-slug>` branch");
     expect(body).toContain("`doc/plan/<feature-slug>/` folder");
     expect(body).toContain("# <feature-slug> review: <title>");
+    expect(body).toContain("with exactly the same frozen `<title>`");
+    expect(body).toContain("`<feature-slug>: plan — ` and `<feature-slug>: review — ` must equal the frozen `<title>` exactly");
+    expect(body).toContain("task and fix commits require only the slug prefix");
     expect(body).toContain("stop before further commands or writes");
     for (const trustMarker of [
-      "recovered scope", "reconstructed phase", "slug/branch/worktree/plan identity",
+      "recovered frozen title verbatim", "recovered scope", "reconstructed phase", "slug/branch/worktree/plan identity",
       "ticket target and reference", "exact remaining write contract", "require explicit confirmation",
       "freshly resolve `target`, `push`, `pushremote`, and `targetdefault`", "require its repo/reference to match",
     ]) expect(body).toContain(trustMarker);
@@ -184,18 +187,31 @@ describe("description-based naming contract", () => {
     ]) expect(legacy).toContain(marker);
   });
 
-  it("keeps the resident router on the same descriptive identity without a global allocator", () => {
+  it("keeps the resident router on the same descriptive identity and presentation gate", () => {
     const body = collapsed("SKILL.md");
-    expect(body).toContain("classify a resume before authoring a new-run slug");
-    expect(body).toContain("feature/<feature-slug>");
-    expect(body).toContain("doc/plan/<feature-slug>/");
+    expect(body).toContain("classify resume before new naming");
     expect(body).toContain("<feature-slug>: plan — <title>");
     expect(body).toContain("<feature-slug>: t<task-number> — <description>");
     expect(body).toContain("never sanitize/add a counter");
     expect(body).toContain("explicit human confirmation");
-    expect(body).toContain("concrete end-to-end override");
+    expect(body).toContain("complete override");
     expect(body).toContain("may delete a raced unregistered directory");
-    expect(body).toContain("confirmed self-owned exact-upstream");
+    expect(body).toContain("confirmed self-owned fast-forward repush");
+    for (const marker of [
+      "hard presentation gate", "immediately after build go", "first read the required phase 2 references",
+      "reference reads are the only tool calls allowed before the announcement",
+      "before every workspace/preflight/mutating command", "before `enterworktree`",
+      "emit user-visible prose", "never leave it in hidden reasoning", "may share the response with later tool calls",
+      "requires no reply",
+    ]) expect(body).toContain(marker);
+    expect(body).not.toContain("before the first phase 2 tool call");
+    const ordered = [
+      "`title: <title>`", "`slug: <feature-slug>`", "`branch: feature/<feature-slug>`",
+      "`plan: doc/plan/<feature-slug>/`", "`race disclosure:`",
+    ];
+    for (let index = 0; index < ordered.length - 1; index += 1) {
+      expectBefore(body, ordered[index]!, ordered[index + 1]!);
+    }
     expect(body).not.toMatch(/next free|pick the next free|feature\/<nn>|f<nn>/i);
   });
 
@@ -218,14 +234,16 @@ describe("description-based naming contract", () => {
     expect(workflow).toContain("at the explicit build go, freeze that title");
     expect(workflow).toContain("a given ticket keeps its existing title unchanged");
     expect(workflow).toContain("printable ascii, single-line, at most 120 characters");
-    expect(workflow).toContain("no control characters or raw ticket text");
+    expect(workflow).toContain("do not directly copy, interpolate, slugify, or mechanically transform raw ticket title/body text");
+    expect(workflow).toContain("rather than rejecting incidental lexical overlap");
     expect(creation).toContain("no identifier prefix");
     expect(creation).toContain("single-line and at most 120 characters");
     expect(creation).toContain("same stable display title");
     expect(creation).toContain("frozen at build go");
     expect(creation).toContain('gh issue create --repo <target> --title "<title>" --body-file <path>');
     expect(creation).toContain("couples the public issue to the durable `ticket:` anchor");
-    expect(integration).toContain("never copy, slugify, or mechanically transform raw ticket text");
+    expect(integration).toContain("never directly copy, interpolate, slugify, or mechanically transform raw ticket text");
+    expect(integration).toContain("incidental lexical overlap does not itself invalidate");
     expect(integration).toContain("freeze it at build go");
     expect(integration).toContain("never rewrite or substitute the existing title of a given ticket");
     expect(integration).toContain("public titles carry no invented identifier prefix");
@@ -238,7 +256,7 @@ describe("description-based naming contract", () => {
     const handoff = collapsed("references/handoff.md");
     const fork = collapsed("references/fork.md");
     for (const marker of [
-      "git push -u origin feature/<feature-slug>",
+      "git push -u <pushremote> feature/<feature-slug>",
       "--head feature/<feature-slug>",
       "## what was built — feature/<feature-slug>",
       "gh run list --branch feature/<feature-slug>",
@@ -257,6 +275,11 @@ describe("description-based naming contract", () => {
       ]) expect(body, `${name}: ${marker}`).toContain(marker);
     }
     expect(fork).toContain("never claim complete race elimination");
+    for (const body of [handoff, fork]) {
+      for (const marker of ["nothing is lost", "local branch, worktree, and commits remain intact", "nothing new was posted", "new descriptive identity"]) {
+        expect(body).toContain(marker);
+      }
+    }
   });
 
   it("pins all commit forms and retained GitHub/task-local numbering", () => {
@@ -277,16 +300,69 @@ describe("description-based naming contract", () => {
       if (file === "references/workflow-detail.md") {
         body = body.replace(/<!-- LEGACY-RESUME-START:[\s\S]*?<!-- LEGACY-RESUME-END -->/, "");
       }
-      expect(body, file).not.toMatch(/<NN>|F<NN>|f<NN>|feature\/<NN>|<NN>-<slug>|<feature-(?:number|id)>/);
-      expect(body, file).not.toMatch(/feature\/\d|doc\/plan\/\d|\bF\d+:|\bf\d+:/);
+      expect(body, file).not.toMatch(/<nn>|f<nn>|feature\/<nn>|<nn>-<slug>|<feature-(?:number|id)>/i);
+      expect(body, file).not.toMatch(/feature\/\d|doc\/plan\/\d|\bf\d+:/i);
       expect(body, file).not.toMatch(/next free (?:feature )?(?:id|number)|global feature (?:id|number)/i);
     }
   });
 
-  it("updates contributor checkout guidance without scanning historical records", () => {
+  it("pins the workflow's hard pre-tool presentation gate, replacement, and residual-race disclosure", () => {
+    const workflow = collapsed("references/workflow-detail.md");
+    for (const marker of [
+      "hard presentation gate", "immediately after the explicit build go", "first read the references required for phase 2",
+      "required reference reads are the only tool calls allowed before the announcement",
+      "before every workspace, preflight, or mutating command", "before `enterworktree`",
+      "complete identity announcement as user-visible prose", "never only as hidden reasoning",
+      "may share the same assistant response with later tool calls", "requires no user reply",
+      "after the required reference reads, do not invoke a workspace, fetch, validation, preflight, mutating command, or `enterworktree` before this prose is visible",
+      "collision checks cover shared/fetched state but cannot eliminate simultaneous or disconnected same-slug races",
+      "author and revalidate a more specific descriptive slug", "repeat the entire fetched/filesystem/ref collision preflight",
+      "repeat the full title/slug/branch/plan announcement",
+    ]) expect(workflow).toContain(marker);
+    expect(workflow).not.toContain("before the first phase 2 tool call");
+    expect(workflow).not.toContain("do not invoke even a read");
+    const ordered = [
+      "title: `<title>`", "slug: `<feature-slug>`", "branch: `feature/<feature-slug>`",
+      "plan: `doc/plan/<feature-slug>/`", "race disclosure:",
+    ];
+    for (let index = 0; index < ordered.length - 1; index += 1) {
+      expectBefore(workflow, ordered[index]!, ordered[index + 1]!);
+    }
+    expectBefore(workflow, "repeat the entire fetched/filesystem/ref collision preflight", "repeat the full title/slug/branch/plan announcement");
+  });
+
+  it("uses canonical issue numbers and exact frozen Title through ticket creation", () => {
+    const creation = read("references/ticket-creation.md");
+    const integration = read("references/ticket-integration.md");
+    for (const marker of [
+      '--search "<Title>"', '--title "<Title>"', '`title=<Title>`',
+      "equal the display title frozen at build go byte-for-byte", "cached `title` must equal the exact frozen `<Title>`",
+    ]) expect(creation).toContain(marker);
+    expect(integration).toContain("the same exact frozen `<Title>` byte-for-byte");
+    expect(creation).toContain("`<target>#N`");
+    expect(integration).toMatch(/only\s+that integer ever appears in a linking keyword/);
+  });
+
+  it("uses pushRemote for resolved maintainer operations and confines origin to the git-only degrade", () => {
+    const workflow = collapsed("references/workflow-detail.md");
+    const handoff = collapsed("references/handoff.md");
+    for (const marker of [
+      "refs/remotes/<pushremote>/head", "git remote show <pushremote>", "git fetch <pushremote>",
+      "<pushremote>/<targetdefault>", "git push -u <pushremote> feature/<feature-slug>",
+      "<pushremote>/feature/<feature-slug>",
+    ]) expect(`${workflow} ${handoff}`).toContain(marker);
+    expect(workflow).toContain("only the explicit no-`gh` git-only degrade uses literal `origin`");
+    expect(handoff).toContain("explicit no-`gh` git-only degrade alone reserves literal `origin`");
+  });
+
+  it("updates contributor and changelog contracts without scanning historical records", () => {
     const contributing = fs.readFileSync(path.resolve(SKILL_DIR, "../../../CONTRIBUTING.md"), "utf8").replace(/\r\n/g, "\n");
+    const changelog = fs.readFileSync(path.resolve(SKILL_DIR, "../../../CHANGELOG.md"), "utf8").replace(/\r\n/g, "\n");
     expect(contributing).toContain("git checkout feature/<feature-slug>");
-    expect(contributing).not.toMatch(/git checkout feature\/<NN>-<slug>/i);
+    expect(contributing).not.toMatch(/git checkout feature\/<nn>-<slug>/i);
+    const unreleased = changelog.slice(changelog.indexOf("## [Unreleased]"), changelog.indexOf("### Added — evaluate skill"));
+    for (const marker of ["descriptive slug", "canonical numeric reference", "`t01`", "legacy"])
+      expect(unreleased.toLowerCase()).toContain(marker);
   });
 });
 
