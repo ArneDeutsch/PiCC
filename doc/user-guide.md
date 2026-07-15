@@ -21,9 +21,11 @@ in-memory model. From then on, on Pi's own agent loop:
   variable, and shell-injection processing — the body loads only on activation (progressive
   disclosure).
 - **Subagents** dispatch via the `Agent` tool into fresh, isolated sessions and return their final
-  message verbatim. A failed dispatch is reported as a loud failure naming the cause — never a
-  silent empty success — and every run leaves a transcript on disk, shows live progress while it
-  runs, records its token/cost, and can be resumed or steered via `SendMessage`. **Worktrees** swap
+  message verbatim — with one exception: a `subagent_type: "fork"` dispatch **inherits the parent
+  conversation** instead of starting fresh (see §4). A failed dispatch is reported as a loud failure
+  naming the cause — never a silent empty success — and every run leaves a transcript on disk, shows
+  live progress while it runs, records its token/cost, and can be resumed or steered via
+  `SendMessage`. **Worktrees** swap
   the session's working directory so the project's own git tooling detects worktree mode.
 
 Nothing is written to your project's tracked files. For the full design see
@@ -164,8 +166,18 @@ Then use it like Claude Code:
 - the model activates skills itself via the `Skill` tool when a task matches a description
 - the model dispatches subagents via the `Agent` tool (description-driven routing; the built-in
   `general-purpose`/`Explore`/`Plan` types complement project agents, a same-named project agent
-  overrides a built-in, and an omitted `subagent_type` defaults to general-purpose).
-  dispatch runs in the **background by default** (matching Claude 2.1.198): an omitted
+  overrides a built-in, and an omitted `subagent_type` defaults to general-purpose). The special
+  `subagent_type: "fork"` type does **not** start fresh — it **inherits the parent conversation**
+  (full history + the parent's model and tools), so you can hand a fork a side task that already
+  knows the whole situation; only its final result returns (its intermediate steps stay out of the
+  main conversation). A fork is honored **only for a dispatch made by the main session** and is
+  gated by the `CLAUDE_CODE_FORK_SUBAGENT` environment variable — set it to `1` to force fork
+  inheritance on, or to `0` to force it off; **left unset it is enabled** (a deliberate PiCC choice).
+  A fork is **not resumable**, and a fork cannot spawn another fork. Whenever a `"fork"` dispatch
+  can't inherit — env off, a nested (non-main-session) dispatcher, print/headless mode with no
+  parent transcript, a fork-spawns-fork, or an SDK that can't fork — it runs with fresh context and
+  says so in a footer note on the result, rather than silently pretending it inherited.
+  Dispatch runs in the **background by default** (matching Claude 2.1.198): an omitted
   `run_in_background` returns a task id immediately, so multiple dispatches in one turn parallelize —
   results are polled/awaited via `TaskOutput` and stopped via `TaskStop`, and a background settlement
   is announced to the coordinator at its next turn without polling. Pass `run_in_background: false`
@@ -248,6 +260,8 @@ Every subagent is now visible, both to you and to the coordinating model:
     when the conversation next continues; PiCC v1 does not re-invoke an idle agent.
   - **`context: fork` / override dispatches are not resumable** — their restricted definition can't
     be re-derived by name, so they are deliberately refused.
+  - **`subagent_type: "fork"` dispatches are not resumable** — a fork's inherited context is the
+    parent conversation *at fork time* and can't be safely re-derived, so `SendMessage` refuses it.
 
 ## 5. Control surface (project-external)
 
@@ -352,7 +366,12 @@ that settlement *timing*: PiCC delivers the notice next-turn where Claude notifi
 `maxDepth × concurrency`) — a conservative PiCC choice, not Claude's single global cap. And
 `SendMessage` resume/steer — no cross-restart resume, steering reaches only
 background dispatches, idle-parent delivery is next-turn, and `context: fork`/override dispatches
-are non-resumable. `maxTurns` is a best-effort cap. Auto memory (`MEMORY.md`) and agent `memory:`
+are non-resumable. The `subagent_type: "fork"` dispatch (inherit the parent conversation) is
+supported at a named limit: main-session dispatch only, env-gated by `CLAUDE_CODE_FORK_SUBAGENT`
+(unset ⇒ enabled), non-resumable, no fork-spawns-fork, and — because PiCC reconstructs rather than
+byte-copies the parent's base prompt — it forgoes the prompt-cache saving; print/headless and
+`isolation: worktree` forks are deferred and degrade visibly to fresh context. `maxTurns` is a
+best-effort cap. Auto memory (`MEMORY.md`) and agent `memory:`
 scopes load with full parity, but writes are conservative by default — memory is written only on
 an explicit request to remember, a deliberate divergence from Claude Code's proactive writes (opt
 into eager writes via `CLAUDE.md`).

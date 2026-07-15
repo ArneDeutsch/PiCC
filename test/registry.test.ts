@@ -227,9 +227,39 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(sm?.note).toContain("stable agent id");
     expect(sm?.note).toContain("PiCC-defined model-visible wording");
     expect(sm?.note).toContain("not verified as exact Claude wording");
-    for (const gap of ["no cross-restart resume", "steering is background-only", "next-turn", "fork/agentOverride"]) {
+    for (const gap of ["no cross-restart resume", "steering is background-only", "next-turn"]) {
       expect(sm?.note).toContain(gap);
     }
+    // F16: the old "fork/agentOverride ... unsupported" phrasing was reworded — a
+    // fork is now a partial capability (tool.Agent.fork), unsupported only for
+    // RESUME (non-resumable). The note must say so and cross-reference the entry,
+    // and must NOT reintroduce the flat "fork ... unsupported" contradiction.
+    expect(sm?.note).toContain("fork dispatches are non-resumable");
+    expect(sm?.note).toContain("tool.Agent.fork");
+  });
+
+  // F16: subagent_type:"fork" is a dedicated partial capability — inherits the
+  // parent conversation (main-session only), env-gated, non-resumable, cannot
+  // spawn another fork, and its system prompt is a same-context reconstruction.
+  it("carries a tool.Agent.fork entry as partial naming the fork semantics and limits", () => {
+    const fork = lookupCapability("tool.Agent.fork");
+    expect(fork, "tool.Agent.fork must exist").toBeDefined();
+    expect(fork?.tier).toBe("partial");
+    // Single-line note (the invariants block also enforces this globally).
+    expect(fork?.note).not.toContain("\n");
+    // Core inheritance + the env gate + the disclosed model overrides.
+    expect(fork?.note).toContain("inherits the parent conversation");
+    expect(fork?.note).toContain("CLAUDE_CODE_FORK_SUBAGENT");
+    expect(fork?.note).toContain("CLAUDE_CODE_SUBAGENT_MODEL");
+    // Main-session-only, non-resumable, no-nested-fork, and the reconstruction limit.
+    expect(fork?.note).toContain("MAIN-SESSION dispatch ONLY");
+    expect(fork?.note).toContain("NON-RESUMABLE");
+    expect(fork?.note).toContain("CANNOT SPAWN ANOTHER FORK");
+    expect(fork?.note).toContain("RECONSTRUCTION");
+    // Verified vs INFERRED/PiCC-defined claims are separated in the note.
+    expect(fork?.note).toContain("PiCC-DEFINED / INFERRED");
+    // Resolves the research section reference.
+    expect(fork?.note).toContain("§2.9");
   });
 
   // TaskOutput reports failed status (never empty success); TaskStop's discard
