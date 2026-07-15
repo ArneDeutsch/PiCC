@@ -59,7 +59,11 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
   returns a task id, collected via `TaskOutput`/`TaskStop`, and its settlement is pushed to the
   coordinator without polling; pass `run_in_background: false` for a synchronous inline result, or set
   `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` to force every dispatch to the foreground. `SendMessage`
-  resumes a finished subagent or steers a running one.
+  resumes a finished subagent or steers a running one. A `subagent_type: "fork"` dispatch is the one
+  type that **inherits the parent conversation** instead of starting fresh (main-session only,
+  env-gated by `CLAUDE_CODE_FORK_SUBAGENT` — unset ⇒ enabled, non-resumable; degrades visibly to
+  fresh context when it can't inherit) — distinct from the skill `context: fork` above, which runs a
+  *skill* in a fresh, isolated subagent (maximum isolation, the opposite of conversation inheritance).
 - **Worktrees** — `EnterWorktree`/`ExitWorktree` with a real session-cwd swap, `.worktreeinclude`
   seeding, Windows-tolerant lifecycle, parallel sessions on one repo.
 - **Hooks** — 13 events (`PreToolUse` … `WorktreeRemove`), full stdin-JSON/stdout-decision

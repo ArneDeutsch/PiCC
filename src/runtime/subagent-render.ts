@@ -4,7 +4,7 @@ import {
   sanitizeProgressText,
   type ProgressSnapshot,
 } from "./subagent-progress.js";
-import { isAgentId } from "../util/subagent-transcripts.js";
+import { FORK_DEGRADE_PREFIX, isAgentId } from "../util/subagent-transcripts.js";
 
 // --- t03 live-progress + result rendering helpers ---
 //
@@ -107,6 +107,35 @@ function pushIdentitySubline(
 ): void {
   const id = agentIdOf(details);
   if (id) pushColored(theme, "muted", id, width, into);
+}
+
+/**
+ * The developer-facing fork-degrade footer (F16). A `subagent_type: "fork"`
+ * dispatch that could not inherit the parent conversation runs fresh and records
+ * a fork-SPECIFIC diagnostic (never the generic unknown-type warning) whose
+ * message starts with this sentinel. We surface it as a muted footer line so the
+ * degrade is VISIBLE — distinguishing a genuine inherited fork (no such line,
+ * honest `Agent(fork)` badge) from a degraded one (this line + a fresh-agent
+ * badge). Read from `details.diagnostics`, the channel BOTH the foreground Agent
+ * result and the background TaskOutput result already carry — so no extra
+ * plumbing is needed. `FORK_DEGRADE_PREFIX` is the shared sentinel (imported from
+ * the transcript util) that the emitter in subagents.ts writes.
+ */
+function forkDegradeLine(
+  details: Record<string, unknown>,
+): { text: string; tone: string } | undefined {
+  const diags = details.diagnostics;
+  if (!Array.isArray(diags)) return undefined;
+  for (const d of diags) {
+    const msg = d && typeof d === "object" ? (d as { message?: unknown }).message : undefined;
+    if (typeof msg === "string" && msg.startsWith(FORK_DEGRADE_PREFIX)) {
+      const severity = (d as { severity?: unknown }).severity;
+      // Tone: `warning` for a genuine can't-do (no transcript, SDK can't fork,
+      // forkFrom threw); muted/calm for a chosen/expected opt-out (env `=0`).
+      return { text: msg, tone: severity === "warning" ? "warning" : "muted" };
+    }
+  }
+  return undefined;
 }
 
 /** First non-empty line of `text`, trimmed and capped for a one-line preview. */
@@ -425,6 +454,12 @@ export function renderAgentResult(
       }
       // Wrap each footer line to width (word-wrap, ANSI-aware) as a final guard.
       for (const f of footer) pushColored(theme, "muted", f, width, lines);
+      // F16: a degraded fork's fork-specific notice — its own footer line, toned
+      // calm (muted) for an expected opt-out and `warning` for a genuine can't-do,
+      // so the developer sees WHY a "fork" ran with fresh context (the badge above
+      // already reads as the fresh agent, not `Agent(fork)`).
+      const forkLine = forkDegradeLine(details);
+      if (forkLine) pushColored(theme, forkLine.tone, sanitizeInline(forkLine.text), width, lines);
       return clampLines(lines.length ? lines : [""], width);
     },
   };

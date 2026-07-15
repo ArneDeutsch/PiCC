@@ -10,7 +10,12 @@ import {
   resolveSubagentTranscript,
   subagentSessionDir,
 } from "../src/util/subagent-transcripts.js";
-import { createAgentToolDefinition, type PiSdk } from "../src/runtime/subagents.js";
+import {
+  createAgentToolDefinition,
+  createSendMessageToolDefinition,
+  type PiSdk,
+} from "../src/runtime/subagents.js";
+import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import {
   BackgroundTaskRegistry,
   createTaskOutputTool,
@@ -393,6 +398,93 @@ describe("dispatch persists a transcript (real Pi SessionManager)", () => {
     expect(result.ok).toBe(true);
     expect(result.resumable).toBe(false);
     expect(result.diagnostics.some((d) => d.message.includes("unavailable in this SDK"))).toBe(true);
+  });
+});
+
+describe("fork inheritance on the REAL Pi SessionManager (F16 t01)", () => {
+  // Fork inheritance defaults to ENABLED; ensure the gate is unset for these
+  // tests (process.env is global within a file — a sibling test could set it).
+  afterEach(() => {
+    delete process.env.CLAUDE_CODE_FORK_SUBAGENT;
+  });
+
+  /** Seed a REAL parent transcript with a unique token; return {file, token}. */
+  function seedParentTranscript(): { file: string; token: string; sessionsDir: string } {
+    const sessionsDir = tempSessionsDir();
+    const token = `PARENT-TOKEN-${mintAgentId()}`;
+    const parent = SessionManager.create(sessionsDir, sessionsDir, { id: "0197-main-session" });
+    parent.appendMessage({ role: "user", content: `the parent said: ${token}` } as never);
+    parent.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "understood" }],
+      stopReason: "stop",
+    } as never);
+    const file = parent.getSessionFile()!;
+    expect(fs.existsSync(file)).toBe(true);
+    return { file, token, sessionsDir };
+  }
+
+  it("a depth-1 fork seeds the child with the parent's full history (genuine inheritance)", async () => {
+    const { file: parentFile, token } = seedParentTranscript();
+    const h = fakeSdk({ replies: ["the fork's own verbatim answer"] });
+    const runtime = makeSubagentRuntime([], h.sdk, { getMainSessionFile: () => parentFile });
+    const result = await runtime.dispatch({ subagentType: "fork", prompt: "continue", depth: 1 });
+
+    expect(result.ok).toBe(true);
+    expect(result.isFork).toBe(true);
+    expect(result.resumable).toBe(false);
+    expect(result.transcriptPath).toBeDefined();
+    // The fork's OWN transcript is a NEW file in the subagents sibling dir.
+    expect(path.resolve(result.transcriptPath!)).not.toBe(path.resolve(parentFile));
+    expect(path.dirname(path.resolve(result.transcriptPath!))).toBe(
+      path.resolve(subagentSessionDir(parentFile)),
+    );
+    // Reopen the fork's own file from disk: it carries the inherited parent token.
+    const reopened = SessionManager.open(result.transcriptPath!);
+    const texts = JSON.stringify(reopened.buildSessionContext().messages);
+    expect(texts).toContain(token);
+    // …and the fork's own reply (output isolation keeps intermediate turns local,
+    // but the child transcript itself records the whole run).
+    expect(texts).toContain("the fork's own verbatim answer");
+    // Only the fork's final assistant message returns to the parent.
+    expect(result.finalMessage).toBe("the fork's own verbatim answer");
+  });
+
+  it("forking NEVER modifies the parent transcript (no reopen-in-place)", async () => {
+    const { file: parentFile } = seedParentTranscript();
+    const before = readEntries(parentFile);
+    const h = fakeSdk({ replies: ["done"] });
+    const runtime = makeSubagentRuntime([], h.sdk, { getMainSessionFile: () => parentFile });
+    await runtime.dispatch({ subagentType: "fork", prompt: "p", depth: 1 });
+    const after = readEntries(parentFile);
+    // Byte-for-byte identical: the fork wrote a brand-new file, not the parent's.
+    expect(after).toEqual(before);
+  });
+
+  it("a fork is non-resumable and SendMessage refuses it cleanly (persisted transcript notwithstanding)", async () => {
+    const { file: parentFile } = seedParentTranscript();
+    const registry = new SubagentRegistry();
+    const backgroundTasks = new BackgroundTaskRegistry();
+    const h = fakeSdk({ replies: ["ok"] });
+    const runtime = makeSubagentRuntime([], h.sdk, {
+      getMainSessionFile: () => parentFile,
+      subagentRegistry: registry,
+    });
+    const result = await runtime.dispatch({ subagentType: "fork", prompt: "p", depth: 1 });
+    // Persisted-transcript posture (a real child file exists) yet non-resumable.
+    expect(result.transcriptPath).toBeDefined();
+    expect(fs.existsSync(result.transcriptPath!)).toBe(true);
+    expect(result.resumable).toBe(false);
+
+    const sm = createSendMessageToolDefinition(runtime, {
+      registry,
+      backgroundTasks,
+    }) as unknown as {
+      execute: (id: string, params: Record<string, unknown>) => Promise<unknown>;
+    };
+    await expect(sm.execute("s", { to: result.agentId, message: "follow up" })).rejects.toThrow(
+      /not resumable/i,
+    );
   });
 });
 

@@ -662,7 +662,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const subagentRuntime = new SubagentRuntime({
     getAgents: () => project.agents,
     buildSystemPrompt: buildSubagentSystemPrompt,
-    customToolsFor: (agent, granted, depth, ownerAgentId, subCwd) => {
+    customToolsFor: (agent, granted, depth, ownerAgentId, dispatcherIsFork, subCwd) => {
       // Per-dispatch instances (fresh TaskStore, dispatch-local cwd binding).
       // NOTE (t04): SendMessage is deliberately NEVER built here — it is
       // parent-initiated only (no subagent→subagent or subagent→parent channel).
@@ -702,9 +702,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       ) {
         // Both Claude names: projects grant and reference the dispatch tool as Task.
         // `ownerAgentId` tags tasks THIS subagent starts, so its own scoped tools
-        // (above) — and nobody else's — can reach them (F13 t02).
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId }));
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId }));
+        // (above) — and nobody else's — can reach them (F13 t02). `dispatcherIsFork`
+        // (F16 t02) marks these tools when the dispatcher is a genuine fork, so a
+        // nested `subagent_type: "fork"` is refused (a fork can't spawn a fork).
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId, dispatcherIsFork }));
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId, dispatcherIsFork }));
       }
       return tools;
     },
