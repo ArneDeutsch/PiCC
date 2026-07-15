@@ -14,13 +14,15 @@ Observable behaviour:
 - Calling `NotebookRead` on a `.ipynb` path returns per-cell content: for each cell,
   its index, type (code / markdown / raw), the source, and — for code cells — its
   outputs (stream text, `text/plain` results, error tracebacks).
-- Large or binary outputs (base64 images, oversized streams) are **elided or
-  truncated** to a short placeholder that names the mime-type and approximate size,
-  rather than dumped into context.
+- Large or binary outputs are **elided or truncated** rather than dumped into context:
+  raster images (`image/png`/`jpeg`/…) are noted by mime-type with an approximate
+  (base64-length) size; other binary/structured outputs (SVG, `application/json`) are
+  noted by mime-type only; oversized text outputs are head-truncated to a marker.
 - The registry entry `tool.NotebookRead` moves from `degraded-noop` to `partial`; the
   capability matrix is regenerated and drift guards stay green. (Tier is `partial`, not
-  the `full` originally worded in #16, because image outputs are noted rather than
-  rendered — decided with the user; see the Note under Tasks.)
+  the `full` originally worded in #16, for two reasons: image outputs are noted rather
+  than rendered visually, and single-cell selection (`cell_id`) is not supported —
+  decided with the user; see the Note under Tasks.)
 
 Non-goals:
 

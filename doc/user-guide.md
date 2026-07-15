@@ -356,9 +356,10 @@ are non-resumable. `maxTurns` is a best-effort cap. Auto memory (`MEMORY.md`) an
 scopes load with full parity, but writes are conservative by default — memory is written only on
 an explicit request to remember, a deliberate divergence from Claude Code's proactive writes (opt
 into eager writes via `CLAUDE.md`). `NotebookRead` reads a `.ipynb` cell by cell (source plus
-stream / `text/plain` / error outputs); it is partial because image and other binary outputs are
-noted by mime-type and approximate size rather than rendered visually, and oversized text outputs are
-head-truncated. Reach for `NotebookRead` (not the inherited `Read`, which does not special-case
+stream / `text/plain` (and other text reprs) / error outputs); it is partial because image outputs are
+noted (raster images by mime-type with an approximate size, other binary/structured outputs by
+mime-type only) rather than rendered visually, oversized text outputs are head-truncated, and
+single-cell selection (`cell_id`) is not supported. Reach for `NotebookRead` (not the inherited `Read`, which does not special-case
 notebooks) when you want cell structure instead of raw notebook JSON; `NotebookEdit` remains a
 degraded no-op.
 
