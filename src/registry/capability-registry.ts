@@ -68,7 +68,7 @@ const TOOL_ENTRIES: CapabilityEntry[] = [
   cap("tool", "tool.Artifact", "degraded-noop", "callable no-op stub — Artifacts out of scope; the notice directs output to a regular file (§7)"),
   cap("tool", "tool.computer", "degraded-noop", "callable no-op stub — computer use out of scope (§7)"),
   cap("tool", "tool.LSP", "degraded-noop", "callable no-op stub — LSP tooling out of scope; the notice directs Grep/Read navigation (§7)"),
-  cap("tool", "tool.MultiEdit", "degraded-noop", "callable no-op stub — batch editing not implemented; the notice directs a sequence of Edit calls (§4.8)"),
+  cap("tool", "tool.MultiEdit", "full", "real implementation of the historical Claude Code MultiEdit — NOTE the pinned Claude Code baseline no longer ships MultiEdit — removed in the 2.0 line, confirmed gone by v2.0.8 — so `full` means faithful to the pre-removal contract, a superset of the pinned baseline kept as an older-project compatibility courtesy, NOT 'matches current Claude Code': batched, strictly exact-string edits (no fuzzy fallback, unlike PiCC's Edit) applied sequentially to one running buffer (each edit sees the prior edit's result), atomic (any miss rejects the whole batch, file left untouched), per-edit replace_all with unique-else-error, and an empty old_string on the first edit of a new file creates it (§4.8)"),
   cap("tool", "tool.BashOutput", "degraded-noop", "callable no-op stub — background shells not implemented; commands run in the foreground (§4.8)"),
   cap("tool", "tool.KillShell", "degraded-noop", "callable no-op stub — background shells not implemented; there is no shell to kill (§4.8)"),
   cap("tool", "tool.KillBash", "degraded-noop", "callable no-op stub — background shells not implemented; there is no shell to kill (§4.8)"),

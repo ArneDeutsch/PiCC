@@ -183,7 +183,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   it("covers the core tool surface as full and TodoWrite as partial", () => {
     for (const tool of [
       "Read", "Write", "Edit", "Bash", "Grep", "Glob",
-      "WebFetch", "WebSearch", "Skill",
+      "WebFetch", "WebSearch", "Skill", "MultiEdit",
       "EnterWorktree", "ExitWorktree",
       "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
     ]) {
@@ -364,6 +364,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     // SlashCommand is a REAL tool now (F11) — retiered to partial and no longer a stub.
     expect(lookupCapability("tool.SlashCommand")?.tier).toBe("partial");
     expect(stubNames.has("SlashCommand")).toBe(false);
+    // MultiEdit is a REAL tool now (F17) — retiered to full and no longer a stub.
+    expect(lookupCapability("tool.MultiEdit")?.tier).toBe("full");
+    expect(stubNames.has("MultiEdit")).toBe(false);
     // The stale wrong spelling must be gone: the shipped stub is "computer".
     expect(lookupCapability("tool.computer-use")).toBeUndefined();
     expect(lookupCapability("tool.computer")?.tier).toBe("degraded-noop");

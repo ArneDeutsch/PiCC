@@ -80,7 +80,7 @@ export function applyUpdatedInput(
 /** File path touched by a tool call (for nested CLAUDE.md / path-scoped rule injection). */
 export function touchedFilePath(piToolName: string, input: Record<string, unknown>): string | undefined {
   const tool = toClaudeToolName(piToolName);
-  if (["Read", "Write", "Edit"].includes(tool)) {
+  if (["Read", "Write", "Edit", "MultiEdit"].includes(tool)) {
     const p = input.file_path ?? input.path;
     return typeof p === "string" ? p : undefined;
   }

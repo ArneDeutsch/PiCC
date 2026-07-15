@@ -154,9 +154,15 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
   gitignored `.claude/.picc/config.json`); provides per-model steering text and the
   effort→thinking-level mapping (plan §10, §13.2).
 - `tools/` — the registered Claude-named tools: `web-tools.ts` (`WebFetch`/`WebSearch`, real),
-  `search-tools.ts` (`Grep`/`Glob`), `task-tools.ts` (`Task*` tracking), `worktree-tools.ts`
-  (`EnterWorktree`/`ExitWorktree`), and `degrade-stubs.ts` (names that resolve for gating but no-op
-  with a notice — `NotebookEdit`, `LSP`, `AskUserQuestion`, `ExitPlanMode`, …).
+  `search-tools.ts` (`Grep`/`Glob`), `multi-edit.ts` (`MultiEdit` — a real, atomic, sequential
+  exact-string multi-edit of one file: edits apply to a running buffer, per-edit `replace_all`, and
+  any miss rejects the whole batch leaving the file untouched), `task-tools.ts` (`Task*` tracking),
+  `worktree-tools.ts` (`EnterWorktree`/`ExitWorktree`), and `degrade-stubs.ts` (names that resolve
+  for gating but no-op with a notice — `NotebookEdit`, `LSP`, `AskUserQuestion`, `ExitPlanMode`, …).
+  `MultiEdit` routes through the same permission/hook/path-injection machinery as `Edit`, and an
+  `Edit(…)` permission rule already gates it (the file-edit family); note that it graduated from a
+  degraded no-op to a *real writer*, so a project can no longer rely on MultiEdit degrading to a
+  no-op as an implicit safety net — its `Edit`/`MultiEdit` deny rules are what hold.
 
 ### `registry/` — the single source of truth for "what's supported"
 - `capability-registry.ts` — `CAPABILITY_REGISTRY: CapabilityEntry[]` and `CLAUDE_BASELINE`. Every
