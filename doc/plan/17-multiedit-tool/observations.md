@@ -24,6 +24,11 @@ Running record of friction, bugs, and follow-up candidates. Raw material for rev
 - 2026-07-15 **Deferred nits (defensible as-is, logged):** (a) on the file-creation path the running buffer starts as the raw `new_string` and later edits match it verbatim (not LF-normalized) — intended, since the model authored that content in the same call; documented inline. (b) empty `old_string` + empty `new_string` on a new file is rejected as "nothing to create" — a degenerate no-op; rejecting with a clear message is fine. (c) `applyEdits` is exported as a pure core but only exercised via `.execute` — harmless; kept per the plan's "pure core for testability".
 - 2026-07-15 **Forward note for t02 (security):** the path-parity guarantee holds only if `getCwd()` and the guard's per-call `cwd` are the same source (main = `cwdState`, subagent = `subCwd`) and MultiEdit registers behind the same guard as Edit/Write — both verified in Phase 4; re-confirm in t02 review.
 
+## Phase 7 — t02 (wiring + registry retier)
+
+- 2026-07-15 t02 landed green (full suite 1110 pass). Four wiring edits + registry retier + matrix regen + reworked tests, all in the declared writable surface (no fixture / permissions change). Review fan-out: coder/claude-parity/docs/tester all PASS, no must-fix/should-fix. Applied one claude-parity NIT: tightened the registry note's version wording ("removed in the 2.0 line, confirmed gone by v2.0.8" instead of the imprecise "about v2.0.8"); regenerated the matrix.
+- 2026-07-15 Verified independently: main/subagent security parity holds (tool `getCwd` == guard `getCwd`; MultiEdit behind the shared guard, no un-guarded path); the registry drift guard is mutual (retier-without-destub or destub-without-retier both fail); the fresh-instance integration test would fail if the `touchedFilePath` edit were reverted. Harmless NIT left as-is: the integration test's 500ms IIFE wait is unnecessary (guard registers synchronously) but kept for `beforeAll` parity.
+
 ## Follow-up candidates (out of scope; for Phase 8 issue-filing offer)
 
 - **Edit exactness audit:** registry claims `tool.Edit` is "exact-string" but Pi's `edit` fuzzy-normalizes on a miss. Worth verifying the claim actually holds / correcting the note. (claude-parity)

@@ -66,10 +66,6 @@ export const DEGRADED_TOOLS: Array<{ name: string; note: string }> = [
     note: "language-server integration is out of scope; use Grep/Read to navigate code (plan §7)",
   },
   {
-    name: "MultiEdit",
-    note: "batch editing is not implemented; apply the changes as a sequence of Edit calls instead",
-  },
-  {
     name: "BashOutput",
     note: "background shells are not implemented; commands run in the foreground, so their output was already returned",
   },
@@ -84,4 +80,6 @@ export const DEGRADED_TOOLS: Array<{ name: string; note: string }> = [
   // SlashCommand is a REAL tool now (F11, src/index.ts createSlashCommandTool) —
   // a thin alias over the shared skill-activation path, no longer a degraded no-op.
   // TaskOutput/TaskStop are REAL tools now (audit E4, src/runtime/background-tasks.ts).
+  // MultiEdit is a REAL tool now (F17, src/runtime/tools/multi-edit.ts) — an atomic,
+  // sequential, exact-string multi-edit, no longer a degraded no-op.
 ];
