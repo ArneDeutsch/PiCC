@@ -6,6 +6,25 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — richer git commit messages by default (2026-07-15)
+
+- **PiCC's always-on conventions block now carries a short commit-message nudge, so a
+  GPT/Codex model writes richer commit messages by default.** When the model is asked to
+  commit, it is nudged to first read the changes (`git status`/`diff`) and the recent
+  `git log`, match the repository's established commit-message style where that style is
+  richer, and — for a non-trivial change — include a short body explaining *why* the change
+  was made, not just what. **Why you'd care:** it narrows the visible quality gap between
+  Claude Code-authored and PiCC-authored commits on the same repo, so a repo's history stays
+  more consistent no matter which harness drafted the commit. This is a best-effort prompt nudge
+  that *approximates* Claude Code's commit quality — outcome is model-dependent, it does not
+  reproduce Claude Code's full commit ceremony (no HEREDOC commit form, no attribution
+  trailer, no parallel git batching), and it changes nothing about attribution
+  (`includeCoAuthoredBy`). The existing `git commit --no-verify` prohibition is preserved.
+  It applies to every project run under PiCC, not just this one. The lever if you want
+  different behavior is the existing per-model `steering` config, which layers on top of the
+  built-in default (see the user guide) — a contrary steering entry can, for example, tone a
+  commit message back down to a terse subject-only line.
+
 ### Changed — background-by-default subagent dispatch (2026-07-14)
 
 - **Subagent dispatch (`Agent`/`Task`) now runs in the background by default, matching Claude Code
