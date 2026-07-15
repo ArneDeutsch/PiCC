@@ -4,7 +4,7 @@ import {
   sanitizeProgressText,
   type ProgressSnapshot,
 } from "./subagent-progress.js";
-import { isAgentId } from "../util/subagent-transcripts.js";
+import { FORK_DEGRADE_PREFIX, isAgentId } from "../util/subagent-transcripts.js";
 
 // --- t03 live-progress + result rendering helpers ---
 //
@@ -118,10 +118,9 @@ function pushIdentitySubline(
  * honest `Agent(fork)` badge) from a degraded one (this line + a fresh-agent
  * badge). Read from `details.diagnostics`, the channel BOTH the foreground Agent
  * result and the background TaskOutput result already carry — so no extra
- * plumbing is needed. The prefix MUST match `FORK_DEGRADE_PREFIX` in subagents.ts.
+ * plumbing is needed. `FORK_DEGRADE_PREFIX` is the shared sentinel (imported from
+ * the transcript util) that the emitter in subagents.ts writes.
  */
-const FORK_DEGRADE_PREFIX = "fork ran with fresh context: ";
-
 function forkDegradeLine(
   details: Record<string, unknown>,
 ): { text: string; tone: string } | undefined {

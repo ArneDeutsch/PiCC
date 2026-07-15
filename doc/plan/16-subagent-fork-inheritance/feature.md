@@ -81,7 +81,11 @@ because several documented edges are deferred.
 
 - The unrelated skill-frontmatter **`context: fork`** (runs a *skill* in a fresh,
   isolated subagent — maximum isolation) is untouched; it is a different feature
-  that happens to share the word "fork".
+  that happens to share the word "fork". (One reserved-name edge: a `context: fork`
+  skill whose frontmatter also names its agent literally `fork` dispatches with
+  `subagent_type: "fork"` and so routes into *this* inheriting-fork path — `"fork"`
+  is a reserved subagent type. Normal `context: fork` skills dispatch as
+  `fork:<skill>` and are unaffected; see research §2.9.)
 - The **git fork / PR contribution workflow** (F12) is unrelated and untouched.
 - **Normal named subagents keep fresh-context semantics** — that is correct and
   faithful to Claude Code; only `"fork"` inherits.

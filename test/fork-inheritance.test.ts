@@ -1,10 +1,14 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createAgentToolDefinition,
   type PiSessionMessage,
 } from "../src/runtime/subagents.js";
+import {
+  BackgroundTaskRegistry,
+  createTaskOutputTool,
+} from "../src/runtime/background-tasks.js";
 import { renderAgentResult } from "../src/runtime/subagent-render.js";
-import { subagentSessionDir } from "../src/util/subagent-transcripts.js";
+import { FORK_DEGRADE_PREFIX, subagentSessionDir } from "../src/util/subagent-transcripts.js";
 import {
   fakeSdk,
   makeSubagentRuntime,
@@ -29,8 +33,15 @@ const SEED: PiSessionMessage[] = [
   { role: "assistant", content: [{ type: "text", text: "ack" }], stopReason: "stop" },
 ];
 
+// Save/restore the gate env around each test (matching runtime-core.test.ts) so a
+// test that sets it can never leak the value into a sibling test or the harness.
+let prevForkEnv: string | undefined;
+beforeEach(() => {
+  prevForkEnv = process.env[FORK_ENV];
+});
 afterEach(() => {
-  delete process.env[FORK_ENV];
+  if (prevForkEnv === undefined) delete process.env[FORK_ENV];
+  else process.env[FORK_ENV] = prevForkEnv;
 });
 
 function forkRuntime(
@@ -309,7 +320,52 @@ describe("fork dispatch reaches the developer-facing footer through the Agent to
       run_in_background: false,
     });
     const diagnostics = res.details.diagnostics as Array<{ message: string }>;
-    expect(diagnostics.some((d) => d.message.startsWith("fork ran with fresh context:"))).toBe(true);
+    expect(diagnostics.some((d) => d.message.startsWith(FORK_DEGRADE_PREFIX))).toBe(true);
     expect(res.details.agent).toBe("general-purpose");
+  });
+});
+
+describe("fork dispatch reaches the developer-facing footer through the BACKGROUND (TaskOutput) surface", () => {
+  it("a degraded fork dispatched with run_in_background:true carries the fork diagnostic on the settled TaskOutput result", async () => {
+    // Acceptance: the degrade footer must reach BOTH the synchronous AND the
+    // backgrounded/TaskOutput surface. Dispatch a degrading fork (env=0) in the
+    // background, wait for settlement, then read the SETTLED TaskOutput result and
+    // assert its details.diagnostics carries the fork-specific message — the same
+    // channel the renderer's muted footer reads (background-tasks copies the
+    // dispatch diagnostics onto the task record → TaskOutput details).
+    process.env[FORK_ENV] = "0";
+    const { runtime } = forkRuntime();
+    const registry = new BackgroundTaskRegistry();
+    const tool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: registry,
+    }) as unknown as {
+      execute: (
+        id: string,
+        params: Record<string, unknown>,
+      ) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
+    };
+    const started = await tool.execute("t", {
+      subagent_type: "fork",
+      prompt: "p",
+      run_in_background: true,
+    });
+    const taskId = String(started.details.taskId);
+    await registry.wait(taskId);
+    const out = await (
+      createTaskOutputTool(registry) as unknown as {
+        execute: (
+          id: string,
+          params: Record<string, unknown>,
+        ) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
+      }
+    ).execute("t2", { task_id: taskId });
+    // The fork-degrade diagnostic reached the BACKGROUND surface (the renderer's
+    // muted footer reads this same `details.diagnostics` channel). NOTE: the
+    // background badge label (`details.agent`) is the eagerly-captured requested
+    // TYPE ("fork") by design, not the final resolved agent — so only the footer
+    // channel is asserted here, matching the acceptance criterion.
+    const diagnostics = out.details.diagnostics as Array<{ message: string }>;
+    expect(diagnostics.some((d) => d.message.startsWith(FORK_DEGRADE_PREFIX))).toBe(true);
   });
 });

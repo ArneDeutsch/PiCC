@@ -27,6 +27,7 @@ import type {
 import {
   agentTrailerFrame,
   agentTrailerLine,
+  FORK_DEGRADE_PREFIX,
   isAgentId,
   mintAgentId,
   subagentSessionDir,
@@ -413,14 +414,6 @@ class Semaphore {
 const FORK_SUBAGENT_TYPE = "fork";
 
 /**
- * Prefix marking the developer-/model-facing fork-degrade line (F16). The result
- * renderer (subagent-render.ts) matches this in `details.diagnostics` to surface a
- * muted footer, so the degrade travels the same channel foreground AND background
- * (TaskOutput) results already carry — no new plumbing through background-tasks.
- */
-const FORK_DEGRADE_PREFIX = "fork ran with fresh context: ";
-
-/**
  * Synthetic agent for an inheriting fork (F16). `tools: undefined` ⇒ all-tools
  * (the main-session grant, since forks are main-session-only), `isolation:
  * undefined` ⇒ shares the parent cwd. Its neutral persona + the normal
@@ -749,7 +742,6 @@ export class SubagentRuntime {
       modelReason: string,
       devReason: string = modelReason,
     ): void => {
-      forkDegrade = { modelReason, devReason, tone };
       prompt = `(PiCC: this "fork" dispatch ran with FRESH context — it did NOT inherit the parent conversation. Reason: ${modelReason}.)\n\n${prompt}`;
       diagnostics.push({ severity: tone, message: `${FORK_DEGRADE_PREFIX}${devReason}` });
     };
@@ -1402,8 +1394,12 @@ export class SubagentRuntime {
         } else {
           // Defensive degrade: `isFork` is only set true alongside a constructed
           // `forkSession`, so this is unreachable — run fresh rather than un-forked
-          // silently if that invariant is ever violated.
+          // silently if that invariant is ever violated. Re-resolve the identity
+          // (mirroring the forkFrom-throw path) so the RESULT badge is honest
+          // (`Agent(general-purpose)`) and never reads `Agent(fork)` while the
+          // footer says it ran fresh.
           isFork = false;
+          agent = resolveAgent(builtins, "general-purpose") ?? agent;
           resumable = false;
           emitForkDegrade("warning", `the parent transcript became unavailable before forking`);
         }

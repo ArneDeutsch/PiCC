@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import picc from "../src/index.js";
@@ -58,8 +58,15 @@ afterAll(() => {
   cleanupFixture(dir);
 });
 
+// Save/restore the gate env around each test (matching runtime-core.test.ts) so a
+// test that sets it can never leak the value into a sibling test or the harness.
+let prevForkEnv: string | undefined;
+beforeEach(() => {
+  prevForkEnv = process.env[FORK_ENV];
+});
 afterEach(() => {
-  delete process.env[FORK_ENV];
+  if (prevForkEnv === undefined) delete process.env[FORK_ENV];
+  else process.env[FORK_ENV] = prevForkEnv;
 });
 
 interface AgentResult {
@@ -181,6 +188,11 @@ describe("F16 t02 — a fork cannot spawn another fork (runtime-set marker)", ()
     expect(degrade).toContain(CANNOT_SPAWN);
     expect(degrade).not.toContain(NESTED_WORDING);
     expect(degrade).not.toContain(FORK_ENV);
+    // Toned CALM (info): fork-spawns-fork is a by-design refusal, not a can't-do.
+    const innerDiag = (
+      inner.details.diagnostics as Array<{ message: string; severity: string }>
+    ).find((d) => d.message.startsWith(FORK_DEGRADE))!;
+    expect(innerDiag.severity).toBe("info");
     // The nested fork NEVER inherited: no seeded history, and forkSessionManager was
     // called EXACTLY ONCE (the top fork) — the refusal short-circuits before forkFrom.
     expect(h.sessions[1]!.inheritedMessageCount).toBe(0);
