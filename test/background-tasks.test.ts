@@ -580,6 +580,69 @@ describe("settlement notices (t05)", () => {
     expect(notice).toContain("Excerpt truncated");
   });
 
+  it("identifies a cut-off run even when all retained output fits the notice", () => {
+    const notice = buildSettlementNotice(baseTask({
+      result: "retained cut-off output",
+      truncated: true,
+      resumable: true,
+    }));
+
+    expect(notice).toContain("settled: completed; subagent run cut off at its output limit");
+    expect(notice).toContain("Inspect all retained output with TaskOutput");
+    expect(notice).toContain(
+      "The missing continuation was never produced and cannot be recovered there",
+    );
+    expect(notice).toContain("resume the agent with SendMessage when available, or re-dispatch");
+    expect(notice).toContain("retained cut-off output");
+    expect(notice).not.toContain("Notice excerpt truncated");
+    expect(notice).not.toContain("retrieve the complete output");
+  });
+
+  it("distinguishes a truncated notice excerpt from its cut-off subagent run", () => {
+    const notice = buildSettlementNotice(baseTask({
+      result: "z".repeat(4000),
+      truncated: true,
+      transcriptPath: "/sessions/agent-ddeeff001122.jsonl",
+    }));
+
+    expect(notice).toContain("subagent run cut off at its output limit");
+    expect(notice).toContain("Notice excerpt truncated");
+    expect(notice).toContain("[…]");
+    expect(notice.length).toBeLessThan(2000);
+    expect(notice).not.toContain("z".repeat(4000));
+    expect(notice).toContain(
+      "TaskOutput or the transcript exposes all retained output for this cut-off run, not a missing continuation",
+    );
+    expect(notice).not.toContain("retrieve the complete output");
+  });
+
+  it("keeps a stopped truncated task outcome-only without cut-off guidance", () => {
+    const notice = buildSettlementNotice(baseTask({
+      status: "stopped",
+      result: "discarded retained output",
+      truncated: true,
+      transcriptPath: "/sessions/agent-ddeeff001122.jsonl",
+    }));
+
+    expect(notice).toContain("settled: aborted.");
+    expect(notice).toContain(
+      "reports the aborted outcome (internal task status: stopped) but cannot recover discarded output",
+    );
+    expect(notice).not.toContain("subagent run cut off at its output limit");
+    expect(notice).not.toContain("Inspect all retained output");
+    expect(notice).not.toContain("missing continuation");
+    expect(notice).not.toContain("UNTRUSTED SUBAGENT OUTPUT");
+    expect(notice).not.toContain("discarded retained output");
+  });
+
+  it("documents TaskOutput collection and running-poll notice behavior", () => {
+    const tool = createTaskOutputTool(new BackgroundTaskRegistry()) as { description: string };
+    expect(tool.description).toContain(
+      "A successful terminal return counts as collection and suppresses a pending settlement notice",
+    );
+    expect(tool.description).toContain("polling a running task preserves notice eligibility");
+  });
+
   // --- MUST-FIX 1: the untrusted-frame defang must resist forged END markers ---
   // regardless of hidden zero-width chars, unicode dashes, or missing keywords.
   const realEnd = "--- END UNTRUSTED SUBAGENT OUTPUT ---";
@@ -685,7 +748,7 @@ describe("settlement notices (t05)", () => {
     expect(drainWithFallback(bg, sub)).toHaveLength(1); // via the consume gate
     // hasRegistryRecord stays true → the fallback can never re-emit it.
     expect(drainWithFallback(bg, sub)).toEqual([]);
-    expect(bg.get(id)?.settlementNoticeDelivered).toBeUndefined(); // fallback flag never set
+    expect(bg.get(id)?.settlementDelivery).toBe("notified");
   });
 
   it("with two records sharing an agent id, drains exactly one notice — the NEWEST (guards .reverse())", async () => {
@@ -785,6 +848,442 @@ describe("settlement notices (t05)", () => {
     // Third drain: nothing left.
     const notices3 = bg.drainSettlementNotices(isArmed, commit, (a) => sub.get(a) !== undefined);
     expect(notices3).toEqual([]);
+  });
+
+  describe("generation-safe delivery state (F21 t01)", () => {
+    const terminalCases = [
+      { name: "completed", value: result({ finalMessage: "complete" }) },
+      { name: "failed", value: result({ outcome: "failed", error: "boom" }) },
+      { name: "stopped", value: result({ outcome: "aborted", error: "stop" }) },
+    ];
+
+    it.each(terminalCases)("committed $name notice is task-locally delivered exactly once", async ({ value }) => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-001122334455";
+      const id = bg.start("agent:worker", Promise.resolve({ ...value, agentId }), undefined, agentId);
+      await bg.wait(id);
+      const [notice] = bg.drainSettlementNotices(() => true, () => {});
+      expect(notice?.content).toContain(`Task(${id})`);
+      expect(notice?.isValid()).toBe(true);
+      notice?.commit();
+      expect(bg.get(id)?.settlementDelivery).toBe("notified");
+      expect(bg.drainSettlementNotices(() => true, () => {})).toEqual([]);
+    });
+
+    it.each(terminalCases)("collection before send suppresses a $name notice", async ({ value }) => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-0123456789ab";
+      const id = bg.start("agent:worker", Promise.resolve({ ...value, agentId }), undefined, agentId);
+      await bg.wait(id);
+      const sub = settledSubRegistry(agentId);
+      expect(bg.markCollected(id)).toBe(true);
+      expect(bg.markCollected(id)).toBe(true); // repeated/concurrent callers are idempotent
+      expect(bg.get(id)?.settlementDelivery).toBe("collected");
+      expect(drain(bg, sub)).toEqual([]);
+    });
+
+    it("a running poll cannot collect or suppress eventual settlement", async () => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-123456789abc";
+      let resolve!: (value: BackgroundResultLike) => void;
+      const id = bg.start("agent:worker", new Promise((r) => (resolve = r)), undefined, agentId);
+      const sub = settledSubRegistry(agentId);
+      expect(bg.markCollected(id)).toBe(false);
+      expect(bg.get(id)?.settlementDelivery).toBe("pending");
+      resolve(result({ agentId }));
+      await bg.wait(id);
+      expect(drain(bg, sub)).toHaveLength(1);
+    });
+
+    it("real TaskOutput wait collects the terminal generation and leaves the next drain empty", async () => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-1a2b3c4d5e6f";
+      let resolve!: (value: BackgroundResultLike) => void;
+      const id = bg.start("agent:worker", new Promise((r) => (resolve = r)), undefined, agentId);
+      const output = createTaskOutputTool(bg) as unknown as ToolLike;
+      const pending = output.execute("wait", { task_id: id });
+      resolve(result({ agentId, finalMessage: "awaited" }));
+      expect((await pending).content[0]?.text).toBe("awaited");
+      expect(bg.get(id)?.settlementDelivery).toBe("collected");
+      expect(bg.drainSettlementNotices(() => true, () => {})).toEqual([]);
+    });
+
+    it("already-settled empty completion returns exact empty content and suppresses its notice", async () => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-2a3b4c5d6e7f";
+      const id = bg.start("agent:worker", Promise.resolve(result({ agentId, finalMessage: "" })), undefined, agentId);
+      await bg.wait(id);
+      const output = createTaskOutputTool(bg) as unknown as ToolLike;
+      const returned = await output.execute("terminal-empty", { task_id: id, wait: false });
+      expect(returned.content[0]?.text).toBe("");
+      expect(returned.details.status).toBe("completed");
+      expect(bg.get(id)?.settlementDelivery).toBe("collected");
+      expect(bg.drainSettlementNotices(() => true, () => {})).toEqual([]);
+    });
+
+    it.each([
+      { name: "failed without partial output", value: result({ outcome: "failed", error: "boom", finalMessage: "" }), text: "failed: boom" },
+      { name: "failed with partial output", value: result({ outcome: "failed", error: "boom", finalMessage: "partial" }), text: "Partial output" },
+      { name: "stopped", value: result({ outcome: "aborted", error: "stop", finalMessage: "discarded" }), text: "was aborted" },
+      { name: "cut-off completion", value: result({ finalMessage: "cut off\n---", truncated: true }), text: "cut off" },
+    ])("already-settled $name retrieval suppresses its notice", async ({ value, text }) => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-2a3b4c5d6e7f";
+      const id = bg.start("agent:worker", Promise.resolve({ ...value, agentId }), undefined, agentId);
+      await bg.wait(id);
+      const output = createTaskOutputTool(bg) as unknown as ToolLike;
+      const returned = await output.execute("terminal", { task_id: id, wait: false });
+      expect(returned.content[0]?.text).toContain(text);
+      expect(bg.get(id)?.settlementDelivery).toBe("collected");
+      expect(bg.drainSettlementNotices(() => true, () => {})).toEqual([]);
+    });
+
+    it("a running wait:false poll and an aborted wait leave eventual delivery eligible", async () => {
+      for (const mode of ["poll", "abort"] as const) {
+        const bg = new BackgroundTaskRegistry();
+        const agentId = mode === "poll" ? "agent-3a4b5c6d7e8f" : "agent-4a5b6c7d8e9f";
+        let resolve!: (value: BackgroundResultLike) => void;
+        const id = bg.start("agent:worker", new Promise((r) => (resolve = r)), undefined, agentId);
+        const output = createTaskOutputTool(bg) as unknown as StreamTool;
+        if (mode === "poll") {
+          expect((await output.execute("poll", { task_id: id, wait: false })).details.status).toBe("running");
+        } else {
+          const controller = new AbortController();
+          const pending = output.execute("abort", { task_id: id }, controller.signal);
+          controller.abort();
+          expect((await pending).details.status).toBe("running");
+        }
+        expect(bg.get(id)?.settlementDelivery).toBe("pending");
+        resolve(result({ agentId, finalMessage: mode }));
+        await bg.wait(id);
+        const notices = bg.drainSettlementNotices(() => true, () => {});
+        expect(notices).toHaveLength(1);
+        notices[0]?.commit();
+        expect(bg.drainSettlementNotices(() => true, () => {})).toEqual([]);
+      }
+    });
+
+    it("deferred TaskOutput wait followed by TaskStop collects the stopped outcome after abort settlement", async () => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-5a6b7c8d9e0f";
+      let resolve!: (value: BackgroundResultLike) => void;
+      const id = bg.start("agent:worker", new Promise((r) => (resolve = r)), () => {}, agentId);
+      const output = createTaskOutputTool(bg) as unknown as ToolLike;
+      const pending = output.execute("wait", { task_id: id });
+      expect(bg.stop(id).abortRequested).toBe(true);
+      resolve(result({ outcome: "aborted", error: "aborted", agentId }));
+      expect((await pending).details.status).toBe("stopped");
+      expect(bg.get(id)?.settlementDelivery).toBe("collected");
+      expect(bg.drainSettlementNotices(() => true, () => {})).toEqual([]);
+    });
+
+    it.each([
+      { name: "without a transcript", transcriptPath: undefined },
+      { name: "with a transcript", transcriptPath: "/sessions/stopped-agent.jsonl" },
+    ])("TaskStop $name emits one truthful outcome-only notice", async ({ transcriptPath }) => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-6a7b8c9d0e1f";
+      let resolve!: (value: BackgroundResultLike) => void;
+      const id = bg.start("agent:worker", new Promise((r) => (resolve = r)), () => {}, agentId);
+      bg.stop(id);
+      resolve(result({
+        outcome: "aborted",
+        error: "aborted",
+        agentId,
+        ...(transcriptPath ? { transcriptPath } : {}),
+      }));
+      await bg.wait(id);
+      const [notice] = bg.drainSettlementNotices(() => true, () => {});
+      expect(notice?.content).toContain("No final task result was retained");
+      expect(notice?.content).toContain(
+        "TaskOutput reports the aborted outcome (internal task status: stopped) but cannot recover discarded output",
+      );
+      expect(notice?.content).not.toContain("Retrieve the full result");
+      expect(notice?.content).not.toContain("retrieve discarded output");
+      if (transcriptPath) {
+        expect(notice?.content).toContain(`The session transcript remains available at ${transcriptPath}.`);
+      } else {
+        expect(notice?.content).not.toContain("session transcript remains available");
+      }
+      notice?.commit();
+      expect(bg.drainSettlementNotices(() => true, () => {})).toEqual([]);
+    });
+
+    it("unknown, foreign scoped, and pre-return failures do not suppress eventual delivery", async () => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-7a8b9c0d1e2f";
+      let resolve!: (value: BackgroundResultLike) => void;
+      const id = bg.start("agent:worker", new Promise((r) => (resolve = r)), undefined, agentId, undefined, "owner-a");
+      const scoped = createTaskOutputTool(bg.scopedTo("owner-b")) as unknown as ToolLike;
+      await expect(scoped.execute("foreign", { task_id: id })).rejects.toThrow(/Unknown task_id/);
+      await expect(scoped.execute("unknown", { task_id: "task-missing" })).rejects.toThrow(/Unknown task_id/);
+
+      const output = createTaskOutputTool(bg) as unknown as StreamTool;
+      await expect(output.execute("update-fails", { task_id: id }, undefined, () => {
+        throw new Error("paint failed");
+      })).rejects.toThrow("paint failed");
+      expect(bg.get(id)?.settlementDelivery).toBe("pending");
+      resolve(result({ agentId }));
+      await bg.wait(id);
+      expect(bg.drainSettlementNotices(() => true, () => {})).toHaveLength(1);
+    });
+
+    it("a terminal registry miss at the pre-return collection point fails closed and leaves delivery pending", async () => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-8a9b0c1d2e3f";
+      const id = bg.start("agent:worker", Promise.resolve(result({ agentId })), undefined, agentId);
+      await bg.wait(id);
+      const view = {
+        get: (taskId: string) => bg.get(taskId),
+        ids: () => bg.ids(),
+        wait: (taskId: string) => bg.wait(taskId),
+        stop: (taskId: string) => bg.stop(taskId),
+        markCollected: () => false,
+        subscribeProgress: (taskId: string, listener: (snapshot: ProgressSnapshot) => void) =>
+          bg.subscribeProgress(taskId, listener),
+      };
+      const output = createTaskOutputTool(view) as unknown as ToolLike;
+      await expect(output.execute("vanished", { task_id: id })).rejects.toThrow(/Unknown task_id/);
+      expect(bg.get(id)?.settlementDelivery).toBe("pending");
+      expect(bg.drainSettlementNotices(() => true, () => {})).toHaveLength(1);
+    });
+
+    it("repeated concurrent collectors are idempotent and mixed tasks notify only the uncollected task", async () => {
+      const bg = new BackgroundTaskRegistry();
+      const collectedAgent = "agent-9a0b1c2d3e4f";
+      const pendingAgent = "agent-a0b1c2d3e4f5";
+      let release!: (value: BackgroundResultLike) => void;
+      const collectedId = bg.start("agent:worker", new Promise((r) => (release = r)), undefined, collectedAgent);
+      const pendingId = bg.start("agent:worker", Promise.resolve(result({ agentId: pendingAgent, finalMessage: "uncollected" })), undefined, pendingAgent);
+      const output = createTaskOutputTool(bg) as unknown as ToolLike;
+      const collectors = [
+        output.execute("one", { task_id: collectedId }),
+        output.execute("two", { task_id: collectedId }),
+      ];
+      release(result({ agentId: collectedAgent, finalMessage: "collected" }));
+      await Promise.all(collectors);
+      await bg.wait(pendingId);
+      expect(bg.get(collectedId)?.settlementDelivery).toBe("collected");
+      const notices = bg.drainSettlementNotices(() => true, () => {});
+      expect(notices).toHaveLength(1);
+      expect(notices[0]?.content).toContain(pendingId);
+      expect(notices[0]?.content).not.toContain(`Task(${collectedId})`);
+    });
+
+    it("successful notification followed by real TaskOutput retrieval preserves the result and never re-arms", async () => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-23456789abcd";
+      const id = bg.start(
+        "agent:worker",
+        Promise.resolve(result({ agentId, finalMessage: "original result" })),
+        undefined,
+        agentId,
+      );
+      await bg.wait(id);
+      const sub = settledSubRegistry(agentId);
+      const [notice] = bg.drainSettlementNotices(
+        (a) => sub.isSettledNoticeArmed(a),
+        (a) => sub.consumeSettledNotice(a),
+      );
+      expect(notice?.isValid()).toBe(true);
+      notice?.commit();
+      expect(bg.get(id)?.settlementDelivery).toBe("notified");
+
+      const taskOutput = createTaskOutputTool(bg) as unknown as ToolLike;
+      const output = await taskOutput.execute("collect-after-notice", { task_id: id });
+      expect(output.content[0]?.text).toBe("original result");
+      expect(output.details.status).toBe("completed");
+      expect(bg.get(id)?.result).toBe("original result");
+      expect(bg.get(id)?.settlementDelivery).toBe("notified");
+      expect(bg.drainSettlementNotices(() => true, () => {})).toEqual([]);
+    });
+
+    it("failed send remains pending and retryable while current", async () => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-3456789abcde";
+      const id = bg.start("agent:worker", Promise.resolve(result({ agentId })), undefined, agentId);
+      await bg.wait(id);
+      const sub = settledSubRegistry(agentId);
+      const [selected] = bg.drainSettlementNotices(
+        (a) => sub.isSettledNoticeArmed(a),
+        (a) => sub.consumeSettledNotice(a),
+      );
+      expect(selected?.isValid()).toBe(true);
+      // Simulated send throw: no commit.
+      expect(bg.get(id)?.settlementDelivery).toBe("pending");
+      const retry = bg.drainSettlementNotices(
+        (a) => sub.isSettledNoticeArmed(a),
+        (a) => sub.consumeSettledNotice(a),
+      );
+      expect(retry).toHaveLength(1);
+      expect(retry[0]?.isValid()).toBe(true);
+    });
+
+    it("collection after selection invalidates that exact notice", async () => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-456789abcdef";
+      const id = bg.start("agent:worker", Promise.resolve(result({ agentId })), undefined, agentId);
+      await bg.wait(id);
+      const sub = settledSubRegistry(agentId);
+      const [selected] = bg.drainSettlementNotices(
+        (a) => sub.isSettledNoticeArmed(a),
+        (a) => sub.consumeSettledNotice(a),
+      );
+      expect(selected?.isValid()).toBe(true);
+      bg.markCollected(id);
+      expect(selected?.isValid()).toBe(false);
+      selected?.commit();
+      expect(bg.get(id)?.settlementDelivery).toBe("collected");
+    });
+
+    it.each(["running", "collected", "notified"] as const)(
+      "a newer $newer generation invalidates an old selection and blocks fallthrough",
+      async (newer) => {
+        const bg = new BackgroundTaskRegistry();
+        const agentId = "agent-56789abcdef0";
+        const oldId = bg.start("agent:worker", Promise.resolve(result({ agentId })), undefined, agentId);
+        await bg.wait(oldId);
+        const sub = settledSubRegistry(agentId);
+        const [oldNotice] = bg.drainSettlementNotices(
+          (a) => sub.isSettledNoticeArmed(a),
+          (a) => sub.consumeSettledNotice(a),
+        );
+        expect(oldNotice?.isValid()).toBe(true);
+
+        let resolveNew!: (value: BackgroundResultLike) => void;
+        const newId = bg.start(
+          "agent:worker",
+          new Promise((resolve) => (resolveNew = resolve)),
+          undefined,
+          agentId,
+        );
+        if (newer !== "running") {
+          resolveNew(result({ agentId, finalMessage: "new" }));
+          await bg.wait(newId);
+          if (newer === "collected") {
+            expect(bg.markCollected(newId)).toBe(true);
+          } else {
+            const [newNotice] = bg.drainSettlementNotices(() => true, () => {});
+            expect(newNotice?.content).toContain(newId);
+            expect(newNotice?.isValid()).toBe(true);
+            newNotice?.commit();
+            expect(bg.get(newId)?.settlementDelivery).toBe("notified");
+          }
+        }
+
+        expect(oldNotice?.isValid()).toBe(false);
+        // An always-armed callback proves task-local/newest suppression, rather
+        // than accidentally relying on the agent registry's consumed gate.
+        expect(bg.drainSettlementNotices(() => true, () => {})).toEqual([]);
+        if (newer === "running") {
+          resolveNew(result({ agentId, finalMessage: "newly settled" }));
+          await bg.wait(newId);
+          const [newNotice] = bg.drainSettlementNotices(() => true, () => {});
+          expect(newNotice?.content).toContain(newId);
+          expect(newNotice?.isValid()).toBe(true);
+          newNotice?.commit();
+          expect(bg.get(newId)?.settlementDelivery).toBe("notified");
+          expect(bg.drainSettlementNotices(() => true, () => {})).toEqual([]);
+        }
+      },
+    );
+
+    it("settled identity correction preserves start-generation ordering and restores the old identity", async () => {
+      const bg = new BackgroundTaskRegistry();
+      const oldAgentId = "agent-aaaaaaaaaaaa";
+      const correctedAgentId = "agent-bbbbbbbbbbbb";
+      const priorOldId = bg.start(
+        "agent:worker",
+        Promise.resolve(result({ agentId: oldAgentId, finalMessage: "prior old identity" })),
+        undefined,
+        oldAgentId,
+      );
+      let resolveCorrection!: (value: BackgroundResultLike) => void;
+      const correctedTaskId = bg.start(
+        "agent:worker",
+        new Promise((resolve) => (resolveCorrection = resolve)),
+        undefined,
+        oldAgentId,
+      );
+      const newestCorrectedId = bg.start(
+        "agent:worker",
+        Promise.resolve(result({ agentId: correctedAgentId, finalMessage: "newest corrected identity" })),
+        undefined,
+        correctedAgentId,
+      );
+      await bg.wait(priorOldId);
+      await bg.wait(newestCorrectedId);
+      resolveCorrection(result({ agentId: correctedAgentId, finalMessage: "moved identity" }));
+      await bg.wait(correctedTaskId);
+
+      const notices = bg.drainSettlementNotices(() => true, () => {});
+      expect(notices).toHaveLength(2);
+      const rendered = notices.map((notice) => notice.content).join("\n");
+      expect(rendered).toContain(priorOldId); // restored as newest for the old id
+      expect(rendered).toContain(newestCorrectedId); // start-newest still wins corrected id
+      expect(rendered).not.toContain(`Task(${correctedTaskId})`);
+      expect(notices.every((notice) => notice.isValid())).toBe(true);
+    });
+
+    it("collecting an older generation does not suppress the newest pending generation", async () => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-6789abcdef01";
+      const oldId = bg.start("agent:worker", Promise.resolve(result({ agentId, finalMessage: "old" })), undefined, agentId);
+      const newId = bg.start("agent:worker", Promise.resolve(result({ agentId, finalMessage: "new" })), undefined, agentId);
+      await bg.wait(oldId);
+      await bg.wait(newId);
+      bg.markCollected(oldId);
+      const notices = bg.drainSettlementNotices(() => true, () => {});
+      expect(notices).toHaveLength(1);
+      expect(notices[0]?.content).toContain(newId);
+      expect(notices[0]?.isValid()).toBe(true);
+    });
+
+    it("scoped views collect only owned terminal tasks", async () => {
+      const bg = new BackgroundTaskRegistry();
+      const own = bg.start("agent:worker", Promise.resolve(result()), undefined, undefined, undefined, "owner-a");
+      const foreign = bg.start("agent:worker", Promise.resolve(result()), undefined, undefined, undefined, "owner-b");
+      await bg.wait(own);
+      await bg.wait(foreign);
+      const scoped = bg.scopedTo("owner-a");
+      expect(scoped.markCollected(own)).toBe(true);
+      expect(scoped.markCollected(foreign)).toBe(false);
+      expect(bg.get(own)?.settlementDelivery).toBe("collected");
+      expect(bg.get(foreign)?.settlementDelivery).toBe("pending");
+    });
+
+    it("registry-miss fallback supports invalidation, retry, delivery, and later collection", async () => {
+      const bg = new BackgroundTaskRegistry();
+      const agentId = "agent-789abcdef012";
+      const firstId = bg.start("agent:worker", Promise.resolve(result({ agentId })), undefined, agentId);
+      await bg.wait(firstId);
+      const missing = new SubagentRegistry();
+      const select = () => bg.drainSettlementNotices(
+        (a) => missing.isSettledNoticeArmed(a),
+        (a) => missing.consumeSettledNotice(a),
+        (a) => missing.get(a) !== undefined,
+      );
+
+      const [selected] = select();
+      expect(selected?.isValid()).toBe(true);
+      bg.markCollected(firstId);
+      expect(selected?.isValid()).toBe(false);
+      expect(select()).toEqual([]);
+
+      const secondId = bg.start("agent:worker", Promise.resolve(result({ agentId })), undefined, agentId);
+      await bg.wait(secondId);
+      const [failedSend] = select();
+      expect(failedSend?.isValid()).toBe(true);
+      const [retry] = select(); // no first commit models a send failure
+      expect(retry?.isValid()).toBe(true);
+      retry?.commit();
+      expect(retry?.isValid()).toBe(false);
+      expect(failedSend?.isValid()).toBe(false);
+      expect(bg.get(secondId)?.settlementDelivery).toBe("notified");
+      expect(bg.markCollected(secondId)).toBe(true);
+      expect(bg.get(secondId)?.settlementDelivery).toBe("notified");
+      expect(select()).toEqual([]);
+    });
   });
 
   it("the DEFAULT (no run_in_background) dispatch path settles + drains a sanitized notice and TaskOutput returns verbatim (F15)", async () => {
@@ -1039,6 +1538,7 @@ describe("Agent tool run_in_background (audit E4)", () => {
     const runtime = makeRuntime([makeAgent()], fakeSdk({ replies: [{ text: "x" }] }).sdk);
     const agentTool = createAgentToolDefinition(runtime, { depth: 0 }) as unknown as {
       description: string;
+      parameters: { properties?: Record<string, { description?: string }> };
     };
     const desc = agentTool.description;
     // No opt-in framing left ("Run the dispatch in the background" / bare "Returns
@@ -1046,6 +1546,21 @@ describe("Agent tool run_in_background (audit E4)", () => {
     expect(desc).toMatch(/background by default/i);
     expect(desc).toContain("run_in_background: false");
     expect(desc).toContain("TaskOutput");
+    // F21: a later notice is conditional, not promised after terminal collection.
+    expect(desc).toContain("latest task generation for an agent");
+    expect(desc).toContain("remains uncollected and unnotified");
+    expect(desc).toContain("later interactive turn starts");
+    expect(desc).toContain("one bounded notice");
+    expect(desc).toContain("running TaskOutput poll preserves eligibility");
+    expect(desc).toContain("terminal collection suppresses a not-yet-sent notice");
+    expect(desc).not.toContain("a settlement notice also arrives");
+
+    const runInBackground = agentTool.parameters.properties?.run_in_background?.description ?? "";
+    expect(runInBackground).toContain("latest generation gets one bounded");
+    expect(runInBackground).toContain("later-interactive-turn notice");
+    expect(runInBackground).toContain("only if it settles and remains uncollected and unnotified");
+    expect(runInBackground).toContain("running poll preserves eligibility");
+    expect(runInBackground).toContain("terminal collection suppresses a not-yet-sent notice");
   });
 
   it("TaskOutput with wait:false polls the running status without blocking", async () => {

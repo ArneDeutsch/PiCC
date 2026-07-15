@@ -56,8 +56,12 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
   (never an empty success) with partial output preserved; every run leaves an on-disk transcript,
   streams live progress, and records its token/cost (`/usage`). Dispatch runs in the **background by
   default** (matching Claude 2.1.198), so an implicit-concurrency fan-out parallelizes — each dispatch
-  returns a task id, collected via `TaskOutput`/`TaskStop`, and its settlement is pushed to the
-  coordinator without polling; pass `run_in_background: false` for a synchronous inline result, or set
+  returns a task id; terminal results are collected via `TaskOutput`, while `TaskStop` stops a run.
+  Here an **eligible current task** means
+  the latest task generation for that agent, still uncollected and unnotified: if it settles, it
+  pushes one bounded notice on the coordinator's next turn. A running poll keeps that
+  notice eligible, while a terminal `TaskOutput` return counts as delivery and suppresses the
+  redundant notice. Pass `run_in_background: false` for a synchronous inline result, or set
   `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` to force every dispatch to the foreground. `SendMessage`
   resumes a finished subagent or steers a running one. A `subagent_type: "fork"` dispatch is the one
   type that **inherits the parent conversation** instead of starting fresh (main-session only,

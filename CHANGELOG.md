@@ -14,6 +14,13 @@ All notable changes to PiCC are documented here. The format is based on
   issue number remains the canonical numeric reference; task ordering remains local (`t01`, `t02`, …).
   Legacy numbered feature runs and historical artifacts keep their established identities unchanged.
 
+### Fixed — collection-aware background settlement delivery (2026-07-15)
+
+- A terminal record successfully returned by `TaskOutput` now counts as delivery, suppressing the
+  redundant not-yet-sent next-turn settlement notice. Running polls still preserve notice eligibility,
+  and eligible uncollected current tasks still receive one bounded notice; post-notice retrieval
+  remains available without re-arming another notice.
+
 ### Added — evaluate skill (2026-07-15)
 
 - **A new `evaluate` skill rates a GitHub issue, a proposed (not-yet-filed) issue, or a pull request
@@ -176,8 +183,9 @@ All notable changes to PiCC are documented here. The format is based on
   2.1.198+.** A dispatch that omits `run_in_background` returns a task id immediately and runs
   concurrently with any other dispatch issued in the same turn, so a Claude-authored implicit-concurrency
   fan-out (dispatch N reviewers in one turn, collect the results) **parallelizes** instead of silently
-  serializing; results are collected via `TaskOutput`/`TaskStop` or pushed to the coordinator as a
-  settlement notice on its next turn. Pass **`run_in_background: false`** to run a dispatch synchronously
+  serializing; terminal results are collected via `TaskOutput`, while `TaskStop` stops a run. An eligible
+  current task that remains uncollected and unnotified receives one bounded settlement notice on the
+  next turn. Pass **`run_in_background: false`** to run a dispatch synchronously
   and return its result inline in the same turn. An agent's `background: true` frontmatter still forces
   background (even against an explicit `run_in_background: false`), and
   `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` still forces **every** `Agent`/`Task` dispatch to the
@@ -189,9 +197,10 @@ All notable changes to PiCC are documented here. The format is based on
   a child does not deadlock. This is a deliberately conservative, finite, deadlock-free PiCC choice that
   diverges from Claude's single global (~10) parallel-agent cap — not exact parity.
 - **Registry + docs re-tiered to tell the truth.** `tool.Agent`/`tool.Task` stay **partial**, but the
-  divergence is no longer "PiCC defaults foreground" — it is the residual settlement *timing* gap (PiCC
-  pushes the notice next turn where Claude notifies mid-turn); the `feature.background-agents` "defaults
-  foreground" gap is removed and `agent.frontmatter.background` is reworded to "forces background". The
+  divergence is no longer "PiCC defaults foreground" — residual settlement timing remains: PiCC pushes
+  eligible notices next-turn, while reporter observations describe active-conversation notification but
+  establish no exact normative timing. The `feature.background-agents` "defaults foreground" gap is
+  removed and `agent.frontmatter.background` is reworded to "forces background". The
   README, user-guide, architecture, and design docs were corrected, and `doc/supported-features.md` was
   regenerated from the registry.
 ### Added — fork-aware hand-off and on-the-fly ticket creation for implement-feature (2026-07-14)
@@ -390,26 +399,28 @@ All notable changes to PiCC are documented here. The format is based on
   Code 2.1.x semantics). Honest limits: no cross-restart resume (the registry is process-lifetime),
   steering reaches only background dispatches, idle-parent delivery is next-turn, and
   `context: fork`/override dispatches are non-resumable.
-- **Background settlement push.** When a background dispatch settles (success or failure), the
-  coordinator is notified at its next turn without calling `TaskOutput` (a bounded, untrusted-framed
-  notice). `background: true` agent frontmatter (Claude 2.1.198) is honored, routing through the
-  same background lifecycle.
+- **Background settlement push.** When the latest generation of a background dispatch settles and
+  remains uncollected and unnotified, the coordinator receives one bounded, untrusted-framed notice at
+  its next turn. Terminal `TaskOutput` collection now suppresses a not-yet-sent notice; running polls
+  preserve eligibility. `background: true` agent frontmatter (Claude 2.1.198) is honored, routing
+  through the same background lifecycle.
 - **Per-subagent usage accounting.** Token/cost usage is recorded with each dispatch result, in the
   transcript, and in a new **`/usage`** control command (per-subagent breakdown + a subagents
   total). `/usage` is **subagent-scoped only** — a PiCC-additive surface, not Claude Code's
   whole-session `/usage`/`/cost` (the Pi extension API exposes no parent-session cost).
 
-### Changed — registry truthfulness (2026-07-13)
+### Changed — registry truthfulness (2026-07-13; historical, superseded by F15)
 
-- Capability registry updated to match shipped behavior: `tool.Agent`/`tool.Task` downgraded to
-  **partial** (PiCC defaults dispatches to the foreground; Claude 2.1.198 runs subagents
-  background-by-default, so an implicit-concurrency fan-out runs serially); **new** `tool.SendMessage`
-  (partial) and `agent.frontmatter.background` (full) entries; `feature.background-agents` now
-  documents settlement push and the default-foreground gap; `tool.TaskOutput`/`tool.TaskStop`,
-  `hook.event.SubagentStart`/`SubagentStop` (agent_id + agent_type; `transcript_path` stays MAIN),
-  and `hook.event.Notification` (settlement fires no `agent_completed`) notes corrected;
-  `setting.cleanupPeriodDays` downgraded to **partial** (worktrees only — no subagent-transcript
-  reaper). `doc/supported-features.md` regenerated from the registry.
+- At the time of this entry, the capability registry was updated to match the then-shipped behavior:
+  `tool.Agent`/`tool.Task` were downgraded to **partial** because PiCC still defaulted dispatches to
+  the foreground while Claude 2.1.198 ran subagents background-by-default. **F15 subsequently closed
+  that default-direction gap: PiCC now dispatches background-by-default.** This historical update also
+  added `tool.SendMessage` (partial) and `agent.frontmatter.background` (full), documented the
+  then-current settlement push in `feature.background-agents`, corrected `tool.TaskOutput`/
+  `tool.TaskStop`, `hook.event.SubagentStart`/`SubagentStop` (agent_id + agent_type;
+  `transcript_path` stays MAIN), and `hook.event.Notification` (settlement fires no
+  `agent_completed`) notes, downgraded `setting.cleanupPeriodDays` to **partial** (worktrees only —
+  no subagent-transcript reaper), and regenerated `doc/supported-features.md`.
 
 ### Added — commit and CI gates (2026-07-12)
 

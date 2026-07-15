@@ -11,4 +11,6 @@ Research this topic without blocking: $ARGUMENTS — canary FS-BG-TASKOUTPUT
    (type + `agent-<id>`) is shown at every surface.
 3. Retrieve the result with the **TaskOutput** tool — `TaskOutput(task_id: "task-1")` — which
    streams the subagent's live activity while it is still running and resolves to the finished
-   outcome badge + transcript + usage when it settles.
+   outcome badge + transcript + usage when it settles. A running poll keeps the task eligible for
+   one bounded next-turn settlement notice; a terminal return is already delivery and suppresses
+   that redundant notice, so do not call TaskOutput again expecting a missing continuation.

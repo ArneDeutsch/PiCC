@@ -179,8 +179,11 @@ Then use it like Claude Code:
   says so in a footer note on the result, rather than silently pretending it inherited.
   Dispatch runs in the **background by default** (matching Claude 2.1.198): an omitted
   `run_in_background` returns a task id immediately, so multiple dispatches in one turn parallelize —
-  results are polled/awaited via `TaskOutput` and stopped via `TaskStop`, and a background settlement
-  is announced to the coordinator at its next turn without polling. Pass `run_in_background: false`
+  results are polled/awaited via `TaskOutput` and stopped via `TaskStop`. An eligible current task is
+  the latest task generation for that agent that remains uncollected and unnotified; it is announced
+  once at the coordinator's next turn after settlement. Polling while it is running keeps
+  that notice eligible, while a successful terminal `TaskOutput` return counts as delivery and
+  suppresses the redundant not-yet-sent notice. Pass `run_in_background: false`
   for a synchronous inline result (an agent's `background: true` frontmatter forces background even
   against that), and `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces every dispatch to the foreground. A
   dispatch that dies on an API error is reported as a **loud, named failure** (with any partial
@@ -228,23 +231,40 @@ Every subagent is now visible, both to you and to the coordinating model:
   rendering is display-only: its completed verbatim result text is unchanged. The one boundary: a
   background task streams live only *while a `TaskOutput` call is awaiting it* — there is no
   always-on background dashboard.
+- **Collection and settlement notices are ordered.** Returning a terminal `TaskOutput` record —
+  completed, failed, aborted, empty, or cut off — delivers all output available for that run and
+  suppresses a later redundant notice that has not yet been sent. Do not repeat `TaskOutput` to try
+  to recover a continuation after a cut-off marker. A running poll does *not* count as delivery, so
+  the eligible current task can still produce one bounded, untrusted-framed notice on the next
+  interactive turn. Retrieval remains available after that notice and does not re-arm another one.
+  A task with an aborted outcome has an outcome-only uncollected notice: its final output was
+  deliberately discarded, although `TaskOutput` can still report the aborted outcome (the internal
+  task status is `stopped`). When `SendMessage` resumes an agent,
+  the new task id is the current generation; older generations remain suppressed by the existing
+  newest-generation-wins rule.
+
+  This suppression is intentional PiCC UX hardening, not verified Claude parity. Reporter-observed
+  Claude Code 2.1.x behavior can enqueue a redundant notification after `TaskOutput` retrieval;
+  Claude's public docs do not define notification-consumption semantics, and available reports do
+  not establish an exact normative background-subagent contract.
 - **`/usage`.** A per-subagent token/cost breakdown for the session: each dispatched agent's id,
   type, outcome, usage line, and transcript path, plus a subagents total. This is **subagent-scoped
   only** — a PiCC-additive view, not Claude Code's whole-session `/usage`/`/cost` (the Pi extension
   API exposes no parent-session cost, so the main agent's own spend is not shown).
 - **Compact lifecycle identity.** A `task-N` identifies one background run; an `agent-<id>`
   identifies the agent and is the reliable correlation key across resume. Resuming keeps that agent
-  id but creates a new task id. Model-visible `TaskStop` results (for every stop outcome), pushed
-  settlement notices, and `SendMessage` resume acknowledgments identify the work with
+  id but creates a new task id. Model-visible `TaskStop` results (for every stop outcome), eligible
+  uncollected-task settlement notices, and `SendMessage` resume acknowledgments identify the work with
   `Task(task-N) · Agent(<type>) · agent-<id>`, though punctuation and surrounding framing can vary.
   TaskStop and settlement use the background task record's stored display type. A fresh dispatch
   record normally stores the requested/display label, which can differ from the resolved registry
   definition after fallback or case-insensitive matching. A resumed task record and its resume
   acknowledgment instead use the clean resolved registry name. The stable agent id—not the type
   text—is therefore the reliable correlation key; broader canonical-type plumbing remains deferred.
-  This concise wording contract is PiCC-defined, not verified as exact Claude Code wording. Tool
-  schemas, lifecycle and stop behavior, settlement delivery, structured results, output framing, and
-  limits are unchanged.
+  This concise wording contract is PiCC-defined, not verified as exact Claude Code wording. This
+  identity-only wording does not otherwise change tool schemas, lifecycle and stop behavior,
+  structured results, output framing, or limits; settlement delivery follows the collection-aware
+  contract above.
 - **`SendMessage` (resume / steer).** The coordinator can address a finished subagent by its agent
   id and continue it with its context intact (it resumes in the background under the same stable id
   and a new task id), or redirect a still-running background one. Honest limitations, by design:
@@ -256,8 +276,12 @@ Every subagent is now visible, both to you and to the coordinating model:
     id or name.
   - **Steering reaches only background dispatches** — a foreground `Agent` call blocks the
     coordinator's turn, so there is no moment to steer it; resume works once any dispatch settles.
-  - **Idle-parent delivery is next-turn** — an idle coordinator learns of a background settlement
-    when the conversation next continues; PiCC v1 does not re-invoke an idle agent.
+  - **Idle-parent delivery is next-turn** — an idle coordinator learns of an eligible uncollected
+    background settlement when the conversation next continues; PiCC v1 does not re-invoke an idle
+    agent. In one-shot print mode there may be no next turn, so await `TaskOutput` before finalizing,
+    pass `run_in_background: false`, or set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` to force foreground.
+    Otherwise uncollected work can remain unsurfaced; this limitation is separate from
+    collection-aware suppression.
   - **`context: fork` / override dispatches are not resumable** — their restricted definition can't
     be re-derived by name, so they are deliberately refused.
   - **`subagent_type: "fork"` dispatches are not resumable** — a fork's inherited context is the
@@ -366,14 +390,19 @@ worktrees (incl. `.worktreeinclude`, Windows-tolerant
 removal), 13 hook events with the full stdin/stdout contract (Claude matcher semantics, parallel
 dispatch, async handlers), CLAUDE.md hierarchy to the filesystem root + `@import` + managed policy,
 settings toggles, deny rules (incl. Windows path normalization), tool gating,
-`WebFetch`/`WebSearch`/`Grep`/`Glob`/`Task*` tools, installed-plugin content, compaction
-preservation under Claude's carryover budgets.
+`WebFetch`/`WebSearch`/`Grep`/`Glob` tools, installed-plugin content, compaction preservation under
+Claude's carryover budgets.
 
 **Partial (works within a named limit):** background subagent dispatch — now the **default** (matching
-Claude Code 2.1.198), with `TaskOutput`/`TaskStop` and settlement pushed to the coordinator at its
-next turn; `run_in_background: false` opts into a synchronous inline result and
-`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces foreground. The residual gap that keeps it partial is
-that settlement *timing*: PiCC delivers the notice next-turn where Claude notifies mid-turn. Nested
+Claude Code 2.1.198), with the partial `TaskOutput`/`TaskStop` tools and one bounded next-turn notice
+for an eligible uncollected current task. A running poll preserves that notice; a successful terminal return counts as
+delivery and suppresses the redundant notice. `run_in_background: false` opts into a synchronous
+inline result and `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces foreground. It remains partial for
+settlement *timing*: PiCC is next-turn, while reporter observations such as anthropics/claude-code#21343 (Claude Code
+2.1.20 background agents) describe late notification during an active conversation but establish no
+exact normative mid-turn/next-turn contract. Reporter-observed Claude 2.1.x redundant post-retrieval
+notification behavior is likewise non-normative. Another limitation is the
+one-shot print-mode loss of uncollected work. Nested
 (depth ≥ 2) background fan-out is concurrency-bounded via per-depth budgets (deadlock-free, total ≤
 `maxDepth × concurrency`) — a conservative PiCC choice, not Claude's single global cap. And
 `SendMessage` resume/steer — no cross-restart resume, steering reaches only

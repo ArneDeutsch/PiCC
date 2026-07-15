@@ -211,7 +211,11 @@ describe("context assembly", () => {
     // the background-by-default framing and the collect-with-TaskOutput directive,
     // so a silent revert to opt-in framing fails here rather than only in prose.
     expect(suffix).toMatch(/background by default/i);
-    expect(suffix).toMatch(/collect each result with TaskOutput/i);
+    expect(suffix).toMatch(/collect each result with TaskOutput before you rely on it or finalize/i);
+    expect(suffix).toMatch(/eligible uncollected results receive one bounded notice/i);
+    expect(suffix).toMatch(/later interactive turn/i);
+    expect(suffix).toMatch(/one-shot print mode may end before that turn/i);
+    expect(suffix).not.toMatch(/otherwise its result is lost/i);
     // F19 anti-regression: the every-turn conventions block must nudge richer
     // commit messages (match the repo's git-log style; why-not-what body), so a
     // silent drop fails here rather than only in prose. The `--no-verify`

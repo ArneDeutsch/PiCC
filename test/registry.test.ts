@@ -192,11 +192,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("tool.TodoWrite")?.tier).toBe("partial");
   });
 
-  // F15 background-by-default: the dispatch tools now run background-by-default
-  // (matching Claude 2.1.198). They stay partial because of a real RESIDUAL — the
-  // settlement-timing gap (PiCC pushes the notice next turn; Claude notifies
-  // mid-turn). The assertion checks the NEW default and that residual, not a
-  // surviving "foreground" substring (which the note legitimately still contains).
+  // F15 background-by-default remains; F21 makes the settlement push conditional
+  // on an eligible uncollected current task and records suppression as PiCC UX
+  // hardening rather than verified Claude parity.
   it("marks the subagent dispatch tools partial and names the failure + background-by-default semantics", () => {
     const agent = lookupCapability("tool.Agent");
     expect(agent?.tier).toBe("partial");
@@ -204,13 +202,24 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(agent?.note).toContain("agent id");
     expect(agent?.note).toContain("BACKGROUND-BY-DEFAULT");
     expect(agent?.note).toContain("run_in_background:false");
-    // The residual timing gap that keeps it partial must be named.
+    expect(agent?.note).toContain("eligible uncollected current task");
+    expect(agent?.note).toContain("polling TaskOutput while running preserves eligibility");
+    expect(agent?.note).toContain("terminal TaskOutput record counts as delivery");
     expect(agent?.note).toContain("next turn");
+    expect(agent?.note).toContain("anthropics/claude-code#21343 (Claude Code 2.1.20)");
+    expect(agent?.note).toContain("anthropics/claude-code#24752");
+    expect(agent?.note).toContain("late notifications while a conversation is active");
+    expect(agent?.note).toContain("official docs define neither notification consumption nor exact mid-turn/next-turn timing");
+    expect(agent?.note).toContain("not verified parity");
     expect(agent?.note).toContain("2.1.198");
     const task = lookupCapability("tool.Task");
     expect(task?.tier).toBe("partial");
     expect(task?.note).toContain("alias");
     expect(task?.note).toContain("background-by-default");
+    expect(task?.note).toContain("eligible current task remaining uncollected");
+    expect(task?.note).toContain("running polls preserve it");
+    expect(task?.note).toContain("terminal TaskOutput collection suppresses it");
+    expect(task?.note).toContain("PiCC UX hardening rather than verified parity");
   });
 
   // SendMessage is a distinct partial entry: Claude supports resume/steer behavior,
@@ -227,6 +236,10 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(sm?.note).toContain("stable agent id");
     expect(sm?.note).toContain("PiCC-defined model-visible wording");
     expect(sm?.note).toContain("not verified as exact Claude wording");
+    expect(sm?.note).toContain("newest generation wins");
+    expect(sm?.note).toContain("eligible uncollected current resumed task");
+    expect(sm?.note).toContain("terminal TaskOutput collection suppresses it");
+    expect(sm?.note).toContain("running polls do not");
     for (const gap of ["no cross-restart resume", "steering is background-only", "next-turn"]) {
       expect(sm?.note).toContain(gap);
     }
@@ -262,11 +275,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(fork?.note).toContain("§2.9");
   });
 
-  // TaskOutput reports failed status (never empty success); TaskStop's discard
-  // contract and identity wording are PiCC-defined.
-  it("keeps TaskOutput full and TaskStop partial with identity plus PiCC-defined discard", () => {
+  // TaskOutput reports failed status (never empty success) but is partial for its
+  // pre-existing schema gap; TaskStop's discard/identity wording is PiCC-defined.
+  it("marks TaskOutput and TaskStop partial with their distinct gaps", () => {
     const out = lookupCapability("tool.TaskOutput");
-    expect(out?.tier).toBe("full");
+    expect(out?.tier).toBe("partial");
     expect(out?.note).toContain("failed status");
     // F13 t03: TaskOutput is INHERITED by subagents but SCOPED to the dispatcher's
     // own tasks — the old inverted "Claude hides TaskOutput; PiCC's session-wide
@@ -274,6 +287,23 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     // and the honest #15098 hardening (not a blanket "non-divergent" claim).
     expect(out?.note).toContain("only tasks it dispatched");
     expect(out?.note).toContain("#15098");
+    expect(out?.note).toContain("poll (wait:false)");
+    expect(out?.note).toContain("preserves settlement-notice eligibility");
+    expect(out?.note).toContain("terminal record counts as delivery");
+    expect(out?.note).toContain("cut-off result");
+    expect(out?.note).toContain("Retrieval remains available after a notice");
+    expect(out?.note).toContain("stopped terminal record reports the outcome");
+    expect(out?.note).toContain("reporter-observed Claude Code 2.1.x");
+    expect(out?.note).toContain("public docs do not specify notification-consumption semantics");
+    expect(out?.note).toContain("NOT claimed as verified parity");
+    expect(out?.note).toContain("PRE-EXISTING SCHEMA GAP (separate from F21)");
+    expect(out?.note).toContain("anthropics/claude-code#21343");
+    expect(out?.note).toContain("Claude Code 2.1.20 TaskOutput using block:true");
+    expect(out?.note).toContain("anthropics/claude-code#76335");
+    expect(out?.note).toContain("2.1.206 local_agent using block:true with timeout");
+    expect(out?.note).toContain("PiCC exposes wait");
+    expect(out?.note).toContain("official tools docs list TaskOutput and its deprecation but publish no parameter schema");
+    expect(out?.note).toContain("This gap makes the tier partial");
     expect(out?.note).not.toContain("hides TaskOutput from subagents");
     expect(out?.note).not.toContain("session-wide, so a subagent");
     const stop = lookupCapability("tool.TaskStop");
@@ -314,6 +344,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     const n = lookupCapability("hook.event.Notification");
     expect(n?.tier).toBe("degraded-noop");
     expect(n?.note).toContain("agent_completed");
+    expect(n?.note).toContain("eligible uncollected current task");
+    expect(n?.note).toContain("conditional next-turn settlement message");
+    expect(n?.note).toContain("terminal TaskOutput collection suppresses");
+    expect(n?.note).toContain("SubagentStop fires independently");
+    expect(n?.note).toContain("not alongside or synchronously");
   });
 
   // Agent frontmatter `background: true` is honored (since t05) as a full entry.
@@ -337,7 +372,22 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(bg?.note).toContain("TaskStop accepts only task_id");
     expect(bg?.note).toContain("Claude 2.1.198+ also accepts agent id/name");
     expect(bg?.note).toContain("resume after TaskStop");
-    expect(bg?.note).toContain("Claude Code 2.1.x reference refuses stopped-agent resume");
+    expect(bg?.note).toContain("Claude Code 2.1.x reference refuses it");
+    expect(bg?.note).toContain("eligible uncollected current task");
+    expect(bg?.note).toContain("one bounded settlement notice");
+    expect(bg?.note).toContain("coordinator's NEXT turn");
+    expect(bg?.note).toContain("running TaskOutput poll preserves eligibility");
+    expect(bg?.note).toContain("terminal return counts as delivery");
+    expect(bg?.note).toContain("retrieval remains available after notification without re-arming");
+    expect(bg?.note).toContain("stopped notices are outcome-only");
+    expect(bg?.note).toContain("newest-generation-wins");
+    expect(bg?.note).toContain("reporter-observed Claude Code 2.1.x");
+    expect(bg?.note).toContain("public docs specify no notification-consumption semantics");
+    expect(bg?.note).toContain("NOT verified parity");
+    expect(bg?.note).toContain("reporter observations (anthropics/claude-code#21343, Claude Code 2.1.20 background agents, and anthropics/claude-code#24752)");
+    expect(bg?.note).toContain("late notification during an active conversation");
+    expect(bg?.note).toContain("without establishing exact normative timing");
+    expect(bg?.note).toContain("one-shot print mode");
     // F15: the default is now background — the note must assert the new default,
     // not the removed "PiCC defaults foreground" gap, and name the residual timing gap.
     expect(bg?.note).toContain("background-by-default");
@@ -385,9 +435,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       if (entry.id === "tool.mcp__*") continue;
       expect(stubNames.has(entry.id.slice("tool.".length)), entry.id).toBe(true);
     }
-    // TaskOutput/TaskStop are REAL tools now (audit E4) — registry must agree
-    // and they must no longer ship as stubs.
-    expect(lookupCapability("tool.TaskOutput")?.tier).toBe("full");
+    // TaskOutput/TaskStop are REAL tools now (audit E4), though partial for
+    // separately documented gaps; neither may ship as a stub.
+    expect(lookupCapability("tool.TaskOutput")?.tier).toBe("partial");
     expect(lookupCapability("tool.TaskStop")?.tier).toBe("partial");
     expect(stubNames.has("TaskOutput")).toBe(false);
     expect(stubNames.has("TaskStop")).toBe(false);

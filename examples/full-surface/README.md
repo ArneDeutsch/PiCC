@@ -23,7 +23,7 @@ Coverage map (each canary string is asserted by tests):
 | disable-model-invocation + unknown frontmatter | `skills/secret-ritual` | `FS-SKILL-USERONLY-BODY` |
 | Legacy command + args | `.claude/commands/ship.md` | `FS-LEGACY-SHIP` |
 | Nested subagents (depth 2) | `agents/planner.md` → researcher | — |
-| Background dispatch (`background: true`) + `TaskOutput` retrieval | `agents/async-researcher.md`, `.claude/commands/bg-research.md` | `FS-BG-TASKOUTPUT` |
+| Background dispatch + collection-aware `TaskOutput` delivery (terminal collection suppresses a redundant notice; running poll does not) | `agents/async-researcher.md`, `.claude/commands/bg-research.md` | `FS-BG-TASKOUTPUT` |
 | Read-only gating / web tools / locked YAML | `agents/reviewer.md`, `researcher.md` | — |
 | isolation: worktree | `agents/isolated-worker.md` | — |
 | Deferred agent fields degrade | `agents/future-agent.md` | — |
@@ -35,3 +35,8 @@ Coverage map (each canary string is asserted by tests):
 | Unknown settings keys | `futureUnknownSetting`, `outputStyle` | compat report |
 | `.mcp.json` degradation | `.mcp.json` | compat report |
 | Project-bundled plugin | `.claude-plugin/` | `FS-PLUGIN-SKILL-BODY` |
+
+The background command documents the directional settlement guidance (focused runtime tests prove the
+behavior): an eligible uncollected current task gets one bounded next-turn notice, but a terminal
+`TaskOutput` return is already delivery and suppresses that redundant notice. Polling while running
+preserves notice eligibility.

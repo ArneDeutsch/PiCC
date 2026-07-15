@@ -11,6 +11,7 @@ import {
 import {
   BackgroundTaskRegistry,
   buildSettlementNotice,
+  createTaskOutputTool,
   createTaskStopTool,
 } from "../src/runtime/background-tasks.js";
 import { mintAgentId } from "../src/util/subagent-transcripts.js";
@@ -482,7 +483,7 @@ describe("SendMessage resume — offline integration (real SessionManager) (t04)
     // usage chain — usage must be captured on the RESUME path, not only fresh
     // dispatch. Both sessions report the same stats here.
     const h = fakeSdk({
-      replies: ["FIRST REPLY", "RESUME REPLY"],
+      replies: ["FIRST REPLY", "RESUME REPLY", "SECOND RESUME", "THIRD RESUME"],
       stats: { tokens: { input: 30, output: 12, cacheRead: 4 }, cost: 0.05 },
     });
     const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
@@ -544,6 +545,12 @@ describe("SendMessage resume — offline integration (real SessionManager) (t04)
     expect(settlement).toContain(TRANSCRIPT_SENTINEL);
     expect(settlement).not.toContain(PATH_SENTINEL);
     expect(settlement).not.toContain(DIAGNOSTIC_SENTINEL);
+
+    // Collect the original background generation through real TaskOutput. The
+    // persisted SendMessage resumes below must create independent delivery state.
+    const taskOutput = createTaskOutputTool(backgroundTasks) as unknown as ToolLike;
+    expect((await taskOutput.execute("collect-original", { task_id: lifecycleTaskId })).details.status).toBe("completed");
+    expect(lifecycleRecord?.settlementDelivery).toBe("collected");
 
     // SendMessage resume → immediate ack, same ID, flipped back to running.
     const sm = createSendMessageToolDefinition(runtime, {
@@ -615,8 +622,39 @@ describe("SendMessage resume — offline integration (real SessionManager) (t04)
     expect(onDisk).toContain("FOLLOW-UP WORK");
     expect(onDisk).toContain("RESUME REPLY");
 
-    // The resumed settlement emits a FRESH notice (re-armed by the resume).
-    expect(registry.consumeSettledNotice(agentId)).toBe(true);
+    const select = () => backgroundTasks.drainSettlementNotices(
+      (id) => registry.isSettledNoticeArmed(id),
+      (id) => registry.consumeSettledNotice(id),
+      (id) => registry.get(id) !== undefined,
+    );
+
+    // Original collection does not suppress the real SendMessage generation:
+    // its uncollected result is selected and delivered exactly once.
+    const [firstResumeNotice] = select();
+    expect(firstResumeNotice?.content).toContain(taskId);
+    expect(firstResumeNotice?.content).toContain("RESUME REPLY");
+    firstResumeNotice?.commit();
+    expect(select()).toEqual([]);
+
+    // A second real persisted resume is collected through TaskOutput, suppressing
+    // only that exact generation.
+    const secondAck = await sm.execute("s2", { to: agentId, message: "SECOND FOLLOW-UP" });
+    const secondTaskId = String(secondAck.details.taskId);
+    await backgroundTasks.wait(secondTaskId);
+    expect((await taskOutput.execute("collect-resume", { task_id: secondTaskId })).content[0]?.text).toContain("SECOND RESUME");
+    expect(select()).toEqual([]);
+
+    // A third resumed generation remains eligible even when the original task is
+    // collected again late: newest-resume-wins and collection is task-local.
+    const thirdAck = await sm.execute("s3", { to: agentId, message: "THIRD FOLLOW-UP" });
+    const thirdTaskId = String(thirdAck.details.taskId);
+    await backgroundTasks.wait(thirdTaskId);
+    await taskOutput.execute("late-original", { task_id: lifecycleTaskId });
+    const [thirdNotice] = select();
+    expect(thirdNotice?.content).toContain(thirdTaskId);
+    expect(thirdNotice?.content).toContain("THIRD RESUME");
+    thirdNotice?.commit();
+    expect(select()).toEqual([]);
   });
 
   it("SECURITY (MUST-FIX #1): the resumed dispatch re-applies the full enforcement stack — identical gated tools, guard + maxTurns extensions, system prompt/lockdown, and preserved depth", async () => {
