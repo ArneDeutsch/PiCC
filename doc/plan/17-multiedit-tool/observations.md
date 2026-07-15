@@ -18,6 +18,12 @@ Running record of friction, bugs, and follow-up candidates. Raw material for rev
 - 2026-07-15 **t01 line-ending traps** (coder + tester): mixed-EOL file collapses to detected ending (test wording said "no normalization" — contradiction, fixed); CRLF inside `new_string` would double-convert to `\r\r\n` (added composed-buffer LF-normalization guard + fixture). Added unit cases: abort discipline, path-resolution security negative (`~/…` literal), empty-`old_string`-as-non-first-edit, `replace_all` with 0 matches. Noted `description` required + validation-in-`execute`.
 - 2026-07-15 **registry note wording** (claude-parity): lead with the baseline-removed hedge; say "strictly exact-string (no fuzzy fallback, unlike PiCC's Edit)" so it doesn't read as Edit-equivalent. Corrected a misleading "keep ASCII" constraint (registry notes use `§`).
 
+## Phase 7 — t01 (core matcher)
+
+- 2026-07-15 t01 landed green (22 unit tests, full suite 1109 pass). Review fan-out: coder/tester/security all PASS, no must-fix. Applied fixes: dropped the post-write abort check (would falsely report failure after a committed write); added an edit-index assertion to the ambiguous-edit test; extracted a `getErrCode` helper + narrowed the `rawContent` cast.
+- 2026-07-15 **Deferred nits (defensible as-is, logged):** (a) on the file-creation path the running buffer starts as the raw `new_string` and later edits match it verbatim (not LF-normalized) — intended, since the model authored that content in the same call; documented inline. (b) empty `old_string` + empty `new_string` on a new file is rejected as "nothing to create" — a degenerate no-op; rejecting with a clear message is fine. (c) `applyEdits` is exported as a pure core but only exercised via `.execute` — harmless; kept per the plan's "pure core for testability".
+- 2026-07-15 **Forward note for t02 (security):** the path-parity guarantee holds only if `getCwd()` and the guard's per-call `cwd` are the same source (main = `cwdState`, subagent = `subCwd`) and MultiEdit registers behind the same guard as Edit/Write — both verified in Phase 4; re-confirm in t02 review.
+
 ## Follow-up candidates (out of scope; for Phase 8 issue-filing offer)
 
 - **Edit exactness audit:** registry claims `tool.Edit` is "exact-string" but Pi's `edit` fuzzy-normalizes on a miss. Worth verifying the claim actually holds / correcting the note. (claude-parity)
