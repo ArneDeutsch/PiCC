@@ -78,6 +78,9 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
 - **Compaction preservation** — project instructions, rules, and active skills survive
   auto-compaction.
 - **Plugins** — content from already-installed plugins and project-bundled `.claude-plugin/`.
+- **Git commits** — nudges richer, repo-style-matching commit messages by default (reads the
+  diff and recent `git log`, favors a why-over-what body for non-trivial changes),
+  approximating Claude Code's commit quality without reproducing its full ceremony.
 
 Everything unrecognized degrades safely and is surfaced — never a crash (the completeness floor).
 The full, always-current compatibility matrix is in

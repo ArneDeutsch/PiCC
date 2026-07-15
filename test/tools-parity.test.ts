@@ -302,7 +302,6 @@ describe("degrade stubs", () => {
     expect(names).toEqual(
       expect.arrayContaining([
         "NotebookEdit",
-        "NotebookRead",
         "AskUserQuestion",
         "ExitPlanMode",
         "EnterPlanMode",

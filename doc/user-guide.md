@@ -304,7 +304,19 @@ tracked project files):
 - `model` / `effort` — defaults applied at session start (effort maps onto Pi thinking levels).
 - `steering` — the **model-steering layer**: per-model-pattern system-prompt guidance nudging
   GPT toward Claude-like behavior, without editing the project. Patterns are globs over
-  `provider/modelId`; all matching entries are appended.
+  `provider/modelId`; all matching entries are appended. Because steering is appended *after*
+  PiCC's built-in conventions block, it is also your lever over those built-ins: you cannot
+  delete their text, but a contrary steering entry (or a project's own commit rule) later in
+  the prompt steers the model against them (later, more-specific guidance tends to win — like
+  any prompt instruction, not a hard guarantee). For example, PiCC nudges richer,
+  repo-style-matching commit messages by default — to tone that back toward terse one-liners,
+  add a steering entry such as:
+
+  ```json
+  "steering": {
+    "openai/*": "Keep commit messages to a one-line subject; no body unless I ask."
+  }
+  ```
 - `effortMap` — extends the mapping from Claude `effort:` values / prose ("apply maximum
   reasoning effort") to thinking levels.
 
@@ -374,7 +386,13 @@ byte-copies the parent's base prompt — it forgoes the prompt-cache saving; pri
 best-effort cap. Auto memory (`MEMORY.md`) and agent `memory:`
 scopes load with full parity, but writes are conservative by default — memory is written only on
 an explicit request to remember, a deliberate divergence from Claude Code's proactive writes (opt
-into eager writes via `CLAUDE.md`).
+into eager writes via `CLAUDE.md`). `NotebookRead` reads a `.ipynb` cell by cell (source plus
+stream / `text/plain` (and other text reprs) / error outputs); it is partial because image outputs are
+noted (raster images by mime-type with an approximate size, other binary/structured outputs by
+mime-type only) rather than rendered visually, oversized text outputs are head-truncated, and
+single-cell selection (`cell_id`) is not supported. Reach for `NotebookRead` (not the inherited `Read`, which does not special-case
+notebooks) when you want cell structure instead of raw notebook JSON; `NotebookEdit` remains a
+degraded no-op.
 
 **Degraded no-op (visible, never crashing):** MCP servers/tools, `ask`/`allow`/permission modes,
 plan mode, `AskUserQuestion`, checkpointing/rewind, output styles, agent teams, background
