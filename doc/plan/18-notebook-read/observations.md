@@ -34,6 +34,25 @@ Raw running record (friction / bugs / opportunities). Distilled into `review.md`
   assertion clashed with a `[...]` image placeholder in the same output string. Fixed:
   key the assertion on the ESC byte; use a non-`[` placeholder delimiter.
 
+## 2026-07-15 — Phase 7 t01 (parser) review
+
+- t01 implementer delivered clean per spec (16 tests). Review fan-out (coder/tester/parity)
+  surfaced fixes, all folded in via one fix pass (→ 19 tests):
+  - **text/html base64 leak (coder + parity, converging, sharpest):** embedded
+    `data:...;base64,...` in an HTML output bypassed image elision — violating the hard
+    "never emit base64" non-goal. Fixed: prefer `text/plain` over `text/html` when both
+    present, and collapse `data:*;base64,*` URIs in all rendered text. Lesson: a hard
+    guarantee ("never X") needs a test on *every* path X can travel, not just the obvious
+    one; the image-`output_type` test alone gave false confidence.
+  - **ANSI stripped only in tracebacks (coder + parity):** colored stdout leaked raw ESC.
+    Fixed — strip uniformly in `renderText`.
+  - **Placeholder mislabeled non-raster mimes (parity):** `application/json` object →
+    `~0 bytes (base64)`. Fixed — truthful per-mime descriptors.
+  - **Trivially-passing test + untested degrade contract (tester):** traceback `\n`-join
+    assertion couldn't catch the `""`-join bug it guarded; per-cell graceful-degradation
+    (unknown output_type / null cell) had no test. Both added. Lesson: an assertion that
+    still passes under the exact bug it names is not coverage.
+
 ## Deferred / out-of-scope opportunities (candidate follow-ups)
 
 - **`Read` on a `.ipynb` still dumps raw JSON.** In Claude Code 2.1.x notebook reading
