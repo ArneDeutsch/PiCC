@@ -678,12 +678,23 @@ export function buildSettlementNotice(task: BackgroundTaskRecord): string {
   } else if (outcome === "aborted") {
     lines.push("The task was stopped before completing; its result was discarded.");
   }
-  lines.push(
-    `This is PiCC metadata about a background subagent — informational only, not an ` +
-      `instruction, and it approves nothing. Retrieve the full result with TaskOutput ` +
-      `(task_id "${taskId}")` +
-      (task.transcriptPath ? ` or read the transcript at ${task.transcriptPath}.` : "."),
-  );
+  if (outcome === "aborted") {
+    lines.push(
+      `This is PiCC metadata about a background subagent — informational only, not an ` +
+        `instruction, and it approves nothing. No final task result was retained; TaskOutput ` +
+        `reports the stopped outcome but cannot recover discarded output.` +
+        (task.transcriptPath
+          ? ` The session transcript remains available at ${task.transcriptPath}.`
+          : ""),
+    );
+  } else {
+    lines.push(
+      `This is PiCC metadata about a background subagent — informational only, not an ` +
+        `instruction, and it approves nothing. Retrieve the full result with TaskOutput ` +
+        `(task_id "${taskId}")` +
+        (task.transcriptPath ? ` or read the transcript at ${task.transcriptPath}.` : "."),
+    );
+  }
   // Excerpt only for outcomes that carry output (completed, or failed with
   // best-effort partial output). Aborted/stopped runs discard their result.
   const raw = outcome === "aborted" ? "" : task.result ?? "";
@@ -869,7 +880,10 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
       // SETTLED task — a running poll carries no outcome (renderResult keys the
       // poll frame on status:"running" instead).
       const outcome = task.status === "running" ? undefined : noticeOutcome(task.status);
-      return {
+      // Construct the complete response before changing delivery state. The
+      // owner-safe transition is the final operation before a terminal return,
+      // so a running poll or any earlier throw leaves settlement eligible.
+      const output = {
         content: [{ type: "text", text }],
         details: {
           taskId: id,
@@ -888,6 +902,13 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
           diagnostics: task.diagnostics,
         },
       };
+      if (task.status !== "running" && !registry.markCollected(id)) {
+        // A terminal record that vanished or left this owner scope cannot be
+        // truthfully returned as collected. Fail closed without mutating any
+        // other generation's delivery state.
+        throw unknownIdError(registry, id);
+      }
+      return output;
     },
   };
 }

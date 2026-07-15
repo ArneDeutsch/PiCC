@@ -180,9 +180,9 @@ function parseSlashCommand(command: string): { name: string; argsText: string } 
  * TEST-ONLY injection point (t05 plan-review MUST-FIX). The fake-Pi harness
  * cannot reach the closure-local registries/runtime, so the offline-integration
  * test for the settlement-notice delivery path needs a named seam. `onWired` is
- * invoked synchronously during construction with the real, in-process registry
- * instances the session built, so a test can seed a settled background task and
- * then drive the REAL `before_agent_start` drain handler.
+ * invoked synchronously during construction with the real in-process registries
+ * and runtime, so tests can inject an offline SDK, traverse registered tools, or
+ * seed focused lifecycle state before driving the REAL `before_agent_start` drain.
  *
  * SECURITY: this seam is reachable ONLY through this in-process second argument.
  * Nothing in the project-loading path (CLAUDE.md, settings, env vars, files)
@@ -197,6 +197,12 @@ function parseSlashCommand(command: string): { name: string; argsText: string } 
  * no `process.env` / `project.settings` / file fallback anywhere on that path.
  */
 export interface PiccTestSeam {
+  /**
+   * TEST-ONLY synchronous barrier immediately before the production settlement
+   * sender's final validity check. It can model collection after selection; no
+   * project-controlled input can supply it and the production path never awaits.
+   */
+  beforeSettlementSend?: (notice: SettlementNotice) => void;
   onWired?: (internals: {
     backgroundTasks: BackgroundTaskRegistry;
     subagentRegistry: SubagentRegistry;
@@ -1019,15 +1025,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Background settlement notices (t05) — visible without polling
   // ---------------------------------------------------------------------------
   // At the parent's NEXT turn (before_agent_start, above), deliver a one-time,
-  // transcript-visible notice for every background subagent that has settled
-  // since the last turn: outcome (t01 vocabulary — a stopped task reads
-  // "aborted"), the capped error when failed, the agent id, and a bounded,
-  // explicitly-framed UNTRUSTED excerpt of its output. The coordinator thus
-  // learns of settlement WITHOUT calling TaskOutput. Delivered via the
-  // message-level channel PiCC already uses (pi.sendMessage + deliverAs "steer")
-  // so it lands in the transcript like Claude Code's settlement message.
-  // Exactly-once per settlement: the drain consumes the registry's per-agent
-  // settled-notice gate (a resume re-arms it). Folded into the single
+  // transcript-visible notice for each eligible, uncollected current task
+  // generation: outcome (t01 vocabulary — a stopped task reads "aborted"), the
+  // capped error when failed, the agent id, and a bounded, explicitly-framed
+  // UNTRUSTED excerpt of its output. Delivered via the message-level channel PiCC
+  // already uses (pi.sendMessage + deliverAs "steer") so it lands in the
+  // transcript like Claude Code's settlement message.
+  // Exactly-once delivery combines task-local collected/notified state with the
+  // per-agent readiness gate (which a resume re-arms). Folded into the single
   // before_agent_start handler (own try/catch) rather than a second listener, so
   // it can never depend on multi-handler ordering and a drain failure can never
   // break prompt assembly.
@@ -1055,12 +1060,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       console.error(`PiCC settlement-notice drain failed: ${(err as Error).message}`);
       return;
     }
-    // Deliver each notice in ITS OWN try/catch and commit the dedup gate only
-    // after pi.sendMessage returns (FIX 1): a throw on one notice must neither
-    // drop the remaining in-batch notices nor consume the throwing one — an
-    // un-committed notice re-fires on the next drain instead of being lost.
+    // Deliver each notice in ITS OWN try/catch. Recheck generation validity
+    // immediately before send, then commit task-local notification and agent
+    // readiness only after pi.sendMessage returns: a throw on one notice must
+    // neither drop the remaining batch nor consume the throwing notice.
     for (const notice of notices) {
       try {
+        // Test-only synchronous barrier can invalidate a selected generation by
+        // collecting it. Production performs no await before the final check,
+        // synchronous send, and commit.
+        testSeam?.beforeSettlementSend?.(notice);
+        if (!notice.isValid()) continue;
         pi.sendMessage(
           { customType: "picc-settlement", content: notice.content, display: true },
           { deliverAs: "steer" },

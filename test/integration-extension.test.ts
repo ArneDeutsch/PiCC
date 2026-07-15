@@ -563,20 +563,24 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
   });
 });
 
-describe("background settlement notices without polling (t05, offline-integration via the seam)", () => {
+describe("background settlement delivery (t05, offline integration via the seam)", () => {
   // The fake-Pi harness cannot reach the closure-local registries, so a fresh
   // extension instance is wired with the test-only `onWired` seam (reachable
-  // ONLY via this in-process argument — never env/settings/files). Each test
-  // seeds a settled background task exactly as a real dispatch would (register →
-  // start → settle → markSettled) and then drives the REAL before_agent_start
-  // drain handler, asserting the notice reaches the model without any TaskOutput
-  // call. Reuses the fixture cwd from the outer beforeAll.
+  // ONLY via this in-process argument — never env/settings/files). Coverage
+  // includes both real registered Agent/TaskOutput traversal and focused seeded
+  // lifecycle cases, all driven through the REAL before_agent_start drain handler.
+  // Reuses the fixture cwd from the outer beforeAll.
   type Internals = Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
 
-  function wire(): { p: FakePi; internals: Internals } {
+  function wire(options: {
+    beforeSettlementSend?: PiccTestSeam["beforeSettlementSend"];
+  } = {}): { p: FakePi; internals: Internals } {
     const p = fakePi();
     let internals!: Internals;
-    picc(p.api as never, { onWired: (i) => (internals = i) });
+    picc(p.api as never, {
+      onWired: (i) => (internals = i),
+      ...(options.beforeSettlementSend ? { beforeSettlementSend: options.beforeSettlementSend } : {}),
+    });
     return { p, internals };
   }
 
@@ -601,6 +605,68 @@ describe("background settlement notices without polling (t05, offline-integratio
         display: m.message.display,
       }));
   }
+
+  it("registered Agent → TaskOutput wait → real next-turn drain emits no stale notice", async () => {
+    const handle = fakeSdk({ replies: ["REAL-WIRED-RESULT"] });
+    const { p, internals } = wire();
+    internals.subagentRuntime.setSdkForTest(handle.sdk);
+    const agent = p.tools.get("Agent");
+    const started = await agent.execute("dispatch", {
+      subagent_type: "reviewer",
+      prompt: "review offline",
+      run_in_background: true,
+    });
+    const taskId = String(started.details.taskId);
+    expect(taskId).toMatch(/^task-\d+$/);
+
+    const taskOutput = p.tools.get("TaskOutput");
+    const returned = await taskOutput.execute("collect", { task_id: taskId });
+    expect(returned.content[0].text).toContain("REAL-WIRED-RESULT");
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    expect(settlements(p)).toHaveLength(0);
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    expect(settlements(p)).toHaveLength(0);
+  });
+
+  it("production pre-send validity skips a notice collected after selection", async () => {
+    let internals!: Internals;
+    let taskId = "";
+    let barrierCalls = 0;
+    const p = fakePi();
+    picc(p.api as never, {
+      onWired: (i) => (internals = i),
+      beforeSettlementSend: () => {
+        barrierCalls++;
+        expect(internals.backgroundTasks.markCollected(taskId)).toBe(true);
+      },
+    });
+    const agentId = "agent-0a1b2c3d4e5f";
+    reg(internals, agentId);
+    taskId = internals.backgroundTasks.start(
+      "agent:reviewer",
+      Promise.resolve({
+        ok: true,
+        outcome: "completed" as const,
+        finalMessage: "selected then collected",
+        agentId,
+        diagnostics: [],
+      }),
+      undefined,
+      agentId,
+      "reviewer",
+    );
+    await internals.backgroundTasks.wait(taskId);
+    internals.subagentRegistry.markSettled(agentId);
+
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    expect(barrierCalls).toBe(1);
+    expect(settlements(p)).toHaveLength(0);
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    expect(barrierCalls).toBe(1);
+    expect(settlements(p)).toHaveLength(0);
+  });
 
   it("announces a settled background task at the next turn (outcome, agent id, framed output) — no TaskOutput needed", async () => {
     const { p, internals } = wire();
