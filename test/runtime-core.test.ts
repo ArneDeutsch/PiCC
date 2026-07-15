@@ -212,6 +212,14 @@ describe("context assembly", () => {
     // so a silent revert to opt-in framing fails here rather than only in prose.
     expect(suffix).toMatch(/background by default/i);
     expect(suffix).toMatch(/collect each result with TaskOutput/i);
+    // F19 anti-regression: the every-turn conventions block must nudge richer
+    // commit messages (match the repo's git-log style; why-not-what body), so a
+    // silent drop fails here rather than only in prose. The `--no-verify`
+    // prohibition is folded into the same Commits bullet — guard it too so a
+    // reword can't silently drop the hook-bypass ban.
+    expect(suffix).toMatch(/recent git log/i);
+    expect(suffix).toMatch(/why the change was made/i);
+    expect(suffix).toMatch(/--no-verify/);
   });
 
   it("keeps activated skill bodies resident", () => {
