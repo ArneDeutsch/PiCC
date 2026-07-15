@@ -122,7 +122,9 @@ export function applyEdits(
       throw new Error(
         `MultiEdit: ${where} for ${filePath} has an empty old_string. An empty old_string is only ` +
           `allowed as the first edit when creating a new file` +
-          (fileExists ? " (this file already exists)." : " (it is not the first edit)."),
+          (fileExists
+            ? " (this file already exists — use a non-empty old_string matching the text to change)."
+            : " (it is not the first edit)."),
       );
     }
 
@@ -143,14 +145,22 @@ export function applyEdits(
 
     const occurrences = countOccurrences(buffer, oldString);
     if (occurrences === 0) {
+      // The classic sequential-multi-edit failure: for a later edit, the text is
+      // most often absent because an EARLIER edit in this same batch already
+      // rewrote or consumed it — say so, so the model corrects against the
+      // post-edit content instead of retrying the same literal.
+      const priorHint =
+        i > 0
+          ? " If an earlier edit in this batch already changed this text, match against the updated content it produced."
+          : "";
       throw new Error(
-        `MultiEdit: ${where} old_string was not found in ${filePath}. It must match exactly, ` +
-          `including all whitespace and newlines.`,
+        `MultiEdit: ${where}: old_string was not found in ${filePath}. It must match exactly, ` +
+          `including all whitespace and newlines.${priorHint}`,
       );
     }
     if (!replaceAll && occurrences > 1) {
       throw new Error(
-        `MultiEdit: ${where} old_string is not unique in ${filePath} (${occurrences} occurrences). ` +
+        `MultiEdit: ${where}: old_string is not unique in ${filePath} (${occurrences} occurrences). ` +
           `Provide more surrounding context to make it unique, or set replace_all.`,
       );
     }

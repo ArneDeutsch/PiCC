@@ -29,7 +29,14 @@ Running record of friction, bugs, and follow-up candidates. Raw material for rev
 - 2026-07-15 t02 landed green (full suite 1110 pass). Four wiring edits + registry retier + matrix regen + reworked tests, all in the declared writable surface (no fixture / permissions change). Review fan-out: coder/claude-parity/docs/tester all PASS, no must-fix/should-fix. Applied one claude-parity NIT: tightened the registry note's version wording ("removed in the 2.0 line, confirmed gone by v2.0.8" instead of the imprecise "about v2.0.8"); regenerated the matrix.
 - 2026-07-15 Verified independently: main/subagent security parity holds (tool `getCwd` == guard `getCwd`; MultiEdit behind the shared guard, no un-guarded path); the registry drift guard is mutual (retier-without-destub or destub-without-retier both fail); the fresh-instance integration test would fail if the `touchedFilePath` edit were reverted. Harmless NIT left as-is: the integration test's 500ms IIFE wait is unnecessary (guard registers synchronously) but kept for `beforeAll` parity.
 
+## Phase 8 — close review
+
+- 2026-07-15 3 close reviewers (generalist adversarial, claude-parity, user-experience) all PASS. Every feature.md Acceptance bullet verified delivered against the diff; no must-fix. Applied UX SHOULD + nits: the "not found" error now hints (for a non-first edit) that an earlier edit in the batch may have rewritten the text (self-correction for the classic sequential-multi-edit miss); the empty-old_string-on-existing-file error now names the next step; added a `:` separator after the edit-index label.
+- 2026-07-15 Reviewer-noted, no action in F17 (documented divergences / beyond-acceptance, all faithful): exact-only matching diverges from PiCC's fuzzy Edit (conscious, in the registry note); empty-old_string file-creation is delivered though not a listed Acceptance bullet (faithful to Claude); reimplemented BOM/EOL helpers duplicate Pi's private ones (latent drift risk, unavoidable).
+
 ## Follow-up candidates (out of scope; for Phase 8 issue-filing offer)
+
+- **Read-before-edit precondition (family-wide):** Claude's real Edit/MultiEdit reject with "File has not been read yet" if the file wasn't Read in-session (or was modified since). PiCC enforces no such freshness guard across the whole Edit/Write/MultiEdit family (all tagged `full`). Best resolved once family-wide — implement the guard, or disclose the divergence registry-wide — not inside F17. (claude-parity, Phase 8)
 
 - **Edit exactness audit:** registry claims `tool.Edit` is "exact-string" but Pi's `edit` fuzzy-normalizes on a miss. Worth verifying the claim actually holds / correcting the note. (claude-parity)
 - **`examples/full-surface` MultiEdit fixture:** the sample project exercises Edit/Write but never MultiEdit; a call site + an "Edit(...) rule gates a MultiEdit call" assertion would lock in the namespace behavior end-to-end. (claude-parity)
