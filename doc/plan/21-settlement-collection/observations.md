@@ -15,3 +15,4 @@
 - 2026-07-15 — User-guide tier summaries built from broad families such as `Task*` can silently contradict the generated per-tool capability matrix.
 - 2026-07-15 — Pre-existing follow-up: settlement frame-marker defanging runs its regex before the 1,200-character cap and may show superlinear behavior on adversarial long lines.
 - 2026-07-15 — Pre-existing follow-up: project compatibility findings ignore `partial` capabilities, so the newly documented TaskOutput `block`/`timeout` schema gap is not surfaced by startup or `/doctor`.
+- 2026-07-15 — Workflow weakness confirmed: proposal-gate evaluators returned all-high assessments in 6–10 seconds with zero tool calls and only 60–88 reasoning tokens. The proposal-gate explicitly asks one sandbox evaluator to score supplied prose but never requires source/project investigation, conflating the existing-ticket security envelope with trusted-proposal value research.
