@@ -101,3 +101,36 @@ describe("implement-feature router (F12 t01)", () => {
     expect(hits[0]).toBe(norm(path.join(SKILL_DIR, "SKILL.md")));
   });
 });
+
+describe("proposal-gate wiring floor markers (evaluate-skill t04)", () => {
+  // Loose, case-insensitive, whitespace-collapsed structural checks. The proposal-gate
+  // wiring lives in the REFERENCE files (Phase 8 gate + Phase 1 annotate), NOT the router
+  // body — loadSkillBody never reads reference bodies, and the router clause is optional —
+  // so assert the marker in the files the wiring actually edits. We do NOT re-assert the
+  // existing --body-file / allow-list floor (it already holds and stays green).
+  const collapse = (p: string): string =>
+    fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
+
+  const TICKET_INTEGRATION_PATH = path.join(REFERENCES_DIR, "ticket-integration.md");
+  const TICKET_CREATION_PATH = path.join(REFERENCES_DIR, "ticket-creation.md");
+
+  it("Phase 8 (ticket-integration.md) gates findings through proposal-gate, dropping clear slop with a review.md tally", () => {
+    const body = collapse(TICKET_INTEGRATION_PATH);
+    expect(body).toContain("proposal-gate");
+    // Clear slop dropped, but the tally says the dropped findings remain in review.md.
+    expect(body).toContain("remain in review.md");
+    // The gate only subtracts clear slop; per-presented-finding choice preserved (one coherent rule).
+    expect(body).toContain("subtracts clear slop, never adds");
+    expect(body).toContain("choose per _presented_ finding");
+  });
+
+  it("Phase 1 (ticket-creation.md) only annotates via proposal-gate in-session and never suppresses the offer", () => {
+    const body = collapse(TICKET_CREATION_PATH);
+    expect(body).toContain("proposal-gate");
+    // Annotate-only, presented in-session and never baked into the filed public issue body.
+    expect(body).toContain("in-session");
+    expect(body).toContain("never baked into the filed public issue body");
+    expect(body).toContain("only annotates");
+    expect(body).toContain("never suppresses this offer");
+  });
+});

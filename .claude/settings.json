@@ -1,5 +1,42 @@
 {
   "enabledPlugins": {
     "skill-creator@claude-plugins-official": true
+  },
+  "permissions": {
+    "deny": [
+      "Bash(gh pr merge *)",
+      "Bash(gh pr close *)",
+      "Bash(gh pr reopen *)",
+      "Bash(gh pr edit *)",
+      "Bash(gh pr review *)",
+      "Bash(gh issue edit *)",
+      "Bash(gh issue delete *)",
+      "Bash(gh issue lock *)",
+      "Bash(gh issue reopen *)",
+      "Bash(gh repo delete *)",
+      "Bash(gh repo rename *)",
+      "Bash(gh repo archive *)",
+      "Bash(gh label create *)",
+      "Bash(gh label delete *)",
+      "Bash(gh label edit *)",
+      "Bash(gh api * --method *)",
+      "Bash(gh api * -X *)",
+      "Bash(gh api * -f *)",
+      "Bash(gh api * -F *)",
+      "Bash(gh api graphql *)",
+      "Bash(gh api -X *)",
+      "Bash(gh api --method *)",
+      "Bash(gh api -f *)",
+      "Bash(gh api -F *)",
+      "Bash(gh api --field *)",
+      "Bash(gh api --raw-field *)",
+      "Bash(gh api --input *)",
+      "Bash(gh api * --field *)",
+      "Bash(gh api * --raw-field *)",
+      "Bash(gh api * --input *)",
+      "Bash(gh api *--method=*)",
+      "Bash(gh api *--field=*)",
+      "Bash(gh api *--raw-field=*)"
+    ]
   }
 }
