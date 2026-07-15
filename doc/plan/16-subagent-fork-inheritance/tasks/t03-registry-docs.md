@@ -35,7 +35,9 @@ needed.
   enabled**, a PiCC parity choice over Claude's under-specified staged-rollout default
   — and note the divergence is *directional*: PiCC may inherit where a staged-rollout
   Claude with fork unset would run fresh); model inheritance respects an operator
-  `CLAUDE_CODE_SUBAGENT_MODEL` override; **non-resumable**; **a fork cannot spawn
+  `CLAUDE_CODE_SUBAGENT_MODEL` override **and a per-call `model` argument on the
+  `"fork"` dispatch** (both override the inherited parent model — disclose both so the
+  "same model as parent" claim stays truthful); **non-resumable**; **a fork cannot spawn
   another fork** (visible refusal — INFERRED mechanism); **print/headless/no-session
   forks degrade** (no parent transcript); **fork-mode's `run_in_background` removal is
   NOT adopted** — PiCC keeps `run_in_background:false` as a synchronous selector

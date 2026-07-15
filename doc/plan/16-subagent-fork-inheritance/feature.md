@@ -47,10 +47,12 @@ masquerade as a fresh `general-purpose` agent. Instead it runs with fresh contex
 **and** surfaces a **specific notice** (distinct from the generic
 "unknown subagent_type" warning) that names *why* it ran fresh. The notice is
 surfaced both to the fork itself (so it doesn't answer as if it inherited) **and to
-the developer running picc** (a muted result-footer line + an honest badge that
-distinguishes an inherited fork from a degraded one); its **tone** is calm/by-design
-for user-chosen or expected cases (env `=0`, a fork-spawns-fork refusal) and a
-warning only for genuine can't-do cases (no transcript, SDK can't fork, fork threw).
+the developer running picc**: a muted result-**footer line** (the reliable signal —
+present on both the synchronous and the backgrounded/TaskOutput result surfaces),
+plus a distinct **badge** on the synchronous path (`Agent(fork)` when it inherited,
+`Agent(general-purpose)` when it degraded). Its **tone** is calm/by-design for
+user-chosen or expected cases (env `=0`, a fork-spawns-fork refusal) and a warning
+only for genuine can't-do cases (no transcript, SDK can't fork, fork threw).
 
 The **capability registry** gains an explicit, truthful entry for the Task-tool
 `"fork"` type describing the supported semantics **and its honest limits** (below),
@@ -122,8 +124,9 @@ itself to.
   (print/headless), nested dispatcher, fork-spawns-fork, SDK cannot fork — runs with
   fresh context **and** surfaces a specific notice (never the generic
   "unknown subagent_type" warning, never a silent fallback). The developer sees an
-  honest signal (footer line + badge) that distinguishes an inherited fork from a
-  degraded one, with by-design cases toned calmly and can't-do cases as warnings.
+  honest signal: a footer line on both the synchronous and backgrounded result
+  surfaces (the reliable discriminator), plus a distinct badge on the synchronous
+  path — with by-design cases toned calmly and can't-do cases as warnings.
 - A fork attempting to dispatch a further fork is refused (degraded to fresh),
   not honored; a fork may still spawn *normal* subagent types.
 - The forked subagent is **not resumable** (its inherited context is the parent

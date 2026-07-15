@@ -54,6 +54,22 @@ fork-specific "cannot spawn a fork" notice, calm tone). Keep the depth guard
 (`:652-663`) as the untouched outer backstop. The refusal still passes the normal
 permission/gate path (no bypass), and must not leak parent history (t01's rules hold).
 
+**Resolve the t01 `forkFrom`-throw marker/identity trap (carried into this task).** In
+t01, `customToolsFor` and the fork *identity* are finalized **before** `forkFrom` is
+attempted, so a `forkFrom` throw flips `isFork` to false *after* the fork-marked tools
+and `Agent(fork)` identity are already built. Threading `isFork` into `customToolsFor`
+here would therefore fork-mark a run that actually degraded — the exact "a degraded
+fork sets `isFork = false`" invariant this feature relies on. **Fix it as part of the
+marker plumbing:** ensure the `isFork` value that reaches `customToolsFor` (and the
+resolved identity/badge) reflects the **final, post-fork-attempt** state — e.g. attempt
+the fork-session-manager construction (or at least detect a `forkFrom` failure) **before**
+building `customTools` and finalizing the fork agent identity, so a throw resolves to a
+plain `general-purpose` (`isFork=false`, unmarked tools, `Agent(general-purpose)` badge)
+before either is fixed. This also closes t01's known cosmetic badge-on-throw edge
+(`log/t01.md`). Add a test that a `forkFrom`-throw degrade produces `isFork=false`,
+unmarked tools (its own nested `"fork"` is NOT refused by the guard for the wrong
+reason), and the honest `general-purpose` badge.
+
 ## Writable surface
 
 - `src/runtime/subagents.ts`
