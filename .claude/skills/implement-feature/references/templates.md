@@ -5,10 +5,10 @@ The three plan-folder templates the router refers to. Copy the relevant one when
 ## Plan folder layout
 
 ```
-doc/plan/<NN>-<slug>/
+doc/plan/<feature-slug>/
   feature.md          WHAT/WHY spec (Phase 3; Tasks section backfilled in Phase 5)
-  tasks/t<NN>-<slug>.md   task specs (Phase 5)
-  log/t<NN>.md        execution logs, written by implementer/fix subagents (Phase 7)
+  tasks/t<task-number>-<task-slug>.md   task specs (Phase 5)
+  log/t<task-number>.md        execution logs, written by implementer/fix subagents (Phase 7)
   observations.md     coordinator's running record of friction/bugs/opportunities (Phase 7)
   review.md           distilled close record (Phase 8)
 ```
@@ -16,7 +16,7 @@ doc/plan/<NN>-<slug>/
 ### `feature.md`
 
 ```markdown
-# F<NN>: <Title>
+# <feature-slug>: <Title>
 
 Ticket: <the linked issue as `<target>#N` — a given ref, or one created via the
 Phase 1 ticket-creation offer (written at Phase 3); `–` when ticketless. Kept
@@ -38,10 +38,10 @@ Phase 5 as an ordered list: t01 <title> (depends on: –), t02 <title>
 adds tasks.>
 ```
 
-### `tasks/t<NN>-<slug>.md`
+### `tasks/t<task-number>-<task-slug>.md`
 
 ```markdown
-# t<NN>: <Title>
+# t<task-number>: <Title>
 
 ## Goal
 <What exists and works when this task is done.>
@@ -75,7 +75,7 @@ cross-platform concerns (Windows + Linux).>
 ### `review.md`
 
 ```markdown
-# F<NN> Review: <Title>
+# <feature-slug> Review: <Title>
 
 ## Outcome
 <One paragraph: what shipped, and how it deviated from the plan (if at all).>

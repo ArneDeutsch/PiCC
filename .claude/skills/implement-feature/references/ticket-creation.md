@@ -26,9 +26,12 @@ Make the offer as a **distinct yes/no exchange, separate from the build go** —
 eventual "go" is never read as "yes, file the issue". Present:
 
 - **The exact title and body that *would be* filed**, in **conditional/future wording** — "here's the
-  issue I'd file if you want it", never "I filed" / "here's the issue". The title is a model-authored
-  ASCII `F<NN>: <short description>` with **no shell metacharacters** (Rule 4); `<NN>` is only assigned
-  at Phase 2, so at Phase 1 show a placeholder (e.g. `F<NN>:`) and note the real number lands at setup.
+  issue I'd file if you want it", never "I filed" / "here's the issue". The title is the independently
+  authored printable-ASCII `<Title>` from the confirmed scope, with **no identifier prefix, control
+  characters, shell metacharacters, or direct copy/interpolation from raw ticket text** (Rule 4).
+  Incidental lexical overlap is not itself invalid. Keep it single-line and at most 120 characters;
+  pass it as one quoted argument. This becomes the same stable display title used by feature/review
+  headings and the eventual PR; the user may edit the preview before build go, when it is frozen.
   The body is the converged WHAT/WHY from the scope mirror, authored under Rule 6 (no leakage), ending
   with the `<attribution trailer>` (Rule 8) — and **the filed body is WHAT/WHY only**. Before showing
   this preview, run evaluate's proposal-gate over the converged scope
@@ -50,11 +53,11 @@ eventual "go" is never read as "yes, file the issue". Present:
 ## Timing — consent now (Phase 1), FILE at Phase 3
 
 The user **accepts at Phase 1**, but the actual `gh issue create` and the anchor write happen together
-at **Phase 3** (feature-spec creation), once `<NN>`, the worktree, the branch, and `feature.md` all
-exist. This is deliberate:
+at **Phase 3** (feature-spec creation), once the immutable descriptive identity, worktree, branch,
+and `feature.md` all exist. This is deliberate:
 
 - it keeps the Phase 1 write-contract's "nothing is posted yet" **honest** through Phase 2;
-- it gives the issue a **real `F<NN>`** title (no placeholder in the public artifact);
+- it couples the public issue to the durable `Ticket:` anchor in the feature spec;
 - the anchor is written in the **same step** as the create, so the resume windows are clean: a resume
   **before** Phase 3 has filed nothing (re-offering is correct), and a resume **after** Phase 3 finds
   the `Ticket:` anchor (the resident anchor reader in `SKILL.md` adopts the ticket path — no re-offer,
@@ -116,19 +119,23 @@ surprise:
 At Phase 3, after `feature.md` is written, perform these together (both, or neither on a re-run):
 
 1. **Rule 9 dedup — mandatory, unconditional on every accept.** Before creating, run
-   `gh issue list --repo <target> --state all --search "<model title>" --json number,title,state,url`.
+   `gh issue list --repo <target> --state all --search "<Title>" --json number,title,state,url`.
+   `<Title>` here must equal the display title frozen at build go byte-for-byte; do not derive or rewrite
+   a search placeholder.
    `--search` is **keyword-based, not typo-fuzzy**, so surface only **plausible** near-matches, framed
    as a reuse choice — "found a possibly-related issue #M — file new, or reuse it?" — and **reuse**
    rather than double-file. This is the sole guard in the Phase 1→Phase 3 window (the anchor doesn't
    exist yet); the resident anchor reader guards after.
 2. **File it.** Write the body with the Write tool to an **OS-temp path outside the worktree** (Rule 1),
-   then `gh issue create --repo <target> --title "<title>" --body-file <path>`. **Echo the new issue
+   then `gh issue create --repo <target> --title "<Title>" --body-file <path>`. The title is one quoted
+   argument and is the display title frozen at build go. **Echo the new issue
    URL** in-session (Rule 7); the body ends with the `<attribution trailer>` (Rule 8) and is
    leakage-stripped (Rule 6). On a fork the issue lands on `<target>` (the upstream).
 3. **Synthesize the cached-issue JSON** the Phase 0 gate would have produced, so every downstream
    "with a ticket present" branch reads it with **no re-fetch**:
-   `number=N`, `title=<model title>`, `body=<the WHAT/WHY just filed>`, **`labels: []`** (the gate
-   caches `labels` and Phase 1 reads them — omitting it breaks a downstream `labels` read),
+   `number=N`, `title=<Title>`, `body=<the WHAT/WHY just filed>`, **`labels: []`** (the gate
+   caches `labels` and Phase 1 reads them — omitting it breaks a downstream `labels` read). The cached `title` must equal the exact frozen `<Title>` passed to dedup and create; no synthesized alias or
+   rewritten placeholder is permitted. The remaining fields are
    `state="open"`, `url=<echoed URL>`, `comments=[]`. Set the working ticket ref to **`<target>#N`**.
 4. **Persist the anchor.** Write `Ticket: <target>#N` into `feature.md` (the `Ticket:` metadata line —
    see [templates.md](templates.md)) so a resumed run reconstructs the ticket path. For a given ticket

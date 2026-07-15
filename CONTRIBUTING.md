@@ -99,7 +99,7 @@ absence).
 the user. Launch picc against the bundled `examples/hello-claude` fixture:
 
 ```bash
-git checkout feature/<NN>-<slug>
+git checkout feature/<feature-slug>
 cd examples/hello-claude
 node ../../bin/picc.mjs        # runs picc in this directory (the target project)
 ```

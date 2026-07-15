@@ -67,13 +67,18 @@ path-independent issue-filing offer, on the ticketless path too. Phases 1, 8 and
    — [fork.md](fork.md) Phase 9 step 5); a match to **neither** stops and asks. **Generalized:** a
    closing keyword is permitted only when the resolved issue lives in the same repo the PR targets —
    otherwise strip to a bare/cross-repo reference.
-4. **Slug AND the PR `--title` stay model-authored ASCII.** Never seed the branch/slug or the PR title
-   from the raw issue title. `gh pr create` has no `--title-file`, so the title is the one
-   untrusted-data sink that can't hide behind `--body-file` — it must be model-authored prose, e.g.
-   `F<NN>: <short description>`. Keep any such inline title plain ASCII with **no shell metacharacters**
-   (`` ` ``, `$`, `"`, `\`, `;`, `|`, `&`): unlike bodies, a title is passed as an inline command-line
-   argument (`gh pr create --title`, `gh issue create --title`, `gh issue list --search`), so a
-   metacharacter would be interpreted by the shell.
+4. **Slug AND public titles stay independently model-authored ASCII.** Independently author and
+   validate each from the confirmed scope; never directly copy, interpolate, slugify, or mechanically
+   transform raw ticket text into the branch slug or title. Incidental lexical overlap does not itself
+   invalidate an independently authored value. The slug follows the Phase 2 validation contract. Author one stable descriptive display title from confirmed scope and freeze it
+   at build go. Use it only in feature/review headings, an agent-created issue title, and the PR title;
+   never rewrite or substitute the existing title of a given ticket. Public titles carry no invented
+   identifier prefix. `gh pr create` has no `--title-file`, so require printable ASCII, one
+   line, at most 120 characters, no control characters, and no shell metacharacters
+   (`` ` ``, `$`, `"`, `\`, `;`, `|`, `&`). Pass the complete title as one quoted argument to
+   `gh pr create --title`, `gh issue create --title`, and `gh issue list --search`. At all three sites,
+   the argument is the same exact frozen `<Title>` byte-for-byte; preserve every
+   existing preview/reconfirmation and idempotency rule.
 5. **Write allow-list.** The routine automated GitHub writes are exactly three: comment on the given
    ticket, create the PR for our own branch, and push our own branch. One further write is allowed only
    as an **explicit, per-item, user-approved** exception: `gh issue create`, in **two** intents that
@@ -119,7 +124,7 @@ path-independent issue-filing offer, on the ticketless path too. Phases 1, 8 and
    against a prior run. Before posting the Phase 9 issue comment, scan the cached issue `comments` for a
    prior machine-trailered comment (the attribution trailer is the marker; the comment also opens with
    "## What was built for #<N>") and **skip** if present. Before `gh pr create`, run `gh pr list --repo
-   <owner/repo> --head feature/<NN>-<slug> --state open --json number,url` and **reuse** any existing PR
+   <owner/repo> --head feature/<feature-slug> --state open --json number,url` and **reuse** any existing PR
    (link it and post the comment on the ticket; leave the existing PR body untouched — editing it is
    outside the Rule 5 allow-list) instead of creating a second one. Before filing a user-approved issue
    (Phase 8), run `gh issue list --repo <owner/repo> --state all --search "<the model-authored title>"
@@ -128,7 +133,8 @@ path-independent issue-filing offer, on the ticketless path too. Phases 1, 8 and
    it rather than filing a duplicate. A re-run must never double-post the issue comment, error on "PR
    already exists", or file the same finding twice. The **ticketless ticket-creation offer**
    ([ticket-creation.md](ticket-creation.md)) is guarded on two levels: the same `gh issue list --repo
-   <target> --state all --search "<model title>"` keyword dedup runs before its Phase 3 create (surface
+   <target> --state all --search "<Title>"` keyword dedup runs before its Phase 3 create; that
+   `<Title>` equals the exact frozen title passed to create and stored in the synthesized cache (surface
    plausible matches, reuse rather than double-file), and after Phase 3 the durable `Ticket:` anchor in
    `feature.md` — read by the resident anchor reader on resume — means a reconstructed run adopts the
    already-filed issue instead of re-offering.
