@@ -62,6 +62,11 @@ real `PermissionEngine`). Five tasks (t01 foundation → t02 issue-eval → t03 
   flagged it; fixed to enumerated destructive subcommands before any code landed.
 - **Caught in t05 review:** the CONTRIBUTING worked example told a first-timer to type `/hello`, a
   command the named `examples/hello-claude` fixture doesn't have (its skill is `/greet`).
+- **Caught by the live smoke test at close:** the coordinator's content redirect wrote **UTF-16LE**
+  under a PowerShell `>`, which the evaluator's Read tool renders as mojibake — issue/PR evaluation
+  would silently break on Windows whenever the coordinator used PowerShell. Fixed by mandating a UTF-8
+  (Bash-tool) redirect across the skill. (The empty-stdout isolation premise itself was *confirmed* by
+  the same test on both shells.)
 - No pre-existing repo bugs surfaced.
 
 ## Improvement opportunities
@@ -74,16 +79,14 @@ real `PermissionEngine`). Five tasks (t01 foundation → t02 issue-eval → t03 
 
 ## Proposed follow-ups
 
-- **Live smoke test of the redirect quarantine (highest priority).** The whole coordinator-non-ingestion
-  story rests on the unverified premise that `gh … > <file>` returns empty stdout to the Bash tool
-  result (and that the evaluator can decode the file — on Windows PowerShell `>` writes UTF-16LE). It's
-  honestly hedged everywhere as "pending one live smoke test." Run it (against a real issue/PR with
-  `gh` authenticated) to either retire the hedge or fall back to the documented weaker guarantee. This
-  doubles as the first real end-to-end exercise of `/evaluate` (the skill has never been runtime-run —
-  it's prose).
-- **Cross-bundle link-integrity test coverage** — a small test extension so evaluate↔implement-feature
-  references can't rot.
+- **Live smoke test of the redirect quarantine — DONE at close.** Run against real GitHub data (#27
+  issue, #25 PR) with `gh` authenticated: the empty-stdout isolation premise was **confirmed** on both
+  Windows Git Bash and PowerShell, and metadata-only issue-vs-PR routing worked; it surfaced the
+  UTF-16LE redirect gap (now fixed — see Bugs discovered). A fuller end-to-end exercise of the *rating*
+  logic (model behaviour) is still worthwhile once the skill is loaded as an invocable command in a
+  session.
 - **De-numbering the implement-feature convention** — already filed as issue #26; a good candidate to
   dogfood the new evaluate skill against.
-- **Optional: harden the evaluator justification channel** to structured-only, closing the disclosed
-  dual-LLM residual.
+- **Considered and declined by the maintainer this cycle:** cross-bundle link-integrity test coverage
+  (low value); hardening the evaluator justification channel to structured-only (low-probability,
+  disclosed residual with a usefulness tradeoff). Left as documented residuals rather than tracked work.

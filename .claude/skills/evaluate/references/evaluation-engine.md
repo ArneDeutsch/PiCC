@@ -96,11 +96,15 @@ metadata it *can* see, and integrates the score. The two guarantees are **not** 
   (`tools: Read, Grep, Glob`); the tool set physically strips shell, write, fetch, and dispatch. This
   is tool-enforced, not prose.
 - **The coordinator never sees raw attacker bytes — a DISCIPLINED REDIRECT (behavioral).** The
-  coordinator *holds* Bash and chooses to redirect content to a file it does not Read. This rests on
-  the **unverified** premise that `gh … > <file>` returns empty stdout to the Bash tool result —
-  pending one live smoke test (noted in the t01 log). It is not tool-enforced; if a redirect ever
-  surfaced body text, the fallback is to handle it under the envelope + text-is-data discipline (and
-  say so), never to claim the coordinator half is structurally guaranteed.
+  coordinator *holds* Bash and chooses to redirect content to a file it does not Read. That the redirect
+  keeps content out of the coordinator's context (`gh … > <file>` returns empty stdout to the Bash tool
+  result) is now **verified on Windows** — on both Git Bash and PowerShell. It stays a **behavioral
+  discipline** (the coordinator must actually perform the redirect), **not** tool-enforced; if a redirect
+  ever surfaced body text, the fallback is to handle it under the envelope + text-is-data discipline (and
+  say so), never to claim the coordinator half is structurally guaranteed. **Correctness additionally
+  requires the redirect to produce a UTF-8 file** — do it via the **Bash tool** (Git Bash `>` writes
+  UTF-8), never a PowerShell `>` redirect (UTF-16LE-with-BOM → the shell-free evaluator, which consumes
+  the file via the Read tool, reads mojibake); see [write-discipline.md](write-discipline.md).
 
 ## Canonical rating / assessment block
 

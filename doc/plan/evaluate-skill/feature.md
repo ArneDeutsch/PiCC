@@ -96,8 +96,11 @@ changes "with no runnable UI".
   enum, or a bounded rating in its own words. So the coordinator operates on the evaluator's bounded
   outputs, not on attacker-controlled bytes. Honest split: the evaluator's inability to write/fetch/run
   is **structural** (tool-gated); the coordinator's non-ingestion is a **disciplined redirect**
-  (behavioral), resting on the premise that `gh … > file` returns empty stdout to the tool — pending one
-  live smoke test before the "quarantine" framing is fully relied on.
+  (behavioral, not tool-enforced — the coordinator must actually redirect rather than read). The
+  `gh … > file ⇒ empty stdout` premise is **smoke-tested and confirmed** (Windows Git Bash + PowerShell:
+  the redirect keeps the content out of the tool result). Correctness additionally requires the redirect
+  produce **UTF-8** (perform it via the Bash tool; a PowerShell `>` writes UTF-16LE that the evaluator's
+  Read cannot decode).
 - **Malicious input is contained.** The screen classifies the target into a **fixed set of categories
   and nothing else**, so a prompt injection can at most flip the category, never smuggle an
   instruction; parsing is strict and fails to keep-open. A malicious classification closes the issue

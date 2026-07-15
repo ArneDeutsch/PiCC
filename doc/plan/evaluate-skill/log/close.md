@@ -89,3 +89,47 @@ Applied the six accepted findings from the evaluate-skill close review. Prose/co
   reference file. Recorded here so the next editor doesn't rediscover it the hard way.
 - implement-feature/SKILL.md sits at 19,988 bytes (12 under the 20k cap). I did not touch it, but it is
   worth flagging as nearly full for anyone editing it next.
+
+## Fix 7 (post-smoke-test) — redirect-isolation UTF-8 encoding gap + verified framing
+
+Live smoke test of the redirect isolation found a real cross-platform correctness gap and confirmed the
+long-hedged empty-stdout premise. Both addressed. Prose only; no `src/` touched.
+
+- **The finding (verified on Windows).** (1) The empty-stdout premise HOLDS: `gh … > <file>` returns
+  empty stdout to the tool on both Git Bash and PowerShell — the coordinator's context never sees the
+  content. (2) BUT the Read tool (the shell-free evaluator's only way to consume the file) does **not**
+  decode UTF-16LE. A **Git Bash** `>` writes UTF-8 (reads back cleanly); a **PowerShell** `>` writes
+  UTF-16LE-with-BOM, which the Read tool returns as garbled space-separated mojibake → breaks
+  evaluation. The skill previously said only `gh … > <file>` with no shell/encoding, so a coordinator
+  using PowerShell on Windows would hand the evaluator garbage.
+
+- **Canonical rule (write-discipline.md).** Added a new `## Content-redirect encoding — the redirect
+  MUST produce a UTF-8 file` section near the mechanics: the content redirect MUST produce UTF-8 because
+  the evaluator consumes the file via the Read tool, which cannot decode UTF-16LE; do the redirect via
+  the **Bash tool** (Git Bash `>` writes UTF-8), **never** a PowerShell `>` redirect (UTF-16LE-with-BOM
+  → mojibake); if PowerShell is unavoidable, pipe explicitly: `gh … | Out-File -Encoding utf8 <file>`.
+  States the WHY (evaluator Read + UTF-16LE decode failure) so it can't be dropped as arbitrary. Same
+  section records the empty-stdout premise as verified-on-Windows-but-still-behavioral.
+
+- **Referenced the rule at each redirect site** (terse pointer, so an implementer at any entry point
+  sees it): SKILL.md resident kernel (the `Redirect it … without reading it` lead + the two-bullet
+  redirect commands), evaluation-engine.md redirect-isolation note, issue-eval.md Step 1
+  (`> <tempfile>`), pr-eval.md Step 1 (`> <difffile>` / `> <contentfile>`). proposal-gate.md has **no**
+  redirect site (structurally shell-free — no `gh` redirect), so it was left untouched by design.
+
+- **Framing upgrade (SKILL.md + evaluation-engine.md).** Replaced the "currently **unverified** premise
+  … pending one live smoke test" hedge in both files with: the redirect keeps content out of the
+  coordinator's context is **verified on Windows** (Git Bash + PowerShell), and correctness
+  **additionally** requires the UTF-8 redirect. Deliberately **kept** the honest distinction that this
+  is a **behavioral discipline** (the coordinator must actually perform the redirect), not a tool-enforced
+  / structural guarantee — did not overclaim. write-discipline.md carried no prior hedge; the verified
+  framing lands in its new UTF-8 section instead.
+
+- **Decision — link form.** The new write-discipline pointer in SKILL.md reuses the already-present
+  `[references/write-discipline.md](references/write-discipline.md)` link form (a real evaluate
+  reference), so the greedy router link-integrity regex (Fix 2 note) stays green. Reference-to-reference
+  pointers use the bare-name `[write-discipline.md](write-discipline.md)` sibling link.
+
+- **Verification.** `npm run typecheck`: clean (no output). `npm test` (full suite): **47 passed |
+  1 skipped** files; **1117 passed | 16 skipped** tests; 0 failures — identical to the Fix 1–6 baseline.
+  SKILL.md now 13,561 bytes (under the 20k cap). Router bidirectional link-integrity green.

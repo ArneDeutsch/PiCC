@@ -44,6 +44,10 @@ coordinator NEVER `cat`s / opens / Reads them.** Keep them strictly **body/diff-
 any coordinator-needed metadata (`state`, `mergedAt`, `statusCheckRollup`, …) into them, or an
 implementer would be led to open an attacker-content file just to read a field it needs:
 
+Each redirect **must produce a UTF-8 file** (UTF-8 — Bash-tool redirect; see
+[write-discipline.md](write-discipline.md)) — the `evaluator` consumes these via the Read tool, which
+cannot decode the UTF-16LE a PowerShell `>` would write:
+
 ```
 gh pr diff <N> --repo <target>                            > <difffile>
 gh pr view <N> --repo <target> --json title,body,comments > <contentfile>

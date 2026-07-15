@@ -72,6 +72,26 @@ attacker-influenced text can never ride along with a destructive action.
    attacker-forgeable, so a forged/ambiguous hit may only cause a conservative skip/ask, never a
    destructive action.
 
+## Content-redirect encoding — the redirect MUST produce a UTF-8 file
+
+The content redirect (`gh … > <file>` — the issue/PR body/diff temp file the `evaluator` Reads) **MUST
+produce a UTF-8 file.** The shell-free `evaluator` consumes that file through the **Read tool**, which
+**cannot decode UTF-16LE**: a UTF-16LE payload comes back as garbled, space-separated mojibake, silently
+feeding every reviewer garbage. This is the WHY — it is a correctness requirement, not an arbitrary
+style rule.
+
+- **Do the redirect via the Bash tool** (Git Bash): a Git Bash `>` redirect writes **UTF-8**, which the
+  Read tool decodes cleanly. This is the default and preferred form.
+- **Never use a PowerShell `>` redirect:** PowerShell's `>` writes **UTF-16LE-with-BOM**, so the
+  evaluator Reads mojibake and the rating wave is fed garbage (verified on Windows).
+- If PowerShell is unavoidable, **pipe explicitly to UTF-8** — `gh … | Out-File -Encoding utf8 <file>` —
+  **never** a bare `gh … > <file>` under PowerShell.
+
+That the redirect also keeps the content out of the coordinator's context (empty stdout to the tool
+result) is **verified on Windows** on both Git Bash and PowerShell — but it stays a **behavioral
+discipline** (the coordinator must actually perform the redirect), not a tool-enforced guarantee; see
+the engine's redirect-isolation note.
+
 ## `#N` / `<target>` sanitization gate — applied at the FIRST `gh` touch
 
 The resolution `gh api` call is where a raw, free-form-parsed ref first reaches the shell, so sanitize

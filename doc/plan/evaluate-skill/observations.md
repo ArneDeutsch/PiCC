@@ -103,3 +103,15 @@ Running record of friction, bugs, and opportunities. Dated bullets, one line eac
 - **Two-artifact verification contract confirmed sound** by the contributor walkthrough: guidance
   (before, in the description, for the reviewer) vs. the manual-verification comment (after, as
   evidence) is additive, not busywork, with a genuine stated rationale.
+
+## close — live smoke test (2026-07-15)
+
+- **Ran the redirect-quarantine smoke test against real GitHub data.** Empty-stdout isolation premise
+  CONFIRMED on Windows (both Git Bash and PowerShell keep `gh … > file` content out of the tool result);
+  metadata-only `--jq` issue-vs-PR routing works (#27→issue/open, #25→PR/closed).
+- **Real bug found & fixed:** a PowerShell `>` redirect writes UTF-16LE-with-BOM, which the Read tool
+  returns as mojibake (`��{ " t i t l e"`); a Git Bash `>` writes clean UTF-8 the evaluator reads fine.
+  The skill said only `gh … > file` — so on Windows/PowerShell the evaluator would get garbage. Fixed by
+  mandating a UTF-8 (Bash-tool) redirect. Lesson: "redirect to a file" is encoding-sensitive on a
+  dual-shell (PowerShell-primary) platform; the load-bearing detail is UTF-8, and only a live run caught
+  it — offline reasoning had marked the premise "holds by construction."

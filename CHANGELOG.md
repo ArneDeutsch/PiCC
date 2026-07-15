@@ -35,9 +35,10 @@ All notable changes to PiCC are documented here. The format is based on
   non-body metadata (issue-vs-PR, open/closed, changed-file list, CI status) via targeted `--jq`
   queries — so no attacker text reaches a shell-capable agent, and the coordinator operates on the
   evaluator's constrained outputs, not raw bytes. **Honest limit:** the coordinator's non-ingestion is
-  a *disciplined redirect* (behavioral), not a tool-enforced block, and rests on `gh … > file`
-  returning empty stdout — pending one live smoke test before the "quarantine" framing is fully relied
-  on.
+  a *disciplined redirect* (behavioral), not a tool-enforced block. The `gh … > file ⇒ empty stdout`
+  premise is smoke-tested and confirmed (Windows Git Bash + PowerShell); correctness also requires the
+  redirect produce UTF-8 (Bash-tool `>`; a PowerShell `>` writes UTF-16LE the evaluator's Read cannot
+  decode).
 - **Malicious input is contained, and re-runs are idempotent.** The screen classifies the target into
   a fixed category set and nothing else, so an injection can at most flip the category, never smuggle
   an instruction; parsing fails safe to keep-open. **Invariant: a close always carries the canned,
