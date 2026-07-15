@@ -75,9 +75,11 @@ changes "with no runnable UI".
   agent *cannot* perform those writes. On the coordinator's own path it is bounded by two real
   controls — a defence-in-depth `settings.json` deny floor and the text-is-data discipline — not by an
   absolute technical block, because in PiCC `allow`/`ask` permission rules are no-ops (only `deny` and
-  per-agent tool-gating are hard). The deny floor covers the write verbs neither skill needs (including
-  `gh api` write methods); `gh issue close` cannot be on it (this skill needs it, the engine is shared
-  with `implement-feature`), so its safety rests on the confidence gate + the close-invariant below.
+  per-agent tool-gating are hard). The deny floor denies the *common* write forms neither skill needs
+  (including the common `gh api` write forms) — but a `*`-anywhere matcher can't express "flag in any
+  position", so it is best-effort defence-in-depth, not the primary control; `gh issue close` cannot be
+  on it (this skill needs it, the engine is shared with `implement-feature`), so its safety rests on the
+  confidence gate + the close-invariant below.
 - **Structural no-write surfaces.** **Every** agent that ingests attacker-controlled target content —
   the maliciousness **screen**, **proposal-gate**, and all the roaster / pro-con / lens **reviewers** —
   runs as a single dedicated read-only agent with no shell, no write, no fetch, and no dispatch tools,
@@ -90,7 +92,10 @@ changes "with no runnable UI".
   it**, and resolves only non-body metadata (issue-vs-PR, open/closed) via targeted queries. The
   shell-free `evaluator` reads that file itself and returns only constrained output — the classification
   enum, or a bounded rating in its own words. So the coordinator operates on the evaluator's bounded
-  outputs, never on attacker-controlled bytes (a dual-LLM-style quarantine).
+  outputs, not on attacker-controlled bytes. Honest split: the evaluator's inability to write/fetch/run
+  is **structural** (tool-gated); the coordinator's non-ingestion is a **disciplined redirect**
+  (behavioral), resting on the premise that `gh … > file` returns empty stdout to the tool — pending one
+  live smoke test before the "quarantine" framing is fully relied on.
 - **Malicious input is contained.** The screen classifies the target into a **fixed set of categories
   and nothing else**, so a prompt injection can at most flip the category, never smuggle an
   instruction; parsing is strict and fails to keep-open. A malicious classification closes the issue
