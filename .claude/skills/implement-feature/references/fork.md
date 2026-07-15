@@ -170,17 +170,29 @@ the body until the rules are available** — do not distill a body with the rule
 
 1. **Merge, then push to the fork.** Re-fetch the **target's** default (via a temporary named remote,
    as in Phase 2 — [workflow-detail.md](workflow-detail.md) Phase 2); if it moved, merge it into the
-   feature branch, resolve conflicts, and verify typecheck + full suite green again. Then push the
-   branch to the fork: `git push -u <pushRemote> feature/<NN>-<slug>`. This is the single automatic
-   write.
+   feature branch, resolve conflicts, and verify typecheck + full suite green again. Immediately
+   before every push, fetch `<pushRemote>` and inspect the exact remote ref plus every case-fold-equivalent
+   sibling for `feature/<feature-slug>`. For a first push, only an absent exact ref with no case-fold
+   sibling is available for `git push -u <pushRemote> feature/<feature-slug>`. An existing exact ref is
+   allowed only as an established self-owned branch: live-run knowledge proves this workflow created it
+   earlier, or the disk-resume trust gate explicitly confirmed it; the configured upstream is exactly
+   `<pushRemote>/feature/<feature-slug>`; no case-fold sibling exists; and the fetched remote tip must
+   equal local `HEAD` or be an ancestor of it. Only then make an ordinary non-forcing equal/fast-forward push, including
+   resumed handoffs and CI-fix repushes. A foreign/ambiguous ref, wrong or absent upstream for an existing
+   ref, sibling, or diverged tip stops before push and later writes. Lead with **"nothing is lost"**;
+   name the conflicting ref and relationship, state that the local branch, worktree, and commits remain
+   intact and nothing new was posted, and offer safe choices to inspect/reconcile ownership or restart
+   under a new descriptive identity. Never force or suggest force, deletion, overwrite, or adoption. This is the
+   single automatic write. The recheck is not atomic: a same-name branch created in the remaining check-to-push
+   race may still be attached by ordinary push when histories permit; never claim complete race elimination.
 2. **Confirm the push landed before printing the compare URL** — a URL for a branch that isn't on the
    fork 404s. Only after the push succeeds, build the URL.
 3. **Compare URL — emit exactly this two-part-head form** (split `target` into
    `<target-owner>/<target-repo>`; take `<forkOwner>` from the fork's `nameWithOwner` = `push`
    (authoritative — do **not** substitute `gh api user --jq .login`, which is wrong for an org-owned
-   fork); `<branch>` = `feature/<NN>-<slug>`):
+   fork); `<branch>` is concretely `feature/<feature-slug>`):
    ```
-   https://github.com/<target-owner>/<target-repo>/compare/<targetDefault>...<forkOwner>:<branch>?expand=1
+   https://github.com/<target-owner>/<target-repo>/compare/<targetDefault>...<forkOwner>:feature/<feature-slug>?expand=1
    ```
    **Three dots**; `?expand=1` (opens the PR-creation form). Use the **two-part** `<forkOwner>:<branch>`
    head, **not** the three-part `<forkOwner>:<forkRepo>:<branch>` form: the three-part head + `?expand=1`
@@ -197,8 +209,8 @@ the body until the rules are available** — do not distill a body with the rule
    neither of those bullets is true here. Reuse only handoff.md step 4's framing (what was
    implemented, decisions/deviations, test status). Then give the fork next-steps:
    - The working **compare URL** (from step 3).
-   - The PR **title** on its own line, copyable — a model-authored ASCII title (Rule 4), e.g.
-     `F<NN>: <short description>`.
+   - The PR **title** on its own line, copyable — the stable printable-ASCII `<Title>` from confirmed
+     scope (Rule 4), with no identifier prefix.
    - The PR **body** in a fenced code block, byte-exact — authored from [handoff.md](handoff.md)'s
      **PR-body skeleton** (answer every heading; "Start your review here" is a semantic verification
      guide, not a code tour). Inside that body's steps use **inline `code`, never a triple-backtick

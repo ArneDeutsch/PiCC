@@ -1,0 +1,10 @@
+- 2026-07-15 — Planning error: the first collision contract overclaimed what prose can guarantee; `EnterWorktree` can delete a raced unregistered directory, adopt a harness branch, and run hooks before reuse is detectable.
+- 2026-07-15 — Review caught that an unconditional pre-push remote-ref collision stop would break resumed handoffs and CI-fix repushes; established branches need explicit ownership, upstream, case-fold, and ancestry checks.
+- 2026-07-15 — Security finding: internally consistent resume artifacts prove identity consistency, not prior human consent; disk-reconstructed resumes need a fresh target match and explicit public-write confirmation.
+- 2026-07-15 — Test-design friction: broad prose-marker checks passed while lifecycle tuples were incomplete; localized assertions and a delimited legacy-resume exception made failures diagnostic without rewriting history.
+- 2026-07-15 — Existing test-suite timing is sensitive to concurrent full-suite/typecheck load; one hook-runner threshold failed under contention but targeted and serial full-suite reruns passed.
+- 2026-07-15 — Close review caught that maintainer commands still hard-coded `origin` despite Phase 0 resolving `pushRemote`; the workflow now reserves `origin` for the explicit no-gh degrade.
+- 2026-07-15 — The first real PiCC smoke reached the correct descriptive artifacts but skipped the visible pre-workspace announcement; stronger presentation wording and localized tests preceded a successful second smoke.
+- 2026-07-15 — Manual smoke verified a ticketless, remoteless Windows Git Bash run through Phase 3 with `smoke-greeting-artifact`; ticketed, fork, resume, and hand-off paths remain structurally reviewed rather than manually exercised.
+- 2026-07-15 — Existing runtime opportunity: an atomic create-only worktree mode would eliminate the destructive/adopting check-to-call race that prose can only disclose and narrow.
+- 2026-07-15 — Pre-existing ticket-integrity concern: fork-only issue URLs are described as adoptable while one router read still targets the upstream repository; investigate separately from de-numbering.
