@@ -42,3 +42,24 @@ Running record of friction, bugs, and opportunities. Dated bullets, one line eac
 - **Accepted residual:** the evaluator's "short justification" fields are a free-text channel; a
   base64-encoded secret could survive an English paraphrase. Owned by feature.md's dual-LLM non-goal;
   optional future hardening is to restrict the composed comment to rubric vocabulary + scores.
+
+## t03 — pr-eval (2026-07-15)
+
+- **Metafile bundling trap (generalizes the t02 "scan comments" leak).** Redirecting attacker content
+  AND coordinator-needed metadata into ONE `--json` file forces the coordinator to read the attacker
+  body just to get `state`/`mergedAt`/file-list/CI — silently breaking redirect isolation. Rule that
+  emerged: redirected content files are **evaluator-only**; everything the coordinator needs comes from
+  **separate metadata-only `--jq` re-queries**. Never co-mingle the two in one file. (Note: `state ==
+  closed` already covers every merged PR, so only the merged-vs-closed *reframe* needs an extra query.)
+- **PR assessment comment needs two labelled sections:** §A "was this ticket worth doing?" (rubric on
+  the ticket, no blast-radius row) and §B "assessment of this diff" (diff-specific rows incl. code
+  consequences/blast-radius + a Tests/CI row) — otherwise a shared "Blast radius" row is ambiguous
+  (ticket vs diff) and doubled.
+- **Canonical-noun drift** ("manual-verification comment" vs "report") had scattered across engine +
+  write-discipline + feature.md; swept. Lesson: when a task canonicalizes a term, sweep the siblings in
+  the same pass or the "all name the same thing" claim ships false.
+- **Cross-bundle link is unguarded:** pr-eval.md's `../../implement-feature/references/handoff.md`
+  see-also is not covered by the link-integrity test (which only checks same-dir refs) — accepted as
+  low-severity provenance coupling; would rot silently if handoff.md moves.
+- **t05 coordination:** the verification contract is canonical in pr-eval.md; t05 must reuse its exact
+  `node bin/picc.mjs` + `examples/` launch command rather than paraphrasing, to avoid drift.

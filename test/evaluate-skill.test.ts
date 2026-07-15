@@ -163,6 +163,55 @@ describe("issue-eval mode floor markers (evaluate-skill t02)", () => {
   });
 });
 
+describe("pr-eval mode floor markers (evaluate-skill t03)", () => {
+  // Loose, case-insensitive, whitespace-collapsed structural checks: assert the
+  // load-bearing never-merge invariant + the canonical verification-applicability
+  // rule survive, NOT exact prose. We do NOT test LLM judgment or the gh writes.
+  const collapse = (p: string): string =>
+    fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
+
+  const { skills } = loadSkills([{ dir: SKILLS_DIR, scope: "project" }], []);
+  const skill = skills.find((s) => s.name === "evaluate");
+
+  const PR_EVAL_PATH = path.join(REFERENCES_DIR, "pr-eval.md");
+
+  it("pr-eval.md exists (linked from the router — bidirectional integrity above)", () => {
+    expect(fs.existsSync(PR_EVAL_PATH)).toBe(true);
+  });
+
+  it("pr-eval.md carries the never-merge invariant (never merges / never says merged)", () => {
+    const body = collapse(PR_EVAL_PATH);
+    expect(body).toContain("never merge");
+    expect(body).toContain('never says "merged"');
+  });
+
+  it("pr-eval.md defines the verification-applicability rule (docs/auto-tested exempt, skill/prose NOT)", () => {
+    const body = collapse(PR_EVAL_PATH);
+    // Docs-only / no-runtime-surface → nothing to manually verify.
+    expect(body).toContain("no runtime surface");
+    // Fully-and-genuinely automated-test coverage → nothing left to verify by hand.
+    expect(body).toContain("automated tests");
+    // Crucial distinction: a skill / harness / prose change is NOT exempt.
+    expect(body).toContain("not exempt");
+    expect(body).toContain("prose");
+    // Canonical noun for the evidence artifact.
+    expect(body).toContain("manual-verification comment");
+  });
+
+  it("pr-eval.md gates the verification-request (only when warranted AND missing; not on closed/merged)", () => {
+    const body = collapse(PR_EVAL_PATH);
+    expect(body).toContain("verification-request");
+    // Applicability-gated + idempotent + never on a closed/merged PR.
+    expect(body).toContain("closed or merged");
+  });
+
+  it("router carries the resident never-merge marker", () => {
+    const routerBody = loadSkillBody(skill!).toLowerCase().replace(/\s+/g, " ");
+    expect(routerBody).toContain("never merge");
+    expect(routerBody).toContain('never says "merged"');
+  });
+});
+
 describe("evaluator sandbox agent (evaluate-skill t01)", () => {
   const { agents, diagnostics } = loadAgents([{ dir: AGENTS_DIR, scope: "project" }]);
 

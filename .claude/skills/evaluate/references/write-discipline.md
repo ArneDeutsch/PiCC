@@ -19,7 +19,7 @@ The **entire** set of GitHub writes this skill may perform:
 2. **Keep-open rating comment** (issue-eval) — a model-authored rating/importance comment.
 3. **PR assessment comment** (pr-eval) — the diff/consequence/fulfilment assessment.
 4. **Verification-request comment** (pr-eval) — only when the change warrants manual verification and
-   the author's manual-verification report is absent.
+   the author's manual-verification comment is absent.
 
 **Nothing else.** Never merge, edit, label, reopen, lock, delete, or push; never open a PR; never
 touch anything outside this list. The `settings.json` deny floor is **defence-in-depth** for the write

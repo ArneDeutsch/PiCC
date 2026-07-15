@@ -19,11 +19,10 @@ The router's **target-detection + reachability gate** has already run before thi
   stopped there with evaluate's own usage/reachability copy.
 - Type was resolved with the metadata-only query
   `gh api repos/<target>/issues/<N> --jq '{isPR:(.pull_request!=null), state:.state}'`.
-  **A `pull_request` key means this was never an issue.** pr-eval is added by t03; until it exists the
-  router announces the detection for the **current state** — "detected a pull request; PR evaluation
-  isn't available yet" — rather than a present-tense "evaluating as a PR". Once pr-eval lands it hands
-  off there. **issue-eval never tells the user to type another command — there is no other command.**
-  It also never emits a "use another command" hand-off of any kind.
+  **A `pull_request` key means this was never an issue — the router routes it to
+  [pr-eval.md](pr-eval.md)** (announced present-tense, "detected a pull request; evaluating as a PR"),
+  and this mode never runs. **issue-eval never tells the user to type another command — there is no
+  other command.** It also never emits a "use another command" hand-off of any kind.
 - Reachability here is **read + comment auth only** (`gh` installed + authed, read/comment access to
   `<target>`). issue-eval does **not** require a pushable remote — do not import implement-feature's
   push-remote precondition.

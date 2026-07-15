@@ -19,9 +19,11 @@ screen, the investigation wave, the canonical rating block) and
 [references/write-discipline.md](references/write-discipline.md) (the closed action allow-list, the
 six write mechanics, the `#N`/`<target>` sanitization gate). Per-mode references, read on demand once
 the router has routed: [references/issue-eval.md](references/issue-eval.md) (the issue mode — screen,
-rate, and drive a confidence-gated close-or-keep-open). The remaining per-mode references (pr-eval,
-proposal-gate) are added by later tasks; when a mode is not yet documented, say so plainly rather than
-inventing behaviour.
+rate, and drive a confidence-gated close-or-keep-open) and
+[references/pr-eval.md](references/pr-eval.md) (the PR mode — assess the diff, fulfilment, and
+verification evidence, then post an **advisory** assessment comment; **never merges**). The remaining
+per-mode reference (proposal-gate) is added by a later task; when a mode is not yet documented, say so
+plainly rather than inventing behaviour.
 
 ## The three modes
 
@@ -37,9 +39,11 @@ inventing behaviour.
   the assessment embedded) but only **annotates** the Phase 1 human-converged feature (it never
   suppresses the user's own offer).
 - **pr-eval** — given a pull request: assess the diff, whether it fulfils its ticket *and* whether the
-  ticket was worth doing, and the verification evidence; post an assessment comment. **Never merges.**
-  It requests a manual-verification report only when the change actually warrants manual verification
-  and the author's report is absent.
+  ticket was worth doing, and the verification evidence; post an **advisory** assessment comment (full
+  mode: [references/pr-eval.md](references/pr-eval.md)). **It never merges, never takes any merge
+  action, and never says "merged"** — the assessment is advice and the maintainer decides. It requests
+  a **manual-verification comment** only when the change actually warrants manual verification and the
+  author's report is absent.
 
 The rubric, the L1 screen, and the rating format are shared —
 [references/evaluation-engine.md](references/evaluation-engine.md).
@@ -113,10 +117,11 @@ Then resolve type with a metadata-only query that returns no free text:
 gh api repos/<target>/issues/<N> --jq '{isPR:(.pull_request!=null), state:.state}'
 ```
 
-A `pull_request` present ⇒ route to **pr-eval**; otherwise **issue-eval**. **Announce the detection.**
-pr-eval is added by t03; until it exists, say so plainly for the current state — "detected a pull
-request; PR evaluation isn't available yet" — rather than a present-tense "evaluating as a PR". Never
-hand the user off to a non-existent command.
+A `pull_request` present ⇒ route to **pr-eval** ([references/pr-eval.md](references/pr-eval.md));
+otherwise **issue-eval** ([references/issue-eval.md](references/issue-eval.md)). **Announce the
+detection** in the present tense — "detected a pull request; evaluating as a PR" — and proceed into
+that mode. Never hand the user off to a separate command (there is none); both modes are single-target
+and route internally.
 (In GitHub's API a PR *is* an issue, so this one call resolves both type and open/closed state.)
 
 **Reachability.** `evaluate` needs only **read + comment auth** — `gh` installed and on PATH, an

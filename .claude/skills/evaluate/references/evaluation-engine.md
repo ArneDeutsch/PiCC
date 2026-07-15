@@ -35,8 +35,9 @@ is a score + a drop/surface (gate) or annotate-only (Phase 1) decision — see t
 **PR-specific criteria** (named here, detailed in t03's `pr-eval.md`): **fulfilment** (does the diff
 actually do what its ticket asked?), **code consequences** (correctness, regressions, maintainability
 of the diff itself), and **verification evidence** (is there adequate automated coverage and — where
-the change warrants it — a manual-verification report?). These render as extra rows in the canonical
-block, not a separate format.
+the change warrants it — a manual-verification comment?). These render as extra rows in the canonical
+block — pr-eval groups its PR-specific rows under a clearly-labelled "this diff" sub-heading (distinct
+from the ticket-worth block) so each row's target is unambiguous — not a wholly separate format.
 
 ## L1 maliciousness screen
 

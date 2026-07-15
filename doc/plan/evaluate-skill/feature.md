@@ -26,7 +26,7 @@ disposition. One shared evaluation engine, three modes:
   ticket *and* whether the ticket was worth doing, and the verification evidence; then post an
   assessment comment. **Never merges.** It first judges whether the change even *warrants* manual
   verification (a docs-only change, or one fully covered by automated tests, does not) — and only
-  when it does and the author's manual-verification report is missing does it post a comment
+  when it does and the author's manual-verification comment is missing does it post a comment
   requesting one.
 
 **The evaluation, in every mode**, weighs the target against named criteria and reports its reasoning
@@ -53,7 +53,7 @@ so a first-time contributor isn't confused:
   which branch to check out, how to launch picc (e.g. against an `examples/` project), exactly what to
   do inside the app to exercise the change or confirm the bug is fixed, and the observable outcome to
   expect. Not a vague "try it out".
-- **As a PR comment — the author's manual-verification *report* (the evidence):** what they actually
+- **The manual-verification comment — the author's evidence (a PR comment):** what they actually
   ran by hand and observed, on which OS/shell, and anything they could not verify.
 
 `CONTRIBUTING.md` is tightened to demand this, with a worked example; a new
