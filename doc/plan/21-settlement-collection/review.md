@@ -36,9 +36,9 @@ F21 fully delivers ArneDeutsch/PiCC#45. A successfully returned terminal `TaskOu
 
 ## Proposed follow-ups
 
-1. **Source-ground proposal-gate evaluations** — separate trusted proposals from attacker-content screening and require project evidence before value scoring.
+1. **Source-ground proposal-gate evaluations** — tracked in ArneDeutsch/PiCC#55; separate trusted proposals from attacker-content screening and require project evidence before value scoring.
 2. **Claude-compatible TaskOutput wait inputs** — support `block`/`timeout` semantics alongside PiCC's `wait` input.
 3. **Project-aware partial capability findings** — surface actionable partial gaps in startup and `/doctor` when the project relies on them.
 4. **Linear settlement marker defanging** — preserve notice-frame hardening while bounding adversarial scan cost.
 
-No follow-up issues were filed; the maintainer explicitly declined ticket creation for this review.
+The maintainer initially declined the three proposed technical follow-up tickets, then explicitly requested the confirmed proposal-gate workflow bug be filed; it is tracked as ArneDeutsch/PiCC#55. No other follow-up issues were filed.
