@@ -580,6 +580,69 @@ describe("settlement notices (t05)", () => {
     expect(notice).toContain("Excerpt truncated");
   });
 
+  it("identifies a cut-off run even when all retained output fits the notice", () => {
+    const notice = buildSettlementNotice(baseTask({
+      result: "retained cut-off output",
+      truncated: true,
+      resumable: true,
+    }));
+
+    expect(notice).toContain("settled: completed; subagent run cut off at its output limit");
+    expect(notice).toContain("Inspect all retained output with TaskOutput");
+    expect(notice).toContain(
+      "The missing continuation was never produced and cannot be recovered there",
+    );
+    expect(notice).toContain("resume the agent with SendMessage when available, or re-dispatch");
+    expect(notice).toContain("retained cut-off output");
+    expect(notice).not.toContain("Notice excerpt truncated");
+    expect(notice).not.toContain("retrieve the complete output");
+  });
+
+  it("distinguishes a truncated notice excerpt from its cut-off subagent run", () => {
+    const notice = buildSettlementNotice(baseTask({
+      result: "z".repeat(4000),
+      truncated: true,
+      transcriptPath: "/sessions/agent-ddeeff001122.jsonl",
+    }));
+
+    expect(notice).toContain("subagent run cut off at its output limit");
+    expect(notice).toContain("Notice excerpt truncated");
+    expect(notice).toContain("[…]");
+    expect(notice.length).toBeLessThan(2000);
+    expect(notice).not.toContain("z".repeat(4000));
+    expect(notice).toContain(
+      "TaskOutput or the transcript exposes all retained output for this cut-off run, not a missing continuation",
+    );
+    expect(notice).not.toContain("retrieve the complete output");
+  });
+
+  it("keeps a stopped truncated task outcome-only without cut-off guidance", () => {
+    const notice = buildSettlementNotice(baseTask({
+      status: "stopped",
+      result: "discarded retained output",
+      truncated: true,
+      transcriptPath: "/sessions/agent-ddeeff001122.jsonl",
+    }));
+
+    expect(notice).toContain("settled: aborted.");
+    expect(notice).toContain(
+      "reports the aborted outcome (internal task status: stopped) but cannot recover discarded output",
+    );
+    expect(notice).not.toContain("subagent run cut off at its output limit");
+    expect(notice).not.toContain("Inspect all retained output");
+    expect(notice).not.toContain("missing continuation");
+    expect(notice).not.toContain("UNTRUSTED SUBAGENT OUTPUT");
+    expect(notice).not.toContain("discarded retained output");
+  });
+
+  it("documents TaskOutput collection and running-poll notice behavior", () => {
+    const tool = createTaskOutputTool(new BackgroundTaskRegistry()) as { description: string };
+    expect(tool.description).toContain(
+      "A successful terminal return counts as collection and suppresses a pending settlement notice",
+    );
+    expect(tool.description).toContain("polling a running task preserves notice eligibility");
+  });
+
   // --- MUST-FIX 1: the untrusted-frame defang must resist forged END markers ---
   // regardless of hidden zero-width chars, unicode dashes, or missing keywords.
   const realEnd = "--- END UNTRUSTED SUBAGENT OUTPUT ---";
@@ -933,7 +996,7 @@ describe("settlement notices (t05)", () => {
       const [notice] = bg.drainSettlementNotices(() => true, () => {});
       expect(notice?.content).toContain("No final task result was retained");
       expect(notice?.content).toContain(
-        "TaskOutput reports the stopped outcome but cannot recover discarded output",
+        "TaskOutput reports the aborted outcome (internal task status: stopped) but cannot recover discarded output",
       );
       expect(notice?.content).not.toContain("Retrieve the full result");
       expect(notice?.content).not.toContain("retrieve discarded output");

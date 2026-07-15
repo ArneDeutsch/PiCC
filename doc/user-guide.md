@@ -232,13 +232,14 @@ Every subagent is now visible, both to you and to the coordinating model:
   background task streams live only *while a `TaskOutput` call is awaiting it* — there is no
   always-on background dashboard.
 - **Collection and settlement notices are ordered.** Returning a terminal `TaskOutput` record —
-  completed, failed, stopped, empty, or cut off — delivers all output available for that run and
+  completed, failed, aborted, empty, or cut off — delivers all output available for that run and
   suppresses a later redundant notice that has not yet been sent. Do not repeat `TaskOutput` to try
   to recover a continuation after a cut-off marker. A running poll does *not* count as delivery, so
   the eligible current task can still produce one bounded, untrusted-framed notice on the next
   interactive turn. Retrieval remains available after that notice and does not re-arm another one.
-  A stopped task's uncollected notice is outcome-only: its final output was deliberately discarded,
-  although `TaskOutput` can still report the stopped outcome. When `SendMessage` resumes an agent,
+  A task with an aborted outcome has an outcome-only uncollected notice: its final output was
+  deliberately discarded, although `TaskOutput` can still report the aborted outcome (the internal
+  task status is `stopped`). When `SendMessage` resumes an agent,
   the new task id is the current generation; older generations remain suppressed by the existing
   newest-generation-wins rule.
 
@@ -260,9 +261,10 @@ Every subagent is now visible, both to you and to the coordinating model:
   definition after fallback or case-insensitive matching. A resumed task record and its resume
   acknowledgment instead use the clean resolved registry name. The stable agent id—not the type
   text—is therefore the reliable correlation key; broader canonical-type plumbing remains deferred.
-  This concise wording contract is PiCC-defined, not verified as exact Claude Code wording. Tool
-  schemas, lifecycle and stop behavior, settlement delivery, structured results, output framing, and
-  limits are unchanged.
+  This concise wording contract is PiCC-defined, not verified as exact Claude Code wording. This
+  identity-only wording does not otherwise change tool schemas, lifecycle and stop behavior,
+  structured results, output framing, or limits; settlement delivery follows the collection-aware
+  contract above.
 - **`SendMessage` (resume / steer).** The coordinator can address a finished subagent by its agent
   id and continue it with its context intact (it resumes in the background under the same stable id
   and a new task id), or redirect a still-running background one. Honest limitations, by design:
@@ -388,12 +390,12 @@ worktrees (incl. `.worktreeinclude`, Windows-tolerant
 removal), 13 hook events with the full stdin/stdout contract (Claude matcher semantics, parallel
 dispatch, async handlers), CLAUDE.md hierarchy to the filesystem root + `@import` + managed policy,
 settings toggles, deny rules (incl. Windows path normalization), tool gating,
-`WebFetch`/`WebSearch`/`Grep`/`Glob`/`Task*` tools, installed-plugin content, compaction
-preservation under Claude's carryover budgets.
+`WebFetch`/`WebSearch`/`Grep`/`Glob` tools, installed-plugin content, compaction preservation under
+Claude's carryover budgets.
 
 **Partial (works within a named limit):** background subagent dispatch — now the **default** (matching
-Claude Code 2.1.198), with `TaskOutput`/`TaskStop` and one bounded next-turn notice for an eligible
-uncollected current task. A running poll preserves that notice; a successful terminal return counts as
+Claude Code 2.1.198), with the partial `TaskOutput`/`TaskStop` tools and one bounded next-turn notice
+for an eligible uncollected current task. A running poll preserves that notice; a successful terminal return counts as
 delivery and suppresses the redundant notice. `run_in_background: false` opts into a synchronous
 inline result and `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces foreground. It remains partial for
 settlement *timing*: PiCC is next-turn, while reporter observations such as anthropics/claude-code#21343 (Claude Code

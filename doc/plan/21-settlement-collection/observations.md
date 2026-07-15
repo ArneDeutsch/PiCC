@@ -11,3 +11,7 @@
 - 2026-07-15 — Settlement promises existed in always-injected model guidance and contributor comments beyond the obvious user docs/registry rows; contract audits need source-wide wording searches.
 - 2026-07-15 — Bare `#N` references to external-repository evidence are ambiguous in repository Markdown; use `owner/repo#N` for cross-repo provenance.
 - 2026-07-15 — Older entries under a still-Unreleased CHANGELOG can contradict current behavior even when the newest entry is correct; historical states need explicit supersession wording.
+- 2026-07-15 — A cut-off task and a bounded notice excerpt are independent truncation events; model guidance must distinguish retained output from a continuation the subagent never produced.
+- 2026-07-15 — User-guide tier summaries built from broad families such as `Task*` can silently contradict the generated per-tool capability matrix.
+- 2026-07-15 — Pre-existing follow-up: settlement frame-marker defanging runs its regex before the 1,200-character cap and may show superlinear behavior on adversarial long lines.
+- 2026-07-15 — Pre-existing follow-up: project compatibility findings ignore `partial` capabilities, so the newly documented TaskOutput `block`/`timeout` schema gap is not surfaced by startup or `/doctor`.

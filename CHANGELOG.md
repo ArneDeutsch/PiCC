@@ -175,8 +175,9 @@ All notable changes to PiCC are documented here. The format is based on
   2.1.198+.** A dispatch that omits `run_in_background` returns a task id immediately and runs
   concurrently with any other dispatch issued in the same turn, so a Claude-authored implicit-concurrency
   fan-out (dispatch N reviewers in one turn, collect the results) **parallelizes** instead of silently
-  serializing; results are collected via `TaskOutput`/`TaskStop`, while an eligible current task that
-  remains uncollected and unnotified receives one bounded settlement notice on the next turn. Pass **`run_in_background: false`** to run a dispatch synchronously
+  serializing; terminal results are collected via `TaskOutput`, while `TaskStop` stops a run. An eligible
+  current task that remains uncollected and unnotified receives one bounded settlement notice on the
+  next turn. Pass **`run_in_background: false`** to run a dispatch synchronously
   and return its result inline in the same turn. An agent's `background: true` frontmatter still forces
   background (even against an explicit `run_in_background: false`), and
   `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` still forces **every** `Agent`/`Task` dispatch to the

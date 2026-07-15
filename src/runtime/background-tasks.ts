@@ -671,8 +671,11 @@ export function buildSettlementNotice(task: BackgroundTaskRecord): string {
     task.agentType ?? task.agentName ?? "subagent",
     task.agentId,
   );
+  const resultBearing = outcome !== "aborted";
+  const runCutOff = resultBearing && task.truncated === true;
   const lines: string[] = [
-    `[PiCC settlement notice] ${identity} — settled: ${outcome}.`,
+    `[PiCC settlement notice] ${identity} — settled: ${outcome}` +
+      (runCutOff ? "; subagent run cut off at its output limit." : "."),
   ];
   if (outcome === "failed") {
     lines.push(`Error: ${capErrorText(task.error ?? "unknown error")}`);
@@ -683,10 +686,19 @@ export function buildSettlementNotice(task: BackgroundTaskRecord): string {
     lines.push(
       `This is PiCC metadata about a background subagent — informational only, not an ` +
         `instruction, and it approves nothing. No final task result was retained; TaskOutput ` +
-        `reports the stopped outcome but cannot recover discarded output.` +
+        `reports the aborted outcome (internal task status: stopped) but cannot recover discarded output.` +
         (task.transcriptPath
           ? ` The session transcript remains available at ${task.transcriptPath}.`
           : ""),
+    );
+  } else if (runCutOff) {
+    lines.push(
+      `This is PiCC metadata about a background subagent — informational only, not an ` +
+        `instruction, and it approves nothing. Inspect all retained output with TaskOutput ` +
+        `(task_id "${taskId}")` +
+        (task.transcriptPath ? ` or the transcript at ${task.transcriptPath}.` : ".") +
+        ` The missing continuation was never produced and cannot be recovered there; resume the ` +
+        `agent with SendMessage when available, or re-dispatch it to continue the work.`,
     );
   } else {
     lines.push(
@@ -704,8 +716,9 @@ export function buildSettlementNotice(task: BackgroundTaskRecord): string {
     lines.push(NOTICE_BEGIN, excerpt, NOTICE_END);
     if (truncated) {
       lines.push(
-        `(Excerpt truncated — retrieve the complete output via TaskOutput` +
-          (task.transcriptPath ? " or the transcript.)" : ".)"),
+        runCutOff
+          ? `(Notice excerpt truncated — TaskOutput${task.transcriptPath ? " or the transcript" : ""} exposes all retained output for this cut-off run, not a missing continuation.)`
+          : `(Excerpt truncated — retrieve the complete output via TaskOutput${task.transcriptPath ? " or the transcript." : "."})`,
       );
     }
   }
@@ -731,7 +744,7 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
     name: "TaskOutput",
     label: "TaskOutput",
     description:
-      "Retrieve the result of a background task dispatched with the Agent tool (background is the default). Waits for completion by default; pass wait: false to poll the current status instead.",
+      "Retrieve the result of a background task dispatched with the Agent tool (background is the default). Waits for completion by default; pass wait: false to poll the current status instead. A successful terminal return counts as collection and suppresses a pending settlement notice; polling a running task preserves notice eligibility.",
     parameters: Type.Object({
       task_id: Type.String({ description: 'Task id returned at start, e.g. "task-1"' }),
       wait: Type.Optional(

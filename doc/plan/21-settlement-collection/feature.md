@@ -29,3 +29,4 @@ Coordinators need a trustworthy delivery sequence for background results. Re-ann
 1. t01 Generation-safe settlement delivery state (depends on: –)
 2. t02 Collection-aware TaskOutput lifecycle (depends on: t01)
 3. t03 Truthful settlement-delivery contract (depends on: t02)
+4. t04 Close-review settlement clarity (depends on: t03)

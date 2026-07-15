@@ -1450,8 +1450,10 @@ export class SubagentRuntime {
       // (running) or resume it (once settled). Registered with everything a resume
       // needs — agent name (re-resolved for construction), depth, cwd/worktree,
       // transcript path — and the live session handle for steering. A resume
-      // re-registers under the same ID: state flips back to running and the t05
-      // settled-notice is re-armed. The finally drops the handle on settlement.
+      // re-registers under the same ID: state flips back to running and re-arms
+      // the agent-level settlement-readiness gate. Task-local delivery state and
+      // newest-generation checks still decide notice eligibility after settlement.
+      // The finally drops the handle on settlement.
       this.deps.subagentRegistry?.register({
         agentId,
         agentName: agent.name,
