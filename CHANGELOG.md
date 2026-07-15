@@ -6,6 +6,25 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — real MultiEdit tool (2026-07-15)
+
+- **`MultiEdit` is now a real tool instead of a degraded no-op.** It takes a `file_path` and an array
+  of `{ old_string, new_string, replace_all? }` edits and applies them **sequentially and atomically**
+  to one file: each edit operates on the result of the previous one, matching is exact-string (an
+  `old_string` that is absent — or ambiguous without `replace_all` — is an error), an empty `old_string`
+  on the first edit of a new file creates it, and if **any** edit fails the whole batch is rejected and
+  the file is left untouched. Previously every `MultiEdit` call returned a notice telling the model to
+  fall back to a sequence of `Edit` calls, losing the all-or-nothing guarantee. It routes through the
+  same permission, hook, and path-scoped-injection machinery as `Edit`, and is grantable to subagents.
+- **Note — posture change:** because `MultiEdit` graduated from a no-op to a *real writer*, a project
+  can no longer treat MultiEdit-degradation as an implicit safety net. Its `Edit`/`MultiEdit` deny rules
+  are what hold — and an `Edit(…)` deny rule already covers `MultiEdit` (the file-edit family), so no
+  settings change is needed to keep an existing `Edit(…)` restriction effective.
+- **Registry + docs re-tiered.** `tool.MultiEdit` moves from `degraded-noop` to **full**, with an honest
+  note that the pinned Claude Code 2.1.x baseline itself no longer ships MultiEdit (removed in the 2.0
+  line) — so `full` means faithful to the pre-removal contract, kept as an older-project compatibility
+  courtesy. `doc/supported-features.md` was regenerated from the registry.
+
 ### Changed — background-by-default subagent dispatch (2026-07-14)
 
 - **Subagent dispatch (`Agent`/`Task`) now runs in the background by default, matching Claude Code
