@@ -30,7 +30,17 @@ eventual "go" is never read as "yes, file the issue". Present:
   ASCII `F<NN>: <short description>` with **no shell metacharacters** (Rule 4); `<NN>` is only assigned
   at Phase 2, so at Phase 1 show a placeholder (e.g. `F<NN>:`) and note the real number lands at setup.
   The body is the converged WHAT/WHY from the scope mirror, authored under Rule 6 (no leakage), ending
-  with the `<attribution trailer>` (Rule 8).
+  with the `<attribution trailer>` (Rule 8) — and **the filed body is WHAT/WHY only**. Before showing
+  this preview, run evaluate's proposal-gate over the converged scope
+  ([../../evaluate/references/proposal-gate.md](../../evaluate/references/proposal-gate.md) — the
+  read-only sandbox scorer, structurally no GitHub writes): it rates whether the scope looks valuable
+  and you present that assessment **in-session, as part of this offer exchange** ("before I file, my
+  read on the value is: <the rating block>; still want it filed as written?"). Here proposal-gate
+  **only annotates — it never suppresses this offer**, and its assessment is **never baked into the
+  filed public issue body** (that stays WHAT/WHY only, so the Phase 3 resume re-read of the synthesized
+  cached `body` — the FILE step below — ingests only feature scope, never a self-grade): the human
+  already converged on this scope, so even a **low score is surfaced in-session** (they may still file,
+  edit, or decline in this preview), never a silently-vanished offer.
 - **Where it writes, plainly**, and that a public artifact appears once filed. On a **fork** name the
   **upstream `target`** explicitly and that it is a repo **the user does not own** — filing puts a
   public issue on someone else's project.

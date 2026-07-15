@@ -212,6 +212,56 @@ describe("pr-eval mode floor markers (evaluate-skill t03)", () => {
   });
 });
 
+describe("proposal-gate mode floor markers (evaluate-skill t04)", () => {
+  // Loose, case-insensitive, whitespace-collapsed structural checks: assert the
+  // load-bearing structural-zero-writes + gate/annotate language survives, NOT exact
+  // prose. We do NOT test LLM judgment or any gh write (there is none in this mode).
+  const collapse = (p: string): string =>
+    fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
+
+  const PROPOSAL_GATE_PATH = path.join(REFERENCES_DIR, "proposal-gate.md");
+
+  it("proposal-gate.md exists (linked from the router — bidirectional integrity above)", () => {
+    expect(fs.existsSync(PROPOSAL_GATE_PATH)).toBe(true);
+  });
+
+  it("proposal-gate.md carries the structural zero-writes / read-only-sandbox floor", () => {
+    const body = collapse(PROPOSAL_GATE_PATH);
+    // Structurally no GitHub writes.
+    expect(body).toContain("zero github writes");
+    // Enforced by running as the shell-free evaluator sandbox agent, not by prose alone.
+    expect(body).toContain("shell-free");
+    expect(body).toContain("sandbox agent");
+    // gh issue close is never part of this mode.
+    expect(body).toContain("gh issue close` is **never**");
+    // A borderline candidate gets a SECOND evaluator pass — never a Bash-capable generalist.
+    expect(body).toContain("second `evaluator` pass");
+    expect(body).toContain("generalist");
+  });
+
+  it("proposal-gate.md pins the bounded-structured-return + gate/annotate dispositions", () => {
+    const body = collapse(PROPOSAL_GATE_PATH);
+    // Bounded structured fields, coordinator composes (not verbatim prose).
+    expect(body).toContain("bounded structured");
+    // Gate use: drops clear slop but the tally says they remain in review.md; per-item choice preserved.
+    expect(body).toContain("remain in `review.md`");
+    expect(body).toContain("per-item user choice preserved");
+    expect(body).toContain("subtracts clear slop, never");
+    // Phase 1 use: only annotates, never suppresses the offer; delimited heading.
+    expect(body).toContain("only annotates");
+    expect(body).toContain("never suppresses");
+    expect(body).toContain("## evaluation");
+  });
+
+  it("router carries the resident proposal-gate zero-writes marker", () => {
+    const { skills } = loadSkills([{ dir: SKILLS_DIR, scope: "project" }], []);
+    const skill = skills.find((s) => s.name === "evaluate");
+    const routerBody = loadSkillBody(skill!).toLowerCase().replace(/\s+/g, " ");
+    expect(routerBody).toContain("no github writes");
+    expect(routerBody).toContain("read-only `evaluator` sandbox agent");
+  });
+});
+
 describe("evaluator sandbox agent (evaluate-skill t01)", () => {
   const { agents, diagnostics } = loadAgents([{ dir: AGENTS_DIR, scope: "project" }]);
 

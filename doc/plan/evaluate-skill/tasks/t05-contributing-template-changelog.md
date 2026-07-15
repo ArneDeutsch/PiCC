@@ -96,4 +96,4 @@ Read-only elsewhere.
 - [ ] typecheck and full test suite green.
 
 ## Depends on
-t01, t03
+t01, t03, t04

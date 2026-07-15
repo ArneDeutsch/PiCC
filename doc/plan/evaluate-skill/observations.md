@@ -63,3 +63,25 @@ Running record of friction, bugs, and opportunities. Dated bullets, one line eac
   low-severity provenance coupling; would rot silently if handoff.md moves.
 - **t05 coordination:** the verification contract is canonical in pr-eval.md; t05 must reuse its exact
   `node bin/picc.mjs` + `examples/` launch command rather than paraphrasing, to avoid drift.
+
+## t04 — proposal-gate + implement-feature wiring (2026-07-15)
+
+- **Don't publicly self-grade the human's own work.** Baking a "value: low/medium" assessment into the
+  maintainer's OWN just-converged feature's public issue body (and on a fork, onto someone else's repo)
+  is odd-to-embarrassing. Moved Phase 1 to an **in-session advisory**; this one change resolved five
+  findings across three reviewers at once (public self-grading + passive `## Evaluation` delimiter +
+  stale FILE-step cache + re-read-scope risk). Lesson: assessments on the human's own converged work
+  belong in-session; the embed-in-body pattern is for **agent-surfaced findings** (separate issues,
+  never re-read as current-feature scope), which is where the user's "assessment in the description"
+  ask genuinely fits.
+- **Editing a shipped, heavily-tuned skill needs invariant reconciliation, not just insertion.** The
+  Phase 8 gate had to be framed as **subtractive-only** ("drops clear slop, never adds") to keep
+  implement-feature's existing "never file anything not surfaced by this build" invariant true, and the
+  word "surfaced" was overloaded (origin-invariant vs post-gate pick) — split to "surfaced" vs
+  "presented".
+- **A gate must leave an in-flow recovery lever.** "Dropped findings remain in review.md" is a durable
+  record but not agency; added an explicit "ask to see the dropped findings and I'll surface them into
+  the pick-list" affordance.
+- **Deviation from decision C (flagged to user):** the user asked to "add an assessment about the
+  feature proposal" at Phase 1; delivered as an in-session advisory rather than a public body embed.
+  One line reverts it if the maintainer prefers the embed.

@@ -21,9 +21,10 @@ six write mechanics, the `#N`/`<target>` sanitization gate). Per-mode references
 the router has routed: [references/issue-eval.md](references/issue-eval.md) (the issue mode — screen,
 rate, and drive a confidence-gated close-or-keep-open) and
 [references/pr-eval.md](references/pr-eval.md) (the PR mode — assess the diff, fulfilment, and
-verification evidence, then post an **advisory** assessment comment; **never merges**). The remaining
-per-mode reference (proposal-gate) is added by a later task; when a mode is not yet documented, say so
-plainly rather than inventing behaviour.
+verification evidence, then post an **advisory** assessment comment; **never merges**) and
+[references/proposal-gate.md](references/proposal-gate.md) (the proposal-gate mode — score a would-be,
+not-yet-filed issue against the rubric with **structurally zero GitHub writes**; agent-invoked by
+`implement-feature` to gate Phase 8 findings and annotate the Phase 1 converged feature).
 
 ## The three modes
 
@@ -33,11 +34,14 @@ plainly rather than inventing behaviour.
   text); everything else ⇒ **keep-open** with a model-authored rating/importance comment. **A close
   always carries the canned category comment; a keep-open always carries the authored rating and never
   closes.** **Biased to keep-open when uncertain** — a borderline case is never closed.
-- **proposal-gate** — given a would-be issue (agent-invoked). Structurally **no GitHub writes**: score
-  it against the rubric and return the score. Used by `implement-feature` in two ways — it **gates**
-  Phase 8 machine-surfaced findings (clear slop dropped with a one-line tally, the rest surfaced with
-  the assessment embedded) but only **annotates** the Phase 1 human-converged feature (it never
-  suppresses the user's own offer).
+- **proposal-gate** — given a would-be issue (agent-invoked; full mode:
+  [references/proposal-gate.md](references/proposal-gate.md)). Structurally **no GitHub writes** — it
+  **runs as the read-only `evaluator` sandbox agent**, which physically cannot write, so there is no
+  close, no comment, and no `<N>`/target to write to: it just scores against the rubric and returns a
+  bounded assessment. Used by `implement-feature` in two ways — it **gates** Phase 8 machine-surfaced
+  findings (clear slop dropped with a one-line tally that says the dropped findings remain in
+  `review.md`, the rest surfaced with the assessment embedded and per-item choice preserved) but only
+  **annotates** the Phase 1 human-converged feature (it never suppresses the user's own offer).
 - **pr-eval** — given a pull request: assess the diff, whether it fulfils its ticket *and* whether the
   ticket was worth doing, and the verification evidence; post an **advisory** assessment comment (full
   mode: [references/pr-eval.md](references/pr-eval.md)). **It never merges, never takes any merge

@@ -19,9 +19,9 @@ disposition. One shared evaluation engine, three modes:
   score it against the rubric. Used in two places with different force: on `implement-feature`'s
   Phase 8 agent-surfaced findings it **gates** — clear slop is dropped (with a one-line tally so
   nothing vanishes invisibly), the rest surfaced with the assessment embedded and per-item choice
-  preserved; on the Phase 1 human-converged feature it **only annotates** — it rates whether the
-  requested scope looks valuable and embeds that assessment, but never suppresses the user's own
-  offer.
+  preserved; on the Phase 1 human-converged feature it **only annotates in-session** — it rates whether
+  the requested scope looks valuable and shows that as an advisory before filing, but never bakes a
+  self-grade into the public issue body and never suppresses the user's own offer.
 - **pr-eval** — given a pull request, assess the diff and its consequences, whether it fulfils its
   ticket *and* whether the ticket was worth doing, and the verification evidence; then post an
   assessment comment. **Never merges.** It first judges whether the change even *warrants* manual
@@ -40,8 +40,9 @@ fulfilment, code consequences, and verification evidence.
 **Behaviour changes to `implement-feature`:** its Phase 8 issue-filing offer runs proposal-gate on
 each machine-surfaced finding — clear slop is dropped (with a one-line tally), the rest surfaced with
 the assessment embedded and per-item choice preserved. Its Phase 1 ticket-creation offer, which files
-the human's own just-converged feature, is **not** gated — proposal-gate only annotates it with a
-value assessment; the human's offer is never suppressed. And its PR hand-off produces **concrete,
+the human's own just-converged feature, is **not** gated — proposal-gate gives an in-session value
+assessment (an advisory before filing, not baked into the public body); the human's offer is never
+suppressed. And its PR hand-off produces **concrete,
 applicability-aware verification guidance** (see below) rather than a generic "verify in the running
 app" prompt.
 
@@ -157,4 +158,4 @@ raises PR-merge decisions to an evidence-backed assessment — so the maintainer
 - t02 issue-eval mode (depends on: t01)
 - t03 pr-eval mode + canonical verification contract (depends on: t01)
 - t04 proposal-gate mode + implement-feature wiring (depends on: t01)
-- t05 CONTRIBUTING + PR template + implement-feature creation-side guidance + CHANGELOG (depends on: t01, t03)
+- t05 CONTRIBUTING + PR template + implement-feature creation-side guidance + CHANGELOG (depends on: t01, t03, t04)
