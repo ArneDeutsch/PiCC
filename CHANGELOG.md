@@ -6,6 +6,14 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed — description-based feature naming (2026-07-15)
+
+- **Future `implement-feature` runs use one concise descriptive slug instead of allocating a global
+  feature number.** The slug consistently names the worktree, `feature/<feature-slug>` branch, plan
+  folder, headings, and commit prefix, with portable validation and collision checks. A linked GitHub
+  issue number remains the canonical numeric reference; task ordering remains local (`t01`, `t02`, …).
+  Existing numbered feature runs and historical artifacts keep their established identities unchanged.
+
 ### Added — evaluate skill (2026-07-15)
 
 - **A new `evaluate` skill rates a GitHub issue, a proposed (not-yet-filed) issue, or a pull request

@@ -1,0 +1,5 @@
+- 2026-07-15 — Planning error: the first collision contract overclaimed what prose can guarantee; `EnterWorktree` can delete a raced unregistered directory, adopt a harness branch, and run hooks before reuse is detectable.
+- 2026-07-15 — Review caught that an unconditional pre-push remote-ref collision stop would break resumed handoffs and CI-fix repushes; established branches need explicit ownership, upstream, case-fold, and ancestry checks.
+- 2026-07-15 — Security finding: internally consistent resume artifacts prove identity consistency, not prior human consent; disk-reconstructed resumes need a fresh target match and explicit public-write confirmation.
+- 2026-07-15 — Test-design friction: broad prose-marker checks passed while lifecycle tuples were incomplete; localized assertions and a delimited legacy-resume exception made failures diagnostic without rewriting history.
+- 2026-07-15 — Existing test-suite timing is sensitive to concurrent full-suite/typecheck load; one hook-runner threshold failed under contention but targeted and serial full-suite reruns passed.
