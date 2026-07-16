@@ -351,6 +351,46 @@ describe("context assembly", () => {
     expect(withoutNote).not.toMatch(WIN_NOTE_MARK);
   });
 
+  it("assembles sections with clean boundaries — no triple-newline gap, stable override ordering (#69)", () => {
+    // Guards the two seams #69's rewrite exposed in buildSystemPromptSuffix:
+    // (1) a section string ending in a stray newline joins to `\n\n\n` under
+    //     sections.join("\n\n") — the trailing-`\n` trap from deleting the old
+    //     `${COLLABORATIVE_PLANNING_GUIDANCE}` interpolation; and
+    // (2) override precedence — a soft-default section (the posture) must stay AHEAD
+    //     of the sections meant to override it (CLAUDE.md, steering).
+    // Controlled inputs only (no arbitrary skill/CLAUDE.md content with internal blank
+    // lines), so the invariant is about the ASSEMBLY, not user content.
+    const state = newSessionContextState(claudeMd);
+    state.activeSkills.set("act", "ACTIVE-SKILL-BODY");
+    const suffix = buildSystemPromptSuffix({
+      claudeMd,
+      rules: [
+        { id: "a.md", body: "UNCOND-RULE", source: { path: "x", scope: "project" }, unknownKeys: [], diagnostics: [] },
+      ],
+      skills: [],
+      agents: [makeAgent()],
+      settings: baseSettings(),
+      state,
+      steeringText: "STEER-TEXT",
+      scratchDir: SCRATCH,
+      includeInteractionPosture: true,
+    });
+    // (1) No triple-newline gap anywhere in the assembled suffix.
+    expect(suffix).not.toContain("\n\n\n");
+    // (2) Section order is stable and keeps every soft default ahead of what overrides it.
+    const order = [
+      "Claude Code compatibility conventions", // mechanical conventions
+      "## Working with the user", // interaction posture (soft default)
+      "ROOT-INSTRUCTIONS", // CLAUDE.md — gets the last word over the posture
+      "UNCOND-RULE", // project rules
+      "ACTIVE-SKILL-BODY", // active skills
+      "STEER-TEXT", // steering — also overrides the posture
+      "## Scratchpad directory", // scratchpad (last)
+    ].map((marker) => suffix.indexOf(marker));
+    for (const idx of order) expect(idx).toBeGreaterThan(-1); // no vacuous pass
+    expect(order).toEqual([...order].sort((a, b) => a - b)); // monotonic == in-order
+  });
+
   it("emits no scratchpad section (and no Windows note) when scratchDir is undefined", () => {
     const inputs = {
       claudeMd,
