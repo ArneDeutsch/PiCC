@@ -261,7 +261,7 @@ describe("stacked skill invocations + re-invocation dedup (extension)", () => {
     );
   }
 
-  beforeAll(() => {
+  beforeAll(async () => {
     projDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-stacked-"));
     execFileSync("git", ["init", "-b", "main"], { cwd: projDir, stdio: "ignore" });
     writeProjectSkill("stack-a", "STACK-A-BODY args=[$ARGUMENTS]");
@@ -276,7 +276,9 @@ describe("stacked skill invocations + re-invocation dedup (extension)", () => {
     process.env.PICC_CLAUDE_USER_DIR = userDir;
     process.chdir(projDir);
     pi = fakePi();
-    picc(pi.api as never);
+    picc(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+    await pi.waitForInitialization();
+    await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
   });
 
   afterAll(() => {

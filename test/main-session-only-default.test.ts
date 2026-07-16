@@ -85,8 +85,9 @@ describe("F22: default settings keep the main session but stop depth-1 subagents
 
     h = fakeSdk({ replies: ["subagent-done"] });
     pi = fakePi();
-    picc(pi.api as never, { sdk: h.sdk });
-    await new Promise((r) => setTimeout(r, 200));
+    picc(pi.api as never, { sdk: h.sdk, onInitializationSettled: pi.captureInitialization });
+    await pi.waitForInitialization();
+    await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
   });
 
   afterAll(() => {
@@ -208,11 +209,13 @@ describe("F22: a subagent-invoked context:fork (depth 2) is refused under the de
     pi = fakePi();
     picc(pi.api as never, {
       sdk: h.sdk,
+      onInitializationSettled: pi.captureInitialization,
       onWired: ({ subagentRegistry }) => {
         registry = subagentRegistry;
       },
     });
-    await new Promise((r) => setTimeout(r, 300));
+    await pi.waitForInitialization();
+    await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
   });
 
   afterAll(() => {

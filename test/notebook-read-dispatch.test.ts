@@ -37,8 +37,9 @@ beforeAll(async () => {
   });
 
   pi = fakePi();
-  picc(pi.api as never, { sdk: h.sdk });
-  await new Promise((r) => setTimeout(r, 500));
+  picc(pi.api as never, { sdk: h.sdk, onInitializationSettled: pi.captureInitialization });
+  await pi.waitForInitialization();
+  await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
 });
 
 afterAll(() => {

@@ -55,11 +55,13 @@ beforeAll(async () => {
   pi = fakePi();
   picc(pi.api as never, {
     sdk: h.sdk,
+    onInitializationSettled: pi.captureInitialization,
     onWired: ({ subagentRegistry }) => {
       registry = subagentRegistry;
     },
   });
-  await new Promise((r) => setTimeout(r, 500));
+  await pi.waitForInitialization();
+  await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
 });
 
 afterAll(() => {

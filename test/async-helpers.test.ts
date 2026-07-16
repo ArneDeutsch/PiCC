@@ -197,6 +197,51 @@ describe("async test readiness helpers", () => {
     await pi.waitForTools([]);
   });
 
+  it("FakePi waits for captured initialization completion rather than capture alone", async () => {
+    const pi = fakePi();
+    const completion = deferred<void>();
+    pi.captureInitialization(completion.promise);
+
+    const waiting = pi.waitForInitialization();
+    let settled = false;
+    void waiting.then(() => (settled = true));
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    completion.resolve();
+    await waiting;
+    expect(settled).toBe(true);
+  });
+
+  it("FakePi supports waiting before initialization completion is captured", async () => {
+    const pi = fakePi();
+    const completion = deferred<void>();
+    const waiting = pi.waitForInitialization();
+    let settled = false;
+    void waiting.then(() => (settled = true));
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    pi.captureInitialization(completion.promise);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(settled).toBe(false);
+
+    completion.resolve();
+    await waiting;
+    expect(settled).toBe(true);
+  });
+
+  it("FakePi reports when initialization completion was never captured", async () => {
+    const pi = fakePi();
+    const waiting = pi.waitForInitialization();
+    const rejection = expect(waiting).rejects.toThrow(
+      /extension detached initialization to be captured and settled; observed: completion callback not captured/,
+    );
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    await rejection;
+  });
+
   it("FakePi timeout reports final missing and registered tool names", async () => {
     const pi = fakePi();
     const waiting = pi.waitForTools(["Read", "Write"]);

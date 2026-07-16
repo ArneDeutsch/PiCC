@@ -1949,9 +1949,9 @@ describe("SendMessage parent-only guard through the real harness (tester NIT-2)"
     process.chdir(dir);
     try {
       const pi = fakePi();
-      piccExtension(pi.api as never);
-      // Boot is async (project/agents load); give it a beat to register tools.
-      await new Promise((r) => setTimeout(r, 200));
+      piccExtension(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+      await pi.waitForInitialization();
+      await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
       const agentTool = pi.tools.get("Agent") as {
         execute: (
           id: string,
@@ -2015,9 +2015,9 @@ describe("scratchpad injection wiring through the real harness (t05)", () => {
     process.chdir(dir);
     try {
       const pi = fakePi();
-      piccExtension(pi.api as never);
-      // Boot is async (project/agents load + eager scratch-dir creation); give it a beat.
-      await new Promise((r) => setTimeout(r, 200));
+      piccExtension(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+      await pi.waitForInitialization();
+      await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
 
       // Main-session suffix via before_agent_start. RED if the main call-site arg (~:1042)
       // is dropped.

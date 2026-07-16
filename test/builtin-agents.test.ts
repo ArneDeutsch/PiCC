@@ -102,8 +102,9 @@ beforeAll(async () => {
   process.env.PICC_CLAUDE_USER_DIR = userDir;
   process.chdir(dir);
   pi = fakePi();
-  picc(pi.api as never);
-  await new Promise((r) => setTimeout(r, 200));
+  picc(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+  await pi.waitForInitialization();
+  await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
 });
 
 afterAll(() => {
@@ -127,7 +128,9 @@ describe("built-in agents through the extension (E1/E2/E6)", () => {
       fs.writeFileSync(path.join(bare, "CLAUDE.md"), "bare\n");
       process.chdir(bare);
       const pi2 = fakePi();
-      picc(pi2.api as never);
+      picc(pi2.api as never, { onInitializationSettled: pi2.captureInitialization });
+      await pi2.waitForInitialization();
+      await pi2.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
       for (const name of ["Agent", "Task", "TaskOutput", "TaskStop"]) {
         expect(pi2.tools.has(name), `missing tool ${name}`).toBe(true);
       }

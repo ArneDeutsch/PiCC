@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import picc from "../src/index.js";
+import { WorktreeManager } from "../src/runtime/worktrees.js";
 import { fakePi } from "./helpers/fake-pi.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 
@@ -53,15 +54,31 @@ afterAll(() => {
 
 describe("F14 t02 — sdk seam invariant", () => {
   it("single-arg picc(pi) (no testSeam) uses the real-sdk path (loadRealSdk), never a smuggled fake", async () => {
-    const p = fakePi();
-    picc(p.api as never); // NO second argument — no seam sdk
-    const skillTool = p.tools.get("Skill");
-    const err = await skillTool
-      .execute("seam", { name: "fork-research", arguments: "x" })
-      .catch((e: Error) => e);
-    expect(err).toBeInstanceOf(Error);
-    // dispatch's catch-all wraps the createAgentSession throw; the sentinel proves
-    // the fork went through loadRealSdk → the (mocked) real module.
-    expect((err as Error).message).toContain(SENTINEL);
+    const originalReapOrphans = WorktreeManager.prototype.reapOrphans;
+    let genuineReaping: ReturnType<WorktreeManager["reapOrphans"]> | undefined;
+
+    WorktreeManager.prototype.reapOrphans = function (...args) {
+      genuineReaping = originalReapOrphans.apply(this, args);
+      return genuineReaping;
+    };
+
+    try {
+      const p = fakePi();
+      picc(p.api as never); // NO second argument — no seam sdk
+      expect(genuineReaping).toBeDefined();
+      await genuineReaping;
+      await p.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
+      const skillTool = p.tools.get("Skill");
+      const err = await skillTool
+        .execute("seam", { name: "fork-research", arguments: "x" })
+        .catch((e: Error) => e);
+      expect(err).toBeInstanceOf(Error);
+      // dispatch's catch-all wraps the createAgentSession throw; the sentinel proves
+      // the fork went through loadRealSdk → the (mocked) real module.
+      expect((err as Error).message).toContain(SENTINEL);
+    } finally {
+      WorktreeManager.prototype.reapOrphans = originalReapOrphans;
+      await genuineReaping;
+    }
   });
 });

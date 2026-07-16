@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import picc from "../src/index.js";
+import { WorktreeManager } from "../src/runtime/worktrees.js";
+import { deferred } from "./helpers/async.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 
 /**
@@ -70,8 +72,9 @@ beforeAll(async () => {
   process.env.PICC_CLAUDE_USER_DIR = userDir;
   process.chdir(dir);
   pi = fakePi();
-  picc(pi.api as never);
-  await new Promise((r) => setTimeout(r, 300));
+  picc(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+  await pi.waitForInitialization();
+  await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
 });
 
 afterAll(() => {
@@ -82,6 +85,44 @@ afterAll(() => {
 });
 
 describe("lifecycle wiring", () => {
+  it("captures real extension initialization synchronously and waits for gated orphan reaping", async () => {
+    const originalReapOrphans = WorktreeManager.prototype.reapOrphans;
+    const reapGate = deferred<void>();
+    let initialization: Promise<void> | undefined;
+
+    WorktreeManager.prototype.reapOrphans = function (...args) {
+      const genuineReaping = originalReapOrphans.apply(this, args);
+      return reapGate.promise.then(() => genuineReaping);
+    };
+
+    try {
+      const gatedPi = fakePi();
+      picc(gatedPi.api as never, {
+        onInitializationSettled: (completion) => {
+          initialization = completion;
+        },
+      });
+
+      // The callback is part of synchronous activation, not a later microtask.
+      expect(initialization).toBeDefined();
+      let settled = false;
+      void initialization!.then(() => (settled = true));
+
+      // Built-ins can finish registering while the independently gated reaper
+      // keeps the combined observational completion pending.
+      await gatedPi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
+      expect(settled).toBe(false);
+
+      reapGate.resolve();
+      await initialization;
+      expect(settled).toBe(true);
+    } finally {
+      reapGate.resolve();
+      WorktreeManager.prototype.reapOrphans = originalReapOrphans;
+      await initialization;
+    }
+  });
+
   it("captures quota headers from after_provider_response and reports them in /quota", async () => {
     await pi.fire("after_provider_response", {
       headers: { "x-ratelimit-remaining-tokens": "1234", "content-type": "application/json" },

@@ -45,9 +45,11 @@ afterAll(() => {
  * `beforeAll` pi (whose runtime lazy-loads the real SDK). The seam sdk reaches
  * every dispatch, including forks that close over the one runtime instance.
  */
-function wire(sdk: PiSdk): FakePi {
+async function wire(sdk: PiSdk): Promise<FakePi> {
   const p = fakePi();
-  picc(p.api as never, { sdk });
+  picc(p.api as never, { sdk, onInitializationSettled: p.captureInitialization });
+  await p.waitForInitialization();
+  await p.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
   return p;
 }
 
@@ -68,7 +70,7 @@ const API_DEATH = /Agent terminated early due to an API error/;
 describe("F14 t02 — Skill-tool fork consumer", () => {
   it("(1) failed WITH partial output → success-shaped content: partial preserved + cut-off note names the cause", async () => {
     const h = fakeSdk({ onPrompt: partialThenApiDeath("503 upstream unavailable") });
-    const skillTool = wire(h.sdk).tools.get("Skill");
+    const skillTool = (await wire(h.sdk)).tools.get("Skill");
     const res = await skillTool.execute("s1", { name: "fork-research", arguments: "wasm abi" });
     const text = res.content[0].text as string;
     expect(text.startsWith("partial research findings")).toBe(true);
@@ -84,7 +86,7 @@ describe("F14 t02 — Skill-tool fork consumer", () => {
     const h = fakeSdk({
       replies: [{ stopReason: "error", errorMessage: "insufficient_quota: usage drained" }],
     });
-    const skillTool = wire(h.sdk).tools.get("Skill");
+    const skillTool = (await wire(h.sdk)).tools.get("Skill");
     const err = await skillTool
       .execute("s2", { name: "fork-research", arguments: "x" })
       .catch((e: Error) => e);
@@ -98,7 +100,7 @@ describe("F14 t02 — Skill-tool fork consumer", () => {
   it("(3) Esc aborts the fork → abort wording (proves the signal threads execute→forkDispatch→dispatch)", async () => {
     const gate = new Promise<void>(() => {}); // never resolves — only abort ends it
     const h = fakeSdk({ replies: [{ text: "never delivered", gate }] });
-    const skillTool = wire(h.sdk).tools.get("Skill");
+    const skillTool = (await wire(h.sdk)).tools.get("Skill");
     const controller = new AbortController();
     // Pi passes the Esc signal positionally as the 3rd execute arg.
     const pending = skillTool.execute(
@@ -119,7 +121,7 @@ describe("F14 t02 — Skill-tool fork consumer", () => {
 
   it("(4) successful fork → verbatim final message (unchanged), not cut off", async () => {
     const h = fakeSdk({ replies: ["- bullet one\n- bullet two\n- bullet three"] });
-    const skillTool = wire(h.sdk).tools.get("Skill");
+    const skillTool = (await wire(h.sdk)).tools.get("Skill");
     const res = await skillTool.execute("s4", { name: "fork-research", arguments: "x" });
     expect(res.content[0].text).toBe("- bullet one\n- bullet two\n- bullet three");
     expect(res.details.forked).toBe(true);
@@ -133,7 +135,7 @@ describe("F14 t02 — Skill-tool fork consumer", () => {
 describe("F14 — SlashCommand-tool fork consumer (shares runSkillActivation with the Skill tool)", () => {
   it("(8) failed WITH partial output → partial preserved + cause named", async () => {
     const h = fakeSdk({ onPrompt: partialThenApiDeath("503 upstream unavailable") });
-    const slashTool = wire(h.sdk).tools.get("SlashCommand");
+    const slashTool = (await wire(h.sdk)).tools.get("SlashCommand");
     const res = await slashTool.execute("c1", { command: "/fork-research wasm abi" });
     const text = res.content[0].text as string;
     expect(text.startsWith("partial research findings")).toBe(true);
@@ -146,7 +148,7 @@ describe("F14 — SlashCommand-tool fork consumer (shares runSkillActivation wit
   it("(9) Esc aborts the fork → abort wording (signal threads SlashCommand→runSkillActivation→dispatch)", async () => {
     const gate = new Promise<void>(() => {}); // never resolves — only abort ends it
     const h = fakeSdk({ replies: [{ text: "never delivered", gate }] });
-    const slashTool = wire(h.sdk).tools.get("SlashCommand");
+    const slashTool = (await wire(h.sdk)).tools.get("SlashCommand");
     const controller = new AbortController();
     const guarded = slashTool
       .execute("c2", { command: "/fork-research x" }, controller.signal)
@@ -164,7 +166,7 @@ describe("F14 — SlashCommand-tool fork consumer (shares runSkillActivation wit
 describe("F14 t02 — input-hook fork consumer (/fork-research …)", () => {
   it("(5) failed WITH partial output → transform text folds the partial AND the cause (success envelope kept)", async () => {
     const h = fakeSdk({ onPrompt: partialThenApiDeath("503 upstream unavailable") });
-    const p = wire(h.sdk);
+    const p = await wire(h.sdk);
     const out = await p.fire("input", { text: "/fork-research wasm abi", source: "interactive" });
     expect(out.action).toBe("transform");
     expect(out.text).toContain("ran in a forked subagent"); // success envelope preserved for a cut-off result
@@ -177,7 +179,7 @@ describe("F14 t02 — input-hook fork consumer (/fork-research …)", () => {
     const h = fakeSdk({
       replies: [{ stopReason: "error", errorMessage: "insufficient_quota: usage drained" }],
     });
-    const p = wire(h.sdk);
+    const p = await wire(h.sdk);
     const out = await p.fire("input", { text: "/fork-research x", source: "interactive" });
     expect(out.action).toBe("transform"); // did not throw → did not fall through to `continue`
     expect(out.text).toContain("did not finish");
@@ -187,7 +189,7 @@ describe("F14 t02 — input-hook fork consumer (/fork-research …)", () => {
 
   it("(7) successful fork → success envelope with the verbatim result (unchanged)", async () => {
     const h = fakeSdk({ replies: ["- a\n- b\n- c"] });
-    const p = wire(h.sdk);
+    const p = await wire(h.sdk);
     const out = await p.fire("input", { text: "/fork-research x", source: "interactive" });
     expect(out.action).toBe("transform");
     expect(out.text).toContain("The fork-research skill ran in a forked subagent. Its result:");
@@ -203,7 +205,7 @@ describe("F14 t02 — input-hook fork consumer (/fork-research …)", () => {
     const ESC = String.fromCharCode(0x1b);
     const gate = new Promise<void>(() => {}); // never resolves — only abort ends it
     const h = fakeSdk({ replies: [{ text: "never delivered", gate }] });
-    const p = wire(h.sdk);
+    const p = await wire(h.sdk);
     let escHandler: ((data: string) => unknown) | undefined;
     let unsubscribed = false;
     const ctx = p.ctx({

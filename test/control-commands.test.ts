@@ -35,9 +35,9 @@ beforeAll(async () => {
   process.env.PICC_CLAUDE_USER_DIR = userDir;
   process.chdir(dir);
   pi = fakePi();
-  picc(pi.api as never);
-  // built-in overrides register via an async IIFE — give it a beat
-  await new Promise((r) => setTimeout(r, 500));
+  picc(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+  await pi.waitForInitialization();
+  await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
 });
 
 afterAll(() => {

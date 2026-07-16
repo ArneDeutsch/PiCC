@@ -17,6 +17,10 @@ export interface FakePi {
   ctx(overrides?: Record<string, unknown>): Record<string, unknown>;
   /** Wait until every named tool has been registered. */
   waitForTools(names: readonly string[]): Promise<void>;
+  /** Capture the extension's observational detached-initialization completion. */
+  captureInitialization(completion: Promise<void>): void;
+  /** Wait for the completion callback to be captured and its promise to settle. */
+  waitForInitialization(): Promise<void>;
 }
 
 export function fakePi(): FakePi {
@@ -54,6 +58,17 @@ export function fakePi(): FakePi {
       },
     }).finally(() => toolWaiters.delete(waiter));
   };
+  let initializationCompletion: Promise<void> | undefined;
+  const captureInitialization = (completion: Promise<void>): void => {
+    initializationCompletion = completion;
+  };
+  const waitForInitialization = (): Promise<void> => waitUntil({
+    description: "extension detached initialization to be captured and settled",
+    predicate: () => initializationCompletion?.then(() => true) ?? false,
+    describeObserved: () => initializationCompletion === undefined
+      ? "completion callback not captured"
+      : "completion captured but still pending",
+  });
 
   const self: FakePi = {
     tools,
@@ -67,6 +82,8 @@ export function fakePi(): FakePi {
     modelSets,
     thinkingLevels,
     waitForTools,
+    captureInitialization,
+    waitForInitialization,
     api: {
       registerTool: (t: any) => {
         tools.set(t.name, t);

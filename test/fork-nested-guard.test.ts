@@ -118,7 +118,9 @@ async function wireFork(opts: {
   });
   const sdk = opts.transformSdk ? opts.transformSdk(h.sdk) : h.sdk;
   const pi = fakePi();
-  picc(pi.api as never, { sdk });
+  picc(pi.api as never, { sdk, onInitializationSettled: pi.captureInitialization });
+  await pi.waitForInitialization();
+  await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
   // getMainSessionFile() must return a real path so a depth-1 fork can inherit —
   // it is populated from ctx.sessionManager captured on session_start.
   await pi.fire(
