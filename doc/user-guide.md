@@ -429,7 +429,22 @@ Deliberately partial, by design (see the plan §6):
   grammar: `Bash(git *)` (shell-operator aware — `git status && rm -rf /` does **not** match;
   space-before-`*` is a word boundary, so bare `git` matches but `github` never does),
   `Read/Edit(glob)` (Windows paths normalized — `//c/**` covers `C:\…`, case-insensitively),
-  `WebFetch(domain:*)`, `Agent(type)`, `Skill(name)`, `mcp__server__tool`.
+  `WebFetch(domain:*)`, `Agent(type)`, `Skill(name)`, `mcp__server__tool`. A `Read(<glob>)` deny is
+  **not** confined to the `Read` tool — it also gates `Grep`, `Glob`, and `NotebookRead` when they
+  target a matching path (`Grep`/`Glob` are documented Claude best-effort parity; `NotebookRead` is
+  inferred defense-in-depth, since Claude's docs do not name it). The expansion is one-directional,
+  mirroring the edit family: a `Grep(<glob>)` rule does **not** gate `Read`.
+  - *Honesty caveat (best-effort, not airtight).* Matching is on the call's **path** argument. A
+    scoped `deny: Read(secrets/**)` blocks a `Grep`/`Glob`/`NotebookRead` call whose path names the
+    protected directory *or* any subpath — both `{path: "secrets"}` and `{path: "secrets/x"}` are
+    blocked (the glob engine covers the bare directory node). The genuine residual gap is a read
+    call with **no path** (or `path: "."`), e.g. `Grep {}`: there is nothing for the path matcher to
+    test, yet its results can still surface matching file contents. Only a **bare** `deny: Read`
+    forecloses that content-exfiltration path *through the built-in read tools* — but at the cost of
+    removing `Read`, `Grep`, `Glob`, and `NotebookRead` from the agent's context entirely (it can no
+    longer search or read files at all), and it still does not stop a shell read such as
+    `Bash(cat secrets/x)`, which needs its own `Bash(...)` deny. This is inherent to path-glob
+    matching and is Claude Code's own best-effort limit.
 - **Agent `tools:` gating is fully enforced** — a read-only reviewer cannot write; an agent
   without web tools cannot fetch.
 - `allow` / `ask` rules and permission modes are parsed and **reported, not enforced** — the
