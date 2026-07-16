@@ -46,8 +46,11 @@ tool calls**, read purely from proposal prose) is exactly what the light path mu
 **Grounding is the evaluator's filesystem job.** The required investigation is performed **by the
 `evaluator` via `Read`/`Grep`/`Glob`** over the trusted working tree — the `implement-feature` /
 `evaluate` coordinator adds **no** new `gh` call, fetch, or dispatch to satisfy grounding: the fixed
-action envelope is unchanged, and "existing issue/plan tracking" means in-repo `doc/plan/`, `CHANGELOG`,
-`review.md`, not a live GitHub query.
+action envelope is unchanged, and "existing issue/plan tracking" means in-repo `doc/plan/`,
+`review.md`, not a live GitHub query. As `evaluation-engine.md` §"The evidence-anchor contract" spells
+out, these are on-disk working-tree records for the current run (`doc/plan/` is gitignored run scratch,
+not durable committed history); durable cross-feature tracking lives in GitHub Issues, which this
+filesystem-only evaluator does not query.
 
 ## Bounded structured return — the evaluator returns fields, the coordinator composes
 

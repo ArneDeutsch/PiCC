@@ -42,7 +42,7 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
 
 **→ Full documentation: [doc/user-guide.md](doc/user-guide.md)** ·
 [Architecture](doc/architecture.md) · [Supported features](doc/supported-features.md) ·
-[Testing](doc/testing.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
+[Testing](doc/testing.md) · [Contributing](CONTRIBUTING.md)
 
 ## What it does
 
@@ -108,7 +108,7 @@ configured outside the project — see the [user guide](doc/user-guide.md#5-cont
 | `examples/hello-claude` | Minimal demo project |
 | `examples/full-surface` | Larger fixture exercising a broad slice of the feature surface |
 | `test/` | Unit, offline-integration, and live e2e tests (vitest) — see [doc/testing.md](doc/testing.md) |
-| `doc/` | [User guide](doc/user-guide.md), [architecture](doc/architecture.md), [supported features](doc/supported-features.md), [testing](doc/testing.md); plus the plan, research corpus, and pinned Pi contracts |
+| `doc/` | [User guide](doc/user-guide.md), [architecture](doc/architecture.md), [supported features](doc/supported-features.md), [testing](doc/testing.md); plus the design plan (`doc/picc-plan.md`) and the pinned Pi contracts (`doc/design/`) |
 
 ## Development
 
