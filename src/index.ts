@@ -52,6 +52,7 @@ import {
 import { builtinAgents } from "./claude/agents.js";
 import { loadAgentMemory } from "./claude/memory.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
+import { wrapForSelfShell } from "./runtime/tool-shell.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
@@ -934,7 +935,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   for (const tool of claudeNamedTools) {
     try {
-      pi.registerTool(tool);
+      // concise-tool-rows t01: wrap EVERY Claude-named tool in the self-shell
+      // seam so its row loses the top/bottom blank-line padding while keeping its
+      // colored band (re-applied per line), its 1-col gutter, and its content.
+      // The wrapper preserves `execute` and all other fields untouched. (The
+      // subagent-scoped customToolsFor set at ~:687 is intentionally NOT wrapped:
+      // it renders inside subagent transcripts, not the parent interactive shell.)
+      pi.registerTool(wrapForSelfShell(tool));
     } catch (err) {
       console.error(`PiCC: failed to register tool: ${(err as Error).message}`);
     }
@@ -971,43 +978,64 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     console.error(`PiCC: session scratch dir unavailable: ${(err as Error).message}`);
   }
 
-  // Cwd-swapping overrides of Pi built-ins (design doc §3.1). Renderers are inherited.
+  // Cwd-swapping overrides of Pi built-ins (design doc §3.1). Execute is sourced from the
+  // ctx-dropping create*Tool factory (byte-identical); renderers are re-applied from
+  // create*ToolDefinition and de-padded via wrapForSelfShell (concise-tool-rows).
   void (async () => {
     try {
       const sdk: any = await import("@earendil-works/pi-coding-agent");
       // Pin the shell to real Git Bash on Windows — Pi's default `bash` lookup can
       // land on the System32 WSL stub (WSL_E_DEFAULT_DISTRO_NOT_FOUND without a distro).
       const shellPath = resolveGitBashPath();
-      const factories: Array<[string, (cwd: string) => any]> = [
-        ["bash", (c) => sdk.createBashTool(c, {
-          ...(shellPath ? { shellPath } : {}),
-          spawnHook: ({ command, cwd, env }: any) => ({
-            command,
-            cwd,
-            env: unicodeSafeSubprocessEnv({
-              ...env,
-              ...project.settings.env,
-              CLAUDE_PROJECT_DIR: project.root,
-            }),
+      // concise-tool-rows t02: each built-in carries TWO sourcings that must stay
+      // separate. `factory` (create*Tool) is the EXECUTE source — kept byte-for-byte
+      // as before, so live-cwd re-resolution, bash spawnHook/env, and Git-Bash pinning
+      // are unchanged, and `read`'s ctx handling (its non-vision image note) is
+      // untouched. `defFactory` (create*ToolDefinition) is the RENDERER source — the
+      // create*Tool factory strips renderCall/renderResult via wrapToolDefinition, so
+      // the diffs/truncation/highlighting come from the Definition. Its renderers are
+      // cwd-light (the render ctx supplies cwd), so one instance is pulled at
+      // registration. Both are routed through the t01 self-shell seam (wrapForSelfShell),
+      // which sets renderShell:"self", reframes each row (no top/bottom padding, colored
+      // band re-applied per line), and threads ctx.lastComponent to the inner component
+      // so the built-ins' incremental rendering survives.
+      const bashOptions = {
+        ...(shellPath ? { shellPath } : {}),
+        spawnHook: ({ command, cwd, env }: any) => ({
+          command,
+          cwd,
+          env: unicodeSafeSubprocessEnv({
+            ...env,
+            ...project.settings.env,
+            CLAUDE_PROJECT_DIR: project.root,
           }),
-        })],
-        ["read", (c) => sdk.createReadTool(c)],
-        ["write", (c) => sdk.createWriteTool(c)],
-        ["edit", (c) => sdk.createEditTool(c)],
-        ["grep", (c) => sdk.createGrepTool(c)],
-        ["find", (c) => sdk.createFindTool(c)],
-        ["ls", (c) => sdk.createLsTool(c)],
+        }),
+      };
+      const factories: Array<[string, (cwd: string) => any, (cwd: string) => any]> = [
+        ["bash", (c) => sdk.createBashTool(c, bashOptions), (c) => sdk.createBashToolDefinition(c)],
+        ["read", (c) => sdk.createReadTool(c), (c) => sdk.createReadToolDefinition(c)],
+        ["write", (c) => sdk.createWriteTool(c), (c) => sdk.createWriteToolDefinition(c)],
+        ["edit", (c) => sdk.createEditTool(c), (c) => sdk.createEditToolDefinition(c)],
+        ["grep", (c) => sdk.createGrepTool(c), (c) => sdk.createGrepToolDefinition(c)],
+        ["find", (c) => sdk.createFindTool(c), (c) => sdk.createFindToolDefinition(c)],
+        ["ls", (c) => sdk.createLsTool(c), (c) => sdk.createLsToolDefinition(c)],
       ];
-      for (const [name, factory] of factories) {
+      for (const [name, factory, defFactory] of factories) {
         const template = factory(cwdState.get());
-        pi.registerTool({
-          ...template,
-          name,
-          async execute(id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) {
-            const live = factory(cwdState.get());
-            return live.execute(id, params, signal, onUpdate, ctx);
-          },
-        });
+        // Renderers only (execute stays sourced from `factory` below, byte-identical).
+        const def = defFactory(cwdState.get());
+        pi.registerTool(
+          wrapForSelfShell({
+            ...template,
+            name,
+            renderCall: def.renderCall,
+            renderResult: def.renderResult,
+            async execute(id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) {
+              const live = factory(cwdState.get());
+              return live.execute(id, params, signal, onUpdate, ctx);
+            },
+          }),
+        );
       }
       // `!` user-bash commands also get the pinned Git Bash (and the effective cwd).
       if (shellPath && typeof sdk.createLocalBashOperations === "function") {

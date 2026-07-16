@@ -44,6 +44,14 @@ export const executeArity: Parameters<Exec>["length"] = 5;
 export const executeSignal: Parameters<Exec>[2] = new AbortController().signal;
 export const executeSignalOptional: Parameters<Exec>[2] = undefined;
 
+// --- concise-tool-rows t02: self-shell row de-padding surface ---
+
+// renderShell accepts "self" — the ONLY ToolDefinition lever that drops Pi's
+// top/bottom row padding (the whole feature depends on it). A Pi change that
+// removes the field or the "self" member fails to compile here. Confirmed at
+// core/extensions/types.d.ts:349 (renderShell?: "default" | "self").
+export const renderShellSelf: NonNullable<ToolDefinition["renderShell"]> = "self";
+
 // --- t02: subagent transcript persistence surface ---
 
 // SessionManager.create(cwd, sessionDir?, options?) — the custom sessionDir +
