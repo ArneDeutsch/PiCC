@@ -114,10 +114,9 @@ TUI, `/model`, project trust. We do not reimplement any of it.
 - `before_agent_start` system-prompt chaining: other extensions may also modify; we append, not replace.
 - Built-in tool override warning in interactive mode is expected (documented for users).
 - Tool-row de-padding (concise-tool-rows) couples `src/runtime/tool-shell.ts` to Pi's render
-  contract in three places. **Two** are pinned by the smoke test (`test/pi-contract.test.ts`, t02) so
-  a Pi bump fails loudly in CI; the **third (`ctx.lastComponent`) cannot be asserted against Pi's side
-  and stays an unguarded watchpoint** — a Pi change there degrades incremental rendering silently on a
-  green CI:
+  contract in three places. **All three** are now pinned by the smoke test
+  (`test/pi-contract.test.ts`) so a Pi bump fails loudly in CI rather than degrading incremental
+  rendering silently on a green CI:
   - **`create*ToolDefinition` renderer shape** — the de-padded built-in rows source their
     `renderCall`/`renderResult` from the public `createRead/Write/Edit/Bash/Grep/Find/LsToolDefinition`
     factories (the plain `create*Tool` factory strips renderers via `wrapToolDefinition`). A rename,
@@ -125,10 +124,12 @@ TUI, `/model`, project trust. We do not reimplement any of it.
   - **`ctx.lastComponent` threading** — `ToolExecutionComponent` hands back the component we returned
     as `ctx.lastComponent`; the built-ins reuse it for incremental render state (`read`/`bash` via
     `?? new …`, `edit` via `instanceof Box`). The wrapper stashes the inner component (`__inner`) and
-    threads it back — a load-bearing coupling to Pi's incremental-render contract. **Not pinned by the
-    smoke test:** only PiCC's own threading logic is unit-tested (`test/runtime-core.test.ts`, with a
-    fake inner + fake ctx); Pi's side (that `ToolExecutionComponent` still hands the returned component
-    back as `ctx.lastComponent`) is not asserted, so this coupling can regress silently on a Pi bump.
+    threads it back — a load-bearing coupling to Pi's incremental-render contract. **Pinned by the
+    smoke test (t04):** PiCC's own threading logic is unit-tested (`test/runtime-core.test.ts`, with a
+    fake inner + fake ctx), and a contract test now drives the real `ToolExecutionComponent` and
+    asserts Pi's side too — that it hands the previously-returned component back as
+    `ctx.lastComponent` on the next render (undefined on the first), for the `renderCall` and
+    `renderResult` slots separately — so this coupling can no longer regress silently on a Pi bump.
     See [`tui-extension-guide.md`](../tui-extension-guide.md) §3.2.
   - **`getTextOutput` transform** — `tool-shell.ts` reproduces Pi's `render-utils.js` `getTextOutput`
     (the deep path is `exports`-blocked); the smoke test pins it against Pi's own via an absolute

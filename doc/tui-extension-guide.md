@@ -150,10 +150,13 @@ wrapped in Pi's try/catch, so an unguarded throw (unknown bg slot, absent theme,
   reuse it for incremental state (`read`/`bash` via `?? new …`, `edit` via an `instanceof Box`
   reuse). A naive wrap would hand the inner renderer *our* wrapper and silently lose that state
   (`edit` especially), so the wrapper stashes the inner component (`__inner`) and threads the
-  *previous inner* component back. This couples to Pi's render contract — an **unguarded churn
-  watchpoint**: PiCC's threading is unit-tested, but Pi's side (that it hands the returned component
-  back as `ctx.lastComponent`) is *not* pinned by any contract test, so a Pi change here degrades
-  incremental rendering silently (see [`pi-integration.md`](pi-integration.md) §4).
+  *previous inner* component back. This couples to Pi's render contract — and is now **pinned**:
+  a contract test drives the real `ToolExecutionComponent` and asserts Pi hands the
+  previously-returned component back as `ctx.lastComponent` on the next render (undefined on the
+  first), for both the `renderCall` and `renderResult` slots (`test/pi-contract.test.ts`,
+  concise-tool-rows t04). PiCC's own threading stays unit-tested; with Pi's side now asserted too,
+  a Pi change here fails loudly in CI instead of degrading incremental rendering silently (see
+  [`pi-integration.md`](pi-integration.md) §4).
 - **The blank line Pi inserts *between* transcript blocks is still not yours.** That is render-loop
   layout (self mode prepends exactly one), not a tool concern. No extension knob changes it — it is
   the hard boundary that still separates two adjacent de-padded rows. Plan around it.

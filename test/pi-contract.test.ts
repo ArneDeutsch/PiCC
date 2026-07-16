@@ -160,3 +160,102 @@ describe("pi 0.80.x API contract", () => {
     expect(failed, `Pi type contract broken:\n${output}`).toBe(false);
   }, 30_000);
 });
+
+/**
+ * concise-tool-rows t04: pin Pi's `ctx.lastComponent` threading with a contract
+ * test that drives the REAL, publicly-exported `ToolExecutionComponent`.
+ *
+ * The de-padded built-ins depend on Pi caching the component our wrapper returns
+ * and handing it back as `ctx.lastComponent` on the next render (t02's `__inner`
+ * threading exists precisely to survive this; `edit`'s `instanceof Box`
+ * incremental reuse breaks if the wrong component is threaded). PiCC's OWN
+ * threading is unit-tested against a fake ctx (`test/runtime-core.test.ts`); this
+ * asserts PI's side of the contract, so a Pi upgrade that stops threading the
+ * prior component fails loudly here instead of degrading incremental rendering
+ * silently in the terminal.
+ */
+describe("ToolExecutionComponent threads the prior render component as ctx.lastComponent (concise-tool-rows t04)", () => {
+  it("hands back the previously-returned component (undefined on the first render), for renderCall and renderResult", async () => {
+    const { ToolExecutionComponent, initTheme } = (await import(
+      "@earendil-works/pi-coding-agent"
+    )) as any;
+    // The render loop reads a module-global `theme`; initialize it first so
+    // render()/updateDisplay() don't throw — same pattern as the wired-edit
+    // integration test (test/integration-extension.test.ts).
+    initTheme();
+
+    // For each renderer slot: the lastComponent it was HANDED on each invocation,
+    // and the fresh sentinel it RETURNED (so we can assert identity, not truthiness).
+    const call: { seen: unknown[]; returned: unknown[] } = { seen: [], returned: [] };
+    const result: { seen: unknown[]; returned: unknown[] } = { seen: [], returned: [] };
+
+    // A sentinel Component: a plain `{ render() }` is a valid pi-tui child
+    // (Container.addChild just stores it; render() collects child.render(width)).
+    const sentinel = () => ({ render: () => [] as string[] });
+
+    // Instrumented tool definition. renderShell:"self" mirrors PiCC's real usage
+    // (the built-ins register self-shell), though Pi's caching is shell-independent.
+    const toolDefinition = {
+      name: "PiccLastComponentProbe",
+      renderShell: "self",
+      renderCall: (_args: unknown, _theme: unknown, ctx: { lastComponent: unknown }) => {
+        call.seen.push(ctx.lastComponent);
+        const c = sentinel();
+        call.returned.push(c);
+        return c;
+      },
+      renderResult: (
+        _res: unknown,
+        _opts: unknown,
+        _theme: unknown,
+        ctx: { lastComponent: unknown },
+      ) => {
+        result.seen.push(ctx.lastComponent);
+        const c = sentinel();
+        result.returned.push(c);
+        return c;
+      },
+    };
+
+    // A made-up toolName so `builtInToolDefinition` (createAllToolDefinitions(cwd)
+    // [toolName]) is undefined and ONLY the instrumented definition drives rendering.
+    const component = new ToolExecutionComponent(
+      "PiccLastComponentProbe",
+      "picc-tc-1",
+      { probe: "args-1" },
+      {},
+      toolDefinition,
+      { requestRender() {} },
+      process.cwd().replace(/\\/g, "/"),
+    );
+
+    // The constructor already ran one updateDisplay (renderCall #1; no result yet).
+    // Drive a second call render, then two result renders — each updateDisplay pass
+    // re-invokes the renderers and threads the prior returned component back.
+    const mkResult = (text: string) => ({
+      content: [{ type: "text", text }],
+      details: {},
+      isError: false,
+    });
+    component.updateArgs({ probe: "args-2" }); // renderCall #2
+    component.updateResult(mkResult("out-1"), false); // renderResult #1 (+ renderCall #3)
+    component.updateResult(mkResult("out-2"), false); // renderResult #2 (+ renderCall #4)
+    component.render(80); // exercise the self-shell render path with the sentinels
+
+    // renderCall: 1st render sees `undefined`; the 2nd sees EXACTLY the component
+    // the renderer returned on the 1st render — non-vacuous (identity, not truthy).
+    expect(call.seen.length).toBeGreaterThanOrEqual(2);
+    expect(call.seen[0]).toBeUndefined();
+    expect(call.seen[1]).toBe(call.returned[0]);
+
+    // renderResult is cached in a SEPARATE slot — same contract holds independently.
+    expect(result.seen.length).toBeGreaterThanOrEqual(2);
+    expect(result.seen[0]).toBeUndefined();
+    expect(result.seen[1]).toBe(result.returned[0]);
+
+    // The two slots really are independent caches (call sentinel is never handed
+    // to the result renderer and vice-versa).
+    expect(call.returned[0]).not.toBe(result.returned[0]);
+    expect(result.seen[1]).not.toBe(call.returned[0]);
+  });
+});
