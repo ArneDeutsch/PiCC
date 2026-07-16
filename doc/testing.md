@@ -17,6 +17,78 @@ is no build step to run first. The e2e layer needs Pi's compiled CLI at
 `node_modules/@earendil-works/pi-coding-agent/dist/cli.js`; `npm install` provides it. If it is
 missing those tests **skip** (they do not fail) with a console warning.
 
+## Synchronizing asynchronous tests
+
+Correctness tests must wait for observable readiness, ordering, or completion—not sleep for a
+fixed interval or require work to finish within a narrow elapsed-time threshold. The shared helpers
+have these contracts:
+
+- `deferred<T>(): Deferred<T>` creates a test-owned promise gate with exposed `resolve` and `reject`.
+- `waitUntil(options: WaitUntilOptions): Promise<void>` observes a predicate and rejects with the
+  described state at its safety ceiling. Configure that ceiling with `options.timeoutMs` here rather
+  than adding a second timer around the caller.
+- `FakeSdkHandle.waitForPromptCalls(count: number): Promise<void>` settles when that many prompts
+  have entered **and their user messages have been recorded**.
+- `FakePi.waitForTools(names: readonly string[]): Promise<void>` settles when the named tools are
+  registered. It observes registration only, not initialization or readiness to run a session.
+- `FakePi.captureInitialization(completion: Promise<void>): void` records detached startup
+  settlement, and `FakePi.waitForInitialization(): Promise<void>` waits until that completion has
+  been captured and settled. Wire the observer with
+  `picc(pi.api as never, { onInitializationSettled: pi.captureInitialization })`.
+
+Detached startup completion specifically combines orphan reaping and the built-in cwd-bound tool
+registration attempts; failures from both activities are caught. Because completion does not prove
+that tools registered successfully, callers that need tools must separately await `waitForTools`.
+This completion is not a session-lifecycle barrier. Keep rejecting ceilings comfortably below
+Vitest's timeout so failures report expected and observed state instead of an opaque test timeout.
+
+For real hook children, use `createHookProcessFixture(parentDir)` and its test-owned marker/release
+protocol. The child atomically publishes an `entered` marker; await it with `fixture.waitFor` before
+asserting, then release identities in the order needed to establish the behavior. Always await
+cleanup with every still-gated identity in `finally`:
+
+```ts
+const fixture = createHookProcessFixture(parentDir);
+const runner = new HookRunner({
+  config: parseHookConfig({
+    UserPromptSubmit: [{ hooks: [{
+      type: "command", command: fixture.command, args: ["gate", "first"], timeout: 8,
+    }] }],
+  }, "<test>").config,
+  projectDir: parentDir,
+  sessionId: "test-session",
+  env: fixture.env,
+  disableAllHooks: false,
+  onSpawnForTest: fixture.onSpawnForTest,
+});
+const firing = runner.fire("UserPromptSubmit", { prompt: "hi" });
+try {
+  await fixture.waitFor(["first.entered"], "hook to enter before release");
+  expect(fixture.exists("first.done")).toBe(false);
+  fixture.release("first");
+  await firing;
+  await fixture.waitFor(["first.done"], "hook to finish after release");
+} finally {
+  await fixture.cleanup("first");
+  await firing;
+}
+```
+
+Values passed through Git Bash must be separately quoted. Prefer portable Node invocation through
+environment variables: `exec "$HOOK_NODE" "$HOOK_SCRIPT"`, with `HOOK_NODE` set from
+`process.execPath` and paths converted to forward slashes. `test/helpers/hook-process.ts` contains
+the reusable implementation.
+
+Timers are not categorically forbidden. Legitimate uses include semantic timeout tests, process
+watchdogs and external-command ceilings, cleanup retries, fixture timestamps, parser-only command
+strings, and shared rejecting ceilings. A timeout-semantics test should assert the timeout result and
+structural process/state effects (for example, cancellation and absence of a post-timeout marker)
+under a later outer hang ceiling; elapsed speed is not the success criterion. Watchdogs terminate
+hung processes, cleanup retries handle eventual resource release, timestamps provide semantic
+fixture data, and parser-only strings such as `sleep` test parsing without executing a wait. Review
+these distinctions directly when adding or changing asynchronous tests; there is no general timing
+linter whose silence proves a test deterministic.
+
 ## Layer 1 — unit tests (per subsystem)
 
 Each subsystem is tested in isolation against its full field/behavior matrix, **including fields the

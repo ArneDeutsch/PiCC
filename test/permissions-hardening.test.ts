@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -624,25 +624,52 @@ describe("UNC path inputs", () => {
   // fs.realpathSync on a nonexistent \\host can block for seconds probing the
   // network stack — deny-direction matching must skip it for UNC inputs and
   // stay on the literal form.
-  it("deny evaluation against a \\\\server\\share input returns quickly and never throws", () => {
-    const engine = denyEngine(["Read(//secrets/**)", "Edit(secrets/**)"]);
+  it("deny evaluation skips canonicalization for a \\\\server\\share input", () => {
+    const engine = denyEngine(["Read(//no-such-host-9f3a/**)"]);
     const unc = "\\\\no-such-host-9f3a\\share\\secrets\\key.pem";
-    const start = Date.now();
-    expect(() => engine.evaluate(call("Read", { file_path: unc }))).not.toThrow();
-    expect(() => engine.evaluate(call("Edit", { file_path: unc }))).not.toThrow();
-    expect(Date.now() - start).toBeLessThan(500);
+    const realpath = vi.spyOn(fs, "realpathSync");
+    try {
+      expect(() => engine.evaluate(call("Read", { file_path: unc }))).not.toThrow();
+      expect(engine.evaluate(call("Read", { file_path: unc }))).toEqual({
+        decision: "deny",
+        rule: "Read(//no-such-host-9f3a/**)",
+      });
+      expect(realpath).not.toHaveBeenCalled();
+    } finally {
+      realpath.mockRestore();
+    }
   });
 
-  it("forward-slash UNC form (//server/share/...) is skipped too", () => {
-    const start = Date.now();
-    expect(() =>
-      matchesRule(
-        "Read(//no-such-host-9f3a/**)",
-        call("Read", { file_path: "//no-such-host-9f3a/share/secrets/key.pem" }),
-        { deny: true, anySegment: true, anchor: ROOT },
-      ),
-    ).not.toThrow();
-    expect(Date.now() - start).toBeLessThan(500);
+  it("forward-slash UNC form skips canonicalization while literal matching remains active", () => {
+    const realpath = vi.spyOn(fs, "realpathSync");
+    try {
+      expect(
+        matchesRule(
+          "Read(//no-such-host-9f3a/**)",
+          call("Read", { file_path: "//no-such-host-9f3a/share/secrets/key.pem" }),
+          { deny: true, anySegment: true, anchor: ROOT },
+        ),
+      ).toBe(true);
+      expect(realpath).not.toHaveBeenCalled();
+    } finally {
+      realpath.mockRestore();
+    }
+  });
+
+  it("non-UNC deny evaluation still canonicalizes existing local paths", () => {
+    const localRoot = fs.mkdtempSync(path.join(os.tmpdir(), "picc-perm-realpath-"));
+    fs.writeFileSync(path.join(localRoot, "visible.txt"), "fixture");
+    const realpath = vi.spyOn(fs, "realpathSync");
+    try {
+      const engine = denyEngine(["Read(visible.txt)"], { cwd: localRoot });
+      expect(engine.evaluate(call("Read", { file_path: "visible.txt" }, localRoot)).decision).toBe(
+        "deny",
+      );
+      expect(realpath).toHaveBeenCalled();
+    } finally {
+      realpath.mockRestore();
+      fs.rmSync(localRoot, { recursive: true, force: true });
+    }
   });
 });
 
