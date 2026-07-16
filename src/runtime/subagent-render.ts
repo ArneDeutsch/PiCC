@@ -29,7 +29,7 @@ function themedBold(theme: unknown, text: string): string {
 // width exceeds the terminal, and it decides that with visibleWidth() (grapheme +
 // East-Asian-width + tabs=3). We MUST use the same function so our clamp agrees
 // exactly with the check pi-tui enforces; a code-unit approximation silently
-// disagrees on CJK/wide/tab content and still crashes. See doc/plan review notes.
+// disagrees on CJK/wide/tab content and still crashes.
 
 /** Append `text` wrapped to `width` visible columns (ANSI- and wide-char-aware). */
 function pushWrapped(text: string, width: number, into: string[]): void {

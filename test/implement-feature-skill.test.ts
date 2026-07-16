@@ -355,14 +355,20 @@ describe("description-based naming contract", () => {
     expect(handoff).toContain("explicit no-`gh` git-only degrade alone reserves literal `origin`");
   });
 
-  it("updates contributor and changelog contracts without scanning historical records", () => {
+  it("updates the contributor contract without scanning historical records", () => {
     const contributing = fs.readFileSync(path.resolve(SKILL_DIR, "../../../CONTRIBUTING.md"), "utf8").replace(/\r\n/g, "\n");
-    const changelog = fs.readFileSync(path.resolve(SKILL_DIR, "../../../CHANGELOG.md"), "utf8").replace(/\r\n/g, "\n");
     expect(contributing).toContain("git checkout feature/<feature-slug>");
     expect(contributing).not.toMatch(/git checkout feature\/<nn>-<slug>/i);
-    const unreleased = changelog.slice(changelog.indexOf("## [Unreleased]"), changelog.indexOf("### Added — evaluate skill"));
-    for (const marker of ["descriptive slug", "canonical numeric reference", "`t01`", "legacy"])
-      expect(unreleased.toLowerCase()).toContain(marker);
+  });
+
+  it("gitignores the per-feature process folders but not doc/design", () => {
+    const gitignore = fs.readFileSync(path.resolve(SKILL_DIR, "../../../.gitignore"), "utf8").replace(/\r\n/g, "\n");
+    for (const entry of ["doc/plan/", "doc/research/", "doc/review/"]) expect(gitignore).toContain(entry);
+    expect(gitignore).not.toContain("doc/design/");
+  });
+
+  it("no longer ships a CHANGELOG.md at the repo root", () => {
+    expect(fs.existsSync(path.resolve(SKILL_DIR, "../../../CHANGELOG.md"))).toBe(false);
   });
 });
 
