@@ -52,6 +52,7 @@ import {
 import { builtinAgents } from "./claude/agents.js";
 import { loadAgentMemory } from "./claude/memory.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
+import { wrapForSelfShell } from "./runtime/tool-shell.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
@@ -934,7 +935,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   for (const tool of claudeNamedTools) {
     try {
-      pi.registerTool(tool);
+      // concise-tool-rows t01: wrap EVERY Claude-named tool in the self-shell
+      // seam so its row loses the top/bottom blank-line padding while keeping its
+      // colored band (re-applied per line), its 1-col gutter, and its content.
+      // The wrapper preserves `execute` and all other fields untouched. (The
+      // subagent-scoped customToolsFor set at ~:687 is intentionally NOT wrapped:
+      // it renders inside subagent transcripts, not the parent interactive shell.)
+      pi.registerTool(wrapForSelfShell(tool));
     } catch (err) {
       console.error(`PiCC: failed to register tool: ${(err as Error).message}`);
     }

@@ -79,6 +79,39 @@ describe("tool surface registration", () => {
     }
   });
 
+  it("de-pads every Claude-named tool row: renderShell:'self' across the registration loop (concise-tool-rows t01)", () => {
+    // A representative set spanning both wrapper cases: own-renderer tools
+    // (Agent/TaskOutput), high-traffic renderer-less tools (TodoWrite/Grep),
+    // SendMessage, and the previously renderer-less TaskStop.
+    for (const name of ["Agent", "Task", "TaskOutput", "TaskStop", "SendMessage", "TodoWrite", "Grep"]) {
+      const tool = pi.tools.get(name);
+      expect(tool, `missing tool ${name}`).toBeTruthy();
+      expect(tool.renderShell, `${name} not self-shell`).toBe("self");
+      // The wrapper always installs BOTH renderers (own or generic fallback).
+      expect(typeof tool.renderCall, `${name} missing renderCall`).toBe("function");
+      expect(typeof tool.renderResult, `${name} missing renderResult`).toBe("function");
+      // execute is preserved (not stripped by the wrapper).
+      expect(typeof tool.execute, `${name} missing execute`).toBe("function");
+    }
+  });
+
+  it("wrapped renderers paint content on a background and keep content (offline integration)", () => {
+    const ESC = String.fromCharCode(27);
+    // A renderer-less tool renders its bold title through the generic fallback,
+    // painted per line via theme.bg — proven by a slot-encoding fake theme.
+    const theme = {
+      fg: (_c: string, s: string) => s,
+      bold: (s: string) => s,
+      bg: (slot: string, text: string) => `${ESC}]${slot}${ESC}\\${text}${ESC}[49m`,
+    };
+    const ctx = { isPartial: false, isError: false, showImages: false };
+    const todo = pi.tools.get("TodoWrite");
+    const callLines = todo.renderCall({}, theme, ctx).render(60);
+    expect(callLines.length).toBe(1);
+    expect(callLines[0]).toContain("TodoWrite"); // content preserved
+    expect(callLines[0]).toContain("toolSuccessBg"); // background re-applied per line
+  });
+
   it("registers the /doctor, /compat, /quota, /skills, /agents control commands", () => {
     for (const name of ["doctor", "compat", "quota", "skills", "agents"]) {
       expect(pi.commands.has(name), `missing command ${name}`).toBe(true);

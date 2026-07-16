@@ -58,6 +58,13 @@ import { createAgentToolDefinition, extractText, type SubagentRuntime } from "..
 import { visibleWidth as tuiVisibleWidth } from "@earendil-works/pi-tui";
 import type { ProgressSnapshot } from "../src/runtime/subagent-progress.js";
 import { renderAgentResult } from "../src/runtime/subagent-render.js";
+import {
+  bgSlotForCtx,
+  reframe,
+  themedBg,
+  wrapForSelfShell,
+  type RenderCtx,
+} from "../src/runtime/tool-shell.js";
 import { agentTrailerFrame } from "../src/util/subagent-transcripts.js";
 import {
   fakeSdk,
@@ -2065,5 +2072,293 @@ describe("scratchpad injection wiring through the real harness (t05)", () => {
         /* OS reaps temp dirs eventually */
       }
     }
+  });
+});
+
+describe("self-shell wrapper (concise-tool-rows t01)", () => {
+  const ESC = String.fromCharCode(27);
+  const BEL = String.fromCharCode(7);
+  const SLOTS = ["toolPendingBg", "toolErrorBg", "toolSuccessBg"] as const;
+
+  // A slot-ENCODING fake theme. Its `bg` frames text with an OSC slot marker
+  // (`ESC ] <slot> BEL`) plus a trailing `ESC[49m` reset — BOTH zero-width under
+  // pi-tui's visibleWidth, exactly like a real `theme.bg` pair — so reframe's
+  // width math (and its no-op (d) net) behaves precisely as in production.
+  //
+  // NOTE (deviation): the spec suggested `bg: (slot, text) => ESC + slot + "|" +
+  // text`, but pi-tui's visibleWidth does NOT treat that as an escape — it counts
+  // the slot name as visible columns, which would spuriously trip reframe's final
+  // width clamp and truncate the painted row. The OSC-framed marker below keeps
+  // the slot encoded (the binding requirement) while being genuinely zero-width.
+  const slotMarker = (slot: string) => `${ESC}]${slot}${BEL}`;
+  const slotTheme = {
+    fg: (_c: string, s: string) => s,
+    bold: (s: string) => s,
+    bg: (slot: string, text: string) => `${slotMarker(slot)}${text}${ESC}[49m`,
+  };
+
+  const ownTool = () => ({
+    name: "Demo",
+    renderCall: () => ({ render: () => ["call-line"] }),
+    renderResult: () => ({ render: () => ["result-line"] }),
+  });
+
+  // The real Agent tool (own renderers) — reused for the "content survives" and
+  // wrapper width-sweep cases.
+  const agentTool = () => {
+    const { sdk } = fakeSdk({ replies: ["x"] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk);
+    return createAgentToolDefinition(runtime, { depth: 0 }) as unknown as Record<string, unknown>;
+  };
+
+  it("bgSlotForCtx maps state to the pinned single tone (partial > error > success)", () => {
+    expect(bgSlotForCtx({ isPartial: true })).toBe("toolPendingBg");
+    expect(bgSlotForCtx({ isPartial: true, isError: true })).toBe("toolPendingBg");
+    expect(bgSlotForCtx({ isError: true })).toBe("toolErrorBg");
+    expect(bgSlotForCtx({})).toBe("toolSuccessBg");
+    expect(bgSlotForCtx(undefined)).toBe("toolSuccessBg");
+  });
+
+  it("themedBg is throw-guarded: unknown slot / absent theme degrade to plain text", () => {
+    const throwing = {
+      bg: () => {
+        throw new Error("Unknown theme background color");
+      },
+    };
+    expect(themedBg(throwing, "toolSuccessBg", "x")).toBe("x");
+    expect(themedBg(undefined, "toolSuccessBg", "x")).toBe("x");
+    expect(themedBg({}, "toolSuccessBg", "x")).toBe("x");
+    expect(themedBg(slotTheme, "toolSuccessBg", "x")).toContain("x");
+  });
+
+  it("single-tone background: call and result carry the SAME, state-correct slot", () => {
+    const wrapped = wrapForSelfShell(ownTool());
+    const cases: Array<[RenderCtx, string]> = [
+      [{ isPartial: true }, "toolPendingBg"],
+      [{ isPartial: false, isError: true }, "toolErrorBg"],
+      [{ isPartial: false, isError: false }, "toolSuccessBg"],
+    ];
+    for (const [ctx, slot] of cases) {
+      const callLines = (
+        wrapped.renderCall as (a: unknown, t: unknown, c: RenderCtx) => { render: (w: number) => string[] }
+      )({}, slotTheme, ctx).render(40);
+      const resLines = (
+        wrapped.renderResult as (
+          r: unknown,
+          o: unknown,
+          t: unknown,
+          c: RenderCtx,
+        ) => { render: (w: number) => string[] }
+      )({ content: [] }, {}, slotTheme, ctx).render(40);
+      expect(callLines.length).toBeGreaterThan(0);
+      expect(resLines.length).toBeGreaterThan(0);
+      for (const l of [...callLines, ...resLines]) {
+        expect(l).toContain(slotMarker(slot)); // correct tone
+        for (const other of SLOTS.filter((s) => s !== slot)) {
+          expect(l).not.toContain(slotMarker(other)); // no other tone
+        }
+      }
+    }
+  });
+
+  it("reframe strips leading/trailing blanks, keeps interior, paints each line, keeps the 1-col gutter", () => {
+    const out = reframe(["", "alpha", "", "beta", ""], 20, slotTheme, "toolSuccessBg");
+    expect(out.length).toBe(3); // alpha, interior blank, beta
+    for (const l of out) {
+      expect(l).toContain(slotMarker("toolSuccessBg")); // per-line bg
+      expect(tuiVisibleWidth(l)).toBe(20); // padded to exactly width
+      expect(l.startsWith(`${slotMarker("toolSuccessBg")} `)).toBe(true); // 1-col gutter
+    }
+    // No blank line at the first or last position (measured after marker strip).
+    expect(tuiVisibleWidth(out[0]!)).toBe(20);
+    expect(tuiVisibleWidth(out[out.length - 1]!)).toBe(20);
+    const joined = out.join("\n");
+    expect(joined).toContain("alpha");
+    expect(joined).toContain("beta");
+  });
+
+  it("a maximally-wide inner line is NOT ellipsized and keeps Pi's right-hand bg margin", () => {
+    // A tool whose inner renderer FILLS exactly the width it is handed — like Pi's
+    // own Box-laid-out content. Before the fix the wrapper handed it the full
+    // terminal width, but reframe preserved only width-GUTTER, so the last content
+    // column was truncated to a trailing "…" (a real "content changed" regression)
+    // and the row could touch the right edge where Pi keeps a >=1-col bg margin.
+    let seenWidth = -1;
+    const tool = {
+      name: "Fill",
+      renderResult: () => ({
+        render: (w: number) => {
+          seenWidth = w;
+          return ["x".repeat(w)]; // exactly `w` visible columns — fills its width
+        },
+      }),
+    };
+    const wrapped = wrapForSelfShell(tool);
+    const width = 40;
+    const out = (
+      wrapped.renderResult as (
+        r: unknown,
+        o: unknown,
+        t: unknown,
+        c: RenderCtx,
+      ) => { render: (w: number) => string[] }
+    )({ content: [] }, {}, slotTheme, { isPartial: false }).render(width);
+    expect(out.length).toBe(1);
+    const line = out[0]!;
+
+    // Inner content is laid out at width - 2 (paddingX=1 on BOTH sides), not full width.
+    expect(seenWidth).toBe(width - 2);
+
+    // Strip the zero-width bg framing to inspect the visible payload.
+    const marker = slotMarker("toolSuccessBg");
+    const inner = line.replace(marker, "").replace(`${ESC}[49m`, "");
+
+    // (a) No column was dropped to an ellipsis: every inner 'x' survives.
+    expect(inner.includes("…")).toBe(false);
+    expect((inner.match(/x/g) ?? []).length).toBe(width - 2);
+
+    // (b) Full-width row: painted to EXACTLY width, ending within the terminal, and
+    // carrying the background to the right edge with Pi's >=1-col margin. The last
+    // visible column is a background space (the fill), not content; the first is the
+    // 1-col gutter.
+    expect(tuiVisibleWidth(line)).toBe(width);
+    expect(inner.startsWith(" ")).toBe(true); // leading 1-col gutter
+    expect(inner.endsWith(" ")).toBe(true); // right-hand bg margin (>=1 col)
+    expect(line).toContain(marker); // still painted with the state tone
+  });
+
+  it("reframe returns [] when only blank lines remain (empty result collapses the row)", () => {
+    expect(reframe([], 20, slotTheme, "toolSuccessBg")).toEqual([]);
+    expect(reframe(["", "", ""], 20, slotTheme, "toolSuccessBg")).toEqual([]);
+  });
+
+  it("no-theme / headless: plain content, no bg marker, no throw", () => {
+    const out = reframe(["hello"], 20, undefined, "toolSuccessBg");
+    expect(out.length).toBe(1);
+    expect(out[0]).toContain("hello");
+    expect(out[0]!.includes(ESC)).toBe(false); // no escape / bg marker at all
+  });
+
+  it("width sweep THROUGH the wrapper (bg added): no overflow, includes over-width content", () => {
+    const wrapped = wrapForSelfShell(agentTool());
+    const wide = "字".repeat(60); // 60 CJK = 120 columns (over width)
+    const ctx: RenderCtx = { isPartial: false, isError: false };
+    const renderRes = wrapped.renderResult as (
+      r: unknown,
+      o: unknown,
+      t: unknown,
+      c: RenderCtx,
+    ) => { render: (w: number) => string[] };
+    const renderCall = wrapped.renderCall as (
+      a: unknown,
+      t: unknown,
+      c: RenderCtx,
+    ) => { render: (w: number) => string[] };
+    for (const width of [1, 2, 3, 20, 40, 138]) {
+      const res = renderRes(
+        {
+          content: [{ type: "text", text: `line1\n${wide}` }],
+          details: { outcome: "completed", agent: "docs" },
+        },
+        { isPartial: false },
+        slotTheme,
+        ctx,
+      ).render(width);
+      for (const l of res) {
+        expect(tuiVisibleWidth(l)).toBeLessThanOrEqual(width); // no RangeError, no overflow
+        expect(l).toContain(slotMarker("toolSuccessBg"));
+      }
+      const call = renderCall(
+        { subagent_type: "x".repeat(200), description: wide },
+        slotTheme,
+        ctx,
+      ).render(width);
+      for (const l of call) expect(tuiVisibleWidth(l)).toBeLessThanOrEqual(width);
+    }
+  });
+
+  it("content survives the wrapper: Agent badge + body still present", () => {
+    const wrapped = wrapForSelfShell(agentTool());
+    const out = (
+      wrapped.renderResult as (
+        r: unknown,
+        o: unknown,
+        t: unknown,
+        c: RenderCtx,
+      ) => { render: (w: number) => string[] }
+    )(
+      {
+        content: [{ type: "text", text: "the body text" }],
+        details: { outcome: "completed", agent: "reviewer" },
+      },
+      { isPartial: false },
+      slotTheme,
+      { isPartial: false },
+    )
+      .render(120)
+      .join("\n");
+    expect(out).toContain("reviewer");
+    expect(out).toContain("the body text");
+  });
+
+  it("generic renderer: renderer-less tool shows bold title + text output; CRLF stripped; image indicator appended", () => {
+    const wrapped = wrapForSelfShell({ name: "TodoWrite" });
+    expect(wrapped.renderShell).toBe("self");
+    const ctx: RenderCtx = { isPartial: false, isError: false };
+    const call = (
+      wrapped.renderCall as (a: unknown, t: unknown, c: RenderCtx) => { render: (w: number) => string[] }
+    )({}, slotTheme, ctx)
+      .render(40)
+      .join("\n");
+    expect(call).toContain("TodoWrite"); // Pi createCallFallback parity (bold title)
+
+    const renderRes = wrapped.renderResult as (
+      r: unknown,
+      o: unknown,
+      t: unknown,
+      c: RenderCtx,
+    ) => { render: (w: number) => string[] };
+
+    // CRLF payload: getTextOutput parity removes EVERY \r (not sanitizeProgressText,
+    // which keeps it) so a bare \r can't return the cursor to col 0 and corrupt the row.
+    const crlf = renderRes(
+      { content: [{ type: "text", text: "line-a\r\nline-b\rTAIL" }] },
+      {},
+      slotTheme,
+      ctx,
+    )
+      .render(80)
+      .join("\n");
+    expect(crlf).toContain("line-a");
+    expect(crlf).toContain("line-b");
+    expect(crlf.includes("\r")).toBe(false);
+
+    // Image block with no text → the [image …] fallback indicator is appended
+    // (a naive text-parts join would emit nothing).
+    const img = renderRes(
+      { content: [{ type: "image", data: "Zm9v", mimeType: "image/png" }] },
+      {},
+      slotTheme,
+      ctx,
+    )
+      .render(80)
+      .join("\n");
+    expect(img).toContain("Image");
+  });
+
+  it("TaskStop (renderer-less, new block): self-shell flag, generic title, bg applied, no blank first/last, execute passthrough", () => {
+    const execute = async () => ({ content: [] });
+    const tool = { name: "TaskStop", execute };
+    const wrapped = wrapForSelfShell(tool);
+    expect(wrapped.renderShell).toBe("self");
+    expect(wrapped.execute).toBe(execute); // execute passes through untouched
+    const ctx: RenderCtx = { isPartial: false, isError: false };
+    const call = (
+      wrapped.renderCall as (a: unknown, t: unknown, c: RenderCtx) => { render: (w: number) => string[] }
+    )({}, slotTheme, ctx).render(40);
+    expect(call.length).toBe(1);
+    expect(call[0]).toContain("TaskStop");
+    expect(call[0]).toContain(slotMarker("toolSuccessBg"));
+    expect(tuiVisibleWidth(call[0]!)).toBe(40); // padded — not a blank line
   });
 });
