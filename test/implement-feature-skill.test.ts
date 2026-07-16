@@ -442,3 +442,92 @@ describe("evidence-grounded evaluation wiring (F23 t04)", () => {
     expect(body).toContain("choose per _presented_ finding");
   });
 });
+
+describe("incoming-ticket evaluation preflight (#50 t04)", () => {
+  // Loose, whitespace-collapsed, case-insensitive structural floors for the Phase 0 preflight
+  // (redirect free text unread -> evaluator -> approve -> hydrate) and the resume isolation. The
+  // true runtime no-write / no-raw-ingest guarantees are live-eval concerns; the assertable surface
+  // is the documented command shape + the cross-skill reuse-by-reference links.
+  const read = (relative: string): string =>
+    fs.readFileSync(path.join(SKILL_DIR, relative), "utf8").replace(/\r\n/g, "\n");
+  const collapse = (relative: string): string => read(relative).toLowerCase().replace(/\s+/g, " ");
+  // A second collapse that also strips backticks, so a revert to a backticked variant of a
+  // forbidden phrase (e.g. "scan the cached issue `comments`") is still caught.
+  const collapseNoTicks = (relative: string): string => collapse(relative).replace(/`/g, "");
+
+  it("Phase 0 router splits into a trusted structured query (no free text) + an unread redirect + evaluator-before-hydrate", () => {
+    const body = collapse("SKILL.md");
+    // The trusted reachability query resolves only structured fields via --jq — it must NOT carry
+    // the old all-fields form that pulled title/body/comments into the coordinator's context.
+    expect(body).toContain("ispr:(.pull_request!=null)");
+    expect(body).not.toContain("number,title,body,labels,state,url,comments");
+    // Structural guard (not just the old exact string): isolate the trusted `gh api … --jq '{…}'`
+    // reachability query and assert THAT projection carries no free-text field token. A regression
+    // that reintroduces free text on the trusted side in ANOTHER shape (e.g. `--json title`, or a new
+    // `body:.body` in the jq) reddens here, where the old exact-string guard alone would let it pass.
+    const apiStart = body.indexOf("gh api repos");
+    expect(apiStart, "missing trusted reachability query").toBeGreaterThanOrEqual(0);
+    const jqEnd = body.indexOf("}'", apiStart);
+    expect(jqEnd, "missing --jq structured projection").toBeGreaterThan(apiStart);
+    const trustedQuery = body.slice(apiStart, jqEnd + 2);
+    for (const freeText of ["title", "body", "comments"]) {
+      expect(trustedQuery, `trusted reachability query leaks free text: ${freeText}`).not.toContain(
+        freeText,
+      );
+    }
+    // The untrusted free text is redirected to a tempfile the coordinator does not read.
+    expect(body).toContain("title,body,comments > <tempfile>");
+    expect(body).toContain("bash tool");
+    // The evaluator is dispatched BEFORE any free-text hydration.
+    const evalIdx = body.indexOf("evaluator");
+    const hydrateIdx = body.indexOf("hydrat");
+    expect(evalIdx, "missing evaluator dispatch").toBeGreaterThanOrEqual(0);
+    expect(hydrateIdx, "missing hydrate step").toBeGreaterThan(evalIdx);
+    // Free text is cached only post-approval, not at Phase 0.
+    expect(body).toContain("post-approval");
+  });
+
+  it("Rule 9 (ticket-integration.md) is the metadata-only --jq html_url scan, not a cached-comments read", () => {
+    const body = collapseNoTicks("references/ticket-integration.md");
+    // Metadata-only form present, keyed on the hand-off opener (not the generic trailer).
+    expect(body).toContain("html_url");
+    expect(body).toContain("## what was built for #<n>");
+    // The old cached-comments scan must be gone (backtick-insensitive, so a `comments` revert fails too).
+    expect(body).not.toContain("scan the cached issue comments");
+  });
+
+  it("resume re-hydrate (ticket-creation.md) never re-ingests raw comments; the single-rule wording has no contradiction", () => {
+    const body = collapse("references/ticket-creation.md");
+    // The single rule: no raw comments on resume; body via feature.md or the screen.
+    expect(body).toContain("no raw `comments` on resume");
+    expect(body).toContain("frozen what/why");
+    // The re-fetch is structured-metadata-only, and the old all-fields read is gone.
+    expect(body).not.toContain("number,title,body,labels,state,url,comments");
+  });
+
+  it("resolves the cross-skill evaluate/evaluator links the preflight adds (wrong-form/broken link fails the suite)", () => {
+    const refFiles = fs.readdirSync(REFERENCES_DIR).filter((n) => n.endsWith(".md"));
+    const linkRe =
+      /\((\.\.\/\.\.\/evaluate\/references\/[A-Za-z0-9_-]+\.md|\.\.\/\.\.\/\.\.\/agents\/[A-Za-z0-9_-]+\.md)\)/g;
+    const seen = new Set<string>();
+    for (const name of refFiles) {
+      const text = fs.readFileSync(path.join(REFERENCES_DIR, name), "utf8");
+      for (const m of text.matchAll(linkRe)) {
+        const rel = m[1]!;
+        seen.add(rel);
+        expect(fs.existsSync(path.resolve(REFERENCES_DIR, rel)), `${name} -> ${rel}`).toBe(true);
+      }
+      // The repo-root `.claude/agents/…` form would NOT resolve from a references/*.md file.
+      expect(text, name).not.toContain("](.claude/agents/");
+    }
+    // The four load-bearing preflight anchors must each ship in reference prose.
+    for (const req of [
+      "../../evaluate/references/issue-eval.md",
+      "../../evaluate/references/write-discipline.md",
+      "../../../agents/evaluator.md",
+      "../../evaluate/references/proposal-gate.md",
+    ]) {
+      expect(seen.has(req), `missing cross-link: ${req}`).toBe(true);
+    }
+  });
+});
