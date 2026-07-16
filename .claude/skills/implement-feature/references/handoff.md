@@ -11,8 +11,7 @@ writes and tell the user.
 > *posted* by `gh` as described in this file. On the **fork** path they are handed to the user
 > *paste-ready* (nothing is auto-posted); the fork path also chooses the top linking line by where the
 > resolved issue lives (a plain `Closes #N` is unsafe cross-repo). That fork-specific delivery and
-> linking discipline live in [fork.md](fork.md) (Phase 9 — fork hand-off); this file's maintainer
-> procedure is unchanged.
+> linking discipline live in [fork.md](fork.md) (Phase 9 — fork hand-off).
 
 1. If a remote exists: `git fetch <pushRemote>`. If `<pushRemote>/<default>` moved, merge it into the feature branch, resolve conflicts, and verify typecheck + full suite are green again. **Immediately before every push**, fetch `<pushRemote>` again and inspect the exact fetched ref plus all case-fold-equivalent siblings for `feature/<feature-slug>`.
    - **First push:** an absent exact ref with no case-fold sibling is available for `git push -u <pushRemote> feature/<feature-slug>`.
@@ -66,7 +65,7 @@ writes and tell the user.
 2. **CI check (when possible).** Local green isn't the same as CI green — CI runs on Linux too and has caught environment-only failures before. If the `gh` CLI is available and authenticated (`gh auth status`), watch the pushed branch's run (`gh run list --branch feature/<feature-slug>`, then `gh run watch <id> --exit-status`) and treat a red run like any test failure: investigate the logs (`gh run view <id> --log-failed`), fix, push again. If `gh` is not available, don't block — note prominently in the final summary that CI on the Actions tab must be green before merging.
 3. ExitWorktree with `action: keep` — the worktree must survive until the user has merged.
 4. Final summary to the user: what was implemented (per feature.md), notable decisions and deviations, test status, and next steps — which differ by path. **Heads-up before the cleanup below:** `git worktree remove` permanently deletes the run's plan folder, `review.md`, and `observations.md` — they were worktree-local and never committed, so anything worth keeping should already have been filed as a GitHub Issue at close (Phase 8). **These two next-steps bullets are the maintainer (non-fork) paths only; on the fork path neither is true (a fork run has no auto-opened PR), so [fork.md](fork.md) (Phase 9 — fork hand-off) step 4 replaces them with the compare-URL + paste-ready hand-off.**
-   - **Ticketless path (unchanged):** print the stable copyable PR title `<Title>` on its own line; review the branch, open a Pull Request on GitHub (or merge locally if no remote) with that title, use "Delete branch" there after merging, and clean up locally afterwards with:
+   - **Ticketless path:** print the stable copyable PR title `<Title>` on its own line; review the branch, open a Pull Request on GitHub (or merge locally if no remote) with that title, use "Delete branch" there after merging, and clean up locally afterwards with:
      - `git worktree remove <worktree-path>`
      - `git branch -d feature/<feature-slug>` (plus the harness-created `worktree-*` branch for that worktree, if one lingers)
    - **Ticket path:** the ready-for-review PR is **already open** (link it) and the ticket carries the single hand-off comment — review the PR by verifying the change in the running app (the PR body's "Start your review here" walks you through it), merge it via GitHub's PR UI, use "Delete branch" there after merging, and clean up locally afterwards with the same two commands above.

@@ -7,8 +7,7 @@ If this file cannot be read, refuse all public writes and tell the user — neve
 unloaded. The reachability & preconditions gate itself stays resident in the router.
 
 The **ticket-linked** hooks in this section run **only when `$ARGUMENTS` carries a ticket ref** — with
-an empty `$ARGUMENTS` none of them apply and every phase below behaves as it did before this path
-existed (save the one path-independent hook noted just below): Phase 1 (scoped direction +
+an empty `$ARGUMENTS` none of them apply (save the one path-independent hook noted just below): Phase 1 (scoped direction +
 write-contract), Phase 8 (close-vs-keep-open + write preview)
 and Phase 9 (auto-PR + issue comment) all defer to the gate and the discipline rules here. One
 close-time hook is **path-independent**: the optional *issue-filing offer* (Phase 8) may also run on the

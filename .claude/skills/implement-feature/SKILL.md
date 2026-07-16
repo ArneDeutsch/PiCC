@@ -23,7 +23,7 @@ This router is the always-loaded trunk: principles, roster, reachability gate, t
 - **Direction before proposal.** Ask for direction first; don't open with a fleshed-out plan the user must argue against.
 - **You own every commit.** Subagents never run `git commit` or `git push` — relay this verbatim into every write-access dispatch. You commit at defined points with the grammar below.
 - **Late decisions.** Decide in the plan only what tasks need to compose (seams, interfaces, ordering); leave the rest to the implementer, marked explicitly as left open.
-- **No status bookkeeping.** State = the git log + the on-disk plan folder. **Classify resume before new naming.** Validate its frozen title against the on-disk `feature.md` heading; require exact feature/review-heading agreement (task/fix: slug prefix only), then show it verbatim at explicit human confirmation of scope/phase/identity/ticket/writes and fresh anchor-target agreement. Legacy resumes use workflow-detail's complete override. Detail: [references/workflow-detail.md](references/workflow-detail.md). **Anchor reader:** before create-offer, read `feature.md`'s `Ticket:` — blank/placeholder → offer; valid sanitized ref → ticket path, re-resolve identities/cache. Detail: [references/ticket-creation.md](references/ticket-creation.md).
+- **No status bookkeeping.** State = the git log + the on-disk plan folder. **Classify resume before new naming.** Validate its frozen title against the on-disk `feature.md` heading; require exact feature/review-heading agreement (task/fix: slug prefix only), then show it verbatim at explicit human confirmation of scope/phase/identity/ticket/writes and fresh anchor-target agreement. Detail: [references/workflow-detail.md](references/workflow-detail.md). **Anchor reader:** before create-offer, read `feature.md`'s `Ticket:` — blank/placeholder → offer; valid sanitized ref → ticket path, re-resolve identities/cache. Detail: [references/ticket-creation.md](references/ticket-creation.md).
 - **Structural escalation boundary.** A gap inside the current task's own spec → adapt it and continue. Anything touching another task's contract, the feature scope, or the WHAT/WHY → stop and ask the user.
 - **Observe while you build.** Capture friction, planning errors, latent bugs, refactoring and process weaknesses as they appear (implementers in task logs, you in `observations.md`), surface major ones immediately, and distill everything into `review.md` at close.
 - **Verify claims.** When reports conflict or a claim is load-bearing, read the code yourself before acting.
@@ -82,9 +82,9 @@ Then read `state`: if the issue is **closed**, warn and ask before proceeding �
 
 Two orthogonal axes govern a run — **ticket presence** (given / created via the Phase 1 offer / none) and **checkout kind** (**maintainer** = the checkout *is* `target`; **fork** = a fork of `target`, resolved at Phase 0). Route per cell; a *created* ticket reaches a ticket cell via the offer, and per-cell detail lives in the phase skeletons below:
 
-- **maintainer + no ticket** — today's plain ticketless flow + the Phase 1 create-offer after the scope mirror; on decline, byte-for-byte as today.
-- **maintainer + ticket** (given or created) — the ticket path: auto-PR + one hand-off comment, hand-off unchanged.
-- **fork + no ticket** — **not** "unchanged": the fork disclosure fires at Phase 1 and hand-off pushes to the fork + a compare URL + paste-ready PR (the create-offer, if accepted, files on `target`).
+- **maintainer + no ticket** — the plain ticketless flow, plus the Phase 1 create-offer after the scope mirror.
+- **maintainer + ticket** (given or created) — the ticket path: auto-PR + one hand-off comment.
+- **fork + no ticket** — the fork disclosure fires at Phase 1; hand-off pushes to the fork with a compare URL + paste-ready PR (the create-offer, if accepted, files on `target`).
 - **fork + ticket** — the same fork hand-off; issue reads/writes use `--repo <target>`, the branch pushes to the fork, the PR + comment are paste-ready — the only automatic write is the fork push.
 
 ## Phase 1 — Direction (WHAT / WHY)
