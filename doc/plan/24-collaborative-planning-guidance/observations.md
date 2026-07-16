@@ -16,3 +16,12 @@ Running record of friction / bugs / opportunities (Phase 7). Raw material for
 - 2026-07-16 (t01) — The shipped nudge sits ~117 words, three under the 120
   ceiling. Any future wording edit must re-run the budget test — thin margin by
   design (it's an anti-bloat guard), but worth flagging in `review.md`.
+- 2026-07-16 (t02) — The registry/docs described the nudge as "discuss only
+  goals/preferences/tradeoffs" while the shipped nudge says "ask only about" —
+  human-facing paraphrase drifted slightly from the model-facing source. Fixed to
+  match verbatim. Process note: when a capability note paraphrases a shipped prompt
+  string, quote the prompt's own verb rather than a synonym.
+- 2026-07-16 (t02) — F19 (`feature.commit-message-guidance`) was an exact,
+  reusable precedent for this whole task (registry entry shape, generated-matrix
+  regen, CHANGELOG idiom, user-guide steering note). Having a near-identical prior
+  feature made the docs work mechanical and low-risk.
