@@ -77,6 +77,33 @@ Raw material for `review.md`.
   so a task can only be committed once the *other* concurrent task's edits are also
   green — must wait for both to settle before selective-staging a commit.
 
+- 2026-07-16: t04 (runtime discoverability) landed; implementer respected the
+  writable-surface boundary well — kept the "exceeds the configured maximum"
+  substring in the reworded guard error to avoid breaking a t01-owned test outside
+  its surface. coder + UX both PASS; the discoverability gap is closed for the
+  /doctor and guard-error paths. Coordinator applied three truthfulness fixes:
+  guarded the default posture branch on `maxDepth === 1` + a truthful out-of-range
+  fallback (was hardcoding "=1, PiCC default" for odd values like 0/1.5);
+  "level(s)" → "levels"; disabled line now names the `disableSubagents` alias too.
+  Added an out-of-range (maxDepth 0) doctor test.
+- 2026-07-16: TWO residual discoverability items deliberately NOT taken in-scope
+  (both beyond the two user-agreed signals — surface at close / candidate
+  follow-ups):
+  1. **Startup-notice routing gap (UX SHOULD).** The main-session-only default is a
+     tier-`full` capability, so it never adds to `degradedCount` and the startup
+     compat notice never fires for it — nothing automatically routes a
+     flatten-surprised user to `/doctor`. The always-present `/doctor` line + guard
+     error only help users who reach those paths on their own. Closing this would
+     need a new always-present startup hint mechanism (compat-report gating change),
+     which is a design decision beyond the agreed scope.
+  2. **Guard-error remedy "2..5" (UX NIT).** When `maxDepth` is already raised
+     (e.g. 2) and a still-deeper dispatch is refused, "raise to 2..5" names a lower
+     bound that wouldn't help. Optimal for the common default (M=1); mildly
+     imprecise for the rare already-raised case. Left as-is.
+- 2026-07-16: `doc/plan/picc-plan.md:201` roadmap line still calls recursive
+  subagents "full support" with no off-by-default note (docs reviewer, out of every
+  task's writable surface) — candidate follow-up.
+
 ## Open escalation (raised to user at Phase 6)
 
 - 2026-07-16: **UX discoverability gap.** The default flip is a *silent* behavior

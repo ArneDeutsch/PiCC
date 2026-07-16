@@ -893,7 +893,7 @@ export class SubagentRuntime {
         agentId,
         resumable: false,
         agentName: agent.name,
-        error: `Subagent nesting depth ${opts.depth} exceeds the configured maximum of ${this.deps.maxDepth}.`,
+        error: `Subagent nesting depth ${opts.depth} exceeds the configured maximum (subagents.maxDepth) of ${this.deps.maxDepth}. Raise subagents.maxDepth to 2..5 in .claude/settings.json to allow nested delegation.`,
         diagnostics,
       };
     }

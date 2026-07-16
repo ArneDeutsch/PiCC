@@ -960,6 +960,39 @@ describe("renderDoctorReport", () => {
     expect(doctor).toContain("Unassessed: none.");
     expect(doctor).toContain(CLAUDE_BASELINE);
   });
+
+  it("shows a main-session-only subagent posture line at the default maxDepth of 1", () => {
+    const project = makeProject({ settings: makeSettings({ subagentMaxDepth: 1 }) });
+    const doctor = renderDoctorReport(project, buildCompatReport(project));
+    expect(doctor).toContain("Subagent nesting: main-session-only");
+    expect(doctor).toContain("subagents.maxDepth=1");
+    expect(doctor).toContain("PiCC default");
+    expect(doctor).toContain("2..5");
+  });
+
+  it("reflects a raised subagents.maxDepth in the posture line", () => {
+    const project = makeProject({ settings: makeSettings({ subagentMaxDepth: 3 }) });
+    const doctor = renderDoctorReport(project, buildCompatReport(project));
+    expect(doctor).toContain("Subagent nesting: up to 3 levels below the main session");
+    expect(doctor).toContain("subagents.maxDepth=3");
+    expect(doctor).not.toContain("main-session-only");
+  });
+
+  it("reports an out-of-range subagents.maxDepth truthfully, not as the default", () => {
+    const project = makeProject({ settings: makeSettings({ subagentMaxDepth: 0 }) });
+    const doctor = renderDoctorReport(project, buildCompatReport(project));
+    expect(doctor).toContain("subagents.maxDepth=0");
+    // must NOT mislabel a non-1 value as the default
+    expect(doctor).not.toContain("subagents.maxDepth=1, PiCC default");
+    expect(doctor).not.toContain("Subagent nesting: main-session-only");
+  });
+
+  it("shows a disabled posture line when subagent dispatch is off", () => {
+    const project = makeProject({ settings: makeSettings({ subagentsEnabled: false }) });
+    const doctor = renderDoctorReport(project, buildCompatReport(project));
+    expect(doctor).toContain("Subagent nesting: subagent dispatch disabled");
+    expect(doctor).toContain("subagents.enabled=false");
+  });
 });
 
 // ---------------------------------------------------------------------------
