@@ -906,3 +906,86 @@ describe("write-discipline points at the element-7 anchor re-validation (F23 clo
     expect(body).toContain("this is a pointer, not a restatement");
   });
 });
+
+describe("locked bounded reviewer return + fail-safe parse (evaluate-scoring-contract t02)", () => {
+  // Loose, case-insensitive, whitespace-collapsed structural checks (handles CRLF).
+  // These pin the t02 contract: ONE locked bounded reviewer return shape defined in the
+  // engine (four parts, same shape regardless of role), a provenance-marker slot bound to
+  // the justification field (enum owned by t03), a conservative coordinator fail-safe parse
+  // for non-conforming returns, the three modes pointing at the engine schema, and the
+  // evaluator agent's return contract (bullet 1) referencing it. We do NOT test LLM
+  // judgment. All pinned phrases here are ASCII, so no String.fromCodePoint build is needed.
+  const collapse = (p: string): string =>
+    fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
+
+  const ENGINE_PATH = path.join(REFERENCES_DIR, "evaluation-engine.md");
+  const ISSUE_EVAL_PATH = path.join(REFERENCES_DIR, "issue-eval.md");
+  const PR_EVAL_PATH = path.join(REFERENCES_DIR, "pr-eval.md");
+  const PROPOSAL_GATE_PATH = path.join(REFERENCES_DIR, "proposal-gate.md");
+  const EVALUATOR_PATH = path.join(AGENTS_DIR, "evaluator.md");
+
+  it("defines one locked bounded reviewer return in the engine, same shape regardless of rating role", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("the locked bounded reviewer return");
+    // Same fixed shape across every rating lens (the L1 screen is excluded — it has its
+    // own single-enum-token shape, not this four-part return).
+    expect(body).toContain("one fixed shape, regardless of rating role");
+    expect(body).toContain("same four-part bounded shape");
+    // The single binding source; modes point at it rather than re-triplicating.
+    expect(body).toContain("single, binding source");
+    expect(body).toContain("do not re-triplicate the field list");
+  });
+
+  it("enumerates the four bounded parts of the locked schema", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("per-criterion ratings");
+    expect(body).toContain("a short justification per load-bearing rating");
+    expect(body).toContain("an overall verdict");
+    expect(body).toContain("a capped anchor list");
+  });
+
+  it("is a portable prose template, not a runtime-validated structure", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("portable prose rendering template, not a validated structure");
+    expect(body).toContain("plain text");
+    expect(body).toContain("never a runtime-enforced contract");
+  });
+
+  it("binds a provenance-marker slot to the justification field (enum owned by t03)", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("each load-bearing justification carries a provenance marker");
+    // The slot is bound to the justification field, not left anchor-only.
+    expect(body).toContain("this slot is bound to the justification field");
+    // t02 opens the slot; t03 defines the enum vocabulary (forward reference).
+    expect(body).toContain("t02 opens this slot");
+    expect(body).toContain("defined by t03");
+  });
+
+  it("specifies a conservative coordinator fail-safe parse mirroring the L1 UNSURE fail-safe", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("fail-safe parse");
+    expect(body).toContain("mirroring the l1 screen's strict parse");
+    // A non-conforming return biases to keep-open / not independently verified.
+    expect(body).toContain("downgrades toward the conservative outcome");
+    expect(body).toContain("not independently verified");
+    expect(body).toContain("biases to keep-open");
+    // The fail-safe is the load-bearing control, not the advisory template.
+    expect(body).toContain("this fail-safe is the load-bearing control");
+  });
+
+  it("all three modes point at the engine's locked bounded reviewer return", () => {
+    for (const p of [ISSUE_EVAL_PATH, PR_EVAL_PATH, PROPOSAL_GATE_PATH]) {
+      const body = collapse(p);
+      expect(body).toContain("the locked bounded reviewer return");
+    }
+  });
+
+  it("the evaluator agent return contract (bullet 1) references the locked schema", () => {
+    const body = collapse(EVALUATOR_PATH);
+    expect(body).toContain("locked bounded reviewer return");
+    // The rating-dispatch shape points at the engine's schema section. Pin the contract,
+    // not the bold markers, so a formatting tweak does not redden this.
+    expect(body).toContain("rating dispatch");
+    expect(body).toContain("that shape is the engine's");
+  });
+});

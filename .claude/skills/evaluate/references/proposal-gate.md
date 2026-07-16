@@ -56,9 +56,13 @@ filesystem-only evaluator does not query.
 
 The `evaluator` has unrestricted `Read` (it can see `~/.pi` / `.env`), and its return is embedded into
 a body that may be filed publicly. So — exactly as issue-eval's keep-open and pr-eval's assessment do
-— **constrain the evaluator's returned shape to bounded structured fields, not free-form prose**:
+— the evaluator returns the engine's **locked bounded reviewer return** (defined once in
+`evaluation-engine.md` §"The locked bounded reviewer return"), not free-form prose. Sized to the gate,
+its **four fixed parts** — per-criterion scores, a short justification per row, the overall importance
+verdict, and bounded evidence anchors — render as:
 
-- **per-criterion scores** (the seven rubric rows) + a **short bounded justification** per row,
+- **per-criterion scores** (the seven rubric rows) + a **short bounded justification** per row, each
+  carrying the provenance marker the engine's locked schema binds to the justification field,
 - an **overall importance verdict** integrating cost-vs-benefit into the disposition
   (drop / surface for the gate use; annotate for Phase 1), and
 - **bounded evidence anchors** — the repo-relative, bounded locators the score rests on, in the engine's

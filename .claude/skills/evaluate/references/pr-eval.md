@@ -246,10 +246,13 @@ comment**, composed exactly as issue-eval's keep-open comment is — the same se
 can see `~/.pi` / `.env`). If a successful injection made it encode a secret into a free-text
 assessment, pasting that verbatim into a public comment would leak it. So:
 
-- The `evaluator` returns a **bounded structured assessment** — per-criterion scores + short
-  justification fields, the fulfilment classification, the CI/verification findings, its **bounded
-  evidence anchors** (repo-relative locators, per the engine contract), and the
-  `ready | needs-work | hold` verdict — **not** free-form prose.
+- The `evaluator` returns the engine's **locked bounded reviewer return** (defined once in
+  `evaluation-engine.md` §"The locked bounded reviewer return" — this mode points at it and does not
+  re-triplicate the field list), sized to this mode and **not** free-form prose: the four fixed parts —
+  per-criterion ratings (incl. the PR-specific rows) + a provenance-marked short justification per row +
+  the overall verdict (here the `ready | needs-work | hold` readiness) + its **bounded evidence anchors**
+  (repo-relative locators, per the engine contract) — plus the mode-specific fulfilment classification
+  and CI/verification findings.
 - The **coordinator composes** the posted comment from those structured fields, **paraphrasing in its
   own words** and applying leakage-stripping (no tokens/env/`~/.pi`/absolute local paths, no raw diff
   bytes). It **never pastes the evaluator's returned text verbatim**, and uses **no verbatim excerpt of

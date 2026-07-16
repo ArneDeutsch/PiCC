@@ -196,6 +196,45 @@ metadata it *can* see, and integrates the score. The two guarantees are **not** 
   UTF-8), never a PowerShell `>` redirect (UTF-16LE-with-BOM → the shell-free evaluator, which consumes
   the file via the Read tool, reads mojibake); see [write-discipline.md](write-discipline.md).
 
+### The locked bounded reviewer return
+
+Those **bounded returns** are not free-form: every **rating** lens returns **one fixed shape, regardless
+of rating role**. proposal-gate's single scorer and every grounded lens (roaster, pro-advocate,
+con-advocate, and any security / blast-radius / coder lens) all return the **same four-part bounded
+shape**, sized to the mode — never free-form prose. (The **L1 screen** is *not* a rating lens: it has
+its own fixed shape — **exactly one enum token** per §"L1 maliciousness screen" above — not this
+four-part return.) This is the **single, binding source** for that rating shape; the mode references
+(issue-eval, pr-eval, proposal-gate) point at it and do not re-triplicate the field list.
+
+**It is a portable prose rendering template, not a validated structure.** PiCC and Claude Code both
+return a subagent's final message as **plain text** — there is no structured-output / JSON-validated
+return channel. So the "locked schema" is a low-ambiguity *return template* (like the canonical block)
+plus a **coordinator-side fail-safe parse**, never a runtime-enforced contract. The four parts:
+
+1. **Per-criterion ratings** — one row per criterion the dispatch named: the seven magnitude rubric
+   rows on the locked `none / low / moderate / high / very-high` vocabulary (plus any mode-specific
+   rows), each on the canonical block's direction-marked scale.
+2. **A short justification per load-bearing rating** — one or two sentences, in the reviewer's own
+   words, never a target excerpt. **Each load-bearing justification carries a provenance marker** that
+   states where its claim came from — this slot is bound to the justification field (not left
+   anchor-only), because the justification is exactly where an unverified `target_claim` can masquerade
+   as verified fact, the hazard this engine exists to close. **t02 opens this slot; the marker's
+   vocabulary — the closed provenance enum and its render — is defined by t03.**
+3. **An overall verdict** — the one-line integrated importance verdict (cost-vs-benefit integrated into
+   a keep-open / close / drop / annotate disposition), as the canonical block's overall-importance line.
+4. **A capped anchor list** — the bounded, repo-relative evidence anchors (0–5), exactly the
+   `**Evidence:**` shape of *The evidence-anchor contract* above; never a target excerpt, never over 5.
+
+**Fail-safe parse — a non-conforming return biases toward keep-open.** The locked shape is a template,
+not a guarantee: a reviewer may drift (GPT phrasing wander, Claude over-elaboration) and return
+something that does not cleanly parse into the four parts. **Mirroring the L1 screen's strict parse**
+(any deviation from an exact single token → `UNSURE`), when a reviewer return is malformed, ambiguous,
+or missing a part, the coordinator **downgrades toward the conservative outcome** — it treats the
+unparseable rating as **not independently verified** and **biases to keep-open**, never silently reading
+a garbled return as a confident verdict or a confident close. An absent or unparseable provenance marker
+is read as *not verified*, never as verified. This fail-safe is the load-bearing control here — the
+template is advisory, the conservative parse is what actually holds.
+
 ## Canonical rating / assessment block
 
 The engine **owns** the shared block skeleton so issue-eval, pr-eval, and proposal-gate all render one

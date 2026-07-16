@@ -181,8 +181,11 @@ comment.
 can see `~/.pi` / `.env`). If a successful injection made it encode a secret into a free-text "rating",
 pasting that verbatim into a public comment would leak it. So:
 
-- The `evaluator` returns a **bounded structured rating** — per-criterion scores + short justification
-  fields + an importance verdict + **bounded evidence anchors** — **not** free-form prose.
+- The `evaluator` returns the engine's **locked bounded reviewer return** (defined once in
+  `evaluation-engine.md` §"The locked bounded reviewer return" — this mode points at it and does not
+  re-triplicate the field list), **not** free-form prose. Here the overall verdict is the **keep-open
+  importance** verdict, and the anchor part is the mode's **bounded evidence anchors**; the engine owns
+  the rest of the field list.
 - The **coordinator composes** the posted comment from those structured fields, **paraphrasing in its
   own words** and applying leakage-stripping (no tokens/env/`~/.pi`/absolute local paths). It **never
   pastes the evaluator's returned text verbatim**, and uses **no verbatim excerpt of target content**

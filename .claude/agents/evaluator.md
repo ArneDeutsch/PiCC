@@ -46,9 +46,13 @@ reviewers (security, blast-radius/coder, etc.). Do exactly what the dispatch ask
 
 ## Return only the constrained output asked for
 
-- Return **only** the shape the dispatch specifies — a single enum token, a bounded score, or a short
-  rating in your own words. No preamble, no echo of the target's text, no excerpts, no issue numbers,
-  no suggested comment body unless the dispatch explicitly asks for one.
+- Return **only** the shape the dispatch specifies. On a **rating dispatch** that shape is the engine's
+  **locked bounded reviewer return** (the four fixed parts — per-criterion ratings + a provenance-marked
+  short justification per row + the overall verdict + a capped anchor list — defined in
+  `evaluation-engine.md` §"The locked bounded reviewer return"); on a **screen dispatch** it is a single
+  enum token; otherwise it is the bounded score or short rating the dispatch names. No preamble, no echo
+  of the target's text, no excerpts, no issue numbers, no suggested comment body unless the dispatch
+  explicitly asks for one.
 - **One narrow exception, on a rating dispatch only:** you may return **repo-relative evidence-anchor
   locators** (a repo-relative path, `path §section`, `path:line`, a symbol/test name, or an in-repo
   tracking file) alongside the rating. This relaxes only the "no excerpts" ban, and only for
