@@ -101,7 +101,7 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
   `before_agent_start`: the Claude-compat conventions block, a **main-session-only** `## Working
   with the user` interaction posture (#69; gated by `includeInteractionPosture`, so dispatched
   subagents omit it), root CLAUDE.md, auto memory, unconditional rules, budgeted skill listing,
-  agent catalog, steering text, rendered active-skill bodies, and — when a per-session scratch dir
+  agent catalog, rendered active-skill bodies, steering text, and — when a per-session scratch dir
   was created — a `buildScratchpadSection` block naming the native-safe scratchpad path and steering
   temp files there instead of `/tmp` (#48; the Windows namespace note is gated on
   `windowsTempNote`). Because the system prompt is rebuilt each turn and never compacted away,
