@@ -6,6 +6,18 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — "verbatim final message" contract documented accurately (2026-07-16)
+
+- The capability registry and design docs claimed a subagent's final message is returned "verbatim
+  (no wrapper)." That was inaccurate for **resumable** dispatches, which append a clearly-delimited
+  in-band identity/resume trailer to the model-visible text (faithful to Claude Code, which appends
+  the same kind of resume handle to resumable subagent results; the human TUI strips it). The docs now state
+  the real contract — verbatim for non-resumable/one-shot dispatches, verbatim plus the delimited
+  identity trailer for resumable ones — so an exact-token / JSON / YAML consumer knows the shape.
+  **Behavior is unchanged**: this is a documentation-truthfulness fix (a downsize of #46; the proposed
+  separate identity channel was deliberately not built — rationale in
+  `doc/plan/26-verbatim-contract-docs/feature.md`).
+
 ### Changed — description-based feature naming (2026-07-15)
 
 - **Future `implement-feature` runs use one concise descriptive slug instead of allocating a global
