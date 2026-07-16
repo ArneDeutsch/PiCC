@@ -46,11 +46,11 @@ a live grounded run is manual — consistent with the maintainer running evals s
 
 ## Improvement opportunities
 
-- **`write-discipline.md` is silent on the new anchor egress.** Its mechanic-3 leakage-strip
-  is exactly the "existing per-criterion leakage-strip" the engine now declares *strictly
-  weaker* than the element-7 anchor re-validation. Each consuming mode independently specifies
-  element-7, so this is belt-and-suspenders, not a functional gap — but a one-clause pointer in
-  the central write-mechanics reference would prevent future drift.
+- **`write-discipline.md` anchor-egress silence — RESOLVED at close.** Its mechanic-3
+  leakage-strip was the "existing per-criterion leakage-strip" the engine declares *strictly
+  weaker* than element-7. This was folded in during the close: mechanic 3 now carries a
+  one-clause pointer to the authoritative engine element-7 (a pointer, not a restatement), with
+  a content-assertion pin. Graded SURFACE by the grounded proposal-gate before folding.
 - **Pre-existing task-ID reference in shipped prose:** `evaluation-engine.md` retains a
   pre-F23 "proposal-gate uses a lighter form — see t04" style reference (planning-artifact
   leak). The F23-introduced one was genericized at close; the pre-existing one is out of scope
@@ -61,9 +61,9 @@ a live grounded run is manual — consistent with the maintainer running evals s
 
 ## Proposed follow-ups
 
-- **Add an anchor-egress note to `write-discipline.md`** — one clause acknowledging that public
-  writes carrying evidence anchors get the stronger element-7 re-validation on top of the
-  mechanic-3 strip. Low effort, closes the one belt-and-suspenders gap.
+- ~~Add an anchor-egress note to `write-discipline.md`~~ — **DONE** at close (folded into this
+  branch; graded SURFACE by the grounded proposal-gate, which also served as a live dogfood —
+  its evidence anchors were independently verified line-accurate against the repo).
 - **Manual dogfood of the grounded proposal-gate** — run `/evaluate` (proposal-gate path) on a
   real candidate and confirm the evaluator actually reads source before rating and emits
   evidence anchors. This is the live half of #55's dogfood criterion; the maintainer runs evals

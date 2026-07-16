@@ -815,3 +815,19 @@ describe("evaluate deny floor (evaluate-skill t01)", () => {
     expect(isDenied("gh pr view 5 --repo owner/repo")).toBe(false);
   });
 });
+
+describe("write-discipline points at the element-7 anchor re-validation (F23 close-fix)", () => {
+  const collapse = (p: string): string =>
+    fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
+  const WRITE_DISCIPLINE_PATH = path.join(REFERENCES_DIR, "write-discipline.md");
+
+  it("the central write-mechanics reference acknowledges the anchor egress as a pointer to element-7", () => {
+    const body = collapse(WRITE_DISCIPLINE_PATH);
+    // Public writes carrying evidence anchors get the stronger element-7 check IN ADDITION TO
+    // the leakage-strip — pinned as a pointer (the engine remains authoritative), not a restatement.
+    expect(body).toContain("evidence anchors");
+    expect(body).toContain("engine element-7 anchor re-validation");
+    expect(body).toContain("in addition to");
+    expect(body).toContain("this is a pointer, not a restatement");
+  });
+});
