@@ -280,6 +280,32 @@ function expectNumber(
   return n;
 }
 
+/**
+ * Positive-integer validation mirroring expectNumber: accepts a value only as an
+ * integer >= 1 (reusing asFiniteNumber's string tolerance), IGNORING anything
+ * else (zero, negative, fractional, non-numeric) with a diagnostic — so a
+ * malformed value at a higher scope never overrides a valid lower-scope value.
+ * Reject-and-keep, never clamp: clamping a bad higher-scope value (e.g. 0 -> 1)
+ * would wrongly override a lower scope's explicit setting. No upper bound.
+ */
+function expectPositiveInt(
+  value: unknown,
+  keyLabel: string,
+  source: string,
+  diagnostics: Diagnostic[],
+): number | undefined {
+  const n = asFiniteNumber(value);
+  if (n === undefined || !Number.isInteger(n) || n < 1) {
+    diagnostics.push({
+      severity: "warning",
+      message: `Setting "${keyLabel}" must be a positive integer (>= 1); ignored`,
+      source,
+    });
+    return undefined;
+  }
+  return n;
+}
+
 function asBool(value: unknown): boolean | undefined {
   if (typeof value === "boolean") return value;
   if (typeof value === "number") return value !== 0;
@@ -485,12 +511,12 @@ function applySubagents(value: unknown, scope: Scope, source: string, out: Claud
         break;
       }
       case "maxDepth": {
-        const n = expectNumber(sub, "subagents.maxDepth", source, out.diagnostics);
+        const n = expectPositiveInt(sub, "subagents.maxDepth", source, out.diagnostics);
         if (n !== undefined) out.subagentMaxDepth = n;
         break;
       }
       case "concurrency": {
-        const n = expectNumber(sub, "subagents.concurrency", source, out.diagnostics);
+        const n = expectPositiveInt(sub, "subagents.concurrency", source, out.diagnostics);
         if (n !== undefined) out.subagentConcurrency = n;
         break;
       }
