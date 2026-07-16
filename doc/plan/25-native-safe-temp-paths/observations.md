@@ -101,3 +101,29 @@ review.md). Dated bullets, one line each.
   Read (the real #48 mode). It does not separately discriminate forward-slash vs backslash for
   *inline* redirects (the path is passed via argv, not shell-parsed) — acceptable: the
   deterministic form-regression lives in t01's pure table, per the plan's test split.
+
+## 2026-07-16 — Phase 8 (close review + t05 gap closure)
+
+- Close review (generalist/coder/tester/parity) surfaced two REAL gaps, both fixed in t05:
+  - **Subagents never received the scratchpad section** (only the main session did) — a
+    subagent writing its own temp file on Windows would reproduce #48, and it under-delivered
+    the "every session/parity" claim. Fixed: threaded scratchDir/windowsTempNote into
+    `buildSubagentSystemPrompt` (safe — harness data, not exfiltration-sensitive like the F16
+    fork case).
+  - **The index.ts computation/threading seam was untested** — dropping the call-site arg,
+    swapping the realpath→transform order, or reverting CLAUDE_CODE_TMPDIR all shipped green.
+    Fixed: extracted a pure `computeSessionScratchDir(io)` helper (injectable IO) + unit tests
+    that catch each regression on any host (the order-swap is invisible to a Linux-CI booted
+    test since the transform is a win32 no-op — so BOTH a booted wiring test and the pure
+    helper test were needed), verified RED-by-revert.
+- Refinements in t05: registry id kebab-cased (`feature.session-scratchpad`); gap (a) now names
+  the Windows forward-slash-vs-backslash divergence explicitly; predicate comment tightened
+  (only the false branch is injectable-testable off-Windows).
+- AC honesty: "verified by re-dogfooding" was aspirational — no live evaluate dogfood was run
+  (this session is Claude Code, not the PiCC/GPT harness). Reworded to cite t03 + the manual
+  reproduction as evidence and flag a live re-dogfood as a **post-merge smoke**.
+- NIT (accepted, pre-existing debt): the booted wiring test uses a fixed `setTimeout(200)` to
+  let async boot settle — mirrors the file's existing parent-guard idiom, not new flake.
+- Parity confirmed the final wording faithfully matches Claude's real scratchpad section
+  (imperative, escape hatch, literal path) and the registry entry is honest; CLAUDE_CODE_TMPDIR
+  honoring verified as real Claude 2.1.x behavior.

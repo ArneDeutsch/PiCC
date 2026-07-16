@@ -90,7 +90,11 @@ the first consumer and the regression witness.
   is injected only when the harness detects the shell↔native namespace mismatch.
 - `evaluate` works on Windows **without modification**: the injected scratchpad steers it
   off `/tmp`, so its redirected bodies/comments/diffs land in the native-safe scratch dir
-  and evaluators read them first attempt — verified by re-dogfooding. (Reframing #48's
+  and evaluators read them first attempt. Evidence: the mechanics are reproduced and the fix
+  proven at the tool layer (t03 exercises the real Git-Bash-write → native-Read handoff on
+  Windows, and the bug↔fix were manually reproduced during planning); a full live
+  `evaluate` re-dogfood on Windows is a **post-merge smoke** (not run in this session, which
+  runs under Claude Code, not the PiCC/GPT harness). (Reframing #48's
   skill-specific acceptance criteria: rather than adapt the skill to use a "safe path,"
   the harness makes the unmodified skill work — the more portable outcome. The ticket's
   temp-file *cleanup* criterion is handled at the harness/retention layer, deferred to #41,
@@ -114,6 +118,8 @@ the first consumer and the regression witness.
   attempt (the #48 acceptance witness) (depends on: t01)
 - t04 Capability registry scratchpad entry + `gen:capabilities` regen + contract docs +
   CHANGELOG (depends on: t02)
+- t05 Close-review gap closure — subagent scratchpad injection + index.ts wiring-seam test +
+  registry id/gap polish (depends on: t01, t02, t04)
 
 (The evaluate skill is intentionally **not** modified — see What/Acceptance. Transparent
 path translation, "approach B", was investigated and rejected — see Non-goals.)

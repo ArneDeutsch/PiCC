@@ -243,8 +243,11 @@ export function resolveGitBashPath(): string | undefined {
  * the harness withholds the Windows note there. Uses the cached `resolveGitBashPath`,
  * so it is free on the per-turn system-prompt hot path.
  *
- * `platform` is injectable (like `toNativeSafeTempForm`) so both branches are
- * unit-testable without faking the real OS.
+ * `platform` is injectable (like `toNativeSafeTempForm`), but only the FALSE branch
+ * is fully unit-testable without a real OS: passing a non-win32 `platform` short-circuits
+ * to false regardless of host. The TRUE branch also requires `resolveGitBashPath()` to
+ * find a pinned Git Bash, and that reads the real `process.platform` (win32) — so the
+ * true branch is only reachable on an actual win32 host, not by injecting `platform`.
  */
 export function shellNamespaceDiffersFromNative(platform?: NodeJS.Platform): boolean {
   return (platform ?? process.platform) === "win32" && resolveGitBashPath() !== undefined;

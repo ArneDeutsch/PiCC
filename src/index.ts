@@ -55,7 +55,7 @@ import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
-import { applyUnicodeSafeProcessEnv, toNativeSafeTempForm, unicodeSafeSubprocessEnv } from "./util/env.js";
+import { applyUnicodeSafeProcessEnv, computeSessionScratchDir, unicodeSafeSubprocessEnv } from "./util/env.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
 
 /**
@@ -631,6 +631,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       settings: project.settings,
       state: newSessionContextState(skipProject ? [] : project.claudeMd),
       steeringText: agentModelRef ? steeringForModel(config, agentModelRef) : steeringText,
+      // Feature 25 / #48: subagents receive the same scratchpad guidance as the
+      // main session — a subagent that writes a temp file via the Bash tool and
+      // then Reads it (or hands it to a nested agent) hits the identical
+      // shell↔native namespace trap. Reuse the one eager `scratchDir` literal +
+      // predicate (harness data, safe to inject into every agent — not an
+      // exfiltration-sensitive value). Reachable here because this closure runs
+      // at dispatch time, after activation initialized `scratchDir`.
+      scratchDir,
+      windowsTempNote: shellNamespaceDiffersFromNative(),
     });
     sections.push(suffix);
     return sections.join("\n\n");
@@ -945,10 +954,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // the harness process env, which a project settings.json cannot touch.
   let scratchDir: string | undefined;
   try {
-    const scratchRoot = process.env.CLAUDE_CODE_TMPDIR || os.tmpdir();
-    const rawDir = fs.mkdtempSync(path.join(scratchRoot, "picc-scratch-"));
-    const realDir = fs.realpathSync(rawDir);
-    scratchDir = toNativeSafeTempForm(realDir);
+    // Root selection + mkdtemp → realpath → slash-transform ORDER live in the pure
+    // `computeSessionScratchDir` helper so the wiring test can lock them on any host
+    // (see src/util/env.ts + test/subprocess-env.test.ts).
+    scratchDir = computeSessionScratchDir({
+      env: process.env,
+      tmpdir: () => os.tmpdir(),
+      mkdtemp: (prefix) => fs.mkdtempSync(prefix),
+      realpath: (p) => fs.realpathSync(p),
+      join: (a, b) => path.join(a, b),
+      platform: process.platform,
+    });
   } catch (err) {
     // A scratch-dir failure must never crash activation; t02 simply omits the
     // scratchpad guidance when the value is unavailable.

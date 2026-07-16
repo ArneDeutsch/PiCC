@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { applyUnicodeSafeProcessEnv, toNativeSafeTempForm, unicodeSafeSubprocessEnv } from "../src/util/env.js";
+import {
+  applyUnicodeSafeProcessEnv,
+  computeSessionScratchDir,
+  toNativeSafeTempForm,
+  unicodeSafeSubprocessEnv,
+  type ScratchDirIo,
+} from "../src/util/env.js";
 
 describe("unicodeSafeSubprocessEnv", () => {
   it("sets Python UTF-8 defaults when unset", () => {
@@ -87,6 +93,95 @@ describe("toNativeSafeTempForm", () => {
     const input = process.platform === "win32" ? "C:\\a\\b" : "/a/b";
     const expected = toNativeSafeTempForm(input, process.platform);
     expect(toNativeSafeTempForm(input)).toBe(expected);
+  });
+});
+
+describe("computeSessionScratchDir (index.ts computation seam — revert-catcher)", () => {
+  // A backslash-joining stub so the win32 root-selection path is exercised on any host.
+  const winJoin = (a: string, b: string) => `${a}\\${b}`;
+
+  function io(overrides: Partial<ScratchDirIo> & Pick<ScratchDirIo, "mkdtemp" | "realpath">): ScratchDirIo {
+    return {
+      env: {},
+      tmpdir: () => "C:\\Fallback\\Temp",
+      join: winJoin,
+      platform: "win32",
+      ...overrides,
+    };
+  }
+
+  it("(a) CLAUDE_CODE_TMPDIR wins over tmpdir() — RED if the env knob honoring is removed", () => {
+    let seenPrefix = "";
+    computeSessionScratchDir(
+      io({
+        env: { CLAUDE_CODE_TMPDIR: "D:\\Relocated" },
+        tmpdir: () => "C:\\Fallback\\Temp",
+        mkdtemp: (prefix) => {
+          seenPrefix = prefix;
+          return `${prefix}XYZ`;
+        },
+        realpath: (p) => p,
+      }),
+    );
+    // The mkdtemp template must be rooted at CLAUDE_CODE_TMPDIR, not os.tmpdir().
+    expect(seenPrefix).toBe("D:\\Relocated\\picc-scratch-");
+    expect(seenPrefix).not.toContain("Fallback");
+  });
+
+  it("(a') falls back to tmpdir() when CLAUDE_CODE_TMPDIR is unset", () => {
+    let seenPrefix = "";
+    computeSessionScratchDir(
+      io({
+        env: {},
+        tmpdir: () => "C:\\Fallback\\Temp",
+        mkdtemp: (prefix) => {
+          seenPrefix = prefix;
+          return `${prefix}XYZ`;
+        },
+        realpath: (p) => p,
+      }),
+    );
+    expect(seenPrefix).toBe("C:\\Fallback\\Temp\\picc-scratch-");
+  });
+
+  it("(b)+(c) win32: realpath is applied BEFORE the slash-transform — RED if the order is swapped", () => {
+    // mkdtemp yields a RAW (possibly short/symlinked) path; realpath canonicalizes to
+    // a DIFFERENT REAL path. Both are backslash form.
+    const raw = "C:\\Fallback\\Temp\\picc-scratch-RAW";
+    const real = "C:\\Fallback\\Temp\\picc-scratch-REAL";
+    let realpathArg = "";
+    const result = computeSessionScratchDir(
+      io({
+        env: {},
+        mkdtemp: () => raw,
+        realpath: (p) => {
+          realpathArg = p;
+          return real;
+        },
+      }),
+    );
+    // realpath must receive the RAW backslash mkdtemp output — if the transform ran
+    // first it would receive the forward-slash "C:/…/RAW" instead.
+    expect(realpathArg).toBe(raw);
+    // Final value is realpath's REAL output, forward-slashed (win32 form). Order swap
+    // would instead yield the backslash REAL path (no transform after realpath) or the
+    // RAW segment — this single assertion catches both the order swap and a missing
+    // win32 transform.
+    expect(result).toBe("C:/Fallback/Temp/picc-scratch-REAL");
+    expect(result).not.toContain("\\");
+    expect(result).not.toContain("RAW");
+  });
+
+  it("non-win32: realpath output is returned unchanged (no slash transform)", () => {
+    const result = computeSessionScratchDir({
+      env: {},
+      tmpdir: () => "/tmp",
+      join: (a, b) => `${a}/${b}`,
+      platform: "linux",
+      mkdtemp: (prefix) => `${prefix}raw`,
+      realpath: () => "/tmp/picc-scratch-real",
+    });
+    expect(result).toBe("/tmp/picc-scratch-real");
   });
 });
 
