@@ -39,17 +39,21 @@ moved). typecheck + full suite green.
   matrix freshness"), which re-renders the matrix in-process and asserts it equals the
   committed `doc/supported-features.md` — so if registry text is unchanged, do NOT run a
   spurious regeneration (a no-op regen is byte-identical and the test passes either way).
-- **The honesty caveat (required, in `doc/user-guide.md` §6).** State the limit plainly:
-  matching is on the tool's path/directory argument, so `deny: Read(secrets/**)` blocks
-  Grep/Glob/NotebookRead calls that *name* a path inside the glob, but does NOT stop a
-  `Grep` with no `path` (or `path: "."`) from reading matching files via its results —
-  and note that naming the bare directory itself (`{path: "secrets"}`) may not match a
-  `secrets/**` rule (write the rule to cover both if that matters). Only a **bare**
-  `deny: Read` (which removes the read tools from context) fully forecloses content
-  exfil. This is inherent to path-glob matching (not new in F26) and is Claude Code's own
-  best-effort limitation — state it, don't oversell containment. CHANGELOG/registry are
-  fine secondary homes, but the caveat MUST appear in user-guide §6; CHANGELOG alone is
-  insufficient (it scrolls into release history, away from where denies are configured).
+- **The honesty caveat (required, in `doc/user-guide.md` §6).** State the limit plainly.
+  **Pinned behavior from t01 (use these exact facts — an earlier assumption was wrong):**
+  matching is on the tool's path argument. `deny: Read(secrets/**)` DOES block a
+  Grep/Glob/NotebookRead call whose `path` names the protected directory *or* a subpath
+  (`{path:"secrets"}` and `{path:"secrets/x"}` are both blocked — the glob engine covers
+  the bare directory node). The genuine residual gap is a read call with **no path** or
+  `path: "."`: `Grep {}` / `Grep {path:"."}` are NOT blocked, because there is no path to
+  match, yet their results can surface matching file contents. Only a **bare**
+  `deny: Read` (which removes the read tools from context entirely) fully forecloses that
+  content-exfil path. This is inherent to path-glob matching (not new in F26) and is
+  Claude Code's own best-effort limitation — state it, don't oversell containment.
+  CHANGELOG/registry are fine secondary homes, but the caveat MUST appear in
+  user-guide §6; CHANGELOG alone is insufficient (it scrolls into release history, away
+  from where denies are configured). Do NOT repeat the earlier draft's incorrect
+  "naming the bare directory may not match" wording — the bare directory IS matched.
 - **Fixture — intentionally not grown.** `examples/full-surface/.claude/settings.json`
   already ships `deny: ["Read(secrets/**)"]`, and `test/e2e-live-pi.test.ts` already
   drives it end-to-end. Per the tester's guidance the guard→engine path is generic once

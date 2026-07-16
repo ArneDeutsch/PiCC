@@ -110,6 +110,12 @@ describe("tool-map", () => {
     applyUpdatedInput("read", live, { file_path: "src/b.ts" });
     expect(live.path).toBe("src/b.ts");
 
+    // F26: a live grep reaches the engine as a matchable Grep call with
+    // file_path populated, so a Read(<glob>) deny can gate it by path.
+    const grepCall = toClaudeCall("grep", { path: "secrets/x" }, "C:\\proj");
+    expect(grepCall.tool).toBe("Grep");
+    expect(grepCall.input.file_path).toBe("secrets/x");
+
     const custom: Record<string, unknown> = { url: "https://x" };
     applyUpdatedInput("WebFetch", custom, { url: "https://y" });
     expect(custom.url).toBe("https://y");

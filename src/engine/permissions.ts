@@ -112,14 +112,27 @@ function toolNameMatches(ruleTool: string, callTool: string): boolean {
 const FILE_EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 
 /**
+ * The tools a `Read` rule gates: ALL built-in file-reading tools. Grep/Glob are
+ * documented Claude parity ("makes a best-effort attempt to apply `Read` rules
+ * to all built-in tools that read files like Grep and Glob"); NotebookRead is
+ * included as inferred defense-in-depth (it is a real file reader since F18) —
+ * Claude's docs do not name it. `Read` is present for symmetry with
+ * {@link FILE_EDIT_TOOLS}; {@link toolNameMatches} already covers Read==Read.
+ */
+const FILE_READ_TOOLS = new Set(["Read", "Grep", "Glob", "NotebookRead"]);
+
+/**
  * Rule-level tool matching: {@link toolNameMatches} plus Claude's documented
- * expansion "`Edit` = all file-editing tools" — a deny `Edit(glob)` must not
- * be bypassable by calling Write/MultiEdit/NotebookEdit on the same path.
- * (One-directional: a `Write` rule does NOT gate Edit calls.)
+ * family expansions — "`Edit` = all file-editing tools" (Write/MultiEdit/
+ * NotebookEdit) and "`Read` = all file-reading tools" (Grep/Glob/NotebookRead)
+ * — so a deny `Edit(glob)` / `Read(glob)` cannot be bypassed by calling a
+ * sibling tool on the same path. Both expansions are strictly one-directional:
+ * a `Write`/`Grep`/`Glob`/`NotebookRead` rule does NOT gate Edit/Read calls.
  */
 function ruleToolMatches(ruleTool: string, callTool: string): boolean {
   if (toolNameMatches(ruleTool, callTool)) return true;
-  return ruleTool === "Edit" && FILE_EDIT_TOOLS.has(callTool);
+  if (ruleTool === "Edit" && FILE_EDIT_TOOLS.has(callTool)) return true;
+  return ruleTool === "Read" && FILE_READ_TOOLS.has(callTool);
 }
 
 // ---------------------------------------------------------------------------
@@ -709,8 +722,11 @@ export class PermissionEngine {
    *
    * Settings `deny` rules with a BARE tool name also remove the tool from
    * context entirely (research 02 §7.1: "a bare tool name deny removes the
-   * tool from context"); a bare `Edit` deny removes all file-editing tools,
-   * matching the call-time rule expansion.
+   * tool from context"); a bare `Edit` deny removes all file-editing tools and
+   * a bare `Read` deny removes all file-reading tools (Grep/Glob/NotebookRead),
+   * matching the call-time rule expansion. A SCOPED deny (`Read(glob)`) removes
+   * nothing from context — the specifier guard leaves the tool in place and it
+   * is blocked per-call instead.
    */
   gateTools(
     granted: string[] | undefined,

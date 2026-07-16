@@ -95,6 +95,81 @@ describe("Edit rules gate all file-modification tools", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 1b. Read rules gate all file-read tools (F26, mirrors the Edit family)
+// ---------------------------------------------------------------------------
+
+describe("Read rules gate all file-read tools", () => {
+  const engine = denyEngine(["Read(secrets/**)"]);
+
+  it("deny Read(glob) blocks Grep on a matching path", () => {
+    expect(engine.evaluate(call("Grep", { path: "secrets/x" }))).toEqual({
+      decision: "deny",
+      rule: "Read(secrets/**)",
+    });
+  });
+
+  it("deny Read(glob) blocks Glob and NotebookRead on a matching path", () => {
+    expect(engine.evaluate(call("Glob", { path: "secrets/sub" })).decision).toBe("deny");
+    expect(
+      engine.evaluate(call("NotebookRead", { notebook_path: "secrets/nb.ipynb" })).decision,
+    ).toBe("deny");
+  });
+
+  it("deny Read(glob) does not gate Write/Edit, and non-matching paths pass", () => {
+    // A non-matching Grep path stays default.
+    expect(engine.evaluate(call("Grep", { path: "src" })).decision).toBe("default");
+    // The read family and edit family are NOT unioned: a Read deny leaves the
+    // edit tools untouched.
+    expect(engine.evaluate(call("Write", { file_path: "secrets/creds.json" })).decision).toBe(
+      "default",
+    );
+    expect(engine.evaluate(call("Edit", { file_path: "secrets/creds.json" })).decision).toBe(
+      "default",
+    );
+  });
+
+  it("the expansion is one-directional: read-family rules do not gate Read", () => {
+    expect(matchesRule("Grep(secrets/**)", call("Read", { file_path: "secrets/x" }))).toBe(false);
+    // Positive control: the same Grep rule DOES gate a Grep call.
+    expect(matchesRule("Grep(secrets/**)", call("Grep", { path: "secrets/x" }))).toBe(true);
+    // A Glob / NotebookRead rule likewise does not gate Read.
+    expect(matchesRule("Glob(secrets/**)", call("Read", { file_path: "secrets/x" }))).toBe(false);
+    expect(
+      matchesRule("NotebookRead(secrets/**)", call("Read", { file_path: "secrets/x" })),
+    ).toBe(false);
+  });
+
+  it("a bare Read deny blocks Grep and Glob calls too (mirrors the Edit-family)", () => {
+    // Bare rule = no specifier, so it matches any path; the read-family
+    // expansion routes a Grep/Glob call through the Read deny.
+    const bare = denyEngine(["Read"]);
+    expect(bare.evaluate(call("Grep", { path: "anything" }))).toEqual({
+      decision: "deny",
+      rule: "Read",
+    });
+    expect(bare.evaluate(call("Glob", { path: "anywhere" })).decision).toBe("deny");
+  });
+
+  it("directory-argument edge: a Glob naming the bare protected dir (pins observed behavior)", () => {
+    // Observed behavior (pinned, not assumed): a Glob/Grep whose path is the
+    // bare protected directory itself ({path:"secrets"}) under deny
+    // Read(secrets/**) IS blocked — the glob engine treats `secrets/**` as
+    // covering the directory node too (both directions), so naming the
+    // directory to enumerate it is caught.
+    expect(engine.evaluate(call("Glob", { path: "secrets" })).decision).toBe("deny");
+    expect(engine.evaluate(call("Grep", { path: "secrets" })).decision).toBe("deny");
+    expect(matchesRule("Read(secrets/**)", call("Glob", { path: "secrets" }))).toBe(true);
+
+    // The REAL residual gap (basis for the t02 honesty caveat) is a read call
+    // that names NO path (or `path:"."`): there is nothing for the path matcher
+    // to test, so the rule cannot fire and matching files stay reachable via
+    // the tool's results. Only a BARE `deny: Read` forecloses that.
+    expect(engine.evaluate(call("Grep", {})).decision).toBe("default");
+    expect(engine.evaluate(call("Grep", { path: "." })).decision).toBe("default");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 2. Stable path-rule anchoring (no cwd drift)
 // ---------------------------------------------------------------------------
 
@@ -295,7 +370,7 @@ describe("parameter-matching rule forms (Tool(key:value))", () => {
 // ---------------------------------------------------------------------------
 
 describe("gateTools removes bare-tool-denied tools from context", () => {
-  const known = ["Bash", "Read", "Edit", "Write", "NotebookEdit", "WebFetch", "mcp__github__create_issue"];
+  const known = ["Bash", "Read", "Grep", "Glob", "NotebookRead", "Edit", "Write", "NotebookEdit", "WebFetch", "mcp__github__create_issue"];
 
   it("a bare deny removes the tool; a scoped deny leaves it (per-call block instead)", () => {
     const engine = denyEngine(["WebFetch", "Bash(rm *)"]);
@@ -310,6 +385,40 @@ describe("gateTools removes bare-tool-denied tools from context", () => {
     expect(gated).not.toContain("Write");
     expect(gated).not.toContain("NotebookEdit");
     expect(gated).toContain("Read");
+    expect(gated).toContain("Bash");
+  });
+
+  it("a bare Read deny removes all file-read tools, matching call-time expansion", () => {
+    const gated = denyEngine(["Read"]).gateTools(undefined, undefined, known);
+    expect(gated).not.toContain("Read");
+    expect(gated).not.toContain("Grep");
+    expect(gated).not.toContain("Glob");
+    expect(gated).not.toContain("NotebookRead");
+    // The edit family and Bash stay in context (families are not unioned).
+    expect(gated).toContain("Edit");
+    expect(gated).toContain("Write");
+    expect(gated).toContain("Bash");
+  });
+
+  it("a scoped Read(glob) deny removes NO tools from context (per-call block instead)", () => {
+    const gated = denyEngine(["Read(secrets/**)"]).gateTools(undefined, undefined, known);
+    expect(gated).toContain("Read");
+    expect(gated).toContain("Grep");
+    expect(gated).toContain("Glob");
+    expect(gated).toContain("NotebookRead");
+  });
+
+  it("a bare Grep deny removes ONLY Grep (the read family is not reverse-unioned)", () => {
+    // Expansion is one-directional: a Read rule gates the read family, but a
+    // Grep-rooted deny must strip ONLY Grep and leave Read/Glob/NotebookRead
+    // (and the edit family + Bash) reachable.
+    const gated = denyEngine(["Grep"]).gateTools(undefined, undefined, known);
+    expect(gated).not.toContain("Grep");
+    expect(gated).toContain("Read");
+    expect(gated).toContain("Glob");
+    expect(gated).toContain("NotebookRead");
+    expect(gated).toContain("Edit");
+    expect(gated).toContain("Write");
     expect(gated).toContain("Bash");
   });
 

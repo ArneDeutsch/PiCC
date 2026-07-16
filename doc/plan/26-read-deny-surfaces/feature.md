@@ -11,8 +11,10 @@ file-reading tools — `Grep`, `Glob`, and `NotebookRead`. This feature makes a
 maintainer who denies reads of a sensitive path (`Read(secrets/**)`, `Read(.env)`)
 keeps that path unreadable across PiCC's built-in read surfaces **for calls that name a
 matching path**. This is Claude Code's own best-effort model, and its limit is stated
-honestly under non-goals below: a `Grep` with no `path` (or `path: "."`) can still read
-matching files via its results — only a bare `deny: Read` fully forecloses that.
+honestly under non-goals below: a `Grep` with **no `path`** (or `path: "."`) can still
+read matching files via its results — only a bare `deny: Read` fully forecloses that.
+(A call that names the protected directory or a subpath, e.g. `path: "secrets"`, IS
+blocked — verified in t01.)
 
 Concretely, the observable behavior after this feature:
 
