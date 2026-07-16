@@ -34,6 +34,18 @@ All notable changes to PiCC are documented here. The format is based on
   even depth-1 fan-out) — distinct from `maxDepth: 1`, which keeps depth-1 fan-out and blocks only
   nesting.
 
+### Fixed — "verbatim final message" contract documented accurately (2026-07-16)
+
+- The capability registry and design docs claimed a subagent's final message is returned "verbatim
+  (no wrapper)." That was inaccurate for **resumable** dispatches, which append a clearly-delimited
+  in-band identity/resume trailer to the model-visible text (faithful to Claude Code, which appends
+  the same kind of resume handle to resumable subagent results; the human TUI strips it). The docs now state
+  the real contract — verbatim for non-resumable/one-shot dispatches, verbatim plus the delimited
+  identity trailer for resumable ones — so an exact-token / JSON / YAML consumer knows the shape.
+  **Behavior is unchanged**: this is a documentation-truthfulness fix (a downsize of #46; the proposed
+  separate identity channel was deliberately not built — rationale in
+  `doc/plan/26-verbatim-contract-docs/feature.md`).
+
 ### Added — collaborative planning posture by default (2026-07-16)
 
 - **PiCC's always-on conventions block now carries a short collaborative-planning nudge, so a
