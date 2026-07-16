@@ -433,7 +433,16 @@ Deliberately partial, by design (see the plan §6):
   **not** confined to the `Read` tool — it also gates `Grep`, `Glob`, and `NotebookRead` when they
   target a matching path (`Grep`/`Glob` are documented Claude best-effort parity; `NotebookRead` is
   inferred defense-in-depth, since Claude's docs do not name it). The expansion is one-directional,
-  mirroring the edit family: a `Grep(<glob>)` rule does **not** gate `Read`.
+  mirroring the edit family: a `Grep(<glob>)` rule does **not** gate `Read`. A scoped `Read(<glob>)`
+  deny *also* blocks `Edit` and `MultiEdit` on a matching path — including creating a new file there —
+  so denying reads of a path also prevents clobbering or recreating it via `Edit` (Claude Code v2.1.208
+  parity). This Read→Edit/MultiEdit cross is **deny-direction and path-scoped only**: a bare
+  `deny: Read` does **not** block or strip `Edit`, and no `allow: Read` ever grants `Edit`.
+  - *Mutation-coverage caveat.* A `deny: Read(<path>)` blocks `Edit`/`MultiEdit` but **not** `Write`
+    or `NotebookEdit` — those whole-file/cell writers remain governed only by their own rules (this
+    exclusion is deliberate Claude parity, not an oversight). Use `Read` deny for **confidentiality**;
+    to fully prevent a path from being modified or recreated by any tool (**integrity**), add an
+    explicit `deny: Edit(<path>)` **and** `deny: Write(<path>)`. This mirrors Claude Code's own guidance.
   - *Honesty caveat (best-effort, not airtight).* Matching is on the call's **path** argument. A
     scoped `deny: Read(secrets/**)` blocks a `Grep`/`Glob`/`NotebookRead` call whose path names the
     protected directory *or* any subpath — both `{path: "secrets"}` and `{path: "secrets/x"}` are

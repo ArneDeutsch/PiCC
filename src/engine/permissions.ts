@@ -122,12 +122,31 @@ const FILE_EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 const FILE_READ_TOOLS = new Set(["Read", "Grep", "Glob", "NotebookRead"]);
 
 /**
+ * The edit tools a **path-scoped, deny-direction** `Read` rule additionally
+ * gates (Claude v2.1.208): a `deny: Read(<glob>)` also blocks `Edit`/`MultiEdit`
+ * on a matching path — including creating a new file there — "because editing
+ * requires reading the result back". This is Edit-family-minus-whole-writers:
+ * `Write` and `NotebookEdit` are whole-file/cell writers that do NOT read the
+ * result back, so they are deliberately excluded (documented Claude parity, not
+ * an oversight). MultiEdit is a batched Edit with identical clobber semantics.
+ * This cross is applied ONLY in the deny direction with a non-empty specifier
+ * (see the guarded clause in {@link matchesRule}); it is intentionally NOT part
+ * of {@link ruleToolMatches}, which is polarity-agnostic and would otherwise
+ * leak the cross into allow/ask/hook-`if:` and into bare-`deny: Read` context
+ * stripping — both divergent from Claude.
+ */
+export const READ_DENY_EDIT_TOOLS = new Set(["Edit", "MultiEdit"]);
+
+/**
  * Rule-level tool matching: {@link toolNameMatches} plus Claude's documented
  * family expansions — "`Edit` = all file-editing tools" (Write/MultiEdit/
  * NotebookEdit) and "`Read` = all file-reading tools" (Grep/Glob/NotebookRead)
  * — so a deny `Edit(glob)` / `Read(glob)` cannot be bypassed by calling a
  * sibling tool on the same path. Both expansions are strictly one-directional:
  * a `Write`/`Grep`/`Glob`/`NotebookRead` rule does NOT gate Edit/Read calls.
+ * The separate deny-only Read→Edit/MultiEdit cross (a `deny: Read(glob)` also
+ * blocking Edit) lives in {@link matchesRule}, NOT here — see
+ * {@link READ_DENY_EDIT_TOOLS}.
  */
 function ruleToolMatches(ruleTool: string, callTool: string): boolean {
   if (toolNameMatches(ruleTool, callTool)) return true;
@@ -523,7 +542,10 @@ const CANONICAL_INPUT_FIELDS = new Set([
  * `opts.anchor` is the stable settings-source/project dir used to anchor
  * Read/Edit path patterns (defaults to `call.cwd` when absent); `opts.deny`
  * marks the deny direction (broader path matching: live-cwd fallback anchor +
- * symlink resolution); `opts.anySegment` is the deny-direction Bash mode.
+ * symlink resolution) and additionally enables the path-scoped Read→Edit/
+ * MultiEdit cross (a `deny: Read(<glob>)` also matches an Edit/MultiEdit call on
+ * a matching path — see {@link READ_DENY_EDIT_TOOLS}); `opts.anySegment` is the
+ * deny-direction Bash mode.
  *
  * Unknown tools degrade predictably: the tool name must match by string
  * identity, and when the rule carries a specifier it is wildcard-matched
@@ -540,6 +562,32 @@ export function matchesRule(
     if (!call || typeof call.tool !== "string") return false;
     const rule = parseRule(ruleText);
     if (!rule.tool) return false;
+
+    // Deny-only Read→Edit/MultiEdit cross (Claude v2.1.208): a path-scoped
+    // `Read(<glob>)` deny also blocks Edit/MultiEdit on a matching path (editing
+    // reads the result back), including creating a new file there. Path-specifier'd
+    // only — a bare `deny: Read` does NOT block Edit. Deny-direction only and
+    // one-directional, so it never leaks into allow/ask/hook-`if:`, and an `Edit`
+    // rule never gates a Read. Placed BEFORE the `ruleToolMatches` gate (which,
+    // being polarity-agnostic, would otherwise reject the Edit call for a Read
+    // rule). Routes through `pathSpecifierMatches` so it reuses the exact glob /
+    // anchor / deny-broadening / drive-normalization / realpath-degrade logic a
+    // Read deny already applies.
+    if (
+      opts.deny === true &&
+      rule.tool === "Read" &&
+      READ_DENY_EDIT_TOOLS.has(call.tool) &&
+      rule.specifier !== undefined &&
+      rule.specifier !== ""
+    ) {
+      const input = call.input ?? {};
+      return pathSpecifierMatches(
+        rule.specifier,
+        { ...call, input },
+        { deny: opts.deny, anchor: opts.anchor },
+      );
+    }
+
     if (!ruleToolMatches(rule.tool, call.tool)) return false;
     const specifier = rule.specifier;
     if (specifier === undefined || specifier === "") return true; // bare rule

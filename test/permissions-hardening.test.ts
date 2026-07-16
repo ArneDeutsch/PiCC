@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { PermissionEngine, matchesRule } from "../src/engine/permissions.js";
+import { PermissionEngine, evaluateIfCondition, matchesRule } from "../src/engine/permissions.js";
 import type { PermissionRules, ToolCallDescriptor } from "../src/types.js";
 
 /**
@@ -115,17 +115,19 @@ describe("Read rules gate all file-read tools", () => {
     ).toBe("deny");
   });
 
-  it("deny Read(glob) does not gate Write/Edit, and non-matching paths pass", () => {
+  it("deny Read(glob) does not gate Write/NotebookEdit, and non-matching paths pass", () => {
     // A non-matching Grep path stays default.
     expect(engine.evaluate(call("Grep", { path: "src" })).decision).toBe("default");
-    // The read family and edit family are NOT unioned: a Read deny leaves the
-    // edit tools untouched.
+    // Whole-file/cell writers stay ungated: Write and NotebookEdit do not read
+    // the result back, so a Read deny leaves them untouched (Claude v2.1.208).
     expect(engine.evaluate(call("Write", { file_path: "secrets/creds.json" })).decision).toBe(
       "default",
     );
-    expect(engine.evaluate(call("Edit", { file_path: "secrets/creds.json" })).decision).toBe(
-      "default",
-    );
+    expect(
+      engine.evaluate(call("NotebookEdit", { notebook_path: "secrets/nb.ipynb" })).decision,
+    ).toBe("default");
+    // Edit/MultiEdit, by contrast, ARE gated by a path-scoped Read deny — see
+    // section 1c below.
   });
 
   it("the expansion is one-directional: read-family rules do not gate Read", () => {
@@ -166,6 +168,94 @@ describe("Read rules gate all file-read tools", () => {
     // the tool's results. Only a BARE `deny: Read` forecloses that.
     expect(engine.evaluate(call("Grep", {})).decision).toBe("default");
     expect(engine.evaluate(call("Grep", { path: "." })).decision).toBe("default");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1c. Read deny also blocks Edit (v2.1.208 parity, deny-only)
+// ---------------------------------------------------------------------------
+
+describe("Read deny also blocks Edit (v2.1.208 parity, deny-only)", () => {
+  const engine = denyEngine(["Read(secrets/**)"]);
+
+  it("deny Read(glob) blocks Edit on a matching (new-file) path", () => {
+    // ROOT is a nonexistent dir, so realpath fails and this exercises the
+    // literal/new-file branch — the "creating a new file there" case.
+    expect(engine.evaluate(call("Edit", { file_path: "secrets/creds.json" }))).toEqual({
+      decision: "deny",
+      rule: "Read(secrets/**)",
+    });
+  });
+
+  it("deny Read(glob) blocks MultiEdit on a matching path", () => {
+    expect(engine.evaluate(call("MultiEdit", { file_path: "secrets/creds.json" }))).toEqual({
+      decision: "deny",
+      rule: "Read(secrets/**)",
+    });
+  });
+
+  it("deny Read(glob) does NOT block Write on a matching path", () => {
+    expect(engine.evaluate(call("Write", { file_path: "secrets/creds.json" })).decision).toBe(
+      "default",
+    );
+  });
+
+  it("deny Read(glob) does NOT block NotebookEdit on a matching path", () => {
+    expect(
+      engine.evaluate(call("NotebookEdit", { notebook_path: "secrets/nb.ipynb" })).decision,
+    ).toBe("default");
+  });
+
+  it("a non-matching Edit path passes", () => {
+    expect(engine.evaluate(call("Edit", { file_path: "public/x.md" })).decision).toBe("default");
+  });
+
+  it("the cross is one-directional: an Edit rule never gates a read tool", () => {
+    expect(matchesRule("Edit(secrets/**)", call("Read", { file_path: "secrets/x" }))).toBe(false);
+    expect(matchesRule("Edit(secrets/**)", call("Grep", { path: "secrets/x" }))).toBe(false);
+    expect(matchesRule("Edit(secrets/**)", call("Glob", { path: "secrets/x" }))).toBe(false);
+    expect(
+      matchesRule("Edit(secrets/**)", call("NotebookRead", { notebook_path: "secrets/x.ipynb" })),
+    ).toBe(false);
+    // Positive control: an Edit rule DOES gate an Edit call.
+    expect(matchesRule("Edit(secrets/**)", call("Edit", { file_path: "secrets/x" }))).toBe(true);
+  });
+
+  it("the cross is deny-direction only (polarity guards)", () => {
+    // Without the deny opt, a Read rule never matches an Edit call.
+    expect(matchesRule("Read(secrets/**)", call("Edit", { file_path: "secrets/x" }))).toBe(false);
+    // With {deny:true} it does.
+    expect(
+      matchesRule("Read(secrets/**)", call("Edit", { file_path: "secrets/x" }), { deny: true }),
+    ).toBe(true);
+    // allow: Read(...) does NOT allow Edit.
+    const allowEngine = new PermissionEngine(rules({ allow: ["Read(secrets/**)"] }), { cwd: ROOT });
+    expect(allowEngine.evaluate(call("Edit", { file_path: "secrets/x" })).decision).toBe("default");
+    // Hook `if: Read(...)` does NOT fire on an Edit call.
+    expect(evaluateIfCondition("Read(secrets/**)", call("Edit", { file_path: "secrets/x" }))).toBe(
+      false,
+    );
+    // Positive control: it fires on a Read call.
+    expect(evaluateIfCondition("Read(secrets/**)", call("Read", { file_path: "secrets/x" }))).toBe(
+      true,
+    );
+  });
+
+  it("bare deny: Read does NOT block Edit (path-specifier'd only)", () => {
+    expect(
+      denyEngine(["Read"]).evaluate(call("Edit", { file_path: "secrets/x" })).decision,
+    ).toBe("default");
+  });
+
+  it("cross-platform: a drive-lettered Read deny blocks a matching Edit", () => {
+    expect(
+      denyEngine(["Read(//c/**/.env)"]).evaluate(call("Edit", { file_path: "C:\\proj\\.env" }))
+        .decision,
+    ).toBe("deny");
+    expect(
+      denyEngine(["Read(//c/**/.env)"]).evaluate(call("Edit", { file_path: "D:\\proj\\.env" }))
+        .decision,
+    ).toBe("default");
   });
 });
 
