@@ -9,15 +9,27 @@ import os from "node:os";
 // This file has no static import of the Pi module, so this mock cleanly
 // intercepts subagents.ts's dynamic `loadRealSdk` import (unlike sendmessage.test,
 // whose top-level SessionManager import defeats interception).
-const rcMock = vi.hoisted(() => ({ created: [] as Array<Record<string, unknown>> }));
+const rcMock = vi.hoisted(() => ({
+  created: [] as Array<Record<string, unknown>>,
+  // t05: capture DefaultResourceLoader options so a dispatch's systemPromptOverride
+  // (which carries the subagent system prompt) is inspectable — it is threaded via
+  // the loader, not createAgentSession.
+  loaderOptions: [] as Array<Record<string, unknown>>,
+}));
 vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   const real = await importOriginal<Record<string, unknown>>();
   const { fakeSdk: makeFakeSdk } = await import("./helpers/fake-sdk.js");
   const { sdk } = makeFakeSdk({ replies: ["rc-nit2-done"], created: rcMock.created });
+  const BaseLoader = sdk.DefaultResourceLoader as new (o: Record<string, unknown>) => unknown;
   return {
     ...real,
     createAgentSession: (options: Record<string, unknown>) => sdk.createAgentSession(options),
-    DefaultResourceLoader: sdk.DefaultResourceLoader,
+    DefaultResourceLoader: class extends (BaseLoader as new (o: Record<string, unknown>) => object) {
+      constructor(o: Record<string, unknown>) {
+        super(o);
+        rcMock.loaderOptions.push(o);
+      }
+    },
     SessionManager: { inMemory: () => ({}) },
     SettingsManager: { inMemory: () => ({}) },
     getAgentDir: () => "/fake-agent-dir",
@@ -255,6 +267,92 @@ describe("context assembly", () => {
     expect(COLLABORATIVE_PLANNING_MAX_WORDS).toBe(120); // pins the acceptance criterion
     const chars = COLLABORATIVE_PLANNING_GUIDANCE.replace(/\r\n/g, "\n").length;
     expect(chars).toBeLessThanOrEqual(900); // long words can't dodge the word ceiling
+  });
+
+  // Feature 25 / #48: per-session scratchpad injection.
+  const SCRATCH = "C:/Users/x/AppData/Local/Temp/picc-scratch-abc123";
+
+  // The Windows note is discriminated by note-specific content ("different namespaces"),
+  // NOT by "mktemp -p" — the all-platform body legitimately names mktemp as one recipe.
+  const WIN_NOTE_MARK = /different namespaces/;
+
+  it("injects the literal scratch-dir path and Claude's imperative directive on all platforms", () => {
+    const suffix = buildSystemPromptSuffix({
+      claudeMd,
+      rules: [],
+      skills: [],
+      agents: [],
+      settings: baseSettings(),
+      state: newSessionContextState(claudeMd),
+      scratchDir: SCRATCH,
+    });
+    expect(suffix).toContain(SCRATCH);
+    expect(suffix).toContain("## Scratchpad directory");
+    // Claude-faithful imperative + instead-of-/tmp + escape hatch.
+    expect(suffix).toMatch(/IMPORTANT: Always use/);
+    expect(suffix).toMatch(/instead of `\/tmp`/);
+    expect(suffix).toMatch(/Only use `\/tmp` if the user explicitly requests it/);
+    // Narrowed skill-override exception (UX): defer only to a specific literal path.
+    expect(suffix).toMatch(/defer to a skill only when it names a specific literal path/);
+    // Redirect pattern covered (not just mktemp) — the shape evaluate actually uses.
+    expect(suffix).toContain(`> "${SCRATCH}/name"`);
+    // No Windows note without the flag.
+    expect(suffix).not.toMatch(WIN_NOTE_MARK);
+    // Anti-regression: existing conventions block still present.
+    expect(suffix).toContain("Claude Code compatibility conventions");
+  });
+
+  it("appends the Windows namespace note only when windowsTempNote is true", () => {
+    const withNote = buildSystemPromptSuffix({
+      claudeMd,
+      rules: [],
+      skills: [],
+      agents: [],
+      settings: baseSettings(),
+      state: newSessionContextState(claudeMd),
+      scratchDir: SCRATCH,
+      windowsTempNote: true,
+    });
+    expect(withNote).toMatch(WIN_NOTE_MARK);
+    // Safe addressing: mktemp -p and the redirect form, bound to the scratch dir.
+    expect(withNote).toContain(`mktemp -p "${SCRATCH}"`);
+    expect(withNote).toContain(`"${SCRATCH}/name"`);
+    // The why clause (drive-relative + forward-slash identical).
+    expect(withNote).toMatch(/drive-relative/i);
+    expect(withNote).toMatch(/forward-slash drive-letter/i);
+    // Never $TEMP/$TMP (cygpath mention dropped per UX NIT).
+    expect(withNote).toMatch(/never a bare `\/tmp\/\.\.\.`, `\$TEMP`, or `\$TMP`/);
+
+    const withoutNote = buildSystemPromptSuffix({
+      claudeMd,
+      rules: [],
+      skills: [],
+      agents: [],
+      settings: baseSettings(),
+      state: newSessionContextState(claudeMd),
+      scratchDir: SCRATCH,
+      windowsTempNote: false,
+    });
+    expect(withoutNote).not.toMatch(WIN_NOTE_MARK);
+  });
+
+  it("emits no scratchpad section (and no Windows note) when scratchDir is undefined", () => {
+    const inputs = {
+      claudeMd,
+      rules: [],
+      skills: [],
+      agents: [],
+      settings: baseSettings(),
+      state: newSessionContextState(claudeMd),
+    } as const;
+    const baseline = buildSystemPromptSuffix(inputs);
+    // Even with the flag forced on, no scratchDir means no section at all.
+    const flagged = buildSystemPromptSuffix({ ...inputs, windowsTempNote: true });
+    expect(flagged).toBe(baseline); // byte-for-byte: off-Windows output unchanged
+    expect(baseline).not.toContain("## Scratchpad directory");
+    expect(baseline).not.toMatch(WIN_NOTE_MARK);
+    // Existing sections intact.
+    expect(baseline).toContain("Claude Code compatibility conventions");
   });
 
   it("keeps activated skill bodies resident", () => {
@@ -1884,6 +1982,79 @@ describe("SendMessage parent-only guard through the real harness (tester NIT-2)"
       );
       expect(toolNames).not.toContain("SendMessage");
       expect(customToolNames).not.toContain("SendMessage");
+    } finally {
+      process.chdir(originalCwd);
+      if (savedUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = savedUserDir;
+      try {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      } catch {
+        /* OS reaps temp dirs eventually */
+      }
+    }
+  });
+});
+
+// Wiring-seam revert-catcher (t05): the scratchpad path is computed in index.ts's
+// activation and threaded into BOTH the main-session before_agent_start suffix AND
+// buildSubagentSystemPrompt's suffix. Boots the REAL harness (same pattern as the
+// parent-guard test above) so a dropped call-site arg on either path ships RED.
+// (The realpath→transform ORDER + CLAUDE_CODE_TMPDIR honoring are locked by the pure
+// computeSessionScratchDir unit tests in test/subprocess-env.test.ts — the win32-only
+// slash transform is a no-op on this Linux CI host, so it cannot be caught by a
+// booted assertion here.)
+describe("scratchpad injection wiring through the real harness (t05)", () => {
+  it("injects the SAME literal scratch path into both the main suffix and the subagent prompt", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-rc-scratch-"));
+    fs.writeFileSync(path.join(dir, "CLAUDE.md"), "scratch-project\n");
+    const userDir = path.join(dir, ".claude-user");
+    fs.mkdirSync(userDir, { recursive: true });
+    const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const originalCwd = process.cwd();
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    process.chdir(dir);
+    try {
+      const pi = fakePi();
+      piccExtension(pi.api as never);
+      // Boot is async (project/agents load + eager scratch-dir creation); give it a beat.
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Main-session suffix via before_agent_start. RED if the main call-site arg (~:1042)
+      // is dropped.
+      const mainResult = (await pi.fire("before_agent_start", {
+        systemPrompt: "BASE-PROMPT",
+      })) as { systemPrompt?: string } | undefined;
+      const mainSuffix = mainResult?.systemPrompt ?? "";
+      expect(mainSuffix, "before_agent_start must return an assembled prompt").toContain(
+        "## Scratchpad directory",
+      );
+      // Extract the literal scratch path the harness computed and injected.
+      const match = mainSuffix.match(/`([^`]*picc-scratch-[^`]*)`/);
+      expect(match, "main suffix must name a literal picc-scratch- path").not.toBeNull();
+      const scratchPath = match![1]!;
+
+      // Subagent system prompt via a real foreground dispatch. RED if the subagent
+      // call-site arg (buildSubagentSystemPrompt, ~:623) is dropped (the SHOULD-1 gap).
+      const agentTool = pi.tools.get("Agent") as {
+        execute: (id: string, params: Record<string, unknown>) => Promise<unknown>;
+      };
+      expect(agentTool, "Agent tool must be registered").toBeDefined();
+      const before = rcMock.loaderOptions.length;
+      await agentTool.execute("t", {
+        subagent_type: "general-purpose",
+        prompt: "go",
+        run_in_background: false,
+      });
+      expect(rcMock.loaderOptions.length).toBeGreaterThan(before);
+      const options = rcMock.loaderOptions[rcMock.loaderOptions.length - 1]!;
+      const override = options.systemPromptOverride as (() => string) | undefined;
+      expect(override, "subagent loader must carry a systemPromptOverride").toBeTypeOf(
+        "function",
+      );
+      const subagentPrompt = override!();
+      expect(subagentPrompt).toContain("## Scratchpad directory");
+      // Same literal path — reuse the one eager scratchDir, no per-subagent dir.
+      expect(subagentPrompt).toContain(scratchPath);
     } finally {
       process.chdir(originalCwd);
       if (savedUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;

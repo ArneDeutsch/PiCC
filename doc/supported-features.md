@@ -171,7 +171,7 @@ Skill (`SKILL.md`), agent (`.claude/agents/*.md`), and rule frontmatter keys.
 | `agent.frontmatter.mcpServers` | degraded-noop | parsed; MCP deferred — no servers started for the agent (§7) |
 | `agent.frontmatter.permissionMode` ⚠ | degraded-noop | parsed, no-op — subagents run the default-permissive posture regardless; deny rules + tools: gating remain the controls; reported when set (§6.1) |
 
-## Runtime features (27)
+## Runtime features (28)
 
 Cross-cutting runtime subsystems and behaviors.
 
@@ -189,6 +189,7 @@ Cross-cutting runtime subsystems and behaviors.
 | `feature.commit-message-guidance` | partial | always-on, every-turn nudge in the conventions block (rebuilt each turn, survives compaction): when asked to commit, first read the changes (git status/diff) and recent git log, match this repo's commit-message style where it is richer, and — for a non-trivial change — write a short why-over-what body; the --no-verify prohibition is preserved. PARTIAL: guidance only, outcome model-dependent (a prompt nudge, not a deterministic output shape); NOT full Claude Code commit parity — omits the HEREDOC commit form, the attribution trailer, and parallel git status/diff/log batching; commit attribution is unchanged — still no attribution trailer either way (see setting.includeCoAuthoredBy) |
 | `feature.hook-handler.http` | partial | http hook handlers dispatched best-effort (§4.5) |
 | `feature.managed-policy` | partial | managed/enterprise policy honored where trivially present; otherwise degrade-safe (§7) |
+| `feature.session-scratchpad` | partial | per-session native-safe scratchpad (#48/feature 25): an eager per-session scratch dir (os.tmpdir()/picc-scratch-*, honoring Claude's CLAUDE_CODE_TMPDIR relocation knob) whose LITERAL resolved path is injected into the system prompt on ALL platforms with an imperative "always use this instead of /tmp" directive plus the "only use /tmp if the user explicitly requests it" escape hatch — mirroring Claude Code's injected-literal-path scratchpad contract (a literal path in the prompt, no env var, matching Claude). PARTIAL for two honest gaps: (a) the scratch PATH SHAPE differs from Claude's — Claude's Windows scratchpad is a backslash %LOCALAPPDATA%\...\claude\...\scratchpad path whereas PiCC injects the forward-slash C:/... form (via toNativeSafeTempForm) so the Bash tool and native Read resolve it to the same file; that separator difference is the deliberate fix, not an accident (on Unix it is os.tmpdir()/picc-scratch-* vs Claude's /tmp/claude/<session>/scratchpad — semantically equivalent, not byte-identical); (b) on the Windows shell↔native namespace split (pinned Git Bash) PiCC ADDITIONALLY emits a Windows-specific mktemp -p recipe note that Claude does not, an additive PiCC mitigation for the bare-/tmp drive-relative resolution trap. Skill-author-facing delivery is this injected prompt guidance (architecture.md §4) |
 | `feature.hook-handler.agent` | degraded-noop | agent hook handlers degrade with a notice (§4.5) |
 | `feature.hook-handler.mcp_tool` | degraded-noop | mcp_tool hook handlers degrade with a notice — MCP deferred (§4.5, §7) |
 | `feature.hook-handler.prompt` | degraded-noop | prompt hook handlers degrade with a notice (§4.5) |
@@ -207,4 +208,4 @@ Cross-cutting runtime subsystems and behaviors.
 
 ## Summary
 
-The registry enumerates **151 capabilities** against baseline `claude-code-2.1.x (mid-2026)`: **79 full**, **23 partial**, **40 degraded-noop**, **9 not-supported**. 5 entries are safety-relevant (marked ⚠) — a divergence where a project's restriction is not enforced and is therefore reported prominently. Unknown inputs outside this registry are not counted here: they are unassessed by definition and degrade safely at runtime (plan §2.4).
+The registry enumerates **152 capabilities** against baseline `claude-code-2.1.x (mid-2026)`: **79 full**, **24 partial**, **40 degraded-noop**, **9 not-supported**. 5 entries are safety-relevant (marked ⚠) — a divergence where a project's restriction is not enforced and is therefore reported prominently. Unknown inputs outside this registry are not counted here: they are unassessed by definition and degrade safely at runtime (plan §2.4).

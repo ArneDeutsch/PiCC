@@ -67,6 +67,20 @@ export interface AssemblyInputs {
   state: SessionContextState;
   steeringText?: string;
   compatNotice?: string;
+  /**
+   * Per-session native-safe scratch dir literal path (#48/feature 25). When set, a
+   * scratchpad section is injected on ALL platforms (mirroring Claude Code) naming
+   * this literal path and steering temp files here instead of `/tmp`. Computed once
+   * in index.ts (the composition root) so this module never imports from `engine/`.
+   */
+  scratchDir?: string;
+  /**
+   * True when the shell↔native namespace split (Windows + pinned Git Bash) means a
+   * bare `/tmp/...` written via the Bash tool is unreadable by the native file tools.
+   * Gates the extra Windows note under the scratchpad section. Computed in index.ts
+   * from `shellNamespaceDiffersFromNative()` — same reason: no `engine/` import here.
+   */
+  windowsTempNote?: boolean;
   /** Auto memory (audit B4): injected as its own section when present (= enabled). */
   autoMemory?: MemorySnapshot;
   /** Approximate model context-window budget in chars for the skill listing. */
@@ -214,7 +228,43 @@ export function buildSystemPromptSuffix(inputs: AssemblyInputs): string {
     sections.push(`## Compatibility\n\n${inputs.compatNotice}`);
   }
 
+  if (inputs.scratchDir) {
+    sections.push(buildScratchpadSection(inputs.scratchDir, inputs.windowsTempNote === true));
+  }
+
   return sections.join("\n\n");
+}
+
+/**
+ * Scratchpad guidance section (#48/feature 25). Mirrors Claude Code's own scratchpad
+ * section: an emphatic all-platform directive naming the literal resolved path and
+ * steering temp files there instead of `/tmp` — Claude's actual contract (a
+ * Claude-authored skill reads the path out of the prompt), so it MUST be the literal
+ * path, not an env-var reference. On the shell↔native namespace split (Windows +
+ * pinned Git Bash) an extra note explains why a bare `/tmp` fails and pins the safe
+ * addressing of temp files. Wording kept imperative and short: the directive leads,
+ * the rationale trails, so a less-reliable model obeys rather than skims.
+ */
+function buildScratchpadSection(scratchDir: string, windowsTempNote: boolean): string {
+  const parts = [
+    `IMPORTANT: Always use this per-session scratchpad directory for temporary files instead of \`/tmp\` or other system temp directories: \`${scratchDir}\`` +
+      "\n\nIt is session-specific and isolated from the project. Put every temporary file here — " +
+      `whether you create it with a shell redirect (\`… > "${scratchDir}/name"\`), \`mktemp -p "${scratchDir}"\`, ` +
+      "or the Write tool. When a skill asks only for a generic temporary or out-of-worktree location, " +
+      "this directory is that location; defer to a skill only when it names a specific literal path of " +
+      "its own. Only use `/tmp` if the user explicitly requests it.",
+  ];
+  if (windowsTempNote) {
+    parts.push(
+      "On Windows the harness shell (Git Bash) and the native Read/Grep/Glob tools resolve path " +
+        "strings in different namespaces, so a bare `/tmp/...` path written through the Bash tool is " +
+        "read drive-relative by the native tools and will not be found. Always address a temp file by " +
+        `the scratchpad path above — redirect to \`"${scratchDir}/name"\` or run \`mktemp -p "${scratchDir}"\` — ` +
+        "never a bare `/tmp/...`, `$TEMP`, or `$TMP`. Its forward-slash drive-letter form is resolved " +
+        "identically by the shell and the native tools.",
+    );
+  }
+  return `## Scratchpad directory\n\n${parts.join("\n\n")}`;
 }
 
 function skillListingBudget(inputs: AssemblyInputs): number | undefined {
