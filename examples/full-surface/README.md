@@ -22,7 +22,7 @@ Coverage map (each canary string is asserted by tests):
 | Path-scoped, non-invocable skill | `skills/rust-helper` | `FS-SKILL-PATHS-BODY` |
 | disable-model-invocation + unknown frontmatter | `skills/secret-ritual` | `FS-SKILL-USERONLY-BODY` |
 | Legacy command + args | `.claude/commands/ship.md` | `FS-LEGACY-SHIP` |
-| Nested subagents (depth 2) | `agents/planner.md` → researcher | — |
+| Nested subagents (depth 2 — **explicit opt-in** via `subagents.maxDepth: 2` in `.claude/settings.json`; nesting is off by default/main-session-only) | `agents/planner.md` → researcher | — |
 | Background dispatch + collection-aware `TaskOutput` delivery (terminal collection suppresses a redundant notice; running poll does not) | `agents/async-researcher.md`, `.claude/commands/bg-research.md` | `FS-BG-TASKOUTPUT` |
 | Read-only gating / web tools / locked YAML | `agents/reviewer.md`, `researcher.md` | — |
 | isolation: worktree | `agents/isolated-worker.md` | — |
