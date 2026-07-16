@@ -37,8 +37,9 @@ not-yet-filed issue against the rubric with **structurally zero GitHub writes**;
 - **proposal-gate** — given a would-be issue (agent-invoked; full mode:
   [references/proposal-gate.md](references/proposal-gate.md)). Structurally **no GitHub writes** — it
   **runs as the read-only `evaluator` sandbox agent**, which physically cannot write, so there is no
-  close, no comment, and no `<N>`/target to write to: it just scores against the rubric and returns a
-  bounded assessment. Used by `implement-feature` in two ways — it **gates** Phase 8 machine-surfaced
+  close, no comment, and no `<N>`/target to write to: it **grounds its score in project evidence**
+  (investigating the repo before rating), scores against the rubric, and returns a bounded assessment
+  carrying evidence anchors. Used by `implement-feature` in two ways — it **gates** Phase 8 machine-surfaced
   findings (clear slop dropped with a one-line tally that says the dropped findings remain in
   `review.md`, the rest surfaced with the assessment embedded and per-item choice preserved) but only
   **annotates** the Phase 1 human-converged feature (it never suppresses the user's own offer).

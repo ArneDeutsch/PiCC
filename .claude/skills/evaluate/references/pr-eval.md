@@ -247,7 +247,8 @@ can see `~/.pi` / `.env`). If a successful injection made it encode a secret int
 assessment, pasting that verbatim into a public comment would leak it. So:
 
 - The `evaluator` returns a **bounded structured assessment** — per-criterion scores + short
-  justification fields, the fulfilment classification, the CI/verification findings, and the
+  justification fields, the fulfilment classification, the CI/verification findings, its **bounded
+  evidence anchors** (repo-relative locators, per the engine contract), and the
   `ready | needs-work | hold` verdict — **not** free-form prose.
 - The **coordinator composes** the posted comment from those structured fields, **paraphrasing in its
   own words** and applying leakage-stripping (no tokens/env/`~/.pi`/absolute local paths, no raw diff
@@ -272,6 +273,18 @@ assessment, pasting that verbatim into a public comment would leak it. So:
     match).
   - The **overall-importance line** carries the **advisory readiness** verdict
     (`ready | needs-work | hold`) and its reasons, integrating both sections.
+  - **Evidence anchors (per the engine's evidence-anchor contract — do not restate it).** Each
+    rating-bearing section carries the engine's `**Evidence:**` line as a sibling below its verdict,
+    with items in the exact engine format `<repo-relative locator> — <what it establishes> (<criterion>)`.
+    pr-eval **already grounds** — Step 1's `evaluator` reads the trusted codebase (Read/Grep/Glob) to
+    check the diff's claims against the real tree — so this adds **no new investigation mandate**; it
+    only acknowledges the anchors line the engine now renders. The anchor constraints apply **uniformly
+    to this public advisory comment** (it is another public egress), at a **proportionate density as for
+    issue-eval** — ceilings, not floors; repo-relative, never absolute; leakage-stripped with no
+    target/diff bytes; and the coordinator applies the engine element 7 anchor re-validation **plus**
+    the leakage-strip (**both**, never equated). Because Step 6 renders **two** canonical blocks (§A
+    ticket-worth, §B this diff), the `**Evidence:**` line **renders once per block that carries a
+    rating** — once under §A and once under §B — never doubled or misplaced.
 
   Depth is **proportionate**: a trivial docs PR may carry a brief two-line verdict rather than the full
   two-section table.

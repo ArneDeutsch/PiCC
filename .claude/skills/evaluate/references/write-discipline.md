@@ -46,7 +46,12 @@ attacker-influenced text can never ride along with a destructive action.
    diff is ever interpolated into a command or executed. No reproducer, command, or link from a target
    is run or fetched (the reading agent has no shell/fetch anyway).
 3. **No leakage.** No tokens, env, credentials, `~/.pi` paths, raw command output/diffs, or absolute
-   local paths in any public write.
+   local paths in any public write. A public write that carries **evidence anchors** (an issue-eval
+   keep-open, a pr-eval advisory, or a Phase 8 filed `## Evaluation` body) additionally gets the
+   **engine element-7 anchor re-validation** — [evaluation-engine.md](evaluation-engine.md) is
+   authoritative — applied **in addition to** this leakage-strip (it is strictly stronger: it also
+   rejects `..`/outside-repo/secret-file locators, normalizes to repo-root-relative, caps at ≤5, and
+   never re-opens an anchor). This is a pointer, not a restatement — the engine owns the list.
 4. **Echo every write back with its URL.**
 5. **Attribution trailer** as the final line of every artifact we author (comment, canned close
    comment):

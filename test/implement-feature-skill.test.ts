@@ -398,3 +398,53 @@ describe("proposal-gate wiring floor markers (evaluate-skill t04)", () => {
     expect(body).toContain("never suppresses this offer");
   });
 });
+
+describe("evidence-grounded evaluation wiring (F23 t04)", () => {
+  // Loose, whitespace-collapsed, case-insensitive checks on the two implement-feature
+  // reference files that consume proposal-gate. Dash seams are built from code points so
+  // this source stays ASCII-clean; asserted path/tool examples use forward slashes (the
+  // repo-relative convention the evidence anchors are normalized to).
+  const collapse = (p: string): string =>
+    fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
+  const TICKET_INTEGRATION_PATH = path.join(REFERENCES_DIR, "ticket-integration.md");
+  const TICKET_CREATION_PATH = path.join(REFERENCES_DIR, "ticket-creation.md");
+  const EN_DASH = String.fromCodePoint(0x2013);
+
+  it("Phase 1 advisory (ticket-creation.md) investigates the project, presents the block with evidence anchors, never baked into the filed body", () => {
+    const body = collapse(TICKET_CREATION_PATH);
+    // Grounded: the advisory now investigates the project before it rates.
+    expect(body).toContain("investigates the project and rates");
+    // The grounding investigation is the EVALUATOR's job via Read/Grep/Glob; the
+    // implement-feature coordinator adds NO new gh/fetch to satisfy grounding.
+    expect(body).toContain("`read`/`grep`/`glob`");
+    expect(body).toContain("coordinator adds no new");
+    expect(body).toContain("no new `gh`");
+    // The presented rating block now includes its evidence anchors, in-session only.
+    expect(body).toContain("evidence anchors");
+    expect(body).toContain("in-session");
+    // Unchanged: the assessment is never baked into the filed public issue body.
+    expect(body).toContain("never baked into the filed public issue body");
+  });
+
+  it("Phase 8 embed (ticket-integration.md) carries repo-relative, leakage-stripped anchors under the full element-7 re-validation, gate semantics unchanged", () => {
+    const body = collapse(TICKET_INTEGRATION_PATH);
+    // The ## Evaluation embed carries the evidence anchors.
+    expect(body).toContain("`## evaluation`");
+    expect(body).toContain("evidence anchors");
+    // Full engine element-7 anchor re-validation, NOT merely Rule 6.
+    expect(body).toContain("element-7 anchor re-validation");
+    expect(body).toContain("`..` traversal");
+    expect(body).toContain("repo-root-relative forward-slash path");
+    // The never-re-open property the anchor re-validation adds over Rule 6.
+    expect(body).toContain("never re-opens or resolves");
+    // Binds the load-bearing must-fix relationship: element-7 is applied IN ADDITION TO
+    // Rule 6, not instead of it — a rewrite that dropped this distinction must redden.
+    expect(body).toContain("strictly stronger check applied **in addition to** rule 6");
+    // Pick-list density: disposition + at most 1–2 decision-flipping anchors.
+    expect(body).toContain(`1${EN_DASH}2`);
+    expect(body).toContain("decision-flipping anchors");
+    // Unchanged gate semantics + per-item maintainer choice.
+    expect(body).toContain("subtracts clear slop, never adds");
+    expect(body).toContain("choose per _presented_ finding");
+  });
+});
