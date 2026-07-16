@@ -1,7 +1,7 @@
 # PiCC architecture
 
 A contributor's map of how PiCC runs a Claude Code project on a GPT/Codex model. It is
-factual and cites file paths; for *what* and *why* see [`doc/plan/picc-plan.md`](plan/picc-plan.md),
+factual and cites file paths; for *what* and *why* see [`doc/picc-plan.md`](picc-plan.md),
 and for the exact Pi API contracts see [`doc/design/pi-integration.md`](design/pi-integration.md).
 
 ## 1. Layered design

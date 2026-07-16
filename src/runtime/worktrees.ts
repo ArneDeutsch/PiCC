@@ -6,8 +6,7 @@ import type { Diagnostic, WorktreeSettings } from "../types.js";
 import { isDirectory, readTextSafe } from "../util/fs.js";
 
 /**
- * Git worktree mechanics for EnterWorktree / ExitWorktree (plan §4.4, §12.3;
- * research doc/research/03-worktrees-and-git.md).
+ * Git worktree mechanics for EnterWorktree / ExitWorktree (plan §4.4, §12.3).
  *
  * Layout & grammar (Claude Code compatible):
  * - Worktree dir:   <projectRoot>/.claude/worktrees/<flat-name>/

@@ -6,3 +6,6 @@ dist/
 examples/**/.claude/worktrees/
 examples/**/.claude/.picc/
 test-output/
+doc/plan/
+doc/research/
+doc/review/

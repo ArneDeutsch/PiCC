@@ -127,7 +127,9 @@ describe("description-based naming contract", () => {
     expect(body).toContain("append/increment a numeric counter");
 
     for (const marker of [
-      "fetched `targetdefault` tree",
+      // The vacuous "doc/plan/<slug> in the fetched targetDefault tree" collision clause was
+      // dropped in untrack-process-artifacts: plan folders are gitignored and never on a fetched
+      // tree, so a stale one can only appear in the current filesystem (still checked below).
       "current filesystem including a dangling symlink",
       "physical `.claude/worktrees/<feature-slug>`",
       "registered worktree",
@@ -161,7 +163,6 @@ describe("description-based naming contract", () => {
     expect(body).toContain("`doc/plan/<feature-slug>/` folder");
     expect(body).toContain("# <feature-slug> review: <title>");
     expect(body).toContain("with exactly the same frozen `<title>`");
-    expect(body).toContain("`<feature-slug>: plan — ` and `<feature-slug>: review — ` must equal the frozen `<title>` exactly");
     expect(body).toContain("task and fix commits require only the slug prefix");
     expect(body).toContain("stop before further commands or writes");
     for (const trustMarker of [
@@ -190,7 +191,6 @@ describe("description-based naming contract", () => {
   it("keeps the resident router on the same descriptive identity and presentation gate", () => {
     const body = collapsed("SKILL.md");
     expect(body).toContain("classify resume before new naming");
-    expect(body).toContain("<feature-slug>: plan — <title>");
     expect(body).toContain("<feature-slug>: t<task-number> — <description>");
     expect(body).toContain("never sanitize/add a counter");
     expect(body).toContain("explicit human confirmation");
@@ -285,8 +285,7 @@ describe("description-based naming contract", () => {
   it("pins all commit forms and retained GitHub/task-local numbering", () => {
     const workflow = collapsed("references/workflow-detail.md");
     for (const form of [
-      "<feature-slug>: plan — <title>", "<feature-slug>: t<task-number> — <description>",
-      "<feature-slug>: review — <title>", "<feature-slug>: <description>",
+      "<feature-slug>: t<task-number> — <description>", "<feature-slug>: <description>",
     ]) expect(workflow).toContain(form);
     expect(read("references/ticket-integration.md")).toContain("#N");
     expect(read("references/templates.md")).toContain("<task-number>");
@@ -355,14 +354,74 @@ describe("description-based naming contract", () => {
     expect(handoff).toContain("explicit no-`gh` git-only degrade alone reserves literal `origin`");
   });
 
-  it("updates contributor and changelog contracts without scanning historical records", () => {
+  it("updates the contributor contract without scanning historical records", () => {
     const contributing = fs.readFileSync(path.resolve(SKILL_DIR, "../../../CONTRIBUTING.md"), "utf8").replace(/\r\n/g, "\n");
-    const changelog = fs.readFileSync(path.resolve(SKILL_DIR, "../../../CHANGELOG.md"), "utf8").replace(/\r\n/g, "\n");
     expect(contributing).toContain("git checkout feature/<feature-slug>");
     expect(contributing).not.toMatch(/git checkout feature\/<nn>-<slug>/i);
-    const unreleased = changelog.slice(changelog.indexOf("## [Unreleased]"), changelog.indexOf("### Added — evaluate skill"));
-    for (const marker of ["descriptive slug", "canonical numeric reference", "`t01`", "legacy"])
-      expect(unreleased.toLowerCase()).toContain(marker);
+  });
+
+  it("gitignores the per-feature process folders but not doc/design", () => {
+    const gitignore = fs.readFileSync(path.resolve(SKILL_DIR, "../../../.gitignore"), "utf8").replace(/\r\n/g, "\n");
+    for (const entry of ["doc/plan/", "doc/research/", "doc/review/"]) expect(gitignore).toContain(entry);
+    expect(gitignore).not.toContain("doc/design/");
+  });
+
+  it("no longer ships a CHANGELOG.md at the repo root", () => {
+    expect(fs.existsSync(path.resolve(SKILL_DIR, "../../../CHANGELOG.md"))).toBe(false);
+  });
+});
+
+describe("untrack-process-artifacts (t03) — implement-feature rework", () => {
+  const read = (relative: string): string =>
+    fs.readFileSync(path.join(SKILL_DIR, relative), "utf8").replace(/\r\n/g, "\n");
+  const collapsed = (relative: string): string => read(relative).toLowerCase().replace(/\s+/g, " ");
+  const AGENTS_DIR = path.resolve(SKILLS_DIR, "..", "agents");
+  const LEGACY_RE = /<!-- LEGACY-RESUME-START:[\s\S]*?<!-- LEGACY-RESUME-END -->/;
+
+  it("carries no case-insensitive 'changelog' anywhere under .claude/skills or .claude/agents", () => {
+    // Regression guard for the whole purge — this covers t01/t02's files too, which is why t03
+    // (its scan) depends on t02. Reuse the loader's own file walker; CRLF is irrelevant to a
+    // case-folded substring test.
+    const files = [
+      ...walkFiles(SKILLS_DIR, (n) => n.endsWith(".md")),
+      ...walkFiles(AGENTS_DIR, (n) => n.endsWith(".md")),
+    ];
+    expect(files.length).toBeGreaterThan(0);
+    for (const file of files) {
+      expect(fs.readFileSync(file, "utf8").toLowerCase(), norm(file)).not.toContain("changelog");
+    }
+  });
+
+  it("carries no plan—/review— commit SUBJECT outside the legacy region, and keeps the task form", () => {
+    // Anchor to the commit SUBJECT form ": plan — " / ": review — ", NEVER bare "review — " prose:
+    // SKILL.md legitimately says "implementation and review — all in this session" and "only
+    // review — never dispatch one to implement". workflow-detail.md's only such hits are the commit
+    // grammar (now removed) or inside the excluded LEGACY-RESUME region.
+    for (const relative of ["SKILL.md", "references/workflow-detail.md"]) {
+      let body = read(relative);
+      if (relative === "references/workflow-detail.md") body = body.replace(LEGACY_RE, "");
+      expect(body, relative).not.toContain(": plan — ");
+      expect(body, relative).not.toContain(": review — ");
+      // The task commit subject form still ships in both files.
+      expect(body, relative).toContain("t<task-number> — ");
+    }
+  });
+
+  it("classifies resume from the on-disk plan folder + feature.md heading, not plan—/review— commit agreement", () => {
+    const body = collapsed("references/workflow-detail.md");
+    // Reconstruction reads the surviving worktree on disk, not a committed tree.
+    expect(body).toContain("on-disk (gitignored) plan folder");
+    expect(body).toContain(
+      "the exact on-disk `doc/plan/<feature-slug>/` folder and `# <feature-slug>: <title>` heading",
+    );
+    // The frozen title is single-sourced from the on-disk feature.md heading.
+    expect(body).toContain("single-sourced from the on-disk `feature.md` heading");
+    // Identity is no longer conditioned on plan—/review— commit-title agreement.
+    expect(body).not.toContain(
+      "`<feature-slug>: plan — ` and `<feature-slug>: review — ` must equal",
+    );
+    // Refinement #8: the absent-plan-folder resume branch does not fall through to the generic stop.
+    expect(body).toContain("never committed, and cannot be recovered here");
   });
 });
 
