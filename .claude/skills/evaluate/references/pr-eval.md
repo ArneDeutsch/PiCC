@@ -247,7 +247,8 @@ can see `~/.pi` / `.env`). If a successful injection made it encode a secret int
 assessment, pasting that verbatim into a public comment would leak it. So:
 
 - The `evaluator` returns a **bounded structured assessment** — per-criterion scores + short
-  justification fields, the fulfilment classification, the CI/verification findings, and the
+  justification fields, the fulfilment classification, the CI/verification findings, its **bounded
+  evidence anchors** (repo-relative locators, per the engine contract), and the
   `ready | needs-work | hold` verdict — **not** free-form prose.
 - The **coordinator composes** the posted comment from those structured fields, **paraphrasing in its
   own words** and applying leakage-stripping (no tokens/env/`~/.pi`/absolute local paths, no raw diff

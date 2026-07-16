@@ -69,7 +69,7 @@ postures:
 
 Every **surfaced** value assessment carries **bounded, repo-relative evidence anchors** below the
 overall-importance line, so a maintainer can see what the judgement is founded on. This is the single,
-binding source for the anchor shape; the modes (t02–t04) reference it and do not restate it.
+binding source for the anchor shape; the mode references (proposal-gate, issue-eval, pr-eval) reference it and do not restate it.
 
 1. **Block label & item format.** The line is `**Evidence:**`, followed by a bulleted list; each anchor
    item reads `<repo-relative locator> — <what it establishes> (<criterion>)`. The locator may be a
