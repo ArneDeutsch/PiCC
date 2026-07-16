@@ -28,3 +28,8 @@ review.md. Dated bullets, one line each.
   are trusted-tree files, only prose is leakage-stripped, both public egresses (issue-eval +
   pr-eval) proportionately bounded, close-invariant/L1/redirect isolation untouched. issue-eval
   cap tightened to ≤1 brief / ≤4 full (stronger than engine's ≤5), ceilings-never-floors.
+- 2026-07-16 t04: docs + tester + security reviews PASS. The Phase 8 `## Evaluation` embed
+  (public body authored by the Bash+Read coordinator) correctly applies the full element-7
+  re-validation IN ADDITION TO Rule 6 (the plan's security must-fix). Added one test pin for
+  the "strictly stronger ... in addition to Rule 6" relationship (tester NIT). CHANGELOG entry
+  style-faithful + conflict-safe (separate dated block); no capability regen, no other docs.
