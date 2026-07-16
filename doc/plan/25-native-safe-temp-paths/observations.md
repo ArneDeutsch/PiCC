@@ -55,3 +55,16 @@ review.md). Dated bullets, one line each.
   skills that hardcode `/tmp` (already broken on Claude Code too — outside the parity goal).
   The approach-B investigation notes are preserved here as the rationale should it ever be
   reconsidered as a separate, deliberate feature.
+
+## 2026-07-16 — Phase 7 (t01 implemented, reviewed, committed)
+
+- t01 PASS (coder + security). Spec was silent on scratch-dir creation-failure handling;
+  implementer added a `try/catch` (console.error, leave `scratchDir` undefined) matching the
+  surrounding completeness-floor idiom — sound gap-fill, t02 treats undefined as "omit".
+- Deferred/known: **scratch-dir cleanup** — a new `picc-scratch-*` dir per session is never
+  removed (Claude Code also leaves scratchpad dirs; retention is #41). Disk-hygiene follow-up
+  candidate — consider a process-exit best-effort `rmSync` or fold into #41.
+- Forward note for t02 review: `toNativeSafeTempForm` blindly converts backslashes on win32;
+  if `realpathSync` ever returns an extended-length `\\?\C:\…` or UNC `\\server\share` form,
+  the result is `//?/…` / `//server/…` — check t02's namespace-agreement holds (low
+  likelihood: Node strips `\\?\` for ordinary temp paths).

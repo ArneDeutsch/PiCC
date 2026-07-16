@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
 import type { HookOutcome, HookPayload, ToolCallDescriptor } from "./types.js";
@@ -54,7 +55,7 @@ import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
 import { resolveGitBashPath } from "./engine/shell-inject.js";
-import { applyUnicodeSafeProcessEnv, unicodeSafeSubprocessEnv } from "./util/env.js";
+import { applyUnicodeSafeProcessEnv, toNativeSafeTempForm, unicodeSafeSubprocessEnv } from "./util/env.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
 
 /**
@@ -928,6 +929,30 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     } catch (err) {
       console.error(`PiCC: failed to register tool: ${(err as Error).message}`);
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Per-session native-safe scratch dir (feature 25 / #48)
+  // ---------------------------------------------------------------------------
+  // Created EAGERLY in the outer scope — before the async IIFE below and the
+  // before_agent_start registration — so its literal resolved path is captured
+  // synchronously at the t02 system-prompt injection call site (not raced by the
+  // first turn nor left `undefined` by the error-swallowing async closure).
+  // Order is load-bearing: mkdtemp → realpath → slash-transform. Applying the
+  // slash transform before realpath'ing would silently return the backslash form.
+  // Root honors CLAUDE_CODE_TMPDIR (Claude Code's actual scratch relocation knob)
+  // so a Claude project's tmpdir policy carries over, else os.tmpdir(). Both read
+  // the harness process env, which a project settings.json cannot touch.
+  let scratchDir: string | undefined;
+  try {
+    const scratchRoot = process.env.CLAUDE_CODE_TMPDIR || os.tmpdir();
+    const rawDir = fs.mkdtempSync(path.join(scratchRoot, "picc-scratch-"));
+    const realDir = fs.realpathSync(rawDir);
+    scratchDir = toNativeSafeTempForm(realDir);
+  } catch (err) {
+    // A scratch-dir failure must never crash activation; t02 simply omits the
+    // scratchpad guidance when the value is unavailable.
+    console.error(`PiCC: session scratch dir unavailable: ${(err as Error).message}`);
   }
 
   // Cwd-swapping overrides of Pi built-ins (design doc §3.1). Renderers are inherited.

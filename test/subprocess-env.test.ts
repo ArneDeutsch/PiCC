@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { applyUnicodeSafeProcessEnv, unicodeSafeSubprocessEnv } from "../src/util/env.js";
+import { applyUnicodeSafeProcessEnv, toNativeSafeTempForm, unicodeSafeSubprocessEnv } from "../src/util/env.js";
 
 describe("unicodeSafeSubprocessEnv", () => {
   it("sets Python UTF-8 defaults when unset", () => {
@@ -43,6 +43,50 @@ describe("unicodeSafeSubprocessEnv", () => {
         expect(env[k]).toBe(v);
       }
     }
+  });
+});
+
+// Table-driven, platform-injected (ungated on all OSes) — locks the #48
+// regression: the win32 result is the forward-slash drive-letter form both the
+// pinned Git Bash and the native Read/Grep/Glob tools resolve to the same real
+// dir, and is NEVER a bare `/tmp/...`, NEVER leading-slash. Off-win32 the path is
+// byte-for-byte unchanged.
+describe("toNativeSafeTempForm", () => {
+  it("win32: converts backslashes to forward slashes (drive-letter form)", () => {
+    const out = toNativeSafeTempForm("C:\\Users\\A\\Temp", "win32");
+    expect(out).toBe("C:/Users/A/Temp");
+    // Anti-/tmp regression: drive-letter form, not a leading-slash mount path.
+    expect(out).toMatch(/^[A-Za-z]:\//);
+    expect(out.startsWith("/")).toBe(false);
+  });
+
+  it("win32: a realistic %LOCALAPPDATA%\\Temp scratch dir stays drive-anchored", () => {
+    const out = toNativeSafeTempForm(
+      "C:\\Users\\Arne\\AppData\\Local\\Temp\\picc-scratch-a1b2c3",
+      "win32",
+    );
+    expect(out).toBe("C:/Users/Arne/AppData/Local/Temp/picc-scratch-a1b2c3");
+    expect(out.startsWith("/")).toBe(false);
+  });
+
+  it("linux: returns the path unchanged", () => {
+    expect(toNativeSafeTempForm("/tmp/x", "linux")).toBe("/tmp/x");
+  });
+
+  it("darwin: returns the path unchanged", () => {
+    expect(toNativeSafeTempForm("/var/folders/x", "darwin")).toBe("/var/folders/x");
+  });
+
+  it("win32: idempotent — applying twice equals applying once", () => {
+    const once = toNativeSafeTempForm("C:\\Users\\A\\Temp", "win32");
+    const twice = toNativeSafeTempForm(once, "win32");
+    expect(twice).toBe(once);
+  });
+
+  it("defaults platform to process.platform", () => {
+    const input = process.platform === "win32" ? "C:\\a\\b" : "/a/b";
+    const expected = toNativeSafeTempForm(input, process.platform);
+    expect(toNativeSafeTempForm(input)).toBe(expected);
   });
 });
 

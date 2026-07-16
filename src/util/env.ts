@@ -27,6 +27,31 @@ export function unicodeSafeSubprocessEnv(
 }
 
 /**
+ * Convert a resolved absolute path into the form that both the pinned Git Bash
+ * (as a redirect target) and the native Node file tools (`Read`/`Grep`/`Glob`)
+ * resolve to the *same* real path.
+ *
+ * On Windows the harness shell is a POSIX-emulation shell (Git Bash/MSYS): a bare
+ * `/tmp/...` string denotes the shell's mount to Git Bash but a drive-relative
+ * `F:\tmp\...` to native Node — the same string, two different real files. The
+ * forward-slash drive-letter form (`C:/Users/A/Temp`) is a valid Git Bash redirect
+ * target AND is resolved identically by the native Pi Read tool, so both namespaces
+ * agree. On every other platform the shell and native tools already share one
+ * namespace, so the path is returned unchanged.
+ *
+ * Pure and side-effect free; `platform` is injectable (default `process.platform`)
+ * mirroring `resolveShellBinary`'s seam. `shell` is deliberately not a parameter:
+ * the forward-slash form is valid for Git Bash, PowerShell, and native Node alike.
+ */
+export function toNativeSafeTempForm(
+  p: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform === "win32") return p.replace(/\\/g, "/");
+  return p;
+}
+
+/**
  * Apply the same defaults to the harness process env once at startup, so every
  * child process — including subagent bash tools built by the Pi SDK, which we do
  * not spawn ourselves — inherits them. Existing values are never overwritten.
