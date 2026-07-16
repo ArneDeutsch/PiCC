@@ -86,3 +86,18 @@ review.md). Dated bullets, one line each.
   turn; a mild tension with evaluate echoing writes. Covered by evaluate's existing
   write-discipline (no absolute local paths in public writes, mechanic 3); not added to the
   injected guidance to avoid bloating it.
+
+- t03 RAN (not skipped) and PASSED on the Windows dev machine — the real #48 witness is green.
+  Spec correction: the pinned Pi SDK read `execute` destructures `{ path }`, NOT `{ file_path }`
+  (my t03 spec said file_path). Production uses `path` end-to-end (the Pi read schema names it
+  `path`; `file_path` is only the Claude-shaped alias the permission/hook layer matches on via
+  tool-map), so there is NO production reliance on file_path reaching the read tool — the test
+  passes both keys defensively. **Follow-up candidate:** if a Claude-authored skill instructs
+  the model to call Read with `file_path`, does the Pi `read` execute accept it (it currently
+  throws on file_path-only)? Likely a non-issue (the model follows the Pi tool's `path` schema),
+  but worth a parity check → review.md.
+- t03 discrimination note: the test proves the prescribed forward-slash drive-letter path works
+  cross-tool first attempt, and a POSIX `/tmp/...` in the same structure WOULD fail the native
+  Read (the real #48 mode). It does not separately discriminate forward-slash vs backslash for
+  *inline* redirects (the path is passed via argv, not shell-parsed) — acceptable: the
+  deterministic form-regression lives in t01's pure table, per the plan's test split.
