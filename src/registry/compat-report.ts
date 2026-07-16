@@ -373,9 +373,13 @@ function subagentPostureLine(project: ClaudeProject): string {
   if (subagentMaxDepth >= 2) {
     return `Subagent nesting: up to ${subagentMaxDepth} levels below the main session (subagents.maxDepth=${subagentMaxDepth}).`;
   }
-  // Out-of-range value (0, negative, fractional) — subagents.maxDepth is not
-  // clamped on load, so report the actual number truthfully instead of claiming
-  // the default. Never asserts "=1, PiCC default" for a value that isn't 1.
+  // Out-of-range value (0, negative, fractional) — the settings loader now
+  // validates subagents.maxDepth as a positive integer, so a loaded value never
+  // reaches here. This defensive branch survives because a ClaudeProject can be
+  // constructed with an out-of-range subagentMaxDepth directly (bypassing the
+  // loader — e.g. registry tests), and we still report the actual number
+  // truthfully instead of claiming the default. Never asserts "=1, PiCC default"
+  // for a value that isn't 1.
   return `Subagent nesting: subagents.maxDepth=${subagentMaxDepth} (a PiCC extension). Set it to 1 for main-session-only, or 2..5 to allow nested delegation.`;
 }
 

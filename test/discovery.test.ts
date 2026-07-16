@@ -534,6 +534,101 @@ describe("loadSettings — recognized toggles", () => {
     expect(load(scopes).subagentsEnabled).toBe(true);
   });
 
+  it.each([
+    ["subagents.maxDepth", "subagentMaxDepth", 1, 0],
+    ["subagents.maxDepth", "subagentMaxDepth", 1, -2],
+    ["subagents.maxDepth", "subagentMaxDepth", 1, 1.5],
+    ["subagents.concurrency", "subagentConcurrency", 4, 0],
+    ["subagents.concurrency", "subagentConcurrency", 4, -2],
+    ["subagents.concurrency", "subagentConcurrency", 4, 1.5],
+  ] as const)(
+    "rejects %s=%s (keeps default) with a diagnostic",
+    (keyLabel, effectiveKey, defaultValue, badValue) => {
+      const sub = keyLabel === "subagents.maxDepth" ? { maxDepth: badValue } : { concurrency: badValue };
+      const scopes = makeScopes();
+      writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), { subagents: sub });
+
+      const settings = load(scopes);
+      expect(settings[effectiveKey]).toBe(defaultValue);
+      expect(
+        settings.diagnostics.some(
+          (d) => d.message.includes(keyLabel) && d.message.includes("must be a positive integer"),
+        ),
+      ).toBe(true);
+    },
+  );
+
+  it("rejects a non-numeric maxDepth/concurrency but honors a numeric string", () => {
+    const scopes = makeScopes();
+    // Numeric string is tolerated (asFiniteNumber), no diagnostic.
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+      subagents: { maxDepth: "3", concurrency: "8" },
+    });
+    let settings = load(scopes);
+    expect(settings.subagentMaxDepth).toBe(3);
+    expect(settings.subagentConcurrency).toBe(8);
+    expect(settings.diagnostics.some((d) => d.message.includes("positive integer"))).toBe(false);
+
+    // Non-numeric values are rejected back to the defaults with diagnostics.
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+      subagents: { maxDepth: "abc", concurrency: true },
+    });
+    settings = load(scopes);
+    expect(settings.subagentMaxDepth).toBe(1);
+    expect(settings.subagentConcurrency).toBe(4);
+    expect(
+      settings.diagnostics.filter((d) => d.message.includes("must be a positive integer")),
+    ).toHaveLength(2);
+  });
+
+  it("honors large positive integers with no upper-bound rejection and no diagnostic", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+      subagents: { maxDepth: 50, concurrency: 100 },
+    });
+    const settings = load(scopes);
+    expect(settings.subagentMaxDepth).toBe(50);
+    expect(settings.subagentConcurrency).toBe(100);
+    expect(settings.diagnostics.some((d) => d.message.includes("positive integer"))).toBe(false);
+  });
+
+  it("keeps a valid lower-scope maxDepth when a higher scope has an invalid value (reject, not clamp)", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), {
+      subagents: { maxDepth: 3 },
+    });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+      subagents: { maxDepth: 0 }, // invalid at higher scope — must be ignored, NOT clamp to 1
+    });
+
+    const settings = load(scopes);
+    expect(settings.subagentMaxDepth).toBe(3);
+    expect(
+      settings.diagnostics.some(
+        (d) => d.message.includes("subagents.maxDepth") && d.message.includes("must be a positive integer"),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps a valid lower-scope concurrency when a higher scope has an invalid value (reject, not clamp)", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), {
+      subagents: { concurrency: 8 },
+    });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+      subagents: { concurrency: -1 }, // invalid at higher scope — must be ignored, NOT clamp
+    });
+
+    const settings = load(scopes);
+    expect(settings.subagentConcurrency).toBe(8);
+    expect(
+      settings.diagnostics.some(
+        (d) =>
+          d.message.includes("subagents.concurrency") && d.message.includes("must be a positive integer"),
+      ),
+    ).toBe(true);
+  });
+
   it("recognizes worktree.baseRef and rejects invalid values with a diagnostic", () => {
     const scopes = makeScopes();
     writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
