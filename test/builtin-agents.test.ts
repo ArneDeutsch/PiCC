@@ -163,6 +163,10 @@ describe("built-in agents through the extension (E1/E2/E6)", () => {
     expect(prompt).not.toContain("BI-ROOT-CLAUDE-MD");
     expect(prompt).not.toContain("BI-UNCOND-RULE");
     expect(prompt).toContain("Claude Code compatibility conventions");
+    // F24: the always-on collaborative-planning nudge reaches subagents too —
+    // even `skipProjectContext` agents (Plan/Explore) keep the conventions block,
+    // so the nudge is present for every model in every dispatch context.
+    expect(prompt).toMatch(/ask only when blocked/);
     expect(prompt).toContain("You are a software architect");
   });
 
