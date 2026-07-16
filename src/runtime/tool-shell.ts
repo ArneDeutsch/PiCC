@@ -218,6 +218,17 @@ export function genericCallComponent(toolName: string, theme: unknown): Componen
  * be shown. Pi's own `getTextOutput` is not importable (blocked by the package
  * `exports` map — the deep `dist/core/tools/render-utils.js` path does not
  * resolve), so the transform is reproduced here.
+ *
+ * Tabs are then normalized to three spaces — exactly what Pi's own fallback does.
+ * Pi renders a renderer-less result via `new Text(...)`, and pi-tui `Text.render`
+ * runs `this.text.replace(/\t/g, "   ")` (a flat 3-space replace, confirmed in
+ * `@earendil-works/pi-tui/dist/components/text.js`) BEFORE `wrapTextWithAnsi`.
+ * `getTextOutput`/`sanitizeBinaryOutput` preserve `\t`, so without this the raw
+ * tab would render instead of Pi's 3-space form — a small divergence from the
+ * "content visually unchanged" promise. Done on the raw segment before coloring
+ * (color spans the whole segment, so a pre-color replace is equivalent) and before
+ * wrapping, matching Pi's order. ONLY the generic fallback path needs this; the
+ * own-renderer and built-in paths delegate to Pi's renderers, which handle tabs.
  */
 export function genericResultComponent(
   result: ResultShape,
@@ -231,8 +242,11 @@ export function genericResultComponent(
       if (!output) return [];
       const lines: string[] = [];
       for (const seg of output.split("\n")) {
-        // Color THEN wrap — wrapTextWithAnsi carries the active ANSI across breaks.
-        for (const l of wrapTextWithAnsi(themedFg(theme, "toolOutput", seg), Math.max(1, width))) {
+        // Normalize tabs to 3 spaces to match Pi's Text.render (which replaces
+        // \t with "   " before wrapping), then color THEN wrap —
+        // wrapTextWithAnsi carries the active ANSI across breaks.
+        const tabbed = seg.replace(/\t/g, "   ");
+        for (const l of wrapTextWithAnsi(themedFg(theme, "toolOutput", tabbed), Math.max(1, width))) {
           lines.push(l);
         }
       }

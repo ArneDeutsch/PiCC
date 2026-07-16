@@ -55,11 +55,12 @@ import {
 } from "../src/runtime/context-assembly.js";
 import { mapEffort, steeringForModel, type PiCCConfig } from "../src/runtime/steering.js";
 import { createAgentToolDefinition, extractText, type SubagentRuntime } from "../src/runtime/subagents.js";
-import { visibleWidth as tuiVisibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth as tuiVisibleWidth, Text as TuiText } from "@earendil-works/pi-tui";
 import type { ProgressSnapshot } from "../src/runtime/subagent-progress.js";
 import { renderAgentResult } from "../src/runtime/subagent-render.js";
 import {
   bgSlotForCtx,
+  genericResultComponent,
   reframe,
   themedBg,
   wrapForSelfShell,
@@ -2344,6 +2345,29 @@ describe("self-shell wrapper (concise-tool-rows t01)", () => {
       .render(80)
       .join("\n");
     expect(img).toContain("Image");
+  });
+
+  it("generic renderer: a literal tab is normalized to 3 spaces, byte-matching Pi's Text.render", () => {
+    // getTextOutput/sanitizeBinaryOutput PRESERVE \t, so the renderer-less
+    // fallback must normalize it itself to stay byte-identical to Pi's own
+    // fallback (which renders via `new Text(...)`, whose render() does
+    // `text.replace(/\t/g, "   ")` — a flat 3-space replace — before wrapping).
+    const out = genericResultComponent(
+      { content: [{ type: "text", text: "before\tafter" }] },
+      slotTheme, // identity fg/bold → the line is exactly the normalized text
+      { showImages: false } as RenderCtx,
+    )
+      .render(80)
+      .join("\n");
+    // No raw tab survives, and the tab became THREE spaces (Pi's replacement).
+    expect(out.includes("\t")).toBe(false);
+    expect(out).toBe("before   after");
+
+    // Strengthened: byte-match Pi's ACTUAL Text normalization. `new Text(text, 0,
+    // 0)` (no margins/padding, no bg) renders one content line = the tab-normalized
+    // text padded to width; trim the pad and it must equal our fallback line.
+    const piLine = new TuiText("before\tafter", 0, 0).render(80)[0] ?? "";
+    expect(piLine.trimEnd()).toBe(out);
   });
 
   it("TaskStop (renderer-less, new block): self-shell flag, generic title, bg applied, no blank first/last, execute passthrough", () => {
