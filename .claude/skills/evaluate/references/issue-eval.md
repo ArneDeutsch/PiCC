@@ -181,8 +181,11 @@ comment.
 can see `~/.pi` / `.env`). If a successful injection made it encode a secret into a free-text "rating",
 pasting that verbatim into a public comment would leak it. So:
 
-- The `evaluator` returns a **bounded structured rating** — per-criterion scores + short justification
-  fields + an importance verdict + **bounded evidence anchors** — **not** free-form prose.
+- The `evaluator` returns the engine's **locked bounded reviewer return** (defined once in
+  `evaluation-engine.md` §"The locked bounded reviewer return" — this mode points at it and does not
+  re-triplicate the field list), **not** free-form prose. Here the overall verdict is the **keep-open
+  importance** verdict, and the anchor part is the mode's **bounded evidence anchors**; the engine owns
+  the rest of the field list.
 - The **coordinator composes** the posted comment from those structured fields, **paraphrasing in its
   own words** and applying leakage-stripping (no tokens/env/`~/.pi`/absolute local paths). It **never
   pastes the evaluator's returned text verbatim**, and uses **no verbatim excerpt of target content**
@@ -213,6 +216,15 @@ line, and the bounded return carries the matching anchors field. Each anchor ite
   repo-root-relative, cap the list at the proportionate ceiling, treat anchors as display-only strings
   it **never re-opens or resolves** — **plus** the existing per-criterion leakage-strip
   (tokens / env / `~/.pi` / absolute local paths). It applies **both**; the two are **never equated**.
+- **Provenance is visible in the render (per the engine's provenance enum, element 3).** The
+  `**Evidence:**` block carries **verified classes only** (`repo_verified` / `metadata_verified` /
+  `github_verified`) — a `target_claim` or `inference` is never eligible there, so the block is
+  **trustworthy against unverified-claim masquerade by construction** (the exclusion property, not a claim
+  that a verified class's contents skip the engine's leakage-strip). Load-bearing claims in the
+  **Reasoning column** instead carry a **lightweight provenance cue** (e.g. "claimed by the issue" /
+  "verified in repo" / "inferred"; the coordinator may additionally attach "coordinator-verified metadata"
+  or "found by the coordinator's issue search") so an unverified target claim can never masquerade as
+  verified fact in the posted comment.
 
 **The slop threshold (this mode's Left-open call).** On the engine's rating scale, map cost-vs-benefit
 to a keep/close boundary: an issue whose integrated cost-vs-benefit is **decisively negative** — low

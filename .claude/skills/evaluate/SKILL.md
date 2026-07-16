@@ -74,6 +74,15 @@ flag in any position", so it is best-effort, not a complete block. The **close-i
 the final guard; `gh issue close` cannot be on the deny floor because this skill needs it.
 Full allow-list + mechanics: [references/write-discipline.md](references/write-discipline.md).
 
+**A read is not a write.** proposal-gate's advisory cross-feature issue search — a read-only
+`gh issue list --search` the **coordinator** runs to cross-check whether a surfaced finding is already
+tracked ([references/proposal-gate.md](references/proposal-gate.md)) — is a coordinator **read**, not a
+fifth write: it adds **zero** write verbs, so this four-write envelope and the `"zero github writes"` /
+`"no github writes"` invariants stay exactly true (they are about writes). Two layers, unchanged: the
+`evaluator` **sandbox** is zero-network (structural, tool-enforced); the **coordinator** already
+performs all `gh` I/O, and this search is a new instance of that existing role, never a new capability
+class — never call the skill as a whole "zero-network".
+
 **Close-invariant:** a **close always carries the canned comment** (which contains none of the
 target's text); only a **keep-open** ever carries a model-authored rating. Attacker-influenced text
 can never ride along with a destructive action.
