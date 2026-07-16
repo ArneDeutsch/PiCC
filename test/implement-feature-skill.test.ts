@@ -163,6 +163,15 @@ describe("description-based naming contract", () => {
     expect(body).not.toMatch(/next free|pick the next free|feature\/<nn>|f<nn>/i);
   });
 
+  it("Phase 7 review fan-out surfaces new untracked non-ignored files, not bare git diff HEAD (GitHub #13)", () => {
+    // Loose positive floor: the fan-out step must stage (or otherwise surface) new untracked
+    // non-ignored files so a reviewer's view is complete — guarding against a silent regression to
+    // bare `git diff HEAD`, the exact recurrence #13 documents three times. Accept either mechanism
+    // (`git add -A` staging or a reviewer `git status --short` read); no brittle exact-phrase pin.
+    const body = collapsed("references/workflow-detail.md");
+    expect(body).toMatch(/git add -a|git status --short/);
+  });
+
   it("pins the plan-folder templates and task-local numbering (loose)", () => {
     const body = read("references/templates.md");
     expect(body).toContain("doc/plan/<feature-slug>/");

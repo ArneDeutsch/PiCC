@@ -113,7 +113,7 @@ Fan reviewers over the whole plan folder (feature.md + all task specs) in parall
 
 ## Phase 7 — Implementation loop
 
-For each task, in planned order: **dispatch** a fresh `implementer` with feature.md + the task spec + the standing rules (relayed verbatim); apply the escalation boundary; run the **review fan-out** yourself (reviewers by surface touched); **triage and fix** (trivial yourself, larger via an `implementer` in fix mode); **distill observations** into `observations.md`; then **gate on green and commit** `<feature-slug>: t<task-number> — <description>` (log/observations gitignored). The standing rules and full loop: [references/workflow-detail.md](references/workflow-detail.md) (Phase 7) — read before dispatching.
+For each task, in planned order: **dispatch** a fresh `implementer` with feature.md + the task spec + the standing rules (relayed verbatim); apply the escalation boundary; run the **review fan-out** yourself (`git add -A` first so reviewers see new untracked files; reviewers by surface touched); **triage and fix** (trivial yourself, larger via an `implementer` in fix mode); **distill observations** into `observations.md`; then **gate on green and commit** `<feature-slug>: t<task-number> — <description>`, staging bounded — never a blank `git add -A` (log/observations gitignored). The standing rules and full loop: [references/workflow-detail.md](references/workflow-detail.md) (Phase 7) — read before dispatching.
 
 ## Phase 8 — Feature close review
 
