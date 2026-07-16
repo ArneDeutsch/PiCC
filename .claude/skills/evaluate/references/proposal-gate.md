@@ -69,8 +69,10 @@ signal (#66) is supplied by the **invoking coordinator** — the `evaluate` skil
 `implement-feature` at its **Phase 8** finding-filing offer — which already holds `gh`/Bash. It is
 **never** run by the sandbox and is **not part of the evaluator's grounding**; it enters the gate as a
 distinct, coordinator-supplied input, typed as a `github_verified` anchor. This is confined to the
-**Phase 8** path (implement-feature's Phase-1 ticket-creation advisory keeps its own "no new `gh`"
-guarantee — see [ticket-creation.md](../../implement-feature/references/ticket-creation.md)).
+**finding-filing path** (the `evaluate` skill's own proposal mode and implement-feature's **Phase 8**
+finding-filing offer) — **not** implement-feature's Phase-1 ticket-creation, whose advisory keeps its
+own "no new `gh`" guarantee (see
+[ticket-creation.md](../../implement-feature/references/ticket-creation.md)).
 
 **Who runs it, and when.** After the gate has produced its disposition and *before* the coordinator
 presents the surfaced findings, the coordinator may run **one** narrow read-only search per surfaced
@@ -210,9 +212,26 @@ filed feature body**:
   `evaluation-engine.md`'s disagreement-disclosure rule) **rides the lean pick-list too**, not only the
   filed body — it is **decision-flipping by definition**, so whoever chooses from the in-session
   pick-list still sees that the reviewers disagreed. **Provenance rides this same split** (per
-  `evaluation-engine.md`'s element-3 render): compact provenance cues on the load-bearing Reasoning
-  claims in the lean pick-list, the full per-item provenance in the filed `## Evaluation` body — the
-  `**Evidence:**` block itself always carries **verified classes only**.
+  `evaluation-engine.md`'s element-3 render): the lean pick-list has **no Reasoning column**, so its
+  compact provenance cue attaches to the **decision-flipping anchor(s)** and/or the **disposition line**
+  (the rating-derived surfaces actually present), while the full per-Reasoning-claim provenance lives in
+  the filed `## Evaluation` body's rendered block — the `**Evidence:**` block itself always carries
+  **verified classes only**.
+
+**Fixed per-item line order in the pick-list — so N stacked findings stay uniform and scannable.** Each
+surfaced finding renders in this fixed order, top to bottom: (1) **headline**, (2) **elaboration**,
+(3) **disposition + 1–2 decision-flipping anchors**, then any of the conditional **riders** in this
+order — (4a) **Reviewers-split** line, (4b) **Possible existing coverage** candidate line, (4c) the
+**per-call existing-issue-check-unavailable** degrade line. A rider is present only when its condition
+fires (per the engine skeleton's conditional siblings); when present it always occupies this slot, so
+stacked findings line up column-for-column. **One explicit exception to that "always occupies its slot"
+rule — the degrade has two cardinalities:** the (4c) slot carries **only the per-call failure** (a
+rate-limit or timeout on *this* finding's own search) — a genuine per-item rider. The **global**
+unavailability (`gh` absent / unauthenticated, so *no* finding could be cross-checked) is **not**
+stamped into each finding's (4c) slot — that would repeat one batch-wide fact N times, contradicting the
+"emit once for the batch" rule above. It instead renders **once as a batch-level banner** on a single
+line **above the pick-list**, alongside the reachability preamble, **not** inside any finding's block
+(the engine skeleton's decide-once placement).
 
 ## The disposition — drop / surface (gate) vs. annotate (Phase 1)
 

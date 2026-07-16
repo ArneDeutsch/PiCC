@@ -959,8 +959,8 @@ describe("locked bounded reviewer return + fail-safe parse (evaluate-scoring-con
     // The slot is bound to the justification field, not left anchor-only.
     expect(body).toContain("this slot is bound to the justification field");
     // t02 opens the slot; t03 defines the enum vocabulary (forward reference).
-    expect(body).toContain("t02 opens this slot");
-    expect(body).toContain("defined by t03");
+    expect(body).toContain("this slot is opened by the locked bounded reviewer return above");
+    expect(body).toContain('defined in element 3 of "the evidence-anchor contract"');
   });
 
   it("specifies a conservative coordinator fail-safe parse mirroring the L1 UNSURE fail-safe", () => {
@@ -1076,7 +1076,7 @@ describe("provenance enum + bare-#N reconciliation + github_verified (evaluate-s
     expect(body).toContain("filesystem-only evaluator does not query");
     // Paired with the coordinator-supplies-it forward-reference to t05.
     expect(body).toContain("may supply that cross-feature tracking signal");
-    expect(body).toContain("the search wiring is t05");
+    expect(body).toContain("the search wiring lives in proposal-gate.md");
   });
 
   it("evaluator bullet 2 emits ONLY the three sandbox-emittable classes, neither coordinator-only class", () => {
@@ -1455,5 +1455,109 @@ describe("evaluate deny floor admits the advisory read, still denies writes (eva
   it("still denies a representative destructive write (positive control — read allowed without opening a write)", () => {
     expect(isDenied("gh issue delete 5")).toBe(true);
     expect(isDenied("gh issue edit 5 --title x")).toBe(true);
+  });
+});
+
+describe("close-review coherence fixes (evaluate-scoring-contract)", () => {
+  // Loose, case-insensitive, whitespace-collapsed structural checks (handles CRLF).
+  // These pin the CLOSE-REVIEW doc-coherence fixes: the two t05 advisory-search lines placed
+  // in the canonical skeleton as conditional siblings (FIX 1), the github_verified two-surface
+  // reconciliation (FIX 1), the Evidence block's non-repo-relative members in the skeleton +
+  // softened summary (FIX 2), where the pick-list provenance cue attaches with no Reasoning
+  // column (FIX 3), the anchor-cap single-ceiling rule + the sanctioned pr-eval two-block
+  // ordering exception + the fixed pick-list line order (FIX 4), and the "finding-filing path"
+  // reword (FIX 6). We do NOT test LLM judgment. All pinned phrases are ASCII.
+  const collapse = (p: string): string =>
+    fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
+
+  const ENGINE_PATH = path.join(REFERENCES_DIR, "evaluation-engine.md");
+  const PROPOSAL_GATE_PATH = path.join(REFERENCES_DIR, "proposal-gate.md");
+
+  it("FIX 1 — the canonical skeleton carries both t05 advisory lines as conditional siblings", () => {
+    const body = collapse(ENGINE_PATH);
+    // The candidate near-match line + its render condition.
+    expect(body).toContain("possible existing coverage:");
+    expect(body).toContain("render only on a proposal-gate advisory-search github_verified hit");
+    // The visible-degrade line + its render condition.
+    expect(body).toContain("existing-issue check unavailable");
+    expect(body).toContain("novelty not cross-checked against github");
+    expect(body).toContain("render only when the advisory search could not run");
+    // The per-batch-vs-per-finding degrade rule restated at the skeleton.
+    expect(body).toContain("once per batch");
+    expect(body).toContain("once per finding");
+  });
+
+  it("FIX 1 — reconciles one github_verified hit across two surfaces (not a contradiction)", () => {
+    const body = collapse(ENGINE_PATH);
+    // The class marks ORIGIN, not the is-tracked claim — so the candidate line and the Evidence
+    // bullet are the same fact for two audiences, reconciled by density (not by dropping the class).
+    expect(body).toContain("same fact rendered for two audiences");
+    expect(body).toContain("same fact in two surfaces");
+    // Lean pick-list: renders once as the candidate line, NOT also as an Evidence bullet.
+    expect(body).toContain("not** also emitted as a `github_verified` `**evidence:**` bullet");
+  });
+
+  it("FIX 2 — the Evidence block anticipates its non-repo-relative members (skeleton + summary)", () => {
+    const body = collapse(ENGINE_PATH);
+    // Skeleton bullet showing the non-repo-relative anchor.
+    expect(body).toContain("verified non-repo-relative anchor renders here too");
+    // The softened summary no longer under-describes the block, without loosening the allow-list.
+    expect(body).toContain("mostly repo-relative");
+    expect(body).toContain("does **not** loosen the general repo-relative allow-list");
+  });
+
+  it("FIX 3 — states where the pick-list provenance cue attaches (no Reasoning column)", () => {
+    const engine = collapse(ENGINE_PATH);
+    expect(engine).toContain("the lean pick-list is not the rendered table");
+    expect(engine).toContain("decision-flipping anchor(s)");
+    const gate = collapse(PROPOSAL_GATE_PATH);
+    expect(gate).toContain("has **no reasoning column**");
+    expect(gate).toContain("attaches to the **decision-flipping anchor(s)**");
+  });
+
+  it("FIX 4 — anchor cap is a single bounded ceiling; coordinator anchors count toward it", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("single bounded ceiling across all lanes");
+    expect(body).toContain("counts **against** that same ceiling, not additively");
+  });
+
+  it("FIX 4 — engine sanctions pr-eval's two-block Evidence ordering as an exception", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("sanctioned pr-eval two-block exception");
+  });
+
+  it("FIX 4 — proposal-gate pins a fixed per-item pick-list line order", () => {
+    const body = collapse(PROPOSAL_GATE_PATH);
+    expect(body).toContain("fixed per-item line order in the pick-list");
+  });
+
+  it("close-review residual — the degrade's two cardinalities have one decide-once placement", () => {
+    // The (4c) per-item slot carries ONLY the per-call failure; the global degrade renders once as
+    // a batch-level banner above the pick-list and is NOT stamped into each finding's slot. Both the
+    // proposal-gate per-item passage and the engine skeleton must say this consistently, so the
+    // "once for the batch" rule and the "a rider always occupies its slot" rule no longer conflict.
+    const gate = collapse(PROPOSAL_GATE_PATH);
+    // The (4c) slot is the per-call rider only.
+    expect(gate).toContain("the (4c) slot carries **only the per-call failure**");
+    // The global case is an explicit exception, rendered as a batch-level banner above the pick-list.
+    expect(gate).toContain('one explicit exception to that "always occupies its slot" rule');
+    expect(gate).toContain("renders **once as a batch-level banner**");
+    expect(gate).toContain("above the pick-list");
+    expect(gate).toContain("not** stamped into each finding's (4c) slot");
+
+    const engine = collapse(ENGINE_PATH);
+    // The engine skeleton states the same split: per-call in the per-item slot, global as a banner.
+    expect(engine).toContain("occupies **that finding's** per-item degrade slot");
+    expect(engine).toContain("single batch-level banner above the pick-list");
+    expect(engine).toContain("not** stamped into each finding's per-item (4c) slot");
+    expect(engine).toContain(
+      'exception** to proposal-gate.md\'s "a rider always occupies its slot" rule',
+    );
+  });
+
+  it("FIX 6 — the advisory search is confined to the finding-filing path, not Phase-1 ticket-creation", () => {
+    const body = collapse(PROPOSAL_GATE_PATH);
+    expect(body).toContain("confined to the **finding-filing path**");
+    expect(body).toContain("**not** implement-feature's phase-1 ticket-creation");
   });
 });
