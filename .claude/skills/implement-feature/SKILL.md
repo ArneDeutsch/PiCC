@@ -109,11 +109,11 @@ Split the work into implementer-sized tasks, write each `tasks/t<task-number>-<t
 
 ## Phase 6 — Plan review & approval
 
-Fan reviewers over the whole plan folder (feature.md + all task specs) in parallel: each relevant specialist, an adversarial `generalist`, a `user-experience` end-user walkthrough. Integrate; fix what's clearly right; escalate WHAT/WHY changes or major HOW tradeoffs; iterate to mutual acceptance (re-show the scope mirror if scope moved). Phase 6 ends **uncommitted** (gitignored plan folder). Full procedure: [references/workflow-detail.md](references/workflow-detail.md) (Phase 6).
+Fan reviewers over the whole plan folder `doc/plan/<feature-slug>/` in parallel: each relevant specialist, an adversarial `generalist`, a `user-experience` end-user walkthrough. Integrate; fix what's clearly right; escalate WHAT/WHY changes or major HOW tradeoffs; iterate to mutual acceptance (re-show the scope mirror if scope moved). Phase 6 ends **uncommitted** (gitignored plan folder). Full procedure: [references/workflow-detail.md](references/workflow-detail.md) (Phase 6).
 
 ## Phase 7 — Implementation loop
 
-For each task, in planned order: **dispatch** a fresh `implementer` with feature.md + the task spec + the standing rules (relayed verbatim); apply the escalation boundary; run the **review fan-out** yourself (`git add -A` first so reviewers see new untracked files; reviewers by surface touched); **triage and fix** (trivial yourself, larger via an `implementer` in fix mode); **distill observations** into `observations.md`; then **gate on green and commit** `<feature-slug>: t<task-number> — <description>`, staging bounded — never a blank `git add -A` (log/observations gitignored). The standing rules and full loop: [references/workflow-detail.md](references/workflow-detail.md) (Phase 7) — read before dispatching.
+For each task, in planned order: **dispatch** a fresh `implementer` with `doc/plan/<feature-slug>/`'s feature.md + task spec + the standing rules; apply the escalation boundary; run the **review fan-out** yourself (`git add -A` first so reviewers see new untracked files; reviewers by surface touched); **triage and fix** (trivial yourself, larger via an `implementer` in fix mode); **distill observations** into `observations.md`; then **gate on green and commit** `<feature-slug>: t<task-number> — <description>`, staging bounded — never a blank `git add -A` (log/observations gitignored). The standing rules and full loop: [references/workflow-detail.md](references/workflow-detail.md) (Phase 7) — read before dispatching.
 
 ## Phase 8 — Feature close review
 
