@@ -60,6 +60,68 @@ describe("pi 0.80.x API contract", () => {
     expect(typeof sdk.AgentSession?.prototype?.getSessionStats).toBe("function");
   });
 
+  it("exposes create*ToolDefinition factories whose renderCall/renderResult are functions (concise-tool-rows t02)", async () => {
+    // The self-shell de-padding of the built-ins sources renderers from these
+    // public Definition factories (create*Tool strips renderers via
+    // wrapToolDefinition). A Pi upgrade that moves/renames them — or drops the
+    // renderer shape the wrap reframes — fails loudly here rather than degrading
+    // the built-in rows silently in the terminal.
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    for (const name of [
+      "createReadToolDefinition",
+      "createWriteToolDefinition",
+      "createEditToolDefinition",
+      "createBashToolDefinition",
+      "createGrepToolDefinition",
+      "createFindToolDefinition",
+      "createLsToolDefinition",
+    ]) {
+      expect(typeof sdk[name], `missing/renamed ${name}`).toBe("function");
+    }
+    // read + edit are the payloads t02's renderers reframe (truncation + diff) —
+    // pin that both expose renderCall/renderResult on a constructed definition.
+    for (const name of ["createReadToolDefinition", "createEditToolDefinition"]) {
+      const def = sdk[name]("/cwd");
+      expect(typeof def.renderCall, `${name}().renderCall`).toBe("function");
+      expect(typeof def.renderResult, `${name}().renderResult`).toBe("function");
+    }
+  });
+
+  it("our getTextOutput reproduction matches Pi's real render-utils.js transform (concise-tool-rows t02)", async () => {
+    // t01 reproduced Pi's getTextOutput locally because the deep path is
+    // exports-blocked by the package name. The concrete file IS importable via an
+    // absolute file:// URL — pin the reproduction against Pi's own so a version
+    // bump that changes the transform (CRLF stripping, image fallbacks) fails
+    // loudly instead of silently diverging.
+    const { getTextOutput: ours } = await import("../src/runtime/tool-shell.js");
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const distIdx = mainUrl.indexOf("/dist/");
+    expect(distIdx, "unexpected Pi dist layout").toBeGreaterThan(0);
+    const realUrl = `${mainUrl.slice(0, distIdx)}/dist/core/tools/render-utils.js`;
+    const real: any = await import(realUrl);
+    expect(typeof real.getTextOutput, "Pi render-utils getTextOutput moved").toBe("function");
+
+    const payloads = [
+      // CRLF-bearing text: every \r must be removed (a bare \r would return the
+      // cursor to col 0 and corrupt the row).
+      { content: [{ type: "text", text: "line-a\r\nline-b\rTAIL" }] },
+      // Image block with no text: the [image …] fallback indicator is appended.
+      { content: [{ type: "image", data: "Zm9v", mimeType: "image/png" }] },
+      // Mixed text + image.
+      {
+        content: [
+          { type: "text", text: "hello\r\nworld" },
+          { type: "image", data: "Zm9v", mimeType: "image/png" },
+        ],
+      },
+    ];
+    for (const showImages of [false, true]) {
+      for (const p of payloads) {
+        expect(ours(p as never, showImages)).toBe(real.getTextOutput(p, showImages));
+      }
+    }
+  });
+
   it("typebox + StringEnum are importable the way our tools use them", async () => {
     const { Type } = await import("typebox");
     const { StringEnum } = await import("@earendil-works/pi-ai");

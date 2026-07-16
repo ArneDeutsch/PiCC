@@ -2361,4 +2361,90 @@ describe("self-shell wrapper (concise-tool-rows t01)", () => {
     expect(call[0]).toContain(slotMarker("toolSuccessBg"));
     expect(tuiVisibleWidth(call[0]!)).toBe(40); // padded — not a blank line
   });
+
+  // --- concise-tool-rows t02: ctx.lastComponent threading for the built-ins ---
+
+  it("threads ctx.lastComponent: the inner renderer receives the PREVIOUS INNER component, not the wrapper", () => {
+    // Non-vacuous: an instrumented fake inner ToolDefinition RECORDS the
+    // lastComponent it is handed. We render once, capture the returned WRAPPER,
+    // feed it back as ctx.lastComponent (exactly what ToolExecutionComponent does),
+    // and assert the inner got the previous INNER — the thing edit.js's
+    // `instanceof Box` reuse depends on. A wrapper leaking through here would
+    // silently drop the built-ins' incremental state.
+    const seenResult: Array<unknown> = [];
+    const innerResults: Array<{ render: (w: number) => string[] }> = [];
+    const seenCall: Array<unknown> = [];
+    const innerCalls: Array<{ render: (w: number) => string[] }> = [];
+    const tool = {
+      name: "Incr",
+      renderCall: (_a: unknown, _t: unknown, ctx: RenderCtx) => {
+        seenCall.push(ctx.lastComponent);
+        const comp = { render: () => ["call-line"] };
+        innerCalls.push(comp);
+        return comp;
+      },
+      renderResult: (_r: unknown, _o: unknown, _t: unknown, ctx: RenderCtx) => {
+        seenResult.push(ctx.lastComponent);
+        const comp = { render: () => ["diff-line"] };
+        innerResults.push(comp);
+        return comp;
+      },
+    };
+    const wrapped = wrapForSelfShell(tool);
+    const rr = wrapped.renderResult as (
+      r: unknown,
+      o: unknown,
+      t: unknown,
+      c: RenderCtx,
+    ) => { render: (w: number) => string[] };
+    const rc = wrapped.renderCall as (
+      a: unknown,
+      t: unknown,
+      c: RenderCtx,
+    ) => { render: (w: number) => string[] };
+
+    // renderResult: first render has no prior component.
+    const firstRes = rr({ content: [] }, {}, slotTheme, { isPartial: false });
+    firstRes.render(40);
+    // Feed the returned WRAPPER back as ctx.lastComponent, the exact hazard.
+    const secondRes = rr({ content: [] }, {}, slotTheme, {
+      isPartial: false,
+      lastComponent: firstRes,
+    });
+    secondRes.render(40);
+    expect(seenResult[0]).toBeUndefined(); // no prior inner on first render
+    expect(seenResult[1]).toBe(innerResults[0]); // previous INNER, not the wrapper
+    expect(seenResult[1]).not.toBe(firstRes); // definitely not the wrapper
+
+    // Same threading for renderCall (Pi caches call + result components separately).
+    const firstCall = rc({}, slotTheme, { isPartial: false });
+    firstCall.render(40);
+    const secondCall = rc({}, slotTheme, { isPartial: false, lastComponent: firstCall });
+    secondCall.render(40);
+    expect(seenCall[0]).toBeUndefined();
+    expect(seenCall[1]).toBe(innerCalls[0]);
+    expect(seenCall[1]).not.toBe(firstCall);
+  });
+
+  it("no-theme built-in render: plain content, no bg marker, no throw", () => {
+    // A built-in-shaped tool (own renderResult, like the create*ToolDefinition
+    // renderers) rendered with theme undefined degrades to plain text — headless /
+    // no-theme must never paint a bg sentinel nor throw.
+    const tool = {
+      name: "read",
+      renderResult: () => ({ render: () => ["file contents here"] }),
+    };
+    const wrapped = wrapForSelfShell(tool);
+    const out = (
+      wrapped.renderResult as (
+        r: unknown,
+        o: unknown,
+        t: unknown,
+        c: RenderCtx,
+      ) => { render: (w: number) => string[] }
+    )({ content: [] }, {}, undefined, { isPartial: false }).render(40);
+    const joined = out.join("\n");
+    expect(joined).toContain("file contents here");
+    expect(joined.includes(ESC)).toBe(false); // no escape / bg marker at all
+  });
 });

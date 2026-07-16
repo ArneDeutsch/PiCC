@@ -274,8 +274,13 @@ function sanitizeBinaryOutput(str: string): string {
     .join("");
 }
 
-/** Mirror of Pi's `render-utils.js` `getTextOutput(result, showImages)`. */
-function getTextOutput(result: ResultShape | undefined, showImages: boolean): string {
+/**
+ * Mirror of Pi's `render-utils.js` `getTextOutput(result, showImages)`. Exported
+ * so the Pi-contract smoke test (t02) can pin this reproduction against Pi's own
+ * `getTextOutput` (imported via an absolute `file://` URL, the deep path being
+ * `exports`-blocked) — a Pi version bump that changes the transform fails loudly.
+ */
+export function getTextOutput(result: ResultShape | undefined, showImages: boolean): string {
   if (!result) return "";
   const content = Array.isArray(result.content) ? (result.content as ContentBlock[]) : [];
   const textBlocks = content.filter((c) => c && c.type === "text");
@@ -311,11 +316,55 @@ type ResultRenderer = (
 ) => Component;
 
 /**
+ * The component the wrapper returns to Pi. It carries the INNER component under
+ * `__inner` so the next render can thread `ctx.lastComponent` back to the inner
+ * renderer (see `innerCtxForLastComponent`).
+ */
+type WrapperComponent = Component & { __inner?: Component };
+
+/**
+ * Thread `ctx.lastComponent` for the built-ins' incremental renderers.
+ *
+ * `ToolExecutionComponent` caches the component WE return and hands it back as
+ * `ctx.lastComponent` on the next render (`tool-execution.js:226,248`). The
+ * built-in renderers reuse THAT for incremental state — `read.js:259,267`
+ * (`?? new Text`), `bash.js:335,351` (`?? new BashResultRenderComponent`),
+ * `edit.js:66,224,270` (`instanceof Box` reuse). A naive wrap hands the inner
+ * renderer OUR wrapper; `edit.js:66`'s `instanceof Box` cast then misfires and
+ * silently loses the incremental state (`read` tolerates it via `?? new Text`,
+ * `edit` does not). So we stash the inner component on the wrapper (`__inner`)
+ * and hand the inner renderer the PREVIOUS INNER component, preserving every
+ * other ctx field.
+ */
+function innerCtxForLastComponent(ctx: RenderCtx): RenderCtx {
+  const prev = ctx?.lastComponent as WrapperComponent | undefined;
+  return { ...ctx, lastComponent: prev?.__inner };
+}
+
+/** Build the self-shell wrapper component: stash the inner + reframe on render. */
+function selfShellComponent(inner: Component, theme: unknown, slot: BgSlot): WrapperComponent {
+  return {
+    // Stash the inner so the NEXT render can pass it back as ctx.lastComponent
+    // (incremental-render threading — see innerCtxForLastComponent).
+    __inner: inner,
+    render(width: number): string[] {
+      // Lay the inner content out at width - 2*GUTTER (Pi's Box both-side padding)
+      // so wrap/layout matches the space the painted line occupies — a maximally-
+      // wide line keeps every column and reframe's clamp is a no-op.
+      return reframe(inner.render(innerRenderWidth(width)), width, theme, slot);
+    },
+  };
+}
+
+/**
  * Wrap a tool so its row renders self-shell (no top/bottom padding) with the
  * background re-applied per line. Sets `renderShell:"self"` and installs a
  * renderCall/renderResult that:
- *   - invoke the tool's OWN renderer when present (Agent/Task/TaskOutput), else a
- *     generic fallback (all the renderer-less Claude-named tools);
+ *   - invoke the tool's OWN renderer when present (Agent/Task/TaskOutput and the
+ *     re-registered built-ins' `create*ToolDefinition` renderers), else a generic
+ *     fallback (all the renderer-less Claude-named tools);
+ *   - thread `ctx.lastComponent` to the PREVIOUS INNER component so the built-ins'
+ *     incremental rendering (diffs, streamed output) survives the wrap;
  *   - reframe the inner lines at render(width) time (width is unavailable
  *     earlier) with the single-tone slot from ctx.
  * Every other field — `execute`, `name`, `parameters`, … — passes through
@@ -334,17 +383,11 @@ export function wrapForSelfShell(tool: Record<string, unknown>): Record<string, 
     renderShell: "self",
     renderCall(args: Record<string, unknown>, theme: unknown, ctx: RenderCtx): Component {
       const slot = bgSlotForCtx(ctx);
+      const innerCtx = innerCtxForLastComponent(ctx);
       const inner = innerCall
-        ? innerCall(args, theme, ctx)
+        ? innerCall(args, theme, innerCtx)
         : genericCallComponent(toolName, theme);
-      return {
-        render(width: number): string[] {
-          // Lay the inner content out at width - 2*GUTTER (Pi's Box both-side
-          // padding) so wrap/layout matches the space the painted line occupies —
-          // a maximally-wide line keeps every column and reframe's clamp is a no-op.
-          return reframe(inner.render(innerRenderWidth(width)), width, theme, slot);
-        },
-      };
+      return selfShellComponent(inner, theme, slot);
     },
     renderResult(
       result: ResultShape,
@@ -353,16 +396,11 @@ export function wrapForSelfShell(tool: Record<string, unknown>): Record<string, 
       ctx: RenderCtx,
     ): Component {
       const slot = bgSlotForCtx(ctx);
+      const innerCtx = innerCtxForLastComponent(ctx);
       const inner = innerResult
-        ? innerResult(result, options, theme, ctx)
-        : genericResultComponent(result, theme, ctx);
-      return {
-        render(width: number): string[] {
-          // See renderCall: inner is laid out at the reduced content width so the
-          // generic renderer's wrapTextWithAnsi(..., width) wraps to the real space.
-          return reframe(inner.render(innerRenderWidth(width)), width, theme, slot);
-        },
-      };
+        ? innerResult(result, options, theme, innerCtx)
+        : genericResultComponent(result, theme, innerCtx);
+      return selfShellComponent(inner, theme, slot);
     },
   };
 }
