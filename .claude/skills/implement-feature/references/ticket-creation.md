@@ -36,9 +36,9 @@ eventual "go" is never read as "yes, file the issue". Present:
   with the `<attribution trailer>` (Rule 8) — and **the filed body is WHAT/WHY only**. Before showing
   this preview, run evaluate's proposal-gate over the converged scope
   ([../../evaluate/references/proposal-gate.md](../../evaluate/references/proposal-gate.md) — the
-  read-only sandbox scorer, structurally no GitHub writes): it rates whether the scope looks valuable
+  read-only sandbox scorer, structurally no GitHub writes): it **investigates the project and rates whether the scope looks valuable**. That grounding investigation is the **evaluator's own job** — it reads architecture, source, tests, docs, and in-repo issue/plan tracking with its own `Read`/`Grep`/`Glob` tools, while the implement-feature coordinator adds no new `gh`/fetch to satisfy grounding (its fixed action envelope is unchanged)
   and you present that assessment **in-session, as part of this offer exchange** ("before I file, my
-  read on the value is: <the rating block>; still want it filed as written?"). Here proposal-gate
+  read on the value is: <the rating block>; still want it filed as written?"). The rating block now **includes its evidence anchors** — the repo-relative locators the value judgement rests on — and this in-session advisory carries a **fuller** anchor set than any filed surface (up to ~4: e.g. one proposal anchor plus one existing-tracking/decision anchor; in-session only, never a filed artifact). Here proposal-gate
   **only annotates — it never suppresses this offer**, and its assessment is **never baked into the
   filed public issue body** (that stays WHAT/WHY only, so the Phase 3 resume re-read of the synthesized
   cached `body` — the FILE step below — ingests only feature scope, never a self-grade): the human

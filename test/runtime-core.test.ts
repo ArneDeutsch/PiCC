@@ -506,6 +506,8 @@ describe("SubagentRuntime (fake SDK)", () => {
     const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 3 });
     expect(result.ok).toBe(false);
     expect(result.error).toContain("depth");
+    expect(result.error).toContain("subagents.maxDepth");
+    expect(result.error).toContain("2..5");
   });
 
   it('subagent_type "fork" is RESERVED — it never hits the generic unknown-type fallback (F16)', async () => {

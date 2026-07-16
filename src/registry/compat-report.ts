@@ -355,11 +355,36 @@ export function renderStartupNotice(
 
 const TIER_ORDER = ["partial", "degraded-noop", "not-supported", "na", "full"] as const;
 
+/**
+ * Always-present subagent nesting-posture line for `/doctor`. `subagents.*` are
+ * PiCC extensions (not Claude-settings parity); the main-session-only default is
+ * a deliberate divergence from Claude Code (nests up to 5). Reads the *effective*
+ * `subagentMaxDepth` — at render time we cannot tell an explicit value from the
+ * default, so we branch on the number and never claim more than is true.
+ */
+function subagentPostureLine(project: ClaudeProject): string {
+  const { subagentsEnabled, subagentMaxDepth } = project.settings;
+  if (subagentsEnabled === false) {
+    return "Subagent nesting: subagent dispatch disabled (subagents.enabled=false / disableSubagents:true); no delegation.";
+  }
+  if (subagentMaxDepth === 1) {
+    return "Subagent nesting: main-session-only (subagents.maxDepth=1, PiCC default; Claude Code nests up to 5). Raise subagents.maxDepth to 2..5 in .claude/settings.json to allow nested delegation.";
+  }
+  if (subagentMaxDepth >= 2) {
+    return `Subagent nesting: up to ${subagentMaxDepth} levels below the main session (subagents.maxDepth=${subagentMaxDepth}).`;
+  }
+  // Out-of-range value (0, negative, fractional) — subagents.maxDepth is not
+  // clamped on load, so report the actual number truthfully instead of claiming
+  // the default. Never asserts "=1, PiCC default" for a value that isn't 1.
+  return `Subagent nesting: subagents.maxDepth=${subagentMaxDepth} (a PiCC extension). Set it to 1 for main-session-only, or 2..5 to allow nested delegation.`;
+}
+
 /** Full /doctor breakdown (§6.2), generated from the registry (§17). */
 export function renderDoctorReport(project: ClaudeProject, report: CompatReport): string {
   const lines: string[] = [
     `PiCC compatibility report — baseline ${CLAUDE_BASELINE}`,
     `Project: ${project.root}`,
+    subagentPostureLine(project),
     "",
   ];
 

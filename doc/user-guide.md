@@ -287,6 +287,56 @@ Every subagent is now visible, both to you and to the coordinating model:
   - **`subagent_type: "fork"` dispatches are not resumable** — a fork's inherited context is the
     parent conversation *at fork time* and can't be safely re-derived, so `SendMessage` refuses it.
 
+### Subagent dispatch controls (`.claude/settings.json`)
+
+Three project settings shape subagent dispatch. They live under a `subagents` key in the project's
+`.claude/settings.json` (they also read at user scope, project overrides user). **These are PiCC
+extensions — they have no Claude-settings equivalent and are not Claude parity;** Claude Code's own
+five-level nesting is fixed and not configurable, so matching its ceiling is not a settings-parity
+claim.
+
+| Key | Default | Effect |
+|---|---|---|
+| `subagents.enabled` | `true` | Gates **all** ordinary subagent delegation. `false` (or the inverse alias `disableSubagents: true`) removes `Agent`/`Task` from the main session entirely — no fan-out at all. |
+| `subagents.maxDepth` | `1` | Caps subagent **nesting** depth. Default `1` = **main-session-only**. |
+| `subagents.concurrency` | `4` | Caps parallel subagent fan-out (see the Partial-tier per-depth-budget prose in §7 below — nested budgets are `maxDepth × concurrency`). |
+
+**Depth semantics.** The main conversation is **depth 0**; the subagents it dispatches are
+**depth 1**. The default `subagents.maxDepth: 1` lets the main session fan out depth-1 subagents but
+**blocks depth 2** — a depth-1 subagent receives neither `Agent` nor `Task`, its system prompt does
+not advertise the subagents catalog, and no alternate in-process path (e.g. a subagent-invoked
+`context: fork` skill) can open a deeper model session. To **opt into nesting**, raise
+`subagents.maxDepth` to `2..5`: each increment allows one more generation below the main session
+(`2` = the main session's subagents may themselves dispatch once, and so on up to five levels).
+
+**The two "off" states are different — don't conflate them:**
+
+- `subagents.enabled: false` / `disableSubagents: true` → **no delegation at all.** The main
+  session loses `Agent`/`Task`; even ordinary depth-1 fan-out is gone.
+- `subagents.maxDepth: 1` (the default) → **keeps depth-1 fan-out, blocks only nesting.** The main
+  session still delegates normally; only its subagents are prevented from recursing.
+
+If your goal is just "no runaway recursion," **keep (or set) `maxDepth`** — do **not** disable
+subagents.
+
+**Further narrowing.** Beyond these settings, each agent's own frontmatter `tools:` (allow-list) and
+`disallowedTools:` (deny-list) narrow what that agent may call. Even where nesting is enabled, an
+agent whose `tools:` omits `Agent`/`Task` cannot dispatch — the settings set the ceiling, the
+per-agent lists narrow it further.
+
+**Migration — restore recursion.** If you relied on the old depth-5 default (subagents that fan out
+further), add to `.claude/settings.json`:
+
+```json
+{
+  "subagents": { "maxDepth": 2 }
+}
+```
+
+`2` restores exactly **one** nested generation below the main session's subagents. If you nested
+deeper (three or more levels), raise the number accordingly — up to `5`. Copying `2` when you
+actually need `3+` will leave the deeper generations blocked.
+
 ## 5. Control surface (project-external)
 
 ### Commands
@@ -411,7 +461,8 @@ cannot drift). Summary:
 **Full:** skills (entire frontmatter set incl. `context: fork`, `paths:`, shell injection under
 bash+powershell, argument substitution with 0-based `$N` and `\$` escaping, stacked slash
 invocations), rules, agents — built-in `general-purpose`/`Explore`/`Plan` plus project/user agents
-— with nested subagent dispatch (default depth cap 5), loud classified failure semantics
+— with nested subagent dispatch **off by default (main-session-only, `subagents.maxDepth: 1`)** and
+opt-in via `subagents.maxDepth: 2..5`, loud classified failure semantics
 (failed/aborted, never an empty success) with partial-output preservation, on-disk subagent
 transcripts, live progress rendering, and per-subagent usage accounting, agent-scoped hooks,
 worktrees (incl. `.worktreeinclude`, Windows-tolerant
@@ -431,8 +482,10 @@ settlement *timing*: PiCC is next-turn, while reporter observations such as anth
 exact normative mid-turn/next-turn contract. Reporter-observed Claude 2.1.x redundant post-retrieval
 notification behavior is likewise non-normative. Another limitation is the
 one-shot print-mode loss of uncollected work. Nested
-(depth ≥ 2) background fan-out is concurrency-bounded via per-depth budgets (deadlock-free, total ≤
-`maxDepth × concurrency`) — a conservative PiCC choice, not Claude's single global cap. And
+(depth ≥ 2) background fan-out is **off by default** (main-session-only) and only occurs when an
+operator raises `subagents.maxDepth` to 2..5; once opted in, it is concurrency-bounded via per-depth
+budgets (deadlock-free, total ≤ `maxDepth × concurrency`) — a conservative PiCC choice, not Claude's
+single global cap. And
 `SendMessage` resume/steer — no cross-restart resume, steering reaches only
 background dispatches, idle-parent delivery is next-turn, and `context: fork`/override dispatches
 are non-resumable. The `subagent_type: "fork"` dispatch (inherit the parent conversation) is
@@ -494,6 +547,7 @@ behaviors worth knowing:
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
 | Startup notice keeps appearing | `/compat suppress` (per-project, stored in `.claude/.picc/`) |
+| Subagents can't spawn subagents / nested fan-out flattened after upgrade | PiCC now defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Raise `subagents.maxDepth` to `2..5` in `.claude/settings.json`; see §4 "Subagent dispatch controls". `/doctor` also shows the current nesting posture. |
 | Unexpected skills/agents from plugins | PiCC loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. `/doctor` and the startup info notice report how many are available but disabled. |
 | A plugin you enabled isn't loading | Confirm it's listed truthy in `enabledPlugins` as `name@marketplace`, and that it isn't in `~/.claude/plugins/blocklist.json`. |
 | Want to see why a fan-out routed the way it did | agent descriptions are the routing surface — inspect the "Available subagents" catalog in the session, and the dispatch tool calls in the transcript |
