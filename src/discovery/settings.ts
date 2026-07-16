@@ -84,8 +84,13 @@ function createDefaultSettings(): ClaudeSettings {
     autoMemoryEnabled: true,
     worktree: { baseRef: "head" },
     subagentsEnabled: true,
-    // Claude Code allows up to 5 nesting levels below the main conversation (audit E3).
-    subagentMaxDepth: 5,
+    // Main-session-only by default: the main conversation may spawn depth-1
+    // subagents, but those subagents cannot recurse. This is a deliberate PiCC
+    // divergence from Claude Code's "up to 5 nesting levels" contract (audit E3):
+    // recursive fan-out under a depth-5 default drains a personal ChatGPT/Codex
+    // subscription with little operator visibility. Opt into nesting explicitly via
+    // `subagents.maxDepth: 2..5` (a PiCC extension key, not Claude-settings parity).
+    subagentMaxDepth: 1,
     subagentConcurrency: 4,
     enabledPlugins: undefined,
     unknownKeys: [],

@@ -39,6 +39,23 @@ Raw material for `review.md`.
 - 2026-07-16: doc line anchors across user-guide/architecture had drifted from the
   investigation snapshot; t03 now carries corrected hints + "locate by content."
 
+## Phase 7 — implementation
+
+- 2026-07-16: t01 landed clean — one production line (`settings.ts` default 5→1 +
+  comment), 5 new tests, 1242/16/0 (baseline +5, no regressions). Implementer
+  self-verified non-vacuousness by flipping the default back to 5 and confirming
+  the new absence/refusal assertions fail — strong practice. coder + tester both
+  PASS on the real diff; coder independently re-derived that `SlashCommand`
+  (ungated) is the isolating control proving `Agent`/`Task` absence is the depth
+  gate, and both confirmed AC#5-by-composition is valid.
+- 2026-07-16: NIT carried forward — the two offline `describe` blocks in
+  `test/main-session-only-default.test.ts` use fixed `setTimeout(200/300)` sleeps
+  to await `picc()` async wiring (mirrors the existing `slashcommand-fork` idiom;
+  a latent CI-flake smell, not introduced here). Left as-is to match the codebase
+  pattern; a deterministic `onWired`-gated wait would be a repo-wide test-infra
+  improvement worth a follow-up. Also minor fixture-boilerplate duplication between
+  the two blocks — readable, left.
+
 ## Open escalation (raised to user at Phase 6)
 
 - 2026-07-16: **UX discoverability gap.** The default flip is a *silent* behavior
