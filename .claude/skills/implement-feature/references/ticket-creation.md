@@ -43,7 +43,17 @@ eventual "go" is never read as "yes, file the issue". Present:
   filed public issue body** (that stays WHAT/WHY only, so the Phase 3 resume re-read of the synthesized
   cached `body` — the FILE step below — ingests only feature scope, never a self-grade): the human
   already converged on this scope, so even a **low score is surfaced in-session** (they may still file,
-  edit, or decline in this preview), never a silently-vanished offer.
+  edit, or decline in this preview), never a silently-vanished offer. Alongside the gate's rating give
+  the maintainer **your own recommendation, in your own words** — a **recommendation-first headline
+  (file / don't file / your call)** plus a **one-to-two-sentence self-contained elaboration** (the
+  problem this captures, its impact, and — the scope being already converged — a light approach + rough
+  scope). This is your **own** file/don't-file call, **distinct from the proposal-gate rating** (the
+  gate's grounded score vs. your judgement); when it **departs** from the rating, reference the rating so
+  the divergence reads as intentional ("gate rated this borderline; I'd still file it because X"). This
+  is the same **self-elaborating presentation** the Phase 8 issue-filing offer uses
+  ([ticket-integration.md](ticket-integration.md)); like it, the rich presentation is **in-session
+  only** — the approach + rough scope is HOW-altitude and **never enters the filed body** (that stays
+  WHAT/WHY only).
 - **Where it writes, plainly**, and that a public artifact appears once filed. On a **fork** name the
   **upstream `target`** explicitly and that it is a repo **the user does not own** — filing puts a
   public issue on someone else's project.
