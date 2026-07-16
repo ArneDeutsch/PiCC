@@ -7,12 +7,12 @@
 > algorithms) — that lands in later design documents.
 >
 > **Baseline:** All support claims are stated relative to **Claude Code ~v2.1.x (mid-2026)**,
-> the reference surface researched in `doc/research/`. See §17 (Forward-compatibility) for how
+> the reference surface studied during planning. See §17 (Forward-compatibility) for how
 > this baseline is tracked and evolved.
 >
-> **Grounding:** This plan builds on `doc/research/00`–`06` and a subsequent gap-analysis
-> sweep against the live Claude Code feature surface. Where the research and the docs diverge,
-> the live documentation wins.
+> **Grounding:** This plan builds on the upfront reference-surface research and a subsequent
+> gap-analysis sweep against the live Claude Code feature surface. Where that research and the
+> docs diverge, the live documentation wins.
 
 ---
 
