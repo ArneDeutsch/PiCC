@@ -17,20 +17,37 @@ Bash, no Write, no Agent), which *physically cannot* write to GitHub, fetch a li
 `gh issue close` is **never** part of this mode; neither is any comment or `gh issue create` (the
 create, when it happens, is `implement-feature`'s own consented write, not proposal-gate's).
 
-## The lightweight path — one `evaluator`, not the full committee
+## The lightweight path — fewer reviewers, never less grounding
 
-proposal-gate is deliberately the **light** form of the engine's investigation wave. It does **not**
-fan out the full roaster / pro-advocate / con-advocate / lens committee: a fork-under-fork committee
-per candidate is expensive and, under the background-dispatch pool, risks a deadlock (the parity
-finding). Instead:
+proposal-gate is deliberately the **light** form of the engine's investigation wave. **Light means
+_fewer reviewers_, never _less grounding_.** It does **not** fan out the full roaster / pro-advocate /
+con-advocate / lens committee: a fork-under-fork committee per candidate is expensive and, under the
+background-dispatch pool, risks a deadlock (the parity finding). What it never trims is the engine's
+grounding requirement — the F21 failure this fix targets (a value score returned in seconds with **zero
+tool calls**, read purely from proposal prose) is exactly what the light path must now refuse. Instead:
 
 - The coordinator dispatches a **single `evaluator`** sandbox agent, role-prompted with the rubric and
-  the proposal text, and asks it to score the seven criteria and integrate a verdict.
-- A **genuinely borderline** candidate — one whose integrated cost-vs-benefit sits close to the line
-  between clear slop and clear keep — may earn a **second `evaluator` pass** (a lean roaster / pro-con
-  framing supplied in the dispatch prompt) to break the tie. That second pass is **always another
-  `evaluator`** — **never** a Bash-capable `generalist`. So the mode stays structurally shell-free end
-  to end; a clear-cut proposal needs only the single sandbox score.
+  the proposal text, and **requires it to investigate the project first** — architecture, source, tests,
+  docs, and existing in-repo issue/plan tracking, via its `Read`/`Grep`/`Glob` tools — **before** it
+  scores the seven criteria and integrates a verdict. Its input is therefore **the proposal plus project
+  evidence**, never the proposal prose alone. A score from the supplied prose alone is permitted **only**
+  with the engine's explicit one-line justification that no project evidence is relevant (per
+  [evaluation-engine.md](evaluation-engine.md)'s grounding contract) — never as the default.
+- A **genuinely borderline _or higher-stakes_** candidate — one whose integrated cost-vs-benefit sits
+  close to the line between clear slop and clear keep, or whose blast radius / vision-conflict makes a
+  wrong call costly — may earn a **second `evaluator` pass** (a lean roaster / pro-con framing supplied
+  in the dispatch prompt) to pressure-test the verdict. There is **no time quota and no mandatory
+  committee for trivial** proposals: a clear-cut candidate needs only the single grounded sandbox score,
+  and the second pass is proportionate, not owed. That second pass is **always another `evaluator`** —
+  **never** a Bash-capable `generalist` — and **inherits the same grounding requirement** (it
+  investigates the project too; it never re-rates from prose). So the mode stays structurally shell-free
+  **and grounded** end to end.
+
+**Grounding is the evaluator's filesystem job.** The required investigation is performed **by the
+`evaluator` via `Read`/`Grep`/`Glob`** over the trusted working tree — the `implement-feature` /
+`evaluate` coordinator adds **no** new `gh` call, fetch, or dispatch to satisfy grounding: the fixed
+action envelope is unchanged, and "existing issue/plan tracking" means in-repo `doc/plan/`, `CHANGELOG`,
+`review.md`, not a live GitHub query.
 
 ## Bounded structured return — the evaluator returns fields, the coordinator composes
 
@@ -38,24 +55,39 @@ The `evaluator` has unrestricted `Read` (it can see `~/.pi` / `.env`), and its r
 a body that may be filed publicly. So — exactly as issue-eval's keep-open and pr-eval's assessment do
 — **constrain the evaluator's returned shape to bounded structured fields, not free-form prose**:
 
-- **per-criterion scores** (the seven rubric rows) + a **short bounded justification** per row, and
+- **per-criterion scores** (the seven rubric rows) + a **short bounded justification** per row,
 - an **overall importance verdict** integrating cost-vs-benefit into the disposition
-  (drop / surface for the gate use; annotate for Phase 1).
+  (drop / surface for the gate use; annotate for Phase 1), and
+- **bounded evidence anchors** — the repo-relative, bounded locators the score rests on, in the engine's
+  `**Evidence:**` shape (`<repo-relative locator> — <what it establishes> (<criterion>)`, 0–5 items,
+  forward-slashed, **never** a target excerpt or file/line contents). Zero anchors is legal only with the
+  engine's one-line "No project evidence — <reason>" note in place of the list.
 
 The **coordinator composes** the rendered assessment from those fields, **paraphrasing in its own
 words**, applying leakage-stripping (no tokens / env / `~/.pi` / absolute local paths) and
 **no-verbatim-reflection** (it never pastes the evaluator's returned text verbatim, and quotes no
-verbatim excerpt of the proposal beyond neutral identifiers). A prompt injection buried in a proposal
-can at most colour a score; it cannot smuggle an instruction or a secret into a filed body, because
-the evaluator's output surface is bounded and the coordinator re-authors it.
+verbatim excerpt of the proposal beyond neutral identifiers). For the anchors specifically, the
+coordinator additionally applies the **anchor re-validation of engine element 7** — the allow-list
+re-check, rejecting any absolute / `..` / outside-repo / secret-file locator, stripping any content bytes
+from the whole item (including the free-text "what it establishes" phrase), normalizing to
+repo-root-relative, capping the list at ≤5 (truncating any over-count return), and treating each anchor
+as a display-only string it **never re-opens or resolves** (engine element 7 remains the authoritative
+list — this restatement is illustrative and must not drift from it). That re-validation is **strictly
+stronger than** — not the same as — the existing per-criterion leakage-strip; the coordinator applies
+**both** and never equates them. A prompt injection buried in a proposal can at most colour a score; it cannot smuggle
+an instruction or a secret into a filed body, because the evaluator's output surface is bounded and the
+coordinator re-authors it.
 
 ## The rendered assessment — the canonical rating block
 
 The assessment renders the engine's **canonical rating block** — the seven criteria rows
 (User value / Reach / Legitimacy / Clarity / Blast radius / Conflict / Cost-vs-benefit) each with a
-rating + short reasoning, and the **overall-importance** line carrying the integrated verdict and the
-disposition it drives. This gives the human enough to judge importance without re-deriving it — more
-than a one-line stamp. The **proportionate / brief-verdict** allowance — a short verdict instead of the
+rating + short reasoning, the **overall-importance** line carrying the integrated verdict and the
+disposition it drives, and — as a sibling below that line, **not** an eighth rubric row — the
+**`**Evidence:**`** block enumerating the bounded, repo-relative anchors the rating rests on, each in the
+engine's `<repo-relative locator> — <what it establishes> (<criterion>)` shape (or the single
+"No project evidence — <reason>" line when there are none). This gives the human enough to judge
+importance without re-deriving it — more than a one-line stamp. The **proportionate / brief-verdict** allowance — a short verdict instead of the
 full seven-row table — is for **trivial keep-opens only** (issue-eval's territory); every **surfaced**
 (borderline-or-above) proposal-gate finding always carries the fuller rating, enough for the human to
 judge its importance, and is **never** reduced to a one-line stamp.
@@ -74,7 +106,11 @@ filed feature body**:
   the user chooses to file that finding, **embedded in that finding's filed body under a
   clearly-delimited `## Evaluation` heading**. Embedding is intended here: a filed finding is a
   standalone issue, **never** re-read as the current feature's WHAT/WHY scope, and the delimiter keeps
-  the finding's own ask and its assessment visibly separate in the body.
+  the finding's own ask and its assessment visibly separate in the body. The surfaced assessment
+  supports a **lean pick-list** presentation — the disposition plus only the **decision-flipping**
+  anchors — while the **full anchor set travels in the filed `## Evaluation` body**; the exact pick-list
+  anchor budget is [ticket-integration.md](../../implement-feature/references/ticket-integration.md)'s
+  to set (t04's single home), not restated here.
 
 ## The disposition — drop / surface (gate) vs. annotate (Phase 1)
 

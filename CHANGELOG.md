@@ -34,6 +34,27 @@ All notable changes to PiCC are documented here. The format is based on
   even depth-1 fan-out) — distinct from `maxDepth: 1`, which keeps depth-1 fan-out and blocks only
   nesting.
 
+### Changed — evidence-grounded evaluation value judgements (2026-07-16)
+
+- **The `evaluate` skill's value judgements now rest on real project evidence, not the supplied prose
+  alone.** proposal-gate's proposal score and issue-eval's post-screen keep-open rating both require the
+  evaluator to investigate the project — architecture, source, tests, docs, and in-repo issue/plan
+  tracking — with its `Read`/`Grep`/`Glob` tools before it rates, and it may rate from prose alone only
+  with an explicit one-line justification that no project evidence is relevant.
+- **Every surfaced assessment now carries bounded, repo-relative evidence anchors** (0–5) below the
+  overall-importance line, so a maintainer can see what a rating is founded on. Anchors are drawn from
+  project files only — never from the target's attacker-controlled issue/PR/diff content — name locators
+  only (never file contents or secret bytes), and are re-validated, repo-root-normalized, and capped by
+  the coordinator before they reach any public surface.
+- **`implement-feature` carries the grounded assessment through both proposal-gate consumers.** The
+  Phase 1 in-session create-offer advisory presents the rating block with its evidence anchors (never
+  baked into the filed issue body), and the Phase 8 `## Evaluation` embed carries the anchors under the
+  full anchor re-validation while the gate still only subtracts clear slop and preserves per-item choice.
+- **The security posture is unchanged.** The target-text-is-data quarantine and redirect isolation, the
+  L1 maliciousness screen and its canned-close invariant, and the structural zero-write guarantee (every
+  content-ingesting reviewer runs as the read-only `evaluator` sandbox) are untouched — grounding adds no
+  write, fetch, or dispatch capability.
+- **Skill/agent prose and tests only** — no `src/` runtime change and no capability-registry change.
 ### Fixed — "verbatim final message" contract documented accurately (2026-07-16)
 
 - The capability registry and design docs claimed a subagent's final message is returned "verbatim
