@@ -179,6 +179,15 @@ describe("matchesRule — path tools (Read/Edit/Write/Glob/Grep)", () => {
     expect(matchesRule("Read(.env)", call("Read", { file_path: "a/b/.envrc" }))).toBe(false);
   });
 
+  it("a Read bare-filename rule gates read-family calls at any depth (F26)", () => {
+    // The Read family expansion (Grep/NotebookRead) inherits the any-depth
+    // bare-filename semantics via the shared path matcher.
+    expect(matchesRule("Read(.env)", call("Grep", { path: "a/b/.env" }))).toBe(true);
+    expect(
+      matchesRule("Read(.env)", call("NotebookRead", { notebook_path: "a/b/.env" })),
+    ).toBe(true);
+  });
+
   it("missing path input never matches a scoped rule (but matches the bare rule)", () => {
     expect(matchesRule("Read(src/**)", call("Read", {}))).toBe(false);
     expect(matchesRule("Read", call("Read", {}))).toBe(true);
@@ -204,6 +213,13 @@ describe("matchesRule — Windows path normalization (D2, platform-independent)"
     expect(matchesRule("Read(//c/**/.env)", call("Read", { file_path: "C:/proj/.env" }))).toBe(true);
     expect(matchesRule("Read(//c/**/.env)", call("Read", { file_path: "D:\\proj\\.env" }))).toBe(false);
     expect(matchesRule("Read(//c/**/.env)", call("Read", { file_path: "C:\\proj\\.envrc" }))).toBe(false);
+  });
+
+  it("a Read drive-letter rule gates a read-family call in any flavor (F26)", () => {
+    // The Read → read-family expansion inherits D2 drive normalization: a
+    // //c/** rule covers a Grep whose path is a drive-lettered input.
+    expect(matchesRule("Read(//c/**/.env)", call("Grep", { path: "C:\\proj\\.env" }))).toBe(true);
+    expect(matchesRule("Read(//c/**/.env)", call("Grep", { path: "D:\\proj\\.env" }))).toBe(false);
   });
 
   it("forward-slash drive rules match backslash inputs (and vice versa)", () => {

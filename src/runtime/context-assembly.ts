@@ -110,6 +110,29 @@ export function createTierChangeReporter(
   };
 }
 
+/**
+ * The acceptance budget (F24): the permanent collaborative-planning nudge is
+ * pinned at "at most 120 words". Exported so the budget test asserts on the same
+ * literal the ceiling is defined by (mirrors the exported `REINJECT_*` budgets).
+ */
+export const COLLABORATIVE_PLANNING_MAX_WORDS = 120;
+
+/**
+ * Always-on collaborative-planning nudge (F24), rendered as the trailing bullets
+ * of {@link HARNESS_CONVENTIONS}. It is model-neutral — injected identically for
+ * every model PiCC drives — and a soft default: it is emitted first in the suffix
+ * so a project's CLAUDE.md, a loaded skill's approval gate, and steering all get
+ * the last word. Guidance, not enforcement; observable effect is model-dependent.
+ *
+ * Declared ABOVE `HARNESS_CONVENTIONS` on purpose: that const interpolates this
+ * one, so a lower declaration would be in the temporal dead zone and throw a
+ * ReferenceError at module load. Kept <= {@link COLLABORATIVE_PLANNING_MAX_WORDS}
+ * words (pinned by a budget test) because this block is re-sent every turn and
+ * never compacted — every sentence is a permanent per-turn cost.
+ */
+export const COLLABORATIVE_PLANNING_GUIDANCE = `- Planning: for a substantial change, don't act as a mere approval gate. Ground yourself in the repo — resolve discoverable facts by reading, not asking, and investigate until the open questions are about intent, not facts. Ask only about goals, preferences, and material tradeoffs; when scope is already clear, say so and proceed instead of inventing questions. Surface alternatives and recommend one, briefly. Don't jump from restating a request to "go"/"confirm"; ask for a skill's explicit confirmation only after the intended convergence has happened.
+- Implementation: once scope is agreed, act decisively; ask only when blocked, lacking authority, or when a choice changes the agreed scope. Concision limits what you say, not how thoroughly you investigate or verify.`;
+
 const HARNESS_CONVENTIONS = `## Claude Code compatibility conventions (PiCC)
 
 You are running a project authored for Claude Code. Honor its conventions:
@@ -118,7 +141,8 @@ You are running a project authored for Claude Code. Honor its conventions:
 - Subagents: dispatch with the Agent tool; choose subagent_type by matching the task against the agent descriptions in the catalog. Subagents run in the background by default — a dispatch returns a task id, not the result — so several dispatched in one turn run concurrently. Collect each result with TaskOutput before you rely on it or finalize an answer (or pass run_in_background: false for a synchronous inline result). Eligible uncollected results receive one bounded notice on a later interactive turn, but one-shot print mode may end before that turn. The collected result is the subagent's final message verbatim — parse it as the calling skill specifies.
 - When a skill or instruction specifies an output format (e.g. a locked YAML block), reproduce it EXACTLY — downstream tooling parses it.
 - Worktrees: EnterWorktree/ExitWorktree isolate work; while inside one, all relative paths and shell commands run there.
-- Commits: when you're asked to commit — by the user, or by a skill or project instruction — first read the changes (git status/diff) and recent git log, and match this repository's commit-message style where it is richer; for a non-trivial change, still write a short body explaining why the change was made, not just what. Never use git commit --no-verify; project hooks must run.`;
+- Commits: when you're asked to commit — by the user, or by a skill or project instruction — first read the changes (git status/diff) and recent git log, and match this repository's commit-message style where it is richer; for a non-trivial change, still write a short body explaining why the change was made, not just what. Never use git commit --no-verify; project hooks must run.
+${COLLABORATIVE_PLANNING_GUIDANCE}`;
 
 /**
  * Conservative memory-write policy (F10). Single-line string, shared verbatim by the

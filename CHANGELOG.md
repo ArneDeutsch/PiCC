@@ -27,6 +27,98 @@ All notable changes to PiCC are documented here. The format is based on
   and warns off bare `/tmp`, `$TEMP`, and `$TMP`. The `evaluate` skill needs no modification — the
   injected guidance steers it off `/tmp` on its own.
 
+### Changed — Read denies gate the whole read family (2026-07-16)
+
+- **A `deny: Read(<glob>)` rule now also blocks `Grep`, `Glob`, and `NotebookRead` on a matching
+  path**, not just the `Read` tool — closing a parity/security gap where a denied path stayed fully
+  readable through the other built-in file-read tools. This mirrors Claude Code's best-effort model
+  of applying `Read` rules across its file-reading tools (`Grep`/`Glob` are documented parity;
+  `NotebookRead` is included as inferred defense-in-depth). The expansion is one-directional — a
+  `Grep(<glob>)` rule does not gate `Read` — matching the existing edit-family behavior. Honest
+  limit: matching is on the call's path argument, so a read with no path (or `path: "."`) is not
+  caught; only a bare `deny: Read` (which removes the read tools from context) forecloses that.
+
+### Changed — main-session-only subagent dispatch by default (2026-07-16)
+
+- **The default `subagents.maxDepth` is now `1` (was `5`): subagent dispatch is main-session-only by
+  default.** The main conversation still spawns depth-1 subagents and runs normal fan-out, but by
+  default those subagents cannot spawn subagents of their own — they receive neither `Agent` nor
+  `Task`, their system prompt omits the subagents catalog, and no alternate in-process path (e.g. a
+  subagent-invoked `context: fork` skill) can open a deeper model session. This removes the
+  recursive-amplification foot-gun that repeatedly drained subscriptions under the old depth-5
+  default.
+- **Migration — to restore nesting**, set in `.claude/settings.json`:
+
+  ```json
+  {
+    "subagents": { "maxDepth": 2 }
+  }
+  ```
+
+  `2` restores exactly **one** nested generation below the main session's subagents. To pick the
+  right number: the main session is depth 0 and its direct subagents are depth 1, so `maxDepth` is
+  the deepest generation you need — `maxDepth: 3` allows three levels below the main session, up to
+  `5`. Copying `2` when you actually needed `3+` will leave the deeper generations blocked.
+- **This is a deliberate divergence from Claude Code**, which nests up to five levels
+  (non-configurable). The `subagents.enabled` / `subagents.maxDepth` / `subagents.concurrency` keys
+  are **PiCC extensions** with no Claude-settings equivalent, not Claude parity. `subagents.enabled:
+  false` / `disableSubagents: true` keep their existing meaning (disable **all** ordinary delegation,
+  even depth-1 fan-out) — distinct from `maxDepth: 1`, which keeps depth-1 fan-out and blocks only
+  nesting.
+
+### Changed — evidence-grounded evaluation value judgements (2026-07-16)
+
+- **The `evaluate` skill's value judgements now rest on real project evidence, not the supplied prose
+  alone.** proposal-gate's proposal score and issue-eval's post-screen keep-open rating both require the
+  evaluator to investigate the project — architecture, source, tests, docs, and in-repo issue/plan
+  tracking — with its `Read`/`Grep`/`Glob` tools before it rates, and it may rate from prose alone only
+  with an explicit one-line justification that no project evidence is relevant.
+- **Every surfaced assessment now carries bounded, repo-relative evidence anchors** (0–5) below the
+  overall-importance line, so a maintainer can see what a rating is founded on. Anchors are drawn from
+  project files only — never from the target's attacker-controlled issue/PR/diff content — name locators
+  only (never file contents or secret bytes), and are re-validated, repo-root-normalized, and capped by
+  the coordinator before they reach any public surface.
+- **`implement-feature` carries the grounded assessment through both proposal-gate consumers.** The
+  Phase 1 in-session create-offer advisory presents the rating block with its evidence anchors (never
+  baked into the filed issue body), and the Phase 8 `## Evaluation` embed carries the anchors under the
+  full anchor re-validation while the gate still only subtracts clear slop and preserves per-item choice.
+- **The security posture is unchanged.** The target-text-is-data quarantine and redirect isolation, the
+  L1 maliciousness screen and its canned-close invariant, and the structural zero-write guarantee (every
+  content-ingesting reviewer runs as the read-only `evaluator` sandbox) are untouched — grounding adds no
+  write, fetch, or dispatch capability.
+- **Skill/agent prose and tests only** — no `src/` runtime change and no capability-registry change.
+### Fixed — "verbatim final message" contract documented accurately (2026-07-16)
+
+- The capability registry and design docs claimed a subagent's final message is returned "verbatim
+  (no wrapper)." That was inaccurate for **resumable** dispatches, which append a clearly-delimited
+  in-band identity/resume trailer to the model-visible text (faithful to Claude Code, which appends
+  the same kind of resume handle to resumable subagent results; the human TUI strips it). The docs now state
+  the real contract — verbatim for non-resumable/one-shot dispatches, verbatim plus the delimited
+  identity trailer for resumable ones — so an exact-token / JSON / YAML consumer knows the shape.
+  **Behavior is unchanged**: this is a documentation-truthfulness fix (a downsize of #46; the proposed
+  separate identity channel was deliberately not built — rationale in
+  `doc/plan/26-verbatim-contract-docs/feature.md`).
+
+### Added — collaborative planning posture by default (2026-07-16)
+
+- **PiCC's always-on conventions block now carries a short collaborative-planning nudge, so a
+  GPT/Codex model adopts a more Claude-Code-style planning posture by default.** On a substantial
+  planning or exploration request the model is nudged to ground itself by reading the repo,
+  resolve discoverable facts instead of asking about them, ask only about goals, preferences, and
+  material tradeoffs, surface meaningful alternatives and recommend one, and avoid collapsing a
+  planning phase into a restatement of the request followed immediately by "go"/"confirm" — while
+  still implementing decisively and autonomously once scope is agreed, and still honoring a skill's
+  explicit approval gate. **Why you'd care:** it narrows the visible interaction-quality gap between
+  Claude Code-authored and PiCC-authored sessions on the same skill, so a Claude-authored workflow
+  like `implement-feature` is nudged to engage before confirming instead of short-circuiting to a
+  "go" prompt.
+  It applies to every project run under PiCC, not just this one, and is a best-effort prompt nudge —
+  outcome is model-dependent (guidance, not enforcement); it is not Plan mode, not the
+  `AskUserQuestion` UI, and not a deterministic conversation state machine. The lever if you want a
+  different interaction style is the existing per-model `steering` config, which layers on top of the
+  built-in default (see the user guide) — a contrary steering entry can, for example, tone the
+  posture back toward terse, minimal-question turns.
+
 ### Changed — description-based feature naming (2026-07-15)
 
 - **Future `implement-feature` runs use one concise descriptive slug instead of allocating a global

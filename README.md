@@ -51,8 +51,9 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
   `context: fork`, legacy `.claude/commands`.
 - **Subagents** — `.claude/agents/*.md` plus the built-in `general-purpose`/`Explore`/`Plan`
   agent types, description-driven routing, parallel fan-out with verbatim final-message return,
-  per-agent `tools:` capability gating, nested dispatch with a configurable depth cap,
-  `isolation: worktree`. **Observable and trustworthy:** a dead dispatch is a loud, named failure
+  per-agent `tools:` capability gating, nested dispatch with a configurable depth cap (**off by
+  default — main-session-only**: the main conversation fans out depth-1 subagents, but nesting is an
+  explicit opt-in via `subagents.maxDepth: 2..5`), `isolation: worktree`. **Observable and trustworthy:** a dead dispatch is a loud, named failure
   (never an empty success) with partial output preserved; every run leaves an on-disk transcript,
   streams live progress, and records its token/cost (`/usage`). Dispatch runs in the **background by
   default** (matching Claude 2.1.198), so an implicit-concurrency fan-out parallelizes — each dispatch

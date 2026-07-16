@@ -50,6 +50,8 @@ import {
   contextForTouchedFile,
   newSessionContextState,
   resetInjectionState,
+  COLLABORATIVE_PLANNING_GUIDANCE,
+  COLLABORATIVE_PLANNING_MAX_WORDS,
 } from "../src/runtime/context-assembly.js";
 import { mapEffort, steeringForModel, type PiCCConfig } from "../src/runtime/steering.js";
 import { createAgentToolDefinition, extractText, type SubagentRuntime } from "../src/runtime/subagents.js";
@@ -121,6 +123,12 @@ describe("tool-map", () => {
     const live: Record<string, unknown> = { path: "src/a.ts" };
     applyUpdatedInput("read", live, { file_path: "src/b.ts" });
     expect(live.path).toBe("src/b.ts");
+
+    // F26: a live grep reaches the engine as a matchable Grep call with
+    // file_path populated, so a Read(<glob>) deny can gate it by path.
+    const grepCall = toClaudeCall("grep", { path: "secrets/x" }, "C:\\proj");
+    expect(grepCall.tool).toBe("Grep");
+    expect(grepCall.input.file_path).toBe("secrets/x");
 
     const custom: Record<string, unknown> = { url: "https://x" };
     applyUpdatedInput("WebFetch", custom, { url: "https://y" });
@@ -236,6 +244,29 @@ describe("context assembly", () => {
     expect(suffix).toMatch(/recent git log/i);
     expect(suffix).toMatch(/why the change was made/i);
     expect(suffix).toMatch(/--no-verify/);
+    // F24: the always-on collaborative-planning nudge is rendered as trailing
+    // bullets INSIDE the conventions block — after its header and before the next
+    // `\n## ` section — so it stays a soft default the later, more-specific
+    // sections (CLAUDE.md / skills / steering) can override. A newline-free
+    // load-bearing phrase is grepped so CRLF-vs-LF can't split the match.
+    const nudgePhrase = "ask only when blocked";
+    const nudgeIdx = suffix.indexOf(nudgePhrase);
+    expect(nudgeIdx).toBeGreaterThan(-1);
+    const conventionsIdx = suffix.indexOf("Claude Code compatibility conventions");
+    expect(conventionsIdx).toBeGreaterThan(-1);
+    expect(nudgeIdx).toBeGreaterThan(conventionsIdx);
+    const nextSectionIdx = suffix.indexOf("\n## ", conventionsIdx + 1);
+    expect(nextSectionIdx).toBeGreaterThan(-1);
+    expect(nudgeIdx).toBeLessThan(nextSectionIdx);
+  });
+
+  it("keeps the collaborative-planning nudge within its word/character budget (F24)", () => {
+    const words = COLLABORATIVE_PLANNING_GUIDANCE.trim().split(/\s+/).filter(Boolean).length;
+    expect(words).toBeGreaterThanOrEqual(60); // guards accidental gutting
+    expect(words).toBeLessThanOrEqual(COLLABORATIVE_PLANNING_MAX_WORDS); // = 120, anti-bloat
+    expect(COLLABORATIVE_PLANNING_MAX_WORDS).toBe(120); // pins the acceptance criterion
+    const chars = COLLABORATIVE_PLANNING_GUIDANCE.replace(/\r\n/g, "\n").length;
+    expect(chars).toBeLessThanOrEqual(900); // long words can't dodge the word ceiling
   });
 
   // Feature 25 / #48: per-session scratchpad injection.
@@ -573,6 +604,8 @@ describe("SubagentRuntime (fake SDK)", () => {
     const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 3 });
     expect(result.ok).toBe(false);
     expect(result.error).toContain("depth");
+    expect(result.error).toContain("subagents.maxDepth");
+    expect(result.error).toContain("2..5");
   });
 
   it('subagent_type "fork" is RESERVED — it never hits the generic unknown-type fallback (F16)', async () => {

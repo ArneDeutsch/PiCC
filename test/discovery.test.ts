@@ -501,8 +501,10 @@ describe("loadSettings — robustness (completeness floor)", () => {
     expect(settings.hooks).toEqual({});
     expect(settings.worktree.baseRef).toBe("head");
     expect(settings.subagentsEnabled).toBe(true);
-    // Claude Code allows up to 5 nesting levels (audit E3).
-    expect(settings.subagentMaxDepth).toBe(5);
+    // F22: main-session-only by default — a deliberate PiCC divergence from Claude
+    // Code's up-to-5 contract (audit E3). Depth-1 fan-out is on; nesting is opt-in
+    // via `subagents.maxDepth: 2..5`.
+    expect(settings.subagentMaxDepth).toBe(1);
     expect(settings.subagentConcurrency).toBe(4);
     expect(settings.disableAllHooks).toBe(false);
     expect(settings.disableSkillShellExecution).toBe(false);
