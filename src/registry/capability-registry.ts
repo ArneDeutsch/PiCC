@@ -142,7 +142,7 @@ const SETTING_ENTRIES: CapabilityEntry[] = [
   cap("setting", "setting.attribution", "degraded-noop", "parsed, not consumed — no commit/PR attribution machinery; reported when set (§5, §7)"),
   cap("setting", "setting.apiKeyHelper", "degraded-noop", "parsed, never invoked — auth comes from the harness subscription/provider flow; reported when set (§5, §7)"),
   // Permissions (§6.1 posture).
-  cap("setting", "setting.permissions.deny", "full", "hard, non-interactive block — the kept deterministic safety valve; a Read(<glob>) deny also gates Grep/Glob/NotebookRead on a matching path, one-directionally (§6.1)"),
+  cap("setting", "setting.permissions.deny", "full", "hard, non-interactive block — the kept deterministic safety valve; a Read(<glob>) deny also gates Grep/Glob/NotebookRead and, deny-direction only, blocks Edit/MultiEdit (not Write/NotebookEdit) on a matching path, one-directionally (§6.1)"),
   cap("setting", "setting.permissions.additionalDirectories", "degraded-noop", "parsed, no-op — the default-permissive posture applies no directory sandbox, so extra grants are moot; reported when set (§6.1)"),
   cap("setting", "setting.permissions.allow", "partial", "parsed and matched, but moot under the default-permissive posture — nothing waits on an allow (§6.1)"),
   cap("setting", "setting.permissions.ask", "degraded-noop", "ask rules will NOT prompt — default-permissive posture runs them without asking (§6.1)", true),

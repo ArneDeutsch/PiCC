@@ -180,7 +180,14 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
   Symmetrically, a `Read(…)` permission rule gates the file-**read** family: it expands one-directionally
   across `Grep`, `Glob`, and `NotebookRead` on a matching path (`Grep`/`Glob` are documented Claude
   best-effort parity, `NotebookRead` is inferred defense-in-depth), while a `Grep(…)`/`Glob(…)` rule
-  does **not** gate `Read` — the same one-directional shape as `Write` not gating `Edit`.
+  does **not** gate `Read` — the same one-directional shape as `Write` not gating `Edit`. There is one
+  further cross that runs the *other* way: a path-scoped `deny: Read(<glob>)` also blocks `Edit`/`MultiEdit`
+  (not `Write`/`NotebookEdit`) on a matching path, mirroring Claude Code v2.1.208 (denying reads of a
+  path also prevents clobbering or recreating it via `Edit`). Unlike the read/edit family expansions
+  above — which are polarity-agnostic and therefore surface in allow, ask, and hook `if:` matching too —
+  this Read→Edit/MultiEdit cross is **deny-direction only** and path-scoped: it lives in a guarded clause
+  in `matchesRule`, not in `ruleToolMatches`/`FILE_READ_TOOLS`/`gateTools`, so `allow: Read` never grants
+  `Edit` and a bare `deny: Read` neither blocks nor strips `Edit`.
 
 ### `registry/` — the single source of truth for "what's supported"
 - `capability-registry.ts` — `CAPABILITY_REGISTRY: CapabilityEntry[]` and `CLAUDE_BASELINE`. Every

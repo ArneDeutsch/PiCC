@@ -45,6 +45,66 @@ function guardWithSkillDeny(rules: string[]) {
   };
 }
 
+function guardWithSettingsDeny(deny: string[]) {
+  const engine = new PermissionEngine(
+    { allow: [], deny, ask: [], additionalDirectories: [] },
+    { cwd: process.cwd() },
+  );
+  const handlers = new Map<string, Array<(e: unknown, c: unknown) => unknown>>();
+  const pi = {
+    on: (ev: string, fn: (e: unknown, c: unknown) => unknown) =>
+      handlers.set(ev, [...(handlers.get(ev) ?? []), fn]),
+    sendMessage: () => undefined,
+  };
+  createGuardExtension({ engine, hooks: noHooks, getCwd: () => process.cwd() })(pi);
+  return async (toolName: string, input: Record<string, unknown>) => {
+    let result: any;
+    for (const fn of handlers.get("tool_call") ?? []) {
+      const r = await fn({ toolName, toolCallId: "t", input }, {});
+      if (r !== undefined) result = r;
+    }
+    return result;
+  };
+}
+
+describe("guard surfaces the Read-deny-blocks-Edit signal (v2.1.208)", () => {
+  it("a Read deny blocking an Edit yields the 'Read deny rule' signal", async () => {
+    const fire = guardWithSettingsDeny(["Read(secrets/**)"]);
+    const blocked = await fire("Edit", { file_path: "secrets/creds.json" });
+    expect(blocked?.block).toBe(true);
+    expect(blocked?.reason).toContain("Read deny rule");
+  });
+
+  it("a MultiEdit under a Read deny yields the same signal", async () => {
+    const fire = guardWithSettingsDeny(["Read(secrets/**)"]);
+    const blocked = await fire("MultiEdit", { file_path: "secrets/creds.json" });
+    expect(blocked?.block).toBe(true);
+    expect(blocked?.reason).toContain("Read deny rule");
+  });
+
+  it("a skill disallow Read(...) blocking an Edit yields the same signal", async () => {
+    const fire = guardWithSkillDeny(["Read(secrets/**)"]);
+    const blocked = await fire("Edit", { file_path: "secrets/creds.json" });
+    expect(blocked?.block).toBe(true);
+    expect(blocked?.reason).toContain("Read deny rule");
+  });
+
+  it("an ordinary deny keeps the generic message (no false signal)", async () => {
+    const fire = guardWithSettingsDeny(["Read(secrets/**)"]);
+    const blocked = await fire("Read", { file_path: "secrets/creds.json" });
+    expect(blocked?.block).toBe(true);
+    expect(blocked?.reason).not.toContain("Read deny rule");
+  });
+
+  it("an Edit blocked by an Edit deny keeps the generic message (signal is Read-rule-specific)", async () => {
+    const fire = guardWithSettingsDeny(["Edit(secrets/**)"]);
+    const blocked = await fire("Edit", { file_path: "secrets/creds.json" });
+    expect(blocked?.block).toBe(true);
+    expect(blocked?.reason).not.toContain("Read deny rule");
+    expect(blocked?.reason).toContain("permission deny rule");
+  });
+});
+
 describe("active-skill disallowed-tools must use deny polarity (guard.ts denyByExtraRules)", () => {
   it("baseline: the direct command IS blocked", async () => {
     const fire = guardWithSkillDeny(["Bash(rm *)"]);

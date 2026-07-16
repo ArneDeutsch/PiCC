@@ -102,7 +102,7 @@ Lifecycle events the hooks engine can fire (`settings.json` `hooks`, plus skill/
 | `setting.enabledPlugins` | full | selects installed-plugin content to load; merges key-wise across scopes, nearer scope wins per plugin (§4.9) |
 | `setting.env` | full | injected into sessions and hook/skill subprocesses (§5) |
 | `setting.hooks` | full | hook config dispatched per §4.5 — Claude matcher semantics (exact/list/unanchored-regex), parallel execution with dedup, async handlers, systemMessage/suppressOutput honored (command handlers full) |
-| `setting.permissions.deny` | full | hard, non-interactive block — the kept deterministic safety valve; a Read(<glob>) deny also gates Grep/Glob/NotebookRead on a matching path, one-directionally (§6.1) |
+| `setting.permissions.deny` | full | hard, non-interactive block — the kept deterministic safety valve; a Read(<glob>) deny also gates Grep/Glob/NotebookRead and, deny-direction only, blocks Edit/MultiEdit (not Write/NotebookEdit) on a matching path, one-directionally (§6.1) |
 | `setting.skillListingBudgetFraction` | full | caps the startup skill-listing token budget (§4.1, §12.1) |
 | `setting.skillListingMaxDescChars` | full | caps per-skill description length in the startup listing (default 1536, Claude parity; tiered degradation, never omits a skill) (§4.1) |
 | `setting.skillOverrides` | full | per-skill overrides applied at load: off / user-invocable-only / name-only (§5) |

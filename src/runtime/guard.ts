@@ -1,5 +1,5 @@
 import type { PermissionEngine } from "../engine/permissions.js";
-import { matchesRule } from "../engine/permissions.js";
+import { matchesRule, parseRule, READ_DENY_EDIT_TOOLS } from "../engine/permissions.js";
 import type { HookRunner } from "../engine/hook-runner.js";
 import { applyUpdatedInput, toClaudeCall, touchedFilePath } from "./tool-map.js";
 
@@ -67,10 +67,35 @@ export function createGuardExtension(deps: GuardDeps) {
     return undefined;
   };
 
+  // A path-scoped `deny: Read(<glob>)` also blocks Edit/MultiEdit (Claude
+  // v2.1.208). When THAT is the cause, surface Claude's wording so the block is
+  // explainable: the matched rule is a `Read` rule but the blocked call is an
+  // Edit/MultiEdit. Returns the signal reason, or undefined for ordinary denies.
+  const readDenyEditReason = (
+    rule: string | undefined,
+    call: ReturnType<typeof toClaudeCall>,
+    kind: "permission deny rule" | "active skill disallowed-tools rule",
+  ): string => {
+    if (
+      rule !== undefined &&
+      READ_DENY_EDIT_TOOLS.has(call.tool) &&
+      parseRule(rule).tool === "Read"
+    ) {
+      // Name the actual source so the signal stays truthful: the same cross fires
+      // from a settings.json deny AND from an active skill's disallowed-tools.
+      const source =
+        kind === "permission deny rule"
+          ? "in your permission settings"
+          : "via an active skill's disallowed-tools rule";
+      return `PiCC: File is covered by a Read deny rule ${source} — ${call.tool} blocked by ${rule}`;
+    }
+    return `PiCC: blocked by ${kind} ${rule ?? ""}`.trim();
+  };
+
   const evaluateDeny = (call: ReturnType<typeof toClaudeCall>): { reason: string } | undefined => {
     const decision = deps.engine.evaluate(call);
     if (decision.decision === "deny") {
-      return { reason: `PiCC: blocked by permission deny rule ${decision.rule ?? ""}`.trim() };
+      return { reason: readDenyEditReason(decision.rule, call, "permission deny rule") };
     }
     if (decision.askDowngraded && decision.rule && !reportedAskRules.has(decision.rule)) {
       reportedAskRules.add(decision.rule);
@@ -80,7 +105,7 @@ export function createGuardExtension(deps: GuardDeps) {
     }
     const extraRule = denyByExtraRules(call);
     if (extraRule !== undefined) {
-      return { reason: `PiCC: blocked by active skill disallowed-tools rule ${extraRule}`.trim() };
+      return { reason: readDenyEditReason(extraRule, call, "active skill disallowed-tools rule") };
     }
     return undefined;
   };
