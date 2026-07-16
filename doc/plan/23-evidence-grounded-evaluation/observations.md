@@ -23,3 +23,8 @@ review.md. Dated bullets, one line each.
   toContains around it — a false-green window); marked engine element 7 as the authoritative
   list in proposal-gate's illustrative restatement (mild single-sourcing drift risk — kept the
   concrete steps since prose is the only compliance guardrail, just anchored authority).
+- 2026-07-16 t03: security + tester reviews PASS, no actionable findings. The sharpest trust
+  case (issue-eval reads untrusted issue text + trusted tree in one dispatch) holds: locators
+  are trusted-tree files, only prose is leakage-stripped, both public egresses (issue-eval +
+  pr-eval) proportionately bounded, close-invariant/L1/redirect isolation untouched. issue-eval
+  cap tightened to ≤1 brief / ≤4 full (stronger than engine's ≤5), ceilings-never-floors.
