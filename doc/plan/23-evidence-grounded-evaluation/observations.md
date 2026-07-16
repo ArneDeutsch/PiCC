@@ -18,3 +18,8 @@ review.md. Dated bullets, one line each.
   loose `.git` test assertion to `.git/`; folded security's Windows-absolute note (drive-letter
   / drive-relative / UNC / symlink canonicalization) into engine element 5 so the cross-platform
   "reject absolute" rule isn't POSIX-only.
+- 2026-07-16 t02: security + tester reviews PASS. Applied 2 fixes: tightened the prose-only
+  test to one binding clause carrying the load-bearing `**only**` (was split into two
+  toContains around it — a false-green window); marked engine element 7 as the authoritative
+  list in proposal-gate's illustrative restatement (mild single-sourcing drift risk — kept the
+  concrete steps since prose is the only compliance guardrail, just anchored authority).

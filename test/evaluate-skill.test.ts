@@ -262,6 +262,81 @@ describe("proposal-gate mode floor markers (evaluate-skill t04)", () => {
   });
 });
 
+describe("proposal-gate grounding + evidence anchors (evaluate-skill t02)", () => {
+  // Loose, case-insensitive, whitespace-collapsed obligation checks (handles CRLF).
+  // These pin the F21 fix OBLIGATIONS — light ≠ ungrounded, prose-only-only-with-
+  // justification, second-pass higher-stakes/no-quota/grounded, anchors in the bounded
+  // return AND the rendered block — not mere keywords. We do NOT test LLM judgment.
+  const collapse = (p: string): string =>
+    fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
+
+  const PROPOSAL_GATE_PATH = path.join(REFERENCES_DIR, "proposal-gate.md");
+  // Build the dash-bearing item-format seam from a code point so the test never flakes
+  // on the em-dash glyph; this matches the engine's evidence-anchor contract verbatim.
+  const EM = String.fromCodePoint(0x2014); // — item/prose separator
+
+  it("re-scopes the light path to fewer reviewers, never less grounding (investigate before scoring)", () => {
+    const body = collapse(PROPOSAL_GATE_PATH);
+    // Light means fewer reviewers, not less grounding.
+    expect(body).toContain("fewer reviewers, never less grounding");
+    // The single-evaluator dispatch REQUIRES project investigation before it scores.
+    expect(body).toContain("requires it to investigate the project first");
+    expect(body).toContain("scores the seven criteria");
+    // Input is reframed to proposal + project evidence, not prose alone.
+    expect(body).toContain("the proposal plus project evidence");
+    // Grounding is the evaluator's filesystem job; the coordinator adds no new gh/fetch.
+    expect(body).toContain("grounding is the evaluator's filesystem job");
+    expect(body).toContain("the fixed action envelope is unchanged");
+  });
+
+  it("permits a prose-only score ONLY with the explicit no-evidence justification", () => {
+    const body = collapse(PROPOSAL_GATE_PATH);
+    // One binding clause carrying the load-bearing **only** — a reword that drops the
+    // prohibition (e.g. "permitted by default, and also with…") can't keep this green.
+    expect(body).toContain(
+      "permitted **only** with the engine's explicit one-line justification that no project evidence is relevant",
+    );
+  });
+
+  it("updates the second pass: borderline OR higher-stakes, no quota / no trivial committee, itself grounded", () => {
+    const body = collapse(PROPOSAL_GATE_PATH);
+    // Higher-stakes trigger alongside borderline.
+    expect(body).toContain("or higher-stakes");
+    // No artificial time quota, no mandatory full committee for trivial proposals.
+    expect(body).toContain("no time quota and no mandatory committee for trivial");
+    // The second pass inherits the grounding requirement (still an evaluator, never generalist).
+    expect(body).toContain("inherits the same grounding requirement");
+    expect(body).toContain("second `evaluator` pass");
+    expect(body).toContain("generalist");
+  });
+
+  it("carries the evidence anchors in the bounded return AND the rendered block (engine item format verbatim)", () => {
+    const body = collapse(PROPOSAL_GATE_PATH);
+    // The bounded structured return gains an evidence-anchors field.
+    expect(body).toContain("bounded evidence anchors");
+    // The rendered canonical block enumerates the **Evidence:** line as a sibling, not a row.
+    expect(body).toContain("**evidence:**");
+    expect(body).toContain("not** an eighth rubric row");
+    // The item format matches the engine's evidence-anchor contract verbatim (em-dash, forward-slashed).
+    expect(body).toContain(`<repo-relative locator> ${EM} <what it establishes> (<criterion>)`);
+  });
+
+  it("re-validates anchors as strictly stronger than the leakage-strip (engine element 7), never equated", () => {
+    const body = collapse(PROPOSAL_GATE_PATH);
+    expect(body).toContain("anchor re-validation of engine element 7");
+    expect(body).toContain("strictly stronger");
+    expect(body).toContain("never re-opens or resolves");
+    // Both are applied; the two are not equated.
+    expect(body).toContain("applies **both**");
+  });
+
+  it("states the Phase-8 lean pick-list vs. full-anchor-set-in-`## Evaluation` density guidance", () => {
+    const body = collapse(PROPOSAL_GATE_PATH);
+    expect(body).toContain("lean pick-list");
+    expect(body).toContain("full anchor set travels in the filed `## evaluation` body");
+  });
+});
+
 describe("verification-contract repo artifacts (evaluate-skill t05)", () => {
   // These files are read RAW (not via loadSkillBody), and `.gitattributes` does not
   // force LF on `.md`, so on Windows they check out CRLF. Normalize \r\n → \n before
