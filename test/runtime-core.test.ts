@@ -50,8 +50,6 @@ import {
   contextForTouchedFile,
   newSessionContextState,
   resetInjectionState,
-  COLLABORATIVE_PLANNING_GUIDANCE,
-  COLLABORATIVE_PLANNING_MAX_WORDS,
 } from "../src/runtime/context-assembly.js";
 import { mapEffort, steeringForModel, type PiCCConfig } from "../src/runtime/steering.js";
 import { createAgentToolDefinition, extractText, type SubagentRuntime } from "../src/runtime/subagents.js";
@@ -226,6 +224,7 @@ describe("context assembly", () => {
       settings: baseSettings(),
       state: newSessionContextState(claudeMd),
       steeringText: "STEER-TEXT",
+      includeInteractionPosture: true,
     });
     expect(suffix).toContain("ROOT-INSTRUCTIONS");
     expect(suffix).toContain("UNCOND-RULE");
@@ -252,29 +251,45 @@ describe("context assembly", () => {
     expect(suffix).toMatch(/recent git log/i);
     expect(suffix).toMatch(/why the change was made/i);
     expect(suffix).toMatch(/--no-verify/);
-    // F24: the always-on collaborative-planning nudge is rendered as trailing
-    // bullets INSIDE the conventions block — after its header and before the next
-    // `\n## ` section — so it stays a soft default the later, more-specific
-    // sections (CLAUDE.md / skills / steering) can override. A newline-free
-    // load-bearing phrase is grepped so CRLF-vs-LF can't split the match.
-    const nudgePhrase = "ask only when blocked";
-    const nudgeIdx = suffix.indexOf(nudgePhrase);
-    expect(nudgeIdx).toBeGreaterThan(-1);
+    // #69: the interaction posture is a standalone `## Working with the user`
+    // section (not trailing bullets of the conventions block). It is a soft default
+    // emitted AFTER the mechanical conventions but BEFORE CLAUDE.md/skills/steering,
+    // so those more-specific sections still get the last word. The header is grepped
+    // with a leading `\n` as a CRLF-safe structural anchor; both body phrases are
+    // grepped so a reword can't silently gut the posture.
+    expect(suffix).toContain("\n## Working with the user");
+    expect(suffix).toMatch(/Ground first/);
+    expect(suffix).toMatch(/invite the user to steer/);
+    const postureIdx = suffix.indexOf("## Working with the user");
     const conventionsIdx = suffix.indexOf("Claude Code compatibility conventions");
+    expect(postureIdx).toBeGreaterThan(-1);
     expect(conventionsIdx).toBeGreaterThan(-1);
-    expect(nudgeIdx).toBeGreaterThan(conventionsIdx);
-    const nextSectionIdx = suffix.indexOf("\n## ", conventionsIdx + 1);
-    expect(nextSectionIdx).toBeGreaterThan(-1);
-    expect(nudgeIdx).toBeLessThan(nextSectionIdx);
+    expect(postureIdx).toBeGreaterThan(conventionsIdx);
+    // Pin the soft-default ordering (load-bearing — the `steering` override and the
+    // "CLAUDE.md gets the last word" property depend on it): the posture must precede
+    // BOTH the CLAUDE.md body (ROOT-INSTRUCTIONS) and the steering text (STEER-TEXT).
+    // Without this, a regression moving the section to the end of `sections` would
+    // still pass every other assertion.
+    expect(postureIdx).toBeLessThan(suffix.indexOf("ROOT-INSTRUCTIONS"));
+    expect(postureIdx).toBeLessThan(suffix.indexOf("STEER-TEXT"));
   });
 
-  it("keeps the collaborative-planning nudge within its word/character budget (F24)", () => {
-    const words = COLLABORATIVE_PLANNING_GUIDANCE.trim().split(/\s+/).filter(Boolean).length;
-    expect(words).toBeGreaterThanOrEqual(60); // guards accidental gutting
-    expect(words).toBeLessThanOrEqual(COLLABORATIVE_PLANNING_MAX_WORDS); // = 120, anti-bloat
-    expect(COLLABORATIVE_PLANNING_MAX_WORDS).toBe(120); // pins the acceptance criterion
-    const chars = COLLABORATIVE_PLANNING_GUIDANCE.replace(/\r\n/g, "\n").length;
-    expect(chars).toBeLessThanOrEqual(900); // long words can't dodge the word ceiling
+  it("gates the interaction posture on includeInteractionPosture (#69)", () => {
+    const base = {
+      claudeMd,
+      rules: [],
+      skills: [],
+      agents: [],
+      settings: baseSettings(),
+      state: newSessionContextState(claudeMd),
+    } as const;
+    // Flag omitted (the subagent default): posture absent, conventions still present.
+    const omitted = buildSystemPromptSuffix(base);
+    expect(omitted).not.toContain("Working with the user");
+    expect(omitted).toContain("Claude Code compatibility conventions");
+    // Flag true (the main session): posture present.
+    const included = buildSystemPromptSuffix({ ...base, includeInteractionPosture: true });
+    expect(included).toContain("## Working with the user");
   });
 
   // Feature 25 / #48: per-session scratchpad injection.
@@ -342,6 +357,46 @@ describe("context assembly", () => {
       windowsTempNote: false,
     });
     expect(withoutNote).not.toMatch(WIN_NOTE_MARK);
+  });
+
+  it("assembles sections with clean boundaries — no triple-newline gap, stable override ordering (#69)", () => {
+    // Guards the two seams #69's rewrite exposed in buildSystemPromptSuffix:
+    // (1) a section string ending in a stray newline joins to `\n\n\n` under
+    //     sections.join("\n\n") — the trailing-`\n` trap from deleting the old
+    //     `${COLLABORATIVE_PLANNING_GUIDANCE}` interpolation; and
+    // (2) override precedence — a soft-default section (the posture) must stay AHEAD
+    //     of the sections meant to override it (CLAUDE.md, steering).
+    // Controlled inputs only (no arbitrary skill/CLAUDE.md content with internal blank
+    // lines), so the invariant is about the ASSEMBLY, not user content.
+    const state = newSessionContextState(claudeMd);
+    state.activeSkills.set("act", "ACTIVE-SKILL-BODY");
+    const suffix = buildSystemPromptSuffix({
+      claudeMd,
+      rules: [
+        { id: "a.md", body: "UNCOND-RULE", source: { path: "x", scope: "project" }, unknownKeys: [], diagnostics: [] },
+      ],
+      skills: [],
+      agents: [makeAgent()],
+      settings: baseSettings(),
+      state,
+      steeringText: "STEER-TEXT",
+      scratchDir: SCRATCH,
+      includeInteractionPosture: true,
+    });
+    // (1) No triple-newline gap anywhere in the assembled suffix.
+    expect(suffix).not.toContain("\n\n\n");
+    // (2) Section order is stable and keeps every soft default ahead of what overrides it.
+    const order = [
+      "Claude Code compatibility conventions", // mechanical conventions
+      "## Working with the user", // interaction posture (soft default)
+      "ROOT-INSTRUCTIONS", // CLAUDE.md — gets the last word over the posture
+      "UNCOND-RULE", // project rules
+      "ACTIVE-SKILL-BODY", // active skills
+      "STEER-TEXT", // steering — also overrides the posture
+      "## Scratchpad directory", // scratchpad (last)
+    ].map((marker) => suffix.indexOf(marker));
+    for (const idx of order) expect(idx).toBeGreaterThan(-1); // no vacuous pass
+    expect(order).toEqual([...order].sort((a, b) => a - b)); // monotonic == in-order
   });
 
   it("emits no scratchpad section (and no Windows note) when scratchDir is undefined", () => {

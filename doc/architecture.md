@@ -98,8 +98,10 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
 
 ### `runtime/` — wiring the parsed model into a live Pi session
 - `context-assembly.ts` — builds the system-prompt suffix appended every turn in
-  `before_agent_start`: root CLAUDE.md, auto memory, unconditional rules, budgeted skill listing,
-  agent catalog, steering text, rendered active-skill bodies, and — when a per-session scratch dir
+  `before_agent_start`: the Claude-compat conventions block, a **main-session-only** `## Working
+  with the user` interaction posture (#69; gated by `includeInteractionPosture`, so dispatched
+  subagents omit it), root CLAUDE.md, auto memory, unconditional rules, budgeted skill listing,
+  agent catalog, rendered active-skill bodies, steering text, and — when a per-session scratch dir
   was created — a `buildScratchpadSection` block naming the native-safe scratchpad path and steering
   temp files there instead of `/tmp` (#48; the Windows namespace note is gated on
   `windowsTempNote`). Because the system prompt is rebuilt each turn and never compacted away,
@@ -259,6 +261,9 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers:
    fresh context with a visible footer notice. Nested dispatch is **off by default**
    (main-session-only, `subagents.maxDepth: 1`): a dispatched subagent normally receives neither
    `Agent` nor `Task` and its prompt omits the subagents catalog, so it does not attempt to nest.
+   A dispatched subagent's prompt also omits the main-session-only `## Working with the user`
+   interaction posture (#69) — it returns a report and has no user to converse with — while the
+   mechanical Claude-compat conventions it needs are unaffected.
    The nested-dispatch tool-provisioning and the depth guard only engage when an operator raises
    `subagents.maxDepth` to 2..5; once raised, the same guard runs inside every subagent session. By
    default the dispatch registers in the
