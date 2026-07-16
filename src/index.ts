@@ -1052,6 +1052,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         settings: project.settings,
         state,
         steeringText,
+        // #69: only the main session receives the `## Working with the user`
+        // interaction posture — subagents (the :623 call site) leave this unset.
+        includeInteractionPosture: true,
         // Feature 25 / #48: the literal native-safe scratch dir (captured eagerly
         // above) is injected on all platforms; the Windows namespace note is gated
         // on the shell↔native split detection.

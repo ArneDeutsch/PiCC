@@ -392,12 +392,14 @@ tracked project files):
   }
   ```
 
-  The **collaborative-planning posture** is another such built-in default: PiCC nudges the model,
-  on a substantial planning request, to ground itself in the repo, ask only about goals and
-  material tradeoffs, and avoid jumping straight to "go"/"confirm" — while still implementing
-  decisively once scope is agreed. It is guidance, not enforcement, so its effect is
-  model-dependent. To adjust it, use the same `steering` lever — for example, to tone it back
-  toward terse, minimal-question turns:
+  The **collaborative-planning posture** is another such built-in default, scoped to the **main
+  session** (the coordinator you talk to — dispatched subagents don't get it). On a substantial or
+  open-ended request, PiCC nudges the model to ground itself in the repo and share what it found,
+  ask only about goals and material tradeoffs, surface the real choices and recommend one, verify
+  load-bearing claims by reading the code, and avoid jumping straight to "go"/"confirm" — then
+  switch to implementing decisively once scope is agreed. It is guidance, not enforcement, so its
+  effect is model-dependent. To adjust it, use the same `steering` lever — for example, to tone it
+  back toward terse, minimal-question turns:
 
   ```json
   "steering": {

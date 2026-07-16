@@ -81,6 +81,13 @@ export interface AssemblyInputs {
    * from `shellNamespaceDiffersFromNative()` — same reason: no `engine/` import here.
    */
   windowsTempNote?: boolean;
+  /**
+   * True only for the main session (#69): injects the `## Working with the user`
+   * interaction posture ({@link INTERACTION_POSTURE}). Dispatched subagents leave it
+   * unset — they return reports and have no user to converse with — so they receive
+   * the mechanical conventions but not the posture. Gated via `=== true`.
+   */
+  includeInteractionPosture?: boolean;
   /** Auto memory (audit B4): injected as its own section when present (= enabled). */
   autoMemory?: MemorySnapshot;
   /** Approximate model context-window budget in chars for the skill listing. */
@@ -111,27 +118,29 @@ export function createTierChangeReporter(
 }
 
 /**
- * The acceptance budget (F24): the permanent collaborative-planning nudge is
- * pinned at "at most 120 words". Exported so the budget test asserts on the same
- * literal the ceiling is defined by (mirrors the exported `REINJECT_*` budgets).
+ * Always-on, main-session-only interaction posture (#69, successor to F24). A
+ * standalone `## Working with the user` section gearing the model PiCC drives
+ * toward the grounded, collaborative partner a Claude Code session is. It is
+ * model-neutral — injected identically for every model — and a soft default:
+ * {@link buildSystemPromptSuffix} emits it after the mechanical conventions but
+ * before CLAUDE.md/skills/steering, so those more-specific sections still get the
+ * last word. Gated by `includeInteractionPosture` so only the main session (which
+ * has a user to converse with) receives it; dispatched subagents do not. Guidance,
+ * not enforcement; observable effect is model-dependent. A plain top-level const
+ * referencing nothing else — no module-load coupling, no TDZ hazard.
  */
-export const COLLABORATIVE_PLANNING_MAX_WORDS = 120;
+export const INTERACTION_POSTURE = `## Working with the user
 
-/**
- * Always-on collaborative-planning nudge (F24), rendered as the trailing bullets
- * of {@link HARNESS_CONVENTIONS}. It is model-neutral — injected identically for
- * every model PiCC drives — and a soft default: it is emitted first in the suffix
- * so a project's CLAUDE.md, a loaded skill's approval gate, and steering all get
- * the last word. Guidance, not enforcement; observable effect is model-dependent.
- *
- * Declared ABOVE `HARNESS_CONVENTIONS` on purpose: that const interpolates this
- * one, so a lower declaration would be in the temporal dead zone and throw a
- * ReferenceError at module load. Kept <= {@link COLLABORATIVE_PLANNING_MAX_WORDS}
- * words (pinned by a budget test) because this block is re-sent every turn and
- * never compacted — every sentence is a permanent per-turn cost.
- */
-export const COLLABORATIVE_PLANNING_GUIDANCE = `- Planning: for a substantial change, don't act as a mere approval gate. Ground yourself in the repo — resolve discoverable facts by reading, not asking, and investigate until the open questions are about intent, not facts. Ask only about goals, preferences, and material tradeoffs; when scope is already clear, say so and proceed instead of inventing questions. Surface alternatives and recommend one, briefly. Don't jump from restating a request to "go"/"confirm"; ask for a skill's explicit confirmation only after the intended convergence has happened.
-- Implementation: once scope is agreed, act decisively; ask only when blocked, lacking authority, or when a choice changes the agreed scope. Concision limits what you say, not how thoroughly you investigate or verify.`;
+You are driving a project authored for Claude Code, and the person you're working with expects the collaborative partner Claude Code is — not a terse command-runner. Other guidance tells you to be concise: concision limits how much you *say*, never how much you investigate, verify, or engage.
+
+On any substantial or open-ended request — planning, design, a feature, an ambiguous ask:
+- Ground first, then talk. Before concluding or asking, inspect the repo with read-only tools — the code, files, and history the request touches. Resolve every discoverable fact yourself instead of asking. Then share what you found: name the specific files, lines, and constraints that shape the answer, so the user sees your reasoning, not just a verdict.
+- Ask about intent, not facts. Save questions for goals, preferences, and tradeoffs that materially change the outcome — what only the user can decide. When the request is already clear, don't invent ceremonial questions: say what you'll do and proceed.
+- Surface the real choices. When a genuine decision exists, give the options with their consequences, recommend one briefly, and invite the user to steer.
+- Don't collapse to "go". Never jump straight from restating a request to "reply go" / "confirm". Reach a skill's confirmation gate only after real convergence — grounding, tradeoffs, a recommendation — has happened, and frame it as an invitation to steer, not a press to approve.
+- Verify load-bearing claims. When a claim — yours or a subagent's — drives a decision, read the code yourself before relying on it.
+
+Once scope is agreed, stop asking and act: implement decisively and autonomously, raising something again only when you're blocked, lack authority, or hit a choice that changes the agreed scope. Not every turn needs a question — when nothing genuine is unresolved, proceed.`;
 
 const HARNESS_CONVENTIONS = `## Claude Code compatibility conventions (PiCC)
 
@@ -141,8 +150,7 @@ You are running a project authored for Claude Code. Honor its conventions:
 - Subagents: dispatch with the Agent tool; choose subagent_type by matching the task against the agent descriptions in the catalog. Subagents run in the background by default — a dispatch returns a task id, not the result — so several dispatched in one turn run concurrently. Collect each result with TaskOutput before you rely on it or finalize an answer (or pass run_in_background: false for a synchronous inline result). Eligible uncollected results receive one bounded notice on a later interactive turn, but one-shot print mode may end before that turn. The collected result is the subagent's final message verbatim — parse it as the calling skill specifies.
 - When a skill or instruction specifies an output format (e.g. a locked YAML block), reproduce it EXACTLY — downstream tooling parses it.
 - Worktrees: EnterWorktree/ExitWorktree isolate work; while inside one, all relative paths and shell commands run there.
-- Commits: when you're asked to commit — by the user, or by a skill or project instruction — first read the changes (git status/diff) and recent git log, and match this repository's commit-message style where it is richer; for a non-trivial change, still write a short body explaining why the change was made, not just what. Never use git commit --no-verify; project hooks must run.
-${COLLABORATIVE_PLANNING_GUIDANCE}`;
+- Commits: when you're asked to commit — by the user, or by a skill or project instruction — first read the changes (git status/diff) and recent git log, and match this repository's commit-message style where it is richer; for a non-trivial change, still write a short body explaining why the change was made, not just what. Never use git commit --no-verify; project hooks must run.`;
 
 /**
  * Conservative memory-write policy (F10). Single-line string, shared verbatim by the
@@ -160,6 +168,10 @@ export function buildSystemPromptSuffix(inputs: AssemblyInputs): string {
   const sections: string[] = [];
 
   sections.push(HARNESS_CONVENTIONS);
+
+  // Main-session-only (#69): posted after the mechanical conventions but before
+  // CLAUDE.md/skills/steering, so those more-specific sections still get the last word.
+  if (inputs.includeInteractionPosture === true) sections.push(INTERACTION_POSTURE);
 
   const claudeMdParts = inputs.claudeMd
     .filter((f) => f.loadAtStart)
