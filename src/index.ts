@@ -54,7 +54,7 @@ import { loadAgentMemory } from "./claude/memory.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
-import { resolveGitBashPath } from "./engine/shell-inject.js";
+import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
 import { applyUnicodeSafeProcessEnv, toNativeSafeTempForm, unicodeSafeSubprocessEnv } from "./util/env.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
 
@@ -1036,6 +1036,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         settings: project.settings,
         state,
         steeringText,
+        // Feature 25 / #48: the literal native-safe scratch dir (captured eagerly
+        // above) is injected on all platforms; the Windows namespace note is gated
+        // on the shell↔native split detection.
+        scratchDir,
+        windowsTempNote: shellNamespaceDiffersFromNative(),
         autoMemory: project.autoMemory,
         onDiagnostic: reportListingDegradation,
       });

@@ -226,6 +226,92 @@ describe("context assembly", () => {
     expect(suffix).toMatch(/--no-verify/);
   });
 
+  // Feature 25 / #48: per-session scratchpad injection.
+  const SCRATCH = "C:/Users/x/AppData/Local/Temp/picc-scratch-abc123";
+
+  // The Windows note is discriminated by note-specific content ("different namespaces"),
+  // NOT by "mktemp -p" — the all-platform body legitimately names mktemp as one recipe.
+  const WIN_NOTE_MARK = /different namespaces/;
+
+  it("injects the literal scratch-dir path and Claude's imperative directive on all platforms", () => {
+    const suffix = buildSystemPromptSuffix({
+      claudeMd,
+      rules: [],
+      skills: [],
+      agents: [],
+      settings: baseSettings(),
+      state: newSessionContextState(claudeMd),
+      scratchDir: SCRATCH,
+    });
+    expect(suffix).toContain(SCRATCH);
+    expect(suffix).toContain("## Scratchpad directory");
+    // Claude-faithful imperative + instead-of-/tmp + escape hatch.
+    expect(suffix).toMatch(/IMPORTANT: Always use/);
+    expect(suffix).toMatch(/instead of `\/tmp`/);
+    expect(suffix).toMatch(/Only use `\/tmp` if the user explicitly requests it/);
+    // Narrowed skill-override exception (UX): defer only to a specific literal path.
+    expect(suffix).toMatch(/defer to a skill only when it names a specific literal path/);
+    // Redirect pattern covered (not just mktemp) — the shape evaluate actually uses.
+    expect(suffix).toContain(`> "${SCRATCH}/name"`);
+    // No Windows note without the flag.
+    expect(suffix).not.toMatch(WIN_NOTE_MARK);
+    // Anti-regression: existing conventions block still present.
+    expect(suffix).toContain("Claude Code compatibility conventions");
+  });
+
+  it("appends the Windows namespace note only when windowsTempNote is true", () => {
+    const withNote = buildSystemPromptSuffix({
+      claudeMd,
+      rules: [],
+      skills: [],
+      agents: [],
+      settings: baseSettings(),
+      state: newSessionContextState(claudeMd),
+      scratchDir: SCRATCH,
+      windowsTempNote: true,
+    });
+    expect(withNote).toMatch(WIN_NOTE_MARK);
+    // Safe addressing: mktemp -p and the redirect form, bound to the scratch dir.
+    expect(withNote).toContain(`mktemp -p "${SCRATCH}"`);
+    expect(withNote).toContain(`"${SCRATCH}/name"`);
+    // The why clause (drive-relative + forward-slash identical).
+    expect(withNote).toMatch(/drive-relative/i);
+    expect(withNote).toMatch(/forward-slash drive-letter/i);
+    // Never $TEMP/$TMP (cygpath mention dropped per UX NIT).
+    expect(withNote).toMatch(/never a bare `\/tmp\/\.\.\.`, `\$TEMP`, or `\$TMP`/);
+
+    const withoutNote = buildSystemPromptSuffix({
+      claudeMd,
+      rules: [],
+      skills: [],
+      agents: [],
+      settings: baseSettings(),
+      state: newSessionContextState(claudeMd),
+      scratchDir: SCRATCH,
+      windowsTempNote: false,
+    });
+    expect(withoutNote).not.toMatch(WIN_NOTE_MARK);
+  });
+
+  it("emits no scratchpad section (and no Windows note) when scratchDir is undefined", () => {
+    const inputs = {
+      claudeMd,
+      rules: [],
+      skills: [],
+      agents: [],
+      settings: baseSettings(),
+      state: newSessionContextState(claudeMd),
+    } as const;
+    const baseline = buildSystemPromptSuffix(inputs);
+    // Even with the flag forced on, no scratchDir means no section at all.
+    const flagged = buildSystemPromptSuffix({ ...inputs, windowsTempNote: true });
+    expect(flagged).toBe(baseline); // byte-for-byte: off-Windows output unchanged
+    expect(baseline).not.toContain("## Scratchpad directory");
+    expect(baseline).not.toMatch(WIN_NOTE_MARK);
+    // Existing sections intact.
+    expect(baseline).toContain("Claude Code compatibility conventions");
+  });
+
   it("keeps activated skill bodies resident", () => {
     const state = newSessionContextState(claudeMd);
     state.activeSkills.set("sk", "ACTIVE-SKILL-BODY");

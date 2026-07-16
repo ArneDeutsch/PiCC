@@ -232,6 +232,24 @@ export function resolveGitBashPath(): string | undefined {
   return bash !== "bash" ? bash : undefined;
 }
 
+/**
+ * True when the harness's pinned shell (Git Bash / MSYS) resolves path strings in
+ * a DIFFERENT namespace than its native Node file tools (Read/Grep/Glob) — i.e. on
+ * Windows with a real Git Bash pinned (#48). In that split a bare `/tmp/...` written
+ * via the Bash tool is resolved drive-relative by the native tools and not found.
+ *
+ * Deliberately false for bare-`bash`/WSL (no Git Bash pinned): those live in yet
+ * another namespace where the forward-slash drive-letter contract does not hold, so
+ * the harness withholds the Windows note there. Uses the cached `resolveGitBashPath`,
+ * so it is free on the per-turn system-prompt hot path.
+ *
+ * `platform` is injectable (like `toNativeSafeTempForm`) so both branches are
+ * unit-testable without faking the real OS.
+ */
+export function shellNamespaceDiffersFromNative(platform?: NodeJS.Platform): boolean {
+  return (platform ?? process.platform) === "win32" && resolveGitBashPath() !== undefined;
+}
+
 interface RunResult {
   ok: boolean;
   stdout: string;

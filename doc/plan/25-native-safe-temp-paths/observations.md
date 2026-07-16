@@ -68,3 +68,21 @@ review.md). Dated bullets, one line each.
   if `realpathSync` ever returns an extended-length `\\?\C:\…` or UNC `\\server\share` form,
   the result is `//?/…` / `//server/…` — check t02's namespace-agreement holds (low
   likelihood: Node strips `\\?\` for ordinary temp paths).
+
+- t02 reviewed: coder PASS; parity + UX both NEEDS-WORK, convergent on guidance strength.
+  The parity agent could observe Claude's actual scratchpad section verbatim — the first
+  draft softened Claude's emphatic "IMPORTANT: Always use…" and dropped the "only use /tmp
+  if the user explicitly requests it" escape hatch. UX (MUST) caught that the "follow a
+  skill's explicit path instructions" exception was too wide — a GPT model could read
+  evaluate's vague "OS-temp path" as an override and reproduce #48 — and (SHOULD) that the
+  recipe only covered `mktemp -p`, not the `>` redirect evaluate actually uses. Coordinator
+  reworked the section: Claude-imperative lead-in, escape hatch, "scratchpad" vocabulary,
+  redirect+Write+mktemp generalization, narrowed exception (defer only to a *specific
+  literal path*), rationale-trails-directive, dropped "first attempt"/`cygpath` noise.
+- Follow-up candidate (parity/UX): `examples/full-surface` has no scratch-dir-consuming
+  skill; a fixture that writes to the injected scratchpad path would lock this parity
+  surface against regression. Deferred → review.md.
+- Deferred NIT (UX): the literal scratch path embeds the OS username and is re-injected each
+  turn; a mild tension with evaluate echoing writes. Covered by evaluate's existing
+  write-discipline (no absolute local paths in public writes, mechanic 3); not added to the
+  injected guidance to avoid bloating it.
