@@ -377,10 +377,11 @@ Deliberately partial, by design (see the plan §6):
     blocked (the glob engine covers the bare directory node). The genuine residual gap is a read
     call with **no path** (or `path: "."`), e.g. `Grep {}`: there is nothing for the path matcher to
     test, yet its results can still surface matching file contents. Only a **bare** `deny: Read`
-    (which removes the read tools from context entirely) forecloses that content-exfiltration path
-    *through the built-in read tools* — it does not stop a shell read such as `Bash(cat secrets/x)`,
-    which needs its own `Bash(...)` deny. This is inherent to path-glob matching and is Claude
-    Code's own best-effort limit.
+    forecloses that content-exfiltration path *through the built-in read tools* — but at the cost of
+    removing `Read`, `Grep`, `Glob`, and `NotebookRead` from the agent's context entirely (it can no
+    longer search or read files at all), and it still does not stop a shell read such as
+    `Bash(cat secrets/x)`, which needs its own `Bash(...)` deny. This is inherent to path-glob
+    matching and is Claude Code's own best-effort limit.
 - **Agent `tools:` gating is fully enforced** — a read-only reviewer cannot write; an agent
   without web tools cannot fetch.
 - `allow` / `ask` rules and permission modes are parsed and **reported, not enforced** — the
