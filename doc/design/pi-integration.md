@@ -35,7 +35,7 @@ Launch modes we support:
 | PreCompact/PostCompact + instruction re-injection | `pi.on("session_before_compact")` (can supply custom summary; we append preserved-instructions block), `pi.on("session_compact")` |
 | Custom tools: `Agent`, `EnterWorktree`, `ExitWorktree`, `WebFetch`, `WebSearch`, `Grep`, `Glob`, `TaskCreate/...`, degrade stubs | `pi.registerTool({ name, description, parameters: TypeBox, execute, prepareArguments? })`; throw ⇒ `isError`; `terminate: true` supported |
 | Slash commands: user-invocable skills, legacy commands, `/doctor`, `/quota`, `/compat` | `pi.registerCommand(name, { description, handler, getArgumentCompletions })`; command handlers get `ExtensionCommandContext` |
-| Worktree cwd swap (load-bearing) | Override built-in tools: re-register `bash`/`read`/`write`/`edit`/`grep`/`find`/`ls` wrappers that resolve paths/cwd through a mutable `EffectiveCwd`; built-ins created per-cwd via `createBashTool(cwd, { spawnHook })`, `createReadTool(cwd, …)` etc. Built-in renderers are inherited when we omit renderCall/renderResult. |
+| Worktree cwd swap (load-bearing) | Override built-in tools: re-register `bash`/`read`/`write`/`edit`/`grep`/`find`/`ls` wrappers that resolve paths/cwd through a mutable `EffectiveCwd`; built-ins created per-cwd via `createBashTool(cwd, { spawnHook })`, `createReadTool(cwd, …)` etc. Built-in renderers are re-applied from `create*ToolDefinition` and de-padded through the self-shell wrapper (`src/runtime/tool-shell.ts`, §4); `execute` stays sourced from `create*Tool` so it is byte-identical. |
 | Subagent runtime (fresh context, parallel, per-agent tools/model, verbatim return) | SDK: `createAgentSession({ cwd, tools, customTools, model, thinkingLevel, resourceLoader: new DefaultResourceLoader({ systemPromptOverride, agentsFilesOverride, skillsOverride, extensionFactories }), sessionManager: SessionManager.inMemory(), settingsManager: SettingsManager.inMemory(), authStorage, modelRegistry })`; final assistant message read from `session.messages` — returned **verbatim** (a resumable dispatch additionally appends a clearly-delimited in-band identity/resume trailer to the model-visible text, matching Claude Code; the human TUI strips it — see §3.4). A `subagent_type: "fork"` dispatch (F16) instead seeds a persisted `sessionManager: SessionManager.forkFrom(parentTranscript, cwd, sessionDir, { id })` so the child inherits the parent conversation (non-resumable), rather than `SessionManager.inMemory()`. |
 | Model/effort control | `pi.setModel(model)`, `ctx.modelRegistry.find(provider,id)`, `pi.setThinkingLevel("off"…"max")` — Claude `effort` maps onto thinking levels |
 | Env & exec | `pi.exec(cmd, args, { signal, timeout })` for git/hook commands; hooks additionally need shell execution via `node:child_process` (stdin JSON contract Pi's exec doesn't cover: we use `spawn` directly) |
@@ -113,4 +113,24 @@ TUI, `/model`, project trust. We do not reimplement any of it.
   (`test/pi-contract.test.ts`) asserts the imports/exports we rely on exist.
 - `before_agent_start` system-prompt chaining: other extensions may also modify; we append, not replace.
 - Built-in tool override warning in interactive mode is expected (documented for users).
+- Tool-row de-padding (concise-tool-rows) couples `src/runtime/tool-shell.ts` to Pi's render
+  contract in three places. **Two** are pinned by the smoke test (`test/pi-contract.test.ts`, t02) so
+  a Pi bump fails loudly in CI; the **third (`ctx.lastComponent`) cannot be asserted against Pi's side
+  and stays an unguarded watchpoint** — a Pi change there degrades incremental rendering silently on a
+  green CI:
+  - **`create*ToolDefinition` renderer shape** — the de-padded built-in rows source their
+    `renderCall`/`renderResult` from the public `createRead/Write/Edit/Bash/Grep/Find/LsToolDefinition`
+    factories (the plain `create*Tool` factory strips renderers via `wrapToolDefinition`). A rename,
+    move, or shape change of these factories breaks the wrap.
+  - **`ctx.lastComponent` threading** — `ToolExecutionComponent` hands back the component we returned
+    as `ctx.lastComponent`; the built-ins reuse it for incremental render state (`read`/`bash` via
+    `?? new …`, `edit` via `instanceof Box`). The wrapper stashes the inner component (`__inner`) and
+    threads it back — a load-bearing coupling to Pi's incremental-render contract. **Not pinned by the
+    smoke test:** only PiCC's own threading logic is unit-tested (`test/runtime-core.test.ts`, with a
+    fake inner + fake ctx); Pi's side (that `ToolExecutionComponent` still hands the returned component
+    back as `ctx.lastComponent`) is not asserted, so this coupling can regress silently on a Pi bump.
+    See [`tui-extension-guide.md`](../tui-extension-guide.md) §3.2.
+  - **`getTextOutput` transform** — `tool-shell.ts` reproduces Pi's `render-utils.js` `getTextOutput`
+    (the deep path is `exports`-blocked); the smoke test pins it against Pi's own via an absolute
+    `file://` import so a transform change (CRLF stripping, image fallbacks) fails loudly.
 - Quota introspection depends on undocumented response headers; feature is best-effort by design.

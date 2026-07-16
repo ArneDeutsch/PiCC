@@ -978,7 +978,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     console.error(`PiCC: session scratch dir unavailable: ${(err as Error).message}`);
   }
 
-  // Cwd-swapping overrides of Pi built-ins (design doc §3.1). Renderers are inherited.
+  // Cwd-swapping overrides of Pi built-ins (design doc §3.1). Execute is sourced from the
+  // ctx-dropping create*Tool factory (byte-identical); renderers are re-applied from
+  // create*ToolDefinition and de-padded via wrapForSelfShell (concise-tool-rows).
   void (async () => {
     try {
       const sdk: any = await import("@earendil-works/pi-coding-agent");
