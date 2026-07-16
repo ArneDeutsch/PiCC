@@ -279,9 +279,14 @@ describe("context assembly", () => {
     const omitted = buildSystemPromptSuffix(base);
     expect(omitted).not.toContain("Working with the user");
     expect(omitted).toContain("Claude Code compatibility conventions");
-    // Flag true (the main session): posture present.
+    // The delegation nudge is part of the gated posture — absent when the flag is
+    // omitted. Keyed on /delegat/i, the sole stem unique to the new bullet (`subagent`
+    // pre-exists in HARNESS_CONVENTIONS + the Verify bullet, so it would false-fail here).
+    expect(omitted).not.toMatch(/delegat/i);
+    // Flag true (the main session): posture present, including the delegation nudge.
     const included = buildSystemPromptSuffix({ ...base, includeInteractionPosture: true });
     expect(included).toContain("## Working with the user");
+    expect(included).toMatch(/delegat/i);
   });
 
   // Feature 25 / #48: per-session scratchpad injection.

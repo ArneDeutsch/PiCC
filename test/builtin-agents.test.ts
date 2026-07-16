@@ -167,6 +167,10 @@ describe("built-in agents through the extension (E1/E2/E6)", () => {
     // dispatched subagents (even `skipProjectContext` ones) keep the mechanical
     // conventions block but do NOT receive the posture.
     expect(prompt).not.toContain("Working with the user");
+    // The main-session-only delegation nudge is absent too (keyed on /delegat/i, the
+    // stem unique to the posture bullet — not /subagent/i, which lives in the always-on
+    // conventions block a subagent still receives).
+    expect(prompt).not.toMatch(/delegat/i);
     expect(prompt).toContain("You are a software architect");
   });
 
@@ -176,6 +180,8 @@ describe("built-in agents through the extension (E1/E2/E6)", () => {
     const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" }))
       .systemPrompt as string;
     expect(prompt).toContain("## Working with the user");
+    // The main-session-only delegation nudge rides along (keyed on /delegat/i).
+    expect(prompt).toMatch(/delegat/i);
   });
 
   it("general-purpose prompt DOES include CLAUDE.md and rules", async () => {
@@ -185,6 +191,8 @@ describe("built-in agents through the extension (E1/E2/E6)", () => {
     // #69: the full-context general-purpose subagent still gets no interaction posture,
     // so the flag-gating is unambiguous — not attributable to Plan's context-trimming.
     expect(prompt).not.toContain("Working with the user");
+    // ...and no delegation nudge either — proves it wasn't misplaced in the always-on block.
+    expect(prompt).not.toMatch(/delegat/i);
   });
 
   it("a project agent overriding Explore keeps the full project context (no built-in skipping)", async () => {
