@@ -541,6 +541,46 @@ describe.skipIf(cliMissing)(
       TEST_TIMEOUT_MS,
     );
 
+    // --- Scenario 6b: a Read deny also blocks an Edit on the same path (v2.1.208 parity) ---
+    it(
+      "hard-blocks an Edit under Read(secrets/**) and never leaks the secret (full-surface)",
+      async () => {
+        const result = await runPi({
+          fixture: "full-surface",
+          script: [
+            {
+              toolCalls: [
+                {
+                  name: "edit",
+                  args: {
+                    path: "secrets/key.txt",
+                    edits: [{ oldText: "placeholder", newText: "x" }],
+                  },
+                },
+              ],
+            },
+            { text: "ok" },
+          ],
+          prompt: "edit the secret",
+          setup: (dir) => {
+            fs.mkdirSync(path.join(dir, "secrets"), { recursive: true });
+            fs.writeFileSync(path.join(dir, "secrets", "key.txt"), "TOPSECRET\n");
+          },
+        });
+
+        expect(result.code).toBe(0);
+        expect(result.requests.length).toBeGreaterThanOrEqual(2);
+        // The Read deny blocks the Edit, and surfaces the "Read deny rule" signal.
+        expect(toolResultText(result.requests[1]!)).toMatch(/deny|blocked|not permitted/i);
+        for (const [i, request] of result.requests.entries()) {
+          expect(allText(request), `request ${i} must not leak the secret`).not.toContain(
+            "TOPSECRET",
+          );
+        }
+      },
+      TEST_TIMEOUT_MS,
+    );
+
     // --- Scenario 7: PreToolUse warn-hook additionalContext reaches the model (full-surface) ---
     it.skipIf(!BASH_AVAILABLE)(
       "runs the PreToolUse write-guard and steers FS-WRITE-GUARD into the model (full-surface)",
