@@ -9,6 +9,7 @@ import {
 import { PermissionEngine } from "../../src/engine/permissions.js";
 import { HookRunner } from "../../src/engine/hook-runner.js";
 import type { ClaudeAgent, HookOutcome } from "../../src/types.js";
+import { deferred, waitUntil, type Deferred } from "./async.js";
 
 /**
  * Shared fake Pi SDK builder (t01): the one place tests fake `createAgentSession`.
@@ -155,6 +156,8 @@ export interface FakeSdkHandle {
   sessions: FakeSessionState[];
   abortCalls: () => number;
   promptCalls: () => number;
+  /** Wait until the requested prompt has entered and its user message is recorded. */
+  waitForPromptCalls(count: number): Promise<void>;
   /** Args of every forkSessionManager call, in order (F16 wiring assertions). */
   forkCalls: () => Array<{ sourcePath: string; cwd: string; sessionDir: string; id: string }>;
 }
@@ -165,8 +168,29 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
   const replies = options.replies ?? [];
   let abortCalls = 0;
   let promptCalls = 0;
+  const promptWaiters = new Set<{ count: number; signal: Deferred<void> }>();
   let replyIndex = 0;
   const forkCalls: Array<{ sourcePath: string; cwd: string; sessionDir: string; id: string }> = [];
+
+  const notifyPromptWaiters = () => {
+    for (const waiter of promptWaiters) {
+      if (promptCalls >= waiter.count) {
+        promptWaiters.delete(waiter);
+        waiter.signal.resolve();
+      }
+    }
+  };
+
+  const waitForPromptCalls = (count: number): Promise<void> => {
+    const waiter = { count, signal: deferred<void>() };
+    if (promptCalls < count) promptWaiters.add(waiter);
+    return waitUntil({
+      description: `prompt call count to reach ${count}`,
+      predicate: () =>
+        promptCalls >= count || waiter.signal.promise.then(() => promptCalls >= count),
+      describeObserved: () => `expected: ${count}; actual: ${promptCalls}`,
+    }).finally(() => promptWaiters.delete(waiter));
+  };
 
   const normalize = (reply: string | FakeReply | undefined): FakeReply =>
     typeof reply === "string" ? { text: reply } : (reply ?? { text: "" });
@@ -235,6 +259,8 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
           async prompt(text: string) {
             promptCalls++;
             record({ role: "user", content: text });
+            // Readiness is observable before any scripted gate can hold the run.
+            notifyPromptWaiters();
             let reply: FakeReply;
             if (options.onPrompt) {
               const before = state.messages.length;
@@ -343,6 +369,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
     sessions,
     abortCalls: () => abortCalls,
     promptCalls: () => promptCalls,
+    waitForPromptCalls,
     forkCalls: () => forkCalls,
   };
 }
