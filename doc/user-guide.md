@@ -341,6 +341,19 @@ tracked project files):
     "openai/*": "Keep commit messages to a one-line subject; no body unless I ask."
   }
   ```
+
+  The **collaborative-planning posture** is another such built-in default: PiCC nudges the model,
+  on a substantial planning request, to ground itself in the repo, ask only about goals and
+  material tradeoffs, and avoid jumping straight to "go"/"confirm" — while still implementing
+  decisively once scope is agreed. It is guidance, not enforcement, so its effect is
+  model-dependent. To adjust it, use the same `steering` lever — for example, to tone it back
+  toward terse, minimal-question turns:
+
+  ```json
+  "steering": {
+    "openai/*": "Skip the collaborative back-and-forth; restate my request briefly and proceed unless something is genuinely blocking."
+  }
+  ```
 - `effortMap` — extends the mapping from Claude `effort:` values / prose ("apply maximum
   reasoning effort") to thinking levels.
 

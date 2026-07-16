@@ -110,8 +110,11 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
   `tools:`/`model`/`effort` (with `CLAUDE_CODE_SUBAGENT_MODEL` as the highest-priority model
   override), enforces the depth cap (default 5), runs agent-scoped `hooks:`, supports
   `isolation: worktree`, `run_in_background`, and `background: true` frontmatter, and returns the
-  subagent's final message **verbatim** (skills parse locked YAML from it — a hard contract,
-  plan §4.3). It also classifies every dispatch outcome (see *Subagent error contract* in §4),
+  subagent's final message **verbatim** for a non-resumable/one-shot dispatch; a
+  **resumable** dispatch additionally appends a clearly-delimited in-band identity/resume trailer to
+  the model-visible text (Claude-faithful; the human TUI strips it), so a skill parsing a locked YAML
+  block from the message must use a one-shot dispatch or account for the trailer (plan §4.3). It also
+  classifies every dispatch outcome (see *Subagent error contract* in §4),
   mints a stable **agent id**, persists a **transcript** discoverable next to the main session's,
   streams **live progress** to the UI via `subagent-progress.ts`, captures **per-subagent usage**,
   and — through `subagent-registry.ts` — backs the `SendMessage` resume/steer channel (F02).
@@ -228,8 +231,9 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers:
    PostToolUse / PostToolUseFailure hooks fire on the result.
 
 6. **Subagent dispatch.** The `Agent`/`Task` tool calls `SubagentRuntime.dispatch`, which spawns a
-   fresh Pi session with the gated tool set and returns the final message verbatim (or a loud,
-   classified failure — see the *Subagent error contract* in §4). One exception to "fresh": a
+   fresh Pi session with the gated tool set and returns the final message verbatim (a resumable
+   dispatch appends a clearly-delimited in-band identity/resume trailer to the model-visible text,
+   Claude-faithful) — or a loud, classified failure (see the *Subagent error contract* in §4). One exception to "fresh": a
    `subagent_type: "fork"` dispatch (F16) **inherits the parent conversation** — a main-session-only,
    env-gated (`CLAUDE_CODE_FORK_SUBAGENT`) fork seeded from the parent transcript via
    `SessionManager.forkFrom`, non-resumable, with output isolation still kept; every case that can't
@@ -261,14 +265,18 @@ principle in the plan (§2.1 mechanical fidelity).
   against `CwdState.get()` (`src/index.ts`, `cwd-state.ts`, design §3.1). Subagents get their cwd
   natively via `createAgentSession({ cwd })`.
 
-- **Verbatim subagent return.** A subagent's final message is returned exactly as produced — no
-  summarizing or wrapping — because skills parse it directly, often a locked-YAML verdict block
-  (`subagents.ts`, plan §4.3).
+- **Verbatim subagent return.** A subagent's final message body is returned exactly as produced — no
+  summarizing, no wrapping of the body. A **resumable** dispatch appends a clearly-delimited in-band
+  identity/resume trailer to the model-visible text (Claude-faithful; the human TUI strips it), so a
+  skill parsing the message directly — often a locked-YAML verdict block — must use a one-shot
+  dispatch or account for the trailer (`subagents.ts`, plan §4.3).
 
 - **Subagent error contract (F02 — the failure class this feature closes).** Every dispatch is
   classified into exactly one outcome, and the classification — not a normal-looking success — is
   what reaches the coordinator:
-  - **completed** — the run finished; its verbatim final message is returned.
+  - **completed** — the run finished; its verbatim final message is returned (a resumable dispatch
+    appends a clearly-delimited in-band identity/resume trailer to the model-visible text,
+    Claude-faithful).
   - **failed** — the run ended on a terminal API error (e.g. a drained usage limit). The tool
     reports a **loud failure naming the cause** (`Agent terminated early due to an API error: …`),
     never an empty or normal-looking success. This is the exact regression that, before F02,

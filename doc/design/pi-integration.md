@@ -36,7 +36,7 @@ Launch modes we support:
 | Custom tools: `Agent`, `EnterWorktree`, `ExitWorktree`, `WebFetch`, `WebSearch`, `Grep`, `Glob`, `TaskCreate/...`, degrade stubs | `pi.registerTool({ name, description, parameters: TypeBox, execute, prepareArguments? })`; throw ⇒ `isError`; `terminate: true` supported |
 | Slash commands: user-invocable skills, legacy commands, `/doctor`, `/quota`, `/compat` | `pi.registerCommand(name, { description, handler, getArgumentCompletions })`; command handlers get `ExtensionCommandContext` |
 | Worktree cwd swap (load-bearing) | Override built-in tools: re-register `bash`/`read`/`write`/`edit`/`grep`/`find`/`ls` wrappers that resolve paths/cwd through a mutable `EffectiveCwd`; built-ins created per-cwd via `createBashTool(cwd, { spawnHook })`, `createReadTool(cwd, …)` etc. Built-in renderers are inherited when we omit renderCall/renderResult. |
-| Subagent runtime (fresh context, parallel, per-agent tools/model, verbatim return) | SDK: `createAgentSession({ cwd, tools, customTools, model, thinkingLevel, resourceLoader: new DefaultResourceLoader({ systemPromptOverride, agentsFilesOverride, skillsOverride, extensionFactories }), sessionManager: SessionManager.inMemory(), settingsManager: SettingsManager.inMemory(), authStorage, modelRegistry })`; final assistant message read from `session.messages` — returned **verbatim**. A `subagent_type: "fork"` dispatch (F16) instead seeds a persisted `sessionManager: SessionManager.forkFrom(parentTranscript, cwd, sessionDir, { id })` so the child inherits the parent conversation (non-resumable), rather than `SessionManager.inMemory()`. |
+| Subagent runtime (fresh context, parallel, per-agent tools/model, verbatim return) | SDK: `createAgentSession({ cwd, tools, customTools, model, thinkingLevel, resourceLoader: new DefaultResourceLoader({ systemPromptOverride, agentsFilesOverride, skillsOverride, extensionFactories }), sessionManager: SessionManager.inMemory(), settingsManager: SettingsManager.inMemory(), authStorage, modelRegistry })`; final assistant message read from `session.messages` — returned **verbatim** (a resumable dispatch additionally appends a clearly-delimited in-band identity/resume trailer to the model-visible text, matching Claude Code; the human TUI strips it — see §3.4). A `subagent_type: "fork"` dispatch (F16) instead seeds a persisted `sessionManager: SessionManager.forkFrom(parentTranscript, cwd, sessionDir, { id })` so the child inherits the parent conversation (non-resumable), rather than `SessionManager.inMemory()`. |
 | Model/effort control | `pi.setModel(model)`, `ctx.modelRegistry.find(provider,id)`, `pi.setThinkingLevel("off"…"max")` — Claude `effort` maps onto thinking levels |
 | Env & exec | `pi.exec(cmd, args, { signal, timeout })` for git/hook commands; hooks additionally need shell execution via `node:child_process` (stdin JSON contract Pi's exec doesn't cover: we use `spawn` directly) |
 | Quota | `ctx.getContextUsage()`; subscription quota via provider headers on `after_provider_response` (rate-limit headers) + `/login`-stored auth; degrade gracefully if absent |
@@ -86,8 +86,11 @@ CLAUDE.md/rules hierarchy; tools = intersection of requested `tools:` minus `dis
 translated per §3.2, with non-granted tools simply absent; per-agent `model`/`effort` resolved
 via `modelRegistry`; depth tracked via an env/context counter, capped by settings
 (default 1 nesting level beyond orchestrator = depth 2 total ⇒ configurable). Return value:
-final assistant message text **verbatim** (no wrapper); on empty/malformed (per caller contract)
-one retry supported by re-prompting.
+final assistant message text **verbatim** for a non-resumable/one-shot dispatch; a **resumable**
+dispatch appends a clearly-delimited in-band identity/resume trailer (`— resumable via SendMessage`)
+to the model-visible text — faithful to Claude Code, which appends the same kind of in-band resume
+handle to resumable subagent results (the human TUI strips it, so it is a model-visible concern only). On
+empty/malformed (per caller contract) one retry supported by re-prompting.
 
 ### 3.5 Compaction preservation
 On `session_before_compact` we do not replace Pi's summarizer; we let default compaction run

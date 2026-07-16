@@ -38,6 +38,8 @@ import {
   contextForTouchedFile,
   newSessionContextState,
   resetInjectionState,
+  COLLABORATIVE_PLANNING_GUIDANCE,
+  COLLABORATIVE_PLANNING_MAX_WORDS,
 } from "../src/runtime/context-assembly.js";
 import { mapEffort, steeringForModel, type PiCCConfig } from "../src/runtime/steering.js";
 import { createAgentToolDefinition, extractText, type SubagentRuntime } from "../src/runtime/subagents.js";
@@ -230,6 +232,29 @@ describe("context assembly", () => {
     expect(suffix).toMatch(/recent git log/i);
     expect(suffix).toMatch(/why the change was made/i);
     expect(suffix).toMatch(/--no-verify/);
+    // F24: the always-on collaborative-planning nudge is rendered as trailing
+    // bullets INSIDE the conventions block — after its header and before the next
+    // `\n## ` section — so it stays a soft default the later, more-specific
+    // sections (CLAUDE.md / skills / steering) can override. A newline-free
+    // load-bearing phrase is grepped so CRLF-vs-LF can't split the match.
+    const nudgePhrase = "ask only when blocked";
+    const nudgeIdx = suffix.indexOf(nudgePhrase);
+    expect(nudgeIdx).toBeGreaterThan(-1);
+    const conventionsIdx = suffix.indexOf("Claude Code compatibility conventions");
+    expect(conventionsIdx).toBeGreaterThan(-1);
+    expect(nudgeIdx).toBeGreaterThan(conventionsIdx);
+    const nextSectionIdx = suffix.indexOf("\n## ", conventionsIdx + 1);
+    expect(nextSectionIdx).toBeGreaterThan(-1);
+    expect(nudgeIdx).toBeLessThan(nextSectionIdx);
+  });
+
+  it("keeps the collaborative-planning nudge within its word/character budget (F24)", () => {
+    const words = COLLABORATIVE_PLANNING_GUIDANCE.trim().split(/\s+/).filter(Boolean).length;
+    expect(words).toBeGreaterThanOrEqual(60); // guards accidental gutting
+    expect(words).toBeLessThanOrEqual(COLLABORATIVE_PLANNING_MAX_WORDS); // = 120, anti-bloat
+    expect(COLLABORATIVE_PLANNING_MAX_WORDS).toBe(120); // pins the acceptance criterion
+    const chars = COLLABORATIVE_PLANNING_GUIDANCE.replace(/\r\n/g, "\n").length;
+    expect(chars).toBeLessThanOrEqual(900); // long words can't dodge the word ceiling
   });
 
   it("keeps activated skill bodies resident", () => {
