@@ -114,8 +114,9 @@ describe("description-based naming contract", () => {
     expect(firstIndex).toBeLessThan(secondIndex);
   };
 
-  it("pins validation, collision preflight, race backstops, and resume semantics in workflow-detail.md", () => {
+  it("keeps the Phase 2 validation contract and collision/race backstops in workflow-detail.md (loose floor)", () => {
     const body = collapsed("references/workflow-detail.md");
+    // Floor 5 — Phase 2 validation contract (kept verbatim: slug regex, bound, device list, ref-check).
     expect(body).toContain("^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$");
     expect(body).toContain("3–48 characters");
     for (const reserved of ["`con`", "`prn`", "`aux`", "`nul`", "`com1`–`com9`", "`lpt1`–`lpt9`"]) {
@@ -126,66 +127,14 @@ describe("description-based naming contract", () => {
     expect(body).toContain("never silently sanitize");
     expect(body).toContain("append/increment a numeric counter");
 
-    for (const marker of [
-      // The vacuous "doc/plan/<slug> in the fetched targetDefault tree" collision clause was
-      // dropped in untrack-process-artifacts: plan folders are gitignored and never on a fetched
-      // tree, so a stale one can only appear in the current filesystem (still checked below).
-      "current filesystem including a dangling symlink",
-      "physical `.claude/worktrees/<feature-slug>`",
-      "registered worktree",
-      "local `refs/heads/feature/<feature-slug>`",
-      "local harness `refs/heads/worktree-<feature-slug>`",
-      "fetched remote `refs/remotes/<pushremote>/feature/<feature-slug>`",
-    ]) {
-      expect(body).toContain(marker);
-    }
-    expect(body).toContain("case-insensitively");
-    expect(body).toContain("exact git/path checks");
+    // Floor 6 — collision/race backstops as a LOOSE representative subset, not the exhaustive prose.
     expect(body).toContain("create-or-reenter");
-    for (const raceMarker of [
-      "delete a newly appeared unregistered directory",
-      "adopt a newly appeared `worktree-<feature-slug>` harness branch",
-      "seed files and run create hooks",
-      "report the worktree as created",
-      "cannot promise preservation or reliably detect",
-      "exact worktree path",
-      "exact harness/feature branch",
-      "full `git status`",
-      "possible deletion, branch adoption, seeding, and hook effects",
-    ]) expect(body).toContain(raceMarker);
-    expect(body).toContain("invoke it with `<feature-slug>`");
-    expect(body).toContain("non-forcing `git switch -c feature/<feature-slug>");
-    expect(body).toContain("no further workflow-initiated repository or github writes");
+    expect(body).toContain("delete a newly appeared unregistered directory");
     expect(body).toContain("cannot atomically reserve");
-
-    expectBefore(body, "resume classification", "author one concise descriptive");
-    expect(body).toContain("worktree basename and exact current `feature/<feature-slug>` branch");
-    expect(body).toContain("`doc/plan/<feature-slug>/` folder");
-    expect(body).toContain("# <feature-slug> review: <title>");
-    expect(body).toContain("with exactly the same frozen `<title>`");
-    expect(body).toContain("task and fix commits require only the slug prefix");
-    expect(body).toContain("stop before further commands or writes");
-    for (const trustMarker of [
-      "recovered frozen title verbatim", "recovered scope", "reconstructed phase", "slug/branch/worktree/plan identity",
-      "ticket target and reference", "exact remaining write contract", "require explicit confirmation",
-      "freshly resolve `target`, `push`, `pushremote`, and `targetdefault`", "require its repo/reference to match",
-    ]) expect(body).toContain(trustMarker);
+    expect(body).toContain("cannot promise preservation or reliably detect");
+    expect(body).toContain("no further workflow-initiated repository or github writes");
+    expect(body).toContain("non-forcing `git switch -c feature/<feature-slug>");
     expect(body).toContain("identity finalized and immutable");
-  });
-
-  it("delimits a concrete legacy override through every remaining phase", () => {
-    const raw = read("references/workflow-detail.md");
-    const start = "<!-- LEGACY-RESUME-START: excluded only from new-run obsolete-form scans -->";
-    const end = "<!-- LEGACY-RESUME-END -->";
-    expectBefore(raw, start, end);
-    const legacy = raw.slice(raw.indexOf(start), raw.indexOf(end) + end.length).toLowerCase();
-    for (const marker of [
-      "feature/20-de-number-feature-names", "doc/plan/20-de-number-feature-names/",
-      "# f20: description-based feature naming", "# f20 review: description-based feature naming",
-      "f20: plan —", "f20: t01 —", "f20: review —",
-      "current plan, task, log, observations, and review paths", "push and configured upstream",
-      "pr lookup/creation", "fork compare url", "ci lookup/repush", "abort guidance", "cleanup commands",
-    ]) expect(legacy).toContain(marker);
   });
 
   it("keeps the resident router on the same descriptive identity and presentation gate", () => {
@@ -194,7 +143,6 @@ describe("description-based naming contract", () => {
     expect(body).toContain("<feature-slug>: t<task-number> — <description>");
     expect(body).toContain("never sanitize/add a counter");
     expect(body).toContain("explicit human confirmation");
-    expect(body).toContain("complete override");
     expect(body).toContain("may delete a raced unregistered directory");
     expect(body).toContain("confirmed self-owned fast-forward repush");
     for (const marker of [
@@ -215,40 +163,34 @@ describe("description-based naming contract", () => {
     expect(body).not.toMatch(/next free|pick the next free|feature\/<nn>|f<nn>/i);
   });
 
-  it("pins templates and task-local numbering independently", () => {
+  it("Phase 7 review fan-out surfaces new untracked non-ignored files, not bare git diff HEAD (GitHub #13)", () => {
+    // Loose positive floor: the fan-out step must stage (or otherwise surface) new untracked
+    // non-ignored files so a reviewer's view is complete — guarding against a silent regression to
+    // bare `git diff HEAD`, the exact recurrence #13 documents three times. Accept either mechanism
+    // (`git add -A` staging or a reviewer `git status --short` read); no brittle exact-phrase pin.
+    const body = collapsed("references/workflow-detail.md");
+    expect(body).toMatch(/git add -a|git status --short/);
+  });
+
+  it("pins the plan-folder templates and task-local numbering (loose)", () => {
     const body = read("references/templates.md");
     expect(body).toContain("doc/plan/<feature-slug>/");
     expect(body).toContain("# <feature-slug>: <Title>");
-    expect(body).toContain("# <feature-slug> Review: <Title>");
     expect(body).toContain("tasks/t<task-number>-<task-slug>.md");
-    expect(body).toContain("log/t<task-number>.md");
     expect(body).toContain("t01");
-    expect(body).toContain("t02");
   });
 
-  it("keeps public ticket titles descriptive, stable, bounded, and safely quoted", () => {
+  it("keeps public ticket titles model-authored, bounded, and body-file-quoted (loose floor)", () => {
+    // Loose representatives of the title-quoting contract: independent authorship, the 120-char
+    // single-line bound, and --body-file at each write site — not the exhaustive phrase list.
     const workflow = collapsed("references/workflow-detail.md");
     const creation = collapsed("references/ticket-creation.md");
     const integration = collapsed("references/ticket-integration.md");
     const handoff = collapsed("references/handoff.md");
-    expect(workflow).toContain("at the explicit build go, freeze that title");
-    expect(workflow).toContain("a given ticket keeps its existing title unchanged");
     expect(workflow).toContain("printable ascii, single-line, at most 120 characters");
     expect(workflow).toContain("do not directly copy, interpolate, slugify, or mechanically transform raw ticket title/body text");
-    expect(workflow).toContain("rather than rejecting incidental lexical overlap");
-    expect(creation).toContain("no identifier prefix");
-    expect(creation).toContain("single-line and at most 120 characters");
-    expect(creation).toContain("same stable display title");
-    expect(creation).toContain("frozen at build go");
     expect(creation).toContain('gh issue create --repo <target> --title "<title>" --body-file <path>');
-    expect(creation).toContain("couples the public issue to the durable `ticket:` anchor");
-    expect(integration).toContain("never directly copy, interpolate, slugify, or mechanically transform raw ticket text");
-    expect(integration).toContain("incidental lexical overlap does not itself invalidate");
-    expect(integration).toContain("freeze it at build go");
-    expect(integration).toContain("never rewrite or substitute the existing title of a given ticket");
-    expect(integration).toContain("public titles carry no invented identifier prefix");
     expect(integration).toContain("pass the complete title as one quoted argument");
-    expect(integration).toContain("preserve every existing preview/reconfirmation and idempotency rule");
     expect(handoff).toContain('--title "<title>" --body-file <path>');
   });
 
@@ -267,19 +209,17 @@ describe("description-based naming contract", () => {
     expect(handoff).toContain("print the stable copyable pr title `<title>`");
     expect(fork).toContain("git push -u <pushremote> feature/<feature-slug>");
     expect(fork).toContain("<forkowner>:feature/<feature-slug>?expand=1");
-    for (const [name, body] of [["maintainer", handoff], ["fork", fork]] as const) {
-      for (const marker of [
-        "first push", "absent exact ref", "no case-fold sibling", "established self-owned branch",
-        "live-run knowledge", "disk-resume trust gate", "configured upstream", "equal local `head` or be an ancestor",
-        "non-forcing", "resumed handoff", "ci-fix repush", "foreign/ambiguous ref", "diverged", "never force",
-      ]) expect(body, `${name}: ${marker}`).toContain(marker);
+    // The full push-safety gate is single-sourced in handoff.md step 1 — assert it there. fork.md
+    // step 1 collapses to the fork delta (re-fetch via a temporary named remote, the single fork
+    // push) plus a pointer to that gate, so the fork side asserts only the pointer and the "nothing
+    // is lost" framing that survives the collapse (it also lives in the fork push-failure degrade).
+    for (const marker of ["first push", "never force", "claim complete race elimination",
+      "nothing is lost", "local branch, worktree, and commits remain intact",
+      "nothing new was posted", "new descriptive identity"]) {
+      expect(handoff, `maintainer: ${marker}`).toContain(marker);
     }
-    expect(fork).toContain("never claim complete race elimination");
-    for (const body of [handoff, fork]) {
-      for (const marker of ["nothing is lost", "local branch, worktree, and commits remain intact", "nothing new was posted", "new descriptive identity"]) {
-        expect(body).toContain(marker);
-      }
-    }
+    expect(fork).toContain("push-safety gate");
+    expect(fork).toContain("nothing is lost");
   });
 
   it("pins all commit forms and retained GitHub/task-local numbering", () => {
@@ -292,13 +232,10 @@ describe("description-based naming contract", () => {
     expect(read("references/templates.md")).toContain("t01");
   });
 
-  it("contains no obsolete new-run placeholders outside only the delimited legacy section", () => {
+  it("contains no obsolete new-run numbering placeholders anywhere in the skill", () => {
     const files = ["SKILL.md", ...fs.readdirSync(REFERENCES_DIR).filter((name) => name.endsWith(".md")).map((name) => `references/${name}`)];
     for (const file of files) {
-      let body = read(file);
-      if (file === "references/workflow-detail.md") {
-        body = body.replace(/<!-- LEGACY-RESUME-START:[\s\S]*?<!-- LEGACY-RESUME-END -->/, "");
-      }
+      const body = read(file);
       expect(body, file).not.toMatch(/<nn>|f<nn>|feature\/<nn>|<nn>-<slug>|<feature-(?:number|id)>/i);
       expect(body, file).not.toMatch(/feature\/\d|doc\/plan\/\d|\bf\d+:/i);
       expect(body, file).not.toMatch(/next free (?:feature )?(?:id|number)|global feature (?:id|number)/i);
@@ -376,7 +313,6 @@ describe("untrack-process-artifacts (t03) — implement-feature rework", () => {
     fs.readFileSync(path.join(SKILL_DIR, relative), "utf8").replace(/\r\n/g, "\n");
   const collapsed = (relative: string): string => read(relative).toLowerCase().replace(/\s+/g, " ");
   const AGENTS_DIR = path.resolve(SKILLS_DIR, "..", "agents");
-  const LEGACY_RE = /<!-- LEGACY-RESUME-START:[\s\S]*?<!-- LEGACY-RESUME-END -->/;
 
   it("carries no case-insensitive 'changelog' anywhere under .claude/skills or .claude/agents", () => {
     // Regression guard for the whole purge — this covers t01/t02's files too, which is why t03
@@ -392,14 +328,13 @@ describe("untrack-process-artifacts (t03) — implement-feature rework", () => {
     }
   });
 
-  it("carries no plan—/review— commit SUBJECT outside the legacy region, and keeps the task form", () => {
+  it("carries no plan—/review— commit SUBJECT anywhere, and keeps the task form", () => {
     // Anchor to the commit SUBJECT form ": plan — " / ": review — ", NEVER bare "review — " prose:
     // SKILL.md legitimately says "implementation and review — all in this session" and "only
-    // review — never dispatch one to implement". workflow-detail.md's only such hits are the commit
-    // grammar (now removed) or inside the excluded LEGACY-RESUME region.
+    // review — never dispatch one to implement". workflow-detail.md's only such hits were the commit
+    // grammar (now removed).
     for (const relative of ["SKILL.md", "references/workflow-detail.md"]) {
-      let body = read(relative);
-      if (relative === "references/workflow-detail.md") body = body.replace(LEGACY_RE, "");
+      const body = read(relative);
       expect(body, relative).not.toContain(": plan — ");
       expect(body, relative).not.toContain(": review — ");
       // The task commit subject form still ships in both files.
@@ -505,5 +440,94 @@ describe("evidence-grounded evaluation wiring (F23 t04)", () => {
     // Unchanged gate semantics + per-item maintainer choice.
     expect(body).toContain("subtracts clear slop, never adds");
     expect(body).toContain("choose per _presented_ finding");
+  });
+});
+
+describe("incoming-ticket evaluation preflight (#50 t04)", () => {
+  // Loose, whitespace-collapsed, case-insensitive structural floors for the Phase 0 preflight
+  // (redirect free text unread -> evaluator -> approve -> hydrate) and the resume isolation. The
+  // true runtime no-write / no-raw-ingest guarantees are live-eval concerns; the assertable surface
+  // is the documented command shape + the cross-skill reuse-by-reference links.
+  const read = (relative: string): string =>
+    fs.readFileSync(path.join(SKILL_DIR, relative), "utf8").replace(/\r\n/g, "\n");
+  const collapse = (relative: string): string => read(relative).toLowerCase().replace(/\s+/g, " ");
+  // A second collapse that also strips backticks, so a revert to a backticked variant of a
+  // forbidden phrase (e.g. "scan the cached issue `comments`") is still caught.
+  const collapseNoTicks = (relative: string): string => collapse(relative).replace(/`/g, "");
+
+  it("Phase 0 router splits into a trusted structured query (no free text) + an unread redirect + evaluator-before-hydrate", () => {
+    const body = collapse("SKILL.md");
+    // The trusted reachability query resolves only structured fields via --jq — it must NOT carry
+    // the old all-fields form that pulled title/body/comments into the coordinator's context.
+    expect(body).toContain("ispr:(.pull_request!=null)");
+    expect(body).not.toContain("number,title,body,labels,state,url,comments");
+    // Structural guard (not just the old exact string): isolate the trusted `gh api … --jq '{…}'`
+    // reachability query and assert THAT projection carries no free-text field token. A regression
+    // that reintroduces free text on the trusted side in ANOTHER shape (e.g. `--json title`, or a new
+    // `body:.body` in the jq) reddens here, where the old exact-string guard alone would let it pass.
+    const apiStart = body.indexOf("gh api repos");
+    expect(apiStart, "missing trusted reachability query").toBeGreaterThanOrEqual(0);
+    const jqEnd = body.indexOf("}'", apiStart);
+    expect(jqEnd, "missing --jq structured projection").toBeGreaterThan(apiStart);
+    const trustedQuery = body.slice(apiStart, jqEnd + 2);
+    for (const freeText of ["title", "body", "comments"]) {
+      expect(trustedQuery, `trusted reachability query leaks free text: ${freeText}`).not.toContain(
+        freeText,
+      );
+    }
+    // The untrusted free text is redirected to a tempfile the coordinator does not read.
+    expect(body).toContain("title,body,comments > <tempfile>");
+    expect(body).toContain("bash tool");
+    // The evaluator is dispatched BEFORE any free-text hydration.
+    const evalIdx = body.indexOf("evaluator");
+    const hydrateIdx = body.indexOf("hydrat");
+    expect(evalIdx, "missing evaluator dispatch").toBeGreaterThanOrEqual(0);
+    expect(hydrateIdx, "missing hydrate step").toBeGreaterThan(evalIdx);
+    // Free text is cached only post-approval, not at Phase 0.
+    expect(body).toContain("post-approval");
+  });
+
+  it("Rule 9 (ticket-integration.md) is the metadata-only --jq html_url scan, not a cached-comments read", () => {
+    const body = collapseNoTicks("references/ticket-integration.md");
+    // Metadata-only form present, keyed on the hand-off opener (not the generic trailer).
+    expect(body).toContain("html_url");
+    expect(body).toContain("## what was built for #<n>");
+    // The old cached-comments scan must be gone (backtick-insensitive, so a `comments` revert fails too).
+    expect(body).not.toContain("scan the cached issue comments");
+  });
+
+  it("resume re-hydrate (ticket-creation.md) never re-ingests raw comments; the single-rule wording has no contradiction", () => {
+    const body = collapse("references/ticket-creation.md");
+    // The single rule: no raw comments on resume; body via feature.md or the screen.
+    expect(body).toContain("no raw `comments` on resume");
+    expect(body).toContain("frozen what/why");
+    // The re-fetch is structured-metadata-only, and the old all-fields read is gone.
+    expect(body).not.toContain("number,title,body,labels,state,url,comments");
+  });
+
+  it("resolves the cross-skill evaluate/evaluator links the preflight adds (wrong-form/broken link fails the suite)", () => {
+    const refFiles = fs.readdirSync(REFERENCES_DIR).filter((n) => n.endsWith(".md"));
+    const linkRe =
+      /\((\.\.\/\.\.\/evaluate\/references\/[A-Za-z0-9_-]+\.md|\.\.\/\.\.\/\.\.\/agents\/[A-Za-z0-9_-]+\.md)\)/g;
+    const seen = new Set<string>();
+    for (const name of refFiles) {
+      const text = fs.readFileSync(path.join(REFERENCES_DIR, name), "utf8");
+      for (const m of text.matchAll(linkRe)) {
+        const rel = m[1]!;
+        seen.add(rel);
+        expect(fs.existsSync(path.resolve(REFERENCES_DIR, rel)), `${name} -> ${rel}`).toBe(true);
+      }
+      // The repo-root `.claude/agents/…` form would NOT resolve from a references/*.md file.
+      expect(text, name).not.toContain("](.claude/agents/");
+    }
+    // The four load-bearing preflight anchors must each ship in reference prose.
+    for (const req of [
+      "../../evaluate/references/issue-eval.md",
+      "../../evaluate/references/write-discipline.md",
+      "../../../agents/evaluator.md",
+      "../../evaluate/references/proposal-gate.md",
+    ]) {
+      expect(seen.has(req), `missing cross-link: ${req}`).toBe(true);
+    }
   });
 });

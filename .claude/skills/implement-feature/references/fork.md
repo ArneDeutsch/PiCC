@@ -26,10 +26,9 @@ ticket-creation offer consume them by these **exact** names:
   match, never assumed to be `origin`/`upstream`).
 - **`targetDefault`** — the default branch of `target`; Phase 2 bases the feature branch on it.
 
-**Maintainer collapse.** When the checkout is not a fork these degrade to today's behavior exactly:
-`target == push ==` the checkout repo's `nameWithOwner`, `pushRemote` = the remote pointing at it
-(`origin` in the ordinary case), `targetDefault` = the default branch resolved as today. Nothing
-about the maintainer path changes — it stays byte-for-byte what it was.
+**Maintainer collapse.** When the checkout is not a fork these collapse to the plain single-repo
+mapping: `target == push ==` the checkout repo's `nameWithOwner`, `pushRemote` = the remote pointing
+at it (`origin` in the ordinary case), `targetDefault` = the default branch resolved git-only.
 
 ## Resolution algorithm (run at Phase 0)
 
@@ -60,9 +59,8 @@ about the maintainer path changes — it stays byte-for-byte what it was.
      gh repo view <target> --json defaultBranchRef -q .defaultBranchRef.name` (the **target's** default,
      not the fork's tracking ref — see the Phase 2 note below).
    - **No fork present, and a remote repo you can push to** → **maintainer path.** `target == push ==`
-     that repo; `pushRemote` = that remote; `targetDefault` resolved **git-only, as today**
+     that repo; `pushRemote` = that remote; `targetDefault` resolved **git-only**
      (`git symbolic-ref refs/remotes/<pushRemote>/HEAD`; if unset, `git remote show <pushRemote>`).
-     Byte-for-byte unchanged in the ordinary single-`origin` case.
 4. **Disambiguation & bias.** The `viewerPermission` from step 2 is your permission on **that** repo —
    on a fork you own it is `ADMIN`, which is **not** evidence of upstream access, so it must never drive
    the maintainer-vs-fork call on its own. When a candidate upstream exists, decide by querying the
@@ -77,10 +75,9 @@ about the maintainer path changes — it stays byte-for-byte what it was.
    only hands off a compare URL (no wrongful write), whereas fork→maintainer would attempt a write the
    user cannot perform.
 5. **No-gh degrade.** If `gh` is absent/unreachable **and** no ticket ref forces the Phase 0 gate, fork
-   classification can't run — degrade to **today's git-only maintainer resolution**
-   (`git symbolic-ref refs/remotes/origin/HEAD`; branch from `origin/<default>`). This keeps the
-   maintainer + ticketless + no-gh cell byte-for-byte as it was before F12. (A ticket ref *does* force
-   the gate, which already requires `gh`, so this degrade only applies to the ticketless path.)
+   classification can't run — degrade to the **git-only maintainer resolution**
+   (`git symbolic-ref refs/remotes/origin/HEAD`; branch from `origin/<default>`). (A ticket ref *does*
+   force the gate, which already requires `gh`, so this degrade only applies to the ticketless path.)
 
 > **The fork-only URL-ref rule.** A URL ref must match host `github.com` and
 > **either** resolved repo. Matching `target` → proceed normally. Matching the **fork only** → adopt
@@ -95,34 +92,26 @@ about the maintainer path changes — it stays byte-for-byte what it was.
 
 ## How the identities thread into the phases
 
-- **Phase 0 reachability gate** (resident in the router): the required pushable github remote is
-  `pushRemote` (the fork on the fork path); a remoteless checkout still stops. Issue reads use
-  `--repo <target>`. A URL ref's owner/repo must match `target` **or the fork** (fork-only → adopt the
-  fork issue + bare cross-repo link, never a closing keyword; see the fork-only URL-ref rule above and Phase 9 step 5).
-- **Phase 2 default branch** ([workflow-detail.md](workflow-detail.md)): base the feature branch on
-  **`targetDefault`**, fetched from the **target** — on the fork path the target's freshest default may
-  be absent or stale in the fork's tracking refs, so fetch it from the target, not the fork. But **do
-  not branch from a bare-URL `FETCH_HEAD`** — it is per-worktree, so a fetch run before/outside the
-  worktree is invisible inside it. Add the target as a **temporary named remote**, fetch it, branch
-  from the shared `refs/remotes/<tmp>/<targetDefault>`, then remove the temp remote (or fetch inside the
-  worktree). Branch from the *target's* default, not the fork's.
-- **Rule 3 & Rule 5** ([ticket-integration.md](ticket-integration.md)): a URL ref must match
-  `target` **or the fork** (fork-only → bare cross-repo link, per the fork-only URL-ref rule above); the branch
-  push (Rule 5's allow-list) targets `pushRemote`/`push` — still "our own branch," just not
-  necessarily `origin`.
-- **Phase 1 disclosure** (below): surface the fork nature the moment it's resolved, on **any** fork
-  checkout — ticketless included — so the manual-PR hand-off is expected, never sprung at Phase 9.
-- **Phase 9 hand-off** (below): push the branch to the fork and hand the user a compare URL +
-  paste-ready PR — the **only** automatic GitHub write on the fork path is that one branch push.
+An index — each rule is stated in full where it points:
 
-## Phase 1 — fork disclosure (a new early moment, any fork checkout)
+- **Phase 0 reachability gate** → resident in `SKILL.md` (required pushable github remote is
+  `pushRemote`, the fork on the fork path; a remoteless checkout still stops; issue reads use
+  `--repo <target>`).
+- **Phase 2 default branch** → [workflow-detail.md](workflow-detail.md) Phase 2 (base on the target's
+  **`targetDefault`**, fetched from the target via a temporary named remote, not the fork).
+- **Phase 1 fork disclosure** → the section below (surface the fork nature the moment it's resolved,
+  any fork checkout, so the hand-off is never sprung at Phase 9).
+- **Phase 9 hand-off** → the section below (the **only** automatic GitHub write on the fork path is
+  the one branch push to the fork).
+- **The fork-only URL-ref rule** → the box above (a URL ref must match `target` **or the fork**);
+  Rule 5's allow-list (the branch push targets `pushRemote`/`push`, not necessarily `origin`) →
+  [ticket-integration.md](ticket-integration.md).
 
-Read this at **Phase 1** whenever Phase 0 resolved a **fork** checkout. Today the only Phase 1
-write-contract moment is gated on the *ticket* path (the router's "extend the scope mirror with the
-write-contract"); a fork checkout with **no** ticket therefore had *no* early fork disclosure and
-would first learn it's a fork when the compare URL appeared at hand-off — the exact spring this
-task forbids. So the fork disclosure is a **new** Phase 1 moment that fires on **any** fork checkout,
-**ticketless included**, independent of the ticket path.
+## Phase 1 — fork disclosure (any fork checkout)
+
+Read this at **Phase 1** whenever Phase 0 resolved a **fork** checkout. The fork disclosure fires on
+**any** fork checkout, **ticketless included**, independent of the ticket path — so a ticketless fork
+run learns it's a fork here at Phase 1, not when the compare URL appears at hand-off.
 
 Surface the fork detection result the moment it's known — fold it into the scope mirror (Phase 1),
 before "go", so the manual-PR hand-off is expected. Present it as prose to the user:
@@ -168,23 +157,14 @@ the body until the rules are available** — do not distill a body with the rule
 
 **Procedure:**
 
-1. **Merge, then push to the fork.** Re-fetch the **target's** default (via a temporary named remote,
-   as in Phase 2 — [workflow-detail.md](workflow-detail.md) Phase 2); if it moved, merge it into the
-   feature branch, resolve conflicts, and verify typecheck + full suite green again. Immediately
-   before every push, fetch `<pushRemote>` and inspect the exact remote ref plus every case-fold-equivalent
-   sibling for `feature/<feature-slug>`. For a first push, only an absent exact ref with no case-fold
-   sibling is available for `git push -u <pushRemote> feature/<feature-slug>`. An existing exact ref is
-   allowed only as an established self-owned branch: live-run knowledge proves this workflow created it
-   earlier, or the disk-resume trust gate explicitly confirmed it; the configured upstream is exactly
-   `<pushRemote>/feature/<feature-slug>`; no case-fold sibling exists; and the fetched remote tip must
-   equal local `HEAD` or be an ancestor of it. Only then make an ordinary non-forcing equal/fast-forward push, including
-   resumed handoffs and CI-fix repushes. A foreign/ambiguous ref, wrong or absent upstream for an existing
-   ref, sibling, or diverged tip stops before push and later writes. Lead with **"nothing is lost"**;
-   name the conflicting ref and relationship, state that the local branch, worktree, and commits remain
-   intact and nothing new was posted, and offer safe choices to inspect/reconcile ownership or restart
-   under a new descriptive identity. Never force or suggest force, deletion, overwrite, or adoption. This is the
-   single automatic write. The recheck is not atomic: a same-name branch created in the remaining check-to-push
-   race may still be attached by ordinary push when histories permit; never claim complete race elimination.
+1. **Merge, then push to the fork.** Re-fetch the **target's** default via a temporary named remote
+   (as in Phase 2 — [workflow-detail.md](workflow-detail.md) Phase 2); if it moved, merge it into the
+   feature branch, resolve conflicts, and verify typecheck + full suite green again. Then apply
+   [handoff.md](handoff.md) step 1's push-safety gate against `<pushRemote>` (the fork) for
+   `git push -u <pushRemote> feature/<feature-slug>` — its first-push condition, established-self-owned
+   criteria, foreign-ref stop, "nothing is lost" framing, never-force rule, and non-atomic-race caveat
+   govern this push exactly as on the maintainer path, just targeting the fork. **This single fork push
+   is the only automatic GitHub write on the fork path.**
 2. **Confirm the push landed before printing the compare URL** — a URL for a branch that isn't on the
    fork 404s. Only after the push succeeds, build the URL.
 3. **Compare URL — emit exactly this two-part-head form** (split `target` into
@@ -256,7 +236,7 @@ command, then hand the paste-ready PR **title**/**body** and the compare-URL **t
 once the push succeeds). No compare URL is shown until a real push lands.
 
 **No-gh-on-a-fork degrade.** Fork detection needs `gh repo view` (Phase 0). If `gh` is unavailable on
-a fork checkout, the run cannot resolve `target`/`push`, so it degrades to today's **generic**
+a fork checkout, the run cannot resolve `target`/`push`, so it degrades to a **generic**
 "push your branch and open a PR yourself" hand-off with **no** compare URL (there is no resolved
 `targetDefault`/fork identity to build one). That degrade must **never** claim an auto-PR was or will
 be created — the maintainer auto-PR path only runs when the checkout is confirmed to *be* the target.
