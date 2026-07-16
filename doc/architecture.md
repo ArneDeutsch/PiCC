@@ -108,7 +108,8 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
   `SessionManager.forkFrom` (F16, main-session only, env-gated by `CLAUDE_CODE_FORK_SUBAGENT`); the
   built-in Explore/Plan types skip the project context), fans out under a concurrency cap, applies per-agent
   `tools:`/`model`/`effort` (with `CLAUDE_CODE_SUBAGENT_MODEL` as the highest-priority model
-  override), enforces the depth cap (default 5), runs agent-scoped `hooks:`, supports
+  override), enforces the depth cap (default `1` = **main-session-only**; raise
+  `subagents.maxDepth` to 2..5 to opt into nesting), runs agent-scoped `hooks:`, supports
   `isolation: worktree`, `run_in_background`, and `background: true` frontmatter, and returns the
   subagent's final message **verbatim** (skills parse locked YAML from it — a hard contract,
   plan §4.3). It also classifies every dispatch outcome (see *Subagent error contract* in §4),
@@ -230,8 +231,12 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers:
    env-gated (`CLAUDE_CODE_FORK_SUBAGENT`) fork seeded from the parent transcript via
    `SessionManager.forkFrom`, non-resumable, with output isolation still kept; every case that can't
    inherit (env off, nested dispatcher, no transcript, fork-spawns-fork, SDK can't fork) degrades to
-   fresh context with a visible footer notice. Nested dispatch is depth-capped;
-   the same guard runs inside every subagent session. By default the dispatch registers in the
+   fresh context with a visible footer notice. Nested dispatch is **off by default**
+   (main-session-only, `subagents.maxDepth: 1`): a dispatched subagent normally receives neither
+   `Agent` nor `Task` and its prompt omits the subagents catalog, so it does not attempt to nest.
+   The nested-dispatch tool-provisioning and the depth guard only engage when an operator raises
+   `subagents.maxDepth` to 2..5; once raised, the same guard runs inside every subagent session. By
+   default the dispatch registers in the
    `BackgroundTaskRegistry` and returns a task id (`run_in_background: false` runs it inline instead;
    an agent's `background: true` frontmatter forces background; `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`
    forces foreground); `TaskOutput`/`TaskStop` manage its lifecycle, and an eligible uncollected
@@ -314,7 +319,10 @@ principle in the plan (§2.1 mechanical fidelity).
     terminal input (`ctx.ui.onTerminalInput`) and aborts on a bare Esc. Print/RPC modes have no
     Esc, so a typed fork there runs to completion.
 
-- **Nested background fan-out is concurrency-bounded (F15 t02).** Dispatch is background-by-default at
+- **Nested background fan-out is concurrency-bounded (F15 t02).** Note first that nested dispatch is
+  **off by default** (main-session-only, `subagents.maxDepth: 1` — a second, larger divergence from
+  Claude beyond the per-depth-budget one below): depth ≥ 2 only occurs when an operator raises
+  `subagents.maxDepth` to 2..5. Once opted in, dispatch is background-by-default at
   every depth, but a nested (depth ≥ 2) fan-out does not spawn an unbounded number of concurrent
   sessions: each depth gets its own `concurrency`-sized budget (a per-depth semaphore keyed by
   depth), so the total is bounded by `maxDepth × concurrency` and a parent blocked in `TaskOutput`

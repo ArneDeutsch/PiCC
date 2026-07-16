@@ -56,6 +56,27 @@ Raw material for `review.md`.
   improvement worth a follow-up. Also minor fixture-boilerplate duplication between
   the two blocks — readable, left.
 
+- 2026-07-16: t02 landed clean (registry reworked, regen in sync); claude-parity +
+  docs both PASS. Coordinator applied two claude-parity fixes (dropped misleading
+  "ordinary" qualifier; fixed "nested generations" off-by-one → "levels below the
+  main session"). Terminology now consistent registry↔docs.
+- 2026-07-16: t03 (prose) review found 2 MUST-FIX + a SHOULD, all fixed by the
+  coordinator directly (small prose): (1) broken cross-ref `../README.md §7` →
+  user-guide's own §7; (2) reintroduced off-by-one in the pi-integration fossil
+  ("that many nested generations") → "levels below the main session"; (3) added a
+  §9 Troubleshooting row for the exact affected upgrader (flattened fan-out); plus
+  CHANGELOG number-to-depth formula and a README run-on nit. Lesson: "N nested
+  generations" phrasing is an off-by-one magnet — "levels below the main session"
+  is the safe framing and is what the registry uses.
+- 2026-07-16: docs reviewer noted `doc/plan/picc-plan.md:201` still calls recursive
+  subagents "full support" with no off-by-default note. It's a roadmap artifact
+  outside every task's writable surface — candidate follow-up for review.md, not
+  fixed here.
+- 2026-07-16 (process): ran t03 + t04 implementers concurrently on disjoint file
+  sets to save wall-clock. Works, but the pre-commit hook compiles the whole tree,
+  so a task can only be committed once the *other* concurrent task's edits are also
+  green — must wait for both to settle before selective-staging a commit.
+
 ## Open escalation (raised to user at Phase 6)
 
 - 2026-07-16: **UX discoverability gap.** The default flip is a *silent* behavior

@@ -6,6 +6,34 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed — main-session-only subagent dispatch by default (2026-07-16)
+
+- **The default `subagents.maxDepth` is now `1` (was `5`): subagent dispatch is main-session-only by
+  default.** The main conversation still spawns depth-1 subagents and runs normal fan-out, but by
+  default those subagents cannot spawn subagents of their own — they receive neither `Agent` nor
+  `Task`, their system prompt omits the subagents catalog, and no alternate in-process path (e.g. a
+  subagent-invoked `context: fork` skill) can open a deeper model session. This removes the
+  recursive-amplification foot-gun that repeatedly drained subscriptions under the old depth-5
+  default.
+- **Migration — to restore nesting**, set in `.claude/settings.json`:
+
+  ```json
+  {
+    "subagents": { "maxDepth": 2 }
+  }
+  ```
+
+  `2` restores exactly **one** nested generation below the main session's subagents. To pick the
+  right number: the main session is depth 0 and its direct subagents are depth 1, so `maxDepth` is
+  the deepest generation you need — `maxDepth: 3` allows three levels below the main session, up to
+  `5`. Copying `2` when you actually needed `3+` will leave the deeper generations blocked.
+- **This is a deliberate divergence from Claude Code**, which nests up to five levels
+  (non-configurable). The `subagents.enabled` / `subagents.maxDepth` / `subagents.concurrency` keys
+  are **PiCC extensions** with no Claude-settings equivalent, not Claude parity. `subagents.enabled:
+  false` / `disableSubagents: true` keep their existing meaning (disable **all** ordinary delegation,
+  even depth-1 fan-out) — distinct from `maxDepth: 1`, which keeps depth-1 fan-out and blocks only
+  nesting.
+
 ### Changed — description-based feature naming (2026-07-15)
 
 - **Future `implement-feature` runs use one concise descriptive slug instead of allocating a global
