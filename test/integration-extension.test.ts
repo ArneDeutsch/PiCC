@@ -30,9 +30,9 @@ beforeAll(async () => {
   process.env.PICC_CLAUDE_USER_DIR = userDir;
   process.chdir(dir);
   pi = fakePi();
-  picc(pi.api as never);
-  // built-in overrides register via an async IIFE — give it a beat
-  await new Promise((r) => setTimeout(r, 500));
+  picc(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+  await pi.waitForInitialization();
+  await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
 });
 
 afterAll(() => {
@@ -506,9 +506,9 @@ describe("permission + hook enforcement (guard)", () => {
     // through on-touch nested-CLAUDE.md / path-scoped-rule injection, end-to-end,
     // as its first `src/` touch — with no fixture edit.
     const freshPi = fakePi();
-    picc(freshPi.api as never);
-    // built-in overrides register via an async IIFE — give it a beat (parity with beforeAll)
-    await new Promise((r) => setTimeout(r, 500));
+    picc(freshPi.api as never, { onInitializationSettled: freshPi.captureInitialization });
+    await freshPi.waitForInitialization();
+    await freshPi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
 
     freshPi.messages.length = 0;
     await freshPi.fire("tool_call", {
@@ -696,15 +696,18 @@ describe("background settlement delivery (t05, offline integration via the seam)
   // Reuses the fixture cwd from the outer beforeAll.
   type Internals = Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
 
-  function wire(options: {
+  async function wire(options: {
     beforeSettlementSend?: PiccTestSeam["beforeSettlementSend"];
-  } = {}): { p: FakePi; internals: Internals } {
+  } = {}): Promise<{ p: FakePi; internals: Internals }> {
     const p = fakePi();
     let internals!: Internals;
     picc(p.api as never, {
       onWired: (i) => (internals = i),
+      onInitializationSettled: p.captureInitialization,
       ...(options.beforeSettlementSend ? { beforeSettlementSend: options.beforeSettlementSend } : {}),
     });
+    await p.waitForInitialization();
+    await p.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
     return { p, internals };
   }
 
@@ -732,7 +735,7 @@ describe("background settlement delivery (t05, offline integration via the seam)
 
   it("registered Agent → TaskOutput wait → real next-turn drain emits no stale notice", async () => {
     const handle = fakeSdk({ replies: ["REAL-WIRED-RESULT"] });
-    const { p, internals } = wire();
+    const { p, internals } = await wire();
     internals.subagentRuntime.setSdkForTest(handle.sdk);
     const agent = p.tools.get("Agent");
     const started = await agent.execute("dispatch", {
@@ -760,11 +763,14 @@ describe("background settlement delivery (t05, offline integration via the seam)
     const p = fakePi();
     picc(p.api as never, {
       onWired: (i) => (internals = i),
+      onInitializationSettled: p.captureInitialization,
       beforeSettlementSend: () => {
         barrierCalls++;
         expect(internals.backgroundTasks.markCollected(taskId)).toBe(true);
       },
     });
+    await p.waitForInitialization();
+    await p.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
     const agentId = "agent-0a1b2c3d4e5f";
     reg(internals, agentId);
     taskId = internals.backgroundTasks.start(
@@ -793,7 +799,7 @@ describe("background settlement delivery (t05, offline integration via the seam)
   });
 
   it("announces a settled background task at the next turn (outcome, agent id, framed output) — no TaskOutput needed", async () => {
-    const { p, internals } = wire();
+    const { p, internals } = await wire();
     const agentId = "agent-0011aa22bb33";
     reg(internals, agentId);
     const taskId = internals.backgroundTasks.start(
@@ -838,7 +844,7 @@ describe("background settlement delivery (t05, offline integration via the seam)
     // in its own try/catch and the dedup gate is committed ONLY after a successful
     // send. A throw on one notice must neither drop the others nor consume the
     // thrower — it re-fires next turn. Nothing is silently lost.
-    const { p, internals } = wire();
+    const { p, internals } = await wire();
     const agentA = "agent-1a2b3c4d5e6f";
     const agentB = "agent-6f5e4d3c2b1a";
     for (const [aid, text] of [
@@ -899,7 +905,7 @@ describe("background settlement delivery (t05, offline integration via the seam)
   });
 
   it("/usage aggregates per-subagent usage, transcript paths, outcome, and a session total (t06)", async () => {
-    const { p, internals } = wire();
+    const { p, internals } = await wire();
     // Two settled dispatches with usage, exactly as the runtime would record:
     // register (running) then markSettled with outcome + usage.
     internals.subagentRegistry.register({
@@ -950,7 +956,7 @@ describe("background settlement delivery (t05, offline integration via the seam)
   });
 
   it("/usage is registered and reports nothing before any dispatch", async () => {
-    const { p } = wire();
+    const { p } = await wire();
     expect(p.commands.has("usage")).toBe(true);
     p.entries.length = 0;
     await p.commands.get("usage").handler("", p.ctx());
@@ -965,7 +971,7 @@ describe("background settlement delivery (t05, offline integration via the seam)
     // agentName derives from agent frontmatter `name`/basename (only trimmed
     // upstream); a hostile ANSI/OSC/control-byte name must not reach the terminal
     // on /usage. Control bytes from code points so this source stays pure ASCII.
-    const { p, internals } = wire();
+    const { p, internals } = await wire();
     const ESC = String.fromCharCode(27);
     const BEL = String.fromCharCode(7);
     const NUL = String.fromCharCode(0);
@@ -995,7 +1001,7 @@ describe("background settlement delivery (t05, offline integration via the seam)
   });
 
   it("delivers completed / failed / stopped shapes together (rate-limit → failed; TaskStop → aborted)", async () => {
-    const { p, internals } = wire();
+    const { p, internals } = await wire();
 
     const okId = "agent-cc33dd44ee55";
     reg(internals, okId);
@@ -1118,7 +1124,12 @@ describe("subagent background-task scoping (F13 t02, offline-integration via a r
 
     const p = fakePi();
     let internals!: Internals;
-    picc(p.api as never, { onWired: (i) => (internals = i) });
+    picc(p.api as never, {
+      onWired: (i) => (internals = i),
+      onInitializationSettled: p.captureInitialization,
+    });
+    await p.waitForInitialization();
+    await p.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
     // Inject the fake SDK into the real runtime BEFORE any dispatch, so the
     // coordinator's registered Agent tool dispatches offline.
     internals.subagentRuntime.setSdkForTest(handle.sdk);

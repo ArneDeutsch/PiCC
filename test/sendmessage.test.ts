@@ -22,6 +22,7 @@ import {
   useRealSessionManager,
   type FakeSessionState,
 } from "./helpers/fake-sdk.js";
+import { deferred, waitUntil } from "./helpers/async.js";
 
 // Resume tests exercise the REAL Pi SessionManager (open/restore/append) — inject
 // it so fakeSdk's reopenSessionManager reopens real transcripts on disk (t02/t04).
@@ -59,14 +60,6 @@ type ToolLike = {
     signal?: AbortSignal,
   ) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
 };
-
-async function waitUntil(fn: () => boolean, timeout = 2000): Promise<void> {
-  const start = Date.now();
-  while (!fn()) {
-    if (Date.now() - start > timeout) throw new Error("waitUntil timed out");
-    await new Promise((r) => setTimeout(r, 5));
-  }
-}
 
 // ---------------------------------------------------------------------------
 // SubagentRegistry — lifecycle, resolution, name integrity, t05 notice state
@@ -187,11 +180,10 @@ describe("SendMessage tool — steer + refusals (t04)", () => {
       run_in_background: true,
     });
     const agentId = String(started.details.agentId);
-    // Wait until the un-awaited dispatch has created + registered its session.
-    // Steer needs the LIVE session handle, which the enrich-register attaches at
-    // session creation — later than the minimal ack-window record (coder
-    // SHOULD-2). Wait for the handle, not merely the running state.
-    await waitUntil(() => registry.get(agentId)?.session !== undefined);
+    // Prompt entry proves session creation enriched the registry with the live
+    // steerable handle and that this cannot pass in the ack-only window.
+    await h.waitForPromptCalls(1);
+    expect(registry.get(agentId)?.session).toBeDefined();
 
     const sm = createSendMessageToolDefinition(runtime, {
       registry,
@@ -227,10 +219,9 @@ describe("SendMessage tool — steer + refusals (t04)", () => {
       run_in_background: true,
     });
     const agentId = String(started.details.agentId);
-    // Steer needs the LIVE session handle, which the enrich-register attaches at
-    // session creation — later than the minimal ack-window record (coder
-    // SHOULD-2). Wait for the handle, not merely the running state.
-    await waitUntil(() => registry.get(agentId)?.session !== undefined);
+    // Prompt entry proves the by-name target is a live steerable session.
+    await h.waitForPromptCalls(1);
+    expect(registry.get(agentId)?.session).toBeDefined();
     const sm = createSendMessageToolDefinition(runtime, {
       registry,
       backgroundTasks,
@@ -791,14 +782,14 @@ describe("SendMessage resume — nested background bound (F15 t02, AC #3)", () =
 
     // The holder parks in onPrompt (still holding its depth-2 slot) until released;
     // the resume records that it reached onPrompt (a second proof it ran).
-    let holderLive = false;
+    const holderEntered = deferred<void>();
     let releaseHolder!: () => void;
     const holderGate = new Promise<void>((r) => (releaseHolder = r));
     let resumeReachedOnPrompt = false;
     const h = fakeSdk({
       onPrompt: async (text) => {
         if (text.includes("HOLD-TASK")) {
-          holderLive = true;
+          holderEntered.resolve();
           await holderGate;
           return "held";
         }
@@ -844,7 +835,11 @@ describe("SendMessage resume — nested background bound (F15 t02, AC #3)", () =
       depth: 2,
       background: true,
     });
-    await waitUntil(() => holderLive);
+    await waitUntil({
+      description: "SendMessage queue holder to enter its gated prompt",
+      predicate: () => holderEntered.promise.then(() => true),
+      describeObserved: () => `prompt calls: ${h.promptCalls()}`,
+    });
 
     // Resume the depth-2 record. The ack is synchronous; the resumed dispatch runs
     // in the background under the same id at `record.depth` (= 2) with background: true.

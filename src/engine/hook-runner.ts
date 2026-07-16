@@ -58,6 +58,8 @@ const HTTP_TIMEOUT_MS = 10_000;
 const KILL_GRACE_MS = 5_000;
 /** Cap per collected context value (stdout / additionalContext), issue #64626. */
 const CONTEXT_VALUE_MAX_CHARS = 10_000;
+/** Keep test-observer failures useful without allowing an arbitrary thrown value to flood output. */
+const OBSERVER_ERROR_MAX_CHARS = 1_000;
 
 /**
  * Events where exit code 2 is a BLOCK (Claude "blockable" events). Everywhere
@@ -88,6 +90,8 @@ export interface HookRunnerOptions {
   pluginDataDirs?: Record<string, string>;
   /** Session transcript file, when the host exposes one (payload `transcript_path`). */
   transcriptPath?: () => string | undefined;
+  /** Test-only observer for the successfully spawned command process. */
+  onSpawnForTest?: (child: ChildProcess) => void;
 }
 
 /**
@@ -288,26 +292,37 @@ export class HookRunner {
         handler.type === "command"
           ? this.runCommand(handler, eventName, fullPayload, asyncDiagnostics)
           : this.runHttp(handler, eventName, fullPayload, asyncDiagnostics);
-      void detached.then((result) => {
-        for (const d of asyncDiagnostics) {
-          if (d.severity === "warning" || d.severity === "error") {
-            reportAsyncHookFailure(d.message);
+      void detached
+        .then((result) => {
+          for (const d of asyncDiagnostics) {
+            if (d.severity === "warning" || d.severity === "error") {
+              reportAsyncHookFailure(d.message);
+            }
           }
-        }
-        if (result?.kind === "error") {
-          reportAsyncHookFailure(`hook (${eventName}) failed to run: ${result.message}`);
-        }
-        if (!process.env["PICC_DEBUG"] || !result) return;
-        if (result.kind === "exit" && result.code !== 0) {
-          console.error(
-            `[picc] async hook (${eventName}) exited with code ${result.code} (ignored)`,
-          );
-        } else if (result.kind === "timeout") {
-          console.error(
-            `[picc] async hook (${eventName}) timed out after ${result.timeoutSec}s (ignored)`,
-          );
-        }
-      });
+          if (result?.kind === "error") {
+            reportAsyncHookFailure(`hook (${eventName}) failed to run: ${result.message}`);
+          }
+          if (!process.env["PICC_DEBUG"] || !result) return;
+          if (result.kind === "exit" && result.code !== 0) {
+            console.error(
+              `[picc] async hook (${eventName}) exited with code ${result.code} (ignored)`,
+            );
+          } else if (result.kind === "timeout") {
+            console.error(
+              `[picc] async hook (${eventName}) timed out after ${result.timeoutSec}s (ignored)`,
+            );
+          }
+        })
+        .catch(() => {
+          // Defense in depth: detached hooks have no outcome to carry a
+          // rejection. Never include the rejected value, whose coercion may
+          // itself be hostile, and never let reporting create another one.
+          try {
+            reportAsyncHookFailure("detached async hook processing failed");
+          } catch {
+            /* terminal rejection handlers must remain non-throwing */
+          }
+        });
       return { result: undefined, diagnostics };
     }
     const result =
@@ -456,7 +471,6 @@ export class HookRunner {
         resolve({ kind: "error", message: errText(err) });
         return;
       }
-
       let stdout = "";
       let stderr = "";
       let timedOut = false;
@@ -486,9 +500,22 @@ export class HookRunner {
         if (timedOut) finish({ kind: "timeout", timeoutSec });
         else finish({ kind: "exit", code: code ?? -1, stdout, stderr });
       });
-
       // Ignore EPIPE when the hook exits without reading stdin.
       child.stdin?.on("error", () => {});
+
+      // The test observer runs only after HookRunner owns the child's complete
+      // lifecycle. It is genuinely observational: a broken observer adds a
+      // warning but cannot alter command execution, stdin delivery, timeout,
+      // or the normal error/close settlement path.
+      try {
+        this.opts.onSpawnForTest?.(child);
+      } catch (err) {
+        diagnostics.push({
+          severity: "warning",
+          message: `hook (${eventName}): spawn observer failed: ${truncateObserverError(errText(err))}; continuing`,
+        });
+      }
+
       child.stdin?.end(JSON.stringify(fullPayload));
     });
   }
@@ -801,8 +828,28 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return undefined;
 }
 
+function truncateObserverError(value: string): string {
+  if (value.length <= OBSERVER_ERROR_MAX_CHARS) return value;
+  return `${value.slice(0, OBSERVER_ERROR_MAX_CHARS)}…[truncated]`;
+}
+
 function errText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  // Reading `message`, checking exotic object identity, and string coercion
+  // can all execute user code. Keep every operation guarded and use a
+  // content-free fallback so error reporting itself can never escape.
+  if ((typeof err === "object" && err !== null) || typeof err === "function") {
+    try {
+      const message = (err as { message?: unknown }).message;
+      if (typeof message === "string") return message;
+    } catch {
+      // Fall through to guarded whole-value coercion.
+    }
+  }
+  try {
+    return String(err);
+  } catch {
+    return "unknown error";
+  }
 }
 
 function quoteArg(arg: string, shellKind: "bash" | "powershell"): string {

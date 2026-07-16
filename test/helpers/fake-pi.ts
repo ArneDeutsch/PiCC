@@ -1,3 +1,5 @@
+import { deferred, waitUntil, type Deferred } from "./async.js";
+
 /** A fake Pi ExtensionAPI capturing everything the PiCC extension registers. */
 export interface FakePi {
   api: Record<string, unknown>;
@@ -13,6 +15,12 @@ export interface FakePi {
   thinkingLevels: string[];
   fire(event: string, evt?: any, ctx?: any): Promise<any>;
   ctx(overrides?: Record<string, unknown>): Record<string, unknown>;
+  /** Wait until every named tool has been registered. */
+  waitForTools(names: readonly string[]): Promise<void>;
+  /** Capture the extension's observational detached-initialization completion. */
+  captureInitialization(completion: Promise<void>): void;
+  /** Wait for the completion callback to be captured and its promise to settle. */
+  waitForInitialization(): Promise<void>;
 }
 
 export function fakePi(): FakePi {
@@ -26,6 +34,41 @@ export function fakePi(): FakePi {
   const notifications: Array<{ text: string; severity?: string }> = [];
   const modelSets: unknown[] = [];
   const thinkingLevels: string[] = [];
+  const toolWaiters = new Set<{ names: readonly string[]; signal: Deferred<void> }>();
+  const hasTools = (names: readonly string[]) => names.every((name) => tools.has(name));
+  const notifyToolWaiters = () => {
+    for (const waiter of toolWaiters) {
+      if (hasTools(waiter.names)) {
+        toolWaiters.delete(waiter);
+        waiter.signal.resolve();
+      }
+    }
+  };
+  const waitForTools = (names: readonly string[]): Promise<void> => {
+    const expected = [...names];
+    const waiter = { names: expected, signal: deferred<void>() };
+    if (!hasTools(expected)) toolWaiters.add(waiter);
+    return waitUntil({
+      description: `tools to be registered: ${expected.join(", ") || "(none)"}`,
+      predicate: () => hasTools(expected) || waiter.signal.promise.then(() => hasTools(expected)),
+      describeObserved: () => {
+        const registered = [...tools.keys()];
+        const missing = expected.filter((name) => !tools.has(name));
+        return `missing: ${missing.join(", ") || "(none)"}; registered: ${registered.join(", ") || "(none)"}`;
+      },
+    }).finally(() => toolWaiters.delete(waiter));
+  };
+  let initializationCompletion: Promise<void> | undefined;
+  const captureInitialization = (completion: Promise<void>): void => {
+    initializationCompletion = completion;
+  };
+  const waitForInitialization = (): Promise<void> => waitUntil({
+    description: "extension detached initialization to be captured and settled",
+    predicate: () => initializationCompletion?.then(() => true) ?? false,
+    describeObserved: () => initializationCompletion === undefined
+      ? "completion callback not captured"
+      : "completion captured but still pending",
+  });
 
   const self: FakePi = {
     tools,
@@ -38,8 +81,14 @@ export function fakePi(): FakePi {
     notifications,
     modelSets,
     thinkingLevels,
+    waitForTools,
+    captureInitialization,
+    waitForInitialization,
     api: {
-      registerTool: (t: any) => tools.set(t.name, t),
+      registerTool: (t: any) => {
+        tools.set(t.name, t);
+        notifyToolWaiters();
+      },
       registerCommand: (name: string, options: any) => commands.set(name, options),
       on: (event: string, handler: (event: any, ctx: any) => unknown) => {
         handlers.set(event, [...(handlers.get(event) ?? []), handler]);

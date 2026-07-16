@@ -63,7 +63,12 @@ function gatedSdk(finalText: string, stats?: PiSessionStats) {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
   const handle = fakeSdk({ replies: [{ text: finalText, gate }], ...(stats ? { stats } : {}) });
-  return { sdk: handle.sdk, release: () => release(), abortCalls: handle.abortCalls };
+  return {
+    sdk: handle.sdk,
+    release: () => release(),
+    abortCalls: handle.abortCalls,
+    waitForPromptCalls: handle.waitForPromptCalls,
+  };
 }
 
 type ToolLike = {
@@ -1812,7 +1817,7 @@ describe("Agent tool run_in_background (audit E4)", () => {
   });
 
   it("TaskStop marks the task stopped and aborts the live session cooperatively", async () => {
-    const { sdk, abortCalls } = gatedSdk("never-used");
+    const { sdk, abortCalls, waitForPromptCalls } = gatedSdk("never-used");
     const registry = new BackgroundTaskRegistry();
     const runtime = makeRuntime([makeAgent()], sdk);
     const agentTool = createAgentToolDefinition(runtime, {
@@ -1825,8 +1830,8 @@ describe("Agent tool run_in_background (audit E4)", () => {
       run_in_background: true,
     });
     const taskId = String(started.details.taskId);
-    // Give the un-awaited dispatch a beat to create its session.
-    await new Promise((r) => setTimeout(r, 20));
+    // Prove TaskStop targets a live prompt rather than taking the pre-start path.
+    await waitForPromptCalls(1);
 
     const taskStop = createTaskStopTool(registry) as unknown as ToolLike;
     const stopped = await taskStop.execute("t2", { task_id: taskId });
@@ -1911,7 +1916,11 @@ describe("Agent tool run_in_background (audit E4)", () => {
     const handle = fakeSdk({ replies: [{ text: "gate-done", gate }] });
     const sessions = () => handle.created.length;
     const registry = new BackgroundTaskRegistry();
-    const runtime = makeRuntime([makeAgent()], handle.sdk, { concurrency: 1 });
+    const subagentRegistry = new SubagentRegistry();
+    const runtime = makeRuntime([makeAgent()], handle.sdk, {
+      concurrency: 1,
+      subagentRegistry,
+    });
     const agentTool = createAgentToolDefinition(runtime, {
       depth: 0,
       backgroundTasks: registry,
@@ -1923,14 +1932,22 @@ describe("Agent tool run_in_background (audit E4)", () => {
       prompt: "hold the slot",
       run_in_background: true,
     });
-    // Task 2 queues on the semaphore — no session yet.
+    await handle.waitForPromptCalls(1); // holder owns the slot while its gate stays closed
+
+    // Task 2 registers and queues on the semaphore — no session yet.
     const second = await agentTool.execute("t2", {
       subagent_type: "worker",
       prompt: "queued work",
       run_in_background: true,
     });
     const secondId = String(second.details.taskId);
-    await new Promise((r) => setTimeout(r, 20));
+    const holderId = String(first.details.agentId);
+    const waiterId = String(second.details.agentId);
+    const dispatches = subagentRegistry.list();
+    expect(dispatches).toHaveLength(2);
+    expect(subagentRegistry.get(holderId)?.session).toBeDefined();
+    expect(subagentRegistry.get(waiterId)?.session).toBeUndefined();
+    expect(dispatches.filter((record) => record.session === undefined)).toHaveLength(1);
     expect(sessions()).toBe(1); // only the gated task created a session
 
     // Stop the QUEUED task, then release the gate so it dequeues.
@@ -1940,7 +1957,7 @@ describe("Agent tool run_in_background (audit E4)", () => {
     await registry.wait(String(first.details.taskId));
     await registry.wait(secondId);
 
-    expect(sessions()).toBe(1); // the stopped dispatch never created a session
+    expect(sessions()).toBe(1); // the stopped dispatch never created a session, even after dequeue
     const taskOutput = createTaskOutputTool(registry) as unknown as ToolLike;
     const out = await taskOutput.execute("t4", { task_id: secondId });
     expect(out.details.status).toBe("stopped");

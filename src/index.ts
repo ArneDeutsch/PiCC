@@ -200,6 +200,12 @@ function parseSlashCommand(command: string): { name: string; argsText: string } 
  */
 export interface PiccTestSeam {
   /**
+   * TEST-ONLY observational callback receiving completion of the extension's
+   * detached startup activities. Invoked synchronously before activation returns;
+   * production still neither awaits nor changes the activities' error handling.
+   */
+  onInitializationSettled?: (completion: Promise<void>) => void;
+  /**
    * TEST-ONLY synchronous barrier immediately before the production settlement
    * sender's final validity check. It can model collection after selection; no
    * project-controlled input can supply it and the production path never awaits.
@@ -293,7 +299,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     cleanupPeriodDays: project.settings.cleanupPeriodDays,
   });
   // Reap orphaned worktree dirs from crashed sessions (plan §4.4) — fire-and-forget.
-  void worktrees.reapOrphans().catch(() => undefined);
+  const orphanReaping = worktrees.reapOrphans().catch(() => undefined);
+  void orphanReaping;
   const state = newSessionContextState(project.claudeMd);
   // Completeness floor (§2.2): a report failure must never abort extension init.
   let compat: CompatReport;
@@ -981,7 +988,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Cwd-swapping overrides of Pi built-ins (design doc §3.1). Execute is sourced from the
   // ctx-dropping create*Tool factory (byte-identical); renderers are re-applied from
   // create*ToolDefinition and de-padded via wrapForSelfShell (concise-tool-rows).
-  void (async () => {
+  // The IIFE promise is captured (not `void`ed) so the t02 readiness seam can await
+  // built-in registration settlement via onInitializationSettled (line ~1775).
+  const builtInRegistration = (async () => {
     try {
       const sdk: any = await import("@earendil-works/pi-coding-agent");
       // Pin the shell to real Git Bash on Windows — Pi's default `bash` lookup can
@@ -1047,6 +1056,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       console.error(`PiCC: built-in cwd overrides unavailable: ${(err as Error).message}`);
     }
   })();
+  void builtInRegistration;
 
   // ---------------------------------------------------------------------------
   // Guard: deny rules + PreToolUse/PostToolUse hooks + on-touch context injection
@@ -1758,4 +1768,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   pi.on("resources_discover", () => ({ promptPaths: [promptStubDir] }));
+
+  testSeam?.onInitializationSettled?.(Promise.all([orphanReaping, builtInRegistration]).then(() => undefined));
 }
