@@ -10,7 +10,12 @@ import {
   substituteArguments,
   substituteVariables,
 } from "../src/claude/skills.js";
-import { preprocessShellInjection, resolveShellBinary } from "../src/engine/shell-inject.js";
+import {
+  preprocessShellInjection,
+  resolveGitBashPath,
+  resolveShellBinary,
+  shellNamespaceDiffersFromNative,
+} from "../src/engine/shell-inject.js";
 import type { ClaudeSkill } from "../src/types.js";
 
 const SENTINEL = "PD_SENTINEL_BODY_2c8f71";
@@ -751,6 +756,32 @@ describe("shell injection env inheritance", () => {
 // ---------------------------------------------------------------------------
 // resolveShellBinary: powershell → pwsh first, Windows PowerShell fallback
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// shellNamespaceDiffersFromNative: injectable platform, exact predicate (#48)
+// ---------------------------------------------------------------------------
+
+describe("shellNamespaceDiffersFromNative", () => {
+  it("is false on non-win32 platforms regardless of Git Bash presence", () => {
+    expect(shellNamespaceDiffersFromNative("linux")).toBe(false);
+    expect(shellNamespaceDiffersFromNative("darwin")).toBe(false);
+  });
+
+  it("on win32 equals whether a real Git Bash is pinned (never bare-bash/WSL)", () => {
+    // Structural equality holds on any host: off-Windows resolveGitBashPath() is
+    // undefined (so false); on Windows with Git Bash it is the exact conjunction.
+    expect(shellNamespaceDiffersFromNative("win32")).toBe(resolveGitBashPath() !== undefined);
+  });
+
+  it("defaults to the real platform (no note off-Windows)", () => {
+    expect(shellNamespaceDiffersFromNative()).toBe(
+      process.platform === "win32" && resolveGitBashPath() !== undefined,
+    );
+    if (process.platform !== "win32") {
+      expect(shellNamespaceDiffersFromNative()).toBe(false);
+    }
+  });
+});
 
 describe("resolveShellBinary: powershell", () => {
   const pwshName = process.platform === "win32" ? "pwsh.exe" : "pwsh";

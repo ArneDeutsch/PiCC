@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
 import type { HookOutcome, HookPayload, ToolCallDescriptor } from "./types.js";
@@ -53,8 +54,8 @@ import { loadAgentMemory } from "./claude/memory.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
-import { resolveGitBashPath } from "./engine/shell-inject.js";
-import { applyUnicodeSafeProcessEnv, unicodeSafeSubprocessEnv } from "./util/env.js";
+import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
+import { applyUnicodeSafeProcessEnv, computeSessionScratchDir, unicodeSafeSubprocessEnv } from "./util/env.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
 
 /**
@@ -630,6 +631,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       settings: project.settings,
       state: newSessionContextState(skipProject ? [] : project.claudeMd),
       steeringText: agentModelRef ? steeringForModel(config, agentModelRef) : steeringText,
+      // Feature 25 / #48: subagents receive the same scratchpad guidance as the
+      // main session — a subagent that writes a temp file via the Bash tool and
+      // then Reads it (or hands it to a nested agent) hits the identical
+      // shell↔native namespace trap. Reuse the one eager `scratchDir` literal +
+      // predicate (harness data, safe to inject into every agent — not an
+      // exfiltration-sensitive value). Reachable here because this closure runs
+      // at dispatch time, after activation initialized `scratchDir`.
+      scratchDir,
+      windowsTempNote: shellNamespaceDiffersFromNative(),
     });
     sections.push(suffix);
     return sections.join("\n\n");
@@ -930,6 +940,37 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Per-session native-safe scratch dir (feature 25 / #48)
+  // ---------------------------------------------------------------------------
+  // Created EAGERLY in the outer scope — before the async IIFE below and the
+  // before_agent_start registration — so its literal resolved path is captured
+  // synchronously at the t02 system-prompt injection call site (not raced by the
+  // first turn nor left `undefined` by the error-swallowing async closure).
+  // Order is load-bearing: mkdtemp → realpath → slash-transform. Applying the
+  // slash transform before realpath'ing would silently return the backslash form.
+  // Root honors CLAUDE_CODE_TMPDIR (Claude Code's actual scratch relocation knob)
+  // so a Claude project's tmpdir policy carries over, else os.tmpdir(). Both read
+  // the harness process env, which a project settings.json cannot touch.
+  let scratchDir: string | undefined;
+  try {
+    // Root selection + mkdtemp → realpath → slash-transform ORDER live in the pure
+    // `computeSessionScratchDir` helper so the wiring test can lock them on any host
+    // (see src/util/env.ts + test/subprocess-env.test.ts).
+    scratchDir = computeSessionScratchDir({
+      env: process.env,
+      tmpdir: () => os.tmpdir(),
+      mkdtemp: (prefix) => fs.mkdtempSync(prefix),
+      realpath: (p) => fs.realpathSync(p),
+      join: (a, b) => path.join(a, b),
+      platform: process.platform,
+    });
+  } catch (err) {
+    // A scratch-dir failure must never crash activation; t02 simply omits the
+    // scratchpad guidance when the value is unavailable.
+    console.error(`PiCC: session scratch dir unavailable: ${(err as Error).message}`);
+  }
+
   // Cwd-swapping overrides of Pi built-ins (design doc §3.1). Renderers are inherited.
   void (async () => {
     try {
@@ -1011,6 +1052,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         settings: project.settings,
         state,
         steeringText,
+        // Feature 25 / #48: the literal native-safe scratch dir (captured eagerly
+        // above) is injected on all platforms; the Windows namespace note is gated
+        // on the shell↔native split detection.
+        scratchDir,
+        windowsTempNote: shellNamespaceDiffersFromNative(),
         autoMemory: project.autoMemory,
         onDiagnostic: reportListingDegradation,
       });
