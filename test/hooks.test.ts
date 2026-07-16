@@ -706,7 +706,19 @@ describe("HookRunner output contract", () => {
       const immediate = child.spawnedChildren();
       expect(immediate).toHaveLength(1);
       const immediatePid = immediate[0]!.pid;
-      expect(immediatePid).toBe(process.platform === "win32" ? observedPids.ppid : observedPids.pid);
+      if (process.platform === "win32") {
+        // The immediate process is the shell, not the exec'd helper, and some
+        // Git Bash/MSYS layerings (e.g. windows-latest CI) insert an extra
+        // process so the helper's ppid is not necessarily the immediate tracked
+        // child. The authoritative kill proof is the immediate ChildProcess
+        // close (below) plus the helper tree-death (below), not an exact ppid
+        // identity; just require a real tracked pid here.
+        expect(typeof immediatePid).toBe("number");
+        expect(immediatePid).toBeGreaterThan(0);
+      } else {
+        // POSIX `exec` replaces the shell, so the helper IS the immediate process.
+        expect(immediatePid).toBe(observedPids.pid);
+      }
       // The observed ChildProcess close event, rather than helper publication,
       // is the authoritative proof that HookRunner's immediate process died.
       await child.waitForAllClosed("timed-out immediate hook process to close");

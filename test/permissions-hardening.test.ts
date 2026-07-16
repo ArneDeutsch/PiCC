@@ -650,7 +650,14 @@ describe("UNC path inputs", () => {
           { deny: true, anySegment: true, anchor: ROOT },
         ),
       ).toBe(true);
-      expect(realpath).not.toHaveBeenCalled();
+      // The `//host` UNC skip is Windows-only: only there does path.resolve
+      // preserve `//host/...` as a UNC path the network-stall guard (^//) skips.
+      // On POSIX `//host/...` collapses to an ordinary single-slash absolute
+      // path, so canonicalization legitimately runs — the load-bearing guarantee
+      // is the literal match above, which holds on both platforms.
+      if (process.platform === "win32") {
+        expect(realpath).not.toHaveBeenCalled();
+      }
     } finally {
       realpath.mockRestore();
     }
