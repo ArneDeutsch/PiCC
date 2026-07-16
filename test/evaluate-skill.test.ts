@@ -989,3 +989,165 @@ describe("locked bounded reviewer return + fail-safe parse (evaluate-scoring-con
     expect(body).toContain("that shape is the engine's");
   });
 });
+
+describe("provenance enum + bare-#N reconciliation + github_verified (evaluate-scoring-contract t03)", () => {
+  // Loose, case-insensitive, whitespace-collapsed structural checks (handles CRLF).
+  // These pin the t03 contract: a CLOSED five-token provenance enum split 3
+  // sandbox-emittable / 2 coordinator-only (the evaluator emits neither coordinator-only
+  // class), provenance-by-origin-channel, the target_claim-never-verified prohibition +
+  // conservative missing/ambiguous default, the required-marker OBLIGATION (not just token
+  // presence), the Option-A render (Evidence block = verified classes only; Reasoning-column
+  // cue) surfaced through the three public modes, the bare-#N ban reconciled by SCOPING (the
+  // sandbox path still can't emit #N), and the existing-tracking sentence paired with a
+  // coordinator-supplies-it note. We do NOT test LLM judgment. All pinned phrases are ASCII
+  // (enum tokens use underscores), so no String.fromCodePoint build is needed here.
+  const collapse = (p: string): string =>
+    fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
+
+  const ENGINE_PATH = path.join(REFERENCES_DIR, "evaluation-engine.md");
+  const EVALUATOR_PATH = path.join(AGENTS_DIR, "evaluator.md");
+  const ISSUE_EVAL_PATH = path.join(REFERENCES_DIR, "issue-eval.md");
+  const PR_EVAL_PATH = path.join(REFERENCES_DIR, "pr-eval.md");
+  const PROPOSAL_GATE_PATH = path.join(REFERENCES_DIR, "proposal-gate.md");
+
+  it("engine defines all five closed provenance enum tokens", () => {
+    const body = collapse(ENGINE_PATH);
+    for (const token of [
+      "target_claim",
+      "repo_verified",
+      "inference",
+      "metadata_verified",
+      "github_verified",
+    ]) {
+      expect(body).toContain(token);
+    }
+  });
+
+  it("engine splits the enum 3 sandbox-emittable / 2 coordinator-only (evaluator emits neither)", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("sandbox-emittable (3)");
+    expect(body).toContain("coordinator-only (2)");
+    // The filesystem-only evaluator can emit NEITHER coordinator-only class.
+    expect(body).toContain("emits neither coordinator-only class");
+    // Classification is by observability — the load-bearing rationale for the split.
+    expect(body).toContain("by who can observe the fact");
+  });
+
+  it("engine pins the required-marker OBLIGATION (not just dead vocabulary)", () => {
+    const body = collapse(ENGINE_PATH);
+    // A later edit must not drop the requirement while leaving the enum tokens behind.
+    expect(body).toContain("required to carry a provenance marker");
+  });
+
+  it("engine states provenance is by origin channel, not by value", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("by origin channel, not by value");
+  });
+
+  it("engine forbids presenting a target_claim as verified evidence + conservative default", () => {
+    const body = collapse(ENGINE_PATH);
+    // Prohibition.
+    expect(body).toContain("presented or rendered as verified evidence");
+    // Conservative parse of a missing/ambiguous marker — never a verified class.
+    expect(body).toContain("missing or ambiguous");
+    expect(body).toContain("never to a verified class");
+  });
+
+  it("engine render rule: Evidence block = verified classes only; Reasoning column = a lightweight cue", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("verified classes only");
+    expect(body).toContain("lightweight provenance cue");
+  });
+
+  it("engine reconciles bare-#N by scoping: sandbox may not emit #N; github_verified is coordinator-only", () => {
+    const body = collapse(ENGINE_PATH);
+    // (a) sandbox path still cannot emit #N — the ban is not loosened.
+    expect(body).toContain("may not emit `#n`");
+    // github_verified is a distinct, coordinator-only class, non-overlapping by construction.
+    expect(body).toContain("distinct, coordinator-only class");
+    expect(body).toContain("non-overlapping by construction");
+  });
+
+  it("engine keeps the existing-tracking sentence true AND pairs it with a coordinator-supplies note", () => {
+    const body = collapse(ENGINE_PATH);
+    // The evaluator-scoped truth is preserved verbatim (also pinned at the element-5 seam).
+    expect(body).toContain("filesystem-only evaluator does not query");
+    // Paired with the coordinator-supplies-it forward-reference to t05.
+    expect(body).toContain("may supply that cross-feature tracking signal");
+    expect(body).toContain("the search wiring is t05");
+  });
+
+  it("evaluator bullet 2 emits ONLY the three sandbox-emittable classes, neither coordinator-only class", () => {
+    const body = collapse(EVALUATOR_PATH);
+    expect(body).toContain("three sandbox-emittable classes");
+    expect(body).toContain("emit neither coordinator-only class");
+    // The three it may emit, and the two it may not — named explicitly.
+    for (const token of ["target_claim", "repo_verified", "inference"]) {
+      expect(body).toContain(token);
+    }
+    expect(body).toContain("metadata_verified");
+    expect(body).toContain("github_verified");
+  });
+
+  it("issue-eval + pr-eval public render carry the verified-only Evidence block + Reasoning cue", () => {
+    for (const p of [ISSUE_EVAL_PATH, PR_EVAL_PATH]) {
+      const body = collapse(p);
+      expect(body).toContain("verified classes only");
+      expect(body).toContain("lightweight provenance cue");
+    }
+  });
+
+  it("proposal-gate pairs the tracking note with coordinator-supplied github_verified + rides the density split", () => {
+    const body = collapse(PROPOSAL_GATE_PATH);
+    // The coordinator supplies the cross-feature signal as a github_verified anchor (t05),
+    // never the evaluator. (Backtick-wrapped token in the prose, so match with the backtick.)
+    expect(body).toContain("`github_verified` provenance anchor");
+    expect(body).toContain("provenance rides this same split");
+  });
+
+  it("engine defines the metadata_verified validation/leakage lane (labels = untrusted display data)", () => {
+    const body = collapse(ENGINE_PATH);
+    // Its own non-repo-relative lane — element 7's repo-relative allow-list does not apply.
+    expect(body).toContain("non-repo-relative validation lane");
+    // labels are attacker-influenceable project-controlled strings — the security crux.
+    expect(body).toContain("project-controlled, attacker-influenceable strings");
+    // The rendered content is untrusted display data subject to the leakage-strip and
+    // no-verbatim-reflection rule — a verified class does NOT exempt the field bytes.
+    expect(body).toContain("untrusted display data");
+    expect(body).toContain("never reflected verbatim into a public write");
+  });
+
+  it("engine pins ONE worked Reasoning-column cue example (placement pattern, not improvised)", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("worked example");
+    // The cue rides at the end of the cell — the pinned placement pattern.
+    expect(body).toContain("cue rendered at the end of the cell");
+  });
+
+  it("engine defines compact-vs-full concretely (for provenance only; not the pick-list budget)", () => {
+    const body = collapse(ENGINE_PATH);
+    // Compact: a cue only on decision-flipping claims. Full: every load-bearing cue in the body.
+    expect(body).toContain("only on decision-flipping claims");
+    expect(body).toContain("every load-bearing justification carries its cue");
+    // Must NOT override t04's ownership of the overall pick-list budget.
+    expect(body).toContain("t04's single home");
+  });
+
+  it("engine + issue-eval reword 'trustworthy by construction' to the exclusion-property phrasing", () => {
+    for (const p of [ENGINE_PATH, ISSUE_EVAL_PATH]) {
+      const body = collapse(p);
+      expect(body).toContain(
+        "trustworthy against unverified-claim masquerade by construction",
+      );
+    }
+  });
+
+  it("issue-eval + pr-eval cue lists are not under-inclusive (coordinator may attach the two extra cues)", () => {
+    for (const p of [ISSUE_EVAL_PATH, PR_EVAL_PATH]) {
+      const body = collapse(p);
+      // The sandbox list is now e.g.-prefixed and names the two coordinator cues too.
+      expect(body).toContain("coordinator-verified metadata");
+      expect(body).toContain("found by the coordinator's issue search");
+    }
+  });
+});

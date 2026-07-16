@@ -216,6 +216,15 @@ line, and the bounded return carries the matching anchors field. Each anchor ite
   repo-root-relative, cap the list at the proportionate ceiling, treat anchors as display-only strings
   it **never re-opens or resolves** — **plus** the existing per-criterion leakage-strip
   (tokens / env / `~/.pi` / absolute local paths). It applies **both**; the two are **never equated**.
+- **Provenance is visible in the render (per the engine's provenance enum, element 3).** The
+  `**Evidence:**` block carries **verified classes only** (`repo_verified` / `metadata_verified` /
+  `github_verified`) — a `target_claim` or `inference` is never eligible there, so the block is
+  **trustworthy against unverified-claim masquerade by construction** (the exclusion property, not a claim
+  that a verified class's contents skip the engine's leakage-strip). Load-bearing claims in the
+  **Reasoning column** instead carry a **lightweight provenance cue** (e.g. "claimed by the issue" /
+  "verified in repo" / "inferred"; the coordinator may additionally attach "coordinator-verified metadata"
+  or "found by the coordinator's issue search") so an unverified target claim can never masquerade as
+  verified fact in the posted comment.
 
 **The slop threshold (this mode's Left-open call).** On the engine's rating scale, map cost-vs-benefit
 to a keep/close boundary: an issue whose integrated cost-vs-benefit is **decisively negative** — low

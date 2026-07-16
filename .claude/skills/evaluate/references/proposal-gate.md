@@ -50,7 +50,10 @@ action envelope is unchanged, and "existing issue/plan tracking" means in-repo `
 `review.md`, not a live GitHub query. As `evaluation-engine.md` §"The evidence-anchor contract" spells
 out, these are on-disk working-tree records for the current run (`doc/plan/` is gitignored run scratch,
 not durable committed history); durable cross-feature tracking lives in GitHub Issues, which this
-filesystem-only evaluator does not query.
+filesystem-only evaluator does not query. That cross-feature tracking signal, when it is available, is
+the **coordinator's** to supply from its own read-only GitHub issue search — entering the gate as a
+`github_verified` provenance anchor (per `evaluation-engine.md`'s element-3 enum), never through the
+evaluator; the search wiring itself is t05.
 
 ## Bounded structured return — the evaluator returns fields, the coordinator composes
 
@@ -119,7 +122,10 @@ filed feature body**:
   supports a **lean pick-list** presentation — the disposition plus only the **decision-flipping**
   anchors — while the **full anchor set travels in the filed `## Evaluation` body**; the exact pick-list
   anchor budget is [ticket-integration.md](../../implement-feature/references/ticket-integration.md)'s
-  to set (t04's single home), not restated here.
+  to set (t04's single home), not restated here. **Provenance rides this same split** (per
+  `evaluation-engine.md`'s element-3 render): compact provenance cues on the load-bearing Reasoning
+  claims in the lean pick-list, the full per-item provenance in the filed `## Evaluation` body — the
+  `**Evidence:**` block itself always carries **verified classes only**.
 
 ## The disposition — drop / surface (gate) vs. annotate (Phase 1)
 
