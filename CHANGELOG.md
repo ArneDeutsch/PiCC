@@ -18,6 +18,26 @@ All notable changes to PiCC are documented here. The format is based on
   separate identity channel was deliberately not built — rationale in
   `doc/plan/26-verbatim-contract-docs/feature.md`).
 
+### Added — collaborative planning posture by default (2026-07-16)
+
+- **PiCC's always-on conventions block now carries a short collaborative-planning nudge, so a
+  GPT/Codex model adopts a more Claude-Code-style planning posture by default.** On a substantial
+  planning or exploration request the model is nudged to ground itself by reading the repo,
+  resolve discoverable facts instead of asking about them, ask only about goals, preferences, and
+  material tradeoffs, surface meaningful alternatives and recommend one, and avoid collapsing a
+  planning phase into a restatement of the request followed immediately by "go"/"confirm" — while
+  still implementing decisively and autonomously once scope is agreed, and still honoring a skill's
+  explicit approval gate. **Why you'd care:** it narrows the visible interaction-quality gap between
+  Claude Code-authored and PiCC-authored sessions on the same skill, so a Claude-authored workflow
+  like `implement-feature` is nudged to engage before confirming instead of short-circuiting to a
+  "go" prompt.
+  It applies to every project run under PiCC, not just this one, and is a best-effort prompt nudge —
+  outcome is model-dependent (guidance, not enforcement); it is not Plan mode, not the
+  `AskUserQuestion` UI, and not a deterministic conversation state machine. The lever if you want a
+  different interaction style is the existing per-model `steering` config, which layers on top of the
+  built-in default (see the user guide) — a contrary steering entry can, for example, tone the
+  posture back toward terse, minimal-question turns.
+
 ### Changed — description-based feature naming (2026-07-15)
 
 - **Future `implement-feature` runs use one concise descriptive slug instead of allocating a global
