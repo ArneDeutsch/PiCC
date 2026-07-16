@@ -37,7 +37,61 @@ Criterion cell of every rendered row, so a reader never has to guess which way i
 **How they combine into a disposition.** Score each criterion, then let cost-vs-benefit integrate
 them. Bias to **keep-open when uncertain** — a close (issue-eval) requires a *clear-cut* low-value or
 malicious verdict, never a borderline one. Proposal-gate applies the same rubric but its "disposition"
-is a score + a drop/surface (gate) or annotate-only (Phase 1) decision — see t04.
+is a score + a drop/surface (gate) or annotate-only (Phase 1) decision — see the mode files.
+
+**The deterministic synthesis rule — how reviewer verdicts combine into one rating and one
+importance.** The coordinator does **not** synthesise by discretion; it applies a fixed, auditable rule
+over the reviewers' §"The locked bounded reviewer return" fields (per-criterion ratings, the
+provenance-marked justification per row, the overall verdict, and the capped anchor list):
+
+1. **Per magnitude criterion (the ordinal-with-direction rows only).** Combine the reviewers'
+   five-level ratings by **median**; on an even split take the **more conservative** side — the one
+   that keeps the finding in play (toward keep-open), never the one that hardens it into a drop/close.
+   Weight each reviewer's rating by the **provenance** of the justification behind it (below).
+   Provenance is **not** a numeric term folded into the median; it **gates how far** the combined rating
+   may move toward drop/close: a rating a reviewer backs only with a `target_claim` cannot, on its own,
+   move the combined rating far enough to justify a close/drop — a **verified** justification is
+   *necessary* to move it that far (necessary, not sufficient: a verified hit unlocks the move but does
+   not by itself compel it), which preserves the invariant that a hit is necessary-not-sufficient for a
+   drop.
+2. **Provenance trust ordering (highest to lowest weight).** The verified trio — `repo_verified`,
+   `metadata_verified`, `github_verified` — carry real, **equal** weight and are the only justifications
+   that can, by themselves, verify a rating; `inference` (the reviewer's own reasoning — real but
+   unverified) sits below them; and `target_claim` (the target's untrusted words) sits at the bottom.
+   In this ordering `github_verified` is a verified class carrying the same weight as `repo_verified`
+   and `metadata_verified` — that real weight is exactly what lets a coordinator-supplied
+   already-tracked hit lower a proposal's novelty read (t05). A missing or ambiguous marker is read
+   conservatively (element 3): as `target_claim` / `inference`, never as a verified class.
+3. **Cost-vs-benefit is a derived row, not a co-equal input.** The Cost-vs-benefit row (and the
+   overall-importance line) already integrate the other six criteria into the net keep/close call, so
+   the synthesis rule reads them as the **already-integrated disposition-drivers** — it does **not**
+   re-fold the six magnitude criteria back in as a seventh independent input, which would
+   double-count them. The disposition follows the combined Cost-vs-benefit / overall verdict reconciled
+   against the per-criterion medians, never a fresh re-tally of all seven.
+4. **Not every row is an ordinal-with-direction.** The seven magnitude criteria (plus any magnitude
+   mode-specific rows) are ordinal-with-direction and combine by median as above; but some
+   mode-specific rows are **categorical**, with no monotonic direction — pr-eval's Fulfilment
+   (`under-reach / full / over-reach`), advisory readiness (`ready / needs-work / hold`), and Tests / CI
+   status (the check conclusion). These are **not** medianed and **not** pushed up/down: take the
+   reviewers' **modal** category, and on a split surface the disagreement (below) rather than inventing
+   a midpoint.
+5. **Keep-open bias preserved.** Whenever the combination is uncertain — reviewers split, the winning
+   rating rests only on unverified provenance, or a return failed the fail-safe parse — the rule
+   resolves toward **keep-open**. It **preserves the conservative keep-open bias under uncertainty**; a
+   deterministic rule never hardens a borderline case into a drop/close.
+
+**Disagreement disclosure — on its own dedicated line.** When the reviewers **materially disagree** on
+importance or rating, the coordinator's public/on-screen assessment **surfaces material disagreement
+instead of silently selecting one side**: it states the split on a **dedicated line** of its own — one
+that **names the axis** they split on (importance, or a named criterion), never two bare values — e.g.
+`**Reviewers split (importance):** keep-open-leaning vs drop-leaning` or
+`**Reviewers split on Reach:** high vs low`, naming both sides — separate from the overall-importance
+line, which already carries the integrated verdict and the disposition it drives. Because a material
+disagreement is the most decision-flipping signal, this line **rides the lean pick-list too** (not only
+the filed `## Evaluation` body), so someone choosing from the in-session pick-list never decides without
+seeing that the reviewers split. This line only **surfaces** the disagreement; it **never
+auto-resolves** it via any single signal (no lone reviewer, no single provenance hit decides). The
+keep-open bias above still governs the disposition.
 
 **PR-specific criteria** (named here, detailed in t03's `pr-eval.md`): **fulfilment** (does the diff
 actually do what its ticket asked?), **code consequences** (correctness, regressions, maintainability
@@ -167,7 +221,7 @@ binding source for the anchor shape; the mode references (proposal-gate, issue-e
      provenance could change the disposition — not on every row. *Full* (the filed `## Evaluation` body):
      **every load-bearing justification carries its cue.** That is the whole compact-vs-full distinction
      *for provenance*; it does **not** set the pick-list's overall anchor budget (that stays
-     `implement-feature`'s ticket-integration reference / t04's single home). Do not bloat the scannable
+     `implement-feature`'s ticket-integration reference). Do not bloat the scannable
      pick-list.
 
    **Prohibition + conservative default.** A `target_claim` may **never** be presented or rendered as
@@ -244,7 +298,7 @@ proposal.
 ## Investigation + adversarial wave
 
 The shape reused by issue-eval and pr-eval to reach a robust rating (proposal-gate uses a lighter form
-— see t04):
+— see the mode files):
 
 - a **roaster** (find every reason to reject),
 - a **pro-advocate** (the strongest case *for* acting),
@@ -316,6 +370,42 @@ a garbled return as a confident verdict or a confident close. An absent or unpar
 is read as *not verified*, never as verified. This fail-safe is the load-bearing control here — the
 template is advisory, the conservative parse is what actually holds.
 
+### Reviewer execution budgets — honest strength tiers
+
+Reviewer investigation is **bounded**, but the bounds are **not all the same strength** — stating them
+as one tier would overclaim enforceability. There are three distinct tiers:
+
+- **Structural (tool-enforced) — the read-scope tool set.** The evaluator's tool set
+  (`Read`/`Grep`/`Glob`; no shell/write/fetch/dispatch) physically confines *what* a reviewer can
+  reach — the permission engine gates exactly those tools. **This tier — the tool set alone — is
+  enforced by the harness, not by prose.** Separately, the coordinator's repo-root allow-list
+  re-validation of the returned anchors (evidence-anchor contract elements 5 and 7) is a
+  **coordinator-side deterministic control**, not harness read-scope enforcement: element 7 has the
+  coordinator re-validate *every* anchor, a model/prose fail-safe (like the locked-return conservative
+  parse — "a coordinator-side fail-safe parse, never a runtime-enforced contract") rather than a runtime
+  guard, and it checks the reviewer's returned **output** (its anchors), not what the reviewer was able
+  to read.
+- **Advisory (prose in the dispatch prompt) — the turn / targeted-search / result-cap budgets.** How
+  *much* a reviewer investigates — its **turns**, its number of **targeted searches**, and the
+  **result caps** on each search — is carried as advisory prose in the dispatch prompt and the reviewer
+  is asked to honor it. **No harness knob enforces these.** The one real knob,
+  `agent.frontmatter.maxTurns`, is best-effort (it blocks further tool calls after the cap but the model
+  still emits its final message), is a **single value shared** across the L1 screen, proposal-gate, and
+  grounded reviewers, and **cannot express per-role budgets** — a single cap would strangle the
+  multi-turn grounded reviewers while over-serving the one-pass L1 screen — so it is deliberately **not**
+  set on `.claude/agents/evaluator.md`. Keep the advisory budgets **proportionate to target
+  complexity**, not fixed caps: the L1 screen is a single pass with no investigation; a light
+  proposal-gate scorer grounds in a handful of reads; a full grounded reviewer scales its targeted
+  searches up with the target's size, each search returning a bounded result set, with anchors capped at
+  ≤5. These advisory budgets are **not** structural — do **not** describe them as sitting "on top of"
+  the structural guards as if they were themselves enforced.
+- **Enforced control (the load-bearing one) — the "not independently verified" fallback.** What
+  actually holds a reviewer to its bounds is the honest fallback: a reviewer that exhausts its advisory
+  budget returns **"not independently verified"** for whatever it could not confirm, rather than
+  fabricating certainty, and the coordinator's conservative parse (the fail-safe above) treats that as
+  **not verified** and **biases to keep-open**. The advisory budgets are a request; this fallback is the
+  control that makes an unmet budget safe.
+
 ## Canonical rating / assessment block
 
 The engine **owns** the shared block skeleton so issue-eval, pr-eval, and proposal-gate all render one
@@ -337,6 +427,7 @@ layout.
 <mode-specific rows: magnitude rows (e.g. pr-eval's Code consequences (lower is better), Verification evidence (higher is better)) fold their direction into the label the same way; categorical rows (pr-eval's Fulfilment: under-reach/full/over-reach; advisory readiness: ready/needs-work/hold; Tests / CI status: the check conclusion) render their own enum and are NOT on the five-level ordinal and NOT direction-marked>
 
 **Overall importance:** <one-line integrated verdict + the disposition this drives>
+**Reviewers split (<axis>):** <side A> vs <side B>   <conditional sibling — render ONLY on material disagreement; <axis> names what they split on: importance, or a named criterion (e.g. "on Reach"), never two bare values>
 
 **Evidence:**
 - <repo-relative locator> — <what it establishes> (<criterion>)

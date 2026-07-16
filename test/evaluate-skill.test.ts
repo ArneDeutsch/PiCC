@@ -1129,8 +1129,10 @@ describe("provenance enum + bare-#N reconciliation + github_verified (evaluate-s
     // Compact: a cue only on decision-flipping claims. Full: every load-bearing cue in the body.
     expect(body).toContain("only on decision-flipping claims");
     expect(body).toContain("every load-bearing justification carries its cue");
-    // Must NOT override t04's ownership of the overall pick-list budget.
-    expect(body).toContain("t04's single home");
+    // Must NOT set the overall pick-list budget here — that home is implement-feature's
+    // ticket-integration reference (t04 defines reviewer EXECUTION budgets, not the anchor budget).
+    expect(body).toContain("does **not** set the pick-list's overall anchor budget");
+    expect(body).toContain("ticket-integration reference");
   });
 
   it("engine + issue-eval reword 'trustworthy by construction' to the exclusion-property phrasing", () => {
@@ -1149,5 +1151,148 @@ describe("provenance enum + bare-#N reconciliation + github_verified (evaluate-s
       expect(body).toContain("coordinator-verified metadata");
       expect(body).toContain("found by the coordinator's issue search");
     }
+  });
+});
+
+describe("deterministic synthesis, disagreement disclosure, reviewer budgets (evaluate-scoring-contract t04)", () => {
+  // Loose, case-insensitive, whitespace-collapsed structural checks (handles CRLF).
+  // These pin the t04 contract: a deterministic synthesis/aggregation rule over t02's
+  // locked verdict fields that weights t03's provenance via an explicit trust ordering of
+  // all five classes (github_verified named as a verified class), treats cost-vs-benefit as
+  // a DERIVED row (not a co-equal input), does not assume every row is ordinal-with-direction,
+  // preserves the conservative keep-open bias, surfaces material reviewer disagreement on its
+  // OWN dedicated line (never auto-resolving), and states reviewer budgets in HONEST STRENGTH
+  // TIERS (structural read-scope guards vs. advisory turn/search/result-cap budgets) with the
+  // "not independently verified" fallback as the enforced control and NO frontmatter maxTurns.
+  // We do NOT test LLM judgment. All pinned phrases are ASCII except the em-dash seams, which
+  // are built from String.fromCodePoint for cross-platform stability.
+  const collapse = (p: string): string =>
+    fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
+
+  const ENGINE_PATH = path.join(REFERENCES_DIR, "evaluation-engine.md");
+  const PROPOSAL_GATE_PATH = path.join(REFERENCES_DIR, "proposal-gate.md");
+  const EVALUATOR_PATH = path.join(AGENTS_DIR, "evaluator.md");
+  const EM = String.fromCodePoint(0x2014); // — sentence/heading separator
+
+  it("defines the deterministic synthesis/aggregation rule over the locked bounded reviewer return", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("the deterministic synthesis rule");
+    // It is a fixed, auditable rule, NOT coordinator discretion.
+    expect(body).toContain("does **not** synthesise by discretion");
+    expect(body).toContain("fixed, auditable rule");
+    // It consumes t02's locked verdict fields.
+    expect(body).toContain(`the locked bounded reviewer return`);
+  });
+
+  it("states the provenance trust ordering placing all five classes, with github_verified named as verified", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("provenance trust ordering (highest to lowest weight)");
+    for (const token of [
+      "target_claim",
+      "repo_verified",
+      "inference",
+      "metadata_verified",
+      "github_verified",
+    ]) {
+      expect(body).toContain(token);
+    }
+    // github_verified is explicitly a VERIFIED class carrying real, equal weight (t05 novelty seam).
+    expect(body).toContain("`github_verified` is a verified class carrying the same weight");
+    // The verified trio outweighs target_claim; inference sits below verified.
+    expect(body).toContain("the verified trio");
+  });
+
+  it("treats cost-vs-benefit as a DERIVED row, never re-folded as a co-equal input (no double-count)", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("cost-vs-benefit is a derived row, not a co-equal input");
+    expect(body).toContain("already-integrated disposition-drivers");
+    expect(body).toContain("double-count");
+  });
+
+  it("does NOT assume every row is an ordinal-with-direction (categorical rows carved out)", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("not every row is an ordinal-with-direction");
+    // Categorical rows are not medianed / not pushed up-or-down; take the modal category.
+    expect(body).toContain("categorical");
+    expect(body).toContain("modal");
+  });
+
+  it("preserves the conservative keep-open bias under uncertainty (no hardening of borderline)", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("preserves the conservative keep-open bias under uncertainty");
+    expect(body).toContain("never hardens a borderline case into a drop/close");
+  });
+
+  it("surfaces material reviewer disagreement on its OWN dedicated line, never auto-resolving", () => {
+    const body = collapse(ENGINE_PATH);
+    // The load-bearing disclosure string, verbatim.
+    expect(body).toContain("surfaces material disagreement instead of silently selecting one side");
+    // A dedicated line of its own, separate from the overall-importance line.
+    expect(body).toContain("dedicated line");
+    expect(body).toContain("reviewers split");
+    expect(body).toContain("separate from the overall-importance line");
+    // It only surfaces; it never auto-resolves via any single signal.
+    expect(body).toContain("never auto-resolves");
+    // The line NAMES the axis they split on (importance, or a named criterion), not two bare values.
+    expect(body).toContain("names the axis");
+    expect(body).toContain("reviewers split (importance):");
+    expect(body).toContain("reviewers split on reach:");
+  });
+
+  it("renders the conditional disagreement line as a templated sibling in the owned canonical block skeleton", () => {
+    const body = collapse(ENGINE_PATH);
+    // The skeleton carries the axis-templated sibling, rendered ONLY on material disagreement.
+    expect(body).toContain("reviewers split (<axis>):");
+    expect(body).toContain("render only on material disagreement");
+    // The sibling names what they split on; it is not two bare values.
+    expect(body).toContain("names what they split on");
+  });
+
+  it("rides the material-disagreement line on the lean pick-list too, not only the filed body", () => {
+    // The engine states the disagreement line rides the lean pick-list too (most decision-flipping).
+    expect(collapse(ENGINE_PATH)).toContain("rides the lean pick-list too");
+    // And proposal-gate's pick-list-vs-filed-body split says the same (decision-flipping by definition).
+    const gate = collapse(PROPOSAL_GATE_PATH);
+    expect(gate).toContain("rides the lean pick-list too");
+    expect(gate).toContain("decision-flipping by definition");
+  });
+
+  it("states reviewer budgets in honest strength tiers (structural vs. advisory), with the enforced fallback", () => {
+    const body = collapse(ENGINE_PATH);
+    expect(body).toContain("honest strength tiers");
+    // Tier 1 — only the read-scope TOOL SET is STRUCTURAL / harness-enforced. The anchor
+    // allow-list re-validation is a coordinator-side control, NOT harness read-scope enforcement.
+    expect(body).toContain("structural (tool-enforced)");
+    expect(body).toContain("read-scope tool set");
+    expect(body).toContain("the tool set alone");
+    expect(body).toContain("coordinator-side deterministic control");
+    // Tier 2 — turn / targeted-search / result-cap budgets are ADVISORY prose in the dispatch prompt.
+    expect(body).toContain("advisory (prose in the dispatch prompt)");
+    expect(body).toContain("turns");
+    expect(body).toContain("targeted searches");
+    expect(body).toContain("result caps");
+    // The advisory tier must NOT be described as sitting "on top of" the structural guards.
+    expect(body).toContain(`these advisory budgets are **not** structural`);
+    // Tier 3 — the "not independently verified" fallback is the ENFORCED control.
+    expect(body).toContain("enforced control (the load-bearing one)");
+    expect(body).toContain("not independently verified");
+  });
+
+  it("does not add a frontmatter maxTurns to the evaluator agent (single cap can't express per-role budgets)", () => {
+    // The engine names maxTurns explicitly to explain why it is NOT set per-role.
+    const engine = collapse(ENGINE_PATH);
+    expect(engine).toContain("cannot express per-role budgets");
+    expect(engine).toContain("deliberately **not** set on `.claude/agents/evaluator.md`");
+    // And the agent frontmatter genuinely carries no maxTurns key.
+    const raw = fs.readFileSync(EVALUATOR_PATH, "utf8");
+    const fm = raw.split(/^---$/m)[1] ?? "";
+    expect(fm).not.toMatch(/maxturns/i);
+  });
+
+  it("keeps the disagreement heading and synthesis heading em-dash-formatted (cross-platform dash seam)", () => {
+    // The two t04 headings carry an em-dash; assert the glyph via code point, never a literal.
+    const raw = fs.readFileSync(ENGINE_PATH, "utf8");
+    expect(raw).toContain(`Disagreement disclosure ${EM} on its own dedicated line`);
+    expect(raw).toContain(`Reviewer execution budgets ${EM} honest strength tiers`);
   });
 });

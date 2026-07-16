@@ -122,7 +122,10 @@ filed feature body**:
   supports a **lean pick-list** presentation — the disposition plus only the **decision-flipping**
   anchors — while the **full anchor set travels in the filed `## Evaluation` body**; the exact pick-list
   anchor budget is [ticket-integration.md](../../implement-feature/references/ticket-integration.md)'s
-  to set (t04's single home), not restated here. **Provenance rides this same split** (per
+  to set, not restated here. A **material-disagreement line** (`**Reviewers split (<axis>):** …`, per
+  `evaluation-engine.md`'s disagreement-disclosure rule) **rides the lean pick-list too**, not only the
+  filed body — it is **decision-flipping by definition**, so whoever chooses from the in-session
+  pick-list still sees that the reviewers disagreed. **Provenance rides this same split** (per
   `evaluation-engine.md`'s element-3 render): compact provenance cues on the load-bearing Reasoning
   claims in the lean pick-list, the full per-item provenance in the filed `## Evaluation` body — the
   `**Evidence:**` block itself always carries **verified classes only**.
