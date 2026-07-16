@@ -38,6 +38,17 @@ function bashPath(p: string): string {
   return p.replace(/\\/g, "/");
 }
 
+function hostileCoercionValue(): object {
+  return new Proxy(Object.create(null) as object, {
+    get(_target, property) {
+      if (property === "message" || property === "toString" || property === Symbol.toPrimitive) {
+        throw new Error("hostile thrown-value content must not escape");
+      }
+      return undefined;
+    },
+  });
+}
+
 function makeRunner(
   rawHooks: unknown,
   overrides: {
@@ -208,7 +219,186 @@ describe("HookRunner parallel execution (C4)", () => {
   });
 });
 
+describe("HookRunner spawn observer safety", () => {
+  it("keeps a tracked command running normally when the observer throws", async () => {
+    const parent = makeTempDir();
+    const child = createHookProcessFixture(parent);
+    const { runner } = makeRunner(
+      { UserPromptSubmit: [{ hooks: [{
+        type: "command", command: child.command,
+        args: ["gate", "observer-normal", "observer output"], timeout: 8,
+      }] }] },
+      {
+        projectDir: parent,
+        env: child.env,
+        onSpawnForTest: (spawned) => {
+          child.onSpawnForTest(spawned);
+          throw new Error(`normal observer exploded: ${"x".repeat(2_000)}`);
+        },
+      },
+    );
+    const firing = runner.fire("UserPromptSubmit", { prompt: "hi" });
+    try {
+      await child.waitFor(["observer-normal.entered"], "observer-warning command to enter");
+      expect(child.exists("observer-normal.done")).toBe(false);
+      child.release("observer-normal");
+      const outcome = await firing;
+      expect(outcome.stdout).toBe("observer output");
+      const warning = outcome.diagnostics.find((diagnostic) =>
+        diagnostic.message.includes("spawn observer failed"));
+      expect(warning?.severity).toBe("warning");
+      expect(warning?.message).toMatch(
+        /^hook \(UserPromptSubmit\): spawn observer failed: normal observer exploded:/,
+      );
+      expect(warning?.message).toContain("…[truncated]; continuing");
+      expect(warning?.message.length).toBeLessThan(1_100);
+      await child.waitFor(["observer-normal.done"], "observer-warning command to finish");
+      await child.waitForAllClosed("observer-warning command process to close");
+      expect(child.exitCode("observer-normal")).toBe(0);
+      expect(child.isClosed(child.spawnedChildren()[0]!)).toBe(true);
+    } finally {
+      await child.cleanup("observer-normal");
+      await firing;
+    }
+  }, 20000);
+
+  it("contains hostile observer coercion before tracking and lets HookRunner own completion", async () => {
+    const parent = makeTempDir();
+    const child = createHookProcessFixture(parent);
+    const { runner } = makeRunner(
+      { UserPromptSubmit: [{ hooks: [{
+        type: "command", command: child.command,
+        args: ["complete", "observer-hostile", "hostile command output"], timeout: 8,
+      }] }] },
+      {
+        projectDir: parent,
+        env: child.env,
+        onSpawnForTest: () => {
+          // Deliberately throw before the fixture can track the handle. The
+          // short child must still receive stdin and reach normal close solely
+          // through HookRunner's already-installed lifecycle.
+          throw hostileCoercionValue();
+        },
+      },
+    );
+    const firing = runner.fire("UserPromptSubmit", { prompt: "hi" });
+    try {
+      const outcome = await firing;
+      expect(outcome.stdout).toBe("hostile command output");
+      expect(outcome.diagnostics.map((diagnostic) => diagnostic.message)).toContain(
+        "hook (UserPromptSubmit): spawn observer failed: unknown error; continuing",
+      );
+      expect(JSON.stringify(outcome)).not.toContain("hostile thrown-value content");
+      expect(child.spawnedChildren()).toHaveLength(0);
+      expect(child.exists("observer-hostile.done")).toBe(true);
+      expect(child.exitCode("observer-hostile")).toBe(0);
+    } finally {
+      await child.cleanup("observer-hostile");
+      await firing;
+    }
+  }, 20000);
+});
+
 describe("HookRunner async hooks (C5)", () => {
+  it("reports a hostile observer warning once without rejecting, killing, or leaking", async () => {
+    const parent = makeTempDir();
+    const first = createHookProcessFixture(path.join(parent, "first"));
+    const second = createHookProcessFixture(path.join(parent, "second"));
+    const sentinel = createHookProcessFixture(path.join(parent, "sentinel"));
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    const hostileObserver = (fixture: ReturnType<typeof createHookProcessFixture>) =>
+      (spawned: ChildProcess) => {
+        fixture.onSpawnForTest(spawned);
+        throw hostileCoercionValue();
+      };
+    const firstRunner = makeRunner(
+      { UserPromptSubmit: [{ hooks: [{
+        type: "command", command: first.command, args: ["gate", "first"], async: true, timeout: 8,
+      }] }] },
+      { projectDir: parent, env: first.env, onSpawnForTest: hostileObserver(first) },
+    ).runner;
+    const secondRunner = makeRunner(
+      { UserPromptSubmit: [{ hooks: [{
+        type: "command", command: second.command, args: ["gate", "second"], async: true, timeout: 8,
+      }] }] },
+      { projectDir: parent, env: second.env, onSpawnForTest: hostileObserver(second) },
+    ).runner;
+    const sentinelRunner = makeRunner(
+      { UserPromptSubmit: [{ hooks: [{
+        type: "command", command: sentinel.command,
+        args: ["complete", "sentinel"], async: true, timeout: 8,
+      }] }] },
+      {
+        projectDir: parent,
+        env: sentinel.env,
+        onSpawnForTest: (spawned) => {
+          sentinel.onSpawnForTest(spawned);
+          throw new Error("observer diagnostic sentinel");
+        },
+      },
+    ).runner;
+    const firings = [
+      firstRunner.fire("UserPromptSubmit", { prompt: "first" }),
+      secondRunner.fire("UserPromptSubmit", { prompt: "second" }),
+    ];
+    try {
+      await Promise.all([
+        first.waitFor(["first.entered"], "first hostile-observer async command to enter"),
+        second.waitFor(["second.entered"], "second hostile-observer async command to enter"),
+      ]);
+      await expect(Promise.all(firings)).resolves.toEqual([
+        { block: false, askDowngraded: false, diagnostics: [] },
+        { block: false, askDowngraded: false, diagnostics: [] },
+      ]);
+      first.release("first");
+      second.release("second");
+      await Promise.all([
+        first.waitFor(["first.done"], "first hostile-observer async command to finish"),
+        second.waitFor(["second.done"], "second hostile-observer async command to finish"),
+        first.waitForAllClosed("first hostile-observer async command to close"),
+        second.waitForAllClosed("second hostile-observer async command to close"),
+      ]);
+
+      // A distinct warning through the same detached reporting pipeline is the
+      // settlement witness for both duplicate warnings; no quiet-period guess
+      // is needed before asserting process-wide deduplication.
+      await expect(sentinelRunner.fire("UserPromptSubmit", { prompt: "sentinel" })).resolves.toEqual({
+        block: false, askDowngraded: false, diagnostics: [],
+      });
+      await sentinel.waitFor(["sentinel.done"], "observer diagnostic sentinel command to finish");
+      await sentinel.waitForAllClosed("observer diagnostic sentinel command to close");
+      await waitUntil({
+        description: "observer diagnostic sentinel report",
+        predicate: () => spy.mock.calls.some((call) =>
+          String(call[0]).includes("observer diagnostic sentinel")),
+        describeObserved: () => JSON.stringify(spy.mock.calls),
+        timeoutMs: 8_000,
+      });
+
+      const hostileReports = spy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.includes("spawn observer failed: unknown error"));
+      expect(hostileReports).toHaveLength(1);
+      expect(spy.mock.calls.map((call) => String(call[0])).join("\n"))
+        .not.toContain("hostile thrown-value content");
+      expect(unhandled).toEqual([]);
+      expect(first.spawnedChildren().every((spawned) => first.isClosed(spawned))).toBe(true);
+      expect(second.spawnedChildren().every((spawned) => second.isClosed(spawned))).toBe(true);
+      expect(first.exitCode("first")).toBe(0);
+      expect(second.exitCode("second")).toBe(0);
+    } finally {
+      await first.cleanup("first");
+      await second.cleanup("second");
+      await sentinel.cleanup("sentinel");
+      await Promise.all(firings);
+      process.off("unhandledRejection", onUnhandled);
+      spy.mockRestore();
+    }
+  }, 20000);
+
   it("async: true handlers return while gated and still complete after release", async () => {
     const parent = makeTempDir();
     const child = createHookProcessFixture(parent);

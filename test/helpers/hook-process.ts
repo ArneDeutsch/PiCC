@@ -48,7 +48,7 @@ try {
     await waitForAny([identity + ".release"], watchdog);
   } else if (mode === "reverse-first" || mode === "reverse-first-block") {
     await waitForAny(["second.done", identity + ".release"], watchdog);
-  } else if (mode !== "reverse-second" && mode !== "reverse-second-block") {
+  } else if (mode !== "reverse-second" && mode !== "reverse-second-block" && mode !== "complete") {
     throw new Error("unknown hook child mode: " + mode);
   }
   if (mode === "timeout") publish("post-timeout-side-effect");

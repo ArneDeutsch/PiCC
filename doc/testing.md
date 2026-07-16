@@ -20,8 +20,15 @@ missing those tests **skip** (they do not fail) with a console warning.
 ## Synchronizing asynchronous tests
 
 Correctness tests must wait for observable readiness, ordering, or completion—not sleep for a
-fixed interval or require work to finish within a narrow elapsed-time threshold. The shared helpers
-have these contracts:
+fixed interval or require work to finish within a narrow elapsed-time threshold. Tests directly
+under `test/` import the shared synchronization and process helpers with:
+
+```ts
+import { deferred, waitUntil } from "./helpers/async.js";
+import { createHookProcessFixture } from "./helpers/hook-process.js";
+```
+
+The shared helpers have these contracts:
 
 - `deferred<T>(): Deferred<T>` creates a test-owned promise gate with exposed `resolve` and `reject`.
 - `waitUntil(options: WaitUntilOptions): Promise<void>` observes a predicate and rejects with the
@@ -42,8 +49,9 @@ that tools registered successfully, callers that need tools must separately awai
 This completion is not a session-lifecycle barrier. Keep rejecting ceilings comfortably below
 Vitest's timeout so failures report expected and observed state instead of an opaque test timeout.
 
-For real hook children, use `createHookProcessFixture(parentDir)` and its test-owned marker/release
-protocol. The child atomically publishes an `entered` marker; await it with `fixture.waitFor` before
+For real hook children, use `createHookProcessFixture(parentDir)` from
+`test/helpers/hook-process.ts` and its test-owned marker/release protocol. The child atomically
+publishes an `entered` marker; await it with `fixture.waitFor` before
 asserting, then release identities in the order needed to establish the behavior. Always await
 cleanup with every still-gated identity in `finally`:
 
@@ -91,9 +99,10 @@ linter whose silence proves a test deterministic.
 
 ## Layer 1 — unit tests (per subsystem)
 
-Each subsystem is tested in isolation against its full field/behavior matrix, **including fields the
-reference project never exercises** (the tier-up completeness bar, plan §2.2). These are fast and
-have no process/network dependencies.
+Each subsystem is tested against its full field/behavior matrix, **including fields the reference
+project never exercises** (the tier-up completeness bar, plan §2.2). This layer uses no external
+network and is mostly isolated, but selected hook, worktree, and subprocess tests launch local
+processes and exercise real Git repositories.
 
 | Test file | Covers |
 |---|---|
