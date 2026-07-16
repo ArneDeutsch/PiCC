@@ -85,7 +85,9 @@ coordinator re-authors it.
 
 The assessment renders the engine's **canonical rating block** — the seven criteria rows
 (User value / Reach / Legitimacy / Clarity / Blast radius / Conflict / Cost-vs-benefit) each with a
-rating + short reasoning, the **overall-importance** line carrying the integrated verdict and the
+rating and short reasoning, its **direction** folded into the criterion label in plain language
+(`higher is better` / `lower is better`, so mixed-direction rows like Blast radius are never mis-read),
+the **overall-importance** line carrying the integrated verdict and the
 disposition it drives, and — as a sibling below that line, **not** an eighth rubric row — the
 **`**Evidence:**`** block enumerating the bounded, repo-relative anchors the rating rests on, each in the
 engine's `<repo-relative locator> — <what it establishes> (<criterion>)` shape (or the single

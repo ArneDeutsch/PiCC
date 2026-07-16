@@ -816,6 +816,81 @@ describe("evaluate deny floor (evaluate-skill t01)", () => {
   });
 });
 
+describe("rating vocabulary + per-criterion score direction (evaluate-scoring-contract t01)", () => {
+  // Loose, case-insensitive, whitespace-collapsed structural checks (handles CRLF).
+  // These pin the locked rating vocabulary and the per-criterion score direction, now
+  // rendered in plain language and folded into the Criterion cell of the canonical block
+  // (no separate Direction column) — the #47 score-direction acceptance. We do NOT test
+  // LLM judgment. All pinned phrases are ASCII, so no String.fromCodePoint build is
+  // needed here (the dash-bearing seams the suite pins elsewhere are the evidence-anchor
+  // item format, unaffected by this task).
+  const collapse = (p: string): string =>
+    fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
+
+  const ENGINE_PATH = path.join(REFERENCES_DIR, "evaluation-engine.md");
+  const ISSUE_EVAL_PATH = path.join(REFERENCES_DIR, "issue-eval.md");
+  const PR_EVAL_PATH = path.join(REFERENCES_DIR, "pr-eval.md");
+  const PROPOSAL_GATE_PATH = path.join(REFERENCES_DIR, "proposal-gate.md");
+
+  it("engine locks one bounded rating vocabulary (five-level ordinal, all three modes)", () => {
+    const body = collapse(ENGINE_PATH);
+    // The single bounded ordinal scale, pinned verbatim so it can't be silently widened/dropped.
+    expect(body).toContain("none / low / moderate / high / very-high");
+    // Declared as the single source (one vocabulary shared across modes).
+    expect(body).toContain("single source for the rating vocabulary");
+    expect(body).toContain("consistent across all three modes");
+  });
+
+  it("removes the old punt sentence (the vocabulary can no longer be silently dropped)", () => {
+    const body = collapse(ENGINE_PATH);
+    // The `:219` punt line had zero prior coverage — pin its removal so a revert reddens.
+    expect(body).not.toContain("the engine's call within the named criteria");
+  });
+
+  it("marks an explicit plain-language direction per criterion in the criteria list", () => {
+    const body = collapse(ENGINE_PATH);
+    // Value criteria are higher-is-better; Blast radius / Conflict are lower-is-better;
+    // Cost-vs-benefit is the net keep signal. Mixed direction is the whole point.
+    expect(body).toContain("**direction: higher is better.**"); // the four value criteria
+    expect(body).toContain("**direction: lower is better**"); // blast radius / conflict
+    expect(body).toContain("**direction: net keep/close"); // cost-vs-benefit net
+  });
+
+  it("the canonical rating block folds plain-language direction into the Criterion cell (local to the row, no separate column)", () => {
+    const body = collapse(ENGINE_PATH);
+    // The table is back to three columns — direction lives in the Criterion label.
+    expect(body).toContain("| criterion | rating | reasoning |");
+    // Direction is on the row itself — a mixed-direction table read unambiguously.
+    expect(body).toContain("| user value (higher is better) | <rating> | <reasoning> |");
+    expect(body).toContain("| blast radius (lower is better) | <rating> | <reasoning> |");
+    expect(body).toContain("| cost-vs-benefit (net keep/close) | <rating> | <reasoning> |");
+  });
+
+  it("categorical mode-specific rows are carved out of the five-level ordinal (not direction-marked)", () => {
+    const body = collapse(ENGINE_PATH);
+    // The truthful scope: only the seven magnitude criteria are on the ordinal + direction;
+    // pr-eval's categorical rows render their own enum and are NOT direction-marked.
+    expect(body).toContain("categorical mode-specific rows are not on this ordinal");
+    expect(body).toContain("not direction-marked");
+  });
+
+  it("all three mode files render via the engine's canonical block", () => {
+    // The engine is the single source; each mode points at the canonical block rather
+    // than restating the vocabulary. This proves the direction marker is inherited.
+    for (const p of [ISSUE_EVAL_PATH, PR_EVAL_PATH, PROPOSAL_GATE_PATH]) {
+      const body = collapse(p);
+      expect(body).toContain("canonical rating block");
+    }
+  });
+
+  it("proposal-gate's rendered-assessment prose names the folded-in direction (public render)", () => {
+    // proposal-gate is the one mode whose prose enumerates the block's columns, so it
+    // restates the direction cue — pin it so a drop from its public render reddens.
+    const body = collapse(PROPOSAL_GATE_PATH);
+    expect(body).toContain("**direction** folded into the criterion label");
+  });
+});
+
 describe("write-discipline points at the element-7 anchor re-validation (F23 close-fix)", () => {
   const collapse = (p: string): string =>
     fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");

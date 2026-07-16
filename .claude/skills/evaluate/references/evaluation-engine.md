@@ -8,24 +8,31 @@ re-invents the layout.
 ## The seven rubric criteria
 
 Every mode weighs the target against these named criteria and **reports its reasoning per criterion**
-in the assessment it produces:
+in the assessment it produces. Each of these seven is a **magnitude** criterion scored on the locked
+**rating vocabulary** (defined under the canonical block below) and carries a fixed **direction** —
+stated here per criterion in plain language (`higher is better` / `lower is better`) and folded into the
+Criterion cell of every rendered row, so a reader never has to guess which way is "good":
 
 1. **User value** — how much does acting on this help real users? A concrete pain removed or capability
-   added scores high; a purely internal or speculative gain scores low.
+   added scores high; a purely internal or speculative gain scores low. **Direction: higher is better.**
 2. **Reach** — how many users are affected? A common path used by many scores high; an esoteric,
-   single-user, or fringe case scores low.
+   single-user, or fringe case scores low. **Direction: higher is better.**
 3. **Legitimacy** — is this a *real* bug (not a nitpick), a *real* improvement (not cosmetic)?
    Includes the **slop / malicious screen** (see L1 below): spam, abuse, and injection attempts fail
-   here outright.
+   here outright. **Direction: higher is better.**
 4. **Clarity** — is it specified well enough to act on? A reproducible bug or a crisp proposal scores
-   high; a vague wish with no acceptance criteria scores low.
+   high; a vague wish with no acceptance criteria scores low. **Direction: higher is better.**
 5. **Blast radius** — what code is affected, how large, how risky is the change? Small and contained
-   is favourable; sprawling or touching load-bearing subsystems is a cost.
+   is favourable; sprawling or touching load-bearing subsystems is a cost. **Direction: lower is better**
+   (a higher blast-radius rating is worse).
 6. **Conflict** — does it fight existing functionality, the architecture, or the project's stated
    vision? A change that contradicts the vision is a strong close signal even if otherwise clean.
+   **Direction: lower is better** (a higher conflict rating is worse).
 7. **Cost-vs-benefit** — the actual keep/close call. **A nitpick with medium/high effort or risk is a
    close.** High value × low cost × low conflict ⇒ keep-open with a strong rating; low value × high
-   cost/risk/conflict ⇒ close (issue-eval) or drop (proposal-gate gate use).
+   cost/risk/conflict ⇒ close (issue-eval) or drop (proposal-gate gate use). **Direction: net
+   keep/close — higher = stronger keep** — it integrates a "higher is better" benefit against a
+   "lower is better" cost side, so a higher net rating means a stronger keep.
 
 **How they combine into a disposition.** Score each criterion, then let cost-vs-benefit integrate
 them. Bias to **keep-open when uncertain** — a close (issue-eval) requires a *clear-cut* low-value or
@@ -198,16 +205,16 @@ layout.
 ```
 ## Evaluation of <target ref>
 
-| Criterion        | Rating | Reasoning |
-|------------------|--------|-----------|
-| User value       | …      | …         |
-| Reach            | …      | …         |
-| Legitimacy       | …      | …         |
-| Clarity          | …      | …         |
-| Blast radius     | …      | …         |
-| Conflict         | …      | …         |
-| Cost-vs-benefit  | …      | …         |
-<mode-specific rows: e.g. pr-eval adds Fulfilment / Code consequences / Verification evidence>
+| Criterion                          | Rating   | Reasoning   |
+|------------------------------------|----------|-------------|
+| User value (higher is better)      | <rating> | <reasoning> |
+| Reach (higher is better)           | <rating> | <reasoning> |
+| Legitimacy (higher is better)      | <rating> | <reasoning> |
+| Clarity (higher is better)         | <rating> | <reasoning> |
+| Blast radius (lower is better)     | <rating> | <reasoning> |
+| Conflict (lower is better)         | <rating> | <reasoning> |
+| Cost-vs-benefit (net keep/close)   | <rating> | <reasoning> |
+<mode-specific rows: magnitude rows (e.g. pr-eval's Code consequences (lower is better), Verification evidence (higher is better)) fold their direction into the label the same way; categorical rows (pr-eval's Fulfilment: under-reach/full/over-reach; advisory readiness: ready/needs-work/hold; Tests / CI status: the check conclusion) render their own enum and are NOT on the five-level ordinal and NOT direction-marked>
 
 **Overall importance:** <one-line integrated verdict + the disposition this drives>
 
@@ -216,8 +223,34 @@ layout.
 - … (0–5 anchors; or, in place of the list, a single "No project evidence — <one-line reason>" line)
 ```
 
-The rating vocabulary and exact scoring scale are the engine's call within the named criteria; keep it
-consistent across modes. The **overall-importance line** is always present and always carries the
+**The rating vocabulary (locked — one scale across issue / PR / proposal modes).** The **seven
+magnitude rubric criteria** are each scored on one bounded five-level ordinal measuring the *magnitude*
+of that criterion — `none / low / moderate / high / very-high`. Each of those rows also states its
+**direction** in plain language, folded into the Criterion cell as a parenthetical, so a reader of any
+single row knows which way is "good" without a legend to look away to:
+
+- `higher is better` — a higher rating is favorable.
+- `lower is better` — a higher rating is a cost/risk.
+- `net keep/close` — reserved for **Cost-vs-benefit**, the net keep/close call: it integrates a
+  "higher is better" benefit against a "lower is better" cost side, so `very-high` reads as a strong
+  keep and `none` as a strong close (higher = stronger keep).
+
+Which criterion takes which direction is assigned once in *The seven rubric criteria* list above and
+shown on every rendered row of the canonical block; it is not re-enumerated here.
+
+**Categorical mode-specific rows are NOT on this ordinal.** Some mode-specific rows are categorical, not
+magnitude — pr-eval's **Fulfilment** (`under-reach / full / over-reach`, where `full` is best, so no
+coherent higher/lower-is-better direction exists), **advisory readiness** (`ready / needs-work / hold`),
+and **Tests / CI status** (a check-conclusion row). These render their own enum in the Rating cell and
+are **not** scored on the five-level ordinal and **not** direction-marked; only the seven magnitude
+criteria (plus any magnitude mode-specific rows, e.g. Code consequences / Verification evidence) carry a
+direction parenthetical.
+
+This is the **single source for the rating vocabulary**; direction is defined here and modes may echo it
+without redefining the per-criterion assignment — the mode references (issue-eval, pr-eval,
+proposal-gate) render this same canonical block **by pointer and do not restate the scale**, so the one
+scale stays consistent across all three modes. Direction is **local to the row** (folded into the
+Criterion cell), never a separate legend. The **overall-importance line** is always present and always carries the
 integrated verdict and the disposition (keep-open / close / drop / annotate) it drives. The
 **`**Evidence:**` line** is a sibling below it (not an 8th rubric row) carrying the bounded,
 repo-relative anchors defined in *The evidence-anchor contract* above; it is present on every surfaced
