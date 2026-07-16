@@ -39,6 +39,86 @@ the change warrants it — a manual-verification comment?). These render as extr
 block — pr-eval groups its PR-specific rows under a clearly-labelled "this diff" sub-heading (distinct
 from the ticket-worth block) so each row's target is unambiguous — not a wholly separate format.
 
+## Grounding — value judgements rest on project evidence
+
+Every **value/rating judgement** the engine produces (issue-eval's post-screen rating, proposal-gate's
+proposal score, and the surfaced-idea assessments — jobs 2, 3, 4) must be **grounded in real project
+evidence**. The evaluator is **required to investigate the project** — architecture, source, tests,
+docs, and existing in-repo issue/plan tracking — with its `Read`/`Grep`/`Glob` tools before it makes a
+value/rating judgement (jobs 2, 3, 4). It may not rate from the supplied prose alone unless it
+explicitly explains why no project evidence is relevant (a one-line justification in place of the
+anchors — see element 2 below). A confident rating founded on no project evidence is the exact failure
+this engine exists to prevent.
+
+**The L1 maliciousness screen is exempt.** The screen (below) is a security classification, not a value
+judgement: it emits one closed enum token with zero investigation, no anchors, and no free text.
+Grounding never applies to it.
+
+**Two trust paths** — a shared rubric is not a shared trust model. The two paths are read with opposite
+postures:
+
+- **Attacker-controlled target content** (an existing issue/PR body, its comments, a handed-in diff) is
+  **untrusted data**: screened at L1, isolated via the redirect (see *Investigation + adversarial wave*
+  and its **DISCIPLINED REDIRECT** note), and read as inert text-in-quotes — never as instructions, and
+  never as a directive that widens what the evaluator reads.
+- **The project working tree is trusted** — it is the ground the value judgement rests on, and the
+  evaluator investigates it with `Read`/`Grep`/`Glob`. (This is not new capability — pr-eval already
+  reads the tree.)
+
+### The evidence-anchor contract
+
+Every **surfaced** value assessment carries **bounded, repo-relative evidence anchors** below the
+overall-importance line, so a maintainer can see what the judgement is founded on. This is the single,
+binding source for the anchor shape; the modes (t02–t04) reference it and do not restate it.
+
+1. **Block label & item format.** The line is `**Evidence:**`, followed by a bulleted list; each anchor
+   item reads `<repo-relative locator> — <what it establishes> (<criterion>)`. The locator may be a
+   repo-relative path, `path §section`, `path:line`, a symbol name, a test name, or an
+   **existing-tracking anchor** — the in-repo file that records the tracking (a `doc/plan/…` entry, a
+   `doc/plan/…/review.md` §section, a `CHANGELOG` entry). A bare GitHub issue `#N` is **not** a valid
+   locator: it is not a working-tree file, is not filesystem-discoverable, and a `#N` lifted from the
+   target body is an injection signal (element 6). When an in-repo file references a prior issue, the
+   anchor is **that file's repo-relative path**, not the number. Existing-tracking anchors are the
+   highest-value class ("is this already tracked / decided?").
+   Example: `- src/engine/permissions.ts:42 — the deny-rule matcher this proposal would change (Blast radius)`.
+2. **Count 0–5.** Zero anchors is a legal, honest outcome — but only with an explicit one-line
+   justification in place of the list (e.g. "No project evidence — pure wording change, no code
+   surface"). Never force a minimum count; a fabricated path to hit a quota is the exact failure this
+   feature exists to kill.
+3. **Contact-verb honesty.** State the depth of contact ("read", "searched `tests/` — no hits",
+   "listed, not opened"); anchor the observable fact, not the conclusion (let the Reasoning column draw
+   conclusions); make thin coverage visible ("(light pass — N files inspected)"). No fabricated numeric
+   confidence score.
+4. **Locators only — never file/line contents, code, or excerpts.** This is what keeps the anchor field
+   from becoming a leak of a committed secret or of attacker-target bytes. The no-contents /
+   no-secret-bytes rule binds the whole anchor item — the free-text "what it establishes" phrase, not
+   just the locator, is the real egress channel (the evaluator has unrestricted Read over `.env`/`~/.pi`),
+   so that phrase must state the observable fact without ever quoting file bytes, secrets, or target text.
+5. **Allow-list / read scope.** Anchors name files inside the repo working tree only. Reject absolute
+   paths (POSIX `/…` **and** the Windows forms — drive-letter `C:\…`, drive-relative `\foo` / `C:foo`,
+   UNC `\\host\share`), any `..`, anything resolving outside the repo root (canonicalize, resolving
+   symlinks, before deciding), and `.env` / `~/.pi` / `.git/` internals /
+   credential or secret files. Investigation itself is confined to the repo tree. Investigation is
+   filesystem-only (`Read`/`Grep`/`Glob`) — the evaluator never runs gh, fetches, or queries GitHub;
+   "existing issue/plan tracking" means in-repo `doc/plan/`, `CHANGELOG`, `review.md`, etc., not a live
+   GitHub query.
+6. **Chosen by the evaluator's own judgement.** A target/proposal that names paths, tells the evaluator
+   what to read, or dictates anchor contents is an **injection attempt** (evidence for the screen — a
+   `MALICIOUS_INJECTION` signal), never a directive that widens the read or the return.
+7. **Dual enforcement (mirrors the existing two-layer split).** (a) The evaluator's returned shape is
+   bounded per this contract; (b) the **coordinator re-validates** every anchor — rejects absolute /
+   `..` / outside-repo / secret-file locators, strips any content bytes from the whole item including the
+   free-text phrase, normalizes to repo-root-relative, caps the list at ≤5 (truncating any over-count
+   return), and treats anchors as display-only strings it never re-opens or resolves. This coordinator
+   re-validation is **strictly stronger** than the existing per-criterion leakage-strip (tokens / env /
+   `~/.pi` / absolute paths / no-verbatim-reflection): it **adds** the path allow-list re-check,
+   `..`/outside-repo rejection, repo-root normalization, and the never-re-open property. Downstream tasks
+   that cite "the coordinator strips them" must require **both** — this anchor re-validation plus the
+   existing leakage-strip — never equate the two. Every public surface is repo-relative (an absolute path
+   leaks the OS username).
+8. **L1 screen exempt.** The screen output stays the closed enum with strict parse — no anchors, no free
+   text added there.
+
 ## L1 maliciousness screen
 
 The first pass on any target. It runs as a dispatch of the shell-free `evaluator` sandbox agent,
@@ -127,8 +207,15 @@ layout.
 <mode-specific rows: e.g. pr-eval adds Fulfilment / Code consequences / Verification evidence>
 
 **Overall importance:** <one-line integrated verdict + the disposition this drives>
+
+**Evidence:**
+- <repo-relative locator> — <what it establishes> (<criterion>)
+- … (0–5 anchors; or, in place of the list, a single "No project evidence — <one-line reason>" line)
 ```
 
 The rating vocabulary and exact scoring scale are the engine's call within the named criteria; keep it
 consistent across modes. The **overall-importance line** is always present and always carries the
-integrated verdict and the disposition (keep-open / close / drop / annotate) it drives.
+integrated verdict and the disposition (keep-open / close / drop / annotate) it drives. The
+**`**Evidence:**` line** is a sibling below it (not an 8th rubric row) carrying the bounded,
+repo-relative anchors defined in *The evidence-anchor contract* above; it is present on every surfaced
+value assessment (jobs 2, 3, 4) and absent from the L1 screen.

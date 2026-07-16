@@ -12,3 +12,9 @@ review.md. Dated bullets, one line each.
   channel — locked to repo-relative locators (no contents/excerpts), an allow-list rejecting
   absolute/`..`/outside-repo/`.env`/`~/.pi`/`.git`, dual-enforced, investigation
   filesystem-only (never `gh`/fetch). This is the load-bearing safety constraint.
+- 2026-07-16 t01: all three diff reviews (security/tester/coder) PASS. Applied 4 trivial
+  coordinator fixes: engine-side pins for element-7 (coordinator re-validation strictly
+  stronger / never re-open / ≤5 cap) and the `#N`-not-a-locator reconciliation; tightened the
+  loose `.git` test assertion to `.git/`; folded security's Windows-absolute note (drive-letter
+  / drive-relative / UNC / symlink canonicalization) into engine element 5 so the cross-platform
+  "reject absolute" rule isn't POSIX-only.
