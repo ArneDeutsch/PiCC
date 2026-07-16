@@ -6,6 +6,7 @@ import type { PiSdk } from "../src/runtime/subagents.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeSessionState } from "./helpers/fake-sdk.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
+import { deferred, waitUntil } from "./helpers/async.js";
 
 /**
  * F14 t02 — offline-integration for the `context: fork` failure/abort path.
@@ -109,7 +110,7 @@ describe("F14 t02 — Skill-tool fork consumer", () => {
       controller.signal,
     );
     const guarded = pending.catch((e: Error) => e);
-    await new Promise((r) => setTimeout(r, 10)); // let the prompt start and block on the gate
+    await h.waitForPromptCalls(1); // prove the signal targets the live gated prompt
     controller.abort();
     const err = await guarded;
     expect(err).toBeInstanceOf(Error);
@@ -153,7 +154,7 @@ describe("F14 — SlashCommand-tool fork consumer (shares runSkillActivation wit
     const guarded = slashTool
       .execute("c2", { command: "/fork-research x" }, controller.signal)
       .catch((e: Error) => e);
-    await new Promise((r) => setTimeout(r, 10));
+    await h.waitForPromptCalls(1); // prove the signal targets the live gated prompt
     controller.abort();
     const err = await guarded;
     expect(err).toBeInstanceOf(Error);
@@ -207,6 +208,7 @@ describe("F14 t02 — input-hook fork consumer (/fork-research …)", () => {
     const h = fakeSdk({ replies: [{ text: "never delivered", gate }] });
     const p = await wire(h.sdk);
     let escHandler: ((data: string) => unknown) | undefined;
+    const handlerInstalled = deferred<void>();
     let unsubscribed = false;
     const ctx = p.ctx({
       mode: "tui",
@@ -216,6 +218,7 @@ describe("F14 t02 — input-hook fork consumer (/fork-research …)", () => {
         setStatus: () => {},
         onTerminalInput: (handler: (data: string) => unknown) => {
           escHandler = handler;
+          handlerInstalled.resolve();
           return () => {
             unsubscribed = true;
           };
@@ -223,15 +226,19 @@ describe("F14 t02 — input-hook fork consumer (/fork-research …)", () => {
       },
     });
     const pending = p.fire("input", { text: "/fork-research x", source: "interactive" }, ctx);
-    pending.catch(() => {}); // avoid an unhandled-rejection warning while we poll
-    // Poll until the hook subscribes (the input-hook path has more awaits before
-    // the fork than the direct execute path, so a fixed short sleep is flaky).
-    for (let i = 0; i < 200 && !escHandler; i++) await new Promise((r) => setTimeout(r, 5));
-    expect(escHandler).toBeDefined();
+    pending.catch(() => {}); // guard while the event-driven readiness waits run
+    await waitUntil({
+      description: "typed slash input to install its terminal-input handler",
+      predicate: () => handlerInstalled.promise.then(() => true),
+      describeObserved: () => `handler installed: ${escHandler !== undefined}`,
+    });
+    const installedHandler = escHandler;
+    expect(installedHandler).toBeDefined();
     // An arrow key (ESC-prefixed sequence) must NOT cancel — only a lone Esc.
-    expect(escHandler!(`${ESC}[A`)).toBeUndefined(); // not consumed, no abort
+    expect(installedHandler!(`${ESC}[A`)).toBeUndefined(); // not consumed, no abort
     expect(h.abortCalls()).toBe(0); // the arrow sequence did not abort the fork
-    const consumed = escHandler!(ESC); // user presses Esc
+    await h.waitForPromptCalls(1); // bare Esc must cancel a live fork, not pre-start work
+    const consumed = installedHandler!(ESC); // user presses Esc
     expect(consumed).toEqual({ consume: true });
     const out = await pending;
     expect(out.action).toBe("transform");

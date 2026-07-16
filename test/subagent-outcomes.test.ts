@@ -4,6 +4,7 @@ import {
   BackgroundTaskRegistry,
   createTaskOutputTool,
 } from "../src/runtime/background-tasks.js";
+import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import { fakeSdk, makeAgent, makeSubagentRuntime, type FakeSessionState } from "./helpers/fake-sdk.js";
 
 /**
@@ -217,7 +218,7 @@ describe("dispatch outcome classification (t01)", () => {
       depth: 1,
       abortSignal: controller.signal,
     });
-    await new Promise((r) => setTimeout(r, 10)); // let the prompt start and block
+    await h.waitForPromptCalls(1); // prove abort lands on the live gated prompt
     controller.abort();
     const result = await pending;
     expect(result.outcome).toBe("aborted");
@@ -237,11 +238,12 @@ describe("dispatch outcome classification (t01)", () => {
       depth: 1,
       abortSignal: controller.signal,
     });
-    await new Promise((r) => setTimeout(r, 10)); // empty reply consumed, retry blocked
+    await h.waitForPromptCalls(2); // empty reply consumed and the retry is live on its gate
     controller.abort();
     const result = await pending;
     expect(result.outcome).toBe("aborted");
-    expect(h.promptCalls()).toBe(2); // the retry fired, then died aborted
+    expect(h.promptCalls()).toBe(2); // exactly one retry fired, then died aborted
+    expect(h.abortCalls()).toBeGreaterThan(0);
   });
 
   it("a token-limit stop completes WITH a truncation note and diagnostic — never a silent clean truncation", async () => {
@@ -311,8 +313,14 @@ describe("dispatch outcome classification (t01)", () => {
     let releaseGate!: () => void;
     const gate = new Promise<void>((resolve) => (releaseGate = resolve));
     const h = fakeSdk({ replies: [{ text: "slot-holder done", gate }] });
-    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, { concurrency: 1 });
+    const registry = new SubagentRegistry();
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      concurrency: 1,
+      subagentRegistry: registry,
+    });
     const first = runtime.dispatch({ subagentType: "reviewer", prompt: "hold", depth: 1 });
+    await h.waitForPromptCalls(1); // holder owns the only slot while its gate is closed
+
     const controller = new AbortController();
     const second = runtime.dispatch({
       subagentType: "reviewer",
@@ -320,13 +328,18 @@ describe("dispatch outcome classification (t01)", () => {
       depth: 1,
       abortSignal: controller.signal,
     });
-    await new Promise((r) => setTimeout(r, 10)); // second is queued on the semaphore
+    // dispatch() registers synchronously before awaiting the semaphore: this proves
+    // the waiter entered dispatch while still proving it created no session.
+    expect(registry.list()).toHaveLength(2);
+    expect(registry.list().filter((record) => record.session === undefined)).toHaveLength(1);
+    expect(h.created).toHaveLength(1);
     controller.abort();
     releaseGate();
     const [r1, r2] = await Promise.all([first, second]);
     expect(r1.outcome).toBe("completed");
     expect(r2.outcome).toBe("aborted");
-    expect(h.created).toHaveLength(1); // the aborted dispatch never created a session
+    expect(r2.error).toContain("stopped before it started");
+    expect(h.created).toHaveLength(1); // the aborted dispatch never created a session, even after dequeue
   });
 });
 
@@ -378,7 +391,7 @@ describe("Agent tool failure mapping (t01, Claude 2.1.200 semantics)", () => {
     // The Agent tool's execute wires its signal parameter into the dispatch (parent Esc).
     const pending = tool.execute("t", { subagent_type: "reviewer", prompt: "p" }, controller.signal);
     const guarded = pending.catch((err: Error) => err);
-    await new Promise((r) => setTimeout(r, 10));
+    await h.waitForPromptCalls(1); // prove the Agent-tool signal targets a live prompt
     controller.abort();
     const err = await guarded;
     expect(err).toBeInstanceOf(Error);

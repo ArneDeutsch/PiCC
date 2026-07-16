@@ -119,10 +119,11 @@ describe("dispatch usage capture (t06)", () => {
       depth: 1,
       abortSignal: controller.signal,
     });
-    while (h.promptCalls() < 1) await new Promise((r) => setTimeout(r, 0));
+    await h.waitForPromptCalls(1); // ensure partial usage is read from a live session
     controller.abort();
     const result = await pending;
     expect(result.outcome).toBe("aborted");
+    expect(h.abortCalls()).toBeGreaterThan(0);
     expect(result.usage).toEqual(FULL_USAGE);
   });
 });
