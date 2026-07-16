@@ -6,6 +6,27 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — first-attempt cross-tool temp reads on Windows (2026-07-16)
+
+- **A temp file a coordinator writes through the Bash tool on Windows is now readable by a subagent's
+  first `Read`/`Grep`/`Glob` — no more `ENOENT` and drive-wide recovery search.** The pinned Git Bash
+  and the native file tools resolved a bare `/tmp/...` string in different namespaces (shell mount vs.
+  drive-relative `F:\tmp\...`), so a handed-off path pointed at two different real files. The harness
+  now steers temp files onto a per-session native-safe scratchpad whose literal path both namespaces
+  agree on, closing the regression that failed the first live `evaluate` dogfood on Windows (#48).
+  Unix path resolution is unchanged; no path is silently rewritten.
+
+### Added — per-session native-safe scratchpad surface (2026-07-16)
+
+- **Every project now gets a per-session scratch directory whose literal path is injected into the
+  system prompt with an imperative "use this instead of `/tmp`" directive**, mirroring Claude Code's
+  own scratchpad contract (a literal path in the prompt, not an env var, so a skill authored against
+  it stays portable back to Claude Code). The directory is created eagerly at activation
+  (`CLAUDE_CODE_TMPDIR` honored as the relocation knob) and named on all platforms; on the Windows
+  shell↔native namespace split an extra note spells out the quoted `mktemp -p "<scratchpad>"` recipe
+  and warns off bare `/tmp`, `$TEMP`, and `$TMP`. The `evaluate` skill needs no modification — the
+  injected guidance steers it off `/tmp` on its own.
+
 ### Changed — description-based feature naming (2026-07-15)
 
 - **Future `implement-feature` runs use one concise descriptive slug instead of allocating a global

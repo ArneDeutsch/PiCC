@@ -99,9 +99,11 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
 ### `runtime/` — wiring the parsed model into a live Pi session
 - `context-assembly.ts` — builds the system-prompt suffix appended every turn in
   `before_agent_start`: root CLAUDE.md, auto memory, unconditional rules, budgeted skill listing,
-  agent catalog, steering text, and rendered active-skill bodies. Because the system prompt is
-  rebuilt each turn and never compacted away, **this is also the primary compaction-preservation
-  mechanism** (plan §9).
+  agent catalog, steering text, rendered active-skill bodies, and — when a per-session scratch dir
+  was created — a `buildScratchpadSection` block naming the native-safe scratchpad path and steering
+  temp files there instead of `/tmp` (#48; the Windows namespace note is gated on
+  `windowsTempNote`). Because the system prompt is rebuilt each turn and never compacted away,
+  **this is also the primary compaction-preservation mechanism** (plan §9).
 - `subagents.ts` — `SubagentRuntime`: spawns a fresh in-memory Pi session per dispatch (agent body
   as system prompt + CLAUDE.md/rules, **not** the parent conversation — *except* a
   `subagent_type: "fork"` dispatch, which inherits the parent conversation via
@@ -190,7 +192,11 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
 - `markdown.ts` — frontmatter/body splitting with **lenient YAML** (malformed frontmatter degrades
   to `frontmatter={}` + a diagnostic, never throws) and HTML-comment stripping.
 - `env.ts` — `unicodeSafeSubprocessEnv` / `applyUnicodeSafeProcessEnv`: force UTF-8 for spawned
-  interpreters so Windows cp1252 (and `LANG=C`) don't `UnicodeEncodeError` on output like `→`.
+  interpreters so Windows cp1252 (and `LANG=C`) don't `UnicodeEncodeError` on output like `→`. Also
+  hosts `toNativeSafeTempForm(p, platform?)`: a pure helper that converts an absolute path to the
+  forward-slash drive-letter form both the pinned Git Bash and native Node file tools resolve to the
+  same real file on Windows (unchanged on other platforms) — the scratchpad primitive behind the #48
+  fix (see §4).
 
 ## 3. Request / turn data flow
 
@@ -201,7 +207,9 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers:
    `HookMultiplexer` so skill-scoped hooks can be added dynamically), and `SubagentRuntime` are
    constructed. All Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered
    (§4). The guard extension is installed on tool events. Prompt-template stubs are written for each
-   user-invocable skill so it appears in the `/` palette (§4).
+   user-invocable skill so it appears in the `/` palette (§4). An eager per-session native-safe
+   **scratch dir** is also created here (`CLAUDE_CODE_TMPDIR || os.tmpdir()` → `mkdtempSync` →
+   `realpathSync` → `toNativeSafeTempForm`), and its literal path held for injection (#48, §4).
 
 2. **`session_start`.** Captures the model registry and active model (→ steering text), applies the
    config model/effort, self-heals `core.hooksPath` when `.githooks/` exists, fires the
@@ -210,7 +218,9 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers:
 
 3. **`before_agent_start` (every turn).** Appends the `buildSystemPromptSuffix` output to Pi's
    system prompt. This re-asserts the full instruction set each turn — the primary
-   compaction-preservation path.
+   compaction-preservation path. When the eager scratch dir exists, the suffix carries the
+   per-session **scratchpad section** (its literal native-safe path + "use instead of `/tmp`", plus
+   the Windows namespace note when `shellNamespaceDiffersFromNative()`) (#48, §4).
 
 4. **`input`.** In order: intercept PiCC control commands so they never reach the model; fire
    the `UserPromptSubmit` hook (block or inject context); expand `/skill [args]` slash commands by
@@ -348,6 +358,27 @@ principle in the plan (§2.1 mechanical fidelity).
   (`PYTHONIOENCODING`/`PYTHONUTF8`, `LANG`/`LC_ALL` when unset), so a Windows cp1252 default code
   page (or `LANG=C`) doesn't crash a tool that prints Unicode. An explicit project/user `env` value
   always wins (`util/env.ts`).
+
+- **A per-session native-safe scratchpad steers temp files off bare `/tmp` (#48).** On Windows the
+  pinned Git Bash and the native `Read`/`Grep`/`Glob` tools resolve path *strings* in different
+  namespaces: a bare `/tmp/foo` written through the Bash tool is the shell's mount to Git Bash but a
+  drive-relative `F:\tmp\foo` to native Node — the same string, two different real files — so a
+  subagent's first `Read` of a coordinator-written temp file `ENOENT`s and burns context recovering.
+  The harness therefore creates one eager per-session scratch dir
+  (`CLAUDE_CODE_TMPDIR || os.tmpdir()` → `mkdtempSync(".../picc-scratch-")` → `realpathSync` →
+  `toNativeSafeTempForm`, the last converting to the forward-slash drive-letter form both namespaces
+  agree on) and injects its **literal resolved path** into the system prompt every turn with an
+  imperative "always use this instead of `/tmp`" directive — mirroring Claude Code's own scratchpad
+  contract (a literal path in the prompt, never an env var, so a skill authored against it stays
+  portable back to Claude Code). The **recipe** is: redirect/`mktemp -p "<scratchpad>"` **quoted**;
+  never a bare `/tmp/...`; never recompute from `$TEMP`/`$TMP`/`cygpath`. On the Windows namespace
+  split (detected via `shellNamespaceDiffersFromNative()`) an extra note spelling out that recipe is
+  appended — an additive PiCC mitigation Claude does not emit. The **skill-author-facing** contract is
+  this injected prompt guidance (`context-assembly.ts` `buildScratchpadSection`); this doc is the
+  contributor record. There is no path *rewriting* — "approach B" (translating model-chosen
+  `Read`/`Grep`/`Glob` paths) was deliberately rejected as a Claude divergence and a permission-guard
+  risk; the fix is honest steering plus a fixed first consumer, not silent path translation
+  (`util/env.ts`, `engine/shell-inject.ts`, `runtime/context-assembly.ts`, `src/index.ts`).
 
 - **Everything degrades, nothing crashes.** Loaders never throw (malformed YAML → `{}` + diagnostic;
   missing files → `undefined`); the hook runner and worktree manager return error results rather
