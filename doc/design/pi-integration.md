@@ -87,7 +87,7 @@ translated per §3.2, with non-granted tools simply absent; per-agent `model`/`e
 via `modelRegistry`; depth tracked via an env/context counter, capped by settings
 (default `subagents.maxDepth: 1` = **main-session-only**: 0 nesting levels beyond the orchestrator's
 direct subagents = depth 1 total; raise to 2..5 to allow that many levels below the main session —
-`maxDepth: 2` adds one nested generation, up to four at `5`). Return value:
+`maxDepth: 2` reaches depth 2, up to depth 5 at `5`). Return value:
 final assistant message text **verbatim** (no wrapper); on empty/malformed (per caller contract)
 one retry supported by re-prompting.
 

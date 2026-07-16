@@ -104,6 +104,23 @@ Raw material for `review.md`.
   subagents "full support" with no off-by-default note (docs reviewer, out of every
   task's writable surface) — candidate follow-up.
 
+## Phase 8 — close review
+
+- 2026-07-16: All three close reviewers (generalist, claude-parity, user-experience)
+  PASS. generalist verified all 11 ACs delivered+tested and found NO unblocked
+  nesting path at the default. claude-parity's one SHOULD-FIX (pi-integration.md
+  anchor collision: "levels below main" vs "nested generations"/"four") was the
+  off-by-one magnet re-surfacing in the fossil I'd edited — normalized to a single
+  depth anchor ("reaches depth N … up to depth 5 at 5"). UX confirmed recovery is
+  complete for anyone reaching /doctor or the docs.
+- Full suite (incl. e2e) green at close: 1246 passed / 16 skipped / 0 failed.
+- Candidate follow-ups (for review.md / issue-filing offer): (1) startup-notice
+  routing gap; (2) guard-error "2..5" precision when already-raised; (3)
+  picc-plan.md:201 stale "full support" roadmap line; (4) test-infra: replace
+  fixed setTimeout sleeps in offline `picc()` tests with a deterministic wire
+  signal; (5) deferred hardening from #52's own non-goals (maxDepth/concurrency
+  bounded-integer validation, resource ceilings, budgets).
+
 ## Open escalation (raised to user at Phase 6)
 
 - 2026-07-16: **UX discoverability gap.** The default flip is a *silent* behavior
