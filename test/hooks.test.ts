@@ -3,6 +3,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import type { ChildProcess } from "node:child_process";
 import type { AddressInfo } from "node:net";
 import { loadAgents } from "../src/claude/agents.js";
 import { mergeHookConfigs, parseHookConfig } from "../src/claude/hooks.js";
@@ -10,6 +11,8 @@ import { HookRunner, effectiveTimeoutSeconds } from "../src/engine/hook-runner.j
 import { createGuardExtension } from "../src/runtime/guard.js";
 import { PermissionEngine } from "../src/engine/permissions.js";
 import type { HookConfig, HookHandler, HookPayload, ToolCallDescriptor } from "../src/types.js";
+import { waitUntil } from "./helpers/async.js";
+import { createHookProcessFixture } from "./helpers/hook-process.js";
 
 // ---------------------------------------------------------------------------
 // Test scaffolding
@@ -38,6 +41,15 @@ function bashPath(p: string): string {
   return p.replace(/\\/g, "/");
 }
 
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 function makeRunner(
   rawHooks: unknown,
   overrides: {
@@ -49,6 +61,7 @@ function makeRunner(
     pluginDataDirs?: Record<string, string>;
     transcriptPath?: () => string | undefined;
     config?: HookConfig;
+    onSpawnForTest?: (child: ChildProcess) => void;
   } = {},
 ): { runner: HookRunner; projectDir: string } {
   const projectDir = overrides.projectDir ?? makeTempDir();
@@ -62,6 +75,7 @@ function makeRunner(
     ...(overrides.pluginRoots ? { pluginRoots: overrides.pluginRoots } : {}),
     ...(overrides.pluginDataDirs ? { pluginDataDirs: overrides.pluginDataDirs } : {}),
     ...(overrides.transcriptPath ? { transcriptPath: overrides.transcriptPath } : {}),
+    ...(overrides.onSpawnForTest ? { onSpawnForTest: overrides.onSpawnForTest } : {}),
   });
   return { runner, projectDir };
 }
@@ -671,17 +685,62 @@ describe("HookRunner output contract", () => {
     expect(outcome2.diagnostics.filter((d) => d.severity === "warning")).toHaveLength(0);
   });
 
-  it("kills timed-out hooks and continues with a diagnostic", async () => {
-    const { runner } = makeRunner({
-      UserPromptSubmit: [{ hooks: [{ type: "command", command: "sleep 5", timeout: 1 }] }],
-    });
-    const start = Date.now();
-    const outcome = await runner.fire("UserPromptSubmit", {});
-    const elapsed = Date.now() - start;
-    expect(elapsed).toBeLessThan(4500);
-    expect(outcome.block).toBe(false);
-    expect(outcome.diagnostics.some((d) => /timed out/i.test(d.message))).toBe(true);
-  }, 15000);
+  it("kills the immediate timed-out hook process and continues with a diagnostic", async () => {
+    const parent = makeTempDir();
+    const child = createHookProcessFixture(parent);
+    const { runner } = makeRunner(
+      { UserPromptSubmit: [{ hooks: [{
+        type: "command", command: child.command, args: ["timeout", "timeout"], timeout: 1,
+      }] }] },
+      { projectDir: parent, env: child.env, onSpawnForTest: child.onSpawnForTest },
+    );
+    let observedPids: { pid: number; ppid: number } | undefined;
+    const firing = runner.fire("UserPromptSubmit", {});
+    try {
+      await child.waitFor(["timeout.entered"], "timed hook to publish pid evidence");
+      observedPids = JSON.parse(child.read("timeout.entered")) as { pid: number; ppid: number };
+      const outcome = await firing;
+      expect(outcome.block).toBe(false);
+      expect(outcome.diagnostics.some((d) => /timed out/i.test(d.message))).toBe(true);
+
+      const immediate = child.spawnedChildren();
+      expect(immediate).toHaveLength(1);
+      const immediatePid = immediate[0]!.pid;
+      expect(immediatePid).toBe(process.platform === "win32" ? observedPids.ppid : observedPids.pid);
+      // The observed ChildProcess close event, rather than helper publication,
+      // is the authoritative proof that HookRunner's immediate process died.
+      await child.waitForAllClosed("timed-out immediate hook process to close");
+      expect(child.isClosed(immediate[0]!)).toBe(true);
+
+      if (process.platform === "win32") {
+        // Keep the protocol-level tree-kill assertion for the native Node child.
+        await waitUntil({
+          description: `timed-out helper process ${observedPids.pid} to die`,
+          predicate: () => !processIsAlive(observedPids!.pid),
+          describeObserved: () => child.describe(),
+          timeoutMs: 5_000,
+        });
+      }
+      // A HookRunner timeout kill is externally imposed: the helper must not
+      // have reached either cooperative completion or its much-later watchdog.
+      expect(child.exists("timeout.done")).toBe(false);
+      expect(child.exists("timeout.watchdog-expired")).toBe(false);
+      expect(child.exists("post-timeout-side-effect")).toBe(false);
+    } finally {
+      // The spawn observer exists before helper startup, so cleanup remains
+      // complete even if timeout.entered was never published.
+      await child.cleanup("timeout");
+      await firing;
+      if (process.platform === "win32" && observedPids) {
+        await waitUntil({
+          description: "timeout helper cleanup",
+          predicate: () => !processIsAlive(observedPids!.pid),
+          describeObserved: () => `helperPid=${observedPids!.pid}`,
+          timeoutMs: 5_000,
+        });
+      }
+    }
+  }, 20000);
 
   it("degrades prompt/agent/mcp_tool handlers to no-ops with a diagnostic", async () => {
     const { runner } = makeRunner({

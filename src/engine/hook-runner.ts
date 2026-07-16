@@ -88,6 +88,8 @@ export interface HookRunnerOptions {
   pluginDataDirs?: Record<string, string>;
   /** Session transcript file, when the host exposes one (payload `transcript_path`). */
   transcriptPath?: () => string | undefined;
+  /** Test-only observer for the successfully spawned command process. */
+  onSpawnForTest?: (child: ChildProcess) => void;
 }
 
 /**
@@ -456,6 +458,7 @@ export class HookRunner {
         resolve({ kind: "error", message: errText(err) });
         return;
       }
+      this.opts.onSpawnForTest?.(child);
 
       let stdout = "";
       let stderr = "";
