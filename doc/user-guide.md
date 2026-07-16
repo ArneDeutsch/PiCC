@@ -392,12 +392,21 @@ tracked project files):
   }
   ```
 
-  The **collaborative-planning posture** is another such built-in default: PiCC nudges the model,
-  on a substantial planning request, to ground itself in the repo, ask only about goals and
-  material tradeoffs, and avoid jumping straight to "go"/"confirm" — while still implementing
-  decisively once scope is agreed. It is guidance, not enforcement, so its effect is
-  model-dependent. To adjust it, use the same `steering` lever — for example, to tone it back
-  toward terse, minimal-question turns:
+  The **collaborative-planning posture** is another such built-in default, scoped to the **main
+  session** (the coordinator you talk to — dispatched subagents don't get it). On a substantial or
+  open-ended request, PiCC nudges the model to ground itself in the repo and share what it found,
+  ask only about goals and material tradeoffs, surface the real choices and recommend one, verify
+  load-bearing claims by reading the code, and avoid jumping straight to "go"/"confirm" — then
+  switch to implementing decisively once scope is agreed. It also nudges the coordinator to
+  **delegate** context-heavy investigation — a broad sweep across the test suite, reading a whole
+  subsystem, a throwaway multi-step dig — to a dispatched subagent and work from the report/summary
+  it returns, keeping the coordinator's own context free for the overview and your conversation;
+  single-file reads and targeted greps it still does inline itself, rather than over-dispatching
+  trivial work. This does not undercut grounding: the coordinator still grounds (from the returned
+  summary for broad sweeps) and still re-reads the code itself for the load-bearing claims that
+  drive an action. It is guidance, not enforcement, so its effect is model-dependent. To adjust
+  it, use the same `steering` lever — for example, to tone it
+  back toward terse, minimal-question turns:
 
   ```json
   "steering": {

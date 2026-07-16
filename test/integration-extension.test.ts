@@ -79,6 +79,101 @@ describe("tool surface registration", () => {
     }
   });
 
+  it("de-pads the re-registered built-ins: renderShell:'self' with renderers installed (concise-tool-rows t02)", () => {
+    for (const name of ["read", "write", "edit", "bash", "grep", "find", "ls"]) {
+      const tool = pi.tools.get(name);
+      expect(tool, `missing builtin ${name}`).toBeTruthy();
+      expect(tool.renderShell, `${name} not self-shell`).toBe("self");
+      // Renderers sourced from create*ToolDefinition (create*Tool strips them),
+      // then wrapped by the self-shell seam — BOTH must be installed.
+      expect(typeof tool.renderCall, `${name} missing renderCall`).toBe("function");
+      expect(typeof tool.renderResult, `${name} missing renderResult`).toBe("function");
+      // execute stays sourced from create*Tool (byte-identical) — not stripped.
+      expect(typeof tool.execute, `${name} missing execute`).toBe("function");
+    }
+  });
+
+  it("wired edit keeps its diff on a colored band with no top/bottom padding (concise-tool-rows t02)", async () => {
+    // edit's renderResult colors the diff body via Pi's theme singleton (renderDiff),
+    // which the real TUI initializes at startup — do the same here.
+    const { initTheme } = await import("@earendil-works/pi-coding-agent");
+    initTheme();
+    const ESC = String.fromCharCode(27);
+    const BEL = String.fromCharCode(7);
+    // A slot-encoding theme (zero-width under pi-tui's visibleWidth, like a real
+    // theme.bg pair). renderDiff colors the diff body via Pi's OWN theme singleton;
+    // the outer band is our reframe painting through this theme.bg.
+    const slotTheme = {
+      fg: (_c: string, s: string) => s,
+      bold: (s: string) => s,
+      inverse: (s: string) => s,
+      bg: (slot: string, text: string) => `${ESC}]${slot}${BEL}${text}${ESC}[49m`,
+    };
+    // Produce a REAL edit result payload (with details.diff) via the WIRED tool.
+    fs.writeFileSync(path.join(dir, "t02-edit-target.txt"), "alpha\nbeta\ngamma\n");
+    const editArgs = { path: "t02-edit-target.txt", edits: [{ oldText: "beta", newText: "BETAEDITED" }] };
+    const result = await pi.tools.get("edit").execute("t02e", editArgs);
+    expect(result.details.diff, "edit did not produce a diff").toBeTruthy();
+
+    // Run the SHIPPED closure-local wrapper (via pi.tools.get) over the payload.
+    const width = 120;
+    const marker = `${ESC}]toolSuccessBg${BEL}`;
+    const out: string[] = pi.tools
+      .get("edit")
+      .renderResult(
+        result,
+        { expanded: true, isPartial: false },
+        slotTheme,
+        { isPartial: false, isError: false, showImages: false, state: {}, args: editArgs, cwd: dir },
+      )
+      .render(width);
+    expect(out.length).toBeGreaterThan(0);
+    const joined = out.join("\n");
+    // Diff survived the wrap: removed AND added tokens are both present.
+    expect(joined).toContain("beta");
+    expect(joined).toContain("BETAEDITED");
+    // Colored band re-applied per line, single success tone.
+    for (const l of out) expect(l).toContain(marker);
+    // No blank first/last line: reframe stripped the inner Spacer; each edge line
+    // carries real content once the zero-width bg framing is removed.
+    const stripBg = (l: string) => l.split(marker).join("").split(`${ESC}[49m`).join("");
+    expect(stripBg(out[0]!).trim().length).toBeGreaterThan(0);
+    expect(stripBg(out[out.length - 1]!).trim().length).toBeGreaterThan(0);
+  });
+
+  it("de-pads every Claude-named tool row: renderShell:'self' across the registration loop (concise-tool-rows t01)", () => {
+    // A representative set spanning both wrapper cases: own-renderer tools
+    // (Agent/TaskOutput), high-traffic renderer-less tools (TodoWrite/Grep),
+    // SendMessage, and the previously renderer-less TaskStop.
+    for (const name of ["Agent", "Task", "TaskOutput", "TaskStop", "SendMessage", "TodoWrite", "Grep"]) {
+      const tool = pi.tools.get(name);
+      expect(tool, `missing tool ${name}`).toBeTruthy();
+      expect(tool.renderShell, `${name} not self-shell`).toBe("self");
+      // The wrapper always installs BOTH renderers (own or generic fallback).
+      expect(typeof tool.renderCall, `${name} missing renderCall`).toBe("function");
+      expect(typeof tool.renderResult, `${name} missing renderResult`).toBe("function");
+      // execute is preserved (not stripped by the wrapper).
+      expect(typeof tool.execute, `${name} missing execute`).toBe("function");
+    }
+  });
+
+  it("wrapped renderers paint content on a background and keep content (offline integration)", () => {
+    const ESC = String.fromCharCode(27);
+    // A renderer-less tool renders its bold title through the generic fallback,
+    // painted per line via theme.bg — proven by a slot-encoding fake theme.
+    const theme = {
+      fg: (_c: string, s: string) => s,
+      bold: (s: string) => s,
+      bg: (slot: string, text: string) => `${ESC}]${slot}${ESC}\\${text}${ESC}[49m`,
+    };
+    const ctx = { isPartial: false, isError: false, showImages: false };
+    const todo = pi.tools.get("TodoWrite");
+    const callLines = todo.renderCall({}, theme, ctx).render(60);
+    expect(callLines.length).toBe(1);
+    expect(callLines[0]).toContain("TodoWrite"); // content preserved
+    expect(callLines[0]).toContain("toolSuccessBg"); // background re-applied per line
+  });
+
   it("registers the /doctor, /compat, /quota, /skills, /agents control commands", () => {
     for (const name of ["doctor", "compat", "quota", "skills", "agents"]) {
       expect(pi.commands.has(name), `missing command ${name}`).toBe(true);
@@ -565,6 +660,30 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     await exit.execute("w6", { action: "keep" });
     expect(fs.existsSync(a.details.worktreePath)).toBe(true);
     expect(fs.existsSync(b.details.worktreePath)).toBe(true);
+  });
+
+  it("re-registered built-in execute re-resolves the live cwd after a worktree swap (concise-tool-rows t02)", async () => {
+    // Proves the wrap did NOT drop the factory(cwdState.get()) re-resolution: call
+    // a built-in's execute, swap cwdState via EnterWorktree, call again, and observe
+    // the effective directory changed. A dropped re-resolution would keep listing
+    // the old cwd.
+    const ls = pi.tools.get("ls");
+    const before = await ls.execute("t02-ls-a", { path: "." });
+    const beforeText = before.content.map((c: { text?: string }) => c.text ?? "").join("\n");
+    expect(beforeText).not.toContain(".worktree-seeded");
+
+    const entered = await pi.tools.get("EnterWorktree").execute("t02-wt", { name: "it/exec-cwd-swap" });
+    const wt = entered.details.worktreePath as string;
+    try {
+      expect(fs.existsSync(path.join(wt, ".worktree-seeded"))).toBe(true);
+      const after = await ls.execute("t02-ls-b", { path: "." });
+      const afterText = after.content.map((c: { text?: string }) => c.text ?? "").join("\n");
+      // The worktree carries a seeded marker the fixture root does not — the
+      // execute now resolves against the swapped cwd.
+      expect(afterText).toContain(".worktree-seeded");
+    } finally {
+      await pi.tools.get("ExitWorktree").execute("t02-wt-exit", { action: "remove" });
+    }
   });
 });
 

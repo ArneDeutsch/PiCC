@@ -166,17 +166,36 @@ describe("built-in agents through the extension (E1/E2/E6)", () => {
     expect(prompt).not.toContain("BI-ROOT-CLAUDE-MD");
     expect(prompt).not.toContain("BI-UNCOND-RULE");
     expect(prompt).toContain("Claude Code compatibility conventions");
-    // F24: the always-on collaborative-planning nudge reaches subagents too —
-    // even `skipProjectContext` agents (Plan/Explore) keep the conventions block,
-    // so the nudge is present for every model in every dispatch context.
-    expect(prompt).toMatch(/ask only when blocked/);
+    // #69: the `## Working with the user` interaction posture is main-session-only —
+    // dispatched subagents (even `skipProjectContext` ones) keep the mechanical
+    // conventions block but do NOT receive the posture.
+    expect(prompt).not.toContain("Working with the user");
+    // The main-session-only delegation nudge is absent too (keyed on /delegat/i, the
+    // stem unique to the posture bullet — not /subagent/i, which lives in the always-on
+    // conventions block a subagent still receives).
+    expect(prompt).not.toMatch(/delegat/i);
     expect(prompt).toContain("You are a software architect");
+  });
+
+  it("main-session prompt DOES include the interaction posture (#69)", async () => {
+    // Proves index.ts:1046 (before_agent_start) passes includeInteractionPosture: true,
+    // while the :623 subagent call site leaves it unset.
+    const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" }))
+      .systemPrompt as string;
+    expect(prompt).toContain("## Working with the user");
+    // The main-session-only delegation nudge rides along (keyed on /delegat/i).
+    expect(prompt).toMatch(/delegat/i);
   });
 
   it("general-purpose prompt DOES include CLAUDE.md and rules", async () => {
     const prompt = await dispatchAndGetPrompt("general-purpose");
     expect(prompt).toContain("BI-ROOT-CLAUDE-MD");
     expect(prompt).toContain("BI-UNCOND-RULE");
+    // #69: the full-context general-purpose subagent still gets no interaction posture,
+    // so the flag-gating is unambiguous — not attributable to Plan's context-trimming.
+    expect(prompt).not.toContain("Working with the user");
+    // ...and no delegation nudge either — proves it wasn't misplaced in the always-on block.
+    expect(prompt).not.toMatch(/delegat/i);
   });
 
   it("a project agent overriding Explore keeps the full project context (no built-in skipping)", async () => {
