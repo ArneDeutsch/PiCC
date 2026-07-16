@@ -28,6 +28,15 @@
 - 2026-07-16 **Deferred (agreed with maintainer):** the Claude v2.1.208 behavior where a
   `Read` deny also blocks the `Edit` tool on the same path (inverse direction) — file as
   a follow-up ticket at close.
+- 2026-07-16 **CONFLICTING parity finding — file a follow-up, do NOT resolve by assumption.**
+  The t02 claude-parity review claims Claude's permissions docs apply `Read`/`Edit` deny
+  rules to *recognized read commands inside Bash* (`cat`/`head`/`tail`/`sed`); the earlier
+  F26 investigation (and issue #37) said the opposite — a `Read` deny does NOT stop a Bash
+  subprocess, which needs a separate `Bash(...)` deny. Both can't be right. F26 ships
+  neither behavior (Bash is untouched), and the user-guide caveat was scoped to "the
+  built-in read tools" so it's correct regardless — but the actual Claude behavior needs
+  its own verification. Candidate follow-up ticket. Also deferred separately: the
+  v2.1.208 Read→Edit block (inverse direction).
 - 2026-07-16 **Parity depth note:** hook `if: Read(...)` widening is a PiCC-only surface
   (Claude's hook `matcher` is separate); no Claude-parity divergence. `ask: Read(...)`
   also widens but `permissions.ask` is degraded-noop, so it never prompts — docs must not

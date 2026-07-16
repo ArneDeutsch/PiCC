@@ -6,6 +6,17 @@ All notable changes to PiCC are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed — Read denies gate the whole read family (2026-07-16)
+
+- **A `deny: Read(<glob>)` rule now also blocks `Grep`, `Glob`, and `NotebookRead` on a matching
+  path**, not just the `Read` tool — closing a parity/security gap where a denied path stayed fully
+  readable through the other built-in file-read tools. This mirrors Claude Code's best-effort model
+  of applying `Read` rules across its file-reading tools (`Grep`/`Glob` are documented parity;
+  `NotebookRead` is included as inferred defense-in-depth). The expansion is one-directional — a
+  `Grep(<glob>)` rule does not gate `Read` — matching the existing edit-family behavior. Honest
+  limit: matching is on the call's path argument, so a read with no path (or `path: "."`) is not
+  caught; only a bare `deny: Read` (which removes the read tools from context) forecloses that.
+
 ### Changed — description-based feature naming (2026-07-15)
 
 - **Future `implement-feature` runs use one concise descriptive slug instead of allocating a global

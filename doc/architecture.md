@@ -169,6 +169,10 @@ catches load failure and returns quietly (completeness floor, plan §2.2).
   `Edit(…)` permission rule already gates it (the file-edit family); note that it graduated from a
   degraded no-op to a *real writer*, so a project can no longer rely on MultiEdit degrading to a
   no-op as an implicit safety net — its `Edit`/`MultiEdit` deny rules are what hold.
+  Symmetrically, a `Read(…)` permission rule gates the file-**read** family: it expands one-directionally
+  across `Grep`, `Glob`, and `NotebookRead` on a matching path (`Grep`/`Glob` are documented Claude
+  best-effort parity, `NotebookRead` is inferred defense-in-depth), while a `Grep(…)`/`Glob(…)` rule
+  does **not** gate `Read` — the same one-directional shape as `Write` not gating `Edit`.
 
 ### `registry/` — the single source of truth for "what's supported"
 - `capability-registry.ts` — `CAPABILITY_REGISTRY: CapabilityEntry[]` and `CLAUDE_BASELINE`. Every
