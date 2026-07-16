@@ -64,7 +64,7 @@ Two objects matter:
 | Goal | Verdict | Mechanism |
 |---|---|---|
 | Custom framing of **our own** tool call/result | **Easy** | `renderCall`/`renderResult` + `renderShell: "self"` on the `ToolDefinition` |
-| Remove blank lines / gutter around a tool row | **Easy (own tools) · Medium (built-ins) · Impossible (global)** | `renderShell: "self"` bypasses the standard shell; built-ins need re-registration; inter-block spacing is render-loop-internal |
+| Remove blank lines / gutter around a tool row | **Done (all rows, generic wrapper) · Impossible (inter-block)** | `renderShell: "self"` + per-line `theme.bg` re-apply in the self-shell wrapper `src/runtime/tool-shell.ts` (`wrapForSelfShell`), applied at both registration seams (§3.2); inter-block spacing is render-loop-internal |
 | Colors in our own components | **Easy** | `theme.fg("<slot>", text)`, `theme.bg`, `theme.bold/italic/...`, or raw ANSI |
 | Re-skin the whole UI / switch themes | **Medium** | `ctx.ui.setTheme`, `new Theme(...)`, ship theme JSON via `resources_discover` |
 | Add a **new named color role** | **Impossible** | `ThemeColor` union is closed |
@@ -110,21 +110,56 @@ argument **is** Pi's `Theme` (see §4).
 ### 3.2 `renderShell` — this is how you control blank lines and framing
 
 `ToolExecutionComponent` (in `dist/modes/interactive/components/tool-execution.js`) wraps a tool
-row in a standard **colored shell** (`contentBox`) that provides the gutter, padding, and the
-leading/trailing spacing you see around every tool. Setting `renderShell: "self"` swaps that for
-a bare `selfRenderContainer` and hands *all* framing to your component — you emit exactly the
-lines you want, no more, no less (confirmed at `tool-execution.js:181`).
+row in a standard **colored shell** — a `Box(paddingX=1, paddingY=1, bgFn)` that provides the
+1-column gutter (`paddingX`) and the leading/trailing colored blank line (`paddingY` — one blank
+line above **and** below the content) you see around every tool row. Setting `renderShell: "self"`
+swaps that for a bare `selfRenderContainer` and hands *all* framing to your component — you emit
+exactly the lines you want, no more, no less (confirmed at `tool-execution.js:181`). The catch:
+self mode **also drops Pi's colored `Box` entirely** — it renders a plain container, prepends
+exactly one plain `""` inter-block separator, and applies **no background**. So `renderShell: "self"`
+is the only lever that removes the padding, but any row that takes it must re-apply the state
+background itself.
 
-- **To drop the blank lines at the start/end of one of our tools:** give it `renderShell: "self"`
-  and return precisely the lines you want from `render(width)`.
-- **To do the same for a built-in** (`bash`/`read`/`edit`/…): PiCC already re-registers these for
-  cwd-swap (`src/index.ts`, the "Cwd-swapping overrides" block) but currently **inherits** their
-  renderers by omitting `renderCall`/`renderResult`. To take over framing, supply your own
-  renderers + `renderShell: "self"` on the re-registered tool. Cost: you now own that tool's whole
-  display, including diffs/truncation the built-in used to give you for free — only do it if the
-  reskin is worth it.
-- **The blank line Pi inserts *between* transcript blocks is not yours.** That is render-loop
-  layout, not a tool concern. No extension knob changes it. Plan around it.
+PiCC uses this today to de-pad **every** tool row (all Claude-named tools *and* the re-registered
+built-ins). Rather than edit each renderer, a single generic **self-shell wrapper**
+(`src/runtime/tool-shell.ts`, `wrapForSelfShell`) is applied at both tool-registration seams. For
+any tool it sets `renderShell: "self"`, strips the leading/trailing blank lines, keeps the 1-column
+gutter, and **re-applies `theme.bg` per line** — self-render drops the tint deliberately, so PiCC
+paints it back byte-exact with Pi's default `Box` (content clamped to `width - 2*gutter`, then
+gutter + width-fill, painted via the theme's own `bg`). Read `tool-shell.ts` before touching this:
+the reframe step order and the throw-guards on `theme.bg` are load-bearing — self-render is *not*
+wrapped in Pi's try/catch, so an unguarded throw (unknown bg slot, absent theme, a negative
+`repeat`) kills Pi's whole render loop; a headless / no-theme render degrades to plain text.
+
+- **Own tools with a renderer** (Agent / Task / TaskOutput): the wrapper invokes the tool's own
+  `renderCall`/`renderResult`, then reframes the result.
+- **Own tools without a renderer** (all the other Claude-named tools): the wrapper injects a
+  **generic fallback** reproducing Pi's own `createCallFallback` (bold tool title) and
+  `createResultFallback` (`getTextOutput` result text), so a renderer-less tool de-pads without
+  anyone writing a bespoke renderer.
+- **Built-ins** (`bash`/`read`/`edit`/`grep`/`find`/`ls`): **wrapped, not reimplemented.** PiCC
+  re-registers these for cwd-swap (`src/index.ts`, the "Cwd-swapping overrides" block). Their
+  renderers are sourced from the public `create*ToolDefinition` factories — the plain `create*Tool`
+  factory strips `renderCall`/`renderResult` via `wrapToolDefinition` — while **`execute` stays
+  sourced from the plain factory unchanged**, so it is byte-identical (live-cwd re-resolution, bash
+  spawnHook/env, and `read`'s `ctx?.model` non-vision note all preserved). The wrapper reframes
+  those renderers through the same seam, so diffs/truncation/highlighting still come from Pi — PiCC
+  reimplements none of it.
+- **`ctx.lastComponent` threading is the load-bearing coupling.** `ToolExecutionComponent` caches
+  the component we return and hands it back as `ctx.lastComponent` on the next render; the built-ins
+  reuse it for incremental state (`read`/`bash` via `?? new …`, `edit` via an `instanceof Box`
+  reuse). A naive wrap would hand the inner renderer *our* wrapper and silently lose that state
+  (`edit` especially), so the wrapper stashes the inner component (`__inner`) and threads the
+  *previous inner* component back. This couples to Pi's render contract — and is now **pinned**:
+  a contract test drives the real `ToolExecutionComponent` and asserts Pi hands the
+  previously-returned component back as `ctx.lastComponent` on the next render (undefined on the
+  first), for both the `renderCall` and `renderResult` slots (`test/pi-contract.test.ts`,
+  concise-tool-rows t04). PiCC's own threading stays unit-tested; with Pi's side now asserted too,
+  a Pi change here fails loudly in CI instead of degrading incremental rendering silently (see
+  [`pi-integration.md`](pi-integration.md) §4).
+- **The blank line Pi inserts *between* transcript blocks is still not yours.** That is render-loop
+  layout (self mode prepends exactly one), not a tool concern. No extension knob changes it — it is
+  the hard boundary that still separates two adjacent de-padded rows. Plan around it.
 
 ### 3.3 Rules to copy from `subagent-render.ts`
 
@@ -306,8 +341,11 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
   `pi.setModel`, `pi.setThinkingLevel`, `pi.exec`.
 - UI: `ctx.ui.notify` (×2), `ctx.ui.onTerminalInput` (Esc-cancel of forks).
 - The mature rendering example: `src/runtime/subagent-render.ts` (+ `subagent-progress.ts`).
+- Tool-row framing: `renderShell: "self"` + per-line `theme.bg` re-apply via the generic self-shell
+  wrapper `src/runtime/tool-shell.ts` (`wrapForSelfShell`) — de-pads every Claude-named tool and
+  re-registered built-in row (§3.2).
 
-**Untapped but available right now:** `renderShell: "self"`, `pi.registerShortcut`,
+**Untapped but available right now:** `pi.registerShortcut`,
 `ctx.ui.custom`, `ctx.ui.setWidget`, `ctx.ui.setFooter`/`setHeader`, `ctx.ui.setStatus`,
 `ctx.ui.setWorkingIndicator`/`setWorkingMessage`, full `ctx.ui.setTheme`,
 `pi.registerMessageRenderer`, `ctx.ui.addAutocompleteProvider`, `ctx.ui.setTitle`,

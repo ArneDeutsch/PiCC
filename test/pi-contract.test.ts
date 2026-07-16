@@ -60,6 +60,68 @@ describe("pi 0.80.x API contract", () => {
     expect(typeof sdk.AgentSession?.prototype?.getSessionStats).toBe("function");
   });
 
+  it("exposes create*ToolDefinition factories whose renderCall/renderResult are functions (concise-tool-rows t02)", async () => {
+    // The self-shell de-padding of the built-ins sources renderers from these
+    // public Definition factories (create*Tool strips renderers via
+    // wrapToolDefinition). A Pi upgrade that moves/renames them — or drops the
+    // renderer shape the wrap reframes — fails loudly here rather than degrading
+    // the built-in rows silently in the terminal.
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    for (const name of [
+      "createReadToolDefinition",
+      "createWriteToolDefinition",
+      "createEditToolDefinition",
+      "createBashToolDefinition",
+      "createGrepToolDefinition",
+      "createFindToolDefinition",
+      "createLsToolDefinition",
+    ]) {
+      expect(typeof sdk[name], `missing/renamed ${name}`).toBe("function");
+    }
+    // read + edit are the payloads t02's renderers reframe (truncation + diff) —
+    // pin that both expose renderCall/renderResult on a constructed definition.
+    for (const name of ["createReadToolDefinition", "createEditToolDefinition"]) {
+      const def = sdk[name]("/cwd");
+      expect(typeof def.renderCall, `${name}().renderCall`).toBe("function");
+      expect(typeof def.renderResult, `${name}().renderResult`).toBe("function");
+    }
+  });
+
+  it("our getTextOutput reproduction matches Pi's real render-utils.js transform (concise-tool-rows t02)", async () => {
+    // t01 reproduced Pi's getTextOutput locally because the deep path is
+    // exports-blocked by the package name. The concrete file IS importable via an
+    // absolute file:// URL — pin the reproduction against Pi's own so a version
+    // bump that changes the transform (CRLF stripping, image fallbacks) fails
+    // loudly instead of silently diverging.
+    const { getTextOutput: ours } = await import("../src/runtime/tool-shell.js");
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const distIdx = mainUrl.indexOf("/dist/");
+    expect(distIdx, "unexpected Pi dist layout").toBeGreaterThan(0);
+    const realUrl = `${mainUrl.slice(0, distIdx)}/dist/core/tools/render-utils.js`;
+    const real: any = await import(realUrl);
+    expect(typeof real.getTextOutput, "Pi render-utils getTextOutput moved").toBe("function");
+
+    const payloads = [
+      // CRLF-bearing text: every \r must be removed (a bare \r would return the
+      // cursor to col 0 and corrupt the row).
+      { content: [{ type: "text", text: "line-a\r\nline-b\rTAIL" }] },
+      // Image block with no text: the [image …] fallback indicator is appended.
+      { content: [{ type: "image", data: "Zm9v", mimeType: "image/png" }] },
+      // Mixed text + image.
+      {
+        content: [
+          { type: "text", text: "hello\r\nworld" },
+          { type: "image", data: "Zm9v", mimeType: "image/png" },
+        ],
+      },
+    ];
+    for (const showImages of [false, true]) {
+      for (const p of payloads) {
+        expect(ours(p as never, showImages)).toBe(real.getTextOutput(p, showImages));
+      }
+    }
+  });
+
   it("typebox + StringEnum are importable the way our tools use them", async () => {
     const { Type } = await import("typebox");
     const { StringEnum } = await import("@earendil-works/pi-ai");
@@ -97,4 +159,103 @@ describe("pi 0.80.x API contract", () => {
     }
     expect(failed, `Pi type contract broken:\n${output}`).toBe(false);
   }, 30_000);
+});
+
+/**
+ * concise-tool-rows t04: pin Pi's `ctx.lastComponent` threading with a contract
+ * test that drives the REAL, publicly-exported `ToolExecutionComponent`.
+ *
+ * The de-padded built-ins depend on Pi caching the component our wrapper returns
+ * and handing it back as `ctx.lastComponent` on the next render (t02's `__inner`
+ * threading exists precisely to survive this; `edit`'s `instanceof Box`
+ * incremental reuse breaks if the wrong component is threaded). PiCC's OWN
+ * threading is unit-tested against a fake ctx (`test/runtime-core.test.ts`); this
+ * asserts PI's side of the contract, so a Pi upgrade that stops threading the
+ * prior component fails loudly here instead of degrading incremental rendering
+ * silently in the terminal.
+ */
+describe("ToolExecutionComponent threads the prior render component as ctx.lastComponent (concise-tool-rows t04)", () => {
+  it("hands back the previously-returned component (undefined on the first render), for renderCall and renderResult", async () => {
+    const { ToolExecutionComponent, initTheme } = (await import(
+      "@earendil-works/pi-coding-agent"
+    )) as any;
+    // The render loop reads a module-global `theme`; initialize it first so
+    // render()/updateDisplay() don't throw — same pattern as the wired-edit
+    // integration test (test/integration-extension.test.ts).
+    initTheme();
+
+    // For each renderer slot: the lastComponent it was HANDED on each invocation,
+    // and the fresh sentinel it RETURNED (so we can assert identity, not truthiness).
+    const call: { seen: unknown[]; returned: unknown[] } = { seen: [], returned: [] };
+    const result: { seen: unknown[]; returned: unknown[] } = { seen: [], returned: [] };
+
+    // A sentinel Component: a plain `{ render() }` is a valid pi-tui child
+    // (Container.addChild just stores it; render() collects child.render(width)).
+    const sentinel = () => ({ render: () => [] as string[] });
+
+    // Instrumented tool definition. renderShell:"self" mirrors PiCC's real usage
+    // (the built-ins register self-shell), though Pi's caching is shell-independent.
+    const toolDefinition = {
+      name: "PiccLastComponentProbe",
+      renderShell: "self",
+      renderCall: (_args: unknown, _theme: unknown, ctx: { lastComponent: unknown }) => {
+        call.seen.push(ctx.lastComponent);
+        const c = sentinel();
+        call.returned.push(c);
+        return c;
+      },
+      renderResult: (
+        _res: unknown,
+        _opts: unknown,
+        _theme: unknown,
+        ctx: { lastComponent: unknown },
+      ) => {
+        result.seen.push(ctx.lastComponent);
+        const c = sentinel();
+        result.returned.push(c);
+        return c;
+      },
+    };
+
+    // A made-up toolName so `builtInToolDefinition` (createAllToolDefinitions(cwd)
+    // [toolName]) is undefined and ONLY the instrumented definition drives rendering.
+    const component = new ToolExecutionComponent(
+      "PiccLastComponentProbe",
+      "picc-tc-1",
+      { probe: "args-1" },
+      {},
+      toolDefinition,
+      { requestRender() {} },
+      process.cwd().replace(/\\/g, "/"),
+    );
+
+    // The constructor already ran one updateDisplay (renderCall #1; no result yet).
+    // Drive a second call render, then two result renders — each updateDisplay pass
+    // re-invokes the renderers and threads the prior returned component back.
+    const mkResult = (text: string) => ({
+      content: [{ type: "text", text }],
+      details: {},
+      isError: false,
+    });
+    component.updateArgs({ probe: "args-2" }); // renderCall #2
+    component.updateResult(mkResult("out-1"), false); // renderResult #1 (+ renderCall #3)
+    component.updateResult(mkResult("out-2"), false); // renderResult #2 (+ renderCall #4)
+    component.render(80); // exercise the self-shell render path with the sentinels
+
+    // renderCall: 1st render sees `undefined`; the 2nd sees EXACTLY the component
+    // the renderer returned on the 1st render — non-vacuous (identity, not truthy).
+    expect(call.seen.length).toBeGreaterThanOrEqual(2);
+    expect(call.seen[0]).toBeUndefined();
+    expect(call.seen[1]).toBe(call.returned[0]);
+
+    // renderResult is cached in a SEPARATE slot — same contract holds independently.
+    expect(result.seen.length).toBeGreaterThanOrEqual(2);
+    expect(result.seen[0]).toBeUndefined();
+    expect(result.seen[1]).toBe(result.returned[0]);
+
+    // The two slots really are independent caches (call sentinel is never handed
+    // to the result renderer and vice-versa).
+    expect(call.returned[0]).not.toBe(result.returned[0]);
+    expect(result.seen[1]).not.toBe(call.returned[0]);
+  });
 });
