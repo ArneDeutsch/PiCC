@@ -26,7 +26,7 @@ writes and tell the user.
    ```
    Author **two distinct texts** — the audiences differ, so don't post one summary twice. Write each to its own temp file **outside the worktree**, each ending with the `<attribution trailer>`; apply **Rule 6** to both while distilling (no absolute paths, no raw output/diffs, no leakage). Echo both URLs in-session (Rule 7).
 
-   - **PR body — for the reviewer, who verifies the change in the running application.** Agents have already reviewed the code and GitHub's UI already shows the diff, so this is *not* a code tour; it is a semantic verification guide. **First judge whether the change even warrants manual verification** (the same applicability rule `CONTRIBUTING.md` and the PR template state): a change with **no runtime surface to drive** — docs, comments — or one **fully and genuinely covered by automated tests** has nothing left to check by hand; write **"no manual verification needed: `<reason>`"** (naming the covering tests, if that is the reason) rather than inventing a step. For a change with no runnable UI — skill/harness/prose-only — **"the running app" is picc executing the changed behaviour**, so it **is not** exempt: give concrete, ordered steps to invoke that flow (which branch, how to launch picc — e.g. against an `examples/` project — the in-app actions) and the observable outcome to confirm (run the command, watch for the changed message/artifact — or its deliberate absence). Open with the linking line — `Closes #N` if Phase 8 judged the feature to **fully** deliver the ticket, else a bare `#N` (ticket stays open); **only that top line may carry a closing keyword — per Rule 3, strip any stray keyword+`#N` from the distilled "what was built"/verification sections** — then a short "what was built" (mild overlap with the comment is fine), then **"Start your review here"**: concrete, ordered steps to exercise the change and the behaviour to confirm at each step. Skeleton — answer every heading (an empty one reads "None"; never omit a heading):
+   - **PR body — for the reviewer, who verifies the change in the running application.** Agents have already reviewed the code and GitHub's UI already shows the diff, so this is *not* a code tour; it is a semantic verification guide. **First judge whether the change even warrants manual verification** (the same applicability rule `CONTRIBUTING.md` and the PR template state): a change with **no runtime surface to drive** — docs, comments — or one **fully and genuinely covered by automated tests** has nothing left to check by hand; write **"no manual verification needed: `<reason>`"** (naming the covering tests, if that is the reason) rather than inventing a step. For a change with no runnable UI — skill/harness/prose-only — **"the running app" is picc executing the changed behaviour**, so it **is not** exempt: give concrete, ordered steps to invoke that flow — how to obtain the branch, launch picc from the right working directory, and the in-app actions — by following the **launch-and-verify recipe** below, and the observable outcome to confirm (run the command, watch for the changed message/artifact — or its deliberate absence). Open with the linking line — `Closes #N` if Phase 8 judged the feature to **fully** deliver the ticket, else a bare `#N` (ticket stays open); **only that top line may carry a closing keyword — per Rule 3, strip any stray keyword+`#N` from the distilled "what was built"/verification sections** — then a short "what was built" (mild overlap with the comment is fine), then **"Start your review here"**: concrete, ordered steps to exercise the change and the behaviour to confirm at each step. Skeleton — answer every heading (an empty one reads "None"; never omit a heading):
      ```
      Closes #N            (or a bare  #N  when the ticket stays open)
 
@@ -44,6 +44,79 @@ writes and tell the user.
      <deliberate cuts / "Left open" in one line; then typecheck + suite green
      locally, CI green/pending/not-checked>
      ```
+
+     **Launch-and-verify recipe — driving picc on the feature branch.**
+
+     > **COORDINATOR authoring note — do NOT paste into the PR body.** This recipe is the
+     > single source for how a reviewer runs the built change against a live model against
+     > a **runnable picc surface** (skill / agent / `CLAUDE.md` / harness / prose); it
+     > fleshes out the PR body's "Start your review here" steps. It sits **behind the
+     > applicability gate above**: a change with no runtime surface (docs) or one fully
+     > covered by automated tests skips it and writes "no manual verification needed:
+     > `<reason>`" instead. The fork path re-uses this same PR body ([fork.md](fork.md)
+     > Phase 9), so author the recipe **once here** and inherit it there — do not
+     > duplicate it, and keep it out of the outcome-only issue comment below. Because the
+     > fork hand-off pastes the whole PR body inside one outer ` ``` ` fence, **every
+     > command you render stays inline `code`, never a triple-backtick fenced block** — a
+     > nested fence would corrupt the copyable artifact. **Render the numbered steps below
+     > as reviewer-facing prose in the PR body, in your own words, dropping every
+     > authoring aside** — this note, the doc cross-references, and the parentheticals
+     > about which corpus loads — so the third party reading the PR sees only the
+     > verification steps.
+
+     When it applies, the "Start your review here" steps follow this order:
+     1. **Obtain & enter the branch.** `gh pr checkout <PR#>` (clone first if you don't
+        have the repo: `gh repo clone <owner/repo>`) — or, without `gh`,
+        `git fetch origin feature/<feature-slug> && git switch feature/<feature-slug>`.
+        Use these repo-local commands only; never hand out an absolute checkout path (it
+        leaks the OS username — Rule 6).
+     2. **Pick the target by change type — picc runs against the current directory (cwd
+        *is* the project; there is no target-dir argument), so the launch form follows
+        from where you stand.** A **skill / agent / `CLAUDE.md` / prose change**: the
+        modified `.claude/` corpus only loads when it is the
+        *active* project, so run **from the feature checkout root**, which is itself the
+        target — `node ./bin/picc.mjs …`. A **harness / code change** (loaders, `bin/`,
+        `src/`): it surfaces against any project, so drive a fixture — `cd
+        examples/hello-claude`, then `node ../../bin/picc.mjs …` (the launcher path is
+        relative to cwd, hence `../../bin/…` from the fixture). Getting this wrong
+        silently verifies the *wrong* corpus, so match the launch form to the change.
+     3. **Use the checkout's own launcher — not the `picc` on `PATH`.** A bare `picc`
+        (from `npm link`) resolves to the installed/main checkout, not this branch, so it
+        would verify the *old* behaviour. Always invoke the feature checkout's own
+        `node ./bin/picc.mjs`.
+     4. **Setup (once per fresh checkout).** Node ≥ 22.19; run `npm install
+        --ignore-scripts` at the checkout root (where `package.json` is), **not** the
+        fixture you may have `cd`'d into in step 2. There is **no build step** — picc runs
+        straight from the TypeScript source. If setup was skipped you'll see `could not
+        find the Pi CLI (@earendil-works/pi-coding-agent)`; the fix is that `npm install`.
+     5. **Launch (same in PowerShell, cmd, and bash).** `node ./bin/picc.mjs --model
+        openai-codex/gpt-5.5` (other valid ids: `gpt-5.4`, `gpt-5.6-sol`). Route the
+        model through the `openai-codex` provider as shown — a bare `openai/<id>`
+        selector fails with "No API key found for openai". The relative forward-slash
+        command is byte-identical on Windows PowerShell, cmd, macOS, and Linux. Windows
+        differs in **one prerequisite only**: Git Bash must be installed (Pi's `bash`
+        tool and project scripts need it). The PowerShell execution-policy prompt applies
+        to the npm-link `picc` PowerShell (`.ps1`) shim — which this `node
+        ./bin/picc.mjs` launch form does not use, so it's **not applicable here** (don't
+        set `RemoteSigned`).
+     6. **First-run auth — in-app, after launch.** At the picc prompt run `/login`,
+        choose "ChatGPT Plus/Pro (Codex Subscription)", and complete the browser OAuth.
+        This is a one-time step *inside* the session (not a shell step before launch);
+        the credential persists to your home `~/.pi/agent/auth.json` (user-global, not
+        per-repo), so later launches skip it.
+     7. **Drive & confirm.** Then run the change-specific ordered action →
+        observable-outcome steps of "Start your review here": trigger each action and
+        watch for the changed message/artifact (or its deliberate absence). The recipe is
+        the preamble that gets a live model running on the right branch — it does **not**
+        replace those steps.
+     8. **Route feedback back — reuse the existing machinery; the human decides the
+        bucket.** A gap in *this* feature's promised behaviour (in scope) means it is
+        **not done**: hold the merge and add a new task to the current plan — the kept
+        worktree still holds the plan folder — an ordinary Phase 7/8 review round. A
+        pre-existing bug or an adjacent improvement (out of scope) routes through the
+        existing **Phase 8 issue-filing offer** (per-item consent). Don't invent a
+        parallel channel; the Phase 9 final-summary next-steps is the home for acting
+        on either.
    - **Issue comment — for the ticket's readers, explaining the outcome.** Post it with `gh issue comment <N> --repo <owner/repo> --body-file <path>` (per **Rule 9** skip if a prior machine-trailered comment is already on the ticket). Explain **what was built and how the application's behaviour changes**, written against the ticket's description and naming any **differences or extensions** to the original ask. Keep it user-facing: no "start-your-review"/risky-file content (that lives in the PR), and **don't restate the PR link** — GitHub already surfaces the PR on the ticket timeline via the linking line, so a repeated link is exactly the redundancy this split removes. Skeleton — answer every heading (an empty one reads "None"; never omit a heading):
      ```
      ## What was built for #N
@@ -68,7 +141,7 @@ writes and tell the user.
    - **Ticketless path:** print the stable copyable PR title `<Title>` on its own line; review the branch, open a Pull Request on GitHub (or merge locally if no remote) with that title, use "Delete branch" there after merging, and clean up locally afterwards with:
      - `git worktree remove <worktree-path>`
      - `git branch -d feature/<feature-slug>` (plus the harness-created `worktree-*` branch for that worktree, if one lingers)
-   - **Ticket path:** the ready-for-review PR is **already open** (link it) and the ticket carries the single hand-off comment — review the PR by verifying the change in the running app (the PR body's "Start your review here" walks you through it), merge it via GitHub's PR UI, use "Delete branch" there after merging, and clean up locally afterwards with the same two commands above.
+   - **Ticket path:** the ready-for-review PR is **already open** (link it) and the ticket carries the single hand-off comment — review the PR by verifying the change in the running app (the PR body's "Start your review here" walks you through it via the launch-and-verify recipe; if it surfaces something, route it per that recipe's feedback step — in-scope → hold the merge and add a task, out-of-scope → the Phase 8 issue offer), merge it via GitHub's PR UI, use "Delete branch" there after merging, and clean up locally afterwards with the same two commands above.
 
 The explicit no-`gh` git-only degrade alone reserves literal `origin` for its `git fetch origin`, `origin/<default>`, and `git push -u origin feature/<feature-slug>` guidance; all resolved maintainer operations above use `<pushRemote>`.
 

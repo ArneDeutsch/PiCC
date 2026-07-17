@@ -204,7 +204,9 @@ the body until the rules are available** — do not distill a body with the rule
      scope (Rule 4), with no identifier prefix.
    - The PR **body** in a fenced code block, byte-exact — authored from [handoff.md](handoff.md)'s
      **PR-body skeleton** (answer every heading; "Start your review here" is a semantic verification
-     guide, not a code tour). Inside that body's steps use **inline `code`, never a triple-backtick
+     guide, not a code tour) — this inherits handoff.md's single-source launch-and-verify recipe
+     (obtain the branch, `node ./bin/picc.mjs --model openai-codex/<id>`, drive-and-confirm); do not
+     re-author it here. Inside that body's steps use **inline `code`, never a triple-backtick
      fenced block** — a nested fence would terminate the outer code fence and corrupt the copyable
      artifact. Include the linking line (step 5) and end with the `<attribution trailer>` (Rule 8).
    - **Ordered steps:** open the compare link → paste the title → paste the body → submit. Note that

@@ -216,7 +216,8 @@ PR body will close it (`Closes #N`); if it only **partly** does, the PR referenc
 (the ticket stays open) and you name the remaining scope. **Bias to keep-open when uncertain** — a
 wrongly-open ticket is a one-click fix, a wrongly-closed one silently drops scope. Then **show the two
 actual texts you intend to post — the PR body and the issue comment.** They differ in audience: the PR
-body guides the reviewer through verifying the change in the running app; the issue comment explains,
+body guides the reviewer through verifying the change in the running app (carrying handoff.md's
+launch-and-verify recipe); the issue comment explains,
 for the ticket's readers, what was built and how behaviour changes against the original ask. Both go
 public under the user's identity, so get explicit confirmation before any Phase 9 write. Author that
 preview from the material that exists now — `observations.md` and the task logs (`review.md`, written
