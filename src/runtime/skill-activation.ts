@@ -29,12 +29,12 @@ export function skillActivationVars(opts: {
 }
 
 /**
- * The skill activation pipeline (plan §4.1): lazy body load → argument substitution →
+ * The skill activation pipeline: lazy body load → argument substitution →
  * ${CLAUDE_*} variable substitution → !`cmd` shell-injection preprocessing.
  * Used by the Skill tool, slash commands, and context:fork dispatch alike.
  * `allowedTools`/`disallowedTools` are per-activation copies with the same
- * variable + argument substitution applied (audit A3); the skill object itself
- * is never mutated.
+ * variable + argument substitution applied; the skill object itself is never
+ * mutated.
  */
 export async function renderSkillForActivation(opts: {
   skill: ClaudeSkill;
@@ -113,8 +113,8 @@ export const REINJECT_PER_SKILL_MAX_CHARS = 20_000;
 export const REINJECT_COMBINED_MAX_CHARS = 100_000;
 
 /**
- * Budget the post-compaction re-injection of active skill bodies (audit A9) —
- * also reused for the resident "Active skills" system-prompt section (G7):
+ * Budget the post-compaction re-injection of active skill bodies — also reused
+ * for the resident "Active skills" system-prompt section:
  * most recently activated skills first, each body capped at ~5k tokens with a
  * `[truncated for compaction]` marker, the combined payload capped at ~25k
  * tokens. Skills that no longer fit are dropped and reported via `dropped`

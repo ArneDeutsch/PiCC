@@ -6,7 +6,7 @@ import type { Diagnostic, WorktreeSettings } from "../types.js";
 import { isDirectory, readTextSafe } from "../util/fs.js";
 
 /**
- * Git worktree mechanics for EnterWorktree / ExitWorktree (plan §4.4, §12.3).
+ * Git worktree mechanics for EnterWorktree / ExitWorktree.
  *
  * Layout & grammar (Claude Code compatible):
  * - Worktree dir:   <projectRoot>/.claude/worktrees/<flat-name>/
@@ -220,8 +220,8 @@ export class WorktreeManager {
 
       // HARD CONTAINMENT: destructive removal only ever runs on dirs strictly
       // inside <root>/.claude/worktrees/ — never the main working tree, never
-      // an arbitrary/nested-repo path (§2.2: must never corrupt state). Refuse
-      // before any mutation (no unlock, no reparse-point stripping, no rmSync).
+      // an arbitrary/nested-repo path. Refuse before any mutation (no unlock,
+      // no reparse-point stripping, no rmSync).
       if (opts.action === "remove" && !this.isManagedWorktreePath(dir)) {
         const error = `ExitWorktree: refusing to remove ${dir} — it is not inside ${this.worktreesRoot()}`;
         diagnostics.push(diag("error", error));
@@ -402,7 +402,8 @@ export class WorktreeManager {
       }
     }
 
-    // Resolve the base commit FIRST (plan §4.4 / claude-code issue #60588).
+    // Resolve the base commit to a concrete SHA BEFORE `git worktree add` —
+    // worktree base-commit resolution, claude-code issue #60588.
     const baseCommit = await this.resolveBaseCommit(diagnostics);
     if (baseCommit === undefined) {
       const error = "EnterWorktree: could not resolve a base commit (repo has no commits?)";
@@ -570,7 +571,7 @@ export class WorktreeManager {
   /**
    * Ensure `.claude/worktrees/` is gitignored. If not (per `git check-ignore`,
    * which sees .gitignore and info/exclude), append to `.git/info/exclude` —
-   * harness-owned, never touches tracked files (plan §2.3).
+   * harness-owned, never touches tracked files.
    */
   private async ensureWorktreesIgnored(diagnostics: Diagnostic[]): Promise<void> {
     const probe = ".claude/worktrees/__picc_probe__";
@@ -651,7 +652,7 @@ export class WorktreeManager {
       }
       for (const entry of entries) {
         // node_modules is never a seeding source; walking it costs O(10^5) fs
-        // entries per worktree creation (plan §12.2: bounded creation latency).
+        // entries per worktree creation, and creation latency must stay bounded.
         if (entry.name === ".git" || entry.name === "node_modules") continue;
         const childRel = rel === "" ? entry.name : `${rel}/${entry.name}`;
         if (childRel === ".claude/worktrees") continue;
@@ -695,7 +696,7 @@ export class WorktreeManager {
   /**
    * Windows: unlink any junction/symlink directory entry at any depth inside
    * the tree (as a LINK, never following it), so recursive removal cannot
-   * escape into the link target (research §d).
+   * escape into the link target.
    */
   private stripReparsePoints(root: string, diagnostics: Diagnostic[]): void {
     const stack: string[] = [root];

@@ -8,7 +8,7 @@ import {
 } from "@earendil-works/pi-tui";
 
 // ---------------------------------------------------------------------------
-// concise-tool-rows t01 — the single self-shell seam.
+// The single self-shell seam.
 //
 // Pi's default tool shell wraps each row in a Box(paddingX=1, paddingY=1, bgFn):
 // paddingY=1 is the colored blank line above AND below the content this feature
@@ -290,7 +290,7 @@ function sanitizeBinaryOutput(str: string): string {
 
 /**
  * Mirror of Pi's `render-utils.js` `getTextOutput(result, showImages)`. Exported
- * so the Pi-contract smoke test (t02) can pin this reproduction against Pi's own
+ * so the Pi-contract smoke test can pin this reproduction against Pi's own
  * `getTextOutput` (imported via an absolute `file://` URL, the deep path being
  * `exports`-blocked) — a Pi version bump that changes the transform fails loudly.
  */
