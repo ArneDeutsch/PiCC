@@ -137,7 +137,13 @@ describe("description-based naming contract", () => {
     expect(body).toContain("identity finalized and immutable");
   });
 
-  it("keeps the resident router on the same descriptive identity and presentation gate", () => {
+  it("keeps the resident identity floor in the router (gate/announcement detail lives in workflow-detail.md)", () => {
+    // Residency contract: the trunk keeps only the
+    // always-resident identity kernels — resume classification, the task commit subject, fail-closed
+    // slug validation, the resume confirmation gate, the race-deletion warning, and the repush
+    // confirmation. The presentation-gate and announcement-field detail is deliberately
+    // load-on-demand in references/workflow-detail.md, pinned by the "hard pre-tool presentation
+    // gate" test below — do not re-pin that prose against the trunk.
     const body = collapsed("SKILL.md");
     expect(body).toContain("classify resume before new naming");
     expect(body).toContain("<feature-slug>: t<task-number> — <description>");
@@ -145,21 +151,6 @@ describe("description-based naming contract", () => {
     expect(body).toContain("explicit human confirmation");
     expect(body).toContain("may delete a raced unregistered directory");
     expect(body).toContain("confirmed self-owned fast-forward repush");
-    for (const marker of [
-      "hard presentation gate", "immediately after build go", "first read the required phase 2 references",
-      "reference reads are the only tool calls allowed before the announcement",
-      "before every workspace/preflight/mutating command", "before `enterworktree`",
-      "emit user-visible prose", "never leave it in hidden reasoning", "may share the response with later tool calls",
-      "requires no reply",
-    ]) expect(body).toContain(marker);
-    expect(body).not.toContain("before the first phase 2 tool call");
-    const ordered = [
-      "`title: <title>`", "`slug: <feature-slug>`", "`branch: feature/<feature-slug>`",
-      "`plan: doc/plan/<feature-slug>/`", "`race disclosure:`",
-    ];
-    for (let index = 0; index < ordered.length - 1; index += 1) {
-      expectBefore(body, ordered[index]!, ordered[index + 1]!);
-    }
     expect(body).not.toMatch(/next free|pick the next free|feature\/<nn>|f<nn>/i);
   });
 
