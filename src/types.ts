@@ -1,7 +1,7 @@
 /**
  * Shared types for all PiCC subsystems.
  *
- * Terminology follows the plan (doc/picc-plan.md):
+ * Terminology:
  * - "artifact": any Claude-format input (skill, agent, rule, CLAUDE.md, settings, hook, plugin content)
  * - "scope": where an artifact was discovered; precedence flows managed > local > project > user.
  */
@@ -50,7 +50,7 @@ export interface ParsedMarkdown {
 }
 
 // ---------------------------------------------------------------------------
-// Skills (§4.1)
+// Skills
 // ---------------------------------------------------------------------------
 
 export interface SkillArgumentSpec {
@@ -96,7 +96,7 @@ export interface ClaudeSkill {
 }
 
 // ---------------------------------------------------------------------------
-// Agents (§4.3)
+// Agents
 // ---------------------------------------------------------------------------
 
 export interface ClaudeAgent {
@@ -115,12 +115,12 @@ export interface ClaudeAgent {
   isolation?: "worktree";
   /**
    * `background: true` (Claude Code 2.1.198): forces the dispatch to run in the
-   * background even when the Agent tool call omits `run_in_background` (t05).
+   * background even when the Agent tool call omits `run_in_background`.
    */
   background?: boolean;
   initialPrompt?: string;
   metadata: Record<string, unknown>;
-  /** Parsed but deferred (§7): memory, mcpServers, hooks. */
+  /** Parsed but deferred: memory, mcpServers, hooks. */
   memory?: unknown;
   mcpServers?: unknown;
   hooks?: HookConfig;
@@ -131,7 +131,7 @@ export interface ClaudeAgent {
   builtin?: boolean;
   /**
    * Skip CLAUDE.md/project-instructions and rules in the subagent system prompt
-   * (Claude's Explore/Plan context trimming — audit E6).
+   * (Claude's Explore/Plan context trimming).
    */
   skipProjectContext?: boolean;
   unknownKeys: string[];
@@ -139,7 +139,7 @@ export interface ClaudeAgent {
 }
 
 // ---------------------------------------------------------------------------
-// Rules (§4.2)
+// Rules
 // ---------------------------------------------------------------------------
 
 export interface ClaudeRule {
@@ -154,7 +154,7 @@ export interface ClaudeRule {
 }
 
 // ---------------------------------------------------------------------------
-// CLAUDE.md (§4.6)
+// CLAUDE.md
 // ---------------------------------------------------------------------------
 
 export interface ClaudeMdFile {
@@ -171,7 +171,7 @@ export interface ClaudeMdFile {
 }
 
 // ---------------------------------------------------------------------------
-// Hooks (§4.5)
+// Hooks
 // ---------------------------------------------------------------------------
 
 export const SUPPORTED_HOOK_EVENTS = [
@@ -244,7 +244,7 @@ export interface HookOutcome {
   /** Hard block (exit 2 or permissionDecision deny). */
   block: boolean;
   blockReason?: string;
-  /** ask decisions are logged-allowed per posture §6.1 but surfaced. */
+  /** ask decisions are logged-allowed by PiCC's single default-permissive posture, but surfaced. */
   askDowngraded: boolean;
   /** Context to inject into the model. */
   additionalContext?: string;
@@ -258,7 +258,7 @@ export interface HookOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// Settings (§5)
+// Settings
 // ---------------------------------------------------------------------------
 
 export interface PermissionRules {
@@ -287,7 +287,7 @@ export interface ClaudeSettings {
   skillListingMaxDescChars?: number;
   skillOverrides: Record<string, unknown>;
   claudeMdExcludes: string[];
-  /** Auto memory read side (B4): default true; env CLAUDE_CODE_DISABLE_AUTO_MEMORY overrides. */
+  /** Auto memory read side: default true; env CLAUDE_CODE_DISABLE_AUTO_MEMORY overrides. */
   autoMemoryEnabled?: boolean;
   /** Overrides the default `<userDir>/projects/<flattened>/memory` auto-memory directory. */
   autoMemoryDirectory?: string;
@@ -309,7 +309,7 @@ export interface ClaudeSettings {
 }
 
 // ---------------------------------------------------------------------------
-// Permission matching (§6)
+// Permission matching
 // ---------------------------------------------------------------------------
 
 export interface PermissionRule {
@@ -331,7 +331,7 @@ export interface ToolCallDescriptor {
 }
 
 // ---------------------------------------------------------------------------
-// Capability registry (§17)
+// Capability registry
 // ---------------------------------------------------------------------------
 
 export type SupportTier =

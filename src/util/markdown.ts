@@ -7,7 +7,7 @@ import type { Diagnostic, ParsedMarkdown } from "../types.js";
  * Rules (Claude Code compatible):
  * - Frontmatter must start at the very first line with `---` and end at the next `---` line.
  * - Malformed YAML never throws: the file degrades to frontmatter={} with a warning
- *   diagnostic and the whole content as body (completeness floor, plan §2.2).
+ *   diagnostic and the whole content as body (completeness floor).
  * - CRLF tolerated.
  */
 export function parseMarkdown(content: string, sourcePath?: string): ParsedMarkdown {

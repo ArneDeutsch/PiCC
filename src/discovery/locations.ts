@@ -3,7 +3,7 @@ import { findRepoRoot, isDirectory } from "../util/fs.js";
 import type { Scope, SourceRef } from "../types.js";
 
 /**
- * Artifact location resolution (plan §3): where skills/agents/rules/commands live,
+ * Artifact location resolution: where skills/agents/rules/commands live,
  * with the monorepo walk-up (cwd → repo root, nearest first) and user-scope dirs.
  */
 
@@ -34,9 +34,9 @@ function samePath(a: string, b: string): boolean {
 }
 
 /**
- * Default managed/policy artifact base directories (research doc §4.1). Mirrors
- * the managed settings locations in settings.ts; degrade-silent when absent.
- * Also the base for the managed CLAUDE.md (audit B3, claude-md.ts).
+ * Default managed/policy artifact base directories. Mirrors the managed settings
+ * locations in settings.ts; degrade-silent when absent. Also the base for the
+ * managed CLAUDE.md (claude-md.ts).
  */
 export function defaultManagedDirs(): string[] {
   if (process.platform === "win32") {
@@ -56,7 +56,7 @@ export function defaultManagedDirs(): string[] {
  * (`<userDir>/skills` etc.) come last. Only existing directories are returned.
  *
  * Rules are guidance text, not name-deduped artifacts, so `ruleDirs` is ordered
- * by ASCENDING priority instead (audit B6): user first (lowest — appears
+ * by ASCENDING priority instead: user first (lowest — appears
  * furthest from the end of the prompt), then project root→cwd, then managed
  * LAST so managed text lands closest and wins on conflicts.
  */
@@ -104,7 +104,7 @@ export function discoverArtifactDirs(opts: {
   // User scope, lowest precedence of the discovered set.
   push(userBase, "user");
 
-  // Rules: ascending priority — user, project root→cwd, managed last (B6).
+  // Rules: ascending priority — user, project root→cwd, managed last.
   addIf(result.ruleDirs, userBase, "rules", "user");
   for (let i = projectClaudeDirs.length - 1; i >= 0; i--) {
     addIf(result.ruleDirs, projectClaudeDirs[i]!, "rules", "project");

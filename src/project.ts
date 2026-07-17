@@ -17,7 +17,7 @@ import {
 } from "./claude/plugins.js";
 
 /**
- * Assemble the full Claude-artifact model of a project (plan §3): settings with
+ * Assemble the full Claude-artifact model of a project: settings with
  * precedence, skills, agents, rules, CLAUDE.md hierarchy, and installed-plugin
  * content folded into the same registries.
  */
@@ -26,7 +26,7 @@ export interface LoadedProject extends ClaudeProject {
   mergedHooks: HookConfig;
   plugins: InstalledPlugin[];
   pluginRoots: Record<string, string>;
-  /** Auto memory (audit B4): dir + truncated MEMORY.md; undefined when disabled. */
+  /** Auto memory: dir + truncated MEMORY.md; undefined when disabled. */
   autoMemory?: MemorySnapshot;
 }
 
@@ -56,7 +56,6 @@ export function loadClaudeProject(opts: {
     managedDirs: opts.managedArtifactDirs,
   });
 
-  // Plugins: user-installed + project-bundled.
   const pluginResult = discoverInstalledPlugins({
     userDir,
     enabledPlugins: settings.enabledPlugins,
@@ -73,8 +72,8 @@ export function loadClaudeProject(opts: {
 
   // Skills & commands (project/user scope first, then plugin content; first-wins
   // dedupe). Plugin content is namespaced `<plugin>:<name>` exactly like Claude
-  // Code (research doc §1.5/§1.6: plugin skills "never collide"), so a plugin
-  // skill is never silently shadowed by a same-named project/user skill.
+  // Code, whose plugin skills never collide — so a plugin skill is never
+  // silently shadowed by a same-named project/user skill.
   const skillsResult = loadSkills(dirs.skillDirs, dirs.commandDirs);
   diagnostics.push(...skillsResult.diagnostics);
   let skills = skillsResult.skills;
@@ -88,7 +87,6 @@ export function loadClaudeProject(opts: {
     skills = dedupeByName([...skills, ...namespacePluginContent(pluginSkills.skills, plugin.name)]);
   }
 
-  // Agents (plugin agents get the same `<plugin>:<name>` scoped ids, research doc §2.3).
   const agentsResult = loadAgents(dirs.agentDirs);
   diagnostics.push(...agentsResult.diagnostics);
   let agents = agentsResult.agents;
@@ -101,17 +99,15 @@ export function loadClaudeProject(opts: {
     agents = dedupeByName([...agents, ...namespacePluginContent(pluginAgents.agents, plugin.name)]);
   }
 
-  // skillOverrides (settings, any scope): per-skill disable/downgrade.
   skills = applySkillOverrides(skills, settings.skillOverrides, diagnostics);
 
-  // Rules.
   const rulesResult = loadRules(dirs.ruleDirs, {
     excludes: settings.claudeMdExcludes,
     projectRoot: root,
   });
   diagnostics.push(...rulesResult.diagnostics);
 
-  // CLAUDE.md hierarchy (managed CLAUDE.md + inline managed `claudeMd` first — B3).
+  // CLAUDE.md hierarchy (managed CLAUDE.md + inline managed `claudeMd` first).
   const claudeMdResult = loadClaudeMdHierarchy({
     cwd,
     projectRoot: root,
@@ -122,10 +118,9 @@ export function loadClaudeProject(opts: {
   });
   diagnostics.push(...claudeMdResult.diagnostics);
 
-  // Auto memory, read side (B4): undefined when disabled by setting or env.
+  // Auto memory, read side: undefined when disabled by setting or env.
   const autoMemory = loadAutoMemory(root, userDir, settings);
 
-  // Hooks: settings hooks + plugin hooks.
   const hookConfigs: HookConfig[] = [settings.hooks];
   for (const plugin of plugins) {
     const rawHooks = loadPluginHooks(plugin);
@@ -156,8 +151,8 @@ export function loadClaudeProject(opts: {
 
 /**
  * Claude Code namespaces plugin skills/agents/commands as `plugin-name:name`
- * (research doc §1.6 "Plugin `my-plugin/skills/review/` → `/my-plugin:review`").
- * The bare name stays reachable via {@link findByName} when unambiguous.
+ * (`my-plugin/skills/review/` → `/my-plugin:review`). The bare name stays
+ * reachable via {@link findByName} when unambiguous.
  */
 function namespacePluginContent<T extends { name: string }>(items: T[], pluginName: string): T[] {
   return items.map((item) =>
@@ -178,7 +173,7 @@ export function findByName<T extends { name: string }>(items: T[], name: string)
 }
 
 /**
- * Apply the settings `skillOverrides` map (research doc §1.7): per skill name,
+ * Apply the settings `skillOverrides` map: per skill name,
  * `"off"` removes the skill, `"user-invocable-only"` hides it from the model
  * listing, `"name-only"` lists it without a description, `"on"` is a no-op.
  * Unknown values degrade to a diagnostic (never throw).
