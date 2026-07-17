@@ -26,7 +26,7 @@ export interface GuardDeps {
   label?: string;
 }
 
-// Pi event payloads are typed loosely here; the pinned shapes are in doc/design/pi-integration.md.
+// Pi event payloads are typed loosely here; the pinned shapes are in doc/pi-integration.md.
 type PiApi = {
   on(event: string, handler: (event: any, ctx: any) => unknown): void;
   sendMessage(message: Record<string, unknown>, options?: Record<string, unknown>): void;

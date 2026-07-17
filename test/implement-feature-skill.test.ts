@@ -297,10 +297,19 @@ describe("description-based naming contract", () => {
     expect(contributing).not.toMatch(/git checkout feature\/<nn>-<slug>/i);
   });
 
-  it("gitignores the per-feature process folders but not doc/design", () => {
+  it("gitignores the per-feature process folders and nothing else under doc/", () => {
     const gitignore = fs.readFileSync(path.resolve(SKILL_DIR, "../../../.gitignore"), "utf8").replace(/\r\n/g, "\n");
-    for (const entry of ["doc/plan/", "doc/research/", "doc/review/"]) expect(gitignore).toContain(entry);
-    expect(gitignore).not.toContain("doc/design/");
+    const processFolders = ["doc/plan/", "doc/research/", "doc/review/"];
+    for (const entry of processFolders) expect(gitignore).toContain(entry);
+    // Everything else under doc/ is committed documentation. Assert the ignore list
+    // reaches no further than the three process folders — a broader pattern would
+    // untrack the docs silently, which is how this used to be checked one folder at
+    // a time.
+    const docEntries = gitignore
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith("#") && line.includes("doc/"));
+    expect(docEntries.sort()).toEqual([...processFolders].sort());
   });
 
   it("no longer ships a CHANGELOG.md at the repo root", () => {
