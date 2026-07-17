@@ -9,10 +9,11 @@
 
 ## Automated checks
 
-- [ ] `npm run typecheck` is green
-- [ ] `npm test` is green
+- [ ] `npm run typecheck` is green locally
+- [ ] `npm test` is green locally
 
-CI runs the same across Windows/Linux on Node 22 and 24.
+CI runs the two lanes separately across Windows/Linux: `test:unit` on Node 22 and 24, `test:e2e`
+on Node 22.
 
 ## Manual verification guidance
 

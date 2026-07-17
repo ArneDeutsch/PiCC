@@ -38,6 +38,9 @@ npm run typecheck   # strict TypeScript, no emit
 npm run test:unit   # the fast lane — also what the pre-commit hook runs
 ```
 
+[`doc/architecture.md`](doc/architecture.md) is the map of `src/` — the layering, what each module
+owns, and where new code belongs. Read it before changing the harness.
+
 [`doc/testing.md`](doc/testing.md) is the reference for the test lanes and what each one covers,
 the three-layer strategy, and how to add an end-to-end scenario. Tests must pass on Windows and
 Linux; guard OS/dependency-specific behavior with `it.skipIf`.
@@ -112,6 +115,11 @@ Deliberately out of scope — each for a reason, not from neglect:
   install them.
 - **Fan-out / subscription economics.** How much parallelism a subscription tolerates is the
   project author's concern, not the harness's.
+- **Console UX parity — recognizable, not identical.** We render the Claude-specific concepts that
+  matter (subagent dispatch and output, skill activation, tool calls) so switching between Claude
+  Code and PiCC has low friction, but we do not chase a 1:1 rebuild of Claude Code's console. We
+  inherit and extend Pi's TUI rather than fight or replace it. UX parity is an open-ended sink;
+  bounding it as best-effort keeps it from consuming the project.
 
 ## Pull requests
 

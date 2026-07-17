@@ -64,7 +64,7 @@ Two objects matter:
 | Goal | Verdict | Mechanism |
 |---|---|---|
 | Custom framing of **our own** tool call/result | **Easy** | `renderCall`/`renderResult` + `renderShell: "self"` on the `ToolDefinition` |
-| Remove blank lines / gutter around a tool row | **Done (all rows, generic wrapper) · Impossible (inter-block)** | `renderShell: "self"` + per-line `theme.bg` re-apply in the self-shell wrapper `src/runtime/tool-shell.ts` (`wrapForSelfShell`), applied at both registration seams (§3.2); inter-block spacing is render-loop-internal |
+| Remove blank lines / gutter around a tool row | **Done (all rows, generic wrapper) · Impossible (inter-block)** | `renderShell: "self"` + per-line `theme.bg` re-apply in the self-shell wrapper `src/runtime/tool-shell.ts` (`wrapForSelfShell`), applied at both registration seams (see "`renderShell` — this is how you control blank lines and framing"); inter-block spacing is render-loop-internal |
 | Colors in our own components | **Easy** | `theme.fg("<slot>", text)`, `theme.bg`, `theme.bold/italic/...`, or raw ANSI |
 | Re-skin the whole UI / switch themes | **Medium** | `ctx.ui.setTheme`, `new Theme(...)`, ship theme JSON via `resources_discover` |
 | Add a **new named color role** | **Impossible** | `ThemeColor` union is closed |
@@ -100,7 +100,7 @@ renderShell?:  "default" | "self"
 
 A **Component** is the structural pi-tui contract: `{ render(width: number): string[] }`. PiCC's
 renderers use the untyped structural form, so no pi-tui type import is needed — but the `theme`
-argument **is** Pi's `Theme` (see §4).
+argument **is** Pi's `Theme` (see "Colors and themes").
 
 - `options` for `renderResult` is `{ expanded: boolean; isPartial: boolean }`. `isPartial` is the
   streaming case (a live, not-yet-final result); render the rolling/partial view then.
@@ -235,7 +235,7 @@ const result = await ctx.ui.custom<TResult>(
 - The factory returns a `Component` (optionally async) that **takes keyboard focus**. Call
   `done(result)` to close and resolve the promise. Optional `dispose()` for cleanup.
 - `keybindings` is the app's `KeybindingsManager` — use it to match keys inside your component
-  (see §7) so navigation stays consistent with the rest of the app.
+  (see "Keybindings") so navigation stays consistent with the rest of the app.
 - `overlay: true` floats it; `overlayOptions` (or a function for dynamic sizing) positions it;
   `onHandle(handle)` gives you an `OverlayHandle` to control visibility.
 
@@ -267,11 +267,11 @@ Several dedicated hooks — all low-risk:
   own color). Omit the argument to restore the default animated spinner.
 - **`ctx.ui.setWorkingMessage(msg)`** / **`ctx.ui.setWorkingVisible(bool)`** — the text and
   visibility of the "working" row shown during streaming.
-- **`ctx.ui.setStatus(key, text)`** — footer status line (see §5.2).
+- **`ctx.ui.setStatus(key, text)`** — footer status line (see "Persistent panes and chrome").
 - **Per-tool live progress** — the tool's `onUpdate` callback drives `renderResult(…, { isPartial:
   true })`. **PiCC already does this** for subagent tails and API-retry waits
   (`src/runtime/subagent-progress.ts` → `subagent-render.ts`). Copy that pattern for any long tool.
-- **A persistent progress pane** — `setWidget` (§5.2).
+- **A persistent progress pane** — `setWidget` (see "Persistent panes and chrome").
 
 ---
 
@@ -342,7 +342,7 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
 - The mature rendering example: `src/runtime/subagent-render.ts` (+ `subagent-progress.ts`).
 - Tool-row framing: `renderShell: "self"` + per-line `theme.bg` re-apply via the generic self-shell
   wrapper `wrapForSelfShell` (`src/runtime/tool-shell.ts`) — de-pads every Claude-named tool and
-  re-registered built-in row (§3.2).
+  re-registered built-in row (see "`renderShell` — this is how you control blank lines and framing").
 
 **Untapped but available right now:** `pi.registerShortcut`,
 `ctx.ui.custom`, `ctx.ui.setWidget`, `ctx.ui.setFooter`/`setHeader`, `ctx.ui.setStatus`,
@@ -356,9 +356,10 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
 
 - **Global transcript layout, inter-block spacing, scrollback model** — render-loop internal, not
   exposed. No extension knob.
-- **New named theme roles** — closed vocabulary (§4.3).
+- **New named theme roles** — closed vocabulary (see "What you cannot do" under "Colors and
+  themes").
 - **Global rebinding of Pi's built-in key actions from code** — user config only; extensions add or
-  intercept, never reassign (§7.3).
+  intercept, never reassign (see "What an extension cannot cleanly do").
 - **Headless modes** — print/RPC/JSON have no interactive UI; every interactive feature needs a
   text-mode degrade.
 - **Anything requiring changes to Pi itself** — possible only by patching/forking `pi-coding-agent`,

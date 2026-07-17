@@ -276,18 +276,23 @@ tracked project files):
 
 ## 6. Security & permission posture
 
-Deliberately partial, by design:
+PiCC's posture is deliberately partial: it runs permissive by default, enforces `permissions.deny`
+and agent `tools:` gating for real, and parses-and-reports the rest rather than enforcing it. The
+startup notice and `/doctor` call out every safety-relevant divergence — never silent. For *why* it
+is drawn this way, see "Security & permission posture" in
+[`doc/architecture.md`](architecture.md).
 
-- **Default permissive** — no per-command prompts (matches auto-mode usage).
-- **`permissions.deny` is a hard, non-interactive block** — the real safety valve. Matchers:
+What that means when you write rules:
+
+- **`permissions.deny` is your safety valve** — a hard, non-interactive block. Matchers:
   `Bash(git *)` (shell-operator aware — `git status && rm -rf /` does **not** match; space-before-`*`
   is a word boundary, so bare `git` matches but `github` never does), `Read/Edit(glob)` (Windows
   paths normalized — `//c/**` covers `C:\…`, case-insensitively), `WebFetch(domain:*)`,
   `Agent(type)`, `Skill(name)`, `mcp__server__tool`.
-- **Agent `tools:` gating is fully enforced** — a read-only reviewer cannot write; an agent
+- **Agent `tools:` gating is your primary control** — a read-only reviewer cannot write; an agent
   without web tools cannot fetch.
-- `allow` / `ask` rules and permission modes are parsed and **reported, not enforced** — the
-  startup notice and `/doctor` call out every safety-relevant divergence. Never silent.
+- **Do not rely on `allow` / `ask` or permission modes to stop anything** — they are reported, not
+  enforced.
 
 **Three rules for writing a `deny` that actually holds.** Matching is on the call's **path**
 argument, which makes it best-effort — Claude Code's own limit, not a PiCC gap:
@@ -309,7 +314,7 @@ table — every tool, hook event, setting, frontmatter field, and feature with i
 exact limit named for each partial — is in [`doc/supported-features.md`](supported-features.md),
 generated from that registry so it cannot drift. The shape of the answer:
 
-- **Full:** skills, rules, agents (project/user + the built-ins), worktrees, **13** hook events with
+- **Full:** skills, rules, agents (project/user + the built-ins), worktrees, most hook events with
   the full stdin/stdout contract, the CLAUDE.md hierarchy + `@import`, settings toggles, deny rules,
   tool gating, `WebFetch`/`WebSearch`/`Grep`/`Glob`, installed-plugin content, and compaction
   preservation.
@@ -319,10 +324,10 @@ generated from that registry so it cannot drift. The shape of the answer:
   degrade-safe); `NotebookRead`; `maxTurns`.
 - **Degraded no-op (visible, never crashing):** MCP servers/tools, `ask`/`allow`/permission modes,
   plan mode, `AskUserQuestion`, checkpointing/rewind, output styles, agent teams, background
-  *shells* (`BashOutput`/`KillShell`), LSP, computer use — and **5 hook events parsed but never
-  fired**: `Notification`, `TaskCompleted`, `TeammateIdle`, `mcp__elicitation`, and ⚠
-  `PermissionRequest`, which is therefore **not** a gate — nothing fires it under the
-  default-permissive posture. Unknown/future fields degrade safely and are reported as unassessed.
+  *shells* (`BashOutput`/`KillShell`), LSP, computer use — and a handful of hook events that are
+  parsed but never fired (the matrix marks which). ⚠ `PermissionRequest` is one of them, so it is
+  **not** a gate — nothing fires it under the default-permissive posture. Unknown/future fields
+  degrade safely and are reported as unassessed.
 - **Not built:** plugin install/marketplace machinery; mid-flight live-session handoff between
   harnesses (worktrees and git themselves are fully interoperable — a worktree created under Claude
   Code can be re-entered here and vice versa).
