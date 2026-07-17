@@ -56,6 +56,13 @@ export interface SubagentPanelWidgetDeps {
   now?: () => number;
   tickMs?: number;
   /**
+   * Panel-local dismissals from the focus controller (`selectionKeyId`
+   * strings), read lazily per view: without it a row dismissed in the focused
+   * panel would re-appear here after the panel closes, until its linger
+   * expired.
+   */
+  dismissed?: () => ReadonlySet<string>;
+  /**
    * Render seam, defaulting to the real renderer. Exists so the
    * defensive-render test can inject a throwing stub and prove the shell
    * catches it — an uncaught throw from a widget render kills Pi's whole
@@ -129,6 +136,7 @@ export class SubagentPanelWidgetController {
       records: this.deps.registry.list(),
       tasks: this.deps.tasks(),
       focused: false,
+      dismissed: this.deps.dismissed?.(),
     });
   }
 

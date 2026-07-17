@@ -1,7 +1,8 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { formatUsageCompact, sanitizeLine } from "./subagent-progress.js";
-import { clampLines, themedFg } from "./render-util.js";
+import { formatUsageCompact, sanitizeLine, sanitizeProgressText } from "./subagent-progress.js";
+import { clampLines, pushWrapped, themedFg } from "./render-util.js";
 import type { PanelRowView, PanelViewModel } from "./subagent-panel-model.js";
+import { guardSteer, type SubagentRegistryRecord } from "./subagent-registry.js";
 
 /**
  * Subagent status-panel renderer: pure PanelViewModel → clamped string lines.
@@ -277,4 +278,276 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
     ),
   );
   return clampLines(lines, width);
+}
+
+// --- drill-down detail view --------------------------------------------------
+
+/** Scrollable body viewport height (lines) inside the drill-down. */
+export const DETAIL_BODY_ROWS = 12;
+/**
+ * Detail-view chords, shown in hints. Control chords, not plain letters:
+ * inside the drill-down every printable key types into the steer buffer.
+ */
+export const DETAIL_PROMPT_KEY = "ctrl+p";
+export const DETAIL_STOP_KEY = "ctrl+x";
+
+// Banners for live state changes while the drill-down is open — the view
+// re-resolves its record each render and narrates the transition instead of
+// crashing or freezing on it.
+export const DETAIL_BANNER_SETTLED = "agent settled while viewing — final answer shown";
+export const DETAIL_BANNER_RESUMED = "agent resumed while viewing — live view";
+export const DETAIL_BANNER_VANISHED = "agent record is no longer available — esc back";
+
+export const DETAIL_STEER_SENT = "steer sent — delivered before the agent's next model call";
+export function detailSteerFailed(reason: string): string {
+  return `steer failed: ${reason}`;
+}
+/**
+ * The honest alternative named beside a foreground steering refusal: a
+ * foreground dispatch blocks the parent's turn, so the only real control the
+ * user has is the editor's own turn cancel.
+ */
+export const DETAIL_FOREGROUND_ALT = "esc to editor; Esc there cancels the whole turn";
+export function detailSteerUnavailable(reason: string): string {
+  return `steering unavailable (${reason})`;
+}
+
+export function detailPromptCollapsed(lineCount: number): string {
+  return `initial prompt (${lineCount} line${lineCount === 1 ? "" : "s"}) — ${DETAIL_PROMPT_KEY} to expand`;
+}
+export const DETAIL_PROMPT_EXPANDED = `initial prompt — ${DETAIL_PROMPT_KEY} to collapse`;
+export const DETAIL_NO_ACTIVITY = "(no activity captured yet)";
+export const DETAIL_NO_TAIL = "(no transcript tail captured)";
+export const DETAIL_NO_FINAL_ANSWER = "(no final answer captured)";
+export const DETAIL_FINAL_LABEL = "final answer:";
+export const DETAIL_TAIL_LABEL = "transcript tail:";
+/** The pinned steer input line's prefix. */
+export const DETAIL_STEER_PREFIX = "steer › ";
+
+/** Per-state footer hint — only keys that actually work in that state. */
+export function detailHint(opts: { steerable: boolean; stoppable: boolean }): string {
+  const parts: string[] = [];
+  if (opts.steerable) parts.push("type to steer · enter send");
+  if (opts.stoppable) parts.push(`${DETAIL_STOP_KEY} stop`);
+  parts.push(`${DETAIL_PROMPT_KEY} prompt`, "↑↓ scroll", "esc back");
+  return parts.join(" · ");
+}
+
+/** Display-side per-line sanitize cap for detail body/notice content. */
+const DETAIL_LINE_CAP = 300;
+
+/** UI state the focus controller owns and threads through every detail render. */
+export interface PanelDetailUiState {
+  promptExpanded: boolean;
+  /** Body scroll anchor: lines from the TOP of the body; ignored while `follow`. */
+  scrollTop: number;
+  /** Auto-follow the newest body line (the running-view default). */
+  follow: boolean;
+  steerBuffer: string;
+  /** Inline one-line notice (send confirmation, refusal, failure). */
+  notice?: string;
+  /** Live state-change banner (settled/resumed/vanished while open). */
+  banner?: string;
+}
+
+/** Per-render data, re-resolved by the caller from the registries each time. */
+export interface PanelDetailData {
+  /** Absent when the record cannot be resolved — renders the vanished banner. */
+  record?: SubagentRegistryRecord;
+  /** Newest-generation background task id, when the agent has one. */
+  taskId?: string;
+  nowMs: number;
+}
+
+export interface DetailRenderOptions {
+  width: number;
+  theme?: unknown;
+  runningFrame?: string;
+}
+
+export interface PanelDetailRender {
+  lines: string[];
+  /** Max valid scrollTop for this body/viewport — the caller clamps its state. */
+  maxScroll: number;
+}
+
+/**
+ * Right-anchored width fit for the steer input line: the END of the buffer
+ * (where the cursor is) must stay visible, so overflow truncates from the
+ * LEFT — the one line where truncateToWidth's end-ellipsis is wrong.
+ */
+function tailToWidth(text: string, maxCols: number): string {
+  if (maxCols <= 0) return "";
+  if (visibleWidth(text) <= maxCols) return text;
+  const chars = [...text];
+  let out = "";
+  let used = 1; // reserved for the leading ellipsis
+  for (let i = chars.length - 1; i >= 0; i--) {
+    const charWidth = visibleWidth(chars[i]!);
+    if (used + charWidth > maxCols) break;
+    out = chars[i]! + out;
+    used += charWidth;
+  }
+  return `…${out}`;
+}
+
+/**
+ * Steer availability for display. The authoritative predicate is t01's
+ * guardSteer (the send path uses ONLY its bound steer fn); this maps the same
+ * ordering onto short display reasons, and the foreground case names the real
+ * alternative rather than a dead end.
+ */
+type DetailSteerSlot = { kind: "input" } | { kind: "notice"; text: string } | { kind: "none" };
+
+function detailSteerSlot(record: SubagentRegistryRecord): DetailSteerSlot {
+  if (record.state !== "running") return { kind: "none" };
+  if (guardSteer(record).ok) return { kind: "input" };
+  if (record.oneShot) return { kind: "notice", text: detailSteerUnavailable("one-shot agent") };
+  if (record.userStopped) {
+    return { kind: "notice", text: detailSteerUnavailable("stopped by user") };
+  }
+  return {
+    kind: "notice",
+    text: `${detailSteerUnavailable("foreground agent")} — ${DETAIL_FOREGROUND_ALT}`,
+  };
+}
+
+/**
+ * The drill-down view: header → (banner) → scrollable body → notice/steer →
+ * hint. Layout by state — running leads with the live tail (auto-following),
+ * finished leads with the final answer. Pure and never-throwing over its
+ * inputs; every emitted line is <= width (clampLines) and all record content
+ * is re-sanitized at render (defense in depth over the capture-time pass).
+ * The transcript path is rendered as an INERT pointer string only — the
+ * drill-down never re-reads the JSONL.
+ */
+export function renderSubagentDetail(
+  data: PanelDetailData,
+  ui: PanelDetailUiState,
+  opts: DetailRenderOptions,
+): PanelDetailRender {
+  const { width, theme } = opts;
+  const muted = (text: string): string => themedFg(theme, "muted", text);
+  const record = data.record;
+  const lines: string[] = [];
+  if (!record) {
+    // Same sanitize discipline as the record branch's banner — the vanished
+    // branch must not become the one path that trusts ui.banner raw.
+    lines.push(
+      themedFg(theme, "warning", sanitizeLine(ui.banner ?? DETAIL_BANNER_VANISHED, DETAIL_LINE_CAP)),
+    );
+    lines.push(muted("esc back"));
+    return { lines: clampLines(lines, width), maxScroll: 0 };
+  }
+
+  const running = record.state === "running";
+  const rowState: PanelRowView["state"] = running
+    ? "running"
+    : record.userStopped || record.outcome === "aborted"
+      ? "stopped"
+      : record.outcome === "failed"
+        ? "failed"
+        : "success";
+  const glyphText = stateGlyph(rowState, opts.runningFrame);
+  // agentName is the one deliberately-raw record field — sanitize at render.
+  const typeText = sanitizeLine(record.agentName, TYPE_RENDER_CAP) || "agent";
+  const labelText = sanitizeLine(record.description ?? "", LABEL_RENDER_CAP);
+  lines.push(
+    `${themedFg(theme, STATE_COLOR[rowState], glyphText)} ` +
+      (theme ? tintAgentColor(record.color, typeText) : typeText) +
+      (labelText && labelText !== typeText ? muted(` · ${labelText}`) : ""),
+  );
+  const elapsedEnd = running ? data.nowMs : (record.settledAt ?? record.startedAt);
+  // Defense-in-depth consistency: agentId and the outcome word are typed
+  // unions/ids today, but the meta line sanitizes every interpolated field
+  // like the rest of the view instead of trusting record shape.
+  const statusWord = running
+    ? "running"
+    : record.userStopped
+      ? "stopped by user"
+      : sanitizeLine(record.outcome ?? "settled", 60);
+  const meta: string[] = [sanitizeLine(record.agentId, 60)];
+  if (data.taskId) meta.push(sanitizeLine(data.taskId, 60));
+  meta.push(formatElapsed(Math.max(0, elapsedEnd - record.startedAt)), statusWord);
+  lines.push(muted(meta.join(" · ")));
+  if (record.transcriptPath) {
+    lines.push(muted(`transcript: ${sanitizeLine(record.transcriptPath, 200)}`));
+  }
+  if (ui.banner) lines.push(themedFg(theme, "warning", sanitizeLine(ui.banner, DETAIL_LINE_CAP)));
+
+  // Scrollable body, assembled per state.
+  const body: string[] = [];
+  // sanitizeProgressText deliberately PRESERVES \r (capture-side callers line-
+  // split themselves), so the multi-line paths must split on CR too: a lone
+  // \r surviving into an emitted line would let hostile content overprint the
+  // line from column 0 (same-line spoof). The tail path is already immune via
+  // sanitizeLine's whitespace collapse.
+  const LINE_BREAK_RE = /\r\n?|\n/;
+  const pushMultiline = (text: string): void => {
+    for (const raw of sanitizeProgressText(text).split(LINE_BREAK_RE)) {
+      pushWrapped(raw, width, body);
+    }
+  };
+  const promptLines = record.prompt
+    ? sanitizeProgressText(record.prompt).split(LINE_BREAK_RE)
+    : [];
+  const pushPrompt = (): void => {
+    if (promptLines.length === 0) return;
+    if (ui.promptExpanded) {
+      body.push(muted(DETAIL_PROMPT_EXPANDED));
+      for (const raw of promptLines) pushWrapped(raw, width, body);
+    } else {
+      body.push(muted(detailPromptCollapsed(promptLines.length)));
+    }
+  };
+  const tailLines = record.fullTail ?? [];
+  const pushTail = (): void => {
+    if (tailLines.length === 0) {
+      body.push(muted(running ? DETAIL_NO_ACTIVITY : DETAIL_NO_TAIL));
+      return;
+    }
+    for (const raw of tailLines) pushWrapped(sanitizeLine(raw, DETAIL_LINE_CAP), width, body);
+  };
+  if (running) {
+    // The collapsed one-liner is PINNED between header and tail (the spec's
+    // running layout) so the auto-following tail can never scroll it away;
+    // the expanded prompt joins the scrollable body instead.
+    if (promptLines.length > 0 && !ui.promptExpanded) {
+      lines.push(muted(detailPromptCollapsed(promptLines.length)));
+    }
+    if (ui.promptExpanded) pushPrompt();
+    pushTail();
+  } else {
+    body.push(muted(DETAIL_FINAL_LABEL));
+    if (record.finalText) pushMultiline(record.finalText);
+    else body.push(muted(DETAIL_NO_FINAL_ANSWER));
+    pushPrompt();
+    body.push(muted(DETAIL_TAIL_LABEL));
+    pushTail();
+  }
+
+  const maxScroll = Math.max(0, body.length - DETAIL_BODY_ROWS);
+  const top = ui.follow ? maxScroll : Math.min(Math.max(0, ui.scrollTop), maxScroll);
+  const end = Math.min(body.length, top + DETAIL_BODY_ROWS);
+  if (top > 0) lines.push(muted(panelMoreAbove(top)));
+  for (let i = top; i < end; i++) lines.push(body[i]!);
+  if (end < body.length) lines.push(muted(panelMoreBelow(body.length - end)));
+
+  if (ui.notice) lines.push(themedFg(theme, "warning", sanitizeLine(ui.notice, DETAIL_LINE_CAP)));
+  const slot = detailSteerSlot(record);
+  if (slot.kind === "input") {
+    const avail = Math.max(0, width - visibleWidth(DETAIL_STEER_PREFIX));
+    lines.push(themedFg(theme, "accent", DETAIL_STEER_PREFIX) + tailToWidth(ui.steerBuffer, avail));
+  } else if (slot.kind === "notice") {
+    lines.push(muted(slot.text));
+  }
+  lines.push(
+    muted(
+      detailHint({
+        steerable: slot.kind === "input",
+        stoppable: running && data.taskId !== undefined,
+      }),
+    ),
+  );
+  return { lines: clampLines(lines, width), maxScroll };
 }

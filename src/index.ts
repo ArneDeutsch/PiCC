@@ -550,6 +550,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const subagentPanel = new SubagentPanelWidgetController({
     registry: subagentRegistry,
     tasks: panelTaskJoin,
+    // Lazy closure over the focus controller declared just below: the widget
+    // reads dismissals only at view time (session_start and later), never
+    // during construction.
+    dismissed: () => subagentPanelFocus.dismissedKeys(),
   });
   // Focused panel (the entry chord's ctx.ui.custom component): selection,
   // stop/dismiss/stop-all. Suppresses the passive widget while open.

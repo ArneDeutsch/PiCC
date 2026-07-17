@@ -21,6 +21,20 @@ import {
 } from "../src/runtime/subagent-panel-model.js";
 import {
   AGENT_COLOR_ANSI,
+  DETAIL_BANNER_RESUMED,
+  DETAIL_BANNER_SETTLED,
+  DETAIL_BANNER_VANISHED,
+  DETAIL_FINAL_LABEL,
+  DETAIL_FOREGROUND_ALT,
+  DETAIL_NO_ACTIVITY,
+  DETAIL_PROMPT_EXPANDED,
+  DETAIL_STEER_PREFIX,
+  DETAIL_STEER_SENT,
+  DETAIL_TAIL_LABEL,
+  detailHint,
+  detailPromptCollapsed,
+  detailSteerFailed,
+  detailSteerUnavailable,
   formatElapsed,
   PANEL_GLYPH_FAILED,
   PANEL_GLYPH_STOPPED,
@@ -31,10 +45,17 @@ import {
   panelHintUnfocused,
   panelMoreAbove,
   panelMoreBelow,
+  renderSubagentDetail,
   renderSubagentPanel,
   tintAgentColor,
+  type PanelDetailUiState,
 } from "../src/runtime/subagent-panel-render.js";
-import { SubagentRegistry, type SubagentRegistryRecord } from "../src/runtime/subagent-registry.js";
+import {
+  SubagentRegistry,
+  type RegisterInput,
+  type SubagentRegistryRecord,
+} from "../src/runtime/subagent-registry.js";
+import { HookRunner } from "../src/engine/hook-runner.js";
 import {
   createPanelHintEmitter,
   PANEL_ENTRY_CHORD,
@@ -52,6 +73,7 @@ import {
   panelNoticeStopAllArmed,
   panelNoticeStopAllDone,
   panelNoticeStopRequested,
+  STEER_INPUT_CAP,
   STOP_ALL_CONFIRM_MS,
   SubagentPanelFocusController,
 } from "../src/runtime/subagent-panel-focus.js";
@@ -753,6 +775,246 @@ describe("formatElapsed", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Drill-down detail rendering (pure)
+// ---------------------------------------------------------------------------
+
+function detailUi(over: Partial<PanelDetailUiState> = {}): PanelDetailUiState {
+  return { promptExpanded: false, scrollTop: 0, follow: true, steerBuffer: "", ...over };
+}
+
+describe("drill-down detail rendering (pure)", () => {
+  const numberedTail = (n: number) =>
+    Array.from({ length: n }, (_, i) => `tail line ${String(i + 1).padStart(2, "0")}`);
+
+  it("running layout: header, collapsed prompt, auto-following tail, steer line, hint", () => {
+    const record = rec({
+      agentId: "agent-a",
+      description: "build the frontend",
+      prompt: "do the thing\nplease",
+      fullTail: numberedTail(20),
+      transcriptPath: "/repo/.claude/.picc/agent-a.jsonl",
+      session: { steer: () => undefined },
+      startedAt: 0,
+    });
+    const { lines, maxScroll } = renderSubagentDetail(
+      { record, taskId: "task-7", nowMs: 12_000 },
+      detailUi(),
+      { width: 120 },
+    );
+    const text = lines.join("\n");
+    expect(text).toContain("coder");
+    expect(text).toContain("build the frontend");
+    expect(text).toContain("agent-a");
+    expect(text).toContain("task-7");
+    expect(text).toContain("12s");
+    expect(text).toContain("running");
+    // The prompt is collapsed to its PINNED one-line affordance — visible even
+    // though the following tail has scrolled its window well past the top.
+    expect(text).toContain(detailPromptCollapsed(2));
+    expect(text).not.toContain("do the thing");
+    // Auto-follow: the newest tail line is visible, the oldest scrolled out.
+    expect(text).toContain("tail line 20");
+    expect(text).not.toContain("tail line 08");
+    expect(text).toContain(panelMoreAbove(8)); // 20 tail lines − 12 body rows
+    expect(maxScroll).toBe(8);
+    // The transcript path is an inert pointer string only (never re-read).
+    expect(text).toContain("/repo/.claude/.picc/agent-a.jsonl");
+    expect(text).toContain(DETAIL_STEER_PREFIX);
+    expect(lines[lines.length - 1]).toContain(
+      detailHint({ steerable: true, stoppable: true }),
+    );
+  });
+
+  it("finished layout: final answer leads, then collapsed prompt, tail below; no steer line", () => {
+    const record = rec({
+      agentId: "agent-a",
+      state: "settled",
+      outcome: "completed",
+      startedAt: 1000,
+      settledAt: 9000,
+      finalText: "Answer: everything passed",
+      prompt: "check it",
+      fullTail: ["step one", "step two"],
+    });
+    const { lines } = renderSubagentDetail(
+      { record, nowMs: 50_000 },
+      detailUi({ follow: false }),
+      { width: 120 },
+    );
+    const text = lines.join("\n");
+    expect(text).toContain(DETAIL_FINAL_LABEL);
+    expect(text).toContain("Answer: everything passed");
+    expect(text).toContain(detailPromptCollapsed(1));
+    expect(text).toContain("8s"); // elapsed frozen at settledAt − startedAt
+    expect(text).toContain("completed");
+    expect(text).not.toContain(DETAIL_STEER_PREFIX);
+    const answerIndex = lines.findIndex((l) => l.includes(DETAIL_FINAL_LABEL));
+    const promptIndex = lines.findIndex((l) => l.includes("initial prompt"));
+    expect(answerIndex).toBeGreaterThanOrEqual(0);
+    expect(answerIndex).toBeLessThan(promptIndex);
+    expect(text).toContain(DETAIL_TAIL_LABEL);
+    expect(text).toContain("step two");
+    expect(lines[lines.length - 1]).toContain(
+      detailHint({ steerable: false, stoppable: false }),
+    );
+  });
+
+  it("expands and collapses the prompt via the ui flag", () => {
+    const record = rec({
+      agentId: "agent-a",
+      prompt: "first line\nsecond line\nthird line",
+      session: { steer: () => undefined },
+    });
+    const collapsed = renderSubagentDetail({ record, nowMs: 0 }, detailUi(), { width: 120 });
+    expect(collapsed.lines.join("\n")).toContain(detailPromptCollapsed(3));
+    expect(collapsed.lines.join("\n")).not.toContain("second line");
+    expect(collapsed.lines.join("\n")).toContain(DETAIL_NO_ACTIVITY); // empty tail placeholder
+    const expanded = renderSubagentDetail(
+      { record, nowMs: 0 },
+      detailUi({ promptExpanded: true }),
+      { width: 120 },
+    );
+    expect(expanded.lines.join("\n")).toContain(DETAIL_PROMPT_EXPANDED);
+    expect(expanded.lines.join("\n")).toContain("second line");
+  });
+
+  it("anchors the scrolled-back window from the top; follow shows the bottom", () => {
+    const record = rec({ agentId: "agent-a", fullTail: numberedTail(30) });
+    const anchored = renderSubagentDetail(
+      { record, nowMs: 0 },
+      detailUi({ follow: false, scrollTop: 0 }),
+      { width: 120 },
+    );
+    const anchoredText = anchored.lines.join("\n");
+    expect(anchoredText).toContain("tail line 01");
+    expect(anchoredText).not.toContain("tail line 30");
+    expect(anchoredText).toContain(panelMoreBelow(18)); // 30 lines − 12 rows
+    expect(anchored.maxScroll).toBe(18);
+    const following = renderSubagentDetail({ record, nowMs: 0 }, detailUi(), { width: 120 });
+    expect(following.lines.join("\n")).toContain("tail line 30");
+    expect(following.lines.join("\n")).not.toContain("tail line 01");
+  });
+
+  it("renders honest unavailability notices: foreground (with the real alternative), one-shot, user-stopped", () => {
+    const foreground = renderSubagentDetail(
+      { record: rec({ agentId: "agent-a" }), nowMs: 0 },
+      detailUi(),
+      { width: 160 },
+    ).lines.join("\n");
+    expect(foreground).toContain(detailSteerUnavailable("foreground agent"));
+    expect(foreground).toContain(DETAIL_FOREGROUND_ALT);
+    expect(foreground).not.toContain(DETAIL_STEER_PREFIX);
+
+    const oneShot = renderSubagentDetail(
+      {
+        record: rec({ agentId: "agent-a", oneShot: true, session: { steer: () => undefined } }),
+        nowMs: 0,
+      },
+      detailUi(),
+      { width: 160 },
+    ).lines.join("\n");
+    expect(oneShot).toContain(detailSteerUnavailable("one-shot agent"));
+
+    const stopped = renderSubagentDetail(
+      {
+        record: rec({ agentId: "agent-a", userStopped: true, session: { steer: () => undefined } }),
+        nowMs: 0,
+      },
+      detailUi(),
+      { width: 160 },
+    ).lines.join("\n");
+    expect(stopped).toContain(detailSteerUnavailable("stopped by user"));
+  });
+
+  it("renders the vanished banner without throwing when the record is gone", () => {
+    const { lines, maxScroll } = renderSubagentDetail(
+      { record: undefined, nowMs: 0 },
+      detailUi({ banner: DETAIL_BANNER_VANISHED }),
+      { width: 80 },
+    );
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines.join("\n")).toContain(DETAIL_BANNER_VANISHED);
+    expect(maxScroll).toBe(0);
+  });
+
+  it("keeps every line <= width for widths 1..90 with hostile ANSI/CJK content in prompt/finalText/tail", () => {
+    const fakeTheme = {
+      fg: (_c: string, s: string) => `${ESC}[36m${s}${ESC}[39m`,
+      bold: (s: string) => `${ESC}[1m${s}${ESC}[22m`,
+    };
+    const hostile = (state: "running" | "settled") =>
+      rec({
+        agentId: "agent-a",
+        agentName: `evil${ESC}[31m名前\tagent`,
+        description: "宽字符".repeat(20),
+        // \r and \r\n included: sanitizeProgressText preserves \r, so a lone
+        // CR surviving into an emitted line would overprint it from column 0.
+        prompt: `p${ESC}]0;pwn${BEL}rompt\rcr-spoof\r\ncrlf-line\n${"宽".repeat(200)}\n${"x".repeat(400)}`,
+        finalText: `f${ESC}[2Jinal\rcr-spoof\r\ncrlf-line\n${"宽宽".repeat(100)}`,
+        fullTail: [`t${ESC}[31mail`, "宽宽宽宽".repeat(30), "z".repeat(400)],
+        session: { steer: () => undefined },
+        state,
+        ...(state === "settled" ? { outcome: "failed" as const, settledAt: 5 } : {}),
+      });
+    for (const state of ["running", "settled"] as const) {
+      for (const promptExpanded of [false, true]) {
+        for (let width = 1; width <= 90; width++) {
+          const { lines } = renderSubagentDetail(
+            { record: hostile(state), taskId: "task-1", nowMs: 9000 },
+            detailUi({ promptExpanded, steerBuffer: "宽".repeat(80) }),
+            { width, theme: fakeTheme, runningFrame: PANEL_RUNNING_FRAMES[0] },
+          );
+          for (const line of lines) {
+            expect(
+              visibleWidth(line),
+              `state=${state} expanded=${promptExpanded} width=${width} line=${JSON.stringify(line)}`,
+            ).toBeLessThanOrEqual(width);
+            // A surviving CR is invisible to visibleWidth but lets content
+            // overprint the line from column 0 — assert none ever leaks.
+            expect(line.includes("\r"), JSON.stringify(line)).toBe(false);
+          }
+        }
+      }
+    }
+    // Themeless render of the same hostile content emits no escape/control
+    // bytes. Width 400 keeps every line wrap-only (no clamp truncation), so
+    // any ESC here would come from CONTENT — pi-tui's truncateToWidth appends
+    // its own benign ANSI reset when it truncates, which is not a leak.
+    for (const state of ["running", "settled"] as const) {
+      const { lines } = renderSubagentDetail(
+        { record: hostile(state), nowMs: 9000 },
+        detailUi({ promptExpanded: true }),
+        { width: 400 },
+      );
+      for (const line of lines) {
+        expect(line.includes(ESC), JSON.stringify(line)).toBe(false);
+        expect(line.includes(BEL), JSON.stringify(line)).toBe(false);
+        expect(line.includes("\r"), JSON.stringify(line)).toBe(false);
+      }
+    }
+  });
+
+  it("left-anchors the steer line: overflow truncates from the START so the buffer end stays visible", () => {
+    const record = rec({ agentId: "agent-a", session: { steer: () => undefined } });
+    const { lines } = renderSubagentDetail(
+      { record, nowMs: 0 },
+      detailUi({ steerBuffer: "0123456789 steer tail END" }),
+      { width: 24 }, // prefix is 8 wide → 16 columns for the buffer
+    );
+    const steerLine = lines.find((l) => l.startsWith(DETAIL_STEER_PREFIX))!;
+    // The END of the buffer (the cursor) is visible; the start is elided.
+    expect(steerLine).toBe(`${DETAIL_STEER_PREFIX}… steer tail END`);
+  });
+
+  it("emits only empty lines at width 0 and never throws", () => {
+    const record = rec({ agentId: "agent-a", prompt: "p", fullTail: ["t"] });
+    const { lines } = renderSubagentDetail({ record, nowMs: 0 }, detailUi(), { width: 0 });
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) expect(line).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Widget shell (subagent-panel-widget.ts) + fake-pi UI surface
 // ---------------------------------------------------------------------------
 
@@ -874,6 +1136,23 @@ describe("panel widget controller (unit, fake-pi ui)", () => {
       expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(false);
       controller.setSuppressed(false);
       expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(true);
+    } finally {
+      controller.setSuppressed(true);
+    }
+  });
+
+  it("consumes the dismissed set: a dismissed settled row leaves the passive widget", () => {
+    const dismissed = new Set<string>();
+    const { registry, pi, ui, controller } = setup({ dismissed: () => dismissed });
+    try {
+      registerRunning(registry, "agent-a");
+      registry.markSettled("agent-a", { outcome: "completed" });
+      controller.attach(ui);
+      expect(pi.widgets.get(SUBAGENT_PANEL_WIDGET_KEY)!.render(120).join("\n")).toContain("coder");
+      dismissed.add("agent:agent-a");
+      registry.markSettled("agent-a", { outcome: "completed" }); // any change resyncs
+      // The only row is dismissed → the widget removes itself entirely.
+      expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(false);
     } finally {
       controller.setSuppressed(true);
     }
@@ -1149,11 +1428,12 @@ describe("fake-pi UI driving surface (the shape later panel tasks build on)", ()
 const KEY_UP = `${ESC}[A`;
 const KEY_DOWN = `${ESC}[B`;
 const KEY_ENTER = String.fromCharCode(13);
+const KEY_BACKSPACE = String.fromCharCode(127);
+const KEY_CTRL_X = String.fromCharCode(24);
+const KEY_CTRL_P = String.fromCharCode(16);
 
 describe("panel focus controller (unit, fake-pi ui)", () => {
-  function focusSetup(over: {
-    renderDetail?: ConstructorParameters<typeof SubagentPanelFocusController>[0]["renderDetail"];
-  } = {}) {
+  function focusSetup() {
     const registry = new SubagentRegistry();
     const tasks: PanelTaskInfo[] = [];
     const stopped: string[] = [];
@@ -1177,7 +1457,6 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
       // A real (unref'd) interval, effectively inert during the test; each
       // component's dispose clears its own.
       tickMs: 3_600_000,
-      ...over,
     });
     /** Open via a TUI ctx and return the recorded custom invocation (if any). */
     const openPanel = () => {
@@ -1188,8 +1467,13 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     return { registry, tasks, stopped, suppressions, clock, poison, pi, controller, openPanel, notices };
   }
 
-  /** Register a running record with panel-visible labeling. */
-  function reg(registry: SubagentRegistry, agentId: string, description?: string): void {
+  /** Register a running record with panel-visible labeling (drill-down fields via `over`). */
+  function reg(
+    registry: SubagentRegistry,
+    agentId: string,
+    description?: string,
+    over: Partial<RegisterInput> = {},
+  ): void {
     registry.register({
       agentId,
       agentName: "coder",
@@ -1198,6 +1482,7 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
       resumable: true,
       oneShot: false,
       description,
+      ...over,
     });
   }
 
@@ -1568,22 +1853,19 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     expect(invocation.closed).toBe(true);
   });
 
-  it("detail seam: Enter hands the selected key to the injected detail view; Esc steps detail → list → close", async () => {
-    const detailCalls: string[] = [];
-    const s = focusSetup({
-      renderDetail: (key, _width, _theme) => {
-        detailCalls.push(selectionKeyId(key));
-        return [`detail for ${selectionKeyId(key)}`];
-      },
-    });
-    reg(s.registry, "agent-a");
+  it("Enter opens the drill-down for the selected row; Esc steps detail → list → close", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", "verify things", { prompt: "check the tests" });
     s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
     const invocation = s.openPanel()!;
     await invocation.ready;
     invocation.render(120);
     invocation.input(KEY_ENTER);
-    expect(invocation.render(120)).toEqual(["detail for task:task-1"]);
-    expect(detailCalls).toContain("task:task-1");
+    const detailText = invocation.render(120).join("\n");
+    expect(detailText).toContain("agent-a");
+    expect(detailText).toContain("task-1");
+    expect(detailText).toContain(detailPromptCollapsed(1));
+    expect(detailText).not.toContain(PANEL_HINT_FOCUSED);
     invocation.input(ESC); // detail → list
     expect(invocation.render(120).join("\n")).toContain(PANEL_HINT_FOCUSED);
     invocation.input(ESC); // list → close
@@ -1591,14 +1873,417 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     expect(invocation.closed).toBe(true);
   });
 
-  it("without a wired detail view, Enter is a stored-selection no-op (the list stays)", async () => {
+  it("typing fills the steer line; Enter sends through the guard's bound steer fn and clears it", async () => {
+    const steered: string[] = [];
     const s = focusSetup();
-    reg(s.registry, "agent-a");
+    reg(s.registry, "agent-a", "steer target", {
+      prompt: "the prompt",
+      session: { steer: (text: string) => void steered.push(text) },
+    });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER); // list → detail
+    invocation.input("fix the testsX");
+    invocation.input(KEY_BACKSPACE); // backspace edits the buffer
+    expect(invocation.render(120).join("\n")).toContain(`${DETAIL_STEER_PREFIX}fix the tests`);
+    invocation.input(KEY_ENTER); // send
+    expect(steered).toEqual(["fix the tests"]);
+    const after = invocation.render(120).join("\n");
+    expect(after).toContain(DETAIL_STEER_SENT);
+    expect(after).not.toContain("fix the tests"); // buffer cleared
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("caps the steer buffer at STEER_INPUT_CAP", async () => {
+    const steered: string[] = [];
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, {
+      session: { steer: (text: string) => void steered.push(text) },
+    });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
     const invocation = s.openPanel()!;
     await invocation.ready;
     invocation.render(120);
     invocation.input(KEY_ENTER);
-    expect(invocation.render(120).join("\n")).toContain(PANEL_HINT_FOCUSED); // still the list
+    invocation.input("a".repeat(STEER_INPUT_CAP + 50));
+    invocation.input(KEY_ENTER);
+    expect(steered).toHaveLength(1);
+    expect(steered[0]).toHaveLength(STEER_INPUT_CAP);
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("PINNED Esc semantics: a non-empty steer buffer is cleared first, the next Esc steps back", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    invocation.input("abc");
+    expect(invocation.render(120).join("\n")).toContain(`${DETAIL_STEER_PREFIX}abc`);
+    invocation.input(ESC); // clears the buffer, stays in detail
+    const cleared = invocation.render(120).join("\n");
+    expect(cleared).not.toContain("abc");
+    expect(cleared).not.toContain(PANEL_HINT_FOCUSED); // still the detail view
+    invocation.input(ESC); // detail → list
+    expect(invocation.render(120).join("\n")).toContain(PANEL_HINT_FOCUSED);
+    invocation.input(ESC); // list → close
+    await invocation.result;
+    expect(invocation.closed).toBe(true);
+  });
+
+  it("ctrl+x in the drill-down stops a running background agent with t05's paired semantics", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    invocation.input(KEY_CTRL_X); // ctrl+x
+    expect(s.stopped).toEqual(["task-1"]);
+    expect(s.registry.get("agent-a")!.userStopped).toBe(true);
+    expect(s.notices()).toContain(panelNoticeStopRequested("coder"));
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("ctrl+x in the drill-down on a foreground agent refuses with the foreground notice", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a"); // no task join: foreground
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    invocation.input(KEY_CTRL_X);
+    expect(s.stopped).toEqual([]);
+    expect(s.registry.get("agent-a")!.userStopped).toBeUndefined();
+    expect(s.notices()).toContain(PANEL_NOTICE_FOREGROUND);
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("a send racing a user stop surfaces the guard's refusal inline, and nothing is delivered", async () => {
+    const steered: string[] = [];
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, {
+      session: { steer: (text: string) => void steered.push(text) },
+    });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    invocation.input("keep going");
+    s.registry.markUserStopped("agent-a"); // the stop lands before Enter
+    invocation.input(KEY_ENTER);
+    expect(steered).toEqual([]);
+    expect(invocation.render(160).join("\n")).toMatch(/stopped by the user/);
+    invocation.input(ESC); // buffer still holds text → cleared
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("typing at an unsteerable (foreground) agent is inert and the unavailability notice names the alternative", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a"); // running foreground: no session handle
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(160);
+    invocation.input(KEY_ENTER);
+    invocation.input("abc"); // never silently buffered
+    const text = invocation.render(160).join("\n");
+    expect(text).not.toContain("abc");
+    expect(text).toContain(detailSteerUnavailable("foreground agent"));
+    expect(text).toContain(DETAIL_FOREGROUND_ALT);
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("settling while the drill-down is open banners and shows the final answer; resuming banners back to live", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    s.tasks[0]!.status = "completed";
+    s.registry.markSettled("agent-a", {
+      outcome: "completed",
+      finalText: "the settled final answer",
+    });
+    const settled = invocation.render(120).join("\n");
+    expect(settled).toContain(DETAIL_BANNER_SETTLED);
+    expect(settled).toContain(DETAIL_FINAL_LABEL);
+    expect(settled).toContain("the settled final answer");
+    s.registry.markResuming("agent-a");
+    expect(invocation.render(120).join("\n")).toContain(DETAIL_BANNER_RESUMED);
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("a poisoned join while the drill-down is open renders the vanished banner instead of crashing", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    s.poison.on = true;
+    const text = invocation.render(120).join("\n");
+    expect(text).toContain(DETAIL_BANNER_VANISHED);
+    s.poison.on = false;
+    invocation.input(ESC); // still escapable
+    invocation.input(ESC);
+    await invocation.result;
+    expect(invocation.closed).toBe(true);
+  });
+
+  it("scrolls the tail: up anchors, incoming lines don't yank, bottom re-engages follow", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const tail = (n: number) =>
+      Array.from({ length: n }, (_, i) => `tail line ${String(i + 1).padStart(2, "0")}`);
+    s.registry.noteProgress("agent-a", { tail: [], activity: "" }, tail(30));
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(200);
+    invocation.input(KEY_ENTER);
+    expect(invocation.render(200).join("\n")).toContain("tail line 30"); // following
+    invocation.input(KEY_UP);
+    const scrolled = invocation.render(200).join("\n");
+    expect(scrolled).not.toContain("tail line 30");
+    expect(scrolled).toContain("tail line 18");
+    // New content arrives while scrolled back: the window stays anchored.
+    s.registry.noteProgress("agent-a", { tail: [], activity: "" }, tail(31));
+    const anchored = invocation.render(200).join("\n");
+    expect(anchored).toContain("tail line 18");
+    expect(anchored).not.toContain("tail line 31");
+    // Scrolling back to the bottom re-engages follow.
+    invocation.input(KEY_DOWN);
+    invocation.render(200);
+    invocation.input(KEY_DOWN);
+    expect(invocation.render(200).join("\n")).toContain("tail line 31");
+    s.registry.noteProgress("agent-a", { tail: [], activity: "" }, tail(32));
+    expect(invocation.render(200).join("\n")).toContain("tail line 32"); // following again
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("ctrl+p toggles the prompt open and closed inside the drill-down", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, {
+      prompt: "first line\nsecond line\nthird line",
+      session: { steer: () => undefined },
+    });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    expect(invocation.render(120).join("\n")).toContain(detailPromptCollapsed(3));
+    expect(invocation.render(120).join("\n")).not.toContain("second line");
+    invocation.input(KEY_CTRL_P); // ctrl+p → expand
+    const expanded = invocation.render(120).join("\n");
+    expect(expanded).toContain(DETAIL_PROMPT_EXPANDED);
+    expect(expanded).toContain("second line");
+    invocation.input(KEY_CTRL_P); // ctrl+p → collapse
+    expect(invocation.render(120).join("\n")).toContain(detailPromptCollapsed(3));
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("subscribes for live repaints only while the drill-down is open (unsubscribed on view exit)", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    const inDetail = s.pi.renderRequests;
+    reg(s.registry, "agent-b"); // registry change while the detail is open
+    expect(s.pi.renderRequests).toBeGreaterThan(inDetail);
+    invocation.input(ESC); // detail → list releases the subscription
+    const afterExit = s.pi.renderRequests;
+    reg(s.registry, "agent-c");
+    expect(s.pi.renderRequests).toBe(afterExit);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("dispose releases the drill-down subscription (the leak-capable path — no Esc ever ran)", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER); // detail open: subscription taken
+    const inDetail = s.pi.renderRequests;
+    reg(s.registry, "agent-b");
+    expect(s.pi.renderRequests).toBeGreaterThan(inDetail); // live before dispose
+    // Pi calls dispose() when the component closes for ANY reason (fake-pi
+    // mirrors this) — with the detail still open, dispose is the only thing
+    // standing between the subscription and a session-long leak.
+    invocation.component!.dispose!();
+    const afterDispose = s.pi.renderRequests;
+    reg(s.registry, "agent-c");
+    expect(s.pi.renderRequests).toBe(afterDispose);
+  });
+
+  it("settling with a long tail top-anchors onto the final answer; resuming re-follows the newest line", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const tail = (n: number) =>
+      Array.from({ length: n }, (_, i) => `tail line ${String(i + 1).padStart(2, "0")}`);
+    // ~30 body lines so the 12-row viewport makes the anchor writes visible.
+    s.registry.noteProgress("agent-a", { tail: [], activity: "" }, tail(30));
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(200);
+    invocation.input(KEY_ENTER);
+    expect(invocation.render(200).join("\n")).toContain("tail line 30"); // following
+    s.tasks[0]!.status = "completed";
+    s.registry.markSettled("agent-a", {
+      outcome: "completed",
+      finalText: "the settled final answer",
+    });
+    // The settle transition wrote follow=false/scrollTop=0: with 30 tail
+    // lines below, the answer is visible ONLY because the view re-anchored.
+    const settled = invocation.render(200).join("\n");
+    expect(settled).toContain(DETAIL_BANNER_SETTLED);
+    expect(settled).toContain(DETAIL_FINAL_LABEL);
+    expect(settled).toContain("the settled final answer");
+    expect(settled).not.toContain("tail line 30");
+    s.registry.markResuming("agent-a");
+    const resumed = invocation.render(200).join("\n");
+    expect(resumed).toContain(DETAIL_BANNER_RESUMED);
+    expect(resumed).toContain("tail line 30"); // re-follow: newest tail visible
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("an async steer rejection replaces the optimistic sent notice with the failure notice", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, {
+      session: { steer: () => Promise.reject(new Error("pipe broke")) },
+    });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    invocation.input("go left");
+    invocation.input(KEY_ENTER); // send: the optimistic notice shows first
+    expect(invocation.render(120).join("\n")).toContain(DETAIL_STEER_SENT);
+    await new Promise((resolve) => setImmediate(resolve)); // let the rejection land
+    const after = invocation.render(120).join("\n");
+    expect(after).toContain(detailSteerFailed("pipe broke"));
+    expect(after).not.toContain(DETAIL_STEER_SENT);
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("a synchronously throwing steer surfaces the failure notice inline", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, {
+      session: {
+        steer: () => {
+          throw new Error("sync boom");
+        },
+      },
+    });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    invocation.input("go right");
+    invocation.input(KEY_ENTER);
+    const after = invocation.render(120).join("\n");
+    expect(after).toContain(detailSteerFailed("sync boom"));
+    expect(after).not.toContain(DETAIL_STEER_SENT);
+    invocation.input(ESC); // the sync-throw path kept the buffer → cleared first
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("a rejection landing after exit-and-re-enter never bleeds into the new detail state", async () => {
+    let rejectSteer!: (err: unknown) => void;
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, {
+      session: {
+        steer: () =>
+          new Promise((_resolve, reject) => {
+            rejectSteer = reject;
+          }),
+      },
+    });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    invocation.input("go");
+    invocation.input(KEY_ENTER); // send: rejection still pending
+    invocation.input(ESC); // detail → list detaches the old DetailState
+    invocation.input(KEY_ENTER); // re-enter: a NEW DetailState
+    rejectSteer(new Error("late failure"));
+    await new Promise((resolve) => setImmediate(resolve));
+    const text = invocation.render(120).join("\n");
+    expect(text).not.toContain(detailSteerFailed("late failure"));
+    expect(text).not.toContain("steer failed");
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("a pasted multi-line chunk flattens into the buffer; lone keys and chords keep their meanings", async () => {
+    const steered: string[] = [];
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, {
+      prompt: "the one prompt line",
+      session: { steer: (text: string) => void steered.push(text) },
+    });
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    const steerLine = () => invocation.render(120).find((l) => l.startsWith(DETAIL_STEER_PREFIX))!;
+    invocation.input("\n"); // a LONE \n is the send key, never buffer text
+    expect(steered).toEqual([]); // empty buffer → nothing sent
+    expect(steerLine()).toBe(DETAIL_STEER_PREFIX); // and nothing buffered
+    invocation.input("line one\nline two"); // pasted chunk: flattened, buffered
+    expect(steerLine()).toBe(`${DETAIL_STEER_PREFIX}line one line two`);
+    invocation.input(KEY_CTRL_P); // ctrl chords unchanged: still the prompt toggle
+    expect(invocation.render(120).join("\n")).toContain(DETAIL_PROMPT_EXPANDED);
+    expect(steerLine()).toBe(`${DETAIL_STEER_PREFIX}line one line two`);
+    invocation.input(KEY_ENTER); // send delivers the flattened text
+    expect(steered).toEqual(["line one line two"]);
+    invocation.input(ESC);
     invocation.input(ESC);
     await invocation.result;
   });
@@ -1753,7 +2438,42 @@ describe("panel focus (offline integration: fake-pi + fake-sdk)", () => {
 
       invocation.input(ESC);
       await invocation.result;
+      await Promise.resolve(); // let the close cleanup (suppression release) settle
+      // The passive widget consumes the dismissed set: the dismissed (and
+      // only) row must NOT re-appear after the panel closes.
+      expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(false);
     } finally {
+      internals.subagentPanel.setSuppressed(true);
+    }
+  });
+
+  it("drill-down steer reaches session.steer and NEVER fires UserPromptSubmit hooks (pinned PiCC decision)", async () => {
+    const gate = new Promise<void>(() => {}); // held open — the agent stays steerable
+    const handle = fakeSdk({ replies: [{ text: "unused", gate }] });
+    const { pi, internals } = await boot(handle);
+    const hookFire = vi.spyOn(HookRunner.prototype, "fire");
+    try {
+      await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx());
+      await dispatchBackground(pi, "t1");
+      await handle.waitForPromptCalls(1);
+
+      pi.shortcuts.get(PANEL_ENTRY_CHORD)!.handler(pi.tuiCtx());
+      const invocation = pi.customs[0]!;
+      await invocation.ready;
+      invocation.render(120);
+      invocation.input(KEY_ENTER); // list → drill-down
+      invocation.input("focus on the failing test");
+      invocation.input(KEY_ENTER); // send
+      expect(handle.sessions[0]!.steerMessages).toEqual(["focus on the failing test"]);
+      expect(invocation.render(120).join("\n")).toContain(DETAIL_STEER_SENT);
+      // Steer text bypasses UserPromptSubmit — the hook runner is never invoked.
+      expect(hookFire.mock.calls.filter(([event]) => event === "UserPromptSubmit")).toEqual([]);
+
+      invocation.input(ESC);
+      invocation.input(ESC);
+      await invocation.result;
+    } finally {
+      hookFire.mockRestore();
       internals.subagentPanel.setSuppressed(true);
     }
   });

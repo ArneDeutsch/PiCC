@@ -1,4 +1,4 @@
-import type { SubagentRegistry, SubagentRegistryRecord } from "./subagent-registry.js";
+import { guardSteer, type SubagentRegistry, type SubagentRegistryRecord } from "./subagent-registry.js";
 import {
   SubagentPanelModel,
   newestTaskByAgent,
@@ -7,7 +7,17 @@ import {
   type PanelTaskInfo,
   type PanelViewModel,
 } from "./subagent-panel-model.js";
-import { PANEL_RUNNING_FRAMES, renderSubagentPanel } from "./subagent-panel-render.js";
+import {
+  DETAIL_BANNER_RESUMED,
+  DETAIL_BANNER_SETTLED,
+  DETAIL_BANNER_VANISHED,
+  DETAIL_STEER_SENT,
+  detailSteerFailed,
+  PANEL_RUNNING_FRAMES,
+  renderSubagentDetail,
+  renderSubagentPanel,
+  type PanelDetailUiState,
+} from "./subagent-panel-render.js";
 import { clampLines, themedFg } from "./render-util.js";
 import { sanitizeLine } from "./subagent-progress.js";
 import { PANEL_ENTRY_CHORD, PANEL_TICK_MS } from "./subagent-panel-widget.js";
@@ -15,19 +25,45 @@ import { PANEL_ENTRY_CHORD, PANEL_TICK_MS } from "./subagent-panel-widget.js";
 /**
  * Focused subagent panel: the `ctx.ui.custom` component behind the panel-entry
  * chord. Owns keyboard focus while open — arrow selection, stop/dismiss/
- * stop-all actions, and the Esc ladder — and suppresses the passive widget so
- * the agent list is never shown twice. All display logic stays in the pure
- * model/renderer; this shell owns key handling and action targeting.
+ * stop-all actions, the drill-down detail view with type-to-steer, and the Esc
+ * ladder (detail → list → editor) — and suppresses the passive widget so the
+ * agent list is never shown twice. All display logic stays in the pure
+ * model/renderer; this shell owns key handling, action targeting, and the
+ * detail view's UI state.
  */
 
-/** Raw ESC byte, kept off string escapes so the source stays pure ASCII. */
+/** Raw control bytes, built from code points so the source stays pure ASCII. */
 const ESC_BYTE = String.fromCharCode(27);
+const CTRL_P_BYTE = String.fromCharCode(16);
+const CTRL_X_BYTE = String.fromCharCode(24);
+const BACKSPACE_DEL = String.fromCharCode(127);
+const BACKSPACE_BS = String.fromCharCode(8);
 
 /** Second `X` within this window confirms stop-all (Claude Code's own pattern). */
 export const STOP_ALL_CONFIRM_MS = 3000;
 
 /** Render-side cap for an agent name interpolated into a status notice. */
 const NOTICE_LABEL_CAP = 60;
+
+/** Steer input buffer cap (code points) — bounded like every other buffer. */
+export const STEER_INPUT_CAP = 2000;
+
+/** Cap for inline detail notices (guard refusals interpolate an agent name). */
+const DETAIL_NOTICE_CAP = 200;
+
+/**
+ * True for data that is typed/pasted TEXT (no control bytes anywhere): only
+ * such input may enter the steer buffer. Chords and escape sequences all carry
+ * a control byte and fall through to the key handlers instead.
+ */
+function isTypedText(data: string): boolean {
+  if (!data) return false;
+  for (const ch of data) {
+    const code = ch.codePointAt(0)!;
+    if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) return false;
+  }
+  return true;
+}
 
 // --- status-line notice wordings (exported so tests pin the exact strings) ---
 
@@ -97,13 +133,23 @@ export interface SubagentPanelFocusDeps {
   /** Injected clock (tests); defaults to Date.now. */
   now?: () => number;
   tickMs?: number;
-  /**
-   * Drill-down seam: the detail-view renderer. When present, Enter on a
-   * resolvable row switches the component's internal view to "detail",
-   * rendered through this function with the stored selection key; Esc pops
-   * back to the list. Absent, Enter only stores the selection (a no-op stub).
-   */
-  renderDetail?: (key: PanelSelectionKey, width: number, theme: unknown) => string[];
+}
+
+/**
+ * Per-open drill-down state. The selection KEY keeps t05's stale-refusal
+ * action semantics for the chorded stop; the agent id is what the view itself
+ * re-resolves each render (registry records never evict, so the record
+ * outlives generation changes and keeps rendering through them).
+ */
+interface DetailState {
+  key: PanelSelectionKey;
+  agentId: string;
+  ui: PanelDetailUiState;
+  lastObservedState: "running" | "settled" | "gone";
+  /** Max scroll reported by the last render — what scroll keys clamp against. */
+  lastMaxScroll: number;
+  /** Live-repaint registry subscription; called on view exit and dispose. */
+  unsubscribe?: () => void;
 }
 
 /**
@@ -158,6 +204,18 @@ export class SubagentPanelFocusController {
   /** Current dismissed keys — introspection for the pruning contract's tests. */
   dismissedKeyIds(): string[] {
     return [...this.dismissed];
+  }
+
+  /**
+   * Read-only snapshot of the dismissed keys — the passive widget's
+   * `dismissed` dep (called per view, so staleness is one render at most), so
+   * a row dismissed here stays hidden after the panel closes instead of
+   * re-appearing until its linger expires. A defensive COPY: the ReadonlySet
+   * type is compile-time only, and handing out the live set would let any
+   * consumer mutate panel dismissal state through a cast.
+   */
+  dismissedKeys(): ReadonlySet<string> {
+    return new Set(this.dismissed);
   }
 
   /**
@@ -296,6 +354,21 @@ export class SubagentPanelFocusController {
   }
 
   /**
+   * Re-resolve the drill-down's record + newest-generation task each render.
+   * A poisoned join degrades to "no record" (→ the vanished banner) — the
+   * detail view never throws or freezes on registry state.
+   */
+  private detailData(agentId: string): { record?: SubagentRegistryRecord; taskId?: string } {
+    try {
+      const record = this.deps.registry.get(agentId);
+      const task = newestTaskByAgent(this.deps.tasks()).get(agentId);
+      return { record, taskId: task?.id };
+    } catch {
+      return {};
+    }
+  }
+
+  /**
    * The full single-stop semantics, applied identically by `x` and stop-all:
    * the agent-side permanence marker FIRST (so a racing settlement already
    * sees `userStopped`), then the task-side marker+abort, which drives the
@@ -331,7 +404,7 @@ export class SubagentPanelFocusController {
     let frame = 0;
     let closed = false;
     let viewMode: "list" | "detail" = "list";
-    let detailKey: PanelSelectionKey | undefined;
+    let detail: DetailState | undefined;
     let stopAllArmedAt: number | undefined;
 
     const close = (): void => {
@@ -374,10 +447,11 @@ export class SubagentPanelFocusController {
     }, this.tickMs);
     interval.unref?.();
 
-    /** Action shared by `x` (context) and `d` (dismiss-only). */
-    const act = (mode: "context" | "dismiss"): void => {
-      const key = model.selection();
-      if (!key) return;
+    /**
+     * Action shared by `x`/`d` in the list and `ctrl+x` in the drill-down —
+     * identical re-resolve/stale semantics on every surface.
+     */
+    const actOnKey = (key: PanelSelectionKey, mode: "context" | "dismiss"): void => {
       const target = this.resolveTarget(key);
       switch (target.kind) {
         case "running-background":
@@ -403,6 +477,11 @@ export class SubagentPanelFocusController {
           return;
       }
     };
+    const act = (mode: "context" | "dismiss"): void => {
+      const key = model.selection();
+      if (!key) return;
+      actOnKey(key, mode);
+    };
 
     const stopAll = (): void => {
       // Targets are collected at THIS keypress, so the confirming press stops
@@ -427,22 +506,216 @@ export class SubagentPanelFocusController {
     const enter = (): void => {
       const key = model.selection();
       if (!key) return;
-      if (this.resolveTarget(key).kind === "stale") {
+      const target = this.resolveTarget(key);
+      if (target.kind === "stale") {
         notify(PANEL_NOTICE_STALE);
         return;
       }
-      detailKey = key;
-      // Without a wired detail view (the drill-down task's seam), Enter only
-      // stores the selection.
-      if (this.deps.renderDetail) viewMode = "detail";
+      // Live repaint while the drill-down is open: progress events land on
+      // the registry between ticks, and a 1s tick alone would lag the tail.
+      let unsubscribe: (() => void) | undefined;
+      try {
+        unsubscribe = this.deps.registry.onChange(() => {
+          try {
+            tui.requestRender?.();
+          } catch {
+            // repaint is best-effort
+          }
+        });
+      } catch {
+        // no live repaint — the tick still refreshes the view
+      }
+      detail = {
+        key,
+        agentId: target.record.agentId,
+        ui: {
+          promptExpanded: false,
+          scrollTop: 0,
+          // Running opens onto the live tail (auto-following); finished opens
+          // at the top, where the final answer leads.
+          follow: target.record.state === "running",
+          steerBuffer: "",
+        },
+        lastObservedState: target.record.state,
+        lastMaxScroll: 0,
+        unsubscribe,
+      };
+      viewMode = "detail";
+    };
+
+    /** Leave the drill-down for the list, releasing its subscription. */
+    const exitDetail = (): void => {
+      try {
+        detail?.unsubscribe?.();
+      } catch {
+        // an unsubscribing throw must not trap the Esc ladder
+      }
+      detail = undefined;
+      viewMode = "list";
+    };
+
+    const scrollDetail = (delta: number): void => {
+      const d = detail!;
+      const max = d.lastMaxScroll;
+      const current = d.ui.follow ? max : Math.min(d.ui.scrollTop, max);
+      const next = Math.max(0, Math.min(max, current + delta));
+      d.ui.scrollTop = next;
+      // Follow re-engages only at the bottom; a scrolled-back view stays
+      // anchored so incoming lines don't yank the reader down.
+      d.ui.follow = next >= max;
+    };
+
+    const sendSteer = (): void => {
+      const d = detail!;
+      const text = d.ui.steerBuffer;
+      if (!text.trim()) return;
+      const record = this.deps.registry.get(d.agentId);
+      if (!record) {
+        d.ui.notice = DETAIL_BANNER_VANISHED;
+        return;
+      }
+      // Deliberately NO UserPromptSubmit hook here — a PiCC decision, not a
+      // parity claim: those hooks fire on the MAIN session's prompt turns
+      // (the `input` handler in src/index.ts), and Claude Code leaves its
+      // steering hook behavior undocumented, so PiCC pins "steer text goes
+      // straight to the running session" rather than inventing a contract.
+      const guarded = guardSteer(record);
+      if (!guarded.ok) {
+        d.ui.notice = sanitizeLine(guarded.refusal, DETAIL_NOTICE_CAP);
+        return;
+      }
+      try {
+        // The ONLY delivery path is the guard's bound steer fn — a caller
+        // that passed the guard cannot reach a different session.
+        const delivered = guarded.steer(text);
+        Promise.resolve(delivered).catch((err) => {
+          // The rejection can land after this DetailState was detached (view
+          // exited, or exited and re-entered — a NEW state object by then):
+          // never write the failure notice into a dead state or bleed it into
+          // a later drill-down.
+          if (detail !== d) return;
+          d.ui.notice = sanitizeLine(
+            detailSteerFailed((err as Error)?.message ?? "unknown error"),
+            DETAIL_NOTICE_CAP,
+          );
+          try {
+            tui.requestRender?.();
+          } catch {
+            // repaint is best-effort
+          }
+        });
+        d.ui.steerBuffer = "";
+        d.ui.notice = DETAIL_STEER_SENT;
+      } catch (err) {
+        d.ui.notice = sanitizeLine(
+          detailSteerFailed((err as Error)?.message ?? "unknown error"),
+          DETAIL_NOTICE_CAP,
+        );
+      }
+    };
+
+    const handleDetailKey = (data: string, matches: (id: string) => boolean): void => {
+      const d = detail!;
+      if (matches("tui.select.up")) {
+        scrollDetail(-1);
+        return;
+      }
+      if (matches("tui.select.down")) {
+        scrollDetail(1);
+        return;
+      }
+      if (matches("tui.select.confirm") || data === "\r" || data === "\n") {
+        sendSteer();
+        return;
+      }
+      if (data === CTRL_X_BYTE) {
+        actOnKey(d.key, "context");
+        return;
+      }
+      if (data === CTRL_P_BYTE) {
+        d.ui.promptExpanded = !d.ui.promptExpanded;
+        if (d.ui.promptExpanded) {
+          // The expanded prompt sits at the TOP of the scrollable body — jump
+          // there, or the expansion would be invisible under a following tail.
+          d.ui.follow = false;
+          d.ui.scrollTop = 0;
+        } else if (d.lastObservedState === "running") {
+          d.ui.follow = true;
+        }
+        return;
+      }
+      if (data === BACKSPACE_DEL || data === BACKSPACE_BS) {
+        d.ui.notice = undefined;
+        d.ui.steerBuffer = [...d.ui.steerBuffer].slice(0, -1).join("");
+        return;
+      }
+      // Paste flatten, for MULTI-character chunks only: a chunk with several
+      // code points is pasted text, so its newlines/tabs become single spaces
+      // BEFORE the control-byte check — a multi-line paste enters the buffer
+      // instead of vanishing silently. Single characters keep their exact key
+      // meanings (lone \r is the send key above; lone \t stays excluded), and
+      // chords/bracketed-paste framing carry OTHER control bytes, so they
+      // still fall through isTypedText unchanged.
+      const text =
+        [...data].length > 1 ? data.replace(/\r\n|[\r\n\t]/g, " ") : data;
+      if (!isTypedText(text)) return;
+      // Typed text reaches the buffer only while steering is actually
+      // available; otherwise the rendered "steering unavailable (…)" line
+      // explains the inert keys — text is never accepted into a buffer that
+      // cannot send.
+      const record = this.deps.registry.get(d.agentId);
+      if (!record || !guardSteer(record).ok) return;
+      d.ui.notice = undefined;
+      d.ui.steerBuffer = [...`${d.ui.steerBuffer}${text}`].slice(0, STEER_INPUT_CAP).join("");
+    };
+
+    const renderDetailView = (width: number): string[] => {
+      const d = detail!;
+      const data = this.detailData(d.agentId);
+      // Live state changes while open are narrated, never a crash/freeze: the
+      // banner pins the transition and the layout/anchor follow the new state.
+      const observed: DetailState["lastObservedState"] = data.record
+        ? data.record.state
+        : "gone";
+      if (observed !== d.lastObservedState) {
+        if (observed === "gone") {
+          d.ui.banner = DETAIL_BANNER_VANISHED;
+          // The vanished view renders no steer line, so buffered text would
+          // make the first Esc (clear-buffer-first semantics) look dead —
+          // there is nothing to send it to anyway.
+          d.ui.steerBuffer = "";
+        } else if (observed === "settled") {
+          d.ui.banner = DETAIL_BANNER_SETTLED;
+          // The finished layout leads with the final answer — jump to it.
+          d.ui.follow = false;
+          d.ui.scrollTop = 0;
+        } else {
+          d.ui.banner = DETAIL_BANNER_RESUMED;
+          d.ui.follow = true;
+          // Re-key the stored selection to the resume's newest task
+          // generation (when one resolves): the header shows the new task id
+          // and the banner announces the resume, so the advertised
+          // `ctrl+x stop` must act on the DISPLAYED generation — the old key
+          // would hit t05's stale refusal instead.
+          if (data.taskId) d.key = { kind: "task", taskId: data.taskId };
+        }
+        d.lastObservedState = observed;
+      }
+      const rendered = renderSubagentDetail(
+        { record: data.record, taskId: data.taskId, nowMs: this.nowFn() },
+        d.ui,
+        { width, theme, runningFrame: PANEL_RUNNING_FRAMES[frame] },
+      );
+      d.lastMaxScroll = rendered.maxScroll;
+      return rendered.lines;
     };
 
     return {
       render: (width: number): string[] => {
         // Defensive render: pi-tui kills the process on a throwing render.
         try {
-          if (viewMode === "detail" && detailKey && this.deps.renderDetail) {
-            return clampLines(this.deps.renderDetail(detailKey, width, theme), width);
+          if (viewMode === "detail" && detail) {
+            return renderDetailView(width);
           }
           const view = computeView();
           if (view.empty) {
@@ -479,11 +752,30 @@ export class SubagentPanelFocusController {
           // Esc first, with a raw-byte fallback so the component stays
           // escapable even if the keybindings surface is broken.
           if (matches("tui.select.cancel") || data === ESC_BYTE) {
-            if (viewMode === "detail") viewMode = "list";
-            else close();
+            if (viewMode === "detail") {
+              // Pinned Esc semantics with a non-empty steer buffer: the first
+              // Esc cancels the in-progress text (standard input-cancel), the
+              // next steps back — Esc never both discards text AND changes
+              // view in one press, and the ladder stays fully walkable.
+              if (detail && detail.ui.steerBuffer.length > 0) {
+                detail.ui.steerBuffer = "";
+                detail.ui.notice = undefined;
+                return;
+              }
+              exitDetail();
+            } else {
+              close();
+            }
             return;
           }
-          if (viewMode === "detail") return; // drill-down keys are the detail task's
+          if (viewMode === "detail") {
+            if (!detail) {
+              viewMode = "list"; // defensive: never wedge on a stateless detail
+              return;
+            }
+            handleDetailKey(data, matches);
+            return;
+          }
           if (matches("tui.select.up")) {
             computeView();
             model.moveSelection(-1);
@@ -508,6 +800,11 @@ export class SubagentPanelFocusController {
       },
       dispose: (): void => {
         clearInterval(interval);
+        try {
+          detail?.unsubscribe?.();
+        } catch {
+          // dispose must complete even if the unsubscribe throws
+        }
       },
     };
   }
