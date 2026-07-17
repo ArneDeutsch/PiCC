@@ -6,7 +6,7 @@ import type { CwdState } from "../cwd-state.js";
 import type { WorktreeManagerLike } from "../subagents.js";
 
 /**
- * EnterWorktree / ExitWorktree tool definitions (plan §4.4).
+ * EnterWorktree / ExitWorktree tool definitions.
  * The cwd swap happens via CwdState — every other tool resolves through it.
  * WorktreeCreate / WorktreeRemove project hooks fire around the lifecycle.
  */
@@ -32,8 +32,8 @@ export function createWorktreeTools(deps: {
       if (!result.ok || !result.worktreePath) {
         throw new Error(result.error ?? "EnterWorktree failed");
       }
-      // Already inside a different worktree: CwdState has no stack (plan §4.4),
-      // so release the previous one (keep + unlock) — otherwise its on-disk
+      // Already inside a different worktree: CwdState has no stack, so release
+      // the previous one (keep + unlock) — otherwise its on-disk
       // `git worktree lock` leaks and blocks the project's own remove/prune.
       let releasedLine: string | undefined;
       if (previous !== undefined && path.resolve(previous) !== path.resolve(result.worktreePath)) {

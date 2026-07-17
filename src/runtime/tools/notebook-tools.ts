@@ -10,8 +10,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 /**
- * NotebookRead (plan F18 / ticket #16): a real, cell-based reader for Jupyter
- * `.ipynb` notebooks, replacing the former degraded no-op stub.
+ * NotebookRead: a cell-based reader for Jupyter `.ipynb` notebooks.
  *
  * PiCC's inherited `Read` tool does NOT special-case `.ipynb`, so without this
  * tool a model reading a notebook gets the raw JSON — base64 image blobs,
@@ -126,7 +125,6 @@ function renderData(data: unknown, state: RenderState): string {
   const hasPlain = entries.some(([mime]) => mime === "text/plain");
   const parts: string[] = [];
   for (const [mime, value] of entries) {
-    // Prefer text/plain over text/html when both exist (single representation).
     if (mime === "text/html" && hasPlain) continue;
     if (mime.startsWith("text/")) {
       parts.push(renderText(joinText(value), state));

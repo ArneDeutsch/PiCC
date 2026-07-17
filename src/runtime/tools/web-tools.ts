@@ -8,9 +8,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 /**
- * Web tools (plan §4.8): real `WebFetch` / `WebSearch` implementations —
- * research skills and agent `tools:` allowlists depend on these names
- * resolving to working tools.
+ * Web tools: `WebFetch` / `WebSearch` — research skills and agent `tools:`
+ * allowlists depend on these names resolving to working tools.
  *
  * All network paths honor both a hard 30s timeout and the execute()
  * AbortSignal (never hang), and all output is truncated.
