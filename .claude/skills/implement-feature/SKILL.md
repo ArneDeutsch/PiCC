@@ -114,7 +114,7 @@ Entry: all task specs written. Fan reviewers over the whole plan folder in paral
 
 ## Phase 7 — Implementation loop
 
-Entry: plan accepted. For each task, in planned order: **dispatch** a fresh `implementer` with feature.md + task spec + the standing rules; apply the escalation boundary; run the **review fan-out** yourself; **triage and fix**; **distill** into `observations.md`; then **gate on green and commit** `<feature-slug>: t<task-number> — <description>`, staging bounded. The standing rules, fan-out staging, and the full loop: `references/phase-7-implementation.md` — you MUST read it before dispatching.
+Entry: plan accepted. For each task, in planned order: **dispatch** a fresh `implementer` with feature.md + task spec + the standing rules; apply the escalation boundary; run the **review fan-out** yourself; **triage and fix**; **distill** into `observations.md`; then **gate on green and commit** `<feature-slug>: t<task-number> — <description>` — never a blank `git add -A`; before every commit re-check the staged set for scope and the working tree for freshness (`git status --short`). The standing rules, fan-out staging, and the full loop: `references/phase-7-implementation.md` — you MUST read it before dispatching.
 
 ## Phase 8 — Feature close review
 

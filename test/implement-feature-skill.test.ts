@@ -147,6 +147,9 @@ describe("description-based naming contract", () => {
     const body = collapsed("SKILL.md");
     expect(body).toContain("classify resume before new naming");
     expect(body).toContain("<feature-slug>: t<task-number> — <description>");
+    // The commit freshness reminder must stay resident: the stale-index hazard fires mid-phase,
+    // with no phase-entry event to trigger a reference re-read.
+    expect(body).toContain("the working tree for freshness");
     expect(body).toContain("never sanitize/add a counter");
     expect(body).toContain("explicit human confirmation");
     expect(body).toContain("may delete a raced unregistered directory");
@@ -161,6 +164,19 @@ describe("description-based naming contract", () => {
     // (`git add -A` staging or a reviewer `git status --short` read); no brittle exact-phrase pin.
     const body = collapsed("references/phase-7-implementation.md");
     expect(body).toMatch(/git add -a|git status --short/);
+  });
+
+  it("Phase 7 commit step pairs a scope check with a staleness-capable freshness check", () => {
+    // Loose representative substrings of the pre-commit contract — the surrounding prose stays
+    // freely editable. Guards against the two real incidents: a stale index committed after a fix
+    // round (all gates green — they run on the working tree, not the index) and a `git mv` rename
+    // from other work swept into an unrelated commit. `collapsed()` keeps backticks, so the
+    // blank-add floor marker retains them.
+    const body = collapsed("references/phase-7-implementation.md");
+    expect(body).toContain("git diff --cached");
+    expect(body).toContain("a double-letter code");
+    expect(body).toContain("`git mv` auto-stages");
+    expect(body).toContain("never a blank `git add -a && git commit`");
   });
 
   it("pins the plan-folder templates and task-local numbering (loose)", () => {
