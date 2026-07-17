@@ -134,18 +134,10 @@ describe("F14 t02 — Skill-tool fork consumer", () => {
 });
 
 describe("F14 — SlashCommand-tool fork consumer (shares runSkillActivation with the Skill tool)", () => {
-  it("(8) failed WITH partial output → partial preserved + cause named", async () => {
-    const h = fakeSdk({ onPrompt: partialThenApiDeath("503 upstream unavailable") });
-    const slashTool = (await wire(h.sdk)).tools.get("SlashCommand");
-    const res = await slashTool.execute("c1", { command: "/fork-research wasm abi" });
-    const text = res.content[0].text as string;
-    expect(text.startsWith("partial research findings")).toBe(true);
-    expect(text).toMatch(API_DEATH);
-    expect(text).toContain("503 upstream unavailable");
-    expect(res.details.cutOff).toBe(true);
-    expect(res.details.forked).toBe(true);
-  });
-
+  // The partial-output / no-output outcomes are proven verbatim by the Skill-tool
+  // matrix above (SlashCommand shares runSkillActivation), so only the distinct
+  // abort path — Esc threaded through SlashCommand.execute's positional 3rd arg —
+  // is retained here as this surface's representative.
   it("(9) Esc aborts the fork → abort wording (signal threads SlashCommand→runSkillActivation→dispatch)", async () => {
     const gate = new Promise<void>(() => {}); // never resolves — only abort ends it
     const h = fakeSdk({ replies: [{ text: "never delivered", gate }] });
