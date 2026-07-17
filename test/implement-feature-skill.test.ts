@@ -25,6 +25,12 @@ describe("implement-feature router", () => {
   const { skills } = loadSkills([{ dir: SKILLS_DIR, scope: "project" }], []);
   const skill = skills.find((s) => s.name === "implement-feature");
 
+  // A representative ~150-char documented invocation, shared by the substitution-inflation and
+  // margin tests below so both render the same worst-case body.
+  const longArgsText =
+    "#5 also add structured logging around the dispatch loop and make sure the retry path is " +
+    "covered by an offline integration test in the tester layer please";
+
   it("loads with a valid frontmatter contract", () => {
     // `name` must equal the expected identity (catches a `name:` value typo; the loader falls back to
     // the dir basename, which is also "implement-feature", so a removed key still passes — acceptable).
@@ -34,6 +40,12 @@ describe("implement-feature router", () => {
     expect(skill!.description.length).toBeGreaterThan(0);
   });
 
+  // The trunk-size constraint, for whoever reddens the assertions below: SKILL.md is the
+  // always-resident body — re-injected into context after every compaction — and is capped at
+  // REINJECT_PER_SKILL_MAX_CHARS, a Claude-parity value whose rationale lives in its JSDoc in
+  // src/runtime/skill-activation.ts. The references/*.md bodies are read on demand and carry no
+  // budget. When a trunk edit trips the cap or the 2k margin, move the detail into a references/
+  // file named by the phase spine — raising the constant is a runtime behavior change, not the fix.
   it("router body stays within the per-skill re-injection cap", () => {
     // Tie the assertion to the runtime constant, not a hardcoded 20000.
     const body = loadSkillBody(skill!);
@@ -48,15 +60,17 @@ describe("implement-feature router", () => {
     // once via the append-fallback instead. Render with a representative ~150-char invocation and
     // assert the rendered body still fits.
     const body = loadSkillBody(skill!);
-    const argsText =
-      "#5 also add structured logging around the dispatch loop and make sure the retry path is " +
-      "covered by an offline integration test in the tester layer please";
-    expect(argsText.length).toBeGreaterThanOrEqual(140);
-    const rendered = substituteArguments(body, argsText, skill!.arguments);
+    expect(longArgsText.length).toBeGreaterThanOrEqual(140);
+    const rendered = substituteArguments(body, longArgsText, skill!.arguments);
     expect(rendered.text.length).toBeLessThanOrEqual(REINJECT_PER_SKILL_MAX_CHARS);
     // The ref still reaches the coordinator — via the no-marker append fallback, since the router
     // body carries no literal `$ARGUMENTS`/`$N`/`$name` marker to substitute in place.
-    expect(rendered.text).toContain(`ARGUMENTS: ${argsText}`);
+    expect(rendered.text).toContain(`ARGUMENTS: ${longArgsText}`);
+  });
+
+  it("trunk stays 2k under the re-injection cap — move detail into references/, never raise the constant", () => {
+    const rendered = substituteArguments(loadSkillBody(skill!), longArgsText, skill!.arguments);
+    expect(rendered.text.length).toBeLessThanOrEqual(REINJECT_PER_SKILL_MAX_CHARS - 2000);
   });
 
   it("every linked reference resolves, and every reference file is linked (bidirectional, count-agnostic)", () => {
@@ -162,8 +176,14 @@ describe("description-based naming contract", () => {
     // non-ignored files so a reviewer's view is complete — guarding against a silent regression to
     // bare `git diff HEAD`, which has recurred repeatedly in practice. Accept either mechanism
     // (`git add -A` staging or a reviewer `git status --short` read); no brittle exact-phrase pin.
+    // Slice to the step-3 fan-out region: the commit step legitimately reads `git status --short`
+    // for freshness, so a file-wide match would pass on that text alone and stop guarding fan-out.
     const body = collapsed("references/phase-7-implementation.md");
-    expect(body).toMatch(/git add -a|git status --short/);
+    const start = body.indexOf("review fan-out");
+    const end = body.indexOf("triage and fix");
+    expect(start, "missing fan-out step marker").toBeGreaterThanOrEqual(0);
+    expect(end, "missing triage step marker").toBeGreaterThan(start);
+    expect(body.slice(start, end)).toMatch(/git add -a|git status --short/);
   });
 
   it("Phase 7 commit step pairs a scope check with a staleness-capable freshness check", () => {
@@ -617,5 +637,84 @@ describe("Phase 8 coordinator-run advisory issue search", () => {
     expect(body).toContain("metadata-only `html_url` scan is a *different* mechanism");
     // Negative pin: the metadata-only Rule 9 scan is NOT turned into a comment-body read.
     expect(body).not.toContain("scan the cached issue comments");
+  });
+});
+
+describe("progressive-phase-disclosure spine guards", () => {
+  // The corpus invariants: reference→reference links resolve, and the trunk keeps the
+  // read-on-entry spine — per-phase detail lives in references/ only because the spine forces the
+  // reads. All rename-proof — pinned
+  // to link/section shape, not filenames, so the corpus can evolve without touching this block.
+  const read = (relative: string): string =>
+    fs.readFileSync(path.join(SKILL_DIR, relative), "utf8").replace(/\r\n/g, "\n");
+  const collapsed = (relative: string): string => read(relative).toLowerCase().replace(/\s+/g, " ");
+
+  it("every reference-to-reference markdown link resolves from the references dir (fragments banned)", () => {
+    // Mirrors the cross-skill resolver's shape but resolves EVERY relative .md link from
+    // REFERENCES_DIR — the cross-skill test half-matches only the ../../ forms, so a renamed or
+    // deleted sibling reference could otherwise leave a dangling pointer. Capture the full link
+    // target before filtering: a naive \(...\.md\) pattern would silently SKIP an anchored
+    // `file.md#frag` link instead of failing it. The corpus is 100% fragment-free (bare `file.md`
+    // siblings plus `../../` cross-skill forms), so fragments are banned outright rather than
+    // stripped.
+    const refFiles = fs.readdirSync(REFERENCES_DIR).filter((n) => n.endsWith(".md"));
+    expect(refFiles.length).toBeGreaterThan(0);
+    let linksSeen = 0;
+    for (const name of refFiles) {
+      const text = read(`references/${name}`);
+      for (const match of text.matchAll(/\]\(([^)]+)\)/g)) {
+        const target = match[1]!;
+        // Only relative markdown-doc links; scheme-qualified targets (https:, mailto:) are not
+        // resolvable on disk and stay out of scope.
+        if (/^[a-z][a-z0-9+.-]*:/i.test(target) || !target.includes(".md")) continue;
+        linksSeen += 1;
+        expect(target, `${name} -> ${target}`).toMatch(/^(?:\.\/)?[A-Za-z0-9._/-]+\.md$/);
+        expect(fs.existsSync(path.resolve(REFERENCES_DIR, target)), `${name} -> ${target}`).toBe(
+          true,
+        );
+      }
+    }
+    expect(linksSeen).toBeGreaterThan(0);
+  });
+
+  it("keeps the read-on-entry re-read rule's kernel resident in the trunk", () => {
+    // The load-bearing mechanism of progressive disclosure: per-phase detail lives in references/
+    // on the strength of this rule, so its kernel must survive every trunk slimming — the
+    // verbatim-in-context test (with the compaction-summary exclusion) and the fail-closed
+    // refuse-writes clause. Loose substring pins on the kernel, not the surrounding prose.
+    const body = collapsed("SKILL.md");
+    expect(body).toContain("not verbatim in context");
+    expect(body).toContain("a compaction summary mentioning it does not count");
+    expect(body).toContain("an unreadable named reference refuses that phase's writes");
+  });
+
+  it("every entry-gated phase section keeps a MUST-read line naming a references/ file (count-agnostic)", () => {
+    // The phase spine, shape-pinned: split the trunk into ## sections and scan the Phase ones.
+    // Every phase section names at least one references/*.md; every phase with an `Entry:` event
+    // also carries a MUST-read line, so a slimming pass cannot silently drop the spine. Phase 0
+    // is the one legitimate exception — it runs at ref-parse time with no entry event (no
+    // `Entry:` line) — so at most ONE phase section may lack `Entry:`; a second one means a phase
+    // dropped its entry gate together with its read requirement.
+    const sections = read("SKILL.md")
+      .split(/\n(?=## )/)
+      .filter((section) => /^## Phase \d/.test(section));
+    expect(sections.length).toBeGreaterThan(0);
+    const entryGated = sections.filter((section) => /\bEntry:/.test(section));
+    const nonGated = sections.filter((section) => !/\bEntry:/.test(section));
+    expect(nonGated.length).toBeLessThanOrEqual(1);
+    // The one legitimate non-gated section is Phase 0 (ref-parse time, no entry event) — pinning
+    // its identity closes the two-edit hole where another phase de-gates while Phase 0 gains an
+    // `Entry:` line in the same change.
+    for (const section of nonGated) {
+      expect(section.split("\n", 1)[0]!).toMatch(/^## Phase 0\b/);
+    }
+    for (const section of sections) {
+      const heading = section.split("\n", 1)[0]!;
+      expect(section, heading).toMatch(/references\/[A-Za-z0-9_-]+\.md/);
+    }
+    for (const section of entryGated) {
+      const heading = section.split("\n", 1)[0]!;
+      expect(section.toLowerCase().replace(/\s+/g, " "), heading).toContain("must read");
+    }
   });
 });
