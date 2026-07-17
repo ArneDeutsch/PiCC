@@ -2147,6 +2147,7 @@ export function createAgentToolDefinition(
             });
           }
         : undefined;
+      const dispatchedAtMs = Date.now();
       const result = await runtime.dispatch({
         ...dispatchOpts,
         abortSignal: signal,
@@ -2162,6 +2163,13 @@ export function createAgentToolDefinition(
         // (formatUsageLine → formatUsageCompact). details is logs/UI-only — never
         // the model-visible content, so the verbatim-return contract is untouched.
         usage: result.usage,
+        // Elapsed wall-clock of the awaited dispatch, so FOREGROUND completion
+        // records show a duration like background ones (whose registry stamps
+        // startedAt/settledAt). Measured locally: the subagent registry that
+        // carries those stamps is private to the runtime and unreachable from
+        // this tool factory; this delta spans the identical interval. details
+        // is UI-only, so print/RPC output is untouched.
+        durationMs: Date.now() - dispatchedAtMs,
       };
       // Claude 2.1.200 outcome→presentation mapping: the text, cut-off frame,
       // resume trailer, and throw-vs-return decision all live in the shared,

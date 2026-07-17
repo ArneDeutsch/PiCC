@@ -45,6 +45,13 @@ const CAPTURED_LINE_CAP = 120;
 export interface SettlementNotice {
   content: string;
   /**
+   * Structured, UI-only record data riding `pi.sendMessage`'s `details` so the
+   * registered `picc-settlement` renderer can draw the collapsed-expandable
+   * completion record. Never model-visible — `content` above stays the entire
+   * model-facing text, byte-identical to before this field existed.
+   */
+  details: Record<string, unknown>;
+  /**
    * Final synchronous check immediately before delivery. A notice selected by a
    * prior drain can become stale when its task is collected or a newer resume
    * generation claims the same agent id.
@@ -163,6 +170,13 @@ export interface BackgroundTaskRecord {
    * "stopped by user" rendering.
    */
   userStopped?: boolean;
+  /**
+   * Epoch ms the task started / left "running" — display-only inputs for the
+   * completion record's `details.durationMs`. Optional so structural
+   * test/diagnostic records created outside the registry stay valid.
+   */
+  startedAt?: number;
+  settledAt?: number;
   diagnostics: Diagnostic[];
   /** Settles when the underlying dispatch ends (never rejects). */
   settled: Promise<void>;
@@ -302,6 +316,7 @@ export class BackgroundTaskRegistry {
           ? undefined
           : sanitizeLine(agentType, CAPTURED_LINE_CAP) || undefined,
       owner,
+      startedAt: Date.now(),
       diagnostics: [],
       settled: Promise.resolve(),
       abort,
@@ -309,6 +324,10 @@ export class BackgroundTaskRegistry {
     };
     record.settled = promise.then(
       (result) => {
+        // Settlement timestamp (display-only): `??=` — a stop() that already
+        // stamped the moment the task left "running" wins over the (later)
+        // promise settlement.
+        record.settledAt ??= Date.now();
         // Capture-time sanitization of the mirrored agent name.
         record.agentName =
           result.agentName === undefined
@@ -349,6 +368,7 @@ export class BackgroundTaskRegistry {
         }
       },
       (err) => {
+        record.settledAt ??= Date.now();
         if (record.status !== "stopped") {
           record.status = "failed";
           record.error = capErrorText(err instanceof Error ? err.message : String(err));
@@ -471,6 +491,7 @@ export class BackgroundTaskRegistry {
         (fallback || isArmed(agentId));
       notices.push({
         content: buildSettlementNotice(task),
+        details: settlementRecordDetails(task),
         isValid,
         commit: () => {
           if (!isValid()) return;
@@ -522,6 +543,9 @@ export class BackgroundTaskRegistry {
       return { found: true, alreadySettled: true, abortRequested: false };
     }
     task.status = "stopped";
+    // Duration display ends at the stop, not at the (possibly much later)
+    // cooperative promise settlement.
+    task.settledAt ??= Date.now();
     let abortRequested = false;
     if (task.abort) {
       try {
@@ -759,6 +783,50 @@ export function buildSettlementNotice(task: BackgroundTaskRecord): string {
   return lines.join("\n");
 }
 
+/**
+ * Cap for the final text carried on the settlement record's UI details —
+ * mirrors the registry's stored-conversation cap (`FINAL_TEXT_CAP` in
+ * subagent-registry.ts), duplicated locally per this module's no-value-import
+ * convention. Bounds the persisted session entry; rendering sanitizes.
+ */
+const RECORD_FINAL_TEXT_CAP = 16384;
+
+/**
+ * The structured, UI-only completion-record data attached to a settlement
+ * notice (`SettlementNotice.details`): everything the collapsed-expandable
+ * record renders — outcome, identity, duration, usage, transcript pointer,
+ * error, bounded final text, the user-stop marker, and a `nested` flag (an
+ * owner-tagged task was dispatched by a subagent; nested tasks get no
+ * main-chat completion record). `record: "subagent-completion"` is the shape
+ * marker the registered renderer keys on. Never model-visible.
+ */
+function settlementRecordDetails(task: BackgroundTaskRecord): Record<string, unknown> {
+  const outcome = noticeOutcome(task.status);
+  const raw = outcome === "aborted" ? "" : task.result ?? "";
+  const finalText =
+    raw.length > RECORD_FINAL_TEXT_CAP ? `${raw.slice(0, RECORD_FINAL_TEXT_CAP)}…` : raw;
+  return {
+    record: "subagent-completion",
+    taskId: task.id,
+    status: task.status,
+    outcome,
+    agent: task.agentType ?? task.agentName ?? "subagent",
+    agentId: task.agentId,
+    cutOff: task.truncated === true,
+    transcriptPath: task.transcriptPath,
+    resumable: task.resumable,
+    usage: task.usage,
+    diagnostics: task.diagnostics,
+    ...(task.startedAt !== undefined && task.settledAt !== undefined
+      ? { durationMs: Math.max(0, task.settledAt - task.startedAt) }
+      : {}),
+    ...(task.error ? { error: task.error } : {}),
+    ...(finalText ? { finalText } : {}),
+    ...(task.userStopped ? { userStopped: true } : {}),
+    ...(task.owner !== undefined ? { nested: true } : {}),
+  };
+}
+
 function unknownIdError(view: BackgroundTaskView, id: string): Error {
   const known = view.ids();
   return new Error(
@@ -931,9 +999,23 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
       // SETTLED task — a running poll carries no outcome (renderResult keys the
       // poll frame on status:"running" instead).
       const outcome = task.status === "running" ? undefined : noticeOutcome(task.status);
+      // Exactly-once reconciliation flag: the completion record was already
+      // emitted for this task generation (settlement notice delivered, or an
+      // earlier collection), so this result renders only a minimal reference
+      // line. Read BEFORE the markCollected transition below flips the state.
+      const alreadyReported =
+        task.status !== "running" && (task.settlementDelivery ?? "pending") !== "pending";
+      const durationMs =
+        task.status !== "running" && task.startedAt !== undefined && task.settledAt !== undefined
+          ? Math.max(0, task.settledAt - task.startedAt)
+          : undefined;
       // Construct the complete response before changing delivery state. The
       // owner-safe transition is the final operation before a terminal return,
       // so a running poll or any earlier throw leaves settlement eligible.
+      // durationMs / error / userStopped / alreadyReported are details-ONLY
+      // additions — the sanctioned UI channel; renderers are pure over
+      // (result, details, theme) and cannot read the registry, and `text`
+      // above stays byte-identical for print/RPC.
       const output = {
         content: [{ type: "text", text }],
         details: {
@@ -949,9 +1031,10 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
           usage: task.usage,
           lastActivity: task.lastActivity,
           diagnostics: task.diagnostics,
-          // "Stopped by user" travels via details ONLY: renderers are pure
-          // over (result, details, theme) and cannot read the registry.
+          ...(durationMs !== undefined ? { durationMs } : {}),
+          ...(task.error ? { error: task.error } : {}),
           ...(task.userStopped ? { userStopped: true } : {}),
+          ...(alreadyReported ? { alreadyReported: true } : {}),
         },
       };
       if (task.status !== "running" && !registry.markCollected(id)) {

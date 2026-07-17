@@ -47,6 +47,14 @@ export interface FakePi {
   userMessages: Array<{ content: any; options?: any }>;
   entries: Array<{ customType: string; data: any }>;
   entryRenderers: Map<string, (entry: any, options: any, theme: any) => any>;
+  /**
+   * Custom-MESSAGE renderers registered via `pi.registerMessageRenderer`
+   * (real Pi records them into `Extension.messageRenderers` and
+   * CustomMessageComponent invokes them with `(message, { expanded }, theme)`
+   * — pinned in test/pi-contract.test.ts). Recorded so wiring tests can drive
+   * the registered renderer against a recorded `sendMessage` payload.
+   */
+  messageRenderers: Map<string, (message: any, options: any, theme: any) => any>;
   notifications: Array<{ text: string; severity?: string }>;
   modelSets: unknown[];
   thinkingLevels: string[];
@@ -106,6 +114,7 @@ export function fakePi(): FakePi {
   const userMessages: Array<{ content: any; options?: any }> = [];
   const entries: Array<{ customType: string; data: any }> = [];
   const entryRenderers = new Map<string, (entry: any, options: any, theme: any) => any>();
+  const messageRenderers = new Map<string, (message: any, options: any, theme: any) => any>();
   const notifications: Array<{ text: string; severity?: string }> = [];
   const modelSets: unknown[] = [];
   const thinkingLevels: string[] = [];
@@ -289,6 +298,7 @@ export function fakePi(): FakePi {
     userMessages,
     entries,
     entryRenderers,
+    messageRenderers,
     notifications,
     modelSets,
     thinkingLevels,
@@ -323,7 +333,8 @@ export function fakePi(): FakePi {
       appendEntry: (customType: string, data: any) => entries.push({ customType, data }),
       registerEntryRenderer: (customType: string, renderer: any) =>
         entryRenderers.set(customType, renderer),
-      registerMessageRenderer: () => undefined,
+      registerMessageRenderer: (customType: string, renderer: any) =>
+        messageRenderers.set(customType, renderer),
       setModel: async (model: unknown) => {
         modelSets.push(model);
         return true;

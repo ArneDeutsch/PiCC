@@ -9,7 +9,12 @@ import {
 } from "../src/runtime/background-tasks.js";
 import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import { createAgentToolDefinition, type PiSessionStats } from "../src/runtime/subagents.js";
-import { renderAgentResult } from "../src/runtime/subagent-render.js";
+import {
+  RECORD_EXPAND_HINT,
+  RECORD_REFERENCE_NOTE,
+  renderAgentResult,
+  renderSettlementRecord,
+} from "../src/runtime/subagent-render.js";
 import {
   formatUsageCompact,
   renderProgressText,
@@ -2120,15 +2125,17 @@ describe("TaskOutput live streaming", () => {
     const final = await pending;
 
     expect(partials.length).toBeGreaterThanOrEqual(1);
-    // At least one partial renders the tail + activity AND is self-identifying.
+    // At least one partial renders as the SINGLE self-identifying status line
+    // (chip + agent + activity — the panel owns the rolling tail). The
+    // EMISSION still carries the full snapshot for panel/RPC consumers.
     const identified = partials.some((p) => {
       const r = renderUpdate(p);
       return (
         r.includes("Task(" + id + ")") &&
         r.includes("Agent(coder)") &&
-        r.includes(AGENT_ID) &&
         r.includes("running Grep…") &&
-        r.includes("> Grep (x)")
+        !r.includes("\n") && // one status line, no tail
+        (p.details?.subagentProgress as ProgressSnapshot | undefined)?.tail.includes("> Grep (x)") === true
       );
     });
     expect(identified).toBe(true);
@@ -2928,5 +2935,260 @@ describe("SubagentRegistry live mirror + onChange", () => {
     ).not.toThrow();
     expect(seen).toBe(1);
     expect(sub.get(id)).toBeDefined();
+  });
+});
+
+/**
+ * Condensed transcript records — settlement-emitter data path
+ * (SettlementNotice.details → renderSettlementRecord) and the exactly-once
+ * reconciliation between the settlement record and TaskOutput collections.
+ */
+describe("settlement completion record (details + exactly-once)", () => {
+  const AGENT_ID = "agent-aabbccddeeff";
+  const USAGE = { inputTokens: 100, outputTokens: 50, costUsd: 0.0123 };
+
+  function armedSubRegistry(agentId: string): SubagentRegistry {
+    const reg = new SubagentRegistry();
+    reg.register({
+      agentId,
+      agentName: "worker",
+      depth: 1,
+      cwd: process.cwd(),
+      resumable: true,
+      oneShot: false,
+    });
+    reg.markSettled(agentId);
+    return reg;
+  }
+  const drainOnce = (bg: BackgroundTaskRegistry, sub: SubagentRegistry) =>
+    bg.drainSettlementNotices(
+      (a) => sub.isSettledNoticeArmed(a),
+      (a) => sub.consumeSettledNotice(a),
+      (a) => sub.get(a) !== undefined,
+    );
+
+  it("a never-awaited settlement's notice carries the UI record details; the registered renderer draws ONE collapsed record", async () => {
+    const bg = new BackgroundTaskRegistry();
+    const id = bg.start(
+      "agent:worker",
+      Promise.resolve(
+        result({
+          finalMessage: "the review report",
+          agentId: AGENT_ID,
+          resumable: true,
+          transcriptPath: `/x/sessions/${AGENT_ID}.jsonl`,
+          usage: USAGE,
+        }),
+      ),
+      undefined,
+      AGENT_ID,
+      "worker",
+    );
+    await bg.wait(id);
+    const sub = armedSubRegistry(AGENT_ID);
+    const notices = drainOnce(bg, sub);
+    expect(notices).toHaveLength(1);
+    const details = notices[0]!.details;
+    // The model-facing content is untouched — details ride BESIDE it, UI-only.
+    expect(notices[0]!.content).toContain("settled: completed");
+    expect(details.record).toBe("subagent-completion");
+    expect(details.taskId).toBe(id);
+    expect(details.outcome).toBe("completed");
+    expect(details.agent).toBe("worker");
+    expect(details.agentId).toBe(AGENT_ID);
+    expect(details.finalText).toBe("the review report");
+    expect(details.transcriptPath).toBe(`/x/sessions/${AGENT_ID}.jsonl`);
+    expect(details.usage).toEqual(USAGE);
+    expect(typeof details.durationMs).toBe("number");
+    expect(details.durationMs as number).toBeGreaterThanOrEqual(0);
+    expect(details.nested).toBeUndefined(); // coordinator-owned → renders
+
+    // The registered renderer draws the collapsed-expandable completion record.
+    const collapsed = renderSettlementRecord(details, { expanded: false }, undefined)!;
+    const collapsedLines = collapsed.render(200);
+    expect(collapsedLines).toHaveLength(1);
+    expect(collapsedLines[0]).toContain(`Task(${id})`);
+    expect(collapsedLines[0]).toContain("Agent(worker) completed");
+    expect(collapsedLines[0]).toContain(RECORD_EXPAND_HINT);
+    expect(collapsedLines[0]).toContain(`${AGENT_ID}.jsonl`);
+    expect(collapsedLines[0]).not.toContain("the review report");
+    const expanded = renderSettlementRecord(details, { expanded: true }, undefined)!
+      .render(200)
+      .join("\n");
+    expect(expanded).toContain("the review report");
+    expect(expanded).toContain("transcript: /x/sessions/");
+    expect(expanded).toContain("usage:");
+  });
+
+  it("failed and user-stopped settlements carry error/userStopped; the record renders them", async () => {
+    const bg = new BackgroundTaskRegistry();
+    const failedId = bg.start(
+      "agent:worker",
+      Promise.resolve(
+        result({
+          ok: false,
+          outcome: "failed",
+          error: "connection reset",
+          finalMessage: "partial work",
+          agentId: AGENT_ID,
+        }),
+      ),
+      undefined,
+      AGENT_ID,
+      "worker",
+    );
+    await bg.wait(failedId);
+    const sub = armedSubRegistry(AGENT_ID);
+    const [failedNotice] = drainOnce(bg, sub);
+    expect(failedNotice!.details.error).toBe("connection reset");
+    expect(failedNotice!.details.finalText).toBe("partial work");
+    const collapsed = renderSettlementRecord(failedNotice!.details, { expanded: false }, undefined)!
+      .render(200)
+      .join("\n");
+    expect(collapsed).toContain("failed");
+    expect(collapsed).toContain("connection reset");
+    const expanded = renderSettlementRecord(failedNotice!.details, { expanded: true }, undefined)!
+      .render(200)
+      .join("\n");
+    expect(expanded).toContain("connection reset");
+    expect(expanded).toContain("partial work");
+
+    // User-stopped: the panel stop marker reaches the record as userStopped.
+    const bg2 = new BackgroundTaskRegistry();
+    const otherAgent = "agent-001122334455";
+    let resolve!: (v: ReturnType<typeof result>) => void;
+    const stoppedId = bg2.start(
+      "agent:worker",
+      new Promise<ReturnType<typeof result>>((r) => (resolve = r)),
+      () => {},
+      otherAgent,
+      "worker",
+    );
+    bg2.markUserStopped(stoppedId);
+    resolve(result({ outcome: "aborted", finalMessage: "discarded", agentId: otherAgent }));
+    await bg2.wait(stoppedId);
+    const sub2 = armedSubRegistry(otherAgent);
+    const [stoppedNotice] = drainOnce(bg2, sub2);
+    expect(stoppedNotice!.details.userStopped).toBe(true);
+    expect(stoppedNotice!.details.finalText).toBeUndefined(); // aborted result discarded
+    const stoppedLine = renderSettlementRecord(stoppedNotice!.details, { expanded: false }, undefined)!
+      .render(200)
+      .join("\n");
+    expect(stoppedLine).toContain("stopped by user");
+  });
+
+  it("NESTED (owner-tagged) settlements render NO main-chat record; detail-less messages fall back too", async () => {
+    const bg = new BackgroundTaskRegistry();
+    const id = bg.start(
+      "agent:worker",
+      Promise.resolve(result({ finalMessage: "child work", agentId: AGENT_ID })),
+      undefined,
+      AGENT_ID,
+      "worker",
+      "agent-parentparent", // dispatched BY a subagent → nested
+    );
+    await bg.wait(id);
+    const sub = armedSubRegistry(AGENT_ID);
+    const [notice] = drainOnce(bg, sub);
+    expect(notice!.details.nested).toBe(true);
+    // Nested → undefined → Pi's default custom-message box (no record markers).
+    expect(renderSettlementRecord(notice!.details, { expanded: false }, undefined)).toBeUndefined();
+    // Messages without the structured details (older sessions) fall back too.
+    expect(renderSettlementRecord(undefined, { expanded: false }, undefined)).toBeUndefined();
+    expect(renderSettlementRecord({}, { expanded: false }, undefined)).toBeUndefined();
+    expect(renderSettlementRecord({ record: "other" }, { expanded: false }, undefined)).toBeUndefined();
+  });
+
+  it("exactly-once: settlement record delivered first → a later TaskOutput renders ONLY the reference line", async () => {
+    const bg = new BackgroundTaskRegistry();
+    const id = bg.start(
+      "agent:worker",
+      Promise.resolve(result({ finalMessage: "the review report", agentId: AGENT_ID })),
+      undefined,
+      AGENT_ID,
+      "worker",
+    );
+    await bg.wait(id);
+    const sub = armedSubRegistry(AGENT_ID);
+    const notices = drainOnce(bg, sub);
+    expect(notices).toHaveLength(1);
+    notices[0]!.commit(); // the settlement record was delivered
+
+    const taskOutput = createTaskOutputTool(bg) as unknown as StreamTool;
+    const out = await taskOutput.execute("t", { task_id: id }, undefined, undefined);
+    // Model-facing content stays the full verbatim result (print/RPC unchanged)…
+    expect(out.content[0]!.text).toBe("the review report");
+    expect(out.details.alreadyReported).toBe(true);
+    // …but the render is the minimal reference line, collapsed AND expanded.
+    for (const expanded of [false, true]) {
+      const lines = taskOutput
+        .renderResult(out, { isPartial: false, expanded }, undefined)
+        .render(200);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(RECORD_REFERENCE_NOTE);
+      expect(lines[0]).not.toContain("the review report");
+    }
+  });
+
+  it("exactly-once, other order: TaskOutput collects first → full record once, then reference; no settlement notice", async () => {
+    const bg = new BackgroundTaskRegistry();
+    const id = bg.start(
+      "agent:worker",
+      Promise.resolve(result({ finalMessage: "the review report", agentId: AGENT_ID })),
+      undefined,
+      AGENT_ID,
+      "worker",
+    );
+    await bg.wait(id);
+    const sub = armedSubRegistry(AGENT_ID);
+    const taskOutput = createTaskOutputTool(bg) as unknown as StreamTool;
+
+    // First collection: the full (collapsed) completion record.
+    const first = await taskOutput.execute("t", { task_id: id }, undefined, undefined);
+    expect(first.details.alreadyReported).toBeUndefined();
+    expect(typeof first.details.durationMs).toBe("number");
+    const collapsed = taskOutput
+      .renderResult(first, { isPartial: false, expanded: false }, undefined)
+      .render(200);
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0]).toContain(RECORD_EXPAND_HINT);
+    // The settlement notice is suppressed (collection already reported it).
+    expect(drainOnce(bg, sub)).toEqual([]);
+
+    // A second collection renders only the reference line.
+    const second = await taskOutput.execute("t2", { task_id: id }, undefined, undefined);
+    expect(second.details.alreadyReported).toBe(true);
+    const ref = taskOutput
+      .renderResult(second, { isPartial: false, expanded: false }, undefined)
+      .render(200);
+    expect(ref).toHaveLength(1);
+    expect(ref[0]).toContain(RECORD_REFERENCE_NOTE);
+  });
+
+  it("TaskOutput details: durationMs only when settled; error only when failed; a running poll has neither", async () => {
+    const bg = new BackgroundTaskRegistry();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const id = bg.start(
+      "agent:worker",
+      (async () => {
+        await gate;
+        return result({ ok: false, outcome: "failed", error: "boom", finalMessage: "", agentId: AGENT_ID });
+      })(),
+      undefined,
+      AGENT_ID,
+      "worker",
+    );
+    const taskOutput = createTaskOutputTool(bg) as unknown as StreamTool;
+    const polled = await taskOutput.execute("t", { task_id: id, wait: false }, undefined, undefined);
+    expect(polled.details.durationMs).toBeUndefined();
+    expect(polled.details.error).toBeUndefined();
+    expect(polled.details.alreadyReported).toBeUndefined();
+    release();
+    await bg.wait(id);
+    const settled = await taskOutput.execute("t2", { task_id: id }, undefined, undefined);
+    expect(typeof settled.details.durationMs).toBe("number");
+    expect(settled.details.durationMs as number).toBeGreaterThanOrEqual(0);
+    expect(settled.details.error).toBe("boom");
   });
 });

@@ -195,6 +195,95 @@ describe("pi 0.80.x API contract", () => {
     expect(ext.shortcuts.get("alt+a")?.description).toBe("probe");
   });
 
+  it("registerMessageRenderer exists on the real ExtensionAPI and sendMessage threads a details param", async () => {
+    // The picc-settlement completion record hangs off BOTH seams: index.ts
+    // registers a custom-message renderer via pi.registerMessageRenderer and
+    // attaches the structured record payload as sendMessage's `details`. A Pi
+    // rename/drop must fail here first, not degrade the settlement notice
+    // silently to the default box (or strip the record data).
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const distIdx = mainUrl.indexOf("/dist/");
+    expect(distIdx, "unexpected Pi dist layout").toBeGreaterThan(0);
+    const loader: any = await import(`${mainUrl.slice(0, distIdx)}/dist/core/extensions/loader.js`);
+    const runtime = loader.createExtensionRuntime
+      ? loader.createExtensionRuntime()
+      : sdk.createExtensionRuntime();
+    let captured: any;
+    const renderer = () => undefined;
+    const ext = await loader.loadExtensionFromFactory(
+      (pi: any) => {
+        captured = pi;
+        pi.registerMessageRenderer("picc-contract-probe", renderer);
+      },
+      process.cwd(),
+      sdk.createEventBus(),
+      runtime,
+    );
+    expect(typeof captured.registerMessageRenderer, "Pi moved: ExtensionAPI.registerMessageRenderer").toBe(
+      "function",
+    );
+    // Registration is recorded where the interactive mode reads it back.
+    expect(
+      ext.messageRenderers?.get("picc-contract-probe"),
+      "Pi moved: registerMessageRenderer no longer records into Extension.messageRenderers",
+    ).toBe(renderer);
+    // sendMessage accepts and threads `details` (bind the runtime slot the way
+    // Runner.bindCore does — createExtensionRuntime ships throwing stubs).
+    const sent: Array<{ message: any; options: any }> = [];
+    runtime.sendMessage = (message: any, options: any) => sent.push({ message, options });
+    captured.sendMessage(
+      { customType: "picc-contract-probe", content: "c", display: true, details: { probe: 1 } },
+      { deliverAs: "steer" },
+    );
+    expect(sent, "Pi moved: ExtensionAPI.sendMessage no longer forwards to the runtime").toHaveLength(1);
+    expect(
+      sent[0]!.message.details,
+      "Pi moved: sendMessage dropped/renamed the details param",
+    ).toEqual({ probe: 1 });
+    expect(sent[0]!.options?.deliverAs).toBe("steer");
+  });
+
+  it("CustomMessageComponent drives the registered renderer with a BOOLEAN expanded and defaults on undefined", async () => {
+    // The collapsed-by-default settlement record keys on the EXPLICIT
+    // `options.expanded === false`; nested/detail-less messages return undefined
+    // to get Pi's default box. Pin both against Pi's REAL interactive component
+    // (exported at the package root), so a Pi change to the renderer calling
+    // convention fails loudly here.
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    // The component reads Pi's module-global theme singleton — initialize it,
+    // as the wired-edit integration test does.
+    sdk.initTheme();
+    const message = {
+      role: "custom",
+      customType: "picc-probe",
+      content: "notice body",
+      display: true,
+      details: { record: "probe" },
+      timestamp: Date.now(),
+    };
+    const seen: unknown[] = [];
+    const component = new sdk.CustomMessageComponent(message, (m: any, options: any) => {
+      expect(m, "Pi moved: renderer no longer receives the CustomMessage itself").toBe(message);
+      seen.push(options?.expanded);
+      return { render: () => ["probe-line"] };
+    });
+    // The global Ctrl+O toggle reaches custom messages through setExpanded.
+    expect(
+      typeof component.setExpanded,
+      "Pi moved: CustomMessageComponent.setExpanded (Ctrl+O expand reach)",
+    ).toBe("function");
+    component.setExpanded(true);
+    expect(seen, "Pi moved: message renderer no longer gets a boolean `expanded`").toEqual([
+      false,
+      true,
+    ]);
+    expect(component.render(80).join("\n")).toContain("probe-line");
+    // A renderer returning undefined falls back to Pi's default labeled box.
+    const fallback = new sdk.CustomMessageComponent(message, () => undefined);
+    expect(fallback.render(80).join("\n")).toContain("picc-probe");
+  });
+
   it("typebox + StringEnum are importable the way our tools use them", async () => {
     const { Type } = await import("typebox");
     const { StringEnum } = await import("@earendil-works/pi-ai");

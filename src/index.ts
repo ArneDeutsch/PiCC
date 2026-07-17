@@ -28,6 +28,7 @@ import {
 import { SubagentPanelFocusController } from "./runtime/subagent-panel-focus.js";
 import type { PanelTaskInfo } from "./runtime/subagent-panel-model.js";
 import { formatUsageCompact, sanitizeLine } from "./runtime/subagent-progress.js";
+import { renderSettlementRecord } from "./runtime/subagent-render.js";
 import { createGuardExtension } from "./runtime/guard.js";
 import {
   buildSystemPromptSuffix,
@@ -1231,8 +1232,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // synchronous send, and commit.
         testSeam?.beforeSettlementSend?.(notice);
         if (!notice.isValid()) continue;
+        // `details` is UI-only structured record data for the registered
+        // picc-settlement renderer; `content` stays the entire model-facing text.
         pi.sendMessage(
-          { customType: "picc-settlement", content: notice.content, display: true },
+          {
+            customType: "picc-settlement",
+            content: notice.content,
+            display: true,
+            details: notice.details,
+          },
           { deliverAs: "steer" },
         );
         notice.commit();
@@ -1730,6 +1738,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   );
   pi.registerEntryRenderer("picc-compat", (entry: any, _opts: any, theme: any) =>
     controlOutputComponent("PiCC compatibility", entry.data?.notice ?? "", theme),
+  );
+  // Settlement notices render as the collapsed-expandable subagent completion
+  // record (same shape as the tool renderers'), so a never-awaited background
+  // settlement still leaves exactly one expandable record in the transcript.
+  // Only the RENDERING changes — the model-facing steer text is untouched.
+  // Returns undefined (→ Pi's default custom-message box) for nested tasks and
+  // for messages without the structured details.
+  pi.registerMessageRenderer("picc-settlement", (message: any, opts: any, theme: any) =>
+    renderSettlementRecord(message?.details, opts, theme),
   );
 
   /**
