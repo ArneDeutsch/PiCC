@@ -7,7 +7,7 @@ import { matchesAny, normalizeSlashes } from "../util/globs.js";
 import { stripBlockHtmlComments } from "../util/markdown.js";
 
 /**
- * CLAUDE.md hierarchy subsystem (plan §4.6).
+ * CLAUDE.md hierarchy subsystem.
  *
  * - `expandImports`: `@path` import expansion (recursive, hop-limited, code-span aware).
  * - `loadClaudeMdHierarchy`: session-start collection (managed → user → filesystem
@@ -241,7 +241,7 @@ function loadOne(
  * Ancestor directories of cwd, from the filesystem root (or `stopDir`, when given)
  * down to cwd — both inclusive, root first, so more specific files load later.
  * Claude walks the FULL ancestor chain, including dirs above the git root
- * (audit B1; issues #26944/#20880).
+ * (anthropics/claude-code#26944, #20880).
  */
 function dirChain(cwd: string, stopDir?: string): string[] {
   const chain: string[] = [];
@@ -260,14 +260,14 @@ function dirChain(cwd: string, stopDir?: string): string[] {
 /**
  * Collect the CLAUDE.md hierarchy loaded at session start, in load order:
  * 1. managed `<managedBase>/CLAUDE.md` + managed-settings inline `claudeMd`
- *    (scope "managed", highest priority, EXEMPT from `excludes` — audit B3)
+ *    (scope "managed", highest priority, EXEMPT from `excludes`)
  * 2. `<userDir>/CLAUDE.md` (scope "user")
  * 3. every `CLAUDE.md` from the filesystem root down to cwd (root→cwd,
- *    scope "project") — ancestors above the git root included (audit B1)
+ *    scope "project") — ancestors above the git root included
  * 4. `<projectRoot>/.claude/CLAUDE.md` if present (scope "project")
  * `CLAUDE.local.md` (scope "local") loads immediately after its sibling slot in the
  * ancestor-chain dirs of step 3 ONLY — never in `.claude/` or the user dir, and even
- * when the sibling CLAUDE.md is absent (audit B2; issues #54425/#22652).
+ * when the sibling CLAUDE.md is absent (anthropics/claude-code#54425, #22652).
  * `excludes` glob patterns (base = projectRoot) skip matching non-managed files;
  * candidates OUTSIDE the project root are additionally matched with the globs
  * anchored at their own directory (see {@link isExcluded}).
@@ -291,7 +291,7 @@ export function loadClaudeMdHierarchy(opts: {
   const projectRoot = path.resolve(opts.projectRoot);
   const seen = new Set<string>();
 
-  // Managed CLAUDE.md first (highest priority; exempt from claudeMdExcludes — B3).
+  // Managed CLAUDE.md first (highest priority; exempt from claudeMdExcludes).
   for (const base of opts.managedDirs ?? defaultManagedDirs()) {
     const full = path.join(path.resolve(base), "CLAUDE.md");
     const key = pathKey(full);
@@ -321,7 +321,7 @@ export function loadClaudeMdHierarchy(opts: {
       scope: "project" as Scope,
       withLocal: true,
     })),
-    // `.claude/CLAUDE.local.md` must NOT auto-load (issue #54425).
+    // `.claude/CLAUDE.local.md` must NOT auto-load (anthropics/claude-code#54425).
     { dir: path.join(projectRoot, ".claude"), scope: "project", withLocal: false },
   ];
 
@@ -352,11 +352,11 @@ export function loadClaudeMdHierarchy(opts: {
 
 /**
  * `claudeMdExcludes` check (base = projectRoot). Candidate files OUTSIDE the
- * project root — the ancestor-chain dirs above the git root (audit B1) and the
+ * project root — the ancestor-chain dirs above the git root and the
  * user dir — can never match root-anchored globs like `**\/CLAUDE.md`, so they
  * are ADDITIONALLY evaluated with the exclude globs anchored at the candidate
  * file's own directory, making `**\/CLAUDE.md` and bare `CLAUDE.md` behave
- * alike for ancestors. Managed scope never reaches this check (exempt — B3).
+ * alike for ancestors. Managed scope never reaches this check (exempt).
  */
 function isExcluded(file: string, dir: string, excludes: string[], projectRoot: string): boolean {
   if (excludes.length === 0) return false;

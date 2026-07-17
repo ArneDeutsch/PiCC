@@ -1,5 +1,5 @@
 /**
- * Installed-plugin content loading (plan §4.9).
+ * Installed-plugin content loading.
  *
  * Discovers the user's *already-installed* plugins under `<userDir>/plugins`
  * and a project-bundled `.claude-plugin/` structure, and resolves the plugin
@@ -180,11 +180,10 @@ function marketplaceOf(root: string): string | undefined {
 /**
  * Resolve enabled state against the settings `enabledPlugins` value.
  *
- * Claude Code semantics (plan §4.9 — "from the enabled-plugins configuration"):
- * a plugin is loaded ONLY when it is **explicitly enabled**. A cloned
- * marketplace under `plugins/marketplaces/` is a *catalog* of available
- * plugins, not installed content — nothing there loads until the user enables
- * it. Therefore:
+ * Claude Code semantics: a plugin is loaded ONLY when it is **explicitly
+ * enabled**. A cloned marketplace under `plugins/marketplaces/` is a *catalog*
+ * of available plugins, not installed content — nothing there loads until the
+ * user enables it. Therefore:
  * - object: the MOST SPECIFIC matching key decides (`name@marketplace` over
  *   bare `name` — an explicit qualified `false` beats a bare `true`); a
  *   matched-but-falsy value → disabled; no matching key → **disabled**.

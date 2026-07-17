@@ -8,7 +8,7 @@ import {
 } from "../types.js";
 
 /**
- * Hook config parsing & merging (plan §4.5, research 02 §3).
+ * Hook config parsing & merging.
  *
  * Normalizes the Claude settings `hooks` value:
  *

@@ -5,7 +5,7 @@ import { expandEnvVars } from "../discovery/settings.js";
 import { isFile, readTextSafe } from "../util/fs.js";
 
 /**
- * Memory subsystem, read side (audit B4/B5).
+ * Memory subsystem, read side.
  *
  * - `loadAutoMemory`: Claude Code's per-project auto memory — `MEMORY.md` under
  *   `<userDir>/projects/<flattened-project-path>/memory` (or the
@@ -87,7 +87,7 @@ function readMemoryMd(dir: string): string | undefined {
 }
 
 /**
- * Resolve and load the auto-memory directory for a project (audit B4).
+ * Resolve and load the auto-memory directory for a project.
  * Returns undefined when auto memory is disabled (`autoMemoryEnabled: false` or
  * a truthy `CLAUDE_CODE_DISABLE_AUTO_MEMORY`); otherwise the directory always
  * resolves, with `content` present only when MEMORY.md exists.
@@ -110,8 +110,8 @@ export function loadAutoMemory(
 }
 
 /**
- * Resolve and load an agent's memory dir for the `memory:` frontmatter scopes
- * (audit B5): user → `<userDir>/agent-memory/<name>/`, project →
+ * Resolve and load an agent's memory dir for the `memory:` frontmatter scopes:
+ * user → `<userDir>/agent-memory/<name>/`, project →
  * `<projectRoot>/.claude/agent-memory/<name>/`, local →
  * `<projectRoot>/.claude/agent-memory-local/<name>/`. Unknown scopes degrade to
  * undefined (never throw).

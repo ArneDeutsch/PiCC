@@ -10,9 +10,9 @@ import { parseMarkdown, toBool, toStringList } from "../util/markdown.js";
 import { isDirectory, readTextSafe, walkFiles } from "../util/fs.js";
 
 /**
- * Skills subsystem core (plan §4.1).
+ * Skills subsystem core.
  *
- * Progressive disclosure is a hard NFR (§12.1): `loadSkills` parses ONLY the
+ * Progressive disclosure is a hard requirement: `loadSkills` parses ONLY the
  * frontmatter — the SKILL.md body is never stored on the returned objects
  * (`body: undefined`). The body enters context only via `loadSkillBody`,
  * which re-reads the file fresh on activation.
@@ -408,7 +408,7 @@ export function loadSkillBody(skill: ClaudeSkill): string {
 }
 
 // ---------------------------------------------------------------------------
-// Startup listing (Level-1 metadata; §12.1 budget)
+// Startup listing (Level-1 metadata)
 // ---------------------------------------------------------------------------
 
 function trimTo(s: string, max: number): string {
@@ -529,7 +529,7 @@ function tokenizeArgs(s: string): string[] {
  *   `name=value`, or positional by spec order; falls back to spec default)
  * - a single `\` immediately before a recognizable token emits the literal
  *   token without that backslash and without substitution. Backslash PAIRS are
- *   NOT collapsed (Claude's rule, audit A2): `\\$1` keeps BOTH backslashes and
+ *   NOT collapsed (Claude's rule): `\\$1` keeps BOTH backslashes and
  *   the token still expands; only the odd trailing backslash of a run escapes
  *   (`\\\$1` → two backslashes + literal `$1`). A backslash before anything
  *   else is left untouched.
@@ -610,7 +610,7 @@ export function substituteArguments(
     (m, backslashes: string, token: string, bracketIdx?: string, posDigits?: string, name?: string) => {
       // $SOMETHING that is not a known argument name stays verbatim (incl. any backslashes).
       if (name !== undefined && !names.has(name)) return m;
-      // Claude's rule (audit A2): only the single odd trailing backslash of a
+      // Claude's rule: only the single odd trailing backslash of a
       // run escapes the token; backslash pairs stay VERBATIM (no bash-style
       // collapsing) and an even run still expands the token.
       if (backslashes.length % 2 === 1) return backslashes.slice(1) + token;
@@ -663,9 +663,10 @@ export function substituteVariables(
 /**
  * Apply the SAME `${CLAUDE_*}` and `$ARGUMENTS`/`$N`/`$name` substitution the
  * skill body gets to `allowed-tools` / `disallowed-tools` entries (Claude Code
- * substitutes both — docs; issue #67652). Returns a per-activation copy; the
- * loaded skill object is never mutated. The no-marker `ARGUMENTS:` fallback is
- * suppressed (tool rules are patterns, not prose). Never throws.
+ * substitutes both — docs; anthropics/claude-code#67652). Returns a
+ * per-activation copy; the loaded skill object is never mutated. The no-marker
+ * `ARGUMENTS:` fallback is suppressed (tool rules are patterns, not prose).
+ * Never throws.
  */
 export function substituteToolRules(
   rules: string[] | undefined,
