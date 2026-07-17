@@ -78,7 +78,7 @@ class HookMultiplexer {
   addScoped(runner: HookRunner): void {
     this.extras.push(runner);
   }
-  /** True when any delegate has handlers for the event (guard payload-skip, F5). */
+  /** True when any delegate has handlers for the event (guard payload-skip). */
   hasHooks(eventName: string): boolean {
     return this.base.hasHooks(eventName) || this.extras.some((r) => r.hasHooks(eventName));
   }
@@ -119,11 +119,11 @@ class HookMultiplexer {
   }
 
   /**
-   * Hook failures must be VISIBLE (§2.2 "visible, documented no-op"): every runner
-   * failure path degrades to a diagnostic (bash missing, timeout, invalid matcher…)
-   * and silently dropping them turns the project's whole enforcement layer off with
-   * no indication. Warnings/errors go to stderr once per distinct message; the rest
-   * to the PICC_DEBUG channel. Ask-downgrades are reported once per session (§6.1).
+   * Completeness floor — hook failures must be VISIBLE: every runner failure path
+   * degrades to a diagnostic (bash missing, timeout, invalid matcher…) and silently
+   * dropping them turns the project's whole enforcement layer off with no
+   * indication. Warnings/errors go to stderr once per distinct message; the rest
+   * to the PICC_DEBUG channel. Ask-downgrades are reported once per session.
    */
   private surface(eventName: string, merged: HookOutcome): void {
     for (const d of merged.diagnostics) {
@@ -147,7 +147,7 @@ class HookMultiplexer {
     if (merged.askDowngraded && !this.askDowngradeReported) {
       this.askDowngradeReported = true;
       console.error(
-        `[picc] a hook requested permissionDecision "ask"; allowed per posture §6.1 (deny rules still enforced)`,
+        `[picc] a hook requested permissionDecision "ask"; allowed per PiCC's default-permissive posture (deny rules still enforced)`,
       );
     }
   }
@@ -155,7 +155,7 @@ class HookMultiplexer {
 
 const CLAUDE_MODEL_ALIASES = new Set(["sonnet", "opus", "haiku", "inherit", "claude"]);
 
-/** Diagnosability channel (plan §12.4): PICC_DEBUG=1 traces decisions to stderr. */
+/** Diagnosability channel: PICC_DEBUG=1 traces decisions to stderr. */
 function debug(...args: unknown[]): void {
   if (process.env.PICC_DEBUG) console.error("[picc]", ...args);
 }
@@ -179,9 +179,9 @@ function parseSlashCommand(command: string): { name: string; argsText: string } 
 }
 
 /**
- * TEST-ONLY injection point (t05 plan-review MUST-FIX). The fake-Pi harness
- * cannot reach the closure-local registries/runtime, so the offline-integration
- * test for the settlement-notice delivery path needs a named seam. `onWired` is
+ * TEST-ONLY injection point. The fake-Pi harness cannot reach the closure-local
+ * registries/runtime, so the offline-integration test for the settlement-notice
+ * delivery path needs a named seam. `onWired` is
  * invoked synchronously during construction with the real in-process registries
  * and runtime, so tests can inject an offline SDK, traverse registered tools, or
  * seed focused lifecycle state before driving the REAL `before_agent_start` drain.
@@ -191,8 +191,8 @@ function parseSlashCommand(command: string): { name: string; argsText: string } 
  * ever supplies it — Pi invokes the extension entry as `picc(pi)` with a single
  * argument — so a loaded project can never use it to swap runtime internals. An
  * env/settings/file-gated seam would be a project-reachable runtime-swap bypass;
- * an in-process argument is not. The same invariant binds the `sdk` field below
- * (F14 t02): the fake Pi SDK it carries is the subagent runtime's execution
+ * an in-process argument is not. The same invariant binds the `sdk` field below:
+ * the fake Pi SDK it carries is the subagent runtime's execution
  * substrate — strictly higher privilege than the `onWired` registries — so it is
  * read ONLY off this in-process argument and plumbed straight into the runtime's
  * `deps.sdk`; when it is absent the runtime lazy-loads the real Pi SDK. There is
@@ -215,8 +215,8 @@ export interface PiccTestSeam {
     backgroundTasks: BackgroundTaskRegistry;
     subagentRegistry: SubagentRegistry;
     /**
-     * The session's SubagentRuntime (F13 t02): lets an offline-integration test
-     * inject a fake PiSdk (`setSdkForTest`) and then drive a REAL dispatch through
+     * The session's SubagentRuntime: lets an offline-integration test inject a
+     * fake PiSdk (`setSdkForTest`) and then drive a REAL dispatch through
      * the coordinator's registered Agent tool, so the dispatcher-owner threading
      * is exercised end to end (the owner id is minted by the runtime, never
      * supplied by the test). Reachable only via this in-process seam.
@@ -227,8 +227,8 @@ export interface PiccTestSeam {
    * TEST-ONLY subagent SDK override: replaces the real Pi SDK the session's
    * SubagentRuntime would otherwise load, so an offline test can drive the REAL
    * dispatch/fork paths through a controllable outcome without an LLM/network —
-   * a `context: fork` skill invoked through the Skill tool, the SlashCommand tool
-   * (F11), or the user-typed `/name` input transform (F14). Consumed at
+   * a `context: fork` skill invoked through the Skill tool, the SlashCommand
+   * tool, or the user-typed `/name` input transform. Consumed at
    * SubagentRuntime construction as `deps.sdk`; unset ⇒ the runtime lazy-loads
    * the real Pi SDK (`loadRealSdk()`). Same in-process-only reachability
    * guarantee as `onWired` above (see the SECURITY note).
@@ -268,7 +268,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return undefined;
     }
   };
-  // ${CLAUDE_PLUGIN_DATA} expansion mirrors ${CLAUDE_PLUGIN_ROOT} (C12).
+  // ${CLAUDE_PLUGIN_DATA} expansion mirrors ${CLAUDE_PLUGIN_ROOT}.
   const pluginDataDirs: Record<string, string> = {};
   for (const p of project.plugins) pluginDataDirs[p.name] = p.dataDir;
   const baseHooks = new HookRunner({
@@ -288,8 +288,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // (subdir launch, EnterWorktree).
     root: project.root,
   });
-  // Rule-validation findings (e.g. unanchored mcp__* allow globs, audit D4)
-  // surface once at startup — never silent, never fatal.
+  // Rule-validation findings (e.g. unanchored mcp__* allow globs) surface once
+  // at startup — never silent, never fatal.
   for (const d of permissionEngine.diagnostics) {
     console.error(`PiCC permissions: ${d.message}`);
   }
@@ -298,11 +298,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     settings: project.settings.worktree,
     cleanupPeriodDays: project.settings.cleanupPeriodDays,
   });
-  // Reap orphaned worktree dirs from crashed sessions (plan §4.4) — fire-and-forget.
+  // Reap orphaned worktree dirs from crashed sessions — fire-and-forget.
   const orphanReaping = worktrees.reapOrphans().catch(() => undefined);
   void orphanReaping;
   const state = newSessionContextState(project.claudeMd);
-  // Completeness floor (§2.2): a report failure must never abort extension init.
+  // Completeness floor: a report failure must never abort extension init.
   let compat: CompatReport;
   try {
     compat = buildCompatReport(project);
@@ -413,11 +413,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       pluginData: plugin.data,
     });
     // context:fork bodies go to the FORK only — keeping them resident in the
-    // parent would defeat the fork's purpose (§12.1 token-efficiency contract).
+    // parent would defeat the fork's token-efficiency purpose.
     if (record && !opts.fork) {
       state.activeSkills.set(skill.name, rendered.text);
-      // Use the per-activation substituted copies (${CLAUDE_*}/$ARGUMENTS, audit
-      // A3) so deny rules like Bash(${CLAUDE_SKILL_DIR}/*) gate the real path.
+      // Use the per-activation substituted copies (${CLAUDE_*}/$ARGUMENTS) so
+      // deny rules like Bash(${CLAUDE_SKILL_DIR}/*) gate the real path.
       for (const rule of rendered.disallowedTools ?? skill.disallowedTools ?? []) {
         activeSkillDenyRules.add(rule);
       }
@@ -426,8 +426,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   /**
-   * Re-invocation dedup (audit A8): fingerprint of the last rendered body per
-   * skill name. A re-invocation whose rendering is byte-identical substitutes a
+   * Re-invocation dedup: fingerprint of the last rendered body per skill name.
+   * A re-invocation whose rendering is byte-identical substitutes a
    * short note instead of a second full copy. FNV-1a 32-bit + length — cheap,
    * dependency-free, and sufficient for change detection.
    */
@@ -453,9 +453,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   /**
    * Dispatches a context:fork skill. A fork without `agent:` runs in a synthetic
    * general-purpose context — fresh CLAUDE.md/rules hierarchy, the skill's own
-   * tool gating (with ${CLAUDE_*}/$ARGUMENTS substituted per activation, audit
-   * A3), no agent persona (and no dependency on whatever agent happens to sort
-   * first, or on any agent existing at all).
+   * tool gating (with ${CLAUDE_*}/$ARGUMENTS substituted per activation), no
+   * agent persona (and no dependency on whatever agent happens to sort first, or
+   * on any agent existing at all).
    */
   function forkDispatch(
     skill: ClaudeSkill,
@@ -489,7 +489,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           unknownKeys: [],
           diagnostics: [],
         };
-    // Threads Pi's Esc AbortSignal into the dispatch (F14 t02). dispatch always
+    // Threads Pi's Esc AbortSignal into the dispatch. dispatch always
     // resolves a DispatchResult (incl. on abort), so forkDispatch resolves and
     // never rejects — both callers rely on that (the input hook must never throw).
     return subagentRuntime.dispatch({
@@ -508,16 +508,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // ---------------------------------------------------------------------------
   const taskToolBundle = createTaskTools();
   const claudeNamedTools: Record<string, unknown>[] = [];
-  // Background tasks (audit E4): one registry per session — run_in_background
-  // dispatches register here; TaskOutput/TaskStop operate on it.
+  // Background tasks: one registry per session — run_in_background dispatches
+  // register here; TaskOutput/TaskStop operate on it.
   const backgroundTasks = new BackgroundTaskRegistry();
-  // Dispatch registry (t04): one per session — every session-creating dispatch
+  // Dispatch registry: one per session — every session-creating dispatch
   // registers here so SendMessage can steer a running background subagent or
   // resume a finished one. Registry-only resolution keeps a hostile `to` off the
-  // filesystem (SECURITY MUST-FIX #2).
+  // filesystem (SECURITY).
   const subagentRegistry = new SubagentRegistry();
-  // Built-in agent types (audit E1): general-purpose/Explore/Plan, appended
-  // AFTER project/user/plugin agents so a same-named project agent wins (an
+  // Built-in agent types: general-purpose/Explore/Plan, appended AFTER
+  // project/user/plugin agents so a same-named project agent wins (an
   // overridden built-in is dropped from the catalog — dispatch resolves the
   // project agent anyway).
   const builtins = builtinAgents();
@@ -579,7 +579,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     for (const name of agent.skills ?? []) {
       const skill = findByName(project.skills, name);
       if (!skill) {
-        // Visible degrade (§2.2): a misspelled/shadowed skills: entry must not vanish.
+        // Visible degrade: a misspelled/shadowed skills: entry must not vanish.
         debug(`agent ${agent.name}: preloaded skill "${name}" not found`);
         sections.push(
           `## Preloaded skill: ${name}\n\n(PiCC: this skill was declared in the agent's skills: list but does not exist in the project — proceed without it.)`,
@@ -594,8 +594,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       });
       sections.push(`## Preloaded skill: ${name}\n\n${body.trim()}`);
     }
-    // Agent memory (audit B5): `memory:` frontmatter scope loads the agent's
-    // MEMORY.md and points the agent at its durable-knowledge directory.
+    // `memory:` frontmatter scope loads the agent's MEMORY.md and points the
+    // agent at its durable-knowledge directory.
     if (agent.memory !== undefined && agent.memory !== null) {
       const memoryScope = typeof agent.memory === "string" ? agent.memory.trim().toLowerCase() : "";
       if (memoryScope === "user" || memoryScope === "project" || memoryScope === "local") {
@@ -609,7 +609,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           sections.push(`# Agent memory\n\n${parts.join("\n\n")}`);
         }
       } else {
-        // Visible degrade (§2.2): an unknown memory scope must not vanish silently.
+        // Visible degrade: an unknown memory scope must not vanish silently.
         debug(`agent ${agent.name}: unknown memory scope "${String(agent.memory)}"; no memory loaded`);
       }
     }
@@ -620,29 +620,29 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       project.settings.subagentsEnabled &&
       depth + 1 <= project.settings.subagentMaxDepth &&
       (granted.includes("Agent") || granted.includes("Task"));
-    // Steering is per-model (§13.2): an agent with its own model: gets that model's guidance.
+    // Steering is per-model: an agent with its own model: gets that model's guidance.
     const agentModel = agent.model ? (resolveModelSpec(agent.model) as { provider?: string; id?: string } | undefined) : undefined;
     const agentModelRef =
       agentModel?.provider && agentModel?.id ? `${agentModel.provider}/${agentModel.id}` : currentModelRef;
-    // Explore/Plan context trimming (audit E6): agents marked skipProjectContext
-    // omit the CLAUDE.md/project-instructions and rules sections (harness
-    // conventions, skill listing, and steering stay).
+    // Explore/Plan context trimming: agents marked skipProjectContext omit the
+    // CLAUDE.md/project-instructions and rules sections (harness conventions,
+    // skill listing, and steering stay).
     const skipProject = agent.skipProjectContext === true;
     const suffix = buildSystemPromptSuffix({
       claudeMd: skipProject ? [] : project.claudeMd,
       rules: skipProject ? [] : project.rules,
-      // Auto memory reaches subagents too (review H2) — except Explore/Plan,
-      // whose skipProjectContext trims all project-level context.
+      // Auto memory reaches subagents too — except Explore/Plan, whose
+      // skipProjectContext trims all project-level context.
       autoMemory: skipProject ? undefined : project.autoMemory,
       skills: project.skills,
       agents: nestedDispatchAvailable ? agentsWithBuiltins() : [],
       settings: project.settings,
       state: newSessionContextState(skipProject ? [] : project.claudeMd),
       steeringText: agentModelRef ? steeringForModel(config, agentModelRef) : steeringText,
-      // Feature 25 / #48: subagents receive the same scratchpad guidance as the
-      // main session — a subagent that writes a temp file via the Bash tool and
-      // then Reads it (or hands it to a nested agent) hits the identical
-      // shell↔native namespace trap. Reuse the one eager `scratchDir` literal +
+      // Subagents receive the same scratchpad guidance as the main session — a
+      // subagent that writes a temp file via the Bash tool and then Reads it (or
+      // hands it to a nested agent) hits the identical shell↔native namespace
+      // trap. Reuse the one eager `scratchDir` literal +
       // predicate (harness data, safe to inject into every agent — not an
       // exfiltration-sensitive value). Reachable here because this closure runs
       // at dispatch time, after activation initialized `scratchDir`.
@@ -688,7 +688,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     buildSystemPrompt: buildSubagentSystemPrompt,
     customToolsFor: (agent, granted, depth, ownerAgentId, dispatcherIsFork, subCwd) => {
       // Per-dispatch instances (fresh TaskStore, dispatch-local cwd binding).
-      // NOTE (t04): SendMessage is deliberately NEVER built here — it is
+      // NOTE: SendMessage is deliberately NEVER built here — it is
       // parent-initiated only (no subagent→subagent or subagent→parent channel).
       // Even a future "inherit all tools" change must not add it to this set.
       const tools: Record<string, unknown>[] = [];
@@ -707,8 +707,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // into context:fork dispatches and leaves parent session state alone.
         tools.push(createSlashCommandTool({ depth, forSubagent: true }) as Record<string, unknown>);
       }
-      // Background-task tools are SCOPED to this dispatcher's own tasks (F13 t02):
-      // built over `backgroundTasks.scopedTo(ownerAgentId)`, so a subagent's
+      // Background-task tools are SCOPED to this dispatcher's own tasks: built
+      // over `backgroundTasks.scopedTo(ownerAgentId)`, so a subagent's
       // TaskOutput/TaskStop reach only the tasks it itself dispatched — a sibling's
       // or the coordinator's task is indistinguishable from an unknown id. The
       // coordinator keeps the full registry (below), retaining reach to every task.
@@ -726,9 +726,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       ) {
         // Both Claude names: projects grant and reference the dispatch tool as Task.
         // `ownerAgentId` tags tasks THIS subagent starts, so its own scoped tools
-        // (above) — and nobody else's — can reach them (F13 t02). `dispatcherIsFork`
-        // (F16 t02) marks these tools when the dispatcher is a genuine fork, so a
-        // nested `subagent_type: "fork"` is refused (a fork can't spawn a fork).
+        // (above) — and nobody else's — can reach them. `dispatcherIsFork` marks
+        // these tools when the dispatcher is a genuine fork, so a nested
+        // `subagent_type: "fork"` is refused (a fork can't spawn a fork).
         tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId, dispatcherIsFork }));
         tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId, dispatcherIsFork }));
       }
@@ -739,11 +739,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     hookRunner: hookRunnerFacade,
     getCwd: () => cwdState.get(),
     makeContextInjector,
-    // Agent-scoped hooks (audit C10): per-dispatch runner with the SAME deps as
-    // the session's base runner; the runtime multiplexes and discards it. Its
-    // transcript_path stays the MAIN session transcript (t02 review round 2):
-    // Claude Code does not re-point subagent hook events at the subagent's own
-    // transcript.
+    // Agent-scoped hooks: per-dispatch runner with the SAME deps as the
+    // session's base runner; the runtime multiplexes and discards it. Its
+    // transcript_path stays the MAIN session transcript — Claude Code does not
+    // re-point subagent hook events at the subagent's own transcript.
     makeScopedHookRunner: (config) =>
       new HookRunner({
         config,
@@ -755,7 +754,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         pluginDataDirs,
         transcriptPath,
       }),
-    // Subagent transcripts (t02) persist next to the MAIN session's transcript.
+    // Subagent transcripts persist next to the MAIN session's transcript.
     getMainSessionFile: transcriptPath,
     resolveModel: resolveModelSpec,
     mapEffort: (effort) => mapEffort(config, effort),
@@ -764,16 +763,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     concurrency: project.settings.subagentConcurrency,
     sessionId,
     subagentRegistry,
-    // TEST-ONLY seam (F11/F14): an injected fake SDK reaches every dispatch —
-    // including forks, which close over this one runtime instance. Read ONLY
+    // TEST-ONLY seam: an injected fake SDK reaches every dispatch — including
+    // forks, which close over this one runtime instance. Read ONLY
     // from the in-process testSeam argument; unset ⇒ the runtime lazy-loads the
     // real Pi SDK (loadRealSdk). Never sourced from env/settings/files.
     ...(testSeam?.sdk ? { sdk: testSeam.sdk } : {}),
   });
 
-  // TEST-ONLY seam (t05 settlement drain; F13 t02 dispatcher-owner threading):
-  // hand the real in-process registries AND the runtime to a test that drives the
-  // settlement-notice delivery path or an offline dispatch (fake SDK injected via
+  // TEST-ONLY seam: hand the real in-process registries AND the runtime to a
+  // test that drives the settlement-notice delivery path (or the dispatcher-owner
+  // threading) through an offline dispatch (fake SDK injected via
   // subagentRuntime.setSdkForTest). See PiccTestSeam — reachable only via this
   // in-process argument, never via project/env/settings/files. Invoked after the
   // runtime is built so the test can inject its fake SDK before the first dispatch.
@@ -797,7 +796,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    * model-visible error. `invokedName` is the CALLER-supplied name (which for a
    * bare name resolving to a plugin-namespaced skill differs from `skill.name`);
    * the refusal message is built from it so each tool's wording is preserved.
-   * `signal` is Pi's per-call Esc signal (F14): threaded into the fork dispatch so
+   * `signal` is Pi's per-call Esc signal: threaded into the fork dispatch so
    * an Esc'd model-invoked fork (Skill OR SlashCommand tool) reports as aborted.
    */
   async function runSkillActivation(
@@ -813,10 +812,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         fork: true,
         recordActivation: !opts.forSubagent,
       });
-      // Thread Pi's Esc signal so an Esc'd fork cancels (F14).
       const result = await forkDispatch(skill, rendered, opts.depth + 1, argsText, opts.signal);
-      // Forks are non-resumable (F02): suppress every resume trailer. The shared
-      // t01 helper reproduces the Agent tool's four-branch mapping —
+      // Forks are non-resumable: suppress every resume trailer. The shared
+      // presenter reproduces the Agent tool's four-branch mapping —
       // failed-with-partial preserves the partial + names the cause;
       // failed-no-output and aborted surface as loud failures (distinct wording);
       // completed stays the verbatim final message.
@@ -831,8 +829,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       recordActivation: !opts.forSubagent,
     });
     // Re-invocation with byte-identical content → short note instead of a
-    // second copy (audit A8). Subagent instances keep their own context and
-    // never consult the parent-session fingerprints.
+    // second copy. Subagent instances keep their own context and never consult
+    // the parent-session fingerprints.
     const note = opts.forSubagent ? undefined : skillDedupNote(skill, rendered);
     if (note) {
       return {
@@ -919,12 +917,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   claudeNamedTools.push(slashCommandTool as Record<string, unknown>);
 
   if (project.settings.subagentsEnabled) {
-    // The built-in agent types (E1) guarantee dispatchable agents even when the
+    // The built-in agent types guarantee dispatchable agents even when the
     // project defines none — so Agent/Task always register when subagents are on.
     claudeNamedTools.push(
       createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Agent", backgroundTasks }),
       createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Task", backgroundTasks }),
-      // SendMessage (t04): the coordinator's channel back into its subagents —
+      // SendMessage: the coordinator's channel back into its subagents —
       // resume a finished one (same id, full context, background) or steer a
       // running background one. Parent-session only (never in customToolsFor).
       createSendMessageToolDefinition(subagentRuntime, {
@@ -933,8 +931,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       }),
     );
   }
-  // Real TaskOutput/TaskStop (audit E4) — formerly degrade stubs; they answer
-  // helpfully even when no background task was ever started.
+  // Registered unconditionally: TaskOutput/TaskStop answer helpfully even when
+  // no background task was ever started.
   claudeNamedTools.push(
     createTaskOutputTool(backgroundTasks) as Record<string, unknown>,
     createTaskStopTool(backgroundTasks) as Record<string, unknown>,
@@ -942,12 +940,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   for (const tool of claudeNamedTools) {
     try {
-      // concise-tool-rows t01: wrap EVERY Claude-named tool in the self-shell
-      // seam so its row loses the top/bottom blank-line padding while keeping its
-      // colored band (re-applied per line), its 1-col gutter, and its content.
-      // The wrapper preserves `execute` and all other fields untouched. (The
-      // subagent-scoped customToolsFor set at ~:687 is intentionally NOT wrapped:
-      // it renders inside subagent transcripts, not the parent interactive shell.)
+      // Wrap EVERY Claude-named tool in the self-shell seam so its row loses the
+      // top/bottom blank-line padding while keeping its colored band (re-applied
+      // per line), its 1-col gutter, and its content. The wrapper preserves
+      // `execute` and all other fields untouched. (The subagent-scoped set built
+      // by `customToolsFor` is intentionally NOT wrapped: it renders inside
+      // subagent transcripts, not the parent interactive shell.)
       pi.registerTool(wrapForSelfShell(tool));
     } catch (err) {
       console.error(`PiCC: failed to register tool: ${(err as Error).message}`);
@@ -955,11 +953,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   // ---------------------------------------------------------------------------
-  // Per-session native-safe scratch dir (feature 25 / #48)
+  // Per-session native-safe scratch dir
   // ---------------------------------------------------------------------------
   // Created EAGERLY in the outer scope — before the async IIFE below and the
   // before_agent_start registration — so its literal resolved path is captured
-  // synchronously at the t02 system-prompt injection call site (not raced by the
+  // synchronously at the system-prompt injection call site (not raced by the
   // first turn nor left `undefined` by the error-swallowing async closure).
   // Order is load-bearing: mkdtemp → realpath → slash-transform. Applying the
   // slash transform before realpath'ing would silently return the backslash form.
@@ -980,31 +978,31 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       platform: process.platform,
     });
   } catch (err) {
-    // A scratch-dir failure must never crash activation; t02 simply omits the
-    // scratchpad guidance when the value is unavailable.
+    // A scratch-dir failure must never crash activation; prompt assembly simply
+    // omits the scratchpad guidance when the value is unavailable.
     console.error(`PiCC: session scratch dir unavailable: ${(err as Error).message}`);
   }
 
-  // Cwd-swapping overrides of Pi built-ins (design doc §3.1). Execute is sourced from the
+  // Cwd-swapping overrides of Pi built-ins. Execute is sourced from the
   // ctx-dropping create*Tool factory (byte-identical); renderers are re-applied from
-  // create*ToolDefinition and de-padded via wrapForSelfShell (concise-tool-rows).
-  // The IIFE promise is captured (not `void`ed) so the t02 readiness seam can await
-  // built-in registration settlement via onInitializationSettled (line ~1775).
+  // create*ToolDefinition and de-padded via wrapForSelfShell.
+  // The IIFE promise is captured (not `void`ed) so the readiness seam can await
+  // built-in registration settlement via onInitializationSettled.
   const builtInRegistration = (async () => {
     try {
       const sdk: any = await import("@earendil-works/pi-coding-agent");
       // Pin the shell to real Git Bash on Windows — Pi's default `bash` lookup can
       // land on the System32 WSL stub (WSL_E_DEFAULT_DISTRO_NOT_FOUND without a distro).
       const shellPath = resolveGitBashPath();
-      // concise-tool-rows t02: each built-in carries TWO sourcings that must stay
-      // separate. `factory` (create*Tool) is the EXECUTE source — kept byte-for-byte
-      // as before, so live-cwd re-resolution, bash spawnHook/env, and Git-Bash pinning
-      // are unchanged, and `read`'s ctx handling (its non-vision image note) is
-      // untouched. `defFactory` (create*ToolDefinition) is the RENDERER source — the
+      // Each built-in carries TWO sourcings that must stay separate. `factory`
+      // (create*Tool) is the EXECUTE source — it drives live-cwd re-resolution, the
+      // bash spawnHook/env, Git-Bash pinning, and `read`'s ctx handling (its
+      // non-vision image note).
+      // `defFactory` (create*ToolDefinition) is the RENDERER source — the
       // create*Tool factory strips renderCall/renderResult via wrapToolDefinition, so
       // the diffs/truncation/highlighting come from the Definition. Its renderers are
       // cwd-light (the render ctx supplies cwd), so one instance is pulled at
-      // registration. Both are routed through the t01 self-shell seam (wrapForSelfShell),
+      // registration. Both are routed through the self-shell seam (wrapForSelfShell),
       // which sets renderShell:"self", reframes each row (no top/bottom padding, colored
       // band re-applied per line), and threads ctx.lastComponent to the inner component
       // so the built-ins' incremental rendering survives.
@@ -1066,14 +1064,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     hooks: hookRunnerFacade,
     getCwd,
     contextForTouchedFile: injectForFile,
-    // Active skills' disallowed-tools (§4.1): enforced while the skill is resident.
+    // Active skills' disallowed-tools: enforced while the skill is resident.
     extraDenyRules: () => [...activeSkillDenyRules],
   })(pi);
 
   // ---------------------------------------------------------------------------
-  // System prompt assembly (every turn — also compaction preservation, plan §9)
+  // System prompt assembly (every turn — also compaction preservation)
   // ---------------------------------------------------------------------------
-  // Skill-listing tier degradation (G5): surfaced once per tier CHANGE — the
+  // Skill-listing tier degradation: surfaced once per tier CHANGE — the
   // suffix renders every turn, so a per-render report would spam stderr.
   const reportListingDegradation = createTierChangeReporter((message) =>
     console.error(`PiCC: ${message}`),
@@ -1085,17 +1083,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         claudeMd: project.claudeMd,
         rules: project.rules,
         skills: project.skills,
-        // Built-ins appear in the routing catalog after the project's agents (E1).
+        // Built-ins appear in the routing catalog after the project's agents.
         agents: project.settings.subagentsEnabled ? agentsWithBuiltins() : [],
         settings: project.settings,
         state,
         steeringText,
-        // #69: only the main session receives the `## Working with the user`
-        // interaction posture — subagents (the :623 call site) leave this unset.
+        // Only the main session receives the `## Working with the user`
+        // interaction posture — the subagent prompt builder leaves this unset.
         includeInteractionPosture: true,
-        // Feature 25 / #48: the literal native-safe scratch dir (captured eagerly
-        // above) is injected on all platforms; the Windows namespace note is gated
-        // on the shell↔native split detection.
+        // The literal native-safe scratch dir (captured eagerly above) is
+        // injected on all platforms; the Windows namespace note is gated on the
+        // shell↔native split detection.
         scratchDir,
         windowsTempNote: shellNamespaceDiffersFromNative(),
         autoMemory: project.autoMemory,
@@ -1109,35 +1107,34 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   // ---------------------------------------------------------------------------
-  // Background settlement notices (t05) — visible without polling
+  // Background settlement notices — visible without polling
   // ---------------------------------------------------------------------------
   // At the parent's NEXT turn (before_agent_start, above), deliver a one-time,
   // transcript-visible notice for each eligible, uncollected current task
-  // generation: outcome (t01 vocabulary — a stopped task reads "aborted"), the
-  // capped error when failed, the agent id, and a bounded, explicitly-framed
-  // UNTRUSTED excerpt of its output. Delivered via the message-level channel PiCC
-  // already uses (pi.sendMessage + deliverAs "steer") so it lands in the
-  // transcript like Claude Code's settlement message.
+  // generation: outcome (the shared presenter's vocabulary — a stopped task reads
+  // "aborted"), the capped error when failed, the agent id, and a bounded,
+  // explicitly-framed UNTRUSTED excerpt of its output. Delivered via the
+  // message-level channel PiCC already uses (pi.sendMessage + deliverAs "steer")
+  // so it lands in the transcript like Claude Code's settlement message.
   // Exactly-once delivery combines task-local collected/notified state with the
   // per-agent readiness gate (which a resume re-arms). Folded into the single
   // before_agent_start handler (own try/catch) rather than a second listener, so
   // it can never depend on multi-handler ordering and a drain failure can never
   // break prompt assembly.
   //
-  // Honest limitation (v1, documented — flagged for the t07 user guide + registry
-  // note): before_agent_start fires when the user continues the conversation, so
-  // an IDLE coordinator (turn ended, awaiting input) learns of settlement only
-  // when the conversation continues — PiCC does NOT re-invoke an idle agent. No
-  // wake-an-idle-parent machinery is built here.
+  // Honest limitation: before_agent_start fires when the user continues the
+  // conversation, so an IDLE coordinator (turn ended, awaiting input) learns of
+  // settlement only when the conversation continues — PiCC does NOT re-invoke an
+  // idle agent. No wake-an-idle-parent machinery is built here.
   function deliverSettlementNotices(): void {
     let notices: SettlementNotice[];
     try {
       notices = backgroundTasks.drainSettlementNotices(
-        // PEEK the dedup gate (FIX 1) — do not flip it while selecting.
+        // PEEK the dedup gate — do not flip it while selecting.
         (agentId) => subagentRegistry.isSettledNoticeArmed(agentId),
         // COMMIT the gate — called by the loop below ONLY after a successful send.
         (agentId) => subagentRegistry.consumeSettledNotice(agentId),
-        // Drain-fallback gate (SHOULD-3): a true registry MISS means the dispatch
+        // Drain-fallback gate: a true registry MISS means the dispatch
         // failed at an early guard before it ever registered — the notice is then
         // emitted from the background record itself, exactly once. A registered
         // task always has a record here, so it stays on the consume path above.
@@ -1189,7 +1186,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         const level = mapEffort(config, config.effort);
         if (level) pi.setThinkingLevel(level);
       }
-      // core.hooksPath self-heal (plan §4.5 git-hook interplay)
+      // core.hooksPath self-heal: a project shipping .githooks expects them live,
+      // but a clone installed with --ignore-scripts never ran the `prepare` that
+      // sets core.hooksPath. (Worktrees inherit it from the shared config.)
       if (fs.existsSync(path.join(project.root, ".githooks"))) {
         const current = await pi.exec("git", ["config", "core.hooksPath"], {}).catch(() => ({ stdout: "" }));
         if (!String(current.stdout ?? "").trim()) {
@@ -1349,11 +1348,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
             );
             continue;
           }
-          // Byte-identical re-invocation → short note instead of a second copy (audit A8).
+          // Byte-identical re-invocation → short note instead of a second copy.
           const note = skillDedupNote(skill, rendered);
           parts.push(note ?? skillActivationMessage(skill, rendered));
         }
-        // The trailing text is NOT re-appended as its own part (G6): the last
+        // The trailing text is NOT re-appended as its own part: the last
         // skill's rendered activation already carries it as $ARGUMENTS (or via
         // the ARGUMENTS: fallback), so a second copy would duplicate the request.
         return { action: "transform", text: parts.join("\n\n") + hookSuffix };
@@ -1434,15 +1433,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   pi.on("session_compact", async () => {
     try {
       await hooks.fire("PostCompact", { cwd: cwdState.get() });
-      // Path-scoped artifacts reload on next relevant access (plan §9): compaction
+      // Path-scoped artifacts reload on next relevant access: compaction
       // summarized their transcript messages away, so the once-only markers reset.
       resetInjectionState(state, project.claudeMd);
-      // Re-inject active skill bodies for mid-turn continuity (plan §9). Auto-
-      // compaction happens MID-RUN and the aborted turn is retried immediately, so
-      // this must deliver before the next LLM call ("steer") — "nextTurn" would sit
-      // queued until the next user prompt, exactly the /doctor-class bug.
-      // Budgeted like Claude's carryover (audit A9): ~5k tokens per skill,
-      // ~25k combined, most recently activated first.
+      // Re-inject active skill bodies for mid-turn continuity. Auto-compaction
+      // happens MID-RUN and the aborted turn is retried immediately, so this must
+      // deliver before the next LLM call ("steer") — "nextTurn" would sit queued
+      // until the next user prompt.
+      // Budgeted like Claude's carryover: ~5k tokens per skill, ~25k combined,
+      // most recently activated first.
       if (state.activeSkills.size) {
         const budgeted = budgetSkillReinjection([...state.activeSkills.entries()]);
         for (const name of budgeted.dropped) {
@@ -1546,11 +1545,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   /**
-   * `/usage` (t06): per-subagent token/cost breakdown for THIS session, plus a
-   * session total — aggregated from the dispatch registry (t04). The user noted
-   * Pi's own usage surface is unhelpful; this is the per-subagent view. Lists
-   * each dispatched agent's id, type, outcome, usage, and transcript path — the
-   * one place a human can look for what their fan-out cost.
+   * `/usage`: per-subagent token/cost breakdown for THIS session, plus a session
+   * total — aggregated from the dispatch registry. Pi's own usage surface does
+   * not break usage down per subagent; this does. Lists each dispatched agent's
+   * id, type, outcome, usage, and transcript path — the one place a human can
+   * look for what their fan-out cost.
    */
   function renderUsageReport(): string {
     const records = subagentRegistry.list();
@@ -1584,7 +1583,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     };
     for (const record of records) {
       const state = record.state === "running" ? "running" : record.outcome ?? "settled";
-      // SECURITY (FIX 4, defense-in-depth): agentName comes from agent frontmatter
+      // SECURITY (defense-in-depth): agentName comes from agent frontmatter
       // `name`/basename (only `.trim()`ed upstream — control bytes survive) and is
       // printed to the human terminal; single-line-sanitize it so an ANSI/OSC/
       // control-byte agent name cannot inject into the terminal on /usage.
