@@ -574,8 +574,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       handler: (ctx: any) => subagentPanelFocus.open(ctx),
     });
   }
-  // One-time chat hint advertising the chord, emitted only once >1 agent runs
-  // concurrently in a TUI session (the ui handle is captured at session_start).
+  // One-time status-line hint (ui.notify) advertising the chord, emitted only
+  // once >1 agent runs concurrently in a TUI session (the ui handle is
+  // captured at session_start).
   let panelHintUi: any;
   const emitPanelHint = createPanelHintEmitter({
     chord: PANEL_ENTRY_CHORD,

@@ -68,6 +68,8 @@ function isTypedText(data: string): boolean {
 // --- status-line notice wordings (exported so tests pin the exact strings) ---
 
 export const PANEL_NOTICE_EMPTY = "No subagents this session.";
+/** The chord's refusal when rows exist but the user dismissed every one. */
+export const PANEL_NOTICE_ALL_DISMISSED = "All subagent rows dismissed.";
 /** A keypress whose selection no longer resolves to a current row refuses. */
 export const PANEL_NOTICE_STALE = "That agent row changed — no action taken.";
 export const PANEL_NOTICE_FOREGROUND =
@@ -240,17 +242,23 @@ export class SubagentPanelFocusController {
           // status-line notices are best-effort
         }
       };
-      // Empty probe on a throwaway model: the component's own model must not
-      // exist yet (its focused view would freeze linger removals).
+      // Entry probe on a throwaway model, with FOCUSED-view semantics: the
+      // opened component's view skips linger expiry, so the probe must too —
+      // probing with the passive (expiring) view would refuse entry to rows
+      // the component would happily show (all-rows-expired sessions). Only a
+      // genuinely record-free session or an everything-dismissed panel
+      // refuses, each with its own honest notice.
       const probe = new SubagentPanelModel({ now: () => this.nowFn() });
       const probeView = probe.view({
         records: this.deps.registry.list(),
         tasks: this.deps.tasks(),
-        focused: false,
+        focused: true,
         dismissed: this.dismissed,
       });
       if (probeView.empty) {
-        notify(PANEL_NOTICE_EMPTY);
+        notify(
+          this.deps.registry.list().length === 0 ? PANEL_NOTICE_EMPTY : PANEL_NOTICE_ALL_DISMISSED,
+        );
         return;
       }
       this.openFlag = true;

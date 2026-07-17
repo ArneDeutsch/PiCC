@@ -66,9 +66,11 @@ const ESC = String.fromCharCode(27);
 const FG_RESET = `${ESC}[39m`;
 
 /**
- * Claude's fixed agent-frontmatter color set → ANSI foreground codes. t01
- * guarantees only these names reach a record, but the map is still consulted
- * defensively: an unknown value falls back to no tint, never a throw.
+ * Claude's fixed agent-frontmatter color set → ANSI foreground codes. Capture
+ * validation (`AGENT_COLOR_NAMES` in subagent-registry.ts) guarantees only
+ * these names reach a record — a test pins the two sets equal so capture and
+ * render cannot drift — but the map is still consulted defensively: an
+ * unknown value falls back to no tint, never a throw.
  */
 export const AGENT_COLOR_ANSI: Readonly<Record<string, string>> = {
   red: `${ESC}[31m`,
@@ -97,7 +99,7 @@ export function tintAgentColor(color: string | undefined, text: string): string 
 /**
  * The unfocused footer hint. CONTRACT: it names the entry chord — for a
  * single-agent run this line is the user's only discovery path into the panel
- * (the one-time chat hint fires only for >1 agent). The chord string is
+ * (the one-time status-line hint fires only for >1 agent). The chord string is
  * injected by the caller (t04 owns the chord constant).
  */
 export function panelHintUnfocused(entryChord: string): string {
@@ -283,13 +285,13 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
 // --- drill-down detail view --------------------------------------------------
 
 /** Scrollable body viewport height (lines) inside the drill-down. */
-export const DETAIL_BODY_ROWS = 12;
+const DETAIL_BODY_ROWS = 12;
 /**
  * Detail-view chords, shown in hints. Control chords, not plain letters:
  * inside the drill-down every printable key types into the steer buffer.
  */
-export const DETAIL_PROMPT_KEY = "ctrl+p";
-export const DETAIL_STOP_KEY = "ctrl+x";
+const DETAIL_PROMPT_KEY = "ctrl+p";
+const DETAIL_STOP_KEY = "ctrl+x";
 
 // Banners for live state changes while the drill-down is open — the view
 // re-resolves its record each render and narrates the transition instead of
@@ -307,7 +309,7 @@ export function detailSteerFailed(reason: string): string {
  * foreground dispatch blocks the parent's turn, so the only real control the
  * user has is the editor's own turn cancel.
  */
-export const DETAIL_FOREGROUND_ALT = "esc to editor; Esc there cancels the whole turn";
+export const DETAIL_FOREGROUND_ALT = "esc to editor; esc there cancels the whole turn";
 export function detailSteerUnavailable(reason: string): string {
   return `steering unavailable (${reason})`;
 }

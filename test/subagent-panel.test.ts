@@ -27,6 +27,8 @@ import {
   DETAIL_FINAL_LABEL,
   DETAIL_FOREGROUND_ALT,
   DETAIL_NO_ACTIVITY,
+  DETAIL_NO_FINAL_ANSWER,
+  DETAIL_NO_TAIL,
   DETAIL_PROMPT_EXPANDED,
   DETAIL_STEER_PREFIX,
   DETAIL_STEER_SENT,
@@ -51,6 +53,7 @@ import {
   type PanelDetailUiState,
 } from "../src/runtime/subagent-panel-render.js";
 import {
+  AGENT_COLOR_NAMES,
   SubagentRegistry,
   type RegisterInput,
   type SubagentRegistryRecord,
@@ -65,6 +68,7 @@ import {
 } from "../src/runtime/subagent-panel-widget.js";
 import {
   PANEL_FOCUSED_EMPTY_LINE,
+  PANEL_NOTICE_ALL_DISMISSED,
   PANEL_NOTICE_EMPTY,
   PANEL_NOTICE_FOREGROUND,
   PANEL_NOTICE_RUNNING_DISMISS,
@@ -581,6 +585,13 @@ describe("row rendering", () => {
     expect(renderAt(200)[0]!).not.toContain(AGENT_COLOR_ANSI.red);
   });
 
+  it("DRIFT GUARD: the render palette's names equal the capture-side color whitelist", () => {
+    // Capture (subagent-registry) whitelists color names; render (this map)
+    // assigns them ANSI codes. A name added to one side only would silently
+    // drop the tint (or dead-code the ANSI entry) — pin the sets equal.
+    expect(Object.keys(AGENT_COLOR_ANSI).sort()).toEqual([...AGENT_COLOR_NAMES].sort());
+  });
+
   it("marks the selected row only while focused", () => {
     const focusedRow = renderAt(200, true)[0]!;
     expect(focusedRow).toContain("❯");
@@ -857,6 +868,21 @@ describe("drill-down detail rendering (pure)", () => {
     expect(lines[lines.length - 1]).toContain(
       detailHint({ steerable: false, stoppable: false }),
     );
+  });
+
+  it("settled view with nothing captured shows the honest placeholders, never blank sections", () => {
+    const record = rec({
+      agentId: "agent-a",
+      state: "settled",
+      outcome: "completed",
+      startedAt: 0,
+      settledAt: 1000,
+    });
+    const text = renderSubagentDetail({ record, nowMs: 5000 }, detailUi({ follow: false }), {
+      width: 120,
+    }).lines.join("\n");
+    expect(text).toContain(DETAIL_NO_FINAL_ANSWER);
+    expect(text).toContain(DETAIL_NO_TAIL);
   });
 
   it("expands and collapses the prompt via the ui flag", () => {
@@ -1746,6 +1772,27 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     await invocation.result;
   });
 
+  it("chord after EVERY row's linger expired (none dismissed) still opens and shows the settled rows", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", "kept past expiry");
+    s.registry.markSettled("agent-a", { outcome: "completed" });
+    reg(s.registry, "agent-b", "failed and expired");
+    s.registry.markSettled("agent-b", { outcome: "failed" });
+    // Far past both linger tiers: the PASSIVE panel is long gone, but the
+    // records still exist — entry must use focused-view (expiry-skipping)
+    // semantics, not the passive view's.
+    s.clock.t += LINGER_FAILURE_MS * 10;
+    const invocation = s.openPanel()!;
+    expect(invocation).toBeDefined();
+    await invocation.ready;
+    const text = invocation.render(160).join("\n");
+    expect(text).toContain("kept past expiry");
+    expect(text).toContain("failed and expired");
+    expect(s.notices()).toEqual([]); // no refusal notice of any kind
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
   it("focus freeze: no row is evicted while the panel is open, however far the clock advances", async () => {
     const s = focusSetup();
     reg(s.registry, "agent-a", "lingering result");
@@ -1769,10 +1816,14 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     invocation.input("x"); // dismiss the settled row
     invocation.input(ESC);
     await invocation.result;
-    // Re-entry: the dismissal persisted, so the panel is empty → notice only.
+    // Re-entry: the dismissal persisted, so the panel is empty. PINNED
+    // everything-dismissed behavior: refuse to open (re-showing rows the user
+    // just dismissed would be wrong), with the honest all-dismissed wording —
+    // never the "no subagents" notice, which would be a lie here.
     s.openPanel();
     expect(s.pi.customs).toHaveLength(1); // no new component opened
-    expect(s.notices()).toContain(PANEL_NOTICE_EMPTY);
+    expect(s.notices()).toContain(PANEL_NOTICE_ALL_DISMISSED);
+    expect(s.notices()).not.toContain(PANEL_NOTICE_EMPTY);
     expect(s.controller.dismissedKeyIds()).toEqual(["task:task-1"]);
     // A resume mints a new task generation: the old dismissed key goes stale
     // and entry-time pruning drops it; the resumed agent is visible again.
@@ -2390,6 +2441,12 @@ describe("panel focus (offline integration: fake-pi + fake-sdk)", () => {
       const delivered = settlements(pi);
       expect(delivered).toHaveLength(1);
       expect(delivered[0]).toContain("settled: aborted");
+      // The chat-record junction: the same message's `details` drive the
+      // REGISTERED picc-settlement renderer to the user-stop record line.
+      const message = pi.messages.find((m) => m.message?.customType === "picc-settlement")!.message;
+      const renderer = pi.messageRenderers.get("picc-settlement")!;
+      const recordLine = renderer(message, { expanded: false }, undefined)!.render(120).join("\n");
+      expect(recordLine).toContain("stopped by user");
 
       // Esc closes; the suppression is released and the widget reinstalls
       // (the stopped row is still lingering).
@@ -2493,8 +2550,8 @@ describe("panel focus (offline integration: fake-pi + fake-sdk)", () => {
       const second = await dispatchBackground(pi, "t2");
       await handle.waitForPromptCalls(2);
 
-      // The one-time chat hint fired once when the fan-out reached 2 agents,
-      // naming the real chord.
+      // The one-time status-line hint fired once when the fan-out reached 2
+      // agents, naming the real chord.
       const hints = pi.notifications.filter((n) => n.text === panelHintText(2, PANEL_ENTRY_CHORD));
       expect(hints).toHaveLength(1);
 

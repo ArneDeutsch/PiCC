@@ -227,7 +227,7 @@ export class SubagentPanelWidgetController {
   }
 }
 
-/** The one-time chat hint advertising the panel-entry chord. */
+/** The one-time status-line hint advertising the panel-entry chord. */
 export function panelHintText(runningCount: number, chord: string): string {
   return `${runningCount} agents running — press ${chord} to manage`;
 }

@@ -178,12 +178,14 @@ Every subagent is visible, both to you and to the coordinating model:
   no `TaskOutput` await needed. One row per agent, nested children indented: a status bubble
   (spinner while running; `●` done, `✗` failed, `■` stopped), the agent type (tinted with the
   agent's `color:` frontmatter when set), your dispatch description, its current activity, elapsed
-  time, and token usage once known (blank until then — never a fake zero). Finished rows linger
-  briefly — ~10 s for successes, ~60 s for failures and stops — then leave on their own. That
-  auto-expiry is a deliberate PiCC deviation: Claude Code keeps finished agents listed until
-  dismissed; the condensed record in the chat (below) is what stays reachable afterwards. While the
-  panel has keyboard focus, no row expires on its own (dismissing with `d` still removes). When several agents run at once, a one-time
-  hint names the entry key.
+  time, and token usage once known (blank until then — never a fake zero; tokens are the first
+  column dropped on narrow terminals). Finished rows linger briefly — ~10 s for successes, ~60 s
+  for failures and stops — then leave on their own. That auto-expiry is a deliberate PiCC
+  deviation: Claude Code keeps finished agents listed until dismissed. An expired row is not lost:
+  `alt+a` reopens the panel with every finished agent still listed, and the condensed record in
+  the chat (below) arrives once the conversation continues. While the panel has keyboard focus,
+  no row expires on its own (dismissing with `d` still removes). When several agents run at once,
+  a one-time hint names the entry key.
 - **Panel navigation (`alt+a`).** Press `alt+a` to focus the panel; a `❯` marker shows the
   selection, and the footer hint lists the keys: `↑↓ select · enter open · x stop · X stop all ·
   d dismiss · esc close`. Stopping from the panel is **background-only** — a foreground agent is
@@ -404,6 +406,7 @@ behaviors worth knowing:
 | Unexpected skills/agents from plugins | PiCC loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. `/doctor` and the startup info notice report how many are available but disabled. |
 | A plugin you enabled isn't loading | Confirm it's listed truthy in `enabledPlugins` as `name@marketplace`, and that it isn't in `~/.claude/plugins/blocklist.json`. |
 | Want to see why a fan-out routed the way it did | agent descriptions are the routing surface — inspect the "Available subagents" catalog in the session, and the dispatch tool calls in the transcript |
+| Agent finished, its panel row is gone, and no record shows in the chat | Press `alt+a` — finished agents stay reachable in the panel after their rows expire. Or continue the conversation: the condensed record rides the next turn. |
 
 ## 10. Verification status
 

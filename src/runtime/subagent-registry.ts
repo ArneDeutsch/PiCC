@@ -66,9 +66,11 @@ const DESCRIPTION_CAP = 120;
 /**
  * Claude Code's fixed agent-frontmatter color-name set (the /agents picker
  * palette). Anything else is dropped at capture — hostile frontmatter must
- * never reach a renderer as a raw string.
+ * never reach a renderer as a raw string. Exported as the whitelist the
+ * render-side ANSI palette (`AGENT_COLOR_ANSI` in subagent-panel-render.ts)
+ * is test-pinned against.
  */
-const AGENT_COLOR_NAMES = new Set([
+export const AGENT_COLOR_NAMES: ReadonlySet<string> = new Set([
   "red",
   "blue",
   "green",
