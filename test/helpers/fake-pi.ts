@@ -1,5 +1,42 @@
 import { deferred, waitUntil, type Deferred } from "./async.js";
 
+/** One recorded `ctx.ui.setWidget` call (removals record `content: undefined`). */
+export interface FakeWidgetCall {
+  key: string;
+  content: unknown;
+  options?: any;
+}
+
+/** A live widget: component factories are invoked SYNCHRONOUSLY, as real Pi does. */
+export interface FakeWidgetInstance {
+  key: string;
+  content: unknown;
+  options?: any;
+  /** The instantiated component when `content` was a factory. */
+  component?: { render(width: number): string[]; dispose?(): void };
+  /** Flipped when the widget is removed/replaced (Pi calls dispose then). */
+  disposed: boolean;
+  render(width: number): string[];
+}
+
+/** A recorded `ctx.ui.custom` invocation, drivable end to end. */
+export interface FakeCustomInvocation {
+  options?: any;
+  /** Resolves when the (possibly async) factory has produced the component. */
+  ready: Promise<void>;
+  /** Resolves with the value the component passes to `done()`. */
+  result: Promise<unknown>;
+  component?: {
+    render(width: number): string[];
+    handleInput?(data: string): void;
+    dispose?(): void;
+  };
+  closed: boolean;
+  /** Feed raw key bytes to the focused component (Pi routes input to it). */
+  input(data: string): void;
+  render(width: number): string[];
+}
+
 /** A fake Pi ExtensionAPI capturing everything the PiCC extension registers. */
 export interface FakePi {
   api: Record<string, unknown>;
@@ -13,8 +50,46 @@ export interface FakePi {
   notifications: Array<{ text: string; severity?: string }>;
   modelSets: unknown[];
   thinkingLevels: string[];
+  /** Shortcuts registered via `pi.registerShortcut`, keyed by KeyId. */
+  shortcuts: Map<string, { description?: string; handler: (ctx: any) => unknown }>;
+  /** Currently-installed widgets by key (removed keys are deleted). */
+  widgets: Map<string, FakeWidgetInstance>;
+  /** Every `setWidget` call in order, including removals. */
+  widgetCalls: FakeWidgetCall[];
+  /** Every `ctx.ui.custom` invocation in order. */
+  customs: FakeCustomInvocation[];
+  /** Live `ctx.ui.onTerminalInput` handlers (unsubscribed ones are removed). */
+  terminalInputHandlers: Array<
+    (data: string) => { consume?: boolean; data?: string } | undefined
+  >;
+  /** Drive the handler chain exactly as pi-tui does: consume stops, data rewrites. */
+  feedTerminalInput(data: string): { consumed: boolean; data: string };
+  /** `tui.requestRender()` calls observed from widget/custom components. */
+  renderRequests: number;
+  /**
+   * The injectable keybinding stub behind the fake KeybindingsManager's
+   * `matches(data, id)`: id → raw byte sequences. Ships the select-navigation
+   * defaults (up/down/confirm/cancel); tests extend or override entries.
+   */
+  keymap: Record<string, string[]>;
   fire(event: string, evt?: any, ctx?: any): Promise<any>;
   ctx(overrides?: Record<string, unknown>): Record<string, unknown>;
+  /** An interactive-TUI ctx: `mode: "tui"`, `hasUI: true`, the recording ui. */
+  tuiCtx(overrides?: Record<string, unknown>): Record<string, unknown>;
+  /**
+   * A ctx modeling REAL Pi print mode (pinned in test/pi-contract.test.ts):
+   * `mode: "print"`, `hasUI: false`, and a ui whose verbs are all PRESENT
+   * (Pi's no-op UI context implements the full interface) — so mode, not
+   * method presence, is the only valid interactivity gate. The verbs still
+   * record here, so a wrongly-gated install is caught, not swallowed.
+   */
+  printCtx(overrides?: Record<string, unknown>): Record<string, unknown>;
+  /**
+   * A ctx modeling RPC mode — the gating trap: `hasUI: true` AND a working
+   * `setWidget`, but `mode: "rpc"`. Only a `mode === "tui"` gate keeps
+   * TUI-only chrome out of it.
+   */
+  rpcCtx(overrides?: Record<string, unknown>): Record<string, unknown>;
   /** Wait until every named tool has been registered. */
   waitForTools(names: readonly string[]): Promise<void>;
   /** Capture the extension's observational detached-initialization completion. */
@@ -34,6 +109,13 @@ export function fakePi(): FakePi {
   const notifications: Array<{ text: string; severity?: string }> = [];
   const modelSets: unknown[] = [];
   const thinkingLevels: string[] = [];
+  const shortcuts = new Map<string, { description?: string; handler: (ctx: any) => unknown }>();
+  const widgets = new Map<string, FakeWidgetInstance>();
+  const widgetCalls: FakeWidgetCall[] = [];
+  const customs: FakeCustomInvocation[] = [];
+  const terminalInputHandlers: Array<
+    (data: string) => { consume?: boolean; data?: string } | undefined
+  > = [];
   const toolWaiters = new Set<{ names: readonly string[]; signal: Deferred<void> }>();
   const hasTools = (names: readonly string[]) => names.every((name) => tools.has(name));
   const notifyToolWaiters = () => {
@@ -70,6 +152,135 @@ export function fakePi(): FakePi {
       : "completion captured but still pending",
   });
 
+  // The tui handed to widget/custom factories: repaint requests are counted.
+  const fakeTui = {
+    requestRender: () => {
+      self.renderRequests++;
+    },
+  };
+  // Identity theme: enough shape for null-guarded renderers, no ANSI noise.
+  const fakeTheme = {
+    fg: (_slot: string, text: string) => text,
+    bg: (_slot: string, text: string) => text,
+    bold: (text: string) => text,
+    italic: (text: string) => text,
+    underline: (text: string) => text,
+  };
+  // KeybindingsManager stand-in for `custom` components: resolves matches()
+  // through the injectable keymap (see FakePi.keymap).
+  const fakeKeybindings = {
+    matches: (data: string, id: string) => (self.keymap[id] ?? []).includes(data),
+  };
+
+  const setWidget = (key: string, content: unknown, options?: any): void => {
+    widgetCalls.push({ key, content, options });
+    // Pi disposes an existing component for the key BEFORE anything else.
+    const existing = widgets.get(key);
+    if (existing) {
+      existing.disposed = true;
+      existing.component?.dispose?.();
+      widgets.delete(key);
+    }
+    if (content === undefined) return;
+    const instance: FakeWidgetInstance = {
+      key,
+      content,
+      options,
+      // Real Pi invokes a factory synchronously inside setWidget.
+      component:
+        typeof content === "function"
+          ? (content as (tui: unknown, theme: unknown) => FakeWidgetInstance["component"])(
+              fakeTui,
+              fakeTheme,
+            )
+          : undefined,
+      disposed: false,
+      render: (width: number) =>
+        Array.isArray(content) ? [...content] : (instance.component?.render(width) ?? []),
+    };
+    widgets.set(key, instance);
+  };
+
+  const custom = (factory: any, options?: any): Promise<unknown> => {
+    let resolveResult!: (value: unknown) => void;
+    let rejectResult!: (err: unknown) => void;
+    const result = new Promise<unknown>((resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    });
+    const invocation: FakeCustomInvocation = {
+      options,
+      ready: Promise.resolve(),
+      result,
+      closed: false,
+      input: (data: string) => invocation.component?.handleInput?.(data),
+      render: (width: number) => invocation.component?.render(width) ?? [],
+    };
+    // Mirrors Pi's close(): resolve once, then dispose (dispose errors ignored).
+    const done = (value: unknown): void => {
+      if (invocation.closed) return;
+      invocation.closed = true;
+      resolveResult(value);
+      try {
+        invocation.component?.dispose?.();
+      } catch {
+        /* ignore dispose errors, as Pi does */
+      }
+    };
+    // Mirrors Pi's showExtensionCustom error path: the factory runs INSIDE the
+    // promise chain, so a synchronous throw (or async rejection) rejects
+    // `result` instead of escaping custom() or dangling forever.
+    invocation.ready = Promise.resolve()
+      .then(() => factory(fakeTui, fakeTheme, fakeKeybindings, done))
+      .then((component: FakeCustomInvocation["component"]) => {
+        if (!invocation.closed) invocation.component = component;
+      })
+      .catch((err: unknown) => {
+        if (!invocation.closed) {
+          invocation.closed = true;
+          rejectResult(err);
+        }
+      });
+    customs.push(invocation);
+    return result;
+  };
+
+  const onTerminalInput = (
+    handler: (data: string) => { consume?: boolean; data?: string } | undefined,
+  ): (() => void) => {
+    terminalInputHandlers.push(handler);
+    return () => {
+      const index = terminalInputHandlers.indexOf(handler);
+      if (index !== -1) terminalInputHandlers.splice(index, 1);
+    };
+  };
+
+  const feedTerminalInput = (data: string): { consumed: boolean; data: string } => {
+    // pi-tui's chain: sequential; consume stops the chain; data rewrites it.
+    let current = data;
+    for (const handler of [...terminalInputHandlers]) {
+      const result = handler(current);
+      if (result?.consume) return { consumed: true, data: current };
+      if (result?.data !== undefined) current = result.data;
+    }
+    return { consumed: false, data: current };
+  };
+
+  /**
+   * Per-call ui factory whose RECORDING STATE is shared by every ctx shape
+   * (like `notifications`); each call yields a distinct ui identity. NOTE:
+   * the mere PRESENCE of these verbs activates presence-gated branches in
+   * production code (e.g. the typed-fork Esc watch) that a verb-less fake
+   * would skip — deliberate, and pinned as Pi-accurate by pi-contract.
+   */
+  const recordingUi = () => ({
+    notify: (text: string, severity?: string) => notifications.push({ text, severity }),
+    setStatus: () => undefined,
+    setWidget,
+    custom,
+    onTerminalInput,
+  });
+
   const self: FakePi = {
     tools,
     commands,
@@ -81,6 +292,19 @@ export function fakePi(): FakePi {
     notifications,
     modelSets,
     thinkingLevels,
+    shortcuts,
+    widgets,
+    widgetCalls,
+    customs,
+    terminalInputHandlers,
+    feedTerminalInput,
+    renderRequests: 0,
+    keymap: {
+      "tui.select.up": ["\u001b[A"],
+      "tui.select.down": ["\u001b[B"],
+      "tui.select.confirm": ["\r"],
+      "tui.select.cancel": ["\u001b"],
+    },
     waitForTools,
     captureInitialization,
     waitForInitialization,
@@ -90,6 +314,7 @@ export function fakePi(): FakePi {
         notifyToolWaiters();
       },
       registerCommand: (name: string, options: any) => commands.set(name, options),
+      registerShortcut: (shortcut: string, options: any) => shortcuts.set(shortcut, options),
       on: (event: string, handler: (event: any, ctx: any) => unknown) => {
         handlers.set(event, [...(handlers.get(event) ?? []), handler]);
       },
@@ -121,18 +346,27 @@ export function fakePi(): FakePi {
     ctx(overrides: Record<string, unknown> = {}) {
       return {
         cwd: process.cwd(),
+        // NOTE: hasUI:true + mode:"print" is a deliberately odd legacy pair
+        // many existing tests rely on (dialog-notify paths without a TUI).
+        // Mode-shape-sensitive tests use tuiCtx/printCtx/rpcCtx instead.
         hasUI: true,
         mode: "print",
-        ui: {
-          notify: (text: string, severity?: string) => notifications.push({ text, severity }),
-          setStatus: () => undefined,
-        },
+        ui: recordingUi(),
         modelRegistry: { find: () => undefined },
         model: { provider: "openai", id: "gpt-test" },
         getContextUsage: () => ({ tokens: 1234 }),
         sessionManager: { getEntries: () => [] },
         ...overrides,
       };
+    },
+    tuiCtx(overrides: Record<string, unknown> = {}) {
+      return self.ctx({ mode: "tui", hasUI: true, ...overrides });
+    },
+    printCtx(overrides: Record<string, unknown> = {}) {
+      return self.ctx({ mode: "print", hasUI: false, ...overrides });
+    },
+    rpcCtx(overrides: Record<string, unknown> = {}) {
+      return self.ctx({ mode: "rpc", hasUI: true, ...overrides });
     },
   };
   return self;

@@ -20,6 +20,8 @@ import {
 import type { PiSdk } from "./runtime/subagents.js";
 import { SubagentRegistry } from "./runtime/subagent-registry.js";
 import type { SubagentRegistryRecord } from "./runtime/subagent-registry.js";
+import { SubagentPanelWidgetController } from "./runtime/subagent-panel-widget.js";
+import type { PanelTaskInfo } from "./runtime/subagent-panel-model.js";
 import { formatUsageCompact, sanitizeLine } from "./runtime/subagent-progress.js";
 import { createGuardExtension } from "./runtime/guard.js";
 import {
@@ -222,6 +224,12 @@ export interface PiccTestSeam {
      * supplied by the test). Reachable only via this in-process seam.
      */
     subagentRuntime: SubagentRuntime;
+    /**
+     * The session's status-panel widget controller: lets an offline test
+     * inject the panel clock/tick (`configureForTest`) so linger expiry is
+     * observable without fake timers around async dispatches.
+     */
+    subagentPanel: SubagentPanelWidgetController;
   }) => void;
   /**
    * TEST-ONLY subagent SDK override: replaces the real Pi SDK the session's
@@ -516,6 +524,21 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // resume a finished one. Registry-only resolution keeps a hostile `to` off the
   // filesystem (SECURITY).
   const subagentRegistry = new SubagentRegistry();
+  // Status panel: a passive belowEditor widget over the dispatch registry.
+  // Constructed unconditionally (cheap, no timer until installed) so the
+  // onWired test seam can reach it; it attaches to a UI only from the
+  // session_start handler's `ctx.mode === "tui"` gate.
+  const subagentPanel = new SubagentPanelWidgetController({
+    registry: subagentRegistry,
+    tasks: (): PanelTaskInfo[] => {
+      const tasks: PanelTaskInfo[] = [];
+      for (const id of backgroundTasks.ids()) {
+        const record = backgroundTasks.get(id);
+        if (record) tasks.push(record);
+      }
+      return tasks;
+    },
+  });
   // Built-in agent types: general-purpose/Explore/Plan, appended AFTER
   // project/user/plugin agents so a same-named project agent wins (an
   // overridden built-in is dropped from the catalog — dispatch resolves the
@@ -777,7 +800,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // in-process argument, never via project/env/settings/files. Invoked after the
   // runtime is built so the test can inject its fake SDK before the first dispatch.
   try {
-    testSeam?.onWired?.({ backgroundTasks, subagentRegistry, subagentRuntime });
+    testSeam?.onWired?.({ backgroundTasks, subagentRegistry, subagentRuntime, subagentPanel });
   } catch (err) {
     console.error(`PiCC test seam onWired failed: ${(err as Error).message}`);
   }
@@ -1173,6 +1196,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     try {
       modelRegistryRef = ctx.modelRegistry;
       sessionManagerRef = ctx.sessionManager;
+      // Status panel: interactive TUI ONLY. The gate is `ctx.mode === "tui"`
+      // specifically, NOT `hasUI` — RPC mode also implements setWidget (and
+      // reports hasUI: true), so a hasUI gate would install the panel into an
+      // RPC client; print/RPC output must stay unchanged.
+      if (ctx.mode === "tui") subagentPanel.attach(ctx.ui);
       if (ctx.model) {
         currentModel = ctx.model;
         currentModelRef = `${ctx.model.provider}/${ctx.model.id}`;

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { fakePi } from "./helpers/fake-pi.js";
 
 /**
  * Pi upstream contract smoke test: asserts every Pi API PiCC
@@ -120,6 +121,78 @@ describe("pi 0.80.x API contract", () => {
         expect(ours(p as never, showImages)).toBe(real.getTextOutput(p, showImages));
       }
     }
+  });
+
+  it("extension ctx pins the UI widget surface and the mode/hasUI gating reality", async () => {
+    // The subagent status panel installs via ctx.ui.setWidget from a
+    // `ctx.mode === "tui"` gate. This pins WHY that gate (and only that gate)
+    // is valid, against Pi's real ExtensionRunner ctx:
+    //  - Default (print) mode: hasUI is FALSE, but every UI verb — setWidget,
+    //    custom, onTerminalInput — is PRESENT as a no-op (Pi's noOpUIContext
+    //    implements the full ExtensionUIContext). Method presence therefore
+    //    proves nothing about interactivity.
+    //  - A bound non-TUI UI context (RPC): hasUI flips TRUE while mode stays
+    //    "rpc" — so a hasUI gate would wrongly install TUI chrome in RPC.
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    const runner = new sdk.ExtensionRunner(
+      [],
+      sdk.createExtensionRuntime(),
+      process.cwd(),
+      {},
+      {},
+    );
+    const ctx = runner.createContext();
+    expect(ctx.mode).toBe("print");
+    expect(ctx.hasUI).toBe(false);
+    for (const verb of ["setWidget", "custom", "onTerminalInput", "notify", "setStatus"]) {
+      expect(typeof ctx.ui[verb], `print-mode ui.${verb} must exist (no-op)`).toBe("function");
+    }
+    // No-op reality: callable without a TUI, returning nothing/unsubscribe.
+    expect(ctx.ui.setWidget("k", ["x"], { placement: "belowEditor" })).toBeUndefined();
+    expect(typeof ctx.ui.onTerminalInput(() => undefined)).toBe("function");
+    await expect(ctx.ui.custom(() => ({ render: () => [] }))).resolves.toBeUndefined();
+
+    // Bind a (dummy) UI context as RPC mode does → the hasUI trap.
+    runner.setUIContext({ setWidget: () => undefined }, "rpc");
+    expect(ctx.mode).toBe("rpc");
+    expect(ctx.hasUI).toBe(true);
+  });
+
+  it("fake-pi's print-mode ctx matches the pinned print-mode reality", async () => {
+    // The "no setWidget in print mode" tests must model Pi, not mirror
+    // whichever field the implementation happens to read — so the fake's
+    // print ctx is pinned here against the same shape as the real one above.
+    const ctx: any = fakePi().printCtx();
+    expect(ctx.mode).toBe("print");
+    expect(ctx.hasUI).toBe(false);
+    for (const verb of ["setWidget", "custom", "onTerminalInput", "notify", "setStatus"]) {
+      expect(typeof ctx.ui[verb], `fake print-mode ui.${verb} must exist`).toBe("function");
+    }
+  });
+
+  it("registerShortcut exists on the extension API and records the shortcut", async () => {
+    // The panel-entry chord (alt+a) registers through pi.registerShortcut;
+    // fake-pi mirrors it, so a Pi rename must fail here first. The loader is
+    // not re-exported at the package root, so it is imported by file URL —
+    // the same pattern as the render-utils getTextOutput pin above.
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const distIdx = mainUrl.indexOf("/dist/");
+    expect(distIdx, "unexpected Pi dist layout").toBeGreaterThan(0);
+    const loader: any = await import(`${mainUrl.slice(0, distIdx)}/dist/core/extensions/loader.js`);
+    expect(typeof loader.loadExtensionFromFactory, "Pi extension loader moved").toBe("function");
+    let captured: any;
+    const ext = await loader.loadExtensionFromFactory(
+      (pi: any) => {
+        captured = pi;
+        pi.registerShortcut("alt+a", { description: "probe", handler: () => undefined });
+      },
+      process.cwd(),
+      sdk.createEventBus(),
+      sdk.createExtensionRuntime(),
+    );
+    expect(typeof captured.registerShortcut).toBe("function");
+    expect(ext.shortcuts.get("alt+a")?.description).toBe("probe");
   });
 
   it("typebox + StringEnum are importable the way our tools use them", async () => {

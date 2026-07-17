@@ -1,5 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import picc, { type PiccTestSeam } from "../src/index.js";
+import { fakePi, type FakePi } from "./helpers/fake-pi.js";
+import { fakeSdk, type FakeSdkHandle } from "./helpers/fake-sdk.js";
+import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
+import { waitUntil } from "./helpers/async.js";
 import {
   LINGER_FAILURE_MS,
   LINGER_SUCCESS_MS,
@@ -27,7 +34,14 @@ import {
   renderSubagentPanel,
   tintAgentColor,
 } from "../src/runtime/subagent-panel-render.js";
-import type { SubagentRegistryRecord } from "../src/runtime/subagent-registry.js";
+import { SubagentRegistry, type SubagentRegistryRecord } from "../src/runtime/subagent-registry.js";
+import {
+  createPanelHintEmitter,
+  PANEL_ENTRY_CHORD,
+  panelHintText,
+  SUBAGENT_PANEL_WIDGET_KEY,
+  SubagentPanelWidgetController,
+} from "../src/runtime/subagent-panel-widget.js";
 
 const ESC = String.fromCharCode(27);
 const BEL = String.fromCharCode(7);
@@ -722,5 +736,395 @@ describe("formatElapsed", () => {
     expect(formatElapsed(62_000)).toBe("1m02s");
     expect(formatElapsed(3_840_000)).toBe("1h04m");
     expect(formatElapsed(Number.NaN)).toBe("0s");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Widget shell (subagent-panel-widget.ts) + fake-pi UI surface
+// ---------------------------------------------------------------------------
+
+describe("panel-entry chord constant", () => {
+  it("is the compile-time literal the render fixtures above assume", () => {
+    // The chord is interpolated into hint lines unsanitized by design — it must
+    // stay a compile-time literal, and the fixture CHORD tracks it.
+    expect(PANEL_ENTRY_CHORD).toBe(CHORD);
+  });
+});
+
+describe("one-time panel hint emitter", () => {
+  it("emits once (with the injected chord) when more than one agent runs, never again", () => {
+    const emitted: string[] = [];
+    const emit = createPanelHintEmitter({
+      chord: "ctrl+t",
+      isTui: () => true,
+      emit: (text) => emitted.push(text),
+    });
+    emit(3);
+    expect(emitted).toEqual([panelHintText(3, "ctrl+t")]);
+    expect(emitted[0]).toContain("ctrl+t");
+    expect(emitted[0]).toContain("3 agents running");
+    emit(5); // once per session: a later, larger fan-out stays silent
+    expect(emitted).toHaveLength(1);
+  });
+
+  it("does NOT emit for a single agent (negative), and a gated-off call keeps the once-gate", () => {
+    const emitted: string[] = [];
+    const emit = createPanelHintEmitter({
+      chord: PANEL_ENTRY_CHORD,
+      isTui: () => true,
+      emit: (text) => emitted.push(text),
+    });
+    emit(0);
+    emit(1);
+    expect(emitted).toEqual([]);
+    emit(2); // the single-agent calls did not consume the gate
+    expect(emitted).toEqual([panelHintText(2, PANEL_ENTRY_CHORD)]);
+  });
+
+  it("emits nothing outside TUI mode, without consuming the once-gate", () => {
+    const emitted: string[] = [];
+    let tui = false;
+    const emit = createPanelHintEmitter({
+      chord: PANEL_ENTRY_CHORD,
+      isTui: () => tui,
+      emit: (text) => emitted.push(text),
+    });
+    emit(4); // print/RPC: silent
+    expect(emitted).toEqual([]);
+    tui = true;
+    emit(4);
+    expect(emitted).toEqual([panelHintText(4, PANEL_ENTRY_CHORD)]);
+  });
+});
+
+/** A minimal running registry record for widget tests. */
+function registerRunning(registry: SubagentRegistry, agentId: string): void {
+  registry.register({
+    agentId,
+    agentName: "coder",
+    depth: 1,
+    cwd: "/repo",
+    resumable: true,
+    oneShot: false,
+  });
+}
+
+describe("panel widget controller (unit, fake-pi ui)", () => {
+  function setup(over: Partial<ConstructorParameters<typeof SubagentPanelWidgetController>[0]> = {}) {
+    const registry = new SubagentRegistry();
+    const pi = fakePi();
+    const ui = (pi.ctx() as { ui: never }).ui;
+    const controller = new SubagentPanelWidgetController({ registry, tasks: () => [], ...over });
+    return { registry, pi, ui, controller };
+  }
+
+  it("installs a belowEditor widget on attach when rows are already visible", () => {
+    const { registry, pi, ui, controller } = setup();
+    registerRunning(registry, "agent-a");
+    try {
+      controller.attach(ui);
+      const install = pi.widgetCalls.find((c) => c.content !== undefined);
+      expect(install?.key).toBe(SUBAGENT_PANEL_WIDGET_KEY);
+      expect(install?.options?.placement).toBe("belowEditor");
+      expect(pi.widgets.get(SUBAGENT_PANEL_WIDGET_KEY)!.render(120).join("\n")).toContain("coder");
+    } finally {
+      controller.setSuppressed(true); // clear the real repaint interval
+    }
+  });
+
+  it("onChange drives the lifecycle: absent while empty, installed on registry activity", () => {
+    const { registry, pi, ui, controller } = setup();
+    try {
+      controller.attach(ui); // empty registry: nothing to show
+      expect(pi.widgetCalls).toEqual([]);
+      registerRunning(registry, "agent-a"); // change while the widget is absent → install
+      expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(true);
+      const requestsAfterInstall = pi.renderRequests;
+      registerRunning(registry, "agent-b"); // change while installed → repaint, no reinstall
+      expect(pi.renderRequests).toBeGreaterThan(requestsAfterInstall);
+      expect(pi.widgetCalls.filter((c) => c.content !== undefined)).toHaveLength(1);
+    } finally {
+      controller.setSuppressed(true);
+    }
+  });
+
+  it("suppression (the t05 focused-panel seam) hides the widget and re-shows it", () => {
+    const { registry, pi, ui, controller } = setup();
+    try {
+      registerRunning(registry, "agent-a");
+      controller.attach(ui);
+      const widget = pi.widgets.get(SUBAGENT_PANEL_WIDGET_KEY)!;
+      controller.setSuppressed(true);
+      expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(false);
+      expect(widget.disposed).toBe(true); // interval died with the widget
+      registerRunning(registry, "agent-b"); // activity while suppressed stays hidden
+      expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(false);
+      controller.setSuppressed(false);
+      expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(true);
+    } finally {
+      controller.setSuppressed(true);
+    }
+  });
+
+  it("defensive render: a poisoned render stub is caught, logged, and renders empty (process-liveness)", () => {
+    // pi-tui kills the whole process on a throwing render — the shell must
+    // catch, log, and emit nothing instead. This is the named process-liveness
+    // property, proven with an injected throwing renderer.
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { registry, pi, ui, controller } = setup({
+      render: () => {
+        throw new Error("poisoned render");
+      },
+    });
+    registerRunning(registry, "agent-a");
+    try {
+      controller.attach(ui);
+      const widget = pi.widgets.get(SUBAGENT_PANEL_WIDGET_KEY)!;
+      expect(widget.render(80)).toEqual([]);
+      expect(errors).toHaveBeenCalledWith(expect.stringContaining("subagent panel render failed"));
+    } finally {
+      controller.setSuppressed(true);
+      errors.mockRestore();
+    }
+  });
+
+  it("a throwing data join never escapes attach/onChange (logs, no widget, registry unharmed)", () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { registry, ui, controller, pi } = setup({
+      tasks: () => {
+        throw new Error("poisoned join");
+      },
+    });
+    try {
+      controller.attach(ui);
+      registerRunning(registry, "agent-a"); // onChange fires into the throwing join
+      expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(false);
+      expect(registry.get("agent-a")).toBeDefined(); // the mutation survived the listener
+      expect(errors).toHaveBeenCalledWith(expect.stringContaining("subagent panel update failed"));
+    } finally {
+      controller.setSuppressed(true);
+      errors.mockRestore();
+    }
+  });
+});
+
+describe("panel widget timer discipline (fake timers)", () => {
+  afterEach(() => {
+    // Repo teardown convention: the interval must be gone after dispose.
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it("creates the tick interval on install and clears it on dispose (no leak)", () => {
+    vi.useFakeTimers();
+    const registry = new SubagentRegistry();
+    const pi = fakePi();
+    const controller = new SubagentPanelWidgetController({ registry, tasks: () => [] });
+    registerRunning(registry, "agent-a");
+    controller.attach((pi.ctx() as { ui: never }).ui);
+    expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(true);
+    expect(vi.getTimerCount()).toBe(1);
+    const before = pi.renderRequests;
+    vi.advanceTimersByTime(3000); // ~1s cadence: three ticks repaint three times
+    expect(pi.renderRequests).toBeGreaterThanOrEqual(before + 3);
+    controller.setSuppressed(true); // remove → dispose → interval cleared
+    expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a tick that finds every row linger-expired removes the widget (and its own interval)", () => {
+    vi.useFakeTimers();
+    const clock = { t: Date.now() };
+    const registry = new SubagentRegistry();
+    const pi = fakePi();
+    const controller = new SubagentPanelWidgetController({
+      registry,
+      tasks: () => [],
+      now: () => clock.t,
+    });
+    registerRunning(registry, "agent-a");
+    registry.markSettled("agent-a", { outcome: "completed" });
+    controller.attach((pi.ctx() as { ui: never }).ui);
+    expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(true); // lingering
+    clock.t += LINGER_SUCCESS_MS + 1;
+    vi.advanceTimersByTime(1000); // the next tick observes the expiry
+    expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(false);
+    expect(pi.widgetCalls[pi.widgetCalls.length - 1]).toMatchObject({
+      key: SUBAGENT_PANEL_WIDGET_KEY,
+      content: undefined,
+    });
+    expect(vi.getTimerCount()).toBe(0);
+    // Expiry-removal → NEW activity → re-install, pinned directly.
+    registerRunning(registry, "agent-b");
+    expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(true);
+    controller.setSuppressed(true); // clean up the fresh interval
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("panel widget wiring (offline integration: fake-pi + fake-sdk)", () => {
+  let dir: string;
+  const originalCwd = process.cwd();
+  const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
+
+  beforeAll(() => {
+    dir = materializeFixture("hello-claude");
+    // Hermetic user scope: don't absorb the developer's real ~/.claude.
+    const userDir = path.join(dir, ".claude-user");
+    fs.mkdirSync(userDir, { recursive: true });
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    process.chdir(dir);
+  });
+
+  afterAll(() => {
+    process.chdir(originalCwd);
+    if (savedUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+    else process.env.PICC_CLAUDE_USER_DIR = savedUserDir;
+    cleanupFixture(dir);
+  });
+
+  type Internals = Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
+
+  async function boot(handle: FakeSdkHandle): Promise<{ pi: FakePi; internals: Internals }> {
+    const pi = fakePi();
+    let internals!: Internals;
+    picc(pi.api as never, {
+      sdk: handle.sdk,
+      onWired: (i) => (internals = i),
+      onInitializationSettled: pi.captureInitialization,
+    });
+    await pi.waitForInitialization();
+    await pi.waitForTools(["Agent"]);
+    return { pi, internals };
+  }
+
+  it("dispatch installs the belowEditor widget; settlement flips the row; linger expiry (injected clock) removes it", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const handle = fakeSdk({ replies: [{ text: "sub done", gate }] });
+    const { pi, internals } = await boot(handle);
+    // Injected clock + short tick per the clock rule: NEVER fake timers around
+    // an async dispatch — the panel clock is swapped through the test seam and
+    // the real (fast) interval observes it.
+    const clock = { t: Date.now() };
+    internals.subagentPanel.configureForTest({ now: () => clock.t, tickMs: 10 });
+
+    await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx());
+    expect(pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY)).toBe(false); // nothing running yet
+
+    const agentTool = pi.tools.get("Agent");
+    const res = await agentTool.execute("t1", {
+      subagent_type: "general-purpose",
+      prompt: "GO",
+      run_in_background: true,
+    });
+    const taskId = res.details.taskId as string;
+    await waitUntil({
+      description: "panel widget installed after the background dispatch",
+      predicate: () => pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY),
+      describeObserved: () => `setWidget calls: ${JSON.stringify(pi.widgetCalls.map((c) => c.key))}`,
+    });
+    const install = pi.widgetCalls.find((c) => c.content !== undefined)!;
+    expect(install.key).toBe(SUBAGENT_PANEL_WIDGET_KEY);
+    expect(install.options?.placement).toBe("belowEditor");
+    const runningRow = pi.widgets.get(SUBAGENT_PANEL_WIDGET_KEY)!.render(120).join("\n");
+    expect(runningRow).toContain("general-purpose");
+    expect(runningRow).not.toContain(PANEL_GLYPH_SUCCESS);
+
+    release();
+    const agentId = internals.backgroundTasks.get(taskId)!.agentId!;
+    await waitUntil({
+      description: "the dispatched agent to settle in the registry",
+      predicate: () => internals.subagentRegistry.get(agentId)?.state === "settled",
+      describeObserved: () => `record state: ${internals.subagentRegistry.get(agentId)?.state}`,
+    });
+    const settledRow = pi.widgets.get(SUBAGENT_PANEL_WIDGET_KEY)!.render(120).join("\n");
+    expect(settledRow).toContain(PANEL_GLYPH_SUCCESS); // flipped to the finished bubble
+
+    clock.t = Date.now() + LINGER_SUCCESS_MS + 60_000; // way past the success linger
+    await waitUntil({
+      description: "the widget to be removed after linger expiry",
+      predicate: () => !pi.widgets.has(SUBAGENT_PANEL_WIDGET_KEY),
+      describeObserved: () => `setWidget calls: ${JSON.stringify(pi.widgetCalls.map((c) => c.key))}`,
+    });
+    expect(pi.widgetCalls[pi.widgetCalls.length - 1]).toMatchObject({
+      key: SUBAGENT_PANEL_WIDGET_KEY,
+      content: undefined,
+    });
+  });
+
+  it("never installs the widget from a print- or RPC-mode session (mode gate, not hasUI)", async () => {
+    const handle = fakeSdk({ replies: ["done"] });
+    const { pi, internals } = await boot(handle);
+    // printCtx models real print mode (hasUI false, verbs present as no-ops);
+    // rpcCtx is the trap shape: hasUI TRUE and a working setWidget — only the
+    // mode gate keeps the panel out of it. Both shapes are pinned against real
+    // Pi in test/pi-contract.test.ts.
+    await pi.fire("session_start", { reason: "startup" }, pi.printCtx());
+    await pi.fire("session_start", { reason: "startup" }, pi.rpcCtx());
+    const agentTool = pi.tools.get("Agent");
+    await agentTool.execute("t1", {
+      subagent_type: "general-purpose",
+      prompt: "GO",
+      run_in_background: false,
+    });
+    expect(internals.subagentRegistry.list().length).toBeGreaterThan(0); // the dispatch really ran
+    expect(pi.widgetCalls).toEqual([]); // setWidget was never touched
+  });
+});
+
+describe("fake-pi UI driving surface (the shape later panel tasks build on)", () => {
+  it("drives a custom component end to end: factory, keybinding matches, input, render, done", async () => {
+    const pi = fakePi();
+    const ui = (pi.ctx() as { ui: any }).ui;
+    const seen: string[] = [];
+    const resultPromise = ui.custom(
+      (_tui: unknown, _theme: unknown, keybindings: any, done: (v: string) => void) => ({
+        render: (width: number) => [`w=${width}`],
+        handleInput: (data: string) => {
+          if (keybindings.matches(data, "tui.select.down")) seen.push("down");
+          else if (keybindings.matches(data, "tui.select.up")) seen.push("up");
+          else if (keybindings.matches(data, "tui.select.confirm")) done("confirmed");
+          else if (keybindings.matches(data, "tui.select.cancel")) done("cancelled");
+        },
+        dispose: () => seen.push("disposed"),
+      }),
+      { overlay: true },
+    );
+    const invocation = pi.customs[0]!;
+    await invocation.ready;
+    expect(invocation.options).toEqual({ overlay: true });
+    expect(invocation.render(42)).toEqual(["w=42"]);
+    invocation.input("\u001b[B"); // tui.select.down (default keymap)
+    invocation.input("\u001b[A"); // tui.select.up
+    invocation.input("\r"); // tui.select.confirm → done()
+    await expect(resultPromise).resolves.toBe("confirmed");
+    expect(invocation.closed).toBe(true);
+    expect(seen).toEqual(["down", "up", "disposed"]); // dispose ran exactly once, at close
+    invocation.input("\u001b"); // done() is one-shot: a late cancel changes nothing
+    await expect(invocation.result).resolves.toBe("confirmed");
+  });
+
+  it("records registerShortcut on the api (panel-entry wiring must not break fake-pi tests)", () => {
+    const pi = fakePi();
+    (pi.api.registerShortcut as (key: string, options: unknown) => void)(PANEL_ENTRY_CHORD, {
+      description: "open the agent panel",
+      handler: () => undefined,
+    });
+    expect(pi.shortcuts.get(PANEL_ENTRY_CHORD)?.description).toBe("open the agent panel");
+  });
+
+  it("feeds terminal input through the handler chain with pi-tui's consume/rewrite semantics", () => {
+    const pi = fakePi();
+    const ui = (pi.ctx() as { ui: any }).ui;
+    const unsubscribe = ui.onTerminalInput((data: string) =>
+      data === "x" ? { consume: true } : { data: data.toUpperCase() },
+    );
+    ui.onTerminalInput((data: string) => (data === "Y" ? { consume: true } : undefined));
+    expect(pi.feedTerminalInput("x")).toEqual({ consumed: true, data: "x" });
+    expect(pi.feedTerminalInput("y")).toEqual({ consumed: true, data: "Y" }); // rewritten, then consumed downstream
+    expect(pi.feedTerminalInput("z")).toEqual({ consumed: false, data: "Z" });
+    unsubscribe();
+    expect(pi.feedTerminalInput("x")).toEqual({ consumed: false, data: "x" });
   });
 });
