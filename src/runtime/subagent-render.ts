@@ -1,69 +1,19 @@
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import {
   formatUsageCompact,
   sanitizeProgressText,
   type ProgressSnapshot,
 } from "./subagent-progress.js";
+import { clampLines, pushColored, pushWrapped, themedBold, themedFg } from "./render-util.js";
 import { FORK_DEGRADE_PREFIX, isAgentId } from "../util/subagent-transcripts.js";
 
 // --- live-progress + result rendering helpers ---
 //
 // The Agent tool's renderCall/renderResult return a STRUCTURAL pi-tui Component
 // ({ render(width): string[] }) — the same untyped contract index.ts's control
-// renderers use, so no pi-tui import is needed. `theme` is Pi's Theme (fg/bold);
-// every access is null-guarded so a print-mode/absent theme degrades to plain
-// text and a renderer can never throw into Pi's render loop.
-
-function themedFg(theme: unknown, color: string, text: string): string {
-  const t = theme as { fg?: (c: string, s: string) => string } | undefined;
-  return typeof t?.fg === "function" ? t.fg(color, text) : text;
-}
-
-function themedBold(theme: unknown, text: string): string {
-  const t = theme as { bold?: (s: string) => string } | undefined;
-  return typeof t?.bold === "function" ? t.bold(text) : text;
-}
-
-// Width-aware line helpers, backed by pi-tui's OWN column measure. pi-tui throws
-// an uncaughtException — killing the whole process — if a rendered line's visible
-// width exceeds the terminal, and it decides that with visibleWidth() (grapheme +
-// East-Asian-width + tabs=3). We MUST use the same function so our clamp agrees
-// exactly with the check pi-tui enforces; a code-unit approximation silently
-// disagrees on CJK/wide/tab content and still crashes.
-
-/** Append `text` wrapped to `width` visible columns (ANSI- and wide-char-aware). */
-function pushWrapped(text: string, width: number, into: string[]): void {
-  for (const l of wrapTextWithAnsi(String(text ?? ""), Math.max(1, width))) into.push(l);
-}
-
-/** Wrap `text` to `width`, coloring each segment; every emitted line is <= width columns. */
-function pushColored(
-  theme: unknown,
-  color: string,
-  text: string,
-  width: number,
-  into: string[],
-): void {
-  // Color first, then wrap — wrapTextWithAnsi preserves active ANSI across breaks.
-  for (const l of wrapTextWithAnsi(themedFg(theme, color, String(text ?? "")), Math.max(1, width))) {
-    into.push(l);
-  }
-}
-
-/**
- * FINAL SAFETY PASS before returning from render(): clamp every line to `width`
- * VISIBLE columns using pi-tui's own measure, so no line a render() returns can
- * exceed the terminal width and crash the process — even one a push site forgot
- * to wrap, or that carries wide/CJK/tab content.
- *
- * This is a WIDTH clamp, NOT a sanitizer: it preserves ANSI verbatim, so callers
- * MUST strip control/escape sequences from untrusted (model-/file-supplied) text
- * BEFORE it reaches here (see sanitizeInline / sanitizeProgressText usages).
- */
-function clampLines(lines: string[], width: number): string[] {
-  if (width <= 0) return lines.map(() => "");
-  return lines.map((l) => (visibleWidth(l) > width ? truncateToWidth(l, width, "…") : l));
-}
+// renderers use, so no pi-tui import is needed. The width/theme helpers
+// (clampLines, pushWrapped, pushColored, themedFg, themedBold) live in
+// render-util.ts, shared with the subagent status panel.
 
 /** Flatten model-/file-supplied label text to a single sanitized display line. */
 function sanitizeInline(text: string): string {
