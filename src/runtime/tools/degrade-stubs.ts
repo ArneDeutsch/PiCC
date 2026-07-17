@@ -2,7 +2,7 @@ import { Type } from "typebox";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 /**
- * Graceful-degradation stubs (plan §4.8, §7): tool names a project can
+ * Graceful-degradation stubs: tool names a project can
  * reference in `tools:`, permission rules, or hook `if:` conditions must
  * resolve predictably even when PiCC does not implement them.
  *
@@ -31,7 +31,7 @@ export function createDegradeStub(toolName: string, note: string): ToolDefinitio
   });
 }
 
-/** Tool names degraded to predictable no-ops in v1, with §7-grounded notes. */
+/** Tool names degraded to predictable no-ops, each with a note for the model. */
 export const DEGRADED_TOOLS: Array<{ name: string; note: string }> = [
   {
     name: "NotebookEdit",
@@ -39,27 +39,27 @@ export const DEGRADED_TOOLS: Array<{ name: string; note: string }> = [
   },
   {
     name: "AskUserQuestion",
-    note: "interactive question prompts are deliberately not provided; ask the user in plain chat instead (plan §7)",
+    note: "interactive question prompts are deliberately not provided; ask the user in plain chat instead",
   },
   {
     name: "ExitPlanMode",
-    note: "plan mode is a no-op in PiCC; simply continue with the work (plan §7)",
+    note: "plan mode is a no-op in PiCC; simply continue with the work",
   },
   {
     name: "EnterPlanMode",
-    note: "plan mode is a no-op in PiCC; treat planning guidance as ordinary instructions (plan §7)",
+    note: "plan mode is a no-op in PiCC; treat planning guidance as ordinary instructions",
   },
   {
     name: "Artifact",
-    note: "Artifacts are out of scope; write output to a regular file instead (plan §7)",
+    note: "Artifacts are out of scope; write output to a regular file instead",
   },
   {
     name: "computer",
-    note: "computer use is out of scope for PiCC (plan §7)",
+    note: "computer use is out of scope for PiCC",
   },
   {
     name: "LSP",
-    note: "language-server integration is out of scope; use Grep/Read to navigate code (plan §7)",
+    note: "language-server integration is out of scope; use Grep/Read to navigate code",
   },
   {
     name: "BashOutput",
@@ -73,9 +73,4 @@ export const DEGRADED_TOOLS: Array<{ name: string; note: string }> = [
     name: "KillBash",
     note: "background shells are not implemented; there is no shell to kill",
   },
-  // SlashCommand is a REAL tool now (F11, src/index.ts createSlashCommandTool) —
-  // a thin alias over the shared skill-activation path, no longer a degraded no-op.
-  // TaskOutput/TaskStop are REAL tools now (audit E4, src/runtime/background-tasks.ts).
-  // MultiEdit is a REAL tool now (F17, src/runtime/tools/multi-edit.ts) — an atomic,
-  // sequential, exact-string multi-edit, no longer a degraded no-op.
 ];

@@ -17,14 +17,14 @@ import {
 } from "./skill-activation.js";
 
 /**
- * Assembles the PiCC system-prompt suffix appended to Pi's prompt each turn
- * (design doc §2: before_agent_start). Because the system prompt is rebuilt every
- * turn and never compacted away, this is ALSO the primary compaction-preservation
- * mechanism (plan §9): root CLAUDE.md, unconditional rules, the skill listing, the
- * agent catalog, and rendered active skills always survive.
+ * Assembles the PiCC system-prompt suffix appended to Pi's prompt each turn (at
+ * Pi's `before_agent_start`). Because the system prompt is rebuilt every turn and
+ * never compacted away, this is ALSO the primary compaction-preservation
+ * mechanism: root CLAUDE.md, unconditional rules, the skill listing, the agent
+ * catalog, and rendered active skills always survive.
  */
 export interface SessionContextState {
-  /** Skill name -> rendered body (stays resident once activated — plan §4.1). */
+  /** Skill name -> rendered body (stays resident once activated). */
   activeSkills: Map<string, string>;
   /** Absolute paths of CLAUDE.md files already in context (root set + injected nested). */
   loadedClaudeMd: Set<string>;
@@ -47,7 +47,7 @@ export function newSessionContextState(claudeMd: ClaudeMdFile[]): SessionContext
 }
 
 /**
- * Reset the once-only injection markers after compaction (plan §9): nested
+ * Reset the once-only injection markers after compaction: nested
  * CLAUDE.md and path-scoped rules/skills were delivered as ordinary transcript
  * messages that compaction summarizes away, so they must re-inject on the next
  * relevant access. Active skills survive via the system-prompt suffix and stay.
@@ -68,7 +68,7 @@ export interface AssemblyInputs {
   steeringText?: string;
   compatNotice?: string;
   /**
-   * Per-session native-safe scratch dir literal path (#48/feature 25). When set, a
+   * Per-session native-safe scratch dir literal path. When set, a
    * scratchpad section is injected on ALL platforms (mirroring Claude Code) naming
    * this literal path and steering temp files here instead of `/tmp`. Computed once
    * in index.ts (the composition root) so this module never imports from `engine/`.
@@ -82,26 +82,26 @@ export interface AssemblyInputs {
    */
   windowsTempNote?: boolean;
   /**
-   * True only for the main session (#69): injects the `## Working with the user`
+   * True only for the main session: injects the `## Working with the user`
    * interaction posture ({@link INTERACTION_POSTURE}). Dispatched subagents leave it
    * unset — they return reports and have no user to converse with — so they receive
    * the mechanical conventions but not the posture. Gated via `=== true`.
    */
   includeInteractionPosture?: boolean;
-  /** Auto memory (audit B4): injected as its own section when present (= enabled). */
+  /** Auto memory: injected as its own section when present (= enabled). */
   autoMemory?: MemorySnapshot;
   /** Approximate model context-window budget in chars for the skill listing. */
   contextWindowChars?: number;
   /**
    * Sink for assembly diagnostics — currently the skill-listing tier
-   * degradation (G5). Called once per diagnostic per render; wrap it with
+   * degradation. Called once per diagnostic per render; wrap it with
    * {@link createTierChangeReporter} to surface each tier change only once.
    */
   onDiagnostic?: (diagnostic: Diagnostic) => void;
 }
 
 /**
- * Wrap a report callback so skill-listing tier-degradation diagnostics (G5)
+ * Wrap a report callback so skill-listing tier-degradation diagnostics
  * surface once per TIER CHANGE, not once per render — the system-prompt suffix
  * is rebuilt every turn and would otherwise repeat the same message forever.
  */
@@ -118,7 +118,7 @@ export function createTierChangeReporter(
 }
 
 /**
- * Always-on, main-session-only interaction posture (#69, successor to F24). A
+ * Always-on, main-session-only interaction posture. A
  * standalone `## Working with the user` section gearing the model PiCC drives
  * toward the grounded, collaborative partner a Claude Code session is. It is
  * model-neutral — injected identically for every model — and a soft default:
@@ -154,7 +154,7 @@ You are running a project authored for Claude Code. Honor its conventions:
 - Commits: when you're asked to commit — by the user, or by a skill or project instruction — first read the changes (git status/diff) and recent git log, and match this repository's commit-message style where it is richer; for a non-trivial change, still write a short body explaining why the change was made, not just what. Never use git commit --no-verify; project hooks must run.`;
 
 /**
- * Conservative memory-write policy (F10). Single-line string, shared verbatim by the
+ * Conservative memory-write policy. Single-line string, shared verbatim by the
  * main-session auto-memory guidance below and the per-agent `memory:` guidance in
  * index.ts so the two can never drift. It opens with a deference clause so a project's
  * own CLAUDE.md eager-write opt-in overrides the conservative default — that section is
@@ -170,7 +170,7 @@ export function buildSystemPromptSuffix(inputs: AssemblyInputs): string {
 
   sections.push(HARNESS_CONVENTIONS);
 
-  // Main-session-only (#69): posted after the mechanical conventions but before
+  // Main-session-only: posted after the mechanical conventions but before
   // CLAUDE.md/skills/steering, so those more-specific sections still get the last word.
   if (inputs.includeInteractionPosture === true) sections.push(INTERACTION_POSTURE);
 
@@ -218,7 +218,7 @@ export function buildSystemPromptSuffix(inputs: AssemblyInputs): string {
   if (inputs.state.activeSkills.size) {
     // The resident section re-sends every active body each turn, so it gets
     // the same ~20k-per-skill / ~100k-combined budget as compaction
-    // re-injection (G7), most recently activated first (Map insertion order
+    // re-injection, most recently activated first (Map insertion order
     // reflects activation order).
     const active = [...inputs.state.activeSkills.entries()];
     const { text, dropped } = budgetSkillReinjection(active);
@@ -249,7 +249,7 @@ export function buildSystemPromptSuffix(inputs: AssemblyInputs): string {
 }
 
 /**
- * Scratchpad guidance section (#48/feature 25). Mirrors Claude Code's own scratchpad
+ * Scratchpad guidance section. Mirrors Claude Code's own scratchpad
  * section: an emphatic all-platform directive naming the literal resolved path and
  * steering temp files there instead of `/tmp` — Claude's actual contract (a
  * Claude-authored skill reads the path out of the prompt), so it MUST be the literal
@@ -323,7 +323,7 @@ export function contextForTouchedFile(opts: {
     }
   }
 
-  // Path-scoped skills (plan §4.1/§4.2 shared glob engine): surface the skill
+  // Path-scoped skills (the shared glob engine): surface the skill
   // when the model first touches a matching file. Suggestion only — activation
   // stays explicit via the Skill tool, mirroring the startup listing.
   for (const skill of opts.skills ?? []) {

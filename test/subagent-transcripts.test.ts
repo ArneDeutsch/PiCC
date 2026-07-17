@@ -30,11 +30,11 @@ import {
 
 // These tests exercise the REAL Pi SessionManager (create/flush/open) — inject it
 // so fakeSdk's default persistedSessionManager persists to disk. Kept out of a
-// static fake-sdk import so builtin-agents' vi.mock factory can't deadlock (t02).
+// static fake-sdk import so builtin-agents' vi.mock factory can't deadlock.
 useRealSessionManager(SessionManager);
 
 /**
- * t02 — persisted subagent transcripts + agent IDs: every dispatch leaves a
+ * Persisted subagent transcripts + agent IDs: every dispatch leaves a
  * JSONL transcript discoverable from the main session via the hardened
  * resolver; the coordinator receives the agent ID in model-readable text; the
  * dispose→reopen round-trip is proven on the REAL Pi SessionManager.
@@ -81,7 +81,7 @@ type ToolLike = {
   ) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
 };
 
-describe("agent IDs and the hardened transcript resolver (t02)", () => {
+describe("agent IDs and the hardened transcript resolver", () => {
   it("mints unique, well-formed agent IDs", () => {
     const minted = new Set<string>();
     for (let i = 0; i < 200; i++) {
@@ -245,7 +245,7 @@ describe("dispatch persists a transcript (real Pi SessionManager)", () => {
     expect(texts).toContain("the task");
     expect(texts).toContain("first answer");
 
-    // Resume-append (t04's write path): append through the reopened manager,
+    // Resume-append (the resume write path): append through the reopened manager,
     // reopen AGAIN, and see all four messages — proving the file stays a valid,
     // appendable Pi session across close/reopen cycles.
     reopened.appendMessage({ role: "user", content: "follow-up question" } as never);
@@ -312,7 +312,7 @@ describe("dispatch persists a transcript (real Pi SessionManager)", () => {
     expect(overridden.resumable).toBe(true);
   });
 
-  it("a caller-provided agent ID is reused verbatim (stability across resumes, t04)", async () => {
+  it("a caller-provided agent ID is reused verbatim (stability across resumes)", async () => {
     const main = fakeMainSessionFile();
     const h = fakeSdk({ replies: ["ok"] });
     const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
@@ -328,7 +328,7 @@ describe("dispatch persists a transcript (real Pi SessionManager)", () => {
     expect(path.basename(result.transcriptPath!)).toContain("_agent-aabbccddeeff.jsonl");
   });
 
-  it("a hostile/malformed caller-provided agent ID fails the dispatch loudly (pre-t04 hardening)", async () => {
+  it("a hostile/malformed caller-provided agent ID fails the dispatch loudly (hardening)", async () => {
     const main = fakeMainSessionFile();
     const h = fakeSdk({ replies: ["should never run"] });
     const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
@@ -401,7 +401,7 @@ describe("dispatch persists a transcript (real Pi SessionManager)", () => {
   });
 });
 
-describe("fork inheritance on the REAL Pi SessionManager (F16 t01)", () => {
+describe("fork inheritance on the REAL Pi SessionManager", () => {
   // Fork inheritance defaults to ENABLED; ensure the gate is unset for these
   // tests (process.env is global within a file — a sibling test could set it).
   afterEach(() => {
@@ -488,7 +488,7 @@ describe("fork inheritance on the REAL Pi SessionManager (F16 t01)", () => {
   });
 });
 
-describe("model-visible agent-ID delivery (t02)", () => {
+describe("model-visible agent-ID delivery", () => {
   it("foreground content of a RESUMABLE agent = verbatim message + delimited ID trailer", async () => {
     const main = fakeMainSessionFile();
     const h = fakeSdk({ replies: ["```yaml\nverdict: approve\n```"] });
@@ -806,7 +806,7 @@ describe("model-visible agent-ID delivery (t02)", () => {
     expect(text.endsWith(`\n[agent ${agentId} — resumable via SendMessage]`)).toBe(true);
   });
 
-  it("a one-shot builtin (Explore) background start message NOW includes the agent id (F04 t02); a resumable one keeps it", async () => {
+  it("a one-shot builtin (Explore) background start message includes the agent id; a resumable one keeps it", async () => {
     const main = fakeMainSessionFile();
     const registry = new BackgroundTaskRegistry();
     const runtime = makeSubagentRuntime([], fakeSdk({ replies: ["explored"] }).sdk, {
@@ -821,7 +821,7 @@ describe("model-visible agent-ID delivery (t02)", () => {
       prompt: "look",
       run_in_background: true,
     });
-    // F04 t02: the id is model-visible at the start-message surface for EVERY
+    // The id is model-visible at the start-message surface for EVERY
     // background task, one-shot builtins included (the old suppression is gone).
     const agentId = String(started.details.agentId);
     expect(started.content[0]!.text).toContain(`agent id: ${agentId}`);
@@ -845,7 +845,7 @@ describe("model-visible agent-ID delivery (t02)", () => {
   });
 });
 
-describe("subagent hooks carry agent_id/agent_type; transcript_path stays = main (t02 parity)", () => {
+describe("subagent hooks carry agent_id/agent_type; transcript_path stays = main (parity)", () => {
   it("agent-scoped hook runners are NOT re-pointed to the subagent transcript (Claude Code parity)", async () => {
     const main = fakeMainSessionFile();
     const h = fakeSdk({ replies: ["done"] });

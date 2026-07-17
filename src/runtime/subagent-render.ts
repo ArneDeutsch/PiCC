@@ -6,7 +6,7 @@ import {
 } from "./subagent-progress.js";
 import { FORK_DEGRADE_PREFIX, isAgentId } from "../util/subagent-transcripts.js";
 
-// --- t03 live-progress + result rendering helpers ---
+// --- live-progress + result rendering helpers ---
 //
 // The Agent tool's renderCall/renderResult return a STRUCTURAL pi-tui Component
 // ({ render(width): string[] }) — the same untyped contract index.ts's control
@@ -71,7 +71,7 @@ function sanitizeInline(text: string): string {
 }
 
 /**
- * The `Task(task-N)` chip (F04 t03) when `details.taskId` is present — the gate
+ * The `Task(task-N)` chip when `details.taskId` is present — the gate
  * for EVERY background-identity addition below, so the foreground Agent view is
  * untouched. `undefined` when absent. `taskId` is registry-minted (`task-N`) but
  * sanitized anyway so the discipline is uniform.
@@ -82,7 +82,7 @@ function taskChip(details: Record<string, unknown>): string | undefined {
 }
 
 /**
- * The stable `agent-<id>` (F04 t03) when present AND well-formed — gated through
+ * The stable `agent-<id>` when present AND well-formed — gated through
  * `isAgentId` (it is model-/file-adjacent metadata), so a malformed value never
  * reaches the terminal. `undefined` otherwise.
  */
@@ -93,7 +93,7 @@ function agentIdOf(details: Record<string, unknown>): string | undefined {
 }
 
 /**
- * The muted `agent-<id>` identity SUBLINE (F04 t03), emitted at EVERY task
+ * The muted `agent-<id>` identity SUBLINE, emitted at EVERY task
  * surface (live / poll / settled) so a background task id is always traceable to
  * its agent and on-disk transcript — INDEPENDENT of `resumable`/`transcript` (a
  * non-resumable, transcript-less builtin still shows its id). Its own line so it
@@ -110,7 +110,7 @@ function pushIdentitySubline(
 }
 
 /**
- * The developer-facing fork-degrade footer (F16). A `subagent_type: "fork"`
+ * The developer-facing fork-degrade footer. A `subagent_type: "fork"`
  * dispatch that could not inherit the parent conversation runs fresh and records
  * a fork-SPECIFIC diagnostic (never the generic unknown-type warning) whose
  * message starts with this sentinel. We surface it as a muted footer line so the
@@ -148,10 +148,10 @@ function firstLine(text: string, max: number): string {
 }
 
 /**
- * Usage formatter for the renderResult footer (t03 slot, populated by t06).
+ * Usage formatter for the renderResult footer.
  * Renders a string as-is, an explicit `text` override, otherwise delegates to
- * the shared `formatUsageCompact` (the t06 `{ inputTokens, … costUsd }` shape,
- * and the legacy `totalTokens`/`cost` shape). Returns NOTHING when absent or an
+ * the shared `formatUsageCompact` (the `{ inputTokens, … costUsd }` shape, and
+ * the legacy `totalTokens`/`cost` shape). Returns NOTHING when absent or an
  * unrecognized shape, so the footer line drops entirely.
  */
 function formatUsageLine(usage: unknown): string | undefined {
@@ -166,8 +166,8 @@ function formatUsageLine(usage: unknown): string | undefined {
 }
 
 /**
- * The outcome badge line (t01 outcome): colored symbol + agent + fate word.
- * When `taskChipLabel` is present (F04 t03 background surface), the badge leads
+ * The outcome badge line: colored symbol + agent + fate word.
+ * When `taskChipLabel` is present (the background surface), the badge leads
  * with the `Task(task-N)` chip — `● Task(task-3) · Agent(coder) completed` — so
  * completed / failed / aborted background outcomes are all self-identifying.
  */
@@ -178,7 +178,7 @@ function outcomeBadgeLine(
   agentName: unknown,
   taskChipLabel?: string,
 ): string {
-  // SEC-2: agentName is model-supplied (subagent_type) OR project-file-supplied
+  // SECURITY: agentName is model-supplied (subagent_type) OR project-file-supplied
   // (agent `name:` frontmatter) — sanitize before it reaches the parent terminal.
   const safeName = sanitizeInline(typeof agentName === "string" ? agentName : "");
   const agent = safeName ? `Agent(${safeName})` : "Agent";
@@ -195,9 +195,9 @@ function outcomeBadgeLine(
     color = "error";
     word = cutOff ? "failed (partial output preserved)" : "failed";
   } else if (outcome === "aborted") {
-    // UX-1: forward-compatible exhaustive branch. Not reached by today's live
-    // foreground path (t01's seam throws aborted/failed-no-output before this
-    // renders) — kept ready for the deferred t01-seam follow-up.
+    // Forward-compatible exhaustive branch. Not reached by today's live
+    // foreground path — the foreground dispatch seam throws aborted/
+    // failed-no-output before this renders.
     symbol = "■";
     color = "warning";
     word = "aborted";
@@ -206,7 +206,7 @@ function outcomeBadgeLine(
 }
 
 /**
- * UX-2: strip the model-facing agent-ID trailer (t02) off the HUMAN-rendered
+ * Strip the model-facing agent-ID trailer off the HUMAN-rendered
  * body. The model still reads `result.content` verbatim (trailer included); only
  * this local display copy drops it, so the footer can present the ID + a single
  * resumable hint without the raw `---`/`[agent …]` plumbing showing up too.
@@ -221,7 +221,7 @@ function stripAgentTrailerForDisplay(text: string): string {
 }
 
 /**
- * F04 t03: strip the leading self-identification (`Background task task-N (type,
+ * Strip the leading self-identification (`Background task task-N (type,
  * agent-<id>) failed: ` / `… was aborted — `) from the DISPLAY body of a failed
  * or aborted TaskOutput result — the badge + agent-<id> subline already state it,
  * so the body would otherwise triple it. The reason/tail is kept (`connection
@@ -242,10 +242,10 @@ function stripTaskIdentityPrefix(text: string, taskId: string, outcome: string):
   return text;
 }
 
-/** renderCall (t03): agent type + description/prompt-head at dispatch time. */
+/** renderCall: agent type + description/prompt-head at dispatch time. */
 export function renderAgentCall(args: Record<string, unknown>, theme: unknown) {
   const a = (args ?? {}) as Record<string, unknown>;
-  // SEC-2: subagent_type/description/prompt are model-supplied and reach the
+  // SECURITY: subagent_type/description/prompt are model-supplied and reach the
   // parent terminal — sanitize the DISPLAY strings (Pi does not sanitize
   // component render output). agentType is additionally flattened to one line.
   const agentType =
@@ -272,11 +272,11 @@ export function renderAgentCall(args: Record<string, unknown>, theme: unknown) {
 }
 
 /**
- * renderResult (t03, REQUIRED). Two modes:
+ * renderResult (REQUIRED). Two modes:
  *  - PARTIAL (streaming): the live rolling tail + current-activity line.
- *  - FINAL: outcome badge (t01) + the verbatim message body + a metadata footer
- *    (transcript path (t02), usage slot (t06), resumable hint). Every field is
- *    optional and rendered only when present.
+ *  - FINAL: outcome badge + the verbatim message body + a metadata footer
+ *    (transcript path, usage, resumable hint). Every field is optional and
+ *    rendered only when present.
  */
 export function renderAgentResult(
   result: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
@@ -294,9 +294,9 @@ export function renderAgentResult(
       const lines: string[] = [];
       if (isPartial) {
         const snap = details.subagentProgress as ProgressSnapshot | undefined;
-        // SEC-2: details.agent originates from the model-supplied subagent_type — sanitize.
+        // SECURITY: details.agent originates from the model-supplied subagent_type — sanitize.
         const agent = sanitizeInline(typeof details.agent === "string" ? details.agent : "") || "subagent";
-        // F04 t03: a background live view leads with the Task chip + agent type;
+        // A background live view leads with the Task chip + agent type;
         // the foreground view (no taskId) keeps the bare `Agent(<type>)` header.
         const chip = taskChip(details);
         const header = chip ? `${chip} · Agent(${agent})` : `Agent(${agent})`;
@@ -323,12 +323,12 @@ export function renderAgentResult(
         }
         if (!emittedBody) {
           if (chip) {
-            // F04 t03: a just-dispatched background task (snapshot absent or its
+            // A just-dispatched background task (snapshot absent or its
             // tail+activity empty) shows a current-activity placeholder, never a
             // bare header — matching the poll placeholder below.
             pushColored(theme, "muted", "… starting…", width, lines);
           } else if (!snap) {
-            // SEC-2: foreground defensive fallback — the live partial path always
+            // SECURITY: foreground defensive fallback — the live partial path always
             // carries a (sanitized) progress snapshot, but keep the sanitize
             // invariant uniform so any future partial emitter can't leak control
             // bytes to the terminal.
@@ -338,7 +338,7 @@ export function renderAgentResult(
         return clampLines(lines.length ? lines : [""], width);
       }
       // Final result.
-      // F04 t03: the "started" block is self-identifying when a taskId is present
+      // The "started" block is self-identifying when a taskId is present
       // (`Agent(<type>) → background as task-N` + a muted retrieve-with-TaskOutput
       // subline); with no taskId it keeps the original foreground-neutral header.
       if (details.background === true) {
@@ -361,12 +361,12 @@ export function renderAgentResult(
           pushColored(theme, "muted", sub, width, lines);
         } else {
           lines.push(themedFg(theme, "accent", themedBold(theme, "Agent → background")));
-          // SEC-2: the start message embeds the model-supplied agent label — sanitize.
+          // SECURITY: the start message embeds the model-supplied agent label — sanitize.
           pushWrapped(sanitizeProgressText(contentText), width, lines);
         }
         return clampLines(lines, width);
       }
-      // F04 t03: a wait:false poll on a RUNNING task renders the same identity
+      // A wait:false poll on a RUNNING task renders the same identity
       // frame (Task chip + agent type + agent-<id>) plus one last-activity line —
       // never a bare unlabelled chip. Gated on taskId (a foreground final never
       // carries status:"running").
@@ -388,11 +388,9 @@ export function renderAgentResult(
       }
       const outcome = typeof details.outcome === "string" ? details.outcome : undefined;
       if (outcome) {
-        // UX-1: `aborted` is handled for forward-compat exhaustiveness. The live
-        // foreground path does NOT currently reach `aborted`/failed-no-output here
-        // (t01's foreground seam throws those before renderResult) — tracked as a
-        // t01-seam follow-up; the renderer stays ready for when the seam changes.
-        // F04 t03: `chip` leads the badge for background outcomes.
+        // `aborted` is handled for forward-compat exhaustiveness: today's
+        // foreground seam throws it before renderResult (see outcomeBadgeLine).
+        // `chip` leads the badge for background outcomes.
         lines.push(outcomeBadgeLine(theme, outcome, details.cutOff === true, details.agent, chip));
         // Identity subline at the SETTLED surface — SUPPRESSED when the resumable
         // footer will already print "— agent <id>" (avoid showing the id twice).
@@ -402,11 +400,11 @@ export function renderAgentResult(
           details.resumable === true && agentIdOf(details) !== undefined;
         if (chip && !resumableFooterShowsId) pushIdentitySubline(theme, details, width, lines);
       }
-      // SEC-2 + UX-2: the model reads result.content verbatim (with the t02
-      // agent-ID trailer); the HUMAN view strips that trailer (the footer carries
-      // the ID + a single resumable hint) and sanitizes control sequences. This
-      // builds a local display string only — result.content is never mutated.
-      // F04 t03 double-render fix: TaskOutput's completed content appends a
+      // SECURITY: the model reads result.content verbatim (with the agent-ID
+      // trailer); the HUMAN view strips that trailer (the footer carries the ID
+      // + a single resumable hint) and sanitizes control sequences. This builds
+      // a local display string only — result.content is never mutated.
+      // TaskOutput's completed content appends a
       // `\nusage: …` line AFTER the agent-ID trailer, which would defeat the
       // end-anchored trailer strip (raw trailer shown + usage rendered twice).
       // Drop that trailing usage line from the DISPLAY body first — the footer
@@ -418,7 +416,7 @@ export function renderAgentResult(
       if (details.taskId != null && details.usage != null) {
         displaySource = displaySource.replace(/\nusage:[^\n]*$/, "");
       }
-      // F04 t03: for a taskId'd failed/aborted result the badge + subline already
+      // For a taskId'd failed/aborted result the badge + subline already
       // state the identity — strip the leading self-identification from the body.
       if (chip && (outcome === "failed" || outcome === "aborted")) {
         displaySource = stripTaskIdentityPrefix(displaySource, String(details.taskId), outcome);
@@ -445,7 +443,7 @@ export function renderAgentResult(
       const usage = formatUsageLine(details.usage);
       if (usage) footer.push(`usage: ${usage}`);
       if (details.resumable === true) {
-        // UX-2: the ID rides in the footer (not a duplicated raw trailer frame).
+        // The ID rides in the footer (not a duplicated raw trailer frame).
         const id =
           typeof details.agentId === "string" && isAgentId(details.agentId)
             ? details.agentId
@@ -454,7 +452,7 @@ export function renderAgentResult(
       }
       // Wrap each footer line to width (word-wrap, ANSI-aware) as a final guard.
       for (const f of footer) pushColored(theme, "muted", f, width, lines);
-      // F16: a degraded fork's fork-specific notice — its own footer line, toned
+      // A degraded fork's fork-specific notice — its own footer line, toned
       // calm (muted) for an expected opt-out and `warning` for a genuine can't-do,
       // so the developer sees WHY a "fork" ran with fresh context (the badge above
       // already reads as the fresh agent, not `Agent(fork)`).
@@ -466,7 +464,7 @@ export function renderAgentResult(
 }
 
 /**
- * renderCall for the TaskOutput tool (F04 t03): a self-identifying dispatch-time
+ * renderCall for the TaskOutput tool: a self-identifying dispatch-time
  * line — `TaskOutput(task-N) · Agent(<type>)` — reusing this module's private
  * width-clamp/theme helpers so it inherits the same overflow + sanitize
  * discipline. `agentType` is looked up from the registry by the caller (it is

@@ -15,7 +15,7 @@ function assistant(text: string) {
   return { role: "assistant", content: [{ type: "text", text }] };
 }
 
-describe("sanitizeProgressText (t03: terminal-injection defense)", () => {
+describe("sanitizeProgressText (terminal-injection defense)", () => {
   it("strips CSI color/cursor sequences", () => {
     const hostile = `${ESC}[31mred${ESC}[0m${ESC}[2J`;
     const clean = sanitizeProgressText(hostile);
@@ -51,7 +51,7 @@ describe("sanitizeProgressText (t03: terminal-injection defense)", () => {
   });
 });
 
-describe("SubagentProgressCondenser (t03)", () => {
+describe("SubagentProgressCondenser", () => {
   it("names the current tool on tool_execution_start and clears on end", () => {
     const c = new SubagentProgressCondenser();
     expect(c.consume({ type: "tool_execution_start", toolName: "Grep", args: { pattern: "x" } })).toBe(

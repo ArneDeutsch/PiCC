@@ -14,7 +14,7 @@ import type {
 } from "../types.js";
 
 /**
- * Hook execution engine (plan §4.5, research 02 §3.4–3.6).
+ * Hook execution engine.
  *
  * Fires configured hooks for a lifecycle event, delivers the Claude Code
  * stdin JSON payload, and aggregates the exit-code / stdout-JSON contract
@@ -31,8 +31,8 @@ const PLAIN_STDOUT_IGNORED_EVENTS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Payload key(s) the `matcher` is compared against, per event (research 02
- * §3.2): tool events match the tool name; SessionStart the source
+ * Payload key(s) the `matcher` is compared against, per event: tool events
+ * match the tool name; SessionStart the source
  * (startup|resume|clear|compact); PreCompact the trigger (manual|auto) —
  * PiCC call sites currently deliver it as `reason`, so that is accepted as a
  * fallback; Subagent* the agent type; SessionEnd the reason. Events not
@@ -56,7 +56,10 @@ const USER_PROMPT_SUBMIT_TIMEOUT_SECONDS = 30;
 const HTTP_TIMEOUT_MS = 10_000;
 /** Grace period after a kill before we stop waiting for the process to close. */
 const KILL_GRACE_MS = 5_000;
-/** Cap per collected context value (stdout / additionalContext), issue #64626. */
+/**
+ * Cap per collected context value (stdout / additionalContext): Claude Code
+ * silently truncates hook context at ~10k chars (anthropics/claude-code#64626).
+ */
 const CONTEXT_VALUE_MAX_CHARS = 10_000;
 /** Keep test-observer failures useful without allowing an arbitrary thrown value to flood output. */
 const OBSERVER_ERROR_MAX_CHARS = 1_000;
@@ -619,7 +622,7 @@ export class HookRunner {
   }
 
   // -------------------------------------------------------------------------
-  // HTTP handlers (best-effort per plan §4.5)
+  // HTTP handlers (best-effort)
   // -------------------------------------------------------------------------
 
   private async runHttp(
@@ -753,9 +756,9 @@ export class HookRunner {
     // decisions, ...) below stay in effect regardless.
 
     const hso = asRecord(json["hookSpecificOutput"]);
-    // Schema requires hookSpecificOutput.hookEventName (issue #55172); a
-    // mismatch is worth a warning but the fields are honored anyway
-    // (graceful superset).
+    // Claude Code's hook schema requires hookSpecificOutput.hookEventName
+    // (anthropics/claude-code#55172); a mismatch is worth a warning but the
+    // fields are honored anyway (graceful superset).
     const hsoEventName = hso?.["hookEventName"];
     if (typeof hsoEventName === "string" && hsoEventName !== eventName) {
       outcome.diagnostics.push({
@@ -769,7 +772,7 @@ export class HookRunner {
       const reason = hso?.["permissionDecisionReason"];
       this.setBlock(outcome, typeof reason === "string" ? reason : undefined);
     } else if (decision === "ask") {
-      // Downgraded to allow per posture §6.1, but surfaced.
+      // Downgraded to allow (default-permissive posture), but surfaced.
       outcome.askDowngraded = true;
     }
     // "allow" / "defer" → proceed.
@@ -815,7 +818,7 @@ function dedupKey(handler: HookHandler): string {
   ]);
 }
 
-/** Each context value is capped at ~10,000 chars, silently truncated (issue #64626). */
+/** Each context value is capped at ~10,000 chars, silently truncated as Claude Code does. */
 function truncateContextValue(value: string): string {
   if (value.length <= CONTEXT_VALUE_MAX_CHARS) return value;
   return `${value.slice(0, CONTEXT_VALUE_MAX_CHARS)}…[truncated]`;

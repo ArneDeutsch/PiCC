@@ -342,7 +342,7 @@ describe("loadSkills", () => {
     expect(status.baseDir).toBe(path.join(commandsDir, "ops"));
   });
 
-  it("ALWAYS registers a qualified alias for nested entries, not only on collision (G4)", () => {
+  it("ALWAYS registers a qualified alias for nested entries, not only on collision", () => {
     const { skills, diagnostics } = load();
     // Non-colliding nested command: plain stem AND colon-qualified alias.
     const alias = skills.find((x) => x.name === "ops:status")!;
@@ -768,7 +768,7 @@ describe("shell injection env inheritance", () => {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// shellNamespaceDiffersFromNative: injectable platform, exact predicate (#48)
+// shellNamespaceDiffersFromNative: injectable platform, exact predicate
 // ---------------------------------------------------------------------------
 
 describe("shellNamespaceDiffersFromNative", () => {

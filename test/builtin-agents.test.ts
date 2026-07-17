@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 /**
- * Built-in agents wired through the WHOLE extension (audits E1/E2/E6 + B5):
+ * Built-in agents wired through the WHOLE extension:
  * Agent/Task registration without project agents, catalog listing, the
  * Explore/Plan CLAUDE.md-skipping prompt, and agent `memory:` injection.
  *
@@ -18,7 +18,7 @@ const h = vi.hoisted(() => ({
 
 vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   const real = await importOriginal<Record<string, unknown>>();
-  // Shared fake-SDK builder (t01): the session/loader fakes live in one place.
+  // Shared fake-SDK builder: the session/loader fakes live in one place.
   const { fakeSdk } = await import("./helpers/fake-sdk.js");
   const { sdk } = fakeSdk({ replies: ["bi-done"], created: h.created });
   return {
@@ -43,7 +43,7 @@ const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
 /** Dispatch through the registered Agent tool and return the captured loader's system prompt. */
 async function dispatchAndGetPrompt(subagentType: string): Promise<string> {
   const agentTool = pi.tools.get("Agent");
-  // F15: background is the default, but this helper inspects the subagent session
+  // Background is the default, but this helper inspects the subagent session
   // created synchronously during dispatch — pin run_in_background: false so the
   // dispatch runs foreground and h.created is populated before execute() returns.
   await agentTool.execute("t", {
@@ -70,7 +70,7 @@ beforeAll(async () => {
     ".claude/agents/Explore.md",
     ["---", "description: project explorer", "---", "PROJECT-EXPLORE-BODY"].join("\n"),
   );
-  // Agents exercising each memory: scope (audit B5).
+  // Agents exercising each memory: scope.
   w(
     ".claude/agents/mem-project.md",
     ["---", "description: project memory agent", "memory: project", "---", "Body"].join("\n"),
@@ -89,7 +89,7 @@ beforeAll(async () => {
   );
   w(".claude/agent-memory/mem-project/MEMORY.md", "BI-MEM-PROJECT-CONTENT\n");
   w(".claude/agent-memory-local/mem-local/MEMORY.md", "BI-MEM-LOCAL-CONTENT\n");
-  // Project auto memory (H2): pinned to a deterministic dir via settings.
+  // Project auto memory: pinned to a deterministic dir via settings.
   w(path.join("auto-memory", "MEMORY.md"), "BI-AUTO-MEMORY-CONTENT\n");
   w(
     ".claude/settings.json",
@@ -121,7 +121,7 @@ afterAll(() => {
   }
 });
 
-describe("built-in agents through the extension (E1/E2/E6)", () => {
+describe("built-in agents through the extension", () => {
   it("registers Agent/Task and the real TaskOutput/TaskStop even when a project has NO agents", async () => {
     const bare = fs.mkdtempSync(path.join(os.tmpdir(), "picc-bi-bare-"));
     try {
@@ -161,12 +161,12 @@ describe("built-in agents through the extension (E1/E2/E6)", () => {
     expect(prompt).not.toContain("Fast read-only agent");
   });
 
-  it("Plan (built-in) prompt omits CLAUDE.md and rules but keeps harness conventions and skills (E6)", async () => {
+  it("Plan (built-in) prompt omits CLAUDE.md and rules but keeps harness conventions and skills", async () => {
     const prompt = await dispatchAndGetPrompt("Plan");
     expect(prompt).not.toContain("BI-ROOT-CLAUDE-MD");
     expect(prompt).not.toContain("BI-UNCOND-RULE");
     expect(prompt).toContain("Claude Code compatibility conventions");
-    // #69: the `## Working with the user` interaction posture is main-session-only —
+    // The `## Working with the user` interaction posture is main-session-only —
     // dispatched subagents (even `skipProjectContext` ones) keep the mechanical
     // conventions block but do NOT receive the posture.
     expect(prompt).not.toContain("Working with the user");
@@ -177,7 +177,7 @@ describe("built-in agents through the extension (E1/E2/E6)", () => {
     expect(prompt).toContain("You are a software architect");
   });
 
-  it("main-session prompt DOES include the interaction posture (#69)", async () => {
+  it("main-session prompt DOES include the interaction posture", async () => {
     // Proves index.ts:1046 (before_agent_start) passes includeInteractionPosture: true,
     // while the :623 subagent call site leaves it unset.
     const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" }))
@@ -191,7 +191,7 @@ describe("built-in agents through the extension (E1/E2/E6)", () => {
     const prompt = await dispatchAndGetPrompt("general-purpose");
     expect(prompt).toContain("BI-ROOT-CLAUDE-MD");
     expect(prompt).toContain("BI-UNCOND-RULE");
-    // #69: the full-context general-purpose subagent still gets no interaction posture,
+    // The full-context general-purpose subagent still gets no interaction posture,
     // so the flag-gating is unambiguous — not attributable to Plan's context-trimming.
     expect(prompt).not.toContain("Working with the user");
     // ...and no delegation nudge either — proves it wasn't misplaced in the always-on block.
@@ -204,9 +204,9 @@ describe("built-in agents through the extension (E1/E2/E6)", () => {
     expect(prompt).toContain("BI-ROOT-CLAUDE-MD");
   });
 
-  it("omitted subagent_type dispatches general-purpose (E2)", async () => {
+  it("omitted subagent_type dispatches general-purpose", async () => {
     const agentTool = pi.tools.get("Agent");
-    // F15: pin run_in_background: false so the foreground verbatim result + agent
+    // Pin run_in_background: false so the foreground verbatim result + agent
     // detail are asserted directly (background is the default otherwise).
     const res = await agentTool.execute("t", { prompt: "just do it", run_in_background: false });
     expect(res.content[0].text).toBe("bi-done");
@@ -220,7 +220,7 @@ describe("built-in agents through the extension (E1/E2/E6)", () => {
   });
 });
 
-describe("agent memory injection (audit B5)", () => {
+describe("agent memory injection", () => {
   it.each([
     ["mem-project", path.join(".claude", "agent-memory", "mem-project"), "BI-MEM-PROJECT-CONTENT"],
     ["mem-user", path.join(".claude-user", "agent-memory", "mem-user"), "BI-MEM-USER-CONTENT"],
@@ -230,7 +230,7 @@ describe("agent memory injection (audit B5)", () => {
     expect(prompt).toContain("# Agent memory");
     expect(prompt).toContain(path.join(dir, relDir));
     expect(prompt).toContain(marker);
-    // The per-agent guidance is now conservative (F10). Assert on a phrase UNIQUE to
+    // The per-agent guidance is conservative. Assert on a phrase UNIQUE to
     // the OLD per-agent string — the co-injected "# Auto memory" section would satisfy
     // a whole-prompt /remember/i even if the per-agent string had not been flipped, so
     // that is a false green. "You may persist" only ever appeared in the per-agent
@@ -254,7 +254,7 @@ describe("agent memory injection (audit B5)", () => {
   });
 });
 
-describe("auto memory in subagent prompts (H2)", () => {
+describe("auto memory in subagent prompts", () => {
   it("general-purpose gets the project's auto memory", async () => {
     const prompt = await dispatchAndGetPrompt("general-purpose");
     expect(prompt).toContain("# Auto memory");

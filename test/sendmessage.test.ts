@@ -25,7 +25,7 @@ import {
 import { deferred, waitUntil } from "./helpers/async.js";
 
 // Resume tests exercise the REAL Pi SessionManager (open/restore/append) — inject
-// it so fakeSdk's reopenSessionManager reopens real transcripts on disk (t02/t04).
+// it so fakeSdk's reopenSessionManager reopens real transcripts on disk.
 useRealSessionManager(SessionManager);
 
 const AGENT_ID = /^agent-[0-9a-f]{12}$/;
@@ -62,10 +62,10 @@ type ToolLike = {
 };
 
 // ---------------------------------------------------------------------------
-// SubagentRegistry — lifecycle, resolution, name integrity, t05 notice state
+// SubagentRegistry — lifecycle, resolution, name integrity, settlement notice state
 // ---------------------------------------------------------------------------
 
-describe("SubagentRegistry (t04)", () => {
+describe("SubagentRegistry", () => {
   function reg(): SubagentRegistry {
     return new SubagentRegistry();
   }
@@ -161,7 +161,7 @@ describe("SubagentRegistry (t04)", () => {
 // SendMessage tool — steer (running) + refusals
 // ---------------------------------------------------------------------------
 
-describe("SendMessage tool — steer + refusals (t04)", () => {
+describe("SendMessage tool — steer + refusals", () => {
   it("steers a RUNNING background subagent as a mid-task course correction and acks", async () => {
     const registry = new SubagentRegistry();
     const backgroundTasks = new BackgroundTaskRegistry();
@@ -266,11 +266,11 @@ describe("SendMessage tool — steer + refusals (t04)", () => {
     expect(registry.ids()).toEqual([agentId]);
   });
 
-  it("MUST-FIX #1: a fork/agentOverride dispatch is registered NON-RESUMABLE; SendMessage refuses it by name AND by id with no re-dispatch (no all-tools resume)", async () => {
+  it("a fork/agentOverride dispatch is registered NON-RESUMABLE; SendMessage refuses it by name AND by id with no re-dispatch (no all-tools resume)", async () => {
     const registry = new SubagentRegistry();
     const backgroundTasks = new BackgroundTaskRegistry();
     // getMainSessionFile → the fork WOULD otherwise persist a transcript and look
-    // resumable; MUST-FIX #1 forces its registry record non-resumable regardless.
+    // resumable; the registry record is forced non-resumable regardless.
     const main = fakeMainSessionFile();
     const h = fakeSdk({ replies: ["forked reply"] });
     const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
@@ -307,7 +307,7 @@ describe("SendMessage tool — steer + refusals (t04)", () => {
     await expect(sm.execute("s", { to: "fork:my-skill", message: "again" })).rejects.toThrow(
       /not resumable/i,
     );
-    // No resumed run occurred: no second createAgentSession — the SEC #1 hole
+    // No resumed run occurred: no second createAgentSession — the security hole
     // (re-resolve to all-tools general-purpose) is unreachable.
     expect(h.created.length).toBe(createdBefore);
   });
@@ -465,12 +465,12 @@ describe("SendMessage tool — steer + refusals (t04)", () => {
 // Resume — offline integration on the REAL SessionManager (temp dir)
 // ---------------------------------------------------------------------------
 
-describe("SendMessage resume — offline integration (real SessionManager) (t04)", () => {
-  it("resumes a finished subagent in the background under the same ID with prior context + appended transcript; ack is immediate; the resumed settlement re-arms the t05 notice", async () => {
+describe("SendMessage resume — offline integration (real SessionManager)", () => {
+  it("resumes a finished subagent in the background under the same ID with prior context + appended transcript; ack is immediate; the resumed settlement re-arms the notice", async () => {
     const main = fakeMainSessionFile();
     const registry = new SubagentRegistry();
     const backgroundTasks = new BackgroundTaskRegistry();
-    // Scripted usage (FIX 8): prove the compound dispatch→persist→settle→RESUME→
+    // Scripted usage: prove the compound dispatch→persist→settle→RESUME→
     // usage chain — usage must be captured on the RESUME path, not only fresh
     // dispatch. Both sessions report the same stats here.
     const h = fakeSdk({
@@ -492,7 +492,7 @@ describe("SendMessage resume — offline integration (real SessionManager) (t04)
     expect(original.transcriptPath).toBeDefined();
     const agentId = original.agentId;
     expect(registry.get(agentId)!.state).toBe("settled");
-    // First settlement notice fires once (t05 hand-off), then dedupes.
+    // First settlement notice fires once, then dedupes.
     expect(registry.consumeSettledNotice(agentId)).toBe(true);
     expect(registry.consumeSettledNotice(agentId)).toBe(false);
 
@@ -579,11 +579,11 @@ describe("SendMessage resume — offline integration (real SessionManager) (t04)
     const record = await backgroundTasks.wait(taskId);
     expect(record?.status).toBe("completed");
     expect(record?.agentId).toBe(agentId);
-    // F04 t02: the resume start() site sets the clean agentType eagerly.
+    // The resume start() site sets the clean agentType eagerly.
     expect(record?.agentType).toBe("reviewer");
     expect(registry.get(agentId)!.state).toBe("settled");
 
-    // FIX 8 (t06 × t04): the RESUMED run's usage is captured — on the background
+    // The RESUMED run's usage is captured — on the background
     // task record AND the dispatch registry record under the same id — proving
     // the resume path (not just fresh dispatch) records per-subagent usage.
     const expectedUsage = {
@@ -648,7 +648,7 @@ describe("SendMessage resume — offline integration (real SessionManager) (t04)
     expect(select()).toEqual([]);
   });
 
-  it("SECURITY (MUST-FIX #1): the resumed dispatch re-applies the full enforcement stack — identical gated tools, guard + maxTurns extensions, system prompt/lockdown, and preserved depth", async () => {
+  it("SECURITY: the resumed dispatch re-applies the full enforcement stack — identical gated tools, guard + maxTurns extensions, system prompt/lockdown, and preserved depth", async () => {
     const main = fakeMainSessionFile();
     const registry = new SubagentRegistry();
     const backgroundTasks = new BackgroundTaskRegistry();
@@ -745,12 +745,12 @@ describe("SendMessage resume — offline integration (real SessionManager) (t04)
 });
 
 // ---------------------------------------------------------------------------
-// SendMessage resume counts against the nested per-depth bound (F15 t02, AC #3)
+// SendMessage resume counts against the nested per-depth bound
 // ---------------------------------------------------------------------------
 
-describe("SendMessage resume — nested background bound (F15 t02, AC #3)", () => {
+describe("SendMessage resume — nested background bound", () => {
   it("a depth-2 resume ACQUIRES its per-depth budget: it queues behind a held slot and only runs once freed (guards `background: true` on the resume dispatch)", async () => {
-    // The narrow-but-real case AC #3 protects: a grandchild id resumable at
+    // The narrow-but-real case this protects: a grandchild id resumable at
     // `record.depth >= 2`. The resume dispatch sets `background: true` so it is
     // routed through the per-depth budget instead of the foreground bypass. Remove
     // that flag and `foregroundNested = depth > 1 && !background` becomes true → the

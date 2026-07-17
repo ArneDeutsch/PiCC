@@ -11,7 +11,7 @@ import os from "node:os";
 // whose top-level SessionManager import defeats interception).
 const rcMock = vi.hoisted(() => ({
   created: [] as Array<Record<string, unknown>>,
-  // t05: capture DefaultResourceLoader options so a dispatch's systemPromptOverride
+  // Capture DefaultResourceLoader options so a dispatch's systemPromptOverride
   // (which carries the subagent system prompt) is inspectable — it is threaded via
   // the loader, not createAgentSession.
   loaderOptions: [] as Array<Record<string, unknown>>,
@@ -130,7 +130,7 @@ describe("tool-map", () => {
     applyUpdatedInput("read", live, { file_path: "src/b.ts" });
     expect(live.path).toBe("src/b.ts");
 
-    // F26: a live grep reaches the engine as a matchable Grep call with
+    // A live grep reaches the engine as a matchable Grep call with
     // file_path populated, so a Read(<glob>) deny can gate it by path.
     const grepCall = toClaudeCall("grep", { path: "secrets/x" }, "C:\\proj");
     expect(grepCall.tool).toBe("Grep");
@@ -233,7 +233,7 @@ describe("context assembly", () => {
     expect(suffix).toContain("reviewer: Reviews things");
     expect(suffix).toContain("STEER-TEXT");
     expect(suffix).toContain("Claude Code compatibility conventions");
-    // F15 anti-regression: the highest-leverage nudge — the HARNESS_CONVENTIONS
+    // Anti-regression: the highest-leverage nudge — the HARNESS_CONVENTIONS
     // subagent line (emitted every turn to every dispatching context) — must carry
     // the background-by-default framing and the collect-with-TaskOutput directive,
     // so a silent revert to opt-in framing fails here rather than only in prose.
@@ -243,7 +243,7 @@ describe("context assembly", () => {
     expect(suffix).toMatch(/later interactive turn/i);
     expect(suffix).toMatch(/one-shot print mode may end before that turn/i);
     expect(suffix).not.toMatch(/otherwise its result is lost/i);
-    // F19 anti-regression: the every-turn conventions block must nudge richer
+    // Anti-regression: the every-turn conventions block must nudge richer
     // commit messages (match the repo's git-log style; why-not-what body), so a
     // silent drop fails here rather than only in prose. The `--no-verify`
     // prohibition is folded into the same Commits bullet — guard it too so a
@@ -251,7 +251,7 @@ describe("context assembly", () => {
     expect(suffix).toMatch(/recent git log/i);
     expect(suffix).toMatch(/why the change was made/i);
     expect(suffix).toMatch(/--no-verify/);
-    // #69: the interaction posture is a standalone `## Working with the user`
+    // The interaction posture is a standalone `## Working with the user`
     // section (not trailing bullets of the conventions block). It is a soft default
     // emitted AFTER the mechanical conventions but BEFORE CLAUDE.md/skills/steering,
     // so those more-specific sections still get the last word. The header is grepped
@@ -274,7 +274,7 @@ describe("context assembly", () => {
     expect(postureIdx).toBeLessThan(suffix.indexOf("STEER-TEXT"));
   });
 
-  it("gates the interaction posture on includeInteractionPosture (#69)", () => {
+  it("gates the interaction posture on includeInteractionPosture", () => {
     const base = {
       claudeMd,
       rules: [],
@@ -297,7 +297,7 @@ describe("context assembly", () => {
     expect(included).toMatch(/delegat/i);
   });
 
-  // Feature 25 / #48: per-session scratchpad injection.
+  // Per-session scratchpad injection.
   const SCRATCH = "C:/Users/x/AppData/Local/Temp/picc-scratch-abc123";
 
   // The Windows note is discriminated by note-specific content ("different namespaces"),
@@ -364,8 +364,8 @@ describe("context assembly", () => {
     expect(withoutNote).not.toMatch(WIN_NOTE_MARK);
   });
 
-  it("assembles sections with clean boundaries — no triple-newline gap, stable override ordering (#69)", () => {
-    // Guards the two seams #69's rewrite exposed in buildSystemPromptSuffix:
+  it("assembles sections with clean boundaries — no triple-newline gap, stable override ordering", () => {
+    // Guards the two seams the posture rewrite exposed in buildSystemPromptSuffix:
     // (1) a section string ending in a stray newline joins to `\n\n\n` under
     //     sections.join("\n\n") — the trailing-`\n` trap from deleting the old
     //     `${COLLABORATIVE_PLANNING_GUIDANCE}` interpolation; and
@@ -474,7 +474,7 @@ describe("context assembly", () => {
       });
       expect(second).toBeUndefined();
 
-      // Plan §9: after compaction the once-only markers reset, so the next
+      // After compaction the once-only markers reset, so the next
       // relevant access re-injects (regression: markers were never cleared).
       resetInjectionState(state, []);
       const afterCompact = contextForTouchedFile({
@@ -572,7 +572,7 @@ describe("context assembly", () => {
     }
   });
 
-  it("surfaces paths:-scoped skills once when a matching file is touched (plan §4.1 paths:)", () => {
+  it("surfaces paths:-scoped skills once when a matching file is touched", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-ctx-"));
     try {
       fs.mkdirSync(path.join(dir, "src"), { recursive: true });
@@ -639,7 +639,7 @@ describe("SubagentRuntime (fake SDK)", () => {
     expect(result.finalMessage).toBe("```yaml\nverdict: approve\n```");
   });
 
-  it("unknown subagent_type falls back to general-purpose with a visible note (H1)", async () => {
+  it("unknown subagent_type falls back to general-purpose with a visible note", async () => {
     const startPrompts: string[] = [];
     const hookRunner = {
       fire: async (event: string, payload: Record<string, unknown>) => {
@@ -676,7 +676,7 @@ describe("SubagentRuntime (fake SDK)", () => {
     expect(result.error).toContain("2..5");
   });
 
-  it('subagent_type "fork" is RESERVED — it never hits the generic unknown-type fallback (F16)', async () => {
+  it('subagent_type "fork" is RESERVED — it never hits the generic unknown-type fallback', async () => {
     // makeRuntime wires no getMainSessionFile → a fork degrades (no transcript),
     // but it must NEVER surface the generic unknown-type warning: the interception
     // always sets `resolved`, so the fork-specific notice fires instead.
@@ -748,7 +748,7 @@ describe("SubagentRuntime (fake SDK)", () => {
     };
     const res = await tool.execute("t1", { subagent_type: "reviewer", prompt: "go" });
     expect(res.content[0]?.text).toBe("fine");
-    // Unknown types fall back to general-purpose (H1) rather than throwing.
+    // Unknown types fall back to general-purpose rather than throwing.
     const fallback = await tool.execute("t2", { subagent_type: "ghost", prompt: "go" });
     expect(fallback.details.agent).toBe("general-purpose");
     // Genuine failures (depth cap) still throw.
@@ -937,10 +937,10 @@ describe("SubagentRuntime (fake SDK)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // Built-in agent types (audit E1/E2)
+  // Built-in agent types
   // -------------------------------------------------------------------------
 
-  it("empty subagent_type defaults to the built-in general-purpose agent (E2)", async () => {
+  it("empty subagent_type defaults to the built-in general-purpose agent", async () => {
     const seen: ClaudeAgent[] = [];
     // customToolsFor sees the RESOLVED agent on every dispatch (the fake loader
     // never calls the lazy systemPromptOverride).
@@ -957,7 +957,7 @@ describe("SubagentRuntime (fake SDK)", () => {
     expect(seen[0]?.builtin).toBe(true);
   });
 
-  it("built-ins resolve AFTER project agents: a project Explore overrides the built-in (E1)", async () => {
+  it("built-ins resolve AFTER project agents: a project Explore overrides the built-in", async () => {
     const seen: ClaudeAgent[] = [];
     const capture = {
       customToolsFor: (a: ClaudeAgent) => {
@@ -1005,7 +1005,7 @@ describe("SubagentRuntime (fake SDK)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // Model resolution order (audit E5): env > param > frontmatter > session
+  // Model resolution order: env > param > frontmatter > session
   // -------------------------------------------------------------------------
 
   it("CLAUDE_CODE_SUBAGENT_MODEL beats the model param, which beats frontmatter, which beats session", async () => {
@@ -1051,7 +1051,7 @@ describe("SubagentRuntime (fake SDK)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // Agent-scoped hooks (audit C10)
+  // Agent-scoped hooks
   // -------------------------------------------------------------------------
 
   it("agent frontmatter hooks dispatch scoped to the subagent: guard wiring + Stop→SubagentStop mapping", async () => {
@@ -1135,7 +1135,7 @@ describe("SubagentRuntime (fake SDK)", () => {
     expect(result.finalMessage).toBe("revised answer");
   });
 
-  it("agent hook systemMessages surface in the dispatch diagnostics, once per distinct message (H4)", async () => {
+  it("agent hook systemMessages surface in the dispatch diagnostics, once per distinct message", async () => {
     const makeScopedHookRunner = () => ({
       fire: async () => ({
         block: false,
@@ -1169,7 +1169,7 @@ describe("SubagentRuntime (fake SDK)", () => {
   });
 });
 
-describe("Subagent live progress (t03)", () => {
+describe("Subagent live progress", () => {
   const streamReply = {
     text: "done",
     events: [
@@ -1299,7 +1299,7 @@ describe("Subagent live progress (t03)", () => {
       isPartial = false,
     ) => tool.renderResult(r, { isPartial }, undefined).render(120).join("\n");
 
-    // Final, completed + resumable + transcript, no usage yet (t06).
+    // Final, completed + resumable + transcript, no usage yet.
     const completed = render({
       content: [{ type: "text", text: "the answer" }],
       details: {
@@ -1315,7 +1315,7 @@ describe("Subagent live progress (t03)", () => {
     expect(completed).toContain("resumable");
     expect(completed).not.toContain("usage:");
 
-    // Usage slot renders defensively when t06's field is present.
+    // Usage slot renders defensively when the field is present.
     const withUsage = render({
       content: [{ type: "text", text: "x" }],
       details: { outcome: "completed", usage: { totalTokens: 1200, costUsd: 0.03 } },
@@ -1529,7 +1529,7 @@ describe("Subagent live progress (t03)", () => {
     expect(result).toContain("clean body");
   });
 
-  it("strips the t02 trailer frame from the human view, one resumable hint with the id (UX-2)", () => {
+  it("strips the trailer frame from the human view, one resumable hint with the id", () => {
     const tool = renderTool();
     const agentId = "agent-0123456789ab";
     const rendered = tool
@@ -1560,7 +1560,7 @@ describe("Subagent live progress (t03)", () => {
     expect(rendered).toContain(agentId);
   });
 
-  it("renders the (truncated) badge for a turn-capped (length-stop) success (UX-3)", async () => {
+  it("renders the (truncated) badge for a turn-capped (length-stop) success", async () => {
     const { sdk } = fakeSdk({ replies: [{ text: "partial answer", stopReason: "length" }] });
     const runtime = makeSubagentRuntime([makeAgent()], sdk);
     const tool = createAgentToolDefinition(runtime, { depth: 0 }) as {
@@ -1579,13 +1579,13 @@ describe("Subagent live progress (t03)", () => {
       ) => { render: (w: number) => string[] };
     };
     const res = await tool.execute("t", { subagent_type: "reviewer", prompt: "go" }, undefined);
-    // UX-3 wiring: the truncated success marks cutOff so the badge can differ.
+    // The truncated success marks cutOff so the badge can differ.
     expect(res.details?.cutOff).toBe(true);
     const rendered = tool.renderResult(res, { isPartial: false }, undefined).render(120).join("\n");
     expect(rendered).toContain("completed (truncated)");
   });
 
-  it("renders the ■ aborted badge when details.outcome is aborted (UX-1)", () => {
+  it("renders the ■ aborted badge when details.outcome is aborted", () => {
     const tool = renderTool();
     const rendered = tool
       .renderResult(
@@ -1657,13 +1657,13 @@ describe("Subagent live progress (t03)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// TaskOutput background-identity render (F04 t03) — the taskId-gated additions
+// TaskOutput background-identity render — the taskId-gated additions
 // to the SHARED renderAgentResult: identity header + agent-<id> subline at every
 // surface, badge chips on all outcomes, poll frame, start-block, placeholders,
 // and the width-clamp/sanitize guarantees. Pure renderer unit tests.
 // ---------------------------------------------------------------------------
 
-describe("TaskOutput identity render (F04 t03)", () => {
+describe("TaskOutput identity render", () => {
   const ESC = String.fromCharCode(27);
   const BEL = String.fromCharCode(7);
   const render = (
@@ -1933,7 +1933,7 @@ describe("TaskOutput identity render (F04 t03)", () => {
     expect(settled).toContain("coder");
   });
 
-  it("FOREGROUND (no taskId): a completed body ending in a usage: line is KEPT — no background usage-strip (MUST-FIX 1)", () => {
+  it("FOREGROUND (no taskId): a completed body ending in a usage: line is KEPT — no background usage-strip", () => {
     // renderAgentResult is SHARED; the usage-line strip must be gated on taskId so
     // a foreground agent whose final message legitimately ends in "usage: …" is
     // never mutilated (details.usage IS set on foreground completed dispatches).
@@ -1951,7 +1951,7 @@ describe("TaskOutput identity render (F04 t03)", () => {
     expect(out).toContain("Here is the result.");
   });
 
-  it("settled resumable SUPPRESSES the standalone agent-<id> subline; non-resumable keeps it (SHOULD-FIX 4)", () => {
+  it("settled resumable SUPPRESSES the standalone agent-<id> subline; non-resumable keeps it", () => {
     const agentId = "agent-aabbccddeeff";
     const settled = (resumable: boolean) =>
       renderAgentResult(
@@ -2034,7 +2034,7 @@ describe("SendMessage parent-only guard through the real harness (tester NIT-2)"
       // customToolsFor must hold under inherit-all (and claudeToolsToPiBuiltins
       // never maps SendMessage to a Pi builtin).
       const before = rcMock.created.length;
-      // F15: pin run_in_background: false so the dispatch runs foreground and the
+      // Pin run_in_background: false so the dispatch runs foreground and the
       // subagent session is created synchronously within execute() — this test
       // inspects the constructed toolset, background-vs-foreground is incidental.
       await agentTool.execute("t", {
@@ -2063,7 +2063,7 @@ describe("SendMessage parent-only guard through the real harness (tester NIT-2)"
   });
 });
 
-// Wiring-seam revert-catcher (t05): the scratchpad path is computed in index.ts's
+// Wiring-seam revert-catcher: the scratchpad path is computed in index.ts's
 // activation and threaded into BOTH the main-session before_agent_start suffix AND
 // buildSubagentSystemPrompt's suffix. Boots the REAL harness (same pattern as the
 // parent-guard test above) so a dropped call-site arg on either path ships RED.
@@ -2071,7 +2071,7 @@ describe("SendMessage parent-only guard through the real harness (tester NIT-2)"
 // computeSessionScratchDir unit tests in test/subprocess-env.test.ts — the win32-only
 // slash transform is a no-op on this Linux CI host, so it cannot be caught by a
 // booted assertion here.)
-describe("scratchpad injection wiring through the real harness (t05)", () => {
+describe("scratchpad injection wiring through the real harness", () => {
   it("injects the SAME literal scratch path into both the main suffix and the subagent prompt", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-rc-scratch-"));
     fs.writeFileSync(path.join(dir, "CLAUDE.md"), "scratch-project\n");
@@ -2136,7 +2136,7 @@ describe("scratchpad injection wiring through the real harness (t05)", () => {
   });
 });
 
-describe("self-shell wrapper (concise-tool-rows t01)", () => {
+describe("self-shell wrapper", () => {
   const ESC = String.fromCharCode(27);
   const BEL = String.fromCharCode(7);
   const SLOTS = ["toolPendingBg", "toolErrorBg", "toolSuccessBg"] as const;
@@ -2446,7 +2446,7 @@ describe("self-shell wrapper (concise-tool-rows t01)", () => {
     expect(tuiVisibleWidth(call[0]!)).toBe(40); // padded — not a blank line
   });
 
-  // --- concise-tool-rows t02: ctx.lastComponent threading for the built-ins ---
+  // --- ctx.lastComponent threading for the built-ins ---
 
   it("threads ctx.lastComponent: the inner renderer receives the PREVIOUS INNER component, not the wrapper", () => {
     // Non-vacuous: an instrumented fake inner ToolDefinition RECORDS the

@@ -6,7 +6,7 @@ import type { Diagnostic } from "../types.js";
 import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 
 /**
- * Harness control surface config (plan §10, §13.2) — lives OUTSIDE the target project
+ * Harness control surface config — lives OUTSIDE the target project
  * (user level) or in a harness-owned gitignored location inside it (never tracked files):
  *   - user:    ~/.picc/config.json
  *   - project: <projectRoot>/.claude/.picc/config.json   (harness-owned, gitignored)

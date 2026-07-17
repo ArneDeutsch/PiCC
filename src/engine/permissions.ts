@@ -9,10 +9,10 @@ import {
 import type { Diagnostic, PermissionRule, PermissionRules, ToolCallDescriptor } from "../types.js";
 
 /**
- * Permission matcher grammar + deny engine (plan §6, research 02 §7).
+ * Permission matcher grammar + deny engine.
  *
  * The matcher grammar is fully implemented even though `allow`/`ask` are a
- * graceful no-op (posture §6.1), because three subsystems reuse it:
+ * graceful no-op, because three subsystems reuse it:
  * - `deny` enforcement (hard, non-interactive block),
  * - `tools:` capability gating for agents/skills,
  * - hook `if:` conditions (the hooks engine imports {@link matchesRule}).
@@ -108,15 +108,15 @@ function toolNameMatches(ruleTool: string, callTool: string): boolean {
   return false;
 }
 
-/** The tools an `Edit` rule gates: ALL file-modification tools (research 02 §7.2). */
+/** The tools an `Edit` rule gates: ALL file-modification tools. */
 const FILE_EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 
 /**
  * The tools a `Read` rule gates: ALL built-in file-reading tools. Grep/Glob are
  * documented Claude parity ("makes a best-effort attempt to apply `Read` rules
  * to all built-in tools that read files like Grep and Glob"); NotebookRead is
- * included as inferred defense-in-depth (it is a real file reader since F18) —
- * Claude's docs do not name it. `Read` is present for symmetry with
+ * included as inferred defense-in-depth (it is a real file reader) — Claude's
+ * docs do not name it. `Read` is present for symmetry with
  * {@link FILE_EDIT_TOOLS}; {@link toolNameMatches} already covers Read==Read.
  */
 const FILE_READ_TOOLS = new Set(["Read", "Grep", "Glob", "NotebookRead"]);
@@ -225,7 +225,7 @@ function splitShellCommand(command: string): string[] {
   return segments.map((s) => s.trim()).filter((s) => s.length > 0);
 }
 
-// --- Process-wrapper stripping (research 02 §7.2) --------------------------
+// --- Process-wrapper stripping ---------------------------------------------
 
 /** Take the first whitespace-delimited token; `[token, rest]` or null. */
 function takeToken(text: string): [string, string] | null {
@@ -251,8 +251,8 @@ function consumeOptions(text: string, valueOpts: ReadonlySet<string>): string {
 /**
  * Strip ONE leading process wrapper — `timeout [opts] <dur>`, `time`,
  * `nice [-n N]`, `nohup`, `stdbuf <opts>`, bare `xargs`, `env [assignments]` —
- * the wrappers Claude strips before Bash pattern matching (research 02 §7.2),
- * so a deny `Bash(curl *)` cannot be evaded via `nohup curl …`. Returns the
+ * the wrappers Claude strips before Bash pattern matching, so a deny
+ * `Bash(curl *)` cannot be evaded via `nohup curl …`. Returns the
  * unwrapped remainder, or null when the segment does not start with a wrapper.
  */
 function stripOneWrapper(segment: string): string | null {
@@ -264,7 +264,7 @@ function stripOneWrapper(segment: string): string | null {
     case "time":
       return rest;
     case "xargs":
-      // Only bare `xargs cmd …` (no options) is stripped, per the reference.
+      // Only bare `xargs cmd …` (no options) is stripped, matching Claude.
       return rest.startsWith("-") ? null : rest;
     case "nice":
       return consumeOptions(rest, new Set(["-n", "--adjustment"]));
@@ -346,7 +346,7 @@ function stripLeadingAssignments(segment: string): string | null {
 }
 
 /**
- * Bash pattern semantics (research 02 §7.2 + official permissions docs):
+ * Bash pattern semantics (official permissions docs):
  * - exact command: `Bash(git status)` — matches only that command;
  * - prefix wildcard: `Bash(git *)` — space-before-`*` is a word boundary
  *   meaning "space or end of string": matches bare `git` and `git push`,
@@ -408,7 +408,7 @@ function bashSpecifierMatches(
  * `//**\/x`), `~/path` home. A bare filename (no slash) matches at any depth
  * (`.env` ≡ `**\/.env`).
  *
- * Windows normalization (D2, v2.1.166): patterns and input paths are
+ * Windows normalization (Claude Code 2.1.166): patterns and input paths are
  * canonicalized (backslashes → `/`, `C:/x` → `/c/x`, case-insensitive for
  * Windows/drive-lettered paths) by the shared glob engine before matching, so
  * a deny `Read(//c/**\/.env)` covers `C:\proj\.env` in any input flavor.
@@ -424,7 +424,7 @@ function bashSpecifierMatches(
  * - patterns additionally match when anchored at the live call cwd (so a
  *   relative deny keeps covering the directory the session works in), and
  * - symlinks are resolved (realpath, existing paths only, graceful failure) —
- *   "deny rules fire if either the symlink or its target matches" (§7.2).
+ *   "deny rules fire if either the symlink or its target matches".
  */
 function pathSpecifierMatches(
   specifier: string,
@@ -521,8 +521,7 @@ function webFetchSpecifierMatches(specifier: string, call: ToolCallDescriptor): 
 
 /**
  * Canonicalized input fields that the specifier grammar already consumes —
- * per research 02 §7.2 these are NOT matchable via the `Tool(key:value)`
- * parameter form.
+ * these are NOT matchable via the `Tool(key:value)` parameter form.
  */
 const CANONICAL_INPUT_FIELDS = new Set([
   "command",
@@ -596,11 +595,11 @@ export function matchesRule(
     const safeCall: ToolCallDescriptor = { ...call, input };
     const pathOpts = { deny: opts.deny, anchor: opts.anchor };
 
-    // Parameter-matching form `Tool(key:value)` (research 02 §7.2): one param
-    // per rule, `*` wildcard allowed, e.g. Agent(model:opus),
-    // Agent(isolation:worktree), Bash(run_in_background:true). Applies only to
-    // non-canonical keys actually present on the call input, so the canonical
-    // forms (WebFetch(domain:…), legacy Bash(git:*)) are unaffected.
+    // Parameter-matching form `Tool(key:value)`: one param per rule, `*`
+    // wildcard allowed, e.g. Agent(model:opus), Agent(isolation:worktree),
+    // Bash(run_in_background:true). Applies only to non-canonical keys actually
+    // present on the call input, so the canonical forms (WebFetch(domain:…),
+    // legacy Bash(git:*)) are unaffected.
     if (rule.tool !== "*") {
       const param = /^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([\s\S]*)$/.exec(specifier);
       const key = param?.[1];
@@ -656,7 +655,7 @@ export interface PermissionEvaluation {
   decision: "deny" | "allow" | "default";
   /** The raw rule text that produced a non-default decision. */
   rule?: string;
-  /** True when an `ask` rule matched and was downgraded to allow (posture §6.1). */
+  /** True when an `ask` rule matched and was downgraded to allow. */
   askDowngraded?: boolean;
 }
 
@@ -696,14 +695,14 @@ export class PermissionEngine {
    * project root that declared the rules (defaults to `cwd`). Both are fixed
    * at construction; rule anchoring never follows the live per-call cwd, so
    * EnterWorktree / cwd drift cannot move a deny rule off the paths it was
-   * written to protect (research 02 §7.2 anchor table).
+   * written to protect.
    */
   constructor(rules: PermissionRules, opts: { cwd: string; root?: string }) {
     this.rules = rules;
     this.cwd = opts.cwd;
     this.anchor = opts.root ?? opts.cwd;
-    // D4: Claude rejects allow rules whose MCP tool part is an unanchored
-    // glob. PiCC ignores them for allow matching and reports a warning.
+    // Claude rejects allow rules whose MCP tool part is an unanchored glob.
+    // PiCC ignores them for allow matching and reports a warning.
     const ignored = new Set<string>();
     for (const rule of this.ruleList("allow")) {
       if (!isUnanchoredMcpGlob(parseRule(rule).tool)) continue;
@@ -730,10 +729,10 @@ export class PermissionEngine {
   }
 
   /**
-   * Evaluate a tool call. Order: deny → ask → allow (research 02 §7.1);
-   * deny is a hard block; a matching `ask` rule is downgraded to allow but
-   * reported (`askDowngraded`) so the caller can log it; no match at all is
-   * "default" — never blocking (default-permissive posture, plan §6.1).
+   * Evaluate a tool call. Order: deny → ask → allow; deny is a hard block; a
+   * matching `ask` rule is downgraded to allow but reported (`askDowngraded`)
+   * so the caller can log it; no match at all is "default" — never blocking
+   * (default-permissive posture).
    */
   evaluate(call: ToolCallDescriptor): PermissionEvaluation {
     const effective: ToolCallDescriptor = { ...call, cwd: call?.cwd || this.cwd };
@@ -751,7 +750,7 @@ export class PermissionEngine {
       }
     }
     for (const rule of this.ruleList("allow")) {
-      if (this.ignoredAllowRules.has(rule)) continue; // D4: unanchored MCP glob
+      if (this.ignoredAllowRules.has(rule)) continue; // unanchored MCP glob
       if (matchesRule(rule, effective, { anchor: this.anchor })) {
         return { decision: "allow", rule };
       }
@@ -766,11 +765,10 @@ export class PermissionEngine {
    * known; `*` in disallowed removes all. A bare `mcp__server` entry covers
    * every `mcp__server__*` tool. Entries with a specifier (e.g.
    * `Bash(rm *)`) grant the tool but never REMOVE it — a scoped deny leaves
-   * the tool in context and blocks per-call instead (research 02 §7.1).
+   * the tool in context and blocks per-call instead.
    *
    * Settings `deny` rules with a BARE tool name also remove the tool from
-   * context entirely (research 02 §7.1: "a bare tool name deny removes the
-   * tool from context"); a bare `Edit` deny removes all file-editing tools and
+   * context entirely; a bare `Edit` deny removes all file-editing tools and
    * a bare `Read` deny removes all file-reading tools (Grep/Glob/NotebookRead),
    * matching the call-time rule expansion. A SCOPED deny (`Read(glob)`) removes
    * nothing from context — the specifier guard leaves the tool in place and it

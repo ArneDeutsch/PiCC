@@ -5,7 +5,7 @@ rendering, colors/themes, interactive panes, progress indicators, and keybinding
 what Pi's extension API makes possible, how hard each thing is, and what to avoid, so we don't
 have to re-derive it from `node_modules` every time.
 
-For the broader integration contracts see [`doc/design/pi-integration.md`](pi-integration.md);
+For the broader integration contracts see [`doc/pi-integration.md`](pi-integration.md);
 for the module map see [`doc/architecture.md`](architecture.md). This guide is the TUI-specific
 companion to both.
 
@@ -64,7 +64,7 @@ Two objects matter:
 | Goal | Verdict | Mechanism |
 |---|---|---|
 | Custom framing of **our own** tool call/result | **Easy** | `renderCall`/`renderResult` + `renderShell: "self"` on the `ToolDefinition` |
-| Remove blank lines / gutter around a tool row | **Done (all rows, generic wrapper) · Impossible (inter-block)** | `renderShell: "self"` + per-line `theme.bg` re-apply in the self-shell wrapper `src/runtime/tool-shell.ts` (`wrapForSelfShell`), applied at both registration seams (§3.2); inter-block spacing is render-loop-internal |
+| Remove blank lines / gutter around a tool row | **Done (all rows, generic wrapper) · Impossible (inter-block)** | `renderShell: "self"` + per-line `theme.bg` re-apply in the self-shell wrapper `src/runtime/tool-shell.ts` (`wrapForSelfShell`), applied at both registration seams (see "`renderShell` — this is how you control blank lines and framing"); inter-block spacing is render-loop-internal |
 | Colors in our own components | **Easy** | `theme.fg("<slot>", text)`, `theme.bg`, `theme.bold/italic/...`, or raw ANSI |
 | Re-skin the whole UI / switch themes | **Medium** | `ctx.ui.setTheme`, `new Theme(...)`, ship theme JSON via `resources_discover` |
 | Add a **new named color role** | **Impossible** | `ThemeColor` union is closed |
@@ -90,7 +90,7 @@ one; it encodes hard-won invariants.
 
 ### 3.1 The contract
 
-A `ToolDefinition` (see `types.d.ts` ~line 335) may supply:
+The `ToolDefinition` type (in `types.d.ts`) may supply:
 
 ```ts
 renderCall?:   (args, theme, ctx) => Component
@@ -100,7 +100,7 @@ renderShell?:  "default" | "self"
 
 A **Component** is the structural pi-tui contract: `{ render(width: number): string[] }`. PiCC's
 renderers use the untyped structural form, so no pi-tui type import is needed — but the `theme`
-argument **is** Pi's `Theme` (see §4).
+argument **is** Pi's `Theme` (see "Colors and themes").
 
 - `options` for `renderResult` is `{ expanded: boolean; isPartial: boolean }`. `isPartial` is the
   streaming case (a live, not-yet-final result); render the rolling/partial view then.
@@ -110,19 +110,17 @@ argument **is** Pi's `Theme` (see §4).
 ### 3.2 `renderShell` — this is how you control blank lines and framing
 
 `ToolExecutionComponent` (in `dist/modes/interactive/components/tool-execution.js`) wraps a tool
-row in a standard **colored shell** — a `Box(paddingX=1, paddingY=1, bgFn)` that provides the
-1-column gutter (`paddingX`) and the leading/trailing colored blank line (`paddingY` — one blank
-line above **and** below the content) you see around every tool row. Setting `renderShell: "self"`
-swaps that for a bare `selfRenderContainer` and hands *all* framing to your component — you emit
-exactly the lines you want, no more, no less (confirmed at `tool-execution.js:181`). The catch:
-self mode **also drops Pi's colored `Box` entirely** — it renders a plain container, prepends
-exactly one plain `""` inter-block separator, and applies **no background**. So `renderShell: "self"`
-is the only lever that removes the padding, but any row that takes it must re-apply the state
-background itself.
+row in a standard **colored shell** — a `Box(paddingX=1, paddingY=1, bgFn)` giving the 1-column
+gutter (`paddingX`) and the colored blank line above **and** below the content (`paddingY`) you see
+around every tool row. `renderShell: "self"` swaps that `Box` for a bare `selfRenderContainer` and
+hands *all* framing to your component — you emit exactly the lines you want, no more, no less. The
+catch: self mode **drops Pi's colored `Box` entirely** — plain container, exactly one plain `""`
+inter-block separator prepended, **no background**. So `renderShell: "self"` is the only lever that
+removes the padding, but any row that takes it must re-apply the state background itself.
 
 PiCC uses this today to de-pad **every** tool row (all Claude-named tools *and* the re-registered
 built-ins). Rather than edit each renderer, a single generic **self-shell wrapper**
-(`src/runtime/tool-shell.ts`, `wrapForSelfShell`) is applied at both tool-registration seams. For
+(`wrapForSelfShell` in `src/runtime/tool-shell.ts`) is applied at both tool-registration seams. For
 any tool it sets `renderShell: "self"`, strips the leading/trailing blank lines, keeps the 1-column
 gutter, and **re-applies `theme.bg` per line** — self-render drops the tint deliberately, so PiCC
 paints it back byte-exact with Pi's default `Box` (content clamped to `width - 2*gutter`, then
@@ -137,7 +135,7 @@ wrapped in Pi's try/catch, so an unguarded throw (unknown bg slot, absent theme,
   **generic fallback** reproducing Pi's own `createCallFallback` (bold tool title) and
   `createResultFallback` (`getTextOutput` result text), so a renderer-less tool de-pads without
   anyone writing a bespoke renderer.
-- **Built-ins** (`bash`/`read`/`edit`/`grep`/`find`/`ls`): **wrapped, not reimplemented.** PiCC
+- **Built-ins** (`bash`/`read`/`write`/`edit`/`grep`/`find`/`ls`): **wrapped, not reimplemented.** PiCC
   re-registers these for cwd-swap (`src/index.ts`, the "Cwd-swapping overrides" block). Their
   renderers are sourced from the public `create*ToolDefinition` factories — the plain `create*Tool`
   factory strips `renderCall`/`renderResult` via `wrapToolDefinition` — while **`execute` stays
@@ -150,13 +148,13 @@ wrapped in Pi's try/catch, so an unguarded throw (unknown bg slot, absent theme,
   reuse it for incremental state (`read`/`bash` via `?? new …`, `edit` via an `instanceof Box`
   reuse). A naive wrap would hand the inner renderer *our* wrapper and silently lose that state
   (`edit` especially), so the wrapper stashes the inner component (`__inner`) and threads the
-  *previous inner* component back. This couples to Pi's render contract — and is now **pinned**:
-  a contract test drives the real `ToolExecutionComponent` and asserts Pi hands the
+  *previous inner* component back. This couples to Pi's render contract, and the coupling is
+  **pinned**: a contract test drives the real `ToolExecutionComponent` and asserts Pi hands the
   previously-returned component back as `ctx.lastComponent` on the next render (undefined on the
-  first), for both the `renderCall` and `renderResult` slots (`test/pi-contract.test.ts`,
-  concise-tool-rows t04). PiCC's own threading stays unit-tested; with Pi's side now asserted too,
-  a Pi change here fails loudly in CI instead of degrading incremental rendering silently (see
-  [`pi-integration.md`](pi-integration.md) §4).
+  first), for both the `renderCall` and `renderResult` slots (`test/pi-contract.test.ts`). PiCC's
+  own threading is unit-tested and Pi's side is asserted, so a Pi change here fails loudly in CI
+  rather than degrading incremental rendering silently (see "Risks / churn watchpoints" in
+  [`pi-integration.md`](pi-integration.md)).
 - **The blank line Pi inserts *between* transcript blocks is still not yours.** That is render-loop
   layout (self mode prepends exactly one), not a tool concern. No extension knob changes it — it is
   the hard boundary that still separates two adjacent de-padded rows. Plan around it.
@@ -190,11 +188,11 @@ These are not style preferences — violating them crashes the app or leaks term
 `Theme` (`dist/modes/interactive/theme/theme.d.ts`) is a fixed vocabulary of **semantic color
 slots**, not a free palette:
 
-- `ThemeColor` (~50 slots): `accent`, `border`, `success`, `error`, `warning`, `muted`, `dim`,
+- `ThemeColor` (~45 slots): `accent`, `border`, `success`, `error`, `warning`, `muted`, `dim`,
   `text`, `toolTitle`, `toolOutput`, `mdHeading`, `mdCode`, `mdCodeBlock`, `toolDiffAdded`,
-  `toolDiffRemoved`, `syntaxKeyword`/`syntaxString`/… , `thinkingLow`…`thinkingMax`, `bashMode`, …
-- `ThemeBg` (~6 slots): `selectedBg`, `userMessageBg`, `toolPendingBg`, `toolSuccessBg`,
-  `toolErrorBg`, …
+  `toolDiffRemoved`, `syntaxKeyword`/`syntaxString`/… , `thinkingOff`…`thinkingMax`, `bashMode`, …
+- `ThemeBg` (6 slots, all of them): `selectedBg`, `userMessageBg`, `customMessageBg`,
+  `toolPendingBg`, `toolSuccessBg`, `toolErrorBg`.
 - Methods: `fg(slot, text)`, `bg(slot, text)`, `bold/italic/underline/inverse/strikethrough`,
   `getFgAnsi(slot)`, `getColorMode()` (`truecolor` | `256color`).
 
@@ -237,7 +235,7 @@ const result = await ctx.ui.custom<TResult>(
 - The factory returns a `Component` (optionally async) that **takes keyboard focus**. Call
   `done(result)` to close and resolve the promise. Optional `dispose()` for cleanup.
 - `keybindings` is the app's `KeybindingsManager` — use it to match keys inside your component
-  (see §7) so navigation stays consistent with the rest of the app.
+  (see "Keybindings") so navigation stays consistent with the rest of the app.
 - `overlay: true` floats it; `overlayOptions` (or a function for dynamic sizing) positions it;
   `onHandle(handle)` gives you an `OverlayHandle` to control visibility.
 
@@ -269,11 +267,11 @@ Several dedicated hooks — all low-risk:
   own color). Omit the argument to restore the default animated spinner.
 - **`ctx.ui.setWorkingMessage(msg)`** / **`ctx.ui.setWorkingVisible(bool)`** — the text and
   visibility of the "working" row shown during streaming.
-- **`ctx.ui.setStatus(key, text)`** — footer status line (see §5.2).
+- **`ctx.ui.setStatus(key, text)`** — footer status line (see "Persistent panes and chrome").
 - **Per-tool live progress** — the tool's `onUpdate` callback drives `renderResult(…, { isPartial:
   true })`. **PiCC already does this** for subagent tails and API-retry waits
   (`src/runtime/subagent-progress.ts` → `subagent-render.ts`). Copy that pattern for any long tool.
-- **A persistent progress pane** — `setWidget` (§5.2).
+- **A persistent progress pane** — `setWidget` (see "Persistent panes and chrome").
 
 ---
 
@@ -305,8 +303,9 @@ and reports conflicts.
   `app.tools.expand` do. That is the user's `keybindings.json`. From code your only levers are:
   - **`ctx.ui.onTerminalInput(handler)`** — raw byte interception; return `{ consume: true }` to
     swallow a key or `{ data }` to rewrite it. **PiCC already uses this** to make forked skills
-    Esc-cancellable (`src/index.ts` ~line 1262). Powerful but order-/precedence-sensitive and
-    bypasses the keybinding abstraction — use sparingly and document it.
+    Esc-cancellable (the `pi.on("input", …)` handler in `src/index.ts`). Powerful but
+    order-/precedence-sensitive and bypasses the keybinding abstraction — use sparingly and
+    document it.
   - **`ctx.ui.setEditorComponent(factory)`** — replace the whole input editor by subclassing
     `CustomEditor` and overriding `handleInput` (call `super.handleInput` for keys you don't
     handle). This is the sanctioned "vim mode" path; heavy, and it makes you responsible for all the
@@ -336,14 +335,14 @@ Treat true global rebinding as **out of scope** — it fights Pi's own model and
 
 From `src/` (grep of `pi.*` / `ctx.ui.*`):
 
-- Registration/events: `pi.on` (×15), `pi.registerTool`, `pi.registerCommand`,
-  `pi.registerEntryRenderer` (×2), `pi.sendMessage`, `pi.appendEntry`, `pi.sendUserMessage`,
+- Registration/events: `pi.on`, `pi.registerTool`, `pi.registerCommand`,
+  `pi.registerEntryRenderer`, `pi.sendMessage`, `pi.appendEntry`, `pi.sendUserMessage`,
   `pi.setModel`, `pi.setThinkingLevel`, `pi.exec`.
-- UI: `ctx.ui.notify` (×2), `ctx.ui.onTerminalInput` (Esc-cancel of forks).
+- UI: `ctx.ui.notify`, `ctx.ui.onTerminalInput` (Esc-cancel of forks).
 - The mature rendering example: `src/runtime/subagent-render.ts` (+ `subagent-progress.ts`).
 - Tool-row framing: `renderShell: "self"` + per-line `theme.bg` re-apply via the generic self-shell
-  wrapper `src/runtime/tool-shell.ts` (`wrapForSelfShell`) — de-pads every Claude-named tool and
-  re-registered built-in row (§3.2).
+  wrapper `wrapForSelfShell` (`src/runtime/tool-shell.ts`) — de-pads every Claude-named tool and
+  re-registered built-in row (see "`renderShell` — this is how you control blank lines and framing").
 
 **Untapped but available right now:** `pi.registerShortcut`,
 `ctx.ui.custom`, `ctx.ui.setWidget`, `ctx.ui.setFooter`/`setHeader`, `ctx.ui.setStatus`,
@@ -357,9 +356,10 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
 
 - **Global transcript layout, inter-block spacing, scrollback model** — render-loop internal, not
   exposed. No extension knob.
-- **New named theme roles** — closed vocabulary (§4.3).
+- **New named theme roles** — closed vocabulary (see "What you cannot do" under "Colors and
+  themes").
 - **Global rebinding of Pi's built-in key actions from code** — user config only; extensions add or
-  intercept, never reassign (§7.3).
+  intercept, never reassign (see "What an extension cannot cleanly do").
 - **Headless modes** — print/RPC/JSON have no interactive UI; every interactive feature needs a
   text-mode degrade.
 - **Anything requiring changes to Pi itself** — possible only by patching/forking `pi-coding-agent`,
@@ -382,8 +382,9 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
    no new slots.
 6. **Keys:** add via `registerShortcut` or handle inside your own component; do not try to reassign
    Pi's actions.
-7. **Upgrade safety:** if you touch `custom`/`widget`/`theme`/`setEditorComponent`, note it in
-   [`doc/design/pi-integration.md`](pi-integration.md) §4 (churn watchpoints) and cover the import/
-   shape in the Pi-contract smoke test — these are the newest, most-churning parts of the API.
+7. **Upgrade safety:** if you touch `custom`/`widget`/`theme`/`setEditorComponent`, note it under
+   "Risks / churn watchpoints" in [`doc/pi-integration.md`](pi-integration.md) and cover the
+   import/shape in the Pi-contract smoke test — these are the newest, most-churning parts of the
+   API.
 8. **Parity check:** a Claude Code project does not expect PiCC-specific chrome. Make new UI additive
    and opt-in, not something that changes how an unmodified project renders.

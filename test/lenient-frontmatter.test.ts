@@ -9,7 +9,7 @@ import path from "node:path";
  * Regression: real Claude projects (DemonMatrix) carry frontmatter that is
  * lenient-YAML but not strict-YAML — an unquoted `description:` value containing
  * `: ` trips the strict parser. Claude Code accepts it; mechanical fidelity
- * (plan §2.1) requires we do too.
+ * requires we do too.
  */
 describe("lenient frontmatter recovery", () => {
   it("recovers a description containing ': ' that strict YAML rejects", () => {

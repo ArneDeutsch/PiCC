@@ -13,7 +13,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 /**
- * Search tools (plan §4.8): Claude-named `Grep` and `Glob`.
+ * Search tools: Claude-named `Grep` and `Glob`.
  *
  * `Grep` prefers the ripgrep binary when present on PATH and falls back to a
  * pure-JS walker otherwise (or when forced for tests). The two engines are
@@ -141,7 +141,6 @@ function findGitRoot(startDir: string): string | undefined {
 // ---------------------------------------------------------------------------
 
 interface WalkedFile {
-  /** Absolute path. */
   abs: string;
   /** Path relative to the walk base, forward slashes. */
   rel: string;

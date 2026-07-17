@@ -1,14 +1,14 @@
 import { isAgentId } from "../util/subagent-transcripts.js";
 
 /**
- * Dispatch registry (t04): the in-memory source of truth for what a subagent ID
- * or name reaches — the ONLY thing `SendMessage` resolves against. Keyed by
- * agent ID; a name → ID index tracks the ORIGINAL binding so a name that was
- * later reused for a different live agent refuses cleanly (name integrity,
- * Claude Code 2.1.199). The registry is per-orchestrator-session and
- * process-lifetime (cross-restart resume is out of scope — t07 records that).
+ * Dispatch registry: the in-memory source of truth for what a subagent ID or
+ * name reaches — the ONLY thing `SendMessage` resolves against. Keyed by agent
+ * ID; a name → ID index tracks the ORIGINAL binding so a name that was later
+ * reused for a different live agent refuses cleanly (name integrity, Claude
+ * Code 2.1.199). The registry is per-orchestrator-session and process-lifetime;
+ * cross-restart resume is out of scope.
  *
- * SECURITY (plan-review MUST-FIX #2): resolution is pure in-memory Map lookups.
+ * SECURITY: resolution is pure in-memory Map lookups.
  * The transcript path used to reopen a session comes from the REGISTRY RECORD
  * (captured from the real persisted SessionManager's `getSessionFile()` at
  * dispatch time), NEVER string-assembled from the model-supplied `to`, and never
@@ -34,8 +34,8 @@ export interface SteerableSession {
 }
 
 /**
- * Per-subagent usage (t06), mirrored structurally from `DispatchUsage`
- * (subagents.ts) so this module keeps no import coupling with the runtime.
+ * Per-subagent usage, mirrored structurally from `DispatchUsage` in
+ * `subagents.ts` so this module keeps no import coupling with the runtime.
  */
 export interface SubagentUsage {
   inputTokens?: number;
@@ -45,7 +45,7 @@ export interface SubagentUsage {
   costUsd?: number;
 }
 
-/** Settled fate of a dispatch (t01 vocabulary), recorded for the /usage report. */
+/** Settled fate of a dispatch, recorded for the /usage report. */
 export type SubagentOutcome = "completed" | "failed" | "aborted";
 
 export interface SubagentRegistryRecord {
@@ -68,23 +68,24 @@ export interface SubagentRegistryRecord {
   /** Whether the dispatch is currently running (steerable) or has settled. */
   state: "running" | "settled";
   /**
-   * Settled fate (t06): completed / failed / aborted, recorded at settlement so
-   * the /usage control command can report each subagent's outcome. Undefined
-   * while running (or for a settle that could not classify).
+   * Recorded at settlement so the /usage control command can report each
+   * subagent's outcome. Undefined while running (or for a settle that could not
+   * classify).
    */
   outcome?: SubagentOutcome;
   /**
-   * Per-subagent token/cost usage (t06), recorded at settlement from the
-   * dispatch's captured session stats. Undefined when the session provided none
-   * (fake/older SDK, or a run that died before any billable turn).
+   * Recorded at settlement from the dispatch's captured session stats.
+   * Undefined when the session provided none (fake/older SDK, or a run that
+   * died before any billable turn).
    */
   usage?: SubagentUsage;
   /** Live session handle while running (steering target); dropped on settlement. */
   session?: SteerableSession;
   /**
-   * t05 settled-notice readiness gate. A (re)dispatch re-arms the agent-level
-   * gate, but F21 task-generation collection and newest-generation checks can
-   * suppress delivery; only an eligible current uncollected run is noticed.
+   * Settled-notice readiness gate. A (re)dispatch re-arms this agent-level
+   * gate, but the background-task registry's task-generation collection and
+   * newest-generation checks can still suppress delivery; only an eligible
+   * current uncollected run is noticed.
    */
   settledNoticeConsumed: boolean;
 }
@@ -119,7 +120,7 @@ export class SubagentRegistry {
    * on resume (same agent ID). New IDs also (re)bind the name index; a resume of
    * an already-known ID leaves the name binding untouched (it is the SAME agent,
    * not a name collision). Every call flips the record to `running`, re-attaches
-   * the live session handle, and RE-ARMS the settled notice (t05).
+   * the live session handle, and RE-ARMS the settled notice.
    */
   register(input: RegisterInput): SubagentRegistryRecord {
     const existing = this.records.get(input.agentId);
@@ -171,11 +172,11 @@ export class SubagentRegistry {
   /**
    * Mark a dispatch settled: drop the live session handle (it is disposed) and
    * flip the state, keeping name/ID/state/transcript-path + everything resume
-   * needs. The agent-level notice gate stays unconsumed; F21 may still suppress
-   * a notice after terminal collection or newest-generation supersession.
-   * `settled.outcome`/`settled.usage` (t06) record the run's fate and per-
-   * subagent usage for the /usage control command; each is stored only when
-   * provided, so a settle that couldn't classify leaves the prior value intact.
+   * needs. The agent-level notice gate stays unconsumed; the background-task
+   * registry may still suppress a notice after terminal collection or
+   * newest-generation supersession. `settled.outcome`/`settled.usage` are each
+   * stored only when provided, so a settle that couldn't classify leaves the
+   * prior value intact.
    */
   markSettled(
     agentId: string,
@@ -212,20 +213,20 @@ export class SubagentRegistry {
   }
 
   /**
-   * Every dispatch record in registration order (t06): the /usage control
-   * command iterates this to report each subagent's id, name, outcome, usage,
-   * and transcript path, plus a session total.
+   * Every dispatch record in registration order — the /usage control command
+   * iterates this to report each subagent's id, name, outcome, usage, and
+   * transcript path, plus a session total.
    */
   list(): SubagentRegistryRecord[] {
     return [...this.records.values()];
   }
 
   /**
-   * t05 PEEK (FIX 1): is the agent-level readiness gate armed for this ID?
-   * Returns true iff the record is settled and its gate is unconsumed, WITHOUT
-   * flipping it. The task registry separately checks F21 collection/current-
-   * generation eligibility. A delivery throw keeps an otherwise eligible notice
-   * armed for the next drain. Pure — no mutation.
+   * PEEK: is the agent-level readiness gate armed for this ID? Returns true iff
+   * the record is settled and its gate is unconsumed, WITHOUT flipping it. The
+   * background-task registry separately checks collection/current-generation
+   * eligibility. A delivery throw keeps an otherwise eligible notice armed for
+   * the next drain. Pure — no mutation.
    */
   isSettledNoticeArmed(agentId: string): boolean {
     const record = this.records.get(agentId);
@@ -233,7 +234,7 @@ export class SubagentRegistry {
   }
 
   /**
-   * t05 agent-level hand-off: consume readiness once for the eligible current
+   * Agent-level hand-off: consume readiness once for the eligible current
    * settlement selected by the background-task registry. Returns true on the
    * first eligible hand-off after arming and false thereafter; terminal
    * collection/newest-generation filtering happens before this gate.
@@ -247,8 +248,8 @@ export class SubagentRegistry {
 
   /**
    * Resolve a model-supplied `to` (agent ID or name) to a registry record.
-   * SECURITY (MUST-FIX #2): registry-only — pure Map lookups, never the
-   * filesystem. Refuses unknown addresses and name collisions (name integrity)
+   * SECURITY: registry-only — pure Map lookups, never the filesystem.
+   * Refuses unknown addresses and name collisions (name integrity)
    * with precise messages; an ID always disambiguates.
    */
   resolve(to: string): ResolveResult {

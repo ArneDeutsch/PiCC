@@ -7,7 +7,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { createGrepTool } from "../src/runtime/tools/search-tools.js";
 
 /**
- * Ripgrep-engine coverage (plan §4.8): runs the same queries through the real
+ * Ripgrep-engine coverage: runs the same queries through the real
  * `rg` binary and the pure-JS fallback and asserts entry-for-entry parity —
  * same files found, same output shape. Skipped when rg is not on PATH.
  */

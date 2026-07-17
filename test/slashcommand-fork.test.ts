@@ -13,7 +13,7 @@ import {
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 
 /**
- * F11 — the SlashCommand tool's dispatch-bound behaviors that the offline
+ * The SlashCommand tool's dispatch-bound behaviors that the offline
  * integration layer cannot reach (its subagentRuntime would load the real SDK):
  * a `context: fork` skill invoked through SlashCommand forks and returns the
  * forked result, and a subagent GRANTED SlashCommand gets a working instance
@@ -69,7 +69,7 @@ afterAll(() => {
   cleanupFixture(dir);
 });
 
-describe("SlashCommand context:fork dispatch (F11)", () => {
+describe("SlashCommand context:fork dispatch", () => {
   it("forks a context:fork skill and returns the forked final message", async () => {
     const slash = pi.tools.get("SlashCommand");
     const res = await slash.execute("f1", { command: "/fork-research the WASM ABI" });
@@ -81,9 +81,9 @@ describe("SlashCommand context:fork dispatch (F11)", () => {
   it("grants a working instance to a subagent that carries its dispatch depth", async () => {
     const agentTool = pi.tools.get("Agent");
     // future-agent inherits ALL tools (no `tools:` frontmatter) → it is granted
-    // SlashCommand. This exercises the allKnownToolNames MUST-FIX + the subagent
+    // SlashCommand. This exercises the allKnownToolNames wiring + the subagent
     // grant block: without either, the subagent could never receive the tool.
-    // F15: pin run_in_background: false so the dispatch runs foreground — this
+    // Pin run_in_background: false so the dispatch runs foreground — this
     // test reads the foreground `outcome` detail and inspects the synchronously
     // created subagent session; background-vs-foreground is incidental here.
     const res = await agentTool.execute("a1", {

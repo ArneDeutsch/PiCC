@@ -34,7 +34,7 @@ describe.skipIf(cliMissing)(
       );
     }
 
-    // --- Scenario 11 (E2E-2): run_in_background + TaskOutput retrieval (audit E4) ---
+    // --- Scenario: run_in_background + TaskOutput retrieval ---
     it(
       "runs a background subagent and retrieves its verbatim result via TaskOutput",
       async () => {
@@ -96,7 +96,7 @@ describe.skipIf(cliMissing)(
           fixture: "full-surface",
           script: [
             // 0) orchestrator dispatches the worktree-isolated agent synchronously
-            //    (F15: pin run_in_background: false — this scenario tests worktree
+            //    (pin run_in_background: false — this scenario tests worktree
             //    isolation, foreground is incidental).
             {
               toolCalls: [
@@ -148,7 +148,7 @@ describe.skipIf(cliMissing)(
       TEST_TIMEOUT_MS,
     );
 
-    // --- Scenario t01: a subagent dying on a terminal API error surfaces as a NAMED failure ---
+    // --- Scenario: a subagent dying on a terminal API error surfaces as a NAMED failure ---
     it(
       "reports a subagent killed by a sticky API error as a named failure — never an empty success",
       async () => {
@@ -156,14 +156,14 @@ describe.skipIf(cliMissing)(
         // every one of ITS requests — including any Pi auto-retries — hits the
         // same sticky 429. The insufficient_quota message is non-retryable for
         // Pi (pi-ai utils/retry.js), mirroring the drained-limit incident that
-        // motivated t01, so the child dies on its first request.
+        // motivated this suite, so the child dies on its first request.
         const isExplore = (r: CapturedRequest) =>
           systemText(r).includes("read-only exploration agent");
         const isParent = (r: CapturedRequest) => !isExplore(r);
         const result = await runPi({
           script: [
             // 0) parent dispatches the Explore subagent synchronously (first request
-            //    is the parent). F15: pin run_in_background: false — this scenario
+            //    is the parent). Pin run_in_background: false — this scenario
             //    tests the inline named-failure surface, foreground is incidental.
             {
               when: isParent,
@@ -206,7 +206,7 @@ describe.skipIf(cliMissing)(
       TEST_TIMEOUT_MS,
     );
 
-    // --- Scenario t02: persisted subagent transcript + model-visible agent ID (real stack) ---
+    // --- Scenario: persisted subagent transcript + model-visible agent ID (real stack) ---
     it(
       "persists the subagent transcript next to the main session and delivers the agent ID trailer to the parent",
       async () => {
@@ -217,7 +217,7 @@ describe.skipIf(cliMissing)(
           systemText(r).includes("You are a general-purpose agent");
         const isParent = (r: CapturedRequest) => !isChild(r);
         const result = await runPi({
-          persistSession: true, // NOT --no-session: the main session file must exist (t02)
+          persistSession: true, // NOT --no-session: the main session file must exist
           script: [
             {
               when: isParent,
@@ -227,7 +227,7 @@ describe.skipIf(cliMissing)(
                   args: {
                     subagent_type: "general-purpose",
                     prompt: "summarize the project",
-                    // F15: pin run_in_background: false — this scenario tests the
+                    // Pin run_in_background: false — this scenario tests the
                     // inline agent-ID trailer delivery, foreground is incidental.
                     run_in_background: false,
                   },

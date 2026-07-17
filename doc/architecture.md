@@ -1,10 +1,15 @@
 # PiCC architecture
 
-A contributor's map of how PiCC runs a Claude Code project on a GPT/Codex model. It is
-factual and cites file paths; for *what* and *why* see [`doc/picc-plan.md`](picc-plan.md),
-and for the exact Pi API contracts see [`doc/design/pi-integration.md`](design/pi-integration.md).
+A map of how PiCC runs a Claude Code project on a GPT/Codex model: the layers, what each folder is
+responsible for, the seams between them, and where new functionality belongs. It is a map, not the
+territory — for how a module actually behaves, read the module and its tests.
 
-## 1. Layered design
+For the principles a change must honor see the guiding principles in
+[`CONTRIBUTING.md`](../CONTRIBUTING.md); for the exact Pi API contracts see
+[`doc/pi-integration.md`](pi-integration.md); for the test layout and which layer a new test belongs
+in see [`doc/testing.md`](testing.md).
+
+## Layered design
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -28,392 +33,378 @@ and for the exact Pi API contracts see [`doc/design/pi-integration.md`](design/p
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-PiCC is **not a fork** of Pi (design §Q1): Pi is an ordinary npm dependency
-(`@earendil-works/pi-coding-agent`, `-agent-core`, `-ai`, all pinned `0.80.x`), and PiCC
-attaches as a single extension whose entry is `src/index.ts`. Pi supplies everything model- and
-UI-related; PiCC supplies Claude Code compatibility and never reimplements auth, the provider
-layer, or the TUI (design §3.6).
+### The Pi ⇄ PiCC boundary
 
-## 2. Module map (`src/`)
+PiCC is **not a fork** of Pi. Pi is an ordinary npm dependency, and PiCC attaches as a single
+extension whose entry is `src/index.ts`; the pinned packages and versions are recorded in
+[`doc/pi-integration.md`](pi-integration.md). Pi supplies everything model- and UI-related; PiCC
+supplies Claude Code compatibility and **never** reimplements auth, the provider layer, or the TUI
+shell. A change that would duplicate a Pi responsibility inside `src/` is the wrong change — extend
+the seam instead.
+
+The carve-out: PiCC does render **its own** tool rows, built on Pi's `pi-tui` primitives — that is
+what `tool-shell.ts` and `subagent-render.ts` are. Rendering a surface PiCC owns is in scope;
+owning the shell it renders into is not.
+
+### The PiCC ⇄ Claude Code boundary: compatible-but-independent
+
+The two harnesses meet at the **filesystem and git level only**, and deliberately nowhere else. A
+worktree or git history produced by one is clean and usable by the other; a user can switch
+providers at will on one project and run **parallel sessions on different worktrees under different
+models**. They do **not** exchange live session state, and there is **no mid-flight handoff** of a
+live worktree or session between them.
+
+This is why PiCC state lives outside the project or in the gitignored, harness-owned
+`.claude/.picc/`, and why compatibility work targets artifacts on disk rather than any shared
+runtime protocol. Anything that would require the two harnesses to agree at runtime is out of scope
+by construction.
+
+## Module map (`src/`)
+
+Each folder below gets its responsibility, its load-bearing invariant, and a placement line. The
+detail of any individual file lives in the file.
+
+### The `engine` ⇄ `runtime` ⇄ `guard` seam
+
+Stated once, because it decides most placement questions:
+
+- **`engine/` is deterministic and session-free.** It answers questions (does this rule match? what
+  did this hook decide?) from plain inputs. It knows nothing about Pi, sessions, or cwd, and it
+  never throws.
+- **`runtime/` owns live session state.** It wires the parsed project model into a Pi session and
+  holds everything mutable — cwd, dispatch registries, worktrees.
+- **`guard.ts` is the single enforcement seam between them.** It is where an engine decision is
+  applied to a real tool call. Enforcement is therefore uniform across the main session and every
+  subagent, because both install the same guard extension.
+
+**Placement:** a new enforcement *primitive* (a matcher, a decision rule) lands in `engine/`; the
+*application* of it to a tool call lands in `guard.ts`; live state lands in `runtime/`. Do not
+enforce from a tool implementation — a check that lives in one tool is a check every other tool
+lacks.
 
 ### `discovery/` — where artifacts live, and precedence
-- `locations.ts` — resolves the repo root and the artifact directories across scopes (user
-  `~/.claude/`, project `.claude/`, local, managed), with the monorepo walk-up (cwd → root,
-  nearest wins) (plan §3).
-- `settings.ts` — reads and merges the `settings.json` hierarchy in ascending precedence
-  (user → project → local → managed), splitting recognized-but-deferred keys and unknown keys out
-  for the compatibility report (plan §5).
+
+Resolves the repo root, the Claude artifact directories, and the `settings.json` hierarchy. Two
+hierarchies, and they are not the same set:
+
+- **Artifact directories** span **managed, project, and user** — plus the monorepo walk-up, where
+  every `.claude/` from cwd up to the repo root contributes. There is no `local` artifact scope.
+- **Settings** additionally have a **`local` scope** (`settings.local.json`), which is settings-only
+  and merges in ascending precedence.
+
+**Two precedence orderings, deliberately opposite — this is the folder's trap:**
+
+- **Named artifacts (skills, agents, commands): the nearest wins.** Candidates are ordered
+  managed → project (nearest-first) → user, and a first-wins dedupe by name keeps the closest
+  definition.
+- **Rules: the reverse — ascending priority, managed last.** Rules are guidance *text*, not
+  name-deduped artifacts, so precedence cannot be expressed by "who wins the name". It is expressed
+  by *position in the prompt*: user first, then project root→cwd, then managed, so the
+  highest-precedence text lands closest to the end and wins on conflicts.
+
+"Nearest wins" is therefore an invariant of the artifact loaders, not of the folder. Keys that are
+recognized-but-deferred and keys that are unknown are split out for the compatibility report rather
+than dropped.
+
+**Placement:** new scopes, precedence rules, or settings-shape handling. Nothing that interprets an
+artifact's *content*.
 
 ### `claude/` — parse each artifact format (loaders only, no runtime)
-- `skills.ts` — `.claude/skills/**/SKILL.md` + `.claude/commands/**/*.md` (recursive; a nested
-  entry whose name collides is qualified as `sub:name`). Parses **frontmatter only**; the body is
-  never stored on the returned object (`body: undefined`) — progressive disclosure is a hard NFR
-  (plan §12.1). `loadSkillBody` re-reads on activation. Also renders the budgeted startup skill
-  listing (per-entry cap 1536 chars, tiered degradation down to names-only — a skill is never
-  omitted) and hosts argument substitution (`$ARGUMENTS`, 0-based `$N`, named, `\$` escaping).
-- `agents.ts` — `.claude/agents/*.md` into `ClaudeAgent` records, plus `builtinAgents()` — the
-  built-in `general-purpose`/`Explore`/`Plan` types (project agents with the same name override;
-  `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` removes Explore/Plan); renders the description-driven
-  routing catalog injected into the orchestrator context.
-- `rules.ts` — `.claude/rules/**/*.md`; files without `paths:` load unconditionally, files with
-  `paths:` inject on matching-file access (plan §4.2).
-- `claude-md.ts` — CLAUDE.md hierarchy: `@import` expansion (recursive, hop-limited, code-span
-  aware — also the `@AGENTS.md` bridge), session-start collection (managed-policy CLAUDE.md and
-  the inline `claudeMd` settings key first, then user, then every ancestor from the **filesystem
-  root** down to cwd with `CLAUDE.local.md` siblings), and `findNestedClaudeMd` for
-  nearest-ancestor injection on file touch (plan §4.6).
-- `memory.ts` — the memory read side: `loadAutoMemory` (per-project `MEMORY.md` under
-  `<userDir>/projects/<flattened-path>/memory`, first 200 lines / 25 KB, gated by
-  `autoMemoryEnabled`/`autoMemoryDirectory`/`CLAUDE_CODE_DISABLE_AUTO_MEMORY`) and
-  `loadAgentMemory` for the agent `memory: user|project|local` frontmatter scopes.
-- `hooks.ts` — normalizes the settings `hooks` value into `HookConfig`; keeps unknown event names
-  and non-command handler types (they degrade, never throw).
-- `plugins.ts` — discovers already-installed plugins under `<userDir>/plugins` and a project
-  `.claude-plugin/`, folding their content into the same registries. Installation/marketplace
-  machinery is explicitly out of scope (plan §4.9).
 
-`project.ts` orchestrates all loaders into one `LoadedProject` (settings, skills, agents, rules,
-CLAUDE.md, plugins, merged hooks). A broken project must never crash the harness — `src/index.ts`
-catches load failure and returns quietly (completeness floor, plan §2.2).
+One loader per Claude artifact format — skills and commands, agents, rules, the CLAUDE.md hierarchy
+with `@import` expansion, memory, hooks config, and installed-plugin content. `src/project.ts` — at
+the source root, *above* the loaders, importing both `discovery/` and `claude/` — orchestrates them
+into one loaded project model. It sits outside this folder precisely because it depends on both:
+a loader knows one format and nothing else.
+
+Invariants across the folder:
+
+- **Loaders never throw.** Malformed input degrades to an empty value plus a diagnostic. A broken
+  project must never crash the harness: `src/index.ts` catches load failure and returns quietly.
+- **Progressive disclosure is a hard requirement, not an optimization.** Skill frontmatter is
+  parsed; the body is **never** stored on the returned object and is re-read only on activation. A
+  change that eagerly holds bodies defeats the whole design.
+- **The startup skill listing degrades tier by tier, but never omits a skill.** A budget may shrink
+  an entry to its name; it may not make a skill invisible.
+- Plugin **content** is folded into the same registries. Installation and marketplace machinery are
+  out of scope.
+
+**Placement:** a new artifact format, or a change to how an existing one parses. No session
+awareness, no I/O beyond reading the artifact.
 
 ### `engine/` — the deterministic enforcement primitives
-- `permissions.ts` — the permission-matcher grammar (`Bash(git *)`, `Read/Edit(glob)`,
+
+- **`permissions.ts`** — the permission-matcher grammar (`Bash(git *)`, `Read/Edit(glob)`,
   `WebFetch(domain:*)`, `Agent(type)`, `Skill(name)`, `mcp__server__tool`) and the `deny` engine.
-  The grammar is fully implemented even though `allow`/`ask` are a no-op, because three subsystems
-  reuse it: `deny` enforcement, `tools:` gating, and hook `if:` conditions. Matching is
-  **shell-operator aware** — `git status && rm -rf /` does not match `Bash(git *)`. Space-before-`*`
-  is a word boundary (`Bash(git *)` matches bare `git` too, never `github`), and file-rule paths
-  are normalized to POSIX form on Windows (`C:\Users` ↔ `//c/**`, case-insensitive). Never throws.
-- `hook-runner.ts` — spawns `type: command` hooks via `node:child_process.spawn`, delivers the
-  Claude Code JSON payload on **stdin** (incl. `permission_mode`, `transcript_path`,
-  `tool_use_id`, `last_assistant_message`, structured `tool_response`), and aggregates the
-  exit-code / stdout-JSON contract (exit 2 = block; `permissionDecision`; `additionalContext`;
-  `updatedInput`; `systemMessage`/`suppressOutput`) into a `HookOutcome`. Matching handlers run
-  in **parallel** with identical-command dedup and most-restrictive merge; `async: true` handlers
-  are fire-and-forget; matchers follow Claude semantics (exact names / `|`,`,` alternation /
-  unanchored regex). `fire()` never throws.
-- `shell-inject.ts` — preprocesses skill bodies: inline `` !`cmd` `` and `` ```! `` fenced blocks are
-  replaced with command stdout before the model sees the content, honoring `shell:` (bash default /
-  powershell) and `disableSkillShellExecution`. Also hosts `resolveGitBashPath()` (see §4).
+  Matching is **shell-operator aware**, paths are normalized to POSIX form on Windows, and it never
+  throws.
+- **`hook-runner.ts`** — spawns `type: command` hooks, delivers the Claude Code JSON payload on
+  stdin, and aggregates the exit-code / stdout-JSON contract into a single `HookOutcome`. Matching
+  handlers run in parallel and merge **most-restrictive-wins**; `fire()` never throws.
+- **`shell-inject.ts`** — preprocesses skill bodies, replacing inline and fenced `!` command blocks
+  with command stdout before the model sees the content. Also resolves the Git Bash path (see *Git
+  Bash is pinned on Windows*).
+
+#### Security & permission posture (deliberately partial, by design)
+
+PiCC does **not** reimplement Claude Code's full interactive security model. Two reasons, and both
+are load-bearing:
+
+- Part of that model — **auto-mode** — is a **server-side classifier we cannot match**. Imitating it
+  would mean inventing a different classifier and calling it parity.
+- Interactive per-command approval is **fragile**: a user cannot reliably interpret a complex
+  command and tends to allow-by-default anyway, so the prompt buys ceremony rather than safety.
+
+The resulting posture:
+
+- **Default permissive** (auto-mode-like) — the workflow is not blocked and the user is not prompted
+  per command.
+- **`deny` is honored as a hard, non-interactive block.** It is the one deterministic, useful part
+  of the permission model, and it is kept as a real safety valve.
+- **`tools:` capability gating is fully honored, and is the primary control.** "These agents may
+  search the web, those may not" is just tool possession — deterministic, and nothing to classify.
+- **`allow` / `ask` rules, permission modes, and auto-mode are a graceful no-op** — parsed and
+  reported, not enforced.
+
+**The matcher grammar is nevertheless fully implemented**, because three subsystems reuse it: `deny`
+enforcement, `tools:` gating, and hook `if:` conditions. It is not dead code kept for a someday
+`allow`.
+
+**Placement:** a new matcher, decision rule, or hook-contract field. Anything needing a session,
+cwd, or Pi object does not belong here.
 
 ### `runtime/` — wiring the parsed model into a live Pi session
-- `context-assembly.ts` — builds the system-prompt suffix appended every turn in
-  `before_agent_start`: the Claude-compat conventions block, a **main-session-only** `## Working
-  with the user` interaction posture (#69; gated by `includeInteractionPosture`, so dispatched
-  subagents omit it), root CLAUDE.md, auto memory, unconditional rules, budgeted skill listing,
-  agent catalog, rendered active-skill bodies, steering text, and — when a per-session scratch dir
-  was created — a `buildScratchpadSection` block naming the native-safe scratchpad path and steering
-  temp files there instead of `/tmp` (#48; the Windows namespace note is gated on
-  `windowsTempNote`). Because the system prompt is rebuilt each turn and never compacted away,
-  **this is also the primary compaction-preservation mechanism** (plan §9).
-- `subagents.ts` — `SubagentRuntime`: spawns a fresh in-memory Pi session per dispatch (agent body
-  as system prompt + CLAUDE.md/rules, **not** the parent conversation — *except* a
-  `subagent_type: "fork"` dispatch, which inherits the parent conversation via
-  `SessionManager.forkFrom` (F16, main-session only, env-gated by `CLAUDE_CODE_FORK_SUBAGENT`); the
-  built-in Explore/Plan types skip the project context), fans out under a concurrency cap, applies per-agent
-  `tools:`/`model`/`effort` (with `CLAUDE_CODE_SUBAGENT_MODEL` as the highest-priority model
-  override), enforces the depth cap (default `1` = **main-session-only**; raise
-  `subagents.maxDepth` to 2..5 to opt into nesting), runs agent-scoped `hooks:`, supports
-  `isolation: worktree`, `run_in_background`, and `background: true` frontmatter, and returns the
-  subagent's final message **verbatim** for a non-resumable/one-shot dispatch; a
-  **resumable** dispatch additionally appends a clearly-delimited in-band identity/resume trailer to
-  the model-visible text (Claude-faithful; the human TUI strips it), so a skill parsing a locked YAML
-  block from the message must use a one-shot dispatch or account for the trailer (plan §4.3). It also
-  classifies every dispatch outcome (see *Subagent error contract* in §4),
-  mints a stable **agent id**, persists a **transcript** discoverable next to the main session's,
-  streams **live progress** to the UI via `subagent-progress.ts`, captures **per-subagent usage**,
-  and — through `subagent-registry.ts` — backs the `SendMessage` resume/steer channel (F02).
-- `subagent-registry.ts` — the process-lifetime dispatch registry (agent-id keyed, name→id index
-  with rebinding detection): records every dispatch's transcript path, resumability, outcome, and
-  usage so `SendMessage` can resolve an address registry-only and the `/usage` command can report a
-  per-subagent breakdown.
-- `subagent-progress.ts` — `SubagentProgressCondenser`: a bounded, sanitized rolling tail of a
-  running subagent's tool/assistant activity (incl. silent API-retry waits), plus the shared
-  display formatters (`sanitizeLine`, `formatUsageCompact`).
-- `subagent-transcripts.ts` (in `util/`) — agent-id mint/validate, the `<base>.subagents/` dir
-  derivation + resolver, and the agent-id result trailer.
-- `background-tasks.ts` — `BackgroundTaskRegistry` plus the real `TaskOutput`/`TaskStop` tools:
-  a dispatch registers the un-awaited run under a task id **by default** (`run_in_background: false`
-  opts back into a blocking foreground run); `TaskOutput` waits/polls for the result (a failed task
-  reports its cause, never an empty success), `TaskStop` requests a cooperative abort
-  (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces every dispatch to the foreground). An eligible
-  uncollected current background task is **pushed** once to the coordinator at its next turn as a
-  bounded, untrusted-framed notice. A running `TaskOutput` poll preserves eligibility; successfully
-  returning a terminal record atomically counts as delivery and invalidates a not-yet-sent notice.
-  Retrieval after a delivered notice remains available and does not re-arm it. Resume generations
-  keep the existing newest-generation-wins supersession rule.
-  Subagent `TaskOutput`/`TaskStop` are **scoped to the dispatcher's own tasks** (via
-  `registry.scopedTo(ownerId)`, F13); the coordinator retains full session-wide reach.
-- `background-identity.ts` — shared validated and bounded background identity formatter, with fixed
-  fallbacks for invalid task ids, agent ids, and display types.
-- `worktrees.ts` — `WorktreeManager` for `EnterWorktree`/`ExitWorktree`: creates
-  `.claude/worktrees/<flat>/` on `worktree-<flat>` off a base ref resolved to a concrete SHA
-  *before* creation, seeds `.worktreeinclude` files, and does Windows-tolerant removal (best-effort,
-  reap orphans later, `core.longpaths`). Public methods never throw.
-- `cwd-state.ts` — `CwdState`: the single mutable source of truth for the effective cwd. Pi has no
-  session-cwd API, so every tool resolves its cwd through `get()` at execute time; `EnterWorktree`
-  swaps it, `ExitWorktree` restores (plan §4.4 — load-bearing).
-- `guard.ts` — `createGuardExtension`: the inline Pi extension shared by the main session and every
-  subagent. On Pi's tool events it applies deny rules (hard block), PreToolUse hooks
-  (block / `updatedInput` / `additionalContext`), PostToolUse / PostToolUseFailure hooks, and
-  on-touch context injection (nested CLAUDE.md, path-scoped rules/skills).
-- `tool-map.ts` — the Claude ⇄ Pi tool-name mapping (`Read↔read`, `Glob↔find/ls`, …). The
-  permission/hook/gating layer operates on Claude names; Pi tool names are translated back before
-  matching. Unknown names stay verbatim and match string-identically.
-- `skill-activation.ts` — the activation pipeline: lazy body load → argument substitution
-  (`$ARGUMENTS`, `$N`, named) → `${CLAUDE_*}` variable substitution → `!`-injection. Shared by the
-  `Skill` tool, slash commands, and `context: fork` dispatch.
-- `steering.ts` — loads the project-external `PiCCConfig` (`~/.picc/config.json` or the
-  gitignored `.claude/.picc/config.json`); provides per-model steering text and the
-  effort→thinking-level mapping (plan §10, §13.2).
-- `tools/` — the registered Claude-named tools: `web-tools.ts` (`WebFetch`/`WebSearch`, real),
-  `search-tools.ts` (`Grep`/`Glob`), `multi-edit.ts` (`MultiEdit` — a real, atomic, sequential
-  exact-string multi-edit of one file: edits apply to a running buffer, per-edit `replace_all`, and
-  any miss rejects the whole batch leaving the file untouched), `notebook-tools.ts` (`NotebookRead`,
-  real — parses a `.ipynb` cell by cell into source + outputs), `task-tools.ts` (`Task*` tracking),
-  `worktree-tools.ts` (`EnterWorktree`/`ExitWorktree`), and `degrade-stubs.ts` (names that resolve
-  for gating but no-op with a notice — `NotebookEdit`, `LSP`, `AskUserQuestion`, `ExitPlanMode`, …).
-  `MultiEdit` routes through the same permission/hook/path-injection machinery as `Edit`, and an
-  `Edit(…)` permission rule already gates it (the file-edit family); note that it graduated from a
-  degraded no-op to a *real writer*, so a project can no longer rely on MultiEdit degrading to a
-  no-op as an implicit safety net — its `Edit`/`MultiEdit` deny rules are what hold.
-  Symmetrically, a `Read(…)` permission rule gates the file-**read** family: it expands one-directionally
-  across `Grep`, `Glob`, and `NotebookRead` on a matching path (`Grep`/`Glob` are documented Claude
-  best-effort parity, `NotebookRead` is inferred defense-in-depth), while a `Grep(…)`/`Glob(…)` rule
-  does **not** gate `Read` — the same one-directional shape as `Write` not gating `Edit`. There is one
-  further cross that runs the *other* way: a path-scoped `deny: Read(<glob>)` also blocks `Edit`/`MultiEdit`
-  (not `Write`/`NotebookEdit`) on a matching path, mirroring Claude Code v2.1.208 (denying reads of a
-  path also prevents clobbering or recreating it via `Edit`). Unlike the read/edit family expansions
-  above — which are polarity-agnostic and therefore surface in allow, ask, and hook `if:` matching too —
-  this Read→Edit/MultiEdit cross is **deny-direction only** and path-scoped: it lives in a guarded clause
-  in `matchesRule`, not in `ruleToolMatches`/`FILE_READ_TOOLS`/`gateTools`, so `allow: Read` never grants
-  `Edit` and a bare `deny: Read` neither blocks nor strips `Edit`.
+
+Clustered by responsibility, not by file — this is where new files land, and a named entry point is
+where to start reading, not the extent of its cluster.
+
+- **Context assembly** (`context-assembly.ts`) — assembles the instruction set into the system-prompt
+  suffix. Rebuilt every turn, the suffix is never compacted away: **this is the primary
+  compaction-preservation mechanism**. Its interaction-posture block is main-session-only — a
+  dispatched subagent returns a report, and has no user to converse with.
+
+- **Subagent dispatch** (`subagents.ts`, plus the registry, progress/render, and background-task
+  modules beside it) — one story: spawn a **fresh-context** session per dispatch, gate it per agent,
+  classify every outcome (see *Subagent error contract*), observe it, resume it. Its invariants:
+  **nesting is off by default** — a dispatched subagent receives neither `Agent` nor `Task` and its
+  prompt omits the agent catalog; raising `subagents.maxDepth` opts in. The one exception to fresh
+  context is a `subagent_type: "fork"` dispatch, which inherits the parent conversation; every case
+  that *cannot* inherit degrades to fresh context **visibly**. An address resolves **registry-only**
+  — a process-lifetime, agent-id-keyed registry holds each dispatch's transcript, resumability,
+  outcome, and usage. A subagent's `TaskOutput`/`TaskStop` reach **only its own dispatched tasks**,
+  while the coordinator keeps session-wide reach and collects uncollected ones via a bounded,
+  untrusted-framed notice. Everything model-visible is bounded and sanitized first.
+
+- **Session state** (`cwd-state.ts`, `worktrees.ts`) — `CwdState` is **the single mutable source of
+  truth for the effective cwd**; every tool resolves through it at execute time (see *The cwd swap is
+  load-bearing*). `WorktreeManager` resolves a base ref to a concrete SHA **before** creating the
+  worktree, removes Windows-tolerantly (best-effort, orphans reaped later), and never throws from a
+  public method.
+
+- **Enforcement wiring** (`guard.ts`, `tool-map.ts`) — the guard applies engine decisions to real
+  tool calls: deny rules, hooks, on-touch context injection. Main session and every subagent install
+  the same one, which is what makes it **the one shared enforcement seam**. Those layers all match on
+  **Claude** names, so Pi names are translated back first; unknown names stay verbatim.
+
+- **Skill activation** (`skill-activation.ts`) — the one pipeline (lazy body load → substitution →
+  `!`-injection) behind the `Skill` tool, slash commands, and `context: fork` dispatch.
+
+- **Steering** (`steering.ts`) — per-model steering text and the effort→thinking-level mapping, read
+  from a config **outside the project** — outside **because harness state must not touch the target
+  project**.
+
+- **Tool-row rendering** (`tool-shell.ts`) — the single self-shell seam, PiCC's side of the carve-out
+  in *The Pi ⇄ PiCC boundary*.
+
+- **`tools/`** — the **self-contained** Claude-named tools, and the degrade stubs: names that resolve
+  for gating but no-op with a notice. A tool that fronts a runtime subsystem lives with that
+  subsystem.
+
+#### Tool gating expands one-directionally
+
+Two invariants that are easy to get backwards when adding a tool:
+
+- A `Read(…)` rule expands across the file-**read** family (`Grep`, `Glob`, `NotebookRead`) on a
+  matching path, and an `Edit(…)` rule across the file-**edit** family (including `MultiEdit`). The
+  expansion does **not** run back the other way: a `Grep(…)` rule does not gate `Read`, just as
+  `Write` does not gate `Edit`.
+- One cross runs the *other* way, and only in the deny direction: a path-scoped `deny: Read(<glob>)`
+  also blocks `Edit`/`MultiEdit` on that path, mirroring Claude Code 2.1.208 (denying reads of a path
+  also prevents clobbering or recreating it). Being deny-only is the point — `allow: Read` must never
+  grant `Edit`.
+
+`MultiEdit` is a **real writer**, so a project cannot treat it as a degraded no-op safety net; its
+`Edit`/`MultiEdit` deny rules are what hold.
+
+**Placement:** anything holding live session state or touching a Pi object. For a new Claude-named
+tool the rule is about *coupling*, not about the name: a **self-contained** tool goes in `tools/`;
+a tool that is the **surface of a runtime subsystem lives with that subsystem**, because it needs
+that subsystem's state and a `tools/` file would only re-export it (`Agent`/`Task`/`SendMessage`
+ship from `subagents.ts`, `TaskOutput`/`TaskStop` from `background-tasks.ts`). Either way it must
+route through the same permission/hook/injection machinery as its siblings — a tool that reaches the
+filesystem outside the guard is a hole.
 
 ### `registry/` — the single source of truth for "what's supported"
-- `capability-registry.ts` — `CAPABILITY_REGISTRY: CapabilityEntry[]` and `CLAUDE_BASELINE`. Every
-  known tool, hook event, setting, frontmatter field, and feature with a tier
-  (`full | partial | degraded-noop | not-supported | na`), an optional `safetyRelevant` flag, and a
-  one-line note. `capabilityForToolName()` synthesizes a `not-supported` entry for anything
-  unassessed, so unknown names still resolve for gating (plan §2.4, §17).
-- `compat-report.ts` — scans the loaded project against the registry, splits safety-relevant from
-  functionality findings, and renders the one-per-session startup notice and the `/doctor` report.
-  Because both are generated from the registry, docs and behavior cannot drift.
 
-`doc/supported-features.md` is generated from this registry by
-[`scripts/gen-capability-matrix.mjs`](../scripts/gen-capability-matrix.mjs).
+`capability-registry.ts` holds every known tool, hook event, setting, frontmatter field, and feature
+with a support tier, an optional `safetyRelevant` flag, and a one-line note. Anything unassessed
+synthesizes a `not-supported` entry, so **unknown names still resolve for gating**.
+`compat-report.ts` scans the loaded project against the registry and renders the startup notice and
+the `/doctor` report. Because both the report and
+[`doc/supported-features.md`](supported-features.md) are generated from the registry (by
+[`scripts/gen-capability-matrix.mjs`](../scripts/gen-capability-matrix.mjs)), docs and behavior
+cannot drift.
+
+**Placement:** every support claim, and the evidence behind a partial tier. Never restate a tier
+claim in prose — state it here and link. Run `npm run gen:capabilities` after a registry change.
+
+### `types.ts` — the shared vocabulary
+
+The types more than one subsystem speaks, including `Scope` and `SCOPE_PRECEDENCE` — the precedence
+constant the discovery prose above paraphrases. **It is the declaration, not a copy:** a precedence
+question is settled here, not re-encoded per subsystem.
+
+**Placement:** a type crossing subsystem boundaries. A type with one subsystem stays with that
+subsystem — moving it here to be tidy makes every folder depend on every folder's vocabulary.
 
 ### `util/` — shared, dependency-light helpers
-- `fs.ts` — never-throwing filesystem reads, repo-root detection, safe JSON parse.
-- `globs.ts` — the shared gitignore-flavored glob engine used by rules/skills `paths:`,
-  `Read/Edit(glob)` permission rules, `claudeMdExcludes`, and `.worktreeinclude`.
-- `markdown.ts` — frontmatter/body splitting with **lenient YAML** (malformed frontmatter degrades
-  to `frontmatter={}` + a diagnostic, never throws) and HTML-comment stripping.
-- `env.ts` — `unicodeSafeSubprocessEnv` / `applyUnicodeSafeProcessEnv`: force UTF-8 for spawned
-  interpreters so Windows cp1252 (and `LANG=C`) don't `UnicodeEncodeError` on output like `→`. Also
-  hosts `toNativeSafeTempForm(p, platform?)`: a pure helper that converts an absolute path to the
-  forward-slash drive-letter form both the pinned Git Bash and native Node file tools resolve to the
-  same real file on Windows (unchanged on other platforms) — the scratchpad primitive behind the #48
-  fix (see §4).
 
-## 3. Request / turn data flow
+Never-throwing filesystem reads and repo-root detection; the shared gitignore-flavored glob engine
+used by `paths:`, permission globs, `claudeMdExcludes`, and `.worktreeinclude`; frontmatter/body
+splitting with lenient YAML; UTF-8 subprocess env; agent-id minting and transcript-path derivation.
 
-The wiring lives in `src/index.ts`, which registers tools and Pi event handlers:
+**Placement:** a pure helper with more than one consumer and no knowledge of the project model.
+Single-consumer logic stays with its consumer.
 
-1. **Extension load.** `applyUnicodeSafeProcessEnv()`, then `loadClaudeProject()` assembles the
-   project model. `CwdState`, `PermissionEngine`, `WorktreeManager`, `HookRunner` (wrapped in a
-   `HookMultiplexer` so skill-scoped hooks can be added dynamically), and `SubagentRuntime` are
-   constructed. All Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered
-   (§4). The guard extension is installed on tool events. Prompt-template stubs are written for each
-   user-invocable skill so it appears in the `/` palette (§4). An eager per-session native-safe
-   **scratch dir** is also created here (`CLAUDE_CODE_TMPDIR || os.tmpdir()` → `mkdtempSync` →
-   `realpathSync` → `toNativeSafeTempForm`), and its literal path held for injection (#48, §4).
+## Request / turn data flow
 
-2. **`session_start`.** Captures the model registry and active model (→ steering text), applies the
-   config model/effort, self-heals `core.hooksPath` when `.githooks/` exists, fires the
-   `SessionStart` hook (stdout injected as context), and emits the one-per-session compatibility
-   notice unless suppressed.
+The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
 
-3. **`before_agent_start` (every turn).** Appends the `buildSystemPromptSuffix` output to Pi's
-   system prompt. This re-asserts the full instruction set each turn — the primary
-   compaction-preservation path. When the eager scratch dir exists, the suffix carries the
-   per-session **scratchpad section** (its literal native-safe path + "use instead of `/tmp`", plus
-   the Windows namespace note when `shellNamespaceDiffersFromNative()`) (#48, §4).
+1. **Extension load.** The process env is made UTF-8-safe, then `loadClaudeProject()` assembles the
+   project model. `CwdState`, `PermissionEngine`, `WorktreeManager`, `HookRunner` (behind a
+   multiplexer so skill-scoped hooks can be added dynamically), and `SubagentRuntime` are
+   constructed. All Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered,
+   the guard extension is installed on tool events, and prompt-template stubs are written for each
+   user-invocable skill so it appears in the `/` palette. The per-session scratch dir is created
+   eagerly here and its literal path held for injection.
 
-4. **`input`.** In order: intercept PiCC control commands so they never reach the model; fire
-   the `UserPromptSubmit` hook (block or inject context); expand `/skill [args]` slash commands by
-   activating the skill(s) and **transforming the user turn** into the rendered bodies (Claude
-   Code's slash semantics — up to 5 leading `/skill` tokens stack, the trailing text feeding the
-   last skill's arguments; a transform works in every Pi mode, unlike a self-dispatching command).
+   Load is **not** fully synchronous: the cwd-swapping overrides need Pi's SDK, so they register
+   from an async step whose settlement is awaited by a readiness seam rather than by load returning.
+   If that import fails the harness **degrades with a stderr notice** and keeps running on Pi's own
+   built-ins — losing the cwd swap, not the session.
 
-5. **Tool calls → `guard`.** Each tool call is translated to its Claude name, checked against deny
-   rules (hard block), run through PreToolUse hooks (`updatedInput`/`additionalContext`/block), and
-   — on file-touching tools — triggers nested-CLAUDE.md and path-scoped rule/skill injection.
-   PostToolUse / PostToolUseFailure hooks fire on the result.
+2. **`session_start`.** Captures the model registry and active model, applies the configured
+   model/effort, self-heals `core.hooksPath` when `.githooks/` exists, fires the `SessionStart`
+   hook, and emits the one-per-session compatibility notice unless suppressed. Steering text is
+   derived from the active model here and **re-derived on `model_select`**, so a mid-session model
+   switch re-steers — steering follows the model, it is not a startup snapshot.
+
+3. **`before_agent_start` (every turn).** Appends the system-prompt suffix, re-asserting the full
+   instruction set and the scratchpad section each turn.
+
+4. **`input`.** In order: intercept PiCC control commands so they never reach the model; fire the
+   `UserPromptSubmit` hook (block or inject context); expand `/skill [args]` slash commands by
+   activating the skills and **transforming the user turn** into the rendered bodies.
+
+5. **Tool calls → `guard`.** Each call is translated to its Claude name, checked against deny rules,
+   run through PreToolUse hooks, and — on file-touching tools — triggers nested-CLAUDE.md and
+   path-scoped rule/skill injection. PostToolUse / PostToolUseFailure hooks fire on the result.
 
 6. **Subagent dispatch.** The `Agent`/`Task` tool calls `SubagentRuntime.dispatch`, which spawns a
-   fresh Pi session with the gated tool set and returns the final message verbatim (a resumable
-   dispatch appends a clearly-delimited in-band identity/resume trailer to the model-visible text,
-   Claude-faithful) — or a loud, classified failure (see the *Subagent error contract* in §4). One exception to "fresh": a
-   `subagent_type: "fork"` dispatch (F16) **inherits the parent conversation** — a main-session-only,
-   env-gated (`CLAUDE_CODE_FORK_SUBAGENT`) fork seeded from the parent transcript via
-   `SessionManager.forkFrom`, non-resumable, with output isolation still kept; every case that can't
-   inherit (env off, nested dispatcher, no transcript, fork-spawns-fork, SDK can't fork) degrades to
-   fresh context with a visible footer notice. Nested dispatch is **off by default**
-   (main-session-only, `subagents.maxDepth: 1`): a dispatched subagent normally receives neither
-   `Agent` nor `Task` and its prompt omits the subagents catalog, so it does not attempt to nest.
-   A dispatched subagent's prompt also omits the main-session-only `## Working with the user`
-   interaction posture (#69) — it returns a report and has no user to converse with — while the
-   mechanical Claude-compat conventions it needs are unaffected.
-   The nested-dispatch tool-provisioning and the depth guard only engage when an operator raises
-   `subagents.maxDepth` to 2..5; once raised, the same guard runs inside every subagent session. By
-   default the dispatch registers in the
-   `BackgroundTaskRegistry` and returns a task id (`run_in_background: false` runs it inline instead;
-   an agent's `background: true` frontmatter forces background; `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`
-   forces foreground); `TaskOutput`/`TaskStop` manage its lifecycle, and an eligible uncollected
-   current settlement is pushed once at the coordinator's next `before_agent_start` (terminal
-   collection suppresses that pending push; a running poll does not). `SendMessage` (parent-only)
-   resumes a finished subagent by its agent id or steers a running background one.
+   session with the gated tool set and returns either the final message verbatim or a loud,
+   classified failure. Dispatch is background-by-default: the call returns a task id, and
+   `TaskOutput`/`TaskStop` manage the lifecycle. `SendMessage` (parent-only) resumes a finished
+   subagent by agent id or steers a running background one.
 
-7. **`agent_settled` / compaction.** `agent_settled` fires the `Stop` hook (exit 2 re-prompts the
-   agent to continue, capped at 8 consecutive blocks). `session_before_compact`/`session_compact`
-   fire `PreCompact`/`PostCompact` and re-inject active skill bodies for mid-turn continuity under
-   Claude's carryover budgets (~5k tokens per skill / ~25k combined, most-recent-first); the
-   system-prompt suffix already preserves the instruction set.
+7. **`agent_settled` / compaction / shutdown.** `agent_settled` fires the `Stop` hook (exit 2
+   re-prompts the agent, capped to bound a loop). `session_before_compact` / `session_compact` fire
+   `PreCompact`/`PostCompact` and re-inject active skill bodies for mid-turn continuity under
+   Claude's carryover budgets; the system-prompt suffix already preserves the instruction set.
+   `session_shutdown` fires `SessionEnd`, with the shutdown reason as the matcher subject.
 
-## 4. Mechanical-fidelity decisions (load-bearing)
+## Mechanical-fidelity decisions (load-bearing)
 
-These are the choices where "close enough" would break real projects. Each maps to a governing
-principle in the plan (§2.1 mechanical fidelity).
+These are the choices where "close enough" breaks real projects.
 
-- **The cwd swap is load-bearing.** A project's own scripts detect worktree vs. main via standard
-  git plumbing, which only works if *every* subsequent tool call runs inside the worktree
-  directory. Pi has no session-cwd API, so PiCC re-registers the built-in
-  `bash/read/write/edit/grep/find/ls` tools as thin wrappers that rebuild the real tool per call
-  against `CwdState.get()` (`src/index.ts`, `cwd-state.ts`, design §3.1). Subagents get their cwd
-  natively via `createAgentSession({ cwd })`.
+- **The cwd swap is load-bearing.** A project's own scripts detect worktree vs. main via standard git
+  plumbing, which only works if *every* subsequent tool call runs inside the worktree directory. Pi
+  has no session-cwd API, so PiCC re-registers the built-in `bash/read/write/edit/grep/find/ls`
+  tools as thin wrappers that rebuild the real tool per call against `CwdState.get()`. Subagents get
+  their cwd natively via `createAgentSession({ cwd })`.
 
 - **Verbatim subagent return.** A subagent's final message body is returned exactly as produced — no
-  summarizing, no wrapping of the body. A **resumable** dispatch appends a clearly-delimited in-band
-  identity/resume trailer to the model-visible text (Claude-faithful; the human TUI strips it), so a
-  skill parsing the message directly — often a locked-YAML verdict block — must use a one-shot
-  dispatch or account for the trailer (`subagents.ts`, plan §4.3).
+  summarizing, no wrapping. The one addition: a **resumable** dispatch appends a clearly-delimited
+  in-band identity/resume trailer to the model-visible text (Claude-faithful; the human TUI strips
+  it). A skill that parses the message directly — often a locked-YAML verdict block — must therefore
+  use a one-shot dispatch or account for the trailer.
 
-- **Subagent error contract (F02 — the failure class this feature closes).** Every dispatch is
-  classified into exactly one outcome, and the classification — not a normal-looking success — is
-  what reaches the coordinator:
-  - **completed** — the run finished; its verbatim final message is returned (a resumable dispatch
-    appends a clearly-delimited in-band identity/resume trailer to the model-visible text,
-    Claude-faithful).
-  - **failed** — the run ended on a terminal API error (e.g. a drained usage limit). The tool
-    reports a **loud failure naming the cause** (`Agent terminated early due to an API error: …`),
-    never an empty or normal-looking success. This is the exact regression that, before F02,
-    returned an empty success and let a coordinator commit under-reviewed work.
-  - **aborted** — the run was stopped on purpose (Esc/user abort, `TaskStop`). Reported as
-    **aborted**, distinct from a failure; a signal wins on every settle path, and a deliberately
-    stopped background result is discarded.
-  - **Partial-output preservation.** If a failed or turn-capped run produced output before dying,
-    that partial text is preserved and delivered inside an explicit cut-off frame
-    (`\n\n---\n[subagent cut off] …`) rather than dropped. A turn-cap (`length`) truncation also
-    pushes a warning diagnostic — never silent.
-  - **Foreground vs background.** The contract holds on both paths: a foreground dispatch throws
-    the loud error (Pi renders it in its own error box) while a background dispatch lands a
-    `failed`/`stopped` status that `TaskOutput` reports with the same named cause and partial
-    output. A terminal return delivers all output available for that run, including a cut-off
-    result; it is not a promise that another retrieval can recover a continuation. A stopped task
-    retains its outcome but deliberately discards final output, so its uncollected settlement notice
-    is outcome-only. A background failure is **never** shown as completed. Retry behavior stays exactly
-    Pi's own — no extra recovery logic (`subagents.ts`/`background-tasks.ts`, feature.md §1).
-    Note the **default direction now matches Claude**: PiCC dispatches **background-by-default**
-    (Claude 2.1.198), so an implicit-concurrency fan-out parallelizes — each dispatch returns a task
-    id collected via `TaskOutput`; `run_in_background: false` opts into a synchronous inline run and
-    `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces every dispatch foreground. The formerly-headline
-    default-direction gap (F15) is **closed**; the residual divergence that keeps
-    `feature.background-agents` partial includes settlement *timing* — PiCC pushes an eligible
-    uncollected current task's notice to an idle parent on its next turn. Reporter observations
-    anthropics/claude-code#21343 (Claude Code 2.1.20 background agents) and
-    anthropics/claude-code#24752 describe late notification during an
-    active conversation, but official docs establish no exact mid-turn/next-turn timing. One-shot
-    print mode may finish before uncollected work can be surfaced. PiCC also intentionally suppresses
-    a not-yet-sent notice after terminal `TaskOutput` collection; reporter-observed Claude Code 2.1.x
-    can enqueue a redundant notification after retrieval, but public docs define no
-    notification-consumption semantics and reports establish no normative contract, so this is UX
-    hardening rather than verified parity (see `feature.background-agents`).
-  - **One presentation for every dispatch (F14).** The `context: fork` path was the last place
-    this contract diverged — a fork that died on a terminal error used to drop its partial output
-    and crash rather than fail loudly. F14 closed that gap, so the fork path now conforms to the
-    contract above. The unification is structural: t01 extracted a shared exported
-    `presentDispatchResult` helper (`subagents.ts`) that renders the completed/failed/aborted
-    outcome, the named cause, and the partial-output cut-off frame from **one** source of truth,
-    and the Agent tool plus **both** fork consumers (the typed top-level-input caller and the
-    model-invoked `Skill`/`SlashCommand`-tool caller — one shared `runSkillActivation` path) route
-    through it. Esc cancels an in-flight fork and reports it aborted on both routes, by different
-    mechanisms: a **model-invoked** fork (the `Skill`/`SlashCommand` tool) rides Pi's per-call
-    abort signal; a **typed top-level `/forked-skill`** has no per-call signal (the input event
-    fires before the turn streams), so in interactive mode the input hook instead watches raw
-    terminal input (`ctx.ui.onTerminalInput`) and aborts on a bare Esc. Print/RPC modes have no
-    Esc, so a typed fork there runs to completion.
+- **Subagent error contract.** Every dispatch is classified into exactly one outcome, and the
+  classification — never a normal-looking success — is what reaches the coordinator:
+  - **completed** — the run finished; its verbatim final message is returned.
+  - **failed** — the run ended on a terminal API error (e.g. a drained usage limit). The tool reports
+    a **loud failure naming the cause**. An empty success here is the exact failure mode that lets a
+    coordinator commit under-reviewed work believing a subagent approved it.
+  - **aborted** — the run was stopped on purpose (Esc, `TaskStop`); distinct from a failure. A signal
+    wins on every settle path, and a deliberately stopped background result discards its output.
+  - **Partial output is preserved,** delivered inside an explicit cut-off frame rather than dropped;
+    a turn-cap truncation also pushes a warning diagnostic, never silent.
+  - The contract holds identically on the foreground, background, and `context: fork` paths, which is
+    why the presentation is rendered from **one** shared helper rather than per call site. A
+    background failure is never shown as completed. Retry behavior stays exactly Pi's own — no extra
+    recovery logic.
 
-- **Nested background fan-out is concurrency-bounded (F15 t02).** Note first that nested dispatch is
-  **off by default** (main-session-only, `subagents.maxDepth: 1` — a second, larger divergence from
-  Claude beyond the per-depth-budget one below): depth ≥ 2 only occurs when an operator raises
-  `subagents.maxDepth` to 2..5. Once opted in, dispatch is background-by-default at
-  every depth, but a nested (depth ≥ 2) fan-out does not spawn an unbounded number of concurrent
-  sessions: each depth gets its own `concurrency`-sized budget (a per-depth semaphore keyed by
-  depth), so the total is bounded by `maxDepth × concurrency` and a parent blocked in `TaskOutput`
-  awaiting a child cannot deadlock against it — every slot edge is intra-depth and every `TaskOutput`
-  wait edge strictly increases depth, so no cross-depth cycle can form. This **diverges from Claude**,
-  whose parallel-agent cap is a *single global* (~10): the per-depth budget is a deliberately
-  conservative, finite, deadlock-free PiCC choice, **not** exact parity, and it makes nested
-  background **bounded-wait** (a deep child may wait for an ancestor turn to release a slot), not
-  infinite parallelism at every depth. The *foreground* nested path is left unbounded by behavioural
-  choice, not deadlock necessity — a foreground nested acquire would also be deadlock-free under
-  per-depth pools — because foreground nested dispatch is parent-blocking and rare (`subagents.ts`,
-  feature.md §1).
+  Dispatch is **background-by-default**, matching Claude Code 2.1.198: an omitted `run_in_background`
+  returns a task id so an implicit-concurrency fan-out parallelizes; `run_in_background: false` opts
+  into a synchronous inline run, and `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces every dispatch
+  foreground. The residual divergences (notably settlement *timing*) and the upstream evidence for
+  them are recorded in the capability registry — do not restate them here.
 
-- **Deny matches any command segment.** The permission matcher is shell-operator aware, so a deny
-  like `Bash(rm *)` cannot be evaded by chaining (`git status && rm -rf /`) — every segment is
-  matched independently (`permissions.ts`, plan §6.1).
+- **Nested background fan-out is concurrency-bounded, and that diverges from Claude.** Each depth
+  gets its own `concurrency`-sized budget, so the total is bounded by `maxDepth × concurrency` and a
+  parent blocked in `TaskOutput` awaiting a child cannot deadlock against it. Claude's parallel-agent
+  cap is instead a *single global*. The per-depth budget is a deliberately conservative, deadlock-free
+  PiCC choice, **not** parity: it makes nested background **bounded-wait**, not infinite parallelism
+  at every depth. The foreground nested path is left unbounded by behavioral choice — it is
+  parent-blocking and rare — not by deadlock necessity.
+
+- **Deny matches any command segment.** The matcher is shell-operator aware, so a deny like
+  `Bash(rm *)` cannot be evaded by chaining (`git status && rm -rf /`) — every segment is matched
+  independently. Space-before-`*` is a word boundary, so `Bash(git *)` matches bare `git` and never
+  `github`.
 
 - **Skills expand as an input-event transform.** `/name` is handled in the `input` handler by
-  rewriting the user turn into the rendered skill body, not by a self-dispatching extension command
-  (which cannot reliably trigger a turn in print mode). Visibility in the `/` palette is provided
-  separately via `resources_discover` prompt stubs, and a project skill wins over a same-named
-  plugin command (`src/index.ts`, plan §4.1/§4.7).
+  rewriting the user turn into the rendered skill body, rather than by a self-dispatching extension
+  command — which cannot reliably trigger a turn in print mode. Palette visibility is provided
+  separately via `resources_discover` prompt stubs. A project skill wins over a same-named plugin
+  command.
 
-- **Git Bash is pinned on Windows.** `resolveGitBashPath()` (`shell-inject.ts`) finds the real Git
-  Bash and **skips the System32 WSL `bash.exe` stub**, which fails with
-  `WSL_E_DEFAULT_DISTRO_NOT_FOUND` when no distro is installed. The resolved shell is passed to Pi's
-  `createBashTool({ shellPath })` and to `!` user-bash, so both hooks and project `dm-*.sh`-style
-  scripts get a working bash (plan §12.3).
+- **Git Bash is pinned on Windows.** `resolveGitBashPath()` finds the real Git Bash and **skips the
+  System32 WSL `bash.exe` stub**, which fails with `WSL_E_DEFAULT_DISTRO_NOT_FOUND` when no distro is
+  installed. The resolved shell is passed to Pi's `createBashTool({ shellPath })` and to `!`
+  user-bash, so hooks and project shell scripts both get a working bash.
 
-- **UTF-8 subprocess env.** Every spawned child inherits a UTF-8 default
-  (`PYTHONIOENCODING`/`PYTHONUTF8`, `LANG`/`LC_ALL` when unset), so a Windows cp1252 default code
-  page (or `LANG=C`) doesn't crash a tool that prints Unicode. An explicit project/user `env` value
-  always wins (`util/env.ts`).
+- **UTF-8 subprocess env.** Every spawned child inherits a UTF-8 default, so a Windows cp1252 code
+  page (or `LANG=C`) does not crash a tool that prints Unicode. An explicit project/user `env` value
+  always wins.
 
-- **A per-session native-safe scratchpad steers temp files off bare `/tmp` (#48).** On Windows the
-  pinned Git Bash and the native `Read`/`Grep`/`Glob` tools resolve path *strings* in different
-  namespaces: a bare `/tmp/foo` written through the Bash tool is the shell's mount to Git Bash but a
-  drive-relative `F:\tmp\foo` to native Node — the same string, two different real files — so a
-  subagent's first `Read` of a coordinator-written temp file `ENOENT`s and burns context recovering.
-  The harness therefore creates one eager per-session scratch dir
-  (`CLAUDE_CODE_TMPDIR || os.tmpdir()` → `mkdtempSync(".../picc-scratch-")` → `realpathSync` →
-  `toNativeSafeTempForm`, the last converting to the forward-slash drive-letter form both namespaces
-  agree on) and injects its **literal resolved path** into the system prompt every turn with an
-  imperative "always use this instead of `/tmp`" directive — mirroring Claude Code's own scratchpad
-  contract (a literal path in the prompt, never an env var, so a skill authored against it stays
-  portable back to Claude Code). The **recipe** is: redirect/`mktemp -p "<scratchpad>"` **quoted**;
-  never a bare `/tmp/...`; never recompute from `$TEMP`/`$TMP`/`cygpath`. On the Windows namespace
-  split (detected via `shellNamespaceDiffersFromNative()`) an extra note spelling out that recipe is
-  appended — an additive PiCC mitigation Claude does not emit. The **skill-author-facing** contract is
-  this injected prompt guidance (`context-assembly.ts` `buildScratchpadSection`); this doc is the
-  contributor record. There is no path *rewriting* — "approach B" (translating model-chosen
-  `Read`/`Grep`/`Glob` paths) was deliberately rejected as a Claude divergence and a permission-guard
-  risk; the fix is honest steering plus a fixed first consumer, not silent path translation
-  (`util/env.ts`, `engine/shell-inject.ts`, `runtime/context-assembly.ts`, `src/index.ts`).
+- **A per-session native-safe scratchpad steers temp files off bare `/tmp`.** On Windows the pinned
+  Git Bash and the native `Read`/`Grep`/`Glob` tools resolve path *strings* in different namespaces:
+  a bare `/tmp/foo` is the shell's mount to Git Bash but a drive-relative `F:\tmp\foo` to native Node
+  — the same string, two different real files — so a subagent's first `Read` of a coordinator-written
+  temp file `ENOENT`s and burns context recovering. The harness therefore creates one eager
+  per-session scratch dir in the form both namespaces agree on and injects its **literal resolved
+  path** into the system prompt every turn. The path is literal rather than an env var because that
+  mirrors Claude Code's own scratchpad contract, keeping a skill authored against it portable back to
+  Claude Code.
 
-- **Everything degrades, nothing crashes.** Loaders never throw (malformed YAML → `{}` + diagnostic;
-  missing files → `undefined`); the hook runner and worktree manager return error results rather
-  than throwing; unknown tool/setting/hook/frontmatter names resolve to a synthesized
-  `not-supported` entry and are surfaced as *unassessed* (completeness floor + forward
-  compatibility, plan §2.2/§2.4).
+  **There is no path *rewriting*.** Translating model-chosen `Read`/`Grep`/`Glob` paths was
+  considered and **deliberately rejected**: it is a Claude divergence and a permission-guard risk
+  (the guard would match a rule against one path while the tool touched another). The fix is honest
+  steering plus a correct first consumer, not silent path translation. The author-facing contract is
+  the injected prompt guidance itself; this doc is the contributor record.
+
+- **Everything degrades, nothing crashes.** Loaders never throw; the hook runner and worktree manager
+  return error results rather than throwing; unknown tool, setting, hook, and frontmatter names
+  resolve to a synthesized `not-supported` entry and are surfaced as *unassessed*. This is the
+  completeness floor and forward compatibility in one rule: a project using something we do not yet
+  support runs, minus that feature.

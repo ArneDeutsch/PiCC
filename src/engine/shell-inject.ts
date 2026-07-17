@@ -5,7 +5,7 @@ import type { Diagnostic } from "../types.js";
 import { unicodeSafeSubprocessEnv } from "../util/env.js";
 
 /**
- * Dynamic context injection for skill bodies (plan §4.1):
+ * Dynamic context injection for skill bodies:
  * - inline `` !`cmd` `` (recognized at line start or after whitespace),
  * - fenced blocks whose info string starts with `!` (the whole fence content
  *   is the script),
@@ -135,7 +135,6 @@ function parseBody(body: string): Part[] {
 let cachedBash: string | undefined;
 let cachedPowershell: string | undefined;
 
-/** First existing file among candidate paths, else undefined. */
 function firstExistingFile(candidates: string[]): string | undefined {
   for (const c of candidates) {
     try {
@@ -181,10 +180,9 @@ function resolvePowershellBinary(env?: Record<string, string>): string {
 /**
  * Resolve the binary to spawn for a given shell (exported for tests/engine).
  *
- * Windows quirk (plan §12.3: "Git Bash on Windows"): a bare `bash` on PATH
- * usually resolves to the System32 WSL stub, which fails when no WSL distro
- * is installed. Prefer Git Bash's bash.exe when it can be located; otherwise
- * fall back to plain `bash`.
+ * Windows quirk: a bare `bash` on PATH usually resolves to the System32 WSL
+ * stub, which fails when no WSL distro is installed. Prefer Git Bash's
+ * bash.exe when it can be located; otherwise fall back to plain `bash`.
  *
  * "powershell" prefers pwsh (PowerShell Core) and falls back to Windows
  * PowerShell — see resolvePowershellBinary.
@@ -235,8 +233,8 @@ export function resolveGitBashPath(): string | undefined {
 /**
  * True when the harness's pinned shell (Git Bash / MSYS) resolves path strings in
  * a DIFFERENT namespace than its native Node file tools (Read/Grep/Glob) — i.e. on
- * Windows with a real Git Bash pinned (#48). In that split a bare `/tmp/...` written
- * via the Bash tool is resolved drive-relative by the native tools and not found.
+ * Windows with a real Git Bash pinned. In that split a bare `/tmp/...` written via
+ * the Bash tool is resolved drive-relative by the native tools and not found.
  *
  * Deliberately false for bare-`bash`/WSL (no Git Bash pinned): those live in yet
  * another namespace where the forward-slash drive-letter contract does not hold, so
@@ -364,7 +362,7 @@ export async function preprocessShellInjection(
         : firstLine(result.stderr) ||
           (result.spawnError ? firstLine(result.spawnError) : "") ||
           (result.timedOut ? `timed out after ${opts.timeoutMs ?? DEFAULT_TIMEOUT_MS}ms` : "no stderr output");
-    // Claude behavior (audit A5): a failed/timed-out command leaves the literal
+    // Claude behavior: a failed/timed-out command leaves the literal
     // placeholder text in place. Single-pass output — it is never re-scanned.
     out.push(part.original);
     diagnostics.push({

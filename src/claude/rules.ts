@@ -5,7 +5,7 @@ import { matchesAny, normalizeSlashes } from "../util/globs.js";
 import { parseMarkdown, toStringList } from "../util/markdown.js";
 
 /**
- * Rules subsystem (plan §4.2): `.claude/rules/**\/*.md`, project and user scope.
+ * Rules subsystem: `.claude/rules/**\/*.md`, project and user scope.
  *
  * Files without `paths:` frontmatter load unconditionally at session start; files with
  * `paths:` (glob list, shared engine with path-scoped skills) inject only when the model
@@ -26,7 +26,7 @@ export interface LoadRulesResult {
  * Recursively load `**\/*.md` under each rules dir.
  *
  * Order: input dir order preserved. The caller passes dirs in ASCENDING priority
- * (audit B6: user, then project root→cwd, then managed last) so higher-priority
+ * (user, then project root→cwd, then managed last) so higher-priority
  * guidance renders later/closer in the prompt; files within a dir sort
  * lexicographically by their forward-slash relative id. `excludes` glob patterns
  * (base = projectRoot) skip matching files.

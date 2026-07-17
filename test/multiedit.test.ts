@@ -6,7 +6,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { createMultiEditTool } from "../src/runtime/tools/multi-edit.js";
 
 /**
- * MultiEdit unit suite (F17 / Layer 1). Runs `createMultiEditTool(() => dir)`
+ * MultiEdit unit suite (Layer 1). Runs `createMultiEditTool(() => dir)`
  * against temp files directly via `.execute` — no model, no SDK. Fixtures use
  * explicit byte literals ("\r\n", "﻿") so the same bytes land on Windows and
  * Linux; the encoding cases must pass on both platforms.

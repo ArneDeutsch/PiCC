@@ -1,5 +1,5 @@
 /**
- * Agents loader (§4.3): parses `.claude/agents/*.md` files into ClaudeAgent
+ * Agents loader: parses `.claude/agents/*.md` files into ClaudeAgent
  * records and renders the description-driven routing catalog injected into
  * the orchestrator context.
  *
@@ -196,9 +196,8 @@ function loadAgentFile(
 
   const hooks = normalizeHooks(fm["hooks"], agentDiagnostics, filePath);
 
-  // background: true (Claude 2.1.198) forces background dispatch (t05). Parsed
-  // here; the runtime routes it through the run_in_background path. Only an
-  // explicit truthy boolean/"true" enables it; everything else leaves it unset.
+  // background: true (Claude 2.1.198) forces background dispatch; the runtime
+  // routes it through the run_in_background path.
   const background = toOptionalBoolean(fm["background"]);
 
   const unknownKeys = Object.keys(fm).filter((k) => !KNOWN_KEYS.has(k));
@@ -218,7 +217,7 @@ function loadAgentFile(
     background,
     initialPrompt: toOptionalString(fm["initialPrompt"]),
     metadata,
-    // Deferred subsystems (§7): parsed and preserved raw, not interpreted here.
+    // Deferred subsystems: parsed and preserved raw, not interpreted here.
     memory: fm["memory"],
     mcpServers: fm["mcpServers"],
     hooks,
@@ -345,7 +344,7 @@ function normalizeHooks(
 }
 
 // ---------------------------------------------------------------------------
-// Built-in agent types (audit E1/E6)
+// Built-in agent types
 // ---------------------------------------------------------------------------
 
 /** Truthy env-flag semantics: set and not an explicit "off" value. */
@@ -366,9 +365,9 @@ const READONLY_BUILTIN_DISALLOWED = [
 ];
 
 /**
- * The Claude Code built-in agent types, constructed in code (audit E1):
+ * The Claude Code built-in agent types, constructed in code:
  * `general-purpose` (all tools), `Explore` and `Plan` (read-only, skip
- * CLAUDE.md/rules — audit E6). Callers resolve project/user/plugin agents
+ * CLAUDE.md/rules). Callers resolve project/user/plugin agents
  * FIRST so a same-named project agent overrides a built-in.
  * `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS=1` removes Explore and Plan
  * (general-purpose always stays).

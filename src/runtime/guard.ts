@@ -6,7 +6,7 @@ import { applyUpdatedInput, toClaudeCall, touchedFilePath } from "./tool-map.js"
 /**
  * The enforcement guard: an inline Pi extension shared by the main session and every
  * subagent session. Implements, on Pi's tool events:
- *  - deny rules as a hard block (plan §6.1),
+ *  - deny rules as a hard block (the one hard stop in PiCC's default-permissive posture),
  *  - PreToolUse hooks (block / updatedInput / additionalContext),
  *  - PostToolUse / PostToolUseFailure hooks (block feedback reaches the model),
  *  - on-touch context injection (nested CLAUDE.md, path-scoped rules/skills).
@@ -26,7 +26,7 @@ export interface GuardDeps {
   label?: string;
 }
 
-// Pi event payloads are typed loosely here; the pinned shapes are in doc/design/pi-integration.md.
+// Pi event payloads are typed loosely here; the pinned shapes are in doc/pi-integration.md.
 type PiApi = {
   on(event: string, handler: (event: any, ctx: any) => unknown): void;
   sendMessage(message: Record<string, unknown>, options?: Record<string, unknown>): void;
@@ -43,7 +43,8 @@ function toolUseIdField(event: any): { tool_use_id?: string } {
 }
 
 export function createGuardExtension(deps: GuardDeps) {
-  // Ask downgrades are a graceful no-op (posture §6.1) but must be VISIBLE — once per rule.
+  // Ask downgrades are a graceful no-op under PiCC's default-permissive posture
+  // (there is no interactive prompt to raise), but must be VISIBLE — once per rule.
   const reportedAskRules = new Set<string>();
   const where = deps.label ? ` [${deps.label}]` : "";
 
@@ -100,7 +101,7 @@ export function createGuardExtension(deps: GuardDeps) {
     if (decision.askDowngraded && decision.rule && !reportedAskRules.has(decision.rule)) {
       reportedAskRules.add(decision.rule);
       console.error(
-        `[picc]${where} ask rule "${decision.rule}" downgraded to allow (posture §6.1 — deny rules still enforced)`,
+        `[picc]${where} ask rule "${decision.rule}" downgraded to allow (default-permissive posture — deny rules still enforced)`,
       );
     }
     const extraRule = denyByExtraRules(call);
@@ -136,7 +137,7 @@ export function createGuardExtension(deps: GuardDeps) {
       }
       if (outcome.updatedInput) {
         applyUpdatedInput(event.toolName, input, outcome.updatedInput);
-        // Deny rules always apply to what actually executes (research 02 §7.5):
+        // Deny rules always apply to what actually executes:
         // re-evaluate against the hook-rewritten input, or a hook rewrite could
         // smuggle a denied command past the pre-rewrite check.
         const updatedCall = toClaudeCall(event.toolName, input, deps.getCwd());

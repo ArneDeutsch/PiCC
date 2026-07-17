@@ -10,7 +10,7 @@ import { formatUsageCompact } from "../src/runtime/subagent-progress.js";
 import { fakeSdk, makeAgent, makeSubagentRuntime } from "./helpers/fake-sdk.js";
 
 /**
- * t06 — per-subagent usage accounting. Every dispatch captures the session's
+ * Per-subagent usage accounting. Every dispatch captures the session's
  * getSessionStats() after the last prompt() and carries it as `usage`
  * (numbers-only, absent fields omitted). Surfaced in the foreground tool-result
  * details, the background TaskOutput text, and the dispatch registry the /usage
@@ -45,7 +45,7 @@ type ToolLike = {
   ) => { render: (w: number) => string[] };
 };
 
-describe("dispatch usage capture (t06)", () => {
+describe("dispatch usage capture", () => {
   it("captures getSessionStats() into result.usage on a completed run, mapped to the numeric shape", async () => {
     const h = fakeSdk({ replies: ["done"], stats: FULL_STATS });
     const runtime = makeSubagentRuntime([makeAgent()], h.sdk);
@@ -128,7 +128,7 @@ describe("dispatch usage capture (t06)", () => {
   });
 });
 
-describe("usage reaches the dispatch registry (t06)", () => {
+describe("usage reaches the dispatch registry", () => {
   it("records per-subagent usage + outcome for a completed dispatch", async () => {
     const registry = new SubagentRegistry();
     const h = fakeSdk({ replies: ["done"], stats: FULL_STATS });
@@ -154,7 +154,7 @@ describe("usage reaches the dispatch registry (t06)", () => {
   });
 });
 
-describe("foreground surfaces the usage (t06 + t03 slot)", () => {
+describe("foreground surfaces the usage", () => {
   it("tool-result details.usage is populated and renderResult's footer lights up", async () => {
     const h = fakeSdk({ replies: ["the answer"], stats: FULL_STATS });
     const runtime = makeSubagentRuntime([makeAgent()], h.sdk);
@@ -164,7 +164,7 @@ describe("foreground surfaces the usage (t06 + t03 slot)", () => {
     // Verbatim-return contract: usage is metadata (details + footer) only — it
     // must NEVER be appended into the model-visible body (finalMessage).
     expect(res.content[0]!.text).not.toContain("usage");
-    // t03's renderResult footer (formatUsageLine → formatUsageCompact) renders it.
+    // The renderResult footer (formatUsageLine → formatUsageCompact) renders it.
     const rendered = tool.renderResult(res, { isPartial: false }, undefined).render(200).join("\n");
     expect(rendered).toContain("usage:");
     expect(rendered).toContain("in 100");
@@ -173,7 +173,7 @@ describe("foreground surfaces the usage (t06 + t03 slot)", () => {
   });
 });
 
-describe("background surfaces the usage (t06)", () => {
+describe("background surfaces the usage", () => {
   it("TaskOutput text carries a compact usage line and details.usage; the record mirrors it", async () => {
     const h = fakeSdk({ replies: ["bg answer"], stats: FULL_STATS });
     const backgroundTasks = new BackgroundTaskRegistry();
@@ -198,7 +198,7 @@ describe("background surfaces the usage (t06)", () => {
   });
 });
 
-describe("formatUsageCompact (t06 shared formatter)", () => {
+describe("formatUsageCompact (shared formatter)", () => {
   it("renders only present fields, joins them, and trims cost zeros", () => {
     expect(formatUsageCompact(FULL_USAGE)).toBe(
       "in 100 · out 50 · cache read 20 · cache write 10 · $0.0123",
@@ -224,7 +224,7 @@ describe("formatUsageCompact (t06 shared formatter)", () => {
     expect(formatUsageCompact(undefined)).toBeUndefined();
     expect(formatUsageCompact({})).toBeUndefined();
     expect(formatUsageCompact("x")).toBeUndefined();
-    // Legacy shape the t03 defensive slot expected (totalTokens + costUsd).
+    // Legacy shape the defensive slot expected (totalTokens + costUsd).
     expect(formatUsageCompact({ totalTokens: 1200, costUsd: 0.03 })).toBe("1200 tokens · $0.03");
   });
 });

@@ -1,7 +1,7 @@
 /**
  * Session-scoped effective-cwd state.
  *
- * Pi has no session-cwd mutation API, so the worktree cwd swap (plan §4.4 — load-bearing)
+ * Pi has no session-cwd mutation API, so the load-bearing worktree cwd swap
  * is implemented by routing every tool execution through this mutable state:
  * all PiCC tools and built-in tool overrides resolve paths/cwd via `get()` at
  * execute time. EnterWorktree pushes a new cwd; ExitWorktree restores the base.

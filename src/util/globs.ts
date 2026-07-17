@@ -2,7 +2,7 @@ import picomatch from "picomatch";
 import path from "node:path";
 
 /**
- * Shared glob engine (plan §4.2): used by rules `paths:`, skills `paths:`,
+ * Shared glob engine: used by rules `paths:`, skills `paths:`,
  * permission rules Read/Edit(glob), `claudeMdExcludes`, `.worktreeinclude`.
  *
  * Semantics (gitignore-flavoured, Claude Code compatible):

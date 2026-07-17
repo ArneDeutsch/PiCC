@@ -1,7 +1,7 @@
 import type { ToolCallDescriptor } from "../types.js";
 
 /**
- * Claude ⇄ Pi tool-name mapping (design doc §3.2).
+ * Claude ⇄ Pi tool-name mapping.
  *
  * The permission/hook/gating layer operates on Claude tool names; Pi built-ins are
  * lower-case. Our own registered tools keep Claude names verbatim and need no mapping.

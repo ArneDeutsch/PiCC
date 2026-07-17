@@ -58,7 +58,7 @@ describe.skipIf(cliMissing)(
     );
 
     // --- Scenario 1: bash tool runs a real project script (Git Bash, not WSL stub) ---
-    // Also absorbs the Python cp1252/UTF-8 boundary (t03 merge): when a python
+    // Also absorbs the Python cp1252/UTF-8 boundary: when a python
     // interpreter is available, the SAME bash call additionally prints U+2192 via
     // chr(0x2192) and we assert it round-trips with no UnicodeEncodeError/charmap.
     // The python portion (command + assertion) is omitted entirely when python is

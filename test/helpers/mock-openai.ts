@@ -16,7 +16,7 @@ export interface MockToolCall {
   args: Record<string, unknown>;
 }
 
-/** Scripted HTTP error response (t01: error-path e2e). */
+/** Scripted HTTP error response (error-path e2e). */
 export interface MockErrorSpec {
   /** HTTP status to answer with (e.g. 429, 500). */
   status: number;

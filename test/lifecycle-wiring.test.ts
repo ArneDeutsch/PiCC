@@ -11,8 +11,8 @@ import { fakePi, type FakePi } from "./helpers/fake-pi.js";
  * Wired-lifecycle coverage (review finding: zero tests fired after_provider_response,
  * model_select, agent_settled, session_shutdown): quota-header capture, steering
  * re-selection on model switch, the Stop-hook continuation loop incl. its cap,
- * SessionEnd dispatch, PostToolUse block feedback, compaction state reset (§9),
- * and /compat suppression wiring (§6.2 done-when).
+ * SessionEnd dispatch, PostToolUse block feedback, compaction state reset,
+ * and /compat suppression wiring.
  */
 
 let dir: string;
@@ -182,7 +182,7 @@ describe("lifecycle wiring", () => {
     expect(text).toContain("LW-LINT-ERRORS");
   });
 
-  it("compaction resets one-shot injection: nested CLAUDE.md + path rules re-inject on next touch (§9)", async () => {
+  it("compaction resets one-shot injection: nested CLAUDE.md + path rules re-inject on next touch", async () => {
     // First touch: nested CLAUDE.md and the scoped rule inject once.
     pi.messages.length = 0;
     await pi.fire("tool_call", { toolName: "read", toolCallId: "c2", input: { path: path.join(dir, "src", "a.ts") } });
@@ -197,7 +197,7 @@ describe("lifecycle wiring", () => {
 
     await pi.fire("session_compact", { reason: "threshold" });
 
-    // Root CLAUDE.md + unconditional rules survive via the per-turn suffix (§9 done-when).
+    // Root CLAUDE.md + unconditional rules survive via the per-turn suffix.
     const suffix = (await pi.fire("before_agent_start", { systemPrompt: "B" })).systemPrompt as string;
     expect(suffix).toContain("LW-ROOT-INSTRUCTIONS");
     expect(suffix).toContain("LW-UNCOND-RULE");
@@ -210,7 +210,7 @@ describe("lifecycle wiring", () => {
     expect(after).toContain("LW-SCOPED-RULE");
   });
 
-  it("an active skill's disallowed-tools deny via the guard (§4.1 enforcement)", async () => {
+  it("an active skill's disallowed-tools deny via the guard (enforcement)", async () => {
     // Before activation, WebFetch passes.
     const before = await pi.fire("tool_call", {
       toolName: "WebFetch",
@@ -230,7 +230,7 @@ describe("lifecycle wiring", () => {
     expect(String(after?.reason ?? "")).toContain("disallowed-tools");
   });
 
-  it("/compat suppress persists, silences the startup notice, and /compat show re-enables (§6.2)", async () => {
+  it("/compat suppress persists, silences the startup notice, and /compat show re-enables", async () => {
     const ack = path.join(dir, ".claude", ".picc", "compat-ack.json");
     await pi.commands.get("compat").handler("suppress", pi.ctx());
     expect(fs.existsSync(ack)).toBe(true);

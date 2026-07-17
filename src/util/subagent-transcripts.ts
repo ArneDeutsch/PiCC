@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 /**
- * Subagent transcript location + agent-ID helpers (t02).
+ * Subagent transcript location + agent-ID helpers.
  *
  * Every subagent dispatch persists its Pi session as one JSONL transcript,
  * discoverable from the MAIN session's transcript file (Claude parity analog:
@@ -15,11 +15,11 @@ import path from "node:path";
  * The per-transcript filename is minted by Pi's `SessionManager.create(cwd,
  * sessionDir, { id: agentId })` — `<timestamp>_<agentId>.jsonl` — so the agent
  * ID is embedded verbatim in the filename and the resolver finds a transcript
- * by scanning for that suffix. A resume (t04) reopens the SAME file via
+ * by scanning for that suffix. A resume reopens the SAME file via
  * `SessionManager.open`, so one agent ID maps to one transcript across resumes.
  *
  * This module is shared by subagents.ts and background-tasks.ts; keeping it in
- * util avoids a value-level import between those two modules (t01 house rule).
+ * util avoids a value-level import between those two modules.
  */
 
 /**
@@ -31,7 +31,7 @@ import path from "node:path";
 const AGENT_ID_RE = /^agent-[0-9a-f]{12}$/;
 
 /**
- * Prefix marking the developer-/model-facing fork-degrade line (F16). A
+ * Prefix marking the developer-/model-facing fork-degrade line. A
  * `subagent_type: "fork"` dispatch that could not inherit the parent
  * conversation runs fresh and records a fork-SPECIFIC diagnostic whose message
  * starts with this sentinel. It is the SHARED home for the prefix so the emitter
@@ -42,7 +42,7 @@ const AGENT_ID_RE = /^agent-[0-9a-f]{12}$/;
  */
 export const FORK_DEGRADE_PREFIX = "fork ran with fresh context: ";
 
-/** Mint a new opaque agent ID (unique per agent, stable across resumes — t04). */
+/** Mint a new opaque agent ID (unique per agent, stable across resumes). */
 export function mintAgentId(): string {
   return `agent-${crypto.randomBytes(6).toString("hex")}`;
 }
@@ -79,12 +79,11 @@ export function subagentSessionDir(mainSessionFile: string): string {
  * subagents directory, or undefined when no transcript exists (never ran,
  * never flushed, or in-memory fallback).
  *
- * This is feature.md's exported "discoverable via the hardened resolver" API:
- * the ID→transcript discovery entry point for EXTERNAL tooling and humans, and
- * it is exercised by the e2e/unit tests that prove transcripts are discoverable.
- * It deliberately has NO `src/` production caller — RESUME (t04/SendMessage)
- * uses the REGISTRY-STORED path captured at dispatch time, never a fresh on-disk
- * scan (SECURITY MUST-FIX #2), so a model-supplied `to` can never drive a disk
+ * This is the ID→transcript discovery entry point for EXTERNAL tooling and
+ * humans, exercised by the e2e/unit tests that prove transcripts are
+ * discoverable. It deliberately has NO `src/` production caller — SECURITY:
+ * resume (SendMessage) uses the REGISTRY-STORED path captured at dispatch time,
+ * never a fresh on-disk scan, so a model-supplied `to` can never drive a disk
  * lookup. Do not "dead-code" delete it; the disk-scan absence in resume is by
  * design, not a gap.
  *
@@ -124,12 +123,12 @@ export function resolveSubagentTranscript(
 }
 
 /**
- * The model-visible agent-ID trailer line (t02 delivery contract). Appended —
- * clearly delimited, outside the verbatim-message contract like t01's cut-off
- * note — to foreground tool results and TaskOutput text of RESUMABLE agents.
+ * The model-visible agent-ID trailer line. Appended — clearly delimited, outside
+ * the verbatim-message contract, like the cut-off note — to foreground tool
+ * results and TaskOutput text of RESUMABLE agents.
  * Advisory, not authenticated: a subagent could forge a look-alike line in its
- * own prose; the dispatch registry (t04) stays the source of truth for what an
- * ID reaches, bounding impact to misdirected (legitimate) delivery — the same
+ * own prose; the dispatch registry stays the source of truth for what an ID
+ * reaches, bounding impact to misdirected (legitimate) delivery — the same
  * in-band property Claude Code has.
  */
 export function agentTrailerLine(agentId: string, opts: { completed: boolean }): string {
@@ -139,7 +138,7 @@ export function agentTrailerLine(agentId: string, opts: { completed: boolean }):
 /**
  * The STANDALONE trailer frame: the `\n\n---\n` delimiter followed by the
  * trailer line. This is the single home of the `\n\n---\n` framing string —
- * hand-writing it at each call site let the delimiter drift (t02 review). Use
+ * hand-writing it at each call site lets the delimiter drift. Use
  * this when the trailer opens its OWN frame (a completed message, or a failed
  * message with no prior cut-off frame). When the trailer instead rides INSIDE
  * an existing cut-off frame (truncated/partial output already ends with a

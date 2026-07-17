@@ -9,8 +9,8 @@ import {
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 
 /**
- * `MultiEdit` (plan F17): a real, atomic, sequential multi-edit tool — the
- * Claude Code `MultiEdit` shape ported onto PiCC.
+ * `MultiEdit`: an atomic, sequential multi-edit tool — the Claude Code
+ * `MultiEdit` shape ported onto PiCC.
  *
  * A model calls it with a single `file_path` and an ordered array of edits,
  * each `{ old_string, new_string, replace_all? }`. The edits are applied
@@ -45,7 +45,6 @@ interface NormalizedEdit {
 // Encoding / line-ending helpers (reimplemented — Pi's are private)
 // ---------------------------------------------------------------------------
 
-/** Strip a leading UTF-8 BOM, returning the BOM (if any) and the remaining text. */
 function stripBom(content: string): { bom: string; text: string } {
   return content.startsWith(BOM) ? { bom: BOM, text: content.slice(1) } : { bom: "", text: content };
 }
@@ -59,12 +58,10 @@ function detectLineEnding(content: string): "\n" | "\r\n" {
   return crlfIdx < lfIdx ? "\r\n" : "\n";
 }
 
-/** Collapse all `\r\n` and lone `\r` to `\n`. */
 function normalizeToLF(text: string): string {
   return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
-/** Restore every `\n` to the detected ending (no-op for LF). */
 function restoreLineEndings(text: string, ending: "\n" | "\r\n"): string {
   return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
 }
@@ -174,7 +171,6 @@ export function applyEdits(
 // Input validation (runtime — the unit harness bypasses the typebox schema)
 // ---------------------------------------------------------------------------
 
-/** The `code` of a Node fs error (e.g. "ENOENT"), or undefined if absent. */
 function getErrCode(err: unknown): string | undefined {
   return typeof err === "object" && err !== null && "code" in err
     ? String((err as { code?: unknown }).code)
@@ -211,10 +207,6 @@ function validateInput(params: unknown): { filePath: string; edits: NormalizedEd
   });
   return { filePath: raw.file_path, edits };
 }
-
-// ---------------------------------------------------------------------------
-// Tool factory
-// ---------------------------------------------------------------------------
 
 export function createMultiEditTool(getCwd: () => string): ToolDefinition {
   return defineTool({
@@ -269,7 +261,6 @@ export function createMultiEditTool(getCwd: () => string): ToolDefinition {
         };
         throwIfAborted();
 
-        // Single read.
         let rawContent: string | undefined;
         try {
           rawContent = await readFile(absPath, "utf-8");

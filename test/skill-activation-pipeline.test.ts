@@ -163,7 +163,7 @@ describe("renderSkillForActivation", () => {
     expect(msg).toContain("</skill>");
   });
 
-  it("substitutes ${CLAUDE_*} and $ARGUMENTS in allowed-/disallowed-tools without mutating the skill (A3)", async () => {
+  it("substitutes ${CLAUDE_*} and $ARGUMENTS in allowed-/disallowed-tools without mutating the skill", async () => {
     const skill = writeSkill("tool-rules", "Body uses $ARGUMENTS.");
     skill.allowedTools = ["Read(${CLAUDE_PROJECT_DIR}/**)", "Bash(deploy $0:*)"];
     skill.disallowedTools = ["Write(${CLAUDE_SKILL_DIR}/*)", "Bash(rm $ARGUMENTS)"];
@@ -187,7 +187,7 @@ describe("renderSkillForActivation", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Compaction re-injection budget (audit A9)
+// Compaction re-injection budget
 // ---------------------------------------------------------------------------
 
 describe("budgetSkillReinjection", () => {
@@ -241,7 +241,7 @@ describe("budgetSkillReinjection", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Stacked slash invocations (A7) + re-invocation dedup (A8) — the extension's
+// Stacked slash invocations + re-invocation dedup — the extension's
 // input handler and Skill tool, driven through a fake Pi on a minimal project.
 // ---------------------------------------------------------------------------
 
@@ -292,7 +292,7 @@ describe("stacked skill invocations + re-invocation dedup (extension)", () => {
     }
   });
 
-  it("activates stacked leading skills in order; remaining text is the LAST skill's args and appears exactly ONCE (G6)", async () => {
+  it("activates stacked leading skills in order; remaining text is the LAST skill's args and appears exactly ONCE", async () => {
     const result = await pi.fire("input", {
       text: "/stack-a /stack-b build the thing",
       source: "interactive",
@@ -307,7 +307,7 @@ describe("stacked skill invocations + re-invocation dedup (extension)", () => {
     expect(text.split("build the thing").length - 1).toBe(1);
   });
 
-  it("a marker-less LAST skill still surfaces the trailing text once, via the ARGUMENTS: fallback (G6)", async () => {
+  it("a marker-less LAST skill still surfaces the trailing text once, via the ARGUMENTS: fallback", async () => {
     const result = await pi.fire("input", {
       text: "/stack-a /stack-c do it now",
       source: "interactive",
@@ -344,7 +344,7 @@ describe("stacked skill invocations + re-invocation dedup (extension)", () => {
     expect(text).toContain("STK-5-BODY [/stk-6 tail]");
   });
 
-  it("substitutes a short note for a byte-identical re-invocation via slash command (A8)", async () => {
+  it("substitutes a short note for a byte-identical re-invocation via slash command", async () => {
     const first = await pi.fire("input", { text: "/redo same-args", source: "interactive" });
     expect(String(first.text)).toContain("REDO-BODY [same-args]");
 

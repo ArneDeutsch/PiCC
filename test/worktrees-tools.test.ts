@@ -4,7 +4,7 @@ import { CwdState } from "../src/runtime/cwd-state.js";
 import { createWorktreeTools } from "../src/runtime/tools/worktree-tools.js";
 
 /**
- * Tool-layer tests for EnterWorktree / ExitWorktree (plan §4.4) against a stub
+ * Tool-layer tests for EnterWorktree / ExitWorktree against a stub
  * WorktreeManager: previous-worktree lock release on re-enter, and truthful
  * removal reporting. The git mechanics themselves live in worktrees.test.ts.
  */

@@ -1,12 +1,12 @@
 # PiCC ↔ Pi integration contracts
 
-> **Status:** Working design record. Pinned against **Pi v0.80.6** (`@earendil-works/pi-coding-agent`,
+> **Status:** Contract record. Pinned against **Pi v0.80.6** (`@earendil-works/pi-coding-agent`,
 > `pi-agent-core`, `pi-ai` — all 0.80.6, verified on npm 2026-07-11). Effective Node floor ≥ 22.19:
 > Pi declares ≥ 20, but its bundled undici 8.x (engines ≥ 22.19) crashes on Node 20 at import
 > (`worker_threads.markAsUncloneable` missing). We develop on 24.
 > Source of truth for every Pi API PiCC builds on. If Pi churns, update here first.
 >
-> Decision Q1 (fork vs depend): **depend + extension bundle**. Pi is a regular npm dependency;
+> Fork vs. depend: **depend + extension bundle**. Pi is a regular npm dependency;
 > PiCC ships as an extension (loaded via `settings.json "extensions"` array, `.pi/extensions/`,
 > or `pi -e`) plus a launcher. No fork.
 
@@ -35,8 +35,9 @@ Launch modes we support:
 | PreCompact/PostCompact + instruction re-injection | `pi.on("session_before_compact")` (can supply custom summary; we append preserved-instructions block), `pi.on("session_compact")` |
 | Custom tools: `Agent`, `EnterWorktree`, `ExitWorktree`, `WebFetch`, `WebSearch`, `Grep`, `Glob`, `TaskCreate/...`, degrade stubs | `pi.registerTool({ name, description, parameters: TypeBox, execute, prepareArguments? })`; throw ⇒ `isError`; `terminate: true` supported |
 | Slash commands: user-invocable skills, legacy commands, `/doctor`, `/quota`, `/compat` | `pi.registerCommand(name, { description, handler, getArgumentCompletions })`; command handlers get `ExtensionCommandContext` |
-| Worktree cwd swap (load-bearing) | Override built-in tools: re-register `bash`/`read`/`write`/`edit`/`grep`/`find`/`ls` wrappers that resolve paths/cwd through a mutable `EffectiveCwd`; built-ins created per-cwd via `createBashTool(cwd, { spawnHook })`, `createReadTool(cwd, …)` etc. Built-in renderers are re-applied from `create*ToolDefinition` and de-padded through the self-shell wrapper (`src/runtime/tool-shell.ts`, §4); `execute` stays sourced from `create*Tool` so it is byte-identical. |
-| Subagent runtime (fresh context, parallel, per-agent tools/model, verbatim return) | SDK: `createAgentSession({ cwd, tools, customTools, model, thinkingLevel, resourceLoader: new DefaultResourceLoader({ systemPromptOverride, agentsFilesOverride, skillsOverride, extensionFactories }), sessionManager: SessionManager.inMemory(), settingsManager: SettingsManager.inMemory(), authStorage, modelRegistry })`; final assistant message read from `session.messages` — returned **verbatim** (a resumable dispatch additionally appends a clearly-delimited in-band identity/resume trailer to the model-visible text, matching Claude Code; the human TUI strips it — see §3.4). A `subagent_type: "fork"` dispatch (F16) instead seeds a persisted `sessionManager: SessionManager.forkFrom(parentTranscript, cwd, sessionDir, { id })` so the child inherits the parent conversation (non-resumable), rather than `SessionManager.inMemory()`. |
+| Worktree cwd swap (load-bearing) | Override built-in tools: re-register `bash`/`read`/`write`/`edit`/`grep`/`find`/`ls` wrappers that resolve paths/cwd through a mutable `EffectiveCwd`; built-ins created per-cwd via `createBashTool(cwd, { spawnHook })`, `createReadTool(cwd, …)` etc. Built-in renderers are re-applied from `create*ToolDefinition` and de-padded through the self-shell wrapper (`src/runtime/tool-shell.ts` — see *Risks / churn watchpoints*); `execute` stays sourced from `create*Tool` so it is byte-identical. |
+| Subagent runtime (fresh context, parallel, per-agent tools/model, verbatim return — see "Verbatim subagent return" in [`architecture.md`](architecture.md)) | SDK: `createAgentSession({ cwd, tools, customTools, resourceLoader, sessionManager, settingsManager, model?, thinkingLevel? })` — the options **PiCC passes**; Pi's own option set is wider. `resourceLoader` is `new DefaultResourceLoader({ cwd, agentDir, systemPromptOverride, agentsFilesOverride, skillsOverride, promptsOverride, extensionFactories })` (`await loader.reload()` before use). Final assistant message read as the last `role: "assistant"` entry of `session.messages`. Per-session `sessionManager` — see "Session managers" below. |
+| Session managers (subagent transcripts) | `SessionManager.create(cwd, sessionDir, { id })` — persisted transcript, the default (Pi names the file `<stamp>_<id>.jsonl`); `SessionManager.open(path, sessionDir, cwd)` — reopen the same file to resume and append; `SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id })` — read a source transcript and write a **brand-new** file, so a `subagent_type: "fork"` child inherits the parent conversation without touching the parent's history; `SessionManager.inMemory(cwd)` — the non-resumable fallback when no transcript is available (no main-session file, a failed `create`, or an SDK without persisted sessions). Settings: `SettingsManager.inMemory(settings)`. |
 | Model/effort control | `pi.setModel(model)`, `ctx.modelRegistry.find(provider,id)`, `pi.setThinkingLevel("off"…"max")` — Claude `effort` maps onto thinking levels |
 | Env & exec | `pi.exec(cmd, args, { signal, timeout })` for git/hook commands; hooks additionally need shell execution via `node:child_process` (stdin JSON contract Pi's exec doesn't cover: we use `spawn` directly) |
 | Quota | `ctx.getContextUsage()`; subscription quota via provider headers on `after_provider_response` (rate-limit headers) + `/login`-stored auth; degrade gracefully if absent |
@@ -62,7 +63,8 @@ names**; a canonical mapping table (in the capability registry) translates: `Rea
 `Edit→edit`, `Write→write`, `Bash→bash`, `Grep→grep`, `Glob→find` (+ our own `Glob` tool),
 and our registered tools keep Claude names verbatim (`Agent`, `WebFetch`, `EnterWorktree`, …).
 Matching is applied on events by translating Pi tool names back to Claude names first.
-Unknown names stay verbatim and match string-identically (degrade-predictably, §4.8 of plan).
+A tool name PiCC does not know stays verbatim and matches string-identically — an unmapped name
+degrades predictably rather than silently matching nothing.
 
 ### 3.3 Hook execution
 `type: command` hooks run via `node:child_process.spawn` with: shell selection (`bash -c` default,
@@ -70,29 +72,34 @@ Unknown names stay verbatim and match string-identically (degrade-predictably, �
 Windows paths double-backslashed in JSON naturally), env incl. `CLAUDE_PROJECT_DIR`,
 `${CLAUDE_*}` placeholder expansion in the command string, timeout (default 60s), and the
 stdout/exit-code contract: exit 2 ⇒ block; JSON `hookSpecificOutput.permissionDecision`
-allow/deny/ask (ask ⇒ treated per §6.1 posture: logged, allowed, surfaced); `additionalContext`
+allow/deny/ask (ask ⇒ logged, allowed, and surfaced — PiCC has no interactive approval prompt);
+`additionalContext`
 ⇒ injected via `sendMessage`/result patch; `updatedInput` ⇒ mutate `event.input` in place.
 
 ### 3.4 Subagent dispatch
-`Agent` tool params: `{ subagent_type, prompt, model?, run_in_background? }` (dispatch is
-**background-by-default** since F15 — an omitted `run_in_background` returns a task id; `false` opts
-into a synchronous foreground run; `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces foreground).
-Fan-out: Pi executes sibling tool calls concurrently
-already (parallel tool mode); our own concurrency limiter (default 4, settings-honored) queues
-`createAgentSession` runs. Each subagent: fresh in-memory session (**except** a
-`subagent_type: "fork"` dispatch — a persisted `SessionManager.forkFrom` session inheriting the
-parent conversation; see §3.4 and the `tool.Agent.fork` registry entry); system prompt = agent body +
-CLAUDE.md/rules hierarchy; tools = intersection of requested `tools:` minus `disallowedTools`,
-translated per §3.2, with non-granted tools simply absent; per-agent `model`/`effort` resolved
-via `modelRegistry`; depth tracked via an env/context counter, capped by settings
-(default `subagents.maxDepth: 1` = **main-session-only**: 0 nesting levels beyond the orchestrator's
-direct subagents = depth 1 total; raise to 2..5 to allow that many levels below the main session —
-`maxDepth: 2` reaches depth 2, up to depth 5 at `5`). Return value:
-final assistant message text **verbatim** for a non-resumable/one-shot dispatch; a **resumable**
-dispatch appends a clearly-delimited in-band identity/resume trailer (`— resumable via SendMessage`)
-to the model-visible text — faithful to Claude Code, which appends the same kind of in-band resume
-handle to resumable subagent results (the human TUI strips it, so it is a model-visible concern only). On
-empty/malformed (per caller contract) one retry supported by re-prompting.
+Each subagent is its own `createAgentSession` run. What that costs us at the Pi seam:
+
+- **Fan-out.** Pi already executes sibling tool calls concurrently (parallel tool mode), so Pi
+  imposes no per-dispatch serialization; our own concurrency limiter (settings-honored) queues the
+  `createAgentSession` runs.
+- **Session seeding.** The default is a persisted transcript (`SessionManager.create`), which is
+  what makes a dispatch resumable via `SessionManager.open`; a `subagent_type: "fork"` dispatch
+  seeds `SessionManager.forkFrom` instead so the child inherits the parent conversation. With no
+  main-session transcript file to work from (print/headless), dispatch falls back to
+  `SessionManager.inMemory` and is non-resumable.
+- **Prompt and tools.** Pi's own resource discovery is fully overridden: the system prompt (agent
+  body + CLAUDE.md/rules hierarchy) arrives via `DefaultResourceLoader`'s `systemPromptOverride`,
+  and the granted tool set — requested `tools:` minus `disallowedTools`, translated per *Tool-name
+  mapping* — is passed as `tools`/`customTools`, with non-granted tools simply absent rather than
+  blocked.
+- **Model/effort.** Resolved per-agent through `ctx.modelRegistry` and passed as
+  `model`/`thinkingLevel`.
+- **Depth.** Pi has no notion of nesting depth; PiCC tracks it in an env/context counter and caps it
+  by the `subagents.maxDepth` setting.
+
+The return value is the last `role: "assistant"` message of `session.messages`, returned verbatim
+— see "Verbatim subagent return" in [`architecture.md`](architecture.md) for the contract and the
+resume trailer that rides on it.
 
 ### 3.5 Compaction preservation
 On `session_before_compact` we do not replace Pi's summarizer; we let default compaction run
@@ -113,24 +120,20 @@ TUI, `/model`, project trust. We do not reimplement any of it.
   (`test/pi-contract.test.ts`) asserts the imports/exports we rely on exist.
 - `before_agent_start` system-prompt chaining: other extensions may also modify; we append, not replace.
 - Built-in tool override warning in interactive mode is expected (documented for users).
-- Tool-row de-padding (concise-tool-rows) couples `src/runtime/tool-shell.ts` to Pi's render
-  contract in three places. **All three** are now pinned by the smoke test
-  (`test/pi-contract.test.ts`) so a Pi bump fails loudly in CI rather than degrading incremental
-  rendering silently on a green CI:
+- Tool-row de-padding couples `src/runtime/tool-shell.ts` to Pi's render contract in three places.
+  **All three** are pinned by the smoke test (`test/pi-contract.test.ts`) so a Pi bump fails loudly
+  in CI rather than degrading incremental rendering silently on a green CI. For what the wrapper
+  does with these, see "`renderShell` — this is how you control blank lines and framing" in
+  [`tui-extension-guide.md`](tui-extension-guide.md); the Pi-side surface is:
   - **`create*ToolDefinition` renderer shape** — the de-padded built-in rows source their
     `renderCall`/`renderResult` from the public `createRead/Write/Edit/Bash/Grep/Find/LsToolDefinition`
     factories (the plain `create*Tool` factory strips renderers via `wrapToolDefinition`). A rename,
     move, or shape change of these factories breaks the wrap.
-  - **`ctx.lastComponent` threading** — `ToolExecutionComponent` hands back the component we returned
-    as `ctx.lastComponent`; the built-ins reuse it for incremental render state (`read`/`bash` via
-    `?? new …`, `edit` via `instanceof Box`). The wrapper stashes the inner component (`__inner`) and
-    threads it back — a load-bearing coupling to Pi's incremental-render contract. **Pinned by the
-    smoke test (t04):** PiCC's own threading logic is unit-tested (`test/runtime-core.test.ts`, with a
-    fake inner + fake ctx), and a contract test now drives the real `ToolExecutionComponent` and
-    asserts Pi's side too — that it hands the previously-returned component back as
-    `ctx.lastComponent` on the next render (undefined on the first), for the `renderCall` and
-    `renderResult` slots separately — so this coupling can no longer regress silently on a Pi bump.
-    See [`tui-extension-guide.md`](../tui-extension-guide.md) §3.2.
+  - **`ctx.lastComponent` threading** — Pi's `ToolExecutionComponent` caches the component a renderer
+    returned and hands it back as `ctx.lastComponent` on the next render (undefined on the first),
+    caching the `renderCall` and `renderResult` slots separately. The built-ins depend on that to
+    carry incremental render state, so a Pi change here would silently degrade rendering: the
+    contract test drives the real `ToolExecutionComponent` and asserts Pi's side of it.
   - **`getTextOutput` transform** — `tool-shell.ts` reproduces Pi's `render-utils.js` `getTextOutput`
     (the deep path is `exports`-blocked); the smoke test pins it against Pi's own via an absolute
     `file://` import so a transform change (CRLF stripping, image fallbacks) fails loudly.

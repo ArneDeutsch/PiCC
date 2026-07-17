@@ -9,7 +9,7 @@ import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import { deferred, waitUntil } from "./helpers/async.js";
 
 /**
- * F14 t02 — offline-integration for the `context: fork` failure/abort path.
+ * Offline-integration for the `context: fork` failure/abort path.
  *
  * Drives the REAL fork consumers (the Skill tool's `execute` and the top-level
  * input-hook expansion) through a controllable dispatch outcome. A fresh
@@ -68,7 +68,7 @@ function partialThenApiDeath(errorMessage: string) {
 
 const API_DEATH = /Agent terminated early due to an API error/;
 
-describe("F14 t02 — Skill-tool fork consumer", () => {
+describe("Skill-tool fork consumer", () => {
   it("(1) failed WITH partial output → success-shaped content: partial preserved + cut-off note names the cause", async () => {
     const h = fakeSdk({ onPrompt: partialThenApiDeath("503 upstream unavailable") });
     const skillTool = (await wire(h.sdk)).tools.get("Skill");
@@ -77,7 +77,7 @@ describe("F14 t02 — Skill-tool fork consumer", () => {
     expect(text.startsWith("partial research findings")).toBe(true);
     expect(text).toMatch(API_DEATH);
     expect(text).toContain("503 upstream unavailable");
-    expect(text).toContain("\n\n---\n"); // the t01 cut-off frame (byte-identical, not hand-written here)
+    expect(text).toContain("\n\n---\n"); // the cut-off frame (byte-identical, not hand-written here)
     expect(res.details.cutOff).toBe(true);
     expect(res.details.forked).toBe(true);
     expect(res.details.agent).toBeTruthy(); // the fork's identity survives on the partial path
@@ -128,12 +128,12 @@ describe("F14 t02 — Skill-tool fork consumer", () => {
     expect(res.details.forked).toBe(true);
     expect(res.details.agent).toBeTruthy();
     // cutOff:false here because forks are non-resumable, so the completed branch never
-    // trailers regardless of allowResumeTrailer — trailer behaviour is unit-covered in t01.
+    // trailers regardless of allowResumeTrailer — trailer behaviour is unit-covered elsewhere.
     expect(res.details.cutOff).toBe(false);
   });
 });
 
-describe("F14 — SlashCommand-tool fork consumer (shares runSkillActivation with the Skill tool)", () => {
+describe("SlashCommand-tool fork consumer (shares runSkillActivation with the Skill tool)", () => {
   // The partial-output / no-output outcomes are proven verbatim by the Skill-tool
   // matrix above (SlashCommand shares runSkillActivation), so only the distinct
   // abort path — Esc threaded through SlashCommand.execute's positional 3rd arg —
@@ -156,7 +156,7 @@ describe("F14 — SlashCommand-tool fork consumer (shares runSkillActivation wit
   });
 });
 
-describe("F14 t02 — input-hook fork consumer (/fork-research …)", () => {
+describe("input-hook fork consumer (/fork-research …)", () => {
   it("(5) failed WITH partial output → transform text folds the partial AND the cause (success envelope kept)", async () => {
     const h = fakeSdk({ onPrompt: partialThenApiDeath("503 upstream unavailable") });
     const p = await wire(h.sdk);

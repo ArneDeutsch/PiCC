@@ -69,7 +69,7 @@ export interface ScratchDirIo {
 }
 
 /**
- * Compute the per-session native-safe scratch dir path (#48 / feature 25).
+ * Compute the per-session native-safe scratch dir path.
  *
  * Order is load-bearing and is the thing the wiring test locks:
  *   root = CLAUDE_CODE_TMPDIR || tmpdir()   (honor Claude Code's relocation knob)

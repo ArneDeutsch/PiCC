@@ -8,8 +8,8 @@ import {
 import { agentTrailerFrame, agentTrailerLine } from "../src/util/subagent-transcripts.js";
 
 /**
- * F14 t01 — unit coverage for the shared, pure `presentDispatchResult` helper.
- * It reproduces the Agent tool's F02 four-branch mapping (completed /
+ * Unit coverage for the shared, pure `presentDispatchResult` helper.
+ * It reproduces the Agent tool's four-branch mapping (completed /
  * failed-with-partial / failed-no-output / aborted). The Agent-tool regression
  * proof lives in subagent-outcomes.test.ts; here we exercise the helper
  * directly, on hand-built DispatchResult values, over the full

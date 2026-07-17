@@ -3,7 +3,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 /**
- * Task tracking tools (plan §4.8): the current `Task*` surface
+ * Task tracking tools: the `Task*` surface
  * (TaskCreate/TaskUpdate/TaskList/TaskGet) backed by an in-memory store,
  * plus a legacy `TodoWrite` mapping (tier "partial") that replaces the
  * store contents wholesale.
@@ -218,7 +218,6 @@ export function createTaskTools(): { tools: ToolDefinition[]; store: TaskStore }
     },
   });
 
-  // Legacy mapping (tier "partial"): TodoWrite replaces the whole store.
   const todoWrite = defineTool({
     name: "TodoWrite",
     label: "Todo Write",

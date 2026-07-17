@@ -15,7 +15,7 @@ import {
 import type { ClaudeSettings, ClaudeSkill } from "../src/types.js";
 
 /**
- * Assembly-level coverage for loadClaudeProject (plan §3, §4.9, §5): settings,
+ * Assembly-level coverage for loadClaudeProject: settings,
  * skills, agents, and plugin content folded into one project model. These tests
  * build on-disk fixtures — they guard the wiring, not just the parsers.
  */
@@ -178,7 +178,7 @@ describe("loadClaudeProject — plugin namespacing", () => {
   });
 });
 
-describe("loadClaudeProject — nested qualified names (G4)", () => {
+describe("loadClaudeProject — nested qualified names", () => {
   it("resolves a nested command's qualified name WITHOUT a collision; the plain stem resolves too", () => {
     const { repo, userDir } = makeBase();
     write(
@@ -229,7 +229,7 @@ describe("findByName", () => {
   });
 });
 
-describe("loadClaudeProject — skillOverrides consumption (§5)", () => {
+describe("loadClaudeProject — skillOverrides consumption", () => {
   it('honors "off", "user-invocable-only", and "name-only" and diagnoses unknown values', () => {
     const { repo, userDir } = makeBase();
     writeSkill(path.join(repo, ".claude", "skills"), "gone", "to be disabled");
@@ -280,8 +280,8 @@ describe("loadClaudeProject — bundled plugin diagnostics", () => {
 });
 
 // ---------------------------------------------------------------------------
-// buildSystemPromptSuffix — listing degradation sink (G5) + Active skills
-// budgeting (G7)
+// buildSystemPromptSuffix — listing degradation sink + Active skills
+// budgeting
 // ---------------------------------------------------------------------------
 
 function suffixSettings(): ClaudeSettings {
@@ -322,7 +322,7 @@ function mkListedSkill(name: string, description: string, whenToUse?: string): C
   };
 }
 
-describe("buildSystemPromptSuffix — skill-listing degradation sink (G5)", () => {
+describe("buildSystemPromptSuffix — skill-listing degradation sink", () => {
   // skillListingBudgetFraction 0.001 × 2M contextWindowChars → 2000-char budget.
   function build(skills: ClaudeSkill[], onDiagnostic: Parameters<typeof buildSystemPromptSuffix>[0]["onDiagnostic"]) {
     return buildSystemPromptSuffix({
@@ -368,7 +368,7 @@ describe("buildSystemPromptSuffix — skill-listing degradation sink (G5)", () =
   });
 });
 
-describe("buildSystemPromptSuffix — Active skills budgeting (G7)", () => {
+describe("buildSystemPromptSuffix — Active skills budgeting", () => {
   function buildWithActive(active: Array<[string, string]>): string {
     const state = newSessionContextState([]);
     for (const [name, body] of active) state.activeSkills.set(name, body);

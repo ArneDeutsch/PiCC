@@ -14,7 +14,7 @@ import {
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 
 /**
- * F16 t02 — fork-spawns-fork guard (runtime-set `dispatcherIsFork` marker).
+ * Fork-spawns-fork guard (runtime-set `dispatcherIsFork` marker).
  *
  * The nested Agent/Task tool with the marker threading exists ONLY through the
  * real `picc()` wiring (customToolsFor → createAgentToolDefinition → dispatchOpts),
@@ -153,7 +153,7 @@ function setFixtureMaxDepth(n: number): number {
   return prev;
 }
 
-describe("F16 t02 — a fork cannot spawn another fork (runtime-set marker)", () => {
+describe("a fork cannot spawn another fork (runtime-set marker)", () => {
   it("refuses a fork's nested `subagent_type: fork` with the DISTINCT cannot-spawn notice, via the marker (not the depth guard)", async () => {
     // env unset ⇒ inheritance enabled (PiCC default).
     const { h, agentTool, nested } = await wireFork({
@@ -350,7 +350,7 @@ describe("F16 t02 — a fork cannot spawn another fork (runtime-set marker)", ()
   });
 
   it("a fork dispatch ABORTED before start leaves NO on-disk fork transcript (forkFrom never runs)", async () => {
-    // FIX 3 lock-in: `forkFrom` is eager + synchronous (it writes the full parent
+    // `forkFrom` is eager + synchronous (it writes the full parent
     // conversation to disk the instant it is called). Its construction is DEFERRED
     // to after the abort-before-start / SubagentStart-block / abort-after-worktree
     // gates, so a dispatch aborted before it starts must never touch the fork

@@ -19,7 +19,7 @@ const REFERENCES_DIR = path.join(SKILL_DIR, "references");
 
 const norm = (p: string): string => p.replace(/\\/g, "/");
 
-describe("implement-feature router (F12 t01)", () => {
+describe("implement-feature router", () => {
   // Use the real loader (not fs.readFileSync): loadSkillBody/parseMarkdown normalize
   // CRLF and strip the BOM, so the char count is deterministic cross-platform.
   const { skills } = loadSkills([{ dir: SKILLS_DIR, scope: "project" }], []);
@@ -71,7 +71,7 @@ describe("implement-feature router (F12 t01)", () => {
     }
 
     // Every reference file on disk must be linked from the router (catches a dropped routing line).
-    // Glob the actual references/*.md rather than hardcoding a file count — t02–t05 add more.
+    // Glob the actual references/*.md rather than hardcoding a file count.
     const onDisk = fs
       .readdirSync(REFERENCES_DIR)
       .filter((n) => n.endsWith(".md"))
@@ -163,10 +163,10 @@ describe("description-based naming contract", () => {
     expect(body).not.toMatch(/next free|pick the next free|feature\/<nn>|f<nn>/i);
   });
 
-  it("Phase 7 review fan-out surfaces new untracked non-ignored files, not bare git diff HEAD (GitHub #13)", () => {
+  it("Phase 7 review fan-out surfaces new untracked non-ignored files, not bare git diff HEAD", () => {
     // Loose positive floor: the fan-out step must stage (or otherwise surface) new untracked
     // non-ignored files so a reviewer's view is complete — guarding against a silent regression to
-    // bare `git diff HEAD`, the exact recurrence #13 documents three times. Accept either mechanism
+    // bare `git diff HEAD`, which has recurred repeatedly in practice. Accept either mechanism
     // (`git add -A` staging or a reviewer `git status --short` read); no brittle exact-phrase pin.
     const body = collapsed("references/workflow-detail.md");
     expect(body).toMatch(/git add -a|git status --short/);
@@ -297,10 +297,19 @@ describe("description-based naming contract", () => {
     expect(contributing).not.toMatch(/git checkout feature\/<nn>-<slug>/i);
   });
 
-  it("gitignores the per-feature process folders but not doc/design", () => {
+  it("gitignores the per-feature process folders and nothing else under doc/", () => {
     const gitignore = fs.readFileSync(path.resolve(SKILL_DIR, "../../../.gitignore"), "utf8").replace(/\r\n/g, "\n");
-    for (const entry of ["doc/plan/", "doc/research/", "doc/review/"]) expect(gitignore).toContain(entry);
-    expect(gitignore).not.toContain("doc/design/");
+    const processFolders = ["doc/plan/", "doc/research/", "doc/review/"];
+    for (const entry of processFolders) expect(gitignore).toContain(entry);
+    // Everything else under doc/ is committed documentation. Assert the ignore list
+    // reaches no further than the three process folders — a broader pattern would
+    // untrack the docs silently, which is how this used to be checked one folder at
+    // a time.
+    const docEntries = gitignore
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith("#") && line.includes("doc/"));
+    expect(docEntries.sort()).toEqual([...processFolders].sort());
   });
 
   it("no longer ships a CHANGELOG.md at the repo root", () => {
@@ -308,15 +317,15 @@ describe("description-based naming contract", () => {
   });
 });
 
-describe("untrack-process-artifacts (t03) — implement-feature rework", () => {
+describe("untrack-process-artifacts — implement-feature rework", () => {
   const read = (relative: string): string =>
     fs.readFileSync(path.join(SKILL_DIR, relative), "utf8").replace(/\r\n/g, "\n");
   const collapsed = (relative: string): string => read(relative).toLowerCase().replace(/\s+/g, " ");
   const AGENTS_DIR = path.resolve(SKILLS_DIR, "..", "agents");
 
   it("carries no case-insensitive 'changelog' anywhere under .claude/skills or .claude/agents", () => {
-    // Regression guard for the whole purge — this covers t01/t02's files too, which is why t03
-    // (its scan) depends on t02. Reuse the loader's own file walker; CRLF is irrelevant to a
+    // Regression guard for the whole purge — the scan covers every phase's files. Reuse the
+    // loader's own file walker; CRLF is irrelevant to a
     // case-folded substring test.
     const files = [
       ...walkFiles(SKILLS_DIR, (n) => n.endsWith(".md")),
@@ -355,12 +364,12 @@ describe("untrack-process-artifacts (t03) — implement-feature rework", () => {
     expect(body).not.toContain(
       "`<feature-slug>: plan — ` and `<feature-slug>: review — ` must equal",
     );
-    // Refinement #8: the absent-plan-folder resume branch does not fall through to the generic stop.
+    // The absent-plan-folder resume branch does not fall through to the generic stop.
     expect(body).toContain("never committed, and cannot be recovered here");
   });
 });
 
-describe("proposal-gate wiring floor markers (evaluate-skill t04)", () => {
+describe("proposal-gate wiring floor markers", () => {
   // Loose, case-insensitive, whitespace-collapsed structural checks. The proposal-gate
   // wiring lives in the REFERENCE files (Phase 8 gate + Phase 1 annotate), NOT the router
   // body — loadSkillBody never reads reference bodies, and the router clause is optional —
@@ -393,7 +402,7 @@ describe("proposal-gate wiring floor markers (evaluate-skill t04)", () => {
   });
 });
 
-describe("evidence-grounded evaluation wiring (F23 t04)", () => {
+describe("evidence-grounded evaluation wiring", () => {
   // Loose, whitespace-collapsed, case-insensitive checks on the two implement-feature
   // reference files that consume proposal-gate. Dash seams are built from code points so
   // this source stays ASCII-clean; asserted path/tool examples use forward slashes (the
@@ -443,7 +452,7 @@ describe("evidence-grounded evaluation wiring (F23 t04)", () => {
   });
 });
 
-describe("incoming-ticket evaluation preflight (#50 t04)", () => {
+describe("incoming-ticket evaluation preflight", () => {
   // Loose, whitespace-collapsed, case-insensitive structural floors for the Phase 0 preflight
   // (redirect free text unread -> evaluator -> approve -> hydrate) and the resume isolation. The
   // true runtime no-write / no-raw-ingest guarantees are live-eval concerns; the assertable surface
@@ -532,11 +541,11 @@ describe("incoming-ticket evaluation preflight (#50 t04)", () => {
   });
 });
 
-describe("Phase 8 coordinator-run advisory issue search (evaluate-scoring-contract t05)", () => {
+describe("Phase 8 coordinator-run advisory issue search", () => {
   // Loose, whitespace-collapsed, case-insensitive checks on ticket-integration.md's Phase 8 hook:
   // the coordinator (holding gh/Bash) runs ONE read-only `gh issue list --search` per surfaced
   // finding, feeds the result to the gate as a github_verified anchor, with coordinator-authored
-  // terms (never target-lifted), the #66 anti-suppression floor, a visible degrade, and a strict
+  // terms (never target-lifted), the anti-suppression floor, a visible degrade, and a strict
   // separation from Rule 9's filing-time metadata scan. The Phase 8 gate pins, the Rule 9
   // metadata-only scan, and the Phase-1 "no new gh" pin are covered by their existing blocks and
   // stay green (the re-scope is Phase-8-only). We do NOT touch Rule 9 or ticket-creation.md.
@@ -562,7 +571,7 @@ describe("Phase 8 coordinator-run advisory issue search (evaluate-scoring-contra
     expect(body).toContain("frozen-title character ban");
   });
 
-  it("Phase 8 states the #66 floor (hit lowers novelty, never by itself drops below threshold), candidate wording + visible degrade", () => {
+  it("Phase 8 states the novelty floor (hit lowers novelty, never by itself drops below threshold), candidate wording + visible degrade", () => {
     const body = collapse(TICKET_INTEGRATION_PATH);
     expect(body).toContain("**never by itself** drops it below the file/keep-open threshold");
     expect(body).toContain("possible existing coverage:");
@@ -571,8 +580,7 @@ describe("Phase 8 coordinator-run advisory issue search (evaluate-scoring-contra
     expect(body).toContain("only** from that json's `number`/`url`");
     expect(body).toContain("never from a target-body `#n`");
     // Defense-in-depth at the create site: the Phase 8 coordinator both receives the search JSON AND
-    // runs `gh issue create`, so a returned attacker title must never be reflected into a write
-    // (evaluate-scoring-contract t05).
+    // runs `gh issue create`, so a returned attacker title must never be reflected into a write.
     expect(body).toContain("returned issue title as untrusted display data");
     expect(body).toContain("never** interpolate a returned title into `gh issue create`");
   });
@@ -582,7 +590,7 @@ describe("Phase 8 coordinator-run advisory issue search (evaluate-scoring-contra
     expect(body).toContain("feeds *scoring*, not filing");
     // The advisory search and Rule 9's filing-time dedup are the SAME `gh issue list --search` read,
     // invoked for two different purposes (novelty score vs. double-file prevention) — not conflated
-    // with the html_url metadata scan (evaluate-scoring-contract t05).
+    // with the html_url metadata scan.
     expect(body).toContain("same read** as rule 9's filing-time `gh issue list --search` dedup");
     // The metadata-only html_url scan is correctly labelled a DIFFERENT mechanism (Phase 9 comment
     // idempotency), NOT the filing-time issue dedup.

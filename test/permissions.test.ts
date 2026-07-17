@@ -179,7 +179,7 @@ describe("matchesRule — path tools (Read/Edit/Write/Glob/Grep)", () => {
     expect(matchesRule("Read(.env)", call("Read", { file_path: "a/b/.envrc" }))).toBe(false);
   });
 
-  it("a Read bare-filename rule gates read-family calls at any depth (F26)", () => {
+  it("a Read bare-filename rule gates read-family calls at any depth", () => {
     // The Read family expansion (Grep/NotebookRead) inherits the any-depth
     // bare-filename semantics via the shared path matcher.
     expect(matchesRule("Read(.env)", call("Grep", { path: "a/b/.env" }))).toBe(true);
@@ -215,7 +215,7 @@ describe("matchesRule — Windows path normalization (D2, platform-independent)"
     expect(matchesRule("Read(//c/**/.env)", call("Read", { file_path: "C:\\proj\\.envrc" }))).toBe(false);
   });
 
-  it("a Read drive-letter rule gates a read-family call in any flavor (F26)", () => {
+  it("a Read drive-letter rule gates a read-family call in any flavor", () => {
     // The Read → read-family expansion inherits D2 drive normalization: a
     // //c/** rule covers a Grep whose path is a drive-lettered input.
     expect(matchesRule("Read(//c/**/.env)", call("Grep", { path: "C:\\proj\\.env" }))).toBe(true);
@@ -383,7 +383,7 @@ describe("PermissionEngine.evaluate", () => {
   });
 });
 
-describe("PermissionEngine — MCP allow-rule glob validation (D4)", () => {
+describe("PermissionEngine — MCP allow-rule glob validation", () => {
   const mcpCall = call("mcp__github__create_issue");
 
   it("an unanchored mcp__* allow rule is ignored and reported as a warning", () => {

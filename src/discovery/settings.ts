@@ -10,7 +10,7 @@ import type {
 } from "../types.js";
 
 /**
- * Settings loading & merging (plan §3, §5; research doc §4).
+ * Settings loading & merging.
  *
  * Reads the standard settings hierarchy in ascending precedence:
  *   user (`<userDir>/settings.json`)
@@ -42,7 +42,7 @@ export interface LoadSettingsOptions {
   managedPaths?: string[];
 }
 
-/** Keys recognized but gating DEFERRED subsystems (plan §7) — recorded, no-op. */
+/** Keys recognized but gating DEFERRED subsystems — recorded, no-op. */
 const DEFERRED_TOP_KEYS = new Set([
   "mcpServers",
   "enableAllProjectMcpServers",
@@ -64,7 +64,7 @@ const DEFERRED_TOP_KEYS = new Set([
 
 const KNOWN_HANDLER_TYPES: readonly string[] = ["command", "http", "prompt", "agent", "mcp_tool"];
 
-/** Default managed/policy settings locations (research doc §4.1; degrade-silent when absent). */
+/** Default managed/policy settings locations; degrade-silent when absent. */
 function defaultManagedPaths(): string[] {
   if (process.platform === "win32") {
     return [path.join("C:\\", "ProgramData", "ClaudeCode", "managed-settings.json")];
@@ -86,7 +86,7 @@ function createDefaultSettings(): ClaudeSettings {
     subagentsEnabled: true,
     // Main-session-only by default: the main conversation may spawn depth-1
     // subagents, but those subagents cannot recurse. This is a deliberate PiCC
-    // divergence from Claude Code's "up to 5 nesting levels" contract (audit E3):
+    // divergence from Claude Code's "up to 5 nesting levels" contract:
     // recursive fan-out under a depth-5 default drains a personal ChatGPT/Codex
     // subscription with little operator visibility. Opt into nesting explicitly via
     // `subagents.maxDepth: 2..5` (a PiCC extension key, not Claude-settings parity).
@@ -454,7 +454,7 @@ function applyPermissions(value: unknown, scope: Scope, source: string, out: Cla
         );
         break;
       case "defaultMode":
-        // Interactive permission modes are a deferred subsystem (plan §6.1/§7): parsed, reported, no-op.
+        // Interactive permission modes are a deferred subsystem: parsed, reported, no-op.
         out.deferredKeys.push({ key: "permissions.defaultMode", scope });
         if (typeof sub === "string") out.permissions.defaultMode = sub;
         break;
@@ -633,7 +633,7 @@ function applySettingsFile(
         break;
       }
       case "claudeMd": {
-        // Inline CLAUDE.md content is a managed-policy mechanism (audit B3): only
+        // Inline CLAUDE.md content is a managed-policy mechanism: only
         // the managed scope may inject it; elsewhere it is ignored with a diagnostic.
         if (scope !== "managed") {
           out.diagnostics.push({
@@ -707,10 +707,6 @@ function applySettingsFile(
   }
 }
 
-/**
- * Load and merge the full settings hierarchy for a project.
- * Never throws — every problem degrades to a Diagnostic on the result.
- */
 /** Path equality that tolerates Windows case-insensitivity. */
 function samePath(a: string, b: string): boolean {
   const ra = path.resolve(a);
@@ -722,7 +718,7 @@ function samePath(a: string, b: string): boolean {
 /**
  * Directories contributing project-scope settings, ordered ROOT-FIRST so the
  * nearest directory is applied last (= wins on scalar conflicts). Mirrors the
- * monorepo walk-up of discoverArtifactDirs (plan §3): cwd up to projectRoot.
+ * monorepo walk-up of discoverArtifactDirs: cwd up to projectRoot.
  */
 function settingsDirChain(cwd: string, projectRoot: string): string[] {
   const chain: string[] = [];
@@ -738,6 +734,10 @@ function settingsDirChain(cwd: string, projectRoot: string): string[] {
   return chain.reverse();
 }
 
+/**
+ * Load and merge the full settings hierarchy for a project.
+ * Never throws — every problem degrades to a Diagnostic on the result.
+ */
 export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
   const settings = createDefaultSettings();
   const managed = opts.managedPaths ?? defaultManagedPaths();

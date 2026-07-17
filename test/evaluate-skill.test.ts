@@ -20,7 +20,7 @@ const SETTINGS_PATH = path.join(ROOT, ".claude", "settings.json");
 
 const norm = (p: string): string => p.replace(/\\/g, "/");
 
-describe("evaluate router (evaluate-skill t01)", () => {
+describe("evaluate router", () => {
   // Use the real loader (not fs.readFileSync): loadSkillBody/parseMarkdown normalize
   // CRLF and strip the BOM, so the char count is deterministic cross-platform.
   const { skills } = loadSkills([{ dir: SKILLS_DIR, scope: "project" }], []);
@@ -61,7 +61,7 @@ describe("evaluate router (evaluate-skill t01)", () => {
 
     // Every reference file on disk must be linked from the router (catches a dropped
     // routing line). Glob the actual references/*.md rather than hardcoding a count —
-    // t02–t04 add the per-mode files later.
+    // The per-mode files are added later.
     const onDisk = fs
       .readdirSync(REFERENCES_DIR)
       .filter((n) => n.endsWith(".md"))
@@ -74,7 +74,7 @@ describe("evaluate router (evaluate-skill t01)", () => {
 
     // The two shared references must be present (superset check, not an exact
     // set) — the bidirectional glob integrity above already guards completeness,
-    // and t02–t04 add more mode files, so don't pin the count here.
+    // and more mode files may be added, so don't pin the count here.
     const onDiskSet = new Set(onDisk);
     expect(onDiskSet.has("references/evaluation-engine.md")).toBe(true);
     expect(onDiskSet.has("references/write-discipline.md")).toBe(true);
@@ -106,7 +106,7 @@ describe("evaluate router (evaluate-skill t01)", () => {
   });
 });
 
-describe("issue-eval mode floor markers (evaluate-skill t02)", () => {
+describe("issue-eval mode floor markers", () => {
   // Loose, case-insensitive, whitespace-collapsed structural checks: assert the
   // load-bearing close-invariant + canned-comment-by-category language survives,
   // NOT exact prose. We do NOT test LLM judgment or the gh writes themselves.
@@ -163,7 +163,7 @@ describe("issue-eval mode floor markers (evaluate-skill t02)", () => {
   });
 });
 
-describe("pr-eval mode floor markers (evaluate-skill t03)", () => {
+describe("pr-eval mode floor markers", () => {
   // Loose, case-insensitive, whitespace-collapsed structural checks: assert the
   // load-bearing never-merge invariant + the canonical verification-applicability
   // rule survive, NOT exact prose. We do NOT test LLM judgment or the gh writes.
@@ -212,7 +212,7 @@ describe("pr-eval mode floor markers (evaluate-skill t03)", () => {
   });
 });
 
-describe("proposal-gate mode floor markers (evaluate-skill t04)", () => {
+describe("proposal-gate mode floor markers", () => {
   // Loose, case-insensitive, whitespace-collapsed structural checks: assert the
   // load-bearing structural-zero-writes + gate/annotate language survives, NOT exact
   // prose. We do NOT test LLM judgment or any gh write (there is none in this mode).
@@ -262,9 +262,9 @@ describe("proposal-gate mode floor markers (evaluate-skill t04)", () => {
   });
 });
 
-describe("proposal-gate grounding + evidence anchors (evaluate-skill t02)", () => {
+describe("proposal-gate grounding + evidence anchors", () => {
   // Loose, case-insensitive, whitespace-collapsed obligation checks (handles CRLF).
-  // These pin the F21 fix OBLIGATIONS — light ≠ ungrounded, prose-only-only-with-
+  // These pin the fix OBLIGATIONS — light ≠ ungrounded, prose-only-only-with-
   // justification, second-pass higher-stakes/no-quota/grounded, anchors in the bounded
   // return AND the rendered block — not mere keywords. We do NOT test LLM judgment.
   const collapse = (p: string): string =>
@@ -284,7 +284,7 @@ describe("proposal-gate grounding + evidence anchors (evaluate-skill t02)", () =
     expect(body).toContain("scores the seven criteria");
     // Input is reframed to proposal + project evidence, not prose alone.
     expect(body).toContain("the proposal plus project evidence");
-    // Grounding is the evaluator's filesystem job — no new gh FOR GROUNDING (t05 re-scopes this to
+    // Grounding is the evaluator's filesystem job — no new gh FOR GROUNDING (later re-scoped to
     // the evaluator/sandbox grounding; the coordinator's separate advisory search is a non-grounding
     // read). The envelope-unchanged half stays true and green here.
     expect(body).toContain("grounding is the evaluator's filesystem job");
@@ -339,7 +339,7 @@ describe("proposal-gate grounding + evidence anchors (evaluate-skill t02)", () =
   });
 });
 
-describe("verification-contract repo artifacts (evaluate-skill t05)", () => {
+describe("verification-contract repo artifacts", () => {
   // These files are read RAW (not via loadSkillBody), and `.gitattributes` does not
   // force LF on `.md`, so on Windows they check out CRLF. Normalize \r\n → \n before
   // any substring/line assertion, or the checks would flake cross-platform.
@@ -387,7 +387,7 @@ describe("verification-contract repo artifacts (evaluate-skill t05)", () => {
   });
 });
 
-describe("evaluator sandbox agent (evaluate-skill t01)", () => {
+describe("evaluator sandbox agent", () => {
   const { agents, diagnostics } = loadAgents([{ dir: AGENTS_DIR, scope: "project" }]);
 
   // allKnownToolNames() is a private closure in src/index.ts; inline an equivalent
@@ -439,7 +439,7 @@ describe("evaluator sandbox agent (evaluate-skill t01)", () => {
   });
 });
 
-describe("engine grounding + evidence-anchor contract floor markers (evaluate-skill t01)", () => {
+describe("engine grounding + evidence-anchor contract floor markers", () => {
   // Loose, case-insensitive, whitespace-collapsed content assertions (handles CRLF).
   // These pin the OBLIGATION/CONDITION of the grounding contract, not loose keywords.
   const collapse = (p: string): string =>
@@ -538,7 +538,7 @@ describe("engine grounding + evidence-anchor contract floor markers (evaluate-sk
   });
 });
 
-describe("evaluator return contract admits repo-relative anchors (evaluate-skill t01)", () => {
+describe("evaluator return contract admits repo-relative anchors", () => {
   const collapse = (p: string): string =>
     fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
 
@@ -570,7 +570,7 @@ describe("evaluator return contract admits repo-relative anchors (evaluate-skill
   });
 });
 
-describe("issue-eval grounding + keep-open evidence anchors (evaluate-skill t03)", () => {
+describe("issue-eval grounding + keep-open evidence anchors", () => {
   // Loose, case-insensitive, whitespace-collapsed obligation checks (handles CRLF).
   // These pin the job-2 grounding OBLIGATIONS: the rating wave grounds in the trusted
   // codebase distinct from the isolated issue file (redirect isolation intact), and the
@@ -654,7 +654,7 @@ describe("issue-eval grounding + keep-open evidence anchors (evaluate-skill t03)
   });
 });
 
-describe("pr-eval block acknowledges the evidence-anchor line (evaluate-skill t03)", () => {
+describe("pr-eval block acknowledges the evidence-anchor line", () => {
   // Loose, case-insensitive, whitespace-collapsed obligation checks (handles CRLF).
   // pr-eval already grounds (it reads the diff/tree), so the Step-6 edit only acknowledges
   // the engine's **Evidence:** line and applies the uniform anchor constraints to its public
@@ -700,7 +700,7 @@ describe("pr-eval block acknowledges the evidence-anchor line (evaluate-skill t0
   });
 });
 
-describe("evaluate deny floor (evaluate-skill t01)", () => {
+describe("evaluate deny floor", () => {
   const settings = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf8")) as {
     enabledPlugins?: Record<string, boolean>;
     permissions?: { deny?: string[] };
@@ -818,11 +818,11 @@ describe("evaluate deny floor (evaluate-skill t01)", () => {
   });
 });
 
-describe("rating vocabulary + per-criterion score direction (evaluate-scoring-contract t01)", () => {
+describe("rating vocabulary + per-criterion score direction", () => {
   // Loose, case-insensitive, whitespace-collapsed structural checks (handles CRLF).
   // These pin the locked rating vocabulary and the per-criterion score direction, now
   // rendered in plain language and folded into the Criterion cell of the canonical block
-  // (no separate Direction column) — the #47 score-direction acceptance. We do NOT test
+  // (no separate Direction column) — the score-direction acceptance. We do NOT test
   // LLM judgment. All pinned phrases are ASCII, so no String.fromCodePoint build is
   // needed here (the dash-bearing seams the suite pins elsewhere are the evidence-anchor
   // item format, unaffected by this task).
@@ -893,7 +893,7 @@ describe("rating vocabulary + per-criterion score direction (evaluate-scoring-co
   });
 });
 
-describe("write-discipline points at the element-7 anchor re-validation (F23 close-fix)", () => {
+describe("write-discipline points at the element-7 anchor re-validation", () => {
   const collapse = (p: string): string =>
     fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
   const WRITE_DISCIPLINE_PATH = path.join(REFERENCES_DIR, "write-discipline.md");
@@ -909,11 +909,11 @@ describe("write-discipline points at the element-7 anchor re-validation (F23 clo
   });
 });
 
-describe("locked bounded reviewer return + fail-safe parse (evaluate-scoring-contract t02)", () => {
+describe("locked bounded reviewer return + fail-safe parse", () => {
   // Loose, case-insensitive, whitespace-collapsed structural checks (handles CRLF).
-  // These pin the t02 contract: ONE locked bounded reviewer return shape defined in the
+  // These pin the contract: ONE locked bounded reviewer return shape defined in the
   // engine (four parts, same shape regardless of role), a provenance-marker slot bound to
-  // the justification field (enum owned by t03), a conservative coordinator fail-safe parse
+  // the justification field, a conservative coordinator fail-safe parse
   // for non-conforming returns, the three modes pointing at the engine schema, and the
   // evaluator agent's return contract (bullet 1) referencing it. We do NOT test LLM
   // judgment. All pinned phrases here are ASCII, so no String.fromCodePoint build is needed.
@@ -953,12 +953,12 @@ describe("locked bounded reviewer return + fail-safe parse (evaluate-scoring-con
     expect(body).toContain("never a runtime-enforced contract");
   });
 
-  it("binds a provenance-marker slot to the justification field (enum owned by t03)", () => {
+  it("binds a provenance-marker slot to the justification field", () => {
     const body = collapse(ENGINE_PATH);
     expect(body).toContain("each load-bearing justification carries a provenance marker");
     // The slot is bound to the justification field, not left anchor-only.
     expect(body).toContain("this slot is bound to the justification field");
-    // t02 opens the slot; t03 defines the enum vocabulary (forward reference).
+    // The slot is opened here; the enum vocabulary is defined separately (forward reference).
     expect(body).toContain("this slot is opened by the locked bounded reviewer return above");
     expect(body).toContain('defined in element 3 of "the evidence-anchor contract"');
   });
@@ -992,9 +992,9 @@ describe("locked bounded reviewer return + fail-safe parse (evaluate-scoring-con
   });
 });
 
-describe("provenance enum + bare-#N reconciliation + github_verified (evaluate-scoring-contract t03)", () => {
+describe("provenance enum + bare-#N reconciliation + github_verified", () => {
   // Loose, case-insensitive, whitespace-collapsed structural checks (handles CRLF).
-  // These pin the t03 contract: a CLOSED five-token provenance enum split 3
+  // These pin the contract: a CLOSED five-token provenance enum split 3
   // sandbox-emittable / 2 coordinator-only (the evaluator emits neither coordinator-only
   // class), provenance-by-origin-channel, the target_claim-never-verified prohibition +
   // conservative missing/ambiguous default, the required-marker OBLIGATION (not just token
@@ -1074,7 +1074,7 @@ describe("provenance enum + bare-#N reconciliation + github_verified (evaluate-s
     const body = collapse(ENGINE_PATH);
     // The evaluator-scoped truth is preserved verbatim (also pinned at the element-5 seam).
     expect(body).toContain("filesystem-only evaluator does not query");
-    // Paired with the coordinator-supplies-it forward-reference to t05.
+    // Paired with the coordinator-supplies-it forward reference.
     expect(body).toContain("may supply that cross-feature tracking signal");
     expect(body).toContain("the search wiring lives in proposal-gate.md");
   });
@@ -1101,7 +1101,7 @@ describe("provenance enum + bare-#N reconciliation + github_verified (evaluate-s
 
   it("proposal-gate pairs the tracking note with coordinator-supplied github_verified + rides the density split", () => {
     const body = collapse(PROPOSAL_GATE_PATH);
-    // The coordinator supplies the cross-feature signal as a github_verified anchor (t05),
+    // The coordinator supplies the cross-feature signal as a github_verified anchor,
     // never the evaluator. (Backtick-wrapped token in the prose, so match with the backtick.)
     expect(body).toContain("`github_verified` provenance anchor");
     expect(body).toContain("provenance rides this same split");
@@ -1132,7 +1132,7 @@ describe("provenance enum + bare-#N reconciliation + github_verified (evaluate-s
     expect(body).toContain("only on decision-flipping claims");
     expect(body).toContain("every load-bearing justification carries its cue");
     // Must NOT set the overall pick-list budget here — that home is implement-feature's
-    // ticket-integration reference (t04 defines reviewer EXECUTION budgets, not the anchor budget).
+    // ticket-integration reference (reviewer EXECUTION budgets are separate from the anchor budget).
     expect(body).toContain("does **not** set the pick-list's overall anchor budget");
     expect(body).toContain("ticket-integration reference");
   });
@@ -1156,10 +1156,10 @@ describe("provenance enum + bare-#N reconciliation + github_verified (evaluate-s
   });
 });
 
-describe("deterministic synthesis, disagreement disclosure, reviewer budgets (evaluate-scoring-contract t04)", () => {
+describe("deterministic synthesis, disagreement disclosure, reviewer budgets", () => {
   // Loose, case-insensitive, whitespace-collapsed structural checks (handles CRLF).
-  // These pin the t04 contract: a deterministic synthesis/aggregation rule over t02's
-  // locked verdict fields that weights t03's provenance via an explicit trust ordering of
+  // These pin the contract: a deterministic synthesis/aggregation rule over the
+  // locked verdict fields that weights provenance via an explicit trust ordering of
   // all five classes (github_verified named as a verified class), treats cost-vs-benefit as
   // a DERIVED row (not a co-equal input), does not assume every row is ordinal-with-direction,
   // preserves the conservative keep-open bias, surfaces material reviewer disagreement on its
@@ -1182,7 +1182,7 @@ describe("deterministic synthesis, disagreement disclosure, reviewer budgets (ev
     // It is a fixed, auditable rule, NOT coordinator discretion.
     expect(body).toContain("does **not** synthesise by discretion");
     expect(body).toContain("fixed, auditable rule");
-    // It consumes t02's locked verdict fields.
+    // It consumes the locked verdict fields.
     expect(body).toContain(`the locked bounded reviewer return`);
   });
 
@@ -1198,7 +1198,7 @@ describe("deterministic synthesis, disagreement disclosure, reviewer budgets (ev
     ]) {
       expect(body).toContain(token);
     }
-    // github_verified is explicitly a VERIFIED class carrying real, equal weight (t05 novelty seam).
+    // github_verified is explicitly a VERIFIED class carrying real, equal weight (novelty seam).
     expect(body).toContain("`github_verified` is a verified class carrying the same weight");
     // The verified trio outweighs target_claim; inference sits below verified.
     expect(body).toContain("the verified trio");
@@ -1292,17 +1292,17 @@ describe("deterministic synthesis, disagreement disclosure, reviewer budgets (ev
   });
 
   it("keeps the disagreement heading and synthesis heading em-dash-formatted (cross-platform dash seam)", () => {
-    // The two t04 headings carry an em-dash; assert the glyph via code point, never a literal.
+    // The two headings carry an em-dash; assert the glyph via code point, never a literal.
     const raw = fs.readFileSync(ENGINE_PATH, "utf8");
     expect(raw).toContain(`Disagreement disclosure ${EM} on its own dedicated line`);
     expect(raw).toContain(`Reviewer execution budgets ${EM} honest strength tiers`);
   });
 });
 
-describe("advisory coordinator gh issue search -> github_verified anchor (evaluate-scoring-contract t05)", () => {
+describe("advisory coordinator gh issue search -> github_verified anchor", () => {
   // Loose, case-insensitive, whitespace-collapsed structural checks (handles CRLF). These pin the
-  // t05 contract in proposal-gate.md + SKILL.md: the coordinator-run, read-only advisory issue
-  // search that feeds a distinct github_verified anchor; the #66 novelty rule floored so a hit
+  // The contract in proposal-gate.md + SKILL.md: the coordinator-run, read-only advisory issue
+  // search that feeds a distinct github_verified anchor; the novelty rule floored so a hit
   // never by itself suppresses a finding; the safe-construction constraints (terms model-authored,
   // one-quoted-arg + character ban as MODEL discipline with a stated quoting style, --repo <target>
   // validated, provenance-by-origin-channel, separate anchor validation lane, returned-title-as-
@@ -1375,14 +1375,14 @@ describe("advisory coordinator gh issue search -> github_verified anchor (evalua
     expect(body).toContain("never** interpolate a returned title");
   });
 
-  it("proposal-gate states the #66 novelty rule AND floors it so a hit never by itself suppresses a finding", () => {
+  it("proposal-gate states the novelty rule AND floors it so a hit never by itself suppresses a finding", () => {
     const body = collapse(PROPOSAL_GATE_PATH);
     // The rule the feature exists for: a hit lowers novelty.
     expect(body).toContain("lowers the proposal's novelty/value contribution");
     // Attacker-plantable, so the anti-suppression floor holds.
     expect(body).toContain("advisory and attacker-plantable");
     // Pin the NEGATION too: inverting the floor to "may by itself move a finding below…" (the exact
-    // attack this floor prevents) must fail the test (evaluate-scoring-contract t05).
+    // attack this floor prevents) must fail the test.
     expect(body).toContain("never by itself move a finding below the file/keep-open threshold");
     // Surfaced as a candidate near-match, never an overclaimed "already tracked", never auto-dedupe.
     expect(body).toContain("candidate near-match");
@@ -1399,7 +1399,7 @@ describe("advisory coordinator gh issue search -> github_verified anchor (evalua
     expect(body).toContain("the degrade is **visible**, never silent");
     expect(body).toContain("novelty not cross-checked against github");
     // A global cause (gh absent/unauthenticated) degrades ONCE per batch; only a per-call failure
-    // (rate-limit/timeout) repeats the notice per finding (evaluate-scoring-contract t05).
+    // (rate-limit/timeout) repeats the notice per finding.
     expect(body).toContain("degrade once per batch when the cause is global");
     expect(body).toContain("once for the batch");
     expect(body).toContain("per-finding only for a per-call failure");
@@ -1413,7 +1413,7 @@ describe("advisory coordinator gh issue search -> github_verified anchor (evalua
     // The two-layer truthful framing — sandbox zero-network vs. coordinator already gh-capable.
     expect(body).toContain("new instance of an existing role, never a new capability class");
     expect(body).toContain('never call the skill as a whole "zero-network"');
-    // The envelope-unchanged half stays literally true (also pinned by the t02 grounding test).
+    // The envelope-unchanged half stays literally true (also pinned by the grounding test).
     expect(body).toContain("the fixed action envelope is unchanged");
   });
 
@@ -1424,14 +1424,13 @@ describe("advisory coordinator gh issue search -> github_verified anchor (evalua
     expect(body).toContain("zero github writes");
     expect(body).toContain('never call the skill as a whole "zero-network"');
     // Referent is generalized: the search also runs in evaluate's own proposal mode, so the kernel
-    // names "a surfaced finding", not the implement-feature-specific "Phase 8" (evaluate-scoring-
-    // contract t05).
+    // names "a surfaced finding", not the implement-feature-specific "Phase 8".
     expect(body).toContain("a surfaced finding is already");
   });
 });
 
-describe("evaluate deny floor admits the advisory read, still denies writes (evaluate-scoring-contract t05)", () => {
-  // Deny-floor controls for the t05 advisory search, against the REAL PermissionEngine. Negative
+describe("evaluate deny floor admits the advisory read, still denies writes", () => {
+  // Deny-floor controls for the advisory search, against the REAL PermissionEngine. Negative
   // control: the coordinator's read-only `gh issue list --search` must NOT be denied (read
   // permitted). Positive control: a representative destructive write is still denied — proving the
   // read is admitted WITHOUT opening a write. NOTE: `gh issue create` / `gh issue close` are
@@ -1460,20 +1459,20 @@ describe("evaluate deny floor admits the advisory read, still denies writes (eva
 
 describe("close-review coherence fixes (evaluate-scoring-contract)", () => {
   // Loose, case-insensitive, whitespace-collapsed structural checks (handles CRLF).
-  // These pin the CLOSE-REVIEW doc-coherence fixes: the two t05 advisory-search lines placed
-  // in the canonical skeleton as conditional siblings (FIX 1), the github_verified two-surface
-  // reconciliation (FIX 1), the Evidence block's non-repo-relative members in the skeleton +
-  // softened summary (FIX 2), where the pick-list provenance cue attaches with no Reasoning
-  // column (FIX 3), the anchor-cap single-ceiling rule + the sanctioned pr-eval two-block
-  // ordering exception + the fixed pick-list line order (FIX 4), and the "finding-filing path"
-  // reword (FIX 6). We do NOT test LLM judgment. All pinned phrases are ASCII.
+  // These pin the doc-coherence fixes: the two advisory-search lines placed in the
+  // canonical skeleton as conditional siblings, the github_verified two-surface
+  // reconciliation, the Evidence block's non-repo-relative members in the skeleton +
+  // softened summary, where the pick-list provenance cue attaches with no Reasoning
+  // column, the anchor-cap single-ceiling rule + the sanctioned pr-eval two-block
+  // ordering exception + the fixed pick-list line order, and the "finding-filing path"
+  // reword. We do NOT test LLM judgment. All pinned phrases are ASCII.
   const collapse = (p: string): string =>
     fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
 
   const ENGINE_PATH = path.join(REFERENCES_DIR, "evaluation-engine.md");
   const PROPOSAL_GATE_PATH = path.join(REFERENCES_DIR, "proposal-gate.md");
 
-  it("FIX 1 — the canonical skeleton carries both t05 advisory lines as conditional siblings", () => {
+  it("the canonical skeleton carries both advisory lines as conditional siblings", () => {
     const body = collapse(ENGINE_PATH);
     // The candidate near-match line + its render condition.
     expect(body).toContain("possible existing coverage:");
@@ -1487,7 +1486,7 @@ describe("close-review coherence fixes (evaluate-scoring-contract)", () => {
     expect(body).toContain("once per finding");
   });
 
-  it("FIX 1 — reconciles one github_verified hit across two surfaces (not a contradiction)", () => {
+  it("reconciles one github_verified hit across two surfaces (not a contradiction)", () => {
     const body = collapse(ENGINE_PATH);
     // The class marks ORIGIN, not the is-tracked claim — so the candidate line and the Evidence
     // bullet are the same fact for two audiences, reconciled by density (not by dropping the class).
@@ -1497,7 +1496,7 @@ describe("close-review coherence fixes (evaluate-scoring-contract)", () => {
     expect(body).toContain("not** also emitted as a `github_verified` `**evidence:**` bullet");
   });
 
-  it("FIX 2 — the Evidence block anticipates its non-repo-relative members (skeleton + summary)", () => {
+  it("the Evidence block anticipates its non-repo-relative members (skeleton + summary)", () => {
     const body = collapse(ENGINE_PATH);
     // Skeleton bullet showing the non-repo-relative anchor.
     expect(body).toContain("verified non-repo-relative anchor renders here too");
@@ -1506,7 +1505,7 @@ describe("close-review coherence fixes (evaluate-scoring-contract)", () => {
     expect(body).toContain("does **not** loosen the general repo-relative allow-list");
   });
 
-  it("FIX 3 — states where the pick-list provenance cue attaches (no Reasoning column)", () => {
+  it("states where the pick-list provenance cue attaches (no Reasoning column)", () => {
     const engine = collapse(ENGINE_PATH);
     expect(engine).toContain("the lean pick-list is not the rendered table");
     expect(engine).toContain("decision-flipping anchor(s)");
@@ -1515,18 +1514,18 @@ describe("close-review coherence fixes (evaluate-scoring-contract)", () => {
     expect(gate).toContain("attaches to the **decision-flipping anchor(s)**");
   });
 
-  it("FIX 4 — anchor cap is a single bounded ceiling; coordinator anchors count toward it", () => {
+  it("anchor cap is a single bounded ceiling; coordinator anchors count toward it", () => {
     const body = collapse(ENGINE_PATH);
     expect(body).toContain("single bounded ceiling across all lanes");
     expect(body).toContain("counts **against** that same ceiling, not additively");
   });
 
-  it("FIX 4 — engine sanctions pr-eval's two-block Evidence ordering as an exception", () => {
+  it("engine sanctions pr-eval's two-block Evidence ordering as an exception", () => {
     const body = collapse(ENGINE_PATH);
     expect(body).toContain("sanctioned pr-eval two-block exception");
   });
 
-  it("FIX 4 — proposal-gate pins a fixed per-item pick-list line order", () => {
+  it("proposal-gate pins a fixed per-item pick-list line order", () => {
     const body = collapse(PROPOSAL_GATE_PATH);
     expect(body).toContain("fixed per-item line order in the pick-list");
   });
@@ -1555,7 +1554,7 @@ describe("close-review coherence fixes (evaluate-scoring-contract)", () => {
     );
   });
 
-  it("FIX 6 — the advisory search is confined to the finding-filing path, not Phase-1 ticket-creation", () => {
+  it("the advisory search is confined to the finding-filing path, not Phase-1 ticket-creation", () => {
     const body = collapse(PROPOSAL_GATE_PATH);
     expect(body).toContain("confined to the **finding-filing path**");
     expect(body).toContain("**not** implement-feature's phase-1 ticket-creation");

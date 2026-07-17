@@ -7,7 +7,7 @@ import { fakePi } from "./helpers/fake-pi.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 
 /**
- * F14 t02 — the `PiccTestSeam.sdk` invariant, guarded (not merely asserted in
+ * The `PiccTestSeam.sdk` invariant, guarded (not merely asserted in
  * prose): a SINGLE-arg `picc(pi)` — no `testSeam` — wires NO `deps.sdk`, so the
  * SubagentRuntime falls to `loadRealSdk()`, i.e. it dynamically imports the REAL
  * `@earendil-works/pi-coding-agent` module. There is no env/settings/file
@@ -52,7 +52,7 @@ afterAll(() => {
   cleanupFixture(dir);
 });
 
-describe("F14 t02 — sdk seam invariant", () => {
+describe("sdk seam invariant", () => {
   it("single-arg picc(pi) (no testSeam) uses the real-sdk path (loadRealSdk), never a smuggled fake", async () => {
     const originalReapOrphans = WorktreeManager.prototype.reapOrphans;
     let genuineReaping: ReturnType<WorktreeManager["reapOrphans"]> | undefined;

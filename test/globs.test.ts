@@ -140,7 +140,7 @@ describe("createGlobMatcher: drive normalization (D2, platform-independent)", ()
   });
 });
 
-describe("createGlobMatcher: UNC path patterns (G2)", () => {
+describe("createGlobMatcher: UNC path patterns", () => {
   it("//server/share/** matches UNC candidates in either slash flavor", () => {
     const m = createGlobMatcher(["//server/share/**"]);
     expect(m("\\\\server\\share\\x.env")).toBe(true);

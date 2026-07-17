@@ -15,9 +15,9 @@ import {
 } from "./background-identity.js";
 
 /**
- * Background task runtime (audit E4): a background dispatch from the Agent tool
- * registers the (un-awaited) dispatch here. Post-F15 background is the default,
- * so the common path is an Agent call that omits `run_in_background` (an explicit
+ * Background task runtime: a background dispatch from the Agent tool registers
+ * the (un-awaited) dispatch here. Background is the default, so the common path
+ * is an Agent call that omits `run_in_background` (an explicit
  * `run_in_background: true` routes here too); TaskOutput retrieves the result,
  * TaskStop requests a best-effort cooperative abort.
  *
@@ -28,8 +28,8 @@ import {
 export type BackgroundTaskStatus = "running" | "completed" | "failed" | "stopped";
 
 /**
- * One pending settlement notice returned by `drainSettlementNotices` (FIX 1):
- * the ready-to-deliver `content`, plus a `commit` the caller invokes ONLY after
+ * One pending settlement notice returned by `drainSettlementNotices`: the
+ * ready-to-deliver `content`, plus a `commit` the caller invokes ONLY after
  * a successful `pi.sendMessage` — flipping the dedup gate so that eligible
  * notice does not re-fire. Leaving `commit` uncalled after a delivery throw
  * keeps it pending for the next drain; collected or superseded tasks remain
@@ -48,9 +48,9 @@ export interface SettlementNotice {
 }
 
 /**
- * Per-subagent token/cost usage (t06), mirrored structurally from
- * `DispatchUsage` (subagents.ts) so this module keeps its no-value-import
- * relationship with the runtime.
+ * Per-subagent token/cost usage, mirrored structurally from `DispatchUsage` in
+ * `subagents.ts` so this module keeps its no-value-import relationship with the
+ * runtime.
  */
 export interface UsageLike {
   inputTokens?: number;
@@ -64,20 +64,20 @@ export interface UsageLike {
 export interface BackgroundResultLike {
   /** True iff `outcome === "completed"`. */
   ok: boolean;
-  /** Classified fate of the dispatch (t01 contract, mirrors DispatchResult exactly). */
+  /** Classified fate of the dispatch — mirrors DispatchResult exactly. */
   outcome: "completed" | "failed" | "aborted";
   /** The subagent's final message, verbatim (on failure: best-effort partial output). */
   finalMessage: string;
-  /** Agent identity (t02 contract): unique per agent, stable across resumes. */
+  /** Agent identity: unique per agent, stable across resumes. */
   agentId?: string;
   /** On-disk JSONL transcript of the subagent's session, when persisted. */
   transcriptPath?: string;
-  /** True when the agent can be continued under `agentId` (t04). */
+  /** True when the agent can be continued under `agentId`. */
   resumable?: boolean;
-  /** True when `finalMessage` was truncated and already carries a cut-off frame (t02). */
+  /** True when `finalMessage` was truncated and already carries a cut-off frame. */
   truncated?: boolean;
   agentName?: string;
-  /** Per-subagent token/cost usage (t06); partial on failed/aborted runs. */
+  /** Per-subagent token/cost usage; partial on failed/aborted runs. */
   usage?: UsageLike;
   /** The single error channel: present iff `outcome !== "completed"`. */
   error?: string;
@@ -89,7 +89,7 @@ export interface BackgroundTaskRecord {
   label: string;
   status: BackgroundTaskStatus;
   /**
-   * The dispatcher that started this task (F13 t01): the agent id of the
+   * The dispatcher that started this task: the agent id of the
    * subagent whose Agent-tool dispatch created it, or `undefined` for the
    * coordinator (owns-all). Distinct from `agentId` — `agentId` is the
    * *dispatched child's* identity; `owner` is the *dispatcher's*. A scoped view
@@ -97,8 +97,8 @@ export interface BackgroundTaskRecord {
    * compare; `undefined` never matches any scoped owner), so a coordinator task
    * is reachable only via the full registry, never a scoped view.
    *
-   * `readonly` (F13 t01 review): set once at start() and never reassigned, so a
-   * foreign task can never be mutated into an own task mid-flight.
+   * `readonly`: set once at start() and never reassigned, so a foreign task can
+   * never be mutated into an own task mid-flight.
    */
   readonly owner?: string;
   /**
@@ -109,41 +109,41 @@ export interface BackgroundTaskRecord {
   error?: string;
   agentName?: string;
   /**
-   * Agent identity (t02): set eagerly at start() when the dispatcher pre-mints
-   * it (the Agent tool does), confirmed/overwritten from the settled result.
+   * Agent identity: set eagerly at start() when the dispatcher pre-mints it
+   * (the Agent tool does), confirmed/overwritten from the settled result.
    */
   agentId?: string;
   /** On-disk JSONL transcript of the subagent's session, when persisted. */
   transcriptPath?: string;
-  /** True when the settled agent can be continued under `agentId` (t04). */
+  /** True when the settled agent can be continued under `agentId`. */
   resumable?: boolean;
-  /** True when `result` was truncated and already carries a cut-off frame (t02). */
+  /** True when `result` was truncated and already carries a cut-off frame. */
   truncated?: boolean;
   /**
-   * Per-subagent token/cost usage (t06), mirrored from the settled dispatch
-   * result. Set for completed, failed (partial), AND stopped/aborted runs — the
+   * Mirrored from the settled dispatch result. Set for completed, failed
+   * (partial), AND stopped/aborted runs — the
    * cost of an aborted run is exactly the "what did the failure cost me" answer.
    * Surfaced in the TaskOutput text + details; never mixed into `result`.
    */
   usage?: UsageLike;
   /**
-   * Last observed live activity of the running dispatch (t03): a short,
-   * sanitized one-liner (current tool / retry wait) fed by the dispatch's
-   * progress callback so TaskOutput can show the background subagent is alive.
+   * Last observed live activity of the running dispatch: a short, sanitized
+   * one-liner (current tool / retry wait) fed by the dispatch's progress
+   * callback so TaskOutput can show the background subagent is alive.
    * Display-only; never part of `result`.
    */
   lastActivity?: string;
   /**
-   * Latest full live progress snapshot (F04 t02): the sanitized rolling
-   * tail + current-activity line produced by SubagentProgressCondenser, fed via
+   * Latest full live progress snapshot: the sanitized rolling tail +
+   * current-activity line produced by SubagentProgressCondenser, fed via
    * noteProgress so a waiting TaskOutput can render the running background
-   * subagent live (t03). Display-only; bounded by the condenser; never merged
-   * into `result`.
+   * subagent live. Display-only; bounded by the condenser; never merged into
+   * `result`.
    */
   progress?: ProgressSnapshot;
   /**
-   * The CLEAN dispatched agent type (F04 t02): e.g. `coder`, `Explore`, set
-   * eagerly at start() — before any progress event fires. Consumers use
+   * The CLEAN dispatched agent type: e.g. `coder`, `Explore`, set eagerly at
+   * start() — before any progress event fires. Consumers use
    * `agentType ?? agentName ?? "subagent"` with no `agent:`-prefix stripping
    * (the `label` still carries the `agent:<type>` form for existing surfaces).
    */
@@ -154,8 +154,8 @@ export interface BackgroundTaskRecord {
   /** Cooperative abort hook (wired to the dispatch's AbortController), if any. */
   abort?: () => void;
   /**
-   * Authoritative, task-generation-local settlement delivery state (F21). It is
-   * initialized to pending for every start() record. Optional only so structural
+   * Authoritative, task-generation-local settlement delivery state, initialized
+   * to pending for every start() record. Optional only so structural
    * test/diagnostic records created outside the registry retain compatibility;
    * absence is interpreted as pending.
    */
@@ -163,8 +163,8 @@ export interface BackgroundTaskRecord {
 }
 
 /**
- * The minimal registry surface the TaskOutput/TaskStop tools consume (F13 t01):
- * exactly the six members both factories and {@link unknownIdError} call. The
+ * The minimal registry surface the TaskOutput/TaskStop tools consume: exactly
+ * the six members both factories and {@link unknownIdError} call. The
  * concrete {@link BackgroundTaskRegistry} satisfies it structurally, so the
  * coordinator keeps passing the full registry unchanged; a subagent instead
  * receives `registry.scopedTo(ownerId)` — a live-delegating, owner-filtered view
@@ -201,7 +201,7 @@ export class BackgroundTaskRegistry {
   private readonly taskGeneration = new Map<string, number>();
   private counter = 0;
   /**
-   * Live progress subscribers per task (F04 t02), fan-out via a Set. Emptied on
+   * Live progress subscribers per task, fan-out via a Set. Emptied on
    * EVERY settle path (fulfilled/rejected/stopped) by the shared `.finally`
    * teardown attached in start(), so no listener can fire or leak after settle.
    */
@@ -279,12 +279,7 @@ export class BackgroundTaskRegistry {
       label,
       status: "running",
       agentId,
-      // Clean agent type present from the moment the task starts (F04 t02), so
-      // it is available before the first progress event and at every surface.
       agentType,
-      // The dispatcher's identity (F13 t01): undefined for the coordinator, the
-      // subagent's own agent id for a subagent dispatch. Left undefined by every
-      // existing caller (t02 threads it), so behavior is unchanged until then.
       owner,
       diagnostics: [],
       settled: Promise.resolve(),
@@ -294,14 +289,14 @@ export class BackgroundTaskRegistry {
     record.settled = promise.then(
       (result) => {
         record.agentName = result.agentName;
-        // Identity mirror (t02): the settled result is authoritative (the
-        // pre-minted id normally matches it). Update the generation index too:
+        // Identity mirror: the settled result is authoritative (the pre-minted
+        // id normally matches it). Update the generation index too:
         // an early record may first acquire or may correct its stable id here.
         this.setAgentIdentity(record, result.agentId ?? record.agentId);
         record.transcriptPath = result.transcriptPath;
         record.resumable = result.resumable === true;
         record.truncated = result.truncated === true;
-        // Usage mirror (t06): recorded before the stopped-branch early return
+        // Usage mirror: recorded before the stopped-branch early return
         // below, so an aborted task still reports what its partial run cost.
         record.usage = result.usage;
         record.diagnostics.push(...(result.diagnostics ?? []));
@@ -335,7 +330,7 @@ export class BackgroundTaskRegistry {
         }
       },
     );
-    // Listener teardown on EVERY settle path (F04 t02): both handlers above
+    // Listener teardown on EVERY settle path: both handlers above
     // swallow, so `settled` always fulfills — a single `.finally` empties the
     // subscriber set for the fulfilled, rejected/throwing, AND stopped paths, so
     // no held listener can fire or leak once the dispatch has ended.
@@ -348,23 +343,20 @@ export class BackgroundTaskRegistry {
   }
 
   /**
-   * Record the latest full live progress SNAPSHOT of a RUNNING task (F04 t02)
-   * and fan it out to subscribers. Stores the (already sanitized/bounded)
-   * snapshot on `record.progress`, derives the model-facing `lastActivity`/poll
-   * string via {@link progressActivityLine} (same string the old
-   * `noteActivity(progressActivityLine(...))` sink produced — semantics
-   * preserved), then notifies every subscriber. Ignored for unknown ids and
-   * settled tasks (mirrors the `noteActivity` post-settle no-op); a settled
-   * task's status/result stays authoritative. A throwing subscriber can neither
-   * break the fan-out nor the dispatch.
+   * Record the latest full live progress SNAPSHOT of a RUNNING task and fan it
+   * out to subscribers. Stores the (already sanitized/bounded) snapshot on
+   * `record.progress`, derives the model-facing `lastActivity`/poll string via
+   * {@link progressActivityLine}, then notifies every subscriber. Ignored for
+   * unknown ids and settled tasks; a settled task's status/result stays
+   * authoritative. A throwing subscriber can neither break the fan-out nor the
+   * dispatch.
    */
   noteProgress(id: string, snapshot: ProgressSnapshot): void {
     const task = this.tasks.get(id);
     if (!task || task.status !== "running") return;
     task.progress = snapshot;
     const activity = progressActivityLine(snapshot);
-    // Guard on non-empty to match the old noteActivity semantics exactly (never
-    // clobber a real last-activity with an empty derived line).
+    // Never clobber a real last-activity with an empty derived line.
     if (activity) task.lastActivity = activity;
     const listeners = this.progressListeners.get(id);
     if (!listeners) return;
@@ -378,7 +370,7 @@ export class BackgroundTaskRegistry {
   }
 
   /**
-   * Subscribe to a RUNNING task's live progress snapshots (F04 t02). Returns an
+   * Subscribe to a RUNNING task's live progress snapshots. Returns an
    * unsubscribe function (idempotent). Multiple concurrent subscribers per task
    * fan out via a Set. Subscribing to an unknown or ALREADY-SETTLED task is a
    * no-op that returns a no-op unsubscribe (mirrors the post-settle
@@ -403,7 +395,7 @@ export class BackgroundTaskRegistry {
   }
 
   /**
-   * Test/diagnostic hook (F04 t02 leak guard): the number of live progress
+   * Test/diagnostic hook (leak guard): the number of live progress
    * subscribers held for a task — 0 for an unknown, never-subscribed, or settled
    * task (whose set is cleared on settle). Deterministic; no timers.
    */
@@ -518,8 +510,8 @@ export class BackgroundTaskRegistry {
   }
 
   /**
-   * A live-delegating, owner-scoped view of this registry (F13 t01): every
-   * member reaches the registry AT CALL TIME (never a construction-time
+   * A live-delegating, owner-scoped view of this registry: every member
+   * reaches the registry AT CALL TIME (never a construction-time
    * snapshot) but is filtered to records whose `owner === ownerId`. Live
    * delegation is load-bearing — a subagent's scoped tools are built before it
    * dispatches its own task, so a frozen id set would report the subagent's own
@@ -564,11 +556,11 @@ function capErrorText(message: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Settlement notices (t05)
+// Settlement notices
 // ---------------------------------------------------------------------------
 
 /**
- * The untrusted-content frame (SECURITY, t05 plan-review MUST-FIX): the
+ * The untrusted-content frame (SECURITY): the
  * subagent's output is model-STEERABLE text being lifted into a privileged
  * channel (the coordinator's context). It is explicitly delimited and labeled
  * as OUTPUT DATA, never as instructions — a hostile subagent's output must not
@@ -581,11 +573,11 @@ const NOTICE_END = "--- END UNTRUSTED SUBAGENT OUTPUT ---";
 const NOTICE_EXCERPT_CAP = 1200;
 
 /**
- * Outcome vocabulary (t01/t05): the notice text uses completed / failed /
- * aborted. A deliberately stopped task's background STATUS is `"stopped"`
- * (t01's mapping) but its notice says `"aborted"`. The drain skips running
- * tasks upstream, so `"running"` is never a notice outcome (NIT: dropped from
- * the return union); a would-be running status falls through to "completed".
+ * Outcome vocabulary: the notice text uses completed / failed / aborted. A
+ * deliberately stopped task's background STATUS is `"stopped"` but its notice
+ * says `"aborted"`. The drain skips running tasks upstream, so `"running"` is
+ * never a notice outcome; a would-be running status falls through to
+ * "completed".
  */
 function noticeOutcome(status: BackgroundTaskStatus): "completed" | "failed" | "aborted" {
   switch (status) {
@@ -602,7 +594,7 @@ function noticeOutcome(status: BackgroundTaskStatus): "completed" | "failed" | "
 /**
  * Neutralize a subagent's output for inclusion in the untrusted-output frame.
  *
- * SECURITY — what this actually guarantees (SHOULD-review MUST-FIX): a SOFT,
+ * SECURITY — what this actually guarantees: a SOFT,
  * LLM-interpretation boundary that resists FORGED frame markers and control /
  * format-character injection — NOT a hard engine boundary. It cannot be relied
  * on as a parser boundary, but a broken frame still cannot approve or execute
@@ -630,8 +622,8 @@ function boundExcerpt(text: string): { excerpt: string; truncated: boolean } {
     // Remove zero-width / format chars (ZWSP/ZWNJ/ZWJ U+200B-200D, word joiner
     // U+2060, BOM/ZWNBSP U+FEFF, and the whole `\p{Cf}` format class) so a char
     // hidden inside a keyword cannot defeat the marker matchers. Removed (not
-    // spaced) so the keyword re-forms and is then caught. Escapes keep the source
-    // pure-ASCII (no invisible bytes — the t01/t02 source-hygiene pitfall).
+    // spaced) so the keyword re-forms and is then caught. Escapes keep the
+    // source pure-ASCII (no invisible bytes).
     .replace(/[\u200B-\u200D\u2060\uFEFF]/gu, "")
     .replace(/\p{Cf}/gu, "")
     // Keep \n and \t; replace every other control char (incl. \r, ESC, BEL, NUL)
@@ -655,8 +647,8 @@ function boundExcerpt(text: string): { excerpt: string; truncated: boolean } {
 }
 
 /**
- * Build the bounded notice for an eligible current uncollected task (t05/F21):
- * the canonical validated identity, OUTCOME (vocabulary above), the capped
+ * Build the bounded notice for an eligible current uncollected task: the
+ * canonical validated identity, OUTCOME (vocabulary above), the capped
  * error when failed, and a bounded, clearly-framed UNTRUSTED excerpt of the
  * final/partial output. Pure — the caller owns dedup (via the registry) and
  * delivery (via `pi.sendMessage`). The drain never passes a running task.
@@ -751,14 +743,14 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
         Type.Boolean({ description: "Wait for completion (default true)" }),
       ),
     }),
-    // Dispatch-time display (F04 t03): a self-identifying `TaskOutput(task-N) ·
+    // Dispatch-time display: a self-identifying `TaskOutput(task-N) ·
     // Agent(<type>)` line. Looks the agent type up from the registry so the chip
     // is legible before the (possibly still running) result renders.
     renderCall(args: Record<string, unknown>, theme: unknown) {
       const rec = registry.get(String((args ?? {}).task_id ?? "").trim());
       return renderTaskOutputCall(args, rec?.agentType ?? rec?.agentName, theme);
     },
-    // Result display (F04 t03): delegate to the SHARED subagent renderer so the
+    // Result display: delegate to the SHARED subagent renderer so the
     // live tail, outcome badge, identity subline, transcript + usage footer all
     // render exactly like a foreground dispatch (no forked renderer). The taskId
     // in `details` gates the background-identity additions.
@@ -779,9 +771,9 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
       const task = registry.get(id);
       if (!task) throw unknownIdError(registry, id);
       // The clean dispatched agent type is the identity shown at every surface
-      // (t02 sets agentType eagerly at start; no `agent:`-prefix stripping).
+      // (agentType is set eagerly at start; no `agent:`-prefix stripping).
       const agent = task.agentType ?? task.agentName ?? "subagent";
-      // Live streaming (F04 t03): while AWAITING a still-running task (wait !==
+      // Live streaming: while AWAITING a still-running task (wait !==
       // false), subscribe to its progress and repaint via onUpdate — a live view
       // matching a running foreground subagent. wait:false polls: NO subscription.
       if (task.status === "running" && params.wait !== false) {
@@ -794,8 +786,8 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
         let removeAbort = () => {};
         try {
           if (onUpdate) {
-            // Subscribe FIRST — t02 guarantees subscribe-after-settle is a no-op
-            // returning a no-op unsub (no race, no leak) — then emit an initial
+            // Subscribe FIRST — subscribe-after-settle is a no-op returning a
+            // no-op unsub (no race, no leak) — then emit an initial
             // paint (… starting… when no snapshot yet) so it is never blank. Both
             // run INSIDE the try so a throwing initial paint still hits the finally
             // teardown (no leaked listener).
@@ -825,12 +817,12 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
         // On abort mid-wait the task may still be "running": fall through to build
         // the current-status (poll) result below rather than throwing.
       }
-      // SECURITY (FIX 4, defense-in-depth): `task.label` derives from the raw
+      // SECURITY (defense-in-depth): `task.label` derives from the raw
       // model-supplied `subagent_type` and is interpolated into this terminal-
       // bound text; single-line-sanitize it (control/ANSI bytes → spaces, capped)
       // before use, mirroring the settlement-notice header sanitize.
       const label = sanitizeLine(task.label, 120);
-      // SEC (F04 t03): the agent TYPE flows into the model-facing running/failed/
+      // SECURITY: the agent TYPE flows into the model-facing running/failed/
       // stopped CONTENT strings (terminal-bound in print/RPC), so single-line-
       // sanitize it here too — the renderer's sanitize does NOT cover this path.
       // Fall back to the (already sanitized) label when no clean type is set.
@@ -842,12 +834,12 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
       let text: string;
       switch (task.status) {
         case "completed":
-          // Verbatim-return contract (plan §4.3): the final message unwrapped.
-          // Resumable agents additionally get the delimited agent-ID trailer
-          // (t02) — same framing as the foreground Agent tool result. A
-          // truncated result already ends with a `---` cut-off frame, so the
-          // trailer rides INSIDE it (single `\n`, non-"completed" wording)
-          // rather than stacking a second frame (t02 review item 4).
+          // Verbatim-return contract: the final message unwrapped. Resumable
+          // agents additionally get the delimited agent-ID trailer — same
+          // framing as the foreground Agent tool result. A truncated result
+          // already ends with a `---` cut-off frame, so the trailer rides
+          // INSIDE it (single `\n`, non-"completed" wording) rather than
+          // stacking a second frame.
           text = task.result ?? "";
           if (task.resumable && task.agentId) {
             text += task.truncated
@@ -856,7 +848,7 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
           }
           break;
         case "failed":
-          // `subject` (F04 t03) carries the sanitized agent type + agent-<id> so
+          // `subject` carries the sanitized agent type + agent-<id> so
           // the failure is self-identifying in print/RPC mode.
           text = `${subject} failed: ${task.error ?? "unknown error"}`;
           if (task.result?.trim()) {
@@ -867,13 +859,13 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
           }
           break;
         case "stopped":
-          // Vocabulary (FIX 3): lead with "aborted" so it matches every other
+          // Vocabulary: lead with "aborted" so it matches every other
           // surface (settlement notice, /usage, user guide); the "stopped before
           // completing" clause still names the mechanism (TaskStop/abort).
           text = `${subject} was aborted — it was stopped before completing, so its result was discarded.`;
           break;
         default:
-          // Liveness (t03): surface the last observed activity so a polled
+          // Liveness: surface the last observed activity so a polled
           // (wait: false) running task doesn't look inert.
           text =
             `${subject} is still running` +
@@ -881,15 +873,15 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
             ". Call TaskOutput again (wait defaults to true) to await its result.";
           break;
       }
-      // Usage line (t06): a compact, clearly-separated metadata line for any
-      // settled task that has usage — including a stopped one (what the aborted
-      // run cost). Rides OUTSIDE the verbatim body, after any t02 agent-ID
-      // trailer, so the verbatim-return contract is untouched (metadata only).
+      // Usage line: a compact, clearly-separated metadata line for any settled
+      // task that has usage — including a stopped one (what the aborted run
+      // cost). Rides OUTSIDE the verbatim body, after any agent-ID trailer, so
+      // the verbatim-return contract is untouched (metadata only).
       const usageLine = formatUsageCompact(task.usage);
       if (usageLine && task.status !== "running") {
         text += `\nusage: ${usageLine}`;
       }
-      // Render outcome (F04 t03): map the background status to the badge outcome
+      // Render outcome: map the background status to the badge outcome
       // (stopped → aborted) so renderResult shows the outcome chip. Only for a
       // SETTLED task — a running poll carries no outcome (renderResult keys the
       // poll frame on status:"running" instead).
@@ -903,8 +895,6 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
           taskId: id,
           status: task.status,
           ...(outcome ? { outcome } : {}),
-          // The dispatched agent TYPE is the identity shown at every surface
-          // (t02 sets it eagerly); fall back to name/"subagent".
           agent,
           agentId: task.agentId,
           // Truncated completed/failed runs carry a cut-off frame → badge suffix.
@@ -928,14 +918,14 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
 }
 
 /**
- * The scoped TaskOutput + TaskStop pair a subagent dispatch is handed (F13 t02):
- * both tools built over `registry.scopedTo(ownerAgentId)`, so a subagent reaches
+ * The scoped TaskOutput + TaskStop pair a subagent dispatch is handed: both
+ * tools built over `registry.scopedTo(ownerAgentId)`, so a subagent reaches
  * ONLY the background tasks it itself dispatched — a sibling's or the
- * coordinator's task is indistinguishable from a truly-unknown id (t01 non-leak
+ * coordinator's task is indistinguishable from a truly-unknown id (the non-leak
  * contract). `ownerAgentId` MUST be the dispatch's own internally-minted agent
- * id, never a value read from a tool param — the same id
- * both scopes these tools and tags the tasks the subagent starts, so they line
- * up. The coordinator keeps building its tools over the full registry directly
+ * id, never a value read from a tool param — the same id both scopes these
+ * tools and tags the tasks the subagent starts, so they line up. The
+ * coordinator keeps building its tools over the full registry directly
  * (unscoped), retaining full reach.
  */
 export function scopedBackgroundTools(

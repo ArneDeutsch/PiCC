@@ -55,7 +55,7 @@ export interface RunPiOptions {
   fixture?: FixtureName;
   extraEnv?: Record<string, string>;
   setup?: (fixtureDir: string) => void;
-  /** Keep session persistence ON (drops --no-session) — transcript scenarios (t02). */
+  /** Keep session persistence ON (drops --no-session) — transcript scenarios. */
   persistSession?: boolean;
 }
 

@@ -83,9 +83,12 @@ writes and tell the user.
         project's `.claude/` corpus you changed.** picc runs against the current directory
         (cwd *is* the project; there is no target-dir argument), so the launch form
         follows from that principle. A **skill / agent / `CLAUDE.md` / prose change** edits
-        picc's *own* `.claude/` corpus, which only loads when it is the *active* project,
-        so run **from the feature checkout root**, which is itself the target — `node
-        ./bin/picc.mjs …`. A **harness / code change** (loaders, `bin/`, `src/`) has no
+        picc's *own* `.claude/` corpus, so run **from the feature checkout root**, which is
+        itself the target — `node ./bin/picc.mjs …`. Launching from a fixture would not
+        isolate it: discovery walks cwd up to the enclosing **git repo root**, and a bundled
+        fixture has no `.git`, so the checkout's corpus loads there *too* — with the
+        fixture's own corpus stacked on top, shadowing any same-named skill. You would be
+        observing the wrong one. A **harness / code change** (loaders, `bin/`, `src/`) has no
         corpus of its own and surfaces against any project, so drive a fixture whose
         `.claude/` exercises it — `cd examples/hello-claude`, then `node ../../bin/picc.mjs
         …` (the launcher path is relative to cwd, hence `../../bin/…` from the fixture).

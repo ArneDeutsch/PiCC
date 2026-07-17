@@ -2,14 +2,14 @@ import { describe, expect, it } from "vitest";
 import { substituteArguments, substituteToolRules } from "../src/claude/skills.js";
 
 /**
- * Focused tests for the Claude argument-substitution semantics (audit A1/A2)
- * and tool-rule substitution (A3): `$N` is 0-based and greedy multi-digit,
+ * Focused tests for the Claude argument-substitution semantics
+ * and tool-rule substitution: `$N` is 0-based and greedy multi-digit,
  * `\` escapes recognizable tokens, `$$` has no special meaning, and
  * allowed/disallowed-tools entries get the same variable + argument
  * substitution as the body (without the ARGUMENTS: fallback append).
  */
 
-describe("substituteArguments: 0-based greedy $N (A1)", () => {
+describe("substituteArguments: 0-based greedy $N", () => {
   it("$0 is the FIRST argument (0-based, ≡ $ARGUMENTS[0])", () => {
     const { text, diagnostics } = substituteArguments("a=$0 b=$1 a2=$ARGUMENTS[0]", "alpha beta");
     expect(text).toBe("a=alpha b=beta a2=alpha");
@@ -48,7 +48,7 @@ describe("substituteArguments: 0-based greedy $N (A1)", () => {
   });
 });
 
-describe("substituteArguments: backslash escaping (A2)", () => {
+describe("substituteArguments: backslash escaping", () => {
   it("\\ before $N emits the literal token without substitution", () => {
     const { text, diagnostics } = substituteArguments("use \\$0 here and $0", "val");
     expect(text).toBe("use $0 here and val");
@@ -106,7 +106,7 @@ describe("substituteArguments: backslash escaping (A2)", () => {
   });
 });
 
-describe("substituteToolRules (A3)", () => {
+describe("substituteToolRules", () => {
   const vars = {
     CLAUDE_PROJECT_DIR: "C:/proj",
     CLAUDE_SKILL_DIR: "C:/proj/.claude/skills/x",

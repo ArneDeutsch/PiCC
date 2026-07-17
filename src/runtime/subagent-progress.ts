@@ -1,5 +1,5 @@
 /**
- * Subagent live-progress condenser (t03).
+ * Subagent live-progress condenser.
  *
  * A subagent runs a full Pi `AgentSession`; its `subscribe(listener)` stream
  * emits `turn_start/end`, `message_update`, `tool_execution_start/update/end`,
@@ -36,8 +36,7 @@ export const DEFAULT_MAX_TAIL_LINES = 12;
 export const DEFAULT_MAX_LINE_LENGTH = 200;
 
 // Control bytes referenced by the ANSI matchers, built from code points so the
-// SOURCE stays pure ASCII (no raw control characters in this file - a t01/t02
-// pitfall). ESC=27, BEL=7.
+// SOURCE stays pure ASCII (no raw control characters in this file). ESC=27, BEL=7.
 const ESC = String.fromCharCode(27);
 const BEL = String.fromCharCode(7);
 // Escape-sequence families: OSC (ESC ] ... BEL-or-ST terminated), CSI (ESC [
@@ -182,7 +181,7 @@ export class SubagentProgressCondenser {
         this.activity = e.success === true ? "retry succeeded; resuming…" : "retry failed";
         break;
       case "tool_execution_start": {
-        // SEC-1: the tool name reaches the parent terminal (this activity line)
+        // SECURITY: the tool name reaches the parent terminal (this activity line)
         // AND the model-visible TaskOutput lastActivity, so sanitize it like every
         // other activity source — live the moment MCP/project-named tools flow
         // through the event stream. push() already sanitizes the tail entry below.
@@ -219,9 +218,9 @@ export class SubagentProgressCondenser {
         for (const line of messageText(e.message).split("\n")) {
           this.push(line);
         }
-        // FIX-A: message_update left `activity` holding the final streamed line,
-        // which we just pushed into `tail` — showing it again as the "… <activity>"
-        // footer duplicates it in the idle snapshot. Reset to a neutral idle label.
+        // message_update leaves `activity` holding the final streamed line, which
+        // we just pushed into `tail` — showing it again as the "… <activity>"
+        // footer would duplicate it in the idle snapshot. Reset to a neutral idle label.
         this.activity = "working…";
         break;
       }
@@ -274,7 +273,7 @@ export function progressActivityLine(snapshot: ProgressSnapshot): string {
   return snapshot.activity || snapshot.tail[snapshot.tail.length - 1] || "";
 }
 
-// --- t06 per-subagent usage formatting (shared display helper) ---
+// --- per-subagent usage formatting (shared display helper) ---
 //
 // The single home of the compact usage-line format, used by the foreground
 // Agent tool result, the background TaskOutput text, and the /usage control
@@ -302,12 +301,12 @@ function finiteNumber(value: unknown): number | undefined {
 }
 
 /**
- * Format a usage object (the t06 `{ inputTokens, outputTokens, cacheReadTokens,
+ * Format a usage object (the `{ inputTokens, outputTokens, cacheReadTokens,
  * cacheWriteTokens, costUsd }` shape) into one compact line, rendering ONLY the
  * fields actually present (Pi omits what it doesn't measure — never invented as
- * zeros). Also accepts the legacy `totalTokens`/`tokens` + `cost` shape (the t03
- * defensive slot's expectation) so `formatUsageLine` can delegate here. Returns
- * undefined when nothing renders, so callers can drop the line entirely.
+ * zeros). Also accepts the legacy `totalTokens`/`tokens` + `cost` shape so
+ * `formatUsageLine` can delegate here. Returns undefined when nothing renders,
+ * so callers can drop the line entirely.
  */
 export function formatUsageCompact(usage: unknown): string | undefined {
   if (!usage || typeof usage !== "object") return undefined;
@@ -328,7 +327,7 @@ export function formatUsageCompact(usage: unknown): string | undefined {
     if (cacheRead !== undefined) parts.push(`cache read ${cacheRead}`);
     if (cacheWrite !== undefined) parts.push(`cache write ${cacheWrite}`);
   } else {
-    // Legacy shape (t03 defensive slot): a single total-token count.
+    // Legacy shape: a single total-token count.
     const total = finiteNumber(u.totalTokens) ?? finiteNumber(u.tokens);
     if (total !== undefined) parts.push(`${total} tokens`);
   }
