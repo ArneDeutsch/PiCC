@@ -46,46 +46,23 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
 
 ## What it does
 
-- **Skills** — full `SKILL.md` frontmatter, progressive disclosure (bodies lazy-load),
-  `$ARGUMENTS`/positional/named substitution, `` !`cmd` `` shell injection (bash + PowerShell),
-  `context: fork`, legacy `.claude/commands`.
-- **Subagents** — `.claude/agents/*.md` plus the built-in `general-purpose`/`Explore`/`Plan`
-  agent types, description-driven routing, parallel fan-out with verbatim final-message return,
-  per-agent `tools:` capability gating, nested dispatch with a configurable depth cap (**off by
-  default — main-session-only**: the main conversation fans out depth-1 subagents, but nesting is an
-  explicit opt-in via `subagents.maxDepth: 2..5`), `isolation: worktree`. **Observable and trustworthy:** a dead dispatch is a loud, named failure
-  (never an empty success) with partial output preserved; every run leaves an on-disk transcript,
-  streams live progress, and records its token/cost (`/usage`). Dispatch runs in the **background by
-  default** (matching Claude 2.1.198), so an implicit-concurrency fan-out parallelizes — each dispatch
-  returns a task id; terminal results are collected via `TaskOutput`, while `TaskStop` stops a run.
-  Here an **eligible current task** means
-  the latest task generation for that agent, still uncollected and unnotified: if it settles, it
-  pushes one bounded notice on the coordinator's next turn. A running poll keeps that
-  notice eligible, while a terminal `TaskOutput` return counts as delivery and suppresses the
-  redundant notice. Pass `run_in_background: false` for a synchronous inline result, or set
-  `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` to force every dispatch to the foreground. `SendMessage`
-  resumes a finished subagent or steers a running one. A `subagent_type: "fork"` dispatch is the one
-  type that **inherits the parent conversation** instead of starting fresh (main-session only,
-  env-gated by `CLAUDE_CODE_FORK_SUBAGENT` — unset ⇒ enabled, non-resumable; degrades visibly to
-  fresh context when it can't inherit) — distinct from the skill `context: fork` above, which runs a
-  *skill* in a fresh, isolated subagent (maximum isolation, the opposite of conversation inheritance).
-- **Worktrees** — `EnterWorktree`/`ExitWorktree` with a real session-cwd swap, `.worktreeinclude`
-  seeding, Windows-tolerant lifecycle, parallel sessions on one repo.
-- **Hooks** — 13 events (`PreToolUse` … `WorktreeRemove`), full stdin-JSON/stdout-decision
-  contract, Claude matcher semantics with parallel dispatch, `if:` conditions, async handlers,
-  plugin-, skill-, and agent-scoped hooks.
-- **CLAUDE.md, memory & rules** — ancestor hierarchy up to the filesystem root, nested on-demand
-  injection, recursive `@import` (the AGENTS.md bridge), managed-policy CLAUDE.md, auto memory
-  (`MEMORY.md`) and agent `memory:` scopes, `.claude/rules/` with `paths:` scoping.
-- **Settings & permissions** — full precedence/merge semantics, honored toggles, `deny` rules as
-  a hard block with the complete matcher grammar; a consolidated compatibility report (`/doctor`)
-  for everything that degrades.
+- **Skills** — `.claude/skills` and legacy `.claude/commands`, with progressive disclosure,
+  argument substitution, and shell injection.
+- **Subagents** — `.claude/agents/*.md` and the built-in agent types, with description-driven
+  routing, parallel background fan-out (nesting is opt-in via `subagents.maxDepth`), per-agent
+  tool gating, and worktree isolation.
+- **Worktrees** — `EnterWorktree`/`ExitWorktree` with a real session-cwd swap and a
+  Windows-tolerant lifecycle, for parallel sessions on one repo.
+- **Hooks** — 13 events (`PreToolUse` … `WorktreeRemove`) with Claude's stdin-JSON/stdout-decision
+  contract and matcher semantics.
+- **CLAUDE.md, memory & rules** — the ancestor hierarchy, recursive `@import` (the AGENTS.md
+  bridge), auto memory, and `.claude/rules/`.
+- **Settings & permissions** — `settings.json` precedence and merge semantics, with `deny` rules
+  as a hard block.
 - **Compaction preservation** — project instructions, rules, and active skills survive
   auto-compaction.
 - **Plugins** — content from already-installed plugins and project-bundled `.claude-plugin/`.
-- **Git commits** — nudges richer, repo-style-matching commit messages by default (reads the
-  diff and recent `git log`, favors a why-over-what body for non-trivial changes),
-  approximating Claude Code's commit quality without reproducing its full ceremony.
+- **Git commits** — nudges richer, repo-style-matching commit messages by default.
 
 Everything unrecognized degrades safely and is surfaced — never a crash (the completeness floor).
 The full, always-current compatibility matrix is in
@@ -108,7 +85,7 @@ configured outside the project — see the [user guide](doc/user-guide.md#5-cont
 | `examples/hello-claude` | Minimal demo project |
 | `examples/full-surface` | Larger fixture exercising a broad slice of the feature surface |
 | `test/` | Unit, offline-integration, and live e2e tests (vitest) — see [doc/testing.md](doc/testing.md) |
-| `doc/` | [User guide](doc/user-guide.md), [architecture](doc/architecture.md), [supported features](doc/supported-features.md), [testing](doc/testing.md); plus the design plan (`doc/picc-plan.md`) and the pinned Pi contracts (`doc/design/`) |
+| `doc/` | [User guide](doc/user-guide.md), [architecture](doc/architecture.md), [supported features](doc/supported-features.md), [testing](doc/testing.md), and the pinned [Pi contracts](doc/pi-integration.md) |
 
 ## Development
 
