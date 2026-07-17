@@ -596,12 +596,22 @@ function binAvailable(bin: string, args: string[]): boolean {
   }
 }
 
-const hasBash = binAvailable(resolveShellBinary("bash"), ["-c", "exit 0"]);
-const hasPowershell = binAvailable(resolveShellBinary("powershell"), [
-  "-NoProfile",
-  "-Command",
-  "exit 0",
-]);
+// Lazy, memoized shell probes: evaluated the first time a `runIf` guard needs
+// them (during collection of the describe below) rather than at module import,
+// so a host without the shell doesn't pay two capped `execFileSync` calls just
+// to load this file. Each probe still runs at most once.
+let bashProbe: boolean | undefined;
+function hasBash(): boolean {
+  return (bashProbe ??= binAvailable(resolveShellBinary("bash"), ["-c", "exit 0"]));
+}
+let powershellProbe: boolean | undefined;
+function hasPowershell(): boolean {
+  return (powershellProbe ??= binAvailable(resolveShellBinary("powershell"), [
+    "-NoProfile",
+    "-Command",
+    "exit 0",
+  ]));
+}
 
 describe("preprocessShellInjection", () => {
   // env is only the Claude-specific OVERLAY — the spawned shell must inherit
@@ -610,7 +620,7 @@ describe("preprocessShellInjection", () => {
   // without PATH when settings.env was empty).
   const baseOpts = { cwd: process.cwd(), env: {}, disabled: false } as const;
 
-  it.runIf(hasBash)("replaces inline !`cmd` with stdout (bash)", async () => {
+  it.runIf(hasBash())("replaces inline !`cmd` with stdout (bash)", async () => {
     const { text, diagnostics } = await preprocessShellInjection(
       "Version: !`echo inline-out` end",
       { ...baseOpts, shell: "bash" },
@@ -619,7 +629,7 @@ describe("preprocessShellInjection", () => {
     expect(diagnostics).toHaveLength(0);
   });
 
-  it.runIf(hasBash)("replaces ```! fenced blocks with the script's stdout", async () => {
+  it.runIf(hasBash())("replaces ```! fenced blocks with the script's stdout", async () => {
     const body = "Before\n```!\necho fenced-out\n```\nAfter";
     const { text } = await preprocessShellInjection(body, { ...baseOpts, shell: "bash" });
     expect(text).toBe("Before\nfenced-out\nAfter");
@@ -635,7 +645,7 @@ describe("preprocessShellInjection", () => {
     expect(diagnostics).toHaveLength(1);
   });
 
-  it.runIf(hasBash)("preserves the literal text of a failing command + diagnostic (never throws)", async () => {
+  it.runIf(hasBash())("preserves the literal text of a failing command + diagnostic (never throws)", async () => {
     const body = "Status: !`echo boom >&2; exit 3`";
     const { text, diagnostics } = await preprocessShellInjection(body, {
       ...baseOpts,
@@ -648,7 +658,7 @@ describe("preprocessShellInjection", () => {
     expect(diagnostics[0]!.message).toContain("boom");
   });
 
-  it.runIf(hasBash)("preserves a failing ```! fenced block verbatim", async () => {
+  it.runIf(hasBash())("preserves a failing ```! fenced block verbatim", async () => {
     const body = "Before\n```!\necho fen >&2\nexit 7\n```\nAfter";
     const { text, diagnostics } = await preprocessShellInjection(body, {
       ...baseOpts,
@@ -659,7 +669,7 @@ describe("preprocessShellInjection", () => {
     expect(diagnostics[0]!.severity).toBe("warning");
   });
 
-  it.runIf(hasBash)("mixes preserved failures with successful injections single-pass", async () => {
+  it.runIf(hasBash())("mixes preserved failures with successful injections single-pass", async () => {
     const { text } = await preprocessShellInjection(
       "ok: !`echo fine` bad: !`exit 2`",
       { ...baseOpts, shell: "bash" },
@@ -667,7 +677,7 @@ describe("preprocessShellInjection", () => {
     expect(text).toBe("ok: fine bad: !`exit 2`");
   });
 
-  it.runIf(hasPowershell)("runs powershell when shell: powershell", async () => {
+  it.runIf(hasPowershell())("runs powershell when shell: powershell", async () => {
     const { text } = await preprocessShellInjection("PS: !`Write-Output ps-out`", {
       ...baseOpts,
       shell: "powershell",
@@ -695,7 +705,7 @@ describe("preprocessShellInjection", () => {
     expect(diagnostics).toHaveLength(0);
   });
 
-  it.runIf(hasBash)("still injects after a code span on the same line", async () => {
+  it.runIf(hasBash())("still injects after a code span on the same line", async () => {
     const { text } = await preprocessShellInjection("See `docs` then !`echo after-span`", {
       ...baseOpts,
       shell: "bash",
@@ -711,7 +721,7 @@ describe("preprocessShellInjection", () => {
 describe("shell injection env inheritance", () => {
   const baseOpts = { cwd: process.cwd(), disabled: false } as const;
 
-  it.runIf(hasBash)("inherits process.env vars absent from the overlay (bash)", async () => {
+  it.runIf(hasBash())("inherits process.env vars absent from the overlay (bash)", async () => {
     process.env.PICC_TEST_INHERIT = "inherited-ok";
     try {
       const { text, diagnostics } = await preprocessShellInjection(
@@ -725,7 +735,7 @@ describe("shell injection env inheritance", () => {
     }
   });
 
-  it.runIf(hasBash)("overlay vars win over inherited process.env", async () => {
+  it.runIf(hasBash())("overlay vars win over inherited process.env", async () => {
     process.env.PICC_TEST_LAYER = "from-process";
     try {
       const { text } = await preprocessShellInjection('V: !`echo "$PICC_TEST_LAYER"`', {
@@ -739,7 +749,7 @@ describe("shell injection env inheritance", () => {
     }
   });
 
-  it.runIf(hasPowershell)("inherits process.env vars under powershell too", async () => {
+  it.runIf(hasPowershell())("inherits process.env vars under powershell too", async () => {
     process.env.PICC_TEST_INHERIT_PS = "ps-inherited";
     try {
       const { text } = await preprocessShellInjection(

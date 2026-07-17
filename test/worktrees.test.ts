@@ -1,10 +1,10 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { WorktreeManager, flattenWorktreeName } from "../src/runtime/worktrees.js";
 import type { WorktreeSettings } from "../src/types.js";
+import { makeRepoFromTemplate } from "./helpers/git-repo.js";
 
 const tempDirs: string[] = [];
 const children: ChildProcess[] = [];
@@ -14,18 +14,8 @@ function git(cwd: string, ...args: string[]): string {
 }
 
 function makeRepo(): string {
-  let dir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-wt-"));
-  dir = fs.realpathSync.native(dir);
+  const dir = makeRepoFromTemplate();
   tempDirs.push(dir);
-  git(dir, "init");
-  git(dir, "config", "user.email", "test@example.com");
-  git(dir, "config", "user.name", "PiCC Test");
-  git(dir, "config", "commit.gpgsign", "false");
-  git(dir, "config", "core.autocrlf", "false");
-  fs.writeFileSync(path.join(dir, "README.md"), "hello\n", "utf8");
-  git(dir, "add", "-A");
-  git(dir, "commit", "-m", "init");
-  git(dir, "branch", "-M", "main");
   return dir;
 }
 

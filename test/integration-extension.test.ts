@@ -711,6 +711,16 @@ describe("background settlement delivery (t05, offline integration via the seam)
     return { p, internals };
   }
 
+  // A single fresh wire shared by the read-only `/usage` cases below (empty
+  // report, then control-byte sanitize). Neither depends on pristine
+  // dedup/injection state: the empty-report test runs first on the pristine
+  // shared instance, and the sanitize test only registers and inspects its own
+  // agent. Sharing avoids a second full wire() (fakePi + init + tool wait).
+  let roShared: { p: FakePi; internals: Internals } | undefined;
+  async function wireReadOnly(): Promise<{ p: FakePi; internals: Internals }> {
+    return (roShared ??= await wire());
+  }
+
   const reg = (internals: Internals, agentId: string) =>
     internals.subagentRegistry.register({
       agentId,
@@ -956,7 +966,7 @@ describe("background settlement delivery (t05, offline integration via the seam)
   });
 
   it("/usage is registered and reports nothing before any dispatch", async () => {
-    const { p } = await wire();
+    const { p } = await wireReadOnly();
     expect(p.commands.has("usage")).toBe(true);
     p.entries.length = 0;
     await p.commands.get("usage").handler("", p.ctx());
@@ -971,7 +981,7 @@ describe("background settlement delivery (t05, offline integration via the seam)
     // agentName derives from agent frontmatter `name`/basename (only trimmed
     // upstream); a hostile ANSI/OSC/control-byte name must not reach the terminal
     // on /usage. Control bytes from code points so this source stays pure ASCII.
-    const { p, internals } = await wire();
+    const { p, internals } = await wireReadOnly();
     const ESC = String.fromCharCode(27);
     const BEL = String.fromCharCode(7);
     const NUL = String.fromCharCode(0);

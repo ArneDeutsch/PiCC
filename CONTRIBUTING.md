@@ -39,6 +39,7 @@ Set `PICC_DEBUG=1` to trace load/skill/routing decisions to stderr.
 npm run typecheck     # strict TypeScript, no emit
 npm run test:unit     # fast: unit + offline-integration (fake Pi API)
 npm run test:e2e      # slower: drives the REAL Pi CLI against a mock OpenAI server
+npm run test:coverage # non-e2e lane coverage over src/** (guidance signal, no thresholds)
 npm test              # everything
 ```
 
