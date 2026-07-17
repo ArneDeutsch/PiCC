@@ -24,6 +24,7 @@ import type {
   SubagentRegistry,
   SubagentUsage,
 } from "./subagent-registry.js";
+import { guardSteer, oneShotRefusal, userStoppedRefusal } from "./subagent-registry.js";
 import {
   agentTrailerFrame,
   agentTrailerLine,
@@ -34,8 +35,10 @@ import {
 } from "../util/subagent-transcripts.js";
 import {
   renderProgressText,
+  sanitizeLine,
   SubagentProgressCondenser,
   type ProgressSnapshot,
+  type SnapshotUsage,
 } from "./subagent-progress.js";
 import { renderAgentCall, renderAgentResult } from "./subagent-render.js";
 import { formatBackgroundTaskIdentity } from "./background-identity.js";
@@ -155,12 +158,13 @@ export interface DispatchUsage {
 
 /**
  * Drift guard: `DispatchUsage` (here), `UsageLike` (background-tasks),
- * and `SubagentUsage` (subagent-registry) are byte-identical by intent but kept
- * in three files to preserve those modules' no-value-import relationship. This
- * compile-time assertion breaks `tsc` the moment any of the three gains, loses,
- * or retypes a field without the others — key drift is caught by the mutual
- * `keyof` containment, field-type drift by the mutual assignability. Type-only
- * (the imports above are `import type`, erased at runtime — no cycle).
+ * `SubagentUsage` (subagent-registry), and `SnapshotUsage` (subagent-progress)
+ * are byte-identical by intent but kept in four files to preserve those
+ * modules' no-value-import relationship. This compile-time assertion breaks
+ * `tsc` the moment any of them gains, loses, or retypes a field without the
+ * others — key drift is caught by the mutual `keyof` containment, field-type
+ * drift by the mutual assignability. Type-only (the imports above are
+ * `import type`, erased at runtime — no cycle).
  */
 type _SameShape<A, B> = [keyof A] extends [keyof B]
   ? [keyof B] extends [keyof A]
@@ -172,7 +176,8 @@ type _SameShape<A, B> = [keyof A] extends [keyof B]
     : never
   : never;
 type _UsageDriftGuard = _SameShape<DispatchUsage, UsageLike> &
-  _SameShape<DispatchUsage, SubagentUsage>;
+  _SameShape<DispatchUsage, SubagentUsage> &
+  _SameShape<DispatchUsage, SnapshotUsage>;
 const _usageDriftOk: _UsageDriftGuard = true;
 void _usageDriftOk;
 
@@ -412,6 +417,13 @@ class Semaphore {
 const FORK_SUBAGENT_TYPE = "fork";
 
 /**
+ * Single-line cap for model-supplied identity/label strings (subagent_type,
+ * description, agent name) sanitized at capture, on top of the render-time
+ * defense that stays in place.
+ */
+const CAPTURED_LINE_CAP = 120;
+
+/**
  * Synthetic agent for an inheriting fork. `tools: undefined` ⇒ all-tools
  * (the main-session grant, since forks are main-session-only), `isolation:
  * undefined` ⇒ shares the parent cwd. Its neutral persona + the normal
@@ -640,6 +652,18 @@ export class SubagentRuntime {
      * start message can carry it; a resume passes the existing ID.
      */
     agentId?: string;
+    /**
+     * The DISPATCHER's own agent id, recorded set-once as the child record's
+     * parent link (the status panel's tree). Runtime-threaded from the Agent
+     * tool's `ownerAgentId` — never a tool parameter (same anti-spoofing
+     * discipline). Absent for a coordinator dispatch.
+     */
+    parentAgentId?: string;
+    /**
+     * The Agent tool's model-supplied `description` label, already sanitized
+     * at capture; stored set-once on the registry record (the panel's label).
+     */
+    description?: string;
     /**
      * Live-progress sink: fed a bounded, sanitized {@link ProgressSnapshot}
      * whenever the running subagent's visible activity changes. Display-only —
@@ -942,6 +966,10 @@ export class SubagentRuntime {
     // record; re-registering minimally here would transiently wipe its
     // transcriptPath/resumable mid-resume.
     if (!opts.resume) {
+      // Panel fields ride on the FIRST register (set-once): parent link,
+      // description, the initial prompt (opts.prompt, not the local `prompt` a
+      // fork degrade may have prefixed), and the frontmatter color (validated
+      // by the registry). startedAt is stamped by the registry itself.
       this.deps.subagentRegistry?.register({
         agentId,
         agentName: agent.name,
@@ -949,6 +977,10 @@ export class SubagentRuntime {
         cwd: this.deps.getCwd(),
         resumable: false,
         oneShot,
+        parentAgentId: opts.parentAgentId,
+        description: opts.description,
+        prompt: opts.prompt,
+        color: agent.color,
       });
     }
 
@@ -1098,6 +1130,11 @@ export class SubagentRuntime {
     // `settledOutcome` records the fate for the registry's per-subagent report.
     let capturedUsage: DispatchUsage | undefined;
     let settledOutcome: DispatchOutcome | undefined;
+    // The final answer text for the registry record (panel drill-down): the
+    // completed final message, or a failed run's best-effort partial. Aborted
+    // runs leave it unset — a deliberately stopped result is discarded by
+    // contract. Read once in the finally alongside outcome/usage.
+    let settledFinalText: string | undefined;
     const captureUsage = (): DispatchUsage | undefined => {
       const live = session;
       if (live && typeof live.getSessionStats === "function") {
@@ -1467,6 +1504,14 @@ export class SubagentRuntime {
         resumable: overrideDispatch || isFork ? false : resumable,
         oneShot,
         session: session as SteerableSession,
+        // Set-once in the registry: on a fresh dispatch these reconfirm the
+        // minimal register's values; on a resume the original prompt/
+        // description/parent/color are preserved (opts.prompt is the follow-up
+        // message here, deliberately NOT stored over the initial prompt).
+        parentAgentId: opts.parentAgentId,
+        description: opts.description,
+        prompt: opts.prompt,
+        color: agent.color,
       });
 
       // Cooperative stop: a TaskStop-triggered signal aborts the
@@ -1487,16 +1532,27 @@ export class SubagentRuntime {
       }
 
       // Live progress: subscribe to the child session's event stream and
-      // condense it into a bounded, sanitized snapshot pushed to opts.onProgress
-      // on every visible change. Event-stream only — NEVER poll session.messages
-      // (compaction inside prompt() rewrites that array mid-flight). Degrades to
-      // nothing when the session has no subscribe() (simple fakes, older SDKs).
-      if (opts.onProgress && typeof session.subscribe === "function") {
+      // condense it into a bounded, sanitized snapshot on every visible change.
+      // The dispatch-registry mirror is UNCONDITIONAL — this subscription is
+      // the panel's single live data source, so foreground (with or without an
+      // onUpdate sink), background, nested, and resumed dispatches all feed it;
+      // opts.onProgress additionally receives the same snapshot when supplied,
+      // exactly as before. Mirror before emit, so the record never lags a
+      // consumer-visible snapshot; the enlarged fullTail rides BESIDE the
+      // snapshot (a parallel record field), never inside the emitted payloads.
+      // Event-stream only — NEVER poll session.messages (compaction inside
+      // prompt() rewrites that array mid-flight). Degrades to nothing when the
+      // session has no subscribe() (simple fakes, older SDKs).
+      const dispatchRegistry = this.deps.subagentRegistry;
+      if ((opts.onProgress || dispatchRegistry) && typeof session.subscribe === "function") {
         const emit = opts.onProgress;
         const condenser = new SubagentProgressCondenser();
         progressUnsub = session.subscribe((event: unknown) => {
           try {
-            if (condenser.consume(event)) emit(condenser.snapshot());
+            if (!condenser.consume(event)) return;
+            const snapshot = condenser.snapshot();
+            dispatchRegistry?.noteProgress(agentId, snapshot, condenser.fullTail());
+            emit?.(snapshot);
           } catch {
             // progress is best-effort display — never let it break the dispatch
           }
@@ -1519,12 +1575,13 @@ export class SubagentRuntime {
         const last = lastAssistantMessage(live);
         if (last?.stopReason === "error") {
           settledOutcome = "failed";
+          // Best-effort partial output: whatever assistant text exists post-run
+          // (compaction inside prompt() may have rewritten earlier turns).
+          settledFinalText = assistantTextSoFar(live);
           return {
             ok: false,
             outcome: "failed",
-            // Best-effort partial output: whatever assistant text exists post-run
-            // (compaction inside prompt() may have rewritten earlier turns).
-            finalMessage: assistantTextSoFar(live),
+            finalMessage: settledFinalText,
             agentId,
             transcriptPath,
             // A failed-but-persisted agent stays resumable: the coordinator may
@@ -1650,6 +1707,7 @@ export class SubagentRuntime {
         );
       }
       settledOutcome = "completed";
+      settledFinalText = finalMessage;
       return {
         ok: true,
         outcome: "completed",
@@ -1716,6 +1774,9 @@ export class SubagentRuntime {
       this.deps.subagentRegistry?.markSettled(agentId, {
         outcome: settledOutcome,
         usage: capturedUsage,
+        // Sanitized+capped by the registry; conversation content, never for
+        // error/log interpolation.
+        finalText: settledFinalText,
       });
       if (worktreePath && this.deps.worktrees && !opts.resume) {
         // Keep the worktree (the project's own merge flow owns its lifecycle); just unlock.
@@ -1976,7 +2037,15 @@ export function createAgentToolDefinition(
       }) => void,
     ) {
       const subagentType = String(params.subagent_type ?? "");
-      const label = subagentType.trim() || "general-purpose";
+      // Capture-time sanitization: the model-supplied
+      // subagent_type becomes the displayed label/agentType — it rides into the
+      // start message, tool details, and the background task record, so it is a
+      // single sanitized line from here on (render-time defense stays too).
+      const label = sanitizeLine(subagentType, CAPTURED_LINE_CAP) || "general-purpose";
+      // Model-supplied task label for the registry record (the panel's label
+      // column) — sanitized at capture, before it is threaded anywhere.
+      const description =
+        sanitizeLine(String(params.description ?? ""), CAPTURED_LINE_CAP) || undefined;
       const dispatchOpts = {
         subagentType,
         prompt: String(params.prompt ?? ""),
@@ -1986,6 +2055,11 @@ export function createAgentToolDefinition(
         // makes (spread into both the background and foreground arms below), so a
         // fork's own Agent/Task tool refuses a nested `subagent_type: "fork"`.
         dispatcherIsFork: opts.dispatcherIsFork,
+        // Parent link for the panel tree: the dispatcher's own id (undefined
+        // for the coordinator) — the same runtime-set channel as ownerAgentId,
+        // never a tool parameter.
+        parentAgentId: opts.ownerAgentId,
+        description,
       };
       const backgroundDisabled = isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS);
       // Background-by-default (Claude 2.1.198+): a dispatch backgrounds
@@ -2073,6 +2147,7 @@ export function createAgentToolDefinition(
             });
           }
         : undefined;
+      const dispatchedAtMs = Date.now();
       const result = await runtime.dispatch({
         ...dispatchOpts,
         abortSignal: signal,
@@ -2088,6 +2163,13 @@ export function createAgentToolDefinition(
         // (formatUsageLine → formatUsageCompact). details is logs/UI-only — never
         // the model-visible content, so the verbatim-return contract is untouched.
         usage: result.usage,
+        // Elapsed wall-clock of the awaited dispatch, so FOREGROUND completion
+        // records show a duration like background ones (whose registry stamps
+        // startedAt/settledAt). Measured locally: the subagent registry that
+        // carries those stamps is private to the runtime and unreachable from
+        // this tool factory; this delta spans the identical interval. details
+        // is UI-only, so print/RPC output is untouched.
+        durationMs: Date.now() - dispatchedAtMs,
       };
       // Claude 2.1.200 outcome→presentation mapping: the text, cut-off frame,
       // resume trailer, and throw-vs-return decision all live in the shared,
@@ -2219,34 +2301,37 @@ export function createSendMessageToolDefinition(
       if (!resolved.ok) throw new Error(resolved.error);
       const record = resolved.record;
 
-      // One-shot builtins (Explore/Plan) refuse resume AND steer.
-      if (record.oneShot) {
-        throw new Error(
-          `Agent ${record.agentId} ("${record.agentName}") is a one-shot ${record.agentName} agent — one-shot built-ins (Explore/Plan) cannot be resumed or steered. Dispatch a new agent instead.`,
-        );
+      // Running background dispatch → steer (mid-task course correction). The
+      // refusal predicates (one-shot, user-stopped, no live steerable handle)
+      // live in the shared guardSteer — the same guard the panel drill-down
+      // steer calls — so the two surfaces cannot drift.
+      if (record.state === "running") {
+        const guard = guardSteer(record);
+        if (!guard.ok) throw new Error(guard.refusal);
+        await Promise.resolve(guard.steer(message));
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Message delivered to running agent ${record.agentId} ("${record.agentName}") as a mid-task course correction.`,
+            },
+          ],
+          details: { agentId: record.agentId, agent: record.agentName, delivery: "steer" },
+        };
       }
 
-      // Running background dispatch → steer (mid-task course correction).
-      if (record.state === "running") {
-        const session = record.session;
-        if (session && typeof session.steer === "function") {
-          await Promise.resolve(session.steer(message));
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Message delivered to running agent ${record.agentId} ("${record.agentName}") as a mid-task course correction.`,
-              },
-            ],
-            details: { agentId: record.agentId, agent: record.agentName, delivery: "steer" },
-          };
-        }
-        // A running record with no steerable handle: a foreground dispatch (which
-        // blocks the parent turn, so this is unreachable in practice) or one that
-        // just settled. Refuse rather than silently drop the message.
-        throw new Error(
-          `Agent ${record.agentId} ("${record.agentName}") is running but cannot be steered right now — only background dispatches are steerable (a foreground Agent call blocks the parent's turn).`,
-        );
+      // One-shot builtins (Explore/Plan) refuse resume too (guardSteer already
+      // refuses the steer arm above).
+      if (record.oneShot) {
+        throw new Error(oneShotRefusal(record));
+      }
+
+      // A USER stop is permanent: the resume seam refuses it here (the steer
+      // seam is guardSteer above). Deliberately narrower than a model TaskStop,
+      // which stays resumable — the registry-documented PiCC divergence
+      // ("PiCC allows resume after TaskStop").
+      if (record.userStopped) {
+        throw new Error(userStoppedRefusal(record));
       }
 
       // Settled → resume. Refuse the non-resumable cleanly — never silently start
@@ -2295,8 +2380,11 @@ export function createSendMessageToolDefinition(
       const onProgress = (snapshot: ProgressSnapshot) => {
         if (taskId) opts.backgroundTasks.noteProgress(taskId, snapshot);
       };
+      // Capture-time sanitization: record.agentName flows into the
+      // background record's label/agentType here — a single sanitized line.
+      const agentLabel = sanitizeLine(record.agentName, CAPTURED_LINE_CAP) || "subagent";
       const id = opts.backgroundTasks.start(
-        `agent:${record.agentName}`,
+        `agent:${agentLabel}`,
         runtime.dispatch({
           subagentType: record.agentName,
           prompt: message,
@@ -2321,7 +2409,7 @@ export function createSendMessageToolDefinition(
         }),
         () => controller.abort(),
         record.agentId,
-        record.agentName,
+        agentLabel,
       );
       taskId = id;
       const identity = formatBackgroundTaskIdentity(id, record.agentName, record.agentId);

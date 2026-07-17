@@ -20,7 +20,15 @@ import {
 import type { PiSdk } from "./runtime/subagents.js";
 import { SubagentRegistry } from "./runtime/subagent-registry.js";
 import type { SubagentRegistryRecord } from "./runtime/subagent-registry.js";
+import {
+  createPanelHintEmitter,
+  PANEL_ENTRY_CHORD,
+  SubagentPanelWidgetController,
+} from "./runtime/subagent-panel-widget.js";
+import { SubagentPanelFocusController } from "./runtime/subagent-panel-focus.js";
+import type { PanelTaskInfo } from "./runtime/subagent-panel-model.js";
 import { formatUsageCompact, sanitizeLine } from "./runtime/subagent-progress.js";
+import { renderSettlementRecord } from "./runtime/subagent-render.js";
 import { createGuardExtension } from "./runtime/guard.js";
 import {
   buildSystemPromptSuffix,
@@ -222,6 +230,18 @@ export interface PiccTestSeam {
      * supplied by the test). Reachable only via this in-process seam.
      */
     subagentRuntime: SubagentRuntime;
+    /**
+     * The session's status-panel widget controller: lets an offline test
+     * inject the panel clock/tick (`configureForTest`) so linger expiry is
+     * observable without fake timers around async dispatches.
+     */
+    subagentPanel: SubagentPanelWidgetController;
+    /**
+     * The focused-panel controller behind the entry chord: lets an offline
+     * test inject its clock (`configureForTest`) so the focus-freeze and
+     * stop-all confirmation windows are observable under the same clock rule.
+     */
+    subagentPanelFocus: SubagentPanelFocusController;
   }) => void;
   /**
    * TEST-ONLY subagent SDK override: replaces the real Pi SDK the session's
@@ -516,6 +536,58 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // resume a finished one. Registry-only resolution keeps a hostile `to` off the
   // filesystem (SECURITY).
   const subagentRegistry = new SubagentRegistry();
+  // Status panel: a passive belowEditor widget over the dispatch registry.
+  // Constructed unconditionally (cheap, no timer until installed) so the
+  // onWired test seam can reach it; it attaches to a UI only from the
+  // session_start handler's `ctx.mode === "tui"` gate.
+  const panelTaskJoin = (): PanelTaskInfo[] => {
+    const tasks: PanelTaskInfo[] = [];
+    for (const id of backgroundTasks.ids()) {
+      const record = backgroundTasks.get(id);
+      if (record) tasks.push(record);
+    }
+    return tasks;
+  };
+  const subagentPanel = new SubagentPanelWidgetController({
+    registry: subagentRegistry,
+    tasks: panelTaskJoin,
+    // Lazy closure over the focus controller declared just below: the widget
+    // reads dismissals only at view time (session_start and later), never
+    // during construction.
+    dismissed: () => subagentPanelFocus.dismissedKeys(),
+  });
+  // Focused panel (the entry chord's ctx.ui.custom component): selection,
+  // stop/dismiss/stop-all. Suppresses the passive widget while open.
+  const subagentPanelFocus = new SubagentPanelFocusController({
+    registry: subagentRegistry,
+    tasks: panelTaskJoin,
+    stopTask: (taskId) => {
+      backgroundTasks.markUserStopped(taskId);
+    },
+    widget: subagentPanel,
+  });
+  // The chord only works in interactive mode (Pi dispatches extension
+  // shortcuts from the TUI editor); open() re-checks the ctx mode itself.
+  if (typeof pi.registerShortcut === "function") {
+    pi.registerShortcut(PANEL_ENTRY_CHORD, {
+      description: "Open the subagent status panel",
+      handler: (ctx: any) => subagentPanelFocus.open(ctx),
+    });
+  }
+  // One-time status-line hint (ui.notify) advertising the chord, emitted only
+  // once >1 agent runs concurrently in a TUI session (the ui handle is
+  // captured at session_start).
+  let panelHintUi: any;
+  const emitPanelHint = createPanelHintEmitter({
+    chord: PANEL_ENTRY_CHORD,
+    isTui: () => panelHintUi !== undefined,
+    emit: (text) => panelHintUi?.notify?.(text, "info"),
+  });
+  subagentRegistry.onChange(() => {
+    let running = 0;
+    for (const record of subagentRegistry.list()) if (record.state === "running") running++;
+    emitPanelHint(running);
+  });
   // Built-in agent types: general-purpose/Explore/Plan, appended AFTER
   // project/user/plugin agents so a same-named project agent wins (an
   // overridden built-in is dropped from the catalog — dispatch resolves the
@@ -777,7 +849,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // in-process argument, never via project/env/settings/files. Invoked after the
   // runtime is built so the test can inject its fake SDK before the first dispatch.
   try {
-    testSeam?.onWired?.({ backgroundTasks, subagentRegistry, subagentRuntime });
+    testSeam?.onWired?.({
+      backgroundTasks,
+      subagentRegistry,
+      subagentRuntime,
+      subagentPanel,
+      subagentPanelFocus,
+    });
   } catch (err) {
     console.error(`PiCC test seam onWired failed: ${(err as Error).message}`);
   }
@@ -1155,8 +1233,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // synchronous send, and commit.
         testSeam?.beforeSettlementSend?.(notice);
         if (!notice.isValid()) continue;
+        // `details` is UI-only structured record data for the registered
+        // picc-settlement renderer; `content` stays the entire model-facing text.
         pi.sendMessage(
-          { customType: "picc-settlement", content: notice.content, display: true },
+          {
+            customType: "picc-settlement",
+            content: notice.content,
+            display: true,
+            details: notice.details,
+          },
           { deliverAs: "steer" },
         );
         notice.commit();
@@ -1173,6 +1258,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     try {
       modelRegistryRef = ctx.modelRegistry;
       sessionManagerRef = ctx.sessionManager;
+      // Status panel: interactive TUI ONLY. The gate is `ctx.mode === "tui"`
+      // specifically, NOT `hasUI` — RPC mode also implements setWidget (and
+      // reports hasUI: true), so a hasUI gate would install the panel into an
+      // RPC client; print/RPC output must stay unchanged.
+      if (ctx.mode === "tui") {
+        subagentPanel.attach(ctx.ui);
+        // Arms the one-time panel hint: the TUI gate is "a TUI ui was seen",
+        // so print/RPC sessions never emit it (and never consume its gate).
+        panelHintUi = ctx.ui;
+      }
       if (ctx.model) {
         currentModel = ctx.model;
         currentModelRef = `${ctx.model.provider}/${ctx.model.id}`;
@@ -1310,6 +1405,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
                   // keys, etc.) are longer, so match the bare byte only. Consume it
                   // so Pi doesn't also act on the same keypress.
                   if (data.length === 1 && data.charCodeAt(0) === 0x1b) {
+                    // Esc layering: raw terminal-input listeners run BEFORE the
+                    // focused component in pi-tui, so while the subagent panel
+                    // is open its close-Esc would otherwise abort this fork —
+                    // pass the byte through to the panel instead.
+                    if (subagentPanelFocus.isOpen()) return undefined;
                     escController.abort();
                     return { consume: true };
                   }
@@ -1639,6 +1739,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   );
   pi.registerEntryRenderer("picc-compat", (entry: any, _opts: any, theme: any) =>
     controlOutputComponent("PiCC compatibility", entry.data?.notice ?? "", theme),
+  );
+  // Settlement notices render as the collapsed-expandable subagent completion
+  // record (same shape as the tool renderers'), so a never-awaited background
+  // settlement still leaves exactly one expandable record in the transcript.
+  // Only the RENDERING changes — the model-facing steer text is untouched.
+  // Returns undefined (→ Pi's default custom-message box) for nested tasks and
+  // for messages without the structured details.
+  pi.registerMessageRenderer("picc-settlement", (message: any, opts: any, theme: any) =>
+    renderSettlementRecord(message?.details, opts, theme),
   );
 
   /**

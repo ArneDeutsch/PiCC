@@ -9,7 +9,12 @@ import {
 } from "../src/runtime/background-tasks.js";
 import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import { createAgentToolDefinition, type PiSessionStats } from "../src/runtime/subagents.js";
-import { renderAgentResult } from "../src/runtime/subagent-render.js";
+import {
+  RECORD_EXPAND_HINT,
+  RECORD_REFERENCE_NOTE,
+  renderAgentResult,
+  renderSettlementRecord,
+} from "../src/runtime/subagent-render.js";
 import {
   formatUsageCompact,
   renderProgressText,
@@ -2120,15 +2125,17 @@ describe("TaskOutput live streaming", () => {
     const final = await pending;
 
     expect(partials.length).toBeGreaterThanOrEqual(1);
-    // At least one partial renders the tail + activity AND is self-identifying.
+    // At least one partial renders as the SINGLE self-identifying status line
+    // (chip + agent + activity — the panel owns the rolling tail). The
+    // EMISSION still carries the full snapshot for panel/RPC consumers.
     const identified = partials.some((p) => {
       const r = renderUpdate(p);
       return (
         r.includes("Task(" + id + ")") &&
         r.includes("Agent(coder)") &&
-        r.includes(AGENT_ID) &&
         r.includes("running Grep…") &&
-        r.includes("> Grep (x)")
+        !r.includes("\n") && // one status line, no tail
+        (p.details?.subagentProgress as ProgressSnapshot | undefined)?.tail.includes("> Grep (x)") === true
       );
     });
     expect(identified).toBe(true);
@@ -2635,5 +2642,553 @@ describe("BackgroundTaskRegistry.scopedTo — per-dispatcher isolation", () => {
     expect(scoped.ids()).toEqual([]);
     const taskOutput = createTaskOutputTool(scoped) as unknown as ToolLike;
     await expect(taskOutput.execute("t", { task_id: b.id })).rejects.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Capture-time sanitization + user-stop marker
+// ---------------------------------------------------------------------------
+
+describe("capture-time sanitization", () => {
+  const ESC = String.fromCharCode(27);
+  const BEL = String.fromCharCode(7);
+
+  it("TaskOutput and TaskStop sanitize a hostile task_id before it is echoed in the unknown-id error", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const hostileId = `bogus${ESC}]0;pwned${BEL}${ESC}[31m \nline2`;
+    for (const tool of [
+      createTaskOutputTool(registry) as unknown as ToolLike,
+      createTaskStopTool(registry) as unknown as ToolLike,
+    ]) {
+      let msg = "";
+      try {
+        await tool.execute("x", { task_id: hostileId });
+      } catch (e) {
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/Unknown task_id/);
+      // Escapes stripped, whitespace flattened to one line, readable remnant kept.
+      expect(msg).toContain("bogus line2");
+      expect(msg).not.toContain(ESC);
+      expect(msg).not.toContain(BEL);
+      expect(msg).not.toContain("\n" + "line2");
+    }
+  });
+
+  it("the Agent tool's hostile subagent_type is clean on the task RECORD (label + agentType) immediately after capture", async () => {
+    const hostileType = `worker${ESC}]0;pwn${BEL}${ESC}[31m`;
+    const { sdk, release } = gatedSdk("done");
+    const bg = new BackgroundTaskRegistry();
+    const runtime = makeRuntime([makeAgent()], sdk);
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: bg,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t", { subagent_type: hostileType, prompt: "go" });
+    // Assert the RECORD, not the printed text: clean the instant it exists.
+    const rec = bg.get(String(started.details.taskId))!;
+    expect(rec.agentType).toBe("worker");
+    expect(rec.label).toBe("agent:worker");
+    expect(String(started.details.agent)).toBe("worker");
+    expect(started.content[0]!.text).not.toContain(ESC);
+    release();
+    await bg.wait(rec.id);
+  });
+
+  it("start() sanitizes hostile label/agentType at record capture and the settled agentName mirror (direct registry path)", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const id = registry.start(
+      `agent:${ESC}[31mworker${BEL}`,
+      Promise.resolve(result({ agentName: `rev${ESC}[0miewer${BEL}` })),
+      undefined,
+      undefined,
+      `wo${ESC}[7mrker`,
+    );
+    const rec = registry.get(id)!;
+    expect(rec.label).toBe("agent:worker");
+    expect(rec.agentType).toBe("worker");
+    await registry.wait(id);
+    expect(rec.agentName).toBe("reviewer"); // BackgroundResultLike mirror, clean at capture
+  });
+
+  it("hostile description, prompt, and final answer are clean on the dispatch registry record at capture", async () => {
+    const sub = new SubagentRegistry();
+    const bg = new BackgroundTaskRegistry();
+    const h = fakeSdk({ replies: [`ans${ESC}[31mwer${BEL}\nline two`] });
+    const runtime = makeRuntime([makeAgent()], h.sdk, { subagentRegistry: sub });
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: bg,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t", {
+      subagent_type: "worker",
+      prompt: `do${ESC}]0;pwn${BEL} the ${ESC}[31mthing\nline2`,
+      run_in_background: true,
+      description: `lab${ESC}[31mel${BEL}`,
+    });
+    const rec = sub.get(String(started.details.agentId))!;
+    // Clean at capture — before any render touches them.
+    expect(rec.description).toBe("label");
+    expect(rec.prompt).toBe("do the thing\nline2"); // multi-line kept, escapes gone
+    await bg.wait(String(started.details.taskId));
+    expect(rec.finalText).toBe("answer\nline two");
+    for (const value of [rec.description, rec.prompt, rec.finalText]) {
+      expect(value).not.toContain(ESC);
+      expect(value).not.toContain(BEL);
+    }
+  });
+});
+
+describe("BackgroundTaskRegistry.markUserStopped", () => {
+  it("marks a running task user-stopped, requests the abort, and TaskOutput details carry userStopped", async () => {
+    const registry = new BackgroundTaskRegistry();
+    let aborted = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const id = registry.start(
+      "agent:worker",
+      gate.then(() => result({ ok: false, outcome: "aborted", error: "stopped" })),
+      () => {
+        aborted = true;
+        release();
+      },
+    );
+    expect(registry.markUserStopped(id)).toEqual({
+      found: true,
+      alreadySettled: false,
+      abortRequested: true,
+    });
+    expect(aborted).toBe(true);
+    expect(registry.get(id)!.userStopped).toBe(true);
+    expect(registry.get(id)!.status).toBe("stopped");
+    await registry.wait(id);
+    const out = await (createTaskOutputTool(registry) as unknown as ToolLike).execute("x", {
+      task_id: id,
+    });
+    // The sanctioned data path for a "stopped by user" rendering: details only.
+    expect(out.details.userStopped).toBe(true);
+    expect(out.details.status).toBe("stopped");
+  });
+
+  it("never claims a completed task, and a model TaskStop/stop() sets no user marker", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const done = registry.start("agent:worker", Promise.resolve(result()));
+    await registry.wait(done);
+    expect(registry.markUserStopped(done)).toEqual({
+      found: true,
+      alreadySettled: true,
+      abortRequested: false,
+    });
+    expect(registry.get(done)!.userStopped).toBeUndefined();
+    expect(registry.markUserStopped("task-999")).toEqual({
+      found: false,
+      alreadySettled: false,
+      abortRequested: false,
+    });
+    // The model's stop path never sets the user marker.
+    const running = registry.start("agent:worker", new Promise(() => {}));
+    registry.stop(running);
+    expect(registry.get(running)!.userStopped).toBeUndefined();
+    const out = await (createTaskOutputTool(registry) as unknown as ToolLike).execute("x", {
+      task_id: running,
+    });
+    expect(out.details.userStopped).toBeUndefined();
+    expect(out.details.status).toBe("stopped");
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("SubagentRegistry live mirror + onChange", () => {
+  it("background dispatch mirrors progress, fullTail, and live usage onto the dispatch registry record and keeps the task record in sync", async () => {
+    const sub = new SubagentRegistry();
+    const bg = new BackgroundTaskRegistry();
+    const events = [
+      { type: "tool_execution_start", toolName: "Grep", args: { pattern: "foo" } },
+      {
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "done" }],
+          // Pi-shaped AssistantMessage.usage: required, usage-bearing here.
+          usage: {
+            input: 10,
+            output: 5,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 15,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.25 },
+          },
+        },
+      },
+    ];
+    const h = fakeSdk({
+      replies: [{ text: "done", events }],
+      // Settlement stats match the event-stream figures, so the live snapshot
+      // usage must equal the settled registry usage exactly.
+      stats: { tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 }, cost: 0.25 },
+    });
+    const runtime = makeRuntime([makeAgent()], h.sdk, { subagentRegistry: sub });
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: bg,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t1", {
+      subagent_type: "worker",
+      prompt: "go",
+      run_in_background: true,
+    });
+    const taskId = String(started.details.taskId);
+    await bg.wait(taskId);
+    const rec = sub.get(String(started.details.agentId))!;
+    expect(rec.progress?.tail.some((l) => l.includes("Grep"))).toBe(true);
+    expect(rec.fullTail?.some((l) => l.includes("Grep"))).toBe(true);
+    const live = {
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costUsd: 0.25,
+    };
+    // Live usage appeared once known and never contradicts settlement stats.
+    expect(rec.progress?.usage).toEqual(live);
+    expect(rec.usage).toEqual(live);
+    // The background task record's own progress mirror stayed in sync.
+    expect(bg.get(taskId)?.progress?.tail).toEqual(rec.progress?.tail);
+    expect(bg.get(taskId)?.progress?.usage).toEqual(live);
+  });
+
+  it("onChange fires on every mutation, skips no-ops, and unsubscribes cleanly", () => {
+    const sub = new SubagentRegistry();
+    let fires = 0;
+    const unsub = sub.onChange(() => fires++);
+    const id = "agent-aaaaaaaaaaaa";
+    sub.register({
+      agentId: id,
+      agentName: "worker",
+      depth: 1,
+      cwd: "/x",
+      resumable: true,
+      oneShot: false,
+    });
+    expect(fires).toBe(1);
+    sub.noteProgress(id, { tail: ["line"], activity: "working…" }, ["full line"]);
+    expect(fires).toBe(2);
+    expect(sub.get(id)?.fullTail).toEqual(["full line"]);
+    // A snapshot-only note keeps the prior fullTail.
+    sub.noteProgress(id, { tail: ["line", "next"], activity: "working…" });
+    expect(fires).toBe(3);
+    expect(sub.get(id)?.fullTail).toEqual(["full line"]);
+    sub.markSettled(id, { outcome: "completed" });
+    expect(fires).toBe(4);
+    // Settled: noteProgress is a silent no-op — the settled record stays authoritative.
+    sub.noteProgress(id, { tail: ["late"], activity: "x" });
+    expect(sub.get(id)?.progress?.tail).toEqual(["line", "next"]);
+    expect(fires).toBe(4);
+    sub.markResuming(id);
+    expect(fires).toBe(5);
+    sub.markSettled(id);
+    expect(fires).toBe(6);
+    sub.markUserStopped(id);
+    expect(fires).toBe(7);
+    // The user-stop veto makes markResuming a silent no-op.
+    sub.markResuming(id);
+    expect(fires).toBe(7);
+    // consumeSettledNotice mutates only the delivery gate — deliberately silent
+    // (nothing rendered reads it; t04's repaint loop trusts this exact fire-set).
+    sub.consumeSettledNotice(id);
+    expect(fires).toBe(7);
+    // Unknown ids never fire.
+    sub.markSettled("agent-bbbbbbbbbbbb");
+    sub.noteProgress("agent-bbbbbbbbbbbb", { tail: [], activity: "" });
+    sub.markUserStopped("agent-bbbbbbbbbbbb");
+    expect(fires).toBe(7);
+    unsub();
+    sub.register({
+      agentId: "agent-cccccccccccc",
+      agentName: "other",
+      depth: 1,
+      cwd: "/x",
+      resumable: false,
+      oneShot: false,
+    });
+    expect(fires).toBe(7);
+  });
+
+  it("a throwing onChange listener neither breaks the mutation nor starves other listeners", () => {
+    const sub = new SubagentRegistry();
+    let seen = 0;
+    sub.onChange(() => {
+      throw new Error("hostile listener");
+    });
+    sub.onChange(() => seen++);
+    const id = "agent-dddddddddddd";
+    expect(() =>
+      sub.register({
+        agentId: id,
+        agentName: "worker",
+        depth: 1,
+        cwd: "/x",
+        resumable: false,
+        oneShot: false,
+      }),
+    ).not.toThrow();
+    expect(seen).toBe(1);
+    expect(sub.get(id)).toBeDefined();
+  });
+});
+
+/**
+ * Condensed transcript records — settlement-emitter data path
+ * (SettlementNotice.details → renderSettlementRecord) and the exactly-once
+ * reconciliation between the settlement record and TaskOutput collections.
+ */
+describe("settlement completion record (details + exactly-once)", () => {
+  const AGENT_ID = "agent-aabbccddeeff";
+  const USAGE = { inputTokens: 100, outputTokens: 50, costUsd: 0.0123 };
+
+  function armedSubRegistry(agentId: string): SubagentRegistry {
+    const reg = new SubagentRegistry();
+    reg.register({
+      agentId,
+      agentName: "worker",
+      depth: 1,
+      cwd: process.cwd(),
+      resumable: true,
+      oneShot: false,
+    });
+    reg.markSettled(agentId);
+    return reg;
+  }
+  const drainOnce = (bg: BackgroundTaskRegistry, sub: SubagentRegistry) =>
+    bg.drainSettlementNotices(
+      (a) => sub.isSettledNoticeArmed(a),
+      (a) => sub.consumeSettledNotice(a),
+      (a) => sub.get(a) !== undefined,
+    );
+
+  it("a never-awaited settlement's notice carries the UI record details; the registered renderer draws ONE collapsed record", async () => {
+    const bg = new BackgroundTaskRegistry();
+    const id = bg.start(
+      "agent:worker",
+      Promise.resolve(
+        result({
+          finalMessage: "the review report",
+          agentId: AGENT_ID,
+          resumable: true,
+          transcriptPath: `/x/sessions/${AGENT_ID}.jsonl`,
+          usage: USAGE,
+        }),
+      ),
+      undefined,
+      AGENT_ID,
+      "worker",
+    );
+    await bg.wait(id);
+    const sub = armedSubRegistry(AGENT_ID);
+    const notices = drainOnce(bg, sub);
+    expect(notices).toHaveLength(1);
+    const details = notices[0]!.details;
+    // The model-facing content is untouched — details ride BESIDE it, UI-only.
+    expect(notices[0]!.content).toContain("settled: completed");
+    expect(details.record).toBe("subagent-completion");
+    expect(details.taskId).toBe(id);
+    expect(details.outcome).toBe("completed");
+    expect(details.agent).toBe("worker");
+    expect(details.agentId).toBe(AGENT_ID);
+    expect(details.finalText).toBe("the review report");
+    expect(details.transcriptPath).toBe(`/x/sessions/${AGENT_ID}.jsonl`);
+    expect(details.usage).toEqual(USAGE);
+    expect(typeof details.durationMs).toBe("number");
+    expect(details.durationMs as number).toBeGreaterThanOrEqual(0);
+    expect(details.nested).toBeUndefined(); // coordinator-owned → renders
+
+    // The registered renderer draws the collapsed-expandable completion record.
+    const collapsed = renderSettlementRecord(details, { expanded: false }, undefined)!;
+    const collapsedLines = collapsed.render(200);
+    expect(collapsedLines).toHaveLength(1);
+    expect(collapsedLines[0]).toContain(`Task(${id})`);
+    expect(collapsedLines[0]).toContain("Agent(worker) completed");
+    expect(collapsedLines[0]).toContain(RECORD_EXPAND_HINT);
+    expect(collapsedLines[0]).toContain(`${AGENT_ID}.jsonl`);
+    expect(collapsedLines[0]).not.toContain("the review report");
+    const expanded = renderSettlementRecord(details, { expanded: true }, undefined)!
+      .render(200)
+      .join("\n");
+    expect(expanded).toContain("the review report");
+    expect(expanded).toContain("transcript: /x/sessions/");
+    expect(expanded).toContain("usage:");
+  });
+
+  it("failed and user-stopped settlements carry error/userStopped; the record renders them", async () => {
+    const bg = new BackgroundTaskRegistry();
+    const failedId = bg.start(
+      "agent:worker",
+      Promise.resolve(
+        result({
+          ok: false,
+          outcome: "failed",
+          error: "connection reset",
+          finalMessage: "partial work",
+          agentId: AGENT_ID,
+        }),
+      ),
+      undefined,
+      AGENT_ID,
+      "worker",
+    );
+    await bg.wait(failedId);
+    const sub = armedSubRegistry(AGENT_ID);
+    const [failedNotice] = drainOnce(bg, sub);
+    expect(failedNotice!.details.error).toBe("connection reset");
+    expect(failedNotice!.details.finalText).toBe("partial work");
+    const collapsed = renderSettlementRecord(failedNotice!.details, { expanded: false }, undefined)!
+      .render(200)
+      .join("\n");
+    expect(collapsed).toContain("failed");
+    expect(collapsed).toContain("connection reset");
+    const expanded = renderSettlementRecord(failedNotice!.details, { expanded: true }, undefined)!
+      .render(200)
+      .join("\n");
+    expect(expanded).toContain("connection reset");
+    expect(expanded).toContain("partial work");
+
+    // User-stopped: the panel stop marker reaches the record as userStopped.
+    const bg2 = new BackgroundTaskRegistry();
+    const otherAgent = "agent-001122334455";
+    let resolve!: (v: ReturnType<typeof result>) => void;
+    const stoppedId = bg2.start(
+      "agent:worker",
+      new Promise<ReturnType<typeof result>>((r) => (resolve = r)),
+      () => {},
+      otherAgent,
+      "worker",
+    );
+    bg2.markUserStopped(stoppedId);
+    resolve(result({ outcome: "aborted", finalMessage: "discarded", agentId: otherAgent }));
+    await bg2.wait(stoppedId);
+    const sub2 = armedSubRegistry(otherAgent);
+    const [stoppedNotice] = drainOnce(bg2, sub2);
+    expect(stoppedNotice!.details.userStopped).toBe(true);
+    expect(stoppedNotice!.details.finalText).toBeUndefined(); // aborted result discarded
+    const stoppedLine = renderSettlementRecord(stoppedNotice!.details, { expanded: false }, undefined)!
+      .render(200)
+      .join("\n");
+    expect(stoppedLine).toContain("stopped by user");
+  });
+
+  it("NESTED (owner-tagged) settlements render NO main-chat record; detail-less messages fall back too", async () => {
+    const bg = new BackgroundTaskRegistry();
+    const id = bg.start(
+      "agent:worker",
+      Promise.resolve(result({ finalMessage: "child work", agentId: AGENT_ID })),
+      undefined,
+      AGENT_ID,
+      "worker",
+      "agent-parentparent", // dispatched BY a subagent → nested
+    );
+    await bg.wait(id);
+    const sub = armedSubRegistry(AGENT_ID);
+    const [notice] = drainOnce(bg, sub);
+    expect(notice!.details.nested).toBe(true);
+    // Nested → undefined → Pi's default custom-message box (no record markers).
+    expect(renderSettlementRecord(notice!.details, { expanded: false }, undefined)).toBeUndefined();
+    // Messages without the structured details (older sessions) fall back too.
+    expect(renderSettlementRecord(undefined, { expanded: false }, undefined)).toBeUndefined();
+    expect(renderSettlementRecord({}, { expanded: false }, undefined)).toBeUndefined();
+    expect(renderSettlementRecord({ record: "other" }, { expanded: false }, undefined)).toBeUndefined();
+  });
+
+  it("exactly-once: settlement record delivered first → a later TaskOutput renders ONLY the reference line", async () => {
+    const bg = new BackgroundTaskRegistry();
+    const id = bg.start(
+      "agent:worker",
+      Promise.resolve(result({ finalMessage: "the review report", agentId: AGENT_ID })),
+      undefined,
+      AGENT_ID,
+      "worker",
+    );
+    await bg.wait(id);
+    const sub = armedSubRegistry(AGENT_ID);
+    const notices = drainOnce(bg, sub);
+    expect(notices).toHaveLength(1);
+    notices[0]!.commit(); // the settlement record was delivered
+
+    const taskOutput = createTaskOutputTool(bg) as unknown as StreamTool;
+    const out = await taskOutput.execute("t", { task_id: id }, undefined, undefined);
+    // Model-facing content stays the full verbatim result (print/RPC unchanged)…
+    expect(out.content[0]!.text).toBe("the review report");
+    expect(out.details.alreadyReported).toBe(true);
+    // …but the render is the minimal reference line, collapsed AND expanded.
+    for (const expanded of [false, true]) {
+      const lines = taskOutput
+        .renderResult(out, { isPartial: false, expanded }, undefined)
+        .render(200);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(RECORD_REFERENCE_NOTE);
+      expect(lines[0]).not.toContain("the review report");
+    }
+  });
+
+  it("exactly-once, other order: TaskOutput collects first → full record once, then reference; no settlement notice", async () => {
+    const bg = new BackgroundTaskRegistry();
+    const id = bg.start(
+      "agent:worker",
+      Promise.resolve(result({ finalMessage: "the review report", agentId: AGENT_ID })),
+      undefined,
+      AGENT_ID,
+      "worker",
+    );
+    await bg.wait(id);
+    const sub = armedSubRegistry(AGENT_ID);
+    const taskOutput = createTaskOutputTool(bg) as unknown as StreamTool;
+
+    // First collection: the full (collapsed) completion record.
+    const first = await taskOutput.execute("t", { task_id: id }, undefined, undefined);
+    expect(first.details.alreadyReported).toBeUndefined();
+    expect(typeof first.details.durationMs).toBe("number");
+    const collapsed = taskOutput
+      .renderResult(first, { isPartial: false, expanded: false }, undefined)
+      .render(200);
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0]).toContain(RECORD_EXPAND_HINT);
+    // The settlement notice is suppressed (collection already reported it).
+    expect(drainOnce(bg, sub)).toEqual([]);
+
+    // A second collection renders only the reference line.
+    const second = await taskOutput.execute("t2", { task_id: id }, undefined, undefined);
+    expect(second.details.alreadyReported).toBe(true);
+    const ref = taskOutput
+      .renderResult(second, { isPartial: false, expanded: false }, undefined)
+      .render(200);
+    expect(ref).toHaveLength(1);
+    expect(ref[0]).toContain(RECORD_REFERENCE_NOTE);
+  });
+
+  it("TaskOutput details: durationMs only when settled; error only when failed; a running poll has neither", async () => {
+    const bg = new BackgroundTaskRegistry();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const id = bg.start(
+      "agent:worker",
+      (async () => {
+        await gate;
+        return result({ ok: false, outcome: "failed", error: "boom", finalMessage: "", agentId: AGENT_ID });
+      })(),
+      undefined,
+      AGENT_ID,
+      "worker",
+    );
+    const taskOutput = createTaskOutputTool(bg) as unknown as StreamTool;
+    const polled = await taskOutput.execute("t", { task_id: id, wait: false }, undefined, undefined);
+    expect(polled.details.durationMs).toBeUndefined();
+    expect(polled.details.error).toBeUndefined();
+    expect(polled.details.alreadyReported).toBeUndefined();
+    release();
+    await bg.wait(id);
+    const settled = await taskOutput.execute("t2", { task_id: id }, undefined, undefined);
+    expect(typeof settled.details.durationMs).toBe("number");
+    expect(settled.details.durationMs as number).toBeGreaterThanOrEqual(0);
+    expect(settled.details.error).toBe("boom");
   });
 });

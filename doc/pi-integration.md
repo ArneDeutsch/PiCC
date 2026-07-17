@@ -41,7 +41,8 @@ Launch modes we support:
 | Model/effort control | `pi.setModel(model)`, `ctx.modelRegistry.find(provider,id)`, `pi.setThinkingLevel("off"…"max")` — Claude `effort` maps onto thinking levels |
 | Env & exec | `pi.exec(cmd, args, { signal, timeout })` for git/hook commands; hooks additionally need shell execution via `node:child_process` (stdin JSON contract Pi's exec doesn't cover: we use `spawn` directly) |
 | Quota | `ctx.getContextUsage()`; subscription quota via provider headers on `after_provider_response` (rate-limit headers) + `/login`-stored auth; degrade gracefully if absent |
-| Compat notices / UX | `ctx.ui.notify`, `pi.appendEntry` + `pi.registerEntryRenderer` (TUI-only), `ctx.ui.setStatus` |
+| Compat notices / UX | `ctx.ui.notify`, `pi.appendEntry` + `pi.registerEntryRenderer` (TUI-only) |
+| Subagent status panel, drill-down & condensed settlement records (interactive TUI only) | `ctx.ui.setWidget(key, factory, { placement: "belowEditor" })` — factory invoked synchronously, replaced/removed components disposed; `ctx.ui.custom(factory)` — focused component, Pi saves/restores the editor draft around it; `pi.registerShortcut(keyId, { description, handler })` — dispatches only while the default editor has focus; `ctx.ui.onTerminalInput` — raw listeners run BEFORE the focused component, so PiCC's fork-Esc watcher yields a lone Esc while the panel is open; `pi.registerMessageRenderer(customType, renderer)` + `pi.sendMessage(…, details)` — rendered by Pi's `CustomMessageComponent` with a boolean `expanded` (Ctrl+O toggle); `undefined`/throw falls back to Pi's default box. Mode gating is on `ctx.mode === "tui"`, never `hasUI`: print's `noOpUIContext` implements the full ui interface with `hasUI` false, while RPC flips `hasUI` true. |
 | Skill listing into system prompt | We do **not** feed `.claude/skills` through Pi's own skill discovery (Pi's XML listing + `/skill:` semantics differ from Claude's budgeted listing, `$ARGUMENTS`, shell-injection, `context: fork`). PiCC owns the Claude skill pipeline end-to-end: listing text appended in `before_agent_start`, activation via our own `Skill` tool + slash commands. Pi's native skill/command discovery of `.pi/`/`.agents/` stays untouched. |
 
 ## 3. Key mechanics decisions
@@ -137,4 +138,10 @@ TUI, `/model`, project trust. We do not reimplement any of it.
   - **`getTextOutput` transform** — `tool-shell.ts` reproduces Pi's `render-utils.js` `getTextOutput`
     (the deep path is `exports`-blocked); the smoke test pins it against Pi's own via an absolute
     `file://` import so a transform change (CRLF stripping, image fallbacks) fails loudly.
+- The subagent panel/record surfaces couple to Pi's UI contract (see the status-panel row in
+  "Pi API surface we use"): the extension-ctx `setWidget`/`custom`/`onTerminalInput` shape and the
+  mode/`hasUI` gating reality, `registerShortcut` presence + recording, `registerMessageRenderer` +
+  `sendMessage` details threading, and `CustomMessageComponent`'s boolean `expanded` with the
+  undefined→default-box fallback. All pinned in `test/pi-contract.test.ts` so a Pi bump fails
+  loudly rather than silently dropping the panel or the settlement records.
 - Quota introspection depends on undocumented response headers; feature is best-effort by design.

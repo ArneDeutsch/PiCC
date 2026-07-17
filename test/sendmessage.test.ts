@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
+import { guardSteer, SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import {
   createAgentToolDefinition,
   createSendMessageToolDefinition,
@@ -154,6 +154,214 @@ describe("SubagentRegistry", () => {
       const res = r.resolve(hostile);
       expect(res.ok, `must miss ${hostile}`).toBe(false);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SubagentRegistry — panel state fields (parent link, timestamps, prompt/final
+// text, color, user stop) and the shared steer guard
+// ---------------------------------------------------------------------------
+
+describe("SubagentRegistry — panel state fields", () => {
+  const ESC = String.fromCharCode(27);
+  const base = {
+    depth: 1,
+    cwd: process.cwd(),
+    transcriptPath: "/x/agent.jsonl",
+    resumable: true,
+    oneShot: false,
+  };
+
+  it("captures parentAgentId/description/prompt/color set-once; an enrich re-register never clobbers them", () => {
+    const r = new SubagentRegistry();
+    const id = mintAgentId();
+    const parent = mintAgentId();
+    r.register({
+      agentId: id,
+      agentName: "reviewer",
+      ...base,
+      parentAgentId: parent,
+      description: "Review auth changes",
+      prompt: "check the login flow",
+      color: "purple",
+    });
+    const rec = r.get(id)!;
+    expect(rec.parentAgentId).toBe(parent);
+    expect(rec.description).toBe("Review auth changes");
+    expect(rec.prompt).toBe("check the login flow");
+    expect(rec.color).toBe("purple");
+    // The enrich/resume re-register (same id) supplies different values — every
+    // set-once field keeps its first capture.
+    r.register({
+      agentId: id,
+      agentName: "reviewer",
+      ...base,
+      parentAgentId: mintAgentId(),
+      description: "other label",
+      prompt: "a follow-up message",
+      color: "red",
+    });
+    expect(rec.parentAgentId).toBe(parent);
+    expect(rec.description).toBe("Review auth changes");
+    expect(rec.prompt).toBe("check the login flow");
+    expect(rec.color).toBe("purple");
+  });
+
+  it("collapses blank-after-sanitize description/prompt to undefined, keeping the truthiness contract", () => {
+    // The panel's label fallback (description -> agentName) is a plain
+    // truthiness test — pure-escape or whitespace input must store undefined,
+    // never "".
+    const r = new SubagentRegistry();
+    const id = mintAgentId();
+    r.register({
+      agentId: id,
+      agentName: "reviewer",
+      ...base,
+      description: `${ESC}[31m${ESC}[0m   `,
+      prompt: `${ESC}]0;title`,
+    });
+    const rec = r.get(id)!;
+    expect(rec.description).toBeUndefined();
+    expect(rec.prompt).toBeUndefined();
+  });
+
+  it("startedAt: set at first register, preserved by enrich; markSettled stamps settledAt; markResuming resets startedAt and clears settledAt", () => {
+    const now = vi.spyOn(Date, "now");
+    now.mockReturnValue(1_000);
+    const r = new SubagentRegistry();
+    const id = mintAgentId();
+    r.register({ agentId: id, agentName: "reviewer", ...base });
+    expect(r.get(id)!.startedAt).toBe(1_000);
+    now.mockReturnValue(2_000);
+    r.register({ agentId: id, agentName: "reviewer", session: {}, ...base });
+    expect(r.get(id)!.startedAt).toBe(1_000); // enrich preserves
+    expect(r.get(id)!.settledAt).toBeUndefined();
+    now.mockReturnValue(3_000);
+    r.markSettled(id);
+    expect(r.get(id)!.settledAt).toBe(3_000);
+    now.mockReturnValue(4_000);
+    r.markResuming(id);
+    // A resumed agent's elapsed time restarts; its settlement stamp clears.
+    expect(r.get(id)!.startedAt).toBe(4_000);
+    expect(r.get(id)!.settledAt).toBeUndefined();
+  });
+
+  it("markSettled records sanitized finalText only when provided (a later settle without text keeps the prior answer)", () => {
+    const r = new SubagentRegistry();
+    const id = mintAgentId();
+    r.register({ agentId: id, agentName: "reviewer", ...base });
+    r.markSettled(id, { finalText: `${ESC}[31mthe answer${ESC}[0m\nline two` });
+    expect(r.get(id)!.finalText).toBe("the answer\nline two");
+    r.markResuming(id);
+    r.markSettled(id);
+    expect(r.get(id)!.finalText).toBe("the answer\nline two");
+  });
+
+  it("caps prompt (~4 KB) and finalText (~16 KB) at capture", () => {
+    const r = new SubagentRegistry();
+    const id = mintAgentId();
+    r.register({ agentId: id, agentName: "reviewer", ...base, prompt: "p".repeat(10_000) });
+    expect(r.get(id)!.prompt!.length).toBeLessThanOrEqual(4_100);
+    expect(r.get(id)!.prompt!.length).toBeLessThan(10_000);
+    r.markSettled(id, { finalText: "f".repeat(50_000) });
+    expect(r.get(id)!.finalText!.length).toBeLessThanOrEqual(16_400);
+    expect(r.get(id)!.finalText!.length).toBeLessThan(50_000);
+  });
+
+  it("validates color against Claude's fixed color-name set: normalizes case, drops anything off-palette (never stored raw)", () => {
+    const r = new SubagentRegistry();
+    const good = mintAgentId();
+    r.register({ agentId: good, agentName: "a", ...base, color: " Purple " });
+    expect(r.get(good)!.color).toBe("purple");
+    for (const hostile of [`${ESC}[31mred`, "rebeccapurple", "#ff0000", "red;41", ""]) {
+      const id = mintAgentId();
+      r.register({ agentId: id, agentName: "b", ...base, color: hostile });
+      expect(r.get(id)!.color, `must drop ${JSON.stringify(hostile)}`).toBeUndefined();
+    }
+  });
+
+  it("markUserStopped is permanent: register() never clears it and markResuming is vetoed", () => {
+    const r = new SubagentRegistry();
+    const id = mintAgentId();
+    r.register({ agentId: id, agentName: "reviewer", ...base });
+    r.markSettled(id);
+    r.markUserStopped(id);
+    expect(r.get(id)!.userStopped).toBe(true);
+    // A re-register under the same id does not clear the marker.
+    r.register({ agentId: id, agentName: "reviewer", ...base });
+    expect(r.get(id)!.userStopped).toBe(true);
+    r.markSettled(id);
+    // The resume flip refuses: the record stays settled.
+    r.markResuming(id);
+    expect(r.get(id)!.state).toBe("settled");
+  });
+});
+
+describe("guardSteer — the shared steer guard", () => {
+  const base = {
+    depth: 1,
+    cwd: process.cwd(),
+    transcriptPath: "/x/agent.jsonl",
+    resumable: true,
+    oneShot: false,
+  };
+
+  it("refuses one-shot builtins", () => {
+    const r = new SubagentRegistry();
+    const id = mintAgentId();
+    r.register({ agentId: id, agentName: "Explore", ...base, oneShot: true, session: { steer() {} } });
+    const guard = guardSteer(r.get(id)!);
+    expect(guard.ok).toBe(false);
+    if (!guard.ok) expect(guard.refusal).toMatch(/one-shot/i);
+  });
+
+  it("refuses a user-stopped agent even with a live steerable session", () => {
+    const r = new SubagentRegistry();
+    const id = mintAgentId();
+    r.register({ agentId: id, agentName: "reviewer", ...base, session: { steer() {} } });
+    r.markUserStopped(id);
+    const guard = guardSteer(r.get(id)!);
+    expect(guard.ok).toBe(false);
+    if (!guard.ok) expect(guard.refusal).toMatch(/stopped by the user/i);
+  });
+
+  it("refuses a settled record (nothing to steer)", () => {
+    const r = new SubagentRegistry();
+    const id = mintAgentId();
+    r.register({ agentId: id, agentName: "reviewer", ...base });
+    r.markSettled(id);
+    const guard = guardSteer(r.get(id)!);
+    expect(guard.ok).toBe(false);
+    if (!guard.ok) expect(guard.refusal).toMatch(/not running/i);
+  });
+
+  it("refuses a running record with no live steerable handle", () => {
+    const r = new SubagentRegistry();
+    const id = mintAgentId();
+    r.register({ agentId: id, agentName: "reviewer", ...base }); // minimal register: no session yet
+    const guard = guardSteer(r.get(id)!);
+    expect(guard.ok).toBe(false);
+    if (!guard.ok) expect(guard.refusal).toMatch(/cannot be steered right now/i);
+  });
+
+  it("passes a steerable running record and hands back the bound steer entry point", async () => {
+    const r = new SubagentRegistry();
+    const id = mintAgentId();
+    const delivered: string[] = [];
+    r.register({
+      agentId: id,
+      agentName: "reviewer",
+      ...base,
+      session: {
+        steer(text: string) {
+          delivered.push(text);
+        },
+      },
+    });
+    const guard = guardSteer(r.get(id)!);
+    expect(guard.ok).toBe(true);
+    if (guard.ok) await Promise.resolve(guard.steer("go left"));
+    expect(delivered).toEqual(["go left"]);
   });
 });
 
@@ -474,7 +682,22 @@ describe("SendMessage resume — offline integration (real SessionManager)", () 
     // usage chain — usage must be captured on the RESUME path, not only fresh
     // dispatch. Both sessions report the same stats here.
     const h = fakeSdk({
-      replies: ["FIRST REPLY", "RESUME REPLY", "SECOND RESUME", "THIRD RESUME"],
+      replies: [
+        "FIRST REPLY",
+        // The resume turn streams a live event so the RESUMED run's registry
+        // mirror is observable (plain string replies emit no session events).
+        {
+          text: "RESUME REPLY",
+          events: [
+            {
+              type: "turn_end",
+              message: { role: "assistant", content: [{ type: "text", text: "RESUME REPLY" }] },
+            },
+          ],
+        },
+        "SECOND RESUME",
+        "THIRD RESUME",
+      ],
       stats: { tokens: { input: 30, output: 12, cacheRead: 4 }, cost: 0.05 },
     });
     const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
@@ -594,6 +817,12 @@ describe("SendMessage resume — offline integration (real SessionManager)", () 
     };
     expect(record?.usage).toEqual(expectedUsage);
     expect(registry.get(agentId)!.usage).toEqual(expectedUsage);
+
+    // The RESUMED run's live-progress mirror worked too: the registry record's
+    // last snapshot reflects the resumed generation, proving markResuming
+    // re-armed the record to "running" BEFORE the mirror's events fired (the
+    // one ordering that keeps noteProgress's running-guard open on resume).
+    expect(registry.get(agentId)!.progress?.tail.join("\n")).toContain("RESUME REPLY");
 
     // A SECOND createAgentSession happened, seeded from the reopened transcript —
     // prior context is available to the resumed run (SECURITY: from the reopened
@@ -868,5 +1097,192 @@ describe("SendMessage resume — nested background bound", () => {
     expect(resumeStarted()).toBe(true); // it ran only AFTER the slot freed
     expect(resumeReachedOnPrompt).toBe(true);
     expect(registry.get(agentId)!.state).toBe("settled");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// User stop — permanent for the agent id; model TaskStop stays resumable
+// ---------------------------------------------------------------------------
+
+describe("user stop vs model stop", () => {
+  it("a user-stopped RUNNING agent refuses SendMessage steer", async () => {
+    const registry = new SubagentRegistry();
+    const backgroundTasks = new BackgroundTaskRegistry();
+    let release = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const h = fakeSdk({ replies: [{ text: "done", gate }] });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, { subagentRegistry: registry });
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t", {
+      subagent_type: "reviewer",
+      prompt: "task",
+      run_in_background: true,
+    });
+    const agentId = String(started.details.agentId);
+    await h.waitForPromptCalls(1);
+    expect(registry.get(agentId)?.session).toBeDefined(); // steerable before the stop
+
+    registry.markUserStopped(agentId);
+    const sm = createSendMessageToolDefinition(runtime, {
+      registry,
+      backgroundTasks,
+    }) as unknown as ToolLike;
+    await expect(sm.execute("s", { to: agentId, message: "keep going" })).rejects.toThrow(
+      /stopped by the user/i,
+    );
+    // The refusal happened at the guard: nothing was steered in.
+    expect(h.sessions[0]!.steerMessages).toEqual([]);
+    release();
+    await backgroundTasks.wait(String(started.details.taskId));
+  });
+
+  it("a user-stopped SETTLED agent refuses SendMessage resume with no re-dispatch", async () => {
+    const main = fakeMainSessionFile();
+    const registry = new SubagentRegistry();
+    const backgroundTasks = new BackgroundTaskRegistry();
+    const h = fakeSdk({ replies: ["first"] });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      subagentRegistry: registry,
+      getMainSessionFile: () => main,
+    });
+    const original = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    expect(original.resumable).toBe(true); // would resume, were it not user-stopped
+    registry.markUserStopped(original.agentId);
+    const createdBefore = h.created.length;
+    const sm = createSendMessageToolDefinition(runtime, {
+      registry,
+      backgroundTasks,
+    }) as unknown as ToolLike;
+    await expect(sm.execute("s", { to: original.agentId, message: "again" })).rejects.toThrow(
+      /stopped by the user/i,
+    );
+    expect(h.created.length).toBe(createdBefore); // no resumed session was created
+    expect(registry.get(original.agentId)!.state).toBe("settled");
+  });
+
+  it("a MODEL TaskStop leaves the agent resumable: SendMessage resume succeeds afterwards", async () => {
+    // The registry-documented PiCC divergence ("PiCC allows resume after
+    // TaskStop") — a model stop must NOT trip the permanent user-stop refusal.
+    const main = fakeMainSessionFile();
+    const registry = new SubagentRegistry();
+    const backgroundTasks = new BackgroundTaskRegistry();
+    let release = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const h = fakeSdk({ replies: [{ text: "held", gate }, "resumed"] });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      subagentRegistry: registry,
+      getMainSessionFile: () => main,
+    });
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t", {
+      subagent_type: "reviewer",
+      prompt: "long task",
+      run_in_background: true,
+    });
+    const taskId = String(started.details.taskId);
+    const agentId = String(started.details.agentId);
+    await h.waitForPromptCalls(1);
+
+    const taskStop = createTaskStopTool(backgroundTasks) as unknown as ToolLike;
+    await taskStop.execute("stop", { task_id: taskId });
+    release();
+    await backgroundTasks.wait(taskId);
+    expect(backgroundTasks.get(taskId)!.status).toBe("stopped");
+    expect(backgroundTasks.get(taskId)!.userStopped).toBeUndefined(); // model stop ≠ user stop
+    expect(registry.get(agentId)!.state).toBe("settled");
+    expect(registry.get(agentId)!.userStopped).toBeUndefined();
+
+    const sm = createSendMessageToolDefinition(runtime, {
+      registry,
+      backgroundTasks,
+    }) as unknown as ToolLike;
+    const ack = await sm.execute("s", { to: agentId, message: "continue the task" });
+    expect(ack.details.delivery).toBe("resume");
+    const resumed = await backgroundTasks.wait(String(ack.details.taskId));
+    expect(resumed?.status).toBe("completed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dispatch → registry panel-field plumbing (parent link, description, prompt,
+// finalText, color, timestamps)
+// ---------------------------------------------------------------------------
+
+describe("dispatch registers the panel fields", () => {
+  it("threads parentAgentId (from ownerAgentId) + description into the record synchronously, set-once across the enrich re-register; settle records settledAt + finalText", async () => {
+    const registry = new SubagentRegistry();
+    const backgroundTasks = new BackgroundTaskRegistry();
+    const owner = mintAgentId(); // this Agent tool instance "belongs" to a subagent
+    let release = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const h = fakeSdk({ replies: [{ text: "the final answer", gate }] });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, { subagentRegistry: registry });
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 1,
+      backgroundTasks,
+      ownerAgentId: owner,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t", {
+      subagent_type: "reviewer",
+      prompt: "the initial task",
+      run_in_background: true,
+      description: "Review auth changes",
+    });
+    const agentId = String(started.details.agentId);
+    // The minimal register already carries the panel fields — available the
+    // instant the ack returns.
+    const rec = registry.get(agentId)!;
+    expect(rec.parentAgentId).toBe(owner);
+    expect(rec.description).toBe("Review auth changes");
+    expect(rec.prompt).toBe("the initial task");
+    expect(rec.startedAt).toBeGreaterThan(0);
+    expect(rec.settledAt).toBeUndefined();
+    await h.waitForPromptCalls(1); // the enrich re-register has happened
+    expect(rec.parentAgentId).toBe(owner); // set-once survived the enrich
+    expect(rec.description).toBe("Review auth changes");
+    expect(rec.prompt).toBe("the initial task");
+    release();
+    await backgroundTasks.wait(String(started.details.taskId));
+    expect(rec.settledAt).toBeGreaterThanOrEqual(rec.startedAt);
+    expect(rec.finalText).toBe("the final answer");
+  });
+
+  it("a coordinator dispatch (no ownerAgentId) records no parentAgentId", async () => {
+    const registry = new SubagentRegistry();
+    const backgroundTasks = new BackgroundTaskRegistry();
+    const h = fakeSdk({ replies: ["done"] });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, { subagentRegistry: registry });
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t", {
+      subagent_type: "reviewer",
+      prompt: "p",
+      run_in_background: true,
+    });
+    await backgroundTasks.wait(String(started.details.taskId));
+    expect(registry.get(String(started.details.agentId))!.parentAgentId).toBeUndefined();
+  });
+
+  it("captures a valid agent frontmatter color and drops a hostile one", async () => {
+    const registry = new SubagentRegistry();
+    const h = fakeSdk({ replies: ["done", "done"] });
+    const ESC = String.fromCharCode(27);
+    const runtime = makeSubagentRuntime(
+      [makeAgent({ name: "tinted", color: "purple" }), makeAgent({ name: "hostile", color: `${ESC}[31mred` })],
+      h.sdk,
+      { subagentRegistry: registry },
+    );
+    const tinted = await runtime.dispatch({ subagentType: "tinted", prompt: "p", depth: 1 });
+    expect(registry.get(tinted.agentId)!.color).toBe("purple");
+    const hostile = await runtime.dispatch({ subagentType: "hostile", prompt: "p", depth: 1 });
+    expect(registry.get(hostile.agentId)!.color).toBeUndefined();
   });
 });

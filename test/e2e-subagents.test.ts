@@ -14,6 +14,7 @@ import {
 } from "./helpers/e2e-live.js";
 import type { CapturedRequest } from "./helpers/mock-openai.js";
 import { resolveSubagentTranscript } from "../src/util/subagent-transcripts.js";
+import { RECORD_EXPAND_HINT, RECORD_FORK_MARKER } from "../src/runtime/subagent-render.js";
 
 /**
  * E2E — subagents (the heaviest lane; each scenario spawns a nested Pi child):
@@ -82,6 +83,12 @@ describe.skipIf(cliMissing)(
         );
         expect(retrieved, "TaskOutput must return the background result verbatim").toBe(true);
         expect(result.stdout).toContain("background retrieved");
+        // Print mode never runs renderers: the TUI-only collapsed-completion-
+        // record markers must never reach print stdout (byte-identical print/RPC
+        // output — the structural half of that proof is that execute()/content
+        // are untouched).
+        expect(result.stdout).not.toContain(RECORD_EXPAND_HINT);
+        expect(result.stdout).not.toContain(RECORD_FORK_MARKER);
         // No crash noise from the un-awaited dispatch (completeness floor).
         expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|unhandledRejection|FATAL/i);
       },

@@ -174,17 +174,52 @@ Every subagent is visible, both to you and to the coordinating model:
   `<mainSessionFileBase>.subagents/<stamp>_<agentId>.jsonl` in Pi's sessions dir
   (`~/.pi/agent/sessions/…`). The agent id appears in the dispatch result, so you can find the run's
   full record without guessing. These files are not reaped automatically.
-- **Live progress.** The UI shows a running subagent's type, your dispatch description, and a
-  rolling tail of its activity. Awaiting a background task with `TaskOutput` streams that same view,
-  then settles in the same call to the outcome, transcript path, and usage — there is no always-on
-  background dashboard.
+- **Status panel.** While agents run, a panel below the input shows the whole agent tree live —
+  no `TaskOutput` await needed. One row per agent, nested children indented: a status bubble
+  (spinner while running; `●` done, `✗` failed, `■` stopped), the agent type (tinted with the
+  agent's `color:` frontmatter when set), your dispatch description, its current activity, elapsed
+  time, and token usage once known (blank until then — never a fake zero; tokens are the first
+  column dropped on narrow terminals). Finished rows linger briefly — ~10 s for successes, ~60 s
+  for failures and stops — then leave on their own. That auto-expiry is a deliberate PiCC
+  deviation: Claude Code keeps finished agents listed until dismissed. An expired row is not lost:
+  `alt+a` reopens the panel with every finished agent still listed, and the condensed record in
+  the chat (below) arrives once the conversation continues. While the panel has keyboard focus,
+  no row expires on its own (dismissing with `d` still removes). When several agents run at once,
+  a one-time hint names the entry key.
+- **Panel navigation (`alt+a`).** Press `alt+a` to focus the panel; a `❯` marker shows the
+  selection, and the footer hint lists the keys: `↑↓ select · enter open · x stop · X stop all ·
+  d dismiss · esc close`. Stopping from the panel is **background-only** — a foreground agent is
+  cancelled with Esc in the editor, as before (that cancels the whole turn). `X` (stop-all) asks
+  for a second press within ~3 s to confirm. A user-initiated stop is **permanent**: a
+  user-stopped agent cannot be steered or resumed afterwards, not even by the model.
+- **Drill-down.** Enter opens the selected agent: its initial prompt (collapsed; `ctrl+p`
+  expands), the live transcript tail (auto-following; `↑↓` scrolls, scrolling back stops the
+  follow), and — once settled — its final answer. `ctrl+x` stops a running background agent
+  (on a settled one it dismisses). While a background agent runs, type a steering message
+  directly into the drill-down and press Enter to send; it is delivered before the agent's next
+  model call (the confirmation is optimistic — a delivery failure replaces it). **Caveat:**
+  drill-down steering does not fire the project's `UserPromptSubmit` hooks — a PiCC decision.
+  Esc steps back one layer: drill-down → list → editor (with typed steer text, the first Esc
+  clears the text; where steering is unavailable — foreground, one-shot, user-stopped — the view
+  says so instead of offering an input line).
+- **Condensed transcript records.** Subagent output does not stream into the chat; the panel and
+  drill-down own the live view. Each depth-1 dispatch leaves one spawn record, and completion adds
+  one collapsed record — outcome, duration, tokens, transcript pointer — that Ctrl+O expands to
+  the full final answer, transcript path, usage, and any warnings. Background agents get their
+  record even if never awaited; an agent that settles while you are away from the prompt gets it
+  when the conversation next continues (the record rides the next turn). A later `TaskOutput`
+  collection adds only a minimal reference line, never a duplicate. Nested agents (depth ≥ 2) get
+  no record of their own — they keep Pi's default notice box and appear in the panel tree and
+  their parent's transcript only.
 - **Esc** cancels a running *foreground* dispatch (it reports as aborted). Esc while *awaiting* a
-  background task only detaches the live view — the task keeps running; retrieve it with `TaskOutput`.
+  background task only detaches the wait — the task keeps running; retrieve it with `TaskOutput`.
 - **`SendMessage`** continues a finished subagent with its context intact, or redirects a running
   background one, addressed by its `agent-<id>`. Resuming keeps that agent id and creates a new task
   id, so the agent id is the reliable correlation key. Resume is process-lifetime only — after you
-  quit and relaunch `picc`, a prior agent id no longer resolves — and fork dispatches are never
-  resumable.
+  quit and relaunch `picc`, a prior agent id no longer resolves — fork dispatches are never
+  resumable, and a user-stopped agent refuses resume and steering permanently.
+- **Interactive TUI only.** The panel, drill-down, and condensed records exist only in the
+  interactive TUI; print and RPC runs keep their previous subagent output unchanged.
 
 ### Subagent dispatch controls (`.claude/settings.json`)
 
@@ -371,6 +406,7 @@ behaviors worth knowing:
 | Unexpected skills/agents from plugins | PiCC loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. `/doctor` and the startup info notice report how many are available but disabled. |
 | A plugin you enabled isn't loading | Confirm it's listed truthy in `enabledPlugins` as `name@marketplace`, and that it isn't in `~/.claude/plugins/blocklist.json`. |
 | Want to see why a fan-out routed the way it did | agent descriptions are the routing surface — inspect the "Available subagents" catalog in the session, and the dispatch tool calls in the transcript |
+| Agent finished, its panel row is gone, and no record shows in the chat | Press `alt+a` — finished agents stay reachable in the panel after their rows expire. Or continue the conversation: the condensed record rides the next turn. |
 
 ## 10. Verification status
 
