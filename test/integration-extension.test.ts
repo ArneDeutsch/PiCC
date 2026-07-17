@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import picc, { type PiccTestSeam } from "../src/index.js";
+import type { BackgroundResultLike } from "../src/runtime/background-tasks.js";
 import { resolveGitBashPath } from "../src/engine/shell-inject.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/fake-sdk.js";
@@ -1046,7 +1047,7 @@ describe("background settlement delivery (offline integration via the seam)", ()
 
     const stopId = "agent-aa11bb22cc33";
     reg(internals, stopId);
-    let resolveStop!: (v: unknown) => void;
+    let resolveStop!: (v: BackgroundResultLike) => void;
     const stopTask = internals.backgroundTasks.start(
       "agent:reviewer",
       new Promise((r) => (resolveStop = r)),
@@ -1216,7 +1217,7 @@ describe("subagent background-task scoping (offline-integration via a real dispa
     // OWN-REACHABLE: subagent1 retrieves its own task, awaited deterministically.
     releaseInner1();
     const ownOut = await sub1Output.execute("r5", { task_id: ownTaskId1!, wait: true });
-    expect(ownOut.content[0].text).toContain("inner1 result");
+    expect(ownOut.content[0]?.text).toContain("inner1 result");
 
     // COORDINATOR FULL REACH: every task, through the coordinator's own tools.
     releaseInner2();

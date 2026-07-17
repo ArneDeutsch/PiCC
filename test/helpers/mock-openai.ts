@@ -189,7 +189,7 @@ export async function startMockModel(script: Turn[]): Promise<MockModelServer> {
   }
 
   const server = http.createServer(async (req, res) => {
-    const path = (req.url ?? "").split("?")[0];
+    const path = (req.url ?? "").split("?")[0] ?? "";
     if (req.method !== "POST" || !path.endsWith("/chat/completions")) {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: `mock: no route for ${req.method} ${path}` } }));
