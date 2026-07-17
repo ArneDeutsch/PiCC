@@ -34,7 +34,7 @@ higher-altitude doc **links** to it.
 | `README.md` | Visitor deciding "what is this, do I want it?" | Highest — pitch + orientation | What PiCC is, the value proposition, quick start, one-line-per-capability feature list, repo layout, links onward | Per-flag/env-var detail, limits and caveats, mechanics, anything that reads like a reference manual |
 | `doc/user-guide.md` | A person *running* PiCC on their project | Task-level, operational | Install, auth, running a project, control surface, configuration, security posture, Windows specifics, troubleshooting | How the harness is built internally; the full capability matrix; re-explaining Claude Code itself |
 | `doc/architecture.md` | Agent or contributor about to change `src/` | Structural — the map, not the territory | Layering, module responsibilities, turn/data flow, the load-bearing mechanical-fidelity decisions and *why* they are load-bearing | Line-by-line narration of code; per-branch behavior detail that the code and its tests already state |
-| `doc/testing.md` | Agent or contributor writing or fixing a test | Decision-guide | The layers, which layer a new test belongs in and why, how to run each lane, the synchronization contracts, how to add an e2e scenario | An inventory of every test file (it rots on the next test added) |
+| `doc/testing.md` | Agent or contributor writing or fixing a test | Decision-guide | The layers, which layer a new test belongs in and why, how to run each lane, the synchronization contracts, how to add an e2e scenario | An inventory of every test file |
 | `CONTRIBUTING.md` | A contributor making a change | Procedural, step-by-step | Setup, dev loop, test commands, the guiding principles a change must honor, PR and manual-verification expectations | Architecture explanation, user-facing operation, duplicated test strategy |
 | `doc/tui-extension-guide.md` | Agent or contributor building a UI surface on Pi's TUI | Reference — capabilities and boundaries | What Pi's TUI can/cannot do, the rendering contract, the hard boundaries to design around | A changelog of PiCC's own UI; code that belongs in `src/` |
 | `doc/pi-integration.md` | Agent or contributor touching a Pi seam | Contract record | The pinned Pi version and Node floor, the Pi APIs PiCC depends on, key seam decisions, churn watchpoints | PiCC-internal design that does not touch a Pi API |
@@ -46,35 +46,50 @@ higher-altitude doc **links** to it.
 instruction surface), `doc/plan/**` (live working artifacts — a plan folder referring to its own
 task ids and section numbers refers to *itself*, which is not an ephemeral reference), `examples/**`
 (test fixtures, not documentation — see *Genres*), and prompt docs (*Genres* again). The
-*Conventions* below bind **durable** surfaces only. The map is written to the end state:
-`doc/pi-integration.md` is being relocated up from `doc/design/` by the same effort that adopts
-this guide.
+*Conventions* below bind **durable** surfaces only.
+
+**This guide describes the repository as it is.** It never describes work in flight: a sentence
+about what a pending change *will* do is stale the day that change lands, and this doc is loaded
+into a working agent's context by default.
 
 **Placement test:** name the one reader and the one decision they are making. If a paragraph serves
-a different reader or a different decision, it belongs in a different doc — as a link.
+a different reader or a different decision, it belongs in a different doc — as a link. And each
+audience's entry doc (README for a visitor, CONTRIBUTING for a contributor) links onward to every doc
+that audience needs: "link, don't copy" only works where the link exists.
 
 ## 3. Quality standards
 
 - **Truth over completeness.** A short, true doc beats a thorough, half-stale one. When you cannot
-  keep a detail current, delete it rather than let it rot.
+  keep a detail current, delete it rather than let it rot. Truth is judged in context: an omission
+  that is locally true still misleads when an adjacent strong claim ("runs unchanged", "never a
+  silent empty success") implies the missing case away. Qualify the claim or state the case.
+- **Verify, don't transcribe — a preserved claim is your claim.** Carrying a claim over, restating
+  it, or being *told* to preserve it makes you its author: check it against the code first. Docs here
+  have shipped false the morning they merged; having the evidence is not the same as reconciling it.
+- **A generalized rule states its exceptions.** "A new tool goes in `tools/`" is false for five of
+  them; "the hook events carry the full contract" is false for the five that never fire. A rule
+  silently false across part of its range misdirects worse than no rule: state the range, or do not
+  state the rule.
+- **Never enumerate a set the code owns.** A count, a member list, or an inventory of anything that
+  changes without touching the doc rots on the next commit — every test file, a grep tally, "13 hook
+  events", "5 never fired". State the shape of the answer and link to the source. Tier *groupings*
+  are shape and are licensed; their counts and members are not.
 - **Right altitude.** Match the map above. Detail that has sunk one level below its surface's
   altitude is bloat even when every word is true.
-- **Single source of truth — link, don't copy.** State a fact in exactly one doc; everywhere else,
-  link to it. Copied facts are the specific drift that rotted these docs: the copy is never updated
-  with the original.
+- **Single source of truth — link, don't copy.** Copied facts are the specific drift that rotted
+  these docs: the copy is never updated with the original. What may never be duplicated is a
+  *decision* — the same mechanism may be stated on two surfaces when each serves a different reader's
+  decision (Git Bash as *what a user installs* and as *why a contributor must not delete the lookup*
+  are two decisions, not a duplication). Run the placement test to tell the cases apart. **The rule
+  binds itself:** a rule of this guide copied into an enforcer's prompt is a second source, and it
+  drifts.
 - **Concision.** Prefer the shortest form that stays true. Cut hedges, restatements, and history
   ("previously…", "note that…", "it is worth mentioning").
-- **The discipline of omission.** Knowing what *not* to write is half the job. Two canonical cases
-  from this repo:
-  - The user guide's **"What is and isn't supported"** section re-litigates every `partial` tier's
-    exact limits, timing caveats, and upstream evidence. That belongs in the capability registry's
-    notes and the generated matrix. The user guide needs the shape of the answer and a link.
-  - The README's **"Subagents"** bullet grew into a specification of env gates, defaults, task-id
-    lifecycle, and notice-eligibility rules. A README bullet earns one line; the mechanics belong in
-    architecture, the claims in the registry.
-
-  In both cases nothing was false. The detail was simply written at the wrong altitude, and the
-  right fix is deletion, not rewording.
+- **The discipline of omission.** Knowing what *not* to write is half the job. The canonical case
+  from this repo: the user guide's **"What is and isn't supported"** section re-litigated every
+  `partial` tier's exact limits, timing caveats, and upstream evidence — content that belongs in the
+  capability registry's notes and the generated matrix. Nothing in it was false. The detail was
+  simply written at the wrong altitude, and the right fix is deletion, not rewording.
 
 ## 4. Genres and their different rules
 
@@ -174,23 +189,22 @@ One rule, three familiar cases:
 | `// #26944:` or `// Feature 25 / #48:` | the claim, with the number behind it: `// Claude Code drops HTML comments in CLAUDE.md (anthropics/claude-code#26944)` |
 
 **The test:** can you name the target — heading, symbol, or claim — in something that exists? Then
-write that name and keep the number as evidence. If you cannot, the pointer goes. This is why a
-`§`-number naming a substantive section of a live artifact (a skill's own numbered report sections)
-survives: you can name what it points at.
+write that name and keep the number as evidence. If you cannot, the pointer goes.
+
+**This binds intra-doc pointers too: a bare `§` aimed at a sibling section is banned.** The very
+edits this guide encourages renumber headings, and an agent reading one *chunk* of a doc has no
+numbering in context — name the section. The carve-out is narrow, and the distinction is the point:
+it is for numbers that **are** the contract (a skill's own numbered report sections, `§A + §B`),
+never for a pointer that merely happens to be intra-doc.
 
 **Applied to issue refs, this decides the internal-vs-upstream question without knowing anyone's
-issue range.** A bare number fails whoever owns it — strip it. A reference that says what it is
-about survives on its context. So when a comment cites upstream evidence as a bare number, the fix
-is to **add the topic, not delete the citation**.
-
-**Upstream evidence is legitimate — judge it by kind, not by syntax.** An upstream issue number, an
-upstream **version**, or a **dated observation**, where it *justifies a parity choice*, is the
-load-bearing part of the comment: keep it, in code comments as much as in prose. Version-shaped
-evidence — `Claude Code 2.1.205 flips the status synchronously` — is the common form in `src/`,
-and it already carries its own topic. That is exactly why it is legitimate: it is a worked
-example of the rule above, not an exception to it. ("Single source of truth" forbids restating a
-*tier claim* in prose where it can drift; it does not ask you to strip evidence from the code that
-depends on it.)
+issue range** — judge evidence by kind, not by syntax. A bare number fails whoever owns it: strip it.
+But an upstream issue number, an upstream **version**, or a **dated observation** that *justifies a
+parity choice* is the load-bearing part of the comment — keep it, in code as much as in prose, and
+when it arrives as a bare number the fix is to **add the topic, not delete the citation**.
+Version-shaped evidence (`Claude Code 2.1.205 flips the status synchronously`) is the common form in
+`src/` and already carries its own topic: a worked example of the rule, not an exception to it. The
+ban on restating a *tier claim* governs prose, not the evidence in the code that depends on it.
 
 ### No ephemeral cross-references
 
@@ -224,15 +238,16 @@ The guard that keeps the docs good after this sweep:
 - **Docs change in the same change that changes behavior.** Not a follow-up, not a ticket. A change
   whose docs land later is an incomplete change.
 - **The capability registry is the single source for the feature matrix.** New or changed support
-  claims go there (see *Generated docs*); never restate a tier claim in prose where it can drift —
-  link instead.
+  claims go there (see *Generated docs*). Prose may carry the shape of the answer — the tier
+  groupings — and a link; never a tier claim, a count, or a member list (see *Never enumerate a set
+  the code owns*).
 - **The docs agent enforces this guide in review.** It reads the guide, and it is on the review panel
   for any documentation-bearing change — including code comments. Severity mapping:
 
 | Severity | Applies to |
 |---|---|
-| **MUST-FIX** | False or stale statements; **a removed comment whose rationale is not recoverable from the code** (a lost non-obvious *why*); prose at the wrong altitude for its surface; a hand-edited generated file; a lost tool directive or comment-shaped syntax |
-| **SHOULD** | Duplication of another doc's content instead of a link; ephemeral cross-references; bare-number references that never name their topic; terminology drift; a comment that restates the code; a history/migration comment |
+| **MUST-FIX** | False or stale statements — including a claim generalized past its exceptions, and a true one an adjacent strong claim renders misleading; **a removed comment whose rationale is not recoverable from the code** (a lost non-obvious *why*); prose at the wrong altitude for its surface; a hand-edited generated file; a lost tool directive or comment-shaped syntax |
+| **SHOULD** | Duplication of another doc's content instead of a link; an enumeration (count, member list, inventory) of a set the code owns; ephemeral cross-references; bare-number references that never name their topic, intra-doc `§`-refs included; terminology drift; a comment that restates the code; a history/migration comment |
 | **NIT** | Wording, ordering, formatting polish |
 
 **The altitude row is scoped to prose.** A code comment that merely restates the code is the SHOULD
