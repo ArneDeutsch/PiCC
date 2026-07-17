@@ -37,7 +37,7 @@ Six agents in `.claude/agents/` are **read-only specialists** — investigate an
 |---|---|---|
 | `coder` | implementation design, code quality, subsystem boundaries | any change to `src/` or `test/` |
 | `tester` | test strategy, vitest layers, cross-platform coverage | any testable behavior changes |
-| `docs` | README, `doc/`, capability-matrix accuracy | user-visible or architectural change |
+| `docs` | prose, code comments, capability-matrix accuracy | always: any doc-bearing change |
 | `security` | hook/shell/permission-engine safety, path traversal, injection | execution, permissions, file paths, worktrees |
 | `user-experience` | DX of running picc: setup, errors, output, docs-as-experienced | user-facing behavior or messages change |
 | `claude-parity` | behaves as Claude Code would; capability-registry truthfulness | any Claude-compat surface (loaders, tools, hooks, settings) |
