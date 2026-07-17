@@ -5,6 +5,8 @@ import path from "node:path";
 import picc, { type PiccTestSeam } from "../src/index.js";
 import type { BackgroundResultLike } from "../src/runtime/background-tasks.js";
 import { resolveGitBashPath } from "../src/engine/shell-inject.js";
+import { RECORD_EXPAND_HINT } from "../src/runtime/subagent-render.js";
+import { formatElapsed } from "../src/runtime/subagent-panel-render.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/fake-sdk.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
@@ -1069,6 +1071,113 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(joined).toContain("insufficient_quota"); // regression: never a silent success
     expect(joined).toContain("settled: aborted"); // outcome vocabulary (status is "stopped")
   });
+
+  it("WIRING: the settlement message carries the record details and the REGISTERED picc-settlement renderer draws the one-line record; nested falls back to Pi's default box", async () => {
+    // End-to-end through the real registration + drain, against the recorded
+    // renderer — a typo'd customType, a dropped `details` attach, or a renderer
+    // that stops delegating would each fail HERE instead of degrading silently
+    // to Pi's default purple notice box in the terminal.
+    const { p, internals } = await wire();
+    const renderer = p.messageRenderers.get("picc-settlement");
+    expect(typeof renderer, "no message renderer registered for picc-settlement").toBe(
+      "function",
+    );
+
+    // A coordinator-owned settlement, never awaited.
+    const agentId = "agent-77aa88bb99cc";
+    reg(internals, agentId);
+    const taskId = internals.backgroundTasks.start(
+      "agent:reviewer",
+      Promise.resolve({
+        ok: true,
+        outcome: "completed" as const,
+        finalMessage: "WIRED-RECORD-REPORT",
+        agentId,
+        transcriptPath: `/x/sessions/${agentId}.jsonl`,
+        resumable: true,
+        diagnostics: [],
+      }),
+      undefined,
+      agentId,
+      "reviewer",
+    );
+    await internals.backgroundTasks.wait(taskId);
+    internals.subagentRegistry.markSettled(agentId);
+
+    // A NESTED (owner-tagged) settlement: dispatched by a subagent.
+    const nestedAgentId = "agent-ddeeff001122";
+    reg(internals, nestedAgentId);
+    const nestedTaskId = internals.backgroundTasks.start(
+      "agent:reviewer",
+      Promise.resolve({
+        ok: true,
+        outcome: "completed" as const,
+        finalMessage: "NESTED-REPORT",
+        agentId: nestedAgentId,
+        diagnostics: [],
+      }),
+      undefined,
+      nestedAgentId,
+      "reviewer",
+      "agent-aabb00112233", // owner tag → nested
+    );
+    await internals.backgroundTasks.wait(nestedTaskId);
+    internals.subagentRegistry.markSettled(nestedAgentId);
+
+    // The real before_agent_start drain delivers both notices.
+    p.messages.length = 0;
+    await p.fire("before_agent_start", { systemPrompt: "B" });
+    const sent = p.messages
+      .filter((m) => m.message?.customType === "picc-settlement")
+      .map((m) => m.message as { content: string; details?: Record<string, unknown> });
+    expect(sent).toHaveLength(2);
+    const top = sent.find((m) => m.details?.taskId === taskId);
+    const nested = sent.find((m) => m.details?.taskId === nestedTaskId);
+    expect(top, "settlement message lost its details payload").toBeDefined();
+    expect(nested).toBeDefined();
+    expect(top!.details!.record).toBe("subagent-completion");
+    expect(top!.content).toContain("settled: completed"); // model-facing text untouched
+
+    // The RECORDED registered renderer, driven with the actual sent message at
+    // Pi's collapsed default ({ expanded: false }) → the one-line record.
+    const component = renderer!(top, { expanded: false }, undefined);
+    expect(component, "registered renderer fell back to the default box").toBeTruthy();
+    const lines = component.render(200) as string[];
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(`Task(${taskId})`);
+    expect(lines[0]).toContain("Agent(reviewer) completed");
+    expect(lines[0]).toContain(`${agentId}.jsonl`); // transcript-basename pointer
+    expect(lines[0]).toContain(RECORD_EXPAND_HINT);
+    expect(lines[0]).not.toContain("WIRED-RECORD-REPORT"); // body stays behind expand
+
+    // Nested settlement: the renderer returns undefined → Pi's default box,
+    // no main-chat completion record for depth ≥ 2 tasks.
+    expect(nested!.details!.nested).toBe(true);
+    expect(renderer!(nested, { expanded: false }, undefined)).toBeUndefined();
+  });
+
+  it("a FOREGROUND completed dispatch carries durationMs; its collapsed record shows a duration segment", async () => {
+    const handle = fakeSdk({ replies: ["FOREGROUND-DONE"] });
+    const { p, internals } = await wire();
+    internals.subagentRuntime.setSdkForTest(handle.sdk);
+    const agent = p.tools.get("Agent");
+    const res = await agent.execute("fg", {
+      subagent_type: "reviewer",
+      prompt: "review inline",
+      run_in_background: false,
+    });
+    expect(res.details.outcome).toBe("completed");
+    const durationMs = res.details.durationMs;
+    expect(typeof durationMs).toBe("number");
+    expect(durationMs as number).toBeGreaterThanOrEqual(0);
+    const lines = agent
+      .renderResult(res, { isPartial: false, expanded: false }, undefined)
+      .render(200) as string[];
+    expect(lines).toHaveLength(1);
+    // The duration segment, exactly as the collapsed line formats it.
+    expect(lines[0]).toContain(` · ${formatElapsed(durationMs as number)}`);
+    expect(lines[0]).toContain(RECORD_EXPAND_HINT);
+  });
 });
 
 describe("subagent background-task scoping (offline-integration via a real dispatch)", () => {
@@ -1174,6 +1283,17 @@ describe("subagent background-task scoping (offline-integration via a real dispa
     expect(coordTaskId).toBeTruthy();
     // Three distinct ids off the single session-wide counter.
     expect(new Set([ownTaskId1, siblingTaskId, coordTaskId]).size).toBe(3);
+
+    // Parent link on a GENUINELY nested dispatch: the inner agent's registry
+    // record carries the outer subagent's runtime-minted id (== the task owner
+    // the runtime tagged) — the seam the panel's tree (t03) is built on.
+    const innerTask1 = internals.backgroundTasks.get(ownTaskId1!);
+    expect(innerTask1?.owner, "nested task carries its dispatcher-owner id").toBeTruthy();
+    const innerRecord1 = internals.subagentRegistry.get(innerTask1!.agentId!);
+    expect(innerRecord1?.parentAgentId).toBe(innerTask1!.owner);
+    // The coordinator-owned task has no parent (depth-1).
+    const coordRecord = internals.subagentRegistry.get(internals.backgroundTasks.get(coordTaskId)!.agentId!);
+    expect(coordRecord?.parentAgentId).toBeUndefined();
 
     const sub1Output = findTool(subagent1Tools, "TaskOutput");
     const sub1Stop = findTool(subagent1Tools, "TaskStop");

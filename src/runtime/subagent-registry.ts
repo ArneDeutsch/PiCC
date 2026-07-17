@@ -1,4 +1,9 @@
 import { isAgentId } from "../util/subagent-transcripts.js";
+import {
+  sanitizeLine,
+  sanitizeProgressText,
+  type ProgressSnapshot,
+} from "./subagent-progress.js";
 
 /**
  * Dispatch registry: the in-memory source of truth for what a subagent ID or
@@ -48,6 +53,58 @@ export interface SubagentUsage {
 /** Settled fate of a dispatch, recorded for the /usage report. */
 export type SubagentOutcome = "completed" | "failed" | "aborted";
 
+/**
+ * Caps for stored conversation content, applied at capture. Both fields hold
+ * model conversation text: they exist for the status panel's drill-down and
+ * must NEVER be interpolated into error messages, thrown strings, or logging.
+ */
+const PROMPT_CAP = 4096;
+const FINAL_TEXT_CAP = 16384;
+/** Single-line cap for the stored Agent-tool `description` label. */
+const DESCRIPTION_CAP = 120;
+
+/**
+ * Claude Code's fixed agent-frontmatter color-name set (the /agents picker
+ * palette). Anything else is dropped at capture — hostile frontmatter must
+ * never reach a renderer as a raw string. Exported as the whitelist the
+ * render-side ANSI palette (`AGENT_COLOR_ANSI` in subagent-panel-render.ts)
+ * is test-pinned against.
+ */
+export const AGENT_COLOR_NAMES: ReadonlySet<string> = new Set([
+  "red",
+  "blue",
+  "green",
+  "yellow",
+  "purple",
+  "orange",
+  "pink",
+  "cyan",
+]);
+
+/** The validated (lowercased) color name, or undefined for anything off-palette. */
+function validAgentColor(color: string | undefined): string | undefined {
+  const normalized = color?.trim().toLowerCase();
+  return normalized && AGENT_COLOR_NAMES.has(normalized) ? normalized : undefined;
+}
+
+/**
+ * Multi-line conversation content sanitized (escape/control stripping, newlines
+ * kept) and capped at capture. Blank-after-sanitize collapses to undefined so a
+ * consumer's "is there content?" check stays a plain truthiness test.
+ */
+function boundedContent(text: string | undefined, cap: number): string | undefined {
+  if (text === undefined) return undefined;
+  const clean = sanitizeProgressText(text);
+  if (!clean.trim()) return undefined;
+  return clean.length > cap ? `${clean.slice(0, cap)}…` : clean;
+}
+
+/** Single-line description label sanitized and capped at capture. */
+function boundedDescription(description: string | undefined): string | undefined {
+  if (description === undefined) return undefined;
+  return sanitizeLine(description, DESCRIPTION_CAP) || undefined;
+}
+
 export interface SubagentRegistryRecord {
   /** Opaque, minted `agent-<12 hex>` identity — the primary key. */
   agentId: string;
@@ -88,6 +145,65 @@ export interface SubagentRegistryRecord {
    * current uncollected run is noticed.
    */
   settledNoticeConsumed: boolean;
+  /**
+   * The DISPATCHING agent's id (the status panel's tree parent link). Set-once
+   * at first register — never clobbered by an enrich/resume re-register.
+   * Absent for a depth-1 dispatch (the coordinator has no agent id).
+   */
+  parentAgentId?: string;
+  /**
+   * The Agent tool's model-supplied `description` label, sanitized and capped
+   * at capture; set-once. The panel's label column (fallback: `agentName`).
+   */
+  description?: string;
+  /**
+   * Epoch ms the CURRENT run started: set at first register, reset by
+   * `markResuming` (a resumed agent's elapsed time restarts).
+   */
+  startedAt: number;
+  /** Epoch ms of the last settlement (`markSettled`); cleared by `markResuming`. */
+  settledAt?: number;
+  /**
+   * The initial dispatch prompt, sanitized and capped at capture; set-once
+   * (a resume's follow-up message never replaces it). Conversation content —
+   * never interpolate into error messages, thrown strings, or logging.
+   */
+  prompt?: string;
+  /**
+   * The final answer text (best-effort partial output on a failed run),
+   * sanitized and capped in `markSettled`. Conversation content — same
+   * never-into-errors/logging rule as `prompt`.
+   */
+  finalText?: string;
+  /**
+   * Agent frontmatter `color:`, validated at capture against Claude's fixed
+   * color-name set (off-palette values are dropped, never stored raw); set-once.
+   */
+  color?: string;
+  /**
+   * Latest bounded live-progress snapshot, mirrored via `noteProgress` from
+   * EVERY dispatch's condenser subscription (foreground, background, nested,
+   * resumed) — the status panel's single live data source. Sanitized by the
+   * condenser at capture. `progress.usage` is the live accumulation; the
+   * settlement-time `usage` above wins where both exist.
+   */
+  progress?: ProgressSnapshot;
+  /**
+   * Enlarged bounded transcript buffer for the panel's drill-down view,
+   * updated beside `progress`. A PARALLEL field, deliberately not on the
+   * snapshot, so it never rides `details.subagentProgress` emissions.
+   * Sanitized and capped by the condenser at capture.
+   */
+  fullTail?: string[];
+  /**
+   * USER-initiated stop marker: set only by `markUserStopped` (a panel stop
+   * action), NEVER by a model `TaskStop`, and never cleared by `register()` or
+   * `markResuming` — a user stop is permanent for this agent id (a fresh
+   * dispatch of the same agent TYPE stays legal). Model-initiated `TaskStop`
+   * deliberately stays resumable ("PiCC allows resume after TaskStop" — the
+   * registry-documented divergence from Claude Code).
+   */
+  userStopped?: boolean;
 }
 
 /** Result of resolving a `to` address to a registry record. */
@@ -106,6 +222,14 @@ export interface RegisterInput {
   resumable: boolean;
   oneShot: boolean;
   session?: SteerableSession;
+  /** The dispatching agent's id; absent for a depth-1 dispatch. Set-once. */
+  parentAgentId?: string;
+  /** Model-supplied Agent-tool `description` (sanitized+capped here). Set-once. */
+  description?: string;
+  /** The initial dispatch prompt (sanitized+capped here). Set-once. */
+  prompt?: string;
+  /** Agent frontmatter `color:` (validated against the fixed set here). Set-once. */
+  color?: string;
 }
 
 export class SubagentRegistry {
@@ -114,6 +238,34 @@ export class SubagentRegistry {
     string,
     { firstId: string; currentId: string; rebound: boolean }
   >();
+  private readonly changeListeners = new Set<() => void>();
+
+  /**
+   * Minimal change-notification seam for event-driven display consumers (the
+   * status panel repaints on it and re-installs its widget on next activity).
+   * `listener` fires synchronously after every record mutation — register,
+   * noteProgress, markSettled, markResuming, markUserStopped — and never for a
+   * no-op call (unknown id, user-stop veto). `consumeSettledNotice`'s gate
+   * flip is deliberately silent: nothing rendered reads it. Returns an
+   * idempotent unsubscribe. A throwing listener is swallowed — display-side
+   * failures must never corrupt registry state or starve other listeners.
+   */
+  onChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
+  }
+
+  private notifyChange(): void {
+    for (const listener of [...this.changeListeners]) {
+      try {
+        listener();
+      } catch {
+        // display-side listener — never corrupt registry mutation
+      }
+    }
+  }
 
   /**
    * Register a dispatch at session-creation time, or UPDATE an existing record
@@ -135,6 +287,17 @@ export class SubagentRegistry {
       existing.session = input.session;
       existing.state = "running";
       existing.settledNoticeConsumed = false;
+      // Set-once panel fields: the enrich/resume re-register never clobbers a
+      // value the first register captured (a resume's follow-up must not
+      // replace the initial prompt). Resume-related RESETS (startedAt,
+      // settledAt) live in markResuming, not here — the SendMessage resume
+      // path already calls it. `userStopped` is deliberately untouched: a
+      // user stop is permanent and register() never clears it.
+      existing.parentAgentId ??= input.parentAgentId;
+      existing.description ??= boundedDescription(input.description);
+      existing.prompt ??= boundedContent(input.prompt, PROMPT_CAP);
+      existing.color ??= validAgentColor(input.color);
+      this.notifyChange();
       return existing;
     }
     const record: SubagentRegistryRecord = {
@@ -149,6 +312,11 @@ export class SubagentRegistry {
       state: "running",
       session: input.session,
       settledNoticeConsumed: false,
+      parentAgentId: input.parentAgentId,
+      description: boundedDescription(input.description),
+      startedAt: Date.now(),
+      prompt: boundedContent(input.prompt, PROMPT_CAP),
+      color: validAgentColor(input.color),
     };
     this.records.set(input.agentId, record);
     // Name → ID index with original-binding tracking. A name reused for a NEW
@@ -166,7 +334,24 @@ export class SubagentRegistry {
       bound.currentId = input.agentId;
       bound.rebound = true;
     }
+    this.notifyChange();
     return record;
+  }
+
+  /**
+   * Mirror the latest live-progress snapshot (and drill-down `fullTail`) of a
+   * RUNNING dispatch onto its record. The condenser is the sanitizer/bounder —
+   * both arguments arrive sanitized and capped at capture. Ignored for
+   * unknown ids and settled records (a settled record's finalText/usage stay
+   * authoritative; dispatch unsubscribes its condenser before settling, so
+   * the guard only catches stale callers).
+   */
+  noteProgress(agentId: string, snapshot: ProgressSnapshot, fullTail?: string[]): void {
+    const record = this.records.get(agentId);
+    if (!record || record.state !== "running") return;
+    record.progress = snapshot;
+    if (fullTail) record.fullTail = fullTail;
+    this.notifyChange();
   }
 
   /**
@@ -174,34 +359,61 @@ export class SubagentRegistry {
    * flip the state, keeping name/ID/state/transcript-path + everything resume
    * needs. The agent-level notice gate stays unconsumed; the background-task
    * registry may still suppress a notice after terminal collection or
-   * newest-generation supersession. `settled.outcome`/`settled.usage` are each
-   * stored only when provided, so a settle that couldn't classify leaves the
-   * prior value intact.
+   * newest-generation supersession. `settled.outcome`/`settled.usage`/
+   * `settled.finalText` are each stored only when provided, so a settle that
+   * couldn't classify (or produced no text) leaves the prior value intact.
+   * `finalText` is sanitized and capped here — conversation content, stored
+   * for the panel drill-down only, never for error/log interpolation.
    */
   markSettled(
     agentId: string,
-    settled?: { outcome?: SubagentOutcome; usage?: SubagentUsage },
+    settled?: { outcome?: SubagentOutcome; usage?: SubagentUsage; finalText?: string },
   ): void {
     const record = this.records.get(agentId);
     if (!record) return;
     record.state = "settled";
     record.session = undefined;
+    record.settledAt = Date.now();
     if (settled?.outcome !== undefined) record.outcome = settled.outcome;
     if (settled?.usage !== undefined) record.usage = settled.usage;
+    const finalText = boundedContent(settled?.finalText, FINAL_TEXT_CAP);
+    if (finalText !== undefined) record.finalText = finalText;
+    this.notifyChange();
   }
 
   /**
    * Flip a record to `running` and re-arm its settled notice at the instant a
    * resume is initiated — Claude Code 2.1.205 flips the status synchronously
    * (stale settled status was a fixed bug). The subsequent `register()` from the
-   * resumed dispatch reconfirms this with the live session handle. No-op for
-   * unknown ids.
+   * resumed dispatch reconfirms this with the live session handle. Also the one
+   * home of the resume-related RESETS: `startedAt` restarts (a resumed agent's
+   * elapsed time restarts) and `settledAt` clears. No-op for unknown ids, and —
+   * the permanence backstop behind the SendMessage refusal — for user-stopped
+   * records.
    */
   markResuming(agentId: string): void {
     const record = this.records.get(agentId);
-    if (!record) return;
+    if (!record || record.userStopped) return;
     record.state = "running";
     record.settledNoticeConsumed = false;
+    record.startedAt = Date.now();
+    record.settledAt = undefined;
+    this.notifyChange();
+  }
+
+  /**
+   * Record a USER-initiated stop (a panel action, never the model's TaskStop).
+   * Permanent for this agent id: register()/markResuming never clear it, the
+   * steer guard and the SendMessage resume path both refuse it — the model
+   * cannot silently resume a user-stopped agent. The caller pairs this with
+   * `BackgroundTaskRegistry.markUserStopped` for the task-side marker/abort.
+   * No-op for unknown ids.
+   */
+  markUserStopped(agentId: string): void {
+    const record = this.records.get(agentId);
+    if (!record) return;
+    record.userStopped = true;
+    this.notifyChange();
   }
 
   get(agentId: string): SubagentRegistryRecord | undefined {
@@ -291,4 +503,69 @@ export class SubagentRegistry {
         : "No subagents have been dispatched this session.";
     return `Unknown SendMessage address ${JSON.stringify(address)}. ${known}`;
   }
+}
+
+/** Verdict of {@link guardSteer}: the steer entry point, or the refusal to surface. */
+export type SteerGuardResult =
+  | { ok: true; steer: (text: string) => Promise<void> | void }
+  | { ok: false; refusal: string };
+
+/**
+ * The one refusal message for a user-stopped agent — shared by the steer guard
+ * and the SendMessage resume path so the two seams cannot drift.
+ */
+export function userStoppedRefusal(record: SubagentRegistryRecord): string {
+  return (
+    `Agent ${record.agentId} ("${record.agentName}") was stopped by the user — ` +
+    `a user-stopped agent cannot be steered or resumed. Dispatch a new agent instead.`
+  );
+}
+
+/**
+ * The one refusal message for a one-shot builtin — shared by the steer guard
+ * and the SendMessage settled branch so the two seams cannot drift.
+ */
+export function oneShotRefusal(record: SubagentRegistryRecord): string {
+  return (
+    `Agent ${record.agentId} ("${record.agentName}") is a one-shot ${record.agentName} agent — ` +
+    `one-shot built-ins (Explore/Plan) cannot be resumed or steered. Dispatch a new agent instead.`
+  );
+}
+
+/**
+ * The single steer guard: every surface that steers a running subagent (the
+ * SendMessage tool, the panel drill-down) routes through this predicate bundle
+ * so the refusal rules cannot drift per caller. On `ok` it hands back the
+ * bound steer entry point, so a caller cannot pass the guard and then reach a
+ * different session. Refusals, in order: one-shot builtins, user-stopped
+ * agents (permanent), not-running records, and running records without a live
+ * steerable handle (the transient minimal-register window, or a fake/older
+ * SDK session).
+ */
+export function guardSteer(record: SubagentRegistryRecord): SteerGuardResult {
+  if (record.oneShot) {
+    return { ok: false, refusal: oneShotRefusal(record) };
+  }
+  if (record.userStopped) {
+    return { ok: false, refusal: userStoppedRefusal(record) };
+  }
+  if (record.state !== "running") {
+    return {
+      ok: false,
+      refusal:
+        `Agent ${record.agentId} ("${record.agentName}") is not running — ` +
+        `there is no live dispatch to steer.`,
+    };
+  }
+  const session = record.session;
+  const steer = session?.steer;
+  if (!session || typeof steer !== "function") {
+    return {
+      ok: false,
+      refusal:
+        `Agent ${record.agentId} ("${record.agentName}") is running but cannot be steered right now — ` +
+        `only background dispatches are steerable (a foreground Agent call blocks the parent's turn).`,
+    };
+  }
+  return { ok: true, steer: steer.bind(session) };
 }

@@ -91,7 +91,12 @@ still exists, so Pi churn fails first and loudly rather than as a confusing down
 `test/integration-extension.test.ts` loads the **whole extension** (`picc(pi)`) against the
 `examples/full-surface` conformance fixture through `test/helpers/fake-pi.ts` — a hand-written
 stand-in for Pi's `ExtensionAPI` that records every tool, command, event handler, message, and
-model/thinking call the extension makes. `test/helpers/fixture.ts` copies a fixture from `examples/`
+model/thinking call the extension makes. It also records and **drives the interactive UI
+surface** with Pi-faithful semantics — widget installs/removals, focused `custom` components,
+the raw terminal-input chain (`feedTerminalInput`), shortcut and message-renderer registration,
+an injectable keymap, and mode-shaped contexts (`tuiCtx`/`printCtx`/`rpcCtx` modeling the real
+TUI/print/RPC ctx shapes) — which is what lets TUI behavior such as the subagent status panel
+and its drill-down be tested offline in the unit lane. `test/helpers/fixture.ts` copies a fixture from `examples/`
 into a temp dir and turns it into a real git repo (so worktree and git-plumbing behavior is
 genuine).
 

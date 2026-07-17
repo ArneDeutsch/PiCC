@@ -7,7 +7,7 @@ import {
   BackgroundTaskRegistry,
   createTaskOutputTool,
 } from "../src/runtime/background-tasks.js";
-import { renderAgentResult } from "../src/runtime/subagent-render.js";
+import { RECORD_FORK_MARKER, renderAgentResult } from "../src/runtime/subagent-render.js";
 import { FORK_DEGRADE_PREFIX, subagentSessionDir } from "../src/util/subagent-transcripts.js";
 import {
   fakeSdk,
@@ -266,35 +266,50 @@ describe("fork dispatch — visible degrade (never the generic unknown-type warn
 });
 
 describe("fork dispatch — developer-facing rendering (renderAgentResult)", () => {
-  function renderLines(details: Record<string, unknown>, text = "answer"): string[] {
+  function renderLines(
+    details: Record<string, unknown>,
+    expanded: boolean,
+    text = "answer",
+  ): string[] {
     const comp = renderAgentResult(
       { content: [{ type: "text", text }], details },
-      { expanded: false, isPartial: false },
+      { expanded, isPartial: false },
       undefined,
     );
-    return comp.render(80);
+    return comp.render(120);
   }
+  const degraded = {
+    outcome: "completed",
+    agent: "general-purpose",
+    diagnostics: [
+      {
+        severity: "info",
+        message:
+          "fork ran with fresh context: fork inheritance is disabled via CLAUDE_CODE_FORK_SUBAGENT; unset it to enable",
+      },
+    ],
+  };
 
-  it("a successful fork badges as Agent(fork) and shows no degrade footer", () => {
-    const lines = renderLines({ outcome: "completed", agent: "fork", diagnostics: [] });
-    const joined = lines.join("\n");
-    expect(joined).toContain("Agent(fork) completed");
-    expect(joined).not.toContain("fork ran with fresh context");
+  it("a successful fork badges as Agent(fork) with no degrade marker, collapsed or expanded", () => {
+    const clean = { outcome: "completed", agent: "fork", diagnostics: [] };
+    const collapsed = renderLines(clean, false).join("\n");
+    expect(collapsed).toContain("Agent(fork) completed");
+    expect(collapsed).not.toContain(RECORD_FORK_MARKER);
+    const expanded = renderLines(clean, true).join("\n");
+    expect(expanded).toContain("Agent(fork) completed");
+    expect(expanded).not.toContain("fork ran with fresh context");
   });
 
-  it("a degraded fork badges as the fresh agent AND shows the muted fork-degrade footer line", () => {
-    const lines = renderLines({
-      outcome: "completed",
-      agent: "general-purpose",
-      diagnostics: [
-        {
-          severity: "info",
-          message:
-            "fork ran with fresh context: fork inheritance is disabled via CLAUDE_CODE_FORK_SUBAGENT; unset it to enable",
-        },
-      ],
-    });
-    const joined = lines.join("\n");
+  it("a degraded fork's COLLAPSED record carries the ⚠ marker — the warning is never expand-only", () => {
+    const lines = renderLines(degraded, false);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("Agent(general-purpose) completed");
+    expect(lines[0]).not.toContain("Agent(fork)");
+    expect(lines[0]).toContain(RECORD_FORK_MARKER);
+  });
+
+  it("a degraded fork EXPANDED badges as the fresh agent AND shows the full fork-degrade footer line", () => {
+    const joined = renderLines(degraded, true).join("\n");
     expect(joined).toContain("Agent(general-purpose) completed");
     expect(joined).not.toContain("Agent(fork)");
     expect(joined).toContain("fork ran with fresh context: fork inheritance is disabled");

@@ -399,7 +399,16 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(bg?.note).toContain("Claude's single global (~10) parallel-agent cap");
     // The subagent-scoping clause must survive future edits to this entry.
     expect(bg?.note).toContain("scoped to the subagent's own dispatched tasks");
-    for (const gap of ["idle parents are not re-invoked", "no always-on Agent View", "no remote/cloud agents", "stop is cooperative"]) {
+    // The in-session Agent View gap is closed by the status panel; the honest
+    // residuals must be named instead of the retired "no always-on Agent View".
+    expect(bg?.note).not.toContain("no always-on Agent View");
+    for (const gap of [
+      "idle parents are not re-invoked",
+      "interactive-TUI-only",
+      "no cross-session agent view",
+      "no remote/cloud agents",
+      "stop is cooperative",
+    ]) {
       expect(bg?.note).toContain(gap);
     }
   });
@@ -496,8 +505,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(mode?.safetyRelevant).toBe(true);
   });
 
-  it("agent color is cosmetic-parsed-only and maxTurns a best-effort partial", () => {
-    expect(lookupCapability("agent.frontmatter.color")?.tier).toBe("degraded-noop");
+  it("agent color is a panel-tint-only partial and maxTurns a best-effort partial", () => {
+    const color = lookupCapability("agent.frontmatter.color");
+    expect(color?.tier).toBe("partial");
+    expect(color?.note).toContain("status panel");
+    expect(color?.note).toContain("untinted");
     const maxTurns = lookupCapability("agent.frontmatter.maxTurns");
     expect(maxTurns?.tier).toBe("partial");
     expect(maxTurns?.note).toContain("best-effort");

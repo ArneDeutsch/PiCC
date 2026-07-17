@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { fakePi } from "./helpers/fake-pi.js";
 
 /**
  * Pi upstream contract smoke test: asserts every Pi API PiCC
@@ -120,6 +121,167 @@ describe("pi 0.80.x API contract", () => {
         expect(ours(p as never, showImages)).toBe(real.getTextOutput(p, showImages));
       }
     }
+  });
+
+  it("extension ctx pins the UI widget surface and the mode/hasUI gating reality", async () => {
+    // The subagent status panel installs via ctx.ui.setWidget from a
+    // `ctx.mode === "tui"` gate. This pins WHY that gate (and only that gate)
+    // is valid, against Pi's real ExtensionRunner ctx:
+    //  - Default (print) mode: hasUI is FALSE, but every UI verb — setWidget,
+    //    custom, onTerminalInput — is PRESENT as a no-op (Pi's noOpUIContext
+    //    implements the full ExtensionUIContext). Method presence therefore
+    //    proves nothing about interactivity.
+    //  - A bound non-TUI UI context (RPC): hasUI flips TRUE while mode stays
+    //    "rpc" — so a hasUI gate would wrongly install TUI chrome in RPC.
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    const runner = new sdk.ExtensionRunner(
+      [],
+      sdk.createExtensionRuntime(),
+      process.cwd(),
+      {},
+      {},
+    );
+    const ctx = runner.createContext();
+    expect(ctx.mode).toBe("print");
+    expect(ctx.hasUI).toBe(false);
+    for (const verb of ["setWidget", "custom", "onTerminalInput", "notify", "setStatus"]) {
+      expect(typeof ctx.ui[verb], `print-mode ui.${verb} must exist (no-op)`).toBe("function");
+    }
+    // No-op reality: callable without a TUI, returning nothing/unsubscribe.
+    expect(ctx.ui.setWidget("k", ["x"], { placement: "belowEditor" })).toBeUndefined();
+    expect(typeof ctx.ui.onTerminalInput(() => undefined)).toBe("function");
+    await expect(ctx.ui.custom(() => ({ render: () => [] }))).resolves.toBeUndefined();
+
+    // Bind a (dummy) UI context as RPC mode does → the hasUI trap.
+    runner.setUIContext({ setWidget: () => undefined }, "rpc");
+    expect(ctx.mode).toBe("rpc");
+    expect(ctx.hasUI).toBe(true);
+  });
+
+  it("fake-pi's print-mode ctx matches the pinned print-mode reality", async () => {
+    // The "no setWidget in print mode" tests must model Pi, not mirror
+    // whichever field the implementation happens to read — so the fake's
+    // print ctx is pinned here against the same shape as the real one above.
+    const ctx: any = fakePi().printCtx();
+    expect(ctx.mode).toBe("print");
+    expect(ctx.hasUI).toBe(false);
+    for (const verb of ["setWidget", "custom", "onTerminalInput", "notify", "setStatus"]) {
+      expect(typeof ctx.ui[verb], `fake print-mode ui.${verb} must exist`).toBe("function");
+    }
+  });
+
+  it("registerShortcut exists on the extension API and records the shortcut", async () => {
+    // The panel-entry chord (alt+a) registers through pi.registerShortcut;
+    // fake-pi mirrors it, so a Pi rename must fail here first. The loader is
+    // not re-exported at the package root, so it is imported by file URL —
+    // the same pattern as the render-utils getTextOutput pin above.
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const distIdx = mainUrl.indexOf("/dist/");
+    expect(distIdx, "unexpected Pi dist layout").toBeGreaterThan(0);
+    const loader: any = await import(`${mainUrl.slice(0, distIdx)}/dist/core/extensions/loader.js`);
+    expect(typeof loader.loadExtensionFromFactory, "Pi extension loader moved").toBe("function");
+    let captured: any;
+    const ext = await loader.loadExtensionFromFactory(
+      (pi: any) => {
+        captured = pi;
+        pi.registerShortcut("alt+a", { description: "probe", handler: () => undefined });
+      },
+      process.cwd(),
+      sdk.createEventBus(),
+      sdk.createExtensionRuntime(),
+    );
+    expect(typeof captured.registerShortcut).toBe("function");
+    expect(ext.shortcuts.get("alt+a")?.description).toBe("probe");
+  });
+
+  it("registerMessageRenderer exists on the real ExtensionAPI and sendMessage threads a details param", async () => {
+    // The picc-settlement completion record hangs off BOTH seams: index.ts
+    // registers a custom-message renderer via pi.registerMessageRenderer and
+    // attaches the structured record payload as sendMessage's `details`. A Pi
+    // rename/drop must fail here first, not degrade the settlement notice
+    // silently to the default box (or strip the record data).
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const distIdx = mainUrl.indexOf("/dist/");
+    expect(distIdx, "unexpected Pi dist layout").toBeGreaterThan(0);
+    const loader: any = await import(`${mainUrl.slice(0, distIdx)}/dist/core/extensions/loader.js`);
+    const runtime = loader.createExtensionRuntime
+      ? loader.createExtensionRuntime()
+      : sdk.createExtensionRuntime();
+    let captured: any;
+    const renderer = () => undefined;
+    const ext = await loader.loadExtensionFromFactory(
+      (pi: any) => {
+        captured = pi;
+        pi.registerMessageRenderer("picc-contract-probe", renderer);
+      },
+      process.cwd(),
+      sdk.createEventBus(),
+      runtime,
+    );
+    expect(typeof captured.registerMessageRenderer, "Pi moved: ExtensionAPI.registerMessageRenderer").toBe(
+      "function",
+    );
+    // Registration is recorded where the interactive mode reads it back.
+    expect(
+      ext.messageRenderers?.get("picc-contract-probe"),
+      "Pi moved: registerMessageRenderer no longer records into Extension.messageRenderers",
+    ).toBe(renderer);
+    // sendMessage accepts and threads `details` (bind the runtime slot the way
+    // Runner.bindCore does — createExtensionRuntime ships throwing stubs).
+    const sent: Array<{ message: any; options: any }> = [];
+    runtime.sendMessage = (message: any, options: any) => sent.push({ message, options });
+    captured.sendMessage(
+      { customType: "picc-contract-probe", content: "c", display: true, details: { probe: 1 } },
+      { deliverAs: "steer" },
+    );
+    expect(sent, "Pi moved: ExtensionAPI.sendMessage no longer forwards to the runtime").toHaveLength(1);
+    expect(
+      sent[0]!.message.details,
+      "Pi moved: sendMessage dropped/renamed the details param",
+    ).toEqual({ probe: 1 });
+    expect(sent[0]!.options?.deliverAs).toBe("steer");
+  });
+
+  it("CustomMessageComponent drives the registered renderer with a BOOLEAN expanded and defaults on undefined", async () => {
+    // The collapsed-by-default settlement record keys on the EXPLICIT
+    // `options.expanded === false`; nested/detail-less messages return undefined
+    // to get Pi's default box. Pin both against Pi's REAL interactive component
+    // (exported at the package root), so a Pi change to the renderer calling
+    // convention fails loudly here.
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    // The component reads Pi's module-global theme singleton — initialize it,
+    // as the wired-edit integration test does.
+    sdk.initTheme();
+    const message = {
+      role: "custom",
+      customType: "picc-probe",
+      content: "notice body",
+      display: true,
+      details: { record: "probe" },
+      timestamp: Date.now(),
+    };
+    const seen: unknown[] = [];
+    const component = new sdk.CustomMessageComponent(message, (m: any, options: any) => {
+      expect(m, "Pi moved: renderer no longer receives the CustomMessage itself").toBe(message);
+      seen.push(options?.expanded);
+      return { render: () => ["probe-line"] };
+    });
+    // The global Ctrl+O toggle reaches custom messages through setExpanded.
+    expect(
+      typeof component.setExpanded,
+      "Pi moved: CustomMessageComponent.setExpanded (Ctrl+O expand reach)",
+    ).toBe("function");
+    component.setExpanded(true);
+    expect(seen, "Pi moved: message renderer no longer gets a boolean `expanded`").toEqual([
+      false,
+      true,
+    ]);
+    expect(component.render(80).join("\n")).toContain("probe-line");
+    // A renderer returning undefined falls back to Pi's default labeled box.
+    const fallback = new sdk.CustomMessageComponent(message, () => undefined);
+    expect(fallback.render(80).join("\n")).toContain("picc-probe");
   });
 
   it("typebox + StringEnum are importable the way our tools use them", async () => {

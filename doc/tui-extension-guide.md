@@ -68,8 +68,8 @@ Two objects matter:
 | Colors in our own components | **Easy** | `theme.fg("<slot>", text)`, `theme.bg`, `theme.bold/italic/...`, or raw ANSI |
 | Re-skin the whole UI / switch themes | **Medium** | `ctx.ui.setTheme`, `new Theme(...)`, ship theme JSON via `resources_discover` |
 | Add a **new named color role** | **Impossible** | `ThemeColor` union is closed |
-| New interactive pane (subagent-view, picker, navigator) | **Possible · Medium effort** | `ctx.ui.custom(factory, { overlay, overlayOptions, onHandle })` |
-| Persistent pane above/below the editor | **Easy–Medium** | `ctx.ui.setWidget(key, content \| factory, { placement })` |
+| New interactive pane (subagent-view, picker, navigator) | **Done** (subagent panel + drill-down — `src/runtime/subagent-panel-focus.ts`) | `ctx.ui.custom(factory, { overlay, overlayOptions, onHandle })` |
+| Persistent pane above/below the editor | **Done** (subagent status panel — `src/runtime/subagent-panel-widget.ts`) | `ctx.ui.setWidget(key, content \| factory, { placement })` |
 | Custom header / footer | **Medium** | `ctx.ui.setHeader` / `ctx.ui.setFooter` |
 | Progress indicators / spinners / status | **Easy** | `setWorkingIndicator`, `setWorkingMessage`, `setWorkingVisible`, `setStatus`, per-tool `onUpdate` |
 | Live in-tool progress (streaming) | **Easy (already done)** | tool `onUpdate` + `renderResult(isPartial)` — see `src/runtime/subagent-render.ts` |
@@ -167,12 +167,16 @@ These are not style preferences — violating them crashes the app or leaks term
    rendered line's *visible* width exceeds `width`. Measure with pi-tui's own
    `visibleWidth`/`truncateToWidth`/`wrapTextWithAnsi` (grapheme + East-Asian-width + tabs=3), not
    `String.length`. Always run a final clamp pass over every line you return (`clampLines`).
-2. **Sanitize model-/file-supplied text before it reaches the terminal.** Tool args, subagent
-   output, file contents can carry ANSI/OSC/control sequences. Strip them
-   (`sanitizeProgressText` / `sanitizeLine` in `src/runtime/subagent-progress.ts`) *before* the
-   width clamp (the clamp preserves ANSI verbatim — it is a width tool, not a sanitizer). This is
-   **security, not cosmetics**: unsanitized text lets a hostile file inject escape sequences into
-   the parent terminal.
+2. **Sanitize model-/file-supplied text — at capture first, at render as a backstop.** Tool args,
+   subagent output, file contents can carry ANSI/OSC/control sequences. The primary pass is
+   **capture-time**: the subagent registry and progress condenser sanitize strings as they are
+   stored (`sanitizeProgressText` / `sanitizeLine` in `src/runtime/subagent-progress.ts`), so no
+   downstream surface holds hostile bytes. Renderers keep a second pass as defense in depth — and
+   it is mandatory for anything deliberately stored raw (`agentName`, the registry's name-index
+   key, is sanitized only at render). Either pass runs *before* the width clamp (the clamp
+   preserves ANSI verbatim — it is a width tool, not a sanitizer). This is **security, not
+   cosmetics**: unsanitized text lets a hostile file inject escape sequences into the parent
+   terminal.
 3. **Null-guard the theme.** In print/RPC or a future themeless path, `theme` may be absent or
    partial. Access it through helpers (`themedFg`, `themedBold`) that fall back to plain text, so a
    renderer can never throw into Pi's render loop.
@@ -239,9 +243,13 @@ const result = await ctx.ui.custom<TResult>(
 - `overlay: true` floats it; `overlayOptions` (or a function for dynamic sizing) positions it;
   `onHandle(handle)` gives you an `OverlayHandle` to control visibility.
 
-This is exactly how a subagent-view backed by `SubagentRegistry` / the progress condenser
-(`src/runtime/subagent-registry.ts`, `subagent-progress.ts`) would be built. Effort is real — you
-implement `render(width)`, input handling, focus, and `dispose` — but it is idiomatic and stable.
+This is how the subagent panel + drill-down (`src/runtime/subagent-panel-focus.ts`, backed by
+`SubagentRegistry` / the progress condenser) is built — read it before writing a new focused
+component. Effort is real — you implement `render(width)`, input handling, focus, and `dispose` —
+but it is idiomatic and stable. Two substrate facts it encodes: Pi swaps the editor out (saving
+its draft) and restores it on close, so focus/draft handling is free; and a `registerShortcut`
+chord dispatches only while the default editor is focused, while raw `onTerminalInput` listeners
+run *before* the focused component — so a raw listener must yield to an open component itself.
 
 ### 5.2 Persistent panes and chrome
 
@@ -269,9 +277,12 @@ Several dedicated hooks — all low-risk:
   visibility of the "working" row shown during streaming.
 - **`ctx.ui.setStatus(key, text)`** — footer status line (see "Persistent panes and chrome").
 - **Per-tool live progress** — the tool's `onUpdate` callback drives `renderResult(…, { isPartial:
-  true })`. **PiCC already does this** for subagent tails and API-retry waits
-  (`src/runtime/subagent-progress.ts` → `subagent-render.ts`). Copy that pattern for any long tool.
-- **A persistent progress pane** — `setWidget` (see "Persistent panes and chrome").
+  true })`. **PiCC already does this** for the subagent single-line live status and API-retry waits
+  (`src/runtime/subagent-progress.ts` → `subagent-render.ts`); the rolling tail lives in the status
+  panel, not the tool row. Copy the pattern for any long tool.
+- **A persistent progress pane** — `setWidget` (see "Persistent panes and chrome"); the subagent
+  status panel (`src/runtime/subagent-panel-widget.ts`) is the shipped example, including the
+  interval-owned-by-the-component lifecycle.
 
 ---
 
@@ -336,19 +347,23 @@ Treat true global rebinding as **out of scope** — it fights Pi's own model and
 From `src/` (grep of `pi.*` / `ctx.ui.*`):
 
 - Registration/events: `pi.on`, `pi.registerTool`, `pi.registerCommand`,
-  `pi.registerEntryRenderer`, `pi.sendMessage`, `pi.appendEntry`, `pi.sendUserMessage`,
-  `pi.setModel`, `pi.setThinkingLevel`, `pi.exec`.
-- UI: `ctx.ui.notify`, `ctx.ui.onTerminalInput` (Esc-cancel of forks).
-- The mature rendering example: `src/runtime/subagent-render.ts` (+ `subagent-progress.ts`).
+  `pi.registerEntryRenderer`, `pi.registerMessageRenderer` (subagent settlement records),
+  `pi.registerShortcut` (the panel entry chord), `pi.sendMessage`, `pi.appendEntry`,
+  `pi.sendUserMessage`, `pi.setModel`, `pi.setThinkingLevel`, `pi.exec`.
+- UI: `ctx.ui.notify`, `ctx.ui.setWidget` (the passive subagent status panel), `ctx.ui.custom`
+  (the focused panel list + drill-down), `ctx.ui.onTerminalInput` (Esc-cancel of forks — the
+  watcher yields a lone Esc to the open panel, since raw listeners run before the focused
+  component).
+- The mature rendering examples: `src/runtime/subagent-render.ts` (+ `subagent-progress.ts`) for
+  tool rows, `src/runtime/subagent-panel-render.ts` (+ `subagent-panel-model.ts`,
+  `render-util.ts`) for a pure widget/component view.
 - Tool-row framing: `renderShell: "self"` + per-line `theme.bg` re-apply via the generic self-shell
   wrapper `wrapForSelfShell` (`src/runtime/tool-shell.ts`) — de-pads every Claude-named tool and
   re-registered built-in row (see "`renderShell` — this is how you control blank lines and framing").
 
-**Untapped but available right now:** `pi.registerShortcut`,
-`ctx.ui.custom`, `ctx.ui.setWidget`, `ctx.ui.setFooter`/`setHeader`, `ctx.ui.setStatus`,
+**Untapped but available right now:** `ctx.ui.setFooter`/`setHeader`, `ctx.ui.setStatus`,
 `ctx.ui.setWorkingIndicator`/`setWorkingMessage`, full `ctx.ui.setTheme`,
-`pi.registerMessageRenderer`, `ctx.ui.addAutocompleteProvider`, `ctx.ui.setTitle`,
-`ctx.ui.setToolsExpanded`.
+`ctx.ui.addAutocompleteProvider`, `ctx.ui.setTitle`, `ctx.ui.setToolsExpanded`.
 
 ---
 

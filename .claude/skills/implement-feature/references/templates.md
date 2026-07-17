@@ -1,6 +1,6 @@
 # Templates
 
-The three plan-folder templates the router refers to. Copy the relevant one when a phase says to write `feature.md`, a task spec, or `review.md`.
+The three plan-folder templates the router and the phase files refer to. Copy the relevant one when a phase says to write `feature.md`, a task spec, or `review.md`.
 
 ## Plan folder layout
 

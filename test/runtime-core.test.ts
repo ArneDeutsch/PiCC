@@ -54,9 +54,16 @@ import {
 } from "../src/runtime/context-assembly.js";
 import { mapEffort, steeringForModel, type PiCCConfig } from "../src/runtime/steering.js";
 import { createAgentToolDefinition, extractText, type SubagentRuntime } from "../src/runtime/subagents.js";
+import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import { visibleWidth as tuiVisibleWidth, Text as TuiText } from "@earendil-works/pi-tui";
 import type { ProgressSnapshot } from "../src/runtime/subagent-progress.js";
-import { renderAgentResult } from "../src/runtime/subagent-render.js";
+import {
+  RECORD_EXPAND_HINT,
+  RECORD_FORK_MARKER,
+  RECORD_REFERENCE_NOTE,
+  renderAgentCall,
+  renderAgentResult,
+} from "../src/runtime/subagent-render.js";
 import {
   bgSlotForCtx,
   genericResultComponent,
@@ -1217,6 +1224,32 @@ describe("Subagent live progress", () => {
     expect(snapshots.length).toBe(0);
   });
 
+  it("a foreground dispatch with NO onProgress sink still mirrors live progress onto the registry record", async () => {
+    // The panel's single-live-data-source contract: the registry mirror rides
+    // dispatch's own condenser subscription, not the tool's onUpdate wiring.
+    const sub = new SubagentRegistry();
+    const { sdk } = fakeSdk({ replies: [streamReply] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk, { subagentRegistry: sub });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    expect(result.ok).toBe(true);
+    const rec = sub.get(result.agentId)!;
+    expect(rec.progress?.tail.some((l) => l.includes("Grep"))).toBe(true);
+    expect(rec.progress?.tail).toContain("final line");
+    expect(rec.fullTail?.some((l) => l.includes("Grep"))).toBe(true);
+  });
+
+  it("a nested (depth 2) dispatch mirrors live progress onto its registry record too", async () => {
+    const sub = new SubagentRegistry();
+    const { sdk } = fakeSdk({ replies: [streamReply] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk, { subagentRegistry: sub });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 2 });
+    expect(result.ok).toBe(true);
+    const rec = sub.get(result.agentId)!;
+    expect(rec.depth).toBe(2);
+    expect(rec.progress?.tail.some((l) => l.includes("Grep"))).toBe(true);
+    expect(rec.fullTail?.some((l) => l.includes("Grep"))).toBe(true);
+  });
+
   it("Agent tool forwards live progress through onUpdate with the expected shape", async () => {
     const { sdk } = fakeSdk({
       replies: [
@@ -1751,14 +1784,14 @@ describe("TaskOutput identity render", () => {
     expect(out).toContain('TaskOutput(task_id "task-2")');
   });
 
-  it("a live partial with an absent/empty snapshot renders the … starting… placeholder (not a bare header)", () => {
+  it("a live partial with an absent/empty snapshot renders the starting… placeholder (not a bare header)", () => {
     const bare = render(
       { taskId: "task-8", agent: "coder", agentId: "agent-aabbccddeeff", live: true },
       "",
       true,
     );
     expect(bare).toContain("Task(task-8)");
-    expect(bare).toContain("… starting…");
+    expect(bare).toContain("starting…");
 
     const emptySnap = render(
       {
@@ -1771,29 +1804,33 @@ describe("TaskOutput identity render", () => {
       "",
       true,
     );
-    expect(emptySnap).toContain("… starting…");
+    expect(emptySnap).toContain("starting…");
   });
 
-  it("a live partial with a snapshot is self-identifying (task id + type + agent-<id> + tail + activity)", () => {
-    const out = render(
+  it("a live partial collapses to ONE self-identifying status line (task id + type + activity); the panel owns the tail", () => {
+    const lines = renderAgentResult(
       {
-        taskId: "task-1",
-        agent: "coder",
-        agentId: "agent-aabbccddeeff",
-        subagentProgress: { tail: ["> Grep (x)"], activity: "running Grep…" },
-        live: true,
+        content: [{ type: "text", text: "> Grep (x)\n… running Grep…" }],
+        details: {
+          taskId: "task-1",
+          agent: "coder",
+          agentId: "agent-aabbccddeeff",
+          subagentProgress: { tail: ["> Grep (x)"], activity: "running Grep…" },
+          live: true,
+        },
       },
-      "> Grep (x)\n… running Grep…",
-      true,
-    );
+      { isPartial: true },
+      undefined,
+    ).render(120);
+    expect(lines).toHaveLength(1); // single status line — no rolling tail in chat
+    const out = lines.join("\n");
     expect(out).toContain("Task(task-1)");
     expect(out).toContain("Agent(coder)");
-    expect(out).toContain("agent-aabbccddeeff");
-    expect(out).toContain("> Grep (x)");
     expect(out).toContain("running Grep…");
+    expect(out).not.toContain("> Grep (x)"); // the tail lives in the panel/drill-down
   });
 
-  it("a wait:false poll renders the identity frame + last activity (not a bare chip); … starting… when idle", () => {
+  it("a wait:false poll renders ONE identity status line + last activity (not a bare chip); starting… when idle", () => {
     const active = render({
       taskId: "task-6",
       status: "running",
@@ -1803,7 +1840,6 @@ describe("TaskOutput identity render", () => {
     }, "Background task task-6 (coder) is still running — running Grep…");
     expect(active).toContain("Task(task-6)");
     expect(active).toContain("Agent(coder)");
-    expect(active).toContain("agent-aabbccddeeff");
     expect(active).toContain("running Grep…");
 
     const idle = render({
@@ -1813,10 +1849,10 @@ describe("TaskOutput identity render", () => {
       agentId: "agent-aabbccddeeff",
     });
     expect(idle).toContain("Task(task-6)");
-    expect(idle).toContain("… starting…");
+    expect(idle).toContain("starting…");
   });
 
-  it("two same-type concurrent tasks render DISTINCT Task(task-N) + agent-<id> frames", () => {
+  it("two same-type concurrent tasks render DISTINCT Task(task-N) status lines", () => {
     const a = render({
       taskId: "task-1",
       status: "running",
@@ -1832,9 +1868,9 @@ describe("TaskOutput identity render", () => {
       lastActivity: "running Read…",
     });
     expect(a).toContain("Task(task-1)");
-    expect(a).toContain("agent-aaaa1111bbbb");
+    expect(a).toContain("running Grep…");
     expect(b).toContain("Task(task-2)");
-    expect(b).toContain("agent-cccc2222dddd");
+    expect(b).toContain("running Read…");
     expect(a).not.toContain("task-2");
     expect(b).not.toContain("task-1");
   });
@@ -1909,12 +1945,13 @@ describe("TaskOutput identity render", () => {
       ).render(width);
       noOverflow(final, width);
 
-      // The agent-<id> is on its own line (identity subline / poll subline), so at
-      // any width wide enough to hold it (>= its 18 columns) it is never the
-      // truncated element.
+      // The agent-<id> is on its own line (identity subline) in the FULL record
+      // (no `expanded` option → the legacy full render), so at any width wide
+      // enough to hold it (>= its 18 columns) it is never the truncated element.
+      // The poll is now a single status line — its identity lives in the spawn
+      // record and the expanded completion record instead.
       if (width >= 20) {
         expect(final.join("\n")).toContain(agentId);
-        expect(poll.join("\n")).toContain(agentId);
       }
     }
 
@@ -1999,6 +2036,300 @@ describe("TaskOutput identity render", () => {
       transcriptPath: "/home/a/.pi/sessions/x.subagents/agent-3b7caeaf8448.jsonl",
     }, "x", false, 40);
     expect(posix).toContain("agent-3b7caeaf8448.jsonl");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Condensed completion records — the collapsed-by-default final render
+// (badge + duration + tokens + pointer + expand affordance), the Ctrl+O
+// expanded full body, the exactly-once reference line, and the \r line-break
+// discipline. Pure renderer unit tests over renderAgentResult.
+// ---------------------------------------------------------------------------
+
+describe("condensed completion records", () => {
+  const ESC = String.fromCharCode(27);
+  const BEL = String.fromCharCode(7);
+  const AGENT_ID = "agent-aabbccddeeff";
+  const completedDetails = {
+    taskId: "task-3",
+    status: "completed",
+    outcome: "completed",
+    agent: "coder",
+    agentId: AGENT_ID,
+    transcriptPath: `/x/sessions/${AGENT_ID}.jsonl`,
+    resumable: true,
+    usage: { inputTokens: 10, outputTokens: 5, costUsd: 0.01 },
+    durationMs: 242_000,
+  };
+  const renderLines = (
+    details: Record<string, unknown>,
+    text: string,
+    expanded: boolean | undefined,
+    width = 200,
+  ) =>
+    renderAgentResult(
+      { content: [{ type: "text", text }], details },
+      expanded === undefined ? { isPartial: false } : { isPartial: false, expanded },
+      undefined,
+    ).render(width);
+
+  it("collapsed (expanded:false): ONE badge line with chip, outcome, duration, tokens, pointer, and the expand affordance — in that order", () => {
+    const lines = renderLines(completedDetails, "the answer", false);
+    expect(lines).toHaveLength(1);
+    const out = lines[0]!;
+    expect(out).toContain("● Task(task-3) · Agent(coder) completed");
+    expect(out).toContain("4m02s"); // durationMs formatted
+    expect(out).toContain("in 10"); // brief tokens (in/out + cost)
+    expect(out).toContain(`${AGENT_ID}.jsonl`); // transcript-basename pointer…
+    expect(out).not.toContain("/x/sessions/"); // …not the full path
+    expect(out).toContain(RECORD_EXPAND_HINT);
+    expect(out).not.toContain("the answer"); // the body stays behind expand
+    // Segment order is pinned: duration → tokens → pointer → hint (metadata
+    // truncates from the right, most-expendable last-but-one).
+    const order = ["4m02s", "in 10", `${AGENT_ID}.jsonl`, RECORD_EXPAND_HINT].map((s) =>
+      out.indexOf(s),
+    );
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+  });
+
+  it("collapsed tokens are in/out (+cost) ONLY — cache read/write counts live exclusively in the expanded usage: footer", () => {
+    const details = {
+      ...completedDetails,
+      usage: {
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 2048,
+        cacheWriteTokens: 1024,
+        costUsd: 0.25,
+      },
+    };
+    const collapsed = renderLines(details, "the answer", false);
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0]).toContain("in 10");
+    expect(collapsed[0]).toContain("out 5");
+    expect(collapsed[0]).toContain("$0.25");
+    expect(collapsed[0]).not.toContain("cache read");
+    expect(collapsed[0]).not.toContain("cache write");
+    // At an ordinary 120-column terminal the pointer and the expand hint are
+    // what the cache counts would have pushed off the right edge.
+    const at120 = renderLines(details, "the answer", false, 120);
+    expect(at120).toHaveLength(1);
+    expect(at120[0]).toContain(`${AGENT_ID}.jsonl`);
+    expect(at120[0]).toContain(RECORD_EXPAND_HINT);
+    // Nothing is lost: the expanded usage: footer keeps the full compact line.
+    const expanded = renderLines(details, "the answer", true).join("\n");
+    expect(expanded).toContain("usage: in 10 · out 5 · cache read 2048 · cache write 1024 · $0.25");
+  });
+
+  it("cross-platform pointer: a Windows-separator transcript path yields the basename on the collapsed line", () => {
+    const lines = renderLines(
+      {
+        ...completedDetails,
+        transcriptPath: `C:\\Users\\a\\.pi\\sessions\\x.subagents\\${AGENT_ID}.jsonl`,
+      },
+      "the answer",
+      false,
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(`${AGENT_ID}.jsonl`);
+    expect(lines[0]).not.toContain("C:\\Users");
+  });
+
+  it("expanded (Ctrl+O) shows the full record: body, transcript path, duration, usage, resumable hint", () => {
+    const out = renderLines(completedDetails, "the answer", true).join("\n");
+    expect(out).toContain("the answer");
+    expect(out).toContain("transcript: /x/sessions/");
+    expect(out).toContain("duration: 4m02s");
+    expect(out).toContain("usage:");
+    expect(out).toContain(`resumable via SendMessage — agent ${AGENT_ID}`);
+    expect(out).not.toContain(RECORD_EXPAND_HINT);
+  });
+
+  it("a structural caller that OMITS the expanded option gets the full record (Pi always passes a boolean)", () => {
+    const out = renderLines(completedDetails, "the answer", undefined).join("\n");
+    expect(out).toContain("the answer");
+    expect(out).toContain("transcript:");
+  });
+
+  it("collapsed FAILED carries the capped error summary on the line", () => {
+    const longError = `connection reset ${"x".repeat(200)}`;
+    const lines = renderLines(
+      { taskId: "task-4", status: "failed", outcome: "failed", agent: "coder", error: longError },
+      "partial work",
+      false,
+    );
+    expect(lines).toHaveLength(1);
+    const out = lines[0]!;
+    expect(out).toContain("✗ Task(task-4) · Agent(coder) failed");
+    expect(out).toContain("connection reset");
+    expect(out).toContain("…"); // capped, not the full 200-char error
+    expect(out).not.toContain("x".repeat(100));
+    expect(out).not.toContain("partial work"); // partial output behind expand
+    expect(renderLines(
+      { taskId: "task-4", status: "failed", outcome: "failed", agent: "coder", error: longError },
+      "partial work",
+      true,
+    ).join("\n")).toContain("partial work");
+  });
+
+  it("a user-stopped task renders ■ … stopped by user, collapsed AND expanded", () => {
+    const details = {
+      taskId: "task-5",
+      status: "stopped",
+      outcome: "aborted",
+      agent: "coder",
+      userStopped: true,
+    };
+    const collapsed = renderLines(details, "", false);
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0]).toContain("■ Task(task-5) · Agent(coder) stopped by user");
+    expect(renderLines(details, "", true).join("\n")).toContain("stopped by user");
+    // A plain model stop keeps the "aborted" wording.
+    const modelStop = renderLines(
+      { taskId: "task-5", status: "stopped", outcome: "aborted", agent: "coder" },
+      "",
+      false,
+    );
+    expect(modelStop[0]).toContain("aborted");
+    expect(modelStop[0]).not.toContain("stopped by user");
+  });
+
+  it("exactly-once: alreadyReported renders ONLY the reference line — collapsed AND expanded, never a second record", () => {
+    const details = { ...completedDetails, alreadyReported: true };
+    for (const expanded of [false, true]) {
+      const lines = renderLines(details, "the answer", expanded);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("● Task(task-3) · Agent(coder) completed");
+      expect(lines[0]).toContain(RECORD_REFERENCE_NOTE);
+      // The reference line still names the on-disk file (basename pointer).
+      expect(lines[0]).toContain(`${AGENT_ID}.jsonl`);
+      expect(lines[0]).not.toContain("/x/sessions/");
+      expect(lines[0]).not.toContain("the answer");
+      expect(lines[0]).not.toContain(RECORD_EXPAND_HINT);
+    }
+    // Without a transcript path the reference line simply drops the pointer.
+    const { transcriptPath: _tp, ...noPath } = details;
+    const bare = renderLines(noPath, "the answer", false);
+    expect(bare).toHaveLength(1);
+    expect(bare[0]).toContain(RECORD_REFERENCE_NOTE);
+    expect(bare[0]).not.toContain(".jsonl");
+  });
+
+  it("hostile fields: the collapsed line never leaks control bytes and never overflows any width", () => {
+    const theme = {
+      fg: (_c: string, s: string) => `${ESC}[31m${s}${ESC}[0m`,
+      bold: (s: string) => `${ESC}[1m${s}${ESC}[22m`,
+    };
+    const evil = `${ESC}]0;pwned${BEL}co${ESC}[31mder`;
+    const details = {
+      taskId: "task-6",
+      status: "failed",
+      outcome: "failed",
+      agent: evil,
+      error: `boom${BEL}${ESC}[2J`,
+      transcriptPath: `/x/${ESC}[31m/agent-3b7caeaf8448.jsonl`,
+      usage: { inputTokens: 1 },
+      durationMs: 1000,
+    };
+    const plain = renderAgentResult(
+      { content: [{ type: "text", text: "b" }], details },
+      { isPartial: false, expanded: false },
+      undefined,
+    ).render(400).join("\n");
+    expect(plain.includes(ESC)).toBe(false);
+    expect(plain.includes(BEL)).toBe(false);
+    expect(plain).toContain("coder");
+    expect(plain).toContain("boom");
+    for (const width of [1, 2, 3, 20, 40, 138]) {
+      for (const expanded of [false, true]) {
+        const lines = renderAgentResult(
+          { content: [{ type: "text", text: "字".repeat(60) }], details },
+          { isPartial: false, expanded },
+          theme,
+        ).render(width);
+        for (const l of lines) expect(tuiVisibleWidth(l)).toBeLessThanOrEqual(width);
+      }
+    }
+  });
+
+  it("malformed durationMs (NaN / negative / non-number) never renders and never throws", () => {
+    for (const durationMs of [Number.NaN, -5, Number.POSITIVE_INFINITY, "soon", null, {}]) {
+      const lines = renderLines({ ...completedDetails, durationMs }, "the answer", false);
+      expect(lines).toHaveLength(1);
+      // The duration segment is dropped whole — no "NaN"/garbage segment — and
+      // the rest of the line (pointer + hint) is intact.
+      expect(lines[0]).not.toContain("NaN");
+      expect(lines[0]).not.toContain("soon");
+      expect(lines[0]).toContain(`${AGENT_ID}.jsonl`);
+      expect(lines[0]).toContain(RECORD_EXPAND_HINT);
+      // Same width/no-throw discipline as the hostile matrix above.
+      for (const width of [1, 3, 20, 138]) {
+        for (const l of renderLines({ ...completedDetails, durationMs }, "x", false, width)) {
+          expect(tuiVisibleWidth(l)).toBeLessThanOrEqual(width);
+        }
+      }
+    }
+  });
+
+  it("a model-controlled \\r breaks the line like \\n — no same-line display spoofing in the expanded body", () => {
+    const CR = String.fromCharCode(13);
+    const lines = renderLines(
+      { outcome: "completed", agent: "coder" },
+      `SAFE-LINE${CR}SPOOF-LINE${CR}\nTHIRD`,
+      true,
+    );
+    for (const l of lines) expect(l.includes(CR)).toBe(false);
+    const out = lines.join("\n");
+    expect(out).toContain("SAFE-LINE");
+    expect(out).toContain("SPOOF-LINE");
+    expect(out).toContain("THIRD");
+    // The CR-separated fragments land on SEPARATE lines.
+    expect(lines.some((l) => l.includes("SAFE-LINE") && l.includes("SPOOF-LINE"))).toBe(false);
+  });
+
+  it("a \\r in a model-supplied description cannot overprint the spawn line (renderAgentCall)", () => {
+    const CR = String.fromCharCode(13);
+    const lines = renderAgentCall(
+      { subagent_type: "coder", description: `SAFE${CR}SPOOF` },
+      undefined,
+    ).render(80);
+    for (const l of lines) expect(l.includes(CR)).toBe(false);
+    const out = lines.join("\n");
+    expect(out).toContain("SAFE");
+    expect(out).toContain("SPOOF");
+    // The CR-separated fragments land on SEPARATE emitted lines.
+    expect(lines.some((l) => l.includes("SAFE") && l.includes("SPOOF"))).toBe(false);
+  });
+
+  it("a \\r in the prompt cannot ride into the one-line preview (firstLine breaks on CR)", () => {
+    const CR = String.fromCharCode(13);
+    const lines = renderAgentCall(
+      { subagent_type: "coder", prompt: `SAFE${CR}SPOOF the rest of the prompt` },
+      undefined,
+    ).render(80);
+    for (const l of lines) expect(l.includes(CR)).toBe(false);
+    const out = lines.join("\n");
+    // firstLine takes only the FIRST CR-delimited segment as the preview.
+    expect(out).toContain("SAFE");
+    expect(out).not.toContain("SPOOF");
+  });
+
+  it("a \\r in a background-start body breaks the line — no same-line spoofing on the fallback start block", () => {
+    const CR = String.fromCharCode(13);
+    // No taskId → the background-start FALLBACK branch renders the content body.
+    const lines = renderAgentResult(
+      {
+        content: [{ type: "text", text: `Agent → background${CR}SPOOF-LINE` }],
+        details: { background: true },
+      },
+      { isPartial: false, expanded: false },
+      undefined,
+    ).render(80);
+    for (const l of lines) expect(l.includes(CR)).toBe(false);
+    const out = lines.join("\n");
+    expect(out).toContain("SPOOF-LINE");
+    expect(lines.some((l) => l.includes("background") && l.includes("SPOOF-LINE"))).toBe(false);
   });
 });
 

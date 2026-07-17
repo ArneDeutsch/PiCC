@@ -25,6 +25,12 @@ describe("implement-feature router", () => {
   const { skills } = loadSkills([{ dir: SKILLS_DIR, scope: "project" }], []);
   const skill = skills.find((s) => s.name === "implement-feature");
 
+  // A representative ~150-char documented invocation, shared by the substitution-inflation and
+  // margin tests below so both render the same worst-case body.
+  const longArgsText =
+    "#5 also add structured logging around the dispatch loop and make sure the retry path is " +
+    "covered by an offline integration test in the tester layer please";
+
   it("loads with a valid frontmatter contract", () => {
     // `name` must equal the expected identity (catches a `name:` value typo; the loader falls back to
     // the dir basename, which is also "implement-feature", so a removed key still passes — acceptable).
@@ -34,6 +40,12 @@ describe("implement-feature router", () => {
     expect(skill!.description.length).toBeGreaterThan(0);
   });
 
+  // The trunk-size constraint, for whoever reddens the assertions below: SKILL.md is the
+  // always-resident body — re-injected into context after every compaction — and is capped at
+  // REINJECT_PER_SKILL_MAX_CHARS, a Claude-parity value whose rationale lives in its JSDoc in
+  // src/runtime/skill-activation.ts. The references/*.md bodies are read on demand and carry no
+  // budget. When a trunk edit trips the cap or the 2k margin, move the detail into a references/
+  // file named by the phase spine — raising the constant is a runtime behavior change, not the fix.
   it("router body stays within the per-skill re-injection cap", () => {
     // Tie the assertion to the runtime constant, not a hardcoded 20000.
     const body = loadSkillBody(skill!);
@@ -48,15 +60,17 @@ describe("implement-feature router", () => {
     // once via the append-fallback instead. Render with a representative ~150-char invocation and
     // assert the rendered body still fits.
     const body = loadSkillBody(skill!);
-    const argsText =
-      "#5 also add structured logging around the dispatch loop and make sure the retry path is " +
-      "covered by an offline integration test in the tester layer please";
-    expect(argsText.length).toBeGreaterThanOrEqual(140);
-    const rendered = substituteArguments(body, argsText, skill!.arguments);
+    expect(longArgsText.length).toBeGreaterThanOrEqual(140);
+    const rendered = substituteArguments(body, longArgsText, skill!.arguments);
     expect(rendered.text.length).toBeLessThanOrEqual(REINJECT_PER_SKILL_MAX_CHARS);
     // The ref still reaches the coordinator — via the no-marker append fallback, since the router
     // body carries no literal `$ARGUMENTS`/`$N`/`$name` marker to substitute in place.
-    expect(rendered.text).toContain(`ARGUMENTS: ${argsText}`);
+    expect(rendered.text).toContain(`ARGUMENTS: ${longArgsText}`);
+  });
+
+  it("trunk stays 2k under the re-injection cap — move detail into references/, never raise the constant", () => {
+    const rendered = substituteArguments(loadSkillBody(skill!), longArgsText, skill!.arguments);
+    expect(rendered.text.length).toBeLessThanOrEqual(REINJECT_PER_SKILL_MAX_CHARS - 2000);
   });
 
   it("every linked reference resolves, and every reference file is linked (bidirectional, count-agnostic)", () => {
@@ -114,8 +128,8 @@ describe("description-based naming contract", () => {
     expect(firstIndex).toBeLessThan(secondIndex);
   };
 
-  it("keeps the Phase 2 validation contract and collision/race backstops in workflow-detail.md (loose floor)", () => {
-    const body = collapsed("references/workflow-detail.md");
+  it("keeps the Phase 2 validation contract and collision/race backstops in phase-2-workspace.md (loose floor)", () => {
+    const body = collapsed("references/phase-2-workspace.md");
     // Floor 5 — Phase 2 validation contract (kept verbatim: slug regex, bound, device list, ref-check).
     expect(body).toContain("^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$");
     expect(body).toContain("3–48 characters");
@@ -137,29 +151,23 @@ describe("description-based naming contract", () => {
     expect(body).toContain("identity finalized and immutable");
   });
 
-  it("keeps the resident router on the same descriptive identity and presentation gate", () => {
+  it("keeps the resident identity floor in the router (gate/announcement detail lives in the phase files)", () => {
+    // Residency contract: the trunk keeps only the
+    // always-resident identity kernels — resume classification, the task commit subject, fail-closed
+    // slug validation, the resume confirmation gate, the race-deletion warning, and the repush
+    // confirmation. The presentation-gate and announcement-field detail is deliberately
+    // load-on-demand in references/phase-1-direction.md, pinned by the "hard pre-tool presentation
+    // gate" test below — do not re-pin that prose against the trunk.
     const body = collapsed("SKILL.md");
     expect(body).toContain("classify resume before new naming");
     expect(body).toContain("<feature-slug>: t<task-number> — <description>");
+    // The commit freshness reminder must stay resident: the stale-index hazard fires mid-phase,
+    // with no phase-entry event to trigger a reference re-read.
+    expect(body).toContain("the working tree for freshness");
     expect(body).toContain("never sanitize/add a counter");
     expect(body).toContain("explicit human confirmation");
     expect(body).toContain("may delete a raced unregistered directory");
     expect(body).toContain("confirmed self-owned fast-forward repush");
-    for (const marker of [
-      "hard presentation gate", "immediately after build go", "first read the required phase 2 references",
-      "reference reads are the only tool calls allowed before the announcement",
-      "before every workspace/preflight/mutating command", "before `enterworktree`",
-      "emit user-visible prose", "never leave it in hidden reasoning", "may share the response with later tool calls",
-      "requires no reply",
-    ]) expect(body).toContain(marker);
-    expect(body).not.toContain("before the first phase 2 tool call");
-    const ordered = [
-      "`title: <title>`", "`slug: <feature-slug>`", "`branch: feature/<feature-slug>`",
-      "`plan: doc/plan/<feature-slug>/`", "`race disclosure:`",
-    ];
-    for (let index = 0; index < ordered.length - 1; index += 1) {
-      expectBefore(body, ordered[index]!, ordered[index + 1]!);
-    }
     expect(body).not.toMatch(/next free|pick the next free|feature\/<nn>|f<nn>/i);
   });
 
@@ -168,8 +176,27 @@ describe("description-based naming contract", () => {
     // non-ignored files so a reviewer's view is complete — guarding against a silent regression to
     // bare `git diff HEAD`, which has recurred repeatedly in practice. Accept either mechanism
     // (`git add -A` staging or a reviewer `git status --short` read); no brittle exact-phrase pin.
-    const body = collapsed("references/workflow-detail.md");
-    expect(body).toMatch(/git add -a|git status --short/);
+    // Slice to the step-3 fan-out region: the commit step legitimately reads `git status --short`
+    // for freshness, so a file-wide match would pass on that text alone and stop guarding fan-out.
+    const body = collapsed("references/phase-7-implementation.md");
+    const start = body.indexOf("review fan-out");
+    const end = body.indexOf("triage and fix");
+    expect(start, "missing fan-out step marker").toBeGreaterThanOrEqual(0);
+    expect(end, "missing triage step marker").toBeGreaterThan(start);
+    expect(body.slice(start, end)).toMatch(/git add -a|git status --short/);
+  });
+
+  it("Phase 7 commit step pairs a scope check with a staleness-capable freshness check", () => {
+    // Loose representative substrings of the pre-commit contract — the surrounding prose stays
+    // freely editable. Guards against the two real incidents: a stale index committed after a fix
+    // round (all gates green — they run on the working tree, not the index) and a `git mv` rename
+    // from other work swept into an unrelated commit. `collapsed()` keeps backticks, so the
+    // blank-add floor marker retains them.
+    const body = collapsed("references/phase-7-implementation.md");
+    expect(body).toContain("git diff --cached");
+    expect(body).toContain("a double-letter code");
+    expect(body).toContain("`git mv` auto-stages");
+    expect(body).toContain("never a blank `git add -a && git commit`");
   });
 
   it("pins the plan-folder templates and task-local numbering (loose)", () => {
@@ -183,12 +210,12 @@ describe("description-based naming contract", () => {
   it("keeps public ticket titles model-authored, bounded, and body-file-quoted (loose floor)", () => {
     // Loose representatives of the title-quoting contract: independent authorship, the 120-char
     // single-line bound, and --body-file at each write site — not the exhaustive phrase list.
-    const workflow = collapsed("references/workflow-detail.md");
+    const direction = collapsed("references/phase-1-direction.md");
     const creation = collapsed("references/ticket-creation.md");
     const integration = collapsed("references/ticket-integration.md");
     const handoff = collapsed("references/handoff.md");
-    expect(workflow).toContain("printable ascii, single-line, at most 120 characters");
-    expect(workflow).toContain("do not directly copy, interpolate, slugify, or mechanically transform raw ticket title/body text");
+    expect(direction).toContain("printable ascii, single-line, at most 120 characters");
+    expect(direction).toContain("do not directly copy, interpolate, slugify, or mechanically transform raw ticket title/body text");
     expect(creation).toContain('gh issue create --repo <target> --title "<title>" --body-file <path>');
     expect(integration).toContain("pass the complete title as one quoted argument");
     expect(handoff).toContain('--title "<title>" --body-file <path>');
@@ -223,10 +250,10 @@ describe("description-based naming contract", () => {
   });
 
   it("pins all commit forms and retained GitHub/task-local numbering", () => {
-    const workflow = collapsed("references/workflow-detail.md");
+    const implementation = collapsed("references/phase-7-implementation.md");
     for (const form of [
       "<feature-slug>: t<task-number> — <description>", "<feature-slug>: <description>",
-    ]) expect(workflow).toContain(form);
+    ]) expect(implementation).toContain(form);
     expect(read("references/ticket-integration.md")).toContain("#N");
     expect(read("references/templates.md")).toContain("<task-number>");
     expect(read("references/templates.md")).toContain("t01");
@@ -243,7 +270,10 @@ describe("description-based naming contract", () => {
   });
 
   it("pins the workflow's hard pre-tool presentation gate, replacement, and residual-race disclosure", () => {
-    const workflow = collapsed("references/workflow-detail.md");
+    // The gate/announcement prose lives in phase-1-direction.md; the collision re-announcement loop
+    // lives in phase-2-workspace.md step 2 — each marker is pinned in the file that holds it.
+    const direction = collapsed("references/phase-1-direction.md");
+    const workspace = collapsed("references/phase-2-workspace.md");
     for (const marker of [
       "hard presentation gate", "immediately after the explicit build go", "first read the references required for phase 2",
       "required reference reads are the only tool calls allowed before the announcement",
@@ -252,19 +282,23 @@ describe("description-based naming contract", () => {
       "may share the same assistant response with later tool calls", "requires no user reply",
       "after the required reference reads, do not invoke a workspace, fetch, validation, preflight, mutating command, or `enterworktree` before this prose is visible",
       "collision checks cover shared/fetched state but cannot eliminate simultaneous or disconnected same-slug races",
+    ]) expect(direction).toContain(marker);
+    for (const marker of [
       "author and revalidate a more specific descriptive slug", "repeat the entire fetched/filesystem/ref collision preflight",
       "repeat the full title/slug/branch/plan announcement",
-    ]) expect(workflow).toContain(marker);
-    expect(workflow).not.toContain("before the first phase 2 tool call");
-    expect(workflow).not.toContain("do not invoke even a read");
+    ]) expect(workspace).toContain(marker);
+    for (const banned of ["before the first phase 2 tool call", "do not invoke even a read"]) {
+      expect(direction).not.toContain(banned);
+      expect(workspace).not.toContain(banned);
+    }
     const ordered = [
       "title: `<title>`", "slug: `<feature-slug>`", "branch: `feature/<feature-slug>`",
       "plan: `doc/plan/<feature-slug>/`", "race disclosure:",
     ];
     for (let index = 0; index < ordered.length - 1; index += 1) {
-      expectBefore(workflow, ordered[index]!, ordered[index + 1]!);
+      expectBefore(direction, ordered[index]!, ordered[index + 1]!);
     }
-    expectBefore(workflow, "repeat the entire fetched/filesystem/ref collision preflight", "repeat the full title/slug/branch/plan announcement");
+    expectBefore(workspace, "repeat the entire fetched/filesystem/ref collision preflight", "repeat the full title/slug/branch/plan announcement");
   });
 
   it("uses canonical issue numbers and exact frozen Title through ticket creation", () => {
@@ -280,14 +314,14 @@ describe("description-based naming contract", () => {
   });
 
   it("uses pushRemote for resolved maintainer operations and confines origin to the git-only degrade", () => {
-    const workflow = collapsed("references/workflow-detail.md");
+    const workspace = collapsed("references/phase-2-workspace.md");
     const handoff = collapsed("references/handoff.md");
     for (const marker of [
       "refs/remotes/<pushremote>/head", "git remote show <pushremote>", "git fetch <pushremote>",
       "<pushremote>/<targetdefault>", "git push -u <pushremote> feature/<feature-slug>",
       "<pushremote>/feature/<feature-slug>",
-    ]) expect(`${workflow} ${handoff}`).toContain(marker);
-    expect(workflow).toContain("only the explicit no-`gh` git-only degrade uses literal `origin`");
+    ]) expect(`${workspace} ${handoff}`).toContain(marker);
+    expect(workspace).toContain("only the explicit no-`gh` git-only degrade uses literal `origin`");
     expect(handoff).toContain("explicit no-`gh` git-only degrade alone reserves literal `origin`");
   });
 
@@ -340,19 +374,25 @@ describe("untrack-process-artifacts — implement-feature rework", () => {
   it("carries no plan—/review— commit SUBJECT anywhere, and keeps the task form", () => {
     // Anchor to the commit SUBJECT form ": plan — " / ": review — ", NEVER bare "review — " prose:
     // SKILL.md legitimately says "implementation and review — all in this session" and "only
-    // review — never dispatch one to implement". workflow-detail.md's only such hits were the commit
-    // grammar (now removed).
-    for (const relative of ["SKILL.md", "references/workflow-detail.md"]) {
+    // review — never dispatch one to implement". Scan the trunk plus every reference file — a
+    // banned subject form could reappear in any of them.
+    const files = [
+      "SKILL.md",
+      ...fs.readdirSync(REFERENCES_DIR).filter((name) => name.endsWith(".md")).map((name) => `references/${name}`),
+    ];
+    for (const relative of files) {
       const body = read(relative);
       expect(body, relative).not.toContain(": plan — ");
       expect(body, relative).not.toContain(": review — ");
-      // The task commit subject form still ships in both files.
-      expect(body, relative).toContain("t<task-number> — ");
+    }
+    // The task commit subject form still ships in the trunk and the Phase 7 grammar home.
+    for (const relative of ["SKILL.md", "references/phase-7-implementation.md"]) {
+      expect(read(relative), relative).toContain("t<task-number> — ");
     }
   });
 
   it("classifies resume from the on-disk plan folder + feature.md heading, not plan—/review— commit agreement", () => {
-    const body = collapsed("references/workflow-detail.md");
+    const body = collapsed("references/resume-and-aborting.md");
     // Reconstruction reads the surviving worktree on disk, not a committed tree.
     expect(body).toContain("on-disk (gitignored) plan folder");
     expect(body).toContain(
@@ -597,5 +637,84 @@ describe("Phase 8 coordinator-run advisory issue search", () => {
     expect(body).toContain("metadata-only `html_url` scan is a *different* mechanism");
     // Negative pin: the metadata-only Rule 9 scan is NOT turned into a comment-body read.
     expect(body).not.toContain("scan the cached issue comments");
+  });
+});
+
+describe("progressive-phase-disclosure spine guards", () => {
+  // The corpus invariants: reference→reference links resolve, and the trunk keeps the
+  // read-on-entry spine — per-phase detail lives in references/ only because the spine forces the
+  // reads. All rename-proof — pinned
+  // to link/section shape, not filenames, so the corpus can evolve without touching this block.
+  const read = (relative: string): string =>
+    fs.readFileSync(path.join(SKILL_DIR, relative), "utf8").replace(/\r\n/g, "\n");
+  const collapsed = (relative: string): string => read(relative).toLowerCase().replace(/\s+/g, " ");
+
+  it("every reference-to-reference markdown link resolves from the references dir (fragments banned)", () => {
+    // Mirrors the cross-skill resolver's shape but resolves EVERY relative .md link from
+    // REFERENCES_DIR — the cross-skill test half-matches only the ../../ forms, so a renamed or
+    // deleted sibling reference could otherwise leave a dangling pointer. Capture the full link
+    // target before filtering: a naive \(...\.md\) pattern would silently SKIP an anchored
+    // `file.md#frag` link instead of failing it. The corpus is 100% fragment-free (bare `file.md`
+    // siblings plus `../../` cross-skill forms), so fragments are banned outright rather than
+    // stripped.
+    const refFiles = fs.readdirSync(REFERENCES_DIR).filter((n) => n.endsWith(".md"));
+    expect(refFiles.length).toBeGreaterThan(0);
+    let linksSeen = 0;
+    for (const name of refFiles) {
+      const text = read(`references/${name}`);
+      for (const match of text.matchAll(/\]\(([^)]+)\)/g)) {
+        const target = match[1]!;
+        // Only relative markdown-doc links; scheme-qualified targets (https:, mailto:) are not
+        // resolvable on disk and stay out of scope.
+        if (/^[a-z][a-z0-9+.-]*:/i.test(target) || !target.includes(".md")) continue;
+        linksSeen += 1;
+        expect(target, `${name} -> ${target}`).toMatch(/^(?:\.\/)?[A-Za-z0-9._/-]+\.md$/);
+        expect(fs.existsSync(path.resolve(REFERENCES_DIR, target)), `${name} -> ${target}`).toBe(
+          true,
+        );
+      }
+    }
+    expect(linksSeen).toBeGreaterThan(0);
+  });
+
+  it("keeps the read-on-entry re-read rule's kernel resident in the trunk", () => {
+    // The load-bearing mechanism of progressive disclosure: per-phase detail lives in references/
+    // on the strength of this rule, so its kernel must survive every trunk slimming — the
+    // verbatim-in-context test (with the compaction-summary exclusion) and the fail-closed
+    // refuse-writes clause. Loose substring pins on the kernel, not the surrounding prose.
+    const body = collapsed("SKILL.md");
+    expect(body).toContain("not verbatim in context");
+    expect(body).toContain("a compaction summary mentioning it does not count");
+    expect(body).toContain("an unreadable named reference refuses that phase's writes");
+  });
+
+  it("every entry-gated phase section keeps a MUST-read line naming a references/ file (count-agnostic)", () => {
+    // The phase spine, shape-pinned: split the trunk into ## sections and scan the Phase ones.
+    // Every phase section names at least one references/*.md; every phase with an `Entry:` event
+    // also carries a MUST-read line, so a slimming pass cannot silently drop the spine. Phase 0
+    // is the one legitimate exception — it runs at ref-parse time with no entry event (no
+    // `Entry:` line) — so at most ONE phase section may lack `Entry:`; a second one means a phase
+    // dropped its entry gate together with its read requirement.
+    const sections = read("SKILL.md")
+      .split(/\n(?=## )/)
+      .filter((section) => /^## Phase \d/.test(section));
+    expect(sections.length).toBeGreaterThan(0);
+    const entryGated = sections.filter((section) => /\bEntry:/.test(section));
+    const nonGated = sections.filter((section) => !/\bEntry:/.test(section));
+    expect(nonGated.length).toBeLessThanOrEqual(1);
+    // The one legitimate non-gated section is Phase 0 (ref-parse time, no entry event) — pinning
+    // its identity closes the two-edit hole where another phase de-gates while Phase 0 gains an
+    // `Entry:` line in the same change.
+    for (const section of nonGated) {
+      expect(section.split("\n", 1)[0]!).toMatch(/^## Phase 0\b/);
+    }
+    for (const section of sections) {
+      const heading = section.split("\n", 1)[0]!;
+      expect(section, heading).toMatch(/references\/[A-Za-z0-9_-]+\.md/);
+    }
+    for (const section of entryGated) {
+      const heading = section.split("\n", 1)[0]!;
+      expect(section.toLowerCase().replace(/\s+/g, " "), heading).toContain("must read");
+    }
   });
 });

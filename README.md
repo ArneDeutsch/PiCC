@@ -51,6 +51,9 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
 - **Subagents** — `.claude/agents/*.md` and the built-in agent types, with description-driven
   routing, parallel background fan-out (nesting is opt-in via `subagents.maxDepth`), per-agent
   tool gating, and worktree isolation.
+- **Subagent observability** — a live status panel of the whole agent tree with a drill-down per
+  agent (prompt, live transcript tail, final answer, stop/dismiss/steer), plus condensed,
+  expandable per-agent records in the chat transcript.
 - **Worktrees** — `EnterWorktree`/`ExitWorktree` with a real session-cwd swap and a
   Windows-tolerant lifecycle, for parallel sessions on one repo.
 - **Hooks** — 13 events (`PreToolUse` … `WorktreeRemove`) with Claude's stdin-JSON/stdout-decision
@@ -72,7 +75,8 @@ The full, always-current compatibility matrix is in
 
 Inside a session: `/skills` and `/agents` list the loaded corpus; `/doctor` gives the full
 compatibility breakdown; `/compat` shows/suppresses the startup notice; `/usage` reports a
-per-subagent token/cost breakdown; `/quota` reports provider quota headers.
+per-subagent token/cost breakdown; `/quota` reports provider quota headers; `alt+a` opens the
+subagent status panel.
 Every user-invocable skill appears in the `/` autocomplete menu. Model and per-model steering are
 configured outside the project — see the [user guide](doc/user-guide.md#5-control-surface-project-external).
 
