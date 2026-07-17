@@ -19,7 +19,9 @@ Resolve these four once at Phase 0 and carry them through the run; the fork hand
 ticket-creation offer consume them by these **exact** names:
 
 - **`target`** — the upstream `owner/repo` where issues live and any PR is based. Every `gh
-  issue`/`gh pr` call uses `--repo <target>`.
+  issue`/`gh pr` call uses `--repo <target>` — **except** the two Phase 0 ticket reads on a
+  **fork-only-URL** ref (the reachability `gh api` and the preflight `gh issue view`), which key on
+  the **issue-host** repo (the resolved fork `push`); see the fork-only URL-ref rule below.
 - **`push`** — the `owner/repo` our feature branch is pushed to: the fork on the fork path;
   **`== target`** on the maintainer path.
 - **`pushRemote`** — the local git remote **name** whose URL normalizes to `push` (found by URL
@@ -86,7 +88,16 @@ at it (`origin` in the ordinary case), `targetDefault` = the default branch reso
 > would **not** close the fork issue and **would wrongly close `target`'s own same-numbered issue** if
 > one exists (fork and upstream share a number sequence). So warn the user, emit a **bare cross-repo
 > `<fork-owner>/<fork-repo>#N`** (no closing keyword — Phase 9 step 5 below), and close the fork issue
-> by hand. Matching **neither** → STOP and ask. This is the detail home for the rule the resident
+> by hand. Matching the **fork only** also redirects the two **Phase 0 ticket reads** — the
+> reachability `gh api repos/<issue-host>/issues/<N>` and the preflight `gh issue view <N> --repo
+> <issue-host>` — to the fork as their **issue-host** repo (on a `target` match, or a `#N`/`N` ref, the
+> issue-host is `target`). The issue-host is keyed on the resolved, cross-verified `push`
+> (regex-validated `^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`, already carrying `isFork:true` and
+> `parent == target`) — **never** parsed out of the URL and **never** interpolated as the raw URL
+> string into a `gh` call (either would bypass that cross-check): the URL is a **selector matched by
+> value-equality only** (compared case-insensitively, any `..` segment rejected). Every **write**, the
+> **PR base**, and the Rule 9 dedup **reads** stay on `target` — only these two reads move. Matching
+> **neither** → STOP and ask. This is the detail home for the rule the resident
 > Phase 0 gate (`SKILL.md`) and Rule 3 ([ticket-integration.md](ticket-integration.md)) state
 > identically (those two are the single-sourced pair; this block only expands the rationale).
 
@@ -95,8 +106,8 @@ at it (`origin` in the ordinary case), `targetDefault` = the default branch reso
 An index — each rule is stated in full where it points:
 
 - **Phase 0 reachability gate** → resident in `SKILL.md` (required pushable github remote is
-  `pushRemote`, the fork on the fork path; a remoteless checkout still stops; issue reads use
-  `--repo <target>`).
+  `pushRemote`, the fork on the fork path; a remoteless checkout still stops; the Phase 0 issue reads
+  use `--repo <issue-host>` — the resolved fork (`push`) on a fork-only-URL ref, else `target`).
 - **Phase 2 default branch** → [workflow-detail.md](workflow-detail.md) Phase 2 (base on the target's
   **`targetDefault`**, fetched from the target via a temporary named remote, not the fork).
 - **Phase 1 fork disclosure** → the section below (surface the fork nature the moment it's resolved,

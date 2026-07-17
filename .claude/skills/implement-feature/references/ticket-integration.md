@@ -17,14 +17,23 @@ even though no ticket ref was given.
 
 Resolve `<owner/repo>` = the **resolved `target`** ([fork.md](fork.md)) — `origin`'s repo on a
 maintainer checkout, the upstream `parent` on a fork — and pass `--repo <target>` explicitly on every
-`gh` issue/PR call (a full-URL selector already encodes owner/repo — omit `--repo` then). The branch
+**write and the PR base**. Concretely, these all stay on `target`: the ticket comment, `gh pr create`
+(the PR base), `gh issue create` (both per-item create offers), and the Rule 9 dedup **reads**
+(`gh pr list`, `gh issue list`, and the `## What was built for #<N>` comment scan). **The one
+exception is the two Phase 0 ticket reads** — the reachability `gh api` and the preflight
+`gh issue view` — which key on the **issue-host** repo: on a **fork-only-URL** ref that is the resolved
+fork (`push`), not `target` ([fork.md](fork.md), the fork-only URL-ref rule); on every other ref the
+issue-host is `target`. (A full-URL selector already encodes owner/repo — omit `--repo` then.) The branch
 push, and only it, targets `pushRemote`/`push` (== `origin` on the maintainer path). `<default>` is
 `targetDefault`, the default branch Phase 2 resolves; `<N>` is the validated issue number.
 
 ## Reachability gate — failure draft message
 
 The gate logic lives resident in the router. When a precondition fails, tell the user with this draft
-(substitute the **actual** ref the user typed — never a hardcoded example — and the failing check):
+(substitute the **actual** ref the user typed — never a hardcoded example, and `user:token@`-stripped
+so an embedded credential never lands in the echoed draft, matching [fork.md](fork.md)'s other echo-site
+redactions — and the failing check; this stripping applies to **every** failing-check branch below,
+including the "different repo than the resolved target" one):
 
 > You ran `implement-feature <ref>`, but I can't start the ticket path: <the failing check — "gh not
 > found" / "gh auth status: not logged in" / "gh issue view <N>: 404 not found" / "no github remote to
@@ -162,7 +171,9 @@ coordinator re-authors), and structurally **zero** GitHub writes. It is **not** 
 shape). Point to the evaluate docs rather than restating them:
 
 - **INPUT shape** — redirect an existing issue's free text unread → dispatch the evaluator → take the
-  rating: [../../evaluate/references/issue-eval.md](../../evaluate/references/issue-eval.md).
+  rating: [../../evaluate/references/issue-eval.md](../../evaluate/references/issue-eval.md). The
+  redirect's `gh issue view --repo <issue-host>` targets the **issue-host** repo — the resolved fork
+  (`push`) on a fork-only-URL ref, else `target` ([fork.md](fork.md)).
 - **Redirect encoding** (Bash/UTF-8, **never** a PowerShell `>`) and the metadata-only idempotency
   `--jq html_url` form (Rule 9 below):
   [../../evaluate/references/write-discipline.md](../../evaluate/references/write-discipline.md).
