@@ -108,7 +108,7 @@ An index — each rule is stated in full where it points:
 - **Phase 0 reachability gate** → resident in `SKILL.md` (required pushable github remote is
   `pushRemote`, the fork on the fork path; a remoteless checkout still stops; the Phase 0 issue reads
   use `--repo <issue-host>` — the resolved fork (`push`) on a fork-only-URL ref, else `target`).
-- **Phase 2 default branch** → [workflow-detail.md](workflow-detail.md) Phase 2 (base on the target's
+- **Phase 2 default branch** → [phase-2-workspace.md](phase-2-workspace.md) (base on the target's
   **`targetDefault`**, fetched from the target via a temporary named remote, not the fork).
 - **Phase 1 fork disclosure** → the section below (surface the fork nature the moment it's resolved,
   any fork checkout, so the hand-off is never sprung at Phase 9).
@@ -169,7 +169,7 @@ the body until the rules are available** — do not distill a body with the rule
 **Procedure:**
 
 1. **Merge, then push to the fork.** Re-fetch the **target's** default via a temporary named remote
-   (as in Phase 2 — [workflow-detail.md](workflow-detail.md) Phase 2); if it moved, merge it into the
+   (as in Phase 2 — [phase-2-workspace.md](phase-2-workspace.md)); if it moved, merge it into the
    feature branch, resolve conflicts, and verify typecheck + full suite green again. Then apply
    [handoff.md](handoff.md) step 1's push-safety gate against `<pushRemote>` (the fork) for
    `git push -u <pushRemote> feature/<feature-slug>` — its first-push condition, established-self-owned

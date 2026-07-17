@@ -1,0 +1,34 @@
+# Phase 7 — Implementation loop & commit grammar
+
+Dispatch prompts are governed by [dispatch-discipline.md](dispatch-discipline.md) — read it before your first fan-out; if it cannot be read, do not dispatch.
+
+For each task, in planned order:
+
+1. **Dispatch** a fresh `implementer` subagent with the full worktree-root paths to `doc/plan/<feature-slug>/feature.md` and its task spec `doc/plan/<feature-slug>/tasks/t<task-number>-<task-slug>.md` (or their absolute joins), and these standing rules (relay them into the dispatch prompt):
+   - Read both files first; work in the worktree at `<path>`.
+   - Stay inside the writable surface. No workarounds, no mocking-away of problems, no scope creep.
+   - Never run `git commit` or `git push` — the coordinator owns all commits.
+   - `npm run typecheck` and `npm test` must be green (or no new failures vs. the recorded baseline).
+   - Keep an execution log at `doc/plan/<feature-slug>/log/t<task-number>.md` (always part of the writable surface): brief bullets while working — key decisions (especially on "Left open" items), deviations from the spec, friction, anything surprising found in the existing code.
+   - If the task cannot be implemented as specified, stop and report precisely why instead of improvising.
+
+   It reports what it did, test results, and any deviations. Fix subagents get the same rules plus the accepted findings, and append to the same log.
+2. **On escalation**, apply the boundary: fixable within this task's own spec → update the spec and re-dispatch a fresh subagent. Touches other tasks' contracts or the feature scope → stop, discuss with the user, update the plan, then continue. Before any re-dispatch, deal with the aborted attempt's leftovers: either reset the working tree to the last commit (keep the log file), or tell the new subagent exactly what partial work exists and whether to build on it.
+3. **Review fan-out**: first run `git add -A` in the worktree so the reviewers' `git diff HEAD` shows the *complete* change set — including newly-created untracked non-ignored files (new `src/`/`test/` files this task added but you haven't committed). This is **review visibility only**: it does not commit and does not widen the eventual commit (step 6 bounds that), and the gitignored plan folder is auto-excluded, so the on-disk log/`observations.md` are not staged. Re-stage before any re-review round, since a step-4 fix may have added more files. Then pick reviewers by surface touched (see roster; `coder` for any code, `security` whenever execution/permissions/paths are involved, `tester` when coverage might be thin, `user-experience`/`claude-parity` when their surfaces moved). **`docs` is not a judgement call**: dispatch it whenever the diff changes any documentation-bearing file — prose, markdown, *or code comments*, excluding the guide's out-of-scope set (prompt docs, `CLAUDE.md`, `doc/plan/**`, `examples/**`) — which is nearly every diff. Skip it only when the diff demonstrably carries no doc-bearing content **and implies no doc change** — no behavior a doc states (a comment-free `src/` diff that changes user-visible behavior still needs `docs`: that is the anti-drift case). It reviews against `doc/documentation-guide.md`. Give each the worktree path and have it run `git diff HEAD` there itself — now complete, so a new file that exists but was untracked no longer draws a false "missing artifact" finding — plus the full `doc/plan/<feature-slug>/…` paths to the task spec and execution log: is the task *fully* done per spec? What must be fixed? What should be refactored (duplication, extraction, dead code, missing tests, unclear docs)? Also ask them to flag friction with the spec or process itself — that feeds `observations.md`. Reviewers stay read-only — they do not stage or commit.
+4. **Triage and fix**: weigh the findings; drop what's wrong, apply trivial fixes yourself, dispatch an `implementer` (fix mode) for larger ones. Re-review only what a fix meaningfully changed. Don't loop forever — after ~3 non-converging rounds, take it to the user.
+5. **Distill observations**: skim the execution log and review reports and append what matters to `observations.md` in the plan folder — friction, planning errors, bugs discovered in existing code, refactoring opportunities, process weaknesses. Dated bullets, one line each; this is raw material for `review.md`, not prose. Surface anything major (a real bug, a plan built on a wrong assumption, a systemic process problem) to the user right away rather than sitting on it until close.
+6. **Gate and commit**: verify yourself that typecheck and the full suite are green. Step 3 left everything staged for review visibility, so **bound the commit surface before committing**: inspect `git status` / the staged set and commit **only** the task's intended **tracked product and doc changes** — never a blank `git add -A && git commit` (that same `git add -A` also caught any `.env`, stray temp file, or symlink a task dropped, none of which are gitignored). Keep `--body-file` bodies and any redirect temp files in OS-temp **outside** the worktree (Rule 1) — staging now makes any stray in-worktree temp file committable, so that discipline matters more. Then commit: `<feature-slug>: t<task-number> — <description>`. The execution log and the `observations.md` update stay on disk — both are gitignored — and are not part of the commit. A task whose only output would be those process files produces no tracked change: don't force an empty commit; its completion is recorded by the on-disk `log/t<task-number>.md` a resume reads.
+
+## Commit grammar & the pre-commit hook
+
+The commit grammar (also summarized resident in the router):
+
+- Task: `<feature-slug>: t<task-number> — <description>`
+- Fixes/close work: `<feature-slug>: <description>`
+- Merge commits keep git's default subject.
+
+The plan folder and `review.md` are worktree-local gitignored scratch, so there is no plan-approval or close-review commit — Phase 6 ends uncommitted and Phase 8 writes `review.md` to disk without committing it.
+
+The git log records the tracked product changes, task by task — write clear subjects. The plan-approval and close-review chapters are deliberately absent from it, so the log tells the story of the shipped *code*, not the full planning narrative.
+
+Every commit triggers the **pre-commit hook** (`.githooks/pre-commit`) — the unit + offline-integration suite (a couple of minutes). A hook failure is a real test failure: fix and commit again; never bypass with `--no-verify`. If it doesn't fire (fresh clone, `--ignore-scripts`), wire it: `git config core.hooksPath .githooks`.

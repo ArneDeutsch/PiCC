@@ -180,8 +180,8 @@ Phase 1/Phase 2 sites need only note the created-ticket exception ("except the f
 approved, filed at Phase 3"). But once the issue is filed it is **public and open**, so the **Aborting**
 text must **name** it (with its URL) rather than claim the ticket is untouched — an abandoned run leaves
 a real, filed issue the user may want to keep or close (never close it yourself — Rule 5). See the
-resident Aborting qualification in `SKILL.md`, and [workflow-detail.md](workflow-detail.md)
-(Phase 1/Phase 2).
+resident Aborting qualification in `SKILL.md`, and
+[phase-1-direction.md](phase-1-direction.md) / [phase-2-workspace.md](phase-2-workspace.md).
 
 ## Decline
 

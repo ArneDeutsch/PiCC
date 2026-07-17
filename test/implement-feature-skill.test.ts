@@ -114,8 +114,8 @@ describe("description-based naming contract", () => {
     expect(firstIndex).toBeLessThan(secondIndex);
   };
 
-  it("keeps the Phase 2 validation contract and collision/race backstops in workflow-detail.md (loose floor)", () => {
-    const body = collapsed("references/workflow-detail.md");
+  it("keeps the Phase 2 validation contract and collision/race backstops in phase-2-workspace.md (loose floor)", () => {
+    const body = collapsed("references/phase-2-workspace.md");
     // Floor 5 — Phase 2 validation contract (kept verbatim: slug regex, bound, device list, ref-check).
     expect(body).toContain("^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$");
     expect(body).toContain("3–48 characters");
@@ -137,12 +137,12 @@ describe("description-based naming contract", () => {
     expect(body).toContain("identity finalized and immutable");
   });
 
-  it("keeps the resident identity floor in the router (gate/announcement detail lives in workflow-detail.md)", () => {
+  it("keeps the resident identity floor in the router (gate/announcement detail lives in the phase files)", () => {
     // Residency contract: the trunk keeps only the
     // always-resident identity kernels — resume classification, the task commit subject, fail-closed
     // slug validation, the resume confirmation gate, the race-deletion warning, and the repush
     // confirmation. The presentation-gate and announcement-field detail is deliberately
-    // load-on-demand in references/workflow-detail.md, pinned by the "hard pre-tool presentation
+    // load-on-demand in references/phase-1-direction.md, pinned by the "hard pre-tool presentation
     // gate" test below — do not re-pin that prose against the trunk.
     const body = collapsed("SKILL.md");
     expect(body).toContain("classify resume before new naming");
@@ -159,7 +159,7 @@ describe("description-based naming contract", () => {
     // non-ignored files so a reviewer's view is complete — guarding against a silent regression to
     // bare `git diff HEAD`, which has recurred repeatedly in practice. Accept either mechanism
     // (`git add -A` staging or a reviewer `git status --short` read); no brittle exact-phrase pin.
-    const body = collapsed("references/workflow-detail.md");
+    const body = collapsed("references/phase-7-implementation.md");
     expect(body).toMatch(/git add -a|git status --short/);
   });
 
@@ -174,12 +174,12 @@ describe("description-based naming contract", () => {
   it("keeps public ticket titles model-authored, bounded, and body-file-quoted (loose floor)", () => {
     // Loose representatives of the title-quoting contract: independent authorship, the 120-char
     // single-line bound, and --body-file at each write site — not the exhaustive phrase list.
-    const workflow = collapsed("references/workflow-detail.md");
+    const direction = collapsed("references/phase-1-direction.md");
     const creation = collapsed("references/ticket-creation.md");
     const integration = collapsed("references/ticket-integration.md");
     const handoff = collapsed("references/handoff.md");
-    expect(workflow).toContain("printable ascii, single-line, at most 120 characters");
-    expect(workflow).toContain("do not directly copy, interpolate, slugify, or mechanically transform raw ticket title/body text");
+    expect(direction).toContain("printable ascii, single-line, at most 120 characters");
+    expect(direction).toContain("do not directly copy, interpolate, slugify, or mechanically transform raw ticket title/body text");
     expect(creation).toContain('gh issue create --repo <target> --title "<title>" --body-file <path>');
     expect(integration).toContain("pass the complete title as one quoted argument");
     expect(handoff).toContain('--title "<title>" --body-file <path>');
@@ -214,10 +214,10 @@ describe("description-based naming contract", () => {
   });
 
   it("pins all commit forms and retained GitHub/task-local numbering", () => {
-    const workflow = collapsed("references/workflow-detail.md");
+    const implementation = collapsed("references/phase-7-implementation.md");
     for (const form of [
       "<feature-slug>: t<task-number> — <description>", "<feature-slug>: <description>",
-    ]) expect(workflow).toContain(form);
+    ]) expect(implementation).toContain(form);
     expect(read("references/ticket-integration.md")).toContain("#N");
     expect(read("references/templates.md")).toContain("<task-number>");
     expect(read("references/templates.md")).toContain("t01");
@@ -234,7 +234,10 @@ describe("description-based naming contract", () => {
   });
 
   it("pins the workflow's hard pre-tool presentation gate, replacement, and residual-race disclosure", () => {
-    const workflow = collapsed("references/workflow-detail.md");
+    // The gate/announcement prose lives in phase-1-direction.md; the collision re-announcement loop
+    // lives in phase-2-workspace.md step 2 — each marker is pinned in the file that holds it.
+    const direction = collapsed("references/phase-1-direction.md");
+    const workspace = collapsed("references/phase-2-workspace.md");
     for (const marker of [
       "hard presentation gate", "immediately after the explicit build go", "first read the references required for phase 2",
       "required reference reads are the only tool calls allowed before the announcement",
@@ -243,19 +246,23 @@ describe("description-based naming contract", () => {
       "may share the same assistant response with later tool calls", "requires no user reply",
       "after the required reference reads, do not invoke a workspace, fetch, validation, preflight, mutating command, or `enterworktree` before this prose is visible",
       "collision checks cover shared/fetched state but cannot eliminate simultaneous or disconnected same-slug races",
+    ]) expect(direction).toContain(marker);
+    for (const marker of [
       "author and revalidate a more specific descriptive slug", "repeat the entire fetched/filesystem/ref collision preflight",
       "repeat the full title/slug/branch/plan announcement",
-    ]) expect(workflow).toContain(marker);
-    expect(workflow).not.toContain("before the first phase 2 tool call");
-    expect(workflow).not.toContain("do not invoke even a read");
+    ]) expect(workspace).toContain(marker);
+    for (const banned of ["before the first phase 2 tool call", "do not invoke even a read"]) {
+      expect(direction).not.toContain(banned);
+      expect(workspace).not.toContain(banned);
+    }
     const ordered = [
       "title: `<title>`", "slug: `<feature-slug>`", "branch: `feature/<feature-slug>`",
       "plan: `doc/plan/<feature-slug>/`", "race disclosure:",
     ];
     for (let index = 0; index < ordered.length - 1; index += 1) {
-      expectBefore(workflow, ordered[index]!, ordered[index + 1]!);
+      expectBefore(direction, ordered[index]!, ordered[index + 1]!);
     }
-    expectBefore(workflow, "repeat the entire fetched/filesystem/ref collision preflight", "repeat the full title/slug/branch/plan announcement");
+    expectBefore(workspace, "repeat the entire fetched/filesystem/ref collision preflight", "repeat the full title/slug/branch/plan announcement");
   });
 
   it("uses canonical issue numbers and exact frozen Title through ticket creation", () => {
@@ -271,14 +278,14 @@ describe("description-based naming contract", () => {
   });
 
   it("uses pushRemote for resolved maintainer operations and confines origin to the git-only degrade", () => {
-    const workflow = collapsed("references/workflow-detail.md");
+    const workspace = collapsed("references/phase-2-workspace.md");
     const handoff = collapsed("references/handoff.md");
     for (const marker of [
       "refs/remotes/<pushremote>/head", "git remote show <pushremote>", "git fetch <pushremote>",
       "<pushremote>/<targetdefault>", "git push -u <pushremote> feature/<feature-slug>",
       "<pushremote>/feature/<feature-slug>",
-    ]) expect(`${workflow} ${handoff}`).toContain(marker);
-    expect(workflow).toContain("only the explicit no-`gh` git-only degrade uses literal `origin`");
+    ]) expect(`${workspace} ${handoff}`).toContain(marker);
+    expect(workspace).toContain("only the explicit no-`gh` git-only degrade uses literal `origin`");
     expect(handoff).toContain("explicit no-`gh` git-only degrade alone reserves literal `origin`");
   });
 
@@ -331,19 +338,25 @@ describe("untrack-process-artifacts — implement-feature rework", () => {
   it("carries no plan—/review— commit SUBJECT anywhere, and keeps the task form", () => {
     // Anchor to the commit SUBJECT form ": plan — " / ": review — ", NEVER bare "review — " prose:
     // SKILL.md legitimately says "implementation and review — all in this session" and "only
-    // review — never dispatch one to implement". workflow-detail.md's only such hits were the commit
-    // grammar (now removed).
-    for (const relative of ["SKILL.md", "references/workflow-detail.md"]) {
+    // review — never dispatch one to implement". Scan the trunk plus every reference file — a
+    // banned subject form could reappear in any of them.
+    const files = [
+      "SKILL.md",
+      ...fs.readdirSync(REFERENCES_DIR).filter((name) => name.endsWith(".md")).map((name) => `references/${name}`),
+    ];
+    for (const relative of files) {
       const body = read(relative);
       expect(body, relative).not.toContain(": plan — ");
       expect(body, relative).not.toContain(": review — ");
-      // The task commit subject form still ships in both files.
-      expect(body, relative).toContain("t<task-number> — ");
+    }
+    // The task commit subject form still ships in the trunk and the Phase 7 grammar home.
+    for (const relative of ["SKILL.md", "references/phase-7-implementation.md"]) {
+      expect(read(relative), relative).toContain("t<task-number> — ");
     }
   });
 
   it("classifies resume from the on-disk plan folder + feature.md heading, not plan—/review— commit agreement", () => {
-    const body = collapsed("references/workflow-detail.md");
+    const body = collapsed("references/resume-and-aborting.md");
     // Reconstruction reads the surviving worktree on disk, not a committed tree.
     expect(body).toContain("on-disk (gitignored) plan folder");
     expect(body).toContain(

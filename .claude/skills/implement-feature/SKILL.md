@@ -24,7 +24,7 @@ This router is the always-loaded trunk; each phase skeleton names the `reference
 - **Direction before proposal.** Ask for direction first; don't open with a plan the user must argue against.
 - **You own every commit.** Subagents never run `git commit` or `git push` — relay this verbatim into every write-access dispatch.
 - **Late decisions.** Decide in the plan only what tasks need to compose (seams, interfaces, ordering); leave the rest to the implementer as explicit left-open items.
-- **No status bookkeeping.** State = the git log + the on-disk plan folder. **Classify resume before new naming**, and on classifying a resume you MUST read `references/workflow-detail.md` (Resume classification) before the confirmation gate — if it cannot be read, stop. Validate the frozen title against the on-disk `feature.md` heading (exact agreement) and show it verbatim at explicit human confirmation of scope/phase/identity/ticket/writes and fresh anchor/issue-host agreement. **Anchor reader:** before create-offer, read `feature.md`'s `Ticket:` — blank/placeholder → offer; valid sanitized ref → ticket path, re-resolve identities/cache (`references/ticket-creation.md`).
+- **No status bookkeeping.** State = the git log + the on-disk plan folder. **Classify resume before new naming**, and on classifying a resume you MUST read `references/resume-and-aborting.md` before the confirmation gate — if it cannot be read, stop. Validate the frozen title against the on-disk `feature.md` heading (exact agreement) and show it verbatim at explicit human confirmation of scope/phase/identity/ticket/writes and fresh anchor/issue-host agreement. **Anchor reader:** before create-offer, read `feature.md`'s `Ticket:` — blank/placeholder → offer; valid sanitized ref → ticket path, re-resolve identities/cache (`references/ticket-creation.md`).
 - **Structural escalation boundary.** A gap inside the current task's own spec → adapt and continue; anything touching another task's contract, feature scope, or the WHAT/WHY → stop and ask.
 - **Observe while you build.** Capture friction, planning errors, and latent bugs as they appear (implementers in task logs, you in `observations.md`); surface major ones at once; distill into `review.md` at close.
 - **Verify claims.** When reports conflict or a claim is load-bearing, read the code yourself first.
@@ -90,35 +90,35 @@ Then run the **incoming-ticket evaluation preflight** (read-only, **zero** GitHu
 
 ## Phase 1 — Direction (WHAT / WHY)
 
-Entry: skill start; Phase 0 first on a ticket ref. Converge on WHAT/WHY (value, scope, non-goals; not HOW), show the **scope mirror** (*You asked for* / *WILL* / *will NOT*), and ask for go — only explicit "go" starts Phase 2; **write nothing into the repo before then.** A ticket extends the mirror with its write-contract; a fork checkout (ticketless too) adds the early disclosure (`references/fork.md`); ticketless with GitHub reachable → the create-offer before go (`references/ticket-creation.md`). You MUST read `references/workflow-detail.md` (Phase 1) on entry. Immediately after build go, first read the Phase 2 references (workflow-detail.md Phase 2; fork.md already read at Phase 0 with a remote); then the identity announcement — user-visible prose — precedes every workspace, preflight, or mutating command and `EnterWorktree`.
+Entry: skill start; Phase 0 first on a ticket ref. Converge on WHAT/WHY (value, scope, non-goals; not HOW), show the **scope mirror** (*You asked for* / *WILL* / *will NOT*), and ask for go — only explicit "go" starts Phase 2; **write nothing into the repo before then.** A ticket extends the mirror with its write-contract; a fork checkout (ticketless too) adds the early disclosure (`references/fork.md`); ticketless with GitHub reachable → the create-offer before go (`references/ticket-creation.md`). You MUST read `references/phase-1-direction.md` on entry. Immediately after build go, first read the Phase 2 references (`references/phase-2-workspace.md`; fork.md already read at Phase 0 with a remote); then the identity announcement — user-visible prose — precedes every workspace, preflight, or mutating command and `EnterWorktree`.
 
 ## Phase 2 — Workspace
 
-Entry: explicit build go, announcement emitted. Validate `<feature-slug>` and preflight collisions; validation fails closed — never sanitize/add a counter. **EnterWorktree, then non-forcing `git switch -c feature/<feature-slug>`** — create-or-reenter may delete a raced unregistered directory. Then bootstrap and run the baseline. You MUST read `references/workflow-detail.md` (Phase 2) before running any workspace command.
+Entry: explicit build go, announcement emitted. Validate `<feature-slug>` and preflight collisions; validation fails closed — never sanitize/add a counter. **EnterWorktree, then non-forcing `git switch -c feature/<feature-slug>`** — create-or-reenter may delete a raced unregistered directory. Then bootstrap and run the baseline. You MUST read `references/phase-2-workspace.md` before running any workspace command.
 
 ## Phase 3 — Feature spec
 
-Entry: worktree and branch exist. Create `doc/plan/<feature-slug>/`, write `feature.md` — WHAT/WHY, **no HOW**; the `Ticket:` anchor line; `## Tasks` placeholder. An accepted create-offer files its issue here (`references/ticket-creation.md` FILE step). You MUST read `references/workflow-detail.md` (Phase 3) and the feature.md template in `references/templates.md` before writing it.
+Entry: worktree and branch exist. Create `doc/plan/<feature-slug>/`, write `feature.md` — WHAT/WHY, **no HOW**; the `Ticket:` anchor line; `## Tasks` placeholder. An accepted create-offer files its issue here (`references/ticket-creation.md` FILE step). You MUST read `references/phase-3-feature-spec.md` and the feature.md template in `references/templates.md` before writing it.
 
 ## Phase 4 — HOW investigation
 
-Entry: feature.md written. Fan out relevant specialists (and `generalist` for cross-surface questions) in investigate mode and integrate into one technical picture. Escalate only direction-deciding questions; batch small ones. You MUST read `references/workflow-detail.md` (Phase 4 — and Dispatch-reference discipline before any fan-out prompt) on entry.
+Entry: feature.md written. Fan out relevant specialists (and `generalist` for cross-surface questions) in investigate mode and integrate into one technical picture. Escalate only direction-deciding questions; batch small ones. You MUST read `references/phase-4-how-investigation.md` on entry — and `references/dispatch-discipline.md` before any fan-out prompt.
 
 ## Phase 5 — Task breakdown
 
-Entry: the technical picture stands. Split into implementer-sized tasks, write each `tasks/t<task-number>-<task-slug>.md`, order by dependency (each leaving the suite green), then **backfill feature.md's `## Tasks`**. Specs are self-contained, precise at the seams, deferred decisions under "Left open". You MUST read `references/workflow-detail.md` (Phase 5) and the task template in `references/templates.md` before writing the first spec.
+Entry: the technical picture stands. Split into implementer-sized tasks, write each `tasks/t<task-number>-<task-slug>.md`, order by dependency (each leaving the suite green), then **backfill feature.md's `## Tasks`**. Specs are self-contained, precise at the seams, deferred decisions under "Left open". You MUST read `references/phase-5-task-breakdown.md` and the task template in `references/templates.md` before writing the first spec.
 
 ## Phase 6 — Plan review & approval
 
-Entry: all task specs written. Fan reviewers over the whole plan folder in parallel (relevant specialists, an adversarial `generalist`, a `user-experience` walkthrough); integrate, fix what's clearly right, escalate WHAT/WHY changes or major HOW tradeoffs, iterate to mutual acceptance. Phase 6 ends **uncommitted**. You MUST read `references/workflow-detail.md` (Phase 6) before dispatching the review fan-out.
+Entry: all task specs written. Fan reviewers over the whole plan folder in parallel (relevant specialists, an adversarial `generalist`, a `user-experience` walkthrough); integrate, fix what's clearly right, escalate WHAT/WHY changes or major HOW tradeoffs, iterate to mutual acceptance. Phase 6 ends **uncommitted**. You MUST read `references/phase-6-plan-review.md` before dispatching the review fan-out.
 
 ## Phase 7 — Implementation loop
 
-Entry: plan accepted. For each task, in planned order: **dispatch** a fresh `implementer` with feature.md + task spec + the standing rules; apply the escalation boundary; run the **review fan-out** yourself; **triage and fix**; **distill** into `observations.md`; then **gate on green and commit** `<feature-slug>: t<task-number> — <description>`, staging bounded. The standing rules, fan-out staging, and the full loop: `references/workflow-detail.md` (Phase 7) — you MUST read it before dispatching.
+Entry: plan accepted. For each task, in planned order: **dispatch** a fresh `implementer` with feature.md + task spec + the standing rules; apply the escalation boundary; run the **review fan-out** yourself; **triage and fix**; **distill** into `observations.md`; then **gate on green and commit** `<feature-slug>: t<task-number> — <description>`, staging bounded. The standing rules, fan-out staging, and the full loop: `references/phase-7-implementation.md` — you MUST read it before dispatching.
 
 ## Phase 8 — Feature close review
 
-Entry: all tasks committed. Review the whole feature against feature.md (relevant roster over the feature diff + adversarial `generalist`); fix small things, spec real gaps as new tasks through Phase 7; write `review.md` to disk, **uncommitted**. You MUST read `references/workflow-detail.md` (Phase 8) on entry, and `references/ticket-integration.md` (Phase 8 hooks) before any hook write.
+Entry: all tasks committed. Review the whole feature against feature.md (relevant roster over the feature diff + adversarial `generalist`); fix small things, spec real gaps as new tasks through Phase 7; write `review.md` to disk, **uncommitted**. You MUST read `references/phase-8-close-review.md` on entry, and `references/ticket-integration.md` (Phase 8 hooks) before any hook write.
 
 ## Phase 9 — Integrate, push, hand off
 
@@ -126,6 +126,6 @@ Entry: close review agreed. Merge a moved default and verify green, then push `f
 
 ## Aborting, layout & commits
 
-- **Aborting/backtracking** — plan rejected → back to Phase 4 (or 1); abandoned → ExitWorktree `action: keep`, tell the user what exists and how to delete it — **never delete their work yourself** — and name any created ticket / filed issues. Detail: `references/workflow-detail.md` (Aborting and backtracking).
+- **Aborting/backtracking** — plan rejected → back to Phase 4 (or 1); abandoned → ExitWorktree `action: keep`, tell the user what exists and how to delete it — **never delete their work yourself** — and name any created ticket / filed issues. Detail: `references/resume-and-aborting.md`.
 - **Plan folder layout** — `references/templates.md`.
-- **Commit grammar** — task: `<feature-slug>: t<task-number> — <description>`; fixes/close work: `<feature-slug>: <description>`; merge commits keep git's default subject. Detail + the pre-commit hook (never `--no-verify`): `references/workflow-detail.md`.
+- **Commit grammar** — task: `<feature-slug>: t<task-number> — <description>`; fixes/close work: `<feature-slug>: <description>`; merge commits keep git's default subject. Detail + the pre-commit hook (never `--no-verify`): `references/phase-7-implementation.md`.
