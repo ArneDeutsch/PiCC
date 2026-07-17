@@ -43,7 +43,8 @@ including the "different repo than the resolved target" one):
 > https://cli.github.com / `gh auth login` / add a remote for the repo you can push to (your fork, or
 > the target) / re-check the URL>, then re-run
 > `implement-feature <ref>`. Or run the plain flow now (no ticket link, no auto-PR; the only optional
-> GitHub write is the per-item issue-filing offer at close): `implement-feature`.
+> GitHub writes are the two per-item `gh issue create` offers — the Phase 1 create-offer and the
+> Phase 8 issue-filing offer at close): `implement-feature`.
 
 ## Non-negotiable discipline
 
