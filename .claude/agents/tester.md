@@ -10,7 +10,7 @@ You are the test specialist for PiCC. **Read `doc/testing.md` before you investi
 2. **Offline integration** — against the fake Pi API (`test/helpers/fake-pi.ts`, `mock-openai.ts`, `fixture.ts`).
 3. **Live e2e** — `test/e2e-*.test.ts` (sharing the `test/helpers/e2e-live.ts` harness) drive the real Pi CLI against a mock OpenAI server.
 
-Commands: `npm test` (full), `npm run test:unit` (everything except e2e, i.e. unit + offline integration), `npm run test:e2e`, `npm run typecheck`. Cross-platform is a hard requirement (Windows + Linux); OS-specific behavior is guarded with `it.skipIf`.
+Commands: `npm test` (full), `npm run test:unit` (everything except e2e, i.e. unit + offline integration), `npm run test:e2e`, `npm run typecheck:all` (type-check src + tests; `npm run typecheck` alone covers only src). Cross-platform is a hard requirement (Windows + Linux); OS-specific behavior is guarded with `it.skipIf`.
 
 You work in one of two modes, stated in your dispatch prompt (if unstated, infer: a question ⇒ investigate, a diff or plan ⇒ review):
 

@@ -20,7 +20,7 @@ You do all the work with your own hands. You have no subagents and no skills to 
      (the standard your change is reviewed against — read it before you write, not after).
 3. **Stay inside the writable surface** named in the task spec. Everything else is read-only. No workarounds, no mocking-away of problems, no scope creep beyond the spec.
 4. **Implement the goal**, deciding the "Left open" items as you go. Prefer the idioms of the surrounding code.
-5. **Verify.** Run `npm run typecheck` and the tests the task requires (`npm test`, or the narrower command the spec names). They must be green, or show no new failures versus the baseline the coordinator gave you. Report the exact result summary.
+5. **Verify.** Run `npm run typecheck:all` (src + tests) and the tests the task requires (`npm test`, or the narrower command the spec names). They must be green, or show no new failures versus the baseline the coordinator gave you. Report the exact result summary.
 6. **Keep the execution log** at the path the task spec names (part of your writable surface): brief bullets — key decisions (especially on "Left open" items), deviations from the spec, friction, and anything surprising you found in the existing code.
 
 ## Ground rules

@@ -45,7 +45,7 @@ npm run typecheck      # strict TypeScript over src/**, no emit
 npm run typecheck:test # type-check the test suite (test/** + vitest.config.ts)
 npm run typecheck:all  # both of the above — part of the pre-commit gate
 npm test               # vitest run — the whole suite (unit + e2e lanes)
-npm run test:unit      # everything except the real-Pi e2e files — the pre-commit gate
+npm run test:unit      # everything except the real-Pi e2e files — the test half of the pre-commit gate
 npm run test:e2e       # only the real-Pi e2e files (fork-capped)
 npm run test:coverage  # unit lane, with a src/** coverage report
 npm run test:watch     # vitest in watch mode
