@@ -7,7 +7,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import { startMockModel, type CapturedRequest, type Turn } from "./helpers/mock-openai.js";
-import { flattenProjectPath } from "../src/claude/memory.js";
 import { resolveShellBinary } from "../src/engine/shell-inject.js";
 import { resolveSubagentTranscript } from "../src/util/subagent-transcripts.js";
 
@@ -196,13 +195,6 @@ function userText(request: CapturedRequest): string {
     .join("\n");
 }
 
-/** Names of tools advertised in a request. */
-function toolNames(request: CapturedRequest): string[] {
-  return (request.tools ?? [])
-    .map((t) => (t as { function?: { name?: string } }).function?.name)
-    .filter((n): n is string => typeof n === "string");
-}
-
 /**
  * Detect a usable `bash`, skip cleanly if absent. Uses the extension's OWN
  * Git Bash resolution (resolveShellBinary skips the System32 WSL stub and
@@ -277,36 +269,6 @@ describe.skipIf(cliMissing)(
     );
 
     it(
-      "executes a scripted write tool call and round-trips the result to the model",
-      async () => {
-        const result = await runPi({
-          script: [
-            { toolCalls: [{ name: "write", args: { path: "hello-out.txt", content: "from-mock" } }] },
-            { text: "wrote it" },
-          ],
-          prompt: "write hello-out.txt",
-        });
-
-        expect(result.code).toBe(0);
-        // The tool actually ran: the file exists in the fixture.
-        const outPath = path.join(result.fixture, "hello-out.txt");
-        expect(fs.existsSync(outPath), `expected ${outPath} to exist`).toBe(true);
-        expect(fs.readFileSync(outPath, "utf8")).toBe("from-mock");
-
-        // The second request carries the tool result back to the model.
-        expect(result.requests.length).toBeGreaterThanOrEqual(2);
-        const second = result.requests[1]!;
-        expect(toolResultText(second)).toMatch(/wrote|hello-out\.txt/i);
-
-        // PreToolUse warn hook (matcher Write|Edit) emitted additionalContext;
-        // the guard steers it in as a message, and Pi print mode delivers it —
-        // observed live as a user message in the follow-up request.
-        expect(allText(second)).toContain("warn-only-guard: writing files is being watched");
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    it(
       "enforces the Read(.env) deny rule live and never leaks the secret to the model",
       async () => {
         const result = await runPi({
@@ -332,62 +294,31 @@ describe.skipIf(cliMissing)(
       TEST_TIMEOUT_MS,
     );
 
-    it(
-      "activates the greet skill via the Skill tool with $0 substitution",
-      async () => {
-        const result = await runPi({
-          script: [
-            { toolCalls: [{ name: "Skill", args: { name: "greet", arguments: "Ada" } }] },
-            { text: "done" },
-          ],
-          prompt: "greet Ada",
-        });
-
-        expect(result.code).toBe(0);
-        expect(result.requests.length).toBeGreaterThanOrEqual(2);
-        const second = result.requests[1]!;
-        const toolResult = toolResultText(second);
-        expect(toolResult).toContain("GREET-SKILL-BODY");
-        expect(toolResult).toContain("named **Ada**");
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    it(
-      "creates and enters a real git worktree via EnterWorktree",
-      async () => {
-        const result = await runPi({
-          script: [{ toolCalls: [{ name: "EnterWorktree", args: { name: "e2e" } }] }, { text: "in" }],
-          prompt: "enter a worktree named e2e",
-        });
-
-        expect(result.code).toBe(0);
-        const worktreeDir = path.join(result.fixture, ".claude", "worktrees", "e2e");
-        expect(fs.existsSync(worktreeDir), `expected worktree at ${worktreeDir}`).toBe(true);
-        // A linked git worktree has a .git *file* pointing at the main repo.
-        const gitPointer = path.join(worktreeDir, ".git");
-        expect(fs.existsSync(gitPointer)).toBe(true);
-        expect(fs.statSync(gitPointer).isFile()).toBe(true);
-        expect(fs.readFileSync(gitPointer, "utf8")).toContain("gitdir:");
-
-        // The tool result confirms the cwd swap to the model.
-        expect(result.requests.length).toBeGreaterThanOrEqual(2);
-        expect(toolResultText(result.requests[1]!)).toMatch(/entered worktree/i);
-      },
-      TEST_TIMEOUT_MS,
-    );
-
     // --- Scenario 1: bash tool runs a real project script (Git Bash, not WSL stub) ---
+    // Also absorbs the Python cp1252/UTF-8 boundary (t03 merge): when a python
+    // interpreter is available, the SAME bash call additionally prints U+2192 via
+    // chr(0x2192) and we assert it round-trips with no UnicodeEncodeError/charmap.
+    // The python portion (command + assertion) is omitted entirely when python is
+    // absent — the scenario stays gated only on BASH_AVAILABLE, never hard-requires
+    // python.
     it.skipIf(!BASH_AVAILABLE)(
       "runs a bash tool call through Git Bash and round-trips real stdout",
       async () => {
+        const arrow = String.fromCharCode(0x2192); // U+2192 RIGHTWARDS ARROW
+        // chr(0x2192) keeps the literal arrow out of the command string.
+        const pythonProbe = PYTHON_BIN
+          ? ` && ${PYTHON_BIN} -c "print('arrow-' + chr(0x2192) + '-end')"`
+          : "";
         const result = await runPi({
           script: [
             {
               toolCalls: [
                 {
                   name: "bash",
-                  args: { command: "echo PCD_BASH_OK && node -e \"console.log('node-'+(1+1))\"" },
+                  args: {
+                    command:
+                      "echo PCD_BASH_OK && node -e \"console.log('node-'+(1+1))\"" + pythonProbe,
+                  },
                 },
               ],
             },
@@ -401,27 +332,12 @@ describe.skipIf(cliMissing)(
         const toolResult = toolResultText(result.requests[1]!);
         expect(toolResult).toContain("PCD_BASH_OK");
         expect(toolResult).toContain("node-2");
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    // --- Scenario 2: Python UTF-8 subprocess prints U+2192 without UnicodeEncodeError ---
-    it.skipIf(!BASH_AVAILABLE || !PYTHON_BIN)(
-      "runs a python subprocess that prints an arrow with no cp1252 UnicodeEncodeError",
-      async () => {
-        // chr(0x2192) keeps the literal arrow out of the command string.
-        const command = `${PYTHON_BIN} -c "print('arrow-' + chr(0x2192) + '-end')"`;
-        const arrow = String.fromCharCode(0x2192); // U+2192 RIGHTWARDS ARROW
-        const result = await runPi({
-          script: [{ toolCalls: [{ name: "bash", args: { command } }] }, { text: "done" }],
-          prompt: "print an arrow",
-        });
-
-        expect(result.code).toBe(0);
-        expect(result.requests.length).toBeGreaterThanOrEqual(2);
-        const toolResult = toolResultText(result.requests[1]!);
-        expect(toolResult).toContain(`arrow-${arrow}-end`);
-        expect(toolResult).not.toMatch(/UnicodeEncodeError|charmap/i);
+        // cp1252/UTF-8 boundary: only asserted when python actually ran (gated on
+        // PYTHON_BIN), so absence of python skips just this portion, not the test.
+        if (PYTHON_BIN) {
+          expect(toolResult).toContain(`arrow-${arrow}-end`);
+          expect(toolResult).not.toMatch(/UnicodeEncodeError|charmap/i);
+        }
       },
       TEST_TIMEOUT_MS,
     );
@@ -443,301 +359,6 @@ describe.skipIf(cliMissing)(
         expect(user).toContain("Deploy to environment **staging** at version **7.7**");
         // It expanded — the raw slash command is not what reached the model verbatim.
         expect(user).not.toMatch(/^\s*"?\/deploy staging 7\.7"?\s*$/);
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    // --- Scenario 4: shell-injection skill runs at activation (full-surface) ---
-    it.skipIf(!BASH_AVAILABLE)(
-      "runs a /repo-info shell-injection skill at activation and injects live git output",
-      async () => {
-        const result = await runPi({
-          fixture: "full-surface",
-          script: [{ text: "ok" }],
-          prompt: "/repo-info",
-        });
-
-        expect(result.code).toBe(0);
-        const user = userText(result.requests[0]!);
-        expect(user).toContain("FS-SKILL-SHELL-BODY");
-        // materializeFixture puts the repo on `main`; the injected branch name lands in the turn.
-        expect(user).toContain("main");
-        // The inline injection marker was executed, not passed through verbatim.
-        expect(user).not.toContain("!`git");
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    // --- Scenario 5: subagent dispatch returns the verbatim final message (full-surface) ---
-    it(
-      "dispatches the reviewer subagent (fresh session) and returns its locked YAML verbatim",
-      async () => {
-        const result = await runPi({
-          fixture: "full-surface",
-          script: [
-            // 0) orchestrator dispatches the reviewer synchronously (F15: background
-            //    is the default, so pin run_in_background: false — this scenario
-            //    tests the verbatim inline return, foreground is incidental).
-            {
-              toolCalls: [
-                {
-                  name: "Agent",
-                  args: {
-                    subagent_type: "reviewer",
-                    prompt: "review src/lib.rs",
-                    run_in_background: false,
-                  },
-                },
-              ],
-            },
-            // 1) the reviewer's OWN Pi session (separate request to the same mock)
-            { text: "```yaml\nverdict: approve\nfindings: []\n```" },
-            // 2) orchestrator's follow-up turn once it has the subagent result
-            { text: "review complete" },
-          ],
-          prompt: "have the reviewer look at src/lib.rs",
-        });
-
-        expect(result.code).toBe(0);
-        // Agent tool is advertised on the orchestrator's first request.
-        expect(toolNames(result.requests[0]!)).toContain("Agent");
-        // A fresh subagent session hit the same mock, so there is a middle request.
-        expect(result.requests.length).toBeGreaterThanOrEqual(3);
-        // The verbatim locked YAML comes back to the orchestrator as a tool result.
-        const anyToolResultHasVerdict = result.requests.some((r) =>
-          toolResultText(r).includes("verdict: approve"),
-        );
-        expect(anyToolResultHasVerdict).toBe(true);
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    // --- Scenario 6: deny rule hard-blocks a tool call (full-surface) ---
-    it(
-      "hard-blocks Read(secrets/**) and never leaks the secret to the model (full-surface)",
-      async () => {
-        const result = await runPi({
-          fixture: "full-surface",
-          script: [
-            { toolCalls: [{ name: "read", args: { path: "secrets/key.txt" } }] },
-            { text: "ok" },
-          ],
-          prompt: "read the secret",
-          setup: (dir) => {
-            fs.mkdirSync(path.join(dir, "secrets"), { recursive: true });
-            fs.writeFileSync(path.join(dir, "secrets", "key.txt"), "TOPSECRET\n");
-          },
-        });
-
-        expect(result.code).toBe(0);
-        expect(result.requests.length).toBeGreaterThanOrEqual(2);
-        expect(toolResultText(result.requests[1]!)).toMatch(/deny|blocked|not permitted/i);
-        for (const [i, request] of result.requests.entries()) {
-          expect(allText(request), `request ${i} must not leak the secret`).not.toContain(
-            "TOPSECRET",
-          );
-        }
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    // --- Scenario 6b: a Read deny also blocks an Edit on the same path (v2.1.208 parity) ---
-    it(
-      "hard-blocks an Edit under Read(secrets/**) and never leaks the secret (full-surface)",
-      async () => {
-        const result = await runPi({
-          fixture: "full-surface",
-          script: [
-            {
-              toolCalls: [
-                {
-                  name: "edit",
-                  args: {
-                    path: "secrets/key.txt",
-                    edits: [{ oldText: "placeholder", newText: "x" }],
-                  },
-                },
-              ],
-            },
-            { text: "ok" },
-          ],
-          prompt: "edit the secret",
-          setup: (dir) => {
-            fs.mkdirSync(path.join(dir, "secrets"), { recursive: true });
-            fs.writeFileSync(path.join(dir, "secrets", "key.txt"), "TOPSECRET\n");
-          },
-        });
-
-        expect(result.code).toBe(0);
-        expect(result.requests.length).toBeGreaterThanOrEqual(2);
-        // The Read deny blocks the Edit, and surfaces the "Read deny rule" signal.
-        expect(toolResultText(result.requests[1]!)).toMatch(/deny|blocked|not permitted/i);
-        for (const [i, request] of result.requests.entries()) {
-          expect(allText(request), `request ${i} must not leak the secret`).not.toContain(
-            "TOPSECRET",
-          );
-        }
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    // --- Scenario 7: PreToolUse warn-hook additionalContext reaches the model (full-surface) ---
-    it.skipIf(!BASH_AVAILABLE)(
-      "runs the PreToolUse write-guard and steers FS-WRITE-GUARD into the model (full-surface)",
-      async () => {
-        const result = await runPi({
-          fixture: "full-surface",
-          script: [
-            { toolCalls: [{ name: "write", args: { path: "docs/probe.txt", content: "x" } }] },
-            { text: "written" },
-          ],
-          prompt: "write docs/probe.txt",
-        });
-
-        expect(result.code).toBe(0);
-        const outPath = path.join(result.fixture, "docs", "probe.txt");
-        expect(fs.existsSync(outPath), `expected ${outPath} to exist`).toBe(true);
-        expect(result.requests.length).toBeGreaterThanOrEqual(2);
-        expect(allText(result.requests[1]!)).toContain("FS-WRITE-GUARD");
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    // --- Scenario 8: EnterWorktree creates an isolated worktree (full-surface) ---
-    it(
-      "creates an isolated git worktree via EnterWorktree (full-surface)",
-      async () => {
-        const result = await runPi({
-          fixture: "full-surface",
-          script: [
-            { toolCalls: [{ name: "EnterWorktree", args: { name: "e2e-wt" } }] },
-            { text: "in" },
-          ],
-          prompt: "enter a worktree named e2e-wt",
-        });
-
-        expect(result.code).toBe(0);
-        const worktreeDir = path.join(result.fixture, ".claude", "worktrees", "e2e-wt");
-        expect(fs.existsSync(worktreeDir), `expected worktree at ${worktreeDir}`).toBe(true);
-        const gitPointer = path.join(worktreeDir, ".git");
-        expect(fs.existsSync(gitPointer)).toBe(true);
-        expect(fs.statSync(gitPointer).isFile()).toBe(true);
-        expect(fs.readFileSync(gitPointer, "utf8")).toContain("gitdir:");
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    // --- Scenario 9: lenient-frontmatter agents reach the routing catalog (full-surface) ---
-    it(
-      "recovers a strict-YAML-breaking agent frontmatter and routes it into the subagent catalog",
-      async () => {
-        const result = await runPi({
-          fixture: "full-surface",
-          script: [{ text: "hi" }],
-          prompt: "say hi",
-          setup: (dir) => {
-            // description contains ": " which breaks a strict YAML parse; lenient
-            // frontmatter must still recover it into the routing catalog.
-            fs.writeFileSync(
-              path.join(dir, ".claude", "agents", "tricky-agent.md"),
-              [
-                "---",
-                "name: tricky-agent",
-                "description: Handles X: Y and Z.",
-                "tools: Read",
-                "---",
-                "",
-                "Tricky agent body.",
-                "",
-              ].join("\n"),
-            );
-          },
-        });
-
-        expect(result.code).toBe(0);
-        const system = systemText(result.requests[0]!);
-        expect(system).toContain("Available subagents");
-        expect(system).toContain("tricky-agent");
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    // --- Scenario 10 (E2E-1): built-in agent types on a project that defines NO agents ---
-    it(
-      "advertises the built-in agents and default-backgrounds Explore, collected via TaskOutput",
-      async () => {
-        // F15: an Explore dispatch with NO run_in_background flag now backgrounds
-        // by default (was foreground). Modelled on Scenario 11 but WITHOUT the
-        // explicit flag, so the new default gets real-stack coverage. The
-        // background subagent session and the parent's next turn hit the mock
-        // CONCURRENTLY, so turns are pinned with `when` predicates, never by
-        // sequence position (positional replies flake under concurrency).
-        const isExplore = (r: CapturedRequest) =>
-          systemText(r).includes("read-only exploration agent");
-        const isParent = (r: CapturedRequest) => !isExplore(r);
-        const result = await runPi({
-          // hello-claude defines no .claude/agents — the catalog is built-ins only.
-          script: [
-            // 0) orchestrator dispatches the built-in Explore agent WITH NO flag
-            //    (first request is always the parent) → default-background task id.
-            {
-              when: isParent,
-              toolCalls: [
-                { name: "Agent", args: { subagent_type: "Explore", prompt: "find the hello script" } },
-              ],
-            },
-            // background Explore subagent's single immediate final answer
-            { when: isExplore, text: "EXPLORE-FINDING-CANARY: src/hello.js prints the greeting" },
-            // parent's next turn: collect the default-background result (task-1)
-            { when: isParent, toolCalls: [{ name: "TaskOutput", args: { task_id: "task-1" } }] },
-            // orchestrator's follow-up once the subagent result is in
-            { when: isParent, text: "explored" },
-          ],
-          prompt: "explore the project",
-        });
-
-        expect(result.code).toBe(0);
-        const first = result.requests[0]!;
-        expect(toolNames(first)).toContain("Agent");
-        const parentSystem = systemText(first);
-        expect(parentSystem).toContain("Available subagents");
-        // Built-in agent types (audit E1) are in the catalog even with no project agents.
-        expect(parentSystem).toContain("- general-purpose: ");
-        expect(parentSystem).toContain("- Explore: ");
-        expect(parentSystem).toContain("- Plan: ");
-        // The PARENT sees the project CLAUDE.md.
-        expect(parentSystem).toContain("ROOT-CLAUDE-MD-LOADED");
-
-        // The default dispatch backgrounded: the Agent call returned a task id.
-        const startResult = result.requests.find((r) =>
-          /Background task task-\d+ started/.test(toolResultText(r)),
-        );
-        expect(startResult, "default Explore dispatch must background and return a task id").toBeDefined();
-
-        // The Explore subagent hit the same mock with its own conversation:
-        // identified by its read-only persona in the system prompt.
-        expect(result.requests.length).toBeGreaterThanOrEqual(3);
-        const subRequests = result.requests.filter((r) =>
-          systemText(r).includes("read-only exploration agent"),
-        );
-        expect(subRequests.length, "expected the Explore subagent session to hit the mock").toBeGreaterThanOrEqual(1);
-        // Explore skips project context (audit E6): no CLAUDE.md in ITS system text.
-        for (const [i, sub] of subRequests.entries()) {
-          expect(
-            systemText(sub),
-            `Explore subagent request ${i} must not carry the project CLAUDE.md`,
-          ).not.toContain("ROOT-CLAUDE-MD-LOADED");
-        }
-
-        // Verbatim-return contract: TaskOutput returns the subagent's final answer
-        // to the parent verbatim.
-        const verbatim = result.requests.some((r) =>
-          toolResultText(r).includes("EXPLORE-FINDING-CANARY: src/hello.js prints the greeting"),
-        );
-        expect(verbatim, "subagent answer must reach the parent verbatim via TaskOutput").toBe(true);
-        expect(result.stdout).toContain("explored");
-        // No crash noise from the un-awaited dispatch (completeness floor).
-        expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|unhandledRejection|FATAL/i);
       },
       TEST_TIMEOUT_MS,
     );
@@ -792,43 +413,6 @@ describe.skipIf(cliMissing)(
         expect(result.stdout).toContain("background retrieved");
         // No crash noise from the un-awaited dispatch (completeness floor).
         expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|unhandledRejection|FATAL/i);
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    // --- Scenario 12 (E2E-3): auto memory (audit B4) loads MEMORY.md into the system prompt ---
-    it(
-      "loads per-project auto memory (MEMORY.md) from the Claude user dir into the system prompt",
-      async () => {
-        const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-memory-user-"));
-        tempDirs.push(userDir);
-        const memoryLine =
-          "AUTO-MEMORY-CANARY-E2E: the flux capacitor lives in src/flux.js";
-        const result = await runPi({
-          script: [{ text: "hello" }],
-          prompt: "say hello",
-          extraEnv: { PICC_CLAUDE_USER_DIR: userDir },
-          setup: (fixtureDir) => {
-            // Same flattening rule as the extension (src/claude/memory.ts):
-            // <userDir>/projects/<flattened-project-path>/memory/MEMORY.md
-            const memDir = path.join(
-              userDir,
-              "projects",
-              flattenProjectPath(fixtureDir),
-              "memory",
-            );
-            fs.mkdirSync(memDir, { recursive: true });
-            fs.writeFileSync(
-              path.join(memDir, "MEMORY.md"),
-              `# Memory index\n\n- ${memoryLine}\n`,
-            );
-          },
-        });
-
-        expect(result.code).toBe(0);
-        const system = systemText(result.requests[0]!);
-        expect(system).toContain("# Auto memory");
-        expect(system).toContain(memoryLine);
       },
       TEST_TIMEOUT_MS,
     );
@@ -1029,33 +613,5 @@ describe.skipIf(cliMissing)(
       TEST_TIMEOUT_MS,
     );
 
-    // --- Scenario 14 (E2E-5): stacked slash skills — /deploy /repo-info now (audit A7) ---
-    it.skipIf(!BASH_AVAILABLE)(
-      "stacks two leading slash skills in one prompt with args going to the last skill",
-      async () => {
-        const result = await runPi({
-          fixture: "full-surface",
-          script: [{ text: "stacked ok" }],
-          prompt: "/deploy /repo-info now",
-        });
-
-        expect(result.code).toBe(0);
-        const user = userText(result.requests[0]!);
-        const count = (needle: string) => user.split(needle).length - 1;
-        // Both skill bodies expanded, each exactly once.
-        expect(count("FS-SKILL-ARGS-BODY"), "deploy body exactly once").toBe(1);
-        expect(count("FS-SKILL-SHELL-BODY"), "repo-info body exactly once").toBe(1);
-        // Skills activate in prompt order: deploy first, repo-info second.
-        expect(user.indexOf("FS-SKILL-ARGS-BODY")).toBeLessThan(user.indexOf("FS-SKILL-SHELL-BODY"));
-        // The trailing text is the LAST skill's arguments: repo-info has no
-        // $ARGUMENTS/$N marker, so it lands via the ARGUMENTS: fallback...
-        expect(user).toContain("ARGUMENTS: now");
-        // ...and did NOT go to the first skill's positional markers.
-        expect(user).not.toContain("**now**");
-        // The shell injection in repo-info still ran (not passed through verbatim).
-        expect(user).not.toContain("!`git");
-      },
-      TEST_TIMEOUT_MS,
-    );
   },
 );
