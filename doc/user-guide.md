@@ -21,12 +21,9 @@ in-memory model. From then on, on Pi's own agent loop:
   variable, and shell-injection processing — the body loads only on activation (progressive
   disclosure).
 - **Subagents** dispatch via the `Agent` tool into fresh, isolated sessions and return their final
-  message verbatim — with one exception: a `subagent_type: "fork"` dispatch **inherits the parent
-  conversation** instead of starting fresh (see §4). A failed dispatch is reported as a loud failure
-  naming the cause — never a silent empty success — and every run leaves a transcript on disk, shows
-  live progress while it runs, records its token/cost, and can be resumed or steered via
-  `SendMessage`. **Worktrees** swap
-  the session's working directory so the project's own git tooling detects worktree mode.
+  message verbatim; a failed dispatch is a loud failure naming the cause, never a silent empty
+  success. **Worktrees** swap the session's working directory so the project's own git tooling
+  detects worktree mode.
 
 Nothing is written to your project's tracked files. For the full design see
 [`doc/architecture.md`](architecture.md); for the exact compatibility matrix see
@@ -42,9 +39,8 @@ Nothing is written to your project's tracked files. For the full design see
 
 ## 2. Install
 
-Every command below is one line per step — paste them one at a time. They work identically in
-**PowerShell**, **cmd**, and **bash** (no `&&` chaining is used anywhere in this guide, because
-Windows PowerShell 5.1 does not support it).
+One line per step — paste them one at a time. They work identically in **PowerShell**, **cmd**, and
+**bash** (nothing in this guide uses `&&` chaining, which Windows PowerShell 5.1 does not support).
 
 ### Windows (PowerShell or cmd)
 
@@ -131,7 +127,7 @@ managed):
 | Artifact | Source |
 |---|---|
 | Instructions | `CLAUDE.md` (cwd ancestors up to the filesystem root, nested per-directory, `@import` expansion, `CLAUDE.local.md` siblings), `~/.claude/CLAUDE.md`, managed-policy CLAUDE.md (file or inline `claudeMd` settings key) |
-| Memory | auto memory: `MEMORY.md` (first 200 lines / 25 KB) from the per-project memory dir under `~/.claude/projects/…/memory`, with conservative write-back — memory is written only when you explicitly ask it to remember something (see note below) — gated by `autoMemoryEnabled` / `autoMemoryDirectory` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY`; agent `memory:` frontmatter scopes likewise |
+| Memory | auto memory: `MEMORY.md` from the per-project memory dir under `~/.claude/projects/…/memory`; gated by `autoMemoryEnabled` / `autoMemoryDirectory` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY`; agent `memory:` frontmatter scopes likewise |
 | Rules | `.claude/rules/**/*.md` (unconditional at start; `paths:`-scoped inject when you touch matching files) |
 | Skills | `.claude/skills/**/SKILL.md` (+ `~/.claude/skills`), lazy-loaded; `.claude/commands/**/*.md` legacy commands (recursive, `sub:name`-qualified on collisions) |
 | Agents | `.claude/agents/*.md` (+ user scope) plus the built-in `general-purpose`, `Explore`, and `Plan` types — dispatchable via the `Agent` tool |
@@ -139,203 +135,73 @@ managed):
 | Hooks | `settings.json` `hooks` (+ plugin hooks, + skill- and agent-scoped `hooks:`) |
 | Plugins | already-installed plugins from `~/.claude/plugins` + project-bundled `.claude-plugin/` |
 
-> **Auto memory is conservative by default.** PiCC loads `MEMORY.md` every session but writes
-> to it only when you explicitly ask it to remember something (e.g. "remember to…", "make a note
-> that…"). This is a deliberate divergence from Claude Code, which also writes proactively — the
-> conservative default keeps low-value entries from accreting in the memory that loads into every
-> session. To restore Claude-Code-style eager writes on a project, add to that project's
-> `CLAUDE.md`:
+> **Auto memory is conservative by default.** PiCC loads `MEMORY.md` every session but writes to
+> it only when you explicitly ask it to remember something (e.g. "remember to…"). This is a
+> deliberate divergence from Claude Code, which also writes proactively. To restore Claude-Code-style
+> eager writes, add an instruction like this to the project's `CLAUDE.md` — or, to opt in without
+> modifying the target project, to your user-scope `~/.claude/CLAUDE.md`:
 >
 > ```markdown
 > ## Memory
 > Proactively record durable project facts to auto memory as you work — don't wait for me to
 > ask. Keep MEMORY.md as the index, one topic per file, and prune stale entries.
 > ```
->
-> To opt in **without modifying the target project** (or across all your projects at once), put
-> the same instruction in your user-scope `~/.claude/CLAUDE.md` instead — it composes into the
-> same prompt and overrides the conservative default the same way.
 
 Then use it like Claude Code:
 
 - `/skill-name args` — run a user-invocable skill (slash command). Arguments substitute as
-  `$ARGUMENTS`, 0-based positionals (`$0` is the first argument, `$ARGUMENTS[N]` equivalent),
-  and named `$name`; `\$` escapes a literal dollar. Up to 5 leading `/skill` tokens stack in one
-  message (`/skill-a /skill-b do XYZ` activates both; the trailing text becomes the last skill's
-  arguments and stays as your request).
+  `$ARGUMENTS`, 0-based positionals (`$0` is the first argument), and named `$name`; `\$` escapes a
+  literal dollar. Up to 5 leading `/skill` tokens stack in one message (`/skill-a /skill-b do XYZ`
+  activates both; the trailing text becomes the last skill's arguments and stays as your request).
 - the model activates skills itself via the `Skill` tool when a task matches a description
-- the model dispatches subagents via the `Agent` tool (description-driven routing; the built-in
-  `general-purpose`/`Explore`/`Plan` types complement project agents, a same-named project agent
-  overrides a built-in, and an omitted `subagent_type` defaults to general-purpose). The special
-  `subagent_type: "fork"` type does **not** start fresh — it **inherits the parent conversation**
-  (full history + the parent's model and tools), so you can hand a fork a side task that already
-  knows the whole situation; only its final result returns (its intermediate steps stay out of the
-  main conversation). A fork is honored **only for a dispatch made by the main session** and is
-  gated by the `CLAUDE_CODE_FORK_SUBAGENT` environment variable — set it to `1` to force fork
-  inheritance on, or to `0` to force it off; **left unset it is enabled** (a deliberate PiCC choice).
-  A fork is **not resumable**, and a fork cannot spawn another fork. Whenever a `"fork"` dispatch
-  can't inherit — env off, a nested (non-main-session) dispatcher, print/headless mode with no
-  parent transcript, a fork-spawns-fork, or an SDK that can't fork — it runs with fresh context and
-  says so in a footer note on the result, rather than silently pretending it inherited.
-  Dispatch runs in the **background by default** (matching Claude 2.1.198): an omitted
-  `run_in_background` returns a task id immediately, so multiple dispatches in one turn parallelize —
-  results are polled/awaited via `TaskOutput` and stopped via `TaskStop`. An eligible current task is
-  the latest task generation for that agent that remains uncollected and unnotified; it is announced
-  once at the coordinator's next turn after settlement. Polling while it is running keeps
-  that notice eligible, while a successful terminal `TaskOutput` return counts as delivery and
-  suppresses the redundant not-yet-sent notice. Pass `run_in_background: false`
-  for a synchronous inline result (an agent's `background: true` frontmatter forces background even
-  against that), and `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces every dispatch to the foreground. A
-  dispatch that dies on an API error is reported as a **loud, named failure** (with any partial
-  output), not an empty success; a run stopped on purpose reports as **aborted**. The coordinator
-  can address a finished subagent by its agent id with **`SendMessage`** to continue it (full prior
-  context) or redirect a still-running background one. See *Observing subagents* below.
+- the model dispatches subagents via the `Agent` tool (description-driven routing; an omitted
+  `subagent_type` defaults to `general-purpose`, and a same-named project agent overrides a
+  built-in). Dispatch runs in the **background by default**: it returns a task id immediately, so
+  several dispatches in one turn run in parallel, and results are collected with `TaskOutput` and
+  stopped with `TaskStop`. Pass `run_in_background: false` for a synchronous inline result (an
+  agent's own `background: true` frontmatter still wins). The special `subagent_type: "fork"`
+  **inherits the parent conversation** instead of starting fresh (see `CLAUDE_CODE_FORK_SUBAGENT`
+  under *Environment variables* for when inheritance is honored).
 - `EnterWorktree`/`ExitWorktree` isolate work in `.claude/worktrees/<name>/` — the session's
   working directory really moves, so project scripts detect worktree mode via git plumbing
 - parallel sessions: open a second terminal, `picc` again, enter a different worktree
 
 ### Observing subagents
 
-Every subagent is now visible, both to you and to the coordinating model:
+Every subagent is visible, both to you and to the coordinating model:
 
-- **Transcript on disk.** Each dispatch leaves a JSONL transcript beside the main session's, under
-  `<mainSessionFileBase>.subagents/<stamp>_<agentId>.jsonl` (in Pi's sessions dir,
-  `~/.pi/agent/sessions/…`). The agent id is embedded in the filename and appears in the dispatch
-  result, so you can locate a subagent's full turn-by-turn record without guessing. (These files
-  accumulate like Pi's own session files — `cleanupPeriodDays` reaps orphaned *worktrees* but does
-  not yet reap subagent transcripts.)
-- **Live progress.** While a subagent runs, the UI shows which agent it is and what it is doing —
-  the agent type and your dispatch description instead of a bare "Agent" box, a rolling tail of its
-  recent tool calls / output lines, and explicit visibility of silent waits (API auto-retry).
-  Pressing **Esc** cancels a running foreground dispatch (it reports as aborted — rendered in an
-  error frame worded as aborted, not a distinct abort badge; the dedicated aborted badge is a
-  background/next-turn surface) — this covers `Agent`/`Task` dispatches and a model-invoked
-  `context: fork` (the `Skill` or `SlashCommand` tool). A *typed* `/forked-skill` expansion has no
-  per-call signal (it runs before the turn streams), so in interactive mode the input hook watches
-  raw terminal input and cancels the fork on Esc; in print/RPC modes there is no Esc, so a typed
-  fork runs to completion. Pressing **Esc** while *awaiting* a background task only detaches
-  the live view — the background task keeps running (retrieve it again with `TaskOutput`); Esc does
-  not stop a background task.
-- **Background tasks are observable too.** A `TaskOutput` call awaiting a still-running background
-  dispatch now streams that same live view — a rolling activity tail and a current-activity line,
-  updating as the background subagent works — then settles, *in the same call*, to a finished view:
-  an outcome badge (completed / failed / aborted), the transcript path, and a per-subagent usage
-  footer, matching what a completed foreground dispatch shows. A poll (`TaskOutput` with
-  `wait: false`) shows the task's current status and last activity inside the same identifying frame.
-  The task-start message and the awaiting/live, poll, and settled `TaskOutput` views carry the same
-  identity components: the task id (`task-N`), displayed agent type, and stable `agent-<id>`, shown
-  even for non-resumable one-shot builtins (the "resumable via `SendMessage`" hint appears only when
-  the task actually is resumable). Their visual framing varies: the start block leads with
-  `Agent(<type>) → background as task-N` (with the `agent-<id>` on a subline), while the
-  live/poll/settled views use the same components in their identifying frame. This TaskOutput
-  rendering is display-only: its completed verbatim result text is unchanged. The one boundary: a
-  background task streams live only *while a `TaskOutput` call is awaiting it* — there is no
-  always-on background dashboard.
-- **Collection and settlement notices are ordered.** Returning a terminal `TaskOutput` record —
-  completed, failed, aborted, empty, or cut off — delivers all output available for that run and
-  suppresses a later redundant notice that has not yet been sent. Do not repeat `TaskOutput` to try
-  to recover a continuation after a cut-off marker. A running poll does *not* count as delivery, so
-  the eligible current task can still produce one bounded, untrusted-framed notice on the next
-  interactive turn. Retrieval remains available after that notice and does not re-arm another one.
-  A task with an aborted outcome has an outcome-only uncollected notice: its final output was
-  deliberately discarded, although `TaskOutput` can still report the aborted outcome (the internal
-  task status is `stopped`). When `SendMessage` resumes an agent,
-  the new task id is the current generation; older generations remain suppressed by the existing
-  newest-generation-wins rule.
-
-  This suppression is intentional PiCC UX hardening, not verified Claude parity. Reporter-observed
-  Claude Code 2.1.x behavior can enqueue a redundant notification after `TaskOutput` retrieval;
-  Claude's public docs do not define notification-consumption semantics, and available reports do
-  not establish an exact normative background-subagent contract.
-- **`/usage`.** A per-subagent token/cost breakdown for the session: each dispatched agent's id,
-  type, outcome, usage line, and transcript path, plus a subagents total. This is **subagent-scoped
-  only** — a PiCC-additive view, not Claude Code's whole-session `/usage`/`/cost` (the Pi extension
-  API exposes no parent-session cost, so the main agent's own spend is not shown).
-- **Compact lifecycle identity.** A `task-N` identifies one background run; an `agent-<id>`
-  identifies the agent and is the reliable correlation key across resume. Resuming keeps that agent
-  id but creates a new task id. Model-visible `TaskStop` results (for every stop outcome), eligible
-  uncollected-task settlement notices, and `SendMessage` resume acknowledgments identify the work with
-  `Task(task-N) · Agent(<type>) · agent-<id>`, though punctuation and surrounding framing can vary.
-  TaskStop and settlement use the background task record's stored display type. A fresh dispatch
-  record normally stores the requested/display label, which can differ from the resolved registry
-  definition after fallback or case-insensitive matching. A resumed task record and its resume
-  acknowledgment instead use the clean resolved registry name. The stable agent id—not the type
-  text—is therefore the reliable correlation key; broader canonical-type plumbing remains deferred.
-  This concise wording contract is PiCC-defined, not verified as exact Claude Code wording. This
-  identity-only wording does not otherwise change tool schemas, lifecycle and stop behavior,
-  structured results, output framing, or limits; settlement delivery follows the collection-aware
-  contract above.
-- **`SendMessage` (resume / steer).** The coordinator can address a finished subagent by its agent
-  id and continue it with its context intact (it resumes in the background under the same stable id
-  and a new task id), or redirect a still-running background one. Honest limitations, by design:
-  - **No cross-restart resume** — the dispatch registry is process-lifetime; after you quit and
-    relaunch `picc`, a prior agent id no longer resolves.
-  - **Stopped agents remain resumable in PiCC** — after `TaskStop`, PiCC currently allows a
-    `SendMessage` resume; the Claude Code 2.1.x reference refuses stopped-agent resume.
-  - **TaskStop addresses tasks only by `task_id`** — current Claude 2.1.198+ also accepts an agent
-    id or name.
-  - **Steering reaches only background dispatches** — a foreground `Agent` call blocks the
-    coordinator's turn, so there is no moment to steer it; resume works once any dispatch settles.
-  - **Idle-parent delivery is next-turn** — an idle coordinator learns of an eligible uncollected
-    background settlement when the conversation next continues; PiCC v1 does not re-invoke an idle
-    agent. In one-shot print mode there may be no next turn, so await `TaskOutput` before finalizing,
-    pass `run_in_background: false`, or set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` to force foreground.
-    Otherwise uncollected work can remain unsurfaced; this limitation is separate from
-    collection-aware suppression.
-  - **`context: fork` / override dispatches are not resumable** — their restricted definition can't
-    be re-derived by name, so they are deliberately refused.
-  - **`subagent_type: "fork"` dispatches are not resumable** — a fork's inherited context is the
-    parent conversation *at fork time* and can't be safely re-derived, so `SendMessage` refuses it.
+- **Transcript on disk.** Each dispatch leaves a JSONL transcript under
+  `<mainSessionFileBase>.subagents/<stamp>_<agentId>.jsonl` in Pi's sessions dir
+  (`~/.pi/agent/sessions/…`). The agent id appears in the dispatch result, so you can find the run's
+  full record without guessing. These files are not reaped automatically.
+- **Live progress.** The UI shows a running subagent's type, your dispatch description, and a
+  rolling tail of its activity. Awaiting a background task with `TaskOutput` streams that same view,
+  then settles in the same call to the outcome, transcript path, and usage — there is no always-on
+  background dashboard.
+- **Esc** cancels a running *foreground* dispatch (it reports as aborted). Esc while *awaiting* a
+  background task only detaches the live view — the task keeps running; retrieve it with `TaskOutput`.
+- **`SendMessage`** continues a finished subagent with its context intact, or redirects a running
+  background one, addressed by its `agent-<id>`. Resuming keeps that agent id and creates a new task
+  id, so the agent id is the reliable correlation key. Resume is process-lifetime only — after you
+  quit and relaunch `picc`, a prior agent id no longer resolves — and fork dispatches are never
+  resumable.
 
 ### Subagent dispatch controls (`.claude/settings.json`)
 
-Three project settings shape subagent dispatch. They live under a `subagents` key in the project's
-`.claude/settings.json` (they also read at user scope, project overrides user). **These are PiCC
-extensions — they have no Claude-settings equivalent and are not Claude parity;** Claude Code's own
-five-level nesting is fixed and not configurable, so matching its ceiling is not a settings-parity
-claim.
+Three project settings shape subagent dispatch, under a `subagents` key (they also read at user
+scope; project overrides user). These are PiCC extensions with no Claude-settings equivalent.
 
 | Key | Default | Effect |
 |---|---|---|
-| `subagents.enabled` | `true` | Gates **all** ordinary subagent delegation. `false` (or the inverse alias `disableSubagents: true`) removes `Agent`/`Task` from the main session entirely — no fan-out at all. |
-| `subagents.maxDepth` | `1` | Caps subagent **nesting** depth. Default `1` = **main-session-only**. |
-| `subagents.concurrency` | `4` | Caps parallel subagent fan-out (see the Partial-tier per-depth-budget prose in §7 below — nested budgets are `maxDepth × concurrency`). |
+| `subagents.enabled` | `true` | Gates **all** subagent delegation. `false` (or the inverse alias `disableSubagents: true`) removes `Agent`/`Task` from the main session entirely. |
+| `subagents.maxDepth` | `1` | Caps subagent **nesting** depth. Default `1` = main-session-only. Raise to `2..5` to let each further generation dispatch. |
+| `subagents.concurrency` | `4` | Caps parallel subagent fan-out. |
 
-**Depth semantics.** The main conversation is **depth 0**; the subagents it dispatches are
-**depth 1**. The default `subagents.maxDepth: 1` lets the main session fan out depth-1 subagents but
-**blocks depth 2** — a depth-1 subagent receives neither `Agent` nor `Task`, its system prompt does
-not advertise the subagents catalog, and no alternate in-process path (e.g. a subagent-invoked
-`context: fork` skill) can open a deeper model session. To **opt into nesting**, raise
-`subagents.maxDepth` to `2..5`: each increment allows one more generation below the main session
-(`2` = the main session's subagents may themselves dispatch once, and so on up to five levels).
+The main conversation is **depth 0**; the subagents it dispatches are depth 1. So the default
+`maxDepth: 1` allows normal fan-out but blocks a subagent from dispatching its own.
 
-**The two "off" states are different — don't conflate them:**
-
-- `subagents.enabled: false` / `disableSubagents: true` → **no delegation at all.** The main
-  session loses `Agent`/`Task`; even ordinary depth-1 fan-out is gone.
-- `subagents.maxDepth: 1` (the default) → **keeps depth-1 fan-out, blocks only nesting.** The main
-  session still delegates normally; only its subagents are prevented from recursing.
-
-If your goal is just "no runaway recursion," **keep (or set) `maxDepth`** — do **not** disable
-subagents.
-
-**Further narrowing.** Beyond these settings, each agent's own frontmatter `tools:` (allow-list) and
-`disallowedTools:` (deny-list) narrow what that agent may call. Even where nesting is enabled, an
-agent whose `tools:` omits `Agent`/`Task` cannot dispatch — the settings set the ceiling, the
-per-agent lists narrow it further.
-
-**Migration — restore recursion.** If you relied on the old depth-5 default (subagents that fan out
-further), add to `.claude/settings.json`:
-
-```json
-{
-  "subagents": { "maxDepth": 2 }
-}
-```
-
-`2` restores exactly **one** nested generation below the main session's subagents. If you nested
-deeper (three or more levels), raise the number accordingly — up to `5`. Copying `2` when you
-actually need `3+` will leave the deeper generations blocked.
+**The two "off" states are different.** If your goal is "no runaway recursion," use `maxDepth` —
+`enabled: false` removes delegation entirely, including ordinary depth-1 fan-out.
 
 ## 5. Control surface (project-external)
 
@@ -347,15 +213,13 @@ actually need `3+` will leave the deeper generations blocked.
 | `/agents` | List every subagent available for dispatch — project/user agents and the built-in `general-purpose`/`Explore`/`Plan` types — with tools, read-only marker, model, and worktree-isolation |
 | `/doctor` | Full compatibility breakdown for this project (generated from the capability registry) |
 | `/compat [suppress\|show]` | Show the consolidated compatibility notice; suppress/unsuppress it |
-| `/usage` | Per-subagent token/cost breakdown for this session (each dispatch's id, type, outcome, usage, transcript path) plus a subagents total. **Subagent-scoped only** — a PiCC-additive surface, *not* Claude Code's whole-session `/usage`/`/cost`: the Pi extension API exposes no parent-session cost, so the main agent's own spend is not included |
+| `/usage` | Per-subagent token/cost breakdown for this session, plus a subagents total. **Subagent-scoped only** — a PiCC-additive surface, *not* Claude Code's whole-session `/usage`/`/cost`: the Pi extension API exposes no parent-session cost, so the main agent's own spend is not included |
 | `/quota` | Context usage + provider rate-limit/quota headers from the last response (best-effort) |
 | `/model`, `/login`, `/settings` | Pi built-ins: model switching, auth, Pi settings |
 
 **Slash autocomplete.** Every user-invocable skill appears in the `/` menu with its description and
 argument hint — type `/` to browse, or start typing a name to filter. Selecting one expands the
-skill into your turn (with argument, variable, and shell-injection processing) exactly as Claude
-Code does. The full instruction body is loaded only on invocation (progressive disclosure), so the
-menu stays fast even with dozens of skills.
+skill into your turn exactly as Claude Code does.
 
 ### Harness configuration
 
@@ -378,39 +242,19 @@ tracked project files):
 - `model` / `effort` — defaults applied at session start (effort maps onto Pi thinking levels).
 - `steering` — the **model-steering layer**: per-model-pattern system-prompt guidance nudging
   GPT toward Claude-like behavior, without editing the project. Patterns are globs over
-  `provider/modelId`; all matching entries are appended. Because steering is appended *after*
-  PiCC's built-in conventions block, it is also your lever over those built-ins: you cannot
-  delete their text, but a contrary steering entry (or a project's own commit rule) later in
-  the prompt steers the model against them (later, more-specific guidance tends to win — like
-  any prompt instruction, not a hard guarantee). For example, PiCC nudges richer,
-  repo-style-matching commit messages by default — to tone that back toward terse one-liners,
-  add a steering entry such as:
+  `provider/modelId`; all matching entries are appended.
+
+  Steering is appended *after* PiCC's built-in conventions, so it is also your lever over them: you
+  cannot delete their text, but a contrary entry later in the prompt steers the model against them
+  (later guidance tends to win — a nudge, not a guarantee). The two built-ins you may want to adjust:
+  PiCC pushes richer, repo-style-matching commit messages, and it puts the **main session** (not
+  dispatched subagents) in a collaborative-planning posture — ground in the repo, surface the real
+  choices, delegate context-heavy investigation, then implement once scope is agreed. To tone either
+  back:
 
   ```json
   "steering": {
-    "openai/*": "Keep commit messages to a one-line subject; no body unless I ask."
-  }
-  ```
-
-  The **collaborative-planning posture** is another such built-in default, scoped to the **main
-  session** (the coordinator you talk to — dispatched subagents don't get it). On a substantial or
-  open-ended request, PiCC nudges the model to ground itself in the repo and share what it found,
-  ask only about goals and material tradeoffs, surface the real choices and recommend one, verify
-  load-bearing claims by reading the code, and avoid jumping straight to "go"/"confirm" — then
-  switch to implementing decisively once scope is agreed. It also nudges the coordinator to
-  **delegate** context-heavy investigation — a broad sweep across the test suite, reading a whole
-  subsystem, a throwaway multi-step dig — to a dispatched subagent and work from the report/summary
-  it returns, keeping the coordinator's own context free for the overview and your conversation;
-  single-file reads and targeted greps it still does inline itself, rather than over-dispatching
-  trivial work. This does not undercut grounding: the coordinator still grounds (from the returned
-  summary for broad sweeps) and still re-reads the code itself for the load-bearing claims that
-  drive an action. It is guidance, not enforcement, so its effect is model-dependent. To adjust
-  it, use the same `steering` lever — for example, to tone it
-  back toward terse, minimal-question turns:
-
-  ```json
-  "steering": {
-    "openai/*": "Skip the collaborative back-and-forth; restate my request briefly and proceed unless something is genuinely blocking."
+    "openai/*": "Keep commit messages to a one-line subject; no body unless I ask. Skip the collaborative back-and-forth; restate my request briefly and proceed unless something is genuinely blocking."
   }
   ```
 - `effortMap` — extends the mapping from Claude `effort:` values / prose ("apply maximum
@@ -426,110 +270,62 @@ tracked project files):
 | `CLAUDE_CODE_SUBAGENT_MODEL` | Highest-priority model override for every subagent dispatch (`inherit` = unset) |
 | `CLAUDE_CODE_DISABLE_AUTO_MEMORY` | Disable auto-memory loading (also: `autoMemoryEnabled: false` in settings) |
 | `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | Force **every** `Agent`/`Task` dispatch to the foreground (background is otherwise the default). `SendMessage` resume is inherently async and is **not** governed by this switch |
+| `CLAUDE_CODE_FORK_SUBAGENT` | Gate `subagent_type: "fork"` dispatch (inherit the parent conversation instead of starting fresh): `1` forces it on, `0` off. **Left unset it is enabled** — a deliberate PiCC choice. Inheritance is honored only for a **main-session** dispatch; nested, print-mode, and `isolation: worktree` forks run with fresh context and say so on the result |
 | `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` | Remove the built-in `Explore`/`Plan` agent types (`general-purpose` always stays) |
 | `SLASH_COMMAND_TOOL_CHAR_BUDGET` | Override the startup skill-listing character budget |
 
 ## 6. Security & permission posture
 
-Deliberately partial, by design (see the plan §6):
+Deliberately partial, by design:
 
 - **Default permissive** — no per-command prompts (matches auto-mode usage).
-- **`permissions.deny` is a hard, non-interactive block** — the real safety valve. Full matcher
-  grammar: `Bash(git *)` (shell-operator aware — `git status && rm -rf /` does **not** match;
-  space-before-`*` is a word boundary, so bare `git` matches but `github` never does),
-  `Read/Edit(glob)` (Windows paths normalized — `//c/**` covers `C:\…`, case-insensitively),
-  `WebFetch(domain:*)`, `Agent(type)`, `Skill(name)`, `mcp__server__tool`. A `Read(<glob>)` deny is
-  **not** confined to the `Read` tool — it also gates `Grep`, `Glob`, and `NotebookRead` when they
-  target a matching path (`Grep`/`Glob` are documented Claude best-effort parity; `NotebookRead` is
-  inferred defense-in-depth, since Claude's docs do not name it). The expansion is one-directional,
-  mirroring the edit family: a `Grep(<glob>)` rule does **not** gate `Read`. A scoped `Read(<glob>)`
-  deny *also* blocks `Edit` and `MultiEdit` on a matching path — including creating a new file there —
-  so denying reads of a path also prevents clobbering or recreating it via `Edit` (Claude Code v2.1.208
-  parity). This Read→Edit/MultiEdit cross is **deny-direction and path-scoped only**: a bare
-  `deny: Read` does **not** block or strip `Edit`, and no `allow: Read` ever grants `Edit`.
-  - *Mutation-coverage caveat.* A `deny: Read(<path>)` blocks `Edit`/`MultiEdit` but **not** `Write`
-    or `NotebookEdit` — those whole-file/cell writers remain governed only by their own rules (this
-    exclusion is deliberate Claude parity, not an oversight). Use `Read` deny for **confidentiality**;
-    to fully prevent a path from being modified or recreated by any tool (**integrity**), add an
-    explicit `deny: Edit(<path>)` **and** `deny: Write(<path>)`. This mirrors Claude Code's own guidance.
-  - *Honesty caveat (best-effort, not airtight).* Matching is on the call's **path** argument. A
-    scoped `deny: Read(secrets/**)` blocks a `Grep`/`Glob`/`NotebookRead` call whose path names the
-    protected directory *or* any subpath — both `{path: "secrets"}` and `{path: "secrets/x"}` are
-    blocked (the glob engine covers the bare directory node). The genuine residual gap is a read
-    call with **no path** (or `path: "."`), e.g. `Grep {}`: there is nothing for the path matcher to
-    test, yet its results can still surface matching file contents. Only a **bare** `deny: Read`
-    forecloses that content-exfiltration path *through the built-in read tools* — but at the cost of
-    removing `Read`, `Grep`, `Glob`, and `NotebookRead` from the agent's context entirely (it can no
-    longer search or read files at all), and it still does not stop a shell read such as
-    `Bash(cat secrets/x)`, which needs its own `Bash(...)` deny. This is inherent to path-glob
-    matching and is Claude Code's own best-effort limit.
+- **`permissions.deny` is a hard, non-interactive block** — the real safety valve. Matchers:
+  `Bash(git *)` (shell-operator aware — `git status && rm -rf /` does **not** match; space-before-`*`
+  is a word boundary, so bare `git` matches but `github` never does), `Read/Edit(glob)` (Windows
+  paths normalized — `//c/**` covers `C:\…`, case-insensitively), `WebFetch(domain:*)`,
+  `Agent(type)`, `Skill(name)`, `mcp__server__tool`.
 - **Agent `tools:` gating is fully enforced** — a read-only reviewer cannot write; an agent
   without web tools cannot fetch.
 - `allow` / `ask` rules and permission modes are parsed and **reported, not enforced** — the
   startup notice and `/doctor` call out every safety-relevant divergence. Never silent.
 
+**Three rules for writing a `deny` that actually holds.** Matching is on the call's **path**
+argument, which makes it best-effort — Claude Code's own limit, not a PiCC gap:
+
+1. **Confidentiality ≠ integrity.** A scoped `deny: Read(<path>)` also blocks `Grep`, `Glob`,
+   `NotebookRead`, `Edit`, and `MultiEdit` on a matching path — but **not** `Write` or
+   `NotebookEdit`. To make a path immutable, add `deny: Edit(<path>)` **and** `deny: Write(<path>)`.
+2. **Pathless read calls aren't matched.** `Grep {}` has no path for the matcher to test, yet its
+   results can surface protected content. Only a **bare** `deny: Read` forecloses that — at the cost
+   of removing `Read`/`Grep`/`Glob`/`NotebookRead` entirely. It does **not** also strip `Edit`/
+   `MultiEdit`; the cross in rule 1 applies to a path-scoped rule only.
+3. **A shell read needs its own `Bash(...)` deny.** `Bash(cat secrets/x)` is not covered by any
+   `Read` rule.
+
 ## 7. What is and isn't supported
 
-Generated truth lives in the capability registry (`src/registry/capability-registry.ts`, baseline
-**Claude Code ~2.1.x, mid-2026**) and is what `/doctor` renders. The full table — every tool, hook
-event, setting, frontmatter field, and feature with its tier — is in
-[`doc/supported-features.md`](supported-features.md) (generated from that same registry, so it
-cannot drift). Summary:
+The capability registry is the single source of truth, and is what `/doctor` renders. The full
+table — every tool, hook event, setting, frontmatter field, and feature with its tier, and the
+exact limit named for each partial — is in [`doc/supported-features.md`](supported-features.md),
+generated from that registry so it cannot drift. The shape of the answer:
 
-**Full:** skills (entire frontmatter set incl. `context: fork`, `paths:`, shell injection under
-bash+powershell, argument substitution with 0-based `$N` and `\$` escaping, stacked slash
-invocations), rules, agents — built-in `general-purpose`/`Explore`/`Plan` plus project/user agents
-— with nested subagent dispatch **off by default (main-session-only, `subagents.maxDepth: 1`)** and
-opt-in via `subagents.maxDepth: 2..5`, loud classified failure semantics
-(failed/aborted, never an empty success) with partial-output preservation, on-disk subagent
-transcripts, live progress rendering, and per-subagent usage accounting, agent-scoped hooks,
-worktrees (incl. `.worktreeinclude`, Windows-tolerant
-removal), 13 hook events with the full stdin/stdout contract (Claude matcher semantics, parallel
-dispatch, async handlers), CLAUDE.md hierarchy to the filesystem root + `@import` + managed policy,
-settings toggles, deny rules (incl. Windows path normalization), tool gating,
-`WebFetch`/`WebSearch`/`Grep`/`Glob` tools, installed-plugin content, compaction preservation under
-Claude's carryover budgets.
-
-**Partial (works within a named limit):** background subagent dispatch — now the **default** (matching
-Claude Code 2.1.198), with the partial `TaskOutput`/`TaskStop` tools and one bounded next-turn notice
-for an eligible uncollected current task. A running poll preserves that notice; a successful terminal return counts as
-delivery and suppresses the redundant notice. `run_in_background: false` opts into a synchronous
-inline result and `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` forces foreground. It remains partial for
-settlement *timing*: PiCC is next-turn, while reporter observations such as anthropics/claude-code#21343 (Claude Code
-2.1.20 background agents) describe late notification during an active conversation but establish no
-exact normative mid-turn/next-turn contract. Reporter-observed Claude 2.1.x redundant post-retrieval
-notification behavior is likewise non-normative. Another limitation is the
-one-shot print-mode loss of uncollected work. Nested
-(depth ≥ 2) background fan-out is **off by default** (main-session-only) and only occurs when an
-operator raises `subagents.maxDepth` to 2..5; once opted in, it is concurrency-bounded via per-depth
-budgets (deadlock-free, total ≤ `maxDepth × concurrency`) — a conservative PiCC choice, not Claude's
-single global cap. And
-`SendMessage` resume/steer — no cross-restart resume, steering reaches only
-background dispatches, idle-parent delivery is next-turn, and `context: fork`/override dispatches
-are non-resumable. The `subagent_type: "fork"` dispatch (inherit the parent conversation) is
-supported at a named limit: main-session dispatch only, env-gated by `CLAUDE_CODE_FORK_SUBAGENT`
-(unset ⇒ enabled), non-resumable, no fork-spawns-fork, and — because PiCC reconstructs rather than
-byte-copies the parent's base prompt — it forgoes the prompt-cache saving; print/headless and
-`isolation: worktree` forks are deferred and degrade visibly to fresh context. `maxTurns` is a
-best-effort cap. Auto memory (`MEMORY.md`) and agent `memory:`
-scopes load with full parity, but writes are conservative by default — memory is written only on
-an explicit request to remember, a deliberate divergence from Claude Code's proactive writes (opt
-into eager writes via `CLAUDE.md`). `NotebookRead` reads a `.ipynb` cell by cell (source plus
-stream / `text/plain` (and other text reprs) / error outputs); it is partial because image outputs are
-noted (raster images by mime-type with an approximate size, other binary/structured outputs by
-mime-type only) rather than rendered visually, oversized text outputs are head-truncated, and
-single-cell selection (`cell_id`) is not supported. Reach for `NotebookRead` (not the inherited `Read`, which does not special-case
-notebooks) when you want cell structure instead of raw notebook JSON; `NotebookEdit` remains a
-degraded no-op.
-
-**Degraded no-op (visible, never crashing):** MCP servers/tools, `ask`/`allow`/permission modes,
-plan mode, `AskUserQuestion`, checkpointing/rewind, output styles, agent teams, background
-*shells* (`BashOutput`/`KillShell`), LSP, computer use. Unknown/future fields degrade safely and
-are reported as unassessed.
-
-**Not built:** plugin install/marketplace machinery; mid-flight live-session handoff between
-harnesses (worktrees/git are fully interoperable — a worktree created under Claude Code can be
-re-entered here and vice versa).
+- **Full:** skills, rules, agents (project/user + the built-ins), worktrees, **13** hook events with
+  the full stdin/stdout contract, the CLAUDE.md hierarchy + `@import`, settings toggles, deny rules,
+  tool gating, `WebFetch`/`WebSearch`/`Grep`/`Glob`, installed-plugin content, and compaction
+  preservation.
+- **Partial (works within a named limit):** background subagent dispatch with `TaskOutput`/`TaskStop`;
+  `SendMessage` resume/steer; `subagent_type: "fork"`; nested (depth ≥ 2) fan-out, off by default;
+  auto-memory writes; managed/enterprise policy (honored where trivially present, otherwise
+  degrade-safe); `NotebookRead`; `maxTurns`.
+- **Degraded no-op (visible, never crashing):** MCP servers/tools, `ask`/`allow`/permission modes,
+  plan mode, `AskUserQuestion`, checkpointing/rewind, output styles, agent teams, background
+  *shells* (`BashOutput`/`KillShell`), LSP, computer use — and **5 hook events parsed but never
+  fired**: `Notification`, `TaskCompleted`, `TeammateIdle`, `mcp__elicitation`, and ⚠
+  `PermissionRequest`, which is therefore **not** a gate — nothing fires it under the
+  default-permissive posture. Unknown/future fields degrade safely and are reported as unassessed.
+- **Not built:** plugin install/marketplace machinery; mid-flight live-session handoff between
+  harnesses (worktrees and git themselves are fully interoperable — a worktree created under Claude
+  Code can be re-entered here and vice versa).
 
 ## 8. Windows specifics
 
@@ -565,20 +361,18 @@ behaviors worth knowing:
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
 | Startup notice keeps appearing | `/compat suppress` (per-project, stored in `.claude/.picc/`) |
-| Subagents can't spawn subagents / nested fan-out flattened after upgrade | PiCC now defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Raise `subagents.maxDepth` to `2..5` in `.claude/settings.json`; see §4 "Subagent dispatch controls". `/doctor` also shows the current nesting posture. |
+| `picc -p` finished but a subagent's output never appeared | Background is the default and a one-shot print run has no next turn to deliver it on. Set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for scripted runs, or collect with `TaskOutput` before the run ends. |
+| Subagents can't spawn subagents / nested fan-out flattened | PiCC defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Raise `subagents.maxDepth` to `2..5` in `.claude/settings.json`; see "Subagent dispatch controls" above. `/doctor` also shows the current nesting posture. |
 | Unexpected skills/agents from plugins | PiCC loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. `/doctor` and the startup info notice report how many are available but disabled. |
 | A plugin you enabled isn't loading | Confirm it's listed truthy in `enabledPlugins` as `name@marketplace`, and that it isn't in `~/.claude/plugins/blocklist.json`. |
 | Want to see why a fan-out routed the way it did | agent descriptions are the routing surface — inspect the "Available subagents" catalog in the session, and the dispatch tool calls in the transcript |
 
 ## 10. Verification status
 
-- **Windows 11**: fully verified — the automated suite runs across three layers (per-subsystem
-  unit tests, an offline whole-extension integration pass against the fixture projects, and an
-  end-to-end suite that drives the **real Pi CLI** with a mock OpenAI-compatible model server; see
-  [`doc/testing.md`](testing.md)) — plus live validation on a real ChatGPT/Codex subscription
-  (skill slash command with argument substitution, description-routed subagent dispatch
-  returning a locked-YAML verdict verbatim, worktree entry detected as `mode=worktree` by the
-  project's own git-plumbing probe, `.worktreeinclude` seeding, `WorktreeCreate` hook).
+- **Windows 11**: fully verified — the automated suite (see [`doc/testing.md`](testing.md)) plus
+  live validation on a real ChatGPT/Codex subscription, covering slash commands with argument
+  substitution, description-routed subagent dispatch, worktree entry detected as `mode=worktree` by
+  a project's own git-plumbing probe, `.worktreeinclude` seeding, and hooks.
 - **Linux**: the code is platform-guarded and expected to work (POSIX is the simpler path for
   every Windows-special case), but has not yet been exercised in CI — run `npm test` on your
   Linux machine before relying on it there.
@@ -591,8 +385,7 @@ Two runnable fixtures ship in `examples/`:
   rules) for a first run.
 - **`examples/full-surface`** — the conformance fixture exercising the whole supported surface
   (nested subagents, path-scoped rules, `@import` chains, worktree seeding, hook events,
-  degradation of unknown/future features). Integration tests run against it; its README maps
-  every feature to a canary string.
+  degradation of unknown features). Its README maps every feature to a canary string.
 
 ```bash
 cd examples/hello-claude
