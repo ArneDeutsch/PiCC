@@ -365,7 +365,7 @@ tracked project files):
 
 ```json
 {
-  "model": "openai/gpt-5.5",
+  "model": "openai-codex/gpt-5.5",
   "effort": "high",
   "steering": {
     "openai/*": "When a skill specifies a locked output format, reproduce it exactly. Prefer dispatching subagents over doing everything inline when the skill says to fan out."

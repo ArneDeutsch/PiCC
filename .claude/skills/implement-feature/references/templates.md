@@ -18,9 +18,12 @@ doc/plan/<feature-slug>/
 ```markdown
 # <feature-slug>: <Title>
 
-Ticket: <the linked issue as `<target>#N` — a given ref, or one created via the
-Phase 1 ticket-creation offer (written at Phase 3); `–` when ticketless. Kept
-machine-greppable and stable: the resident anchor reader greps this line on resume.>
+Ticket: <the linked issue as `<issue-host>#N` — the **issue-host** repo where the
+issue actually lives: `<fork>#N` for a **given** fork-hosted ticket (a URL ref that
+matched the fork only), else `<target>#N`. A ticket **created** via the Phase 1
+ticket-creation offer always lands on `target`, so its anchor is always `<target>#N`
+(as is a given ref that matched `target`); written at Phase 3; `–` when ticketless.
+Kept machine-greppable and stable: the resident anchor reader greps this line on resume.>
 
 ## What
 <What the feature does, as observable behavior. Include explicit non-goals.>

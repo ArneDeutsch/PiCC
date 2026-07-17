@@ -2,7 +2,7 @@
 /**
  * PiCC launcher: runs Pi with the PiCC extension preloaded, in the
  * current directory (the target Claude Code project). All arguments pass through
- * to pi (e.g. `picc -p "..."`, `picc --model openai/gpt-5.5`).
+ * to pi (e.g. `picc -p "..."`, `picc --model openai-codex/gpt-5.5`).
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs";
