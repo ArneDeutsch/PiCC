@@ -28,7 +28,7 @@ import { toNativeSafeTempForm } from "../src/util/env.js";
  * `hasBash` is probed once from the extension's OWN Git Bash resolution
  * (`resolveShellBinary`, which skips the System32 WSL stub), so it probes exactly
  * the binary the harness Bash tool spawns. Mirrors the BASH_AVAILABLE idiom in
- * test/e2e-live-pi.test.ts.
+ * test/helpers/e2e-live.ts.
  */
 const hasBash = (() => {
   try {

@@ -1,233 +1,31 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
-import { startMockModel, type CapturedRequest, type Turn } from "./helpers/mock-openai.js";
-import { resolveShellBinary } from "../src/engine/shell-inject.js";
+import {
+  BASH_AVAILABLE,
+  cliMissing,
+  createE2ELive,
+  systemText,
+  TEST_TIMEOUT_MS,
+  toolResultText,
+  CLI_PATH,
+} from "./helpers/e2e-live.js";
+import type { CapturedRequest } from "./helpers/mock-openai.js";
 import { resolveSubagentTranscript } from "../src/util/subagent-transcripts.js";
 
 /**
- * Live end-to-end tests: the REAL Pi CLI (dist/cli.js) runs the assembled
- * PiCC extension against the hello-claude fixture, driven by a local mock
- * OpenAI-compatible model server — no real network, no subscription.
- *
- * Each scenario scripts the model's turns, spawns `pi -p`, and asserts on the
- * requests Pi actually sent to the "model" plus on-disk side effects.
+ * E2E — subagents (the heaviest lane; each scenario spawns a nested Pi child):
+ * background dispatch + TaskOutput, worktree isolation, provider-error named
+ * failure, and on-disk transcript persistence. See test/helpers/e2e-live.ts.
  */
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const CLI_PATH = path.join(
-  REPO_ROOT,
-  "node_modules",
-  "@earendil-works",
-  "pi-coding-agent",
-  "dist",
-  "cli.js",
-);
-const EXTENSION_PATH = path.join(REPO_ROOT, "src", "index.ts");
-const cliMissing = !fs.existsSync(CLI_PATH);
-const RUN_TIMEOUT_MS = 90_000;
-const TEST_TIMEOUT_MS = 120_000;
-
-const tempDirs: string[] = [];
-const fixtures: string[] = [];
-
-afterEach(() => {
-  for (const dir of fixtures.splice(0)) cleanupFixture(dir);
-  for (const dir of tempDirs.splice(0)) {
-    try {
-      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-    } catch {
-      /* OS reaps temp dirs eventually */
-    }
-  }
-});
-
-function makeAgentDir(mockUrl: string): string {
-  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-piagent-"));
-  tempDirs.push(agentDir);
-  // Shape verified against pi docs/models.md ("Full Example") and docs/settings.md.
-  fs.writeFileSync(
-    path.join(agentDir, "models.json"),
-    JSON.stringify(
-      {
-        providers: {
-          mock: {
-            baseUrl: `${mockUrl}/v1`,
-            api: "openai-completions",
-            apiKey: "test-key",
-            models: [
-              {
-                id: "mock-1",
-                name: "Mock",
-                reasoning: false,
-                input: ["text"],
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                contextWindow: 128000,
-                maxTokens: 8192,
-              },
-            ],
-          },
-        },
-      },
-      null,
-      2,
-    ),
-  );
-  fs.writeFileSync(
-    path.join(agentDir, "settings.json"),
-    JSON.stringify(
-      {
-        defaultProvider: "mock",
-        defaultModel: "mock-1",
-        defaultProjectTrust: "always",
-        compaction: { enabled: false },
-      },
-      null,
-      2,
-    ),
-  );
-  return agentDir;
-}
-
-interface RunResult {
-  code: number | null;
-  stdout: string;
-  stderr: string;
-  requests: CapturedRequest[];
-  fixture: string;
-  /** The per-run PI_CODING_AGENT_DIR (sessions land under <agentDir>/sessions). */
-  agentDir: string;
-}
-
-type FixtureName = "hello-claude" | "full-surface";
-
-async function runPi(opts: {
-  script: Turn[];
-  prompt: string;
-  fixture?: FixtureName;
-  extraEnv?: Record<string, string>;
-  setup?: (fixtureDir: string) => void;
-  /** Keep session persistence ON (drops --no-session) — transcript scenarios (t02). */
-  persistSession?: boolean;
-}): Promise<RunResult> {
-  const fixture = materializeFixture(opts.fixture ?? "hello-claude");
-  fixtures.push(fixture);
-  opts.setup?.(fixture);
-
-  const mock = await startMockModel(opts.script);
-  try {
-    const agentDir = makeAgentDir(mock.url);
-    const emptyUserDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-claude-user-"));
-    tempDirs.push(emptyUserDir);
-
-    const child = spawn(
-      process.execPath,
-      [
-        CLI_PATH,
-        "-e",
-        EXTENSION_PATH,
-        ...(opts.persistSession ? [] : ["--no-session"]),
-        "-p",
-        opts.prompt,
-      ],
-      {
-        cwd: fixture,
-        env: {
-          ...process.env,
-          PI_CODING_AGENT_DIR: agentDir,
-          // Disables Pi's startup network operations (update check, install
-          // telemetry) only — provider requests to the local mock still flow.
-          PI_OFFLINE: "1",
-          PI_SKIP_VERSION_CHECK: "1",
-          PICC_CLAUDE_USER_DIR: emptyUserDir,
-          NO_COLOR: "1",
-          ...opts.extraEnv,
-        },
-        // stdin must be closed: Pi's print mode waits on piped stdin otherwise.
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
-      },
-    );
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-    const killTimer = setTimeout(() => child.kill(), RUN_TIMEOUT_MS);
-    const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
-    clearTimeout(killTimer);
-    return { code, stdout, stderr, requests: mock.requests, fixture, agentDir };
-  } finally {
-    await mock.close();
-  }
-}
-
-/** All message content of a request as one searchable string. */
-function allText(request: CapturedRequest): string {
-  return JSON.stringify(request.messages);
-}
-
-/** Concatenated system/developer message content of a request. */
-function systemText(request: CapturedRequest): string {
-  return request.messages
-    .filter((m) => m.role === "system" || m.role === "developer")
-    .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
-    .join("\n");
-}
-
-/** Concatenated role:"tool" (tool result) message content of a request. */
-function toolResultText(request: CapturedRequest): string {
-  return request.messages
-    .filter((m) => m.role === "tool")
-    .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
-    .join("\n");
-}
-
-/** Concatenated role:"user" message content of a request. */
-function userText(request: CapturedRequest): string {
-  return request.messages
-    .filter((m) => m.role === "user")
-    .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
-    .join("\n");
-}
-
-/**
- * Detect a usable `bash`, skip cleanly if absent. Uses the extension's OWN
- * Git Bash resolution (resolveShellBinary skips the System32 WSL stub and
- * also finds per-user Git installs under LOCALAPPDATA), so the tests probe
- * exactly the binary the extension will spawn.
- */
-const BASH_AVAILABLE = (() => {
-  for (const cand of [resolveShellBinary("bash"), "C:\\Program Files\\Git\\bin\\bash.exe"]) {
-    try {
-      execFileSync(cand, ["--version"], { stdio: "ignore" });
-      return true;
-    } catch {
-      /* try next */
-    }
-  }
-  return false;
-})();
-
-/** Detect a python interpreter name on PATH, or undefined. */
-const PYTHON_BIN = (() => {
-  for (const cand of ["python", "python3", "py"]) {
-    try {
-      execFileSync(cand, ["--version"], { stdio: "ignore" });
-      return cand;
-    } catch {
-      /* try next */
-    }
-  }
-  return undefined;
-})();
+const { runPi, cleanup } = createE2ELive();
+afterEach(cleanup);
 
 describe.skipIf(cliMissing)(
-  "e2e: real Pi CLI + PiCC extension + mock OpenAI model",
+  "e2e subagents: real Pi CLI + PiCC extension + mock OpenAI model",
   () => {
     if (cliMissing) {
       // eslint-disable-next-line no-console
@@ -235,133 +33,6 @@ describe.skipIf(cliMissing)(
         `Skipping live e2e tests: Pi CLI not found at ${CLI_PATH} — run npm install first.`,
       );
     }
-
-    it(
-      "assembles the Claude project context into the system prompt sent to the model",
-      async () => {
-        const result = await runPi({ script: [{ text: "hello" }], prompt: "say hello" });
-
-        expect(result.code).toBe(0);
-        expect(result.requests.length).toBeGreaterThanOrEqual(1);
-        const first = result.requests[0]!;
-
-        // Pi advertises both built-in (lower-case) and Claude-named tools.
-        const toolNames = (first.tools ?? []).map(
-          (t) => (t as { function?: { name?: string } }).function?.name,
-        );
-        for (const expected of ["write", "read", "bash", "Skill", "Agent", "EnterWorktree"]) {
-          expect(toolNames, `tool ${expected} advertised`).toContain(expected);
-        }
-
-        const system = systemText(first);
-        expect(system).toContain("ROOT-CLAUDE-MD-LOADED");
-        expect(system).toContain("AGENTS-MD-IMPORTED");
-        expect(system).toContain("STYLE-RULE-LOADED");
-        expect(system).toContain("Available subagents");
-        // The greet skill is listed by name+description...
-        expect(system).toMatch(/greet: Greet a person by name/);
-        // ...but its body stays lazy-loaded (NFR): not in context until activated.
-        expect(allText(first)).not.toContain("GREET-SKILL-BODY");
-
-        expect(result.stdout).toContain("hello");
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    it(
-      "enforces the Read(.env) deny rule live and never leaks the secret to the model",
-      async () => {
-        const result = await runPi({
-          script: [{ toolCalls: [{ name: "read", args: { path: ".env" } }] }, { text: "ok" }],
-          prompt: "read the env file",
-          setup: (dir) => fs.writeFileSync(path.join(dir, ".env"), "SECRET=TOP-SECRET-VALUE\n"),
-        });
-
-        expect(result.code).toBe(0);
-        expect(result.requests.length).toBeGreaterThanOrEqual(2);
-        const second = result.requests[1]!;
-
-        // The tool result sent back marks the call as denied/blocked.
-        expect(toolResultText(second)).toMatch(/deny|blocked/i);
-
-        // The secret never reaches the model in any request.
-        for (const [i, request] of result.requests.entries()) {
-          expect(allText(request), `request ${i} must not leak .env content`).not.toContain(
-            "TOP-SECRET-VALUE",
-          );
-        }
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    // --- Scenario 1: bash tool runs a real project script (Git Bash, not WSL stub) ---
-    // Also absorbs the Python cp1252/UTF-8 boundary (t03 merge): when a python
-    // interpreter is available, the SAME bash call additionally prints U+2192 via
-    // chr(0x2192) and we assert it round-trips with no UnicodeEncodeError/charmap.
-    // The python portion (command + assertion) is omitted entirely when python is
-    // absent — the scenario stays gated only on BASH_AVAILABLE, never hard-requires
-    // python.
-    it.skipIf(!BASH_AVAILABLE)(
-      "runs a bash tool call through Git Bash and round-trips real stdout",
-      async () => {
-        const arrow = String.fromCharCode(0x2192); // U+2192 RIGHTWARDS ARROW
-        // chr(0x2192) keeps the literal arrow out of the command string.
-        const pythonProbe = PYTHON_BIN
-          ? ` && ${PYTHON_BIN} -c "print('arrow-' + chr(0x2192) + '-end')"`
-          : "";
-        const result = await runPi({
-          script: [
-            {
-              toolCalls: [
-                {
-                  name: "bash",
-                  args: {
-                    command:
-                      "echo PCD_BASH_OK && node -e \"console.log('node-'+(1+1))\"" + pythonProbe,
-                  },
-                },
-              ],
-            },
-            { text: "ran it" },
-          ],
-          prompt: "run the probe",
-        });
-
-        expect(result.code).toBe(0);
-        expect(result.requests.length).toBeGreaterThanOrEqual(2);
-        const toolResult = toolResultText(result.requests[1]!);
-        expect(toolResult).toContain("PCD_BASH_OK");
-        expect(toolResult).toContain("node-2");
-        // cp1252/UTF-8 boundary: only asserted when python actually ran (gated on
-        // PYTHON_BIN), so absence of python skips just this portion, not the test.
-        if (PYTHON_BIN) {
-          expect(toolResult).toContain(`arrow-${arrow}-end`);
-          expect(toolResult).not.toMatch(/UnicodeEncodeError|charmap/i);
-        }
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    // --- Scenario 3: slash-skill expansion end-to-end via the input event ---
-    it(
-      "expands a /deploy slash skill into the user turn with positional args (full-surface)",
-      async () => {
-        const result = await runPi({
-          fixture: "full-surface",
-          script: [{ text: "done" }],
-          prompt: "/deploy staging 7.7",
-        });
-
-        expect(result.code).toBe(0);
-        expect(result.requests.length).toBeGreaterThanOrEqual(1);
-        const user = userText(result.requests[0]!);
-        expect(user).toContain("FS-SKILL-ARGS-BODY");
-        expect(user).toContain("Deploy to environment **staging** at version **7.7**");
-        // It expanded — the raw slash command is not what reached the model verbatim.
-        expect(user).not.toMatch(/^\s*"?\/deploy staging 7\.7"?\s*$/);
-      },
-      TEST_TIMEOUT_MS,
-    );
 
     // --- Scenario 11 (E2E-2): run_in_background + TaskOutput retrieval (audit E4) ---
     it(
@@ -612,6 +283,5 @@ describe.skipIf(cliMissing)(
       },
       TEST_TIMEOUT_MS,
     );
-
   },
 );
