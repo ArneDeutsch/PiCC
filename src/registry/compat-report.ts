@@ -1,6 +1,6 @@
 /**
- * Compatibility report (plan §6.2) — generated from the capability registry
- * (§17) so it cannot drift from actual behavior.
+ * Compatibility report — generated from the capability registry so it cannot
+ * drift from actual behavior.
  *
  * On config load, buildCompatReport() scans the assembled project for
  * declared-but-not-fully-honored usage. renderStartupNotice() emits ONE
@@ -38,9 +38,9 @@ export interface CompatFinding {
 export interface CompatReport {
   /** Functionality findings (a declared feature simply won't work). */
   findings: CompatFinding[];
-  /** Safety-relevant findings (something restricted now runs freely) — §6.2. */
+  /** Safety-relevant findings (something restricted now runs freely). */
   safetyFindings: CompatFinding[];
-  /** Inputs unknown at the baseline — surfaced as unassessed (§2.4, §17). */
+  /** Inputs unknown at the baseline — surfaced as unassessed. */
   unassessed: string[];
 }
 
@@ -57,7 +57,7 @@ function deferredSettingCapability(key: string): CapabilityEntry {
       id: `setting.${key}`,
       kind: "setting",
       tier: "degraded-noop",
-      note: "recognized key gating a deferred subsystem — parsed, no-op (§7)",
+      note: "recognized key gating a deferred subsystem — parsed, no-op",
     }
   );
 }
@@ -89,7 +89,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
 
   const { settings } = project;
 
-  // --- Permissions (§6.1 posture) ---------------------------------------
+  // --- Permissions --------------------------------------------------------
   if (settings.permissions.ask.length > 0) {
     const cap = lookupCapability("setting.permissions.ask");
     if (cap) {
@@ -121,7 +121,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     }
   }
 
-  // --- Settings parsed into typed fields but consumed by nothing (§5) ------
+  // --- Settings parsed into typed fields but consumed by nothing ----------
   // These never reach deferredKeys (they parse into ClaudeSettings), so they
   // need direct checks to appear in the report instead of silently vanishing.
   if (settings.model !== undefined) {
@@ -156,7 +156,7 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   // Skill hooks arrive as RAW frontmatter (parseHookConfig normalizes them only at
   // activation), so every shape here is project-controlled input: a single matcher
   // object instead of an array, missing `hooks`, missing handler `type` (defaults
-  // to "command"). Scanning must never throw (§2.2 floor).
+  // to "command"). Scanning must never throw (completeness floor).
   const scanHooks = (config: HookConfig | undefined, where: string) => {
     if (!config || typeof config !== "object") return;
     for (const [event, rawMatchers] of Object.entries(config)) {
@@ -242,8 +242,8 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
       if (cap) addFinding(cap, `agent "${agent.name}" sets hooks:`);
     }
     if (agent.permissionMode !== undefined) {
-      // Safety-relevant no-op (§6.1/§6.2): an agent restricting its permission
-      // mode still runs default-permissive — never silently.
+      // Safety-relevant no-op: an agent restricting its permission mode still
+      // runs default-permissive — never silently.
       const cap = lookupCapability("agent.frontmatter.permissionMode");
       if (cap) {
         addFinding(cap, `agent "${agent.name}" sets permissionMode: "${agent.permissionMode}"`);
@@ -318,7 +318,7 @@ function groupByCapability(findings: CompatFinding[]): Array<{
 }
 
 /**
- * ONE consolidated startup notice per session (§6.2).
+ * ONE consolidated startup notice per session.
  * Returns undefined when suppressed or when there is nothing to report.
  */
 export function renderStartupNotice(
@@ -383,7 +383,7 @@ function subagentPostureLine(project: ClaudeProject): string {
   return `Subagent nesting: subagents.maxDepth=${subagentMaxDepth} (a PiCC extension). Set it to 1 for main-session-only, or 2..5 to allow nested delegation.`;
 }
 
-/** Full /doctor breakdown (§6.2), generated from the registry (§17). */
+/** Full /doctor breakdown, generated from the registry. */
 export function renderDoctorReport(project: ClaudeProject, report: CompatReport): string {
   const lines: string[] = [
     `PiCC compatibility report — baseline ${CLAUDE_BASELINE}`,
@@ -432,12 +432,12 @@ export function renderDoctorReport(project: ClaudeProject, report: CompatReport)
 }
 
 // ---------------------------------------------------------------------------
-// Suppression persistence (§6.2 — suppressible once acknowledged)
+// Suppression persistence — suppressible once acknowledged
 // ---------------------------------------------------------------------------
 
 /**
- * Harness-owned, non-tracked location per §2.3: `.claude/.picc/` is
- * PiCC state, never a tracked project file.
+ * Harness-owned, non-tracked location: `.claude/.picc/` is PiCC state, never a
+ * tracked project file.
  */
 function suppressionPath(projectRoot: string): string {
   return path.join(projectRoot, ".claude", ".picc", "compat-ack.json");

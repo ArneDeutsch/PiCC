@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
-// In-process matrix renderer (FIX 9): importing this does NOT spawn or write —
+// In-process matrix renderer: importing this does NOT spawn or write —
 // the .mjs runs its CLI only when executed directly. Lets the freshness guard
 // regenerate the matrix deterministically without a child process / CRLF flake.
 import { renderCapabilityMatrix } from "../scripts/gen-capability-matrix.mjs";
@@ -192,7 +192,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("tool.TodoWrite")?.tier).toBe("partial");
   });
 
-  // F15 background-by-default remains; F21 makes the settlement push conditional
+  // Background-by-default remains; the settlement push is conditional
   // on an eligible uncollected current task and records suppression as PiCC UX
   // hardening rather than verified Claude parity.
   it("marks the subagent dispatch tools partial and names the failure + background-by-default semantics", () => {
@@ -243,7 +243,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     for (const gap of ["no cross-restart resume", "steering is background-only", "next-turn"]) {
       expect(sm?.note).toContain(gap);
     }
-    // F16: the old "fork/agentOverride ... unsupported" phrasing was reworded — a
+    // The old "fork/agentOverride ... unsupported" phrasing was reworded — a
     // fork is now a partial capability (tool.Agent.fork), unsupported only for
     // RESUME (non-resumable). The note must say so and cross-reference the entry,
     // and must NOT reintroduce the flat "fork ... unsupported" contradiction.
@@ -251,7 +251,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(sm?.note).toContain("tool.Agent.fork");
   });
 
-  // F16: subagent_type:"fork" is a dedicated partial capability — inherits the
+  // subagent_type:"fork" is a dedicated partial capability — inherits the
   // parent conversation (main-session only), env-gated, non-resumable, cannot
   // spawn another fork, and its system prompt is a same-context reconstruction.
   it("carries a tool.Agent.fork entry as partial naming the fork semantics and limits", () => {
@@ -271,8 +271,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(fork?.note).toContain("RECONSTRUCTION");
     // Verified vs INFERRED/PiCC-defined claims are separated in the note.
     expect(fork?.note).toContain("PiCC-DEFINED / INFERRED");
-    // Resolves the research section reference.
-    expect(fork?.note).toContain("§2.9");
+    // The tier rationale names the reconstruction limit, not just the deferrals.
+    expect(fork?.note).toContain("Tier PARTIAL: the prompt reconstruction");
   });
 
   // TaskOutput reports failed status (never empty success) but is partial for its
@@ -281,7 +281,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     const out = lookupCapability("tool.TaskOutput");
     expect(out?.tier).toBe("partial");
     expect(out?.note).toContain("failed status");
-    // F13 t03: TaskOutput is INHERITED by subagents but SCOPED to the dispatcher's
+    // TaskOutput is INHERITED by subagents but SCOPED to the dispatcher's
     // own tasks — the old inverted "Claude hides TaskOutput; PiCC's session-wide
     // registry does not" wording is gone. The note must state the scoped behavior
     // and the honest #15098 hardening (not a blanket "non-divergent" claim).
@@ -296,7 +296,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(out?.note).toContain("reporter-observed Claude Code 2.1.x");
     expect(out?.note).toContain("public docs do not specify notification-consumption semantics");
     expect(out?.note).toContain("NOT claimed as verified parity");
-    expect(out?.note).toContain("PRE-EXISTING SCHEMA GAP (separate from F21)");
+    expect(out?.note).toContain("PRE-EXISTING SCHEMA GAP");
     expect(out?.note).toContain("anthropics/claude-code#21343");
     expect(out?.note).toContain("Claude Code 2.1.20 TaskOutput using block:true");
     expect(out?.note).toContain("anthropics/claude-code#76335");
@@ -317,7 +317,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(stop?.note).toContain("cooperative");
     expect(stop?.note).toContain("discarded late result");
     expect(stop?.note).toContain("post-stop result semantics are undocumented");
-    // F13 t03: TaskStop is scoped by the identical per-dispatcher guard as
+    // TaskStop is scoped by the identical per-dispatcher guard as
     // TaskOutput — carry the honest scoped-behavior + #15098 hardening note.
     expect(stop?.note).toContain("only tasks it dispatched");
     expect(stop?.note).toContain("#15098");
@@ -331,7 +331,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       expect(entry?.tier, ev).toBe("full");
       expect(entry?.note, ev).toContain("agent_id + agent_type");
       expect(entry?.note, ev).toContain("MAIN session transcript");
-      // t07 FIX 5: the parity claim is softened re plugin agent_type — the note
+      // The parity claim is softened re plugin agent_type — the note
       // must state agent_type is the bare frontmatter name (no plugin-scoped id),
       // so "full"/"parity" no longer rests on an unverified plugin assumption.
       expect(entry?.note.toLowerCase(), ev).toContain("plugin");
@@ -339,7 +339,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   });
 
   // Notification stays a degraded no-op; the note must record that settlement does
-  // NOT fire an agent_completed Notification (t05 left it unwired).
+  // NOT fire an agent_completed Notification (it is unwired).
   it("records that background settlement does not fire an agent_completed Notification", () => {
     const n = lookupCapability("hook.event.Notification");
     expect(n?.tier).toBe("degraded-noop");
@@ -351,7 +351,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(n?.note).toContain("not alongside or synchronously");
   });
 
-  // Agent frontmatter `background: true` is honored (since t05) as a full entry.
+  // Agent frontmatter `background: true` is honored as a full entry.
   it("carries an agent.frontmatter.background entry as full", () => {
     const bg = lookupCapability("agent.frontmatter.background");
     expect(bg, "agent.frontmatter.background must exist").toBeDefined();
@@ -388,23 +388,23 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(bg?.note).toContain("late notification during an active conversation");
     expect(bg?.note).toContain("without establishing exact normative timing");
     expect(bg?.note).toContain("one-shot print mode");
-    // F15: the default is now background — the note must assert the new default,
+    // The default is background — the note must assert that default,
     // not the removed "PiCC defaults foreground" gap, and name the residual timing gap.
     expect(bg?.note).toContain("background-by-default");
     expect(bg?.note).not.toContain("PiCC defaults foreground");
-    // F15 t02: the nested-concurrency model is machine-readable — per-depth budgets
+    // The nested-concurrency model is machine-readable — per-depth budgets
     // bound nested fan-out and diverge from Claude's single global parallel-agent cap.
     expect(bg?.note).toContain("per-depth budgets");
     expect(bg?.note).toContain("maxDepth × concurrency");
     expect(bg?.note).toContain("Claude's single global (~10) parallel-agent cap");
-    // F13: the subagent-scoping clause must survive future edits to this entry.
+    // The subagent-scoping clause must survive future edits to this entry.
     expect(bg?.note).toContain("scoped to the subagent's own dispatched tasks");
     for (const gap of ["idle parents are not re-invoked", "no always-on Agent View", "no remote/cloud agents", "stop is cooperative"]) {
       expect(bg?.note).toContain(gap);
     }
   });
 
-  // F11: SlashCommand is a real thin-alias tool at partial tier; the note must
+  // SlashCommand is a real thin-alias tool at partial tier; the note must
   // name the shared skill-activation path and the built-in-command gap.
   it("carries a SlashCommand entry as partial naming the alias path and the built-in gap", () => {
     const sc = lookupCapability("tool.SlashCommand");
@@ -420,7 +420,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
 
   it("stays in sync with the shipped degrade-stub list, in both directions", () => {
     // Every shipped stub resolves to a dedicated degraded-noop registry entry
-    // (a stub reported "unassessed" would be registry drift, §17).
+    // (a stub reported "unassessed" would be registry drift).
     for (const { name } of DEGRADED_TOOLS) {
       const cap = capabilityForToolName(name);
       expect(cap.id, name).toBe(`tool.${name}`);
@@ -435,19 +435,19 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       if (entry.id === "tool.mcp__*") continue;
       expect(stubNames.has(entry.id.slice("tool.".length)), entry.id).toBe(true);
     }
-    // TaskOutput/TaskStop are REAL tools now (audit E4), though partial for
+    // TaskOutput/TaskStop are REAL tools now, though partial for
     // separately documented gaps; neither may ship as a stub.
     expect(lookupCapability("tool.TaskOutput")?.tier).toBe("partial");
     expect(lookupCapability("tool.TaskStop")?.tier).toBe("partial");
     expect(stubNames.has("TaskOutput")).toBe(false);
     expect(stubNames.has("TaskStop")).toBe(false);
-    // SlashCommand is a REAL tool now (F11) — retiered to partial and no longer a stub.
+    // SlashCommand is a REAL tool now — retiered to partial and no longer a stub.
     expect(lookupCapability("tool.SlashCommand")?.tier).toBe("partial");
     expect(stubNames.has("SlashCommand")).toBe(false);
-    // NotebookRead is a REAL tool now (F18) — retiered to partial and no longer a stub.
+    // NotebookRead is a REAL tool now — retiered to partial and no longer a stub.
     expect(lookupCapability("tool.NotebookRead")?.tier).toBe("partial");
     expect(stubNames.has("NotebookRead")).toBe(false);
-    // MultiEdit is a REAL tool now (F17) — retiered to full and no longer a stub.
+    // MultiEdit is a REAL tool now — retiered to full and no longer a stub.
     expect(lookupCapability("tool.MultiEdit")?.tier).toBe("full");
     expect(stubNames.has("MultiEdit")).toBe(false);
     // The stale wrong spelling must be gone: the shipped stub is "computer".
@@ -482,7 +482,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     }
   });
 
-  // cleanupPeriodDays reaps orphaned WORKTREES only — t02 shipped no subagent
+  // cleanupPeriodDays reaps orphaned WORKTREES only — there is no subagent
   // transcript reaper, so the claim is downgraded from full to partial (undersell).
   it("marks cleanupPeriodDays partial — worktrees only, no subagent-transcript cleanup", () => {
     const c = lookupCapability("setting.cleanupPeriodDays");
@@ -525,15 +525,15 @@ describe("CAPABILITY_REGISTRY invariants", () => {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Matrix freshness (t07 FIX 9) — the un-fakeable guard
+// Matrix freshness — the un-fakeable guard
 // ---------------------------------------------------------------------------
 
 describe("capability matrix freshness", () => {
   it("committed doc/supported-features.md is in sync with the registry (regenerated in-process)", () => {
     // Regenerate from the SAME registry + baseline the runtime uses and diff
     // against the committed doc. Both sides CRLF-normalized so a Windows checkout
-    // can't false-fail. The first t07 pass shipped a stale matrix; this makes
-    // that un-fakeable — a registry edit without `npm run gen:capabilities` fails.
+    // can't false-fail. This makes a stale matrix un-fakeable — a registry edit
+    // without `npm run gen:capabilities` fails.
     const regenerated = renderCapabilityMatrix(CAPABILITY_REGISTRY, CLAUDE_BASELINE);
     const committedPath = fileURLToPath(new URL("../doc/supported-features.md", import.meta.url));
     const committed = fs.readFileSync(committedPath, "utf8");
@@ -811,7 +811,7 @@ describe("buildCompatReport", () => {
     expect(report.findings.some((f) => f.capability.id === "tool.Bash")).toBe(false);
     expect(report.unassessed.some((u) => u.includes("Bash"))).toBe(false);
     // disallowed-tools denying a tool is trivially satisfied — no finding. NotebookRead
-    // is now a real `partial` tool (F18), and denying a real tool is equally legitimate.
+    // is now a real `partial` tool, and denying a real tool is equally legitimate.
     expect(report.findings.some((f) => f.capability.id === "tool.NotebookRead")).toBe(false);
   });
 

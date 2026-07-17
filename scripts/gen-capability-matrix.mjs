@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Generate doc/supported-features.md from the capability registry
- * (src/registry/capability-registry.ts) — the single source of truth (plan §17).
+ * (src/registry/capability-registry.ts) — the single source of truth.
  *
  * The registry is TypeScript, so this script cannot `import` it under plain
  * Node. Instead it spawns a short-lived `node --import tsx` child that loads the
@@ -12,7 +12,7 @@
  * The pure formatter `renderCapabilityMatrix(entries, baseline)` is EXPORTED so a
  * test can regenerate the matrix IN-PROCESS (feed it the imported
  * CAPABILITY_REGISTRY) and assert the committed doc is in sync — no spawning, no
- * child-process/CRLF flakiness (t07 FIX 9). Importing this module does NOT spawn
+ * child-process/CRLF flakiness. Importing this module does NOT spawn
  * or write anything; the CLI runs only when executed directly.
  *
  * Run:  node scripts/gen-capability-matrix.mjs
@@ -99,7 +99,7 @@ export function renderCapabilityMatrix(entries, baseline) {
   lines.push(
     `> **Generated file — do not edit by hand.** This matrix is generated from the living ` +
       `capability registry (\`src/registry/capability-registry.ts\`), the single source of truth ` +
-      `for what PiCC supports (plan §17). The same registry drives the runtime \`/doctor\` ` +
+      `for what PiCC supports. The same registry drives the runtime \`/doctor\` ` +
       `report and the startup compatibility notice, so this document cannot drift from actual behavior.`,
   );
   lines.push(">");
@@ -118,7 +118,7 @@ export function renderCapabilityMatrix(entries, baseline) {
   lines.push("");
   lines.push(
     "A ⚠ marker on an ID means the divergence is **safety-relevant**: something a project intended " +
-      "to restrict now runs freely. These are always surfaced at startup and in `/doctor`, never silent (plan §6.2).",
+      "to restrict now runs freely. These are always surfaced at startup and in `/doctor`, never silent.",
   );
   lines.push("");
 
@@ -154,7 +154,7 @@ export function renderCapabilityMatrix(entries, baseline) {
       `${safetyCount} entr${safetyCount === 1 ? "y is" : "ies are"} safety-relevant (marked ⚠) — ` +
       "a divergence where a project's restriction is not enforced and is therefore reported prominently. " +
       "Unknown inputs outside this registry are not counted here: they are unassessed by definition and " +
-      "degrade safely at runtime (plan §2.4).",
+      "degrade safely at runtime.",
   );
   lines.push("");
 
