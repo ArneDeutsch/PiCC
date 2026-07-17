@@ -11,7 +11,11 @@
  *     assistant output, short tool-result previews), newest last, capped in
  *     both count and per-line length, and
  *   - a single `activity` line naming what is happening RIGHT NOW (current tool,
- *     or a silent auto-retry wait - "waiting: API retry 2/3").
+ *     or a silent auto-retry wait - "waiting: API retry 2/3"), and
+ *   - accumulated token `usage`, absent until the first usage-bearing event.
+ *
+ * Beside the snapshot, the condenser keeps an enlarged `fullTail` buffer (same
+ * capture-time sanitization, larger caps) for the status panel's drill-down.
  *
  * SANITIZATION IS SECURITY, NOT COSMETICS: the tail replays subagent-controlled
  * text (its assistant output and - deliberately truncated - its tool results,
@@ -22,18 +26,51 @@
  * truncated preview line so a huge file cannot flood the parent UI.
  */
 
+/**
+ * Token/cost usage accumulated across a dispatch's turns so far. Structurally
+ * identical to `SubagentUsage` (subagent-registry.ts) and `DispatchUsage`
+ * (subagents.ts) — declared locally to keep this module import-free of both;
+ * the compile-time drift guard in subagents.ts breaks tsc the moment the
+ * shapes diverge. One shape everywhere means `formatUsageCompact` and the
+ * status panel read live and settlement usage identically.
+ */
+export interface SnapshotUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  costUsd?: number;
+}
+
 /** A bounded, sanitized view of a running subagent's recent activity. */
 export interface ProgressSnapshot {
   /** Recent activity lines, oldest -> newest; bounded in count and line length. */
   tail: string[];
   /** What the subagent is doing right now (current tool / retry wait / thinking). */
   activity: string;
+  /**
+   * Usage accumulated across this dispatch's turns so far. ABSENT until the
+   * first usage-bearing event (nonzero `totalTokens`): Pi's
+   * `AssistantMessage.usage` is a REQUIRED field, typically zero-filled
+   * mid-stream, and a zero-filled event must not surface as a fake `0`
+   * display. Settlement-time `getSessionStats()` stays authoritative — the
+   * registry record's settled `usage` wins where both exist.
+   */
+  usage?: SnapshotUsage;
 }
 
 /** Default rolling-tail length (lines). Chosen to fit a small TUI slice. */
 export const DEFAULT_MAX_TAIL_LINES = 12;
 /** Default per-line cap (characters) before truncation. */
 export const DEFAULT_MAX_LINE_LENGTH = 200;
+/**
+ * Bounds for the enlarged per-agent transcript buffer (`fullTail`) kept for
+ * the status panel's drill-down view. Larger than the rolling `tail`, but
+ * still hard-capped — the same hostile-content concerns apply, only the
+ * display budget differs.
+ */
+export const FULL_TAIL_MAX_LINES = 100;
+export const FULL_TAIL_MAX_LINE_LENGTH = 300;
 
 // Control bytes referenced by the ANSI matchers, built from code points so the
 // SOURCE stays pure ASCII (no raw control characters in this file). ESC=27, BEL=7.
@@ -121,6 +158,41 @@ function asNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/**
+ * One assistant-message event's usage, or undefined when the event is not
+ * usage-bearing. "Usage-bearing" means nonzero `totalTokens`: Pi zero-fills
+ * the required `usage` field mid-stream, and a zero-filled event must not
+ * start a fake accumulation. On a bearing event, zero individual fields are
+ * honest measured zeros and are kept (mirroring `usageFromStats`).
+ */
+function messageUsage(message: unknown): SnapshotUsage | undefined {
+  const usage = (message as { usage?: unknown } | undefined)?.usage;
+  if (!usage || typeof usage !== "object") return undefined;
+  const u = usage as Record<string, unknown>;
+  const total = asNumber(u.totalTokens);
+  if (total === undefined || total <= 0) return undefined;
+  const cost = asNumber((u.cost as Record<string, unknown> | undefined)?.total);
+  return {
+    inputTokens: asNumber(u.input) ?? 0,
+    outputTokens: asNumber(u.output) ?? 0,
+    cacheReadTokens: asNumber(u.cacheRead) ?? 0,
+    cacheWriteTokens: asNumber(u.cacheWrite) ?? 0,
+    costUsd: cost ?? 0,
+  };
+}
+
+/** Fieldwise sum; `a` may be absent (the first bearing turn starts the total). */
+function addUsage(a: SnapshotUsage | undefined, b: SnapshotUsage): SnapshotUsage {
+  if (!a) return { ...b };
+  return {
+    inputTokens: (a.inputTokens ?? 0) + (b.inputTokens ?? 0),
+    outputTokens: (a.outputTokens ?? 0) + (b.outputTokens ?? 0),
+    cacheReadTokens: (a.cacheReadTokens ?? 0) + (b.cacheReadTokens ?? 0),
+    cacheWriteTokens: (a.cacheWriteTokens ?? 0) + (b.cacheWriteTokens ?? 0),
+    costUsd: (a.costUsd ?? 0) + (b.costUsd ?? 0),
+  };
+}
+
 /** A short, safe hint of a tool call's target (path/command/query), if any. */
 function argHint(args: unknown, maxLen: number): string {
   if (!args || typeof args !== "object") return "";
@@ -143,7 +215,17 @@ function argHint(args: unknown, maxLen: number): string {
  */
 export class SubagentProgressCondenser {
   private readonly tail: string[] = [];
+  /** The enlarged drill-down buffer — same pushes as `tail`, larger caps. */
+  private readonly fullTailBuffer: string[] = [];
   private activity = "";
+  /** Usage summed over COMPLETED turns; folded at each turn_end. */
+  private settledUsage: SnapshotUsage | undefined;
+  /**
+   * Latest usage of the IN-FLIGHT streamed message. Replaced, never summed —
+   * a message's streamed usage is cumulative within that message, so summing
+   * chunks would double-count.
+   */
+  private streamingUsage: SnapshotUsage | undefined;
   private lastSnapshot: string;
 
   constructor(
@@ -210,6 +292,8 @@ export class SubagentProgressCondenser {
         // bounded line) - never grow the tail token-by-token (memory + spam).
         const preview = lastNonEmptyLine(messageText(e.message));
         if (preview) this.activity = sanitizeLine(preview, this.maxLineLength);
+        const usage = messageUsage(e.message);
+        if (usage) this.streamingUsage = usage;
         break;
       }
       case "turn_end": {
@@ -222,6 +306,18 @@ export class SubagentProgressCondenser {
         // we just pushed into `tail` — showing it again as the "… <activity>"
         // footer would duplicate it in the idle snapshot. Reset to a neutral idle label.
         this.activity = "working…";
+        // Usage accumulates by SUMMING each turn's own `AssistantMessage.usage`
+        // (per-LLM-call, never session-cumulative) at turn_end. Event-stream
+        // only: totals are never re-read from `session.messages`, so a
+        // compaction rewriting that array mid-run can neither double- nor
+        // un-count a billed call (a compaction's own summarization call counts
+        // iff it surfaces as a usage-bearing event). The turn_end message is
+        // the streamed message's final form — fold IT, falling back to the last
+        // streamed figure only when the final event lacks usage, and drop the
+        // in-flight value either way so nothing is counted twice.
+        const finalUsage = messageUsage(e.message) ?? this.streamingUsage;
+        if (finalUsage) this.settledUsage = addUsage(this.settledUsage, finalUsage);
+        this.streamingUsage = undefined;
         break;
       }
       default:
@@ -232,7 +328,27 @@ export class SubagentProgressCondenser {
 
   /** Current bounded, sanitized snapshot (a fresh copy). */
   snapshot(): ProgressSnapshot {
-    return { tail: [...this.tail], activity: this.activity };
+    const usage = this.accumulatedUsage();
+    return usage
+      ? { tail: [...this.tail], activity: this.activity, usage }
+      : { tail: [...this.tail], activity: this.activity };
+  }
+
+  /**
+   * The enlarged bounded transcript buffer for the drill-down view (a fresh
+   * copy). Deliberately NOT part of {@link snapshot}: a snapshot-borne
+   * fullTail would ride every `details.subagentProgress` emission and multiply
+   * the JSON.stringify dedupe cost in `changed()`. It travels as a parallel
+   * registry-record field instead and never participates in change detection.
+   */
+  fullTail(): string[] {
+    return [...this.fullTailBuffer];
+  }
+
+  /** Settled turns + the in-flight figure; undefined until usage-bearing. */
+  private accumulatedUsage(): SnapshotUsage | undefined {
+    if (this.streamingUsage) return addUsage(this.settledUsage, this.streamingUsage);
+    return this.settledUsage ? { ...this.settledUsage } : undefined;
   }
 
   private push(line: string): void {
@@ -241,6 +357,13 @@ export class SubagentProgressCondenser {
     this.tail.push(s);
     if (this.tail.length > this.maxTailLines) {
       this.tail.splice(0, this.tail.length - this.maxTailLines);
+    }
+    // The drill-down buffer takes the same line under its own larger caps —
+    // sanitized independently so a narrow display cap never truncates it.
+    // (Empty-after-sanitize is cap-independent: the `!s` return above covers both.)
+    this.fullTailBuffer.push(sanitizeLine(line, FULL_TAIL_MAX_LINE_LENGTH));
+    if (this.fullTailBuffer.length > FULL_TAIL_MAX_LINES) {
+      this.fullTailBuffer.splice(0, this.fullTailBuffer.length - FULL_TAIL_MAX_LINES);
     }
   }
 

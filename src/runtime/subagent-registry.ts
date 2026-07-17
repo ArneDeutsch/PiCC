@@ -1,5 +1,9 @@
 import { isAgentId } from "../util/subagent-transcripts.js";
-import { sanitizeLine, sanitizeProgressText } from "./subagent-progress.js";
+import {
+  sanitizeLine,
+  sanitizeProgressText,
+  type ProgressSnapshot,
+} from "./subagent-progress.js";
 
 /**
  * Dispatch registry: the in-memory source of truth for what a subagent ID or
@@ -175,6 +179,21 @@ export interface SubagentRegistryRecord {
    */
   color?: string;
   /**
+   * Latest bounded live-progress snapshot, mirrored via `noteProgress` from
+   * EVERY dispatch's condenser subscription (foreground, background, nested,
+   * resumed) — the status panel's single live data source. Sanitized by the
+   * condenser at capture. `progress.usage` is the live accumulation; the
+   * settlement-time `usage` above wins where both exist.
+   */
+  progress?: ProgressSnapshot;
+  /**
+   * Enlarged bounded transcript buffer for the panel's drill-down view,
+   * updated beside `progress`. A PARALLEL field, deliberately not on the
+   * snapshot, so it never rides `details.subagentProgress` emissions.
+   * Sanitized and capped by the condenser at capture.
+   */
+  fullTail?: string[];
+  /**
    * USER-initiated stop marker: set only by `markUserStopped` (a panel stop
    * action), NEVER by a model `TaskStop`, and never cleared by `register()` or
    * `markResuming` — a user stop is permanent for this agent id (a fresh
@@ -217,6 +236,34 @@ export class SubagentRegistry {
     string,
     { firstId: string; currentId: string; rebound: boolean }
   >();
+  private readonly changeListeners = new Set<() => void>();
+
+  /**
+   * Minimal change-notification seam for event-driven display consumers (the
+   * status panel repaints on it and re-installs its widget on next activity).
+   * `listener` fires synchronously after every record mutation — register,
+   * noteProgress, markSettled, markResuming, markUserStopped — and never for a
+   * no-op call (unknown id, user-stop veto). `consumeSettledNotice`'s gate
+   * flip is deliberately silent: nothing rendered reads it. Returns an
+   * idempotent unsubscribe. A throwing listener is swallowed — display-side
+   * failures must never corrupt registry state or starve other listeners.
+   */
+  onChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
+  }
+
+  private notifyChange(): void {
+    for (const listener of [...this.changeListeners]) {
+      try {
+        listener();
+      } catch {
+        // display-side listener — never corrupt registry mutation
+      }
+    }
+  }
 
   /**
    * Register a dispatch at session-creation time, or UPDATE an existing record
@@ -248,6 +295,7 @@ export class SubagentRegistry {
       existing.description ??= boundedDescription(input.description);
       existing.prompt ??= boundedContent(input.prompt, PROMPT_CAP);
       existing.color ??= validAgentColor(input.color);
+      this.notifyChange();
       return existing;
     }
     const record: SubagentRegistryRecord = {
@@ -284,7 +332,24 @@ export class SubagentRegistry {
       bound.currentId = input.agentId;
       bound.rebound = true;
     }
+    this.notifyChange();
     return record;
+  }
+
+  /**
+   * Mirror the latest live-progress snapshot (and drill-down `fullTail`) of a
+   * RUNNING dispatch onto its record. The condenser is the sanitizer/bounder —
+   * both arguments arrive sanitized and capped at capture. Ignored for
+   * unknown ids and settled records (a settled record's finalText/usage stay
+   * authoritative; dispatch unsubscribes its condenser before settling, so
+   * the guard only catches stale callers).
+   */
+  noteProgress(agentId: string, snapshot: ProgressSnapshot, fullTail?: string[]): void {
+    const record = this.records.get(agentId);
+    if (!record || record.state !== "running") return;
+    record.progress = snapshot;
+    if (fullTail) record.fullTail = fullTail;
+    this.notifyChange();
   }
 
   /**
@@ -311,6 +376,7 @@ export class SubagentRegistry {
     if (settled?.usage !== undefined) record.usage = settled.usage;
     const finalText = boundedContent(settled?.finalText, FINAL_TEXT_CAP);
     if (finalText !== undefined) record.finalText = finalText;
+    this.notifyChange();
   }
 
   /**
@@ -330,6 +396,7 @@ export class SubagentRegistry {
     record.settledNoticeConsumed = false;
     record.startedAt = Date.now();
     record.settledAt = undefined;
+    this.notifyChange();
   }
 
   /**
@@ -344,6 +411,7 @@ export class SubagentRegistry {
     const record = this.records.get(agentId);
     if (!record) return;
     record.userStopped = true;
+    this.notifyChange();
   }
 
   get(agentId: string): SubagentRegistryRecord | undefined {

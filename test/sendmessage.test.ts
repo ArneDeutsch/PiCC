@@ -682,7 +682,22 @@ describe("SendMessage resume — offline integration (real SessionManager)", () 
     // usage chain — usage must be captured on the RESUME path, not only fresh
     // dispatch. Both sessions report the same stats here.
     const h = fakeSdk({
-      replies: ["FIRST REPLY", "RESUME REPLY", "SECOND RESUME", "THIRD RESUME"],
+      replies: [
+        "FIRST REPLY",
+        // The resume turn streams a live event so the RESUMED run's registry
+        // mirror is observable (plain string replies emit no session events).
+        {
+          text: "RESUME REPLY",
+          events: [
+            {
+              type: "turn_end",
+              message: { role: "assistant", content: [{ type: "text", text: "RESUME REPLY" }] },
+            },
+          ],
+        },
+        "SECOND RESUME",
+        "THIRD RESUME",
+      ],
       stats: { tokens: { input: 30, output: 12, cacheRead: 4 }, cost: 0.05 },
     });
     const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
@@ -802,6 +817,12 @@ describe("SendMessage resume — offline integration (real SessionManager)", () 
     };
     expect(record?.usage).toEqual(expectedUsage);
     expect(registry.get(agentId)!.usage).toEqual(expectedUsage);
+
+    // The RESUMED run's live-progress mirror worked too: the registry record's
+    // last snapshot reflects the resumed generation, proving markResuming
+    // re-armed the record to "running" BEFORE the mirror's events fired (the
+    // one ordering that keeps noteProgress's running-guard open on resume).
+    expect(registry.get(agentId)!.progress?.tail.join("\n")).toContain("RESUME REPLY");
 
     // A SECOND createAgentSession happened, seeded from the reopened transcript —
     // prior context is available to the resumed run (SECURITY: from the reopened

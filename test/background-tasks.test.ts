@@ -2789,3 +2789,144 @@ describe("BackgroundTaskRegistry.markUserStopped", () => {
     expect(out.details.status).toBe("stopped");
   });
 });
+
+// ---------------------------------------------------------------------------
+
+describe("SubagentRegistry live mirror + onChange", () => {
+  it("background dispatch mirrors progress, fullTail, and live usage onto the dispatch registry record and keeps the task record in sync", async () => {
+    const sub = new SubagentRegistry();
+    const bg = new BackgroundTaskRegistry();
+    const events = [
+      { type: "tool_execution_start", toolName: "Grep", args: { pattern: "foo" } },
+      {
+        type: "turn_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "done" }],
+          // Pi-shaped AssistantMessage.usage: required, usage-bearing here.
+          usage: {
+            input: 10,
+            output: 5,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 15,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.25 },
+          },
+        },
+      },
+    ];
+    const h = fakeSdk({
+      replies: [{ text: "done", events }],
+      // Settlement stats match the event-stream figures, so the live snapshot
+      // usage must equal the settled registry usage exactly.
+      stats: { tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 }, cost: 0.25 },
+    });
+    const runtime = makeRuntime([makeAgent()], h.sdk, { subagentRegistry: sub });
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: bg,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t1", {
+      subagent_type: "worker",
+      prompt: "go",
+      run_in_background: true,
+    });
+    const taskId = String(started.details.taskId);
+    await bg.wait(taskId);
+    const rec = sub.get(String(started.details.agentId))!;
+    expect(rec.progress?.tail.some((l) => l.includes("Grep"))).toBe(true);
+    expect(rec.fullTail?.some((l) => l.includes("Grep"))).toBe(true);
+    const live = {
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costUsd: 0.25,
+    };
+    // Live usage appeared once known and never contradicts settlement stats.
+    expect(rec.progress?.usage).toEqual(live);
+    expect(rec.usage).toEqual(live);
+    // The background task record's own progress mirror stayed in sync.
+    expect(bg.get(taskId)?.progress?.tail).toEqual(rec.progress?.tail);
+    expect(bg.get(taskId)?.progress?.usage).toEqual(live);
+  });
+
+  it("onChange fires on every mutation, skips no-ops, and unsubscribes cleanly", () => {
+    const sub = new SubagentRegistry();
+    let fires = 0;
+    const unsub = sub.onChange(() => fires++);
+    const id = "agent-aaaaaaaaaaaa";
+    sub.register({
+      agentId: id,
+      agentName: "worker",
+      depth: 1,
+      cwd: "/x",
+      resumable: true,
+      oneShot: false,
+    });
+    expect(fires).toBe(1);
+    sub.noteProgress(id, { tail: ["line"], activity: "working…" }, ["full line"]);
+    expect(fires).toBe(2);
+    expect(sub.get(id)?.fullTail).toEqual(["full line"]);
+    // A snapshot-only note keeps the prior fullTail.
+    sub.noteProgress(id, { tail: ["line", "next"], activity: "working…" });
+    expect(fires).toBe(3);
+    expect(sub.get(id)?.fullTail).toEqual(["full line"]);
+    sub.markSettled(id, { outcome: "completed" });
+    expect(fires).toBe(4);
+    // Settled: noteProgress is a silent no-op — the settled record stays authoritative.
+    sub.noteProgress(id, { tail: ["late"], activity: "x" });
+    expect(sub.get(id)?.progress?.tail).toEqual(["line", "next"]);
+    expect(fires).toBe(4);
+    sub.markResuming(id);
+    expect(fires).toBe(5);
+    sub.markSettled(id);
+    expect(fires).toBe(6);
+    sub.markUserStopped(id);
+    expect(fires).toBe(7);
+    // The user-stop veto makes markResuming a silent no-op.
+    sub.markResuming(id);
+    expect(fires).toBe(7);
+    // consumeSettledNotice mutates only the delivery gate — deliberately silent
+    // (nothing rendered reads it; t04's repaint loop trusts this exact fire-set).
+    sub.consumeSettledNotice(id);
+    expect(fires).toBe(7);
+    // Unknown ids never fire.
+    sub.markSettled("agent-bbbbbbbbbbbb");
+    sub.noteProgress("agent-bbbbbbbbbbbb", { tail: [], activity: "" });
+    sub.markUserStopped("agent-bbbbbbbbbbbb");
+    expect(fires).toBe(7);
+    unsub();
+    sub.register({
+      agentId: "agent-cccccccccccc",
+      agentName: "other",
+      depth: 1,
+      cwd: "/x",
+      resumable: false,
+      oneShot: false,
+    });
+    expect(fires).toBe(7);
+  });
+
+  it("a throwing onChange listener neither breaks the mutation nor starves other listeners", () => {
+    const sub = new SubagentRegistry();
+    let seen = 0;
+    sub.onChange(() => {
+      throw new Error("hostile listener");
+    });
+    sub.onChange(() => seen++);
+    const id = "agent-dddddddddddd";
+    expect(() =>
+      sub.register({
+        agentId: id,
+        agentName: "worker",
+        depth: 1,
+        cwd: "/x",
+        resumable: false,
+        oneShot: false,
+      }),
+    ).not.toThrow();
+    expect(seen).toBe(1);
+    expect(sub.get(id)).toBeDefined();
+  });
+});

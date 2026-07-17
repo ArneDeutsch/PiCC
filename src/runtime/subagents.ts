@@ -38,6 +38,7 @@ import {
   sanitizeLine,
   SubagentProgressCondenser,
   type ProgressSnapshot,
+  type SnapshotUsage,
 } from "./subagent-progress.js";
 import { renderAgentCall, renderAgentResult } from "./subagent-render.js";
 import { formatBackgroundTaskIdentity } from "./background-identity.js";
@@ -157,12 +158,13 @@ export interface DispatchUsage {
 
 /**
  * Drift guard: `DispatchUsage` (here), `UsageLike` (background-tasks),
- * and `SubagentUsage` (subagent-registry) are byte-identical by intent but kept
- * in three files to preserve those modules' no-value-import relationship. This
- * compile-time assertion breaks `tsc` the moment any of the three gains, loses,
- * or retypes a field without the others — key drift is caught by the mutual
- * `keyof` containment, field-type drift by the mutual assignability. Type-only
- * (the imports above are `import type`, erased at runtime — no cycle).
+ * `SubagentUsage` (subagent-registry), and `SnapshotUsage` (subagent-progress)
+ * are byte-identical by intent but kept in four files to preserve those
+ * modules' no-value-import relationship. This compile-time assertion breaks
+ * `tsc` the moment any of them gains, loses, or retypes a field without the
+ * others — key drift is caught by the mutual `keyof` containment, field-type
+ * drift by the mutual assignability. Type-only (the imports above are
+ * `import type`, erased at runtime — no cycle).
  */
 type _SameShape<A, B> = [keyof A] extends [keyof B]
   ? [keyof B] extends [keyof A]
@@ -174,7 +176,8 @@ type _SameShape<A, B> = [keyof A] extends [keyof B]
     : never
   : never;
 type _UsageDriftGuard = _SameShape<DispatchUsage, UsageLike> &
-  _SameShape<DispatchUsage, SubagentUsage>;
+  _SameShape<DispatchUsage, SubagentUsage> &
+  _SameShape<DispatchUsage, SnapshotUsage>;
 const _usageDriftOk: _UsageDriftGuard = true;
 void _usageDriftOk;
 
@@ -1529,16 +1532,27 @@ export class SubagentRuntime {
       }
 
       // Live progress: subscribe to the child session's event stream and
-      // condense it into a bounded, sanitized snapshot pushed to opts.onProgress
-      // on every visible change. Event-stream only — NEVER poll session.messages
-      // (compaction inside prompt() rewrites that array mid-flight). Degrades to
-      // nothing when the session has no subscribe() (simple fakes, older SDKs).
-      if (opts.onProgress && typeof session.subscribe === "function") {
+      // condense it into a bounded, sanitized snapshot on every visible change.
+      // The dispatch-registry mirror is UNCONDITIONAL — this subscription is
+      // the panel's single live data source, so foreground (with or without an
+      // onUpdate sink), background, nested, and resumed dispatches all feed it;
+      // opts.onProgress additionally receives the same snapshot when supplied,
+      // exactly as before. Mirror before emit, so the record never lags a
+      // consumer-visible snapshot; the enlarged fullTail rides BESIDE the
+      // snapshot (a parallel record field), never inside the emitted payloads.
+      // Event-stream only — NEVER poll session.messages (compaction inside
+      // prompt() rewrites that array mid-flight). Degrades to nothing when the
+      // session has no subscribe() (simple fakes, older SDKs).
+      const dispatchRegistry = this.deps.subagentRegistry;
+      if ((opts.onProgress || dispatchRegistry) && typeof session.subscribe === "function") {
         const emit = opts.onProgress;
         const condenser = new SubagentProgressCondenser();
         progressUnsub = session.subscribe((event: unknown) => {
           try {
-            if (condenser.consume(event)) emit(condenser.snapshot());
+            if (!condenser.consume(event)) return;
+            const snapshot = condenser.snapshot();
+            dispatchRegistry?.noteProgress(agentId, snapshot, condenser.fullTail());
+            emit?.(snapshot);
           } catch {
             // progress is best-effort display — never let it break the dispatch
           }

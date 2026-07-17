@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_MAX_LINE_LENGTH,
   DEFAULT_MAX_TAIL_LINES,
+  formatUsageCompact,
+  FULL_TAIL_MAX_LINE_LENGTH,
+  FULL_TAIL_MAX_LINES,
   renderProgressText,
   sanitizeLine,
   sanitizeProgressText,
@@ -215,5 +219,186 @@ describe("SubagentProgressCondenser", () => {
     const snap: ProgressSnapshot = { tail: ["a", "b"], activity: "running Read…" };
     expect(renderProgressText(snap)).toBe("a\nb\n… running Read…");
     expect(renderProgressText({ tail: [], activity: "" })).toBe("");
+  });
+});
+
+/** A Pi-shaped `AssistantMessage.usage` (all fields required, zero-filled by default). */
+function piUsage(
+  over: Partial<{
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    totalTokens: number;
+    cost: number;
+  }> = {},
+) {
+  return {
+    input: over.input ?? 0,
+    output: over.output ?? 0,
+    cacheRead: over.cacheRead ?? 0,
+    cacheWrite: over.cacheWrite ?? 0,
+    totalTokens: over.totalTokens ?? 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: over.cost ?? 0 },
+  };
+}
+
+/** An assistant message carrying Pi-shaped usage. */
+function assistantWithUsage(text: string, usage: ReturnType<typeof piUsage>) {
+  return { role: "assistant", content: [{ type: "text", text }], usage };
+}
+
+describe("SubagentProgressCondenser usage accumulation", () => {
+  it("stays absent through zero-filled mid-stream events (never a fake 0 display)", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({ type: "message_update", message: assistantWithUsage("draft", piUsage()) });
+    expect(c.snapshot().usage).toBeUndefined();
+    c.consume({ type: "turn_end", message: assistantWithUsage("draft", piUsage()) });
+    expect(c.snapshot().usage).toBeUndefined();
+  });
+
+  it("sums each turn's own usage at turn_end, keeping honest measured zeros", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({
+      type: "turn_end",
+      message: assistantWithUsage("one", piUsage({ input: 10, output: 5, totalTokens: 15, cost: 0.25 })),
+    });
+    expect(c.snapshot().usage).toEqual({
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costUsd: 0.25,
+    });
+    c.consume({
+      type: "turn_end",
+      message: assistantWithUsage("two", piUsage({ input: 4, output: 2, cacheRead: 8, totalTokens: 14, cost: 0.5 })),
+    });
+    expect(c.snapshot().usage).toEqual({
+      inputTokens: 14,
+      outputTokens: 7,
+      cacheReadTokens: 8,
+      cacheWriteTokens: 0,
+      costUsd: 0.75,
+    });
+  });
+
+  it("streamed usage REPLACES the in-flight figure and is not double-counted at turn_end", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({
+      type: "message_update",
+      message: assistantWithUsage("d", piUsage({ input: 3, output: 1, totalTokens: 4 })),
+    });
+    expect(c.snapshot().usage?.outputTokens).toBe(1);
+    // The streamed figure is cumulative within the message: replace, never sum.
+    c.consume({
+      type: "message_update",
+      message: assistantWithUsage("dr", piUsage({ input: 3, output: 6, totalTokens: 9 })),
+    });
+    const expected = {
+      inputTokens: 3,
+      outputTokens: 6,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costUsd: 0,
+    };
+    expect(c.snapshot().usage).toEqual(expected);
+    // turn_end folds the SAME message's final figure — no double count.
+    c.consume({
+      type: "turn_end",
+      message: assistantWithUsage("dr", piUsage({ input: 3, output: 6, totalTokens: 9 })),
+    });
+    expect(c.snapshot().usage).toEqual(expected);
+  });
+
+  it("turn_end without usage falls back to the last streamed figure, exactly once", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({
+      type: "message_update",
+      message: assistantWithUsage("d", piUsage({ input: 2, output: 2, totalTokens: 4 })),
+    });
+    c.consume({ type: "turn_end", message: assistant("d") }); // final event lacks usage
+    const expected = {
+      inputTokens: 2,
+      outputTokens: 2,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costUsd: 0,
+    };
+    expect(c.snapshot().usage).toEqual(expected);
+    // A later usage-less turn re-counts nothing.
+    c.consume({ type: "turn_end", message: assistant("e") });
+    expect(c.snapshot().usage).toEqual(expected);
+  });
+
+  it("a usage tick alone is a visible change, so live counts reach subscribers", () => {
+    const c = new SubagentProgressCondenser();
+    // Empty text: tail and activity are untouched — only usage changed.
+    expect(
+      c.consume({
+        type: "message_update",
+        message: assistantWithUsage("", piUsage({ input: 1, totalTokens: 1 })),
+      }),
+    ).toBe(true);
+    expect(c.snapshot().usage?.inputTokens).toBe(1);
+  });
+
+  it("formatUsageCompact reads the snapshot usage unchanged (one shape, not two)", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({
+      type: "turn_end",
+      message: assistantWithUsage("x", piUsage({ input: 10, output: 5, totalTokens: 15, cost: 0.25 })),
+    });
+    expect(formatUsageCompact(c.snapshot().usage)).toBe(
+      "in 10 · out 5 · cache read 0 · cache write 0 · $0.25",
+    );
+  });
+});
+
+describe("SubagentProgressCondenser fullTail (drill-down buffer)", () => {
+  it("keeps more history than the tail, bounded to FULL_TAIL_MAX_LINES (newest kept)", () => {
+    const c = new SubagentProgressCondenser();
+    const pushes = FULL_TAIL_MAX_LINES + 20;
+    for (let i = 0; i < pushes; i++) {
+      c.consume({ type: "tool_execution_start", toolName: `T${i}`, args: {} });
+    }
+    expect(c.snapshot().tail.length).toBe(DEFAULT_MAX_TAIL_LINES);
+    const full = c.fullTail();
+    expect(full.length).toBe(FULL_TAIL_MAX_LINES);
+    expect(full[0]).toBe(`> T${pushes - FULL_TAIL_MAX_LINES}`); // oldest overflow rotated out
+    expect(full[full.length - 1]).toBe(`> T${pushes - 1}`);
+  });
+
+  it("caps fullTail lines at FULL_TAIL_MAX_LINE_LENGTH beside the shorter tail cap", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({ type: "turn_end", message: assistant("x".repeat(1000)) });
+    const tailLine = c.snapshot().tail[0]!;
+    const fullLine = c.fullTail()[0]!;
+    expect(tailLine.length).toBe(DEFAULT_MAX_LINE_LENGTH);
+    expect(fullLine.length).toBe(FULL_TAIL_MAX_LINE_LENGTH);
+    expect(fullLine.endsWith("…")).toBe(true);
+    // Same content, different budget: the tail line is a prefix of the full line.
+    expect(fullLine.startsWith(tailLine.slice(0, -1))).toBe(true);
+  });
+
+  it("applies the same capture-time sanitization as the tail (matrix reuse)", () => {
+    const c = new SubagentProgressCondenser();
+    const hostile = `${ESC}]0;pwn${BEL}payload ${ESC}[31mred${ESC}Dtail`;
+    c.consume({ type: "tool_execution_end", toolName: "Read", result: hostile, isError: false });
+    const full = c.fullTail();
+    expect(full.some((l) => l.includes("payload redtail"))).toBe(true);
+    for (const line of full) {
+      expect(line.includes(ESC)).toBe(false);
+      expect(line.includes(BEL)).toBe(false);
+    }
+  });
+
+  it("is a parallel buffer: never on the snapshot, returned as a fresh copy", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({ type: "tool_execution_start", toolName: "Grep", args: {} });
+    expect("fullTail" in c.snapshot()).toBe(false);
+    const copy = c.fullTail();
+    copy.push("mutated");
+    expect(c.fullTail()).not.toContain("mutated");
   });
 });

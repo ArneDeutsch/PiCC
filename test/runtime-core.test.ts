@@ -53,6 +53,7 @@ import {
 } from "../src/runtime/context-assembly.js";
 import { mapEffort, steeringForModel, type PiCCConfig } from "../src/runtime/steering.js";
 import { createAgentToolDefinition, extractText, type SubagentRuntime } from "../src/runtime/subagents.js";
+import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import { visibleWidth as tuiVisibleWidth, Text as TuiText } from "@earendil-works/pi-tui";
 import type { ProgressSnapshot } from "../src/runtime/subagent-progress.js";
 import { renderAgentResult } from "../src/runtime/subagent-render.js";
@@ -1214,6 +1215,32 @@ describe("Subagent live progress", () => {
     expect(result.ok).toBe(true);
     expect(result.finalMessage).toBe("ok");
     expect(snapshots.length).toBe(0);
+  });
+
+  it("a foreground dispatch with NO onProgress sink still mirrors live progress onto the registry record", async () => {
+    // The panel's single-live-data-source contract: the registry mirror rides
+    // dispatch's own condenser subscription, not the tool's onUpdate wiring.
+    const sub = new SubagentRegistry();
+    const { sdk } = fakeSdk({ replies: [streamReply] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk, { subagentRegistry: sub });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    expect(result.ok).toBe(true);
+    const rec = sub.get(result.agentId)!;
+    expect(rec.progress?.tail.some((l) => l.includes("Grep"))).toBe(true);
+    expect(rec.progress?.tail).toContain("final line");
+    expect(rec.fullTail?.some((l) => l.includes("Grep"))).toBe(true);
+  });
+
+  it("a nested (depth 2) dispatch mirrors live progress onto its registry record too", async () => {
+    const sub = new SubagentRegistry();
+    const { sdk } = fakeSdk({ replies: [streamReply] });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk, { subagentRegistry: sub });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 2 });
+    expect(result.ok).toBe(true);
+    const rec = sub.get(result.agentId)!;
+    expect(rec.depth).toBe(2);
+    expect(rec.progress?.tail.some((l) => l.includes("Grep"))).toBe(true);
+    expect(rec.fullTail?.some((l) => l.includes("Grep"))).toBe(true);
   });
 
   it("Agent tool forwards live progress through onUpdate with the expected shape", async () => {
