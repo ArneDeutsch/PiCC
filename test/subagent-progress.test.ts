@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_MAX_TAIL_LINES,
   renderProgressText,
+  sanitizeLine,
   sanitizeProgressText,
   SubagentProgressCondenser,
   type ProgressSnapshot,
@@ -48,6 +49,35 @@ describe("sanitizeProgressText (terminal-injection defense)", () => {
     // FIX-B pin: sanitizeProgressText preserves \r (code 13) so callers can split
     // into lines first; the per-line sanitizer (sanitizeLine) collapses the \r.
     expect(sanitizeProgressText("x\ry")).toBe("x\ry");
+  });
+
+  it("strips single-char Fe escapes (ESC + final byte)", () => {
+    // ESC D (Index) is a two-byte Fe escape — both bytes go, the payload stays.
+    expect(sanitizeProgressText(`a${ESC}Db`)).toBe("ab");
+  });
+});
+
+describe("sanitizeLine (the capture-site single-line sanitizer)", () => {
+  // The exact sanitizer applied at capture to model-controlled identity strings
+  // (task_id echoes, subagent_type labels, descriptions, agent names).
+  it("flattens hostile multi-line/control input to one clean line", () => {
+    const c1Csi = String.fromCharCode(155); // single-byte C1 CSI
+    const hostile = `a${ESC}]0;title${BEL}b\r\nc\td${c1Csi}`;
+    expect(sanitizeLine(hostile, 80)).toBe("ab c d");
+  });
+
+  it("strips OSC, CSI, and Fe escape families wholesale", () => {
+    const hostile = `x${ESC}]0;pwn${BEL}${ESC}[31m${ESC}Dy`;
+    const clean = sanitizeLine(hostile, 80);
+    expect(clean).toBe("xy");
+    expect(clean.includes(ESC)).toBe(false);
+    expect(clean.includes(BEL)).toBe(false);
+  });
+
+  it("caps to the requested length with a visible ellipsis", () => {
+    const out = sanitizeLine("x".repeat(100), 10);
+    expect(out.length).toBe(10);
+    expect(out.endsWith("…")).toBe(true);
   });
 });
 

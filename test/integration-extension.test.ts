@@ -1174,6 +1174,17 @@ describe("subagent background-task scoping (offline-integration via a real dispa
     // Three distinct ids off the single session-wide counter.
     expect(new Set([ownTaskId1, siblingTaskId, coordTaskId]).size).toBe(3);
 
+    // Parent link on a GENUINELY nested dispatch: the inner agent's registry
+    // record carries the outer subagent's runtime-minted id (== the task owner
+    // the runtime tagged) — the seam the panel's tree (t03) is built on.
+    const innerTask1 = internals.backgroundTasks.get(ownTaskId1!);
+    expect(innerTask1?.owner, "nested task carries its dispatcher-owner id").toBeTruthy();
+    const innerRecord1 = internals.subagentRegistry.get(innerTask1!.agentId!);
+    expect(innerRecord1?.parentAgentId).toBe(innerTask1!.owner);
+    // The coordinator-owned task has no parent (depth-1).
+    const coordRecord = internals.subagentRegistry.get(internals.backgroundTasks.get(coordTaskId)!.agentId!);
+    expect(coordRecord?.parentAgentId).toBeUndefined();
+
     const sub1Output = findTool(subagent1Tools, "TaskOutput");
     const sub1Stop = findTool(subagent1Tools, "TaskStop");
     // Sanity: subagent2 also received its own scoped tools (used implicitly via

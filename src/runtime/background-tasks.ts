@@ -28,6 +28,13 @@ import {
 export type BackgroundTaskStatus = "running" | "completed" | "failed" | "stopped";
 
 /**
+ * Single-line cap for model-supplied identity strings (task_id echoes, labels,
+ * agent names) sanitized at capture, on top of the render-time defense that
+ * stays in place.
+ */
+const CAPTURED_LINE_CAP = 120;
+
+/**
  * One pending settlement notice returned by `drainSettlementNotices`: the
  * ready-to-deliver `content`, plus a `commit` the caller invokes ONLY after
  * a successful `pi.sendMessage` — flipping the dedup gate so that eligible
@@ -148,6 +155,14 @@ export interface BackgroundTaskRecord {
    * (the `label` still carries the `agent:<type>` form for existing surfaces).
    */
   agentType?: string;
+  /**
+   * USER-initiated stop marker (a panel action): set only via
+   * `markUserStopped`, never by the model's TaskStop tool. Surfaced through
+   * TaskOutput `details` — renderers are pure over (result, details, theme)
+   * and cannot read registries, so details is the sanctioned data path for a
+   * "stopped by user" rendering.
+   */
+  userStopped?: boolean;
   diagnostics: Diagnostic[];
   /** Settles when the underlying dispatch ends (never rejects). */
   settled: Promise<void>;
@@ -274,12 +289,18 @@ export class BackgroundTaskRegistry {
     const generation = ++this.counter;
     const id = `task-${generation}`;
     this.taskGeneration.set(id, generation);
+    // Capture-time sanitization: label/agentType derive from the
+    // model-supplied subagent_type — the stored record fields are clean from
+    // the moment they exist, whoever the caller is.
     const record: BackgroundTaskRecord = {
       id,
-      label,
+      label: sanitizeLine(label, CAPTURED_LINE_CAP),
       status: "running",
       agentId,
-      agentType,
+      agentType:
+        agentType === undefined
+          ? undefined
+          : sanitizeLine(agentType, CAPTURED_LINE_CAP) || undefined,
       owner,
       diagnostics: [],
       settled: Promise.resolve(),
@@ -288,7 +309,11 @@ export class BackgroundTaskRegistry {
     };
     record.settled = promise.then(
       (result) => {
-        record.agentName = result.agentName;
+        // Capture-time sanitization of the mirrored agent name.
+        record.agentName =
+          result.agentName === undefined
+            ? undefined
+            : sanitizeLine(result.agentName, CAPTURED_LINE_CAP) || undefined;
         // Identity mirror: the settled result is authoritative (the pre-minted
         // id normally matches it). Update the generation index too:
         // an early record may first acquire or may correct its stable id here.
@@ -507,6 +532,23 @@ export class BackgroundTaskRegistry {
       }
     }
     return { found: true, alreadySettled: false, abortRequested };
+  }
+
+  /**
+   * USER-initiated stop (a panel action, never the model's TaskStop tool):
+   * marks the record user-stopped, then performs the same best-effort stop
+   * transition as {@link stop}. The marker is what lets TaskOutput details
+   * consumers distinguish "stopped by user" from a model stop; callers pair
+   * it with `SubagentRegistry.markUserStopped`, which makes the
+   * stop permanent for the agent id. The marker is set only when the task is
+   * running (or already stopped): a completed/failed task cannot be
+   * retroactively claimed as user-stopped.
+   */
+  markUserStopped(id: string): { found: boolean; alreadySettled: boolean; abortRequested: boolean } {
+    const task = this.tasks.get(id);
+    if (!task) return { found: false, alreadySettled: false, abortRequested: false };
+    if (task.status === "running" || task.status === "stopped") task.userStopped = true;
+    return this.stop(id);
   }
 
   /**
@@ -767,7 +809,10 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
       signal?: AbortSignal,
       onUpdate?: (update: ToolUpdate) => void,
     ) {
-      const id = String(params.task_id ?? "").trim();
+      // Capture-time sanitization: a hostile task_id is echoed by
+      // unknownIdError into terminal-bound text — single line, capped, BEFORE
+      // lookup or interpolation. Minted ids ("task-N") pass through unchanged.
+      const id = sanitizeLine(String(params.task_id ?? ""), CAPTURED_LINE_CAP);
       const task = registry.get(id);
       if (!task) throw unknownIdError(registry, id);
       // The clean dispatched agent type is the identity shown at every surface
@@ -904,6 +949,9 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
           usage: task.usage,
           lastActivity: task.lastActivity,
           diagnostics: task.diagnostics,
+          // "Stopped by user" travels via details ONLY: renderers are pure
+          // over (result, details, theme) and cannot read the registry.
+          ...(task.userStopped ? { userStopped: true } : {}),
         },
       };
       if (task.status !== "running" && !registry.markCollected(id)) {
@@ -950,7 +998,9 @@ export function createTaskStopTool(registry: BackgroundTaskView): Record<string,
       task_id: Type.String({ description: 'Task id returned at start, e.g. "task-1"' }),
     }),
     async execute(_toolCallId: string, params: { task_id: string }) {
-      const id = String(params.task_id ?? "").trim();
+      // Capture-time sanitization: mirrors TaskOutput — the id is
+      // echoed by unknownIdError, so sanitize before lookup/interpolation.
+      const id = sanitizeLine(String(params.task_id ?? ""), CAPTURED_LINE_CAP);
       const task = registry.get(id);
       if (!task) throw unknownIdError(registry, id);
       const stopped = registry.stop(id);

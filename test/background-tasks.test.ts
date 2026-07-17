@@ -2637,3 +2637,155 @@ describe("BackgroundTaskRegistry.scopedTo — per-dispatcher isolation", () => {
     await expect(taskOutput.execute("t", { task_id: b.id })).rejects.toThrow();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Capture-time sanitization + user-stop marker
+// ---------------------------------------------------------------------------
+
+describe("capture-time sanitization", () => {
+  const ESC = String.fromCharCode(27);
+  const BEL = String.fromCharCode(7);
+
+  it("TaskOutput and TaskStop sanitize a hostile task_id before it is echoed in the unknown-id error", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const hostileId = `bogus${ESC}]0;pwned${BEL}${ESC}[31m \nline2`;
+    for (const tool of [
+      createTaskOutputTool(registry) as unknown as ToolLike,
+      createTaskStopTool(registry) as unknown as ToolLike,
+    ]) {
+      let msg = "";
+      try {
+        await tool.execute("x", { task_id: hostileId });
+      } catch (e) {
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/Unknown task_id/);
+      // Escapes stripped, whitespace flattened to one line, readable remnant kept.
+      expect(msg).toContain("bogus line2");
+      expect(msg).not.toContain(ESC);
+      expect(msg).not.toContain(BEL);
+      expect(msg).not.toContain("\n" + "line2");
+    }
+  });
+
+  it("the Agent tool's hostile subagent_type is clean on the task RECORD (label + agentType) immediately after capture", async () => {
+    const hostileType = `worker${ESC}]0;pwn${BEL}${ESC}[31m`;
+    const { sdk, release } = gatedSdk("done");
+    const bg = new BackgroundTaskRegistry();
+    const runtime = makeRuntime([makeAgent()], sdk);
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: bg,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t", { subagent_type: hostileType, prompt: "go" });
+    // Assert the RECORD, not the printed text: clean the instant it exists.
+    const rec = bg.get(String(started.details.taskId))!;
+    expect(rec.agentType).toBe("worker");
+    expect(rec.label).toBe("agent:worker");
+    expect(String(started.details.agent)).toBe("worker");
+    expect(started.content[0]!.text).not.toContain(ESC);
+    release();
+    await bg.wait(rec.id);
+  });
+
+  it("start() sanitizes hostile label/agentType at record capture and the settled agentName mirror (direct registry path)", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const id = registry.start(
+      `agent:${ESC}[31mworker${BEL}`,
+      Promise.resolve(result({ agentName: `rev${ESC}[0miewer${BEL}` })),
+      undefined,
+      undefined,
+      `wo${ESC}[7mrker`,
+    );
+    const rec = registry.get(id)!;
+    expect(rec.label).toBe("agent:worker");
+    expect(rec.agentType).toBe("worker");
+    await registry.wait(id);
+    expect(rec.agentName).toBe("reviewer"); // BackgroundResultLike mirror, clean at capture
+  });
+
+  it("hostile description, prompt, and final answer are clean on the dispatch registry record at capture", async () => {
+    const sub = new SubagentRegistry();
+    const bg = new BackgroundTaskRegistry();
+    const h = fakeSdk({ replies: [`ans${ESC}[31mwer${BEL}\nline two`] });
+    const runtime = makeRuntime([makeAgent()], h.sdk, { subagentRegistry: sub });
+    const agentTool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: bg,
+    }) as unknown as ToolLike;
+    const started = await agentTool.execute("t", {
+      subagent_type: "worker",
+      prompt: `do${ESC}]0;pwn${BEL} the ${ESC}[31mthing\nline2`,
+      run_in_background: true,
+      description: `lab${ESC}[31mel${BEL}`,
+    });
+    const rec = sub.get(String(started.details.agentId))!;
+    // Clean at capture — before any render touches them.
+    expect(rec.description).toBe("label");
+    expect(rec.prompt).toBe("do the thing\nline2"); // multi-line kept, escapes gone
+    await bg.wait(String(started.details.taskId));
+    expect(rec.finalText).toBe("answer\nline two");
+    for (const value of [rec.description, rec.prompt, rec.finalText]) {
+      expect(value).not.toContain(ESC);
+      expect(value).not.toContain(BEL);
+    }
+  });
+});
+
+describe("BackgroundTaskRegistry.markUserStopped", () => {
+  it("marks a running task user-stopped, requests the abort, and TaskOutput details carry userStopped", async () => {
+    const registry = new BackgroundTaskRegistry();
+    let aborted = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const id = registry.start(
+      "agent:worker",
+      gate.then(() => result({ ok: false, outcome: "aborted", error: "stopped" })),
+      () => {
+        aborted = true;
+        release();
+      },
+    );
+    expect(registry.markUserStopped(id)).toEqual({
+      found: true,
+      alreadySettled: false,
+      abortRequested: true,
+    });
+    expect(aborted).toBe(true);
+    expect(registry.get(id)!.userStopped).toBe(true);
+    expect(registry.get(id)!.status).toBe("stopped");
+    await registry.wait(id);
+    const out = await (createTaskOutputTool(registry) as unknown as ToolLike).execute("x", {
+      task_id: id,
+    });
+    // The sanctioned data path for a "stopped by user" rendering: details only.
+    expect(out.details.userStopped).toBe(true);
+    expect(out.details.status).toBe("stopped");
+  });
+
+  it("never claims a completed task, and a model TaskStop/stop() sets no user marker", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const done = registry.start("agent:worker", Promise.resolve(result()));
+    await registry.wait(done);
+    expect(registry.markUserStopped(done)).toEqual({
+      found: true,
+      alreadySettled: true,
+      abortRequested: false,
+    });
+    expect(registry.get(done)!.userStopped).toBeUndefined();
+    expect(registry.markUserStopped("task-999")).toEqual({
+      found: false,
+      alreadySettled: false,
+      abortRequested: false,
+    });
+    // The model's stop path never sets the user marker.
+    const running = registry.start("agent:worker", new Promise(() => {}));
+    registry.stop(running);
+    expect(registry.get(running)!.userStopped).toBeUndefined();
+    const out = await (createTaskOutputTool(registry) as unknown as ToolLike).execute("x", {
+      task_id: running,
+    });
+    expect(out.details.userStopped).toBeUndefined();
+    expect(out.details.status).toBe("stopped");
+  });
+});
