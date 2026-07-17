@@ -41,7 +41,7 @@ import { renderAgentCall, renderAgentResult } from "./subagent-render.js";
 import { formatBackgroundTaskIdentity } from "./background-identity.js";
 
 /**
- * Subagent dispatch runtime (plan §4.3): spawns fresh-context Pi sessions per dispatch,
+ * Subagent dispatch runtime: spawns fresh-context Pi sessions per dispatch,
  * parallel fan-out under a concurrency cap, per-agent tools:/model/effort, configurable
  * nesting depth, optional worktree isolation, and VERBATIM final-message return
  * (skills parse the final message — often locked YAML — directly; hard contract).
@@ -67,12 +67,12 @@ export interface SubagentRuntimeDeps {
    * Claude-named custom tool definitions granted to an agent (WebFetch, Task*, ...).
    * `ownerAgentId` is the DISPATCHER's own agent id (this dispatch's minted id,
    * the `agentId` minted in `dispatch`) — it scopes the agent's TaskOutput/TaskStop to the tasks this
-   * dispatch started AND tags the tasks it starts, so the two line up (F13 t02).
+   * dispatch started AND tags the tasks it starts, so the two line up.
    * `subCwd` is the dispatch-local cwd state — tools must resolve against it, not
    * the orchestrator's cwd, or worktree-isolated agents search the wrong checkout.
    * (`ownerAgentId` is inserted BEFORE the optional `subCwd` because a required
    * parameter cannot follow an optional one.)
-   * `dispatcherIsFork` (F16 t02) is the runtime-set marker: true iff THIS dispatch
+   * `dispatcherIsFork` is the runtime-set marker: true iff THIS dispatch
    * is a genuinely-inheriting fork, so the Agent/Task tools it grants know their
    * dispatcher was a fork and can refuse a fork-spawns-fork. Never derived from a
    * tool parameter (same anti-spoofing discipline as `ownerAgentId`); called
@@ -104,18 +104,18 @@ export interface SubagentRuntimeDeps {
   resolveModel: (spec: string | undefined) => unknown | undefined;
   mapEffort: (effort: string | undefined) => string | undefined;
   /**
-   * Builds a per-dispatch HookRunner for an agent's frontmatter `hooks:`
-   * (audit C10) — same deps as the session's main runner. The scoped runner
-   * fires only for that subagent's dispatch and is discarded when it ends.
+   * Builds a per-dispatch HookRunner for an agent's frontmatter `hooks:` —
+   * same deps as the session's main runner. The scoped runner fires only for
+   * that subagent's dispatch and is discarded when it ends.
    * Its `transcript_path` stays the MAIN session transcript (Claude Code
-   * parity, t02 review round 2): PiCC does NOT re-point subagent hook events
-   * at the subagent's own transcript.
+   * parity): PiCC does NOT re-point subagent hook events at the subagent's
+   * own transcript.
    */
   makeScopedHookRunner?: (config: HookConfig) => HookRunner;
   /**
    * MAIN session transcript file (late-bound; undefined in print/no-session
    * modes and tests). Subagent transcripts persist in a sibling directory
-   * derived from it (t02); without it, dispatch degrades to in-memory.
+   * derived from it; without it, dispatch degrades to in-memory.
    */
   getMainSessionFile?: () => string | undefined;
   worktrees?: WorktreeManagerLike;
@@ -123,10 +123,10 @@ export interface SubagentRuntimeDeps {
   concurrency: number;
   sessionId: string;
   /**
-   * Dispatch registry (t04): every session-creating dispatch registers here so
+   * Dispatch registry: every session-creating dispatch registers here so
    * SendMessage can resolve an agent ID/name to its live session (steer) or its
-   * persisted transcript (resume). Optional — when absent, dispatch runs exactly
-   * as before and SendMessage is simply not wired (print/test paths).
+   * persisted transcript (resume). Optional — when absent, dispatch runs
+   * unchanged and SendMessage is simply not wired (print/test paths).
    */
   subagentRegistry?: SubagentRegistry;
   /** Injected for testability; defaults to the real Pi SDK. */
@@ -140,7 +140,7 @@ export interface PiSessionManagerLike {
 }
 
 /**
- * Per-subagent token/cost usage (t06). Numbers only, and each field is OMITTED
+ * Per-subagent token/cost usage. Numbers only, and each field is OMITTED
  * when Pi doesn't measure it rather than invented as a zero. Mirrored
  * structurally on `BackgroundResultLike`/`BackgroundTaskRecord` (background-
  * tasks.ts) and the dispatch registry record (subagent-registry.ts).
@@ -154,7 +154,7 @@ export interface DispatchUsage {
 }
 
 /**
- * Drift guard (FIX 7): `DispatchUsage` (here), `UsageLike` (background-tasks),
+ * Drift guard: `DispatchUsage` (here), `UsageLike` (background-tasks),
  * and `SubagentUsage` (subagent-registry) are byte-identical by intent but kept
  * in three files to preserve those modules' no-value-import relationship. This
  * compile-time assertion breaks `tsc` the moment any of the three gains, loses,
@@ -173,13 +173,12 @@ type _SameShape<A, B> = [keyof A] extends [keyof B]
   : never;
 type _UsageDriftGuard = _SameShape<DispatchUsage, UsageLike> &
   _SameShape<DispatchUsage, SubagentUsage>;
-// A `true` here means all three shapes match; `never` (drift) fails this line.
 const _usageDriftOk: _UsageDriftGuard = true;
 void _usageDriftOk;
 
 /**
  * Structural view of Pi's `AgentSession.getSessionStats()` return
- * (`SessionStats`): the subset t06 reads. Pi aggregates over ALL session
+ * (`SessionStats`): the subset the usage accounting reads. Pi aggregates over ALL session
  * entries (incl. compacted-away history), so these totals reflect what was
  * actually billed for the subagent's whole run.
  */
@@ -194,7 +193,7 @@ export interface PiSessionStats {
   cost?: number;
 }
 
-/** Map Pi's SessionStats to the t06 usage shape, omitting fields Pi didn't report. */
+/** Map Pi's SessionStats to the usage shape, omitting fields Pi didn't report. */
 export function usageFromStats(stats: PiSessionStats | undefined): DispatchUsage | undefined {
   if (!stats || typeof stats !== "object") return undefined;
   const usage: DispatchUsage = {};
@@ -215,15 +214,15 @@ export interface PiSdk {
   inMemorySessionManager(cwd: string): unknown;
   /**
    * Persisted session manager in a custom directory with a pinned session id
-   * (t02: subagent transcripts — Pi names the file `<stamp>_<id>.jsonl`).
+   * (subagent transcripts — Pi names the file `<stamp>_<id>.jsonl`).
    * Optional: when absent, dispatch degrades to in-memory (non-resumable).
    */
   persistedSessionManager?(cwd: string, sessionDir: string, id: string): PiSessionManagerLike;
   /**
-   * Reopen a persisted subagent transcript for resume (t04: SendMessage) —
+   * Reopen a persisted subagent transcript for a SendMessage resume —
    * `SessionManager.open(path, sessionDir?, cwdOverride?)`. Restores the prior
-   * messages (t02 dispose→reopen proof) and appends the resumed run to the SAME
-   * file. Optional: when absent, resume fails loudly rather than losing context.
+   * messages and appends the resumed run to the SAME file. Optional: when
+   * absent, resume fails loudly rather than losing context.
    */
   reopenSessionManager?(
     transcriptPath: string,
@@ -232,7 +231,7 @@ export interface PiSdk {
   ): PiSessionManagerLike;
   /**
    * Fork a persisted subagent transcript FROM a source session's full history
-   * (F16: `subagent_type: "fork"`). Wraps `SessionManager.forkFrom`, which reads
+   * (`subagent_type: "fork"`). Wraps `SessionManager.forkFrom`, which reads
    * the source transcript FILE and writes a BRAND-NEW file, so the parent
    * transcript is never touched (NEVER reopen it in place — that would append the
    * fork's steps onto the parent's on-disk history). Optional: when absent (older/
@@ -270,13 +269,13 @@ interface PiSession {
   /** Cooperative abort (real Pi sessions expose it; TaskStop uses it best-effort). */
   abort?(): Promise<void> | void;
   /**
-   * Live event stream (real Pi `AgentSession.subscribe`; t03 live progress).
+   * Live event stream (real Pi `AgentSession.subscribe`; live progress).
    * Optional so simple test fakes can omit it — dispatch degrades to no live
    * progress when absent, never crashing. Returns an unsubscribe function.
    */
   subscribe?(listener: (event: unknown) => void): () => void;
   /**
-   * Mid-task course correction for a RUNNING dispatch (t04: SendMessage steer).
+   * Mid-task course correction for a RUNNING dispatch (SendMessage steer).
    * Real Pi `AgentSession.steer` queues the message, delivered after the current
    * assistant turn's tool calls, before the next LLM call. Optional so fakes/
    * older SDKs degrade cleanly — steering a session without it refuses.
@@ -290,13 +289,13 @@ interface PiSession {
   followUp?(text: string): Promise<void> | void;
   /**
    * Aggregate token/cost stats for the whole session (real Pi
-   * `AgentSession.getSessionStats`; t06 usage accounting). Optional so simple
+   * `AgentSession.getSessionStats`; usage accounting). Optional so simple
    * fakes/older SDKs omit it — dispatch then reports no usage, never crashing.
    */
   getSessionStats?(): PiSessionStats;
 }
 
-/** Classified fate of a dispatch. Mirrored by `BackgroundResultLike` (t01 contract). */
+/** Classified fate of a dispatch. Mirrored by `BackgroundResultLike`. */
 export type DispatchOutcome = "completed" | "failed" | "aborted";
 
 export interface DispatchResult {
@@ -311,8 +310,8 @@ export interface DispatchResult {
    */
   finalMessage: string;
   /**
-   * Opaque dispatch identity (t02): unique per agent, stable across resumes —
-   * a resume (t04) reuses the ID and appends to the same transcript.
+   * Opaque dispatch identity: unique per agent, stable across resumes — a
+   * resume reuses the ID and appends to the same transcript.
    */
   agentId: string;
   /** On-disk JSONL transcript of the subagent's session, when persisted. */
@@ -320,18 +319,18 @@ export interface DispatchResult {
   /**
    * True when this agent can be continued under `agentId` (persisted
    * transcript; not a one-shot builtin like Explore/Plan; not the in-memory
-   * fallback). t04's SendMessage refuses non-resumable IDs cleanly.
+   * fallback). SendMessage refuses non-resumable IDs cleanly.
    */
   resumable: boolean;
   /**
    * True when `finalMessage` was cut at the model's output token limit (stop
-   * reason "length") and already carries the t01 cut-off frame. The model-visible
+   * reason "length") and already carries the cut-off frame. The model-visible
    * trailer then rides INSIDE that existing frame instead of opening a second one.
    */
   truncated?: boolean;
   /**
    * True ONLY when this dispatch was a `subagent_type: "fork"` that ACTUALLY
-   * inherited the parent conversation (F16). A degraded fork (gate off, no
+   * inherited the parent conversation. A degraded fork (gate off, no
    * transcript, nested dispatcher, SDK cannot fork, forkFrom threw) is a plain
    * fresh general-purpose run and reports `isFork` falsey. Metadata only.
    */
@@ -339,7 +338,7 @@ export interface DispatchResult {
   agentName?: string;
   worktreePath?: string;
   /**
-   * Per-subagent token/cost usage (t06), captured from the session's
+   * Per-subagent token/cost usage, captured from the session's
    * `getSessionStats()` after the last `prompt()`. Present when the session
    * provided stats — including failed/aborted runs (their PARTIAL usage answers
    * "what did the failure cost me"). Metadata only: NEVER mixed into
@@ -360,16 +359,15 @@ async function loadRealSdk(): Promise<PiSdk> {
     createAgentSession: (options) => m.createAgentSession(options),
     DefaultResourceLoader: m.DefaultResourceLoader,
     inMemorySessionManager: (cwd: string) => m.SessionManager.inMemory(cwd),
-    // Persisted subagent transcript (t02): Pi validates the id and names the
+    // Persisted subagent transcript: Pi validates the id and names the
     // file `<stamp>_<id>.jsonl` in the custom directory (created on demand).
     persistedSessionManager: (cwd: string, sessionDir: string, id: string) =>
       m.SessionManager.create(cwd, sessionDir, { id }),
-    // Resume (t04): reopen the SAME transcript file to restore prior context and
-    // append the resumed run. `open(path, sessionDir, cwdOverride)` — proven by
-    // t02's dispose→reopen round-trip.
+    // Resume: reopen the SAME transcript file to restore prior context and
+    // append the resumed run — `open(path, sessionDir, cwdOverride)`.
     reopenSessionManager: (transcriptPath: string, sessionDir: string, cwd: string) =>
       m.SessionManager.open(transcriptPath, sessionDir, cwd),
-    // Fork (F16): seed a NEW subagent transcript with the parent (main-session)
+    // Fork: seed a NEW subagent transcript with the parent (main-session)
     // conversation. `forkFrom(sourcePath, targetCwd, sessionDir, { id })` reads the
     // source file and writes a brand-new file — the parent transcript is untouched.
     forkSessionManager: (sourcePath: string, cwd: string, sessionDir: string, id: string) =>
@@ -408,13 +406,13 @@ class Semaphore {
 }
 
 /**
- * The reserved `subagent_type` that inherits the parent conversation (F16).
+ * The reserved `subagent_type` that inherits the parent conversation.
  * A project agent literally named `fork` never shadows it — the interception wins.
  */
 const FORK_SUBAGENT_TYPE = "fork";
 
 /**
- * Synthetic agent for an inheriting fork (F16). `tools: undefined` ⇒ all-tools
+ * Synthetic agent for an inheriting fork. `tools: undefined` ⇒ all-tools
  * (the main-session grant, since forks are main-session-only), `isolation:
  * undefined` ⇒ shares the parent cwd. Its neutral persona + the normal
  * buildSystemPrompt path reconstruct the parent's project context (CLAUDE.md/
@@ -471,7 +469,7 @@ function mergeHookOutcomes(outcomes: Array<HookOutcome | undefined>): HookOutcom
 
 /**
  * HookRunner-shaped facade multiplexing the session runner with an agent's
- * scoped runner (audit C10) — same pattern as index.ts's HookMultiplexer,
+ * scoped runner — same pattern as index.ts's HookMultiplexer,
  * but per-dispatch and discarded with it.
  */
 function multiplexHookRunners(base: HookRunner, scoped: HookRunner): HookRunner {
@@ -502,7 +500,7 @@ export function extractText(content: unknown): string {
 export class SubagentRuntime {
   private readonly semaphore: Semaphore;
   /**
-   * Per-depth budgets for nested BACKGROUND dispatches (F15 t02). Each `depth ≥ 2`
+   * Per-depth budgets for nested BACKGROUND dispatches. Each `depth ≥ 2`
    * gets its own `Semaphore` sized like the root, created lazily. A dispatch
    * acquires from the pool for ITS OWN depth, so an ancestor at depth `d` (holding
    * a slot in pool `d`, e.g. while blocked in a `TaskOutput(wait)` on a child)
@@ -542,12 +540,11 @@ export class SubagentRuntime {
   }
 
   /**
-   * TEST-ONLY (F13 t02): inject a fake {@link PiSdk} so an offline-integration
+   * TEST-ONLY: inject a fake {@link PiSdk} so an offline-integration
    * test can drive a REAL dispatch through the `picc()`-constructed runtime
    * (proving the dispatch-mint → customToolsFor → scopedTo / start() owner threading) with
    * no live model call. Reachable only via the in-process `onWired` seam, never
-   * the project-loading path; call before the first dispatch. Additive: leaves
-   * the production `sdk()` fall-through to `loadRealSdk()` untouched.
+   * the project-loading path; call before the first dispatch.
    */
   setSdkForTest(sdk: PiSdk): void {
     this.deps.sdk = sdk;
@@ -558,7 +555,7 @@ export class SubagentRuntime {
    * chain: project/user/plugin agents by exact name, then case-insensitive
    * name, then built-ins. `dispatch()` prepends its `agentOverride`;
    * `isOneShotBuiltin()` uses the bare chain — both route through here so the
-   * resolution order can never desync between them (t02 review round 2).
+   * resolution order can never desync between them.
    */
   private resolveAgentDefinition(requested: string): ClaudeAgent | undefined {
     const agents = this.deps.getAgents();
@@ -572,7 +569,7 @@ export class SubagentRuntime {
   /**
    * The one-shot-builtin predicate (Explore/Plan): shared by dispatch()'s
    * `resumable` flag and the background start message's id suppression, so a
-   * future third one-shot builtin can't desync them (t02 review round 2).
+   * future third one-shot builtin can't desync them.
    */
   private isOneShot(agent: ClaudeAgent | undefined): boolean {
     return agent?.builtin === true && (agent.name === "Explore" || agent.name === "Plan");
@@ -584,8 +581,8 @@ export class SubagentRuntime {
    * order (shared resolver) so a same-named PROJECT agent (which resolves first
    * and lacks the builtin marker) is NOT treated as one-shot. Used by the
    * background Agent tool to decide whether the start message should advertise
-   * an agent id (t02): one-shot builtins get no id segment (t04 would refuse a
-   * follow-up).
+   * an agent id: one-shot builtins get no id segment (a follow-up would be
+   * refused).
    */
   isOneShotBuiltin(subagentType: string): boolean {
     const requested = subagentType.trim() || "general-purpose";
@@ -595,7 +592,7 @@ export class SubagentRuntime {
   /**
    * True iff `subagentType` resolves to an agent whose frontmatter sets
    * `background: true` (Claude 2.1.198): the dispatch runs in the background
-   * even against an explicit `run_in_background: false` (t05) — its remaining
+   * even against an explicit `run_in_background: false` — its remaining
    * significance now that dispatch is background-by-default. Mirrors
    * dispatch()'s resolution order via the shared resolver.
    */
@@ -612,7 +609,7 @@ export class SubagentRuntime {
     effort?: string;
     depth: number;
     /**
-     * Nested background bound (F15 t02): when a `depth > 1` dispatch is issued on
+     * Nested background bound: when a `depth > 1` dispatch is issued on
      * the BACKGROUND arm (un-awaited via `backgroundTasks.start`, or a
      * `SendMessage` resume that landed at `record.depth ≥ 2`), it must count
      * against the concurrency bound instead of taking the foreground nested
@@ -622,7 +619,7 @@ export class SubagentRuntime {
      */
     background?: boolean;
     /**
-     * Runtime-set fork-spawns-fork marker (F16 t02): true iff this dispatch's
+     * Runtime-set fork-spawns-fork marker: true iff this dispatch's
      * DISPATCHER is a genuinely-inheriting fork. Set ONLY by the runtime (threaded
      * from a fork's `isFork` into its granted Agent/Task tool definitions), NEVER
      * derived from a tool parameter — same anti-spoofing discipline as `ownerAgentId`.
@@ -636,26 +633,26 @@ export class SubagentRuntime {
      * used for the synthetic general-purpose target of agent-less context:fork skills.
      */
     agentOverride?: ClaudeAgent;
-    /** Cooperative abort (TaskStop, audit E4): best-effort session.abort() when signaled. */
+    /** Cooperative abort (TaskStop): best-effort session.abort() when signaled. */
     abortSignal?: AbortSignal;
     /**
-     * Pre-minted agent ID (t02): the background Agent tool mints it up front so
-     * the start message can carry it; t04 passes an existing ID on resume.
+     * Pre-minted agent ID: the background Agent tool mints it up front so the
+     * start message can carry it; a resume passes the existing ID.
      */
     agentId?: string;
     /**
-     * Live-progress sink (t03): fed a bounded, sanitized {@link ProgressSnapshot}
+     * Live-progress sink: fed a bounded, sanitized {@link ProgressSnapshot}
      * whenever the running subagent's visible activity changes. Display-only —
      * NEVER part of `finalMessage` (the verbatim-return contract is untouched).
      * Requires the session to expose `subscribe`; a no-op when it does not.
      */
     onProgress?: (snapshot: ProgressSnapshot) => void;
     /**
-     * Resume a finished subagent (t04: SendMessage). When set, dispatch takes the
+     * Resume a finished subagent (SendMessage). When set, dispatch takes the
      * SAME construction path (gated tools, guard, scoped hooks, system prompt +
      * lockdown, maxTurns, depth, model) but seeds the session from the persisted
      * transcript instead of creating a fresh one, and reuses the original cwd/
-     * worktree instead of entering a new one. SECURITY (MUST-FIX #1): there is no
+     * worktree instead of entering a new one. SECURITY: there is no
      * lighter resume path — every enforcement layer is re-applied because it is
      * the identical dispatch code. The caller passes the SAME `agentId`.
      */
@@ -669,10 +666,10 @@ export class SubagentRuntime {
     };
   }): Promise<DispatchResult> {
     const diagnostics: Diagnostic[] = [];
-    // Caller-provided agent ID hardening (t02, pre-t04): a resume/model-derived
-    // ID (t04 feeds these) MUST be the minted `agent-<12 hex>` form. A hostile or
-    // malformed value fails the dispatch loudly (t01 semantics) — never silently
-    // minted-over or passed through to the session/filesystem path.
+    // Caller-provided agent ID hardening: a resume/model-derived ID MUST be the
+    // minted `agent-<12 hex>` form. A hostile or malformed value fails the
+    // dispatch loudly — never silently minted-over or passed through to the
+    // session/filesystem path.
     if (opts.agentId !== undefined && !isAgentId(opts.agentId)) {
       return {
         ok: false,
@@ -686,27 +683,27 @@ export class SubagentRuntime {
         diagnostics,
       };
     }
-    // Agent identity (t02): minted here unless the caller pre-minted/reuses one.
+    // Agent identity: minted here unless the caller pre-minted/reuses one.
     // Every exit path carries it, so mirrors (background records) stay keyed.
     const agentId = opts.agentId ?? mintAgentId();
     const agents = this.deps.getAgents();
-    // Built-ins resolve AFTER project/user/plugin agents (audit E1): a project
-    // agent named Explore overrides the built-in. Empty/omitted subagent_type
-    // defaults to general-purpose (audit E2).
+    // Built-ins resolve AFTER project/user/plugin agents: a project agent named
+    // Explore overrides the built-in. Empty/omitted subagent_type defaults to
+    // general-purpose.
     const builtins = builtinAgents();
     const requested = opts.subagentType.trim() || "general-purpose";
     let prompt = opts.prompt;
 
-    // F16: the reserved `subagent_type: "fork"` inherits the parent conversation.
+    // The reserved `subagent_type: "fork"` inherits the parent conversation.
     // Intercepted HERE — before the unknown-type fallback below — and always sets
     // `resolved`, so the generic `unknown subagent_type "fork"; ran as
     // general-purpose` warning can NEVER fire for a fork. `isFork` is the single
     // per-dispatch marker (true ONLY when the fork will ACTUALLY inherit) kept in
-    // scope down to the customToolsFor call (t02 threads it into the fork's
-    // Agent/Task tools). A degraded fork keeps `isFork === false` — it is a plain
+    // scope down to the customToolsFor call, which threads it into the fork's
+    // Agent/Task tools. A degraded fork keeps `isFork === false` — it is a plain
     // fresh general-purpose run and must not carry the fork marker.
     let isFork = false;
-    // t02: an inheriting fork's child session-manager. It is REUSED by the later
+    // An inheriting fork's child session-manager. It is REUSED by the later
     // session-manager stage (never re-forked). `forkFrom` is EAGER + SYNCHRONOUS —
     // it writes a full copy of the parent conversation to disk the instant it is
     // called — so the actual construction is DEFERRED (via `attemptForkSession`
@@ -717,7 +714,7 @@ export class SubagentRuntime {
     // general-purpose (isFork=false, unmarked tools, honest badge) before either is
     // fixed. Undefined ⇒ this dispatch is not (or no longer) an inheriting fork.
     let forkSession: PiSessionManagerLike | undefined;
-    // t02 review: the deferred `forkFrom` call. Set (in the interception below) ONLY
+    // The deferred `forkFrom` call. Set (in the interception below) ONLY
     // for a fork that passed every degrade check; invoked once, immediately before
     // `customToolsFor`. A fork shares the parent cwd (isolation undefined) and is
     // never a resume, so the cwd known at interception equals the dispatch cwd passed
@@ -730,7 +727,7 @@ export class SubagentRuntime {
     // detail for the developer diagnostic (forkFrom-throw case).
     let forkDegrade: { modelReason: string; devReason?: string; tone: "info" | "warning" } | undefined;
     let resolved: ClaudeAgent | undefined;
-    // F16: emit a fork-degrade in ONE place so the model-facing prompt prefix and
+    // Emit a fork-degrade in ONE place so the model-facing prompt prefix and
     // the developer-facing diagnostic sentinel can't drift across the (3) degrade
     // sites (gate/nested/no-transcript/no-SDK here, plus forkFrom-throw and the
     // defensive branch in the session-manager stage). SECURITY: the MODEL sees
@@ -778,12 +775,12 @@ export class SubagentRuntime {
       const canForkSdk = typeof forkSdk?.forkSessionManager === "function";
 
       if (opts.dispatcherIsFork) {
-        // t02 fork-spawns-fork guard: this dispatch's DISPATCHER is itself a
+        // Fork-spawns-fork guard: this dispatch's DISPATCHER is itself a
         // genuinely-inheriting fork (the runtime-set `dispatcherIsFork` marker,
         // threaded into a fork's Agent/Task tools — NEVER a tool parameter). A
         // fork cannot spawn another fork (Claude's documented rule), so refuse it:
         // a VISIBLE degrade to fresh general-purpose with a fork-SPECIFIC, calm
-        // (by-design) notice — distinct from t01's gate/nested wording. Enforced
+        // (by-design) notice — distinct from the gate/nested wording. Enforced
         // via the marker, not the depth guard (which stays the untouched outer
         // backstop). Checked FIRST so a nested fork (depth ≠ 1) gets this precise
         // reason rather than the generic "nested fork" one.
@@ -821,7 +818,7 @@ export class SubagentRuntime {
         // creates the on-disk copy. Tentatively mark isFork so the gates + the
         // SubagentStart payload use the fork identity; the deferred attempt settles
         // the FINAL isFork/identity/badge (a throw there re-resolves to
-        // general-purpose) BEFORE the child tools + identity are built (trap fix).
+        // general-purpose) BEFORE the child tools + identity are built.
         // The env=0 / nested / no-transcript / SDK-can't-fork / fork-spawns-fork
         // degrades stay resolved at interception — none of them need `forkFrom`.
         isFork = true;
@@ -849,11 +846,11 @@ export class SubagentRuntime {
         emitForkDegrade(forkDegrade!.tone, forkDegrade!.modelReason, forkDegrade!.devReason);
       }
     } else {
-      // Shared resolver (t02 review round 2): one home for the resolution order so
+      // Shared resolver: one home for the resolution order so
       // isOneShotBuiltin() can't desync from this dispatch's settled resumability.
       resolved = opts.agentOverride ?? this.resolveAgentDefinition(requested);
     }
-    // Claude fallback (review H1): an unknown subagent_type runs as
+    // Claude fallback: an unknown subagent_type runs as
     // general-purpose instead of hard-erroring — with a VISIBLE degrade in
     // both the diagnostics and the subagent's own prompt. (A fork always set
     // `resolved` above, so this generic warning can never fire for it.)
@@ -910,27 +907,27 @@ export class SubagentRuntime {
       };
     }
 
-    // Transcript persistence state (t02): the transcript path only exists once
-    // the session manager is created (below); it is carried on the
-    // DispatchResult and drives `resumable`. Parity (review round 2): subagent
-    // hook events are NOT re-pointed to it — they keep the main transcript_path.
+    // Transcript persistence state: the transcript path only exists once the
+    // session manager is created (below); it is carried on the DispatchResult
+    // and drives `resumable`. Parity: subagent hook events are NOT re-pointed to
+    // it — they keep the main transcript_path.
     let transcriptPath: string | undefined;
     let resumable = false;
     // Built-in one-shot agents (Explore/Plan) are never resumable — the flag
-    // travels with the ID so t04 can refuse. A same-named PROJECT agent is a
+    // travels with the ID so SendMessage can refuse. A same-named PROJECT agent is a
     // normal agent (it resolves first and lacks the builtin marker).
     const oneShot = this.isOneShot(agent);
 
     // A fork/`agentOverride` dispatch runs a SYNTHETIC agent definition
     // (`fork:<skill>`) that is NOT in getAgents()/builtins — it cannot be safely
     // re-derived by name on resume (a by-name resolve would miss and fall back to
-    // all-tools general-purpose, WIDENING the tool gate). SECURITY (MUST-FIX #1):
+    // all-tools general-purpose, WIDENING the tool gate). SECURITY:
     // such a dispatch is recorded NON-RESUMABLE regardless of transcript, so
     // SendMessage refuses it via the existing non-resumable path (forks are not
     // SendMessage-resumable).
     const overrideDispatch = opts.agentOverride !== undefined;
 
-    // Ack-before-register window (coder SHOULD-2): for a fresh `run_in_background`
+    // Ack-before-register window: for a fresh `run_in_background`
     // dispatch the ack (carrying agentId) is handed out by backgroundTasks.start()
     // BEFORE this async dispatch reaches the session-creation register() below, so
     // a coordinator that SendMessages that id in the SAME turn would hit a registry
@@ -955,7 +952,7 @@ export class SubagentRuntime {
       });
     }
 
-    // Agent-scoped hooks (audit C10): frontmatter `hooks:` dispatch while THIS
+    // Agent-scoped hooks: frontmatter `hooks:` dispatch while THIS
     // subagent runs. The scoped runner is multiplexed with the session runner
     // for the dispatch's guard and Subagent* events and discarded when it ends.
     let scopedHooks: HookRunner | undefined;
@@ -968,7 +965,7 @@ export class SubagentRuntime {
         const parsed = parseHookConfig(agent.hooks, agent.source.path);
         diagnostics.push(...parsed.diagnostics);
         if (Object.keys(parsed.config).length > 0) {
-          // Parity (t02 review round 2): the scoped runner keeps the MAIN session
+          // Parity: the scoped runner keeps the MAIN session
           // transcript_path — subagent hook events must NOT be re-pointed at the
           // subagent's own transcript (Claude Code behavior).
           scopedHooks = this.deps.makeScopedHookRunner(parsed.config);
@@ -978,12 +975,11 @@ export class SubagentRuntime {
           });
         }
       } catch (err) {
-        // coder NIT-3: this hook-config parsing sits BETWEEN the minimal
-        // register() above and the main try/finally that settles the record. A
-        // throw here (before the semaphore is acquired) would otherwise strand the
-        // registry record as "running" forever. Settle it failed and fail the
-        // dispatch loudly (t01 semantics). No slot to release — the semaphore has
-        // not been acquired yet.
+        // This hook-config parsing sits BETWEEN the minimal register() above and
+        // the main try/finally that settles the record. A throw here (before the
+        // semaphore is acquired) would otherwise strand the registry record as
+        // "running" forever. Settle it failed and fail the dispatch loudly. No
+        // slot to release — the semaphore has not been acquired yet.
         this.deps.subagentRegistry?.markSettled(agentId, { outcome: "failed" });
         return {
           ok: false,
@@ -1000,7 +996,7 @@ export class SubagentRuntime {
       }
     }
     if (scopedHooks) {
-      // Agent-hook `systemMessage`s are user-facing (review H4): surface each
+      // Agent-hook `systemMessage`s are user-facing: surface each
       // distinct message through the dispatch diagnostics (the same channel the
       // Agent tool result / console reports).
       const inner = scopedHooks;
@@ -1024,14 +1020,14 @@ export class SubagentRuntime {
         },
       } as unknown as HookRunner;
     }
-    // Central identity injection (t02): agent_id AND agent_type (the agent's
+    // Central identity injection: agent_id AND agent_type (the agent's
     // name) ride on EVERY hook payload fired within this dispatch — the guard's
     // PreToolUse/PostToolUse fired from inside the subagent, SubagentStart, and
     // SubagentStop/Stop — so the subagent identity can't drift per fire site
     // (Claude Code hook input carries both). One choke point wrapping each raw
-    // runner. transcript_path is deliberately NOT injected — parity (review
-    // round 2): subagent hook events keep the MAIN session transcript_path (the
-    // runner's own constructed default), never the subagent's own file.
+    // runner. transcript_path is deliberately NOT injected — parity: subagent
+    // hook events keep the MAIN session transcript_path (the runner's own
+    // constructed default), never the subagent's own file.
     const injectIdentity = (runner: HookRunner): HookRunner =>
       ({
         fire: (
@@ -1054,7 +1050,7 @@ export class SubagentRuntime {
     const fireSubagentStop = async (
       payload: Partial<HookPayload>,
     ): Promise<HookOutcome | undefined> => {
-      // Parity (t02 review round 2): the Stop payload carries NO transcript_path.
+      // Parity: the Stop payload carries NO transcript_path.
       // Inside a subagent Claude Code keeps transcript_path pointing at the MAIN
       // session transcript, which the HookRunner supplies from its own
       // constructed default — PiCC must not clobber it with the subagent's own
@@ -1068,7 +1064,7 @@ export class SubagentRuntime {
       return mergeHookOutcomes(outcomes);
     };
 
-    // Concurrency gate (F15 t02). Two nested-deadlock hazards, handled distinctly:
+    // Concurrency gate. Two nested-deadlock hazards, handled distinctly:
     //   * FOREGROUND nested (`depth > 1`, no `background`): keeps its `() => {}`
     //     bypass. A foreground parent BLOCKS its turn awaiting the child, holding
     //     its slot; if the child had to acquire the SAME pool the parent holds, C
@@ -1092,7 +1088,7 @@ export class SubagentRuntime {
     let stopFired = false;
     let abortListener: (() => void) | undefined;
     let progressUnsub: (() => void) | undefined;
-    // Usage accounting (t06): capture the session's aggregate stats AFTER the
+    // Usage accounting: capture the session's aggregate stats AFTER the
     // last prompt() and BEFORE each result is built — the result literals live
     // in this try block, so a finally-only capture would have nowhere to attach
     // to the returned DispatchResult. `captureUsage()` reads the live session's
@@ -1115,7 +1111,7 @@ export class SubagentRuntime {
     };
     try {
       if (opts.abortSignal?.aborted) {
-        // Re-check after the semaphore wait (review H3): a TaskStop issued while
+        // Re-check after the semaphore wait: a TaskStop issued while
         // the dispatch was queued must not burn a full session. Informational
         // SubagentStop matches the error-path pattern; finally releases the slot.
         settledOutcome = "aborted";
@@ -1139,7 +1135,7 @@ export class SubagentRuntime {
         .fire("SubagentStart", {
           // agent_id + agent_type are added centrally (injectIdentity); a
           // SubagentStart payload carries NO transcript_path (the session/
-          // transcript may not exist yet — item 6).
+          // transcript may not exist yet).
           subagent_type: agent.name,
           prompt,
           cwd: this.deps.getCwd(),
@@ -1162,7 +1158,7 @@ export class SubagentRuntime {
 
       let cwd = this.deps.getCwd();
       if (opts.resume) {
-        // Resume (t04): reuse the ORIGINAL cwd/worktree exactly — never enter a
+        // Resume: reuse the ORIGINAL cwd/worktree exactly — never enter a
         // new worktree (that would branch a fresh, empty checkout and lose the
         // run's context). Reachability was already checked by SendMessage against
         // the REGISTRY-stored path before this dispatch was kicked off.
@@ -1186,7 +1182,7 @@ export class SubagentRuntime {
         }
       }
       if (opts.abortSignal?.aborted) {
-        // Re-check after worktree entry (review H3): a stop during enter() must
+        // Re-check after worktree entry: a stop during enter() must
         // not spin up the session. The finally keep-exits the worktree.
         settledOutcome = "aborted";
         stopFired = true;
@@ -1206,7 +1202,7 @@ export class SubagentRuntime {
           diagnostics,
         };
       }
-      // t02 review: the DEFERRED forkFrom call. `forkFrom` is eager + synchronous —
+      // The DEFERRED forkFrom call. `forkFrom` is eager + synchronous —
       // it immediately writes a full copy of the parent conversation to disk — so it
       // runs HERE, AFTER the abort-before-start, SubagentStart-block, and
       // abort-after-worktree gates: an aborted or hook-blocked fork never leaves an
@@ -1214,7 +1210,7 @@ export class SubagentRuntime {
       // fork-spawns-fork degrades were already resolved at interception — they don't
       // need `forkFrom`). It still runs BEFORE `customToolsFor` so the FINAL isFork +
       // resolved identity/badge are settled before the child tools + identity are
-      // built (the trap fix). The constructed manager is reused by the session-manager
+      // built. The constructed manager is reused by the session-manager
       // stage (never re-forked), keeping `forkCalls()` at 1.
       if (attemptForkSession) {
         try {
@@ -1251,9 +1247,9 @@ export class SubagentRuntime {
       );
       const piBuiltins = claudeToolsToPiBuiltins(granted);
       // `agentId` (the dispatch's own minted id, above) is the OWNER that
-      // scopes this agent's TaskOutput/TaskStop and tags the tasks it starts
-      // (F13 t02). Never derived from a tool param (anti-spoofing).
-      // F16 t02: `isFork` is in scope here (true ONLY for a fork that ACTUALLY
+      // scopes this agent's TaskOutput/TaskStop and tags the tasks it starts.
+      // Never derived from a tool param (anti-spoofing).
+      // `isFork` is in scope here (true ONLY for a fork that ACTUALLY
       // inherits — the DEFERRED forkFrom attempt just above has already flipped it
       // false on throw) — thread it as the runtime-set `dispatcherIsFork` marker so
       // the fork's granted Agent/Task tools refuse a fork-spawns-fork. A degraded
@@ -1267,7 +1263,7 @@ export class SubagentRuntime {
         : this.deps.contextForTouchedFile;
       const guard = createGuardExtension({
         engine: this.deps.permissionEngine,
-        // Multiplexed runner (C10): the agent's scoped PreToolUse/PostToolUse/
+        // Multiplexed runner: the agent's scoped PreToolUse/PostToolUse/
         // PostToolUseFailure hooks fire alongside the session hooks — for this
         // dispatch's tool calls only.
         hooks: hookRunner,
@@ -1295,7 +1291,7 @@ export class SubagentRuntime {
       });
       await loader.reload();
 
-      // Model resolution order (audit E5): CLAUDE_CODE_SUBAGENT_MODEL env beats
+      // Model resolution order: CLAUDE_CODE_SUBAGENT_MODEL env beats
       // the per-invocation `model` param, which beats agent frontmatter `model:`,
       // which beats the session model. "inherit"/empty env value = unset.
       const envModelRaw = process.env.CLAUDE_CODE_SUBAGENT_MODEL?.trim();
@@ -1304,7 +1300,7 @@ export class SubagentRuntime {
       const modelSpec = envModel ?? opts.model ?? agent.model;
       let model = this.deps.resolveModel(modelSpec);
       if (modelSpec && model === undefined) {
-        // Visible degrade (§2.2): inherit the session model rather than silently
+        // Visible degrade: inherit the session model rather than silently
         // falling through to Pi's default model.
         diagnostics.push({
           severity: "warning",
@@ -1318,7 +1314,7 @@ export class SubagentRuntime {
         ...customTools.map((t) => (t as { name: string }).name),
       ];
 
-      // Persisted subagent transcript (t02): one JSONL per dispatch, named by
+      // Persisted subagent transcript: one JSONL per dispatch, named by
       // the agent ID, in a sibling directory of the MAIN session's transcript.
       // Degrade, never crash: unknown main file (print/no-session modes,
       // tests), an SDK without the factory, or a failing create all fall back
@@ -1331,7 +1327,7 @@ export class SubagentRuntime {
         mainSessionFile = undefined;
       }
       if (opts.resume) {
-        // Resume (t04): REOPEN the same transcript instead of creating a fresh
+        // Resume: REOPEN the same transcript instead of creating a fresh
         // one, so the reopened session carries the prior context. A resume that
         // cannot reopen must FAIL LOUDLY — silently degrading to a fresh
         // in-memory session would run the agent WITHOUT its context (the exact
@@ -1377,12 +1373,12 @@ export class SubagentRuntime {
           };
         }
       } else if (isFork) {
-        // F16 fork branch (third session-manager branch): the child session was
-        // ALREADY forkFrom-seeded just before `customToolsFor` (t02 trap fix +
-        // review relocation) — `isFork` here therefore reflects the FINAL
-        // post-fork-attempt state, so a forkFrom throw already degraded to fresh
-        // (isFork=false, unmarked tools, general-purpose badge) and never reaches
-        // this branch. REUSE the constructed manager (a BRAND-NEW file seeded with
+        // Fork branch (third session-manager branch): the child session was
+        // ALREADY forkFrom-seeded just before `customToolsFor` — `isFork` here
+        // therefore reflects the FINAL post-fork-attempt state, so a forkFrom
+        // throw already degraded to fresh (isFork=false, unmarked tools,
+        // general-purpose badge) and never reaches this branch. REUSE the
+        // constructed manager (a BRAND-NEW file seeded with
         // the parent history; the parent transcript is untouched); never re-fork.
         if (forkSession) {
           // Read the real path back for transcriptPath ONLY — a fork is forced
@@ -1446,7 +1442,7 @@ export class SubagentRuntime {
       session = created.session;
       if (thinking && session.setThinkingLevel) session.setThinkingLevel(thinking);
 
-      // Dispatch registry (t04): record this live run so SendMessage can steer it
+      // Dispatch registry: record this live run so SendMessage can steer it
       // (running) or resume it (once settled). Registered with everything a resume
       // needs — agent name (re-resolved for construction), depth, cwd/worktree,
       // transcript path — and the live session handle for steering. A resume
@@ -1461,9 +1457,9 @@ export class SubagentRuntime {
         cwd,
         worktreePath,
         transcriptPath,
-        // SECURITY (MUST-FIX #1): a fork/agentOverride dispatch is never
-        // resumable — its synthetic `fork:<skill>` definition cannot be
-        // re-derived by name without weakening the tool gate. F16: an inheriting
+        // SECURITY: a fork/agentOverride dispatch is never resumable — its
+        // synthetic `fork:<skill>` definition cannot be re-derived by name
+        // without weakening the tool gate. An inheriting
         // fork (isFork) is likewise never resumable — its inherited parent
         // conversation at fork time cannot be safely re-derived (the local
         // `resumable` is already forced false in the fork branch; this predicate
@@ -1473,7 +1469,7 @@ export class SubagentRuntime {
         session: session as SteerableSession,
       });
 
-      // Cooperative stop (audit E4): a TaskStop-triggered signal aborts the
+      // Cooperative stop: a TaskStop-triggered signal aborts the
       // live session best-effort (real Pi sessions expose abort()).
       if (opts.abortSignal) {
         const live = session;
@@ -1490,7 +1486,7 @@ export class SubagentRuntime {
         else opts.abortSignal.addEventListener("abort", abortListener, { once: true });
       }
 
-      // Live progress (t03): subscribe to the child session's event stream and
+      // Live progress: subscribe to the child session's event stream and
       // condense it into a bounded, sanitized snapshot pushed to opts.onProgress
       // on every visible change. Event-stream only — NEVER poll session.messages
       // (compaction inside prompt() rewrites that array mid-flight). Degrades to
@@ -1512,7 +1508,7 @@ export class SubagentRuntime {
         ? `${agent.initialPrompt}\n\n${prompt}`
         : prompt;
 
-      // Post-prompt() classification (t01): Pi's prompt() resolves NORMALLY on a
+      // Post-prompt() classification: Pi's prompt() resolves NORMALLY on a
       // terminal LLM failure — the failure lives on the last assistant message as
       // stopReason "error"/"aborted". Called after every prompt() so the retry and
       // SubagentStop-loop re-prompts are classified too.
@@ -1532,12 +1528,12 @@ export class SubagentRuntime {
             agentId,
             transcriptPath,
             // A failed-but-persisted agent stays resumable: the coordinator may
-            // follow up / retry it with its prior context (t04 decides).
+            // follow up / retry it with its prior context.
             resumable,
             agentName: agent.name,
             worktreePath,
             isFork,
-            // Partial usage of the failed run (t06): "what did the failure cost me".
+            // Partial usage of the failed run: "what did the failure cost me".
             usage: captureUsage(),
             error: `Agent terminated early due to an API error: ${capErrorText(last.errorMessage ?? "unknown error")}`,
             diagnostics,
@@ -1582,7 +1578,7 @@ export class SubagentRuntime {
       // Verbatim final assistant message (hard contract — no wrapping/summarizing).
       let finalMessage = lastAssistantText(session);
 
-      // One-retry-on-empty convention (plan §4.3): a single re-prompt when nothing
+      // One-retry-on-empty convention: a single re-prompt when nothing
       // came back — only for genuinely successful empty stops. Error/abort stops
       // returned above (retrying them just repeated the failure and doubled latency).
       if (!finalMessage.trim()) {
@@ -1595,7 +1591,7 @@ export class SubagentRuntime {
         diagnostics.push({ severity: "info", message: "subagent returned empty; retried once" });
       }
 
-      // SubagentStop validation loop (plan §4.5 "don't stop until validated"):
+      // SubagentStop validation loop ("don't stop until validated"):
       // a blocking hook re-prompts the subagent with its reason, bounded like the
       // main-session Stop loop.
       for (let iteration = 0; ; iteration++) {
@@ -1606,7 +1602,7 @@ export class SubagentRuntime {
         });
         stopFired = true;
         if (opts.abortSignal?.aborted) {
-          // Abort-race consistency (t01 review): a signal firing during
+          // Abort-race consistency: a signal firing during
           // SubagentStop-hook evaluation classifies aborted — the same way a
           // signal firing while prompt() settles does (terminalOutcome). Aborted
           // results are discarded by contract, so breaking out to a
@@ -1643,9 +1639,9 @@ export class SubagentRuntime {
         finalMessage = lastAssistantText(session);
       }
 
-      // A truncated completion ends with the t01 cut-off frame; `cutOff` records
+      // A truncated completion ends with the cut-off frame; `cutOff` records
       // that so the model-visible ID trailer rides INSIDE that frame instead of
-      // opening a second `---` frame (t02 review item 4).
+      // opening a second `---` frame.
       const cutOff = truncated && finalMessage.trim() !== "";
       if (cutOff) {
         finalMessage = appendCutOffNote(
@@ -1684,7 +1680,7 @@ export class SubagentRuntime {
         isFork,
         agentName: agent.name,
         worktreePath,
-        // Partial usage when the session ran at all before throwing (t06).
+        // Partial usage when the session ran at all before throwing.
         usage: captureUsage(),
         error: `Subagent "${agent.name}" failed: ${capErrorText((err as Error)?.message ?? String(err))}`,
         diagnostics,
@@ -1702,7 +1698,7 @@ export class SubagentRuntime {
       } catch {
         // unsubscribe must not mask results
       }
-      // Usage safety-net (t06): capture stats one last time while the session is
+      // Usage safety-net: capture stats one last time while the session is
       // still alive (before dispose), so the registry record carries usage even
       // if some future return path forgets to capture. Idempotent with the
       // per-return captures above (same session, same value).
@@ -1712,7 +1708,7 @@ export class SubagentRuntime {
       } catch {
         // dispose failures must not mask results
       }
-      // Dispatch registry (t04/t06): the session is disposed — drop the live
+      // Dispatch registry: the session is disposed — drop the live
       // handle and flip the record to settled, keeping name/ID/state/transcript-
       // path so a later SendMessage can still resume it, and recording the run's
       // fate + per-subagent usage for the /usage control command. No-op for
@@ -1781,9 +1777,9 @@ function capErrorText(message: string): string {
 }
 
 /**
- * The cut-off-note mechanism (t01): partial/truncated subagent output followed
+ * The cut-off-note mechanism: partial/truncated subagent output followed
  * by a clearly separated note naming the cause. The note is the ONLY error text
- * ever mixed into the otherwise-verbatim message channel. Exported (F14 t01) so
+ * ever mixed into the otherwise-verbatim message channel. Exported so
  * the fork presentation path can produce a byte-identical frame.
  */
 export function appendCutOffNote(text: string, note: string): string {
@@ -1791,14 +1787,14 @@ export function appendCutOffNote(text: string, note: string): string {
 }
 
 /**
- * The default cut-off note (F14 t01): used when a failed run carries partial
- * output but no explicit error string. Reproduces the Agent tool's inline
- * wording verbatim so the fork path (t02) stays byte-identical.
+ * The default cut-off note: used when a failed run carries partial output but
+ * no explicit error string. Reproduces the Agent tool's inline wording verbatim
+ * so the fork path stays byte-identical.
  */
 const DEFAULT_CUT_OFF_NOTE = "The run ended on an API error before completing.";
 
 /**
- * The user-facing presentation of a {@link DispatchResult} (F14 t01). A
+ * The user-facing presentation of a {@link DispatchResult}. A
  * `result` is returned/folded into content text (carrying `cutOff`); a
  * `failure` is thrown or folded into an error channel. The `text`/`message`
  * already carry any resume trailer and cut-off frame — the consumer owns only
@@ -1810,8 +1806,8 @@ export type DispatchPresentation =
   | { kind: "failure"; message: string };
 
 /**
- * Map a {@link DispatchResult} to its user-facing {@link DispatchPresentation}
- * (F14 t01), reproducing the `Agent` tool's F02 four-branch mapping exactly:
+ * Map a {@link DispatchResult} to its user-facing {@link DispatchPresentation},
+ * reproducing the `Agent` tool's four-branch mapping exactly:
  * completed / failed-with-partial / failed-no-output / aborted.
  *
  * TOTAL & pure: returns a presentation for every result and never throws (reads
@@ -1821,7 +1817,7 @@ export type DispatchPresentation =
  *
  * `allowResumeTrailer` (default `true`) gates the resume trailer on top of
  * `result.resumable`; passing `false` suppresses every trailer regardless of
- * resumability (forks are non-resumable — t02 passes `false`).
+ * resumability (forks are non-resumable — the fork path passes `false`).
  */
 export function presentDispatchResult(
   result: DispatchResult,
@@ -1875,7 +1871,7 @@ export function presentDispatchResult(
 }
 
 /**
- * Best-effort `maxTurns` enforcement (plan §4.3 tier-up): Pi sessions have no
+ * Best-effort `maxTurns` enforcement: Pi sessions have no
  * turn-cap option, so past the cap every further tool call is blocked with an
  * instruction to answer — the subagent can still produce its final message.
  */
@@ -1911,7 +1907,7 @@ export function createAgentToolDefinition(
     name?: string;
     backgroundTasks?: BackgroundTaskRegistry;
     /**
-     * The DISPATCHER's own agent id (F13 t02): when this Agent tool is handed to
+     * The DISPATCHER's own agent id: when this Agent tool is handed to
      * a subagent, tasks it starts in the background are tagged with this owner so
      * the subagent's scoped TaskOutput/TaskStop can reach them (and nobody else's
      * can). Undefined for the coordinator instance — its tasks stay
@@ -1919,7 +1915,7 @@ export function createAgentToolDefinition(
      */
     ownerAgentId?: string;
     /**
-     * Runtime-set fork-spawns-fork marker (F16 t02): true iff the dispatcher that
+     * Runtime-set fork-spawns-fork marker: true iff the dispatcher that
      * was granted THIS Agent/Task tool is a genuinely-inheriting fork. Carried onto
      * every dispatch this tool makes (both background and foreground arms) so a
      * nested `subagent_type: "fork"` is refused. Undefined for the coordinator and
@@ -1952,16 +1948,16 @@ export function createAgentToolDefinition(
         }),
       ),
     }),
-    // Dispatch-time display (t03): show WHICH agent and WHAT it was asked, at
+    // Dispatch-time display: show WHICH agent and WHAT it was asked, at
     // call time — replacing Pi's bare bold "Agent" fallback. Cheap and
     // model-independent. Returns a structural pi-tui Component ({ render });
     // guarded so it can never throw into the render loop.
     renderCall(args: Record<string, unknown>, theme: unknown) {
       return renderAgentCall(args, theme);
     },
-    // Result display (t03, REQUIRED): Pi's fallback renders only result text, so
-    // without this the outcome badge, agent ID, transcript path (t02), and usage
-    // (t06) would be invisible. Also renders the live rolling tail for partial
+    // Result display (REQUIRED): Pi's fallback renders only result text, so
+    // without this the outcome badge, agent ID, transcript path, and usage
+    // would be invisible. Also renders the live rolling tail for partial
     // (streaming) results. Renders defensively when optional fields are absent.
     renderResult(
       result: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
@@ -1986,13 +1982,13 @@ export function createAgentToolDefinition(
         prompt: String(params.prompt ?? ""),
         model: params.model ? String(params.model) : undefined,
         depth: opts.depth + 1,
-        // F16 t02: propagate the runtime-set marker onto EVERY dispatch this tool
+        // Propagate the runtime-set marker onto EVERY dispatch this tool
         // makes (spread into both the background and foreground arms below), so a
         // fork's own Agent/Task tool refuses a nested `subagent_type: "fork"`.
         dispatcherIsFork: opts.dispatcherIsFork,
       };
       const backgroundDisabled = isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS);
-      // Background-by-default (F15, Claude 2.1.198+): a dispatch backgrounds
+      // Background-by-default (Claude 2.1.198+): a dispatch backgrounds
       // unless it explicitly opts out with `run_in_background: false`. Precedence
       // ladder (with the env gate below): CLAUDE_CODE_DISABLE_BACKGROUND_TASKS >
       // `background: true` frontmatter > explicit `run_in_background` > default
@@ -2004,30 +2000,29 @@ export function createAgentToolDefinition(
       // note below reuses it.
       const isBg = runtime.isBackgroundAgent(subagentType);
       const wantsBackground = isBg || params.run_in_background !== false;
-      // Degrade-note intent (F15): the "background requested but ran foreground"
-      // note keys on EXPLICIT background intent only — the OLD routing predicate —
-      // so a merely-defaulted dispatch that ends up foreground (disable-env, or a
+      // Degrade-note intent: the "background requested but ran foreground" note
+      // keys on EXPLICIT background intent only, so a merely-defaulted dispatch
+      // that ends up foreground (disable-env, or a
       // caller with no background registry wired) never falsely claims background
       // was requested. `wantsBackground` drives routing; this drives the note.
       const explicitBackgroundIntent = params.run_in_background === true || isBg;
       if (wantsBackground && !backgroundDisabled && opts.backgroundTasks) {
-        // Real background execution (audit E4): the un-awaited dispatch still
+        // Real background execution: the un-awaited dispatch still
         // takes its concurrency slot and fires SubagentStart/Stop hooks; the
         // registry owns its settlement (never an unhandled rejection).
         const controller = new AbortController();
-        // Pre-minted agent ID (t02): the start message is the background
+        // Pre-minted agent ID: the start message is the background
         // channel's guaranteed model-visible ID delivery, so it must exist
         // BEFORE the un-awaited dispatch settles.
         const agentId = mintAgentId();
         const registry = opts.backgroundTasks;
-        // Live progress → task record (t03): the same condensed activity that
+        // Live progress → task record: the same condensed activity that
         // drives the foreground UI updates a lightweight last-activity field so
         // TaskOutput shows the background subagent is alive. `taskId` is assigned
         // synchronously by start() below, long before any event fires.
         let taskId: string | undefined;
-        // Live progress → task record (F04 t02): hand the whole condensed
-        // snapshot to noteProgress, which stores it, derives lastActivity, and
-        // fans out to any waiting TaskOutput subscriber (t03).
+        // Hand the whole condensed snapshot to noteProgress, which stores it,
+        // derives lastActivity, and fans out to any waiting TaskOutput subscriber.
         const onProgress = (snapshot: ProgressSnapshot) => {
           if (taskId) registry.noteProgress(taskId, snapshot);
         };
@@ -2035,7 +2030,7 @@ export function createAgentToolDefinition(
           `agent:${label}`,
           runtime.dispatch({
             ...dispatchOpts,
-            // Nested background bound (F15 t02): mark this un-awaited dispatch as
+            // Nested background bound: mark this un-awaited dispatch as
             // background so a `depth > 1` fan-out acquires its per-depth budget
             // instead of taking the foreground bypass (which would be unbounded).
             background: true,
@@ -2046,13 +2041,13 @@ export function createAgentToolDefinition(
           () => controller.abort(),
           agentId,
           label,
-          // Owner tag (F13 t02): the dispatcher's id (a subagent's own id, or
+          // Owner tag: the dispatcher's id (a subagent's own id, or
           // undefined for the coordinator) so scoped TaskOutput/TaskStop reach
           // exactly the tasks that dispatcher started.
           opts.ownerAgentId,
         );
         taskId = id;
-        // Identity-at-start (F04 t02): the agent id appears for EVERY background
+        // Identity-at-start: the agent id appears for EVERY background
         // task — including one-shot builtins (Explore/Plan) — since the
         // start-message is the only model-visible id delivery in print/RPC mode.
         return {
@@ -2066,7 +2061,7 @@ export function createAgentToolDefinition(
         };
       }
       // Foreground: Pi's per-call signal (parent Esc) aborts the dispatch.
-      // Live progress (t03): stream the child's condensed, sanitized activity
+      // Live progress: stream the child's condensed, sanitized activity
       // through Pi's onUpdate partial-result channel (works in interactive AND
       // print/RPC modes — no ctx.ui dependency). Display-only: this text never
       // enters `finalMessage` (the returned content below is authoritative).
@@ -2089,15 +2084,15 @@ export function createAgentToolDefinition(
         agentId: result.agentId,
         transcriptPath: result.transcriptPath,
         resumable: result.resumable,
-        // Usage metadata (t06): populates t03's renderResult footer usage line
+        // Usage metadata: populates the renderResult footer usage line
         // (formatUsageLine → formatUsageCompact). details is logs/UI-only — never
         // the model-visible content, so the verbatim-return contract is untouched.
         usage: result.usage,
       };
-      // Claude 2.1.200 outcome→presentation mapping (F14 t01): the text, cut-off
-      // frame, resume trailer, and throw-vs-return decision all live in the
-      // shared, pure `presentDispatchResult` helper — the fork path (t02)
-      // consumes the same helper for byte-identical framing. `details`
+      // Claude 2.1.200 outcome→presentation mapping: the text, cut-off frame,
+      // resume trailer, and throw-vs-return decision all live in the shared,
+      // pure `presentDispatchResult` helper — the fork path consumes the same
+      // helper for byte-identical framing. `details`
       // (identity/usage/outcome/error/note) stays this consumer's job.
       const presentation = presentDispatchResult(result);
       if (presentation.kind === "failure") {
@@ -2115,8 +2110,8 @@ export function createAgentToolDefinition(
       if (result.outcome === "failed") {
         // failed WITH partial output → success-shaped cut-off result: the partial
         // output plus a clearly separated cut-off note. A resumable agent's ID
-        // rides in the same delimited frame (t02): the coordinator can follow up
-        // on the cut-off run via SendMessage (t04).
+        // rides in the same delimited frame: the coordinator can follow up on
+        // the cut-off run via SendMessage.
         return {
           content: [{ type: "text", text: presentation.text }],
           details: {
@@ -2130,14 +2125,14 @@ export function createAgentToolDefinition(
           },
         };
       }
-      // Verbatim-return contract (plan §4.3): callers parse finalMessage directly
-      // (often a locked YAML block) — compatibility notes belong in details only.
-      // Exception (t02 plan-review MUST-FIX): resumable agents get a clearly
+      // Verbatim-return contract: callers parse finalMessage directly (often a
+      // locked YAML block) — compatibility notes belong in details only.
+      // Exception: resumable agents get a clearly
       // delimited agent-ID trailer OUTSIDE the verbatim message, in the content
       // the model actually reads — `details` never reaches it. When the
       // completion was truncated it already ends with a `---` cut-off frame, so
       // the trailer rides INSIDE that frame (single `\n`, non-"completed"
-      // wording) rather than stacking a second frame (t02 review item 4).
+      // wording) rather than stacking a second frame.
       return {
         content: [{ type: "text", text: presentation.text }],
         details: {
@@ -2145,15 +2140,15 @@ export function createAgentToolDefinition(
           worktreePath: result.worktreePath,
           diagnostics: result.diagnostics,
           outcome: result.outcome,
-          // UX-3: a turn-capped SUCCESS is truncated — surface it so the badge
+          // A turn-capped SUCCESS is truncated — surface it so the badge
           // renders `completed (truncated)` instead of a clean `● completed`
           // (`presentation.cutOff === result.truncated === true` on this path).
           cutOff: presentation.cutOff,
           ...identityDetails,
-          // Visible-degrade note (F15 intent-split): key it on EXPLICIT background
+          // Visible-degrade note: key it on EXPLICIT background
           // intent — `run_in_background: true` OR a `background: true` frontmatter
-          // agent (isBackgroundAgent) — NOT on wantsBackground, which since the
-          // background-by-default flip is true for every defaulted dispatch. So a
+          // agent (isBackgroundAgent) — NOT on wantsBackground, which is true
+          // for every defaulted dispatch. So a
           // frontmatter-background agent (or an explicit run_in_background) forced
           // foreground (e.g. under CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, or with no
           // background registry wired) still surfaces the divergence — matching the
@@ -2173,17 +2168,17 @@ export function createAgentToolDefinition(
 }
 
 /**
- * The `SendMessage` tool (t04): the coordinator's channel back into its
- * subagents. Addressing is by agent ID or name (`to`), resolved EXCLUSIVELY
- * against the in-memory dispatch registry (SECURITY MUST-FIX #2 — a hostile `to`
- * never touches the filesystem). Two deliveries:
+ * The `SendMessage` tool: the coordinator's channel back into its subagents.
+ * Addressing is by agent ID or name (`to`), resolved EXCLUSIVELY against the
+ * in-memory dispatch registry (SECURITY — a hostile `to` never touches the
+ * filesystem). Two deliveries:
  *  - A still-running BACKGROUND subagent → the message is steered in as a
  *    mid-task course correction (`AgentSession.steer`); an ack is returned. (A
  *    foreground Agent call blocks the parent's turn, so steering de-facto reaches
  *    only background dispatches — by design, not a defect.)
  *  - A FINISHED subagent → it resumes IN THE BACKGROUND under the SAME agent ID
  *    with its full prior context, via a full re-dispatch through
- *    `SubagentRuntime.dispatch({ resume })` (SECURITY MUST-FIX #1 — the entire
+ *    `SubagentRuntime.dispatch({ resume })` (SECURITY — the entire
  *    enforcement stack is re-applied because it is the identical construction
  *    path). The tool returns an immediate ack; the run's outcome is available
  *    via TaskOutput (and, while eligible/current/uncollected, a bounded notice).
@@ -2217,7 +2212,7 @@ export function createSendMessageToolDefinition(
       if (!message.trim()) {
         throw new Error("SendMessage requires a non-empty `message` to deliver.");
       }
-      // SECURITY (MUST-FIX #2): registry-only resolution — pure in-memory Map
+      // SECURITY: registry-only resolution — pure in-memory Map
       // lookups. A hostile `to` (`..`, separators, absolute path) is neither a
       // minted agent id nor a registered name → clean miss, no filesystem touch.
       const resolved = opts.registry.resolve(to);
@@ -2257,7 +2252,7 @@ export function createSendMessageToolDefinition(
       // Settled → resume. Refuse the non-resumable cleanly — never silently start
       // a fresh context-less run. Two shapes: no persisted transcript (in-memory
       // fallback / one-shot builtin) OR a persisted transcript that is still
-      // non-resumable (F16: a fork persists its inherited transcript but its
+      // non-resumable (a fork persists its inherited transcript but its
       // context — the parent conversation at fork time — cannot be safely
       // re-derived). Give each an honest reason (tests assert refusal, not wording).
       if (!record.resumable || !record.transcriptPath) {
@@ -2287,10 +2282,10 @@ export function createSendMessageToolDefinition(
       }
 
       // Resume: flip the record to running eagerly (Claude 2.1.205 synchronous
-      // status flip; re-arms notice eligibility, subject to F21 collection and
+      // status flip; re-arms notice eligibility, subject to collection and
       // newest-generation checks), then re-dispatch in the
       // BACKGROUND under the SAME agent id through the shared construction path.
-      // NIT-3: between this markResuming and the re-dispatch's session-creation
+      // Between this markResuming and the re-dispatch's session-creation
       // register(), the record is running with no live session handle — a second
       // concurrent SendMessage in that window hits the "running but not yet
       // steerable" refusal (transient, by design).
@@ -2306,7 +2301,7 @@ export function createSendMessageToolDefinition(
           subagentType: record.agentName,
           prompt: message,
           depth: record.depth,
-          // Nested background bound (F15 t02): a SendMessage resume is always
+          // Nested background bound: a SendMessage resume is always
           // background. It is REQUIRED here, not optional — SendMessage is
           // parent-initiated only, so the common resumable agent is depth-1
           // (acquires its root pool regardless), but a grandchild id that bubbled
