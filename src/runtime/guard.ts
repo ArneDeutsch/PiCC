@@ -1,6 +1,6 @@
 import type { PermissionEngine } from "../engine/permissions.js";
 import { matchesRule, parseRule, READ_DENY_EDIT_TOOLS } from "../engine/permissions.js";
-import type { HookRunner } from "../engine/hook-runner.js";
+import type { HookRunnerLike } from "../engine/hook-runner.js";
 import { applyUpdatedInput, toClaudeCall, touchedFilePath } from "./tool-map.js";
 
 /**
@@ -13,7 +13,7 @@ import { applyUpdatedInput, toClaudeCall, touchedFilePath } from "./tool-map.js"
  */
 export interface GuardDeps {
   engine: PermissionEngine;
-  hooks: HookRunner;
+  hooks: HookRunnerLike;
   getCwd: () => string;
   /** Returns context to inject when a file is touched (nested CLAUDE.md, path rules). */
   contextForTouchedFile?: (filePath: string) => string | undefined;

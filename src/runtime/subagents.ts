@@ -10,7 +10,7 @@ import type {
   HookPayload,
   ToolCallDescriptor,
 } from "../types.js";
-import type { HookRunner } from "../engine/hook-runner.js";
+import type { HookRunner, HookRunnerLike } from "../engine/hook-runner.js";
 import { PermissionEngine } from "../engine/permissions.js";
 import { builtinAgents, resolveAgent } from "../claude/agents.js";
 import { parseHookConfig } from "../claude/hooks.js";
@@ -111,7 +111,7 @@ export interface SubagentRuntimeDeps {
    * parity): PiCC does NOT re-point subagent hook events at the subagent's
    * own transcript.
    */
-  makeScopedHookRunner?: (config: HookConfig) => HookRunner;
+  makeScopedHookRunner?: (config: HookConfig) => HookRunnerLike;
   /**
    * MAIN session transcript file (late-bound; undefined in print/no-session
    * modes and tests). Subagent transcripts persist in a sibling directory
@@ -472,7 +472,7 @@ function mergeHookOutcomes(outcomes: Array<HookOutcome | undefined>): HookOutcom
  * scoped runner — same pattern as index.ts's HookMultiplexer,
  * but per-dispatch and discarded with it.
  */
-function multiplexHookRunners(base: HookRunner, scoped: HookRunner): HookRunner {
+function multiplexHookRunners(base: HookRunnerLike, scoped: HookRunnerLike): HookRunnerLike {
   return {
     fire: async (
       eventName: string,
@@ -483,7 +483,7 @@ function multiplexHookRunners(base: HookRunner, scoped: HookRunner): HookRunner 
         await base.fire(eventName, payload, toolCall),
         await scoped.fire(eventName, payload, toolCall),
       ]),
-  } as unknown as HookRunner;
+  };
 }
 
 export function extractText(content: unknown): string {
@@ -955,7 +955,7 @@ export class SubagentRuntime {
     // Agent-scoped hooks: frontmatter `hooks:` dispatch while THIS
     // subagent runs. The scoped runner is multiplexed with the session runner
     // for the dispatch's guard and Subagent* events and discarded when it ends.
-    let scopedHooks: HookRunner | undefined;
+    let scopedHooks: HookRunnerLike | undefined;
     if (
       this.deps.makeScopedHookRunner &&
       agent.hooks &&
@@ -1018,7 +1018,7 @@ export class SubagentRuntime {
           }
           return outcome;
         },
-      } as unknown as HookRunner;
+      };
     }
     // Central identity injection: agent_id AND agent_type (the agent's
     // name) ride on EVERY hook payload fired within this dispatch — the guard's
@@ -1028,19 +1028,14 @@ export class SubagentRuntime {
     // runner. transcript_path is deliberately NOT injected — parity: subagent
     // hook events keep the MAIN session transcript_path (the runner's own
     // constructed default), never the subagent's own file.
-    const injectIdentity = (runner: HookRunner): HookRunner =>
-      ({
-        fire: (
-          eventName: string,
-          payload: Partial<HookPayload>,
-          toolCall?: ToolCallDescriptor,
-        ): Promise<HookOutcome> =>
-          runner.fire(
-            eventName,
-            { ...payload, agent_id: agentId, agent_type: agent.name },
-            toolCall,
-          ),
-      }) as unknown as HookRunner;
+    const injectIdentity = (runner: HookRunnerLike): HookRunnerLike => ({
+      fire: (
+        eventName: string,
+        payload: Partial<HookPayload>,
+        toolCall?: ToolCallDescriptor,
+      ): Promise<HookOutcome> =>
+        runner.fire(eventName, { ...payload, agent_id: agentId, agent_type: agent.name }, toolCall),
+    });
     const baseRunner = injectIdentity(this.deps.hookRunner);
     if (scopedHooks) scopedHooks = injectIdentity(scopedHooks);
     const hookRunner = scopedHooks

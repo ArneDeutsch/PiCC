@@ -50,6 +50,7 @@ import {
   contextForTouchedFile,
   newSessionContextState,
   resetInjectionState,
+  type AssemblyInputs,
 } from "../src/runtime/context-assembly.js";
 import { mapEffort, steeringForModel, type PiCCConfig } from "../src/runtime/steering.js";
 import { createAgentToolDefinition, extractText, type SubagentRuntime } from "../src/runtime/subagents.js";
@@ -275,14 +276,14 @@ describe("context assembly", () => {
   });
 
   it("gates the interaction posture on includeInteractionPosture", () => {
-    const base = {
+    const base: AssemblyInputs = {
       claudeMd,
       rules: [],
       skills: [],
       agents: [],
       settings: baseSettings(),
       state: newSessionContextState(claudeMd),
-    } as const;
+    };
     // Flag omitted (the subagent default): posture absent, conventions still present.
     const omitted = buildSystemPromptSuffix(base);
     expect(omitted).not.toContain("Working with the user");
@@ -405,14 +406,14 @@ describe("context assembly", () => {
   });
 
   it("emits no scratchpad section (and no Windows note) when scratchDir is undefined", () => {
-    const inputs = {
+    const inputs: AssemblyInputs = {
       claudeMd,
       rules: [],
       skills: [],
       agents: [],
       settings: baseSettings(),
       state: newSessionContextState(claudeMd),
-    } as const;
+    };
     const baseline = buildSystemPromptSuffix(inputs);
     // Even with the flag forced on, no scratchDir means no section at all.
     const flagged = buildSystemPromptSuffix({ ...inputs, windowsTempNote: true });
@@ -788,7 +789,7 @@ describe("SubagentRuntime (fake SDK)", () => {
         const agentTool = session.customTools.find((t) => t.name === "Agent");
         if (agentTool && text.includes("delegate")) {
           const res = await agentTool.execute("id", { subagent_type: "inner", prompt: "leaf work" });
-          return `nested:${res.content[0].text}`;
+          return `nested:${res.content[0]?.text}`;
         }
         return "leaf-done";
       },
