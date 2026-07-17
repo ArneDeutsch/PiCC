@@ -1,5 +1,5 @@
 /**
- * Type-level Pi contract pins (t01). This file is never executed — it is
+ * Type-level Pi contract pins. This file is never executed — it is
  * compiled by test/pi-contract.test.ts with the REAL TypeScript checker
  * (vitest's esbuild transform does not typecheck, and the project tsconfig
  * excludes test/), so a Pi type-surface change fails the contract suite
@@ -44,7 +44,7 @@ export const executeArity: Parameters<Exec>["length"] = 5;
 export const executeSignal: Parameters<Exec>[2] = new AbortController().signal;
 export const executeSignalOptional: Parameters<Exec>[2] = undefined;
 
-// --- concise-tool-rows t02: self-shell row de-padding surface ---
+// --- self-shell row de-padding surface ---
 
 // renderShell accepts "self" — the ONLY ToolDefinition lever that drops Pi's
 // top/bottom row padding (the whole feature depends on it). A Pi change that
@@ -52,7 +52,7 @@ export const executeSignalOptional: Parameters<Exec>[2] = undefined;
 // core/extensions/types.d.ts:349 (renderShell?: "default" | "self").
 export const renderShellSelf: NonNullable<ToolDefinition["renderShell"]> = "self";
 
-// --- t02: subagent transcript persistence surface ---
+// --- subagent transcript persistence surface ---
 
 // SessionManager.create(cwd, sessionDir?, options?) — the custom sessionDir +
 // pinned-id form PiCC uses for subagent transcripts — returns a SessionManager.
@@ -79,7 +79,7 @@ export const openReturns: ReturnType<typeof SessionManager.open> extends Session
 export const sessionFileGetter: ReturnType<SessionManager["getSessionFile"]> = undefined;
 export const restoreSurface: keyof SessionManager = "buildSessionContext";
 
-// --- t03: live-progress event stream surface ---
+// --- live-progress event stream surface ---
 
 // AgentSession.subscribe(listener) exists and returns an unsubscribe function —
 // the seam dispatch() uses to stream a subagent's activity to the parent UI.
@@ -105,7 +105,7 @@ export const toolUpdate: Extract<
 export const toolEnd: Extract<AgentSessionEvent, { type: "tool_execution_end" }>["type"] =
   "tool_execution_end";
 
-// --- t04: resume + steer surface ---
+// --- resume + steer surface ---
 
 // AgentSession.steer(text, images?) → Promise<void> — the mid-task
 // course-correction seam SendMessage uses for a RUNNING background dispatch.
@@ -115,7 +115,7 @@ export const steerReturns: ReturnType<AgentSession["steer"]> = Promise.resolve()
 export const followUpArg: Parameters<AgentSession["followUp"]>[0] = "follow up";
 export const followUpReturns: ReturnType<AgentSession["followUp"]> = Promise.resolve();
 
-// --- t06: per-subagent usage accounting surface ---
+// --- per-subagent usage accounting surface ---
 
 // AgentSession.getSessionStats() returns SessionStats — the aggregate token/cost
 // totals PiCC records per subagent. A signature change fails this pin.

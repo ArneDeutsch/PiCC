@@ -52,7 +52,7 @@ describe("unicodeSafeSubprocessEnv", () => {
   });
 });
 
-// Table-driven, platform-injected (ungated on all OSes) — locks the #48
+// Table-driven, platform-injected (ungated on all OSes) — locks the
 // regression: the win32 result is the forward-slash drive-letter form both the
 // pinned Git Bash and the native Read/Grep/Glob tools resolve to the same real
 // dir, and is NEVER a bare `/tmp/...`, NEVER leading-slash. Off-win32 the path is

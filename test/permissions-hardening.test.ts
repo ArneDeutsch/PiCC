@@ -6,7 +6,7 @@ import { PermissionEngine, evaluateIfCondition, matchesRule } from "../src/engin
 import type { PermissionRules, ToolCallDescriptor } from "../src/types.js";
 
 /**
- * Regression tests for the permissions review findings (research 02 §7):
+ * Regression tests for the permissions review findings:
  * - Edit rules gate ALL file-modification tools (Write/MultiEdit/NotebookEdit),
  * - path-rule anchoring is stable (settings root, not the drifting session cwd),
  * - process-wrapper stripping for Bash deny prefix rules,
@@ -85,7 +85,7 @@ describe("Edit rules gate all file-modification tools", () => {
     expect(matchesRule("MultiEdit(src/**)", call("MultiEdit", { file_path: "src/a.ts" }))).toBe(true);
   });
 
-  it("a path-scoped NotebookRead rule routes through pathSpecifierMatches (F18)", () => {
+  it("a path-scoped NotebookRead rule routes through pathSpecifierMatches", () => {
     // The real NotebookRead reader shares Read's trust boundary, so a
     // NotebookRead(<glob>) rule must match on notebook_path (in the glob) and
     // NOT match one outside it — proving the new matchesRule switch case.
@@ -95,7 +95,7 @@ describe("Edit rules gate all file-modification tools", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 1b. Read rules gate all file-read tools (F26, mirrors the Edit family)
+// 1b. Read rules gate all file-read tools (mirrors the Edit family)
 // ---------------------------------------------------------------------------
 
 describe("Read rules gate all file-read tools", () => {
@@ -162,7 +162,7 @@ describe("Read rules gate all file-read tools", () => {
     expect(engine.evaluate(call("Grep", { path: "secrets" })).decision).toBe("deny");
     expect(matchesRule("Read(secrets/**)", call("Glob", { path: "secrets" }))).toBe(true);
 
-    // The REAL residual gap (basis for the t02 honesty caveat) is a read call
+    // The REAL residual gap (basis for the honesty caveat) is a read call
     // that names NO path (or `path:"."`): there is nothing for the path matcher
     // to test, so the rule cannot fire and matching files stay reachable via
     // the tool's results. Only a BARE `deny: Read` forecloses that.

@@ -18,7 +18,7 @@ import {
 import type { HookOutcome } from "../src/types.js";
 
 /**
- * F16 t01 — `subagent_type: "fork"` parent-conversation inheritance, env gate,
+ * `subagent_type: "fork"` parent-conversation inheritance, env gate,
  * and VISIBLE degrade. These are the unit/wiring layer; the genuine on-disk
  * forkFrom proof (real Pi SessionManager) lives in subagent-transcripts.test.ts.
  */

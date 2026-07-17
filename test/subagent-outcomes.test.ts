@@ -8,7 +8,7 @@ import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import { fakeSdk, makeAgent, makeSubagentRuntime, type FakeSessionState } from "./helpers/fake-sdk.js";
 
 /**
- * t01 — loud failure semantics: every dispatch exit path yields a classified
+ * Loud failure semantics: every dispatch exit path yields a classified
  * outcome (completed/failed/aborted); a terminal LLM error (stopReason "error"
  * on the last assistant message) can NEVER come back as an empty success.
  * Regression suite for the 2026-07-12 drained-limit incident.
@@ -24,7 +24,7 @@ type ToolLike = {
 
 const API_DEATH = /Agent terminated early due to an API error/;
 
-describe("dispatch outcome classification (t01)", () => {
+describe("dispatch outcome classification", () => {
   it("stopReason 'error' with no prior output → failed with the error named, never an empty success", async () => {
     const h = fakeSdk({
       replies: [{ stopReason: "error", errorMessage: "429 rate limit exceeded (mock provider)" }],
@@ -343,7 +343,7 @@ describe("dispatch outcome classification (t01)", () => {
   });
 });
 
-describe("Agent tool failure mapping (t01, Claude 2.1.200 semantics)", () => {
+describe("Agent tool failure mapping (Claude 2.1.200 semantics)", () => {
   it("failed with partial output → SUCCESS result: partial output + separated cut-off note naming the API error", async () => {
     const h = fakeSdk({
       onPrompt: (_text, session: FakeSessionState) => {
@@ -410,7 +410,7 @@ describe("Agent tool failure mapping (t01, Claude 2.1.200 semantics)", () => {
   });
 });
 
-describe("background dispatch failure mapping (t01, through dispatch — not registry literals)", () => {
+describe("background dispatch failure mapping (through dispatch — not registry literals)", () => {
   it("a rate-limit death lands as status 'failed' with the error in TaskOutput — never 'completed' + empty", async () => {
     const h = fakeSdk({
       replies: [{ stopReason: "error", errorMessage: "429 too many requests" }],

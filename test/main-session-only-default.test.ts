@@ -15,7 +15,7 @@ import {
 } from "./helpers/fake-sdk.js";
 
 /**
- * F22 t01 — main-session-only by DEFAULT. With no subagent settings configured,
+ * Main-session-only by DEFAULT. With no subagent settings configured,
  * `createDefaultSettings()` resolves `subagentMaxDepth` to 1, so:
  *   - the main session (depth 0) is untouched: it keeps Agent + Task and the
  *     "Available subagents" catalog (gated only on subagentsEnabled), and
@@ -47,7 +47,7 @@ function rmQuiet(dir: string): void {
 // ---------------------------------------------------------------------------
 // Unit: the runtime depth guard is driven purely by maxDepth.
 // ---------------------------------------------------------------------------
-describe("F22: runtime depth guard under maxDepth 1 (and the opt-in mirror)", () => {
+describe("runtime depth guard under maxDepth 1 (and the opt-in mirror)", () => {
   it("rejects a direct depth-2 dispatch at maxDepth 1", async () => {
     const { sdk } = fakeSdk({ replies: ["x"] });
     const runtime = makeSubagentRuntime([makeAgent()], sdk, { maxDepth: 1 });
@@ -67,7 +67,7 @@ describe("F22: runtime depth guard under maxDepth 1 (and the opt-in mirror)", ()
 // ---------------------------------------------------------------------------
 // Offline-integration: default settings ⇒ maxDepth 1 through the real picc() wiring.
 // ---------------------------------------------------------------------------
-describe("F22: default settings keep the main session but stop depth-1 subagents recursing", () => {
+describe("default settings keep the main session but stop depth-1 subagents recursing", () => {
   let dir: string;
   let pi: FakePi;
   let h: FakeSdkHandle;
@@ -137,7 +137,7 @@ describe("F22: default settings keep the main session but stop depth-1 subagents
 // ---------------------------------------------------------------------------
 // Offline-integration: the non-Agent `context: fork` alternate path is refused too.
 // ---------------------------------------------------------------------------
-describe("F22: a subagent-invoked context:fork (depth 2) is refused under the default", () => {
+describe("a subagent-invoked context:fork (depth 2) is refused under the default", () => {
   let dir: string;
   let pi: FakePi;
   let h: FakeSdkHandle;

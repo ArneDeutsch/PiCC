@@ -203,7 +203,7 @@ describe("loadAgents", () => {
     expect(a.diagnostics.some((d) => d.message.includes("isolation"))).toBe(true);
   });
 
-  it("parses `background: true` frontmatter (Claude 2.1.198, t05); absent/false stay off", () => {
+  it("parses `background: true` frontmatter (Claude 2.1.198); absent/false stay off", () => {
     writeAgent(
       "bg.md",
       ["---", "description: bg agent", "background: true", "---", "b"].join("\n"),
@@ -223,7 +223,7 @@ describe("loadAgents", () => {
     expect(byName["bg"]!.unknownKeys).not.toContain("background");
   });
 
-  it('parses string background values ("true"/"1"/"yes" → true; garbage → undefined) (t05)', () => {
+  it('parses string background values ("true"/"1"/"yes" → true; garbage → undefined)', () => {
     // Quoted so YAML keeps them as STRINGS (bare yes/no/1 would coerce in YAML),
     // exercising toOptionalBoolean's string branch directly.
     writeAgent("bg-s-true.md", ["---", 'description: d', 'background: "true"', "---", "b"].join("\n"));
@@ -267,7 +267,7 @@ describe("loadAgents", () => {
       ["---", "tools: [unclosed", "description: d", "---", "Body"].join("\n"),
     );
     const { agents } = load();
-    // Lenient recovery (plan §2.1 mechanical fidelity — Claude Code accepts these):
+    // Lenient recovery (mechanical fidelity — Claude Code accepts these):
     // the description is recovered so the agent loads; the malformed inline
     // collection `[unclosed` is dropped rather than turned into a bogus tool.
     expect(agents).toHaveLength(1);
@@ -386,7 +386,7 @@ describe("renderAgentCatalog", () => {
   });
 });
 
-describe("builtinAgents (audit E1/E6)", () => {
+describe("builtinAgents", () => {
   it("defines general-purpose, Explore, and Plan with the built-in markers", () => {
     const agents = builtinAgents({});
     expect(agents.map((a) => a.name)).toEqual(["general-purpose", "Explore", "Plan"]);
@@ -404,7 +404,7 @@ describe("builtinAgents (audit E1/E6)", () => {
     expect(gp.skipProjectContext).toBeUndefined();
     for (const name of ["Explore", "Plan"]) {
       const a = agents.find((x) => x.name === name)!;
-      // Read-only restriction + Claude's CLAUDE.md skipping (E6).
+      // Read-only restriction + Claude's CLAUDE.md skipping.
       expect(a.disallowedTools).toEqual([
         "Edit",
         "Write",

@@ -145,7 +145,7 @@ describe("expandImports", () => {
 
 describe("loadClaudeMdHierarchy", () => {
   // All hierarchy tests pass stopDir (and managedDirs: []) so the ancestor walk —
-  // which reaches the filesystem root in production (audit B1) — stays inside tmp.
+  // which reaches the filesystem root in production — stays inside tmp.
   it("loads user, then root→cwd chain, then .claude, in order with correct scopes", () => {
     const userDir = path.join(tmp, "userhome");
     const root = path.join(tmp, "proj");
@@ -200,7 +200,7 @@ describe("loadClaudeMdHierarchy", () => {
     expect(res.files[1]!.scope).toBe("local");
   });
 
-  it("loads ancestor CLAUDE.md files above the git root, root-first (B1)", () => {
+  it("loads ancestor CLAUDE.md files above the git root, root-first", () => {
     const root = path.join(tmp, "above", "repo");
     write("above/CLAUDE.md", "ABOVE");
     write("above/repo/CLAUDE.md", "ROOT");
@@ -234,7 +234,7 @@ describe("loadClaudeMdHierarchy", () => {
     ).not.toThrow();
   });
 
-  it("does NOT auto-load .claude/CLAUDE.local.md or a user-dir CLAUDE.local.md (B2)", () => {
+  it("does NOT auto-load .claude/CLAUDE.local.md or a user-dir CLAUDE.local.md", () => {
     const userDir = path.join(tmp, "userhome");
     const root = path.join(tmp, "proj");
     write("userhome/CLAUDE.md", "USER");
@@ -254,7 +254,7 @@ describe("loadClaudeMdHierarchy", () => {
     expect(res.files.map((f) => f.content)).toEqual(["USER", "ROOT", "DOTCLAUDE"]);
   });
 
-  it("loads a standalone CLAUDE.local.md in an ancestor dir even without a sibling CLAUDE.md (B2)", () => {
+  it("loads a standalone CLAUDE.local.md in an ancestor dir even without a sibling CLAUDE.md", () => {
     const root = path.join(tmp, "proj");
     write("proj/CLAUDE.md", "ROOT");
     write("proj/sub/CLAUDE.local.md", "SUB LOCAL");
@@ -271,7 +271,7 @@ describe("loadClaudeMdHierarchy", () => {
     expect(res.files[1]!.scope).toBe("local");
   });
 
-  it("loads the managed CLAUDE.md first and exempts it from claudeMdExcludes (B3)", () => {
+  it("loads the managed CLAUDE.md first and exempts it from claudeMdExcludes", () => {
     const managedBase = path.join(tmp, "managed");
     const root = path.join(tmp, "proj");
     write("managed/CLAUDE.md", "MANAGED POLICY");
@@ -291,7 +291,7 @@ describe("loadClaudeMdHierarchy", () => {
     expect(res.diagnostics.some((d) => /claudeMdExcludes/.test(d.message))).toBe(true);
   });
 
-  it("injects managed-settings inline claudeMd content after the managed file, before user scope (B3)", () => {
+  it("injects managed-settings inline claudeMd content after the managed file, before user scope", () => {
     const managedBase = path.join(tmp, "managed");
     const managedSettings = path.join(managedBase, "managed-settings.json");
     const userDir = path.join(tmp, "userhome");
@@ -320,7 +320,7 @@ describe("loadClaudeMdHierarchy", () => {
     expect(res.files[1]!.loadAtStart).toBe(true);
   });
 
-  it("**/CLAUDE.md exclude reaches ancestor files ABOVE the project root (G3)", () => {
+  it("**/CLAUDE.md exclude reaches ancestor files ABOVE the project root", () => {
     const root = path.join(tmp, "above", "repo");
     write("above/CLAUDE.md", "ABOVE");
     write("above/repo/CLAUDE.md", "ROOT");
@@ -339,7 +339,7 @@ describe("loadClaudeMdHierarchy", () => {
     expect(res.diagnostics.filter((d) => /claudeMdExcludes/.test(d.message))).toHaveLength(2);
   });
 
-  it("bare-name exclude also reaches ancestor files above the project root (G3)", () => {
+  it("bare-name exclude also reaches ancestor files above the project root", () => {
     const root = path.join(tmp, "above", "repo");
     write("above/CLAUDE.md", "ABOVE");
     write("above/repo/CLAUDE.md", "ROOT");

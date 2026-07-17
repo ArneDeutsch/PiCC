@@ -7,7 +7,7 @@ import { fakeSdk, type FakeCustomTool, type FakeSdkHandle } from "./helpers/fake
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 
 /**
- * F18 — the `allKnownToolNames` wiring for the real NotebookRead tool, proven
+ * The `allKnownToolNames` wiring for the real NotebookRead tool, proven
  * through the REAL `picc(...)` dispatch path with a fake Pi SDK (no LLM/network).
  *
  * `gateTools` filters an agent's grant against `allKnownToolNames()`; if the
@@ -17,7 +17,7 @@ import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
  * future-agent and asserts a NotebookRead customTool actually reached the
  * created subagent session — it fails iff the literal is missing (the compat-
  * report tests route through the registry, not gateTools, so they cannot catch
- * this). Mirrors test/slashcommand-fork.test.ts:79-109.
+ * this). Mirrors test/slashcommand-fork.test.ts.
  */
 
 let dir: string;
@@ -47,7 +47,7 @@ afterAll(() => {
   cleanupFixture(dir);
 });
 
-describe("NotebookRead subagent-dispatch wiring (F18)", () => {
+describe("NotebookRead subagent-dispatch wiring", () => {
   it("provisions the main session with a real NotebookRead tool", () => {
     expect(pi.tools.has("NotebookRead")).toBe(true);
   });
@@ -55,7 +55,7 @@ describe("NotebookRead subagent-dispatch wiring (F18)", () => {
   it("grants a real NotebookRead tool to a subagent that inherits all tools", async () => {
     const agentTool = pi.tools.get("Agent");
     // future-agent has no `tools:` frontmatter → inherits ALL tools → is granted
-    // NotebookRead. This exercises the allKnownToolNames MUST-FIX + the subagent
+    // NotebookRead. This exercises the allKnownToolNames wiring + the subagent
     // grant block: without the "NotebookRead" literal, gateTools drops the name
     // and the subagent could never receive the tool. Pin foreground so the
     // subagent session is created synchronously and its customTools inspectable.

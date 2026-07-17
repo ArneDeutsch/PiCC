@@ -86,7 +86,7 @@ describe("control commands display immediately and never leak to the model", () 
   });
 
   it("/usage via the input event is intercepted (print/non-interactive mode) and never leaks to the model", async () => {
-    // Regression guard (t07 FIX 3): /usage was registered as a command but MISSING
+    // Regression guard: /usage was registered as a command but MISSING
     // from the input-handler control-command interceptor, so in print mode it fell
     // through to the model instead of being short-circuited.
     reset();

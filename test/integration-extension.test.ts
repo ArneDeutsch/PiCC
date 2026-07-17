@@ -9,7 +9,7 @@ import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/f
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 
 /**
- * Integration + NFR tests (plan §14, §15.3, §12.1): the whole extension wired against
+ * Integration + NFR tests: the whole extension wired against
  * the full-surface conformance fixture through a fake Pi API. No LLM/network involved —
  * these assert the mechanical-fidelity tier end to end.
  */
@@ -79,7 +79,7 @@ describe("tool surface registration", () => {
     }
   });
 
-  it("de-pads the re-registered built-ins: renderShell:'self' with renderers installed (concise-tool-rows t02)", () => {
+  it("de-pads the re-registered built-ins: renderShell:'self' with renderers installed", () => {
     for (const name of ["read", "write", "edit", "bash", "grep", "find", "ls"]) {
       const tool = pi.tools.get(name);
       expect(tool, `missing builtin ${name}`).toBeTruthy();
@@ -93,7 +93,7 @@ describe("tool surface registration", () => {
     }
   });
 
-  it("wired edit keeps its diff on a colored band with no top/bottom padding (concise-tool-rows t02)", async () => {
+  it("wired edit keeps its diff on a colored band with no top/bottom padding", async () => {
     // edit's renderResult colors the diff body via Pi's theme singleton (renderDiff),
     // which the real TUI initializes at startup — do the same here.
     const { initTheme } = await import("@earendil-works/pi-coding-agent");
@@ -141,7 +141,7 @@ describe("tool surface registration", () => {
     expect(stripBg(out[out.length - 1]!).trim().length).toBeGreaterThan(0);
   });
 
-  it("de-pads every Claude-named tool row: renderShell:'self' across the registration loop (concise-tool-rows t01)", () => {
+  it("de-pads every Claude-named tool row: renderShell:'self' across the registration loop", () => {
     // A representative set spanning both wrapper cases: own-renderer tools
     // (Agent/TaskOutput), high-traffic renderer-less tools (TodoWrite/Grep),
     // SendMessage, and the previously renderer-less TaskStop.
@@ -257,7 +257,7 @@ describe("system prompt assembly + progressive disclosure NFR", () => {
     expect(prompt).toContain("plugin-skill:");
     // …but user-only skill hidden from the model listing
     expect(prompt).not.toMatch(/- secret-ritual:/);
-    // THE lazy-load NFR: no skill body may be in context before activation (plan §12.1)
+    // THE lazy-load NFR: no skill body may be in context before activation
     for (const canary of [
       "FS-SKILL-FORK-BODY",
       "FS-SKILL-ARGS-BODY",
@@ -332,7 +332,7 @@ describe("skill activation", () => {
     ).toBe(true);
   });
 
-  it("background dispatch + TaskOutput path is exercisable (F04): bg agent loads, /bg-research expands", async () => {
+  it("background dispatch + TaskOutput path is exercisable: bg agent loads, /bg-research expands", async () => {
     // The async-researcher background agent (background: true) reaches the routing catalog…
     const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" })).systemPrompt as string;
     expect(prompt).toMatch(/- async-researcher( \(read-only\))?: Researches a question in the background/);
@@ -352,7 +352,7 @@ describe("skill activation", () => {
   });
 });
 
-describe("SlashCommand tool (F11)", () => {
+describe("SlashCommand tool", () => {
   it("activates the resolved skill with args, byte-identical to the Skill tool for the same input", async () => {
     const skillTool = pi.tools.get("Skill");
     const slash = pi.tools.get("SlashCommand");
@@ -595,7 +595,7 @@ describe("session lifecycle hooks", () => {
     expect(doctor.toLowerCase()).toContain("mcp");
   });
 
-  it("compaction: PostCompact re-injects active skills mid-run via steer (NFR §9)", async () => {
+  it("compaction: PostCompact re-injects active skills mid-run via steer", async () => {
     const skillTool = pi.tools.get("Skill");
     await skillTool.execute("t6", { name: "deploy", arguments: "prod 2.0" });
     pi.messages.length = 0;
@@ -662,7 +662,7 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     expect(fs.existsSync(b.details.worktreePath)).toBe(true);
   });
 
-  it("re-registered built-in execute re-resolves the live cwd after a worktree swap (concise-tool-rows t02)", async () => {
+  it("re-registered built-in execute re-resolves the live cwd after a worktree swap", async () => {
     // Proves the wrap did NOT drop the factory(cwdState.get()) re-resolution: call
     // a built-in's execute, swap cwdState via EnterWorktree, call again, and observe
     // the effective directory changed. A dropped re-resolution would keep listing
@@ -687,7 +687,7 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
   });
 });
 
-describe("background settlement delivery (t05, offline integration via the seam)", () => {
+describe("background settlement delivery (offline integration via the seam)", () => {
   // The fake-Pi harness cannot reach the closure-local registries, so a fresh
   // extension instance is wired with the test-only `onWired` seam (reachable
   // ONLY via this in-process argument — never env/settings/files). Coverage
@@ -849,7 +849,7 @@ describe("background settlement delivery (t05, offline integration via the seam)
     expect(settlements(p)).toHaveLength(0);
   });
 
-  it("a pi.sendMessage throw on one notice still delivers the others and re-fires the throwing one next turn (FIX 1)", async () => {
+  it("a pi.sendMessage throw on one notice still delivers the others and re-fires the throwing one next turn", async () => {
     // The real delivery path (deliverSettlementNotices): each notice is delivered
     // in its own try/catch and the dedup gate is committed ONLY after a successful
     // send. A throw on one notice must neither drop the others nor consume the
@@ -914,7 +914,7 @@ describe("background settlement delivery (t05, offline integration via the seam)
     expect(settlements(p)).toHaveLength(0);
   });
 
-  it("/usage aggregates per-subagent usage, transcript paths, outcome, and a session total (t06)", async () => {
+  it("/usage aggregates per-subagent usage, transcript paths, outcome, and a session total", async () => {
     const { p, internals } = await wire();
     // Two settled dispatches with usage, exactly as the runtime would record:
     // register (running) then markSettled with outcome + usage.
@@ -977,7 +977,7 @@ describe("background settlement delivery (t05, offline integration via the seam)
     expect(out).toContain("No subagents have been dispatched this session");
   });
 
-  it("sanitizes a control-byte agent name in the /usage report (FIX 4 security)", async () => {
+  it("sanitizes a control-byte agent name in the /usage report", async () => {
     // agentName derives from agent frontmatter `name`/basename (only trimmed
     // upstream); a hostile ANSI/OSC/control-byte name must not reach the terminal
     // on /usage. Control bytes from code points so this source stays pure ASCII.
@@ -1065,12 +1065,12 @@ describe("background settlement delivery (t05, offline integration via the seam)
     expect(settlements(p)).toHaveLength(3);
     expect(joined).toContain("settled: completed");
     expect(joined).toContain("settled: failed");
-    expect(joined).toContain("insufficient_quota"); // t01 regression: never a silent success
+    expect(joined).toContain("insufficient_quota"); // regression: never a silent success
     expect(joined).toContain("settled: aborted"); // outcome vocabulary (status is "stopped")
   });
 });
 
-describe("subagent background-task scoping (F13 t02, offline-integration via a real dispatch)", () => {
+describe("subagent background-task scoping (offline-integration via a real dispatch)", () => {
   // A REAL dispatch through the coordinator's registered Agent tool, driven
   // OFFLINE by a fake SDK injected via the onWired seam's subagentRuntime. The
   // dispatcher-owner id is minted by the RUNTIME (the `mintAgentId` in dispatch)
@@ -1147,7 +1147,7 @@ describe("subagent background-task scoping (F13 t02, offline-integration via a r
     const coordAgent = p.tools.get("Agent");
     // Two foreground subagent dispatches: each starts ITS OWN nested background
     // task (owner = that subagent's runtime-minted id). run_in_background: false
-    // pins them foreground (F15 made dispatch background-by-default) so each outer
+    // pins them foreground (dispatch is background-by-default) so each outer
     // subagent runs synchronously and its nested task id is captured before the
     // scoping assertions below.
     await coordAgent.execute("c1", {

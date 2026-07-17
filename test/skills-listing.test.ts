@@ -3,7 +3,7 @@ import { renderSkillListing } from "../src/claude/skills.js";
 import type { ClaudeSkill, Diagnostic } from "../src/types.js";
 
 /**
- * Focused tests for the skill-listing budgets (audit A4): 1536-char per-entry
+ * Focused tests for the skill-listing budgets: 1536-char per-entry
  * default, ~8k-char default budget, SLASH_COMMAND_TOOL_CHAR_BUDGET env
  * override, and the tiered degradation (full → no when: → truncated
  * descriptions → names-only) that never omits a skill.

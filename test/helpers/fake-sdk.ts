@@ -12,7 +12,7 @@ import type { ClaudeAgent, HookOutcome } from "../../src/types.js";
 import { deferred, waitUntil, type Deferred } from "./async.js";
 
 /**
- * Shared fake Pi SDK builder (t01): the one place tests fake `createAgentSession`.
+ * Shared fake Pi SDK builder: the one place tests fake `createAgentSession`.
  * Replaces the copy-pasted fakes that previously lived in runtime-core,
  * background-tasks, and builtin-agents tests — extend THIS instead of forking.
  *
@@ -33,9 +33,9 @@ import { deferred, waitUntil, type Deferred } from "./async.js";
  */
 type RealSessionManager = {
   create(cwd: string, sessionDir: string, opts: { id: string }): PiSessionManagerLike;
-  /** Reopen a transcript for resume (t04) — SessionManager.open. */
+  /** Reopen a transcript for resume — SessionManager.open. */
   open(path: string, sessionDir?: string, cwdOverride?: string): PiSessionManagerLike;
-  /** Fork a NEW transcript seeded from a source's full history (F16) — SessionManager.forkFrom. */
+  /** Fork a NEW transcript seeded from a source's full history — SessionManager.forkFrom. */
   forkFrom(
     sourcePath: string,
     targetCwd: string,
@@ -59,7 +59,7 @@ export interface FakeReply {
   /** Await this before replying — lets tests hold a prompt open (abort/concurrency). */
   gate?: Promise<void>;
   /**
-   * Live session events (t03) emitted to `subscribe` listeners while THIS reply
+   * Live session events emitted to `subscribe` listeners while THIS reply
    * is produced (after the gate resolves, before the assistant message lands) —
    * lets tests script a `tool_execution_*` / `message_update` / `auto_retry_*`
    * sequence the progress condenser consumes. Loosely typed on purpose.
@@ -84,17 +84,16 @@ export interface FakeSessionState {
   /** The customTools passed into createAgentSession (for nested-dispatch scripts). */
   customTools: FakeCustomTool[];
   /**
-   * Live count of event listeners currently subscribed to this session (t03,
-   * FIX-B): lets a test assert dispatch's `finally` unsubscribes — the count
+   * Live count of event listeners currently subscribed to this session: lets a test assert dispatch's `finally` unsubscribes — the count
    * must return to 0 after dispatch settles, on both success and failure paths.
    */
   listenerCount(): number;
-  /** Messages delivered via `steer()` (t04): SendMessage's running-agent path. */
+  /** Messages delivered via `steer()`: SendMessage's running-agent path. */
   steerMessages: string[];
-  /** Messages delivered via `followUp()` (t04). */
+  /** Messages delivered via `followUp()`. */
   followUpMessages: string[];
   /**
-   * Count of messages this session INHERITED from a fork seed (F16) — pre-loaded
+   * Count of messages this session INHERITED from a fork seed — pre-loaded
    * into `messages` before the first prompt(), mirroring real Pi's forkFrom which
    * seeds the child session with the parent's history. `0` for a fresh (non-fork
    * or degraded-fork) session, so "fresh vs fork" is a one-line differential.
@@ -116,24 +115,24 @@ export interface FakeSdkOptions {
   /** Reuse a caller-owned capture array for session options (vi.hoisted interop). */
   created?: Array<Record<string, unknown>>;
   /**
-   * Omit `subscribe` from fake sessions (t03): proves dispatch works unchanged
+   * Omit `subscribe` from fake sessions: proves dispatch works unchanged
    * when the session cannot stream events (older SDK / minimal fake).
    */
   noSubscribe?: boolean;
   /**
-   * Scripted session stats (t06): fake sessions return this from
+   * Scripted session stats: fake sessions return this from
    * `getSessionStats()`. A value is returned as-is; a function is evaluated per
    * call (lets a test vary usage across sessions). When absent, getSessionStats
    * returns undefined → dispatch reports no usage.
    */
   stats?: PiSessionStats | ((session: FakeSessionState) => PiSessionStats | undefined);
   /**
-   * Omit `getSessionStats` from fake sessions (t06): proves usage stays
+   * Omit `getSessionStats` from fake sessions: proves usage stays
    * undefined with no crash when the SDK/session cannot report stats.
    */
   noGetSessionStats?: boolean;
   /**
-   * Seed the parent history a `subagent_type: "fork"` inherits (F16). The fake
+   * Seed the parent history a `subagent_type: "fork"` inherits. The fake
    * `forkSessionManager` captures these; `createAgentSession` pre-populates the
    * child session's `messages` from them (real Pi's forkFrom pre-loads the same
    * history from the source transcript FILE). Undefined ⇒ an empty inherited
@@ -142,7 +141,7 @@ export interface FakeSdkOptions {
    */
   forkSeed?: PiSessionMessage[];
   /**
-   * Omit `forkSessionManager` from the fake SDK (F16): proves the "SDK cannot
+   * Omit `forkSessionManager` from the fake SDK: proves the "SDK cannot
    * fork" degrade path (a `"fork"` dispatch then runs fresh with a notice).
    */
   noForkSessionManager?: boolean;
@@ -158,7 +157,7 @@ export interface FakeSdkHandle {
   promptCalls: () => number;
   /** Wait until the requested prompt has entered and its user message is recorded. */
   waitForPromptCalls(count: number): Promise<void>;
-  /** Args of every forkSessionManager call, in order (F16 wiring assertions). */
+  /** Args of every forkSessionManager call, in order (wiring assertions). */
   forkCalls: () => Array<{ sourcePath: string; cwd: string; sessionDir: string; id: string }>;
 }
 
@@ -208,18 +207,18 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
         inheritedMessageCount: 0,
       };
       sessions.push(state);
-      // Persistence mirror (t02): real AgentSessions write every message
+      // Persistence mirror: real AgentSessions write every message
       // through their SessionManager — fake sessions do the same when the
       // dispatch handed them one with appendMessage (the real SessionManager
       // from persistedSessionManager below; the in-memory `{}` is a no-op).
       const manager = sessionOptions.sessionManager as
         | { appendMessage?: (message: unknown) => unknown; __forkSeed?: PiSessionMessage[] }
         | undefined;
-      // Fork inheritance (F16): a fork's fake session manager carries a captured
+      // Fork inheritance: a fork's fake session manager carries a captured
       // seed of the parent history (`__forkSeed`) — pre-load it into the child
       // session's messages, exactly as real Pi's forkFrom pre-loads the parent's
       // history from the source transcript. Gated on the marker so ordinary
-      // persisted/reopened managers (t02/t04) are untouched.
+      // persisted/reopened managers are untouched.
       if (manager?.__forkSeed?.length) {
         for (const seeded of manager.__forkSeed) state.messages.push(seeded);
         state.inheritedMessageCount = manager.__forkSeed.length;
@@ -230,7 +229,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
       };
       let signalAbort: () => void = () => {};
       const abortedGate = new Promise<void>((resolve) => (signalAbort = resolve));
-      // Live event listeners (t03): real AgentSessions expose subscribe(); fakes
+      // Live event listeners: real AgentSessions expose subscribe(); fakes
       // register listeners here and reply.events are broadcast during prompt().
       const listeners = new Set<(event: unknown) => void>();
       state.listenerCount = () => listeners.size;
@@ -247,7 +246,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
         listeners.add(listener);
         return () => listeners.delete(listener);
       };
-      // Scripted usage stats (t06): a real AgentSession exposes getSessionStats();
+      // Scripted usage stats: a real AgentSession exposes getSessionStats();
       // fakes return the scripted stats (or a per-session function's result).
       const getSessionStats = (): PiSessionStats | undefined =>
         typeof options.stats === "function" ? options.stats(state) : options.stats;
@@ -278,7 +277,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
               replyIndex++;
             }
             if (reply.gate) await Promise.race([reply.gate, abortedGate]);
-            // Broadcast scripted live events (t03) before the reply settles.
+            // Broadcast scripted live events before the reply settles.
             for (const event of reply.events ?? []) emit(event);
             if (state.aborted) {
               // Real Pi: an aborted run ends on a stopReason "aborted" assistant message.
@@ -303,7 +302,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
             state.aborted = true;
             signalAbort();
           },
-          // Steering seam (t04): SendMessage delivers a mid-task course
+          // Steering seam: SendMessage delivers a mid-task course
           // correction to a RUNNING background dispatch through steer().
           steer(text: string) {
             state.steerMessages.push(text);
@@ -319,7 +318,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
       async reload() {}
     },
     inMemorySessionManager: () => ({}),
-    // The REAL Pi SessionManager (t02): transcript tests exercise the actual
+    // The REAL Pi SessionManager: transcript tests exercise the actual
     // create/flush/open surface. Only reached when a dispatch knows the main
     // session file (deps.getMainSessionFile) AND a test injected the real
     // manager via useRealSessionManager(); otherwise absent, so unit tests stay
@@ -328,13 +327,13 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
       ? (cwd: string, sessionDir: string, id: string) =>
           realSessionManager!.create(cwd, sessionDir, { id })
       : undefined,
-    // Resume (t04): reopen the SAME transcript with the REAL SessionManager so
+    // Resume: reopen the SAME transcript with the REAL SessionManager so
     // offline-integration tests exercise Pi's actual open/restore/append surface.
     reopenSessionManager: realSessionManager
       ? (transcriptPath: string, sessionDir: string, cwd: string) =>
           realSessionManager!.open(transcriptPath, sessionDir, cwd)
       : undefined,
-    // Fork (F16): seed a NEW subagent transcript from a source session's history.
+    // Fork: seed a NEW subagent transcript from a source session's history.
     // With the real SessionManager injected, exercise the genuine on-disk
     // forkFrom; otherwise return a fake manager carrying a captured `__forkSeed`
     // (createAgentSession pre-loads it). Omitted entirely under noForkSessionManager

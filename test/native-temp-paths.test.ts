@@ -8,7 +8,7 @@ import { resolveShellBinary } from "../src/engine/shell-inject.js";
 import { toNativeSafeTempForm } from "../src/util/env.js";
 
 /**
- * #48 acceptance witness: the real mixed-tool route on Windows. A UTF-8 payload
+ * Acceptance witness for the real mixed-tool route on Windows. A UTF-8 payload
  * written THROUGH PiCC's pinned Git Bash (POSIX-emulation shell) to a path in
  * `toNativeSafeTempForm` form must be read by the REAL native Pi Read tool on the
  * FIRST attempt, with byte-identical content.
@@ -20,7 +20,7 @@ import { toNativeSafeTempForm } from "../src/util/env.js";
  * only the shell-write → native-read handoff does.
  *
  * Gating: this genuinely EXECUTES on CI's `windows-latest` leg (which ships Git
- * for Windows), where it is the sole automated #48 witness. It skips cleanly
+ * for Windows), where it is the sole automated witness. It skips cleanly
  * (green, not failed) on Linux/macOS (one shared namespace, no defect) and on any
  * Windows box lacking Git Bash. CAVEAT: if the `windows-latest` image ever drops
  * Git Bash, this skips green with NO signal — the witness would silently vanish.

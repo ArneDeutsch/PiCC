@@ -297,7 +297,7 @@ describe("degrade stubs", () => {
     expect(res.details.degraded).toBe(true);
   });
 
-  it("cover the plan §7 degraded tool names", async () => {
+  it("cover the degraded tool names", async () => {
     const names = DEGRADED_TOOLS.map((d) => d.name);
     expect(names).toEqual(
       expect.arrayContaining([

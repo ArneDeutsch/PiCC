@@ -11,7 +11,7 @@ import { createHookProcessFixture } from "./helpers/hook-process.js";
 
 /**
  * Parallel execution, dedup, and async (fire-and-forget) hook semantics
- * (completeness audit C4/C5): all matching handlers of one fire() run
+ * All matching handlers of one fire() run
  * concurrently, identical commands run once, outcomes merge in CONFIG order,
  * and `async: true` handlers never delay fire().
  */
@@ -69,7 +69,7 @@ function makeRunner(
   return { runner, projectDir };
 }
 
-describe("HookRunner parallel execution (C4)", () => {
+describe("HookRunner parallel execution", () => {
   it("runs matching handlers concurrently, not serially", async () => {
     const parent = makeTempDir();
     const child = createHookProcessFixture(parent);
@@ -299,7 +299,7 @@ describe("HookRunner spawn observer safety", () => {
   }, 20000);
 });
 
-describe("HookRunner async hooks (C5)", () => {
+describe("HookRunner async hooks", () => {
   it("reports a hostile observer warning once without rejecting, killing, or leaking", async () => {
     const parent = makeTempDir();
     const first = createHookProcessFixture(path.join(parent, "first"));

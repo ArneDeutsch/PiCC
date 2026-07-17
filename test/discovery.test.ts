@@ -252,7 +252,7 @@ describe("loadSettings — precedence & merging", () => {
     ).toHaveLength(4);
   });
 
-  it("recognizes autoMemoryEnabled and autoMemoryDirectory (B4)", () => {
+  it("recognizes autoMemoryEnabled and autoMemoryDirectory", () => {
     const scopes = makeScopes();
     writeJson(path.join(scopes.userDir, "settings.json"), {
       autoMemoryEnabled: false,
@@ -268,7 +268,7 @@ describe("loadSettings — precedence & merging", () => {
     expect(load(makeScopes()).autoMemoryEnabled).toBe(true);
   });
 
-  it("honors the claudeMd inline key ONLY in managed settings (B3)", () => {
+  it("honors the claudeMd inline key ONLY in managed settings", () => {
     const scopes = makeScopes();
     const managedFile = scopes.absentManaged[0]!;
     writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
@@ -300,7 +300,7 @@ describe("loadSettings — precedence & merging", () => {
   });
 });
 
-describe("loadSettings — nested/monorepo settings (plan §3)", () => {
+describe("loadSettings — nested/monorepo settings", () => {
   it("loads .claude/settings.json from every dir between cwd and the repo root, nearest wins", () => {
     const base = makeTmp();
     const root = path.join(base, "repo");
@@ -501,8 +501,8 @@ describe("loadSettings — robustness (completeness floor)", () => {
     expect(settings.hooks).toEqual({});
     expect(settings.worktree.baseRef).toBe("head");
     expect(settings.subagentsEnabled).toBe(true);
-    // F22: main-session-only by default — a deliberate PiCC divergence from Claude
-    // Code's up-to-5 contract (audit E3). Depth-1 fan-out is on; nesting is opt-in
+    // Main-session-only by default — a deliberate PiCC divergence from Claude
+    // Code's up-to-5 contract. Depth-1 fan-out is on; nesting is opt-in
     // via `subagents.maxDepth: 2..5`.
     expect(settings.subagentMaxDepth).toBe(1);
     expect(settings.subagentConcurrency).toBe(4);
@@ -776,7 +776,7 @@ describe("locations — project root & artifact discovery", () => {
     expect(absent.skillDirs).toEqual([{ dir: path.join(root, ".claude", "skills"), scope: "project" }]);
   });
 
-  it("orders ruleDirs by ascending priority: user, project root→cwd, managed last (B6)", () => {
+  it("orders ruleDirs by ascending priority: user, project root→cwd, managed last", () => {
     const base = makeTmp();
     const root = path.join(base, "repo");
     const pkg = path.join(root, "packages", "app");

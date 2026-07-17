@@ -359,7 +359,7 @@ describe("HookRunner selection", () => {
     expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toEqual(["either"]);
 
     await runner.fire("SessionStart", { source: "startup" });
-    // Matching hooks execute in parallel (audit C4), so the append order of the
+    // Matching hooks execute in parallel, so the append order of the
     // second fire is nondeterministic — assert membership and counts instead.
     const lines = fs.readFileSync(marker, "utf8").trim().split(/\r?\n/).sort();
     expect(lines).toEqual(["either", "either", "startup-only"]);
@@ -987,8 +987,8 @@ describe("HookRunner stdin payload", () => {
     expect("transcript_path" in payload2).toBe(false);
   });
 
-  it("SubagentStop with NO transcript_path in the payload gets the runner's default (main) — subagent parity (t02)", async () => {
-    // t02 review round 2: PiCC fires SubagentStop inside a dispatch WITHOUT a
+  it("SubagentStop with NO transcript_path in the payload gets the runner's default (main) — subagent parity", async () => {
+    // PiCC fires SubagentStop inside a dispatch WITHOUT a
     // payload transcript_path, so the HookRunner's own default getter (the MAIN
     // session transcript) is what reaches the hook — never the subagent's file.
     const dir = makeTempDir();
@@ -1035,7 +1035,7 @@ describe("HookRunner stdin payload", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Guard wiring — Pre/PostToolUse payload fields (C2)
+// Guard wiring — Pre/PostToolUse payload fields
 // ---------------------------------------------------------------------------
 
 describe("guard hook payloads", () => {
@@ -1173,7 +1173,7 @@ describe("guard hook payloads", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Timeout defaults (C6)
+// Timeout defaults
 // ---------------------------------------------------------------------------
 
 describe("effectiveTimeoutSeconds", () => {

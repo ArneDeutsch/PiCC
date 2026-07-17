@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 /**
- * Pi upstream contract smoke test (design doc §4): asserts every Pi API PiCC
+ * Pi upstream contract smoke test: asserts every Pi API PiCC
  * builds on exists in the pinned version. If Pi churns, this fails first and loudly.
  */
 describe("pi 0.80.x API contract", () => {
@@ -36,31 +36,31 @@ describe("pi 0.80.x API contract", () => {
     expect(typeof sdk.SettingsManager.inMemory).toBe("function");
   });
 
-  it("SessionManager exposes create/open for persisted subagent transcripts (t02)", async () => {
+  it("SessionManager exposes create/open for persisted subagent transcripts", async () => {
     const sdk: any = await import("@earendil-works/pi-coding-agent");
     expect(typeof sdk.SessionManager.create).toBe("function");
     expect(typeof sdk.SessionManager.open).toBe("function");
   });
 
-  it("AgentSession exposes subscribe() for live progress (t03)", async () => {
+  it("AgentSession exposes subscribe() for live progress", async () => {
     const sdk: any = await import("@earendil-works/pi-coding-agent");
     // subscribe is an instance method; assert it's on the prototype (constructing
     // a real session needs a provider/model, out of scope for a contract smoke).
     expect(typeof sdk.AgentSession?.prototype?.subscribe).toBe("function");
   });
 
-  it("AgentSession exposes steer()/followUp() for SendMessage steering (t04)", async () => {
+  it("AgentSession exposes steer()/followUp() for SendMessage steering", async () => {
     const sdk: any = await import("@earendil-works/pi-coding-agent");
     expect(typeof sdk.AgentSession?.prototype?.steer).toBe("function");
     expect(typeof sdk.AgentSession?.prototype?.followUp).toBe("function");
   });
 
-  it("AgentSession exposes getSessionStats() for usage accounting (t06)", async () => {
+  it("AgentSession exposes getSessionStats() for usage accounting", async () => {
     const sdk: any = await import("@earendil-works/pi-coding-agent");
     expect(typeof sdk.AgentSession?.prototype?.getSessionStats).toBe("function");
   });
 
-  it("exposes create*ToolDefinition factories whose renderCall/renderResult are functions (concise-tool-rows t02)", async () => {
+  it("exposes create*ToolDefinition factories whose renderCall/renderResult are functions", async () => {
     // The self-shell de-padding of the built-ins sources renderers from these
     // public Definition factories (create*Tool strips renderers via
     // wrapToolDefinition). A Pi upgrade that moves/renames them — or drops the
@@ -78,7 +78,7 @@ describe("pi 0.80.x API contract", () => {
     ]) {
       expect(typeof sdk[name], `missing/renamed ${name}`).toBe("function");
     }
-    // read + edit are the payloads t02's renderers reframe (truncation + diff) —
+    // read + edit are the payloads our renderers reframe (truncation + diff) —
     // pin that both expose renderCall/renderResult on a constructed definition.
     for (const name of ["createReadToolDefinition", "createEditToolDefinition"]) {
       const def = sdk[name]("/cwd");
@@ -87,8 +87,8 @@ describe("pi 0.80.x API contract", () => {
     }
   });
 
-  it("our getTextOutput reproduction matches Pi's real render-utils.js transform (concise-tool-rows t02)", async () => {
-    // t01 reproduced Pi's getTextOutput locally because the deep path is
+  it("our getTextOutput reproduction matches Pi's real render-utils.js transform", async () => {
+    // We reproduce Pi's getTextOutput locally because the deep path is
     // exports-blocked by the package name. The concrete file IS importable via an
     // absolute file:// URL — pin the reproduction against Pi's own so a version
     // bump that changes the transform (CRLF stripping, image fallbacks) fails
@@ -129,7 +129,7 @@ describe("pi 0.80.x API contract", () => {
     expect(typeof StringEnum).toBe("function");
   });
 
-  it("type pins compile against the pinned Pi: stopReason/errorMessage, 5-arg execute (t01), transcript surface (t02), subscribe + event kinds (t03)", async () => {
+  it("type pins compile against the pinned Pi: stopReason/errorMessage, 5-arg execute, transcript surface, subscribe + event kinds", async () => {
     // vitest strips types without checking them and the project tsconfig
     // excludes test/, so the pins live in test/helpers/pi-contract-pins.ts and
     // are compiled HERE with the real TypeScript checker — Pi type churn fails
@@ -162,11 +162,11 @@ describe("pi 0.80.x API contract", () => {
 });
 
 /**
- * concise-tool-rows t04: pin Pi's `ctx.lastComponent` threading with a contract
+ * Pin Pi's `ctx.lastComponent` threading with a contract
  * test that drives the REAL, publicly-exported `ToolExecutionComponent`.
  *
  * The de-padded built-ins depend on Pi caching the component our wrapper returns
- * and handing it back as `ctx.lastComponent` on the next render (t02's `__inner`
+ * and handing it back as `ctx.lastComponent` on the next render (the `__inner`
  * threading exists precisely to survive this; `edit`'s `instanceof Box`
  * incremental reuse breaks if the wrong component is threaded). PiCC's OWN
  * threading is unit-tested against a fake ctx (`test/runtime-core.test.ts`); this
@@ -174,7 +174,7 @@ describe("pi 0.80.x API contract", () => {
  * prior component fails loudly here instead of degrading incremental rendering
  * silently in the terminal.
  */
-describe("ToolExecutionComponent threads the prior render component as ctx.lastComponent (concise-tool-rows t04)", () => {
+describe("ToolExecutionComponent threads the prior render component as ctx.lastComponent", () => {
   it("hands back the previously-returned component (undefined on the first render), for renderCall and renderResult", async () => {
     const { ToolExecutionComponent, initTheme } = (await import(
       "@earendil-works/pi-coding-agent"

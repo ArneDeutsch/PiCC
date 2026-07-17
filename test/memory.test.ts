@@ -209,7 +209,7 @@ describe("loadAgentMemory", () => {
   });
 });
 
-describe("buildSystemPromptSuffix — Auto memory section (B4)", () => {
+describe("buildSystemPromptSuffix — Auto memory section", () => {
   function suffix(autoMemory?: { dir: string; content?: string }): string {
     return buildSystemPromptSuffix({
       claudeMd: [],
@@ -227,7 +227,7 @@ describe("buildSystemPromptSuffix — Auto memory section (B4)", () => {
     expect(out).toContain("# Auto memory");
     expect(out).toContain("Memory directory: F:\\mem\\dir");
     expect(out).toContain("- durable fact");
-    // Intent-not-prose: conservative, explicit-request-only writing (F10).
+    // Intent-not-prose: conservative, explicit-request-only writing.
     // Positive trigger for the explicit-request path.
     expect(out).toMatch(/remember/i);
     // Deference carve-out so a project's CLAUDE.md eager-write opt-in wins.

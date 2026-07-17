@@ -6,7 +6,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { createGrepTool } from "../src/runtime/tools/search-tools.js";
 
 /**
- * Grep parameter-surface and engine-alignment tests (plan §4.8), run against
+ * Grep parameter-surface and engine-alignment tests, run against
  * the pure-JS engine (`forceJs: true`) for determinism. Ripgrep-engine parity
  * is covered in search-tools-rg.test.ts.
  */
