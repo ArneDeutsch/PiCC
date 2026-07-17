@@ -20,7 +20,12 @@ import {
 import type { PiSdk } from "./runtime/subagents.js";
 import { SubagentRegistry } from "./runtime/subagent-registry.js";
 import type { SubagentRegistryRecord } from "./runtime/subagent-registry.js";
-import { SubagentPanelWidgetController } from "./runtime/subagent-panel-widget.js";
+import {
+  createPanelHintEmitter,
+  PANEL_ENTRY_CHORD,
+  SubagentPanelWidgetController,
+} from "./runtime/subagent-panel-widget.js";
+import { SubagentPanelFocusController } from "./runtime/subagent-panel-focus.js";
 import type { PanelTaskInfo } from "./runtime/subagent-panel-model.js";
 import { formatUsageCompact, sanitizeLine } from "./runtime/subagent-progress.js";
 import { createGuardExtension } from "./runtime/guard.js";
@@ -230,6 +235,12 @@ export interface PiccTestSeam {
      * observable without fake timers around async dispatches.
      */
     subagentPanel: SubagentPanelWidgetController;
+    /**
+     * The focused-panel controller behind the entry chord: lets an offline
+     * test inject its clock (`configureForTest`) so the focus-freeze and
+     * stop-all confirmation windows are observable under the same clock rule.
+     */
+    subagentPanelFocus: SubagentPanelFocusController;
   }) => void;
   /**
    * TEST-ONLY subagent SDK override: replaces the real Pi SDK the session's
@@ -528,16 +539,48 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Constructed unconditionally (cheap, no timer until installed) so the
   // onWired test seam can reach it; it attaches to a UI only from the
   // session_start handler's `ctx.mode === "tui"` gate.
+  const panelTaskJoin = (): PanelTaskInfo[] => {
+    const tasks: PanelTaskInfo[] = [];
+    for (const id of backgroundTasks.ids()) {
+      const record = backgroundTasks.get(id);
+      if (record) tasks.push(record);
+    }
+    return tasks;
+  };
   const subagentPanel = new SubagentPanelWidgetController({
     registry: subagentRegistry,
-    tasks: (): PanelTaskInfo[] => {
-      const tasks: PanelTaskInfo[] = [];
-      for (const id of backgroundTasks.ids()) {
-        const record = backgroundTasks.get(id);
-        if (record) tasks.push(record);
-      }
-      return tasks;
+    tasks: panelTaskJoin,
+  });
+  // Focused panel (the entry chord's ctx.ui.custom component): selection,
+  // stop/dismiss/stop-all. Suppresses the passive widget while open.
+  const subagentPanelFocus = new SubagentPanelFocusController({
+    registry: subagentRegistry,
+    tasks: panelTaskJoin,
+    stopTask: (taskId) => {
+      backgroundTasks.markUserStopped(taskId);
     },
+    widget: subagentPanel,
+  });
+  // The chord only works in interactive mode (Pi dispatches extension
+  // shortcuts from the TUI editor); open() re-checks the ctx mode itself.
+  if (typeof pi.registerShortcut === "function") {
+    pi.registerShortcut(PANEL_ENTRY_CHORD, {
+      description: "Open the subagent status panel",
+      handler: (ctx: any) => subagentPanelFocus.open(ctx),
+    });
+  }
+  // One-time chat hint advertising the chord, emitted only once >1 agent runs
+  // concurrently in a TUI session (the ui handle is captured at session_start).
+  let panelHintUi: any;
+  const emitPanelHint = createPanelHintEmitter({
+    chord: PANEL_ENTRY_CHORD,
+    isTui: () => panelHintUi !== undefined,
+    emit: (text) => panelHintUi?.notify?.(text, "info"),
+  });
+  subagentRegistry.onChange(() => {
+    let running = 0;
+    for (const record of subagentRegistry.list()) if (record.state === "running") running++;
+    emitPanelHint(running);
   });
   // Built-in agent types: general-purpose/Explore/Plan, appended AFTER
   // project/user/plugin agents so a same-named project agent wins (an
@@ -800,7 +843,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // in-process argument, never via project/env/settings/files. Invoked after the
   // runtime is built so the test can inject its fake SDK before the first dispatch.
   try {
-    testSeam?.onWired?.({ backgroundTasks, subagentRegistry, subagentRuntime, subagentPanel });
+    testSeam?.onWired?.({
+      backgroundTasks,
+      subagentRegistry,
+      subagentRuntime,
+      subagentPanel,
+      subagentPanelFocus,
+    });
   } catch (err) {
     console.error(`PiCC test seam onWired failed: ${(err as Error).message}`);
   }
@@ -1200,7 +1249,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // specifically, NOT `hasUI` — RPC mode also implements setWidget (and
       // reports hasUI: true), so a hasUI gate would install the panel into an
       // RPC client; print/RPC output must stay unchanged.
-      if (ctx.mode === "tui") subagentPanel.attach(ctx.ui);
+      if (ctx.mode === "tui") {
+        subagentPanel.attach(ctx.ui);
+        // Arms the one-time panel hint: the TUI gate is "a TUI ui was seen",
+        // so print/RPC sessions never emit it (and never consume its gate).
+        panelHintUi = ctx.ui;
+      }
       if (ctx.model) {
         currentModel = ctx.model;
         currentModelRef = `${ctx.model.provider}/${ctx.model.id}`;
@@ -1338,6 +1392,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
                   // keys, etc.) are longer, so match the bare byte only. Consume it
                   // so Pi doesn't also act on the same keypress.
                   if (data.length === 1 && data.charCodeAt(0) === 0x1b) {
+                    // Esc layering: raw terminal-input listeners run BEFORE the
+                    // focused component in pi-tui, so while the subagent panel
+                    // is open its close-Esc would otherwise abort this fork —
+                    // pass the byte through to the panel instead.
+                    if (subagentPanelFocus.isOpen()) return undefined;
                     escController.abort();
                     return { consume: true };
                   }
