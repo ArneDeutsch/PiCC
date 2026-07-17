@@ -6,10 +6,19 @@ import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
-/** Copy an examples/ fixture into a temp dir and turn it into a real git repo. */
-export function materializeFixture(name: string): string {
+/**
+ * Build-once/copy-per-test templates for the examples/ fixture repo shape,
+ * keyed by fixture name. Each template is a standalone git repo built lazily
+ * into its OWN `mkdtempSync` dir (unique per process, so `pool: "forks"` never
+ * lets two forks race the same git build) and memoized at module level. All git
+ * calls are synchronous and fully returned before the first copy, so no
+ * `.git/index.lock` can be copied into a consumer.
+ */
+const fixtureTemplates = new Map<string, string>();
+
+function buildFixtureTemplate(name: string): string {
   const src = path.join(REPO_ROOT, "examples", name);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `pcd-fixture-`));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `pcd-fixture-tmpl-`));
   fs.cpSync(src, dir, { recursive: true });
   const git = (...args: string[]) =>
     execFileSync("git", args, { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
@@ -19,6 +28,18 @@ export function materializeFixture(name: string): string {
   git("config", "core.autocrlf", "false");
   git("add", "-A");
   git("commit", "-m", "fixture baseline", "--no-gpg-sign");
+  return dir;
+}
+
+/** Copy an examples/ fixture into a temp dir and turn it into a real git repo. */
+export function materializeFixture(name: string): string {
+  let template = fixtureTemplates.get(name);
+  if (template === undefined) {
+    template = buildFixtureTemplate(name);
+    fixtureTemplates.set(name, template);
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `pcd-fixture-`));
+  fs.cpSync(template, dir, { recursive: true });
   return dir;
 }
 
