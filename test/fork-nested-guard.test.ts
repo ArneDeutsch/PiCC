@@ -74,6 +74,21 @@ interface AgentResult {
   details: Record<string, unknown>;
 }
 
+/** The generic result of a directly-driven `FakeCustomTool.execute` — `details`
+ * is optional (correct for arbitrary custom tools). The Agent tool always
+ * populates it, so the capture boundary narrows this to `AgentResult`. */
+type GenericToolResult = Awaited<ReturnType<FakeCustomTool["execute"]>>;
+
+/** Narrow a generic tool result to `AgentResult` at the single capture boundary.
+ * The Agent tool always returns `details`; its absence is impossible in practice,
+ * so surface it as a clear failure rather than papering over it with a cast. */
+function asAgentResult(result: GenericToolResult): AgentResult {
+  if (result.details === undefined) {
+    throw new Error("expected the Agent tool result to include `details`, but it was absent");
+  }
+  return { content: result.content, details: result.details };
+}
+
 interface Wired {
   pi: FakePi;
   h: FakeSdkHandle;
@@ -95,8 +110,8 @@ interface Wired {
 async function wireFork(opts: {
   sdkOptions?: FakeSdkOptions;
   transformSdk?: (sdk: PiSdk) => PiSdk;
-  nestedAction?: (agent: FakeCustomTool) => Promise<AgentResult>;
-  nestedAction2?: (agent: FakeCustomTool) => Promise<AgentResult>;
+  nestedAction?: (agent: FakeCustomTool) => Promise<GenericToolResult>;
+  nestedAction2?: (agent: FakeCustomTool) => Promise<GenericToolResult>;
 }): Promise<Wired> {
   const nested: { result?: AgentResult; result2?: AgentResult } = {};
   let agentSessions = 0;
@@ -108,9 +123,9 @@ async function wireFork(opts: {
       if (agent) {
         agentSessions += 1;
         if (agentSessions === 1 && opts.nestedAction) {
-          nested.result = await opts.nestedAction(agent);
+          nested.result = asAgentResult(await opts.nestedAction(agent));
         } else if (agentSessions === 2 && opts.nestedAction2) {
-          nested.result2 = await opts.nestedAction2(agent);
+          nested.result2 = asAgentResult(await opts.nestedAction2(agent));
         }
       }
       return "TOP-FORK-REPLY";
