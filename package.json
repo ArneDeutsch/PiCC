@@ -50,6 +50,7 @@
     "test:watch": "vitest",
     "test:unit": "vitest run --exclude \"**/e2e-*.test.ts\"",
     "test:e2e": "vitest run test/e2e-live-pi.test.ts",
+    "test:coverage": "vitest run --coverage --exclude \"**/e2e-*.test.ts\"",
     "gen:capabilities": "node scripts/gen-capability-matrix.mjs",
     "prepare": "git config core.hooksPath .githooks || exit 0",
     "prepublishOnly": "npm run typecheck"
@@ -65,6 +66,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
+    "@vitest/coverage-v8": "^4.1.10",
     "@types/picomatch": "^4.0.3",
     "tsx": "^4.23.0",
     "typescript": "^7.0.2",
