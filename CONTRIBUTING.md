@@ -15,9 +15,9 @@ git config core.hooksPath .githooks   # only after --ignore-scripts; see below
 Requirements: Node ≥ 22.19 (Pi's bundled undici 8.x does not run on Node 20) and git. On
 Windows, Git Bash must be on PATH — see [`doc/user-guide.md`](doc/user-guide.md).
 
-The pre-commit hook (`.githooks/pre-commit`) runs `npm run test:unit` before every commit. A
-plain `npm install`/`npm ci` wires it automatically via the `prepare` script; after an
-`--ignore-scripts` install, run the `git config` line above yourself.
+The pre-commit hook (`.githooks/pre-commit`) runs `npm run typecheck:all` and then
+`npm run test:unit` before every commit. A plain `npm install`/`npm ci` wires it automatically via
+the `prepare` script; after an `--ignore-scripts` install, run the `git config` line above yourself.
 
 ## Develop
 
@@ -34,8 +34,8 @@ node <path-to-picc>/bin/picc.mjs
 The dev loop:
 
 ```bash
-npm run typecheck   # strict TypeScript, no emit
-npm run test:unit   # the fast lane — also what the pre-commit hook runs
+npm run typecheck:all   # strict TypeScript over src + tests, no emit
+npm run test:unit       # the fast lane — both are also what the pre-commit hook runs
 ```
 
 [`doc/architecture.md`](doc/architecture.md) is the map of `src/` — the layering, what each module
@@ -126,8 +126,8 @@ Deliberately out of scope — each for a reason, not from neglect:
 - Keep changes focused; match the surrounding code style.
 - Add or update tests for behavior changes — prefer an end-to-end scenario for anything a user
   would observe.
-- Run `npm run typecheck` and `npm test` before opening the PR. CI runs `test:unit` and `test:e2e`
-  as separate lanes on Windows and Linux — unit on Node 22 and 24, e2e on Node 22.
+- Run `npm run typecheck:all` and `npm test` before opening the PR. CI runs `test:unit` and
+  `test:e2e` as separate lanes on Windows and Linux — unit on Node 22 and 24, e2e on Node 22.
 - Note any capability-registry or documentation updates in the PR description.
 
 ### Manual verification

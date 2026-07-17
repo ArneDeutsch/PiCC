@@ -55,7 +55,7 @@
     "test:coverage": "vitest run --coverage --exclude \"**/e2e-*.test.ts\"",
     "gen:capabilities": "node scripts/gen-capability-matrix.mjs",
     "prepare": "git config core.hooksPath .githooks || exit 0",
-    "prepublishOnly": "npm run typecheck"
+    "prepublishOnly": "npm run typecheck:all"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "^0.80.6",
