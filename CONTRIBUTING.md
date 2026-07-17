@@ -95,8 +95,8 @@ surface and is **not** exempt: "the running app" for such a change is picc runni
 and you verify by driving that flow and observing the changed message or artifact (or its deliberate
 absence).
 
-**Worked example** (cross-platform — Windows Git Bash and Linux). Say you changed how a skill greets
-the user. Launch picc against the bundled `examples/hello-claude` fixture:
+**Worked example** (cross-platform — Windows Git Bash, macOS, and Linux). Say you changed how a skill
+greets the user. Launch picc against the bundled `examples/hello-claude` fixture:
 
 ```bash
 git checkout feature/<feature-slug>
@@ -108,8 +108,12 @@ Then, in the PR description under **Start your review here**, spell out the in-a
 outcome — e.g. "at the prompt type `/greet Ada`; the reply now opens with `<the new greeting>` instead
 of `<the old one>`, and a `greeted: Ada` line is appended to `greetings.log`." After you run those same
 steps yourself, post the manual-verification comment: e.g. "Ran the steps above on Windows 11 / Git
-Bash and on Ubuntu; saw the new greeting and the `greetings.log` entry on both; did not test the
-`--model` override."
+Bash, on macOS, and on Ubuntu; saw the new greeting and the `greetings.log` entry on all three; did
+not test the `--model` override."
+
+The `implement-feature` skill's hand-off produces this same launch-and-verify recipe for agent runs;
+it is single-sourced in `.claude/skills/implement-feature/references/handoff.md`, so the contributor
+and agent paths stay in step on the launch facts (OS set, `openai-codex/…` model routing).
 
 ## Reporting issues
 
