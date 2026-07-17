@@ -104,6 +104,12 @@ cd examples/hello-claude
 node ../../bin/picc.mjs        # runs picc in this directory (the target project)
 ```
 
+The rule behind that `cd`: **launch picc from the root of whichever project's `.claude/`
+corpus you changed.** Here the greeting lives in the fixture's own skill, so you launch
+from the fixture. Had you instead changed picc's *own* skill under `.claude/skills/`, you
+would launch from the checkout root — not the fixture — because that corpus only loads when
+the checkout itself is the active project.
+
 Then, in the PR description under **Start your review here**, spell out the in-app steps and the
 outcome — e.g. "at the prompt type `/greet Ada`; the reply now opens with `<the new greeting>` instead
 of `<the old one>`, and a `greeted: Ada` line is appended to `greetings.log`." After you run those same
@@ -113,7 +119,10 @@ not test the `--model` override."
 
 The `implement-feature` skill's hand-off produces this same launch-and-verify recipe for agent runs;
 it is single-sourced in `.claude/skills/implement-feature/references/handoff.md`, so the contributor
-and agent paths stay in step on the launch facts (OS set, `openai-codex/…` model routing).
+and agent paths stay in step on the launch facts: the same cross-platform launch form, and — when a
+run does pin a model — routing it through the `openai-codex` provider (never a bare `openai/…`
+selector, which fails). The worked example above omits `--model` and runs the configured default, so
+it does not itself exercise that flag.
 
 ## Reporting issues
 

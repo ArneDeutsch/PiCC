@@ -58,11 +58,14 @@ writes and tell the user.
      > duplicate it, and keep it out of the outcome-only issue comment below. Because the
      > fork hand-off pastes the whole PR body inside one outer ` ``` ` fence, **every
      > command you render stays inline `code`, never a triple-backtick fenced block** — a
-     > nested fence would corrupt the copyable artifact. **Render the numbered steps below
-     > as reviewer-facing prose in the PR body, in your own words, dropping every
-     > authoring aside** — this note, the doc cross-references, and the parentheticals
-     > about which corpus loads — so the third party reading the PR sees only the
-     > verification steps.
+     > nested fence would corrupt the copyable artifact. **Steps 1–7 below are the
+     > reviewer-facing verification steps: render them into the PR body in your own words,
+     > dropping every authoring aside** — this note, the doc cross-references, and the
+     > parentheticals about which corpus loads — so the third party reading the PR sees
+     > only the verification steps. **Step 8 (feedback routing) is guidance for the run's
+     > owner/coordinator, not a verification step — keep it here for your own use but do
+     > NOT paste it into the third-party PR body** (a stranger reviewing your PR cannot
+     > add tasks to your plan folder).
 
      When it applies, the "Start your review here" steps follow this order:
      1. **Obtain & enter the branch.** `gh pr checkout <PR#>` (clone first if you don't
@@ -70,27 +73,31 @@ writes and tell the user.
         `git fetch origin feature/<feature-slug> && git switch feature/<feature-slug>`.
         Use these repo-local commands only; never hand out an absolute checkout path (it
         leaks the OS username — Rule 6).
-     2. **Pick the target by change type — picc runs against the current directory (cwd
-        *is* the project; there is no target-dir argument), so the launch form follows
-        from where you stand.** A **skill / agent / `CLAUDE.md` / prose change**: the
-        modified `.claude/` corpus only loads when it is the
-        *active* project, so run **from the feature checkout root**, which is itself the
-        target — `node ./bin/picc.mjs …`. A **harness / code change** (loaders, `bin/`,
-        `src/`): it surfaces against any project, so drive a fixture — `cd
-        examples/hello-claude`, then `node ../../bin/picc.mjs …` (the launcher path is
-        relative to cwd, hence `../../bin/…` from the fixture). Getting this wrong
-        silently verifies the *wrong* corpus, so match the launch form to the change.
-     3. **Use the checkout's own launcher — not the `picc` on `PATH`.** A bare `picc`
+     2. **Setup (once per fresh checkout).** Node ≥ 22.19; run `npm install
+        --ignore-scripts` at the checkout root (where `package.json` is) — do this
+        **before** you `cd` into any fixture in the next step. There is **no build step**
+        — picc runs straight from the TypeScript source. If setup was skipped you'll see
+        `could not find the Pi CLI (@earendil-works/pi-coding-agent)`; the fix is that
+        `npm install`.
+     3. **Pick the target by change type — launch picc from the root of whichever
+        project's `.claude/` corpus you changed.** picc runs against the current directory
+        (cwd *is* the project; there is no target-dir argument), so the launch form
+        follows from that principle. A **skill / agent / `CLAUDE.md` / prose change** edits
+        picc's *own* `.claude/` corpus, which only loads when it is the *active* project,
+        so run **from the feature checkout root**, which is itself the target — `node
+        ./bin/picc.mjs …`. A **harness / code change** (loaders, `bin/`, `src/`) has no
+        corpus of its own and surfaces against any project, so drive a fixture whose
+        `.claude/` exercises it — `cd examples/hello-claude`, then `node ../../bin/picc.mjs
+        …` (the launcher path is relative to cwd, hence `../../bin/…` from the fixture).
+        Getting this wrong silently verifies the *wrong* corpus, so match the launch form
+        to the change.
+     4. **Use the checkout's own launcher — not the `picc` on `PATH`.** A bare `picc`
         (from `npm link`) resolves to the installed/main checkout, not this branch, so it
         would verify the *old* behaviour. Always invoke the feature checkout's own
         `node ./bin/picc.mjs`.
-     4. **Setup (once per fresh checkout).** Node ≥ 22.19; run `npm install
-        --ignore-scripts` at the checkout root (where `package.json` is), **not** the
-        fixture you may have `cd`'d into in step 2. There is **no build step** — picc runs
-        straight from the TypeScript source. If setup was skipped you'll see `could not
-        find the Pi CLI (@earendil-works/pi-coding-agent)`; the fix is that `npm install`.
      5. **Launch (same in PowerShell, cmd, and bash).** `node ./bin/picc.mjs --model
-        openai-codex/gpt-5.5` (other valid ids: `gpt-5.4`, `gpt-5.6-sol`). Route the
+        openai-codex/gpt-5.5` (other valid ids: `openai-codex/gpt-5.4`,
+        `openai-codex/gpt-5.6-sol`). Route the
         model through the `openai-codex` provider as shown — a bare `openai/<id>`
         selector fails with "No API key found for openai". The relative forward-slash
         command is byte-identical on Windows PowerShell, cmd, macOS, and Linux. Windows
