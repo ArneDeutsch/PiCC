@@ -7,18 +7,18 @@ import { fileURLToPath } from "node:url";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 /**
- * Build-once/copy-per-test templates for the examples/ fixture repo shape,
- * keyed by fixture name. Each template is a standalone git repo built lazily
- * into its OWN `mkdtempSync` dir (unique per process, so `pool: "forks"` never
- * lets two forks race the same git build) and memoized at module level. All git
- * calls are synchronous and fully returned before the first copy, so no
- * `.git/index.lock` can be copied into a consumer.
+ * Copy an examples/ fixture into a temp dir and turn it into a real git repo.
+ *
+ * Built directly (not from a cached template) on purpose: most consumers call
+ * this exactly once per process (a `beforeAll`), where a build-once/copy-per-test
+ * template is pure overhead — the process pays the template build AND a copy,
+ * ~2x the work, which pushed the slowest CI leg (windows/node-24) past the 30s
+ * hook timeout. The multi-call hot path that a template genuinely helps is the
+ * git-repo shape in ./git-repo.ts (worktrees.test.ts calls it ~24x per process).
  */
-const fixtureTemplates = new Map<string, string>();
-
-function buildFixtureTemplate(name: string): string {
+export function materializeFixture(name: string): string {
   const src = path.join(REPO_ROOT, "examples", name);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `pcd-fixture-tmpl-`));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `pcd-fixture-`));
   fs.cpSync(src, dir, { recursive: true });
   const git = (...args: string[]) =>
     execFileSync("git", args, { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
@@ -28,18 +28,6 @@ function buildFixtureTemplate(name: string): string {
   git("config", "core.autocrlf", "false");
   git("add", "-A");
   git("commit", "-m", "fixture baseline", "--no-gpg-sign");
-  return dir;
-}
-
-/** Copy an examples/ fixture into a temp dir and turn it into a real git repo. */
-export function materializeFixture(name: string): string {
-  let template = fixtureTemplates.get(name);
-  if (template === undefined) {
-    template = buildFixtureTemplate(name);
-    fixtureTemplates.set(name, template);
-  }
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `pcd-fixture-`));
-  fs.cpSync(template, dir, { recursive: true });
   return dir;
 }
 
