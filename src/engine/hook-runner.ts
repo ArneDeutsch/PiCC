@@ -803,6 +803,15 @@ export class HookRunner {
   }
 }
 
+/**
+ * The minimal structural surface the scoped-hook seam actually consumes: `fire`
+ * (required) plus the optional `hasHooks` config probe. The runtime facades
+ * (multiplexers, identity injectors) implement only `fire`, so `hasHooks` is
+ * optional here and its callers guard it with `typeof … === "function"`. A real
+ * `HookRunner` satisfies this alias, so genuine runners still flow through.
+ */
+export type HookRunnerLike = Pick<HookRunner, "fire"> & Partial<Pick<HookRunner, "hasHooks">>;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

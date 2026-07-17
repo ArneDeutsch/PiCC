@@ -56,10 +56,10 @@ export default defineConfig({
           pool: "forks",
           // Each e2e file's Pi child spawns more children (subagent Pi + mock
           // server), so real-process count is multiplicative — keep this small.
-          // vitest 4 collapsed poolOptions.forks.maxForks into top-level
-          // maxWorkers/minWorkers. Validated on the 2-core CI runner (Phase 9).
+          // vitest 4 has no per-project (or top-level) `minWorkers`; the cap is
+          // `maxWorkers`, which replaced the removed poolOptions.forks.maxForks.
+          // Validated on the 2-core CI runner (Phase 9).
           maxWorkers: 2,
-          minWorkers: 1,
           // vitest requires projects with a distinct maxWorkers to run in their
           // own group; a later groupOrder runs the capped e2e lane after the
           // unit lane under a full `vitest run`.

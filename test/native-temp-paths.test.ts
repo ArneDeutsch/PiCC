@@ -76,19 +76,15 @@ describe("native-safe temp paths: Git Bash write → native Read (first attempt)
       );
 
       // Read side: the REAL native Pi Read tool, wired exactly as src/index.ts does
-      // — the factory takes a cwd STRING (not a thunk). 5-arg execute shape per
-      // test/search-tools-rg.test.ts.
-      // The pinned SDK read schema destructures `path`; Claude's tool surface names
-      // it `file_path` (the SDK renderers accept that alias). Pass both so the call
-      // matches the real execute param and documents the naming bridge.
-      const CTX = {} as never;
+      // — the factory takes a cwd STRING (not a thunk). `createReadTool` returns an
+      // `AgentTool` whose `execute` takes `(toolCallId, params, signal?, onUpdate?)`
+      // — 4 args, no trailing ctx. Its params schema names the target `path`.
       const tool = createReadTool(dir);
       const res = await tool.execute(
         "t03-read",
-        { path: filePath, file_path: filePath },
+        { path: filePath },
         undefined,
         undefined,
-        CTX,
       );
 
       // First-attempt success: no retry, no drive-wide search. Byte-identical UTF-8.

@@ -46,6 +46,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:test": "tsc -p tsconfig.test.json",
+    "typecheck:all": "npm run typecheck && npm run typecheck:test",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:unit": "vitest run --exclude \"**/e2e-*.test.ts\"",
@@ -53,7 +55,7 @@
     "test:coverage": "vitest run --coverage --exclude \"**/e2e-*.test.ts\"",
     "gen:capabilities": "node scripts/gen-capability-matrix.mjs",
     "prepare": "git config core.hooksPath .githooks || exit 0",
-    "prepublishOnly": "npm run typecheck"
+    "prepublishOnly": "npm run typecheck:all"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "^0.80.6",

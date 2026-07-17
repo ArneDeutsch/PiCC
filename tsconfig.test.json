@@ -1,0 +1,16 @@
+// Type-check config for the test suite (test/** and vitest.config.ts).
+// Extends the src config so tests are covered without weakening the strict
+// gate that guards src/**. A test imports a committed .mjs helper; allowJs
+// lets it resolve while checkJs off keeps .mjs out of the strict gate.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true,
+    "declaration": false,
+    "allowJs": true,
+    "checkJs": false
+  },
+  "include": ["test/**/*.ts", "vitest.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

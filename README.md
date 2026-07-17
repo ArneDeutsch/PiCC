@@ -94,7 +94,7 @@ configured outside the project — see the [user guide](doc/user-guide.md#5-cont
 ## Development
 
 ```bash
-npm run typecheck        # strict TS
+npm run typecheck:all    # strict TS over src + tests
 npm run test:unit        # fast: unit + offline integration
 npm run test:e2e         # drives the real Pi CLI against a mock model
 npm test                 # everything

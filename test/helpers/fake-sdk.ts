@@ -122,10 +122,13 @@ export interface FakeSdkOptions {
   /**
    * Scripted session stats: fake sessions return this from
    * `getSessionStats()`. A value is returned as-is; a function is evaluated per
-   * call (lets a test vary usage across sessions). When absent, getSessionStats
-   * returns undefined → dispatch reports no usage.
+   * call (lets a test vary usage across sessions). Faithful to the real optional
+   * contract — `getSessionStats?(): PiSessionStats` — the method is present-or-
+   * absent and, when present, returns a NON-undefined `PiSessionStats`; the
+   * function form must too. When `stats` is unset the method is omitted entirely
+   * (method-absent), so dispatch reports no usage via that faithful route.
    */
-  stats?: PiSessionStats | ((session: FakeSessionState) => PiSessionStats | undefined);
+  stats?: PiSessionStats | ((session: FakeSessionState) => PiSessionStats);
   /**
    * Omit `getSessionStats` from fake sessions: proves usage stays
    * undefined with no crash when the SDK/session cannot report stats.
@@ -248,13 +251,24 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
       };
       // Scripted usage stats: a real AgentSession exposes getSessionStats();
       // fakes return the scripted stats (or a per-session function's result).
-      const getSessionStats = (): PiSessionStats | undefined =>
-        typeof options.stats === "function" ? options.stats(state) : options.stats;
+      // Faithful to the real optional contract: the method is present only when
+      // stats are actually scripted, and when present it always yields a
+      // non-undefined PiSessionStats. `scriptedStats` is const, so the per-branch
+      // narrowing carries into the closures — no cast needed.
+      const scriptedStats = options.stats;
+      const getSessionStats: (() => PiSessionStats) | undefined =
+        scriptedStats === undefined
+          ? undefined
+          : typeof scriptedStats === "function"
+            ? () => scriptedStats(state)
+            : () => scriptedStats;
       return {
         session: {
           messages: state.messages,
           ...(options.noSubscribe ? {} : { subscribe }),
-          ...(options.noGetSessionStats ? {} : { getSessionStats }),
+          ...(options.noGetSessionStats || getSessionStats === undefined
+            ? {}
+            : { getSessionStats }),
           async prompt(text: string) {
             promptCalls++;
             record({ role: "user", content: text });

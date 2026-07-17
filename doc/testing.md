@@ -41,9 +41,11 @@ This is the canonical list of lanes.
 
 ```bash
 npm install            # also fetches Pi, whose CLI the e2e layer drives
-npm run typecheck      # strict TypeScript, no emit
+npm run typecheck      # strict TypeScript over src/**, no emit
+npm run typecheck:test # type-check the test suite (test/** + vitest.config.ts)
+npm run typecheck:all  # both of the above — part of the pre-commit gate
 npm test               # vitest run — the whole suite (unit + e2e lanes)
-npm run test:unit      # everything except the real-Pi e2e files — the pre-commit gate
+npm run test:unit      # everything except the real-Pi e2e files — the test half of the pre-commit gate
 npm run test:e2e       # only the real-Pi e2e files (fork-capped)
 npm run test:coverage  # unit lane, with a src/** coverage report
 npm run test:watch     # vitest in watch mode
@@ -56,8 +58,9 @@ the cap is the contention lever, not raised timeouts. `test:coverage` instrument
 code, so it reports the unit lane's coverage of `src/**` and cannot measure the real-Pi child
 process; it is a guidance signal with no thresholds.
 
-CI never runs `npm test`: it runs `test:unit` and `test:e2e` as separate lanes, across
-Windows/Linux. `test:unit` also runs before every commit via `.githooks/pre-commit`.
+CI never runs `npm test`: it type-checks with `typecheck:all` and runs `test:unit` and `test:e2e`
+as separate lanes, across Windows/Linux. The pre-commit hook (`.githooks/pre-commit`) runs
+`typecheck:all` then `test:unit` before every commit.
 
 The runner is [vitest](https://vitest.dev). Tests are TypeScript run through `tsx`/vitest — there
 is no build step to run first. The e2e layer needs Pi's compiled CLI at
