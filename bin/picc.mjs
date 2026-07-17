@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 /**
- * PiCC launcher: runs Pi with the PiCC extension preloaded, in the
- * current directory (the target Claude Code project). All arguments pass through
- * to pi (e.g. `picc -p "..."`, `picc --model openai-codex/gpt-5.5`).
+ * PiCC launcher: runs Pi with the PiCC extension preloaded, in the current
+ * directory (the target Claude Code project).
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -17,9 +16,7 @@ const extension = path.join(here, "..", "picc", "index.ts");
 /**
  * Resolve Pi's CLI (dist/cli.js). The package's `exports` map exposes only an
  * `"import"` condition and hides subpaths, so `require.resolve()` fails and a
- * subpath import can't reach dist/cli.js directly. We resolve the main ESM entry
- * (dist/index.js) and take cli.js from the same directory, with a node_modules
- * walk as a fallback.
+ * subpath import can't reach dist/cli.js directly.
  */
 function resolvePiCli() {
   // 1) ESM resolution of the package main (works when installed as a dependency,
