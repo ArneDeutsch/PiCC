@@ -44,7 +44,7 @@ type StreamTool = {
   renderCall: (args: Record<string, unknown>, theme: unknown) => { render: (w: number) => string[] };
   renderResult: (
     r: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
-    o: { isPartial?: boolean },
+    o: { expanded?: boolean; isPartial?: boolean },
     theme: unknown,
   ) => { render: (w: number) => string[] };
 };
