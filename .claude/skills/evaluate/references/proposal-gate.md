@@ -254,8 +254,8 @@ one of:
 proposal-gate is called from two `implement-feature` reference files, with **different force**:
 
 - **Phase 8 issue-filing offer** —
-  [ticket-integration.md](../../implement-feature/references/ticket-integration.md) (Per-phase ticket
-  hooks → Phase 8). It **gates** the machine-surfaced findings: **clear slop is dropped**, but with a
+  [phase-8-file-finding.md](../../implement-feature/references/phase-8-file-finding.md). It **gates**
+  the machine-surfaced findings: **clear slop is dropped**, but with a
   **one-line tally that also says the dropped findings remain in `review.md`** so nothing is lost (e.g.
   "(N low-value findings not offered — they remain in review.md)"). The tally is an **in-flow lever, not
   just a pointer**: a maintainer who disagrees with the gate can **ask to see the gate-dropped

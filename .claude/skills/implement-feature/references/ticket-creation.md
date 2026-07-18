@@ -4,7 +4,7 @@ Read this at **Phase 1**, on the **ticketless** path (empty `$ARGUMENTS`), **aft
 converges** and before asking for the build "go". It carries the whole opt-in offer flow: the
 reachability precondition, the preview, the checkout-aware accept contract, the deferred Phase 3 FILE
 step, and the decline path. It is the sibling of the Phase 8 issue-filing offer in
-[ticket-integration.md](ticket-integration.md) (Per-phase ticket hooks → Phase 8): same write, same
+[phase-8-file-finding.md](phase-8-file-finding.md): same write, same
 discipline, different intent — Phase 8 files a *surfaced finding* at close, this files the *agreed
 WHAT/WHY* up front so the rest of the run proceeds on the ticket path. Both obey the nine rules; load
 [ticket-integration.md](ticket-integration.md) before any `gh issue create`, and if it can't be read,

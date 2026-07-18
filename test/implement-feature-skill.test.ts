@@ -420,11 +420,11 @@ describe("proposal-gate wiring floor markers", () => {
   const collapse = (p: string): string =>
     fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
 
-  const TICKET_INTEGRATION_PATH = path.join(REFERENCES_DIR, "ticket-integration.md");
+  const FILE_FINDING_PATH = path.join(REFERENCES_DIR, "phase-8-file-finding.md");
   const TICKET_CREATION_PATH = path.join(REFERENCES_DIR, "ticket-creation.md");
 
-  it("Phase 8 (ticket-integration.md) gates findings through proposal-gate, dropping clear slop with a review.md tally", () => {
-    const body = collapse(TICKET_INTEGRATION_PATH);
+  it("Phase 8 (phase-8-file-finding.md) gates findings through proposal-gate, dropping clear slop with a review.md tally", () => {
+    const body = collapse(FILE_FINDING_PATH);
     expect(body).toContain("proposal-gate");
     // Clear slop dropped, but the tally says the dropped findings remain in review.md.
     expect(body).toContain("remain in review.md");
@@ -451,7 +451,7 @@ describe("evidence-grounded evaluation wiring", () => {
   // repo-relative convention the evidence anchors are normalized to).
   const collapse = (p: string): string =>
     fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
-  const TICKET_INTEGRATION_PATH = path.join(REFERENCES_DIR, "ticket-integration.md");
+  const FILE_FINDING_PATH = path.join(REFERENCES_DIR, "phase-8-file-finding.md");
   const TICKET_CREATION_PATH = path.join(REFERENCES_DIR, "ticket-creation.md");
   const EN_DASH = String.fromCodePoint(0x2013);
 
@@ -471,8 +471,8 @@ describe("evidence-grounded evaluation wiring", () => {
     expect(body).toContain("never baked into the filed public issue body");
   });
 
-  it("Phase 8 embed (ticket-integration.md) carries repo-relative, leakage-stripped anchors under the full element-7 re-validation, gate semantics unchanged", () => {
-    const body = collapse(TICKET_INTEGRATION_PATH);
+  it("Phase 8 embed (phase-8-file-finding.md) carries repo-relative, leakage-stripped anchors under the full element-7 re-validation, gate semantics unchanged", () => {
+    const body = collapse(FILE_FINDING_PATH);
     // The ## Evaluation embed carries the evidence anchors.
     expect(body).toContain("`## evaluation`");
     expect(body).toContain("evidence anchors");
@@ -624,10 +624,10 @@ describe("Phase 8 coordinator-run advisory issue search", () => {
   // stay green (the re-scope is Phase-8-only). We do NOT touch Rule 9 or ticket-creation.md.
   const collapse = (p: string): string =>
     fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
-  const TICKET_INTEGRATION_PATH = path.join(REFERENCES_DIR, "ticket-integration.md");
+  const FILE_FINDING_PATH = path.join(REFERENCES_DIR, "phase-8-file-finding.md");
 
   it("Phase 8 hook points at a coordinator-run, read-only advisory search feeding a github_verified anchor", () => {
-    const body = collapse(TICKET_INTEGRATION_PATH);
+    const body = collapse(FILE_FINDING_PATH);
     // The coordinator path holds gh/Bash and runs one narrow read-only list per finding.
     expect(body).toContain("one narrow read-only");
     expect(body).toContain('--search "<terms>"');
@@ -638,14 +638,14 @@ describe("Phase 8 coordinator-run advisory issue search", () => {
   });
 
   it("Phase 8 terms are coordinator-authored, never target-lifted, obeying the frozen-title character ban", () => {
-    const body = collapse(TICKET_INTEGRATION_PATH);
+    const body = collapse(FILE_FINDING_PATH);
     expect(body).toContain("**coordinator-authored**");
     expect(body).toContain("never** lifted from issue/pr body");
     expect(body).toContain("frozen-title character ban");
   });
 
   it("Phase 8 states the novelty floor (hit lowers novelty, never by itself drops below threshold), candidate wording + visible degrade", () => {
-    const body = collapse(TICKET_INTEGRATION_PATH);
+    const body = collapse(FILE_FINDING_PATH);
     expect(body).toContain("**never by itself** drops it below the file/keep-open threshold");
     expect(body).toContain("possible existing coverage:");
     expect(body).toContain("not cross-checked against github");
@@ -659,7 +659,7 @@ describe("Phase 8 coordinator-run advisory issue search", () => {
   });
 
   it("Phase 8 advisory search feeds SCORING; it is the SAME read as Rule 9's filing-time --search dedup, distinct from the html_url comment scan", () => {
-    const body = collapse(TICKET_INTEGRATION_PATH);
+    const body = collapse(FILE_FINDING_PATH);
     expect(body).toContain("feeds *scoring*, not filing");
     // The advisory search and Rule 9's filing-time dedup are the SAME `gh issue list --search` read,
     // invoked for two different purposes (novelty score vs. double-file prevention) — not conflated
@@ -750,4 +750,41 @@ describe("progressive-phase-disclosure spine guards", () => {
       expect(section.toLowerCase().replace(/\s+/g, " "), heading).toContain("must read");
     }
   });
+});
+
+describe("fail-closed floor pointer on every write-site reference", () => {
+  // Layer-1 static guard for the whole restructure's binding invariant: every reference file that
+  // itself performs or authors a public GitHub write must BOTH name the nine-rules floor
+  // (ticket-integration.md) AND carry a fail-closed clause — read the floor first, refuse the write if
+  // it cannot be read. This is what keeps a write from proceeding with the rules unloaded, and no
+  // prior test covered it. Tolerant on wording, strict on presence.
+  const read = (relative: string): string =>
+    fs.readFileSync(path.join(REFERENCES_DIR, relative), "utf8").replace(/\r\n/g, "\n");
+  // Accept the corpus's wording variants: "cannot be read" (handoff), "can't be read" (feature-spec,
+  // fork-handoff — the latter hard-wrapped across a newline), "can not be read", or "unreadable".
+  // Whitespace between words is flexible (\s+) so a line break inside the clause still matches.
+  const READ_FAILURE = /can(?:not|['\u2019]?t| not)\s+be\s+read|unreadable/i;
+
+  // Every write-site reference file. phase-3-feature-spec.md points at the accepted create-offer's
+  // FILE step and ticket-creation.md holds the actual `gh issue create` for it; phase-8-file-finding.md
+  // files surfaced findings; the two Phase 9 files author the PR/comment. (t05 moves the FILE-step
+  // write into phase-3-ticket-file.md — reconcile this list there.)
+  const writeSites = [
+    "phase-3-feature-spec.md",
+    "ticket-creation.md",
+    "phase-8-file-finding.md",
+    "phase-9-handoff.md",
+    "phase-9-fork-handoff.md",
+  ];
+
+  for (const site of writeSites) {
+    it(`${site} names the nine-rules floor and carries a fail-closed clause`, () => {
+      const body = read(site);
+      expect(body, `${site}: missing ticket-integration.md floor pointer`).toContain(
+        "ticket-integration.md",
+      );
+      expect(body, `${site}: missing refuse clause`).toMatch(/refuse/i);
+      expect(body, `${site}: missing read-failure clause`).toMatch(READ_FAILURE);
+    });
+  }
 });
