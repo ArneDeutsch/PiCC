@@ -42,6 +42,7 @@ import {
 } from "./subagent-progress.js";
 import { renderAgentCall, renderAgentResult } from "./subagent-render.js";
 import { formatBackgroundTaskIdentity } from "./background-identity.js";
+import type { BuiltinToolSdk } from "./builtin-tools.js";
 
 /**
  * Subagent dispatch runtime: spawns fresh-context Pi sessions per dispatch,
@@ -213,7 +214,20 @@ export function usageFromStats(stats: PiSessionStats | undefined): DispatchUsage
   return Object.keys(usage).length ? usage : undefined;
 }
 
-export interface PiSdk {
+/**
+ * PiSdk also mirrors {@link BuiltinToolSdk}'s built-in tool constructors, but as
+ * OPTIONAL members (via `Partial`) so the checked fake-sdk literal and any
+ * un-wired fake still satisfy the interface. The subagent path narrows/asserts
+ * the handle to the required `BuiltinToolSdk` before calling
+ * `buildStockBuiltinTools`.
+ *
+ * This mirror is hand-maintained: the main path passes the raw Pi import
+ * directly, so a newly-added built-in must be added to `loadRealSdk` by hand. That
+ * is loud-fail plumbing (`undefined is not a function`), NOT a semantic-drift
+ * surface — both paths still call the SAME factory, so tool *semantics* stay
+ * single-owned.
+ */
+export interface PiSdk extends Partial<BuiltinToolSdk> {
   createAgentSession(options: Record<string, unknown>): Promise<{ session: PiSession }>;
   DefaultResourceLoader: new (options: Record<string, unknown>) => { reload(): Promise<void> };
   inMemorySessionManager(cwd: string): unknown;
@@ -384,6 +398,23 @@ async function loadRealSdk(): Promise<PiSdk> {
         ...(shellPath ? { shellPath } : {}),
       }),
     agentDir: () => m.getAgentDir(),
+    // Built-in tool constructors (hand-maintained mirror; see PiSdk doc). Exposed
+    // so the shared factory (buildStockBuiltinTools) can build the subagent path's
+    // built-ins from the same source the main session uses.
+    createBashTool: (cwd: string, options: unknown) => m.createBashTool(cwd, options),
+    createReadTool: (cwd: string) => m.createReadTool(cwd),
+    createWriteTool: (cwd: string) => m.createWriteTool(cwd),
+    createEditTool: (cwd: string) => m.createEditTool(cwd),
+    createGrepTool: (cwd: string) => m.createGrepTool(cwd),
+    createFindTool: (cwd: string) => m.createFindTool(cwd),
+    createLsTool: (cwd: string) => m.createLsTool(cwd),
+    createBashToolDefinition: (cwd: string) => m.createBashToolDefinition(cwd),
+    createReadToolDefinition: (cwd: string) => m.createReadToolDefinition(cwd),
+    createWriteToolDefinition: (cwd: string) => m.createWriteToolDefinition(cwd),
+    createEditToolDefinition: (cwd: string) => m.createEditToolDefinition(cwd),
+    createGrepToolDefinition: (cwd: string) => m.createGrepToolDefinition(cwd),
+    createFindToolDefinition: (cwd: string) => m.createFindToolDefinition(cwd),
+    createLsToolDefinition: (cwd: string) => m.createLsToolDefinition(cwd),
   };
 }
 
