@@ -22,6 +22,8 @@ import {
   writeSuppression,
 } from "../src/registry/compat-report.js";
 import { DEGRADED_TOOLS } from "../src/runtime/tools/degrade-stubs.js";
+import { sniffImageMime } from "../src/runtime/image-ingest.js";
+import { renderNotebook } from "../src/runtime/notebook-render.js";
 import type {
   ClaudeAgent,
   ClaudeProject,
@@ -425,6 +427,64 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(sc?.note).toContain("built-in commands");
     // Must NOT lead with the degraded-noop em-dash pattern.
     expect(sc?.note.startsWith("—")).toBe(false);
+  });
+
+  // tool.Read stays full for its text/image/notebook core, but the note must
+  // disclose the vision-gate exception, the byte-based (not extension-based)
+  // classification, that the image-FILE path is inherited from base Pi, the
+  // Claude-style binary error, and cross-reference the PDF gap to its own entry.
+  it("describes Read's notebook/image/binary behavior at full, vision-gated, byte-based, PDF cross-referenced", () => {
+    const read = lookupCapability("tool.Read");
+    expect(read?.tier).toBe("full");
+    expect(read?.note).toContain("CELL-AWARE");
+    expect(read?.note).toContain("image content block");
+    expect(read?.note).toContain("vision-gate exception");
+    expect(read?.note).toContain("INHERITED from base Pi");
+    expect(read?.note).toContain("BYTE-BASED");
+    expect(read?.note).toContain("not extension-based");
+    expect(read?.note).toContain("Claude-style binary error");
+    // The PDF gap is discoverable via its own entry, not hidden inside "full".
+    expect(read?.note).toContain("feature.read.pdf");
+    expect(read?.note).toContain("feature.read.images");
+  });
+
+  // The image-ingestion entry is a single `partial` entry: full-on-vision /
+  // degraded-on-non-vision, with the split and PiCC-own normalization stated.
+  it("carries a partial image-ingestion entry naming the vision split and normalization", () => {
+    const img = lookupCapability("feature.read.images");
+    expect(img, "feature.read.images must exist").toBeDefined();
+    expect(img?.tier).toBe("partial");
+    expect(img?.note.toLowerCase()).toContain("vision-capable model");
+    expect(img?.note).toContain("SPLITS on vision");
+    expect(img?.note).toContain("model-visible text note");
+    expect(img?.note).toContain("byte-based");
+    // PiCC's own normalization, not asserted byte-identical to Claude.
+    expect(img?.note).toContain("NOT asserted byte-identical to Claude Code");
+    expect(img?.note).toContain("inherited from base Pi");
+  });
+
+  // PDF is disclosed as BELOW the Claude baseline through a discoverable
+  // not-supported entry, so /doctor flags it rather than Read hiding it.
+  it("carries a not-supported PDF entry disclosing it is below the Claude baseline", () => {
+    const pdf = lookupCapability("feature.read.pdf");
+    expect(pdf, "feature.read.pdf must exist").toBeDefined();
+    expect(pdf?.tier).toBe("not-supported");
+    expect(pdf?.note).toContain("Claude Code reads PDFs at baseline");
+    expect(pdf?.note).toContain("binary error");
+    expect(pdf?.note).toContain("BELOW the Claude baseline");
+    // Must NOT imply Claude also errors on PDF.
+    expect(pdf?.note).toContain("NOT a claim that Claude also errors on PDF");
+  });
+
+  // NotebookEdit was reconciled alongside the retirement: its note directs raw
+  // .ipynb editing via Edit and viewing raw JSON via Bash (Read now renders
+  // notebooks cell-aware). This verifies that reconciled note still reads truthfully.
+  it("keeps the NotebookEdit note truthful about editing raw JSON via Edit and viewing via Bash", () => {
+    const ne = lookupCapability("tool.NotebookEdit");
+    expect(ne?.tier).toBe("degraded-noop");
+    expect(ne?.note).toContain("Edit");
+    expect(ne?.note).toContain("Bash");
+    expect(ne?.note).toContain("Read now renders notebooks cell-aware");
   });
 
   it("stays in sync with the shipped degrade-stub list, in both directions", () => {
@@ -1176,5 +1236,48 @@ describe("suppression persistence", () => {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, "not json at all", "utf8");
     expect(readSuppression(root)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Committed notebook-with-image fixture — a reviewable .ipynb that a durable
+// artifact carries (in-test Buffers cover the unit layers; this one proves the
+// committed file parses and renders cell-aware). It is TEXT (JSON), so it is
+// deliberately NOT marked `binary` in .gitattributes. The test decodes and
+// magic-byte-SNIFFS the embedded raster (not a bare `existsSync`), so a
+// truncated or malformed payload fails loudly rather than silently rotting.
+// ---------------------------------------------------------------------------
+
+describe("committed notebook-with-image fixture (examples/full-surface/analysis.ipynb)", () => {
+  const fixturePath = fileURLToPath(
+    new URL("../examples/full-surface/analysis.ipynb", import.meta.url),
+  );
+  const raw = fs.readFileSync(fixturePath, "utf8");
+
+  it("carries a decodable embedded raster image", () => {
+    const doc = JSON.parse(raw) as {
+      cells: Array<{ outputs?: Array<{ data?: Record<string, unknown> }> }>;
+    };
+    const b64 = doc.cells
+      .flatMap((c) => c.outputs ?? [])
+      .map((o) => o.data?.["image/png"])
+      .find((v): v is string => typeof v === "string");
+    expect(b64, "fixture must embed an image/png output").toBeDefined();
+    // Decode + magic-byte sniff: a truncated/malformed payload fails here.
+    expect(sniffImageMime(Buffer.from(b64!, "base64"))).toBe("image/png");
+  });
+
+  it("renders the committed notebook cell-aware, degrading the image to a placeholder off-vision", async () => {
+    const { content } = await renderNotebook(raw, { model: { input: ["text"] } });
+    const text = content
+      .filter((b): b is { type: "text"; text: string } => b.type === "text")
+      .map((b) => b.text)
+      .join("\n");
+    expect(text).toContain("=== Cell 0 (markdown");
+    expect(text).toContain("training complete");
+    // Off-vision: the raster output is a text placeholder, not an image block.
+    expect(content.some((b) => b.type === "image")).toBe(false);
+    expect(text).toContain("image/png");
+    expect(text).toContain("does not support images");
   });
 });
