@@ -282,6 +282,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   const config = loadPiCCConfig(project.root);
+  // Config-validation findings (malformed file, out-of-range compaction knob reverted
+  // to its default) surface once at startup — never silently swallowed. Same pattern as
+  // the permission-engine diagnostics below.
+  for (const d of config.diagnostics) {
+    console.error(`PiCC config: ${d.message}`);
+  }
   const sessionId = randomUUID();
   const cwdState = new CwdState(project.cwd);
   // Hook payload `transcript_path`: Pi's session manager (captured on
@@ -1531,10 +1537,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         const notice = `PiCC: compacting context early at ${at} of the context window (threshold ${threshold}%, configurable via proactiveCompactPercent)`;
         // Always-visible notice (NOT PICC_DEBUG-only debug()): same channel as the startup
         // compat notice; doubles as discovery of the proactiveCompactPercent knob. Mirror the
-        // startup pattern: also persist an entry so the notice leaves a trace in print/headless
-        // mode, where ctx.ui.notify no-ops.
+        // emitControlOutput pattern: notify the interactive toast, persist an entry that the
+        // registered renderer shows in the TUI transcript, and — where there is no UI (print/
+        // headless) — emit the notice to stdout so it still leaves a visible trace.
         ctx?.ui?.notify?.(notice, "info");
         pi.appendEntry("picc-proactive-compact", { notice });
+        if (!ctx?.hasUI) console.log(notice);
         // Consumed by the next session_before_compact → PreCompact trigger:"auto".
         proactiveCompactInFlight = true;
         ctx?.compact?.();
@@ -1825,6 +1833,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   pi.registerEntryRenderer("picc-compat", (entry: any, _opts: any, theme: any) =>
     controlOutputComponent("PiCC compatibility", entry.data?.notice ?? "", theme),
   );
+  pi.registerEntryRenderer("picc-proactive-compact", (entry: any, _opts: any, theme: any) =>
+    controlOutputComponent("PiCC proactive compaction", entry.data?.notice ?? "", theme),
+  );
   // Settlement notices render as the collapsed-expandable subagent completion
   // record (same shape as the tool renderers'), so a never-awaited background
   // settlement still leaves exactly one expandable record in the transcript.
@@ -1849,7 +1860,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   function runControlCommand(name: string, args: string, ctx: any): string | undefined {
     switch (name) {
       case "doctor":
-        return renderDoctorReport(project, compat, currentModel);
+        return renderDoctorReport(project, compat, currentModel, config.compaction);
       case "skills":
         return renderSkillsList();
       case "agents":

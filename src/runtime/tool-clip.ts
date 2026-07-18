@@ -51,6 +51,9 @@ function sanitizeArg(value: unknown): string {
  */
 function recoveryHint(claudeTool: string, input: Record<string, unknown>): string {
   if (claudeTool === "Read") {
+    // Forward-defensive: Pi's built-in Read is pre-bounded below the clip budget, so a Read
+    // result rarely reaches this clip in production — this hint covers a Claude-named/re-mapped
+    // Read whose output is not so bounded.
     const fp = sanitizeArg(input.file_path ?? input.path);
     const target = fp ? `\`${fp}\`` : "the file";
     return `re-read ${target} over a narrower range (offset=<line> limit=<count>) to recover the omitted region`;
@@ -65,8 +68,14 @@ function recoveryHint(claudeTool: string, input: Record<string, unknown>): strin
 
 /** Marker builder: distinctive `[PiCC clipped …]`, honest char count, tool-appropriate hint. */
 function makeMarker(claudeTool: string, hint: string): (omittedChars: number) => string {
+  // `claudeTool` comes from toClaudeToolName, which passes unknown/MCP tool names through
+  // verbatim — so a hostile project/MCP tool name containing `]`/newline/`PiCC clipped`
+  // could otherwise forge or break out of this PiCC-authored marker. Run it through the
+  // same sanitizeArg the hint args use (known names like Read/Grep/Bash are byte-identical);
+  // fall back to a neutral label if a name is stripped to nothing.
+  const safeTool = sanitizeArg(claudeTool) || "tool";
   return (omittedChars) =>
-    `\n\n[PiCC clipped ${String(Number(omittedChars))} characters from the middle of this ${claudeTool} output — ${hint}]\n\n`;
+    `\n\n[PiCC clipped ${String(Number(omittedChars))} characters from the middle of this ${safeTool} output — ${hint}]\n\n`;
 }
 
 /** Split the post-marker budget into a head and a (slightly smaller-or-equal) tail. */

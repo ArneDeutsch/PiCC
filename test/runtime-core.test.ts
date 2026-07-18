@@ -391,6 +391,47 @@ describe("loadPiCCConfig compaction knobs (real file)", () => {
     }
   });
 
+  it("surfaces a validation diagnostic on stderr at harness startup (not just on config.diagnostics)", async () => {
+    // A silently-reverted knob is the bug: the harness must ECHO the diagnostic, the same way
+    // it surfaces permission-engine findings. Boot the real extension over a project whose
+    // config carries an out-of-range value and assert the drain reached console.error.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "picc-home-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-boot-"));
+    const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(home);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const originalCwd = process.cwd();
+    try {
+      fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# Boot project\n");
+      const userDir = path.join(dir, ".claude-user");
+      fs.mkdirSync(userDir, { recursive: true });
+      process.env.PICC_CLAUDE_USER_DIR = userDir;
+      const file = projectConfigPath(dir);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      // clipMaxTokens=500 is below the 1000 floor → reverts to default WITH a diagnostic.
+      fs.writeFileSync(file, JSON.stringify({ clipMaxTokens: 500 }), "utf8");
+      process.chdir(dir);
+
+      const pi = fakePi();
+      piccExtension(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+      await pi.waitForInitialization();
+
+      const surfaced = errSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((m) => m.startsWith("PiCC config:") && m.includes("clipMaxTokens"));
+      expect(surfaced.length, "a config validation diagnostic must reach stderr").toBeGreaterThan(0);
+    } finally {
+      process.chdir(originalCwd);
+      if (savedUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = savedUserDir;
+      errSpy.mockRestore();
+      homeSpy.mockRestore();
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("an invalid project value defaults the knob and does not keep a valid user value", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "picc-home-"));
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-cfg-"));

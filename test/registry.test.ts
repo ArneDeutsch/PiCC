@@ -1098,6 +1098,22 @@ describe("renderDoctorReport", () => {
     expect(doctor).toContain("Subagent nesting: subagent dispatch disabled");
     expect(doctor).toContain("subagents.enabled=false");
   });
+
+  it("echoes the resolved compaction knob values when a compaction config is supplied", () => {
+    const project = makeProject();
+    const doctor = renderDoctorReport(project, buildCompatReport(project), undefined, {
+      proactiveCompactPercent: 70,
+      clipMaxTokens: 5000,
+    });
+    expect(doctor).toContain("proactiveCompactPercent=70");
+    expect(doctor).toContain("clipMaxTokens=5000");
+  });
+
+  it("omits the compaction line when no compaction config is supplied", () => {
+    const project = makeProject();
+    const doctor = renderDoctorReport(project, buildCompatReport(project));
+    expect(doctor).not.toContain("proactiveCompactPercent=");
+  });
 });
 
 // ---------------------------------------------------------------------------

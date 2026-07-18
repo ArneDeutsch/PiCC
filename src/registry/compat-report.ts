@@ -18,6 +18,7 @@ import type {
 import { SUPPORTED_HOOK_EVENTS } from "../types.js";
 import { loadPluginHooks, type InstalledPlugin } from "../claude/plugins.js";
 import { modelSupportsImages } from "../util/model.js";
+import type { ResolvedCompactionConfig } from "../runtime/steering.js";
 import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 import {
   CAPABILITY_REGISTRY,
@@ -473,17 +474,28 @@ function subagentPostureLine(project: ClaudeProject): string {
   return `Subagent nesting: subagents.maxDepth=${subagentMaxDepth} (a PiCC extension). Set it to 1 for main-session-only, or 2..5 to allow nested delegation.`;
 }
 
+/**
+ * Resolved compaction-knob line for `/doctor` — lets a user confirm their
+ * `proactiveCompactPercent`/`clipMaxTokens` overrides actually took effect
+ * (an out-of-range value fails closed to the default and is reported here as-resolved).
+ */
+function compactionKnobsLine(compaction: ResolvedCompactionConfig): string {
+  return `Compaction: proactiveCompactPercent=${compaction.proactiveCompactPercent} (of context window), clipMaxTokens=${compaction.clipMaxTokens} (per tool-result block).`;
+}
+
 /** Full /doctor breakdown, generated from the registry. */
 export function renderDoctorReport(
   project: ClaudeProject,
   report: CompatReport,
   activeModel?: unknown,
+  compaction?: ResolvedCompactionConfig,
 ): string {
   const lines: string[] = [
     `PiCC compatibility report — baseline ${CLAUDE_BASELINE}`,
     `Project: ${project.root}`,
     activeModelVisionLine(activeModel),
     subagentPostureLine(project),
+    ...(compaction ? [compactionKnobsLine(compaction)] : []),
     "",
   ];
 
