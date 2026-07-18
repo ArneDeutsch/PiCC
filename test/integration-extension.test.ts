@@ -573,6 +573,39 @@ describe("session lifecycle hooks", () => {
     expect(result.action === "continue" || !String(result.text ?? "").includes("FS-SKILL")).toBe(true);
   });
 
+  // A pasted/dropped image Pi captured on the input (`event.images`) must survive
+  // whenever the turn text is rewritten — both transform return sites of the input
+  // handler carry it forward via one shared helper.
+  it("preserves captured images through a hook-suffix-only transform", async () => {
+    const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0=" } };
+    const result = await pi.fire("input", { text: "hello", images: [image], source: "interactive" });
+    expect(result.action).toBe("transform");
+    expect(result.text).toContain("FS-PROMPT-HOOK-CONTEXT"); // the transform fired
+    expect(result.images).toEqual([image]); // captured block preserved, unchanged
+  });
+
+  it("preserves captured images through a skill-expansion transform", async () => {
+    const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA=" } };
+    // Unique args so the session-wide dedup fingerprint renders the full body
+    // (not the "invoked again" note) — the point here is the image, not dedup.
+    const result = await pi.fire("input", {
+      text: "/deploy t05env 7.7",
+      images: [image],
+      source: "interactive",
+    });
+    expect(result.action).toBe("transform");
+    expect(result.text).toContain("FS-SKILL-ARGS-BODY"); // skill expanded
+    expect(result.images).toEqual([image]);
+  });
+
+  it("does not attach captured images to an extension-synthesized input (early-return unchanged)", async () => {
+    const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "BBBB=" } };
+    const result = await pi.fire("input", { text: "hello", images: [image], source: "extension" });
+    // Synthesized text is passed through verbatim: the handler returns `continue`
+    // (Pi keeps the original event), and never forwards the block itself.
+    expect(result).toEqual({ action: "continue" });
+  });
+
   it("SessionStart hook stdout reaches the model + compat notice raised", async () => {
     pi.messages.length = 0;
     pi.entries.length = 0;

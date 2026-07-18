@@ -1315,6 +1315,25 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     try {
       if (event.source === "extension") return { action: "continue" };
 
+      // Every transforming path below rewrites the turn text, but Pi may have
+      // already captured images the user pasted or dropped onto this input
+      // (`event.images`). A `transform` result that omits them makes Pi
+      // assemble a text-only turn, silently losing the image. Carry the
+      // captured blocks forward on every transform — unchanged and in order,
+      // additive (prepend any images the branch itself produced; none do
+      // today, but keep it composable). This forwards genuine user captures
+      // only: `source === "extension"` (model/extension-synthesized text)
+      // already returned above, so every remaining source (interactive/rpc)
+      // is genuine user/host input, not model-synthesized. This does NOT
+      // scrape image paths out of prose — the model `Read`s those (a
+      // deliberate non-goal).
+      type TransformResult = { action: "transform"; text: string; images?: unknown[] };
+      const withCapturedImages = (result: TransformResult): TransformResult => {
+        const captured = Array.isArray(event.images) ? event.images : [];
+        if (captured.length === 0) return result;
+        return { ...result, images: [...(result.images ?? []), ...captured] };
+      };
+
       // 0) PiCC control commands (/doctor /compat /quota /skills /agents /usage).
       //    In interactive mode Pi's own command router intercepts these before
       //    the input event; this branch covers the other modes so a control
@@ -1444,11 +1463,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // The trailing text is NOT re-appended as its own part: the last
         // skill's rendered activation already carries it as $ARGUMENTS (or via
         // the ARGUMENTS: fallback), so a second copy would duplicate the request.
-        return { action: "transform", text: parts.join("\n\n") + hookSuffix };
+        return withCapturedImages({ action: "transform", text: parts.join("\n\n") + hookSuffix });
       }
 
       if (hookSuffix) {
-        return { action: "transform", text: `${text}${hookSuffix}` };
+        return withCapturedImages({ action: "transform", text: `${text}${hookSuffix}` });
       }
       return { action: "continue" };
     } catch (err) {

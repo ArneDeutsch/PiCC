@@ -374,4 +374,20 @@ describe("stacked skill invocations + re-invocation dedup (extension)", () => {
     const third = await skillTool.execute("d3", { name: "redo-tool", arguments: "y" });
     expect(third.content[0].text).toContain("REDO-TOOL-BODY [y]");
   });
+
+  // Control for the image-preservation fix: when nothing transforms the input
+  // (no skill token, and this minimal project has no UserPromptSubmit hook), the
+  // handler returns `continue` and never touches `event.images` — Pi keeps the
+  // original event, so a captured image is preserved by pass-through.
+  it("leaves captured images untouched when no transform fires (continue pass-through)", async () => {
+    const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "CCCC=" } };
+    const result = await pi.fire("input", {
+      text: "just a plain message with a pasted screenshot",
+      images: [image],
+      source: "interactive",
+    });
+    // `continue` = Pi reuses the original event (images intact); the handler does
+    // not synthesize its own `images` on this path.
+    expect(result).toEqual({ action: "continue" });
+  });
 });
