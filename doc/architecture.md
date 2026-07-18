@@ -340,6 +340,9 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    re-prompts the agent, capped to bound a loop). `session_before_compact` / `session_compact` fire
    `PreCompact`/`PostCompact` and re-inject active skill bodies for mid-turn continuity under
    Claude's carryover budgets; the system-prompt suffix already preserves the instruction set.
+   At the `agent_settled` boundary PiCC also proactively triggers `ctx.compact()` once usage
+   crosses a configurable percent of the window (`proactiveCompactPercent`) — the
+   extension-side substitute for raising Pi's `reserveTokens`, keeping the session off the edge.
    `session_shutdown` fires `SessionEnd`, with the shutdown reason as the matcher subject.
 
 ## Mechanical-fidelity decisions (load-bearing)

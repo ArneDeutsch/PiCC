@@ -178,7 +178,7 @@ Cross-cutting runtime subsystems and behaviors.
 | ID | Tier | Note |
 |---|---|---|
 | `feature.claude-md-import` | full | @import expansion, recursive up to 4 hops, incl. the AGENTS.md bridge |
-| `feature.compaction-preservation` | full | root CLAUDE.md + active skills (Claude-parity 20k/100k char budgets, most-recent-first) + unconditional rules survive compaction |
+| `feature.compaction-preservation` | full | root CLAUDE.md + active skills (Claude-parity 20k/100k char budgets, most-recent-first) + unconditional rules survive compaction. Additionally, PiCC triggers compaction EARLIER than Claude's threshold — proactively at a PiCC-configurable percent of the window (default 85%, the proactiveCompactPercent knob) rather than reproducing Claude's auto-compact trigger — so PreCompact/PostCompact hook cadence shifts accordingly (fires sooner, more often). This proactive compaction presents to PreCompact hooks as trigger:"auto" (Claude-faithful: an automatic compaction, not a user /compact), so a matcher keyed on manual\|auto still matches exactly |
 | `feature.nested-claude-md` | full | full ancestor-chain CLAUDE.md/CLAUDE.local.md load (to filesystem root) + nearest-ancestor injection on subdir file access, incl. worktrees |
 | `feature.plugins-content` | full | installed-plugin skills/agents/hooks/commands folded into the registries |
 | `feature.rules` | full | .claude/rules/ unconditional load + path-scoped injection at project and user scope |

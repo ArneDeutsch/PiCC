@@ -115,7 +115,10 @@ rules, and the rendered bodies of currently-active skills. Additionally our `bef
 always re-asserts the instruction set in the system prompt (system prompt is rebuilt every turn
 and never compacted away) — that is the primary preservation mechanism; the post-compact message
 covers mid-turn context. PreCompact/PostCompact **project hooks** fire around these events.
-Compaction settings pass through Pi (`compaction.reserveTokens` etc.).
+Compaction settings pass through Pi (`compaction.reserveTokens` etc.). `reserveTokens` is a
+**Pi settings-file** value that extensions cannot raise; PiCC's `proactiveCompactPercent`
+compacts *sooner* as the extension-side margin lever, but it cannot make Pi tolerate more than
+`contextWindow − reserveTokens` — raising the hard reserve stays an upstream-Pi/settings matter.
 
 ### 3.6 What stays Pi-native
 Auth (`/login` ChatGPT/Codex OAuth), provider abstraction, retry, session persistence/tree,

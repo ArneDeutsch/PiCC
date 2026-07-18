@@ -6,6 +6,13 @@ import { Type } from "typebox";
 import type { HookOutcome, HookPayload, ToolCallDescriptor } from "./types.js";
 import { findByName, loadClaudeProject, type LoadedProject } from "./project.js";
 import { loadPiCCConfig, mapEffort, steeringForModel } from "./runtime/steering.js";
+import {
+  decideProactiveCompaction,
+  initialPendingState,
+  pendingStateAfterCompaction,
+  type ContextUsageShape,
+  type ProactivePendingState,
+} from "./runtime/proactive-compaction.js";
 import { CwdState } from "./runtime/cwd-state.js";
 import { HookRunner } from "./engine/hook-runner.js";
 import { PermissionEngine } from "./engine/permissions.js";
@@ -336,6 +343,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   let currentModel: unknown; // the orchestrator's active model — inherited by subagents
   let steeringText: string | undefined;
   let stopHookIterations = 0;
+  // Anti-thrash state for proactive early compaction: set when a compaction has been
+  // requested at a turn boundary, reset on `session_compact` success (which also opens the
+  // cooldown window) OR by the bounded turn-count fallback inside decideProactiveCompaction
+  // (compaction failure fires no event).
+  let proactivePending: ProactivePendingState = initialPendingState();
+  // One-shot marker: a PiCC-initiated proactive `ctx.compact()` reaches Pi as reason:"manual",
+  // but to hooks it is an AUTOMATIC compaction. Set right before ctx.compact(), consumed by the
+  // very next session_before_compact to present PreCompact as trigger:"auto" (Claude fidelity:
+  // manual is reserved for a user /compact).
+  let proactiveCompactInFlight = false;
   const quotaHeaders: Record<string, string> = {};
 
   const hookRunnerFacade = {
@@ -1483,6 +1500,43 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("agent_settled", async (_event: any, ctx: any) => {
+    // Proactive early compaction: at this settled turn boundary (nothing in-flight, so
+    // ctx.compact()'s abort is benign), compact via Pi's own authed transport once usage
+    // crosses the configured percent of the window — the extension-side substitute for a
+    // larger reserveTokens, and the primary resilience lever. Degrade, never throw:
+    // getContextUsage() may be undefined and percent/tokens may be null.
+    try {
+      // A prior proactive compaction's in-flight marker never legitimately survives to the
+      // next settled turn (its session_before_compact fires during that compaction, before the
+      // retried turn settles), so any marker still set here is stale — clear it so a later user
+      // /compact is never misread as auto.
+      proactiveCompactInFlight = false;
+      let usage: ContextUsageShape | undefined;
+      try {
+        usage = ctx?.getContextUsage?.();
+      } catch {
+        usage = undefined;
+      }
+      const threshold = config.compaction.proactiveCompactPercent;
+      const decision = decideProactiveCompaction(usage, threshold, proactivePending);
+      proactivePending = decision.pending;
+      if (decision.compact) {
+        const at =
+          typeof usage?.percent === "number" ? `${Math.round(usage.percent)}%` : `${threshold}%`;
+        const notice = `PiCC: compacting context early at ${at} of the context window (threshold ${threshold}%, configurable via proactiveCompactPercent)`;
+        // Always-visible notice (NOT PICC_DEBUG-only debug()): same channel as the startup
+        // compat notice; doubles as discovery of the proactiveCompactPercent knob. Mirror the
+        // startup pattern: also persist an entry so the notice leaves a trace in print/headless
+        // mode, where ctx.ui.notify no-ops.
+        ctx?.ui?.notify?.(notice, "info");
+        pi.appendEntry("picc-proactive-compact", { notice });
+        // Consumed by the next session_before_compact → PreCompact trigger:"auto".
+        proactiveCompactInFlight = true;
+        ctx?.compact?.();
+      }
+    } catch {
+      /* floor: proactive compaction is best-effort and must never break the turn */
+    }
     try {
       // Stop payload `last_assistant_message` (Claude wire contract): the
       // settled event carries no messages, so read the session branch via ctx
@@ -1531,11 +1585,18 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("session_before_compact", async (event: any) => {
+    // A PiCC-initiated proactive compaction reaches Pi via ctx.compact(), which reports
+    // reason:"manual" here — but Claude Code fires PreCompact with trigger:"auto" for any
+    // automatic/threshold compaction and reserves "manual" for a user /compact. Consume the
+    // one-shot in-flight marker so the proactive path maps to "auto" while a genuine user
+    // /compact (marker unset) stays "manual".
+    const proactive = proactiveCompactInFlight;
+    proactiveCompactInFlight = false;
     try {
       // `trigger` (manual|auto) is the matcher subject Claude documents for PreCompact.
       await hooks.fire("PreCompact", {
         reason: event.reason,
-        trigger: event.reason === "manual" ? "manual" : "auto",
+        trigger: proactive ? "auto" : event.reason === "manual" ? "manual" : "auto",
         cwd: cwdState.get(),
       });
     } catch {
@@ -1545,6 +1606,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("session_compact", async () => {
+    // Compaction succeeded (this event is success-only): clear the proactive pending flag and
+    // open the cooldown window so the next few turns can't back-to-back re-compact if usage
+    // stayed at/above threshold (a silent failure fires no event and instead re-fires via the
+    // bounded pending fallback).
+    proactivePending = pendingStateAfterCompaction();
     try {
       await hooks.fire("PostCompact", { cwd: cwdState.get() });
       // Path-scoped artifacts reload on next relevant access: compaction

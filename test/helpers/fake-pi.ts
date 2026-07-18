@@ -98,6 +98,8 @@ export interface FakePi {
    * TUI-only chrome out of it.
    */
   rpcCtx(overrides?: Record<string, unknown>): Record<string, unknown>;
+  /** Every `ctx.compact()` call recorded from any ctx this fake produces. */
+  compactCalls: Array<unknown>;
   /** Wait until every named tool has been registered. */
   waitForTools(names: readonly string[]): Promise<void>;
   /** Capture the extension's observational detached-initialization completion. */
@@ -125,6 +127,7 @@ export function fakePi(): FakePi {
   const terminalInputHandlers: Array<
     (data: string) => { consume?: boolean; data?: string } | undefined
   > = [];
+  const compactCalls: Array<unknown> = [];
   const toolWaiters = new Set<{ names: readonly string[]; signal: Deferred<void> }>();
   const hasTools = (names: readonly string[]) => names.every((name) => tools.has(name));
   const notifyToolWaiters = () => {
@@ -308,6 +311,7 @@ export function fakePi(): FakePi {
     customs,
     terminalInputHandlers,
     feedTerminalInput,
+    compactCalls,
     renderRequests: 0,
     keymap: {
       "tui.select.up": ["\u001b[A"],
@@ -365,7 +369,12 @@ export function fakePi(): FakePi {
         ui: recordingUi(),
         modelRegistry: { find: () => undefined },
         model: { provider: "openai", id: "gpt-test" },
-        getContextUsage: () => ({ tokens: 1234 }),
+        // Real Pi ContextUsage is a 3-field shape ({ tokens, contextWindow, percent } on the
+        // 0–100 scale). The default sits well below any proactive-compaction threshold so
+        // firing `agent_settled` never incidentally triggers compaction; tests that exercise
+        // proactive compaction override getContextUsage with an above-threshold percent.
+        getContextUsage: () => ({ tokens: 1234, contextWindow: 400000, percent: (1234 / 400000) * 100 }),
+        compact: (options?: unknown) => compactCalls.push(options),
         sessionManager: { getEntries: () => [] },
         ...overrides,
       };

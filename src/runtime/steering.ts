@@ -68,6 +68,8 @@ export const DEFAULT_PROACTIVE_COMPACT_PERCENT = 85;
 export const DEFAULT_CLIP_MAX_TOKENS = 20000;
 
 const PROACTIVE_COMPACT_PERCENT_MIN = 50;
+// Capped below Pi's own ~95.6% hard compaction trigger so the proactive lever always
+// PRE-EMPTS it (the whole point is to compact early) — do not raise toward 99.
 const PROACTIVE_COMPACT_PERCENT_MAX = 95;
 const CLIP_MAX_TOKENS_MIN = 1000;
 
