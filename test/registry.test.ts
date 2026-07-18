@@ -22,6 +22,8 @@ import {
   writeSuppression,
 } from "../src/registry/compat-report.js";
 import { DEGRADED_TOOLS } from "../src/runtime/tools/degrade-stubs.js";
+import { sniffImageMime } from "../src/runtime/image-ingest.js";
+import { renderNotebook } from "../src/runtime/notebook-render.js";
 import type {
   ClaudeAgent,
   ClaudeProject,
@@ -427,6 +429,75 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(sc?.note.startsWith("—")).toBe(false);
   });
 
+  // tool.Read stays full for its text/image/notebook core, but the note must
+  // disclose the vision-gate exception, that the image-FILE path is inherited
+  // from base Pi, the Claude-style binary error, and cross-reference the PDF gap
+  // to its own entry. Classification truthfulness: IMAGE and BINARY detection is
+  // byte-based (magic bytes), but NOTEBOOK routing is keyed on the .ipynb
+  // extension (parity with Claude's merged Read), not byte-based — the note must
+  // scope the byte-based claim to image/binary and call the notebook path
+  // extension-keyed.
+  it("describes Read's notebook/image/binary behavior at full, vision-gated, byte-based(image/binary)/extension-keyed(notebook), PDF cross-referenced", () => {
+    const read = lookupCapability("tool.Read");
+    expect(read?.tier).toBe("full");
+    expect(read?.note).toContain("CELL-AWARE");
+    expect(read?.note).toContain("image content block");
+    expect(read?.note).toContain("vision-gate exception");
+    expect(read?.note).toContain("INHERITED from base Pi");
+    // Byte-based classification is scoped to IMAGE and BINARY only...
+    expect(read?.note).toContain("IMAGE and BINARY classification is BYTE-BASED");
+    expect(read?.note).toContain("not extension-based");
+    // ...while notebook reads are keyed on the .ipynb extension (Claude parity).
+    expect(read?.note).toContain(".ipynb extension");
+    expect(read?.note.toLowerCase()).toContain("parity");
+    expect(read?.note).toContain("Claude-style binary error");
+    // The PDF gap is discoverable via its own entry, not hidden inside "full",
+    // and is NOT claimed to be named by /doctor.
+    expect(read?.note).toContain("feature.read.pdf");
+    expect(read?.note).toContain("feature.read.images");
+    expect(read?.note).not.toContain("/doctor flags");
+  });
+
+  // The image-ingestion entry is a single `partial` entry: full-on-vision /
+  // degraded-on-non-vision, with the split and PiCC-own normalization stated.
+  it("carries a partial image-ingestion entry naming the vision split and normalization", () => {
+    const img = lookupCapability("feature.read.images");
+    expect(img, "feature.read.images must exist").toBeDefined();
+    expect(img?.tier).toBe("partial");
+    expect(img?.note.toLowerCase()).toContain("vision-capable model");
+    expect(img?.note).toContain("SPLITS on vision");
+    expect(img?.note).toContain("model-visible text note");
+    expect(img?.note).toContain("byte-based");
+    // PiCC's own normalization, not asserted byte-identical to Claude.
+    expect(img?.note).toContain("NOT asserted byte-identical to Claude Code");
+    expect(img?.note).toContain("inherited from base Pi");
+  });
+
+  // PDF is disclosed as BELOW the Claude baseline through a discoverable
+  // not-supported entry (runtime binary error + support-matrix table), rather
+  // than Read hiding it inside its full tier.
+  it("carries a not-supported PDF entry disclosing it is below the Claude baseline", () => {
+    const pdf = lookupCapability("feature.read.pdf");
+    expect(pdf, "feature.read.pdf must exist").toBeDefined();
+    expect(pdf?.tier).toBe("not-supported");
+    expect(pdf?.note).toContain("Claude Code reads PDFs at baseline");
+    expect(pdf?.note).toContain("binary error");
+    expect(pdf?.note).toContain("BELOW the Claude baseline");
+    // Must NOT imply Claude also errors on PDF.
+    expect(pdf?.note).toContain("NOT a claim that Claude also errors on PDF");
+  });
+
+  // NotebookEdit was reconciled alongside the retirement: its note directs raw
+  // .ipynb editing via Edit and viewing raw JSON via Bash (Read now renders
+  // notebooks cell-aware). This verifies that reconciled note still reads truthfully.
+  it("keeps the NotebookEdit note truthful about editing raw JSON via Edit and viewing via Bash", () => {
+    const ne = lookupCapability("tool.NotebookEdit");
+    expect(ne?.tier).toBe("degraded-noop");
+    expect(ne?.note).toContain("Edit");
+    expect(ne?.note).toContain("Bash");
+    expect(ne?.note).toContain("Read now renders notebooks cell-aware");
+  });
+
   it("stays in sync with the shipped degrade-stub list, in both directions", () => {
     // Every shipped stub resolves to a dedicated degraded-noop registry entry
     // (a stub reported "unassessed" would be registry drift).
@@ -453,9 +524,10 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     // SlashCommand is a REAL tool now — retiered to partial and no longer a stub.
     expect(lookupCapability("tool.SlashCommand")?.tier).toBe("partial");
     expect(stubNames.has("SlashCommand")).toBe(false);
-    // NotebookRead is a REAL tool now — retiered to partial and no longer a stub.
-    expect(lookupCapability("tool.NotebookRead")?.tier).toBe("partial");
-    expect(stubNames.has("NotebookRead")).toBe(false);
+    // NotebookRead is RETIRED to a degrade-stub — notebook reading merged into
+    // Read (cell-aware); the name is retained only as a gating token.
+    expect(lookupCapability("tool.NotebookRead")?.tier).toBe("degraded-noop");
+    expect(stubNames.has("NotebookRead")).toBe(true);
     // MultiEdit is a REAL tool now — retiered to full and no longer a stub.
     expect(lookupCapability("tool.MultiEdit")?.tier).toBe("full");
     expect(stubNames.has("MultiEdit")).toBe(false);
@@ -1008,6 +1080,150 @@ describe("renderDoctorReport", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Active-model vision surface (/doctor + startup notice)
+// ---------------------------------------------------------------------------
+
+const VISION_MODEL = { provider: "openai", id: "gpt-see", input: ["text", "image"] };
+const NON_VISION_MODEL = { provider: "openai", id: "gpt-text", input: ["text"] };
+
+describe("active-model vision line in /doctor", () => {
+  it("reports vision: yes for a vision-capable active model", () => {
+    const project = makeProject();
+    const doctor = renderDoctorReport(project, buildCompatReport(project), VISION_MODEL);
+    expect(doctor).toContain("Active model: openai/gpt-see — vision: yes");
+  });
+
+  it("reports vision: no and names the remedy for a non-vision active model", () => {
+    const project = makeProject();
+    const doctor = renderDoctorReport(project, buildCompatReport(project), NON_VISION_MODEL);
+    expect(doctor).toContain("Active model: openai/gpt-text — vision: no");
+    expect(doctor).toContain("text placeholders");
+    expect(doctor).toContain("use a vision-capable model");
+  });
+
+  it("degrades to vision: unknown when no active model is available", () => {
+    const project = makeProject();
+    // Both the omitted param and an opaque object degrade to "unknown", never throw.
+    expect(renderDoctorReport(project, buildCompatReport(project))).toContain(
+      "Active model: unknown — vision: unknown",
+    );
+    expect(() => renderDoctorReport(project, buildCompatReport(project), {})).not.toThrow();
+    expect(renderDoctorReport(project, buildCompatReport(project), {})).toContain(
+      "vision: unknown",
+    );
+  });
+
+  it("reports vision: unknown (not no) for a model with an id but no input array", () => {
+    const project = makeProject();
+    // An id without a readable `input` modality array is OPAQUE on the vision axis:
+    // we must not claim "vision: no" — that would be untruthful.
+    const doctor = renderDoctorReport(project, buildCompatReport(project), { id: "gpt-opaque" });
+    expect(doctor).toContain("vision: unknown");
+    expect(doctor).not.toContain("vision: no");
+  });
+});
+
+describe("active-model vision warning in the startup notice", () => {
+  const cleanProject = makeProject();
+
+  it("surfaces the non-vision warning on a ZERO-findings project and puts it on the first line (the toast)", () => {
+    const report = buildCompatReport(cleanProject);
+    // Sanity: this project has nothing to report on its own.
+    expect(report.findings).toEqual([]);
+    expect(report.safetyFindings).toEqual([]);
+    expect(report.unassessed).toEqual([]);
+
+    const notice = renderStartupNotice(report, {
+      suppressed: false,
+      activeModel: NON_VISION_MODEL,
+    });
+    expect(notice).toBeDefined();
+    const text = notice as string;
+    // The warning is the FIRST line — the emission site builds the toast from it.
+    const firstLine = text.split("\n")[0];
+    expect(firstLine).toContain("openai/gpt-text is not vision-capable");
+    expect(firstLine).toMatch(/use a vision-capable model/i);
+  });
+
+  it("stays quiet on a clean project for a vision-capable model", () => {
+    const report = buildCompatReport(cleanProject);
+    expect(
+      renderStartupNotice(report, { suppressed: false, activeModel: VISION_MODEL }),
+    ).toBeUndefined();
+  });
+
+  it("stays quiet on a clean project when the active model is unknown/opaque", () => {
+    const report = buildCompatReport(cleanProject);
+    expect(
+      renderStartupNotice(report, { suppressed: false, activeModel: {} }),
+    ).toBeUndefined();
+    expect(renderStartupNotice(report, { suppressed: false })).toBeUndefined();
+  });
+
+  it("fires no non-vision warning for a model with an id but no input array", () => {
+    const report = buildCompatReport(cleanProject);
+    // Opaque on the vision axis (no readable modalities) — don't nag; /doctor still
+    // reports "unknown" for it.
+    expect(
+      renderStartupNotice(report, { suppressed: false, activeModel: { id: "gpt-opaque" } }),
+    ).toBeUndefined();
+  });
+
+  it("prepends the non-vision warning above the compat header when the project also has findings", () => {
+    const noisy = makeProject({
+      settings: makeSettings({
+        permissions: { allow: [], deny: [], ask: ["Bash(rm *)"], additionalDirectories: [] },
+      }),
+    });
+    const report = buildCompatReport(noisy);
+    const text = renderStartupNotice(report, {
+      suppressed: false,
+      activeModel: NON_VISION_MODEL,
+    }) as string;
+    const warnIdx = text.indexOf("is not vision-capable");
+    const headerIdx = text.indexOf("PiCC compatibility:");
+    expect(warnIdx).toBeGreaterThan(-1);
+    expect(headerIdx).toBeGreaterThan(warnIdx);
+  });
+
+  it("surfaces the non-vision warning through suppression, but drops the findings body", () => {
+    // `/compat suppress` acknowledges PROJECT findings; a non-vision model is a
+    // separate safety axis that must still surface (a user may suppress on a vision
+    // model, then switch to a non-vision one). The findings header/body stay hidden.
+    const noisy = makeProject({
+      settings: makeSettings({
+        permissions: { allow: [], deny: [], ask: ["Bash(rm *)"], additionalDirectories: [] },
+      }),
+    });
+    const report = buildCompatReport(noisy);
+    const notice = renderStartupNotice(report, {
+      suppressed: true,
+      activeModel: NON_VISION_MODEL,
+    });
+    expect(notice).toBeDefined();
+    const text = notice as string;
+    expect(text.split("\n")[0]).toContain("openai/gpt-text is not vision-capable");
+    expect(text.split("\n")[0]).toMatch(/use a vision-capable model/i);
+    // Suppression still silences the project-findings header/body and footer.
+    expect(text).not.toContain("PiCC compatibility:");
+    expect(text).not.toContain("Run /doctor for details");
+  });
+
+  it("stays silent under suppression for a vision-capable or opaque model", () => {
+    const report = buildCompatReport(cleanProject);
+    expect(
+      renderStartupNotice(report, { suppressed: true, activeModel: VISION_MODEL }),
+    ).toBeUndefined();
+    expect(
+      renderStartupNotice(report, { suppressed: true, activeModel: {} }),
+    ).toBeUndefined();
+    expect(
+      renderStartupNotice(report, { suppressed: true, activeModel: { id: "gpt-opaque" } }),
+    ).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Suppression persistence
 // ---------------------------------------------------------------------------
 
@@ -1031,5 +1247,48 @@ describe("suppression persistence", () => {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, "not json at all", "utf8");
     expect(readSuppression(root)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Committed notebook-with-image fixture — a reviewable .ipynb that a durable
+// artifact carries (in-test Buffers cover the unit layers; this one proves the
+// committed file parses and renders cell-aware). It is TEXT (JSON), so it is
+// deliberately NOT marked `binary` in .gitattributes. The test decodes and
+// magic-byte-SNIFFS the embedded raster (not a bare `existsSync`), so a
+// truncated or malformed payload fails loudly rather than silently rotting.
+// ---------------------------------------------------------------------------
+
+describe("committed notebook-with-image fixture (examples/full-surface/analysis.ipynb)", () => {
+  const fixturePath = fileURLToPath(
+    new URL("../examples/full-surface/analysis.ipynb", import.meta.url),
+  );
+  const raw = fs.readFileSync(fixturePath, "utf8");
+
+  it("carries a decodable embedded raster image", () => {
+    const doc = JSON.parse(raw) as {
+      cells: Array<{ outputs?: Array<{ data?: Record<string, unknown> }> }>;
+    };
+    const b64 = doc.cells
+      .flatMap((c) => c.outputs ?? [])
+      .map((o) => o.data?.["image/png"])
+      .find((v): v is string => typeof v === "string");
+    expect(b64, "fixture must embed an image/png output").toBeDefined();
+    // Decode + magic-byte sniff: a truncated/malformed payload fails here.
+    expect(sniffImageMime(Buffer.from(b64!, "base64"))).toBe("image/png");
+  });
+
+  it("renders the committed notebook cell-aware, degrading the image to a placeholder off-vision", async () => {
+    const { content } = await renderNotebook(raw, { model: { input: ["text"] } });
+    const text = content
+      .filter((b): b is { type: "text"; text: string } => b.type === "text")
+      .map((b) => b.text)
+      .join("\n");
+    expect(text).toContain("=== Cell 0 (markdown");
+    expect(text).toContain("training complete");
+    // Off-vision: the raster output is a text placeholder, not an image block.
+    expect(content.some((b) => b.type === "image")).toBe(false);
+    expect(text).toContain("image/png");
+    expect(text).toContain("does not support images");
   });
 });

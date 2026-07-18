@@ -47,7 +47,6 @@ import {
 import { createWorktreeTools } from "./runtime/tools/worktree-tools.js";
 import { createWebFetchTool, createWebSearchTool } from "./runtime/tools/web-tools.js";
 import { createGrepTool as createClaudeGrepTool, createGlobTool } from "./runtime/tools/search-tools.js";
-import { createNotebookReadTool } from "./runtime/tools/notebook-tools.js";
 import { createMultiEditTool } from "./runtime/tools/multi-edit.js";
 import { createTaskTools } from "./runtime/tools/task-tools.js";
 import {
@@ -615,12 +614,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       createWebSearchTool(get) as unknown as Record<string, unknown>,
       createClaudeGrepTool(get) as unknown as Record<string, unknown>,
       createGlobTool(get) as unknown as Record<string, unknown>,
-      createNotebookReadTool(get) as unknown as Record<string, unknown>,
       createMultiEditTool(get) as unknown as Record<string, unknown>,
       ...(taskBundle.tools as unknown as Record<string, unknown>[]),
       ...createWorktreeTools({ worktrees, cwdState: cwdRef, hookRunner: hookRunnerFacade }),
       ...DEGRADED_TOOLS.map(
-        (d) => createDegradeStub(d.name, d.note) as unknown as Record<string, unknown>,
+        (d) =>
+          createDegradeStub(d.name, d.note, { redirect: d.redirect }) as unknown as Record<
+            string,
+            unknown
+          >,
       ),
     ];
   }
@@ -734,7 +736,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       "Bash",
       "Grep",
       "Glob",
-      "NotebookRead",
       "WebFetch",
       "WebSearch",
       "Agent",
@@ -1289,8 +1290,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           { deliverAs: "nextTurn" },
         );
       }
-      if (!compatSuppressed && event.reason === "startup") {
-        const notice = renderStartupNotice(compat, { suppressed: false });
+      if (event.reason === "startup") {
+        // Pass the live suppression flag: when compat is suppressed, the notice is
+        // silent EXCEPT for a model-derived non-vision safety warning, which is
+        // decoupled from project-findings suppression and still surfaces here.
+        const notice = renderStartupNotice(compat, {
+          suppressed: compatSuppressed,
+          activeModel: currentModel,
+        });
         if (notice && ctx.hasUI) ctx.ui.notify(notice.split("\n")[0] + " — run /doctor", "warning");
         if (notice) {
           pi.appendEntry("picc-compat", { notice });
@@ -1313,6 +1320,25 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   pi.on("input", async (event: any, ctx: any) => {
     try {
       if (event.source === "extension") return { action: "continue" };
+
+      // Every transforming path below rewrites the turn text, but Pi may have
+      // already captured images the user pasted or dropped onto this input
+      // (`event.images`). A `transform` result that omits them makes Pi
+      // assemble a text-only turn, silently losing the image. Carry the
+      // captured blocks forward on every transform — unchanged and in order,
+      // additive (prepend any images the branch itself produced; none do
+      // today, but keep it composable). This forwards genuine user captures
+      // only: `source === "extension"` (model/extension-synthesized text)
+      // already returned above, so every remaining source (interactive/rpc)
+      // is genuine user/host input, not model-synthesized. This does NOT
+      // scrape image paths out of prose — the model `Read`s those (a
+      // deliberate non-goal).
+      type TransformResult = { action: "transform"; text: string; images?: unknown[] };
+      const withCapturedImages = (result: TransformResult): TransformResult => {
+        const captured = Array.isArray(event.images) ? event.images : [];
+        if (captured.length === 0) return result;
+        return { ...result, images: [...(result.images ?? []), ...captured] };
+      };
 
       // 0) PiCC control commands (/doctor /compat /quota /skills /agents /usage).
       //    In interactive mode Pi's own command router intercepts these before
@@ -1443,11 +1469,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // The trailing text is NOT re-appended as its own part: the last
         // skill's rendered activation already carries it as $ARGUMENTS (or via
         // the ARGUMENTS: fallback), so a second copy would duplicate the request.
-        return { action: "transform", text: parts.join("\n\n") + hookSuffix };
+        return withCapturedImages({ action: "transform", text: parts.join("\n\n") + hookSuffix });
       }
 
       if (hookSuffix) {
-        return { action: "transform", text: `${text}${hookSuffix}` };
+        return withCapturedImages({ action: "transform", text: `${text}${hookSuffix}` });
       }
       return { action: "continue" };
     } catch (err) {
@@ -1752,7 +1778,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   function runControlCommand(name: string, args: string, ctx: any): string | undefined {
     switch (name) {
       case "doctor":
-        return renderDoctorReport(project, compat);
+        return renderDoctorReport(project, compat, currentModel);
       case "skills":
         return renderSkillsList();
       case "agents":
@@ -1772,7 +1798,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           writeSuppression(project.root, false);
           compatSuppressed = false;
         }
-        return renderStartupNotice(compat, { suppressed: false }) ?? "No compatibility findings for this project.";
+        return renderStartupNotice(compat, { suppressed: false, activeModel: currentModel }) ?? "No compatibility findings for this project.";
       }
       default:
         return undefined;

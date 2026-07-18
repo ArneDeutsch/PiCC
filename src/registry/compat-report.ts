@@ -17,6 +17,7 @@ import type {
 } from "../types.js";
 import { SUPPORTED_HOOK_EVENTS } from "../types.js";
 import { loadPluginHooks, type InstalledPlugin } from "../claude/plugins.js";
+import { modelSupportsImages } from "../util/model.js";
 import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 import {
   CAPABILITY_REGISTRY,
@@ -317,24 +318,113 @@ function groupByCapability(findings: CompatFinding[]): Array<{
   return [...byId.values()];
 }
 
+// ---------------------------------------------------------------------------
+// Active-model vision surface.
+//
+// This line is derived from the ACTIVE model's input modalities (via
+// `modelSupportsImages`), NOT from the static capability registry and NOT from
+// the terminal's render capability. It tells a user whether their model can
+// actually see image inputs (image files, pasted/dropped images, notebook image outputs), so a
+// non-vision GPT/Codex user is never silently misled into thinking a pasted
+// screenshot or notebook plot reached the model.
+// ---------------------------------------------------------------------------
+
+/** Display id for the active model (`provider/id` or `id`), or undefined when opaque. */
+function activeModelId(model: unknown): string | undefined {
+  const m = model as { id?: unknown; provider?: unknown } | null | undefined;
+  if (!m || typeof m.id !== "string" || m.id === "") return undefined;
+  const provider = typeof m.provider === "string" && m.provider !== "" ? m.provider : undefined;
+  return provider ? `${provider}/${m.id}` : m.id;
+}
+
+/**
+ * True when the model exposes a readable `input` modality array. A model with an
+ * `id` but no (or a non-array) `input` is OPAQUE on the vision axis — we cannot
+ * say yes OR no, only "unknown". Mirrors the `Array.isArray` guard in
+ * `modelSupportsImages`.
+ */
+function modelHasVisionAxis(model: unknown): boolean {
+  return Array.isArray((model as { input?: unknown } | null | undefined)?.input);
+}
+
+/**
+ * Full, always-shown vision-state line for `/doctor` — yes / no / unknown.
+ * Never throws: an absent active model, or one with no readable `input` array,
+ * degrades to "vision: unknown" (naming the model id when we have it).
+ */
+function activeModelVisionLine(model: unknown): string {
+  const id = activeModelId(model);
+  const label = id ?? "unknown";
+  // No id, or an id with no readable modality array → opaque on the vision axis.
+  if (id === undefined || !modelHasVisionAxis(model)) {
+    return (
+      `Active model: ${label} — vision: unknown. If it is not vision-capable, image inputs ` +
+      "(image files, pasted/dropped images, notebook image outputs) are sent as text placeholders, not seen by the " +
+      "model; use a vision-capable model to have images seen."
+    );
+  }
+  if (modelSupportsImages(model)) {
+    return `Active model: ${label} — vision: yes. Image inputs (image files, pasted/dropped images, notebook image outputs) are delivered to the model as images.`;
+  }
+  return (
+    `Active model: ${label} — vision: no. Image inputs (image files, pasted/dropped images, notebook image outputs) are ` +
+    "sent as text placeholders, not seen by the model; use a vision-capable model to have images seen."
+  );
+}
+
+/**
+ * The high-value startup warning: emitted ONLY when the active model is known
+ * and definitively non-vision (a readable `input` array that lacks "image").
+ * Returns undefined for a vision-capable model (the positive line is
+ * `/doctor`-only), for an opaque/absent model, and for a model with an `id` but
+ * no readable modality array (don't nag when we can't tell — `/doctor` still
+ * reports "unknown"). The FIRST line is short and self-contained with the remedy
+ * so it survives toast truncation on a narrow terminal; a second, fuller line
+ * carries the detail for the notice body / `/doctor`.
+ */
+function nonVisionStartupWarning(model: unknown): string | undefined {
+  const id = activeModelId(model);
+  if (id === undefined) return undefined;
+  if (!modelHasVisionAxis(model)) return undefined;
+  if (modelSupportsImages(model)) return undefined;
+  return (
+    `Active model ${id} is not vision-capable — images sent as text; use a vision-capable model.\n` +
+    "Image inputs (image files, pasted/dropped images, notebook image outputs) are sent as text placeholders, not seen by the model."
+  );
+}
+
 /**
  * ONE consolidated startup notice per session.
  * Returns undefined when suppressed or when there is nothing to report.
  */
 export function renderStartupNotice(
   report: CompatReport,
-  opts: { suppressed: boolean },
+  opts: { suppressed: boolean; activeModel?: unknown },
 ): string | undefined {
-  if (opts.suppressed) return undefined;
+  // The non-vision active-model warning is DECOUPLED from project-findings
+  // suppression. `/compat suppress` acknowledges this project's compat findings,
+  // but whether the ACTIVE model can see images is a separate, safety-relevant
+  // axis (a user may suppress on a vision model, then later switch to a non-vision
+  // one). So it is computed independent of `suppressed`, and when present it is
+  // always the FIRST line — the emission site builds the toast from that line.
+  const visionWarning = nonVisionStartupWarning(opts.activeModel);
+
+  // Suppression silences only the project-findings body/header. A non-vision model
+  // still surfaces its warning through suppression; a vision-capable or opaque
+  // model stays fully silent (undefined).
+  if (opts.suppressed) return visionWarning;
 
   const safety = groupByCapability(report.safetyFindings);
   const functionality = groupByCapability(report.findings);
   const degradedCount = safety.length + functionality.length + report.unassessed.length;
-  if (degradedCount === 0) return undefined;
 
-  const lines: string[] = [
-    `PiCC compatibility: ${degradedCount} feature(s) degraded for this project`,
-  ];
+  if (degradedCount === 0 && visionWarning === undefined) return undefined;
+
+  const lines: string[] = [];
+  if (visionWarning !== undefined) lines.push(visionWarning);
+  if (degradedCount > 0) {
+    lines.push(`PiCC compatibility: ${degradedCount} feature(s) degraded for this project`);
+  }
   if (safety.length > 0) {
     lines.push("SAFETY:");
     for (const g of safety) {
@@ -384,10 +474,15 @@ function subagentPostureLine(project: ClaudeProject): string {
 }
 
 /** Full /doctor breakdown, generated from the registry. */
-export function renderDoctorReport(project: ClaudeProject, report: CompatReport): string {
+export function renderDoctorReport(
+  project: ClaudeProject,
+  report: CompatReport,
+  activeModel?: unknown,
+): string {
   const lines: string[] = [
     `PiCC compatibility report — baseline ${CLAUDE_BASELINE}`,
     `Project: ${project.root}`,
+    activeModelVisionLine(activeModel),
     subagentPostureLine(project),
     "",
   ];

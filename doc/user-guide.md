@@ -356,10 +356,12 @@ generated from that registry so it cannot drift. The shape of the answer:
 - **Partial (works within a named limit):** background subagent dispatch with `TaskOutput`/`TaskStop`;
   `SendMessage` resume/steer; `subagent_type: "fork"`; nested (depth ≥ 2) fan-out, off by default;
   auto-memory writes; managed/enterprise policy (honored where trivially present, otherwise
-  degrade-safe); `NotebookRead`; `maxTurns`.
+  degrade-safe); `maxTurns`.
 - **Degraded no-op (visible, never crashing):** MCP servers/tools, `ask`/`allow`/permission modes,
   plan mode, `AskUserQuestion`, checkpointing/rewind, output styles, agent teams, background
-  *shells* (`BashOutput`/`KillShell`), LSP, computer use — and a handful of hook events that are
+  *shells* (`BashOutput`/`KillShell`), LSP, computer use, `NotebookRead` (retired — notebook
+  reading is merged into `Read`, which renders `.ipynb` cell-aware; the name stays a read-family
+  gating token) — and a handful of hook events that are
   parsed but never fired (the matrix marks which). ⚠ `PermissionRequest` is one of them, so it is
   **not** a gate — nothing fires it under the default-permissive posture. Unknown/future fields
   degrade safely and are reported as unassessed.
