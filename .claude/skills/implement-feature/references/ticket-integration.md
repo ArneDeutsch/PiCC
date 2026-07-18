@@ -126,7 +126,7 @@ path-independent issue-filing offer, on the ticketless path too. Phases 1, 8 and
    > authenticated `gh` account, not hand-written._
 
    (matching the repo's `Co-Authored-By` / "🤖 Generated with Claude Code" convention). Templates
-   elsewhere (the Phase 9 skeletons in `references/handoff.md`, the Phase 8 hooks below) refer to this
+   elsewhere (the Phase 9 skeletons in `references/phase-9-handoff.md`, the Phase 8 hooks below) refer to this
    as `<attribution trailer>`.
 9. **Idempotent on resume.** The "No status bookkeeping" principle means a resumed/compacted run
    reconstructs from git — which has no record of GitHub writes. So guard **every** public write
@@ -217,7 +217,7 @@ PR body will close it (`Closes #N`); if it only **partly** does, the PR referenc
 (the ticket stays open) and you name the remaining scope. **Bias to keep-open when uncertain** — a
 wrongly-open ticket is a one-click fix, a wrongly-closed one silently drops scope. Then **show the two
 actual texts you intend to post — the PR body and the issue comment.** They differ in audience: the PR
-body guides the reviewer through verifying the change in the running app (carrying handoff.md's
+body guides the reviewer through verifying the change in the running app (carrying phase-9-handoff.md's
 launch-and-verify recipe); the issue comment explains,
 for the ticket's readers, what was built and how behaviour changes against the original ask. Both go
 public under the user's identity, so get explicit confirmation before any Phase 9 write. Author that

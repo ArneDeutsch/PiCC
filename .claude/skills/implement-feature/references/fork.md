@@ -149,11 +149,11 @@ fork disclosure to make — the run is on the git-only maintainer resolution and
 ## Phase 9 — fork hand-off (push to fork, compare URL, paste-ready PR)
 
 Read this at **Phase 9** on the **fork path** (Phase 0 resolved `push != target`). It **replaces**
-the "Ticket path — open the PR and post the comment" block of [handoff.md](handoff.md) with a
-paste-ready hand-off; the common spine of [handoff.md](handoff.md) Phase 9 still applies — the
+the "Ticket path — open the PR and post the comment" block of [phase-9-handoff.md](phase-9-handoff.md) with a
+paste-ready hand-off; the common spine of [phase-9-handoff.md](phase-9-handoff.md) Phase 9 still applies — the
 push/merge preamble (step 1), the CI check (step 2), ExitWorktree `action: keep` (step 3), and the
 per-path final summary (step 4). The PR **body** and issue-**comment** skeletons are **single-sourced
-in [handoff.md](handoff.md)** — do not re-invent them here; this section changes only the *delivery*
+in [phase-9-handoff.md](phase-9-handoff.md)** — do not re-invent them here; this section changes only the *delivery*
 (handed to the user paste-ready, not posted) and the linking form (below).
 
 **The only automatic GitHub write on the fork path is the branch push to the fork.** No `gh pr
@@ -171,7 +171,7 @@ the body until the rules are available** — do not distill a body with the rule
 1. **Merge, then push to the fork.** Re-fetch the **target's** default via a temporary named remote
    (as in Phase 2 — [phase-2-workspace.md](phase-2-workspace.md)); if it moved, merge it into the
    feature branch, resolve conflicts, and verify typecheck + full suite green again. Then apply
-   [handoff.md](handoff.md) step 1's push-safety gate against `<pushRemote>` (the fork) for
+   [phase-9-handoff.md](phase-9-handoff.md) step 1's push-safety gate against `<pushRemote>` (the fork) for
    `git push -u <pushRemote> feature/<feature-slug>` — its first-push condition, established-self-owned
    criteria, foreign-ref stop, "nothing is lost" framing, never-force rule, and non-atomic-race caveat
    govern this push exactly as on the maintainer path, just targeting the fork. **This single fork push
@@ -194,17 +194,17 @@ the body until the rules are available** — do not distill a body with the rule
    ASCII / URL-path-safe given the model-authored branch slug (Rule 4). Do **not** pre-fill the PR body
    via URL query params: it would clobber the upstream PR template this flow deliberately surfaces and
    overflows URL limits.
-4. **Present the final summary.** This **replaces** [handoff.md](handoff.md) step 4's next-steps
+4. **Present the final summary.** This **replaces** [phase-9-handoff.md](phase-9-handoff.md) step 4's next-steps
    bullets — both the ticketless "open a Pull Request yourself" line **and** the ticket-path "the
    ready-for-review PR is already open" line: on the fork path a ticket run has **no** open PR, so
-   neither of those bullets is true here. Reuse only handoff.md step 4's framing (what was
+   neither of those bullets is true here. Reuse only phase-9-handoff.md step 4's framing (what was
    implemented, decisions/deviations, test status). Then give the fork next-steps:
    - The working **compare URL** (from step 3).
    - The PR **title** on its own line, copyable — the stable printable-ASCII `<Title>` from confirmed
      scope (Rule 4), with no identifier prefix.
-   - The PR **body** in a fenced code block, byte-exact — authored from [handoff.md](handoff.md)'s
+   - The PR **body** in a fenced code block, byte-exact — authored from [phase-9-handoff.md](phase-9-handoff.md)'s
      **PR-body skeleton** (answer every heading; "Start your review here" is a semantic verification
-     guide, not a code tour) — this inherits handoff.md's single-source launch-and-verify recipe
+     guide, not a code tour) — this inherits phase-9-handoff.md's single-source launch-and-verify recipe
      (obtain the branch, `node ./bin/picc.mjs --model openai-codex/<id>`, drive-and-confirm); do not
      re-author it here. Inside that body's steps use **inline `code`, never a triple-backtick
      fenced block** — a nested fence would terminate the outer code fence and corrupt the copyable
@@ -218,7 +218,7 @@ the body until the rules are available** — do not distill a body with the rule
    issue lives in the same repo the PR targets** — i.e. the issue is on `target`. Never hard-code
    `Closes #N`; pick the top linking line from where the issue lives:
    - **Issue on `target`** (the given ticket whose URL matched `target`, or a ticket created on the
-     upstream via the create-offer): use [handoff.md](handoff.md)'s skeleton top line as-is — `Closes #N`
+     upstream via the create-offer): use [phase-9-handoff.md](phase-9-handoff.md)'s skeleton top line as-is — `Closes #N`
      if Phase 8 judged the feature to **fully** deliver #N, else a bare `#N` (ticket stays open).
    - **Issue on the fork** (a URL ref pointing at a fork-hosted issue — the fork-only URL-ref case): a plain
      `Closes #N` on a PR that targets `target` does **not** close the fork issue and **would wrongly
@@ -232,12 +232,12 @@ the body until the rules are available** — do not distill a body with the rule
    stripping.
 6. **Issue comment — do not auto-post.** At hand-off the PR doesn't exist yet, a fork-PR↔upstream-issue
    link is cross-repo so GitHub won't auto-surface it, and auto-commenting on a repo the user doesn't
-   own is unwanted. **Optionally** hand the [handoff.md](handoff.md) issue-**comment** text as a
+   own is unwanted. **Optionally** hand the [phase-9-handoff.md](phase-9-handoff.md) issue-**comment** text as a
    *paste-ready* artifact ("if you want to leave a note on #N after opening the PR") — offer it, don't
    dump it by default. It is authored under the same discipline (via the skeleton, ending with the
    `<attribution trailer>`, Rule 6 leakage-stripped).
 
-**Push-failure degrade** (the fork push is rejected — mirror [handoff.md](handoff.md)'s
+**Push-failure degrade** (the fork push is rejected — mirror [phase-9-handoff.md](phase-9-handoff.md)'s
 push-rejected branch): do **not** stop cold. Lead with **"nothing is lost"** (everything is committed
 on the branch in the worktree), give the actual `git`/`gh` error — but **redact any embedded
 credential first**: a raw `git push` error can echo a remote URL like

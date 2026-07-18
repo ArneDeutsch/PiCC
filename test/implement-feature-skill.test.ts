@@ -16,6 +16,7 @@ const SKILLS_DIR = path.resolve(
 );
 const SKILL_DIR = path.join(SKILLS_DIR, "implement-feature");
 const REFERENCES_DIR = path.join(SKILL_DIR, "references");
+const EVALUATE_DIR = path.join(SKILLS_DIR, "evaluate");
 
 const norm = (p: string): string => p.replace(/\\/g, "/");
 
@@ -213,7 +214,7 @@ describe("description-based naming contract", () => {
     const direction = collapsed("references/phase-1-direction.md");
     const creation = collapsed("references/ticket-creation.md");
     const integration = collapsed("references/ticket-integration.md");
-    const handoff = collapsed("references/handoff.md");
+    const handoff = collapsed("references/phase-9-handoff.md");
     expect(direction).toContain("printable ascii, single-line, at most 120 characters");
     expect(direction).toContain("do not directly copy, interpolate, slugify, or mechanically transform raw ticket title/body text");
     expect(creation).toContain('gh issue create --repo <target> --title "<title>" --body-file <path>');
@@ -222,7 +223,7 @@ describe("description-based naming contract", () => {
   });
 
   it("threads the exact branch through maintainer handoff, fork compare, CI, and cleanup", () => {
-    const handoff = collapsed("references/handoff.md");
+    const handoff = collapsed("references/phase-9-handoff.md");
     const fork = collapsed("references/fork.md");
     for (const marker of [
       "git push -u <pushremote> feature/<feature-slug>",
@@ -236,7 +237,7 @@ describe("description-based naming contract", () => {
     expect(handoff).toContain("print the stable copyable pr title `<title>`");
     expect(fork).toContain("git push -u <pushremote> feature/<feature-slug>");
     expect(fork).toContain("<forkowner>:feature/<feature-slug>?expand=1");
-    // The full push-safety gate is single-sourced in handoff.md step 1 — assert it there. fork.md
+    // The full push-safety gate is single-sourced in phase-9-handoff.md step 1 — assert it there. fork.md
     // step 1 collapses to the fork delta (re-fetch via a temporary named remote, the single fork
     // push) plus a pointer to that gate, so the fork side asserts only the pointer and the "nothing
     // is lost" framing that survives the collapse (it also lives in the fork push-failure degrade).
@@ -315,7 +316,7 @@ describe("description-based naming contract", () => {
 
   it("uses pushRemote for resolved maintainer operations and confines origin to the git-only degrade", () => {
     const workspace = collapsed("references/phase-2-workspace.md");
-    const handoff = collapsed("references/handoff.md");
+    const handoff = collapsed("references/phase-9-handoff.md");
     for (const marker of [
       "refs/remotes/<pushremote>/head", "git remote show <pushremote>", "git fetch <pushremote>",
       "<pushremote>/<targetdefault>", "git push -u <pushremote> feature/<feature-slug>",
@@ -578,6 +579,37 @@ describe("incoming-ticket evaluation preflight", () => {
     ]) {
       expect(seen.has(req), `missing cross-link: ${req}`).toBe(true);
     }
+  });
+
+  it("resolves the evaluate skill's back-links into implement-feature (reciprocal of the in-skill resolver)", () => {
+    // The mirror of the resolver above: the existing tests only resolve implement-feature -> evaluate
+    // and the in-skill references dir, so an evaluate/*.md link INTO implement-feature (e.g.
+    // pr-eval.md's `phase-9-handoff.md` pointer) could dangle after a rename with a green suite. Glob
+    // the whole evaluate skill and resolve every `../../implement-feature/references/<file>.md` and
+    // `../../../agents/<file>.md` link on disk, from the containing file's own directory. Scheme-
+    // qualified (http/mailto) and non-`.md` targets stay out of scope, matching the in-skill resolver.
+    const evalFiles = walkFiles(EVALUATE_DIR, (name) => name.endsWith(".md"));
+    expect(evalFiles.length).toBeGreaterThan(0);
+    const linkRe =
+      /\]\((\.\.\/\.\.\/implement-feature\/references\/[A-Za-z0-9_-]+\.md|\.\.\/\.\.\/\.\.\/agents\/[A-Za-z0-9_-]+\.md)\)/g;
+    const seen = new Set<string>();
+    for (const file of evalFiles) {
+      const text = fs.readFileSync(file, "utf8");
+      for (const m of text.matchAll(linkRe)) {
+        const rel = m[1]!;
+        seen.add(rel);
+        expect(
+          fs.existsSync(path.resolve(path.dirname(file), rel)),
+          `${norm(path.relative(EVALUATE_DIR, file))} -> ${rel}`,
+        ).toBe(true);
+      }
+    }
+    // The load-bearing cross-link this task installs the guard for: pr-eval.md points at the renamed
+    // phase-9-handoff.md. If a future rename drops the pr-eval.md repoint, this assertion reddens.
+    expect(
+      seen.has("../../implement-feature/references/phase-9-handoff.md"),
+      "missing back-link: ../../implement-feature/references/phase-9-handoff.md",
+    ).toBe(true);
   });
 });
 
