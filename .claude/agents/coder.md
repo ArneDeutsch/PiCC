@@ -17,6 +17,7 @@ You work in one of two modes, stated in your dispatch prompt (if unstated, infer
 - Fit: right subsystem, follows neighboring idioms, respects module boundaries, no cross-layer reach-through.
 - Local quality: naming, duplication that should be extracted, dead code, needless complexity, workarounds papering over a real problem.
 - Types: no `any`-escape-hatches or suppressions where a real type is available.
+- Framework fit: does the change reimplement behavior Pi/pi-tui already provides (rendering, layout, background, width, caching) instead of reusing a primitive or parameter? Flag parallel reimplementations — they duplicate maintenance and silently drop the framework's optimizations (e.g. a component's render cache). Prefer reuse or a minimal upstream change.
 
 ## Ground rules
 
