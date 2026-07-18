@@ -1,4 +1,5 @@
 import {
+  Box,
   getCapabilities,
   getImageDimensions,
   imageFallback,
@@ -21,11 +22,25 @@ import {
 // `wrapForSelfShell` does that for any tool without editing its renderers: it
 // sets `renderShell:"self"`, wraps the tool's own renderCall/renderResult (or
 // injects a generic fallback that reproduces Pi's createCallFallback /
-// createResultFallback when the tool has none), and reframes the resulting
-// lines — strip the leading/trailing blank lines, keep the 1-column gutter,
-// clamp, and re-apply the state-appropriate background per line. The state/slot
-// decision lives HERE (once), so it can never diverge between a tool's call and
-// result line. The wrapper sits OUTSIDE the individual renderers.
+// createResultFallback when the tool has none), and frames the resulting lines
+// with a REAL pi-tui `Box(paddingX=1, paddingY=0, bgFn)` — the very component
+// Pi's default shell uses, minus the two blank padding lines (`paddingY=0`). We
+// delegate to Box so rows stay
+// compact AND inherit Box's built-in render cache: a settled row re-rendered
+// unchanged returns Box's cached lines without re-running the per-line paint,
+// which is what removes the per-frame CPU spin. The gutter (Box's `leftPad` from
+// `paddingX=1`), the inner content width (`width - 2*paddingX`), and the per-line
+// background (our `bgFn` -> guarded `themedBg`) are all Box's, matching the old
+// paint byte-for-byte. The state/slot decision lives HERE (once), so it can never
+// diverge between a tool's call and result line. The wrapper sits OUTSIDE the
+// individual renderers.
+//
+// Box does NOT strip blank edges and does NOT clamp an over-wide child line, so a
+// tiny persistent adapter child sits between the Box and the inner renderer: it
+// strips leading/trailing blank inner lines and clamps each line to
+// `clampContentWidth(width)` before Box paints, so output stays byte-identical to
+// Pi's default Box row minus the padding (including at degenerate widths 1
+// and 2, where an un-clamped gutter+content would overflow the row).
 //
 // Everything is null-/throw-guarded: `ToolExecutionComponent` calls these
 // renderers from a self-render path that is NOT wrapped in try/catch, so an
@@ -38,26 +53,17 @@ import {
 const GUTTER = 1;
 
 /**
- * The inner content width Pi's default Box lays a row out at: full width minus
- * BOTH gutters (`paddingX=1` on each side → `box.js:57` computes
- * `contentWidth = width - paddingX*2`). We render the inner content at this width
- * so a maximally-wide inner line is NOT truncated at the leading gutter and so
- * bg-filling to `width` leaves Pi's guaranteed right-hand background margin
- * (content <= width-2, +1 gutter <= width-1, fill >= 1). Floored at 1 so a
- * renderer is never handed a zero/negative width at degenerate terminal widths.
- */
-function innerRenderWidth(width: number): number {
-  return Math.max(1, width - 2 * GUTTER);
-}
-
-/**
- * The width reframe CLAMPS a content line to before adding the gutter. Same
- * `width - 2*GUTTER` (both-side padding), but floored at 0 rather than 1: at a
- * degenerate width (1 or 2) the 1-col gutter alone already fills the row, so the
- * clamped content must be 0 cols — otherwise `gutter + content` would exceed
- * `width` and force the final (d) clamp to fire and strip the bg reset. Flooring
- * here keeps `gutter + content <= width` at every width, so (d) stays a true
- * no-op and the painted line always ends within the terminal.
+ * The width the adapter CLAMPS a content line to before Box adds the gutter. Same
+ * `width - 2*GUTTER` as the width Box lays the inner out at (`box.js`
+ * `contentWidth = width - paddingX*2`), but floored at 0 rather than Box's floor
+ * of 1: at a degenerate width (1 or 2) the 1-col gutter alone already fills the
+ * row, so the clamped content must be 0 cols — otherwise `gutter + content` would
+ * exceed `width` and overflow the painted line past the terminal (Box does NOT
+ * truncate an over-wide child line, so the crash-invariant guard lives here).
+ * Flooring at 0 keeps `gutter + content <= width` at every width, so the painted
+ * line always ends within the terminal. This is why the adapter needs the OUTER
+ * width, not the `width-2`-floored-at-1 that Box passes its child: those two
+ * differ precisely at widths 1 and 2.
  */
 function clampContentWidth(width: number): number {
   return Math.max(0, width - 2 * GUTTER);
@@ -129,7 +135,7 @@ export function themedBg(theme: unknown, slot: BgSlot, text: string): string {
 //
 // pi-tui throws an uncaughtException — killing the process — if a rendered line
 // exceeds the terminal, and decides that with visibleWidth() (grapheme +
-// East-Asian-width + tabs). We MUST clamp with the same function so our reframe
+// East-Asian-width + tabs). We MUST clamp with the same function so the adapter
 // agrees exactly with the check pi-tui enforces.
 
 /** A line is blank iff its VISIBLE width (after ANSI strip) is 0 — never `=== ""` (a bg-filled pad line is a non-empty raw string). */
@@ -152,52 +158,12 @@ function clampLine(line: string, width: number): string {
   return visibleWidth(line) > width ? truncateToWidth(line, width, "…") : line;
 }
 
-/**
- * Reframe inner-renderer lines into a de-padded, gutter-kept, background-painted
- * row. The ORDER is load-bearing (all four steps are crash/appearance guards):
- *
- *   a. strip ONLY the leading/trailing blank lines (Pi still prepends its single
- *      plain "" separator in self mode, so we must not add our own);
- *   b. clamp each content line to `clampContentWidth(width)` (`width - 2*GUTTER`)
- *      FIRST — the same width the inner renderer laid the line out at (BOTH-side
- *      padding, exactly Pi's Box). This is what stops a maximally-wide inner line
- *      (one that fills `width` columns) from losing its last column to an ellipsis,
- *      and guarantees room for the right-hand bg margin (an un-clamped width-wide
- *      line + gutter would overflow → pi-tui crash);
- *   c. add the 1-column gutter, then pad to EXACTLY `width` with
- *      `Math.max(0, …)` spaces (a naive negative `repeat` throws RangeError) and
- *      paint the WHOLE line via the guarded themedBg — matching Pi's default Box,
- *      which paints gutter + content + fill so the colored band spans the row;
- *      because content is <= width-2 and the gutter is 1, the fill is >= 1, so the
- *      band carries to the right edge with Pi's >=1-col background margin;
- *   d. a final clamp to `width` as a genuine no-op safety net — it must NOT fire
- *      (step (b) keeps every painted line <= width visible cols); if it ever did it
- *      would slice off the trailing `\x1b[49m` bg reset and bleed the background,
- *      so it exists only to guarantee no line can exceed the width.
- *
- * Empty result: if stripping leaves zero content lines, returns [] so Pi
- * collapses/hides the row (`tool-execution.js:183-184`) rather than showing a
- * lone painted blank.
- */
-export function reframe(lines: string[], width: number, theme: unknown, slot: BgSlot): string[] {
-  const stripped = stripBlankEdges(lines);
-  if (stripped.length === 0) return [];
-  const contentWidth = clampContentWidth(width); // width - 2*GUTTER, floored at 0
-  return stripped.map((raw) => {
-    const clamped = clampLine(raw, contentWidth); // (b) clamp BEFORE bg
-    const guttered = " ".repeat(GUTTER) + clamped; // (c) 1-col gutter
-    const fill = Math.max(0, width - visibleWidth(guttered)); // guard: never negative
-    const painted = themedBg(theme, slot, guttered + " ".repeat(fill));
-    return clampLine(painted, width); // (d) no-op safety net
-  });
-}
-
 // --- generic fallback renderer (renderer-less tools) ---
 
 /**
  * The generic call renderer for a tool with no renderCall — byte-identical to
  * Pi's `createCallFallback` (`tool-execution.js:107`): the bold, toolTitle-colored
- * tool name on one line. reframe adds the gutter + background.
+ * tool name on one line. The Box adds the gutter + background.
  */
 export function genericCallComponent(toolName: string, theme: unknown): Component {
   return {
@@ -332,9 +298,60 @@ type ResultRenderer = (
 /**
  * The component the wrapper returns to Pi. It carries the INNER component under
  * `__inner` so the next render can thread `ctx.lastComponent` back to the inner
- * renderer (see `innerCtxForLastComponent`).
+ * renderer (see `innerCtxForLastComponent`); it also carries the persistent
+ * pi-tui `Box` (`__box`) and its blank-edge adapter (`__adapter`) so the SAME Box
+ * survives across frames and its render cache can actually hit (a fresh Box per
+ * frame would never match its own cache).
  */
-type WrapperComponent = Component & { __inner?: Component };
+type WrapperComponent = Component & {
+  __inner?: Component;
+  __box?: Box;
+  __adapter?: BlankEdgeAdapter;
+};
+
+/**
+ * The single persistent child of the Box. Box neither strips blank edges nor
+ * clamps an over-wide child line, so this adapter does BOTH before Box paints —
+ * the framing's step (a) strip + step (b) clamp:
+ *   - `inner.render(w)` renders at Box's `contentWidth` (`w = max(1, width-2)`),
+ *     the same width the inner saw before;
+ *   - leading/trailing blank inner lines are dropped (Pi still prepends its one
+ *     plain "" separator in self mode, so we must not add our own);
+ *   - each surviving line is clamped to `clampContentWidth(outerWidth)`
+ *     (`max(0, width-2)`), NOT to `w` — the two differ at widths 1 and 2, where
+ *     content must clamp to 0 so `gutter + content` never overflows the row.
+ * `inner` and `outerWidth` are MUTABLE fields updated in place each frame so the
+ * adapter object identity — and therefore `Box.children` — never changes (Box's
+ * `addChild`/`removeChild` invalidate its cache; a field swap does not).
+ *
+ * `invalidate()` satisfies pi-tui's `Component` contract (required by
+ * `Box.addChild`). Nothing invokes it in this design: the Box is not part of Pi's
+ * component tree — our wrapper calls `box.render` directly — so `Box.invalidate`
+ * (which would forward to children) never fires here, and tone/theme changes are
+ * caught by Box's `bgSample` re-sampling, not by invalidation. It is a
+ * type-satisfaction stub that forwards to the inner renderer if it exposes one.
+ */
+type BlankEdgeAdapter = Component & {
+  inner: Component;
+  outerWidth: number;
+  invalidate(): void;
+};
+
+function makeBlankEdgeAdapter(inner: Component): BlankEdgeAdapter {
+  return {
+    inner,
+    outerWidth: 0,
+    render(contentWidth: number): string[] {
+      const clampTo = clampContentWidth(this.outerWidth);
+      return stripBlankEdges(this.inner.render(contentWidth)).map((line) =>
+        clampLine(line, clampTo),
+      );
+    },
+    invalidate(): void {
+      (this.inner as { invalidate?: () => void }).invalidate?.();
+    },
+  };
+}
 
 /**
  * Thread `ctx.lastComponent` for the built-ins' incremental renderers.
@@ -355,17 +372,60 @@ function innerCtxForLastComponent(ctx: RenderCtx): RenderCtx {
   return { ...ctx, lastComponent: prev?.__inner };
 }
 
-/** Build the self-shell wrapper component: stash the inner + reframe on render. */
-function selfShellComponent(inner: Component, theme: unknown, slot: BgSlot): WrapperComponent {
+/**
+ * Build the self-shell wrapper component: frame the inner with a real pi-tui
+ * `Box(paddingX=GUTTER, paddingY=0, bgFn)` (Pi's own row component, minus the
+ * blank padding lines). The Box lays the adapter out at `width - 2*GUTTER`, adds
+ * the 1-col gutter (`leftPad`), pads to `width`, and paints every line via `bgFn`
+ * — byte-identical to Pi's default Box row (minus the blank padding), and with
+ * Box's built-in render cache (an unchanged re-render returns cached lines without
+ * re-running the per-line paint).
+ *
+ * The Box + adapter are REUSED across frames when the previous wrapper is handed
+ * back (`prev`, from `ctx.lastComponent`), because Box's cache only helps if the
+ * SAME Box instance persists. On reuse we swap `adapter.inner` (a field, so
+ * `Box.children` is untouched and the cache is not invalidated) and refresh the
+ * `bgFn` via `setBgFn` (its identity changes each frame but its OUTPUT is stable
+ * for an unchanged state/theme, so Box's bgSample check still matches). This swap
+ * happens at BUILD time, but is safe under Pi's build-then-render lifecycle: only
+ * the wrapper we return here is rendered next, so the mutation targets exactly the
+ * Box that render will use.
+ *
+ * `bgFn` routes through the guarded `themedBg`, so it never throws (the render
+ * loop is not try/catch-wrapped) and a headless/no-theme run degrades to plain
+ * text (bgFn returns its input unpainted).
+ */
+function selfShellComponent(
+  inner: Component,
+  theme: unknown,
+  slot: BgSlot,
+  prev: WrapperComponent | undefined,
+): WrapperComponent {
+  const bgFn = (text: string): string => themedBg(theme, slot, text);
+  let box = prev?.__box;
+  let adapter = prev?.__adapter;
+  if (box && adapter) {
+    adapter.inner = inner; // swap child content WITHOUT touching Box.children
+    box.setBgFn(bgFn); // detected via bgSample, not an invalidation
+  } else {
+    adapter = makeBlankEdgeAdapter(inner);
+    box = new Box(GUTTER, 0, bgFn);
+    box.addChild(adapter);
+  }
+  const persistentBox = box;
+  const persistentAdapter = adapter;
   return {
     // Stash the inner so the NEXT render can pass it back as ctx.lastComponent
-    // (incremental-render threading — see innerCtxForLastComponent).
+    // (incremental-render threading — see innerCtxForLastComponent), plus the Box
+    // + adapter so the SAME Box (and its cache) persists across frames.
     __inner: inner,
+    __box: persistentBox,
+    __adapter: persistentAdapter,
     render(width: number): string[] {
-      // Lay the inner content out at width - 2*GUTTER (Pi's Box both-side padding)
-      // so wrap/layout matches the space the painted line occupies — a maximally-
-      // wide line keeps every column and reframe's clamp is a no-op.
-      return reframe(inner.render(innerRenderWidth(width)), width, theme, slot);
+      // The adapter needs the OUTER width to clamp content (Box only hands its
+      // child `width - 2*GUTTER`); set it before delegating to Box.render.
+      persistentAdapter.outerWidth = width;
+      return persistentBox.render(width);
     },
   };
 }
@@ -378,9 +438,10 @@ function selfShellComponent(inner: Component, theme: unknown, slot: BgSlot): Wra
  *     re-registered built-ins' `create*ToolDefinition` renderers), else a generic
  *     fallback (all the renderer-less Claude-named tools);
  *   - thread `ctx.lastComponent` to the PREVIOUS INNER component so the built-ins'
- *     incremental rendering (diffs, streamed output) survives the wrap;
- *   - reframe the inner lines at render(width) time (width is unavailable
- *     earlier) with the single-tone slot from ctx.
+ *     incremental rendering (diffs, streamed output) survives the wrap, and reuse
+ *     the previous wrapper's persistent Box so its render cache survives too;
+ *   - frame the inner lines with a pi-tui Box at render(width) time (width is
+ *     unavailable earlier) with the single-tone slot from ctx.
  * Every other field — `execute`, `name`, `parameters`, … — passes through
  * unchanged; `result.content` is never mutated (the generic renderer reads a
  * local display string only).
@@ -401,7 +462,8 @@ export function wrapForSelfShell(tool: Record<string, unknown>): Record<string, 
       const inner = innerCall
         ? innerCall(args, theme, innerCtx)
         : genericCallComponent(toolName, theme);
-      return selfShellComponent(inner, theme, slot);
+      const prev = ctx?.lastComponent as WrapperComponent | undefined;
+      return selfShellComponent(inner, theme, slot, prev);
     },
     renderResult(
       result: ResultShape,
@@ -414,7 +476,8 @@ export function wrapForSelfShell(tool: Record<string, unknown>): Record<string, 
       const inner = innerResult
         ? innerResult(result, options, theme, innerCtx)
         : genericResultComponent(result, theme, innerCtx);
-      return selfShellComponent(inner, theme, slot);
+      const prev = ctx?.lastComponent as WrapperComponent | undefined;
+      return selfShellComponent(inner, theme, slot, prev);
     },
   };
 }

@@ -67,7 +67,6 @@ import {
 import {
   bgSlotForCtx,
   genericResultComponent,
-  reframe,
   themedBg,
   wrapForSelfShell,
   type RenderCtx,
@@ -2583,14 +2582,14 @@ describe("self-shell wrapper", () => {
 
   // A slot-ENCODING fake theme. Its `bg` frames text with an OSC slot marker
   // (`ESC ] <slot> BEL`) plus a trailing `ESC[49m` reset — BOTH zero-width under
-  // pi-tui's visibleWidth, exactly like a real `theme.bg` pair — so reframe's
-  // width math (and its no-op (d) net) behaves precisely as in production.
+  // pi-tui's visibleWidth, exactly like a real `theme.bg` pair — so the Box's
+  // width math (and the adapter's clamp) behaves precisely as in production.
   //
   // NOTE (deviation): the spec suggested `bg: (slot, text) => ESC + slot + "|" +
   // text`, but pi-tui's visibleWidth does NOT treat that as an escape — it counts
-  // the slot name as visible columns, which would spuriously trip reframe's final
-  // width clamp and truncate the painted row. The OSC-framed marker below keeps
-  // the slot encoded (the binding requirement) while being genuinely zero-width.
+  // the slot name as visible columns, which would spuriously trip the adapter's
+  // clamp and truncate the painted row. The OSC-framed marker below keeps the
+  // slot encoded (the binding requirement) while being genuinely zero-width.
   const slotMarker = (slot: string) => `${ESC}]${slot}${BEL}`;
   const slotTheme = {
     fg: (_c: string, s: string) => s,
@@ -2611,6 +2610,28 @@ describe("self-shell wrapper", () => {
     const runtime = makeSubagentRuntime([makeAgent()], sdk);
     return createAgentToolDefinition(runtime, { depth: 0 }) as unknown as Record<string, unknown>;
   };
+
+  type Renderer = { render: (w: number) => string[] };
+  // Build a renderer-less-or-own tool that emits fixed result lines, then return
+  // its wrapped renderResult component (own renderers → the Box framing path).
+  const linesTool = (lines: string[]): Record<string, unknown> => ({
+    name: "Demo",
+    renderResult: () => ({ render: () => lines }),
+  });
+  const wrappedResult = (
+    tool: Record<string, unknown>,
+    theme: unknown,
+    ctx: RenderCtx,
+    prev?: Renderer,
+  ): Renderer =>
+    (
+      wrapForSelfShell(tool).renderResult as (
+        r: unknown,
+        o: unknown,
+        t: unknown,
+        c: RenderCtx,
+      ) => Renderer
+    )({ content: [] }, {}, theme, prev ? { ...ctx, lastComponent: prev } : ctx);
 
   it("bgSlotForCtx maps state to the pinned single tone (partial > error > success)", () => {
     expect(bgSlotForCtx({ isPartial: true })).toBe("toolPendingBg");
@@ -2662,8 +2683,16 @@ describe("self-shell wrapper", () => {
     }
   });
 
-  it("reframe strips leading/trailing blanks, keeps interior, paints each line, keeps the 1-col gutter", () => {
-    const out = reframe(["", "alpha", "", "beta", ""], 20, slotTheme, "toolSuccessBg");
+  it("blank-edge adapter: leading/trailing blanks stripped, interior kept, each line painted with the 1-col gutter", () => {
+    // The Box does NOT strip blank edges; the adapter must, before Box paints —
+    // the framing's step (a): strip leading/trailing blanks. An inner renderer that emits a
+    // leading + trailing blank (and an interior blank that IS content) frames to
+    // exactly the 3 non-edge lines.
+    const out = wrappedResult(
+      linesTool(["", "alpha", "", "beta", ""]),
+      slotTheme,
+      { isPartial: false },
+    ).render(20);
     expect(out.length).toBe(3); // alpha, interior blank, beta
     for (const l of out) {
       expect(l).toContain(slotMarker("toolSuccessBg")); // per-line bg
@@ -2681,7 +2710,7 @@ describe("self-shell wrapper", () => {
   it("a maximally-wide inner line is NOT ellipsized and keeps Pi's right-hand bg margin", () => {
     // A tool whose inner renderer FILLS exactly the width it is handed — like Pi's
     // own Box-laid-out content. Before the fix the wrapper handed it the full
-    // terminal width, but reframe preserved only width-GUTTER, so the last content
+    // terminal width, but the framing preserved only width-GUTTER, so the last content
     // column was truncated to a trailing "…" (a real "content changed" regression)
     // and the row could touch the right edge where Pi keeps a >=1-col bg margin.
     let seenWidth = -1;
@@ -2728,13 +2757,17 @@ describe("self-shell wrapper", () => {
     expect(line).toContain(marker); // still painted with the state tone
   });
 
-  it("reframe returns [] when only blank lines remain (empty result collapses the row)", () => {
-    expect(reframe([], 20, slotTheme, "toolSuccessBg")).toEqual([]);
-    expect(reframe(["", "", ""], 20, slotTheme, "toolSuccessBg")).toEqual([]);
+  it("empty result collapses the row: no lines / only blank lines frame to []", () => {
+    // stripBlankEdges leaves nothing → the Box has no child lines → [] so Pi
+    // collapses/hides the row rather than painting a lone blank band.
+    expect(wrappedResult(linesTool([]), slotTheme, { isPartial: false }).render(20)).toEqual([]);
+    expect(
+      wrappedResult(linesTool(["", "", ""]), slotTheme, { isPartial: false }).render(20),
+    ).toEqual([]);
   });
 
   it("no-theme / headless: plain content, no bg marker, no throw", () => {
-    const out = reframe(["hello"], 20, undefined, "toolSuccessBg");
+    const out = wrappedResult(linesTool(["hello"]), undefined, { isPartial: false }).render(20);
     expect(out.length).toBe(1);
     expect(out[0]).toContain("hello");
     expect(out[0]!.includes(ESC)).toBe(false); // no escape / bg marker at all
@@ -2970,5 +3003,52 @@ describe("self-shell wrapper", () => {
     const joined = out.join("\n");
     expect(joined).toContain("file contents here");
     expect(joined.includes(ESC)).toBe(false); // no escape / bg marker at all
+  });
+
+  it("Box render cache is exercised: a settled row re-rendered unchanged returns the cached paint", () => {
+    // The whole point of delegating to pi-tui Box is to inherit its render cache.
+    // Render a wrapped tool once, feed the returned WRAPPER back as
+    // ctx.lastComponent (exactly what ToolExecutionComponent does each frame) so
+    // the SAME Box persists, and render again at the same width with unchanged
+    // child lines. On a cache hit Box returns the SAME lines array by reference
+    // (box.js returns `this.cache.lines`) — the observable proof the per-line
+    // paint was NOT re-run. Asserted purely through Box's own contract, no
+    // internal instrumentation.
+    const tool = linesTool(["settled-line-a", "settled-line-b"]);
+    const ctx: RenderCtx = { isPartial: false };
+    const first = wrappedResult(tool, slotTheme, ctx);
+    const out1 = first.render(40);
+    // Reuse the same Box via lastComponent = the previous wrapper.
+    const second = wrappedResult(tool, slotTheme, ctx, first);
+    const out2 = second.render(40);
+    expect(out2).toBe(out1); // same array reference → Box cache hit (paint skipped)
+    // Sanity: the cached content is the real painted row, not an empty collapse.
+    expect(out1.length).toBe(2);
+    for (const l of out1) expect(l).toContain(slotMarker("toolSuccessBg"));
+
+    // A CHANGED child block (different lines) must NOT return the stale cache.
+    const changed = wrappedResult(linesTool(["settled-line-a", "DIFFERENT"]), slotTheme, ctx, second);
+    const out3 = changed.render(40);
+    expect(out3).not.toBe(out1);
+    expect(out3.join("\n")).toContain("DIFFERENT");
+  });
+
+  it("reused Box repaints on a state/slot transition: a pending row settling to success drops the stale tone", () => {
+    // The reuse-across-frames design relies on box.setBgFn + Box's bgSample
+    // re-sampling to force a repaint when the tone changes (pending→success),
+    // even though the child lines are unchanged. Without it a settled row would
+    // keep painting the stale pending tone. Same Box (threaded via lastComponent),
+    // same content, only the state changes.
+    const tool = linesTool(["row-a", "row-b"]);
+    const first = wrappedResult(tool, slotTheme, { isPartial: true }); // pending
+    const outPending = first.render(40);
+    for (const l of outPending) expect(l).toContain(slotMarker("toolPendingBg"));
+    const second = wrappedResult(tool, slotTheme, { isPartial: false }, first); // reuse Box, settled
+    const outSuccess = second.render(40);
+    expect(outSuccess).not.toBe(outPending); // cache NOT served across the tone change
+    for (const l of outSuccess) {
+      expect(l).toContain(slotMarker("toolSuccessBg")); // new tone painted
+      expect(l).not.toContain(slotMarker("toolPendingBg")); // no stale pending tone
+    }
   });
 });

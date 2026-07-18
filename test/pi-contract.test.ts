@@ -65,7 +65,7 @@ describe("pi 0.80.x API contract", () => {
     // The self-shell de-padding of the built-ins sources renderers from these
     // public Definition factories (create*Tool strips renderers via
     // wrapToolDefinition). A Pi upgrade that moves/renames them — or drops the
-    // renderer shape the wrap reframes — fails loudly here rather than degrading
+    // renderer shape the wrap frames — fails loudly here rather than degrading
     // the built-in rows silently in the terminal.
     const sdk: any = await import("@earendil-works/pi-coding-agent");
     for (const name of [
@@ -79,7 +79,7 @@ describe("pi 0.80.x API contract", () => {
     ]) {
       expect(typeof sdk[name], `missing/renamed ${name}`).toBe("function");
     }
-    // read + edit are the payloads our renderers reframe (truncation + diff) —
+    // read + edit are the payloads our renderers frame (truncation + diff) —
     // pin that both expose renderCall/renderResult on a constructed definition.
     for (const name of ["createReadToolDefinition", "createEditToolDefinition"]) {
       const def = sdk[name]("/cwd");

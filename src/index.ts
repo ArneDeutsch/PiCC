@@ -1098,8 +1098,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // live-cwd execute rebind live in the shared factory so the main session and
       // the subagent path construct byte-identical tools. The factory returns the
       // merged defs RAW; registration routes each through the self-shell seam
-      // (wrapForSelfShell) — which sets renderShell:"self", reframes each row (no
-      // top/bottom padding, colored band re-applied per line), and threads
+      // (wrapForSelfShell) — which sets renderShell:"self", frames each row via a
+      // pi-tui Box (no top/bottom padding, colored band re-applied per line), and threads
       // ctx.lastComponent to the inner component so incremental rendering survives —
       // then registers it with Pi.
       const builtins = buildStockBuiltinTools(sdk as BuiltinToolSdk, cwdState, {

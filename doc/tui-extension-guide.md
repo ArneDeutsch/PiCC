@@ -123,14 +123,15 @@ built-ins). Rather than edit each renderer, a single generic **self-shell wrappe
 (`wrapForSelfShell` in `src/runtime/tool-shell.ts`) is applied at both tool-registration seams. For
 any tool it sets `renderShell: "self"`, strips the leading/trailing blank lines, keeps the 1-column
 gutter, and **re-applies `theme.bg` per line** — self-render drops the tint deliberately, so PiCC
-paints it back byte-exact with Pi's default `Box` (content clamped to `width - 2*gutter`, then
-gutter + width-fill, painted via the theme's own `bg`). Read `tool-shell.ts` before touching this:
-the reframe step order and the throw-guards on `theme.bg` are load-bearing — self-render is *not*
+frames the row with a real pi-tui `Box(paddingY=0)` (content clamped to `width - 2*gutter`, then
+gutter + width-fill, painted via the theme's own `bg`) — byte-exact with Pi's default row, minus the
+padding, and inheriting Box's render cache. Read `tool-shell.ts` before touching this:
+the framing step order (strip/clamp before the Box paints) and the throw-guards on `theme.bg` are load-bearing — self-render is *not*
 wrapped in Pi's try/catch, so an unguarded throw (unknown bg slot, absent theme, a negative
 `repeat`) kills Pi's whole render loop; a headless / no-theme render degrades to plain text.
 
 - **Own tools with a renderer** (Agent / Task / TaskOutput): the wrapper invokes the tool's own
-  `renderCall`/`renderResult`, then reframes the result.
+  `renderCall`/`renderResult`, then frames the result via the Box.
 - **Own tools without a renderer** (all the other Claude-named tools): the wrapper injects a
   **generic fallback** reproducing Pi's own `createCallFallback` (bold tool title) and
   `createResultFallback` (`getTextOutput` result text), so a renderer-less tool de-pads without
@@ -140,7 +141,7 @@ wrapped in Pi's try/catch, so an unguarded throw (unknown bg slot, absent theme,
   renderers are sourced from the public `create*ToolDefinition` factories — the plain `create*Tool`
   factory strips `renderCall`/`renderResult` via `wrapToolDefinition` — while **`execute` stays
   sourced from the plain factory unchanged**, so it is byte-identical (live-cwd re-resolution, bash
-  spawnHook/env, and `read`'s `ctx?.model` non-vision note all preserved). The wrapper reframes
+  spawnHook/env, and `read`'s `ctx?.model` non-vision note all preserved). The wrapper frames
   those renderers through the same seam, so diffs/truncation/highlighting still come from Pi — PiCC
   reimplements none of it.
 - **`ctx.lastComponent` threading is the load-bearing coupling.** `ToolExecutionComponent` caches
