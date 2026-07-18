@@ -453,9 +453,10 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     // SlashCommand is a REAL tool now — retiered to partial and no longer a stub.
     expect(lookupCapability("tool.SlashCommand")?.tier).toBe("partial");
     expect(stubNames.has("SlashCommand")).toBe(false);
-    // NotebookRead is a REAL tool now — retiered to partial and no longer a stub.
-    expect(lookupCapability("tool.NotebookRead")?.tier).toBe("partial");
-    expect(stubNames.has("NotebookRead")).toBe(false);
+    // NotebookRead is RETIRED to a degrade-stub — notebook reading merged into
+    // Read (cell-aware); the name is retained only as a gating token.
+    expect(lookupCapability("tool.NotebookRead")?.tier).toBe("degraded-noop");
+    expect(stubNames.has("NotebookRead")).toBe(true);
     // MultiEdit is a REAL tool now — retiered to full and no longer a stub.
     expect(lookupCapability("tool.MultiEdit")?.tier).toBe("full");
     expect(stubNames.has("MultiEdit")).toBe(false);

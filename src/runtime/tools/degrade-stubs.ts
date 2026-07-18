@@ -11,7 +11,20 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
  * tool — an unknown tool name must not fail a gate or wedge the session.
  */
 
-export function createDegradeStub(toolName: string, note: string): ToolDefinition {
+/**
+ * A `redirect` stub points the model at another tool that DOES the job, so the
+ * generic "Proceed without it." tail (which tells the model to skip the work) is
+ * omitted — its `note` already carries the redirect and states no capability is
+ * lost. Non-redirect stubs keep the tail.
+ */
+export function createDegradeStub(
+  toolName: string,
+  note: string,
+  opts: { redirect?: boolean } = {},
+): ToolDefinition {
+  const text = opts.redirect
+    ? `The ${toolName} tool is not available in PiCC: ${note}.`
+    : `The ${toolName} tool is not available in PiCC: ${note}. Proceed without it.`;
   return defineTool({
     name: toolName,
     label: toolName,
@@ -22,7 +35,7 @@ export function createDegradeStub(toolName: string, note: string): ToolDefinitio
         content: [
           {
             type: "text" as const,
-            text: `The ${toolName} tool is not available in PiCC: ${note}. Proceed without it.`,
+            text,
           },
         ],
         details: { degraded: true },
@@ -31,11 +44,25 @@ export function createDegradeStub(toolName: string, note: string): ToolDefinitio
   });
 }
 
-/** Tool names degraded to predictable no-ops, each with a note for the model. */
-export const DEGRADED_TOOLS: Array<{ name: string; note: string }> = [
+/**
+ * Tool names degraded to predictable no-ops, each with a note for the model.
+ * A `redirect: true` entry omits the generic "proceed without it" tail because
+ * its note points the model at a tool that still does the job (no capability
+ * lost) — see {@link createDegradeStub}.
+ */
+export const DEGRADED_TOOLS: Array<{ name: string; note: string; redirect?: boolean }> = [
+  {
+    name: "NotebookRead",
+    note:
+      "read the notebook with Read instead — Read renders .ipynb cell-aware (source + outputs), " +
+      "so no capability is lost; the NotebookRead name is retained only as a permission-gating token",
+    redirect: true,
+  },
   {
     name: "NotebookEdit",
-    note: "notebook editing is not implemented; edit the .ipynb file as JSON with Read/Edit instead",
+    note:
+      "notebook editing is not implemented; edit the raw .ipynb JSON with Edit " +
+      "(view the raw JSON via Bash, e.g. cat, since Read now renders notebooks cell-aware)",
   },
   {
     name: "AskUserQuestion",

@@ -310,8 +310,8 @@ describe("degrade stubs", () => {
       ]),
     );
     // Every listed stub instantiates and executes without throwing.
-    for (const { name, note } of DEGRADED_TOOLS) {
-      const res = await run(createDegradeStub(name, note), {});
+    for (const { name, note, redirect } of DEGRADED_TOOLS) {
+      const res = await run(createDegradeStub(name, note, { redirect }), {});
       expect(res.text).toContain(`The ${name} tool is not available`);
     }
   });

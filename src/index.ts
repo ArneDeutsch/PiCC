@@ -47,7 +47,6 @@ import {
 import { createWorktreeTools } from "./runtime/tools/worktree-tools.js";
 import { createWebFetchTool, createWebSearchTool } from "./runtime/tools/web-tools.js";
 import { createGrepTool as createClaudeGrepTool, createGlobTool } from "./runtime/tools/search-tools.js";
-import { createNotebookReadTool } from "./runtime/tools/notebook-tools.js";
 import { createMultiEditTool } from "./runtime/tools/multi-edit.js";
 import { createTaskTools } from "./runtime/tools/task-tools.js";
 import {
@@ -615,12 +614,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       createWebSearchTool(get) as unknown as Record<string, unknown>,
       createClaudeGrepTool(get) as unknown as Record<string, unknown>,
       createGlobTool(get) as unknown as Record<string, unknown>,
-      createNotebookReadTool(get) as unknown as Record<string, unknown>,
       createMultiEditTool(get) as unknown as Record<string, unknown>,
       ...(taskBundle.tools as unknown as Record<string, unknown>[]),
       ...createWorktreeTools({ worktrees, cwdState: cwdRef, hookRunner: hookRunnerFacade }),
       ...DEGRADED_TOOLS.map(
-        (d) => createDegradeStub(d.name, d.note) as unknown as Record<string, unknown>,
+        (d) =>
+          createDegradeStub(d.name, d.note, { redirect: d.redirect }) as unknown as Record<
+            string,
+            unknown
+          >,
       ),
     ];
   }
@@ -734,7 +736,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       "Bash",
       "Grep",
       "Glob",
-      "NotebookRead",
       "WebFetch",
       "WebSearch",
       "Agent",

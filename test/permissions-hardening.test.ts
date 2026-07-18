@@ -260,6 +260,74 @@ describe("Read deny also blocks Edit (v2.1.208 parity, deny-only)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 1b. Deny-only NotebookRead→Read cross (notebook reading now flows through Read)
+// ---------------------------------------------------------------------------
+
+describe("deny NotebookRead(glob) protects the notebook read through Read", () => {
+  const engine = denyEngine(["NotebookRead(**/*.ipynb)"]);
+
+  it("deny NotebookRead(glob) blocks a Read call on a matching .ipynb", () => {
+    expect(engine.evaluate(call("Read", { file_path: "nb/secret.ipynb" }))).toEqual({
+      decision: "deny",
+      rule: "NotebookRead(**/*.ipynb)",
+    });
+  });
+
+  it("deny NotebookRead(glob) does NOT block a Read on a non-matching path", () => {
+    expect(engine.evaluate(call("Read", { file_path: "docs/readme.md" })).decision).toBe("default");
+  });
+
+  it("a bare deny: NotebookRead does NOT block unrelated Reads (path-specifier'd only)", () => {
+    expect(
+      denyEngine(["NotebookRead"]).evaluate(call("Read", { file_path: "docs/readme.md" })).decision,
+    ).toBe("default");
+    // Positive control: a bare NotebookRead deny still gates a NotebookRead call
+    // (the name resolves cleanly as a gating token).
+    expect(
+      denyEngine(["NotebookRead"]).evaluate(call("NotebookRead", { notebook_path: "a.ipynb" }))
+        .decision,
+    ).toBe("deny");
+  });
+
+  it("the cross is deny-direction only (never allow/ask/hook-if:)", () => {
+    // Without the deny opt, a NotebookRead rule never matches a Read call.
+    expect(
+      matchesRule("NotebookRead(**/*.ipynb)", call("Read", { file_path: "nb/secret.ipynb" })),
+    ).toBe(false);
+    // With {deny:true} it does.
+    expect(
+      matchesRule("NotebookRead(**/*.ipynb)", call("Read", { file_path: "nb/secret.ipynb" }), {
+        deny: true,
+      }),
+    ).toBe(true);
+    // allow: NotebookRead(...) does NOT allow a Read.
+    const allowEngine = new PermissionEngine(rules({ allow: ["NotebookRead(**/*.ipynb)"] }), {
+      cwd: ROOT,
+    });
+    expect(allowEngine.evaluate(call("Read", { file_path: "nb/secret.ipynb" })).decision).toBe(
+      "default",
+    );
+    // Hook `if: NotebookRead(...)` does NOT fire on a Read call.
+    expect(
+      evaluateIfCondition("NotebookRead(**/*.ipynb)", call("Read", { file_path: "nb/secret.ipynb" })),
+    ).toBe(false);
+  });
+
+  it("cross-platform: a drive-lettered NotebookRead deny blocks a matching Read", () => {
+    expect(
+      denyEngine(["NotebookRead(//c/**/*.ipynb)"]).evaluate(
+        call("Read", { file_path: "C:\\proj\\secret.ipynb" }),
+      ).decision,
+    ).toBe("deny");
+    expect(
+      denyEngine(["NotebookRead(//c/**/*.ipynb)"]).evaluate(
+        call("Read", { file_path: "D:\\proj\\secret.ipynb" }),
+      ).decision,
+    ).toBe("default");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 2. Stable path-rule anchoring (no cwd drift)
 // ---------------------------------------------------------------------------
 

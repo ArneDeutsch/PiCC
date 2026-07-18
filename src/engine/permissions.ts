@@ -115,8 +115,9 @@ const FILE_EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
  * The tools a `Read` rule gates: ALL built-in file-reading tools. Grep/Glob are
  * documented Claude parity ("makes a best-effort attempt to apply `Read` rules
  * to all built-in tools that read files like Grep and Glob"); NotebookRead is
- * included as inferred defense-in-depth (it is a real file reader) — Claude's
- * docs do not name it. `Read` is present for symmetry with
+ * a RETIRED gating-token stub — notebook reads now route through `Read`, but the
+ * name is retained here so `deny/allow: NotebookRead(<glob>)` rules keep gating
+ * the notebook read. `Read` is present for symmetry with
  * {@link FILE_EDIT_TOOLS}; {@link toolNameMatches} already covers Read==Read.
  */
 const FILE_READ_TOOLS = new Set(["Read", "Grep", "Glob", "NotebookRead"]);
@@ -136,6 +137,21 @@ const FILE_READ_TOOLS = new Set(["Read", "Grep", "Glob", "NotebookRead"]);
  * stripping — both divergent from Claude.
  */
 export const READ_DENY_EDIT_TOOLS = new Set(["Edit", "MultiEdit"]);
+
+/**
+ * Reverse of the forward `Read`→read-family expansion, for `NotebookRead` only:
+ * notebook reading now flows through `Read` (the standalone NotebookRead tool is
+ * retired to a gating-token stub), so a `deny: NotebookRead(<glob>)` rule would
+ * silently stop protecting the notebook once the read routes through `Read`. This
+ * deny-only, specifier-scoped cross restores that protection — a path-scoped
+ * `NotebookRead(<glob>)` deny also matches a `Read` call on the same path. It is
+ * the mirror image of {@link READ_DENY_EDIT_TOOLS} (deny-direction only, so it
+ * never leaks into allow/ask/hook-`if:`, and specifier-scoped, so a bare
+ * `deny: NotebookRead` does NOT block all `Read`s). The forward
+ * `ruleToolMatches` expansion is one-directional (`Read`→family only), so this
+ * lives in {@link matchesRule} alongside the Read→Edit cross, not there.
+ */
+const NOTEBOOKREAD_DENY_READ_TOOLS = new Set(["Read"]);
 
 /**
  * Rule-level tool matching: {@link toolNameMatches} plus Claude's documented
@@ -576,6 +592,31 @@ export function matchesRule(
       opts.deny === true &&
       rule.tool === "Read" &&
       READ_DENY_EDIT_TOOLS.has(call.tool) &&
+      rule.specifier !== undefined &&
+      rule.specifier !== ""
+    ) {
+      const input = call.input ?? {};
+      return pathSpecifierMatches(
+        rule.specifier,
+        { ...call, input },
+        { deny: opts.deny, anchor: opts.anchor },
+      );
+    }
+
+    // Deny-only NotebookRead→Read cross: a path-scoped `deny: NotebookRead(<glob>)`
+    // also blocks a `Read` call on a matching notebook, because notebook reading
+    // now routes through `Read` (NotebookRead is retired to a gating-token stub).
+    // Path-specifier'd only — a bare `deny: NotebookRead` does NOT block Reads.
+    // Deny-direction only and one-directional (a `Read` rule never gates via this
+    // clause). Placed BEFORE the `ruleToolMatches` gate, which — being polarity-
+    // agnostic and expanding only `Read`→family, not the reverse — would otherwise
+    // reject the Read call for a NotebookRead rule. Reuses `pathSpecifierMatches`
+    // (which reads notebook_path/file_path interchangeably) for identical glob /
+    // anchor / deny-broadening / drive-normalization / realpath-degrade logic.
+    if (
+      opts.deny === true &&
+      rule.tool === "NotebookRead" &&
+      NOTEBOOKREAD_DENY_READ_TOOLS.has(call.tool) &&
       rule.specifier !== undefined &&
       rule.specifier !== ""
     ) {
