@@ -114,6 +114,14 @@ export interface SubagentRuntimeDeps {
    */
   shellPath?: string;
   /**
+   * Per-text-block token budget above which a single tool result is clipped, fed
+   * into every subagent's guard so the backstop covers subagent/Task/MCP outputs
+   * too. `PiCCConfig` is not in scope at the subagent guard-install site, so the
+   * resolved value (`config.compaction.clipMaxTokens`) is threaded here. OPTIONAL;
+   * when unset the clip simply does not run for subagents.
+   */
+  clipMaxTokens?: number;
+  /**
    * Preferred: builds a PER-DISPATCH context injector with its own fresh injection
    * state. Sharing the parent's injector would let a subagent's file touches consume
    * the orchestrator's one-shot nested-CLAUDE.md/path-rule injections (and vice versa).
@@ -1406,6 +1414,7 @@ export class SubagentRuntime {
         getCwd: () => subCwd.get(),
         contextForTouchedFile: injector,
         label: `subagent:${agent.name}`,
+        ...(this.deps.clipMaxTokens !== undefined ? { clipMaxTokens: this.deps.clipMaxTokens } : {}),
       });
       const extensionFactories: Array<{ name: string; factory: (pi: unknown) => unknown }> = [
         { name: `picc-guard-${agent.name}`, factory: guard as (pi: unknown) => unknown },

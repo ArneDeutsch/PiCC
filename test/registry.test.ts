@@ -224,6 +224,27 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(task?.note).toContain("PiCC UX hardening rather than verified parity");
   });
 
+  // The tool-output clip backstop is a deliberate directional divergence (a HIGH
+  // backstop above Claude's own bounds), not a reproduction of Claude thresholds,
+  // and carries a consumer note about the truncation a strict consumer must expect.
+  it("frames the tool-output-clip backstop as a directional divergence with a consumer note", () => {
+    const clip = lookupCapability("feature.tool-output-clip");
+    expect(clip?.tier).toBe("partial");
+    expect(clip?.note).toContain("DIRECTIONAL DIVERGENCE");
+    expect(clip?.note).toContain("HIGH backstop ABOVE Claude's own bounding");
+    expect(clip?.note).toContain("PiCC HARDENING, NOT Claude parity");
+    // Softened TUI-render claim: the mechanism, not an asserted human observation.
+    expect(clip?.note).toContain("renders the row from the clipped content");
+    // Parity Q5 consumer note: the clip is a TRUNCATION, not just an added marker.
+    expect(clip?.note).toContain("CONSUMER NOTE (parity Q5)");
+    expect(clip?.note).toContain("account for the truncation itself, not merely the added marker");
+    // The 25k-token Read error stays firmly sourced; the Bash ~30k figure is softened.
+    expect(clip?.note).toContain("~25k tokens (VERIFIED)");
+    expect(clip?.note).toContain("less-firmly-sourced figure than the 25k-token Read error");
+    // Grep cross-references the clip: its results can be reshaped with a Grep hint.
+    expect(lookupCapability("tool.Grep")?.note).toContain("feature.tool-output-clip");
+  });
+
   // SendMessage is a distinct partial entry: Claude supports resume/steer behavior,
   // while PiCC defines the acknowledgment wording and retains the documented gaps.
   it("carries a SendMessage entry as partial naming resume identity and its gaps", () => {

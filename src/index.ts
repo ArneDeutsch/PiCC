@@ -849,6 +849,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     settingsEnv: project.settings.env ?? {},
     projectRoot: project.root,
     ...(subagentBashShellPath ? { shellPath: subagentBashShellPath } : {}),
+    // Same oversized-tool-result backstop the main guard runs, threaded into every
+    // subagent's guard (config is not in scope at the subagent install site).
+    clipMaxTokens: config.compaction.clipMaxTokens,
     makeContextInjector,
     // Agent-scoped hooks: per-dispatch runner with the SAME deps as the
     // session's base runner; the runtime multiplexes and discards it. Its
@@ -1150,6 +1153,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     contextForTouchedFile: injectForFile,
     // Active skills' disallowed-tools: enforced while the skill is resident.
     extraDenyRules: () => [...activeSkillDenyRules],
+    // Backstop: clip a single oversized tool result before it enters context.
+    clipMaxTokens: config.compaction.clipMaxTokens,
   })(pi);
 
   // ---------------------------------------------------------------------------
