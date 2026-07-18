@@ -824,7 +824,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // Shared built-in factory inputs: the subagent path builds its seven
     // built-ins from the SAME factory the main session uses, so a subagent's bash
     // subprocess gets `settings.env` + `CLAUDE_PROJECT_DIR` and the Windows Git-Bash
-    // pin, identical to the main session.
+    // pin, identical to the main session. Keep these three values in lockstep with
+    // the main-session factory call below (`buildStockBuiltinTools(...)`): the factory
+    // single-owns tool *logic*, but its *inputs* are wired at both sites, so a new
+    // dep must be added to both or the two paths silently diverge on that input.
     settingsEnv: project.settings.env ?? {},
     projectRoot: project.root,
     ...(subagentBashShellPath ? { shellPath: subagentBashShellPath } : {}),

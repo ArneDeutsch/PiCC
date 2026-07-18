@@ -354,10 +354,12 @@ These are the choices where "close enough" breaks real projects.
   dispatch-local `subCwd`, so a worktree a subagent enters mid-run takes effect for its own tools and
   its permission guard in lockstep.
 
-- **A nested dispatch inherits its parent's cwd.** A subagent that dispatches its own children hands
-  them its live `subCwd` (threaded as the Agent/Task tool's `dispatchCwd` → the child dispatch's
-  `parentCwd`), so a worktree-resident parent's isolation extends to the children it spawns rather
-  than dropping them back at the orchestrator's cwd. Top-level (coordinator) dispatches carry no
+- **A nested dispatch inherits its parent's cwd.** This is a deliberate PiCC coherence *decision*,
+  not an observed Claude Code behavior — whether Claude hands a worktree-resident parent's cwd to its
+  nested children is undocumented, so PiCC chooses the least-surprising option. A subagent that
+  dispatches its own children hands them its live `subCwd` (threaded as the Agent/Task tool's
+  `dispatchCwd` → the child dispatch's `parentCwd`), so a worktree-resident parent's isolation extends
+  to the children it spawns rather than dropping them back at the orchestrator's cwd. Top-level (coordinator) dispatches carry no
   parent cwd and keep the orchestrator's; resume is unaffected (a resumed run reuses its original
   cwd/worktree). Scope of the inheritance: `parentCwd` sets a nested child's *starting* cwd only
   when that child does **not** enter its own worktree (`isolation: none`, or a failed worktree
