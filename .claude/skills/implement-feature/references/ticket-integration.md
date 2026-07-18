@@ -73,7 +73,7 @@ path-independent issue-filing offer, on the ticketless path too. Phases 1, 8 and
    `target` → proceed; the **fork only** → adopt the fork-hosted issue, but warn the user and make the
    PR carry a **bare cross-repo `<fork>#N`** (never a closing keyword: a plain `Closes #N` on the
    upstream PR won't close the fork issue and **would wrongly close `target`'s own same-numbered issue**
-   — [fork.md](fork.md) Phase 9 step 5); a match to **neither** stops and asks. **Generalized:** a
+   — [phase-9-fork-handoff.md](phase-9-fork-handoff.md) Phase 9 step 5); a match to **neither** stops and asks. **Generalized:** a
    closing keyword is permitted only when the resolved issue lives in the same repo the PR targets —
    otherwise strip to a bare/cross-repo reference.
 4. **Slug AND public titles stay independently model-authored ASCII.** Independently author and
@@ -103,7 +103,7 @@ path-independent issue-filing offer, on the ticketless path too. Phases 1, 8 and
    this changes only *where* the push goes, not the allow-list. Moreover, on the fork path the two
    automated *upstream* writes of the routine three — the PR and the ticket comment — are **not made**:
    they are replaced by **paste-ready** delivery (the user opens the PR by hand), so the branch push is
-   the **only** automatic GitHub write on a fork run — see [fork.md](fork.md) (Phase 9 — fork hand-off).
+   the **only** automatic GitHub write on a fork run — see [phase-9-fork-handoff.md](phase-9-fork-handoff.md) (Phase 9 — fork hand-off).
    In one line: **the routine three writes, plus the two explicit per-item `gh issue create` offers —
    create-feature-ticket ([ticket-creation.md](ticket-creation.md), Phase 1) and file-finding (Phase 8
    below) — and nothing else; on a fork the push targets the fork remote and the two upstream writes

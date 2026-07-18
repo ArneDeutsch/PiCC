@@ -141,7 +141,7 @@ surprise:
   comment). I will post nothing *further* to `<target>` automatically."
   **Reconcile the apparent contradiction explicitly:** the feature issue is the *one consented public
   write* on `<target>`; nothing *else* is auto-posted there, and the PR is opened **by the user** via
-  the compare URL (the fork hand-off — [fork.md](fork.md) Phase 9), **never** an auto-PR.
+  the compare URL (the fork hand-off — [phase-9-fork-handoff.md](phase-9-fork-handoff.md) Phase 9), **never** an auto-PR.
 
 ## Phase 3 FILE step (on accept)
 

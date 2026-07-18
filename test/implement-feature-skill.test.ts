@@ -224,7 +224,7 @@ describe("description-based naming contract", () => {
 
   it("threads the exact branch through maintainer handoff, fork compare, CI, and cleanup", () => {
     const handoff = collapsed("references/phase-9-handoff.md");
-    const fork = collapsed("references/fork.md");
+    const forkHandoff = collapsed("references/phase-9-fork-handoff.md");
     for (const marker of [
       "git push -u <pushremote> feature/<feature-slug>",
       "--head feature/<feature-slug>",
@@ -235,19 +235,20 @@ describe("description-based naming contract", () => {
       expect(handoff).toContain(marker);
     }
     expect(handoff).toContain("print the stable copyable pr title `<title>`");
-    expect(fork).toContain("git push -u <pushremote> feature/<feature-slug>");
-    expect(fork).toContain("<forkowner>:feature/<feature-slug>?expand=1");
-    // The full push-safety gate is single-sourced in phase-9-handoff.md step 1 — assert it there. fork.md
-    // step 1 collapses to the fork delta (re-fetch via a temporary named remote, the single fork
-    // push) plus a pointer to that gate, so the fork side asserts only the pointer and the "nothing
-    // is lost" framing that survives the collapse (it also lives in the fork push-failure degrade).
+    expect(forkHandoff).toContain("git push -u <pushremote> feature/<feature-slug>");
+    expect(forkHandoff).toContain("<forkowner>:feature/<feature-slug>?expand=1");
+    // The full push-safety gate is single-sourced in phase-9-handoff.md step 1 — assert it there.
+    // phase-9-fork-handoff.md step 1 collapses to the fork delta (re-fetch via a temporary named
+    // remote, the single fork push) plus a pointer to that gate, so the fork side asserts only the
+    // pointer and the "nothing is lost" framing that survives the collapse (it also lives in the fork
+    // push-failure degrade).
     for (const marker of ["first push", "never force", "claim complete race elimination",
       "nothing is lost", "local branch, worktree, and commits remain intact",
       "nothing new was posted", "new descriptive identity"]) {
       expect(handoff, `maintainer: ${marker}`).toContain(marker);
     }
-    expect(fork).toContain("push-safety gate");
-    expect(fork).toContain("nothing is lost");
+    expect(forkHandoff).toContain("push-safety gate");
+    expect(forkHandoff).toContain("nothing is lost");
   });
 
   it("pins all commit forms and retained GitHub/task-local numbering", () => {
