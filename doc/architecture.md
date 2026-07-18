@@ -349,8 +349,34 @@ These are the choices where "close enough" breaks real projects.
 - **The cwd swap is load-bearing.** A project's own scripts detect worktree vs. main via standard git
   plumbing, which only works if *every* subsequent tool call runs inside the worktree directory. Pi
   has no session-cwd API, so PiCC re-registers the built-in `bash/read/write/edit/grep/find/ls`
-  tools as thin wrappers that rebuild the real tool per call against `CwdState.get()`. Subagents get
-  their cwd natively via `createAgentSession({ cwd })`.
+  tools as thin wrappers that rebuild the real tool per call against `CwdState.get()`. Subagents
+  resolve their cwd by the same mechanism: their built-ins are rebuilt per call against the
+  dispatch-local `subCwd`, so a worktree a subagent enters mid-run takes effect for its own tools and
+  its permission guard in lockstep.
+
+- **A nested dispatch inherits its parent's cwd.** A subagent that dispatches its own children hands
+  them its live `subCwd` (threaded as the Agent/Task tool's `dispatchCwd` → the child dispatch's
+  `parentCwd`), so a worktree-resident parent's isolation extends to the children it spawns rather
+  than dropping them back at the orchestrator's cwd. Top-level (coordinator) dispatches carry no
+  parent cwd and keep the orchestrator's; resume is unaffected (a resumed run reuses its original
+  cwd/worktree). Scope of the inheritance: `parentCwd` sets a nested child's *starting* cwd only
+  when that child does **not** enter its own worktree (`isolation: none`, or a failed worktree
+  entry). A nested child that requests `isolation: worktree` still gets its worktree directory under
+  the orchestrator's `projectRoot` — the `WorktreeManager` is pinned there and `parentCwd` is never
+  threaded into worktree-path resolution — after which the child runs in that worktree. So `parentCwd`
+  governs the isolation-`none` case; the worktree case is already isolated by construction.
+
+- **The builtin bash tool's Git-Bash pin has one owner: the shared factory.** On Windows the factory
+  (`buildStockBuiltinTools`) threads `shellPath` into every builtin bash it constructs, main session
+  and subagent alike, so the model-invoked bash resolves Git Bash from a single source. Two other
+  Git-Bash resolutions survive as separate, intentional backstops for *different* shells, not
+  redundant copies: the main-session `!` user-bash (`createLocalBashOperations`) and the subagent's
+  SDK-internal / `!`-shell path (the settings-manager `shellPath` in `loadRealSdk`). The
+  settings-manager pin does **not** back the factory bash — the factory bash shadows stock bash by
+  name, so the settings manager's stock-bash config never reaches the tool the model calls. The
+  factory's `shellPath` threading is pinned by the win32 shared-factory bash-options unit test; the
+  end-to-end proof that a subagent's bash actually resolves Git Bash on Windows is the real-stack
+  subagent e2e (which runs a real subprocess), not the settings-manager backstop.
 
 - **Verbatim subagent return.** A subagent's final message body is returned exactly as produced — no
   summarizing, no wrapping. The one addition: a **resumable** dispatch appends a clearly-delimited

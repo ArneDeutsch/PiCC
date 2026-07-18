@@ -919,6 +919,54 @@ describe("SubagentRuntime (fake SDK)", () => {
     expect(new Set(names).size).toBe(4);
   });
 
+  it("a nested child starts in the parent subagent's worktree cwd, not the orchestrator's", async () => {
+    // A worktree-resident parent must extend its isolation to the children it
+    // spawns: the nested dispatch begins at the parent's cwd (its subCwd), never
+    // at the orchestrator's process.cwd().
+    const worktreePath = "C:\\proj\\.claude\\worktrees\\parent-wt";
+    const worktrees = {
+      async enter() {
+        return { ok: true, worktreePath, branch: "b", diagnostics: [] };
+      },
+      async exit() {
+        return {};
+      },
+    };
+    const { sdk, created } = fakeSdk({
+      onPrompt: async (text, session) => {
+        const agentTool = session.customTools.find((t) => t.name === "Agent");
+        if (agentTool && text.includes("delegate")) {
+          const res = await agentTool.execute("id", { subagent_type: "inner", prompt: "leaf work" });
+          return `nested:${res.content[0]?.text}`;
+        }
+        return "leaf-done";
+      },
+    });
+    const agents = [
+      makeAgent({ name: "outer", isolation: "worktree" }),
+      makeAgent({ name: "inner" }),
+    ];
+    const runtime: SubagentRuntime = makeSubagentRuntime(agents, sdk, {
+      worktrees,
+      // subagentMaxDepth: allow one level of nesting so the parent can spawn a child.
+      maxDepth: 2,
+      // Mirror index.ts's real wiring: the dispatching subagent's Agent tool carries
+      // dispatchCwd sourced from its own dispatch-local subCwd.
+      customToolsFor: (_a: ClaudeAgent, _g: string[], depth: number, _o: string, _f: boolean, subCwd?: CwdState) =>
+        depth + 1 <= 2 && subCwd
+          ? [createAgentToolDefinition(runtime, { depth, name: "Agent", dispatchCwd: () => subCwd.get() })]
+          : [],
+    });
+    const result = await runtime.dispatch({ subagentType: "outer", prompt: "please delegate", depth: 1 });
+    expect(result.ok).toBe(true);
+    expect(result.finalMessage).toBe("nested:leaf-done");
+    // created[0] = parent session (in its worktree); created[1] = nested child.
+    // The child must be constructed at the parent's worktree cwd, not the orchestrator's.
+    expect(created).toHaveLength(2);
+    expect(created[1]?.cwd).toBe(worktreePath);
+    expect(created[1]?.cwd).not.toBe(process.cwd());
+  }, 10_000);
+
   it("worktree entry failure degrades to the shared cwd with a warning", async () => {
     const worktrees = {
       async enter() {

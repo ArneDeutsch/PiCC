@@ -408,7 +408,16 @@ async function loadRealSdk(): Promise<PiSdk> {
     // source file and writes a brand-new file — the parent transcript is untouched.
     forkSessionManager: (sourcePath: string, cwd: string, sessionDir: string, id: string) =>
       m.SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id }),
-    // shellPath pins subagent bash to Git Bash on Windows (see resolveGitBashPath).
+    // Git-Bash pin — DEGRADE BACKSTOP, not the primary owner. The single owner of
+    // the builtin bash tool's Windows Git-Bash pin is the shared factory
+    // (buildStockBuiltinTools, threaded `shellPath`): that factory bash shadows the
+    // SDK's stock bash BY NAME, so this settings-manager `shellPath` no longer
+    // reaches the tool the model actually calls. It backs only the SDK-INTERNAL /
+    // `!`-shell path (which still resolves through the settings manager). The
+    // factory's `shellPath` threading is covered by the win32 shared-factory
+    // bash-options unit test; the end-to-end proof that subagent bash resolves Git
+    // Bash on Windows is the real-stack subagent e2e. Keep this line as an explicit
+    // backstop for the `!`-shell path, do not delete it.
     inMemorySettingsManager: () =>
       m.SettingsManager.inMemory({
         compaction: { enabled: true },
@@ -707,6 +716,16 @@ export class SubagentRuntime {
      * discipline). Absent for a coordinator dispatch.
      */
     parentAgentId?: string;
+    /**
+     * The dispatching subagent's own working directory (its `subCwd`, i.e. the
+     * worktree it entered). When set, a FRESH dispatch begins here instead of at
+     * the orchestrator's cwd, so a worktree-resident parent's isolation extends to
+     * the children it spawns. Absent for a top-level (coordinator) dispatch, which
+     * keeps the orchestrator cwd. Ignored on resume (a resumed run reuses its
+     * original cwd/worktree). Runtime-threaded from the Agent tool's `dispatchCwd`,
+     * never a tool parameter.
+     */
+    parentCwd?: string;
     /**
      * The Agent tool's model-supplied `description` label, already sanitized
      * at capture; stored set-once on the registry record (the panel's label).
@@ -1236,7 +1255,15 @@ export class SubagentRuntime {
       }
       started = true;
 
-      let cwd = this.deps.getCwd();
+      // A nested dispatch begins at its DISPATCHER's cwd (`parentCwd`): a subagent
+      // that entered a worktree extends that isolation to the children it spawns.
+      // Top-level (coordinator) dispatches carry no `parentCwd` and keep the
+      // orchestrator cwd. Resume overrides this below (original cwd reused). This
+      // seed governs a child that stays put (`isolation: none` or a failed entry);
+      // a child that requests `isolation: worktree` overwrites `cwd` with its own
+      // worktree in the branch below — and that worktree is anchored to the
+      // WorktreeManager's fixed projectRoot, NOT to `parentCwd`.
+      let cwd = opts.parentCwd ?? this.deps.getCwd();
       if (opts.resume) {
         // Resume: reuse the ORIGINAL cwd/worktree exactly — never enter a
         // new worktree (that would branch a fresh, empty checkout and lose the
@@ -2064,6 +2091,16 @@ export function createAgentToolDefinition(
      * for normal (non-fork) subagents. Never sourced from a tool parameter.
      */
     dispatcherIsFork?: boolean;
+    /**
+     * The DISPATCHER's own live working directory. When this Agent/Task tool is
+     * handed to a subagent, this returns that subagent's current cwd (its
+     * dispatch-local `subCwd` — the worktree it may have entered), so a fresh
+     * nested dispatch begins where its parent is working rather than at the
+     * orchestrator's cwd. Read at dispatch time so a mid-run worktree entry is
+     * reflected. Absent for the coordinator instance, whose dispatches keep the
+     * orchestrator cwd. Never sourced from a tool parameter.
+     */
+    dispatchCwd?: () => string;
   },
 ): Record<string, unknown> {
   return {
@@ -2140,6 +2177,11 @@ export function createAgentToolDefinition(
         // for the coordinator) — the same runtime-set channel as ownerAgentId,
         // never a tool parameter.
         parentAgentId: opts.ownerAgentId,
+        // The dispatching subagent's live cwd, resolved NOW (dispatch time) so a
+        // worktree the parent entered mid-run is captured. A fresh nested dispatch
+        // starts here; undefined for a coordinator dispatch (no dispatchCwd), which
+        // keeps the orchestrator cwd.
+        parentCwd: opts.dispatchCwd?.(),
         description,
       };
       const backgroundDisabled = isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS);

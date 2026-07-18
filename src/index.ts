@@ -806,8 +806,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // (above) — and nobody else's — can reach them. `dispatcherIsFork` marks
         // these tools when the dispatcher is a genuine fork, so a nested
         // `subagent_type: "fork"` is refused (a fork can't spawn a fork).
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId, dispatcherIsFork }));
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId, dispatcherIsFork }));
+        // `dispatchCwd` carries the dispatching subagent's OWN live cwd (its
+        // `subCwd` — the worktree it may have entered) so a nested child begins
+        // where its parent is working, not at the orchestrator's cwd. Read at the
+        // moment the child is dispatched, so a worktree the parent enters mid-run
+        // is reflected.
+        const dispatchCwd = () => (subCwd ?? cwdState).get();
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd }));
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd }));
       }
       return tools;
     },
