@@ -61,10 +61,11 @@ import { builtinAgents } from "./claude/agents.js";
 import { loadAgentMemory } from "./claude/memory.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
 import { wrapForSelfShell } from "./runtime/tool-shell.js";
+import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
-import { applyUnicodeSafeProcessEnv, computeSessionScratchDir, unicodeSafeSubprocessEnv } from "./util/env.js";
+import { applyUnicodeSafeProcessEnv, computeSessionScratchDir } from "./util/env.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
 
 /**
@@ -755,6 +756,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     ];
   }
 
+  // Git-Bash pin for the subagent built-in bash tool (Windows), resolved once and
+  // threaded through the deps into the shared factory — same source the main
+  // session uses (resolveGitBashPath is cached).
+  const subagentBashShellPath = resolveGitBashPath();
   const subagentRuntime = new SubagentRuntime({
     getAgents: () => project.agents,
     buildSystemPrompt: buildSubagentSystemPrompt,
@@ -801,8 +806,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // (above) — and nobody else's — can reach them. `dispatcherIsFork` marks
         // these tools when the dispatcher is a genuine fork, so a nested
         // `subagent_type: "fork"` is refused (a fork can't spawn a fork).
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId, dispatcherIsFork }));
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId, dispatcherIsFork }));
+        // `dispatchCwd` carries the dispatching subagent's OWN live cwd (its
+        // `subCwd` — the worktree it may have entered) so a nested child begins
+        // where its parent is working, not at the orchestrator's cwd. Read at the
+        // moment the child is dispatched, so a worktree the parent enters mid-run
+        // is reflected.
+        const dispatchCwd = () => (subCwd ?? cwdState).get();
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd }));
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd }));
       }
       return tools;
     },
@@ -810,6 +821,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     permissionEngine,
     hookRunner: hookRunnerFacade,
     getCwd: () => cwdState.get(),
+    // Shared built-in factory inputs: the subagent path builds its seven
+    // built-ins from the SAME factory the main session uses, so a subagent's bash
+    // subprocess gets `settings.env` + `CLAUDE_PROJECT_DIR` and the Windows Git-Bash
+    // pin, identical to the main session. Keep these three values in lockstep with
+    // the main-session factory call below (`buildStockBuiltinTools(...)`): the factory
+    // single-owns tool *logic*, but its *inputs* are wired at both sites, so a new
+    // dep must be added to both or the two paths silently diverge on that input.
+    settingsEnv: project.settings.env ?? {},
+    projectRoot: project.root,
+    ...(subagentBashShellPath ? { shellPath: subagentBashShellPath } : {}),
     makeContextInjector,
     // Agent-scoped hooks: per-dispatch runner with the SAME deps as the
     // session's base runner; the runtime multiplexes and discards it. Its
@@ -1072,55 +1093,22 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // Pin the shell to real Git Bash on Windows — Pi's default `bash` lookup can
       // land on the System32 WSL stub (WSL_E_DEFAULT_DISTRO_NOT_FOUND without a distro).
       const shellPath = resolveGitBashPath();
-      // Each built-in carries TWO sourcings that must stay separate. `factory`
-      // (create*Tool) is the EXECUTE source — it drives live-cwd re-resolution, the
-      // bash spawnHook/env, Git-Bash pinning, and `read`'s ctx handling (its
-      // non-vision image note).
-      // `defFactory` (create*ToolDefinition) is the RENDERER source — the
-      // create*Tool factory strips renderCall/renderResult via wrapToolDefinition, so
-      // the diffs/truncation/highlighting come from the Definition. Its renderers are
-      // cwd-light (the render ctx supplies cwd), so one instance is pulled at
-      // registration. Both are routed through the self-shell seam (wrapForSelfShell),
-      // which sets renderShell:"self", reframes each row (no top/bottom padding, colored
-      // band re-applied per line), and threads ctx.lastComponent to the inner component
-      // so the built-ins' incremental rendering survives.
-      const bashOptions = {
+      // Both built-in sourcings (execute from create*Tool, renderers from
+      // create*ToolDefinition), the bash spawnHook/env, Git-Bash pinning, and the
+      // live-cwd execute rebind live in the shared factory so the main session and
+      // the subagent path construct byte-identical tools. The factory returns the
+      // merged defs RAW; registration routes each through the self-shell seam
+      // (wrapForSelfShell) — which sets renderShell:"self", reframes each row (no
+      // top/bottom padding, colored band re-applied per line), and threads
+      // ctx.lastComponent to the inner component so incremental rendering survives —
+      // then registers it with Pi.
+      const builtins = buildStockBuiltinTools(sdk as BuiltinToolSdk, cwdState, {
+        settingsEnv: project.settings.env ?? {},
+        projectRoot: project.root,
         ...(shellPath ? { shellPath } : {}),
-        spawnHook: ({ command, cwd, env }: any) => ({
-          command,
-          cwd,
-          env: unicodeSafeSubprocessEnv({
-            ...env,
-            ...project.settings.env,
-            CLAUDE_PROJECT_DIR: project.root,
-          }),
-        }),
-      };
-      const factories: Array<[string, (cwd: string) => any, (cwd: string) => any]> = [
-        ["bash", (c) => sdk.createBashTool(c, bashOptions), (c) => sdk.createBashToolDefinition(c)],
-        ["read", (c) => sdk.createReadTool(c), (c) => sdk.createReadToolDefinition(c)],
-        ["write", (c) => sdk.createWriteTool(c), (c) => sdk.createWriteToolDefinition(c)],
-        ["edit", (c) => sdk.createEditTool(c), (c) => sdk.createEditToolDefinition(c)],
-        ["grep", (c) => sdk.createGrepTool(c), (c) => sdk.createGrepToolDefinition(c)],
-        ["find", (c) => sdk.createFindTool(c), (c) => sdk.createFindToolDefinition(c)],
-        ["ls", (c) => sdk.createLsTool(c), (c) => sdk.createLsToolDefinition(c)],
-      ];
-      for (const [name, factory, defFactory] of factories) {
-        const template = factory(cwdState.get());
-        // Renderers only (execute stays sourced from `factory` below, byte-identical).
-        const def = defFactory(cwdState.get());
-        pi.registerTool(
-          wrapForSelfShell({
-            ...template,
-            name,
-            renderCall: def.renderCall,
-            renderResult: def.renderResult,
-            async execute(id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) {
-              const live = factory(cwdState.get());
-              return live.execute(id, params, signal, onUpdate, ctx);
-            },
-          }),
-        );
+      });
+      for (const { def } of builtins) {
+        pi.registerTool(wrapForSelfShell(def));
       }
       // `!` user-bash commands also get the pinned Git Bash (and the effective cwd).
       if (shellPath && typeof sdk.createLocalBashOperations === "function") {

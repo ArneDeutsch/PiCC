@@ -53,8 +53,13 @@ At extension load we re-register all built-in tools with wrappers that build the
 per-call via `create*Tool(cwdState.effective, …)` and delegate. `EnterWorktree` mutates
 `cwdState.effective`; `ExitWorktree` restores. Relative paths and bash cwd then resolve inside
 the worktree, which is what project preflight scripts probe. `ctx.cwd` (Pi's own value) remains
-the launch dir; our wrappers are the single source of truth for tool execution. Subagents get
-their worktree cwd natively via `createAgentSession({ cwd })`.
+the launch dir; our wrappers are the single source of truth for tool execution. Subagents build
+the **same** built-in tools from the shared factory (`buildStockBuiltinTools`) against their own
+dispatch-local `CwdState` (`subCwd`); each built-in's `execute` rebinds per call via
+`subCwd.get()`, so after a subagent's own `EnterWorktree` its built-ins, custom tools, and
+permission guard (`getCwd: () => subCwd.get()`) all re-resolve to the new worktree cwd in
+lockstep. `createAgentSession({ cwd })` only fixes the *initial* directory; the live worktree
+swap flows through `subCwd`, exactly as the main session's swap flows through `cwdState`.
 
 ### 3.2 Tool-name mapping (Claude ⇄ Pi)
 Claude artifacts name tools `Read`, `Write`, `Edit`, `Bash`, `Grep`, `Glob`, `WebFetch`,

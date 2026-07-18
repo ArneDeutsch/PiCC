@@ -29,7 +29,15 @@ export function toClaudeToolName(piName: string): string {
   return PI_TO_CLAUDE[piName] ?? piName;
 }
 
-/** Pi built-in names granted by a list of Claude tool names (unknown names pass through). */
+/**
+ * Pi built-in names granted by a list of Claude tool names (unknown names pass through).
+ *
+ * This is an allowlist NAME-map only — it decides WHICH built-ins a session may use.
+ * The built-in IMPLEMENTATIONS come from the shared factory
+ * (`buildStockBuiltinTools`); the main session and the subagent path both filter the
+ * factory's output by membership in this set (`Glob → [find, ls]` fan-out included),
+ * so restriction is the only permitted difference between the two paths.
+ */
 export function claudeToolsToPiBuiltins(claudeNames: string[]): string[] {
   const out = new Set<string>();
   for (const name of claudeNames) {
