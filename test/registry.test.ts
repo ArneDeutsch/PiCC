@@ -430,22 +430,32 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   });
 
   // tool.Read stays full for its text/image/notebook core, but the note must
-  // disclose the vision-gate exception, the byte-based (not extension-based)
-  // classification, that the image-FILE path is inherited from base Pi, the
-  // Claude-style binary error, and cross-reference the PDF gap to its own entry.
-  it("describes Read's notebook/image/binary behavior at full, vision-gated, byte-based, PDF cross-referenced", () => {
+  // disclose the vision-gate exception, that the image-FILE path is inherited
+  // from base Pi, the Claude-style binary error, and cross-reference the PDF gap
+  // to its own entry. Classification truthfulness: IMAGE and BINARY detection is
+  // byte-based (magic bytes), but NOTEBOOK routing is keyed on the .ipynb
+  // extension (parity with Claude's merged Read), not byte-based — the note must
+  // scope the byte-based claim to image/binary and call the notebook path
+  // extension-keyed.
+  it("describes Read's notebook/image/binary behavior at full, vision-gated, byte-based(image/binary)/extension-keyed(notebook), PDF cross-referenced", () => {
     const read = lookupCapability("tool.Read");
     expect(read?.tier).toBe("full");
     expect(read?.note).toContain("CELL-AWARE");
     expect(read?.note).toContain("image content block");
     expect(read?.note).toContain("vision-gate exception");
     expect(read?.note).toContain("INHERITED from base Pi");
-    expect(read?.note).toContain("BYTE-BASED");
+    // Byte-based classification is scoped to IMAGE and BINARY only...
+    expect(read?.note).toContain("IMAGE and BINARY classification is BYTE-BASED");
     expect(read?.note).toContain("not extension-based");
+    // ...while notebook reads are keyed on the .ipynb extension (Claude parity).
+    expect(read?.note).toContain(".ipynb extension");
+    expect(read?.note.toLowerCase()).toContain("parity");
     expect(read?.note).toContain("Claude-style binary error");
-    // The PDF gap is discoverable via its own entry, not hidden inside "full".
+    // The PDF gap is discoverable via its own entry, not hidden inside "full",
+    // and is NOT claimed to be named by /doctor.
     expect(read?.note).toContain("feature.read.pdf");
     expect(read?.note).toContain("feature.read.images");
+    expect(read?.note).not.toContain("/doctor flags");
   });
 
   // The image-ingestion entry is a single `partial` entry: full-on-vision /
@@ -464,7 +474,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   });
 
   // PDF is disclosed as BELOW the Claude baseline through a discoverable
-  // not-supported entry, so /doctor flags it rather than Read hiding it.
+  // not-supported entry (runtime binary error + support-matrix table), rather
+  // than Read hiding it inside its full tier.
   it("carries a not-supported PDF entry disclosing it is below the Claude baseline", () => {
     const pdf = lookupCapability("feature.read.pdf");
     expect(pdf, "feature.read.pdf must exist").toBeDefined();

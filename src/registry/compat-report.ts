@@ -17,7 +17,7 @@ import type {
 } from "../types.js";
 import { SUPPORTED_HOOK_EVENTS } from "../types.js";
 import { loadPluginHooks, type InstalledPlugin } from "../claude/plugins.js";
-import { modelSupportsImages } from "../runtime/image-ingest.js";
+import { modelSupportsImages } from "../util/model.js";
 import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 import {
   CAPABILITY_REGISTRY,
@@ -324,7 +324,7 @@ function groupByCapability(findings: CompatFinding[]): Array<{
 // This line is derived from the ACTIVE model's input modalities (via
 // `modelSupportsImages`), NOT from the static capability registry and NOT from
 // the terminal's render capability. It tells a user whether their model can
-// actually see image inputs (image files, notebook image outputs), so a
+// actually see image inputs (image files, pasted/dropped images, notebook image outputs), so a
 // non-vision GPT/Codex user is never silently misled into thinking a pasted
 // screenshot or notebook plot reached the model.
 // ---------------------------------------------------------------------------
@@ -359,15 +359,15 @@ function activeModelVisionLine(model: unknown): string {
   if (id === undefined || !modelHasVisionAxis(model)) {
     return (
       `Active model: ${label} — vision: unknown. If it is not vision-capable, image inputs ` +
-      "(image files, notebook image outputs) are sent as text placeholders, not seen by the " +
+      "(image files, pasted/dropped images, notebook image outputs) are sent as text placeholders, not seen by the " +
       "model; use a vision-capable model to have images seen."
     );
   }
   if (modelSupportsImages(model)) {
-    return `Active model: ${label} — vision: yes. Image inputs (image files, notebook image outputs) are delivered to the model as images.`;
+    return `Active model: ${label} — vision: yes. Image inputs (image files, pasted/dropped images, notebook image outputs) are delivered to the model as images.`;
   }
   return (
-    `Active model: ${label} — vision: no. Image inputs (image files, notebook image outputs) are ` +
+    `Active model: ${label} — vision: no. Image inputs (image files, pasted/dropped images, notebook image outputs) are ` +
     "sent as text placeholders, not seen by the model; use a vision-capable model to have images seen."
   );
 }
@@ -389,7 +389,7 @@ function nonVisionStartupWarning(model: unknown): string | undefined {
   if (modelSupportsImages(model)) return undefined;
   return (
     `Active model ${id} is not vision-capable — images sent as text; use a vision-capable model.\n` +
-    "Image inputs (image files, notebook image outputs) are sent as text placeholders, not seen by the model."
+    "Image inputs (image files, pasted/dropped images, notebook image outputs) are sent as text placeholders, not seen by the model."
   );
 }
 

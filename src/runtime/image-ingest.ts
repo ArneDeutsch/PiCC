@@ -1,5 +1,10 @@
 import type { ImageContent } from "@earendil-works/pi-ai";
 
+// The pure vision predicate lives in the lowest shared layer (util/) so the
+// registry can consume it without a registry→runtime import. Re-exported here for
+// call-site convenience; util/model.ts holds the canonical definition.
+export { modelSupportsImages } from "../util/model.js";
+
 // ---------------------------------------------------------------------------
 // Shared image / binary / vision primitives. This module is PURE (no session,
 // no Pi object, no I/O beyond the buffers a caller hands it) and is the single
@@ -230,18 +235,9 @@ export function isBinaryBuffer(buffer: Buffer): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Model-vision predicate + non-vision note.
+// Non-vision note. (The `modelSupportsImages` predicate now lives in
+// ../util/model.js and is re-exported at the top of this module.)
 // ---------------------------------------------------------------------------
-
-/**
- * True iff the model's input modalities include `"image"`. Tolerant of a
- * missing/opaque model (defaults to `false`) — mirrors the condition Pi's
- * `getNonVisionImageNote` keys on (`model.input.includes("image")`).
- */
-export function modelSupportsImages(model: unknown): boolean {
-  const input = (model as { input?: unknown } | null | undefined)?.input;
-  return Array.isArray(input) && input.includes("image");
-}
 
 /**
  * The reproduced Pi non-vision note. Returns the wording so callers use it

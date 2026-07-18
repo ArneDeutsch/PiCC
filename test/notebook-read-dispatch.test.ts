@@ -25,6 +25,7 @@ let dir: string;
 let pi: FakePi;
 let h: FakeSdkHandle;
 const originalCwd = process.cwd();
+const originalUserDir = process.env.PICC_CLAUDE_USER_DIR;
 
 beforeAll(async () => {
   dir = materializeFixture("full-surface");
@@ -45,6 +46,8 @@ beforeAll(async () => {
 
 afterAll(() => {
   process.chdir(originalCwd);
+  if (originalUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+  else process.env.PICC_CLAUDE_USER_DIR = originalUserDir;
   cleanupFixture(dir);
 });
 

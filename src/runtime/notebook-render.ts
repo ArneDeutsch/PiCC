@@ -6,10 +6,10 @@ import {
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import {
   SUPPORTED_IMAGE_MIMES,
-  modelSupportsImages,
   nonVisionImageNote,
   toImageContent,
 } from "./image-ingest.js";
+import { modelSupportsImages } from "../util/model.js";
 
 /**
  * Cell-aware Jupyter `.ipynb` renderer. Parses an nbformat v4 notebook and

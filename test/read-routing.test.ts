@@ -156,6 +156,12 @@ describe("Read routing (shared factory + real Pi read)", () => {
     fs.writeFileSync(path.join(dir, "pic.png"), makePng(8, 8));
     fs.writeFileSync(path.join(dir, "pic.bmp"), makeBmp(8, 8));
     fs.writeFileSync(path.join(dir, "plain.txt"), "hello world\nsecond line\n");
+    // SVG is XML, not raster: sniffImageMime → null AND isBinaryBuffer → false,
+    // so it must fall through to Pi's text read, never the binary error.
+    fs.writeFileSync(
+      path.join(dir, "vector.svg"),
+      '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>\n',
+    );
 
     const tools = buildStockBuiltinTools(piSdk as unknown as BuiltinToolSdk, new CwdState(dir), {
       settingsEnv: {},
@@ -247,6 +253,18 @@ describe("Read routing (shared factory + real Pi read)", () => {
     const res = await run({ path: "pic.bmp" }, VISION_CTX);
     expect(hasImageBlock(res)).toBe(true);
     expect(joinText(res).startsWith(BINARY_READ_ERROR)).toBe(false);
+  });
+
+  it("delegates an .svg file to Pi's text read, NOT the binary error", async () => {
+    const res = await run({ path: "vector.svg" }, NONVISION_CTX);
+    const text = joinText(res);
+    // SVG sniffs to null (excluded from the raster set) and is not binary (XML
+    // text), so it falls through to Pi's read as text — never the binary error,
+    // never an image block.
+    expect(text.startsWith(BINARY_READ_ERROR)).toBe(false);
+    expect(hasImageBlock(res)).toBe(false);
+    expect(text).toContain("<svg");
+    expect(text).toContain("<rect");
   });
 
   it("delegates a plain-text file to Pi's read unchanged", async () => {
