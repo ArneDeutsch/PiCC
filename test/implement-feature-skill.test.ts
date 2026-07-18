@@ -798,3 +798,37 @@ describe("fail-closed floor pointer on every write-site reference", () => {
     });
   }
 });
+
+describe("implementer standing rules — incremental logs and OS-temp scratch (#102)", () => {
+  // The Phase-7 standing rules are duplicated: the coordinator relays them from
+  // references/phase-7-implementation.md, and the implementer agent carries its own mirror in
+  // .claude/agents/implementer.md. Both copies must require (a) writing the execution log to disk
+  // incrementally as work proceeds — protecting the on-disk log a resume reads as the sole record
+  // of a commit-less task's completion — and (b) keeping scratch/temp files in the OS temp dir,
+  // never inside the worktree. Loose, whitespace-collapsed, case-insensitive markers.
+  const collapse = (p: string): string =>
+    fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
+  const AGENTS_DIR = path.resolve(SKILLS_DIR, "..", "agents");
+  const PHASE_7_PATH = path.join(REFERENCES_DIR, "phase-7-implementation.md");
+  const IMPLEMENTER_PATH = path.join(AGENTS_DIR, "implementer.md");
+
+  it("phase-7-implementation.md requires an incremental on-disk log and OS-temp-only scratch", () => {
+    const body = collapse(PHASE_7_PATH);
+    // Incremental-log marker: "brief bullets while working" alone existed before; the on-disk
+    // incremental requirement is genuinely new.
+    expect(body).toContain("incrementally as work proceeds");
+    expect(body).toContain("append as you go");
+    // OS-temp-scratch marker: keyed on the distinctive implementer-scratch wording, NOT the loose
+    // "outside the worktree" that step 6's pre-existing `--body-file` clause already carries.
+    expect(body).toContain("scratch/temp files");
+    expect(body).toContain("never inside the worktree");
+  });
+
+  it("implementer.md mirrors the incremental on-disk log and OS-temp-only scratch rules", () => {
+    const body = collapse(IMPLEMENTER_PATH);
+    expect(body).toContain("incrementally as work proceeds");
+    expect(body).toContain("append as you go");
+    expect(body).toContain("scratch/temp files");
+    expect(body).toContain("never inside the worktree");
+  });
+});

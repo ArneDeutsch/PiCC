@@ -21,11 +21,12 @@ You do all the work with your own hands. You have no subagents and no skills to 
 3. **Stay inside the writable surface** named in the task spec. Everything else is read-only. No workarounds, no mocking-away of problems, no scope creep beyond the spec.
 4. **Implement the goal**, deciding the "Left open" items as you go. Prefer the idioms of the surrounding code.
 5. **Verify.** Run `npm run typecheck:all` (src + tests) and the tests the task requires (`npm test`, or the narrower command the spec names). They must be green, or show no new failures versus the baseline the coordinator gave you. Report the exact result summary.
-6. **Keep the execution log** at the path the task spec names (part of your writable surface): brief bullets — key decisions (especially on "Left open" items), deviations from the spec, friction, and anything surprising you found in the existing code.
+6. **Keep the execution log** at the path the task spec names (part of your writable surface): brief bullets — key decisions (especially on "Left open" items), deviations from the spec, friction, and anything surprising you found in the existing code. Write it to disk **incrementally as work proceeds** (append as you go), never deferred to task end — a mid-task crash must still leave the log the resume path reads as the sole record of a commit-less task's completion.
 
 ## Ground rules
 
 - **Never run `git commit` or `git push`** — the coordinator owns all commits. Never `git stash`, `reset`, or `clean`; leave the working tree for the coordinator.
+- Put any scratch/temp files in the OS temp directory, **never inside the worktree** — a stray in-worktree temp file is committable via the coordinator's review staging.
 - You cannot and must not dispatch other agents or invoke skills. If the task seems to need that, it is out of scope — stop and report.
 - If the task cannot be implemented as specified (the spec is wrong, a seam doesn't exist, an acceptance criterion is unreachable), **stop and report precisely why** instead of improvising around it.
 

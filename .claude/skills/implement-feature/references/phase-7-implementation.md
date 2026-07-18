@@ -9,7 +9,8 @@ For each task, in planned order:
    - Stay inside the writable surface. No workarounds, no mocking-away of problems, no scope creep.
    - Never run `git commit` or `git push` — the coordinator owns all commits.
    - `npm run typecheck` and `npm test` must be green (or no new failures vs. the recorded baseline).
-   - Keep an execution log at `doc/plan/<feature-slug>/log/t<task-number>.md` (always part of the writable surface): brief bullets while working — key decisions (especially on "Left open" items), deviations from the spec, friction, anything surprising found in the existing code.
+   - Keep an execution log at `doc/plan/<feature-slug>/log/t<task-number>.md` (always part of the writable surface): brief bullets while working — key decisions (especially on "Left open" items), deviations from the spec, friction, anything surprising found in the existing code. Write it to disk **incrementally as work proceeds** (append as you go), never deferred to task end — a mid-task crash must still leave the log the resume path reads as the sole record of a commit-less task's completion.
+   - Put any scratch/temp files in the OS temp directory, **never inside the worktree** — a stray in-worktree temp file is committable via the coordinator's review staging.
    - If the task cannot be implemented as specified, stop and report precisely why instead of improvising.
 
    It reports what it did, test results, and any deviations. Fix subagents get the same rules plus the accepted findings, and append to the same log.
