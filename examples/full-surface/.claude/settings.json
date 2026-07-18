@@ -12,7 +12,8 @@
     "deny": [
       "Read(secrets/**)",
       "Bash(curl *)",
-      "WebFetch(domain:evil.example.com)"
+      "WebFetch(domain:evil.example.com)",
+      "Write(.claude/worktrees/midrun-net/no-write.txt)"
     ],
     "ask": ["Bash(git push *)"],
     "defaultMode": "acceptEdits"

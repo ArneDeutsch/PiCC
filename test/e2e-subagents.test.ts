@@ -25,6 +25,20 @@ import { RECORD_EXPAND_HINT, RECORD_FORK_MARKER } from "../src/runtime/subagent-
 const { runPi, cleanup } = createE2ELive();
 afterEach(cleanup);
 
+/** Canonicalize a path for cross-form comparison (backslashes, casing, trailing slash). */
+function normPath(p: string): string {
+  return path.resolve(p).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/** First capture group of `re` across any request's tool-result text, or undefined. */
+function firstGroup(requests: CapturedRequest[], re: RegExp): string | undefined {
+  for (const request of requests) {
+    const m = re.exec(toolResultText(request));
+    if (m?.[1] !== undefined) return m[1];
+  }
+  return undefined;
+}
+
 describe.skipIf(cliMissing)(
   "e2e subagents: real Pi CLI + PiCC extension + mock OpenAI model",
   () => {
@@ -151,6 +165,167 @@ describe.skipIf(cliMissing)(
         // The subagent's final message came back to the orchestrator verbatim.
         const done = result.requests.some((r) => toolResultText(r).includes("DONE-ISO"));
         expect(done, "parent tool result must contain DONE-ISO").toBe(true);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario: worktree-isolated subagent bash sees settings.env + CLAUDE_PROJECT_DIR ---
+    // Proves the REAL shared bash factory honors its spawn env hook inside a real
+    // subagent subprocess: a settings.env value reaches the subagent shell, and the
+    // built-in CLAUDE_PROJECT_DIR points at the MAIN checkout — not the agent's own
+    // isolation worktree (the parity semantic).
+    it.skipIf(!BASH_AVAILABLE)(
+      "delivers settings.env and CLAUDE_PROJECT_DIR (the project root, not the worktree) to a worktree-isolated subagent's bash",
+      async () => {
+        const result = await runPi({
+          fixture: "full-surface",
+          script: [
+            // 0) orchestrator dispatches the worktree-isolated agent (foreground)
+            {
+              toolCalls: [
+                {
+                  name: "Agent",
+                  args: {
+                    subagent_type: "isolated-worker",
+                    prompt: "print the project env",
+                    run_in_background: false,
+                  },
+                },
+              ],
+            },
+            // 1) the subagent echoes the settings.env var and the built-in project dir
+            {
+              toolCalls: [
+                {
+                  name: "bash",
+                  args: {
+                    command:
+                      'echo "FSVAR=[$FS_FIXTURE]"; echo "PROJDIR=[$CLAUDE_PROJECT_DIR]"; echo "CWD=[$(pwd)]"',
+                  },
+                },
+              ],
+            },
+            // 2) the subagent's final answer
+            { text: "ENV-PROBE-DONE" },
+            // 3) orchestrator's follow-up
+            { text: "env verified" },
+          ],
+          prompt: "have isolated-worker print the project env",
+        });
+
+        expect(result.code).toBe(0);
+
+        // settings.env (FS_FIXTURE) reached the subagent shell.
+        const fsVarSeen = result.requests.some((r) =>
+          /FSVAR=\[full-surface\]/.test(toolResultText(r)),
+        );
+        expect(fsVarSeen, "subagent bash must see settings.env FS_FIXTURE").toBe(true);
+
+        // Self-containment: the discriminator below (PROJDIR==root, not the worktree)
+        // only bites if the agent's bash really runs in a worktree. Assert cwd != root
+        // so a silent isolation degrade can't make PROJDIR==root pass vacuously.
+        const bashCwd = firstGroup(result.requests, /CWD=\[([^\]]*)\]/);
+        expect(bashCwd, "subagent bash must report its cwd").toBeDefined();
+        expect(bashCwd!.replace(/\\/g, "/")).toContain("worktrees");
+
+        // CLAUDE_PROJECT_DIR reached the subagent shell and points at the main
+        // checkout, NOT the agent's isolation worktree.
+        const projDir = firstGroup(result.requests, /PROJDIR=\[([^\]]*)\]/);
+        expect(projDir, "subagent bash must see CLAUDE_PROJECT_DIR").toBeDefined();
+        expect(normPath(projDir!)).toBe(normPath(result.fixture));
+        expect(projDir!.replace(/\\/g, "/")).not.toContain("worktrees");
+
+        // The subagent's final message came back to the orchestrator verbatim.
+        expect(result.requests.some((r) => toolResultText(r).includes("ENV-PROBE-DONE"))).toBe(true);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario: mid-run EnterWorktree — builtins and the deny guard follow the new cwd ---
+    // A non-isolation subagent enters a worktree AS A TOOL CALL mid-run, then its
+    // relative-path write and bash pwd act in the NEW worktree while CLAUDE_PROJECT_DIR
+    // stays the project root. A deny rule scoped to a path inside that worktree is
+    // enforced by the guard against the same (worktree) cwd the built-in write uses —
+    // proving guard/built-in cwd agreement across the real Pi stack.
+    it.skipIf(!BASH_AVAILABLE)(
+      "keeps a subagent's built-ins and deny guard in lockstep with a worktree it enters mid-run",
+      async () => {
+        const worktreeName = "midrun-net"; // deterministic → .claude/worktrees/midrun-net
+        const result = await runPi({
+          fixture: "full-surface",
+          script: [
+            // 0) orchestrator dispatches the non-isolation worktree-runner (foreground)
+            {
+              toolCalls: [
+                {
+                  name: "Agent",
+                  args: {
+                    subagent_type: "midrun-worktree-runner",
+                    prompt: "enter a worktree and work inside it",
+                    run_in_background: false,
+                  },
+                },
+              ],
+            },
+            // 1) the subagent enters a fresh worktree by a deterministic name
+            { toolCalls: [{ name: "EnterWorktree", args: { name: worktreeName } }] },
+            // 2) bash pwd + project dir, evaluated from inside the new worktree
+            {
+              toolCalls: [
+                {
+                  name: "bash",
+                  args: { command: 'echo "CWD=[$(pwd)]"; echo "PROJDIR=[$CLAUDE_PROJECT_DIR]"' },
+                },
+              ],
+            },
+            // 3) an allowed relative-path write lands in the new worktree
+            { toolCalls: [{ name: "write", args: { path: "landed.txt", content: "MIDRUN-LANDED" } }] },
+            // 4) a write to the worktree-scoped denied path — the guard must block it
+            {
+              toolCalls: [{ name: "write", args: { path: "no-write.txt", content: "SHOULD-NOT-LAND" } }],
+            },
+            // 5) the subagent's final answer
+            { text: "MIDRUN-DONE" },
+            // 6) orchestrator's follow-up
+            { text: "midrun verified" },
+          ],
+          prompt: "have midrun-worktree-runner enter a worktree and work inside it",
+        });
+
+        expect(result.code).toBe(0);
+
+        const worktreeDir = path.join(result.fixture, ".claude", "worktrees", worktreeName);
+
+        // The allowed relative write landed INSIDE the mid-run worktree, not the main tree.
+        const landed = path.join(worktreeDir, "landed.txt");
+        expect(fs.existsSync(landed), `landed.txt must exist in ${worktreeDir}`).toBe(true);
+        expect(fs.readFileSync(landed, "utf8")).toContain("MIDRUN-LANDED");
+        expect(fs.existsSync(path.join(result.fixture, "landed.txt"))).toBe(false);
+
+        // bash pwd ran inside the new worktree, and CLAUDE_PROJECT_DIR still points
+        // at the project root — not the worktree the subagent just entered.
+        const cwdSeen = result.requests.some((r) =>
+          /CWD=\[[^\]]*midrun-net[^\]]*\]/.test(toolResultText(r)),
+        );
+        expect(cwdSeen, "subagent bash pwd must run inside the mid-run worktree").toBe(true);
+        const projDir = firstGroup(result.requests, /PROJDIR=\[([^\]]*)\]/);
+        expect(projDir, "subagent bash must see CLAUDE_PROJECT_DIR inside the worktree").toBeDefined();
+        expect(normPath(projDir!)).toBe(normPath(result.fixture));
+        expect(projDir!.replace(/\\/g, "/")).not.toContain("worktrees");
+
+        // Guard/built-in agreement. The built-in-follows-cwd half is pinned by the
+        // `landed.txt` assertion above (pre-fix it would have landed at the construction
+        // root, not the worktree). This deny assertion pins the complementary direction:
+        // a worktree-scoped deny is enforced against the same live cwd, so a guarded write
+        // never lands (catches a guard-at-root / built-in-at-worktree bypass).
+        expect(fs.existsSync(path.join(worktreeDir, "no-write.txt"))).toBe(false);
+        const denied = result.requests.find(
+          (r) => /deny|blocked/i.test(toolResultText(r)) && toolResultText(r).includes("no-write.txt"),
+        );
+        expect(denied, "the worktree-scoped Write deny must be enforced against the subagent cwd").toBeDefined();
+
+        // The subagent's final message came back to the orchestrator verbatim.
+        expect(result.requests.some((r) => toolResultText(r).includes("MIDRUN-DONE"))).toBe(true);
       },
       TEST_TIMEOUT_MS,
     );

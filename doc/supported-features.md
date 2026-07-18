@@ -25,7 +25,7 @@ Built-in tool names a project can reference in `tools:`, `permissions.*`, or a h
 
 | ID | Tier | Note |
 |---|---|---|
-| `tool.Bash` | full | real implementation (from Pi) — shell execution, bash + PowerShell aware |
+| `tool.Bash` | full | real implementation (from Pi) — shell execution, bash + PowerShell aware; PiCC also exports the Claude built-in CLAUDE_PROJECT_DIR (the project root, NOT the live worktree cwd) into every Bash subprocess, main and subagent alike |
 | `tool.Edit` | full | real implementation — exact-string replacement edits |
 | `tool.EnterWorktree` | full | creates/re-enters .claude/worktrees/<flat>/ and swaps the session cwd |
 | `tool.ExitWorktree` | full | keep\|remove lifecycle with cwd restore, Windows-tolerant removal |
@@ -100,7 +100,7 @@ Lifecycle events the hooks engine can fire (`settings.json` `hooks`, plus skill/
 | `setting.disableAllHooks` | full | disables all hook dispatch |
 | `setting.disableSkillShellExecution` | full | disables !`cmd` skill shell injection |
 | `setting.enabledPlugins` | full | selects installed-plugin content to load; merges key-wise across scopes, nearer scope wins per plugin |
-| `setting.env` | full | injected into sessions and hook/skill subprocesses |
+| `setting.env` | full | injected into every session's Bash subprocesses (main and subagent), and into hook/skill subprocesses |
 | `setting.hooks` | full | hook config dispatched with Claude matcher semantics (exact/list/unanchored-regex), parallel execution with dedup, async handlers, systemMessage/suppressOutput honored (command handlers full) |
 | `setting.permissions.deny` | full | hard, non-interactive block — the kept deterministic safety valve; a Read(<glob>) deny also gates Grep/Glob/NotebookRead and, deny-direction only, blocks Edit/MultiEdit (not Write/NotebookEdit) on a matching path, one-directionally |
 | `setting.skillListingBudgetFraction` | full | caps the startup skill-listing token budget |
