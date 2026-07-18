@@ -1290,8 +1290,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           { deliverAs: "nextTurn" },
         );
       }
-      if (!compatSuppressed && event.reason === "startup") {
-        const notice = renderStartupNotice(compat, { suppressed: false });
+      if (event.reason === "startup") {
+        // Pass the live suppression flag: when compat is suppressed, the notice is
+        // silent EXCEPT for a model-derived non-vision safety warning, which is
+        // decoupled from project-findings suppression and still surfaces here.
+        const notice = renderStartupNotice(compat, {
+          suppressed: compatSuppressed,
+          activeModel: currentModel,
+        });
         if (notice && ctx.hasUI) ctx.ui.notify(notice.split("\n")[0] + " — run /doctor", "warning");
         if (notice) {
           pi.appendEntry("picc-compat", { notice });
@@ -1772,7 +1778,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   function runControlCommand(name: string, args: string, ctx: any): string | undefined {
     switch (name) {
       case "doctor":
-        return renderDoctorReport(project, compat);
+        return renderDoctorReport(project, compat, currentModel);
       case "skills":
         return renderSkillsList();
       case "agents":
@@ -1792,7 +1798,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           writeSuppression(project.root, false);
           compatSuppressed = false;
         }
-        return renderStartupNotice(compat, { suppressed: false }) ?? "No compatibility findings for this project.";
+        return renderStartupNotice(compat, { suppressed: false, activeModel: currentModel }) ?? "No compatibility findings for this project.";
       }
       default:
         return undefined;
