@@ -2,9 +2,9 @@
 
 Read this at **Phase 1**, on the **ticketless** path (empty `$ARGUMENTS`), **after the scope mirror
 converges** and before asking for the build "go". It carries the whole opt-in offer flow: the
-reachability precondition, the preview, the checkout-aware accept contract, the deferred Phase 3 FILE
-step, and the decline path. It is the sibling of the Phase 8 issue-filing offer in
-[ticket-integration.md](ticket-integration.md) (Per-phase ticket hooks → Phase 8): same write, same
+reachability precondition, the preview, the checkout-aware accept contract, and the decline path — the
+deferred Phase 3 FILE step itself lives in [phase-3-ticket-file.md](phase-3-ticket-file.md). It is the sibling of the Phase 8 issue-filing offer in
+[phase-8-file-finding.md](phase-8-file-finding.md): same write, same
 discipline, different intent — Phase 8 files a *surfaced finding* at close, this files the *agreed
 WHAT/WHY* up front so the rest of the run proceeds on the ticket path. Both obey the nine rules; load
 [ticket-integration.md](ticket-integration.md) before any `gh issue create`, and if it can't be read,
@@ -41,7 +41,7 @@ eventual "go" is never read as "yes, file the issue". Present:
   read on the value is: <the rating block>; still want it filed as written?"). The rating block now **includes its evidence anchors** — the repo-relative locators the value judgement rests on — and this in-session advisory carries a **fuller** anchor set than any filed surface (up to ~4: e.g. one proposal anchor plus one existing-tracking/decision anchor; in-session only, never a filed artifact). Here proposal-gate
   **only annotates — it never suppresses this offer**, and its assessment is **never baked into the
   filed public issue body** (that stays WHAT/WHY only, so the Phase 3 resume re-read of the synthesized
-  cached `body` — the FILE step below — ingests only feature scope, never a self-grade): the human
+  cached `body` — the FILE step ([phase-3-ticket-file.md](phase-3-ticket-file.md)) — ingests only feature scope, never a self-grade): the human
   already converged on this scope, so even a **low score is surfaced in-session** (they may still file,
   edit, or decline in this preview), never a silently-vanished offer. Alongside the gate's rating give
   the maintainer **your own recommendation, in your own words** — a **recommendation-first headline
@@ -51,7 +51,7 @@ eventual "go" is never read as "yes, file the issue". Present:
   gate's grounded score vs. your judgement); when it **departs** from the rating, reference the rating so
   the divergence reads as intentional ("gate rated this borderline; I'd still file it because X"). This
   is the same **self-elaborating presentation** the Phase 8 issue-filing offer uses
-  ([ticket-integration.md](ticket-integration.md)); like it, the rich presentation is **in-session
+  ([phase-8-file-finding.md](phase-8-file-finding.md)); like it, the rich presentation is **in-session
   only** — the approach + rough scope is HOW-altitude and **never enters the filed body** (that stays
   WHAT/WHY only).
 - **Where it writes, plainly**, and that a public artifact appears once filed. On a **fork** name the
@@ -141,37 +141,7 @@ surprise:
   comment). I will post nothing *further* to `<target>` automatically."
   **Reconcile the apparent contradiction explicitly:** the feature issue is the *one consented public
   write* on `<target>`; nothing *else* is auto-posted there, and the PR is opened **by the user** via
-  the compare URL (the fork hand-off — [fork.md](fork.md) Phase 9), **never** an auto-PR.
-
-## Phase 3 FILE step (on accept)
-
-At Phase 3, after `feature.md` is written, perform these together (both, or neither on a re-run):
-
-1. **Rule 9 dedup — mandatory, unconditional on every accept.** Before creating, run
-   `gh issue list --repo <target> --state all --search "<Title>" --json number,title,state,url`.
-   `<Title>` here must equal the display title frozen at build go byte-for-byte; do not derive or rewrite
-   a search placeholder.
-   `--search` is **keyword-based, not typo-fuzzy**, so surface only **plausible** near-matches, framed
-   as a reuse choice — "found a possibly-related issue #M — file new, or reuse it?" — and **reuse**
-   rather than double-file. This is the sole guard in the Phase 1→Phase 3 window (the anchor doesn't
-   exist yet); the resident anchor reader guards after.
-2. **File it.** Write the body with the Write tool to an **OS-temp path outside the worktree** (Rule 1),
-   then `gh issue create --repo <target> --title "<Title>" --body-file <path>`. The title is one quoted
-   argument and is the display title frozen at build go. **Echo the new issue
-   URL** in-session (Rule 7); the body ends with the `<attribution trailer>` (Rule 8) and is
-   leakage-stripped (Rule 6). On a fork the issue lands on `<target>` (the upstream).
-3. **Synthesize the cached-issue JSON** the Phase 0 gate would have produced, so every downstream
-   "with a ticket present" branch reads it with **no re-fetch**:
-   `number=N`, `title=<Title>`, `body=<the WHAT/WHY just filed>`, **`labels: []`** (the gate
-   caches `labels` and Phase 1 reads them — omitting it breaks a downstream `labels` read). The cached `title` must equal the exact frozen `<Title>` passed to dedup and create; no synthesized alias or
-   rewritten placeholder is permitted. The remaining fields are
-   `state="open"`, `url=<echoed URL>`, `comments=[]`. Set the working ticket ref to **`<target>#N`**.
-4. **Persist the anchor.** Write `Ticket: <target>#N` into `feature.md` (the `Ticket:` metadata line —
-   see [templates.md](templates.md)) so a resumed run reconstructs the ticket path. For a given ticket
-   the same line carries its ref; a plain ticketless run leaves it `–`.
-
-From here the run **is** on the ticket path: the Phase 8 close hooks and the Phase 9 hand-off (auto-PR
-+ comment on maintainer; compare-URL paste-ready on fork) apply exactly as for a ticket given up front.
+  the compare URL (the fork hand-off — [phase-9-fork-handoff.md](phase-9-fork-handoff.md) Phase 9), **never** an auto-PR.
 
 ## Invariant reconciliation — the "nothing posted before hand-off" claim
 

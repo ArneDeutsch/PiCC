@@ -197,7 +197,7 @@ filed feature body**:
   the human sees, as an advisory ("before I file, my read on the value is: <the rating block>; still
   want it filed as written?"). It is **not** embedded in the issue body that gets filed: that public
   body stays WHAT/WHY only, so `implement-feature`'s Phase 3 resume re-read of the synthesized cached
-  `body` ([ticket-creation.md](../../implement-feature/references/ticket-creation.md), the FILE step)
+  `body` ([phase-3-ticket-file.md](../../implement-feature/references/phase-3-ticket-file.md), the FILE step)
   ingests only the feature scope, never a self-grade.
 - **Phase 8 (gate) filed findings** — a **surfaced** finding is filed as its **own separate issue**, so
   the same block appears **both** in the in-session pick presentation the human chooses from **and**, if
@@ -207,7 +207,7 @@ filed feature body**:
   the finding's own ask and its assessment visibly separate in the body. The surfaced assessment
   supports a **lean pick-list** presentation — the disposition plus only the **decision-flipping**
   anchors — while the **full anchor set travels in the filed `## Evaluation` body**; the exact pick-list
-  anchor budget is [ticket-integration.md](../../implement-feature/references/ticket-integration.md)'s
+  anchor budget is [phase-8-file-finding.md](../../implement-feature/references/phase-8-file-finding.md)'s
   to set, not restated here. A **material-disagreement line** (`**Reviewers split (<axis>):** …`, per
   `evaluation-engine.md`'s disagreement-disclosure rule) **rides the lean pick-list too**, not only the
   filed body — it is **decision-flipping by definition**, so whoever chooses from the in-session
@@ -254,8 +254,8 @@ one of:
 proposal-gate is called from two `implement-feature` reference files, with **different force**:
 
 - **Phase 8 issue-filing offer** —
-  [ticket-integration.md](../../implement-feature/references/ticket-integration.md) (Per-phase ticket
-  hooks → Phase 8). It **gates** the machine-surfaced findings: **clear slop is dropped**, but with a
+  [phase-8-file-finding.md](../../implement-feature/references/phase-8-file-finding.md). It **gates**
+  the machine-surfaced findings: **clear slop is dropped**, but with a
   **one-line tally that also says the dropped findings remain in `review.md`** so nothing is lost (e.g.
   "(N low-value findings not offered — they remain in review.md)"). The tally is an **in-flow lever, not
   just a pointer**: a maintainer who disagrees with the gate can **ask to see the gate-dropped

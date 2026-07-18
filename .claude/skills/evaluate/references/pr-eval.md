@@ -161,12 +161,12 @@ The rule:
   <reason>"** instead of nagging.
 - A change **fully and genuinely** covered by automated tests likewise has nothing left to verify by
   hand — record the same, naming the covering tests.
-- **Crucial distinction (per [handoff.md](../../implement-feature/references/handoff.md)'s existing
+- **Crucial distinction (per [phase-9-handoff.md](../../implement-feature/references/phase-9-handoff.md)'s existing
   doctrine):** a **skill / harness / prose** change **does** have a runtime surface — **picc executing
   the changed behaviour** — so it is **NOT exempt**. For such a change "the running app" is picc
   running the changed flow, and manual verification means driving that flow and observing the changed
   message/artifact (or its deliberate absence). Only **genuinely no-runtime-surface (docs)** or
-  **fully-auto-tested** changes are exempt. This **threads with** handoff.md's "no runnable UI"
+  **fully-auto-tested** changes are exempt. This **threads with** phase-9-handoff.md's "no runnable UI"
   guidance (which already treats a skill/prose change as verifiable by running picc) rather than
   contradicting it.
 
