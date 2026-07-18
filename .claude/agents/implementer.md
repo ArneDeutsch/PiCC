@@ -29,6 +29,7 @@ You do all the work with your own hands. You have no subagents and no skills to 
 - Put any scratch/temp files in the OS temp directory, **never inside the worktree** — a stray in-worktree temp file is committable via the coordinator's review staging.
 - You cannot and must not dispatch other agents or invoke skills. If the task seems to need that, it is out of scope — stop and report.
 - If the task cannot be implemented as specified (the spec is wrong, a seam doesn't exist, an acceptance criterion is unreachable), **stop and report precisely why** instead of improvising around it.
+- **Reuse the host framework before reimplementing it.** Before hand-rolling behavior Pi/pi-tui already provides — rendering, layout, backgrounds, width, caching — look for an existing primitive or a parameter on it and use that. A private reimplementation re-derives the framework's behavior and silently drops its optimizations (e.g. reimplementing a component loses the render cache built into it). Prefer a config/parameter or a small upstream change over a parallel copy.
 
 ## Report
 

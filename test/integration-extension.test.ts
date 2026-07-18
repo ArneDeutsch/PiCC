@@ -105,7 +105,7 @@ describe("tool surface registration", () => {
     const BEL = String.fromCharCode(7);
     // A slot-encoding theme (zero-width under pi-tui's visibleWidth, like a real
     // theme.bg pair). renderDiff colors the diff body via Pi's OWN theme singleton;
-    // the outer band is our reframe painting through this theme.bg.
+    // the outer band is our Box framing through this theme.bg.
     const slotTheme = {
       fg: (_c: string, s: string) => s,
       bold: (s: string) => s,
@@ -137,7 +137,7 @@ describe("tool surface registration", () => {
     expect(joined).toContain("BETAEDITED");
     // Colored band re-applied per line, single success tone.
     for (const l of out) expect(l).toContain(marker);
-    // No blank first/last line: reframe stripped the inner Spacer; each edge line
+    // No blank first/last line: the blank-edge adapter stripped the inner Spacer; each edge line
     // carries real content once the zero-width bg framing is removed.
     const stripBg = (l: string) => l.split(marker).join("").split(`${ESC}[49m`).join("");
     expect(stripBg(out[0]!).trim().length).toBeGreaterThan(0);
