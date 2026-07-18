@@ -15,7 +15,7 @@ before "go", so the manual-PR hand-off is expected. Present it as prose to the u
 
 Substitute the resolved `push`/`target` `owner/repo` names. On the **ticket** path this composes
 with — does not replace — the ticket write-contract from
-[ticket-integration.md](ticket-integration.md) (Per-phase ticket hooks → Phase 1): show both, so the
+[phase-1-ticket-scope.md](phase-1-ticket-scope.md) (Phase 1 — ticket scope + write-contract): show both, so the
 maintainer sees the ticket writes *and* that the PR is opened by hand against the upstream. When the
 ticketless fork run **declines** the create-offer (staying ticketless), this disclosure is the *only*
 Phase 1 write-contract moment; when it **accepts**, the create-offer adds its own accept contract
