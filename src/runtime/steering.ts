@@ -26,6 +26,28 @@ export interface PiCCConfig {
   effortMap: Record<string, string>;
   /** Suppress the startup compatibility notice. */
   suppressCompatNotice?: boolean;
+  /**
+   * Compaction-resilience knob: percent of the context window at which PiCC
+   * proactively triggers Pi's own compaction. **0–100 scale** (NOT a 0–1 fraction) so it
+   * compares directly against Pi's `ContextUsage.percent`. Default 85; valid range 50–95.
+   * Raw pre-validation file value (a number, or a numeric string from JSON) — validated once
+   * via {@link resolveCompactionConfig}; production readers use {@link compaction} instead.
+   */
+  proactiveCompactPercent?: number | string;
+  /**
+   * Compaction-resilience knob: per-text-block token budget above which a single
+   * tool result's text block is clipped (head+tail). Default 20000; valid integer >= 1000.
+   * Raw pre-validation file value (a number, or a numeric string from JSON) — validated once
+   * via {@link resolveCompactionConfig}; production readers use {@link compaction} instead.
+   */
+  clipMaxTokens?: number | string;
+  /**
+   * Fully-defaulted, validated compaction knobs, resolved exactly once at load by
+   * {@link loadPiCCConfig}. This is the production read path — the hot-path consumers read
+   * `config.compaction.*` and MUST NOT call {@link resolveCompactionConfig} themselves (that
+   * pushes diagnostics; a per-turn call would spam them).
+   */
+  compaction: ResolvedCompactionConfig;
   diagnostics: Diagnostic[];
 }
 
@@ -40,6 +62,113 @@ const DEFAULT_EFFORT_MAP: Record<string, string> = {
   xhigh: "xhigh",
 };
 
+/** Percent of the context window at which PiCC proactively compacts (0–100 scale). */
+export const DEFAULT_PROACTIVE_COMPACT_PERCENT = 85;
+/** Per-text-block token budget above which a single tool result is clipped. */
+export const DEFAULT_CLIP_MAX_TOKENS = 20000;
+
+const PROACTIVE_COMPACT_PERCENT_MIN = 50;
+const PROACTIVE_COMPACT_PERCENT_MAX = 95;
+const CLIP_MAX_TOKENS_MIN = 1000;
+
+/** Fully-defaulted, validated compaction knobs — the seam the proactive-compaction and clip paths read from. */
+export interface ResolvedCompactionConfig {
+  /** 0–100 scale (matches Pi `ContextUsage.percent`). Always within [50, 95]. */
+  proactiveCompactPercent: number;
+  /** Integer >= 1000. */
+  clipMaxTokens: number;
+}
+
+/**
+ * Finite-number coercion mirroring `asFiniteNumber` in src/discovery/settings.ts:
+ * a number that is finite, or a non-empty numeric string. Rejects NaN/Infinity
+ * (and "1e999", which parses to Infinity), booleans, objects, and empty strings.
+ */
+function asFiniteNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+interface NumericBounds {
+  def: number;
+  min: number;
+  max: number;
+  integer: boolean;
+  label: string;
+  rangeText: string;
+}
+
+/**
+ * Fail-closed numeric resolution: validate a raw config value against its bounds and
+ * fall back to the safe default (with a warning diagnostic) on anything invalid —
+ * wrong type, non-finite, non-integer where an integer is required, or out of range.
+ * Never clamps, never throws. Unset (`undefined`) yields the default silently.
+ */
+function resolveNumeric(
+  raw: unknown,
+  bounds: NumericBounds,
+  diagnostics: Diagnostic[],
+): number {
+  if (raw === undefined) return bounds.def;
+  const n = asFiniteNumber(raw);
+  if (
+    n === undefined ||
+    (bounds.integer && !Number.isInteger(n)) ||
+    n < bounds.min ||
+    n > bounds.max
+  ) {
+    diagnostics.push({
+      severity: "warning",
+      message:
+        `PiCC config "${bounds.label}" (${JSON.stringify(raw)}) is invalid ` +
+        `(expected ${bounds.integer ? "an integer " : ""}${bounds.rangeText}); ` +
+        `using default ${bounds.def}`,
+    });
+    return bounds.def;
+  }
+  return n;
+}
+
+/**
+ * The single, validated resolver for the compaction-resilience knobs. Called exactly once
+ * at load by {@link loadPiCCConfig} (which stores the result on `config.compaction`); the
+ * proactive-compaction and clip paths read that field and never re-parse or re-default.
+ * Invalid values fail closed to the documented defaults with a diagnostic appended to
+ * `config.diagnostics`; it never throws.
+ */
+export function resolveCompactionConfig(config: PiCCConfig): ResolvedCompactionConfig {
+  return {
+    proactiveCompactPercent: resolveNumeric(
+      config.proactiveCompactPercent,
+      {
+        def: DEFAULT_PROACTIVE_COMPACT_PERCENT,
+        min: PROACTIVE_COMPACT_PERCENT_MIN,
+        max: PROACTIVE_COMPACT_PERCENT_MAX,
+        integer: false,
+        label: "proactiveCompactPercent",
+        rangeText: `${PROACTIVE_COMPACT_PERCENT_MIN}–${PROACTIVE_COMPACT_PERCENT_MAX}`,
+      },
+      config.diagnostics,
+    ),
+    clipMaxTokens: resolveNumeric(
+      config.clipMaxTokens,
+      {
+        def: DEFAULT_CLIP_MAX_TOKENS,
+        min: CLIP_MAX_TOKENS_MIN,
+        max: Number.MAX_SAFE_INTEGER,
+        integer: true,
+        label: "clipMaxTokens",
+        rangeText: `>= ${CLIP_MAX_TOKENS_MIN}`,
+      },
+      config.diagnostics,
+    ),
+  };
+}
+
 export function userConfigPath(): string {
   return path.join(os.homedir(), ".picc", "config.json");
 }
@@ -53,6 +182,11 @@ export function loadPiCCConfig(projectRoot: string): PiCCConfig {
   const result: PiCCConfig = {
     steering: {},
     effortMap: { ...DEFAULT_EFFORT_MAP },
+    // Placeholder; overwritten by the single resolver call below once the raw values are read.
+    compaction: {
+      proactiveCompactPercent: DEFAULT_PROACTIVE_COMPACT_PERCENT,
+      clipMaxTokens: DEFAULT_CLIP_MAX_TOKENS,
+    },
     diagnostics,
   };
   for (const file of [userConfigPath(), projectConfigPath(projectRoot)]) {
@@ -66,6 +200,14 @@ export function loadPiCCConfig(projectRoot: string): PiCCConfig {
     if (typeof parsed.model === "string") result.model = parsed.model;
     if (typeof parsed.effort === "string") result.effort = parsed.effort;
     if (typeof parsed.suppressCompatNotice === "boolean") result.suppressCompatNotice = parsed.suppressCompatNotice;
+    // Compaction knobs: store the raw file value (number or numeric string) so the
+    // single validator, resolveCompactionConfig, is the one place range/type is enforced.
+    if (typeof parsed.proactiveCompactPercent === "number" || typeof parsed.proactiveCompactPercent === "string") {
+      result.proactiveCompactPercent = parsed.proactiveCompactPercent;
+    }
+    if (typeof parsed.clipMaxTokens === "number" || typeof parsed.clipMaxTokens === "string") {
+      result.clipMaxTokens = parsed.clipMaxTokens;
+    }
     if (parsed.steering && typeof parsed.steering === "object") {
       for (const [k, v] of Object.entries(parsed.steering as Record<string, unknown>)) {
         if (typeof v === "string") result.steering[k] = v;
@@ -77,6 +219,9 @@ export function loadPiCCConfig(projectRoot: string): PiCCConfig {
       }
     }
   }
+  // Resolve and validate the compaction knobs exactly once, here, emitting any validation
+  // diagnostics at this single point. Production readers use `config.compaction.*`.
+  result.compaction = resolveCompactionConfig(result);
   return result;
 }
 

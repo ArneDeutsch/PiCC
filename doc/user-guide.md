@@ -270,7 +270,9 @@ tracked project files):
     "openai/*": "When a skill specifies a locked output format, reproduce it exactly. Prefer dispatching subagents over doing everything inline when the skill says to fan out."
   },
   "effortMap": { "ultra": "max" },
-  "suppressCompatNotice": false
+  "suppressCompatNotice": false,
+  "proactiveCompactPercent": 85,
+  "clipMaxTokens": 20000
 }
 ```
 
@@ -294,6 +296,23 @@ tracked project files):
   ```
 - `effortMap` — extends the mapping from Claude `effort:` values / prose ("apply maximum
   reasoning effort") to thinking levels.
+- `proactiveCompactPercent` — percent of the model's context window at which PiCC
+  proactively triggers Pi's own compaction, keeping the session off the ~99% edge where an
+  oversized output or a network blip can be fatal. **0–100 scale** (e.g. `85`, not `0.85`).
+  **Default `85`**; valid range **50–95**. An out-of-range or malformed value falls back to
+  the default with a diagnostic (never disables compaction). Lower it if a session still
+  rides too close to the window; raise it to compact later. This is the extension-reachable
+  margin lever — Pi's *hard* `reserveTokens` is a Pi settings-file matter, not set here.
+  If both user and project scopes set this knob and the project value is malformed, the safe
+  default is used (not the still-valid user value).
+- `clipMaxTokens` — per-tool-result token budget above which a single oversized tool-result
+  text block is clipped (head + tail kept, middle replaced by a model-visible marker naming
+  what was omitted and how to retrieve it). A backstop against pathological outputs, **not** a
+  trimmer: **default `20000`** tokens (≈80k chars) is generous, so everyday results — a ~20k-char
+  diff — pass through untouched. Valid **integer ≥ 1000**; a malformed value falls back to the
+  default with a diagnostic. As with `proactiveCompactPercent`, if both user and project scopes
+  set this knob and the project value is malformed, the safe default is used (not the still-valid
+  user value).
 
 ### Environment variables
 
@@ -403,6 +422,7 @@ behaviors worth knowing:
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
 | Startup notice keeps appearing | `/compat suppress` (per-project, stored in `.claude/.picc/`) |
+| Session died at high context / "input exceeds the context window" | Lower `proactiveCompactPercent` in `.claude/.picc/config.json` so PiCC compacts earlier (see Harness configuration above) |
 | `picc -p` finished but a subagent's output never appeared | Background is the default and a one-shot print run has no next turn to deliver it on. Set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for scripted runs, or collect with `TaskOutput` before the run ends. |
 | Subagents can't spawn subagents / nested fan-out flattened | PiCC defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Raise `subagents.maxDepth` to `2..5` in `.claude/settings.json`; see "Subagent dispatch controls" above. `/doctor` also shows the current nesting posture. |
 | Unexpected skills/agents from plugins | PiCC loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. `/doctor` and the startup info notice report how many are available but disabled. |
