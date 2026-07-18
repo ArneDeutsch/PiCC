@@ -198,6 +198,13 @@ describe("description-based naming contract", () => {
     expect(body).toContain("a double-letter code");
     expect(body).toContain("`git mv` auto-stages");
     expect(body).toContain("never a blank `git add -a && git commit`");
+    // Bidirectional gate: both remedies key on one positively-enumerated intent predicate, so a
+    // secret can never be staged. Pin the symmetric never-swap rule and the direction of each
+    // remedy — unstage is the not-on-surface remedy, stage is the on-surface-but-missing remedy —
+    // so a future edit transposing them reddens. Keep the literal "never swap the remedies".
+    expect(body).toContain("never swap the remedies");
+    expect(body).toContain("unstage** every staged path *not* on the intended surface");
+    expect(body).toContain("stage** every path that *is* on the intended surface but missing from the index");
   });
 
   it("pins the plan-folder templates and task-local numbering (loose)", () => {
