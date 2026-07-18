@@ -1,4 +1,3 @@
-import { convertToPng, resizeImage } from "@earendil-works/pi-coding-agent";
 import type { ImageContent } from "@earendil-works/pi-ai";
 
 // ---------------------------------------------------------------------------
@@ -441,6 +440,14 @@ export async function toImageContent(
   }
 
   const resizeOptions = opts?.maxBytes !== undefined ? { maxBytes: opts.maxBytes } : undefined;
+
+  // Pi's image codecs are loaded lazily, only when an image is actually
+  // normalized. Importing them at module load pulls Pi's Photon/WASM worker
+  // machinery into every module that imports this file — including the built-in
+  // `read` factory on the session hot path — which deadlocks in fork-heavy
+  // contexts. Deferring the import here keeps the detection helpers (sniff/binary)
+  // free of that side effect, so only a real image render pays the cost.
+  const { convertToPng, resizeImage } = await import("@earendil-works/pi-coding-agent");
 
   // Pi resizes png/jpeg/gif/webp directly; anything else (BMP) is converted to
   // PNG first, exactly as Pi's `processImage`/`normalizeImage` does.

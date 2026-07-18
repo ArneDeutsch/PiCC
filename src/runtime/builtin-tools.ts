@@ -12,8 +12,19 @@
  * concern, because the self-shell reframing and registration are session-shell
  * decisions, not tool-construction decisions.
  */
+import { open as fsOpen, readFile as fsReadFile, stat as fsStat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { isAbsolute, resolve as resolvePath } from "node:path";
 import { unicodeSafeSubprocessEnv } from "../util/env.js";
 import type { CwdState } from "./cwd-state.js";
+import { BINARY_READ_ERROR, isBinaryBuffer, sniffImageMime } from "./image-ingest.js";
+// NOTE: `./notebook-render.js` is imported dynamically inside the notebook branch
+// below, NOT at module load. It transitively imports the Pi package root (for
+// `truncateHead`), which pulls in Pi's Photon/WASM image machinery; loading that on
+// this hot-path module (the built-in `read` factory, imported by every session and
+// subagent fork) deadlocks fork-heavy contexts. Deferring it to an actual `.ipynb`
+// read keeps it off the eager graph. `image-ingest`'s detection helpers stay a
+// static import because that module carries no Pi runtime import.
 
 /**
  * A constructed Pi built-in tool instance. `execute` is the load-bearing member
@@ -124,6 +135,204 @@ export interface StockBuiltinTool {
   def: Record<string, unknown>;
 }
 
+// ---------------------------------------------------------------------------
+// Read routing: notebook / image / binary awareness layered over Pi's `read`.
+//
+// The stock Pi `read` already handles image FILES (magic-byte detection →
+// normalized image block + non-vision note) and plain text; PiCC delegates both
+// of those straight back to it. This wrapper adds only what Pi's read lacks:
+//   - `.ipynb` → cell-aware render (renderNotebook) with vision-gated image blocks;
+//   - an unsupported binary (incl. PDF) → a Claude-style "cannot read binary
+//     files" notice instead of mojibake.
+// The routing lives here in the shared factory so it reaches BOTH the main session
+// and dispatched subagents (both build their `read` from buildStockBuiltinTools).
+// Every branch degrades rather than crashes: any failure falls back to Pi's read
+// (or, for notebooks, to a read-shaped notice), so a session never dies here.
+// ---------------------------------------------------------------------------
+
+/**
+ * Bounded window read for the image/binary routing decision — never slurps a
+ * whole large file just to classify it. `sniffImageMime` needs only the format
+ * header and `isBinaryBuffer` scans at most ~8 KB, so this window is ample.
+ */
+const READ_ROUTING_HEADER_BYTES = 64 * 1024;
+
+/** The `read` tool result shape this wrapper both returns and delegates. */
+interface ReadResult {
+  content: unknown[];
+  details?: Record<string, unknown>;
+}
+
+/** Pull the file path from `read` params (`path`, with `file_path` as Pi's alias). */
+function readParamPath(params: unknown): string | undefined {
+  if (params === null || typeof params !== "object") return undefined;
+  const candidate = (params as Record<string, unknown>).path ?? (params as Record<string, unknown>).file_path;
+  return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+}
+
+/** The active model from the tool ctx, threaded to the notebook renderer's vision gate. */
+function ctxModel(ctx: unknown): unknown {
+  return (ctx as { model?: unknown } | null | undefined)?.model;
+}
+
+/**
+ * Resolve a read path against the effective cwd for PiCC's own pre-read (stat +
+ * header window). Handles `~` expansion and absolute paths; a delegated read
+ * still re-resolves through Pi (which also applies its macOS filename variants),
+ * so any path this misses simply falls through to Pi unchanged.
+ */
+function resolveReadTarget(rawPath: string, cwd: string): string {
+  let p = rawPath;
+  if (p === "~") p = homedir();
+  else if (p.startsWith("~/") || p.startsWith("~\\")) p = resolvePath(homedir(), p.slice(2));
+  return isAbsolute(p) ? p : resolvePath(cwd, p);
+}
+
+/** Read at most {@link READ_ROUTING_HEADER_BYTES} from the file head for the routing decision. */
+async function readRoutingHeader(absPath: string): Promise<Buffer> {
+  const handle = await fsOpen(absPath, "r");
+  try {
+    const { size } = await handle.stat();
+    const length = Math.min(size, READ_ROUTING_HEADER_BYTES);
+    if (length === 0) return Buffer.alloc(0);
+    const header = Buffer.alloc(length);
+    await handle.read(header, 0, length, 0);
+    return header;
+  } finally {
+    await handle.close();
+  }
+}
+
+function startsWithBytes(buf: Buffer, bytes: number[]): boolean {
+  if (buf.length < bytes.length) return false;
+  return bytes.every((b, i) => buf[i] === b);
+}
+
+/**
+ * A detected non-text file kind, from a FIXED magic-signature allowlist. `label`
+ * is a friendly type name; `notYet` marks a format PiCC deliberately does not
+ * read yet (PDF) rather than a universal binary limitation. Only these fixed
+ * labels are ever surfaced — never the sniffed bytes.
+ */
+interface BinaryKind {
+  label: string;
+  notYet?: boolean;
+}
+
+/**
+ * Classify a buffer by a fixed magic-signature allowlist. Returns a friendly
+ * kind or `undefined`. PDF is called out with `notYet` so its notice can say
+ * "not supported yet" — a plain "binary" message would mislead a Claude-tuned
+ * user who knows Claude reads PDFs. The signatures are distinctive enough to not
+ * fire on plain text.
+ */
+function detectBinaryKind(buf: Buffer): BinaryKind | undefined {
+  if (startsWithBytes(buf, [0x25, 0x50, 0x44, 0x46, 0x2d])) return { label: "PDF", notYet: true }; // "%PDF-"
+  if (startsWithBytes(buf, [0x50, 0x4b, 0x03, 0x04])) return { label: "ZIP archive" };
+  if (startsWithBytes(buf, [0x1f, 0x8b])) return { label: "gzip archive" };
+  if (startsWithBytes(buf, [0x7f, 0x45, 0x4c, 0x46])) return { label: "ELF executable" };
+  return undefined;
+}
+
+/**
+ * The Claude-style binary-read notice. The stable {@link BINARY_READ_ERROR}
+ * prefix is always first (tests assert the prefix, never a byte-exact string);
+ * the suffix (PiCC's own wording) names only the path and a fixed detected-type
+ * label, never any sniffed byte content.
+ */
+function binaryNotice(kind: BinaryKind | undefined, rawPath: string): ReadResult {
+  let text = BINARY_READ_ERROR;
+  if (kind?.notYet) {
+    text += ` The file "${rawPath}" looks like a ${kind.label}, which PiCC does not support reading yet.`;
+  } else if (kind) {
+    text += ` The file "${rawPath}" appears to be a ${kind.label}.`;
+  } else {
+    text += ` The file "${rawPath}" appears to contain binary (non-text) data.`;
+  }
+  return { content: [{ type: "text", text }], details: { binary: true } };
+}
+
+/** A read-shaped notice for a notebook that could not be rendered (degrade, never crash). */
+function notebookNotice(message: string, rawPath: string): ReadResult {
+  return {
+    content: [{ type: "text", text: `Could not read notebook "${rawPath}": ${message}` }],
+    details: { notebookError: true },
+  };
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Route one `read` call. `makeRead` builds a live-cwd Pi read instance for the
+ * delegated (image-file / plain-text) branches; `cwd` is the effective cwd used
+ * for PiCC's own pre-read resolution.
+ *
+ * Routing order is load-bearing (see the module header): notebook → image →
+ * binary → text.
+ */
+async function routeReadExecute(
+  makeRead: () => BuiltinToolInstance,
+  cwd: string,
+  id: string,
+  params: unknown,
+  signal: unknown,
+  onUpdate: unknown,
+  ctx: unknown,
+): Promise<unknown> {
+  const delegate = () => makeRead().execute(id, params, signal, onUpdate, ctx);
+  const rawPath = readParamPath(params);
+  if (rawPath === undefined) return delegate();
+
+  // (1) Notebook. Stat FIRST and reject an over-size file before reading it: this
+  // pre-read stat is the real OOM guard — a huge/hostile .ipynb must be rejected
+  // before it is slurped into memory (renderNotebook's own byte cap runs only
+  // AFTER the read, so it cannot prevent the OOM the read itself would cause). A
+  // structural throw (bad JSON, no `cells`, missing file) is caught and degraded
+  // to a read-shaped notice — it must never escape and crash the session.
+  if (rawPath.toLowerCase().endsWith(".ipynb")) {
+    const abs = resolveReadTarget(rawPath, cwd);
+    try {
+      const { MAX_NOTEBOOK_BYTES, renderNotebook } = await import("./notebook-render.js");
+      const { size } = await fsStat(abs);
+      if (size > MAX_NOTEBOOK_BYTES) {
+        return notebookNotice(
+          `it is ${size} bytes, larger than the ${MAX_NOTEBOOK_BYTES}-byte notebook read limit`,
+          rawPath,
+        );
+      }
+      const text = await fsReadFile(abs, "utf8");
+      const { content, truncated } = await renderNotebook(text, { model: ctxModel(ctx) });
+      return { content, details: { truncated } } satisfies ReadResult;
+    } catch (err) {
+      return notebookNotice(errorText(err), rawPath);
+    }
+  }
+
+  // (2) Image / (3) binary. Classify from a bounded header window; on ANY failure
+  // (path this resolver misses, stat/read error) fall through to Pi's read, which
+  // re-resolves the path itself and emits its own error. The binary check runs
+  // only AFTER the supported-image exclusion (images carry NUL bytes, so a raw
+  // isBinaryBuffer on a PNG would wrongly error).
+  try {
+    const abs = resolveReadTarget(rawPath, cwd);
+    const header = await readRoutingHeader(abs);
+    // (2) A supported image file → delegate to Pi's read (normalization + image
+    // block + non-vision note). PiCC does not hand-roll the image-file path.
+    if (sniffImageMime(header) !== null) return delegate();
+    // (3) An unsupported binary → a Claude-style notice, not mojibake. A magic
+    // match (e.g. PDF) is decisive on its own; otherwise the byte heuristic decides.
+    const kind = detectBinaryKind(header);
+    if (kind !== undefined || isBinaryBuffer(header)) return binaryNotice(kind, rawPath);
+  } catch {
+    // Fall through to Pi's read (its own resolution + error handling).
+  }
+
+  // (4) Plain text → Pi's read, unchanged.
+  return delegate();
+}
+
 /**
  * Construct the seven PiCC-semantic built-in tools.
  *
@@ -162,6 +371,17 @@ export function buildStockBuiltinTools(
     const template = factory(cwdRef.get());
     // Renderers only (execute stays sourced from `factory` below, byte-identical).
     const def = defFactory(cwdRef.get());
+    // `read` gains the notebook/image/binary routing wrapper; every other tool
+    // delegates straight to its live-cwd instance. Both re-source the execute
+    // from `factory(cwdRef.get())` per call so the worktree cwd swap is honored.
+    const execute =
+      name === "read"
+        ? async (id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) =>
+            routeReadExecute(() => factory(cwdRef.get()), cwdRef.get(), id, params, signal, onUpdate, ctx)
+        : async (id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) => {
+            const live = factory(cwdRef.get());
+            return live.execute(id, params, signal, onUpdate, ctx);
+          };
     tools.push({
       name,
       def: {
@@ -169,10 +389,7 @@ export function buildStockBuiltinTools(
         name,
         renderCall: def.renderCall,
         renderResult: def.renderResult,
-        async execute(id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) {
-          const live = factory(cwdRef.get());
-          return live.execute(id, params, signal, onUpdate, ctx);
-        },
+        execute,
       },
     });
   }
