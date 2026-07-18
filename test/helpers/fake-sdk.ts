@@ -150,6 +150,16 @@ export interface FakeSdkOptions {
   noForkSessionManager?: boolean;
 }
 
+/** The options object the shared factory passes to each `createBashTool`. */
+export interface BuiltinBashOptions {
+  shellPath?: string;
+  spawnHook?: (a: { command: unknown; cwd: unknown; env: Record<string, string | undefined> }) => {
+    command: unknown;
+    cwd: unknown;
+    env: Record<string, string>;
+  };
+}
+
 export interface FakeSdkHandle {
   sdk: PiSdk;
   /** Options of every createAgentSession call, in order. */
@@ -162,6 +172,8 @@ export interface FakeSdkHandle {
   waitForPromptCalls(count: number): Promise<void>;
   /** Args of every forkSessionManager call, in order (wiring assertions). */
   forkCalls: () => Array<{ sourcePath: string; cwd: string; sessionDir: string; id: string }>;
+  /** Options captured from each shared-factory `createBashTool` call (spawnHook + shellPath). */
+  builtinBashOptions: () => BuiltinBashOptions[];
 }
 
 export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
@@ -173,6 +185,33 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
   const promptWaiters = new Set<{ count: number; signal: Deferred<void> }>();
   let replyIndex = 0;
   const forkCalls: Array<{ sourcePath: string; cwd: string; sessionDir: string; id: string }> = [];
+
+  // Shared built-in factory (buildStockBuiltinTools) wiring capture: the
+  // subagent path now builds its seven built-ins from the factory against these
+  // RECORDING constructors, so tests can (a) capture the bash options object —
+  // including its `spawnHook` — to prove the env wiring, and (b) observe the
+  // per-execute cwd rebind (BUG-2) via each tool's echoed construction cwd.
+  const builtinBashOptions: BuiltinBashOptions[] = [];
+  // Echo the CONSTRUCTION cwd per execute: the factory rebinds
+  // `factory(cwdRef.get())` on EVERY call, so a recording tool constructed with
+  // the live cwd reflects it — making the BUG-2 rebind test non-vacuous.
+  const recordingBuiltin =
+    (name: string) =>
+    (cwd: string, options?: unknown) => {
+      if (name === "bash" && options && typeof options === "object") {
+        builtinBashOptions.push(options as BuiltinBashOptions);
+      }
+      return {
+        name,
+        async execute() {
+          return { content: [{ type: "text", text: `${name}@${cwd}` }], details: { cwd } };
+        },
+      };
+    };
+  const recordingBuiltinDef = (_cwd: string) => ({
+    renderCall: () => ({ render: () => [] as string[] }),
+    renderResult: () => ({ render: () => [] as string[] }),
+  });
 
   const notifyPromptWaiters = () => {
     for (const waiter of promptWaiters) {
@@ -374,6 +413,24 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
           },
     inMemorySettingsManager: () => ({}),
     agentDir: () => "/fake-agent-dir",
+    // Shared built-in factory constructors: RECORDING versions so the
+    // subagent path's `buildStockBuiltinTools` call produces valid, non-crashing
+    // tool defs the whole dispatch corpus can run through, while capturing the
+    // bash spawnHook (env wiring) and echoing the live cwd per execute (cwd rebind).
+    createBashTool: recordingBuiltin("bash"),
+    createReadTool: recordingBuiltin("read"),
+    createWriteTool: recordingBuiltin("write"),
+    createEditTool: recordingBuiltin("edit"),
+    createGrepTool: recordingBuiltin("grep"),
+    createFindTool: recordingBuiltin("find"),
+    createLsTool: recordingBuiltin("ls"),
+    createBashToolDefinition: recordingBuiltinDef,
+    createReadToolDefinition: recordingBuiltinDef,
+    createWriteToolDefinition: recordingBuiltinDef,
+    createEditToolDefinition: recordingBuiltinDef,
+    createGrepToolDefinition: recordingBuiltinDef,
+    createFindToolDefinition: recordingBuiltinDef,
+    createLsToolDefinition: recordingBuiltinDef,
   };
 
   return {
@@ -384,6 +441,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
     promptCalls: () => promptCalls,
     waitForPromptCalls,
     forkCalls: () => forkCalls,
+    builtinBashOptions: () => builtinBashOptions,
   };
 }
 

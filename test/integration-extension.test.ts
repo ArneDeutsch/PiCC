@@ -1351,6 +1351,51 @@ describe("subagent background-task scoping (offline-integration via a real dispa
   });
 });
 
+describe("subagent built-ins via the shared factory (offline-integration)", () => {
+  type Internals = Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
+
+  it("builds a subagent's bash through the shared factory; its spawnHook yields settings.env + CLAUDE_PROJECT_DIR (BUG 1)", async () => {
+    // Drive a REAL dispatch offline (fakeSdk via the onWired seam). The fake's
+    // RECORDING createBashTool captures the options object the shared factory hands
+    // it — proving (a) the subagent path went THROUGH the factory (non-vacuous), and
+    // (b) the captured spawnHook layers project.settings.env + CLAUDE_PROJECT_DIR,
+    // exactly as the main-session bash does. general-purpose inherits all tools, so
+    // Bash is granted and its built-in is constructed.
+    const handle = fakeSdk({ replies: ["FACTORY-BASH-DONE"] });
+    const p = fakePi();
+    let internals!: Internals;
+    picc(p.api as never, {
+      onWired: (i) => (internals = i),
+      onInitializationSettled: p.captureInitialization,
+    });
+    await p.waitForInitialization();
+    await p.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
+    internals.subagentRuntime.setSdkForTest(handle.sdk);
+
+    const agent = p.tools.get("Agent");
+    await agent.execute("fb", {
+      subagent_type: "general-purpose",
+      prompt: "run something",
+      run_in_background: false,
+    });
+
+    const bashOpts = handle.builtinBashOptions();
+    expect(bashOpts.length, "subagent bash was NOT built through the shared factory").toBeGreaterThan(
+      0,
+    );
+    const spawnHook = bashOpts[0]!.spawnHook;
+    expect(typeof spawnHook, "factory bash options carry no spawnHook").toBe("function");
+    const out = spawnHook!({ command: "echo hi", cwd: dir, env: { PATH: "/usr/bin" } });
+    // the project's settings.env is layered onto the subprocess env…
+    expect(out.env.FS_FIXTURE).toBe("full-surface");
+    // …and CLAUDE_PROJECT_DIR is injected (exact key casing) at the project root.
+    expect(out.env.CLAUDE_PROJECT_DIR).toBeDefined();
+    expect(path.resolve(out.env.CLAUDE_PROJECT_DIR!)).toBe(path.resolve(dir));
+    // Inherited env is preserved.
+    expect(out.env.PATH).toBe("/usr/bin");
+  });
+});
+
 describe("degradation floor", () => {
   it("unknown hook event, degraded handler types, future settings keys — nothing crashed at load", () => {
     // The extension registered tools/commands despite FuturisticUnknownEvent,

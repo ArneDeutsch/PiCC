@@ -42,7 +42,7 @@ import {
 } from "./subagent-progress.js";
 import { renderAgentCall, renderAgentResult } from "./subagent-render.js";
 import { formatBackgroundTaskIdentity } from "./background-identity.js";
-import type { BuiltinToolSdk } from "./builtin-tools.js";
+import { buildStockBuiltinTools, type BuiltinToolSdk } from "./builtin-tools.js";
 
 /**
  * Subagent dispatch runtime: spawns fresh-context Pi sessions per dispatch,
@@ -96,6 +96,23 @@ export interface SubagentRuntimeDeps {
   permissionEngine: PermissionEngine;
   hookRunner: HookRunner;
   getCwd: () => string;
+  /**
+   * The project's configured environment (`project.settings.env`), fed to the
+   * shared built-in factory so a subagent's bash subprocess receives the same
+   * env the main session's bash does. OPTIONAL with a `{}` default so the
+   * fake `makeSubagentRuntime` and any hand-built deps literal don't break.
+   */
+  settingsEnv?: Record<string, string | undefined>;
+  /**
+   * Absolute project root, injected as `CLAUDE_PROJECT_DIR` into subagent bash.
+   * OPTIONAL; defaults to the dispatch cwd when unset.
+   */
+  projectRoot?: string;
+  /**
+   * Pinned Git-Bash path on Windows (from `resolveGitBashPath`), applied to the
+   * subagent built-in bash tool by the shared factory. OPTIONAL/absent elsewhere.
+   */
+  shellPath?: string;
   /**
    * Preferred: builds a PER-DISPATCH context injector with its own fresh injection
    * state. Sharing the parent's injector would let a subagent's file touches consume
@@ -1321,6 +1338,35 @@ export class SubagentRuntime {
       const customTools = this.deps.customToolsFor(agent, granted, opts.depth, agentId, isFork, subCwd);
 
       const sdk = await this.sdk();
+
+      // Subagent built-ins from the SHARED factory: the exact same seven tool
+      // implementations the main session builds (index.ts), constructed here
+      // against the dispatch-local `subCwd` — NEVER the orchestrator cwd. The
+      // execute closure rebinds per call via `subCwd.get()`, so after THIS agent's
+      // own EnterWorktree its built-ins re-resolve to the new worktree cwd in
+      // lockstep with the guard (which reads the same `subCwd` via `getCwd`, above)
+      // and the custom tools (all cwd-bound to the same `subCwd`). This gives the
+      // subagent bash `settingsEnv` + `CLAUDE_PROJECT_DIR` via the factory's
+      // spawnHook, and eliminates the built-in/guard cwd desync after a worktree entry.
+      //
+      // Filter by `piBuiltins` (== `claudeToolsToPiBuiltins(granted)`), NOT by
+      // `granted`: `granted` holds CLAUDE names (`Bash`, `Glob`) while the factory
+      // emits PI names (`bash`, `find`, `ls`) and `Glob` fans out to `[find, ls]`.
+      // A read-only agent thus receives only its permitted built-in implementations.
+      //
+      // The tools keep their Pi lowercase names so they (a) SHADOW the stock Pi
+      // built-ins and (b) the guard's `toClaudeCall`/`PI_TO_CLAUDE` map still
+      // resolves `bash → Bash` for deny rules. Appended RAW (no `wrapForSelfShell`
+      // — the subagent set renders in subagent transcripts, not the TUI).
+      const grantedPiBuiltins = new Set(piBuiltins);
+      const factoryBuiltins = buildStockBuiltinTools(sdk as BuiltinToolSdk, subCwd, {
+        settingsEnv: this.deps.settingsEnv ?? {},
+        projectRoot: this.deps.projectRoot ?? cwd,
+        ...(this.deps.shellPath ? { shellPath: this.deps.shellPath } : {}),
+      });
+      for (const builtin of factoryBuiltins) {
+        if (grantedPiBuiltins.has(builtin.name)) customTools.push(builtin.def);
+      }
       const injector = this.deps.makeContextInjector
         ? this.deps.makeContextInjector(() => subCwd.get())
         : this.deps.contextForTouchedFile;
@@ -1372,6 +1418,15 @@ export class SubagentRuntime {
         model = this.deps.resolveModel(undefined);
       }
       const thinking = this.deps.mapEffort(opts.effort ?? agent.effort);
+      // The built-in NAMES must appear in `toolNames`: verified against the Pi SDK
+      // (agent-session.js), custom tools are filtered by the `tools:` allowlist by
+      // name, so a name absent from `toolNames` would drop the same-named FACTORY
+      // custom too; the registry then sets customs over stock built-ins by name
+      // last, so the same-named custom deterministically WINS (shadows the stock
+      // built-in). The appended factory built-ins already contribute those names via
+      // `customTools.map` below, so spreading `piBuiltins` here is belt-and-suspenders,
+      // not strictly required — kept for clarity. Each name then appears twice in
+      // `toolNames`, harmless because Pi de-dups `allowedToolNames` into a Set.
       const toolNames = [
         ...piBuiltins,
         ...customTools.map((t) => (t as { name: string }).name),

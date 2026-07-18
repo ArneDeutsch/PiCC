@@ -714,12 +714,72 @@ describe("SubagentRuntime (fake SDK)", () => {
       ["ok"],
     );
     await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
-    const tools = created[0]?.tools as string[];
-    expect(tools).toContain("read");
-    expect(tools).toContain("grep");
-    expect(tools).not.toContain("write");
-    expect(tools).not.toContain("edit");
-    expect(tools).not.toContain("bash");
+    // Assert on `customTools` (the FACTORY-built built-in implementations), not
+    // `tools`/`toolNames`: after the shared-factory rewire, `toolNames` still
+    // carries every granted allowlist name, so an assertion there would stay green
+    // even if the factory over-produced a `write` implementation for a read-only
+    // agent. The factory-side filter (membership in claudeToolsToPiBuiltins) is what
+    // this test now pins — a read-only agent's constructed built-ins exclude
+    // write/edit/bash.
+    const customToolNames = ((created[0]?.customTools as Array<{ name: string }>) ?? []).map(
+      (t) => t.name,
+    );
+    expect(customToolNames).toContain("read");
+    expect(customToolNames).toContain("grep");
+    // Glob → [find, ls] fan-out reaches the read-only agent too.
+    expect(customToolNames).toContain("find");
+    expect(customToolNames).toContain("ls");
+    expect(customToolNames).not.toContain("write");
+    expect(customToolNames).not.toContain("edit");
+    expect(customToolNames).not.toContain("bash");
+  });
+
+  it("subagent built-ins re-resolve to the new cwd after its own EnterWorktree, in lockstep with the guard (BUG 2)", async () => {
+    // The dispatch builds the factory built-ins, the guard (getCwd), and the
+    // custom tools ALL against ONE dispatch-local `subCwd` instance. `customToolsFor`
+    // receives that same instance as its 6th arg — capture it, and hand the subagent
+    // a fake worktree-entering tool that mutates it. Driving the subagent's OWN
+    // factory `read` (from the session's customTools) before and after that mutation
+    // proves the per-execute rebind against the shared instance.
+    let capturedSubCwd: CwdState | undefined;
+    const observed: string[] = [];
+    const { sdk } = fakeSdk({
+      onPrompt: async (_text, session) => {
+        const read = session.customTools.find((t) => t.name === "read");
+        const enter = session.customTools.find((t) => t.name === "EnterFake");
+        const before = await read!.execute("a", { path: "." });
+        observed.push(String(before.details?.cwd));
+        await enter!.execute("b", {});
+        const after = await read!.execute("c", { path: "." });
+        observed.push(String(after.details?.cwd));
+        return "done";
+      },
+    });
+    const runtime = makeSubagentRuntime([makeAgent({ tools: ["Read", "Bash"] })], sdk, {
+      customToolsFor: (_a: ClaudeAgent, _g: string[], _d: number, _o: string, _f: boolean, subCwd) => {
+        capturedSubCwd = subCwd;
+        return [
+          {
+            name: "EnterFake",
+            async execute() {
+              subCwd!.enterWorktree("/wt-new");
+              return { content: [] };
+            },
+          },
+        ];
+      },
+      settingsEnv: {},
+      projectRoot: "/proj",
+    });
+    await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    // The instance the guard reads (`getCwd: () => subCwd.get()`) and the one the
+    // worktree tool mutates are the SAME dispatch-local CwdState the factory built
+    // against — the read echoes it live.
+    expect(capturedSubCwd).toBeInstanceOf(CwdState);
+    expect(observed[0]).not.toBe("/wt-new"); // dispatch base cwd (process.cwd())
+    expect(observed[1]).toBe("/wt-new"); // re-resolved after EnterWorktree
+    // Lockstep proof at the guard level: the same instance now reads the swapped cwd.
+    expect(capturedSubCwd!.get()).toBe("/wt-new");
   });
 
   it("retries once on an empty reply", async () => {

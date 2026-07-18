@@ -756,6 +756,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     ];
   }
 
+  // Git-Bash pin for the subagent built-in bash tool (Windows), resolved once and
+  // threaded through the deps into the shared factory — same source the main
+  // session uses (resolveGitBashPath is cached).
+  const subagentBashShellPath = resolveGitBashPath();
   const subagentRuntime = new SubagentRuntime({
     getAgents: () => project.agents,
     buildSystemPrompt: buildSubagentSystemPrompt,
@@ -811,6 +815,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     permissionEngine,
     hookRunner: hookRunnerFacade,
     getCwd: () => cwdState.get(),
+    // Shared built-in factory inputs: the subagent path builds its seven
+    // built-ins from the SAME factory the main session uses, so a subagent's bash
+    // subprocess gets `settings.env` + `CLAUDE_PROJECT_DIR` and the Windows Git-Bash
+    // pin, identical to the main session.
+    settingsEnv: project.settings.env ?? {},
+    projectRoot: project.root,
+    ...(subagentBashShellPath ? { shellPath: subagentBashShellPath } : {}),
     makeContextInjector,
     // Agent-scoped hooks: per-dispatch runner with the SAME deps as the
     // session's base runner; the runtime multiplexes and discards it. Its
