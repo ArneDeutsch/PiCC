@@ -16,6 +16,7 @@ const SKILLS_DIR = path.resolve(
 );
 const SKILL_DIR = path.join(SKILLS_DIR, "implement-feature");
 const REFERENCES_DIR = path.join(SKILL_DIR, "references");
+const EVALUATE_DIR = path.join(SKILLS_DIR, "evaluate");
 
 const norm = (p: string): string => p.replace(/\\/g, "/");
 
@@ -197,6 +198,13 @@ describe("description-based naming contract", () => {
     expect(body).toContain("a double-letter code");
     expect(body).toContain("`git mv` auto-stages");
     expect(body).toContain("never a blank `git add -a && git commit`");
+    // Bidirectional gate: both remedies key on one positively-enumerated intent predicate, so a
+    // secret can never be staged. Pin the symmetric never-swap rule and the direction of each
+    // remedy — unstage is the not-on-surface remedy, stage is the on-surface-but-missing remedy —
+    // so a future edit transposing them reddens. Keep the literal "never swap the remedies".
+    expect(body).toContain("never swap the remedies");
+    expect(body).toContain("unstage** every staged path *not* on the intended surface");
+    expect(body).toContain("stage** every path that *is* on the intended surface but missing from the index");
   });
 
   it("pins the plan-folder templates and task-local numbering (loose)", () => {
@@ -211,19 +219,20 @@ describe("description-based naming contract", () => {
     // Loose representatives of the title-quoting contract: independent authorship, the 120-char
     // single-line bound, and --body-file at each write site — not the exhaustive phrase list.
     const direction = collapsed("references/phase-1-direction.md");
-    const creation = collapsed("references/ticket-creation.md");
+    // The `gh issue create` command moved out of ticket-creation.md into the Phase-3 FILE-step chunk.
+    const ticketFile = collapsed("references/phase-3-ticket-file.md");
     const integration = collapsed("references/ticket-integration.md");
-    const handoff = collapsed("references/handoff.md");
+    const handoff = collapsed("references/phase-9-handoff.md");
     expect(direction).toContain("printable ascii, single-line, at most 120 characters");
     expect(direction).toContain("do not directly copy, interpolate, slugify, or mechanically transform raw ticket title/body text");
-    expect(creation).toContain('gh issue create --repo <target> --title "<title>" --body-file <path>');
+    expect(ticketFile).toContain('gh issue create --repo <target> --title "<title>" --body-file <path>');
     expect(integration).toContain("pass the complete title as one quoted argument");
     expect(handoff).toContain('--title "<title>" --body-file <path>');
   });
 
   it("threads the exact branch through maintainer handoff, fork compare, CI, and cleanup", () => {
-    const handoff = collapsed("references/handoff.md");
-    const fork = collapsed("references/fork.md");
+    const handoff = collapsed("references/phase-9-handoff.md");
+    const forkHandoff = collapsed("references/phase-9-fork-handoff.md");
     for (const marker of [
       "git push -u <pushremote> feature/<feature-slug>",
       "--head feature/<feature-slug>",
@@ -234,19 +243,20 @@ describe("description-based naming contract", () => {
       expect(handoff).toContain(marker);
     }
     expect(handoff).toContain("print the stable copyable pr title `<title>`");
-    expect(fork).toContain("git push -u <pushremote> feature/<feature-slug>");
-    expect(fork).toContain("<forkowner>:feature/<feature-slug>?expand=1");
-    // The full push-safety gate is single-sourced in handoff.md step 1 — assert it there. fork.md
-    // step 1 collapses to the fork delta (re-fetch via a temporary named remote, the single fork
-    // push) plus a pointer to that gate, so the fork side asserts only the pointer and the "nothing
-    // is lost" framing that survives the collapse (it also lives in the fork push-failure degrade).
+    expect(forkHandoff).toContain("git push -u <pushremote> feature/<feature-slug>");
+    expect(forkHandoff).toContain("<forkowner>:feature/<feature-slug>?expand=1");
+    // The full push-safety gate is single-sourced in phase-9-handoff.md step 1 — assert it there.
+    // phase-9-fork-handoff.md step 1 collapses to the fork delta (re-fetch via a temporary named
+    // remote, the single fork push) plus a pointer to that gate, so the fork side asserts only the
+    // pointer and the "nothing is lost" framing that survives the collapse (it also lives in the fork
+    // push-failure degrade).
     for (const marker of ["first push", "never force", "claim complete race elimination",
       "nothing is lost", "local branch, worktree, and commits remain intact",
       "nothing new was posted", "new descriptive identity"]) {
       expect(handoff, `maintainer: ${marker}`).toContain(marker);
     }
-    expect(fork).toContain("push-safety gate");
-    expect(fork).toContain("nothing is lost");
+    expect(forkHandoff).toContain("push-safety gate");
+    expect(forkHandoff).toContain("nothing is lost");
   });
 
   it("pins all commit forms and retained GitHub/task-local numbering", () => {
@@ -302,20 +312,22 @@ describe("description-based naming contract", () => {
   });
 
   it("uses canonical issue numbers and exact frozen Title through ticket creation", () => {
-    const creation = read("references/ticket-creation.md");
+    // The FILE-step content (dedup search, create, synthesized cache, `<target>#N` ref) moved into
+    // the Phase-3 FILE-step chunk; the frozen-Title contract is asserted there now.
+    const ticketFile = read("references/phase-3-ticket-file.md");
     const integration = read("references/ticket-integration.md");
     for (const marker of [
       '--search "<Title>"', '--title "<Title>"', '`title=<Title>`',
       "equal the display title frozen at build go byte-for-byte", "cached `title` must equal the exact frozen `<Title>`",
-    ]) expect(creation).toContain(marker);
+    ]) expect(ticketFile).toContain(marker);
     expect(integration).toContain("the same exact frozen `<Title>` byte-for-byte");
-    expect(creation).toContain("`<target>#N`");
+    expect(ticketFile).toContain("`<target>#N`");
     expect(integration).toMatch(/only\s+that integer ever appears in a linking keyword/);
   });
 
   it("uses pushRemote for resolved maintainer operations and confines origin to the git-only degrade", () => {
     const workspace = collapsed("references/phase-2-workspace.md");
-    const handoff = collapsed("references/handoff.md");
+    const handoff = collapsed("references/phase-9-handoff.md");
     for (const marker of [
       "refs/remotes/<pushremote>/head", "git remote show <pushremote>", "git fetch <pushremote>",
       "<pushremote>/<targetdefault>", "git push -u <pushremote> feature/<feature-slug>",
@@ -418,11 +430,11 @@ describe("proposal-gate wiring floor markers", () => {
   const collapse = (p: string): string =>
     fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
 
-  const TICKET_INTEGRATION_PATH = path.join(REFERENCES_DIR, "ticket-integration.md");
+  const FILE_FINDING_PATH = path.join(REFERENCES_DIR, "phase-8-file-finding.md");
   const TICKET_CREATION_PATH = path.join(REFERENCES_DIR, "ticket-creation.md");
 
-  it("Phase 8 (ticket-integration.md) gates findings through proposal-gate, dropping clear slop with a review.md tally", () => {
-    const body = collapse(TICKET_INTEGRATION_PATH);
+  it("Phase 8 (phase-8-file-finding.md) gates findings through proposal-gate, dropping clear slop with a review.md tally", () => {
+    const body = collapse(FILE_FINDING_PATH);
     expect(body).toContain("proposal-gate");
     // Clear slop dropped, but the tally says the dropped findings remain in review.md.
     expect(body).toContain("remain in review.md");
@@ -449,7 +461,7 @@ describe("evidence-grounded evaluation wiring", () => {
   // repo-relative convention the evidence anchors are normalized to).
   const collapse = (p: string): string =>
     fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
-  const TICKET_INTEGRATION_PATH = path.join(REFERENCES_DIR, "ticket-integration.md");
+  const FILE_FINDING_PATH = path.join(REFERENCES_DIR, "phase-8-file-finding.md");
   const TICKET_CREATION_PATH = path.join(REFERENCES_DIR, "ticket-creation.md");
   const EN_DASH = String.fromCodePoint(0x2013);
 
@@ -469,8 +481,8 @@ describe("evidence-grounded evaluation wiring", () => {
     expect(body).toContain("never baked into the filed public issue body");
   });
 
-  it("Phase 8 embed (ticket-integration.md) carries repo-relative, leakage-stripped anchors under the full element-7 re-validation, gate semantics unchanged", () => {
-    const body = collapse(TICKET_INTEGRATION_PATH);
+  it("Phase 8 embed (phase-8-file-finding.md) carries repo-relative, leakage-stripped anchors under the full element-7 re-validation, gate semantics unchanged", () => {
+    const body = collapse(FILE_FINDING_PATH);
     // The ## Evaluation embed carries the evidence anchors.
     expect(body).toContain("`## evaluation`");
     expect(body).toContain("evidence anchors");
@@ -579,6 +591,37 @@ describe("incoming-ticket evaluation preflight", () => {
       expect(seen.has(req), `missing cross-link: ${req}`).toBe(true);
     }
   });
+
+  it("resolves the evaluate skill's back-links into implement-feature (reciprocal of the in-skill resolver)", () => {
+    // The mirror of the resolver above: the existing tests only resolve implement-feature -> evaluate
+    // and the in-skill references dir, so an evaluate/*.md link INTO implement-feature (e.g.
+    // pr-eval.md's `phase-9-handoff.md` pointer) could dangle after a rename with a green suite. Glob
+    // the whole evaluate skill and resolve every `../../implement-feature/references/<file>.md` and
+    // `../../../agents/<file>.md` link on disk, from the containing file's own directory. Scheme-
+    // qualified (http/mailto) and non-`.md` targets stay out of scope, matching the in-skill resolver.
+    const evalFiles = walkFiles(EVALUATE_DIR, (name) => name.endsWith(".md"));
+    expect(evalFiles.length).toBeGreaterThan(0);
+    const linkRe =
+      /\]\((\.\.\/\.\.\/implement-feature\/references\/[A-Za-z0-9_-]+\.md|\.\.\/\.\.\/\.\.\/agents\/[A-Za-z0-9_-]+\.md)\)/g;
+    const seen = new Set<string>();
+    for (const file of evalFiles) {
+      const text = fs.readFileSync(file, "utf8");
+      for (const m of text.matchAll(linkRe)) {
+        const rel = m[1]!;
+        seen.add(rel);
+        expect(
+          fs.existsSync(path.resolve(path.dirname(file), rel)),
+          `${norm(path.relative(EVALUATE_DIR, file))} -> ${rel}`,
+        ).toBe(true);
+      }
+    }
+    // The load-bearing cross-link this task installs the guard for: pr-eval.md points at the renamed
+    // phase-9-handoff.md. If a future rename drops the pr-eval.md repoint, this assertion reddens.
+    expect(
+      seen.has("../../implement-feature/references/phase-9-handoff.md"),
+      "missing back-link: ../../implement-feature/references/phase-9-handoff.md",
+    ).toBe(true);
+  });
 });
 
 describe("Phase 8 coordinator-run advisory issue search", () => {
@@ -591,10 +634,10 @@ describe("Phase 8 coordinator-run advisory issue search", () => {
   // stay green (the re-scope is Phase-8-only). We do NOT touch Rule 9 or ticket-creation.md.
   const collapse = (p: string): string =>
     fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
-  const TICKET_INTEGRATION_PATH = path.join(REFERENCES_DIR, "ticket-integration.md");
+  const FILE_FINDING_PATH = path.join(REFERENCES_DIR, "phase-8-file-finding.md");
 
   it("Phase 8 hook points at a coordinator-run, read-only advisory search feeding a github_verified anchor", () => {
-    const body = collapse(TICKET_INTEGRATION_PATH);
+    const body = collapse(FILE_FINDING_PATH);
     // The coordinator path holds gh/Bash and runs one narrow read-only list per finding.
     expect(body).toContain("one narrow read-only");
     expect(body).toContain('--search "<terms>"');
@@ -605,14 +648,14 @@ describe("Phase 8 coordinator-run advisory issue search", () => {
   });
 
   it("Phase 8 terms are coordinator-authored, never target-lifted, obeying the frozen-title character ban", () => {
-    const body = collapse(TICKET_INTEGRATION_PATH);
+    const body = collapse(FILE_FINDING_PATH);
     expect(body).toContain("**coordinator-authored**");
     expect(body).toContain("never** lifted from issue/pr body");
     expect(body).toContain("frozen-title character ban");
   });
 
   it("Phase 8 states the novelty floor (hit lowers novelty, never by itself drops below threshold), candidate wording + visible degrade", () => {
-    const body = collapse(TICKET_INTEGRATION_PATH);
+    const body = collapse(FILE_FINDING_PATH);
     expect(body).toContain("**never by itself** drops it below the file/keep-open threshold");
     expect(body).toContain("possible existing coverage:");
     expect(body).toContain("not cross-checked against github");
@@ -626,7 +669,7 @@ describe("Phase 8 coordinator-run advisory issue search", () => {
   });
 
   it("Phase 8 advisory search feeds SCORING; it is the SAME read as Rule 9's filing-time --search dedup, distinct from the html_url comment scan", () => {
-    const body = collapse(TICKET_INTEGRATION_PATH);
+    const body = collapse(FILE_FINDING_PATH);
     expect(body).toContain("feeds *scoring*, not filing");
     // The advisory search and Rule 9's filing-time dedup are the SAME `gh issue list --search` read,
     // invoked for two different purposes (novelty score vs. double-file prevention) — not conflated
@@ -716,5 +759,80 @@ describe("progressive-phase-disclosure spine guards", () => {
       const heading = section.split("\n", 1)[0]!;
       expect(section.toLowerCase().replace(/\s+/g, " "), heading).toContain("must read");
     }
+  });
+});
+
+describe("fail-closed floor pointer on every write-site reference", () => {
+  // Layer-1 static guard for the whole restructure's binding invariant: every reference file that
+  // itself performs or authors a public GitHub write must BOTH name the nine-rules floor
+  // (ticket-integration.md) AND carry a fail-closed clause — read the floor first, refuse the write if
+  // it cannot be read. This is what keeps a write from proceeding with the rules unloaded, and no
+  // prior test covered it. Tolerant on wording, strict on presence.
+  const read = (relative: string): string =>
+    fs.readFileSync(path.join(REFERENCES_DIR, relative), "utf8").replace(/\r\n/g, "\n");
+  // Accept the corpus's wording variants: "cannot be read" (handoff), "can't be read" (feature-spec,
+  // fork-handoff — the latter hard-wrapped across a newline), "can not be read", or "unreadable".
+  // Whitespace between words is flexible (\s+) so a line break inside the clause still matches.
+  const READ_FAILURE = /can(?:not|['\u2019]?t| not)\s+be\s+read|unreadable/i;
+
+  // Every write-site reference file. phase-3-feature-spec.md points at the accepted create-offer's
+  // FILE step and phase-3-ticket-file.md holds the actual `gh issue create` for it (t05 moved that
+  // write out of ticket-creation.md, which no longer performs a write and drops off this list);
+  // phase-8-file-finding.md files surfaced findings; the two Phase 9 files author the PR/comment.
+  const writeSites = [
+    "phase-3-feature-spec.md",
+    "phase-3-ticket-file.md",
+    // ticket-creation.md's write moved to phase-3-ticket-file.md (t05), but it retains a
+    // defense-in-depth floor pointer — pin it so a future edit reintroducing a direct
+    // `gh issue create` there can't slip past this guard.
+    "ticket-creation.md",
+    "phase-8-file-finding.md",
+    "phase-9-handoff.md",
+    "phase-9-fork-handoff.md",
+  ];
+
+  for (const site of writeSites) {
+    it(`${site} names the nine-rules floor and carries a fail-closed clause`, () => {
+      const body = read(site);
+      expect(body, `${site}: missing ticket-integration.md floor pointer`).toContain(
+        "ticket-integration.md",
+      );
+      expect(body, `${site}: missing refuse clause`).toMatch(/refuse/i);
+      expect(body, `${site}: missing read-failure clause`).toMatch(READ_FAILURE);
+    });
+  }
+});
+
+describe("implementer standing rules — incremental logs and OS-temp scratch (#102)", () => {
+  // The Phase-7 standing rules are duplicated: the coordinator relays them from
+  // references/phase-7-implementation.md, and the implementer agent carries its own mirror in
+  // .claude/agents/implementer.md. Both copies must require (a) writing the execution log to disk
+  // incrementally as work proceeds — protecting the on-disk log a resume reads as the sole record
+  // of a commit-less task's completion — and (b) keeping scratch/temp files in the OS temp dir,
+  // never inside the worktree. Loose, whitespace-collapsed, case-insensitive markers.
+  const collapse = (p: string): string =>
+    fs.readFileSync(p, "utf8").toLowerCase().replace(/\s+/g, " ");
+  const AGENTS_DIR = path.resolve(SKILLS_DIR, "..", "agents");
+  const PHASE_7_PATH = path.join(REFERENCES_DIR, "phase-7-implementation.md");
+  const IMPLEMENTER_PATH = path.join(AGENTS_DIR, "implementer.md");
+
+  it("phase-7-implementation.md requires an incremental on-disk log and OS-temp-only scratch", () => {
+    const body = collapse(PHASE_7_PATH);
+    // Incremental-log marker: "brief bullets while working" alone existed before; the on-disk
+    // incremental requirement is genuinely new.
+    expect(body).toContain("incrementally as work proceeds");
+    expect(body).toContain("append as you go");
+    // OS-temp-scratch marker: keyed on the distinctive implementer-scratch wording, NOT the loose
+    // "outside the worktree" that step 6's pre-existing `--body-file` clause already carries.
+    expect(body).toContain("scratch/temp files");
+    expect(body).toContain("never inside the worktree");
+  });
+
+  it("implementer.md mirrors the incremental on-disk log and OS-temp-only scratch rules", () => {
+    const body = collapse(IMPLEMENTER_PATH);
+    expect(body).toContain("incrementally as work proceeds");
+    expect(body).toContain("append as you go");
+    expect(body).toContain("scratch/temp files");
+    expect(body).toContain("never inside the worktree");
   });
 });

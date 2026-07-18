@@ -176,7 +176,7 @@ A bare `openai/<id>` selector fails with "No API key found for openai". Omit `--
 configured default.
 
 The `implement-feature` skill's hand-off produces the same launch-and-verify recipe for agent runs,
-single-sourced in `.claude/skills/implement-feature/references/handoff.md`, so the contributor and
+single-sourced in `.claude/skills/implement-feature/references/phase-9-handoff.md`, so the contributor and
 agent paths stay in step on the launch facts.
 
 ## Reporting issues
