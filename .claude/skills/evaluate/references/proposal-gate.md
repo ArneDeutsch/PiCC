@@ -207,7 +207,7 @@ filed feature body**:
   the finding's own ask and its assessment visibly separate in the body. The surfaced assessment
   supports a **lean pick-list** presentation — the disposition plus only the **decision-flipping**
   anchors — while the **full anchor set travels in the filed `## Evaluation` body**; the exact pick-list
-  anchor budget is [ticket-integration.md](../../implement-feature/references/ticket-integration.md)'s
+  anchor budget is [phase-8-file-finding.md](../../implement-feature/references/phase-8-file-finding.md)'s
   to set, not restated here. A **material-disagreement line** (`**Reviewers split (<axis>):** …`, per
   `evaluation-engine.md`'s disagreement-disclosure rule) **rides the lean pick-list too**, not only the
   filed body — it is **decision-flipping by definition**, so whoever chooses from the in-session

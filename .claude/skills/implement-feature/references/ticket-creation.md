@@ -51,7 +51,7 @@ eventual "go" is never read as "yes, file the issue". Present:
   gate's grounded score vs. your judgement); when it **departs** from the rating, reference the rating so
   the divergence reads as intentional ("gate rated this borderline; I'd still file it because X"). This
   is the same **self-elaborating presentation** the Phase 8 issue-filing offer uses
-  ([ticket-integration.md](ticket-integration.md)); like it, the rich presentation is **in-session
+  ([phase-8-file-finding.md](phase-8-file-finding.md)); like it, the rich presentation is **in-session
   only** — the approach + rough scope is HOW-altitude and **never enters the filed body** (that stays
   WHAT/WHY only).
 - **Where it writes, plainly**, and that a public artifact appears once filed. On a **fork** name the

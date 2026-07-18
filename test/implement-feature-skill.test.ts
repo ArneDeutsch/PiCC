@@ -782,6 +782,10 @@ describe("fail-closed floor pointer on every write-site reference", () => {
   const writeSites = [
     "phase-3-feature-spec.md",
     "phase-3-ticket-file.md",
+    // ticket-creation.md's write moved to phase-3-ticket-file.md (t05), but it retains a
+    // defense-in-depth floor pointer — pin it so a future edit reintroducing a direct
+    // `gh issue create` there can't slip past this guard.
+    "ticket-creation.md",
     "phase-8-file-finding.md",
     "phase-9-handoff.md",
     "phase-9-fork-handoff.md",
