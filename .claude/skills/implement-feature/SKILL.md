@@ -98,7 +98,7 @@ Entry: explicit build go, announcement emitted. Validate `<feature-slug>` and pr
 
 ## Phase 3 — Feature spec
 
-Entry: worktree and branch exist. Create `doc/plan/<feature-slug>/`, write `feature.md` — WHAT/WHY, **no HOW**; the `Ticket:` anchor line; `## Tasks` placeholder. An accepted create-offer files its issue here (`references/ticket-creation.md` FILE step). You MUST read `references/phase-3-feature-spec.md` and the feature.md template in `references/templates.md` before writing it.
+Entry: worktree and branch exist. Create `doc/plan/<feature-slug>/`, write `feature.md` — WHAT/WHY, **no HOW**; the `Ticket:` anchor line; `## Tasks` placeholder. An accepted create-offer files its issue here (`references/phase-3-ticket-file.md`). You MUST read `references/phase-3-feature-spec.md` and the feature.md template in `references/templates.md` before writing it.
 
 ## Phase 4 — HOW investigation
 

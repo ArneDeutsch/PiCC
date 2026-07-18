@@ -197,7 +197,7 @@ filed feature body**:
   the human sees, as an advisory ("before I file, my read on the value is: <the rating block>; still
   want it filed as written?"). It is **not** embedded in the issue body that gets filed: that public
   body stays WHAT/WHY only, so `implement-feature`'s Phase 3 resume re-read of the synthesized cached
-  `body` ([ticket-creation.md](../../implement-feature/references/ticket-creation.md), the FILE step)
+  `body` ([phase-3-ticket-file.md](../../implement-feature/references/phase-3-ticket-file.md), the FILE step)
   ingests only the feature scope, never a self-grade.
 - **Phase 8 (gate) filed findings** — a **surfaced** finding is filed as its **own separate issue**, so
   the same block appears **both** in the in-session pick presentation the human chooses from **and**, if

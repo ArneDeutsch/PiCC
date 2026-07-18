@@ -212,12 +212,13 @@ describe("description-based naming contract", () => {
     // Loose representatives of the title-quoting contract: independent authorship, the 120-char
     // single-line bound, and --body-file at each write site — not the exhaustive phrase list.
     const direction = collapsed("references/phase-1-direction.md");
-    const creation = collapsed("references/ticket-creation.md");
+    // The `gh issue create` command moved out of ticket-creation.md into the Phase-3 FILE-step chunk.
+    const ticketFile = collapsed("references/phase-3-ticket-file.md");
     const integration = collapsed("references/ticket-integration.md");
     const handoff = collapsed("references/phase-9-handoff.md");
     expect(direction).toContain("printable ascii, single-line, at most 120 characters");
     expect(direction).toContain("do not directly copy, interpolate, slugify, or mechanically transform raw ticket title/body text");
-    expect(creation).toContain('gh issue create --repo <target> --title "<title>" --body-file <path>');
+    expect(ticketFile).toContain('gh issue create --repo <target> --title "<title>" --body-file <path>');
     expect(integration).toContain("pass the complete title as one quoted argument");
     expect(handoff).toContain('--title "<title>" --body-file <path>');
   });
@@ -304,14 +305,16 @@ describe("description-based naming contract", () => {
   });
 
   it("uses canonical issue numbers and exact frozen Title through ticket creation", () => {
-    const creation = read("references/ticket-creation.md");
+    // The FILE-step content (dedup search, create, synthesized cache, `<target>#N` ref) moved into
+    // the Phase-3 FILE-step chunk; the frozen-Title contract is asserted there now.
+    const ticketFile = read("references/phase-3-ticket-file.md");
     const integration = read("references/ticket-integration.md");
     for (const marker of [
       '--search "<Title>"', '--title "<Title>"', '`title=<Title>`',
       "equal the display title frozen at build go byte-for-byte", "cached `title` must equal the exact frozen `<Title>`",
-    ]) expect(creation).toContain(marker);
+    ]) expect(ticketFile).toContain(marker);
     expect(integration).toContain("the same exact frozen `<Title>` byte-for-byte");
-    expect(creation).toContain("`<target>#N`");
+    expect(ticketFile).toContain("`<target>#N`");
     expect(integration).toMatch(/only\s+that integer ever appears in a linking keyword/);
   });
 
@@ -766,12 +769,12 @@ describe("fail-closed floor pointer on every write-site reference", () => {
   const READ_FAILURE = /can(?:not|['\u2019]?t| not)\s+be\s+read|unreadable/i;
 
   // Every write-site reference file. phase-3-feature-spec.md points at the accepted create-offer's
-  // FILE step and ticket-creation.md holds the actual `gh issue create` for it; phase-8-file-finding.md
-  // files surfaced findings; the two Phase 9 files author the PR/comment. (t05 moves the FILE-step
-  // write into phase-3-ticket-file.md — reconcile this list there.)
+  // FILE step and phase-3-ticket-file.md holds the actual `gh issue create` for it (t05 moved that
+  // write out of ticket-creation.md, which no longer performs a write and drops off this list);
+  // phase-8-file-finding.md files surfaced findings; the two Phase 9 files author the PR/comment.
   const writeSites = [
     "phase-3-feature-spec.md",
-    "ticket-creation.md",
+    "phase-3-ticket-file.md",
     "phase-8-file-finding.md",
     "phase-9-handoff.md",
     "phase-9-fork-handoff.md",
