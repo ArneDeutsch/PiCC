@@ -41,7 +41,7 @@ const TOOL_ENTRIES: CapabilityEntry[] = [
   cap("tool", "tool.Read", "full", "real implementation — file reads with Claude-shaped input"),
   cap("tool", "tool.Write", "full", "real implementation — file creation/overwrite"),
   cap("tool", "tool.Edit", "full", "real implementation — exact-string replacement edits"),
-  cap("tool", "tool.Bash", "full", "real implementation (from Pi) — shell execution, bash + PowerShell aware"),
+  cap("tool", "tool.Bash", "full", "real implementation (from Pi) — shell execution, bash + PowerShell aware; PiCC also exports the Claude built-in CLAUDE_PROJECT_DIR (the project root, NOT the live worktree cwd) into every Bash subprocess, main and subagent alike"),
   cap("tool", "tool.Grep", "full", "real implementation — Claude-baseline parameter surface (-n, -A/-B/-C/context, -i, -o, type, glob, multiline, content/files_with_matches/count modes, head_limit/offset) with ripgrep/JS engine parity"),
   cap("tool", "tool.Glob", "full", "real implementation — file pattern matching"),
   cap("tool", "tool.NotebookRead", "partial", "real implementation — parses the .ipynb JSON and presents each cell's source + outputs (stream text, text/plain and other text reprs, error traceback); PARTIAL: image/binary outputs are noted by mime-type (raster images with an approximate base64 size), not rendered visually; oversized text outputs are head-truncated; single-cell selection (cell_id) is not supported"),
@@ -118,7 +118,7 @@ const HOOK_EVENT_ENTRIES: CapabilityEntry[] = [
 const SETTING_ENTRIES: CapabilityEntry[] = [
   // Honored toggles — full.
   cap("setting", "setting.hooks", "full", "hook config dispatched with Claude matcher semantics (exact/list/unanchored-regex), parallel execution with dedup, async handlers, systemMessage/suppressOutput honored (command handlers full)"),
-  cap("setting", "setting.env", "full", "injected into sessions and hook/skill subprocesses"),
+  cap("setting", "setting.env", "full", "injected into every session's Bash subprocesses (main and subagent), and into hook/skill subprocesses"),
   cap("setting", "setting.disableAllHooks", "full", "disables all hook dispatch"),
   cap("setting", "setting.disableSkillShellExecution", "full", "disables !`cmd` skill shell injection"),
   cap("setting", "setting.skillListingBudgetFraction", "full", "caps the startup skill-listing token budget"),

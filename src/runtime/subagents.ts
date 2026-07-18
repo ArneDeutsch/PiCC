@@ -42,6 +42,7 @@ import {
 } from "./subagent-progress.js";
 import { renderAgentCall, renderAgentResult } from "./subagent-render.js";
 import { formatBackgroundTaskIdentity } from "./background-identity.js";
+import { buildStockBuiltinTools, type BuiltinToolSdk } from "./builtin-tools.js";
 
 /**
  * Subagent dispatch runtime: spawns fresh-context Pi sessions per dispatch,
@@ -95,6 +96,23 @@ export interface SubagentRuntimeDeps {
   permissionEngine: PermissionEngine;
   hookRunner: HookRunner;
   getCwd: () => string;
+  /**
+   * The project's configured environment (`project.settings.env`), fed to the
+   * shared built-in factory so a subagent's bash subprocess receives the same
+   * env the main session's bash does. OPTIONAL with a `{}` default so the
+   * fake `makeSubagentRuntime` and any hand-built deps literal don't break.
+   */
+  settingsEnv?: Record<string, string | undefined>;
+  /**
+   * Absolute project root, injected as `CLAUDE_PROJECT_DIR` into subagent bash.
+   * OPTIONAL; defaults to the dispatch cwd when unset.
+   */
+  projectRoot?: string;
+  /**
+   * Pinned Git-Bash path on Windows (from `resolveGitBashPath`), applied to the
+   * subagent built-in bash tool by the shared factory. OPTIONAL/absent elsewhere.
+   */
+  shellPath?: string;
   /**
    * Preferred: builds a PER-DISPATCH context injector with its own fresh injection
    * state. Sharing the parent's injector would let a subagent's file touches consume
@@ -213,7 +231,20 @@ export function usageFromStats(stats: PiSessionStats | undefined): DispatchUsage
   return Object.keys(usage).length ? usage : undefined;
 }
 
-export interface PiSdk {
+/**
+ * PiSdk also mirrors {@link BuiltinToolSdk}'s built-in tool constructors, but as
+ * OPTIONAL members (via `Partial`) so the checked fake-sdk literal and any
+ * un-wired fake still satisfy the interface. The subagent path narrows/asserts
+ * the handle to the required `BuiltinToolSdk` before calling
+ * `buildStockBuiltinTools`.
+ *
+ * This mirror is hand-maintained: the main path passes the raw Pi import
+ * directly, so a newly-added built-in must be added to `loadRealSdk` by hand. That
+ * is loud-fail plumbing (`undefined is not a function`), NOT a semantic-drift
+ * surface — both paths still call the SAME factory, so tool *semantics* stay
+ * single-owned.
+ */
+export interface PiSdk extends Partial<BuiltinToolSdk> {
   createAgentSession(options: Record<string, unknown>): Promise<{ session: PiSession }>;
   DefaultResourceLoader: new (options: Record<string, unknown>) => { reload(): Promise<void> };
   inMemorySessionManager(cwd: string): unknown;
@@ -377,13 +408,39 @@ async function loadRealSdk(): Promise<PiSdk> {
     // source file and writes a brand-new file — the parent transcript is untouched.
     forkSessionManager: (sourcePath: string, cwd: string, sessionDir: string, id: string) =>
       m.SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id }),
-    // shellPath pins subagent bash to Git Bash on Windows (see resolveGitBashPath).
+    // Git-Bash pin — DEGRADE BACKSTOP, not the primary owner. The single owner of
+    // the builtin bash tool's Windows Git-Bash pin is the shared factory
+    // (buildStockBuiltinTools, threaded `shellPath`): that factory bash shadows the
+    // SDK's stock bash BY NAME, so this settings-manager `shellPath` no longer
+    // reaches the tool the model actually calls. It backs only the SDK-INTERNAL /
+    // `!`-shell path (which still resolves through the settings manager). The
+    // factory's `shellPath` threading is covered by the win32 shared-factory
+    // bash-options unit test; the end-to-end proof that subagent bash resolves Git
+    // Bash on Windows is the real-stack subagent e2e. Keep this line as an explicit
+    // backstop for the `!`-shell path, do not delete it.
     inMemorySettingsManager: () =>
       m.SettingsManager.inMemory({
         compaction: { enabled: true },
         ...(shellPath ? { shellPath } : {}),
       }),
     agentDir: () => m.getAgentDir(),
+    // Built-in tool constructors (hand-maintained mirror; see PiSdk doc). Exposed
+    // so the shared factory (buildStockBuiltinTools) can build the subagent path's
+    // built-ins from the same source the main session uses.
+    createBashTool: (cwd: string, options: unknown) => m.createBashTool(cwd, options),
+    createReadTool: (cwd: string) => m.createReadTool(cwd),
+    createWriteTool: (cwd: string) => m.createWriteTool(cwd),
+    createEditTool: (cwd: string) => m.createEditTool(cwd),
+    createGrepTool: (cwd: string) => m.createGrepTool(cwd),
+    createFindTool: (cwd: string) => m.createFindTool(cwd),
+    createLsTool: (cwd: string) => m.createLsTool(cwd),
+    createBashToolDefinition: (cwd: string) => m.createBashToolDefinition(cwd),
+    createReadToolDefinition: (cwd: string) => m.createReadToolDefinition(cwd),
+    createWriteToolDefinition: (cwd: string) => m.createWriteToolDefinition(cwd),
+    createEditToolDefinition: (cwd: string) => m.createEditToolDefinition(cwd),
+    createGrepToolDefinition: (cwd: string) => m.createGrepToolDefinition(cwd),
+    createFindToolDefinition: (cwd: string) => m.createFindToolDefinition(cwd),
+    createLsToolDefinition: (cwd: string) => m.createLsToolDefinition(cwd),
   };
 }
 
@@ -659,6 +716,16 @@ export class SubagentRuntime {
      * discipline). Absent for a coordinator dispatch.
      */
     parentAgentId?: string;
+    /**
+     * The dispatching subagent's own working directory (its `subCwd`, i.e. the
+     * worktree it entered). When set, a FRESH dispatch begins here instead of at
+     * the orchestrator's cwd, so a worktree-resident parent's isolation extends to
+     * the children it spawns. Absent for a top-level (coordinator) dispatch, which
+     * keeps the orchestrator cwd. Ignored on resume (a resumed run reuses its
+     * original cwd/worktree). Runtime-threaded from the Agent tool's `dispatchCwd`,
+     * never a tool parameter.
+     */
+    parentCwd?: string;
     /**
      * The Agent tool's model-supplied `description` label, already sanitized
      * at capture; stored set-once on the registry record (the panel's label).
@@ -1188,7 +1255,15 @@ export class SubagentRuntime {
       }
       started = true;
 
-      let cwd = this.deps.getCwd();
+      // A nested dispatch begins at its DISPATCHER's cwd (`parentCwd`): a subagent
+      // that entered a worktree extends that isolation to the children it spawns.
+      // Top-level (coordinator) dispatches carry no `parentCwd` and keep the
+      // orchestrator cwd. Resume overrides this below (original cwd reused). This
+      // seed governs a child that stays put (`isolation: none` or a failed entry);
+      // a child that requests `isolation: worktree` overwrites `cwd` with its own
+      // worktree in the branch below — and that worktree is anchored to the
+      // WorktreeManager's fixed projectRoot, NOT to `parentCwd`.
+      let cwd = opts.parentCwd ?? this.deps.getCwd();
       if (opts.resume) {
         // Resume: reuse the ORIGINAL cwd/worktree exactly — never enter a
         // new worktree (that would branch a fresh, empty checkout and lose the
@@ -1290,6 +1365,35 @@ export class SubagentRuntime {
       const customTools = this.deps.customToolsFor(agent, granted, opts.depth, agentId, isFork, subCwd);
 
       const sdk = await this.sdk();
+
+      // Subagent built-ins from the SHARED factory: the exact same seven tool
+      // implementations the main session builds (index.ts), constructed here
+      // against the dispatch-local `subCwd` — NEVER the orchestrator cwd. The
+      // execute closure rebinds per call via `subCwd.get()`, so after THIS agent's
+      // own EnterWorktree its built-ins re-resolve to the new worktree cwd in
+      // lockstep with the guard (which reads the same `subCwd` via `getCwd`, above)
+      // and the custom tools (all cwd-bound to the same `subCwd`). This gives the
+      // subagent bash `settingsEnv` + `CLAUDE_PROJECT_DIR` via the factory's
+      // spawnHook, and eliminates the built-in/guard cwd desync after a worktree entry.
+      //
+      // Filter by `piBuiltins` (== `claudeToolsToPiBuiltins(granted)`), NOT by
+      // `granted`: `granted` holds CLAUDE names (`Bash`, `Glob`) while the factory
+      // emits PI names (`bash`, `find`, `ls`) and `Glob` fans out to `[find, ls]`.
+      // A read-only agent thus receives only its permitted built-in implementations.
+      //
+      // The tools keep their Pi lowercase names so they (a) SHADOW the stock Pi
+      // built-ins and (b) the guard's `toClaudeCall`/`PI_TO_CLAUDE` map still
+      // resolves `bash → Bash` for deny rules. Appended RAW (no `wrapForSelfShell`
+      // — the subagent set renders in subagent transcripts, not the TUI).
+      const grantedPiBuiltins = new Set(piBuiltins);
+      const factoryBuiltins = buildStockBuiltinTools(sdk as BuiltinToolSdk, subCwd, {
+        settingsEnv: this.deps.settingsEnv ?? {},
+        projectRoot: this.deps.projectRoot ?? cwd,
+        ...(this.deps.shellPath ? { shellPath: this.deps.shellPath } : {}),
+      });
+      for (const builtin of factoryBuiltins) {
+        if (grantedPiBuiltins.has(builtin.name)) customTools.push(builtin.def);
+      }
       const injector = this.deps.makeContextInjector
         ? this.deps.makeContextInjector(() => subCwd.get())
         : this.deps.contextForTouchedFile;
@@ -1341,6 +1445,15 @@ export class SubagentRuntime {
         model = this.deps.resolveModel(undefined);
       }
       const thinking = this.deps.mapEffort(opts.effort ?? agent.effort);
+      // The built-in NAMES must appear in `toolNames`: verified against the Pi SDK
+      // (agent-session.js), custom tools are filtered by the `tools:` allowlist by
+      // name, so a name absent from `toolNames` would drop the same-named FACTORY
+      // custom too; the registry then sets customs over stock built-ins by name
+      // last, so the same-named custom deterministically WINS (shadows the stock
+      // built-in). The appended factory built-ins already contribute those names via
+      // `customTools.map` below, so spreading `piBuiltins` here is belt-and-suspenders,
+      // not strictly required — kept for clarity. Each name then appears twice in
+      // `toolNames`, harmless because Pi de-dups `allowedToolNames` into a Set.
       const toolNames = [
         ...piBuiltins,
         ...customTools.map((t) => (t as { name: string }).name),
@@ -1978,6 +2091,16 @@ export function createAgentToolDefinition(
      * for normal (non-fork) subagents. Never sourced from a tool parameter.
      */
     dispatcherIsFork?: boolean;
+    /**
+     * The DISPATCHER's own live working directory. When this Agent/Task tool is
+     * handed to a subagent, this returns that subagent's current cwd (its
+     * dispatch-local `subCwd` — the worktree it may have entered), so a fresh
+     * nested dispatch begins where its parent is working rather than at the
+     * orchestrator's cwd. Read at dispatch time so a mid-run worktree entry is
+     * reflected. Absent for the coordinator instance, whose dispatches keep the
+     * orchestrator cwd. Never sourced from a tool parameter.
+     */
+    dispatchCwd?: () => string;
   },
 ): Record<string, unknown> {
   return {
@@ -2054,6 +2177,11 @@ export function createAgentToolDefinition(
         // for the coordinator) — the same runtime-set channel as ownerAgentId,
         // never a tool parameter.
         parentAgentId: opts.ownerAgentId,
+        // The dispatching subagent's live cwd, resolved NOW (dispatch time) so a
+        // worktree the parent entered mid-run is captured. A fresh nested dispatch
+        // starts here; undefined for a coordinator dispatch (no dispatchCwd), which
+        // keeps the orchestrator cwd.
+        parentCwd: opts.dispatchCwd?.(),
         description,
       };
       const backgroundDisabled = isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS);
