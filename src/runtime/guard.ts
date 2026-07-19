@@ -2,6 +2,7 @@ import type { PermissionEngine } from "../engine/permissions.js";
 import { matchesRule, parseRule, READ_DENY_EDIT_TOOLS } from "../engine/permissions.js";
 import type { HookRunnerLike } from "../engine/hook-runner.js";
 import { applyUpdatedInput, toClaudeCall, touchedFilePath } from "./tool-map.js";
+import { clipOversizedToolResult } from "./tool-clip.js";
 
 /**
  * The enforcement guard: an inline Pi extension shared by the main session and every
@@ -24,6 +25,13 @@ export interface GuardDeps {
   extraDenyRules?: () => string[];
   /** Label used in notices (e.g. "subagent:reviewer"). */
   label?: string;
+  /**
+   * Per-text-block token budget above which a single tool result is clipped
+   * (head + tail kept, middle replaced by a model-visible marker). Resolved once
+   * at load (`config.compaction.clipMaxTokens`) and threaded in. Omitted where a
+   * facade carries no config — the clip then simply does not run.
+   */
+  clipMaxTokens?: number;
 }
 
 // Pi event payloads are typed loosely here; the pinned shapes are in doc/pi-integration.md.
@@ -172,11 +180,26 @@ export function createGuardExtension(deps: GuardDeps) {
 
     pi.on("tool_result", async (event: any) => {
       const eventName = event.isError ? "PostToolUseFailure" : "PostToolUse";
+      // Clip oversized tool-result text BEFORE the hasHooks gate below, so the
+      // backstop fires even for the common project that has no PostToolUse hooks.
+      // Because the returned value is the one canonical result (content/details/
+      // isError), the TUI renders the row from the clipped content — the marker
+      // travels in-band on the same result, with no separate un-clipped path.
+      // `clipContent === event.content` (same reference) means everyday-sized
+      // results are left byte-identical.
+      const clipContent =
+        deps.clipMaxTokens !== undefined
+          ? clipOversizedToolResult(event.content, deps.clipMaxTokens, event.toolName, event.input ?? {})
+          : event.content;
+      const clipped = clipContent !== event.content;
       // No hooks configured for this event: skip the payload construction
       // (including the serializability probe over a possibly huge result) and
       // the fire() entirely. Facades without hasHooks degrade to always-fire.
+      // A clip still returns (replacing the result); an untouched result is a no-op.
       if (typeof deps.hooks.hasHooks === "function" && !deps.hooks.hasHooks(eventName)) {
-        return undefined;
+        return clipped
+          ? { content: clipContent, details: event.details, isError: event.isError }
+          : undefined;
       }
       const input = (event.input ?? {}) as Record<string, unknown>;
       const call = toClaudeCall(event.toolName, input, deps.getCwd());
@@ -220,10 +243,16 @@ export function createGuardExtension(deps: GuardDeps) {
         feedback.push(`[hook blocked] ${outcome.blockReason ?? "PostToolUse hook rejected this result"}`);
       }
       if (outcome.additionalContext) feedback.push(`[hook context] ${outcome.additionalContext}`);
+      // One owner of the return: the clipped content is the base, hook feedback is
+      // appended to it, and details/isError are always preserved (a bare `{ content }`
+      // lets agent-session.js overwrite details with undefined).
       if (feedback.length) {
-        const content = Array.isArray(event.content) ? [...event.content] : [];
+        const content = Array.isArray(clipContent) ? [...clipContent] : [];
         content.push({ type: "text", text: `\n${feedback.join("\n")}` });
-        return { content };
+        return { content, details: event.details, isError: event.isError };
+      }
+      if (clipped) {
+        return { content: clipContent, details: event.details, isError: event.isError };
       }
       return undefined;
     });

@@ -115,7 +115,21 @@ rules, and the rendered bodies of currently-active skills. Additionally our `bef
 always re-asserts the instruction set in the system prompt (system prompt is rebuilt every turn
 and never compacted away) — that is the primary preservation mechanism; the post-compact message
 covers mid-turn context. PreCompact/PostCompact **project hooks** fire around these events.
-Compaction settings pass through Pi (`compaction.reserveTokens` etc.).
+Compaction settings pass through Pi (`compaction.reserveTokens` etc.). `reserveTokens` is a
+**Pi settings-file** value that extensions cannot raise; PiCC's `proactiveCompactPercent`
+compacts *sooner* as the extension-side margin lever, but it cannot make Pi tolerate more than
+`contextWindow − reserveTokens` — raising the hard reserve stays an upstream-Pi/settings matter.
+
+We likewise do not *retry* Pi's overflow-recovery summarization when it fails on a transient
+error. That recovery is a single, non-retried summarization Pi runs on its own authed transport
+(`this.agent.streamFn`), and the extension seam exposes no `streamFn`/`agent` handle to re-run it:
+the only completion path reachable from an extension (`completeSimple` with `streamFn` undefined)
+bypasses ChatGPT/Codex OAuth and so cannot faithfully stand in for Pi's summarizer. A true
+in-recovery retry is therefore an **upstream-Pi requirement**, not something PiCC can add from the
+seam. PiCC's resilience comes instead from the proactive early compaction above: firing Pi's own
+reliable compaction before usage reaches the edge means a transient blip lands during a safe
+compaction (the next turn simply re-fires) rather than during the single-shot recovery at the
+overflow edge where it is fatal.
 
 ### 3.6 What stays Pi-native
 Auth (`/login` ChatGPT/Codex OAuth), provider abstraction, retry, session persistence/tree,

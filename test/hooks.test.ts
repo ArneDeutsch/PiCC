@@ -1039,7 +1039,9 @@ describe("HookRunner stdin payload", () => {
 // ---------------------------------------------------------------------------
 
 describe("guard hook payloads", () => {
-  function makeGuard(opts: { hasHooks?: (event: string) => boolean } = {}) {
+  function makeGuard(
+    opts: { hasHooks?: (event: string) => boolean; clipMaxTokens?: number } = {},
+  ) {
     const fired: Array<{ event: string; payload: Partial<HookPayload> }> = [];
     const hooks = {
       fire: async (event: string, payload: Partial<HookPayload>) => {
@@ -1058,7 +1060,12 @@ describe("guard hook payloads", () => {
         handlers.set(event, handler),
       sendMessage: () => undefined,
     };
-    createGuardExtension({ engine, hooks, getCwd: () => process.cwd() })(pi as never);
+    createGuardExtension({
+      engine,
+      hooks,
+      getCwd: () => process.cwd(),
+      ...(opts.clipMaxTokens !== undefined ? { clipMaxTokens: opts.clipMaxTokens } : {}),
+    })(pi as never);
     return { fired, handlers };
   }
 
@@ -1099,34 +1106,29 @@ describe("guard hook payloads", () => {
     expect(fired[0]?.payload.tool_use_id).toBeUndefined();
   });
 
-  it("skips payload construction and fire entirely when hasHooks reports no PostToolUse hooks", async () => {
+  it("fires no hook and builds no hook payload when hasHooks reports no PostToolUse hooks", async () => {
     const probed: string[] = [];
+    // Configure the clip so its (legitimate) pre-gate `.text` read happens — the
+    // guard reads the result text to size the clip BEFORE the hasHooks gate. The
+    // invariant is no longer "zero .text reads"; it is that with no PostToolUse
+    // hooks the handler fires NO hook and builds NO JSON hook payload.
     const { fired, handlers } = makeGuard({
+      clipMaxTokens: 20_000,
       hasHooks: (event) => {
         probed.push(event);
         return false;
       },
     });
-    // A getter counts serialization-probe touches: with no hooks configured
-    // the guard must not even attempt to JSON-serialize the result content.
-    let touches = 0;
-    const content = [
-      {
-        type: "text",
-        get text() {
-          touches++;
-          return "x";
-        },
-      },
-    ];
+    // A small, below-budget result is left untouched, so the handler is a no-op.
+    const content = [{ type: "text", text: "x" }];
     const result = await handlers.get("tool_result")!(
       { toolName: "bash", input: { command: "ls" }, content, isError: false },
       {},
     );
     expect(result).toBeUndefined();
     expect(probed).toEqual(["PostToolUse"]);
+    // The clip path must not call deps.hooks.fire when no hooks are configured.
     expect(fired).toHaveLength(0);
-    expect(touches).toBe(0);
   });
 
   it("still fires when hasHooks reports true, and asks per failure event", async () => {

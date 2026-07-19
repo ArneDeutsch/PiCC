@@ -52,7 +52,16 @@ import {
   resetInjectionState,
   type AssemblyInputs,
 } from "../src/runtime/context-assembly.js";
-import { mapEffort, steeringForModel, type PiCCConfig } from "../src/runtime/steering.js";
+import {
+  mapEffort,
+  steeringForModel,
+  loadPiCCConfig,
+  resolveCompactionConfig,
+  DEFAULT_PROACTIVE_COMPACT_PERCENT,
+  DEFAULT_CLIP_MAX_TOKENS,
+  projectConfigPath,
+  type PiCCConfig,
+} from "../src/runtime/steering.js";
 import { createAgentToolDefinition, extractText, type SubagentRuntime } from "../src/runtime/subagents.js";
 import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import { visibleWidth as tuiVisibleWidth, Text as TuiText } from "@earendil-works/pi-tui";
@@ -160,6 +169,7 @@ describe("steering", () => {
   const config: PiCCConfig = {
     steering: { "openai/*": "Be terse.", "*/gpt-5*": "Use locked YAML faithfully." },
     effortMap: { low: "low", medium: "medium", high: "high", max: "max", maximum: "max" },
+    compaction: { proactiveCompactPercent: DEFAULT_PROACTIVE_COMPACT_PERCENT, clipMaxTokens: DEFAULT_CLIP_MAX_TOKENS },
     diagnostics: [],
   };
 
@@ -179,6 +189,7 @@ describe("steering", () => {
     const cfg: PiCCConfig = {
       steering: { "*": "ALL-MODELS", "gpt-5*": "GPT-GUIDANCE" },
       effortMap: {},
+      compaction: { proactiveCompactPercent: DEFAULT_PROACTIVE_COMPACT_PERCENT, clipMaxTokens: DEFAULT_CLIP_MAX_TOKENS },
       diagnostics: [],
     };
     expect(steeringForModel(cfg, "openai/gpt-5.5")).toContain("ALL-MODELS");
@@ -187,8 +198,266 @@ describe("steering", () => {
   });
 
   it("never throws on a malformed steering pattern", () => {
-    const cfg: PiCCConfig = { steering: { "[unclosed": "X" }, effortMap: {}, diagnostics: [] };
+    const cfg: PiCCConfig = {
+      steering: { "[unclosed": "X" },
+      effortMap: {},
+      compaction: { proactiveCompactPercent: DEFAULT_PROACTIVE_COMPACT_PERCENT, clipMaxTokens: DEFAULT_CLIP_MAX_TOKENS },
+      diagnostics: [],
+    };
     expect(() => steeringForModel(cfg, "openai/gpt-5.5")).not.toThrow();
+  });
+});
+
+describe("resolveCompactionConfig", () => {
+  const baseConfig = (over: Partial<PiCCConfig> = {}): PiCCConfig => ({
+    steering: {},
+    effortMap: {},
+    compaction: { proactiveCompactPercent: DEFAULT_PROACTIVE_COMPACT_PERCENT, clipMaxTokens: DEFAULT_CLIP_MAX_TOKENS },
+    diagnostics: [],
+    ...over,
+  });
+
+  it("applies documented defaults when both knobs are unset (no diagnostic)", () => {
+    const cfg = baseConfig();
+    const resolved = resolveCompactionConfig(cfg);
+    expect(resolved.proactiveCompactPercent).toBe(DEFAULT_PROACTIVE_COMPACT_PERCENT);
+    expect(resolved.proactiveCompactPercent).toBe(85);
+    expect(resolved.clipMaxTokens).toBe(DEFAULT_CLIP_MAX_TOKENS);
+    expect(resolved.clipMaxTokens).toBe(20000);
+    expect(cfg.diagnostics).toHaveLength(0);
+  });
+
+  it("passes through valid in-range values", () => {
+    const cfg = baseConfig({ proactiveCompactPercent: 70, clipMaxTokens: 5000 });
+    const resolved = resolveCompactionConfig(cfg);
+    expect(resolved.proactiveCompactPercent).toBe(70);
+    expect(resolved.clipMaxTokens).toBe(5000);
+    expect(cfg.diagnostics).toHaveLength(0);
+  });
+
+  it("accepts the exact inclusive boundaries unchanged with no diagnostic", () => {
+    const low = baseConfig({ proactiveCompactPercent: 50, clipMaxTokens: 1000 });
+    const lowResolved = resolveCompactionConfig(low);
+    expect(lowResolved.proactiveCompactPercent).toBe(50);
+    expect(lowResolved.clipMaxTokens).toBe(1000);
+    expect(low.diagnostics).toHaveLength(0);
+
+    const high = baseConfig({ proactiveCompactPercent: 95 });
+    const highResolved = resolveCompactionConfig(high);
+    expect(highResolved.proactiveCompactPercent).toBe(95);
+    expect(high.diagnostics).toHaveLength(0);
+  });
+
+  it("accepts a fractional percent but requires an integer clip budget", () => {
+    const cfg = baseConfig({ proactiveCompactPercent: 87.5, clipMaxTokens: 20000.5 });
+    const resolved = resolveCompactionConfig(cfg);
+    expect(resolved.proactiveCompactPercent).toBe(87.5);
+    // non-integer clip budget is rejected -> default, with a diagnostic
+    expect(resolved.clipMaxTokens).toBe(DEFAULT_CLIP_MAX_TOKENS);
+    expect(
+      cfg.diagnostics.some((d) => d.severity === "warning" && d.message.includes("clipMaxTokens")),
+    ).toBe(true);
+  });
+
+  it("stores proactiveCompactPercent on the 0–100 scale (not a 0–1 fraction)", () => {
+    // A fraction like 0.85 is out of range [50,95] and must NOT be silently accepted —
+    // it fails closed to the 0–100-scale default so proactive compaction never thrashes.
+    const cfg = baseConfig({ proactiveCompactPercent: 0.85 });
+    const resolved = resolveCompactionConfig(cfg);
+    expect(resolved.proactiveCompactPercent).toBe(85);
+    expect(
+      cfg.diagnostics.some((d) => d.severity === "warning" && d.message.includes("proactiveCompactPercent")),
+    ).toBe(true);
+  });
+
+  // Each invalid value falls back to its default, emits a diagnostic, never throws or zeroes.
+  const invalidPercent: Array<[string, unknown]> = [
+    ["wrong type (boolean)", true],
+    ["zero", 0],
+    ["negative", -10],
+    ["NaN", NaN],
+    ["Infinity", Infinity],
+    ['"1e999" string', "1e999"],
+    ["below range", 40],
+    ["above range", 99],
+  ];
+  for (const [label, value] of invalidPercent) {
+    it(`fails closed to the percent default on ${label}`, () => {
+      const cfg = baseConfig({ proactiveCompactPercent: value as number });
+      let resolved!: ReturnType<typeof resolveCompactionConfig>;
+      expect(() => {
+        resolved = resolveCompactionConfig(cfg);
+      }).not.toThrow();
+      expect(resolved.proactiveCompactPercent).toBe(DEFAULT_PROACTIVE_COMPACT_PERCENT);
+      expect(
+        cfg.diagnostics.some((d) => d.severity === "warning" && d.message.includes("proactiveCompactPercent")),
+      ).toBe(true);
+    });
+  }
+
+  const invalidClip: Array<[string, unknown]> = [
+    ["wrong type (boolean)", true],
+    ["zero", 0],
+    ["negative", -5],
+    ["NaN", NaN],
+    ["Infinity", Infinity],
+    ['"1e999" string', "1e999"],
+    ["below floor", 500],
+  ];
+  for (const [label, value] of invalidClip) {
+    it(`fails closed to the clip default on ${label}`, () => {
+      const cfg = baseConfig({ clipMaxTokens: value as number });
+      let resolved!: ReturnType<typeof resolveCompactionConfig>;
+      expect(() => {
+        resolved = resolveCompactionConfig(cfg);
+      }).not.toThrow();
+      expect(resolved.clipMaxTokens).toBe(DEFAULT_CLIP_MAX_TOKENS);
+      expect(resolved.clipMaxTokens).toBeGreaterThan(0);
+      expect(
+        cfg.diagnostics.some((d) => d.severity === "warning" && d.message.includes("clipMaxTokens")),
+      ).toBe(true);
+    });
+  }
+
+  it("accepts numeric strings from a config file (asFiniteNumber tolerance)", () => {
+    const cfg = baseConfig({
+      proactiveCompactPercent: "80" as unknown as number,
+      clipMaxTokens: "12000" as unknown as number,
+    });
+    const resolved = resolveCompactionConfig(cfg);
+    expect(resolved.proactiveCompactPercent).toBe(80);
+    expect(resolved.clipMaxTokens).toBe(12000);
+    expect(cfg.diagnostics).toHaveLength(0);
+  });
+});
+
+describe("loadPiCCConfig compaction knobs (real file)", () => {
+  it("resolves valid knobs once at load and project overrides user", () => {
+    // Materialize a real user config by pointing homedir at a temp dir (userConfigPath
+    // is derived from os.homedir()), then a project config that overrides it key-wise.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "picc-home-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-cfg-"));
+    const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      const userFile = path.join(home, ".picc", "config.json");
+      fs.mkdirSync(path.dirname(userFile), { recursive: true });
+      fs.writeFileSync(
+        userFile,
+        JSON.stringify({ proactiveCompactPercent: 60, clipMaxTokens: 5000 }),
+        "utf8",
+      );
+      const file = projectConfigPath(dir);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(
+        file,
+        JSON.stringify({ proactiveCompactPercent: 75, clipMaxTokens: 30000 }),
+        "utf8",
+      );
+      const config = loadPiCCConfig(dir);
+      // Production read path: resolved once at load, stored on config.compaction.
+      expect(config.compaction.proactiveCompactPercent).toBe(75);
+      expect(config.compaction.clipMaxTokens).toBe(30000);
+      // Both scopes were valid, so no validation diagnostics — and exactly none, proving
+      // the resolver ran a single time (a double-resolve would still be zero here, so the
+      // count is pinned harder on the malformed cases below).
+      expect(config.diagnostics).toHaveLength(0);
+    } finally {
+      homeSpy.mockRestore();
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves only once at load (no double diagnostics) on a malformed value in the file", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-cfg-"));
+    try {
+      const file = projectConfigPath(dir);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(
+        file,
+        JSON.stringify({ proactiveCompactPercent: "not-a-number", clipMaxTokens: 999 }),
+        "utf8",
+      );
+      const config = loadPiCCConfig(dir);
+      // Read the resolve-once field, not a fresh resolve.
+      expect(config.compaction.proactiveCompactPercent).toBe(DEFAULT_PROACTIVE_COMPACT_PERCENT);
+      expect(config.compaction.clipMaxTokens).toBe(DEFAULT_CLIP_MAX_TOKENS);
+      // Exactly one warning per invalid knob (two total). A per-turn re-resolve would
+      // have doubled these — this pins the single-resolve-at-load contract.
+      expect(config.diagnostics.filter((d) => d.severity === "warning" && d.message.includes("proactiveCompactPercent"))).toHaveLength(1);
+      expect(config.diagnostics.filter((d) => d.severity === "warning" && d.message.includes("clipMaxTokens"))).toHaveLength(1);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("surfaces a validation diagnostic on stderr at harness startup (not just on config.diagnostics)", async () => {
+    // A silently-reverted knob is the bug: the harness must ECHO the diagnostic, the same way
+    // it surfaces permission-engine findings. Boot the real extension over a project whose
+    // config carries an out-of-range value and assert the drain reached console.error.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "picc-home-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-boot-"));
+    const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(home);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const originalCwd = process.cwd();
+    try {
+      fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "CLAUDE.md"), "# Boot project\n");
+      const userDir = path.join(dir, ".claude-user");
+      fs.mkdirSync(userDir, { recursive: true });
+      process.env.PICC_CLAUDE_USER_DIR = userDir;
+      const file = projectConfigPath(dir);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      // clipMaxTokens=500 is below the 1000 floor → reverts to default WITH a diagnostic.
+      fs.writeFileSync(file, JSON.stringify({ clipMaxTokens: 500 }), "utf8");
+      process.chdir(dir);
+
+      const pi = fakePi();
+      piccExtension(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+      await pi.waitForInitialization();
+
+      const surfaced = errSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((m) => m.startsWith("PiCC config:") && m.includes("clipMaxTokens"));
+      expect(surfaced.length, "a config validation diagnostic must reach stderr").toBeGreaterThan(0);
+    } finally {
+      process.chdir(originalCwd);
+      if (savedUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = savedUserDir;
+      errSpy.mockRestore();
+      homeSpy.mockRestore();
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("an invalid project value defaults the knob and does not keep a valid user value", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "picc-home-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-cfg-"));
+    const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      // Valid user value...
+      const userFile = path.join(home, ".picc", "config.json");
+      fs.mkdirSync(path.dirname(userFile), { recursive: true });
+      fs.writeFileSync(userFile, JSON.stringify({ proactiveCompactPercent: 60 }), "utf8");
+      // ...clobbered by a malformed project value (project overrides user key-wise).
+      const file = projectConfigPath(dir);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify({ proactiveCompactPercent: "bad" }), "utf8");
+
+      const config = loadPiCCConfig(dir);
+      // The safe default is used — NOT the valid user value 60.
+      expect(config.compaction.proactiveCompactPercent).toBe(DEFAULT_PROACTIVE_COMPACT_PERCENT);
+      expect(config.compaction.proactiveCompactPercent).not.toBe(60);
+      expect(
+        config.diagnostics.some((d) => d.severity === "warning" && d.message.includes("proactiveCompactPercent")),
+      ).toBe(true);
+    } finally {
+      homeSpy.mockRestore();
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

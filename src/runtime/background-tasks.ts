@@ -1,6 +1,7 @@
 import { Type } from "typebox";
 import type { Diagnostic } from "../types.js";
 import { agentTrailerFrame, agentTrailerLine, isAgentId } from "../util/subagent-transcripts.js";
+import { neutralizeControlChars } from "../util/neutralize-text.js";
 import {
   formatUsageCompact,
   progressActivityLine,
@@ -683,18 +684,10 @@ function noticeOutcome(status: BackgroundTaskStatus): "completed" | "failed" | "
  * are separated by the literal "OUTPUT").
  */
 function boundExcerpt(text: string): { excerpt: string; truncated: boolean } {
-  let flat = text
-    .normalize("NFC")
-    // Remove zero-width / format chars (ZWSP/ZWNJ/ZWJ U+200B-200D, word joiner
-    // U+2060, BOM/ZWNBSP U+FEFF, and the whole `\p{Cf}` format class) so a char
-    // hidden inside a keyword cannot defeat the marker matchers. Removed (not
-    // spaced) so the keyword re-forms and is then caught. Escapes keep the
-    // source pure-ASCII (no invisible bytes).
-    .replace(/[\u200B-\u200D\u2060\uFEFF]/gu, "")
-    .replace(/\p{Cf}/gu, "")
-    // Keep \n and \t; replace every other control char (incl. \r, ESC, BEL, NUL)
-    // with a space so no terminal escape survives.
-    .replace(/\p{Cc}/gu, (c) => (c === "\n" || c === "\t" ? c : " "))
+  // Codepoint-safe control/format neutralization (NFC, strip `\p{Cf}`, space out
+  // other control chars) is the shared core; the frame-marker defang below is
+  // this caller's own layer on top of it.
+  let flat = neutralizeControlChars(text)
     // Fast path: neutralize the EXACT literal frame markers.
     .split(NOTICE_BEGIN)
     .join("[frame marker removed]")
