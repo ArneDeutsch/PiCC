@@ -233,8 +233,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(clip?.note).toContain("DIRECTIONAL DIVERGENCE");
     expect(clip?.note).toContain("HIGH backstop ABOVE Claude's own bounding");
     expect(clip?.note).toContain("PiCC HARDENING, NOT Claude parity");
-    // Softened TUI-render claim: the mechanism, not an asserted human observation.
-    expect(clip?.note).toContain("renders the row from the clipped content");
+    // Human presentation may summarize clipping without changing canonical model content.
+    expect(clip?.note).toContain("marker travels in-band on the canonical model-visible result");
     // Parity Q5 consumer note: the clip is a TRUNCATION, not just an added marker.
     expect(clip?.note).toContain("CONSUMER NOTE (parity Q5)");
     expect(clip?.note).toContain("account for the truncation itself, not merely the added marker");

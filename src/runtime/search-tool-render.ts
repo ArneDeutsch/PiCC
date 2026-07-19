@@ -460,6 +460,7 @@ const CLIP_HINTS: Record<SearchName, string> = {
   Glob: "re-run a narrower command — target a specific path, request fewer entries, or pipe through a filter — to recover the omitted output",
 };
 
+// Only the guard's exact marker licenses adding clipped status; counts and user prose do not.
 function exactClipMarker(toolName: SearchName, text: string): boolean {
   const escaped = CLIP_HINTS[toolName].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(
@@ -608,6 +609,8 @@ function combinedComponent(components: readonly Component[]): Component {
   });
 }
 
+// HTML serializes the call before the result, so renderResult owns the settled summary;
+// the empty call also avoids a second TUI content row.
 export function withCompactSearchTuiRendering<T extends ToolDefinition>(tool: T): T {
   if (tool.name !== "Grep" && tool.name !== "Glob") throw new TypeError("compact search rendering accepts only Grep or Glob tools");
   const toolName = tool.name;

@@ -434,9 +434,8 @@ function selfShellComponent(
  * Wrap a tool so its row renders self-shell (no top/bottom padding) with the
  * background re-applied per line. Sets `renderShell:"self"` and installs a
  * renderCall/renderResult that:
- *   - invoke the tool's OWN renderer when present (Agent/Task/TaskOutput and the
- *     re-registered built-ins' `create*ToolDefinition` renderers), else a generic
- *     fallback (all the renderer-less Claude-named tools);
+ *   - invoke the tool's own renderer when present, else install the generic
+ *     fallback without maintaining a separate tool-name inventory;
  *   - thread `ctx.lastComponent` to the PREVIOUS INNER component so the built-ins'
  *     incremental rendering (diffs, streamed output) survives the wrap, and reuse
  *     the previous wrapper's persistent Box so its render cache survives too;

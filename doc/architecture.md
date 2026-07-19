@@ -232,8 +232,8 @@ where to start reading, not the extent of its cluster.
   from a config **outside the project** — outside **because harness state must not touch the target
   project**.
 
-- **Tool-row rendering** (`tool-shell.ts`) — the single self-shell seam, PiCC's side of the carve-out
-  in *The Pi ⇄ PiCC boundary*.
+- **Tool-row rendering** (`tool-shell.ts`, `search-tool-render.ts`) — the self-shell framing seam and
+  its specialized main-session Grep/Glob human renderer; neither changes canonical tool results.
 
 - **`tools/`** — the **self-contained** Claude-named tools, and the degrade stubs: names that resolve
   for gating but no-op with a notice. A tool that fronts a runtime subsystem lives with that

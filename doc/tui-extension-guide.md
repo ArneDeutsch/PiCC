@@ -130,12 +130,11 @@ the framing step order (strip/clamp before the Box paints) and the throw-guards 
 wrapped in Pi's try/catch, so an unguarded throw (unknown bg slot, absent theme, a negative
 `repeat`) kills Pi's whole render loop; a headless / no-theme render degrades to plain text.
 
-- **Own tools with a renderer** (Agent / Task / TaskOutput): the wrapper invokes the tool's own
-  `renderCall`/`renderResult`, then frames the result via the Box.
-- **Own tools without a renderer** (all the other Claude-named tools): the wrapper injects a
-  **generic fallback** reproducing Pi's own `createCallFallback` (bold tool title) and
-  `createResultFallback` (`getTextOutput` result text), so a renderer-less tool de-pads without
-  anyone writing a bespoke renderer.
+- **Own tools with a renderer:** the wrapper invokes the tool's own `renderCall`/`renderResult`,
+  including renderers added by a registration-time decorator, then frames the result via the Box.
+- **Own tools without a renderer:** the wrapper injects a **generic fallback** reproducing Pi's own
+  `createCallFallback` (bold tool title) and `createResultFallback` (`getTextOutput` result text),
+  so a renderer-less tool de-pads without anyone writing a bespoke renderer.
 - **Built-ins** (`bash`/`read`/`write`/`edit`/`grep`/`find`/`ls`): **wrapped, not reimplemented.** PiCC
   re-registers these for cwd-swap (`src/index.ts`, the "Cwd-swapping overrides" block). Their
   renderers are sourced from the public `create*ToolDefinition` factories — the plain `create*Tool`

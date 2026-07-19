@@ -182,9 +182,8 @@ export function createGuardExtension(deps: GuardDeps) {
       const eventName = event.isError ? "PostToolUseFailure" : "PostToolUse";
       // Clip oversized tool-result text BEFORE the hasHooks gate below, so the
       // backstop fires even for the common project that has no PostToolUse hooks.
-      // Because the returned value is the one canonical result (content/details/
-      // isError), the TUI renders the row from the clipped content — the marker
-      // travels in-band on the same result, with no separate un-clipped path.
+      // The marker travels in-band on the canonical/model-visible result; a
+      // specialized human renderer may summarize it without changing that result.
       // `clipContent === event.content` (same reference) means everyday-sized
       // results are left byte-identical.
       const clipContent =

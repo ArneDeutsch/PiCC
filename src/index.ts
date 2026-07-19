@@ -1070,8 +1070,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     try {
       // Wrap EVERY Claude-named tool in the self-shell seam so its row loses the
       // top/bottom blank-line padding while keeping its colored band (re-applied
-      // per line), its 1-col gutter, and its content. The wrapper preserves
-      // `execute` and all other fields untouched. (The subagent-scoped set built
+      // per line) and its 1-col gutter. The wrapper preserves `execute` and all
+      // other fields untouched. (The subagent-scoped set built
       // by `customToolsFor` is intentionally NOT wrapped: it renders inside
       // subagent transcripts, not the parent interactive shell.)
       const mainSessionTool: Record<string, unknown> = tool.name === "Grep" || tool.name === "Glob"
