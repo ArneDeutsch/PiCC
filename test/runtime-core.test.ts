@@ -2753,11 +2753,22 @@ describe("SendMessage parent-only guard through the real harness (tester NIT-2)"
       expect(rcMock.created.length).toBeGreaterThan(before);
       const options = rcMock.created[rcMock.created.length - 1]!;
       const toolNames = (options.tools as string[]) ?? [];
-      const customToolNames = ((options.customTools as Array<{ name: string }>) ?? []).map(
-        (t) => t.name,
-      );
+      const customTools = (options.customTools as Array<{
+        name: string;
+        renderCall?: unknown;
+        renderResult?: unknown;
+        renderShell?: unknown;
+      }>) ?? [];
+      const customToolNames = customTools.map((t) => t.name);
       expect(toolNames).not.toContain("SendMessage");
       expect(customToolNames).not.toContain("SendMessage");
+      for (const name of ["Grep", "Glob"]) {
+        const search = customTools.find((tool) => tool.name === name);
+        expect(search, `subagent missing ${name}`).toBeDefined();
+        expect(search?.renderCall, `${name} gained main-TUI renderer`).toBeUndefined();
+        expect(search?.renderResult, `${name} gained main-TUI renderer`).toBeUndefined();
+        expect(search?.renderShell, `${name} gained main-TUI shell`).toBeUndefined();
+      }
     } finally {
       process.chdir(originalCwd);
       if (savedUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;

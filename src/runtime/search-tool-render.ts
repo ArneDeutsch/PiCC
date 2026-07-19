@@ -8,8 +8,6 @@ import { genericResultComponent, type RenderCtx } from "./tool-shell.js";
 
 const GLOB_CAP = 200;
 const DEFAULT_HEAD_LIMIT = 100;
-const ROW_STATE = "compactSearch";
-const OWN_ROW_STATE = Symbol("compactSearchRowState");
 const LINE_BREAK_RE = /\r\n?|\n|\u2028|\u2029/;
 
 interface Component {
@@ -21,8 +19,7 @@ interface ResultShape {
   details?: unknown;
 }
 
-interface RowState {
-  [OWN_ROW_STATE]?: true;
+interface SummaryState {
   status?: string;
   compactStatus?: string;
   count?: string;
@@ -32,7 +29,6 @@ interface RowState {
 
 interface RenderContext extends RenderCtx {
   args?: unknown;
-  state?: unknown;
 }
 
 interface GrepDetails {
@@ -261,43 +257,6 @@ function guarded(component: Component, fallback = "Search result unavailable"): 
   };
 }
 
-function rowState(context: RenderContext | undefined): RowState | undefined {
-  const holder = safeGet(context, "state");
-  if ((typeof holder !== "object" && typeof holder !== "function") || holder === null) return undefined;
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(holder, ROW_STATE);
-    if (
-      descriptor &&
-      "value" in descriptor &&
-      plainRecord(descriptor.value) &&
-      safeOwn(descriptor.value, OWN_ROW_STATE) === true
-    ) return descriptor.value as RowState;
-    if (descriptor && descriptor.configurable === false) return undefined;
-    const created: RowState = { [OWN_ROW_STATE]: true };
-    Object.defineProperty(holder, ROW_STATE, {
-      value: created,
-      writable: true,
-      configurable: true,
-      enumerable: true,
-    });
-    return created;
-  } catch {
-    return undefined;
-  }
-}
-
-function clearState(context: RenderContext | undefined): void {
-  const state = rowState(context);
-  if (!state) return;
-  for (const key of ["status", "compactStatus", "count", "compactCount", "recovery"] as const) {
-    try {
-      delete state[key];
-    } catch {
-      return;
-    }
-  }
-}
-
 function quote(value: string): string {
   return `“${value || "?"}”`;
 }
@@ -428,7 +387,7 @@ function styledCore(
 function selectSummaryCore(
   toolName: SearchName,
   expression: string,
-  state: RowState | undefined,
+  state: SummaryState | undefined,
   theme: unknown,
   width: number,
   requireRecovery: boolean,
@@ -465,7 +424,7 @@ function selectSummaryCore(
 function summaryLine(
   toolName: SearchName,
   args: Snapshot,
-  state: RowState | undefined,
+  state: SummaryState | undefined,
   theme: unknown,
   width: number,
 ): string {
@@ -509,7 +468,7 @@ function exactClipMarker(toolName: SearchName, text: string): boolean {
   ).test(text);
 }
 
-function deriveState(toolName: SearchName, details: GrepDetails | GlobDetails, args: Snapshot, primaryText: string): RowState {
+function deriveState(toolName: SearchName, details: GrepDetails | GlobDetails, args: Snapshot, primaryText: string): SummaryState {
   const statuses: string[] = [];
   const compact: string[] = [];
   let countText: string;
@@ -626,7 +585,7 @@ function feedbackComponent(texts: readonly string[], theme: unknown): Component 
   }, "Feedback unavailable");
 }
 
-function recoveryComponent(toolName: SearchName, args: Snapshot, state: RowState, theme: unknown): Component {
+function recoveryComponent(toolName: SearchName, args: Snapshot, state: SummaryState, theme: unknown): Component {
   const recovery = sanitize(state.recovery, true);
   const expression = invocationParts(toolName, args).expression;
   const snapshot = recovery ? `Recovery: ${recovery}.` : "";
@@ -637,21 +596,6 @@ function recoveryComponent(toolName: SearchName, args: Snapshot, state: RowState
       return wrapTextWithAnsi(safeFg(theme, "warning", snapshot), Math.max(1, width));
     },
   }, "Recovery unavailable");
-}
-
-function publishState(target: RowState, source: RowState): boolean {
-  try {
-    target.status = source.status;
-    target.compactStatus = source.compactStatus;
-    target.count = source.count;
-    target.compactCount = source.compactCount;
-    target.recovery = source.recovery;
-    return target.status === source.status && target.compactStatus === source.compactStatus &&
-      target.count === source.count && target.compactCount === source.compactCount &&
-      target.recovery === source.recovery;
-  } catch {
-    return false;
-  }
 }
 
 function combinedComponent(components: readonly Component[]): Component {
@@ -669,25 +613,21 @@ export function withCompactSearchTuiRendering<T extends ToolDefinition>(tool: T)
   const toolName = tool.name;
   return {
     ...tool,
-    renderCall(args: unknown, theme: unknown, context: RenderContext): Component {
-      const argsSnapshot = snapshotArgs(args);
-      const state = rowState(context);
-      return guarded({ render: (width) => [summaryLine(toolName, argsSnapshot, state, theme, width)] }, toolName);
+    renderCall(): Component {
+      return { render: () => [] };
     },
     renderResult(result: ResultShape, options: { isPartial?: boolean }, theme: unknown, context: RenderContext): Component {
       try {
-        clearState(context);
+        const args = snapshotArgs(safeGet(context, "args"));
         if (safeGet(context, "isError") === true) {
-          const state = rowState(context);
-          if (state) {
-            state.status = "failed";
-            state.compactStatus = "fail";
-          }
-          return failOpenComponent(result, theme, context);
+          const failed: SummaryState = { status: "failed", compactStatus: "fail" };
+          return combinedComponent([
+            guarded({ render: (width) => [summaryLine(toolName, args, failed, theme, width)] }, toolName),
+            failOpenComponent(result, theme, context),
+          ]);
         }
         if (safeGet(options, "isPartial") === true) return failOpenComponent(result, theme, context);
         const content = safeOwn(result, "content");
-        const args = snapshotArgs(safeGet(context, "args"));
         const detailsValue = safeOwn(result, "details");
         const details = toolName === "Grep" ? validateGrepDetails(detailsValue, args) : validateGlobDetails(detailsValue);
         if (!validArgs(toolName, args) || !Array.isArray(content) || content.length === 0 || !details) {
@@ -702,13 +642,13 @@ export function withCompactSearchTuiRendering<T extends ToolDefinition>(tool: T)
           feedback.push(text);
         }
         const state = deriveState(toolName, details, args, primaryText);
-        const shared = rowState(context);
-        if (!shared || !publishState(shared, state)) return failOpenComponent(result, theme, context);
-        const components: Component[] = [recoveryComponent(toolName, args, state, theme)];
+        const components: Component[] = [
+          guarded({ render: (width) => [summaryLine(toolName, args, state, theme, width)] }, toolName),
+          recoveryComponent(toolName, args, state, theme),
+        ];
         if (feedback.length > 0) components.push(feedbackComponent(feedback, theme));
         return combinedComponent(components);
       } catch {
-        clearState(context);
         return failOpenComponent(result, theme, context);
       }
     },

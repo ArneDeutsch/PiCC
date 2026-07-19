@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
 import {
   allText,
   cliMissing,
   createE2ELive,
   systemText,
+  toolResultText,
   TEST_TIMEOUT_MS,
   toolNames,
   userText,
@@ -57,7 +60,48 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
     TEST_TIMEOUT_MS,
   );
 
-  // --- Scenario 3: slash-skill expansion end-to-end via the input event ---
+  it(
+    "keeps compact search presentation out of print output and the next model request",
+    async () => {
+      const result = await runPi({
+        script: [
+          {
+            toolCalls: [{
+              name: "Grep",
+              args: { pattern: "MODEL_BOUNDARY_NEEDLE", path: "search-target.txt", output_mode: "content" },
+            }],
+          },
+          { text: "SEARCH_BOUNDARY_COMPLETE" },
+        ],
+        prompt: "search once",
+        setup(fixtureDir) {
+          fs.writeFileSync(
+            path.join(fixtureDir, "search-target.txt"),
+            "MODEL_BOUNDARY_NEEDLE first distinct payload\nbetween\nMODEL_BOUNDARY_NEEDLE second distinct payload\n",
+          );
+        },
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.requests).toHaveLength(2);
+      const expected = [
+        "search-target.txt:1:MODEL_BOUNDARY_NEEDLE first distinct payload",
+        "search-target.txt:3:MODEL_BOUNDARY_NEEDLE second distinct payload",
+      ].join("\n");
+      const nextToolMessage = toolResultText(result.requests[1]!);
+      expect(nextToolMessage).toBe(expected);
+      expect(nextToolMessage).not.toContain("Grep “MODEL_BOUNDARY_NEEDLE”");
+      expect(nextToolMessage).not.toContain("2/2 entries");
+
+      const stdout = result.stdout.replace(/\r\n/g, "\n");
+      expect(stdout).toContain("SEARCH_BOUNDARY_COMPLETE");
+      expect(stdout).not.toContain("Grep “MODEL_BOUNDARY_NEEDLE”");
+      expect(stdout).not.toContain("2/2 entries");
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  // --- Slash-skill expansion end-to-end via the input event ---
   it(
     "expands a /deploy slash skill into the user turn with positional args (full-surface)",
     async () => {

@@ -1,5 +1,10 @@
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { fakePi } from "./helpers/fake-pi.js";
+import { withCompactSearchTuiRendering } from "../src/runtime/search-tool-render.js";
+import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 
 /**
  * Pi upstream contract smoke test: asserts every Pi API PiCC
@@ -321,6 +326,198 @@ describe("pi 0.80.x API contract", () => {
     }
     expect(failed, `Pi type contract broken:\n${output}`).toBe(false);
   }, 30_000);
+});
+
+describe("real Pi compact-search composition", () => {
+  const cases = [
+    {
+      name: "Grep" as const,
+      args: { pattern: "lifecycle-needle", path: "src", output_mode: "content", head_limit: 1 },
+      ordinary: {
+        content: [{ type: "text", text: "src/a.ts:1:lifecycle-needle\nsrc/b.ts:2:lifecycle-needle" }],
+        details: { mode: "content", engine: "js", totalEntries: 1, returnedEntries: 1, truncated: false },
+        isError: false,
+      },
+      status: {
+        content: [
+          { type: "text", text: "src/a.ts:1:lifecycle-needle" },
+          { type: "text", text: "Post-processing Grep feedback." },
+        ],
+        details: { mode: "content", engine: "js", totalEntries: 3, returnedEntries: 1, truncated: true },
+        isError: false,
+      },
+      statusText: /limited|lim/,
+      hidden: "src/a.ts:1",
+    },
+    {
+      name: "Glob" as const,
+      args: { pattern: "**/*.ts", path: "src" },
+      ordinary: {
+        content: [{ type: "text", text: "src/a.ts\nsrc/b.ts" }],
+        details: { totalMatches: 2, returned: 2, capped: false, truncated: false },
+        isError: false,
+      },
+      status: {
+        content: [
+          { type: "text", text: "src/a.ts" },
+          { type: "text", text: "Post-processing Glob feedback." },
+        ],
+        details: { totalMatches: 250, returned: 200, capped: true, truncated: true },
+        isError: false,
+      },
+      statusText: /capped|cap/,
+      hidden: "src/a.ts",
+    },
+  ];
+
+  it.each(cases)("composes result-owned $name summaries in collapsed, expanded, and reconstructed TUI rows", async (search) => {
+    const { ToolExecutionComponent, initTheme } = (await import(
+      "@earendil-works/pi-coding-agent"
+    )) as any;
+    const { visibleWidth } = await import("@earendil-works/pi-tui");
+    initTheme();
+    const definition = wrapForSelfShell(withCompactSearchTuiRendering({ name: search.name } as any));
+    const build = (payload: any) => {
+      const component = new ToolExecutionComponent(
+        search.name, `${search.name}-contract`, search.args, {}, definition,
+        { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+      );
+      component.updateResult(payload, false);
+      return component;
+    };
+    const paint = (component: any, expanded: boolean, width = 100): string[] => {
+      component.setExpanded(expanded);
+      const lines = component.render(width) as string[];
+      for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+      return lines;
+    };
+
+    for (const expanded of [false, true]) {
+      const lines = paint(build(search.ordinary), expanded);
+      expect(lines).toHaveLength(2); // shell-owned separator + one result-owned content row
+      expect(lines[0]).toBe("");
+      expect(lines[1]).toContain(search.name);
+      expect(lines.join("\n")).not.toContain(search.hidden);
+    }
+    expect(paint(build(search.ordinary), true)).toEqual(paint(build(search.ordinary), false));
+
+    const partial = new ToolExecutionComponent(
+      search.name, `${search.name}-partial`, search.args, {}, definition,
+      { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+    );
+    partial.updateResult(search.ordinary, true);
+    expect(paint(partial, false).join("\n")).toContain(search.hidden);
+
+    const statusLines = paint(build(search.status), false, 48);
+    expect(statusLines.join("\n")).toMatch(search.statusText);
+    expect(statusLines.join("\n")).toContain(`Post-processing ${search.name} feedback.`);
+    expect(statusLines.join("\n")).toContain("Recovery:");
+    expect(statusLines.join("\n")).not.toContain(search.hidden);
+
+    const failure = build({
+      content: [{ type: "text", text: `${search.name} search failed; repair the input.` }],
+      details: undefined,
+      isError: true,
+    });
+    expect(paint(failure, false).join("\n")).toContain("failed");
+    expect(paint(failure, false).join("\n")).toContain(`${search.name} search failed`);
+  });
+
+  async function htmlHarness(search: (typeof cases)[number]) {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    sdk.initTheme();
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const distIdx = mainUrl.indexOf("/dist/");
+    expect(distIdx, "unexpected Pi dist layout").toBeGreaterThan(0);
+    const piDist = mainUrl.slice(0, distIdx);
+    const htmlModule: any = await import(`${piDist}/dist/core/export-html/tool-renderer.js`);
+    const exportModule: any = await import(`${piDist}/dist/core/export-html/index.js`);
+    const themeModule: any = await import(`${piDist}/dist/modes/interactive/theme/theme.js`);
+    expect(typeof htmlModule.createToolHtmlRenderer).toBe("function");
+    expect(typeof exportModule.exportSessionToHtml).toBe("function");
+    const definition = wrapForSelfShell(withCompactSearchTuiRendering({ name: search.name } as any));
+    const renderer = htmlModule.createToolHtmlRenderer({
+      getToolDefinition: (name: string) => name === search.name ? definition : undefined,
+      theme: themeModule.theme,
+      cwd: process.cwd(),
+      width: 48,
+    });
+    return { sdk, exportModule, renderer };
+  }
+
+  it.each(cases)("renders equivalent compact $name status and feedback through the real HTML renderer", async (search) => {
+    const { renderer } = await htmlHarness(search);
+    const id = `html-${search.name}`;
+    expect(renderer.renderCall(id, search.name, search.args)).toBe("");
+    const rendered = renderer.renderResult(
+      id, search.name, search.status.content, search.status.details, false,
+    );
+    expect(rendered).toBeDefined();
+    const collapsed = rendered.collapsed ?? rendered.expanded;
+    expect(collapsed).toContain(search.name);
+    expect(collapsed).toMatch(search.statusText);
+    expect(collapsed).toContain(`Post-processing ${search.name} feedback.`);
+    expect(collapsed).toContain("Recovery:");
+    expect(collapsed).not.toContain(search.hidden);
+    expect(rendered.expanded).toBe(collapsed);
+
+    const errorId = `html-error-${search.name}`;
+    renderer.renderCall(errorId, search.name, search.args);
+    const error = renderer.renderResult(
+      errorId, search.name,
+      [{ type: "text", text: `${search.name} HTML failure body` }], undefined, true,
+    );
+    expect(error?.expanded).toContain("failed");
+    expect(error?.expanded).toContain(`${search.name} HTML failure body`);
+  });
+
+  it.each(cases)("assembles full $name HTML export with a generic header and one compact settled result", async (search) => {
+    const { sdk, exportModule, renderer } = await htmlHarness(search);
+    const dir = mkdtempSync(join(tmpdir(), "picc-search-export-"));
+    const outputPath = join(dir, `${search.name}.html`);
+    try {
+      const session = sdk.SessionManager.create(dir, dir, { id: `compact-${search.name.toLowerCase()}` });
+      const toolCallId = `export-${search.name}`;
+      session.appendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: toolCallId, name: search.name, arguments: search.args }],
+        stopReason: "toolUse",
+      } as never);
+      session.appendMessage({
+        role: "toolResult",
+        toolCallId,
+        toolName: search.name,
+        content: search.status.content,
+        details: search.status.details,
+        isError: false,
+      } as never);
+
+      await exportModule.exportSessionToHtml(session, undefined, { outputPath, toolRenderer: renderer });
+      const html = readFileSync(outputPath, "utf8");
+      const encoded = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1];
+      expect(encoded).toBeDefined();
+      const data = JSON.parse(Buffer.from(encoded!, "base64").toString("utf8"));
+      const rendered = data.renderedTools?.[toolCallId];
+      const canonicalResult = data.entries.find(
+        (entry: any) => entry.message?.role === "toolResult" && entry.message.toolCallId === toolCallId,
+      );
+
+      expect(JSON.stringify(canonicalResult?.message?.content)).toContain(search.hidden);
+      expect(rendered).toBeDefined();
+      expect(rendered.callHtml).toBeUndefined();
+      expect(rendered.resultHtmlExpanded).toContain(search.name);
+      expect(rendered.resultHtmlExpanded).toMatch(search.statusText);
+      expect(rendered.resultHtmlExpanded).toContain(`Post-processing ${search.name} feedback.`);
+      expect(rendered.resultHtmlExpanded).not.toContain(search.hidden);
+      expect(rendered.resultHtmlCollapsed).toBeUndefined();
+      expect(html).toContain(
+        'html += `<div class="tool-header"><span class="tool-name">${escapeHtml(name)}</span></div>`;',
+      );
+      expect(html).not.toContain(search.hidden);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 /**

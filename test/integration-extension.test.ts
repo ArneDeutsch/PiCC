@@ -7,6 +7,7 @@ import type { BackgroundResultLike } from "../src/runtime/background-tasks.js";
 import { resolveGitBashPath } from "../src/engine/shell-inject.js";
 import { RECORD_EXPAND_HINT } from "../src/runtime/subagent-render.js";
 import { formatElapsed } from "../src/runtime/subagent-panel-render.js";
+import { createGlobTool, createGrepTool } from "../src/runtime/tools/search-tools.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/fake-sdk.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
@@ -158,6 +159,87 @@ describe("tool surface registration", () => {
       // execute is preserved (not stripped by the wrapper).
       expect(typeof tool.execute, `${name} missing execute`).toBe("function");
     }
+  });
+
+  it("main Grep/Glob execute unchanged and render one compact row collapsed and expanded", async () => {
+    const searchDir = path.join(dir, "t02-search");
+    fs.mkdirSync(searchDir, { recursive: true });
+    fs.writeFileSync(path.join(searchDir, "needle.txt"), "alpha\nT02-SEARCH-NEEDLE\nomega\n");
+
+    const cases = [
+      {
+        name: "Grep",
+        args: { pattern: "T02-SEARCH-NEEDLE", path: "t02-search", output_mode: "content" },
+        undecorated: createGrepTool(() => dir),
+      },
+      {
+        name: "Glob",
+        args: { pattern: "**/*.txt", path: "t02-search" },
+        undecorated: createGlobTool(() => dir),
+      },
+    ] as const;
+
+    for (const search of cases) {
+      const registered = pi.tools.get(search.name);
+      const result = await registered.execute(`t02-${search.name}`, search.args);
+      const baseline = await search.undecorated.execute(
+        `baseline-${search.name}`,
+        search.args,
+        undefined,
+        undefined,
+        undefined as never,
+      );
+      expect(result).toEqual(baseline);
+      const beforeRender = structuredClone(result);
+
+      for (const expanded of [false, true]) {
+        const ctx = {
+          args: search.args,
+          state: {},
+          isPartial: false,
+          isError: false,
+          expanded,
+          showImages: false,
+        };
+        const call = registered.renderCall(search.args, undefined, ctx);
+        const renderedResult = registered.renderResult(
+          result,
+          { expanded, isPartial: false },
+          undefined,
+          ctx,
+        );
+        expect(call.render(80)).toEqual([]);
+        const lines = renderedResult.render(80);
+        expect(lines).toHaveLength(1);
+        expect(lines[0]!.trim()).not.toBe("");
+        expect(lines[0]).toContain(search.name);
+        expect(lines[0]).toContain(search.args.pattern);
+      }
+      expect(result).toEqual(beforeRender);
+    }
+  });
+
+  it("keeps unrelated Claude and lowercase built-in rendering outside compact specialization", async () => {
+    const todo = pi.tools.get("TodoWrite");
+    const lowerGrep = pi.tools.get("grep");
+    expect(todo.renderCall({}, undefined, { state: {} }).render(80).join("\n")).toContain("TodoWrite");
+
+    const args = { pattern: "T02-LOWERCASE-STOCK", path: "t02-lowercase.txt" };
+    fs.writeFileSync(path.join(dir, "t02-lowercase.txt"), "T02-LOWERCASE-STOCK complete stock result\n");
+    const result = await lowerGrep.execute("lowercase-stock", args);
+    const ctx = { args, state: {}, isError: false, isPartial: false, expanded: false, showImages: false };
+    const theme = {
+      fg: (_slot: string, text: string) => text,
+      bold: (text: string) => text,
+      bg: (_slot: string, text: string) => text,
+    };
+    const callText = lowerGrep.renderCall(args, theme, ctx).render(100).join("\n");
+    const resultText = lowerGrep.renderResult(
+      result, { expanded: false, isPartial: false }, theme, ctx,
+    ).render(100).join("\n");
+    expect(callText).toContain("T02-LOWERCASE-STOCK");
+    expect(resultText).toContain("complete stock result");
+    expect(`${callText}\n${resultText}`).not.toContain("1/1 entries");
   });
 
   it("wrapped renderers paint content on a background and keep content (offline integration)", () => {

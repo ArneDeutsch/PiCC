@@ -99,17 +99,12 @@ describe("compact search TUI decorator", () => {
     ).toThrow(/only Grep or Glob/);
   });
 
-  it("renders pending Grep and Glob calls as one recognizable row", () => {
-    const cases: Array<[RenderTool, Record<string, unknown>, RegExp]> = [
-      [grepTool(), { pattern: "needle", path: "src", glob: "*.ts", type: "ts" }, /Grep.*needle/],
-      [globTool(), { pattern: "**\/*.ts", path: "src" }, /Glob.*\.ts/],
-    ];
-    for (const [tool, args, expected] of cases) {
-      const lines = tool.renderCall(args, undefined, context(args)).render(100);
-      expect(lines).toHaveLength(1);
-      expect(lines[0]).toMatch(expected);
-      expect(lines[0]).toContain("src");
-      expectBounded(lines, 100);
+  it("emits no persisted call content before the result is available", () => {
+    for (const [tool, args] of [
+      [grepTool(), { pattern: "needle", path: "src" }],
+      [globTool(), { pattern: "**/*.ts", path: "src" }],
+    ] as const) {
+      expect(tool.renderCall(args, undefined, context(args)).render(100)).toEqual([]);
     }
   });
 
@@ -122,10 +117,10 @@ describe("compact search TUI decorator", () => {
         100,
         expanded,
       );
-      expect(grep.call).toHaveLength(1);
-      expect(grep.call.join(" ")).toContain("2/2 entries");
-      expect(grep.call.join(" ")).not.toContain("a.ts");
-      expect(grep.result).toEqual([]);
+      expect(grep.call).toEqual([]);
+      expect(grep.result).toHaveLength(1);
+      expect(grep.result.join(" ")).toContain("2/2 entries");
+      expect(grep.result.join(" ")).not.toContain("a.ts");
 
       const glob = callAndFinalize(
         globTool(),
@@ -134,9 +129,9 @@ describe("compact search TUI decorator", () => {
         100,
         expanded,
       );
-      expect(glob.call).toHaveLength(1);
-      expect(glob.call.join(" ")).toContain("2/2 files");
-      expect(glob.result).toEqual([]);
+      expect(glob.call).toEqual([]);
+      expect(glob.result).toHaveLength(1);
+      expect(glob.result.join(" ")).toContain("2/2 files");
     }
   });
 
@@ -146,22 +141,22 @@ describe("compact search TUI decorator", () => {
       { pattern: "x" },
       textResult("No matches found", { ...grepDetails, totalEntries: 0, returnedEntries: 0 }),
     );
-    expect(zeroGrep.call.join(" ")).toContain("no matches");
+    expect(zeroGrep.result.join(" ")).toContain("no matches");
 
     const zeroGlob = callAndFinalize(
       globTool(),
       { pattern: "x" },
       textResult("No files found", { ...globDetails, totalMatches: 0, returned: 0 }),
     );
-    expect(zeroGlob.call.join(" ")).toContain("no files");
+    expect(zeroGlob.result.join(" ")).toContain("no files");
 
     const emptyPage = callAndFinalize(
       grepTool(),
       { pattern: "x", offset: 8 },
       textResult("No entries at offset 8 (2 total)", { ...grepDetails, returnedEntries: 0 }),
     );
-    expect(emptyPage.call.join(" ")).toContain("empty page at offset 8");
-    expect(emptyPage.call.join(" ")).not.toContain("no matches");
+    expect(emptyPage.result.join(" ")).toContain("empty page at offset 8");
+    expect(emptyPage.result.join(" ")).not.toContain("no matches");
   });
 
   it("treats every positive Grep offset as incomplete while preserving empty-page status", () => {
@@ -171,8 +166,8 @@ describe("compact search TUI decorator", () => {
       textResult("three remaining", { ...grepDetails, totalEntries: 5, returnedEntries: 3 }),
       140,
     );
-    expect(remainingPage.call.join(" ")).toContain("offset 2");
-    expect([...remainingPage.call, ...remainingPage.result].join(" ")).toContain("head_limit/offset");
+    expect(remainingPage.result.join(" ")).toContain("offset 2");
+    expect(remainingPage.result.join(" ")).toContain("head_limit/offset");
 
     const emptyPage = callAndFinalize(
       grepTool(),
@@ -180,8 +175,8 @@ describe("compact search TUI decorator", () => {
       textResult("empty", { ...grepDetails, returnedEntries: 0 }),
       140,
     );
-    expect(emptyPage.call.join(" ")).toContain("empty page at offset 8");
-    expect([...emptyPage.call, ...emptyPage.result].join(" ")).toContain("head_limit/offset");
+    expect(emptyPage.result.join(" ")).toContain("empty page at offset 8");
+    expect(emptyPage.result.join(" ")).toContain("head_limit/offset");
   });
 
   it("shows limited, capped, truncated, and simultaneous statuses with tool-specific recovery", () => {
@@ -191,9 +186,9 @@ describe("compact search TUI decorator", () => {
       textResult("a\nb", { ...grepDetails, totalEntries: 9, truncated: true }),
       140,
     );
-    expect(limited.call.join(" ")).toContain("limited + truncated");
-    expect(limited.call.join(" ")).toContain("head_limit/offset");
-    expect(limited.result).toEqual([]);
+    expect(limited.result.join(" ")).toContain("limited + truncated");
+    expect(limited.result.join(" ")).toContain("head_limit/offset");
+    expect(limited.result).toHaveLength(1);
 
     const capped = callAndFinalize(
       globTool(),
@@ -201,8 +196,8 @@ describe("compact search TUI decorator", () => {
       textResult("many", { totalMatches: 250, returned: 200, capped: true, truncated: true }),
       140,
     );
-    expect(capped.call.join(" ")).toContain("capped + truncated");
-    expect(capped.call.join(" ")).toContain("cap is fixed");
+    expect(capped.result.join(" ")).toContain("capped + truncated");
+    expect(capped.result.join(" ")).toContain("cap is fixed");
   });
 
   it("moves fixed recovery below the row when practical inline space is unavailable", () => {
@@ -212,8 +207,8 @@ describe("compact search TUI decorator", () => {
       textResult("a", { ...grepDetails, totalEntries: 5, returnedEntries: 1 }),
       32,
     );
-    expect(rendered.call).toHaveLength(1);
-    expect(rendered.call.join(" ")).toContain("limited");
+    expect(rendered.result.length).toBeGreaterThan(1);
+    expect(rendered.result[0]).toContain("limited");
     expect(rendered.result.join(" ")).toContain("Recovery:");
     expect(rendered.result.join(" ")).toContain("head_limit/offset");
     expectBounded(rendered.result, 32);
@@ -223,8 +218,8 @@ describe("compact search TUI decorator", () => {
     const marker =
       "head\n\n[PiCC clipped 123 characters from the middle of this Grep output — re-run the search with a tighter pattern or a smaller head_limit/offset to recover the omitted matches]\n\ntail";
     const exact = callAndFinalize(grepTool(), { pattern: "x" }, textResult(marker, grepDetails), 140);
-    expect(exact.call.join(" ")).toContain("clipped");
-    expect(exact.call.join(" ")).toContain("head_limit/offset");
+    expect(exact.result.join(" ")).toContain("clipped");
+    expect(exact.result.join(" ")).toContain("head_limit/offset");
 
     const lookalike = callAndFinalize(
       grepTool(),
@@ -232,7 +227,7 @@ describe("compact search TUI decorator", () => {
       textResult("prefix [PiCC clipped 123 characters from this output] suffix", grepDetails),
       140,
     );
-    expect(lookalike.call.join(" ")).not.toContain("clipped");
+    expect(lookalike.result.join(" ")).not.toContain("clipped");
   });
 
   it("keeps all appended text feedback while never re-showing the primary body", () => {
@@ -283,7 +278,11 @@ describe("compact search TUI decorator", () => {
     };
     const tool = grepTool();
     for (const width of [1, 2, 3, 4, 8, 16, 40, 80, 120]) {
-      const lines = tool.renderCall(args, undefined, context(args)).render(width);
+      const ctx = context(args);
+      const lines = tool.renderResult(
+        textResult("ordinary", { ...grepDetails, mode: "content" }),
+        { expanded: false, isPartial: false }, undefined, ctx,
+      ).render(width);
       expect(lines).toHaveLength(1);
       expectBounded(lines, width);
       if (width >= 3) expect(visibleWidth(lines[0] ?? "")).toBeGreaterThan(0);
@@ -294,14 +293,10 @@ describe("compact search TUI decorator", () => {
   });
 
   it("displays only effective Grep modifiers", () => {
-    const nonContent = grepTool()
-      .renderCall(
-        { pattern: "x", output_mode: "count", "-A": 3, context: 4, "-o": true, "-i": true },
-        undefined,
-        context({ pattern: "x" }),
-      )
-      .render(160)
-      .join(" ");
+    const args = { pattern: "x", output_mode: "count", "-A": 3, context: 4, "-o": true, "-i": true };
+    const nonContent = callAndFinalize(
+      grepTool(), args, textResult("2", { ...grepDetails, mode: "count" }), 160,
+    ).result.join(" ");
     expect(nonContent).toContain("mode count");
     expect(nonContent).toContain("-i");
     expect(nonContent).not.toContain("-A");
@@ -321,18 +316,17 @@ describe("compact search TUI decorator", () => {
       ctx,
     );
     expect(partial.render(80).join(" ")).toContain("partial match");
-    expect(call.render(80)).toHaveLength(1);
+    expect(call.render(80)).toEqual([]);
 
     const final = tool.renderResult(
       textResult("final match", grepDetails),
       { expanded: false, isPartial: false },
       undefined,
       ctx,
-    );
-    expect(final.render(80)).toEqual([]);
-    expect(call.render(80)).toHaveLength(1);
-    expect(call.render(80).join(" ")).toContain("2/2 entries");
-    expect(call.render(80).join(" ")).not.toContain("final match");
+    ).render(80);
+    expect(final).toHaveLength(1);
+    expect(final.join(" ")).toContain("2/2 entries");
+    expect(final.join(" ")).not.toContain("final match");
   });
 
   it("keeps errors visible after pending or partial states", () => {
@@ -353,34 +347,27 @@ describe("compact search TUI decorator", () => {
       undefined,
       ctx,
     );
-    expect(call.render(100).join(" ")).toContain("failed");
+    expect(call.render(100)).toEqual([]);
+    expect(failed.render(100).join(" ")).toContain("failed");
     expect(failed.render(100).join(" ")).toContain("directory exploded");
   });
 
-  it("does not leak state between interleaved calls", () => {
+  it("derives each summary independently from its result context", () => {
     const tool = grepTool();
     const aArgs = { pattern: "alpha" };
     const bArgs = { pattern: "beta", head_limit: 1 };
-    const aCtx = context(aArgs);
-    const bCtx = context(bArgs);
-    const aCall = tool.renderCall(aArgs, undefined, aCtx);
-    const bCall = tool.renderCall(bArgs, undefined, bCtx);
-    tool.renderResult(
+    const a = tool.renderResult(
       textResult("a", { ...grepDetails, totalEntries: 0, returnedEntries: 0 }),
-      { expanded: false, isPartial: false },
-      undefined,
-      aCtx,
-    );
-    tool.renderResult(
+      { expanded: false, isPartial: false }, undefined, context(aArgs),
+    ).render(120).join(" ");
+    const b = tool.renderResult(
       textResult("b", { ...grepDetails, totalEntries: 5, returnedEntries: 1 }),
-      { expanded: false, isPartial: false },
-      undefined,
-      bCtx,
-    );
-    expect(aCall.render(120).join(" ")).toContain("no matches");
-    expect(aCall.render(120).join(" ")).not.toContain("limited");
-    expect(bCall.render(120).join(" ")).toContain("limited");
-    expect(bCall.render(120).join(" ")).not.toContain("no matches");
+      { expanded: false, isPartial: false }, undefined, context(bArgs),
+    ).render(120).join(" ");
+    expect(a).toContain("no matches");
+    expect(a).not.toContain("limited");
+    expect(b).toContain("limited");
+    expect(b).not.toContain("no matches");
   });
 
   it("tolerates undefined, null, partial, and throwing themes and state", () => {
@@ -393,7 +380,9 @@ describe("compact search TUI decorator", () => {
     const tool = grepTool();
     for (const theme of themes) {
       const ctx = context({ pattern: "x" });
-      const lines = tool.renderCall({ pattern: "x" }, theme, ctx).render(20);
+      const lines = tool.renderResult(
+        textResult("ordinary", grepDetails), { expanded: false, isPartial: false }, theme, ctx,
+      ).render(20);
       expect(lines).toHaveLength(1);
       expectBounded(lines, 20);
     }
@@ -491,8 +480,8 @@ describe("compact search TUI decorator", () => {
         const args = { pattern: "x", output_mode: mode };
         const details = { ...grepDetails, mode, engine };
         const rendered = callAndFinalize(grepTool(), args, textResult("ordinary", details));
-        expect(rendered.result).toEqual([]);
-        expect(rendered.call.join(" ")).toContain("2/2 entries");
+        expect(rendered.result).toHaveLength(1);
+        expect(rendered.result.join(" ")).toContain("2/2 entries");
       }
     }
   });
@@ -522,16 +511,19 @@ describe("compact search TUI decorator", () => {
         textResult("ordinary", { ...grepDetails, totalEntries: 5, returnedEntries }),
         220,
       );
-      expect(rendered.result).toEqual([]);
-      if (display) expect(rendered.call.join(" ")).toContain(display);
-      else expect(rendered.call.join(" ")).not.toContain("offset");
+      expect(rendered.result).toHaveLength(1);
+      if (display) expect(rendered.result.join(" ")).toContain(display);
+      else expect(rendered.result.join(" ")).not.toContain("offset");
     }
   });
 
   it("renders resolved context precedence and clamping, omitting ineffective aliases", () => {
     const tool = grepTool();
     const render = (args: Record<string, unknown>) =>
-      tool.renderCall(args, undefined, context(args)).render(240).join(" ");
+      tool.renderResult(
+        textResult("ordinary", { ...grepDetails, mode: "content" }),
+        { expanded: false, isPartial: false }, undefined, context(args),
+      ).render(240).join(" ");
     const precedence = render({
       pattern: "x", output_mode: "content", context: 9.8, "-C": 4.8, "-B": 2.9, "-A": -7,
     });
@@ -551,7 +543,7 @@ describe("compact search TUI decorator", () => {
 
   it("omits pagination defaults and displays only effective non-defaults", () => {
     const args = { pattern: "x", head_limit: 100, offset: 0 };
-    const row = grepTool().renderCall(args, undefined, context(args)).render(180).join(" ");
+    const row = callAndFinalize(grepTool(), args, textResult("ordinary", grepDetails), 180).result.join(" ");
     expect(row).not.toContain("limit 100");
     expect(row).not.toContain("offset 0");
   });
@@ -590,7 +582,7 @@ describe("compact search TUI decorator", () => {
     ]) {
       const args = { pattern: "x", path };
       const rendered = callAndFinalize(grepTool(), args, textResult("ordinary", grepDetails), 58);
-      const row = rendered.call.join(" ");
+      const row = rendered.result.join(" ");
       expect(row).toContain("2/2 entries");
       expect(row).toContain("in …");
       expect(row).toMatch(/recognizable-(?:posix|win)\.ts/);
@@ -605,58 +597,46 @@ describe("compact search TUI decorator", () => {
       textResult("none", { ...grepDetails, totalEntries: 0, returnedEntries: 0 }),
       16,
     );
-    expect(rendered.call.join(" ")).toContain("none");
-    expect(rendered.call.join(" ")).not.toContain("0/0");
-    expect(rendered.call.join(" ")).not.toContain("ordinary");
+    expect(rendered.result.join(" ")).toContain("none");
+    expect(rendered.result.join(" ")).not.toContain("0/0");
+    expect(rendered.result.join(" ")).not.toContain("ordinary");
   });
 
   it("bounds finalized clean and status rows across degenerate and practical widths", () => {
     for (const width of [1, 2, 3, 8, 12, 20, 40, 80, 120]) {
-      const cleanCtx = context({ pattern: "中🙂" });
-      const cleanCall = globTool().renderCall({ pattern: "中🙂" }, undefined, cleanCtx);
-      globTool().renderResult(textResult("ordinary", globDetails), { expanded: false, isPartial: false }, undefined, cleanCtx);
-      const statusCtx = context({ pattern: "x" });
-      const statusTool = grepTool();
-      const statusCall = statusTool.renderCall({ pattern: "x" }, undefined, statusCtx);
-      statusTool.renderResult(
+      const clean = globTool().renderResult(
+        textResult("ordinary", globDetails), { expanded: false, isPartial: false },
+        undefined, context({ pattern: "中🙂" }),
+      ).render(width);
+      const status = grepTool().renderResult(
         textResult("none", { ...grepDetails, totalEntries: 0, returnedEntries: 0 }),
-        { expanded: false, isPartial: false }, undefined, statusCtx,
-      );
-      for (const lines of [cleanCall.render(width), statusCall.render(width)]) {
+        { expanded: false, isPartial: false }, undefined, context({ pattern: "x" }),
+      ).render(width);
+      for (const lines of [clean, status]) {
         expect(lines).toHaveLength(1);
         expectBounded(lines, width);
         if (width >= 3) expect(visibleWidth(lines[0] ?? "")).toBeGreaterThan(0);
         expect(lines.join(" ")).not.toContain("ordinary");
       }
-      if (width >= 20) expect(statusCall.render(width).join(" ")).toMatch(/no matches|none/);
+      if (width >= 20) expect(status.join(" ")).toMatch(/no matches|none/);
     }
   });
 
-  it("replaces stale final status on partial, later success, error, and malformed fail-open", () => {
+  it("keeps successive result components independent", () => {
     const tool = grepTool();
-    const args = { pattern: "x", head_limit: 1 };
-    const ctx = context(args);
-    const call = tool.renderCall(args, undefined, ctx);
-    tool.renderResult(
+    const ctx = context({ pattern: "x", head_limit: 1 });
+    const limited = tool.renderResult(
       textResult("one", { ...grepDetails, totalEntries: 4, returnedEntries: 1 }),
       { expanded: false, isPartial: false }, undefined, ctx,
     );
-    expect(call.render(120).join(" ")).toContain("limited");
-
-    tool.renderResult(textResult("partial", grepDetails), { expanded: false, isPartial: true }, undefined, ctx);
-    expect(call.render(120).join(" ")).not.toContain("limited");
-
+    expect(limited.render(120).join(" ")).toContain("limited");
     ctx.args = { pattern: "x" };
-    tool.renderResult(textResult("clean", grepDetails), { expanded: false, isPartial: false }, undefined, ctx);
-    expect(call.render(120).join(" ")).toContain("2/2");
-    expect(call.render(120).join(" ")).not.toContain("limited");
-
-    ctx.isError = true;
-    tool.renderResult(textResult("error", undefined), { expanded: false, isPartial: false }, undefined, ctx);
-    expect(call.render(120).join(" ")).toContain("failed");
-    ctx.isError = false;
-    tool.renderResult(textResult("malformed", { bad: true }), { expanded: false, isPartial: false }, undefined, ctx);
-    expect(call.render(120).join(" ")).not.toMatch(/failed|limited|2\/2/);
+    const clean = tool.renderResult(
+      textResult("clean", grepDetails), { expanded: false, isPartial: false }, undefined, ctx,
+    );
+    expect(clean.render(120).join(" ")).toContain("2/2");
+    expect(clean.render(120).join(" ")).not.toContain("limited");
+    expect(limited.render(120).join(" ")).toContain("limited");
   });
 
   it("preserves a measured recognizable expression before single and simultaneous statuses", () => {
@@ -664,17 +644,17 @@ describe("compact search TUI decorator", () => {
       grepTool(), { pattern: "recognizable-expression" },
       textResult("none", { ...grepDetails, totalEntries: 0, returnedEntries: 0 }), 24,
     );
-    expect(single.call.join(" ")).toMatch(/rec/);
-    expect(single.call.join(" ")).toContain("none");
-    expect(single.call.join(" ")).not.toMatch(/[“"]…[”"]/u);
+    expect(single.result.join(" ")).toMatch(/rec/);
+    expect(single.result.join(" ")).toContain("none");
+    expect(single.result.join(" ")).not.toMatch(/[“"]…[”"]/u);
 
     const simultaneous = callAndFinalize(
       grepTool(), { pattern: "recognizable-expression", head_limit: 1 },
       textResult("one", { ...grepDetails, totalEntries: 5, returnedEntries: 1, truncated: true }), 28,
     );
-    expect(simultaneous.call.join(" ")).toMatch(/rec/);
-    expect(simultaneous.call.join(" ")).toContain("lim+trunc");
-    expect(simultaneous.call.join(" ")).not.toMatch(/[“"]…[”"]/u);
+    expect(simultaneous.result.join(" ")).toMatch(/rec/);
+    expect(simultaneous.result.join(" ")).toContain("lim+trunc");
+    expect(simultaneous.result.join(" ")).not.toMatch(/[“"]…[”"]/u);
   });
 
   it("chooses inline versus fixed recovery with the same measured summary candidates", () => {
@@ -686,16 +666,16 @@ describe("compact search TUI decorator", () => {
         textResult("one", { ...grepDetails, totalEntries: 4, returnedEntries: 1 }),
         width,
       );
-      const callText = rendered.call.join(" ");
-      const inline = callText.includes("head_limit/offset");
-      const separate = rendered.result.join(" ").includes("Recovery:");
+      const summaryText = rendered.result[0] ?? "";
+      const inline = summaryText.includes("head_limit/offset");
+      const separate = rendered.result.slice(1).join(" ").includes("Recovery:");
       expect(inline).toBe(!separate);
       if (inline) {
-        expect(callText).toMatch(/r/);
-        expect(callText).toMatch(/limited|lim/);
-        expect(callText).not.toMatch(/[“"]…[”"]/u);
+        expect(summaryText).toMatch(/r/);
+        expect(summaryText).toMatch(/limited|lim/);
+        expect(summaryText).not.toMatch(/[“"]…[”"]/u);
       }
-      expectBounded([...rendered.call, ...rendered.result], width);
+      expectBounded(rendered.result, width);
     }
   });
 
@@ -703,9 +683,9 @@ describe("compact search TUI decorator", () => {
     const marker =
       "head\n\n[PiCC clipped 9 characters from the middle of this Glob output — re-run a narrower command — target a specific path, request fewer entries, or pipe through a filter — to recover the omitted output]\n\ntail";
     const rendered = callAndFinalize(globTool(), { pattern: "**/*" }, textResult(marker, globDetails), 150);
-    expect(rendered.call.join(" ")).toContain("clipped");
-    expect(rendered.call.join(" ")).toContain("cap is fixed");
-    expect(rendered.call.join(" ")).not.toContain("head_limit");
+    expect(rendered.result.join(" ")).toContain("clipped");
+    expect(rendered.result.join(" ")).toContain("cap is fixed");
+    expect(rendered.result.join(" ")).not.toContain("head_limit");
   });
 
   it("does not parse exact clip grammar inside feedback as status", () => {
@@ -714,26 +694,24 @@ describe("compact search TUI decorator", () => {
     const rendered = callAndFinalize(
       grepTool(), { pattern: "x" }, textResult("ordinary", grepDetails, [{ type: "text", text: marker }]), 140,
     );
-    expect(rendered.call.join(" ")).not.toContain("clipped");
-    expect(rendered.result.join(" ")).toContain("PiCC clipped");
+    expect(rendered.result[0]).not.toContain("clipped");
+    expect(rendered.result.slice(1).join(" ")).toContain("PiCC clipped");
   });
 
   it("snapshots mutable args and feedback before delayed rendering", () => {
     const tool = grepTool();
     const args = { pattern: "before", path: "/before/path" };
     const ctx = context(args);
-    const call = tool.renderCall(args, undefined, ctx);
-    args.pattern = "after";
-    args.path = "/after/path";
-    expect(call.render(120).join(" ")).toContain("before");
-    expect(call.render(120).join(" ")).not.toContain("after");
-
     const block = { type: "text", text: "feedback-before" };
     const result = tool.renderResult(
       textResult("ordinary", grepDetails, [block]),
       { expanded: false, isPartial: false }, undefined, ctx,
     );
+    args.pattern = "after";
+    args.path = "/after/path";
     block.text = "feedback-after";
+    expect(result.render(120).join(" ")).toContain("before");
+    expect(result.render(120).join(" ")).not.toContain("after");
     expect(result.render(80).join(" ")).toContain("feedback-before");
     expect(result.render(80).join(" ")).not.toContain("feedback-after");
   });
@@ -807,49 +785,8 @@ describe("compact search TUI decorator", () => {
       textResult("empty", { ...grepDetails, returnedEntries: 0 }),
       16,
     );
-    expect(rendered.call.join(" ")).toMatch(/empty page|empty@8/);
-    expect(rendered.call.join(" ")).not.toContain("ordinary");
+    expect(rendered.result.join(" ")).toMatch(/empty page|empty@8/);
+    expect(rendered.result.join(" ")).not.toContain("ordinary");
   });
 
-  it("acquires state safely around inherited accessors and proxies while preserving other keys", () => {
-    const prototype = Object.create(null) as Record<string, unknown>;
-    Object.defineProperty(prototype, "compactSearch", { get: () => { throw new Error("inherited"); } });
-    const state = Object.assign(Object.create(prototype), { keep: "valid" }) as Record<string, unknown>;
-    const args = { pattern: "x" };
-    const ctx = { args, state } as RenderContext;
-    const tool = grepTool();
-    const call = tool.renderCall(args, undefined, ctx);
-    tool.renderResult(
-      textResult("none", { ...grepDetails, totalEntries: 0, returnedEntries: 0 }),
-      { expanded: false, isPartial: false }, undefined, ctx,
-    );
-    expect(call.render(40).join(" ")).toContain("no matches");
-    expect(state.keep).toBe("valid");
-
-    const inheritedContext = Object.assign(
-      Object.create({ get state() { return state; } }),
-      { args },
-    ) as RenderContext;
-    const inheritedCall = tool.renderCall(args, undefined, inheritedContext);
-    tool.renderResult(
-      textResult("none", { ...grepDetails, totalEntries: 0, returnedEntries: 0 }),
-      { expanded: false, isPartial: false }, undefined, inheritedContext,
-    );
-    expect(inheritedCall.render(40).join(" ")).toContain("no matches");
-    expect(state.keep).toBe("valid");
-
-    const throwingContext = Object.create(null) as Record<string, unknown>;
-    throwingContext.args = args;
-    Object.defineProperty(throwingContext, "state", { get: () => { throw new Error("state getter"); } });
-    expect(() => tool.renderCall(args, undefined, throwingContext as unknown as RenderContext).render(20)).not.toThrow();
-
-    const proxyState = new Proxy({}, { getOwnPropertyDescriptor: () => { throw new Error("proxy"); } });
-    const proxyCtx = { args, state: proxyState } as RenderContext;
-    expect(() => tool.renderCall(args, undefined, proxyCtx).render(20)).not.toThrow();
-    const visible = tool.renderResult(
-      textResult("ordinary-visible-body", grepDetails),
-      { expanded: false, isPartial: false }, undefined, proxyCtx,
-    ).render(40);
-    expect(visible.join(" ")).toContain("ordinary-visible-body");
-  });
 });

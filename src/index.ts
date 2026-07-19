@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HookOutcome, HookPayload, ToolCallDescriptor } from "./types.js";
 import { findByName, loadClaudeProject, type LoadedProject } from "./project.js";
 import { loadPiCCConfig, mapEffort, steeringForModel } from "./runtime/steering.js";
@@ -67,6 +68,7 @@ import { builtinAgents } from "./claude/agents.js";
 import { loadAgentMemory } from "./claude/memory.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
 import { wrapForSelfShell } from "./runtime/tool-shell.js";
+import { withCompactSearchTuiRendering } from "./runtime/search-tool-render.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
@@ -1072,7 +1074,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // `execute` and all other fields untouched. (The subagent-scoped set built
       // by `customToolsFor` is intentionally NOT wrapped: it renders inside
       // subagent transcripts, not the parent interactive shell.)
-      pi.registerTool(wrapForSelfShell(tool));
+      const mainSessionTool: Record<string, unknown> = tool.name === "Grep" || tool.name === "Glob"
+        ? withCompactSearchTuiRendering(tool as unknown as ToolDefinition) as unknown as Record<string, unknown>
+        : tool;
+      pi.registerTool(wrapForSelfShell(mainSessionTool));
     } catch (err) {
       console.error(`PiCC: failed to register tool: ${(err as Error).message}`);
     }
