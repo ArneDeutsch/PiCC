@@ -212,6 +212,61 @@ describe.skipIf(!rgAvailable)("Grep tool (ripgrep engine, parity with JS fallbac
     expect(js.text).toBe(rg.text);
   });
 
+  it("normalizes large, fractional, and negative numeric inputs with exact engine parity", async () => {
+    const cases = [
+      {
+        label: "large values; rg rejects the context argument and falls back",
+        params: {
+          pattern: "foo",
+          path: "a.txt",
+          output_mode: "content",
+          head_limit: Number.MAX_VALUE,
+          offset: Number.MAX_VALUE,
+          context: Number.MAX_VALUE,
+        },
+        text: "No entries at offset 1.7976931348623157e+308 (7 total)",
+        details: { mode: "content", engine: "js", totalEntries: 7, returnedEntries: 0, truncated: false },
+        rgEngine: "js",
+      },
+      {
+        label: "fractions below one",
+        params: {
+          pattern: "foo",
+          path: "a.txt",
+          output_mode: "content",
+          head_limit: 0.9,
+          offset: 0.9,
+          context: 0.9,
+        },
+        text: "No entries at offset 0 (2 total)",
+        details: { mode: "content", engine: "js", totalEntries: 2, returnedEntries: 0, truncated: false },
+        rgEngine: "rg",
+      },
+      {
+        label: "negative fractions",
+        params: {
+          pattern: "foo",
+          path: "a.txt",
+          output_mode: "content",
+          head_limit: -0.1,
+          offset: -0.1,
+          context: -0.1,
+        },
+        text: "a.txt:2:foo bar\na.txt:6:foo again",
+        details: { mode: "content", engine: "js", totalEntries: 2, returnedEntries: 2, truncated: false },
+        rgEngine: "rg",
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const rg = await run(rgGrep, testCase.params);
+      const js = await run(jsGrep, testCase.params);
+      expect(js, testCase.label).toEqual({ text: testCase.text, details: testCase.details });
+      expect(rg.text, testCase.label).toBe(testCase.text);
+      expect(rg.details, testCase.label).toEqual({ ...testCase.details, engine: testCase.rgEngine });
+    }
+  });
+
   it("no-match parity", async () => {
     const [rg, js] = await both({ pattern: "zebra-not-present" });
     expect(rg.text).toBe("No matches found");

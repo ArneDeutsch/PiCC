@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { fakePi } from "./helpers/fake-pi.js";
-import { withCompactSearchTuiRendering } from "../src/runtime/search-tool-render.js";
+import { withCompactSearchRendering } from "../src/runtime/search-tool-render.js";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 
 /**
@@ -376,7 +376,7 @@ describe("real Pi compact-search composition", () => {
     )) as any;
     const { visibleWidth } = await import("@earendil-works/pi-tui");
     initTheme();
-    const definition = wrapForSelfShell(withCompactSearchTuiRendering({ name: search.name } as any));
+    const definition = wrapForSelfShell(withCompactSearchRendering({ name: search.name } as any));
     const build = (payload: any) => {
       const component = new ToolExecutionComponent(
         search.name, `${search.name}-contract`, search.args, {}, definition,
@@ -435,7 +435,7 @@ describe("real Pi compact-search composition", () => {
     const themeModule: any = await import(`${piDist}/dist/modes/interactive/theme/theme.js`);
     expect(typeof htmlModule.createToolHtmlRenderer).toBe("function");
     expect(typeof exportModule.exportSessionToHtml).toBe("function");
-    const definition = wrapForSelfShell(withCompactSearchTuiRendering({ name: search.name } as any));
+    const definition = wrapForSelfShell(withCompactSearchRendering({ name: search.name } as any));
     const renderer = htmlModule.createToolHtmlRenderer({
       getToolDefinition: (name: string) => name === search.name ? definition : undefined,
       theme: themeModule.theme,

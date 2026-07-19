@@ -153,6 +153,121 @@ describe("Grep parameter surface (JS engine)", () => {
     expect(unlimited.text).not.toContain("[Results limited");
   });
 
+  it("pins execution at zero and fractional pagination/context boundaries", async () => {
+    const cases = [
+      {
+        args: { pattern: "NEEDLE", output_mode: "content", head_limit: 0.9 },
+        text: "No entries at offset 0 (2 total)",
+        totalEntries: 2,
+        returnedEntries: 0,
+      },
+      {
+        args: { pattern: "NEEDLE", output_mode: "content", head_limit: -0.1 },
+        text: "f.txt:2:two NEEDLE\nf.txt:6:six NEEDLE",
+        totalEntries: 2,
+        returnedEntries: 2,
+      },
+      {
+        args: { pattern: "NEEDLE", output_mode: "content", head_limit: 0 },
+        text: "f.txt:2:two NEEDLE\nf.txt:6:six NEEDLE",
+        totalEntries: 2,
+        returnedEntries: 2,
+      },
+      {
+        args: { pattern: "NEEDLE", output_mode: "content", offset: 0.9 },
+        text: "f.txt:2:two NEEDLE\nf.txt:6:six NEEDLE",
+        totalEntries: 2,
+        returnedEntries: 2,
+      },
+      {
+        args: { pattern: "NEEDLE", output_mode: "content", offset: -0.1 },
+        text: "f.txt:2:two NEEDLE\nf.txt:6:six NEEDLE",
+        totalEntries: 2,
+        returnedEntries: 2,
+      },
+      {
+        args: { pattern: "NEEDLE", output_mode: "content", context: 0.9 },
+        text: "f.txt:2:two NEEDLE\nf.txt:6:six NEEDLE",
+        totalEntries: 2,
+        returnedEntries: 2,
+      },
+      {
+        args: { pattern: "NEEDLE", output_mode: "content", context: 1.9 },
+        text: [
+          "f.txt-1-one",
+          "f.txt:2:two NEEDLE",
+          "f.txt-3-three",
+          "--",
+          "f.txt-5-five",
+          "f.txt:6:six NEEDLE",
+          "f.txt-7-seven",
+        ].join("\n"),
+        totalEntries: 7,
+        returnedEntries: 7,
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const result = await run(grep, testCase.args);
+      expect(result).toEqual({
+        text: testCase.text,
+        details: {
+          mode: "content",
+          engine: "js",
+          totalEntries: testCase.totalEntries,
+          returnedEntries: testCase.returnedEntries,
+          truncated: false,
+        },
+      });
+    }
+  });
+
+  it("normalizes every finite pagination/context number without a safe-integer restriction", async () => {
+    const baseline = await run(grep, { pattern: "bulk", output_mode: "content", head_limit: 0 });
+    for (const head_limit of [Number.MAX_VALUE, -Number.MAX_VALUE, 4_500_000_000_000_000.5]) {
+      const result = await run(grep, { pattern: "bulk", output_mode: "content", head_limit });
+      expect(result).toEqual(baseline);
+    }
+
+    const hugeOffset = await run(grep, {
+      pattern: "NEEDLE",
+      output_mode: "content",
+      offset: Number.MAX_VALUE,
+    });
+    expect(hugeOffset.text).toBe(`No entries at offset ${String(Number.MAX_VALUE)} (2 total)`);
+    expect(hugeOffset.details.returnedEntries).toBe(0);
+    const negativeOffset = await run(grep, {
+      pattern: "NEEDLE",
+      output_mode: "content",
+      offset: -Number.MAX_VALUE,
+    });
+    expect(negativeOffset.text).toBe("f.txt:2:two NEEDLE\nf.txt:6:six NEEDLE");
+
+    const fullContext = await run(grep, {
+      pattern: "NEEDLE",
+      output_mode: "content",
+      context: Number.MAX_VALUE,
+    });
+    expect(fullContext.text.split("\n")).toHaveLength(7);
+    expect(fullContext.text).not.toContain("--");
+    const overridden = await run(grep, {
+      pattern: "NEEDLE",
+      output_mode: "content",
+      context: Number.MAX_VALUE,
+      "-C": -Number.MAX_VALUE,
+      "-B": 4_500_000_000_000_000.5,
+      "-A": -3.9,
+    });
+    expect(overridden.text).toBe([
+      "f.txt-1-one",
+      "f.txt:2:two NEEDLE",
+      "f.txt-3-three",
+      "f.txt-4-four",
+      "f.txt-5-five",
+      "f.txt:6:six NEEDLE",
+    ].join("\n"));
+  });
+
   it("ignores content-only flags in files_with_matches mode", async () => {
     const { text } = await run(grep, { pattern: "NEEDLE", "-C": 2, "-n": false, "-o": true });
     expect(text).toBe("f.txt");

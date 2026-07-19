@@ -68,7 +68,7 @@ import { builtinAgents } from "./claude/agents.js";
 import { loadAgentMemory } from "./claude/memory.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
 import { wrapForSelfShell } from "./runtime/tool-shell.js";
-import { withCompactSearchTuiRendering } from "./runtime/search-tool-render.js";
+import { withCompactSearchRendering } from "./runtime/search-tool-render.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
@@ -1075,7 +1075,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // by `customToolsFor` is intentionally NOT wrapped: it renders inside
       // subagent transcripts, not the parent interactive shell.)
       const mainSessionTool: Record<string, unknown> = tool.name === "Grep" || tool.name === "Glob"
-        ? withCompactSearchTuiRendering(tool as unknown as ToolDefinition) as unknown as Record<string, unknown>
+        ? withCompactSearchRendering(tool as unknown as ToolDefinition) as unknown as Record<string, unknown>
         : tool;
       pi.registerTool(wrapForSelfShell(mainSessionTool));
     } catch (err) {

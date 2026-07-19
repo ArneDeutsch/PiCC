@@ -4,10 +4,17 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+  DEFAULT_GREP_HEAD_LIMIT,
+  GLOB_RESULT_CAP,
+  normalizeFiniteNonnegative,
+  resolveGrepContext,
+  resolveGrepHeadLimit,
+  resolveGrepMode,
+  type GlobResultDetails,
+  type GrepResultDetails,
+} from "./tools/search-tools.js";
 import { genericResultComponent, type RenderCtx } from "./tool-shell.js";
-
-const GLOB_CAP = 200;
-const DEFAULT_HEAD_LIMIT = 100;
 const LINE_BREAK_RE = /\r\n?|\n|\u2028|\u2029/;
 
 interface Component {
@@ -29,21 +36,6 @@ interface SummaryState {
 
 interface RenderContext extends RenderCtx {
   args?: unknown;
-}
-
-interface GrepDetails {
-  mode: "content" | "files_with_matches" | "count";
-  engine: "rg" | "js";
-  totalEntries: number;
-  returnedEntries: number;
-  truncated: boolean;
-}
-
-interface GlobDetails {
-  totalMatches: number;
-  returned: number;
-  capped: boolean;
-  truncated: boolean;
 }
 
 type SearchName = "Grep" | "Glob";
@@ -102,21 +94,6 @@ function count(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-function finite(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-function effectiveNonnegative(value: unknown, fallback: number): number | undefined {
-  if (value === undefined) return fallback;
-  if (!finite(value)) return undefined;
-  const resolved = Math.max(0, Math.floor(value));
-  return Number.isSafeInteger(resolved) ? resolved : undefined;
-}
-
-function resolvedMode(args: Snapshot): GrepDetails["mode"] | undefined {
-  const mode = args.output_mode ?? "files_with_matches";
-  return mode === "content" || mode === "files_with_matches" || mode === "count" ? mode : undefined;
-}
 
 function validOptional(args: Snapshot, key: string, type: "string" | "boolean" | "number"): boolean {
   const value = args[key];
@@ -131,20 +108,11 @@ function validArgs(toolName: SearchName, args: Snapshot): boolean {
   for (const key of ["-A", "-B", "-C", "context", "head_limit", "offset"]) {
     if (!validOptional(args, key, "number")) return false;
   }
-  return resolvedMode(args) !== undefined;
+  return resolveGrepMode(args) !== undefined;
 }
 
-function resolvedLimit(args: Snapshot): number | undefined {
-  const raw = args.head_limit;
-  if (raw === undefined) return DEFAULT_HEAD_LIMIT;
-  if (!finite(raw)) return undefined;
-  if (raw <= 0) return Number.POSITIVE_INFINITY;
-  const resolved = Math.floor(raw);
-  return Number.isSafeInteger(resolved) ? resolved : undefined;
-}
-
-function validateGrepDetails(value: unknown, args: Snapshot): GrepDetails | undefined {
-  if (!exactKeys(value, ["mode", "engine", "totalEntries", "returnedEntries", "truncated"])) return undefined;
+function validateGrepDetails(value: unknown, args: Snapshot): GrepResultDetails | undefined {
+  if (!plainRecord(value)) return undefined;
   const mode = safeOwn(value, "mode");
   const engine = safeOwn(value, "engine");
   const totalEntries = safeOwn(value, "totalEntries");
@@ -153,24 +121,24 @@ function validateGrepDetails(value: unknown, args: Snapshot): GrepDetails | unde
   if (mode !== "content" && mode !== "files_with_matches" && mode !== "count") return undefined;
   if (engine !== "rg" && engine !== "js") return undefined;
   if (!count(totalEntries) || !count(returnedEntries) || typeof truncated !== "boolean") return undefined;
-  if (resolvedMode(args) !== mode) return undefined;
-  const offset = effectiveNonnegative(args.offset, 0);
-  const limit = resolvedLimit(args);
+  if (resolveGrepMode(args) !== mode) return undefined;
+  const offset = normalizeFiniteNonnegative(args.offset);
+  const limit = resolveGrepHeadLimit(args.head_limit);
   if (offset === undefined || limit === undefined) return undefined;
   const expected = Math.min(Math.max(0, totalEntries - offset), limit);
   if (returnedEntries !== expected) return undefined;
   return { mode, engine, totalEntries, returnedEntries, truncated };
 }
 
-function validateGlobDetails(value: unknown): GlobDetails | undefined {
-  if (!exactKeys(value, ["totalMatches", "returned", "capped", "truncated"])) return undefined;
+function validateGlobDetails(value: unknown): GlobResultDetails | undefined {
+  if (!plainRecord(value)) return undefined;
   const totalMatches = safeOwn(value, "totalMatches");
   const returned = safeOwn(value, "returned");
   const capped = safeOwn(value, "capped");
   const truncated = safeOwn(value, "truncated");
   if (!count(totalMatches) || !count(returned)) return undefined;
   if (typeof capped !== "boolean" || typeof truncated !== "boolean") return undefined;
-  if (returned !== Math.min(totalMatches, GLOB_CAP) || capped !== (totalMatches > GLOB_CAP)) return undefined;
+  if (returned !== Math.min(totalMatches, GLOB_RESULT_CAP) || capped !== (totalMatches > GLOB_RESULT_CAP)) return undefined;
   return { totalMatches, returned, capped, truncated };
 }
 
@@ -261,14 +229,6 @@ function quote(value: string): string {
   return `“${value || "?"}”`;
 }
 
-function resolvedContext(args: Snapshot): { before: number; after: number } | undefined {
-  const bothRaw = args["-C"] ?? args.context;
-  const both = effectiveNonnegative(bothRaw, 0);
-  const before = effectiveNonnegative(args["-B"], both ?? 0);
-  const after = effectiveNonnegative(args["-A"], both ?? 0);
-  return both === undefined || before === undefined || after === undefined ? undefined : { before, after };
-}
-
 function invocationParts(toolName: SearchName, args: Snapshot): {
   expression: string;
   path: string;
@@ -285,7 +245,7 @@ function invocationParts(toolName: SearchName, args: Snapshot): {
   if (typeof args.type === "string" && type) filters.push(`type ${type}`);
 
   const modifiers: string[] = [];
-  const mode = resolvedMode(args);
+  const mode = resolveGrepMode(args);
   if (mode === "content" || mode === "count") modifiers.push(`mode ${mode}`);
   if (args["-i"] === true) modifiers.push("-i");
   if (args.multiline === true) modifiers.push("multiline");
@@ -294,7 +254,7 @@ function invocationParts(toolName: SearchName, args: Snapshot): {
     if (args["-o"] === true) {
       modifiers.push("-o");
     } else {
-      const context = resolvedContext(args);
+      const context = mode ? resolveGrepContext(args, mode) : undefined;
       if (context) {
         if (context.before === context.after && context.before > 0) modifiers.push(`-C ${String(context.before)}`);
         else {
@@ -304,10 +264,10 @@ function invocationParts(toolName: SearchName, args: Snapshot): {
       }
     }
   }
-  const limit = resolvedLimit(args);
+  const limit = resolveGrepHeadLimit(args.head_limit);
   if (limit === Number.POSITIVE_INFINITY) modifiers.push("limit unlimited");
-  else if (limit !== undefined && limit !== DEFAULT_HEAD_LIMIT) modifiers.push(`limit ${String(limit)}`);
-  const offset = effectiveNonnegative(args.offset, 0);
+  else if (limit !== undefined && limit !== DEFAULT_GREP_HEAD_LIMIT) modifiers.push(`limit ${String(limit)}`);
+  const offset = normalizeFiniteNonnegative(args.offset);
   if (offset !== undefined && offset > 0) modifiers.push(`offset ${String(offset)}`);
   return { expression, path, filters, modifiers };
 }
@@ -460,7 +420,7 @@ const CLIP_HINTS: Record<SearchName, string> = {
   Glob: "re-run a narrower command — target a specific path, request fewer entries, or pipe through a filter — to recover the omitted output",
 };
 
-// Only the guard's exact marker licenses adding clipped status; counts and user prose do not.
+// The exact in-band marker is an advisory clipping signal; ordinary prose and counts are ignored.
 function exactClipMarker(toolName: SearchName, text: string): boolean {
   const escaped = CLIP_HINTS[toolName].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(
@@ -469,15 +429,15 @@ function exactClipMarker(toolName: SearchName, text: string): boolean {
   ).test(text);
 }
 
-function deriveState(toolName: SearchName, details: GrepDetails | GlobDetails, args: Snapshot, primaryText: string): SummaryState {
+function deriveState(toolName: SearchName, details: GrepResultDetails | GlobResultDetails, args: Snapshot, primaryText: string): SummaryState {
   const statuses: string[] = [];
   const compact: string[] = [];
   let countText: string;
   let compactCount: string;
   let incomplete = false;
   if (toolName === "Grep") {
-    const grep = details as GrepDetails;
-    const offset = effectiveNonnegative(args.offset, 0) ?? 0;
+    const grep = details as GrepResultDetails;
+    const offset = normalizeFiniteNonnegative(args.offset) ?? 0;
     const available = Math.max(0, grep.totalEntries - offset);
     if (grep.totalEntries === 0) {
       statuses.push("no matches"); compact.push("none");
@@ -496,7 +456,7 @@ function deriveState(toolName: SearchName, details: GrepDetails | GlobDetails, a
     countText = `${String(grep.returnedEntries)}/${String(grep.totalEntries)} entries`;
     compactCount = `${String(grep.returnedEntries)}/${String(grep.totalEntries)}`;
   } else {
-    const glob = details as GlobDetails;
+    const glob = details as GlobResultDetails;
     if (glob.totalMatches === 0) {
       statuses.push("no files"); compact.push("none");
     }
@@ -611,7 +571,7 @@ function combinedComponent(components: readonly Component[]): Component {
 
 // HTML serializes the call before the result, so renderResult owns the settled summary;
 // the empty call also avoids a second TUI content row.
-export function withCompactSearchTuiRendering<T extends ToolDefinition>(tool: T): T {
+export function withCompactSearchRendering<T extends ToolDefinition>(tool: T): T {
   if (tool.name !== "Grep" && tool.name !== "Glob") throw new TypeError("compact search rendering accepts only Grep or Glob tools");
   const toolName = tool.name;
   return {

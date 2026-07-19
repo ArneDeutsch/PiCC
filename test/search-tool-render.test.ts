@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { withCompactSearchTuiRendering } from "../src/runtime/search-tool-render.js";
+import { withCompactSearchRendering } from "../src/runtime/search-tool-render.js";
 import { createGlobTool, createGrepTool } from "../src/runtime/tools/search-tools.js";
 
 interface Component {
@@ -48,11 +51,11 @@ const globDetails = {
 };
 
 function grepTool(): RenderTool {
-  return withCompactSearchTuiRendering(createGrepTool(() => ".", { forceJs: true })) as unknown as RenderTool;
+  return withCompactSearchRendering(createGrepTool(() => ".", { forceJs: true })) as unknown as RenderTool;
 }
 
 function globTool(): RenderTool {
-  return withCompactSearchTuiRendering(createGlobTool(() => ".")) as unknown as RenderTool;
+  return withCompactSearchRendering(createGlobTool(() => ".")) as unknown as RenderTool;
 }
 
 function context(args: Record<string, unknown>, extra: Partial<RenderContext> = {}): RenderContext {
@@ -81,10 +84,10 @@ function expectBounded(lines: string[], width: number): void {
   for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 }
 
-describe("compact search TUI decorator", () => {
+describe("compact search rendering decorator", () => {
   it("preserves execute and every non-render field", () => {
     const source = createGrepTool(() => ".", { forceJs: true });
-    const decorated = withCompactSearchTuiRendering(source);
+    const decorated = withCompactSearchRendering(source);
     expect(decorated).not.toBe(source);
     expect(decorated.execute).toBe(source.execute);
     for (const key of Object.keys(source)) {
@@ -95,7 +98,7 @@ describe("compact search TUI decorator", () => {
       }
     }
     expect(() =>
-      withCompactSearchTuiRendering({ ...source, name: "Other" } as typeof source),
+      withCompactSearchRendering({ ...source, name: "Other" } as typeof source),
     ).toThrow(/only Grep or Glob/);
   });
 
@@ -395,12 +398,35 @@ describe("compact search TUI decorator", () => {
     ["infinity", { ...grepDetails, returnedEntries: Number.POSITIVE_INFINITY }],
     ["negative", { ...grepDetails, totalEntries: -1 }],
     ["inconsistent counts", { ...grepDetails, totalEntries: 1, returnedEntries: 2 }],
+    ["missing required field", {
+      mode: grepDetails.mode,
+      engine: grepDetails.engine,
+      totalEntries: grepDetails.totalEntries,
+      returnedEntries: grepDetails.returnedEntries,
+    }],
     ["unknown mode", { ...grepDetails, mode: "paths" }],
     ["unknown engine", { ...grepDetails, engine: "other" }],
-    ["extra key", { ...grepDetails, extra: true }],
   ])("fails open for invalid Grep details: %s", (_label, details) => {
     const rendered = callAndFinalize(grepTool(), { pattern: "x" }, textResult("raw body", details));
     expect(rendered.result.join(" ")).toContain("raw body");
+  });
+
+  it("keeps Grep and Glob compact when details gain additive own data fields", () => {
+    const grep = callAndFinalize(
+      grepTool(),
+      { pattern: "x" },
+      textResult("hidden grep body", { ...grepDetails, futureMetadata: { source: "new" } }),
+    );
+    expect(grep.result).toHaveLength(1);
+    expect(grep.result.join(" ")).not.toContain("hidden grep body");
+
+    const glob = callAndFinalize(
+      globTool(),
+      { pattern: "*" },
+      textResult("hidden glob body", { ...globDetails, diagnostics: ["additive"] }),
+    );
+    expect(glob.result).toHaveLength(1);
+    expect(glob.result.join(" ")).not.toContain("hidden glob body");
   });
 
   it("fails open for hostile details prototypes, getters, and incoherent pagination", () => {
@@ -435,9 +461,13 @@ describe("compact search TUI decorator", () => {
     ["NaN", { ...globDetails, totalMatches: Number.NaN }],
     ["infinity", { ...globDetails, returned: Number.POSITIVE_INFINITY }],
     ["negative", { ...globDetails, totalMatches: -1 }],
+    ["missing required field", {
+      totalMatches: globDetails.totalMatches,
+      returned: globDetails.returned,
+      capped: globDetails.capped,
+    }],
     ["bad cap count", { totalMatches: 250, returned: 199, capped: true, truncated: false }],
     ["bad cap flag", { totalMatches: 250, returned: 200, capped: false, truncated: false }],
-    ["extra key", { ...globDetails, other: 1 }],
   ])("fails open for invalid Glob details: %s", (_label, details) => {
     const rendered = callAndFinalize(globTool(), { pattern: "*" }, textResult("raw body", details));
     expect(rendered.result.join(" ")).toContain("raw body");
@@ -496,24 +526,101 @@ describe("compact search TUI decorator", () => {
     }
   });
 
-  it("uses execution-equivalent pagination for zero, positive, floored, and clamped values", () => {
-    const cases: Array<[Record<string, unknown>, number, string | undefined]> = [
-      [{ pattern: "x", head_limit: 0 }, 5, "limit unlimited"],
-      [{ pattern: "x", head_limit: -3 }, 5, "limit unlimited"],
-      [{ pattern: "x", head_limit: 2.9 }, 2, "limit 2"],
-      [{ pattern: "x", offset: -4 }, 5, undefined],
-      [{ pattern: "x", offset: 1.9 }, 4, "offset 1"],
-    ];
-    for (const [args, returnedEntries, display] of cases) {
-      const rendered = callAndFinalize(
-        grepTool(),
-        args,
-        textResult("ordinary", { ...grepDetails, totalEntries: 5, returnedEntries }),
-        220,
-      );
-      expect(rendered.result).toHaveLength(1);
-      if (display) expect(rendered.result.join(" ")).toContain(display);
-      else expect(rendered.result.join(" ")).not.toContain("offset");
+  it("renders actual zero/fraction execution results with normalized modifiers and counts", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-search-render-boundaries-"));
+    try {
+      fs.writeFileSync(path.join(dir, "f.txt"), "one\ntwo NEEDLE\nthree\nfour\nfive\nsix NEEDLE\nseven\n");
+      const source = createGrepTool(() => dir, { forceJs: true });
+      const tool = withCompactSearchRendering(source) as unknown as RenderTool;
+      const matches = "f.txt:2:two NEEDLE\nf.txt:6:six NEEDLE";
+      const contextMatches = [
+        "f.txt-1-one",
+        "f.txt:2:two NEEDLE",
+        "f.txt-3-three",
+        "--",
+        "f.txt-5-five",
+        "f.txt:6:six NEEDLE",
+        "f.txt-7-seven",
+      ].join("\n");
+      const cases = [
+        { args: { pattern: "NEEDLE", output_mode: "content", head_limit: 0.9 }, text: "No entries at offset 0 (2 total)", total: 2, returned: 0, include: ["limit 0", "0/2 entries", "limited"], exclude: [] },
+        { args: { pattern: "NEEDLE", output_mode: "content", head_limit: -0.1 }, text: matches, total: 2, returned: 2, include: ["limit unlimited", "2/2 entries"], exclude: [" · limited"] },
+        { args: { pattern: "NEEDLE", output_mode: "content", head_limit: 0 }, text: matches, total: 2, returned: 2, include: ["limit unlimited", "2/2 entries"], exclude: [" · limited"] },
+        { args: { pattern: "NEEDLE", output_mode: "content", offset: 0.9 }, text: matches, total: 2, returned: 2, include: ["2/2 entries"], exclude: ["offset"] },
+        { args: { pattern: "NEEDLE", output_mode: "content", offset: -0.1 }, text: matches, total: 2, returned: 2, include: ["2/2 entries"], exclude: ["offset"] },
+        { args: { pattern: "NEEDLE", output_mode: "content", context: 0.9 }, text: matches, total: 2, returned: 2, include: ["2/2 entries"], exclude: ["-C"] },
+        { args: { pattern: "NEEDLE", output_mode: "content", context: 1.9 }, text: contextMatches, total: 7, returned: 7, include: ["-C 1", "7/7 entries"], exclude: [] },
+      ] as const;
+
+      for (const testCase of cases) {
+        const result = await source.execute("boundary-contract", testCase.args as never, undefined, undefined, {} as never);
+        expect(result).toEqual({
+          content: [{ type: "text", text: testCase.text }],
+          details: {
+            mode: "content",
+            engine: "js",
+            totalEntries: testCase.total,
+            returnedEntries: testCase.returned,
+            truncated: false,
+          },
+        });
+        const row = tool.renderResult(
+          result,
+          { expanded: true, isPartial: false },
+          undefined,
+          context(testCase.args),
+        ).render(240);
+        expect(row).toHaveLength(1);
+        expect(row.join(" ")).not.toContain(testCase.text);
+        for (const expected of testCase.include) expect(row.join(" ")).toContain(expected);
+        for (const omitted of testCase.exclude) expect(row.join(" ")).not.toContain(omitted);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps large finite execution results compact under the shared normalization contract", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-search-render-contract-"));
+    try {
+      fs.writeFileSync(path.join(dir, "a.txt"), "needle\n");
+      fs.writeFileSync(path.join(dir, "b.txt"), "needle\n");
+      fs.writeFileSync(path.join(dir, "c.txt"), "needle\n");
+      const source = createGrepTool(() => dir, { forceJs: true });
+      const tool = withCompactSearchRendering(source) as unknown as RenderTool;
+      const cases: Record<string, unknown>[] = [
+        { pattern: "needle", head_limit: Number.MAX_VALUE },
+        { pattern: "needle", head_limit: -Number.MAX_VALUE },
+        { pattern: "needle", head_limit: 4_500_000_000_000_000.5 },
+        { pattern: "needle", offset: Number.MAX_VALUE },
+        { pattern: "needle", offset: -Number.MAX_VALUE },
+        { pattern: "needle", offset: 1.9 },
+        { pattern: "needle", output_mode: "content", context: Number.MAX_VALUE },
+        {
+          pattern: "needle",
+          output_mode: "content",
+          context: Number.MAX_VALUE,
+          "-C": -Number.MAX_VALUE,
+          "-B": 4_500_000_000_000_000.5,
+          "-A": -3.9,
+        },
+      ];
+      for (const args of cases) {
+        const result = await source.execute("shared-contract", args as never, undefined, undefined, {} as never);
+        const before = JSON.stringify(result);
+        const primary = (result.content[0] as { type: "text"; text: string }).text;
+        const lines = tool.renderResult(
+          result,
+          { expanded: true, isPartial: false },
+          undefined,
+          context(args),
+        ).render(240);
+        expect(lines.length).toBeGreaterThan(0);
+        expect(lines.join(" ")).not.toContain(primary);
+        expect(JSON.stringify(result)).toBe(before);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 

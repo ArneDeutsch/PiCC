@@ -28,8 +28,8 @@ import {
 
 const MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB — skip larger files in the JS walker
 const BINARY_SNIFF_BYTES = 8192;
-const DEFAULT_HEAD_LIMIT = 100;
-const GLOB_MAX_RESULTS = 200;
+export const DEFAULT_GREP_HEAD_LIMIT = 100;
+export const GLOB_RESULT_CAP = 200;
 const RG_TIMEOUT_MS = 30_000;
 const SKIP_DIRS = new Set([".git", "node_modules"]);
 
@@ -243,7 +243,64 @@ function readTextFile(abs: string): string | undefined {
 // Grep
 // ---------------------------------------------------------------------------
 
-type GrepMode = "content" | "files_with_matches" | "count";
+export type GrepMode = "content" | "files_with_matches" | "count";
+
+export interface GrepResultDetails {
+  mode: GrepMode;
+  engine: "rg" | "js";
+  totalEntries: number;
+  returnedEntries: number;
+  truncated: boolean;
+}
+
+export interface GlobResultDetails {
+  totalMatches: number;
+  returned: number;
+  capped: boolean;
+  truncated: boolean;
+}
+
+interface GrepNormalizationArgs {
+  output_mode?: unknown;
+  "-A"?: unknown;
+  "-B"?: unknown;
+  "-C"?: unknown;
+  context?: unknown;
+}
+
+export function resolveGrepMode(args: { output_mode?: unknown }): GrepMode | undefined {
+  const mode = args.output_mode ?? "files_with_matches";
+  return mode === "content" || mode === "files_with_matches" || mode === "count"
+    ? mode
+    : undefined;
+}
+
+export function normalizeFiniteNonnegative(
+  value: unknown,
+  fallback = 0,
+): number | undefined {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return Math.max(0, Math.floor(value));
+}
+
+export function resolveGrepHeadLimit(value: unknown): number | undefined {
+  if (value === undefined) return DEFAULT_GREP_HEAD_LIMIT;
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return value <= 0 ? Number.POSITIVE_INFINITY : Math.floor(value);
+}
+
+export function resolveGrepContext(
+  args: GrepNormalizationArgs,
+  mode: GrepMode,
+): { before: number; after: number } | undefined {
+  if (mode !== "content") return { before: 0, after: 0 };
+  const both = normalizeFiniteNonnegative(args["-C"] ?? args.context);
+  if (both === undefined) return undefined;
+  const before = normalizeFiniteNonnegative(args["-B"], both);
+  const after = normalizeFiniteNonnegative(args["-A"], both);
+  return before === undefined || after === undefined ? undefined : { before, after };
+}
 
 /** Fully resolved query shared by both engines. */
 interface GrepQuery {
@@ -702,29 +759,22 @@ export function createGrepTool(getCwd: () => string, opts: GrepToolOptions = {})
       if (!fs.existsSync(searchPath)) {
         throw new Error(`Grep: path does not exist: ${searchPath}`);
       }
-      const mode: GrepMode = params.output_mode ?? "files_with_matches";
-      const contextBoth = params["-C"] ?? params.context;
-      const clampContext = (v: number | undefined): number =>
-        mode === "content" && v !== undefined ? Math.max(0, Math.floor(v)) : 0;
+      const mode = resolveGrepMode(params) as GrepMode;
+      const resolvedContext = resolveGrepContext(params, mode) as { before: number; after: number };
       const query: GrepQuery = {
         pattern: params.pattern,
         mode,
         ignoreCase: params["-i"] === true,
         lineNumbers: params["-n"] !== false,
-        before: clampContext(params["-B"] ?? contextBoth),
-        after: clampContext(params["-A"] ?? contextBoth),
+        before: resolvedContext.before,
+        after: resolvedContext.after,
         onlyMatching: mode === "content" && params["-o"] === true,
         multiline: params.multiline === true,
         glob: params.glob,
         type: params.type,
       };
-      const headLimit =
-        params.head_limit === undefined
-          ? DEFAULT_HEAD_LIMIT
-          : params.head_limit <= 0
-            ? Number.POSITIVE_INFINITY // 0 = unlimited
-            : Math.floor(params.head_limit);
-      const offset = Math.max(0, Math.floor(params.offset ?? 0));
+      const headLimit = resolveGrepHeadLimit(params.head_limit) as number;
+      const offset = normalizeFiniteNonnegative(params.offset) as number;
 
       let result: GrepResult | null = null;
       if (!opts.forceJs) {
@@ -768,7 +818,7 @@ export function createGrepTool(getCwd: () => string, opts: GrepToolOptions = {})
           totalEntries: total,
           returnedEntries: limited.length,
           truncated: truncation.truncated,
-        },
+        } satisfies GrepResultDetails,
       };
     },
   });
@@ -811,8 +861,8 @@ export function createGlobTool(getCwd: () => string): ToolDefinition {
         matches.push({ abs: file.abs, mtime });
       }
       matches.sort((a, b) => b.mtime - a.mtime);
-      const capped = matches.length > GLOB_MAX_RESULTS;
-      const shown = matches.slice(0, GLOB_MAX_RESULTS);
+      const capped = matches.length > GLOB_RESULT_CAP;
+      const shown = matches.slice(0, GLOB_RESULT_CAP);
 
       let text: string;
       if (shown.length === 0) {
@@ -820,7 +870,7 @@ export function createGlobTool(getCwd: () => string): ToolDefinition {
       } else {
         text = shown.map((m) => m.abs).join("\n");
         if (capped) {
-          text += `\n[Results capped at ${GLOB_MAX_RESULTS} of ${matches.length} files]`;
+          text += `\n[Results capped at ${GLOB_RESULT_CAP} of ${matches.length} files]`;
         }
       }
       const truncation = truncateHead(text, {
@@ -834,7 +884,7 @@ export function createGlobTool(getCwd: () => string): ToolDefinition {
           returned: shown.length,
           capped,
           truncated: truncation.truncated,
-        },
+        } satisfies GlobResultDetails,
       };
     },
   });
