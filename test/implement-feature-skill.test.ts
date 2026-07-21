@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { loadAgents } from "../src/claude/agents.js";
 import { loadSkillBody, loadSkills, substituteArguments } from "../src/claude/skills.js";
 import { REINJECT_PER_SKILL_MAX_CHARS } from "../src/runtime/skill-activation.js";
 import { walkFiles } from "../src/util/fs.js";
@@ -801,6 +802,206 @@ describe("fail-closed floor pointer on every write-site reference", () => {
       expect(body, `${site}: missing read-failure clause`).toMatch(READ_FAILURE);
     });
   }
+});
+
+describe("proportional documentation scope contracts", () => {
+  const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const AGENTS_DIR = path.join(REPO_ROOT, ".claude", "agents");
+  const GUIDE_PATH = path.join(REPO_ROOT, "doc", "documentation-guide.md");
+  const ROUTER_PATH = path.join(SKILL_DIR, "SKILL.md");
+  const phasePaths = [
+    "phase-4-how-investigation.md",
+    "phase-5-task-breakdown.md",
+    "phase-6-plan-review.md",
+    "phase-7-implementation.md",
+    "phase-8-close-review.md",
+  ] as const;
+  const normalize = (text: string): string => text.replace(/\r\n/g, "\n");
+  const collapseText = (text: string): string => normalize(text).toLowerCase().replace(/\s+/g, " ").trim();
+  const collapseFile = (file: string): string => collapseText(fs.readFileSync(file, "utf8"));
+  const phase = (name: (typeof phasePaths)[number]): string => collapseFile(path.join(REFERENCES_DIR, name));
+  const between = (text: string, start: string, end: string): string => {
+    const from = text.indexOf(start);
+    const to = text.indexOf(end, from + start.length);
+    expect(from, `missing section start: ${start}`).toBeGreaterThanOrEqual(0);
+    expect(to, `missing section end: ${end}`).toBeGreaterThan(from);
+    return text.slice(from, to);
+  };
+
+  it("keeps the complete decision and genre exclusions in the guide's Proportional scope section", () => {
+    const guide = collapseFile(GUIDE_PATH);
+    const proportional = between(guide, "### proportional scope", "## 3. quality standards");
+    for (const marker of [
+      "no durable documentation change",
+      "smallest sufficient set",
+      "reader",
+      "necessary decision",
+      "existing sources are insufficient",
+      "smallest sufficient placement",
+      "set-level removal test",
+      "aggregate excess",
+      "must-fix",
+      "mechanically generated output",
+      "retained non-obvious rationale",
+      "not optional surfaces",
+    ]) expect(proportional, marker).toContain(marker);
+  });
+
+  it("keeps anti-drift factual and mandatory while proportional scope governs only additional prose", () => {
+    const guide = collapseFile(GUIDE_PATH);
+    const generated = between(guide, "### generated docs", "### test fixtures");
+    expect(generated).toContain("anti-drift investigation determines factually whether behavior changed a support claim");
+    expect(generated).toContain("repair the registry");
+    expect(generated).toContain("regenerate, never hand-edit");
+    expect(generated).toContain("proportional scope decides only whether additional prose is warranted");
+    expect(generated).toContain("never permits required registry repair or regeneration to be skipped");
+
+    const comments = between(guide, "### code comments", "### prompt docs");
+    expect(comments).toContain("add a comment only when that local rationale is necessary");
+    expect(comments).toContain("cannot justify removing existing load-bearing rationale");
+
+    const antiDrift = between(guide, "## 7. anti-drift", "**the altitude row");
+    expect(antiDrift).toContain("when behavior makes existing documentation false");
+    expect(antiDrift).toContain("a behavior change does not by itself require a durable addition");
+    expect(antiDrift).toContain("aggregate excess under *proportional scope*");
+  });
+
+  it("loads the real docs agent and relates Investigate and Review to anti-drift without presumed additions", () => {
+    const { agents, diagnostics } = loadAgents([{ dir: AGENTS_DIR, scope: "project" }]);
+    expect(diagnostics).toEqual([]);
+    const docs = agents.find((agent) => agent.name === "docs");
+    expect(docs).toBeDefined();
+    const body = collapseText(docs!.body);
+    expect(body).toContain("read `doc/documentation-guide.md` first");
+
+    const investigate = between(body, "**investigate**", "**review**");
+    for (const marker of [
+      "no durable documentation change",
+      "existing claims remain true",
+      "smallest sufficient set",
+      "complete named *proportional scope* test",
+      "anti-drift investigation finds that support truth",
+      "mandatory registry repair and regeneration",
+      "decides only whether additional prose is warranted",
+      "local non-obvious why",
+      "preserve existing load-bearing rationale",
+    ]) expect(investigate, marker).toContain(marker);
+
+    const review = between(body, "**review**", "severity follows");
+    expect(review).toContain("new durable prose only when the guide's *proportional scope* test warrants it");
+    expect(review).toContain("repair any existing claim the realized behavior invalidates");
+    expect(review).toContain("after mandatory truth repairs");
+    expect(review).toContain("aggregate excess");
+    expect(review).toContain("no-change result passes only after the anti-drift check");
+    expect(review).toContain("review never presumes additions");
+    expect(review).toContain("mechanical regeneration remain mandatory");
+
+    const severity = between(body, "severity follows", "**the altitude row");
+    expect(severity).toContain("**must-fix**");
+    expect(severity).toContain("aggregate excess under *proportional scope*");
+  });
+
+  it("pins Phase 4 mandatory investigation, either disposition, and carry-forward reuse", () => {
+    const body = phase("phase-4-how-investigation.md");
+    expect(body).toContain("always including `docs`");
+    expect(body).toContain("either a concise justified no-durable-change disposition or the smallest sufficient set");
+    expect(body).toContain("carry the docs disposition or accepted surface rationales into that picture");
+    expect(body).toContain("reuse it later unless assumptions change");
+  });
+
+  it("pins Phase 5 disposition ownership, removal coupling, and standalone-task threshold", () => {
+    const body = phase("phase-5-task-breakdown.md");
+    expect(body).toContain("no-change disposition exactly once");
+    expect(body).toContain("owning behavior task's existing `context & seams`");
+    expect(body).toContain("each path's rationale in that path's one owning task");
+    expect(body).toContain("that task's `writable surface`");
+    expect(body).toContain("removing a surface removes both its path and rationale");
+    expect(body).toContain("no ceremonial task");
+    expect(body).toContain("independently implementer-sized or dependency-separated");
+  });
+
+  it("pins Phase 6 always-docs aggregate review and partial-versus-total removal", () => {
+    const body = phase("phase-6-plan-review.md");
+    expect(body).toContain("always including `docs`");
+    expect(body).toContain("whole plan's aggregate footprint");
+    expect(body).toContain("remove an unnecessary documentation task");
+    for (const marker of ["`feature.md`", "dependencies", "rationale", "writable surfaces", "rather than leaving a tombstone"]) {
+      expect(body, marker).toContain(marker);
+    }
+    expect(body).toContain("after a partial removal, preserve the disposition for every remaining accepted surface");
+    expect(body).toContain("only when no accepted durable surfaces remain");
+  });
+
+  it("pins Phase 7 realized trigger branches, evidence inputs, and safe no-output lifecycle", () => {
+    const body = phase("phase-7-implementation.md");
+    expect(body).toContain("either realized trigger branch matches");
+    expect(body).toContain("(1) the diff changes documentation-bearing content");
+    expect(body).toContain("(2) the realized behavior may invalidate existing documentation");
+    expect(body).toContain("skip `docs` only when neither branch matches");
+    expect(body).toContain("no documentation-bearing content **and** the realized behavior cannot invalidate existing documentation");
+    expect(body).toContain("never decide this from the task's planned intent");
+    for (const marker of [
+      "verify a clean tracked baseline before starting",
+      "`feature.md`, the current task spec, and its execution log",
+      "only the task specs carrying documentation dispositions",
+      "`git diff <default-branch>...head`",
+      "`git diff head` for the current-task diff",
+      "realized aggregate without presuming additions",
+      "update its owning task's rationale and writable surface",
+      "in-place mandatory repair",
+      "derived matrix regeneration remains mandatory",
+      "proven to originate from that task's intended writable surface",
+      "retain and amend its task spec with the concise no-change disposition",
+      "retain its execution log",
+      "make no empty commit",
+      "ownership is ambiguous",
+      "tracked baseline was not clean",
+      "intended tracked commit surface excludes mandated gitignored plan-process files",
+    ]) expect(body, marker).toContain(marker);
+  });
+
+  it("aligns Phase 8 reference and router entry while retaining both-direction close floors", () => {
+    const body = phase("phase-8-close-review.md");
+    const router = collapseFile(ROUTER_PATH);
+    const entry = "all tasks are complete and all retained tracked outputs are committed";
+    expect(body).toContain(entry);
+    expect(router).toContain("all tasks complete and all retained tracked outputs committed");
+    for (const marker of [
+      "always including `docs`",
+      "all task specs carrying documentation dispositions",
+      "both currentness and the complete aggregate",
+      "without presuming additions",
+      "remove already committed aggregate excess",
+      "small justified new durable surface is a close fix owned by the relevant completed task",
+      "record its rationale and path in that task's spec and writable surface",
+      "append its execution log",
+      "phase 7 fix discipline",
+      "feature-fix grammar",
+      "rerun the complete-feature review",
+      "in-place small repair to an existing false claim",
+      "needs no discretionary-addition rationale",
+      "create a new task and run it through phase 7",
+      "independently implementer-sized or dependency-separated",
+      "required capability regeneration is never optional",
+      "all remaining tasks are complete",
+      "all retained tracked outputs are committed",
+    ]) expect(body, marker).toContain(marker);
+  });
+
+  it("single-sources the four decision inputs in the guide, including the docs Investigate contract", () => {
+    const canonicalInputs = ["reader", "necessary decision", "existing sources", "smallest sufficient placement"];
+    const { agents } = loadAgents([{ dir: AGENTS_DIR, scope: "project" }]);
+    const docsBody = collapseText(agents.find((agent) => agent.name === "docs")!.body);
+    const investigate = between(docsBody, "**investigate**", "**review**");
+    expect(canonicalInputs.filter((marker) => investigate.includes(marker)), "docs Investigate restates the canonical test").not.toHaveLength(4);
+
+    for (const name of phasePaths) {
+      const body = phase(name);
+      expect(body, `${name}: missing guide reference`).toContain("documentation-guide.md");
+      expect(body, `${name}: missing named rule`).toContain("proportional scope");
+      expect(canonicalInputs.filter((marker) => body.includes(marker)), `${name} restates the canonical test`).not.toHaveLength(4);
+    }
+  });
 });
 
 describe("implementer standing rules — incremental logs and OS-temp scratch (#102)", () => {

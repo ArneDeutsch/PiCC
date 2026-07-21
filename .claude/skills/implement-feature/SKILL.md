@@ -118,7 +118,7 @@ Entry: plan accepted. For each task, in planned order: **dispatch** a fresh `imp
 
 ## Phase 8 — Feature close review
 
-Entry: all tasks committed. Review the whole feature against feature.md (relevant roster over the feature diff + adversarial `generalist`); fix small things, spec real gaps as new tasks through Phase 7; write `review.md` to disk, **uncommitted**. You MUST read `references/phase-8-close-review.md` on entry; the either-path issue-filing offer is `references/phase-8-file-finding.md`, and the ticket-only close-vs-keep-open judgement is `references/phase-8-ticket-close.md` (ticket path only — the ticketless close never loads it). Read `references/ticket-integration.md` (the nine-rules floor) before any hook write; refuse if it cannot be read.
+Entry: all tasks complete and all retained tracked outputs committed. Review the whole feature against feature.md (relevant roster over the feature diff + adversarial `generalist`); fix small things, spec real gaps as new tasks through Phase 7; write `review.md` to disk, **uncommitted**. You MUST read `references/phase-8-close-review.md` on entry; the either-path issue-filing offer is `references/phase-8-file-finding.md`, and the ticket-only close-vs-keep-open judgement is `references/phase-8-ticket-close.md` (ticket path only — the ticketless close never loads it). Read `references/ticket-integration.md` (the nine-rules floor) before any hook write; refuse if it cannot be read.
 
 ## Phase 9 — Integrate, push, hand off
 
