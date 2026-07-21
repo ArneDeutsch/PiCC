@@ -28,6 +28,7 @@ interface ChildHarness {
   events(): string[];
   customMessages(): Array<{ customType: string; content: unknown }>;
   guardResults(): unknown[];
+  providerRegistrations(): Array<{ name: string; config: Record<string, unknown> }>;
 }
 
 function checkpointSdk(
@@ -38,6 +39,7 @@ function checkpointSdk(
   mixedBatch = false,
   activateSkill = false,
   reExhaustWithRestorationFailure = false,
+  replayReject = false,
 ): ChildHarness {
   const base = fakeSdk().sdk;
   let compactions = 0;
@@ -48,6 +50,7 @@ function checkpointSdk(
   const events: string[] = [];
   const customMessages: Array<{ customType: string; content: unknown }> = [];
   const guardResults: unknown[] = [];
+  const providerRegistrations: Array<{ name: string; config: Record<string, unknown> }> = [];
   let releaseRecoveryCompact!: () => void;
   let markRecoveryCompactStarted!: () => void;
   const recoveryCompactGate = new Promise<void>((resolve) => { releaseRecoveryCompact = resolve; });
@@ -65,11 +68,17 @@ function checkpointSdk(
       creations += 1;
       const loader = options.resourceLoader as Loader;
       const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+      const realSdk: any = await import("@earendil-works/pi-coding-agent");
+      const childRegistry = realSdk.ModelRegistry.inMemory(realSdk.AuthStorage.inMemory());
       const extensionPi = {
         on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
           const list = handlers.get(event) ?? [];
           list.push(handler);
           handlers.set(event, list);
+        },
+        registerProvider(name: string, config: Record<string, unknown>) {
+          childRegistry.registerProvider(name, config);
+          providerRegistrations.push({ name, config });
         },
       };
       for (const entry of loader.options.extensionFactories as Array<{
@@ -82,6 +91,7 @@ function checkpointSdk(
         for (const handler of handlers.get(event) ?? []) results.push(await handler(payload, ctx));
         return results;
       };
+      let activeResumeAborted = false;
       const ctx = {
         model: { api: "openai-responses" },
         mode: "json",
@@ -89,13 +99,20 @@ function checkpointSdk(
           ? ({ percent: 10, tokens: 100, contextWindow: 1000 })
           : ({ percent: 95, tokens: 950, contextWindow: 1000 }),
         hasPendingMessages: () => false,
-        abort: () => { aborted = true; },
+        abort: () => {
+          aborted = true;
+          if (resumed) activeResumeAborted = true;
+        },
       };
       let resumed = false;
       let rejectedRecovery = false;
       const runResumed = async (): Promise<void> => {
         await emit("turn_start", {}, ctx);
         await emit("before_provider_request", {}, ctx);
+        if (activeResumeAborted) {
+          await emit("agent_settled", {}, ctx);
+          return;
+        }
         events.push("resumed-provider");
         const assistant: PiSessionMessage = {
           role: "assistant",
@@ -191,6 +208,7 @@ function checkpointSdk(
         ) {
           if (sendOptions?.triggerTurn) {
             resumed = true;
+            activeResumeAborted = false;
             resumeCalls += 1;
             await Promise.resolve();
             if (recoveryReject === "before" && !rejectedRecovery) {
@@ -203,14 +221,20 @@ function checkpointSdk(
               throw new Error("recovery rejected after turn_start");
             }
           } else {
-            if (message.customType === "picc-retained-parent-input") events.push("queued-replay");
+            if (message.customType === "picc-retained-parent-input") {
+              events.push("queued-replay");
+              if (replayReject) throw new Error("retained replay rejected");
+            }
             customMessages.push({ customType: message.customType, content: message.content });
             messages.push({ role: "custom", content: message.content });
           }
         },
         steer() {},
         followUp() {},
-        abort() { aborted = true; },
+        abort() {
+          aborted = true;
+          if (resumed) activeResumeAborted = true;
+        },
         abortCompaction() { releaseRecoveryCompact(); },
         dispose() { disposed = true; },
       };
@@ -231,6 +255,7 @@ function checkpointSdk(
     events: () => [...events],
     customMessages: () => [...customMessages],
     guardResults: () => [...guardResults],
+    providerRegistrations: () => [...providerRegistrations],
   };
 }
 
@@ -239,18 +264,19 @@ function runtimeFor(
   agent: ClaudeAgent = makeAgent(),
   subagentRegistry?: SubagentRegistry,
   failPostCompactAttempt?: number,
+  customHookRunner?: { fire(eventName: string): Promise<any> },
 ) {
   let postCompactAttempts = 0;
   return makeSubagentRuntime([agent], harness.sdk, {
     proactiveCompactPercent: 90,
     allKnownToolNames: () => ["CheckpointTool"],
     subagentRegistry,
-    hookRunner: failPostCompactAttempt === undefined ? undefined : {
+    hookRunner: customHookRunner ?? (failPostCompactAttempt === undefined ? undefined : {
       async fire(eventName: string) {
         const block = eventName === "PostCompact" && ++postCompactAttempts === failPostCompactAttempt;
         return { block, blockReason: block ? "restoration rejected" : undefined, askDowngraded: false, diagnostics: [] };
       },
-    },
+    }),
     customToolsFor: () => [
       {
         name: "CheckpointTool",
@@ -285,7 +311,79 @@ describe("subagent mid-run compaction", () => {
     expect(result.finalMessage).toBe("resumed final");
     expect(harness.compactCalls()).toBe(2);
     expect(harness.sessionCreations()).toBe(1);
+    expect(harness.providerRegistrations()).toEqual([
+      expect.objectContaining({
+        name: "picc-codex-abort-guard",
+        config: expect.objectContaining({ api: "openai-codex-responses", streamSimple: expect.any(Function) }),
+      }),
+    ]);
     expect(harness.disposed()).toBe(true);
+  });
+
+  it("cancels a child operation while PreCompact is awaited without resuming", async () => {
+    let markEntered!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    const hooks = {
+      async fire(eventName: string) {
+        if (eventName === "PreCompact") {
+          markEntered();
+          await released;
+        }
+        return { block: false, askDowngraded: false, diagnostics: [] };
+      },
+    };
+    const harness = checkpointSdk(0);
+    const abort = new AbortController();
+    const dispatch = runtimeFor(harness, makeAgent(), undefined, undefined, hooks).dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1, abortSignal: abort.signal,
+    });
+    await entered;
+    abort.abort();
+    release();
+    const result = await dispatch;
+    expect(result.outcome).toBe("aborted");
+    expect(harness.resumeCalls()).toBe(0);
+    expect(harness.events()).not.toContain("resumed-provider");
+  });
+
+  it("surfaces PostCompact diagnostics without injecting output and ignores its ordinary block decision", async () => {
+    const harness = checkpointSdk(0);
+    const hooks = {
+      async fire(eventName: string) {
+        if (eventName === "SessionStart") {
+          return { block: false, askDowngraded: false, stdout: "session context", diagnostics: [] };
+        }
+        if (eventName === "PostCompact") {
+          return {
+            block: true,
+            blockReason: "ordinary post decision",
+            askDowngraded: false,
+            stdout: "post stdout",
+            additionalContext: "post context",
+            systemMessages: ["post visible"],
+            diagnostics: [{ severity: "warning" as const, message: "post diagnostic" }],
+          };
+        }
+        return { block: false, askDowngraded: false, diagnostics: [] };
+      },
+    };
+    const result = await runtimeFor(harness, makeAgent(), undefined, undefined, hooks).dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1,
+    });
+    expect(result.outcome).toBe("completed");
+    expect(harness.customMessages()).toEqual([
+      expect.objectContaining({ customType: "picc-hook-context", content: "session context" }),
+    ]);
+    expect(harness.customMessages()).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ content: expect.stringContaining("post stdout") }),
+      expect.objectContaining({ content: expect.stringContaining("post context") }),
+    ]));
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ message: "post diagnostic" }),
+      expect.objectContaining({ message: "hook (PostCompact): post visible" }),
+    ]));
   });
 
   it("preserves child-local Skill activation through real extension tool assembly and compaction", async () => {
@@ -386,6 +484,33 @@ describe("subagent mid-run compaction", () => {
     expect(events.indexOf("queued-replay")).toBeLessThan(events.indexOf("resumed-provider"));
   });
 
+  it("aborts and joins the child before publishing a retained-replay failure", async () => {
+    const harness = checkpointSdk(1, undefined, true, false, false, false, false, true);
+    const registry = new SubagentRegistry();
+    const runtime = runtimeFor(harness, makeAgent(), registry);
+    const dispatch = runtime.dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1,
+      agentId: "agent-666666666666",
+    });
+    await harness.recoveryCompactStarted();
+    const send = createSendMessageToolDefinition(runtime, {
+      registry,
+      backgroundTasks: new BackgroundTaskRegistry(),
+    });
+    await (send.execute as Function)("send-queued", {
+      to: "agent-666666666666",
+      message: "parent message that replay rejects",
+    });
+    harness.releaseRecoveryCompact();
+    const result = await dispatch;
+
+    expect(result).toMatchObject({ outcome: "failed", checkpointPaused: true });
+    expect(harness.aborted()).toBe(true);
+    expect(harness.events()).toContain("queued-replay");
+    expect(harness.events()).not.toContain("resumed-provider");
+    expect(registry.get("agent-666666666666")?.checkpointPaused).toBe(true);
+  });
+
   it("reports JSON/RPC-compatible retry and exhaustion progress to the parent once in order", async () => {
     const harness = checkpointSdk(3);
     const progress: string[] = [];
@@ -449,7 +574,7 @@ describe("subagent mid-run compaction", () => {
   });
 
   it.each(["before", "after"] as const)(
-    "keeps recovery paused when sendCustomMessage rejects %s turn_start and allows a later retry",
+    "closes recovery when sendCustomMessage rejects %s turn_start after commit",
     async (when) => {
       const harness = checkpointSdk(3, when);
       const registry = new SubagentRegistry();
@@ -463,16 +588,16 @@ describe("subagent mid-run compaction", () => {
       await expect((tool.execute as Function)("send-1", {
         to: exhausted.agentId,
         message: "first recovery",
-      })).rejects.toThrow(/remains paused/);
+      })).rejects.toThrow(/Do not compact it again or retry SendMessage/);
       expect(registry.get(exhausted.agentId)?.checkpointPaused).toBe(true);
       expect(harness.disposed()).toBe(false);
+      expect(harness.compactCalls()).toBe(4);
 
-      const retried = await (tool.execute as Function)("send-2", {
+      await expect((tool.execute as Function)("send-2", {
         to: exhausted.agentId,
         message: "retry recovery",
-      });
-      expect(retried.details.outcome).toBe("completed");
-      expect(harness.disposed()).toBe(true);
+      })).rejects.toThrow(/Do not compact it again or retry SendMessage/);
+      expect(harness.compactCalls()).toBe(4);
     },
   );
 

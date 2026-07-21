@@ -33,7 +33,7 @@ Launch modes we support:
 | SessionStart / SessionEnd hooks | `pi.on("session_start")` / `pi.on("session_shutdown")` |
 | UserPromptSubmit hook | `pi.on("input")` → `continue/transform/handled` (stdout context → `transform`) |
 | Stop hook | `pi.on("agent_settled")` + `pi.sendUserMessage(..., { deliverAs: "followUp" })` to continue when a Stop hook blocks stopping |
-| PreCompact/PostCompact + instruction re-injection | `pi.on("session_before_compact")` (can cancel), `pi.on("session_compact")`; PiCC restores hook output and recent skill bodies through `pi.sendMessage` |
+| PreCompact/PostCompact + instruction re-injection | `pi.on("session_before_compact")` (can cancel), `pi.on("session_compact")`; PiCC restores SessionStart(compact) context and recent skill bodies through `pi.sendMessage`, while PostCompact output is diagnostic-only |
 | Custom tools: `Agent`, `EnterWorktree`, `ExitWorktree`, `WebFetch`, `WebSearch`, `Grep`, `Glob`, `TaskCreate/...`, degrade stubs | `pi.registerTool({ name, description, parameters: TypeBox, execute, prepareArguments? })`; throw ⇒ `isError`; `terminate: true` stops only after Pi completes all sibling results in the requested batch |
 | Slash commands: user-invocable skills, legacy commands, `/doctor`, `/quota`, `/compat` | `pi.registerCommand(name, { description, handler, getArgumentCompletions })`; command handlers get `ExtensionCommandContext` |
 | Worktree cwd swap (load-bearing) | Override built-in tools: re-register `bash`/`read`/`write`/`edit`/`grep`/`find`/`ls` wrappers that resolve paths/cwd through a mutable `EffectiveCwd`; built-ins created per-cwd via `createBashTool(cwd, { spawnHook })`, `createReadTool(cwd, …)` etc. Built-in renderers are re-applied from `create*ToolDefinition` and de-padded through the self-shell wrapper (`src/runtime/tool-shell.ts` — see *Risks / churn watchpoints*); `execute` stays sourced from `create*Tool` so it is byte-identical. |
@@ -111,13 +111,13 @@ The return value is the last `role: "assistant"` message of `session.messages`, 
 resume trailer that rides on it.
 
 ### 3.5 Compaction preservation and proactive checkpoints
-The system-prompt suffix reasserts durable instructions every turn. After `session_compact`, PiCC
-also queues hook output and the latest rendered active skill bodies that fit its heuristic character
-budget, most-recent-first. This approximates Claude Code's token-counted retention policy and can
-under- or over-retain it. `PreCompact` runs before commit; `SessionStart` with source `compact` and
-`PostCompact` run only after commit. Main sessions fire `PostCompact` before active-skill restoration;
-children fire it after that restoration. Pi's void main-session `sendMessage` confirms only synchronous
-enqueue acceptance, so later delivery failure is not observable.
+The system-prompt suffix reasserts durable instructions every turn. After `session_compact`, both
+main and child sessions run SessionStart with source `compact`, surface PostCompact diagnostics
+without injecting its stdout or additional context, then restore the latest rendered active skill
+bodies that fit the heuristic character budget, most-recent-first. This approximates Claude Code's
+token-counted retention policy and can under- or over-retain it. `PreCompact` runs before commit;
+SessionStart(compact) and PostCompact run only after commit. Pi's void main-session `sendMessage`
+confirms only synchronous enqueue acceptance, so later delivery failure is not observable.
 
 `proactiveCompactPercent` defaults to 90. At `turn_end`, PiCC waits for every requested tool result.
 A clean PiCC-owned batch uses `terminate`; any mixed, blocked, malformed, truncated, pending, or
@@ -131,10 +131,10 @@ This is PiCC-only hardening built entirely on the public APIs listed above; no P
 It covers the main session and every PiCC-created child session, but only for models using Pi's
 `openai-completions`, `openai-responses`, or `openai-codex-responses` APIs. The continuation is a
 synthetic persisted, model-visible custom message, not a documented Claude threshold/retry/resume
-mechanism. Operational or hook exhaustion retains a manually recoverable paused boundary; a
-post-commit restoration failure instead requires a new session and must not compact the committed
-summary again. Print stdout/exit status and RPC command acknowledgement remain Pi-owned; JSON/RPC
-lifecycle entries are uncorrelated. Pi
+mechanism. Operational or hook exhaustion retains a manually recoverable paused boundary. Any
+restoration, replay, provider release, continuation-start, or settlement failure after commit
+instead requires a new session and must not compact the committed summary again. Print stdout/exit
+status and RPC command acknowledgement remain Pi-owned; JSON/RPC lifecycle entries are uncorrelated. Pi
 0.80.6 also emits a native physical `agent_end` for the intentionally stopped pre-compaction run
 and can expose a native RPC compaction error before PiCC lifecycle handling; extensions cannot
 suppress, correlate, or redact those native records.

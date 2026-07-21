@@ -16,6 +16,7 @@ import { builtinAgents, resolveAgent } from "../claude/agents.js";
 import { parseHookConfig } from "../claude/hooks.js";
 import { claudeToolsToPiBuiltins } from "./tool-map.js";
 import { createGuardExtension } from "./guard.js";
+import { registerCodexAbortGuard } from "./codex-abort-guard.js";
 import { CwdState } from "./cwd-state.js";
 import { findByName } from "../project.js";
 import type { BackgroundTaskRegistry, UsageLike } from "./background-tasks.js";
@@ -555,6 +556,10 @@ function mergeHookOutcomes(outcomes: Array<HookOutcome | undefined>): HookOutcom
       merged.block = true;
       merged.blockReason = o.blockReason;
     }
+    if (o.stop && !merged.stop) {
+      merged.stop = true;
+      merged.stopReason = o.stopReason;
+    }
     merged.askDowngraded = merged.askDowngraded || o.askDowngraded;
     if (o.additionalContext) {
       merged.additionalContext = merged.additionalContext
@@ -621,6 +626,13 @@ class ChildCheckpointCoordinator {
   private hookBlocked = false;
   private restorationFailed = false;
   private manualRecovery = false;
+  private compactOperation: {
+    identity: object;
+    controller: import("./mid-run-compaction.js").MidRunCompactionController;
+    generation: number;
+    proactive: boolean;
+    trigger: "auto" | "manual";
+  } | undefined;
   private retained: {
     recover: (text: string) => Promise<DispatchResult>;
     cleanup: (outcome: DispatchOutcome, finalText?: string) => Promise<void>;
@@ -677,11 +689,20 @@ class ChildCheckpointCoordinator {
 
   hookFacade(base: HookRunnerLike): HookRunnerLike {
     return {
-      fire: async (eventName, payload, toolCall) => mergeHookOutcomes([
-        await base.fire(eventName, payload, toolCall),
-        ...await Promise.all(this.activation.hookRunners.map((runner) =>
-          runner.fire(eventName, payload, toolCall))),
-      ]),
+      fire: async (eventName, payload, toolCall) => {
+        const outcome = mergeHookOutcomes([
+          await base.fire(eventName, payload, toolCall),
+          ...await Promise.all(this.activation.hookRunners.map((runner) =>
+            runner.fire(eventName, payload, toolCall))),
+        ]);
+        if (eventName === "SessionStart" || eventName === "PostCompact") {
+          this.diagnostics.push(...outcome.diagnostics);
+          for (const message of outcome.systemMessages ?? []) {
+            this.diagnostics.push({ severity: "info", message: `hook (${eventName}): ${message}` });
+          }
+        }
+        return outcome;
+      },
     };
   }
 
@@ -722,12 +743,12 @@ class ChildCheckpointCoordinator {
   failureMessage(): string {
     const snapshot = this.gate.currentController().snapshot();
     if (snapshot.failureCategory === "restoration-paused") {
-      return `Automatic context compaction for subagent "${this.agentName}" committed, but post-compaction hook/context/skill restoration failed. The agent is paused and no continuation ran. Do not compact it again or retry SendMessage; abandon it with TaskStop using agent id ${this.agentId}, then dispatch a replacement agent with the retained input.`;
+      return `Automatic context compaction for subagent "${this.agentName}" committed, but restoration or continuation failed. The agent is paused and no continuation ran. Do not compact it again or retry SendMessage; abandon it with TaskStop using agent id ${this.agentId}, then dispatch a replacement agent with the retained input.`;
     }
     if (snapshot.failureCategory === "hook-blocked") {
-      return `Automatic context compaction for subagent "${this.agentName}" paused because a PreCompact hook blocked the attempt. The agent is paused and no continuation ran; repair or disable the hook before using SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
+      return `Automatic context compaction for subagent "${this.agentName}" paused because a PreCompact hook blocked the attempt. The agent is paused and no continuation ran; before this process exits, repair or disable the hook and use SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
     }
-    return `Automatic context compaction for subagent "${this.agentName}" failed after up to three attempts. The agent is paused and no continuation ran; use SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
+    return `Automatic context compaction for subagent "${this.agentName}" failed after up to three attempts. The agent is paused and no continuation ran; before this process exits, use SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
   }
 
   retain(
@@ -761,6 +782,7 @@ class ChildCheckpointCoordinator {
     const controller = this.gate.currentController();
     const generation = controller.snapshot().generation;
     const cancellation = this.gate.cancel(kind);
+    this.compactOperation = undefined;
     try { session?.abortCompaction?.(); } catch { /* cancellation still joins the run */ }
     const resume = this.activeResume;
     this.activeResume = undefined;
@@ -822,14 +844,14 @@ class ChildCheckpointCoordinator {
       await session.compact();
     } catch (error) {
       const category = this.hookBlocked ? "PreCompact hook" : "manual compaction";
-      throw new Error(`${category} failed for recovery attempt on subagent "${this.agentName}": ${capErrorText((error as Error)?.message ?? String(error))}. The agent remains paused; retry SendMessage after repairing the cause.`);
+      void error;
+      throw new Error(`${category} failed for recovery attempt on subagent "${this.agentName}". The agent remains paused; retry SendMessage after repairing the cause.`);
     } finally {
       this.manualRecovery = false;
     }
     if (retained.stopping || this.retained !== retained) throw new Error("checkpoint recovery was cancelled");
     if (this.restorationFailed) {
-      controller.recoverAfterManualCompaction(token);
-      controller.pauseAfterRecoveryFailure(generation, "restoration-paused");
+      await controller.failAfterCommittedSummary(generation);
       throw new Error(`Context or skill restoration failed after compaction committed for subagent "${this.agentName}". Do not compact it again; abandon it with TaskStop using agent id ${this.agentId}, then dispatch a replacement agent with the retained input.`);
     }
     const recovered = controller.recoverAfterManualCompaction(token);
@@ -851,8 +873,9 @@ class ChildCheckpointCoordinator {
       if (snapshot.phase === "exhausted" && snapshot.failureCategory === "restoration-paused") {
         throw new Error(this.failureMessage());
       }
-      controller.pauseAfterRecoveryFailure(generation);
-      throw new Error(`Recovery continuation failed for subagent "${this.agentName}": ${capErrorText((error as Error)?.message ?? String(error))}. The agent remains paused; retry SendMessage.`);
+      const currentController = this.gate.currentController();
+      await currentController.failAfterCommittedSummary(currentController.snapshot().generation);
+      throw new Error(this.failureMessage());
     }
   }
 
@@ -896,6 +919,8 @@ class ChildCheckpointCoordinator {
       return result;
     } finally {
       signal.removeEventListener("abort", abort);
+      if (this.compactOperation?.controller === controller &&
+          this.compactOperation.generation === generation) this.compactOperation = undefined;
       this.bridge.endCompactionSummary(controller, token);
     }
   }
@@ -906,14 +931,24 @@ class ChildCheckpointCoordinator {
     const started = childDeferred();
     const providerOpen = childDeferred();
     const settled = childDeferred();
-    // Defer the SDK call by one microtask so the generation ownership below is
-    // installed before a synchronous turn_start emission can observe it.
-    const run = Promise.resolve().then(() => session.sendCustomMessage!({
-      customType: "picc-checkpoint-resume",
-      content: "Context was compacted. Continue the same pending task from the preserved state.",
-      display: false,
-    }, { triggerTurn: true }));
-    const resume = {
+    let resume!: NonNullable<ChildCheckpointCoordinator["activeResume"]>;
+    const isCurrent = (): boolean => {
+      const controller = this.gate.currentController();
+      const snapshot = controller.snapshot();
+      return this.activeResume === resume && !context.signal.aborted &&
+        snapshot.generation === context.generation && snapshot.phase === "resuming";
+    };
+    // Defer the SDK call by one microtask so ownership is installed first, then
+    // authenticate again immediately before the public send side effect.
+    const run = Promise.resolve().then(() => {
+      if (!isCurrent()) throw new Error("checkpoint resume lost authority before startup");
+      return session.sendCustomMessage!({
+        customType: "picc-checkpoint-resume",
+        content: "Context was compacted. Continue the same pending task from the preserved state.",
+        display: false,
+      }, { triggerTurn: true });
+    });
+    resume = {
       generation: context.generation,
       token: context.token,
       started,
@@ -924,7 +959,11 @@ class ChildCheckpointCoordinator {
       runCompleted: false,
     };
     this.activeResume = resume;
-    this.gate.installResumeBarrier(context.generation, providerOpen.promise);
+    if (!this.gate.installResumeBarrier(context.generation, providerOpen.promise)) {
+      this.activeResume = undefined;
+      void run.catch(() => undefined);
+      throw new Error("Cannot install child resumed provider barrier");
+    }
     void run.then(() => {
       resume.runCompleted = true;
       if (resume.agentSettled && this.activeResume === resume) {
@@ -938,15 +977,11 @@ class ChildCheckpointCoordinator {
       // a false successful/empty continuation.
       started.resolve();
       providerOpen.resolve();
+      this.gate.clearResumeBarrier(context.generation, providerOpen.promise);
       settled.reject(error);
       if (this.activeResume === resume) this.activeResume = undefined;
     });
-    const isCurrent = (): boolean => {
-      const controller = this.gate.currentController();
-      const snapshot = controller.snapshot();
-      return this.activeResume === resume && !context.signal.aborted &&
-        snapshot.generation === context.generation && snapshot.phase === "resuming";
-    };
+    let replayCompleted = false;
     return {
       settled: settled.promise,
       replay: async (input: QueuedInputShadow) => {
@@ -962,13 +997,16 @@ class ChildCheckpointCoordinator {
         return { delivered: isCurrent() as true | false };
       },
       replayComplete: () => {
-        if (!isCurrent()) throw new Error("checkpoint resume was cancelled before provider release");
+        if (!isCurrent() || replayCompleted) throw new Error("checkpoint resume provider release is not current");
+        replayCompleted = true;
         providerOpen.resolve();
       },
       cancelAndJoin: async () => {
         started.resolve();
         providerOpen.resolve();
+        this.gate.clearResumeBarrier(context.generation, providerOpen.promise);
         try { await Promise.resolve(session.abort?.()); } finally { await run.catch(() => undefined); }
+        if (this.activeResume === resume) this.activeResume = undefined;
       },
     };
   }
@@ -977,63 +1015,101 @@ class ChildCheckpointCoordinator {
     const controller = this.gate.currentController();
     const generation = controller.snapshot().generation;
     const proactive = controller.isCompactionSummaryActive(generation);
-    if (!proactive && !this.manualRecovery) return { cancel: true };
+    if ((!proactive && !this.manualRecovery) || this.compactOperation) return { cancel: true };
+    const operation = {
+      identity: {}, controller, generation, proactive,
+      trigger: (proactive ? "auto" : "manual") as "auto" | "manual",
+    };
+    this.compactOperation = operation;
+    const isCurrent = () => this.compactOperation === operation &&
+      this.gate.currentController() === controller && controller.snapshot().generation === generation &&
+      (proactive ? controller.isCompactionSummaryActive(generation) : this.manualRecovery);
     const outcome = await this.hooks.fire("PreCompact", {
-      trigger: proactive ? "auto" : "manual",
+      trigger: operation.trigger,
       custom_instructions: String(event?.customInstructions ?? ""),
       cwd: this.cwd.get(),
     }).catch(() => undefined);
-    if (outcome?.block) {
-      this.hookBlocked = true;
+    if (!isCurrent() || !outcome || outcome.block || outcome.stop) {
+      if (isCurrent()) this.hookBlocked = true;
+      if (this.compactOperation === operation) this.compactOperation = undefined;
       return { cancel: true };
     }
     return undefined;
   }
 
   private async afterCompact(event: any): Promise<void> {
+    const operation = this.compactOperation;
     const session = this.session;
-    let hookContext = "";
+    if (!operation || !session) return;
+    const isCurrent = () => this.compactOperation === operation &&
+      this.gate.currentController() === operation.controller &&
+      operation.controller.snapshot().generation === operation.generation &&
+      (operation.proactive
+        ? operation.controller.isCompactionSummaryActive(operation.generation)
+        : this.manualRecovery);
+    if (!isCurrent()) return;
     try {
-      const started = await this.hooks.fire("SessionStart", { source: "compact", cwd: this.cwd.get() });
-      if (started.block) this.restorationFailed = true;
-      hookContext = [started.stdout, started.additionalContext].filter(Boolean).join("\n").trim();
-    } catch {
-      this.restorationFailed = true;
-    }
-    // Hook context and resident skills are independent restoration attempts: a
-    // failure in either must not suppress the other attempt.
-    if (hookContext) {
+      let universalStop = false;
+      let startedContext = "";
       try {
-        await session?.sendCustomMessage?.({
-          customType: "picc-hook-context",
-          content: hookContext,
-          display: true,
-        }, { deliverAs: "steer" });
+        const started = await this.hooks.fire("SessionStart", { source: "compact", cwd: this.cwd.get() });
+        if (!isCurrent()) return;
+        if (started.stop) {
+          this.restorationFailed = true;
+          universalStop = true;
+        }
+        startedContext = [started.stdout, started.additionalContext].filter(Boolean).join("\n").trim();
       } catch {
         this.restorationFailed = true;
       }
-    }
-    const preserved = budgetSkillReinjection([...this.activation.activeSkills.entries()]);
-    if (preserved.text) {
-      try {
-        await session?.sendCustomMessage?.({
-          customType: "picc-preserved",
-          content: `Context preserved across compaction (PiCC):\n\n${preserved.text}`,
-          display: false,
-        }, { deliverAs: "steer" });
+      if (!isCurrent()) return;
+      if (!universalStop && startedContext) {
+        try {
+          if (!isCurrent()) return;
+          if (!session.sendCustomMessage) throw new Error("child hook restoration unavailable");
+          await session.sendCustomMessage({
+            customType: "picc-hook-context",
+            content: startedContext,
+            display: true,
+          }, { deliverAs: "steer" });
+          if (!isCurrent()) return;
+        } catch {
+          this.restorationFailed = true;
+        }
+      }
+      if (!isCurrent()) return;
+      if (!universalStop) try {
+        const post = await this.hooks.fire("PostCompact", {
+          trigger: operation.trigger,
+          compact_summary: String(event?.compactionEntry?.summary ?? ""),
+          cwd: this.cwd.get(),
+        });
+        if (!isCurrent()) return;
+        if (post.stop) {
+          this.restorationFailed = true;
+          universalStop = true;
+        }
       } catch {
         this.restorationFailed = true;
       }
-    }
-    try {
-      const post = await this.hooks.fire("PostCompact", {
-        trigger: this.manualRecovery ? "manual" : "auto",
-        compact_summary: String(event?.compactionEntry?.summary ?? ""),
-        cwd: this.cwd.get(),
-      });
-      if (post.block) this.restorationFailed = true;
-    } catch {
-      this.restorationFailed = true;
+      if (!isCurrent()) return;
+      const preserved = budgetSkillReinjection([...this.activation.activeSkills.entries()]);
+      if (!universalStop && preserved.text) {
+        try {
+          if (!isCurrent()) return;
+          if (!session.sendCustomMessage) throw new Error("child skill restoration unavailable");
+          await session.sendCustomMessage({
+            customType: "picc-preserved",
+            content: `Context preserved across compaction (PiCC):\n\n${preserved.text}`,
+            display: false,
+          }, { deliverAs: "steer" });
+          if (!isCurrent()) return;
+        } catch {
+          this.restorationFailed = true;
+        }
+      }
+    } finally {
+      if (this.compactOperation === operation) this.compactOperation = undefined;
     }
   }
 
@@ -1758,6 +1834,21 @@ export class SubagentRuntime {
           cwd: this.deps.getCwd(),
         })
         .catch(() => undefined);
+      if (startOutcome?.stop) {
+        const reason = startOutcome.stopReason ?? "SubagentStart hook requested stop";
+        diagnostics.push({ severity: "warning", message: reason });
+        settledOutcome = "aborted";
+        return {
+          ok: false,
+          outcome: "aborted",
+          finalMessage: "",
+          agentId,
+          resumable: false,
+          agentName: agent.name,
+          error: `Subagent "${agent.name}" was stopped by its SubagentStart hook: ${reason}`,
+          diagnostics,
+        };
+      }
       if (startOutcome?.block) {
         settledOutcome = "failed";
         return {
@@ -1952,6 +2043,14 @@ export class SubagentRuntime {
         ...(this.deps.clipMaxTokens !== undefined ? { clipMaxTokens: this.deps.clipMaxTokens } : {}),
       });
       const extensionFactories: Array<{ name: string; factory: (pi: unknown) => unknown }> = [
+        {
+          name: "picc-codex-provider",
+          factory: ((pi: { registerProvider?: (name: string, config: Record<string, unknown>) => void }) => {
+            if (typeof pi.registerProvider === "function") {
+              registerCodexAbortGuard({ registerProvider: pi.registerProvider.bind(pi) });
+            }
+          }) as (pi: unknown) => unknown,
+        },
         { name: `picc-guard-${agent.name}`, factory: guard as (pi: unknown) => unknown },
         { name: `picc-checkpoint-${agent.name}`, factory: checkpoint.extensionFactory() as (pi: unknown) => unknown },
       ];
@@ -2369,6 +2468,18 @@ export class SubagentRuntime {
               ok: false, outcome: "aborted", finalMessage: "", agentId, transcriptPath,
               resumable, agentName: agent.name, worktreePath, isFork, usage: captureUsage(),
               error: `Subagent "${agent.name}" was aborted before completing its task.`, diagnostics,
+            };
+          }
+          if (stopOutcome?.stop) {
+            const reason = stopOutcome.stopReason ?? "SubagentStop hook requested stop";
+            diagnostics.push({ severity: "warning", message: reason });
+            try { await Promise.resolve(session!.abort?.()); } catch { /* stop remains final */ }
+            settledOutcome = "aborted";
+            return {
+              ok: false, outcome: "aborted", finalMessage: "", agentId, transcriptPath,
+              resumable, agentName: agent.name, worktreePath, isFork, usage: captureUsage(),
+              error: `Subagent "${agent.name}" was stopped by its SubagentStop hook: ${reason}`,
+              diagnostics,
             };
           }
           if (!stopOutcome?.block) break;

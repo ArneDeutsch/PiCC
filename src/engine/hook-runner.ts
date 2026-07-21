@@ -768,7 +768,7 @@ export class HookRunner {
     }
 
     const decision = hso?.["permissionDecision"];
-    if (decision === "deny") {
+    if (decision === "deny" && EXIT2_BLOCKABLE_EVENTS.has(eventName)) {
       const reason = hso?.["permissionDecisionReason"];
       this.setBlock(outcome, typeof reason === "string" ? reason : undefined);
     } else if (decision === "ask") {
@@ -784,14 +784,17 @@ export class HookRunner {
     const updated = asRecord(hso?.["updatedInput"]) ?? asRecord(json["updatedInput"]);
     if (updated) outcome.updatedInput = { ...outcome.updatedInput, ...updated };
 
-    // Stop-hook style top-level block.
-    if (json["decision"] === "block") {
+    // Event-specific blocking and universal hook stop are separate authorities.
+    // Compact post-events ignore ordinary block decisions, but continue:false
+    // still stops restoration/resume after the committed summary.
+    if (json["decision"] === "block" && EXIT2_BLOCKABLE_EVENTS.has(eventName)) {
       const reason = json["reason"];
       this.setBlock(outcome, typeof reason === "string" ? reason : undefined);
     }
-    if (json["continue"] === false) {
+    if (json["continue"] === false && !outcome.stop) {
       const stopReason = json["stopReason"];
-      this.setBlock(outcome, typeof stopReason === "string" ? stopReason : undefined);
+      outcome.stop = true;
+      if (typeof stopReason === "string") outcome.stopReason = stopReason;
     }
   }
 

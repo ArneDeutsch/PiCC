@@ -135,7 +135,7 @@ export function createGuardExtension(deps: GuardDeps) {
   };
 
   return (pi: PiApi) => {
-    pi.on("tool_call", async (event: any) => {
+    pi.on("tool_call", async (event: any, ctx: any) => {
       const input = (event.input ?? {}) as Record<string, unknown>;
       const call = toClaudeCall(event.toolName, input, deps.getCwd());
 
@@ -152,6 +152,12 @@ export function createGuardExtension(deps: GuardDeps) {
         },
         call,
       );
+      if (outcome.stop) {
+        const reason = outcome.stopReason ?? "PreToolUse hook requested stop";
+        console.error(`[picc]${where} ${reason}`);
+        try { ctx?.abort?.(); } catch { /* hook stop remains authoritative */ }
+        return { block: true, reason: `PiCC: tool cancelled because the hook stopped the run: ${reason}` };
+      }
       if (outcome.block) {
         return {
           block: true,
@@ -193,7 +199,7 @@ export function createGuardExtension(deps: GuardDeps) {
       return undefined;
     });
 
-    pi.on("tool_result", async (event: any) => {
+    pi.on("tool_result", async (event: any, ctx: any) => {
       const eventName = event.isError ? "PostToolUseFailure" : "PostToolUse";
       // Clip oversized tool-result text BEFORE the hasHooks gate below, so the
       // backstop fires even for the common project that has no PostToolUse hooks.
@@ -251,6 +257,14 @@ export function createGuardExtension(deps: GuardDeps) {
         },
         call,
       );
+      if (outcome.stop) {
+        const reason = outcome.stopReason ?? `${eventName} hook requested stop`;
+        console.error(`[picc]${where} ${reason}`);
+        try { ctx?.abort?.(); } catch { /* hook stop remains authoritative */ }
+        return clipped
+          ? { content: clipContent, details: event.details, isError: event.isError }
+          : undefined;
+      }
       // Claude semantics: a blocking PostToolUse hook (exit 2 / decision "block")
       // feeds its reason back to the model — this is the post-edit lint-and-fix loop.
       const feedback: string[] = [];

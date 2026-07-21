@@ -200,10 +200,12 @@ where to start reading, not the extent of its cluster.
   of caller — **except `agentName`**, deliberately raw as the registry's name-index key and therefore
   sanitized at every render; render-time sanitization stays as a backstop for the rest. Dispatch mirrors each session's condensed
   progress and per-turn usage accumulation into the registry, which makes the registry the single
-  data source for the status panel and drill-down below. A **user-initiated stop** (from the panel)
-  is permanent: the record carries the marker and `SendMessage` refuses to steer or resume a
-  user-stopped agent — distinct from a model `TaskStop`, after which PiCC still allows resume (the
-  divergence is recorded in the capability registry).
+  data source for the status panel and drill-down below. Registry addresses, including the stable
+  agent id accepted by `TaskStop` for a checkpoint-retained child, exist only for the originating
+  process lifetime. A **user-initiated stop** (from the panel) is permanent: the record carries the
+  marker and `SendMessage` refuses to steer or resume a user-stopped agent — distinct from a model
+  `TaskStop`, after which PiCC still allows resume (the divergence is recorded in the capability
+  registry).
 
 - **Subagent status panel** (`subagent-panel-model.ts`, `subagent-panel-render.ts`,
   `subagent-panel-widget.ts`, `subagent-panel-focus.ts`, with the shared width/theme helpers
@@ -233,8 +235,8 @@ where to start reading, not the extent of its cluster.
 - **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
   in `subagents.ts`) — a session-local controller owns threshold sampling, complete-tool-batch
   stopping, bounded compaction retries, queued-input reconciliation, resume, cancellation, and
-  exhaustion. Operational or hook exhaustion remains recoverable in-session; post-commit
-  restoration failure is terminal for that session. Clean PiCC-owned tool batches terminate after
+  exhaustion. Operational or hook exhaustion remains recoverable in-session; any post-commit
+  restoration, replay, or continuation-start failure is terminal for that session. Clean PiCC-owned tool batches terminate after
   every requested result;
   mixed or ambiguous paths abort, while provider guards remain the final fail-closed boundary.
   Compaction and resume are awaited re-entrant lifecycle work, so the original logical run does not
@@ -354,10 +356,13 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    logical run only after restoration and queued-input reconciliation. The controller permits its
    own summary request through the provider gate. Mixed, blocked, malformed, or queued tool paths
    abort and settle before compaction; a separate `agent_settled` sample is a non-resuming fallback.
-   `session_before_compact` / `session_compact` fire compact hooks and restore recent active skill
-   bodies within PiCC's heuristic character budget; the system-prompt suffix preserves durable
-   instructions. Operational or hook exhaustion leaves admission paused and recoverable; a
-   post-commit restoration failure closes the session and requires replacement. Pi's internally
+   `session_before_compact` / `session_compact` fire compact hooks and restore bounded
+   SessionStart(compact) context followed by recent active skill bodies within PiCC's heuristic
+   character budget; PostCompact output is diagnostic-only, and the system-prompt
+   suffix preserves durable instructions. SessionStart(compact) and PostCompact ordinary block output
+   is diagnostic-only, while universal hook stop closes the committed-summary session. Operational or
+   hook exhaustion leaves admission paused and recoverable; any post-commit failure closes the session
+   and requires replacement. Pi's internally
    owned overflow recovery remains outside this controller and is not retried by PiCC. `Stop` runs
    at the logical settlement boundary, and `session_shutdown` joins checkpoint work before firing
    `SessionEnd`.
@@ -409,9 +414,10 @@ These are the choices where "close enough" breaks real projects.
 - **Subagent error contract.** Every dispatch is classified into exactly one outcome, and the
   classification — never a normal-looking success — is what reaches the coordinator:
   - **completed** — the run finished; its verbatim final message is returned.
-  - **failed** — the run ended on a terminal API error (e.g. a drained usage limit). The tool reports
-    a **loud failure naming the cause**. An empty success here is the exact failure mode that lets a
-    coordinator commit under-reviewed work believing a subagent approved it.
+  - **failed** — the run ended on a terminal API or session error. The tool reports a **loud,
+    category-authored failure** without exposing raw provider/session error text. An empty success
+    here is the exact failure mode that lets a coordinator commit under-reviewed work believing a
+    subagent approved it.
   - **aborted** — the run was stopped on purpose (Esc, `TaskStop`); distinct from a failure. A signal
     wins on every settle path, and a deliberately stopped background result discards its output.
   - **Partial output is preserved,** delivered inside an explicit cut-off frame rather than dropped;

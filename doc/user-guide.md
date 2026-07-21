@@ -216,10 +216,13 @@ Every subagent is visible, both to you and to the coordinating model:
 - **`SendMessage`** continues a finished subagent with its context intact, or redirects a running
   background one, addressed by its `agent-<id>`. Resuming normally keeps that agent id and creates a
   new task id, so the agent id is the reliable correlation key. A foreground or background agent
-  paused by checkpoint exhaustion is retained under its agent id instead: awaiting `SendMessage`
-  performs recovery and returns the result directly without creating a task generation; `TaskStop`
-  abandons the retained agent. Resume is process-lifetime only — after you quit and relaunch `picc`,
-  a prior agent id no longer resolves — fork dispatches are never resumable, and a user-stopped
+  paused by pre-commit operational or hook exhaustion is retained under its agent id instead:
+  after repairing the cause, awaiting `SendMessage` performs recovery and returns the result directly
+  without creating a task generation. A child whose committed summary cannot be restored or continued
+  is terminal and must be abandoned with `TaskStop` and replaced. `TaskStop` accepts that retained
+  child's stable agent id only while the originating process is alive.
+  Resume is process-lifetime only — after you quit and relaunch `picc`, a prior agent id no longer
+  resolves — fork dispatches are never resumable, and a user-stopped
   agent refuses resume and steering permanently.
 - **Interactive TUI only.** The panel, drill-down, and condensed records exist only in the
   interactive TUI; print and RPC runs keep their previous subagent output unchanged.
@@ -312,26 +315,29 @@ tracked project files):
   cycle. The complete requested tool batch finishes first. Once the threshold is reached,
   PiCC pauses ordinary model requests, compacts, and resumes the same logical work; completed
   results and queued input remain pending. Operational failures use up to three attempts. A
-  PreCompact policy block fails closed on its first block, unlike Claude Code's
-  continue-uncompacted behavior. If compaction or mandatory restoration cannot complete, work
+  PreCompact policy block fails closed on its first block. If compaction or mandatory restoration
+  cannot complete, work
   remains paused rather than continuing near the limit.
 
   This gate applies only to models using Pi's `openai-completions`, `openai-responses`, or
   `openai-codex-responses` API. It covers interactive TUI, print, JSON, and RPC operation. TUI
   reports status and recovery in-session. Print reports progress on stderr; only exhaustion and
   its recovery guidance are persisted, and Pi-owned stdout or exit status does not prove the
-  logical work completed. Reopen the exact persisted session in Pi's session picker before using
-  `/compact`. For an operational pre-commit failure, run `/compact`, then explicitly continue. If
-  a PreCompact hook blocked the attempt, first repair or disable that hook (or allow a manual
-  trigger), then run `/compact` and explicitly continue. If the summary committed but restoration
-  failed, **do not compact again**: start a new session and resend the retained input.
+  logical work completed. For a persisted session, reopen that exact session in Pi's session
+  picker before `/compact`; an ephemeral print/JSON session cannot be reopened and requires a
+  replacement session with the retained input resent. For an operational pre-commit failure, run
+  `/compact`, then explicitly continue. If a PreCompact hook blocked the attempt, first repair or
+  disable that hook (or allow a manual trigger), then run `/compact` and explicitly continue. If
+  the summary committed but restoration or continuation startup failed, **do not compact again**:
+  start a new session and resend the retained input.
 
   JSON and RPC expose uncorrelated `picc-checkpoint-lifecycle` custom entries; use category
   `checkpoint-exhausted` to detect a paused boundary and `checkpoint-resumed` to detect resumed
   work. An RPC prompt acknowledgement is not a checkpoint-completion acknowledgement. Pi may also
   emit native physical-run or compaction-error records that extensions cannot suppress or redact.
-  A retained PiCC subagent is recovered with awaited `SendMessage` by agent id after repairing the
-  cause, or abandoned with `TaskStop`.
+  A PiCC subagent retained after pre-commit operational or hook exhaustion is recovered with awaited
+  `SendMessage` by agent id after repairing the cause, or abandoned with `TaskStop` before the process
+  exits. A terminal post-commit child can only be abandoned and replaced.
 - `clipMaxTokens` — per-tool-result token budget above which a single oversized tool-result
   text block is clipped (head + tail kept, middle replaced by a model-visible marker naming
   what was omitted and how to retrieve it). A backstop against pathological outputs, **not** a
@@ -390,29 +396,10 @@ argument, which makes it best-effort — Claude Code's own limit, not a PiCC gap
 
 ## 7. What is and isn't supported
 
-The capability registry is the single source of truth, and is what `/doctor` renders. The full
-table — every tool, hook event, setting, frontmatter field, and feature with its tier, and the
-exact limit named for each partial — is in [`doc/supported-features.md`](supported-features.md),
-generated from that registry so it cannot drift. The shape of the answer:
-
-- **Full:** skills, rules, agents (project/user + the built-ins), worktrees, most hook events with
-  the full stdin/stdout contract, the CLAUDE.md hierarchy + `@import`, settings toggles, deny rules,
-  tool gating, `WebFetch`/`WebSearch`/`Grep`/`Glob`, and installed-plugin content.
-- **Partial (works within a named limit):** background subagent dispatch with `TaskOutput`/`TaskStop`;
-  `SendMessage` resume/steer; `subagent_type: "fork"`; nested (depth ≥ 2) fan-out, off by default;
-  proactive compaction policy and preservation; compact lifecycle hooks; auto-memory writes;
-  managed/enterprise policy (honored where trivially present, otherwise degrade-safe); `maxTurns`.
-- **Degraded no-op (visible, never crashing):** MCP servers/tools, `ask`/`allow`/permission modes,
-  plan mode, `AskUserQuestion`, checkpointing/rewind, output styles, agent teams, background
-  *shells* (`BashOutput`/`KillShell`), LSP, computer use, `NotebookRead` (retired — notebook
-  reading is merged into `Read`, which renders `.ipynb` cell-aware; the name stays a read-family
-  gating token) — and a handful of hook events that are
-  parsed but never fired (the matrix marks which). ⚠ `PermissionRequest` is one of them, so it is
-  **not** a gate — nothing fires it under the default-permissive posture. Unknown/future fields
-  degrade safely and are reported as unassessed.
-- **Not built:** plugin install/marketplace machinery; mid-flight live-session handoff between
-  harnesses (worktrees and git themselves are fully interoperable — a worktree created under Claude
-  Code can be re-entered here and vice versa).
+The capability registry is the single source of truth, and is what `/doctor` renders. The generated
+[`doc/supported-features.md`](supported-features.md) records every current capability tier and the
+exact limit for partial support. Unknown or future fields degrade safely and are reported as
+unassessed.
 
 ## 8. Windows specifics
 
@@ -449,7 +436,7 @@ behaviors worth knowing:
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
 | Startup notice keeps appearing | `/compat suppress` (per-project, stored in `.claude/.picc/`) |
 | Session died at high context / "input exceeds the context window" | Lower `proactiveCompactPercent` in `.claude/.picc/config.json` so PiCC compacts earlier (see Harness configuration above) |
-| Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | Reopen the exact persisted session before recovery. For operational exhaustion, run `/compact`, then explicitly continue. For a hook block, repair/disable the hook or allow manual compaction first. For restoration failure, do **not** compact again; start a new session and resend retained input. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories `checkpoint-exhausted` and `checkpoint-resumed`; RPC acknowledgement, print stdout, and print exit status do not prove logical completion. |
+| Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | Reopen the exact persisted session before recovery; an ephemeral headless session instead requires a replacement session and resent input. For operational exhaustion, run `/compact`, then explicitly continue. For a hook block, repair/disable the hook or allow manual compaction first. For any post-commit restoration/startup failure, do **not** compact again; start a new session and resend retained input. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories `checkpoint-exhausted` and `checkpoint-resumed`; RPC acknowledgement, print stdout, and print exit status do not prove logical completion. |
 | `picc -p` finished but a subagent's output never appeared | Background is the default and a one-shot print run has no next turn to deliver it on. Set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for scripted runs, or collect with `TaskOutput` before the run ends. |
 | Subagents can't spawn subagents / nested fan-out flattened | PiCC defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Raise `subagents.maxDepth` to `2..5` in `.claude/settings.json`; see "Subagent dispatch controls" above. `/doctor` also shows the current nesting posture. |
 | Unexpected skills/agents from plugins | PiCC loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. `/doctor` and the startup info notice report how many are available but disabled. |

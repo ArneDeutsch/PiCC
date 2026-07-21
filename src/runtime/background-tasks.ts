@@ -1162,9 +1162,11 @@ export function createTaskStopTool(
     name: "TaskStop",
     label: "TaskStop",
     description:
-      "Stop a running background task (best-effort). The task is marked stopped and its result is discarded.",
+      "Stop a running background task by task-* id (best-effort). A live checkpoint-paused child may instead be stopped by its process-lifetime agent-* id. The task is marked stopped and its result is discarded.",
     parameters: Type.Object({
-      task_id: Type.String({ description: 'Task id returned at start, e.g. "task-1"' }),
+      task_id: Type.String({
+        description: 'Task id returned at start (normally "task-*"), or the "agent-*" id of a live checkpoint-paused child in this process',
+      }),
     }),
     async execute(_toolCallId: string, params: { task_id: string }) {
       // Capture-time sanitization: mirrors TaskOutput — the id is

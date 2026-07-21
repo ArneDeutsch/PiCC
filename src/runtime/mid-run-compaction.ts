@@ -17,6 +17,7 @@ export type CheckpointPhase =
   | "compacting"
   | "backoff"
   | "resuming"
+  | "terminalizing"
   | "exhausted"
   | "cancelled";
 
@@ -250,6 +251,7 @@ export class MidRunCompactionController {
   private cancellation: CancellationState | undefined;
   private compactionSummary: CompactionSummaryToken | undefined;
   private terminalFailure: CompactionFailureCategory | undefined;
+  private terminalization: Promise<readonly QueuedInputShadow[]> | undefined;
 
   constructor(private readonly options: MidRunCompactionOptions) {
     this.sessionId = options.sessionId;
@@ -295,6 +297,7 @@ export class MidRunCompactionController {
     this.cancellation = undefined;
     this.compactionSummary = undefined;
     this.terminalFailure = undefined;
+    this.terminalization = undefined;
     this.emit("checkpoint-armed");
     return this.generation;
   }
@@ -465,6 +468,12 @@ export class MidRunCompactionController {
     if (generation !== this.generation || this.phase === "idle") {
       return Promise.resolve({ cancelled: false, rejected: [] });
     }
+    if (this.phase === "terminalizing") {
+      return (this.terminalization ?? Promise.resolve([])).then((rejected) => ({
+        cancelled: true,
+        rejected,
+      }));
+    }
     if (this.phase === "cancelled") {
       return this.cancellation?.generation === generation
         ? this.cancellation.outcome.promise
@@ -480,7 +489,8 @@ export class MidRunCompactionController {
     this.emit("checkpoint-cancelled", generation, undefined, {
       action: kind === "user" ? "manual-recovery" : "new-session",
     });
-    if (this.stable) this.scheduleCancellationFinish(generation, this.stable);
+    const generationBarrier = this.stable ??= deferred();
+    this.scheduleCancellationFinish(generation, generationBarrier);
     return this.cancellation.outcome.promise;
   }
 
@@ -503,6 +513,11 @@ export class MidRunCompactionController {
     this.recovery = undefined;
     this.emit("checkpoint-recovered");
     return { recovered: true, rejected };
+  }
+
+  /** Close a generation after its summary committed; no recovery capability survives. */
+  failAfterCommittedSummary(generation: number): Promise<readonly QueuedInputShadow[]> {
+    return this.terminalizeAfterCommittedSummary(generation);
   }
 
   /** A public-session continuation failed to start or settle; only pre-commit failures remain recoverable. */
@@ -600,6 +615,8 @@ export class MidRunCompactionController {
       if (NON_RETRYABLE.has(result.category) || attempt === 3) {
         if (result.category === "cancelled" || result.category === "shutdown") {
           void this.cancel(generation, result.category === "shutdown" ? "shutdown" : "user");
+        } else if (result.category === "restoration-paused") {
+          await this.terminalizeAfterCommittedSummary(generation);
         } else {
           this.exhaust(generation, result.category);
         }
@@ -648,7 +665,10 @@ export class MidRunCompactionController {
       await this.replayUntilSettled(generation, ownership, context, settlement);
     } catch {
       if (this.isCancelled()) return;
-      this.exhaust(generation);
+      // The summary is already committed before resume ownership begins. Any
+      // restoration, replay, startup, or settlement failure is terminal for
+      // this session and must never mint a token that permits re-compaction.
+      await this.terminalizeAfterCommittedSummary(generation);
     }
   }
 
@@ -659,6 +679,7 @@ export class MidRunCompactionController {
     settlement: Promise<void>,
   ): Promise<void> {
     let settled = false;
+    let replayCompleted = false;
     const settlementEvent = settlement.then(() => {
       settled = true;
       return "settled" as const;
@@ -667,7 +688,7 @@ export class MidRunCompactionController {
     while (this.isCurrent(generation)) {
       while (this.queue.length > 0 && this.isCurrent(generation)) {
         if (settled) {
-          this.exhaust(generation);
+          await this.terminalizeAfterCommittedSummary(generation);
           return;
         }
         const entry = this.queue[0];
@@ -682,17 +703,18 @@ export class MidRunCompactionController {
           if (result.delivered && this.queue[0] === entry) this.queue.shift();
           if (this.isCancelled()) return;
           if (!result.delivered) {
-            this.exhaust(generation);
+            await this.terminalizeAfterCommittedSummary(generation);
             return;
           }
         }
       }
       if (!this.isCurrent(generation)) break;
-      if (ownership.replayComplete) {
+      if (!replayCompleted && ownership.replayComplete) {
         try {
           await ownership.replayComplete(context);
+          replayCompleted = true;
         } catch {
-          if (!this.isCancelled()) this.exhaust(generation);
+          if (!this.isCancelled()) await this.terminalizeAfterCommittedSummary(generation);
           return;
         }
       }
@@ -709,10 +731,55 @@ export class MidRunCompactionController {
       ]);
       if (event === "settled") {
         if (this.queue.length === 0) this.finishGeneration();
-        else this.exhaust(generation);
+        else await this.terminalizeAfterCommittedSummary(generation);
         return;
       }
     }
+  }
+
+  private terminalizeAfterCommittedSummary(generation: number): Promise<readonly QueuedInputShadow[]> {
+    if (generation !== this.generation || this.phase === "cancelled" || this.phase === "exhausted") {
+      return Promise.resolve([]);
+    }
+    if (this.phase === "terminalizing") return this.terminalization ?? Promise.resolve([]);
+
+    const ownership = this.resumedOwnership;
+    const context = this.resumeContext;
+    const generationBarrier = this.stable;
+    this.phase = "terminalizing";
+    this.checkpointAbortRequested = false;
+    this.compactionSummary = undefined;
+    this.terminalFailure = "restoration-paused";
+    this.recovery = undefined;
+    this.runAbort.abort("post-commit failure");
+    this.queueChanged.resolve();
+
+    const terminalization = (async (): Promise<readonly QueuedInputShadow[]> => {
+      if (ownership && context) {
+        try {
+          await ownership.cancelAndJoin("replacement", context);
+        } catch {
+          // The adapter has already revoked provider/replay authority. A failed
+          // host join cannot reopen this generation, but stable publication must
+          // still wait for that exact join attempt to settle.
+        }
+      }
+      if (generation !== this.generation || this.phase !== "terminalizing") return [];
+      this.resumedOwnership = undefined;
+      this.resumeContext = undefined;
+      this.resumeToken = undefined;
+      this.resumedSettlement = undefined;
+      const rejected = this.queue.splice(0);
+      this.phase = "exhausted";
+      generationBarrier?.resolve();
+      this.emit("checkpoint-exhausted", generation, this.attempt, {
+        action: "new-session",
+        failureCategory: "restoration-paused",
+      });
+      return rejected;
+    })();
+    this.terminalization = terminalization;
+    return terminalization;
   }
 
   private finishGeneration(): void {
@@ -783,7 +850,8 @@ export class MidRunCompactionController {
   }
 
   private isCurrent(generation: number): boolean {
-    return generation === this.generation && this.phase !== "cancelled" && this.phase !== "exhausted";
+    return generation === this.generation && this.phase !== "cancelled" &&
+      this.phase !== "terminalizing" && this.phase !== "exhausted";
   }
 
   private isCancelled(): boolean {
@@ -1079,6 +1147,12 @@ export class MainSessionCheckpointGate {
   installResumeBarrier(generation: number, barrier: Promise<void>): boolean {
     if (generation !== this.generation || this.controller.snapshot().phase !== "resuming") return false;
     this.resumeBarrier = { generation, promise: barrier };
+    return true;
+  }
+
+  clearResumeBarrier(generation: number, barrier: Promise<void>): boolean {
+    if (this.resumeBarrier?.generation !== generation || this.resumeBarrier.promise !== barrier) return false;
+    this.resumeBarrier = undefined;
     return true;
   }
 

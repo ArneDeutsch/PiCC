@@ -565,7 +565,7 @@ describe("HookRunner output contract", () => {
     expect(outcome.updatedInput).toEqual({ command: "npm run lint", description: "lint" });
   });
 
-  it("blocks on Stop-hook style top-level decision/reason and continue:false", async () => {
+  it("keeps event-specific block separate from universal continue:false", async () => {
     const stopJson = '{"decision":"block","reason":"tests not run"}';
     const { runner } = makeRunner({ Stop: [{ hooks: [`echo '${stopJson}'`] }] });
     const outcome = await runner.fire("Stop", {});
@@ -575,8 +575,17 @@ describe("HookRunner output contract", () => {
     const contJson = '{"continue":false,"stopReason":"build failed"}';
     const { runner: runner2 } = makeRunner({ Stop: [{ hooks: [`echo '${contJson}'`] }] });
     const outcome2 = await runner2.fire("Stop", {});
-    expect(outcome2.block).toBe(true);
-    expect(outcome2.blockReason).toBe("build failed");
+    expect(outcome2.block).toBe(false);
+    expect(outcome2.blockReason).toBeUndefined();
+    expect(outcome2.stop).toBe(true);
+    expect(outcome2.stopReason).toBe("build failed");
+
+    const { runner: compactRunner } = makeRunner({
+      PostCompact: [{ hooks: [`echo '${stopJson}'`, `echo '${contJson}'`] }],
+    });
+    const compact = await compactRunner.fire("PostCompact", { trigger: "auto" });
+    expect(compact.block).toBe(false);
+    expect(compact.stop).toBe(true);
   });
 
   it("captures plain stdout for UserPromptSubmit but ignores it for PreToolUse", async () => {

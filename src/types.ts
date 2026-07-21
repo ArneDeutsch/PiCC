@@ -241,9 +241,12 @@ export interface HookPayload {
 }
 
 export interface HookOutcome {
-  /** Hard block (exit 2 or permissionDecision deny). */
+  /** Event-specific block (exit 2, decision:block, or permissionDecision deny). */
   block: boolean;
   blockReason?: string;
+  /** Universal hook stop (`continue:false`), independent of whether the event is blockable. */
+  stop?: boolean;
+  stopReason?: string;
   /** ask decisions are logged-allowed by PiCC's single default-permissive posture, but surfaced. */
   askDowngraded: boolean;
   /** Context to inject into the model. */

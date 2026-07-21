@@ -12,6 +12,15 @@ import { openAICodexResponsesApi } from "@earendil-works/pi-ai/compat";
 const codexStreamSimple = openAICodexResponsesApi().streamSimple;
 
 /** Preserve normal Codex auto transport; force abort-aware SSE only once already aborted. */
+export function registerCodexAbortGuard(pi: {
+  registerProvider(name: string, config: Record<string, unknown>): void;
+}): void {
+  pi.registerProvider("picc-codex-abort-guard", {
+    api: "openai-codex-responses",
+    streamSimple: codexAbortGuardStreamSimple,
+  });
+}
+
 export function codexAbortGuardStreamSimple(
   model: Model<"openai-codex-responses">,
   context: Context,

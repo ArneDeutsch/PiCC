@@ -76,7 +76,7 @@ import {
   type CompactionSummaryToken,
   type ResumeToken,
 } from "./runtime/mid-run-compaction.js";
-import { codexAbortGuardStreamSimple } from "./runtime/codex-abort-guard.js";
+import { registerCodexAbortGuard } from "./runtime/codex-abort-guard.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
@@ -124,6 +124,10 @@ class HookMultiplexer {
       if (o.block && !merged.block) {
         merged.block = true;
         merged.blockReason = o.blockReason;
+      }
+      if (o.stop && !merged.stop) {
+        merged.stop = true;
+        merged.stopReason = o.stopReason;
       }
       merged.askDowngraded = merged.askDowngraded || o.askDowngraded;
       if (o.additionalContext) {
@@ -350,10 +354,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // arbitrary custom handlers for the same API are outside the guarded scope.
   if (!codexProviderRegistries.has(pi)) {
     codexProviderRegistries.add(pi);
-    pi.registerProvider("picc-codex-abort-guard", {
-      api: "openai-codex-responses",
-      streamSimple: codexAbortGuardStreamSimple,
-    });
+    registerCodexAbortGuard(pi);
   }
   const cwdState = new CwdState(project.cwd);
   // Hook payload `transcript_path`: Pi's session manager (captured on
@@ -454,6 +455,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     context: any;
     settled: Promise<void>;
     resolveSettled(): void;
+    replayCompleted: boolean;
   } | undefined;
   const quotaHeaders: Record<string, string> = {};
 
@@ -997,7 +999,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       case "checkpoint-exhausted": return event.failureCategory === "hook-blocked"
         ? "Automatic context compaction was blocked by a PreCompact hook. Work is paused and no continuation ran. Repair or disable the hook, or allow a manual compact trigger; then run /compact and explicitly continue."
         : event.failureCategory === "restoration-paused"
-          ? "Context was compacted, but mandatory context restoration could not be queued. Work is paused and no continuation ran. Do not compact the committed summary again; start a new session and resend the retained input."
+          ? "Context was compacted, but mandatory restoration or continuation failed. Work is paused and no continuation ran. Do not compact the committed summary again; start a new session and resend the retained input."
           : "Automatic context compaction could not complete. Work is paused and no continuation ran. Run /compact, then explicitly continue.";
       case "checkpoint-cancelled": return event.action === "new-session"
         ? "Proactive context compaction stopped with the old session; resend input in the new session."
@@ -1062,12 +1064,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     const baseText = checkpointText(event);
     const recoverableHeadlessExhaustion = event.category === "checkpoint-exhausted" &&
       event.failureCategory !== "restoration-paused" && mode !== "tui";
+    const persisted = transcriptPath() !== undefined;
     const headlessCause = event.failureCategory === "hook-blocked"
       ? "Automatic context compaction was blocked by a PreCompact hook. Work is paused and no continuation ran. Repair or disable the hook, or allow a manual compact trigger first."
       : "Automatic context compaction could not complete. Work is paused and no continuation ran.";
-    const text = recoverableHeadlessExhaustion
-      ? `${headlessCause} If this process exits, reopen the exact persisted session before /compact.${mode === "rpc" ? " RPC acknowledgements are uncorrelated." : ""} Run /compact, then explicitly continue.`
-      : baseText;
+    const recoveryGuidance = persisted
+      ? `If this process exits, reopen the exact persisted session before /compact.${mode === "rpc" ? " RPC acknowledgements are uncorrelated." : ""} Run /compact, then explicitly continue.`
+      : "This headless session is ephemeral and cannot be reopened; start a replacement session and resend the retained input.";
+    const text = recoverableHeadlessExhaustion ? `${headlessCause} ${recoveryGuidance}` : baseText;
     if (mode === "tui") {
       try {
         ctx.ui?.setStatus?.("picc-checkpoint", event.category === "checkpoint-recovered" ? undefined : text);
@@ -1090,9 +1094,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         ...(event.category === "checkpoint-exhausted" ? {
           recovery: event.failureCategory === "restoration-paused"
             ? "start a new session and resend retained input; do not compact the committed summary again"
-            : event.failureCategory === "hook-blocked"
-              ? "repair or disable the hook, or allow manual compaction; then run /compact and explicitly continue"
-              : "/compact, then explicitly continue",
+            : !persisted
+              ? "start a replacement session and resend retained input; this ephemeral session cannot be reopened"
+              : event.failureCategory === "hook-blocked"
+                ? "repair or disable the hook, or allow manual compaction; then run /compact and explicitly continue"
+                : "/compact, then explicitly continue",
         } : {}),
       });
     }
@@ -1190,15 +1196,33 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         context: ctx,
         settled,
         resolveSettled,
+        replayCompleted: false,
       };
-      pi.sendMessage(
-        {
-          customType: "picc-checkpoint-continuation",
-          content: "Continue the paused work.",
-          display: false,
-        },
-        { triggerTurn: true },
-      );
+      const resume = activeMainResume;
+      const isCurrent = () => {
+        const controller = mainCheckpointGate.currentController();
+        const snapshot = controller.snapshot();
+        return activeMainResume === resume && resume.epoch === checkpointSessionEpoch &&
+          resume.generation === snapshot.generation && resume.token === resumeContext.token &&
+          snapshot.phase === "resuming" && !resumeContext.signal.aborted;
+      };
+      try {
+        if (!isCurrent()) throw new Error("checkpoint resume lost authority before startup");
+        pi.sendMessage(
+          {
+            customType: "picc-checkpoint-continuation",
+            content: "Continue the paused work.",
+            display: false,
+          },
+          { triggerTurn: true },
+        );
+      } catch (error) {
+        if (activeMainResume === resume) activeMainResume = undefined;
+        mainCheckpointGate.clearResumeBarrier(resumeContext.generation, providerBarrier);
+        rejectProvider(error);
+        resolveSettled();
+        throw error;
+      }
       return {
         replay: (input: any) => {
           mainCheckpointGate.withReplayAuthorization(input, () => {
@@ -1207,6 +1231,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           return { delivered: true } as const;
         },
         replayComplete: () => {
+          if (!isCurrent() || resume.replayCompleted) {
+            throw new Error("checkpoint resume cannot release the provider twice");
+          }
+          resume.replayCompleted = true;
           openProvider();
           const text = "Context compacted; resumed the paused work.";
           if (ctx?.mode === "tui") ctx.ui?.setStatus?.("picc-checkpoint", text);
@@ -1221,8 +1249,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         },
         cancelAndJoin: async () => {
           rejectProvider(new Error("checkpoint cancelled"));
+          mainCheckpointGate.clearResumeBarrier(resumeContext.generation, providerBarrier);
           try { ctx?.abort?.(); } catch { /* join below remains authoritative */ }
           await settled;
+          if (activeMainResume === resume) activeMainResume = undefined;
         },
       };
     },
@@ -1652,6 +1682,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     await mainCheckpointGate.startSession(randomUUID());
     checkpointContext = ctx;
     checkpointSessionEpoch = {};
+    const sessionStartEpoch = checkpointSessionEpoch;
+    const sessionStartController = mainCheckpointGate.currentController();
     activeCompactionOperation = undefined;
     printedResumeToken = undefined;
     stopHookIterations = 0;
@@ -1663,6 +1695,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // reports hasUI: true), so a hasUI gate would install the panel into an
       // RPC client; print/RPC output must stay unchanged.
       if (ctx.mode === "tui") {
+        ctx.ui?.setStatus?.("picc-checkpoint", undefined);
         subagentPanel.attach(ctx.ui);
         // Arms the one-time panel hint: the TUI gate is "a TUI ui was seen",
         // so print/RPC sessions never emit it (and never consume its gate).
@@ -1699,6 +1732,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         source: sessionStartSource,
         cwd: cwdState.get(),
       });
+      if (checkpointSessionEpoch !== sessionStartEpoch ||
+          mainCheckpointGate.currentController() !== sessionStartController) return;
+      if (outcome.stop) {
+        const reason = outcome.stopReason ?? "SessionStart hook requested stop";
+        try {
+          if (ctx.hasUI) ctx.ui?.notify?.(reason, "warning");
+          else console.error(`PiCC: ${reason}`);
+          ctx.abort?.();
+        } catch { /* stop authority remains final */ }
+        return;
+      }
       const hookContext = [outcome.stdout, outcome.additionalContext].filter(Boolean).join("\n");
       if (hookContext.trim()) {
         pi.sendMessage(
@@ -1801,7 +1845,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         const text = inputDisposition === "reject-recoverable"
           ? "Work remains paused. Run /compact, then explicitly continue."
           : inputDisposition === "reject-restoration"
-            ? "The compacted summary is committed, but context restoration failed. Do not compact it again; start a new session and resend the retained input."
+            ? "The compacted summary is committed, but restoration or continuation failed. Do not compact it again; start a new session and resend the retained input."
             : "The prior checkpoint was cancelled. Run /compact to recover this session, or start a new session.";
         try {
           if (ctx.mode === "print") console.error(`PiCC: ${text}`);
@@ -1899,9 +1943,19 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         prompt: event.text,
         cwd: cwdState.get(),
       });
-      if (outcome.block) {
+      if (outcome.stop) {
+        const reason = outcome.stopReason ?? "UserPromptSubmit hook requested stop";
         try {
-          if (ctx.hasUI) ctx.ui.notify(`Prompt blocked by hook: ${outcome.blockReason ?? ""}`, "warning");
+          if (ctx.hasUI) ctx.ui.notify(`Prompt stopped by hook: ${reason}`, "warning");
+          else console.error(`PiCC: ${reason}`);
+          ctx.abort?.();
+        } catch { /* hook stop remains final */ }
+        return { action: "handled" };
+      }
+      if (outcome.block) {
+        const reason = outcome.blockReason ?? "";
+        try {
+          if (ctx.hasUI) ctx.ui.notify(`Prompt blocked by hook: ${reason}`, "warning");
         } catch { /* hook admission remains blocked */ }
         return { action: "handled" };
       }
@@ -2071,11 +2125,21 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         stop_hook_active: stopHookIterations > 0,
         ...(lastAssistantMessage === undefined ? {} : { last_assistant_message: lastAssistantMessage }),
       });
+      if (outcome.stop) {
+        const reason = outcome.stopReason ?? "Stop hook requested termination";
+        try {
+          if (ctx?.hasUI) ctx.ui?.notify?.(reason, "warning");
+          else console.error(`PiCC: ${reason}`);
+          ctx?.abort?.();
+        } catch { /* universal stop remains terminal */ }
+        stopHookIterations = 0;
+        return true;
+      }
       // Claude caps consecutive Stop-hook blocks at 8; carry that same bound
       // across checkpoint resume so the internal physical turn cannot reset it.
       if (outcome.block && stopHookIterations < 8) {
         stopHookIterations += 1;
-        const continuation = `[Stop hook] Continue working: ${outcome.blockReason ?? "the stop condition is not met yet"}`;
+        const continuation = `[Stop hook] Continue working: ${outcome.stopReason ?? outcome.blockReason ?? "the stop condition is not met yet"}`;
         const controller = mainCheckpointGate.currentController();
         const snapshot = controller.snapshot();
         const resume = activeMainResume;
@@ -2139,6 +2203,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     const resume = activeMainResume;
     if (resume?.generation === controller.snapshot().generation &&
         resume.epoch === checkpointSessionEpoch) {
+      if (controller.snapshot().phase === "terminalizing") {
+        resume.resolveSettled();
+        return;
+      }
       if (controller.snapshot().phase === "cancelled") {
         resume.resolveSettled();
         activeMainResume = undefined;
@@ -2224,9 +2292,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         custom_instructions: typeof event.customInstructions === "string" ? event.customInstructions : "",
         cwd: cwdState.get(),
       });
+      const snapshot = controller.snapshot();
       const stale = activeCompactionOperation !== operation || checkpointSessionEpoch !== epoch ||
-        mainCheckpointGate.currentController() !== controller;
-      if (stale || outcome.block) {
+        mainCheckpointGate.currentController() !== controller || snapshot.generation !== generation ||
+        (proactive
+          ? !controller.isCompactionSummaryActive(generation)
+          : operation.recovery
+            ? operation.recovery !== controller.recoveryToken(generation)
+            : snapshot.phase !== "idle");
+      if (stale || outcome.block || outcome.stop) {
         if (!stale && proactive && checkpointAttempt === attempt) attempt.hookBlocked = true;
         if (activeCompactionOperation === operation) activeCompactionOperation = undefined;
         return { cancel: true };
@@ -2244,41 +2318,56 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (!operation) return;
     const { controller, generation, proactive, trigger, epoch } = operation;
     const attempt = checkpointAttempt;
-    const current = operation === activeCompactionOperation && epoch === checkpointSessionEpoch &&
+    const isCurrent = () => operation === activeCompactionOperation && epoch === checkpointSessionEpoch &&
       controller === mainCheckpointGate.currentController() && controller.snapshot().generation === generation &&
-      (!proactive || (attempt?.operation === operation.identity && attempt.controller === controller));
-    if (!current) {
+      (proactive
+        ? controller.isCompactionSummaryActive(generation) &&
+          attempt?.operation === operation.identity && attempt.controller === controller
+        : operation.recovery
+          ? operation.recovery === controller.recoveryToken(generation)
+          : controller.snapshot().phase === "idle");
+    if (!isCurrent()) {
       if (activeCompactionOperation === operation) activeCompactionOperation = undefined;
       return;
     }
 
     let restorationFailed = false;
+    let universalStop = false;
     try {
       const started = await hooks.fire("SessionStart", { source: "compact", cwd: cwdState.get() });
-      if (activeCompactionOperation !== operation || epoch !== checkpointSessionEpoch ||
-          controller !== mainCheckpointGate.currentController()) return;
-      const hookContext = [started.stdout, started.additionalContext].filter(Boolean).join("\n").trim();
-      if (hookContext) {
-        // Pi's void delivery API confirms only synchronous enqueue acceptance.
-        // A synchronous throw is the complete observable failure boundary here.
+      if (!isCurrent()) return;
+      if (started.stop) {
+        restorationFailed = true;
+        universalStop = true;
+      }
+      const startedContext = [started.stdout, started.additionalContext].filter(Boolean).join("\n").trim();
+      if (!universalStop && startedContext) {
+        if (!isCurrent()) return;
         pi.sendMessage(
-          { customType: "picc-hook-context", content: hookContext, display: true },
+          { customType: "picc-hook-context", content: startedContext, display: true },
           { deliverAs: "steer" },
         );
       }
     } catch {
       restorationFailed = true;
     }
-    try {
-      await hooks.fire("PostCompact", {
+    if (!isCurrent()) return;
+    if (!universalStop) try {
+      const post = await hooks.fire("PostCompact", {
         trigger,
         compact_summary: String(event.compactionEntry?.summary ?? ""),
         cwd: cwdState.get(),
       });
+      if (!isCurrent()) return;
+      if (post.stop) {
+        restorationFailed = true;
+        universalStop = true;
+      }
     } catch {
-      /* PostCompact cannot roll back or retry a committed summary */
+      restorationFailed = true;
     }
-    try {
+    if (!isCurrent()) return;
+    if (!universalStop) try {
       resetInjectionState(state, project.claudeMd);
       if (state.activeSkills.size) {
         const budgeted = budgetSkillReinjection([...state.activeSkills.entries()]);
@@ -2286,8 +2375,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           debug(`compaction: active skill "${name}" dropped from re-injection (combined budget exceeded)`);
         }
         if (budgeted.text) {
-          // Steering is load-bearing here: restoration must enter the resumed
-          // ordinary provider request, whereas nextTurn would wait for another user prompt.
+          if (!isCurrent()) return;
           pi.sendMessage(
             {
               customType: "picc-preserved",
@@ -2301,15 +2389,20 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     } catch {
       restorationFailed = true;
     }
+    if (!isCurrent()) return;
     if (proactive && attempt && checkpointAttempt === attempt && attempt.operation === operation.identity) {
       attempt.restorationFailed = restorationFailed;
     }
-    if (!proactive && event.reason === "manual" && operation.recovery &&
-        operation.recovery === controller.recoveryToken(generation)) {
-      const recovered = controller.recoverAfterManualCompaction(operation.recovery);
-      if (recovered.recovered) {
-        publishCheckpoint({ category: "checkpoint-recovered", generation, action: "manual-recovery" }, checkpointContext);
-        reportRejectedShadows(recovered.rejected, checkpointContext);
+    if (!proactive && event.reason === "manual") {
+      if (restorationFailed) {
+        const rejected = await controller.failAfterCommittedSummary(generation);
+        reportRejectedShadows(rejected, checkpointContext);
+      } else if (operation.recovery && operation.recovery === controller.recoveryToken(generation)) {
+        const recovered = controller.recoverAfterManualCompaction(operation.recovery);
+        if (recovered.recovered) {
+          publishCheckpoint({ category: "checkpoint-recovered", generation, action: "manual-recovery" }, checkpointContext);
+          reportRejectedShadows(recovered.rejected, checkpointContext);
+        }
       }
     }
     if (activeCompactionOperation === operation) activeCompactionOperation = undefined;

@@ -407,6 +407,68 @@ describe("MidRunCompactionController", () => {
     expect(controller.snapshot()).toMatchObject({ phase: "cancelled", admission: "closed", queuedInputs: 1 });
   });
 
+  it.each(["replay", "release", "settlement"] as const)(
+    "terminalizes a post-commit %s failure only after the exact resumed owner joins",
+    async (failure) => {
+      const join = deferred<void>();
+      const settlement = deferred<void>();
+      const replayGate = deferred<void>();
+      let replayEntered = false;
+      let joinCalls = 0;
+      const controller = createController({
+        sessionId: "post-commit", threshold: 90, compact: async () => ({ ok: true }),
+        resume: () => ({
+          settled: failure === "settlement" ? settlement.promise : new Promise<void>(() => undefined),
+          replay: async () => {
+            if (failure === "settlement" && !replayEntered) {
+              replayEntered = true;
+              await replayGate.promise;
+            }
+            return { delivered: failure !== "replay" };
+          },
+          replayComplete: () => {
+            if (failure === "release") throw new Error("provider release failed");
+          },
+          cancelAndJoin: () => {
+            joinCalls += 1;
+            return join.promise;
+          },
+        }),
+      });
+      const { generation, handle } = arm(controller);
+      controller.completeToolBatch(handle);
+      if (failure !== "release") controller.shadowInput(generation, "retained", "steer");
+      let stableDone = false;
+      const stable = controller.checkpoint(generation).then(() => { stableDone = true; });
+      if (failure === "settlement") {
+        await waitUntil({ description: "first replay to enter", predicate: () => replayEntered });
+        controller.shadowInput(generation, "late retained", "followUp");
+        settlement.resolve();
+        await Promise.resolve();
+        replayGate.resolve();
+      }
+      await waitUntil({
+        description: `${failure} failure to revoke resumed authority`,
+        predicate: () => controller.snapshot().phase === "terminalizing",
+      });
+      expect(controller.snapshot()).toMatchObject({ admission: "checkpoint-only", failureCategory: "restoration-paused" });
+      expect(stableDone).toBe(false);
+      expect(joinCalls).toBe(1);
+
+      const cancellation = controller.cancel(generation, "replacement");
+      await Promise.resolve();
+      expect(joinCalls).toBe(1);
+      expect(stableDone).toBe(false);
+      join.resolve();
+      await stable;
+      await expect(cancellation).resolves.toMatchObject({ cancelled: true });
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+      });
+      expect(joinCalls).toBe(1);
+    },
+  );
+
   it("cancellation while resume Promise starts waits for abort and join", async () => {
     const join = deferred<void>();
     let observedAbort = false;
@@ -1046,7 +1108,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
           SessionStart: [
             {
               matcher: "compact",
-              hooks: [{ type: "command", command: 'payload=$(cat); printf "%s" "$payload" | grep -q "\\\"source\\\":\\\"compact\\\"" && echo start >> "$CLAUDE_PROJECT_DIR/.claude/.compact-trace"; if [ -f "$CLAUDE_PROJECT_DIR/.claude/.session-context" ]; then echo mandatory-context; fi' }],
+              hooks: [{ type: "command", command: `payload=$(cat); printf "%s" "$payload" | grep -q '\"source\":\"compact\"' && echo start >> "$CLAUDE_PROJECT_DIR/.claude/.compact-trace"; if [ -f "$CLAUDE_PROJECT_DIR/.claude/.session-stop" ]; then printf '%s\\n' '{"continue":false,"stopReason":"compact lifecycle stopped"}'; elif [ -f "$CLAUDE_PROJECT_DIR/.claude/.session-context" ]; then echo mandatory-context; fi` }],
             },
           ],
           PostCompact: [
@@ -1071,12 +1133,14 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
               hooks: [
                 { type: "command", command: 'payload=$(cat); printf "%s" "$payload" | grep -q "\\\"trigger\\\":\\\"auto\\\"" && printf "%s" "$payload" | grep -q "\\\"custom_instructions\\\":\\\"\\\"" && echo auto >> "$CLAUDE_PROJECT_DIR/.claude/.precompact-log" && echo pre >> "$CLAUDE_PROJECT_DIR/.claude/.compact-trace"' },
                 { type: "command", command: 'if [ -f "$CLAUDE_PROJECT_DIR/.claude/block-compact" ]; then echo "policy block" >&2; exit 2; fi' },
+                { type: "command", command: 'if [ -f "$CLAUDE_PROJECT_DIR/.claude/gate-precompact" ]; then echo entered > "$CLAUDE_PROJECT_DIR/.claude/precompact-entered"; while [ ! -f "$CLAUDE_PROJECT_DIR/.claude/release-precompact" ]; do sleep 0.02; done; fi' },
               ],
             },
             {
               matcher: "manual",
               hooks: [
                 { type: "command", command: 'echo manual >> "$CLAUDE_PROJECT_DIR/.claude/.precompact-log"' },
+                { type: "command", command: 'if [ -f "$CLAUDE_PROJECT_DIR/.claude/gate-precompact" ]; then echo entered > "$CLAUDE_PROJECT_DIR/.claude/precompact-entered"; while [ ! -f "$CLAUDE_PROJECT_DIR/.claude/release-precompact" ]; do sleep 0.02; done; fi' },
               ],
             },
           ],
@@ -1623,6 +1687,68 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(mainCheckpointGate.currentController().snapshot().admission).toBe("open");
   });
 
+  it("terminalizes an ordinary idle compact after mandatory SessionStart delivery failure", async () => {
+    await mainCheckpointGate.startSession("ordinary-delivery");
+    pi.entries.length = 0;
+    pi.messages.length = 0;
+    const marker = path.join(dir, ".claude", ".session-context");
+    fs.writeFileSync(marker, "enabled");
+    const originalSendMessage = pi.api.sendMessage as (message: any, options?: any) => void;
+    (pi.api as any).sendMessage = (message: any, options: any) => {
+      if (message?.customType === "picc-hook-context") throw new Error("mandatory delivery failed");
+      return originalSendMessage(message, options);
+    };
+    const ctx = pi.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
+    });
+    try {
+      expect(await pi.fire("session_before_compact", { reason: "manual" }, ctx)).toBeUndefined();
+      await pi.fire("session_compact", {
+        reason: "manual", compactionEntry: { summary: "ordinary committed summary" },
+      }, ctx);
+    } finally {
+      (pi.api as any).sendMessage = originalSendMessage;
+      fs.rmSync(marker, { force: true });
+    }
+
+    const controller = mainCheckpointGate.currentController();
+    expect(controller.snapshot()).toMatchObject({
+      phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+    });
+    expect(controller.recoveryToken(controller.snapshot().generation)).toBeUndefined();
+    expect(controller.manualCompactionDisposition()).toBe("unavailable");
+    expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation")).toBe(false);
+    expect(pi.entries.find((entry) => entry.data.category === "checkpoint-exhausted")?.data)
+      .toMatchObject({ failureCategory: "restoration-paused", action: "new-session" });
+  });
+
+  it("terminalizes an ordinary idle compact when SessionStart universally stops", async () => {
+    await mainCheckpointGate.startSession("ordinary-stop");
+    pi.entries.length = 0;
+    pi.messages.length = 0;
+    const marker = path.join(dir, ".claude", ".session-stop");
+    fs.writeFileSync(marker, "enabled");
+    const ctx = pi.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
+    });
+    try {
+      expect(await pi.fire("session_before_compact", { reason: "manual" }, ctx)).toBeUndefined();
+      await pi.fire("session_compact", {
+        reason: "manual", compactionEntry: { summary: "ordinary committed summary" },
+      }, ctx);
+    } finally {
+      fs.rmSync(marker, { force: true });
+    }
+    const controller = mainCheckpointGate.currentController();
+    expect(controller.snapshot()).toMatchObject({
+      phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+    });
+    expect(controller.recoveryToken(controller.snapshot().generation)).toBeUndefined();
+    expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation")).toBe(false);
+  });
+
   it("pauses without resummarizing when synchronous active-skill restoration delivery fails", async () => {
     await mainCheckpointGate.startSession("restoration-failure");
     pi.compactCalls.length = 0;
@@ -1695,6 +1821,54 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     });
   });
 
+  it("closes after synchronous hidden continuation enqueue failure without a second compaction", async () => {
+    await mainCheckpointGate.startSession("continuation-enqueue-failure");
+    pi.compactCalls.length = 0;
+    const originalSendMessage = pi.api.sendMessage as (message: any, options?: any) => void;
+    (pi.api as any).sendMessage = (message: any, options: any) => {
+      if (message?.customType === "picc-checkpoint-continuation") {
+        throw new Error("hidden startup enqueue failed");
+      }
+      return originalSendMessage(message, options);
+    };
+    const ctx = pi.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      compact: (options: any) => {
+        pi.compactCalls.push(options);
+        void (async () => {
+          const before = await pi.fire("session_before_compact", { reason: "manual" }, ctx);
+          if (before?.cancel) return options.onError(new Error("cancelled"));
+          await pi.fire("session_compact", {
+            reason: "manual", compactionEntry: { summary: "committed once" },
+          }, ctx);
+          options.onComplete({ summary: "committed once" });
+        })();
+      },
+    });
+    mainCheckpointGate.assistantMessageEnded({
+      role: "assistant", content: [{ type: "toolCall", id: "enqueue", name: "probe", arguments: {} }],
+    });
+    const wrapped: any = mainCheckpointGate.wrapTool({
+      name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+    });
+    const result = await wrapped.execute("enqueue", {}, undefined, undefined, ctx);
+    mainCheckpointGate.toolExecutionEnded({ toolCallId: "enqueue", result, isError: false });
+    mainCheckpointGate.turnEnded(ctx);
+    try {
+      await pi.fire("agent_settled", {}, ctx);
+    } finally {
+      (pi.api as any).sendMessage = originalSendMessage;
+    }
+    const controller = mainCheckpointGate.currentController();
+    expect(pi.compactCalls).toHaveLength(1);
+    expect(controller.snapshot()).toMatchObject({
+      phase: "exhausted", failureCategory: "restoration-paused", admission: "closed",
+    });
+    expect(controller.recoveryToken(controller.snapshot().generation)).toBeUndefined();
+    expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation")).toBe(false);
+  });
+
   it("retries callback failures three times and leaves print recovery persisted on exhaustion", async () => {
     await mainCheckpointGate.startSession("main-exhaustion");
     pi.compactCalls.length = 0;
@@ -1702,6 +1876,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     pi.messages.length = 0;
     let enteredOperations = 0;
     const ctx = pi.printCtx({
+      sessionManager: { getSessionFile: () => path.join(dir, "persisted-session.jsonl") },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       compact: (options: any) => {
         pi.compactCalls.push(options);
@@ -1714,6 +1889,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         })();
       },
     });
+    await pi.fire("session_start", { reason: "startup" }, ctx);
     await pi.fire("agent_settled", {}, ctx);
     expect(pi.compactCalls).toHaveLength(3);
     expect(enteredOperations).toBe(3);
@@ -1736,6 +1912,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await expect(pi.fire("input", {
       text: "explicit continuation", source: "interactive", streamingBehavior: undefined,
     }, ctx)).resolves.toEqual({ action: "continue" });
+    await pi.fire("session_start", { reason: "startup" }, pi.printCtx());
   });
 
   it.each([
@@ -1800,6 +1977,44 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(pi.notifications.at(-1)?.text).toContain("must be resent");
   });
 
+  it("revalidates same-controller manual compact authority after an awaited PreCompact hook", async () => {
+    await mainCheckpointGate.startSession("manual-hook-authority-race");
+    const controller = mainCheckpointGate.currentController();
+    const gate = path.join(dir, ".claude", "gate-precompact");
+    const entered = path.join(dir, ".claude", "precompact-entered");
+    const release = path.join(dir, ".claude", "release-precompact");
+    const compactTrace = path.join(dir, ".claude", ".compact-trace");
+    fs.writeFileSync(gate, "gate");
+    fs.rmSync(compactTrace, { force: true });
+    const sentBefore = pi.messages.length;
+    const ctx = pi.tuiCtx();
+    const before = pi.fire("session_before_compact", { reason: "manual" }, ctx);
+    try {
+      await waitUntil({
+        description: "PreCompact hook to enter",
+        predicate: () => fs.existsSync(entered),
+        describeObserved: () => String(fs.existsSync(entered)),
+      });
+      const generation = controller.sample(
+        { tokens: 900, contextWindow: 1000, percent: 90 },
+        "settled",
+      );
+      expect(generation).toBeDefined();
+      await expect(controller.cancel(generation!, "user")).resolves.toMatchObject({ cancelled: true });
+      expect(mainCheckpointGate.currentController()).toBe(controller);
+      expect(controller.snapshot()).toMatchObject({ generation, phase: "cancelled" });
+
+      fs.writeFileSync(release, "release");
+      await expect(before).resolves.toEqual({ cancel: true });
+      expect(fs.existsSync(compactTrace)).toBe(false);
+      expect(pi.messages).toHaveLength(sentBefore);
+    } finally {
+      fs.writeFileSync(release, "release");
+      await before.catch(() => undefined);
+      for (const file of [gate, entered, release, compactTrace]) fs.rmSync(file, { force: true });
+    }
+  });
+
   it("does not retry a PreCompact policy block", async () => {
     await mainCheckpointGate.startSession("main-hook-block");
     const marker = path.join(dir, ".claude", "block-compact");
@@ -1836,9 +2051,9 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await pi.fire("agent_settled", {}, ctx);
     const records = pi.entries.filter((entry) => entry.customType === "picc-checkpoint-lifecycle");
     expect(records.some((entry) => entry.data.category === "checkpoint-exhausted")).toBe(true);
-    expect(records.at(-1)?.data.notice).toContain("reopen the exact persisted session before /compact");
-    expect(records.at(-1)?.data.notice).toContain("Run /compact, then explicitly continue");
-    if (mode === "rpc") expect(records.at(-1)?.data.notice).toContain("RPC acknowledgements are uncorrelated");
+    expect(records.at(-1)?.data.notice).toContain("ephemeral and cannot be reopened");
+    expect(records.at(-1)?.data.notice).toContain("start a replacement session");
+    expect(records.at(-1)?.data.notice).not.toContain("Run /compact");
     expect(records.map((entry) => entry.data.notice).join("\n")).not.toContain("private failure");
     expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-lifecycle")).toBe(false);
   });
@@ -1916,7 +2131,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(outerDone).toBe(true);
   });
 
-  it("replacement aborts outstanding host compaction and waits for its callback after post-commit hooks", async () => {
+  it("replacement aborts outstanding host compaction and suppresses stale post-commit hooks", async () => {
     await mainCheckpointGate.startSession("replacement-host-compact");
     fs.rmSync(path.join(dir, ".claude", ".compact-trace"), { force: true });
     const release = deferred<void>();
@@ -1956,7 +2171,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await expect(switching).resolves.toBeUndefined();
     await settlement;
     expect(fs.readFileSync(path.join(dir, ".claude", ".compact-trace"), "utf8").trim().split(/\s+/))
-      .toEqual(["pre", "start", "post"]);
+      .toEqual(["pre"]);
   });
 
   it("session lifecycle events reject old shadows and install a fresh controller", async () => {

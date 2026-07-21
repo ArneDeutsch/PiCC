@@ -170,8 +170,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("setting.permissions.allow")?.tier).toBe("partial");
   });
 
-  it("keeps supported hooks full except the explicit compact-lifecycle partials", () => {
-    const partial = new Set(["SessionStart", "PreCompact", "PostCompact"]);
+  it("keeps supported hooks full except the explicit lifecycle partials", () => {
+    const partial = new Set(["SessionStart", "PreCompact", "PostCompact", "WorktreeCreate"]);
     for (const ev of SUPPORTED_HOOK_EVENTS) {
       expect(lookupCapability(`hook.event.${ev}`)?.tier, ev).toBe(partial.has(ev) ? "partial" : "full");
     }
@@ -180,6 +180,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(sessionStart).toContain("startup and reload reasons map to startup");
     expect(sessionStart).toContain("new maps to clear");
     expect(sessionStart).not.toContain("fork source is missing");
+
+    const worktreeCreate = lookupCapability("hook.event.WorktreeCreate")?.note ?? "";
+    expect(worktreeCreate).toContain("after worktree creation and entry");
+    expect(worktreeCreate).toContain("ordinary nonzero/exit-2 hook outcomes cannot abort creation");
+    expect(worktreeCreate).toContain("Universal continue:false aborts subsequent run processing");
+    expect(worktreeCreate).toContain("tool result remain truthful");
   });
 
   it("marks MCP tools degraded-noop with safetyRelevant false", () => {
