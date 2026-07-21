@@ -159,6 +159,16 @@ describe("lifecycle wiring", () => {
     expect(String(continuations[0]?.content)).toContain("LW-not-done");
   });
 
+  it("resets blocked Stop iteration state when the session is replaced", async () => {
+    pi.userMessages.length = 0;
+    for (let i = 0; i < 8; i++) await pi.fire("agent_settled", {}, pi.ctx());
+    expect(pi.userMessages.filter((m) => String(m.content).includes("[Stop hook]")).length).toBe(8);
+
+    await pi.fire("session_start", { reason: "switch" }, pi.ctx());
+    await pi.fire("agent_settled", {}, pi.ctx());
+    expect(pi.userMessages.filter((m) => String(m.content).includes("[Stop hook]")).length).toBe(9);
+  });
+
   it("session_shutdown fires the SessionEnd hook", async () => {
     const log = path.join(dir, ".claude", ".session-end-log");
     fs.rmSync(log, { force: true });
@@ -195,6 +205,7 @@ describe("lifecycle wiring", () => {
     await pi.fire("tool_call", { toolName: "read", toolCallId: "c3", input: { path: path.join(dir, "src", "b.ts") } });
     expect(pi.messages.map((m) => String(m.message.content)).join("\n")).not.toContain("LW-NESTED-SRC");
 
+    await pi.fire("session_before_compact", { reason: "threshold" });
     await pi.fire("session_compact", { reason: "threshold" });
 
     // Root CLAUDE.md + unconditional rules survive via the per-turn suffix.

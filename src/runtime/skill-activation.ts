@@ -107,6 +107,12 @@ export function skillActivationMessage(skill: ClaudeSkill, rendered: string): st
   ].join("\n");
 }
 
+/** Replace a resident skill while moving its latest rendering to activation-recency order. */
+export function recordResidentSkill(active: Map<string, string>, name: string, rendered: string): void {
+  active.delete(name);
+  active.set(name, rendered);
+}
+
 /** Per-skill compaction re-injection cap (~5k tokens, Claude's carryover budget). */
 export const REINJECT_PER_SKILL_MAX_CHARS = 20_000;
 /** Combined compaction re-injection cap (~25k tokens). */

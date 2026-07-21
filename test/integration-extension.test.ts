@@ -717,7 +717,15 @@ describe("session lifecycle hooks", () => {
     const skillTool = pi.tools.get("Skill");
     await skillTool.execute("t6", { name: "deploy", arguments: "prod 2.0" });
     pi.messages.length = 0;
-    await pi.fire("session_compact", { reason: "threshold" });
+    const compactCtx = pi.ctx();
+    await expect(pi.fire("session_before_compact", {
+      reason: "threshold",
+      customInstructions: undefined,
+    }, compactCtx)).resolves.toBeUndefined();
+    await pi.fire("session_compact", {
+      reason: "threshold",
+      compactionEntry: { summary: "threshold summary" },
+    }, compactCtx);
     const entry = pi.messages.find((m) => m.message?.customType === "picc-preserved");
     expect(entry, "expected a picc-preserved message").toBeDefined();
     const preserved = String(entry?.message?.content ?? "");

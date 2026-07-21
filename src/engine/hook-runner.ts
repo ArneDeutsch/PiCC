@@ -33,9 +33,8 @@ const PLAIN_STDOUT_IGNORED_EVENTS: ReadonlySet<string> = new Set([
 /**
  * Payload key(s) the `matcher` is compared against, per event: tool events
  * match the tool name; SessionStart the source
- * (startup|resume|clear|compact); PreCompact the trigger (manual|auto) —
- * PiCC call sites currently deliver it as `reason`, so that is accepted as a
- * fallback; Subagent* the agent type; SessionEnd the reason. Events not
+ * (startup|resume|clear|compact); PreCompact and PostCompact the trigger
+ * (manual|auto); Subagent* the agent type; SessionEnd the reason. Events not
  * listed here document no matcher subject and Claude ignores `matcher` there
  * (entries fire unconditionally).
  */
@@ -45,6 +44,7 @@ const MATCHER_SUBJECT_KEYS: Readonly<Record<string, readonly string[]>> = {
   PostToolUseFailure: ["tool_name"],
   SessionStart: ["source"],
   PreCompact: ["trigger", "reason"],
+  PostCompact: ["trigger"],
   SubagentStart: ["subagent_type", "agent_type"],
   SubagentStop: ["subagent_type", "agent_type"],
   SessionEnd: ["reason"],

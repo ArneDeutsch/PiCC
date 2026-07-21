@@ -23,6 +23,7 @@ export type CompactionFailureCategory =
   | "operational"
   | "cancelled"
   | "hook-blocked"
+  | "restoration-paused"
   | "stale-generation"
   | "shutdown"
   | "overflow-recovery";
@@ -50,6 +51,8 @@ export interface CheckpointProgress {
   category: CheckpointDiagnosticCategory;
   generation: number;
   attempt?: number;
+  action?: "resume" | "settled-fallback" | "manual-recovery" | "repair-restoration" | "new-session";
+  failureCategory?: CompactionFailureCategory;
 }
 
 export interface CheckpointSnapshot {
@@ -59,6 +62,7 @@ export interface CheckpointSnapshot {
   checkpointAbortRequested: boolean;
   queuedInputs: number;
   admission: "open" | "checkpoint-only" | "recoverable-rejection" | "closed";
+  failureCategory?: CompactionFailureCategory;
 }
 
 export interface ToolBatchDisposition {
@@ -106,6 +110,8 @@ export type ReplayDeliveryResult = { delivered: true } | { delivered: false };
  */
 export interface ResumedRunOwnership {
   replay(input: QueuedInputShadow, context: ReplayContext): ReplayDeliveryResult | Promise<ReplayDeliveryResult>;
+  /** Opens the resumed provider barrier only after every accepted shadow has reconciled. */
+  replayComplete?(context: ResumeContext): void | Promise<void>;
   settled?: Promise<void>;
   cancelAndJoin(kind: CancellationKind, context: ResumeContext): void | Promise<void>;
 }
@@ -120,7 +126,7 @@ export interface ManualCompactionOwnership {
 }
 
 export type ManualCompactionCapability = ManualCompactionOwnership | { kind: "unavailable" };
-export type OrdinaryInputDisposition = "accept" | "quarantine" | "reject-recoverable" | "reject-closed";
+export type OrdinaryInputDisposition = "accept" | "quarantine" | "reject-recoverable" | "reject-restoration" | "reject-closed";
 export type ManualCompactionDisposition = "allow" | "already-active" | "unavailable";
 
 export interface CancellationOutcome {
@@ -208,6 +214,7 @@ function usageMeetsThreshold(usage: ContextUsageShape | undefined, threshold: nu
 const NON_RETRYABLE = new Set<CompactionFailureCategory>([
   "cancelled",
   "hook-blocked",
+  "restoration-paused",
   "stale-generation",
   "shutdown",
   "overflow-recovery",
@@ -237,6 +244,7 @@ export class MidRunCompactionController {
   private resumeContext: ResumeContext | undefined;
   private cancellation: CancellationState | undefined;
   private compactionSummary: CompactionSummaryToken | undefined;
+  private terminalFailure: CompactionFailureCategory | undefined;
 
   constructor(private readonly options: MidRunCompactionOptions) {
     this.sessionId = options.sessionId;
@@ -251,12 +259,13 @@ export class MidRunCompactionController {
       checkpointAbortRequested: this.checkpointAbortRequested,
       queuedInputs: this.queue.length,
       admission: this.phase === "exhausted"
-        ? "recoverable-rejection"
+        ? this.terminalFailure === "restoration-paused" ? "closed" : "recoverable-rejection"
         : this.phase === "cancelled"
           ? "closed"
           : this.phase === "idle"
             ? "open"
             : "checkpoint-only",
+      ...(this.terminalFailure === undefined ? {} : { failureCategory: this.terminalFailure }),
     };
   }
 
@@ -280,6 +289,7 @@ export class MidRunCompactionController {
     this.resumeContext = undefined;
     this.cancellation = undefined;
     this.compactionSummary = undefined;
+    this.terminalFailure = undefined;
     this.emit("checkpoint-armed");
     return this.generation;
   }
@@ -400,14 +410,19 @@ export class MidRunCompactionController {
 
   ordinaryInputDisposition(): OrdinaryInputDisposition {
     if (this.phase === "idle") return "accept";
-    if (this.phase === "exhausted") return "reject-recoverable";
+    if (this.phase === "exhausted") {
+      return this.terminalFailure === "restoration-paused" ? "reject-restoration" : "reject-recoverable";
+    }
     if (this.phase === "cancelled") return "reject-closed";
     return "quarantine";
   }
 
   manualCompactionDisposition(): ManualCompactionDisposition {
-    if (this.phase === "idle" || this.phase === "exhausted") return "allow";
-    if (this.phase === "cancelled") return "unavailable";
+    if (this.phase === "idle" || (this.phase === "exhausted" && this.recovery !== undefined) ||
+        (this.phase === "cancelled" && this.cancellation?.kind === "user" && this.recovery !== undefined)) {
+      return "allow";
+    }
+    if (this.phase === "cancelled" || this.phase === "exhausted") return "unavailable";
     return "already-active";
   }
 
@@ -457,18 +472,24 @@ export class MidRunCompactionController {
     this.runAbort.abort(kind);
     this.queueChanged.resolve();
     this.startCancelAndJoin(generation);
-    this.emit("checkpoint-cancelled", generation);
+    this.emit("checkpoint-cancelled", generation, undefined, {
+      action: kind === "user" ? "manual-recovery" : "new-session",
+    });
     if (this.stable) this.scheduleCancellationFinish(generation, this.stable);
     return this.cancellation.outcome.promise;
   }
 
   recoveryToken(generation: number): RecoveryToken | undefined {
-    return generation === this.generation && this.phase === "exhausted" ? this.recovery : undefined;
+    const recoverable = this.phase === "exhausted" ||
+      (this.phase === "cancelled" && this.cancellation?.kind === "user");
+    return generation === this.generation && recoverable ? this.recovery : undefined;
   }
 
-  /** Recovery rejects retained input explicitly and never revives the exhausted continuation. */
+  /** Recovery rejects retained input explicitly and never revives the old continuation. */
   recoverAfterManualCompaction(token: RecoveryToken): { recovered: boolean; rejected: readonly QueuedInputShadow[] } {
-    if (this.phase !== "exhausted" || token !== this.recovery || token.generation !== this.generation) {
+    const recoverable = this.phase === "exhausted" ||
+      (this.phase === "cancelled" && this.cancellation?.kind === "user");
+    if (!recoverable || token !== this.recovery || token.generation !== this.generation) {
       return { recovered: false, rejected: [] };
     }
     const rejected = this.queue.splice(0);
@@ -549,7 +570,9 @@ export class MidRunCompactionController {
       if (!this.isCurrent(generation)) return;
       if (result.ok) {
         this.phase = "awaiting-settlement";
-        this.emit("checkpoint-complete", generation, attempt);
+        this.emit("checkpoint-complete", generation, attempt, {
+          action: this.fallback ? "settled-fallback" : "resume",
+        });
         await this.resumeOrFinish(generation);
         return;
       }
@@ -557,7 +580,7 @@ export class MidRunCompactionController {
         if (result.category === "cancelled" || result.category === "shutdown") {
           void this.cancel(generation, result.category === "shutdown" ? "shutdown" : "user");
         } else {
-          this.exhaust(generation);
+          this.exhaust(generation, result.category);
         }
         return;
       }
@@ -644,6 +667,15 @@ export class MidRunCompactionController {
         }
       }
       if (!this.isCurrent(generation)) break;
+      if (ownership.replayComplete) {
+        try {
+          await ownership.replayComplete(context);
+        } catch {
+          if (!this.isCancelled()) this.exhaust(generation);
+          return;
+        }
+      }
+      if (!this.isCurrent(generation)) return;
       if (settled) {
         this.finishGeneration();
         return;
@@ -674,15 +706,19 @@ export class MidRunCompactionController {
     generationBarrier?.resolve();
   }
 
-  private exhaust(generation: number): void {
+  private exhaust(generation: number, failureCategory: CompactionFailureCategory = "operational"): void {
     if (!this.isCurrent(generation)) return;
     const generationBarrier = this.stable;
     this.phase = "exhausted";
     this.checkpointAbortRequested = false;
     this.compactionSummary = undefined;
-    this.recovery = { generation, token: {} };
+    this.terminalFailure = failureCategory;
+    this.recovery = failureCategory === "restoration-paused" ? undefined : { generation, token: {} };
     generationBarrier?.resolve();
-    this.emit("checkpoint-exhausted", generation, this.attempt);
+    this.emit("checkpoint-exhausted", generation, this.attempt, {
+      action: failureCategory === "restoration-paused" ? "repair-restoration" : "manual-recovery",
+      failureCategory,
+    });
   }
 
   private startCancelAndJoin(generation: number): void {
@@ -720,6 +756,7 @@ export class MidRunCompactionController {
       return;
     }
     const rejected = this.queue.splice(0);
+    if (cancellation.kind === "user") this.recovery = { generation, token: {} };
     generationBarrier.resolve();
     cancellation.outcome.resolve({ cancelled: true, rejected });
   }
@@ -732,9 +769,14 @@ export class MidRunCompactionController {
     return this.phase === "cancelled";
   }
 
-  private emit(category: CheckpointDiagnosticCategory, generation = this.generation, attempt?: number): void {
+  private emit(
+    category: CheckpointDiagnosticCategory,
+    generation = this.generation,
+    attempt?: number,
+    details: Pick<CheckpointProgress, "action" | "failureCategory"> = {},
+  ): void {
     try {
-      this.options.progress?.({ category, generation, ...(attempt === undefined ? {} : { attempt }) });
+      this.options.progress?.({ category, generation, ...(attempt === undefined ? {} : { attempt }), ...details });
     } catch {
       // Observers cannot own checkpoint transitions or barriers.
     }
@@ -771,7 +813,7 @@ export interface MainSessionCheckpointExecutionAdapter {
   progress?(event: CheckpointProgress): void;
 }
 
-/** Stable mutable seam through which later wiring supplies session execution behavior. */
+/** Stable mutable seam through which main-session lifecycle wiring supplies execution behavior. */
 export class MainSessionCheckpointExecutionBridge {
   private adapter: MainSessionCheckpointExecutionAdapter | undefined;
 
@@ -887,6 +929,7 @@ export class MainSessionCheckpointGate {
   private ambiguousInput = false;
   private sessionEpoch: object = {};
   private transition: Promise<void> = Promise.resolve();
+  private resumeBarrier: { generation: number; promise: Promise<void> } | undefined;
 
   constructor(
     private readonly execution: MainSessionCheckpointExecutionBridge,
@@ -901,10 +944,13 @@ export class MainSessionCheckpointGate {
   }
 
   async beforeSessionSwitch(): Promise<{ cancel: true } | undefined> {
-    // Pi swallows lifecycle-handler throws, so revoke replay authority synchronously
-    // and report cancellation explicitly if the old generation cannot join.
-    this.sessionEpoch = {};
-    const operation = this.transition.then(() => this.cancelCurrent("replacement"));
+    // Pi swallows lifecycle-handler throws, so report cancellation explicitly if
+    // the old generation cannot join. The controller must cancel before replay
+    // authority is revoked so its abort-before-join ordering remains observable.
+    const operation = this.transition.then(async () => {
+      await this.cancelCurrent("replacement");
+      this.sessionEpoch = {};
+    });
     this.transition = operation.catch(() => undefined);
     try {
       await operation;
@@ -982,10 +1028,54 @@ export class MainSessionCheckpointGate {
     return disposition;
   }
 
-  defensiveLatch(ctx: MainGateContext): void {
-    if (this.generation === undefined || this.controller.isCompactionSummaryActive(this.generation)) return;
-    if (this.controller.snapshot().phase === "idle") return;
+  async defensiveLatch(ctx: MainGateContext): Promise<void> {
+    const generation = this.generation;
+    if (generation === undefined || this.controller.isCompactionSummaryActive(generation)) return;
+    const snapshot = this.controller.snapshot();
+    if (snapshot.phase === "idle") return;
+    const barrier = this.resumeBarrier;
+    if (snapshot.phase === "resuming" && barrier?.generation === generation) {
+      try {
+        await barrier.promise;
+      } catch {
+        this.abortAfterBatch(ctx);
+      }
+      return;
+    }
     this.abortAfterBatch(ctx);
+  }
+
+  installResumeBarrier(generation: number, barrier: Promise<void>): boolean {
+    if (generation !== this.generation || this.controller.snapshot().phase !== "resuming") return false;
+    this.resumeBarrier = { generation, promise: barrier };
+    return true;
+  }
+
+  settlementGeneration(ctx: MainGateContext): number | undefined {
+    this.resetCompletedGeneration();
+    if (this.generation !== undefined) {
+      return this.controller.snapshot().phase === "awaiting-settlement" ? this.generation : undefined;
+    }
+    let usage: ContextUsageShape | undefined;
+    try {
+      usage = ctx.getContextUsage?.();
+    } catch {
+      usage = undefined;
+    }
+    const generation = this.controller.sample(usage, "settled");
+    if (generation !== undefined) this.generation = generation;
+    return generation;
+  }
+
+  ordinaryInputDisposition(): OrdinaryInputDisposition {
+    return this.controller.ordinaryInputDisposition();
+  }
+
+  async cancel(kind: CancellationKind): Promise<CancellationOutcome> {
+    const snapshot = this.controller.snapshot();
+    return snapshot.phase === "idle"
+      ? { cancelled: false, rejected: [] }
+      : this.controller.cancel(snapshot.generation, kind);
   }
 
   isActive(): boolean {
@@ -1017,7 +1107,9 @@ export class MainSessionCheckpointGate {
     streamingBehavior?: unknown;
   }): QueuedInputShadow | undefined {
     const authorization = replayAuthorization.getStore();
+    const phase = this.controller.snapshot().phase;
     if (!authorization || authorization.used || authorization.gate !== this.sessionEpoch ||
+        phase === "cancelled" || phase === "exhausted" ||
         authorization.sessionId !== this.controller.sessionId || authorization.generation !== this.generation ||
         event.source !== authorization.source || event.streamingBehavior !== authorization.mode ||
         canonical(acceptedContent(String(event.text ?? ""), event.images)) !== authorization.canonical ||
@@ -1032,15 +1124,17 @@ export class MainSessionCheckpointGate {
     images: readonly unknown[] | undefined,
     delivery: QueueDeliveryMode | undefined,
   ): QueuedInputShadow | undefined {
-    if (!delivery || !GUARDED_OPENAI_APIS.has(ctx.model?.api ?? "")) return undefined;
+    if (!GUARDED_OPENAI_APIS.has(ctx.model?.api ?? "")) return undefined;
     const content = acceptedContent(text, images);
-    const expected = { content, canonical: canonical(content), delivery };
     this.arm(ctx);
+    const effectiveDelivery = delivery ?? (this.generation === undefined ? undefined : "followUp");
+    if (!effectiveDelivery) return undefined;
+    const expected = { content, canonical: canonical(content), delivery: effectiveDelivery };
     if (this.generation === undefined) {
       this.acceptedBeforeArm.push(expected);
       return undefined;
     }
-    return this.controller.shadowInput(this.generation, content, delivery);
+    return this.controller.shadowInput(this.generation, content, effectiveDelivery);
   }
 
   userMessageStarted(message: unknown, delivery?: QueueDeliveryMode): QueuedInputShadow | undefined {
@@ -1116,6 +1210,7 @@ export class MainSessionCheckpointGate {
     this.handle = undefined;
     this.abortIssued = undefined;
     this.ambiguousInput = false;
+    this.resumeBarrier = undefined;
   }
 
   private invalidate(): void {
@@ -1159,6 +1254,7 @@ export class MainSessionCheckpointGate {
     this.acceptedBeforeArm = [];
     this.ambiguousInput = false;
     this.sessionEpoch = {};
+    this.resumeBarrier = undefined;
   }
 }
 
@@ -1182,17 +1278,18 @@ export function callbackCompactionAttempt(
     const finish = (candidate: CompactionCallbackToken, result: CompactionAttemptResult): void => {
       if (settled || candidate !== token || candidate.generation !== generation) return;
       settled = true;
-      resolve(result);
+      resolve(signal.aborted ? { ok: false, category: "cancelled" } : result);
     };
+    // Once host compaction starts, cancellation requests host abort but still joins
+    // the real callback; that callback follows Pi's committed hook/restoration work.
     if (signal.aborted) {
       finish(token, { ok: false, category: "cancelled" });
       return;
     }
-    signal.addEventListener("abort", () => finish(token, { ok: false, category: "cancelled" }), { once: true });
     try {
       start(token, finish);
     } catch {
-      finish(token, { ok: false, category: "operational" });
+      finish(token, { ok: false, category: signal.aborted ? "cancelled" : "operational" });
     }
   });
 }

@@ -7,13 +7,6 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HookOutcome, HookPayload, ToolCallDescriptor } from "./types.js";
 import { findByName, loadClaudeProject, type LoadedProject } from "./project.js";
 import { loadPiCCConfig, mapEffort, steeringForModel } from "./runtime/steering.js";
-import {
-  decideProactiveCompaction,
-  initialPendingState,
-  pendingStateAfterCompaction,
-  type ContextUsageShape,
-  type ProactivePendingState,
-} from "./runtime/proactive-compaction.js";
 import { CwdState } from "./runtime/cwd-state.js";
 import { HookRunner } from "./engine/hook-runner.js";
 import { PermissionEngine } from "./engine/permissions.js";
@@ -48,6 +41,7 @@ import {
 } from "./runtime/context-assembly.js";
 import {
   budgetSkillReinjection,
+  recordResidentSkill,
   renderSkillForActivation,
   skillActivationMessage,
   skillActivationVars,
@@ -73,6 +67,11 @@ import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-t
 import {
   MainSessionCheckpointExecutionBridge,
   MainSessionCheckpointGate,
+  callbackCompactionAttempt,
+  type CheckpointProgress,
+  type MidRunCompactionController,
+  type CompactionSummaryToken,
+  type ResumeToken,
 } from "./runtime/mid-run-compaction.js";
 import { codexAbortGuardStreamSimple } from "./runtime/codex-abort-guard.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
@@ -376,16 +375,35 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   let currentModel: unknown; // the orchestrator's active model — inherited by subagents
   let steeringText: string | undefined;
   let stopHookIterations = 0;
-  // Anti-thrash state for proactive early compaction: set when a compaction has been
-  // requested at a turn boundary, reset on `session_compact` success (which also opens the
-  // cooldown window) OR by the bounded turn-count fallback inside decideProactiveCompaction
-  // (compaction failure fires no event).
-  let proactivePending: ProactivePendingState = initialPendingState();
-  // One-shot marker: a PiCC-initiated proactive `ctx.compact()` reaches Pi as reason:"manual",
-  // but to hooks it is an AUTOMATIC compaction. Set right before ctx.compact(), consumed by the
-  // very next session_before_compact to present PreCompact as trigger:"auto" (Claude fidelity:
-  // manual is reserved for a user /compact).
-  let proactiveCompactInFlight = false;
+  let checkpointContext: any;
+  let checkpointSessionEpoch: object = {};
+  interface CompactionLifecycleOperation {
+    identity: object;
+    epoch: object;
+    controller: MidRunCompactionController;
+    generation: number;
+    proactive: boolean;
+    trigger: "auto" | "manual";
+    recovery?: import("./runtime/mid-run-compaction.js").RecoveryToken;
+  }
+  let activeCompactionOperation: CompactionLifecycleOperation | undefined;
+  let checkpointAttempt: {
+    epoch: object;
+    controller: MidRunCompactionController;
+    generation: number;
+    summary: CompactionSummaryToken;
+    hookBlocked: boolean;
+    operation?: object;
+    restorationFailed: boolean;
+  } | undefined;
+  let activeMainResume: {
+    generation: number;
+    token: ResumeToken;
+    epoch: object;
+    context: any;
+    settled: Promise<void>;
+    resolveSettled(): void;
+  } | undefined;
   const quotaHeaders: Record<string, string> = {};
 
   const hookRunnerFacade = {
@@ -437,8 +455,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   /** Skills whose scoped hooks are already registered (re-activation must not stack duplicates). */
   const scopedHookSkills = new Set<string>();
-  /** Active skills' disallowed-tools, enforced by the guard while the skill is resident. */
-  const activeSkillDenyRules = new Set<string>();
+  /** Active skills' current disallowed-tools, keyed so reactivation replaces expired effects. */
+  const activeSkillDenyRules = new Map<string, string[]>();
 
   async function activateSkill(
     skill: ClaudeSkill,
@@ -485,12 +503,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // context:fork bodies go to the FORK only — keeping them resident in the
     // parent would defeat the fork's token-efficiency purpose.
     if (record && !opts.fork) {
-      state.activeSkills.set(skill.name, rendered.text);
-      // Use the per-activation substituted copies (${CLAUDE_*}/$ARGUMENTS) so
-      // deny rules like Bash(${CLAUDE_SKILL_DIR}/*) gate the real path.
-      for (const rule of rendered.disallowedTools ?? skill.disallowedTools ?? []) {
-        activeSkillDenyRules.add(rule);
-      }
+      recordResidentSkill(state.activeSkills, skill.name, rendered.text);
+      // Use the current activation's substituted copies so argument/path effects
+      // survive this logical turn without reviving an older activation's rules.
+      activeSkillDenyRules.set(
+        skill.name,
+        [...(rendered.disallowedTools ?? skill.disallowedTools ?? [])],
+      );
     }
     return rendered.text;
   }
@@ -917,6 +936,238 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     ...(testSeam?.sdk ? { sdk: testSeam.sdk } : {}),
   });
 
+  const checkpointText = (event: CheckpointProgress): string => {
+    switch (event.category) {
+      case "checkpoint-armed": return "Pausing for proactive context compaction.";
+      case "checkpoint-retrying": return `Context compaction failed; retrying (attempt ${Math.min((event.attempt ?? 1) + 1, 3)} of 3).`;
+      case "checkpoint-complete": return event.action === "settled-fallback"
+        ? "Context compaction completed."
+        : "Context compacted; reconnecting the paused work.";
+      case "checkpoint-exhausted": return event.failureCategory === "hook-blocked"
+        ? "Automatic context compaction was blocked by a PreCompact hook. Work is paused and no continuation ran. Run /compact, then explicitly continue."
+        : event.failureCategory === "restoration-paused"
+          ? "Context was compacted, but mandatory context restoration could not be queued. Work is paused and no continuation ran. Do not compact the committed summary again; repair delivery or start a new session."
+          : "Automatic context compaction could not complete. Work is paused and no continuation ran. Run /compact, then explicitly continue.";
+      case "checkpoint-cancelled": return event.action === "new-session"
+        ? "Proactive context compaction stopped with the old session; resend input in the new session."
+        : "Proactive context compaction was cancelled. Run /compact to recover this session, or start a new session.";
+      case "checkpoint-recovered": return "Manual compaction recovered the paused session; explicitly continue when ready.";
+    }
+  };
+
+  const appendCheckpointEntry = (data: Record<string, unknown>): void => {
+    try { pi.appendEntry("picc-checkpoint-lifecycle", data); } catch { /* presentation only */ }
+  };
+
+  const reportRejectedShadows = (rejected: readonly import("./runtime/mid-run-compaction.js").QueuedInputShadow[], ctx: any): void => {
+    if (rejected.length === 0) return;
+    const representable: string[] = [];
+    let unrepresentable = 0;
+    for (const shadow of rejected) {
+      if (typeof shadow.content === "string") {
+        representable.push(shadow.content);
+        continue;
+      }
+      const text = shadow.content
+        .filter((part) => part && typeof part === "object" &&
+          (part as { type?: unknown }).type === "text" &&
+          typeof (part as { text?: unknown }).text === "string")
+        .map((part) => (part as { text: string }).text)
+        .join("");
+      if (text) representable.push(text);
+      if (shadow.content.some((part) => !part || typeof part !== "object" ||
+          (part as { type?: unknown }).type !== "text")) unrepresentable += 1;
+    }
+    let restoredTextCount = 0;
+    let guidance = `${rejected.length} queued input${rejected.length === 1 ? " was" : "s were"} not replayed. Resend ${representable.length} text input${representable.length === 1 ? "" : "s"}${unrepresentable ? ` and ${unrepresentable} image/unrepresentable input${unrepresentable === 1 ? "" : "s"}` : ""}.`;
+    if (ctx?.mode === "tui") {
+      try {
+        if (representable.length && typeof ctx.ui?.setEditorText === "function") {
+          const draft = String(ctx.ui?.getEditorText?.() ?? "");
+          ctx.ui.setEditorText(`${representable.join("\n")}\n${draft}`);
+          restoredTextCount = representable.length;
+        }
+        guidance = `${rejected.length} queued input${rejected.length === 1 ? " was" : "s were"} not replayed; ${restoredTextCount} text input${restoredTextCount === 1 ? " was" : "s were"} restored${representable.length > restoredTextCount || unrepresentable ? "; remaining input must be resent" : ""}.`;
+        ctx.ui?.notify?.(guidance, representable.length > restoredTextCount || unrepresentable ? "warning" : "info");
+      } catch {
+        restoredTextCount = 0;
+        guidance = `${rejected.length} queued input${rejected.length === 1 ? " was" : "s were"} not replayed. Resend ${representable.length} text input${representable.length === 1 ? "" : "s"}${unrepresentable ? ` and ${unrepresentable} image/unrepresentable input${unrepresentable === 1 ? "" : "s"}` : ""}.`;
+      }
+    } else if (ctx?.mode === "print") {
+      console.error(`PiCC: ${guidance}`);
+    }
+    appendCheckpointEntry({
+      category: "checkpoint-input-recovery",
+      count: rejected.length,
+      restoredTextCount,
+      unrepresentableCount: unrepresentable,
+      action: representable.length > restoredTextCount || unrepresentable ? "resend-input" : "review-restored-text",
+      notice: guidance,
+    });
+  };
+
+  const publishCheckpoint = (event: CheckpointProgress, ctx = checkpointContext): void => {
+    const text = checkpointText(event);
+    const mode = ctx?.mode;
+    if (mode === "tui") {
+      try {
+        ctx.ui?.setStatus?.("picc-checkpoint", event.category === "checkpoint-recovered" ? undefined : text);
+        if (event.category === "checkpoint-exhausted") ctx.ui?.notify?.(text, "error");
+        if (event.category === "checkpoint-recovered") ctx.ui?.notify?.(text, "info");
+      } catch {
+        // Presentation cannot own checkpoint state.
+      }
+    } else if (mode === "print") {
+      console.error(`PiCC: ${text}`);
+    }
+    if (mode === "json" || mode === "rpc" || event.category === "checkpoint-exhausted") {
+      appendCheckpointEntry({
+        category: event.category,
+        generation: event.generation,
+        notice: text,
+        ...(event.attempt === undefined ? {} : { attempt: event.attempt }),
+        ...(event.action === undefined ? {} : { action: event.action }),
+        ...(event.failureCategory === undefined ? {} : { failureCategory: event.failureCategory }),
+        ...(event.category === "checkpoint-exhausted" ? {
+          recovery: event.failureCategory === "restoration-paused"
+            ? "repair restoration delivery or start a new session; do not compact the committed summary again"
+            : "/compact, then explicitly continue",
+        } : {}),
+      });
+    }
+    if (event.category === "checkpoint-cancelled") {
+      const controller = mainCheckpointGate.currentController();
+      void controller.cancel(event.generation, event.action === "new-session" ? "replacement" : "user")
+        .then((outcome) => reportRejectedShadows(outcome.rejected, ctx))
+        .catch(() => undefined);
+    }
+  };
+
+  const detachCheckpointExecution = checkpointExecution.attach({
+    manualCompaction: { kind: "unavailable" },
+    progress: publishCheckpoint,
+    compact: async (_attempt, signal) => {
+      const ctx = checkpointContext;
+      const epoch = checkpointSessionEpoch;
+      const controller = mainCheckpointGate.currentController();
+      const generation = controller.snapshot().generation;
+      const summary = checkpointExecution.beginCompactionSummary(controller, generation);
+      if (!summary || typeof ctx?.compact !== "function") {
+        return { ok: false, category: "operational" };
+      }
+      const attempt = {
+        epoch,
+        controller,
+        generation,
+        summary,
+        hookBlocked: false,
+        operation: undefined as object | undefined,
+        restorationFailed: false,
+      };
+      checkpointAttempt = attempt;
+      const abortHost = () => {
+        try { ctx.abort?.(); } catch { /* controller cancellation remains authoritative */ }
+      };
+      signal.addEventListener("abort", abortHost, { once: true });
+      try {
+        return await callbackCompactionAttempt(generation, (_token, complete) => {
+          ctx.compact({
+            onComplete: () => complete(_token, attempt.restorationFailed
+              ? { ok: false, category: "restoration-paused" }
+              : epoch !== checkpointSessionEpoch || controller !== mainCheckpointGate.currentController()
+                ? { ok: false, category: "stale-generation" }
+                : { ok: true }),
+            onError: (error: unknown) => {
+              let hostCancelled = false;
+              try {
+                hostCancelled = error instanceof Error &&
+                  (error.name === "AbortError" || error.message === "Compaction cancelled");
+              } catch { /* hostile error objects classify as operational */ }
+              // A failed physical attempt has no session_compact event to release
+              // its lifecycle identity. Release only this attempt's identity so a
+              // bounded retry can enter without weakening another in-flight compact.
+              if (activeCompactionOperation?.identity === attempt.operation) {
+                activeCompactionOperation = undefined;
+              }
+              complete(_token, {
+                ok: false,
+                category: checkpointAttempt === attempt && attempt.hookBlocked
+                  ? "hook-blocked"
+                  : signal.aborted || epoch !== checkpointSessionEpoch || hostCancelled
+                    ? "cancelled"
+                    : "operational",
+              });
+            },
+          });
+        }, signal);
+      } finally {
+        signal.removeEventListener("abort", abortHost);
+        checkpointExecution.endCompactionSummary(controller, summary);
+        if (checkpointAttempt === attempt) checkpointAttempt = undefined;
+      }
+    },
+    resume: (resumeContext) => {
+      const ctx = checkpointContext;
+      let openProvider!: () => void;
+      let rejectProvider!: (reason?: unknown) => void;
+      // The hidden continuation starts the run, but queued steering must be
+      // installed before its first provider request or it lands one turn late.
+      const providerBarrier = new Promise<void>((resolve, reject) => {
+        openProvider = resolve;
+        rejectProvider = reject;
+      });
+      void providerBarrier.catch(() => undefined);
+      if (!mainCheckpointGate.installResumeBarrier(resumeContext.generation, providerBarrier)) {
+        throw new Error("Cannot install the resumed provider barrier");
+      }
+      let resolveSettled!: () => void;
+      const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+      activeMainResume = {
+        generation: resumeContext.generation,
+        token: resumeContext.token,
+        epoch: checkpointSessionEpoch,
+        context: ctx,
+        settled,
+        resolveSettled,
+      };
+      pi.sendMessage(
+        {
+          customType: "picc-checkpoint-continuation",
+          content: "Continue the paused work.",
+          display: false,
+        },
+        { triggerTurn: true },
+      );
+      return {
+        replay: (input: any) => {
+          mainCheckpointGate.withReplayAuthorization(input, () => {
+            pi.sendUserMessage(input.content as any, { deliverAs: input.delivery });
+          });
+          return { delivered: true } as const;
+        },
+        replayComplete: () => {
+          openProvider();
+          const text = "Context compacted; resumed the paused work.";
+          if (ctx?.mode === "tui") ctx.ui?.setStatus?.("picc-checkpoint", text);
+          else if (ctx?.mode === "print") console.error(`PiCC: ${text}`);
+          else if (ctx?.mode === "json" || ctx?.mode === "rpc") {
+            appendCheckpointEntry({
+              category: "checkpoint-resumed",
+              generation: resumeContext.generation,
+              notice: text,
+            });
+          }
+        },
+        cancelAndJoin: async () => {
+          rejectProvider(new Error("checkpoint cancelled"));
+          try { ctx?.abort?.(); } catch { /* join below remains authoritative */ }
+          await settled;
+        },
+      };
+    },
+  });
+  void detachCheckpointExecution;
+
   // TEST-ONLY seam: hand the real in-process registries AND the runtime to a
   // test that drives the settlement-notice delivery path (or the dispatcher-owner
   // threading) through an offline dispatch (fake SDK injected via
@@ -1190,7 +1441,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     getCwd,
     contextForTouchedFile: injectForFile,
     // Active skills' disallowed-tools: enforced while the skill is resident.
-    extraDenyRules: () => [...activeSkillDenyRules],
+    extraDenyRules: () => [...activeSkillDenyRules.values()].flat(),
     // Backstop: clip a single oversized tool result before it enters context.
     clipMaxTokens: config.compaction.clipMaxTokens,
   })(pi);
@@ -1304,11 +1555,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Session lifecycle
   // ---------------------------------------------------------------------------
   pi.on("session_before_switch", async () => {
-    return mainCheckpointGate.beforeSessionSwitch();
+    // The controller cancels first; the old nested agent_settled or host callback
+    // is the only authority that can confirm the logical run has joined.
+    const result = await mainCheckpointGate.beforeSessionSwitch();
+    if (!result?.cancel) {
+      // Invalidate lifecycle authority at switch acceptance, not only at the next
+      // session_start, so an old manual completion in that gap is inert.
+      checkpointSessionEpoch = {};
+      activeCompactionOperation = undefined;
+    }
+    return result;
   });
 
   pi.on("session_start", async (event: any, ctx: any) => {
     await mainCheckpointGate.startSession(randomUUID());
+    checkpointContext = ctx;
+    checkpointSessionEpoch = {};
+    activeCompactionOperation = undefined;
+    stopHookIterations = 0;
     try {
       modelRegistryRef = ctx.modelRegistry;
       sessionManagerRef = ctx.sessionManager;
@@ -1389,19 +1653,22 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("turn_end", (_event: any, ctx: any) => {
+    checkpointContext = ctx;
     mainCheckpointGate.turnEnded(ctx);
   });
 
-  pi.on("turn_start", (_event: any, ctx: any) => {
-    mainCheckpointGate.defensiveLatch(ctx);
+  pi.on("turn_start", async (_event: any, ctx: any) => {
+    await mainCheckpointGate.defensiveLatch(ctx);
   });
 
-  pi.on("before_provider_request", (_event: any, ctx: any) => {
-    mainCheckpointGate.defensiveLatch(ctx);
+  pi.on("before_provider_request", async (_event: any, ctx: any) => {
+    await mainCheckpointGate.defensiveLatch(ctx);
   });
 
   pi.on("session_shutdown", async (event: any) => {
     try {
+      // Cancellation owns abort-before-join; never manufacture nested settlement.
+      await mainCheckpointGate.cancel("shutdown");
       // `reason` is the matcher subject for SessionEnd (Claude wire contract).
       await hooks.fire("SessionEnd", { cwd: cwdState.get(), reason: event?.reason ?? "other" });
     } catch {
@@ -1412,7 +1679,47 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   pi.on("input", async (event: any, ctx: any) => {
     try {
       if (mainCheckpointGate.authorizeReplay(event)) return { action: "continue" };
-      if (event.source === "extension") return { action: "continue" };
+      const inputDisposition = mainCheckpointGate.ordinaryInputDisposition();
+      if (inputDisposition === "reject-recoverable" || inputDisposition === "reject-restoration" ||
+          inputDisposition === "reject-closed") {
+        const text = inputDisposition === "reject-recoverable"
+          ? "Work remains paused. Run /compact, then explicitly continue."
+          : inputDisposition === "reject-restoration"
+            ? "The compacted summary is committed, but context restoration failed. Do not compact it again; repair delivery or start a new session."
+            : "The prior checkpoint was cancelled. Run /compact to recover this session, or start a new session.";
+        try {
+          if (ctx.mode === "print") console.error(`PiCC: ${text}`);
+          else if (ctx.mode === "tui") ctx.ui?.notify?.(text, "warning");
+        } catch { /* admission was already decided */ }
+        const controller = mainCheckpointGate.currentController();
+        const content = Array.isArray(event.images) && event.images.length > 0
+          ? [{ type: "text", text: String(event.text ?? "") }, ...event.images]
+          : String(event.text ?? "");
+        reportRejectedShadows([{
+          id: -1,
+          generation: controller.snapshot().generation,
+          sessionId: controller.sessionId,
+          content,
+          delivery: event.streamingBehavior === "steer" ? "steer" : "followUp",
+        }], ctx);
+        return { action: "handled" };
+      }
+      if (event.source === "extension") {
+        if (inputDisposition === "quarantine") {
+          const controller = mainCheckpointGate.currentController();
+          const images = Array.isArray(event.images) ? event.images : [];
+          reportRejectedShadows([{
+            id: 0,
+            generation: controller.snapshot().generation,
+            sessionId: controller.sessionId,
+            content: images.length > 0
+              ? [{ type: "text", text: String(event.text ?? "") }, ...images]
+              : String(event.text ?? ""),
+            delivery: event.streamingBehavior === "steer" ? "steer" : "followUp",
+          }], ctx);
+        }
+        return inputDisposition === "accept" ? { action: "continue" } : { action: "handled" };
+      }
 
       // Every transforming path below rewrites the turn text, but Pi may have
       // already captured images the user pasted or dropped onto this input
@@ -1431,11 +1738,29 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         if (captured.length === 0) return result;
         return { ...result, images: [...(result.images ?? []), ...captured] };
       };
-      const accept = <T extends { action: "continue" } | TransformResult>(result: T): T => {
+      const accept = <T extends { action: "continue" } | TransformResult>(result: T): T | { action: "handled" } => {
         const text = result.action === "transform" ? result.text : String(event.text ?? "");
         const images = result.action === "transform" ? result.images : event.images;
-        mainCheckpointGate.captureAcceptedInput(ctx, text, images, event.streamingBehavior);
-        return result;
+        const shadow = mainCheckpointGate.captureAcceptedInput(ctx, text, images, event.streamingBehavior);
+        // Quarantine is an admission decision, not a consequence of successful
+        // shadow capture. A settled fallback cannot queue input, but it still must
+        // retain/report it rather than allowing provider work.
+        if (inputDisposition === "quarantine" && !shadow) {
+          const content = Array.isArray(images) && images.length > 0
+            ? [{ type: "text", text }, ...images]
+            : text;
+          const controller = mainCheckpointGate.currentController();
+          reportRejectedShadows([{
+            id: 0,
+            generation: controller.snapshot().generation,
+            sessionId: controller.sessionId,
+            content,
+            delivery: event.streamingBehavior === "steer" ? "steer" : "followUp",
+          }], ctx);
+        }
+        // Any quarantined input is handled even when shadow capture is unavailable;
+        // otherwise it could start a second turn before or during compaction.
+        return shadow || inputDisposition === "quarantine" ? { action: "handled" } : result;
       };
 
       // 0) PiCC control commands (/doctor /compat /quota /skills /agents /usage).
@@ -1459,9 +1784,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         cwd: cwdState.get(),
       });
       if (outcome.block) {
-        if (ctx.hasUI) ctx.ui.notify(`Prompt blocked by hook: ${outcome.blockReason ?? ""}`, "warning");
+        try {
+          if (ctx.hasUI) ctx.ui.notify(`Prompt blocked by hook: ${outcome.blockReason ?? ""}`, "warning");
+        } catch { /* hook admission remains blocked */ }
         return { action: "handled" };
       }
+      // Activation-scoped effects belong to one logical user turn. Only a new,
+      // accepted human input expires them; replay and synthetic continuations
+      // returned above must preserve the effects across physical turns.
+      activeSkillDenyRules.clear();
       const extra = [outcome.stdout, outcome.additionalContext].filter(Boolean).join("\n").trim();
       const hookSuffix = extra ? `\n\n<hook-context>\n${extra}\n</hook-context>` : "";
 
@@ -1576,139 +1907,198 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       return accept({ action: "continue" });
     } catch (err) {
       debug(`input handler error: ${(err as Error).message}`);
-      return { action: "continue" };
+      // Once a checkpoint has closed admission, capture/hook/pipeline failures
+      // cannot reopen transport by falling through to Pi. If quarantine could not
+      // reach the normal capture path, preserve/report the raw input here.
+      const disposition = mainCheckpointGate.ordinaryInputDisposition();
+      if (disposition === "quarantine") {
+        const controller = mainCheckpointGate.currentController();
+        const images = Array.isArray(event.images) ? event.images : [];
+        reportRejectedShadows([{
+          id: 0,
+          generation: controller.snapshot().generation,
+          sessionId: controller.sessionId,
+          content: images.length > 0
+            ? [{ type: "text", text: String(event.text ?? "") }, ...images]
+            : String(event.text ?? ""),
+          delivery: event.streamingBehavior === "steer" ? "steer" : "followUp",
+        }], ctx);
+      }
+      return disposition === "accept" ? { action: "continue" } : { action: "handled" };
     }
   });
 
-  pi.on("agent_settled", async (_event: any, ctx: any) => {
-    // Proactive early compaction: at this settled turn boundary (nothing in-flight, so
-    // ctx.compact()'s abort is benign), compact via Pi's own authed transport once usage
-    // crosses the configured percent of the window — the extension-side substitute for a
-    // larger reserveTokens, and the primary resilience lever. Degrade, never throw:
-    // getContextUsage() may be undefined and percent/tokens may be null.
+  const runStopHook = async (ctx: any): Promise<boolean> => {
     try {
-      // The one-shot trigger must not classify a later user /compact as automatic.
-      proactiveCompactInFlight = false;
-      let usage: ContextUsageShape | undefined;
-      try {
-        usage = ctx?.getContextUsage?.();
-      } catch {
-        usage = undefined;
-      }
-      const threshold = config.compaction.proactiveCompactPercent;
-      const decision = mainCheckpointGate.isActive()
-        ? { compact: false, pending: proactivePending }
-        : decideProactiveCompaction(usage, threshold, proactivePending);
-      proactivePending = decision.pending;
-      if (decision.compact) {
-        const at =
-          typeof usage?.percent === "number" ? `${Math.round(usage.percent)}%` : `${threshold}%`;
-        const notice = `PiCC: compacting context early at ${at} of the context window (threshold ${threshold}%, configurable via proactiveCompactPercent)`;
-        // Always-visible notice (NOT PICC_DEBUG-only debug()): same channel as the startup
-        // compat notice; doubles as discovery of the proactiveCompactPercent knob. Mirror the
-        // emitControlOutput pattern: notify the interactive toast, persist an entry that the
-        // registered renderer shows in the TUI transcript, and — where there is no UI (print/
-        // headless) — emit the notice to stdout so it still leaves a visible trace.
-        ctx?.ui?.notify?.(notice, "info");
-        pi.appendEntry("picc-proactive-compact", { notice });
-        if (!ctx?.hasUI) console.log(notice);
-        // Consumed by the next session_before_compact → PreCompact trigger:"auto".
-        proactiveCompactInFlight = true;
-        ctx?.compact?.();
-      }
-    } catch {
-      /* floor: proactive compaction is best-effort and must never break the turn */
-    }
-    try {
-      // Stop payload `last_assistant_message` (Claude wire contract): the
-      // settled event carries no messages, so read the session branch via ctx
-      // (best-effort — the field is simply absent when the host exposes none).
       let lastAssistantMessage: string | undefined;
       try {
-        const sm = ctx?.sessionManager;
-        const entries: any[] = sm?.getBranch?.() ?? sm?.getEntries?.() ?? [];
+        // agent_settled carries no messages, so derive Claude's
+        // last_assistant_message from Pi's active session branch.
+        // getEntries() is only the fallback for doubles without branch selection.
+        const entries: any[] = ctx?.sessionManager?.getBranch?.() ?? ctx?.sessionManager?.getEntries?.() ?? [];
         for (let i = entries.length - 1; i >= 0; i--) {
           const entry = entries[i];
           if (entry?.type !== "message" || entry.message?.role !== "assistant") continue;
           const content = entry.message.content;
-          lastAssistantMessage =
-            typeof content === "string"
-              ? content
-              : Array.isArray(content)
-                ? content
-                    .filter((c: any) => c?.type === "text")
-                    .map((c: any) => String(c.text ?? ""))
-                    .join("")
-                : undefined;
+          lastAssistantMessage = typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content.filter((part: any) => part?.type === "text").map((part: any) => String(part.text ?? "")).join("")
+              : undefined;
           break;
         }
       } catch {
-        /* best-effort field */
+        /* optional Stop payload field */
       }
       const outcome = await hooks.fire("Stop", {
         cwd: cwdState.get(),
         stop_hook_active: stopHookIterations > 0,
-        ...(lastAssistantMessage !== undefined
-          ? { last_assistant_message: lastAssistantMessage }
-          : {}),
+        ...(lastAssistantMessage === undefined ? {} : { last_assistant_message: lastAssistantMessage }),
       });
-      // Claude caps consecutive Stop-hook blocks at 8, then stops anyway.
+      // Claude caps consecutive Stop-hook blocks at 8; carry that same bound
+      // across checkpoint resume so the internal physical turn cannot reset it.
       if (outcome.block && stopHookIterations < 8) {
-        stopHookIterations++;
+        stopHookIterations += 1;
         pi.sendUserMessage(
           `[Stop hook] Continue working: ${outcome.blockReason ?? "the stop condition is not met yet"}`,
         );
-      } else {
-        stopHookIterations = 0;
+        return false;
       }
+      stopHookIterations = 0;
+      return true;
     } catch {
-      /* floor */
+      return true;
     }
+  };
+
+  pi.on("agent_settled", async (_event: any, ctx: any) => {
+    checkpointContext = ctx;
+    const controller = mainCheckpointGate.currentController();
+    const resume = activeMainResume;
+    if (resume?.generation === controller.snapshot().generation &&
+        resume.epoch === checkpointSessionEpoch && resume.context === ctx) {
+      if (controller.snapshot().phase === "cancelled") {
+        resume.resolveSettled();
+        activeMainResume = undefined;
+        return;
+      }
+      if (controller.snapshot().phase === "resuming") {
+        if (!await runStopHook(ctx)) return;
+        controller.resumedSettled(resume.token);
+        resume.resolveSettled();
+        activeMainResume = undefined;
+        if (ctx?.mode === "tui") ctx.ui?.setStatus?.("picc-checkpoint", undefined);
+        return;
+      }
+    }
+
+    const checkpointWasArmed = mainCheckpointGate.isActive();
+    const generation = mainCheckpointGate.settlementGeneration(ctx);
+    if (generation !== undefined) {
+      await controller.checkpoint(generation);
+      const phase = controller.snapshot().phase;
+      if (phase === "exhausted" || phase === "cancelled" || checkpointWasArmed) return;
+    }
+    await runStopHook(ctx);
   });
 
   pi.on("session_before_compact", async (event: any) => {
-    // A PiCC-initiated proactive compaction reaches Pi via ctx.compact(), which reports
-    // reason:"manual" here — but Claude Code fires PreCompact with trigger:"auto" for any
-    // automatic/threshold compaction and reserves "manual" for a user /compact. Consume the
-    // one-shot in-flight marker so the proactive path maps to "auto" while a genuine user
-    // /compact (marker unset) stays "manual".
-    const proactive = proactiveCompactInFlight;
-    proactiveCompactInFlight = false;
+    const epoch = checkpointSessionEpoch;
+    const controller = mainCheckpointGate.currentController();
+    const generation = controller.snapshot().generation;
+    const attempt = checkpointAttempt;
+    const proactive = controller.isCompactionSummaryActive(generation) &&
+      attempt?.epoch === epoch && attempt.controller === controller && attempt.generation === generation;
+    const replacingStaleManual = event.reason === "manual" && !proactive &&
+      activeCompactionOperation !== undefined && !activeCompactionOperation.proactive &&
+      activeCompactionOperation.epoch === epoch && activeCompactionOperation.controller === controller &&
+      activeCompactionOperation.generation === generation;
+    if ((activeCompactionOperation && !replacingStaleManual) ||
+        (!proactive && controller.manualCompactionDisposition() !== "allow")) {
+      return { cancel: true };
+    }
+    // Pi labels extension-initiated compact() as manual; controller summary
+    // authority is what maps that physical host request to Claude's auto trigger.
+    const trigger = proactive ? "auto" : event.reason === "manual" ? "manual" : "auto";
+    const operation: CompactionLifecycleOperation = {
+      identity: {}, epoch, controller, generation, proactive, trigger,
+    };
+    activeCompactionOperation = operation;
+    if (attempt && proactive) {
+      attempt.operation = operation.identity;
+    } else if (event.reason === "manual") {
+      operation.recovery = controller.recoveryToken(generation);
+    }
     try {
-      // `trigger` (manual|auto) is the matcher subject Claude documents for PreCompact.
-      await hooks.fire("PreCompact", {
-        reason: event.reason,
-        trigger: proactive ? "auto" : event.reason === "manual" ? "manual" : "auto",
+      const outcome = await hooks.fire("PreCompact", {
+        trigger,
+        custom_instructions: typeof event.customInstructions === "string" ? event.customInstructions : "",
+        cwd: cwdState.get(),
+      });
+      const stale = activeCompactionOperation !== operation || checkpointSessionEpoch !== epoch ||
+        mainCheckpointGate.currentController() !== controller;
+      if (stale || outcome.block) {
+        if (!stale && proactive && checkpointAttempt === attempt) attempt.hookBlocked = true;
+        if (activeCompactionOperation === operation) activeCompactionOperation = undefined;
+        return { cancel: true };
+      }
+    } catch {
+      if (proactive && checkpointAttempt === attempt) attempt.hookBlocked = true;
+      if (activeCompactionOperation === operation) activeCompactionOperation = undefined;
+      return { cancel: true };
+    }
+    return undefined;
+  });
+
+  pi.on("session_compact", async (event: any) => {
+    const operation = activeCompactionOperation;
+    if (!operation) return;
+    const { controller, generation, proactive, trigger, epoch } = operation;
+    const attempt = checkpointAttempt;
+    const current = operation === activeCompactionOperation && epoch === checkpointSessionEpoch &&
+      controller === mainCheckpointGate.currentController() && controller.snapshot().generation === generation &&
+      (!proactive || (attempt?.operation === operation.identity && attempt.controller === controller));
+    if (!current) {
+      if (activeCompactionOperation === operation) activeCompactionOperation = undefined;
+      return;
+    }
+
+    let restorationFailed = false;
+    try {
+      const started = await hooks.fire("SessionStart", { source: "compact", cwd: cwdState.get() });
+      if (activeCompactionOperation !== operation || epoch !== checkpointSessionEpoch ||
+          controller !== mainCheckpointGate.currentController()) return;
+      const hookContext = [started.stdout, started.additionalContext].filter(Boolean).join("\n").trim();
+      if (hookContext) {
+        // Pi's void delivery API confirms only synchronous enqueue acceptance.
+        // A synchronous throw is the complete observable failure boundary here.
+        pi.sendMessage(
+          { customType: "picc-hook-context", content: hookContext, display: true },
+          { deliverAs: "steer" },
+        );
+      }
+    } catch {
+      restorationFailed = true;
+    }
+    try {
+      await hooks.fire("PostCompact", {
+        trigger,
+        compact_summary: String(event.compactionEntry?.summary ?? ""),
         cwd: cwdState.get(),
       });
     } catch {
-      /* floor */
+      /* PostCompact cannot roll back or retry a committed summary */
     }
-    return undefined; // let Pi's compaction run; preservation happens via system prompt + below
-  });
-
-  pi.on("session_compact", async () => {
-    // Success clears the pending flag and opens the anti-thrash cooldown window.
-    proactivePending = pendingStateAfterCompaction();
     try {
-      await hooks.fire("PostCompact", { cwd: cwdState.get() });
-      // Path-scoped artifacts reload on next relevant access: compaction
-      // summarized their transcript messages away, so the once-only markers reset.
       resetInjectionState(state, project.claudeMd);
-      // Re-inject active skill bodies for mid-turn continuity. Auto-compaction
-      // happens MID-RUN and the aborted turn is retried immediately, so this must
-      // deliver before the next LLM call ("steer") — "nextTurn" would sit queued
-      // until the next user prompt.
-      // Budgeted like Claude's carryover: ~5k tokens per skill, ~25k combined,
-      // most recently activated first.
       if (state.activeSkills.size) {
         const budgeted = budgetSkillReinjection([...state.activeSkills.entries()]);
         for (const name of budgeted.dropped) {
-          debug(
-            `compaction: active skill "${name}" dropped from re-injection (combined budget exceeded)`,
-          );
+          debug(`compaction: active skill "${name}" dropped from re-injection (combined budget exceeded)`);
         }
         if (budgeted.text) {
+          // Steering is load-bearing here: restoration must enter the resumed
+          // provider request, whereas nextTurn would wait for another user prompt.
           pi.sendMessage(
             {
               customType: "picc-preserved",
@@ -1720,8 +2110,20 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         }
       }
     } catch {
-      /* floor */
+      restorationFailed = true;
     }
+    if (proactive && attempt && checkpointAttempt === attempt && attempt.operation === operation.identity) {
+      attempt.restorationFailed = restorationFailed;
+    }
+    if (!proactive && event.reason === "manual" && operation.recovery &&
+        operation.recovery === controller.recoveryToken(generation)) {
+      const recovered = controller.recoverAfterManualCompaction(operation.recovery);
+      if (recovered.recovered) {
+        publishCheckpoint({ category: "checkpoint-recovered", generation, action: "manual-recovery" }, checkpointContext);
+        reportRejectedShadows(recovered.rejected, checkpointContext);
+      }
+    }
+    if (activeCompactionOperation === operation) activeCompactionOperation = undefined;
   });
 
   pi.on("model_select", (event: any) => {
