@@ -115,6 +115,64 @@ function displayArgs(toolName: ToolName, value: unknown): Data | undefined {
   return { file_path: sanitize(args.file_path, MAX_PATH, true), edits };
 }
 
+function liveDisplayArgs(toolName: ToolName, value: unknown): Data | undefined {
+  const source = data(value);
+  if (!source) return undefined;
+  const result: Data = {};
+  const copyString = (key: string, limit: number, inline = false): boolean => {
+    if (!(key in source)) return true;
+    const field = source[key];
+    if (typeof field !== "string" || field.length > limit) return false;
+    result[key] = sanitize(field, limit, inline);
+    return true;
+  };
+  const copyNumber = (key: string): boolean => {
+    if (!(key in source)) return true;
+    const field = source[key];
+    if (typeof field !== "number" || !Number.isFinite(field)) return false;
+    result[key] = field;
+    return true;
+  };
+  const copyEdits = (key: string, oldKey: string, newKey: string): boolean => {
+    if (!(key in source)) return true;
+    const field = source[key];
+    if (!Array.isArray(field) || field.length > MAX_ARRAY) return false;
+    const edits: Data[] = [];
+    for (const value of field) {
+      const edit = data(value);
+      if (!edit) return false;
+      const safe: Data = {};
+      for (const textKey of [oldKey, newKey]) {
+        if (!(textKey in edit)) continue;
+        const text = edit[textKey];
+        if (typeof text !== "string" || text.length > MAX_TEXT) return false;
+        safe[textKey] = sanitize(text, MAX_TEXT);
+      }
+      if ("replace_all" in edit) {
+        if (typeof edit.replace_all !== "boolean") return false;
+        safe.replace_all = edit.replace_all;
+      }
+      edits.push(safe);
+    }
+    result[key] = edits;
+    return true;
+  };
+
+  if (toolName === "read") {
+    return copyString("path", MAX_PATH, true) && copyNumber("offset") && copyNumber("limit") ? result : undefined;
+  }
+  if (toolName === "write") {
+    return copyString("path", MAX_PATH, true) && copyString("content", MAX_TEXT) ? result : undefined;
+  }
+  if (toolName === "bash") {
+    return copyString("command", MAX_TEXT) && copyNumber("timeout") ? result : undefined;
+  }
+  if (toolName === "edit") {
+    return copyString("path", MAX_PATH, true) && copyEdits("edits", "oldText", "newText") ? result : undefined;
+  }
+  return copyString("file_path", MAX_PATH, true) && copyEdits("edits", "old_string", "new_string") ? result : undefined;
+}
+
 function displayContent(value: unknown): Array<Data> | undefined {
   if (!Array.isArray(value) || value.length > MAX_ARRAY) return undefined;
   const blocks: Data[] = [];
@@ -185,9 +243,15 @@ function bindingHint(): string | undefined {
   }
 }
 
-function lineCount(value: string): number {
-  const normalized = sanitize(value, MAX_TEXT).trimEnd();
-  return normalized.length === 0 ? 0 : normalized.split("\n").length;
+function fileLineCount(value: string): number {
+  const lines = sanitize(value, MAX_TEXT).split("\n");
+  while (lines.at(-1) === "") lines.pop();
+  return lines.length;
+}
+
+function bashLineCount(value: string): number {
+  const trimmed = sanitize(value, MAX_TEXT).trim();
+  return trimmed.length === 0 ? 0 : trimmed.split("\n").length;
 }
 
 function oneText(result: unknown): { text: string; details: unknown } | undefined {
@@ -213,12 +277,12 @@ function recognize(toolName: ToolName, args: Data, result: unknown, context: unk
     if (text.details !== undefined || /(?:^|\n)\[(?:Showing lines |Line \d+ is |\d+ more lines in file\.|PiCC clipped |Truncated:|First line exceeds)/u.test(text.text) ||
       text.text.startsWith("Read image file [")) return undefined;
     const offset = typeof args.offset === "number" ? args.offset : 1;
-    return { kind: "file", path: args.path as string, lines: lineCount(text.text),
+    return { kind: "file", path: args.path as string, lines: fileLineCount(text.text),
       ...((args.offset !== undefined || args.limit !== undefined) ? { range: `:${offset}${typeof args.limit === "number" ? `-${offset + args.limit - 1}` : ""}` } : {}) };
   }
   if (toolName === "write") {
     if (text.details !== undefined || text.text !== `Successfully wrote ${(args.content as string).length} bytes to ${args.path as string}`) return undefined;
-    return { kind: "file", path: args.path as string, lines: lineCount(args.content as string) };
+    return { kind: "file", path: args.path as string, lines: fileLineCount(args.content as string) };
   }
   if (toolName === "bash") {
     if (text.details !== undefined) return undefined;
@@ -229,9 +293,9 @@ function recognize(toolName: ToolName, args: Data, result: unknown, context: unk
       Number.isFinite(startedAt) && Number.isFinite(endedAt) && endedAt >= startedAt
       ? `${((endedAt - startedAt) / 1000).toFixed(1)}s`
       : undefined;
-    // Stock Bash displays an ellipsis for an empty command, so one visible command line is truthful.
-    return { kind: "bash", outputLines: text.text === "(no output)" ? 0 : lineCount(text.text),
-      commandLines: Math.max(1, lineCount(args.command as string)), ...(duration ? { duration } : {}) };
+    // Stock Bash displays an ellipsis for an empty command, so its summary retains one command line.
+    return { kind: "bash", outputLines: text.text === "(no output)" ? 0 : bashLineCount(text.text),
+      commandLines: Math.max(1, bashLineCount(args.command as string)), ...(duration ? { duration } : {}) };
   }
   const editArgs = args.edits as unknown[];
   const details = exact(text.details, ["diff", "patch", "firstChangedLine"]);
@@ -242,12 +306,12 @@ function recognize(toolName: ToolName, args: Data, result: unknown, context: unk
   }
   if (details.diff.length === 0 || !Number.isSafeInteger(details.firstChangedLine) || (details.firstChangedLine as number) < 1) return undefined;
   return { kind: "mutation", path: args.path as string, edits: editArgs.length,
-    diffLines: lineCount(sanitize(details.diff, MAX_TEXT)), noNet: false };
+    diffLines: fileLineCount(sanitize(details.diff, MAX_TEXT)), noNet: false };
 }
 
 function multiSummary(snapshot: MultiEditSnapshot): MutationSummary {
   return { kind: "mutation", path: snapshot.path, edits: snapshot.editCount,
-    ...(snapshot.diff.length === 0 ? { noNet: true } : { noNet: false, diffLines: lineCount(snapshot.diff) }) };
+    ...(snapshot.diff.length === 0 ? { noNet: true } : { noNet: false, diffLines: fileLineCount(snapshot.diff) }) };
 }
 
 function themed(theme: unknown, method: "fg" | "bold", args: string[], fallback: string): string {
@@ -307,14 +371,20 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
   const decorated = { ...tool } as T;
   decorated.renderCall = ((argsValue: unknown, theme: unknown, context: unknown): Component => {
     const current = lifecycle(context);
-    const args = displayArgs(toolName, argsValue);
+    const settled = booleanField(context, "isPartial") === false;
+    const args = settled ? displayArgs(toolName, argsValue) : liveDisplayArgs(toolName, argsValue);
     if (!args) return messageComponent("Unfamiliar arguments", theme);
     if (!current) {
       try { return nativeCall(args, theme, nativeContext(context, args, undefined, booleanField(context, "expanded") === true)); }
       catch { return messageComponent("Renderer failed", theme); }
     }
+    if (!settled) {
+      try {
+        current.call = nativeCall(args, theme, nativeContext(context, args, current.call, booleanField(context, "expanded") === true));
+        return current.call;
+      } catch { return messageComponent("Renderer failed", theme); }
+    }
     current.args = args;
-    const settled = booleanField(context, "isPartial") === false;
     const hint = bindingHint();
     const expanded = booleanField(context, "expanded") === true || (settled && !hint);
     try {
@@ -330,7 +400,10 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
 
   decorated.renderResult = ((resultValue: unknown, options: unknown, theme: unknown, context: unknown): Component => {
     const current = lifecycle(context);
-    const args = current?.args ?? displayArgs(toolName, data(context)?.args);
+    const partial = booleanField(options, "isPartial") === true || booleanField(context, "isPartial") === true;
+    const args = current?.args ?? (partial
+      ? liveDisplayArgs(toolName, data(context)?.args)
+      : displayArgs(toolName, data(context)?.args));
     const result = displayResult(resultValue);
     if (!args) return messageComponent("Unfamiliar arguments", theme);
     if (!result) return messageComponent("Unfamiliar result", theme);
@@ -340,7 +413,6 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
           nativeContext(context, args, undefined, true));
       } catch { return messageComponent("Renderer failed", theme); }
     }
-    const partial = booleanField(options, "isPartial") === true || booleanField(context, "isPartial") === true;
     const requestedExpanded = booleanField(options, "expanded") === true;
     const hint = bindingHint();
     if (partial) {

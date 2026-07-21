@@ -123,6 +123,9 @@ describe("tool surface registration", () => {
 
     const created: Array<Record<string, unknown>> = [];
     const handle = fakeSdk({ replies: ["done"], created });
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    handle.sdk.createReadToolDefinition = (cwd: string) => sdk.createReadToolDefinition(cwd);
     const fresh = fakePi();
     let internals!: Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
     picc(fresh.api as never, {
@@ -134,11 +137,44 @@ describe("tool surface registration", () => {
     await fresh.tools.get("Agent").execute("main-only", {
       subagent_type: "general-purpose", prompt: "inspect", run_in_background: false,
     });
-    const subagentTools = created[0]?.customTools as Array<{ name: string; renderShell?: string }>;
-    for (const name of ["read", "write", "edit", "MultiEdit", "bash"]) {
-      const subagentTool = subagentTools.find((tool) => tool.name === name);
-      expect(subagentTool, `missing subagent ${name}`).toBeDefined();
-      expect(subagentTool!.renderShell, name).not.toBe("self");
+    const subagentTools = created[0]?.customTools as Array<Record<string, any>>;
+    const rawRead = subagentTools.find((tool) => tool.name === "read");
+    const rawMultiEdit = subagentTools.find((tool) => tool.name === "MultiEdit");
+    expect(rawRead, "missing subagent read").toBeDefined();
+    expect(rawMultiEdit, "missing subagent MultiEdit").toBeDefined();
+    expect(rawRead!.renderShell).not.toBe("self");
+    expect(rawMultiEdit!.renderShell).not.toBe("self");
+
+    const renderRaw = (name: string, args: unknown, definition: Record<string, unknown>, result: unknown): string => {
+      const row = new sdk.ToolExecutionComponent(
+        name, `subagent-${name}`, args, {}, definition,
+        { requestRender() {} }, dir.replace(/\\/g, "/"),
+      );
+      row.setArgsComplete();
+      row.markExecutionStarted();
+      row.render(160);
+      row.updateResult(result, false);
+      return (row.render(160) as string[]).join("\n");
+    };
+    const rawReadRendered = renderRaw("read", { path: "subagent-read.txt" }, rawRead!, {
+      content: [{ type: "text", text: "SUBAGENT_READ_DETAIL_ONE\nSUBAGENT_READ_DETAIL_TWO" }],
+      details: undefined,
+    });
+    const rawMultiEditRendered = renderRaw("MultiEdit", {
+      file_path: "subagent-multi.txt",
+      edits: [{ old_string: "old", new_string: "new" }],
+    }, rawMultiEdit!, {
+      content: [{ type: "text", text: "Successfully applied 1 edit(s) to subagent-multi.txt." }],
+      details: { filePath: "subagent-multi.txt", edits: 1, created: false, diff: "-old\n+new", firstChangedLine: 1 },
+    });
+    const rawReadPlain = rawReadRendered
+      .replace(/\u001b\].*?(?:\u0007|\u001b\\)/gu, "")
+      .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+    expect(rawReadPlain).toContain("read subagent-read.txt");
+    expect(rawMultiEditRendered).toContain("Successfully applied 1 edit(s) to subagent-multi.txt.");
+    for (const rendered of [rawReadRendered, rawMultiEditRendered]) {
+      expect(rendered).not.toContain("hidden");
+      expect(rendered).not.toContain("to expand");
     }
   });
 

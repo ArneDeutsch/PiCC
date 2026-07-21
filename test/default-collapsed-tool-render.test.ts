@@ -6,7 +6,7 @@ import {
   TUI_KEYBINDINGS,
   visibleWidth,
 } from "@earendil-works/pi-tui";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition, initTheme, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { withDefaultCollapsedToolRendering } from "../src/runtime/default-collapsed-tool-render.js";
 import { recognizeMultiEditSuccess, withRoutineToolRendering } from "../src/runtime/routine-tool-render.js";
 
@@ -34,7 +34,7 @@ function definition(name: "read" | "write" | "bash" | "edit"): RenderTool {
     name, label: name, description: "test", parameters: {}, execute,
     renderCall(args: unknown) {
       const value = args as { path?: string; content?: string; command?: string };
-      return component(name === "bash" ? `native bash ${value.command}` : `native ${name} ${value.path}\n${value.content ?? ""}`);
+      return component(name === "bash" ? `native bash ${value.command ?? "..."}` : `native ${name} ${value.path}\n${value.content ?? ""}`);
     },
     renderResult(result: unknown) {
       const value = result as { content: Array<{ text?: string }>; details?: { diff?: string } };
@@ -107,6 +107,24 @@ describe("default-collapsed tool rendering", () => {
     }
   }));
 
+  it("counts file whitespace-only tails while matching Bash's full trim", () => withBinding(["ctrl+o"], () => {
+    const cases = [
+      {
+        rendered: settle(definition("read"), { path: "read.ts" }, readResult("body\n \n\t\n\n")),
+        expected: "3 lines hidden",
+      },
+      {
+        rendered: settle(definition("read"), { path: "empty.ts" }, readResult("\n\n")),
+        expected: "0 lines hidden",
+      },
+      {
+        rendered: settle(definition("bash"), { command: " \n command \n\t" }, readResult("\n output \n\t")),
+        expected: "1 output line hidden · ctrl+o to expand · 1 command line hidden",
+      },
+    ];
+    for (const entry of cases) expect(entry.rendered).toContain(entry.expected);
+  }));
+
   it("keeps exact no-net mutations compact", () => withBinding(["ctrl+o"], () => {
     const edit = settle(definition("edit"),
       { path: "edit.ts", edits: [{ oldText: "same", newText: "same" }] }, editResult("edit.ts", 1, ""));
@@ -138,6 +156,23 @@ describe("default-collapsed tool rendering", () => {
     for (const flags of [{ isPartial: true }, { isError: true }, { isError: undefined }]) {
       expect(settle(tool, args, result, false, flags)).toContain("native-state-detail");
     }
+  }));
+
+  it("delegates incomplete live arguments to native renderers", () => withBinding(["ctrl+o"], () => {
+    initTheme();
+    const bash = withDefaultCollapsedToolRendering(
+      createBashToolDefinition(process.cwd()) as unknown as ToolDefinition,
+    ) as unknown as RenderTool;
+    const bashCall = bash.renderCall({}, theme, { args: {}, state: {}, isPartial: true, expanded: false })
+      .render(80).join("\n");
+    expect(bashCall).toContain("...");
+    expect(bashCall).not.toContain("Unfamiliar arguments");
+
+    const write = definition("write");
+    const writeCall = write.renderCall({ path: "streaming.ts" }, theme,
+      { args: { path: "streaming.ts" }, state: {}, isPartial: true, expanded: false }).render(80).join("\n");
+    expect(writeCall).toContain("native write streaming.ts");
+    expect(writeCall).not.toContain("Unfamiliar arguments");
   }));
 
   it("delegates a shared partial state natively without hiding progress", () => withBinding(["ctrl+o"], () => {

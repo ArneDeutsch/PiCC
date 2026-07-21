@@ -911,10 +911,10 @@ function multiEditResult(
   const snapshot = recognizeMultiEditSuccess(result, options, context);
   if (!snapshot) return failOpenComponent(result, "MultiEdit", theme);
   if (snapshot.kind === "oversized") {
-    return textComponent(`Edit details too large to display for ${snapshot.path}`, theme);
+    return textComponent(`Diff too large to display for ${snapshot.path}`, theme);
   }
   if (snapshot.diff.length === 0) {
-    return textComponent(`No net change (${snapshot.editCount} ${snapshot.editCount === 1 ? "edit" : "edits"} applied)`, theme);
+    return textComponent(`No net change (${snapshot.editCount} edits applied)`, theme);
   }
   const fallback = failOpenComponent(result, "MultiEdit", theme);
   try {
