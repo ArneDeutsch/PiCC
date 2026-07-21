@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { waitUntil } from "./helpers/async.js";
 import { withRoutineToolRendering } from "../src/runtime/routine-tool-render.js";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 
@@ -66,6 +67,54 @@ function definition(name: RoutineName): Record<string, unknown> {
 }
 
 describe("real Pi routine rendering composition", () => {
+  it("preserves Edit call preview state while removing only its outer padding rows", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    const directory = mkdtempSync(join(tmpdir(), "picc-edit-render-"));
+    const filePath = "edit-target.txt";
+    const absolutePath = join(directory, filePath);
+    const args = { path: filePath, edits: [{ oldText: "before", newText: "after" }] };
+    let invalidations = 0;
+    try {
+      const source = sdk.createEditToolDefinition(directory);
+      const definition = wrapForSelfShell(withRoutineToolRendering(source));
+      const component = new sdk.ToolExecutionComponent(
+        "edit",
+        "edit-contract",
+        args,
+        {},
+        definition,
+        { requestRender() { invalidations++; } },
+        directory.replace(/\\/g, "/"),
+      );
+      await import("node:fs/promises").then(({ writeFile }) => writeFile(absolutePath, "before\n"));
+      component.setArgsComplete();
+      component.render(80);
+      await waitUntil({
+        predicate: () => invalidations >= 2,
+        description: "Edit asynchronous preview invalidation",
+      });
+      const preview = component.render(80) as string[];
+      const result = await source.execute("edit-contract", args, undefined, undefined, {});
+      component.updateResult(result, false);
+      const settled = component.render(80) as string[];
+      const stripAnsi = (line: string) => line.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+
+      for (const lines of [preview, settled]) {
+        expect(lines[0]).toBe("");
+        expect(lines.join("\n")).toContain(filePath);
+        expect(lines.join("\n")).toContain("before");
+        expect(lines.join("\n")).toContain("after");
+        expect(stripAnsi(lines[1] ?? "").trim()).not.toBe("");
+        expect(stripAnsi(lines[lines.length - 1] ?? "").trim()).not.toBe("");
+        expect(lines.filter((line) => stripAnsi(line).trim() === "")).toHaveLength(2);
+      }
+      expect(settled.map(stripAnsi)).toEqual(preview.map(stripAnsi));
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it.each(cases)("gives settled $name exactly one interactive content row in collapsed and expanded modes", async (entry) => {
     const sdk = await import("@earendil-works/pi-coding-agent") as any;
     sdk.initTheme();
@@ -214,6 +263,131 @@ describe("real Pi routine rendering composition", () => {
     );
     expect(rendered?.expanded).toContain(entry.invocation);
     expect(rendered?.expanded).not.toContain(entry.hidden);
+  });
+
+  it("renders MultiEdit HTML with its path and one delegated diff while malformed/errors stay visible", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const piDist = mainUrl.slice(0, mainUrl.indexOf("/dist/"));
+    const htmlModule = await import(`${piDist}/dist/core/export-html/tool-renderer.js`) as any;
+    const themeModule = await import(`${piDist}/dist/modes/interactive/theme/theme.js`) as any;
+    const definition = wrapForSelfShell(withRoutineToolRendering({ name: "MultiEdit" } as never));
+    const renderer = htmlModule.createToolHtmlRenderer({
+      getToolDefinition: (name: string) => name === "MultiEdit" ? definition : undefined,
+      theme: themeModule.theme,
+      cwd: process.cwd(),
+      width: 80,
+    });
+    const args = {
+      file_path: "src/html.ts",
+      edits: [{ old_string: "old", new_string: "new" }],
+    };
+    const details = {
+      filePath: "src/html.ts",
+      edits: 1,
+      created: false,
+      diff: "-1 old\n+1 new",
+      firstChangedLine: 1,
+    };
+    const id = "html-MultiEdit";
+    expect(renderer.renderCall(id, "MultiEdit", args)).toContain("src/html.ts");
+    const success = renderer.renderResult(
+      id,
+      "MultiEdit",
+      [{ type: "text", text: "Successfully applied 1 edit(s) to src/html.ts." }],
+      details,
+      false,
+    );
+    expect(success?.expanded).toContain("old");
+    expect(success?.expanded).toContain("new");
+    expect(success?.expanded.match(/old/g)).toHaveLength(1);
+
+    for (const [suffix, text, malformedDetails, isError] of [
+      ["error", "MultiEdit HTML failure", undefined, true],
+      ["malformed", "MultiEdit HTML unfamiliar", { ...details, future: true }, false],
+    ] as const) {
+      const resultId = `${id}-${suffix}`;
+      renderer.renderCall(resultId, "MultiEdit", args);
+      expect(renderer.renderResult(
+        resultId,
+        "MultiEdit",
+        [{ type: "text", text }],
+        malformedDetails,
+        isError,
+      )?.expanded).toContain(text);
+    }
+  });
+
+  it("delegates MultiEdit HTML collapsed and expanded passes independently without mutating canonical data", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const piDist = mainUrl.slice(0, mainUrl.indexOf("/dist/"));
+    const htmlModule = await import(`${piDist}/dist/core/export-html/tool-renderer.js`) as any;
+    const themeModule = await import(`${piDist}/dist/modes/interactive/theme/theme.js`) as any;
+    const calls: Array<{ result: unknown; options: unknown; context: unknown }> = [];
+    const custom = withRoutineToolRendering(
+      { name: "MultiEdit" } as never,
+      { createEditDefinition: () => ({
+        renderResult(result, options, _theme, context) {
+          calls.push({ result, options, context });
+          const expanded = (options as { expanded: boolean }).expanded;
+          return { render: () => [expanded ? "EXPANDED SENTINEL" : "COLLAPSED SENTINEL"] };
+        },
+      }) },
+    );
+    const renderer = htmlModule.createToolHtmlRenderer({
+      getToolDefinition: (name: string) => name === "MultiEdit" ? wrapForSelfShell(custom) : undefined,
+      theme: themeModule.theme,
+      cwd: process.cwd(),
+      width: 80,
+    });
+    const args = Object.freeze({
+      file_path: "src/frozen-html.ts",
+      edits: Object.freeze([Object.freeze({ old_string: "old", new_string: "new" })]),
+    });
+    const content = Object.freeze([Object.freeze({
+      type: "text",
+      text: "Successfully applied 1 edit(s) to src/frozen-html.ts.",
+    })]);
+    const details = Object.freeze({
+      filePath: "src/frozen-html.ts",
+      edits: 1,
+      created: false,
+      diff: "-1 old\n+1 new",
+      firstChangedLine: 1,
+    });
+    renderer.renderCall("html-sentinel", "MultiEdit", args);
+    const rendered = renderer.renderResult("html-sentinel", "MultiEdit", content, details, false);
+
+    expect(rendered?.collapsed).toContain("COLLAPSED SENTINEL");
+    expect(rendered?.expanded).toContain("EXPANDED SENTINEL");
+    expect(calls).toHaveLength(2);
+    expect(calls.map((call) => (call.options as { expanded: boolean }).expanded)).toEqual([false, true]);
+    for (const call of calls) {
+      const dto = call.result as { content: unknown; details: unknown };
+      expect(dto.content).not.toBe(content);
+      expect(dto.details).not.toBe(details);
+      expect((call.context as { args: unknown }).args).not.toBe(args);
+    }
+    const collapsedCall = calls[0]! as {
+      result: { content: unknown; details: unknown };
+      context: { args: unknown; state: unknown };
+    };
+    const expandedCall = calls[1]! as {
+      result: { content: unknown; details: unknown };
+      context: { args: unknown; state: unknown };
+    };
+    expect(collapsedCall.result).not.toBe(expandedCall.result);
+    expect(collapsedCall.result.content).not.toBe(expandedCall.result.content);
+    expect(collapsedCall.result.details).not.toBe(expandedCall.result.details);
+    expect(collapsedCall.context).not.toBe(expandedCall.context);
+    expect(collapsedCall.context.args).not.toBe(expandedCall.context.args);
+    expect(collapsedCall.context.state).not.toBe(expandedCall.context.state);
+    expect(args.file_path).toBe("src/frozen-html.ts");
+    expect(content[0]?.text).toBe("Successfully applied 1 edit(s) to src/frozen-html.ts.");
+    expect(details.diff).toBe("-1 old\n+1 new");
   });
 
   it.each(cases)("retains canonical $name session content but excludes it from complete rendered HTML", async (entry) => {

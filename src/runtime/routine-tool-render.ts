@@ -1,4 +1,7 @@
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+  createEditToolDefinition,
+  type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 interface Component {
@@ -12,11 +15,18 @@ interface ResultShape {
 
 type WebToolName = "WebFetch" | "WebSearch";
 type ActivationToolName = "Skill" | "SlashCommand";
-type RoutineToolName = WebToolName | ActivationToolName;
+type MutationToolName = "edit" | "MultiEdit";
+type RoutineToolName = WebToolName | ActivationToolName | MutationToolName;
 type DataSnapshot = Record<string, unknown>;
 
 const MAX_FAIL_OPEN_CHARS = 4_096;
 const MAX_FAIL_OPEN_LINES = 16;
+// These caps are deliberately above routine use while bounding hostile settled-result preprocessing.
+const MAX_MULTI_EDIT_COUNT = 1_000;
+const MAX_MULTI_EDIT_PATH_CHARS = 16_384;
+const MAX_MULTI_EDIT_DIFF_CHARS = 1_000_000;
+const MAX_OVERSIZED_PATH_CHARS = 512;
+const MUTATION_CONTROL_PLACEHOLDER = "�";
 const LINE_BREAK_RE = /\r\n?|\n|\u2028|\u2029/gu;
 
 function unfamiliarFormatLabel(toolName: RoutineToolName): string {
@@ -395,7 +405,8 @@ function routineToolName(tool: unknown): RoutineToolName | undefined {
     const descriptor = Object.getOwnPropertyDescriptor(tool, "name");
     if (!descriptor || !("value" in descriptor)) return undefined;
     return descriptor.value === "WebFetch" || descriptor.value === "WebSearch" ||
-      descriptor.value === "Skill" || descriptor.value === "SlashCommand"
+      descriptor.value === "Skill" || descriptor.value === "SlashCommand" ||
+      descriptor.value === "edit" || descriptor.value === "MultiEdit"
       ? descriptor.value
       : undefined;
   } catch {
@@ -403,8 +414,335 @@ function routineToolName(tool: unknown): RoutineToolName | undefined {
   }
 }
 
+const EDIT_CALL_INNER = Symbol("picc.editCallInner");
+const EDIT_RESULT_INNER = Symbol("picc.editResultInner");
+
+type MarkedComponent = Component & { [EDIT_CALL_INNER]?: Component; [EDIT_RESULT_INNER]?: Component };
+type PublicEditDefinition = ReturnType<typeof createEditToolDefinition>;
+type PublicEditCallRenderer = NonNullable<PublicEditDefinition["renderCall"]>;
+type PublicEditResultRenderer = NonNullable<PublicEditDefinition["renderResult"]>;
+type EditCallRenderer = (...args: Parameters<PublicEditCallRenderer>) => Component;
+type EditResultRenderer = (...args: Parameters<PublicEditResultRenderer>) => Component;
+type EditRendererDefinition = {
+  renderCall?: EditCallRenderer;
+  renderResult?: EditResultRenderer;
+};
+
+export interface RoutineRenderingDependencies {
+  createEditDefinition?: (cwd: string) => EditRendererDefinition;
+}
+
+function componentMarker(value: unknown, marker: symbol): Component | undefined {
+  const candidate = ownData(value, marker);
+  if (candidate === null || typeof candidate !== "object") return undefined;
+  try {
+    return typeof Reflect.get(candidate, "render") === "function" ? candidate as Component : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function editContext(context: unknown, lastComponent: Component | undefined): Record<string, unknown> {
+  if (context === null || typeof context !== "object") return { lastComponent };
+  try {
+    return { ...Object.fromEntries(Object.entries(context)), lastComponent };
+  } catch {
+    return { lastComponent };
+  }
+}
+
+function knownEditPadding(line: string, width: number): boolean {
+  if (!Number.isFinite(width) || width < 0) return false;
+  const columns = Math.floor(width);
+  try {
+    return visibleWidth(line) === columns && stripTerminalControls(line) === " ".repeat(columns);
+  } catch {
+    return false;
+  }
+}
+
+function adaptEditCallRenderer(renderer: EditCallRenderer): EditCallRenderer {
+  return (args, theme, context): Component => {
+    const previous = componentMarker(ownData(context, "lastComponent"), EDIT_CALL_INNER);
+    const inner = renderer(args, theme, editContext(context, previous) as unknown as typeof context);
+    const adapted: MarkedComponent = {
+      [EDIT_CALL_INNER]: inner,
+      render(width: number): string[] {
+        const lines = inner.render(width);
+        return lines.length >= 2 &&
+          knownEditPadding(lines[0] ?? "", width) &&
+          knownEditPadding(lines[lines.length - 1] ?? "", width)
+          ? lines.slice(1, -1)
+          : lines;
+      },
+    };
+    return adapted;
+  };
+}
+
+function sanitizeMutationText(value: unknown, inline: boolean, maxRawChars: number): string {
+  if (typeof value !== "string" || maxRawChars <= 0) return "";
+  let text: string;
+  try {
+    text = value.slice(0, maxRawChars).normalize("NFC").replace(/\r\n?/gu, "\n");
+  } catch {
+    return "";
+  }
+  let safe = "";
+  for (let index = 0; index < text.length;) {
+    const code = text.charCodeAt(index);
+    const next = text.charCodeAt(index + 1);
+    const isCsi = code === 0x9b || (code === 0x1b && next === 0x5b);
+    const isOsc = code === 0x9d || (code === 0x1b && next === 0x5d);
+    if (isCsi || isOsc) {
+      index += code === 0x1b ? 2 : 1;
+      while (index < text.length && text[index] !== "\n") {
+        const current = text.charCodeAt(index);
+        if (isCsi && current >= 0x40 && current <= 0x7e) {
+          index++;
+          break;
+        }
+        if (isOsc && (current === 0x07 || current === 0x9c)) {
+          index++;
+          break;
+        }
+        if (isOsc && current === 0x1b && text.charCodeAt(index + 1) === 0x5c) {
+          index += 2;
+          break;
+        }
+        index++;
+      }
+      safe += MUTATION_CONTROL_PLACEHOLDER;
+      continue;
+    }
+    const character = text[index] ?? "";
+    if (code === 0x1b || code < 0x20 || (code >= 0x7f && code <= 0x9f) || /\p{Cf}/u.test(character)) {
+      if (character === "\n") safe += inline ? " " : "\n";
+      else if (character === "\t") safe += "   ";
+      else safe += MUTATION_CONTROL_PLACEHOLDER;
+      index++;
+      continue;
+    }
+    safe += character;
+    index++;
+  }
+  return inline ? safe.replace(/\s+/gu, " ").trim() : safe;
+}
+
+function multiEditArrayLength(value: unknown): number | undefined {
+  if (!Array.isArray(value)) return undefined;
+  try {
+    if (Object.getPrototypeOf(value) !== Array.prototype) return undefined;
+    const length = ownData(value, "length");
+    return Number.isSafeInteger(length) && (length as number) >= 1 ? length as number : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function validateMultiEditEntries(value: unknown, length: number): boolean {
+  if (!Array.isArray(value) || length > MAX_MULTI_EDIT_COUNT) return false;
+  try {
+    if (Reflect.ownKeys(value).length !== length + 1) return false;
+    for (let index = 0; index < length; index++) {
+      const entry = plainOwnData(ownData(value, String(index)), ["old_string", "new_string"]) ??
+        plainOwnData(ownData(value, String(index)), ["old_string", "new_string", "replace_all"]);
+      if (!entry || typeof entry.old_string !== "string" || typeof entry.new_string !== "string" ||
+        ("replace_all" in entry && typeof entry.replace_all !== "boolean")) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+interface MultiEditSnapshot {
+  kind: "displayable";
+  path: string;
+  diff: string;
+  firstChangedLine: number | undefined;
+  editCount: number;
+  created: boolean;
+  canonicalText: string;
+}
+
+interface OversizedMultiEditSnapshot {
+  kind: "oversized";
+  path: string;
+}
+
+type MultiEditSuccess = MultiEditSnapshot | OversizedMultiEditSnapshot;
+
+function boundedPathMatches(left: string, right: string): boolean {
+  if (left.length !== right.length) return false;
+  if (left.length <= MAX_MULTI_EDIT_PATH_CHARS) return left === right;
+  const tailOffset = left.length - MAX_OVERSIZED_PATH_CHARS;
+  return left.startsWith(right.slice(0, MAX_OVERSIZED_PATH_CHARS)) &&
+    left.endsWith(right.slice(tailOffset));
+}
+
+function canonicalMultiEditTextMatches(
+  text: string,
+  path: string,
+  editCount: number,
+  created: boolean,
+): boolean {
+  const prefix = created ? "Created " : `Successfully applied ${editCount} edit(s) to `;
+  const suffix = created ? ` with ${editCount} edit(s).` : ".";
+  if (text.length !== prefix.length + path.length + suffix.length ||
+    !text.startsWith(prefix) || !text.endsWith(suffix)) return false;
+  if (path.length <= MAX_MULTI_EDIT_PATH_CHARS) return text.startsWith(path, prefix.length);
+  const head = path.slice(0, MAX_OVERSIZED_PATH_CHARS);
+  const tail = path.slice(path.length - MAX_OVERSIZED_PATH_CHARS);
+  return text.startsWith(head, prefix.length) &&
+    text.startsWith(tail, prefix.length + path.length - tail.length);
+}
+
+function recognizeMultiEditSuccess(
+  result: unknown,
+  options: unknown,
+  context: unknown,
+): MultiEditSuccess | undefined {
+  if (ownData(options, "isPartial") !== false || ownData(context, "isError") !== false) return undefined;
+  const resultSnapshot = plainOwnData(result, ["content", "details"]) ??
+    plainOwnData(result, ["content", "details", "isError"]);
+  if (!resultSnapshot || ("isError" in resultSnapshot && resultSnapshot.isError !== false) ||
+    !oneTextContent(resultSnapshot.content)) return undefined;
+  const args = plainOwnData(ownData(context, "args"), ["file_path", "edits"]);
+  const details = plainOwnData(
+    resultSnapshot.details,
+    ["filePath", "edits", "created", "diff", "firstChangedLine"],
+  );
+  const contentBlock = ownData(resultSnapshot.content, "0");
+  const canonicalText = ownData(contentBlock, "text");
+  const editCount = args ? multiEditArrayLength(args.edits) : undefined;
+  if (!args || !details || typeof args.file_path !== "string" ||
+    typeof details.filePath !== "string" || !boundedPathMatches(details.filePath, args.file_path) ||
+    typeof details.edits !== "number" || !Number.isSafeInteger(details.edits) || details.edits < 1 ||
+    editCount !== details.edits || typeof details.created !== "boolean" ||
+    typeof details.diff !== "string" || typeof canonicalText !== "string" ||
+    !canonicalMultiEditTextMatches(canonicalText, details.filePath, details.edits, details.created)) {
+    return undefined;
+  }
+  const firstChangedLine = details.firstChangedLine;
+  if (details.diff.length === 0) {
+    if (details.created || firstChangedLine !== undefined) return undefined;
+  } else if (!Number.isSafeInteger(firstChangedLine) || (firstChangedLine as number) < 1) {
+    return undefined;
+  }
+  const oversized = editCount > MAX_MULTI_EDIT_COUNT ||
+    details.filePath.length > MAX_MULTI_EDIT_PATH_CHARS ||
+    details.diff.length > MAX_MULTI_EDIT_DIFF_CHARS;
+  if (oversized) {
+    const boundedRawPath = details.filePath.slice(0, MAX_OVERSIZED_PATH_CHARS);
+    const path = sanitizeMutationText(boundedRawPath, true, MAX_OVERSIZED_PATH_CHARS) +
+      (details.filePath.length > MAX_OVERSIZED_PATH_CHARS ? "…" : "");
+    return path.length > 0 ? { kind: "oversized", path } : undefined;
+  }
+  if (!validateMultiEditEntries(args.edits, editCount)) return undefined;
+  const path = sanitizeMutationText(details.filePath, true, MAX_MULTI_EDIT_PATH_CHARS);
+  const diff = sanitizeMutationText(details.diff, false, MAX_MULTI_EDIT_DIFF_CHARS);
+  if (path.length === 0 || (details.diff.length > 0 && diff.length === 0)) return undefined;
+  return {
+    kind: "displayable",
+    path,
+    diff,
+    firstChangedLine: firstChangedLine as number | undefined,
+    editCount: details.edits,
+    created: details.created,
+    canonicalText: details.created
+      ? `Created ${path} with ${details.edits} edit(s).`
+      : `Successfully applied ${details.edits} edit(s) to ${path}.`,
+  };
+}
+
+function multiEditCall(args: unknown, theme: unknown): Component {
+  const snapshot = plainOwnData(args, ["file_path", "edits"]);
+  const path = sanitizeMutationText(snapshot?.file_path, true, MAX_MULTI_EDIT_PATH_CHARS);
+  return commandComponent("MultiEdit", path, theme);
+}
+
+function textComponent(text: string, theme: unknown): Component {
+  return {
+    render(width: number): string[] {
+      return [clamp(safeThemeMethod(theme, "fg", ["toolOutput", text], text), width)];
+    },
+  };
+}
+
+function multiEditResult(
+  result: unknown,
+  options: unknown,
+  theme: unknown,
+  context: unknown,
+  dependencies: RoutineRenderingDependencies,
+): Component {
+  const snapshot = recognizeMultiEditSuccess(result, options, context);
+  if (!snapshot) return failOpenComponent(result, "MultiEdit", theme);
+  if (snapshot.kind === "oversized") {
+    return textComponent(`Diff too large to display for ${snapshot.path}`, theme);
+  }
+  if (snapshot.diff.length === 0) {
+    return textComponent(`No net change (${snapshot.editCount} edits applied)`, theme);
+  }
+  const fallback = failOpenComponent(result, "MultiEdit", theme);
+  try {
+    const cwd = sanitizeText(ownData(context, "cwd"), true);
+    const createDefinition: (cwd: string) => EditRendererDefinition =
+      dependencies.createEditDefinition ??
+      ((definitionCwd) => createEditToolDefinition(definitionCwd) as unknown as EditRendererDefinition);
+    const definition = createDefinition(cwd);
+    if (typeof definition.renderResult !== "function") return fallback;
+    const previous = componentMarker(ownData(context, "lastComponent"), EDIT_RESULT_INNER);
+    const detachedResult: Parameters<EditResultRenderer>[0] = {
+      content: [{ type: "text", text: snapshot.canonicalText }],
+      details: { diff: snapshot.diff, patch: "", firstChangedLine: snapshot.firstChangedLine },
+    };
+    const detachedOptions = {
+      expanded: ownData(options, "expanded") === true,
+      isPartial: false,
+    };
+    const detachedContext = {
+      args: { path: snapshot.path, edits: [] },
+      toolCallId: "MultiEdit-display",
+      invalidate() {},
+      state: {},
+      lastComponent: previous,
+      cwd,
+      executionStarted: true,
+      argsComplete: true,
+      isPartial: false,
+      expanded: detachedOptions.expanded,
+      showImages: false,
+      isError: false,
+    } as unknown as Parameters<EditResultRenderer>[3];
+    const delegated = definition.renderResult(
+      detachedResult,
+      detachedOptions,
+      theme as Parameters<EditResultRenderer>[2],
+      detachedContext,
+    );
+    const adapted: MarkedComponent = {
+      [EDIT_RESULT_INNER]: delegated,
+      render(width: number): string[] {
+        try {
+          return delegated.render(width);
+        } catch {
+          return fallback.render(width);
+        }
+      },
+    };
+    return adapted;
+  } catch {
+    return fallback;
+  }
+}
+
 /** Add guarded human-only routine presentation without changing canonical tool execution/results. */
-export function withRoutineToolRendering<T extends ToolDefinition>(tool: T): T {
+export function withRoutineToolRendering<T extends ToolDefinition>(
+  tool: T,
+  dependencies: RoutineRenderingDependencies = {},
+): T {
   const toolName = routineToolName(tool);
   if (!toolName) return tool;
 
@@ -414,6 +752,22 @@ export function withRoutineToolRendering<T extends ToolDefinition>(tool: T): T {
   } catch {
     return tool;
   }
+  const originalCall = descriptors.renderCall && "value" in descriptors.renderCall
+    ? descriptors.renderCall.value as unknown
+    : undefined;
+  if (toolName === "edit") {
+    if (typeof originalCall !== "function") return tool;
+    delete descriptors.renderCall;
+    const decoratedEdit = Object.defineProperties({}, descriptors) as T;
+    Object.defineProperty(decoratedEdit, "renderCall", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: adaptEditCallRenderer(originalCall as EditCallRenderer),
+    });
+    return decoratedEdit;
+  }
+
   delete descriptors.renderCall;
   delete descriptors.renderResult;
   const decorated = Object.defineProperties({}, descriptors) as T;
@@ -422,8 +776,10 @@ export function withRoutineToolRendering<T extends ToolDefinition>(tool: T): T {
       configurable: true,
       enumerable: true,
       writable: true,
-      value(): Component {
-        return { render: () => [] };
+      value(args: unknown, theme: unknown): Component {
+        return toolName === "MultiEdit"
+          ? multiEditCall(args, theme)
+          : { render: () => [] };
       },
     },
     renderResult: {
@@ -432,6 +788,9 @@ export function withRoutineToolRendering<T extends ToolDefinition>(tool: T): T {
       writable: true,
       value(result: ResultShape, options: unknown, theme: unknown, context: unknown): Component {
         try {
+          if (toolName === "MultiEdit") {
+            return multiEditResult(result, options, theme, context, dependencies);
+          }
           const invocation = toolName === "WebFetch" || toolName === "WebSearch"
             ? recognizeWebSuccess(toolName, result, options, context)
             : recognizeActivationSuccess(toolName, result, options, context);

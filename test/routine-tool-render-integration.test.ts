@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import picc from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
@@ -72,6 +73,34 @@ describe("main-session routine rendering registration", () => {
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain(invocation);
     expect(lines.join("\n")).not.toContain(hidden);
+  });
+
+  it("executes and renders the registered MultiEdit with canonical content unchanged", async () => {
+    initTheme();
+    const filePath = "routine-multiedit.txt";
+    fs.writeFileSync(path.join(directory, filePath), "alpha\nbeta\n");
+    const args = {
+      file_path: filePath,
+      edits: [
+        { old_string: "alpha", new_string: "middle" },
+        { old_string: "middle", new_string: "omega" },
+      ],
+    };
+    const tool = pi.tools.get("MultiEdit");
+    expect(tool).toBeDefined();
+    expect(tool.renderCall(args, undefined, { args }).render(100).join("\n")).toContain(filePath);
+
+    const result = await tool.execute("registered-multiedit", args);
+    expect(result.content[0].text).toBe(`Successfully applied 2 edit(s) to ${filePath}.`);
+    expect(result.details).toMatchObject({ filePath, edits: 2, created: false });
+    const lines = tool.renderResult(
+      result,
+      { expanded: false, isPartial: false },
+      undefined,
+      { args, isError: false, cwd: directory },
+    ).render(100) as string[];
+    expect(lines.join("\n")).toContain("alpha");
+    expect(lines.join("\n")).toContain("omega");
   });
 
   it.each([

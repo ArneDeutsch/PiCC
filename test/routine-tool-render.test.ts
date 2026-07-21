@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { initTheme, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { withRoutineToolRendering } from "../src/runtime/routine-tool-render.js";
+import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 import { createWebFetchTool, createWebSearchTool } from "../src/runtime/tools/web-tools.js";
 
 interface Component {
@@ -524,6 +525,320 @@ describe("routine tool rendering decorator", () => {
       expect(lines.join("\n")).toContain("SlashCommand");
       expect(lines.join("\n")).not.toContain("FROZEN SECRET BODY");
     }
+  });
+
+  it("threads Edit's inner call component through its adapter and removes only known edge padding", () => {
+    const seen: unknown[] = [];
+    const inners: Component[] = [];
+    const source = {
+      name: "edit",
+      renderCall(_args: unknown, _theme: unknown, context: any) {
+        seen.push(context.lastComponent);
+        const inner = context.lastComponent ?? {
+          render(width: number) { return [" ".repeat(width), "path", " ".repeat(width), "- old", "+ new", " ".repeat(width)]; },
+        };
+        inners.push(inner);
+        return inner;
+      },
+      renderResult() { return { render: () => ["result"] }; },
+    } as unknown as ToolDefinition;
+    const tool = decorate(source);
+    const first = tool.renderCall({}, undefined, {}).render(20);
+    const firstWrapper = tool.renderCall({}, undefined, {}) as unknown as Component;
+    const second = tool.renderCall({}, undefined, { lastComponent: firstWrapper }).render(20);
+    expect(first).toEqual(["path", " ".repeat(20), "- old", "+ new"]);
+    expect(second).toEqual(first);
+    expect(seen[0]).toBeUndefined();
+    expect(seen[2]).toBe(inners[1]);
+    expect((tool as any).renderResult).toBe((source as any).renderResult);
+  });
+
+  it("keeps Edit edge rows unless both are exactly the known full-width padding", () => {
+    const renderWith = (lines: (width: number) => string[]) => {
+      const tool = decorate({
+        name: "edit",
+        renderCall: () => ({ render: lines }),
+      } as unknown as ToolDefinition);
+      return tool.renderCall({}, undefined, {}).render(8);
+    };
+    expect(renderWith((width) => [" ".repeat(width), "path", " ".repeat(width)])).toEqual(["path"]);
+    expect(renderWith((width) => [" ".repeat(width - 1), "path", " ".repeat(width)])).toEqual([
+      " ".repeat(7), "path", " ".repeat(8),
+    ]);
+    expect(renderWith((width) => [" ".repeat(width), "path", " ".repeat(width - 1)])).toEqual([
+      " ".repeat(8), "path", " ".repeat(7),
+    ]);
+    expect(renderWith((width) => ["x".repeat(width), "path", " ".repeat(width)])).toEqual([
+      "x".repeat(8), "path", " ".repeat(8),
+    ]);
+    expect(renderWith((width) => [" ".repeat(width), "path", " ".repeat(width), "diff", " ".repeat(width)])).toEqual([
+      "path", " ".repeat(8), "diff",
+    ]);
+  });
+
+  it("delegates validated MultiEdit evidence once to a detached Edit result DTO without preview", () => {
+    const args = Object.freeze({
+      file_path: "src/hostile\u001b[31m.ts",
+      edits: Object.freeze([Object.freeze({ old_string: "old", new_string: "new" })]),
+    });
+    const result = Object.freeze({
+      content: Object.freeze([Object.freeze({
+        type: "text",
+        text: "Successfully applied 1 edit(s) to src/hostile\u001b[31m.ts.",
+      })]),
+      details: Object.freeze({
+        filePath: "src/hostile\u001b[31m.ts",
+        edits: 1,
+        created: false,
+        diff: " 1 old\n\u001b[31m-1 old\u001b[0m\n+1 new",
+        firstChangedLine: 1,
+      }),
+    });
+    const preview = vi.fn();
+    const seen: unknown[][] = [];
+    const resultRenderer = vi.fn((...values: unknown[]) => {
+      seen.push(values);
+      return { render: () => ["SENTINEL EDIT DIFF"] };
+    });
+    const tool = withRoutineToolRendering(
+      { name: "MultiEdit" } as ToolDefinition,
+      { createEditDefinition: () => ({ renderCall: preview, renderResult: resultRenderer }) },
+    ) as unknown as RenderTool;
+
+    expect(tool.renderCall(args, undefined, { args }).render(80)[0]).toContain("src/hostile");
+    expect(tool.renderCall(args, undefined, { args }).render(80).join("\n")).not.toContain("[31m");
+    expect(renderResult(tool, args, result)).toEqual(["SENTINEL EDIT DIFF"]);
+    expect(preview).not.toHaveBeenCalled();
+    expect(resultRenderer).toHaveBeenCalledTimes(1);
+    const [dto, delegatedOptions, , delegatedContext] = seen[0] as any[];
+    expect(dto).not.toBe(result);
+    expect(dto.details).not.toBe(result.details);
+    expect(dto.content).not.toBe(result.content);
+    expect(dto.details.diff).toBe(" 1 old\n�-1 old�\n+1 new");
+    expect(delegatedOptions).toEqual({ expanded: false, isPartial: false });
+    expect(delegatedContext.args).toEqual({ path: "src/hostile�.ts", edits: [] });
+    expect(delegatedContext.args).not.toBe(args);
+    expect(delegatedContext.state).toEqual({});
+  });
+
+  it("recognizes transparent MultiEdit proxies through data descriptors without property gets", () => {
+    let propertyGets = 0;
+    const noGet = <T extends object>(value: T): T => new Proxy(value, {
+      get() { propertyGets++; throw new Error("property get forbidden"); },
+    });
+    const args = noGet({
+      file_path: "proxy.ts",
+      edits: noGet([noGet({ old_string: "a", new_string: "b" })]),
+    });
+    const result = noGet({
+      content: noGet([noGet({ type: "text", text: "Successfully applied 1 edit(s) to proxy.ts." })]),
+      details: noGet({
+        filePath: "proxy.ts", edits: 1, created: false, diff: "-1 a\n+1 b", firstChangedLine: 1,
+      }),
+    });
+    const tool = withRoutineToolRendering(
+      { name: "MultiEdit" } as ToolDefinition,
+      { createEditDefinition: () => ({ renderResult: () => ({ render: () => ["PROXY DIFF"] }) }) },
+    ) as unknown as RenderTool;
+    expect(renderResult(tool, args, result)).toEqual(["PROXY DIFF"]);
+    expect(propertyGets).toBe(0);
+  });
+
+  it("renders real Pi MultiEdit combined diff, non-empty creation, and no-net-change truthfully", () => {
+    initTheme();
+    const tool = decorate({ name: "MultiEdit" } as ToolDefinition);
+    const args = {
+      file_path: "src/example.ts",
+      edits: [{ old_string: "old", new_string: "middle" }, { old_string: "middle", new_string: "new" }],
+    };
+    const ordinary = {
+      content: [{ type: "text", text: "Successfully applied 2 edit(s) to src/example.ts." }],
+      details: { filePath: "src/example.ts", edits: 2, created: false, diff: "-1 old\n+1 new", firstChangedLine: 1 },
+    };
+    const lines = renderResult(tool, args, ordinary, { width: 80 });
+    expect(lines.join("\n")).toContain("old");
+    expect(lines.join("\n")).toContain("new");
+    expect(lines.join("\n").match(/-1 old/g)).toHaveLength(1);
+
+    const creationArgs = { file_path: "new.ts", edits: [{ old_string: "", new_string: "hello" }] };
+    const creation = {
+      content: [{ type: "text", text: "Created new.ts with 1 edit(s)." }],
+      details: { filePath: "new.ts", edits: 1, created: true, diff: "+1 hello", firstChangedLine: 1 },
+    };
+    expect(renderResult(tool, creationArgs, creation).join("\n")).toContain("hello");
+
+    const noNet = {
+      content: [{ type: "text", text: "Successfully applied 2 edit(s) to src/example.ts." }],
+      details: { filePath: "src/example.ts", edits: 2, created: false, diff: "", firstChangedLine: undefined },
+    };
+    expect(renderResult(tool, args, noNet)).toEqual(["No net change (2 edits applied)"]);
+  });
+
+  it("sanitizes MultiEdit path/diff payloads while preserving diff newlines at narrow Unicode widths", () => {
+    initTheme();
+    const rawPath = "src/界🙂\u001b]0;pwn\u0007.ts";
+    const args = { file_path: rawPath, edits: [{ old_string: "界", new_string: "🙂" }] };
+    const result = {
+      content: [{ type: "text", text: `Successfully applied 1 edit(s) to ${rawPath}.` }],
+      details: {
+        filePath: rawPath,
+        edits: 1,
+        created: false,
+        diff: " 1 context\n\u001b[31m-2 界\u001b[0m\n+2 🙂",
+        firstChangedLine: 2,
+      },
+    };
+    const tool = wrapForSelfShell(
+      withRoutineToolRendering({ name: "MultiEdit" } as ToolDefinition) as unknown as Record<string, unknown>,
+    ) as unknown as RenderTool;
+    const normal = renderResult(tool, args, result, { width: 80 }).join("\n");
+    expect(normal).toContain("界");
+    expect(normal).toContain("🙂");
+    expect(normal).not.toContain("]0;pwn");
+    expect(normal).not.toContain("[31m");
+    for (const width of [1, 2, 7, 12]) {
+      const lines = renderResult(tool, args, result, { width });
+      expect(lines.length).toBeGreaterThan(0);
+      expectBounded(lines, width);
+    }
+  });
+
+  it("replaces mutation controls visibly without letting malformed sequences consume later diff rows", () => {
+    const rawPath = "\u001b]0;only-path\u0007";
+    const args = { file_path: rawPath, edits: [{ old_string: "a", new_string: "b" }] };
+    const result = {
+      content: [{ type: "text", text: `Successfully applied 1 edit(s) to ${rawPath}.` }],
+      details: {
+        filePath: rawPath,
+        edits: 1,
+        created: false,
+        diff: "-1 \u001b]terminated\u0007\n+2 later\n-3 \u001b]unterminated\n+4 survives\n-5 \u001b[31;\n+6 also survives",
+        firstChangedLine: 1,
+      },
+    };
+    const seen: unknown[] = [];
+    const trusted = "\u001b[35mTRUSTED PI STYLE\u001b[0m";
+    const tool = withRoutineToolRendering(
+      { name: "MultiEdit" } as ToolDefinition,
+      { createEditDefinition: () => ({
+        renderResult(dto) {
+          seen.push(dto);
+          return { render: () => [trusted] };
+        },
+      }) },
+    ) as unknown as RenderTool;
+    expect(tool.renderCall(args, undefined, { args }).render(80).join("\n")).toContain("MultiEdit �");
+    expect(renderResult(tool, args, result)).toEqual([trusted]);
+    const dto = seen[0] as { details: { diff: string }; content: Array<{ text: string }> };
+    expect(dto.details.diff.split("\n")).toEqual([
+      "-1 �", "+2 later", "-3 �", "+4 survives", "-5 �", "+6 also survives",
+    ]);
+    expect(dto.content[0]?.text).toContain("to �.");
+    expect(dto.details.diff).not.toContain("terminated");
+  });
+
+  it("bounds oversized MultiEdit successes before edit traversal or Pi delegation", () => {
+    const renderer = vi.fn(() => ({ render: () => ["MUST NOT DELEGATE"] }));
+    const tool = withRoutineToolRendering(
+      { name: "MultiEdit" } as ToolDefinition,
+      { createEditDefinition: () => ({ renderResult: renderer }) },
+    ) as unknown as RenderTool;
+    const cases = [
+      {
+        path: "count.ts",
+        edits: new Array(1_001),
+        count: 1_001,
+        diff: "-1 a\n+1 b",
+      },
+      {
+        path: "diff.ts",
+        edits: [{ old_string: "a", new_string: "b" }],
+        count: 1,
+        diff: "-1 " + "x".repeat(1_000_001),
+      },
+      {
+        path: "p".repeat(16_385),
+        edits: [{ old_string: "a", new_string: "b" }],
+        count: 1,
+        diff: "-1 a\n+1 b",
+      },
+    ] as const;
+    for (const entry of cases) {
+      let indexedReads = 0;
+      const edits = new Proxy(entry.edits, {
+        getOwnPropertyDescriptor(target, key) {
+          if (key !== "length") indexedReads++;
+          return Reflect.getOwnPropertyDescriptor(target, key);
+        },
+      });
+      const args = Object.freeze({ file_path: entry.path, edits });
+      const canonicalText = `Successfully applied ${entry.count} edit(s) to ${entry.path}.`;
+      const result = Object.freeze({
+        content: Object.freeze([Object.freeze({ type: "text", text: canonicalText })]),
+        details: Object.freeze({
+          filePath: entry.path,
+          edits: entry.count,
+          created: false,
+          diff: entry.diff,
+          firstChangedLine: 1,
+        }),
+      });
+      const output = renderResult(tool, args, result, { width: 120 }).join("\n");
+      expect(output).toContain("Diff too large to display");
+      expect(output).toContain(entry.path.slice(0, Math.min(entry.path.length, 20)));
+      expect(indexedReads).toBe(0);
+      expect(result.content[0]?.text).toBe(canonicalText);
+    }
+    expect(renderer).not.toHaveBeenCalled();
+  });
+
+  it("fails MultiEdit open for errors, partial/malformed/contradictory shapes and guarded renderer failures", () => {
+    const args = { file_path: "x.ts", edits: [{ old_string: "a", new_string: "b" }] };
+    const result = {
+      content: [{ type: "text", text: "Successfully applied 1 edit(s) to x.ts." }],
+      details: { filePath: "x.ts", edits: 1, created: false, diff: "-1 a\n+1 b", firstChangedLine: 1 },
+    };
+    const delegated = vi.fn(() => ({ render: () => ["UNEXPECTED DELEGATION"] }));
+    const tool = withRoutineToolRendering(
+      { name: "MultiEdit" } as ToolDefinition,
+      { createEditDefinition: () => ({ renderResult: delegated }) },
+    ) as unknown as RenderTool;
+    for (const [candidateArgs, candidate, flags] of [
+      [args, result, { partial: true }],
+      [args, result, { error: true }],
+      [args, { ...result, details: { ...result.details, filePath: "other.ts" } }, {}],
+      [args, { ...result, details: { ...result.details, edits: 2 } }, {}],
+      [{ ...args, edits: [{ old_string: "a" }] }, result, {}],
+      [{ ...args, edits: [{ old_string: "a", new_string: "b", replace_all: "yes" }] }, result, {}],
+      [args, { ...result, details: { ...result.details, firstChangedLine: 0 } }, {}],
+      [args, { ...result, details: { ...result.details, firstChangedLine: 1.5 } }, {}],
+      [args, { ...result, details: { filePath: "x.ts", edits: 1, created: false, firstChangedLine: 1 } }, {}],
+      [args, { ...result, details: { ...result.details, created: true, diff: "", firstChangedLine: undefined } }, {}],
+      [args, { ...result, details: { ...result.details, future: true } }, {}],
+      [args, { ...result, content: [{ type: "text", text: "MISMATCHED CANONICAL" }] }, {}],
+    ] as const) {
+      const canonical = (candidate as any).content[0].text as string;
+      const output = renderResult(tool, candidateArgs, candidate, flags).join("\n");
+      expect(output).toContain(canonical);
+      expect(output).not.toContain("SENTINEL EDIT DIFF");
+    }
+
+    let accessorReads = 0;
+    const accessorDetails = Object.defineProperty({}, "diff", {
+      enumerable: true,
+      get() { accessorReads++; return result.details.diff; },
+    });
+    expect(renderResult(tool, args, { ...result, details: accessorDetails }).join("\n")).toContain(
+      result.content[0]!.text,
+    );
+    expect(accessorReads).toBe(0);
+    expect(delegated).not.toHaveBeenCalled();
+
+    const throwing = withRoutineToolRendering(
+      { name: "MultiEdit" } as ToolDefinition,
+      { createEditDefinition: () => ({ renderResult: () => ({ render() { throw new Error("paint"); } }) }) },
+    ) as unknown as RenderTool;
+    expect(renderResult(throwing, args, result).join("\n")).toContain(result.content[0]!.text);
   });
 
   it("preserves execute/fields and leaves source arguments/results and unrelated tools untouched", () => {

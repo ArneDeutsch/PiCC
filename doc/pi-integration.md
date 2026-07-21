@@ -140,9 +140,10 @@ TUI, `/model`, project trust. We do not reimplement any of it.
   (`test/pi-contract.test.ts`) asserts the imports/exports we rely on exist.
 - `before_agent_start` system-prompt chaining: other extensions may also modify; we append, not replace.
 - Built-in tool override warning in interactive mode is expected (documented for users).
-- Tool-row de-padding couples `src/runtime/tool-shell.ts` to Pi's render contract in three places.
-  **All three** are pinned by the smoke test (`test/pi-contract.test.ts`) so a Pi bump fails loudly
-  in CI rather than degrading incremental rendering silently on a green CI. For what the wrapper
+- Tool-row de-padding and mutation presentation couple `src/runtime/tool-shell.ts` and
+  `src/runtime/routine-tool-render.ts` to Pi's render contract. These dependencies are pinned by
+  Pi-contract tests so a Pi bump fails loudly in CI rather than degrading incremental rendering
+  silently on a green CI. For what the wrapper
   does with these, see "`renderShell` — this is how you control blank lines and framing" in
   [`tui-extension-guide.md`](tui-extension-guide.md); the Pi-side surface is:
   - **`create*ToolDefinition` renderer shape** — the de-padded built-in rows source their
@@ -154,6 +155,15 @@ TUI, `/model`, project trust. We do not reimplement any of it.
     caching the `renderCall` and `renderResult` slots separately. The built-ins depend on that to
     carry incremental render state, so a Pi change here would silently degrade rendering: the
     contract test drives the real `ToolExecutionComponent` and asserts Pi's side of it.
+  - **Edit's nested call `Box`** — the public Edit call renderer returns a stateful `Box(1, 1)` and
+    recognizes that Box through `ctx.lastComponent`. The routine adapter retains the inner Box and
+    removes only its verified full-width outer padding rows; the real lifecycle test covers initial
+    call, asynchronous preview, and settled reuse.
+  - **Public Edit result renderer and custom HTML lifecycle** — MultiEdit passes a detached,
+    sanitized Edit-shaped success snapshot to `createEditToolDefinition().renderResult`; it never
+    invokes Edit preview. Pi's custom HTML renderer records call arguments before result rendering
+    and renders collapsed and expanded results separately, so each pass must remain independently
+    valid and must not depend on shared canonical objects.
   - **`getTextOutput` transform** — `tool-shell.ts` reproduces Pi's `render-utils.js` `getTextOutput`
     (the deep path is `exports`-blocked); the smoke test pins it against Pi's own via an absolute
     `file://` import so a transform change (CRLF stripping, image fallbacks) fails loudly.
