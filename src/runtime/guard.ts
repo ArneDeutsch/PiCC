@@ -43,6 +43,21 @@ type PiApi = {
 /** Cap on the serialized structured tool_response delivered to PostToolUse hooks. */
 const TOOL_RESPONSE_MAX_CHARS = 50_000;
 
+// Object identity makes this metadata impossible for model/tool output to forge, while
+// leaving the canonical result details and permission-facing payload unchanged.
+const guardClippedContent = new WeakSet<object>();
+
+/** Whether the guard clipped the canonical content carried by this result. */
+export function toolResultHasGuardClipping(result: unknown): boolean {
+  if (!result || typeof result !== "object") return false;
+  const content = (result as { content?: unknown }).content;
+  return (typeof content === "object" && content !== null) ? guardClippedContent.has(content) : false;
+}
+
+function markGuardClipped(content: unknown): void {
+  if (typeof content === "object" && content !== null) guardClippedContent.add(content);
+}
+
 /** Claude payload `tool_use_id`, when the Pi event carries a tool-call id. */
 function toolUseIdField(event: any): { tool_use_id?: string } {
   return typeof event?.toolCallId === "string" && event.toolCallId.length > 0
@@ -191,6 +206,7 @@ export function createGuardExtension(deps: GuardDeps) {
           ? clipOversizedToolResult(event.content, deps.clipMaxTokens, event.toolName, event.input ?? {})
           : event.content;
       const clipped = clipContent !== event.content;
+      if (clipped) markGuardClipped(clipContent);
       // No hooks configured for this event: skip the payload construction
       // (including the serializability probe over a possibly huge result) and
       // the fire() entirely. Facades without hasHooks degrade to always-fire.
@@ -248,6 +264,7 @@ export function createGuardExtension(deps: GuardDeps) {
       if (feedback.length) {
         const content = Array.isArray(clipContent) ? [...clipContent] : [];
         content.push({ type: "text", text: `\n${feedback.join("\n")}` });
+        if (clipped) markGuardClipped(content);
         return { content, details: event.details, isError: event.isError };
       }
       if (clipped) {

@@ -1,6 +1,8 @@
 /** Session-local coordination for proactive mid-run context checkpoints. */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { ContextUsageShape } from "./proactive-compaction.js";
+import { toolResultHasGuardClipping } from "./guard.js";
 
 export type CheckpointPhase =
   | "idle"
@@ -78,6 +80,12 @@ export interface RecoveryToken {
 }
 
 export interface ResumeToken {
+  readonly generation: number;
+  readonly token: object;
+}
+
+/** Identity-authenticated permission for one controller-owned summary request. */
+export interface CompactionSummaryToken {
   readonly generation: number;
   readonly token: object;
 }
@@ -228,6 +236,7 @@ export class MidRunCompactionController {
   private resumedOwnership: ResumedRunOwnership | undefined;
   private resumeContext: ResumeContext | undefined;
   private cancellation: CancellationState | undefined;
+  private compactionSummary: CompactionSummaryToken | undefined;
 
   constructor(private readonly options: MidRunCompactionOptions) {
     this.sessionId = options.sessionId;
@@ -270,6 +279,7 @@ export class MidRunCompactionController {
     this.resumedOwnership = undefined;
     this.resumeContext = undefined;
     this.cancellation = undefined;
+    this.compactionSummary = undefined;
     this.emit("checkpoint-armed");
     return this.generation;
   }
@@ -334,6 +344,31 @@ export class MidRunCompactionController {
 
   isCheckpointAbort(generation: number): boolean {
     return generation === this.generation && this.checkpointAbortRequested && this.phase !== "cancelled";
+  }
+
+  beginCompactionSummary(generation: number): CompactionSummaryToken | undefined {
+    if (generation !== this.generation || this.phase !== "compacting" || this.compactionSummary) return undefined;
+    const token = { generation, token: {} };
+    this.compactionSummary = token;
+    return token;
+  }
+
+  endCompactionSummary(token: CompactionSummaryToken): boolean {
+    if (token !== this.compactionSummary || token.generation !== this.generation) return false;
+    this.compactionSummary = undefined;
+    return true;
+  }
+
+  isCompactionSummaryActive(generation: number): boolean {
+    return generation === this.generation && this.compactionSummary?.generation === generation;
+  }
+
+  /** Mark host-observed validation, permission, hook, truncation, or queue paths unclean. */
+  invalidateToolBatch(handle: ToolBatchHandle): boolean {
+    const batch = this.currentBatch(handle);
+    if (!batch) return false;
+    batch.malformed = true;
+    return true;
   }
 
   shadowInput(
@@ -418,6 +453,7 @@ export class MidRunCompactionController {
     this.phase = "cancelled";
     this.cancellation = { generation, kind, outcome: deferred<CancellationOutcome>() };
     this.checkpointAbortRequested = false;
+    this.compactionSummary = undefined;
     this.runAbort.abort(kind);
     this.queueChanged.resolve();
     this.startCancelAndJoin(generation);
@@ -505,6 +541,10 @@ export class MidRunCompactionController {
         result = this.runAbort.signal.aborted
           ? { ok: false, category: "cancelled" }
           : { ok: false, category: "operational" };
+      } finally {
+        // The adapter normally closes its token; this floor keeps a failed adapter
+        // from authorizing ordinary transport during backoff or a later attempt.
+        this.compactionSummary = undefined;
       }
       if (!this.isCurrent(generation)) return;
       if (result.ok) {
@@ -630,6 +670,7 @@ export class MidRunCompactionController {
     const generationBarrier = this.stable;
     this.phase = "idle";
     this.checkpointAbortRequested = false;
+    this.compactionSummary = undefined;
     generationBarrier?.resolve();
   }
 
@@ -638,6 +679,7 @@ export class MidRunCompactionController {
     const generationBarrier = this.stable;
     this.phase = "exhausted";
     this.checkpointAbortRequested = false;
+    this.compactionSummary = undefined;
     this.recovery = { generation, token: {} };
     generationBarrier?.resolve();
     this.emit("checkpoint-exhausted", generation, this.attempt);
@@ -696,6 +738,427 @@ export class MidRunCompactionController {
     } catch {
       // Observers cannot own checkpoint transitions or barriers.
     }
+  }
+}
+
+const GUARDED_OPENAI_APIS = new Set([
+  "openai-completions",
+  "openai-responses",
+  "openai-codex-responses",
+]);
+
+interface MainGateContext {
+  model?: { api?: string };
+  mode?: string;
+  ui?: { getEditorText?: () => string; setEditorText?: (text: string) => void };
+  getContextUsage?: () => ContextUsageShape | undefined;
+  hasPendingMessages?: () => boolean;
+  abort?: () => void;
+}
+
+interface MainBatchObservation {
+  run: object;
+  ids: string[];
+  final: Map<string, { isError: boolean; truncated: boolean }>;
+  successful: Map<string, { terminated: boolean; truncated: boolean }>;
+}
+
+export interface MainSessionCheckpointExecutionAdapter {
+  compact(attempt: number, signal: AbortSignal): Promise<CompactionAttemptResult>;
+  resume?(context: ResumeContext): ResumedRunOwnership | Promise<ResumedRunOwnership>;
+  manualCompaction: ManualCompactionCapability;
+  delay?(milliseconds: number, signal: AbortSignal): Promise<void>;
+  progress?(event: CheckpointProgress): void;
+}
+
+/** Stable mutable seam through which later wiring supplies session execution behavior. */
+export class MainSessionCheckpointExecutionBridge {
+  private adapter: MainSessionCheckpointExecutionAdapter | undefined;
+
+  attach(adapter: MainSessionCheckpointExecutionAdapter): () => void {
+    this.adapter = adapter;
+    return () => {
+      if (this.adapter === adapter) this.adapter = undefined;
+    };
+  }
+
+  createController(sessionId: string, threshold: number): MidRunCompactionController {
+    const bridge = this;
+    const manual = {
+      get kind(): ManualCompactionCapability["kind"] {
+        return bridge.adapter?.manualCompaction.kind ?? "unavailable";
+      },
+      isActive: () => bridge.adapter?.manualCompaction.kind === "available" &&
+        bridge.adapter.manualCompaction.isActive(),
+      waitAndResample: (context: { generation: number; signal: AbortSignal }) => {
+        const capability = bridge.adapter?.manualCompaction;
+        return capability?.kind === "available"
+          ? capability.waitAndResample(context)
+          : Promise.resolve({ ended: false, usage: undefined });
+      },
+    } as ManualCompactionCapability;
+    return new MidRunCompactionController({
+      sessionId,
+      threshold,
+      compact: (attempt, signal) => this.adapter
+        ? this.adapter.compact(attempt, signal)
+        : Promise.resolve({ ok: false, category: "operational" }),
+      resume: (context) => {
+        const resume = this.adapter?.resume;
+        if (!resume) throw new Error("Main-session checkpoint resume adapter is not attached");
+        return resume(context);
+      },
+      delay: (milliseconds, signal) => this.adapter?.delay
+        ? this.adapter.delay(milliseconds, signal)
+        : defaultDelay(milliseconds, signal),
+      progress: (event) => this.adapter?.progress?.(event),
+      manualCompaction: manual,
+    });
+  }
+
+  beginCompactionSummary(controller: MidRunCompactionController, generation: number): CompactionSummaryToken | undefined {
+    return controller.beginCompactionSummary(generation);
+  }
+
+  endCompactionSummary(controller: MidRunCompactionController, token: CompactionSummaryToken): boolean {
+    return controller.endCompactionSummary(token);
+  }
+}
+
+function toolCallIds(message: unknown): string[] {
+  if (!message || typeof message !== "object" || (message as { role?: string }).role !== "assistant") return [];
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter((block): block is { type: "toolCall"; id: string } =>
+      block?.type === "toolCall" && typeof block.id === "string")
+    .map((block) => block.id);
+}
+
+function resultIsTruncated(result: unknown): boolean {
+  return toolResultHasGuardClipping(result);
+}
+
+function canonical(value: unknown, seen = new WeakSet<object>()): string {
+  if (value === undefined) return "u";
+  if (value === null) return "n";
+  if (typeof value === "string") return `s${value.length}:${value}`;
+  if (typeof value === "boolean") return value ? "b1" : "b0";
+  if (typeof value === "number") return `d${Number.isNaN(value) ? "nan" : String(value)}`;
+  if (typeof value !== "object") return `${typeof value}:${String(value)}`;
+  if (seen.has(value)) return "circular";
+  seen.add(value);
+  if (Array.isArray(value)) return `a[${value.map((item) => canonical(item, seen)).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `o{${Object.keys(record).sort().map((key) => `${canonical(key)}=${canonical(record[key], seen)}`).join(",")}}`;
+}
+
+function acceptedContent(text: string, images: readonly unknown[] | undefined): QueueContent {
+  return images?.length ? [{ type: "text", text }, ...images] : text;
+}
+
+interface ExpectedInput {
+  content: QueueContent;
+  canonical: string;
+  delivery: QueueDeliveryMode;
+}
+
+interface ReplayAuthorization {
+  gate: object;
+  sessionId: string;
+  generation: number;
+  shadow: QueuedInputShadow;
+  canonical: string;
+  source: string;
+  mode: QueueDeliveryMode;
+  used: boolean;
+}
+
+const replayAuthorization = new AsyncLocalStorage<ReplayAuthorization>();
+
+/** Main-session lifecycle adapter around the generation-authenticated controller. */
+export class MainSessionCheckpointGate {
+  private controller: MidRunCompactionController;
+  private generation: number | undefined;
+  private handle: ToolBatchHandle | undefined;
+  private batch: MainBatchObservation = { run: {}, ids: [], final: new Map(), successful: new Map() };
+  private abortIssued: { generation: number; run: object } | undefined;
+  private acceptedBeforeArm: ExpectedInput[] = [];
+  private ambiguousInput = false;
+  private sessionEpoch: object = {};
+  private transition: Promise<void> = Promise.resolve();
+
+  constructor(
+    private readonly execution: MainSessionCheckpointExecutionBridge,
+    sessionId: string,
+    private readonly threshold: number,
+  ) {
+    this.controller = execution.createController(sessionId, threshold);
+  }
+
+  currentController(): MidRunCompactionController {
+    return this.controller;
+  }
+
+  async beforeSessionSwitch(): Promise<{ cancel: true } | undefined> {
+    // Pi swallows lifecycle-handler throws, so revoke replay authority synchronously
+    // and report cancellation explicitly if the old generation cannot join.
+    this.sessionEpoch = {};
+    const operation = this.transition.then(() => this.cancelCurrent("replacement"));
+    this.transition = operation.catch(() => undefined);
+    try {
+      await operation;
+    } catch {
+      return { cancel: true };
+    }
+    this.invalidateSessionState();
+    return undefined;
+  }
+
+  async startSession(sessionId: string): Promise<void> {
+    const operation = this.transition.then(async () => {
+      await this.cancelCurrent("replacement");
+      this.controller = this.execution.createController(sessionId, this.threshold);
+      this.invalidateSessionState();
+    });
+    this.transition = operation.catch(() => undefined);
+    await operation;
+  }
+
+  wrapTool<T extends Record<string, unknown>>(tool: T): T {
+    const execute = tool.execute;
+    if (typeof execute !== "function") return tool;
+    const gate = this;
+    return {
+      ...tool,
+      async execute(this: unknown, ...args: unknown[]) {
+        const result = await Reflect.apply(execute, this, args) as unknown as Record<string, unknown>;
+        return gate.successfulTool(String(args[0] ?? ""), result, args[4] as MainGateContext | undefined);
+      },
+    };
+  }
+
+  assistantMessageEnded(message: unknown): void {
+    if (!message || typeof message !== "object" || (message as { role?: string }).role !== "assistant") return;
+    this.batch = { run: {}, ids: toolCallIds(message), final: new Map(), successful: new Map() };
+    this.handle = undefined;
+    this.abortIssued = undefined;
+  }
+
+  toolExecutionEnded(event: { toolCallId?: unknown; result?: unknown; isError?: unknown }): void {
+    if (typeof event.toolCallId !== "string") return;
+    const truncated = resultIsTruncated(event.result);
+    this.batch.final.set(event.toolCallId, { isError: event.isError === true, truncated });
+    if (event.isError === true || truncated) this.invalidate();
+  }
+
+  turnEnded(ctx: MainGateContext): ToolBatchDisposition | undefined {
+    let pending = false;
+    try {
+      pending = ctx.hasPendingMessages?.() === true;
+    } catch {
+      pending = true;
+    }
+    if (this.batch.ids.length === 0 && !pending) return undefined;
+    this.arm(ctx);
+    if (this.generation === undefined) return undefined;
+    this.beginBatch(true);
+    if (!this.handle) return undefined;
+
+    for (const id of this.batch.ids) {
+      const observed = this.batch.successful.get(id);
+      const final = this.batch.final.get(id);
+      if (!observed?.terminated || observed.truncated || !final || final.isError || final.truncated) {
+        this.controller.invalidateToolBatch(this.handle);
+      }
+    }
+    if (this.batch.final.size !== this.batch.ids.length ||
+        [...this.batch.final.keys()].some((id) => !this.batch.ids.includes(id)) || pending || this.ambiguousInput) {
+      this.controller.invalidateToolBatch(this.handle);
+    }
+
+    const disposition = this.controller.completeToolBatch(this.handle);
+    if (disposition.stop === "abort") this.abortAfterBatch(ctx);
+    return disposition;
+  }
+
+  defensiveLatch(ctx: MainGateContext): void {
+    if (this.generation === undefined || this.controller.isCompactionSummaryActive(this.generation)) return;
+    if (this.controller.snapshot().phase === "idle") return;
+    this.abortAfterBatch(ctx);
+  }
+
+  isActive(): boolean {
+    this.resetCompletedGeneration();
+    return this.generation !== undefined;
+  }
+
+  withReplayAuthorization<T>(input: QueuedInputShadow, operation: () => T, source = "extension"): T {
+    const current = this.controller.queuedInputSnapshot().find((entry) => entry === input);
+    if (!current || input.sessionId !== this.controller.sessionId || input.generation !== this.generation) {
+      throw new Error("Cannot authorize stale checkpoint replay");
+    }
+    return replayAuthorization.run({
+      gate: this.sessionEpoch,
+      sessionId: input.sessionId,
+      generation: input.generation,
+      shadow: input,
+      canonical: canonical(input.content),
+      source,
+      mode: input.delivery,
+      used: false,
+    }, operation);
+  }
+
+  authorizeReplay(event: {
+    text?: unknown;
+    images?: readonly unknown[];
+    source?: unknown;
+    streamingBehavior?: unknown;
+  }): QueuedInputShadow | undefined {
+    const authorization = replayAuthorization.getStore();
+    if (!authorization || authorization.used || authorization.gate !== this.sessionEpoch ||
+        authorization.sessionId !== this.controller.sessionId || authorization.generation !== this.generation ||
+        event.source !== authorization.source || event.streamingBehavior !== authorization.mode ||
+        canonical(acceptedContent(String(event.text ?? ""), event.images)) !== authorization.canonical ||
+        !this.controller.queuedInputSnapshot().some((entry) => entry === authorization.shadow)) return undefined;
+    authorization.used = true;
+    return authorization.shadow;
+  }
+
+  captureAcceptedInput(
+    ctx: MainGateContext,
+    text: string,
+    images: readonly unknown[] | undefined,
+    delivery: QueueDeliveryMode | undefined,
+  ): QueuedInputShadow | undefined {
+    if (!delivery || !GUARDED_OPENAI_APIS.has(ctx.model?.api ?? "")) return undefined;
+    const content = acceptedContent(text, images);
+    const expected = { content, canonical: canonical(content), delivery };
+    this.arm(ctx);
+    if (this.generation === undefined) {
+      this.acceptedBeforeArm.push(expected);
+      return undefined;
+    }
+    return this.controller.shadowInput(this.generation, content, delivery);
+  }
+
+  userMessageStarted(message: unknown, delivery?: QueueDeliveryMode): QueuedInputShadow | undefined {
+    if (!message || typeof message !== "object" || (message as { role?: string }).role !== "user") return undefined;
+    const messageCanonical = canonical((message as { content?: unknown }).content);
+    if (this.generation === undefined) {
+      const index = this.acceptedBeforeArm.findIndex((entry) =>
+        entry.canonical === messageCanonical && (delivery === undefined || entry.delivery === delivery));
+      if (index >= 0) this.acceptedBeforeArm.splice(index, 1);
+      else if (this.acceptedBeforeArm.length > 0) this.ambiguousInput = true;
+      return undefined;
+    }
+    const match = this.controller.queuedInputSnapshot().find((entry) =>
+      entry.generation === this.generation && entry.sessionId === this.controller.sessionId &&
+      canonical(entry.content) === messageCanonical && (delivery === undefined || entry.delivery === delivery));
+    if (!match) {
+      if (this.controller.queuedInputSnapshot().length > 0) {
+        this.ambiguousInput = true;
+        this.invalidate();
+      }
+      return undefined;
+    }
+    return this.controller.consumeShadow(this.generation, match.id, this.controller.sessionId);
+  }
+
+  private successfulTool(id: string, result: Record<string, unknown>, ctx: MainGateContext | undefined): Record<string, unknown> {
+    if (ctx) this.arm(ctx);
+    const truncated = resultIsTruncated(result);
+    const observation = { terminated: false, truncated };
+    this.batch.successful.set(id, observation);
+    this.beginBatch();
+    if (!this.handle || !this.batch.ids.includes(id)) {
+      this.invalidate();
+      return result;
+    }
+    const finalized = this.controller.finalizeTool(this.handle, id, { owned: true, canTerminate: !truncated });
+    if (!finalized || truncated) {
+      this.controller.invalidateToolBatch(this.handle);
+      return result;
+    }
+    observation.terminated = true;
+    return this.controller.terminateResult(this.handle, id, result);
+  }
+
+  private arm(ctx: MainGateContext): void {
+    this.resetCompletedGeneration();
+    if (this.generation !== undefined || !GUARDED_OPENAI_APIS.has(ctx.model?.api ?? "")) return;
+    let usage: ContextUsageShape | undefined;
+    try {
+      usage = ctx.getContextUsage?.();
+    } catch {
+      usage = undefined;
+    }
+    const generation = this.controller.sample(usage, "tool");
+    if (generation !== undefined) {
+      this.generation = generation;
+      for (const accepted of this.acceptedBeforeArm.splice(0)) {
+        this.controller.shadowInput(generation, accepted.content, accepted.delivery);
+      }
+      this.beginBatch();
+      if (this.ambiguousInput && this.handle) this.controller.invalidateToolBatch(this.handle);
+    }
+  }
+
+  private beginBatch(allowEmpty = false): void {
+    if (this.handle || this.generation === undefined || (!allowEmpty && this.batch.ids.length === 0)) return;
+    this.handle = this.controller.beginToolBatch(this.generation, this.batch.ids);
+  }
+
+  private resetCompletedGeneration(): void {
+    if (this.generation === undefined || this.controller.snapshot().phase !== "idle") return;
+    this.generation = undefined;
+    this.handle = undefined;
+    this.abortIssued = undefined;
+    this.ambiguousInput = false;
+  }
+
+  private invalidate(): void {
+    if (this.handle) this.controller.invalidateToolBatch(this.handle);
+    else this.ambiguousInput = true;
+  }
+
+  private abortAfterBatch(ctx: MainGateContext): void {
+    const generation = this.generation;
+    if (generation === undefined ||
+        (this.abortIssued?.generation === generation && this.abortIssued.run === this.batch.run) ||
+        typeof ctx.abort !== "function") return;
+    let editor: string | undefined;
+    if (ctx.mode === "tui") {
+      try { editor = ctx.ui?.getEditorText?.(); } catch { editor = undefined; }
+    }
+    try {
+      ctx.abort();
+      this.abortIssued = { generation, run: this.batch.run };
+    } catch {
+      return;
+    } finally {
+      if (editor !== undefined) {
+        try { ctx.ui?.setEditorText?.(editor); } catch {
+          // Queue ownership does not depend on best-effort editor restoration.
+        }
+      }
+    }
+  }
+
+  private async cancelCurrent(kind: CancellationKind): Promise<void> {
+    const snapshot = this.controller.snapshot();
+    if (snapshot.phase !== "idle") await this.controller.cancel(snapshot.generation, kind);
+  }
+
+  private invalidateSessionState(): void {
+    this.generation = undefined;
+    this.handle = undefined;
+    this.batch = { run: {}, ids: [], final: new Map(), successful: new Map() };
+    this.abortIssued = undefined;
+    this.acceptedBeforeArm = [];
+    this.ambiguousInput = false;
+    this.sessionEpoch = {};
   }
 }
 

@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
 import { fakePi } from "./helpers/fake-pi.js";
 import { withCompactSearchRendering } from "../src/runtime/search-tool-render.js";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
+import { codexAbortGuardStreamSimple } from "../src/runtime/codex-abort-guard.js";
+import picc from "../src/index.js";
 
 /**
  * Pi upstream contract smoke test: asserts every Pi API PiCC
@@ -33,6 +35,97 @@ describe("pi 0.80.x API contract", () => {
       "CONFIG_DIR_NAME",
     ]) {
       expect(sdk[name], `missing pi export: ${name}`).toBeDefined();
+    }
+  });
+
+  it("claims the Codex API handler only once for the same extension registry", () => {
+    const isolated = fakePi();
+    picc(isolated.api as never);
+    picc(isolated.api as never);
+    expect(isolated.providerRegistrations.filter((entry) => entry.name === "picc-codex-abort-guard")).toHaveLength(1);
+  });
+
+  it("public Codex abort guard sends no HTTP/WebSocket request when pre-aborted and leaves normal auto transport enabled", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalWebSocket = globalThis.WebSocket;
+    let fetches = 0;
+    let sockets = 0;
+    class ThrowingWebSocket {
+      constructor() {
+        sockets += 1;
+        throw new Error("websocket probe");
+      }
+    }
+    globalThis.WebSocket = ThrowingWebSocket as never;
+    globalThis.fetch = (async () => {
+      fetches += 1;
+      return new Response(
+        'data: {"type":"response.completed","response":{"id":"r","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }) as typeof fetch;
+    const tokenPayload = Buffer.from(JSON.stringify({
+      "https://api.openai.com/auth": { chatgpt_account_id: "account" },
+    })).toString("base64url");
+    const model: any = {
+      id: "gpt-test", name: "GPT Test", api: "openai-codex-responses", provider: "openai-codex",
+      baseUrl: "https://example.invalid", reasoning: false, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1_000,
+    };
+    const context: any = { systemPrompt: "", messages: [] };
+    try {
+      const abort = new AbortController();
+      abort.abort();
+      const blocked = codexAbortGuardStreamSimple(model, context, {
+        apiKey: `x.${tokenPayload}.x`, signal: abort.signal, sessionId: "pre-aborted",
+      });
+      await blocked.result();
+      expect(fetches).toBe(0);
+      expect(sockets).toBe(0);
+
+      const normal = codexAbortGuardStreamSimple(model, context, {
+        apiKey: `x.${tokenPayload}.x`, sessionId: "normal-auto", maxRetries: 0,
+      });
+      await normal.result();
+      expect(sockets).toBe(1);
+      expect(fetches).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it("public OpenAI Responses and Completions transports send zero HTTP when pre-aborted", async () => {
+    const originalFetch = globalThis.fetch;
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches += 1;
+      throw new Error("pre-aborted transport reached fetch");
+    }) as typeof fetch;
+    const baseModel = {
+      id: "gpt-test", name: "GPT Test", provider: "openai", baseUrl: "https://example.invalid/v1",
+      reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 100_000, maxTokens: 1_000,
+    };
+    const context: any = { systemPrompt: "", messages: [] };
+    try {
+      for (const [subpath, api] of [
+        ["openai-responses", "openai-responses"],
+        ["openai-completions", "openai-completions"],
+      ] as const) {
+        const implementation: any = await import(`@earendil-works/pi-ai/api/${subpath}`);
+        const abort = new AbortController();
+        abort.abort();
+        const stream = implementation.streamSimple(
+          { ...baseModel, api },
+          context,
+          { apiKey: "test-key", signal: abort.signal },
+        );
+        await stream.result();
+      }
+      expect(fetches).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
     }
   });
 

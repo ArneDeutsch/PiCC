@@ -70,6 +70,11 @@ import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs
 import { wrapForSelfShell } from "./runtime/tool-shell.js";
 import { withCompactSearchRendering } from "./runtime/search-tool-render.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
+import {
+  MainSessionCheckpointExecutionBridge,
+  MainSessionCheckpointGate,
+} from "./runtime/mid-run-compaction.js";
+import { codexAbortGuardStreamSimple } from "./runtime/codex-abort-guard.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
@@ -251,6 +256,8 @@ export interface PiccTestSeam {
      * stop-all confirmation windows are observable under the same clock rule.
      */
     subagentPanelFocus: SubagentPanelFocusController;
+    mainCheckpointGate: MainSessionCheckpointGate;
+    checkpointExecution: MainSessionCheckpointExecutionBridge;
   }) => void;
   /**
    * TEST-ONLY subagent SDK override: replaces the real Pi SDK the session's
@@ -264,6 +271,8 @@ export interface PiccTestSeam {
    */
   sdk?: PiSdk;
 }
+
+const codexProviderRegistries = new WeakSet<object>();
 
 export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // UTF-8 stdio for any child process (fixes Windows cp1252 UnicodeEncodeError,
@@ -291,6 +300,22 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     console.error(`PiCC config: ${d.message}`);
   }
   const sessionId = randomUUID();
+  const checkpointExecution = new MainSessionCheckpointExecutionBridge();
+  const mainCheckpointGate = new MainSessionCheckpointGate(
+    checkpointExecution,
+    `pre-session:${sessionId}`,
+    config.compaction.proactiveCompactPercent,
+  );
+  // PiCC is the sole owner of this API handler while loaded. Supplying only these
+  // fields preserves Pi's built-in models, OAuth, credentials, options, and headers;
+  // arbitrary custom handlers for the same API are outside the guarded scope.
+  if (!codexProviderRegistries.has(pi)) {
+    codexProviderRegistries.add(pi);
+    pi.registerProvider("picc-codex-abort-guard", {
+      api: "openai-codex-responses",
+      streamSimple: codexAbortGuardStreamSimple,
+    });
+  }
   const cwdState = new CwdState(project.cwd);
   // Hook payload `transcript_path`: Pi's session manager (captured on
   // session_start) exposes the session file — the closest analog to Claude's
@@ -905,6 +930,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       subagentRuntime,
       subagentPanel,
       subagentPanelFocus,
+      mainCheckpointGate,
+      checkpointExecution,
     });
   } catch (err) {
     console.error(`PiCC test seam onWired failed: ${(err as Error).message}`);
@@ -1077,7 +1104,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       const mainSessionTool: Record<string, unknown> = tool.name === "Grep" || tool.name === "Glob"
         ? withCompactSearchRendering(tool as unknown as ToolDefinition) as unknown as Record<string, unknown>
         : tool;
-      pi.registerTool(wrapForSelfShell(mainSessionTool));
+      pi.registerTool(mainCheckpointGate.wrapTool(wrapForSelfShell(mainSessionTool)));
     } catch (err) {
       console.error(`PiCC: failed to register tool: ${(err as Error).message}`);
     }
@@ -1140,7 +1167,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         ...(shellPath ? { shellPath } : {}),
       });
       for (const { def } of builtins) {
-        pi.registerTool(wrapForSelfShell(def));
+        pi.registerTool(mainCheckpointGate.wrapTool(wrapForSelfShell(def)));
       }
       // `!` user-bash commands also get the pinned Git Bash (and the effective cwd).
       if (shellPath && typeof sdk.createLocalBashOperations === "function") {
@@ -1276,7 +1303,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // ---------------------------------------------------------------------------
   // Session lifecycle
   // ---------------------------------------------------------------------------
+  pi.on("session_before_switch", async () => {
+    return mainCheckpointGate.beforeSessionSwitch();
+  });
+
   pi.on("session_start", async (event: any, ctx: any) => {
+    await mainCheckpointGate.startSession(randomUUID());
     try {
       modelRegistryRef = ctx.modelRegistry;
       sessionManagerRef = ctx.sessionManager;
@@ -1341,6 +1373,33 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   });
 
+  pi.on("message_end", (event: any) => {
+    mainCheckpointGate.assistantMessageEnded(event?.message);
+  });
+
+  pi.on("message_start", (event: any) => {
+    mainCheckpointGate.userMessageStarted(
+      event?.message,
+      event?.streamingBehavior ?? event?.delivery ?? event?.message?.delivery,
+    );
+  });
+
+  pi.on("tool_execution_end", (event: any) => {
+    mainCheckpointGate.toolExecutionEnded(event);
+  });
+
+  pi.on("turn_end", (_event: any, ctx: any) => {
+    mainCheckpointGate.turnEnded(ctx);
+  });
+
+  pi.on("turn_start", (_event: any, ctx: any) => {
+    mainCheckpointGate.defensiveLatch(ctx);
+  });
+
+  pi.on("before_provider_request", (_event: any, ctx: any) => {
+    mainCheckpointGate.defensiveLatch(ctx);
+  });
+
   pi.on("session_shutdown", async (event: any) => {
     try {
       // `reason` is the matcher subject for SessionEnd (Claude wire contract).
@@ -1352,6 +1411,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   pi.on("input", async (event: any, ctx: any) => {
     try {
+      if (mainCheckpointGate.authorizeReplay(event)) return { action: "continue" };
       if (event.source === "extension") return { action: "continue" };
 
       // Every transforming path below rewrites the turn text, but Pi may have
@@ -1360,10 +1420,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // assemble a text-only turn, silently losing the image. Carry the
       // captured blocks forward on every transform — unchanged and in order,
       // additive (prepend any images the branch itself produced; none do
-      // today, but keep it composable). This forwards genuine user captures
-      // only: `source === "extension"` (model/extension-synthesized text)
-      // already returned above, so every remaining source (interactive/rpc)
-      // is genuine user/host input, not model-synthesized. This does NOT
+      // today, but keep it composable). Only genuine user captures enter this
+      // pipeline; an authenticated replay already completed it and returned above.
+      // This does NOT
       // scrape image paths out of prose — the model `Read`s those (a
       // deliberate non-goal).
       type TransformResult = { action: "transform"; text: string; images?: unknown[] };
@@ -1371,6 +1430,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         const captured = Array.isArray(event.images) ? event.images : [];
         if (captured.length === 0) return result;
         return { ...result, images: [...(result.images ?? []), ...captured] };
+      };
+      const accept = <T extends { action: "continue" } | TransformResult>(result: T): T => {
+        const text = result.action === "transform" ? result.text : String(event.text ?? "");
+        const images = result.action === "transform" ? result.images : event.images;
+        mainCheckpointGate.captureAcceptedInput(ctx, text, images, event.streamingBehavior);
+        return result;
       };
 
       // 0) PiCC control commands (/doctor /compat /quota /skills /agents /usage).
@@ -1502,13 +1567,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // The trailing text is NOT re-appended as its own part: the last
         // skill's rendered activation already carries it as $ARGUMENTS (or via
         // the ARGUMENTS: fallback), so a second copy would duplicate the request.
-        return withCapturedImages({ action: "transform", text: parts.join("\n\n") + hookSuffix });
+        return accept(withCapturedImages({ action: "transform", text: parts.join("\n\n") + hookSuffix }));
       }
 
       if (hookSuffix) {
-        return withCapturedImages({ action: "transform", text: `${text}${hookSuffix}` });
+        return accept(withCapturedImages({ action: "transform", text: `${text}${hookSuffix}` }));
       }
-      return { action: "continue" };
+      return accept({ action: "continue" });
     } catch (err) {
       debug(`input handler error: ${(err as Error).message}`);
       return { action: "continue" };
@@ -1522,10 +1587,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // larger reserveTokens, and the primary resilience lever. Degrade, never throw:
     // getContextUsage() may be undefined and percent/tokens may be null.
     try {
-      // A prior proactive compaction's in-flight marker never legitimately survives to the
-      // next settled turn (its session_before_compact fires during that compaction, before the
-      // retried turn settles), so any marker still set here is stale — clear it so a later user
-      // /compact is never misread as auto.
+      // The one-shot trigger must not classify a later user /compact as automatic.
       proactiveCompactInFlight = false;
       let usage: ContextUsageShape | undefined;
       try {
@@ -1534,7 +1596,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         usage = undefined;
       }
       const threshold = config.compaction.proactiveCompactPercent;
-      const decision = decideProactiveCompaction(usage, threshold, proactivePending);
+      const decision = mainCheckpointGate.isActive()
+        ? { compact: false, pending: proactivePending }
+        : decideProactiveCompaction(usage, threshold, proactivePending);
       proactivePending = decision.pending;
       if (decision.compact) {
         const at =
@@ -1624,10 +1688,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("session_compact", async () => {
-    // Compaction succeeded (this event is success-only): clear the proactive pending flag and
-    // open the cooldown window so the next few turns can't back-to-back re-compact if usage
-    // stayed at/above threshold (a silent failure fires no event and instead re-fires via the
-    // bounded pending fallback).
+    // Success clears the pending flag and opens the anti-thrash cooldown window.
     proactivePending = pendingStateAfterCompaction();
     try {
       await hooks.fire("PostCompact", { cwd: cwdState.get() });
