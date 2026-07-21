@@ -64,7 +64,7 @@ Two objects matter:
 | Goal | Verdict | Mechanism |
 |---|---|---|
 | Custom framing of **our own** tool call/result | **Easy** | `renderCall`/`renderResult` + `renderShell: "self"` on the `ToolDefinition` |
-| Remove blank lines / gutter around a tool row | **Done (generic wrapper, plus Edit inner adapter) · Impossible (inter-block)** | `renderShell: "self"` + per-line `theme.bg` re-apply in `wrapForSelfShell`; Edit's renderer adds its own nested padding, removed by `withRoutineToolRendering` before generic framing; inter-block spacing is render-loop-internal |
+| Remove vertical padding / blank rows around a tool row | **Done (generic wrapper, plus Edit inner adapter) · Impossible (inter-block)** | `renderShell: "self"` + per-line `theme.bg` re-apply in `wrapForSelfShell`; the one-column horizontal gutter remains; Edit's renderer adds its own nested padding, removed by `withRoutineToolRendering` before generic framing; inter-block spacing is render-loop-internal |
 | Colors in our own components | **Easy** | `theme.fg("<slot>", text)`, `theme.bg`, `theme.bold/italic/...`, or raw ANSI |
 | Re-skin the whole UI / switch themes | **Medium** | `ctx.ui.setTheme`, `new Theme(...)`, ship theme JSON via `resources_discover` |
 | Add a **new named color role** | **Impossible** | `ThemeColor` union is closed |
@@ -406,5 +406,7 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
    "Risks / churn watchpoints" in [`doc/pi-integration.md`](pi-integration.md) and cover the
    import/shape in the Pi-contract smoke test — these are the newest, most-churning parts of the
    API.
-8. **Parity check:** a Claude Code project does not expect PiCC-specific chrome. Make new UI additive
-   and opt-in, not something that changes how an unmodified project renders.
+8. **Parity check:** a Claude Code project does not expect PiCC-specific persistent or interactive
+   chrome. Make that UI additive and opt-in. Default tool-presentation adapters may apply
+   automatically when they change only human rendering, preserve canonical results, and keep
+   failures and unfamiliar outcomes visible.
