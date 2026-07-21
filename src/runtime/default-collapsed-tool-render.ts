@@ -2,7 +2,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 interface Component { render(width: number): string[] }
-type ToolName = "read" | "write";
+type ToolName = "read" | "write" | "bash";
 type Data = Record<string, unknown>;
 type NativeCall = (args: unknown, theme: unknown, context: unknown) => Component;
 type NativeResult = (result: unknown, options: unknown, theme: unknown, context: unknown) => Component;
@@ -11,9 +11,14 @@ interface Lifecycle {
   settledObserved: boolean;
   nativeCall?: Component;
   nativeResult?: Component;
+  nativeArgs?: Data;
 }
-interface ArgsSnapshot { path: string; content?: string; offset?: number; limit?: number }
-interface OrdinarySnapshot { path: string; hiddenLines: number; range?: string }
+interface FileArgsSnapshot { path: string; content?: string; offset?: number; limit?: number }
+interface BashArgsSnapshot { command: string; timeout?: number }
+type ArgsSnapshot = FileArgsSnapshot | BashArgsSnapshot;
+interface FileOrdinarySnapshot { kind: "file"; path: string; hiddenLines: number; range?: string }
+interface BashOrdinarySnapshot { kind: "bash"; commandLines: number; outputLines: number; duration?: string }
+type OrdinarySnapshot = FileOrdinarySnapshot | BashOrdinarySnapshot;
 
 type Snapshot<T = unknown> =
   | { kind: "complete"; value: T }
@@ -138,7 +143,7 @@ function lifecycleFor(context: unknown): Lifecycle | undefined {
   } catch { return undefined; }
 }
 
-function sanitize(value: string, maxChars: number, inline: boolean): string {
+function sanitize(value: string, maxChars: number, inline: boolean, unsafeReplacement = REPLACEMENT): string {
   let source: string;
   try { source = value.slice(0, maxChars).normalize("NFC"); } catch { return ""; }
   let output = "";
@@ -161,7 +166,7 @@ function sanitize(value: string, maxChars: number, inline: boolean): string {
         if (current === 0x1b && source.charCodeAt(index + 1) === 0x5c) { index += 2; break; }
         index++;
       }
-      output += REPLACEMENT;
+      output += unsafeReplacement;
       continue;
     }
     const codePoint = source.codePointAt(index) ?? code;
@@ -171,7 +176,7 @@ function sanitize(value: string, maxChars: number, inline: boolean): string {
     if (code === 0x0a) output += inline ? " " : "\n";
     else if (code === 0x09) output += "   ";
     else if (code === 0x1b || code < 0x20 || (code >= 0x7f && code <= 0x9f) || /\p{Cf}/u.test(character)) {
-      output += REPLACEMENT;
+      output += unsafeReplacement;
     } else output += character;
     index += codeUnits;
   }
@@ -202,7 +207,7 @@ function sanitizeArgsDto(value: unknown): Data | undefined {
     if (typeof key !== "string") continue;
     const field = ownData(data, key);
     const sanitized = typeof field === "string"
-      ? sanitize(field, key === "content" ? MAX_TEXT_CHARS : MAX_PATH_CHARS, key !== "content")
+      ? sanitize(field, key === "content" || key === "command" ? MAX_TEXT_CHARS : MAX_PATH_CHARS, key !== "content" && key !== "command")
       : sanitizeDto(field, 1);
     Object.defineProperty(result, key, { value: sanitized, enumerable: true, configurable: true, writable: true });
   }
@@ -242,6 +247,12 @@ function keyHint(): string | undefined {
 }
 
 function argsFrom(value: unknown, toolName: ToolName): ArgsSnapshot | undefined {
+  if (toolName === "bash") {
+    const data = oneExact(value, [["command"], ["command", "timeout"]]);
+    if (!data || typeof data.command !== "string") return undefined;
+    if (data.timeout !== undefined && (!Number.isFinite(data.timeout) || (data.timeout as number) <= 0)) return undefined;
+    return { command: data.command, ...(typeof data.timeout === "number" ? { timeout: data.timeout } : {}) };
+  }
   const shapes = toolName === "write" ? [["path", "content"]] as const
     : [["path"], ["path", "offset"], ["path", "limit"], ["path", "offset", "limit"]] as const;
   const data = oneExact(value, shapes);
@@ -280,22 +291,57 @@ function logicalLineCount(value: string): Snapshot<number> {
   }
   return { kind: "complete", value: retainedLines };
 }
+function bashDisplayLineCount(value: string): Snapshot<number> {
+  // Count the same detached, terminal-safe DTO that native expansion receives.
+  const display = sanitize(value, MAX_TEXT_CHARS, false).trim();
+  if (!display) return { kind: "complete", value: 0 };
+  let lines = 1;
+  for (let index = 0; index < display.length; index++) {
+    if (display.charCodeAt(index) !== 0x0a) continue;
+    lines++;
+    if (lines > MAX_DISPLAY_LINES) return { kind: "capped", budget: "elements" };
+  }
+  return { kind: "complete", value: lines };
+}
 function hasReadNotice(text: string): boolean {
   return /(?:^|\n)\[(?:Showing lines |Line \d+ is |\d+ more lines in file\.|PiCC clipped |Truncated:|First line exceeds)/u.test(text);
 }
-function ordinary(toolName: ToolName, args: ArgsSnapshot, result: unknown): Snapshot<OrdinarySnapshot> {
+function nativeDuration(context: unknown): string | undefined {
+  const state = ownData(context, "state");
+  const startedAt = ownData(state, "startedAt");
+  const endedAt = ownData(state, "endedAt");
+  if (typeof startedAt !== "number" || !Number.isFinite(startedAt) ||
+    typeof endedAt !== "number" || !Number.isFinite(endedAt) || endedAt < startedAt) return undefined;
+  return `${((endedAt - startedAt) / 1000).toFixed(1)}s`;
+}
+function ordinary(toolName: ToolName, args: ArgsSnapshot, result: unknown, context: unknown): Snapshot<OrdinarySnapshot> {
   const envelope = resultEnvelope(result);
   if (!envelope || ("isError" in envelope && envelope.isError !== false) || envelope.details !== undefined) return { kind: "malformed" };
   const blocks = contentBlocks(envelope.content);
   if (!blocks || blocks.length !== 1) return { kind: "malformed" };
   const text = textBlock(blocks[0]);
   if (text === undefined) return { kind: "malformed" };
+  if (toolName === "bash") {
+    if (!("command" in args)) return { kind: "malformed" };
+    // Stock Bash displays `...` for an empty command; count the same sanitized display value delegated to it.
+    const commandDisplay = sanitize(args.command, MAX_TEXT_CHARS, false) || "...";
+    const commandCount = logicalLineCount(commandDisplay);
+    const outputCount = text === "(no output)" ? { kind: "complete", value: 0 } as const : bashDisplayLineCount(text);
+    if (commandCount.kind !== "complete") return commandCount;
+    if (outputCount.kind !== "complete") return outputCount;
+    const duration = nativeDuration(context);
+    return { kind: "complete", value: {
+      kind: "bash", commandLines: commandCount.value, outputLines: outputCount.value,
+      ...(duration === undefined ? {} : { duration }),
+    } };
+  }
+  if (!("path" in args)) return { kind: "malformed" };
   if (toolName === "read") {
     if (hasReadNotice(text) || text.startsWith("Read image file [")) return { kind: "malformed" };
     const count = logicalLineCount(text);
     return count.kind === "complete" ? {
       kind: "complete", value: {
-        path: args.path, hiddenLines: count.value,
+        kind: "file", path: args.path, hiddenLines: count.value,
         ...((args.offset !== undefined || args.limit !== undefined) ? {
           range: `:${args.offset ?? 1}${args.limit === undefined ? "" : `-${(args.offset ?? 1) + args.limit - 1}`}`,
         } : {}),
@@ -304,7 +350,7 @@ function ordinary(toolName: ToolName, args: ArgsSnapshot, result: unknown): Snap
   }
   if (args.content === undefined || text !== `Successfully wrote ${args.content.length} bytes to ${args.path}`) return { kind: "malformed" };
   const count = logicalLineCount(args.content);
-  return count.kind === "complete" ? { kind: "complete", value: { path: args.path, hiddenLines: count.value } } : count;
+  return count.kind === "complete" ? { kind: "complete", value: { kind: "file", path: args.path, hiddenLines: count.value } } : count;
 }
 
 function recognizedContent(value: unknown): boolean {
@@ -335,13 +381,29 @@ function recognizedReadDetails(value: unknown): boolean {
   return ["totalLines", "totalBytes", "outputLines", "outputBytes", "maxLines", "maxBytes"]
     .every((key) => Number.isSafeInteger(truncation[key]) && (truncation[key] as number) >= 0);
 }
+function recognizedBashDetails(value: unknown): boolean {
+  if (value === undefined) return true;
+  const details = oneExact(value, [["truncation"], ["fullOutputPath"], ["truncation", "fullOutputPath"]]);
+  if (!details) return false;
+  if (details.fullOutputPath !== undefined && typeof details.fullOutputPath !== "string") return false;
+  return recognizedReadDetails(details.truncation === undefined ? undefined : { truncation: details.truncation });
+}
 function delegable(toolName: ToolName, args: ArgsSnapshot, result: unknown): { args: Data; result: Data } | undefined {
   const envelope = resultEnvelope(result);
   if (!envelope || !recognizedContent(envelope.content) ||
-    (toolName === "write" ? envelope.details !== undefined : !recognizedReadDetails(envelope.details))) return undefined;
-  const rawArgs: Data = toolName === "write"
-    ? { path: args.path, content: args.content }
-    : { path: args.path, ...(args.offset !== undefined ? { offset: args.offset } : {}), ...(args.limit !== undefined ? { limit: args.limit } : {}) };
+    (toolName === "write" ? envelope.details !== undefined
+      : toolName === "bash" ? !recognizedBashDetails(envelope.details) : !recognizedReadDetails(envelope.details))) return undefined;
+  let rawArgs: Data;
+  if (toolName === "bash") {
+    if (!("command" in args)) return undefined;
+    rawArgs = { command: args.command, ...(args.timeout !== undefined ? { timeout: args.timeout } : {}) };
+  } else if (toolName === "write") {
+    if (!("path" in args)) return undefined;
+    rawArgs = { path: args.path, content: args.content };
+  } else {
+    if (!("path" in args)) return undefined;
+    rawArgs = { path: args.path, ...(args.offset !== undefined ? { offset: args.offset } : {}), ...(args.limit !== undefined ? { limit: args.limit } : {}) };
+  }
   return { args: sanitizeArgsDto(rawArgs) as Data, result: sanitizeDto(result) as Data };
 }
 function failure(snapshotResult: Snapshot): string {
@@ -376,7 +438,32 @@ function nativeContext(context: unknown, args: Data, lastComponent: Component | 
   };
 }
 function summaryComponent(toolName: ToolName, snapshotValue: OrdinarySnapshot, hint: string, theme: unknown): Component {
-  const identity = toolName === "read" ? "Read" : "Write";
+  const identity = toolName === "read" ? "Read" : toolName === "write" ? "Write" : "Bash";
+  if (snapshotValue.kind === "bash") {
+    const output = snapshotValue.outputLines === 0 ? "(no output)"
+      : `${snapshotValue.outputLines} output ${snapshotValue.outputLines === 1 ? "line" : "lines"} hidden`;
+    const outputFallback = snapshotValue.outputLines === 0 ? output : "output hidden";
+    const expansion = `${hint} to expand`;
+    const command = `${snapshotValue.commandLines} command ${snapshotValue.commandLines === 1 ? "line" : "lines"} hidden`;
+    return { render(width: number): string[] {
+      if (!Number.isFinite(width) || width <= 0) return [""];
+      const columns = Math.floor(width);
+      let line = clamp(safeTheme(theme, "fg", ["toolTitle", safeTheme(theme, "bold", [identity], identity)], identity), columns);
+      const append = (text: string, slot: "dim" | "muted"): boolean => {
+        const segment = safeTheme(theme, "fg", [slot, ` · ${text}`], ` · ${text}`);
+        try {
+          if (visibleWidth(line + segment) > columns) return false;
+          line += segment;
+          return true;
+        } catch { return false; }
+      };
+      if (!append(output, "muted") && (outputFallback === output || !append(outputFallback, "muted"))) return [clamp(line, columns)];
+      if (!append(expansion, "dim")) return [clamp(line, columns)];
+      if (snapshotValue.duration !== undefined && !append(snapshotValue.duration, "muted")) return [clamp(line, columns)];
+      append(command, "muted");
+      return [clamp(line, columns)];
+    } };
+  }
   const path = sanitize(snapshotValue.path, MAX_PATH_CHARS, true);
   const range = sanitize(snapshotValue.range ?? "", MAX_PATH_CHARS, true);
   const count = `${snapshotValue.hiddenLines} ${snapshotValue.hiddenLines === 1 ? "line" : "lines"} hidden`;
@@ -447,7 +534,7 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
     const name = Object.getOwnPropertyDescriptor(tool, "name");
     const call = Object.getOwnPropertyDescriptor(tool, "renderCall");
     const result = Object.getOwnPropertyDescriptor(tool, "renderResult");
-    if (!name || !("value" in name) || (name.value !== "read" && name.value !== "write") ||
+    if (!name || !("value" in name) || (name.value !== "read" && name.value !== "write" && name.value !== "bash") ||
       !call || !("value" in call) || typeof call.value !== "function" ||
       !result || !("value" in result) || typeof result.value !== "function") return tool;
     descriptors = Object.getOwnPropertyDescriptors(tool);
@@ -459,6 +546,30 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
   delete descriptors.renderResult;
   let decorated: T;
   try { decorated = Object.defineProperties({}, descriptors) as T; } catch { return tool; }
+
+  function finalizeBash(
+    lifecycle: Lifecycle,
+    args: Data | undefined,
+    result: Data | undefined,
+    expanded: boolean,
+    theme: unknown,
+    context: unknown,
+  ): { component?: Component; failed: boolean } {
+    const displayArgs = args ?? lifecycle.nativeArgs ?? { command: "" };
+    try {
+      const component = nativeResult(
+        result ?? { content: [], details: undefined },
+        { expanded, isPartial: false },
+        theme,
+        nativeContext(context, displayArgs, lifecycle.nativeResult, expanded),
+      );
+      lifecycle.nativeResult = component;
+      return { component, failed: false };
+    } catch { return { failed: true }; }
+  }
+  function cleanupFailed(primary: string, theme: unknown): Component {
+    return statusComponent(`${primary} · Native cleanup failed`, theme);
+  }
 
   Object.defineProperties(decorated, {
     renderCall: { configurable: true, enumerable: true, writable: true, value(argsValue: unknown, theme: unknown, context: unknown): Component {
@@ -474,6 +585,7 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
       try {
         const component = nativeCall(dto, theme, nativeContext(context, dto, lifecycle.nativeCall, forceExpanded || ownBoolean(context, "expanded") === true));
         lifecycle.nativeCall = component;
+        if (toolName === "bash") lifecycle.nativeArgs = dto;
         if (settled) lifecycle.settledObserved = true;
         return settled && hint ? emptyComponent() : component;
       } catch { return statusComponent("Renderer failed", theme); }
@@ -483,12 +595,59 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
       const argsInspection = inspect(ownData(context, "args"));
       const resultInspection = inspect(resultValue);
       const args = argsInspection.kind === "complete" ? argsFrom(argsInspection.value, toolName) : undefined;
-      if (!lifecycle || !args || argsInspection.kind !== "complete") return statusComponent(argsFailure(argsInspection), theme);
-      if (resultInspection.kind !== "complete") return statusComponent(failure(resultInspection), theme);
-      const hint = keyHint();
-      const settled = ownBoolean(options, "isPartial") === false && ownBoolean(context, "isError") !== undefined;
       const expanded = ownBoolean(options, "expanded") === true;
-      if (!settled) {
+      if (!lifecycle) return statusComponent(argsFailure(argsInspection), theme);
+
+      if (toolName !== "bash") {
+        if (!args || argsInspection.kind !== "complete") return statusComponent(argsFailure(argsInspection), theme);
+        if (resultInspection.kind !== "complete") return statusComponent(failure(resultInspection), theme);
+        const hint = keyHint();
+        const settled = ownBoolean(options, "isPartial") === false && ownBoolean(context, "isError") !== undefined;
+        if (!settled) {
+          const resultRecord = record(resultInspection.value);
+          if (!resultRecord) return statusComponent("Unfamiliar result", theme);
+          const displayArgs = sanitizeArgsDto(argsInspection.value) as Data;
+          const displayResult = sanitizeDto(resultRecord) as Data;
+          try {
+            const component = nativeResult(displayResult, { expanded, isPartial: true }, theme,
+              nativeContext(context, displayArgs, lifecycle.nativeResult, expanded));
+            lifecycle.nativeResult = component;
+            return component;
+          } catch { return statusComponent("Renderer failed", theme); }
+        }
+        const safe = delegable(toolName, args, resultInspection.value);
+        if (!safe) return statusComponent("Unfamiliar result", theme);
+        const owned = lifecycle.settledObserved && Boolean(hint);
+        const isOrdinary = ownBoolean(context, "isError") === false
+          ? ordinary(toolName, args, resultInspection.value, context) : { kind: "malformed" } as const;
+        if (isOrdinary.kind === "capped") return statusComponent(failure(isOrdinary), theme);
+        if (owned && isOrdinary.kind === "complete" && !expanded) {
+          return summaryComponent(toolName, isOrdinary.value, hint as string, theme);
+        }
+        const forceExpanded = !hint;
+        try {
+          const resultComponent = nativeResult(
+            safe.result,
+            { expanded: forceExpanded || expanded, isPartial: false },
+            theme,
+            nativeContext(context, safe.args, lifecycle.nativeResult, forceExpanded || expanded),
+          );
+          lifecycle.nativeResult = resultComponent;
+          if (!owned) return resultComponent;
+          if (!lifecycle.nativeCall) return statusComponent("Unfamiliar result", theme);
+          if (isOrdinary.kind === "complete") return combined([lifecycle.nativeCall, resultComponent], theme);
+          return combined([statusComponent("Elaborated result", theme), lifecycle.nativeCall, resultComponent], theme);
+        } catch { return statusComponent("Renderer failed", theme); }
+      }
+
+      const optionsFinal = ownBoolean(options, "isPartial") === false;
+      const contextFinal = ownBoolean(context, "isPartial") === false;
+      const contextError = ownBoolean(context, "isError") === true;
+      const nativeFinal = optionsFinal || contextFinal || contextError;
+      const compactContext = optionsFinal && contextFinal && ownBoolean(context, "isError") === false;
+      if (!optionsFinal && !nativeFinal) {
+        if (!args || argsInspection.kind !== "complete") return statusComponent(argsFailure(argsInspection), theme);
+        if (resultInspection.kind !== "complete") return statusComponent(failure(resultInspection), theme);
         const resultRecord = record(resultInspection.value);
         if (!resultRecord) return statusComponent("Unfamiliar result", theme);
         const displayArgs = sanitizeArgsDto(argsInspection.value) as Data;
@@ -500,26 +659,64 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
           return component;
         } catch { return statusComponent("Renderer failed", theme); }
       }
-      const safe = delegable(toolName, args, resultInspection.value);
-      if (!safe) return statusComponent("Unfamiliar result", theme);
-      const owned = lifecycle.settledObserved && settled && Boolean(hint);
-      const isOrdinary = ownBoolean(context, "isError") === false ? ordinary(toolName, args, resultInspection.value) : { kind: "malformed" } as const;
-      if (isOrdinary.kind === "capped") return statusComponent(failure(isOrdinary), theme);
 
-      if (owned && isOrdinary.kind === "complete" && !expanded) return summaryComponent(toolName, isOrdinary.value, hint as string, theme);
-      const forceExpanded = !hint && settled;
+      const displayArgs = argsInspection.kind === "complete" && record(argsInspection.value)
+        ? sanitizeArgsDto(argsInspection.value) : undefined;
+      const inspectedResult = resultInspection.kind === "complete" ? resultInspection.value : undefined;
+      const safe = args && resultInspection.kind === "complete" ? delegable(toolName, args, inspectedResult) : undefined;
+      const hint = keyHint();
+      const owned = lifecycle.settledObserved && Boolean(hint);
+      const forceExpanded = !hint;
+      const classificationArgs = safe ? argsFrom(safe.args, "bash") : undefined;
+      let isOrdinary: Snapshot<OrdinarySnapshot> = compactContext && classificationArgs && resultInspection.kind === "complete"
+        ? ordinary("bash", classificationArgs, inspectedResult, context)
+        : { kind: "malformed" };
+      let primary: string | undefined;
+      if (!args || argsInspection.kind !== "complete") primary = argsFailure(argsInspection);
+      else if (resultInspection.kind !== "complete") primary = failure(resultInspection);
+      else if (!safe) primary = "Unfamiliar result";
+      else if (!compactContext || isOrdinary.kind === "malformed") primary = "Elaborated result";
+      else if (isOrdinary.kind === "capped") primary = failure(isOrdinary);
+
+      let resultComponent: Component | undefined;
+      if (toolName === "bash" && nativeFinal) {
+        const finalized = finalizeBash(
+          lifecycle,
+          safe?.args ?? displayArgs,
+          safe?.result,
+          forceExpanded || expanded,
+          theme,
+          context,
+        );
+        if (finalized.failed) return cleanupFailed(primary ?? "Renderer failed", theme);
+        resultComponent = finalized.component;
+        if (!primary && compactContext && classificationArgs && resultInspection.kind === "complete") {
+          isOrdinary = ordinary("bash", classificationArgs, inspectedResult, context);
+        }
+      }
+      if (primary && primary !== "Elaborated result") return statusComponent(primary, theme);
+      if (primary === "Elaborated result" && toolName === "bash") {
+        if (hint && lifecycle.nativeCall && resultComponent) {
+          return combined([statusComponent(primary, theme), lifecycle.nativeCall, resultComponent], theme);
+        }
+        return resultComponent ?? statusComponent(primary, theme);
+      }
+      if (!safe) return statusComponent("Unfamiliar result", theme);
+      if (owned && isOrdinary.kind === "complete" && !expanded) {
+        return summaryComponent(toolName, isOrdinary.value, hint as string, theme);
+      }
       try {
-        const resultComponent = nativeResult(
+        const visibleResult = resultComponent ?? nativeResult(
           safe.result,
-          { expanded: forceExpanded || expanded, isPartial: !settled },
+          { expanded: forceExpanded || expanded, isPartial: false },
           theme,
           nativeContext(context, safe.args, lifecycle.nativeResult, forceExpanded || expanded),
         );
-        lifecycle.nativeResult = resultComponent;
-        if (!owned) return resultComponent;
+        lifecycle.nativeResult = visibleResult;
+        if (!owned) return visibleResult;
         if (!lifecycle.nativeCall) return statusComponent("Unfamiliar result", theme);
-        if (isOrdinary.kind === "complete") return combined([lifecycle.nativeCall, resultComponent], theme);
-        return combined([statusComponent("Elaborated result", theme), lifecycle.nativeCall, resultComponent], theme);
+        if (isOrdinary.kind === "complete") return combined([lifecycle.nativeCall, visibleResult], theme);
+        return combined([statusComponent("Elaborated result", theme), lifecycle.nativeCall, visibleResult], theme);
       } catch { return statusComponent("Renderer failed", theme); }
     } },
   });

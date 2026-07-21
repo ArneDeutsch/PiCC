@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -283,7 +283,97 @@ describe("real Pi default-collapsed rendering contract", () => {
     expect((resultEntries[1]!.last as { id: number }).id).toBe(3);
   }));
 
-  it("keeps complete stock Read and Write HTML exports on Pi's unchanged native path", async () => {
+  it("keeps two stock Bash rows independent through repeated partials, settlement, expansion, and error", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    await withExpansionBindingAsync(["ctrl+k"], async () => {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(10_000);
+        const make = (id: string, command: string) => new sdk.ToolExecutionComponent(
+          "bash", id, { command }, {},
+          wrapForSelfShell(withDefaultCollapsedToolRendering(sdk.createBashToolDefinition(process.cwd()))),
+          { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+        );
+        const first = make("bash-contract-a", "TOKEN=A-command-secret printf A-output-secret");
+        const second = make("bash-contract-b", "TOKEN=B-command-secret printf B-output-secret");
+        const firstState = first.rendererState as Record<string, unknown>;
+        const secondState = second.rendererState as Record<string, unknown>;
+
+        for (const row of [first, second]) {
+          row.setArgsComplete();
+          row.markExecutionStarted();
+          row.render(100);
+        }
+        first.updateResult({ content: [{ type: "text", text: "A-rolling-one" }], details: undefined }, true);
+        first.render(100);
+        const firstNative = (first.resultRendererComponent as { __inner?: unknown }).__inner;
+        first.updateResult({ content: [{ type: "text", text: "A-rolling-two" }], details: undefined }, true);
+        expect((first.render(100) as string[]).map(stripAnsi).join("\n")).toContain("A-rolling-two");
+        expect((first.resultRendererComponent as { __inner?: unknown }).__inner).toBe(firstNative);
+
+        second.updateResult({ content: [{ type: "text", text: "B-rolling-one" }], details: undefined }, true);
+        second.render(100);
+        const secondNative = (second.resultRendererComponent as { __inner?: unknown }).__inner;
+        second.updateResult({ content: [{ type: "text", text: "B-rolling-two" }], details: undefined }, true);
+        expect((second.render(100) as string[]).map(stripAnsi).join("\n")).toContain("B-rolling-two");
+        expect((second.resultRendererComponent as { __inner?: unknown }).__inner).toBe(secondNative);
+        expect(vi.getTimerCount()).toBe(2);
+
+        vi.setSystemTime(11_250);
+        first.updateResult({ content: [{ type: "text", text: "A-output-secret\nA-second" }], details: undefined }, false);
+        const collapsed = (first.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(collapsed).toContain("Bash · 2 output lines hidden · ctrl+k to expand · 1.3s · 1 command line hidden");
+        expect(collapsed).not.toContain("A-command-secret");
+        expect(collapsed).not.toContain("A-output-secret");
+        expect(firstState.endedAt).toBe(11_250);
+        expect(secondState.endedAt).toBeUndefined();
+        expect(vi.getTimerCount()).toBe(1);
+
+        first.setExpanded(true);
+        const expanded = (first.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(expanded).toContain("A-command-secret");
+        expect(expanded).toContain("A-output-secret");
+        expect(expanded).toContain("Took 1.3s");
+        expect((second.render(100) as string[]).map(stripAnsi).join("\n")).toContain("B-rolling-two");
+        expect(vi.getTimerCount()).toBe(1);
+        first.setExpanded(false);
+
+        vi.setSystemTime(13_000);
+        second.updateResult({ content: [{ type: "text", text: "Command timed out after B-error-sentinel" }], details: undefined, isError: true }, false);
+        const error = (second.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(error).toContain("B-error-sentinel");
+        expect(error).toContain("Took 3.0s");
+        expect(error).not.toContain("output lines hidden");
+        expect(secondState.endedAt).toBe(13_000);
+        expect(firstState.endedAt).toBe(11_250);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally { vi.useRealTimers(); }
+    });
+  });
+
+  it("keeps a final unbound stock Bash command and output native without arming a timer", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    withExpansionBinding([], () => {
+      vi.useFakeTimers();
+      try {
+        const component = new sdk.ToolExecutionComponent(
+          "bash", "bash-unbound", { command: "printf unbound-command-sentinel" }, {},
+          wrapForSelfShell(withDefaultCollapsedToolRendering(sdk.createBashToolDefinition(process.cwd()))),
+          { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+        );
+        component.updateResult({ content: [{ type: "text", text: "unbound-output-sentinel" }], details: undefined }, false);
+        const rendered = (component.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(rendered).toContain("unbound-command-sentinel");
+        expect(rendered).toContain("unbound-output-sentinel");
+        expect(rendered).not.toContain("hidden");
+        expect(vi.getTimerCount()).toBe(0);
+      } finally { vi.useRealTimers(); }
+    });
+  });
+
+  it("keeps complete stock Read, Write, and Bash HTML exports on Pi's unchanged native path", async () => {
     const sdk = await import("@earendil-works/pi-coding-agent") as any;
     sdk.initTheme();
     const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
@@ -294,6 +384,7 @@ describe("real Pi default-collapsed rendering contract", () => {
     const definitions = new Map([
       ["read", withDefaultCollapsedToolRendering(sdk.createReadToolDefinition(process.cwd()))],
       ["write", withDefaultCollapsedToolRendering(sdk.createWriteToolDefinition(process.cwd()))],
+      ["bash", withDefaultCollapsedToolRendering(sdk.createBashToolDefinition(process.cwd()))],
     ]);
     const renderer = htmlModule.createToolHtmlRenderer({
       getToolDefinition: (name: string) => definitions.get(name), theme: themeModule.theme, cwd: process.cwd(),
@@ -304,6 +395,7 @@ describe("real Pi default-collapsed rendering contract", () => {
       for (const entry of [
         { id: "stock-read", name: "read", args: { path: "stock.txt" }, text: "STOCK READ HTML BODY", details: undefined },
         { id: "stock-write", name: "write", args: { path: "stock-write.txt", content: "STOCK WRITE HTML BODY" }, text: "Successfully wrote 21 bytes to stock-write.txt", details: undefined },
+        { id: "stock-bash", name: "bash", args: { command: "printf STOCK_BASH_HTML_BODY" }, text: "STOCK_BASH_HTML_BODY", details: undefined },
       ]) {
         session.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: entry.id, name: entry.name, arguments: entry.args }], stopReason: "toolUse" } as never);
         session.appendMessage({ role: "toolResult", toolCallId: entry.id, toolName: entry.name,
@@ -318,8 +410,10 @@ describe("real Pi default-collapsed rendering contract", () => {
       const canonical = JSON.stringify(data.entries);
       expect(canonical).toContain("STOCK READ HTML BODY");
       expect(canonical).toContain("STOCK WRITE HTML BODY");
+      expect(canonical).toContain("STOCK_BASH_HTML_BODY");
       expect(data.renderedTools?.["stock-read"]).toBeUndefined();
       expect(data.renderedTools?.["stock-write"]).toBeUndefined();
+      expect(data.renderedTools?.["stock-bash"]).toBeUndefined();
       expect(html).not.toContain("lines hidden");
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });

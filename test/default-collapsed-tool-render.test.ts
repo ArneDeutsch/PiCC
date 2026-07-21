@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   getKeybindings,
   KeybindingsManager,
@@ -26,7 +26,15 @@ function component(text: string): Component {
   return { render: () => text.split("\n") };
 }
 
-function definition(name: "read" | "write"): RenderTool {
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object") {
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function definition(name: "read" | "write" | "bash"): RenderTool {
   const execute = () => undefined;
   return withDefaultCollapsedToolRendering({
     name,
@@ -35,12 +43,13 @@ function definition(name: "read" | "write"): RenderTool {
     parameters: {},
     execute,
     renderCall(args: unknown) {
-      const path = (args as { path?: string }).path ?? "?";
-      const content = (args as { content?: string }).content;
-      return component(`native ${name} ${path}${content === undefined ? "" : `\n${content}`}`);
+      const data = args as { path?: string; content?: string; command?: string };
+      if (name === "bash") return component(`native bash ${data.command ?? "?"}`);
+      const path = data.path ?? "?";
+      return component(`native ${name} ${path}${data.content === undefined ? "" : `\n${data.content}`}`);
     },
     renderResult(result: unknown) {
-      const text = ((result as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? "");
+      const text = ((result as { content?: Array<{ text?: string }> }).content ?? []).map((block) => block.text ?? "").join("\n");
       return component(`native result ${text}`);
     },
   } as unknown as ToolDefinition) as unknown as RenderTool;
@@ -55,6 +64,10 @@ function writeResult(path: string, content: string): unknown {
     content: [{ type: "text", text: `Successfully wrote ${content.length} bytes to ${path}` }],
     details: undefined,
   };
+}
+
+function bashResult(text = "(no output)", details: unknown = undefined): unknown {
+  return { content: [{ type: "text", text }], details };
 }
 
 function contexts(args: unknown) {
@@ -158,6 +171,500 @@ describe("default-collapsed tool rendering", () => {
       const expanded = settle(tool, args, result, true).join("\n");
       expect(expanded.match(new RegExp(`native ${tool.name}`, "g"))).toHaveLength(1);
       expect(expanded.match(/native result/g)).toHaveLength(1);
+    }
+  }));
+
+  it("preserves the established Read and Write settlement predicate independently of context isPartial", () => withBindings(["ctrl+k"], () => {
+    for (const [tool, args, result] of [
+      [definition("read"), { path: "read.txt" }, readResult("body")],
+      [definition("write"), { path: "write.txt", content: "body" }, writeResult("write.txt", "body")],
+    ] as const) {
+      const state = {};
+      tool.renderCall(args, theme, { args, state, isPartial: false, isError: false });
+      const disagreed = tool.renderResult(result, { expanded: false, isPartial: false }, theme,
+        { args, state, isPartial: true, isError: false }).render(120).join("\n");
+      expect(disagreed, tool.name).toMatch(/\bline(?:s)? hidden\b/u);
+      expect(disagreed, tool.name).not.toContain("Elaborated result");
+
+      const error = tool.renderResult(result, { expanded: false, isPartial: false }, theme,
+        { args, state, isPartial: true, isError: true }).render(120).join("\n");
+      expect(error, tool.name).toContain("Elaborated result");
+      expect(error, tool.name).toContain("native result");
+
+      const absentError = tool.renderResult(result, { expanded: false, isPartial: false }, theme,
+        { args, state, isPartial: false }).render(120).join("\n");
+      expect(absentError, tool.name).toContain("native result");
+      expect(absentError, tool.name).not.toMatch(/\bline(?:s)? hidden\b/u);
+
+      const partialOptions = tool.renderResult(result, { expanded: false, isPartial: true }, theme,
+        { args, state, isPartial: false, isError: false }).render(120).join("\n");
+      expect(partialOptions, tool.name).toContain("native result");
+      expect(partialOptions, tool.name).not.toMatch(/\bline(?:s)? hidden\b/u);
+    }
+  }));
+
+  it("collapses Bash without command/output-derived text and restores both only on expansion", () => withBindings(["ctrl+k"], () => {
+    const tool = definition("bash");
+    const command = "AUTH_TOKEN=env-secret curl -u user:url-secret 'https://url-user:url-pass@host/path?key=query-secret' -H 'Authorization: Bearer bearer-secret' --password arg-secret\nprintf done";
+    const output = "output-secret /credential-output/token-secret.log\nbearer-output-token";
+    const collapsed = settle(tool, { command }, bashResult(output)).join("\n");
+    expect(collapsed).toContain("Bash");
+    expect(collapsed).toContain("2 output lines hidden");
+    expect(collapsed).toContain("2 command lines hidden");
+    expect(collapsed).toContain("ctrl+k to expand");
+    for (const sentinel of ["env-secret", "url-secret", "url-user", "url-pass", "query-secret", "bearer-secret", "arg-secret", "output-secret", "token-secret.log", "bearer-output-token", "curl", "printf"]) {
+      expect(collapsed).not.toContain(sentinel);
+    }
+
+    const context = contexts({ command });
+    tool.renderCall({ command }, theme, { ...context.call, expanded: true });
+    const expanded = tool.renderResult(bashResult(output), { expanded: true, isPartial: false }, theme,
+      { ...context.result, expanded: true }).render(500).join("\n");
+    expect(expanded).toContain(command);
+    expect(expanded).toContain(output);
+    expect(expanded.match(/native bash/g)).toHaveLength(1);
+    expect(expanded.match(/native result/g)).toHaveLength(1);
+    expect(settle(tool, { command: "true" }, bashResult()).join("\n")).toContain("(no output)");
+  }));
+
+  it.each([
+    ["\n alpha\n beta \n", "2 output lines hidden"],
+    ["  \n\t  ", "(no output)"],
+    ["", "(no output)"],
+    ["(no output)", "(no output)"],
+    ["one\r\ntwo", "2 output lines hidden"],
+    ["one\rtwo", "1 output line hidden"],
+    ["\u001b[31m\none\u001b[0m", "2 output lines hidden"],
+    ["first\u001b]0;title\ncontinued\u0007\nsecond", "2 output lines hidden"],
+  ])("counts Bash output after stock display normalization for %j", (output, expected) => withBindings(["ctrl+o"], () => {
+    const rendered = settle(definition("bash"), { command: "true" }, bashResult(output)).join("\n");
+    expect(rendered).toContain(expected);
+  }));
+
+  it.each([
+    ["first\u001b[31\nmsecond", "1 command line hidden", "first�second"],
+    ["first\u001b]0;title\ncontinued\u0007\nsecond", "2 command lines hidden", "first�\nsecond"],
+  ])("counts command lines from the exact sanitized native command DTO for %j", (command, expected, delegated) => withBindings(["ctrl+o"], () => {
+    const tool = definition("bash");
+    const collapsed = settle(tool, { command }, bashResult("ok")).join("\n");
+    expect(collapsed).toContain(expected);
+    const context = contexts({ command });
+    tool.renderCall({ command }, theme, { ...context.call, expanded: true });
+    const expanded = tool.renderResult(bashResult("ok"), { expanded: true, isPartial: false }, theme,
+      { ...context.result, expanded: true }).render(500).join("\n");
+    expect(expanded).toContain(`native bash ${delegated}`);
+    expect(expanded).not.toContain(command);
+  }));
+
+  it("counts Pi's visible fallback for an empty Bash command", () => withBindings(["ctrl+o"], () => {
+    const collapsed = settle(definition("bash"), { command: "" }, bashResult("ok")).join("\n");
+    expect(collapsed).toContain("1 command line hidden");
+  }));
+
+  it("enforces Bash Unicode width, identity, summary priority, and truthful narrow fallback", () => withBindings(["ctrl+o"], () => {
+    const tool = definition("bash");
+    const args = { command: "界-command-secret\nsecond" };
+    const context = contexts(args);
+    tool.renderCall(args, theme, context.call);
+    const row = tool.renderResult(bashResult(Array.from({ length: 12 }, () => "界-output-secret").join("\n")),
+      { expanded: false, isPartial: false }, theme, context.result);
+    expect(row.render(4).join("\n")).toBe("Bash");
+    expect(row.render(20).join("\n")).toBe("Bash · output hidden");
+    expect(row.render(32).join("\n")).toContain("12 output lines hidden");
+    expect(row.render(32).join("\n")).not.toContain("expand");
+    expect(row.render(48).join("\n")).toBe("Bash · 12 output lines hidden · ctrl+o to expand");
+    expect(row.render(48).join("\n")).not.toContain("command");
+    for (const width of [0, 1, 2, 3, 4, 20, 32, 48, 80]) {
+      const rendered = row.render(width).join("\n");
+      expect(visibleWidth(rendered)).toBeLessThanOrEqual(width);
+      if (width >= 4) expect(rendered).toContain("Bash");
+      expect(rendered).not.toContain("界");
+      if (!rendered.includes("output")) expect(rendered).not.toMatch(/expand|command|\d\.\ds/u);
+      if (!rendered.includes("expand")) expect(rendered).not.toMatch(/command|\d\.\ds/u);
+    }
+  }));
+
+  it("keeps duration-bearing Bash segments in priority order at every narrow boundary", () => withBindings(["ctrl+o"], () => {
+    const tool = definition("bash");
+    const args = { command: "first\nsecond" };
+    const state = { startedAt: 1_000, endedAt: 2_250 };
+    tool.renderCall(args, theme, { args, state, isPartial: false, isError: false });
+    const row = tool.renderResult(bashResult("one\ntwo"), { expanded: false, isPartial: false }, theme,
+      { args, state, isPartial: false, isError: false });
+    const output = "Bash · 2 output lines hidden";
+    const expansion = `${output} · ctrl+o to expand`;
+    const duration = `${expansion} · 1.3s`;
+    const command = `${duration} · 2 command lines hidden`;
+    expect(row.render(visibleWidth(duration)).join("\n")).toBe(duration);
+    expect(row.render(visibleWidth(duration) - 1).join("\n")).toBe(expansion);
+    expect(row.render(visibleWidth(command)).join("\n")).toBe(command);
+    expect(row.render(visibleWidth(command) - 1).join("\n")).toBe(duration);
+    for (const [width, present, absent] of [
+      [visibleWidth(output) - 1, "output hidden", /expand|1\.3s|command/u],
+      [visibleWidth(expansion) - 1, output, /expand|1\.3s|command/u],
+      [visibleWidth(duration) - 1, expansion, /1\.3s|command/u],
+      [visibleWidth(command) - 1, duration, /command/u],
+    ] as const) {
+      const rendered = row.render(width).join("\n");
+      expect(rendered).toContain(present);
+      expect(rendered).not.toMatch(absent);
+    }
+  }));
+
+  it("sanitizes Bash controls, bounds commands, clamps narrow summaries, and fails open when expansion is unbound", () => {
+    const controlledCommand = "printf before\u001b]0;terminal-secret\u0007after";
+    const controlledOutput = "left\u001b[31moutput-secret\u001b[0mright";
+    withBindings(["ctrl+o"], () => {
+      const tool = definition("bash");
+      const args = { command: controlledCommand };
+      const result = bashResult(controlledOutput);
+      const context = contexts(args);
+      tool.renderCall(args, theme, context.call);
+      const summary = tool.renderResult(result, { expanded: false, isPartial: false }, theme, context.result);
+      for (const width of [0, 1, 2, 6, 40]) {
+        const rendered = summary.render(width).join("\n");
+        expect(visibleWidth(rendered)).toBeLessThanOrEqual(width);
+        expect(rendered).not.toContain("terminal-secret");
+        expect(rendered).not.toContain("output-secret");
+      }
+      const expandedContext = contexts(args);
+      tool.renderCall(args, theme, { ...expandedContext.call, expanded: true });
+      const expanded = tool.renderResult(result, { expanded: true, isPartial: false }, theme,
+        { ...expandedContext.result, expanded: true }).render(200).join("\n");
+      expect(expanded).not.toMatch(/[\u001b\u0007]/u);
+      expect(expanded).not.toContain("terminal-secret");
+      expect(expanded).toContain("before�after");
+      expect(expanded).toContain("left�output-secret�right");
+      expect(args.command).toBe(controlledCommand);
+      expect((result as { content: Array<{ text: string }> }).content[0]!.text).toBe(controlledOutput);
+
+      const capped = tool.renderCall({ command: "x".repeat(1_000_001) }, theme,
+        { state: {}, isPartial: false }).render(100).join("\n");
+      expect(capped).toContain("Detail inspection limit reached");
+      expect(capped).toContain("uninspected");
+    });
+
+    withBindings([], () => {
+      const tool = definition("bash");
+      const args = { command: "unbound-command" };
+      const context = contexts(args);
+      const call = tool.renderCall(args, theme, context.call).render(100).join("\n");
+      const result = tool.renderResult(bashResult("unbound-output"), { expanded: false, isPartial: false }, theme,
+        context.result).render(100).join("\n");
+      expect(call).toContain("unbound-command");
+      expect(result).toContain("unbound-output");
+      expect(`${call}\n${result}`).not.toContain("hidden");
+    });
+  });
+
+  it("settles Bash native result state while collapsed and clears its live interval on success and error", () => withBindings(["ctrl+o"], () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000);
+      const calls: Array<{ partial: boolean; result: unknown }> = [];
+      const source = {
+        name: "bash", label: "bash", description: "timer probe", parameters: {}, execute() {},
+        renderCall(args: unknown, _theme: unknown, context: { state: Record<string, unknown>; executionStarted?: boolean }) {
+          if (context.executionStarted && context.state.startedAt === undefined) context.state.startedAt = Date.now();
+          return component(`native command ${(args as { command: string }).command}`);
+        },
+        renderResult(result: unknown, options: { isPartial: boolean }, _theme: unknown,
+          context: { state: Record<string, unknown>; invalidate(): void; isError?: boolean }) {
+          calls.push({ partial: options.isPartial, result });
+          if (options.isPartial && context.state.interval === undefined) {
+            context.state.interval = setInterval(() => context.invalidate(), 1_000);
+          }
+          if (!options.isPartial || context.isError) {
+            context.state.endedAt ??= Date.now();
+            if (context.state.interval !== undefined) clearInterval(context.state.interval as ReturnType<typeof setInterval>);
+            context.state.interval = undefined;
+          }
+          return component(`native result ${JSON.stringify(result)}`);
+        },
+      };
+      const tool = withDefaultCollapsedToolRendering(source as never) as unknown as RenderTool;
+      const args = { command: "secret-command" };
+      const state: Record<string, unknown> = {};
+      tool.renderCall(args, theme, { args, state, isPartial: true, executionStarted: true });
+      tool.renderResult(bashResult("rolling"), { expanded: false, isPartial: true }, theme,
+        { args, state, isPartial: true, isError: false, invalidate() {} });
+      expect(vi.getTimerCount()).toBe(1);
+      vi.setSystemTime(2_250);
+      tool.renderCall(args, theme, { args, state, isPartial: false, executionStarted: true });
+      const collapsed = tool.renderResult(bashResult("settled-secret"), { expanded: false, isPartial: false }, theme,
+        { args, state, isPartial: false, isError: false, invalidate() {} }).render(120).join("\n");
+      expect(collapsed).toContain("1.3s");
+      expect(collapsed).not.toContain("settled-secret");
+      expect(state.endedAt).toBe(2_250);
+      expect(state.interval).toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(calls.at(-1)?.partial).toBe(false);
+
+      const errorState: Record<string, unknown> = {};
+      tool.renderCall(args, theme, { args, state: errorState, isPartial: true, executionStarted: true });
+      tool.renderResult(bashResult("rolling"), { expanded: false, isPartial: true }, theme,
+        { args, state: errorState, isPartial: true, isError: false, invalidate() {} });
+      expect(vi.getTimerCount()).toBe(1);
+      tool.renderCall(args, theme, { args, state: errorState, isPartial: false, executionStarted: true });
+      const error = tool.renderResult(bashResult("Command timed out after 1 seconds"), { expanded: false, isPartial: false }, theme,
+        { args, state: errorState, isPartial: false, isError: true, invalidate() {} }).render(120).join("\n");
+      expect(error).toContain("Elaborated result");
+      expect(error).toContain("timed out");
+      expect(vi.getTimerCount()).toBe(0);
+
+      const malformedState: Record<string, unknown> = {};
+      tool.renderCall(args, theme, { args, state: malformedState, isPartial: true, executionStarted: true });
+      tool.renderResult(bashResult("rolling"), { expanded: false, isPartial: true }, theme,
+        { args, state: malformedState, isPartial: true, isError: false, invalidate() {} });
+      expect(vi.getTimerCount()).toBe(1);
+      const malformedArgs = Object.defineProperty({}, "command", { get() { throw new Error("must not run"); } });
+      const unfamiliar = tool.renderResult({ future: true }, { expanded: false, isPartial: false }, theme,
+        { args: malformedArgs, state: malformedState, isPartial: false, isError: true, invalidate() {} }).render(120).join("\n");
+      expect(unfamiliar).toContain("Unfamiliar arguments");
+      expect(malformedState.interval).toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  }));
+
+  it("settles repeated Bash partials once across every exceptional and disagreeing final shape", () => withBindings(["ctrl+o"], () => {
+    vi.useFakeTimers();
+    try {
+      const cases: Array<{
+        name: string; result: unknown; optionsPartial?: boolean; contextPartial?: boolean;
+        isError?: boolean; omitOptionsPartial?: boolean; omitContextPartial?: boolean; omitIsError?: boolean; expected: string;
+      }> = [
+        { name: "nonzero", result: bashResult("Command exited with code 7"), isError: true, expected: "Elaborated result" },
+        { name: "timeout", result: bashResult("Command timed out"), isError: true, expected: "Elaborated result" },
+        { name: "abort", result: bashResult("Command aborted"), isError: true, expected: "Elaborated result" },
+        { name: "error-only-final", result: bashResult("Command failed"), optionsPartial: true, contextPartial: true, isError: true, expected: "Elaborated result" },
+        { name: "truncation", result: bashResult("tail", {
+          truncation: { content: "tail", truncated: true, truncatedBy: "lines", totalLines: 2, totalBytes: 8,
+            outputLines: 1, outputBytes: 4, lastLinePartial: false, firstLineExceedsLimit: false, maxLines: 1, maxBytes: 50_000 },
+          fullOutputPath: "/credential-output/token-secret.log",
+        }), isError: false, expected: "Elaborated result" },
+        { name: "recovery", result: { content: [{ type: "text", text: "ok" }, { type: "text", text: "Recovered partial output" }], details: undefined }, isError: false, expected: "Elaborated result" },
+        { name: "additional-block", result: { content: [{ type: "text", text: "ok" }, { type: "text", text: "additional" }], details: undefined }, isError: false, expected: "Elaborated result" },
+        { name: "future-details", result: bashResult("ok", { future: true }), isError: false, expected: "Unfamiliar result" },
+        { name: "malformed", result: { future: true }, isError: false, expected: "Unfamiliar result" },
+        { name: "inspection-capped", result: bashResult("x".repeat(1_000_001)), isError: false, expected: "Detail inspection limit reached" },
+        { name: "display-capped", result: bashResult(Array.from({ length: 10_001 }, () => "x").join("\n")), isError: false, expected: "Detail inspection limit reached" },
+        { name: "options-final-context-partial", result: bashResult("ordinary"), contextPartial: true, isError: false, expected: "Elaborated result" },
+        { name: "options-partial-context-final", result: bashResult("ordinary"), optionsPartial: true, isError: false, expected: "Elaborated result" },
+        { name: "options-missing-context-final", result: bashResult("ordinary"), omitOptionsPartial: true, isError: false, expected: "Elaborated result" },
+        { name: "options-final-context-missing", result: bashResult("ordinary"), omitContextPartial: true, isError: false, expected: "Elaborated result" },
+        { name: "missing-error", result: bashResult("ordinary"), omitIsError: true, expected: "Elaborated result" },
+      ];
+      for (const item of cases) {
+        let serial = 0;
+        const nativeCalls: Array<{ partial: boolean; last: unknown; args: unknown; result: unknown; returned: Component }> = [];
+        const source = {
+          name: "bash", label: "bash", description: item.name, parameters: {}, execute() {},
+          renderCall(_args: unknown, _theme: unknown, context: { state: Record<string, unknown>; executionStarted?: boolean }) {
+            if (context.executionStarted) context.state.startedAt ??= Date.now();
+            return component("native command");
+          },
+          renderResult(result: unknown, options: { isPartial: boolean }, _theme: unknown,
+            context: { state: Record<string, unknown>; lastComponent?: unknown; invalidate(): void }) {
+            if (options.isPartial) context.state.interval ??= setInterval(() => context.invalidate(), 1000);
+            else {
+              context.state.endedAt ??= Date.now();
+              if (context.state.interval !== undefined) clearInterval(context.state.interval as ReturnType<typeof setInterval>);
+              context.state.interval = undefined;
+            }
+            const returned = component(`native-${++serial}`);
+            nativeCalls.push({ partial: options.isPartial, last: context.lastComponent, args: (context as { args?: unknown }).args, result, returned });
+            return returned;
+          },
+        };
+        const tool = withDefaultCollapsedToolRendering(source as never) as unknown as RenderTool;
+        const args = { command: `secret-${item.name}` };
+        const state: Record<string, unknown> = {};
+        tool.renderCall(args, theme, { args, state, isPartial: true, executionStarted: true });
+        tool.renderResult(bashResult("rolling-one"), { expanded: false, isPartial: true }, theme,
+          { args, state, isPartial: true, isError: false, invalidate() {} });
+        tool.renderResult(bashResult("rolling-two"), { expanded: false, isPartial: true }, theme,
+          { args, state, isPartial: true, isError: false, invalidate() {} });
+        expect(vi.getTimerCount(), item.name).toBe(1);
+        expect(nativeCalls[1]!.last, item.name).toBe(nativeCalls[0]!.returned);
+        const contextPartial = item.contextPartial ?? false;
+        tool.renderCall(args, theme, { args, state, isPartial: contextPartial, executionStarted: true });
+        const finalContext = {
+          args, state, invalidate() {},
+          ...(item.omitContextPartial ? {} : { isPartial: contextPartial }),
+          ...(item.omitIsError ? {} : { isError: item.isError ?? false }),
+        };
+        const finalOptions = {
+          expanded: false,
+          ...(item.omitOptionsPartial ? {} : { isPartial: item.optionsPartial ?? false }),
+        };
+        const rendered = tool.renderResult(item.result, finalOptions, theme, finalContext).render(160).join("\n");
+        expect(rendered, item.name).toContain(item.expected);
+        const finalCalls = nativeCalls.filter((call) => !call.partial);
+        expect(finalCalls, item.name).toHaveLength(1);
+        expect(finalCalls[0]!.last, item.name).toBe(nativeCalls[1]!.returned);
+        expect(state.interval, item.name).toBeUndefined();
+        expect(vi.getTimerCount(), item.name).toBe(0);
+      }
+    } finally { vi.useRealTimers(); }
+  }));
+
+  it("preserves capped and truncated primaries when armed native Bash cleanup throws", () => withBindings(["ctrl+o"], () => {
+    vi.useFakeTimers();
+    try {
+      const truncation = {
+        truncation: { content: "tail", truncated: true, truncatedBy: "lines", totalLines: 2, totalBytes: 8,
+          outputLines: 1, outputBytes: 4, lastLinePartial: false, firstLineExceedsLimit: false, maxLines: 1, maxBytes: 50_000 },
+        fullOutputPath: "/credential-output/token-secret.log",
+      };
+      for (const [result, primary] of [
+        [bashResult("x".repeat(1_000_001)), "Detail inspection limit reached"],
+        [bashResult(Array.from({ length: 10_001 }, () => "x").join("\n")), "Detail inspection limit reached"],
+        [bashResult("tail", truncation), "Elaborated result"],
+      ] as const) {
+        let serial = 0;
+        let cleanupTransitions = 0;
+        const calls: Array<{ partial: boolean; last: unknown; returned?: Component }> = [];
+        const source = {
+          name: "bash", label: "bash", description: "cleanup failure", parameters: {}, execute() {},
+          renderCall: () => component("call"),
+          renderResult(_result: unknown, options: { isPartial: boolean }, _theme: unknown,
+            context: { state: Record<string, unknown>; lastComponent?: unknown; invalidate(): void }) {
+            if (options.isPartial) {
+              context.state.interval ??= setInterval(() => context.invalidate(), 1_000);
+              const returned = component(`partial-${++serial}`);
+              calls.push({ partial: true, last: context.lastComponent, returned });
+              return returned;
+            }
+            if (context.state.interval !== undefined) {
+              clearInterval(context.state.interval as ReturnType<typeof setInterval>);
+              context.state.interval = undefined;
+              cleanupTransitions++;
+            }
+            calls.push({ partial: false, last: context.lastComponent });
+            throw new Error("cleanup exploded");
+          },
+        };
+        const tool = withDefaultCollapsedToolRendering(source as never) as unknown as RenderTool;
+        const args = { command: "secret" };
+        const state: Record<string, unknown> = {};
+        tool.renderCall(args, theme, { args, state, isPartial: true });
+        tool.renderResult(bashResult("rolling-one"), { expanded: false, isPartial: true }, theme,
+          { args, state, isPartial: true, isError: false, invalidate() {} });
+        tool.renderResult(bashResult("rolling-two"), { expanded: false, isPartial: true }, theme,
+          { args, state, isPartial: true, isError: false, invalidate() {} });
+        expect(vi.getTimerCount()).toBe(1);
+        expect(calls[1]!.last).toBe(calls[0]!.returned);
+
+        const rendered = tool.renderResult(result, { expanded: false, isPartial: false }, theme,
+          { args, state, isPartial: false, isError: false, invalidate() {} }).render(160).join("\n");
+        expect(rendered).toContain(primary);
+        expect(rendered).toContain("Native cleanup failed");
+        expect(calls[2]!.last).toBe(calls[1]!.returned);
+        expect(cleanupTransitions).toBe(1);
+        expect(state.interval).toBeUndefined();
+        expect(vi.getTimerCount()).toBe(0);
+      }
+    } finally { vi.useRealTimers(); }
+  }));
+
+  it("elaborates every recognized Bash exception and refuses malformed, future, truncated, or capped success", () => withBindings(["ctrl+o"], () => {
+    const tool = definition("bash");
+    const args = { command: "secret-command" };
+    for (const [result, isError] of [
+      [bashResult("Command exited with code 7"), true],
+      [bashResult("Command timed out after 1 seconds"), true],
+      [bashResult("Command aborted"), true],
+      [bashResult("warning", {
+        truncation: { content: "warning", truncated: true, truncatedBy: "lines", totalLines: 2, totalBytes: 8,
+          outputLines: 1, outputBytes: 7, lastLinePartial: false, firstLineExceedsLimit: false, maxLines: 1, maxBytes: 50_000 },
+        fullOutputPath: "/secret/full-output.log",
+      }), false],
+    ] as const) {
+      const context = contexts(args);
+      tool.renderCall(args, theme, context.call);
+      const rendered = tool.renderResult(result, { expanded: false, isPartial: false }, theme,
+        { ...context.result, isError }).render(200).join("\n");
+      expect(rendered).toContain("Elaborated result");
+      expect(rendered).not.toContain("output lines hidden");
+    }
+    const additional = settle(tool, args, {
+      content: [{ type: "text", text: "ok" }, { type: "text", text: "recovery" }], details: undefined,
+    }).join("\n");
+    expect(additional).toContain("Elaborated result");
+    expect(additional).toContain("recovery");
+    for (const result of [
+      { content: [{ type: "text", text: "ok" }], details: { future: true } },
+      { future: true },
+    ]) expect(settle(tool, args, result).join("\n")).toContain("Unfamiliar result");
+    const capped = settle(tool, args, bashResult("x".repeat(1_000_001))).join("\n");
+    expect(capped).toContain("Detail inspection limit reached");
+    expect(capped).not.toContain("output lines hidden");
+  }));
+
+  it("classifies Bash only from exact renderer state, never output keywords", () => withBindings(["ctrl+o"], () => {
+    for (const keyword of ["error", "warning", "timed out", "aborted"]) {
+      expect(settle(definition("bash"), { command: "true" }, bashResult(`successful ${keyword}`)).join("\n"))
+        .toContain("1 output line hidden");
+    }
+
+    const args = { command: "true" };
+    for (const [optionsPartial, contextPartial] of [[false, true], [true, false]] as const) {
+      const tool = definition("bash");
+      const state = {};
+      tool.renderCall(args, theme, { args, state, isPartial: contextPartial, isError: false });
+      const rendered = tool.renderResult(bashResult("ordinary"),
+        { expanded: false, isPartial: optionsPartial }, theme,
+        { args, state, isPartial: contextPartial, isError: false }).render(120).join("\n");
+      expect(rendered).toContain("native result");
+      expect(rendered).not.toContain("output line hidden");
+    }
+  }));
+
+  it("keeps deeply frozen canonical Bash values unchanged and delegates only detached sanitized DTOs", () => withBindings(["ctrl+o"], () => {
+    const seenArgs: unknown[] = [];
+    const seenResults: unknown[] = [];
+    const source = {
+      name: "bash", label: "bash", description: "immutable probe", parameters: {}, execute() {},
+      renderCall(args: unknown) { seenArgs.push(args); return component("call"); },
+      renderResult(result: unknown) { seenResults.push(result); return component("result"); },
+    };
+    const tool = withDefaultCollapsedToolRendering(source as never) as unknown as RenderTool;
+    const args = deepFreeze({ command: "TOKEN=frozen-secret printf '\u001b[31mvalue'", timeout: 3 });
+    const partialOne = deepFreeze(bashResult("rolling-one\u001b[31m"));
+    const partialTwo = deepFreeze(bashResult("rolling-two"));
+    const settled = deepFreeze(bashResult("settled-output"));
+    const errorResult = deepFreeze({ content: [{ type: "text", text: "Command aborted" }], details: undefined, isError: true });
+    const canonical = JSON.stringify({ args, partialOne, partialTwo, settled, errorResult });
+    const state = {};
+
+    tool.renderCall(args, theme, { args, state, isPartial: true, executionStarted: true });
+    tool.renderResult(partialOne, { expanded: false, isPartial: true }, theme,
+      { args, state, isPartial: true, isError: false, invalidate() {} });
+    tool.renderResult(partialTwo, { expanded: false, isPartial: true }, theme,
+      { args, state, isPartial: true, isError: false, invalidate() {} });
+    tool.renderCall(args, theme, { args, state, isPartial: false, executionStarted: true });
+    tool.renderResult(settled, { expanded: false, isPartial: false }, theme,
+      { args, state, isPartial: false, isError: false, invalidate() {} });
+    tool.renderCall(args, theme, { args, state, isPartial: false, expanded: true, executionStarted: true });
+    tool.renderResult(settled, { expanded: true, isPartial: false }, theme,
+      { args, state, isPartial: false, isError: false, expanded: true, invalidate() {} });
+
+    const errorState = {};
+    tool.renderCall(args, theme, { args, state: errorState, isPartial: true, executionStarted: true });
+    tool.renderResult(partialOne, { expanded: false, isPartial: true }, theme,
+      { args, state: errorState, isPartial: true, isError: false, invalidate() {} });
+    tool.renderResult(errorResult, { expanded: false, isPartial: false }, theme,
+      { args, state: errorState, isPartial: false, isError: true, invalidate() {} });
+
+    expect(JSON.stringify({ args, partialOne, partialTwo, settled, errorResult })).toBe(canonical);
+    expect(Object.isFrozen(args)).toBe(true);
+    for (const delegated of seenArgs) {
+      expect(delegated).not.toBe(args);
+      expect(JSON.stringify(delegated)).not.toContain("\\u001b");
+    }
+    for (const delegated of seenResults) {
+      expect([partialOne, partialTwo, settled, errorResult]).not.toContain(delegated);
+      expect(JSON.stringify(delegated)).not.toContain("\\u001b");
     }
   }));
 
