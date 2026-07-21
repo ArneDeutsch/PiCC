@@ -53,7 +53,7 @@ function renderResult(
     result,
     { expanded: extra.expanded ?? false, isPartial: extra.partial ?? false },
     extra.theme,
-    { args, isError: extra.error ?? false },
+    { args, isPartial: extra.partial ?? false, isError: extra.error ?? false },
   ).render(extra.width ?? 120);
 }
 
@@ -784,7 +784,7 @@ describe("routine tool rendering decorator", () => {
         }),
       });
       const output = renderResult(tool, args, result, { width: 120 }).join("\n");
-      expect(output).toContain("Diff too large to display");
+      expect(output).toContain("Edit details too large to display");
       expect(output).toContain(entry.path.slice(0, Math.min(entry.path.length, 20)));
       expect(indexedReads).toBe(0);
       expect(result.content[0]?.text).toBe(canonicalText);
@@ -833,6 +833,24 @@ describe("routine tool rendering decorator", () => {
     );
     expect(accessorReads).toBe(0);
     expect(delegated).not.toHaveBeenCalled();
+
+    for (const [options, context] of [
+      [{ expanded: false }, { args, isPartial: false, isError: false }],
+      [{ expanded: false, isPartial: false }, { args, isError: false }],
+      [{ expanded: false, isPartial: true }, { args, isPartial: false, isError: false }],
+      [{ expanded: false, isPartial: false }, { args, isPartial: true, isError: false }],
+      [{ expanded: false, isPartial: false }, { args, isPartial: false, isError: true }],
+      [{ expanded: false, isPartial: false }, { args, isPartial: false }],
+    ] as const) {
+      const settlementDelegated = vi.fn(() => ({ render: () => ["UNEXPECTED DELEGATION"] }));
+      const settlementTool = withRoutineToolRendering(
+        { name: "MultiEdit" } as ToolDefinition,
+        { createEditDefinition: () => ({ renderResult: settlementDelegated }) },
+      ) as unknown as RenderTool;
+      const output = renderRaw(settlementTool, result, options, context).join("\n");
+      expect(output).toContain(result.content[0]!.text);
+      expect(settlementDelegated).not.toHaveBeenCalled();
+    }
 
     const throwing = withRoutineToolRendering(
       { name: "MultiEdit" } as ToolDefinition,

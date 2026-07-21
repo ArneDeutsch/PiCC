@@ -10,6 +10,7 @@ import {
   visibleWidth,
 } from "@earendil-works/pi-tui";
 import { withDefaultCollapsedToolRendering } from "../src/runtime/default-collapsed-tool-render.js";
+import { withRoutineToolRendering } from "../src/runtime/routine-tool-render.js";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 
 function stripAnsi(value: string): string {
@@ -95,6 +96,147 @@ describe("real Pi default-collapsed rendering contract", () => {
       expect(recollapsed).toHaveLength(2);
       expect(recollapsed.join("\n")).toContain("2 lines hidden");
       expect(recollapsed.join("\n")).not.toContain("first");
+    });
+  });
+
+  it("preserves stock Edit preview invalidation and collapses only after result-driven settlement", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    await withExpansionBindingAsync(["ctrl+k"], async () => {
+      const directory = mkdtempSync(join(tmpdir(), "picc-collapsed-edit-"));
+      const args = { path: "target.txt", edits: [{ oldText: "BEFORE_EDIT", newText: "AFTER_EDIT" }] };
+      let invalidations = 0;
+      try {
+        await import("node:fs/promises").then(({ writeFile }) => writeFile(join(directory, args.path), "BEFORE_EDIT\n"));
+        const source = sdk.createEditToolDefinition(directory);
+        const decorated = wrapForSelfShell(withDefaultCollapsedToolRendering(withRoutineToolRendering(source)));
+        const component = new sdk.ToolExecutionComponent(
+          "edit", "collapsed-edit-contract", args, {}, decorated,
+          { requestRender() { invalidations++; } }, directory.replace(/\\/g, "/"),
+        );
+        component.setArgsComplete();
+        component.render(100);
+        await vi.waitFor(() => expect(invalidations).toBeGreaterThanOrEqual(2));
+        const preview = (component.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(preview).toContain("BEFORE_EDIT");
+        expect(preview).toContain("AFTER_EDIT");
+        expect(preview).not.toContain("diff lines hidden");
+
+        const result = await source.execute("collapsed-edit-contract", args, undefined, undefined, {});
+        component.updateResult(result, false);
+        const collapsed = (component.render(100) as string[]).map(stripAnsi);
+        expect(collapsed).toHaveLength(2);
+        expect(collapsed.join("\n")).toContain("Edit target.txt · 1 edit applied · 2 diff lines hidden · ctrl+k to expand");
+        expect(collapsed.join("\n")).not.toContain("BEFORE_EDIT");
+        expect(collapsed.join("\n")).not.toContain("AFTER_EDIT");
+
+        component.setExpanded(true);
+        const expanded = (component.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(expanded.match(/BEFORE_EDIT/g)).toHaveLength(1);
+        expect(expanded.match(/AFTER_EDIT/g)).toHaveLength(1);
+        component.setExpanded(false);
+        expect((component.render(100) as string[]).map(stripAnsi).join("\n")).toContain("diff lines hidden");
+        component.setExpanded(true);
+        const reexpanded = (component.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(reexpanded.match(/BEFORE_EDIT/g)).toHaveLength(1);
+        expect(reexpanded.match(/AFTER_EDIT/g)).toHaveLength(1);
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("keeps Edit preview-failure evidence when a reconstructed stored success settles", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    await withExpansionBindingAsync(["ctrl+o"], async () => {
+      const directory = mkdtempSync(join(tmpdir(), "picc-collapsed-edit-failed-preview-"));
+      const args = { path: "missing.txt", edits: [{ oldText: "OLD_STORED", newText: "NEW_STORED" }] };
+      let invalidations = 0;
+      try {
+        const source = sdk.createEditToolDefinition(directory);
+        const decorated = wrapForSelfShell(withDefaultCollapsedToolRendering(withRoutineToolRendering(source)));
+        const component = new sdk.ToolExecutionComponent(
+          "edit", "stored-edit-contract", args, {}, decorated,
+          { requestRender() { invalidations++; } }, directory.replace(/\\/g, "/"),
+        );
+        component.setArgsComplete();
+        component.render(100);
+        await vi.waitFor(() => {
+          const failedPreview = (component.render(100) as string[]).map(stripAnsi).join("\n");
+          expect(failedPreview).toMatch(/ENOENT|no such file|could not/iu);
+        });
+        expect(invalidations).toBeGreaterThan(0);
+
+        component.updateResult({
+          content: [{ type: "text", text: "Successfully replaced 1 block(s) in missing.txt." }],
+          details: { diff: "-1 OLD_STORED\n+1 NEW_STORED", patch: "stored patch", firstChangedLine: 1 },
+        }, false);
+        const settled = (component.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(settled).toContain("Edit preview failed:");
+        expect(settled).toContain("settled result elabo");
+        expect(settled.match(/OLD_STORED/g)).toHaveLength(1);
+        expect(settled.match(/NEW_STORED/g)).toHaveLength(1);
+        expect(settled).not.toContain("diff lines hidden");
+        expect(settled).not.toContain("no net change");
+        component.setExpanded(true);
+        const expanded = (component.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(expanded).toContain("Edit preview failed:");
+        expect(expanded.match(/OLD_STORED/g)).toHaveLength(1);
+        expect(expanded.match(/NEW_STORED/g)).toHaveLength(1);
+        component.setExpanded(false);
+        expect((component.render(100) as string[]).map(stripAnsi).join("\n")).toContain("Edit preview failed:");
+        component.setExpanded(true);
+        expect((component.render(100) as string[]).map(stripAnsi).join("\n").match(/NEW_STORED/g)).toHaveLength(1);
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("collapses MultiEdit from its detached Pi Edit DTO and expands one delegated diff", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    withExpansionBinding(["ctrl+o"], () => {
+      const args = {
+        file_path: "src/multi-contract.ts",
+        edits: [{ old_string: "OLD_MULTI", new_string: "NEW_MULTI" }],
+      };
+      const result = {
+        content: [{ type: "text", text: "Successfully applied 1 edit(s) to src/multi-contract.ts." }],
+        details: {
+          filePath: "src/multi-contract.ts", edits: 1, created: false,
+          diff: "-1 OLD_MULTI\n+1 NEW_MULTI", firstChangedLine: 1,
+        },
+      };
+      const decorated = wrapForSelfShell(withDefaultCollapsedToolRendering(
+        withRoutineToolRendering({ name: "MultiEdit" } as never),
+      ));
+      const component = new sdk.ToolExecutionComponent(
+        "MultiEdit", "collapsed-multiedit-contract", args, {}, decorated,
+        { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+      );
+      component.setArgsComplete();
+      component.updateResult(result, false);
+      const collapsed = (component.render(100) as string[]).map(stripAnsi);
+      expect(collapsed).toHaveLength(2);
+      expect(collapsed.join("\n")).toContain("MultiEdit src/multi-contract.ts · 1 edit applied · 2 diff lines hidden");
+      expect(collapsed.join("\n")).not.toContain("OLD_MULTI");
+      expect(collapsed.join("\n")).not.toContain("NEW_MULTI");
+
+      component.setExpanded(true);
+      const expanded = (component.render(100) as string[]).map(stripAnsi).join("\n");
+      expect(expanded.match(/OLD_MULTI/g)).toHaveLength(1);
+      expect(expanded.match(/NEW_MULTI/g)).toHaveLength(1);
+      expect(expanded.match(/src\/multi-contract\.ts/g)).toHaveLength(1);
+      component.setExpanded(false);
+      const recollapsed = (component.render(100) as string[]).map(stripAnsi).join("\n");
+      expect(recollapsed).toContain("diff lines hidden");
+      expect(recollapsed).not.toContain("OLD_MULTI");
+      component.setExpanded(true);
+      const reexpanded = (component.render(100) as string[]).map(stripAnsi).join("\n");
+      expect(reexpanded.match(/OLD_MULTI/g)).toHaveLength(1);
+      expect(reexpanded.match(/NEW_MULTI/g)).toHaveLength(1);
     });
   });
 
@@ -373,7 +515,7 @@ describe("real Pi default-collapsed rendering contract", () => {
     });
   });
 
-  it("keeps complete stock Read, Write, and Bash HTML exports on Pi's unchanged native path", async () => {
+  it("keeps complete stock Read, Write, Edit, and Bash HTML exports on Pi's unchanged native path", async () => {
     const sdk = await import("@earendil-works/pi-coding-agent") as any;
     sdk.initTheme();
     const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
@@ -384,17 +526,26 @@ describe("real Pi default-collapsed rendering contract", () => {
     const definitions = new Map([
       ["read", withDefaultCollapsedToolRendering(sdk.createReadToolDefinition(process.cwd()))],
       ["write", withDefaultCollapsedToolRendering(sdk.createWriteToolDefinition(process.cwd()))],
+      ["edit", withDefaultCollapsedToolRendering(withRoutineToolRendering(sdk.createEditToolDefinition(process.cwd())))],
       ["bash", withDefaultCollapsedToolRendering(sdk.createBashToolDefinition(process.cwd()))],
     ]);
-    const renderer = htmlModule.createToolHtmlRenderer({
-      getToolDefinition: (name: string) => definitions.get(name), theme: themeModule.theme, cwd: process.cwd(),
+    const nativeDefinitions = new Map([
+      ["read", sdk.createReadToolDefinition(process.cwd())],
+      ["write", sdk.createWriteToolDefinition(process.cwd())],
+      ["edit", sdk.createEditToolDefinition(process.cwd())],
+      ["bash", sdk.createBashToolDefinition(process.cwd())],
+    ]);
+    const makeRenderer = (source: Map<string, unknown>) => htmlModule.createToolHtmlRenderer({
+      getToolDefinition: (name: string) => source.get(name), theme: themeModule.theme, cwd: process.cwd(),
     });
+    const renderer = makeRenderer(definitions);
     const directory = mkdtempSync(join(tmpdir(), "picc-file-export-"));
     try {
       const session = sdk.SessionManager.create(directory, directory, { id: "stock-file-export" });
       for (const entry of [
         { id: "stock-read", name: "read", args: { path: "stock.txt" }, text: "STOCK READ HTML BODY", details: undefined },
         { id: "stock-write", name: "write", args: { path: "stock-write.txt", content: "STOCK WRITE HTML BODY" }, text: "Successfully wrote 21 bytes to stock-write.txt", details: undefined },
+        { id: "stock-edit", name: "edit", args: { path: "stock-edit.txt", edits: [{ oldText: "OLD", newText: "NEW" }] }, text: "Successfully replaced 1 block(s) in stock-edit.txt.", details: { diff: "-1 OLD\n+1 NEW", patch: "patch", firstChangedLine: 1 } },
         { id: "stock-bash", name: "bash", args: { command: "printf STOCK_BASH_HTML_BODY" }, text: "STOCK_BASH_HTML_BODY", details: undefined },
       ]) {
         session.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: entry.id, name: entry.name, arguments: entry.args }], stopReason: "toolUse" } as never);
@@ -402,20 +553,62 @@ describe("real Pi default-collapsed rendering contract", () => {
           content: [{ type: "text", text: entry.text }], details: entry.details, isError: false } as never);
       }
       const outputPath = join(directory, "stock.html");
+      const nativeOutputPath = join(directory, "stock-native.html");
       await exportModule.exportSessionToHtml(session, undefined, { outputPath, toolRenderer: renderer });
+      await exportModule.exportSessionToHtml(session, undefined, {
+        outputPath: nativeOutputPath, toolRenderer: makeRenderer(nativeDefinitions),
+      });
       const html = readFileSync(outputPath, "utf8");
-      const encoded = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1];
-      expect(encoded).toBeDefined();
-      const data = JSON.parse(Buffer.from(encoded!, "base64").toString("utf8"));
+      const nativeHtml = readFileSync(nativeOutputPath, "utf8");
+      const decode = (source: string) => {
+        const encoded = source.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1];
+        expect(encoded).toBeDefined();
+        return JSON.parse(Buffer.from(encoded!, "base64").toString("utf8"));
+      };
+      const data = decode(html);
+      const nativeData = decode(nativeHtml);
+      expect(data.entries).toEqual(nativeData.entries);
+      expect(data.renderedTools).toEqual(nativeData.renderedTools);
       const canonical = JSON.stringify(data.entries);
       expect(canonical).toContain("STOCK READ HTML BODY");
       expect(canonical).toContain("STOCK WRITE HTML BODY");
+      expect(canonical).toContain("stock-edit.txt");
+      expect(canonical).toContain("-1 OLD\\n+1 NEW");
       expect(canonical).toContain("STOCK_BASH_HTML_BODY");
       expect(data.renderedTools?.["stock-read"]).toBeUndefined();
       expect(data.renderedTools?.["stock-write"]).toBeUndefined();
+      expect(data.renderedTools?.["stock-edit"]).toBeUndefined();
       expect(data.renderedTools?.["stock-bash"]).toBeUndefined();
       expect(html).not.toContain("lines hidden");
     } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("keeps custom MultiEdit HTML byte-equivalent because export never establishes the settled-call marker", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    await withExpansionBindingAsync(["ctrl+o"], async () => {
+      const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+      const piDist = mainUrl.slice(0, mainUrl.indexOf("/dist/"));
+      const htmlModule = await import(`${piDist}/dist/core/export-html/tool-renderer.js`) as any;
+      const themeModule = await import(`${piDist}/dist/modes/interactive/theme/theme.js`) as any;
+      const routine = withRoutineToolRendering({ name: "MultiEdit" } as never);
+      const make = (definition: unknown) => htmlModule.createToolHtmlRenderer({
+        getToolDefinition: (name: string) => name === "MultiEdit" ? definition : undefined,
+        theme: themeModule.theme, cwd: process.cwd(), width: 80,
+      });
+      const nativeRenderer = make(routine);
+      const decoratedRenderer = make(withDefaultCollapsedToolRendering(routine));
+      const args = { file_path: "src/html-marker.ts", edits: [{ old_string: "OLD_HTML", new_string: "NEW_HTML" }] };
+      const content = [{ type: "text", text: "Successfully applied 1 edit(s) to src/html-marker.ts." }];
+      const details = { filePath: "src/html-marker.ts", edits: 1, created: false,
+        diff: "-1 OLD_HTML\n+1 NEW_HTML", firstChangedLine: 1 };
+      for (const renderer of [nativeRenderer, decoratedRenderer]) renderer.renderCall("html-marker", "MultiEdit", args);
+      const native = nativeRenderer.renderResult("html-marker", "MultiEdit", content, details, false);
+      const decorated = decoratedRenderer.renderResult("html-marker", "MultiEdit", content, details, false);
+      expect(decorated).toEqual(native);
+      expect(decorated?.expanded).toContain("OLD_HTML");
+      expect(decorated?.expanded).not.toContain("diff lines hidden");
+    });
   });
 
   it("does not arm collapse through Pi's HTML partial-call lifecycle", async () => {

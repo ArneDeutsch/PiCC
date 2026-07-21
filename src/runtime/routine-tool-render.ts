@@ -644,8 +644,13 @@ function routineToolName(tool: unknown): RoutineToolName | undefined {
 
 const EDIT_CALL_INNER = Symbol("picc.editCallInner");
 const EDIT_RESULT_INNER = Symbol("picc.editResultInner");
+const MULTI_EDIT_SNAPSHOT = Symbol("picc.multiEditSnapshot");
 
-type MarkedComponent = Component & { [EDIT_CALL_INNER]?: Component; [EDIT_RESULT_INNER]?: Component };
+type MarkedComponent = Component & {
+  [EDIT_CALL_INNER]?: Component;
+  [EDIT_RESULT_INNER]?: Component;
+  [MULTI_EDIT_SNAPSHOT]?: MultiEditSuccess;
+};
 type PublicEditDefinition = ReturnType<typeof createEditToolDefinition>;
 type PublicEditCallRenderer = NonNullable<PublicEditDefinition["renderCall"]>;
 type PublicEditResultRenderer = NonNullable<PublicEditDefinition["renderResult"]>;
@@ -668,6 +673,22 @@ function componentMarker(value: unknown, marker: symbol): Component | undefined 
   } catch {
     return undefined;
   }
+}
+
+/** Read only the native preview-error evidence retained inside this module's Edit call adapter. */
+export function adaptedEditPreviewError(value: unknown): string | undefined {
+  const inner = componentMarker(value, EDIT_CALL_INNER);
+  const preview = ownData(inner, "preview");
+  const error = ownData(preview, "error");
+  return typeof error === "string" ? error : undefined;
+}
+
+/** Read the authoritative snapshot attached by the bounded routine MultiEdit renderer. */
+export function adaptedMultiEditSnapshot(value: unknown): MultiEditSuccess | undefined {
+  const snapshot = ownData(value, MULTI_EDIT_SNAPSHOT);
+  if (snapshot === null || typeof snapshot !== "object") return undefined;
+  const kind = ownData(snapshot, "kind");
+  return kind === "displayable" || kind === "oversized" ? snapshot as MultiEditSuccess : undefined;
 }
 
 function editContext(context: unknown, lastComponent: Component | undefined): Record<string, unknown> {
@@ -784,7 +805,7 @@ function validateMultiEditEntries(value: unknown, length: number): boolean {
   }
 }
 
-interface MultiEditSnapshot {
+export interface MultiEditSnapshot {
   kind: "displayable";
   path: string;
   diff: string;
@@ -793,12 +814,12 @@ interface MultiEditSnapshot {
   canonicalText: string;
 }
 
-interface OversizedMultiEditSnapshot {
+export interface OversizedMultiEditSnapshot {
   kind: "oversized";
   path: string;
 }
 
-type MultiEditSuccess = MultiEditSnapshot | OversizedMultiEditSnapshot;
+export type MultiEditSuccess = MultiEditSnapshot | OversizedMultiEditSnapshot;
 
 function boundedPathMatches(left: string, right: string): boolean {
   if (left.length !== right.length) return false;
@@ -825,12 +846,13 @@ function canonicalMultiEditTextMatches(
     text.startsWith(tail, prefix.length + path.length - tail.length);
 }
 
-function recognizeMultiEditSuccess(
+export function recognizeMultiEditSuccess(
   result: unknown,
   options: unknown,
   context: unknown,
 ): MultiEditSuccess | undefined {
-  if (ownData(options, "isPartial") !== false || ownData(context, "isError") !== false) return undefined;
+  if (ownData(options, "isPartial") !== false || ownData(context, "isPartial") !== false ||
+    ownData(context, "isError") !== false) return undefined;
   const resultSnapshot = plainOwnData(result, ["content", "details"]) ??
     plainOwnData(result, ["content", "details", "isError"]);
   if (!resultSnapshot || ("isError" in resultSnapshot && resultSnapshot.isError !== false) ||
@@ -888,8 +910,9 @@ function multiEditCall(args: unknown, theme: unknown): Component {
   return commandComponent("MultiEdit", path, theme);
 }
 
-function textComponent(text: string, theme: unknown): Component {
+function textComponent(text: string, theme: unknown, snapshot?: MultiEditSuccess): Component {
   return {
+    ...(snapshot ? { [MULTI_EDIT_SNAPSHOT]: snapshot } : {}),
     render(width: number): string[] {
       return [clamp(safeThemeMethod(theme, "fg", ["toolOutput", text], text), width)];
     },
@@ -906,10 +929,10 @@ function multiEditResult(
   const snapshot = recognizeMultiEditSuccess(result, options, context);
   if (!snapshot) return failOpenComponent(result, "MultiEdit", theme);
   if (snapshot.kind === "oversized") {
-    return textComponent(`Diff too large to display for ${snapshot.path}`, theme);
+    return textComponent(`Edit details too large to display for ${snapshot.path}`, theme, snapshot);
   }
   if (snapshot.diff.length === 0) {
-    return textComponent(`No net change (${snapshot.editCount} edits applied)`, theme);
+    return textComponent(`No net change (${snapshot.editCount} ${snapshot.editCount === 1 ? "edit" : "edits"} applied)`, theme, snapshot);
   }
   const fallback = failOpenComponent(result, "MultiEdit", theme);
   try {
@@ -950,6 +973,7 @@ function multiEditResult(
     );
     const adapted: MarkedComponent = {
       [EDIT_RESULT_INNER]: delegated,
+      [MULTI_EDIT_SNAPSHOT]: snapshot,
       render(width: number): string[] {
         try {
           return delegated.render(width);

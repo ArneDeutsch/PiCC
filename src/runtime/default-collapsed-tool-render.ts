@@ -1,8 +1,13 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+  adaptedEditPreviewError,
+  adaptedMultiEditSnapshot,
+  type MultiEditSuccess,
+} from "./routine-tool-render.js";
 
 interface Component { render(width: number): string[] }
-type ToolName = "read" | "write" | "bash";
+type ToolName = "read" | "write" | "bash" | "edit" | "MultiEdit";
 type Data = Record<string, unknown>;
 type NativeCall = (args: unknown, theme: unknown, context: unknown) => Component;
 type NativeResult = (result: unknown, options: unknown, theme: unknown, context: unknown) => Component;
@@ -12,25 +17,53 @@ interface Lifecycle {
   nativeCall?: Component;
   nativeResult?: Component;
   nativeArgs?: Data;
+  editPreviewError?: string;
+  editOversized: boolean;
+  editOversizedTarget?: string;
 }
 interface FileArgsSnapshot { path: string; content?: string; offset?: number; limit?: number }
 interface BashArgsSnapshot { command: string; timeout?: number }
-type ArgsSnapshot = FileArgsSnapshot | BashArgsSnapshot;
+interface EditArgsSnapshot {
+  path: string;
+  editCount: number;
+  content?: never;
+  offset?: never;
+  limit?: never;
+}
+type ArgsSnapshot = FileArgsSnapshot | BashArgsSnapshot | EditArgsSnapshot;
 interface FileOrdinarySnapshot { kind: "file"; path: string; hiddenLines: number; range?: string }
 interface BashOrdinarySnapshot { kind: "bash"; commandLines: number; outputLines: number; duration?: string }
-type OrdinarySnapshot = FileOrdinarySnapshot | BashOrdinarySnapshot;
+interface MutationOrdinarySnapshot {
+  kind: "mutation";
+  path: string;
+  editCount: number;
+  diffLines?: number;
+  noNet: boolean;
+}
+type OrdinarySnapshot = FileOrdinarySnapshot | BashOrdinarySnapshot | MutationOrdinarySnapshot;
 
 type Snapshot<T = unknown> =
   | { kind: "complete"; value: T }
   | { kind: "capped"; budget: "characters" | "depth" | "elements" | "keys" }
   | { kind: "malformed" };
-interface Budget { chars: number; elements: number; keys: number }
+interface Budget {
+  chars: number;
+  maxStringChars: number;
+  elements: number;
+  keys: number;
+  maxContainerKeys: number;
+  maxElements: number;
+  maxDepth: number;
+}
 
 const MAX_KEYS = 256;
 const MAX_CONTAINER_KEYS = 64;
 const MAX_ELEMENTS = 128;
 const MAX_DEPTH = 8;
+const MAX_EDIT_ELEMENTS = 256;
+const MAX_EDIT_KEYS = 1_024;
 const MAX_TEXT_CHARS = 1_000_000;
+const MAX_EDIT_TEXT_CHARS = 2_000_000;
 const MAX_PATH_CHARS = 16_384;
 const MAX_DISPLAY_LINES = 10_000;
 const MAX_RENDERED_LINES = 20_000;
@@ -65,12 +98,14 @@ function snapshot(value: unknown, budget: Budget, depth = 0): Snapshot {
     return { kind: "complete", value };
   }
   if (typeof value === "string") {
-    if (value.length > budget.chars) return { kind: "capped", budget: "characters" };
+    if (value.length > budget.maxStringChars || value.length > budget.chars) {
+      return { kind: "capped", budget: "characters" };
+    }
     budget.chars -= value.length;
     return { kind: "complete", value };
   }
   if (typeof value !== "object") return { kind: "malformed" };
-  if (depth >= MAX_DEPTH) return { kind: "capped", budget: "depth" };
+  if (depth >= budget.maxDepth) return { kind: "capped", budget: "depth" };
   const array = safeIsArray(value);
   if (array === undefined) return { kind: "malformed" };
   const prototype = safePrototype(value);
@@ -79,13 +114,13 @@ function snapshot(value: unknown, budget: Budget, depth = 0): Snapshot {
   }
   const keys = safeKeys(value);
   if (!keys) return { kind: "malformed" };
-  if (keys.length > MAX_CONTAINER_KEYS || keys.length > budget.keys) return { kind: "capped", budget: "keys" };
+  if (keys.length > budget.maxContainerKeys || keys.length > budget.keys) return { kind: "capped", budget: "keys" };
   budget.keys -= keys.length;
 
   if (array) {
     const length = ownData(value, "length");
     if (!Number.isSafeInteger(length) || (length as number) < 0) return { kind: "malformed" };
-    if ((length as number) > MAX_ELEMENTS || (length as number) > budget.elements) {
+    if ((length as number) > budget.maxElements || (length as number) > budget.elements) {
       return { kind: "capped", budget: "elements" };
     }
     if (keys.length !== (length as number) + 1 || !keys.includes("length")) return { kind: "malformed" };
@@ -114,7 +149,17 @@ function snapshot(value: unknown, budget: Budget, depth = 0): Snapshot {
 }
 
 function inspect(value: unknown): Snapshot {
-  return snapshot(value, { chars: MAX_TEXT_CHARS, elements: MAX_ELEMENTS, keys: MAX_KEYS });
+  return snapshot(value, {
+    chars: MAX_TEXT_CHARS, maxStringChars: MAX_TEXT_CHARS, elements: MAX_ELEMENTS, keys: MAX_KEYS,
+    maxContainerKeys: MAX_CONTAINER_KEYS, maxElements: MAX_ELEMENTS, maxDepth: MAX_DEPTH,
+  });
+}
+function inspectEdit(value: unknown): Snapshot {
+  return snapshot(value, {
+    chars: MAX_EDIT_TEXT_CHARS, maxStringChars: MAX_TEXT_CHARS,
+    elements: MAX_EDIT_ELEMENTS, keys: MAX_EDIT_KEYS,
+    maxContainerKeys: MAX_EDIT_ELEMENTS + 1, maxElements: MAX_EDIT_ELEMENTS, maxDepth: MAX_DEPTH,
+  });
 }
 function record(value: unknown): Data | undefined {
   return value !== null && typeof value === "object" && safeIsArray(value) === false ? value as Data : undefined;
@@ -138,7 +183,7 @@ function lifecycleFor(context: unknown): Lifecycle | undefined {
   if (state === null || typeof state !== "object") return undefined;
   try {
     let lifecycle = lifecycles.get(state);
-    if (!lifecycle) { lifecycle = { settledObserved: false }; lifecycles.set(state, lifecycle); }
+    if (!lifecycle) { lifecycle = { settledObserved: false, editOversized: false }; lifecycles.set(state, lifecycle); }
     return lifecycle;
   } catch { return undefined; }
 }
@@ -247,6 +292,18 @@ function keyHint(): string | undefined {
 }
 
 function argsFrom(value: unknown, toolName: ToolName): ArgsSnapshot | undefined {
+  if (toolName === "edit") {
+    const data = exact(value, ["path", "edits"]);
+    const edits = data && contentBlocks(data.edits);
+    if (!data || typeof data.path !== "string" || data.path.length > MAX_PATH_CHARS ||
+      !sanitize(data.path, MAX_PATH_CHARS, true) || !edits || edits.length < 1) return undefined;
+    for (const entry of edits) {
+      const replacement = exact(entry, ["oldText", "newText"]);
+      if (!replacement || typeof replacement.oldText !== "string" || typeof replacement.newText !== "string") return undefined;
+    }
+    return { path: data.path, editCount: edits.length };
+  }
+  if (toolName === "MultiEdit") return undefined;
   if (toolName === "bash") {
     const data = oneExact(value, [["command"], ["command", "timeout"]]);
     if (!data || typeof data.command !== "string") return undefined;
@@ -315,6 +372,22 @@ function nativeDuration(context: unknown): string | undefined {
   return `${((endedAt - startedAt) / 1000).toFixed(1)}s`;
 }
 function ordinary(toolName: ToolName, args: ArgsSnapshot, result: unknown, context: unknown): Snapshot<OrdinarySnapshot> {
+  if (toolName === "edit") {
+    if (!("editCount" in args)) return { kind: "malformed" };
+    const envelope = resultEnvelope(result);
+    const details = envelope && exact(envelope.details, ["diff", "patch", "firstChangedLine"]);
+    const blocks = envelope && contentBlocks(envelope.content);
+    const text = blocks?.length === 1 ? textBlock(blocks[0]) : undefined;
+    if (!envelope || ("isError" in envelope && envelope.isError !== false) || !details ||
+      typeof details.diff !== "string" || typeof details.patch !== "string" ||
+      text !== `Successfully replaced ${args.editCount} block(s) in ${args.path}.`) return { kind: "malformed" };
+    if (details.diff.length === 0) return { kind: "malformed" };
+    if (!Number.isSafeInteger(details.firstChangedLine) || (details.firstChangedLine as number) < 1) return { kind: "malformed" };
+    const count = logicalLineCount(sanitize(details.diff, MAX_TEXT_CHARS, false));
+    return count.kind === "complete" ? { kind: "complete", value: {
+      kind: "mutation", path: args.path, editCount: args.editCount, diffLines: count.value, noNet: false,
+    } } : count;
+  }
   const envelope = resultEnvelope(result);
   if (!envelope || ("isError" in envelope && envelope.isError !== false) || envelope.details !== undefined) return { kind: "malformed" };
   const blocks = contentBlocks(envelope.content);
@@ -351,6 +424,34 @@ function ordinary(toolName: ToolName, args: ArgsSnapshot, result: unknown, conte
   if (args.content === undefined || text !== `Successfully wrote ${args.content.length} bytes to ${args.path}`) return { kind: "malformed" };
   const count = logicalLineCount(args.content);
   return count.kind === "complete" ? { kind: "complete", value: { kind: "file", path: args.path, hiddenLines: count.value } } : count;
+}
+
+function multiEditOrdinary(value: MultiEditSuccess): Snapshot<MutationOrdinarySnapshot> {
+  if (value.kind !== "displayable") return { kind: "malformed" };
+  if (value.diff.length === 0) return { kind: "complete", value: {
+    kind: "mutation", path: value.path, editCount: value.editCount, noNet: true,
+  } };
+  const count = logicalLineCount(value.diff);
+  return count.kind === "complete" ? { kind: "complete", value: {
+    kind: "mutation", path: value.path, editCount: value.editCount, diffLines: count.value, noNet: false,
+  } } : count;
+}
+
+function recognizedEditNoNet(
+  args: EditArgsSnapshot,
+  result: unknown,
+  options: unknown,
+  context: unknown,
+): boolean {
+  if (ownBoolean(options, "isPartial") !== false || ownBoolean(context, "isPartial") !== false ||
+    ownBoolean(context, "isError") !== false) return false;
+  const envelope = resultEnvelope(result);
+  const details = envelope && exact(envelope.details, ["diff", "patch", "firstChangedLine"]);
+  const blocks = envelope && contentBlocks(envelope.content);
+  return Boolean(envelope && (!("isError" in envelope) || envelope.isError === false) && details &&
+    blocks?.length === 1 &&
+    textBlock(blocks[0]) === `Successfully replaced ${args.editCount} block(s) in ${args.path}.` &&
+    details.diff === "" && details.patch === "" && details.firstChangedLine === undefined);
 }
 
 function recognizedContent(value: unknown): boolean {
@@ -411,6 +512,17 @@ function failure(snapshotResult: Snapshot): string {
     ? `Detail inspection limit reached (${snapshotResult.budget}); remaining detail uninspected`
     : "Unfamiliar result";
 }
+function editTarget(value: unknown): string | undefined {
+  const data = exact(value, ["path", "edits"]);
+  const path = data && ownData(data, "path");
+  if (typeof path !== "string") return undefined;
+  const safe = sanitize(path, MAX_PATH_CHARS, true);
+  return safe || undefined;
+}
+function editOversizedStatus(target: string | undefined): string {
+  return target ? `Edit · edit details too large; details uninspected · target ${target}`
+    : "Edit · edit details too large; target and details uninspected";
+}
 function argsFailure(snapshotResult: Snapshot): string {
   if (snapshotResult.kind === "capped") return failure(snapshotResult);
   if (snapshotResult.kind === "complete") {
@@ -432,13 +544,14 @@ function nativeContext(context: unknown, args: Data, lastComponent: Component | 
     cwd: typeof ownData(context, "cwd") === "string" ? sanitize(ownData(context, "cwd") as string, MAX_PATH_CHARS, true) : "",
     executionStarted: ownBoolean(context, "executionStarted") === true,
     argsComplete: ownBoolean(context, "argsComplete") === true,
-    isPartial: ownBoolean(context, "isPartial") === true,
+    isPartial: ownBoolean(context, "isPartial"),
     expanded, showImages: ownBoolean(context, "showImages") === true,
-    isError: ownBoolean(context, "isError") === true,
+    isError: ownBoolean(context, "isError"),
   };
 }
 function summaryComponent(toolName: ToolName, snapshotValue: OrdinarySnapshot, hint: string, theme: unknown): Component {
-  const identity = toolName === "read" ? "Read" : toolName === "write" ? "Write" : "Bash";
+  const identity = toolName === "read" ? "Read" : toolName === "write" ? "Write"
+    : toolName === "edit" ? "Edit" : toolName === "MultiEdit" ? "MultiEdit" : "Bash";
   if (snapshotValue.kind === "bash") {
     const output = snapshotValue.outputLines === 0 ? "(no output)"
       : `${snapshotValue.outputLines} output ${snapshotValue.outputLines === 1 ? "line" : "lines"} hidden`;
@@ -465,20 +578,36 @@ function summaryComponent(toolName: ToolName, snapshotValue: OrdinarySnapshot, h
     } };
   }
   const path = sanitize(snapshotValue.path, MAX_PATH_CHARS, true);
-  const range = sanitize(snapshotValue.range ?? "", MAX_PATH_CHARS, true);
-  const count = `${snapshotValue.hiddenLines} ${snapshotValue.hiddenLines === 1 ? "line" : "lines"} hidden`;
+  const range = sanitize(snapshotValue.kind === "file" ? snapshotValue.range ?? "" : "", MAX_PATH_CHARS, true);
+  const count = snapshotValue.kind === "mutation"
+    ? `${snapshotValue.editCount} ${snapshotValue.editCount === 1 ? "edit" : "edits"} applied · ${snapshotValue.noNet
+      ? "no net change"
+      : `${snapshotValue.diffLines} diff ${snapshotValue.diffLines === 1 ? "line" : "lines"} hidden`}`
+    : `${snapshotValue.hiddenLines} ${snapshotValue.hiddenLines === 1 ? "line" : "lines"} hidden`;
   return { render(width: number): string[] {
     if (!Number.isFinite(width) || width <= 0) return [""];
     const columns = Math.floor(width);
     const title = safeTheme(theme, "fg", ["toolTitle", safeTheme(theme, "bold", [identity], identity)], identity);
-    const status = safeTheme(theme, "fg", ["muted", ` · ${count}`], ` · ${count}`);
+    const fullStatus = safeTheme(theme, "fg", ["muted", ` · ${count}`], ` · ${count}`);
+    const compactMutationStatus = snapshotValue.kind === "mutation"
+      ? safeTheme(theme, "fg", ["muted", ` · ${snapshotValue.noNet ? "no net change" : "diff hidden"}`],
+        ` · ${snapshotValue.noNet ? "no net change" : "diff hidden"}`)
+      : undefined;
     const expansion = safeTheme(theme, "fg", ["dim", ` · ${hint} to expand`], ` · ${hint} to expand`);
     let line = clamp(title, columns);
     try {
       const identityWidth = visibleWidth(line);
-      const statusWidth = visibleWidth(status);
       const available = Math.max(0, columns - identityWidth - 1);
-      const reserveStatus = available >= statusWidth + 2;
+      const fullStatusWidth = visibleWidth(fullStatus);
+      const compactStatusWidth = compactMutationStatus === undefined ? Number.POSITIVE_INFINITY : visibleWidth(compactMutationStatus);
+      const status = snapshotValue.kind === "mutation"
+        ? (available >= fullStatusWidth + 2 ? fullStatus
+          : available >= compactStatusWidth ? compactMutationStatus : undefined)
+        : fullStatus;
+      const statusWidth = status === undefined ? 0 : visibleWidth(status);
+      const reserveStatus = snapshotValue.kind === "mutation"
+        ? status !== undefined
+        : available >= statusWidth + 2;
       const targetRoom = Math.max(0, available - (reserveStatus ? statusWidth : 0));
       if (targetRoom > 0) {
         const rangeWidth = visibleWidth(range);
@@ -495,7 +624,7 @@ function summaryComponent(toolName: ToolName, snapshotValue: OrdinarySnapshot, h
         const target = safeTheme(theme, "fg", ["accent", targetText], targetText);
         line += ` ${target}`;
       }
-      if (visibleWidth(line + status) <= columns) line += status;
+      if (status !== undefined && visibleWidth(line + status) <= columns) line += status;
       if (visibleWidth(line + expansion) <= columns) line += expansion;
     } catch { return [clamp(line, columns)]; }
     return [clamp(line, columns)];
@@ -534,7 +663,8 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
     const name = Object.getOwnPropertyDescriptor(tool, "name");
     const call = Object.getOwnPropertyDescriptor(tool, "renderCall");
     const result = Object.getOwnPropertyDescriptor(tool, "renderResult");
-    if (!name || !("value" in name) || (name.value !== "read" && name.value !== "write" && name.value !== "bash") ||
+    if (!name || !("value" in name) || (name.value !== "read" && name.value !== "write" && name.value !== "bash" &&
+      name.value !== "edit" && name.value !== "MultiEdit") ||
       !call || !("value" in call) || typeof call.value !== "function" ||
       !result || !("value" in result) || typeof result.value !== "function") return tool;
     descriptors = Object.getOwnPropertyDescriptors(tool);
@@ -574,10 +704,36 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
   Object.defineProperties(decorated, {
     renderCall: { configurable: true, enumerable: true, writable: true, value(argsValue: unknown, theme: unknown, context: unknown): Component {
       const lifecycle = lifecycleFor(context);
-      const argsInspection = inspect(argsValue);
       const settled = ownBoolean(context, "isPartial") === false;
+      if (toolName === "MultiEdit") {
+        if (!lifecycle) {
+          try { return nativeCall(argsValue, theme, context); }
+          catch { return statusComponent("Renderer failed", theme); }
+        }
+        const hint = keyHint();
+        const forceExpanded = settled && !hint;
+        try {
+          const component = nativeCall(argsValue, theme,
+            nativeContext(context, record(argsValue) ?? {}, lifecycle.nativeCall,
+              forceExpanded || ownBoolean(context, "expanded") === true));
+          lifecycle.nativeCall = component;
+          if (settled) lifecycle.settledObserved = true;
+          return settled && hint ? emptyComponent() : component;
+        } catch { return statusComponent("Renderer failed", theme); }
+      }
+      const argsInspection = toolName === "edit" ? inspectEdit(argsValue) : inspect(argsValue);
       const args = argsInspection.kind === "complete" ? argsFrom(argsInspection.value, toolName) : undefined;
       const displayable = argsInspection.kind === "complete" && record(argsInspection.value);
+      const rawEditPath = toolName === "edit" ? ownData(exact(argsValue, ["path", "edits"]), "path") : undefined;
+      if (toolName === "edit" && (argsInspection.kind === "capped" ||
+        (typeof rawEditPath === "string" && rawEditPath.length > MAX_PATH_CHARS))) {
+        const target = editTarget(argsValue);
+        if (lifecycle) {
+          lifecycle.editOversized = true;
+          lifecycle.editOversizedTarget = target;
+        }
+        return statusComponent(editOversizedStatus(target), theme);
+      }
       if (!lifecycle || !displayable || (settled && !args)) return statusComponent(argsFailure(argsInspection), theme);
       const hint = keyHint();
       const forceExpanded = settled && !hint;
@@ -585,6 +741,10 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
       try {
         const component = nativeCall(dto, theme, nativeContext(context, dto, lifecycle.nativeCall, forceExpanded || ownBoolean(context, "expanded") === true));
         lifecycle.nativeCall = component;
+        if (toolName === "edit") {
+          const previewError = adaptedEditPreviewError(component);
+          if (previewError !== undefined) lifecycle.editPreviewError = sanitize(previewError, 512, true) || "unknown preview error";
+        }
         if (toolName === "bash") lifecycle.nativeArgs = dto;
         if (settled) lifecycle.settledObserved = true;
         return settled && hint ? emptyComponent() : component;
@@ -592,11 +752,100 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
     } },
     renderResult: { configurable: true, enumerable: true, writable: true, value(resultValue: unknown, options: unknown, theme: unknown, context: unknown): Component {
       const lifecycle = lifecycleFor(context);
-      const argsInspection = inspect(ownData(context, "args"));
-      const resultInspection = inspect(resultValue);
-      const args = argsInspection.kind === "complete" ? argsFrom(argsInspection.value, toolName) : undefined;
       const expanded = ownBoolean(options, "expanded") === true;
-      if (!lifecycle) return statusComponent(argsFailure(argsInspection), theme);
+      if (!lifecycle) {
+        if (toolName === "edit" || toolName === "MultiEdit") {
+          try { return nativeResult(resultValue, options, theme, context); }
+          catch { return statusComponent("Renderer failed", theme); }
+        }
+        return statusComponent(argsFailure(inspect(ownData(context, "args"))), theme);
+      }
+
+      if (toolName === "MultiEdit") {
+        const hint = keyHint();
+        const owned = lifecycle.settledObserved && Boolean(hint);
+        const forceExpanded = !hint;
+        let resultComponent: Component;
+        try {
+          resultComponent = nativeResult(resultValue, {
+            expanded: forceExpanded || expanded,
+            isPartial: ownBoolean(options, "isPartial"),
+          }, theme, nativeContext(
+            context,
+            record(ownData(context, "args")) ?? {},
+            lifecycle.nativeResult,
+            forceExpanded || expanded,
+          ));
+          lifecycle.nativeResult = resultComponent;
+        } catch { return statusComponent("Renderer failed", theme); }
+        if (!owned) return resultComponent;
+        if (!lifecycle.nativeCall) return statusComponent("Unfamiliar result", theme);
+        const recognized = adaptedMultiEditSnapshot(resultComponent);
+        const ordinaryMutation = recognized ? multiEditOrdinary(recognized) : { kind: "malformed" } as const;
+        if (ordinaryMutation.kind === "capped") return statusComponent(failure(ordinaryMutation), theme);
+        if (ordinaryMutation.kind === "complete" && !expanded) {
+          return summaryComponent(toolName, ordinaryMutation.value, hint as string, theme);
+        }
+        if (ordinaryMutation.kind === "complete") return combined([lifecycle.nativeCall, resultComponent], theme);
+        return combined([statusComponent("Elaborated result", theme), lifecycle.nativeCall, resultComponent], theme);
+      }
+
+      const argsInspection = toolName === "edit" ? inspectEdit(ownData(context, "args")) : inspect(ownData(context, "args"));
+      const resultInspection = toolName === "edit" ? inspectEdit(resultValue) : inspect(resultValue);
+      const args = argsInspection.kind === "complete" ? argsFrom(argsInspection.value, toolName) : undefined;
+
+      if (toolName === "edit") {
+        if (argsInspection.kind === "capped" || lifecycle.editOversized) {
+          return statusComponent(editOversizedStatus(lifecycle.editOversizedTarget ?? editTarget(ownData(context, "args"))), theme);
+        }
+        if (!args || !("editCount" in args) || !("path" in args) || argsInspection.kind !== "complete") {
+          return statusComponent(argsFailure(argsInspection), theme);
+        }
+        const editArgs = args as EditArgsSnapshot;
+        if (resultInspection.kind === "capped") {
+          return statusComponent(editOversizedStatus(editArgs.path), theme);
+        }
+        if (resultInspection.kind !== "complete") return statusComponent(failure(resultInspection), theme);
+        const resultRecord = record(resultInspection.value);
+        if (!resultRecord) return statusComponent("Unfamiliar result", theme);
+        const hint = keyHint();
+        const owned = lifecycle.settledObserved && Boolean(hint);
+        const forceExpanded = !hint;
+        const settled = ownBoolean(options, "isPartial") === false && ownBoolean(context, "isPartial") === false;
+        const displayArgs = sanitizeArgsDto(argsInspection.value) as Data;
+        const displayResult = sanitizeDto(resultRecord) as Data;
+        const currentPreviewError = adaptedEditPreviewError(lifecycle.nativeCall);
+        if (currentPreviewError !== undefined) {
+          lifecycle.editPreviewError = sanitize(currentPreviewError, 512, true) || "unknown preview error";
+        }
+        let resultComponent: Component;
+        try {
+          resultComponent = nativeResult(displayResult, { expanded: forceExpanded || expanded, isPartial: !settled }, theme,
+            nativeContext(context, displayArgs, lifecycle.nativeResult, forceExpanded || expanded));
+          lifecycle.nativeResult = resultComponent;
+        } catch { return statusComponent("Renderer failed", theme); }
+        if (!owned) return resultComponent;
+        if (!lifecycle.nativeCall) return statusComponent("Unfamiliar result", theme);
+        let ordinaryMutation: Snapshot<MutationOrdinarySnapshot> = { kind: "malformed" };
+        if (settled && ownBoolean(context, "isError") === false && lifecycle.editPreviewError === undefined) {
+          const changed = ordinary("edit", editArgs, resultInspection.value, context) as Snapshot<MutationOrdinarySnapshot>;
+          ordinaryMutation = changed.kind !== "malformed" ? changed
+            : recognizedEditNoNet(editArgs, resultInspection.value, options, context)
+              ? { kind: "complete", value: {
+                kind: "mutation", path: editArgs.path, editCount: editArgs.editCount, noNet: true,
+              } }
+              : changed;
+        }
+        if (ordinaryMutation.kind === "capped") return statusComponent(failure(ordinaryMutation), theme);
+        if (ordinaryMutation.kind === "complete" && !expanded) {
+          return summaryComponent(toolName, ordinaryMutation.value, hint as string, theme);
+        }
+        if (ordinaryMutation.kind === "complete") return combined([lifecycle.nativeCall, resultComponent], theme);
+        const status = lifecycle.editPreviewError === undefined
+          ? "Elaborated result"
+          : `Edit preview failed: ${lifecycle.editPreviewError} · settled result elaborated`;
+        return combined([statusComponent(status, theme), lifecycle.nativeCall, resultComponent], theme);
+      }
 
       if (toolName !== "bash") {
         if (!args || argsInspection.kind !== "complete") return statusComponent(argsFailure(argsInspection), theme);

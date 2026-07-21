@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { withDefaultCollapsedToolRendering } from "../src/runtime/default-collapsed-tool-render.js";
+import { withRoutineToolRendering } from "../src/runtime/routine-tool-render.js";
 
 interface Component { render(width: number): string[] }
 interface RenderTool {
@@ -34,7 +35,7 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-function definition(name: "read" | "write" | "bash"): RenderTool {
+function definition(name: "read" | "write" | "bash" | "edit"): RenderTool {
   const execute = () => undefined;
   return withDefaultCollapsedToolRendering({
     name,
@@ -49,8 +50,9 @@ function definition(name: "read" | "write" | "bash"): RenderTool {
       return component(`native ${name} ${path}${data.content === undefined ? "" : `\n${data.content}`}`);
     },
     renderResult(result: unknown) {
-      const text = ((result as { content?: Array<{ text?: string }> }).content ?? []).map((block) => block.text ?? "").join("\n");
-      return component(`native result ${text}`);
+      const value = result as { content?: Array<{ text?: string }>; details?: { diff?: string } };
+      const text = (value.content ?? []).map((block) => block.text ?? "").join("\n");
+      return component(`native result ${name === "edit" ? value.details?.diff ?? text : text}`);
     },
   } as unknown as ToolDefinition) as unknown as RenderTool;
 }
@@ -68,6 +70,34 @@ function writeResult(path: string, content: string): unknown {
 
 function bashResult(text = "(no output)", details: unknown = undefined): unknown {
   return { content: [{ type: "text", text }], details };
+}
+
+function editResult(path: string, editCount: number, diff: string, firstChangedLine: number | undefined = diff ? 1 : undefined): unknown {
+  return {
+    content: [{ type: "text", text: `Successfully replaced ${editCount} block(s) in ${path}.` }],
+    details: { diff, patch: diff ? `patch:${diff}` : "", firstChangedLine },
+  };
+}
+
+function multiEditDefinition(): RenderTool {
+  const routine = withRoutineToolRendering(
+    { name: "MultiEdit", execute() {} } as unknown as ToolDefinition,
+    { createEditDefinition: () => ({
+      renderResult(result) {
+        return component(`native delegated diff ${(result as { details: { diff: string } }).details.diff}`);
+      },
+    }) },
+  );
+  return withDefaultCollapsedToolRendering(routine) as unknown as RenderTool;
+}
+
+function multiEditResult(path: string, editCount: number, diff: string, created = false): Record<string, unknown> {
+  return {
+    content: [{ type: "text", text: created
+      ? `Created ${path} with ${editCount} edit(s).`
+      : `Successfully applied ${editCount} edit(s) to ${path}.` }],
+    details: { filePath: path, edits: editCount, created, diff, firstChangedLine: diff ? 1 : undefined },
+  };
 }
 
 function contexts(args: unknown) {
@@ -172,6 +202,424 @@ describe("default-collapsed tool rendering", () => {
       expect(expanded.match(new RegExp(`native ${tool.name}`, "g"))).toHaveLength(1);
       expect(expanded.match(/native result/g)).toHaveLength(1);
     }
+  }));
+
+  it("collapses ordinary Edit and MultiEdit successes and restores each native diff exactly once", () => withBindings(["ctrl+k"], () => {
+    const editArgs = {
+      path: "src/edit.ts",
+      edits: [{ oldText: "old", newText: "new" }, { oldText: "before", newText: "after" }],
+    };
+    const multiArgs = {
+      file_path: "src/multi.ts",
+      edits: [{ old_string: "old", new_string: "new" }, { old_string: "before", new_string: "after" }],
+    };
+    const cases = [
+      [definition("edit"), editArgs, editResult("src/edit.ts", 2, "-1 old\n+1 new"), "Edit", "src/edit.ts"],
+      [multiEditDefinition(), multiArgs, multiEditResult("src/multi.ts", 2, "-1 old\n+1 new"), "MultiEdit", "src/multi.ts"],
+    ] as const;
+    for (const [tool, args, result, identity, path] of cases) {
+      const collapsed = settle(tool, args, result).join("\n");
+      expect(collapsed).toContain(identity);
+      expect(collapsed).toContain(path);
+      expect(collapsed).toContain("2 edits applied");
+      expect(collapsed).toContain("2 diff lines hidden");
+      expect(collapsed).toContain("ctrl+k to expand");
+      expect(collapsed).not.toContain("old");
+      expect(collapsed).not.toContain("new");
+
+      const expanded = settle(tool, args, result, true).join("\n");
+      expect(expanded.match(/-1 old/g)).toHaveLength(1);
+      expect(expanded.match(/\+1 new/g)).toHaveLength(1);
+    }
+  }));
+
+  it("sanitizes and snapshots frozen mutation summaries at Unicode and narrow widths", () => withBindings(["ctrl+o"], () => {
+    const rawPath = "src/界🙂\u001b]0;target-secret\u0007.ts";
+    const args = deepFreeze({
+      file_path: rawPath,
+      edits: deepFreeze([deepFreeze({ old_string: "old", new_string: "new" })]),
+    });
+    const result = deepFreeze(multiEditResult(rawPath, 1, "-1 old\n+1 new", true));
+    const tool = multiEditDefinition();
+    const context = contexts(args);
+    tool.renderCall(args, theme, context.call);
+    const row = tool.renderResult(result, { expanded: false, isPartial: false }, theme, context.result);
+    for (const width of [0, 1, 2, 12, 40, 100]) {
+      const rendered = row.render(width).join("\n");
+      expect(visibleWidth(rendered)).toBeLessThanOrEqual(width);
+      expect(rendered).not.toContain("target-secret");
+      expect(rendered).not.toContain("]0;");
+      expect(rendered).not.toContain("\u0007");
+    }
+    expect(row.render(100).join("\n")).toContain("1 edit applied · 2 diff lines hidden");
+    expect(Object.isFrozen(args)).toBe(true);
+    expect(Object.isFrozen(result)).toBe(true);
+  }));
+
+  it("keeps mutation no-op, oversized, malformed, and error outcomes explicitly elaborated", () => withBindings(["ctrl+o"], () => {
+    const edit = definition("edit");
+    const editArgs = { path: "noop.ts", edits: [{ oldText: "same", newText: "same" }] };
+    const editNoNet = settle(edit, editArgs, editResult("noop.ts", 1, "", undefined)).join("\n");
+    expect(editNoNet).toContain("1 edit applied · no net change");
+    expect(editNoNet).not.toContain("Elaborated result");
+
+    const multi = multiEditDefinition();
+    const multiArgs = { file_path: "multi.ts", edits: [{ old_string: "same", new_string: "same" }] };
+    const multiNoNet = settle(multi, multiArgs, multiEditResult("multi.ts", 1, "")).join("\n");
+    expect(multiNoNet).toContain("1 edit applied · no net change");
+    expect(multiNoNet).not.toContain("Elaborated result");
+    expect(settle(multi, multiArgs, { ...multiEditResult("multi.ts", 1, "-1 a\n+1 b"), details: { future: true } }).join("\n"))
+      .toContain("Elaborated result");
+
+    const oversizedArgs = { file_path: "large.ts", edits: new Array(1_001) };
+    const oversized = {
+      content: [{ type: "text", text: "Successfully applied 1001 edit(s) to large.ts." }],
+      details: { filePath: "large.ts", edits: 1_001, created: false, diff: "-1 a\n+1 b", firstChangedLine: 1 },
+    };
+    const oversizedOutput = settle(multi, oversizedArgs, oversized).join("\n");
+    expect(oversizedOutput).toContain("Edit details too large to display");
+    expect(oversizedOutput).not.toContain("diff lines hidden");
+
+    const errorContext = contexts(editArgs);
+    edit.renderCall(editArgs, theme, errorContext.call);
+    const error = edit.renderResult(
+      { content: [{ type: "text", text: "Could not edit noop.ts" }], details: undefined },
+      { expanded: false, isPartial: false }, theme, { ...errorContext.result, isError: true },
+    ).render(120).join("\n");
+    expect(error).toContain("Elaborated result");
+    expect(error).not.toContain("diff lines hidden");
+  }));
+
+  it("recognizes mutation no-net only from exact settled non-error evidence", () => withBindings(["ctrl+o"], () => {
+    const edit = definition("edit");
+    const args = { path: "exact.ts", edits: [{ oldText: "same", newText: "same" }] };
+    const canonical = editResult("exact.ts", 1, "", undefined) as Record<string, unknown>;
+    const variants: unknown[] = [
+      { ...canonical, isError: true },
+      { ...canonical, warning: "recovered" },
+      { ...canonical, content: [...(canonical.content as unknown[]), { type: "text", text: "warning" }] },
+      { ...canonical, content: [{ type: "text", text: "Successfully replaced 2 block(s) in exact.ts." }] },
+      { ...canonical, details: { diff: "", patch: "warning", firstChangedLine: undefined } },
+      { ...canonical, details: { diff: "", patch: "", firstChangedLine: undefined, warning: true } },
+    ];
+    for (const result of variants) {
+      const rendered = settle(edit, args, result).join("\n");
+      expect(rendered).toContain("Elaborated result");
+      expect(rendered).not.toContain("no net change");
+    }
+    const context = contexts(args);
+    edit.renderCall(args, theme, context.call);
+    for (const [options, resultContext] of [
+      [{ expanded: false, isPartial: true }, context.result],
+      [{ expanded: false, isPartial: false }, { ...context.result, isPartial: true }],
+      [{ expanded: false, isPartial: false }, { ...context.result, isError: true }],
+      [{ expanded: false, isPartial: false }, { ...context.result, isError: undefined }],
+    ] as const) {
+      const rendered = edit.renderResult(canonical, options, theme, resultContext).render(120).join("\n");
+      expect(rendered).not.toContain("no net change");
+    }
+
+    const multi = multiEditDefinition();
+    const multiArgs = { file_path: "exact.ts", edits: [{ old_string: "same", new_string: "same" }] };
+    const multiCanonical = multiEditResult("exact.ts", 1, "");
+    for (const result of [
+      { ...multiCanonical, isError: true },
+      { ...multiCanonical, warning: true },
+      { ...multiCanonical, content: [...(multiCanonical.content as unknown[]), { type: "text", text: "warning" }] },
+      { ...multiCanonical, details: { ...(multiCanonical.details as object), warning: true } },
+    ]) {
+      const rendered = settle(multi, multiArgs, result).join("\n");
+      expect(rendered).toContain("Elaborated result");
+      expect(rendered).not.toContain("no net change");
+    }
+
+    for (const [options, resultFlags] of [
+      [{ expanded: false }, { isPartial: false, isError: false }],
+      [{ expanded: false, isPartial: false }, { isError: false }],
+      [{ expanded: false, isPartial: true }, { isPartial: false, isError: false }],
+      [{ expanded: false, isPartial: false }, { isPartial: true, isError: false }],
+      [{ expanded: false, isPartial: false }, { isPartial: false, isError: true }],
+      [{ expanded: false, isPartial: false }, { isPartial: false }],
+    ] as const) {
+      const candidate = multiEditDefinition();
+      const state = {};
+      candidate.renderCall(multiArgs, theme, { args: multiArgs, state, isPartial: false, isError: false });
+      const rendered = candidate.renderResult(multiCanonical, options, theme, {
+        args: multiArgs, state, ...resultFlags,
+      }).render(120).join("\n");
+      expect(rendered).toContain("Elaborated result");
+      expect(rendered).not.toContain("no net change");
+      expect(rendered).not.toContain("diff lines hidden");
+    }
+  }));
+
+  it("keeps moderate Edit sets native and makes over-budget Edit detail explicit without native delegation", () => withBindings(["ctrl+o"], () => {
+    const moderate = Array.from({ length: 65 }, (_, index) => ({ oldText: `old-${index}`, newText: `new-${index}` }));
+    const moderateOutput = settle(
+      definition("edit"),
+      { path: "moderate.ts", edits: moderate },
+      editResult("moderate.ts", 65, "-1 old\n+1 new"),
+    ).join("\n");
+    expect(moderateOutput).toContain("65 edits applied");
+    expect(moderateOutput).toContain("diff lines hidden");
+
+    let callDelegations = 0;
+    let resultDelegations = 0;
+    const source = {
+      name: "edit", execute() {},
+      renderCall() { callDelegations++; return component("unsafe original call"); },
+      renderResult() { resultDelegations++; return component("unsafe original result"); },
+    } as unknown as ToolDefinition;
+    const tool = withDefaultCollapsedToolRendering(source) as unknown as RenderTool;
+    const hugeArgs = { path: "safe-target.ts", edits: Array.from({ length: 257 }, () => ({ oldText: "a", newText: "b" })) };
+    const state = {};
+    const call = tool.renderCall(hugeArgs, theme, { args: hugeArgs, state, isPartial: false, isError: false }).render(120).join("\n");
+    expect(call).toContain("Edit · edit details too large; details uninspected · target safe-target.ts");
+    const result = tool.renderResult(editResult("safe-target.ts", 257, "-1 a\n+1 b"),
+      { expanded: false, isPartial: false }, theme,
+      { args: hugeArgs, state, isPartial: false, isError: false }).render(120).join("\n");
+    expect(result).toContain("safe-target.ts");
+    expect(result).toContain("edit details too large");
+    expect(callDelegations).toBe(0);
+    expect(resultDelegations).toBe(0);
+  }));
+
+  it("enforces the complete Edit inspection and detached-display budget matrix", () => withBindings(["ctrl+o"], () => {
+    const displayCap = 1_000_000;
+    const make = () => {
+      const calls = { call: 0, result: 0 };
+      const tool = withDefaultCollapsedToolRendering({
+        name: "edit", execute() {},
+        renderCall() { calls.call++; return component("native call"); },
+        renderResult() { calls.result++; return component("native result"); },
+      } as never) as unknown as RenderTool;
+      return { tool, calls };
+    };
+    const renderCall = (tool: RenderTool, args: unknown) => tool.renderCall(args, theme, {
+      args, state: {}, isPartial: false, isError: false,
+    }).render(140).join("\n");
+    const renderSettled = (tool: RenderTool, args: unknown, result: unknown) => {
+      const state = {};
+      tool.renderCall(args, theme, { args, state, isPartial: false, isError: false });
+      return tool.renderResult(result, { expanded: false, isPartial: false }, theme, {
+        args, state, isPartial: false, isError: false,
+      }).render(140).join("\n");
+    };
+    const ordinaryArgs = { path: "budget-target.ts", edits: [{ oldText: "a", newText: "b" }] };
+
+    const acceptedEdits = make();
+    const edits256 = Array.from({ length: 256 }, () => ({ oldText: "a", newText: "b" }));
+    expect(renderSettled(acceptedEdits.tool, { path: "budget-target.ts", edits: edits256 },
+      editResult("budget-target.ts", 256, "-1 a\n+1 b"))).toContain("256 edits applied");
+    expect(acceptedEdits.calls).toEqual({ call: 1, result: 1 });
+
+    const rejectedEdits = make();
+    const edits257 = Array.from({ length: 257 }, (_, index) => ({
+      oldText: index === 256 ? "SECRET_SUFFIX" : "a", newText: "b",
+    }));
+    const rejectedEditOutput = renderCall(rejectedEdits.tool, { path: "budget-target.ts", edits: edits257 });
+    expect(rejectedEditOutput).toContain("budget-target.ts");
+    expect(rejectedEditOutput).toContain("details uninspected");
+    expect(rejectedEditOutput).not.toContain("SECRET_SUFFIX");
+    expect(rejectedEdits.calls).toEqual({ call: 0, result: 0 });
+
+    const content256 = make();
+    const content256Output = renderSettled(content256.tool, ordinaryArgs, {
+      content: Array.from({ length: 256 }, () => "handled"),
+      details: undefined,
+    });
+    expect(content256Output).toContain("Elaborated result");
+    expect(content256Output).not.toContain("details uninspected");
+
+    const content257 = make();
+    const content257Output = renderSettled(content257.tool, ordinaryArgs, {
+      content: Array.from({ length: 257 }, (_, index) => index === 256 ? "SECRET_SUFFIX" : "handled"),
+      details: undefined,
+    });
+    expect(content257Output).toContain("details uninspected");
+    expect(content257Output).not.toContain("SECRET_SUFFIX");
+    expect(content257.calls).toEqual({ call: 1, result: 0 });
+
+    const container257 = make();
+    const container257Output = renderSettled(container257.tool, ordinaryArgs,
+      Object.fromEntries(Array.from({ length: 257 }, (_, index) => [`field${index}`, index === 256 ? "SECRET_SUFFIX" : true])));
+    expect(container257Output).toContain("Elaborated result");
+    expect(container257Output).not.toContain("details uninspected");
+    expect(container257Output).not.toContain("SECRET_SUFFIX");
+
+    const container258 = make();
+    const container258Output = renderSettled(container258.tool, ordinaryArgs,
+      Object.fromEntries(Array.from({ length: 258 }, (_, index) => [`field${index}`, index === 257 ? "SECRET_SUFFIX" : true])));
+    expect(container258Output).toContain("details uninspected");
+    expect(container258Output).not.toContain("SECRET_SUFFIX");
+    expect(container258.calls).toEqual({ call: 1, result: 0 });
+
+    const nested = (containers: number, leaf: unknown): unknown => {
+      let value = leaf;
+      for (let index = 0; index < containers; index++) value = { child: value };
+      return value;
+    };
+    const depthAccepted = make();
+    const depthAcceptedOutput = renderSettled(depthAccepted.tool, ordinaryArgs, { probe: nested(7, "SECRET_SUFFIX") });
+    expect(depthAcceptedOutput).toContain("Elaborated result");
+    expect(depthAcceptedOutput).not.toContain("details uninspected");
+    expect(depthAcceptedOutput).not.toContain("SECRET_SUFFIX");
+
+    const depthRejected = make();
+    const depthRejectedOutput = renderSettled(depthRejected.tool, ordinaryArgs, { probe: nested(8, "SECRET_SUFFIX") });
+    expect(depthRejectedOutput).toContain("details uninspected");
+    expect(depthRejectedOutput).not.toContain("SECRET_SUFFIX");
+    expect(depthRejected.calls).toEqual({ call: 1, result: 0 });
+
+    const keyedContainer = (count: number, secret = false) => Object.fromEntries(
+      Array.from({ length: count }, (_, index) => [`key${index}`, secret && index === count - 1 ? "SECRET_SUFFIX" : true]),
+    );
+    const aggregate1024 = make();
+    const aggregate1024Output = renderSettled(aggregate1024.tool, ordinaryArgs, {
+      first: keyedContainer(255), second: keyedContainer(255), third: keyedContainer(255), fourth: keyedContainer(255, true),
+    });
+    expect(aggregate1024Output).toContain("Elaborated result");
+    expect(aggregate1024Output).not.toContain("details uninspected");
+    expect(aggregate1024Output).not.toContain("SECRET_SUFFIX");
+
+    const aggregate1025 = make();
+    const aggregate1025Output = renderSettled(aggregate1025.tool, ordinaryArgs, {
+      first: keyedContainer(256), second: keyedContainer(255), third: keyedContainer(255), fourth: keyedContainer(255, true),
+    });
+    expect(aggregate1025Output).toContain("details uninspected");
+    expect(aggregate1025Output).not.toContain("SECRET_SUFFIX");
+    expect(aggregate1025.calls).toEqual({ call: 1, result: 0 });
+
+    for (const field of ["oldText", "newText"] as const) {
+      const accepted = make();
+      const entry = { oldText: "", newText: "", [field]: "x".repeat(displayCap) };
+      renderCall(accepted.tool, { path: "boundary.ts", edits: [entry] });
+      expect(accepted.calls.call, `${field} boundary`).toBe(1);
+
+      const rejected = make();
+      const secret = "SECRET_SUFFIX";
+      const oversizedEntry = { oldText: "", newText: "", [field]: "x".repeat(displayCap + 1) + secret };
+      const output = renderCall(rejected.tool, { path: "budget-target.ts", edits: [oversizedEntry] });
+      expect(output).toContain("budget-target.ts");
+      expect(output).toContain("details uninspected");
+      expect(output).not.toContain(secret);
+      expect(rejected.calls).toEqual({ call: 0, result: 0 });
+    }
+
+    const aggregate = make();
+    const aggregateOutput = renderCall(aggregate.tool, {
+      path: "budget-target.ts",
+      edits: [{ oldText: "o".repeat(displayCap), newText: "n".repeat(displayCap) }],
+    });
+    expect(aggregateOutput).toContain("details uninspected");
+    expect(aggregate.calls).toEqual({ call: 0, result: 0 });
+
+    for (const [label, result] of [
+      ["content string", { content: [{ type: "text", text: "x".repeat(displayCap + 1) + "SECRET_SUFFIX" }], details: undefined }],
+      ["diff string", editResult("budget-target.ts", 1, "x".repeat(displayCap + 1) + "SECRET_SUFFIX")],
+      ["patch string", { ...(editResult("budget-target.ts", 1, "-1 a\n+1 b") as Record<string, unknown>), details: {
+        diff: "-1 a\n+1 b", patch: "x".repeat(displayCap + 1) + "SECRET_SUFFIX", firstChangedLine: 1,
+      } }],
+      ["elements", { content: Array.from({ length: 257 }, () => ({ type: "text", text: "SECRET_SUFFIX" })), details: undefined }],
+      ["keys", { content: [{ type: "text", text: "ok" }], details: {
+        diff: "-1 a\n+1 b", patch: Object.fromEntries(Array.from({ length: 258 }, (_, index) => [`k${index}`, "SECRET_SUFFIX"])), firstChangedLine: 1,
+      } }],
+      ["depth", { content: [{ type: "text", text: "ok" }], details: {
+        diff: "-1 a\n+1 b", patch: { a: { b: { c: { d: { e: { f: { g: { h: "SECRET_SUFFIX" } } } } } } } }, firstChangedLine: 1,
+      } }],
+    ] as const) {
+      const rejected = make();
+      const output = renderSettled(rejected.tool, ordinaryArgs, result);
+      expect(output, label).toContain("budget-target.ts");
+      expect(output, label).toContain("details uninspected");
+      expect(output, label).not.toContain("SECRET_SUFFIX");
+      expect(rejected.calls, label).toEqual({ call: 1, result: 0 });
+    }
+
+    for (const [label, result] of [
+      ["content", { content: [{ type: "text", text: "x".repeat(displayCap) }], details: undefined }],
+      ["diff", { ...(editResult("budget-target.ts", 1, "x") as Record<string, unknown>), details: {
+        diff: "x".repeat(displayCap), patch: "", firstChangedLine: 1,
+      } }],
+      ["patch", { ...(editResult("budget-target.ts", 1, "-1 a\n+1 b") as Record<string, unknown>), details: {
+        diff: "-1 a\n+1 b", patch: "x".repeat(displayCap), firstChangedLine: 1,
+      } }],
+    ] as const) {
+      const accepted = make();
+      renderSettled(accepted.tool, ordinaryArgs, result);
+      expect(accepted.calls, `${label} boundary`).toEqual({ call: 1, result: 1 });
+    }
+  }));
+
+  it("does not delegate hostile Edit originals and sanitizes mutation controls", () => withBindings(["ctrl+o"], () => {
+    let callDelegations = 0;
+    let resultDelegations = 0;
+    const tool = withDefaultCollapsedToolRendering({
+      name: "edit", execute() {},
+      renderCall() { callDelegations++; return component("delegated call"); },
+      renderResult() { resultDelegations++; return component("delegated result"); },
+    } as never) as unknown as RenderTool;
+    let getters = 0;
+    const hostileArgs = Object.defineProperty({}, "path", {
+      enumerable: true, get() { getters++; throw new Error("hostile getter"); },
+    });
+    expect(tool.renderCall(hostileArgs, theme, { state: {}, isPartial: false }).render(80).join("\n"))
+      .toContain("Unfamiliar arguments");
+    expect(callDelegations).toBe(0);
+    expect(resultDelegations).toBe(0);
+    const validArgs = { path: "safe.ts", edits: [{ oldText: "old", newText: "new" }] };
+    const context = contexts(validArgs);
+    tool.renderCall(validArgs, theme, context.call);
+    const hostileResult = new Proxy({}, {
+      ownKeys() { throw new Error("hostile proxy"); },
+      getOwnPropertyDescriptor() { throw new Error("hostile proxy"); },
+    });
+    expect(tool.renderResult(hostileResult, { expanded: false, isPartial: false }, theme, context.result).render(80).join("\n"))
+      .toContain("Unfamiliar result");
+    expect(getters).toBe(0);
+    expect(callDelegations).toBe(1);
+    expect(resultDelegations).toBe(0);
+
+    const detachedArgs = { path: "detached.ts", edits: [{ oldText: "old", newText: "new" }] };
+    const detached = contexts(detachedArgs);
+    tool.renderCall(detachedArgs, theme, detached.call);
+    tool.renderResult(editResult("detached.ts", 1, "-1 old\n+1 new"),
+      { expanded: false, isPartial: false }, theme, detached.result);
+    expect(callDelegations).toBe(2);
+    expect(resultDelegations).toBe(1);
+
+    const controlledPath = "src/clean\u001b]0;path-secret\u0007.ts";
+    const controlled = settle(definition("edit"),
+      { path: controlledPath, edits: [{ oldText: "old", newText: "new" }] },
+      editResult(controlledPath, 1, "-1 old\u001b]0;diff-secret\u0007\n+1 new"),
+    ).join("\n");
+    expect(controlled).not.toContain("path-secret");
+    expect(controlled).not.toContain("diff-secret");
+    expect(controlled).toContain("diff lines hidden");
+  }));
+
+  it("reserves mutation truth before a long target at narrow widths", () => withBindings(["ctrl+o"], () => {
+    const changed = settle(definition("edit"), {
+      path: "a-very-long-target-name-that-must-yield.ts",
+      edits: [{ oldText: "a", newText: "b" }],
+    }, editResult("a-very-long-target-name-that-must-yield.ts", 1, "-1 a\n+1 b"));
+    const noNet = settle(definition("edit"), {
+      path: "a-very-long-target-name-that-must-yield.ts",
+      edits: [{ oldText: "a", newText: "a" }],
+    }, editResult("a-very-long-target-name-that-must-yield.ts", 1, "", undefined));
+    expect(changed.join("\n")).toContain("diff lines hidden");
+    const changedTool = definition("edit");
+    const changedArgs = { path: "a-very-long-target-name-that-must-yield.ts", edits: [{ oldText: "a", newText: "b" }] };
+    const changedContext = contexts(changedArgs);
+    changedTool.renderCall(changedArgs, theme, changedContext.call);
+    const changedRow = changedTool.renderResult(editResult(changedArgs.path, 1, "-1 a\n+1 b"), { expanded: false, isPartial: false }, theme, changedContext.result);
+    expect(changedRow.render(24).join("\n")).toContain("diff hidden");
+    expect(noNet.join("\n")).toContain("no net change");
+    const noNetTool = definition("edit");
+    const noNetContext = contexts(changedArgs);
+    noNetTool.renderCall(changedArgs, theme, noNetContext.call);
+    const noNetRow = noNetTool.renderResult(editResult(changedArgs.path, 1, "", undefined), { expanded: false, isPartial: false }, theme, noNetContext.result);
+    expect(noNetRow.render(26).join("\n")).toContain("no net change");
   }));
 
   it("preserves the established Read and Write settlement predicate independently of context isPartial", () => withBindings(["ctrl+k"], () => {
