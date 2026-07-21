@@ -1,7 +1,8 @@
 # PiCC ↔ Pi integration contracts
 
-> **Status:** Contract record. Pinned against **Pi v0.80.6** (`@earendil-works/pi-coding-agent`,
-> `pi-agent-core`, `pi-ai` — all 0.80.6, verified on npm 2026-07-11). Effective Node floor ≥ 22.19:
+> **Status:** Contract record. `package.json` accepts compatible Pi releases from **^0.80.6**;
+> the lockfile-tested versions of `@earendil-works/pi-coding-agent`, `pi-agent-core`, and `pi-ai`
+> are **0.80.6** (verified on npm 2026-07-11). Effective Node floor ≥ 22.19:
 > Pi declares ≥ 20, but its bundled undici 8.x (engines ≥ 22.19) crashes on Node 20 at import
 > (`worker_threads.markAsUncloneable` missing). We develop on 24.
 > Source of truth for every Pi API PiCC builds on. If Pi churns, update here first.
@@ -32,8 +33,8 @@ Launch modes we support:
 | SessionStart / SessionEnd hooks | `pi.on("session_start")` / `pi.on("session_shutdown")` |
 | UserPromptSubmit hook | `pi.on("input")` → `continue/transform/handled` (stdout context → `transform`) |
 | Stop hook | `pi.on("agent_settled")` + `pi.sendUserMessage(..., { deliverAs: "followUp" })` to continue when a Stop hook blocks stopping |
-| PreCompact/PostCompact + instruction re-injection | `pi.on("session_before_compact")` (can supply custom summary; we append preserved-instructions block), `pi.on("session_compact")` |
-| Custom tools: `Agent`, `EnterWorktree`, `ExitWorktree`, `WebFetch`, `WebSearch`, `Grep`, `Glob`, `TaskCreate/...`, degrade stubs | `pi.registerTool({ name, description, parameters: TypeBox, execute, prepareArguments? })`; throw ⇒ `isError`; `terminate: true` supported |
+| PreCompact/PostCompact + instruction re-injection | `pi.on("session_before_compact")` (can cancel), `pi.on("session_compact")`; PiCC restores hook output and recent skill bodies through `pi.sendMessage` |
+| Custom tools: `Agent`, `EnterWorktree`, `ExitWorktree`, `WebFetch`, `WebSearch`, `Grep`, `Glob`, `TaskCreate/...`, degrade stubs | `pi.registerTool({ name, description, parameters: TypeBox, execute, prepareArguments? })`; throw ⇒ `isError`; `terminate: true` stops only after Pi completes all sibling results in the requested batch |
 | Slash commands: user-invocable skills, legacy commands, `/doctor`, `/quota`, `/compat` | `pi.registerCommand(name, { description, handler, getArgumentCompletions })`; command handlers get `ExtensionCommandContext` |
 | Worktree cwd swap (load-bearing) | Override built-in tools: re-register `bash`/`read`/`write`/`edit`/`grep`/`find`/`ls` wrappers that resolve paths/cwd through a mutable `EffectiveCwd`; built-ins created per-cwd via `createBashTool(cwd, { spawnHook })`, `createReadTool(cwd, …)` etc. Built-in renderers are re-applied from `create*ToolDefinition` and de-padded through the self-shell wrapper (`src/runtime/tool-shell.ts` — see *Risks / churn watchpoints*); `execute` stays sourced from `create*Tool` so it is byte-identical. |
 | Subagent runtime (fresh context, parallel, per-agent tools/model, verbatim return — see "Verbatim subagent return" in [`architecture.md`](architecture.md)) | SDK: `createAgentSession({ cwd, tools, customTools, resourceLoader, sessionManager, settingsManager, model?, thinkingLevel? })` — the options **PiCC passes**; Pi's own option set is wider. `resourceLoader` is `new DefaultResourceLoader({ cwd, agentDir, systemPromptOverride, agentsFilesOverride, skillsOverride, promptsOverride, extensionFactories })` (`await loader.reload()` before use). Final assistant message read as the last `role: "assistant"` entry of `session.messages`. Per-session `sessionManager` — see "Session managers" below. |
@@ -44,6 +45,8 @@ Launch modes we support:
 | Compat notices / UX | `ctx.ui.notify`, `pi.appendEntry` + `pi.registerEntryRenderer` (TUI-only) |
 | Subagent status panel, drill-down & condensed settlement records (interactive TUI only) | `ctx.ui.setWidget(key, factory, { placement: "belowEditor" })` — factory invoked synchronously, replaced/removed components disposed; `ctx.ui.custom(factory)` — focused component, Pi saves/restores the editor draft around it; `pi.registerShortcut(keyId, { description, handler })` — dispatches only while the default editor has focus; `ctx.ui.onTerminalInput` — raw listeners run BEFORE the focused component, so PiCC's fork-Esc watcher yields a lone Esc while the panel is open; `pi.registerMessageRenderer(customType, renderer)` + `pi.sendMessage(…, details)` — rendered by Pi's `CustomMessageComponent` with a boolean `expanded` (Ctrl+O toggle); `undefined`/throw falls back to Pi's default box. Mode gating is on `ctx.mode === "tui"`, never `hasUI`: print's `noOpUIContext` implements the full ui interface with `hasUI` false, while RPC flips `hasUI` true. |
 | Skill listing into system prompt | We do **not** feed `.claude/skills` through Pi's own skill discovery (Pi's XML listing + `/skill:` semantics differ from Claude's budgeted listing, `$ARGUMENTS`, shell-injection, `context: fork`). PiCC owns the Claude skill pipeline end-to-end: listing text appended in `before_agent_start`, activation via our own `Skill` tool + slash commands. Pi's native skill/command discovery of `.pi/`/`.agents/` stays untouched. |
+| Mid-run proactive checkpoint | `turn_end` observes the completed tool batch; tool results may set `terminate: true`, and `ctx.abort()` is the fail-closed fallback. Main compaction uses `ctx.compact({ onComplete, onError })`; child sessions use public `AgentSession.compact()`, `abortCompaction()`, `sendCustomMessage()`, `abort()`, and `subscribe()`. Hidden `pi.sendMessage(..., { triggerTurn: true })` / child `sendCustomMessage(..., { triggerTurn: true })` starts the synthetic continuation; lifecycle handlers await its re-entrant settlement while `before_provider_request` guards ordinary transport. |
+| Guarded provider APIs | The checkpoint gate recognizes only model API ids `openai-completions`, `openai-responses`, and `openai-codex-responses`. Pi's OpenAI Completions/Responses streams honor a pre-aborted signal. PiCC owns the public `openai-codex-responses` registration while loaded and delegates to Pi's public compat loader; it preserves normal automatic transport, but forces abort-aware SSE for an already-aborted request so a cached Codex WebSocket cannot send. Compaction-summary authority is session/generation scoped; arbitrary competing custom API handlers are outside scope. |
 
 ## 3. Key mechanics decisions
 
@@ -107,38 +110,53 @@ The return value is the last `role: "assistant"` message of `session.messages`, 
 — see "Verbatim subagent return" in [`architecture.md`](architecture.md) for the contract and the
 resume trailer that rides on it.
 
-### 3.5 Compaction preservation
-On `session_before_compact` we do not replace Pi's summarizer; we let default compaction run
-(return nothing) but register a **post-compact re-injection**: on `session_compact` we
-`sendMessage` a persistent custom message containing: root CLAUDE.md (+imports), unconditional
-rules, and the rendered bodies of currently-active skills. Additionally our `before_agent_start`
-always re-asserts the instruction set in the system prompt (system prompt is rebuilt every turn
-and never compacted away) — that is the primary preservation mechanism; the post-compact message
-covers mid-turn context. PreCompact/PostCompact **project hooks** fire around these events.
-Compaction settings pass through Pi (`compaction.reserveTokens` etc.). `reserveTokens` is a
-**Pi settings-file** value that extensions cannot raise; PiCC's `proactiveCompactPercent`
-compacts *sooner* as the extension-side margin lever, but it cannot make Pi tolerate more than
-`contextWindow − reserveTokens` — raising the hard reserve stays an upstream-Pi/settings matter.
+### 3.5 Compaction preservation and proactive checkpoints
+The system-prompt suffix reasserts durable instructions every turn. After `session_compact`, PiCC
+also queues hook output and the latest rendered active skill bodies that fit its heuristic character
+budget, most-recent-first. This approximates Claude Code's token-counted retention policy and can
+under- or over-retain it. `PreCompact` runs before commit; `SessionStart` with source `compact` and
+`PostCompact` run only after commit. Main sessions fire `PostCompact` before active-skill restoration;
+children fire it after that restoration. Pi's void main-session `sendMessage` confirms only synchronous
+enqueue acceptance, so later delivery failure is not observable.
 
-We likewise do not *retry* Pi's overflow-recovery summarization when it fails on a transient
-error. That recovery is a single, non-retried summarization Pi runs on its own authed transport
-(`this.agent.streamFn`), and the extension seam exposes no `streamFn`/`agent` handle to re-run it:
-the only completion path reachable from an extension (`completeSimple` with `streamFn` undefined)
-bypasses ChatGPT/Codex OAuth and so cannot faithfully stand in for Pi's summarizer. A true
-in-recovery retry is therefore an **upstream-Pi requirement**, not something PiCC can add from the
-seam. PiCC's resilience comes instead from the proactive early compaction above: firing Pi's own
-reliable compaction before usage reaches the edge means a transient blip lands during a safe
-compaction (the next turn simply re-fires) rather than during the single-shot recovery at the
-overflow edge where it is fatal.
+`proactiveCompactPercent` defaults to 90. At `turn_end`, PiCC waits for every requested tool result.
+A clean PiCC-owned batch uses `terminate`; any mixed, blocked, malformed, truncated, pending, or
+ambiguous path uses `ctx.abort()` and the provider guard. The controller then awaits compaction and
+the re-entrant synthetic continuation before the original logical run settles. Operational
+PiCC-initiated compaction failures use up to three attempts. A blocked `PreCompact` is policy, not
+an operational failure: PiCC fails closed and pauses rather than continuing uncompacted, which
+differs from Claude Code. The settled-idle sample remains a non-resuming fallback.
+
+This is PiCC-only hardening built entirely on the public APIs listed above; no Pi patch is needed.
+It covers the main session and every PiCC-created child session, but only for models using Pi's
+`openai-completions`, `openai-responses`, or `openai-codex-responses` APIs. The continuation is a
+synthetic persisted, model-visible custom message, not a documented Claude threshold/retry/resume
+mechanism. Operational or hook exhaustion retains a manually recoverable paused boundary; a
+post-commit restoration failure instead requires a new session and must not compact the committed
+summary again. Print stdout/exit status and RPC command acknowledgement remain Pi-owned; JSON/RPC
+lifecycle entries are uncorrelated. Pi
+0.80.6 also emits a native physical `agent_end` for the intentionally stopped pre-compaction run
+and can expose a native RPC compaction error before PiCC lifecycle handling; extensions cannot
+suppress, correlate, or redact those native records.
+
+Pi's internally owned overflow-recovery summarization remains distinct. It uses Pi's private authed
+stream and exposes neither retry ownership nor a public replacement transport to extensions, so
+PiCC does not retry it. `compaction.reserveTokens` likewise remains a Pi settings-file boundary.
 
 ### 3.6 What stays Pi-native
 Auth (`/login` ChatGPT/Codex OAuth), provider abstraction, retry, session persistence/tree,
 TUI, `/model`, project trust. We do not reimplement any of it.
 
 ## 4. Risks / churn watchpoints
-- Pre-1.0 API churn: pin `0.80.x` exact in package.json; this doc + a smoke test
-  (`test/pi-contract.test.ts`) asserts the imports/exports we rely on exist.
+- Pre-1.0 API churn: `package.json` uses the `^0.80.6` range and the lockfile tests 0.80.6; this
+  doc + a smoke test (`test/pi-contract.test.ts`) asserts the imports/exports we rely on exist.
 - `before_agent_start` system-prompt chaining: other extensions may also modify; we append, not replace.
+- Mid-run checkpoint watchpoints: `turn_end` must remain after all sibling tool results; `terminate`
+  must retain the all-results rule; `ctx.abort()` must stop before another ordinary provider request;
+  callback `ctx.compact` and Promise-style SDK `compact` must remain safely callable from settled,
+  re-entrant lifecycle work; hidden custom messages must still trigger a turn and persist. Provider
+  registration remains API-global last-writer-wins, and Codex cached-WebSocket pre-abort behavior is
+  pinned by contract tests.
 - Built-in tool override warning in interactive mode is expected (documented for users).
 - Tool-row de-padding couples `src/runtime/tool-shell.ts` to Pi's render contract in three places.
   **All three** are pinned by the smoke test (`test/pi-contract.test.ts`) so a Pi bump fails loudly

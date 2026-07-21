@@ -721,12 +721,13 @@ class ChildCheckpointCoordinator {
 
   failureMessage(): string {
     const snapshot = this.gate.currentController().snapshot();
-    const cause = snapshot.failureCategory === "hook-blocked"
-      ? "PreCompact hook blocked every attempt"
-      : snapshot.failureCategory === "restoration-paused"
-        ? "post-compaction hook/context/skill restoration failed"
-        : "compaction failed after 3 attempts";
-    return `Automatic context compaction for subagent "${this.agentName}" paused because ${cause}. The agent is paused and no continuation ran; use SendMessage with agent id ${this.agentId} to retry that same live agent, or stop it with TaskStop using that agent id.`;
+    if (snapshot.failureCategory === "restoration-paused") {
+      return `Automatic context compaction for subagent "${this.agentName}" committed, but post-compaction hook/context/skill restoration failed. The agent is paused and no continuation ran. Do not compact it again or retry SendMessage; abandon it with TaskStop using agent id ${this.agentId}, then dispatch a replacement agent with the retained input.`;
+    }
+    if (snapshot.failureCategory === "hook-blocked") {
+      return `Automatic context compaction for subagent "${this.agentName}" paused because a PreCompact hook blocked the attempt. The agent is paused and no continuation ran; repair or disable the hook before using SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
+    }
+    return `Automatic context compaction for subagent "${this.agentName}" failed after up to three attempts. The agent is paused and no continuation ran; use SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
   }
 
   retain(
@@ -827,7 +828,9 @@ class ChildCheckpointCoordinator {
     }
     if (retained.stopping || this.retained !== retained) throw new Error("checkpoint recovery was cancelled");
     if (this.restorationFailed) {
-      throw new Error(`Context or skill restoration failed for recovery attempt on subagent "${this.agentName}". The agent remains paused; retry SendMessage after repairing the restoration path.`);
+      controller.recoverAfterManualCompaction(token);
+      controller.pauseAfterRecoveryFailure(generation, "restoration-paused");
+      throw new Error(`Context or skill restoration failed after compaction committed for subagent "${this.agentName}". Do not compact it again; abandon it with TaskStop using agent id ${this.agentId}, then dispatch a replacement agent with the retained input.`);
     }
     const recovered = controller.recoverAfterManualCompaction(token);
     if (!recovered.recovered || retained.stopping) throw new Error("checkpoint recovery was cancelled");
@@ -843,8 +846,12 @@ class ChildCheckpointCoordinator {
       }
       return result;
     } catch (error) {
-      if (!retained.stopping) controller.pauseAfterRecoveryFailure(generation);
       if (retained.stopping) throw new Error("checkpoint recovery was cancelled");
+      const snapshot = controller.snapshot();
+      if (snapshot.phase === "exhausted" && snapshot.failureCategory === "restoration-paused") {
+        throw new Error(this.failureMessage());
+      }
+      controller.pauseAfterRecoveryFailure(generation);
       throw new Error(`Recovery continuation failed for subagent "${this.agentName}": ${capErrorText((error as Error)?.message ?? String(error))}. The agent remains paused; retry SendMessage.`);
     }
   }
@@ -2299,8 +2306,6 @@ export class SubagentRuntime {
         if (!checkpoint.exhausted()) return undefined;
         checkpointPaused = true;
         settledOutcome = "failed";
-        const exhaustedGeneration = checkpoint.gate.currentController().snapshot().generation;
-        checkpoint.gate.currentController().enableRestorationRecovery(exhaustedGeneration);
         this.deps.subagentRegistry?.markCheckpointPaused(agentId);
         checkpoint.retain(
           async (text) => {
@@ -2969,7 +2974,7 @@ export function createSendMessageToolDefinition(
     name: "SendMessage",
     label: "SendMessage",
     description:
-      "Send a follow-up message to a subagent you previously dispatched. Address it by its agent id (agent-…) or name (`to`). A finished subagent resumes in the background under the same id with its full prior context; a still-running background subagent receives the message as a mid-task course correction. Returns an acknowledgment; a resumed run's result arrives via TaskOutput.",
+      "Send a follow-up message to a subagent you previously dispatched. Address it by its agent id (agent-…) or name (`to`). A finished subagent resumes in the background under the same id with its full prior context; a still-running background subagent receives the message as a mid-task course correction. Ordinarily this returns an acknowledgment and a resumed run's result arrives via TaskOutput. Checkpoint-paused exception: the awaited call recovers the retained agent and returns its result directly, with no TaskOutput or new task generation.",
     parameters: Type.Object({
       to: Type.String({
         description: "Agent id (e.g. agent-3fa9c2d1b4e5) or the agent name from a prior dispatch",

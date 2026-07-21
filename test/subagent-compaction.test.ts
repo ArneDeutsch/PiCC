@@ -37,6 +37,7 @@ function checkpointSdk(
   reExhaustOnce = false,
   mixedBatch = false,
   activateSkill = false,
+  reExhaustWithRestorationFailure = false,
 ): ChildHarness {
   const base = fakeSdk().sdk;
   let compactions = 0;
@@ -84,7 +85,7 @@ function checkpointSdk(
       const ctx = {
         model: { api: "openai-responses" },
         mode: "json",
-        getContextUsage: () => compactions >= (reExhaustOnce ? 8 : 4)
+        getContextUsage: () => compactions >= (reExhaustOnce ? 8 : reExhaustWithRestorationFailure ? 5 : 4)
           ? ({ percent: 10, tokens: 100, contextWindow: 1000 })
           : ({ percent: 95, tokens: 950, contextWindow: 1000 }),
         hasPendingMessages: () => false,
@@ -237,11 +238,19 @@ function runtimeFor(
   harness: ChildHarness,
   agent: ClaudeAgent = makeAgent(),
   subagentRegistry?: SubagentRegistry,
+  failPostCompactAttempt?: number,
 ) {
+  let postCompactAttempts = 0;
   return makeSubagentRuntime([agent], harness.sdk, {
     proactiveCompactPercent: 90,
     allKnownToolNames: () => ["CheckpointTool"],
     subagentRegistry,
+    hookRunner: failPostCompactAttempt === undefined ? undefined : {
+      async fire(eventName: string) {
+        const block = eventName === "PostCompact" && ++postCompactAttempts === failPostCompactAttempt;
+        return { block, blockReason: block ? "restoration rejected" : undefined, askDowngraded: false, diagnostics: [] };
+      },
+    },
     customToolsFor: () => [
       {
         name: "CheckpointTool",
@@ -493,6 +502,36 @@ describe("subagent mid-run compaction", () => {
     expect(harness.sessionCreations()).toBe(1);
     expect(harness.compactCalls()).toBe(8);
     expect(harness.disposed()).toBe(true);
+  });
+
+  it("preserves terminal restoration guidance when a recovery continuation rejects after re-exhaustion", async () => {
+    const harness = checkpointSdk(3, "after", false, false, false, false, true);
+    const registry = new SubagentRegistry();
+    const runtime = runtimeFor(harness, makeAgent(), registry, 2);
+    const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
+    const tool = createSendMessageToolDefinition(runtime, {
+      registry,
+      backgroundTasks: new BackgroundTaskRegistry(),
+    });
+
+    let message = "";
+    try {
+      await (tool.execute as Function)("send-1", {
+        to: exhausted.agentId,
+        message: "recover into restoration failure",
+      });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    expect(message).toContain("Do not compact it again or retry SendMessage");
+    expect(message).toContain(`TaskStop using agent id ${exhausted.agentId}`);
+    expect(message).toContain("dispatch a replacement agent with the retained input");
+    expect(message).not.toContain("Recovery continuation failed");
+    expect(message).not.toContain("The agent remains paused; retry SendMessage");
+    expect(registry.get(exhausted.agentId)?.checkpointPaused).toBe(true);
+    expect(harness.compactCalls()).toBe(5);
+    expect(harness.disposed()).toBe(false);
   });
 
   it("accepts a retained foreground agent id in TaskStop and joins before disposal", async () => {

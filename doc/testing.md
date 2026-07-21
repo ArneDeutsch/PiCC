@@ -9,8 +9,8 @@ and the synchronization contracts that keep async tests deterministic.
 
 **The shape is a pyramid.** Cover behavior **fully at the unit layer**; use the costlier layers as
 **targeted safety nets** for what a cheaper layer structurally cannot prove. Do not drive every
-branch through e2e. The real suite already has this shape: 55 unit-lane files against 3 curated
-e2e files, and the unit lane — not the full suite — is the pre-commit gate (`.githooks/pre-commit`).
+branch through e2e. The unit lane — not the full suite — is the pre-commit gate
+(`.githooks/pre-commit`).
 
 **The trade-off is speed against coverage.** Each e2e scenario spawns a real Pi CLI which spawns
 further children, on a lane that must stay small enough to survive a 2-core runner; the same branch
@@ -112,20 +112,11 @@ The `test/e2e-*.test.ts` files are the highest-fidelity layer. Each **spawns the
 a local **mock OpenAI-compatible model server** (`test/helpers/mock-openai.ts`) via a throwaway Pi
 agent dir. No real model, no subscription, no outbound network.
 
-They share one extracted harness in `test/helpers/e2e-live.ts`: the `createE2ELive()` factory
-returns `{ runPi, cleanup }` closing over that file's own per-run temp/fixture bookkeeping, plus the
-stateless request helpers (`allText` / `systemText` / `toolResultText` / `userText` / `toolNames`)
-and probes (`cliMissing`, `BASH_AVAILABLE`, `PYTHON_BIN`, and the timeouts). The scenarios are
-grouped by cost so the subagent-heavy tests aren't one long serial pole:
-
-| File | Scenarios |
-|---|---|
-| `test/e2e-core.test.ts` | context/prompt assembly smoke; `/deploy` slash-skill expansion |
-| `test/e2e-safety-tools.test.ts` | `Read(.env)` deny + secret non-leak; bash (Git Bash) + python encoding round-trip |
-| `test/e2e-subagents.test.ts` | background subagent + `TaskOutput`; worktree isolation; provider-error named failure; transcript persistence |
-
-Keeping the `e2e-` prefix on every file is a **contract**: `test:unit` excludes
-`**/e2e-*.test.ts`, so the prefix is what keeps real-Pi spawns out of the unit lane.
+They share the process harness and request helpers in `test/helpers/e2e-live.ts`. Group scenarios by
+cost so subagent-heavy or compaction-heavy processes do not form one serial pole. Keeping the
+`e2e-` prefix on every file is a **contract**: `test:unit` excludes `**/e2e-*.test.ts`, so the prefix
+is what keeps real-Pi spawns out of the unit lane. List `test/e2e-*.test.ts` for the current scenario
+set rather than maintaining an inventory here.
 
 `mock-openai.ts` is a scriptable SSE server: each test hands it a list of `Turn`s (either scripted
 `tool_calls` or plain text, optionally pinned with a `when` predicate or a scripted `error`), and it
@@ -135,12 +126,9 @@ advertised tools, tool results, absence of leaked secrets) and the real on-disk 
 written, git worktrees created, transcripts persisted).
 
 **What this layer proves** is that PiCC works as a real Pi extension through Pi's genuine agent
-loop, tool dispatch, streaming, and print mode — not just against the fake API. The lane is curated
-to a small **real-stack security layer**: each surviving scenario proves a boundary a cheaper
-unit/integration test structurally cannot — secret non-leak across the real model-request boundary,
-real subprocess/shell dispatch and OS encoding, a real background-subagent session round-trip, real
-worktree isolation for a spawned subagent, a real provider error killing a real subagent, and real
-on-disk transcript persistence.
+loop, tool dispatch, streaming, machine modes, and persistence — not just against the fake API.
+Keep it as a curated **real-stack security layer**: each scenario must prove a boundary a cheaper
+unit/integration test structurally cannot.
 
 ### Adding a new e2e scenario
 
@@ -193,12 +181,11 @@ The shared helpers have these contracts:
   been captured and settled. Wire the observer with
   `picc(pi.api as never, { onInitializationSettled: pi.captureInitialization })`.
 
-Those six are the whole set for `async.ts`, `FakePi`, and `FakeSdkHandle`; the hook fixture below
-adds its own. Detached startup completion combines orphan reaping and the built-in cwd-bound tool
-registration attempts, catching failures from both — so completion does **not** prove
-that tools registered, and callers that need tools must separately await `waitForTools`. It is not a
-session-lifecycle barrier either. Keep rejecting ceilings comfortably below Vitest's timeout so
-failures report expected and observed state instead of an opaque test timeout.
+Detached startup completion combines orphan reaping and the built-in cwd-bound tool registration
+attempts, catching failures from both — so completion does **not** prove that tools registered, and
+callers that need tools must separately await `waitForTools`. It is not a session-lifecycle barrier
+either. Keep rejecting ceilings comfortably below Vitest's timeout so failures report expected and
+observed state instead of an opaque test timeout.
 
 For real hook children, use `createHookProcessFixture(parentDir)` from
 `test/helpers/hook-process.ts` and its test-owned marker/release protocol. The child atomically

@@ -995,9 +995,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         ? "Context compaction completed."
         : "Context compacted; reconnecting the paused work.";
       case "checkpoint-exhausted": return event.failureCategory === "hook-blocked"
-        ? "Automatic context compaction was blocked by a PreCompact hook. Work is paused and no continuation ran. Run /compact, then explicitly continue."
+        ? "Automatic context compaction was blocked by a PreCompact hook. Work is paused and no continuation ran. Repair or disable the hook, or allow a manual compact trigger; then run /compact and explicitly continue."
         : event.failureCategory === "restoration-paused"
-          ? "Context was compacted, but mandatory context restoration could not be queued. Work is paused and no continuation ran. Do not compact the committed summary again; repair delivery or start a new session."
+          ? "Context was compacted, but mandatory context restoration could not be queued. Work is paused and no continuation ran. Do not compact the committed summary again; start a new session and resend the retained input."
           : "Automatic context compaction could not complete. Work is paused and no continuation ran. Run /compact, then explicitly continue.";
       case "checkpoint-cancelled": return event.action === "new-session"
         ? "Proactive context compaction stopped with the old session; resend input in the new session."
@@ -1058,8 +1058,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   };
 
   const publishCheckpoint = (event: CheckpointProgress, ctx = checkpointContext): void => {
-    const text = checkpointText(event);
     const mode = ctx?.mode;
+    const baseText = checkpointText(event);
+    const recoverableHeadlessExhaustion = event.category === "checkpoint-exhausted" &&
+      event.failureCategory !== "restoration-paused" && mode !== "tui";
+    const headlessCause = event.failureCategory === "hook-blocked"
+      ? "Automatic context compaction was blocked by a PreCompact hook. Work is paused and no continuation ran. Repair or disable the hook, or allow a manual compact trigger first."
+      : "Automatic context compaction could not complete. Work is paused and no continuation ran.";
+    const text = recoverableHeadlessExhaustion
+      ? `${headlessCause} If this process exits, reopen the exact persisted session before /compact.${mode === "rpc" ? " RPC acknowledgements are uncorrelated." : ""} Run /compact, then explicitly continue.`
+      : baseText;
     if (mode === "tui") {
       try {
         ctx.ui?.setStatus?.("picc-checkpoint", event.category === "checkpoint-recovered" ? undefined : text);
@@ -1081,8 +1089,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         ...(event.failureCategory === undefined ? {} : { failureCategory: event.failureCategory }),
         ...(event.category === "checkpoint-exhausted" ? {
           recovery: event.failureCategory === "restoration-paused"
-            ? "repair restoration delivery or start a new session; do not compact the committed summary again"
-            : "/compact, then explicitly continue",
+            ? "start a new session and resend retained input; do not compact the committed summary again"
+            : event.failureCategory === "hook-blocked"
+              ? "repair or disable the hook, or allow manual compaction; then run /compact and explicitly continue"
+              : "/compact, then explicitly continue",
         } : {}),
       });
     }
@@ -1162,7 +1172,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       let openProvider!: () => void;
       let rejectProvider!: (reason?: unknown) => void;
       // The hidden continuation starts the run, but queued steering must be
-      // installed before its first provider request or it lands one turn late.
+      // installed before its first ordinary provider request or it lands one turn late.
       const providerBarrier = new Promise<void>((resolve, reject) => {
         openProvider = resolve;
         rejectProvider = reject;
@@ -1680,8 +1690,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           await pi.exec("git", ["config", "core.hooksPath", ".githooks"], {}).catch(() => undefined);
         }
       }
+      const sessionStartSource = event.reason === "new"
+        ? "clear"
+        : event.reason === "reload"
+          ? "startup"
+          : event.reason;
       const outcome = await hooks.fire("SessionStart", {
-        source: event.reason,
+        source: sessionStartSource,
         cwd: cwdState.get(),
       });
       const hookContext = [outcome.stdout, outcome.additionalContext].filter(Boolean).join("\n");
@@ -1786,7 +1801,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         const text = inputDisposition === "reject-recoverable"
           ? "Work remains paused. Run /compact, then explicitly continue."
           : inputDisposition === "reject-restoration"
-            ? "The compacted summary is committed, but context restoration failed. Do not compact it again; repair delivery or start a new session."
+            ? "The compacted summary is committed, but context restoration failed. Do not compact it again; start a new session and resend the retained input."
             : "The prior checkpoint was cancelled. Run /compact to recover this session, or start a new session.";
         try {
           if (ctx.mode === "print") console.error(`PiCC: ${text}`);
@@ -2272,7 +2287,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         }
         if (budgeted.text) {
           // Steering is load-bearing here: restoration must enter the resumed
-          // provider request, whereas nextTurn would wait for another user prompt.
+          // ordinary provider request, whereas nextTurn would wait for another user prompt.
           pi.sendMessage(
             {
               customType: "picc-preserved",

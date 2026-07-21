@@ -56,14 +56,15 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
   expandable per-agent records in the chat transcript.
 - **Worktrees** — `EnterWorktree`/`ExitWorktree` with a real session-cwd swap and a
   Windows-tolerant lifecycle, for parallel sessions on one repo.
-- **Hooks** — 13 events (`PreToolUse` … `WorktreeRemove`) with Claude's stdin-JSON/stdout-decision
-  contract and matcher semantics.
+- **Hooks** — command hooks with Claude's stdin-JSON/stdout-decision contract and matcher
+  semantics; compact lifecycle hooks are partial (see the capability matrix).
 - **CLAUDE.md, memory & rules** — the ancestor hierarchy, recursive `@import` (the AGENTS.md
   bridge), auto memory, and `.claude/rules/`.
 - **Settings & permissions** — `settings.json` precedence and merge semantics, with `deny` rules
   as a hard block.
-- **Compaction preservation** — project instructions, rules, and active skills survive
-  auto-compaction.
+- **Compaction resilience** — partial proactive checkpointing and preservation: project
+  instructions and rules are rebuilt, while latest active skills are restored within PiCC's
+  heuristic character budget.
 - **Plugins** — content from already-installed plugins and project-bundled `.claude-plugin/`.
 - **Images & notebooks** — `Read` delivers image files and cell-aware `.ipynb` output (plots
   included) as real image blocks on a vision-capable model, degrading to a text placeholder on a

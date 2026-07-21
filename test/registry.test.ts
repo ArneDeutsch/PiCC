@@ -170,10 +170,16 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("setting.permissions.allow")?.tier).toBe("partial");
   });
 
-  it("covers all 13 supported hook events as full", () => {
+  it("keeps supported hooks full except the explicit compact-lifecycle partials", () => {
+    const partial = new Set(["SessionStart", "PreCompact", "PostCompact"]);
     for (const ev of SUPPORTED_HOOK_EVENTS) {
-      expect(lookupCapability(`hook.event.${ev}`)?.tier, ev).toBe("full");
+      expect(lookupCapability(`hook.event.${ev}`)?.tier, ev).toBe(partial.has(ev) ? "partial" : "full");
     }
+    const sessionStart = lookupCapability("hook.event.SessionStart")?.note ?? "";
+    expect(sessionStart).toContain("startup|resume|clear|compact|fork");
+    expect(sessionStart).toContain("startup and reload reasons map to startup");
+    expect(sessionStart).toContain("new maps to clear");
+    expect(sessionStart).not.toContain("fork source is missing");
   });
 
   it("marks MCP tools degraded-noop with safetyRelevant false", () => {
@@ -254,7 +260,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(sm?.note).toContain("Claude 2.1.x");
     expect(sm?.note).toContain("resume after TaskStop");
     expect(sm?.note).toContain("Claude Code 2.1.x reference refuses stopped-agent resume");
-    expect(sm?.note).toContain("new task id");
+    expect(sm?.note).toContain("returns its result directly, with no TaskOutput or new task generation");
+    expect(sm?.note).toContain("For ordinary resume, the acknowledgment includes the new task id");
     expect(sm?.note).toContain("resolved registry name");
     expect(sm?.note).toContain("stable agent id");
     expect(sm?.note).toContain("PiCC-defined model-visible wording");

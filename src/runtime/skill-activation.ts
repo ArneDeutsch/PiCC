@@ -139,9 +139,9 @@ export function recordResidentSkill(active: Map<string, string>, name: string, r
   active.set(name, rendered);
 }
 
-/** Per-skill compaction re-injection cap (~5k tokens, Claude's carryover budget). */
+/** PiCC heuristic character cap for each latest rendered skill body restored after compaction. */
 export const REINJECT_PER_SKILL_MAX_CHARS = 20_000;
-/** Combined compaction re-injection cap (~25k tokens). */
+/** PiCC heuristic combined character cap for restored latest rendered skill bodies. */
 export const REINJECT_COMBINED_MAX_CHARS = 100_000;
 
 /**

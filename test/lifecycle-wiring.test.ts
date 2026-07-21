@@ -38,6 +38,13 @@ beforeAll(async () => {
     JSON.stringify({
       permissions: { ask: ["Bash(git push *)"] },
       hooks: {
+        SessionStart: ["startup", "resume", "clear", "fork"].map((source) => ({
+          matcher: source,
+          hooks: [{
+            type: "command",
+            command: `echo '${source}' >> "$CLAUDE_PROJECT_DIR/.claude/.session-start-log"`,
+          }],
+        })),
         Stop: [{ hooks: [{ type: "command", command: "echo 'LW-not-done' >&2; exit 2" }] }],
         SessionEnd: [
           {
@@ -167,6 +174,17 @@ describe("lifecycle wiring", () => {
     await pi.fire("session_start", { reason: "switch" }, pi.ctx());
     await pi.fire("agent_settled", {}, pi.ctx());
     expect(pi.userMessages.filter((m) => String(m.content).includes("[Stop hook]")).length).toBe(9);
+  });
+
+  it("maps Pi 0.80.6 session reasons to Claude SessionStart sources", async () => {
+    const log = path.join(dir, ".claude", ".session-start-log");
+    fs.rmSync(log, { force: true });
+    for (const reason of ["startup", "reload", "new", "resume", "fork"]) {
+      await pi.fire("session_start", { reason }, pi.ctx());
+    }
+    expect(fs.readFileSync(log, "utf8").trim().split(/\r?\n/u)).toEqual([
+      "startup", "startup", "clear", "resume", "fork",
+    ]);
   });
 
   it("session_shutdown fires the SessionEnd hook", async () => {

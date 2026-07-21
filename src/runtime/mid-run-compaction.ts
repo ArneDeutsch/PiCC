@@ -1,8 +1,13 @@
 /** Session-local coordination for proactive mid-run context checkpoints. */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { ContextUsageShape } from "./proactive-compaction.js";
 import { toolResultHasGuardClipping } from "./guard.js";
+
+export interface ContextUsageShape {
+  tokens?: number | null;
+  contextWindow?: number;
+  percent?: number | null;
+}
 
 export type CheckpointPhase =
   | "idle"
@@ -51,7 +56,7 @@ export interface CheckpointProgress {
   category: CheckpointDiagnosticCategory;
   generation: number;
   attempt?: number;
-  action?: "resume" | "settled-fallback" | "manual-recovery" | "repair-restoration" | "new-session";
+  action?: "resume" | "settled-fallback" | "manual-recovery" | "new-session";
   failureCategory?: CompactionFailureCategory;
 }
 
@@ -500,15 +505,7 @@ export class MidRunCompactionController {
     return { recovered: true, rejected };
   }
 
-  /** Child live-session adapters may retry repaired restoration without reopening ordinary work. */
-  enableRestorationRecovery(generation: number): boolean {
-    if (generation !== this.generation || this.phase !== "exhausted" ||
-        this.terminalFailure !== "restoration-paused") return false;
-    this.recovery = { generation, token: {} };
-    return true;
-  }
-
-  /** A public-session continuation failed to start or settle; keep this generation recoverable. */
+  /** A public-session continuation failed to start or settle; only pre-commit failures remain recoverable. */
   pauseAfterRecoveryFailure(
     generation: number,
     failureCategory: CompactionFailureCategory = "operational",
@@ -516,9 +513,9 @@ export class MidRunCompactionController {
     if (generation !== this.generation || this.phase !== "idle") return false;
     this.phase = "exhausted";
     this.terminalFailure = failureCategory;
-    this.recovery = { generation, token: {} };
+    this.recovery = failureCategory === "restoration-paused" ? undefined : { generation, token: {} };
     this.emit("checkpoint-exhausted", generation, this.attempt, {
-      action: "manual-recovery",
+      action: failureCategory === "restoration-paused" ? "new-session" : "manual-recovery",
       failureCategory,
     });
     return true;
@@ -740,7 +737,7 @@ export class MidRunCompactionController {
     this.recovery = failureCategory === "restoration-paused" ? undefined : { generation, token: {} };
     generationBarrier?.resolve();
     this.emit("checkpoint-exhausted", generation, this.attempt, {
-      action: failureCategory === "restoration-paused" ? "repair-restoration" : "manual-recovery",
+      action: failureCategory === "restoration-paused" ? "new-session" : "manual-recovery",
       failureCategory,
     });
   }

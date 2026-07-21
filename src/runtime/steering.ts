@@ -73,7 +73,7 @@ const PROACTIVE_COMPACT_PERCENT_MIN = 50;
 const PROACTIVE_COMPACT_PERCENT_MAX = 95;
 const CLIP_MAX_TOKENS_MIN = 1000;
 
-/** Fully-defaulted, validated compaction knobs — the seam the proactive-compaction and clip paths read from. */
+/** Fully-defaulted, validated compaction knobs used by checkpoint and clipping paths. */
 export interface ResolvedCompactionConfig {
   /** 0–100 scale (matches Pi `ContextUsage.percent`). Always within [50, 95]. */
   proactiveCompactPercent: number;
@@ -138,7 +138,7 @@ function resolveNumeric(
 /**
  * The single, validated resolver for the compaction-resilience knobs. Called exactly once
  * at load by {@link loadPiCCConfig} (which stores the result on `config.compaction`); the
- * proactive-compaction and clip paths read that field and never re-parse or re-default.
+ * checkpoint and clipping paths read that field and never re-parse or re-default.
  * Invalid values fail closed to the documented defaults with a diagnostic appended to
  * `config.diagnostics`; it never throws.
  */

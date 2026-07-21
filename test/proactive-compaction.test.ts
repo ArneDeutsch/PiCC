@@ -1677,9 +1677,10 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       phase: "exhausted", failureCategory: "restoration-paused", admission: "closed",
     });
     expect(controller.manualCompactionDisposition()).toBe("unavailable");
+    expect(controller.recoveryToken(controller.snapshot().generation)).toBeUndefined();
     expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation")).toBe(false);
     const failure = pi.entries.find((entry) => entry.data.category === "checkpoint-exhausted");
-    expect(failure?.data).toMatchObject({ failureCategory: "restoration-paused", action: "repair-restoration" });
+    expect(failure?.data).toMatchObject({ failureCategory: "restoration-paused", action: "new-session" });
     expect(String(failure?.data.recovery)).toContain("do not compact");
     await expect(pi.fire("session_before_compact", { reason: "manual" }, high))
       .resolves.toEqual({ cancel: true });
@@ -1719,6 +1720,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(mainCheckpointGate.currentController().snapshot().phase).toBe("exhausted");
     const failure = pi.entries.find((entry) =>
       entry.customType === "picc-checkpoint-lifecycle" && entry.data.category === "checkpoint-exhausted");
+    expect(failure?.data.notice).toContain("reopen the exact persisted session before /compact");
     expect(failure?.data.notice).toContain("Run /compact, then explicitly continue");
     expect(String(failure?.data.notice)).not.toContain("provider detail");
     expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation")).toBe(false);
@@ -1834,7 +1836,9 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await pi.fire("agent_settled", {}, ctx);
     const records = pi.entries.filter((entry) => entry.customType === "picc-checkpoint-lifecycle");
     expect(records.some((entry) => entry.data.category === "checkpoint-exhausted")).toBe(true);
-    expect(records.at(-1)?.data.notice).toContain("/compact");
+    expect(records.at(-1)?.data.notice).toContain("reopen the exact persisted session before /compact");
+    expect(records.at(-1)?.data.notice).toContain("Run /compact, then explicitly continue");
+    if (mode === "rpc") expect(records.at(-1)?.data.notice).toContain("RPC acknowledgements are uncorrelated");
     expect(records.map((entry) => entry.data.notice).join("\n")).not.toContain("private failure");
     expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-lifecycle")).toBe(false);
   });
