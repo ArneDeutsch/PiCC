@@ -9,11 +9,12 @@ For the broader integration contracts see [`doc/pi-integration.md`](pi-integrati
 for the module map see [`doc/architecture.md`](architecture.md). This guide is the TUI-specific
 companion to both.
 
-> **Baseline:** Pi `@earendil-works/pi-*` `^0.80.6` (the version pinned in `package.json`). The
-> authoritative source for everything below is
-> `node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/types.d.ts` (the extension
-> API) and `.../dist/modes/interactive/theme/theme.d.ts` (the theme model). When Pi is upgraded,
-> re-verify against those files — this is a pre-1.0 surface and it moves.
+> **Baseline:** the declared and tested Pi `@earendil-works/pi-*` 0.80.10 suite
+> (`package.json` uses `^0.80.10`; the lockfile resolves 0.80.10 exactly). The public extension,
+> renderer, mode, widget/input, shortcut/message-renderer, and theme declarations below were
+> re-verified against `pi-coding-agent` 0.80.10. Their authoritative declarations are
+> `dist/core/extensions/types.d.ts` and `dist/modes/interactive/theme/theme.d.ts`; re-verify them
+> on every Pi upgrade because this is a pre-1.0 surface.
 
 ---
 
