@@ -77,6 +77,9 @@ export const DETAIL_LOG_MAX_ENTRIES = 100;
 export const DETAIL_FIELD_MAX_LENGTH = 300;
 /** Maximum raw code units inspected when sanitizing a malformed detail scalar. */
 const DETAIL_RAW_INSPECTION_LIMIT = 4096;
+/** Fixed work ceilings for a tool outcome, including payloads with no visible text. */
+export const TOOL_OUTCOME_BLOCK_INSPECTION_LIMIT = 64;
+export const TOOL_OUTCOME_RAW_INSPECTION_LIMIT = 4096;
 
 // Control bytes referenced by the ANSI matchers, built from code points so the
 // SOURCE stays pure ASCII (no raw control characters in this file). ESC=27, BEL=7.
@@ -108,6 +111,16 @@ export function sanitizeProgressText(text: string): string {
   let out = "";
   for (const ch of escaped) {
     if (!isStrippableControl(ch.charCodeAt(0))) out += ch;
+  }
+  return out;
+}
+
+export function scalarSafeText(text: string): string {
+  let out = "";
+  for (const ch of text) {
+    const code = ch.codePointAt(0)!;
+    if (ch.length === 1 && code >= 0xd800 && code <= 0xdfff) continue;
+    out += ch;
   }
   return out;
 }
@@ -169,6 +182,7 @@ class BoundedScalarAccumulator {
       this.escapeState = "csi";
       return;
     }
+    if (ch.length === 1 && code >= 0xd800 && code <= 0xdfff) return;
     if (isStrippableControl(code)) return;
     if (/\s/u.test(ch)) {
       if (this.out) this.pendingSpace = true;
@@ -211,9 +225,12 @@ export function sanitizeDetailScalar(
 /** Extract a display scalar without joining a complete multi-block payload. */
 function boundedScalar(parts: Iterable<unknown>, maxLen = DETAIL_FIELD_MAX_LENGTH): string {
   const accumulator = new BoundedScalarAccumulator(maxLen);
+  let inspected = 0;
   outer: for (const part of parts) {
     if (typeof part !== "string") continue;
     for (const ch of part) {
+      if (inspected + ch.length > DETAIL_RAW_INSPECTION_LIMIT) break outer;
+      inspected += ch.length;
       accumulator.feed(ch, ch.codePointAt(0)!);
       if (accumulator.truncated) break outer;
     }
@@ -244,19 +261,39 @@ function* messageTextParts(message: unknown): Iterable<unknown> {
   }
 }
 
+function safeField(value: unknown, key: PropertyKey): unknown {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
+  try {
+    return Reflect.get(value, key);
+  } catch {
+    return undefined;
+  }
+}
+
+function safeArray(value: unknown): value is unknown[] {
+  try {
+    return Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
 function* resultTextParts(result: unknown): Iterable<unknown> {
   if (typeof result === "string") {
     yield result;
     return;
   }
-  const content = (result as { content?: unknown } | undefined)?.content;
-  if (!Array.isArray(content)) return;
-  for (let i = 0; i < content.length; i++) {
-    const block = content[i];
-    if (!block || typeof block !== "object" || (block as { type?: string }).type !== "text") continue;
-    yield (block as { text?: unknown }).text;
+  const content = safeField(result, "content");
+  if (!safeArray(content)) return;
+  const rawLength = safeField(content, "length");
+  if (typeof rawLength !== "number" || !Number.isSafeInteger(rawLength) || rawLength < 0) return;
+  const length = Math.min(rawLength, TOOL_OUTCOME_BLOCK_INSPECTION_LIMIT);
+  for (let i = 0; i < length; i++) {
+    const block = safeField(content, i);
+    if (safeField(block, "type") !== "text") continue;
+    yield safeField(block, "text");
     // The separator lets a first-line consumer stop before the next block is inspected.
-    if (i < content.length - 1) yield "\n";
+    if (i < length - 1) yield "\n";
   }
 }
 
@@ -446,13 +483,19 @@ function toolOutcomePreview(
 ): ToolOutcomePreview {
   const snapshot = new LegacyLineAccumulator(snapshotMax);
   const detail = new BoundedScalarAccumulator(DETAIL_FIELD_MAX_LENGTH);
-  const prefix = failed ? `  x ${rawName} failed` : `  ${rawName}`;
+  const inspectedName = rawName.slice(0, TOOL_OUTCOME_RAW_INSPECTION_LIMIT);
+  const prefix = failed ? `  x ${inspectedName} failed` : `  ${inspectedName}`;
   snapshot.feed(prefix);
   let found = false;
+  let inspected = 0;
 
   for (const part of resultTextParts(result)) {
     if (typeof part !== "string") continue;
     for (const ch of part) {
+      if (inspected + ch.length > TOOL_OUTCOME_RAW_INSPECTION_LIMIT) {
+        return { found, snapshotLine: snapshot.value(), detail: detail.value() };
+      }
+      inspected += ch.length;
       if (ch === "\n") {
         if (found) return { found, snapshotLine: snapshot.value(), detail: detail.value() };
         continue;

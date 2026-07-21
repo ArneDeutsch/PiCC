@@ -3,6 +3,7 @@ import {
   assistantTextFingerprint,
   sanitizeLine,
   sanitizeProgressText,
+  scalarSafeText,
   type ProgressSnapshot,
   type SubagentDetailEntry,
 } from "./subagent-progress.js";
@@ -96,9 +97,12 @@ function validAgentColor(color: string | undefined): string | undefined {
  */
 function boundedContent(text: string | undefined, cap: number): string | undefined {
   if (text === undefined) return undefined;
-  const clean = sanitizeProgressText(text);
+  const clean = scalarSafeText(sanitizeProgressText(text.slice(0, cap + 1)));
   if (!clean.trim()) return undefined;
-  return clean.length > cap ? `${clean.slice(0, cap)}…` : clean;
+  if (text.length <= cap && clean.length <= cap) return clean;
+  let prefix = clean.slice(0, cap);
+  if (/[\uD800-\uDBFF]$/u.test(prefix)) prefix = prefix.slice(0, -1);
+  return `${prefix}…`;
 }
 
 /** Single-line description label sanitized and capped at capture. */

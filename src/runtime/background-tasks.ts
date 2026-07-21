@@ -7,6 +7,8 @@ import {
   progressActivityLine,
   renderProgressText,
   sanitizeLine,
+  sanitizeProgressText,
+  scalarSafeText,
   type ProgressSnapshot,
 } from "./subagent-progress.js";
 import {
@@ -154,11 +156,10 @@ export interface BackgroundTaskRecord {
    */
   lastActivity?: string;
   /**
-   * Latest full live progress snapshot: the sanitized rolling tail +
-   * current-activity line produced by SubagentProgressCondenser, fed via
-   * noteProgress so a waiting TaskOutput can render the running background
-   * subagent live. Display-only; bounded by the condenser; never merged into
-   * `result`.
+   * Latest condensed progress snapshot for model-facing poll/activity text and
+   * a waiting TaskOutput's initial live paint. Structured detail is retained
+   * separately by the subagent registry. Bounded by the condenser; never merged
+   * into `result`.
    */
   progress?: ProgressSnapshot;
   /**
@@ -820,8 +821,13 @@ function terminalTiming(task: BackgroundTaskRecord): Pick<SubagentRenderDetails,
 function settlementRecordDetails(task: BackgroundTaskRecord): SubagentRenderDetails {
   const outcome = noticeOutcome(task.status);
   const raw = outcome === "aborted" ? "" : task.result ?? "";
-  const finalText =
-    raw.length > RECORD_FINAL_TEXT_CAP ? `${raw.slice(0, RECORD_FINAL_TEXT_CAP)}…` : raw;
+  const inspected = scalarSafeText(sanitizeProgressText(raw.slice(0, RECORD_FINAL_TEXT_CAP + 1)));
+  let finalText = inspected;
+  if (raw.length > RECORD_FINAL_TEXT_CAP || inspected.length > RECORD_FINAL_TEXT_CAP) {
+    let prefix = inspected.slice(0, RECORD_FINAL_TEXT_CAP);
+    if (/[\uD800-\uDBFF]$/u.test(prefix)) prefix = prefix.slice(0, -1);
+    finalText = `${prefix}…`;
+  }
   return {
     record: "subagent-completion",
     taskId: task.id,

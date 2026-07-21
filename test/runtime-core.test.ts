@@ -3097,6 +3097,132 @@ describe("condensed completion records", () => {
     ).not.toThrow();
   });
 
+  it("normalizes direct and settlement details totally and within fixed inspection budgets", () => {
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    expect(() =>
+      renderAgentResult(
+        { content: [{ type: "text", text: "body" }], details: revoked.proxy as never },
+        { expanded: true },
+        undefined,
+      ).render(80),
+    ).not.toThrow();
+    expect(() => renderSettlementRecord(revoked.proxy, { expanded: true }, undefined)).not.toThrow();
+    const throwingFields = new Proxy({}, {
+      get(): never {
+        throw new Error("detail getter");
+      },
+    });
+    expect(() => renderSettlementRecord(throwingFields, { expanded: true }, undefined)).not.toThrow();
+
+    let diagnosticReads = 0;
+    const diagnostics = new Proxy(new Array(10_000), {
+      get(target, key, receiver) {
+        if (typeof key === "string" && /^\d+$/u.test(key)) diagnosticReads++;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const hostileUsage = Object.defineProperty({}, "inputTokens", {
+      get(): never {
+        throw new Error("usage getter");
+      },
+    });
+    let tailReads = 0;
+    const oversizedTail = new Proxy(new Array(10_000), {
+      get(target, key, receiver) {
+        if (typeof key === "string" && /^\d+$/u.test(key)) tailReads++;
+        return typeof key === "string" && /^\d+$/u.test(key)
+          ? "tail".repeat(1_000)
+          : Reflect.get(target, key, receiver);
+      },
+    });
+    const hostileProgress = { activity: "working".repeat(10_000), tail: oversizedTail };
+    const oversized = {
+      outcome: "completed",
+      diagnostics,
+      usage: hostileUsage,
+      subagentProgress: hostileProgress,
+    };
+    expect(() =>
+      renderAgentResult(
+        { content: [{ type: "text", text: "safe body" }], details: oversized },
+        { expanded: true },
+        undefined,
+      ).render(80),
+    ).not.toThrow();
+    expect(() => renderSettlementRecord(oversized, { expanded: true }, undefined)?.render(80)).not.toThrow();
+    expect(diagnosticReads).toBeLessThanOrEqual(200);
+    expect(tailReads).toBeLessThanOrEqual(24);
+
+    const scalarSafe = renderSettlementRecord(
+      { record: "subagent-completion", outcome: "completed", agent: `a\uD800😀\uDC00z`, finalText: `f\uD800😀\uDC00z` },
+      { expanded: true },
+      undefined,
+    )!.render(200).join("\n");
+    expect(scalarSafe).toContain("a😀z");
+    expect(scalarSafe).toContain("f😀z");
+    expect(scalarSafe).not.toMatch(/[\uD800-\uDFFF]/u);
+  });
+
+  it("keeps compact paths content-inert and bounds primitive-only expanded extraction", () => {
+    for (const details of [
+      { background: true, taskId: "task-1", agent: "coder" },
+      { taskId: "task-1", status: "running", agent: "coder" },
+      { taskId: "task-1", outcome: "completed", alreadyReported: true, agent: "coder" },
+      { taskId: "task-1", outcome: "completed", agent: "coder" },
+    ]) {
+      let contentReads = 0;
+      const result = Object.defineProperty({ details }, "content", {
+        get() {
+          contentReads++;
+          return [{ type: "text", text: "must stay unread" }];
+        },
+      });
+      renderAgentResult(
+        result,
+        { isPartial: details.status === "running", expanded: false },
+        undefined,
+      ).render(120);
+      expect(contentReads).toBe(0);
+    }
+
+    let slots = 0;
+    const blocks = new Proxy(new Array(10_000), {
+      get(target, key, receiver) {
+        if (typeof key === "string" && /^\d+$/u.test(key)) slots++;
+        if (key === "0") return { type: "text", text: "safe body" };
+        if (key === "1") return { type: "text", text: { toString: () => { throw new Error("coerced"); } } };
+        if (key === "9999") return { type: "text", text: "late sentinel" };
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const expanded = renderAgentResult(
+      { content: blocks, details: { outcome: "completed", agent: "coder" } },
+      { expanded: true },
+      undefined,
+    ).render(120).join("\n");
+    expect(expanded).toContain("safe body");
+    expect(expanded).not.toContain("late sentinel");
+    expect(slots).toBeLessThanOrEqual(256);
+
+    const bodyLimit = 1_048_576;
+    for (const content of [
+      [{ type: "text", text: `${"r".repeat(bodyLimit - 1)}😀RAW-SENTINEL` }],
+      [
+        { type: "text", text: "t".repeat(bodyLimit - 2) },
+        { type: "text", text: `😀TEXT-SENTINEL` },
+      ],
+    ]) {
+      const rendered = renderAgentResult(
+        { content, details: { outcome: "completed", agent: "coder" } },
+        { expanded: true },
+        undefined,
+      ).render(bodyLimit * 2).join("\n");
+      expect(rendered).not.toContain("SENTINEL");
+      expect(rendered).not.toMatch(/[\uD800-\uDFFF]/u);
+    }
+  });
+
   it("hostile fields: the collapsed line never leaks control bytes and never overflows any width", () => {
     const theme = {
       fg: (_c: string, s: string) => `${ESC}[31m${s}${ESC}[0m`,
@@ -3196,21 +3322,21 @@ describe("condensed completion records", () => {
     expect(out).toBe("Agent(coder)");
   });
 
-  it("a \\r in a background-start body breaks the line — no same-line spoofing on the fallback start block", () => {
-    const CR = String.fromCharCode(13);
-    // No taskId → the background-start FALLBACK branch renders the content body.
-    const lines = renderAgentResult(
-      {
-        content: [{ type: "text", text: `Agent → background${CR}SPOOF-LINE` }],
-        details: { background: true },
+  it("keeps the task-id-less background fallback content-inert", () => {
+    let contentReads = 0;
+    const result = Object.defineProperty({ details: { background: true } }, "content", {
+      get() {
+        contentReads++;
+        return [{ type: "text", text: "SPOOF-LINE" }];
       },
+    });
+    const lines = renderAgentResult(
+      result,
       { isPartial: false, expanded: false },
       undefined,
     ).render(80);
-    for (const l of lines) expect(l.includes(CR)).toBe(false);
-    const out = lines.join("\n");
-    expect(out).toContain("SPOOF-LINE");
-    expect(lines.some((l) => l.includes("background") && l.includes("SPOOF-LINE"))).toBe(false);
+    expect(lines).toEqual(["Agent → background"]);
+    expect(contentReads).toBe(0);
   });
 });
 

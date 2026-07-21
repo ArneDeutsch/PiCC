@@ -2,6 +2,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
   formatUsageCompact,
   sanitizeProgressText,
+  scalarSafeText,
   type ProgressSnapshot,
 } from "./subagent-progress.js";
 import { clampLines, pushColored, pushWrapped, themedBold, themedFg } from "./render-util.js";
@@ -75,135 +76,187 @@ export interface SubagentRenderDetails {
   resumed?: boolean;
 }
 
+const RENDER_SCALAR_LIMIT = 16_385;
+const RENDER_DIAGNOSTIC_LIMIT = 100;
+const RENDER_DIAGNOSTIC_MESSAGE_LIMIT = 1_000;
+const RENDER_PROGRESS_TAIL_LIMIT = 12;
+const RENDER_PROGRESS_LINE_LIMIT = 200;
+const RENDER_BODY_BLOCK_LIMIT = 256;
+const RENDER_BODY_RAW_LIMIT = 1_048_576;
+const RENDER_BODY_TEXT_LIMIT = 1_048_576;
+
+function safeArray(value: unknown): value is unknown[] {
+  try {
+    return Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+  return value !== null && typeof value === "object" && !safeArray(value);
+}
+
+function safeField(value: unknown, key: PropertyKey): unknown {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
+  try {
+    return Reflect.get(value, key);
+  } catch {
+    return undefined;
+  }
+}
+
+function boundedString(value: unknown, limit = RENDER_SCALAR_LIMIT): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const inspected = value.slice(0, limit + 1);
+  const clean = scalarSafeText(sanitizeProgressText(inspected));
+  if (clean.length <= limit && value.length <= limit) return clean;
+  let prefix = clean.slice(0, limit);
+  if (/[\uD800-\uDBFF]$/u.test(prefix)) prefix = prefix.slice(0, -1);
+  return `${prefix}…`;
+}
+
+function arrayLength(value: unknown, limit: number): number {
+  if (!safeArray(value)) return 0;
+  try {
+    const length = value.length;
+    return Number.isSafeInteger(length) && length > 0 ? Math.min(length, limit) : 0;
+  } catch {
+    return 0;
+  }
 }
 
 function normalizeDiagnostics(value: unknown): Diagnostic[] | undefined {
-  if (!Array.isArray(value)) return undefined;
   const diagnostics: Diagnostic[] = [];
-  for (const item of value) {
+  const length = arrayLength(value, RENDER_DIAGNOSTIC_LIMIT);
+  for (let i = 0; i < length; i++) {
+    const item = safeField(value, i);
     if (!isRecord(item)) continue;
-    const { severity, message, source } = item;
+    const severity = safeField(item, "severity");
+    const message = boundedString(safeField(item, "message"), RENDER_DIAGNOSTIC_MESSAGE_LIMIT);
+    const sourceValue = safeField(item, "source");
+    const source = boundedString(sourceValue, RENDER_DIAGNOSTIC_MESSAGE_LIMIT);
     if (
       (severity !== "info" && severity !== "warning" && severity !== "error") ||
-      typeof message !== "string" ||
-      (source !== undefined && typeof source !== "string")
-    ) {
-      continue;
-    }
-    diagnostics.push({ severity, message, ...(source === undefined ? {} : { source }) });
+      message === undefined ||
+      (sourceValue !== undefined && source === undefined)
+    ) continue;
+    diagnostics.push(source === undefined ? { severity, message } : { severity, message, source });
   }
   return diagnostics.length > 0 ? diagnostics : undefined;
-}
-
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
 function finiteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+function normalizeUsageFields(value: unknown): Record<string, number> | undefined {
+  if (!isRecord(value)) return undefined;
+  const usage: Record<string, number> = {};
+  for (const key of [
+    "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens",
+    "totalTokens", "tokens", "costUsd", "cost",
+  ]) {
+    const field = finiteNumber(safeField(value, key));
+    if (field !== undefined) usage[key] = field;
+  }
+  return Object.keys(usage).length > 0 ? usage : undefined;
+}
+
 function normalizeProgressSnapshot(value: unknown): ProgressSnapshot | undefined {
-  if (!isRecord(value) || typeof value.activity !== "string" || !isStringArray(value.tail)) {
-    return undefined;
+  if (!isRecord(value)) return undefined;
+  const activity = boundedString(safeField(value, "activity"), RENDER_PROGRESS_LINE_LIMIT);
+  const rawTail = safeField(value, "tail");
+  if (activity === undefined || !safeArray(rawTail)) return undefined;
+  const tail: string[] = [];
+  const length = arrayLength(rawTail, RENDER_PROGRESS_TAIL_LIMIT);
+  for (let i = 0; i < length; i++) {
+    const line = boundedString(safeField(rawTail, i), RENDER_PROGRESS_LINE_LIMIT);
+    if (line !== undefined) tail.push(line);
   }
-  const usage: NonNullable<ProgressSnapshot["usage"]> = {};
-  if (isRecord(value.usage)) {
-    const inputTokens = finiteNumber(value.usage.inputTokens);
-    const outputTokens = finiteNumber(value.usage.outputTokens);
-    const cacheReadTokens = finiteNumber(value.usage.cacheReadTokens);
-    const cacheWriteTokens = finiteNumber(value.usage.cacheWriteTokens);
-    const costUsd = finiteNumber(value.usage.costUsd);
-    if (inputTokens !== undefined) usage.inputTokens = inputTokens;
-    if (outputTokens !== undefined) usage.outputTokens = outputTokens;
-    if (cacheReadTokens !== undefined) usage.cacheReadTokens = cacheReadTokens;
-    if (cacheWriteTokens !== undefined) usage.cacheWriteTokens = cacheWriteTokens;
-    if (costUsd !== undefined) usage.costUsd = costUsd;
-  }
-  return {
-    activity: value.activity,
-    tail: [...value.tail],
-    ...(Object.keys(usage).length > 0 ? { usage } : {}),
-  };
+  const usage = normalizeUsageFields(safeField(value, "usage"));
+  return usage ? { activity, tail, usage } : { activity, tail };
 }
 
 function normalizeUsage(value: unknown): string | Record<string, string | number> | undefined {
-  if (typeof value === "string") return sanitizeInline(value);
+  const textValue = boundedString(value);
+  if (textValue !== undefined) return sanitizeInline(textValue);
   if (!isRecord(value)) return undefined;
-  const usage: Record<string, string | number> = {};
-  if (typeof value.text === "string") usage.text = sanitizeInline(value.text);
-  for (const key of [
-    "inputTokens",
-    "outputTokens",
-    "cacheReadTokens",
-    "cacheWriteTokens",
-    "totalTokens",
-    "tokens",
-    "costUsd",
-    "cost",
-  ]) {
-    const field = finiteNumber(value[key]);
-    if (field !== undefined) usage[key] = field;
-  }
-  return usage;
+  const usage: Record<string, string | number> = normalizeUsageFields(value) ?? {};
+  const text = boundedString(safeField(value, "text"));
+  if (text !== undefined) usage.text = sanitizeInline(text);
+  return Object.keys(usage).length > 0 ? usage : undefined;
 }
 
 /** Copy validated renderer fields from persisted or extension-message data. */
 function normalizeSubagentRenderDetails(value: unknown): SubagentRenderDetails | undefined {
   if (!isRecord(value)) return undefined;
   const normalized: SubagentRenderDetails = {};
-
-  if (value.record === "subagent-completion") normalized.record = value.record;
-  if (
-    value.status === "running" ||
-    value.status === "completed" ||
-    value.status === "failed" ||
-    value.status === "stopped"
-  ) {
-    normalized.status = value.status;
+  const record = safeField(value, "record");
+  if (record === "subagent-completion") normalized.record = record;
+  const status = safeField(value, "status");
+  if (status === "running" || status === "completed" || status === "failed" || status === "stopped") {
+    normalized.status = status;
   }
-  if (value.outcome === "completed" || value.outcome === "failed" || value.outcome === "aborted") {
-    normalized.outcome = value.outcome;
+  const outcome = safeField(value, "outcome");
+  if (outcome === "completed" || outcome === "failed" || outcome === "aborted") normalized.outcome = outcome;
+  const delivery = safeField(value, "delivery");
+  if (delivery === "steer" || delivery === "resume") normalized.delivery = delivery;
+
+  for (const key of [
+    "taskId", "agent", "agentId", "description", "transcriptPath", "lastActivity",
+    "error", "finalText", "worktreePath", "note",
+  ] as const) {
+    const scalar = boundedString(safeField(value, key));
+    if (scalar !== undefined) normalized[key] = scalar;
   }
-  if (value.delivery === "steer" || value.delivery === "resume") normalized.delivery = value.delivery;
-
-  if (typeof value.taskId === "string") normalized.taskId = value.taskId;
-  if (typeof value.agent === "string") normalized.agent = value.agent;
-  if (typeof value.agentId === "string") normalized.agentId = value.agentId;
-  if (typeof value.description === "string") normalized.description = value.description;
-  if (typeof value.transcriptPath === "string") normalized.transcriptPath = value.transcriptPath;
-  if (typeof value.lastActivity === "string") normalized.lastActivity = value.lastActivity;
-  if (typeof value.error === "string") normalized.error = value.error;
-  if (typeof value.finalText === "string") normalized.finalText = value.finalText;
-  if (typeof value.worktreePath === "string") normalized.worktreePath = value.worktreePath;
-  if (typeof value.note === "string") normalized.note = value.note;
-
-  const durationMs = finiteNumber(value.durationMs);
-  const settledAt = finiteNumber(value.settledAt);
-  if (durationMs !== undefined) normalized.durationMs = durationMs;
-  if (settledAt !== undefined) normalized.settledAt = settledAt;
-
-  if (typeof value.background === "boolean") normalized.background = value.background;
-  if (typeof value.cutOff === "boolean") normalized.cutOff = value.cutOff;
-  if (typeof value.userStopped === "boolean") normalized.userStopped = value.userStopped;
-  if (typeof value.resumable === "boolean") normalized.resumable = value.resumable;
-  if (typeof value.alreadyReported === "boolean") {
-    normalized.alreadyReported = value.alreadyReported;
+  for (const key of ["durationMs", "settledAt"] as const) {
+    const number = finiteNumber(safeField(value, key));
+    if (number !== undefined) normalized[key] = number;
   }
-  if (typeof value.nested === "boolean") normalized.nested = value.nested;
-  if (typeof value.live === "boolean") normalized.live = value.live;
-  if (typeof value.resumed === "boolean") normalized.resumed = value.resumed;
+  for (const key of [
+    "background", "cutOff", "userStopped", "resumable", "alreadyReported",
+    "nested", "live", "resumed",
+  ] as const) {
+    const flag = safeField(value, key);
+    if (typeof flag === "boolean") normalized[key] = flag;
+  }
 
-  const usage = normalizeUsage(value.usage);
+  const usage = normalizeUsage(safeField(value, "usage"));
   if (usage !== undefined) normalized.usage = usage;
-  const diagnostics = normalizeDiagnostics(value.diagnostics);
+  const diagnostics = normalizeDiagnostics(safeField(value, "diagnostics"));
   if (diagnostics) normalized.diagnostics = diagnostics;
-  const progress = normalizeProgressSnapshot(value.subagentProgress);
+  const progress = normalizeProgressSnapshot(safeField(value, "subagentProgress"));
   if (progress) normalized.subagentProgress = progress;
-
   return normalized;
+}
+
+function boundedBodyText(result: unknown): string {
+  const content = safeField(result, "content");
+  const length = arrayLength(content, RENDER_BODY_BLOCK_LIMIT);
+  const parts: string[] = [];
+  let raw = 0;
+  let output = 0;
+  for (let i = 0; i < length && raw < RENDER_BODY_RAW_LIMIT && output < RENDER_BODY_TEXT_LIMIT; i++) {
+    const block = safeField(content, i);
+    if (safeField(block, "type") !== "text") continue;
+    const text = safeField(block, "text");
+    if (typeof text !== "string") continue;
+    const rawRoom = RENDER_BODY_RAW_LIMIT - raw;
+    const separatorWidth = parts.length > 0 ? 1 : 0;
+    const outputRoom = RENDER_BODY_TEXT_LIMIT - output - separatorWidth;
+    if (outputRoom <= 0) break;
+    const inspectedLength = Math.min(text.length, rawRoom, outputRoom);
+    const part = scalarSafeText(text.slice(0, inspectedLength));
+    raw += inspectedLength;
+    if (separatorWidth) {
+      parts.push("\n");
+      output++;
+    }
+    parts.push(part);
+    output += part.length;
+  }
+  return parts.join("");
 }
 
 /**
@@ -667,12 +720,11 @@ export function renderAgentCall(
   theme: unknown,
   context?: SubagentLifecycleRenderContext,
 ) {
-  const a = (args ?? {}) as Record<string, unknown>;
-  const agentType = sanitizeInline(String(a.subagent_type ?? "")) || "general-purpose";
-  const description = sanitizeInline(String(a.description ?? ""));
+  const agentType = sanitizeInline(boundedString(safeField(args, "subagent_type")) ?? "") || "general-purpose";
+  const description = sanitizeInline(boundedString(safeField(args, "description")) ?? "");
   return {
     render(width: number): string[] {
-      if (context?.state?.resultOwned === true) return [];
+      if (safeField(safeField(context, "state"), "resultOwned") === true) return [];
       return lifecycleLine(
         theme,
         {
@@ -697,42 +749,32 @@ export function renderAgentCall(
  *    rendered only when present.
  */
 export function renderAgentResult(
-  result: { content?: Array<{ type: string; text: string }>; details?: SubagentRenderDetails },
-  options: { expanded?: boolean; isPartial?: boolean },
+  result: unknown,
+  options: unknown,
   theme: unknown,
   context?: SubagentLifecycleRenderContext,
 ) {
-  if (context?.state) context.state.resultOwned = true;
-  const details: SubagentRenderDetails = result?.details ?? {};
-  const contentText = (result?.content ?? [])
-    .filter((c) => c && c.type === "text")
-    .map((c) => String(c.text ?? ""))
-    .join("\n");
-  const isPartial = options?.isPartial === true;
+  const state = safeField(context, "state");
+  if (isRecord(state)) {
+    try {
+      Reflect.set(state, "resultOwned", true);
+    } catch {
+      // Per-call renderer state is an optimization; hostile state degrades safely.
+    }
+  }
+  const details = normalizeSubagentRenderDetails(safeField(result, "details")) ?? {};
+  const isPartial = safeField(options, "isPartial") === true;
+  const expanded = safeField(options, "expanded");
   return {
     render(width: number): string[] {
       const lines: string[] = [];
       if (isPartial) {
-        const candidate = details.subagentProgress;
-        const snap =
-          candidate &&
-          typeof candidate.activity === "string" &&
-          Array.isArray(candidate.tail) &&
-          candidate.tail.every((line) => typeof line === "string")
-            ? candidate
-            : undefined;
         // SECURITY: details.agent originates from the model-supplied subagent_type — sanitize.
         const agent = sanitizeInline(typeof details.agent === "string" ? details.agent : "") || "subagent";
         // A background live view leads with the Task chip + agent type;
         // the foreground view (no taskId) keeps the bare `Agent(<type>)` header.
         const chip = taskChip(details);
-        return runningStatusLines(
-          theme,
-          chip,
-          agent,
-          snap ? { ...details, subagentProgress: snap } : details,
-          width,
-        );
+        return runningStatusLines(theme, chip, agent, details, width);
       }
       // Final result.
       // A successful background dispatch is one task-targeted line. The normal
@@ -757,8 +799,6 @@ export function renderAgentResult(
           );
         } else {
           lines.push(themedFg(theme, "accent", themedBold(theme, "Agent → background")));
-          // SECURITY: the start message embeds the model-supplied agent label — sanitize.
-          pushBodyText(sanitizeProgressText(contentText), width, lines);
         }
         return clampLines(lines, width);
       }
@@ -783,7 +823,7 @@ export function renderAgentResult(
       // collapse keys on the EXPLICIT false. A structural caller that omits the
       // option gets the full record — print/RPC never run renderers, so this
       // only widens compatibility for direct callers.
-      if (outcome && options?.expanded === false) {
+      if (outcome && expanded === false) {
         return collapsedRecordLines(theme, details, outcome, chip, width);
       }
       if (outcome) {
@@ -818,7 +858,7 @@ export function renderAgentResult(
       // appends this line) so a FOREGROUND agent whose final message legitimately
       // ends in a `usage:` line is never mutilated; and on details.usage so a
       // background task with none keeps a genuine trailing `usage:` body line.
-      let displaySource = contentText;
+      let displaySource = boundedBodyText(result);
       if (details.taskId != null && details.usage != null) {
         displaySource = displaySource.replace(/\nusage:[^\n]*$/, "");
       }
@@ -883,11 +923,11 @@ export function renderTaskOutputCall(
   theme: unknown,
   context?: SubagentLifecycleRenderContext,
 ) {
-  const taskId = sanitizeInline(String((args ?? {}).task_id ?? ""));
-  const action = (args ?? {}).wait === false ? "polling" : "awaiting";
+  const taskId = sanitizeInline(boundedString(safeField(args, "task_id")) ?? "");
+  const action = safeField(args, "wait") === false ? "polling" : "awaiting";
   return {
     render(width: number): string[] {
-      if (context?.state?.resultOwned === true) return [];
+      if (safeField(safeField(context, "state"), "resultOwned") === true) return [];
       const chip = taskId ? `TaskOutput(${taskId})` : "TaskOutput";
       return clampLines(
         [themedFg(theme, "toolTitle", themedBold(theme, `${chip} ${action}`))],
@@ -931,7 +971,7 @@ export function renderSettlementRecord(
   return renderAgentResult(
     { content: [{ type: "text", text }], details: normalized },
     // Normalize to an explicit boolean: expanded===false is the collapse key.
-    { expanded: options?.expanded === true, isPartial: false },
+    { expanded: safeField(options, "expanded") === true, isPartial: false },
     theme,
   );
 }

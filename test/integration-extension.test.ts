@@ -1197,6 +1197,16 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(typeof renderer, "no message renderer registered for picc-settlement").toBe(
       "function",
     );
+    const throwingDetails = Object.defineProperty({}, "details", {
+      get(): never {
+        throw new Error("details getter");
+      },
+    });
+    const revokedMessage = Proxy.revocable({}, {});
+    revokedMessage.revoke();
+    expect(() => renderer!(throwingDetails, { expanded: false }, undefined)).not.toThrow();
+    expect(() => renderer!(revokedMessage.proxy, { expanded: false }, undefined)).not.toThrow();
+    expect(renderer!(throwingDetails, { expanded: false }, undefined)).toBeUndefined();
 
     // A coordinator-owned settlement, never awaited.
     const agentId = "agent-77aa88bb99cc";

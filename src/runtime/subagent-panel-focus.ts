@@ -8,8 +8,10 @@ import {
   type PanelViewModel,
 } from "./subagent-panel-model.js";
 import {
+  DETAIL_BANNER_FAILED,
   DETAIL_BANNER_RESUMED,
   DETAIL_BANNER_SETTLED,
+  DETAIL_BANNER_STOPPED,
   DETAIL_BANNER_VANISHED,
   DETAIL_STEER_SENT,
   detailSteerFailed,
@@ -693,8 +695,12 @@ export class SubagentPanelFocusController {
           // there is nothing to send it to anyway.
           d.ui.steerBuffer = "";
         } else if (observed === "settled") {
-          d.ui.banner = DETAIL_BANNER_SETTLED;
-          // The finished layout leads with the final answer — jump to it.
+          d.ui.banner = data.record?.userStopped || data.record?.outcome === "aborted"
+            ? DETAIL_BANNER_STOPPED
+            : data.record?.outcome === "failed"
+              ? DETAIL_BANNER_FAILED
+              : DETAIL_BANNER_SETTLED;
+          // The finished layout leads with outcome-aware output — jump to it.
           d.ui.follow = false;
           d.ui.scrollTop = 0;
         } else {

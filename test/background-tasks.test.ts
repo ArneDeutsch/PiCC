@@ -3199,6 +3199,23 @@ describe("settlement completion record (details + exactly-once)", () => {
     expect(expanded).toContain("usage:");
   });
 
+  it("caps settlement UI final text at a scalar boundary without changing the task result", async () => {
+    const raw = `${"x".repeat(16_383)}😀tail`;
+    const bg = new BackgroundTaskRegistry();
+    const id = bg.start(
+      "agent:worker",
+      Promise.resolve(result({ finalMessage: raw, agentId: AGENT_ID })),
+      undefined,
+      AGENT_ID,
+      "worker",
+    );
+    await bg.wait(id);
+    const notices = drainOnce(bg, armedSubRegistry(AGENT_ID));
+    expect(bg.get(id)?.result).toBe(raw);
+    expect(notices[0]?.details.finalText).not.toMatch(/[\uD800-\uDFFF]/u);
+    expect(notices[0]?.details.finalText).toBe(`${"x".repeat(16_383)}…`);
+  });
+
   it("failed and user-stopped settlements carry error/userStopped; the record renders them", async () => {
     const bg = new BackgroundTaskRegistry();
     const failedId = bg.start(

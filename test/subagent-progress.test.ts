@@ -5,6 +5,8 @@ import {
   DEFAULT_MAX_TAIL_LINES,
   DETAIL_FIELD_MAX_LENGTH,
   DETAIL_LOG_MAX_ENTRIES,
+  TOOL_OUTCOME_BLOCK_INSPECTION_LIMIT,
+  TOOL_OUTCOME_RAW_INSPECTION_LIMIT,
   formatUsageCompact,
   renderProgressText,
   sanitizeDetailScalar,
@@ -72,6 +74,11 @@ describe("sanitizeProgressText (terminal-injection defense)", () => {
 });
 
 describe("sanitizeDetailScalar (bounded malformed-input inspection)", () => {
+  it("rejects isolated surrogate halves while preserving astral scalars", () => {
+    expect(sanitizeDetailScalar(`a\uD800😀\uDC00z`)).toBe("a😀z");
+    expect(sanitizeProgressText(`a\uD800😀\uDC00z`)).toBe(`a\uD800😀\uDC00z`);
+  });
+
   it("does not scan through huge non-rendering prefixes to a sentinel", () => {
     const sentinel = "RAW_INSPECTION_SENTINEL";
     const values = [
@@ -457,6 +464,63 @@ describe("SubagentProgressCondenser structured detail log", () => {
     expect(c.detailLog()).toEqual([
       { kind: "tool-outcome", tool: "Read", detail: "safe", failed: false },
     ]);
+  });
+
+  it("keeps legacy snapshot bytes but makes structured tool outcomes scalar-safe", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({
+      type: "tool_execution_end",
+      toolName: "Read",
+      result: { content: [{ type: "text", text: `a\uD800😀\uDC00z` }] },
+    });
+    expect(c.snapshot().tail).toEqual([`Read: a\uD800😀\uDC00z`]);
+    expect(c.detailLog()).toEqual([
+      { kind: "tool-outcome", tool: "Read", failed: false, detail: "a😀z" },
+    ]);
+  });
+
+  it("stops invisible tool-outcome floods at fixed raw and block inspection ceilings", () => {
+    let textReads = 0;
+    const whitespace = new Proxy(
+      Array.from({ length: TOOL_OUTCOME_BLOCK_INSPECTION_LIMIT + 20 }, () => ({ type: "text", text: "" })),
+      {
+        get(target, key, receiver) {
+          if (typeof key === "string" && /^\d+$/u.test(key)) textReads++;
+          return Reflect.get(target, key, receiver);
+        },
+      },
+    );
+    const byBlocks = new SubagentProgressCondenser();
+    byBlocks.consume({ type: "tool_execution_end", toolName: "Read", result: { content: whitespace } });
+    expect(textReads).toBe(TOOL_OUTCOME_BLOCK_INSPECTION_LIMIT);
+    expect(byBlocks.detailLog()).toEqual([{ kind: "tool-outcome", tool: "Read", failed: false }]);
+
+    const sentinel = "SHOULD_NOT_BE_INSPECTED";
+    const byRaw = new SubagentProgressCondenser();
+    byRaw.consume({
+      type: "tool_execution_end",
+      toolName: "Read",
+      result: `${" \t\r\n".repeat(TOOL_OUTCOME_RAW_INSPECTION_LIMIT)}${sentinel}`,
+    });
+    expect(byRaw.snapshot().tail).toEqual([]);
+    expect(byRaw.detailLog()).toEqual([{ kind: "tool-outcome", tool: "Read", failed: false }]);
+    expect(JSON.stringify(byRaw.detailLog())).not.toContain(sentinel);
+
+    let indexReads = 0;
+    const hostileLength = new Proxy([], {
+      get(target, key, receiver) {
+        if (key === "length") return { valueOf: () => { throw new Error("coerced length"); } };
+        if (typeof key === "string" && /^\d+$/u.test(key)) indexReads++;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const malformedLength = new SubagentProgressCondenser();
+    expect(() => malformedLength.consume({
+      type: "tool_execution_end",
+      toolName: "Read",
+      result: { content: hostileLength },
+    })).not.toThrow();
+    expect(indexReads).toBe(0);
   });
 
   it("consumes a C1 CSI introducer in structured fields", () => {

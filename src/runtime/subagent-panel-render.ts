@@ -6,6 +6,7 @@ import {
   sanitizeDetailScalar,
   sanitizeLine,
   sanitizeProgressText,
+  scalarSafeText,
   type SubagentDetailEntry,
 } from "./subagent-progress.js";
 import { clampLines, pushWrapped, themedFg } from "./render-util.js";
@@ -358,7 +359,9 @@ const DETAIL_STOP_KEY = "ctrl+x";
 // Banners for live state changes while the drill-down is open — the view
 // re-resolves its record each render and narrates the transition instead of
 // crashing or freezing on it.
-export const DETAIL_BANNER_SETTLED = "agent settled while viewing — final answer shown";
+export const DETAIL_BANNER_SETTLED = "agent completed while viewing — final answer shown";
+export const DETAIL_BANNER_FAILED = "agent failed while viewing — partial output shown";
+export const DETAIL_BANNER_STOPPED = "agent stopped while viewing — discarded output shown";
 export const DETAIL_BANNER_RESUMED = "agent resumed while viewing — live view";
 export const DETAIL_BANNER_VANISHED = "agent record is no longer available — esc back";
 
@@ -406,7 +409,7 @@ const DETAIL_MULTILINE_RAW_INSPECTION_LIMIT = SUBAGENT_FINAL_TEXT_CAP + 1;
 function boundedMultiline(value: string, cap: number): string {
   let raw = value.slice(0, DETAIL_MULTILINE_RAW_INSPECTION_LIMIT);
   if (value.length > raw.length && /[\uD800-\uDBFF]$/u.test(raw)) raw = raw.slice(0, -1);
-  const clean = sanitizeProgressText(raw);
+  const clean = scalarSafeText(sanitizeProgressText(raw));
   // Registry-capped values include cap code units plus their existing ellipsis.
   if (clean.length <= cap || (clean.length === cap + 1 && clean.endsWith("…"))) return clean;
   let prefix = clean.slice(0, cap);

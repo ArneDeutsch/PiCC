@@ -21,8 +21,10 @@ import {
 } from "../src/runtime/subagent-panel-model.js";
 import {
   AGENT_COLOR_ANSI,
+  DETAIL_BANNER_FAILED,
   DETAIL_BANNER_RESUMED,
   DETAIL_BANNER_SETTLED,
+  DETAIL_BANNER_STOPPED,
   DETAIL_BANNER_VANISHED,
   DETAIL_FINAL_LABEL,
   DETAIL_FOREGROUND_ALT,
@@ -1176,6 +1178,42 @@ describe("drill-down detail rendering (pure)", () => {
       { width: 20_000 },
     ).lines.join("\n");
     expect(settled).toContain(`${"f".repeat(16_384)}…`);
+  });
+
+  it("keeps prompt/final capture and runtime-injected rendering scalar-safe", () => {
+    const registry = new SubagentRegistry();
+    registry.register({
+      agentId: "agent-a",
+      agentName: "worker",
+      depth: 1,
+      cwd: "/repo",
+      resumable: false,
+      oneShot: false,
+      prompt: `${"p".repeat(4095)}😀tail`,
+    });
+    registry.markSettled("agent-a", {
+      outcome: "completed",
+      finalText: `${"f".repeat(16_383)}😀tail`,
+    });
+    const captured = registry.get("agent-a")!;
+    expect(captured.prompt).not.toMatch(/[\uD800-\uDFFF]/u);
+    expect(captured.finalText).not.toMatch(/[\uD800-\uDFFF]/u);
+
+    const injected = rec({
+      agentId: "agent-b",
+      state: "settled",
+      outcome: "completed",
+      prompt: `before\uD800after\uDC00`,
+      finalText: `final\uD800text\uDC00`,
+    });
+    const rendered = renderSubagentDetail(
+      { record: injected, nowMs: 0 },
+      detailUi({ promptExpanded: true, follow: false }),
+      { width: 200 },
+    ).lines.join("\n");
+    expect(rendered).toContain("beforeafter");
+    expect(rendered).toContain("finaltext");
+    expect(rendered).not.toMatch(/[\uD800-\uDFFF]/u);
   });
 
   it("bounds raw prompt/final inspection even when hostile prefixes render nothing", () => {
@@ -2456,7 +2494,7 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     await invocation.result;
   });
 
-  it("settling while the drill-down is open banners and shows the final answer; resuming banners back to live", async () => {
+  it("settling while the drill-down is open uses completed, failed, and stopped banners", async () => {
     const s = focusSetup();
     reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
     s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
@@ -2474,7 +2512,23 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     expect(settled).toContain(DETAIL_FINAL_LABEL);
     expect(settled).toContain("the settled final answer");
     s.registry.markResuming("agent-a");
+    s.tasks[0]!.status = "running";
     expect(invocation.render(120).join("\n")).toContain(DETAIL_BANNER_RESUMED);
+
+    s.registry.markSettled("agent-a", { outcome: "failed", finalText: "partial" });
+    s.tasks[0]!.status = "failed";
+    const failed = invocation.render(120).join("\n");
+    expect(failed).toContain(DETAIL_BANNER_FAILED);
+    expect(failed).toContain(DETAIL_PARTIAL_LABEL);
+
+    s.registry.markResuming("agent-a");
+    s.tasks[0]!.status = "running";
+    expect(invocation.render(120).join("\n")).toContain(DETAIL_BANNER_RESUMED);
+    s.registry.markSettled("agent-a", { outcome: "aborted", finalText: "discarded" });
+    s.tasks[0]!.status = "stopped";
+    const stopped = invocation.render(120).join("\n");
+    expect(stopped).toContain(DETAIL_BANNER_STOPPED);
+    expect(stopped).toContain(DETAIL_DISCARDED_LABEL);
     invocation.input(ESC);
     invocation.input(ESC);
     await invocation.result;
