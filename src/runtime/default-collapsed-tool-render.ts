@@ -1,0 +1,527 @@
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+
+interface Component { render(width: number): string[] }
+type ToolName = "read" | "write";
+type Data = Record<string, unknown>;
+type NativeCall = (args: unknown, theme: unknown, context: unknown) => Component;
+type NativeResult = (result: unknown, options: unknown, theme: unknown, context: unknown) => Component;
+
+interface Lifecycle {
+  settledObserved: boolean;
+  nativeCall?: Component;
+  nativeResult?: Component;
+}
+interface ArgsSnapshot { path: string; content?: string; offset?: number; limit?: number }
+interface OrdinarySnapshot { path: string; hiddenLines: number; range?: string }
+
+type Snapshot<T = unknown> =
+  | { kind: "complete"; value: T }
+  | { kind: "capped"; budget: "characters" | "depth" | "elements" | "keys" }
+  | { kind: "malformed" };
+interface Budget { chars: number; elements: number; keys: number }
+
+const MAX_KEYS = 256;
+const MAX_CONTAINER_KEYS = 64;
+const MAX_ELEMENTS = 128;
+const MAX_DEPTH = 8;
+const MAX_TEXT_CHARS = 1_000_000;
+const MAX_PATH_CHARS = 16_384;
+const MAX_DISPLAY_LINES = 10_000;
+const MAX_RENDERED_LINES = 20_000;
+const MAX_KEY_HINT_CHARS = 128;
+const REPLACEMENT = "�";
+const lifecycles = new WeakMap<object, Lifecycle>();
+
+function ownDescriptor(value: unknown, key: PropertyKey): PropertyDescriptor | undefined {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
+  try { return Object.getOwnPropertyDescriptor(value, key); } catch { return undefined; }
+}
+function ownData(value: unknown, key: PropertyKey): unknown {
+  const descriptor = ownDescriptor(value, key);
+  return descriptor && "value" in descriptor ? descriptor.value : undefined;
+}
+function ownBoolean(value: unknown, key: PropertyKey): boolean | undefined {
+  const field = ownData(value, key);
+  return typeof field === "boolean" ? field : undefined;
+}
+function safeIsArray(value: unknown): boolean | undefined {
+  try { return Array.isArray(value); } catch { return undefined; }
+}
+function safePrototype(value: object): object | null | undefined {
+  try { return Object.getPrototypeOf(value); } catch { return undefined; }
+}
+function safeKeys(value: object): PropertyKey[] | undefined {
+  try { return Reflect.ownKeys(value); } catch { return undefined; }
+}
+
+function snapshot(value: unknown, budget: Budget, depth = 0): Snapshot {
+  if (value === undefined || value === null || typeof value === "boolean" || typeof value === "number") {
+    return { kind: "complete", value };
+  }
+  if (typeof value === "string") {
+    if (value.length > budget.chars) return { kind: "capped", budget: "characters" };
+    budget.chars -= value.length;
+    return { kind: "complete", value };
+  }
+  if (typeof value !== "object") return { kind: "malformed" };
+  if (depth >= MAX_DEPTH) return { kind: "capped", budget: "depth" };
+  const array = safeIsArray(value);
+  if (array === undefined) return { kind: "malformed" };
+  const prototype = safePrototype(value);
+  if (prototype === undefined || prototype !== (array ? Array.prototype : Object.prototype)) {
+    return { kind: "malformed" };
+  }
+  const keys = safeKeys(value);
+  if (!keys) return { kind: "malformed" };
+  if (keys.length > MAX_CONTAINER_KEYS || keys.length > budget.keys) return { kind: "capped", budget: "keys" };
+  budget.keys -= keys.length;
+
+  if (array) {
+    const length = ownData(value, "length");
+    if (!Number.isSafeInteger(length) || (length as number) < 0) return { kind: "malformed" };
+    if ((length as number) > MAX_ELEMENTS || (length as number) > budget.elements) {
+      return { kind: "capped", budget: "elements" };
+    }
+    if (keys.length !== (length as number) + 1 || !keys.includes("length")) return { kind: "malformed" };
+    budget.elements -= length as number;
+    const copy: unknown[] = [];
+    for (let index = 0; index < (length as number); index++) {
+      const descriptor = ownDescriptor(value, String(index));
+      if (!descriptor || !("value" in descriptor)) return { kind: "malformed" };
+      const child = snapshot(descriptor.value, budget, depth + 1);
+      if (child.kind !== "complete") return child;
+      copy.push(child.value);
+    }
+    return { kind: "complete", value: copy };
+  }
+
+  const copy: Data = Object.create(null) as Data;
+  for (const key of keys) {
+    if (typeof key !== "string") return { kind: "malformed" };
+    const descriptor = ownDescriptor(value, key);
+    if (!descriptor || !("value" in descriptor)) return { kind: "malformed" };
+    const child = snapshot(descriptor.value, budget, depth + 1);
+    if (child.kind !== "complete") return child;
+    Object.defineProperty(copy, key, { value: child.value, enumerable: true, configurable: true, writable: true });
+  }
+  return { kind: "complete", value: copy };
+}
+
+function inspect(value: unknown): Snapshot {
+  return snapshot(value, { chars: MAX_TEXT_CHARS, elements: MAX_ELEMENTS, keys: MAX_KEYS });
+}
+function record(value: unknown): Data | undefined {
+  return value !== null && typeof value === "object" && safeIsArray(value) === false ? value as Data : undefined;
+}
+function exact(value: unknown, expected: readonly string[]): Data | undefined {
+  const data = record(value);
+  if (!data) return undefined;
+  const keys = safeKeys(data);
+  if (!keys || keys.length !== expected.length) return undefined;
+  const allowed = new Set(expected);
+  for (const key of keys) if (typeof key !== "string" || !allowed.has(key)) return undefined;
+  return data;
+}
+function oneExact(value: unknown, shapes: readonly (readonly string[])[]): Data | undefined {
+  for (const shape of shapes) { const found = exact(value, shape); if (found) return found; }
+  return undefined;
+}
+
+function lifecycleFor(context: unknown): Lifecycle | undefined {
+  const state = ownData(context, "state");
+  if (state === null || typeof state !== "object") return undefined;
+  try {
+    let lifecycle = lifecycles.get(state);
+    if (!lifecycle) { lifecycle = { settledObserved: false }; lifecycles.set(state, lifecycle); }
+    return lifecycle;
+  } catch { return undefined; }
+}
+
+function sanitize(value: string, maxChars: number, inline: boolean): string {
+  let source: string;
+  try { source = value.slice(0, maxChars).normalize("NFC"); } catch { return ""; }
+  let output = "";
+  for (let index = 0; index < source.length;) {
+    const code = source.charCodeAt(index);
+    const next = source.charCodeAt(index + 1);
+    const introducerLength = code === 0x1b ? 2 : 1;
+    const kind = code === 0x9b || (code === 0x1b && next === 0x5b) ? "csi"
+      : code === 0x9d || (code === 0x1b && next === 0x5d) ? "osc"
+      : code === 0x90 || code === 0x98 || code === 0x9e || code === 0x9f ||
+        (code === 0x1b && (next === 0x50 || next === 0x58 || next === 0x5e || next === 0x5f)) ? "st"
+      : undefined;
+    if (kind) {
+      index += introducerLength;
+      while (index < source.length) {
+        const current = source.charCodeAt(index);
+        if (kind === "csi" && current >= 0x40 && current <= 0x7e) { index++; break; }
+        if (kind === "osc" && current === 0x07) { index++; break; }
+        if (current === 0x9c) { index++; break; }
+        if (current === 0x1b && source.charCodeAt(index + 1) === 0x5c) { index += 2; break; }
+        index++;
+      }
+      output += REPLACEMENT;
+      continue;
+    }
+    const codePoint = source.codePointAt(index) ?? code;
+    const character = String.fromCodePoint(codePoint);
+    const codeUnits = codePoint > 0xffff ? 2 : 1;
+    if (code === 0x0d) { index++; continue; }
+    if (code === 0x0a) output += inline ? " " : "\n";
+    else if (code === 0x09) output += "   ";
+    else if (code === 0x1b || code < 0x20 || (code >= 0x7f && code <= 0x9f) || /\p{Cf}/u.test(character)) {
+      output += REPLACEMENT;
+    } else output += character;
+    index += codeUnits;
+  }
+  return inline ? output.replace(/\s+/gu, " ").trim() : output;
+}
+
+function sanitizeDto(value: unknown, depth = 0): unknown {
+  if (typeof value === "string") return sanitize(value, MAX_TEXT_CHARS, false);
+  if (value === null || value === undefined || typeof value === "boolean" || typeof value === "number") return value;
+  if (depth >= MAX_DEPTH) return undefined;
+  if (safeIsArray(value) === true) return (value as unknown[]).map((item) => sanitizeDto(item, depth + 1));
+  const data = record(value);
+  if (!data) return undefined;
+  const result: Data = Object.create(null) as Data;
+  const keys = safeKeys(data) ?? [];
+  for (const key of keys) {
+    if (typeof key === "string") Object.defineProperty(result, key, {
+      value: sanitizeDto(ownData(data, key), depth + 1), enumerable: true, configurable: true, writable: true,
+    });
+  }
+  return result;
+}
+function sanitizeArgsDto(value: unknown): Data | undefined {
+  const data = record(value);
+  if (!data) return undefined;
+  const result: Data = Object.create(null) as Data;
+  for (const key of safeKeys(data) ?? []) {
+    if (typeof key !== "string") continue;
+    const field = ownData(data, key);
+    const sanitized = typeof field === "string"
+      ? sanitize(field, key === "content" ? MAX_TEXT_CHARS : MAX_PATH_CHARS, key !== "content")
+      : sanitizeDto(field, 1);
+    Object.defineProperty(result, key, { value: sanitized, enumerable: true, configurable: true, writable: true });
+  }
+  return result;
+}
+
+function safeTheme(theme: unknown, method: "fg" | "bold", args: string[], fallback: string): string {
+  try {
+    const candidate = ownData(theme, method);
+    if (typeof candidate !== "function") return fallback;
+    const rendered = Reflect.apply(candidate, theme, args);
+    return typeof rendered === "string" ? rendered : fallback;
+  } catch { return fallback; }
+}
+function clamp(line: string, width: number): string {
+  if (!Number.isFinite(width) || width <= 0) return "";
+  const columns = Math.floor(width);
+  try { return visibleWidth(line) > columns ? truncateToWidth(line, columns, "…") : line; }
+  catch { return sanitize(line, Math.max(columns, 1), true).slice(0, columns); }
+}
+function keyHint(): string | undefined {
+  try {
+    const keys: unknown = getKeybindings().getKeys("app.tools.expand");
+    if (safeIsArray(keys) !== true || (keys as unknown[]).length === 0 || (keys as unknown[]).length > MAX_ELEMENTS) return undefined;
+    let chars = 0;
+    const displayed: string[] = [];
+    for (let index = 0; index < (keys as unknown[]).length; index++) {
+      const key = ownData(keys, String(index));
+      if (typeof key !== "string" || key.length === 0 || key.length > MAX_KEY_HINT_CHARS) return undefined;
+      const safe = sanitize(key, MAX_KEY_HINT_CHARS, true);
+      chars += safe.length;
+      if (!safe || chars > MAX_KEY_HINT_CHARS) return undefined;
+      displayed.push(safe);
+    }
+    return displayed.join("/");
+  } catch { return undefined; }
+}
+
+function argsFrom(value: unknown, toolName: ToolName): ArgsSnapshot | undefined {
+  const shapes = toolName === "write" ? [["path", "content"]] as const
+    : [["path"], ["path", "offset"], ["path", "limit"], ["path", "offset", "limit"]] as const;
+  const data = oneExact(value, shapes);
+  if (!data || typeof data.path !== "string" || data.path.length > MAX_PATH_CHARS || !sanitize(data.path, MAX_PATH_CHARS, true)) return undefined;
+  if (toolName === "write") {
+    return typeof data.content === "string" ? { path: data.path, content: data.content } : undefined;
+  }
+  for (const key of ["offset", "limit"] as const) {
+    const field = data[key];
+    if (field !== undefined && (!Number.isSafeInteger(field) || (field as number) < 1)) return undefined;
+  }
+  return { path: data.path, ...(typeof data.offset === "number" ? { offset: data.offset } : {}), ...(typeof data.limit === "number" ? { limit: data.limit } : {}) };
+}
+function resultEnvelope(value: unknown): Data | undefined {
+  return oneExact(value, [["content", "details"], ["content", "details", "isError"]]);
+}
+function contentBlocks(value: unknown): unknown[] | undefined {
+  return safeIsArray(value) === true ? value as unknown[] : undefined;
+}
+function textBlock(value: unknown): string | undefined {
+  const data = exact(value, ["type", "text"]);
+  return data?.type === "text" && typeof data.text === "string" ? data.text : undefined;
+}
+function logicalLineCount(value: string): Snapshot<number> {
+  let currentLine = 1;
+  let retainedLines = 0;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code === 0x0d) continue;
+    if (code === 0x0a) {
+      currentLine++;
+      continue;
+    }
+    retainedLines = currentLine;
+    if (retainedLines > MAX_DISPLAY_LINES) return { kind: "capped", budget: "elements" };
+  }
+  return { kind: "complete", value: retainedLines };
+}
+function hasReadNotice(text: string): boolean {
+  return /(?:^|\n)\[(?:Showing lines |Line \d+ is |\d+ more lines in file\.|PiCC clipped |Truncated:|First line exceeds)/u.test(text);
+}
+function ordinary(toolName: ToolName, args: ArgsSnapshot, result: unknown): Snapshot<OrdinarySnapshot> {
+  const envelope = resultEnvelope(result);
+  if (!envelope || ("isError" in envelope && envelope.isError !== false) || envelope.details !== undefined) return { kind: "malformed" };
+  const blocks = contentBlocks(envelope.content);
+  if (!blocks || blocks.length !== 1) return { kind: "malformed" };
+  const text = textBlock(blocks[0]);
+  if (text === undefined) return { kind: "malformed" };
+  if (toolName === "read") {
+    if (hasReadNotice(text) || text.startsWith("Read image file [")) return { kind: "malformed" };
+    const count = logicalLineCount(text);
+    return count.kind === "complete" ? {
+      kind: "complete", value: {
+        path: args.path, hiddenLines: count.value,
+        ...((args.offset !== undefined || args.limit !== undefined) ? {
+          range: `:${args.offset ?? 1}${args.limit === undefined ? "" : `-${(args.offset ?? 1) + args.limit - 1}`}`,
+        } : {}),
+      },
+    } : count;
+  }
+  if (args.content === undefined || text !== `Successfully wrote ${args.content.length} bytes to ${args.path}`) return { kind: "malformed" };
+  const count = logicalLineCount(args.content);
+  return count.kind === "complete" ? { kind: "complete", value: { path: args.path, hiddenLines: count.value } } : count;
+}
+
+function recognizedContent(value: unknown): boolean {
+  const blocks = contentBlocks(value);
+  if (!blocks || blocks.length === 0) return false;
+  for (const block of blocks) {
+    const text = exact(block, ["type", "text"]);
+    if (text && text.type === "text" && typeof text.text === "string") continue;
+    const image = exact(block, ["type", "data", "mimeType"]);
+    if (!image || image.type !== "image" || typeof image.data !== "string" || typeof image.mimeType !== "string") return false;
+  }
+  return true;
+}
+function recognizedReadDetails(value: unknown): boolean {
+  if (value === undefined) return true;
+  for (const key of ["binary", "notebookError", "truncated"] as const) {
+    const detail = exact(value, [key]);
+    if (detail && typeof detail[key] === "boolean") return true;
+  }
+  const details = exact(value, ["truncation"]);
+  const truncation = details && exact(details.truncation, [
+    "content", "truncated", "truncatedBy", "totalLines", "totalBytes", "outputLines", "outputBytes",
+    "lastLinePartial", "firstLineExceedsLimit", "maxLines", "maxBytes",
+  ]);
+  if (!truncation || typeof truncation.content !== "string" || typeof truncation.truncated !== "boolean" ||
+    !["lines", "bytes", null].includes(truncation.truncatedBy as never) ||
+    typeof truncation.lastLinePartial !== "boolean" || typeof truncation.firstLineExceedsLimit !== "boolean") return false;
+  return ["totalLines", "totalBytes", "outputLines", "outputBytes", "maxLines", "maxBytes"]
+    .every((key) => Number.isSafeInteger(truncation[key]) && (truncation[key] as number) >= 0);
+}
+function delegable(toolName: ToolName, args: ArgsSnapshot, result: unknown): { args: Data; result: Data } | undefined {
+  const envelope = resultEnvelope(result);
+  if (!envelope || !recognizedContent(envelope.content) ||
+    (toolName === "write" ? envelope.details !== undefined : !recognizedReadDetails(envelope.details))) return undefined;
+  const rawArgs: Data = toolName === "write"
+    ? { path: args.path, content: args.content }
+    : { path: args.path, ...(args.offset !== undefined ? { offset: args.offset } : {}), ...(args.limit !== undefined ? { limit: args.limit } : {}) };
+  return { args: sanitizeArgsDto(rawArgs) as Data, result: sanitizeDto(result) as Data };
+}
+function failure(snapshotResult: Snapshot): string {
+  return snapshotResult.kind === "capped"
+    ? `Detail inspection limit reached (${snapshotResult.budget}); remaining detail uninspected`
+    : "Unfamiliar result";
+}
+function argsFailure(snapshotResult: Snapshot): string {
+  if (snapshotResult.kind === "capped") return failure(snapshotResult);
+  if (snapshotResult.kind === "complete") {
+    const data = record(snapshotResult.value);
+    if ((typeof data?.path === "string" && data.path.length > MAX_PATH_CHARS) ||
+      (typeof data?.content === "string" && data.content.length > MAX_TEXT_CHARS)) {
+      return failure({ kind: "capped", budget: "characters" });
+    }
+  }
+  return "Unfamiliar arguments";
+}
+
+function nativeContext(context: unknown, args: Data, lastComponent: Component | undefined, expanded: boolean): Data {
+  const state = ownData(context, "state");
+  return {
+    args, toolCallId: typeof ownData(context, "toolCallId") === "string" ? ownData(context, "toolCallId") : "display",
+    invalidate: typeof ownData(context, "invalidate") === "function" ? ownData(context, "invalidate") : () => {},
+    lastComponent, state: state && typeof state === "object" ? state : {},
+    cwd: typeof ownData(context, "cwd") === "string" ? sanitize(ownData(context, "cwd") as string, MAX_PATH_CHARS, true) : "",
+    executionStarted: ownBoolean(context, "executionStarted") === true,
+    argsComplete: ownBoolean(context, "argsComplete") === true,
+    isPartial: ownBoolean(context, "isPartial") === true,
+    expanded, showImages: ownBoolean(context, "showImages") === true,
+    isError: ownBoolean(context, "isError") === true,
+  };
+}
+function summaryComponent(toolName: ToolName, snapshotValue: OrdinarySnapshot, hint: string, theme: unknown): Component {
+  const identity = toolName === "read" ? "Read" : "Write";
+  const path = sanitize(snapshotValue.path, MAX_PATH_CHARS, true);
+  const range = sanitize(snapshotValue.range ?? "", MAX_PATH_CHARS, true);
+  const count = `${snapshotValue.hiddenLines} ${snapshotValue.hiddenLines === 1 ? "line" : "lines"} hidden`;
+  return { render(width: number): string[] {
+    if (!Number.isFinite(width) || width <= 0) return [""];
+    const columns = Math.floor(width);
+    const title = safeTheme(theme, "fg", ["toolTitle", safeTheme(theme, "bold", [identity], identity)], identity);
+    const status = safeTheme(theme, "fg", ["muted", ` · ${count}`], ` · ${count}`);
+    const expansion = safeTheme(theme, "fg", ["dim", ` · ${hint} to expand`], ` · ${hint} to expand`);
+    let line = clamp(title, columns);
+    try {
+      const identityWidth = visibleWidth(line);
+      const statusWidth = visibleWidth(status);
+      const available = Math.max(0, columns - identityWidth - 1);
+      const reserveStatus = available >= statusWidth + 2;
+      const targetRoom = Math.max(0, available - (reserveStatus ? statusWidth : 0));
+      if (targetRoom > 0) {
+        const rangeWidth = visibleWidth(range);
+        let targetText: string;
+        if (range && rangeWidth <= targetRoom) {
+          const pathRoom = targetRoom - rangeWidth;
+          const pathText = pathRoom > 0
+            ? (visibleWidth(path) > pathRoom ? truncateToWidth(path, pathRoom, "…") : path)
+            : "";
+          targetText = pathText + range;
+        } else {
+          targetText = visibleWidth(path) > targetRoom ? truncateToWidth(path, targetRoom, "…") : path;
+        }
+        const target = safeTheme(theme, "fg", ["accent", targetText], targetText);
+        line += ` ${target}`;
+      }
+      if (visibleWidth(line + status) <= columns) line += status;
+      if (visibleWidth(line + expansion) <= columns) line += expansion;
+    } catch { return [clamp(line, columns)]; }
+    return [clamp(line, columns)];
+  } };
+}
+function statusComponent(text: string, theme: unknown): Component {
+  const safe = sanitize(text, 512, true) || "Unfamiliar result";
+  return { render: (width) => [clamp(safeTheme(theme, "fg", ["warning", safe], safe), width)] };
+}
+function emptyComponent(): Component { return { render: () => [] }; }
+function combined(components: readonly Component[], theme: unknown): Component {
+  return { render(width: number): string[] {
+    const lines: string[] = [];
+    try {
+      for (const component of components) {
+        const rendered = component.render(width);
+        if (safeIsArray(rendered) !== true) throw new TypeError("renderer returned non-lines");
+        for (let index = 0; index < rendered.length; index++) {
+          if (lines.length >= MAX_RENDERED_LINES) {
+            lines.push(clamp("Detail inspection limit reached (rendered lines); remaining detail omitted", width));
+            return lines;
+          }
+          const line = ownData(rendered, String(index));
+          lines.push(clamp(typeof line === "string" ? line : "Renderer failed", width));
+        }
+      }
+      return lines;
+    } catch { return statusComponent("Renderer failed", theme).render(width); }
+  } };
+}
+
+/** Decorate recognized main-session tools with a fail-open settled collapse lifecycle. */
+export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool: T): T {
+  let descriptors: PropertyDescriptorMap;
+  try {
+    const name = Object.getOwnPropertyDescriptor(tool, "name");
+    const call = Object.getOwnPropertyDescriptor(tool, "renderCall");
+    const result = Object.getOwnPropertyDescriptor(tool, "renderResult");
+    if (!name || !("value" in name) || (name.value !== "read" && name.value !== "write") ||
+      !call || !("value" in call) || typeof call.value !== "function" ||
+      !result || !("value" in result) || typeof result.value !== "function") return tool;
+    descriptors = Object.getOwnPropertyDescriptors(tool);
+  } catch { return tool; }
+  const toolName = (descriptors.name as PropertyDescriptor & { value: ToolName }).value;
+  const nativeCall = (descriptors.renderCall as PropertyDescriptor & { value: NativeCall }).value;
+  const nativeResult = (descriptors.renderResult as PropertyDescriptor & { value: NativeResult }).value;
+  delete descriptors.renderCall;
+  delete descriptors.renderResult;
+  let decorated: T;
+  try { decorated = Object.defineProperties({}, descriptors) as T; } catch { return tool; }
+
+  Object.defineProperties(decorated, {
+    renderCall: { configurable: true, enumerable: true, writable: true, value(argsValue: unknown, theme: unknown, context: unknown): Component {
+      const lifecycle = lifecycleFor(context);
+      const argsInspection = inspect(argsValue);
+      const settled = ownBoolean(context, "isPartial") === false;
+      const args = argsInspection.kind === "complete" ? argsFrom(argsInspection.value, toolName) : undefined;
+      const displayable = argsInspection.kind === "complete" && record(argsInspection.value);
+      if (!lifecycle || !displayable || (settled && !args)) return statusComponent(argsFailure(argsInspection), theme);
+      const hint = keyHint();
+      const forceExpanded = settled && !hint;
+      const dto = sanitizeArgsDto(argsInspection.value) as Data;
+      try {
+        const component = nativeCall(dto, theme, nativeContext(context, dto, lifecycle.nativeCall, forceExpanded || ownBoolean(context, "expanded") === true));
+        lifecycle.nativeCall = component;
+        if (settled) lifecycle.settledObserved = true;
+        return settled && hint ? emptyComponent() : component;
+      } catch { return statusComponent("Renderer failed", theme); }
+    } },
+    renderResult: { configurable: true, enumerable: true, writable: true, value(resultValue: unknown, options: unknown, theme: unknown, context: unknown): Component {
+      const lifecycle = lifecycleFor(context);
+      const argsInspection = inspect(ownData(context, "args"));
+      const resultInspection = inspect(resultValue);
+      const args = argsInspection.kind === "complete" ? argsFrom(argsInspection.value, toolName) : undefined;
+      if (!lifecycle || !args || argsInspection.kind !== "complete") return statusComponent(argsFailure(argsInspection), theme);
+      if (resultInspection.kind !== "complete") return statusComponent(failure(resultInspection), theme);
+      const hint = keyHint();
+      const settled = ownBoolean(options, "isPartial") === false && ownBoolean(context, "isError") !== undefined;
+      const expanded = ownBoolean(options, "expanded") === true;
+      if (!settled) {
+        const resultRecord = record(resultInspection.value);
+        if (!resultRecord) return statusComponent("Unfamiliar result", theme);
+        const displayArgs = sanitizeArgsDto(argsInspection.value) as Data;
+        const displayResult = sanitizeDto(resultRecord) as Data;
+        try {
+          const component = nativeResult(displayResult, { expanded, isPartial: true }, theme,
+            nativeContext(context, displayArgs, lifecycle.nativeResult, expanded));
+          lifecycle.nativeResult = component;
+          return component;
+        } catch { return statusComponent("Renderer failed", theme); }
+      }
+      const safe = delegable(toolName, args, resultInspection.value);
+      if (!safe) return statusComponent("Unfamiliar result", theme);
+      const owned = lifecycle.settledObserved && settled && Boolean(hint);
+      const isOrdinary = ownBoolean(context, "isError") === false ? ordinary(toolName, args, resultInspection.value) : { kind: "malformed" } as const;
+      if (isOrdinary.kind === "capped") return statusComponent(failure(isOrdinary), theme);
+
+      if (owned && isOrdinary.kind === "complete" && !expanded) return summaryComponent(toolName, isOrdinary.value, hint as string, theme);
+      const forceExpanded = !hint && settled;
+      try {
+        const resultComponent = nativeResult(
+          safe.result,
+          { expanded: forceExpanded || expanded, isPartial: !settled },
+          theme,
+          nativeContext(context, safe.args, lifecycle.nativeResult, forceExpanded || expanded),
+        );
+        lifecycle.nativeResult = resultComponent;
+        if (!owned) return resultComponent;
+        if (!lifecycle.nativeCall) return statusComponent("Unfamiliar result", theme);
+        if (isOrdinary.kind === "complete") return combined([lifecycle.nativeCall, resultComponent], theme);
+        return combined([statusComponent("Elaborated result", theme), lifecycle.nativeCall, resultComponent], theme);
+      } catch { return statusComponent("Renderer failed", theme); }
+    } },
+  });
+  return decorated;
+}

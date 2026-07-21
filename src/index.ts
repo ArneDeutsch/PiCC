@@ -70,6 +70,7 @@ import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs
 import { wrapForSelfShell } from "./runtime/tool-shell.js";
 import { withCompactSearchRendering } from "./runtime/search-tool-render.js";
 import { withRoutineToolRendering } from "./runtime/routine-tool-render.js";
+import { withDefaultCollapsedToolRendering } from "./runtime/default-collapsed-tool-render.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
@@ -223,6 +224,14 @@ export interface PiccTestSeam {
    * production still neither awaits nor changes the activities' error handling.
    */
   onInitializationSettled?: (completion: Promise<void>) => void;
+  /**
+   * TEST-ONLY definitions appended to the first, Claude-named main-session
+   * registration loop. This distinguishes that loop from the later built-in
+   * override loop without source inspection. Like the rest of this seam, the
+   * definitions are reachable only through the in-process second argument;
+   * project settings, environment variables, and files cannot supply them.
+   */
+  claudeNamedToolDefinitions?: readonly ToolDefinition[];
   /**
    * TEST-ONLY synchronous barrier immediately before the production settlement
    * sender's final validity check. It can model collection after selection; no
@@ -1066,6 +1075,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     createTaskOutputTool(backgroundTasks) as Record<string, unknown>,
     createTaskStopTool(backgroundTasks) as Record<string, unknown>,
   );
+  for (const definition of testSeam?.claudeNamedToolDefinitions ?? []) {
+    claudeNamedTools.push(definition as unknown as Record<string, unknown>);
+  }
 
   for (const tool of claudeNamedTools) {
     try {
@@ -1080,8 +1092,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         : tool;
       const routineRendered = withRoutineToolRendering(
         mainSessionTool as unknown as ToolDefinition,
-      ) as unknown as Record<string, unknown>;
-      pi.registerTool(wrapForSelfShell(routineRendered));
+      );
+      const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
+      pi.registerTool(wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>));
     } catch (err) {
       console.error(`PiCC: failed to register tool: ${(err as Error).message}`);
     }
@@ -1146,8 +1159,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       for (const { def } of builtins) {
         const routineRendered = withRoutineToolRendering(
           def as unknown as ToolDefinition,
-        ) as unknown as Record<string, unknown>;
-        pi.registerTool(wrapForSelfShell(routineRendered));
+        );
+        const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
+        pi.registerTool(wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>));
       }
       // `!` user-bash commands also get the pinned Git Bash (and the effective cwd).
       if (shellPath && typeof sdk.createLocalBashOperations === "function") {

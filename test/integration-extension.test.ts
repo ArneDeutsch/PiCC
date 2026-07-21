@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import picc, { type PiccTestSeam } from "../src/index.js";
 import type { BackgroundResultLike } from "../src/runtime/background-tasks.js";
+import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { resolveGitBashPath } from "../src/engine/shell-inject.js";
 import { RECORD_EXPAND_HINT } from "../src/runtime/subagent-render.js";
 import { formatElapsed } from "../src/runtime/subagent-panel-render.js";
@@ -143,6 +144,90 @@ describe("tool surface registration", () => {
     const stripBg = (l: string) => l.split(marker).join("").split(`${ESC}[49m`).join("");
     expect(stripBg(out[0]!).trim().length).toBeGreaterThan(0);
     expect(stripBg(out[out.length - 1]!).trim().length).toBeGreaterThan(0);
+  });
+
+  it("orders collapse in both main registration loops and never installs it in subagents", async () => {
+    const injectedPi = fakePi();
+    const injectedSource = {
+      name: "read", label: "injected-read", description: "first-loop probe", parameters: {}, execute() {},
+      renderCall: () => ({ render: () => ["INJECTED NATIVE CALL"] }),
+      renderResult: () => ({ render: () => ["INJECTED NATIVE RESULT"] }),
+    };
+    picc(injectedPi.api as never, {
+      claudeNamedToolDefinitions: [injectedSource as never],
+      onInitializationSettled: injectedPi.captureInitialization,
+    });
+    const firstLoopRead = injectedPi.tools.get("read");
+    expect(firstLoopRead.label).toBe("injected-read");
+    expect(firstLoopRead.renderShell).toBe("self");
+    const injectedArgs = { path: "first-loop.txt" };
+    const injectedResult = { content: [{ type: "text", text: "first\nsecond" }], details: undefined };
+    const injectedState = {};
+    const injectedTheme = { fg: (_slot: string, text: string) => text, bold: (text: string) => text, bg: (_slot: string, text: string) => text };
+    const injectedBindings = getKeybindings();
+    setKeybindings(new KeybindingsManager({ ...TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } }));
+    try {
+      expect(firstLoopRead.renderCall(injectedArgs, injectedTheme,
+        { args: injectedArgs, state: injectedState, isPartial: false, isError: false }).render(80)).toEqual([]);
+      const collapsed = firstLoopRead.renderResult(injectedResult, { expanded: false, isPartial: false }, injectedTheme,
+        { args: injectedArgs, state: injectedState, isPartial: false, isError: false }).render(80).join("\n");
+      expect(collapsed).toContain("Read first-loop.txt · 2 lines hidden");
+      expect(collapsed).not.toContain("INJECTED NATIVE");
+      const expanded = firstLoopRead.renderResult(injectedResult, { expanded: true, isPartial: false }, injectedTheme,
+        { args: injectedArgs, state: injectedState, isPartial: false, isError: false, expanded: true }).render(80).join("\n");
+      expect(expanded).toContain("INJECTED NATIVE CALL");
+      expect(expanded).toContain("INJECTED NATIVE RESULT");
+    } finally { setKeybindings(injectedBindings); }
+    await injectedPi.waitForInitialization();
+
+    // The asynchronously registered stock definition distinguishes the second loop.
+    const mainRead = pi.tools.get("read");
+    const args = { path: "offline-collapse.txt" };
+    const result = { content: [{ type: "text", text: "first\nsecond" }], details: undefined };
+    const state = {};
+    const mainTheme = { fg: (_slot: string, text: string) => text, bold: (text: string) => text, bg: (_slot: string, text: string) => text };
+    const previousBindings = getKeybindings();
+    setKeybindings(new KeybindingsManager({ ...TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } }));
+    try {
+      expect(mainRead.renderCall(args, mainTheme, { args, state, isPartial: false, isError: false }).render(80)).toEqual([]);
+      const row = mainRead.renderResult(result, { expanded: false, isPartial: false }, mainTheme,
+        { args, state, isPartial: false, isError: false }).render(80).join("\n");
+      expect(row).toContain("Read");
+      expect(row).toContain("2 lines hidden");
+      expect(mainRead.renderShell).toBe("self");
+      expect(pi.tools.get("Grep").renderCall({ pattern: "needle" }, undefined, { state: {} }).render(80)).toEqual([]);
+    } finally { setKeybindings(previousBindings); }
+
+    const created: Array<Record<string, unknown>> = [];
+    const handle = fakeSdk({ replies: ["done"], created });
+    const fresh = fakePi();
+    let internals!: Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
+    picc(fresh.api as never, {
+      onWired: (value) => { internals = value; },
+      onInitializationSettled: fresh.captureInitialization,
+    });
+    await fresh.waitForInitialization();
+    await fresh.waitForTools(["read"]);
+    internals.subagentRuntime.setSdkForTest(handle.sdk);
+    await fresh.tools.get("Agent").execute("main-only", {
+      subagent_type: "reviewer", prompt: "inspect registration", run_in_background: false,
+    });
+    const subTools = created[0]?.customTools as Array<Record<string, unknown>>;
+    const subRead = subTools.find((tool) => tool.name === "read") as Record<string, any>;
+    expect(subRead).toBeTruthy();
+    const subTheme = { fg: (_slot: string, text: string) => text, bold: (text: string) => text };
+    const subState = {};
+    const beforeSubBindings = getKeybindings();
+    setKeybindings(new KeybindingsManager({ ...TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } }));
+    try {
+      subRead.renderCall(args, subTheme, { args, state: subState, isPartial: false, expanded: false, cwd: dir });
+      const subResult = subRead.renderResult(result, { expanded: false, isPartial: false }, subTheme,
+        { args, state: subState, isPartial: false, isError: false, expanded: false, cwd: dir }).render(80).join("\n");
+      expect(subResult).not.toContain("lines hidden");
+    } finally { setKeybindings(beforeSubBindings); }
   });
 
   it("de-pads every Claude-named tool row: renderShell:'self' across the registration loop", () => {
