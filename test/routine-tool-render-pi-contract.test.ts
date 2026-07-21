@@ -35,9 +35,33 @@ const cases = [
     invocation: "contract query",
     hidden: "CANONICAL SEARCH TITLE",
   },
+  {
+    name: "Skill" as const,
+    args: { name: "deploy", arguments: "contract staging" },
+    ordinary: {
+      content: [{ type: "text", text: "CANONICAL SKILL INSTRUCTION SENTINEL" }],
+      details: { skill: "deploy" },
+      isError: false,
+    },
+    invocation: "deploy — contract staging",
+    hidden: "CANONICAL SKILL INSTRUCTION SENTINEL",
+  },
+  {
+    name: "SlashCommand" as const,
+    args: { command: "/deploy contract production" },
+    ordinary: {
+      content: [{ type: "text", text: "CANONICAL SLASH INSTRUCTION SENTINEL" }],
+      details: { skill: "deploy" },
+      isError: false,
+    },
+    invocation: "/deploy contract production",
+    hidden: "CANONICAL SLASH INSTRUCTION SENTINEL",
+  },
 ];
 
-function definition(name: "WebFetch" | "WebSearch"): Record<string, unknown> {
+type RoutineName = (typeof cases)[number]["name"];
+
+function definition(name: RoutineName): Record<string, unknown> {
   return wrapForSelfShell(withRoutineToolRendering({ name } as never));
 }
 
@@ -81,7 +105,31 @@ describe("real Pi routine rendering composition", () => {
     expect(malformed).toContain(`${entry.name} unfamiliar result`);
   });
 
-  async function htmlHarness(entry: (typeof cases)[number]) {
+  it.each(cases.filter((entry) => entry.name === "Skill" || entry.name === "SlashCommand"))("keeps mismatched $name activation identity visible in the interactive TUI", async (entry) => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    const component = new sdk.ToolExecutionComponent(
+      entry.name,
+      `mismatch-${entry.name}`,
+      entry.args,
+      {},
+      definition(entry.name),
+      { requestRender() {} },
+      process.cwd().replace(/\\/g, "/"),
+    );
+    const visibleBody = `VISIBLE ${entry.name} IDENTITY MISMATCH`;
+    component.updateResult({
+      content: [{ type: "text", text: visibleBody }],
+      details: { skill: "different-skill" },
+      isError: false,
+    }, false);
+    for (const expanded of [false, true]) {
+      component.setExpanded(expanded);
+      expect((component.render(100) as string[]).join("\n")).toContain(visibleBody);
+    }
+  });
+
+  async function htmlHarness(entry: (typeof cases)[number], themeOverride?: unknown) {
     const sdk = await import("@earendil-works/pi-coding-agent") as any;
     sdk.initTheme();
     const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
@@ -93,7 +141,7 @@ describe("real Pi routine rendering composition", () => {
     const themeModule = await import(`${piDist}/dist/modes/interactive/theme/theme.js`) as any;
     const renderer = htmlModule.createToolHtmlRenderer({
       getToolDefinition: (name: string) => name === entry.name ? definition(entry.name) : undefined,
-      theme: themeModule.theme,
+      theme: themeOverride ?? themeModule.theme,
       cwd: process.cwd(),
       width: 80,
     });
@@ -130,6 +178,42 @@ describe("real Pi routine rendering composition", () => {
       );
       expect(visible?.expanded).toContain(text);
     }
+  });
+
+  it.each(cases.filter((entry) => entry.name === "Skill" || entry.name === "SlashCommand"))("keeps mismatched $name activation identity visible in HTML", async (entry) => {
+    const { renderer } = await htmlHarness(entry);
+    const id = `html-mismatch-${entry.name}`;
+    const visibleBody = `VISIBLE ${entry.name} HTML IDENTITY MISMATCH`;
+    renderer.renderCall(id, entry.name, entry.args);
+    const rendered = renderer.renderResult(
+      id,
+      entry.name,
+      [{ type: "text", text: visibleBody }],
+      { skill: "different-skill" },
+      false,
+    );
+    expect(rendered?.expanded).toContain(visibleBody);
+    expect(rendered?.expanded).not.toContain(entry.invocation);
+  });
+
+  it.each(cases.filter((entry) => entry.name === "Skill" || entry.name === "SlashCommand"))("does not expose ordinary $name bodies when HTML renderer styling degrades", async (entry) => {
+    const hostileTheme = {
+      bg: (_slot: string, text: string) => text,
+      fg() { throw new Error("foreground unavailable"); },
+      bold() { throw new Error("bold unavailable"); },
+    };
+    const { renderer } = await htmlHarness(entry, hostileTheme);
+    const id = `html-degraded-${entry.name}`;
+    expect(renderer.renderCall(id, entry.name, entry.args)).toBe("");
+    const rendered = renderer.renderResult(
+      id,
+      entry.name,
+      entry.ordinary.content,
+      entry.ordinary.details,
+      false,
+    );
+    expect(rendered?.expanded).toContain(entry.invocation);
+    expect(rendered?.expanded).not.toContain(entry.hidden);
   });
 
   it.each(cases)("retains canonical $name session content but excludes it from complete rendered HTML", async (entry) => {

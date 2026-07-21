@@ -11,13 +11,15 @@ interface ResultShape {
 }
 
 type WebToolName = "WebFetch" | "WebSearch";
+type ActivationToolName = "Skill" | "SlashCommand";
+type RoutineToolName = WebToolName | ActivationToolName;
 type DataSnapshot = Record<string, unknown>;
 
 const MAX_FAIL_OPEN_CHARS = 4_096;
 const MAX_FAIL_OPEN_LINES = 16;
 const LINE_BREAK_RE = /\r\n?|\n|\u2028|\u2029/gu;
 
-function unfamiliarFormatLabel(toolName: WebToolName): string {
+function unfamiliarFormatLabel(toolName: RoutineToolName): string {
   return `Unfamiliar ${toolName} presentation format`;
 }
 
@@ -132,10 +134,9 @@ function clamp(line: string, width: number): string {
   }
 }
 
-function commandComponent(toolName: WebToolName, invocation: string, theme: unknown): Component {
-  const plain = toolName === "WebSearch"
-    ? `${toolName} “${invocation}”`
-    : `${toolName} ${invocation}`;
+function commandComponent(toolName: RoutineToolName, invocation: string, theme: unknown): Component {
+  const displayedInvocation = toolName === "WebSearch" ? `“${invocation}”` : invocation;
+  const plain = `${toolName} ${displayedInvocation}`;
   return {
     render(width: number): string[] {
       try {
@@ -148,8 +149,8 @@ function commandComponent(toolName: WebToolName, invocation: string, theme: unkn
         const argument = safeThemeMethod(
           theme,
           "fg",
-          ["accent", toolName === "WebSearch" ? `“${invocation}”` : invocation],
-          toolName === "WebSearch" ? `“${invocation}”` : invocation,
+          ["accent", displayedInvocation],
+          displayedInvocation,
         );
         const styled = `${title} ${argument}`;
         try {
@@ -167,7 +168,7 @@ function commandComponent(toolName: WebToolName, invocation: string, theme: unkn
 
 function boundedCanonicalText(
   result: unknown,
-  toolName: WebToolName,
+  toolName: RoutineToolName,
   reason?: string,
 ): string[] {
   const label = unfamiliarFormatLabel(toolName);
@@ -207,7 +208,7 @@ function boundedCanonicalText(
 
 function failOpenComponent(
   result: unknown,
-  toolName: WebToolName,
+  toolName: RoutineToolName,
   theme: unknown,
   reason?: string,
 ): Component {
@@ -270,7 +271,7 @@ function validSearch(args: DataSnapshot, details: DataSnapshot): boolean {
     typeof details.truncated === "boolean";
 }
 
-function recognizeSuccess(
+function recognizeWebSuccess(
   toolName: WebToolName,
   result: unknown,
   options: unknown,
@@ -316,21 +317,85 @@ function recognizeSuccess(
   return invocation.length > 0 ? invocation : undefined;
 }
 
-function emptyInvocationReason(toolName: WebToolName, context: unknown): string | undefined {
+function emptyInvocationReason(toolName: RoutineToolName, context: unknown): string | undefined {
   const args = ownData(context, "args");
-  const invocation = ownData(args, toolName === "WebFetch" ? "url" : "query");
+  const invocation = ownData(
+    args,
+    toolName === "WebFetch" ? "url" : toolName === "WebSearch" ? "query" :
+      toolName === "Skill" ? "name" : "command",
+  );
   return typeof invocation === "string" && sanitizeText(invocation, true).length === 0
     ? unfamiliarFormatLabel(toolName)
     : undefined;
 }
 
-function webToolName(tool: unknown): WebToolName | undefined {
+function activationIdentityMatches(requestedName: string, canonicalName: string): boolean {
+  return requestedName === canonicalName ||
+    (!requestedName.includes(":") && canonicalName.endsWith(`:${requestedName}`));
+}
+
+function slashCommandName(command: string): string | undefined {
+  let trimmed: string;
+  try {
+    trimmed = command.trim();
+  } catch {
+    return undefined;
+  }
+  const match = /^\/?([A-Za-z0-9][\w-]*(?::[\w-]+)*)(?=[ \t]|$)/.exec(trimmed);
+  return match?.[1];
+}
+
+function recognizeActivationSuccess(
+  toolName: ActivationToolName,
+  result: unknown,
+  options: unknown,
+  context: unknown,
+): string | undefined {
+  if (ownData(options, "isPartial") !== false || ownData(context, "isError") !== false) {
+    return undefined;
+  }
+  const resultSnapshot = plainOwnData(result, ["content", "details"]) ??
+    plainOwnData(result, ["content", "details", "isError"]);
+  if (
+    !resultSnapshot ||
+    ("isError" in resultSnapshot && resultSnapshot.isError !== false) ||
+    !oneTextContent(resultSnapshot.content)
+  ) return undefined;
+  const details = plainOwnData(resultSnapshot.details, ["skill"]);
+  if (!details || typeof details.skill !== "string" || details.skill.length === 0) return undefined;
+
+  const argsValue = ownData(context, "args");
+  if (toolName === "SlashCommand") {
+    const args = plainOwnData(argsValue, ["command"]);
+    if (!args || typeof args.command !== "string") return undefined;
+    const requestedName = slashCommandName(args.command);
+    if (!requestedName || !activationIdentityMatches(requestedName, details.skill)) return undefined;
+    const command = sanitizeText(args.command, true);
+    return command.length > 0 ? command : undefined;
+  }
+
+  const args = plainOwnData(argsValue, ["name"]) ??
+    plainOwnData(argsValue, ["name", "arguments"]);
+  if (
+    !args ||
+    typeof args.name !== "string" ||
+    ("arguments" in args && typeof args.arguments !== "string") ||
+    !activationIdentityMatches(args.name, details.skill)
+  ) return undefined;
+  const name = sanitizeText(args.name, true);
+  if (name.length === 0) return undefined;
+  const argumentsText = sanitizeText(args.arguments, true);
+  return argumentsText.length > 0 ? `${name} — ${argumentsText}` : name;
+}
+
+function routineToolName(tool: unknown): RoutineToolName | undefined {
   if (tool === null || typeof tool !== "object") return undefined;
   try {
     if (Object.getPrototypeOf(tool) !== Object.prototype) return undefined;
     const descriptor = Object.getOwnPropertyDescriptor(tool, "name");
     if (!descriptor || !("value" in descriptor)) return undefined;
-    return descriptor.value === "WebFetch" || descriptor.value === "WebSearch"
+    return descriptor.value === "WebFetch" || descriptor.value === "WebSearch" ||
+      descriptor.value === "Skill" || descriptor.value === "SlashCommand"
       ? descriptor.value
       : undefined;
   } catch {
@@ -340,7 +405,7 @@ function webToolName(tool: unknown): WebToolName | undefined {
 
 /** Add guarded human-only routine presentation without changing canonical tool execution/results. */
 export function withRoutineToolRendering<T extends ToolDefinition>(tool: T): T {
-  const toolName = webToolName(tool);
+  const toolName = routineToolName(tool);
   if (!toolName) return tool;
 
   let descriptors: PropertyDescriptorMap;
@@ -367,7 +432,9 @@ export function withRoutineToolRendering<T extends ToolDefinition>(tool: T): T {
       writable: true,
       value(result: ResultShape, options: unknown, theme: unknown, context: unknown): Component {
         try {
-          const invocation = recognizeSuccess(toolName, result, options, context);
+          const invocation = toolName === "WebFetch" || toolName === "WebSearch"
+            ? recognizeWebSuccess(toolName, result, options, context)
+            : recognizeActivationSuccess(toolName, result, options, context);
           return invocation === undefined
             ? failOpenComponent(
                 result,

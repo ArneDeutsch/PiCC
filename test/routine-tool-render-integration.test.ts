@@ -11,7 +11,7 @@ const originalCwd = process.cwd();
 const originalUserDir = process.env.PICC_CLAUDE_USER_DIR;
 
 beforeAll(async () => {
-  directory = materializeFixture("hello-claude");
+  directory = materializeFixture("full-surface");
   const userDir = path.join(directory, ".claude-user");
   fs.mkdirSync(userDir, { recursive: true });
   process.env.PICC_CLAUDE_USER_DIR = userDir;
@@ -72,5 +72,26 @@ describe("main-session routine rendering registration", () => {
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain(invocation);
     expect(lines.join("\n")).not.toContain(hidden);
+  });
+
+  it.each([
+    { name: "Skill", args: { name: "deploy", arguments: "render-skill 7.1" }, invocation: "deploy — render-skill 7.1" },
+    { name: "SlashCommand", args: { command: "/deploy render-slash 7.2" }, invocation: "/deploy render-slash 7.2" },
+  ])("executes and compactly renders a real fixture $name activation without changing canonical content", async ({ name, args, invocation }) => {
+    const tool = pi.tools.get(name);
+    expect(tool).toBeDefined();
+    expect(tool.renderCall(args, undefined, { args }).render(100)).toEqual([]);
+
+    const result = await tool.execute(`activation-${name}`, args);
+    expect(result.content[0].text).toContain("FS-SKILL-ARGS-BODY");
+    const lines = tool.renderResult(
+      result,
+      { expanded: true, isPartial: false },
+      undefined,
+      { args, isError: false },
+    ).render(100) as string[];
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(invocation);
+    expect(lines.join("\n")).not.toContain("FS-SKILL-ARGS-BODY");
   });
 });

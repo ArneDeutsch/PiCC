@@ -31,6 +31,12 @@ const searchResult = {
   content: [{ type: "text", text: "SECRET SEARCH TITLE\nSECRET SEARCH SNIPPET" }],
   details: { query: searchArgs.query, backend: "duckduckgo", resultCount: 0, truncated: true },
 };
+const skillArgs = { name: "deploy", arguments: "staging 1.2.3" };
+const slashArgs = { command: "/deploy staging 1.2.3" };
+const activationResult = {
+  content: [{ type: "text", text: "SECRET INJECTED INSTRUCTION BODY" }],
+  details: { skill: "deploy" },
+};
 
 function decorate(tool: ToolDefinition): RenderTool {
   return withRoutineToolRendering(tool) as unknown as RenderTool;
@@ -368,6 +374,158 @@ describe("routine tool rendering decorator", () => {
     expect(lines.join("\n")).toContain("Unfamiliar WebFetch presentation format");
   });
 
+  it("renders ordinary Skill and SlashCommand activations from snapshotted call arguments only", () => {
+    const cases = [
+      [decorate({ name: "Skill" } as ToolDefinition), skillArgs, "Skill deploy — staging 1.2.3"],
+      [decorate({ name: "SlashCommand" } as ToolDefinition), slashArgs, "SlashCommand /deploy staging 1.2.3"],
+    ] as const;
+    for (const [tool, args, expected] of cases) {
+      expect(tool.renderCall(args, undefined, { args }).render(80)).toEqual([]);
+      for (const expanded of [false, true]) {
+        const lines = renderResult(tool, args, activationResult, { expanded });
+        expect(lines).toEqual([expected]);
+        expect(lines.join("\n")).not.toContain("SECRET INJECTED");
+      }
+    }
+  });
+
+  it("renders no-argument Skill and SlashCommand activations without a dangling separator or body", () => {
+    const cases = [
+      [decorate({ name: "Skill" } as ToolDefinition), { name: "deploy" }, "Skill deploy"],
+      [decorate({ name: "SlashCommand" } as ToolDefinition), { command: "/deploy" }, "SlashCommand /deploy"],
+    ] as const;
+    for (const [tool, args, expected] of cases) {
+      for (const expanded of [false, true]) {
+        const lines = renderResult(tool, args, activationResult, { expanded });
+        expect(lines).toEqual([expected]);
+        expect(lines[0]).not.toContain("—");
+        expect(lines[0]).not.toContain("SECRET INJECTED");
+      }
+    }
+  });
+
+  it("compacts only activation results whose canonical identity matches the invocation", () => {
+    const compactCases: Array<[RenderTool, unknown, unknown, string]> = [
+      [decorate({ name: "Skill" } as ToolDefinition), { name: "plugin:deploy" }, { ...activationResult, details: { skill: "plugin:deploy" } }, "Skill plugin:deploy"],
+      [decorate({ name: "Skill" } as ToolDefinition), { name: "deploy" }, { ...activationResult, details: { skill: "plugin:deploy" } }, "Skill deploy"],
+      [decorate({ name: "SlashCommand" } as ToolDefinition), { command: "/plugin:deploy now" }, { ...activationResult, details: { skill: "plugin:deploy" } }, "SlashCommand /plugin:deploy now"],
+      [decorate({ name: "SlashCommand" } as ToolDefinition), { command: "deploy now" }, { ...activationResult, details: { skill: "plugin:deploy" } }, "SlashCommand deploy now"],
+    ];
+    for (const [tool, args, result, expected] of compactCases) {
+      expect(renderResult(tool, args, result)).toEqual([expected]);
+    }
+
+    const visibleBody = "VISIBLE MISMATCHED ACTIVATION BODY";
+    const mismatches: Array<[RenderTool, unknown]> = [
+      [decorate({ name: "Skill" } as ToolDefinition), { name: "other" }],
+      [decorate({ name: "SlashCommand" } as ToolDefinition), { command: "/other now" }],
+      [decorate({ name: "SlashCommand" } as ToolDefinition), { command: "/deploy/invalid now" }],
+    ];
+    for (const [tool, args] of mismatches) {
+      const result = { content: [{ type: "text", text: visibleBody }], details: { skill: "deploy" } };
+      expect(renderResult(tool, args, result).join("\n")).toContain(visibleBody);
+    }
+  });
+
+  it("keeps deduplicated, forked, partial, failed, additional, and unfamiliar activation outcomes visible", () => {
+    const tool = decorate({ name: "Skill" } as ToolDefinition);
+    const cases: Array<[unknown, Record<string, boolean>, string]> = [
+      [{ content: [{ type: "text", text: "VISIBLE DEDUP NOTICE" }], details: { skill: "deploy", deduplicated: true } }, {}, "VISIBLE DEDUP NOTICE"],
+      [{ content: [{ type: "text", text: "VISIBLE FORK OUTPUT" }], details: { forked: true, agent: "worker", cutOff: false } }, {}, "VISIBLE FORK OUTPUT"],
+      [activationResult, { partial: true }, "SECRET INJECTED INSTRUCTION BODY"],
+      [activationResult, { error: true }, "SECRET INJECTED INSTRUCTION BODY"],
+      [{ ...activationResult, content: [...activationResult.content, { type: "text", text: "VISIBLE EXTRA" }] }, {}, "SECRET INJECTED INSTRUCTION BODY"],
+      [{ ...activationResult, details: { skill: "deploy", future: true } }, {}, "SECRET INJECTED INSTRUCTION BODY"],
+      [{ content: [{ type: "future", payload: "VISIBLE FUTURE" }], details: { skill: "deploy" } }, {}, "Unfamiliar Skill presentation format"],
+    ];
+    for (const [result, flags, visible] of cases) {
+      const text = renderResult(tool, skillArgs, result, flags).join("\n");
+      expect(text).toContain(visible);
+      expect(text).not.toBe("Skill deploy — staging 1.2.3");
+    }
+  });
+
+  it("sanitizes and clamps hostile activation fields across tiny and Unicode widths", () => {
+    const escape = "\u001b";
+    const args = {
+      name: "deploy",
+      arguments: `déploy界🙂${escape}[31mfirst\r\nsecond\u2028${escape}]0;pwn\u0007\u009b32mC1CSI\u009b0m\u009d0;C1OSC\u009c`,
+    };
+    const tool = decorate({ name: "Skill" } as ToolDefinition);
+    for (const width of [0, 1, 2, 9, 80]) {
+      const lines = renderResult(tool, args, activationResult, { width });
+      expect(lines).toHaveLength(1);
+      expectBounded(lines, width);
+      expect(lines[0]).not.toMatch(/[\r\n\u2028\u0007\u009b\u009d\u009c]/u);
+      expect(lines[0]).not.toContain("[31m");
+      expect(lines[0]).not.toContain("]0;pwn");
+      expect(lines[0]).not.toContain("32m");
+      expect(lines[0]).not.toContain("C1OSC");
+      expect(lines[0]).not.toContain("SECRET INJECTED");
+    }
+  });
+
+  it("fails activation accessors, hostile descriptors, and non-exact shapes open without reads", () => {
+    const tool = decorate({ name: "SlashCommand" } as ToolDefinition);
+    let getterCalls = 0;
+    const accessorArgs = Object.defineProperty({}, "command", {
+      enumerable: true,
+      get() { getterCalls++; return slashArgs.command; },
+    });
+    const hostileDetails = new Proxy({ skill: "deploy" }, {
+      get() { getterCalls++; throw new Error("must not get"); },
+      getOwnPropertyDescriptor() { throw new Error("no descriptors"); },
+    });
+    const cases: Array<[unknown, unknown, unknown]> = [
+      [accessorArgs, activationResult, { expanded: false, isPartial: false }],
+      [slashArgs, { ...activationResult, details: hostileDetails }, { expanded: false, isPartial: false }],
+      [{ ...slashArgs, future: true }, activationResult, { expanded: false, isPartial: false }],
+      [slashArgs, { ...activationResult, isError: "false" }, { expanded: false, isPartial: false }],
+      [slashArgs, activationResult, { expanded: false }],
+    ];
+    for (const [args, result, options] of cases) {
+      const text = renderRaw(tool, result, options, { args, isError: false }).join("\n");
+      expect(text).toContain("SECRET INJECTED INSTRUCTION BODY");
+      expect(text).not.toBe(`SlashCommand ${slashArgs.command}`);
+    }
+    expect(getterCalls).toBe(0);
+  });
+
+  it("recognizes transparent activation proxies through descriptors without property gets", () => {
+    let propertyGets = 0;
+    const noGet = <T extends object>(value: T): T => new Proxy(value, {
+      get() { propertyGets++; throw new Error("property get forbidden"); },
+    });
+    const args = noGet({ name: "部署", arguments: "é🙂" });
+    const result = noGet({
+      content: noGet([noGet({ type: "text", text: "PROXY SECRET BODY" })]),
+      details: noGet({ skill: "部署" }),
+    });
+    const lines = renderResult(decorate({ name: "Skill" } as ToolDefinition), args, result, { width: 80 });
+    expect(lines).toEqual(["Skill 部署 — é🙂"]);
+    expect(propertyGets).toBe(0);
+  });
+
+  it("keeps recognized activation success compact when inputs are frozen or styling degrades", () => {
+    const tool = decorate({ name: "SlashCommand" } as ToolDefinition);
+    const args = Object.freeze({ command: "/deploy é🙂" });
+    const result = Object.freeze({
+      content: Object.freeze([Object.freeze({ type: "text", text: "FROZEN SECRET BODY" })]),
+      details: Object.freeze({ skill: "deploy" }),
+    });
+    const themes = [
+      new Proxy({}, { get() { throw new Error("theme unavailable"); } }),
+      { fg: () => ({ malformed: true }), bold: () => { throw new Error("bold unavailable"); } },
+    ];
+    for (const theme of themes) {
+      const lines = renderResult(tool, args, result, { theme, width: 18 });
+      expect(lines).toHaveLength(1);
+      expectBounded(lines, 18);
+      expect(lines.join("\n")).toContain("SlashCommand");
+      expect(lines.join("\n")).not.toContain("FROZEN SECRET BODY");
+    }
+  });
+
   it("preserves execute/fields and leaves source arguments/results and unrelated tools untouched", () => {
     const source = createWebFetchTool(() => ".");
     const decorated = withRoutineToolRendering(source);
@@ -387,7 +545,7 @@ describe("routine tool rendering decorator", () => {
     expect(fetchArgs).toEqual(argsBefore);
     expect(fetchResult).toEqual(resultBefore);
 
-    for (const name of ["Agent", "Task", "TaskOutput", "Other"]) {
+    for (const name of ["Agent", "Task", "TaskOutput", "TaskStop", "SendMessage", "Other"]) {
       const unrelated = { name, execute() {} } as unknown as ToolDefinition;
       expect(withRoutineToolRendering(unrelated)).toBe(unrelated);
     }
