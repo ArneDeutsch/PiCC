@@ -945,6 +945,13 @@ describe("proportional documentation scope contracts", () => {
 
   it("pins Phase 7 realized trigger branches, evidence inputs, and safe no-output lifecycle", () => {
     const body = phase("phase-7-implementation.md");
+    const baseline = between(body, "for each task", "1. **dispatch**");
+    for (const marker of [
+      "clean tracked baseline at the current `head` immediately before dispatch",
+      "for later tasks",
+      "may be the preceding task's commit or remain unchanged after verified clean revert/no-output completion",
+      "when another task follows a no-output task",
+    ]) expect(baseline, marker).toContain(marker);
     expect(body).toContain("either realized trigger branch matches");
     expect(body).toContain("(1) the diff changes documentation-bearing content");
     expect(body).toContain("(2) the realized behavior may invalidate existing documentation");
@@ -952,7 +959,6 @@ describe("proportional documentation scope contracts", () => {
     expect(body).toContain("no documentation-bearing content **and** the realized behavior cannot invalidate existing documentation");
     expect(body).toContain("never decide this from the task's planned intent");
     for (const marker of [
-      "verify a clean tracked baseline before starting",
       "`feature.md`, the current task spec, and its execution log",
       "only the task specs carrying documentation dispositions",
       "`git diff <default-branch>...head`",
@@ -975,6 +981,14 @@ describe("proportional documentation scope contracts", () => {
     const body = phase("phase-8-close-review.md");
     const router = collapseFile(ROUTER_PATH);
     const entry = "all tasks are complete and all retained tracked outputs are committed";
+    const correctiveRemoval = between(body, "integrate.", "a small justified new durable surface");
+    for (const marker of [
+      "reviewed corrective commit",
+      "at the same time",
+      "remove each rejected path and its rationale from the owning task spec",
+      "preserve the dispositions for remaining accepted surfaces",
+      "record a concise no-change disposition when none remain",
+    ]) expect(correctiveRemoval, marker).toContain(marker);
     expect(body).toContain(entry);
     expect(router).toContain("all tasks complete and all retained tracked outputs committed");
     for (const marker of [

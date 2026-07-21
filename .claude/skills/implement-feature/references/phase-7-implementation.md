@@ -2,7 +2,7 @@
 
 Dispatch prompts are governed by [dispatch-discipline.md](dispatch-discipline.md) — read it before your first fan-out; if it cannot be read, do not dispatch.
 
-For each task, in planned order, verify a clean tracked baseline before starting; after the first task, the preceding task's commit establishes it:
+For each task, in planned order, verify a clean tracked baseline at the current `HEAD` immediately before dispatch. For later tasks, the current `HEAD` may be the preceding task's commit or remain unchanged after verified clean revert/no-output completion, including when another task follows a no-output task:
 
 1. **Dispatch** a fresh `implementer` subagent with the full worktree-root paths to `doc/plan/<feature-slug>/feature.md` and its task spec `doc/plan/<feature-slug>/tasks/t<task-number>-<task-slug>.md` (or their absolute joins), and these standing rules (relay them into the dispatch prompt):
    - Read both files first; work in the worktree at `<path>`.
