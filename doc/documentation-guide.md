@@ -59,16 +59,19 @@ that audience needs: "link, don't copy" only works where the link exists.
 
 ### Proportional scope
 
-After repairing existing false, stale, or misleading claims, **no durable documentation change** is
-a valid result. Otherwise, start with the smallest sufficient set. For every proposed durable
-surface, name its reader, the necessary decision it enables, why existing sources are insufficient,
-and why this is the smallest sufficient placement.
+First check only existing claims affected by the planned or realized behavior, and repair any that
+became false, stale, or misleading. If none needs repair, **no durable documentation change** is a
+valid result. If repairs are required, make them, but presume no optional additions beyond them.
+For optional additions, start with the smallest sufficient set. For every proposed durable surface,
+name its reader, the necessary decision it enables, why existing sources are insufficient, and why
+this is the smallest sufficient placement.
 
-Then apply the set-level removal test: remove a proposed surface and ask whether a named reader can
-still make the necessary decision. If so, leave it out. Any optional surface that remains despite
+Then apply the set-level removal test to every proposed durable surface and every separable proposed
+content unit within a retained surface: remove it and ask whether a named reader can still make the
+necessary decision. If so, leave it out. Any optional surface or content unit that remains despite
 failing this test is aggregate excess and **MUST-FIX**, even when each statement is true and correctly
-placed. Mechanically generated output and retained non-obvious rationale are not optional surfaces;
-the genre rules below decide when they are required.
+placed. Mechanically generated output and retained non-obvious rationale are not optional; the genre
+rules below decide when they are required.
 
 ## 3. Quality standards
 
@@ -159,11 +162,12 @@ behavioral reason, and expect to verify the behavior.
 ### Generated docs (`doc/supported-features.md`)
 
 A capability registry entry is support truth, not feature bookkeeping. Anti-drift investigation
-determines factually whether behavior changed a support claim; when it did, repair the registry and
-**regenerate, never hand-edit** `doc/supported-features.md` with `npm run gen:capabilities`.
-Proportional scope decides only whether additional prose is warranted; it never permits required
-registry repair or regeneration to be skipped. A hand edit is a defect — it is silently reverted by
-the next regeneration and, until then, lies about behavior.
+determines factually whether behavior changed required tier or note truth; when it did, repair the
+registry and **regenerate, never hand-edit** `doc/supported-features.md` with
+`npm run gen:capabilities`. Discretionary explanatory detail in registry inputs must pass
+*Proportional scope*; proportionality never permits required registry repair or regeneration to be
+skipped. A hand edit is a defect — it is silently reverted by the next regeneration and, until then,
+lies about behavior.
 
 ### Test fixtures (`examples/**`)
 

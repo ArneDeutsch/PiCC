@@ -828,33 +828,39 @@ describe("proportional documentation scope contracts", () => {
     return text.slice(from, to);
   };
 
-  it("keeps the complete decision and genre exclusions in the guide's Proportional scope section", () => {
+  it("bounds the guide's Proportional scope decision and applies removal to surfaces and content units", () => {
     const guide = collapseFile(GUIDE_PATH);
     const proportional = between(guide, "### proportional scope", "## 3. quality standards");
     for (const marker of [
+      "only existing claims affected by the planned or realized behavior",
+      "if none needs repair",
       "no durable documentation change",
+      "if repairs are required, make them, but presume no optional additions beyond them",
       "smallest sufficient set",
       "reader",
       "necessary decision",
       "existing sources are insufficient",
       "smallest sufficient placement",
       "set-level removal test",
+      "every proposed durable surface",
+      "every separable proposed content unit within a retained surface",
+      "optional surface or content unit",
       "aggregate excess",
       "must-fix",
       "mechanically generated output",
       "retained non-obvious rationale",
-      "not optional surfaces",
+      "not optional",
     ]) expect(proportional, marker).toContain(marker);
   });
 
-  it("keeps anti-drift factual and mandatory while proportional scope governs only additional prose", () => {
+  it("keeps capability truth and regeneration mandatory while making registry detail proportional", () => {
     const guide = collapseFile(GUIDE_PATH);
     const generated = between(guide, "### generated docs", "### test fixtures");
-    expect(generated).toContain("anti-drift investigation determines factually whether behavior changed a support claim");
+    expect(generated).toContain("anti-drift investigation determines factually whether behavior changed required tier or note truth");
     expect(generated).toContain("repair the registry");
     expect(generated).toContain("regenerate, never hand-edit");
-    expect(generated).toContain("proportional scope decides only whether additional prose is warranted");
-    expect(generated).toContain("never permits required registry repair or regeneration to be skipped");
+    expect(generated).toContain("discretionary explanatory detail in registry inputs must pass *proportional scope*");
+    expect(generated).toContain("proportionality never permits required registry repair or regeneration to be skipped");
 
     const comments = between(guide, "### code comments", "### prompt docs");
     expect(comments).toContain("add a comment only when that local rationale is necessary");
@@ -876,25 +882,30 @@ describe("proportional documentation scope contracts", () => {
 
     const investigate = between(body, "**investigate**", "**review**");
     for (const marker of [
+      "existing claims affected by the planned behavior",
+      "identify any required repairs independently",
       "no durable documentation change",
-      "existing claims remain true",
-      "smallest sufficient set",
-      "complete named *proportional scope* test",
-      "anti-drift investigation finds that support truth",
+      "only when neither a repair nor an optional surface is needed",
+      "required repairs and/or the smallest sufficient optional set",
+      "named *proportional scope* test",
+      "required tier or note truth",
       "mandatory registry repair and regeneration",
-      "decides only whether additional prose is warranted",
+      "discretionary explanatory detail in registry inputs must pass *proportional scope*",
       "local non-obvious why",
       "preserve existing load-bearing rationale",
     ]) expect(investigate, marker).toContain(marker);
 
     const review = between(body, "**review**", "severity follows");
-    expect(review).toContain("new durable prose only when the guide's *proportional scope* test warrants it");
-    expect(review).toContain("repair any existing claim the realized behavior invalidates");
+    expect(review).toContain("existing claims affected by the realized behavior");
+    expect(review).toContain("repair any it invalidates");
+    expect(review).toContain("optional durable prose only when the guide's *proportional scope* test warrants it");
     expect(review).toContain("after mandatory truth repairs");
-    expect(review).toContain("aggregate excess");
-    expect(review).toContain("no-change result passes only after the anti-drift check");
-    expect(review).toContain("review never presumes additions");
-    expect(review).toContain("mechanical regeneration remain mandatory");
+    expect(review).toContain("separable proposed content");
+    expect(review).toContain("excess within a necessary surface");
+    expect(review).toContain("a no-repair/no-durable-change result may pass");
+    expect(review).toContain("required repairs do not presume optional additions");
+    expect(review).toContain("required capability tier or note truth and mechanical regeneration remain mandatory");
+    expect(review).toContain("discretionary explanatory detail in registry inputs is separate");
 
     const severity = between(body, "severity follows", "**the altitude row");
     expect(severity).toContain("**must-fix**");
