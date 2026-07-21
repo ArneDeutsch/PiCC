@@ -39,6 +39,17 @@ function firstGroup(requests: CapturedRequest[], re: RegExp): string | undefined
   return undefined;
 }
 
+function requestedTool(request: CapturedRequest, name: string): boolean {
+  return request.messages.some((message) => {
+    if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) return false;
+    return message.tool_calls.some((call) => {
+      if (typeof call !== "object" || call === null) return false;
+      const fn = (call as Record<string, unknown>).function;
+      return typeof fn === "object" && fn !== null && (fn as Record<string, unknown>).name === name;
+    });
+  });
+}
+
 describe.skipIf(cliMissing)(
   "e2e subagents: real Pi CLI + PiCC extension + mock OpenAI model",
   () => {
@@ -105,6 +116,117 @@ describe.skipIf(cliMissing)(
         expect(result.stdout).not.toContain(RECORD_FORK_MARKER);
         // No crash noise from the un-awaited dispatch (completeness floor).
         expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|unhandledRejection|FATAL/i);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    // --- Scenario: completed coordinator EnterWorktree routes a later ordinary child dispatch ---
+    it.skipIf(!BASH_AVAILABLE)(
+      "keeps an ordinary foreground subagent's relative writes in the coordinator worktree",
+      async () => {
+        const worktreeName = "coordinator-child-cwd";
+        const writeEditRelative = "child-write-edit.txt";
+        const bashRelative = "child-bash.txt";
+        const isChild = (r: CapturedRequest) =>
+          systemText(r).includes("You are a general-purpose agent");
+        const isParent = (r: CapturedRequest) => !isChild(r);
+
+        const result = await runPi({
+          fixture: "full-surface",
+          script: [
+            {
+              when: isParent,
+              toolCalls: [{ name: "EnterWorktree", args: { name: worktreeName } }],
+            },
+            {
+              when: isParent,
+              toolCalls: [
+                {
+                  name: "Agent",
+                  args: {
+                    subagent_type: "general-purpose",
+                    prompt: "perform the requested relative file operations",
+                    run_in_background: false,
+                  },
+                },
+              ],
+            },
+            {
+              when: isChild,
+              toolCalls: [
+                {
+                  name: "write",
+                  args: {
+                    path: writeEditRelative,
+                    content: "WRITE-CANARY\nEDIT-BEFORE\n",
+                  },
+                },
+              ],
+            },
+            {
+              when: isChild,
+              toolCalls: [
+                {
+                  name: "edit",
+                  args: {
+                    path: writeEditRelative,
+                    oldText: "EDIT-BEFORE",
+                    newText: "EDIT-AFTER",
+                  },
+                },
+              ],
+            },
+            {
+              when: isChild,
+              toolCalls: [
+                {
+                  name: "bash",
+                  args: { command: `printf '%s\\n' 'BASH-CANARY' > ${bashRelative}` },
+                },
+              ],
+            },
+            { when: isChild, text: "COORDINATOR-CWD-CHILD-DONE" },
+            { when: isParent, text: "coordinator worktree dispatch verified" },
+          ],
+          prompt: "enter a worktree, then delegate relative writes",
+        });
+
+        expect(result.code).toBe(0);
+
+        const childRequests = result.requests.filter(isChild);
+        const parentRequests = result.requests.filter(isParent);
+        const enterCompletion = parentRequests.find((request) => {
+          const text = toolResultText(request).replaceAll("\\", "/");
+          return text.includes("Created and entered worktree:") &&
+            text.includes(`/.claude/worktrees/${worktreeName}`);
+        });
+        expect(enterCompletion, "EnterWorktree must complete before Agent dispatch").toBeDefined();
+        for (const toolName of ["write", "edit", "bash"]) {
+          expect(
+            childRequests.some((request) => requestedTool(request, toolName)),
+            `the child session must issue ${toolName}`,
+          ).toBe(true);
+          expect(
+            parentRequests.some((request) => requestedTool(request, toolName)),
+            `the coordinator must not issue ${toolName}`,
+          ).toBe(false);
+        }
+
+        const agentCompletion = parentRequests.find((request) =>
+          toolResultText(request).includes("COORDINATOR-CWD-CHILD-DONE"),
+        );
+        expect(agentCompletion, "the foreground Agent call must return the child completion").toBeDefined();
+        expect(toolResultText(agentCompletion!), "the Agent result must not be failed partial output")
+          .not.toContain("[subagent cut off]");
+        expect(result.stdout).toContain("coordinator worktree dispatch verified");
+
+        const worktreeDir = path.join(result.fixture, ".claude", "worktrees", worktreeName);
+        const writeEditInWorktree = path.join(worktreeDir, writeEditRelative);
+        const bashInWorktree = path.join(worktreeDir, bashRelative);
+        expect(fs.readFileSync(writeEditInWorktree, "utf8")).toBe("WRITE-CANARY\nEDIT-AFTER\n");
+        expect(fs.readFileSync(bashInWorktree, "utf8")).toBe("BASH-CANARY\n");
+        expect(fs.existsSync(path.join(result.fixture, writeEditRelative))).toBe(false);
+        expect(fs.existsSync(path.join(result.fixture, bashRelative))).toBe(false);
       },
       TEST_TIMEOUT_MS,
     );
