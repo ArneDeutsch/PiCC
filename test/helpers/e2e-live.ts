@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -55,6 +56,10 @@ export interface RunPiOptions {
   fixture?: FixtureName;
   extraEnv?: Record<string, string>;
   setup?: (fixtureDir: string) => void;
+  /** Override the synthetic stored credential for the default mock model. */
+  defaultModelCredential?: string;
+  /** A second local provider/model, authenticated only by a synthetic stored credential. */
+  secondaryModel?: { provider: string; id: string; credential: string };
   /** Keep session persistence ON (drops --no-session) — transcript scenarios. */
   persistSession?: boolean;
 }
@@ -73,36 +78,51 @@ export function createE2ELive(): E2ELive {
   const tempDirs: string[] = [];
   const fixtures: string[] = [];
 
-  function makeAgentDir(mockUrl: string): string {
+  function makeAgentDir(
+    mockUrl: string,
+    defaultModelCredential: string,
+    secondaryModel?: RunPiOptions["secondaryModel"],
+  ): string {
     const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-piagent-"));
     tempDirs.push(agentDir);
-    // Shape verified against pi docs/models.md ("Full Example") and docs/settings.md.
+    const model = (id: string, name: string) => ({
+      id,
+      name,
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 8192,
+    });
+    const providers: Record<string, unknown> = {
+      mock: {
+        baseUrl: `${mockUrl}/v1`,
+        api: "openai-completions",
+        models: [model("mock-1", "Mock")],
+      },
+    };
+    const credentials: Record<string, unknown> = {
+      mock: { type: "api_key", key: defaultModelCredential },
+    };
+    if (secondaryModel) {
+      providers[secondaryModel.provider] = {
+        baseUrl: `${mockUrl}/v1`,
+        api: "openai-completions",
+        models: [model(secondaryModel.id, "Secondary Mock")],
+      };
+      credentials[secondaryModel.provider] = {
+        type: "api_key",
+        key: secondaryModel.credential,
+      };
+    }
+    // Models stay credential-blind; auth.json exercises Pi's stored-credential path.
     fs.writeFileSync(
       path.join(agentDir, "models.json"),
-      JSON.stringify(
-        {
-          providers: {
-            mock: {
-              baseUrl: `${mockUrl}/v1`,
-              api: "openai-completions",
-              apiKey: "test-key",
-              models: [
-                {
-                  id: "mock-1",
-                  name: "Mock",
-                  reasoning: false,
-                  input: ["text"],
-                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                  contextWindow: 128000,
-                  maxTokens: 8192,
-                },
-              ],
-            },
-          },
-        },
-        null,
-        2,
-      ),
+      JSON.stringify({ providers }, null, 2),
+    );
+    fs.writeFileSync(
+      path.join(agentDir, "auth.json"),
+      JSON.stringify(credentials, null, 2),
     );
     fs.writeFileSync(
       path.join(agentDir, "settings.json"),
@@ -125,9 +145,19 @@ export function createE2ELive(): E2ELive {
     fixtures.push(fixture);
     opts.setup?.(fixture);
 
-    const mock = await startMockModel(opts.script);
+    const defaultModelCredential =
+      opts.defaultModelCredential ?? "synthetic-default-model-key";
+    const authorizationDigest = (credential: string) =>
+      createHash("sha256").update(`Bearer ${credential}`).digest("hex");
+    const authorizationDigestsByModel = new Map<string, string>([
+      ["mock-1", authorizationDigest(defaultModelCredential)],
+      ...(opts.secondaryModel
+        ? [[opts.secondaryModel.id, authorizationDigest(opts.secondaryModel.credential)] as const]
+        : []),
+    ]);
+    const mock = await startMockModel(opts.script, authorizationDigestsByModel);
     try {
-      const agentDir = makeAgentDir(mock.url);
+      const agentDir = makeAgentDir(mock.url, defaultModelCredential, opts.secondaryModel);
       const emptyUserDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-claude-user-"));
       tempDirs.push(emptyUserDir);
 
