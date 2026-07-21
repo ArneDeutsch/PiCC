@@ -16,6 +16,7 @@ import {
   renderSettlementRecord,
 } from "../src/runtime/subagent-render.js";
 import {
+  assistantTextFingerprint,
   formatUsageCompact,
   renderProgressText,
   type ProgressSnapshot,
@@ -2800,7 +2801,7 @@ describe("BackgroundTaskRegistry.markUserStopped", () => {
 // ---------------------------------------------------------------------------
 
 describe("SubagentRegistry live mirror + onChange", () => {
-  it("background dispatch mirrors progress, fullTail, and live usage onto the dispatch registry record and keeps the task record in sync", async () => {
+  it("background dispatch mirrors progress, structured detail, and live usage onto the dispatch registry record and keeps the task record in sync", async () => {
     const sub = new SubagentRegistry();
     const bg = new BackgroundTaskRegistry();
     const events = [
@@ -2842,7 +2843,7 @@ describe("SubagentRegistry live mirror + onChange", () => {
     await bg.wait(taskId);
     const rec = sub.get(String(started.details.agentId))!;
     expect(rec.progress?.tail.some((l) => l.includes("Grep"))).toBe(true);
-    expect(rec.fullTail?.some((l) => l.includes("Grep"))).toBe(true);
+    expect(rec.detailLog?.some((entry) => entry.kind === "tool-call" && entry.tool === "Grep")).toBe(true);
     const live = {
       inputTokens: 10,
       outputTokens: 5,
@@ -2872,13 +2873,18 @@ describe("SubagentRegistry live mirror + onChange", () => {
       oneShot: false,
     });
     expect(fires).toBe(1);
-    sub.noteProgress(id, { tail: ["line"], activity: "working…" }, ["full line"]);
+    const detail = [{
+      kind: "assistant" as const,
+      text: "full line",
+      fingerprint: assistantTextFingerprint(["full line"]),
+    }];
+    sub.noteProgress(id, { tail: ["line"], activity: "working…" }, detail);
     expect(fires).toBe(2);
-    expect(sub.get(id)?.fullTail).toEqual(["full line"]);
-    // A snapshot-only note keeps the prior fullTail.
+    expect(sub.get(id)?.detailLog).toEqual(detail);
+    // A snapshot-only note keeps the prior structured detail.
     sub.noteProgress(id, { tail: ["line", "next"], activity: "working…" });
     expect(fires).toBe(3);
-    expect(sub.get(id)?.fullTail).toEqual(["full line"]);
+    expect(sub.get(id)?.detailLog).toEqual(detail);
     sub.markSettled(id, { outcome: "completed" });
     expect(fires).toBe(4);
     // Settled: noteProgress is a silent no-op — the settled record stays authoritative.

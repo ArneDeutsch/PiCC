@@ -1205,6 +1205,7 @@ export class SubagentRuntime {
     // runs leave it unset — a deliberately stopped result is discarded by
     // contract. Read once in the finally alongside outcome/usage.
     let settledFinalText: string | undefined;
+    let settledAssistantIdentityText: string | undefined;
     const captureUsage = (): DispatchUsage | undefined => {
       const live = session;
       if (live && typeof live.getSessionStats === "function") {
@@ -1655,8 +1656,8 @@ export class SubagentRuntime {
       // onUpdate sink), background, nested, and resumed dispatches all feed it;
       // opts.onProgress additionally receives the same snapshot when supplied,
       // exactly as before. Mirror before emit, so the record never lags a
-      // consumer-visible snapshot; the enlarged fullTail rides BESIDE the
-      // snapshot (a parallel record field), never inside the emitted payloads.
+      // consumer-visible snapshot; structured detail travels only to the
+      // registry record, never inside model-facing emitted payloads.
       // Event-stream only — NEVER poll session.messages (compaction inside
       // prompt() rewrites that array mid-flight). Degrades to nothing when the
       // session has no subscribe() (simple fakes, older SDKs).
@@ -1673,7 +1674,6 @@ export class SubagentRuntime {
             dispatchRegistry?.noteProgress(
               agentId,
               snapshot,
-              snapshotChanged ? condenser.fullTail() : undefined,
               detailChanged ? condenser.detailLog() : undefined,
             );
             if (snapshot) emit?.(snapshot);
@@ -1820,6 +1820,10 @@ export class SubagentRuntime {
         finalMessage = lastAssistantText(session);
       }
 
+      // Preserve the terminal assistant turn's identity before any display-only
+      // cut-off decoration; the registry stores the decoration but deduplicates
+      // against this raw source.
+      settledAssistantIdentityText = finalMessage;
       // A truncated completion ends with the cut-off frame; `cutOff` records
       // that so the model-visible ID trailer rides INSIDE that frame instead of
       // opening a second `---` frame.
@@ -1901,6 +1905,7 @@ export class SubagentRuntime {
         // Sanitized+capped by the registry; conversation content, never for
         // error/log interpolation.
         finalText: settledFinalText,
+        assistantIdentityText: settledAssistantIdentityText,
       });
       if (worktreePath && this.deps.worktrees && !opts.resume) {
         // Keep the worktree (the project's own merge flow owns its lifecycle); just unlock.

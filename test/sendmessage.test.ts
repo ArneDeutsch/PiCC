@@ -4,6 +4,7 @@ import path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { guardSteer, SubagentRegistry } from "../src/runtime/subagent-registry.js";
+import { assistantTextFingerprint } from "../src/runtime/subagent-progress.js";
 import {
   createAgentToolDefinition,
   createSendMessageToolDefinition,
@@ -250,8 +251,12 @@ describe("SubagentRegistry — panel state fields", () => {
     const r = new SubagentRegistry();
     const id = mintAgentId();
     r.register({ agentId: id, agentName: "reviewer", ...base, prompt: "initial task" });
-    const details = [{ kind: "assistant" as const, text: "old live answer" }];
-    r.noteProgress(id, { tail: ["old progress"], activity: "working…" }, ["old full tail"], details);
+    const details = [{
+      kind: "assistant" as const,
+      text: "old live answer",
+      fingerprint: assistantTextFingerprint(["old live answer"]),
+    }];
+    r.noteProgress(id, { tail: ["old progress"], activity: "working…" }, details);
     r.markSettled(id, {
       outcome: "completed",
       usage: { inputTokens: 12 },
@@ -268,7 +273,7 @@ describe("SubagentRegistry — panel state fields", () => {
       transcriptPath: base.transcriptPath,
       state: "running",
     });
-    for (const field of ["finalText", "outcome", "usage", "progress", "detailLog", "fullTail", "settledAt"] as const) {
+    for (const field of ["finalText", "outcome", "usage", "progress", "detailLog", "settledAt"] as const) {
       expect(resumed[field]).toBeUndefined();
     }
 
@@ -287,7 +292,7 @@ describe("SubagentRegistry — panel state fields", () => {
     const id = mintAgentId();
     r.register({ agentId: id, agentName: "reviewer", ...base });
     const detail = [{ kind: "tool-call" as const, tool: "Read", detail: "a.ts" }];
-    r.noteProgress(id, undefined, undefined, detail);
+    r.noteProgress(id, undefined, detail);
     detail[0]!.tool = "mutated";
     detail.push({ kind: "tool-call", tool: "Write", detail: "b.ts" });
     expect(r.get(id)!.detailLog).toEqual([

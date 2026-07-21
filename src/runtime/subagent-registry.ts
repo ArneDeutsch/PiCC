@@ -1,5 +1,6 @@
 import { isAgentId } from "../util/subagent-transcripts.js";
 import {
+  assistantTextFingerprint,
   sanitizeLine,
   sanitizeProgressText,
   type ProgressSnapshot,
@@ -59,8 +60,8 @@ export type SubagentOutcome = "completed" | "failed" | "aborted";
  * model conversation text: they exist for the status panel's drill-down and
  * must NEVER be interpolated into error messages, thrown strings, or logging.
  */
-const PROMPT_CAP = 4096;
-const FINAL_TEXT_CAP = 16384;
+export const SUBAGENT_PROMPT_CAP = 4096;
+export const SUBAGENT_FINAL_TEXT_CAP = 16_384;
 /** Single-line cap for the stored Agent-tool `description` label. */
 const DESCRIPTION_CAP = 120;
 
@@ -190,13 +191,6 @@ export interface SubagentRegistryRecord {
    */
   progress?: ProgressSnapshot;
   /**
-   * Enlarged bounded transcript buffer for the panel's drill-down view,
-   * updated beside `progress`. A PARALLEL field, deliberately not on the
-   * snapshot, so it never rides `details.subagentProgress` emissions.
-   * Sanitized and capped by the condenser at capture.
-   */
-  fullTail?: string[];
-  /**
    * Structured, typed live detail events for the selected-agent view. Entries
    * are display-only, sanitized and bounded by the condenser, then copied here
    * so the registry remains the panel's sole ownership boundary.
@@ -302,7 +296,7 @@ export class SubagentRegistry {
       // user stop is permanent and register() never clears it.
       existing.parentAgentId ??= input.parentAgentId;
       existing.description ??= boundedDescription(input.description);
-      existing.prompt ??= boundedContent(input.prompt, PROMPT_CAP);
+      existing.prompt ??= boundedContent(input.prompt, SUBAGENT_PROMPT_CAP);
       existing.color ??= validAgentColor(input.color);
       this.notifyChange();
       return existing;
@@ -322,7 +316,7 @@ export class SubagentRegistry {
       parentAgentId: input.parentAgentId,
       description: boundedDescription(input.description),
       startedAt: Date.now(),
-      prompt: boundedContent(input.prompt, PROMPT_CAP),
+      prompt: boundedContent(input.prompt, SUBAGENT_PROMPT_CAP),
       color: validAgentColor(input.color),
     };
     this.records.set(input.agentId, record);
@@ -356,7 +350,6 @@ export class SubagentRegistry {
   noteProgress(
     agentId: string,
     snapshot: ProgressSnapshot | undefined,
-    fullTail?: string[],
     detailLog?: SubagentDetailEntry[],
   ): void {
     const record = this.records.get(agentId);
@@ -368,7 +361,6 @@ export class SubagentRegistry {
         ...(snapshot.usage ? { usage: { ...snapshot.usage } } : {}),
       };
     }
-    if (fullTail) record.fullTail = [...fullTail];
     if (detailLog) record.detailLog = detailLog.map((entry) => ({ ...entry }));
     this.notifyChange();
   }
@@ -381,12 +373,19 @@ export class SubagentRegistry {
    * newest-generation supersession. `settled.outcome`/`settled.usage`/
    * `settled.finalText` are each stored only when provided, so a settle that
    * couldn't classify (or produced no text) leaves the prior value intact.
-   * `finalText` is sanitized and capped here — conversation content, stored
+   * Before `finalText` is sanitized/capped, the identity-only source (defaulting
+   * to that raw text) removes only an exactly matching trailing assistant detail
+   * entry. The identity source is never stored. Conversation content is stored
    * for the panel drill-down only, never for error/log interpolation.
    */
   markSettled(
     agentId: string,
-    settled?: { outcome?: SubagentOutcome; usage?: SubagentUsage; finalText?: string },
+    settled?: {
+      outcome?: SubagentOutcome;
+      usage?: SubagentUsage;
+      finalText?: string;
+      assistantIdentityText?: string;
+    },
   ): void {
     const record = this.records.get(agentId);
     if (!record) return;
@@ -395,7 +394,19 @@ export class SubagentRegistry {
     record.settledAt = Date.now();
     if (settled?.outcome !== undefined) record.outcome = settled.outcome;
     if (settled?.usage !== undefined) record.usage = settled.usage;
-    const finalText = boundedContent(settled?.finalText, FINAL_TEXT_CAP);
+    const rawFinalText = settled?.finalText;
+    const assistantIdentityText = settled?.assistantIdentityText ?? rawFinalText;
+    const detailLog = record.detailLog;
+    const trailingDetail = detailLog?.at(-1);
+    if (
+      assistantIdentityText !== undefined &&
+      detailLog &&
+      trailingDetail?.kind === "assistant" &&
+      trailingDetail.fingerprint === assistantTextFingerprint([assistantIdentityText])
+    ) {
+      record.detailLog = detailLog.slice(0, -1);
+    }
+    const finalText = boundedContent(rawFinalText, SUBAGENT_FINAL_TEXT_CAP);
     if (finalText !== undefined) record.finalText = finalText;
     this.notifyChange();
   }
@@ -422,7 +433,6 @@ export class SubagentRegistry {
     record.usage = undefined;
     record.progress = undefined;
     record.detailLog = undefined;
-    record.fullTail = undefined;
     record.settledAt = undefined;
     this.notifyChange();
   }

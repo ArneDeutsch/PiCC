@@ -520,7 +520,7 @@ export class SubagentPanelFocusController {
         return;
       }
       // Live repaint while the drill-down is open: progress events land on
-      // the registry between ticks, and a 1s tick alone would lag the tail.
+      // the registry between ticks, and a 1s tick alone would lag structured detail.
       let unsubscribe: (() => void) | undefined;
       try {
         unsubscribe = this.deps.registry.onChange(() => {
@@ -539,8 +539,8 @@ export class SubagentPanelFocusController {
         ui: {
           promptExpanded: false,
           scrollTop: 0,
-          // Running opens onto the live tail (auto-following); finished opens
-          // at the top, where the final answer leads.
+          // Running opens onto structured live detail (auto-following); finished
+          // opens at the top, where the outcome-aware output leads.
           follow: target.record.state === "running",
           steerBuffer: "",
         },

@@ -1639,7 +1639,28 @@ describe("Subagent live progress", () => {
     const rec = sub.get(result.agentId)!;
     expect(rec.progress?.tail.some((l) => l.includes("Grep"))).toBe(true);
     expect(rec.progress?.tail).toContain("final line");
-    expect(rec.fullTail?.some((l) => l.includes("Grep"))).toBe(true);
+    expect(rec.detailLog?.some((entry) => entry.kind === "tool-call" && entry.tool === "Grep")).toBe(true);
+  });
+
+  it("deduplicates a long truncated terminal turn against its raw pre-decoration identity", async () => {
+    const rawFinal = `TRUNCATED_FINAL_${"x".repeat(500)}`;
+    const sub = new SubagentRegistry();
+    const { sdk } = fakeSdk({
+      replies: [{
+        text: rawFinal,
+        stopReason: "length",
+        events: [{
+          type: "turn_end",
+          message: { role: "assistant", content: [{ type: "text", text: rawFinal }] },
+        }],
+      }],
+    });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk, { subagentRegistry: sub });
+    const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+    const record = sub.get(result.agentId)!;
+    expect(result.truncated).toBe(true);
+    expect(record.finalText).toContain("[subagent cut off]");
+    expect(record.detailLog).toEqual([]);
   });
 
   it("a nested (depth 2) dispatch mirrors live progress onto its registry record too", async () => {
@@ -1651,7 +1672,7 @@ describe("Subagent live progress", () => {
     const rec = sub.get(result.agentId)!;
     expect(rec.depth).toBe(2);
     expect(rec.progress?.tail.some((l) => l.includes("Grep"))).toBe(true);
-    expect(rec.fullTail?.some((l) => l.includes("Grep"))).toBe(true);
+    expect(rec.detailLog?.some((entry) => entry.kind === "tool-call" && entry.tool === "Grep")).toBe(true);
   });
 
   it("Agent tool forwards live progress through onUpdate with the expected shape", async () => {

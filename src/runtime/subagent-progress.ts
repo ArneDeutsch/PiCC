@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * Subagent live-progress condenser.
  *
@@ -14,9 +16,8 @@
  *     or a silent auto-retry wait - "waiting: API retry 2/3"), and
  *   - accumulated token `usage`, absent until the first usage-bearing event.
  *
- * Beside the snapshot, the condenser keeps the enlarged `fullTail` and a typed
- * structured detail log. Both are capture-sanitized and hard-bounded;
- * neither enters model-facing progress.
+ * Beside the snapshot, the condenser keeps a typed structured detail log.
+ * It is capture-sanitized and hard-bounded and never enters model-facing progress.
  *
  * SANITIZATION IS SECURITY, NOT COSMETICS: the tail replays subagent-controlled
  * text (its assistant output and - deliberately truncated - its tool results,
@@ -45,7 +46,7 @@ export interface SnapshotUsage {
 
 /** One bounded, sanitized event for the selected-agent detail view. */
 export type SubagentDetailEntry =
-  | { kind: "assistant"; text: string }
+  | { kind: "assistant"; text: string; fingerprint: string }
   | { kind: "tool-call"; tool: string; detail?: string }
   | { kind: "tool-outcome"; tool: string; detail?: string; failed: boolean }
   | { kind: "status"; text: string };
@@ -71,17 +72,11 @@ export interface ProgressSnapshot {
 export const DEFAULT_MAX_TAIL_LINES = 12;
 /** Default per-line cap (characters) before truncation. */
 export const DEFAULT_MAX_LINE_LENGTH = 200;
-/**
- * Bounds for the enlarged per-agent transcript buffer (`fullTail`) kept for
- * the status panel's drill-down view. Larger than the rolling `tail`, but
- * still hard-capped — the same hostile-content concerns apply, only the
- * display budget differs.
- */
-export const FULL_TAIL_MAX_LINES = 100;
-export const FULL_TAIL_MAX_LINE_LENGTH = 300;
-/** The structured detail log uses the same hard display budgets as fullTail. */
-export const DETAIL_LOG_MAX_ENTRIES = FULL_TAIL_MAX_LINES;
-export const DETAIL_FIELD_MAX_LENGTH = FULL_TAIL_MAX_LINE_LENGTH;
+/** Hard display budgets for the structured selected-agent detail log. */
+export const DETAIL_LOG_MAX_ENTRIES = 100;
+export const DETAIL_FIELD_MAX_LENGTH = 300;
+/** Maximum raw code units inspected when sanitizing a malformed detail scalar. */
+const DETAIL_RAW_INSPECTION_LIMIT = 4096;
 
 // Control bytes referenced by the ANSI matchers, built from code points so the
 // SOURCE stays pure ASCII (no raw control characters in this file). ESC=27, BEL=7.
@@ -126,7 +121,7 @@ function ellipsizedPrefix(text: string, maxLen: number): string {
   return `${prefix}…`;
 }
 
-/** Sanitize one line with the legacy snapshot/fullTail byte semantics. */
+/** Sanitize one line with the compact snapshot's legacy byte semantics. */
 export function sanitizeLine(text: string, maxLen: number): string {
   const flat = sanitizeProgressText(text).replace(/\s+/g, " ").trim();
   if (flat.length <= maxLen) return flat;
@@ -193,6 +188,26 @@ class BoundedScalarAccumulator {
   }
 }
 
+/**
+ * Sanitize one structured-detail scalar while retaining at most its display
+ * budget. Unlike sanitizeProgressText(), this never allocates a cleaned copy of
+ * an attacker-sized input before applying the cap.
+ */
+export function sanitizeDetailScalar(
+  value: string,
+  maxLen = DETAIL_FIELD_MAX_LENGTH,
+): string {
+  const accumulator = new BoundedScalarAccumulator(maxLen);
+  let inspected = 0;
+  for (const ch of value) {
+    if (inspected + ch.length > DETAIL_RAW_INSPECTION_LIMIT) break;
+    inspected += ch.length;
+    accumulator.feed(ch, ch.codePointAt(0)!);
+    if (accumulator.truncated) break;
+  }
+  return accumulator.value();
+}
+
 /** Extract a display scalar without joining a complete multi-block payload. */
 function boundedScalar(parts: Iterable<unknown>, maxLen = DETAIL_FIELD_MAX_LENGTH): string {
   const accumulator = new BoundedScalarAccumulator(maxLen);
@@ -204,6 +219,15 @@ function boundedScalar(parts: Iterable<unknown>, maxLen = DETAIL_FIELD_MAX_LENGT
     }
   }
   return accumulator.value();
+}
+
+/** Cryptographic identity of the exact JS UTF-16 code units in uncapped assistant text. */
+export function assistantTextFingerprint(parts: Iterable<unknown>): string {
+  const hash = createHash("sha256");
+  for (const part of parts) {
+    if (typeof part === "string") hash.update(part, "utf16le");
+  }
+  return hash.digest("hex");
 }
 
 function* messageTextParts(message: unknown): Iterable<unknown> {
@@ -411,7 +435,6 @@ function lastLegacyNonEmptyLine(parts: Iterable<unknown>, maxLen: number): Bound
 interface ToolOutcomePreview {
   found: boolean;
   snapshotLine: string;
-  fullLine: string;
   detail: string;
 }
 
@@ -422,35 +445,29 @@ function toolOutcomePreview(
   snapshotMax: number,
 ): ToolOutcomePreview {
   const snapshot = new LegacyLineAccumulator(snapshotMax);
-  const full = new LegacyLineAccumulator(FULL_TAIL_MAX_LINE_LENGTH);
   const detail = new BoundedScalarAccumulator(DETAIL_FIELD_MAX_LENGTH);
   const prefix = failed ? `  x ${rawName} failed` : `  ${rawName}`;
   snapshot.feed(prefix);
-  full.feed(prefix);
   let found = false;
 
   for (const part of resultTextParts(result)) {
     if (typeof part !== "string") continue;
     for (const ch of part) {
       if (ch === "\n") {
-        if (found) {
-          return { found, snapshotLine: snapshot.value(), fullLine: full.value(), detail: detail.value() };
-        }
+        if (found) return { found, snapshotLine: snapshot.value(), detail: detail.value() };
         continue;
       }
       if (!found && !/\s/u.test(ch)) {
         found = true;
         snapshot.feed(": ");
-        full.feed(": ");
       }
       if (found) {
         snapshot.feed(ch);
-        full.feed(ch);
         detail.feed(ch, ch.codePointAt(0)!);
       }
     }
   }
-  return { found, snapshotLine: snapshot.value(), fullLine: full.value(), detail: detail.value() };
+  return { found, snapshotLine: snapshot.value(), detail: detail.value() };
 }
 
 function asNumber(value: unknown): number | undefined {
@@ -524,8 +541,6 @@ function argHint(args: unknown, maxLen: number): string {
  */
 export class SubagentProgressCondenser {
   private readonly tail: string[] = [];
-  /** The enlarged drill-down buffer — same pushes as `tail`, larger caps. */
-  private readonly fullTailBuffer: string[] = [];
   private readonly detailLogBuffer: SubagentDetailEntry[] = [];
   private detailChangedOnLastConsume = false;
   private activity = "";
@@ -598,7 +613,7 @@ export class SubagentProgressCondenser {
         const rawName = (typeof e.toolName === "string" && e.toolName) || "tool";
         const failed = e.isError === true;
         const preview = toolOutcomePreview(rawName, e.result, failed, this.maxLineLength);
-        if (failed || preview.found) this.pushPrepared(preview.snapshotLine, preview.fullLine);
+        if (failed || preview.found) this.pushPrepared(preview.snapshotLine);
         const tool = boundedScalar([rawName], DETAIL_FIELD_MAX_LENGTH) || "tool";
         this.pushDetail(
           preview.detail
@@ -619,14 +634,20 @@ export class SubagentProgressCondenser {
       }
       case "turn_end": {
         const detailText = boundedScalar(messageTextParts(e.message));
-        if (detailText) this.pushDetail({ kind: "assistant", text: detailText });
+        if (detailText) {
+          this.pushDetail({
+            kind: "assistant",
+            text: detailText,
+            fingerprint: assistantTextFingerprint(messageTextParts(e.message)),
+          });
+        }
         // Text blocks concatenate exactly as before, but logical lines are
         // sanitized and pushed incrementally so no joined payload is allocated.
         scanLogicalLines(
           messageTextParts(e.message),
-          [this.maxLineLength, FULL_TAIL_MAX_LINE_LENGTH],
+          [this.maxLineLength],
           [],
-          (legacy) => this.pushPrepared(legacy[0]!, legacy[1]!),
+          (legacy) => this.pushPrepared(legacy[0]!),
         );
         // message_update leaves `activity` holding the final streamed line, which
         // we just pushed into `tail` — showing it again as the "… <activity>"
@@ -660,17 +681,6 @@ export class SubagentProgressCondenser {
       : { tail: [...this.tail], activity: this.activity };
   }
 
-  /**
-   * The enlarged bounded transcript buffer for the drill-down view (a fresh
-   * copy). Deliberately NOT part of {@link snapshot}: a snapshot-borne
-   * fullTail would ride every `details.subagentProgress` emission and multiply
-   * the JSON.stringify dedupe cost in `changed()`. It travels as a parallel
-   * registry-record field instead and never participates in change detection.
-   */
-  fullTail(): string[] {
-    return [...this.fullTailBuffer];
-  }
-
   /** Structured detail entries, oldest to newest, with no mutable internals exposed. */
   detailLog(): SubagentDetailEntry[] {
     return this.detailLogBuffer.map((entry) => ({ ...entry }));
@@ -696,22 +706,14 @@ export class SubagentProgressCondenser {
   }
 
   private push(line: string): void {
-    this.pushPrepared(
-      sanitizeLine(line, this.maxLineLength),
-      sanitizeLine(line, FULL_TAIL_MAX_LINE_LENGTH),
-    );
+    this.pushPrepared(sanitizeLine(line, this.maxLineLength));
   }
 
-  private pushPrepared(snapshotLine: string, fullLine: string): void {
+  private pushPrepared(snapshotLine: string): void {
     if (!snapshotLine) return;
     this.tail.push(snapshotLine);
     if (this.tail.length > this.maxTailLines) {
       this.tail.splice(0, this.tail.length - this.maxTailLines);
-    }
-    // The drill-down buffer takes the same logical line under its larger cap.
-    this.fullTailBuffer.push(fullLine);
-    if (this.fullTailBuffer.length > FULL_TAIL_MAX_LINES) {
-      this.fullTailBuffer.splice(0, this.fullTailBuffer.length - FULL_TAIL_MAX_LINES);
     }
   }
 

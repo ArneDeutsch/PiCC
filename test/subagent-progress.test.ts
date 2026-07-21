@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  assistantTextFingerprint,
   DEFAULT_MAX_LINE_LENGTH,
   DEFAULT_MAX_TAIL_LINES,
   DETAIL_FIELD_MAX_LENGTH,
   DETAIL_LOG_MAX_ENTRIES,
   formatUsageCompact,
-  FULL_TAIL_MAX_LINE_LENGTH,
-  FULL_TAIL_MAX_LINES,
   renderProgressText,
+  sanitizeDetailScalar,
   sanitizeLine,
   sanitizeProgressText,
   SubagentProgressCondenser,
@@ -20,6 +20,14 @@ const BEL = String.fromCharCode(7);
 /** Build an assistant-message-shaped object the condenser can read text from. */
 function assistant(text: string) {
   return { role: "assistant", content: [{ type: "text", text }] };
+}
+
+function detailAssistant(rawText: string) {
+  return {
+    kind: "assistant" as const,
+    text: sanitizeDetailScalar(rawText),
+    fingerprint: assistantTextFingerprint([rawText]),
+  };
 }
 
 describe("sanitizeProgressText (terminal-injection defense)", () => {
@@ -60,6 +68,18 @@ describe("sanitizeProgressText (terminal-injection defense)", () => {
   it("strips single-char Fe escapes (ESC + final byte)", () => {
     // ESC D (Index) is a two-byte Fe escape — both bytes go, the payload stays.
     expect(sanitizeProgressText(`a${ESC}Db`)).toBe("ab");
+  });
+});
+
+describe("sanitizeDetailScalar (bounded malformed-input inspection)", () => {
+  it("does not scan through huge non-rendering prefixes to a sentinel", () => {
+    const sentinel = "RAW_INSPECTION_SENTINEL";
+    const values = [
+      `${" ".repeat(100_000)}${sentinel}`,
+      `${String.fromCharCode(1).repeat(100_000)}${sentinel}`,
+      `${ESC}]${"x".repeat(100_000)}${sentinel}`,
+    ];
+    for (const value of values) expect(sanitizeDetailScalar(value)).not.toContain(sentinel);
   });
 });
 
@@ -376,7 +396,7 @@ describe("SubagentProgressCondenser structured detail log", () => {
       { kind: "status", text: "retry succeeded; resuming…" },
       { kind: "tool-call", tool: "Read", detail: "a.ts" },
       { kind: "tool-outcome", tool: "Read", failed: false },
-      { kind: "assistant", text: "settled answer" },
+      detailAssistant("settled answer"),
     ]);
   });
 
@@ -470,7 +490,7 @@ describe("SubagentProgressCondenser structured detail log", () => {
     }
     expect(c.detailLog()).toEqual([]);
     c.consume({ type: "turn_end", message: assistant("final") });
-    expect(c.detailLog()).toEqual([{ kind: "assistant", text: "final" }]);
+    expect(c.detailLog()).toEqual([detailAssistant("final")]);
   });
 
   it("keeps the newest fixed number of entries and deep-copies every returned object", () => {
@@ -503,7 +523,27 @@ describe("SubagentProgressCondenser structured detail log", () => {
         expect(value).not.toContain(BEL);
       }
     }
-    expect(c.detailLog().at(-1)).toEqual({ kind: "assistant", text: "red blue" });
+    expect(c.detailLog().at(-1)).toEqual(detailAssistant(hostile));
+  });
+
+  it("fingerprints full multiline and long assistant turns without storing their uncapped content", () => {
+    const parts = ["first line\n", "x".repeat(500)];
+    const c = new SubagentProgressCondenser();
+    c.consume({
+      type: "turn_end",
+      message: {
+        role: "assistant",
+        content: parts.map((text) => ({ type: "text", text })),
+      },
+    });
+    const entry = c.detailLog()[0];
+    expect(entry).toEqual({
+      kind: "assistant",
+      text: sanitizeDetailScalar(parts.join("")),
+      fingerprint: assistantTextFingerprint(parts),
+    });
+    expect((entry as { text: string }).text).not.toContain("x".repeat(400));
+    expect((entry as { fingerprint: string }).fingerprint).toHaveLength(64);
   });
 
   it("bounds huge strings and block counts before they enter the detail log", () => {
@@ -534,10 +574,9 @@ describe("SubagentProgressCondenser structured detail log", () => {
       `${"i".repeat(10)}[31`,
       `${"x".repeat(298)}\ud83d…`,
     ]);
-    expect(c.fullTail()).toEqual(c.snapshot().tail);
     expect(c.detailLog()).toEqual([
-      { kind: "assistant", text: "i".repeat(10) },
-      { kind: "assistant", text: `${"x".repeat(298)}…` },
+      detailAssistant(incomplete),
+      detailAssistant(astral),
     ]);
     expect((c.detailLog()[1] as { text: string }).text).not.toMatch(/[\uD800-\uDFFF]/u);
   });
@@ -557,12 +596,6 @@ describe("SubagentProgressCondenser structured detail log", () => {
       },
     });
     expect(c.snapshot().tail).toEqual(["first", "second", `${"q".repeat(19)}…`, "newest"]);
-    expect(c.fullTail()).toEqual([
-      "first",
-      "second",
-      `${"q".repeat(FULL_TAIL_MAX_LINE_LENGTH - 1)}…`,
-      "newest",
-    ]);
   });
 
   it("reports detail-only changes separately without changing snapshots or rendered progress", () => {
@@ -576,53 +609,5 @@ describe("SubagentProgressCondenser structured detail log", () => {
     expect(renderProgressText(c.snapshot())).toBe(rendered);
     expect(c.consume({ type: "tool_execution_update", partialResult: "ignored" })).toBe(false);
     expect(c.detailChanged()).toBe(false);
-  });
-});
-
-describe("SubagentProgressCondenser fullTail (drill-down buffer)", () => {
-  it("keeps more history than the tail, bounded to FULL_TAIL_MAX_LINES (newest kept)", () => {
-    const c = new SubagentProgressCondenser();
-    const pushes = FULL_TAIL_MAX_LINES + 20;
-    for (let i = 0; i < pushes; i++) {
-      c.consume({ type: "tool_execution_start", toolName: `T${i}`, args: {} });
-    }
-    expect(c.snapshot().tail.length).toBe(DEFAULT_MAX_TAIL_LINES);
-    const full = c.fullTail();
-    expect(full.length).toBe(FULL_TAIL_MAX_LINES);
-    expect(full[0]).toBe(`> T${pushes - FULL_TAIL_MAX_LINES}`); // oldest overflow rotated out
-    expect(full[full.length - 1]).toBe(`> T${pushes - 1}`);
-  });
-
-  it("caps fullTail lines at FULL_TAIL_MAX_LINE_LENGTH beside the shorter tail cap", () => {
-    const c = new SubagentProgressCondenser();
-    c.consume({ type: "turn_end", message: assistant("x".repeat(1000)) });
-    const tailLine = c.snapshot().tail[0]!;
-    const fullLine = c.fullTail()[0]!;
-    expect(tailLine.length).toBe(DEFAULT_MAX_LINE_LENGTH);
-    expect(fullLine.length).toBe(FULL_TAIL_MAX_LINE_LENGTH);
-    expect(fullLine.endsWith("…")).toBe(true);
-    // Same content, different budget: the tail line is a prefix of the full line.
-    expect(fullLine.startsWith(tailLine.slice(0, -1))).toBe(true);
-  });
-
-  it("applies the same capture-time sanitization as the tail (matrix reuse)", () => {
-    const c = new SubagentProgressCondenser();
-    const hostile = `${ESC}]0;pwn${BEL}payload ${ESC}[31mred${ESC}Dtail`;
-    c.consume({ type: "tool_execution_end", toolName: "Read", result: hostile, isError: false });
-    const full = c.fullTail();
-    expect(full.some((l) => l.includes("payload redtail"))).toBe(true);
-    for (const line of full) {
-      expect(line.includes(ESC)).toBe(false);
-      expect(line.includes(BEL)).toBe(false);
-    }
-  });
-
-  it("is a parallel buffer: never on the snapshot, returned as a fresh copy", () => {
-    const c = new SubagentProgressCondenser();
-    c.consume({ type: "tool_execution_start", toolName: "Grep", args: {} });
-    expect("fullTail" in c.snapshot()).toBe(false);
-    const copy = c.fullTail();
-    copy.push("mutated");
-    expect(c.fullTail()).not.toContain("mutated");
   });
 });
