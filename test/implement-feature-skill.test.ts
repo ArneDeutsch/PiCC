@@ -1017,6 +1017,55 @@ describe("proportional documentation scope contracts", () => {
     expect(existing).toContain("forward-slashed repository-relative path");
   });
 
+  it("rejects Windows-special forms on every candidate while preserving trusted root syntax", () => {
+    const body = phase("phase-4-how-investigation.md");
+    const windows = between(
+      body,
+      "after establishing provenance but before branch-specific validation or normalization",
+      "for an existing ordinary path",
+    );
+    for (const pathKind of [
+      "direct tool locators",
+      "existing ordinary paths",
+      "nonexistent destinations",
+      "tracked symlink entries",
+    ]) expect(windows, pathKind).toContain(pathKind);
+    expect(windows).toContain("treating `/` and `\\` as equivalent separators");
+    expect(windows).toContain("absolute-root syntax is permitted only for a direct trusted coordinator-tool locator");
+    expect(windows).toContain("posix root or windows drive root");
+    expect(windows).toContain("reject root-relative or absolute syntax from every other source");
+
+    for (const namespace of ["\\\\?\\", "//?/", "\\\\.\\", "//./", "\\??\\", "/??/"]) {
+      expect(windows, namespace).toContain(namespace);
+    }
+    expect(windows).toContain("alternate-data-stream colon in any component");
+    expect(windows).toContain("only colon exception is the initial `[a-za-z]:` drive separator");
+    expect(windows).toContain("`c:\\repo\\file.ts`");
+    expect(windows).toContain("`c:\\repo\\file.ts:stream`");
+
+    expect(windows).toContain("split every candidate into components on both slash styles");
+    expect(windows).toContain("reject any component ending in a dot or space");
+    expect(windows).toContain("each component's substring before its first `.`");
+    expect(windows).toContain("trim trailing dots and spaces from that stem");
+    expect(windows).toContain("compare case-insensitively");
+    for (const reserved of [
+      "`con`",
+      "`prn`",
+      "`aux`",
+      "`nul`",
+      "`com1`–`com9`",
+      "`lpt1`–`lpt9`",
+      "`com¹`–`com³`",
+      "`lpt¹`–`lpt³`",
+      "`con.txt`",
+      "`nul.`",
+      "`nul.tar.gz`",
+      "`dir/aux.json`",
+      "`com¹.log`",
+    ]) expect(windows, reserved).toContain(reserved);
+    expect(windows).toContain("content-derived strings remain inert even when they pass these lexical checks");
+  });
+
   it("pins nonexistent rename-destination validation through the nearest existing parent", () => {
     const body = phase("phase-4-how-investigation.md");
     const destination = between(body, "for a nonexistent rename destination", "a symlink is not an ordinary-path shortcut");
@@ -1093,6 +1142,26 @@ describe("proportional documentation scope contracts", () => {
     expect(body).toContain("never turn search results into broad repository globs or directory ownership");
     expect(body).toContain("include only claims or links the contract change makes false or unusable");
     expect(body).toContain("reuse the existing task fields rather than adding an inventory artifact or template section");
+  });
+
+  it("carries accepted tracked-symlink constraints into the self-contained implementer task and Phase 7 boundary", () => {
+    const phase5 = phase("phase-5-task-breakdown.md");
+    const phase7 = phase("phase-7-implementation.md");
+    const propagation = between(phase5, "for every accepted tracked symlink", "phase 4 discovery");
+    for (const marker of [
+      "classified tracked-symlink path kind",
+      "owning task's self-contained `context & seams`",
+      "ownership covers the link entry only",
+      "that task's `approach constraints`",
+      "changing the link entry without dereferencing it",
+      "forbid authorizing its target or any path traversing through it",
+      "a writable-path list alone is insufficient",
+      "the implementer receives the task spec plus feature spec, not the phase 4 inventory",
+    ]) expect(propagation, marker).toContain(marker);
+    expect(phase7).toContain("with the full worktree-root paths");
+    expect(phase7).toContain("and its task spec");
+    expect(phase7).toContain("stay inside the writable surface");
+    expect(phase7).toContain("stop and report precisely why instead of improvising");
   });
 
   it("couples the Phase 4/5 preflight to the actual Phase 7 stop boundary", () => {
