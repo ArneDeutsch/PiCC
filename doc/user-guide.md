@@ -166,6 +166,11 @@ Then use it like Claude Code:
   working directory really moves, so project scripts detect worktree mode via git plumbing
 - parallel sessions: open a second terminal, `picc` again, enter a different worktree
 
+In the interactive TUI, safely recognized settled tool successes use compact rows. The configured
+`app.tools.expand` action (Ctrl+O by default) reveals their native detail. Noncompact paths retain
+native detail where safe; otherwise they show bounded diagnostics. HTML export, non-interactive
+output, model-facing results, and execution are unchanged.
+
 ### Observing subagents
 
 Every subagent is visible, both to you and to the coordinating model:
@@ -204,7 +209,8 @@ Every subagent is visible, both to you and to the coordinating model:
 - **Condensed transcript records.** Subagent output does not stream into the chat; selected-agent
   detail owns the live view. Each depth-1 normal-path result replaces its pending call in the same
   tool row; background completion adds one collapsed record — outcome, duration, tokens — that
-  Ctrl+O expands to the outcome-appropriate retained output, if any, plus the transcript path, usage, and any warnings. Background
+  the configured `app.tools.expand` action (Ctrl+O by default) expands to the retained output, if any,
+  plus the transcript path, usage, and warnings. Background
   agents get their record even if never awaited; an agent that settles while you are away from the prompt gets it
   when the conversation next continues (the record rides the next turn). A later `TaskOutput`
   collection adds only a minimal reference line, never a duplicate. Nested agents (depth ≥ 2) get

@@ -42,7 +42,7 @@ Launch modes we support:
 | Env & exec | `pi.exec(cmd, args, { signal, timeout })` for git/hook commands; hooks additionally need shell execution via `node:child_process` (stdin JSON contract Pi's exec doesn't cover: we use `spawn` directly) |
 | Quota | `ctx.getContextUsage()`; subscription quota via provider headers on `after_provider_response` (rate-limit headers) + `/login`-stored auth; degrade gracefully if absent |
 | Compat notices / UX | `ctx.ui.notify`, `pi.appendEntry` + `pi.registerEntryRenderer` (TUI-only) |
-| Subagent status panel, drill-down & condensed settlement records (interactive TUI only) | `ctx.ui.setWidget(key, factory, { placement: "belowEditor" })` — factory invoked synchronously, replaced/removed components disposed; `ctx.ui.custom(factory)` — focused component, Pi saves/restores the editor draft around it; `pi.registerShortcut(keyId, { description, handler })` — dispatches only while the default editor has focus; `ctx.ui.onTerminalInput` — raw listeners run BEFORE the focused component, so PiCC's fork-Esc watcher yields a lone Esc while the panel is open; `pi.registerMessageRenderer(customType, renderer)` + `pi.sendMessage(…, details)` — rendered by Pi's `CustomMessageComponent` with a boolean `expanded` (Ctrl+O toggle); `undefined`/throw falls back to Pi's default box. Mode gating is on `ctx.mode === "tui"`, never `hasUI`: print's `noOpUIContext` implements the full ui interface with `hasUI` false, while RPC flips `hasUI` true. |
+| Subagent status panel, drill-down & condensed settlement records (interactive TUI only) | `ctx.ui.setWidget(key, factory, { placement: "belowEditor" })` — factory invoked synchronously, replaced/removed components disposed; `ctx.ui.custom(factory)` — focused component, Pi saves/restores the editor draft around it; `pi.registerShortcut(keyId, { description, handler })` — dispatches only while the default editor has focus; `ctx.ui.onTerminalInput` — raw listeners run BEFORE the focused component, so PiCC's fork-Esc watcher yields a lone Esc while the panel is open; `pi.registerMessageRenderer(customType, renderer)` + `pi.sendMessage(…, details)` — rendered by Pi's `CustomMessageComponent` with a boolean `expanded` controlled by the configured `app.tools.expand` action (Ctrl+O by default); `undefined`/throw falls back to Pi's default box. Mode gating is on `ctx.mode === "tui"`, never `hasUI`: print's `noOpUIContext` implements the full ui interface with `hasUI` false, while RPC flips `hasUI` true. |
 | Skill listing into system prompt | We do **not** feed `.claude/skills` through Pi's own skill discovery (Pi's XML listing + `/skill:` semantics differ from Claude's budgeted listing, `$ARGUMENTS`, shell-injection, `context: fork`). PiCC owns the Claude skill pipeline end-to-end: listing text appended in `before_agent_start`, activation via our own `Skill` tool + slash commands. Pi's native skill/command discovery of `.pi/`/`.agents/` stays untouched. |
 
 ## 3. Key mechanics decisions
@@ -143,10 +143,13 @@ not adopt deferred tool activation. We do not reimplement these Pi-native surfac
   imports/exports we rely on exist.
 - `before_agent_start` system-prompt chaining: other extensions may also modify; we append, not replace.
 - Built-in tool override warning in interactive mode is expected (documented for users).
-- Tool-row de-padding and mutation presentation couple `src/runtime/tool-shell.ts` and
-  `src/runtime/routine-tool-render.ts` to Pi's render contract. These dependencies are pinned by
-  Pi-contract tests so a Pi bump fails loudly in CI rather than degrading incremental rendering
-  silently on a green CI. For what the wrapper
+- Tool-row de-padding, mutation presentation, and settled interactive collapse couple
+  `src/runtime/tool-shell.ts`, `src/runtime/routine-tool-render.ts`, and
+  `src/runtime/default-collapsed-tool-render.ts` to Pi's render contract. The collapse lifecycle
+  additionally relies on Pi propagating configured `app.tools.expand` state and invoking a settled
+  TUI call renderer before its result renderer with shared per-call state. Pi-contract tests pin
+  these dependencies so a Pi bump fails loudly in CI rather than degrading rendering silently.
+  For what the wrapper
   does with these, see "`renderShell` — this is how you control blank lines and framing" in
   [`tui-extension-guide.md`](tui-extension-guide.md); the Pi-side surface is:
   - **`create*ToolDefinition` renderer shape** — the de-padded built-in rows source their

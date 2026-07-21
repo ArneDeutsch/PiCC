@@ -169,8 +169,24 @@ describe("default-collapsed tool rendering", () => {
       if (key !== "renderCall" && key !== "renderResult") expect(after[key]).toEqual(before[key]);
     }
     expect(Reflect.ownKeys(after)).toEqual(Reflect.ownKeys(before));
-    (decorated.renderCall as RenderTool["renderCall"])({ path: "x" }, theme, { state: {}, isPartial: true }).render(80);
+    const decoratedTool = decorated as unknown as RenderTool;
+    decoratedTool.renderCall({ path: "x" }, theme, { state: {}, isPartial: true }).render(80);
+    expect(decorated.execute).toBe(execute);
     expect(executions).toBe(0);
+    const settledState = {};
+    const settledArgs = { path: "x" };
+    decoratedTool.renderCall(settledArgs, theme, {
+      args: settledArgs, state: settledState, isPartial: false, argsComplete: true, executionStarted: true,
+    }).render(80);
+    expect(decorated.execute).toBe(execute);
+    expect(executions).toBe(0);
+    for (const expanded of [false, true]) {
+      decoratedTool.renderResult(readResult("settled body\n"), { expanded, isPartial: false }, theme, {
+        args: settledArgs, state: settledState, isPartial: false, isError: false, expanded,
+      }).render(80);
+      expect(decorated.execute).toBe(execute);
+      expect(executions).toBe(0);
+    }
     expect(Object.getOwnPropertyDescriptors(source)).toEqual(before);
     expect(Object.getOwnPropertyDescriptors(nestedMetadata)).toEqual(nestedBefore);
     expect(Reflect.ownKeys(source)).toEqual(Reflect.ownKeys(before));
