@@ -1262,8 +1262,8 @@ describe("background settlement delivery (offline integration via the seam)", ()
     const lines = component.render(200) as string[];
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain(`Task(${taskId})`);
-    expect(lines[0]).toContain("Agent(reviewer) completed");
-    expect(lines[0]).toContain(`${agentId}.jsonl`); // transcript-basename pointer
+    expect(lines[0]).toContain(`Agent(reviewer) → Task(${taskId}) completed`);
+    expect(lines[0]).not.toContain(".jsonl");
     expect(lines[0]).toContain(RECORD_EXPAND_HINT);
     expect(lines[0]).not.toContain("WIRED-RECORD-REPORT"); // body stays behind expand
 

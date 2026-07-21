@@ -43,6 +43,7 @@ import {
 import {
   renderAgentCall,
   renderAgentResult,
+  type SubagentLifecycleRenderContext,
   type SubagentRenderDetails,
 } from "./subagent-render.js";
 import { formatBackgroundTaskIdentity } from "./background-identity.js";
@@ -2152,23 +2153,24 @@ export function createAgentToolDefinition(
         }),
       ),
     }),
-    // Dispatch-time display: show WHICH agent and WHAT it was asked, at
-    // call time — replacing Pi's bare bold "Agent" fallback. Cheap and
-    // model-independent. Returns a structural pi-tui Component ({ render });
-    // guarded so it can never throw into the render loop.
-    renderCall(args: Record<string, unknown>, theme: unknown) {
-      return renderAgentCall(args, theme);
+    // Pending display is mode-neutral and result ownership is shared through
+    // Pi's per-call renderer state.
+    renderCall(
+      args: Record<string, unknown>,
+      theme: unknown,
+      context: SubagentLifecycleRenderContext,
+    ) {
+      return renderAgentCall(args, theme, context);
     },
-    // Result display (REQUIRED): Pi's fallback renders only result text, so
-    // without this the outcome badge, agent ID, transcript path, and usage
-    // would be invisible. Also renders the live rolling tail for partial
-    // (streaming) results. Renders defensively when optional fields are absent.
+    // Result display owns normal rows once a partial or final result exists;
+    // expansion retains full output and transcript access.
     renderResult(
       result: { content?: Array<{ type: string; text: string }>; details?: SubagentRenderDetails },
       options: { expanded?: boolean; isPartial?: boolean },
       theme: unknown,
+      context: SubagentLifecycleRenderContext,
     ) {
-      return renderAgentResult(result, options, theme);
+      return renderAgentResult(result, options, theme, context);
     },
     async execute(
       _toolCallId: string,

@@ -78,6 +78,7 @@ import {
   RECORD_REFERENCE_NOTE,
   renderAgentCall,
   renderAgentResult,
+  renderSettlementRecord,
   type SubagentRenderDetails,
 } from "../src/runtime/subagent-render.js";
 import {
@@ -87,7 +88,7 @@ import {
   wrapForSelfShell,
   type RenderCtx,
 } from "../src/runtime/tool-shell.js";
-import { agentTrailerFrame } from "../src/util/subagent-transcripts.js";
+import { agentTrailerFrame, FORK_DEGRADE_PREFIX } from "../src/util/subagent-transcripts.js";
 import {
   fakeSdk,
   makeAgent,
@@ -1851,7 +1852,7 @@ describe("Subagent live progress", () => {
     expect(last.details?.live).toBe(true);
   });
 
-  it("renderCall shows the agent type and description / prompt head", () => {
+  it("renderCall shows one mode-neutral pending line with type and optional description", () => {
     const { sdk } = fakeSdk({ replies: ["x"] });
     const runtime = makeSubagentRuntime([makeAgent()], sdk);
     const tool = createAgentToolDefinition(runtime, { depth: 0 }) as {
@@ -1871,7 +1872,18 @@ describe("Subagent live progress", () => {
       .renderCall({ subagent_type: "reviewer", prompt: "Do the thing please" }, undefined)
       .render(80)
       .join("\n");
-    expect(withPrompt).toContain("Do the thing");
+    expect(withPrompt).toBe("Agent(reviewer)");
+
+    const explicitForeground = tool
+      .renderCall({ subagent_type: "reviewer", run_in_background: false }, undefined)
+      .render(80)
+      .join("\n");
+    const explicitBackground = tool
+      .renderCall({ subagent_type: "reviewer", run_in_background: true }, undefined)
+      .render(80)
+      .join("\n");
+    expect(explicitForeground).toBe("Agent(reviewer)");
+    expect(explicitBackground).toBe("Agent(reviewer)");
 
     const empty = tool.renderCall({}, undefined).render(80).join("\n");
     expect(empty).toContain("Agent(general-purpose)");
@@ -1924,7 +1936,7 @@ describe("Subagent live progress", () => {
     expect(failed).toContain("failed");
     expect(failed).toContain("partial work");
 
-    // Partial/streaming shows the live tail + activity.
+    // Partial/streaming shows only stable identity/state; live activity stays in detail.
     const partial = render(
       {
         content: [],
@@ -1936,8 +1948,8 @@ describe("Subagent live progress", () => {
       },
       true,
     );
-    expect(partial).toContain("running Grep…");
-    expect(partial).toContain("Grep");
+    expect(partial).toBe("Agent(reviewer) running");
+    expect(partial).not.toContain("Grep");
 
     // Empty details: never throws, falls back to the content text.
     const bare = render({ content: [{ type: "text", text: "hi" }], details: {} });
@@ -2167,14 +2179,17 @@ describe("Subagent live progress", () => {
       }>;
       renderResult: (
         r: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
-        o: { isPartial?: boolean },
+        o: { isPartial?: boolean; expanded?: boolean },
         theme: unknown,
       ) => { render: (w: number) => string[] };
     };
     const res = await tool.execute("t", { subagent_type: "reviewer", prompt: "go" }, undefined);
-    // The truncated success marks cutOff so the badge can differ.
+    // The truncated success marks cutOff so the compact badge remains truthful.
     expect(res.details?.cutOff).toBe(true);
-    const rendered = tool.renderResult(res, { isPartial: false }, undefined).render(120).join("\n");
+    const rendered = tool
+      .renderResult(res, { isPartial: false, expanded: false }, undefined)
+      .render(120)
+      .join("\n");
     expect(rendered).toContain("completed (truncated)");
   });
 
@@ -2192,26 +2207,26 @@ describe("Subagent live progress", () => {
     expect(rendered).toContain("aborted");
   });
 
-  it("renderCall flags background and renderResult shows the background header (FIX-B)", () => {
+  it("renderCall stays mode-neutral and a background result owns one compact row", () => {
     const tool = renderTool();
     const call = tool
       .renderCall({ subagent_type: "reviewer", run_in_background: true }, undefined)
       .render(80)
       .join("\n");
-    expect(call).toContain("[background]");
+    expect(call).toBe("Agent(reviewer)");
     const result = tool
       .renderResult(
         {
           content: [{ type: "text", text: "Background task task-1 started" }],
-          details: { background: true, agent: "reviewer" },
+          details: { background: true, taskId: "task-1", agent: "reviewer", description: "Review auth" },
         },
         { isPartial: false },
         undefined,
       )
       .render(120)
       .join("\n");
-    expect(result).toContain("Agent → background");
-    expect(result).toContain("Background task task-1 started");
+    expect(result).toBe("Agent(reviewer) → Task(task-1) background - Review auth");
+    expect(result).not.toContain("Background task task-1 started");
   });
 
   it("unsubscribes from the session event stream after dispatch settles (FIX-B)", async () => {
@@ -2331,26 +2346,26 @@ describe("TaskOutput identity render", () => {
     expect(out).not.toContain("resumable via SendMessage"); // …but no false invite
   });
 
-  it("the background start block is self-identifying: task-N + agent type + agent-<id>", () => {
+  it("the background start block is one compact task-targeted line", () => {
     const out = render({
       background: true,
       taskId: "task-2",
       agent: "reviewer",
       agentId: "agent-0123456789ab",
     }, "Background task task-2 started");
-    expect(out).toContain("Agent(reviewer) → background as task-2");
-    expect(out).toContain("agent-0123456789ab");
-    expect(out).toContain('TaskOutput(task_id "task-2")');
+    expect(out).toBe("Agent(reviewer) → Task(task-2) background");
+    expect(out).not.toContain("agent-0123456789ab");
+    expect(out).not.toContain("TaskOutput");
   });
 
-  it("a live partial with an absent/empty snapshot renders the starting… placeholder (not a bare header)", () => {
+  it("a live partial with an absent/empty snapshot renders only identity and running state", () => {
     const bare = render(
       { taskId: "task-8", agent: "coder", agentId: "agent-aabbccddeeff", live: true },
       "",
       true,
     );
     expect(bare).toContain("Task(task-8)");
-    expect(bare).toContain("starting…");
+    expect(bare).toBe("Agent(coder) → Task(task-8) running");
 
     const emptySnap = render(
       {
@@ -2363,10 +2378,10 @@ describe("TaskOutput identity render", () => {
       "",
       true,
     );
-    expect(emptySnap).toContain("starting…");
+    expect(emptySnap).toBe("Agent(coder) → Task(task-8) running");
   });
 
-  it("a live partial collapses to ONE self-identifying status line (task id + type + activity); the panel owns the tail", () => {
+  it("a live partial collapses to one identity/state line without activity; detail owns the tail", () => {
     const lines = renderAgentResult(
       {
         content: [{ type: "text", text: "> Grep (x)\n… running Grep…" }],
@@ -2385,11 +2400,12 @@ describe("TaskOutput identity render", () => {
     const out = lines.join("\n");
     expect(out).toContain("Task(task-1)");
     expect(out).toContain("Agent(coder)");
-    expect(out).toContain("running Grep…");
+    expect(out).toContain("running");
+    expect(out).not.toContain("Grep");
     expect(out).not.toContain("> Grep (x)"); // the tail lives in the panel/drill-down
   });
 
-  it("a wait:false poll renders ONE identity status line + last activity (not a bare chip); starting… when idle", () => {
+  it("a wait:false poll renders one identity/state line without live activity", () => {
     const active = render({
       taskId: "task-6",
       status: "running",
@@ -2399,7 +2415,8 @@ describe("TaskOutput identity render", () => {
     }, "Background task task-6 (coder) is still running — running Grep…");
     expect(active).toContain("Task(task-6)");
     expect(active).toContain("Agent(coder)");
-    expect(active).toContain("running Grep…");
+    expect(active).toContain("running");
+    expect(active).not.toContain("Grep");
 
     const idle = render({
       taskId: "task-6",
@@ -2408,7 +2425,7 @@ describe("TaskOutput identity render", () => {
       agentId: "agent-aabbccddeeff",
     });
     expect(idle).toContain("Task(task-6)");
-    expect(idle).toContain("starting…");
+    expect(idle).toContain("running");
   });
 
   it("two same-type concurrent tasks render DISTINCT Task(task-N) status lines", () => {
@@ -2427,9 +2444,11 @@ describe("TaskOutput identity render", () => {
       lastActivity: "running Read…",
     });
     expect(a).toContain("Task(task-1)");
-    expect(a).toContain("running Grep…");
+    expect(a).toContain("running");
+    expect(a).not.toContain("Grep");
     expect(b).toContain("Task(task-2)");
-    expect(b).toContain("running Read…");
+    expect(b).toContain("running");
+    expect(b).not.toContain("Read");
     expect(a).not.toContain("task-2");
     expect(b).not.toContain("task-1");
   });
@@ -2600,7 +2619,7 @@ describe("TaskOutput identity render", () => {
 
 // ---------------------------------------------------------------------------
 // Condensed completion records — the collapsed-by-default final render
-// (badge + duration + tokens + pointer + expand affordance), the Ctrl+O
+// (identity + duration + usage + local time + expand affordance), the Ctrl+O
 // expanded full body, the exactly-once reference line, and the \r line-break
 // discipline. Pure renderer unit tests over renderAgentResult.
 // ---------------------------------------------------------------------------
@@ -2619,6 +2638,7 @@ describe("condensed completion records", () => {
     resumable: true,
     usage: { inputTokens: 10, outputTokens: 5, costUsd: 0.01 },
     durationMs: 242_000,
+    settledAt: new Date(2026, 0, 2, 7, 5).getTime(),
   };
   const renderLines = (
     details: Record<string, unknown>,
@@ -2632,24 +2652,225 @@ describe("condensed completion records", () => {
       undefined,
     ).render(width);
 
-  it("collapsed (expanded:false): ONE badge line with chip, outcome, duration, tokens, pointer, and the expand affordance — in that order", () => {
+  it("collapsed success is one Agent-to-Task completion line with metadata, local time, and expand affordance", () => {
     const lines = renderLines(completedDetails, "the answer", false);
     expect(lines).toHaveLength(1);
     const out = lines[0]!;
-    expect(out).toContain("● Task(task-3) · Agent(coder) completed");
-    expect(out).toContain("4m02s"); // durationMs formatted
-    expect(out).toContain("in 10"); // brief tokens (in/out + cost)
-    expect(out).toContain(`${AGENT_ID}.jsonl`); // transcript-basename pointer…
-    expect(out).not.toContain("/x/sessions/"); // …not the full path
+    expect(out).toContain("Agent(coder) → Task(task-3) completed");
+    expect(out).toContain("4m02s");
+    expect(out).toContain("in 10");
+    expect(out).toContain("07:05");
+    expect(out).not.toContain(".jsonl");
+    expect(out).not.toContain("/x/sessions/");
     expect(out).toContain(RECORD_EXPAND_HINT);
-    expect(out).not.toContain("the answer"); // the body stays behind expand
-    // Segment order is pinned: duration → tokens → pointer → hint (metadata
-    // truncates from the right, most-expendable last-but-one).
-    const order = ["4m02s", "in 10", `${AGENT_ID}.jsonl`, RECORD_EXPAND_HINT].map((s) =>
-      out.indexOf(s),
-    );
+    expect(out).not.toContain("the answer");
+    const order = ["4m02s", "in 10", "07:05", RECORD_EXPAND_HINT].map((s) => out.indexOf(s));
     expect(order.every((i) => i >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
+  });
+
+  it("preserves task identity, state, and full cues at 60/80 columns with long project agent types", () => {
+    const longAgent = "project-security-reviewer-with-an-extra-long-name";
+    const usageSegment = "USAGESEGMENT01234567890123456789";
+    for (const width of [60, 80]) {
+      const completed = renderLines(
+        { ...completedDetails, agent: longAgent, usage: usageSegment },
+        "answer",
+        false,
+        width,
+      )[0]!;
+      expect(completed).toContain("Task(task-3) completed");
+      expect(completed).toContain(RECORD_EXPAND_HINT);
+      expect(completed.includes(usageSegment) || !completed.includes("USAGESEGMENT")).toBe(true);
+      expect(tuiVisibleWidth(completed)).toBeLessThanOrEqual(width);
+
+      const running = renderAgentResult(
+        {
+          content: [{ type: "text", text: "ignored activity" }],
+          details: {
+            taskId: "task-3",
+            status: "running",
+            agent: longAgent,
+            usage: usageSegment,
+            durationMs: 12_000,
+          },
+        },
+        { isPartial: true, expanded: false },
+        undefined,
+      ).render(width)[0]!;
+      expect(running).toContain("Task(task-3) running");
+      expect(running.includes(usageSegment) || !running.includes("USAGESEGMENT")).toBe(true);
+      expect(tuiVisibleWidth(running)).toBeLessThanOrEqual(width);
+
+      const reference = renderLines(
+        { ...completedDetails, agent: longAgent, alreadyReported: true },
+        "answer",
+        false,
+        width,
+      )[0]!;
+      expect(reference).toContain("Task(task-3) completed");
+      expect(reference).toContain(RECORD_REFERENCE_NOTE);
+      expect(tuiVisibleWidth(reference)).toBeLessThanOrEqual(width);
+    }
+  });
+
+  it("drops optional lifecycle segments whole across their width boundaries", () => {
+    const usageSegment = "USAGESEGMENT0123456789";
+    for (let width = 45; width <= 100; width += 1) {
+      const completed = renderLines(
+        { ...completedDetails, agent: "long-project-reviewer", usage: usageSegment },
+        "answer",
+        false,
+        width,
+      )[0]!;
+      expect(completed.includes(usageSegment) || !completed.includes("USAGESEGMENT")).toBe(true);
+      if (width >= 60) {
+        expect(completed).toContain("Task(task-3) completed");
+        expect(completed).toContain(RECORD_EXPAND_HINT);
+      }
+      expect(tuiVisibleWidth(completed)).toBeLessThanOrEqual(width);
+    }
+  });
+
+  it("preserves complete failed, aborted, and user-stopped states and cues at 60/80 columns", () => {
+    const agent = "project-security-reviewer-with-an-extra-long-name";
+    const cases = [
+      { taskId: "task-4", status: "failed", outcome: "failed", agent, error: "ERRORSEGMENT0123456789" },
+      { taskId: "task-5", status: "stopped", outcome: "aborted", agent },
+      { taskId: "task-6", status: "stopped", outcome: "aborted", agent, userStopped: true },
+    ];
+    const states = ["failed", "aborted", "stopped by user"];
+    for (const width of [60, 80]) {
+      cases.forEach((details, index) => {
+        const out = renderLines(details, "partial output", false, width)[0]!;
+        expect(out).toContain(`Task(${details.taskId})`);
+        expect(out).toContain(`) ${states[index]}`);
+        expect(out).toContain(RECORD_EXPAND_HINT);
+        expect(out).toContain("Agent(");
+        expect(tuiVisibleWidth(out)).toBeLessThanOrEqual(width);
+      });
+    }
+  });
+
+  it("drops the entire elastic Agent segment before fork-degraded success/failure cues at 60 columns", () => {
+    const forkDiagnostic = {
+      severity: "warning",
+      message: `${FORK_DEGRADE_PREFIX}: parent transcript unavailable`,
+    };
+    const agent = "project-security-reviewer-with-an-extra-long-name";
+    const success = renderLines(
+      {
+        ...completedDetails,
+        agent,
+        diagnostics: [forkDiagnostic],
+        usage: "USAGESEGMENT0123456789",
+      },
+      "answer",
+      false,
+      60,
+    )[0]!;
+    const failureDetails = {
+      taskId: "task-4",
+      status: "failed",
+      outcome: "failed",
+      agent,
+      diagnostics: [forkDiagnostic],
+      error: "ERRORSEGMENT0123456789",
+    };
+    const failure = renderLines(failureDetails, "partial output", false, 60)[0]!;
+    const successReference = renderLines(
+      { ...completedDetails, agent, diagnostics: [forkDiagnostic], alreadyReported: true },
+      "answer",
+      false,
+      60,
+    )[0]!;
+    const failureReference = renderLines(
+      { ...failureDetails, alreadyReported: true },
+      "partial output",
+      false,
+      60,
+    )[0]!;
+
+    expect(success).toBe(`Task(task-3) completed · ${RECORD_FORK_MARKER} · ${RECORD_EXPAND_HINT}`);
+    expect(failure).toBe(`✗ Task(task-4) failed · ${RECORD_FORK_MARKER} · ${RECORD_EXPAND_HINT}`);
+    expect(successReference).toBe(
+      `Task(task-3) completed · ${RECORD_FORK_MARKER} · ${RECORD_REFERENCE_NOTE}`,
+    );
+    expect(failureReference).toBe(
+      `✗ Task(task-4) failed · ${RECORD_FORK_MARKER} · ${RECORD_REFERENCE_NOTE}`,
+    );
+    for (const out of [success, failure, successReference, failureReference]) {
+      expect(out).not.toContain("Agent(");
+      expect(tuiVisibleWidth(out)).toBeLessThanOrEqual(60);
+    }
+  });
+
+  it("fits exceptional references at 60/80 and segment boundaries without partial mandatory cues", () => {
+    const agent = "project-security-reviewer-with-an-extra-long-name";
+    const cases = [
+      { taskId: "task-4", status: "failed", outcome: "failed", agent, error: "failure detail" },
+      { taskId: "task-5", status: "stopped", outcome: "aborted", agent },
+      { taskId: "task-6", status: "stopped", outcome: "aborted", agent, userStopped: true },
+    ];
+    const states = ["failed", "aborted", "stopped by user"];
+    const glyphs = ["✗", "■", "■"];
+    for (const width of [60, 80, ...Array.from({ length: 21 }, (_, index) => 61 + index)]) {
+      cases.forEach((details, index) => {
+        const out = renderLines({ ...details, alreadyReported: true }, "partial output", false, width)[0]!;
+        expect(out.startsWith(`${glyphs[index]} `)).toBe(true);
+        expect(out).toContain(`Task(${details.taskId})`);
+        expect(out).toContain(states[index]!);
+        expect(out).toContain(RECORD_REFERENCE_NOTE);
+        expect(out).not.toContain(RECORD_EXPAND_HINT);
+        expect(out).not.toContain("failure detail");
+        if (out.includes("Agent(")) expect(out).toMatch(/Agent\([^)]*\)/);
+        expect(tuiVisibleWidth(out)).toBeLessThanOrEqual(width);
+      });
+    }
+  });
+
+  it("drops exceptional error and metadata segments whole at every ordinary-width boundary", () => {
+    const error = "ERRORSEGMENT0123456789";
+    const usage = "USAGESEGMENT0123456789";
+    const base = {
+      agent: "project-security-reviewer-with-an-extra-long-name",
+      durationMs: 242_000,
+      settledAt: new Date(2026, 0, 2, 7, 5).getTime(),
+      usage,
+    };
+    const cases = [
+      { ...base, taskId: "task-4", status: "failed", outcome: "failed", error },
+      { ...base, taskId: "task-5", status: "stopped", outcome: "aborted" },
+      { ...base, taskId: "task-6", status: "stopped", outcome: "aborted", userStopped: true },
+    ];
+    const states = ["failed", "aborted", "stopped by user"];
+    for (let width = 60; width <= 160; width += 1) {
+      cases.forEach((details, index) => {
+        const out = renderLines(details, "partial output", false, width)[0]!;
+        expect(out).toContain(`Task(${details.taskId})`);
+        expect(out).toContain(`) ${states[index]}`);
+        expect(out).toContain(RECORD_EXPAND_HINT);
+        expect(out.includes(error) || !out.includes("ERRORSEGMENT")).toBe(true);
+        expect(out.includes(usage) || !out.includes("USAGESEGMENT")).toBe(true);
+        expect(out.includes("4m02s") || !out.includes("4m0")).toBe(true);
+        expect(out.includes("07:05") || !out.includes("07:")).toBe(true);
+        expect(tuiVisibleWidth(out)).toBeLessThanOrEqual(width);
+      });
+    }
+  });
+
+  it("foreground success uses the same grammar without a Task target", () => {
+    const lines = renderLines(
+      { ...completedDetails, taskId: undefined, transcriptPath: "/x/foreground.jsonl" },
+      "foreground answer",
+      false,
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("Agent(coder) completed");
+    expect(lines[0]).not.toContain("Task(");
+    expect(lines[0]).not.toContain(".jsonl");
+    expect(lines[0]).not.toContain("foreground answer");
+    expect(lines[0]).toContain(RECORD_EXPAND_HINT);
   });
 
   it("collapsed tokens are in/out (+cost) ONLY — cache read/write counts live exclusively in the expanded usage: footer", () => {
@@ -2670,18 +2891,17 @@ describe("condensed completion records", () => {
     expect(collapsed[0]).toContain("$0.25");
     expect(collapsed[0]).not.toContain("cache read");
     expect(collapsed[0]).not.toContain("cache write");
-    // At an ordinary 120-column terminal the pointer and the expand hint are
-    // what the cache counts would have pushed off the right edge.
+    // At an ordinary 120-column terminal the sole expand cue survives optional metadata.
     const at120 = renderLines(details, "the answer", false, 120);
     expect(at120).toHaveLength(1);
-    expect(at120[0]).toContain(`${AGENT_ID}.jsonl`);
+    expect(at120[0]).not.toContain(".jsonl");
     expect(at120[0]).toContain(RECORD_EXPAND_HINT);
     // Nothing is lost: the expanded usage: footer keeps the full compact line.
     const expanded = renderLines(details, "the answer", true).join("\n");
     expect(expanded).toContain("usage: in 10 · out 5 · cache read 2048 · cache write 1024 · $0.25");
   });
 
-  it("cross-platform pointer: a Windows-separator transcript path yields the basename on the collapsed line", () => {
+  it("compact success omits transcript filenames for both path separator styles", () => {
     const lines = renderLines(
       {
         ...completedDetails,
@@ -2691,8 +2911,14 @@ describe("condensed completion records", () => {
       false,
     );
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain(`${AGENT_ID}.jsonl`);
+    expect(lines[0]).not.toContain(".jsonl");
     expect(lines[0]).not.toContain("C:\\Users");
+    const posix = renderLines(
+      { ...completedDetails, transcriptPath: `/home/a/${AGENT_ID}.jsonl` },
+      "the answer",
+      false,
+    );
+    expect(posix[0]).not.toContain(".jsonl");
   });
 
   it("expanded (Ctrl+O) shows the full record: body, transcript path, duration, usage, resumable hint", () => {
@@ -2705,6 +2931,41 @@ describe("condensed completion records", () => {
     expect(out).not.toContain(RECORD_EXPAND_HINT);
   });
 
+  it("formats only Date-TimeClip-valid settlement timestamps as local HH:MM", () => {
+    const hhmm = (value: number) => {
+      const date = new Date(value);
+      return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+    };
+    const valid = [
+      0,
+      -1,
+      new Date(2026, 0, 2, 7, 5).getTime(),
+      new Date(2026, 0, 2, 23, 59).getTime(),
+      -8.64e15,
+      8.64e15,
+    ];
+    for (const settledAt of valid) {
+      const out = renderLines({ ...completedDetails, settledAt }, "answer", false, 300).join("\n");
+      expect(out).toContain(hhmm(settledAt));
+    }
+
+    for (const settledAt of [undefined, Number.NaN, Number.POSITIVE_INFINITY, -8.64e15 - 1, 8.64e15 + 1]) {
+      const details = { ...completedDetails, settledAt };
+      const out = renderLines(details, "answer", false, 300).join("\n");
+      expect(out).not.toMatch(/ · \d{2}:\d{2} · ctrl\+o to expand$/);
+    }
+  });
+
+  it("uses settlement time rather than render time", () => {
+    const settledAt = new Date(2024, 4, 6, 7, 5).getTime();
+    const before = renderLines({ ...completedDetails, settledAt }, "answer", false).join("\n");
+    const now = vi.spyOn(Date, "now").mockReturnValue(new Date(2035, 0, 1, 23, 59).getTime());
+    const later = renderLines({ ...completedDetails, settledAt }, "answer", false).join("\n");
+    now.mockRestore();
+    expect(before).toBe(later);
+    expect(later).toContain("07:05");
+  });
+
   it("a structural caller that OMITS the expanded option gets the full record (Pi always passes a boolean)", () => {
     const out = renderLines(completedDetails, "the answer", undefined).join("\n");
     expect(out).toContain("the answer");
@@ -2714,7 +2975,14 @@ describe("condensed completion records", () => {
   it("collapsed FAILED carries the capped error summary on the line", () => {
     const longError = `connection reset ${"x".repeat(200)}`;
     const lines = renderLines(
-      { taskId: "task-4", status: "failed", outcome: "failed", agent: "coder", error: longError },
+      {
+        taskId: "task-4",
+        status: "failed",
+        outcome: "failed",
+        agent: "coder",
+        error: longError,
+        transcriptPath: "/x/failure.jsonl",
+      },
       "partial work",
       false,
     );
@@ -2725,6 +2993,7 @@ describe("condensed completion records", () => {
     expect(out).toContain("…"); // capped, not the full 200-char error
     expect(out).not.toContain("x".repeat(100));
     expect(out).not.toContain("partial work"); // partial output behind expand
+    expect(out).not.toContain(".jsonl");
     expect(renderLines(
       { taskId: "task-4", status: "failed", outcome: "failed", agent: "coder", error: longError },
       "partial work",
@@ -2759,20 +3028,73 @@ describe("condensed completion records", () => {
     for (const expanded of [false, true]) {
       const lines = renderLines(details, "the answer", expanded);
       expect(lines).toHaveLength(1);
-      expect(lines[0]).toContain("● Task(task-3) · Agent(coder) completed");
+      expect(lines[0]).toContain("Agent(coder) → Task(task-3) completed");
       expect(lines[0]).toContain(RECORD_REFERENCE_NOTE);
-      // The reference line still names the on-disk file (basename pointer).
-      expect(lines[0]).toContain(`${AGENT_ID}.jsonl`);
+      expect(lines[0]).not.toContain(".jsonl");
       expect(lines[0]).not.toContain("/x/sessions/");
       expect(lines[0]).not.toContain("the answer");
       expect(lines[0]).not.toContain(RECORD_EXPAND_HINT);
     }
-    // Without a transcript path the reference line simply drops the pointer.
+    // A missing transcript path has no effect on the compact reference.
     const { transcriptPath: _tp, ...noPath } = details;
     const bare = renderLines(noPath, "the answer", false);
     expect(bare).toHaveLength(1);
     expect(bare[0]).toContain(RECORD_REFERENCE_NOTE);
     expect(bare[0]).not.toContain(".jsonl");
+  });
+
+  it.each([
+    ["scalar", `${ESC}]0;pwn${BEL}SAFE${ESC}[31m RED\rOVER${String.fromCharCode(1)}`],
+    ["text field", { text: `${ESC}]0;pwn${BEL}SAFE${ESC}[31m RED\rOVER${String.fromCharCode(1)}` }],
+  ])("sanitizes hostile textual usage in collapsed, running, and expanded rendering (%s)", (_label, usage) => {
+    const collapsed = renderLines({ ...completedDetails, usage }, "answer", false, 200).join("\n");
+    const running = renderAgentResult(
+      {
+        content: [{ type: "text", text: "activity" }],
+        details: { taskId: "task-3", status: "running", agent: "coder", usage },
+      },
+      { isPartial: true, expanded: false },
+      undefined,
+    ).render(200).join("\n");
+    const expanded = renderLines({ ...completedDetails, usage }, "answer", true, 80).join("\n");
+    for (const output of [collapsed, running, expanded]) {
+      expect(output).toContain("SAFE RED OVER");
+      expect(output).not.toContain(ESC);
+      expect(output).not.toContain(BEL);
+      expect(output).not.toContain("\r");
+      expect(output).not.toContain(String.fromCharCode(1));
+      for (const line of output.split("\n")) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(200);
+    }
+  });
+
+  it("settlement diagnostics skip null and malformed entries instead of throwing", () => {
+    const renderer = renderSettlementRecord(
+      {
+        record: "subagent-completion",
+        outcome: "completed",
+        agent: "coder",
+        finalText: "answer",
+        diagnostics: [
+          null,
+          {},
+          { severity: null, message: null },
+          { severity: "bogus", message: "wrong severity" },
+          { severity: "warning", message: 42 },
+          { severity: "warning", message: `${FORK_DEGRADE_PREFIX}: unavailable` },
+        ],
+      },
+      { expanded: true },
+      undefined,
+    );
+    expect(() => renderer?.render(80)).not.toThrow();
+    expect(renderer?.render(80).join("\n")).toContain(FORK_DEGRADE_PREFIX);
+    expect(() =>
+      renderAgentResult(
+        { content: [], details: { outcome: "completed", diagnostics: [null] } as never },
+        { expanded: true },
+        undefined,
+      ).render(80),
+    ).not.toThrow();
   });
 
   it("hostile fields: the collapsed line never leaks control bytes and never overflows any width", () => {
@@ -2817,10 +3139,10 @@ describe("condensed completion records", () => {
       const lines = renderLines({ ...completedDetails, durationMs }, "the answer", false);
       expect(lines).toHaveLength(1);
       // The duration segment is dropped whole — no "NaN"/garbage segment — and
-      // the rest of the line (pointer + hint) is intact.
+      // the expand affordance remains intact.
       expect(lines[0]).not.toContain("NaN");
       expect(lines[0]).not.toContain("soon");
-      expect(lines[0]).toContain(`${AGENT_ID}.jsonl`);
+      expect(lines[0]).not.toContain(".jsonl");
       expect(lines[0]).toContain(RECORD_EXPAND_HINT);
       // Same width/no-throw discipline as the hostile matrix above.
       for (const width of [1, 3, 20, 138]) {
@@ -2857,11 +3179,12 @@ describe("condensed completion records", () => {
     const out = lines.join("\n");
     expect(out).toContain("SAFE");
     expect(out).toContain("SPOOF");
-    // The CR-separated fragments land on SEPARATE emitted lines.
-    expect(lines.some((l) => l.includes("SAFE") && l.includes("SPOOF"))).toBe(false);
+    // Compact labels flatten line breaks only after control-byte sanitization.
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("SAFE SPOOF");
   });
 
-  it("a \\r in the prompt cannot ride into the one-line preview (firstLine breaks on CR)", () => {
+  it("prompt text is absent from the one-line pending row", () => {
     const CR = String.fromCharCode(13);
     const lines = renderAgentCall(
       { subagent_type: "coder", prompt: `SAFE${CR}SPOOF the rest of the prompt` },
@@ -2869,9 +3192,8 @@ describe("condensed completion records", () => {
     ).render(80);
     for (const l of lines) expect(l.includes(CR)).toBe(false);
     const out = lines.join("\n");
-    // firstLine takes only the FIRST CR-delimited segment as the preview.
-    expect(out).toContain("SAFE");
-    expect(out).not.toContain("SPOOF");
+    // Prompt text is intentionally absent from compact pending rows.
+    expect(out).toBe("Agent(coder)");
   });
 
   it("a \\r in a background-start body breaks the line — no same-line spoofing on the fallback start block", () => {

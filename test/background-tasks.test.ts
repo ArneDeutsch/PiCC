@@ -2127,15 +2127,15 @@ describe("TaskOutput live streaming", () => {
     const final = await pending;
 
     expect(partials.length).toBeGreaterThanOrEqual(1);
-    // At least one partial renders as the SINGLE self-identifying status line
-    // (chip + agent + activity — the panel owns the rolling tail). The
-    // EMISSION still carries the full snapshot for panel/RPC consumers.
+    // At least one partial renders as the single identity/state line. The
+    // emission still carries the full snapshot for panel/RPC/detail consumers.
     const identified = partials.some((p) => {
       const r = renderUpdate(p);
       return (
         r.includes("Task(" + id + ")") &&
         r.includes("Agent(coder)") &&
-        r.includes("running Grep…") &&
+        r.includes("running") &&
+        !r.includes("Grep") &&
         !r.includes("\n") && // one status line, no tail
         (p.details?.subagentProgress as ProgressSnapshot | undefined)?.tail.includes("> Grep (x)") === true
       );
@@ -2317,10 +2317,14 @@ describe("TaskOutput live streaming", () => {
     expect(rendered).toContain("coder");
     expect(rendered.includes(ESC)).toBe(false);
     expect(rendered.includes(BEL)).toBe(false);
-    // renderCall is self-identifying too.
+    // Pending call grammar distinguishes default await from explicit polling.
     const call = taskOutput.renderCall({ task_id: id }, undefined).render(120).join("\n");
-    expect(call).toContain("TaskOutput(" + id + ")");
-    expect(call).toContain("coder");
+    const pollCall = taskOutput
+      .renderCall({ task_id: id, wait: false }, undefined)
+      .render(120)
+      .join("\n");
+    expect(call).toBe(`TaskOutput(${id}) awaiting`);
+    expect(pollCall).toBe(`TaskOutput(${id}) polling`);
     expect(call.includes(ESC)).toBe(false);
     release();
     await registry.wait(id);
@@ -3094,7 +3098,11 @@ describe("settlement completion record (details + exactly-once)", () => {
       .renderResult(afterNotice, { isPartial: false, expanded: false }, undefined)
       .render(200);
     expect(noticeReference).toHaveLength(1);
-    expect(noticeReference[0]).toContain(`Agent(worker) ${testCase.badge}`);
+    expect(noticeReference[0]).toContain(
+      testCase.outcome === "completed"
+        ? `Agent(worker) → Task(${noticeTask.id}) completed`
+        : `Agent(worker) ${testCase.badge}`,
+    );
     expect(noticeReference[0]).toContain(RECORD_REFERENCE_NOTE);
 
     const directTask = await makeTask();
@@ -3124,7 +3132,11 @@ describe("settlement completion record (details + exactly-once)", () => {
       .renderResult(second, { isPartial: false, expanded: false }, undefined)
       .render(200);
     expect(collectionReference).toHaveLength(1);
-    expect(collectionReference[0]).toContain(`Agent(worker) ${testCase.badge}`);
+    expect(collectionReference[0]).toContain(
+      testCase.outcome === "completed"
+        ? `Agent(worker) → Task(${directTask.id}) completed`
+        : `Agent(worker) ${testCase.badge}`,
+    );
     expect(collectionReference[0]).toContain(RECORD_REFERENCE_NOTE);
   });
 
@@ -3175,9 +3187,9 @@ describe("settlement completion record (details + exactly-once)", () => {
     const collapsedLines = collapsed.render(200);
     expect(collapsedLines).toHaveLength(1);
     expect(collapsedLines[0]).toContain(`Task(${id})`);
-    expect(collapsedLines[0]).toContain("Agent(worker) completed");
+    expect(collapsedLines[0]).toContain(`Agent(worker) → Task(${id}) completed`);
     expect(collapsedLines[0]).toContain(RECORD_EXPAND_HINT);
-    expect(collapsedLines[0]).toContain(`${AGENT_ID}.jsonl`);
+    expect(collapsedLines[0]).not.toContain(".jsonl");
     expect(collapsedLines[0]).not.toContain("the review report");
     const expanded = renderSettlementRecord(details, { expanded: true }, undefined)!
       .render(200)

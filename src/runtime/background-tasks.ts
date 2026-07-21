@@ -12,6 +12,7 @@ import {
 import {
   renderAgentResult,
   renderTaskOutputCall,
+  type SubagentLifecycleRenderContext,
   type SubagentRenderDetails,
 } from "./subagent-render.js";
 import {
@@ -868,23 +869,24 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
         Type.Boolean({ description: "Wait for completion (default true)" }),
       ),
     }),
-    // Dispatch-time display: a self-identifying `TaskOutput(task-N) ·
-    // Agent(<type>)` line. Looks the agent type up from the registry so the chip
-    // is legible before the (possibly still running) result renders.
-    renderCall(args: Record<string, unknown>, theme: unknown) {
-      const rec = registry.get(String((args ?? {}).task_id ?? "").trim());
-      return renderTaskOutputCall(args, rec?.agentType ?? rec?.agentName, theme);
+    // Pending display distinguishes awaiting from polling. Pi's per-call state
+    // lets a partial or final result replace it without a duplicate shell.
+    renderCall(
+      args: Record<string, unknown>,
+      theme: unknown,
+      context: SubagentLifecycleRenderContext,
+    ) {
+      return renderTaskOutputCall(args, theme, context);
     },
-    // Result display: delegate to the SHARED subagent renderer so the
-    // live tail, outcome badge, identity subline, transcript + usage footer all
-    // render exactly like a foreground dispatch (no forked renderer). The taskId
-    // in `details` gates the background-identity additions.
+    // Delegate to the shared renderer so running/completion grammar and expanded
+    // transcript access match foreground dispatches.
     renderResult(
       result: { content?: Array<{ type: string; text: string }>; details?: SubagentRenderDetails },
       options: { expanded?: boolean; isPartial?: boolean },
       theme: unknown,
+      context: SubagentLifecycleRenderContext,
     ) {
-      return renderAgentResult(result, options, theme);
+      return renderAgentResult(result, options, theme, context);
     },
     async execute(
       _toolCallId: string,
