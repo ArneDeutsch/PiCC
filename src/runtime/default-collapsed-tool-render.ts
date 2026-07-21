@@ -348,6 +348,9 @@ function logicalLineCount(value: string): Snapshot<number> {
   }
   return { kind: "complete", value: retainedLines };
 }
+function detachedDisplayLineCount(value: string): Snapshot<number> {
+  return logicalLineCount(sanitize(value, MAX_TEXT_CHARS, false));
+}
 function bashDisplayLineCount(value: string): Snapshot<number> {
   // Count the same detached, terminal-safe DTO that native expansion receives.
   const display = sanitize(value, MAX_TEXT_CHARS, false).trim();
@@ -411,7 +414,7 @@ function ordinary(toolName: ToolName, args: ArgsSnapshot, result: unknown, conte
   if (!("path" in args)) return { kind: "malformed" };
   if (toolName === "read") {
     if (hasReadNotice(text) || text.startsWith("Read image file [")) return { kind: "malformed" };
-    const count = logicalLineCount(text);
+    const count = detachedDisplayLineCount(text);
     return count.kind === "complete" ? {
       kind: "complete", value: {
         kind: "file", path: args.path, hiddenLines: count.value,
@@ -422,7 +425,7 @@ function ordinary(toolName: ToolName, args: ArgsSnapshot, result: unknown, conte
     } : count;
   }
   if (args.content === undefined || text !== `Successfully wrote ${args.content.length} bytes to ${args.path}`) return { kind: "malformed" };
-  const count = logicalLineCount(args.content);
+  const count = detachedDisplayLineCount(args.content);
   return count.kind === "complete" ? { kind: "complete", value: { kind: "file", path: args.path, hiddenLines: count.value } } : count;
 }
 
@@ -850,31 +853,36 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
       if (toolName !== "bash") {
         if (!args || argsInspection.kind !== "complete") return statusComponent(argsFailure(argsInspection), theme);
         if (resultInspection.kind !== "complete") return statusComponent(failure(resultInspection), theme);
-        const hint = keyHint();
-        const settled = ownBoolean(options, "isPartial") === false && ownBoolean(context, "isError") !== undefined;
-        if (!settled) {
-          const resultRecord = record(resultInspection.value);
-          if (!resultRecord) return statusComponent("Unfamiliar result", theme);
-          const displayArgs = sanitizeArgsDto(argsInspection.value) as Data;
-          const displayResult = sanitizeDto(resultRecord) as Data;
+        const safe = delegable(toolName, args, resultInspection.value);
+        if (!safe) return statusComponent("Unfamiliar result", theme);
+        const optionsPartial = ownBoolean(options, "isPartial");
+        const contextPartial = ownBoolean(context, "isPartial");
+        if (optionsPartial === true || contextPartial === true) {
           try {
-            const component = nativeResult(displayResult, { expanded, isPartial: true }, theme,
-              nativeContext(context, displayArgs, lifecycle.nativeResult, expanded));
+            const component = nativeResult(safe.result, { expanded, isPartial: true }, theme,
+              nativeContext(context, safe.args, lifecycle.nativeResult, expanded));
             lifecycle.nativeResult = component;
             return component;
           } catch { return statusComponent("Renderer failed", theme); }
         }
-        const safe = delegable(toolName, args, resultInspection.value);
-        if (!safe) return statusComponent("Unfamiliar result", theme);
+        const hint = keyHint();
+        const settledAgreement = optionsPartial === false && contextPartial === false &&
+          ownBoolean(context, "isError") === false;
         const owned = lifecycle.settledObserved && Boolean(hint);
-        const isOrdinary = ownBoolean(context, "isError") === false
+        const isOrdinary = settledAgreement
           ? ordinary(toolName, args, resultInspection.value, context) : { kind: "malformed" } as const;
         if (isOrdinary.kind === "capped") return statusComponent(failure(isOrdinary), theme);
         if (owned && isOrdinary.kind === "complete" && !expanded) {
           return summaryComponent(toolName, isOrdinary.value, hint as string, theme);
         }
-        const forceExpanded = !hint;
+        const forceExpanded = !hint || !settledAgreement;
         try {
+          let callComponent = lifecycle.nativeCall;
+          if (owned && forceExpanded) {
+            callComponent = nativeCall(safe.args, theme,
+              nativeContext(context, safe.args, lifecycle.nativeCall, true));
+            lifecycle.nativeCall = callComponent;
+          }
           const resultComponent = nativeResult(
             safe.result,
             { expanded: forceExpanded || expanded, isPartial: false },
@@ -883,9 +891,11 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
           );
           lifecycle.nativeResult = resultComponent;
           if (!owned) return resultComponent;
-          if (!lifecycle.nativeCall) return statusComponent("Unfamiliar result", theme);
-          if (isOrdinary.kind === "complete") return combined([lifecycle.nativeCall, resultComponent], theme);
-          return combined([statusComponent("Elaborated result", theme), lifecycle.nativeCall, resultComponent], theme);
+          if (!callComponent) return statusComponent("Unfamiliar result", theme);
+          if (settledAgreement && isOrdinary.kind === "malformed") {
+            return combined([statusComponent("Elaborated result", theme), callComponent, resultComponent], theme);
+          }
+          return combined([callComponent, resultComponent], theme);
         } catch { return statusComponent("Renderer failed", theme); }
       }
 

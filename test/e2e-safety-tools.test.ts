@@ -32,6 +32,19 @@ const CONTROLLED_PRESENTATION_LITERALS = [
   "no net change",
   "(no output)",
   "to expand",
+  "Elaborated result",
+  "Renderer failed",
+  "Unfamiliar result",
+  "Unfamiliar arguments",
+  "Detail inspection limit reached",
+  "Native cleanup failed",
+  "Edit preview failed",
+  "edit details too large",
+  "remaining detail uninspected",
+  "details uninspected",
+  "display only; tool data unchanged",
+  "presentation failure",
+  "settled result elaborated",
   RECORD_EXPAND_HINT,
 ] as const;
 function expectNoPresentationLiterals(value: string): void {
@@ -92,16 +105,15 @@ describe.skipIf(cliMissing)(
         const pythonProbe = PYTHON_BIN
           ? ` && ${PYTHON_BIN} -c "print('arrow-' + chr(0x2192) + '-end')"`
           : "";
+        const command = "echo PCD_BASH_OK && node -e \"console.log('node-'+(1+1))\"" + pythonProbe;
         const result = await runPi({
+          persistSession: true,
           script: [
             {
               toolCalls: [
                 {
                   name: "bash",
-                  args: {
-                    command:
-                      "echo PCD_BASH_OK && node -e \"console.log('node-'+(1+1))\"" + pythonProbe,
-                  },
+                  args: { command },
                 },
               ],
             },
@@ -112,9 +124,19 @@ describe.skipIf(cliMissing)(
 
         expect(result.code).toBe(0);
         expect(result.requests.length).toBeGreaterThanOrEqual(2);
-        const toolResult = toolResultText(result.requests[1]!);
-        expect(toolResult).toContain("PCD_BASH_OK");
-        expect(toolResult).toContain("node-2");
+        const expectedOutput = [
+          "PCD_BASH_OK",
+          "node-2",
+          ...(PYTHON_BIN ? [`arrow-${arrow}-end`] : []),
+        ].join("\n") + (PYTHON_BIN && process.platform === "win32" ? "\r\n" : "\n");
+        const secondRequest = result.requests[1]!;
+        const toolResult = toolResultText(secondRequest);
+        expect(toolResult).toBe(expectedOutput);
+        const modelToolMessages = secondRequest.messages.filter((message) => message.role === "tool");
+        expect(modelToolMessages).toHaveLength(1);
+        expect(modelToolMessages[0]!.role).toBe("tool");
+        expect(modelToolMessages[0]!.content).toBe(expectedOutput);
+        expect(typeof modelToolMessages[0]!.tool_call_id).toBe("string");
         expectNoPresentationLiterals(toolResult);
         expectNoPresentationLiterals(result.stdout);
         // cp1252/UTF-8 boundary: only asserted when python actually ran (gated on
@@ -123,6 +145,44 @@ describe.skipIf(cliMissing)(
           expect(toolResult).toContain(`arrow-${arrow}-end`);
           expect(toolResult).not.toMatch(/UnicodeEncodeError|charmap/i);
         }
+
+        // Pi stores main sessions under <agentDir>/sessions/<encoded-cwd>/*.jsonl.
+        const sessionFiles: string[] = [];
+        const collectSessionFiles = (directory: string): void => {
+          for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+            const full = path.join(directory, entry.name);
+            if (entry.isDirectory()) collectSessionFiles(full);
+            else if (entry.name.endsWith(".jsonl")) sessionFiles.push(full);
+          }
+        };
+        collectSessionFiles(path.join(result.agentDir, "sessions"));
+        expect(sessionFiles).toHaveLength(1);
+        const transcript = fs.readFileSync(sessionFiles[0]!, "utf8");
+        expect(transcript.endsWith("\n")).toBe(true);
+        const entries = transcript.slice(0, -1).split("\n").map((line, index) => {
+          expect(line, `session frame ${index} must be nonempty`).not.toBe("");
+          return JSON.parse(line) as Record<string, unknown>;
+        });
+        const messages = entries
+          .filter((entry) => entry.type === "message")
+          .map((entry) => entry.message as Record<string, unknown>);
+        const assistant = messages.find((message) => message.role === "assistant" &&
+          Array.isArray(message.content) && message.content.some((block) =>
+            (block as { type?: unknown; name?: unknown }).type === "toolCall" &&
+            (block as { name?: unknown }).name === "bash"));
+        expect(assistant).toBeDefined();
+        const calls = (assistant!.content as Array<Record<string, unknown>>)
+          .filter((block) => block.type === "toolCall" && block.name === "bash");
+        expect(calls).toHaveLength(1);
+        expect(calls[0]!.arguments).toEqual({ command });
+        const toolCallId = calls[0]!.id;
+        const storedResults = messages.filter((message) => message.role === "toolResult" &&
+          message.toolCallId === toolCallId && message.toolName === "bash");
+        expect(storedResults).toHaveLength(1);
+        expect(modelToolMessages[0]!.tool_call_id).toBe(toolCallId);
+        expect(storedResults[0]!.content).toEqual([{ type: "text", text: expectedOutput }]);
+        expect(storedResults[0]!.isError).toBe(false);
+        expectNoPresentationLiterals(JSON.stringify({ call: calls[0], result: storedResults[0] }));
       },
       TEST_TIMEOUT_MS,
     );

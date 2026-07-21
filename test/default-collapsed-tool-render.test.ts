@@ -638,32 +638,63 @@ describe("default-collapsed tool rendering", () => {
     expect(noNetRow.render(26).join("\n")).toContain("no net change");
   }));
 
-  it("preserves the established Read and Write settlement predicate independently of context isPartial", () => withBindings(["ctrl+k"], () => {
-    for (const [tool, args, result] of [
-      [definition("read"), { path: "read.txt" }, readResult("body")],
-      [definition("write"), { path: "write.txt", content: "body" }, writeResult("write.txt", "body")],
-    ] as const) {
+  it("requires exact settled agreement while preserving native partial and fail-open lifecycle state", () => withBindings(["ctrl+k"], () => {
+    const cases = [
+      { label: "settled", optionsPartial: false, contextPartial: false, isError: false, requestedExpanded: false, compact: true, resultExpanded: false, resultPartial: false, callCount: 1, resultCount: 0 },
+      { label: "options partial", optionsPartial: true, contextPartial: false, isError: false, requestedExpanded: true, compact: false, resultExpanded: true, resultPartial: true, callCount: 1 },
+      { label: "context partial", optionsPartial: false, contextPartial: true, isError: false, requestedExpanded: false, compact: false, resultExpanded: false, resultPartial: true, callCount: 1 },
+      { label: "missing options", optionsPartial: undefined, contextPartial: false, isError: false, requestedExpanded: false, compact: false, resultExpanded: true, resultPartial: false, callCount: 2 },
+      { label: "missing context", optionsPartial: false, contextPartial: undefined, isError: false, requestedExpanded: false, compact: false, resultExpanded: true, resultPartial: false, callCount: 2 },
+      { label: "missing error", optionsPartial: false, contextPartial: false, isError: undefined, requestedExpanded: false, compact: false, resultExpanded: true, resultPartial: false, callCount: 2 },
+      { label: "settled error", optionsPartial: false, contextPartial: false, isError: true, requestedExpanded: false, compact: false, resultExpanded: true, resultPartial: false, callCount: 2 },
+    ] as const;
+    for (const name of ["read", "write"] as const) for (const candidate of cases) {
+      const callRecords: Array<{ expanded: boolean; last: unknown; returned: Component }> = [];
+      const resultRecords: Array<{ expanded: boolean; isPartial: boolean; last: unknown; returned: Component }> = [];
+      const source = {
+        name, execute() {},
+        renderCall(_args: unknown, _theme: unknown, ctx: { expanded: boolean; lastComponent?: unknown }) {
+          const returned = component(`native ${name} call ${ctx.expanded ? "expanded" : "collapsed"}`);
+          callRecords.push({ expanded: ctx.expanded, last: ctx.lastComponent, returned });
+          return returned;
+        },
+        renderResult(_result: unknown, options: { expanded: boolean; isPartial: boolean }, _theme: unknown,
+          ctx: { lastComponent?: unknown }) {
+          const returned = component(`native result ${options.expanded ? "expanded" : "collapsed"}\npreview second line`);
+          resultRecords.push({ ...options, last: ctx.lastComponent, returned });
+          return returned;
+        },
+      };
+      const tool = withDefaultCollapsedToolRendering(source as never) as unknown as RenderTool;
+      const args = name === "read" ? { path: "probe.txt" } : { path: "probe.txt", content: "body" };
+      const result = name === "read" ? readResult("body") : writeResult("probe.txt", "body");
       const state = {};
-      tool.renderCall(args, theme, { args, state, isPartial: false, isError: false });
-      const disagreed = tool.renderResult(result, { expanded: false, isPartial: false }, theme,
-        { args, state, isPartial: true, isError: false }).render(120).join("\n");
-      expect(disagreed, tool.name).toMatch(/\bline(?:s)? hidden\b/u);
-      expect(disagreed, tool.name).not.toContain("Elaborated result");
-
-      const error = tool.renderResult(result, { expanded: false, isPartial: false }, theme,
-        { args, state, isPartial: true, isError: true }).render(120).join("\n");
-      expect(error, tool.name).toContain("Elaborated result");
-      expect(error, tool.name).toContain("native result");
-
-      const absentError = tool.renderResult(result, { expanded: false, isPartial: false }, theme,
-        { args, state, isPartial: false }).render(120).join("\n");
-      expect(absentError, tool.name).toContain("native result");
-      expect(absentError, tool.name).not.toMatch(/\bline(?:s)? hidden\b/u);
-
-      const partialOptions = tool.renderResult(result, { expanded: false, isPartial: true }, theme,
-        { args, state, isPartial: false, isError: false }).render(120).join("\n");
-      expect(partialOptions, tool.name).toContain("native result");
-      expect(partialOptions, tool.name).not.toMatch(/\bline(?:s)? hidden\b/u);
+      tool.renderCall(args, theme, { args, state, isPartial: false, isError: false, expanded: false });
+      const options = { expanded: candidate.requestedExpanded, ...(candidate.optionsPartial === undefined ? {} : { isPartial: candidate.optionsPartial }) };
+      const resultContext = {
+        args, state, expanded: candidate.requestedExpanded,
+        ...(candidate.contextPartial === undefined ? {} : { isPartial: candidate.contextPartial }),
+        ...(candidate.isError === undefined ? {} : { isError: candidate.isError }),
+      };
+      const rendered = tool.renderResult(result, options, theme, resultContext).render(240).join("\n");
+      expect(callRecords, `${name} ${candidate.label}`).toHaveLength(candidate.callCount);
+      const expectedResultCount = "resultCount" in candidate ? candidate.resultCount : 1;
+      expect(resultRecords, `${name} ${candidate.label}`).toHaveLength(expectedResultCount);
+      if (expectedResultCount === 1) {
+        expect(resultRecords[0]!.expanded, `${name} ${candidate.label}`).toBe(candidate.resultExpanded);
+        expect(resultRecords[0]!.isPartial, `${name} ${candidate.label}`).toBe(candidate.resultPartial);
+        expect(resultRecords[0]!.last, `${name} ${candidate.label}`).toBeUndefined();
+      }
+      if (candidate.callCount === 2) {
+        expect(callRecords[1]!.expanded, `${name} ${candidate.label}`).toBe(true);
+        expect(callRecords[1]!.last, `${name} ${candidate.label}`).toBe(callRecords[0]!.returned);
+      }
+      if (candidate.compact) expect(rendered).toMatch(/\bline(?:s)? hidden\b/u);
+      else {
+        expect(rendered).not.toMatch(/\bline(?:s)? hidden\b/u);
+        expect(rendered).toContain("preview second line");
+        expect(rendered).not.toContain("Elaborated result");
+      }
     }
   }));
 
@@ -1142,6 +1173,27 @@ describe("default-collapsed tool rendering", () => {
     expect(settle(definition("read"), { path: "f.txt" }, readResult(text)).join("\n")).toContain(expected);
   }));
 
+  it.each([
+    ["OSC", "first\u001b]0;hidden\ninside\u0007\nsecond", "2 lines hidden", "first�\nsecond"],
+    ["DCS", "first\u001bPhidden\ninside\u001b\\\nsecond", "2 lines hidden", "first�\nsecond"],
+    ["APC", "first\u001b_hidden\ninside\u001b\\\nsecond", "2 lines hidden", "first�\nsecond"],
+    ["CSI", "first\u001b[31\nmsecond", "1 line hidden", "first�second"],
+  ])("counts Read/Write %s detail from the exact detached native display", (_kind, text, expected, delegated) => withBindings(["ctrl+o"], () => {
+    for (const [name, args, result] of [
+      ["read", { path: "controlled.txt" }, readResult(text)],
+      ["write", { path: "controlled.txt", content: text }, writeResult("controlled.txt", text)],
+    ] as const) {
+      const tool = definition(name);
+      expect(settle(tool, args, result).join("\n")).toContain(expected);
+      const context = contexts(args);
+      tool.renderCall(args, theme, { ...context.call, expanded: true });
+      const expanded = tool.renderResult(result, { expanded: true, isPartial: false }, theme,
+        { ...context.result, expanded: true }).render(240).join("\n");
+      expect(expanded, name).toContain(delegated);
+      expect(expanded, name).not.toContain("inside");
+    }
+  }));
+
   it("keeps live/partial rendering native and fails open for exceptional and unfamiliar results", () => withBindings(["ctrl+o"], () => {
     const tool = definition("read");
     const args = { path: "f.txt" };
@@ -1265,7 +1317,8 @@ describe("default-collapsed tool rendering", () => {
     read.renderCall(args, theme, { args, state, isPartial: false });
     const error = read.renderResult(readResult("permission denied"), { expanded: false, isPartial: false }, theme,
       { args, state, isPartial: false, isError: true }).render(80).join("\n");
-    expect(error).toContain("Elaborated result");
+    expect(error).not.toContain("Elaborated result");
+    expect(error).toContain("native read error.txt");
     expect(error).toContain("permission denied");
     expect(error).not.toContain("hidden");
     const altered = settle(definition("write"), { path: "x", content: "body" }, readResult("Successfully wrote 999 bytes to x")).join("\n");
@@ -1370,6 +1423,71 @@ describe("default-collapsed tool rendering", () => {
     expect(args).toEqual(canonicalArgs);
     expect(partial).toEqual(readResult(dangerous));
     expect(success).toEqual(canonicalResult);
+  }));
+
+  it("fails closed for every hostile and non-exact Write argument/result shape", () => withBindings(["ctrl+o"], () => {
+    let getterCalls = 0;
+    const revokedArgsHandle = Proxy.revocable({}, {});
+    revokedArgsHandle.revoke();
+    const inheritedArgs = Object.create({ path: "inherited.txt", content: "secret" });
+    const argumentCases: Array<{ label: string; value: unknown; expected: string }> = [
+      { label: "accessor", value: Object.defineProperty({ content: "secret" }, "path", {
+        enumerable: true, get() { getterCalls++; return "getter.txt"; },
+      }), expected: "Unfamiliar arguments" },
+      { label: "inherited", value: inheritedArgs, expected: "Unfamiliar arguments" },
+      { label: "revoked proxy", value: revokedArgsHandle.proxy, expected: "Unfamiliar arguments" },
+      { label: "future field", value: { path: "future.txt", content: "secret", future: true }, expected: "Unfamiliar arguments" },
+      { label: "oversized keys", value: Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`k${index}`, "secret"])), expected: "Detail inspection limit reached (keys); remaining detail uninspected" },
+      { label: "over-budget content", value: { path: "large.txt", content: "x".repeat(1_000_001) + "ARG_SECRET" }, expected: "Detail inspection limit reached (characters); remaining detail uninspected" },
+    ];
+    for (const item of argumentCases) {
+      const seen: unknown[] = [];
+      const tool = withDefaultCollapsedToolRendering({
+        name: "write", execute() {},
+        renderCall(value: unknown) { seen.push(value); return component("native call"); },
+        renderResult(value: unknown) { seen.push(value); return component("native result"); },
+      } as never) as unknown as RenderTool;
+      const rendered = tool.renderCall(item.value, theme, { args: item.value, state: {}, isPartial: false, isError: false })
+        .render(180).join("\n");
+      expect(rendered, item.label).toBe(item.expected);
+      expect(rendered, item.label).not.toMatch(/secret|ARG_SECRET|getter\.txt|future\.txt|large\.txt/iu);
+      expect(seen, item.label).toHaveLength(0);
+    }
+
+    const revokedResultHandle = Proxy.revocable({}, {});
+    revokedResultHandle.revoke();
+    const inheritedResult = Object.create({ details: undefined });
+    inheritedResult.content = [{ type: "text", text: "RESULT_SECRET" }];
+    const resultCases: Array<{ label: string; value: unknown; expected: string }> = [
+      { label: "accessor", value: Object.defineProperty({ content: [{ type: "text", text: "RESULT_SECRET" }] }, "details", {
+        enumerable: true, get() { getterCalls++; return undefined; },
+      }), expected: "Unfamiliar result" },
+      { label: "inherited", value: inheritedResult, expected: "Unfamiliar result" },
+      { label: "revoked proxy", value: revokedResultHandle.proxy, expected: "Unfamiliar result" },
+      { label: "future field", value: { ...(writeResult("safe.txt", "body") as Record<string, unknown>), future: true }, expected: "Unfamiliar result" },
+      { label: "oversized keys", value: Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`k${index}`, "RESULT_SECRET"])), expected: "Detail inspection limit reached (keys); remaining detail uninspected" },
+      { label: "over-budget result", value: readResult("x".repeat(1_000_001) + "RESULT_SECRET"), expected: "Detail inspection limit reached (characters); remaining detail uninspected" },
+    ];
+    for (const item of resultCases) {
+      const calls: unknown[] = [];
+      const results: unknown[] = [];
+      const tool = withDefaultCollapsedToolRendering({
+        name: "write", execute() {},
+        renderCall(value: unknown) { calls.push(value); return component("native call"); },
+        renderResult(value: unknown) { results.push(value); return component("native result"); },
+      } as never) as unknown as RenderTool;
+      const args = { path: "safe.txt", content: "body" };
+      const state = {};
+      tool.renderCall(args, theme, { args, state, isPartial: false, isError: false });
+      const rendered = tool.renderResult(item.value, { expanded: false, isPartial: false }, theme,
+        { args, state, isPartial: false, isError: false }).render(180).join("\n");
+      expect(rendered, item.label).toBe(item.expected);
+      expect(rendered, item.label).not.toContain("RESULT_SECRET");
+      expect(calls, item.label).toHaveLength(1);
+      expect(calls[0], item.label).not.toBe(args);
+      expect(results, item.label).toHaveLength(0);
+    }
+    expect(getterCalls).toBe(0);
   }));
 
   it("clamps tiny widths for statuses, expanded detail, and capped output", () => withBindings(["ctrl+o"], () => {
