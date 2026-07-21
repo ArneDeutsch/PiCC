@@ -221,7 +221,7 @@ describe("resolveCompactionConfig", () => {
     const cfg = baseConfig();
     const resolved = resolveCompactionConfig(cfg);
     expect(resolved.proactiveCompactPercent).toBe(DEFAULT_PROACTIVE_COMPACT_PERCENT);
-    expect(resolved.proactiveCompactPercent).toBe(85);
+    expect(resolved.proactiveCompactPercent).toBe(90);
     expect(resolved.clipMaxTokens).toBe(DEFAULT_CLIP_MAX_TOKENS);
     expect(resolved.clipMaxTokens).toBe(20000);
     expect(cfg.diagnostics).toHaveLength(0);
@@ -264,7 +264,7 @@ describe("resolveCompactionConfig", () => {
     // it fails closed to the 0–100-scale default so proactive compaction never thrashes.
     const cfg = baseConfig({ proactiveCompactPercent: 0.85 });
     const resolved = resolveCompactionConfig(cfg);
-    expect(resolved.proactiveCompactPercent).toBe(85);
+    expect(resolved.proactiveCompactPercent).toBe(90);
     expect(
       cfg.diagnostics.some((d) => d.severity === "warning" && d.message.includes("proactiveCompactPercent")),
     ).toBe(true);

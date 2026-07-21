@@ -29,7 +29,7 @@ export interface PiCCConfig {
   /**
    * Compaction-resilience knob: percent of the context window at which PiCC
    * proactively triggers Pi's own compaction. **0–100 scale** (NOT a 0–1 fraction) so it
-   * compares directly against Pi's `ContextUsage.percent`. Default 85; valid range 50–95.
+   * compares directly against Pi's `ContextUsage.percent`. Default 90; valid range 50–95.
    * Raw pre-validation file value (a number, or a numeric string from JSON) — validated once
    * via {@link resolveCompactionConfig}; production readers use {@link compaction} instead.
    */
@@ -63,7 +63,7 @@ const DEFAULT_EFFORT_MAP: Record<string, string> = {
 };
 
 /** Percent of the context window at which PiCC proactively compacts (0–100 scale). */
-export const DEFAULT_PROACTIVE_COMPACT_PERCENT = 85;
+export const DEFAULT_PROACTIVE_COMPACT_PERCENT = 90;
 /** Per-text-block token budget above which a single tool result is clipped. */
 export const DEFAULT_CLIP_MAX_TOKENS = 20000;
 
