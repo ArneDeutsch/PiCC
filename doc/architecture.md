@@ -232,8 +232,9 @@ where to start reading, not the extent of its cluster.
   from a config **outside the project** — outside **because harness state must not touch the target
   project**.
 
-- **Tool-row rendering** (`tool-shell.ts`, `search-tool-render.ts`) — the self-shell framing seam and
-  its specialized main-session Grep/Glob human renderer; neither changes canonical tool results.
+- **Tool-row rendering** (`tool-shell.ts`, `search-tool-render.ts`, `routine-tool-render.ts`) — the
+  self-shell framing seam plus guarded main-session human renderers for specialized search and
+  routine tool rows; decoration changes only presentation and never canonical model-facing results.
 
 - **`tools/`** — the **self-contained** Claude-named tools, and the degrade stubs: names that resolve
   for gating but no-op with a notice. A tool that fronts a runtime subsystem lives with that
