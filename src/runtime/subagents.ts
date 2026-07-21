@@ -40,7 +40,12 @@ import {
   type ProgressSnapshot,
   type SnapshotUsage,
 } from "./subagent-progress.js";
-import { renderAgentCall, renderAgentResult } from "./subagent-render.js";
+import {
+  renderAgentCall,
+  renderAgentResult,
+  type SubagentLifecycleRenderContext,
+  type SubagentRenderDetails,
+} from "./subagent-render.js";
 import { formatBackgroundTaskIdentity } from "./background-identity.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./builtin-tools.js";
 
@@ -1205,6 +1210,7 @@ export class SubagentRuntime {
     // runs leave it unset — a deliberately stopped result is discarded by
     // contract. Read once in the finally alongside outcome/usage.
     let settledFinalText: string | undefined;
+    let settledAssistantIdentityText: string | undefined;
     const captureUsage = (): DispatchUsage | undefined => {
       const live = session;
       if (live && typeof live.getSessionStats === "function") {
@@ -1655,8 +1661,8 @@ export class SubagentRuntime {
       // onUpdate sink), background, nested, and resumed dispatches all feed it;
       // opts.onProgress additionally receives the same snapshot when supplied,
       // exactly as before. Mirror before emit, so the record never lags a
-      // consumer-visible snapshot; the enlarged fullTail rides BESIDE the
-      // snapshot (a parallel record field), never inside the emitted payloads.
+      // consumer-visible snapshot; structured detail travels only to the
+      // registry record, never inside model-facing emitted payloads.
       // Event-stream only — NEVER poll session.messages (compaction inside
       // prompt() rewrites that array mid-flight). Degrades to nothing when the
       // session has no subscribe() (simple fakes, older SDKs).
@@ -1666,10 +1672,16 @@ export class SubagentRuntime {
         const condenser = new SubagentProgressCondenser();
         progressUnsub = session.subscribe((event: unknown) => {
           try {
-            if (!condenser.consume(event)) return;
-            const snapshot = condenser.snapshot();
-            dispatchRegistry?.noteProgress(agentId, snapshot, condenser.fullTail());
-            emit?.(snapshot);
+            const snapshotChanged = condenser.consume(event);
+            const detailChanged = condenser.detailChanged();
+            if (!snapshotChanged && !detailChanged) return;
+            const snapshot = snapshotChanged ? condenser.snapshot() : undefined;
+            dispatchRegistry?.noteProgress(
+              agentId,
+              snapshot,
+              detailChanged ? condenser.detailLog() : undefined,
+            );
+            if (snapshot) emit?.(snapshot);
           } catch {
             // progress is best-effort display — never let it break the dispatch
           }
@@ -1813,6 +1825,10 @@ export class SubagentRuntime {
         finalMessage = lastAssistantText(session);
       }
 
+      // Preserve the terminal assistant turn's identity before any display-only
+      // cut-off decoration; the registry stores the decoration but deduplicates
+      // against this raw source.
+      settledAssistantIdentityText = finalMessage;
       // A truncated completion ends with the cut-off frame; `cutOff` records
       // that so the model-visible ID trailer rides INSIDE that frame instead of
       // opening a second `---` frame.
@@ -1894,6 +1910,7 @@ export class SubagentRuntime {
         // Sanitized+capped by the registry; conversation content, never for
         // error/log interpolation.
         finalText: settledFinalText,
+        assistantIdentityText: settledAssistantIdentityText,
       });
       if (worktreePath && this.deps.worktrees && !opts.resume) {
         // Keep the worktree (the project's own merge flow owns its lifecycle); just unlock.
@@ -2136,23 +2153,24 @@ export function createAgentToolDefinition(
         }),
       ),
     }),
-    // Dispatch-time display: show WHICH agent and WHAT it was asked, at
-    // call time — replacing Pi's bare bold "Agent" fallback. Cheap and
-    // model-independent. Returns a structural pi-tui Component ({ render });
-    // guarded so it can never throw into the render loop.
-    renderCall(args: Record<string, unknown>, theme: unknown) {
-      return renderAgentCall(args, theme);
+    // Pending display is mode-neutral and result ownership is shared through
+    // Pi's per-call renderer state.
+    renderCall(
+      args: Record<string, unknown>,
+      theme: unknown,
+      context: SubagentLifecycleRenderContext,
+    ) {
+      return renderAgentCall(args, theme, context);
     },
-    // Result display (REQUIRED): Pi's fallback renders only result text, so
-    // without this the outcome badge, agent ID, transcript path, and usage
-    // would be invisible. Also renders the live rolling tail for partial
-    // (streaming) results. Renders defensively when optional fields are absent.
+    // Result display owns normal rows once a partial or final result exists;
+    // expansion retains full output and transcript access.
     renderResult(
-      result: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+      result: { content?: Array<{ type: string; text: string }>; details?: SubagentRenderDetails },
       options: { expanded?: boolean; isPartial?: boolean },
       theme: unknown,
+      context: SubagentLifecycleRenderContext,
     ) {
-      return renderAgentResult(result, options, theme);
+      return renderAgentResult(result, options, theme, context);
     },
     async execute(
       _toolCallId: string,
@@ -2251,6 +2269,7 @@ export function createAgentToolDefinition(
           // undefined for the coordinator) so scoped TaskOutput/TaskStop reach
           // exactly the tasks that dispatcher started.
           opts.ownerAgentId,
+          description,
         );
         taskId = id;
         // Identity-at-start: the agent id appears for EVERY background
@@ -2263,7 +2282,13 @@ export function createAgentToolDefinition(
               text: `Background task ${id} started (agent: ${label}, agent id: ${agentId}). Use TaskOutput with task_id "${id}" to retrieve the result before finalizing.`,
             },
           ],
-          details: { background: true, taskId: id, agent: label, agentId },
+          details: {
+            background: true,
+            taskId: id,
+            agent: label,
+            agentId,
+            description,
+          } satisfies SubagentRenderDetails,
         };
       }
       // Foreground: Pi's per-call signal (parent Esc) aborts the dispatch.
@@ -2275,7 +2300,11 @@ export function createAgentToolDefinition(
         ? (snapshot: ProgressSnapshot) => {
             onUpdate({
               content: [{ type: "text", text: renderProgressText(snapshot) }],
-              details: { subagentProgress: snapshot, agent: label, live: true },
+              details: {
+                subagentProgress: snapshot,
+                agent: label,
+                live: true,
+              } satisfies SubagentRenderDetails,
             });
           }
         : undefined;
@@ -2285,6 +2314,15 @@ export function createAgentToolDefinition(
         abortSignal: signal,
         onProgress,
       });
+      const settledAt = Date.now();
+      const durationMs = settledAt - dispatchedAtMs;
+      const timing =
+        Number.isFinite(dispatchedAtMs) &&
+        Number.isFinite(settledAt) &&
+        Number.isFinite(durationMs) &&
+        durationMs >= 0
+          ? { durationMs, settledAt }
+          : {};
       // Structured copy of the identity fields for every content-returning path
       // (details is logs/UI-only — the model never sees it, hence the trailer).
       const identityDetails = {
@@ -2295,14 +2333,11 @@ export function createAgentToolDefinition(
         // (formatUsageLine → formatUsageCompact). details is logs/UI-only — never
         // the model-visible content, so the verbatim-return contract is untouched.
         usage: result.usage,
-        // Elapsed wall-clock of the awaited dispatch, so FOREGROUND completion
-        // records show a duration like background ones (whose registry stamps
-        // startedAt/settledAt). Measured locally: the subagent registry that
-        // carries those stamps is private to the runtime and unreachable from
-        // this tool factory; this delta spans the identical interval. details
-        // is UI-only, so print/RPC output is untouched.
-        durationMs: Date.now() - dispatchedAtMs,
-      };
+        description,
+        // Panel-registry timestamps are private to the runtime; one local
+        // completion clock keeps duration and settlement instant in agreement.
+        ...timing,
+      } satisfies SubagentRenderDetails;
       // Claude 2.1.200 outcome→presentation mapping: the text, cut-off frame,
       // resume trailer, and throw-vs-return decision all live in the shared,
       // pure `presentDispatchResult` helper — the fork path consumes the same
@@ -2336,7 +2371,7 @@ export function createAgentToolDefinition(
             cutOff: presentation.cutOff,
             error: result.error,
             ...identityDetails,
-          },
+          } satisfies SubagentRenderDetails,
         };
       }
       // Verbatim-return contract: callers parse finalMessage directly (often a
@@ -2375,7 +2410,7 @@ export function createAgentToolDefinition(
                   : "background dispatch (run_in_background or a background:true agent) requested but no background task registry is wired; ran in foreground",
               }
             : {}),
-        },
+        } satisfies SubagentRenderDetails,
       };
     },
   };
@@ -2448,7 +2483,12 @@ export function createSendMessageToolDefinition(
               text: `Message delivered to running agent ${record.agentId} ("${record.agentName}") as a mid-task course correction.`,
             },
           ],
-          details: { agentId: record.agentId, agent: record.agentName, delivery: "steer" },
+          details: {
+            agentId: record.agentId,
+            agent: record.agentName,
+            description: record.description,
+            delivery: "steer",
+          } satisfies SubagentRenderDetails,
         };
       }
 
@@ -2542,6 +2582,8 @@ export function createSendMessageToolDefinition(
         () => controller.abort(),
         record.agentId,
         agentLabel,
+        undefined,
+        record.description,
       );
       taskId = id;
       const identity = formatBackgroundTaskIdentity(id, record.agentName, record.agentId);
@@ -2556,9 +2598,10 @@ export function createSendMessageToolDefinition(
           agentId: record.agentId,
           agent: record.agentName,
           taskId: id,
+          description: record.description,
           delivery: "resume",
           resumed: true,
-        },
+        } satisfies SubagentRenderDetails,
       };
     },
   };

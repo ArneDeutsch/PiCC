@@ -1854,9 +1854,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Only the RENDERING changes — the model-facing steer text is untouched.
   // Returns undefined (→ Pi's default custom-message box) for nested tasks and
   // for messages without the structured details.
-  pi.registerMessageRenderer("picc-settlement", (message: any, opts: any, theme: any) =>
-    renderSettlementRecord(message?.details, opts, theme),
-  );
+  pi.registerMessageRenderer("picc-settlement", (message: any, opts: any, theme: any) => {
+    let details: unknown;
+    try {
+      details = message?.details;
+    } catch {
+      return undefined;
+    }
+    return renderSettlementRecord(details, opts, theme);
+  });
 
   /**
    * Shows control-command output immediately. An appended entry renders in the

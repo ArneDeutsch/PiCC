@@ -52,7 +52,7 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
   routing, parallel background fan-out (nesting is opt-in via `subagents.maxDepth`), per-agent
   tool gating, and worktree isolation.
 - **Subagent observability** — a live status panel of the whole agent tree with a drill-down per
-  agent (prompt, live transcript tail, final answer, stop/dismiss/steer), plus condensed,
+  agent (prompt, structured live detail, final answer, stop/dismiss/steer), plus condensed,
   expandable per-agent records in the chat transcript.
 - **Worktrees** — `EnterWorktree`/`ExitWorktree` with a real session-cwd swap and a
   Windows-tolerant lifecycle, for parallel sessions on one repo.

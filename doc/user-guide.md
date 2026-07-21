@@ -177,10 +177,9 @@ Every subagent is visible, both to you and to the coordinating model:
 - **Status panel.** While agents run, a panel below the input shows the whole agent tree live —
   no `TaskOutput` await needed. One row per agent, nested children indented: a status bubble
   (spinner while running; `●` done, `✗` failed, `■` stopped), the agent type (tinted with the
-  agent's `color:` frontmatter when set), your dispatch description, its current activity, elapsed
-  time, and token usage once known (blank until then — never a fake zero; tokens are the first
-  column dropped on narrow terminals). Finished rows linger briefly — ~10 s for successes, ~60 s
-  for failures and stops — then leave on their own. That auto-expiry is a deliberate PiCC
+  agent's `color:` frontmatter when set), your dispatch description, elapsed time, and token usage
+  once known (blank until then — never a fake zero). Finished rows linger briefly — ~10 s
+  for successes, ~60 s for failures and stops — then leave on their own. That auto-expiry is a deliberate PiCC
   deviation: Claude Code keeps finished agents listed until dismissed. An expired row is not lost:
   `alt+a` reopens the panel with every finished agent still listed, and the condensed record in
   the chat (below) arrives once the conversation continues. While the panel has keyboard focus,
@@ -193,8 +192,8 @@ Every subagent is visible, both to you and to the coordinating model:
   for a second press within ~3 s to confirm. A user-initiated stop is **permanent**: a
   user-stopped agent cannot be steered or resumed afterwards, not even by the model.
 - **Drill-down.** Enter opens the selected agent: its initial prompt (collapsed; `ctrl+p`
-  expands), the live transcript tail (auto-following; `↑↓` scrolls, scrolling back stops the
-  follow), and — once settled — its final answer. `ctrl+x` stops a running background agent
+  expands), bounded structured live detail (auto-following; `↑↓` scrolls, scrolling back stops
+  the follow), and — once settled — its final answer. `ctrl+x` stops a running background agent
   (on a settled one it dismisses). While a background agent runs, type a steering message
   directly into the drill-down and press Enter to send; it is delivered before the agent's next
   model call (the confirmation is optimistic — a delivery failure replaces it). **Caveat:**
@@ -202,11 +201,11 @@ Every subagent is visible, both to you and to the coordinating model:
   Esc steps back one layer: drill-down → list → editor (with typed steer text, the first Esc
   clears the text; where steering is unavailable — foreground, one-shot, user-stopped — the view
   says so instead of offering an input line).
-- **Condensed transcript records.** Subagent output does not stream into the chat; the panel and
-  drill-down own the live view. Each depth-1 dispatch leaves one spawn record, and completion adds
-  one collapsed record — outcome, duration, tokens, transcript pointer — that Ctrl+O expands to
-  the full final answer, transcript path, usage, and any warnings. Background agents get their
-  record even if never awaited; an agent that settles while you are away from the prompt gets it
+- **Condensed transcript records.** Subagent output does not stream into the chat; selected-agent
+  detail owns the live view. Each depth-1 normal-path result replaces its pending call in the same
+  tool row; background completion adds one collapsed record — outcome, duration, tokens — that
+  Ctrl+O expands to the outcome-appropriate retained output, if any, plus the transcript path, usage, and any warnings. Background
+  agents get their record even if never awaited; an agent that settles while you are away from the prompt gets it
   when the conversation next continues (the record rides the next turn). A later `TaskOutput`
   collection adds only a minimal reference line, never a duplicate. Nested agents (depth ≥ 2) get
   no record of their own — they keep Pi's default notice box and appear in the panel tree and

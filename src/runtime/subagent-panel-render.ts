@@ -1,8 +1,22 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { formatUsageCompact, sanitizeLine, sanitizeProgressText } from "./subagent-progress.js";
+import {
+  DETAIL_FIELD_MAX_LENGTH,
+  DETAIL_LOG_MAX_ENTRIES,
+  formatUsageCompact,
+  sanitizeDetailScalar,
+  sanitizeLine,
+  sanitizeProgressText,
+  scalarSafeText,
+  type SubagentDetailEntry,
+} from "./subagent-progress.js";
 import { clampLines, pushWrapped, themedFg } from "./render-util.js";
 import type { PanelRowView, PanelViewModel } from "./subagent-panel-model.js";
-import { guardSteer, type SubagentRegistryRecord } from "./subagent-registry.js";
+import {
+  guardSteer,
+  SUBAGENT_FINAL_TEXT_CAP,
+  SUBAGENT_PROMPT_CAP,
+  type SubagentRegistryRecord,
+} from "./subagent-registry.js";
 
 /**
  * Subagent status-panel renderer: pure PanelViewModel → clamped string lines.
@@ -165,15 +179,34 @@ function segJoin(segs: readonly (Seg | undefined)[]): string {
 const MAX_INDENT_LEVELS = 6;
 /** Render-side caps for row fields (records are already capture-capped). */
 const TYPE_RENDER_CAP = 60;
+const TASK_ID_RENDER_CAP = 60;
+const TASK_ID_SANITIZE_CAP = TASK_ID_RENDER_CAP * 4;
 const LABEL_RENDER_CAP = 160;
-const ACTIVITY_RENDER_CAP = 160;
+
+function taskIdDisplay(taskId: string): string {
+  const flat = sanitizeProgressText(taskId).replace(/\s+/gu, " ").trim();
+  if (flat.length <= TASK_ID_SANITIZE_CAP) {
+    return truncateToWidth(flat, TASK_ID_RENDER_CAP, "…");
+  }
+  let prefix = "";
+  for (const scalar of flat) {
+    if (prefix.length + scalar.length > TASK_ID_SANITIZE_CAP - 1) break;
+    prefix += scalar;
+  }
+  return truncateToWidth(`${prefix}…`, TASK_ID_RENDER_CAP, "…");
+}
 
 /**
- * One panel row as a single line. Width degrade order when the line does not
- * fit: tokens → activity → elapsed → elastic label truncation; the final
- * clamp in renderSubagentPanel() is the safety net for the residue.
+ * One panel row as a single line. Identity, state, elapsed time, and known
+ * usage are fixed metadata; only the description is elastic. Returns absent
+ * when even a syntactically complete fixed-metadata row cannot fit, allowing
+ * the whole panel to use its existing aggregate summary instead.
  */
-function renderPanelRow(row: PanelRowView, opts: PanelRenderOptions, focused: boolean): string {
+function renderPanelRow(
+  row: PanelRowView,
+  opts: PanelRenderOptions,
+  focused: boolean,
+): string | undefined {
   const { width, theme } = opts;
   const muted = (text: string): Seg => ({ plain: text, styled: themedFg(theme, "muted", text) });
 
@@ -199,41 +232,68 @@ function renderPanelRow(row: PanelRowView, opts: PanelRenderOptions, focused: bo
     plain: typeText,
     styled: theme ? tintAgentColor(row.color, typeText) : typeText,
   };
+  // sanitizeLine bounds hostile input first; pi-tui then owns the display
+  // boundary so task-id truncation cannot split a grapheme or surrogate pair.
+  const taskText = row.taskId ? taskIdDisplay(row.taskId) : "";
+  const task: Seg | undefined = taskText ? muted(` [${taskText}]`) : undefined;
   const chip: Seg | undefined =
     row.hiddenDescendants > 0 ? muted(` (+${row.hiddenDescendants})`) : undefined;
 
   const labelText = sanitizeLine(row.label, LABEL_RENDER_CAP);
-  // The label column falls back to agentName; when it IS the agent name the
+  // The description falls back to agentName; when it IS the agent name the
   // type segment already shows it — render no duplicate.
   const hasLabel = labelText !== "" && labelText !== typeText;
-  const activityText = sanitizeLine(row.activity, ACTIVITY_RENDER_CAP);
-  const activity: Seg | undefined = activityText ? muted(` · ${activityText}`) : undefined;
   const elapsed: Seg = muted(` · ${formatElapsed(row.elapsedMs)}`);
-  // Tokens are BLANK until known — a fake 0 is worse than no figure.
+  // Usage is absent until known — a fake zero is worse than no figure.
   const usageText = row.usage ? formatUsageCompact(row.usage) : undefined;
-  const tokens: Seg | undefined = usageText ? muted(` · ${usageText}`) : undefined;
+  const usage: Seg | undefined = usageText ? muted(` · ${usageText}`) : undefined;
 
-  const labelSeg = (text: string): Seg => muted(` ${text}`);
-  const fixed = [marker, indent, glyph, type, chip];
-  const label = hasLabel ? labelSeg(labelText) : undefined;
-  const attempts: (Seg | undefined)[][] = [
-    [...fixed, label, activity, elapsed, tokens],
-    [...fixed, label, activity, elapsed],
-    [...fixed, label, elapsed],
-    [...fixed, label],
-  ];
-  for (const segs of attempts) {
-    if (segWidth(segs) <= width) return segJoin(segs);
+  const labelSeg = (text: string): Seg => muted(` · ${text}`);
+  const fixed = [marker, indent, glyph, type, task, chip, elapsed, usage];
+  if (segWidth(fixed) <= width) {
+    if (!hasLabel) return segJoin(fixed);
+    const room = width - segWidth(fixed) - 3; // description separator
+    if (room <= 0) return segJoin(fixed);
+    const fitted = truncateToWidth(labelText, room, "…");
+    return segJoin([...fixed, labelSeg(fitted)]);
   }
-  // Elastic label truncation: give the label whatever the fixed columns leave.
-  if (hasLabel) {
-    const room = width - segWidth(fixed) - 1; // 1 = the label's leading space
-    if (room >= 2) {
-      const truncated = truncateToWidth(labelText, room, "…");
-      return segJoin([...fixed, labelSeg(truncated)]);
-    }
+
+  // Constrained fixed-metadata fallback. Fit identity inside its own measured
+  // slot; never let the final clamp splice usage directly into a type or id.
+  const surrounding = [marker, indent, glyph, chip, elapsed, usage];
+  const identityRoom = width - segWidth(surrounding);
+  const taskSyntaxWidth = task ? visibleWidth(" []") : 0;
+  const minimumIdentityWidth = task ? taskSyntaxWidth + 2 : 1;
+  if (identityRoom < minimumIdentityWidth) return undefined;
+
+  if (!task) {
+    const fittedType = truncateToWidth(typeText, identityRoom, "…");
+    const fitted: Seg = {
+      plain: fittedType,
+      styled: theme ? tintAgentColor(row.color, fittedType) : fittedType,
+    };
+    return segJoin([marker, indent, glyph, fitted, chip, elapsed, usage]);
   }
-  return segJoin(fixed);
+
+  const contentRoom = identityRoom - taskSyntaxWidth;
+  const taskRoom = Math.min(visibleWidth(taskText), Math.max(1, Math.ceil(contentRoom / 2)));
+  const typeRoom = contentRoom - taskRoom;
+  const fittedTypeText = truncateToWidth(typeText, typeRoom, "…");
+  const fittedTaskText = truncateToWidth(taskText, taskRoom, "…");
+  const fittedType: Seg = {
+    plain: fittedTypeText,
+    styled: theme ? tintAgentColor(row.color, fittedTypeText) : fittedTypeText,
+  };
+  return segJoin([
+    marker,
+    indent,
+    glyph,
+    fittedType,
+    muted(` [${fittedTaskText}]`),
+    chip,
+    elapsed,
+    usage,
+  ]);
 }
 
 /** The whole-panel single line for very narrow terminals. */
@@ -262,13 +322,16 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
   if (width < PANEL_NARROW_WIDTH) {
     return clampLines([renderSummaryLine(view, opts)], width);
   }
+  const renderedRows = view.rows.map((row) => renderPanelRow(row, opts, view.focused));
+  if (renderedRows.some((row) => row === undefined)) {
+    return clampLines([renderSummaryLine(view, opts)], width);
+  }
+
   const lines: string[] = [];
   if (view.hiddenAbove > 0) {
     lines.push(themedFg(opts.theme, "muted", panelMoreAbove(view.hiddenAbove)));
   }
-  for (const row of view.rows) {
-    lines.push(renderPanelRow(row, opts, view.focused));
-  }
+  lines.push(...renderedRows.filter((row): row is string => row !== undefined));
   if (view.hiddenBelow > 0) {
     lines.push(themedFg(opts.theme, "muted", panelMoreBelow(view.hiddenBelow)));
   }
@@ -296,7 +359,9 @@ const DETAIL_STOP_KEY = "ctrl+x";
 // Banners for live state changes while the drill-down is open — the view
 // re-resolves its record each render and narrates the transition instead of
 // crashing or freezing on it.
-export const DETAIL_BANNER_SETTLED = "agent settled while viewing — final answer shown";
+export const DETAIL_BANNER_SETTLED = "agent completed while viewing — final answer shown";
+export const DETAIL_BANNER_FAILED = "agent failed while viewing — partial output shown";
+export const DETAIL_BANNER_STOPPED = "agent stopped while viewing — discarded output shown";
 export const DETAIL_BANNER_RESUMED = "agent resumed while viewing — live view";
 export const DETAIL_BANNER_VANISHED = "agent record is no longer available — esc back";
 
@@ -318,11 +383,13 @@ export function detailPromptCollapsed(lineCount: number): string {
   return `initial prompt (${lineCount} line${lineCount === 1 ? "" : "s"}) — ${DETAIL_PROMPT_KEY} to expand`;
 }
 export const DETAIL_PROMPT_EXPANDED = `initial prompt — ${DETAIL_PROMPT_KEY} to collapse`;
-export const DETAIL_NO_ACTIVITY = "(no activity captured yet)";
-export const DETAIL_NO_TAIL = "(no transcript tail captured)";
+export const DETAIL_NO_ACTIVITY = "(no detail events captured yet)";
 export const DETAIL_NO_FINAL_ANSWER = "(no final answer captured)";
+export const DETAIL_NO_PARTIAL_OUTPUT = "(no partial output captured before failure)";
+export const DETAIL_NO_DISCARDED_OUTPUT = "(no discarded output captured)";
 export const DETAIL_FINAL_LABEL = "final answer:";
-export const DETAIL_TAIL_LABEL = "transcript tail:";
+export const DETAIL_PARTIAL_LABEL = "partial output before failure:";
+export const DETAIL_DISCARDED_LABEL = "discarded output from stopped run:";
 /** The pinned steer input line's prefix. */
 export const DETAIL_STEER_PREFIX = "steer › ";
 
@@ -335,8 +402,94 @@ export function detailHint(opts: { steerable: boolean; stoppable: boolean }): st
   return parts.join(" · ");
 }
 
-/** Display-side per-line sanitize cap for detail body/notice content. */
-const DETAIL_LINE_CAP = 300;
+// sanitizeProgressText preserves CR, so splitting CR prevents hostile same-line overprinting.
+const LINE_BREAK_RE = /\r\n?|\n/;
+const DETAIL_MULTILINE_RAW_INSPECTION_LIMIT = SUBAGENT_FINAL_TEXT_CAP + 1;
+
+function boundedMultiline(value: string, cap: number): string {
+  let raw = value.slice(0, DETAIL_MULTILINE_RAW_INSPECTION_LIMIT);
+  if (value.length > raw.length && /[\uD800-\uDBFF]$/u.test(raw)) raw = raw.slice(0, -1);
+  const clean = scalarSafeText(sanitizeProgressText(raw));
+  // Registry-capped values include cap code units plus their existing ellipsis.
+  if (clean.length <= cap || (clean.length === cap + 1 && clean.endsWith("…"))) return clean;
+  let prefix = clean.slice(0, cap);
+  if (/[\uD800-\uDBFF]$/u.test(prefix)) prefix = prefix.slice(0, -1);
+  return `${prefix}…`;
+}
+
+/** Validate untrusted runtime-shaped detail data without walking more than its fixed budget. */
+function renderableDetailLog(value: unknown): SubagentDetailEntry[] {
+  let isArray = false;
+  try {
+    isArray = Array.isArray(value);
+  } catch {
+    return [];
+  }
+  if (!isArray) return [];
+
+  const entries: SubagentDetailEntry[] = [];
+  let count = 0;
+  try {
+    const length = (value as unknown[]).length;
+    if (typeof length !== "number" || !Number.isFinite(length) || length <= 0) return entries;
+    count = Math.min(Math.floor(length), DETAIL_LOG_MAX_ENTRIES);
+  } catch {
+    return entries;
+  }
+  for (let i = 0; i < count; i++) {
+    try {
+      const raw = (value as unknown[])[i];
+      if (!raw || typeof raw !== "object") continue;
+      const entry = raw as Record<string, unknown>;
+      const kind = entry.kind;
+      if (kind === "assistant") {
+        const textValue = entry.text;
+        const fingerprint = entry.fingerprint;
+        if (
+          typeof textValue !== "string" ||
+          typeof fingerprint !== "string" ||
+          fingerprint.length !== 64 ||
+          !/^[0-9a-f]{64}$/u.test(fingerprint)
+        ) continue;
+        const text = sanitizeDetailScalar(textValue);
+        if (text) entries.push({ kind, text, fingerprint });
+        continue;
+      }
+      if (kind === "status") {
+        const textValue = entry.text;
+        if (typeof textValue !== "string") continue;
+        const text = sanitizeDetailScalar(textValue);
+        if (text) entries.push({ kind, text });
+        continue;
+      }
+      if (kind === "tool-call") {
+        const toolValue = entry.tool;
+        const detailValue = entry.detail;
+        if (typeof toolValue !== "string") continue;
+        const tool = sanitizeDetailScalar(toolValue) || "tool";
+        const detail = typeof detailValue === "string"
+          ? sanitizeDetailScalar(detailValue)
+          : undefined;
+        entries.push(detail ? { kind, tool, detail } : { kind, tool });
+        continue;
+      }
+      if (kind === "tool-outcome") {
+        const toolValue = entry.tool;
+        const detailValue = entry.detail;
+        const failed = entry.failed;
+        if (typeof toolValue !== "string" || typeof failed !== "boolean") continue;
+        const tool = sanitizeDetailScalar(toolValue) || "tool";
+        const detail = typeof detailValue === "string"
+          ? sanitizeDetailScalar(detailValue)
+          : undefined;
+        entries.push(detail ? { kind, tool, detail, failed } : { kind, tool, failed });
+      }
+    } catch {
+      // A hostile getter/proxy is one malformed entry, not a render-loop failure.
+    }
+  }
+  return entries;
+}
 
 /** UI state the focus controller owns and threads through every detail render. */
 export interface PanelDetailUiState {
@@ -371,6 +524,10 @@ export interface PanelDetailRender {
   lines: string[];
   /** Max valid scrollTop for this body/viewport — the caller clamps its state. */
   maxScroll: number;
+}
+
+function detailWidth(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
 }
 
 /**
@@ -416,8 +573,8 @@ function detailSteerSlot(record: SubagentRegistryRecord): DetailSteerSlot {
 
 /**
  * The drill-down view: header → (banner) → scrollable body → notice/steer →
- * hint. Layout by state — running leads with the live tail (auto-following),
- * finished leads with the final answer. Pure and never-throwing over its
+ * hint. Layout by state — running leads with structured live detail (auto-following),
+ * finished leads with outcome-aware output. Pure and never-throwing over its
  * inputs; every emitted line is <= width (clampLines) and all record content
  * is re-sanitized at render (defense in depth over the capture-time pass).
  * The transcript path is rendered as an INERT pointer string only — the
@@ -428,7 +585,8 @@ export function renderSubagentDetail(
   ui: PanelDetailUiState,
   opts: DetailRenderOptions,
 ): PanelDetailRender {
-  const { width, theme } = opts;
+  const width = detailWidth(opts.width);
+  const theme = opts.theme;
   const muted = (text: string): string => themedFg(theme, "muted", text);
   const record = data.record;
   const lines: string[] = [];
@@ -436,7 +594,7 @@ export function renderSubagentDetail(
     // Same sanitize discipline as the record branch's banner — the vanished
     // branch must not become the one path that trusts ui.banner raw.
     lines.push(
-      themedFg(theme, "warning", sanitizeLine(ui.banner ?? DETAIL_BANNER_VANISHED, DETAIL_LINE_CAP)),
+      themedFg(theme, "warning", sanitizeLine(ui.banner ?? DETAIL_BANNER_VANISHED, DETAIL_FIELD_MAX_LENGTH)),
     );
     lines.push(muted("esc back"));
     return { lines: clampLines(lines, width), maxScroll: 0 };
@@ -475,24 +633,29 @@ export function renderSubagentDetail(
   if (record.transcriptPath) {
     lines.push(muted(`transcript: ${sanitizeLine(record.transcriptPath, 200)}`));
   }
-  if (ui.banner) lines.push(themedFg(theme, "warning", sanitizeLine(ui.banner, DETAIL_LINE_CAP)));
+  if (ui.banner) {
+    lines.push(themedFg(theme, "warning", sanitizeLine(ui.banner, DETAIL_FIELD_MAX_LENGTH)));
+  }
 
-  // Scrollable body, assembled per state.
+  // Scrollable body, assembled per state. Detail records are runtime-validated
+  // here rather than trusted from TypeScript because extension data can cross
+  // persistence/plugin boundaries with malformed shapes.
   const body: string[] = [];
-  // sanitizeProgressText deliberately PRESERVES \r (capture-side callers line-
-  // split themselves), so the multi-line paths must split on CR too: a lone
-  // \r surviving into an emitted line would let hostile content overprint the
-  // line from column 0 (same-line spoof). The tail path is already immune via
-  // sanitizeLine's whitespace collapse.
-  const LINE_BREAK_RE = /\r\n?|\n/;
-  const pushMultiline = (text: string): void => {
-    for (const raw of sanitizeProgressText(text).split(LINE_BREAK_RE)) {
-      pushWrapped(raw, width, body);
+  const pushMultiline = (text: string, color?: string): void => {
+    for (const raw of text.split(LINE_BREAK_RE)) {
+      pushWrapped(color ? themedFg(theme, color, raw) : raw, width, body);
     }
   };
-  const promptLines = record.prompt
-    ? sanitizeProgressText(record.prompt).split(LINE_BREAK_RE)
-    : [];
+  const pushSemantic = (label: string, text: string, color: string): void => {
+    const logical = text.split(LINE_BREAK_RE);
+    const first = logical.shift() ?? "";
+    pushWrapped(themedFg(theme, color, first ? `${label} ${first}` : label), width, body);
+    for (const raw of logical) pushWrapped(themedFg(theme, color, `  ${raw}`), width, body);
+  };
+  const promptText = typeof record.prompt === "string"
+    ? boundedMultiline(record.prompt, SUBAGENT_PROMPT_CAP)
+    : "";
+  const promptLines = promptText ? promptText.split(LINE_BREAK_RE) : [];
   const pushPrompt = (): void => {
     if (promptLines.length === 0) return;
     if (ui.promptExpanded) {
@@ -502,30 +665,69 @@ export function renderSubagentDetail(
       body.push(muted(detailPromptCollapsed(promptLines.length)));
     }
   };
-  const tailLines = record.fullTail ?? [];
-  const pushTail = (): void => {
-    if (tailLines.length === 0) {
-      body.push(muted(running ? DETAIL_NO_ACTIVITY : DETAIL_NO_TAIL));
+  const finalText = typeof record.finalText === "string"
+    ? boundedMultiline(record.finalText, SUBAGENT_FINAL_TEXT_CAP)
+    : undefined;
+  let rawDetailLog: unknown;
+  try {
+    rawDetailLog = record.detailLog;
+  } catch {
+    rawDetailLog = undefined;
+  }
+  const detailEntries = renderableDetailLog(rawDetailLog);
+  const pushDetailEntries = (): void => {
+    if (detailEntries.length === 0) {
+      body.push(muted(DETAIL_NO_ACTIVITY));
       return;
     }
-    for (const raw of tailLines) pushWrapped(sanitizeLine(raw, DETAIL_LINE_CAP), width, body);
+    for (const entry of detailEntries) {
+      switch (entry.kind) {
+        case "assistant":
+          pushSemantic("assistant:", entry.text, "text");
+          break;
+        case "tool-call":
+          pushSemantic("→ tool call:", entry.tool, "accent");
+          if (entry.detail) pushSemantic("  input:", entry.detail, "muted");
+          break;
+        case "tool-outcome":
+          pushSemantic(
+            entry.failed ? "✗ tool failure:" : "✓ tool result:",
+            entry.tool,
+            entry.failed ? "error" : "success",
+          );
+          if (entry.detail) pushSemantic("  output:", entry.detail, entry.failed ? "error" : "muted");
+          break;
+        case "status":
+          pushSemantic("status:", entry.text, "muted");
+          break;
+      }
+    }
   };
   if (running) {
-    // The collapsed one-liner is PINNED between header and tail (the spec's
-    // running layout) so the auto-following tail can never scroll it away;
-    // the expanded prompt joins the scrollable body instead.
+    // The collapsed one-liner stays pinned above the following viewport.
     if (promptLines.length > 0 && !ui.promptExpanded) {
       lines.push(muted(detailPromptCollapsed(promptLines.length)));
     }
     if (ui.promptExpanded) pushPrompt();
-    pushTail();
+    pushDetailEntries();
   } else {
-    body.push(muted(DETAIL_FINAL_LABEL));
-    if (record.finalText) pushMultiline(record.finalText);
-    else body.push(muted(DETAIL_NO_FINAL_ANSWER));
+    const stopped = record.userStopped || record.outcome === "aborted";
+    const failed = record.outcome === "failed";
+    const outputLabel = stopped
+      ? DETAIL_DISCARDED_LABEL
+      : failed
+        ? DETAIL_PARTIAL_LABEL
+        : DETAIL_FINAL_LABEL;
+    const absentLabel = stopped
+      ? DETAIL_NO_DISCARDED_OUTPUT
+      : failed
+        ? DETAIL_NO_PARTIAL_OUTPUT
+        : DETAIL_NO_FINAL_ANSWER;
+    body.push(muted(outputLabel));
+    if (finalText) pushMultiline(finalText);
+    else body.push(muted(absentLabel));
     pushPrompt();
-    body.push(muted(DETAIL_TAIL_LABEL));
-    pushTail();
+    pushDetailEntries();
   }
 
   const maxScroll = Math.max(0, body.length - DETAIL_BODY_ROWS);
@@ -535,7 +737,9 @@ export function renderSubagentDetail(
   for (let i = top; i < end; i++) lines.push(body[i]!);
   if (end < body.length) lines.push(muted(panelMoreBelow(body.length - end)));
 
-  if (ui.notice) lines.push(themedFg(theme, "warning", sanitizeLine(ui.notice, DETAIL_LINE_CAP)));
+  if (ui.notice) {
+    lines.push(themedFg(theme, "warning", sanitizeLine(ui.notice, DETAIL_FIELD_MAX_LENGTH)));
+  }
   const slot = detailSteerSlot(record);
   if (slot.kind === "input") {
     const avail = Math.max(0, width - visibleWidth(DETAIL_STEER_PREFIX));

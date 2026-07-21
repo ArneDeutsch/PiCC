@@ -208,11 +208,12 @@ where to start reading, not the extent of its cluster.
   extracted into `render-util.ts`) — the interactive-TUI observability surface over the dispatch
   registry: a pure view model and pure renderer, a thin `setWidget` shell for the passive
   below-editor panel, and a `ctx.ui.custom` focus controller for list navigation, the drill-down
-  (prompt / live tail / final answer), stop/dismiss/stop-all, and steering. TUI-only by
+  (prompt / structured live detail / final answer), stop/dismiss/stop-all, and steering. TUI-only by
   construction — the controllers are constructed unconditionally but attached only when
   `ctx.mode === "tui"`; print/RPC runs never touch a UI verb. The flip side is transcript slimming:
-  spawn and completion render as condensed, expandable records (`subagent-render.ts`, settlement
-  records via `pi.registerMessageRenderer`), and subagent output no longer streams into the chat.
+  normal-path results replace pending calls in the same tool row, while background completion renders
+  as a condensed, expandable record (`subagent-render.ts`, settlement records via
+  `pi.registerMessageRenderer`), and subagent output no longer streams into the chat.
 
 - **Session state** (`cwd-state.ts`, `worktrees.ts`) — `CwdState` is **the single mutable source of
   truth for the effective cwd**; every tool resolves through it at execute time (see *The cwd swap is

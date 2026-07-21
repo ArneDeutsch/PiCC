@@ -1197,6 +1197,16 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(typeof renderer, "no message renderer registered for picc-settlement").toBe(
       "function",
     );
+    const throwingDetails = Object.defineProperty({}, "details", {
+      get(): never {
+        throw new Error("details getter");
+      },
+    });
+    const revokedMessage = Proxy.revocable({}, {});
+    revokedMessage.revoke();
+    expect(() => renderer!(throwingDetails, { expanded: false }, undefined)).not.toThrow();
+    expect(() => renderer!(revokedMessage.proxy, { expanded: false }, undefined)).not.toThrow();
+    expect(renderer!(throwingDetails, { expanded: false }, undefined)).toBeUndefined();
 
     // A coordinator-owned settlement, never awaited.
     const agentId = "agent-77aa88bb99cc";
@@ -1251,6 +1261,8 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(top, "settlement message lost its details payload").toBeDefined();
     expect(nested).toBeDefined();
     expect(top!.details!.record).toBe("subagent-completion");
+    expect(typeof top!.details!.settledAt).toBe("number");
+    expect(typeof top!.details!.durationMs).toBe("number");
     expect(top!.content).toContain("settled: completed"); // model-facing text untouched
 
     // The RECORDED registered renderer, driven with the actual sent message at
@@ -1260,8 +1272,8 @@ describe("background settlement delivery (offline integration via the seam)", ()
     const lines = component.render(200) as string[];
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain(`Task(${taskId})`);
-    expect(lines[0]).toContain("Agent(reviewer) completed");
-    expect(lines[0]).toContain(`${agentId}.jsonl`); // transcript-basename pointer
+    expect(lines[0]).toContain(`Agent(reviewer) → Task(${taskId}) completed`);
+    expect(lines[0]).not.toContain(".jsonl");
     expect(lines[0]).toContain(RECORD_EXPAND_HINT);
     expect(lines[0]).not.toContain("WIRED-RECORD-REPORT"); // body stays behind expand
 
@@ -1269,6 +1281,32 @@ describe("background settlement delivery (offline integration via the seam)", ()
     // no main-chat completion record for depth ≥ 2 tasks.
     expect(nested!.details!.nested).toBe(true);
     expect(renderer!(nested, { expanded: false }, undefined)).toBeUndefined();
+  });
+
+  it("registered Agent threads a background description through the real TaskOutput wiring", async () => {
+    const handle = fakeSdk({ replies: ["BACKGROUND-DONE"] });
+    const { p, internals } = await wire();
+    internals.subagentRuntime.setSdkForTest(handle.sdk);
+    const agent = p.tools.get("Agent");
+    const started = await agent.execute("bg-description", {
+      subagent_type: "reviewer",
+      prompt: "review in background",
+      description: "Review authentication",
+      run_in_background: true,
+    });
+    expect(started.content).toEqual([
+      {
+        type: "text",
+        text: `Background task ${started.details.taskId} started (agent: reviewer, agent id: ${started.details.agentId}). Use TaskOutput with task_id "${started.details.taskId}" to retrieve the result before finalizing.`,
+      },
+    ]);
+    expect(started.details.description).toBe("Review authentication");
+    await internals.backgroundTasks.wait(String(started.details.taskId));
+    const output = await p.tools.get("TaskOutput").execute("collect-description", {
+      task_id: started.details.taskId,
+    });
+    expect(output.content[0]!.text).toContain("BACKGROUND-DONE");
+    expect(output.details.description).toBe("Review authentication");
   });
 
   it("a FOREGROUND completed dispatch carries durationMs; its collapsed record shows a duration segment", async () => {
@@ -1282,6 +1320,7 @@ describe("background settlement delivery (offline integration via the seam)", ()
       run_in_background: false,
     });
     expect(res.details.outcome).toBe("completed");
+    expect(typeof res.details.settledAt).toBe("number");
     const durationMs = res.details.durationMs;
     expect(typeof durationMs).toBe("number");
     expect(durationMs as number).toBeGreaterThanOrEqual(0);

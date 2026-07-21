@@ -21,18 +21,22 @@ import {
 } from "../src/runtime/subagent-panel-model.js";
 import {
   AGENT_COLOR_ANSI,
+  DETAIL_BANNER_FAILED,
   DETAIL_BANNER_RESUMED,
   DETAIL_BANNER_SETTLED,
+  DETAIL_BANNER_STOPPED,
   DETAIL_BANNER_VANISHED,
   DETAIL_FINAL_LABEL,
   DETAIL_FOREGROUND_ALT,
   DETAIL_NO_ACTIVITY,
+  DETAIL_NO_DISCARDED_OUTPUT,
   DETAIL_NO_FINAL_ANSWER,
-  DETAIL_NO_TAIL,
+  DETAIL_NO_PARTIAL_OUTPUT,
+  DETAIL_PARTIAL_LABEL,
+  DETAIL_DISCARDED_LABEL,
   DETAIL_PROMPT_EXPANDED,
   DETAIL_STEER_PREFIX,
   DETAIL_STEER_SENT,
-  DETAIL_TAIL_LABEL,
   detailHint,
   detailPromptCollapsed,
   detailSteerFailed,
@@ -52,6 +56,11 @@ import {
   tintAgentColor,
   type PanelDetailUiState,
 } from "../src/runtime/subagent-panel-render.js";
+import {
+  assistantTextFingerprint,
+  sanitizeDetailScalar,
+  type SubagentDetailEntry,
+} from "../src/runtime/subagent-progress.js";
 import {
   AGENT_COLOR_NAMES,
   SubagentRegistry,
@@ -343,6 +352,7 @@ describe("row state classification", () => {
     expect(byId.get("agent-a")?.usage).toEqual({ inputTokens: 9 });
     expect(byId.get("agent-b")?.usage).toEqual({ inputTokens: 2 });
     expect(byId.get("agent-c")?.usage).toBeUndefined();
+    for (const row of v.rows) expect(row).not.toHaveProperty("activity");
   });
 });
 
@@ -469,9 +479,10 @@ describe("overflow windowing", () => {
 });
 
 describe("row rendering", () => {
-  // Long enough that every degrade stage stays above the narrow-summary
-  // threshold (the width probes subtract from the previous stage's width).
   const LABEL = "build the entire frontend and wire the API layer";
+  const ASSISTANT_CANARY = "ASSISTANT_STREAM_CANARY";
+  const TOOL_CALL_CANARY = "TOOL_CALL_CANARY";
+  const TOOL_OUTCOME_CANARY = "TOOL_OUTCOME_CANARY";
   const richRecords = () => [
     rec({
       agentId: "agent-a",
@@ -480,54 +491,121 @@ describe("row rendering", () => {
       startedAt: 0,
       color: "red",
       progress: {
-        tail: ["done step 1"],
-        activity: "running bash…",
+        tail: [TOOL_CALL_CANARY, TOOL_OUTCOME_CANARY],
+        activity: ASSISTANT_CANARY,
         usage: { inputTokens: 1200, outputTokens: 340 },
       },
     }),
   ];
 
-  function renderAt(width: number, focused = false): string[] {
+  function renderAt(width: number, focused = false, withTask = true): string[] {
     const clock = { t: 12_000 };
     const model = makeModel(clock);
-    const v = view(model, richRecords(), { focused });
+    const v = view(model, richRecords(), {
+      focused,
+      tasks: withTask ? [{ id: "task-7", status: "running", agentId: "agent-a" }] : undefined,
+    });
     return renderSubagentPanel(v, { width, entryChord: CHORD });
   }
 
-  it("renders type, label, activity, elapsed, and tokens at generous width", () => {
-    const lines = renderAt(200);
-    const row = lines[0]!;
-    expect(row).toContain("coder");
-    expect(row).toContain(LABEL);
-    expect(row).toContain("running bash…");
-    expect(row).toContain("12s");
-    expect(row).toContain("in 1200");
-    expect(row).toContain("out 340");
+  it("renders task identity and stable metadata, never live activity, at generous width", () => {
+    for (const focused of [false, true]) {
+      const row = renderAt(200, focused)[0]!;
+      expect(row).toContain("coder");
+      expect(row).toContain("task-7");
+      expect(row).toContain(LABEL);
+      expect(row).toContain("12s");
+      expect(row).toContain("in 1200");
+      expect(row).toContain("out 340");
+      for (const canary of [ASSISTANT_CANARY, TOOL_CALL_CANARY, TOOL_OUTCOME_CANARY]) {
+        expect(row).not.toContain(canary);
+      }
+    }
   });
 
-  it("degrades in order: tokens → activity → elapsed → label truncation", () => {
-    const full = renderAt(200)[0]!;
-    const w1 = visibleWidth(full);
-    const noTokens = renderAt(w1 - 1)[0]!;
-    expect(noTokens).not.toContain("in 1200");
-    expect(noTokens).toContain("running bash…");
-    expect(noTokens).toContain("12s");
+  it("preserves metadata-first rows across focus, nested selection, and lifecycle state", () => {
+    const cases = [
+      { name: "passive", focused: false, selectedChild: false },
+      { name: "focused root", focused: true, selectedChild: false },
+      { name: "focused nested child", focused: true, selectedChild: true },
+    ] as const;
 
-    const w2 = visibleWidth(noTokens);
-    const noActivity = renderAt(w2 - 1)[0]!;
-    expect(noActivity).not.toContain("running bash…");
-    expect(noActivity).toContain("12s");
-    expect(noActivity).toContain(LABEL);
+    for (const testCase of cases) {
+      const clock = { t: 12_000 };
+      const model = makeModel(clock);
+      const records = [
+        rec({
+          agentId: "agent-root",
+          agentName: "rooter",
+          description: `running ${LABEL}`,
+          progress: {
+            tail: [TOOL_CALL_CANARY, TOOL_OUTCOME_CANARY],
+            activity: ASSISTANT_CANARY,
+            usage: { inputTokens: 120, outputTokens: 30 },
+          },
+        }),
+        rec({
+          agentId: "agent-child",
+          parentAgentId: "agent-root",
+          agentName: "child",
+          description: `settled ${LABEL}`,
+          startedAt: 2_000,
+          state: "settled",
+          outcome: "completed",
+          settledAt: 9_000,
+          usage: { inputTokens: 80, outputTokens: 20 },
+          progress: { tail: [TOOL_CALL_CANARY], activity: ASSISTANT_CANARY },
+        }),
+      ];
+      const input = {
+        focused: testCase.focused,
+        tasks: [
+          { id: "task-root", status: "running" as const, agentId: "agent-root" },
+          { id: "task-child", status: "completed" as const, agentId: "agent-child" },
+        ],
+      };
+      view(model, records, input);
+      if (testCase.selectedChild) model.moveSelection(1);
 
-    const w3 = visibleWidth(noActivity);
-    const noElapsed = renderAt(w3 - 1)[0]!;
-    expect(noElapsed).not.toContain("12s");
-    expect(noElapsed).toContain(LABEL);
+      const wide = renderSubagentPanel(view(model, records, input), {
+        width: 200,
+        entryChord: CHORD,
+      });
+      const constrained = renderSubagentPanel(view(model, records, input), {
+        width: 48,
+        entryChord: CHORD,
+      });
+      const wideText = wide.join("\n");
+      const constrainedText = constrained.join("\n");
 
-    const truncated = renderAt(PANEL_NARROW_WIDTH)[0]!;
-    expect(truncated).toContain("coder");
-    expect(truncated).not.toContain(LABEL);
-    expect(truncated).toContain("…");
+      expect(wideText, testCase.name).toContain(`running ${LABEL}`);
+      expect(wideText, testCase.name).toContain(`settled ${LABEL}`);
+      expect(constrainedText, testCase.name).not.toContain(LABEL);
+      expect(constrainedText, testCase.name).toContain("12s");
+      expect(constrainedText, testCase.name).toContain("7s");
+      expect(constrainedText, testCase.name).toContain("in 120");
+      expect(constrainedText, testCase.name).toContain("out 30");
+      expect(constrainedText, testCase.name).toContain("in 80");
+      expect(constrainedText, testCase.name).toContain("out 20");
+      expect(constrainedText, testCase.name).toContain("task-root");
+      expect(constrainedText, testCase.name).toContain("task-child");
+      for (const canary of [ASSISTANT_CANARY, TOOL_CALL_CANARY, TOOL_OUTCOME_CANARY]) {
+        expect(wideText, testCase.name).not.toContain(canary);
+        expect(constrainedText, testCase.name).not.toContain(canary);
+      }
+
+      if (testCase.focused) {
+        const selectedIdentity = testCase.selectedChild ? "task-child" : "task-root";
+        expect(constrained.find((line) => line.includes(selectedIdentity)), testCase.name).toContain("❯");
+      } else {
+        expect(constrainedText, testCase.name).not.toContain("❯");
+      }
+    }
+  });
+
+  it("renders task ids only when present", () => {
+    expect(renderAt(120)[0]).toContain("task-7");
+    expect(renderAt(120, false, false)[0]).not.toContain("task-7");
   });
 
   it("never invents a zero token figure (blank until known)", () => {
@@ -535,9 +613,9 @@ describe("row rendering", () => {
     const model = makeModel(clock);
     const v = view(model, [rec({ agentId: "agent-a", description: "quiet work" })]);
     const row = renderSubagentPanel(v, { width: 120, entryChord: CHORD })[0]!;
-    expect(row).not.toMatch(/\b0 tokens\b/);
-    expect(row).not.toContain("in 0");
-    expect(row).not.toContain("$0");
+    expect(row).not.toMatch(
+      /\b(?:in|out|cache(?: read| write)?)\s+\d|\b\d+ tokens?\b|\$\d/i,
+    );
   });
 
   it("does not duplicate the agent name when the label falls back to it", () => {
@@ -646,18 +724,31 @@ describe("panel chrome (hints, overflow lines, summary, empty)", () => {
     expect(above).toContain(panelMoreAbove(5));
   });
 
-  it("degrades to a single summary line below the narrow threshold", () => {
+  it("pins the narrow threshold: one column below summarizes, the boundary is coherent", () => {
     const clock = { t: 2000 };
     const model = makeModel(clock);
-    const v = view(model, [
-      rec({ agentId: "agent-a" }),
+    const records = [
+      rec({
+        agentId: "agent-a",
+        progress: { tail: [], activity: "", usage: { inputTokens: 12, outputTokens: 3 } },
+      }),
       rec({ agentId: "agent-b" }),
       rec({ agentId: "agent-c", state: "settled", outcome: "completed", settledAt: 1500 }),
-    ]);
-    const lines = renderSubagentPanel(v, { width: PANEL_NARROW_WIDTH - 1, entryChord: CHORD });
-    expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("2 running");
-    expect(lines[0]).toContain("1 done");
+    ];
+    const tasks = [{ id: "task-7", status: "running" as const, agentId: "agent-a" }];
+    const v = view(model, records, { tasks });
+    const below = renderSubagentPanel(v, {
+      width: PANEL_NARROW_WIDTH - 1,
+      entryChord: CHORD,
+    });
+    expect(below).toHaveLength(1);
+    expect(below[0]).toContain("2 running");
+    expect(below[0]).toContain("1 done");
+
+    const boundary = renderSubagentPanel(v, { width: PANEL_NARROW_WIDTH, entryChord: CHORD });
+    expect(boundary.length).toBeGreaterThan(1);
+    expect(boundary[0]).toMatch(/coder \[task-7\] · 2s · in 12 · out 3/);
+    expect(boundary[0]).not.toMatch(/(?:out 3|task-7)coder/);
   });
 });
 
@@ -753,23 +844,54 @@ describe("width-clamp invariant (pi-tui visibleWidth on every line)", () => {
     }
   });
 
-  it("strips hostile escape/control sequences from every rendered line", () => {
+  it("keeps zero-width-padded task-id truncation scalar-safe", () => {
+    const unpairedSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+    const paddedTaskId = `t${"\u0301".repeat(238)}😀x`;
     const clock = { t: 90_000 };
     const model = makeModel(clock);
-    const hostile = [
-      rec({
-        agentId: "agent-a",
-        agentName: `${ESC}[2Jevil${ESC}]0;pwn${BEL}name`,
-        description: `d${ESC}[31mescription`,
-        progress: { tail: [], activity: `${ESC}]8;;http://x${BEL}act` },
-      }),
-    ];
-    const lines = renderSubagentPanel(view(model, hostile), { width: 120, entryChord: CHORD });
-    for (const line of lines) {
-      expect(line.includes(ESC)).toBe(false);
-      expect(line.includes(BEL)).toBe(false);
+    const v = view(model, [rec({ agentId: "agent-a" })], {
+      tasks: [{ id: paddedTaskId, status: "running", agentId: "agent-a" }],
+    });
+    const rendered = renderSubagentPanel(v, { width: 120, entryChord: CHORD }).join("\n");
+    expect(rendered).not.toMatch(unpairedSurrogate);
+    expect(rendered).toContain("…");
+  });
+
+  it("sanitizes hostile task ids at all widths without unsafe grapheme boundaries", () => {
+    const dangerousControls = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/u;
+    const unpairedSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+    const hostileTaskId =
+      `task${ESC}[2J${ESC}]0;pwn${BEL}-名字-🙂-\t-\r-\u0001-` + "👨‍👩‍👧‍👦".repeat(20);
+
+    for (const focused of [false, true]) {
+      for (const width of Array.from({ length: 121 }, (_, value) => value)) {
+        const clock = { t: 90_000 };
+        const model = makeModel(clock);
+        const v = view(
+          model,
+          [
+            rec({
+              agentId: "agent-a",
+              agentName: `${ESC}[2Jevil${ESC}]0;pwn${BEL}name`,
+              description: `d${ESC}[31mescription`,
+              progress: { tail: [], activity: `${ESC}]8;;http://x${BEL}act` },
+            }),
+          ],
+          {
+            focused,
+            tasks: [{ id: hostileTaskId, status: "running", agentId: "agent-a" }],
+          },
+        );
+        const lines = renderSubagentPanel(v, { width, entryChord: CHORD });
+        for (const line of lines) {
+          const withoutSafeResets = line.replaceAll(`${ESC}[0m`, "").replaceAll(`${ESC}[39m`, "");
+          expect(visibleWidth(line), `focused=${focused} width=${width}`).toBeLessThanOrEqual(width);
+          expect(withoutSafeResets, `focused=${focused} width=${width}`).not.toMatch(dangerousControls);
+          expect(withoutSafeResets, `focused=${focused} width=${width}`).not.toMatch(unpairedSurrogate);
+          expect(withoutSafeResets, `focused=${focused} width=${width}`).not.toContain("‍…");
+        }
+      }
     }
-    expect(lines[0]).toContain("evil");
   });
 });
 
@@ -793,16 +915,26 @@ function detailUi(over: Partial<PanelDetailUiState> = {}): PanelDetailUiState {
   return { promptExpanded: false, scrollTop: 0, follow: true, steerBuffer: "", ...over };
 }
 
+function detailAssistant(text: string): SubagentDetailEntry {
+  return {
+    kind: "assistant",
+    text: sanitizeDetailScalar(text),
+    fingerprint: assistantTextFingerprint([text]),
+  };
+}
+
 describe("drill-down detail rendering (pure)", () => {
-  const numberedTail = (n: number) =>
-    Array.from({ length: n }, (_, i) => `tail line ${String(i + 1).padStart(2, "0")}`);
+  const numberedDetail = (n: number) =>
+    Array.from({ length: n }, (_, i) =>
+      detailAssistant(`tail line ${String(i + 1).padStart(2, "0")}`),
+    );
 
   it("running layout: header, collapsed prompt, auto-following tail, steer line, hint", () => {
     const record = rec({
       agentId: "agent-a",
       description: "build the frontend",
       prompt: "do the thing\nplease",
-      fullTail: numberedTail(20),
+      detailLog: numberedDetail(20),
       transcriptPath: "/repo/.claude/.picc/agent-a.jsonl",
       session: { steer: () => undefined },
       startedAt: 0,
@@ -845,7 +977,10 @@ describe("drill-down detail rendering (pure)", () => {
       settledAt: 9000,
       finalText: "Answer: everything passed",
       prompt: "check it",
-      fullTail: ["step one", "step two"],
+      detailLog: [
+        { kind: "status", text: "step one" },
+        detailAssistant("step two"),
+      ],
     });
     const { lines } = renderSubagentDetail(
       { record, nowMs: 50_000 },
@@ -863,11 +998,289 @@ describe("drill-down detail rendering (pure)", () => {
     const promptIndex = lines.findIndex((l) => l.includes("initial prompt"));
     expect(answerIndex).toBeGreaterThanOrEqual(0);
     expect(answerIndex).toBeLessThan(promptIndex);
-    expect(text).toContain(DETAIL_TAIL_LABEL);
-    expect(text).toContain("step two");
+    expect(text).toContain("assistant: step two");
     expect(lines[lines.length - 1]).toContain(
       detailHint({ steerable: false, stoppable: false }),
     );
+  });
+
+  it("renders every structured category with explicit success/failure distinctions", () => {
+    const record = rec({
+      agentId: "agent-a",
+      detailLog: [
+        detailAssistant("analysis line"),
+        { kind: "tool-call", tool: "Read", detail: "a.ts" },
+        { kind: "tool-outcome", tool: "Read", detail: "loaded", failed: false },
+        { kind: "tool-outcome", tool: "Write", detail: "denied", failed: true },
+        { kind: "status", text: "retrying" },
+      ],
+    });
+    const text = renderSubagentDetail({ record, nowMs: 0 }, detailUi({ follow: false }), {
+      width: 120,
+    }).lines.join("\n");
+    expect(text).toContain("assistant: analysis line");
+    expect(text).toContain("→ tool call: Read");
+    expect(text).toContain("input: a.ts");
+    expect(text).toContain("✓ tool result: Read");
+    expect(text).toContain("output: loaded");
+    expect(text).toContain("✗ tool failure: Write");
+    expect(text).toContain("output: denied");
+    expect(text).toContain("status: retrying");
+  });
+
+  it("deduplicates only an exact trailing assistant turn at registry settlement", () => {
+    const settle = (
+      detailLog: SubagentDetailEntry[],
+      finalText: string,
+      outcome: "completed" | "failed" = "completed",
+      assistantIdentityText?: string,
+    ) => {
+      const registry = new SubagentRegistry();
+      registry.register({
+        agentId: "agent-a",
+        agentName: "coder",
+        depth: 1,
+        cwd: "/repo",
+        resumable: true,
+        oneShot: false,
+      });
+      registry.noteProgress("agent-a", undefined, detailLog);
+      registry.markSettled("agent-a", { outcome, finalText, assistantIdentityText });
+      const record = registry.get("agent-a")!;
+      const text = renderSubagentDetail(
+        { record, nowMs: 0 },
+        detailUi({ follow: false }),
+        { width: 500 },
+      ).lines.join("\n");
+      return { record, text };
+    };
+
+    for (const [finalText, outcome, marker] of [
+      ["MULTILINE_ONLY\npart two", "completed", "MULTILINE_ONLY"],
+      [`LONG_ONLY_${"x".repeat(500)}`, "completed", "LONG_ONLY_"],
+      ["FAILED_ONLY\npartial", "failed", "FAILED_ONLY"],
+    ] as const) {
+      const { record, text } = settle([detailAssistant(finalText)], finalText, outcome);
+      expect(record.detailLog).toEqual([]);
+      expect(text).not.toContain("assistant:");
+      expect(text.match(new RegExp(marker, "g"))).toHaveLength(1);
+    }
+
+    const earlier = settle(
+      [detailAssistant("same"), { kind: "status", text: "between" }, detailAssistant("same")],
+      "same",
+    );
+    expect(earlier.record.detailLog).toEqual([
+      detailAssistant("same"),
+      { kind: "status", text: "between" },
+    ]);
+    expect(earlier.text.match(/same/g)).toHaveLength(2);
+    expect(earlier.text).toContain("assistant: same");
+
+    for (const following of [
+      { kind: "status", text: "after" } as const,
+      { kind: "tool-call", tool: "Read" } as const,
+    ]) {
+      const { record, text } = settle([detailAssistant("final"), following], "final");
+      expect(record.detailLog).toEqual([detailAssistant("final"), following]);
+      expect(text).toContain("assistant: final");
+    }
+
+    for (const [near, finalText] of [
+      ["final prefix", "final"],
+      ["suffix final", "final"],
+      ["Final", "final"],
+      ["final ", "final"],
+      [`${"p".repeat(300)}A`, `${"p".repeat(300)}B`],
+      [`${"p".repeat(300)}B`, `${"p".repeat(300)}A`],
+    ] as const) {
+      const { record, text } = settle([detailAssistant(near)], finalText);
+      expect(record.detailLog).toEqual([detailAssistant(near)]);
+      expect(text).toContain(`assistant: ${sanitizeDetailScalar(near)}`);
+    }
+
+    const loneHigh = "\uD800";
+    const replacement = "\uFFFD";
+    expect(assistantTextFingerprint([loneHigh])).not.toBe(assistantTextFingerprint([replacement]));
+    const collisionRegression = settle([detailAssistant(loneHigh)], replacement);
+    expect(collisionRegression.record.detailLog).toEqual([detailAssistant(loneHigh)]);
+  });
+
+  it("uses outcome-aware settled output labels and honest absent-output text", () => {
+    const render = (outcome: "completed" | "failed" | "aborted", finalText?: string) =>
+      renderSubagentDetail(
+        { record: rec({ agentId: "agent-a", state: "settled", outcome, finalText }), nowMs: 0 },
+        detailUi({ follow: false }),
+        { width: 120 },
+      ).lines.join("\n");
+    expect(render("completed", "answer")).toContain(DETAIL_FINAL_LABEL);
+    expect(render("failed", "partial")).toContain(DETAIL_PARTIAL_LABEL);
+    expect(render("failed")).toContain(DETAIL_NO_PARTIAL_OUTPUT);
+    expect(render("aborted", "discard me")).toContain(DETAIL_DISCARDED_LABEL);
+    expect(render("aborted")).toContain(DETAIL_NO_DISCARDED_OUTPUT);
+  });
+
+  it("defensively validates malformed logs, caps inspection, sanitizes fields, and never mutates input", () => {
+    const oversized: unknown[] = Array(10_000);
+    oversized[0] = null;
+    oversized[1] = {
+      kind: "assistant",
+      text: `safe${ESC}[2J\rnext`,
+      fingerprint: assistantTextFingerprint([`safe${ESC}[2J\rnext`]),
+    };
+    oversized[2] = { kind: "tool-call", tool: 42, detail: { hostile: true } };
+    oversized[3] = { kind: "tool-outcome", tool: "Read", failed: "no" };
+    oversized[4] = { kind: "future", value: { arbitrary: true } };
+    oversized[5] = { kind: "status", text: `${"s".repeat(1000)}OVERSIZED_SENTINEL` };
+    oversized[100] = { kind: "assistant", text: "outside-inspection-budget" };
+    const before = oversized.slice();
+    const record = rec({ agentId: "agent-a" });
+    (record as { detailLog?: unknown }).detailLog = oversized;
+    const text = renderSubagentDetail({ record, nowMs: 0 }, detailUi({ follow: false }), {
+      width: 400,
+    }).lines.join("\n");
+    expect(text).toContain("assistant: safe");
+    expect(text).toContain("next");
+    expect(text).toContain("status:");
+    expect(text).not.toContain(ESC);
+    expect(text).not.toContain("outside-inspection-budget");
+    expect(text).not.toContain("OVERSIZED_SENTINEL");
+    expect(text).not.toContain("[object Object]");
+    expect(oversized).toEqual(before);
+
+    const nonArray = rec({ agentId: "agent-b" });
+    (nonArray as { detailLog?: unknown }).detailLog = { kind: "assistant", text: "ignored" };
+    expect(() => renderSubagentDetail({ record: nonArray, nowMs: 0 }, detailUi(), { width: 1 })).not.toThrow();
+  });
+
+  it("retains normally registry-capped prompt and final values", () => {
+    const registry = new SubagentRegistry();
+    registry.register({
+      agentId: "agent-a",
+      agentName: "coder",
+      depth: 1,
+      cwd: "/repo",
+      resumable: true,
+      oneShot: false,
+      prompt: "p".repeat(10_000),
+    });
+    const running = renderSubagentDetail(
+      { record: registry.get("agent-a")!, nowMs: 0 },
+      detailUi({ promptExpanded: true, follow: false }),
+      { width: 20_000 },
+    ).lines.join("\n");
+    expect(running).toContain(`${"p".repeat(4096)}…`);
+
+    registry.markSettled("agent-a", { outcome: "completed", finalText: "f".repeat(20_000) });
+    const settled = renderSubagentDetail(
+      { record: registry.get("agent-a")!, nowMs: 0 },
+      detailUi({ follow: false }),
+      { width: 20_000 },
+    ).lines.join("\n");
+    expect(settled).toContain(`${"f".repeat(16_384)}…`);
+  });
+
+  it("keeps prompt/final capture and runtime-injected rendering scalar-safe", () => {
+    const registry = new SubagentRegistry();
+    registry.register({
+      agentId: "agent-a",
+      agentName: "worker",
+      depth: 1,
+      cwd: "/repo",
+      resumable: false,
+      oneShot: false,
+      prompt: `${"p".repeat(4095)}😀tail`,
+    });
+    registry.markSettled("agent-a", {
+      outcome: "completed",
+      finalText: `${"f".repeat(16_383)}😀tail`,
+    });
+    const captured = registry.get("agent-a")!;
+    expect(captured.prompt).not.toMatch(/[\uD800-\uDFFF]/u);
+    expect(captured.finalText).not.toMatch(/[\uD800-\uDFFF]/u);
+
+    const injected = rec({
+      agentId: "agent-b",
+      state: "settled",
+      outcome: "completed",
+      prompt: `before\uD800after\uDC00`,
+      finalText: `final\uD800text\uDC00`,
+    });
+    const rendered = renderSubagentDetail(
+      { record: injected, nowMs: 0 },
+      detailUi({ promptExpanded: true, follow: false }),
+      { width: 200 },
+    ).lines.join("\n");
+    expect(rendered).toContain("beforeafter");
+    expect(rendered).toContain("finaltext");
+    expect(rendered).not.toMatch(/[\uD800-\uDFFF]/u);
+  });
+
+  it("bounds raw prompt/final inspection even when hostile prefixes render nothing", () => {
+    const sentinel = "MULTILINE_RAW_SENTINEL";
+    const hostileValues = [
+      `${" ".repeat(100_000)}${sentinel}`,
+      `${String.fromCharCode(1).repeat(100_000)}${sentinel}`,
+      `${ESC}]${"x".repeat(100_000)}${sentinel}`,
+    ];
+    for (const hostile of hostileValues) {
+      const running = renderSubagentDetail(
+        { record: rec({ agentId: "agent-a", prompt: hostile }), nowMs: 0 },
+        detailUi({ promptExpanded: true, follow: false }),
+        { width: 500 },
+      ).lines.join("\n");
+      const settled = renderSubagentDetail(
+        {
+          record: rec({ agentId: "agent-b", state: "settled", outcome: "completed", finalText: hostile }),
+          nowMs: 0,
+        },
+        detailUi({ follow: false }),
+        { width: 500 },
+      ).lines.join("\n");
+      expect(running).not.toContain(sentinel);
+      expect(settled).not.toContain(sentinel);
+    }
+  });
+
+  it("degrades safely for revoked and throwing detail arrays, slots, entries, and record getters", () => {
+    const revoked = Proxy.revocable<unknown[]>([], {});
+    revoked.revoke();
+    const throwingLength = new Proxy<unknown[]>([], {
+      get(target, property, receiver) {
+        if (property === "length") throw new Error("length poisoned");
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const throwingSlot = new Proxy<unknown[]>([detailAssistant("hidden")], {
+      get(target, property, receiver) {
+        if (property === "0") throw new Error("slot poisoned");
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const throwingEntry = new Proxy(detailAssistant("hidden"), {
+      get(target, property, receiver) {
+        if (property === "text") throw new Error("entry poisoned");
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    for (const detailLog of [revoked.proxy, throwingLength, throwingSlot, [throwingEntry]]) {
+      const record = rec({ agentId: "agent-a" });
+      (record as { detailLog?: unknown }).detailLog = detailLog;
+      expect(() => renderSubagentDetail({ record, nowMs: 0 }, detailUi(), { width: 80 })).not.toThrow();
+    }
+
+    const throwingRecord = rec({ agentId: "agent-b" });
+    Object.defineProperty(throwingRecord, "detailLog", {
+      get() {
+        throw new Error("detailLog poisoned");
+      },
+    });
+    expect(() => renderSubagentDetail(
+      { record: throwingRecord, nowMs: 0 },
+      detailUi(),
+      { width: 80 },
+    )).not.toThrow();
   });
 
   it("settled view with nothing captured shows the honest placeholders, never blank sections", () => {
@@ -882,7 +1295,7 @@ describe("drill-down detail rendering (pure)", () => {
       width: 120,
     }).lines.join("\n");
     expect(text).toContain(DETAIL_NO_FINAL_ANSWER);
-    expect(text).toContain(DETAIL_NO_TAIL);
+    expect(text).toContain(DETAIL_NO_ACTIVITY);
   });
 
   it("expands and collapses the prompt via the ui flag", () => {
@@ -905,7 +1318,7 @@ describe("drill-down detail rendering (pure)", () => {
   });
 
   it("anchors the scrolled-back window from the top; follow shows the bottom", () => {
-    const record = rec({ agentId: "agent-a", fullTail: numberedTail(30) });
+    const record = rec({ agentId: "agent-a", detailLog: numberedDetail(30) });
     const anchored = renderSubagentDetail(
       { record, nowMs: 0 },
       detailUi({ follow: false, scrollTop: 0 }),
@@ -977,7 +1390,15 @@ describe("drill-down detail rendering (pure)", () => {
         // CR surviving into an emitted line would overprint it from column 0.
         prompt: `p${ESC}]0;pwn${BEL}rompt\rcr-spoof\r\ncrlf-line\n${"宽".repeat(200)}\n${"x".repeat(400)}`,
         finalText: `f${ESC}[2Jinal\rcr-spoof\r\ncrlf-line\n${"宽宽".repeat(100)}`,
-        fullTail: [`t${ESC}[31mail`, "宽宽宽宽".repeat(30), "z".repeat(400)],
+        detailLog: [
+          {
+            kind: "assistant",
+            text: `t${ESC}[31mail`,
+            fingerprint: assistantTextFingerprint([`t${ESC}[31mail`]),
+          },
+          { kind: "tool-call", tool: "Read", detail: "宽宽宽宽".repeat(30) },
+          { kind: "tool-outcome", tool: "Read", detail: "z".repeat(400), failed: state === "settled" },
+        ],
         session: { steer: () => undefined },
         state,
         ...(state === "settled" ? { outcome: "failed" as const, settledAt: 5 } : {}),
@@ -1032,11 +1453,22 @@ describe("drill-down detail rendering (pure)", () => {
     expect(steerLine).toBe(`${DETAIL_STEER_PREFIX}… steer tail END`);
   });
 
-  it("emits only empty lines at width 0 and never throws", () => {
-    const record = rec({ agentId: "agent-a", prompt: "p", fullTail: ["t"] });
-    const { lines } = renderSubagentDetail({ record, nowMs: 0 }, detailUi(), { width: 0 });
-    expect(lines.length).toBeGreaterThan(0);
-    for (const line of lines) expect(line).toBe("");
+  it("normalizes invalid and fractional widths once at the detail boundary", () => {
+    const record = rec({ agentId: "agent-a", prompt: "p", detailLog: [detailAssistant("t")] });
+    for (const width of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1.5, 0]) {
+      const { lines } = renderSubagentDetail({ record, nowMs: 0 }, detailUi(), { width });
+      expect(lines.length).toBeGreaterThan(0);
+      for (const line of lines) expect(line).toBe("");
+    }
+
+    const fractional = renderSubagentDetail(
+      { record, nowMs: 0 },
+      detailUi(),
+      { width: 12.9 },
+    );
+    const integer = renderSubagentDetail({ record, nowMs: 0 }, detailUi(), { width: 12 });
+    expect(fractional).toEqual(integer);
+    for (const line of fractional.lines) expect(visibleWidth(line)).toBeLessThanOrEqual(12);
   });
 });
 
@@ -2062,7 +2494,7 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     await invocation.result;
   });
 
-  it("settling while the drill-down is open banners and shows the final answer; resuming banners back to live", async () => {
+  it("settling while the drill-down is open uses completed, failed, and stopped banners", async () => {
     const s = focusSetup();
     reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
     s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
@@ -2080,7 +2512,23 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     expect(settled).toContain(DETAIL_FINAL_LABEL);
     expect(settled).toContain("the settled final answer");
     s.registry.markResuming("agent-a");
+    s.tasks[0]!.status = "running";
     expect(invocation.render(120).join("\n")).toContain(DETAIL_BANNER_RESUMED);
+
+    s.registry.markSettled("agent-a", { outcome: "failed", finalText: "partial" });
+    s.tasks[0]!.status = "failed";
+    const failed = invocation.render(120).join("\n");
+    expect(failed).toContain(DETAIL_BANNER_FAILED);
+    expect(failed).toContain(DETAIL_PARTIAL_LABEL);
+
+    s.registry.markResuming("agent-a");
+    s.tasks[0]!.status = "running";
+    expect(invocation.render(120).join("\n")).toContain(DETAIL_BANNER_RESUMED);
+    s.registry.markSettled("agent-a", { outcome: "aborted", finalText: "discarded" });
+    s.tasks[0]!.status = "stopped";
+    const stopped = invocation.render(120).join("\n");
+    expect(stopped).toContain(DETAIL_BANNER_STOPPED);
+    expect(stopped).toContain(DETAIL_DISCARDED_LABEL);
     invocation.input(ESC);
     invocation.input(ESC);
     await invocation.result;
@@ -2104,12 +2552,14 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     expect(invocation.closed).toBe(true);
   });
 
-  it("scrolls the tail: up anchors, incoming lines don't yank, bottom re-engages follow", async () => {
+  it("scrolls the detail log: up anchors, incoming entries don't yank, bottom re-engages follow", async () => {
     const s = focusSetup();
     reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
     s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
     const tail = (n: number) =>
-      Array.from({ length: n }, (_, i) => `tail line ${String(i + 1).padStart(2, "0")}`);
+      Array.from({ length: n }, (_, i) =>
+        detailAssistant(`tail line ${String(i + 1).padStart(2, "0")}`),
+      );
     s.registry.noteProgress("agent-a", { tail: [], activity: "" }, tail(30));
     const invocation = s.openPanel()!;
     await invocation.ready;
@@ -2200,12 +2650,14 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     expect(s.pi.renderRequests).toBe(afterDispose);
   });
 
-  it("settling with a long tail top-anchors onto the final answer; resuming re-follows the newest line", async () => {
+  it("settling top-anchors onto the final answer; resuming clears prior-generation detail", async () => {
     const s = focusSetup();
     reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
     s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
     const tail = (n: number) =>
-      Array.from({ length: n }, (_, i) => `tail line ${String(i + 1).padStart(2, "0")}`);
+      Array.from({ length: n }, (_, i) =>
+        detailAssistant(`tail line ${String(i + 1).padStart(2, "0")}`),
+      );
     // ~30 body lines so the 12-row viewport makes the anchor writes visible.
     s.registry.noteProgress("agent-a", { tail: [], activity: "" }, tail(30));
     const invocation = s.openPanel()!;
@@ -2228,7 +2680,8 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     s.registry.markResuming("agent-a");
     const resumed = invocation.render(200).join("\n");
     expect(resumed).toContain(DETAIL_BANNER_RESUMED);
-    expect(resumed).toContain("tail line 30"); // re-follow: newest tail visible
+    expect(resumed).not.toContain("tail line 30");
+    expect(resumed).not.toContain("the settled final answer");
     invocation.input(ESC);
     invocation.input(ESC);
     await invocation.result;
