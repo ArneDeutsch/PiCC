@@ -57,6 +57,22 @@ a different reader or a different decision, it belongs in a different doc — as
 audience's entry doc (README for a visitor, CONTRIBUTING for a contributor) links onward to every doc
 that audience needs: "link, don't copy" only works where the link exists.
 
+### Proportional scope
+
+First check only existing claims affected by the planned or realized behavior, and repair any that
+became false, stale, or misleading. If none needs repair, **no durable documentation change** is a
+valid result. If repairs are required, make them, but presume no optional additions beyond them.
+For optional additions, start with the smallest sufficient set. For every proposed durable surface,
+name its reader, the necessary decision it enables, why existing sources are insufficient, and why
+this is the smallest sufficient placement.
+
+Then apply the set-level removal test to every proposed durable surface and every separable proposed
+content unit within a retained surface: remove it and ask whether a named reader can still make the
+necessary decision. If so, leave it out. Any optional surface or content unit that remains despite
+failing this test is aggregate excess and **MUST-FIX**, even when each statement is true and correctly
+placed. Mechanically generated output and retained non-obvious rationale are not optional; the genre
+rules below decide when they are required.
+
 ## 3. Quality standards
 
 - **Truth over completeness.** A short, true doc beats a thorough, half-stale one. When you cannot
@@ -103,8 +119,10 @@ apply in full.
 
 ### Code comments
 
-**Comment only the non-obvious — above all, the *why* behind an unusual choice.** The reviewer's
-checklist, applied comment by comment:
+**Comment only the non-obvious — above all, the *why* behind an unusual choice.** Add a comment only
+when that local rationale is necessary and not evident from the code. Proportional scope can reject a
+new comment, but it cannot justify removing existing load-bearing rationale, comment-shaped
+directives, or syntax. The reviewer's checklist, applied comment by comment:
 
 1. **Does it restate the code?** Delete. `// increment i` and `/** Returns the name. */` on
    `getName()` are noise.
@@ -143,9 +161,13 @@ behavioral reason, and expect to verify the behavior.
 
 ### Generated docs (`doc/supported-features.md`)
 
-**Regenerate, never hand-edit.** Change `src/registry/capability-registry.ts`, then run
-`npm run gen:capabilities`. A hand edit is a defect — it is silently reverted by the next
-regeneration and, until then, lies about behavior.
+A capability registry entry is support truth, not feature bookkeeping. Anti-drift investigation
+determines factually whether behavior changed required tier or note truth; when it did, repair the
+registry and **regenerate, never hand-edit** `doc/supported-features.md` with
+`npm run gen:capabilities`. Discretionary explanatory detail in registry inputs must pass
+*Proportional scope*; proportionality never permits required registry repair or regeneration to be
+skipped. A hand edit is a defect — it is silently reverted by the next regeneration and, until then,
+lies about behavior.
 
 ### Test fixtures (`examples/**`)
 
@@ -235,8 +257,9 @@ That bans the one claim, not the word: `subagent_type: "fork"`, `tool.Agent.fork
 
 The guard that keeps the docs good after this sweep:
 
-- **Docs change in the same change that changes behavior.** Not a follow-up, not a ticket. A change
-  whose docs land later is an incomplete change.
+- **Repair invalidated claims in the same change.** When behavior makes existing documentation false,
+  stale, or misleading, repair it now — not in a follow-up or ticket. A behavior change does not by
+  itself require a durable addition; apply *Proportional scope* after the anti-drift check.
 - **The capability registry is the single source for the feature matrix.** New or changed support
   claims go there (see *Generated docs*). Prose may carry the shape of the answer — the tier
   groupings — and a link; never a tier claim, a count, or a member list (see *Never enumerate a set
@@ -246,7 +269,7 @@ The guard that keeps the docs good after this sweep:
 
 | Severity | Applies to |
 |---|---|
-| **MUST-FIX** | False or stale statements — including a claim generalized past its exceptions, and a true one an adjacent strong claim renders misleading; **a removed comment whose rationale is not recoverable from the code** (a lost non-obvious *why*); prose at the wrong altitude for its surface; a hand-edited generated file; a lost tool directive or comment-shaped syntax |
+| **MUST-FIX** | False or stale statements — including a claim generalized past its exceptions, and a true one an adjacent strong claim renders misleading; aggregate excess under *Proportional scope*; **a removed comment whose rationale is not recoverable from the code** (a lost non-obvious *why*); prose at the wrong altitude for its surface; a hand-edited generated file; a lost tool directive or comment-shaped syntax |
 | **SHOULD** | Duplication of another doc's content instead of a link; an enumeration (count, member list, inventory) of a set the code owns; ephemeral cross-references; bare-number references that never name their topic, intra-doc `§`-refs included; terminology drift; a comment that restates the code; a history/migration comment |
 | **NIT** | Wording, ordering, formatting polish |
 
