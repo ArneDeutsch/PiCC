@@ -165,15 +165,34 @@ function segJoin(segs: readonly (Seg | undefined)[]): string {
 const MAX_INDENT_LEVELS = 6;
 /** Render-side caps for row fields (records are already capture-capped). */
 const TYPE_RENDER_CAP = 60;
+const TASK_ID_RENDER_CAP = 60;
+const TASK_ID_SANITIZE_CAP = TASK_ID_RENDER_CAP * 4;
 const LABEL_RENDER_CAP = 160;
-const ACTIVITY_RENDER_CAP = 160;
+
+function taskIdDisplay(taskId: string): string {
+  const flat = sanitizeProgressText(taskId).replace(/\s+/gu, " ").trim();
+  if (flat.length <= TASK_ID_SANITIZE_CAP) {
+    return truncateToWidth(flat, TASK_ID_RENDER_CAP, "…");
+  }
+  let prefix = "";
+  for (const scalar of flat) {
+    if (prefix.length + scalar.length > TASK_ID_SANITIZE_CAP - 1) break;
+    prefix += scalar;
+  }
+  return truncateToWidth(`${prefix}…`, TASK_ID_RENDER_CAP, "…");
+}
 
 /**
- * One panel row as a single line. Width degrade order when the line does not
- * fit: tokens → activity → elapsed → elastic label truncation; the final
- * clamp in renderSubagentPanel() is the safety net for the residue.
+ * One panel row as a single line. Identity, state, elapsed time, and known
+ * usage are fixed metadata; only the description is elastic. Returns absent
+ * when even a syntactically complete fixed-metadata row cannot fit, allowing
+ * the whole panel to use its existing aggregate summary instead.
  */
-function renderPanelRow(row: PanelRowView, opts: PanelRenderOptions, focused: boolean): string {
+function renderPanelRow(
+  row: PanelRowView,
+  opts: PanelRenderOptions,
+  focused: boolean,
+): string | undefined {
   const { width, theme } = opts;
   const muted = (text: string): Seg => ({ plain: text, styled: themedFg(theme, "muted", text) });
 
@@ -199,41 +218,68 @@ function renderPanelRow(row: PanelRowView, opts: PanelRenderOptions, focused: bo
     plain: typeText,
     styled: theme ? tintAgentColor(row.color, typeText) : typeText,
   };
+  // sanitizeLine bounds hostile input first; pi-tui then owns the display
+  // boundary so task-id truncation cannot split a grapheme or surrogate pair.
+  const taskText = row.taskId ? taskIdDisplay(row.taskId) : "";
+  const task: Seg | undefined = taskText ? muted(` [${taskText}]`) : undefined;
   const chip: Seg | undefined =
     row.hiddenDescendants > 0 ? muted(` (+${row.hiddenDescendants})`) : undefined;
 
   const labelText = sanitizeLine(row.label, LABEL_RENDER_CAP);
-  // The label column falls back to agentName; when it IS the agent name the
+  // The description falls back to agentName; when it IS the agent name the
   // type segment already shows it — render no duplicate.
   const hasLabel = labelText !== "" && labelText !== typeText;
-  const activityText = sanitizeLine(row.activity, ACTIVITY_RENDER_CAP);
-  const activity: Seg | undefined = activityText ? muted(` · ${activityText}`) : undefined;
   const elapsed: Seg = muted(` · ${formatElapsed(row.elapsedMs)}`);
-  // Tokens are BLANK until known — a fake 0 is worse than no figure.
+  // Usage is absent until known — a fake zero is worse than no figure.
   const usageText = row.usage ? formatUsageCompact(row.usage) : undefined;
-  const tokens: Seg | undefined = usageText ? muted(` · ${usageText}`) : undefined;
+  const usage: Seg | undefined = usageText ? muted(` · ${usageText}`) : undefined;
 
-  const labelSeg = (text: string): Seg => muted(` ${text}`);
-  const fixed = [marker, indent, glyph, type, chip];
-  const label = hasLabel ? labelSeg(labelText) : undefined;
-  const attempts: (Seg | undefined)[][] = [
-    [...fixed, label, activity, elapsed, tokens],
-    [...fixed, label, activity, elapsed],
-    [...fixed, label, elapsed],
-    [...fixed, label],
-  ];
-  for (const segs of attempts) {
-    if (segWidth(segs) <= width) return segJoin(segs);
+  const labelSeg = (text: string): Seg => muted(` · ${text}`);
+  const fixed = [marker, indent, glyph, type, task, chip, elapsed, usage];
+  if (segWidth(fixed) <= width) {
+    if (!hasLabel) return segJoin(fixed);
+    const room = width - segWidth(fixed) - 3; // description separator
+    if (room <= 0) return segJoin(fixed);
+    const fitted = truncateToWidth(labelText, room, "…");
+    return segJoin([...fixed, labelSeg(fitted)]);
   }
-  // Elastic label truncation: give the label whatever the fixed columns leave.
-  if (hasLabel) {
-    const room = width - segWidth(fixed) - 1; // 1 = the label's leading space
-    if (room >= 2) {
-      const truncated = truncateToWidth(labelText, room, "…");
-      return segJoin([...fixed, labelSeg(truncated)]);
-    }
+
+  // Constrained fixed-metadata fallback. Fit identity inside its own measured
+  // slot; never let the final clamp splice usage directly into a type or id.
+  const surrounding = [marker, indent, glyph, chip, elapsed, usage];
+  const identityRoom = width - segWidth(surrounding);
+  const taskSyntaxWidth = task ? visibleWidth(" []") : 0;
+  const minimumIdentityWidth = task ? taskSyntaxWidth + 2 : 1;
+  if (identityRoom < minimumIdentityWidth) return undefined;
+
+  if (!task) {
+    const fittedType = truncateToWidth(typeText, identityRoom, "…");
+    const fitted: Seg = {
+      plain: fittedType,
+      styled: theme ? tintAgentColor(row.color, fittedType) : fittedType,
+    };
+    return segJoin([marker, indent, glyph, fitted, chip, elapsed, usage]);
   }
-  return segJoin(fixed);
+
+  const contentRoom = identityRoom - taskSyntaxWidth;
+  const taskRoom = Math.min(visibleWidth(taskText), Math.max(1, Math.ceil(contentRoom / 2)));
+  const typeRoom = contentRoom - taskRoom;
+  const fittedTypeText = truncateToWidth(typeText, typeRoom, "…");
+  const fittedTaskText = truncateToWidth(taskText, taskRoom, "…");
+  const fittedType: Seg = {
+    plain: fittedTypeText,
+    styled: theme ? tintAgentColor(row.color, fittedTypeText) : fittedTypeText,
+  };
+  return segJoin([
+    marker,
+    indent,
+    glyph,
+    fittedType,
+    muted(` [${fittedTaskText}]`),
+    chip,
+    elapsed,
+    usage,
+  ]);
 }
 
 /** The whole-panel single line for very narrow terminals. */
@@ -262,13 +308,16 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
   if (width < PANEL_NARROW_WIDTH) {
     return clampLines([renderSummaryLine(view, opts)], width);
   }
+  const renderedRows = view.rows.map((row) => renderPanelRow(row, opts, view.focused));
+  if (renderedRows.some((row) => row === undefined)) {
+    return clampLines([renderSummaryLine(view, opts)], width);
+  }
+
   const lines: string[] = [];
   if (view.hiddenAbove > 0) {
     lines.push(themedFg(opts.theme, "muted", panelMoreAbove(view.hiddenAbove)));
   }
-  for (const row of view.rows) {
-    lines.push(renderPanelRow(row, opts, view.focused));
-  }
+  lines.push(...renderedRows.filter((row): row is string => row !== undefined));
   if (view.hiddenBelow > 0) {
     lines.push(themedFg(opts.theme, "muted", panelMoreBelow(view.hiddenBelow)));
   }
