@@ -41,10 +41,12 @@ import {
 } from "./runtime/context-assembly.js";
 import {
   budgetSkillReinjection,
+  newSkillActivationState,
   recordResidentSkill,
   renderSkillForActivation,
   skillActivationMessage,
   skillActivationVars,
+  type SkillActivationState,
 } from "./runtime/skill-activation.js";
 import { createWorktreeTools } from "./runtime/tools/worktree-tools.js";
 import { createWebFetchTool, createWebSearchTool } from "./runtime/tools/web-tools.js";
@@ -453,60 +455,48 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return plugin ? { root: plugin.root, data: plugin.dataDir } : {};
   }
 
-  /** Skills whose scoped hooks are already registered (re-activation must not stack duplicates). */
-  const scopedHookSkills = new Set<string>();
-  /** Active skills' current disallowed-tools, keyed so reactivation replaces expired effects. */
-  const activeSkillDenyRules = new Map<string, string[]>();
+  const mainActivation = newSkillActivationState(state.activeSkills);
+  const activeSkillDenyRules = mainActivation.denyRules;
 
   async function activateSkill(
     skill: ClaudeSkill,
     argsText: string,
-    opts: { fork?: boolean; recordActivation?: boolean } = {},
+    opts: { fork?: boolean; activation?: SkillActivationState; cwd?: string } = {},
   ): Promise<string> {
-    const record = opts.recordActivation ?? true;
-    if (skill.hooks && Object.keys(skill.hooks).length) {
-      if (!record) {
-        // Subagent-side activation: scoped hooks are session-wide state and must
-        // not leak across the fresh-context boundary (visible degrade).
-        debug(`skill ${skill.name}: scoped hooks not registered for a subagent-side activation`);
-      } else if (!scopedHookSkills.has(skill.name)) {
-        // Register once per skill: re-activation must not duplicate side effects
-        // (and reusing the runner preserves its `once:` tracking).
-        scopedHookSkills.add(skill.name);
-        const parsed = parseHookConfig(skill.hooks, skill.source.path);
-        hooks.addScoped(
-          new HookRunner({
-            config: parsed.config,
-            projectDir: project.root,
-            sessionId,
-            env: project.settings.env,
-            disableAllHooks: project.settings.disableAllHooks,
-            pluginRoots: project.pluginRoots,
-            pluginDataDirs,
-            transcriptPath,
-          }),
-        );
-      }
+    const activation = opts.activation ?? mainActivation;
+    if (skill.hooks && Object.keys(skill.hooks).length && !activation.scopedHookSkills.has(skill.name)) {
+      activation.scopedHookSkills.add(skill.name);
+      const parsed = parseHookConfig(skill.hooks, skill.source.path);
+      const runner = new HookRunner({
+        config: parsed.config,
+        projectDir: project.root,
+        sessionId,
+        env: project.settings.env,
+        disableAllHooks: project.settings.disableAllHooks,
+        pluginRoots: project.pluginRoots,
+        pluginDataDirs,
+        transcriptPath,
+      });
+      if (activation === mainActivation) hooks.addScoped(runner);
+      else activation.hookRunners.push(activation.wrapHookRunner?.(runner) ?? runner);
     }
     const plugin = pluginContextFor(skill);
     const rendered = await renderSkillForActivation({
       skill,
       argsText,
       projectRoot: project.root,
-      cwd: cwdState.get(),
+      cwd: opts.cwd ?? cwdState.get(),
       sessionId,
       effort: skill.effort ?? config.effort,
       settings: project.settings,
       pluginRoot: plugin.root,
       pluginData: plugin.data,
     });
-    // context:fork bodies go to the FORK only — keeping them resident in the
+    // context:fork bodies go to the fork only. Keeping them resident in the
     // parent would defeat the fork's token-efficiency purpose.
-    if (record && !opts.fork) {
-      recordResidentSkill(state.activeSkills, skill.name, rendered.text);
-      // Use the current activation's substituted copies so argument/path effects
-      // survive this logical turn without reviving an older activation's rules.
-      activeSkillDenyRules.set(
+    if (!opts.fork) {
+      recordResidentSkill(activation.activeSkills, skill.name, rendered.text);
+      activation.denyRules.set(
         skill.name,
         [...(rendered.disallowedTools ?? skill.disallowedTools ?? [])],
       );
@@ -515,12 +505,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   /**
-   * Re-invocation dedup: fingerprint of the last rendered body per skill name.
-   * A re-invocation whose rendering is byte-identical substitutes a
-   * short note instead of a second full copy. FNV-1a 32-bit + length — cheap,
-   * dependency-free, and sufficient for change detection.
+   * FNV-1a 32-bit plus length is dependency-free and sufficient for detecting
+   * byte-identical re-invocations without retaining another full skill body.
    */
-  const lastSkillRenderHash = new Map<string, string>();
   function skillRenderFingerprint(text: string): string {
     let h = 0x811c9dc5;
     for (let i = 0; i < text.length; i++) {
@@ -530,12 +517,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return `${text.length}:${(h >>> 0).toString(16)}`;
   }
   /** Returns the dedup note when `rendered` is byte-identical to the last copy, else records it. */
-  function skillDedupNote(skill: ClaudeSkill, rendered: string): string | undefined {
+  function skillDedupNote(
+    skill: ClaudeSkill,
+    rendered: string,
+    activation: SkillActivationState = mainActivation,
+  ): string | undefined {
     const fp = skillRenderFingerprint(rendered);
-    if (lastSkillRenderHash.get(skill.name) === fp) {
+    if (activation.lastRenderHash.get(skill.name) === fp) {
       return `Skill "${skill.name}" was invoked again; its content is unchanged from the earlier copy above.`;
     }
-    lastSkillRenderHash.set(skill.name, fp);
+    activation.lastRenderHash.set(skill.name, fp);
     return undefined;
   }
 
@@ -833,7 +824,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const subagentRuntime = new SubagentRuntime({
     getAgents: () => project.agents,
     buildSystemPrompt: buildSubagentSystemPrompt,
-    customToolsFor: (agent, granted, depth, ownerAgentId, dispatcherIsFork, subCwd) => {
+    customToolsFor: (agent, granted, depth, ownerAgentId, dispatcherIsFork, subCwd, activation) => {
       // Per-dispatch instances (fresh TaskStore, dispatch-local cwd binding).
       // NOTE: SendMessage is deliberately NEVER built here — it is
       // parent-initiated only (no subagent→subagent or subagent→parent channel).
@@ -846,20 +837,30 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       if (granted.includes("Skill")) {
         // Per-dispatch Skill tool: carries the caller's depth into context:fork
         // dispatches (depth cap holds) and never mutates the parent session state.
-        tools.push(createSkillTool({ depth, forSubagent: true }) as Record<string, unknown>);
+        tools.push(createSkillTool({
+          depth,
+          forSubagent: true,
+          activation,
+          getCwd: () => (subCwd ?? cwdState).get(),
+        }) as Record<string, unknown>);
       }
       if (granted.includes("SlashCommand")) {
         // Per-dispatch SlashCommand tool: a thin alias over the same shared
         // skill-activation path as the Skill tool — carries the caller's depth
         // into context:fork dispatches and leaves parent session state alone.
-        tools.push(createSlashCommandTool({ depth, forSubagent: true }) as Record<string, unknown>);
+        tools.push(createSlashCommandTool({
+          depth,
+          forSubagent: true,
+          activation,
+          getCwd: () => (subCwd ?? cwdState).get(),
+        }) as Record<string, unknown>);
       }
       // Background-task tools are SCOPED to this dispatcher's own tasks: built
       // over `backgroundTasks.scopedTo(ownerAgentId)`, so a subagent's
       // TaskOutput/TaskStop reach only the tasks it itself dispatched — a sibling's
       // or the coordinator's task is indistinguishable from an unknown id. The
       // coordinator keeps the full registry (below), retaining reach to every task.
-      const scoped = scopedBackgroundTools(backgroundTasks, ownerAgentId);
+      const scoped = scopedBackgroundTools(backgroundTasks, ownerAgentId, subagentRegistry);
       if (granted.includes("TaskOutput")) {
         tools.push(scoped.taskOutput);
       }
@@ -904,6 +905,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // Same oversized-tool-result backstop the main guard runs, threaded into every
     // subagent's guard (config is not in scope at the subagent install site).
     clipMaxTokens: config.compaction.clipMaxTokens,
+    proactiveCompactPercent: config.compaction.proactiveCompactPercent,
     makeContextInjector,
     // Agent-scoped hooks: per-dispatch runner with the SAME deps as the
     // session's base runner; the runtime multiplexes and discards it. Its
@@ -1208,7 +1210,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   async function runSkillActivation(
     skill: ClaudeSkill,
     argsText: string,
-    opts: { forSubagent: boolean; depth: number; invokedName: string; signal?: AbortSignal },
+    opts: {
+      forSubagent: boolean;
+      depth: number;
+      invokedName: string;
+      signal?: AbortSignal;
+      activation?: SkillActivationState;
+      cwd?: string;
+    },
   ): Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }> {
     if (skill.disableModelInvocation) {
       throw new Error(`Skill "${opts.invokedName}" is user-only (disable-model-invocation). Ask the user to run /${opts.invokedName}.`);
@@ -1216,7 +1225,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (skill.contextFork) {
       const rendered = await activateSkill(skill, argsText, {
         fork: true,
-        recordActivation: !opts.forSubagent,
+        activation: opts.activation,
+        cwd: opts.cwd,
       });
       const result = await forkDispatch(skill, rendered, opts.depth + 1, argsText, opts.signal);
       // Forks are non-resumable: suppress every resume trailer. The shared
@@ -1232,12 +1242,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       };
     }
     const rendered = await activateSkill(skill, argsText, {
-      recordActivation: !opts.forSubagent,
+      activation: opts.activation,
+      cwd: opts.cwd,
     });
-    // Re-invocation with byte-identical content → short note instead of a
-    // second copy. Subagent instances keep their own context and never consult
-    // the parent-session fingerprints.
-    const note = opts.forSubagent ? undefined : skillDedupNote(skill, rendered);
+    const note = skillDedupNote(skill, rendered, opts.activation);
     if (note) {
       return {
         content: [{ type: "text", text: note }],
@@ -1255,7 +1263,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    * activations (resident body, disallowed-tools gate, scoped hooks); subagent
    * instances carry their dispatch depth into forks and leave parent state alone.
    */
-  function createSkillTool(opts: { depth: number; forSubagent: boolean }) {
+  function createSkillTool(opts: {
+    depth: number;
+    forSubagent: boolean;
+    activation?: SkillActivationState;
+    getCwd?: () => string;
+  }) {
     return {
       name: "Skill",
       label: "Skill",
@@ -1278,6 +1291,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           depth: opts.depth,
           invokedName: params.name,
           signal,
+          activation: opts.activation,
+          cwd: opts.getCwd?.(),
         });
       },
     };
@@ -1295,7 +1310,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    * skills still activate) — the NON-stacking single-command counterpart of the
    * user-typed `/name` prompt transform.
    */
-  function createSlashCommandTool(opts: { depth: number; forSubagent: boolean }) {
+  function createSlashCommandTool(opts: {
+    depth: number;
+    forSubagent: boolean;
+    activation?: SkillActivationState;
+    getCwd?: () => string;
+  }) {
     return {
       name: "SlashCommand",
       label: "SlashCommand",
@@ -1315,6 +1335,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           depth: opts.depth,
           invokedName: parsed.name,
           signal,
+          activation: opts.activation,
+          cwd: opts.getCwd?.(),
         });
       },
     };
@@ -1341,7 +1363,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // no background task was ever started.
   claudeNamedTools.push(
     createTaskOutputTool(backgroundTasks) as Record<string, unknown>,
-    createTaskStopTool(backgroundTasks) as Record<string, unknown>,
+    createTaskStopTool(backgroundTasks, subagentRegistry) as Record<string, unknown>,
   );
 
   for (const tool of claudeNamedTools) {
@@ -1669,6 +1691,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     try {
       // Cancellation owns abort-before-join; never manufacture nested settlement.
       await mainCheckpointGate.cancel("shutdown");
+      // This registry/runtime pair is session-local: claim any linked background
+      // generations first (suppressing stale output/notices), then join every
+      // retained child before SessionEnd and process shutdown proceed.
+      await Promise.allSettled(subagentRegistry.list()
+        .filter((record) => record.state === "running" && record.checkpointPaused)
+        .map((record) => backgroundTasks.stopAgentAndWait(record.agentId)));
+      await subagentRuntime.shutdownCheckpointPaused();
       // `reason` is the matcher subject for SessionEnd (Claude wire contract).
       await hooks.fire("SessionEnd", { cwd: cwdState.get(), reason: event?.reason ?? "other" });
     } catch {

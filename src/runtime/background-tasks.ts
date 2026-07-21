@@ -94,6 +94,8 @@ export interface BackgroundResultLike {
   agentName?: string;
   /** Per-subagent token/cost usage; partial on failed/aborted runs. */
   usage?: UsageLike;
+  /** A compaction-exhausted child retains its live session until recovery or stop. */
+  checkpointPaused?: boolean;
   /** The single error channel: present iff `outcome !== "completed"`. */
   error?: string;
   diagnostics?: Diagnostic[];
@@ -182,7 +184,11 @@ export interface BackgroundTaskRecord {
   /** Settles when the underlying dispatch ends (never rejects). */
   settled: Promise<void>;
   /** Cooperative abort hook (wired to the dispatch's AbortController), if any. */
-  abort?: () => void;
+  abort?: () => void | Promise<void>;
+  /** Settlement of the single claimed cooperative abort invocation. */
+  abortSettlement?: Promise<void>;
+  /** Failed result retained a live compaction-paused child. */
+  checkpointPaused?: boolean;
   /**
    * Authoritative, task-generation-local settlement delivery state, initialized
    * to pending for every start() record. Optional only so structural
@@ -206,6 +212,10 @@ export interface BackgroundTaskView {
   ids(): string[];
   wait(id: string): Promise<BackgroundTaskRecord | undefined>;
   stop(id: string): { found: boolean; alreadySettled: boolean; abortRequested: boolean };
+  /** Stop and join both dispatch settlement and any retained checkpoint cleanup. */
+  stopAndWait?(id: string): Promise<{ found: boolean; alreadySettled: boolean; abortRequested: boolean }>;
+  /** Atomically stop the newest owned task linked to an agent identity. */
+  stopAgentAndWait?(agentId: string): Promise<{ record?: BackgroundTaskRecord; found: boolean; alreadySettled: boolean; abortRequested: boolean }>;
   /** Mark a terminal task result as collected through TaskOutput. */
   markCollected(id: string): boolean;
   subscribeProgress(id: string, listener: (snapshot: ProgressSnapshot) => void): () => void;
@@ -296,7 +306,7 @@ export class BackgroundTaskRegistry {
   start(
     label: string,
     promise: Promise<BackgroundResultLike>,
-    abort?: () => void,
+    abort?: () => void | Promise<void>,
     agentId?: string,
     agentType?: string,
     owner?: string,
@@ -341,6 +351,7 @@ export class BackgroundTaskRegistry {
         record.transcriptPath = result.transcriptPath;
         record.resumable = result.resumable === true;
         record.truncated = result.truncated === true;
+        record.checkpointPaused = result.checkpointPaused === true;
         // Usage mirror: recorded before the stopped-branch early return
         // below, so an aborted task still reports what its partial run cost.
         record.usage = result.usage;
@@ -540,23 +551,69 @@ export class BackgroundTaskRegistry {
   stop(id: string): { found: boolean; alreadySettled: boolean; abortRequested: boolean } {
     const task = this.tasks.get(id);
     if (!task) return { found: false, alreadySettled: false, abortRequested: false };
-    if (task.status !== "running") {
+    // A stop already owns asynchronous cleanup. Until that exact promise
+    // settles, every task-id/agent-id caller observes an in-progress stop rather
+    // than the superficially terminal status written below.
+    if (task.abortSettlement) {
+      return { found: true, alreadySettled: false, abortRequested: true };
+    }
+    if (task.status !== "running" && !task.checkpointPaused) {
       return { found: true, alreadySettled: true, abortRequested: false };
     }
     task.status = "stopped";
+    task.checkpointPaused = false;
     // Duration display ends at the stop, not at the (possibly much later)
     // cooperative promise settlement.
     task.settledAt ??= Date.now();
     let abortRequested = false;
     if (task.abort) {
       try {
-        task.abort();
+        const claimed = Promise.resolve(task.abort()).catch(() => undefined);
+        // Claim once before exposing settlement to an awaiting TaskStop. Keep
+        // the marker authoritative until settlement, then remove only this
+        // generation's claim so a later stop sees the genuinely settled state.
+        task.abortSettlement = claimed;
+        void claimed.finally(() => {
+          if (task.abortSettlement === claimed) task.abortSettlement = undefined;
+        });
         abortRequested = true;
       } catch {
         // best-effort — a failing abort hook must not fail the stop
       }
     }
     return { found: true, alreadySettled: false, abortRequested };
+  }
+
+  async stopAndWait(id: string): Promise<{ found: boolean; alreadySettled: boolean; abortRequested: boolean }> {
+    const task = this.tasks.get(id);
+    const pendingStop = task?.abortSettlement;
+    const joinRetainedCheckpoint = task?.checkpointPaused === true;
+    const result = this.stop(id);
+    const abortSettlement = pendingStop ?? task?.abortSettlement;
+    // Ordinary TaskStop remains a cooperative request (the underlying task may
+    // ignore abort indefinitely). A checkpoint-paused record is different: its
+    // dispatch already settled and the abort callback owns finite retained
+    // cleanup, which TaskStop must join before reporting success.
+    if (joinRetainedCheckpoint || pendingStop) {
+      await abortSettlement;
+      await task?.settled;
+    }
+    return result;
+  }
+
+  async stopAgentAndWait(agentId: string): Promise<{
+    record?: BackgroundTaskRecord;
+    found: boolean;
+    alreadySettled: boolean;
+    abortRequested: boolean;
+  }> {
+    const record = this.newestTaskByAgent.get(agentId);
+    if (!record) return { found: false, alreadySettled: false, abortRequested: false };
+    // Suppress collection/notice before any await: agent-id stop owns both the
+    // paused child and its linked background generation atomically.
+    record.settlementDelivery = "collected";
+    const result = await this.stopAndWait(record.id);
+    return { record, ...result };
   }
 
   /**
@@ -602,6 +659,15 @@ export class BackgroundTaskRegistry {
       wait: async (id) => (owns(id) ? this.wait(id) : undefined),
       stop: (id) =>
         owns(id) ? this.stop(id) : { found: false, alreadySettled: false, abortRequested: false },
+      stopAndWait: (id) => owns(id)
+        ? this.stopAndWait(id)
+        : Promise.resolve({ found: false, alreadySettled: false, abortRequested: false }),
+      stopAgentAndWait: (agentId) => {
+        const record = this.newestTaskByAgent.get(agentId);
+        return record && record.owner === ownerId
+          ? this.stopAgentAndWait(agentId)
+          : Promise.resolve({ found: false, alreadySettled: false, abortRequested: false });
+      },
       markCollected: (id) => (owns(id) ? this.markCollected(id) : false),
       subscribeProgress: (id, listener) =>
         owns(id) ? this.subscribeProgress(id, listener) : () => {},
@@ -1055,16 +1121,43 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
 export function scopedBackgroundTools(
   registry: BackgroundTaskRegistry,
   ownerAgentId: string,
+  pausedAgents?: {
+    get(agentId: string): {
+      agentId: string;
+      agentName: string;
+      parentAgentId?: string;
+      state: "running" | "settled";
+      checkpointPaused?: boolean;
+      session?: { stopCheckpoint?(): Promise<void> };
+    } | undefined;
+  },
 ): { taskOutput: Record<string, unknown>; taskStop: Record<string, unknown> } {
   const view = registry.scopedTo(ownerAgentId);
+  const ownedPaused = pausedAgents ? {
+    get: (agentId: string) => {
+      const record = pausedAgents.get(agentId);
+      return record?.parentAgentId === ownerAgentId ? record : undefined;
+    },
+  } : undefined;
   return {
     taskOutput: createTaskOutputTool(view),
-    taskStop: createTaskStopTool(view),
+    taskStop: createTaskStopTool(view, ownedPaused),
   };
 }
 
 /** The `TaskStop` tool: best-effort cooperative stop of a background task. */
-export function createTaskStopTool(registry: BackgroundTaskView): Record<string, unknown> {
+export function createTaskStopTool(
+  registry: BackgroundTaskView,
+  pausedAgents?: {
+    get(agentId: string): {
+      agentId: string;
+      agentName: string;
+      state: "running" | "settled";
+      checkpointPaused?: boolean;
+      session?: { stopCheckpoint?(): Promise<void> };
+    } | undefined;
+  },
+): Record<string, unknown> {
   return {
     name: "TaskStop",
     label: "TaskStop",
@@ -1078,8 +1171,30 @@ export function createTaskStopTool(registry: BackgroundTaskView): Record<string,
       // echoed by unknownIdError, so sanitize before lookup/interpolation.
       const id = sanitizeLine(String(params.task_id ?? ""), CAPTURED_LINE_CAP);
       const task = registry.get(id);
-      if (!task) throw unknownIdError(registry, id);
-      const stopped = registry.stop(id);
+      if (!task) {
+        const paused = isAgentId(id) ? pausedAgents?.get(id) : undefined;
+        if (!paused || paused.state !== "running" || !paused.checkpointPaused ||
+            !paused.session?.stopCheckpoint) {
+          throw unknownIdError(registry, id);
+        }
+        const stopCheckpoint = paused.session.stopCheckpoint.bind(paused.session);
+        // Claim a linked background generation before joining the child so no
+        // stale TaskOutput or settlement notice survives an agent-id stop. The
+        // registry record is mutable and cleanup clears `session`, so bind the
+        // authenticated stop capability before the await.
+        const linked = await registry.stopAgentAndWait?.(id);
+        if (!linked?.abortRequested) await stopCheckpoint();
+        return {
+          content: [{
+            type: "text",
+            text: `Agent ${paused.agentId} ("${sanitizeLine(paused.agentName, CAPTURED_LINE_CAP)}") — checkpoint-paused session stopped after joining active recovery work.`,
+          }],
+          details: { agentId: paused.agentId, status: "stopped", checkpointPaused: true },
+        };
+      }
+      const stopped = registry.stopAndWait
+        ? await registry.stopAndWait(id)
+        : registry.stop(id);
       const identity = formatBackgroundTaskIdentity(
         id,
         task.agentType ?? task.agentName ?? "subagent",

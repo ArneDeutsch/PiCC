@@ -500,6 +500,30 @@ export class MidRunCompactionController {
     return { recovered: true, rejected };
   }
 
+  /** Child live-session adapters may retry repaired restoration without reopening ordinary work. */
+  enableRestorationRecovery(generation: number): boolean {
+    if (generation !== this.generation || this.phase !== "exhausted" ||
+        this.terminalFailure !== "restoration-paused") return false;
+    this.recovery = { generation, token: {} };
+    return true;
+  }
+
+  /** A public-session continuation failed to start or settle; keep this generation recoverable. */
+  pauseAfterRecoveryFailure(
+    generation: number,
+    failureCategory: CompactionFailureCategory = "operational",
+  ): boolean {
+    if (generation !== this.generation || this.phase !== "idle") return false;
+    this.phase = "exhausted";
+    this.terminalFailure = failureCategory;
+    this.recovery = { generation, token: {} };
+    this.emit("checkpoint-exhausted", generation, this.attempt, {
+      action: "manual-recovery",
+      failureCategory,
+    });
+    return true;
+  }
+
   private currentBatch(handle: ToolBatchHandle): ActiveBatch | undefined {
     return this.phase === "stopping" && handle === this.activeBatch?.handle &&
       handle.generation === this.generation ? this.activeBatch : undefined;
@@ -1038,6 +1062,16 @@ export class MainSessionCheckpointGate {
       try {
         await barrier.promise;
       } catch {
+        this.abortAfterBatch(ctx);
+        return;
+      }
+      // Opening the latch is not itself transport authority. Cancellation or a
+      // replacement can settle the barrier specifically to unblock waiters; a
+      // provider callback waking afterward must re-authenticate the same
+      // controller generation and resuming phase before it may return to Pi.
+      const current = this.controller.snapshot();
+      if (this.generation !== generation || this.resumeBarrier !== barrier ||
+          current.generation !== generation || current.phase !== "resuming") {
         this.abortAfterBatch(ctx);
       }
       return;

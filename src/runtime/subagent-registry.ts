@@ -27,9 +27,23 @@ import {
  * be steered through. Defined here (not imported from subagents.ts) so this
  * module has no import cycle with the runtime that populates it.
  */
+export interface CheckpointRecoveryResult {
+  ok: boolean;
+  outcome: SubagentOutcome;
+  finalMessage: string;
+  agentId: string;
+  agentName?: string;
+  truncated?: boolean;
+  error?: string;
+}
+
 export interface SteerableSession {
   /** Queue a mid-task course correction (delivered before the next LLM call). */
   steer?(text: string): Promise<void> | void;
+  /** Authenticated continuation of this exact retained checkpoint-paused session. */
+  recoverCheckpoint?(text: string): Promise<CheckpointRecoveryResult>;
+  /** Stop and join this exact retained checkpoint-paused session. */
+  stopCheckpoint?(): Promise<void>;
   /**
    * Queue a follow-up processed after the agent finishes its current work.
    * Declared for the pi-contract pin; the runtime never calls it — steering
@@ -136,8 +150,10 @@ export interface SubagentRegistryRecord {
    * died before any billable turn).
    */
   usage?: SubagentUsage;
-  /** Live session handle while running (steering target); dropped on settlement. */
+  /** Live session handle while running (steering or checkpoint-recovery target). */
   session?: SteerableSession;
+  /** The running record is retained solely at a settled checkpoint exhaustion boundary. */
+  checkpointPaused?: boolean;
   /**
    * Settled-notice readiness gate. A (re)dispatch re-arms this agent-level
    * gate, but the background-task registry's task-generation collection and
@@ -222,6 +238,7 @@ export interface RegisterInput {
   resumable: boolean;
   oneShot: boolean;
   session?: SteerableSession;
+  checkpointPaused?: boolean;
   /** The dispatching agent's id; absent for a depth-1 dispatch. Set-once. */
   parentAgentId?: string;
   /** Model-supplied Agent-tool `description` (sanitized+capped here). Set-once. */
@@ -285,6 +302,7 @@ export class SubagentRegistry {
       existing.resumable = input.resumable;
       existing.oneShot = input.oneShot;
       existing.session = input.session;
+      existing.checkpointPaused = input.checkpointPaused;
       existing.state = "running";
       existing.settledNoticeConsumed = false;
       // Set-once panel fields: the enrich/resume re-register never clobbers a
@@ -311,6 +329,7 @@ export class SubagentRegistry {
       oneShot: input.oneShot,
       state: "running",
       session: input.session,
+      checkpointPaused: input.checkpointPaused,
       settledNoticeConsumed: false,
       parentAgentId: input.parentAgentId,
       description: boundedDescription(input.description),
@@ -354,6 +373,14 @@ export class SubagentRegistry {
     this.notifyChange();
   }
 
+  /** Mark a running record as the exact live checkpoint-paused recovery target. */
+  markCheckpointPaused(agentId: string): void {
+    const record = this.records.get(agentId);
+    if (!record || record.state !== "running" || !record.session?.recoverCheckpoint) return;
+    record.checkpointPaused = true;
+    this.notifyChange();
+  }
+
   /**
    * Mark a dispatch settled: drop the live session handle (it is disposed) and
    * flip the state, keeping name/ID/state/transcript-path + everything resume
@@ -373,6 +400,7 @@ export class SubagentRegistry {
     if (!record) return;
     record.state = "settled";
     record.session = undefined;
+    record.checkpointPaused = false;
     record.settledAt = Date.now();
     if (settled?.outcome !== undefined) record.outcome = settled.outcome;
     if (settled?.usage !== undefined) record.usage = settled.usage;

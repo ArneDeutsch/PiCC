@@ -141,11 +141,20 @@ describe("pi 0.80.x API contract", () => {
     expect(typeof sdk.SessionManager.open).toBe("function");
   });
 
-  it("AgentSession exposes subscribe() for live progress", async () => {
+  it("AgentSession exposes the public compaction, continuation, cancellation, and lifecycle surface", async () => {
     const sdk: any = await import("@earendil-works/pi-coding-agent");
-    // subscribe is an instance method; assert it's on the prototype (constructing
-    // a real session needs a provider/model, out of scope for a contract smoke).
-    expect(typeof sdk.AgentSession?.prototype?.subscribe).toBe("function");
+    // These are instance methods; constructing a real session needs a model and
+    // provider, which belongs to the real-stack lane rather than this smoke pin.
+    for (const method of [
+      "prompt",
+      "compact",
+      "sendCustomMessage",
+      "abortCompaction",
+      "abort",
+      "subscribe",
+    ]) {
+      expect(typeof sdk.AgentSession?.prototype?.[method], `AgentSession.${method}`).toBe("function");
+    }
   });
 
   it("AgentSession exposes steer()/followUp() for SendMessage steering", async () => {

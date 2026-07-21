@@ -7,6 +7,32 @@ import {
   substituteVariables,
 } from "../claude/skills.js";
 import { preprocessShellInjection } from "../engine/shell-inject.js";
+import type { HookRunnerLike } from "../engine/hook-runner.js";
+
+/** Mutable preservation state owned by one main session or one child dispatch. */
+export interface SkillActivationState {
+  activeSkills: Map<string, string>;
+  denyRules: Map<string, string[]>;
+  scopedHookSkills: Set<string>;
+  hookRunners: HookRunnerLike[];
+  lastRenderHash: Map<string, string>;
+  /** Child dispatches identity-wrap runners created by later skill activations. */
+  wrapHookRunner?: (runner: HookRunnerLike) => HookRunnerLike;
+}
+
+export function newSkillActivationState(
+  activeSkills = new Map<string, string>(),
+  wrapHookRunner?: (runner: HookRunnerLike) => HookRunnerLike,
+): SkillActivationState {
+  return {
+    activeSkills,
+    denyRules: new Map(),
+    scopedHookSkills: new Set(),
+    hookRunners: [],
+    lastRenderHash: new Map(),
+    ...(wrapHookRunner ? { wrapHookRunner } : {}),
+  };
+}
 
 /** The `${CLAUDE_*}` variable set a skill activation substitutes (body + tool rules). */
 export function skillActivationVars(opts: {

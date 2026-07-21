@@ -176,6 +176,58 @@ describe("lifecycle wiring", () => {
     expect(fs.existsSync(log)).toBe(true);
   });
 
+  it("production session_shutdown joins retained child cleanup before worktree release and SessionEnd", async () => {
+    const shutdownPi = fakePi();
+    type Seam = NonNullable<Parameters<typeof picc>[1]>;
+    let internals!: Parameters<NonNullable<Seam["onWired"]>>[0];
+    picc(shutdownPi.api as never, {
+      onInitializationSettled: shutdownPi.captureInitialization,
+      onWired: (value) => { internals = value; },
+    });
+    await shutdownPi.waitForInitialization();
+    const log = path.join(dir, ".claude", ".session-end-log");
+    fs.rmSync(log, { force: true });
+    const cleanup = deferred<void>();
+    let worktreeReleased = false;
+    const agentId = "agent-444444444444";
+    const taskId = internals.backgroundTasks.start(
+      "agent:reviewer",
+      Promise.resolve({
+        ok: false, outcome: "failed" as const, finalMessage: "", agentId,
+        agentName: "reviewer", checkpointPaused: true, error: "paused",
+      }),
+      async () => {
+        await cleanup.promise;
+        worktreeReleased = true;
+      },
+      agentId,
+      "reviewer",
+    );
+    await internals.backgroundTasks.wait(taskId);
+    internals.subagentRegistry.register({
+      agentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
+      checkpointPaused: true,
+      session: {
+        recoverCheckpoint: async () => { throw new Error("unused"); },
+        stopCheckpoint: async () => cleanup.promise,
+      },
+    });
+
+    let shutdownSettled = false;
+    const shutdown = shutdownPi.fire("session_shutdown", { reason: "other" })
+      .then(() => { shutdownSettled = true; });
+    await Promise.resolve();
+    expect(shutdownSettled).toBe(false);
+    expect(worktreeReleased).toBe(false);
+    expect(fs.existsSync(log)).toBe(false);
+    expect(internals.backgroundTasks.drainSettlementNotices(() => true, () => {})).toEqual([]);
+
+    cleanup.resolve();
+    await shutdown;
+    expect(worktreeReleased).toBe(true);
+    expect(fs.existsSync(log)).toBe(true);
+  });
+
   it("PostToolUse exit-2 feedback reaches the model in the tool result (lint-and-fix loop)", async () => {
     const result = await pi.fire("tool_result", {
       toolName: "edit",
