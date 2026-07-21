@@ -204,7 +204,7 @@ Every subagent is visible, both to you and to the coordinating model:
 - **Condensed transcript records.** Subagent output does not stream into the chat; selected-agent
   detail owns the live view. Each depth-1 normal-path result replaces its pending call in the same
   tool row; background completion adds one collapsed record — outcome, duration, tokens — that
-  Ctrl+O expands to the full final answer, transcript path, usage, and any warnings. Background
+  Ctrl+O expands to the outcome-appropriate retained output, if any, plus the transcript path, usage, and any warnings. Background
   agents get their record even if never awaited; an agent that settles while you are away from the prompt gets it
   when the conversation next continues (the record rides the next turn). A later `TaskOutput`
   collection adds only a minimal reference line, never a duplicate. Nested agents (depth ≥ 2) get
