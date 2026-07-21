@@ -36,9 +36,11 @@ export function createWorktreeTools(deps: {
       // the previous one (keep + unlock) — otherwise its on-disk
       // `git worktree lock` leaks and blocks the project's own remove/prune.
       let releasedLine: string | undefined;
+      let previousWorktreePath: string | undefined;
       if (previous !== undefined && path.resolve(previous) !== path.resolve(result.worktreePath)) {
         await deps.worktrees.exit({ worktreePath: previous, action: "keep" });
         releasedLine = `Left previous worktree (kept, unlocked): ${previous}`;
+        previousWorktreePath = previous;
       }
       deps.cwdState.enterWorktree(result.worktreePath);
       const created = (result as { created?: boolean }).created ?? false;
@@ -59,7 +61,14 @@ export function createWorktreeTools(deps: {
       ].filter(Boolean);
       return {
         content: [{ type: "text", text: lines.join("\n") }],
-        details: { worktreePath: result.worktreePath, created, seeded },
+        details: {
+          worktreePath: result.worktreePath,
+          branch: (result as { branch?: string }).branch,
+          created,
+          seeded,
+          previousUnlockAttempted: previousWorktreePath !== undefined,
+          ...(previousWorktreePath !== undefined ? { previousWorktreePath } : {}),
+        },
       };
     },
   };
@@ -77,7 +86,7 @@ export function createWorktreeTools(deps: {
       if (!worktreePath) {
         return {
           content: [{ type: "text", text: "Not inside a worktree; nothing to exit." }],
-          details: {},
+          details: { outcome: "none", restorePath: deps.cwdState.getBase() },
         };
       }
       if (params.action === "remove") {
@@ -87,9 +96,11 @@ export function createWorktreeTools(deps: {
         });
       }
       const result = (await deps.worktrees.exit({ worktreePath, action: params.action })) as {
+        ok?: boolean;
         removed?: boolean;
         orphaned?: boolean;
         error?: string;
+        diagnostics?: unknown[];
       };
       deps.cwdState.exitWorktree();
       // Report truthfully: "removed" only when removal actually happened.
@@ -101,7 +112,26 @@ export function createWorktreeTools(deps: {
             : result.orphaned === true
               ? `Exited worktree; removal was blocked (Windows file lock?) — it will be reaped later. Working directory restored.`
               : `Exited worktree, but removal FAILED${result.error ? ` (${result.error})` : ""} — ${worktreePath} was kept. Working directory restored.`;
-      return { content: [{ type: "text", text }], details: { worktreePath, ...result } };
+      const outcome = params.action === "keep"
+        ? "kept"
+        : result.removed === true
+          ? "removed"
+          : result.orphaned === true
+            ? "deferred-removal"
+            : "removal-failed";
+      return {
+        content: [{ type: "text", text }],
+        details: {
+          ok: result.ok,
+          removed: result.removed,
+          orphaned: result.orphaned,
+          diagnostics: result.diagnostics,
+          ...(typeof result.error === "string" ? { error: result.error } : {}),
+          worktreePath,
+          outcome,
+          restorePath: deps.cwdState.getBase(),
+        },
+      };
     },
   };
 

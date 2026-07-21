@@ -1,3 +1,4 @@
+import path from "node:path";
 import {
   createEditToolDefinition,
   type ToolDefinition,
@@ -16,7 +17,8 @@ interface ResultShape {
 type WebToolName = "WebFetch" | "WebSearch";
 type ActivationToolName = "Skill" | "SlashCommand";
 type MutationToolName = "edit" | "MultiEdit";
-type RoutineToolName = WebToolName | ActivationToolName | MutationToolName;
+type WorktreeToolName = "EnterWorktree" | "ExitWorktree";
+type RoutineToolName = WebToolName | ActivationToolName | MutationToolName | WorktreeToolName;
 type DataSnapshot = Record<string, unknown>;
 
 const MAX_FAIL_OPEN_CHARS = 4_096;
@@ -26,6 +28,8 @@ const MAX_MULTI_EDIT_COUNT = 1_000;
 const MAX_MULTI_EDIT_PATH_CHARS = 16_384;
 const MAX_MULTI_EDIT_DIFF_CHARS = 1_000_000;
 const MAX_OVERSIZED_PATH_CHARS = 512;
+const MAX_WORKTREE_SEEDED_FILES = 1_000;
+const MAX_WORKTREE_DIAGNOSTICS = 1_000;
 const MUTATION_CONTROL_PLACEHOLDER = "�";
 const LINE_BREAK_RE = /\r\n?|\n|\u2028|\u2029/gu;
 
@@ -68,14 +72,14 @@ function plainOwnData(
   }
 }
 
-function exactStringArray(value: unknown): boolean {
+function exactStringArray(value: unknown, maxLength = Number.MAX_SAFE_INTEGER): boolean {
   if (!Array.isArray(value)) return false;
   try {
     if (Object.getPrototypeOf(value) !== Array.prototype) return false;
     const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
     if (!lengthDescriptor || !("value" in lengthDescriptor)) return false;
     const length = lengthDescriptor.value;
-    if (!Number.isSafeInteger(length) || length < 0) return false;
+    if (!Number.isSafeInteger(length) || length < 0 || length > maxLength) return false;
     const keys = Reflect.ownKeys(value);
     if (keys.length !== length + 1 || !keys.includes("length")) return false;
     for (let index = 0; index < length; index++) {
@@ -142,6 +146,44 @@ function clamp(line: string, width: number): string {
     const fallback = sanitizeText(line, true);
     return fallback.slice(0, Math.max(0, Math.floor(width)));
   }
+}
+
+function structuredRowComponent(
+  literals: readonly string[],
+  fields: readonly string[],
+  theme: unknown,
+): Component {
+  return {
+    render(width: number): string[] {
+      if (!Number.isFinite(width) || width <= 0) return [""];
+      const columns = Math.max(0, Math.floor(width));
+      try {
+        const fixedWidth = literals.reduce((sum, literal) => sum + visibleWidth(literal), 0);
+        let remaining = Math.max(0, columns - fixedWidth);
+        const displayed: string[] = [];
+        for (let index = 0; index < fields.length; index++) {
+          const fieldCount = fields.length - index;
+          const allowance = Math.floor(remaining / fieldCount);
+          const field = visibleWidth(fields[index] ?? "") > allowance
+            ? truncateToWidth(fields[index] ?? "", allowance, "…")
+            : fields[index] ?? "";
+          displayed.push(field);
+          remaining -= visibleWidth(field);
+        }
+        let line = literals[0] ?? "";
+        for (let index = 0; index < displayed.length; index++) {
+          line += (displayed[index] ?? "") + (literals[index + 1] ?? "");
+        }
+        return [clamp(safeThemeMethod(theme, "fg", ["toolOutput", line], line), columns)];
+      } catch {
+        let line = literals[0] ?? "";
+        for (let index = 0; index < fields.length; index++) {
+          line += (fields[index] ?? "") + (literals[index + 1] ?? "");
+        }
+        return [clamp(line, columns)];
+      }
+    },
+  };
 }
 
 function commandComponent(toolName: RoutineToolName, invocation: string, theme: unknown): Component {
@@ -339,6 +381,26 @@ function emptyInvocationReason(toolName: RoutineToolName, context: unknown): str
     : undefined;
 }
 
+function exactDataArray(value: unknown, maxLength: number): boolean {
+  if (!Array.isArray(value)) return false;
+  try {
+    if (Object.getPrototypeOf(value) !== Array.prototype) return false;
+    const length = ownData(value, "length");
+    if (!Number.isSafeInteger(length) || (length as number) < 0 || (length as number) > maxLength) {
+      return false;
+    }
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== (length as number) + 1 || !keys.includes("length")) return false;
+    for (let index = 0; index < (length as number); index++) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !("value" in descriptor)) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function activationIdentityMatches(requestedName: string, canonicalName: string): boolean {
   return requestedName === canonicalName ||
     (!requestedName.includes(":") && canonicalName.endsWith(`:${requestedName}`));
@@ -398,6 +460,134 @@ function recognizeActivationSuccess(
   return argumentsText.length > 0 ? `${name} — ${argumentsText}` : name;
 }
 
+interface WorktreeRow {
+  literals: string[];
+  fields: string[];
+}
+
+function recognizeEnterWorktree(
+  result: unknown,
+  options: unknown,
+  context: unknown,
+): WorktreeRow | undefined {
+  if (ownData(options, "isPartial") !== false || ownData(context, "isError") !== false) return undefined;
+  const resultSnapshot = plainOwnData(result, ["content", "details"]) ??
+    plainOwnData(result, ["content", "details", "isError"]);
+  if (!resultSnapshot || ("isError" in resultSnapshot && resultSnapshot.isError !== false) ||
+    !oneTextContent(resultSnapshot.content)) return undefined;
+  const baseKeys = ["worktreePath", "branch", "created", "seeded", "previousUnlockAttempted"];
+  const details = plainOwnData(resultSnapshot.details, baseKeys) ??
+    plainOwnData(resultSnapshot.details, [...baseKeys, "previousWorktreePath"]);
+  if (!details || typeof details.worktreePath !== "string" || typeof details.branch !== "string" ||
+    typeof details.created !== "boolean" ||
+    !exactStringArray(details.seeded, MAX_WORKTREE_SEEDED_FILES) ||
+    typeof details.previousUnlockAttempted !== "boolean") return undefined;
+  const argsValue = ownData(context, "args");
+  const nameArgs = plainOwnData(argsValue, ["name"]);
+  const pathArgs = plainOwnData(argsValue, ["path"]);
+  if ((nameArgs && typeof nameArgs.name !== "string") ||
+    (pathArgs && typeof pathArgs.path !== "string") ||
+    (!nameArgs && !pathArgs) || (pathArgs && details.created)) return undefined;
+  if (pathArgs) {
+    try {
+      if (path.resolve(pathArgs.path as string) !== path.resolve(details.worktreePath)) return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  const hasPrevious = "previousWorktreePath" in details;
+  if (hasPrevious !== details.previousUnlockAttempted ||
+    (hasPrevious && typeof details.previousWorktreePath !== "string")) return undefined;
+  const worktreePath = sanitizeText(details.worktreePath, true);
+  const branch = sanitizeText(details.branch, true);
+  const previousPath = hasPrevious ? sanitizeText(details.previousWorktreePath, true) : undefined;
+  if (!worktreePath || !branch || (hasPrevious && !previousPath)) return undefined;
+  const seededCount = ownData(details.seeded, "length") as number;
+  if (!details.created && seededCount !== 0) return undefined;
+  const literals = ["EnterWorktree(", ") on branch "];
+  const fields = [worktreePath, branch];
+  let suffix = seededCount > 0 ? `; seeded ${seededCount} files` : "";
+  if (previousPath !== undefined) {
+    suffix += "; previous ";
+    literals.push(suffix, " kept; unlock attempted");
+    fields.push(previousPath);
+  } else {
+    literals.push(suffix);
+  }
+  return { literals, fields };
+}
+
+function recognizeExitWorktree(
+  result: unknown,
+  options: unknown,
+  context: unknown,
+): WorktreeRow | undefined {
+  if (ownData(options, "isPartial") !== false || ownData(context, "isError") !== false) return undefined;
+  const resultSnapshot = plainOwnData(result, ["content", "details"]) ??
+    plainOwnData(result, ["content", "details", "isError"]);
+  if (!resultSnapshot || ("isError" in resultSnapshot && resultSnapshot.isError !== false) ||
+    !oneTextContent(resultSnapshot.content)) return undefined;
+  const none = plainOwnData(resultSnapshot.details, ["outcome", "restorePath"]);
+  if (none) {
+    if (none.outcome !== "none" || typeof none.restorePath !== "string") return undefined;
+    const restorePath = sanitizeText(none.restorePath, true);
+    return restorePath
+      ? { literals: ["ExitWorktree(no active worktree); already at ", ""], fields: [restorePath] }
+      : undefined;
+  }
+  const baseKeys = [
+    "worktreePath", "outcome", "restorePath", "ok", "removed", "orphaned", "diagnostics",
+  ];
+  const details = plainOwnData(resultSnapshot.details, baseKeys) ??
+    plainOwnData(resultSnapshot.details, [...baseKeys, "error"]);
+  if (!details || typeof details.worktreePath !== "string" || typeof details.restorePath !== "string" ||
+    typeof details.ok !== "boolean" || typeof details.removed !== "boolean" ||
+    typeof details.orphaned !== "boolean" ||
+    !exactDataArray(details.diagnostics, MAX_WORKTREE_DIAGNOSTICS)) return undefined;
+  const worktreePath = sanitizeText(details.worktreePath, true);
+  const restorePath = sanitizeText(details.restorePath, true);
+  if (!worktreePath || !restorePath) return undefined;
+  if (details.outcome === "kept") {
+    if (details.ok !== true || details.removed || details.orphaned || "error" in details) return undefined;
+    return {
+      literals: ["ExitWorktree(", ") kept; restored ", ""],
+      fields: [worktreePath, restorePath],
+    };
+  }
+  if (details.outcome === "removed") {
+    if (details.ok !== true || details.removed !== true || details.orphaned || "error" in details) return undefined;
+    return {
+      literals: ["ExitWorktree(", ") removed; restored ", ""],
+      fields: [worktreePath, restorePath],
+    };
+  }
+  if (details.outcome === "deferred-removal") {
+    if (details.ok !== true || details.removed || details.orphaned !== true || "error" in details) return undefined;
+    return {
+      literals: ["ExitWorktree(", ") removal deferred; restored ", ""],
+      fields: [worktreePath, restorePath],
+    };
+  }
+  if (details.outcome !== "removal-failed" || details.ok !== false || details.removed || details.orphaned) {
+    return undefined;
+  }
+  if ("error" in details) {
+    const error = sanitizeText(details.error, true);
+    if (typeof details.error !== "string" || !error) return undefined;
+    return {
+      literals: [
+        "ExitWorktree(", ") removal failed: ",
+        "; worktree state unknown; restored ", "",
+      ],
+      fields: [worktreePath, error, restorePath],
+    };
+  }
+  return {
+    literals: ["ExitWorktree(", ") removal failed; worktree state unknown; restored ", ""],
+    fields: [worktreePath, restorePath],
+  };
+}
+
 function routineToolName(tool: unknown): RoutineToolName | undefined {
   if (tool === null || typeof tool !== "object") return undefined;
   try {
@@ -406,7 +596,8 @@ function routineToolName(tool: unknown): RoutineToolName | undefined {
     if (!descriptor || !("value" in descriptor)) return undefined;
     return descriptor.value === "WebFetch" || descriptor.value === "WebSearch" ||
       descriptor.value === "Skill" || descriptor.value === "SlashCommand" ||
-      descriptor.value === "edit" || descriptor.value === "MultiEdit"
+      descriptor.value === "edit" || descriptor.value === "MultiEdit" ||
+      descriptor.value === "EnterWorktree" || descriptor.value === "ExitWorktree"
       ? descriptor.value
       : undefined;
   } catch {
@@ -790,6 +981,14 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
         try {
           if (toolName === "MultiEdit") {
             return multiEditResult(result, options, theme, context, dependencies);
+          }
+          if (toolName === "EnterWorktree" || toolName === "ExitWorktree") {
+            const row = toolName === "EnterWorktree"
+              ? recognizeEnterWorktree(result, options, context)
+              : recognizeExitWorktree(result, options, context);
+            return row === undefined
+              ? failOpenComponent(result, toolName, theme)
+              : structuredRowComponent(row.literals, row.fields, theme);
           }
           const invocation = toolName === "WebFetch" || toolName === "WebSearch"
             ? recognizeWebSuccess(toolName, result, options, context)

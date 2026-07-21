@@ -75,6 +75,46 @@ describe("main-session routine rendering registration", () => {
     expect(lines.join("\n")).not.toContain(hidden);
   });
 
+  it.each([
+    {
+      name: "EnterWorktree",
+      args: { name: "registered" },
+      details: {
+        worktreePath: "/repo/.claude/worktrees/registered", branch: "worktree-registered",
+        created: true, seeded: [], previousUnlockAttempted: false,
+      },
+      expected: "EnterWorktree(/repo/.claude/worktrees/registered) on branch worktree-registered",
+    },
+    {
+      name: "ExitWorktree",
+      args: { action: "remove" },
+      details: {
+        worktreePath: "/repo/.claude/worktrees/registered", outcome: "deferred-removal",
+        restorePath: "/repo", ok: true, removed: false, orphaned: true, diagnostics: [],
+      },
+      expected: "ExitWorktree(/repo/.claude/worktrees/registered) removal deferred; restored /repo",
+    },
+  ])("registers $name with compact structured-result rendering", ({ name, args, details, expected }) => {
+    const tool = pi.tools.get(name);
+    expect(tool).toBeDefined();
+    expect(tool.renderShell).toBe("self");
+    expect(tool.renderCall(args, undefined, { args }).render(100)).toEqual([]);
+    const canonical = `${name} REGISTERED CANONICAL BODY`;
+    const result = { content: [{ type: "text", text: canonical }], details };
+    for (const expanded of [false, true]) {
+      const lines = tool.renderResult(
+        result,
+        { expanded, isPartial: false },
+        undefined,
+        { args, isError: false },
+      ).render(120) as string[];
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(expected);
+      expect(lines.join("\n")).not.toContain(canonical);
+    }
+    expect(result.content[0]?.text).toBe(canonical);
+  });
+
   it("executes and renders the registered MultiEdit with canonical content unchanged", async () => {
     initTheme();
     const filePath = "routine-multiedit.txt";

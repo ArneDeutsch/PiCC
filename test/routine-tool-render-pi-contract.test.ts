@@ -115,6 +115,66 @@ describe("real Pi routine rendering composition", () => {
     }
   });
 
+  it.each([
+    {
+      name: "EnterWorktree",
+      args: { name: "PENDING-ENTER-ONLY" },
+      result: {
+        content: [{ type: "text", text: "PENDING ENTER SENTINEL / CANONICAL ENTER PROSE" }],
+        details: {
+          worktreePath: "/repo/wt", branch: "worktree-contract", created: true,
+          seeded: [], previousUnlockAttempted: false,
+        },
+      },
+      pending: "EnterWorktree(PENDING-ENTER-ONLY)",
+      canonical: "PENDING ENTER SENTINEL / CANONICAL ENTER PROSE",
+      row: "EnterWorktree(/repo/wt) on branch worktree-contract",
+    },
+    {
+      name: "ExitWorktree",
+      args: { action: "remove" },
+      result: {
+        content: [{ type: "text", text: "PENDING EXIT SENTINEL / CANONICAL EXIT PROSE" }],
+        details: {
+          worktreePath: "/repo/wt", outcome: "removed", restorePath: "/repo",
+          ok: true, removed: true, orphaned: false, diagnostics: [],
+        },
+      },
+      pending: "ExitWorktree(remove)",
+      canonical: "PENDING EXIT SENTINEL / CANONICAL EXIT PROSE",
+      row: "ExitWorktree(/repo/wt) removed; restored /repo",
+    },
+  ])("keeps real Pi $name rows purely result-owned", async (entry) => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    const component = new sdk.ToolExecutionComponent(
+      entry.name,
+      `${entry.name}-worktree-contract`,
+      entry.args,
+      {},
+      wrapForSelfShell(withRoutineToolRendering({ name: entry.name } as never)),
+      { requestRender() {} },
+      process.cwd().replace(/\\/g, "/"),
+    );
+    component.setArgsComplete();
+    const stripAnsi = (line: string) => line.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+    const pending = component.render(100) as string[];
+    expect(pending).toEqual([]);
+    expect(pending.join("\n")).not.toContain(entry.pending);
+    expect(pending.join("\n")).not.toContain(entry.canonical);
+
+    component.updateResult(entry.result, false);
+    for (const expanded of [false, true]) {
+      component.setExpanded(expanded);
+      const lines = component.render(100) as string[];
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toBe("");
+      expect(stripAnsi(lines[1] ?? "").trim()).toBe(entry.row);
+      expect(lines.join("\n")).not.toContain(entry.pending);
+      expect(lines.join("\n")).not.toContain(entry.canonical);
+    }
+  });
+
   it.each(cases)("gives settled $name exactly one interactive content row in collapsed and expanded modes", async (entry) => {
     const sdk = await import("@earendil-works/pi-coding-agent") as any;
     sdk.initTheme();
@@ -263,6 +323,50 @@ describe("real Pi routine rendering composition", () => {
     );
     expect(rendered?.expanded).toContain(entry.invocation);
     expect(rendered?.expanded).not.toContain(entry.hidden);
+  });
+
+  it("composes worktree structured rows with Pi's real HTML renderer and keeps exceptional text visible", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const piDist = mainUrl.slice(0, mainUrl.indexOf("/dist/"));
+    const htmlModule = await import(`${piDist}/dist/core/export-html/tool-renderer.js`) as any;
+    const themeModule = await import(`${piDist}/dist/modes/interactive/theme/theme.js`) as any;
+    const tools = new Map([
+      ["EnterWorktree", wrapForSelfShell(withRoutineToolRendering({ name: "EnterWorktree" } as never))],
+      ["ExitWorktree", wrapForSelfShell(withRoutineToolRendering({ name: "ExitWorktree" } as never))],
+    ]);
+    const renderer = htmlModule.createToolHtmlRenderer({
+      getToolDefinition: (name: string) => tools.get(name),
+      theme: themeModule.theme,
+      cwd: process.cwd(),
+      width: 100,
+    });
+    const enterId = "html-enter-worktree";
+    expect(renderer.renderCall(enterId, "EnterWorktree", { name: "html" })).toBe("");
+    const ordinary = renderer.renderResult(
+      enterId,
+      "EnterWorktree",
+      [{ type: "text", text: "HIDDEN ENTER CANONICAL" }],
+      {
+        worktreePath: "/repo/wt", branch: "worktree-html", created: true,
+        seeded: [], previousUnlockAttempted: false,
+      },
+      false,
+    );
+    expect(ordinary?.expanded).toContain("EnterWorktree(/repo/wt) on branch worktree-html");
+    expect(ordinary?.expanded).not.toContain("HIDDEN ENTER CANONICAL");
+
+    const exitId = "html-exit-worktree";
+    renderer.renderCall(exitId, "ExitWorktree", { action: "remove" });
+    const exceptional = renderer.renderResult(
+      exitId,
+      "ExitWorktree",
+      [{ type: "text", text: "VISIBLE MALFORMED EXIT" }],
+      { outcome: "removed", restorePath: "/repo" },
+      false,
+    );
+    expect(exceptional?.expanded).toContain("VISIBLE MALFORMED EXIT");
   });
 
   it("renders MultiEdit HTML with its path and one delegated diff while malformed/errors stay visible", async () => {
