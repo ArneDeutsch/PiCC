@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import picc from "../src/index.js";
+import picc, { writeFdFully } from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { deferred, waitUntil } from "./helpers/async.js";
 import {
@@ -14,6 +14,43 @@ import {
   type CompactionAttemptResult,
   type MidRunCompactionOptions,
 } from "../src/runtime/mid-run-compaction.js";
+
+describe("public async fd writer", () => {
+  it("loops partial writes, retries bounded transient pressure, and propagates permanent failure", async () => {
+    const source = Buffer.from("partial-transient-complete", "utf8");
+    const output: Buffer[] = [];
+    const delays: number[] = [];
+    const actions: Array<number | NodeJS.ErrnoException> = [4, Object.assign(new Error("busy"), { code: "EAGAIN" }), 3, Object.assign(new Error("buffered"), { code: "ENOBUFS" }), 99];
+    const writer = ((_fd: number, buffer: Buffer, offset: number, length: number, _position: null,
+      callback: (error: NodeJS.ErrnoException | null, bytesWritten: number) => void) => {
+      const action = actions.shift()!;
+      queueMicrotask(() => {
+        if (action instanceof Error) callback(action, 0);
+        else {
+          const written = Math.min(action, length);
+          output.push(Buffer.from(buffer.subarray(offset, offset + written)));
+          callback(null, written);
+        }
+      });
+    });
+    await writeFdFully(1, source, writer, async (delay) => { delays.push(delay); });
+    expect(Buffer.concat(output).toString("utf8")).toBe(source.toString("utf8"));
+    expect(delays).toEqual([1, 1]);
+
+    const permanent = Object.assign(new Error("closed"), { code: "EPIPE" });
+    await expect(writeFdFully(1, Buffer.from("secret-sentinel"),
+      ((_fd, _buffer, _offset, _length, _position, callback) => callback(permanent, 0))))
+      .rejects.toBe(permanent);
+
+    let attempts = 0;
+    await expect(writeFdFully(1, Buffer.from("bounded"),
+      ((_fd, _buffer, _offset, _length, _position, callback) => {
+        attempts += 1;
+        callback(Object.assign(new Error("again"), { code: "EWOULDBLOCK" }), 0);
+      }), async () => undefined)).rejects.toMatchObject({ code: "EWOULDBLOCK" });
+    expect(attempts).toBe(6);
+  });
+});
 
 describe("MidRunCompactionController", () => {
   const usage = (percent: number | null) => ({ tokens: 900, contextWindow: 1000, percent });
@@ -1025,7 +1062,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
           ],
           Stop: [
             {
-              hooks: [{ type: "command", command: 'if [ -f "$CLAUDE_PROJECT_DIR/.claude/block-stop" ]; then echo "continue test work" >&2; exit 2; fi' }],
+              hooks: [{ type: "command", command: 'if [ -f "$CLAUDE_PROJECT_DIR/.claude/gate-stop" ]; then echo entered > "$CLAUDE_PROJECT_DIR/.claude/stop-entered"; while [ ! -f "$CLAUDE_PROJECT_DIR/.claude/release-stop" ]; do sleep 0.02; done; fi; if [ -f "$CLAUDE_PROJECT_DIR/.claude/block-stop" ]; then echo "continue test work" >&2; exit 2; fi' }],
             },
           ],
           PreCompact: [
@@ -1196,17 +1233,41 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
   it("awaits callback compaction, hidden resume, replay, and nested settlement", async () => {
     await mainCheckpointGate.startSession("main-resume");
     const order: string[] = [];
+    const stopAdmissionResults: Array<Promise<unknown>> = [];
+    const staleStopInput = deferred<void>();
+    let capturedStaleStopInput = false;
     const originalSendMessage = pi.api.sendMessage as (...args: any[]) => void;
     const originalSendUserMessage = pi.api.sendUserMessage as (...args: any[]) => void;
     pi.api.sendMessage = (message: any, options: any) => {
       order.push(message.customType);
       originalSendMessage(message, options);
     };
+    let high: any;
     pi.api.sendUserMessage = (content: any, options: any) => {
       order.push("user-replay");
       originalSendUserMessage(content, options);
+      if (typeof content !== "string" || !content.startsWith("[Stop hook]")) return;
+      if (!capturedStaleStopInput) {
+        capturedStaleStopInput = true;
+        stopAdmissionResults.push(pi.fire("input", {
+          text: content, source: "extension", images: [{ type: "image", data: "mismatch" }],
+          streamingBehavior: undefined,
+        }, high));
+        stopAdmissionResults.push(pi.fire("input", {
+          text: content, source: "extension", images: undefined, streamingBehavior: "followUp",
+        }, high));
+        stopAdmissionResults.push(staleStopInput.promise.then(() => pi.fire("input", {
+          text: content, source: "extension", images: undefined, streamingBehavior: undefined,
+        }, high)));
+      }
+      stopAdmissionResults.push(pi.fire("input", {
+        text: content, source: "extension", images: undefined, streamingBehavior: undefined,
+      }, high));
+      stopAdmissionResults.push(pi.fire("input", {
+        text: content, source: "extension", images: undefined, streamingBehavior: undefined,
+      }, high));
     };
-    const high = pi.printCtx({
+    high = pi.printCtx({
       model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       compact: (options: any) => {
@@ -1265,6 +1326,10 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
 
     const stopMarker = path.join(dir, ".claude", "block-stop");
     fs.writeFileSync(stopMarker, "block");
+    const predictableContinuation = "[Stop hook] Continue working: continue test work";
+    await expect(pi.fire("input", {
+      text: predictableContinuation, source: "extension", images: undefined, streamingBehavior: undefined,
+    }, high)).resolves.toEqual({ action: "handled" });
     for (let iteration = 1; iteration <= 8; iteration += 1) {
       await pi.fire("agent_settled", {}, high);
       expect(outerDone).toBe(false);
@@ -1274,12 +1339,288 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await pi.fire("agent_settled", {}, high);
     fs.rmSync(stopMarker, { force: true });
     await outer;
+    await mainCheckpointGate.startSession("stop-admission-stale-epoch");
+    staleStopInput.resolve();
+    const admission = await Promise.all(stopAdmissionResults);
+    expect(admission.filter((result) => (result as any)?.action === "continue")).toHaveLength(8);
+    expect(admission.filter((result) => (result as any)?.action === "handled")).toHaveLength(11);
     expect(outerDone).toBe(true);
     expect(fs.existsSync(inputHookCount)).toBe(false);
     expect(controller.snapshot().phase).toBe("idle");
     expect(fs.readFileSync(trace, "utf8").trim().split(/\r?\n/)).toEqual(["pre", "start", "post"]);
     pi.api.sendMessage = originalSendMessage;
     pi.api.sendUserMessage = originalSendUserMessage;
+  });
+
+  it("bridges a successful resumed print result exactly once and hides every unsafe settlement", async () => {
+    const runResume = async (
+      sessionId: string,
+      mode: "print" | "json" | "rpc",
+      message: Record<string, unknown>,
+    ) => {
+      await mainCheckpointGate.startSession(sessionId);
+      const ctx = pi.ctx({
+        mode,
+        hasUI: mode === "rpc",
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [{ type: "message", message }] },
+        compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+      });
+      mainCheckpointGate.assistantMessageEnded({
+        role: "assistant",
+        content: [{ type: "toolCall", id: sessionId, name: "probe", arguments: {} }],
+      });
+      const wrapped: any = mainCheckpointGate.wrapTool({
+        name: "probe",
+        execute: async () => ({ content: [{ type: "text", text: "tool complete" }] }),
+      });
+      const result = await wrapped.execute(sessionId, {}, undefined, undefined, ctx);
+      mainCheckpointGate.toolExecutionEnded({ toolCallId: sessionId, result, isError: false });
+      mainCheckpointGate.turnEnded(ctx);
+      const outer = pi.fire("agent_settled", {}, ctx);
+      await waitUntil({
+        description: `${sessionId} resumed settlement`,
+        predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming",
+      });
+      await Promise.all([
+        pi.fire("agent_settled", {}, { ...ctx }),
+        pi.fire("agent_settled", {}, { ...ctx }),
+      ]);
+      await outer;
+      await pi.fire("agent_settled", {}, { ...ctx });
+    };
+
+    const writes: string[] = [];
+    const originalWrite = fs.write.bind(fs);
+    const writeSpy = vi.spyOn(fs, "write").mockImplementation(((fd: any, data: any, offset: any, length: any, position: any, callback: any) => {
+      if (fd === process.stdout.fd && Buffer.isBuffer(data)) {
+        writes.push(data.subarray(offset, offset + length).toString("utf8"));
+        queueMicrotask(() => callback(null, length, data));
+        return;
+      }
+      return originalWrite(fd, data, offset, length, position, callback);
+    }) as typeof fs.write);
+    pi.messages.length = 0;
+    try {
+      await runResume("print-safe", "print", {
+        role: "assistant",
+        content: [
+          { type: "text", text: "resumed one" },
+          { type: "image", data: "not printable" },
+          { type: "text", text: "resumed two" },
+        ],
+        stopReason: "stop",
+      });
+      await runResume("print-error", "print", {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "thinking-secret-sentinel C:/private/transcript.jsonl" },
+          { type: "text", text: "unsafe error secret-sentinel C:/private/transcript.jsonl" },
+        ],
+        stopReason: "error",
+      });
+      await runResume("print-aborted", "print", {
+        role: "assistant", content: [{ type: "text", text: "unsafe aborted" }], stopReason: "aborted",
+      });
+      await runResume("json-safe", "json", {
+        role: "assistant", content: [{ type: "text", text: "machine result" }], stopReason: "stop",
+      });
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    expect(writes).toEqual(["resumed one\nresumed two\n"]);
+    expect(writes.join("\n")).not.toMatch(/thinking|secret-sentinel|private|transcript/);
+    expect(pi.messages.filter((entry) => entry.message.customType === "picc-checkpoint-print-result"))
+      .toHaveLength(1);
+  });
+
+  it("re-authenticates after a gated Stop hook and suppresses a cancelled stale print result", async () => {
+    await mainCheckpointGate.startSession("cancel-during-stop");
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "STALE_THINKING_SECRET" },
+        { type: "text", text: "STALE_RESULT_SECRET C:/private/session.jsonl" },
+      ],
+      stopReason: "stop",
+    };
+    const ctx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      hasPendingMessages: () => false,
+      sessionManager: { getBranch: () => [{ type: "message", message }] },
+      compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+    });
+    mainCheckpointGate.assistantMessageEnded({
+      role: "assistant", content: [{ type: "toolCall", id: "cancel-tool", name: "probe", arguments: {} }],
+    });
+    const wrapped: any = mainCheckpointGate.wrapTool({
+      name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+    });
+    const toolResult = await wrapped.execute("cancel-tool", {}, undefined, undefined, ctx);
+    mainCheckpointGate.toolExecutionEnded({ toolCallId: "cancel-tool", result: toolResult, isError: false });
+    mainCheckpointGate.turnEnded(ctx);
+    const markerCountBefore = pi.messages.filter((entry) => entry.message.customType === "picc-checkpoint-print-result").length;
+    const outer = pi.fire("agent_settled", {}, ctx);
+    await waitUntil({ description: "cancel test resume", predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming" });
+    const staleWrites: string[] = [];
+    const originalWrite = fs.write.bind(fs);
+    const writeSpy = vi.spyOn(fs, "write").mockImplementation(((fd: any, data: any, offset: any, length: any, position: any, callback: any) => {
+      if (fd === process.stdout.fd && Buffer.isBuffer(data)) {
+        staleWrites.push(data.subarray(offset, offset + length).toString("utf8"));
+        queueMicrotask(() => callback(null, length, data));
+        return;
+      }
+      return originalWrite(fd, data, offset, length, position, callback);
+    }) as typeof fs.write);
+
+    const gate = path.join(dir, ".claude", "gate-stop");
+    const entered = path.join(dir, ".claude", "stop-entered");
+    const release = path.join(dir, ".claude", "release-stop");
+    fs.writeFileSync(gate, "gate");
+    const nested = pi.fire("agent_settled", {}, { ...ctx });
+    await waitUntil({ description: "Stop hook gate entry", predicate: () => fs.existsSync(entered) });
+    const replacement = mainCheckpointGate.startSession("replacement-during-stop");
+    fs.writeFileSync(release, "release");
+    await nested;
+    await replacement;
+    await outer;
+    writeSpy.mockRestore();
+    fs.rmSync(gate, { force: true });
+    fs.rmSync(entered, { force: true });
+    fs.rmSync(release, { force: true });
+
+    expect(staleWrites).toEqual([]);
+    expect(pi.messages.filter((entry) => entry.message.customType === "picc-checkpoint-print-result")).toHaveLength(markerCountBefore);
+    expect(mainCheckpointGate.currentController().snapshot().phase).toBe("idle");
+  });
+
+  it("drops queued resumed print output when session replacement revokes its serialized-write authority", async () => {
+    await mainCheckpointGate.startSession("queued-print-authority");
+    const ctx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      hasPendingMessages: () => false,
+      sessionManager: { getBranch: () => [] },
+      compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+    });
+    mainCheckpointGate.assistantMessageEnded({
+      role: "assistant",
+      content: [{ type: "toolCall", id: "queued-print", name: "probe", arguments: {} }],
+    });
+    const wrapped: any = mainCheckpointGate.wrapTool({
+      name: "probe",
+      execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+    });
+    const toolResult = await wrapped.execute("queued-print", {}, undefined, undefined, ctx);
+    mainCheckpointGate.toolExecutionEnded({ toolCallId: "queued-print", result: toolResult, isError: false });
+    mainCheckpointGate.turnEnded(ctx);
+    const outer = pi.fire("agent_settled", {}, ctx);
+    await waitUntil({
+      description: "queued print resume",
+      predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming",
+    });
+
+    const attemptedWrites: string[] = [];
+    let releaseWrite!: () => void;
+    const writeEntered = deferred<void>();
+    const markerCount = () => pi.messages.filter(
+      (entry) => entry.message.customType === "picc-checkpoint-print-result",
+    ).length;
+    const markersBefore = markerCount();
+    const writeSpy = vi.spyOn(fs, "write").mockImplementation(((_fd: any, data: any, offset: any,
+      length: any, _position: any, callback: any) => {
+      attemptedWrites.push(data.subarray(offset, offset + length).toString("utf8"));
+      writeEntered.resolve();
+      releaseWrite = () => callback(Object.assign(new Error("revoked write"), { code: "EPIPE" }), 0);
+    }) as typeof fs.write);
+    const resultContext = (text: string, onRead?: () => void) => ({
+      ...ctx,
+      sessionManager: {
+        getBranch: () => {
+          onRead?.();
+          return [{
+            type: "message",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text }],
+              stopReason: "stop",
+            },
+          }];
+        },
+      },
+    });
+    try {
+      const firstSettlement = pi.fire("agent_settled", {}, resultContext("tail blocker"));
+      await writeEntered.promise;
+      let queuedBranchRead = false;
+      const queuedSettlement = pi.fire("agent_settled", {}, resultContext(
+        "stale queued result",
+        () => { queuedBranchRead = true; },
+      ));
+      await waitUntil({
+        description: "second resumed print result queued behind the write tail",
+        predicate: () => queuedBranchRead,
+      });
+
+      const replacement = mainCheckpointGate.startSession("replacement-before-queued-print-write");
+      await waitUntil({
+        description: "queued print authority cancellation",
+        predicate: () => mainCheckpointGate.currentController().snapshot().phase === "cancelled",
+      });
+      releaseWrite();
+      await Promise.all([firstSettlement, queuedSettlement, outer, replacement]);
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    expect(attemptedWrites).toEqual(["tail blocker\n"]);
+    expect(attemptedWrites.join("")).not.toContain("stale queued result");
+    expect(markerCount()).toBe(markersBefore);
+    expect(mainCheckpointGate.currentController().snapshot().phase).toBe("idle");
+    expect(mainCheckpointGate.currentController().snapshot().admission).toBe("open");
+  });
+
+  it("settles a permanent print-write failure without a marker so Pi's native last-assistant printer can run", async () => {
+    await mainCheckpointGate.startSession("print-permanent-failure");
+    const assistantEntry = {
+      type: "message",
+      message: { role: "assistant", content: [{ type: "text", text: "retry-safe-result" }], stopReason: "stop" },
+    };
+    const branch = [assistantEntry];
+    const ctx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      hasPendingMessages: () => false,
+      sessionManager: { getBranch: () => branch },
+      compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+    });
+    mainCheckpointGate.assistantMessageEnded({
+      role: "assistant", content: [{ type: "toolCall", id: "permanent", name: "probe", arguments: {} }],
+    });
+    const wrapped: any = mainCheckpointGate.wrapTool({ name: "probe", execute: async () => ({ content: [] }) });
+    const result = await wrapped.execute("permanent", {}, undefined, undefined, ctx);
+    mainCheckpointGate.toolExecutionEnded({ toolCallId: "permanent", result, isError: false });
+    mainCheckpointGate.turnEnded(ctx);
+    const outer = pi.fire("agent_settled", {}, ctx);
+    await waitUntil({ description: "permanent writer resume", predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming" });
+
+    const markerCount = () => pi.messages.filter((entry) => entry.message.customType === "picc-checkpoint-print-result").length;
+    const before = markerCount();
+    const permanent = Object.assign(new Error("stdout closed"), { code: "EPIPE" });
+    const failedWrite = vi.spyOn(fs, "write").mockImplementation(((_fd: any, _data: any, _offset: any, _length: any, _position: any, callback: any) => {
+      queueMicrotask(() => callback(permanent, 0));
+    }) as typeof fs.write);
+    await expect(pi.fire("agent_settled", {}, { ...ctx })).resolves.toBeUndefined();
+    failedWrite.mockRestore();
+    await outer;
+    expect(markerCount()).toBe(before);
+    expect((ctx.sessionManager as any).getBranch().at(-1)).toBe(assistantEntry);
+    expect(mainCheckpointGate.currentController().snapshot().phase).toBe("idle");
+    expect(mainCheckpointGate.currentController().snapshot().admission).toBe("open");
   });
 
   it("pauses without resummarizing when synchronous active-skill restoration delivery fails", async () => {

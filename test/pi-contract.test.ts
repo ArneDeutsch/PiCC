@@ -2,16 +2,67 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { createRequire } from "node:module";
 import { fakePi } from "./helpers/fake-pi.js";
 import { withCompactSearchRendering } from "../src/runtime/search-tool-render.js";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 import { codexAbortGuardStreamSimple } from "../src/runtime/codex-abort-guard.js";
 import picc from "../src/index.js";
+import { classifyRequest, createResponseGate, startMockModel, type CapturedRequest } from "./helpers/mock-openai.js";
 
 /**
  * Pi upstream contract smoke test: asserts every Pi API PiCC
  * builds on exists in the pinned version. If Pi churns, this fails first and loudly.
  */
+describe("mock wire request classification", () => {
+  const mainSystem = "PiCC instructions\nAvailable subagents (dispatch with the Agent tool, subagent_type = name):\n- general-purpose";
+  const summarySystem = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant.";
+  const ordinary = (system: string, user: string, sessionKind: "main" | "child"): CapturedRequest => ({
+    path: "/chat/completions", messages: [{ role: "system", content: system }, { role: "user", content: user }],
+    body: {}, requestKind: "ordinary", sessionKind,
+  });
+
+  it.each([
+    ["main", mainSystem, "ordinary main request", undefined, "main"],
+    ["child", "You are a general-purpose agent.", "exact child task", ["exact child task"], "child"],
+    ["nested child", mainSystem, "exact nested task", ["exact nested task"], "child"],
+    ["adversarial child-like user prose", mainSystem, "I am a child subagent and this is my final report", ["different exact task"], "main"],
+    ["adversarial summary-like user prose", mainSystem, "You are a context summarization assistant. Your task is to read a conversation", undefined, "main"],
+  ] as const)("classifies real-shaped %s from exact configured child markers", (_name, system, user, markers, expected) => {
+    expect(classifyRequest({ messages: [{ role: "system", content: system }, { role: "user", content: user }] }, [],
+      { childUserMessages: markers })).toEqual({ requestKind: "ordinary", sessionKind: expected });
+  });
+
+  it("uses an exact configured persona marker for a resumed child whose original user turn was compacted away", () => {
+    const request = ordinary("You are a read-only exploration agent.\nPiCC suffix", "[checkpoint continuation]", "child");
+    expect(classifyRequest(request, [], { childSystemMarkers: ["You are a read-only exploration agent."] }))
+      .toEqual({ requestKind: "ordinary", sessionKind: "child" });
+    expect(classifyRequest(request, [], { childSystemMarkers: ["You are a general-purpose agent."] }))
+      .toEqual({ requestKind: "ordinary", sessionKind: "main" });
+  });
+
+  it("close rejects pending request waiters and unreached response gates without timer leaks", async () => {
+    const gate = createResponseGate();
+    const server = await startMockModel([{ gate, text: "never entered" }]);
+    const waiting = server.waitForRequest(() => false, 1, 60_000);
+    await server.close();
+    await expect(waiting).rejects.toThrow(/closed during pending operation/);
+    await expect(gate.entered).rejects.toThrow(/closed during pending operation/);
+    await expect(server.waitForRequest()).rejects.toThrow(/is closed/);
+    await server.close();
+  });
+
+  it("correlates main and child compaction summaries to the exact originating request", () => {
+    const prior = [ordinary(mainSystem, "same-prefix main", "main"), ordinary("child system", "same-prefix", "child")];
+    const summary = (user: string) => ({ messages: [
+      { role: "system", content: summarySystem },
+      { role: "user", content: `<conversation>\n[User]: ${user}\n[Assistant]: work\n</conversation>` },
+    ] });
+    expect(classifyRequest(summary("same-prefix"), prior)).toEqual({ requestKind: "compaction", sessionKind: "child" });
+    expect(classifyRequest(summary("same-prefix main"), prior)).toEqual({ requestKind: "compaction", sessionKind: "main" });
+  });
+});
+
 describe("pi 0.80.x API contract", () => {
   it("exports the SDK surface PiCC uses", async () => {
     const sdk: Record<string, unknown> = await import("@earendil-works/pi-coding-agent");
@@ -38,6 +89,59 @@ describe("pi 0.80.x API contract", () => {
     }
   });
 
+  it("keeps interleaved main and child provider registrations stateless through independent shutdown", async () => {
+    const main = fakePi();
+    const childA = fakePi();
+    const childB = fakePi();
+    picc(main.api as never);
+    picc(childA.api as never);
+    picc(main.api as never);
+    picc(childB.api as never);
+    picc(childA.api as never);
+    for (const registry of [main, childA, childB]) {
+      const registrations = registry.providerRegistrations.filter((entry) => entry.name === "picc-codex-abort-guard");
+      expect(registrations).toHaveLength(1);
+      expect(Object.keys(registrations[0]!.config).sort()).toEqual(["api", "streamSimple"]);
+    }
+    await Promise.all([
+      ...(main.handlers.get("session_shutdown") ?? []).map((handler) => handler({ reason: "test" }, main.printCtx())),
+      ...(childA.handlers.get("session_shutdown") ?? []).map((handler) => handler({ reason: "test" }, childA.printCtx())),
+    ]);
+
+    const originalFetch = globalThis.fetch;
+    const originalWebSocket = globalThis.WebSocket;
+    let fetches = 0;
+    let sockets = 0;
+    globalThis.fetch = (async () => {
+      fetches += 1;
+      throw new Error("pre-aborted surviving guard must not fetch");
+    }) as typeof fetch;
+    globalThis.WebSocket = class {
+      constructor() {
+        sockets += 1;
+        throw new Error("pre-aborted surviving guard must not open a socket");
+      }
+    } as never;
+    try {
+      const surviving = childB.providerRegistrations[0]!.config.streamSimple as typeof codexAbortGuardStreamSimple;
+      const abort = new AbortController();
+      abort.abort();
+      const model: any = {
+        id: "gpt-test", name: "GPT Test", api: "openai-codex-responses", provider: "openai-codex",
+        baseUrl: "https://example.invalid", reasoning: false, input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1_000,
+      };
+      await surviving(model, { systemPrompt: "", messages: [] }, {
+        apiKey: "unused", signal: abort.signal, sessionId: "surviving-after-independent-shutdown",
+      }).result();
+      expect(fetches).toBe(0);
+      expect(sockets).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
   it("claims the Codex API handler only once for the same extension registry", () => {
     const isolated = fakePi();
     picc(isolated.api as never);
@@ -50,6 +154,7 @@ describe("pi 0.80.x API contract", () => {
     const originalWebSocket = globalThis.WebSocket;
     let fetches = 0;
     let sockets = 0;
+    const fetchCalls: Array<{ input: unknown; init?: RequestInit }> = [];
     class ThrowingWebSocket {
       constructor() {
         sockets += 1;
@@ -57,8 +162,9 @@ describe("pi 0.80.x API contract", () => {
       }
     }
     globalThis.WebSocket = ThrowingWebSocket as never;
-    globalThis.fetch = (async () => {
+    globalThis.fetch = (async (input, init) => {
       fetches += 1;
+      fetchCalls.push({ input, init });
       return new Response(
         'data: {"type":"response.completed","response":{"id":"r","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}\n\ndata: [DONE]\n\n',
         { status: 200, headers: { "content-type": "text/event-stream" } },
@@ -69,7 +175,7 @@ describe("pi 0.80.x API contract", () => {
     })).toString("base64url");
     const model: any = {
       id: "gpt-test", name: "GPT Test", api: "openai-codex-responses", provider: "openai-codex",
-      baseUrl: "https://example.invalid", reasoning: false, input: ["text"],
+      baseUrl: "https://example.invalid", headers: { "x-model-header": "model-value" }, reasoning: false, input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1_000,
     };
     const context: any = { systemPrompt: "", messages: [] };
@@ -80,18 +186,88 @@ describe("pi 0.80.x API contract", () => {
         apiKey: `x.${tokenPayload}.x`, signal: abort.signal, sessionId: "pre-aborted",
       });
       await blocked.result();
+      const codexApi: any = await import("@earendil-works/pi-ai/api/openai-codex-responses");
+      const blockedSse = codexApi.streamSimple(model, context, {
+        apiKey: `x.${tokenPayload}.x`, signal: abort.signal, sessionId: "pre-aborted-sse", transport: "sse",
+      });
+      await blockedSse.result();
       expect(fetches).toBe(0);
       expect(sockets).toBe(0);
 
       const normal = codexAbortGuardStreamSimple(model, context, {
         apiKey: `x.${tokenPayload}.x`, sessionId: "normal-auto", maxRetries: 0,
+        headers: { "x-request-header": "request-value" },
       });
       await normal.result();
       expect(sockets).toBe(1);
       expect(fetches).toBe(1);
+      const sent = fetchCalls[0]!;
+      expect(String(sent.input)).toContain("example.invalid");
+      const headers = new Headers(sent.init?.headers);
+      expect(headers.get("authorization")).toBe(`Bearer x.${tokenPayload}.x`);
+      expect(headers.get("x-model-header")).toBe("model-value");
+      expect(headers.get("x-request-header")).toBe("request-value");
+      expect(sent.init?.method).toBe("POST");
+      expect(sent.init?.body).toBeDefined();
     } finally {
       globalThis.fetch = originalFetch;
       globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it("registered Codex override bypasses an already-open cached WebSocket and fetch when pre-aborted", async () => {
+    const { WebSocketServer } = createRequire(import.meta.url)("ws") as { WebSocketServer: new(options: Record<string, unknown>) => any };
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    const address = server.address();
+    if (typeof address === "string") throw new Error("expected TCP WebSocket address");
+    let frames = 0;
+    server.on("connection", (socket: any) => {
+      socket.on("message", () => {
+        frames += 1;
+        socket.send(JSON.stringify({ type: "response.created", response: { id: "cached-response", status: "in_progress", output: [] } }));
+        socket.send(JSON.stringify({
+          type: "response.completed",
+          response: { id: "cached-response", status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 1 } },
+        }));
+      });
+    });
+    const originalFetch = globalThis.fetch;
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches += 1;
+      throw new Error("fetch must not run");
+    }) as typeof fetch;
+    const isolated = fakePi();
+    picc(isolated.api as never);
+    const override = isolated.providerRegistrations.find((entry) => entry.name === "picc-codex-abort-guard")!
+      .config.streamSimple as typeof codexAbortGuardStreamSimple;
+    const payload = Buffer.from(JSON.stringify({
+      "https://api.openai.com/auth": { chatgpt_account_id: "acct-test" },
+    })).toString("base64url");
+    const model: any = {
+      id: "gpt-test", name: "GPT Test", api: "openai-codex-responses", provider: "openai-codex",
+      baseUrl: `http://127.0.0.1:${address.port}`, reasoning: false, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1_000,
+    };
+    const options = { apiKey: `x.${payload}.x`, sessionId: "cached-guard-t05", transport: "websocket-cached" as const, maxRetries: 0 };
+    try {
+      const warm = override(model, { systemPrompt: "", messages: [] }, options);
+      await warm.result();
+      expect(frames).toBe(1);
+      expect(fetches).toBe(0);
+
+      const abort = new AbortController();
+      abort.abort();
+      const blocked = override(model, { systemPrompt: "", messages: [] }, { ...options, signal: abort.signal });
+      await blocked.result();
+      expect(frames).toBe(1);
+      expect(fetches).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+      const codexApi: any = await import("@earendil-works/pi-ai/api/openai-codex-responses");
+      codexApi.closeOpenAICodexWebSocketSessions("cached-guard-t05");
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 
@@ -161,6 +337,54 @@ describe("pi 0.80.x API contract", () => {
     const sdk: any = await import("@earendil-works/pi-coding-agent");
     expect(typeof sdk.AgentSession?.prototype?.steer).toBe("function");
     expect(typeof sdk.AgentSession?.prototype?.followUp).toBe("function");
+  });
+
+  it("real Agent preserves duplicate-image steering identity and steer-before-followUp order", async () => {
+    const { Agent }: any = await import("@earendil-works/pi-agent-core");
+    const { createAssistantMessageEventStream }: any = await import("@earendil-works/pi-ai");
+    const calls: any[] = [];
+    let releaseFirst!: () => void;
+    const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const model = {
+      id: "queue-model", name: "Queue Model", api: "openai-completions", provider: "mock",
+      baseUrl: "http://127.0.0.1", reasoning: false, input: ["text", "image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1_000,
+    };
+    const agent = new Agent({
+      initialState: { systemPrompt: "queue contract", model, thinkingLevel: "off", tools: [], messages: [] },
+      streamFn: (_model: any, context: any) => {
+        const stream = createAssistantMessageEventStream();
+        const index = calls.push(structuredClone(context)) - 1;
+        void (async () => {
+          if (index === 0) await firstRelease;
+          const message = {
+            role: "assistant", content: [{ type: "text", text: `answer-${index}` }],
+            api: "openai-completions", provider: "mock", model: "queue-model",
+            usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+            stopReason: "stop", timestamp: Date.now(),
+          };
+          stream.push({ type: "start", partial: message });
+          stream.push({ type: "done", reason: "stop", message });
+        })();
+        return stream;
+      },
+    });
+    const running = agent.prompt("start");
+    while (calls.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+    const imageA = { type: "image", mimeType: "image/png", data: "a" };
+    const imageB = { type: "image", mimeType: "image/png", data: "b" };
+    agent.steer({ role: "user", content: [{ type: "text", text: "duplicate" }, imageA], timestamp: 1 });
+    agent.steer({ role: "user", content: [{ type: "text", text: "duplicate" }, imageB], timestamp: 2 });
+    agent.followUp({ role: "user", content: [{ type: "text", text: "after steering" }], timestamp: 3 });
+    releaseFirst();
+    await running;
+
+    expect(calls).toHaveLength(4);
+    const users = (call: any) => call.messages.filter((message: any) => message.role === "user").map((message: any) => message.content);
+    expect(users(calls[1]).at(-1)).toEqual([{ type: "text", text: "duplicate" }, imageA]);
+    expect(users(calls[2]).at(-1)).toEqual([{ type: "text", text: "duplicate" }, imageB]);
+    expect(users(calls[3]).at(-1)).toEqual([{ type: "text", text: "after steering" }]);
   });
 
   it("AgentSession exposes getSessionStats() for usage accounting", async () => {

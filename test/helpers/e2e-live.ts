@@ -1,10 +1,10 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { cleanupFixture, materializeFixture } from "./fixture.js";
-import { startMockModel, type CapturedRequest, type Turn } from "./mock-openai.js";
+import { startMockModel, type CapturedRequest, type RequestClassifierOptions, type Turn } from "./mock-openai.js";
 import { resolveShellBinary } from "../../src/engine/shell-inject.js";
 
 /**
@@ -52,16 +52,42 @@ export type FixtureName = "hello-claude" | "full-surface";
 export interface RunPiOptions {
   script: Turn[];
   prompt: string;
+  classifier?: RequestClassifierOptions;
   fixture?: FixtureName;
   extraEnv?: Record<string, string>;
   setup?: (fixtureDir: string) => void;
   /** Keep session persistence ON (drops --no-session) — transcript scenarios. */
   persistSession?: boolean;
+  /** Override model capacity for deterministic usage-threshold scenarios. */
+  contextWindow?: number;
+  /** Merge into the real Pi settings file. */
+  piSettings?: Record<string, unknown>;
+  /** CLI mode arguments replacing print `-p <prompt>` (RPC/JSON contract tests). */
+  modeArgs?: string[];
+}
+
+export interface StartedPi {
+  requests: CapturedRequest[];
+  waitForRequest(
+    predicate?: (request: CapturedRequest) => boolean,
+    count?: number,
+    timeoutMs?: number,
+  ): Promise<CapturedRequest>;
+  waitForOutput(
+    predicate: (record: Record<string, unknown>) => boolean,
+    timeoutMs?: number,
+    count?: number,
+  ): Promise<Record<string, unknown>>;
+  sendInput(line: string): void;
+  closeInput(): void;
+  completion: Promise<RunResult>;
+  stop(): Promise<void>;
 }
 
 export interface E2ELive {
+  startPi: (opts: RunPiOptions) => Promise<StartedPi>;
   runPi: (opts: RunPiOptions) => Promise<RunResult>;
-  cleanup: () => void;
+  cleanup: () => Promise<void>;
 }
 
 /**
@@ -72,8 +98,13 @@ export interface E2ELive {
 export function createE2ELive(): E2ELive {
   const tempDirs: string[] = [];
   const fixtures: string[] = [];
+  const active = new Set<StartedPi>();
 
-  function makeAgentDir(mockUrl: string): string {
+  function makeAgentDir(
+    mockUrl: string,
+    contextWindow = 128000,
+    extraSettings: Record<string, unknown> = {},
+  ): string {
     const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-piagent-"));
     tempDirs.push(agentDir);
     // Shape verified against pi docs/models.md ("Full Example") and docs/settings.md.
@@ -93,7 +124,7 @@ export function createE2ELive(): E2ELive {
                   reasoning: false,
                   input: ["text"],
                   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                  contextWindow: 128000,
+                  contextWindow,
                   maxTokens: 8192,
                 },
               ],
@@ -112,6 +143,7 @@ export function createE2ELive(): E2ELive {
           defaultModel: "mock-1",
           defaultProjectTrust: "always",
           compaction: { enabled: false },
+          ...extraSettings,
         },
         null,
         2,
@@ -120,59 +152,140 @@ export function createE2ELive(): E2ELive {
     return agentDir;
   }
 
-  async function runPi(opts: RunPiOptions): Promise<RunResult> {
+  async function startPi(opts: RunPiOptions): Promise<StartedPi> {
     const fixture = materializeFixture(opts.fixture ?? "hello-claude");
     fixtures.push(fixture);
     opts.setup?.(fixture);
-
-    const mock = await startMockModel(opts.script);
+    const mock = await startMockModel(opts.script, opts.classifier);
+    const agentDir = makeAgentDir(mock.url, opts.contextWindow, opts.piSettings);
+    const emptyUserDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-claude-user-"));
+    tempDirs.push(emptyUserDir);
+    let child: ChildProcess | undefined;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let stdout = "";
+    let stderr = "";
+    let closed: Promise<number | null> | undefined;
+    const stop = async (): Promise<void> => {
+      if (!child || child.exitCode !== null || child.signalCode !== null) return;
+      child.kill();
+      await closed;
+    };
     try {
-      const agentDir = makeAgentDir(mock.url);
-      const emptyUserDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-claude-user-"));
-      tempDirs.push(emptyUserDir);
-
-      const child = spawn(
+      child = spawn(
         process.execPath,
         [
           CLI_PATH,
           "-e",
           EXTENSION_PATH,
           ...(opts.persistSession ? [] : ["--no-session"]),
-          "-p",
-          opts.prompt,
+          ...(opts.modeArgs ?? ["-p", opts.prompt]),
         ],
         {
           cwd: fixture,
           env: {
             ...process.env,
             PI_CODING_AGENT_DIR: agentDir,
-            // Disables Pi's startup network operations (update check, install
-            // telemetry) only — provider requests to the local mock still flow.
             PI_OFFLINE: "1",
             PI_SKIP_VERSION_CHECK: "1",
             PICC_CLAUDE_USER_DIR: emptyUserDir,
             NO_COLOR: "1",
             ...opts.extraEnv,
           },
-          // stdin must be closed: Pi's print mode waits on piped stdin otherwise.
-          stdio: ["ignore", "pipe", "pipe"],
+          stdio: [opts.modeArgs?.includes("rpc") ? "pipe" : "ignore", "pipe", "pipe"],
           windowsHide: true,
         },
       );
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-      child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-      const killTimer = setTimeout(() => child.kill(), RUN_TIMEOUT_MS);
-      const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
-      clearTimeout(killTimer);
-      return { code, stdout, stderr, requests: mock.requests, fixture, agentDir };
-    } finally {
+      const outputRecords: Record<string, unknown>[] = [];
+      const outputWaiters = new Set<{
+        predicate: (record: Record<string, unknown>) => boolean;
+        count: number;
+        resolve: (record: Record<string, unknown>) => void;
+        reject: (error: Error) => void;
+        timer: ReturnType<typeof setTimeout>;
+      }>();
+      let outputRemainder = "";
+      child.stdout!.on("data", (d: Buffer) => {
+        const text = d.toString();
+        stdout += text;
+        outputRemainder += text;
+        const lines = outputRemainder.split(/\r?\n/u);
+        outputRemainder = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let record: Record<string, unknown>;
+          try { record = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+          outputRecords.push(record);
+          for (const waiter of [...outputWaiters]) {
+            if (!waiter.predicate(record) || outputRecords.filter(waiter.predicate).length < waiter.count) continue;
+            outputWaiters.delete(waiter);
+            clearTimeout(waiter.timer);
+            waiter.resolve(record);
+          }
+        }
+      });
+      child.stderr!.on("data", (d: Buffer) => (stderr += d.toString()));
+      closed = new Promise<number | null>((resolve, reject) => {
+        child!.once("error", reject);
+        child!.once("close", resolve);
+      });
+      killTimer = setTimeout(() => child?.kill(), RUN_TIMEOUT_MS);
+      let started!: StartedPi;
+      const completion = (async (): Promise<RunResult> => {
+        try {
+          const code = await closed;
+          return { code, stdout, stderr, requests: mock.requests, fixture, agentDir };
+        } finally {
+          if (killTimer) clearTimeout(killTimer);
+          await mock.close();
+          for (const waiter of outputWaiters) {
+            clearTimeout(waiter.timer);
+            waiter.reject(new Error("Pi process closed while waiting for output"));
+          }
+          outputWaiters.clear();
+          active.delete(started);
+        }
+      })();
+      started = {
+        requests: mock.requests,
+        waitForRequest: (predicate, count, timeoutMs) => mock.waitForRequest(predicate, count, timeoutMs),
+        waitForOutput: (predicate, timeoutMs = 10_000, count = 1) => {
+          const existing = outputRecords.filter(predicate);
+          if (existing.length >= count) return Promise.resolve(existing[count - 1]!);
+          return new Promise<Record<string, unknown>>((resolve, reject) => {
+            const waiter = {
+              predicate, count, resolve, reject,
+              timer: setTimeout(() => {
+                outputWaiters.delete(waiter);
+                reject(new Error(`Timed out waiting for Pi output; captured ${outputRecords.length} records`));
+              }, timeoutMs),
+            };
+            outputWaiters.add(waiter);
+          });
+        },
+        sendInput: (line) => child?.stdin?.write(`${line}\n`),
+        closeInput: () => child?.stdin?.end(),
+        completion,
+        stop,
+      };
+      active.add(started);
+      return started;
+    } catch (error) {
+      if (killTimer) clearTimeout(killTimer);
+      child?.kill();
       await mock.close();
+      throw error;
     }
   }
 
-  function cleanup(): void {
+  async function runPi(opts: RunPiOptions): Promise<RunResult> {
+    return (await startPi(opts)).completion;
+  }
+
+  async function cleanup(): Promise<void> {
+    await Promise.all([...active].map(async (run) => {
+      try { await run.stop(); } catch { /* continue unconditional cleanup */ }
+      try { await run.completion; } catch { /* failed process is already closed */ }
+    }));
     for (const dir of fixtures.splice(0)) cleanupFixture(dir);
     for (const dir of tempDirs.splice(0)) {
       try {
@@ -183,7 +296,7 @@ export function createE2ELive(): E2ELive {
     }
   }
 
-  return { runPi, cleanup };
+  return { startPi, runPi, cleanup };
 }
 
 /** All message content of a request as one searchable string. */

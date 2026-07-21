@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -275,6 +276,43 @@ export interface PiccTestSeam {
 
 const codexProviderRegistries = new WeakSet<object>();
 
+type FdWriter = (
+  fd: number,
+  buffer: Buffer,
+  offset: number,
+  length: number,
+  position: null,
+  callback: (error: NodeJS.ErrnoException | null, bytesWritten: number) => void,
+) => void;
+
+export async function writeFdFully(
+  fd: number,
+  data: Buffer,
+  write: FdWriter = fs.write.bind(fs),
+  wait: (delayMs: number) => Promise<void> = (delayMs) =>
+    new Promise<void>((resolve) => setTimeout(resolve, delayMs)),
+): Promise<void> {
+  let offset = 0;
+  let transientAttempts = 0;
+  while (offset < data.length) {
+    try {
+      const bytesWritten = await new Promise<number>((resolve, reject) => {
+        write(fd, data, offset, data.length - offset, null, (error, written) => {
+          if (error) reject(error);
+          else resolve(written);
+        });
+      });
+      if (bytesWritten <= 0) throw Object.assign(new Error("fd write made no progress"), { code: "EIO" });
+      offset += bytesWritten;
+      transientAttempts = 0;
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+      if (!["EAGAIN", "EWOULDBLOCK", "ENOBUFS"].includes(code) || transientAttempts >= 5) throw error;
+      await wait(2 ** transientAttempts++);
+    }
+  }
+}
+
 export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // UTF-8 stdio for any child process (fixes Windows cp1252 UnicodeEncodeError,
   // e.g. Python printing `→`). Set before any subprocess can be spawned.
@@ -379,6 +417,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   let stopHookIterations = 0;
   let checkpointContext: any;
   let checkpointSessionEpoch: object = {};
+  let printedResumeToken: ResumeToken | undefined;
+  let printWriteTail: Promise<void> = Promise.resolve();
+  interface StopContinuationCapability {
+    readonly epoch: object;
+    readonly controller: MidRunCompactionController;
+    readonly generation: number;
+    readonly resumeToken: ResumeToken;
+    readonly text: string;
+    consumed: boolean;
+  }
+  const stopContinuationAdmission = new AsyncLocalStorage<StopContinuationCapability>();
   interface CompactionLifecycleOperation {
     identity: object;
     epoch: object;
@@ -1594,6 +1643,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     checkpointContext = ctx;
     checkpointSessionEpoch = {};
     activeCompactionOperation = undefined;
+    printedResumeToken = undefined;
     stopHookIterations = 0;
     try {
       modelRegistryRef = ctx.modelRegistry;
@@ -1708,6 +1758,28 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   pi.on("input", async (event: any, ctx: any) => {
     try {
       if (mainCheckpointGate.authorizeReplay(event)) return { action: "continue" };
+      const stopCapability = stopContinuationAdmission.getStore();
+      if (stopCapability) {
+        if (!stopCapability.consumed && event.source === "extension" &&
+            event.text === stopCapability.text && event.images === undefined &&
+            event.streamingBehavior === undefined) {
+          const controller = mainCheckpointGate.currentController();
+          const snapshot = controller.snapshot();
+          const resume = activeMainResume;
+          if (stopCapability.epoch === checkpointSessionEpoch &&
+              stopCapability.controller === controller &&
+              stopCapability.generation === snapshot.generation &&
+              stopCapability.resumeToken === resume?.token &&
+              resume.epoch === stopCapability.epoch &&
+              resume.generation === stopCapability.generation &&
+              resume.token.generation === stopCapability.generation &&
+              snapshot.phase === "resuming") {
+            stopCapability.consumed = true;
+            return { action: "continue" };
+          }
+        }
+        return { action: "handled" };
+      }
       const inputDisposition = mainCheckpointGate.ordinaryInputDisposition();
       if (inputDisposition === "reject-recoverable" || inputDisposition === "reject-restoration" ||
           inputDisposition === "reject-closed") {
@@ -1988,9 +2060,25 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // across checkpoint resume so the internal physical turn cannot reset it.
       if (outcome.block && stopHookIterations < 8) {
         stopHookIterations += 1;
-        pi.sendUserMessage(
-          `[Stop hook] Continue working: ${outcome.blockReason ?? "the stop condition is not met yet"}`,
-        );
+        const continuation = `[Stop hook] Continue working: ${outcome.blockReason ?? "the stop condition is not met yet"}`;
+        const controller = mainCheckpointGate.currentController();
+        const snapshot = controller.snapshot();
+        const resume = activeMainResume;
+        if (resume && resume.epoch === checkpointSessionEpoch &&
+            resume.generation === snapshot.generation &&
+            resume.token.generation === snapshot.generation && snapshot.phase === "resuming") {
+          const capability: StopContinuationCapability = {
+            epoch: checkpointSessionEpoch,
+            controller,
+            generation: snapshot.generation,
+            resumeToken: resume.token,
+            text: continuation,
+            consumed: false,
+          };
+          stopContinuationAdmission.run(capability, () => pi.sendUserMessage(continuation));
+        } else {
+          pi.sendUserMessage(continuation);
+        }
         return false;
       }
       stopHookIterations = 0;
@@ -2000,12 +2088,42 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   };
 
+  const emitResumedPrintResult = async (
+    ctx: any,
+    token: ResumeToken,
+    hasAuthority: () => boolean,
+  ): Promise<void> => {
+    if (ctx?.mode !== "print" || printedResumeToken === token) return;
+    const entries: any[] = ctx.sessionManager?.getBranch?.() ?? ctx.sessionManager?.getEntries?.() ?? [];
+    const entry = [...entries].reverse().find((candidate) =>
+      candidate?.type === "message" && candidate.message?.role === "assistant");
+    const message = entry?.message;
+    if (!message || message.stopReason === "error" || message.stopReason === "aborted") return;
+    const blocks = Array.isArray(message.content)
+      ? message.content.filter((part: any) => part?.type === "text" && typeof part.text === "string")
+      : [];
+    if (blocks.length === 0) return;
+    const data = Buffer.from(blocks.map((part: any) => `${part.text}\n`).join(""), "utf8");
+    const writing = printWriteTail.then(async () => {
+      if (printedResumeToken === token || !hasAuthority()) return;
+      await writeFdFully(process.stdout.fd, data);
+      printedResumeToken = token;
+      pi.sendMessage({
+        customType: "picc-checkpoint-print-result",
+        content: "",
+        display: false,
+      });
+    });
+    printWriteTail = writing.catch(() => undefined);
+    await writing;
+  };
+
   pi.on("agent_settled", async (_event: any, ctx: any) => {
     checkpointContext = ctx;
     const controller = mainCheckpointGate.currentController();
     const resume = activeMainResume;
     if (resume?.generation === controller.snapshot().generation &&
-        resume.epoch === checkpointSessionEpoch && resume.context === ctx) {
+        resume.epoch === checkpointSessionEpoch) {
       if (controller.snapshot().phase === "cancelled") {
         resume.resolveSettled();
         activeMainResume = undefined;
@@ -2013,6 +2131,33 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       }
       if (controller.snapshot().phase === "resuming") {
         if (!await runStopHook(ctx)) return;
+        const current = mainCheckpointGate.currentController();
+        const snapshot = current.snapshot();
+        if (current === controller && activeMainResume === resume &&
+            resume.epoch === checkpointSessionEpoch && snapshot.phase === "cancelled") {
+          resume.resolveSettled();
+          activeMainResume = undefined;
+          return;
+        }
+        if (current !== controller || activeMainResume !== resume ||
+            resume.generation !== snapshot.generation || resume.epoch !== checkpointSessionEpoch ||
+            resume.token.generation !== snapshot.generation || snapshot.phase !== "resuming") return;
+        const hasPrintAuthority = () => {
+          const authorityController = mainCheckpointGate.currentController();
+          const authoritySnapshot = authorityController.snapshot();
+          const authorityResume = activeMainResume;
+          return authorityController === controller && authorityResume === resume &&
+            authorityResume.token === resume.token && resume.epoch === checkpointSessionEpoch &&
+            resume.generation === authoritySnapshot.generation &&
+            resume.token.generation === authoritySnapshot.generation &&
+            authoritySnapshot.phase === "resuming";
+        };
+        try {
+          await emitResumedPrintResult(ctx, resume.token, hasPrintAuthority);
+        } catch {
+          // Leave the assistant entry last: Pi's native print-mode selector can
+          // still emit it once this outer settlement barrier is released.
+        }
         controller.resumedSettled(resume.token);
         resume.resolveSettled();
         activeMainResume = undefined;
