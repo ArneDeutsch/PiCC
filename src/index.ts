@@ -69,6 +69,7 @@ import { loadAgentMemory } from "./claude/memory.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
 import { wrapForSelfShell } from "./runtime/tool-shell.js";
 import { withCompactSearchRendering } from "./runtime/search-tool-render.js";
+import { withRoutineToolRendering } from "./runtime/routine-tool-render.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
@@ -1077,7 +1078,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       const mainSessionTool: Record<string, unknown> = tool.name === "Grep" || tool.name === "Glob"
         ? withCompactSearchRendering(tool as unknown as ToolDefinition) as unknown as Record<string, unknown>
         : tool;
-      pi.registerTool(wrapForSelfShell(mainSessionTool));
+      const routineRendered = withRoutineToolRendering(
+        mainSessionTool as unknown as ToolDefinition,
+      ) as unknown as Record<string, unknown>;
+      pi.registerTool(wrapForSelfShell(routineRendered));
     } catch (err) {
       console.error(`PiCC: failed to register tool: ${(err as Error).message}`);
     }
@@ -1140,7 +1144,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         ...(shellPath ? { shellPath } : {}),
       });
       for (const { def } of builtins) {
-        pi.registerTool(wrapForSelfShell(def));
+        const routineRendered = withRoutineToolRendering(
+          def as unknown as ToolDefinition,
+        ) as unknown as Record<string, unknown>;
+        pi.registerTool(wrapForSelfShell(routineRendered));
       }
       // `!` user-bash commands also get the pinned Git Bash (and the effective cwd).
       if (shellPath && typeof sdk.createLocalBashOperations === "function") {

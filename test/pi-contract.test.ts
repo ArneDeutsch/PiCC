@@ -31,7 +31,6 @@ describe("pi 0.80.x API contract", () => {
       "DefaultResourceLoader",
       "SessionManager",
       "SettingsManager",
-      "AuthStorage",
       "ModelRegistry",
       "defineTool",
       "createBashTool",
