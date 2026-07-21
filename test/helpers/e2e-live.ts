@@ -13,8 +13,8 @@ import { resolveShellBinary } from "../../src/engine/shell-inject.js";
  * runs the assembled PiCC extension against a materialized fixture, driven by a
  * local mock OpenAI-compatible model server — no real network, no subscription.
  *
- * Each scenario scripts the model's turns, spawns Pi in the selected print/JSON/RPC mode, and
- * asserts on model requests, protocol output where applicable, and on-disk side effects.
+ * Each scenario scripts the model's turns, spawns `pi -p`, and asserts on the
+ * requests Pi actually sent to the "model" plus on-disk side effects.
  *
  * The stateful part (`runPi` + its per-run temp/fixture bookkeeping) is exposed
  * via the `createE2ELive()` factory so every split `test/e2e-*.test.ts` file gets
@@ -42,8 +42,6 @@ export interface RunResult {
   code: number | null;
   stdout: string;
   stderr: string;
-  /** Parsed stdout records for JSON and RPC modes; empty in print mode. */
-  jsonl: unknown[];
   requests: CapturedRequest[];
   fixture: string;
   /** The per-run PI_CODING_AGENT_DIR (sessions land under <agentDir>/sessions). */
@@ -55,7 +53,6 @@ export type FixtureName = "hello-claude" | "full-surface";
 export interface RunPiOptions {
   script: Turn[];
   prompt: string;
-  mode?: "print" | "json" | "rpc";
   fixture?: FixtureName;
   extraEnv?: Record<string, string>;
   setup?: (fixtureDir: string) => void;
@@ -70,146 +67,6 @@ export interface RunPiOptions {
 export interface E2ELive {
   runPi: (opts: RunPiOptions) => Promise<RunResult>;
   cleanup: () => void;
-}
-
-/** Incrementally decode strict UTF-8, LF-framed JSON records. */
-export class JsonlDecoder {
-  readonly records: unknown[] = [];
-  private readonly decoder = new TextDecoder("utf-8", { fatal: true });
-  private pending = "";
-  private failure: Error | undefined;
-
-  constructor(
-    private readonly onRecord?: (record: unknown) => void,
-    private readonly onFailure?: (error: Error) => void,
-  ) {}
-
-  push(chunk: Buffer): void {
-    if (this.failure) return;
-    try {
-      this.pending += this.decoder.decode(chunk, { stream: true });
-      this.drain();
-    } catch (error) {
-      this.fail(new Error("Invalid UTF-8 in JSONL stream", { cause: error }));
-    }
-  }
-
-  finish(): void {
-    if (!this.failure) {
-      try {
-        this.pending += this.decoder.decode();
-        this.drain();
-      } catch (error) {
-        this.fail(new Error("Invalid or truncated UTF-8 in JSONL stream", { cause: error }));
-      }
-    }
-    if (!this.failure && this.pending.length > 0) {
-      this.fail(new Error(`JSONL stream ended without LF framing: ${this.pending}`));
-    }
-    if (this.failure) throw this.failure;
-  }
-
-  private drain(): void {
-    for (;;) {
-      const lf = this.pending.indexOf("\n");
-      if (lf < 0) return;
-      const frame = this.pending.slice(0, lf);
-      this.pending = this.pending.slice(lf + 1);
-      if (frame.length === 0) {
-        this.fail(new Error("Invalid JSONL empty frame"));
-        return;
-      }
-      if (frame.endsWith("\r")) {
-        this.fail(new Error("Invalid JSONL CRLF frame"));
-        return;
-      }
-      try {
-        const record: unknown = JSON.parse(frame);
-        this.records.push(record);
-        this.onRecord?.(record);
-      } catch (error) {
-        this.fail(new Error(`Invalid JSONL frame: ${frame}`, { cause: error }));
-        return;
-      }
-    }
-  }
-
-  private fail(error: Error): void {
-    if (this.failure) return;
-    this.failure = error;
-    this.onFailure?.(error);
-  }
-}
-
-interface RpcRecord {
-  id?: unknown;
-  type?: unknown;
-  command?: unknown;
-  success?: unknown;
-  error?: unknown;
-  message?: unknown;
-}
-
-/** State machine for the one correlated prompt owned by an RPC e2e run. */
-export class RpcPromptLifecycle {
-  private responseSeen = false;
-  private settled = false;
-  private stopping = false;
-  private failure: Error | undefined;
-
-  observe(record: unknown): boolean {
-    const value = record as RpcRecord | null;
-    if (value?.type === "response" && value.id === "e2e-prompt" && value.command === "prompt") {
-      if (this.responseSeen) this.fail("RPC emitted duplicate correlated e2e-prompt responses");
-      this.responseSeen = true;
-      if (value.success !== true) {
-        const detail = value.error ?? value.message ?? "unspecified protocol error";
-        this.fail(`RPC e2e-prompt failed: ${String(detail)}`);
-      }
-    } else if (value?.type === "agent_settled") {
-      if (!this.responseSeen) this.fail("RPC agent settled before the correlated e2e-prompt response");
-      else this.settled = true;
-    }
-    if ((this.failure || (this.responseSeen && this.settled)) && !this.stopping) {
-      this.stopping = true;
-      return true;
-    }
-    return false;
-  }
-
-  stdinError(error: Error & { code?: string }): boolean {
-    if (error.code === "EPIPE" && this.stopping) return false;
-    this.failure ??= new Error("RPC stdin failed", { cause: error });
-    if (this.stopping) return false;
-    this.stopping = true;
-    return true;
-  }
-
-  timeout(): void {
-    this.failure ??= new Error("RPC process exceeded the global timeout");
-  }
-
-  getFailure(): Error | undefined {
-    return this.failure;
-  }
-
-  finish(code: number | null, signal: NodeJS.Signals | null, forcedFallback = false): void {
-    if (this.failure) throw this.failure;
-    if (!this.responseSeen) throw new Error("RPC process exited before the correlated e2e-prompt response");
-    if (!this.settled) throw new Error("RPC process exited before agent settlement");
-    if (!this.stopping) throw new Error("RPC process exited before intentional shutdown began");
-    if (forcedFallback || signal === "SIGKILL") {
-      throw new Error("RPC process required SIGKILL fallback after intentional shutdown");
-    }
-    if (code === 0 && signal === null) return;
-    if (code === null && signal === "SIGTERM") return;
-    if (code !== null) throw new Error(`RPC process exited with unexpected code ${code}`);
-    throw new Error(`RPC process exited with unexpected signal ${signal ?? "none"}`);
-  }
-
-  private fail(message: string): void {
-    this.failure ??= new Error(message);
-  }
 }
 
 /**
@@ -304,7 +161,6 @@ export function createE2ELive(): E2ELive {
       const emptyUserDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcd-claude-user-"));
       tempDirs.push(emptyUserDir);
 
-      const mode = opts.mode ?? "print";
       const child = spawn(
         process.execPath,
         [
@@ -312,9 +168,8 @@ export function createE2ELive(): E2ELive {
           "-e",
           EXTENSION_PATH,
           ...(opts.persistSession ? [] : ["--no-session"]),
-          ...(mode === "print" ? ["-p", opts.prompt]
-            : mode === "json" ? ["--mode", "json", opts.prompt]
-              : ["--mode", "rpc"]),
+          "-p",
+          opts.prompt,
         ],
         {
           cwd: fixture,
@@ -329,111 +184,19 @@ export function createE2ELive(): E2ELive {
             NO_COLOR: "1",
             ...opts.extraEnv,
           },
-          // Print/JSON stdin stays closed; RPC alone owns a strict LF-framed pipe.
-          stdio: [mode === "rpc" ? "pipe" : "ignore", "pipe", "pipe"],
+          // stdin must be closed: Pi's print mode waits on piped stdin otherwise.
+          stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
         },
       );
-      const stdoutChunks: Buffer[] = [];
+      let stdout = "";
       let stderr = "";
-      let protocolFailure: Error | undefined;
-      let timeoutFailure: Error | undefined;
-      let forceKillTimer: NodeJS.Timeout | undefined;
-      let cleanupWaitTimer: NodeJS.Timeout | undefined;
-      let killTimer: NodeJS.Timeout | undefined;
-      let shutdownStarted = false;
-      let forcedFallback = false;
-      const rpcLifecycle = mode === "rpc" ? new RpcPromptLifecycle() : undefined;
-      const beginChildShutdown = () => {
-        if (shutdownStarted) return;
-        shutdownStarted = true;
-        // Match Pi's own RpcClient: EOF races two shutdown paths on Windows,
-        // while SIGTERM is the supported deterministic stop operation.
-        child.kill("SIGTERM");
-        forceKillTimer = setTimeout(() => {
-          forcedFallback = true;
-          child.kill("SIGKILL");
-        }, 2_000);
-      };
-      const decoder = new JsonlDecoder(
-        (record) => {
-          if (!rpcLifecycle) return;
-          const shouldStop = rpcLifecycle.observe(record);
-          protocolFailure ??= rpcLifecycle.getFailure();
-          if (shouldStop) beginChildShutdown();
-        },
-        (error) => {
-          protocolFailure ??= error;
-          beginChildShutdown();
-        },
-      );
-      child.stdout!.on("data", (chunk: Buffer) => {
-        const captured = Buffer.from(chunk);
-        stdoutChunks.push(captured);
-        if (mode !== "print") decoder.push(captured);
-      });
-      child.stderr!.on("data", (d: Buffer) => (stderr += d.toString()));
-      if (mode === "rpc") {
-        const stdin = child.stdin!;
-        const captureInputError = (error: Error & { code?: string }) => {
-          const shouldStop = rpcLifecycle!.stdinError(error);
-          protocolFailure ??= rpcLifecycle!.getFailure();
-          if (shouldStop) beginChildShutdown();
-        };
-        stdin.on("error", captureInputError);
-        // Protocol framing is deliberately literal LF, never platform EOL.
-        stdin.write(
-          `${JSON.stringify({ id: "e2e-prompt", type: "prompt", message: opts.prompt })}\n`,
-          (error) => { if (error) captureInputError(error); },
-        );
-      }
-      killTimer = setTimeout(() => {
-        timeoutFailure = new Error(`${mode} process exceeded the global timeout`);
-        rpcLifecycle?.timeout();
-        beginChildShutdown();
-      }, RUN_TIMEOUT_MS);
-
-      let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
-      let waitFailure: unknown;
-      try {
-        exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
-          child.once("error", reject);
-          child.once("close", (code, signal) => resolve({ code, signal }));
-        });
-        if (mode !== "print") {
-          try {
-            decoder.finish();
-          } catch (error) {
-            protocolFailure ??= error instanceof Error ? error : new Error(String(error));
-          }
-        }
-      } catch (error) {
-        waitFailure = error;
-        beginChildShutdown();
-        await new Promise<void>((resolve) => {
-          if (child.exitCode !== null || child.signalCode !== null) {
-            resolve();
-            return;
-          }
-          child.once("close", () => resolve());
-          cleanupWaitTimer = setTimeout(resolve, 2_500);
-        });
-      } finally {
-        if (killTimer) clearTimeout(killTimer);
-        if (forceKillTimer) clearTimeout(forceKillTimer);
-        if (cleanupWaitTimer) clearTimeout(cleanupWaitTimer);
-      }
-
-      if (protocolFailure) throw protocolFailure;
-      if (waitFailure) throw waitFailure;
-      if (!exit) throw new Error(`${mode} process wait ended without an exit result`);
-      if (timeoutFailure) throw timeoutFailure;
-      const stdout = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(stdoutChunks));
-      if (rpcLifecycle) rpcLifecycle.finish(exit.code, exit.signal, forcedFallback);
-      else if (exit.code === null) {
-        throw new Error(`${mode} process exited without a code (signal: ${exit.signal ?? "none"})`);
-      }
-      return { code: exit.code, stdout, stderr, jsonl: decoder.records, requests: mock.requests, fixture, agentDir };
+      child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+      child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+      const killTimer = setTimeout(() => child.kill(), RUN_TIMEOUT_MS);
+      const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+      clearTimeout(killTimer);
+      return { code, stdout, stderr, requests: mock.requests, fixture, agentDir };
     } finally {
       await mock.close();
     }

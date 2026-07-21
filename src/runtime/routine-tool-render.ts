@@ -642,15 +642,8 @@ function routineToolName(tool: unknown): RoutineToolName | undefined {
   }
 }
 
-const EDIT_CALL_INNER = Symbol("picc.editCallInner");
-const EDIT_RESULT_INNER = Symbol("picc.editResultInner");
-const MULTI_EDIT_SNAPSHOT = Symbol("picc.multiEditSnapshot");
-
-type MarkedComponent = Component & {
-  [EDIT_CALL_INNER]?: Component;
-  [EDIT_RESULT_INNER]?: Component;
-  [MULTI_EDIT_SNAPSHOT]?: MultiEditSuccess;
-};
+const editCallInners = new WeakMap<Component, Component>();
+const editResultInners = new WeakMap<Component, Component>();
 type PublicEditDefinition = ReturnType<typeof createEditToolDefinition>;
 type PublicEditCallRenderer = NonNullable<PublicEditDefinition["renderCall"]>;
 type PublicEditResultRenderer = NonNullable<PublicEditDefinition["renderResult"]>;
@@ -665,30 +658,19 @@ export interface RoutineRenderingDependencies {
   createEditDefinition?: (cwd: string) => EditRendererDefinition;
 }
 
-function componentMarker(value: unknown, marker: symbol): Component | undefined {
-  const candidate = ownData(value, marker);
-  if (candidate === null || typeof candidate !== "object") return undefined;
-  try {
-    return typeof Reflect.get(candidate, "render") === "function" ? candidate as Component : undefined;
-  } catch {
-    return undefined;
-  }
+function componentFrom(value: unknown): Component | undefined {
+  return value !== null && typeof value === "object" && typeof (value as Component).render === "function"
+    ? value as Component
+    : undefined;
 }
 
-/** Read only the native preview-error evidence retained inside this module's Edit call adapter. */
+/** Read preview-failure evidence retained by this module's Edit call adapter. */
 export function adaptedEditPreviewError(value: unknown): string | undefined {
-  const inner = componentMarker(value, EDIT_CALL_INNER);
-  const preview = ownData(inner, "preview");
+  const component = componentFrom(value);
+  const inner = component && editCallInners.get(component);
+  const preview = inner && ownData(inner, "preview");
   const error = ownData(preview, "error");
   return typeof error === "string" ? error : undefined;
-}
-
-/** Read the authoritative snapshot attached by the bounded routine MultiEdit renderer. */
-export function adaptedMultiEditSnapshot(value: unknown): MultiEditSuccess | undefined {
-  const snapshot = ownData(value, MULTI_EDIT_SNAPSHOT);
-  if (snapshot === null || typeof snapshot !== "object") return undefined;
-  const kind = ownData(snapshot, "kind");
-  return kind === "displayable" || kind === "oversized" ? snapshot as MultiEditSuccess : undefined;
 }
 
 function editContext(context: unknown, lastComponent: Component | undefined): Record<string, unknown> {
@@ -712,10 +694,10 @@ function knownEditPadding(line: string, width: number): boolean {
 
 function adaptEditCallRenderer(renderer: EditCallRenderer): EditCallRenderer {
   return (args, theme, context): Component => {
-    const previous = componentMarker(ownData(context, "lastComponent"), EDIT_CALL_INNER);
+    const previousComponent = componentFrom(ownData(context, "lastComponent"));
+    const previous = previousComponent && editCallInners.get(previousComponent);
     const inner = renderer(args, theme, editContext(context, previous) as unknown as typeof context);
-    const adapted: MarkedComponent = {
-      [EDIT_CALL_INNER]: inner,
+    const adapted: Component = {
       render(width: number): string[] {
         const lines = inner.render(width);
         return lines.length >= 2 &&
@@ -725,6 +707,7 @@ function adaptEditCallRenderer(renderer: EditCallRenderer): EditCallRenderer {
           : lines;
       },
     };
+    editCallInners.set(adapted, inner);
     return adapted;
   };
 }
@@ -910,9 +893,8 @@ function multiEditCall(args: unknown, theme: unknown): Component {
   return commandComponent("MultiEdit", path, theme);
 }
 
-function textComponent(text: string, theme: unknown, snapshot?: MultiEditSuccess): Component {
+function textComponent(text: string, theme: unknown): Component {
   return {
-    ...(snapshot ? { [MULTI_EDIT_SNAPSHOT]: snapshot } : {}),
     render(width: number): string[] {
       return [clamp(safeThemeMethod(theme, "fg", ["toolOutput", text], text), width)];
     },
@@ -929,10 +911,10 @@ function multiEditResult(
   const snapshot = recognizeMultiEditSuccess(result, options, context);
   if (!snapshot) return failOpenComponent(result, "MultiEdit", theme);
   if (snapshot.kind === "oversized") {
-    return textComponent(`Edit details too large to display for ${snapshot.path}`, theme, snapshot);
+    return textComponent(`Edit details too large to display for ${snapshot.path}`, theme);
   }
   if (snapshot.diff.length === 0) {
-    return textComponent(`No net change (${snapshot.editCount} ${snapshot.editCount === 1 ? "edit" : "edits"} applied)`, theme, snapshot);
+    return textComponent(`No net change (${snapshot.editCount} ${snapshot.editCount === 1 ? "edit" : "edits"} applied)`, theme);
   }
   const fallback = failOpenComponent(result, "MultiEdit", theme);
   try {
@@ -942,7 +924,8 @@ function multiEditResult(
       ((definitionCwd) => createEditToolDefinition(definitionCwd) as unknown as EditRendererDefinition);
     const definition = createDefinition(cwd);
     if (typeof definition.renderResult !== "function") return fallback;
-    const previous = componentMarker(ownData(context, "lastComponent"), EDIT_RESULT_INNER);
+    const previousComponent = componentFrom(ownData(context, "lastComponent"));
+    const previous = previousComponent && editResultInners.get(previousComponent);
     const detachedResult: Parameters<EditResultRenderer>[0] = {
       content: [{ type: "text", text: snapshot.canonicalText }],
       details: { diff: snapshot.diff, patch: "", firstChangedLine: snapshot.firstChangedLine },
@@ -971,9 +954,7 @@ function multiEditResult(
       theme as Parameters<EditResultRenderer>[2],
       detachedContext,
     );
-    const adapted: MarkedComponent = {
-      [EDIT_RESULT_INNER]: delegated,
-      [MULTI_EDIT_SNAPSHOT]: snapshot,
+    const adapted: Component = {
       render(width: number): string[] {
         try {
           return delegated.render(width);
@@ -982,6 +963,7 @@ function multiEditResult(
         }
       },
     };
+    editResultInners.set(adapted, delegated);
     return adapted;
   } catch {
     return fallback;

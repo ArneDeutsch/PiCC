@@ -1,9 +1,9 @@
 # Testing
 
-PiCC is tested in layers from isolated units up to the **real Pi CLI driven by a mock model** — no
-live subscription or network is needed for the full suite. This doc tells you **which layer a new
-test belongs in and why**, how to run each lane, and the synchronization contracts that keep async
-tests deterministic.
+PiCC is tested in three layers, from isolated units up to the **real Pi CLI driven by a mock
+model** — no live subscription and no real network are needed for the full suite. This doc is a
+decision guide: it tells you **which layer a new test belongs in and why**, how to run each lane,
+and the synchronization contracts that keep async tests deterministic.
 
 ## Choosing a layer
 
@@ -24,9 +24,8 @@ The decision, in order:
 2. **Go to Layer 2 when the behavior *is* the wiring** — the thing under test only exists once the
    whole extension is loaded (registration, prompt assembly, cross-subsystem ordering).
 3. **Go to Layer 3 only for a genuine real-stack boundary** — something that is true only because
-   **Pi's own CLI, agent loop, or selected print/JSON/RPC mode** is involved — the sole
-   discriminator, since Layers 1–2 cannot instantiate a real Pi process (Layer 2 fakes
-   `ExtensionAPI`). A real process, shell,
+   **Pi's own CLI, agent loop, or print mode** is involved — the sole discriminator, since Layers
+   1–2 cannot instantiate a real Pi process (Layer 2 fakes `ExtensionAPI`). A real process, shell,
    or OS encoding **by itself stays at Layer 1**, where the hook, worktree, and subprocess tests
    already prove exactly those. If a scenario would merely re-prove PiCC's own logic through a more
    expensive path, it does not earn its place; scenarios like that have been deliberately removed.
@@ -108,19 +107,40 @@ degrade. It is the fastest way to test cross-subsystem wiring, and it runs in th
 
 ## Layer 3 — live e2e (real Pi CLI + mock OpenAI model)
 
-The `test/e2e-*.test.ts` files are the highest-fidelity layer. Each **spawns the real Pi CLI** with
-the print, JSON, or RPC mode selected for the boundary under test, in a materialized `examples/`
-fixture pointed at a local **mock OpenAI-compatible model server** (`test/helpers/mock-openai.ts`)
-via a throwaway Pi agent dir. No real model, subscription, or outbound network is involved.
+The `test/e2e-*.test.ts` files are the highest-fidelity layer. Each **spawns the real Pi CLI**
+(`node dist/cli.js -e src/index.ts -p "<prompt>"`) in a materialized `examples/` fixture, pointed at
+a local **mock OpenAI-compatible model server** (`test/helpers/mock-openai.ts`) via a throwaway Pi
+agent dir. No real model, no subscription, no outbound network.
 
-They share `test/helpers/e2e-live.ts`, which provides the process harness, request helpers, and
-runtime probes. `mock-openai.ts` scripts model turns and captures every request Pi sends, so tests
-can assert model/session boundaries, non-interactive protocol output, and real filesystem effects.
-Use this layer only to prove Pi CLI, agent-loop, mode, or session behavior that in-process tests
-cannot.
+They share one extracted harness in `test/helpers/e2e-live.ts`: the `createE2ELive()` factory
+returns `{ runPi, cleanup }` closing over that file's own per-run temp/fixture bookkeeping, plus the
+stateless request helpers (`allText` / `systemText` / `toolResultText` / `userText` / `toolNames`)
+and probes (`cliMissing`, `BASH_AVAILABLE`, `PYTHON_BIN`, and the timeouts). The scenarios are
+grouped by cost so the subagent-heavy tests aren't one long serial pole:
+
+| File | Scenarios |
+|---|---|
+| `test/e2e-core.test.ts` | context/prompt assembly smoke; `/deploy` slash-skill expansion |
+| `test/e2e-safety-tools.test.ts` | `Read(.env)` deny + secret non-leak; bash (Git Bash) + python encoding round-trip |
+| `test/e2e-subagents.test.ts` | background subagent + `TaskOutput`; worktree isolation; provider-error named failure; transcript persistence |
 
 Keeping the `e2e-` prefix on every file is a **contract**: `test:unit` excludes
-`**/e2e-*.test.ts`, so the prefix keeps real-Pi spawns out of the unit lane.
+`**/e2e-*.test.ts`, so the prefix is what keeps real-Pi spawns out of the unit lane.
+
+`mock-openai.ts` is a scriptable SSE server: each test hands it a list of `Turn`s (either scripted
+`tool_calls` or plain text, optionally pinned with a `when` predicate or a scripted `error`), and it
+streams back OpenAI-shaped chunks while **capturing every request Pi actually sent**. A test
+therefore asserts on both sides of the loop — the requests Pi sent to the "model" (system prompt,
+advertised tools, tool results, absence of leaked secrets) and the real on-disk side effects (files
+written, git worktrees created, transcripts persisted).
+
+**What this layer proves** is that PiCC works as a real Pi extension through Pi's genuine agent
+loop, tool dispatch, streaming, and print mode — not just against the fake API. The lane is curated
+to a small **real-stack security layer**: each surviving scenario proves a boundary a cheaper
+unit/integration test structurally cannot — secret non-leak across the real model-request boundary,
+real subprocess/shell dispatch and OS encoding, a real background-subagent session round-trip, real
+worktree isolation for a spawned subagent, a real provider error killing a real subagent, and real
+on-disk transcript persistence.
 
 ### Adding a new e2e scenario
 
@@ -132,13 +152,18 @@ Keeping the `e2e-` prefix on every file is a **contract**: `test:unit` excludes
    afterEach(cleanup);
    ```
 
-2. Add an `it(...)` inside that file's `describe.skipIf(cliMissing)` block and call `runPi(...)`.
-   Its options are declared by `RunPiOptions` in `test/helpers/e2e-live.ts`; keep that interface as
-   the source of truth rather than copying its inventory here.
+2. Add an `it(...)` inside that file's `describe.skipIf(cliMissing)` block and call
+   `runPi({ script, prompt, setup?, fixture?, persistSession? })`:
+   - `script: Turn[]` — the model's turns. Use `{ toolCalls: [{ name, args }] }` to drive a tool call
+     (tool `name` is the Pi/registered tool name, e.g. `write`, `bash`, `Agent`), or `{ text }` for a
+     plain reply. When the script is exhausted the mock replies `"done"`, so the loop always terminates.
+   - `prompt` — the user prompt Pi is launched with.
+   - `setup(fixtureDir)` — optional: write extra files into the fixture before the run.
+   - `fixture` — `"hello-claude"` (default) or `"full-surface"`.
+   - `persistSession` — keep session persistence on (drops `--no-session`) for transcript scenarios.
 3. Assert on `result.requests` (what Pi sent the model — use the `systemText` / `toolResultText` /
-   `allText` / `userText` helpers), selected-mode protocol records, and files under
-   `result.fixture` / `result.agentDir` (real side effects). Gate shell/python scenarios on
-   `BASH_AVAILABLE` / `PYTHON_BIN` as the existing ones do.
+   `allText` / `userText` helpers) and on files under `result.fixture` / `result.agentDir` (real side
+   effects). Gate shell/python scenarios on `BASH_AVAILABLE` / `PYTHON_BIN` as the existing ones do.
 4. If a scenario needs artifacts the `hello-claude` fixture lacks, prefer extending `full-surface`
    and its Layer-2 coverage; keep e2e scenarios focused on genuine real-stack boundaries.
 

@@ -22,11 +22,14 @@ import type { Diagnostic } from "../types.js";
 // the print-mode e2e negative assertion share the exact strings (print mode
 // never runs renderers, so these must never appear on stdout).
 /**
- * Binding-neutral on purpose: the configured expansion key is unavailable at
- * this pure renderer seam. Looking it up through Pi's module-global TUI state
- * would introduce a throw risk in direct and headless callers.
+ * The subtle expand affordance on the collapsed completion record, phrased
+ * like Pi's own hints (`<key> to <verb>`). A STATIC string on purpose: Pi's
+ * keybinding-aware `keyHint` helper reads Pi's module-global theme + keybinding
+ * singletons (initialized only inside the real TUI), so it is not reachable
+ * from this pure `(result, options, theme)` renderer seam without a throw risk —
+ * and the e2e print-mode negative assertion needs a stable literal to pin.
  */
-export const RECORD_EXPAND_HINT = "expand details";
+export const RECORD_EXPAND_HINT = "ctrl+o to expand";
 /** The condensed fork-degrade warning — NEVER expand-only on a degraded fork. */
 export const RECORD_FORK_MARKER = "⚠ fork degraded";
 /** Suffix of the minimal reference line for an already-reported settlement. */
@@ -519,7 +522,7 @@ function lifecycleLine(
  * agent, fate word, then (muted) the capped error summary for failures, the
  * condensed fork-degrade marker (never expand-only), duration, brief usage,
  * successful completion time, and the expand affordance. Transcript access and
- * complete metadata remain reachable through Pi's configured tool-expansion action.
+ * complete metadata remain reachable via the existing Ctrl+O expansion.
  */
 function collapsedRecordLines(
   theme: unknown,
@@ -741,8 +744,8 @@ export function renderAgentCall(
  *  - PARTIAL (streaming): ONE identity/state/metadata line; the status panel
  *    and its drill-down own live activity.
  *  - FINAL: the collapsed completion record by default (identity + duration +
- *    usage + local completion time + expand affordance), with Pi's configured
- *    tool-expansion action revealing the full body + metadata footer. Every field is optional and
+ *    usage + local completion time + expand affordance), expanding via Ctrl+O
+ *    mechanism to the full body + metadata footer. Every field is optional and
  *    rendered only when present.
  */
 export function renderAgentResult(
@@ -816,8 +819,8 @@ export function renderAgentResult(
         return referenceRecordLines(theme, details, outcome, chip, width);
       }
       // Collapsed by default in the interactive transcript: Pi always passes a
-      // BOOLEAN `expanded` (false until the configured expansion action toggles),
-      // so collapse keys on the EXPLICIT false. A structural caller that omits the
+      // BOOLEAN `expanded` (false until the global Ctrl+O toggle), so the
+      // collapse keys on the EXPLICIT false. A structural caller that omits the
       // option gets the full record — print/RPC never run renderers, so this
       // only widens compatibility for direct callers.
       if (outcome && expanded === false) {

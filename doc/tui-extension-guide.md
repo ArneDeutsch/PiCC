@@ -125,9 +125,9 @@ applied at both tool-registration seams. Lowercase Edit is the exception inside 
 Pi's call renderer returns its own padded `Box`, so `withRoutineToolRendering` first removes only
 that Box's verified outer padding pair while retaining its interior spacer and state. The
 `withDefaultCollapsedToolRendering` adapter compacts only recognized settled interactive
-successes. The configured `app.tools.expand` action restores native call/result detail. Safely
-recognized live, exceptional, and unbound-action rows delegate to native rendering where possible;
-unsafe, unfamiliar, or inspection-capped inputs show bounded diagnostics. For any tool
+successes. The configured `app.tools.expand` action restores native call/result detail. Live,
+exceptional, unfamiliar, and unbound-action rows remain elaborated; malformed display fields fall
+back to a concise warning. For any tool
 the generic wrapper sets `renderShell: "self"`, strips the leading/trailing blank lines, keeps the
 1-column gutter, and **re-applies `theme.bg` per line** — self-render drops the tint deliberately, so PiCC
 frames the row with a real pi-tui `Box(paddingY=0)` (content clamped to `width - 2*gutter`, then
@@ -368,9 +368,9 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
   `render-util.ts`) for a pure widget/component view.
 - Tool-row framing: specialized/routine adapters → `withDefaultCollapsedToolRendering` →
   `wrapForSelfShell` (`src/runtime/tool-shell.ts`). This de-pads every main-session row while compacting
-  only safely recognized settled successes; expansion restores native detail. Safely recognized
-  live, exceptional, and unbound rows delegate to native rendering where possible; unsafe,
-  unfamiliar, or capped inputs show bounded diagnostics (see "`renderShell` — this is how you control blank lines and framing").
+  only safely recognized settled successes; expansion restores native detail. Live, exceptional,
+  unfamiliar, and unbound rows remain elaborated; malformed display fields fall back to a concise
+  warning (see "`renderShell` — this is how you control blank lines and framing").
 
 **Untapped but available right now:** `ctx.ui.setFooter`/`setHeader`, `ctx.ui.setStatus`,
 `ctx.ui.setWorkingIndicator`/`setWorkingMessage`, full `ctx.ui.setTheme`,

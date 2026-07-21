@@ -3,8 +3,8 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import picc, { type PiccTestSeam } from "../src/index.js";
-import type { BackgroundResultLike } from "../src/runtime/background-tasks.js";
 import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
+import type { BackgroundResultLike } from "../src/runtime/background-tasks.js";
 import { resolveGitBashPath } from "../src/engine/shell-inject.js";
 import { RECORD_EXPAND_HINT } from "../src/runtime/subagent-render.js";
 import { formatElapsed } from "../src/runtime/subagent-panel-render.js";
@@ -12,7 +12,6 @@ import { createGlobTool, createGrepTool } from "../src/runtime/tools/search-tool
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/fake-sdk.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
-import { JsonlDecoder, RpcPromptLifecycle } from "./helpers/e2e-live.js";
 
 /**
  * Integration + NFR tests: the whole extension wired against
@@ -23,124 +22,6 @@ import { JsonlDecoder, RpcPromptLifecycle } from "./helpers/e2e-live.js";
 let dir: string;
 let pi: FakePi;
 const originalCwd = process.cwd();
-const producerBash = process.platform === "win32" ? resolveGitBashPath() : "bash";
-const producerBashAvailable = (() => {
-  if (!producerBash) return false;
-  try {
-    execFileSync(producerBash, ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-})();
-
-function visibleRenderedText(value: string): string {
-  return value
-    .replace(/\u001b\].*?(?:\u0007|\u001b\\)/gu, "")
-    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
-}
-
-interface RawRenderableTool {
-  name: string;
-  renderShell?: string;
-  renderCall?: (args: unknown, theme: unknown, context: unknown) => { render(width: number): string[] };
-  renderResult?: (
-    result: unknown,
-    options: { expanded: boolean; isPartial: boolean },
-    theme: unknown,
-    context: unknown,
-  ) => { render(width: number): string[] };
-}
-
-describe("live JSONL helper", () => {
-  it("decodes split UTF-8 and LF framing while preserving record callback order", () => {
-    const seen: unknown[] = [];
-    const wire = Buffer.from(`${JSON.stringify({ n: 1, text: "snowman ☃" })}\n${JSON.stringify({ n: 2 })}\n`, "utf8");
-    const snowmanSplit = wire.indexOf(Buffer.from("☃")) + 1;
-    const firstLf = wire.indexOf("\n");
-    const decoder = new JsonlDecoder((record) => seen.push(record));
-    decoder.push(wire.subarray(0, snowmanSplit));
-    decoder.push(wire.subarray(snowmanSplit, firstLf));
-    decoder.push(wire.subarray(firstLf, firstLf + 1));
-    decoder.push(wire.subarray(firstLf + 1));
-    decoder.finish();
-    expect(decoder.records).toEqual([{ n: 1, text: "snowman ☃" }, { n: 2 }]);
-    expect(seen).toEqual(decoder.records);
-  });
-
-  it.each([
-    ["empty frame", Buffer.from("{}\n\n"), /empty frame/],
-    ["CRLF", Buffer.from("{}\r\n"), /CRLF/],
-    ["multiple JSON values", Buffer.from("{} {}\n"), /Invalid JSONL frame/],
-    ["unterminated record", Buffer.from("{}"), /without LF framing/],
-    ["invalid UTF-8", Buffer.from([0x7b, 0x7d, 0xc0, 0xaf, 0x0a]), /Invalid UTF-8/],
-    ["truncated UTF-8", Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xe2, 0x82]), /truncated UTF-8/],
-  ])("rejects %s and reports the first failure as soon as it is knowable", (_name, wire, message) => {
-    const failures: Error[] = [];
-    const decoder = new JsonlDecoder(undefined, (error) => failures.push(error));
-    decoder.push(wire);
-    const knowableDuringPush = wire.includes(0x0a) || _name === "invalid UTF-8";
-    expect(failures, _name).toHaveLength(knowableDuringPush ? 1 : 0);
-    expect(() => decoder.finish()).toThrow(message);
-    expect(failures).toHaveLength(1);
-    expect(() => decoder.finish()).toThrow(failures[0]);
-  });
-});
-
-describe("RPC prompt lifecycle helper", () => {
-  const response = { id: "e2e-prompt", type: "response", command: "prompt", success: true };
-
-  it("stops only after the exact correlated success is followed by settlement", () => {
-    const lifecycle = new RpcPromptLifecycle();
-    expect(lifecycle.observe({ ...response, id: "other" })).toBe(false);
-    expect(lifecycle.observe(response)).toBe(false);
-    expect(lifecycle.observe({ type: "agent_settled" })).toBe(true);
-    expect(lifecycle.stdinError(Object.assign(new Error("shutdown pipe race"), { code: "EPIPE" }))).toBe(false);
-    expect(() => lifecycle.finish(null, "SIGTERM")).not.toThrow();
-  });
-
-  it("stops promptly and surfaces correlated protocol failure", () => {
-    const lifecycle = new RpcPromptLifecycle();
-    expect(lifecycle.observe({ ...response, success: false, error: "provider rejected prompt" })).toBe(true);
-    expect(() => lifecycle.finish(null, "SIGTERM")).toThrow(/provider rejected prompt/);
-  });
-
-  it("rejects premature settlement, early EPIPE, premature exit, and timeout explicitly", () => {
-    const settledEarly = new RpcPromptLifecycle();
-    expect(settledEarly.observe({ type: "agent_settled" })).toBe(true);
-    expect(() => settledEarly.finish(0, null)).toThrow(/settled before/);
-
-    const earlyPipe = new RpcPromptLifecycle();
-    expect(earlyPipe.stdinError(Object.assign(new Error("broken pipe"), { code: "EPIPE" }))).toBe(true);
-    expect(() => earlyPipe.finish(null, null)).toThrow(/stdin failed/);
-
-    const premature = new RpcPromptLifecycle();
-    expect(() => premature.finish(null, "SIGTERM")).toThrow(/before the correlated/);
-
-    const respondedButUnsettled = new RpcPromptLifecycle();
-    expect(respondedButUnsettled.observe(response)).toBe(false);
-    expect(() => respondedButUnsettled.finish(0, null)).toThrow(/before agent settlement/);
-
-    const timedOut = new RpcPromptLifecycle();
-    timedOut.timeout();
-    expect(() => timedOut.finish(null, "SIGKILL", true)).toThrow(/global timeout/);
-  });
-
-  it.each([
-    [0, null, false, undefined],
-    [null, "SIGTERM", false, undefined],
-    [2, null, false, /unexpected code 2/],
-    [null, "SIGINT", false, /unexpected signal SIGINT/],
-    [null, "SIGKILL", true, /SIGKILL fallback/],
-  ] as const)("validates intentional shutdown outcome %#", (code, signal, forced, failure) => {
-    const lifecycle = new RpcPromptLifecycle();
-    lifecycle.observe(response);
-    lifecycle.observe({ type: "agent_settled" });
-    const finish = () => lifecycle.finish(code, signal, forced);
-    if (failure) expect(finish).toThrow(failure);
-    else expect(finish).not.toThrow();
-  });
-});
 
 beforeAll(async () => {
   dir = materializeFixture("full-surface");
@@ -186,6 +67,78 @@ describe("tool surface registration", () => {
       "TodoWrite",
     ]) {
       expect(pi.tools.has(name), `missing tool ${name}`).toBe(true);
+    }
+  });
+
+  it("installs collapse only on main-session tool definitions", async () => {
+    for (const name of ["read", "write", "edit", "MultiEdit", "bash"]) {
+      expect(pi.tools.get(name).renderShell, name).toBe("self");
+    }
+    const previousBindings = getKeybindings();
+    setKeybindings(new KeybindingsManager({ ...TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } }));
+    try {
+      const read = pi.tools.get("read");
+      const args = { path: "registered.txt" };
+      const state = {};
+      const theme = { fg: (_slot: string, text: string) => text, bold: (text: string) => text,
+        bg: (_slot: string, text: string) => text };
+      const context = { args, state, isPartial: false, isError: false, expanded: false,
+        cwd: dir, showImages: false, invalidate() {} };
+      read.renderCall(args, theme, context);
+      const rendered = read.renderResult(
+        { content: [{ type: "text", text: "REGISTERED_DETAIL_ONE\nREGISTERED_DETAIL_TWO" }], details: undefined },
+        { expanded: false, isPartial: false }, theme, context,
+      ).render(160).join("\n");
+      expect(rendered).toContain("Read registered.txt · 2 lines hidden");
+      expect(rendered).not.toContain("REGISTERED_DETAIL");
+
+      const multiEdit = pi.tools.get("MultiEdit");
+      const multiEditArgs = {
+        file_path: "registered-multi.txt",
+        edits: [{ old_string: "REGISTERED_MULTIEDIT_DETAIL_OLD", new_string: "REGISTERED_MULTIEDIT_DETAIL_NEW" }],
+      };
+      const multiEditState = {};
+      const multiEditContext = { args: multiEditArgs, state: multiEditState, isPartial: false,
+        isError: false, expanded: false, cwd: dir, showImages: false, invalidate() {} };
+      multiEdit.renderCall(multiEditArgs, theme, multiEditContext);
+      const multiEditRendered = multiEdit.renderResult(
+        {
+          content: [{ type: "text", text: "Successfully applied 1 edit(s) to registered-multi.txt." }],
+          details: {
+            filePath: "registered-multi.txt",
+            edits: 1,
+            created: false,
+            diff: "-REGISTERED_MULTIEDIT_DETAIL_OLD\n+REGISTERED_MULTIEDIT_DETAIL_NEW",
+            firstChangedLine: 1,
+          },
+        },
+        { expanded: false, isPartial: false }, theme, multiEditContext,
+      ).render(160).join("\n");
+      expect(multiEditRendered).toContain("MultiEdit registered-multi.txt · 1 edit applied · 2 diff lines hidden");
+      expect(multiEditRendered).not.toContain("REGISTERED_MULTIEDIT_DETAIL");
+    } finally {
+      setKeybindings(previousBindings);
+    }
+
+    const created: Array<Record<string, unknown>> = [];
+    const handle = fakeSdk({ replies: ["done"], created });
+    const fresh = fakePi();
+    let internals!: Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
+    picc(fresh.api as never, {
+      onWired: (value) => { internals = value; },
+      onInitializationSettled: fresh.captureInitialization,
+    });
+    await fresh.waitForInitialization();
+    internals.subagentRuntime.setSdkForTest(handle.sdk);
+    await fresh.tools.get("Agent").execute("main-only", {
+      subagent_type: "general-purpose", prompt: "inspect", run_in_background: false,
+    });
+    const subagentTools = created[0]?.customTools as Array<{ name: string; renderShell?: string }>;
+    for (const name of ["read", "write", "edit", "MultiEdit", "bash"]) {
+      const subagentTool = subagentTools.find((tool) => tool.name === name);
+      expect(subagentTool, `missing subagent ${name}`).toBeDefined();
+      expect(subagentTool!.renderShell, name).not.toBe("self");
     }
   });
 
@@ -264,301 +217,6 @@ describe("tool surface registration", () => {
     expect(stripBg(out[0]!).trim().length).toBeGreaterThan(0);
     expect(stripBg(out[out.length - 1]!).trim().length).toBeGreaterThan(0);
   });
-
-  it("keeps the actual first-loop MultiEdit and second-loop stock definitions main-session-only", async () => {
-    expect(pi.tools.get("MultiEdit").renderShell).toBe("self");
-    expect(pi.tools.get("read").renderShell).toBe("self");
-
-    const created: Array<Record<string, unknown>> = [];
-    const handle = fakeSdk({ replies: ["done"], created });
-    const fresh = fakePi();
-    let internals!: Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
-    picc(fresh.api as never, {
-      onWired: (value) => { internals = value; },
-      onInitializationSettled: fresh.captureInitialization,
-    });
-    await fresh.waitForInitialization();
-    await fresh.waitForTools(["read"]);
-    const sdk = await import("@earendil-works/pi-coding-agent") as any;
-    internals.subagentRuntime.setSdkForTest({
-      ...handle.sdk,
-      createReadTool: sdk.createReadTool,
-      createWriteTool: sdk.createWriteTool,
-      createEditTool: sdk.createEditTool,
-      createBashTool: sdk.createBashTool,
-      createReadToolDefinition: sdk.createReadToolDefinition,
-      createWriteToolDefinition: sdk.createWriteToolDefinition,
-      createEditToolDefinition: sdk.createEditToolDefinition,
-      createBashToolDefinition: sdk.createBashToolDefinition,
-    });
-    await fresh.tools.get("Agent").execute("main-only", {
-      subagent_type: "general-purpose", prompt: "inspect registration", run_in_background: false,
-    });
-    const subTools = created[0]?.customTools as RawRenderableTool[];
-    for (const name of ["read", "write", "edit", "MultiEdit", "bash"]) {
-      const raw = subTools.find((tool) => tool.name === name);
-      expect(raw, `missing raw subagent ${name}`).toBeTruthy();
-      expect(raw!.renderShell, `${name} inherited parent self-shell`).not.toBe("self");
-    }
-    sdk.initTheme();
-    const nativeCases = [
-      {
-        name: "read", args: { path: "raw-read.txt" },
-        result: { content: [{ type: "text", text: "RAW_READ_FIRST\nRAW_READ_SECOND" }], details: undefined },
-        expected: "RAW_READ_SECOND",
-      },
-      {
-        name: "write", args: { path: "raw-write.txt", content: "RAW_WRITE_BODY" },
-        result: { content: [{ type: "text", text: "Successfully wrote 14 bytes to raw-write.txt" }], details: undefined },
-        expected: "RAW_WRITE_BODY",
-      },
-      {
-        name: "bash", args: { command: "printf RAW_BASH_COMMAND" },
-        result: { content: [{ type: "text", text: "RAW_BASH_OUTPUT" }], details: undefined },
-        expected: "RAW_BASH_OUTPUT",
-      },
-      {
-        name: "edit", args: { path: "raw-edit.txt", edits: [{ oldText: "RAW_EDIT_OLD", newText: "RAW_EDIT_NEW" }] },
-        result: {
-          content: [{ type: "text", text: "Successfully replaced 1 block(s) in raw-edit.txt." }],
-          details: { diff: "-RAW_EDIT_OLD\n+RAW_EDIT_NEW", patch: "", firstChangedLine: 1 },
-        },
-        expected: "raw-edit.txt",
-      },
-      {
-        name: "MultiEdit", args: { file_path: "raw-multi.txt", edits: [{ old_string: "RAW_MULTI_OLD", new_string: "RAW_MULTI_NEW" }] },
-        result: {
-          content: [{ type: "text", text: "Successfully applied 1 edit(s) to raw-multi.txt." }],
-          details: { filePath: "raw-multi.txt", edits: 1, created: false, diff: "-RAW_MULTI_OLD\n+RAW_MULTI_NEW", firstChangedLine: 1 },
-        },
-        expected: "Successfully applied 1 edit(s) to raw-multi.txt.",
-      },
-    ] as const;
-    const nativeTheme = {
-      fg: (_slot: string, text: string) => text,
-      bold: (text: string) => text,
-      bg: (_slot: string, text: string) => text,
-    };
-    for (const item of nativeCases) {
-      const raw = subTools.find((tool) => tool.name === item.name)!;
-      let collapsed: string;
-      let expanded: string;
-      if (typeof raw.renderCall === "function" && typeof raw.renderResult === "function") {
-        const renderCall = raw.renderCall;
-        const renderResult = raw.renderResult;
-        const paint = (isExpanded: boolean) => {
-          const state = {};
-          const context = {
-            args: item.args, state, isPartial: false, isError: false, expanded: isExpanded,
-            argsComplete: true, executionStarted: true, showImages: false, cwd: dir, invalidate() {},
-          };
-          const call = renderCall(item.args, nativeTheme, context).render(160).join("\n");
-          const result = renderResult(item.result, { expanded: isExpanded, isPartial: false }, nativeTheme, context)
-            .render(160).join("\n");
-          return `${call}\n${result}`.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-        };
-        collapsed = paint(false);
-        expanded = paint(true);
-      } else {
-        const component = new sdk.ToolExecutionComponent(
-          item.name, `raw-${item.name}`, item.args, {}, raw,
-          { requestRender() {} }, dir.replace(/\\/g, "/"),
-        );
-        component.setArgsComplete();
-        component.updateResult(item.result, false);
-        const paint = () => (component.render(160) as string[])
-          .join("\n")
-          .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-        collapsed = paint();
-        component.setExpanded(true);
-        expanded = paint();
-      }
-      expect(expanded, item.name).toContain(item.expected);
-      for (const rendered of [collapsed, expanded]) {
-        expect(rendered, item.name).not.toMatch(/(?:line|lines|output|diff|command line|command lines) hidden|no net change/i);
-        expect(rendered, item.name).not.toContain(RECORD_EXPAND_HINT);
-      }
-    }
-  });
-
-  it("ships the complete collapsed producer surface only through main-session composition", () => {
-    for (const name of ["read", "write", "edit", "MultiEdit", "bash"]) {
-      const tool = pi.tools.get(name);
-      expect(tool.renderShell, `${name} not self-shell`).toBe("self");
-      expect(typeof tool.renderCall, `${name} missing composed call renderer`).toBe("function");
-      expect(typeof tool.renderResult, `${name} missing composed result renderer`).toBe("function");
-      expect(typeof tool.execute, `${name} lost execute`).toBe("function");
-    }
-  });
-
-  it("executes and renders actual registered file producers with canonical one-shot effects", async () => {
-    const { initTheme } = await import("@earendil-works/pi-coding-agent");
-    initTheme();
-    const file = "t04-producer-file.txt";
-    const unrelatedFile = "t04-unrelated.txt";
-    const leakSentinel = "T04_UNRELATED_SENTINEL_MUST_NOT_LEAK";
-    fs.writeFileSync(path.join(dir, unrelatedFile), leakSentinel);
-    const writeArgs = { path: file, content: "WRITE_BODY_TOKEN\nEDIT_SOURCE_TOKEN\nMULTI_SOURCE_TOKEN\n" };
-    const readArgs = { path: file };
-    const editArgs = { path: file, edits: [{ oldText: "EDIT_SOURCE_TOKEN", newText: "EDIT_DETAIL_TOKEN" }] };
-    const multiArgs = { file_path: file, edits: [{ old_string: "MULTI_SOURCE_TOKEN", new_string: "MULTI_DETAIL_TOKEN" }] };
-    const theme = {
-      fg: (_slot: string, text: string) => text,
-      bold: (text: string) => text,
-      bg: (_slot: string, text: string) => text,
-    };
-    const previousBindings = getKeybindings();
-    setKeybindings(new KeybindingsManager({ ...TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } }));
-    const begin = (name: string, args: unknown) => {
-      const tool = pi.tools.get(name);
-      const state = {};
-      const context = {
-        args, state, isPartial: false, isError: false, expanded: false, cwd: dir,
-        argsComplete: false, executionStarted: true, showImages: false, invalidate: () => {},
-      };
-      expect(tool.renderShell).toBe("self");
-      expect(tool.renderCall(args, theme, context).render(180)).toEqual([]);
-      return { name, tool, args, state };
-    };
-    try {
-      const write = begin("write", writeArgs);
-      const writeResult = await write.tool.execute("t04-write", writeArgs);
-      expect(writeResult).toEqual({
-        content: [{ type: "text", text: `Successfully wrote ${writeArgs.content.length} bytes to ${file}` }],
-        details: undefined,
-      });
-      expect(fs.readFileSync(path.join(dir, file), "utf8")).toBe(writeArgs.content);
-
-      const read = begin("read", readArgs);
-      const readResult = await read.tool.execute("t04-read", readArgs);
-      expect(readResult).toEqual({ content: [{ type: "text", text: writeArgs.content }], details: undefined });
-
-      const edit = begin("edit", editArgs);
-      const editResult = await edit.tool.execute("t04-edit", editArgs);
-      expect(editResult).toEqual({
-        content: [{ type: "text", text: `Successfully replaced 1 block(s) in ${file}.` }],
-        details: {
-          diff: expect.stringContaining("EDIT_DETAIL_TOKEN"),
-          patch: expect.any(String),
-          firstChangedLine: 2,
-        },
-      });
-      expect(fs.readFileSync(path.join(dir, file), "utf8"))
-        .toBe("WRITE_BODY_TOKEN\nEDIT_DETAIL_TOKEN\nMULTI_SOURCE_TOKEN\n");
-      const editResultSnapshot = structuredClone(editResult);
-
-      const multi = begin("MultiEdit", multiArgs);
-      const multiResult = await multi.tool.execute("t04-multi", multiArgs);
-      expect(multiResult).toEqual({
-        content: [{ type: "text", text: `Successfully applied 1 edit(s) to ${file}.` }],
-        details: {
-          filePath: file,
-          edits: 1,
-          created: false,
-          diff: expect.stringContaining("MULTI_DETAIL_TOKEN"),
-          firstChangedLine: 3,
-        },
-      });
-      expect(fs.readFileSync(path.join(dir, file), "utf8"))
-        .toBe("WRITE_BODY_TOKEN\nEDIT_DETAIL_TOKEN\nMULTI_DETAIL_TOKEN\n");
-
-      const renderedRows: string[] = [];
-      const cases = [
-        { ...write, result: writeResult, summary: ["Write", "3 lines hidden"], hidden: "WRITE_BODY_TOKEN", detail: "WRITE_BODY_TOKEN" },
-        { ...read, result: readResult, summary: ["Read", "3 lines hidden"], hidden: "MULTI_SOURCE_TOKEN", detail: "MULTI_SOURCE_TOKEN" },
-        { ...edit, result: editResult, summary: ["Edit", "1 edit applied", "diff lines hidden"], hidden: "EDIT_DETAIL_TOKEN", detail: "EDIT_DETAIL_TOKEN" },
-        { ...multi, result: multiResult, summary: ["MultiEdit", "1 edit applied", "diff lines hidden"], hidden: "MULTI_DETAIL_TOKEN", detail: "MULTI_DETAIL_TOKEN" },
-      ];
-      for (const item of cases) {
-        const collapsed = visibleRenderedText(item.tool.renderResult(item.result, { expanded: false, isPartial: false }, theme,
-          { args: item.args, state: item.state, isPartial: false, isError: false, expanded: false, cwd: dir })
-          .render(180).join("\n"));
-        renderedRows.push(collapsed);
-        for (const summary of item.summary) expect(collapsed, item.name).toContain(summary);
-        expect(collapsed, item.name).not.toContain(item.hidden);
-        const expanded = visibleRenderedText(item.tool.renderResult(item.result, { expanded: true, isPartial: false }, theme,
-          { args: item.args, state: item.state, isPartial: false, isError: false, expanded: true, cwd: dir })
-          .render(180).join("\n"));
-        renderedRows.push(expanded);
-        expect(expanded, item.name).toContain(item.detail);
-        expect(expanded.split(item.detail)).toHaveLength(2);
-      }
-
-      for (const row of renderedRows) {
-        expect(row).not.toContain(leakSentinel);
-        expect(row).not.toContain(unrelatedFile);
-        expect(row).not.toContain(dir);
-        expect(row).not.toContain(dir.replace(/\\/g, "/"));
-      }
-      expect(editResult).toEqual(editResultSnapshot);
-      const serialized = JSON.stringify([writeResult, readResult, editResult, multiResult]);
-      expect(serialized).not.toContain(dir);
-      expect(serialized).not.toContain(dir.replace(/\\/g, "/"));
-      expect(serialized).not.toContain(unrelatedFile);
-      expect(serialized).not.toContain(leakSentinel);
-    } finally {
-      setKeybindings(previousBindings);
-    }
-  });
-
-  it.skipIf(!producerBashAvailable)(
-    "executes the registered Bash producer once with portable canonical output and filesystem effects",
-    async () => {
-      const { initTheme } = await import("@earendil-works/pi-coding-agent");
-      initTheme();
-      const effect = "t04-bash-effect.txt";
-      const unrelatedFile = "t04-bash-unrelated.txt";
-      const token = "T04_BASH_ONCE_TOKEN";
-      const leakSentinel = "T04_BASH_UNRELATED_SENTINEL_MUST_NOT_LEAK";
-      fs.writeFileSync(path.join(dir, unrelatedFile), leakSentinel);
-      const args = {
-        command: `printf '%s' '${token}' >> '${effect}'; printf '%s%s' 'T04_BASH_' 'STDOUT'`,
-      };
-      const tool = pi.tools.get("bash");
-      const theme = { fg: (_slot: string, text: string) => text, bold: (text: string) => text, bg: (_slot: string, text: string) => text };
-      const state = {};
-      const previousBindings = getKeybindings();
-      setKeybindings(new KeybindingsManager({ ...TUI_KEYBINDINGS,
-        "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } }));
-      try {
-        const context = {
-          args, state, isPartial: false, isError: false, expanded: false, cwd: dir,
-          argsComplete: false, executionStarted: true, showImages: false, invalidate: () => {},
-        };
-        expect(tool.renderCall(args, theme, context).render(160)).toEqual([]);
-        const result = await tool.execute("t04-bash", args);
-        expect(result).toEqual({ content: [{ type: "text", text: "T04_BASH_STDOUT" }], details: undefined });
-        const collapsed = visibleRenderedText(tool.renderResult(result, { expanded: false, isPartial: false }, theme,
-          { args, state, isPartial: false, isError: false, expanded: false, cwd: dir }).render(160).join("\n"));
-        expect(collapsed).toContain("Bash");
-        expect(collapsed).toContain("1 output line hidden");
-        expect(collapsed).toContain("1 command line hidden");
-        expect(collapsed).not.toContain("T04_BASH_STDOUT");
-        expect(collapsed).not.toContain(token);
-        const expanded = visibleRenderedText(tool.renderResult(result, { expanded: true, isPartial: false }, theme,
-          { args, state, isPartial: false, isError: false, expanded: true, cwd: dir }).render(160).join("\n"));
-        for (const row of [collapsed, expanded]) {
-          expect(row).not.toContain(dir);
-          expect(row).not.toContain(dir.replace(/\\/g, "/"));
-          expect(row).not.toContain(unrelatedFile);
-          expect(row).not.toContain(leakSentinel);
-        }
-        const serialized = JSON.stringify(result);
-        expect(serialized).not.toContain(dir);
-        expect(serialized).not.toContain(dir.replace(/\\/g, "/"));
-        expect(serialized).not.toContain(unrelatedFile);
-        expect(serialized).not.toContain(leakSentinel);
-        expect(expanded).toContain("T04_BASH_STDOUT");
-        expect(expanded).toContain(token);
-        expect(expanded.split("T04_BASH_STDOUT")).toHaveLength(2);
-        expect(expanded.split(token)).toHaveLength(2);
-        expect(fs.readFileSync(path.join(dir, effect), "utf8")).toBe(token);
-      } finally {
-        setKeybindings(previousBindings);
-      }
-    },
-  );
 
   it("de-pads every Claude-named tool row: renderShell:'self' across the registration loop", () => {
     // A representative set spanning both wrapper cases: own-renderer tools

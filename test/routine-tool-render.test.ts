@@ -834,24 +834,6 @@ describe("routine tool rendering decorator", () => {
     expect(accessorReads).toBe(0);
     expect(delegated).not.toHaveBeenCalled();
 
-    for (const [options, context] of [
-      [{ expanded: false }, { args, isPartial: false, isError: false }],
-      [{ expanded: false, isPartial: false }, { args, isError: false }],
-      [{ expanded: false, isPartial: true }, { args, isPartial: false, isError: false }],
-      [{ expanded: false, isPartial: false }, { args, isPartial: true, isError: false }],
-      [{ expanded: false, isPartial: false }, { args, isPartial: false, isError: true }],
-      [{ expanded: false, isPartial: false }, { args, isPartial: false }],
-    ] as const) {
-      const settlementDelegated = vi.fn(() => ({ render: () => ["UNEXPECTED DELEGATION"] }));
-      const settlementTool = withRoutineToolRendering(
-        { name: "MultiEdit" } as ToolDefinition,
-        { createEditDefinition: () => ({ renderResult: settlementDelegated }) },
-      ) as unknown as RenderTool;
-      const output = renderRaw(settlementTool, result, options, context).join("\n");
-      expect(output).toContain(result.content[0]!.text);
-      expect(settlementDelegated).not.toHaveBeenCalled();
-    }
-
     const throwing = withRoutineToolRendering(
       { name: "MultiEdit" } as ToolDefinition,
       { createEditDefinition: () => ({ renderResult: () => ({ render() { throw new Error("paint"); } }) }) },
