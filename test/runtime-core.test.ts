@@ -1600,6 +1600,34 @@ describe("Subagent live progress", () => {
     expect(snapshots.length).toBe(0);
   });
 
+  it("mirrors a detail-only event without emitting another model-facing progress snapshot", async () => {
+    const sub = new SubagentRegistry();
+    const { sdk } = fakeSdk({
+      replies: [
+        {
+          text: "done",
+          events: [
+            { type: "tool_execution_end", toolName: "Read", result: "", isError: false },
+            { type: "tool_execution_end", toolName: "Write", result: "", isError: false },
+          ],
+        },
+      ],
+    });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk, { subagentRegistry: sub });
+    const snapshots: ProgressSnapshot[] = [];
+    const result = await runtime.dispatch({
+      subagentType: "reviewer",
+      prompt: "p",
+      depth: 1,
+      onProgress: (snapshot) => snapshots.push(snapshot),
+    });
+    expect(snapshots).toHaveLength(1);
+    expect(sub.get(result.agentId)?.detailLog).toEqual([
+      { kind: "tool-outcome", tool: "Read", failed: false },
+      { kind: "tool-outcome", tool: "Write", failed: false },
+    ]);
+  });
+
   it("a foreground dispatch with NO onProgress sink still mirrors live progress onto the registry record", async () => {
     // The panel's single-live-data-source contract: the registry mirror rides
     // dispatch's own condenser subscription, not the tool's onUpdate wiring.

@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_MAX_LINE_LENGTH,
   DEFAULT_MAX_TAIL_LINES,
+  DETAIL_FIELD_MAX_LENGTH,
+  DETAIL_LOG_MAX_ENTRIES,
   formatUsageCompact,
   FULL_TAIL_MAX_LINE_LENGTH,
   FULL_TAIL_MAX_LINES,
@@ -82,6 +84,12 @@ describe("sanitizeLine (the capture-site single-line sanitizer)", () => {
     const out = sanitizeLine("x".repeat(100), 10);
     expect(out.length).toBe(10);
     expect(out.endsWith("…")).toBe(true);
+  });
+
+  it("preserves the legacy UTF-16 truncation boundary", () => {
+    const out = sanitizeLine(`${"x".repeat(298)}😀tail`, DETAIL_FIELD_MAX_LENGTH);
+    expect(out).toBe(`${"x".repeat(298)}\ud83d…`);
+    expect(out).toHaveLength(DETAIL_FIELD_MAX_LENGTH);
   });
 });
 
@@ -352,6 +360,222 @@ describe("SubagentProgressCondenser usage accumulation", () => {
     expect(formatUsageCompact(c.snapshot().usage)).toBe(
       "in 10 · out 5 · cache read 0 · cache write 0 · $0.25",
     );
+  });
+});
+
+describe("SubagentProgressCondenser structured detail log", () => {
+  it("captures every typed entry in event order, including an empty successful outcome", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({ type: "auto_retry_start", attempt: 1, maxAttempts: 3 });
+    c.consume({ type: "auto_retry_end", success: true });
+    c.consume({ type: "tool_execution_start", toolName: "Read", args: { file_path: "a.ts" } });
+    c.consume({ type: "tool_execution_end", toolName: "Read", result: "", isError: false });
+    c.consume({ type: "turn_end", message: assistant("settled answer") });
+    expect(c.detailLog()).toEqual([
+      { kind: "status", text: "waiting: API retry 1/3" },
+      { kind: "status", text: "retry succeeded; resuming…" },
+      { kind: "tool-call", tool: "Read", detail: "a.ts" },
+      { kind: "tool-outcome", tool: "Read", failed: false },
+      { kind: "assistant", text: "settled answer" },
+    ]);
+  });
+
+  it("captures exact failed retry and sanitized failed-tool details", () => {
+    const hostile = `${ESC}[31mBash${ESC}[0m\nignored`;
+    const c = new SubagentProgressCondenser();
+    c.consume({ type: "auto_retry_end", success: false });
+    c.consume({
+      type: "tool_execution_end",
+      toolName: hostile,
+      result: { content: [{ type: "text", text: `\n${ESC}]0;pwn${BEL}bad\tresult\nignored` }] },
+      isError: true,
+    });
+    expect(c.detailLog()).toEqual([
+      { kind: "status", text: "retry failed" },
+      { kind: "tool-outcome", tool: "Bash ignored", detail: "bad result", failed: true },
+    ]);
+  });
+
+  it("caps tool-call names independently when snapshot lines allow more than 300 units", () => {
+    const c = new SubagentProgressCondenser(DEFAULT_MAX_TAIL_LINES, 1_000);
+    c.consume({ type: "tool_execution_start", toolName: "T".repeat(900), args: {} });
+    const entry = c.detailLog()[0];
+    expect(entry).toEqual({ kind: "tool-call", tool: `${"T".repeat(299)}…` });
+    expect((entry as { tool: string }).tool).toHaveLength(DETAIL_FIELD_MAX_LENGTH);
+    expect(c.snapshot().activity.length).toBeGreaterThan(DETAIL_FIELD_MAX_LENGTH);
+  });
+
+  it("bounds huge command detail and keeps its ellipsis code-point safe", () => {
+    const c = new SubagentProgressCondenser(DEFAULT_MAX_TAIL_LINES, 1_000);
+    c.consume({
+      type: "tool_execution_start",
+      toolName: "Bash",
+      args: { command: `${"x".repeat(298)}😀${"y".repeat(1_000_000)}` },
+    });
+    expect(c.detailLog()).toEqual([
+      { kind: "tool-call", tool: "Bash", detail: `${"x".repeat(298)}…` },
+    ]);
+    expect((c.detailLog()[0] as { detail: string }).detail).not.toMatch(/[\uD800-\uDFFF]/u);
+  });
+
+  it("stops a complete short tool-result preview before inspecting a poison block", () => {
+    const poison = Object.defineProperty({}, "type", {
+      get(): never {
+        throw new Error("late result block was touched");
+      },
+    });
+    const c = new SubagentProgressCondenser();
+    expect(() =>
+      c.consume({
+        type: "tool_execution_end",
+        toolName: "Read",
+        result: { content: [{ type: "text", text: "safe" }, poison] },
+        isError: false,
+      }),
+    ).not.toThrow();
+    expect(c.snapshot().tail).toEqual(["Read: safe"]);
+    expect(c.detailLog()).toEqual([
+      { kind: "tool-outcome", tool: "Read", detail: "safe", failed: false },
+    ]);
+  });
+
+  it("consumes a C1 CSI introducer in structured fields", () => {
+    const csi = String.fromCharCode(155);
+    const c = new SubagentProgressCondenser();
+    c.consume({ type: "tool_execution_end", toolName: "Read", result: `a${csi}31mRED`, isError: false });
+    expect(c.detailLog()).toEqual([
+      { kind: "tool-outcome", tool: "Read", detail: "aRED", failed: false },
+    ]);
+    expect(c.snapshot().tail).toEqual(["Read: a31mRED"]);
+  });
+
+  it("retains raw-line found semantics when sanitization removes the whole line", () => {
+    const ansiOnly = `${ESC}[31m${ESC}[0m`;
+    const tool = new SubagentProgressCondenser();
+    tool.consume({ type: "tool_execution_end", toolName: "Read", result: ansiOnly, isError: false });
+    expect(tool.snapshot().tail).toEqual(["Read:"]);
+    expect(tool.detailLog()).toEqual([{ kind: "tool-outcome", tool: "Read", failed: false }]);
+
+    const assistantActivity = new SubagentProgressCondenser();
+    assistantActivity.consume({ type: "turn_start" });
+    assistantActivity.consume({ type: "message_update", message: assistant(ansiOnly) });
+    expect(assistantActivity.snapshot().activity).toBe("");
+  });
+
+  it("ignores streaming and tool-update floods while recording settled assistant text once", () => {
+    const c = new SubagentProgressCondenser();
+    for (let i = 0; i < 1_000; i++) {
+      c.consume({ type: "message_update", message: assistant(`draft ${i}`) });
+      c.consume({ type: "tool_execution_update", toolName: "Read", partialResult: `chunk ${i}` });
+    }
+    expect(c.detailLog()).toEqual([]);
+    c.consume({ type: "turn_end", message: assistant("final") });
+    expect(c.detailLog()).toEqual([{ kind: "assistant", text: "final" }]);
+  });
+
+  it("keeps the newest fixed number of entries and deep-copies every returned object", () => {
+    const c = new SubagentProgressCondenser();
+    for (let i = 0; i < DETAIL_LOG_MAX_ENTRIES + 10; i++) {
+      c.consume({ type: "tool_execution_end", toolName: `T${i}`, result: "", isError: false });
+    }
+    const first = c.detailLog();
+    expect(first).toHaveLength(DETAIL_LOG_MAX_ENTRIES);
+    expect(first[0]).toMatchObject({ kind: "tool-outcome", tool: "T10" });
+    (first[0] as { tool: string }).tool = "mutated";
+    first.push({ kind: "status", text: "caller mutation" });
+    expect(c.detailLog()[0]).toMatchObject({ tool: "T10" });
+    expect(c.detailLog()).toHaveLength(DETAIL_LOG_MAX_ENTRIES);
+  });
+
+  it("sanitizes every scalar to one bounded physical line", () => {
+    const controls = `${String.fromCharCode(0)}${String.fromCharCode(155)}`;
+    const hostile = `${ESC}]0;pwn${BEL}${ESC}[31mred${ESC}[0m\r\n\tblue${controls}`;
+    const c = new SubagentProgressCondenser();
+    c.consume({ type: "tool_execution_start", toolName: hostile, args: { command: hostile } });
+    c.consume({ type: "tool_execution_end", toolName: hostile, result: hostile, isError: true });
+    c.consume({ type: "turn_end", message: assistant(hostile) });
+    for (const entry of c.detailLog()) {
+      for (const value of Object.values(entry)) {
+        if (typeof value !== "string") continue;
+        expect(value.length).toBeLessThanOrEqual(DETAIL_FIELD_MAX_LENGTH);
+        expect(value).not.toMatch(/[\r\n\t]/u);
+        expect(value).not.toContain(ESC);
+        expect(value).not.toContain(BEL);
+      }
+    }
+    expect(c.detailLog().at(-1)).toEqual({ kind: "assistant", text: "red blue" });
+  });
+
+  it("bounds huge strings and block counts before they enter the detail log", () => {
+    const hugeBlocks = Array.from({ length: 20_000 }, () => ({ type: "text", text: "block " }));
+    const c = new SubagentProgressCondenser();
+    c.consume({
+      type: "turn_end",
+      message: { role: "assistant", content: [{ type: "text", text: "x".repeat(1_000_000) }, ...hugeBlocks] },
+    });
+    c.consume({
+      type: "tool_execution_end",
+      toolName: "Read",
+      result: { content: hugeBlocks },
+      isError: false,
+    });
+    const detail = c.detailLog();
+    expect((detail[0] as { text: string }).text).toHaveLength(DETAIL_FIELD_MAX_LENGTH);
+    expect((detail[1] as { detail: string }).detail.length).toBeLessThanOrEqual(DETAIL_FIELD_MAX_LENGTH);
+  });
+
+  it("preserves legacy incomplete-CSI and astral truncation while structured fields stay safe", () => {
+    const incomplete = `${"i".repeat(10)}${ESC}[31`;
+    const astral = `${"x".repeat(298)}😀tail`;
+    const c = new SubagentProgressCondenser(DEFAULT_MAX_TAIL_LINES, DETAIL_FIELD_MAX_LENGTH);
+    c.consume({ type: "turn_end", message: assistant(incomplete) });
+    c.consume({ type: "turn_end", message: assistant(astral) });
+    expect(c.snapshot().tail).toEqual([
+      `${"i".repeat(10)}[31`,
+      `${"x".repeat(298)}\ud83d…`,
+    ]);
+    expect(c.fullTail()).toEqual(c.snapshot().tail);
+    expect(c.detailLog()).toEqual([
+      { kind: "assistant", text: "i".repeat(10) },
+      { kind: "assistant", text: `${"x".repeat(298)}…` },
+    ]);
+    expect((c.detailLog()[1] as { text: string }).text).not.toMatch(/[\uD800-\uDFFF]/u);
+  });
+
+  it("preserves assistant block concatenation and newest-tail semantics with bounded huge lines", () => {
+    const c = new SubagentProgressCondenser(4, 20);
+    c.consume({
+      type: "turn_end",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "first\nsec" },
+          { type: "text", text: "ond\n" },
+          { type: "text", text: "q".repeat(1_000_000) },
+          { type: "text", text: "\nnewest" },
+        ],
+      },
+    });
+    expect(c.snapshot().tail).toEqual(["first", "second", `${"q".repeat(19)}…`, "newest"]);
+    expect(c.fullTail()).toEqual([
+      "first",
+      "second",
+      `${"q".repeat(FULL_TAIL_MAX_LINE_LENGTH - 1)}…`,
+      "newest",
+    ]);
+  });
+
+  it("reports detail-only changes separately without changing snapshots or rendered progress", () => {
+    const c = new SubagentProgressCondenser();
+    c.consume({ type: "tool_execution_end", toolName: "Read", result: "", isError: false });
+    const before = c.snapshot();
+    const rendered = renderProgressText(before);
+    expect(c.consume({ type: "tool_execution_end", toolName: "Write", result: "", isError: false })).toBe(false);
+    expect(c.detailChanged()).toBe(true);
+    expect(c.snapshot()).toEqual(before);
+    expect(renderProgressText(c.snapshot())).toBe(rendered);
+    expect(c.consume({ type: "tool_execution_update", partialResult: "ignored" })).toBe(false);
+    expect(c.detailChanged()).toBe(false);
   });
 });
 

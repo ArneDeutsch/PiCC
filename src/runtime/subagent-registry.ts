@@ -3,6 +3,7 @@ import {
   sanitizeLine,
   sanitizeProgressText,
   type ProgressSnapshot,
+  type SubagentDetailEntry,
 } from "./subagent-progress.js";
 
 /**
@@ -196,6 +197,12 @@ export interface SubagentRegistryRecord {
    */
   fullTail?: string[];
   /**
+   * Structured, typed live detail events for the selected-agent view. Entries
+   * are display-only, sanitized and bounded by the condenser, then copied here
+   * so the registry remains the panel's sole ownership boundary.
+   */
+  detailLog?: SubagentDetailEntry[];
+  /**
    * USER-initiated stop marker: set only by `markUserStopped` (a panel stop
    * action), NEVER by a model `TaskStop`, and never cleared by `register()` or
    * `markResuming` — a user stop is permanent for this agent id (a fresh
@@ -339,18 +346,30 @@ export class SubagentRegistry {
   }
 
   /**
-   * Mirror the latest live-progress snapshot (and drill-down `fullTail`) of a
-   * RUNNING dispatch onto its record. The condenser is the sanitizer/bounder —
-   * both arguments arrive sanitized and capped at capture. Ignored for
+   * Mirror changed live display fields of a RUNNING dispatch onto its record.
+   * Snapshot and detail changes travel independently; the condenser has already
+   * sanitized and bounded every value. Ignored for
    * unknown ids and settled records (a settled record's finalText/usage stay
    * authoritative; dispatch unsubscribes its condenser before settling, so
    * the guard only catches stale callers).
    */
-  noteProgress(agentId: string, snapshot: ProgressSnapshot, fullTail?: string[]): void {
+  noteProgress(
+    agentId: string,
+    snapshot: ProgressSnapshot | undefined,
+    fullTail?: string[],
+    detailLog?: SubagentDetailEntry[],
+  ): void {
     const record = this.records.get(agentId);
     if (!record || record.state !== "running") return;
-    record.progress = snapshot;
-    if (fullTail) record.fullTail = fullTail;
+    if (snapshot) {
+      record.progress = {
+        ...snapshot,
+        tail: [...snapshot.tail],
+        ...(snapshot.usage ? { usage: { ...snapshot.usage } } : {}),
+      };
+    }
+    if (fullTail) record.fullTail = [...fullTail];
+    if (detailLog) record.detailLog = detailLog.map((entry) => ({ ...entry }));
     this.notifyChange();
   }
 
@@ -386,8 +405,9 @@ export class SubagentRegistry {
    * resume is initiated — Claude Code 2.1.205 flips the status synchronously
    * (stale settled status was a fixed bug). The subsequent `register()` from the
    * resumed dispatch reconfirms this with the live session handle. Also the one
-   * home of the resume-related RESETS: `startedAt` restarts (a resumed agent's
-   * elapsed time restarts) and `settledAt` clears. No-op for unknown ids, and —
+   * home of generation-local resets: elapsed time restarts and every prior
+   * outcome, usage, progress/detail buffer, final text, and settlement time
+   * clears before the resumed session can emit. No-op for unknown ids, and —
    * the permanence backstop behind the SendMessage refusal — for user-stopped
    * records.
    */
@@ -397,6 +417,12 @@ export class SubagentRegistry {
     record.state = "running";
     record.settledNoticeConsumed = false;
     record.startedAt = Date.now();
+    record.finalText = undefined;
+    record.outcome = undefined;
+    record.usage = undefined;
+    record.progress = undefined;
+    record.detailLog = undefined;
+    record.fullTail = undefined;
     record.settledAt = undefined;
     this.notifyChange();
   }

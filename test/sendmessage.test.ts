@@ -246,15 +246,53 @@ describe("SubagentRegistry — panel state fields", () => {
     expect(r.get(id)!.settledAt).toBeUndefined();
   });
 
-  it("markSettled records sanitized finalText only when provided (a later settle without text keeps the prior answer)", () => {
+  it("markResuming synchronously clears every generation-local display field", () => {
+    const r = new SubagentRegistry();
+    const id = mintAgentId();
+    r.register({ agentId: id, agentName: "reviewer", ...base, prompt: "initial task" });
+    const details = [{ kind: "assistant" as const, text: "old live answer" }];
+    r.noteProgress(id, { tail: ["old progress"], activity: "working…" }, ["old full tail"], details);
+    r.markSettled(id, {
+      outcome: "completed",
+      usage: { inputTokens: 12 },
+      finalText: `${ESC}[31mthe answer${ESC}[0m\nline two`,
+    });
+    expect(r.get(id)!.finalText).toBe("the answer\nline two");
+
+    r.markResuming(id);
+    const resumed = r.get(id)!;
+    expect(resumed).toMatchObject({
+      agentId: id,
+      agentName: "reviewer",
+      prompt: "initial task",
+      transcriptPath: base.transcriptPath,
+      state: "running",
+    });
+    for (const field of ["finalText", "outcome", "usage", "progress", "detailLog", "fullTail", "settledAt"] as const) {
+      expect(resumed[field]).toBeUndefined();
+    }
+
+    // A resumed generation may emit no progress and settle with no text/usage;
+    // nothing from the prior generation is allowed to reappear.
+    r.markSettled(id, { outcome: "completed" });
+    expect(r.get(id)!.outcome).toBe("completed");
+    expect(r.get(id)!.finalText).toBeUndefined();
+    expect(r.get(id)!.usage).toBeUndefined();
+    expect(r.get(id)!.progress).toBeUndefined();
+    expect(r.get(id)!.detailLog).toBeUndefined();
+  });
+
+  it("deep-copies structured detail entries when storing them", () => {
     const r = new SubagentRegistry();
     const id = mintAgentId();
     r.register({ agentId: id, agentName: "reviewer", ...base });
-    r.markSettled(id, { finalText: `${ESC}[31mthe answer${ESC}[0m\nline two` });
-    expect(r.get(id)!.finalText).toBe("the answer\nline two");
-    r.markResuming(id);
-    r.markSettled(id);
-    expect(r.get(id)!.finalText).toBe("the answer\nline two");
+    const detail = [{ kind: "tool-call" as const, tool: "Read", detail: "a.ts" }];
+    r.noteProgress(id, undefined, undefined, detail);
+    detail[0]!.tool = "mutated";
+    detail.push({ kind: "tool-call", tool: "Write", detail: "b.ts" });
+    expect(r.get(id)!.detailLog).toEqual([
+      { kind: "tool-call", tool: "Read", detail: "a.ts" },
+    ]);
   });
 
   it("caps prompt (~4 KB) and finalText (~16 KB) at capture", () => {

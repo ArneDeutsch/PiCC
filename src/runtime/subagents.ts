@@ -1666,10 +1666,17 @@ export class SubagentRuntime {
         const condenser = new SubagentProgressCondenser();
         progressUnsub = session.subscribe((event: unknown) => {
           try {
-            if (!condenser.consume(event)) return;
-            const snapshot = condenser.snapshot();
-            dispatchRegistry?.noteProgress(agentId, snapshot, condenser.fullTail());
-            emit?.(snapshot);
+            const snapshotChanged = condenser.consume(event);
+            const detailChanged = condenser.detailChanged();
+            if (!snapshotChanged && !detailChanged) return;
+            const snapshot = snapshotChanged ? condenser.snapshot() : undefined;
+            dispatchRegistry?.noteProgress(
+              agentId,
+              snapshot,
+              snapshotChanged ? condenser.fullTail() : undefined,
+              detailChanged ? condenser.detailLog() : undefined,
+            );
+            if (snapshot) emit?.(snapshot);
           } catch {
             // progress is best-effort display — never let it break the dispatch
           }

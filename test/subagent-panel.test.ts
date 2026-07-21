@@ -2200,7 +2200,7 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     expect(s.pi.renderRequests).toBe(afterDispose);
   });
 
-  it("settling with a long tail top-anchors onto the final answer; resuming re-follows the newest line", async () => {
+  it("settling top-anchors onto the final answer; resuming clears prior-generation detail", async () => {
     const s = focusSetup();
     reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
     s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
@@ -2228,7 +2228,8 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     s.registry.markResuming("agent-a");
     const resumed = invocation.render(200).join("\n");
     expect(resumed).toContain(DETAIL_BANNER_RESUMED);
-    expect(resumed).toContain("tail line 30"); // re-follow: newest tail visible
+    expect(resumed).not.toContain("tail line 30");
+    expect(resumed).not.toContain("the settled final answer");
     invocation.input(ESC);
     invocation.input(ESC);
     await invocation.result;
