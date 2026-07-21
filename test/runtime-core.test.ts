@@ -62,7 +62,13 @@ import {
   projectConfigPath,
   type PiCCConfig,
 } from "../src/runtime/steering.js";
-import { createAgentToolDefinition, extractText, type SubagentRuntime } from "../src/runtime/subagents.js";
+import {
+  createAgentToolDefinition,
+  createSendMessageToolDefinition,
+  extractText,
+  type SubagentRuntime,
+} from "../src/runtime/subagents.js";
+import { BackgroundTaskRegistry, createTaskOutputTool } from "../src/runtime/background-tasks.js";
 import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import { visibleWidth as tuiVisibleWidth, Text as TuiText } from "@earendil-works/pi-tui";
 import type { ProgressSnapshot } from "../src/runtime/subagent-progress.js";
@@ -72,6 +78,7 @@ import {
   RECORD_REFERENCE_NOTE,
   renderAgentCall,
   renderAgentResult,
+  type SubagentRenderDetails,
 } from "../src/runtime/subagent-render.js";
 import {
   bgSlotForCtx,
@@ -1072,6 +1079,133 @@ describe("SubagentRuntime (fake SDK)", () => {
     const { runtime } = makeRuntime([makeAgent({ name: "Reviewer" })], ["ok"]);
     const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
     expect(result.ok).toBe(true);
+  });
+
+  it("foreground success and failed-partial results preserve exact content and one-clock metadata", async () => {
+    const cases = [
+      {
+        reply: { text: "done" },
+        content: "done",
+        outcome: "completed" as const,
+      },
+      {
+        reply: { text: "partial", stopReason: "error" as const, errorMessage: "provider failed" },
+        content:
+          "partial\n\n---\n[subagent cut off] Agent terminated early due to an API error: provider failed",
+        outcome: "failed" as const,
+      },
+    ];
+    for (const testCase of cases) {
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(1_000);
+        const { sdk } = fakeSdk({
+          onPrompt: () => {
+            vi.setSystemTime(1_450);
+            return testCase.reply;
+          },
+        });
+        const runtime = makeSubagentRuntime([makeAgent()], sdk);
+        const tool = createAgentToolDefinition(runtime, { depth: 0 }) as {
+          execute: (
+            id: string,
+            params: Record<string, unknown>,
+          ) => Promise<{ content: Array<{ type: string; text: string }>; details: SubagentRenderDetails }>;
+        };
+        const output = await tool.execute("t", {
+          subagent_type: "reviewer",
+          prompt: "go",
+          description: "Review authentication",
+          run_in_background: false,
+        });
+        expect(output.content).toEqual([{ type: "text", text: testCase.content }]);
+        expect(output.details).toMatchObject({
+          description: "Review authentication",
+          outcome: testCase.outcome,
+          settledAt: 1_450,
+          durationMs: 450,
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  });
+
+  it("foreground timing omits a finite-clock subtraction that overflows", async () => {
+    let now = -Number.MAX_VALUE;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      const { sdk } = fakeSdk({
+        onPrompt: () => {
+          now = Number.MAX_VALUE;
+          return { text: "done" };
+        },
+      });
+      const tool = createAgentToolDefinition(makeSubagentRuntime([makeAgent()], sdk), { depth: 0 }) as {
+        execute: (
+          id: string,
+          params: Record<string, unknown>,
+        ) => Promise<{ content: Array<{ type: string; text: string }>; details: SubagentRenderDetails }>;
+      };
+      const output = await tool.execute("t", {
+        subagent_type: "reviewer",
+        prompt: "go",
+        run_in_background: false,
+      });
+      expect(output.content).toEqual([{ type: "text", text: "done" }]);
+      expect(output.details.durationMs).toBeUndefined();
+      expect(output.details.settledAt).toBeUndefined();
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("SendMessage resume keeps the original sanitized description in start and terminal details", async () => {
+    const registry = new SubagentRegistry();
+    const backgroundTasks = new BackgroundTaskRegistry();
+    const agentId = "agent-aabbccddeeff";
+    registry.register({
+      agentId,
+      agentName: "reviewer",
+      depth: 1,
+      cwd: process.cwd(),
+      resumable: true,
+      oneShot: false,
+      transcriptPath: "/x/sessions/agent-aabbccddeeff.jsonl",
+      description: `Review${String.fromCharCode(27)}[31m auth`,
+    });
+    registry.markSettled(agentId, { outcome: "completed" });
+    const runtime = {
+      dispatch: vi.fn().mockResolvedValue({
+        ok: true,
+        outcome: "completed",
+        finalMessage: "resumed report",
+        agentId,
+        agentName: "reviewer",
+        diagnostics: [],
+      }),
+    } as unknown as SubagentRuntime;
+    const sendMessage = createSendMessageToolDefinition(runtime, { registry, backgroundTasks }) as {
+      execute: (
+        id: string,
+        params: Record<string, unknown>,
+      ) => Promise<{ content: Array<{ type: string; text: string }>; details: SubagentRenderDetails }>;
+    };
+
+    const started = await sendMessage.execute("sm", { to: agentId, message: "continue" });
+    expect(started.details.description).toBe("Review auth");
+    const taskId = started.details.taskId!;
+    expect(backgroundTasks.get(taskId)?.description).toBe("Review auth");
+    await backgroundTasks.wait(taskId);
+    const taskOutput = createTaskOutputTool(backgroundTasks) as unknown as {
+      execute: (
+        id: string,
+        params: Record<string, unknown>,
+      ) => Promise<{ content: Array<{ type: string; text: string }>; details: SubagentRenderDetails }>;
+    };
+    const completed = await taskOutput.execute("out", { task_id: taskId });
+    expect(completed.content).toEqual([{ type: "text", text: "resumed report" }]);
+    expect(completed.details.description).toBe("Review auth");
   });
 
   it("Agent tool definition dispatches at depth+1 and throws on failure", async () => {
@@ -2656,7 +2790,7 @@ describe("condensed completion records", () => {
       transcriptPath: `/x/${ESC}[31m/agent-3b7caeaf8448.jsonl`,
       usage: { inputTokens: 1 },
       durationMs: 1000,
-    };
+    } as const;
     const plain = renderAgentResult(
       { content: [{ type: "text", text: "b" }], details },
       { isPartial: false, expanded: false },

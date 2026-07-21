@@ -9,7 +9,11 @@ import {
   sanitizeLine,
   type ProgressSnapshot,
 } from "./subagent-progress.js";
-import { renderAgentResult, renderTaskOutputCall } from "./subagent-render.js";
+import {
+  renderAgentResult,
+  renderTaskOutputCall,
+  type SubagentRenderDetails,
+} from "./subagent-render.js";
 import {
   formatBackgroundTaskIdentity,
   normalizeBackgroundTaskId,
@@ -51,7 +55,7 @@ export interface SettlementNotice {
    * completion record. Never model-visible — `content` above stays the entire
    * model-facing text, byte-identical to before this field existed.
    */
-  details: Record<string, unknown>;
+  details: SubagentRenderDetails;
   /**
    * Final synchronous check immediately before delivery. A notice selected by a
    * prior drain can become stale when its task is collected or a newer resume
@@ -163,6 +167,8 @@ export interface BackgroundTaskRecord {
    * (the `label` still carries the `agent:<type>` form for existing surfaces).
    */
   agentType?: string;
+  /** Sanitized human-readable dispatch label, when supplied. */
+  description?: string;
   /**
    * USER-initiated stop marker (a panel action): set only via
    * `markUserStopped`, never by the model's TaskStop tool. Surfaced through
@@ -300,6 +306,7 @@ export class BackgroundTaskRegistry {
     agentId?: string,
     agentType?: string,
     owner?: string,
+    description?: string,
   ): string {
     const generation = ++this.counter;
     const id = `task-${generation}`;
@@ -317,6 +324,10 @@ export class BackgroundTaskRegistry {
           ? undefined
           : sanitizeLine(agentType, CAPTURED_LINE_CAP) || undefined,
       owner,
+      description:
+        description === undefined
+          ? undefined
+          : sanitizeLine(description, CAPTURED_LINE_CAP) || undefined,
       startedAt: Date.now(),
       diagnostics: [],
       settled: Promise.resolve(),
@@ -793,7 +804,19 @@ const RECORD_FINAL_TEXT_CAP = 16384;
  * main-chat completion record). `record: "subagent-completion"` is the shape
  * marker the registered renderer keys on. Never model-visible.
  */
-function settlementRecordDetails(task: BackgroundTaskRecord): Record<string, unknown> {
+function terminalTiming(task: BackgroundTaskRecord): Pick<SubagentRenderDetails, "durationMs" | "settledAt"> {
+  const { startedAt, settledAt } = task;
+  if (
+    typeof startedAt !== "number" ||
+    !Number.isFinite(startedAt) ||
+    typeof settledAt !== "number" ||
+    !Number.isFinite(settledAt)
+  ) return {};
+  const durationMs = settledAt - startedAt;
+  return Number.isFinite(durationMs) && durationMs >= 0 ? { durationMs, settledAt } : {};
+}
+
+function settlementRecordDetails(task: BackgroundTaskRecord): SubagentRenderDetails {
   const outcome = noticeOutcome(task.status);
   const raw = outcome === "aborted" ? "" : task.result ?? "";
   const finalText =
@@ -805,19 +828,18 @@ function settlementRecordDetails(task: BackgroundTaskRecord): Record<string, unk
     outcome,
     agent: task.agentType ?? task.agentName ?? "subagent",
     agentId: task.agentId,
+    description: task.description,
     cutOff: task.truncated === true,
     transcriptPath: task.transcriptPath,
     resumable: task.resumable,
     usage: task.usage,
     diagnostics: task.diagnostics,
-    ...(task.startedAt !== undefined && task.settledAt !== undefined
-      ? { durationMs: Math.max(0, task.settledAt - task.startedAt) }
-      : {}),
+    ...terminalTiming(task),
     ...(task.error ? { error: task.error } : {}),
     ...(finalText ? { finalText } : {}),
     ...(task.userStopped ? { userStopped: true } : {}),
     ...(task.owner !== undefined ? { nested: true } : {}),
-  };
+  } satisfies SubagentRenderDetails;
 }
 
 function unknownIdError(view: BackgroundTaskView, id: string): Error {
@@ -830,7 +852,7 @@ function unknownIdError(view: BackgroundTaskView, id: string): Error {
 /** The onUpdate payload shape Pi re-renders on each streaming partial. */
 type ToolUpdate = {
   content: Array<{ type: string; text: string }>;
-  details?: Record<string, unknown>;
+  details?: SubagentRenderDetails;
 };
 
 /** The `TaskOutput` tool: retrieve a background task's result (waits by default). */
@@ -858,7 +880,7 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
     // render exactly like a foreground dispatch (no forked renderer). The taskId
     // in `details` gates the background-identity additions.
     renderResult(
-      result: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+      result: { content?: Array<{ type: string; text: string }>; details?: SubagentRenderDetails },
       options: { expanded?: boolean; isPartial?: boolean },
       theme: unknown,
     ) {
@@ -886,7 +908,13 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
         const partial = (snap: ProgressSnapshot | undefined): ToolUpdate => ({
           // Mirror the foreground partial: print/RPC legibility rides in content.
           content: [{ type: "text", text: snap ? renderProgressText(snap) : "" }],
-          details: { subagentProgress: snap, agent, taskId: id, agentId: task.agentId, live: true },
+          details: {
+            subagentProgress: snap,
+            agent,
+            taskId: id,
+            agentId: task.agentId,
+            live: true,
+          } satisfies SubagentRenderDetails,
         });
         let unsub = () => {};
         let removeAbort = () => {};
@@ -998,10 +1026,7 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
       // line. Read BEFORE the markCollected transition below flips the state.
       const alreadyReported =
         task.status !== "running" && (task.settlementDelivery ?? "pending") !== "pending";
-      const durationMs =
-        task.status !== "running" && task.startedAt !== undefined && task.settledAt !== undefined
-          ? Math.max(0, task.settledAt - task.startedAt)
-          : undefined;
+      const timing = task.status === "running" ? {} : terminalTiming(task);
       // Construct the complete response before changing delivery state. The
       // owner-safe transition is the final operation before a terminal return,
       // so a running poll or any earlier throw leaves settlement eligible.
@@ -1024,11 +1049,12 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
           usage: task.usage,
           lastActivity: task.lastActivity,
           diagnostics: task.diagnostics,
-          ...(durationMs !== undefined ? { durationMs } : {}),
+          description: task.description,
+          ...timing,
           ...(task.error ? { error: task.error } : {}),
           ...(task.userStopped ? { userStopped: true } : {}),
           ...(alreadyReported ? { alreadyReported: true } : {}),
-        },
+        } satisfies SubagentRenderDetails,
       };
       if (task.status !== "running" && !registry.markCollected(id)) {
         // A terminal record that vanished or left this owner scope cannot be
@@ -1092,7 +1118,10 @@ export function createTaskStopTool(registry: BackgroundTaskView): Record<string,
           : `${identity} — marked stopped. Cooperative stop is not supported for this dispatch; it may run to completion, but its result will be discarded.`;
       return {
         content: [{ type: "text", text }],
-        details: { taskId: id, status: task.status },
+        details: {
+          taskId: id,
+          status: task.status,
+        } satisfies SubagentRenderDetails,
       };
     },
   };

@@ -40,7 +40,11 @@ import {
   type ProgressSnapshot,
   type SnapshotUsage,
 } from "./subagent-progress.js";
-import { renderAgentCall, renderAgentResult } from "./subagent-render.js";
+import {
+  renderAgentCall,
+  renderAgentResult,
+  type SubagentRenderDetails,
+} from "./subagent-render.js";
 import { formatBackgroundTaskIdentity } from "./background-identity.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./builtin-tools.js";
 
@@ -2160,7 +2164,7 @@ export function createAgentToolDefinition(
     // would be invisible. Also renders the live rolling tail for partial
     // (streaming) results. Renders defensively when optional fields are absent.
     renderResult(
-      result: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+      result: { content?: Array<{ type: string; text: string }>; details?: SubagentRenderDetails },
       options: { expanded?: boolean; isPartial?: boolean },
       theme: unknown,
     ) {
@@ -2263,6 +2267,7 @@ export function createAgentToolDefinition(
           // undefined for the coordinator) so scoped TaskOutput/TaskStop reach
           // exactly the tasks that dispatcher started.
           opts.ownerAgentId,
+          description,
         );
         taskId = id;
         // Identity-at-start: the agent id appears for EVERY background
@@ -2275,7 +2280,13 @@ export function createAgentToolDefinition(
               text: `Background task ${id} started (agent: ${label}, agent id: ${agentId}). Use TaskOutput with task_id "${id}" to retrieve the result before finalizing.`,
             },
           ],
-          details: { background: true, taskId: id, agent: label, agentId },
+          details: {
+            background: true,
+            taskId: id,
+            agent: label,
+            agentId,
+            description,
+          } satisfies SubagentRenderDetails,
         };
       }
       // Foreground: Pi's per-call signal (parent Esc) aborts the dispatch.
@@ -2287,7 +2298,11 @@ export function createAgentToolDefinition(
         ? (snapshot: ProgressSnapshot) => {
             onUpdate({
               content: [{ type: "text", text: renderProgressText(snapshot) }],
-              details: { subagentProgress: snapshot, agent: label, live: true },
+              details: {
+                subagentProgress: snapshot,
+                agent: label,
+                live: true,
+              } satisfies SubagentRenderDetails,
             });
           }
         : undefined;
@@ -2297,6 +2312,15 @@ export function createAgentToolDefinition(
         abortSignal: signal,
         onProgress,
       });
+      const settledAt = Date.now();
+      const durationMs = settledAt - dispatchedAtMs;
+      const timing =
+        Number.isFinite(dispatchedAtMs) &&
+        Number.isFinite(settledAt) &&
+        Number.isFinite(durationMs) &&
+        durationMs >= 0
+          ? { durationMs, settledAt }
+          : {};
       // Structured copy of the identity fields for every content-returning path
       // (details is logs/UI-only — the model never sees it, hence the trailer).
       const identityDetails = {
@@ -2307,14 +2331,11 @@ export function createAgentToolDefinition(
         // (formatUsageLine → formatUsageCompact). details is logs/UI-only — never
         // the model-visible content, so the verbatim-return contract is untouched.
         usage: result.usage,
-        // Elapsed wall-clock of the awaited dispatch, so FOREGROUND completion
-        // records show a duration like background ones (whose registry stamps
-        // startedAt/settledAt). Measured locally: the subagent registry that
-        // carries those stamps is private to the runtime and unreachable from
-        // this tool factory; this delta spans the identical interval. details
-        // is UI-only, so print/RPC output is untouched.
-        durationMs: Date.now() - dispatchedAtMs,
-      };
+        description,
+        // Panel-registry timestamps are private to the runtime; one local
+        // completion clock keeps duration and settlement instant in agreement.
+        ...timing,
+      } satisfies SubagentRenderDetails;
       // Claude 2.1.200 outcome→presentation mapping: the text, cut-off frame,
       // resume trailer, and throw-vs-return decision all live in the shared,
       // pure `presentDispatchResult` helper — the fork path consumes the same
@@ -2348,7 +2369,7 @@ export function createAgentToolDefinition(
             cutOff: presentation.cutOff,
             error: result.error,
             ...identityDetails,
-          },
+          } satisfies SubagentRenderDetails,
         };
       }
       // Verbatim-return contract: callers parse finalMessage directly (often a
@@ -2387,7 +2408,7 @@ export function createAgentToolDefinition(
                   : "background dispatch (run_in_background or a background:true agent) requested but no background task registry is wired; ran in foreground",
               }
             : {}),
-        },
+        } satisfies SubagentRenderDetails,
       };
     },
   };
@@ -2460,7 +2481,12 @@ export function createSendMessageToolDefinition(
               text: `Message delivered to running agent ${record.agentId} ("${record.agentName}") as a mid-task course correction.`,
             },
           ],
-          details: { agentId: record.agentId, agent: record.agentName, delivery: "steer" },
+          details: {
+            agentId: record.agentId,
+            agent: record.agentName,
+            description: record.description,
+            delivery: "steer",
+          } satisfies SubagentRenderDetails,
         };
       }
 
@@ -2554,6 +2580,8 @@ export function createSendMessageToolDefinition(
         () => controller.abort(),
         record.agentId,
         agentLabel,
+        undefined,
+        record.description,
       );
       taskId = id;
       const identity = formatBackgroundTaskIdentity(id, record.agentName, record.agentId);
@@ -2568,9 +2596,10 @@ export function createSendMessageToolDefinition(
           agentId: record.agentId,
           agent: record.agentName,
           taskId: id,
+          description: record.description,
           delivery: "resume",
           resumed: true,
-        },
+        } satisfies SubagentRenderDetails,
       };
     },
   };

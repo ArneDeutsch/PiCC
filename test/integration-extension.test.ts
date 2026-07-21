@@ -1251,6 +1251,8 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(top, "settlement message lost its details payload").toBeDefined();
     expect(nested).toBeDefined();
     expect(top!.details!.record).toBe("subagent-completion");
+    expect(typeof top!.details!.settledAt).toBe("number");
+    expect(typeof top!.details!.durationMs).toBe("number");
     expect(top!.content).toContain("settled: completed"); // model-facing text untouched
 
     // The RECORDED registered renderer, driven with the actual sent message at
@@ -1271,6 +1273,32 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(renderer!(nested, { expanded: false }, undefined)).toBeUndefined();
   });
 
+  it("registered Agent threads a background description through the real TaskOutput wiring", async () => {
+    const handle = fakeSdk({ replies: ["BACKGROUND-DONE"] });
+    const { p, internals } = await wire();
+    internals.subagentRuntime.setSdkForTest(handle.sdk);
+    const agent = p.tools.get("Agent");
+    const started = await agent.execute("bg-description", {
+      subagent_type: "reviewer",
+      prompt: "review in background",
+      description: "Review authentication",
+      run_in_background: true,
+    });
+    expect(started.content).toEqual([
+      {
+        type: "text",
+        text: `Background task ${started.details.taskId} started (agent: reviewer, agent id: ${started.details.agentId}). Use TaskOutput with task_id "${started.details.taskId}" to retrieve the result before finalizing.`,
+      },
+    ]);
+    expect(started.details.description).toBe("Review authentication");
+    await internals.backgroundTasks.wait(String(started.details.taskId));
+    const output = await p.tools.get("TaskOutput").execute("collect-description", {
+      task_id: started.details.taskId,
+    });
+    expect(output.content[0]!.text).toContain("BACKGROUND-DONE");
+    expect(output.details.description).toBe("Review authentication");
+  });
+
   it("a FOREGROUND completed dispatch carries durationMs; its collapsed record shows a duration segment", async () => {
     const handle = fakeSdk({ replies: ["FOREGROUND-DONE"] });
     const { p, internals } = await wire();
@@ -1282,6 +1310,7 @@ describe("background settlement delivery (offline integration via the seam)", ()
       run_in_background: false,
     });
     expect(res.details.outcome).toBe("completed");
+    expect(typeof res.details.settledAt).toBe("number");
     const durationMs = res.details.durationMs;
     expect(typeof durationMs).toBe("number");
     expect(durationMs as number).toBeGreaterThanOrEqual(0);

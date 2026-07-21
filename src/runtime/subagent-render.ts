@@ -7,6 +7,7 @@ import {
 import { clampLines, pushColored, pushWrapped, themedBold, themedFg } from "./render-util.js";
 import { formatElapsed } from "./subagent-panel-render.js";
 import { FORK_DEGRADE_PREFIX, isAgentId } from "../util/subagent-transcripts.js";
+import type { Diagnostic } from "../types.js";
 
 // --- live-progress + result rendering helpers ---
 //
@@ -33,6 +34,168 @@ export const RECORD_FORK_MARKER = "⚠ fork degraded";
 /** Suffix of the minimal reference line for an already-reported settlement. */
 export const RECORD_REFERENCE_NOTE = "full record above";
 
+/** Complete details-only contract consumed by subagent lifecycle renderers. */
+export interface SubagentRenderDetails {
+  record?: "subagent-completion";
+  background?: boolean;
+  taskId?: string;
+  status?: "running" | "completed" | "failed" | "stopped";
+  outcome?: "completed" | "failed" | "aborted";
+  agent?: string;
+  agentId?: string;
+  description?: string;
+  durationMs?: number;
+  settledAt?: number;
+  usage?: unknown;
+  cutOff?: boolean;
+  userStopped?: boolean;
+  resumable?: boolean;
+  transcriptPath?: string;
+  diagnostics?: Diagnostic[];
+  subagentProgress?: ProgressSnapshot;
+  lastActivity?: string;
+  alreadyReported?: boolean;
+  error?: string;
+  finalText?: string;
+  nested?: boolean;
+  live?: boolean;
+  worktreePath?: string;
+  note?: string;
+  delivery?: "steer" | "resume";
+  resumed?: boolean;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeDiagnostics(value: unknown): Diagnostic[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const diagnostics: Diagnostic[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) return undefined;
+    const { severity, message, source } = item;
+    if (
+      (severity !== "info" && severity !== "warning" && severity !== "error") ||
+      typeof message !== "string" ||
+      (source !== undefined && typeof source !== "string")
+    ) {
+      return undefined;
+    }
+    diagnostics.push({ severity, message, ...(source === undefined ? {} : { source }) });
+  }
+  return diagnostics;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function normalizeProgressSnapshot(value: unknown): ProgressSnapshot | undefined {
+  if (!isRecord(value) || typeof value.activity !== "string" || !isStringArray(value.tail)) {
+    return undefined;
+  }
+  const usage: NonNullable<ProgressSnapshot["usage"]> = {};
+  if (isRecord(value.usage)) {
+    const inputTokens = finiteNumber(value.usage.inputTokens);
+    const outputTokens = finiteNumber(value.usage.outputTokens);
+    const cacheReadTokens = finiteNumber(value.usage.cacheReadTokens);
+    const cacheWriteTokens = finiteNumber(value.usage.cacheWriteTokens);
+    const costUsd = finiteNumber(value.usage.costUsd);
+    if (inputTokens !== undefined) usage.inputTokens = inputTokens;
+    if (outputTokens !== undefined) usage.outputTokens = outputTokens;
+    if (cacheReadTokens !== undefined) usage.cacheReadTokens = cacheReadTokens;
+    if (cacheWriteTokens !== undefined) usage.cacheWriteTokens = cacheWriteTokens;
+    if (costUsd !== undefined) usage.costUsd = costUsd;
+  }
+  return {
+    activity: value.activity,
+    tail: [...value.tail],
+    ...(Object.keys(usage).length > 0 ? { usage } : {}),
+  };
+}
+
+function normalizeUsage(value: unknown): string | Record<string, string | number> | undefined {
+  if (typeof value === "string") return value;
+  if (!isRecord(value)) return undefined;
+  const usage: Record<string, string | number> = {};
+  if (typeof value.text === "string") usage.text = value.text;
+  for (const key of [
+    "inputTokens",
+    "outputTokens",
+    "cacheReadTokens",
+    "cacheWriteTokens",
+    "totalTokens",
+    "tokens",
+    "costUsd",
+    "cost",
+  ]) {
+    const field = finiteNumber(value[key]);
+    if (field !== undefined) usage[key] = field;
+  }
+  return usage;
+}
+
+/** Copy validated renderer fields from persisted or extension-message data. */
+function normalizeSubagentRenderDetails(value: unknown): SubagentRenderDetails | undefined {
+  if (!isRecord(value)) return undefined;
+  const normalized: SubagentRenderDetails = {};
+
+  if (value.record === "subagent-completion") normalized.record = value.record;
+  if (
+    value.status === "running" ||
+    value.status === "completed" ||
+    value.status === "failed" ||
+    value.status === "stopped"
+  ) {
+    normalized.status = value.status;
+  }
+  if (value.outcome === "completed" || value.outcome === "failed" || value.outcome === "aborted") {
+    normalized.outcome = value.outcome;
+  }
+  if (value.delivery === "steer" || value.delivery === "resume") normalized.delivery = value.delivery;
+
+  if (typeof value.taskId === "string") normalized.taskId = value.taskId;
+  if (typeof value.agent === "string") normalized.agent = value.agent;
+  if (typeof value.agentId === "string") normalized.agentId = value.agentId;
+  if (typeof value.description === "string") normalized.description = value.description;
+  if (typeof value.transcriptPath === "string") normalized.transcriptPath = value.transcriptPath;
+  if (typeof value.lastActivity === "string") normalized.lastActivity = value.lastActivity;
+  if (typeof value.error === "string") normalized.error = value.error;
+  if (typeof value.finalText === "string") normalized.finalText = value.finalText;
+  if (typeof value.worktreePath === "string") normalized.worktreePath = value.worktreePath;
+  if (typeof value.note === "string") normalized.note = value.note;
+
+  const durationMs = finiteNumber(value.durationMs);
+  const settledAt = finiteNumber(value.settledAt);
+  if (durationMs !== undefined) normalized.durationMs = durationMs;
+  if (settledAt !== undefined) normalized.settledAt = settledAt;
+
+  if (typeof value.background === "boolean") normalized.background = value.background;
+  if (typeof value.cutOff === "boolean") normalized.cutOff = value.cutOff;
+  if (typeof value.userStopped === "boolean") normalized.userStopped = value.userStopped;
+  if (typeof value.resumable === "boolean") normalized.resumable = value.resumable;
+  if (typeof value.alreadyReported === "boolean") {
+    normalized.alreadyReported = value.alreadyReported;
+  }
+  if (typeof value.nested === "boolean") normalized.nested = value.nested;
+  if (typeof value.live === "boolean") normalized.live = value.live;
+  if (typeof value.resumed === "boolean") normalized.resumed = value.resumed;
+
+  const usage = normalizeUsage(value.usage);
+  if (usage !== undefined) normalized.usage = usage;
+  const diagnostics = normalizeDiagnostics(value.diagnostics);
+  if (diagnostics) normalized.diagnostics = diagnostics;
+  const progress = normalizeProgressSnapshot(value.subagentProgress);
+  if (progress) normalized.subagentProgress = progress;
+
+  return normalized;
+}
+
 /**
  * SECURITY: body render paths split on this, not on `\n` alone — a
  * model-controlled `\r` surviving into an emitted line would overprint the line
@@ -57,7 +220,7 @@ function sanitizeInline(text: string): string {
  * untouched. `undefined` when absent. `taskId` is registry-minted (`task-N`) but
  * sanitized anyway so the discipline is uniform.
  */
-function taskChip(details: Record<string, unknown>): string | undefined {
+function taskChip(details: SubagentRenderDetails): string | undefined {
   const taskId = typeof details.taskId === "string" ? sanitizeInline(details.taskId) : "";
   return taskId ? `Task(${taskId})` : undefined;
 }
@@ -67,7 +230,7 @@ function taskChip(details: Record<string, unknown>): string | undefined {
  * `isAgentId` (it is model-/file-adjacent metadata), so a malformed value never
  * reaches the terminal. `undefined` otherwise.
  */
-function agentIdOf(details: Record<string, unknown>): string | undefined {
+function agentIdOf(details: SubagentRenderDetails): string | undefined {
   return typeof details.agentId === "string" && isAgentId(details.agentId)
     ? details.agentId
     : undefined;
@@ -82,7 +245,7 @@ function agentIdOf(details: Record<string, unknown>): string | undefined {
  */
 function pushIdentitySubline(
   theme: unknown,
-  details: Record<string, unknown>,
+  details: SubagentRenderDetails,
   width: number,
   into: string[],
 ): void {
@@ -103,14 +266,14 @@ function pushIdentitySubline(
  * the transcript util) that the emitter in subagents.ts writes.
  */
 function forkDegradeLine(
-  details: Record<string, unknown>,
+  details: SubagentRenderDetails,
 ): { text: string; tone: string } | undefined {
   const diags = details.diagnostics;
   if (!Array.isArray(diags)) return undefined;
   for (const d of diags) {
-    const msg = d && typeof d === "object" ? (d as { message?: unknown }).message : undefined;
-    if (typeof msg === "string" && msg.startsWith(FORK_DEGRADE_PREFIX)) {
-      const severity = (d as { severity?: unknown }).severity;
+    const msg = d.message;
+    if (msg.startsWith(FORK_DEGRADE_PREFIX)) {
+      const severity = d.severity;
       // Tone: `warning` for a genuine can't-do (no transcript, SDK can't fork,
       // forkFrom threw); muted/calm for a chosen/expected opt-out (env `=0`).
       return { text: msg, tone: severity === "warning" ? "warning" : "muted" };
@@ -195,7 +358,7 @@ function outcomeBadgeLine(
 }
 
 /** `details.durationMs` formatted for display, or undefined when absent/invalid. */
-function durationOf(details: Record<string, unknown>): string | undefined {
+function durationOf(details: SubagentRenderDetails): string | undefined {
   const ms = details.durationMs;
   return typeof ms === "number" && Number.isFinite(ms) && ms >= 0
     ? formatElapsed(ms)
@@ -203,7 +366,7 @@ function durationOf(details: Record<string, unknown>): string | undefined {
 }
 
 /** The transcript-file basename (the human pointer to the on-disk transcript). */
-function transcriptBasename(details: Record<string, unknown>): string | undefined {
+function transcriptBasename(details: SubagentRenderDetails): string | undefined {
   const tp =
     typeof details.transcriptPath === "string" && details.transcriptPath
       ? sanitizeInline(details.transcriptPath)
@@ -244,8 +407,8 @@ function formatUsageBrief(usage: unknown): string | undefined {
  */
 function collapsedRecordLines(
   theme: unknown,
-  details: Record<string, unknown>,
-  outcome: string,
+  details: SubagentRenderDetails,
+  outcome: "completed" | "failed" | "aborted",
   chip: string | undefined,
   width: number,
 ): string[] {
@@ -293,8 +456,8 @@ function collapsedRecordLines(
  */
 function referenceRecordLines(
   theme: unknown,
-  details: Record<string, unknown>,
-  outcome: string,
+  details: SubagentRenderDetails,
+  outcome: "completed" | "failed" | "aborted",
   chip: string | undefined,
   width: number,
 ): string[] {
@@ -412,11 +575,11 @@ export function renderAgentCall(args: Record<string, unknown>, theme: unknown) {
  *    rendered only when present.
  */
 export function renderAgentResult(
-  result: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
+  result: { content?: Array<{ type: string; text: string }>; details?: SubagentRenderDetails },
   options: { expanded?: boolean; isPartial?: boolean },
   theme: unknown,
 ) {
-  const details = (result?.details ?? {}) as Record<string, unknown>;
+  const details: SubagentRenderDetails = result?.details ?? {};
   const contentText = (result?.content ?? [])
     .filter((c) => c && c.type === "text")
     .map((c) => String(c.text ?? ""))
@@ -426,7 +589,14 @@ export function renderAgentResult(
     render(width: number): string[] {
       const lines: string[] = [];
       if (isPartial) {
-        const snap = details.subagentProgress as ProgressSnapshot | undefined;
+        const candidate = details.subagentProgress;
+        const snap =
+          candidate &&
+          typeof candidate.activity === "string" &&
+          Array.isArray(candidate.tail) &&
+          candidate.tail.every((line) => typeof line === "string")
+            ? candidate
+            : undefined;
         // SECURITY: details.agent originates from the model-supplied subagent_type — sanitize.
         const agent = sanitizeInline(typeof details.agent === "string" ? details.agent : "") || "subagent";
         // A background live view leads with the Task chip + agent type;
@@ -624,24 +794,23 @@ export function renderSettlementRecord(
   options: { expanded?: boolean } | undefined,
   theme: unknown,
 ): { render(width: number): string[] } | undefined {
-  if (!details || typeof details !== "object") return undefined;
-  const d = details as Record<string, unknown>;
-  if (d.record !== "subagent-completion") return undefined;
-  if (d.nested === true) return undefined;
-  const finalText = typeof d.finalText === "string" ? d.finalText : "";
-  const outcome = typeof d.outcome === "string" ? d.outcome : "completed";
+  const normalized = normalizeSubagentRenderDetails(details);
+  if (normalized?.record !== "subagent-completion") return undefined;
+  if (normalized.nested === true) return undefined;
+  const finalText = normalized.finalText ?? "";
+  const outcome = normalized.outcome ?? "completed";
   // Compose the expanded body the way the TaskOutput display reads: reason +
   // partial output for a failure, the discard note for an abort, the verbatim
   // final text otherwise. renderAgentResult sanitizes it before display.
   let text = finalText;
   if (outcome === "failed") {
-    const err = typeof d.error === "string" && d.error ? d.error : "unknown error";
+    const err = normalized.error || "unknown error";
     text = finalText ? `${err}\n\nPartial output before the failure:\n${finalText}` : err;
   } else if (outcome === "aborted") {
     text = "The task was stopped before completing; its result was discarded.";
   }
   return renderAgentResult(
-    { content: [{ type: "text", text }], details: d },
+    { content: [{ type: "text", text }], details: normalized },
     // Normalize to an explicit boolean: expanded===false is the collapse key.
     { expanded: options?.expanded === true, isPartial: false },
     theme,
