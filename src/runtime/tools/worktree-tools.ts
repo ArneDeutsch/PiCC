@@ -37,10 +37,17 @@ export function createWorktreeTools(deps: {
       // `git worktree lock` leaks and blocks the project's own remove/prune.
       let releasedLine: string | undefined;
       let previousWorktreePath: string | undefined;
+      let previousKeepOutcome: "kept" | "keep-failed" | undefined;
+      let previousKeepError: string | undefined;
       if (previous !== undefined && path.resolve(previous) !== path.resolve(result.worktreePath)) {
-        await deps.worktrees.exit({ worktreePath: previous, action: "keep" });
+        const releaseResult = (await deps.worktrees.exit({ worktreePath: previous, action: "keep" })) as {
+          ok?: boolean;
+          error?: string;
+        };
         releasedLine = `Left previous worktree (kept, unlocked): ${previous}`;
         previousWorktreePath = previous;
+        previousKeepOutcome = releaseResult.ok === true ? "kept" : "keep-failed";
+        if (typeof releaseResult.error === "string") previousKeepError = releaseResult.error;
       }
       deps.cwdState.enterWorktree(result.worktreePath);
       const created = (result as { created?: boolean }).created ?? false;
@@ -67,7 +74,13 @@ export function createWorktreeTools(deps: {
           created,
           seeded,
           previousUnlockAttempted: previousWorktreePath !== undefined,
-          ...(previousWorktreePath !== undefined ? { previousWorktreePath } : {}),
+          ...(previousWorktreePath !== undefined
+            ? {
+                previousWorktreePath,
+                previousKeepOutcome,
+                ...(previousKeepError !== undefined ? { previousKeepError } : {}),
+              }
+            : {}),
         },
       };
     },
@@ -113,7 +126,7 @@ export function createWorktreeTools(deps: {
               ? `Exited worktree; removal was blocked (Windows file lock?) — it will be reaped later. Working directory restored.`
               : `Exited worktree, but removal FAILED${result.error ? ` (${result.error})` : ""} — ${worktreePath} was kept. Working directory restored.`;
       const outcome = params.action === "keep"
-        ? "kept"
+        ? result.ok === true ? "kept" : "keep-failed"
         : result.removed === true
           ? "removed"
           : result.orphaned === true

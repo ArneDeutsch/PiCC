@@ -118,7 +118,34 @@ describe("EnterWorktree tool: previous-worktree handling", () => {
       seeded: [],
       previousUnlockAttempted: true,
       previousWorktreePath: h.wtPath("wt-a"),
+      previousKeepOutcome: "kept",
     });
+  });
+
+  it("preserves canonical Enter prose but exposes a failed previous keep for presentation", async () => {
+    const h = makeHarness({
+      exitResult: { ok: false, removed: false, orphaned: false, error: "unlock denied", diagnostics: [] },
+    });
+    await h.enter.execute("t1", { name: "wt-a" });
+    const res = await h.enter.execute("t2", { name: "wt-b" });
+
+    expect(text(res)).toBe([
+      `Created and entered worktree: ${h.wtPath("wt-b")}`,
+      "Branch: worktree-wt-b",
+      `Left previous worktree (kept, unlocked): ${h.wtPath("wt-a")}`,
+      "The session working directory is now inside the worktree; all relative paths and shell commands run there.",
+    ].join("\n"));
+    expect(res.details).toEqual({
+      worktreePath: h.wtPath("wt-b"),
+      branch: "worktree-wt-b",
+      created: true,
+      seeded: [],
+      previousUnlockAttempted: true,
+      previousWorktreePath: h.wtPath("wt-a"),
+      previousKeepOutcome: "keep-failed",
+      previousKeepError: "unlock denied",
+    });
+    expect(h.cwdState.getWorktree()).toBe(h.wtPath("wt-b"));
   });
 
   it("does not release anything when re-entering the same worktree", async () => {
@@ -224,6 +251,28 @@ describe("ExitWorktree tool: truthful reporting", () => {
       diagnostics: [],
       worktreePath: h.wtPath("wt-a"),
       outcome: "kept",
+      restorePath: h.base,
+    });
+  });
+
+  it("preserves canonical keep prose but exposes manager keep failure metadata", async () => {
+    const h = makeHarness({
+      exitResult: { ok: false, removed: false, orphaned: false, error: "unlock denied", diagnostics: [] },
+    });
+    await h.enter.execute("t1", { name: "wt-a" });
+    const res = await h.exit.execute("t2", { action: "keep" });
+
+    expect(text(res)).toBe(
+      `Exited worktree (kept): ${h.wtPath("wt-a")}. Working directory restored to ${h.base}.`,
+    );
+    expect(res.details).toEqual({
+      ok: false,
+      removed: false,
+      orphaned: false,
+      error: "unlock denied",
+      diagnostics: [],
+      worktreePath: h.wtPath("wt-a"),
+      outcome: "keep-failed",
       restorePath: h.base,
     });
   });

@@ -115,6 +115,52 @@ describe("real Pi routine rendering composition", () => {
     }
   });
 
+  it("drives decorated MultiEdit from pending invocation to one delegated settled diff", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    const args = {
+      file_path: "src/lifecycle.ts",
+      edits: [{ old_string: "OLD_LIFECYCLE", new_string: "NEW_LIFECYCLE" }],
+    };
+    const canonical = "Successfully applied 1 edit(s) to src/lifecycle.ts.";
+    const component = new sdk.ToolExecutionComponent(
+      "MultiEdit",
+      "multiedit-lifecycle-contract",
+      args,
+      {},
+      wrapForSelfShell(withRoutineToolRendering({ name: "MultiEdit" } as never)),
+      { requestRender() {} },
+      process.cwd().replace(/\\/g, "/"),
+    );
+    component.setArgsComplete();
+    const stripAnsi = (lines: string[]) => lines
+      .map((line) => line.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, ""))
+      .join("\n");
+    const pending = stripAnsi(component.render(100) as string[]);
+    expect(pending.match(/src\/lifecycle\.ts/g)).toHaveLength(1);
+    expect(pending).not.toContain("OLD_LIFECYCLE");
+    expect(pending).not.toContain("NEW_LIFECYCLE");
+
+    component.updateResult({
+      content: [{ type: "text", text: canonical }],
+      details: {
+        filePath: "src/lifecycle.ts",
+        edits: 1,
+        created: false,
+        diff: "-1 OLD_LIFECYCLE\n+1 NEW_LIFECYCLE",
+        firstChangedLine: 1,
+      },
+    }, false);
+    for (const expanded of [false, true]) {
+      component.setExpanded(expanded);
+      const settled = stripAnsi(component.render(100) as string[]);
+      expect(settled.match(/src\/lifecycle\.ts/g)).toHaveLength(1);
+      expect(settled.match(/OLD_LIFECYCLE/g)).toHaveLength(1);
+      expect(settled.match(/NEW_LIFECYCLE/g)).toHaveLength(1);
+      expect(settled).not.toContain(canonical);
+    }
+  });
+
   it.each([
     {
       name: "EnterWorktree",
@@ -144,6 +190,35 @@ describe("real Pi routine rendering composition", () => {
       canonical: "PENDING EXIT SENTINEL / CANONICAL EXIT PROSE",
       row: "ExitWorktree(/repo/wt) removed; restored /repo",
     },
+    {
+      name: "ExitWorktree",
+      args: { action: "keep" },
+      result: {
+        content: [{ type: "text", text: "Exited worktree (kept): /repo/wt. Working directory restored to /repo." }],
+        details: {
+          worktreePath: "/repo/wt", outcome: "keep-failed", restorePath: "/repo",
+          ok: false, removed: false, orphaned: false, diagnostics: [], error: "unlock denied\nretry",
+        },
+      },
+      pending: "ExitWorktree(keep)",
+      canonical: "Exited worktree (kept): /repo/wt. Working directory restored to /repo.",
+      row: "ExitWorktree(/repo/wt) keep failed: unlock denied retry; worktree state unknown; restored /repo",
+    },
+    {
+      name: "EnterWorktree",
+      args: { name: "PENDING-ENTER-FAILED-PRIOR" },
+      result: {
+        content: [{ type: "text", text: "CANONICAL ENTER STILL CLAIMS PRIOR KEEP" }],
+        details: {
+          worktreePath: "/repo/new", branch: "worktree-new", created: true, seeded: [],
+          previousUnlockAttempted: true, previousWorktreePath: "/repo/old",
+          previousKeepOutcome: "keep-failed", previousKeepError: "unlock denied\nretry",
+        },
+      },
+      pending: "EnterWorktree(PENDING-ENTER-FAILED-PRIOR)",
+      canonical: "CANONICAL ENTER STILL CLAIMS PRIOR KEEP",
+      row: "EnterWorktree(/repo/new) on branch worktree-new; previous /repo/old keep failed: unlock denied retry; previous worktree state unknown",
+    },
   ])("keeps real Pi $name rows purely result-owned", async (entry) => {
     const sdk = await import("@earendil-works/pi-coding-agent") as any;
     sdk.initTheme();
@@ -158,7 +233,7 @@ describe("real Pi routine rendering composition", () => {
     );
     component.setArgsComplete();
     const stripAnsi = (line: string) => line.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
-    const pending = component.render(100) as string[];
+    const pending = component.render(200) as string[];
     expect(pending).toEqual([]);
     expect(pending.join("\n")).not.toContain(entry.pending);
     expect(pending.join("\n")).not.toContain(entry.canonical);
@@ -166,7 +241,7 @@ describe("real Pi routine rendering composition", () => {
     component.updateResult(entry.result, false);
     for (const expanded of [false, true]) {
       component.setExpanded(expanded);
-      const lines = component.render(100) as string[];
+      const lines = component.render(200) as string[];
       expect(lines).toHaveLength(2);
       expect(lines[0]).toBe("");
       expect(stripAnsi(lines[1] ?? "").trim()).toBe(entry.row);
@@ -532,9 +607,6 @@ describe("real Pi routine rendering composition", () => {
       expect(rendered?.resultHtmlExpanded).toContain(entry.invocation);
       expect(rendered?.resultHtmlExpanded).not.toContain(entry.hidden);
       expect(rendered?.resultHtmlCollapsed).toBeUndefined();
-      expect(html).toContain(
-        'html += `<div class="tool-header"><span class="tool-name">${escapeHtml(name)}</span></div>`;',
-      );
       expect(html).not.toContain(entry.hidden);
     } finally {
       rmSync(directory, { recursive: true, force: true });

@@ -871,6 +871,7 @@ describe("routine tool rendering decorator", () => {
         {
           worktreePath: "/repo/wt", branch: "worktree-a", created: true,
           seeded: [], previousUnlockAttempted: true, previousWorktreePath: "/repo/old",
+          previousKeepOutcome: "kept",
         },
         "EnterWorktree(/repo/wt) on branch worktree-a; previous /repo/old kept; unlock attempted",
       ],
@@ -879,14 +880,33 @@ describe("routine tool rendering decorator", () => {
         {
           worktreePath: "/repo/wt", branch: "worktree-a", created: true,
           seeded: ["a", "b"], previousUnlockAttempted: true, previousWorktreePath: "/repo/old",
+          previousKeepOutcome: "kept",
         },
         "EnterWorktree(/repo/wt) on branch worktree-a; seeded 2 files; previous /repo/old kept; unlock attempted",
+      ],
+      [
+        { name: "a" },
+        {
+          worktreePath: "/repo/wt", branch: "worktree-a", created: true,
+          seeded: [], previousUnlockAttempted: true, previousWorktreePath: "/repo/old",
+          previousKeepOutcome: "keep-failed", previousKeepError: "unlock denied",
+        },
+        "EnterWorktree(/repo/wt) on branch worktree-a; previous /repo/old keep failed: unlock denied; previous worktree state unknown",
+      ],
+      [
+        { name: "a" },
+        {
+          worktreePath: "/repo/wt", branch: "worktree-a", created: true,
+          seeded: [], previousUnlockAttempted: true, previousWorktreePath: "/repo/old",
+          previousKeepOutcome: "keep-failed",
+        },
+        "EnterWorktree(/repo/wt) on branch worktree-a; previous /repo/old keep failed; previous worktree state unknown",
       ],
     ] as const;
     for (const [args, details, expected] of enterCases) {
       const result = canonical("CANONICAL ENTER BODY", details);
-      expect(renderResult(enter, args, result)).toEqual([expected]);
-      expect(renderResult(enter, args, result, { expanded: true })).toEqual([expected]);
+      expect(renderResult(enter, args, result, { width: 240 })).toEqual([expected]);
+      expect(renderResult(enter, args, result, { expanded: true, width: 240 })).toEqual([expected]);
       expect(result.content[0]?.text).toBe("CANONICAL ENTER BODY");
     }
 
@@ -895,6 +915,8 @@ describe("routine tool rendering decorator", () => {
     const exitCases = [
       [{ outcome: "none", restorePath: "/repo" }, "ExitWorktree(no active worktree); already at /repo"],
       [{ ...base, outcome: "kept", ok: true, removed: false, orphaned: false }, "ExitWorktree(/repo/wt) kept; restored /repo"],
+      [{ ...base, outcome: "keep-failed", ok: false, removed: false, orphaned: false, error: "unlock denied" }, "ExitWorktree(/repo/wt) keep failed: unlock denied; worktree state unknown; restored /repo"],
+      [{ ...base, outcome: "keep-failed", ok: false, removed: false, orphaned: false }, "ExitWorktree(/repo/wt) keep failed; worktree state unknown; restored /repo"],
       [{ ...base, outcome: "removed", ok: true, removed: true, orphaned: false }, "ExitWorktree(/repo/wt) removed; restored /repo"],
       [{ ...base, outcome: "deferred-removal", ok: true, removed: false, orphaned: true }, "ExitWorktree(/repo/wt) removal deferred; restored /repo"],
       [{ ...base, outcome: "removal-failed", ok: false, removed: false, orphaned: false, error: "boom" }, "ExitWorktree(/repo/wt) removal failed: boom; worktree state unknown; restored /repo"],
@@ -902,8 +924,8 @@ describe("routine tool rendering decorator", () => {
     ] as const;
     for (const [details, expected] of exitCases) {
       const result = canonical("CANONICAL EXIT BODY", details);
-      expect(renderResult(exit, { action: "remove" }, result)).toEqual([expected]);
-      expect(renderResult(exit, { action: "remove" }, result, { expanded: true })).toEqual([expected]);
+      expect(renderResult(exit, { action: "remove" }, result, { width: 240 })).toEqual([expected]);
+      expect(renderResult(exit, { action: "remove" }, result, { expanded: true, width: 240 })).toEqual([expected]);
       expect(result.content[0]?.text).toBe("CANONICAL EXIT BODY");
     }
   });
@@ -923,6 +945,7 @@ describe("routine tool rendering decorator", () => {
         seeded: ["a"],
         previousUnlockAttempted: true,
         previousWorktreePath: "/old/" + "wide界🙂".repeat(20),
+        previousKeepOutcome: "kept",
       },
     };
     for (const width of [0, 1, 2, 40, 100]) {

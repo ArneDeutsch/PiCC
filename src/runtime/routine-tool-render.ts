@@ -476,8 +476,10 @@ function recognizeEnterWorktree(
   if (!resultSnapshot || ("isError" in resultSnapshot && resultSnapshot.isError !== false) ||
     !oneTextContent(resultSnapshot.content)) return undefined;
   const baseKeys = ["worktreePath", "branch", "created", "seeded", "previousUnlockAttempted"];
+  const previousKeys = [...baseKeys, "previousWorktreePath", "previousKeepOutcome"];
   const details = plainOwnData(resultSnapshot.details, baseKeys) ??
-    plainOwnData(resultSnapshot.details, [...baseKeys, "previousWorktreePath"]);
+    plainOwnData(resultSnapshot.details, previousKeys) ??
+    plainOwnData(resultSnapshot.details, [...previousKeys, "previousKeepError"]);
   if (!details || typeof details.worktreePath !== "string" || typeof details.branch !== "string" ||
     typeof details.created !== "boolean" ||
     !exactStringArray(details.seeded, MAX_WORKTREE_SEEDED_FILES) ||
@@ -496,12 +498,21 @@ function recognizeEnterWorktree(
     }
   }
   const hasPrevious = "previousWorktreePath" in details;
-  if (hasPrevious !== details.previousUnlockAttempted ||
-    (hasPrevious && typeof details.previousWorktreePath !== "string")) return undefined;
+  const hasPreviousOutcome = "previousKeepOutcome" in details;
+  const hasPreviousError = "previousKeepError" in details;
+  if (hasPrevious !== details.previousUnlockAttempted || hasPrevious !== hasPreviousOutcome ||
+    (hasPrevious && typeof details.previousWorktreePath !== "string") ||
+    (hasPreviousOutcome && details.previousKeepOutcome !== "kept" &&
+      details.previousKeepOutcome !== "keep-failed") ||
+    (hasPreviousError && (details.previousKeepOutcome !== "keep-failed" ||
+      typeof details.previousKeepError !== "string"))) return undefined;
   const worktreePath = sanitizeText(details.worktreePath, true);
   const branch = sanitizeText(details.branch, true);
   const previousPath = hasPrevious ? sanitizeText(details.previousWorktreePath, true) : undefined;
-  if (!worktreePath || !branch || (hasPrevious && !previousPath)) return undefined;
+  const previousError = hasPreviousError ? sanitizeText(details.previousKeepError, true) : undefined;
+  if (!worktreePath || !branch || (hasPrevious && !previousPath) || (hasPreviousError && !previousError)) {
+    return undefined;
+  }
   const seededCount = ownData(details.seeded, "length") as number;
   if (!details.created && seededCount !== 0) return undefined;
   const literals = ["EnterWorktree(", ") on branch "];
@@ -509,8 +520,16 @@ function recognizeEnterWorktree(
   let suffix = seededCount > 0 ? `; seeded ${seededCount} files` : "";
   if (previousPath !== undefined) {
     suffix += "; previous ";
-    literals.push(suffix, " kept; unlock attempted");
-    fields.push(previousPath);
+    if (details.previousKeepOutcome === "kept") {
+      literals.push(suffix, " kept; unlock attempted");
+      fields.push(previousPath);
+    } else if (previousError !== undefined) {
+      literals.push(suffix, " keep failed: ", "; previous worktree state unknown");
+      fields.push(previousPath, previousError);
+    } else {
+      literals.push(suffix, " keep failed; previous worktree state unknown");
+      fields.push(previousPath);
+    }
   } else {
     literals.push(suffix);
   }
@@ -551,6 +570,24 @@ function recognizeExitWorktree(
     if (details.ok !== true || details.removed || details.orphaned || "error" in details) return undefined;
     return {
       literals: ["ExitWorktree(", ") kept; restored ", ""],
+      fields: [worktreePath, restorePath],
+    };
+  }
+  if (details.outcome === "keep-failed") {
+    if (details.ok !== false || details.removed || details.orphaned) return undefined;
+    if ("error" in details) {
+      const error = sanitizeText(details.error, true);
+      if (typeof details.error !== "string" || !error) return undefined;
+      return {
+        literals: [
+          "ExitWorktree(", ") keep failed: ",
+          "; worktree state unknown; restored ", "",
+        ],
+        fields: [worktreePath, error, restorePath],
+      };
+    }
+    return {
+      literals: ["ExitWorktree(", ") keep failed; worktree state unknown; restored ", ""],
       fields: [worktreePath, restorePath],
     };
   }
@@ -753,7 +790,6 @@ interface MultiEditSnapshot {
   diff: string;
   firstChangedLine: number | undefined;
   editCount: number;
-  created: boolean;
   canonicalText: string;
 }
 
@@ -840,7 +876,6 @@ function recognizeMultiEditSuccess(
     diff,
     firstChangedLine: firstChangedLine as number | undefined,
     editCount: details.edits,
-    created: details.created,
     canonicalText: details.created
       ? `Created ${path} with ${details.edits} edit(s).`
       : `Successfully applied ${details.edits} edit(s) to ${path}.`,
