@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -52,6 +53,8 @@ export interface CapturedRequest {
   model?: string;
   messages: Array<Record<string, unknown>>;
   tools?: Array<Record<string, unknown>>;
+  /** Whether the request supplied the stored credential required by its model. */
+  authorizationValid: boolean;
   /** Full parsed request body. */
   body: Record<string, unknown>;
 }
@@ -171,7 +174,10 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
-export async function startMockModel(script: Turn[]): Promise<MockModelServer> {
+export async function startMockModel(
+  script: Turn[],
+  authorizationDigestsByModel: ReadonlyMap<string, string>,
+): Promise<MockModelServer> {
   const requests: CapturedRequest[] = [];
   const consumed = script.map(() => false);
 
@@ -206,17 +212,31 @@ export async function startMockModel(script: Turn[]): Promise<MockModelServer> {
     }
 
     const requestIndex = requests.length;
+    const model = typeof body.model === "string" ? body.model : undefined;
+    const expectedDigest =
+      model === undefined ? undefined : authorizationDigestsByModel.get(model);
+    const authorizationValid =
+      expectedDigest !== undefined &&
+      typeof req.headers.authorization === "string" &&
+      createHash("sha256").update(req.headers.authorization).digest("hex") === expectedDigest;
     const captured: CapturedRequest = {
       path,
-      model: typeof body.model === "string" ? body.model : undefined,
+      model,
       messages: Array.isArray(body.messages) ? (body.messages as Array<Record<string, unknown>>) : [],
       tools: Array.isArray(body.tools) ? (body.tools as Array<Record<string, unknown>>) : undefined,
+      authorizationValid,
       body,
     };
     requests.push(captured);
 
+    if (!authorizationValid) {
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "mock: authorization rejected" } }));
+      return;
+    }
+
     const turn = nextTurn(captured);
-    const model = typeof body.model === "string" ? body.model : "mock-1";
+    const responseModel = model ?? "mock-1";
 
     if (turn.error) {
       // OpenAI-style error body; applies to streaming and non-streaming requests
@@ -236,7 +256,7 @@ export async function startMockModel(script: Turn[]): Promise<MockModelServer> {
 
     if (body.stream === false) {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(buildNonStreamingResponse(turn, model, requestIndex)));
+      res.end(JSON.stringify(buildNonStreamingResponse(turn, responseModel, requestIndex)));
       return;
     }
 
@@ -246,7 +266,7 @@ export async function startMockModel(script: Turn[]): Promise<MockModelServer> {
       "cache-control": "no-cache",
       connection: "keep-alive",
     });
-    for (const chunk of buildChunks(turn, model, requestIndex)) {
+    for (const chunk of buildChunks(turn, responseModel, requestIndex)) {
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     }
     res.write("data: [DONE]\n\n");
