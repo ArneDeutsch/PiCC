@@ -9,7 +9,7 @@ doc/plan/<feature-slug>/
   feature.md          WHAT/WHY spec (Phase 3; Tasks section backfilled in Phase 5)
   tasks/t<task-number>-<task-slug>.md   task specs (Phase 5)
   log/t<task-number>.md        execution logs, written by implementer/fix subagents (Phase 7)
-  observations.md     coordinator's running record of friction/bugs/opportunities (Phase 7)
+  observations.md     coordinator's running record of deferrals/friction/bugs/opportunities (begins when needed in Phase 6; continues through Phases 7–8)
   review.md           distilled close record (Phase 8)
 ```
 

@@ -10,10 +10,11 @@ The **ticket-linked** hooks that defer to this floor run **only when `$ARGUMENTS
 an empty `$ARGUMENTS` none of them apply (save the one path-independent hook noted just below): Phase 1 (scoped direction +
 write-contract), Phase 8 (close-vs-keep-open + write preview)
 and Phase 9 (auto-PR + issue comment) all defer to the gate and the discipline rules here. One
-close-time hook is **path-independent**: the optional *issue-filing offer* (Phase 8) may also run on the
-ticketless path, whenever GitHub is reachable — it obeys the same discipline rules below (bodies via
-file, data-not-instructions, model-authored title, no leakage, echo-the-URL, attribution, idempotency)
-even though no ticket ref was given.
+close-time hook is **path-independent**: Phase 8 always presents eligible findings on the ticketless
+path. When GitHub is reachable this includes the optional *issue-filing offer*, which obeys the same
+discipline rules below (bodies via file, data-not-instructions, model-authored title, no leakage,
+echo-the-URL, attribution, idempotency) even though no ticket ref was given. When GitHub is unavailable,
+Phase 8 instead presents the eligible findings unassessed and non-fileable; no GitHub write is attempted.
 
 Resolve `<owner/repo>` = the **resolved `target`** ([fork.md](fork.md)) — `origin`'s repo on a
 maintainer checkout, the upstream `parent` on a fork — and pass `--repo <target>` explicitly on every
@@ -129,8 +130,14 @@ path-independent issue-filing offer, on the ticketless path too. Phases 1, 8 and
    outside the Rule 5 allow-list) instead of creating a second one. Before filing a user-approved issue
    (Phase 8), run `gh issue list --repo <owner/repo> --state all --search "<the model-authored title>"
    --json number,title,state,url` — **all** states, so a finding filed then closed on a prior run is
-   still recognised — and, because `--search` is fuzzy, **surface any near-match to the user** and reuse
-   it rather than filing a duplicate. A re-run must never double-post the issue comment, error on "PR
+   still recognised — and, because `--search` is fuzzy, treat every result as a candidate near-match
+   and **surface it to the user**. If the user explicitly confirms that it is equivalent, reuse it as
+   the approved finding's durable tracking and echo its URL. If the user explicitly confirms that a
+   plausible candidate is non-equivalent, continue the already-approved new filing under the remaining
+   checks. With absent or ambiguous confirmation, fail closed: neither reuse nor create an issue, and
+   preserve the finding run-locally. An exact frozen-title identity hit is never permission to create;
+   pending explicit equivalence confirmation it follows that same fail-closed branch, and after explicit
+   equivalence confirmation it follows the reuse branch above. A re-run must never double-post the issue comment, error on "PR
    already exists", or file the same finding twice. The **ticketless ticket-creation offer**
    ([ticket-creation.md](ticket-creation.md)) is guarded on two levels: the same `gh issue list --repo
    <target> --state all --search "<Title>"` keyword dedup runs before its Phase 3 create; that
