@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import http from "node:http";
 import type { AddressInfo, Socket } from "node:net";
 import { deferred, type Deferred } from "./async.js";
@@ -63,6 +64,9 @@ export interface CapturedRequest {
   model?: string;
   messages: Array<Record<string, unknown>>;
   tools?: Array<Record<string, unknown>>;
+  /** Whether the request supplied the stored credential required by its model. */
+  authorizationValid: boolean;
+  /** Full parsed request body. */
   body: Record<string, unknown>;
   requestKind: RequestKind;
   sessionKind: SessionKind;
@@ -208,8 +212,15 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 
 export async function startMockModel(
   script: Turn[],
-  classifierOptions: RequestClassifierOptions = {},
+  classifierOptionsOrAuthorization: RequestClassifierOptions | ReadonlyMap<string, string> = {},
+  explicitAuthorizationDigests?: ReadonlyMap<string, string>,
 ): Promise<MockModelServer> {
+  const classifierOptions: RequestClassifierOptions = classifierOptionsOrAuthorization instanceof Map
+    ? {}
+    : classifierOptionsOrAuthorization as RequestClassifierOptions;
+  const authorizationDigestsByModel = classifierOptionsOrAuthorization instanceof Map
+    ? classifierOptionsOrAuthorization
+    : explicitAuthorizationDigests;
   const requests: CapturedRequest[] = [];
   const consumed = script.map(() => false);
   const waiters = new Set<{
@@ -263,16 +274,34 @@ export async function startMockModel(
       res.end(JSON.stringify({ error: { message: `mock: bad JSON body: ${(err as Error).message}` } }));
       return;
     }
+
+    const requestIndex = requests.length;
+    const model = typeof body.model === "string" ? body.model : undefined;
+    const expectedDigest =
+      model === undefined ? undefined : authorizationDigestsByModel?.get(model);
+    const authorizationValid = authorizationDigestsByModel === undefined || (
+      expectedDigest !== undefined &&
+      typeof req.headers.authorization === "string" &&
+      createHash("sha256").update(req.headers.authorization).digest("hex") === expectedDigest
+    );
     const base = {
       path: requestPath,
-      model: typeof body.model === "string" ? body.model : undefined,
+      model,
       messages: Array.isArray(body.messages) ? body.messages as Array<Record<string, unknown>> : [],
       tools: Array.isArray(body.tools) ? body.tools as Array<Record<string, unknown>> : undefined,
+      authorizationValid,
       body,
     };
     const captured: CapturedRequest = { ...base, ...classifyRequest(base, requests, classifierOptions) };
     requests.push(captured);
     publish(captured);
+
+    if (!authorizationValid) {
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "mock: authorization rejected" } }));
+      return;
+    }
+
     const turn = nextTurn(captured);
     if (turn.gate) {
       const gate = turn.gate as InternalResponseGate;
@@ -287,8 +316,8 @@ export async function startMockModel(
       }
       if (res.destroyed) return;
     }
-    const requestIndex = requests.length - 1;
-    const model = typeof body.model === "string" ? body.model : "mock-1";
+    const responseModel = model ?? "mock-1";
+
     if (turn.error) {
       res.writeHead(turn.error.status, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: turn.error.message ?? `mock: scripted error (${turn.error.status})`, type: "mock_scripted_error", code: turn.error.status } }));
@@ -296,11 +325,19 @@ export async function startMockModel(
     }
     if (body.stream === false) {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(buildNonStreamingResponse(turn, model, requestIndex)));
+      res.end(JSON.stringify(buildNonStreamingResponse(turn, responseModel, requestIndex)));
       return;
     }
-    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
-    for (const chunk of buildChunks(turn, model, requestIndex)) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+
+    // SSE streaming (Pi always sends stream: true).
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    for (const chunk of buildChunks(turn, responseModel, requestIndex)) {
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    }
     res.write("data: [DONE]\n\n");
     res.end();
   });

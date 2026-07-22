@@ -251,7 +251,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         prompt: "run exhausted compaction",
       });
 
-      // Pi 0.80.6 owns print exit status and currently maps this exhausted
+      // Pi 0.80.10 owns print exit status and currently maps this exhausted
       // terminal API-error boundary to 1; PiCC only guarantees settlement.
       expect(result.code).toBe(1);
       expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction", "compaction", "compaction"]);

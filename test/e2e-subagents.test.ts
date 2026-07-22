@@ -11,6 +11,7 @@ import {
   createE2ELive,
   systemText,
   TEST_TIMEOUT_MS,
+  toolNames,
   toolResultText,
   writeCheckpointConfig,
   CLI_PATH,
@@ -154,6 +155,90 @@ describe.skipIf(cliMissing)(
           event.type === "message_end" && event.message?.role === "assistant" &&
           JSON.stringify(event.message.content).includes("PARENT_RECEIVED_CHILD_T05"));
         expect(terminalParentMessages).toHaveLength(1);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    it(
+      "resolves an explicit child model synchronously with eager parent/child tools and no stored-credential leak",
+      async () => {
+        const defaultCredentialCanary = "synthetic-default-credential-canary-e2e";
+        const childCredentialCanary = "synthetic-child-credential-canary-e2e";
+        const credentialCanaries = [defaultCredentialCanary, childCredentialCanary];
+        const childProvider = "mock-child";
+        const childModel = "mock-2";
+        const isParent = (request: CapturedRequest) => request.model === "mock-1";
+        const isChild = (request: CapturedRequest) => request.model === childModel;
+        const result = await runPi({
+          persistSession: true,
+          defaultModelCredential: defaultCredentialCanary,
+          secondaryModel: {
+            provider: childProvider,
+            id: childModel,
+            credential: childCredentialCanary,
+          },
+          script: [
+            {
+              when: isParent,
+              toolCalls: [
+                {
+                  name: "Agent",
+                  args: {
+                    subagent_type: "general-purpose",
+                    prompt: "verify the explicit model boundary",
+                    model: `${childProvider}/${childModel}`,
+                    run_in_background: false,
+                  },
+                },
+              ],
+            },
+            { when: isChild, text: "EXPLICIT-CHILD-MODEL-DONE" },
+            { when: isParent, text: "explicit child model verified" },
+          ],
+          prompt: "dispatch on the explicit child model",
+        });
+
+        expect(result.code).toBe(0);
+        const parentFirst = result.requests.find(isParent);
+        const childFirst = result.requests.find(isChild);
+        expect(parentFirst, "the default model must receive the parent's first request").toBeDefined();
+        expect(childFirst, "the explicit model must receive the child's first request").toBeDefined();
+
+        const eagerParentTools = [
+          "read", "write", "edit", "bash", "grep", "find", "ls", "Grep", "Glob", "MultiEdit", "WebFetch", "WebSearch",
+          "Agent", "Task", "SendMessage", "Skill", "SlashCommand",
+          "EnterWorktree", "ExitWorktree", "TaskCreate", "TaskUpdate",
+          "TaskList", "TaskGet", "TodoWrite", "TaskOutput", "TaskStop",
+          "NotebookRead", "NotebookEdit", "AskUserQuestion", "ExitPlanMode",
+          "EnterPlanMode", "Artifact", "computer", "LSP", "BashOutput",
+          "KillShell", "KillBash",
+        ];
+        const eagerChildTools = eagerParentTools.filter(
+          (name) => !["Agent", "Task", "SendMessage"].includes(name),
+        );
+        expect(new Set(toolNames(parentFirst!))).toEqual(new Set(eagerParentTools));
+        expect(new Set(toolNames(childFirst!))).toEqual(new Set(eagerChildTools));
+
+        const transcriptText: string[] = [];
+        const collectTranscripts = (dir: string) => {
+          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) collectTranscripts(full);
+            else if (entry.name.endsWith(".jsonl")) transcriptText.push(fs.readFileSync(full, "utf8"));
+          }
+        };
+        collectTranscripts(path.join(result.agentDir, "sessions"));
+        const persistedTranscripts = transcriptText.join("\n");
+        for (const credentialCanary of credentialCanaries) {
+          expect(result.stdout).not.toContain(credentialCanary);
+          expect(result.stderr).not.toContain(credentialCanary);
+          expect(persistedTranscripts).not.toContain(credentialCanary);
+          for (const request of result.requests) {
+            expect(request.authorizationValid).toBe(true);
+            expect(toolResultText(request)).not.toContain(credentialCanary);
+            expect(JSON.stringify(request.body)).not.toContain(credentialCanary);
+          }
+        }
       },
       TEST_TIMEOUT_MS,
     );

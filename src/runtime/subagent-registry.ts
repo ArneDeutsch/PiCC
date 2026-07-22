@@ -1,8 +1,11 @@
 import { isAgentId } from "../util/subagent-transcripts.js";
 import {
+  assistantTextFingerprint,
   sanitizeLine,
   sanitizeProgressText,
+  scalarSafeText,
   type ProgressSnapshot,
+  type SubagentDetailEntry,
 } from "./subagent-progress.js";
 
 /**
@@ -72,8 +75,8 @@ export type SubagentOutcome = "completed" | "failed" | "aborted";
  * model conversation text: they exist for the status panel's drill-down and
  * must NEVER be interpolated into error messages, thrown strings, or logging.
  */
-const PROMPT_CAP = 4096;
-const FINAL_TEXT_CAP = 16384;
+export const SUBAGENT_PROMPT_CAP = 4096;
+export const SUBAGENT_FINAL_TEXT_CAP = 16_384;
 /** Single-line cap for the stored Agent-tool `description` label. */
 const DESCRIPTION_CAP = 120;
 
@@ -108,9 +111,12 @@ function validAgentColor(color: string | undefined): string | undefined {
  */
 function boundedContent(text: string | undefined, cap: number): string | undefined {
   if (text === undefined) return undefined;
-  const clean = sanitizeProgressText(text);
+  const clean = scalarSafeText(sanitizeProgressText(text.slice(0, cap + 1)));
   if (!clean.trim()) return undefined;
-  return clean.length > cap ? `${clean.slice(0, cap)}…` : clean;
+  if (text.length <= cap && clean.length <= cap) return clean;
+  let prefix = clean.slice(0, cap);
+  if (/[\uD800-\uDBFF]$/u.test(prefix)) prefix = prefix.slice(0, -1);
+  return `${prefix}…`;
 }
 
 /** Single-line description label sanitized and capped at capture. */
@@ -205,12 +211,11 @@ export interface SubagentRegistryRecord {
    */
   progress?: ProgressSnapshot;
   /**
-   * Enlarged bounded transcript buffer for the panel's drill-down view,
-   * updated beside `progress`. A PARALLEL field, deliberately not on the
-   * snapshot, so it never rides `details.subagentProgress` emissions.
-   * Sanitized and capped by the condenser at capture.
+   * Structured, typed live detail events for the selected-agent view. Entries
+   * are display-only, sanitized and bounded by the condenser, then copied here
+   * so the registry remains the panel's sole ownership boundary.
    */
-  fullTail?: string[];
+  detailLog?: SubagentDetailEntry[];
   /**
    * USER-initiated stop marker: set only by `markUserStopped` (a panel stop
    * action), NEVER by a model `TaskStop`, and never cleared by `register()` or
@@ -313,7 +318,7 @@ export class SubagentRegistry {
       // user stop is permanent and register() never clears it.
       existing.parentAgentId ??= input.parentAgentId;
       existing.description ??= boundedDescription(input.description);
-      existing.prompt ??= boundedContent(input.prompt, PROMPT_CAP);
+      existing.prompt ??= boundedContent(input.prompt, SUBAGENT_PROMPT_CAP);
       existing.color ??= validAgentColor(input.color);
       this.notifyChange();
       return existing;
@@ -334,7 +339,7 @@ export class SubagentRegistry {
       parentAgentId: input.parentAgentId,
       description: boundedDescription(input.description),
       startedAt: Date.now(),
-      prompt: boundedContent(input.prompt, PROMPT_CAP),
+      prompt: boundedContent(input.prompt, SUBAGENT_PROMPT_CAP),
       color: validAgentColor(input.color),
     };
     this.records.set(input.agentId, record);
@@ -358,18 +363,28 @@ export class SubagentRegistry {
   }
 
   /**
-   * Mirror the latest live-progress snapshot (and drill-down `fullTail`) of a
-   * RUNNING dispatch onto its record. The condenser is the sanitizer/bounder —
-   * both arguments arrive sanitized and capped at capture. Ignored for
+   * Mirror changed live display fields of a RUNNING dispatch onto its record.
+   * Snapshot and detail changes travel independently; the condenser has already
+   * sanitized and bounded every value. Ignored for
    * unknown ids and settled records (a settled record's finalText/usage stay
    * authoritative; dispatch unsubscribes its condenser before settling, so
    * the guard only catches stale callers).
    */
-  noteProgress(agentId: string, snapshot: ProgressSnapshot, fullTail?: string[]): void {
+  noteProgress(
+    agentId: string,
+    snapshot: ProgressSnapshot | undefined,
+    detailLog?: SubagentDetailEntry[],
+  ): void {
     const record = this.records.get(agentId);
     if (!record || record.state !== "running") return;
-    record.progress = snapshot;
-    if (fullTail) record.fullTail = fullTail;
+    if (snapshot) {
+      record.progress = {
+        ...snapshot,
+        tail: [...snapshot.tail],
+        ...(snapshot.usage ? { usage: { ...snapshot.usage } } : {}),
+      };
+    }
+    if (detailLog) record.detailLog = detailLog.map((entry) => ({ ...entry }));
     this.notifyChange();
   }
 
@@ -389,12 +404,19 @@ export class SubagentRegistry {
    * newest-generation supersession. `settled.outcome`/`settled.usage`/
    * `settled.finalText` are each stored only when provided, so a settle that
    * couldn't classify (or produced no text) leaves the prior value intact.
-   * `finalText` is sanitized and capped here — conversation content, stored
+   * Before `finalText` is sanitized/capped, the identity-only source (defaulting
+   * to that raw text) removes only an exactly matching trailing assistant detail
+   * entry. The identity source is never stored. Conversation content is stored
    * for the panel drill-down only, never for error/log interpolation.
    */
   markSettled(
     agentId: string,
-    settled?: { outcome?: SubagentOutcome; usage?: SubagentUsage; finalText?: string },
+    settled?: {
+      outcome?: SubagentOutcome;
+      usage?: SubagentUsage;
+      finalText?: string;
+      assistantIdentityText?: string;
+    },
   ): void {
     const record = this.records.get(agentId);
     if (!record) return;
@@ -404,7 +426,19 @@ export class SubagentRegistry {
     record.settledAt = Date.now();
     if (settled?.outcome !== undefined) record.outcome = settled.outcome;
     if (settled?.usage !== undefined) record.usage = settled.usage;
-    const finalText = boundedContent(settled?.finalText, FINAL_TEXT_CAP);
+    const rawFinalText = settled?.finalText;
+    const assistantIdentityText = settled?.assistantIdentityText ?? rawFinalText;
+    const detailLog = record.detailLog;
+    const trailingDetail = detailLog?.at(-1);
+    if (
+      assistantIdentityText !== undefined &&
+      detailLog &&
+      trailingDetail?.kind === "assistant" &&
+      trailingDetail.fingerprint === assistantTextFingerprint([assistantIdentityText])
+    ) {
+      record.detailLog = detailLog.slice(0, -1);
+    }
+    const finalText = boundedContent(rawFinalText, SUBAGENT_FINAL_TEXT_CAP);
     if (finalText !== undefined) record.finalText = finalText;
     this.notifyChange();
   }
@@ -414,8 +448,9 @@ export class SubagentRegistry {
    * resume is initiated — Claude Code 2.1.205 flips the status synchronously
    * (stale settled status was a fixed bug). The subsequent `register()` from the
    * resumed dispatch reconfirms this with the live session handle. Also the one
-   * home of the resume-related RESETS: `startedAt` restarts (a resumed agent's
-   * elapsed time restarts) and `settledAt` clears. No-op for unknown ids, and —
+   * home of generation-local resets: elapsed time restarts and every prior
+   * outcome, usage, progress/detail buffer, final text, and settlement time
+   * clears before the resumed session can emit. No-op for unknown ids, and —
    * the permanence backstop behind the SendMessage refusal — for user-stopped
    * records.
    */
@@ -425,6 +460,11 @@ export class SubagentRegistry {
     record.state = "running";
     record.settledNoticeConsumed = false;
     record.startedAt = Date.now();
+    record.finalText = undefined;
+    record.outcome = undefined;
+    record.usage = undefined;
+    record.progress = undefined;
+    record.detailLog = undefined;
     record.settledAt = undefined;
     this.notifyChange();
   }

@@ -9,6 +9,19 @@ import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 import { codexAbortGuardStreamSimple } from "../src/runtime/codex-abort-guard.js";
 import picc from "../src/index.js";
 import { classifyRequest, createResponseGate, startMockModel, type CapturedRequest } from "./helpers/mock-openai.js";
+import {
+  renderAgentCall,
+  renderAgentResult,
+  type SubagentLifecycleRenderContext,
+} from "../src/runtime/subagent-render.js";
+import {
+  createAgentToolDefinition,
+  type SubagentRuntime,
+} from "../src/runtime/subagents.js";
+import {
+  BackgroundTaskRegistry,
+  createTaskOutputTool,
+} from "../src/runtime/background-tasks.js";
 
 /**
  * Pi upstream contract smoke test: asserts every Pi API PiCC
@@ -19,7 +32,7 @@ describe("mock wire request classification", () => {
   const summarySystem = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant.";
   const ordinary = (system: string, user: string, sessionKind: "main" | "child"): CapturedRequest => ({
     path: "/chat/completions", messages: [{ role: "system", content: system }, { role: "user", content: user }],
-    body: {}, requestKind: "ordinary", sessionKind,
+    authorizationValid: true, body: {}, requestKind: "ordinary", sessionKind,
   });
 
   it.each([
@@ -71,7 +84,6 @@ describe("pi 0.80.x API contract", () => {
       "DefaultResourceLoader",
       "SessionManager",
       "SettingsManager",
-      "AuthStorage",
       "ModelRegistry",
       "defineTool",
       "createBashTool",
@@ -824,6 +836,160 @@ describe("real Pi compact-search composition", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("real Pi lifecycle row ownership", () => {
+  it("composes Agent and TaskOutput pending, partial, collapsed, expanded, and error rows without call shells", async () => {
+    const { ToolExecutionComponent, initTheme } = (await import(
+      "@earendil-works/pi-coding-agent"
+    )) as any;
+    initTheme();
+    const cwd = process.cwd().replace(/\\/g, "/");
+    const ui = { requestRender() {} };
+    // Use the production factories, not renderer-shaped test doubles: this
+    // proves each definition forwards Pi's per-call context into the shared
+    // lifecycle renderers before the real self-shell composes the component.
+    const definitions = {
+      Agent: wrapForSelfShell(
+        createAgentToolDefinition({} as SubagentRuntime, { depth: 0 }),
+      ),
+      TaskOutput: wrapForSelfShell(
+        createTaskOutputTool(new BackgroundTaskRegistry()),
+      ),
+    };
+    const definition = (name: "Agent" | "TaskOutput") => definitions[name];
+    const build = (name: "Agent" | "TaskOutput", id: string, args: Record<string, unknown>) =>
+      new ToolExecutionComponent(name, id, args, {}, definition(name), ui, cwd);
+    const text = (component: any, expanded = false) => {
+      component.setExpanded(expanded);
+      return (component.render(120) as string[])
+        .join("\n")
+        .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+    };
+
+    const semanticLines = (rendered: string) => rendered.split("\n").filter((line) => line.trim());
+
+    const agent = build("Agent", "agent-row", {
+      subagent_type: "coder",
+      description: "Review auth",
+      run_in_background: true,
+    });
+    expect(text(agent)).toContain("Agent(coder) - Review auth");
+    expect(text(agent)).not.toContain("background");
+    expect(semanticLines(text(agent))).toHaveLength(1);
+    agent.updateResult(
+      { content: [{ type: "text", text: "live assistant text" }], details: { agent: "coder" }, isError: false },
+      true,
+    );
+    const running = text(agent);
+    expect(running).toContain("Agent(coder) running");
+    expect(running).not.toContain("Review auth");
+    expect(running).not.toContain("live assistant text");
+    expect(semanticLines(running)).toHaveLength(1);
+
+    agent.updateResult(
+      {
+        content: [{ type: "text", text: "final answer" }],
+        details: {
+          outcome: "completed",
+          agent: "coder",
+          durationMs: 1_000,
+          settledAt: new Date(2026, 0, 2, 7, 5).getTime(),
+          transcriptPath: "/x/agent-aabbccddeeff.jsonl",
+        },
+        isError: false,
+      },
+      false,
+    );
+    const collapsed = text(agent);
+    expect(collapsed).toContain("Agent(coder) completed");
+    expect(collapsed).toContain("07:05");
+    expect(collapsed).not.toContain("Review auth");
+    expect(collapsed).not.toContain("final answer");
+    expect(collapsed).not.toContain(".jsonl");
+    expect(semanticLines(collapsed)).toHaveLength(1);
+    const expanded = text(agent, true);
+    expect(expanded).toContain("final answer");
+    expect(expanded).toContain("transcript: /x/agent-aabbccddeeff.jsonl");
+    expect(expanded).not.toContain("Review auth");
+
+    const awaiting = build("TaskOutput", "task-await", { task_id: "task-1" });
+    const polling = build("TaskOutput", "task-poll", { task_id: "task-2", wait: false });
+    expect(text(awaiting)).toContain("TaskOutput(task-1) awaiting");
+    expect(text(polling)).toContain("TaskOutput(task-2) polling");
+    expect(semanticLines(text(awaiting))).toHaveLength(1);
+    expect(semanticLines(text(polling))).toHaveLength(1);
+    awaiting.updateResult(
+      {
+        content: [{ type: "text", text: "running Grep" }],
+        details: { taskId: "task-1", status: "running", agent: "coder", lastActivity: "running Grep" },
+        isError: false,
+      },
+      true,
+    );
+    const taskRunning = text(awaiting);
+    expect(taskRunning).toContain("Agent(coder) → Task(task-1) running");
+    expect(taskRunning).not.toContain("awaiting");
+    expect(taskRunning).not.toContain("Grep");
+    expect(semanticLines(taskRunning)).toHaveLength(1);
+    awaiting.updateResult(
+      {
+        content: [{ type: "text", text: "task answer" }],
+        details: { taskId: "task-1", status: "completed", outcome: "completed", agent: "coder" },
+        isError: false,
+      },
+      false,
+    );
+    expect(text(awaiting)).toContain("Agent(coder) → Task(task-1) completed");
+    expect(text(awaiting)).not.toContain("awaiting");
+    expect(semanticLines(text(awaiting))).toHaveLength(1);
+
+    const failed = build("Agent", "agent-error", { subagent_type: "coder" });
+    failed.updateResult(
+      { content: [{ type: "text", text: "provider failed" }], details: undefined, isError: true },
+      false,
+    );
+    expect(text(failed)).toContain("provider failed");
+    expect(text(failed)).not.toContain("Agent(coder)");
+  });
+
+  it("keeps ownership isolated across interleaved calls and a throwing result renderer", async () => {
+    const { ToolExecutionComponent, initTheme } = (await import(
+      "@earendil-works/pi-coding-agent"
+    )) as any;
+    initTheme();
+    const cwd = process.cwd().replace(/\\/g, "/");
+    const ui = { requestRender() {} };
+    const throwingDefinition = wrapForSelfShell({
+      name: "Agent",
+      renderCall: renderAgentCall,
+      renderResult(_result: unknown, _options: unknown, _theme: unknown, ctx: SubagentLifecycleRenderContext) {
+        if (ctx.state) ctx.state.resultOwned = true;
+        throw new Error("renderer boom");
+      },
+    });
+    const normalDefinition = wrapForSelfShell({
+      name: "Agent",
+      renderCall: renderAgentCall,
+      renderResult: renderAgentResult,
+    });
+    const first = new ToolExecutionComponent(
+      "Agent", "isolated-a", { subagent_type: "coder" }, {}, throwingDefinition, ui, cwd,
+    );
+    const second = new ToolExecutionComponent(
+      "Agent", "isolated-b", { subagent_type: "reviewer" }, {}, normalDefinition, ui, cwd,
+    );
+    first.updateResult(
+      { content: [{ type: "text", text: "fallback result" }], details: {}, isError: false },
+      false,
+    );
+    const firstText = (first.render(100) as string[]).join("\n");
+    const secondText = (second.render(100) as string[]).join("\n");
+    expect(firstText).toContain("fallback result");
+    expect(firstText).not.toContain("Agent(coder)");
+    expect(secondText).toContain("Agent(reviewer)");
+    expect(secondText).not.toContain("fallback result");
   });
 });
 

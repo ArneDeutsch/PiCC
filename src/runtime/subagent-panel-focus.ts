@@ -8,8 +8,10 @@ import {
   type PanelViewModel,
 } from "./subagent-panel-model.js";
 import {
+  DETAIL_BANNER_FAILED,
   DETAIL_BANNER_RESUMED,
   DETAIL_BANNER_SETTLED,
+  DETAIL_BANNER_STOPPED,
   DETAIL_BANNER_VANISHED,
   DETAIL_STEER_SENT,
   detailSteerFailed,
@@ -520,7 +522,7 @@ export class SubagentPanelFocusController {
         return;
       }
       // Live repaint while the drill-down is open: progress events land on
-      // the registry between ticks, and a 1s tick alone would lag the tail.
+      // the registry between ticks, and a 1s tick alone would lag structured detail.
       let unsubscribe: (() => void) | undefined;
       try {
         unsubscribe = this.deps.registry.onChange(() => {
@@ -539,8 +541,8 @@ export class SubagentPanelFocusController {
         ui: {
           promptExpanded: false,
           scrollTop: 0,
-          // Running opens onto the live tail (auto-following); finished opens
-          // at the top, where the final answer leads.
+          // Running opens onto structured live detail (auto-following); finished
+          // opens at the top, where the outcome-aware output leads.
           follow: target.record.state === "running",
           steerBuffer: "",
         },
@@ -693,8 +695,12 @@ export class SubagentPanelFocusController {
           // there is nothing to send it to anyway.
           d.ui.steerBuffer = "";
         } else if (observed === "settled") {
-          d.ui.banner = DETAIL_BANNER_SETTLED;
-          // The finished layout leads with the final answer — jump to it.
+          d.ui.banner = data.record?.userStopped || data.record?.outcome === "aborted"
+            ? DETAIL_BANNER_STOPPED
+            : data.record?.outcome === "failed"
+              ? DETAIL_BANNER_FAILED
+              : DETAIL_BANNER_SETTLED;
+          // The finished layout leads with outcome-aware output — jump to it.
           d.ui.follow = false;
           d.ui.scrollTop = 0;
         } else {

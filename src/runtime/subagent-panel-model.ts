@@ -1,5 +1,4 @@
 import type { SubagentRegistryRecord, SubagentUsage } from "./subagent-registry.js";
-import { progressActivityLine } from "./subagent-progress.js";
 
 /**
  * Subagent status-panel model: pure data-in/rows-out. Turns registry records
@@ -94,8 +93,6 @@ export interface PanelRowView {
   label: string;
   /** Validated Claude color name from agent frontmatter, when present. */
   color?: string;
-  /** Live activity one-liner for a running row; empty when idle/settled. */
-  activity: string;
   /** Elapsed run time: now−startedAt while running, settledAt−startedAt after. */
   elapsedMs: number;
   /** Live-accumulated or settlement usage (settled wins); absent until known. */
@@ -262,8 +259,6 @@ export class SubagentPanelModel {
         agentType: record.agentName,
         label: record.description || record.agentName,
         color: record.color,
-        activity:
-          flat.state === "running" && record.progress ? progressActivityLine(record.progress) : "",
         elapsedMs: Math.max(0, elapsedEnd - record.startedAt),
         usage: record.state === "settled" ? (record.usage ?? record.progress?.usage) : record.progress?.usage,
         selected: selIndex === i,

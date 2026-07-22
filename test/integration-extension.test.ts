@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import picc, { type PiccTestSeam } from "../src/index.js";
+import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import type { BackgroundResultLike } from "../src/runtime/background-tasks.js";
 import { resolveGitBashPath } from "../src/engine/shell-inject.js";
 import { RECORD_EXPAND_HINT } from "../src/runtime/subagent-render.js";
@@ -67,6 +68,114 @@ describe("tool surface registration", () => {
       "TodoWrite",
     ]) {
       expect(pi.tools.has(name), `missing tool ${name}`).toBe(true);
+    }
+  });
+
+  it("installs collapse only on main-session tool definitions", async () => {
+    for (const name of ["read", "write", "edit", "MultiEdit", "bash"]) {
+      expect(pi.tools.get(name).renderShell, name).toBe("self");
+    }
+    const previousBindings = getKeybindings();
+    setKeybindings(new KeybindingsManager({ ...TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } }));
+    try {
+      const read = pi.tools.get("read");
+      const args = { path: "registered.txt" };
+      const state = {};
+      const theme = { fg: (_slot: string, text: string) => text, bold: (text: string) => text,
+        bg: (_slot: string, text: string) => text };
+      const context = { args, state, isPartial: false, isError: false, expanded: false,
+        cwd: dir, showImages: false, invalidate() {} };
+      read.renderCall(args, theme, context);
+      const rendered = read.renderResult(
+        { content: [{ type: "text", text: "REGISTERED_DETAIL_ONE\nREGISTERED_DETAIL_TWO" }], details: undefined },
+        { expanded: false, isPartial: false }, theme, context,
+      ).render(160).join("\n");
+      expect(rendered).toContain("Read registered.txt · 2 lines hidden");
+      expect(rendered).not.toContain("REGISTERED_DETAIL");
+
+      const multiEdit = pi.tools.get("MultiEdit");
+      const multiEditArgs = {
+        file_path: "registered-multi.txt",
+        edits: [{ old_string: "REGISTERED_MULTIEDIT_DETAIL_OLD", new_string: "REGISTERED_MULTIEDIT_DETAIL_NEW" }],
+      };
+      const multiEditState = {};
+      const multiEditContext = { args: multiEditArgs, state: multiEditState, isPartial: false,
+        isError: false, expanded: false, cwd: dir, showImages: false, invalidate() {} };
+      multiEdit.renderCall(multiEditArgs, theme, multiEditContext);
+      const multiEditRendered = multiEdit.renderResult(
+        {
+          content: [{ type: "text", text: "Successfully applied 1 edit(s) to registered-multi.txt." }],
+          details: {
+            filePath: "registered-multi.txt",
+            edits: 1,
+            created: false,
+            diff: "-REGISTERED_MULTIEDIT_DETAIL_OLD\n+REGISTERED_MULTIEDIT_DETAIL_NEW",
+            firstChangedLine: 1,
+          },
+        },
+        { expanded: false, isPartial: false }, theme, multiEditContext,
+      ).render(160).join("\n");
+      expect(multiEditRendered).toContain("MultiEdit registered-multi.txt · 1 edit applied · 2 diff lines hidden");
+      expect(multiEditRendered).not.toContain("REGISTERED_MULTIEDIT_DETAIL");
+    } finally {
+      setKeybindings(previousBindings);
+    }
+
+    const created: Array<Record<string, unknown>> = [];
+    const handle = fakeSdk({ replies: ["done"], created });
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    handle.sdk.createReadToolDefinition = (cwd: string) => sdk.createReadToolDefinition(cwd);
+    const fresh = fakePi();
+    let internals!: Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
+    picc(fresh.api as never, {
+      onWired: (value) => { internals = value; },
+      onInitializationSettled: fresh.captureInitialization,
+    });
+    await fresh.waitForInitialization();
+    internals.subagentRuntime.setSdkForTest(handle.sdk);
+    await fresh.tools.get("Agent").execute("main-only", {
+      subagent_type: "general-purpose", prompt: "inspect", run_in_background: false,
+    });
+    const subagentTools = created[0]?.customTools as Array<Record<string, any>>;
+    const rawRead = subagentTools.find((tool) => tool.name === "read");
+    const rawMultiEdit = subagentTools.find((tool) => tool.name === "MultiEdit");
+    expect(rawRead, "missing subagent read").toBeDefined();
+    expect(rawMultiEdit, "missing subagent MultiEdit").toBeDefined();
+    expect(rawRead!.renderShell).not.toBe("self");
+    expect(rawMultiEdit!.renderShell).not.toBe("self");
+
+    const renderRaw = (name: string, args: unknown, definition: Record<string, unknown>, result: unknown): string => {
+      const row = new sdk.ToolExecutionComponent(
+        name, `subagent-${name}`, args, {}, definition,
+        { requestRender() {} }, dir.replace(/\\/g, "/"),
+      );
+      row.setArgsComplete();
+      row.markExecutionStarted();
+      row.render(160);
+      row.updateResult(result, false);
+      return (row.render(160) as string[]).join("\n");
+    };
+    const rawReadRendered = renderRaw("read", { path: "subagent-read.txt" }, rawRead!, {
+      content: [{ type: "text", text: "SUBAGENT_READ_DETAIL_ONE\nSUBAGENT_READ_DETAIL_TWO" }],
+      details: undefined,
+    });
+    const rawMultiEditRendered = renderRaw("MultiEdit", {
+      file_path: "subagent-multi.txt",
+      edits: [{ old_string: "old", new_string: "new" }],
+    }, rawMultiEdit!, {
+      content: [{ type: "text", text: "Successfully applied 1 edit(s) to subagent-multi.txt." }],
+      details: { filePath: "subagent-multi.txt", edits: 1, created: false, diff: "-old\n+new", firstChangedLine: 1 },
+    });
+    const rawReadPlain = rawReadRendered
+      .replace(/\u001b\].*?(?:\u0007|\u001b\\)/gu, "")
+      .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+    expect(rawReadPlain).toContain("read subagent-read.txt");
+    expect(rawMultiEditRendered).toContain("Successfully applied 1 edit(s) to subagent-multi.txt.");
+    for (const rendered of [rawReadRendered, rawMultiEditRendered]) {
+      expect(rendered).not.toContain("hidden");
+      expect(rendered).not.toContain("to expand");
     }
   });
 
@@ -1206,6 +1315,16 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(typeof renderer, "no message renderer registered for picc-settlement").toBe(
       "function",
     );
+    const throwingDetails = Object.defineProperty({}, "details", {
+      get(): never {
+        throw new Error("details getter");
+      },
+    });
+    const revokedMessage = Proxy.revocable({}, {});
+    revokedMessage.revoke();
+    expect(() => renderer!(throwingDetails, { expanded: false }, undefined)).not.toThrow();
+    expect(() => renderer!(revokedMessage.proxy, { expanded: false }, undefined)).not.toThrow();
+    expect(renderer!(throwingDetails, { expanded: false }, undefined)).toBeUndefined();
 
     // A coordinator-owned settlement, never awaited.
     const agentId = "agent-77aa88bb99cc";
@@ -1260,6 +1379,8 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(top, "settlement message lost its details payload").toBeDefined();
     expect(nested).toBeDefined();
     expect(top!.details!.record).toBe("subagent-completion");
+    expect(typeof top!.details!.settledAt).toBe("number");
+    expect(typeof top!.details!.durationMs).toBe("number");
     expect(top!.content).toContain("settled: completed"); // model-facing text untouched
 
     // The RECORDED registered renderer, driven with the actual sent message at
@@ -1269,8 +1390,8 @@ describe("background settlement delivery (offline integration via the seam)", ()
     const lines = component.render(200) as string[];
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain(`Task(${taskId})`);
-    expect(lines[0]).toContain("Agent(reviewer) completed");
-    expect(lines[0]).toContain(`${agentId}.jsonl`); // transcript-basename pointer
+    expect(lines[0]).toContain(`Agent(reviewer) → Task(${taskId}) completed`);
+    expect(lines[0]).not.toContain(".jsonl");
     expect(lines[0]).toContain(RECORD_EXPAND_HINT);
     expect(lines[0]).not.toContain("WIRED-RECORD-REPORT"); // body stays behind expand
 
@@ -1278,6 +1399,32 @@ describe("background settlement delivery (offline integration via the seam)", ()
     // no main-chat completion record for depth ≥ 2 tasks.
     expect(nested!.details!.nested).toBe(true);
     expect(renderer!(nested, { expanded: false }, undefined)).toBeUndefined();
+  });
+
+  it("registered Agent threads a background description through the real TaskOutput wiring", async () => {
+    const handle = fakeSdk({ replies: ["BACKGROUND-DONE"] });
+    const { p, internals } = await wire();
+    internals.subagentRuntime.setSdkForTest(handle.sdk);
+    const agent = p.tools.get("Agent");
+    const started = await agent.execute("bg-description", {
+      subagent_type: "reviewer",
+      prompt: "review in background",
+      description: "Review authentication",
+      run_in_background: true,
+    });
+    expect(started.content).toEqual([
+      {
+        type: "text",
+        text: `Background task ${started.details.taskId} started (agent: reviewer, agent id: ${started.details.agentId}). Use TaskOutput with task_id "${started.details.taskId}" to retrieve the result before finalizing.`,
+      },
+    ]);
+    expect(started.details.description).toBe("Review authentication");
+    await internals.backgroundTasks.wait(String(started.details.taskId));
+    const output = await p.tools.get("TaskOutput").execute("collect-description", {
+      task_id: started.details.taskId,
+    });
+    expect(output.content[0]!.text).toContain("BACKGROUND-DONE");
+    expect(output.details.description).toBe("Review authentication");
   });
 
   it("a FOREGROUND completed dispatch carries durationMs; its collapsed record shows a duration segment", async () => {
@@ -1291,6 +1438,7 @@ describe("background settlement delivery (offline integration via the seam)", ()
       run_in_background: false,
     });
     expect(res.details.outcome).toBe("completed");
+    expect(typeof res.details.settledAt).toBe("number");
     const durationMs = res.details.durationMs;
     expect(typeof durationMs).toBe("number");
     expect(durationMs as number).toBeGreaterThanOrEqual(0);

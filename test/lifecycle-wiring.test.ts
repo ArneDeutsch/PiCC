@@ -176,7 +176,7 @@ describe("lifecycle wiring", () => {
     expect(pi.userMessages.filter((m) => String(m.content).includes("[Stop hook]")).length).toBe(9);
   });
 
-  it("maps Pi 0.80.6 session reasons to Claude SessionStart sources", async () => {
+  it("maps Pi 0.80.10 session reasons to Claude SessionStart sources", async () => {
     const log = path.join(dir, ".claude", ".session-start-log");
     fs.rmSync(log, { force: true });
     for (const reason of ["startup", "reload", "new", "resume", "fork"]) {

@@ -58,7 +58,7 @@ function write(name: string, content: string): string {
 describe("MultiEdit sequential application & atomicity", () => {
   it("(1) applies edits sequentially — edit 2 matches text produced by edit 1", async () => {
     const p = write("seq.txt", "foo\n");
-    await run(tool, {
+    const result = await run(tool, {
       file_path: "seq.txt",
       edits: [
         { old_string: "foo", new_string: "bar" },
@@ -66,6 +66,16 @@ describe("MultiEdit sequential application & atomicity", () => {
       ],
     });
     expect(readExact(p)).toBe("baz\n");
+    expect(result.text).toBe("Successfully applied 2 edit(s) to seq.txt.");
+    expect(result.details).toMatchObject({
+      filePath: "seq.txt",
+      edits: 2,
+      created: false,
+      firstChangedLine: 1,
+    });
+    expect(result.details.diff).toBeTypeOf("string");
+    expect(result.details.diff).toContain("foo");
+    expect(result.details.diff).toContain("baz");
   });
 
   it("(2) rolls back atomically when a later edit fails — file byte-identical", async () => {

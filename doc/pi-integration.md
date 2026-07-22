@@ -1,10 +1,9 @@
 # PiCC ↔ Pi integration contracts
 
-> **Status:** Contract record. `package.json` accepts compatible Pi releases from **^0.80.6**;
-> the lockfile-tested versions of `@earendil-works/pi-coding-agent`, `pi-agent-core`, and `pi-ai`
-> are **0.80.6** (verified on npm 2026-07-11). Effective Node floor ≥ 22.19:
-> Pi declares ≥ 20, but its bundled undici 8.x (engines ≥ 22.19) crashes on Node 20 at import
-> (`worker_threads.markAsUncloneable` missing). We develop on 24.
+> **Status:** Contract record for the coordinated Pi 0.80.10 suite
+> (`@earendil-works/pi-agent-core`, `pi-ai`, `pi-coding-agent`, and `pi-tui`). `package.json`
+> declares `^0.80.10`; `package-lock.json` resolves every direct and coding-agent-nested copy to
+> exactly 0.80.10. Pi directly declares Node ≥ 22.19.0.
 > Source of truth for every Pi API PiCC builds on. If Pi churns, update here first.
 >
 > Fork vs. depend: **depend + extension bundle**. Pi is a regular npm dependency;
@@ -22,7 +21,7 @@ Launch modes we support:
 - `"extensions": ["<path>"]` in `~/.pi/agent/settings.json` or `.pi/settings.json` (persistent).
 - A `picc` launcher (thin wrapper) that runs Pi with the extension preloaded.
 
-## 2. Pi API surface we use (pinned)
+## 2. Pi API surface we use (tested baseline)
 
 | PiCC subsystem | Pi API used |
 |---|---|
@@ -135,7 +134,7 @@ mechanism. Operational or hook exhaustion retains a manually recoverable paused 
 restoration, replay, provider release, continuation-start, or settlement failure after commit
 instead requires a new session and must not compact the committed summary again. Print stdout/exit
 status and RPC command acknowledgement remain Pi-owned; JSON/RPC lifecycle entries are uncorrelated. Pi
-0.80.6 also emits a native physical `agent_end` for the intentionally stopped pre-compaction run
+0.80.10 also emits a native physical `agent_end` for the intentionally stopped pre-compaction run
 and can expose a native RPC compaction error before PiCC lifecycle handling; extensions cannot
 suppress, correlate, or redact those native records.
 
@@ -145,11 +144,14 @@ PiCC does not retry it. `compaction.reserveTokens` likewise remains a Pi setting
 
 ### 3.6 What stays Pi-native
 Auth (`/login` ChatGPT/Codex OAuth), provider abstraction, retry, session persistence/tree,
-TUI, `/model`, project trust. We do not reimplement any of it.
+TUI, `/model`, project trust. Pi 0.80.10's auth/model/catalog internals and base-prompt date removal
+are inherited behavior, not PiCC compatibility features. PiCC keeps complete eager tool sets and does
+not adopt deferred tool activation. We do not reimplement these Pi-native surfaces.
 
 ## 4. Risks / churn watchpoints
-- Pre-1.0 API churn: `package.json` uses the `^0.80.6` range and the lockfile tests 0.80.6; this
-  doc + a smoke test (`test/pi-contract.test.ts`) asserts the imports/exports we rely on exist.
+- Pre-1.0 API churn: the manifest keeps the coordinated `^0.80.10` policy while the lockfile is the
+  exact resolution boundary; this doc + a smoke test (`test/pi-contract.test.ts`) asserts the
+  imports/exports we rely on exist.
 - `before_agent_start` system-prompt chaining: other extensions may also modify; we append, not replace.
 - Mid-run checkpoint watchpoints: `turn_end` must remain after all sibling tool results; `terminate`
   must retain the all-results rule; `ctx.abort()` must stop before another ordinary provider request;
@@ -158,9 +160,13 @@ TUI, `/model`, project trust. We do not reimplement any of it.
   registration remains API-global last-writer-wins, and Codex cached-WebSocket pre-abort behavior is
   pinned by contract tests.
 - Built-in tool override warning in interactive mode is expected (documented for users).
-- Tool-row de-padding couples `src/runtime/tool-shell.ts` to Pi's render contract in three places.
-  **All three** are pinned by the smoke test (`test/pi-contract.test.ts`) so a Pi bump fails loudly
-  in CI rather than degrading incremental rendering silently on a green CI. For what the wrapper
+- Tool-row de-padding, mutation presentation, and settled interactive collapse couple
+  `src/runtime/tool-shell.ts`, `src/runtime/routine-tool-render.ts`, and
+  `src/runtime/default-collapsed-tool-render.ts` to Pi's render contract. The collapse lifecycle
+  additionally relies on Pi propagating configured `app.tools.expand` state and invoking a settled
+  TUI call renderer before its result renderer with shared per-call state. Pi-contract tests pin
+  these dependencies so a Pi bump fails loudly in CI rather than degrading rendering silently.
+  For what the wrapper
   does with these, see "`renderShell` — this is how you control blank lines and framing" in
   [`tui-extension-guide.md`](tui-extension-guide.md); the Pi-side surface is:
   - **`create*ToolDefinition` renderer shape** — the de-padded built-in rows source their
@@ -172,6 +178,15 @@ TUI, `/model`, project trust. We do not reimplement any of it.
     caching the `renderCall` and `renderResult` slots separately. The built-ins depend on that to
     carry incremental render state, so a Pi change here would silently degrade rendering: the
     contract test drives the real `ToolExecutionComponent` and asserts Pi's side of it.
+  - **Edit's nested call `Box`** — the public Edit call renderer returns a stateful `Box(1, 1)` and
+    recognizes that Box through `ctx.lastComponent`. The routine adapter retains the inner Box and
+    removes only its verified full-width outer padding rows; the real lifecycle test covers initial
+    call, asynchronous preview, and settled reuse.
+  - **Public Edit result renderer and custom HTML lifecycle** — MultiEdit passes a detached,
+    sanitized Edit-shaped success snapshot to `createEditToolDefinition().renderResult`; it never
+    invokes Edit preview. Pi's custom HTML renderer records call arguments before result rendering
+    and renders collapsed and expanded results separately, so each pass must remain independently
+    valid and must not depend on shared canonical objects.
   - **`getTextOutput` transform** — `tool-shell.ts` reproduces Pi's `render-utils.js` `getTextOutput`
     (the deep path is `exports`-blocked); the smoke test pins it against Pi's own via an absolute
     `file://` import so a transform change (CRLF stripping, image fallbacks) fails loudly.

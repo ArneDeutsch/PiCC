@@ -85,8 +85,6 @@ function checkpointSdk({
       creations += 1;
       const loader = options.resourceLoader as Loader;
       const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
-      const realSdk: any = await import("@earendil-works/pi-coding-agent");
-      const childRegistry = realSdk.ModelRegistry.inMemory(realSdk.AuthStorage.inMemory());
       const extensionPi = {
         on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
           const list = handlers.get(event) ?? [];
@@ -94,7 +92,6 @@ function checkpointSdk({
           handlers.set(event, list);
         },
         registerProvider(name: string, config: Record<string, unknown>) {
-          childRegistry.registerProvider(name, config);
           providerRegistrations.push({ name, config });
         },
         sendMessage(message: { customType: string; content: unknown }) {

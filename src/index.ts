@@ -66,6 +66,8 @@ import { loadAgentMemory } from "./claude/memory.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
 import { wrapForSelfShell } from "./runtime/tool-shell.js";
 import { withCompactSearchRendering } from "./runtime/search-tool-render.js";
+import { withRoutineToolRendering } from "./runtime/routine-tool-render.js";
+import { withDefaultCollapsedToolRendering } from "./runtime/default-collapsed-tool-render.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
 import {
   MainSessionCheckpointGate,
@@ -1428,19 +1430,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     createTaskOutputTool(backgroundTasks) as Record<string, unknown>,
     createTaskStopTool(backgroundTasks, subagentRegistry) as Record<string, unknown>,
   );
-
   for (const tool of claudeNamedTools) {
     try {
-      // Wrap EVERY Claude-named tool in the self-shell seam so its row loses the
-      // top/bottom blank-line padding while keeping its colored band (re-applied
-      // per line) and its 1-col gutter. The wrapper preserves `execute` and all
-      // other fields untouched. (The subagent-scoped set built
-      // by `customToolsFor` is intentionally NOT wrapped: it renders inside
-      // subagent transcripts, not the parent interactive shell.)
+      // Main-session presentation composes in this order: specialized search,
+      // routine mutation, safe settled-success collapse, then self-shell framing.
+      // The final frame removes vertical padding while preserving execute and all
+      // metadata. `customToolsFor` intentionally skips the entire presentation
+      // chain because subagent rows belong to their own transcripts, not the
+      // parent interactive TUI.
       const mainSessionTool: Record<string, unknown> = tool.name === "Grep" || tool.name === "Glob"
         ? withCompactSearchRendering(tool as unknown as ToolDefinition) as unknown as Record<string, unknown>
         : tool;
-      pi.registerTool(mainCheckpointGate.wrapTool(wrapForSelfShell(mainSessionTool)));
+      const routineRendered = withRoutineToolRendering(
+        mainSessionTool as unknown as ToolDefinition,
+      );
+      const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
+      pi.registerTool(mainCheckpointGate.wrapTool(
+        wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
+      ));
     } catch (err) {
       console.error(`PiCC: failed to register tool: ${(err as Error).message}`);
     }
@@ -1478,8 +1485,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   // Cwd-swapping overrides of Pi built-ins. Execute is sourced from the
-  // ctx-dropping create*Tool factory (byte-identical); renderers are re-applied from
-  // create*ToolDefinition and de-padded via wrapForSelfShell.
+  // ctx-dropping create*Tool factory (byte-identical). Main-session presentation
+  // composes routine mutation → safe default collapse → self-shell framing around
+  // the native create*ToolDefinition renderers; subagent stock definitions stay raw.
   // The IIFE promise is captured (not `void`ed) so the readiness seam can await
   // built-in registration settlement via onInitializationSettled.
   const builtInRegistration = (async () => {
@@ -1491,19 +1499,22 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // Both built-in sourcings (execute from create*Tool, renderers from
       // create*ToolDefinition), the bash spawnHook/env, Git-Bash pinning, and the
       // live-cwd execute rebind live in the shared factory so the main session and
-      // the subagent path construct byte-identical tools. The factory returns the
-      // merged defs RAW; registration routes each through the self-shell seam
-      // (wrapForSelfShell) — which sets renderShell:"self", frames each row via a
-      // pi-tui Box (no top/bottom padding, colored band re-applied per line), and threads
-      // ctx.lastComponent to the inner component so incremental rendering survives —
-      // then registers it with Pi.
+      // subagents construct byte-identical raw tools. Only this registration loop
+      // adds routine mutation → safe default collapse → self-shell framing; keeping
+      // that composition here prevents parent-TUI policy from entering subagents.
       const builtins = buildStockBuiltinTools(sdk as BuiltinToolSdk, cwdState, {
         settingsEnv: project.settings.env ?? {},
         projectRoot: project.root,
         ...(shellPath ? { shellPath } : {}),
       });
       for (const { def } of builtins) {
-        pi.registerTool(mainCheckpointGate.wrapTool(wrapForSelfShell(def)));
+        const routineRendered = withRoutineToolRendering(
+          def as unknown as ToolDefinition,
+        );
+        const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
+        pi.registerTool(mainCheckpointGate.wrapTool(
+          wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
+        ));
       }
       // `!` user-bash commands also get the pinned Git Bash (and the effective cwd).
       if (shellPath && typeof sdk.createLocalBashOperations === "function") {
@@ -2605,9 +2616,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Only the RENDERING changes — the model-facing steer text is untouched.
   // Returns undefined (→ Pi's default custom-message box) for nested tasks and
   // for messages without the structured details.
-  pi.registerMessageRenderer("picc-settlement", (message: any, opts: any, theme: any) =>
-    renderSettlementRecord(message?.details, opts, theme),
-  );
+  pi.registerMessageRenderer("picc-settlement", (message: any, opts: any, theme: any) => {
+    let details: unknown;
+    try {
+      details = message?.details;
+    } catch {
+      return undefined;
+    }
+    return renderSettlementRecord(details, opts, theme);
+  });
 
   /**
    * Shows control-command output immediately. An appended entry renders in the

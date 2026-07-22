@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * Subagent live-progress condenser.
  *
@@ -14,8 +16,8 @@
  *     or a silent auto-retry wait - "waiting: API retry 2/3"), and
  *   - accumulated token `usage`, absent until the first usage-bearing event.
  *
- * Beside the snapshot, the condenser keeps an enlarged `fullTail` buffer (same
- * capture-time sanitization, larger caps) for the status panel's drill-down.
+ * Beside the snapshot, the condenser keeps a typed structured detail log.
+ * It is capture-sanitized and hard-bounded and never enters model-facing progress.
  *
  * SANITIZATION IS SECURITY, NOT COSMETICS: the tail replays subagent-controlled
  * text (its assistant output and - deliberately truncated - its tool results,
@@ -42,6 +44,13 @@ export interface SnapshotUsage {
   costUsd?: number;
 }
 
+/** One bounded, sanitized event for the selected-agent detail view. */
+export type SubagentDetailEntry =
+  | { kind: "assistant"; text: string; fingerprint: string }
+  | { kind: "tool-call"; tool: string; detail?: string }
+  | { kind: "tool-outcome"; tool: string; detail?: string; failed: boolean }
+  | { kind: "status"; text: string };
+
 /** A bounded, sanitized view of a running subagent's recent activity. */
 export interface ProgressSnapshot {
   /** Recent activity lines, oldest -> newest; bounded in count and line length. */
@@ -63,14 +72,14 @@ export interface ProgressSnapshot {
 export const DEFAULT_MAX_TAIL_LINES = 12;
 /** Default per-line cap (characters) before truncation. */
 export const DEFAULT_MAX_LINE_LENGTH = 200;
-/**
- * Bounds for the enlarged per-agent transcript buffer (`fullTail`) kept for
- * the status panel's drill-down view. Larger than the rolling `tail`, but
- * still hard-capped — the same hostile-content concerns apply, only the
- * display budget differs.
- */
-export const FULL_TAIL_MAX_LINES = 100;
-export const FULL_TAIL_MAX_LINE_LENGTH = 300;
+/** Hard display budgets for the structured selected-agent detail log. */
+export const DETAIL_LOG_MAX_ENTRIES = 100;
+export const DETAIL_FIELD_MAX_LENGTH = 300;
+/** Maximum raw code units inspected when sanitizing a malformed detail scalar. */
+const DETAIL_RAW_INSPECTION_LIMIT = 4096;
+/** Fixed work ceilings for a tool outcome, including payloads with no visible text. */
+export const TOOL_OUTCOME_BLOCK_INSPECTION_LIMIT = 64;
+export const TOOL_OUTCOME_RAW_INSPECTION_LIMIT = 4096;
 
 // Control bytes referenced by the ANSI matchers, built from code points so the
 // SOURCE stays pure ASCII (no raw control characters in this file). ESC=27, BEL=7.
@@ -106,52 +115,402 @@ export function sanitizeProgressText(text: string): string {
   return out;
 }
 
-/** Sanitize one line: strip escapes/control, collapse whitespace, cap length. */
+export function scalarSafeText(text: string): string {
+  let out = "";
+  for (const ch of text) {
+    const code = ch.codePointAt(0)!;
+    if (ch.length === 1 && code >= 0xd800 && code <= 0xdfff) continue;
+    out += ch;
+  }
+  return out;
+}
+
+/** Keep an ellipsis truncation boundary from bisecting an astral code point. */
+function ellipsizedPrefix(text: string, maxLen: number): string {
+  if (maxLen <= 0) return "";
+  const limit = Math.max(0, maxLen - 1);
+  let prefix = text.slice(0, limit);
+  if (prefix.length && /[\uD800-\uDBFF]/u.test(prefix[prefix.length - 1]!)) prefix = prefix.slice(0, -1);
+  return `${prefix}…`;
+}
+
+/** Sanitize one line with the compact snapshot's legacy byte semantics. */
 export function sanitizeLine(text: string, maxLen: number): string {
   const flat = sanitizeProgressText(text).replace(/\s+/g, " ").trim();
   if (flat.length <= maxLen) return flat;
   return `${flat.slice(0, Math.max(0, maxLen - 1))}…`;
 }
 
-/** Local text extractor (avoids a value-import cycle with subagents.ts). */
-function messageText(message: unknown): string {
+type EscapeState = "normal" | "escape" | "csi" | "osc" | "osc-escape";
+
+/** Streaming equivalent of sanitizeLine, retaining at most one display budget. */
+class BoundedScalarAccumulator {
+  private out = "";
+  private pendingSpace = false;
+  private escapeState: EscapeState = "normal";
+  truncated = false;
+
+  constructor(private readonly maxLen: number) {}
+
+  feed(ch: string, code: number): void {
+    if (this.truncated) return;
+    if (this.escapeState === "escape") {
+      this.escapeState = code === 93 ? "osc" : code === 91 ? "csi" : "normal";
+      if ((code >= 64 && code <= 95) || code === 91 || code === 93) return;
+    } else if (this.escapeState === "csi") {
+      if (code >= 64 && code <= 126) this.escapeState = "normal";
+      return;
+    } else if (this.escapeState === "osc") {
+      if (code === 7) this.escapeState = "normal";
+      else if (code === 27) this.escapeState = "osc-escape";
+      return;
+    } else if (this.escapeState === "osc-escape") {
+      if (code === 92) {
+        this.escapeState = "normal";
+        return;
+      }
+      this.escapeState = "escape";
+      this.feed(ch, code);
+      return;
+    }
+
+    if (code === 27) {
+      this.escapeState = "escape";
+      return;
+    }
+    if (code === 155) {
+      this.escapeState = "csi";
+      return;
+    }
+    if (ch.length === 1 && code >= 0xd800 && code <= 0xdfff) return;
+    if (isStrippableControl(code)) return;
+    if (/\s/u.test(ch)) {
+      if (this.out) this.pendingSpace = true;
+      return;
+    }
+    const addition = `${this.pendingSpace ? " " : ""}${ch}`;
+    this.pendingSpace = false;
+    if (this.out.length + addition.length > this.maxLen) {
+      this.truncated = true;
+      return;
+    }
+    this.out += addition;
+  }
+
+  value(): string {
+    return this.truncated ? ellipsizedPrefix(this.out, this.maxLen) : this.out;
+  }
+}
+
+/**
+ * Sanitize one structured-detail scalar while retaining at most its display
+ * budget. Unlike sanitizeProgressText(), this never allocates a cleaned copy of
+ * an attacker-sized input before applying the cap.
+ */
+export function sanitizeDetailScalar(
+  value: string,
+  maxLen = DETAIL_FIELD_MAX_LENGTH,
+): string {
+  const accumulator = new BoundedScalarAccumulator(maxLen);
+  let inspected = 0;
+  for (const ch of value) {
+    if (inspected + ch.length > DETAIL_RAW_INSPECTION_LIMIT) break;
+    inspected += ch.length;
+    accumulator.feed(ch, ch.codePointAt(0)!);
+    if (accumulator.truncated) break;
+  }
+  return accumulator.value();
+}
+
+/** Extract a display scalar without joining a complete multi-block payload. */
+function boundedScalar(parts: Iterable<unknown>, maxLen = DETAIL_FIELD_MAX_LENGTH): string {
+  const accumulator = new BoundedScalarAccumulator(maxLen);
+  let inspected = 0;
+  outer: for (const part of parts) {
+    if (typeof part !== "string") continue;
+    for (const ch of part) {
+      if (inspected + ch.length > DETAIL_RAW_INSPECTION_LIMIT) break outer;
+      inspected += ch.length;
+      accumulator.feed(ch, ch.codePointAt(0)!);
+      if (accumulator.truncated) break outer;
+    }
+  }
+  return accumulator.value();
+}
+
+/** Cryptographic identity of the exact JS UTF-16 code units in uncapped assistant text. */
+export function assistantTextFingerprint(parts: Iterable<unknown>): string {
+  const hash = createHash("sha256");
+  for (const part of parts) {
+    if (typeof part === "string") hash.update(part, "utf16le");
+  }
+  return hash.digest("hex");
+}
+
+function* messageTextParts(message: unknown): Iterable<unknown> {
   const content = (message as { content?: unknown } | undefined)?.content;
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .filter((c) => c && typeof c === "object" && (c as { type?: string }).type === "text")
-      .map((c) => (c as { text?: string }).text ?? "")
-      .join("");
+  if (typeof content === "string") {
+    yield content;
+    return;
   }
-  return "";
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (block && typeof block === "object" && (block as { type?: string }).type === "text") {
+      yield (block as { text?: unknown }).text;
+    }
+  }
 }
 
-/** Extract text from a tool result (AgentToolResult shape or a bare string). */
-function resultText(result: unknown): string {
-  if (typeof result === "string") return result;
-  const content = (result as { content?: unknown } | undefined)?.content;
-  if (Array.isArray(content)) {
-    return content
-      .filter((c) => c && typeof c === "object" && (c as { type?: string }).type === "text")
-      .map((c) => (c as { text?: string }).text ?? "")
-      .join("\n");
+function safeField(value: unknown, key: PropertyKey): unknown {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
+  try {
+    return Reflect.get(value, key);
+  } catch {
+    return undefined;
   }
-  return "";
 }
 
-function firstNonEmptyLine(text: string): string {
-  for (const line of String(text ?? "").split("\n")) {
-    if (line.trim()) return line;
+function safeArray(value: unknown): value is unknown[] {
+  try {
+    return Array.isArray(value);
+  } catch {
+    return false;
   }
-  return "";
 }
 
-function lastNonEmptyLine(text: string): string {
-  const lines = String(text ?? "").split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i]!.trim()) return lines[i]!;
+function* resultTextParts(result: unknown): Iterable<unknown> {
+  if (typeof result === "string") {
+    yield result;
+    return;
   }
-  return "";
+  const content = safeField(result, "content");
+  if (!safeArray(content)) return;
+  const rawLength = safeField(content, "length");
+  if (typeof rawLength !== "number" || !Number.isSafeInteger(rawLength) || rawLength < 0) return;
+  const length = Math.min(rawLength, TOOL_OUTCOME_BLOCK_INSPECTION_LIMIT);
+  for (let i = 0; i < length; i++) {
+    const block = safeField(content, i);
+    if (safeField(block, "type") !== "text") continue;
+    yield safeField(block, "text");
+    // The separator lets a first-line consumer stop before the next block is inspected.
+    if (i < length - 1) yield "\n";
+  }
+}
+
+type LegacyEscapeState = "normal" | "escape" | "csi-params" | "csi-intermediate" | "osc" | "osc-escape";
+
+/** Incremental equivalent of the legacy sanitizeLine pipeline. */
+class LegacyLineAccumulator {
+  private out = "";
+  private pendingSpace = false;
+  private state: LegacyEscapeState = "normal";
+  private csiCandidate = "";
+  private overflow = false;
+
+  constructor(private readonly maxLen: number) {}
+
+  feed(text: string): void {
+    for (const ch of text) this.feedCharacter(ch);
+  }
+
+  private feedCharacter(ch: string): void {
+    const code = ch.codePointAt(0)!;
+    if (this.state === "escape") {
+      if (code === 93) {
+        this.state = "osc";
+        return;
+      }
+      if (code === 91) {
+        this.state = "csi-params";
+        this.csiCandidate = "";
+        return;
+      }
+      this.state = "normal";
+      if ((code >= 64 && code <= 90) || (code >= 92 && code <= 95)) return;
+    } else if (this.state === "osc") {
+      if (code === 7) this.state = "normal";
+      else if (code === 27) this.state = "osc-escape";
+      return;
+    } else if (this.state === "osc-escape") {
+      if (code === 92) {
+        this.state = "normal";
+        return;
+      }
+      this.state = "escape";
+      this.feedCharacter(ch);
+      return;
+    } else if (this.state === "csi-params") {
+      if ((code >= 48 && code <= 57) || code === 59 || code === 58 || code === 63) {
+        this.rememberCsi(ch);
+        return;
+      }
+      if (code >= 32 && code <= 47) {
+        this.rememberCsi(ch);
+        this.state = "csi-intermediate";
+        return;
+      }
+      if (code >= 64 && code <= 126) {
+        this.state = "normal";
+        this.csiCandidate = "";
+        return;
+      }
+      this.flushIncompleteCsi();
+    } else if (this.state === "csi-intermediate") {
+      if (code >= 32 && code <= 47) {
+        this.rememberCsi(ch);
+        return;
+      }
+      if (code >= 64 && code <= 126) {
+        this.state = "normal";
+        this.csiCandidate = "";
+        return;
+      }
+      this.flushIncompleteCsi();
+    }
+
+    if (code === 27) {
+      this.state = "escape";
+      return;
+    }
+    if (isStrippableControl(code)) return;
+    if (/\s/u.test(ch)) {
+      if (this.out) this.pendingSpace = true;
+      return;
+    }
+    this.append(`${this.pendingSpace ? " " : ""}${ch}`);
+    this.pendingSpace = false;
+  }
+
+  private rememberCsi(ch: string): void {
+    if (this.csiCandidate.length <= this.maxLen) this.csiCandidate += ch;
+  }
+
+  private flushIncompleteCsi(): void {
+    const candidate = this.csiCandidate;
+    this.state = "normal";
+    this.csiCandidate = "";
+    // Legacy sanitizeProgressText strips the ESC control byte from an incomplete
+    // CSI but preserves its literal '[' introducer and parameter bytes.
+    this.feedCharacter("[");
+    for (const ch of candidate) this.feedCharacter(ch);
+    if (candidate.length > this.maxLen) this.overflow = true;
+  }
+
+  private append(text: string): void {
+    if (this.out.length <= this.maxLen) this.out += text;
+    if (this.out.length > this.maxLen) this.overflow = true;
+  }
+
+  value(): string {
+    if (this.state === "csi-params" || this.state === "csi-intermediate") this.flushIncompleteCsi();
+    const flat = this.out;
+    if (!this.overflow && flat.length <= this.maxLen) return flat;
+    return `${flat.slice(0, Math.max(0, this.maxLen - 1))}…`;
+  }
+}
+
+function legacyScalar(parts: Iterable<unknown>, maxLen: number): string {
+  const accumulator = new LegacyLineAccumulator(maxLen);
+  for (const part of parts) {
+    if (typeof part === "string") accumulator.feed(part);
+  }
+  return accumulator.value();
+}
+
+interface BoundedLine {
+  found: boolean;
+  value: string;
+}
+
+type LogicalLineVisitor = (legacyValues: readonly string[], safeValues: readonly string[], found: boolean) => boolean | void;
+
+/** Walk concatenated text parts as logical lines without joining the payload. */
+function scanLogicalLines(
+  parts: Iterable<unknown>,
+  legacyLengths: readonly number[],
+  safeLengths: readonly number[],
+  visit: LogicalLineVisitor,
+): void {
+  let legacy = legacyLengths.map((length) => new LegacyLineAccumulator(length));
+  let safe = safeLengths.map((length) => new BoundedScalarAccumulator(length));
+  let found = false;
+  const emit = (): boolean => {
+    const keepGoing = visit(
+      legacy.map((accumulator) => accumulator.value()),
+      safe.map((accumulator) => accumulator.value()),
+      found,
+    );
+    legacy = legacyLengths.map((length) => new LegacyLineAccumulator(length));
+    safe = safeLengths.map((length) => new BoundedScalarAccumulator(length));
+    found = false;
+    return keepGoing !== false;
+  };
+
+  for (const part of parts) {
+    if (typeof part !== "string") continue;
+    for (const ch of part) {
+      if (ch === "\n") {
+        if (!emit()) return;
+        continue;
+      }
+      if (!/\s/u.test(ch)) found = true;
+      for (const accumulator of legacy) accumulator.feed(ch);
+      for (const accumulator of safe) accumulator.feed(ch, ch.codePointAt(0)!);
+    }
+  }
+  emit();
+}
+
+function lastLegacyNonEmptyLine(parts: Iterable<unknown>, maxLen: number): BoundedLine {
+  let result: BoundedLine = { found: false, value: "" };
+  scanLogicalLines(parts, [maxLen], [], (legacy, _safe, found) => {
+    if (found) result = { found: true, value: legacy[0]! };
+  });
+  return result;
+}
+
+interface ToolOutcomePreview {
+  found: boolean;
+  snapshotLine: string;
+  detail: string;
+}
+
+function toolOutcomePreview(
+  rawName: string,
+  result: unknown,
+  failed: boolean,
+  snapshotMax: number,
+): ToolOutcomePreview {
+  const snapshot = new LegacyLineAccumulator(snapshotMax);
+  const detail = new BoundedScalarAccumulator(DETAIL_FIELD_MAX_LENGTH);
+  const inspectedName = rawName.slice(0, TOOL_OUTCOME_RAW_INSPECTION_LIMIT);
+  const prefix = failed ? `  x ${inspectedName} failed` : `  ${inspectedName}`;
+  snapshot.feed(prefix);
+  let found = false;
+  let inspected = 0;
+
+  for (const part of resultTextParts(result)) {
+    if (typeof part !== "string") continue;
+    for (const ch of part) {
+      if (inspected + ch.length > TOOL_OUTCOME_RAW_INSPECTION_LIMIT) {
+        return { found, snapshotLine: snapshot.value(), detail: detail.value() };
+      }
+      inspected += ch.length;
+      if (ch === "\n") {
+        if (found) return { found, snapshotLine: snapshot.value(), detail: detail.value() };
+        continue;
+      }
+      if (!found && !/\s/u.test(ch)) {
+        found = true;
+        snapshot.feed(": ");
+      }
+      if (found) {
+        snapshot.feed(ch);
+        detail.feed(ch, ch.codePointAt(0)!);
+      }
+    }
+  }
+  return { found, snapshotLine: snapshot.value(), detail: detail.value() };
 }
 
 function asNumber(value: unknown): number | undefined {
@@ -194,13 +553,23 @@ function addUsage(a: SnapshotUsage | undefined, b: SnapshotUsage): SnapshotUsage
 }
 
 /** A short, safe hint of a tool call's target (path/command/query), if any. */
+function argumentDetail(args: unknown): string | undefined {
+  if (!args || typeof args !== "object") return undefined;
+  const a = args as Record<string, unknown>;
+  for (const key of ["command", "file_path", "path", "pattern", "query", "url", "description"]) {
+    const detail = boundedScalar([a[key]]);
+    if (detail) return detail;
+  }
+  return undefined;
+}
+
 function argHint(args: unknown, maxLen: number): string {
   if (!args || typeof args !== "object") return "";
   const a = args as Record<string, unknown>;
   for (const key of ["command", "file_path", "path", "pattern", "query", "url", "description"]) {
-    const v = a[key];
-    if (typeof v === "string" && v.trim()) {
-      return ` (${sanitizeLine(v, Math.min(maxLen, 60))})`;
+    const value = a[key];
+    if (typeof value === "string" && /\S/u.test(value)) {
+      return ` (${legacyScalar([value], Math.min(maxLen, 60))})`;
     }
   }
   return "";
@@ -215,8 +584,8 @@ function argHint(args: unknown, maxLen: number): string {
  */
 export class SubagentProgressCondenser {
   private readonly tail: string[] = [];
-  /** The enlarged drill-down buffer — same pushes as `tail`, larger caps. */
-  private readonly fullTailBuffer: string[] = [];
+  private readonly detailLogBuffer: SubagentDetailEntry[] = [];
+  private detailChangedOnLastConsume = false;
   private activity = "";
   /** Usage summed over COMPLETED turns; folded at each turn_end. */
   private settledUsage: SnapshotUsage | undefined;
@@ -243,6 +612,7 @@ export class SubagentProgressCondenser {
    * Unknown/irrelevant event types are ignored (no change).
    */
   consume(event: unknown): boolean {
+    this.detailChangedOnLastConsume = false;
     const e = (event ?? {}) as { type?: string; [k: string]: unknown };
     switch (e.type) {
       case "turn_start":
@@ -257,51 +627,71 @@ export class SubagentProgressCondenser {
             ? `waiting: API retry ${attempt}/${max}`
             : "waiting: API retry";
         this.push(this.activity);
+        this.pushDetail({ kind: "status", text: this.activity });
         break;
       }
       case "auto_retry_end":
         this.activity = e.success === true ? "retry succeeded; resuming…" : "retry failed";
+        this.pushDetail({ kind: "status", text: this.activity });
         break;
       case "tool_execution_start": {
         // SECURITY: the tool name reaches the parent terminal (this activity line)
         // AND the model-visible TaskOutput lastActivity, so sanitize it like every
         // other activity source — live the moment MCP/project-named tools flow
-        // through the event stream. push() already sanitizes the tail entry below.
-        const name =
-          sanitizeLine((typeof e.toolName === "string" && e.toolName) || "tool", this.maxLineLength) ||
-          "tool";
+        // through the event stream. Its structured field has an independent cap.
+        const rawName = (typeof e.toolName === "string" && e.toolName) || "tool";
+        const name = legacyScalar([rawName], this.maxLineLength) || "tool";
+        const detailTool = boundedScalar([rawName], DETAIL_FIELD_MAX_LENGTH) || "tool";
         this.activity = `running ${name}…`;
         this.push(`> ${name}${argHint(e.args, this.maxLineLength)}`);
+        const detail = argumentDetail(e.args);
+        this.pushDetail(
+          detail
+            ? { kind: "tool-call", tool: detailTool, detail }
+            : { kind: "tool-call", tool: detailTool },
+        );
         break;
       }
       case "tool_execution_end": {
-        const name = (typeof e.toolName === "string" && e.toolName) || "tool";
-        // Tool RESULTS are arbitrary repo content: reduce to ONE sanitized,
-        // truncated preview line (push() strips ANSI/control) - never replay raw.
-        const preview = firstNonEmptyLine(resultText(e.result));
-        if (e.isError === true) {
-          this.push(`  x ${name} failed${preview ? `: ${preview}` : ""}`);
-        } else if (preview) {
-          this.push(`  ${name}: ${preview}`);
-        }
+        const rawName = (typeof e.toolName === "string" && e.toolName) || "tool";
+        const failed = e.isError === true;
+        const preview = toolOutcomePreview(rawName, e.result, failed, this.maxLineLength);
+        if (failed || preview.found) this.pushPrepared(preview.snapshotLine);
+        const tool = boundedScalar([rawName], DETAIL_FIELD_MAX_LENGTH) || "tool";
+        this.pushDetail(
+          preview.detail
+            ? { kind: "tool-outcome", tool, detail: preview.detail, failed }
+            : { kind: "tool-outcome", tool, failed },
+        );
         this.activity = "working…";
         break;
       }
       case "message_update": {
         // Streaming assistant text: update the ACTIVITY preview only (a single
         // bounded line) - never grow the tail token-by-token (memory + spam).
-        const preview = lastNonEmptyLine(messageText(e.message));
-        if (preview) this.activity = sanitizeLine(preview, this.maxLineLength);
+        const preview = lastLegacyNonEmptyLine(messageTextParts(e.message), this.maxLineLength);
+        if (preview.found) this.activity = preview.value;
         const usage = messageUsage(e.message);
         if (usage) this.streamingUsage = usage;
         break;
       }
       case "turn_end": {
-        // The settled assistant message: its lines join the rolling tail (the
-        // "latest output lines"). The tail cap keeps only the most recent.
-        for (const line of messageText(e.message).split("\n")) {
-          this.push(line);
+        const detailText = boundedScalar(messageTextParts(e.message));
+        if (detailText) {
+          this.pushDetail({
+            kind: "assistant",
+            text: detailText,
+            fingerprint: assistantTextFingerprint(messageTextParts(e.message)),
+          });
         }
+        // Text blocks concatenate exactly as before, but logical lines are
+        // sanitized and pushed incrementally so no joined payload is allocated.
+        scanLogicalLines(
+          messageTextParts(e.message),
+          [this.maxLineLength],
+          [],
+          (legacy) => this.pushPrepared(legacy[0]!),
+        );
         // message_update leaves `activity` holding the final streamed line, which
         // we just pushed into `tail` — showing it again as the "… <activity>"
         // footer would duplicate it in the idle snapshot. Reset to a neutral idle label.
@@ -334,15 +724,14 @@ export class SubagentProgressCondenser {
       : { tail: [...this.tail], activity: this.activity };
   }
 
-  /**
-   * The enlarged bounded transcript buffer for the drill-down view (a fresh
-   * copy). Deliberately NOT part of {@link snapshot}: a snapshot-borne
-   * fullTail would ride every `details.subagentProgress` emission and multiply
-   * the JSON.stringify dedupe cost in `changed()`. It travels as a parallel
-   * registry-record field instead and never participates in change detection.
-   */
-  fullTail(): string[] {
-    return [...this.fullTailBuffer];
+  /** Structured detail entries, oldest to newest, with no mutable internals exposed. */
+  detailLog(): SubagentDetailEntry[] {
+    return this.detailLogBuffer.map((entry) => ({ ...entry }));
+  }
+
+  /** Whether the most recent consume changed only-or-also the structured log. */
+  detailChanged(): boolean {
+    return this.detailChangedOnLastConsume;
   }
 
   /** Settled turns + the in-flight figure; undefined until usage-bearing. */
@@ -351,19 +740,23 @@ export class SubagentProgressCondenser {
     return this.settledUsage ? { ...this.settledUsage } : undefined;
   }
 
+  private pushDetail(entry: SubagentDetailEntry): void {
+    this.detailLogBuffer.push({ ...entry });
+    if (this.detailLogBuffer.length > DETAIL_LOG_MAX_ENTRIES) {
+      this.detailLogBuffer.splice(0, this.detailLogBuffer.length - DETAIL_LOG_MAX_ENTRIES);
+    }
+    this.detailChangedOnLastConsume = true;
+  }
+
   private push(line: string): void {
-    const s = sanitizeLine(line, this.maxLineLength);
-    if (!s) return;
-    this.tail.push(s);
+    this.pushPrepared(sanitizeLine(line, this.maxLineLength));
+  }
+
+  private pushPrepared(snapshotLine: string): void {
+    if (!snapshotLine) return;
+    this.tail.push(snapshotLine);
     if (this.tail.length > this.maxTailLines) {
       this.tail.splice(0, this.tail.length - this.maxTailLines);
-    }
-    // The drill-down buffer takes the same line under its own larger caps —
-    // sanitized independently so a narrow display cap never truncates it.
-    // (Empty-after-sanitize is cap-independent: the `!s` return above covers both.)
-    this.fullTailBuffer.push(sanitizeLine(line, FULL_TAIL_MAX_LINE_LENGTH));
-    if (this.fullTailBuffer.length > FULL_TAIL_MAX_LINES) {
-      this.fullTailBuffer.splice(0, this.fullTailBuffer.length - FULL_TAIL_MAX_LINES);
     }
   }
 
