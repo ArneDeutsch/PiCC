@@ -49,6 +49,7 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
       `${piDist}/dist/modes/interactive/theme/theme.js`
     ) as { theme: unknown };
 
+    const requestedDefinitions: string[] = [];
     const customDefinition = wrapForSelfShell({
       name: "CustomBoundary",
       renderCall(args: Record<string, unknown>) {
@@ -59,7 +60,10 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
       },
     });
     const toolRenderer = htmlRendererModule.createToolHtmlRenderer({
-      getToolDefinition: (name) => name === "CustomBoundary" ? customDefinition : undefined,
+      getToolDefinition: (name) => {
+        requestedDefinitions.push(name);
+        return name === "CustomBoundary" ? customDefinition : undefined;
+      },
       theme: themeModule.theme,
       cwd: process.cwd(),
       width: 100,
@@ -99,10 +103,16 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
 
       expect(Buffer.from(JSON.stringify(session.getEntries()), "utf8")).toEqual(canonicalBytes);
       const html = readFileSync(outputPath, "utf8");
-      expect(html).toContain(".tool-execution.pending { background: var(--toolPendingBg); }");
-      expect(html).toContain(".tool-execution.success { background: var(--toolSuccessBg); }");
-      expect(html).toContain(".tool-execution.error { background: var(--toolErrorBg); }");
-      expect(html).toContain("case 'read':");
+      for (const [state, variable] of [
+        ["pending", "toolPendingBg"],
+        ["success", "toolSuccessBg"],
+        ["error", "toolErrorBg"],
+      ] as const) {
+        expect(html).toMatch(new RegExp(
+          String.raw`\.tool-execution\.${state}\s*\{[^}]*background\s*:\s*var\(\s*--${variable}\s*\)`,
+          "u",
+        ));
+      }
 
       const encoded = html.match(
         /<script id="session-data" type="application\/json">([^<]+)<\/script>/u,
@@ -117,6 +127,9 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
         }>;
       };
       expect(Buffer.from(JSON.stringify(data.entries), "utf8")).toEqual(canonicalBytes);
+      expect(JSON.stringify(data.entries)).toContain('"name":"read"');
+      expect(requestedDefinitions).toContain("CustomBoundary");
+      expect(requestedDefinitions).not.toContain("read");
       expect(data.renderedTools?.["stock-read"]).toBeUndefined();
 
       const custom = data.renderedTools?.["custom-boundary"];

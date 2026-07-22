@@ -46,7 +46,6 @@ const OUTCOME_PRESENTATION: Record<ToolRowOutcome, { glyph: string; color: Theme
 };
 
 interface Generation {
-  readonly id: number;
   readonly state?: object;
   outcome: ToolRowOutcome;
   resultRegistered: boolean;
@@ -56,7 +55,6 @@ interface Generation {
 }
 
 interface Coordinator {
-  nextId: number;
   current?: Generation;
 }
 
@@ -71,7 +69,6 @@ interface ShellCache {
   continuation: boolean;
   registered: boolean;
   theme: unknown;
-  inner: Component;
   lines: string[];
   innerLines: string[];
 }
@@ -120,7 +117,7 @@ function coordinatorFor(state: object | undefined, owner: object): Coordinator |
   }
   let coordinator = byOwner.get(owner);
   if (!coordinator) {
-    coordinator = { nextId: 1 };
+    coordinator = {};
     byOwner.set(owner, coordinator);
   }
   return coordinator;
@@ -128,7 +125,6 @@ function coordinatorFor(state: object | undefined, owner: object): Coordinator |
 
 function freshGeneration(ctx: unknown, state: object | undefined, coordinator?: Coordinator): Generation {
   const generation: Generation = {
-    id: coordinator?.nextId ?? 1,
     state,
     outcome: ordinaryOutcome(ctx),
     resultRegistered: false,
@@ -137,7 +133,6 @@ function freshGeneration(ctx: unknown, state: object | undefined, coordinator?: 
     active: true,
   };
   if (coordinator) {
-    coordinator.nextId++;
     if (coordinator.current) coordinator.current.active = false;
     coordinator.current = generation;
   }
@@ -423,7 +418,6 @@ function shellComponent(
           continuation,
           registered: generation.resultRegistered,
           theme,
-          inner,
           lines: output,
           innerLines: lines,
         };

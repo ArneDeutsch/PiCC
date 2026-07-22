@@ -413,8 +413,9 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
    there; don't assume ambient access.
 3. **Rendering:** width-clamp with pi-tui's own measure, sanitize untrusted text before the clamp,
    null-guard the theme, never mutate `result.content`. (Copy `subagent-render.ts`.)
-4. **Framing:** use `renderShell: "self"` only when you truly want to own every line; otherwise the
-   default shell gives you gutter + diffs + truncation for free.
+4. **Framing:** use `renderShell: "self"` only when you truly want to own every line. The default
+   shell supplies padded state-background framing only; renderers still own content, diffs, and
+   width safety.
 5. **Color:** prefer an existing `ThemeColor` slot over raw ANSI so themes keep working; there are
    no new slots.
 6. **Keys:** add via `registerShortcut` or handle inside your own component; do not try to reassign

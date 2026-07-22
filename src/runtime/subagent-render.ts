@@ -725,7 +725,6 @@ export function renderAgentCall(
   theme: unknown,
   context?: SubagentLifecycleRenderContext,
 ) {
-  setToolRowOutcome(context, "running");
   const agentType = sanitizeInline(boundedString(safeField(args, "subagent_type")) ?? "") || "general-purpose";
   const description = sanitizeInline(boundedString(safeField(args, "description")) ?? "");
   return {
@@ -749,8 +748,8 @@ function lifecycleToolRowOutcome(
   details: SubagentRenderDetails,
   isPartial: boolean,
 ): ToolRowOutcome | undefined {
-  if (isPartial) return "running";
   if (details.userStopped === true) return "stopped";
+  if (isPartial) return "running";
   if (details.background === true) return "success";
   if (details.taskId !== undefined && details.status === "running") return "running";
   if (details.outcome === "completed") return "success";
@@ -798,6 +797,13 @@ export function renderAgentResult(
         // A background live view leads with the Task chip + agent type;
         // the foreground view (no taskId) keeps the bare `Agent(<type>)` header.
         const chip = taskChip(details);
+        if (details.userStopped === true) {
+          return lifecycleLine(
+            theme,
+            { agent, ...(chip ? { chip } : {}), state: "stopped by user", tone: "warning" },
+            width,
+          );
+        }
         return runningStatusLines(theme, chip, agent, details, width);
       }
       // Final result.
@@ -948,7 +954,6 @@ export function renderTaskOutputCall(
   theme: unknown,
   context?: SubagentLifecycleRenderContext,
 ) {
-  setToolRowOutcome(context, "running");
   const taskId = sanitizeInline(boundedString(safeField(args, "task_id")) ?? "");
   const action = safeField(args, "wait") === false ? "polling" : "awaiting";
   return {

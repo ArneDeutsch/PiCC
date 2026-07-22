@@ -51,11 +51,15 @@ function renderPending(name: "Agent" | "Task" | "TaskOutput"): string[] {
 function renderLifecycle(
   name: "Agent" | "Task" | "TaskOutput",
   result: Result,
-  options: { expanded: boolean; isPartial?: boolean } = { expanded: false },
+  options: { expanded: boolean; isPartial?: boolean; isError?: boolean } = { expanded: false },
   width = 100,
 ): string[] {
   const tool = lifecycleTool(name);
-  const context: RenderCtx = { state: {}, isPartial: options.isPartial === true };
+  const context: RenderCtx = {
+    state: {},
+    isPartial: options.isPartial === true,
+    isError: options.isError === true,
+  };
   const args = name === "TaskOutput" ? { task_id: "task-7" } : { subagent_type: "reviewer" };
   const call = (tool.renderCall as Function)(args, theme, context) as Component;
   const canonical = structuredClone(result);
@@ -93,6 +97,29 @@ describe("subagent lifecycle glyph ownership", () => {
     const lines = renderPending(name);
     expectSingleMarker(lines, "○");
     expect(lines.join("\n")).toContain(name === "TaskOutput" ? "TaskOutput(task-7) awaiting" : "Agent(reviewer)");
+  });
+
+  it.each(["Agent", "Task", "TaskOutput"] as const)("uses shell failure for unstructured final %s errors", (name) => {
+    const unstructured: Result = { content: [{ type: "text", text: "factory error" }] };
+    const lines = renderLifecycle(name, unstructured, { expanded: false, isError: true });
+    expectSingleMarker(lines, "✗");
+    expect(lines.join("\n")).toContain("factory error");
+  });
+
+  it.each(["Agent", "Task", "TaskOutput"] as const)("gives partial user-stopped %s defensive outcomes stopped semantics", (name) => {
+    for (const outcome of ["failed", "aborted"] as const) {
+      const defensive = result({
+        ...(name === "TaskOutput" ? { taskId: "task-7", status: "stopped" } : {}),
+        outcome,
+        userStopped: true,
+      }, "defensive partial");
+      const canonical = structuredClone(defensive);
+      const lines = renderLifecycle(name, defensive, { expanded: false, isPartial: true });
+      expectSingleMarker(lines, "■");
+      expect(lines.join("\n")).toContain("stopped by user");
+      expect(lines.join("\n")).not.toContain("running");
+      expect(defensive).toEqual(canonical);
+    }
   });
 
   it.each(["Agent", "Task"] as const)("maps completed, failed, and stopped foreground %s outcomes", (name) => {
