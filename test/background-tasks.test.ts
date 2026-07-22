@@ -29,6 +29,7 @@ import {
   makeSubagentRuntime as makeRuntime,
 } from "./helpers/fake-sdk.js";
 import type { ClaudeAgent } from "../src/types.js";
+import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 
 /** onUpdate payload shape + streaming-capable tool view. */
 type ToolUpdate = {
@@ -329,11 +330,20 @@ describe("BackgroundTaskRegistry", () => {
 describe("TaskStop background identity", () => {
   const AGENT_ID = "agent-aabbccddeeff";
 
-  async function stopResult(options: { settled?: boolean; abort?: boolean }) {
+  async function stopResult(options: {
+    settled?: "completed" | "failed" | "stopped";
+    abort?: boolean;
+    repeated?: boolean;
+  }) {
     const registry = new BackgroundTaskRegistry();
     let resolve!: (value: BackgroundResultLike) => void;
     const promise = options.settled
-      ? Promise.resolve(result({ agentId: AGENT_ID, agentName: "worker" }))
+      ? Promise.resolve(result({
+          agentId: AGENT_ID,
+          agentName: "worker",
+          outcome: options.settled === "completed" ? "completed" : options.settled === "failed" ? "failed" : "aborted",
+          ...(options.settled === "failed" ? { ok: false, error: "provider failed" } : {}),
+        }))
       : new Promise<BackgroundResultLike>((r) => (resolve = r));
     const id = registry.start(
       "agent:INTERNAL-SENTINEL",
@@ -346,42 +356,94 @@ describe("TaskStop background identity", () => {
     const tool = createTaskStopTool(registry) as unknown as ToolLike & {
       parameters: { properties: Record<string, unknown> };
     };
-    const out = await tool.execute("stop", { task_id: id });
+    const first = await tool.execute("stop", { task_id: id });
+    const out = options.repeated ? await tool.execute("stop-again", { task_id: id }) : first;
+    const canonical = structuredClone(out);
+    const wrapped = wrapForSelfShell(tool as unknown as Record<string, unknown>);
+    const rendered = (wrapped.renderResult as Function)(
+      out,
+      { expanded: false, isPartial: false },
+      undefined,
+      { state: {}, isPartial: false },
+    ).render(500) as string[];
+    expect(rendered.join("\n").match(/[○●✗■]/gu) ?? []).toHaveLength(1);
     if (!options.settled) {
       resolve(result({ outcome: "aborted", agentId: AGENT_ID }));
       await registry.wait(id);
     }
-    return { id, out, tool };
+    expect(out).toEqual(canonical);
+    return { id, out, tool, rendered };
   }
 
   it("identifies an already-settled task while preserving schema and details", async () => {
-    const { id, out, tool } = await stopResult({ settled: true });
+    const { id, out, tool, rendered } = await stopResult({ settled: "completed" });
     const identity = `Task(${id}) · Agent(worker) · ${AGENT_ID}`;
     expect(out.content[0]!.text.split(identity)).toHaveLength(2);
     expect(out.content[0]!.text).toContain("already finished");
     expect(out.content[0]!.text).toContain("nothing to stop");
     expect(out.content[0]!.text).not.toContain("agent:INTERNAL-SENTINEL");
+    expect(rendered).toEqual([`● ${out.content[0]!.text}`]);
     expect(tool.parameters.properties).toHaveProperty("task_id");
     expect(out.details).toEqual({ taskId: id, status: "completed" });
   });
 
+  it("identifies failed and stopped settled no-ops with their producer status", async () => {
+    const failed = await stopResult({ settled: "failed" });
+    expect(failed.out.content[0]!.text).toContain('already finished with status "failed"');
+    expect(failed.out.content[0]!.text).toContain("nothing to stop");
+    expect(failed.out.details).toEqual({ taskId: failed.id, status: "failed" });
+    expect(failed.rendered).toEqual([`✗ ${failed.out.content[0]!.text}`]);
+
+    const stopped = await stopResult({ settled: "stopped", repeated: true });
+    expect(stopped.out.content[0]!.text).toContain('already finished with status "stopped"');
+    expect(stopped.out.content[0]!.text).toContain("nothing to stop");
+    expect(stopped.out.details).toEqual({ taskId: stopped.id, status: "stopped" });
+    expect(stopped.rendered).toEqual([`■ ${stopped.out.content[0]!.text}`]);
+  });
+
   it("identifies a cooperative abort request", async () => {
-    const { id, out } = await stopResult({ abort: true });
+    const { id, out, rendered } = await stopResult({ abort: true });
     const identity = `Task(${id}) · Agent(worker) · ${AGENT_ID}`;
     expect(out.content[0]!.text.split(identity)).toHaveLength(2);
     expect(out.content[0]!.text).toContain("stop requested (cooperative abort)");
     expect(out.content[0]!.text).toContain("result will be discarded");
     expect(out.content[0]!.text).not.toContain("agent:INTERNAL-SENTINEL");
+    expect(rendered).toEqual([`■ ${out.content[0]!.text}`]);
     expect(out.details).toEqual({ taskId: id, status: "stopped" });
   });
 
+  it("leaves an unknown-id producer error on Pi's error state", async () => {
+    const tool = createTaskStopTool(new BackgroundTaskRegistry()) as unknown as ToolLike;
+    let thrown: unknown;
+    try {
+      await tool.execute("stop", { task_id: "task-404" });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    const text = (thrown as Error).message;
+    expect(text).toContain("Unknown task_id");
+    const wrapped = wrapForSelfShell(tool as unknown as Record<string, unknown>);
+    const piErrorResult = { content: [{ type: "text", text }] };
+    const rendered = (wrapped.renderResult as Function)(
+      piErrorResult,
+      { expanded: false, isPartial: false },
+      undefined,
+      { state: {}, isPartial: false, isError: true },
+    ).render(120) as string[];
+    expect(rendered[0]).toMatch(/^✗ /u);
+    expect(rendered.join("\n").match(/[○●✗■]/gu) ?? []).toHaveLength(1);
+    expect(piErrorResult.content[0]!.text).toBe(text);
+  });
+
   it("identifies a task marked stopped without cooperative abort support", async () => {
-    const { id, out } = await stopResult({ abort: false });
+    const { id, out, rendered } = await stopResult({ abort: false });
     const identity = `Task(${id}) · Agent(worker) · ${AGENT_ID}`;
     expect(out.content[0]!.text.split(identity)).toHaveLength(2);
     expect(out.content[0]!.text).toContain("marked stopped");
     expect(out.content[0]!.text).toContain("Cooperative stop is not supported");
     expect(out.content[0]!.text).not.toContain("agent:INTERNAL-SENTINEL");
+    expect(rendered).toEqual([`■ ${out.content[0]!.text}`]);
     expect(out.details).toEqual({ taskId: id, status: "stopped" });
   });
 });

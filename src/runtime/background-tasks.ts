@@ -14,6 +14,7 @@ import {
 import {
   renderAgentResult,
   renderTaskOutputCall,
+  renderTaskStopResult,
   type SubagentLifecycleRenderContext,
   type SubagentRenderDetails,
 } from "./subagent-render.js";
@@ -1202,6 +1203,14 @@ export function createTaskStopTool(
         description: 'Task id returned at start (normally "task-*"), or the "agent-*" id of a live checkpoint-paused child in this process',
       }),
     }),
+    renderResult(
+      result: { content?: Array<{ type?: string; text?: string }>; details?: Record<string, unknown> },
+      _options: Record<string, unknown>,
+      theme: unknown,
+      context: SubagentLifecycleRenderContext,
+    ) {
+      return renderTaskStopResult(result, theme, context);
+    },
     async execute(_toolCallId: string, params: { task_id: string }) {
       // Capture-time sanitization: mirrors TaskOutput — the id is
       // echoed by unknownIdError, so sanitize before lookup/interpolation.
