@@ -902,6 +902,32 @@ describe("MainSessionCheckpointGate", () => {
     expect(gate.isLogicalRunStopped()).toBe(false);
   });
 
+  it("samples the settled fallback only for a supported proactive API", () => {
+    const unsupported = setup();
+    expect(unsupported.gate.settlementGeneration({
+      model: { api: "anthropic-messages" }, getContextUsage: () => usage,
+    })).toBeUndefined();
+    expect(unsupported.controller.snapshot().phase).toBe("idle");
+
+    const supported = setup();
+    const generation = supported.gate.settlementGeneration({
+      model: { api: "openai-responses" }, getContextUsage: () => usage,
+    });
+    expect(generation).toBe(supported.controller.snapshot().generation);
+    expect(supported.controller.snapshot().phase).toBe("awaiting-settlement");
+  });
+
+  it("preserves an already-active supported generation after the model API changes", () => {
+    const { controller, gate } = setup();
+    const generation = gate.settlementGeneration({
+      model: { api: "openai-responses" }, getContextUsage: () => usage,
+    });
+    expect(gate.settlementGeneration({
+      model: { api: "anthropic-messages" }, getContextUsage: () => usage,
+    })).toBe(generation);
+    expect(controller.snapshot().phase).toBe("awaiting-settlement");
+  });
+
   it("keeps logical-run authority stable across physical checkpoint reentry", () => {
     const { gate } = setup();
     const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage };
@@ -1791,6 +1817,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       return originalSendMessage(message, options);
     };
     const high = pi.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       compact: (options: any) => {
         pi.compactCalls.push(options);
@@ -1894,6 +1921,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     let enteredOperations = 0;
     const ctx = pi.printCtx({
       sessionManager: { getSessionFile: () => path.join(dir, "persisted-session.jsonl") },
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       compact: (options: any) => {
         pi.compactCalls.push(options);
@@ -1928,7 +1956,11 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(mainCheckpointGate.currentController().snapshot().phase).toBe("idle");
     await expect(pi.fire("input", {
       text: "explicit continuation", source: "interactive", streamingBehavior: undefined,
-    }, ctx)).resolves.toEqual({ action: "continue" });
+    }, pi.printCtx({
+      ...ctx,
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
+    }))).resolves.toEqual({ action: "continue" });
     await pi.fire("session_start", { reason: "startup" }, pi.printCtx());
   });
 
@@ -1940,6 +1972,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     pi.compactCalls.length = 0;
     pi.entries.length = 0;
     const ctx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       compact: (options: any) => {
         pi.compactCalls.push(options);
@@ -2038,6 +2071,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     fs.writeFileSync(marker, "block");
     pi.compactCalls.length = 0;
     const ctx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       compact: (options: any) => {
         pi.compactCalls.push(options);
@@ -2062,9 +2096,12 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     const ctx = pi.ctx({
       mode,
       hasUI: mode === "rpc",
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      sessionManager: { getEntries: () => [] },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       compact: (options: any) => queueMicrotask(() => options.onError(new Error("private failure"))),
     });
+    await pi.fire("session_start", { reason: "startup" }, ctx);
     await pi.fire("agent_settled", {}, ctx);
     const records = pi.entries.filter((entry) => entry.customType === "picc-checkpoint-lifecycle");
     expect(records.some((entry) => entry.data.category === "checkpoint-exhausted")).toBe(true);
@@ -2154,6 +2191,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     const release = deferred<void>();
     let aborts = 0;
     const ctx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       abort: () => { aborts += 1; },
       compact: (options: any) => {

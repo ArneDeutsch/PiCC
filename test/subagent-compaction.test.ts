@@ -42,6 +42,7 @@ interface CheckpointSdkOptions {
   reExhaustWithRestorationFailure?: boolean;
   replayReject?: boolean;
   resumedToolHook?: boolean;
+  cancelBeforeCompactLifecycle?: boolean;
 }
 
 function checkpointSdk({
@@ -54,6 +55,7 @@ function checkpointSdk({
   reExhaustWithRestorationFailure = false,
   replayReject = false,
   resumedToolHook = false,
+  cancelBeforeCompactLifecycle = false,
 }: CheckpointSdkOptions): ChildHarness {
   const base = fakeSdk().sdk;
   let compactions = 0;
@@ -230,6 +232,15 @@ function checkpointSdk({
             events.push("compact-started");
             markRecoveryCompactStarted();
             await recoveryCompactGate;
+          }
+          if (cancelBeforeCompactLifecycle) {
+            void emit("session_shutdown", {}, ctx);
+            await Promise.resolve();
+            await emit("session_compact", { compactionEntry: { summary: "stale summary" } }, ctx);
+            await emit("tool_call", {
+              toolName: "read", toolCallId: "stale-post-compact-touch", input: { path: "sub/note.txt" },
+            }, ctx);
+            return { summary: "stale summary" };
           }
           await emit("session_compact", { compactionEntry: { summary: "summary" } }, ctx);
           return { summary: "summary" };
@@ -451,7 +462,7 @@ describe("subagent mid-run compaction", () => {
     expect(harness.events()).not.toContain("resumed-provider");
   });
 
-  it("preserves child-local Skill activation through real extension tool assembly and compaction", async () => {
+  it("ignores stale child compact reset, then resets child-local context on current successful compaction", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-child-skill-"));
     const priorCwd = process.cwd();
     const priorUser = process.env.PICC_CLAUDE_USER_DIR;
@@ -463,6 +474,7 @@ describe("subagent mid-run compaction", () => {
     const hookLog = path.join(dir, "hook.json");
     write("CLAUDE.md", "parent instructions\n");
     write("sub/CLAUDE.md", "CHILD-NESTED-INSTRUCTIONS\n");
+    write(".claude/rules/child-path.md", "---\npaths:\n  - sub/**\n---\nCHILD-PATH-INSTRUCTIONS\n");
     write("sub/note.txt", "touch\n");
     write(".claude/agents/reviewer.md", "---\ndescription: reviewer\ntools: Skill, WebFetch, Bash\n---\nreview\n");
     write("hook.mjs", `import fs from "node:fs";let s="";for await(const c of process.stdin)s+=c;fs.writeFileSync(${JSON.stringify(hookLog)},s);`);
@@ -484,6 +496,7 @@ describe("subagent mid-run compaction", () => {
       "CHILD-SKILL-BODY $ARGUMENTS",
       "",
     ].join("\n"));
+    const staleHarness = checkpointSdk({ failures: 0, activateSkill: true, cancelBeforeCompactLifecycle: true });
     const harness = checkpointSdk({ failures: 1, activateSkill: true });
     const childPi = fakePi();
     let runtime!: ReturnType<typeof runtimeFor>;
@@ -491,17 +504,27 @@ describe("subagent mid-run compaction", () => {
       process.chdir(dir);
       process.env.PICC_CLAUDE_USER_DIR = path.join(dir, ".user");
       picc(childPi.api as never, {
-        sdk: harness.sdk,
+        sdk: staleHarness.sdk,
         onInitializationSettled: childPi.captureInitialization,
         onWired: ({ subagentRuntime }) => { runtime = subagentRuntime; },
       });
       await childPi.waitForInitialization();
+      const stale = await runtime.dispatch({ subagentType: "reviewer", prompt: "stale compact", depth: 1 });
+      expect(stale.outcome).toBe("completed");
+      const staleContext = staleHarness.customMessages().filter((message) => message.customType === "picc-context");
+      expect(staleContext.filter((message) => String(message.content).includes("CHILD-NESTED-INSTRUCTIONS"))).toHaveLength(1);
+      expect(staleContext.filter((message) => String(message.content).includes("CHILD-PATH-INSTRUCTIONS"))).toHaveLength(1);
+
+      runtime.setSdkForTest(harness.sdk);
       const child = await runtime.dispatch({ subagentType: "reviewer", prompt: "activate", depth: 1 });
       expect(child.outcome).toBe("completed");
       expect(harness.customMessages().find((message) => message.customType === "picc-preserved")?.content)
         .toContain("CHILD-SKILL-BODY example.com");
       expect(harness.customMessages().filter((message) =>
         message.customType === "picc-context" && String(message.content).includes("CHILD-NESTED-INSTRUCTIONS"),
+      )).toHaveLength(2);
+      expect(harness.customMessages().filter((message) =>
+        message.customType === "picc-context" && String(message.content).includes("CHILD-PATH-INSTRUCTIONS"),
       )).toHaveLength(2);
       expect(harness.guardResults().some((result: any) => result?.block === true)).toBe(true);
       const hookPayload = JSON.parse(fs.readFileSync(hookLog, "utf8"));

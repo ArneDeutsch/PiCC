@@ -1090,6 +1090,7 @@ export class MainSessionCheckpointGate {
     if (this.generation !== undefined) {
       return this.controller.snapshot().phase === "awaiting-settlement" ? this.generation : undefined;
     }
+    if (!isProactiveCompactionApi(ctx.model?.api)) return undefined;
     let usage: ContextUsageShape | undefined;
     try {
       usage = ctx.getContextUsage?.();

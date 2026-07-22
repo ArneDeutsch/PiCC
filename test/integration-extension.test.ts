@@ -6,6 +6,7 @@ import picc, { type PiccTestSeam } from "../src/index.js";
 import type { BackgroundResultLike } from "../src/runtime/background-tasks.js";
 import { resolveGitBashPath } from "../src/engine/shell-inject.js";
 import { RECORD_EXPAND_HINT } from "../src/runtime/subagent-render.js";
+import type { PiSessionMessage } from "../src/runtime/subagents.js";
 import { formatElapsed } from "../src/runtime/subagent-panel-render.js";
 import { createGlobTool, createGrepTool } from "../src/runtime/tools/search-tools.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
@@ -1532,4 +1533,317 @@ describe("degradation floor", () => {
     const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" })).systemPrompt as string;
     expect(prompt).toContain("future-agent:");
   });
+});
+
+describe("universal tool/worktree stops through production wiring", () => {
+  const cases = [
+    { event: "PreToolUse", kind: "tool" },
+    { event: "PostToolUse", kind: "tool" },
+    { event: "WorktreeCreate", kind: "create" },
+    { event: "WorktreeRemove", kind: "remove" },
+  ] as const;
+
+  it.each(cases)("main $event stops the threshold run and releases the next cycle", async ({ event, kind }) => {
+    const fixture = materializeFixture("full-surface");
+    const previousCwd = process.cwd();
+    const previousUser = process.env.PICC_CLAUDE_USER_DIR;
+    const marker = path.join(fixture, `.stop-once-${event}`);
+    const script = path.join(fixture, "stop-once.cjs");
+    fs.writeFileSync(script, [
+      "const fs=require('node:fs');",
+      `const marker=${JSON.stringify(marker)};`,
+      "if(!fs.existsSync(marker)){fs.writeFileSync(marker,'stopped');process.stdout.write(JSON.stringify({continue:false,stopReason:'wired universal stop'}));}",
+    ].join(""));
+    const settingsFile = path.join(fixture, ".claude", "settings.json");
+    const settings = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
+    settings.env = { ...(settings.env ?? {}), STOP_NODE: process.execPath, STOP_SCRIPT: script };
+    settings.hooks = {
+      [event]: [{
+        ...(event === "PreToolUse" || event === "PostToolUse" ? { matcher: "TodoWrite" } : {}),
+        hooks: [{ type: "command", command: "\"$STOP_NODE\" \"$STOP_SCRIPT\"" }],
+      }],
+    };
+    fs.writeFileSync(settingsFile, JSON.stringify(settings));
+
+    const p = fakePi();
+    let high = true;
+    const context = p.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => high
+        ? ({ tokens: 950, contextWindow: 1000, percent: 95 })
+        : ({ tokens: 100, contextWindow: 1000, percent: 10 }),
+    });
+    try {
+      process.chdir(fixture);
+      process.env.PICC_CLAUDE_USER_DIR = path.join(fixture, ".user");
+      picc(p.api as never, { onInitializationSettled: p.captureInitialization });
+      await p.waitForInitialization();
+      await p.fire("session_start", { sessionId: "wired-stop" }, context);
+      await p.fire("input", { text: "first run", source: "interactive" }, context);
+
+      let toolName = "TodoWrite";
+      let args: Record<string, unknown> = { todos: [] };
+      if (kind === "create") {
+        toolName = "EnterWorktree";
+        args = { name: `stop-create-${Date.now()}` };
+      } else if (kind === "remove") {
+        const entered = await p.tools.get("EnterWorktree").execute("seed", { name: `stop-remove-${Date.now()}` }, undefined, undefined, context);
+        toolName = "ExitWorktree";
+        args = { action: "remove" };
+        expect(entered.details.worktreePath).toBeTruthy();
+      }
+      const callId = `call-${event}`;
+      await p.fire("message_end", {
+        message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: callId, name: toolName, arguments: args }] },
+      }, context);
+      const pre = await p.fire("tool_call", { toolName, toolCallId: callId, input: args }, context);
+      let result: any = { content: [{ type: "text", text: "blocked" }], details: {}, isError: true };
+      if (!pre?.block) {
+        result = await p.tools.get(toolName).execute(callId, args, undefined, undefined, context);
+        await p.fire("tool_result", { toolName, toolCallId: callId, input: args, ...result }, context);
+      }
+      await p.fire("tool_execution_end", { toolCallId: callId, result, isError: result.isError === true }, context);
+      await p.fire("turn_end", {}, context);
+      await p.fire("before_provider_request", {}, context);
+      await p.fire("agent_settled", {}, context);
+
+      expect(p.compactCalls).toHaveLength(0);
+      expect(p.messages.some(({ message }) => message.customType === "picc-checkpoint-continuation")).toBe(false);
+      expect(p.userMessages).toHaveLength(0);
+      const stoppedAborts = p.abortCalls;
+      expect(stoppedAborts).toBeGreaterThan(0);
+
+      high = false;
+      expect(await p.fire("input", { text: "next genuine run", source: "interactive" }, context)).toMatchObject({ action: "continue" });
+      const nextId = `next-${event}`;
+      const nextArgs = { todos: [] };
+      await p.fire("message_end", {
+        message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: nextId, name: "TodoWrite", arguments: nextArgs }] },
+      }, context);
+      expect((await p.fire("tool_call", { toolName: "TodoWrite", toolCallId: nextId, input: nextArgs }, context))?.block).not.toBe(true);
+      const nextResult = await p.tools.get("TodoWrite").execute(nextId, nextArgs, undefined, undefined, context);
+      await p.fire("tool_result", { toolName: "TodoWrite", toolCallId: nextId, input: nextArgs, ...nextResult }, context);
+      await p.fire("tool_execution_end", { toolCallId: nextId, result: nextResult, isError: false }, context);
+      await p.fire("turn_end", {}, context);
+      await p.fire("before_provider_request", {}, context);
+      expect(p.abortCalls).toBe(stoppedAborts);
+    } finally {
+      process.chdir(previousCwd);
+      if (previousUser === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUser;
+      cleanupFixture(fixture);
+    }
+  });
+});
+
+describe("child worktree stops through the production extension assembly", () => {
+  type Internals = Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
+
+  it.each(["WorktreeCreate", "WorktreeRemove"] as const)(
+    "%s continue:false reaches the child gate and leaves the next dispatch healthy",
+    async (event) => {
+      const fixture = materializeFixture("full-surface");
+      const previousCwd = process.cwd();
+      const previousUser = process.env.PICC_CLAUDE_USER_DIR;
+      const markerPath = path.join(fixture, `.child-stop-once-${event}`);
+      const hookScript = path.join(fixture, "child-worktree-stop.cjs");
+      fs.writeFileSync(hookScript, [
+        "const fs=require('node:fs');",
+        `const marker=${JSON.stringify(markerPath)};`,
+        "if(!fs.existsSync(marker)){fs.writeFileSync(marker,'stopped');process.stdout.write(JSON.stringify({continue:false,stopReason:'child worktree stop'}));}",
+      ].join(""));
+      const settingsPath = path.join(fixture, ".claude", "settings.json");
+      const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+      settings.env = { ...(settings.env ?? {}), STOP_NODE: process.execPath, STOP_SCRIPT: hookScript };
+      settings.hooks = {
+        [event]: [{ hooks: [{ type: "command", command: "\"$STOP_NODE\" \"$STOP_SCRIPT\"" }] }],
+      };
+      fs.writeFileSync(settingsPath, JSON.stringify(settings));
+
+      const base = fakeSdk().sdk;
+      let creations = 0;
+      let compactions = 0;
+      let continuations = 0;
+      let ordinaryProviderRequests = 0;
+      let childAborts = 0;
+
+      class Loader {
+        constructor(readonly options: Record<string, unknown>) {}
+        async reload(): Promise<void> {}
+      }
+
+      const sdk: typeof base = {
+        ...base,
+        DefaultResourceLoader: Loader,
+        async createAgentSession(options) {
+          creations += 1;
+          const creation = creations;
+          const loader = options.resourceLoader as Loader;
+          const handlers = new Map<string, Array<(payload: unknown, ctx: unknown) => unknown>>();
+          const extensionPi = {
+            on(name: string, handler: (payload: unknown, ctx: unknown) => unknown) {
+              const list = handlers.get(name) ?? [];
+              list.push(handler);
+              handlers.set(name, list);
+            },
+            registerProvider() {},
+            sendMessage() {},
+          };
+          for (const extension of loader.options.extensionFactories as Array<{
+            factory(pi: typeof extensionPi): unknown;
+          }>) extension.factory(extensionPi);
+          const emit = async (name: string, payload: unknown, ctx: unknown): Promise<unknown[]> => {
+            const results: unknown[] = [];
+            for (const handler of handlers.get(name) ?? []) results.push(await handler(payload, ctx));
+            return results;
+          };
+          const messages: PiSessionMessage[] = [];
+          const listeners = new Set<(event: unknown) => void>();
+          let aborted = false;
+          const ctx = {
+            mode: "json",
+            model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+            getContextUsage: () => creation === 1
+              ? ({ tokens: 950, contextWindow: 1000, percent: 95 })
+              : ({ tokens: 100, contextWindow: 1000, percent: 10 }),
+            hasPendingMessages: () => false,
+            abort: () => { aborted = true; childAborts += 1; },
+          };
+          const recordProviderIfAdmitted = async () => {
+            await emit("before_provider_request", {}, ctx);
+            if (!aborted) ordinaryProviderRequests += 1;
+          };
+          const session = {
+            messages,
+            subscribe(listener: (event: unknown) => void) {
+              listeners.add(listener);
+              return () => { listeners.delete(listener); };
+            },
+            async prompt(text: string) {
+              messages.push({ role: "user", content: text });
+              await emit("turn_start", {}, ctx);
+              await recordProviderIfAdmitted();
+              const calls = event === "WorktreeCreate"
+                ? [{ id: "enter", name: "EnterWorktree", args: { name: `wired-${event}-${creation}` } }]
+                : [
+                    { id: "enter", name: "EnterWorktree", args: { name: `wired-${event}-${creation}` } },
+                    { id: "exit", name: "ExitWorktree", args: { action: "remove" } },
+                  ];
+              const assistant = {
+                role: "assistant",
+                stopReason: "toolUse",
+                content: calls.map((call) => ({
+                  type: "toolCall", id: call.id, name: call.name, arguments: call.args,
+                })),
+              };
+              messages.push(assistant);
+              await emit("message_end", { message: assistant }, ctx);
+              for (const call of calls) {
+                await emit("tool_call", {
+                  toolName: call.name, toolCallId: call.id, input: call.args,
+                }, ctx);
+                const tool = (options.customTools as FakeCustomTool[])
+                  .find((candidate) => candidate.name === call.name);
+                if (!tool) throw new Error(`${call.name} was not assembled for the child session`);
+                const result = await (tool.execute as (...args: unknown[]) => Promise<Record<string, unknown>>)(
+                  call.id, call.args, undefined, undefined, ctx,
+                );
+                await emit("tool_result", {
+                  toolName: call.name, toolCallId: call.id, input: call.args, ...result,
+                }, ctx);
+                await emit("tool_execution_end", {
+                  toolCallId: call.id, result, isError: result.isError === true,
+                }, ctx);
+              }
+              const continuationsBefore = continuations;
+              await emit("turn_end", {}, ctx);
+              if (continuations === continuationsBefore) {
+                await recordProviderIfAdmitted();
+                messages.push({
+                  role: "assistant",
+                  content: [],
+                  stopReason: aborted ? "aborted" : "stop",
+                  ...(aborted ? { errorMessage: "Aborted" } : {}),
+                });
+                await emit("agent_settled", {}, ctx);
+              }
+            },
+            async compact() {
+              compactions += 1;
+              const before = await emit("session_before_compact", { reason: "manual" }, ctx);
+              if (before.some((result) => (result as { cancel?: boolean } | undefined)?.cancel)) {
+                throw new Error("compaction cancelled");
+              }
+              await emit("session_compact", { compactionEntry: { summary: "summary" } }, ctx);
+              return { summary: "summary" };
+            },
+            abortCompaction() {},
+            async sendCustomMessage(
+              _message: { customType: string; content: unknown; display: boolean },
+              sendOptions?: { triggerTurn?: boolean },
+            ) {
+              if (!sendOptions?.triggerTurn) return;
+              continuations += 1;
+              aborted = false;
+              await emit("turn_start", {}, ctx);
+              await recordProviderIfAdmitted();
+              messages.push({
+                role: "assistant",
+                content: [{ type: "text", text: "continued" }],
+                stopReason: "stop",
+              });
+              await emit("turn_end", {}, ctx);
+              await emit("agent_settled", {}, ctx);
+            },
+            abort() { aborted = true; childAborts += 1; },
+            dispose() {},
+          };
+          return { session };
+        },
+      };
+
+      const p = fakePi();
+      let internals!: Internals;
+      try {
+        process.chdir(fixture);
+        process.env.PICC_CLAUDE_USER_DIR = path.join(fixture, ".user");
+        picc(p.api as never, {
+          onWired: (wired) => { internals = wired; },
+          onInitializationSettled: p.captureInitialization,
+        });
+        await p.waitForInitialization();
+        await p.waitForTools(["Agent"]);
+        internals.subagentRuntime.setSdkForTest(sdk);
+
+        const agent = p.tools.get("Agent");
+        await expect(agent.execute("first", {
+          subagent_type: "general-purpose",
+          prompt: "stopped threshold child run",
+          run_in_background: false,
+        })).rejects.toThrow(/aborted before completing/);
+        expect(fs.readFileSync(markerPath, "utf8")).toBe("stopped");
+        expect(compactions).toBe(0);
+        expect(continuations).toBe(0);
+        expect(ordinaryProviderRequests).toBe(1);
+        expect(childAborts).toBeGreaterThan(0);
+
+        const abortsAfterStoppedRun = childAborts;
+        const second = await agent.execute("second", {
+          subagent_type: "general-purpose",
+          prompt: "subsequent healthy child run",
+          run_in_background: false,
+        });
+        expect(second.details.outcome).toBe("completed");
+        expect(compactions).toBe(0);
+        expect(continuations).toBe(0);
+        expect(ordinaryProviderRequests).toBeGreaterThan(1);
+        expect(childAborts).toBe(abortsAfterStoppedRun);
+      } finally {
+        process.chdir(previousCwd);
+        if (previousUser === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+        else process.env.PICC_CLAUDE_USER_DIR = previousUser;
+        cleanupFixture(fixture);
+      }
+    },
+  );
 });
