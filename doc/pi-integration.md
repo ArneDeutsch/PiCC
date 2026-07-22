@@ -62,6 +62,9 @@ dispatch-local `CwdState` (`subCwd`); each built-in's `execute` rebinds per call
 permission guard (`getCwd: () => subCwd.get()`) all re-resolve to the new worktree cwd in
 lockstep. `createAgentSession({ cwd })` only fixes the *initial* directory; the live worktree
 swap flows through `subCwd`, exactly as the main session's swap flows through `cwdState`.
+Main-session live Edit rendering must also bind native preview I/O to the effective cwd at argument
+completion and revalidate it at execution start; `ctx.cwd` remains the correct source for HTML and
+reconstructed history rendering.
 
 ### 3.2 Tool-name mapping (Claude ⇄ Pi)
 Claude artifacts name tools `Read`, `Write`, `Edit`, `Bash`, `Grep`, `Glob`, `WebFetch`,

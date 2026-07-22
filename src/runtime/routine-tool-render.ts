@@ -664,6 +664,7 @@ type EditRendererDefinition = {
 
 export interface RoutineRenderingDependencies {
   createEditDefinition?: (cwd: string) => EditRendererDefinition;
+  resolveEditRenderCwd?: () => unknown;
 }
 
 function componentFrom(value: unknown): Component | undefined {
@@ -681,13 +682,126 @@ export function adaptedEditPreviewError(value: unknown): string | undefined {
   return typeof error === "string" ? error : undefined;
 }
 
-function editContext(context: unknown, lastComponent: Component | undefined): Record<string, unknown> {
-  if (context === null || typeof context !== "object") return { lastComponent };
+function editContext(
+  context: unknown,
+  overrides: Record<string, unknown>,
+): Record<string, unknown> {
+  if (context === null || typeof context !== "object") return overrides;
   try {
-    return { ...Object.fromEntries(Object.entries(context)), lastComponent };
+    return { ...Object.fromEntries(Object.entries(context)), ...overrides };
   } catch {
-    return { lastComponent };
+    return overrides;
   }
+}
+
+function usableAbsoluteCwd(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 && path.isAbsolute(value)
+    ? value
+    : undefined;
+}
+
+interface LiveEditRenderLifecycle {
+  delegatedState: object;
+  activated: boolean;
+  previewResolutionDone: boolean;
+  previewCwd?: string;
+  previewStarted: boolean;
+  executionResolutionDone: boolean;
+  executionCwd?: string;
+  suppressPreview: boolean;
+}
+
+interface LiveEditCallBinding {
+  context: Record<string, unknown>;
+  rotated: boolean;
+}
+
+function resolveEditRenderCwd(resolver: () => unknown): string | undefined {
+  try {
+    return usableAbsoluteCwd(resolver());
+  } catch {
+    return undefined;
+  }
+}
+
+function liveEditState(context: unknown): object | undefined {
+  const state = ownData(context, "state");
+  return state !== null && (typeof state === "object" || typeof state === "function")
+    ? state
+    : undefined;
+}
+
+function bindLiveEditCallContext(
+  context: unknown,
+  lifecycles: WeakMap<object, LiveEditRenderLifecycle>,
+  resolver: () => unknown,
+): LiveEditCallBinding {
+  const state = liveEditState(context);
+  if (!state) return { context: editContext(context, {}), rotated: false };
+
+  let lifecycle = lifecycles.get(state);
+  const argsComplete = ownData(context, "argsComplete") === true;
+  const executionStarted = ownData(context, "executionStarted") === true;
+  if (!lifecycle) {
+    if (argsComplete || executionStarted) {
+      return { context: editContext(context, {}), rotated: false };
+    }
+    lifecycle = {
+      delegatedState: state,
+      activated: false,
+      previewResolutionDone: false,
+      previewStarted: false,
+      executionResolutionDone: false,
+      suppressPreview: false,
+    };
+    lifecycles.set(state, lifecycle);
+  }
+
+  if (argsComplete && !executionStarted && !lifecycle.previewResolutionDone) {
+    lifecycle.activated = true;
+    lifecycle.previewResolutionDone = true;
+    lifecycle.previewCwd = resolveEditRenderCwd(resolver);
+    lifecycle.previewStarted = lifecycle.previewCwd !== undefined;
+    lifecycle.suppressPreview = !lifecycle.previewStarted;
+  }
+
+  let rotated = false;
+  if (executionStarted && !lifecycle.executionResolutionDone) {
+    lifecycle.activated = true;
+    lifecycle.executionResolutionDone = true;
+    lifecycle.executionCwd = resolveEditRenderCwd(resolver);
+    if (!lifecycle.previewStarted || lifecycle.executionCwd !== lifecycle.previewCwd) {
+      if (lifecycle.previewStarted) {
+        // Pi keys async Edit previews by arguments, not cwd; reuse admits stale completion while replacement preview would race execution.
+        lifecycle.delegatedState = {};
+        rotated = true;
+      }
+      lifecycle.suppressPreview = true;
+    }
+  }
+
+  const cwd = executionStarted
+    ? lifecycle.executionCwd ?? ownData(context, "cwd")
+    : lifecycle.previewCwd ?? ownData(context, "cwd");
+  return {
+    context: editContext(context, {
+      state: lifecycle.delegatedState,
+      cwd,
+      argsComplete: lifecycle.suppressPreview ? false : argsComplete,
+    }),
+    rotated,
+  };
+}
+
+function bindLiveEditResultContext(
+  context: unknown,
+  lifecycle: LiveEditRenderLifecycle,
+): Record<string, unknown> {
+  return editContext(context, {
+    state: lifecycle.delegatedState,
+    cwd: lifecycle.executionCwd ?? ownData(context, "cwd"),
+    argsComplete: lifecycle.suppressPreview ? false : ownData(context, "argsComplete"),
+  });
 }
 
 function knownEditPadding(line: string, width: number): boolean {
@@ -707,11 +821,24 @@ function renderNeutralEditBox(component: Component, width: number): string[] {
   return component.render(width);
 }
 
-function adaptEditCallRenderer(renderer: EditCallRenderer): EditCallRenderer {
+function adaptEditCallRenderer(
+  renderer: EditCallRenderer,
+  resolver?: () => unknown,
+  lifecycles?: WeakMap<object, LiveEditRenderLifecycle>,
+): EditCallRenderer {
   return (args, theme, context): Component => {
+    const binding = resolver && lifecycles
+      ? bindLiveEditCallContext(context, lifecycles, resolver)
+      : { context: editContext(context, {}), rotated: false };
     const previousComponent = componentFrom(ownData(context, "lastComponent"));
-    const previous = previousComponent && editCallInners.get(previousComponent);
-    const inner = renderer(args, theme, editContext(context, previous) as unknown as typeof context);
+    const previous = binding.rotated
+      ? undefined
+      : previousComponent && editCallInners.get(previousComponent);
+    const inner = renderer(
+      args,
+      theme,
+      editContext(binding.context, { lastComponent: previous }) as unknown as typeof context,
+    );
     const adapted: Component = {
       render(width: number): string[] {
         const lines = renderNeutralEditBox(inner, width);
@@ -723,6 +850,30 @@ function adaptEditCallRenderer(renderer: EditCallRenderer): EditCallRenderer {
       },
     };
     editCallInners.set(adapted, inner);
+    return adapted;
+  };
+}
+
+function adaptEditResultRenderer(
+  renderer: EditResultRenderer,
+  lifecycles: WeakMap<object, LiveEditRenderLifecycle>,
+): EditResultRenderer {
+  return (result, options, theme, context): Component => {
+    const state = liveEditState(context);
+    const lifecycle = state && lifecycles.get(state);
+    if (!lifecycle?.activated) return renderer(result, options, theme, context);
+
+    const previousComponent = componentFrom(ownData(context, "lastComponent"));
+    const previous = previousComponent && editResultInners.get(previousComponent);
+    const delegatedContext = bindLiveEditResultContext(context, lifecycle);
+    const inner = renderer(
+      result,
+      options,
+      theme,
+      editContext(delegatedContext, { lastComponent: previous }) as unknown as typeof context,
+    );
+    const adapted: Component = { render: (width) => inner.render(width) };
+    editResultInners.set(adapted, inner);
     return adapted;
   };
 }
@@ -1004,14 +1155,28 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
     : undefined;
   if (toolName === "edit") {
     if (typeof originalCall !== "function") return tool;
+    const originalResult = descriptors.renderResult && "value" in descriptors.renderResult
+      ? descriptors.renderResult.value as unknown
+      : undefined;
+    const resolver = dependencies.resolveEditRenderCwd;
+    const lifecycles = resolver ? new WeakMap<object, LiveEditRenderLifecycle>() : undefined;
     delete descriptors.renderCall;
+    if (resolver && typeof originalResult === "function") delete descriptors.renderResult;
     const decoratedEdit = Object.defineProperties({}, descriptors) as T;
     Object.defineProperty(decoratedEdit, "renderCall", {
       configurable: true,
       enumerable: true,
       writable: true,
-      value: adaptEditCallRenderer(originalCall as EditCallRenderer),
+      value: adaptEditCallRenderer(originalCall as EditCallRenderer, resolver, lifecycles),
     });
+    if (resolver && lifecycles && typeof originalResult === "function") {
+      Object.defineProperty(decoratedEdit, "renderResult", {
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value: adaptEditResultRenderer(originalResult as EditResultRenderer, lifecycles),
+      });
+    }
     return decoratedEdit;
   }
 

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -12,6 +12,7 @@ import { formatElapsed } from "../src/runtime/subagent-panel-render.js";
 import { createGlobTool, createGrepTool } from "../src/runtime/tools/search-tools.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/fake-sdk.js";
+import { waitUntil } from "./helpers/async.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 
 /**
@@ -127,6 +128,20 @@ describe("tool surface registration", () => {
     const sdk = await import("@earendil-works/pi-coding-agent") as any;
     sdk.initTheme();
     handle.sdk.createReadToolDefinition = (cwd: string) => sdk.createReadToolDefinition(cwd);
+    const rawEditCallContexts: any[] = [];
+    const rawEditResultContexts: any[] = [];
+    const rawEditRenderCall = vi.fn((_args: unknown, _theme: unknown, context: any) => {
+      rawEditCallContexts.push(context);
+      return context.lastComponent ?? { render: () => [`raw edit call ${context.cwd}`] };
+    });
+    const rawEditRenderResult = vi.fn((_result: unknown, _options: unknown, _theme: unknown, context: any) => {
+      rawEditResultContexts.push(context);
+      return { render: () => [`raw edit result ${context.cwd}`] };
+    });
+    handle.sdk.createEditToolDefinition = () => ({
+      renderCall: rawEditRenderCall,
+      renderResult: rawEditRenderResult,
+    }) as never;
     const fresh = fakePi();
     let internals!: Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
     picc(fresh.api as never, {
@@ -140,11 +155,16 @@ describe("tool surface registration", () => {
     });
     const subagentTools = created[0]?.customTools as Array<Record<string, any>>;
     const rawRead = subagentTools.find((tool) => tool.name === "read");
+    const rawEdit = subagentTools.find((tool) => tool.name === "edit");
     const rawMultiEdit = subagentTools.find((tool) => tool.name === "MultiEdit");
     expect(rawRead, "missing subagent read").toBeDefined();
+    expect(rawEdit, "missing subagent edit").toBeDefined();
     expect(rawMultiEdit, "missing subagent MultiEdit").toBeDefined();
     expect(rawRead!.renderShell).not.toBe("self");
+    expect(rawEdit!.renderShell).not.toBe("self");
     expect(rawMultiEdit!.renderShell).not.toBe("self");
+    expect(rawEdit!.renderCall).toBe(rawEditRenderCall);
+    expect(rawEdit!.renderResult).toBe(rawEditRenderResult);
 
     const renderRaw = (name: string, args: unknown, definition: Record<string, unknown>, result: unknown): string => {
       const row = new sdk.ToolExecutionComponent(
@@ -161,6 +181,29 @@ describe("tool surface registration", () => {
       content: [{ type: "text", text: "SUBAGENT_READ_DETAIL_ONE\nSUBAGENT_READ_DETAIL_TWO" }],
       details: undefined,
     });
+    const rawEditState = {};
+    const rawEditCwd = path.join(dir, "subagent-render-cwd").replace(/\\/g, "/");
+    const rawEditArgs = { path: "subagent-edit.txt", edits: [] };
+    const rawEditInitialContext = {
+      state: rawEditState, cwd: rawEditCwd, argsComplete: false, executionStarted: false,
+    };
+    const rawEditInitial = rawEdit!.renderCall(rawEditArgs, undefined, rawEditInitialContext);
+    const rawEditPreviewContext = {
+      ...rawEditInitialContext, argsComplete: true, lastComponent: rawEditInitial,
+    };
+    const rawEditPreview = rawEdit!.renderCall(rawEditArgs, undefined, rawEditPreviewContext);
+    const rawEditExecutionContext = {
+      ...rawEditPreviewContext, executionStarted: true, lastComponent: rawEditPreview,
+    };
+    rawEdit!.renderCall(rawEditArgs, undefined, rawEditExecutionContext);
+    const rawEditRendered = rawEdit!.renderResult(
+      { content: [{ type: "text", text: "raw settled" }], details: undefined },
+      { expanded: false, isPartial: false }, undefined, rawEditExecutionContext,
+    ).render(160).join("\n");
+    expect(rawEditCallContexts).toHaveLength(3);
+    expect(rawEditCallContexts.every(({ cwd, state }) => cwd === rawEditCwd && state === rawEditState)).toBe(true);
+    expect(rawEditResultContexts).toHaveLength(1);
+    expect(rawEditResultContexts[0]).toEqual(expect.objectContaining({ cwd: rawEditCwd, state: rawEditState }));
     const rawMultiEditRendered = renderRaw("MultiEdit", {
       file_path: "subagent-multi.txt",
       edits: [{ old_string: "old", new_string: "new" }],
@@ -172,8 +215,9 @@ describe("tool surface registration", () => {
       .replace(/\u001b\].*?(?:\u0007|\u001b\\)/gu, "")
       .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
     expect(rawReadPlain).toContain("read subagent-read.txt");
+    expect(rawEditRendered).toContain(`raw edit result ${rawEditCwd}`);
     expect(rawMultiEditRendered).toContain("Successfully applied 1 edit(s) to subagent-multi.txt.");
-    for (const rendered of [rawReadRendered, rawMultiEditRendered]) {
+    for (const rendered of [rawReadRendered, rawEditRendered, rawMultiEditRendered]) {
       expect(rendered).not.toContain("hidden");
       expect(rendered).not.toContain("to expand");
     }
@@ -886,6 +930,151 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     await exit.execute("w6", { action: "keep" });
     expect(fs.existsSync(a.details.worktreePath)).toBe(true);
     expect(fs.existsSync(b.details.worktreePath)).toBe(true);
+  });
+
+  it("registered Edit previews and settles against the effective cwd across entry and restoration", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    const edit = pi.tools.get("edit");
+    const relativePath = `edit-preview-cwd-${Date.now()}.txt`;
+    const errorRelativePath = `edit-preview-error-${Date.now()}.txt`;
+    const basePath = path.join(dir, relativePath);
+    const errorBasePath = path.join(dir, errorRelativePath);
+    const plainRow = (row: any): string => (row.render(120) as string[]).join("\n")
+      .replace(/\u001b\].*?(?:\u0007|\u001b\\)/gu, "")
+      .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+    const makeRow = (id: string, args: unknown) => new sdk.ToolExecutionComponent(
+      "edit", id, args, {}, edit, { requestRender() {} }, dir.replace(/\\/g, "/"),
+    );
+
+    fs.writeFileSync(basePath, "BASE TOKEN\n");
+    fs.writeFileSync(errorBasePath, "BASE WITHOUT MATCH\n");
+    let activeWorktree = false;
+    try {
+      const rotationArgs = {
+        path: relativePath, edits: [{ oldText: "TOKEN", newText: "ROTATED" }],
+      };
+      const rotationRow = makeRow("edit-preview-rotation", rotationArgs);
+      rotationRow.setArgsComplete();
+      await waitUntil({
+        description: "the base Edit preview to finish before cwd rotation",
+        predicate: () => plainRow(rotationRow).includes("BASE ROTATED"),
+        describeObserved: () => plainRow(rotationRow),
+        timeoutMs: 15_000,
+      });
+
+      const errorArgs = {
+        path: errorRelativePath, edits: [{ oldText: "ERROR TOKEN", newText: "RECOVERED" }],
+      };
+      const errorRow = makeRow("edit-preview-error-rotation", errorArgs);
+      errorRow.setArgsComplete();
+      await waitUntil({
+        description: "the mismatched base Edit preview to fail before cwd rotation",
+        predicate: () => plainRow(errorRow).includes("Could not find the exact text"),
+        describeObserved: () => plainRow(errorRow),
+        timeoutMs: 15_000,
+      });
+      const obsoleteErrorComponent = errorRow.callRendererComponent;
+
+      const entered = await pi.tools.get("EnterWorktree").execute(
+        "edit-preview-enter", { name: `it/edit-preview-${Date.now()}` },
+      );
+      activeWorktree = true;
+      const worktreePath = entered.details.worktreePath as string;
+      fs.writeFileSync(path.join(worktreePath, relativePath), "WORKTREE TOKEN\n");
+      fs.writeFileSync(path.join(worktreePath, errorRelativePath), "WORKTREE ERROR TOKEN\n");
+
+      errorRow.markExecutionStarted();
+      expect(errorRow.callRendererComponent).not.toBe(obsoleteErrorComponent);
+      expect(plainRow(errorRow)).not.toContain("Could not find the exact text");
+      const recoveredResult = await edit.execute("edit-preview-error-rotation", errorArgs);
+      errorRow.updateResult(recoveredResult, false);
+      const recoveredSettled = plainRow(errorRow);
+      expect(recoveredSettled).toContain("WORKTREE RECOVERED");
+      expect(recoveredSettled).not.toContain("Edit preview failed");
+      expect(recoveredResult.details.diff).toContain("WORKTREE RECOVERED");
+      expect(fs.readFileSync(errorBasePath, "utf8")).toBe("BASE WITHOUT MATCH\n");
+
+      rotationRow.markExecutionStarted();
+      expect(plainRow(rotationRow)).not.toContain("BASE ROTATED");
+      const rotatedResult = await edit.execute("edit-preview-rotation", rotationArgs);
+      rotationRow.updateResult(rotatedResult, false);
+      const rotatedSettled = plainRow(rotationRow);
+      expect(rotatedSettled).toContain("WORKTREE ROTATED");
+      expect(rotatedSettled).not.toContain("BASE ROTATED");
+      expect(rotatedSettled).not.toContain("Edit preview failed");
+      expect(rotatedResult.content[0].text).toContain("Successfully replaced 1 block");
+      expect(rotatedResult.details.diff).toContain("WORKTREE ROTATED");
+      expect(fs.readFileSync(basePath, "utf8")).toBe("BASE TOKEN\n");
+
+      fs.writeFileSync(path.join(worktreePath, relativePath), "WORKTREE FRESH\n");
+      const worktreeArgs = {
+        path: relativePath, edits: [{ oldText: "FRESH", newText: "EDITED" }],
+      };
+      const worktreeRow = makeRow("edit-preview-worktree", worktreeArgs);
+      worktreeRow.setArgsComplete();
+      await waitUntil({
+        description: "the worktree Edit preview to finish",
+        predicate: () => {
+          const preview = plainRow(worktreeRow);
+          return preview.includes("WORKTREE EDITED") && !preview.includes("BASE TOKEN");
+        },
+        describeObserved: () => plainRow(worktreeRow),
+        timeoutMs: 15_000,
+      });
+      worktreeRow.markExecutionStarted();
+      const worktreeResult = await edit.execute("edit-preview-worktree", worktreeArgs);
+      worktreeRow.updateResult(worktreeResult, false);
+      expect(plainRow(worktreeRow)).not.toContain("Edit preview failed");
+
+      await pi.tools.get("ExitWorktree").execute("edit-preview-exit", { action: "remove" });
+      activeWorktree = false;
+      const baseArgs = {
+        path: relativePath, edits: [{ oldText: "TOKEN", newText: "RESTORED" }],
+      };
+      const baseRow = makeRow("edit-preview-base", baseArgs);
+      baseRow.setArgsComplete();
+      await waitUntil({
+        description: "the restored-base Edit preview to finish",
+        predicate: () => plainRow(baseRow).includes("BASE RESTORED"),
+        describeObserved: () => plainRow(baseRow),
+        timeoutMs: 15_000,
+      });
+      baseRow.markExecutionStarted();
+      const baseResult = await edit.execute("edit-preview-base", baseArgs);
+      baseRow.updateResult(baseResult, false);
+      expect(plainRow(baseRow)).not.toContain("Edit preview failed");
+      expect(fs.readFileSync(basePath, "utf8")).toBe("BASE RESTORED\n");
+
+      const mismatchArgs = {
+        path: relativePath, edits: [{ oldText: "MISSING BLOCK", newText: "NEVER WRITTEN" }],
+      };
+      const mismatchRow = makeRow("edit-preview-mismatch", mismatchArgs);
+      mismatchRow.setArgsComplete();
+      mismatchRow.markExecutionStarted();
+      let mismatchMessage = "";
+      try {
+        await edit.execute("edit-preview-mismatch", mismatchArgs);
+      } catch (error) {
+        mismatchMessage = error instanceof Error ? error.message : String(error);
+      }
+      expect(mismatchMessage).toMatch(/not found|match/iu);
+      mismatchRow.updateResult({
+        isError: true,
+        content: [{ type: "text", text: mismatchMessage }],
+        details: undefined,
+      }, false);
+      const mismatchRendered = plainRow(mismatchRow);
+      expect(mismatchRendered).toContain("Could not find the exact text");
+      expect(mismatchRendered).toContain("Edit preview failed");
+      expect(fs.readFileSync(basePath, "utf8")).toBe("BASE RESTORED\n");
+    } finally {
+      if (activeWorktree) {
+        await pi.tools.get("ExitWorktree").execute("edit-preview-cleanup", { action: "remove" });
+      }
+      fs.rmSync(basePath, { force: true });
+      fs.rmSync(errorBasePath, { force: true });
+    }
   });
 
   it("re-registered built-in execute re-resolves the live cwd after a worktree swap", async () => {

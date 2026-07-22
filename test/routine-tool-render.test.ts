@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createRequire } from "node:module";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { initTheme, type ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -633,6 +634,281 @@ describe("routine tool rendering decorator", () => {
     expect(renderWith((width) => [" ".repeat(width), "path", " ".repeat(width), "diff", " ".repeat(width)])).toEqual([
       "path", " ".repeat(8), "diff",
     ]);
+  });
+
+  it("keeps non-live Edit state, result context, and result component transparent", () => {
+    const resolver = vi.fn(() => path.resolve("must-not-be-used"));
+    const callContexts: unknown[] = [];
+    const resultContexts: unknown[] = [];
+    const resultComponent = { render: () => ["native result"] };
+    const source = {
+      name: "edit",
+      renderCall(_args: unknown, _theme: unknown, context: unknown) {
+        callContexts.push(context);
+        return { render: () => ["native call"] };
+      },
+      renderResult(_result: unknown, _options: unknown, _theme: unknown, context: unknown) {
+        resultContexts.push(context);
+        return resultComponent;
+      },
+    } as unknown as ToolDefinition;
+    const tool = withRoutineToolRendering(source, { resolveEditRenderCwd: resolver }) as unknown as RenderTool;
+    const state = { nativeState: true };
+    const historyContext = {
+      state,
+      cwd: path.resolve("history-cwd"),
+      argsComplete: false,
+      executionStarted: false,
+    };
+
+    tool.renderCall({}, undefined, historyContext);
+    const historyResult = tool.renderResult({}, { expanded: false, isPartial: false }, undefined, historyContext);
+    const directContext = {
+      state: { htmlState: true },
+      cwd: path.resolve("html-cwd"),
+      argsComplete: true,
+      executionStarted: false,
+    };
+    const directResult = tool.renderResult({}, { expanded: true, isPartial: false }, undefined, directContext);
+
+    expect((callContexts[0] as { state: unknown }).state).toBe(state);
+    expect(resultContexts).toHaveLength(2);
+    expect(resultContexts[0]).toBe(historyContext);
+    expect(resultContexts[1]).toBe(directContext);
+    expect(historyResult).toBe(resultComponent);
+    expect(directResult).toBe(resultComponent);
+    expect(resolver).not.toHaveBeenCalled();
+  });
+
+  it("binds a live Edit row at args completion and freezes the same cwd across repeated redraws", () => {
+    const worktreeCwd = path.resolve("effective-worktree");
+    const futureCwds = [
+      worktreeCwd,
+      worktreeCwd,
+      path.resolve("future-preview-redraw"),
+      path.resolve("future-execution-redraw"),
+      path.resolve("future-result-redraw"),
+    ];
+    const launchCwd = path.resolve("launch-base");
+    const resolver = vi.fn(() => futureCwds.shift());
+    const callContexts: any[] = [];
+    const callComponents: any[] = [];
+    const resultContexts: any[] = [];
+    const source = {
+      name: "edit",
+      renderCall(_args: unknown, _theme: unknown, context: any) {
+        callContexts.push(context);
+        const component = context.lastComponent ?? { render: () => [String(context.cwd)] };
+        callComponents.push(component);
+        return component;
+      },
+      renderResult(_result: unknown, _options: unknown, _theme: unknown, context: any) {
+        resultContexts.push(context);
+        return { render: () => [String(context.cwd)] };
+      },
+    } as unknown as ToolDefinition;
+    const tool = withRoutineToolRendering(source, { resolveEditRenderCwd: resolver }) as unknown as RenderTool;
+    const state = {};
+    const base = {
+      args: { path: "same.txt", edits: [{ oldText: "a", newText: "b" }] },
+      state,
+      cwd: launchCwd,
+      marker: { preserved: true },
+      argsComplete: false,
+      executionStarted: false,
+    };
+
+    const initial = tool.renderCall(base.args, undefined, base);
+    const completeContext = { ...base, argsComplete: true, lastComponent: initial };
+    const completed = tool.renderCall(base.args, undefined, completeContext);
+    const completedRedraw = tool.renderCall(base.args, undefined, { ...completeContext, lastComponent: completed });
+    const executionContext = {
+      ...completeContext,
+      executionStarted: true,
+      lastComponent: completedRedraw,
+    };
+    const executing = tool.renderCall(base.args, undefined, executionContext);
+    const executionRedrawContext = { ...executionContext, lastComponent: executing };
+    tool.renderCall(base.args, undefined, executionRedrawContext);
+    tool.renderResult({}, { expanded: false, isPartial: false }, undefined, executionRedrawContext);
+    tool.renderResult({}, { expanded: true, isPartial: false }, undefined, executionRedrawContext);
+
+    expect(resolver).toHaveBeenCalledTimes(2);
+    expect(futureCwds).toHaveLength(3);
+    expect(callContexts.map(({ cwd, argsComplete, executionStarted }) => ({ cwd, argsComplete, executionStarted })))
+      .toEqual([
+        { cwd: launchCwd, argsComplete: false, executionStarted: false },
+        { cwd: worktreeCwd, argsComplete: true, executionStarted: false },
+        { cwd: worktreeCwd, argsComplete: true, executionStarted: false },
+        { cwd: worktreeCwd, argsComplete: true, executionStarted: true },
+        { cwd: worktreeCwd, argsComplete: true, executionStarted: true },
+      ]);
+    expect(callContexts.every(({ state: delegatedState }) => delegatedState === state)).toBe(true);
+    expect(callComponents.slice(1).every((component) => component === callComponents[1])).toBe(true);
+    expect(callContexts.slice(1).every(({ marker }) => marker === base.marker)).toBe(true);
+    expect(resultContexts).toHaveLength(2);
+    expect(resultContexts.every(({ cwd }) => cwd === worktreeCwd)).toBe(true);
+    expect(resultContexts.every(({ state: resultState }) => resultState === callContexts[1].state)).toBe(true);
+    expect(base).toEqual(expect.objectContaining({ cwd: launchCwd, argsComplete: false, state }));
+  });
+
+  it("rotates a stale Edit preview generation at execution start and detaches late completion", () => {
+    const checkoutA = path.resolve("checkout-a");
+    const checkoutB = path.resolve("checkout-b");
+    const resolver = vi.fn()
+      .mockReturnValueOnce(checkoutA)
+      .mockReturnValueOnce(checkoutB);
+    const generations: Array<{ text: string }> = [];
+    const contexts: any[] = [];
+    const source = {
+      name: "edit",
+      renderCall(_args: unknown, _theme: unknown, context: any) {
+        contexts.push(context);
+        const generation = (context.state.generation ??= { text: `generation-${generations.length + 1}` });
+        if (!generations.includes(generation)) generations.push(generation);
+        return context.lastComponent ?? { render: () => [generation.text] };
+      },
+      renderResult(_result: unknown, _options: unknown, _theme: unknown, context: any) {
+        context.state.generation.text = "authoritative-result";
+        return { render: () => [context.state.generation.text] };
+      },
+    } as unknown as ToolDefinition;
+    const tool = withRoutineToolRendering(source, { resolveEditRenderCwd: resolver }) as unknown as RenderTool;
+    const state = {};
+    const args = { path: "target.txt", edits: [{ oldText: "old", newText: "new" }] };
+    const initialContext = { args, state, cwd: "/launch", argsComplete: false, executionStarted: false };
+    const initial = tool.renderCall(args, undefined, initialContext);
+    const preview = tool.renderCall(args, undefined, {
+      ...initialContext, argsComplete: true, lastComponent: initial,
+    });
+    const executionContext = {
+      ...initialContext, argsComplete: true, executionStarted: true, lastComponent: preview,
+    };
+    const execution = tool.renderCall(args, undefined, executionContext);
+
+    expect(generations).toHaveLength(2);
+    expect(contexts[2]).toEqual(expect.objectContaining({ cwd: checkoutB, argsComplete: false }));
+    expect(contexts[2].lastComponent).toBeUndefined();
+    generations[0]!.text = "OBSOLETE LATE PREVIEW";
+    expect(execution.render(80)).toEqual(["generation-2"]);
+    expect(execution.render(80)).not.toContain("OBSOLETE LATE PREVIEW");
+    expect(tool.renderResult({}, { expanded: false, isPartial: false }, undefined, executionContext).render(80))
+      .toEqual(["authoritative-result"]);
+    expect(contexts[2].cwd).toBe(checkoutB);
+  });
+
+  it("rotates an Edit preview when execution-start cwd revalidation becomes unusable", () => {
+    const checkout = path.resolve("preview-checkout");
+    const resolver = vi.fn().mockReturnValueOnce(checkout).mockReturnValueOnce(undefined);
+    const contexts: any[] = [];
+    const tool = withRoutineToolRendering({
+      name: "edit",
+      renderCall(_args: unknown, _theme: unknown, context: any) {
+        contexts.push(context);
+        return context.lastComponent ?? { render: () => [String(context.cwd)] };
+      },
+    } as unknown as ToolDefinition, { resolveEditRenderCwd: resolver }) as unknown as RenderTool;
+    const state = {};
+    const initialContext = {
+      state, cwd: path.resolve("launch"), argsComplete: false, executionStarted: false,
+    };
+    const initial = tool.renderCall({}, undefined, initialContext);
+    const preview = tool.renderCall({}, undefined, {
+      ...initialContext, argsComplete: true, lastComponent: initial,
+    });
+    tool.renderCall({}, undefined, {
+      ...initialContext, argsComplete: true, executionStarted: true, lastComponent: preview,
+    });
+    expect(contexts[2]).toEqual(expect.objectContaining({
+      cwd: initialContext.cwd,
+      argsComplete: false,
+      lastComponent: undefined,
+    }));
+    expect(contexts[2].state).not.toBe(contexts[1].state);
+  });
+
+  it("suppresses speculative Edit preview for unusable cwd resolution and isolates concurrent rows", () => {
+    const unusable = [undefined, 7, "", "relative/path", () => { throw new Error("cwd unavailable"); }];
+    for (const candidate of unusable) {
+      const seen: any[] = [];
+      const resolver = vi.fn(() => typeof candidate === "function" ? candidate() : candidate);
+      const tool = withRoutineToolRendering({
+        name: "edit",
+        renderCall(_args: unknown, _theme: unknown, context: any) {
+          seen.push(context);
+          return { render: () => ["visible edit invocation"] };
+        },
+      } as unknown as ToolDefinition, { resolveEditRenderCwd: resolver }) as unknown as RenderTool;
+      const state = {};
+      const context = { state, cwd: "/launch", argsComplete: false, executionStarted: false };
+      tool.renderCall({}, undefined, context);
+      expect(tool.renderCall({}, undefined, { ...context, argsComplete: true }).render(80))
+        .toEqual(["visible edit invocation"]);
+      expect(seen[1]).toEqual(expect.objectContaining({ cwd: "/launch", argsComplete: false }));
+      expect(resolver).toHaveBeenCalledTimes(1);
+    }
+
+    const calls: any[] = [];
+    const rowA = path.resolve("row-a");
+    const rowB = path.resolve("row-b");
+    const cwdByRow = [rowA, rowB];
+    const tool = withRoutineToolRendering({
+      name: "edit",
+      renderCall(_args: unknown, _theme: unknown, context: any) {
+        calls.push(context);
+        return { render: () => [String(context.cwd)] };
+      },
+    } as unknown as ToolDefinition, {
+      resolveEditRenderCwd: () => cwdByRow.shift(),
+    }) as unknown as RenderTool;
+    const first = { state: {}, cwd: "/launch", argsComplete: false, executionStarted: false };
+    const second = { state: {}, cwd: "/launch", argsComplete: false, executionStarted: false };
+    tool.renderCall({}, undefined, first);
+    tool.renderCall({}, undefined, second);
+    tool.renderCall({}, undefined, { ...first, argsComplete: true });
+    tool.renderCall({}, undefined, { ...second, argsComplete: true });
+    expect(calls[2].cwd).toBe(rowA);
+    expect(calls[3].cwd).toBe(rowB);
+    expect(calls[2].state).not.toBe(calls[3].state);
+  });
+
+  it("does not consult the live Edit cwd resolver for non-Edit tools or MultiEdit", () => {
+    const resolver = vi.fn(() => path.resolve("must-not-be-used"));
+    const web = withRoutineToolRendering(createWebFetchTool(() => "."), {
+      resolveEditRenderCwd: resolver,
+    }) as unknown as RenderTool;
+    web.renderCall(fetchArgs, undefined, {
+      state: {}, cwd: path.resolve("launch"), argsComplete: true, executionStarted: false,
+    });
+    renderResult(web, fetchArgs, fetchResult);
+
+    const multi = withRoutineToolRendering({ name: "MultiEdit" } as ToolDefinition, {
+      resolveEditRenderCwd: resolver,
+      createEditDefinition: () => ({ renderResult: () => ({ render: () => ["diff"] }) }),
+    }) as unknown as RenderTool;
+    multi.renderCall({ file_path: "x", edits: [] }, undefined, {
+      state: {}, cwd: path.resolve("launch"), argsComplete: true, executionStarted: false,
+    });
+    expect(resolver).not.toHaveBeenCalled();
+  });
+
+  it("leaves Edit rendering unchanged when no live-cwd dependency is supplied", () => {
+    const contexts: any[] = [];
+    const source = {
+      name: "edit",
+      renderCall(_args: unknown, _theme: unknown, context: any) {
+        contexts.push(context);
+        return { render: () => ["native"] };
+      },
+      renderResult() { return { render: () => ["result"] }; },
+    } as unknown as ToolDefinition;
+    const tool = withRoutineToolRendering(source) as unknown as RenderTool;
+    const state = {};
+    const context = { state, cwd: "/native", argsComplete: true, executionStarted: false };
+    tool.renderCall({}, undefined, context);
+    expect(contexts[0]).toEqual(expect.objectContaining(context));
+    expect(contexts[0].state).toBe(state);
+    expect((tool as any).renderResult).toBe((source as any).renderResult);
   });
 
   it("delegates validated MultiEdit evidence once to a detached Edit result DTO without preview", () => {
