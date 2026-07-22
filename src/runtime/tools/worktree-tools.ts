@@ -66,7 +66,9 @@ export function createWorktreeTools(deps: {
           ok?: boolean;
           error?: string;
         };
-        releasedLine = `Left previous worktree (kept, unlocked): ${previous}`;
+        releasedLine = releaseResult.ok === true
+          ? `Previous worktree retained; unlock attempted: ${previous}`
+          : `Previous worktree release failed; final state unknown: ${previous}`;
         previousWorktreePath = previous;
         previousKeepOutcome = releaseResult.ok === true ? "kept" : "keep-failed";
         if (typeof releaseResult.error === "string") previousKeepError = releaseResult.error;
@@ -155,12 +157,14 @@ export function createWorktreeTools(deps: {
       // Report truthfully: "removed" only when removal actually happened.
       const text =
         params.action === "keep"
-          ? `Exited worktree (kept): ${worktreePath}. Working directory restored to ${deps.cwdState.getBase()}.`
+          ? result.ok === true
+            ? `Exited worktree (kept): ${worktreePath}. Working directory restored to ${deps.cwdState.getBase()}.`
+            : `Exited worktree, but keep FAILED; final state of ${worktreePath} is unknown. Working directory restored to ${deps.cwdState.getBase()}.`
           : result.removed === true
             ? `Exited and removed worktree: ${worktreePath}. Working directory restored.`
             : result.orphaned === true
               ? `Exited worktree; removal was blocked (Windows file lock?) — it will be reaped later. Working directory restored.`
-              : `Exited worktree, but removal FAILED${result.error ? ` (${result.error})` : ""} — ${worktreePath} was kept. Working directory restored.`;
+              : `Exited worktree, but removal FAILED${result.error ? ` (${result.error})` : ""} — final state of ${worktreePath} is unknown. Working directory restored.`;
       const outcome = params.action === "keep"
         ? result.ok === true ? "kept" : "keep-failed"
         : result.removed === true

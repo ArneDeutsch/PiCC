@@ -98,6 +98,23 @@ function text(res: ToolResult): string {
   return res.content.map((c) => c.text).join("\n");
 }
 
+function interactiveText(tool: Tool, result: ToolResult, args: Record<string, unknown>): string {
+  const decorated = withRoutineToolRendering(tool as never) as unknown as {
+    renderResult(
+      result: unknown,
+      options: unknown,
+      theme: unknown,
+      context: unknown,
+    ): { render(width: number): string[] };
+  };
+  return decorated.renderResult(
+    result,
+    { expanded: true, isPartial: false },
+    undefined,
+    { args, isError: false },
+  ).render(240).join("\n");
+}
+
 describe("EnterWorktree tool: previous-worktree handling", () => {
   it("preserves seeded-file facts beside creation metadata", async () => {
     const h = makeHarness({ seededFiles: [".env.example", "config/dev.json"] });
@@ -132,7 +149,7 @@ describe("EnterWorktree tool: previous-worktree handling", () => {
     expect(text(res)).toBe([
       `Created and entered worktree: ${h.wtPath("wt-b")}`,
       "Branch: worktree-wt-b",
-      `Left previous worktree (kept, unlocked): ${h.wtPath("wt-a")}`,
+      `Previous worktree retained; unlock attempted: ${h.wtPath("wt-a")}`,
       "The session working directory is now inside the worktree; all relative paths and shell commands run there.",
     ].join("\n"));
     expect(res.details).toEqual({
@@ -146,9 +163,18 @@ describe("EnterWorktree tool: previous-worktree handling", () => {
     });
   });
 
-  it("preserves canonical Enter prose but exposes a failed previous keep for presentation", async () => {
+  it.each([
+    { error: "DISTINCTIVE_PREVIOUS_KEEP_ERROR" },
+    { error: undefined },
+  ])("reports failed previous release and unknown state without exposing its error ($error)", async ({ error }) => {
     const h = makeHarness({
-      exitResult: { ok: false, removed: false, orphaned: false, error: "unlock denied", diagnostics: [] },
+      exitResult: {
+        ok: false,
+        removed: false,
+        orphaned: false,
+        ...(error === undefined ? {} : { error }),
+        diagnostics: [],
+      },
     });
     await h.enter.execute("t1", { name: "wt-a" });
     const res = await h.enter.execute("t2", { name: "wt-b" });
@@ -156,9 +182,10 @@ describe("EnterWorktree tool: previous-worktree handling", () => {
     expect(text(res)).toBe([
       `Created and entered worktree: ${h.wtPath("wt-b")}`,
       "Branch: worktree-wt-b",
-      `Left previous worktree (kept, unlocked): ${h.wtPath("wt-a")}`,
+      `Previous worktree release failed; final state unknown: ${h.wtPath("wt-a")}`,
       "The session working directory is now inside the worktree; all relative paths and shell commands run there.",
     ].join("\n"));
+    expect(text(res)).not.toContain("DISTINCTIVE_PREVIOUS_KEEP_ERROR");
     expect(res.details).toEqual({
       worktreePath: h.wtPath("wt-b"),
       branch: "worktree-wt-b",
@@ -167,7 +194,7 @@ describe("EnterWorktree tool: previous-worktree handling", () => {
       previousUnlockAttempted: true,
       previousWorktreePath: h.wtPath("wt-a"),
       previousKeepOutcome: "keep-failed",
-      previousKeepError: "unlock denied",
+      ...(error === undefined ? {} : { previousKeepError: error }),
     });
     expect(h.cwdState.getWorktree()).toBe(h.wtPath("wt-b"));
   });
@@ -226,7 +253,7 @@ describe("EnterWorktree tool: previous-worktree handling", () => {
 });
 
 describe("ExitWorktree tool: truthful reporting", () => {
-  it("says removal FAILED (kept) when exit() reports neither removed nor orphaned", async () => {
+  it("reports unknown final state when removal fails with an error", async () => {
     const h = makeHarness({
       exitResult: { ok: false, removed: false, orphaned: false, error: "boom", diagnostics: [] },
     });
@@ -235,7 +262,7 @@ describe("ExitWorktree tool: truthful reporting", () => {
     // Old code claimed "Exited and removed worktree" for this exact result.
     const res = await h.exit.execute("t2", { action: "remove" });
     expect(text(res)).toBe(
-      `Exited worktree, but removal FAILED (boom) — ${h.wtPath("wt-a")} was kept. Working directory restored.`,
+      `Exited worktree, but removal FAILED (boom) — final state of ${h.wtPath("wt-a")} is unknown. Working directory restored.`,
     );
     expect(h.cwdState.getWorktree()).toBeUndefined();
     expect(h.cwdState.get()).toBe(h.base);
@@ -325,6 +352,8 @@ describe("ExitWorktree tool: truthful reporting", () => {
       outcome: "deferred-removal",
       restorePath: h.base,
     });
+    expect(h.cwdState.getWorktree()).toBeUndefined();
+    expect(h.cwdState.get()).toBe(h.base);
   });
 
   it("reports keep and no-worktree cases unchanged", async () => {
@@ -347,23 +376,37 @@ describe("ExitWorktree tool: truthful reporting", () => {
       outcome: "kept",
       restorePath: h.base,
     });
+    expect(h.cwdState.getWorktree()).toBeUndefined();
+    expect(h.cwdState.get()).toBe(h.base);
   });
 
-  it("preserves canonical keep prose but exposes manager keep failure metadata", async () => {
+  it.each([
+    { error: "DISTINCTIVE_DIRECT_KEEP_ERROR" },
+    { error: undefined },
+  ])("reports failed direct keep and unknown state without exposing its error ($error)", async ({ error }) => {
     const h = makeHarness({
-      exitResult: { ok: false, removed: false, orphaned: false, error: "unlock denied", diagnostics: [] },
+      exitResult: {
+        ok: false,
+        removed: false,
+        orphaned: false,
+        ...(error === undefined ? {} : { error }),
+        diagnostics: [],
+      },
     });
     await h.enter.execute("t1", { name: "wt-a" });
     const res = await h.exit.execute("t2", { action: "keep" });
 
     expect(text(res)).toBe(
-      `Exited worktree (kept): ${h.wtPath("wt-a")}. Working directory restored to ${h.base}.`,
+      `Exited worktree, but keep FAILED; final state of ${h.wtPath("wt-a")} is unknown. Working directory restored to ${h.base}.`,
     );
+    expect(text(res)).not.toContain("DISTINCTIVE_DIRECT_KEEP_ERROR");
+    expect(h.cwdState.getWorktree()).toBeUndefined();
+    expect(h.cwdState.get()).toBe(h.base);
     expect(res.details).toEqual({
       ok: false,
       removed: false,
       orphaned: false,
-      error: "unlock denied",
+      ...(error === undefined ? {} : { error }),
       diagnostics: [],
       worktreePath: h.wtPath("wt-a"),
       outcome: "keep-failed",
@@ -423,6 +466,68 @@ describe("ExitWorktree tool: truthful reporting", () => {
     );
   });
 
+  it("keeps canonical and interactive evidence levels aligned for uncertain producer outcomes", async () => {
+    const enterHarness = makeHarness({
+      exitResult: {
+        ok: false,
+        removed: false,
+        orphaned: false,
+        error: "ENTER_DIAGNOSTIC_SENTINEL",
+        diagnostics: [],
+      },
+    });
+    await enterHarness.enter.execute("t1", { name: "wt-a" });
+    const uncertainEnter = await enterHarness.enter.execute("t2", { name: "wt-b" });
+
+    const keepHarness = makeHarness({
+      exitResult: {
+        ok: false,
+        removed: false,
+        orphaned: false,
+        error: "KEEP_DIAGNOSTIC_SENTINEL",
+        diagnostics: [],
+      },
+    });
+    await keepHarness.enter.execute("t1", { name: "wt-a" });
+    const uncertainKeep = await keepHarness.exit.execute("t2", { action: "keep" });
+
+    const removeHarness = makeHarness({
+      exitResult: {
+        ok: false,
+        removed: false,
+        orphaned: false,
+        error: "REMOVE_DIAGNOSTIC_SENTINEL",
+        diagnostics: [],
+      },
+    });
+    await removeHarness.enter.execute("t1", { name: "wt-a" });
+    const uncertainRemoval = await removeHarness.exit.execute("t2", { action: "remove" });
+
+    expect(text(uncertainEnter)).toBe([
+      `Created and entered worktree: ${enterHarness.wtPath("wt-b")}`,
+      "Branch: worktree-wt-b",
+      `Previous worktree release failed; final state unknown: ${enterHarness.wtPath("wt-a")}`,
+      "The session working directory is now inside the worktree; all relative paths and shell commands run there.",
+    ].join("\n"));
+    expect(interactiveText(enterHarness.enter, uncertainEnter, { name: "wt-b" })).toBe(
+      `EnterWorktree(${enterHarness.wtPath("wt-b")}) on branch worktree-wt-b; previous ${enterHarness.wtPath("wt-a")} keep failed: ENTER_DIAGNOSTIC_SENTINEL; previous worktree state unknown`,
+    );
+
+    expect(text(uncertainKeep)).toBe(
+      `Exited worktree, but keep FAILED; final state of ${keepHarness.wtPath("wt-a")} is unknown. Working directory restored to ${keepHarness.base}.`,
+    );
+    expect(interactiveText(keepHarness.exit, uncertainKeep, { action: "keep" })).toBe(
+      `ExitWorktree(${keepHarness.wtPath("wt-a")}) keep failed: KEEP_DIAGNOSTIC_SENTINEL; worktree state unknown; restored ${keepHarness.base}`,
+    );
+
+    expect(text(uncertainRemoval)).toBe(
+      `Exited worktree, but removal FAILED (REMOVE_DIAGNOSTIC_SENTINEL) — final state of ${removeHarness.wtPath("wt-a")} is unknown. Working directory restored.`,
+    );
+    expect(interactiveText(removeHarness.exit, uncertainRemoval, { action: "remove" })).toBe(
+      `ExitWorktree(${removeHarness.wtPath("wt-a")}) removal failed: REMOVE_DIAGNOSTIC_SENTINEL; worktree state unknown; restored ${removeHarness.base}`,
+    );
+  });
+
   it("classifies the manager catch shape without inventing an error cause", async () => {
     const h = makeHarness({
       exitResult: { ok: false, removed: false, orphaned: false, diagnostics: [] },
@@ -430,7 +535,7 @@ describe("ExitWorktree tool: truthful reporting", () => {
     await h.enter.execute("t1", { name: "wt-a" });
     const res = await h.exit.execute("t2", { action: "remove" });
     expect(text(res)).toBe(
-      `Exited worktree, but removal FAILED — ${h.wtPath("wt-a")} was kept. Working directory restored.`,
+      `Exited worktree, but removal FAILED — final state of ${h.wtPath("wt-a")} is unknown. Working directory restored.`,
     );
     expect(res.details).toEqual({
       worktreePath: h.wtPath("wt-a"),
@@ -441,5 +546,7 @@ describe("ExitWorktree tool: truthful reporting", () => {
       orphaned: false,
       diagnostics: [],
     });
+    expect(h.cwdState.getWorktree()).toBeUndefined();
+    expect(h.cwdState.get()).toBe(h.base);
   });
 });
