@@ -947,7 +947,9 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     sdk.initTheme();
     const edit = pi.tools.get("edit");
     const relativePath = `edit-preview-cwd-${Date.now()}.txt`;
+    const errorRelativePath = `edit-preview-error-${Date.now()}.txt`;
     const basePath = path.join(dir, relativePath);
+    const errorBasePath = path.join(dir, errorRelativePath);
     const plainRow = (row: any): string => (row.render(120) as string[]).join("\n")
       .replace(/\u001b\].*?(?:\u0007|\u001b\\)/gu, "")
       .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
@@ -956,6 +958,7 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     );
 
     fs.writeFileSync(basePath, "BASE TOKEN\n");
+    fs.writeFileSync(errorBasePath, "BASE WITHOUT MATCH\n");
     let activeWorktree = false;
     try {
       const rotationArgs = {
@@ -970,12 +973,37 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
         timeoutMs: 15_000,
       });
 
+      const errorArgs = {
+        path: errorRelativePath, edits: [{ oldText: "ERROR TOKEN", newText: "RECOVERED" }],
+      };
+      const errorRow = makeRow("edit-preview-error-rotation", errorArgs);
+      errorRow.setArgsComplete();
+      await waitUntil({
+        description: "the mismatched base Edit preview to fail before cwd rotation",
+        predicate: () => plainRow(errorRow).includes("Could not find the exact text"),
+        describeObserved: () => plainRow(errorRow),
+        timeoutMs: 15_000,
+      });
+      const obsoleteErrorComponent = errorRow.callRendererComponent;
+
       const entered = await pi.tools.get("EnterWorktree").execute(
         "edit-preview-enter", { name: `it/edit-preview-${Date.now()}` },
       );
       activeWorktree = true;
       const worktreePath = entered.details.worktreePath as string;
       fs.writeFileSync(path.join(worktreePath, relativePath), "WORKTREE TOKEN\n");
+      fs.writeFileSync(path.join(worktreePath, errorRelativePath), "WORKTREE ERROR TOKEN\n");
+
+      errorRow.markExecutionStarted();
+      expect(errorRow.callRendererComponent).not.toBe(obsoleteErrorComponent);
+      expect(plainRow(errorRow)).not.toContain("Could not find the exact text");
+      const recoveredResult = await edit.execute("edit-preview-error-rotation", errorArgs);
+      errorRow.updateResult(recoveredResult, false);
+      const recoveredSettled = plainRow(errorRow);
+      expect(recoveredSettled).toContain("WORKTREE RECOVERED");
+      expect(recoveredSettled).not.toContain("Edit preview failed");
+      expect(recoveredResult.details.diff).toContain("WORKTREE RECOVERED");
+      expect(fs.readFileSync(errorBasePath, "utf8")).toBe("BASE WITHOUT MATCH\n");
 
       rotationRow.markExecutionStarted();
       expect(plainRow(rotationRow)).not.toContain("BASE ROTATED");
@@ -1055,6 +1083,7 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
         await pi.tools.get("ExitWorktree").execute("edit-preview-cleanup", { action: "remove" });
       }
       fs.rmSync(basePath, { force: true });
+      fs.rmSync(errorBasePath, { force: true });
     }
   });
 

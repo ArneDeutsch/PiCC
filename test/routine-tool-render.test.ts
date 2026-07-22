@@ -577,6 +577,50 @@ describe("routine tool rendering decorator", () => {
     ]);
   });
 
+  it("keeps non-live Edit state, result context, and result component transparent", () => {
+    const resolver = vi.fn(() => path.resolve("must-not-be-used"));
+    const callContexts: unknown[] = [];
+    const resultContexts: unknown[] = [];
+    const resultComponent = { render: () => ["native result"] };
+    const source = {
+      name: "edit",
+      renderCall(_args: unknown, _theme: unknown, context: unknown) {
+        callContexts.push(context);
+        return { render: () => ["native call"] };
+      },
+      renderResult(_result: unknown, _options: unknown, _theme: unknown, context: unknown) {
+        resultContexts.push(context);
+        return resultComponent;
+      },
+    } as unknown as ToolDefinition;
+    const tool = withRoutineToolRendering(source, { resolveEditRenderCwd: resolver }) as unknown as RenderTool;
+    const state = { nativeState: true };
+    const historyContext = {
+      state,
+      cwd: path.resolve("history-cwd"),
+      argsComplete: false,
+      executionStarted: false,
+    };
+
+    tool.renderCall({}, undefined, historyContext);
+    const historyResult = tool.renderResult({}, { expanded: false, isPartial: false }, undefined, historyContext);
+    const directContext = {
+      state: { htmlState: true },
+      cwd: path.resolve("html-cwd"),
+      argsComplete: true,
+      executionStarted: false,
+    };
+    const directResult = tool.renderResult({}, { expanded: true, isPartial: false }, undefined, directContext);
+
+    expect((callContexts[0] as { state: unknown }).state).toBe(state);
+    expect(resultContexts).toHaveLength(2);
+    expect(resultContexts[0]).toBe(historyContext);
+    expect(resultContexts[1]).toBe(directContext);
+    expect(historyResult).toBe(resultComponent);
+    expect(directResult).toBe(resultComponent);
+    expect(resolver).not.toHaveBeenCalled();
+  });
+
   it("binds a live Edit row at args completion and freezes the same cwd across repeated redraws", () => {
     const worktreeCwd = path.resolve("effective-worktree");
     const futureCwds = [
@@ -640,9 +684,7 @@ describe("routine tool rendering decorator", () => {
         { cwd: worktreeCwd, argsComplete: true, executionStarted: true },
         { cwd: worktreeCwd, argsComplete: true, executionStarted: true },
       ]);
-    expect(callContexts.slice(1).every(({ state: delegatedState }) => delegatedState === callContexts[1].state))
-      .toBe(true);
-    expect(callContexts[1].state).not.toBe(state);
+    expect(callContexts.every(({ state: delegatedState }) => delegatedState === state)).toBe(true);
     expect(callComponents.slice(1).every((component) => component === callComponents[1])).toBe(true);
     expect(callContexts.slice(1).every(({ marker }) => marker === base.marker)).toBe(true);
     expect(resultContexts).toHaveLength(2);

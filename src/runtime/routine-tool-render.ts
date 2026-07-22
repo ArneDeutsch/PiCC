@@ -693,7 +693,8 @@ function usableAbsoluteCwd(value: unknown): string | undefined {
 }
 
 interface LiveEditRenderLifecycle {
-  delegatedState: Record<string, unknown>;
+  delegatedState: object;
+  activated: boolean;
   previewResolutionDone: boolean;
   previewCwd?: string;
   previewStarted: boolean;
@@ -738,7 +739,8 @@ function bindLiveEditCallContext(
       return { context: editContext(context, {}), rotated: false };
     }
     lifecycle = {
-      delegatedState: {},
+      delegatedState: state,
+      activated: false,
       previewResolutionDone: false,
       previewStarted: false,
       executionResolutionDone: false,
@@ -748,6 +750,7 @@ function bindLiveEditCallContext(
   }
 
   if (argsComplete && !executionStarted && !lifecycle.previewResolutionDone) {
+    lifecycle.activated = true;
     lifecycle.previewResolutionDone = true;
     lifecycle.previewCwd = resolveEditRenderCwd(resolver);
     lifecycle.previewStarted = lifecycle.previewCwd !== undefined;
@@ -756,6 +759,7 @@ function bindLiveEditCallContext(
 
   let rotated = false;
   if (executionStarted && !lifecycle.executionResolutionDone) {
+    lifecycle.activated = true;
     lifecycle.executionResolutionDone = true;
     lifecycle.executionCwd = resolveEditRenderCwd(resolver);
     if (!lifecycle.previewStarted || lifecycle.executionCwd !== lifecycle.previewCwd) {
@@ -783,11 +787,8 @@ function bindLiveEditCallContext(
 
 function bindLiveEditResultContext(
   context: unknown,
-  lifecycles: WeakMap<object, LiveEditRenderLifecycle>,
+  lifecycle: LiveEditRenderLifecycle,
 ): Record<string, unknown> {
-  const state = liveEditState(context);
-  const lifecycle = state && lifecycles.get(state);
-  if (!lifecycle) return editContext(context, {});
   return editContext(context, {
     state: lifecycle.delegatedState,
     cwd: lifecycle.executionCwd ?? ownData(context, "cwd"),
@@ -843,9 +844,13 @@ function adaptEditResultRenderer(
   lifecycles: WeakMap<object, LiveEditRenderLifecycle>,
 ): EditResultRenderer {
   return (result, options, theme, context): Component => {
+    const state = liveEditState(context);
+    const lifecycle = state && lifecycles.get(state);
+    if (!lifecycle?.activated) return renderer(result, options, theme, context);
+
     const previousComponent = componentFrom(ownData(context, "lastComponent"));
     const previous = previousComponent && editResultInners.get(previousComponent);
-    const delegatedContext = bindLiveEditResultContext(context, lifecycles);
+    const delegatedContext = bindLiveEditResultContext(context, lifecycle);
     const inner = renderer(
       result,
       options,
