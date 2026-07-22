@@ -1188,3 +1188,285 @@ describe("implementer standing rules — incremental logs and OS-temp scratch (#
     expect(body).toContain("never inside the worktree");
   });
 });
+
+describe("current-feature proportional review triage", () => {
+  const read = (relative: string): string =>
+    fs.readFileSync(path.join(SKILL_DIR, relative), "utf8").replace(/\r\n/g, "\n");
+  const collapseText = (text: string): string =>
+    text.toLowerCase().replace(/\s+/g, " ").trim();
+  const collapse = (relative: string): string => collapseText(read(relative));
+  const bulletContaining = (text: string, marker: string): string => {
+    const bullet = text.split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.startsWith("- ") && line.includes(marker));
+    expect(bullet, `missing bullet containing: ${marker}`).toBeDefined();
+    return bullet!;
+  };
+  const between = (text: string, start: string, end: string): string => {
+    const from = text.indexOf(start);
+    const to = text.indexOf(end, from + start.length);
+    expect(from, `missing section start: ${start}`).toBeGreaterThanOrEqual(0);
+    expect(to, `missing section end: ${end}`).toBeGreaterThan(from);
+    return text.slice(from, to);
+  };
+  const expectBefore = (text: string, first: string, second: string): void => {
+    const firstIndex = text.indexOf(first);
+    const secondIndex = text.indexOf(second);
+    expect(firstIndex, `missing marker: ${first}`).toBeGreaterThanOrEqual(0);
+    expect(secondIndex, `missing marker: ${second}`).toBeGreaterThanOrEqual(0);
+    expect(firstIndex).toBeLessThan(secondIndex);
+  };
+
+  it("keeps the concise anti-waiver principle resident and routes one canonical gate", () => {
+    const router = collapse("SKILL.md");
+    const principles = between(router, "## principles", "## subagent roster");
+    expect(principles).toContain("reviewer severity is evidence, not authorization");
+    expect(principles).toContain("verify and classify findings before expanding current-feature work");
+    expect(principles).toContain("references/review-triage.md");
+    for (const obligation of [
+      "explicit acceptance", "correctness", "security", "compatibility", "cross-platform", "truthfulness",
+    ]) expect(principles, obligation).toContain(obligation);
+    expect(principles).toContain("cannot be waived as disproportionate");
+    expect(principles).toContain("surface immediately when a current direction, blocker, or safety decision is required");
+    expect(principles).toContain("otherwise preserve findings for the phase's assessed presentation");
+  });
+
+  it("orders safe verification, obligation classification, then remedy judgement", () => {
+    const canonical = collapse("references/review-triage.md");
+    const ordered = between(canonical, "## ordered decision", "## decision-ready review evidence");
+    expectBefore(ordered, "verify safely and independently", "classify the obligation");
+    expectBefore(ordered, "classify the obligation", "judge the remedy");
+    expect(ordered).toContain("mandatory current-feature obligation");
+    expect(ordered).toContain("discretionary current-feature opportunity");
+    expect(ordered).toContain("unrelated/pre-existing concern");
+    expect(ordered).toContain("smallest sufficient remedy that fully discharges the obligation");
+  });
+
+  it("pins safe verification without authorizing hostile dynamic evidence", () => {
+    const canonical = collapse("references/review-triage.md");
+    const ordered = between(canonical, "## ordered decision", "## decision-ready review evidence");
+    expect(ordered).toContain("source/path reasoning");
+    expect(ordered).toContain("existing trusted evidence");
+    expect(ordered).toContain("inert or benign fixtures");
+    expect(ordered).toMatch(
+      /never execute or fetch[^.]+exploit[^.]+reproducer[^.]+command[^.]+script[^.]+hook[^.]+link/,
+    );
+    expect(ordered).toMatch(
+      /dynamic reproduction[^.]+requires explicit user approval[^.]+separately justified containment/,
+    );
+    expect(ordered).toContain("attacker-input-to-trust-boundary path");
+    expect(ordered).toContain("without executing an exploit");
+  });
+
+  it("requires decision-ready evidence for changes and removals", () => {
+    const canonical = collapse("references/review-triage.md");
+    const evidence = between(canonical, "## decision-ready review evidence", "## proportional remedy gate");
+    for (const marker of [
+      "approved outcome or contract invalidated by the current feature",
+      "realistic user, runtime, or threat path",
+      "smallest sufficient remedy",
+      "proof at the nearest sufficient layer",
+      "material marginal implementation, review, and maintenance burden",
+      "what becomes incomplete, unsafe, incompatible, cross-platform-broken, or untruthful",
+      "for a removal or reversion",
+      "what approved behavior and proof remain afterward",
+      "reviewers supply this evidence; they do not decide admission",
+    ]) expect(evidence, marker).toContain(marker);
+  });
+
+  it("pins the full qualitative remedy gate, positive admission, and boundary-appropriate proof", () => {
+    const canonical = collapse("references/review-triage.md");
+    const gate = between(canonical, "## proportional remedy gate", "## floors and default dispositions");
+    for (const marker of [
+      "direct linkage to the approved outcome or a contract invalidated by the current feature",
+      "realistic path to observable impact",
+      "value or risk reduction proportionate to implementation, review, and maintenance cost",
+      "proof at the nearest sufficient layer",
+      "justified marginal durable surface and maintenance burden",
+      "successful removal test",
+      "end-to-end proof remains appropriate when the claim genuinely crosses that boundary",
+    ]) expect(gate, marker).toContain(marker);
+    expect(gate).toMatch(/discretionary work that clearly passes the full gate is admitted/);
+    expect(canonical).toContain("applies only to review-driven decisions inside the implement-feature workflow");
+    expect(canonical).toContain("qualitative");
+    expect(canonical).toContain("do not invent scores, numeric thresholds, or change/testing quotas");
+  });
+
+  it("pins mandatory floors and ties each default category to its disposition", () => {
+    const canonical = read("references/review-triage.md").toLowerCase();
+    const dispositions = between(canonical, "## floors and default dispositions", "## deferral path");
+    const blockerDisposition = bulletContaining(dispositions, "verified blockers affecting");
+    for (const obligation of [
+      "explicit acceptance criteria", "correctness", "security", "compatibility",
+      "cross-platform behavior", "truthfulness",
+    ]) expect(blockerDisposition, obligation).toContain(obligation);
+    expect(blockerDisposition).toContain("fixed now with the smallest sufficient remedy");
+    expect(blockerDisposition).toContain("cannot be waived as disproportionate");
+    expect(collapseText(dispositions)).toContain("unsupported severity labels receive ordinary gate treatment");
+    expect(dispositions).toMatch(
+      /optional hardening and `should`\/`nit` findings defer unless they clearly pass the full gate/,
+    );
+    expect(dispositions).toMatch(
+      /opportunistic refactors, helpers, abstractions, duplicated proof, and speculative infrastructure defer unless they clearly pass the full gate/,
+    );
+    expect(dispositions).toMatch(/wrong, duplicate, and non-actionable findings may be dropped/);
+  });
+
+  it("pins the complete serious-pre-existing-defect admission boundary", () => {
+    const canonical = read("references/review-triage.md").toLowerCase();
+    const dispositions = between(canonical, "## floors and default dispositions", "## deferral path");
+    const preExistingDisposition = bulletContaining(dispositions, "serious pre-existing defects");
+    expect(preExistingDisposition).toContain("surfaced promptly and preserved");
+    expect(preExistingDisposition).toContain("join active work only when");
+    for (const trigger of [
+      "creates or materially widens their realistic user/runtime/threat reachability",
+      "depends on them", "worsens them", "cannot safely and truthfully ship because of them",
+    ]) expect(preExistingDisposition, trigger).toContain(trigger);
+    expect(preExistingDisposition).toContain("discovery during review alone does not qualify");
+  });
+
+  it("requires safe corrective removal without weakening unrelated defenses", () => {
+    const canonical = collapse("references/review-triage.md");
+    const dispositions = between(canonical, "## floors and default dispositions", "## deferral path");
+    expect(dispositions).toContain("existing verified aggregate excess");
+    expect(dispositions).toContain("obligation to remove during close review");
+    expect(dispositions).toContain("smallest safe corrective removal");
+    expect(dispositions).toContain("confirm accepted behavior and proof remain");
+    expect(dispositions).toContain("never authorize weakening or deleting unrelated existing");
+    for (const defense of ["security", "permission", "path", "ticket", "public-write", "other safety defenses"]) {
+      expect(dispositions, defense).toContain(defense);
+    }
+  });
+
+  it("loads the canonical reference fail-closed in Phases 6, 7, and 8", () => {
+    const phases = [
+      ["phase-6-plan-review.md", "fan out reviewers"],
+      ["phase-7-implementation.md", "3. **review fan-out**"],
+      ["phase-8-close-review.md", "fan out the full relevant roster"],
+    ] as const;
+    for (const [phase, dispatchMarker] of phases) {
+      const body = collapse(`references/${phase}`);
+      expect(body, phase).toContain("before review dispatch or triage");
+      expect(body, phase).toContain("read or re-read [review-triage.md](review-triage.md)");
+      expect(body, phase).toContain("if it is unreadable");
+      expect(body, phase).toMatch(/refuse review-driven[^.]+(?:write|scope expansion|fix|removal|new task)/);
+      expectBefore(body, "review-triage.md", dispatchMarker);
+    }
+  });
+
+  it("requests scoped canonical evidence before collection and gates each phase before expansion", () => {
+    const phase6 = collapse("references/phase-6-plan-review.md");
+    const review6 = between(phase6, "fan out reviewers", "surface major findings");
+    expect(review6).toContain("every proposed remedy affecting accepted scope or a durable surface");
+    expectBefore(review6, "decision-ready review evidence", "after collecting findings");
+    expectBefore(review6, "verify, classify, and judge each remedy", "changing task scope, dependencies, rationales, or writable surfaces");
+
+    const phase7 = collapse("references/phase-7-implementation.md");
+    const review7 = between(phase7, "3. **review fan-out**", "5. **distill observations**");
+    expect(review7).toContain("each proposed remedy affecting accepted scope or a durable surface");
+    expectBefore(review7, "decision-ready review evidence", "after collecting findings");
+    expectBefore(review7, "apply the canonical remedy gate", "accepting any fix, refactor, reversion, or new durable surface");
+
+    const phase8 = collapse("references/phase-8-close-review.md");
+    const review8 = between(phase8, "when all tasks are complete", "also make sure the repo's own records");
+    expect(review8).toContain("every proposed remedy affecting accepted scope or a durable surface");
+    expectBefore(review8, "decision-ready review evidence", "after collecting findings");
+    expectBefore(review8, "apply the canonical remedy gate", "before any close fix, corrective removal, new durable surface, or new task");
+    expect(review8).toContain("corrective removal remains mandatory");
+    expect(review8).toContain("no accepted obligation or proof is lost");
+    expect(review8).toContain("verified current-feature blocker cannot remain unresolved at completion");
+  });
+
+  it("captures useful deferrals at each triage decision before corrective loops", () => {
+    const phase6 = collapse("references/phase-6-plan-review.md");
+    const review6 = between(phase6, "fan out reviewers", "surface major findings");
+    expectBefore(review6, "judge each remedy", "at the moment triage decides");
+    expectBefore(review6, "at the moment triage decides", "fix admitted findings");
+    expect(review6).toMatch(/immediately append[^.]+run-local `observations\.md`/);
+    expect(review6).toContain("yyyy-mm-dd — phase 6 deferred: <finding and disposition>");
+
+    const phase7 = collapse("references/phase-7-implementation.md");
+    const review7 = between(phase7, "3. **review fan-out**", "5. **distill observations**");
+    expectBefore(review7, "apply the canonical remedy gate", "at the moment triage decides");
+    expectBefore(review7, "at the moment triage decides", "drop what's wrong");
+    expect(review7).toMatch(/immediately append[^.]+run-local `observations\.md`/);
+    expect(review7).toContain("yyyy-mm-dd — phase 7 deferred: <finding and disposition>");
+    const distill7 = between(phase7, "5. **distill observations**", "6. **gate and commit**");
+    expect(distill7).toContain("triage did not already capture");
+    expect(distill7).toContain("do not postpone or duplicate");
+
+    const phase8 = collapse("references/phase-8-close-review.md");
+    const review8 = between(phase8, "when all tasks are complete", "also make sure the repo's own records");
+    expectBefore(review8, "apply the canonical remedy gate", "at the moment triage decides");
+    expectBefore(review8, "at the moment triage decides", "remove already committed aggregate excess");
+    expect(review8).toMatch(/immediately append[^.]+run-local `observations\.md`/);
+    expect(review8).toContain("yyyy-mm-dd — phase 8 deferred: <finding and disposition>");
+    expect(review8).toContain("before corrective work or new-task creation");
+  });
+
+  it("carries every useful phase finding through the assessed offer before completion", () => {
+    const phase8 = collapse("references/phase-8-close-review.md");
+    const close = between(phase8, "before asking the user to close the feature", "the ticket-path close hooks");
+    expectBefore(close, "write the feature's `review.md`", "by distilling `observations.md`");
+    expect(close).toContain("every still-useful deferred phase 6, 7, or 8 finding that warrants follow-up");
+    expectBefore(close, "write the feature's `review.md`", "`bugs discovered` or `proposed follow-ups`");
+    expectBefore(close, "`bugs discovered` or `proposed follow-ups`", "invoke the existing per-item offer");
+    expectBefore(close, "invoke the existing per-item offer", "proposal gate assesses the findings");
+    expectBefore(close, "proposal gate assesses the findings", "presenting one coherent assessed pick-list");
+    expect(close).not.toMatch(/present[^.]+(?:then|before)[^.]+(?:run|invoke)[^.]+per-item offer/);
+    expectBefore(phase8, "per-item offer", "completion summary");
+    expectBefore(phase8, "completion summary", "agrees");
+  });
+
+  it("reserves Phase 8 follow-up presentation for the assessed pick-list", () => {
+    const phase8 = collapse("references/phase-8-close-review.md");
+    const triage = between(phase8, "integrate. after collecting findings", "also make sure the repo's own records");
+    expect(triage).toContain("do not ordinarily present a deferred or follow-up finding yet");
+    expect(triage).toContain("reserve ordinary follow-up presentation for the one proposal-gated assessed pick-list");
+    expect(triage).toMatch(
+      /surface a finding immediately only when it requires a current direction, blocker, or safety decision[^.]+after capturing it in `observations\.md`/,
+    );
+    expectBefore(phase8, "do not ordinarily present", "invoke the existing per-item offer");
+
+    const canonical = collapse("references/review-triage.md");
+    const deferralStart = canonical.indexOf("## deferral path");
+    expect(deferralStart).toBeGreaterThanOrEqual(0);
+    const deferral = canonical.slice(deferralStart);
+    expect(deferral).toContain("interrupt immediately only when a finding requires a current direction, blocker, or safety decision");
+    expect(deferral).toContain("in phase 8, capture ordinary follow-ups without presenting them early");
+    expect(deferral).toContain("reserve their presentation for the single proposal-gated assessed pick-list");
+  });
+
+  it("describes low-value and GitHub-unavailable branches as run-local, not durable", () => {
+    const filing = collapse("references/phase-8-file-finding.md");
+    const unavailable = between(filing, "## reachability preconditions", "## gate through evaluate's proposal-gate");
+    expect(unavailable).toContain("no durable cross-feature record was created");
+    expect(unavailable).toContain("`observations.md` and `review.md` remain run-local staging records");
+    expect(unavailable).toContain("lost with worktree cleanup");
+    expect(unavailable).toContain("do not imply that either persists");
+
+    const lowValue = between(filing, "## gate through evaluate's proposal-gate", "## cross-feature \"already-tracked?\" check");
+    expect(lowValue).toContain("remain in review.md as run-local staging until worktree cleanup");
+    expect(lowValue).toContain("no durable issue was filed");
+    expect(lowValue).toContain("not durable unless the user approves filing and a github issue is created");
+    expect(filing).toContain("only a user-approved filed github issue is durable cross-feature tracking");
+
+    const proposal = collapseText(fs.readFileSync(
+      path.join(EVALUATE_DIR, "references", "proposal-gate.md"),
+      "utf8",
+    ));
+    const phase8Wiring = between(proposal, "- **phase 8 issue-filing offer**", "- **phase 1 ticket-creation offer**");
+    expect(phase8Wiring).toMatch(/remain in `review\.md` only as run-local staging[^.]+lost with worktree cleanup/);
+    expect(phase8Wiring).toContain("lost with worktree cleanup");
+    expect(phase8Wiring).toContain("no durable issue was filed");
+    expect(phase8Wiring).toContain("only a user-approved filed github issue is durable cross-feature tracking");
+    expect(phase8Wiring).not.toContain("`review.md` as the durable record");
+  });
+
+  it("keeps the plan layout truthful when observations begin in Phase 6", () => {
+    const templates = collapse("references/templates.md");
+    expect(templates).toContain("observations.md");
+    expect(templates).toContain("begins when needed in phase 6");
+    expect(templates).toContain("continues through phases 7–8");
+  });
+});

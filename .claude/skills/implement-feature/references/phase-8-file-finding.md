@@ -4,7 +4,7 @@ Read this at **Phase 8**, inside the close review ([phase-8-close-review.md](pha
 
 ## The offer: what and when
 
-**Optional issue-filing for out-of-scope findings (either path).** The bugs left unfixed and the improvement opportunities you just distilled into `review.md` (its *Bugs discovered* and *Proposed follow-ups* sections) are exactly the things that get lost after hand-off.
+**Optional issue-filing for out-of-scope findings (either path).** The bugs left unfixed and improvement opportunities just distilled into run-local `review.md` (its *Bugs discovered* and *Proposed follow-ups* sections) need this offer because that staging record is lost with worktree cleanup. Only a user-approved filed GitHub issue is durable cross-feature tracking.
 
 So when you present those findings, **offer to file the ones the user picks as GitHub issues.**
 
@@ -12,13 +12,13 @@ This is the **sibling** of the Phase 1 ticket-creation offer ([ticket-creation.m
 
 ## Reachability preconditions
 
-It runs regardless of whether a ticket ref was given — surfaced work is worth tracking either way — so first confirm GitHub is reachable with the gate's own preconditions (`gh` installed, `gh auth status` authenticated, and a resolvable `target` repo — [fork.md](fork.md), `origin`'s repo on a maintainer checkout, the upstream `parent` on a fork); if any fails, say so and let `review.md` stand as the only record.
+It runs regardless of whether a ticket ref was given — surfaced work is worth tracking either way — so first confirm GitHub is reachable with the gate's own preconditions (`gh` installed, `gh auth status` authenticated, and a resolvable `target` repo — [fork.md](fork.md), `origin`'s repo on a maintainer checkout, the upstream `parent` on a fork). If any fails, say that no durable cross-feature record was created: `observations.md` and `review.md` remain run-local staging records and are lost with worktree cleanup; do not imply that either persists.
 
 ## Gate through evaluate's proposal-gate
 
-**Before presenting the findings, gate them through evaluate's proposal-gate** ([../../evaluate/references/proposal-gate.md](../../evaluate/references/proposal-gate.md) — the read-only sandbox scorer, structurally no GitHub writes): it scores each finding against the shared rubric and **silently drops clear slop**, emitting a **one-line tally that says the dropped findings remain in `review.md`** ("(N low-value findings not offered — they remain in review.md)") so nothing vanishes invisibly.
+**Before presenting the findings, gate them through evaluate's proposal-gate** ([../../evaluate/references/proposal-gate.md](../../evaluate/references/proposal-gate.md) — the read-only sandbox scorer, structurally no GitHub writes): it scores each finding against the shared rubric and **silently drops clear slop**, emitting a truthful **one-line tally**: "(N low-value findings not offered — they remain in review.md as run-local staging until worktree cleanup; no durable issue was filed.)" Nothing vanishes invisibly, but the tally must not imply persistence.
 
-That tally is an **in-flow lever, not just a pointer to `review.md`**: a maintainer who disagrees with the gate can **ask to see the gate-dropped findings, and you surface them into the pick-list on request** (they stay in `review.md` as the durable record either way).
+That tally is an **in-flow lever, not just a pointer to `review.md`**: a maintainer who disagrees with the gate can **ask to see the gate-dropped findings, and you surface them into the pick-list on request** while the run remains active. They are not durable unless the user approves filing and a GitHub issue is created.
 
 ## Cross-feature "already-tracked?" check
 
