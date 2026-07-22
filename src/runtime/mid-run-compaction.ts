@@ -31,8 +31,7 @@ export type CompactionFailureCategory =
   | "hook-blocked"
   | "restoration-paused"
   | "stale-generation"
-  | "shutdown"
-  | "overflow-recovery";
+  | "shutdown";
 export type CheckpointDiagnosticCategory =
   | "checkpoint-armed"
   | "checkpoint-retrying"
@@ -106,8 +105,6 @@ export interface ResumeContext {
   signal: AbortSignal;
 }
 
-export interface ReplayContext extends ResumeContext {}
-
 export type ReplayDeliveryResult = { delivered: true } | { delivered: false };
 
 /**
@@ -115,23 +112,13 @@ export type ReplayDeliveryResult = { delivered: true } | { delivered: false };
  * their nested settlement with `resumedSettled`; Promise runs provide `settled`.
  */
 export interface ResumedRunOwnership {
-  replay(input: QueuedInputShadow, context: ReplayContext): ReplayDeliveryResult | Promise<ReplayDeliveryResult>;
+  replay(input: QueuedInputShadow, context: ResumeContext): ReplayDeliveryResult | Promise<ReplayDeliveryResult>;
   /** Opens the resumed provider barrier only after every accepted shadow has reconciled. */
   replayComplete?(context: ResumeContext): void | Promise<void>;
   settled?: Promise<void>;
   cancelAndJoin(kind: CancellationKind, context: ResumeContext): void | Promise<void>;
 }
 
-export interface ManualCompactionOwnership {
-  kind: "available";
-  isActive(): boolean;
-  waitAndResample(context: { generation: number; signal: AbortSignal }): Promise<{
-    ended: boolean;
-    usage: ContextUsageShape | undefined;
-  }>;
-}
-
-export type ManualCompactionCapability = ManualCompactionOwnership | { kind: "unavailable" };
 export type OrdinaryInputDisposition = "accept" | "quarantine" | "reject-recoverable" | "reject-restoration" | "reject-closed";
 export type ManualCompactionDisposition = "allow" | "already-active" | "unavailable";
 
@@ -148,7 +135,6 @@ export interface MidRunCompactionOptions {
   delay?(milliseconds: number, signal: AbortSignal): Promise<void>;
   backoffMs?: readonly number[];
   progress?(event: CheckpointProgress): void;
-  manualCompaction: ManualCompactionCapability;
 }
 
 interface ToolState {
@@ -191,7 +177,6 @@ interface CancellationState {
 
 interface RunOwnership {
   generation: number;
-  token: object;
   settled: Deferred<void>;
 }
 
@@ -223,7 +208,6 @@ const NON_RETRYABLE = new Set<CompactionFailureCategory>([
   "restoration-paused",
   "stale-generation",
   "shutdown",
-  "overflow-recovery",
 ]);
 
 /** Coordinates one session's checkpoint generation and leaves Pi-specific wiring to callers. */
@@ -442,7 +426,7 @@ export class MidRunCompactionController {
     if (generation !== this.generation || !this.stable) return Promise.resolve();
     const generationBarrier = this.stable;
     if (this.runOwnership?.generation !== generation && this.phase === "awaiting-settlement") {
-      const ownership: RunOwnership = { generation, token: {}, settled: deferred() };
+      const ownership: RunOwnership = { generation, settled: deferred() };
       this.runOwnership = ownership;
       void this.run(generation)
         .catch(() => {
@@ -450,7 +434,7 @@ export class MidRunCompactionController {
           if (this.isCurrent(generation)) this.exhaust(generation);
         })
         .finally(() => {
-          if (this.runOwnership?.token === ownership.token) this.runOwnership = undefined;
+          if (this.runOwnership === ownership) this.runOwnership = undefined;
           ownership.settled.resolve();
         });
     }
@@ -520,72 +504,12 @@ export class MidRunCompactionController {
     return this.terminalizeAfterCommittedSummary(generation);
   }
 
-  /** A public-session continuation failed to start or settle; only pre-commit failures remain recoverable. */
-  pauseAfterRecoveryFailure(
-    generation: number,
-    failureCategory: CompactionFailureCategory = "operational",
-  ): boolean {
-    if (generation !== this.generation || this.phase !== "idle") return false;
-    this.phase = "exhausted";
-    this.terminalFailure = failureCategory;
-    this.recovery = failureCategory === "restoration-paused" ? undefined : { generation, token: {} };
-    this.emit("checkpoint-exhausted", generation, this.attempt, {
-      action: failureCategory === "restoration-paused" ? "new-session" : "manual-recovery",
-      failureCategory,
-    });
-    return true;
-  }
-
   private currentBatch(handle: ToolBatchHandle): ActiveBatch | undefined {
     return this.phase === "stopping" && handle === this.activeBatch?.handle &&
       handle.generation === this.generation ? this.activeBatch : undefined;
   }
 
   private async run(generation: number): Promise<void> {
-    const manual = this.options.manualCompaction;
-    if (!manual || (manual.kind !== "available" && manual.kind !== "unavailable")) {
-      this.exhaust(generation);
-      return;
-    }
-    if (manual.kind === "available") {
-      if (typeof manual.isActive !== "function" || typeof manual.waitAndResample !== "function") {
-        this.exhaust(generation);
-        return;
-      }
-      let active: boolean;
-      try {
-        active = manual.isActive();
-      } catch {
-        this.exhaust(generation);
-        return;
-      }
-      if (active) {
-        let sample: { ended: boolean; usage: ContextUsageShape | undefined };
-        try {
-          sample = await manual.waitAndResample({ generation, signal: this.runAbort.signal });
-        } catch {
-          if (this.phase === "cancelled") return;
-          this.exhaust(generation);
-          return;
-        }
-        if (!this.isCurrent(generation)) return;
-        let ended: boolean;
-        try {
-          ended = sample.ended && !manual.isActive();
-        } catch {
-          ended = false;
-        }
-        if (!ended || !usageIsKnown(sample.usage)) {
-          this.exhaust(generation);
-          return;
-        }
-        if (!usageMeetsThreshold(sample.usage, this.threshold)) {
-          await this.resumeOrFinish(generation);
-          return;
-        }
-      }
-    }
-
     const backoffs = this.options.backoffMs ?? [25, 100];
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       if (!this.isCurrent(generation)) return;
@@ -894,66 +818,11 @@ interface MainBatchObservation {
   successful: Map<string, { terminated: boolean; truncated: boolean }>;
 }
 
-export interface MainSessionCheckpointExecutionAdapter {
+export interface CheckpointExecutionAdapter {
   compact(attempt: number, signal: AbortSignal): Promise<CompactionAttemptResult>;
   resume?(context: ResumeContext): ResumedRunOwnership | Promise<ResumedRunOwnership>;
-  manualCompaction: ManualCompactionCapability;
   delay?(milliseconds: number, signal: AbortSignal): Promise<void>;
   progress?(event: CheckpointProgress): void;
-}
-
-/** Stable mutable seam through which main-session lifecycle wiring supplies execution behavior. */
-export class MainSessionCheckpointExecutionBridge {
-  private adapter: MainSessionCheckpointExecutionAdapter | undefined;
-
-  attach(adapter: MainSessionCheckpointExecutionAdapter): () => void {
-    this.adapter = adapter;
-    return () => {
-      if (this.adapter === adapter) this.adapter = undefined;
-    };
-  }
-
-  createController(sessionId: string, threshold: number): MidRunCompactionController {
-    const bridge = this;
-    const manual = {
-      get kind(): ManualCompactionCapability["kind"] {
-        return bridge.adapter?.manualCompaction.kind ?? "unavailable";
-      },
-      isActive: () => bridge.adapter?.manualCompaction.kind === "available" &&
-        bridge.adapter.manualCompaction.isActive(),
-      waitAndResample: (context: { generation: number; signal: AbortSignal }) => {
-        const capability = bridge.adapter?.manualCompaction;
-        return capability?.kind === "available"
-          ? capability.waitAndResample(context)
-          : Promise.resolve({ ended: false, usage: undefined });
-      },
-    } as ManualCompactionCapability;
-    return new MidRunCompactionController({
-      sessionId,
-      threshold,
-      compact: (attempt, signal) => this.adapter
-        ? this.adapter.compact(attempt, signal)
-        : Promise.resolve({ ok: false, category: "operational" }),
-      resume: (context) => {
-        const resume = this.adapter?.resume;
-        if (!resume) throw new Error("Main-session checkpoint resume adapter is not attached");
-        return resume(context);
-      },
-      delay: (milliseconds, signal) => this.adapter?.delay
-        ? this.adapter.delay(milliseconds, signal)
-        : defaultDelay(milliseconds, signal),
-      progress: (event) => this.adapter?.progress?.(event),
-      manualCompaction: manual,
-    });
-  }
-
-  beginCompactionSummary(controller: MidRunCompactionController, generation: number): CompactionSummaryToken | undefined {
-    return controller.beginCompactionSummary(generation);
-  }
-
-  endCompactionSummary(controller: MidRunCompactionController, token: CompactionSummaryToken): boolean {
-    return controller.endCompactionSummary(token);
-  }
 }
 
 function toolCallIds(message: unknown): string[] {
@@ -964,10 +833,6 @@ function toolCallIds(message: unknown): string[] {
     .filter((block): block is { type: "toolCall"; id: string } =>
       block?.type === "toolCall" && typeof block.id === "string")
     .map((block) => block.id);
-}
-
-function resultIsTruncated(result: unknown): boolean {
-  return toolResultHasGuardClipping(result);
 }
 
 function canonical(value: unknown, seen = new WeakSet<object>()): string {
@@ -1010,6 +875,7 @@ const replayAuthorization = new AsyncLocalStorage<ReplayAuthorization>();
 /** Main-session lifecycle adapter around the generation-authenticated controller. */
 export class MainSessionCheckpointGate {
   private controller: MidRunCompactionController;
+  private execution: CheckpointExecutionAdapter | undefined;
   private generation: number | undefined;
   private handle: ToolBatchHandle | undefined;
   private batch: MainBatchObservation = { run: {}, ids: [], final: new Map(), successful: new Map() };
@@ -1020,12 +886,12 @@ export class MainSessionCheckpointGate {
   private transition: Promise<void> = Promise.resolve();
   private resumeBarrier: { generation: number; promise: Promise<void> } | undefined;
 
-  constructor(
-    private readonly execution: MainSessionCheckpointExecutionBridge,
-    sessionId: string,
-    private readonly threshold: number,
-  ) {
-    this.controller = execution.createController(sessionId, threshold);
+  constructor(sessionId: string, private readonly threshold: number) {
+    this.controller = this.createController(sessionId);
+  }
+
+  attachExecution(adapter: CheckpointExecutionAdapter): void {
+    this.execution = adapter;
   }
 
   currentController(): MidRunCompactionController {
@@ -1053,7 +919,7 @@ export class MainSessionCheckpointGate {
   async startSession(sessionId: string): Promise<void> {
     const operation = this.transition.then(async () => {
       await this.cancelCurrent("replacement");
-      this.controller = this.execution.createController(sessionId, this.threshold);
+      this.controller = this.createController(sessionId);
       this.invalidateSessionState();
     });
     this.transition = operation.catch(() => undefined);
@@ -1082,7 +948,7 @@ export class MainSessionCheckpointGate {
 
   toolExecutionEnded(event: { toolCallId?: unknown; result?: unknown; isError?: unknown }): void {
     if (typeof event.toolCallId !== "string") return;
-    const truncated = resultIsTruncated(event.result);
+    const truncated = toolResultHasGuardClipping(event.result);
     this.batch.final.set(event.toolCallId, { isError: event.isError === true, truncated });
     if (event.isError === true || truncated) this.invalidate();
   }
@@ -1267,7 +1133,7 @@ export class MainSessionCheckpointGate {
 
   private successfulTool(id: string, result: Record<string, unknown>, ctx: MainGateContext | undefined): Record<string, unknown> {
     if (ctx) this.arm(ctx);
-    const truncated = resultIsTruncated(result);
+    const truncated = toolResultHasGuardClipping(result);
     const observation = { terminated: false, truncated };
     this.batch.successful.set(id, observation);
     this.beginBatch();
@@ -1344,6 +1210,25 @@ export class MainSessionCheckpointGate {
         }
       }
     }
+  }
+
+  private createController(sessionId: string): MidRunCompactionController {
+    return new MidRunCompactionController({
+      sessionId,
+      threshold: this.threshold,
+      compact: (attempt, signal) => this.execution
+        ? this.execution.compact(attempt, signal)
+        : Promise.resolve({ ok: false, category: "operational" }),
+      resume: (context) => {
+        const resume = this.execution?.resume;
+        if (!resume) throw new Error("Checkpoint resume adapter is not attached");
+        return resume(context);
+      },
+      delay: (milliseconds, signal) => this.execution?.delay
+        ? this.execution.delay(milliseconds, signal)
+        : defaultDelay(milliseconds, signal),
+      progress: (event) => this.execution?.progress?.(event),
+    });
   }
 
   private async cancelCurrent(kind: CancellationKind): Promise<void> {

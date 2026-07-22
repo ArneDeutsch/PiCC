@@ -305,38 +305,19 @@ describe("pi 0.80.x API contract", () => {
     }
   });
 
-  it("SessionManager/SettingsManager expose in-memory factories", async () => {
+  it("exposes the session factories and AgentSession methods PiCC uses", async () => {
     const sdk: any = await import("@earendil-works/pi-coding-agent");
-    expect(typeof sdk.SessionManager.inMemory).toBe("function");
-    expect(typeof sdk.SettingsManager.inMemory).toBe("function");
-  });
-
-  it("SessionManager exposes create/open for persisted subagent transcripts", async () => {
-    const sdk: any = await import("@earendil-works/pi-coding-agent");
-    expect(typeof sdk.SessionManager.create).toBe("function");
-    expect(typeof sdk.SessionManager.open).toBe("function");
-  });
-
-  it("AgentSession exposes the public compaction, continuation, cancellation, and lifecycle surface", async () => {
-    const sdk: any = await import("@earendil-works/pi-coding-agent");
-    // These are instance methods; constructing a real session needs a model and
-    // provider, which belongs to the real-stack lane rather than this smoke pin.
-    for (const method of [
-      "prompt",
-      "compact",
-      "sendCustomMessage",
-      "abortCompaction",
-      "abort",
-      "subscribe",
-    ]) {
-      expect(typeof sdk.AgentSession?.prototype?.[method], `AgentSession.${method}`).toBe("function");
+    for (const [owner, methods] of [
+      [sdk.SessionManager, ["inMemory", "create", "open"]],
+      [sdk.SettingsManager, ["inMemory"]],
+      // AgentSession methods live on the prototype; constructing a real session
+      // needs a model/provider and belongs to the real-stack lane, not this smoke pin.
+      [sdk.AgentSession?.prototype, [
+        "prompt", "compact", "sendCustomMessage", "abortCompaction", "abort", "subscribe", "steer", "followUp",
+      ]],
+    ] as const) {
+      for (const method of methods) expect(typeof owner?.[method], method).toBe("function");
     }
-  });
-
-  it("AgentSession exposes steer()/followUp() for SendMessage steering", async () => {
-    const sdk: any = await import("@earendil-works/pi-coding-agent");
-    expect(typeof sdk.AgentSession?.prototype?.steer).toBe("function");
-    expect(typeof sdk.AgentSession?.prototype?.followUp).toBe("function");
   });
 
   it("real Agent preserves duplicate-image steering identity and steer-before-followUp order", async () => {

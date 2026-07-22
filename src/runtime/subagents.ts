@@ -10,7 +10,7 @@ import type {
   HookPayload,
   ToolCallDescriptor,
 } from "../types.js";
-import type { HookRunner, HookRunnerLike } from "../engine/hook-runner.js";
+import { mergeHookOutcomes, type HookRunner, type HookRunnerLike } from "../engine/hook-runner.js";
 import { PermissionEngine } from "../engine/permissions.js";
 import { builtinAgents, resolveAgent } from "../claude/agents.js";
 import { parseHookConfig } from "../claude/hooks.js";
@@ -45,7 +45,6 @@ import { renderAgentCall, renderAgentResult } from "./subagent-render.js";
 import { formatBackgroundTaskIdentity } from "./background-identity.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./builtin-tools.js";
 import {
-  MainSessionCheckpointExecutionBridge,
   MainSessionCheckpointGate,
   promiseCompactionAttempt,
   type CancellationKind,
@@ -547,35 +546,6 @@ function isEnvTruthy(value: string | undefined): boolean {
   return v !== "" && v !== "0" && v !== "false" && v !== "no" && v !== "off";
 }
 
-/** Merge hook outcomes: any block wins (first reason), context/diagnostics accumulate. */
-function mergeHookOutcomes(outcomes: Array<HookOutcome | undefined>): HookOutcome {
-  const merged: HookOutcome = { block: false, askDowngraded: false, diagnostics: [] };
-  for (const o of outcomes) {
-    if (!o) continue;
-    if (o.block && !merged.block) {
-      merged.block = true;
-      merged.blockReason = o.blockReason;
-    }
-    if (o.stop && !merged.stop) {
-      merged.stop = true;
-      merged.stopReason = o.stopReason;
-    }
-    merged.askDowngraded = merged.askDowngraded || o.askDowngraded;
-    if (o.additionalContext) {
-      merged.additionalContext = merged.additionalContext
-        ? `${merged.additionalContext}\n${o.additionalContext}`
-        : o.additionalContext;
-    }
-    if (o.updatedInput) merged.updatedInput = { ...merged.updatedInput, ...o.updatedInput };
-    if (o.stdout) merged.stdout = merged.stdout ? `${merged.stdout}\n${o.stdout}` : o.stdout;
-    if (o.systemMessages?.length) {
-      merged.systemMessages = [...(merged.systemMessages ?? []), ...o.systemMessages];
-    }
-    merged.diagnostics.push(...o.diagnostics);
-  }
-  return merged;
-}
-
 /**
  * HookRunner-shaped facade multiplexing the session runner with an agent's
  * scoped runner — same pattern as index.ts's HookMultiplexer,
@@ -618,7 +588,6 @@ function childDeferred<T = void>(): ChildDeferred<T> {
 /** Adapts one live child AgentSession to the shared checkpoint state machine. */
 class ChildCheckpointCoordinator {
   readonly activation: SkillActivationState;
-  readonly bridge = new MainSessionCheckpointExecutionBridge();
   readonly gate: MainSessionCheckpointGate;
 
   private session: PiSession | undefined;
@@ -627,7 +596,6 @@ class ChildCheckpointCoordinator {
   private restorationFailed = false;
   private manualRecovery = false;
   private compactOperation: {
-    identity: object;
     controller: import("./mid-run-compaction.js").MidRunCompactionController;
     generation: number;
     proactive: boolean;
@@ -670,9 +638,8 @@ class ChildCheckpointCoordinator {
     });
     this.activation = newSkillActivationState(new Map(), identityWrap);
     this.hooks = this.hookFacade(hooks);
-    this.gate = new MainSessionCheckpointGate(this.bridge, sessionId, threshold);
-    this.bridge.attach({
-      manualCompaction: { kind: "unavailable" },
+    this.gate = new MainSessionCheckpointGate(sessionId, threshold);
+    this.gate.attachExecution({
       progress: (event) => this.progress(event),
       compact: (attempt, signal) => this.compact(attempt, signal),
       resume: (context) => this.resume(context),
@@ -902,7 +869,7 @@ class ChildCheckpointCoordinator {
     const session = this.session;
     const controller = this.gate.currentController();
     const generation = controller.snapshot().generation;
-    const token = this.bridge.beginCompactionSummary(controller, generation);
+    const token = controller.beginCompactionSummary(generation);
     if (!session?.compact || !token) return { ok: false as const, category: "operational" as const };
     this.hookBlocked = false;
     this.restorationFailed = false;
@@ -921,7 +888,7 @@ class ChildCheckpointCoordinator {
       signal.removeEventListener("abort", abort);
       if (this.compactOperation?.controller === controller &&
           this.compactOperation.generation === generation) this.compactOperation = undefined;
-      this.bridge.endCompactionSummary(controller, token);
+      controller.endCompactionSummary(token);
     }
   }
 
@@ -1017,7 +984,7 @@ class ChildCheckpointCoordinator {
     const proactive = controller.isCompactionSummaryActive(generation);
     if ((!proactive && !this.manualRecovery) || this.compactOperation) return { cancel: true };
     const operation = {
-      identity: {}, controller, generation, proactive,
+      controller, generation, proactive,
       trigger: (proactive ? "auto" : "manual") as "auto" | "manual",
     };
     this.compactOperation = operation;
@@ -2440,7 +2407,11 @@ export class SubagentRuntime {
         const terminal = terminalOutcome();
         if (terminal) return terminal;
 
+        // The returned assistant text is a verbatim contract: callers may parse
+        // strict JSON/YAML, so classification must not summarize or wrap it.
         let finalMessage = lastAssistantText(session!);
+        // Retry only a genuinely successful empty reply. terminalOutcome() above
+        // has already classified API errors/aborts, which must not be re-prompted.
         if (!finalMessage.trim()) {
           await session!.prompt(
             "Your previous reply was empty. Reply now with your final answer in the requested format.",
@@ -2462,6 +2433,8 @@ export class SubagentRuntime {
             stop_hook_active: iteration > 0,
           });
           stopFired = true;
+          // A parent abort racing the awaited hook still wins: returning the
+          // previously completed text here would leak a false success past cancellation.
           if (opts.abortSignal?.aborted) {
             settledOutcome = "aborted";
             return {
@@ -2571,6 +2544,8 @@ export class SubagentRuntime {
         if (worktreePath && this.deps.worktrees && !opts.resume) {
           await this.deps.worktrees.exit({ worktreePath, action: "keep" }).catch(() => undefined);
         }
+        // Error/abort paths still fire SubagentStop once for observability;
+        // blocking is moot because no continuation can safely recover this dispatch.
         if (started && !stopFired) {
           await fireSubagentStop({
             subagent_type: agent.name,

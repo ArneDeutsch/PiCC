@@ -6,7 +6,6 @@ import picc, { writeFdFully } from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { deferred, waitUntil } from "./helpers/async.js";
 import {
-  MainSessionCheckpointExecutionBridge,
   MainSessionCheckpointGate,
   MidRunCompactionController,
   callbackCompactionAttempt,
@@ -54,10 +53,7 @@ describe("public async fd writer", () => {
 
 describe("MidRunCompactionController", () => {
   const usage = (percent: number | null) => ({ tokens: 900, contextWindow: 1000, percent });
-  const createController = (
-    options: Omit<MidRunCompactionOptions, "manualCompaction"> &
-      { manualCompaction?: MidRunCompactionOptions["manualCompaction"] },
-  ) => new MidRunCompactionController({ manualCompaction: { kind: "unavailable" }, ...options });
+  const createController = (options: MidRunCompactionOptions) => new MidRunCompactionController(options);
   const owned = (settled: Promise<void> = Promise.resolve(), replay: (input: any) => void = () => undefined) => ({
     settled,
     replay: async (input: any) => {
@@ -147,7 +143,7 @@ describe("MidRunCompactionController", () => {
     expect(controller.snapshot().phase).toBe("idle");
   });
 
-  it.each(["hook-blocked", "stale-generation", "overflow-recovery"] as const)("exhausts without retry for %s", async (category) => {
+  it.each(["hook-blocked", "stale-generation"] as const)("exhausts without retry for %s", async (category) => {
     let attempts = 0;
     const controller = createController({
       sessionId: "s", threshold: 90, compact: async () => { attempts += 1; return { ok: false, category }; },
@@ -241,72 +237,6 @@ describe("MidRunCompactionController", () => {
     controller.shadowInput(generation, "retained", "followUp");
     await controller.checkpoint(generation);
     expect(controller.snapshot()).toMatchObject({ phase: "exhausted", queuedInputs: 1 });
-  });
-
-  it.each([
-    ["missing", undefined],
-    ["partial", { kind: "available", isActive: () => false }],
-  ])("fails closed for %s manual capability", async (_name, manualCompaction) => {
-    let attempts = 0;
-    const controller = new MidRunCompactionController({
-      sessionId: "s",
-      threshold: 90,
-      compact: async () => { attempts += 1; return { ok: true }; },
-      manualCompaction,
-    } as MidRunCompactionOptions);
-    const generation = controller.sample(usage(90), "settled")!;
-    await controller.checkpoint(generation);
-    expect(attempts).toBe(0);
-    expect(controller.snapshot().phase).toBe("exhausted");
-  });
-
-  it("manual ownership rechecks end and rejects unknown usage", async () => {
-    for (const sample of [{ ended: false, usage: usage(20) }, { ended: true, usage: undefined }]) {
-      const controller = createController({
-        sessionId: "s", threshold: 90, compact: async () => ({ ok: true }),
-        manualCompaction: { kind: "available", isActive: () => true, waitAndResample: async () => sample }, resume: () => owned(),
-      });
-      const { generation, handle } = arm(controller);
-      controller.completeToolBatch(handle);
-      await controller.checkpoint(generation);
-      expect(controller.snapshot().phase).toBe("exhausted");
-    }
-  });
-
-  it("manual ownership resumes after a valid below-threshold resample", async () => {
-    let active = true;
-    let attempts = 0;
-    const controller = createController({
-      sessionId: "s", threshold: 90, compact: async () => { attempts += 1; return { ok: true }; },
-      manualCompaction: { kind: "available", isActive: () => active, waitAndResample: async () => { active = false; return { ended: true, usage: usage(20) }; } },
-      resume: () => owned(),
-    });
-    const { generation, handle } = arm(controller);
-    controller.completeToolBatch(handle);
-    await controller.checkpoint(generation);
-    expect(attempts).toBe(0);
-    expect(controller.snapshot().phase).toBe("idle");
-  });
-
-  it("cancellation during manual wait waits for that work to join", async () => {
-    const manual = deferred<{ ended: boolean; usage: ReturnType<typeof usage> }>();
-    const controller = createController({
-      sessionId: "s", threshold: 90, compact: async () => ({ ok: true }),
-      manualCompaction: { kind: "available", isActive: () => true, waitAndResample: () => manual.promise }, resume: () => owned(),
-    });
-    const { generation, handle } = arm(controller);
-    controller.completeToolBatch(handle);
-    let done = false;
-    const stable = controller.checkpoint(generation).then(() => { done = true; });
-    await waitUntil({ description: "manual wait", predicate: () => controller.manualCompactionDisposition() === "already-active" });
-    const cancellation = controller.cancel(generation, "user");
-    await Promise.resolve();
-    expect(done).toBe(false);
-    expect(controller.manualCompactionDisposition()).toBe("unavailable");
-    manual.resolve({ ended: true, usage: usage(20) });
-    await expect(cancellation).resolves.toEqual({ cancelled: true, rejected: [] });
-    expect(controller.manualCompactionDisposition()).toBe("allow");
-    await stable;
   });
 
   it.each(["compacting", "backoff"] as const)("cancellation during %s joins active work", async (phase) => {
@@ -513,27 +443,6 @@ describe("MidRunCompactionController", () => {
     settlement.resolve();
   });
 
-  it.each(["active-check", "wait"] as const)("fails closed when manual %s throws", async (where) => {
-    const controller = createController({
-      sessionId: "s", threshold: 90, compact: async () => ({ ok: true }),
-      manualCompaction: {
-        kind: "available",
-        isActive: () => {
-          if (where === "active-check") throw new Error("private");
-          return true;
-        },
-        waitAndResample: async () => {
-          throw new Error("private");
-        },
-      },
-      resume: () => owned(),
-    });
-    const { generation, handle } = arm(controller);
-    controller.completeToolBatch(handle);
-    await controller.checkpoint(generation);
-    expect(controller.snapshot().phase).toBe("exhausted");
-  });
-
   it("resolves only the old generation barrier before reentrant progress arms a new generation", async () => {
     let controller!: MidRunCompactionController;
     let nextGeneration: number | undefined;
@@ -556,37 +465,32 @@ describe("MidRunCompactionController", () => {
     expect(controller.snapshot().phase).toBe("awaiting-settlement");
   });
 
-  it.each([
-    ["missing", undefined],
-    ["malformed", { kind: "available", isActive: () => false }],
-  ])("keeps cancellation joined to generation N+1 after synchronous %s-capability exhaustion recovery", async (_name, initialCapability) => {
+  it("keeps cancellation joined to generation N+1 after synchronous exhaustion recovery", async () => {
     const nextRun = deferred<CompactionAttemptResult>();
     let controller!: MidRunCompactionController;
     let nextGeneration: number | undefined;
-    let nextRunEntered = false;
-    const options = {
+    let firstRun = true;
+    controller = createController({
       sessionId: "s",
       threshold: 90,
-      manualCompaction: initialCapability,
       compact: () => {
-        nextRunEntered = true;
+        if (firstRun) {
+          firstRun = false;
+          return Promise.resolve({ ok: false, category: "hook-blocked" });
+        }
         return nextRun.promise;
       },
-      progress: (event: { category: string; generation: number }) => {
+      progress: (event) => {
         if (event.category !== "checkpoint-exhausted" || event.generation !== 1) return;
         const recovery = controller.recoveryToken(event.generation)!;
         expect(controller.recoverAfterManualCompaction(recovery).recovered).toBe(true);
-        options.manualCompaction = { kind: "unavailable" };
         nextGeneration = controller.sample(usage(90), "settled");
         void controller.checkpoint(nextGeneration!);
       },
-    } as unknown as MidRunCompactionOptions;
-    controller = new MidRunCompactionController(options);
+    });
 
-    const firstGeneration = controller.sample(usage(90), "settled")!;
-    await controller.checkpoint(firstGeneration);
+    await controller.checkpoint(controller.sample(usage(90), "settled")!);
     expect(nextGeneration).toBe(2);
-    expect(nextRunEntered).toBe(true);
     expect(controller.snapshot()).toMatchObject({ generation: 2, phase: "compacting" });
 
     let cancellationSettled = false;
@@ -680,9 +584,8 @@ describe("MidRunCompactionController", () => {
 describe("MainSessionCheckpointGate", () => {
   const usage = { tokens: 900, contextWindow: 1000, percent: 90 };
   const setup = () => {
-    const execution = new MainSessionCheckpointExecutionBridge();
-    const gate = new MainSessionCheckpointGate(execution, "main", 90);
-    return { controller: gate.currentController(), execution, gate };
+    const gate = new MainSessionCheckpointGate("main", 90);
+    return { controller: gate.currentController(), gate };
   };
   const assistant = (...ids: string[]) => ({
     role: "assistant",
@@ -729,11 +632,10 @@ describe("MainSessionCheckpointGate", () => {
   });
 
   it("keeps before_provider_request latched until replayComplete opens the generation barrier", async () => {
-    const { controller, execution, gate } = setup();
+    const { controller, gate } = setup();
     const replayRelease = deferred<void>();
     const settlement = deferred<void>();
-    execution.attach({
-      manualCompaction: { kind: "unavailable" },
+    gate.attachExecution({
       compact: async () => ({ ok: true }),
       resume: (context) => {
         let open!: () => void;
@@ -1007,10 +909,9 @@ describe("MainSessionCheckpointGate", () => {
   });
 
   it("revokes replay immediately and cancels a switch when quiescence cannot be confirmed", async () => {
-    const { controller, execution, gate } = setup();
+    const { controller, gate } = setup();
     const resumedSettlement = deferred<void>();
-    execution.attach({
-      manualCompaction: { kind: "unavailable" },
+    gate.attachExecution({
       compact: async () => ({ ok: true }),
       resume: () => ({
         replay: async () => ({ delivered: true }),
@@ -1049,18 +950,17 @@ describe("MainSessionCheckpointGate", () => {
   });
 
   it("uses the attached execution adapter and controller-owned summary latch", async () => {
-    const { controller, execution, gate } = setup();
+    const { controller, gate } = setup();
     let compactCalls = 0;
-    execution.attach({
-      manualCompaction: { kind: "unavailable" },
+    gate.attachExecution({
       compact: async (_attempt, _signal) => {
         compactCalls += 1;
         const generation = controller.snapshot().generation;
-        const token = execution.beginCompactionSummary(controller, generation)!;
+        const token = controller.beginCompactionSummary(generation)!;
         let aborts = 0;
         gate.defensiveLatch({ abort: () => { aborts += 1; } });
         expect(aborts).toBe(0);
-        expect(execution.endCompactionSummary(controller, token)).toBe(true);
+        expect(controller.endCompactionSummary(token)).toBe(true);
         return { ok: false, category: "hook-blocked" };
       },
     });
@@ -1176,15 +1076,6 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     if (savedUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
     else process.env.PICC_CLAUDE_USER_DIR = savedUserDir;
     fs.rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("registers only the API-global stateless Codex override and owns it idempotently per registry", () => {
-    const registrations = pi.providerRegistrations.filter((entry) => entry.name === "picc-codex-abort-guard");
-    expect(registrations).toHaveLength(1);
-    const registration = registrations[0]!;
-    expect(Object.keys(registration.config).sort()).toEqual(["api", "streamSimple"]);
-    expect(registration.config.api).toBe("openai-codex-responses");
-    expect(registration.config.streamSimple).toBeTypeOf("function");
   });
 
   it("gates clean and fallback cycles through the actual registered lifecycle handlers", async () => {

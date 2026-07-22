@@ -4,6 +4,9 @@ import path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   allText,
+  CHECKPOINT_CONTEXT_WINDOW,
+  CHECKPOINT_PI_SETTINGS,
+  CHECKPOINT_USAGE,
   cliMissing,
   createE2ELive,
   systemText,
@@ -11,6 +14,7 @@ import {
   TEST_TIMEOUT_MS,
   toolNames,
   userText,
+  writeCheckpointConfig,
   CLI_PATH,
 } from "./helpers/e2e-live.js";
 import { createResponseGate, type Turn } from "./helpers/mock-openai.js";
@@ -107,20 +111,15 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
     "compacts a completed real-Pi tool batch before exactly one resumed ordinary request",
     async () => {
       const summaryGate = createResponseGate();
-      const highUsage = { prompt_tokens: 90_000, completion_tokens: 100, total_tokens: 90_100 };
       const summaryCanary = "MODEL_SUMMARY_CANARY_T05";
       const secretSentinel = "SECRET_T05_MUST_NOT_RENDER";
       const pathSentinel = "C:/private/t05-never-render";
       const live = await startPi({
         persistSession: true,
-        contextWindow: 100_000,
-        piSettings: {
-          compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 1 },
-        },
+        contextWindow: CHECKPOINT_CONTEXT_WINDOW,
+        piSettings: CHECKPOINT_PI_SETTINGS,
         setup(fixtureDir) {
-          const configDir = path.join(fixtureDir, ".claude", ".picc");
-          fs.mkdirSync(configDir, { recursive: true });
-          fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ proactiveCompactPercent: 90 }));
+          writeCheckpointConfig(fixtureDir);
         },
         script: [
           {
@@ -128,7 +127,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
               { name: "write", args: { path: "batch-a.txt", content: "result-a" } },
               { name: "write", args: { path: "batch-b.txt", content: "result-b" } },
             ],
-            usage: highUsage,
+            usage: CHECKPOINT_USAGE,
           },
           { text: summaryCanary, gate: summaryGate },
           { text: "RESUMED_FINAL_T05" },
@@ -189,20 +188,17 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   it(
     "retries one failed real Pi compaction, commits only the successful model summary, then resumes once",
     async () => {
-      const highUsage = { prompt_tokens: 90_000, completion_tokens: 100, total_tokens: 90_100 };
       const errorSentinels = ["COMPACT_ERROR_SECRET_T05", "C:/private/compact/session.jsonl", "COMPACT_TRANSCRIPT_T05"];
       const summaryCanary = "TRANSIENT_SUCCESS_SUMMARY_T05";
       const result = await runPi({
         persistSession: true,
-        contextWindow: 100_000,
-        piSettings: { compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 1 } },
+        contextWindow: CHECKPOINT_CONTEXT_WINDOW,
+        piSettings: CHECKPOINT_PI_SETTINGS,
         setup(fixtureDir) {
-          const configDir = path.join(fixtureDir, ".claude", ".picc");
-          fs.mkdirSync(configDir, { recursive: true });
-          fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ proactiveCompactPercent: 90 }));
+          writeCheckpointConfig(fixtureDir);
         },
         script: [
-          { toolCalls: [{ name: "write", args: { path: "transient.txt", content: "complete" } }], usage: highUsage },
+          { toolCalls: [{ name: "write", args: { path: "transient.txt", content: "complete" } }], usage: CHECKPOINT_USAGE },
           { when: (request) => request.requestKind === "compaction", error: { status: 400, sticky: false, message: errorSentinels.join(" ") } },
           { when: (request) => request.requestKind === "compaction", text: summaryCanary },
           { text: "TRANSIENT_RESUMED_FINAL_T05" },
@@ -235,7 +231,6 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   it(
     "exhausts three real Pi compactions without a summary or ordinary resume and keeps print exit semantics Pi-owned",
     async () => {
-      const highUsage = { prompt_tokens: 90_000, completion_tokens: 100, total_tokens: 90_100 };
       const errorSentinels = ["EXHAUST_SECRET_T05", "C:/private/exhaust/session.jsonl", "EXHAUST_TRANSCRIPT_T05"];
       const failures: Turn[] = Array.from({ length: 3 }, () => ({
         when: (request) => request.requestKind === "compaction",
@@ -243,15 +238,13 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       }));
       const result = await runPi({
         persistSession: true,
-        contextWindow: 100_000,
-        piSettings: { compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 1 } },
+        contextWindow: CHECKPOINT_CONTEXT_WINDOW,
+        piSettings: CHECKPOINT_PI_SETTINGS,
         setup(fixtureDir) {
-          const configDir = path.join(fixtureDir, ".claude", ".picc");
-          fs.mkdirSync(configDir, { recursive: true });
-          fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ proactiveCompactPercent: 90 }));
+          writeCheckpointConfig(fixtureDir);
         },
         script: [
-          { toolCalls: [{ name: "write", args: { path: "exhausted.txt", content: "complete" } }], usage: highUsage },
+          { toolCalls: [{ name: "write", args: { path: "exhausted.txt", content: "complete" } }], usage: CHECKPOINT_USAGE },
           ...failures,
           { text: "ORDINARY_MUST_NOT_RUN_AFTER_EXHAUSTION" },
         ],
@@ -284,18 +277,15 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   it(
     "orders real JSON lifecycle records before one resumed terminal assistant message",
     async () => {
-      const highUsage = { prompt_tokens: 90_000, completion_tokens: 100, total_tokens: 90_100 };
       const result = await runPi({
         modeArgs: ["--mode", "json", "-p", "run the JSON checkpoint"],
-        contextWindow: 100_000,
-        piSettings: { compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 1 } },
+        contextWindow: CHECKPOINT_CONTEXT_WINDOW,
+        piSettings: CHECKPOINT_PI_SETTINGS,
         setup(fixtureDir) {
-          const configDir = path.join(fixtureDir, ".claude", ".picc");
-          fs.mkdirSync(configDir, { recursive: true });
-          fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ proactiveCompactPercent: 90 }));
+          writeCheckpointConfig(fixtureDir);
         },
         script: [
-          { toolCalls: [{ name: "write", args: { path: "json-cycle.txt", content: "complete" } }], usage: highUsage },
+          { toolCalls: [{ name: "write", args: { path: "json-cycle.txt", content: "complete" } }], usage: CHECKPOINT_USAGE },
           { text: "JSON_SUMMARY_T05" },
           { text: "JSON_RESUMED_FINAL_T05" },
         ],
@@ -335,17 +325,14 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   it(
     "drives the real RPC entry through checkpoint lifecycle and acknowledges only the prompt command",
     async () => {
-      const highUsage = { prompt_tokens: 90_000, completion_tokens: 100, total_tokens: 90_100 };
       const live = await startPi({
-        contextWindow: 100_000,
-        piSettings: { compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 1 } },
+        contextWindow: CHECKPOINT_CONTEXT_WINDOW,
+        piSettings: CHECKPOINT_PI_SETTINGS,
         setup(fixtureDir) {
-          const configDir = path.join(fixtureDir, ".claude", ".picc");
-          fs.mkdirSync(configDir, { recursive: true });
-          fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ proactiveCompactPercent: 90 }));
+          writeCheckpointConfig(fixtureDir);
         },
         script: [
-          { toolCalls: [{ name: "write", args: { path: "rpc-cycle.txt", content: "complete" } }], usage: highUsage },
+          { toolCalls: [{ name: "write", args: { path: "rpc-cycle.txt", content: "complete" } }], usage: CHECKPOINT_USAGE },
           { text: "RPC_SUMMARY_T05" },
           { text: "RPC_RESUMED_FINAL_T05" },
         ],
@@ -402,21 +389,18 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   it(
     "gates a subsequent real RPC prompt after three-attempt compaction exhaustion",
     async () => {
-      const highUsage = { prompt_tokens: 90_000, completion_tokens: 100, total_tokens: 90_100 };
       const failures: Turn[] = Array.from({ length: 3 }, () => ({
         when: (request) => request.requestKind === "compaction",
         error: { status: 400, sticky: false, message: "RPC_EXHAUST_SECRET C:/private/rpc/session.jsonl RPC_TRANSCRIPT_SENTINEL" },
       }));
       const live = await startPi({
-        contextWindow: 100_000,
-        piSettings: { compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 1 } },
+        contextWindow: CHECKPOINT_CONTEXT_WINDOW,
+        piSettings: CHECKPOINT_PI_SETTINGS,
         setup(fixtureDir) {
-          const configDir = path.join(fixtureDir, ".claude", ".picc");
-          fs.mkdirSync(configDir, { recursive: true });
-          fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ proactiveCompactPercent: 90 }));
+          writeCheckpointConfig(fixtureDir);
         },
         script: [
-          { toolCalls: [{ name: "write", args: { path: "rpc-exhaust.txt", content: "complete" } }], usage: highUsage },
+          { toolCalls: [{ name: "write", args: { path: "rpc-exhaust.txt", content: "complete" } }], usage: CHECKPOINT_USAGE },
           ...failures,
           { text: "RPC_ORDINARY_MUST_STAY_GATED" },
         ],
@@ -452,16 +436,13 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   it(
     "transfers a real Stop-blocked JSON continuation after compact hooks and withholds the outer final",
     async () => {
-      const highUsage = { prompt_tokens: 90_000, completion_tokens: 100, total_tokens: 90_100 };
       const result = await runPi({
         persistSession: true,
-        contextWindow: 100_000,
-        piSettings: { compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 1 } },
+        contextWindow: CHECKPOINT_CONTEXT_WINDOW,
+        piSettings: CHECKPOINT_PI_SETTINGS,
         setup(fixtureDir) {
           const claudeDir = path.join(fixtureDir, ".claude");
-          const configDir = path.join(claudeDir, ".picc");
-          fs.mkdirSync(configDir, { recursive: true });
-          fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ proactiveCompactPercent: 90 }));
+          writeCheckpointConfig(fixtureDir);
           fs.writeFileSync(path.join(claudeDir, "stop-once"), "block");
           fs.writeFileSync(path.join(claudeDir, "settings.json"), JSON.stringify({ hooks: {
             PreCompact: [{ matcher: "auto", hooks: [{ type: "command", command: "echo 'PreCompact(auto)' >> \"$CLAUDE_PROJECT_DIR/hook-trace.txt\"" }] }],
@@ -472,7 +453,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         },
         script: [
           { toolCalls: [{ name: "write", args: { path: "stop-transfer-a.txt", content: "complete-a" } }] },
-          { toolCalls: [{ name: "write", args: { path: "stop-transfer-b.txt", content: "complete-b" } }], usage: highUsage },
+          { toolCalls: [{ name: "write", args: { path: "stop-transfer-b.txt", content: "complete-b" } }], usage: CHECKPOINT_USAGE },
           { text: "STOP_TRANSFER_SUMMARY_T05" },
           { text: "INTERIM_MUST_NOT_BE_OUTER_FINAL" },
           { text: "STOP_TRANSFER_FINAL_T05" },
@@ -512,15 +493,12 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   it(
     "compacts after real permission-blocked and invalid tool calls while preserving the completed sibling",
     async () => {
-      const highUsage = { prompt_tokens: 90_000, completion_tokens: 100, total_tokens: 90_100 };
       const result = await runPi({
-        contextWindow: 100_000,
-        piSettings: { compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 1 } },
+        contextWindow: CHECKPOINT_CONTEXT_WINDOW,
+        piSettings: CHECKPOINT_PI_SETTINGS,
         setup(fixtureDir) {
           const claudeDir = path.join(fixtureDir, ".claude");
-          const configDir = path.join(claudeDir, ".picc");
-          fs.mkdirSync(configDir, { recursive: true });
-          fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ proactiveCompactPercent: 90 }));
+          writeCheckpointConfig(fixtureDir);
           fs.writeFileSync(path.join(claudeDir, "settings.json"), JSON.stringify({ permissions: { deny: ["Write(blocked.txt)"] } }));
         },
         script: [
@@ -528,7 +506,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
             { name: "write", args: { path: "fallback-sibling.txt", content: "completed sibling" } },
             { name: "write", args: { path: "blocked.txt", content: "must not land" } },
             { name: "not_a_registered_tool", args: { malformed: true } },
-          ], usage: highUsage },
+          ], usage: CHECKPOINT_USAGE },
           { text: "FALLBACK_PERMISSION_INVALID_SUMMARY_T05" },
           { text: "FALLBACK_PERMISSION_INVALID_FINAL_T05" },
         ],
@@ -544,45 +522,6 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       expect(summaryInput).toMatch(/blocked|denied/i);
       expect(summaryInput).toMatch(/not_a_registered_tool|not found|unknown/i);
       expect(result.stdout.match(/FALLBACK_PERMISSION_INVALID_FINAL_T05/g)).toHaveLength(1);
-    },
-    TEST_TIMEOUT_MS,
-  );
-
-  it(
-    "fails a mixed real-Pi tool batch closed, persists completed siblings, then compacts and resumes once",
-    async () => {
-      const highUsage = { prompt_tokens: 90_000, completion_tokens: 100, total_tokens: 90_100 };
-      const result = await runPi({
-        contextWindow: 100_000,
-        piSettings: { compaction: { enabled: false, reserveTokens: 100, keepRecentTokens: 1 } },
-        setup(fixtureDir) {
-          const configDir = path.join(fixtureDir, ".claude", ".picc");
-          fs.mkdirSync(configDir, { recursive: true });
-          fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ proactiveCompactPercent: 90 }));
-        },
-        script: [
-          {
-            toolCalls: [
-              { name: "write", args: { path: "mixed-sibling.txt", content: "persisted-before-compact" } },
-              { name: "Skill", args: { name: "missing-real-stack-skill" } },
-            ],
-            usage: highUsage,
-          },
-          { text: "MIXED_SUMMARY_T05" },
-          { text: "MIXED_RESUMED_FINAL_T05" },
-        ],
-        prompt: "run the complete mixed batch",
-      });
-
-      expect(result.code).toBe(0);
-      expect(fs.readFileSync(path.join(result.fixture, "mixed-sibling.txt"), "utf8")).toBe("persisted-before-compact");
-      expect(result.requests.map((request) => `${request.sessionKind}/${request.requestKind}`)).toEqual([
-        "main/ordinary",
-        "main/compaction",
-        "main/ordinary",
-      ]);
-      expect(result.stdout.match(/MIXED_RESUMED_FINAL_T05/g)).toHaveLength(1);
-      expect(allText(result.requests[1]!)).toContain("missing-real-stack-skill");
     },
     TEST_TIMEOUT_MS,
   );

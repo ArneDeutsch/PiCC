@@ -9,7 +9,7 @@ import type { HookOutcome, HookPayload, ToolCallDescriptor } from "./types.js";
 import { findByName, loadClaudeProject, type LoadedProject } from "./project.js";
 import { loadPiCCConfig, mapEffort, steeringForModel } from "./runtime/steering.js";
 import { CwdState } from "./runtime/cwd-state.js";
-import { HookRunner } from "./engine/hook-runner.js";
+import { HookRunner, mergeHookOutcomes } from "./engine/hook-runner.js";
 import { PermissionEngine } from "./engine/permissions.js";
 import { parseHookConfig } from "./claude/hooks.js";
 import { WorktreeManager } from "./runtime/worktrees.js";
@@ -68,12 +68,10 @@ import { wrapForSelfShell } from "./runtime/tool-shell.js";
 import { withCompactSearchRendering } from "./runtime/search-tool-render.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
 import {
-  MainSessionCheckpointExecutionBridge,
   MainSessionCheckpointGate,
   callbackCompactionAttempt,
   type CheckpointProgress,
   type MidRunCompactionController,
-  type CompactionSummaryToken,
   type ResumeToken,
 } from "./runtime/mid-run-compaction.js";
 import { registerCodexAbortGuard } from "./runtime/codex-abort-guard.js";
@@ -119,29 +117,7 @@ class HookMultiplexer {
     for (const extra of this.extras) {
       outcomes.push(await extra.fire(eventName, payload, toolCall));
     }
-    const merged: HookOutcome = { block: false, askDowngraded: false, diagnostics: [] };
-    for (const o of outcomes) {
-      if (o.block && !merged.block) {
-        merged.block = true;
-        merged.blockReason = o.blockReason;
-      }
-      if (o.stop && !merged.stop) {
-        merged.stop = true;
-        merged.stopReason = o.stopReason;
-      }
-      merged.askDowngraded = merged.askDowngraded || o.askDowngraded;
-      if (o.additionalContext) {
-        merged.additionalContext = merged.additionalContext
-          ? `${merged.additionalContext}\n${o.additionalContext}`
-          : o.additionalContext;
-      }
-      if (o.updatedInput) merged.updatedInput = { ...merged.updatedInput, ...o.updatedInput };
-      if (o.stdout) merged.stdout = merged.stdout ? `${merged.stdout}\n${o.stdout}` : o.stdout;
-      if (o.systemMessages?.length) {
-        merged.systemMessages = [...(merged.systemMessages ?? []), ...o.systemMessages];
-      }
-      merged.diagnostics.push(...o.diagnostics);
-    }
+    const merged = mergeHookOutcomes(outcomes);
     this.surface(eventName, merged);
     return merged;
   }
@@ -263,7 +239,6 @@ export interface PiccTestSeam {
      */
     subagentPanelFocus: SubagentPanelFocusController;
     mainCheckpointGate: MainSessionCheckpointGate;
-    checkpointExecution: MainSessionCheckpointExecutionBridge;
   }) => void;
   /**
    * TEST-ONLY subagent SDK override: replaces the real Pi SDK the session's
@@ -343,9 +318,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     console.error(`PiCC config: ${d.message}`);
   }
   const sessionId = randomUUID();
-  const checkpointExecution = new MainSessionCheckpointExecutionBridge();
   const mainCheckpointGate = new MainSessionCheckpointGate(
-    checkpointExecution,
     `pre-session:${sessionId}`,
     config.compaction.proactiveCompactPercent,
   );
@@ -443,7 +416,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     epoch: object;
     controller: MidRunCompactionController;
     generation: number;
-    summary: CompactionSummaryToken;
     hookBlocked: boolean;
     operation?: object;
     restorationFailed: boolean;
@@ -1110,15 +1082,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   };
 
-  const detachCheckpointExecution = checkpointExecution.attach({
-    manualCompaction: { kind: "unavailable" },
+  mainCheckpointGate.attachExecution({
     progress: publishCheckpoint,
     compact: async (_attempt, signal) => {
       const ctx = checkpointContext;
       const epoch = checkpointSessionEpoch;
       const controller = mainCheckpointGate.currentController();
       const generation = controller.snapshot().generation;
-      const summary = checkpointExecution.beginCompactionSummary(controller, generation);
+      const summary = controller.beginCompactionSummary(generation);
       if (!summary || typeof ctx?.compact !== "function") {
         return { ok: false, category: "operational" };
       }
@@ -1126,7 +1097,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         epoch,
         controller,
         generation,
-        summary,
         hookBlocked: false,
         operation: undefined as object | undefined,
         restorationFailed: false,
@@ -1169,7 +1139,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         }, signal);
       } finally {
         signal.removeEventListener("abort", abortHost);
-        checkpointExecution.endCompactionSummary(controller, summary);
+        controller.endCompactionSummary(summary);
         if (checkpointAttempt === attempt) checkpointAttempt = undefined;
       }
     },
@@ -1257,7 +1227,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       };
     },
   });
-  void detachCheckpointExecution;
 
   // TEST-ONLY seam: hand the real in-process registries AND the runtime to a
   // test that drives the settlement-notice delivery path (or the dispatcher-owner
@@ -1273,7 +1242,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       subagentPanel,
       subagentPanelFocus,
       mainCheckpointGate,
-      checkpointExecution,
     });
   } catch (err) {
     console.error(`PiCC test seam onWired failed: ${(err as Error).message}`);

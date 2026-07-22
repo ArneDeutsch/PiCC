@@ -31,16 +31,27 @@ interface ChildHarness {
   providerRegistrations(): Array<{ name: string; config: Record<string, unknown> }>;
 }
 
-function checkpointSdk(
-  failures: number,
-  recoveryReject: "before" | "after" | undefined = undefined,
+interface CheckpointSdkOptions {
+  failures: number;
+  recoveryReject?: "before" | "after";
+  gateRecoveryCompact?: boolean;
+  reExhaustOnce?: boolean;
+  mixedBatch?: boolean;
+  activateSkill?: boolean;
+  reExhaustWithRestorationFailure?: boolean;
+  replayReject?: boolean;
+}
+
+function checkpointSdk({
+  failures,
+  recoveryReject,
   gateRecoveryCompact = false,
   reExhaustOnce = false,
   mixedBatch = false,
   activateSkill = false,
   reExhaustWithRestorationFailure = false,
   replayReject = false,
-): ChildHarness {
+}: CheckpointSdkOptions): ChildHarness {
   const base = fakeSdk().sdk;
   let compactions = 0;
   let creations = 0;
@@ -300,7 +311,7 @@ function runtimeFor(
 
 describe("subagent mid-run compaction", () => {
   it("retries, compacts, and resumes on the same live child session before classification", async () => {
-    const harness = checkpointSdk(1);
+    const harness = checkpointSdk({ failures: 1 });
     const result = await runtimeFor(harness).dispatch({
       subagentType: "reviewer",
       prompt: "review",
@@ -334,7 +345,7 @@ describe("subagent mid-run compaction", () => {
         return { block: false, askDowngraded: false, diagnostics: [] };
       },
     };
-    const harness = checkpointSdk(0);
+    const harness = checkpointSdk({ failures: 0 });
     const abort = new AbortController();
     const dispatch = runtimeFor(harness, makeAgent(), undefined, undefined, hooks).dispatch({
       subagentType: "reviewer", prompt: "review", depth: 1, abortSignal: abort.signal,
@@ -349,7 +360,7 @@ describe("subagent mid-run compaction", () => {
   });
 
   it("surfaces PostCompact diagnostics without injecting output and ignores its ordinary block decision", async () => {
-    const harness = checkpointSdk(0);
+    const harness = checkpointSdk({ failures: 0 });
     const hooks = {
       async fire(eventName: string) {
         if (eventName === "SessionStart") {
@@ -417,7 +428,7 @@ describe("subagent mid-run compaction", () => {
       "CHILD-SKILL-BODY $ARGUMENTS",
       "",
     ].join("\n"));
-    const harness = checkpointSdk(1, undefined, false, false, false, true);
+    const harness = checkpointSdk({ failures: 1, activateSkill: true });
     const childPi = fakePi();
     let runtime!: ReturnType<typeof runtimeFor>;
     try {
@@ -452,7 +463,7 @@ describe("subagent mid-run compaction", () => {
   });
 
   it("persists a mixed parallel child batch before compact and replays queued parent input before provider release", async () => {
-    const harness = checkpointSdk(1, undefined, true, false, true);
+    const harness = checkpointSdk({ failures: 1, gateRecoveryCompact: true, mixedBatch: true });
     const registry = new SubagentRegistry();
     const runtime = runtimeFor(harness, makeAgent(), registry);
     const dispatch = runtime.dispatch({
@@ -485,7 +496,7 @@ describe("subagent mid-run compaction", () => {
   });
 
   it("aborts and joins the child before publishing a retained-replay failure", async () => {
-    const harness = checkpointSdk(1, undefined, true, false, false, false, false, true);
+    const harness = checkpointSdk({ failures: 1, gateRecoveryCompact: true, replayReject: true });
     const registry = new SubagentRegistry();
     const runtime = runtimeFor(harness, makeAgent(), registry);
     const dispatch = runtime.dispatch({
@@ -511,8 +522,8 @@ describe("subagent mid-run compaction", () => {
     expect(registry.get("agent-666666666666")?.checkpointPaused).toBe(true);
   });
 
-  it("reports JSON/RPC-compatible retry and exhaustion progress to the parent once in order", async () => {
-    const harness = checkpointSdk(3);
+  it("returns an actionable paused failure with ordered progress after bounded exhaustion", async () => {
+    const harness = checkpointSdk({ failures: 3 });
     const progress: string[] = [];
     const result = await runtimeFor(harness).dispatch({
       subagentType: "reviewer",
@@ -521,24 +532,13 @@ describe("subagent mid-run compaction", () => {
       onProgress: (snapshot) => progress.push(snapshot.activity ?? ""),
     });
 
-    expect(result.checkpointPaused).toBe(true);
+    expect(result.outcome).toBe("failed");
     expect(progress).toEqual([
       "checkpoint: checkpoint-armed",
       "checkpoint retry 2/3",
       "checkpoint retry 3/3",
       "checkpoint paused: recovery required",
     ]);
-  });
-
-  it("returns an actionable paused failure after bounded exhaustion and retains the live session", async () => {
-    const harness = checkpointSdk(3);
-    const result = await runtimeFor(harness).dispatch({
-      subagentType: "reviewer",
-      prompt: "review",
-      depth: 1,
-    });
-
-    expect(result.outcome).toBe("failed");
     expect(result.checkpointPaused).toBe(true);
     expect(result.error).toContain("paused and no continuation ran");
     expect(harness.compactCalls()).toBe(3);
@@ -548,7 +548,7 @@ describe("subagent mid-run compaction", () => {
   });
 
   it("makes awaited SendMessage own and return the classified retained recovery result", async () => {
-    const harness = checkpointSdk(3);
+    const harness = checkpointSdk({ failures: 3 });
     const registry = new SubagentRegistry();
     const runtime = runtimeFor(harness, makeAgent(), registry);
     const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
@@ -576,7 +576,7 @@ describe("subagent mid-run compaction", () => {
   it.each(["before", "after"] as const)(
     "closes recovery when sendCustomMessage rejects %s turn_start after commit",
     async (when) => {
-      const harness = checkpointSdk(3, when);
+      const harness = checkpointSdk({ failures: 3, recoveryReject: when });
       const registry = new SubagentRegistry();
       const runtime = runtimeFor(harness, makeAgent(), registry);
       const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
@@ -602,7 +602,7 @@ describe("subagent mid-run compaction", () => {
   );
 
   it("keeps the original retained owner when a recovery continuation re-exhausts", async () => {
-    const harness = checkpointSdk(3, undefined, false, true);
+    const harness = checkpointSdk({ failures: 3, reExhaustOnce: true });
     const registry = new SubagentRegistry();
     const runtime = runtimeFor(harness, makeAgent(), registry);
     const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
@@ -630,7 +630,7 @@ describe("subagent mid-run compaction", () => {
   });
 
   it("preserves terminal restoration guidance when a recovery continuation rejects after re-exhaustion", async () => {
-    const harness = checkpointSdk(3, "after", false, false, false, false, true);
+    const harness = checkpointSdk({ failures: 3, recoveryReject: "after", reExhaustWithRestorationFailure: true });
     const registry = new SubagentRegistry();
     const runtime = runtimeFor(harness, makeAgent(), registry, 2);
     const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
@@ -660,7 +660,7 @@ describe("subagent mid-run compaction", () => {
   });
 
   it("accepts a retained foreground agent id in TaskStop and joins before disposal", async () => {
-    const harness = checkpointSdk(3);
+    const harness = checkpointSdk({ failures: 3 });
     const registry = new SubagentRegistry();
     const runtime = runtimeFor(harness, makeAgent(), registry);
     const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
@@ -675,7 +675,7 @@ describe("subagent mid-run compaction", () => {
   });
 
   it("TaskStop during manual recovery joins it and forbids a late continuation", async () => {
-    const harness = checkpointSdk(3, undefined, true);
+    const harness = checkpointSdk({ failures: 3, gateRecoveryCompact: true });
     const registry = new SubagentRegistry();
     const runtime = runtimeFor(harness, makeAgent(), registry);
     const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
@@ -700,7 +700,7 @@ describe("subagent mid-run compaction", () => {
   });
 
   it("TaskStop by task id joins retained cleanup and leaves one stopped generation", async () => {
-    const harness = checkpointSdk(3);
+    const harness = checkpointSdk({ failures: 3 });
     const registry = new SubagentRegistry();
     const runtime = runtimeFor(harness, makeAgent(), registry);
     const tasks = new BackgroundTaskRegistry();
@@ -779,7 +779,7 @@ describe("subagent mid-run compaction", () => {
   });
 
   it("agent-id TaskStop atomically suppresses its linked background result", async () => {
-    const harness = checkpointSdk(3);
+    const harness = checkpointSdk({ failures: 3 });
     const registry = new SubagentRegistry();
     const runtime = runtimeFor(harness, makeAgent(), registry);
     const tasks = new BackgroundTaskRegistry();
@@ -803,7 +803,7 @@ describe("subagent mid-run compaction", () => {
   it("lets a nested parent stop only its own paused foreground child", async () => {
     const parentId = "agent-aaaaaaaaaaaa";
     const childId = "agent-bbbbbbbbbbbb";
-    const harness = checkpointSdk(3);
+    const harness = checkpointSdk({ failures: 3 });
     const registry = new SubagentRegistry();
     const runtime = runtimeFor(harness, makeAgent(), registry);
     await runtime.dispatch({
@@ -819,12 +819,12 @@ describe("subagent mid-run compaction", () => {
   });
 
   it("session-local runtime shutdown joins all of its retained paused children", async () => {
-    const first = checkpointSdk(3);
+    const first = checkpointSdk({ failures: 3 });
     const firstRegistry = new SubagentRegistry();
     const firstRuntime = runtimeFor(first, makeAgent(), firstRegistry);
     await firstRuntime.dispatch({ subagentType: "reviewer", prompt: "one", depth: 1 });
 
-    const independent = checkpointSdk(3);
+    const independent = checkpointSdk({ failures: 3 });
     const independentRuntime = runtimeFor(independent, makeAgent(), new SubagentRegistry());
     await independentRuntime.dispatch({ subagentType: "reviewer", prompt: "two", depth: 1 });
 

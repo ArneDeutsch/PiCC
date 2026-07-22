@@ -36,6 +36,21 @@ export const EXTENSION_PATH = path.join(REPO_ROOT, "src", "index.ts");
 export const cliMissing = !fs.existsSync(CLI_PATH);
 export const RUN_TIMEOUT_MS = 90_000;
 export const TEST_TIMEOUT_MS = 120_000;
+export const CHECKPOINT_USAGE = Object.freeze({
+  prompt_tokens: 90_000,
+  completion_tokens: 100,
+  total_tokens: 90_100,
+});
+export const CHECKPOINT_CONTEXT_WINDOW = 100_000;
+export const CHECKPOINT_PI_SETTINGS = Object.freeze({
+  compaction: Object.freeze({ enabled: false, reserveTokens: 100, keepRecentTokens: 1 }),
+});
+
+export function writeCheckpointConfig(fixtureDir: string): void {
+  const configDir = path.join(fixtureDir, ".claude", ".picc");
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ proactiveCompactPercent: 90 }));
+}
 
 export interface RunResult {
   code: number | null;

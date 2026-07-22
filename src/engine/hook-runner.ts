@@ -80,6 +80,32 @@ const EXIT2_BLOCKABLE_EVENTS: ReadonlySet<string> = new Set([
   "PreCompact",
 ]);
 
+export function mergeHookOutcomes(outcomes: readonly (HookOutcome | undefined)[]): HookOutcome {
+  const merged: HookOutcome = { block: false, askDowngraded: false, diagnostics: [] };
+  for (const outcome of outcomes) {
+    if (!outcome) continue;
+    if (outcome.block && !merged.block) {
+      merged.block = true;
+      merged.blockReason = outcome.blockReason;
+    }
+    if (outcome.stop && !merged.stop) {
+      merged.stop = true;
+      merged.stopReason = outcome.stopReason;
+    }
+    merged.askDowngraded ||= outcome.askDowngraded;
+    if (outcome.additionalContext) {
+      merged.additionalContext = [merged.additionalContext, outcome.additionalContext].filter(Boolean).join("\n");
+    }
+    if (outcome.updatedInput) merged.updatedInput = { ...merged.updatedInput, ...outcome.updatedInput };
+    if (outcome.stdout) merged.stdout = [merged.stdout, outcome.stdout].filter(Boolean).join("\n");
+    if (outcome.systemMessages?.length) {
+      merged.systemMessages = [...(merged.systemMessages ?? []), ...outcome.systemMessages];
+    }
+    merged.diagnostics.push(...outcome.diagnostics);
+  }
+  return merged;
+}
+
 export interface HookRunnerOptions {
   config: HookConfig;
   projectDir: string;

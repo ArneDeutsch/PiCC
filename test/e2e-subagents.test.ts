@@ -5,11 +5,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   BASH_AVAILABLE,
+  CHECKPOINT_CONTEXT_WINDOW,
+  CHECKPOINT_USAGE,
   cliMissing,
   createE2ELive,
   systemText,
   TEST_TIMEOUT_MS,
   toolResultText,
+  writeCheckpointConfig,
   CLI_PATH,
 } from "./helpers/e2e-live.js";
 import type { CapturedRequest } from "./helpers/mock-openai.js";
@@ -63,7 +66,6 @@ describe.skipIf(cliMissing)(
     it(
       "retries and commits one real foreground-child compaction before returning one parent result",
       async () => {
-        const highUsage = { prompt_tokens: 90_000, completion_tokens: 100, total_tokens: 90_100 };
         const child = (request: CapturedRequest) => request.sessionKind === "child";
         const parent = (request: CapturedRequest) => request.sessionKind === "main";
         const childErrorSentinels = ["CHILD_SUMMARY_SECRET_T05", "C:/private/child/session.jsonl", "CHILD_TRANSCRIPT_T05"];
@@ -73,12 +75,10 @@ describe.skipIf(cliMissing)(
             childUserMessages: ["finish all child reads"],
             childSystemMarkers: ["You are a read-only exploration agent"],
           },
-          contextWindow: 100_000,
+          contextWindow: CHECKPOINT_CONTEXT_WINDOW,
           piSettings: { compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 1 } },
           setup(fixtureDir) {
-            const configDir = path.join(fixtureDir, ".claude", ".picc");
-            fs.mkdirSync(configDir, { recursive: true });
-            fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ proactiveCompactPercent: 90 }));
+            writeCheckpointConfig(fixtureDir);
             fs.writeFileSync(path.join(fixtureDir, "child-a.txt"), "a".repeat(24_000));
             fs.writeFileSync(path.join(fixtureDir, "child-b.txt"), "b".repeat(24_000));
             fs.writeFileSync(path.join(fixtureDir, "child-c.txt"), "c".repeat(24_000));
@@ -104,7 +104,7 @@ describe.skipIf(cliMissing)(
                 { name: "read", args: { path: "child-c.txt" } },
                 { name: "read", args: { path: "child-d.txt" } },
               ],
-              usage: highUsage,
+              usage: CHECKPOINT_USAGE,
             },
             {
               when: (request) => child(request) && request.requestKind === "compaction",
