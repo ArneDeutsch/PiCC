@@ -480,6 +480,7 @@ function sanitizeBinaryOutput(value: string): string {
       if (code === undefined) return false;
       if (code === 0x09 || code === 0x0a || code === 0x0d) return true;
       if (code <= 0x1f) return false;
+      // Interlinear annotation controls U+FFF9–U+FFFB break terminal width measurement.
       return code < 0xfff9 || code > 0xfffb;
     })
     .join("");
@@ -492,6 +493,7 @@ export function getTextOutput(result: ResultShape | undefined, showImages: boole
   const textBlocks = content.filter((block) => block?.type === "text");
   const imageBlocks = content.filter((block) => block?.type === "image");
   let output = textBlocks
+    // Remove every CR (including CRLF's CR) so output cannot return the cursor to column zero.
     .map((block) => sanitizeBinaryOutput(stripAnsi(String(block.text || ""))).replace(/\r/gu, ""))
     .join("\n");
   const capabilities = getCapabilities();
