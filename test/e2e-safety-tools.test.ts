@@ -95,6 +95,8 @@ describe.skipIf(cliMissing)(
         const toolResult = toolResultText(result.requests[1]!);
         expect(toolResult).toContain("PCD_BASH_OK");
         expect(toolResult).toContain("node-2");
+        expect(toolResult).not.toMatch(/\b\d+ (?:output |command )?lines? hidden\b/iu);
+        expect(toolResult).not.toMatch(/\bto expand\b/iu);
         // cp1252/UTF-8 boundary: only asserted when python actually ran (gated on
         // PYTHON_BIN), so absence of python skips just this portion, not the test.
         if (PYTHON_BIN) {

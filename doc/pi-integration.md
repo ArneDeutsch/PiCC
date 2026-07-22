@@ -143,10 +143,13 @@ not adopt deferred tool activation. We do not reimplement these Pi-native surfac
   imports/exports we rely on exist.
 - `before_agent_start` system-prompt chaining: other extensions may also modify; we append, not replace.
 - Built-in tool override warning in interactive mode is expected (documented for users).
-- Tool-row de-padding and mutation presentation couple `src/runtime/tool-shell.ts` and
-  `src/runtime/routine-tool-render.ts` to Pi's render contract. These dependencies are pinned by
-  Pi-contract tests so a Pi bump fails loudly in CI rather than degrading incremental rendering
-  silently on a green CI. For what the wrapper
+- Tool-row de-padding, mutation presentation, and settled interactive collapse couple
+  `src/runtime/tool-shell.ts`, `src/runtime/routine-tool-render.ts`, and
+  `src/runtime/default-collapsed-tool-render.ts` to Pi's render contract. The collapse lifecycle
+  additionally relies on Pi propagating configured `app.tools.expand` state and invoking a settled
+  TUI call renderer before its result renderer with shared per-call state. Pi-contract tests pin
+  these dependencies so a Pi bump fails loudly in CI rather than degrading rendering silently.
+  For what the wrapper
   does with these, see "`renderShell` — this is how you control blank lines and framing" in
   [`tui-extension-guide.md`](tui-extension-guide.md); the Pi-side surface is:
   - **`create*ToolDefinition` renderer shape** — the de-padded built-in rows source their

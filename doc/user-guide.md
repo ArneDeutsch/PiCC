@@ -166,6 +166,12 @@ Then use it like Claude Code:
   working directory really moves, so project scripts detect worktree mode via git plumbing
 - parallel sessions: open a second terminal, `picc` again, enter a different worktree
 
+In the interactive TUI, ordinary settled Read, Write, Edit, MultiEdit, and Bash successes use compact
+rows; the configured `app.tools.expand` action (Ctrl+O by default) reveals their native detail.
+Display-safe live, exceptional, and unfamiliar shapes remain native, while malformed display data
+uses a concise warning. This default-collapse presentation does not apply to HTML export or
+non-interactive output, and it does not change model-facing results or execution.
+
 ### Observing subagents
 
 Every subagent is visible, both to you and to the coordinating model:

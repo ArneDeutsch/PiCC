@@ -53,7 +53,7 @@ function renderResult(
     result,
     { expanded: extra.expanded ?? false, isPartial: extra.partial ?? false },
     extra.theme,
-    { args, isError: extra.error ?? false },
+    { args, isPartial: extra.partial ?? false, isError: extra.error ?? false },
   ).render(extra.width ?? 120);
 }
 
@@ -784,7 +784,7 @@ describe("routine tool rendering decorator", () => {
         }),
       });
       const output = renderResult(tool, args, result, { width: 120 }).join("\n");
-      expect(output).toContain("Diff too large to display");
+      expect(output).toContain("Diff too large to display for");
       expect(output).toContain(entry.path.slice(0, Math.min(entry.path.length, 20)));
       expect(indexedReads).toBe(0);
       expect(result.content[0]?.text).toBe(canonicalText);

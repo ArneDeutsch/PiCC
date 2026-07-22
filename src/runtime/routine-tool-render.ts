@@ -642,10 +642,8 @@ function routineToolName(tool: unknown): RoutineToolName | undefined {
   }
 }
 
-const EDIT_CALL_INNER = Symbol("picc.editCallInner");
-const EDIT_RESULT_INNER = Symbol("picc.editResultInner");
-
-type MarkedComponent = Component & { [EDIT_CALL_INNER]?: Component; [EDIT_RESULT_INNER]?: Component };
+const editCallInners = new WeakMap<Component, Component>();
+const editResultInners = new WeakMap<Component, Component>();
 type PublicEditDefinition = ReturnType<typeof createEditToolDefinition>;
 type PublicEditCallRenderer = NonNullable<PublicEditDefinition["renderCall"]>;
 type PublicEditResultRenderer = NonNullable<PublicEditDefinition["renderResult"]>;
@@ -660,14 +658,19 @@ export interface RoutineRenderingDependencies {
   createEditDefinition?: (cwd: string) => EditRendererDefinition;
 }
 
-function componentMarker(value: unknown, marker: symbol): Component | undefined {
-  const candidate = ownData(value, marker);
-  if (candidate === null || typeof candidate !== "object") return undefined;
-  try {
-    return typeof Reflect.get(candidate, "render") === "function" ? candidate as Component : undefined;
-  } catch {
-    return undefined;
-  }
+function componentFrom(value: unknown): Component | undefined {
+  return value !== null && typeof value === "object" && typeof (value as Component).render === "function"
+    ? value as Component
+    : undefined;
+}
+
+/** Read preview-failure evidence retained by this module's Edit call adapter. */
+export function adaptedEditPreviewError(value: unknown): string | undefined {
+  const component = componentFrom(value);
+  const inner = component && editCallInners.get(component);
+  const preview = inner && ownData(inner, "preview");
+  const error = ownData(preview, "error");
+  return typeof error === "string" ? error : undefined;
 }
 
 function editContext(context: unknown, lastComponent: Component | undefined): Record<string, unknown> {
@@ -691,10 +694,10 @@ function knownEditPadding(line: string, width: number): boolean {
 
 function adaptEditCallRenderer(renderer: EditCallRenderer): EditCallRenderer {
   return (args, theme, context): Component => {
-    const previous = componentMarker(ownData(context, "lastComponent"), EDIT_CALL_INNER);
+    const previousComponent = componentFrom(ownData(context, "lastComponent"));
+    const previous = previousComponent && editCallInners.get(previousComponent);
     const inner = renderer(args, theme, editContext(context, previous) as unknown as typeof context);
-    const adapted: MarkedComponent = {
-      [EDIT_CALL_INNER]: inner,
+    const adapted: Component = {
       render(width: number): string[] {
         const lines = inner.render(width);
         return lines.length >= 2 &&
@@ -704,6 +707,7 @@ function adaptEditCallRenderer(renderer: EditCallRenderer): EditCallRenderer {
           : lines;
       },
     };
+    editCallInners.set(adapted, inner);
     return adapted;
   };
 }
@@ -784,7 +788,7 @@ function validateMultiEditEntries(value: unknown, length: number): boolean {
   }
 }
 
-interface MultiEditSnapshot {
+export interface MultiEditSnapshot {
   kind: "displayable";
   path: string;
   diff: string;
@@ -793,12 +797,12 @@ interface MultiEditSnapshot {
   canonicalText: string;
 }
 
-interface OversizedMultiEditSnapshot {
+export interface OversizedMultiEditSnapshot {
   kind: "oversized";
   path: string;
 }
 
-type MultiEditSuccess = MultiEditSnapshot | OversizedMultiEditSnapshot;
+export type MultiEditSuccess = MultiEditSnapshot | OversizedMultiEditSnapshot;
 
 function boundedPathMatches(left: string, right: string): boolean {
   if (left.length !== right.length) return false;
@@ -825,12 +829,13 @@ function canonicalMultiEditTextMatches(
     text.startsWith(tail, prefix.length + path.length - tail.length);
 }
 
-function recognizeMultiEditSuccess(
+export function recognizeMultiEditSuccess(
   result: unknown,
   options: unknown,
   context: unknown,
 ): MultiEditSuccess | undefined {
-  if (ownData(options, "isPartial") !== false || ownData(context, "isError") !== false) return undefined;
+  if (ownData(options, "isPartial") !== false || ownData(context, "isPartial") !== false ||
+    ownData(context, "isError") !== false) return undefined;
   const resultSnapshot = plainOwnData(result, ["content", "details"]) ??
     plainOwnData(result, ["content", "details", "isError"]);
   if (!resultSnapshot || ("isError" in resultSnapshot && resultSnapshot.isError !== false) ||
@@ -919,7 +924,8 @@ function multiEditResult(
       ((definitionCwd) => createEditToolDefinition(definitionCwd) as unknown as EditRendererDefinition);
     const definition = createDefinition(cwd);
     if (typeof definition.renderResult !== "function") return fallback;
-    const previous = componentMarker(ownData(context, "lastComponent"), EDIT_RESULT_INNER);
+    const previousComponent = componentFrom(ownData(context, "lastComponent"));
+    const previous = previousComponent && editResultInners.get(previousComponent);
     const detachedResult: Parameters<EditResultRenderer>[0] = {
       content: [{ type: "text", text: snapshot.canonicalText }],
       details: { diff: snapshot.diff, patch: "", firstChangedLine: snapshot.firstChangedLine },
@@ -948,8 +954,7 @@ function multiEditResult(
       theme as Parameters<EditResultRenderer>[2],
       detachedContext,
     );
-    const adapted: MarkedComponent = {
-      [EDIT_RESULT_INNER]: delegated,
+    const adapted: Component = {
       render(width: number): string[] {
         try {
           return delegated.render(width);
@@ -958,6 +963,7 @@ function multiEditResult(
         }
       },
     };
+    editResultInners.set(adapted, delegated);
     return adapted;
   } catch {
     return fallback;

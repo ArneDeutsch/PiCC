@@ -9,8 +9,8 @@ and the synchronization contracts that keep async tests deterministic.
 
 **The shape is a pyramid.** Cover behavior **fully at the unit layer**; use the costlier layers as
 **targeted safety nets** for what a cheaper layer structurally cannot prove. Do not drive every
-branch through e2e. The real suite already has this shape: 55 unit-lane files against 3 curated
-e2e files, and the unit lane — not the full suite — is the pre-commit gate (`.githooks/pre-commit`).
+branch through e2e. The unit lane — not the full suite — is the pre-commit gate
+(`.githooks/pre-commit`).
 
 **The trade-off is speed against coverage.** Each e2e scenario spawns a real Pi CLI which spawns
 further children, on a lane that must stay small enough to survive a 2-core runner; the same branch

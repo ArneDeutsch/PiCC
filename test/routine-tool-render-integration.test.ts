@@ -137,7 +137,7 @@ describe("main-session routine rendering registration", () => {
       result,
       { expanded: false, isPartial: false },
       undefined,
-      { args, isError: false, cwd: directory },
+      { args, isPartial: false, isError: false, cwd: directory },
     ).render(100) as string[];
     expect(lines.join("\n")).toContain("alpha");
     expect(lines.join("\n")).toContain("omega");
