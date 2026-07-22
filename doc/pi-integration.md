@@ -35,7 +35,7 @@ Launch modes we support:
 | PreCompact/PostCompact + instruction re-injection | `pi.on("session_before_compact")` (can cancel), `pi.on("session_compact")`; PiCC restores SessionStart(compact) context and recent skill bodies through `pi.sendMessage`, while PostCompact output is diagnostic-only |
 | Custom tools: `Agent`, `EnterWorktree`, `ExitWorktree`, `WebFetch`, `WebSearch`, `Grep`, `Glob`, `TaskCreate/...`, degrade stubs | `pi.registerTool({ name, description, parameters: TypeBox, execute, prepareArguments? })`; throw ⇒ `isError`; `terminate: true` stops only after Pi completes all sibling results in the requested batch |
 | Slash commands: user-invocable skills, legacy commands, `/doctor`, `/quota`, `/compat` | `pi.registerCommand(name, { description, handler, getArgumentCompletions })`; command handlers get `ExtensionCommandContext` |
-| Worktree cwd swap (load-bearing) | Override built-in tools: re-register `bash`/`read`/`write`/`edit`/`grep`/`find`/`ls` wrappers that resolve paths/cwd through a mutable `EffectiveCwd`; built-ins created per-cwd via `createBashTool(cwd, { spawnHook })`, `createReadTool(cwd, …)` etc. Built-in renderers are re-applied from `create*ToolDefinition` and de-padded through the self-shell wrapper (`src/runtime/tool-shell.ts` — see *Risks / churn watchpoints*); `execute` stays sourced from `create*Tool` so it is byte-identical. |
+| Worktree cwd swap (load-bearing) | Override built-in tools: re-register `bash`/`read`/`write`/`edit`/`grep`/`find`/`ls` wrappers that resolve paths/cwd through a mutable `EffectiveCwd`; built-ins created per-cwd via `createBashTool(cwd, { spawnHook })`, `createReadTool(cwd, …)` etc. Built-in renderers are re-applied from `create*ToolDefinition` and placed in the foreground-glyph self shell (`src/runtime/tool-shell.ts` — see *Risks / churn watchpoints*); `execute` stays sourced from `create*Tool` until the one outer checkpoint wrapper. |
 | Subagent runtime (fresh context, parallel, per-agent tools/model, verbatim return — see "Verbatim subagent return" in [`architecture.md`](architecture.md)) | SDK: `createAgentSession({ cwd, tools, customTools, resourceLoader, sessionManager, settingsManager, model?, thinkingLevel? })` — the options **PiCC passes**; Pi's own option set is wider. `resourceLoader` is `new DefaultResourceLoader({ cwd, agentDir, systemPromptOverride, agentsFilesOverride, skillsOverride, promptsOverride, extensionFactories })` (`await loader.reload()` before use). Final assistant message read as the last `role: "assistant"` entry of `session.messages`. Per-session `sessionManager` — see "Session managers" below. |
 | Session managers (subagent transcripts) | `SessionManager.create(cwd, sessionDir, { id })` — persisted transcript, the default (Pi names the file `<stamp>_<id>.jsonl`); `SessionManager.open(path, sessionDir, cwd)` — reopen the same file to resume and append; `SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id })` — read a source transcript and write a **brand-new** file, so a `subagent_type: "fork"` child inherits the parent conversation without touching the parent's history; `SessionManager.inMemory(cwd)` — the non-resumable fallback when no transcript is available (no main-session file, a failed `create`, or an SDK without persisted sessions). Settings: `SettingsManager.inMemory(settings)`. |
 | Model/effort control | `pi.setModel(model)`, `ctx.modelRegistry.find(provider,id)`, `pi.setThinkingLevel("off"…"max")` — Claude `effort` maps onto thinking levels |
@@ -160,16 +160,21 @@ not adopt deferred tool activation. We do not reimplement these Pi-native surfac
   registration remains API-global last-writer-wins, and Codex cached-WebSocket pre-abort behavior is
   pinned by contract tests.
 - Built-in tool override warning in interactive mode is expected (documented for users).
-- Tool-row de-padding, mutation presentation, and settled interactive collapse couple
+- Tool-row glyph framing, mutation presentation, and settled interactive collapse couple
   `src/runtime/tool-shell.ts`, `src/runtime/routine-tool-render.ts`, and
-  `src/runtime/default-collapsed-tool-render.ts` to Pi's render contract. The collapse lifecycle
-  additionally relies on Pi propagating configured `app.tools.expand` state and invoking a settled
-  TUI call renderer before its result renderer with shared per-call state. Pi-contract tests pin
-  these dependencies so a Pi bump fails loudly in CI rather than degrading rendering silently.
+  `src/runtime/default-collapsed-tool-render.ts` to Pi's render contract. A pending call-only update
+  constructs only the call component; if rendered before a later update supersedes it, only that
+  component paints. On an update when a result exists, Pi constructs the call component and then
+  the result component with the exact same `ctx.state` object before either can paint; when rendered,
+  the call paints before the result. Glyph coordination and collapse rely
+  on that result-bearing build-before-paint order and state identity; collapse additionally relies
+  on Pi propagating the configured `app.tools.expand` state. The Pi-contract test pins this sequence
+  and identity across repeated result-bearing updates so a Pi bump fails loudly rather than
+  degrading rendering silently.
   For what the wrapper
   does with these, see "`renderShell` — this is how you control blank lines and framing" in
   [`tui-extension-guide.md`](tui-extension-guide.md); the Pi-side surface is:
-  - **`create*ToolDefinition` renderer shape** — the de-padded built-in rows source their
+  - **`create*ToolDefinition` renderer shape** — the glyph-framed built-in rows source their
     `renderCall`/`renderResult` from the public `createRead/Write/Edit/Bash/Grep/Find/LsToolDefinition`
     factories (the plain `create*Tool` factory strips renderers via `wrapToolDefinition`). A rename,
     move, or shape change of these factories breaks the wrap.
@@ -179,9 +184,10 @@ not adopt deferred tool activation. We do not reimplement these Pi-native surfac
     carry incremental render state, so a Pi change here would silently degrade rendering: the
     contract test drives the real `ToolExecutionComponent` and asserts Pi's side of it.
   - **Edit's nested call `Box`** — the public Edit call renderer returns a stateful `Box(1, 1)` and
-    recognizes that Box through `ctx.lastComponent`. The routine adapter retains the inner Box and
-    removes only its verified full-width outer padding rows; the real lifecycle test covers initial
-    call, asynchronous preview, and settled reuse.
+    recognizes that Box through `ctx.lastComponent`. The routine adapter retains the exact inner
+    Box in a WeakMap, removes only recognized full-width outer padding rows, and neutralizes its
+    state background immediately before every render because Pi can reapply it. The real lifecycle
+    test covers initial call, asynchronous preview, and settled reuse.
   - **Public Edit result renderer and custom HTML lifecycle** — MultiEdit passes a detached,
     sanitized Edit-shaped success snapshot to `createEditToolDefinition().renderResult`; it never
     invokes Edit preview. Pi's custom HTML renderer records call arguments before result rendering

@@ -166,11 +166,15 @@ Then use it like Claude Code:
   working directory really moves, so project scripts detect worktree mode via git plumbing
 - parallel sessions: open a second terminal, `picc` again, enter a different worktree
 
-In the interactive TUI, ordinary settled Read, Write, Edit, MultiEdit, and Bash successes use compact
-rows; the configured `app.tools.expand` action (Ctrl+O by default) reveals their native detail.
-Display-safe live, exceptional, and unfamiliar shapes remain native, while malformed display data
-uses a concise warning. This default-collapse presentation does not apply to HTML export or
-non-interactive output, and it does not change model-facing results or execution.
+In the interactive TUI, each main-session tool row has one foreground state marker: `○` running,
+`●` success, `✗` failure, or `■` stopped/aborted. Lifecycle tools show the meaningful underlying
+outcome even when their transport call succeeds. Ordinary settled Read, Write, Edit, MultiEdit, and
+Bash successes use compact detail; the configured `app.tools.expand` action (Ctrl+O by default)
+reveals native detail without changing the marker. Live, exceptional, and unfamiliar rows retain
+native detail inside the same glyph frame, while malformed display data uses a concise warning.
+Binary images remain native. HTML export may retain Pi's state-background cards and built-in
+presentation, and eligible custom fragments may include phase-local glyphs; non-interactive output
+has no renderer glyphs. None of these presentations changes model-facing results or execution.
 
 ### Observing subagents
 

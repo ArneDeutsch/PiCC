@@ -1060,14 +1060,26 @@ describe("real Pi glyph-shell construction and render ordering", () => {
       "OrderProbe", id, {}, {}, definition, { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
     );
     const first = build("order-a");
+    constructed.length = 0;
     first.updateResult({ content: [{ type: "text", text: "canonical" }], details: undefined }, false);
-    const paired = constructed.slice(-2);
-    expect(paired.map(({ kind }) => kind)).toEqual(["call", "result"]);
-    expect(paired[0]?.state).toBe(paired[1]?.state);
+    expect(constructed.map(({ kind }) => kind)).toEqual(["call", "result"]);
+    expect(constructed[0]?.state).toBe(constructed[1]?.state);
+    const invocationState = constructed[0]?.state;
+    expect(rendered).toEqual([]);
 
     const firstPaint = first.render(80) as string[];
+    expect(rendered).toEqual(["call", "result"]);
+
+    constructed.length = 0;
+    rendered.length = 0;
+    first.updateResult({ content: [{ type: "text", text: "updated" }], details: undefined }, false);
+    expect(constructed.map(({ kind }) => kind)).toEqual(["call", "result"]);
+    expect(constructed[0]?.state).toBe(constructed[1]?.state);
+    expect(constructed[0]?.state).toBe(invocationState);
+    expect(rendered).toEqual([]);
+
     const secondPaint = first.render(80) as string[];
-    expect(rendered.slice(-4)).toEqual(["call", "result", "call", "result"]);
+    expect(rendered).toEqual(["call", "result"]);
     for (const paint of [firstPaint, secondPaint]) {
       expect(paint[0]).toBe("");
       expect(paint.join("\n").match(/[○●✗■]/gu)).toHaveLength(1);
@@ -1099,10 +1111,11 @@ describe("real Pi glyph-shell construction and render ordering", () => {
  * Pin Pi's `ctx.lastComponent` threading with a contract
  * test that drives the REAL, publicly-exported `ToolExecutionComponent`.
  *
- * The de-padded built-ins depend on Pi caching the component our wrapper returns
- * and handing it back as `ctx.lastComponent` on the next render (the `__inner`
- * threading exists precisely to survive this; `edit`'s `instanceof Box`
- * incremental reuse breaks if the wrong component is threaded). PiCC's OWN
+ * The glyph-framed built-ins depend on Pi caching the outer component our wrapper
+ * returns and handing it back as `ctx.lastComponent` on the next render. PiCC's
+ * `wrapperMetadata` WeakMap resolves that outer component to its retained previous
+ * inner component; `edit`'s `instanceof Box` incremental reuse breaks if the wrong
+ * component is threaded. PiCC's own
  * threading is unit-tested against a fake ctx (`test/runtime-core.test.ts`); this
  * asserts PI's side of the contract, so a Pi upgrade that stops threading the
  * prior component fails loudly here instead of degrading incremental rendering
