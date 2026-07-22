@@ -12,7 +12,9 @@ This is the **sibling** of the Phase 1 ticket-creation offer ([ticket-creation.m
 
 ## Reachability preconditions
 
-It runs regardless of whether a ticket ref was given — surfaced work is worth tracking either way — so first confirm GitHub is reachable with the gate's own preconditions (`gh` installed, `gh auth status` authenticated, and a resolvable `target` repo — [fork.md](fork.md), `origin`'s repo on a maintainer checkout, the upstream `parent` on a fork). If any fails, say that no durable cross-feature record was created: `observations.md` and `review.md` remain run-local staging records and are lost with worktree cleanup; do not imply that either persists.
+It runs regardless of whether a ticket ref was given — surfaced work is worth tracking either way — so first confirm GitHub is reachable with the gate's own preconditions (`gh` installed, `gh auth status` authenticated, and a resolvable `target` repo — [fork.md](fork.md), `origin`'s repo on a maintainer checkout, the upstream `parent` on a fork).
+
+If any reachability precondition fails, disable only GitHub existing-issue search and issue filing; the filesystem-only proposal gate and finding presentation still run. First assess the findings through the gate, then present its assessed pick-list with filing visibly marked unavailable, and only then complete the offer. Say that no durable cross-feature record was created: `observations.md` and `review.md` remain run-local staging records and are lost with worktree cleanup; do not imply that either persists.
 
 ## Gate through evaluate's proposal-gate
 

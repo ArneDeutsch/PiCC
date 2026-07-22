@@ -2,7 +2,7 @@
 
 Before review dispatch or triage, read or re-read [review-triage.md](review-triage.md), the canonical current-feature gate. If it is unreadable, refuse review-driven close fixes, writes, removals, new tasks, or scope expansion and stop. Dispatch prompts are governed by [dispatch-discipline.md](dispatch-discipline.md) — read it before your first fan-out; if it cannot be read, do not dispatch.
 
-When all tasks are complete and all retained tracked outputs are committed, review the whole feature against feature.md. Before findings are collected, require [review-triage.md](review-triage.md)'s **Decision-ready review evidence** for every proposed remedy affecting accepted scope or a durable surface:
+When all tasks are complete and all retained tracked outputs are committed, review the whole feature against feature.md. Before findings are collected, require every reviewer to follow [review-triage.md](review-triage.md)'s **Safe verification** rule while gathering its **Decision-ready review evidence** for every proposed remedy affecting accepted scope or a durable surface:
 
 - Fan out the full relevant roster, always including `docs`, over the complete feature diff (`git diff <default-branch>...HEAD`) + `doc/plan/<feature-slug>/feature.md` and all task specs carrying documentation dispositions: is the WHAT fully delivered? Anything half-done, inconsistent, undocumented, or excessive? The docs reviewer validates both currentness and the complete aggregate under [*Proportional scope* in the documentation guide](../../../../doc/documentation-guide.md), without presuming additions.
 - Add one adversarial completeness check (`generalist`): "what would a skeptical reviewer of the PR find missing?"

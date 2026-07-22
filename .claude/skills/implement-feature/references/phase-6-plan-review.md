@@ -2,7 +2,7 @@
 
 Before review dispatch or triage, read or re-read [review-triage.md](review-triage.md), the canonical current-feature gate. If it is unreadable, refuse review-driven plan writes or scope expansion and stop. Dispatch prompts are governed by [dispatch-discipline.md](dispatch-discipline.md) — read it before your first fan-out; if it cannot be read, do not dispatch.
 
-Fan out reviewers over the whole plan folder `doc/plan/<feature-slug>/` (its `feature.md` + all `tasks/` specs), in parallel, in review mode. Before findings are collected, unambiguously request the canonical reference's **Decision-ready review evidence** for every proposed remedy affecting accepted scope or a durable surface:
+Fan out reviewers over the whole plan folder `doc/plan/<feature-slug>/` (its `feature.md` + all `tasks/` specs), in parallel, in review mode. Before findings are collected, require every reviewer to follow the canonical reference's **Safe verification** rule while gathering its **Decision-ready review evidence** for every proposed remedy affecting accepted scope or a durable surface:
 
 - Each **relevant specialist**, always including `docs`: "Is your aspect completely covered by this plan? What's missing?" The docs reviewer applies [*Proportional scope* in the documentation guide](../../../../doc/documentation-guide.md) to the whole plan's aggregate footprint, validating the existing disposition against the plan rather than presuming additions.
 - An **adversarial reviewer** (`generalist`): find holes, contradictions, unstated assumptions, seam mismatches between task specs, missed edge cases in the WHAT/WHY/HOW.
