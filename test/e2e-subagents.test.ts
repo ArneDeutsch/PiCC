@@ -54,6 +54,97 @@ function requestedTool(request: CapturedRequest, name: string): boolean {
   });
 }
 
+type WireToolCall = { id: string; name: string; arguments: string };
+type OrderedToolExchange = {
+  call: WireToolCall;
+  callIndex: number;
+  result: string;
+  resultIndex: number;
+};
+
+function assistantToolCalls(request: CapturedRequest, name: string): Array<WireToolCall & { messageIndex: number }> {
+  const calls: Array<WireToolCall & { messageIndex: number }> = [];
+  request.messages.forEach((message, messageIndex) => {
+    if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) return;
+    for (const value of message.tool_calls) {
+      if (typeof value !== "object" || value === null) continue;
+      const call = value as Record<string, unknown>;
+      const fn = call.function;
+      if (typeof call.id !== "string" || typeof fn !== "object" || fn === null) continue;
+      const wireFunction = fn as Record<string, unknown>;
+      if (wireFunction.name !== name || typeof wireFunction.arguments !== "string") continue;
+      calls.push({ id: call.id, name, arguments: wireFunction.arguments, messageIndex });
+    }
+  });
+  return calls;
+}
+
+/** Deduplicate cumulative snapshots by provider call ID, not by result content. */
+function uniqueAssistantToolCalls(requests: CapturedRequest[], name: string): WireToolCall[] {
+  const byId = new Map<string, WireToolCall>();
+  for (const request of requests.filter((candidate) => candidate.sessionKind === "main")) {
+    for (const { messageIndex: _messageIndex, ...found } of assistantToolCalls(request, name)) {
+      const prior = byId.get(found.id);
+      if (prior !== undefined && JSON.stringify(prior) !== JSON.stringify(found)) {
+        throw new Error(`Conflicting cumulative tool-call history for ${found.id}`);
+      }
+      byId.set(found.id, found);
+    }
+  }
+  return [...byId.values()];
+}
+
+/** Match each call to exactly one later result inside one cumulative parent history. */
+function orderedToolExchanges(request: CapturedRequest, name: string): OrderedToolExchange[] {
+  const calls = assistantToolCalls(request, name);
+  return calls.map(({ messageIndex: callIndex, ...call }) => {
+    const results = request.messages.flatMap((message, resultIndex) =>
+      message.role === "tool" && message.tool_call_id === call.id && typeof message.content === "string"
+        ? [{ result: message.content, resultIndex }]
+        : []
+    );
+    expect(results, `one model-visible result for ${call.id}`).toHaveLength(1);
+    expect(results[0]!.resultIndex, `result for ${call.id} follows its assistant call`).toBeGreaterThan(callIndex);
+    return { call, callIndex, ...results[0]! };
+  });
+}
+
+function cumulativeParentHistory(requests: CapturedRequest[], callIds: string[]): CapturedRequest {
+  let history: CapturedRequest | undefined;
+  for (let index = requests.length - 1; index >= 0; index -= 1) {
+    const request = requests[index]!;
+    if (request.sessionKind !== "main") continue;
+    const ids = new Set(assistantToolCalls(request, "TaskOutput").map((call) => call.id));
+    if (callIds.every((id) => ids.has(id)) && callIds.every((id) =>
+      request.messages.some((message) => message.role === "tool" && message.tool_call_id === id))) {
+      history = request;
+      break;
+    }
+  }
+  expect(history, "a cumulative parent request containing every call and matching result").toBeDefined();
+  return history!;
+}
+
+const STRUCTURED_SUBAGENT_RESULT = `{
+  "type": "function",
+  "function": {
+    "name": "TaskOutput",
+    "arguments": {
+      "task_id": "task-structured-canary",
+      "wait": false
+    }
+  },
+  "summary": "review complete",
+  "findings": [],
+  "recommendation": "approve"
+}`;
+function expectStructuredTaskOutputResult(result: string): void {
+  expect(result.slice(0, STRUCTURED_SUBAGENT_RESULT.length)).toBe(STRUCTURED_SUBAGENT_RESULT);
+  expect(result.slice(STRUCTURED_SUBAGENT_RESULT.length)).toMatch(
+    /^\nusage: in \d+(?:\.\d+)? · out \d+(?:\.\d+)? · cache read \d+(?:\.\d+)? · cache write \d+(?:\.\d+)? · <?\$\d+(?:\.\d+)?$/u,
+  );
+}
+
 describe.skipIf(cliMissing)(
   "e2e subagents: real Pi CLI + PiCC extension + mock OpenAI model",
   () => {
@@ -245,60 +336,110 @@ describe.skipIf(cliMissing)(
 
     // --- Scenario: run_in_background + TaskOutput retrieval ---
     it(
-      "runs a background subagent and retrieves its verbatim result via TaskOutput",
+      "keeps structured background output attached to one valid TaskOutput call",
       async () => {
-        // The background dispatch's session and the parent's next turn hit the
-        // mock CONCURRENTLY (order nondeterministic), so the subagent/parent
-        // turns are pinned with `when` predicates instead of sequence position.
-        // Explore is used because its persona is trivially detectable.
+        // The child and the parent's continuation can reach the mock concurrently,
+        // so routing is pinned to the real request shape rather than script order.
         const isExplore = (r: CapturedRequest) =>
           systemText(r).includes("read-only exploration agent");
         const isParent = (r: CapturedRequest) => !isExplore(r);
         const result = await runPi({
           script: [
-            // 0) parent starts the background task (first request is always the parent)
             {
-              toolCalls: [
-                {
-                  name: "Agent",
-                  args: {
-                    subagent_type: "Explore",
-                    prompt: "look around",
-                    run_in_background: true,
-                  },
+              toolCalls: [{
+                name: "Agent",
+                args: {
+                  subagent_type: "Explore",
+                  prompt: "return the structured review result",
+                  run_in_background: true,
                 },
-              ],
+              }],
             },
-            // background subagent's single immediate final answer
-            { when: isExplore, text: "BG-TASK-ANSWER-E2E" },
-            // parent's next turn: retrieve the result (first background task id is task-1)
+            { when: isExplore, text: STRUCTURED_SUBAGENT_RESULT },
             { when: isParent, toolCalls: [{ name: "TaskOutput", args: { task_id: "task-1" } }] },
-            // parent's final turn
             { when: isParent, text: "background retrieved" },
           ],
           prompt: "explore in the background",
         });
 
         expect(result.code).toBe(0);
-        // The Agent call returned immediately with a task id.
         const startResult = result.requests.find((r) =>
           /Background task task-\d+ started/.test(toolResultText(r)),
         );
         expect(startResult, "expected the immediate background-start tool result").toBeDefined();
-        // TaskOutput returned the subagent's final message verbatim as its tool result.
-        const retrieved = result.requests.some((r) =>
-          toolResultText(r).includes("BG-TASK-ANSWER-E2E"),
-        );
-        expect(retrieved, "TaskOutput must return the background result verbatim").toBe(true);
+
+        const taskOutputCalls = uniqueAssistantToolCalls(result.requests, "TaskOutput");
+        expect(taskOutputCalls).toHaveLength(1);
+        expect(JSON.parse(taskOutputCalls[0]!.arguments)).toEqual({ task_id: "task-1" });
+        const parentHistory = cumulativeParentHistory(result.requests, [taskOutputCalls[0]!.id]);
+        const [exchange] = orderedToolExchanges(parentHistory, "TaskOutput");
+        expect(exchange!.call).toEqual(taskOutputCalls[0]);
+        expectStructuredTaskOutputResult(exchange!.result);
+
         expect(result.stdout).toContain("background retrieved");
-        // Print mode never runs renderers: the TUI-only collapsed-completion-
-        // record markers must never reach print stdout (byte-identical print/RPC
-        // output — the structural half of that proof is that execute()/content
-        // are untouched).
         expect(result.stdout).not.toContain(RECORD_EXPAND_HINT);
         expect(result.stdout).not.toContain(RECORD_FORK_MARKER);
-        // No crash noise from the un-awaited dispatch (completeness floor).
         expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|unhandledRejection|FATAL/i);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    it(
+      "rejects a distinct malformed provider TaskOutput call after structured result delivery",
+      async () => {
+        const isExplore = (r: CapturedRequest) =>
+          systemText(r).includes("read-only exploration agent");
+        const isParent = (r: CapturedRequest) => !isExplore(r);
+        const malformedArguments = {
+          summary: "review complete",
+          findings: [],
+          recommendation: "approve",
+        };
+        const result = await runPi({
+          script: [
+            {
+              toolCalls: [{
+                name: "Agent",
+                args: {
+                  subagent_type: "Explore",
+                  prompt: "return the structured review result before the malformed contrast",
+                  run_in_background: true,
+                },
+              }],
+            },
+            { when: isExplore, text: STRUCTURED_SUBAGENT_RESULT },
+            { when: isParent, toolCalls: [{ name: "TaskOutput", args: { task_id: "task-1" } }] },
+            { when: isParent, toolCalls: [{ name: "TaskOutput", args: malformedArguments }] },
+            { when: isParent, text: "malformed call rejected" },
+          ],
+          prompt: "exercise the explicit malformed-call contrast",
+        });
+
+        expect(result.code).toBe(0);
+        const calls = uniqueAssistantToolCalls(result.requests, "TaskOutput");
+        expect(calls).toHaveLength(2);
+        const valid = calls.find((call) => "task_id" in (JSON.parse(call.arguments) as Record<string, unknown>));
+        const malformed = calls.find((call) => !("task_id" in (JSON.parse(call.arguments) as Record<string, unknown>)));
+        expect(valid).toBeDefined();
+        expect(malformed).toBeDefined();
+        expect(valid!.id).not.toBe(malformed!.id);
+        expect(JSON.parse(valid!.arguments)).toEqual({ task_id: "task-1" });
+        expect(JSON.parse(malformed!.arguments)).toEqual(malformedArguments);
+
+        const parentHistory = cumulativeParentHistory(result.requests, [valid!.id, malformed!.id]);
+        const exchanges = orderedToolExchanges(parentHistory, "TaskOutput");
+        expect(exchanges).toHaveLength(2);
+        const validExchange = exchanges.find((exchange) => exchange.call.id === valid!.id)!;
+        const malformedExchange = exchanges.find((exchange) => exchange.call.id === malformed!.id)!;
+        expect(validExchange.callIndex).toBeLessThan(validExchange.resultIndex);
+        expect(validExchange.resultIndex).toBeLessThan(malformedExchange.callIndex);
+        expect(malformedExchange.callIndex).toBeLessThan(malformedExchange.resultIndex);
+        expectStructuredTaskOutputResult(validExchange.result);
+        expect(malformedExchange.result).toContain('Validation failed for tool "TaskOutput"');
+        expect(malformedExchange.result).toMatch(/(?:task_id.*(?:required|missing)|(?:required|missing).*task_id)/is);
+        expect(malformedExchange.result).not.toMatch(/Unknown task_id|task-structured-canary/);
+        // The validation result is model-visible in parentHistory; stdout only proves the loop continued.
+        expect(result.stdout).toContain("malformed call rejected");
       },
       TEST_TIMEOUT_MS,
     );
