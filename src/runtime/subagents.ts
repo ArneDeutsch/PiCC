@@ -44,6 +44,7 @@ import {
 import {
   renderAgentCall,
   renderAgentResult,
+  renderSendMessageResult,
   type SubagentLifecycleRenderContext,
   type SubagentRenderDetails,
 } from "./subagent-render.js";
@@ -3206,6 +3207,14 @@ export function createSendMessageToolDefinition(
         description: "The follow-up instruction, delivered to the agent verbatim as a user turn",
       }),
     }),
+    renderResult(
+      result: { content?: Array<{ type?: string; text?: string }>; details?: Record<string, unknown> },
+      _options: Record<string, unknown>,
+      theme: unknown,
+      context: SubagentLifecycleRenderContext,
+    ) {
+      return renderSendMessageResult(result, theme, context);
+    },
     async execute(_toolCallId: string, params: Record<string, unknown>) {
       const to = String(params.to ?? "");
       const message = String(params.message ?? "");

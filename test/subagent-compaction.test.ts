@@ -15,6 +15,7 @@ import {
 import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import { fakeSdk, makeAgent, makeSubagentRuntime } from "./helpers/fake-sdk.js";
 import { fakePi } from "./helpers/fake-pi.js";
+import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 
 interface ChildHarness {
   sdk: PiSdk;
@@ -638,6 +639,7 @@ describe("subagent mid-run compaction", () => {
       to: exhausted.agentId,
       message: "finish recovery",
     });
+    const canonicalRecovered = structuredClone(recovered);
 
     expect(recovered.content[0].text).toBe("resumed final");
     expect(recovered.details).toMatchObject({
@@ -646,6 +648,16 @@ describe("subagent mid-run compaction", () => {
       outcome: "completed",
       recovered: true,
     });
+    const wrapped = wrapForSelfShell(tool);
+    const rendered = (wrapped.renderResult as Function)(
+      recovered,
+      { expanded: false, isPartial: false },
+      undefined,
+      { state: {}, isPartial: false },
+    ).render(80) as string[];
+    expect(rendered).toEqual(["● resumed final"]);
+    expect(rendered.join("\n").match(/[○●✗■]/gu) ?? []).toHaveLength(1);
+    expect(recovered).toEqual(canonicalRecovered);
     expect(background.ids()).toEqual([]);
     expect(harness.compactCalls()).toBe(4);
     expect(harness.disposed()).toBe(true);
@@ -780,7 +792,22 @@ describe("subagent mid-run compaction", () => {
       to: exhausted.agentId,
       message: "recover once",
     });
-    expect(reExhausted.details).toMatchObject({ outcome: "failed", recovered: false });
+    const canonical = structuredClone(reExhausted);
+    expect(reExhausted.details).toMatchObject({
+      delivery: "checkpoint-recovery",
+      outcome: "failed",
+      recovered: false,
+    });
+    const wrapped = wrapForSelfShell(tool);
+    const rendered = (wrapped.renderResult as Function)(
+      reExhausted,
+      { expanded: false, isPartial: false },
+      undefined,
+      { state: {}, isPartial: false },
+    ).render(120) as string[];
+    expect(rendered[0]).toMatch(/^✗ /u);
+    expect(rendered.join("\n").match(/[○●✗■]/gu) ?? []).toHaveLength(1);
+    expect(reExhausted).toEqual(canonical);
     expect(registry.get(exhausted.agentId)?.checkpointPaused).toBe(true);
     expect(harness.disposed()).toBe(false);
 
@@ -792,6 +819,49 @@ describe("subagent mid-run compaction", () => {
     expect(harness.sessionCreations()).toBe(1);
     expect(harness.compactCalls()).toBe(8);
     expect(harness.disposed()).toBe(true);
+  });
+
+  it("renders an actual SendMessage aborted checkpoint result as stopped without changing it", async () => {
+    const harness = checkpointSdk({ failures: 3 });
+    const registry = new SubagentRegistry();
+    const hooks = {
+      async fire(eventName: string) {
+        const stop = eventName === "SubagentStop";
+        return {
+          block: false,
+          stop,
+          stopReason: stop ? "stop recovered generation" : undefined,
+          askDowngraded: false,
+          diagnostics: [],
+        };
+      },
+    };
+    const runtime = runtimeFor(harness, makeAgent(), registry, undefined, hooks);
+    const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
+    const tool = createSendMessageToolDefinition(runtime, {
+      registry,
+      backgroundTasks: new BackgroundTaskRegistry(),
+    });
+    const aborted = await (tool.execute as Function)("send", {
+      to: exhausted.agentId,
+      message: "recover then stop",
+    });
+    const canonical = structuredClone(aborted);
+    expect(aborted.details).toMatchObject({
+      delivery: "checkpoint-recovery",
+      outcome: "aborted",
+      recovered: false,
+    });
+    const wrapped = wrapForSelfShell(tool);
+    const rendered = (wrapped.renderResult as Function)(
+      aborted,
+      { expanded: false, isPartial: false },
+      undefined,
+      { state: {}, isPartial: false },
+    ).render(120) as string[];
+    expect(rendered[0]).toMatch(/^■ /u);
+    expect(rendered.join("\n").match(/[○●✗■]/gu) ?? []).toHaveLength(1);
+    expect(aborted).toEqual(canonical);
   });
 
   it("preserves terminal restoration guidance when a recovery continuation rejects after re-exhaustion", async () => {
@@ -873,9 +943,26 @@ describe("subagent mid-run compaction", () => {
     });
     await harness.recoveryCompactStarted();
 
-    await (createTaskStopTool(new BackgroundTaskRegistry(), registry).execute as Function)("stop", {
+    const stopTool = createTaskStopTool(new BackgroundTaskRegistry(), registry);
+    const stopped = await (stopTool.execute as Function)("stop", {
       task_id: exhausted.agentId,
     });
+    const canonicalStop = structuredClone(stopped);
+    expect(stopped.details).toMatchObject({
+      agentId: exhausted.agentId,
+      checkpointPaused: true,
+      status: "stopped",
+    });
+    const wrappedStop = wrapForSelfShell(stopTool);
+    const renderedStop = (wrappedStop.renderResult as Function)(
+      stopped,
+      { expanded: false, isPartial: false },
+      undefined,
+      { state: {}, isPartial: false },
+    ).render(120) as string[];
+    expect(renderedStop[0]).toMatch(/^■ /u);
+    expect(renderedStop.join("\n").match(/[○●✗■]/gu) ?? []).toHaveLength(1);
+    expect(stopped).toEqual(canonicalStop);
 
     await expect(recovery).rejects.toThrow(/cancelled/);
     expect(harness.resumeCalls()).toBe(0);

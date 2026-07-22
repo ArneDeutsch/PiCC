@@ -18,6 +18,10 @@ function stripAnsi(value: string): string {
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
 }
 
+function glyphs(value: string): string[] {
+  return stripAnsi(value).match(/[○●✗■]/gu) ?? [];
+}
+
 function withBinding<T>(keys: string[], run: () => T): T {
   const previous = getKeybindings();
   setKeybindings(new KeybindingsManager({
@@ -48,22 +52,33 @@ describe("real Pi default-collapse contracts", () => {
         { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
       );
       row.setArgsComplete();
-      expect((row.render(80) as string[]).map(stripAnsi).join("\n")).toContain("contract.txt");
+      const pending = (row.render(80) as string[]).map(stripAnsi).join("\n");
+      expect(pending).toContain("contract.txt");
+      expect(glyphs(pending)).toEqual(["○"]);
       row.markExecutionStarted();
+      row.setExpanded(true);
       row.updateResult({ content: [{ type: "text", text: "rolling" }], details: undefined }, true);
       const partial = (row.render(80) as string[]).map(stripAnsi).join("\n");
       expect(partial).toContain("contract.txt");
+      expect(partial).toContain("rolling");
+      expect(partial.split("\n").find((line) => line.includes("rolling"))).toMatch(/^  /u);
       expect(partial).not.toContain("lines hidden");
+      expect(glyphs(partial)).toEqual(["○"]);
+      row.setExpanded(false);
       row.updateResult({ content: [{ type: "text", text: "first\nsecond" }], details: undefined }, false);
       const collapsed = (row.render(80) as string[]).map(stripAnsi).join("\n");
       expect(collapsed).toContain("Read contract.txt · 2 lines hidden · ctrl+k to expand");
       expect(collapsed).not.toContain("first");
+      expect(glyphs(collapsed)).toEqual(["●"]);
       row.setExpanded(true);
       const expanded = (row.render(80) as string[]).map(stripAnsi).join("\n");
       expect(expanded.match(/contract\.txt/g)).toHaveLength(1);
       expect(expanded.match(/first/g)).toHaveLength(1);
+      expect(glyphs(expanded)).toEqual(["●"]);
       row.setExpanded(false);
-      expect((row.render(80) as string[]).map(stripAnsi).join("\n")).not.toContain("first");
+      const recollapsed = (row.render(80) as string[]).map(stripAnsi).join("\n");
+      expect(recollapsed).not.toContain("first");
+      expect(glyphs(recollapsed)).toEqual(["●"]);
     });
   });
 
@@ -88,6 +103,7 @@ describe("real Pi default-collapse contracts", () => {
         row.updateResult(result, false);
         const settled = (row.render(100) as string[]).map(stripAnsi).join("\n");
         expect(settled).toContain("3 more lines in file");
+        expect(glyphs(settled)).toEqual(["●"]);
         expect(settled).toContain("offset=2 to continue");
         expect(settled).not.toContain("lines hidden");
       } finally {
@@ -143,9 +159,13 @@ describe("real Pi default-collapse contracts", () => {
         );
         row.setArgsComplete();
         row.markExecutionStarted();
-        row.render(100);
+        const pending = (row.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(glyphs(pending)).toEqual(["○"]);
         row.updateResult({ content: [{ type: "text", text: "rolling-output" }], details: undefined }, true);
-        row.render(100);
+        const partial = (row.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(partial).toContain("rolling-output");
+        expect(partial.split("\n").find((line) => line.includes("rolling-output"))).toMatch(/^  /u);
+        expect(glyphs(partial)).toEqual(["○"]);
         expect(vi.getTimerCount()).toBe(1);
         vi.setSystemTime(11_250);
         row.updateResult({ content: [{ type: "text", text: "output-secret" }], details: undefined }, false);
@@ -153,12 +173,43 @@ describe("real Pi default-collapse contracts", () => {
         expect(collapsed).toContain("Bash · 1 output line hidden · ctrl+o to expand · 1.3s");
         expect(collapsed).not.toContain("command-secret");
         expect(collapsed).not.toContain("output-secret");
+        expect(glyphs(collapsed)).toEqual(["●"]);
         expect(vi.getTimerCount()).toBe(0);
         row.setExpanded(true);
         const expanded = (row.render(100) as string[]).map(stripAnsi).join("\n");
         expect(expanded).toContain("command-secret");
         expect(expanded).toContain("output-secret");
+        expect(glyphs(expanded)).toEqual(["●"]);
+        row.setExpanded(false);
+        expect(glyphs((row.render(100) as string[]).join("\n"))).toEqual(["●"]);
       } finally { vi.useRealTimers(); }
+    });
+  });
+
+  it("keeps error fail-open detail and malformed warnings behind one marker", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    withBinding(["ctrl+o"], () => {
+      const error = new sdk.ToolExecutionComponent(
+        "read", "read-error", { path: "broken.txt" }, {},
+        wrapForSelfShell(withDefaultCollapsedToolRendering(sdk.createReadToolDefinition(process.cwd()))),
+        { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+      );
+      error.updateResult({ content: [{ type: "text", text: "read failed visibly" }], details: undefined, isError: true }, false);
+      const errorText = (error.render(80) as string[]).map(stripAnsi).join("\n");
+      expect(errorText).toContain("read failed visibly");
+      expect(glyphs(errorText)).toEqual(["✗"]);
+
+      const malformed = new sdk.ToolExecutionComponent(
+        "read", "read-malformed", { path: 42 }, {},
+        wrapForSelfShell(withDefaultCollapsedToolRendering(sdk.createReadToolDefinition(process.cwd()))),
+        { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+      );
+      malformed.updateResult({ content: [{ type: "text", text: "ignored" }], details: undefined }, false);
+      const malformedText = (malformed.render(80) as string[]).map(stripAnsi).join("\n");
+      expect(malformedText).toContain("Unfamiliar arguments");
+      expect(malformedText.match(/Unfamiliar arguments/gu)?.length).toBeLessThanOrEqual(2);
+      expect(glyphs(malformedText)).toEqual(["●"]);
     });
   });
 

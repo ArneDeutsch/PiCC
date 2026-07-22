@@ -24,6 +24,7 @@ import {
   type FakeSessionState,
 } from "./helpers/fake-sdk.js";
 import { deferred, waitUntil } from "./helpers/async.js";
+import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 
 // Resume tests exercise the REAL Pi SessionManager (open/restore/append) — inject
 // it so fakeSdk's reopenSessionManager reopens real transcripts on disk.
@@ -441,8 +442,19 @@ describe("SendMessage tool — steer + refusals", () => {
       backgroundTasks,
     }) as unknown as ToolLike;
     const ack = await sm.execute("s", { to: agentId, message: "focus on the auth module" });
+    const canonicalAck = structuredClone(ack);
     expect(ack.content[0]!.text).toContain("mid-task course correction");
     expect(ack.details.delivery).toBe("steer");
+    const wrapped = wrapForSelfShell(sm as unknown as Record<string, unknown>);
+    const rendered = (wrapped.renderResult as Function)(
+      ack,
+      { expanded: false, isPartial: false },
+      undefined,
+      { state: {}, isPartial: false },
+    ).render(120);
+    expect(rendered).toEqual([`● ${ack.content[0]!.text}`]);
+    expect(rendered.join("\n").match(/[○●✗■]/gu) ?? []).toHaveLength(1);
+    expect(ack).toEqual(canonicalAck);
 
     // The steer reached the live fake session verbatim.
     const session = h.sessions[0]!;
@@ -838,6 +850,18 @@ describe("SendMessage resume — offline integration (real SessionManager)", () 
       delivery: "resume",
       resumed: true,
     });
+    const canonicalAck = structuredClone(ack);
+    const wrapped = wrapForSelfShell(sm as unknown as Record<string, unknown>);
+    const renderedAck = (wrapped.renderResult as Function)(
+      ack,
+      { expanded: false, isPartial: false },
+      undefined,
+      { state: {}, isPartial: false },
+    ).render(120) as string[];
+    expect(renderedAck[0]).toMatch(/^● /u);
+    expect(renderedAck.join("\n")).toContain("resume started in background with prior context");
+    expect(renderedAck.join("\n").match(/[○●✗■]/gu) ?? []).toHaveLength(1);
+    expect(ack).toEqual(canonicalAck);
     // Status flipped back to running synchronously (Claude 2.1.205).
     expect(registry.get(agentId)!.state).toBe("running");
 

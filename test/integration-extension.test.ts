@@ -207,21 +207,17 @@ describe("tool surface registration", () => {
     }
   });
 
-  it("wired edit keeps its diff on a colored band with no top/bottom padding", async () => {
+  it("wired edit keeps its diff under one outer success glyph with no outer background", async () => {
     // edit's renderResult colors the diff body via Pi's theme singleton (renderDiff),
     // which the real TUI initializes at startup — do the same here.
     const { initTheme } = await import("@earendil-works/pi-coding-agent");
     initTheme();
-    const ESC = String.fromCharCode(27);
-    const BEL = String.fromCharCode(7);
-    // A slot-encoding theme (zero-width under pi-tui's visibleWidth, like a real
-    // theme.bg pair). renderDiff colors the diff body via Pi's OWN theme singleton;
-    // the outer band is our Box framing through this theme.bg.
+    let backgroundCalls = 0;
     const slotTheme = {
       fg: (_c: string, s: string) => s,
       bold: (s: string) => s,
       inverse: (s: string) => s,
-      bg: (slot: string, text: string) => `${ESC}]${slot}${BEL}${text}${ESC}[49m`,
+      bg: (_slot: string, text: string) => { backgroundCalls++; return text; },
     };
     // Produce a REAL edit result payload (with details.diff) via the WIRED tool.
     fs.writeFileSync(path.join(dir, "t02-edit-target.txt"), "alpha\nbeta\ngamma\n");
@@ -231,7 +227,6 @@ describe("tool surface registration", () => {
 
     // Run the SHIPPED closure-local wrapper (via pi.tools.get) over the payload.
     const width = 120;
-    const marker = `${ESC}]toolSuccessBg${BEL}`;
     const out: string[] = pi.tools
       .get("edit")
       .renderResult(
@@ -246,13 +241,11 @@ describe("tool surface registration", () => {
     // Diff survived the wrap: removed AND added tokens are both present.
     expect(joined).toContain("beta");
     expect(joined).toContain("BETAEDITED");
-    // Colored band re-applied per line, single success tone.
-    for (const l of out) expect(l).toContain(marker);
-    // No blank first/last line: the blank-edge adapter stripped the inner Spacer; each edge line
-    // carries real content once the zero-width bg framing is removed.
-    const stripBg = (l: string) => l.split(marker).join("").split(`${ESC}[49m`).join("");
-    expect(stripBg(out[0]!).trim().length).toBeGreaterThan(0);
-    expect(stripBg(out[out.length - 1]!).trim().length).toBeGreaterThan(0);
+    expect(backgroundCalls).toBe(0);
+    const plain = out.join("\n").replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+    expect(plain.match(/●/gu)).toHaveLength(1);
+    expect(plain.split("\n")[0]).toMatch(/^● /u);
+    expect(plain.split("\n").at(-1)?.trim().length).toBeGreaterThan(0);
   });
 
   it("de-pads every Claude-named tool row: renderShell:'self' across the registration loop", () => {
@@ -271,7 +264,7 @@ describe("tool surface registration", () => {
     }
   });
 
-  it("main Grep/Glob execute unchanged and render one compact row collapsed and expanded", async () => {
+  it("keeps checkpoint-gated Grep/Glob canonical results unchanged after collapsed and expanded rendering", async () => {
     const searchDir = path.join(dir, "t02-search");
     fs.mkdirSync(searchDir, { recursive: true });
     fs.writeFileSync(path.join(searchDir, "needle.txt"), "alpha\nT02-SEARCH-NEEDLE\nomega\n");
@@ -352,21 +345,18 @@ describe("tool surface registration", () => {
     expect(`${callText}\n${resultText}`).not.toContain("1/1 entries");
   });
 
-  it("wrapped renderers paint content on a background and keep content (offline integration)", () => {
-    const ESC = String.fromCharCode(27);
-    // A renderer-less tool renders its bold title through the generic fallback,
-    // painted per line via theme.bg — proven by a slot-encoding fake theme.
+  it("wrapped renderers add one foreground glyph without invoking theme.bg", () => {
+    let backgroundCalls = 0;
     const theme = {
       fg: (_c: string, s: string) => s,
       bold: (s: string) => s,
-      bg: (slot: string, text: string) => `${ESC}]${slot}${ESC}\\${text}${ESC}[49m`,
+      bg: (_slot: string, text: string) => { backgroundCalls++; return text; },
     };
     const ctx = { isPartial: false, isError: false, showImages: false };
     const todo = pi.tools.get("TodoWrite");
     const callLines = todo.renderCall({}, theme, ctx).render(60);
-    expect(callLines.length).toBe(1);
-    expect(callLines[0]).toContain("TodoWrite"); // content preserved
-    expect(callLines[0]).toContain("toolSuccessBg"); // background re-applied per line
+    expect(callLines).toEqual(["● TodoWrite"]);
+    expect(backgroundCalls).toBe(0);
   });
 
   it("registers the /doctor, /compat, /quota, /skills, /agents control commands", () => {

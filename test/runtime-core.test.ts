@@ -83,11 +83,12 @@ import {
   type SubagentRenderDetails,
 } from "../src/runtime/subagent-render.js";
 import {
-  bgSlotForCtx,
+  genericCallComponent,
   genericResultComponent,
-  themedBg,
+  setToolRowOutcome,
   wrapForSelfShell,
   type RenderCtx,
+  type ToolRowOutcome,
 } from "../src/runtime/tool-shell.js";
 import { agentTrailerFrame, FORK_DEGRADE_PREFIX } from "../src/util/subagent-transcripts.js";
 import {
@@ -3642,480 +3643,360 @@ describe("scratchpad injection wiring through the real harness", () => {
   });
 });
 
-describe("self-shell wrapper", () => {
-  const ESC = String.fromCharCode(27);
-  const BEL = String.fromCharCode(7);
-  const SLOTS = ["toolPendingBg", "toolErrorBg", "toolSuccessBg"] as const;
-
-  // A slot-ENCODING fake theme. Its `bg` frames text with an OSC slot marker
-  // (`ESC ] <slot> BEL`) plus a trailing `ESC[49m` reset — BOTH zero-width under
-  // pi-tui's visibleWidth, exactly like a real `theme.bg` pair — so the Box's
-  // width math (and the adapter's clamp) behaves precisely as in production.
-  //
-  // NOTE (deviation): the spec suggested `bg: (slot, text) => ESC + slot + "|" +
-  // text`, but pi-tui's visibleWidth does NOT treat that as an escape — it counts
-  // the slot name as visible columns, which would spuriously trip the adapter's
-  // clamp and truncate the painted row. The OSC-framed marker below keeps the
-  // slot encoded (the binding requirement) while being genuinely zero-width.
-  const slotMarker = (slot: string) => `${ESC}]${slot}${BEL}`;
-  const slotTheme = {
-    fg: (_c: string, s: string) => s,
-    bold: (s: string) => s,
-    bg: (slot: string, text: string) => `${slotMarker(slot)}${text}${ESC}[49m`,
+describe("self-shell glyph wrapper", () => {
+  const ESC = "\u001b";
+  const stripAnsi = (value: string) => value.replace(/\u001b\[[0-9;]*m/gu, "");
+  const theme = {
+    fg(slot: string, text: string) {
+      const code = slot === "muted" ? "90" : slot === "success" ? "32" : slot === "error" ? "31" : "33";
+      return `${ESC}[${code}m${text}${ESC}[39m`;
+    },
+    bold: (text: string) => text,
   };
+  type Renderer = { render(width: number): string[] };
+  const call = (tool: Record<string, unknown>, args: Record<string, unknown>, ctx: RenderCtx, styled: unknown = theme) =>
+    (tool.renderCall as (a: Record<string, unknown>, t: unknown, c: RenderCtx) => Renderer)(args, styled, ctx);
+  const result = (tool: Record<string, unknown>, value: Record<string, unknown>, ctx: RenderCtx, styled: unknown = theme) =>
+    (tool.renderResult as (r: Record<string, unknown>, o: Record<string, unknown>, t: unknown, c: RenderCtx) => Renderer)(
+      value, { expanded: false, isPartial: ctx.isPartial === true }, styled, ctx,
+    );
 
-  const ownTool = () => ({
-    name: "Demo",
-    renderCall: () => ({ render: () => ["call-line"] }),
-    renderResult: () => ({ render: () => ["result-line"] }),
+  it.each([
+    [{ isPartial: true }, "○", "muted"],
+    [{ isPartial: true, isError: true }, "○", "muted"],
+    [{ isPartial: false, isError: true }, "✗", "error"],
+    [{ isPartial: false, isError: false }, "●", "success"],
+  ] as Array<[RenderCtx, string, string]>)
+  ("maps ordinary state precedence to foreground glyphs", (ctx, glyph, slot) => {
+    const colors: string[] = [];
+    const styled = { fg(color: string, text: string) { colors.push(color); return text; }, bg() { throw new Error("bg forbidden"); } };
+    const wrapped = wrapForSelfShell({ name: "Demo", renderCall: () => ({ render: () => ["content"] }) });
+    expect(call(wrapped, {}, ctx, styled).render(40)).toEqual([`${glyph} content`]);
+    expect(colors).toContain(slot);
   });
 
-  // The real Agent tool (own renderers) — reused for the "content survives" and
-  // wrapper width-sweep cases.
-  const agentTool = () => {
-    const { sdk } = fakeSdk({ replies: ["x"] });
-    const runtime = makeSubagentRuntime([makeAgent()], sdk);
-    return createAgentToolDefinition(runtime, { depth: 0 }) as unknown as Record<string, unknown>;
-  };
-
-  type Renderer = { render: (w: number) => string[] };
-  // Build a renderer-less-or-own tool that emits fixed result lines, then return
-  // its wrapped renderResult component (own renderers → the Box framing path).
-  const linesTool = (lines: string[]): Record<string, unknown> => ({
-    name: "Demo",
-    renderResult: () => ({ render: () => lines }),
-  });
-  const wrappedResult = (
-    tool: Record<string, unknown>,
-    theme: unknown,
-    ctx: RenderCtx,
-    prev?: Renderer,
-  ): Renderer =>
-    (
-      wrapForSelfShell(tool).renderResult as (
-        r: unknown,
-        o: unknown,
-        t: unknown,
-        c: RenderCtx,
-      ) => Renderer
-    )({ content: [] }, {}, theme, prev ? { ...ctx, lastComponent: prev } : ctx);
-
-  it("bgSlotForCtx maps state to the pinned single tone (partial > error > success)", () => {
-    expect(bgSlotForCtx({ isPartial: true })).toBe("toolPendingBg");
-    expect(bgSlotForCtx({ isPartial: true, isError: true })).toBe("toolPendingBg");
-    expect(bgSlotForCtx({ isError: true })).toBe("toolErrorBg");
-    expect(bgSlotForCtx({})).toBe("toolSuccessBg");
-    expect(bgSlotForCtx(undefined)).toBe("toolSuccessBg");
-  });
-
-  it("themedBg is throw-guarded: unknown slot / absent theme degrade to plain text", () => {
-    const throwing = {
-      bg: () => {
-        throw new Error("Unknown theme background color");
-      },
-    };
-    expect(themedBg(throwing, "toolSuccessBg", "x")).toBe("x");
-    expect(themedBg(undefined, "toolSuccessBg", "x")).toBe("x");
-    expect(themedBg({}, "toolSuccessBg", "x")).toBe("x");
-    expect(themedBg(slotTheme, "toolSuccessBg", "x")).toContain("x");
-  });
-
-  it("single-tone background: call and result carry the SAME, state-correct slot", () => {
-    const wrapped = wrapForSelfShell(ownTool());
-    const cases: Array<[RenderCtx, string]> = [
-      [{ isPartial: true }, "toolPendingBg"],
-      [{ isPartial: false, isError: true }, "toolErrorBg"],
-      [{ isPartial: false, isError: false }, "toolSuccessBg"],
-    ];
-    for (const [ctx, slot] of cases) {
-      const callLines = (
-        wrapped.renderCall as (a: unknown, t: unknown, c: RenderCtx) => { render: (w: number) => string[] }
-      )({}, slotTheme, ctx).render(40);
-      const resLines = (
-        wrapped.renderResult as (
-          r: unknown,
-          o: unknown,
-          t: unknown,
-          c: RenderCtx,
-        ) => { render: (w: number) => string[] }
-      )({ content: [] }, {}, slotTheme, ctx).render(40);
-      expect(callLines.length).toBeGreaterThan(0);
-      expect(resLines.length).toBeGreaterThan(0);
-      for (const l of [...callLines, ...resLines]) {
-        expect(l).toContain(slotMarker(slot)); // correct tone
-        for (const other of SLOTS.filter((s) => s !== slot)) {
-          expect(l).not.toContain(slotMarker(other)); // no other tone
-        }
-      }
-    }
-  });
-
-  it("blank-edge adapter: leading/trailing blanks stripped, interior kept, each line painted with the 1-col gutter", () => {
-    // The Box does NOT strip blank edges; the adapter must, before Box paints —
-    // the framing's step (a): strip leading/trailing blanks. An inner renderer that emits a
-    // leading + trailing blank (and an interior blank that IS content) frames to
-    // exactly the 3 non-edge lines.
-    const out = wrappedResult(
-      linesTool(["", "alpha", "", "beta", ""]),
-      slotTheme,
-      { isPartial: false },
-    ).render(20);
-    expect(out.length).toBe(3); // alpha, interior blank, beta
-    for (const l of out) {
-      expect(l).toContain(slotMarker("toolSuccessBg")); // per-line bg
-      expect(tuiVisibleWidth(l)).toBe(20); // padded to exactly width
-      expect(l.startsWith(`${slotMarker("toolSuccessBg")} `)).toBe(true); // 1-col gutter
-    }
-    // No blank line at the first or last position (measured after marker strip).
-    expect(tuiVisibleWidth(out[0]!)).toBe(20);
-    expect(tuiVisibleWidth(out[out.length - 1]!)).toBe(20);
-    const joined = out.join("\n");
-    expect(joined).toContain("alpha");
-    expect(joined).toContain("beta");
-  });
-
-  it("a maximally-wide inner line is NOT ellipsized and keeps Pi's right-hand bg margin", () => {
-    // A tool whose inner renderer FILLS exactly the width it is handed — like Pi's
-    // own Box-laid-out content. Before the fix the wrapper handed it the full
-    // terminal width, but the framing preserved only width-GUTTER, so the last content
-    // column was truncated to a trailing "…" (a real "content changed" regression)
-    // and the row could touch the right edge where Pi keeps a >=1-col bg margin.
-    let seenWidth = -1;
-    const tool = {
-      name: "Fill",
-      renderResult: () => ({
-        render: (w: number) => {
-          seenWidth = w;
-          return ["x".repeat(w)]; // exactly `w` visible columns — fills its width
-        },
-      }),
-    };
-    const wrapped = wrapForSelfShell(tool);
-    const width = 40;
-    const out = (
-      wrapped.renderResult as (
-        r: unknown,
-        o: unknown,
-        t: unknown,
-        c: RenderCtx,
-      ) => { render: (w: number) => string[] }
-    )({ content: [] }, {}, slotTheme, { isPartial: false }).render(width);
-    expect(out.length).toBe(1);
-    const line = out[0]!;
-
-    // Inner content is laid out at width - 2 (paddingX=1 on BOTH sides), not full width.
-    expect(seenWidth).toBe(width - 2);
-
-    // Strip the zero-width bg framing to inspect the visible payload.
-    const marker = slotMarker("toolSuccessBg");
-    const inner = line.replace(marker, "").replace(`${ESC}[49m`, "");
-
-    // (a) No column was dropped to an ellipsis: every inner 'x' survives.
-    expect(inner.includes("…")).toBe(false);
-    expect((inner.match(/x/g) ?? []).length).toBe(width - 2);
-
-    // (b) Full-width row: painted to EXACTLY width, ending within the terminal, and
-    // carrying the background to the right edge with Pi's >=1-col margin. The last
-    // visible column is a background space (the fill), not content; the first is the
-    // 1-col gutter.
-    expect(tuiVisibleWidth(line)).toBe(width);
-    expect(inner.startsWith(" ")).toBe(true); // leading 1-col gutter
-    expect(inner.endsWith(" ")).toBe(true); // right-hand bg margin (>=1 col)
-    expect(line).toContain(marker); // still painted with the state tone
-  });
-
-  it("empty result collapses the row: no lines / only blank lines frame to []", () => {
-    // stripBlankEdges leaves nothing → the Box has no child lines → [] so Pi
-    // collapses/hides the row rather than painting a lone blank band.
-    expect(wrappedResult(linesTool([]), slotTheme, { isPartial: false }).render(20)).toEqual([]);
-    expect(
-      wrappedResult(linesTool(["", "", ""]), slotTheme, { isPartial: false }).render(20),
-    ).toEqual([]);
-  });
-
-  it("no-theme / headless: plain content, no bg marker, no throw", () => {
-    const out = wrappedResult(linesTool(["hello"]), undefined, { isPartial: false }).render(20);
-    expect(out.length).toBe(1);
-    expect(out[0]).toContain("hello");
-    expect(out[0]!.includes(ESC)).toBe(false); // no escape / bg marker at all
-  });
-
-  it("width sweep THROUGH the wrapper (bg added): no overflow, includes over-width content", () => {
-    const wrapped = wrapForSelfShell(agentTool());
-    const wide = "字".repeat(60); // 60 CJK = 120 columns (over width)
-    const ctx: RenderCtx = { isPartial: false, isError: false };
-    const renderRes = wrapped.renderResult as (
-      r: unknown,
-      o: unknown,
-      t: unknown,
-      c: RenderCtx,
-    ) => { render: (w: number) => string[] };
-    const renderCall = wrapped.renderCall as (
-      a: unknown,
-      t: unknown,
-      c: RenderCtx,
-    ) => { render: (w: number) => string[] };
-    for (const width of [1, 2, 3, 20, 40, 138]) {
-      const res = renderRes(
-        {
-          content: [{ type: "text", text: `line1\n${wide}` }],
-          details: { outcome: "completed", agent: "docs" },
-        },
-        { isPartial: false },
-        slotTheme,
-        ctx,
-      ).render(width);
-      for (const l of res) {
-        expect(tuiVisibleWidth(l)).toBeLessThanOrEqual(width); // no RangeError, no overflow
-        expect(l).toContain(slotMarker("toolSuccessBg"));
-      }
-      const call = renderCall(
-        { subagent_type: "x".repeat(200), description: wide },
-        slotTheme,
-        ctx,
-      ).render(width);
-      for (const l of call) expect(tuiVisibleWidth(l)).toBeLessThanOrEqual(width);
-    }
-  });
-
-  it("content survives the wrapper: Agent badge + body still present", () => {
-    const wrapped = wrapForSelfShell(agentTool());
-    const out = (
-      wrapped.renderResult as (
-        r: unknown,
-        o: unknown,
-        t: unknown,
-        c: RenderCtx,
-      ) => { render: (w: number) => string[] }
-    )(
-      {
-        content: [{ type: "text", text: "the body text" }],
-        details: { outcome: "completed", agent: "reviewer" },
-      },
-      { isPartial: false },
-      slotTheme,
-      { isPartial: false },
-    )
-      .render(120)
-      .join("\n");
-    expect(out).toContain("reviewer");
-    expect(out).toContain("the body text");
-  });
-
-  it("generic renderer: renderer-less tool shows bold title + text output; CRLF stripped; image indicator appended", () => {
-    const wrapped = wrapForSelfShell({ name: "TodoWrite" });
-    expect(wrapped.renderShell).toBe("self");
-    const ctx: RenderCtx = { isPartial: false, isError: false };
-    const call = (
-      wrapped.renderCall as (a: unknown, t: unknown, c: RenderCtx) => { render: (w: number) => string[] }
-    )({}, slotTheme, ctx)
-      .render(40)
-      .join("\n");
-    expect(call).toContain("TodoWrite"); // Pi createCallFallback parity (bold title)
-
-    const renderRes = wrapped.renderResult as (
-      r: unknown,
-      o: unknown,
-      t: unknown,
-      c: RenderCtx,
-    ) => { render: (w: number) => string[] };
-
-    // CRLF payload: getTextOutput parity removes EVERY \r (not sanitizeProgressText,
-    // which keeps it) so a bare \r can't return the cursor to col 0 and corrupt the row.
-    const crlf = renderRes(
-      { content: [{ type: "text", text: "line-a\r\nline-b\rTAIL" }] },
-      {},
-      slotTheme,
-      ctx,
-    )
-      .render(80)
-      .join("\n");
-    expect(crlf).toContain("line-a");
-    expect(crlf).toContain("line-b");
-    expect(crlf.includes("\r")).toBe(false);
-
-    // Image block with no text → the [image …] fallback indicator is appended
-    // (a naive text-parts join would emit nothing).
-    const img = renderRes(
-      { content: [{ type: "image", data: "Zm9v", mimeType: "image/png" }] },
-      {},
-      slotTheme,
-      ctx,
-    )
-      .render(80)
-      .join("\n");
-    expect(img).toContain("Image");
-  });
-
-  it("generic renderer: a literal tab is normalized to 3 spaces, byte-matching Pi's Text.render", () => {
-    // getTextOutput/sanitizeBinaryOutput PRESERVE \t, so the renderer-less
-    // fallback must normalize it itself to stay byte-identical to Pi's own
-    // fallback (which renders via `new Text(...)`, whose render() does
-    // `text.replace(/\t/g, "   ")` — a flat 3-space replace — before wrapping).
-    const out = genericResultComponent(
-      { content: [{ type: "text", text: "before\tafter" }] },
-      slotTheme, // identity fg/bold → the line is exactly the normalized text
-      { showImages: false } as RenderCtx,
-    )
-      .render(80)
-      .join("\n");
-    // No raw tab survives, and the tab became THREE spaces (Pi's replacement).
-    expect(out.includes("\t")).toBe(false);
-    expect(out).toBe("before   after");
-
-    // Strengthened: byte-match Pi's ACTUAL Text normalization. `new Text(text, 0,
-    // 0)` (no margins/padding, no bg) renders one content line = the tab-normalized
-    // text padded to width; trim the pad and it must equal our fallback line.
-    const piLine = new TuiText("before\tafter", 0, 0).render(80)[0] ?? "";
-    expect(piLine.trimEnd()).toBe(out);
-  });
-
-  it("TaskStop (renderer-less, new block): self-shell flag, generic title, bg applied, no blank first/last, execute passthrough", () => {
-    const execute = async () => ({ content: [] });
-    const tool = { name: "TaskStop", execute };
-    const wrapped = wrapForSelfShell(tool);
-    expect(wrapped.renderShell).toBe("self");
-    expect(wrapped.execute).toBe(execute); // execute passes through untouched
-    const ctx: RenderCtx = { isPartial: false, isError: false };
-    const call = (
-      wrapped.renderCall as (a: unknown, t: unknown, c: RenderCtx) => { render: (w: number) => string[] }
-    )({}, slotTheme, ctx).render(40);
-    expect(call.length).toBe(1);
-    expect(call[0]).toContain("TaskStop");
-    expect(call[0]).toContain(slotMarker("toolSuccessBg"));
-    expect(tuiVisibleWidth(call[0]!)).toBe(40); // padded — not a blank line
-  });
-
-  // --- ctx.lastComponent threading for the built-ins ---
-
-  it("threads ctx.lastComponent: the inner renderer receives the PREVIOUS INNER component, not the wrapper", () => {
-    // Non-vacuous: an instrumented fake inner ToolDefinition RECORDS the
-    // lastComponent it is handed. We render once, capture the returned WRAPPER,
-    // feed it back as ctx.lastComponent (exactly what ToolExecutionComponent does),
-    // and assert the inner got the previous INNER — the thing edit.js's
-    // `instanceof Box` reuse depends on. A wrapper leaking through here would
-    // silently drop the built-ins' incremental state.
-    const seenResult: Array<unknown> = [];
-    const innerResults: Array<{ render: (w: number) => string[] }> = [];
-    const seenCall: Array<unknown> = [];
-    const innerCalls: Array<{ render: (w: number) => string[] }> = [];
-    const tool = {
-      name: "Incr",
-      renderCall: (_a: unknown, _t: unknown, ctx: RenderCtx) => {
-        seenCall.push(ctx.lastComponent);
-        const comp = { render: () => ["call-line"] };
-        innerCalls.push(comp);
-        return comp;
-      },
-      renderResult: (_r: unknown, _o: unknown, _t: unknown, ctx: RenderCtx) => {
-        seenResult.push(ctx.lastComponent);
-        const comp = { render: () => ["diff-line"] };
-        innerResults.push(comp);
-        return comp;
-      },
-    };
-    const wrapped = wrapForSelfShell(tool);
-    const rr = wrapped.renderResult as (
-      r: unknown,
-      o: unknown,
-      t: unknown,
-      c: RenderCtx,
-    ) => { render: (w: number) => string[] };
-    const rc = wrapped.renderCall as (
-      a: unknown,
-      t: unknown,
-      c: RenderCtx,
-    ) => { render: (w: number) => string[] };
-
-    // renderResult: first render has no prior component.
-    const firstRes = rr({ content: [] }, {}, slotTheme, { isPartial: false });
-    firstRes.render(40);
-    // Feed the returned WRAPPER back as ctx.lastComponent, the exact hazard.
-    const secondRes = rr({ content: [] }, {}, slotTheme, {
-      isPartial: false,
-      lastComponent: firstRes,
+  it("arbitrates one marker across call/result visibility and repeated renders", () => {
+    const wrapped = wrapForSelfShell({
+      name: "Demo",
+      renderCall: () => ({ render: () => ["call", "call-more"] }),
+      renderResult: () => ({ render: () => ["result", "result-more"] }),
     });
-    secondRes.render(40);
-    expect(seenResult[0]).toBeUndefined(); // no prior inner on first render
-    expect(seenResult[1]).toBe(innerResults[0]); // previous INNER, not the wrapper
-    expect(seenResult[1]).not.toBe(firstRes); // definitely not the wrapper
-
-    // Same threading for renderCall (Pi caches call + result components separately).
-    const firstCall = rc({}, slotTheme, { isPartial: false });
-    firstCall.render(40);
-    const secondCall = rc({}, slotTheme, { isPartial: false, lastComponent: firstCall });
-    secondCall.render(40);
-    expect(seenCall[0]).toBeUndefined();
-    expect(seenCall[1]).toBe(innerCalls[0]);
-    expect(seenCall[1]).not.toBe(firstCall);
-  });
-
-  it("no-theme built-in render: plain content, no bg marker, no throw", () => {
-    // A built-in-shaped tool (own renderResult, like the create*ToolDefinition
-    // renderers) rendered with theme undefined degrades to plain text — headless /
-    // no-theme must never paint a bg sentinel nor throw.
-    const tool = {
-      name: "read",
-      renderResult: () => ({ render: () => ["file contents here"] }),
-    };
-    const wrapped = wrapForSelfShell(tool);
-    const out = (
-      wrapped.renderResult as (
-        r: unknown,
-        o: unknown,
-        t: unknown,
-        c: RenderCtx,
-      ) => { render: (w: number) => string[] }
-    )({ content: [] }, {}, undefined, { isPartial: false }).render(40);
-    const joined = out.join("\n");
-    expect(joined).toContain("file contents here");
-    expect(joined.includes(ESC)).toBe(false); // no escape / bg marker at all
-  });
-
-  it("Box render cache is exercised: a settled row re-rendered unchanged returns the cached paint", () => {
-    // The whole point of delegating to pi-tui Box is to inherit its render cache.
-    // Render a wrapped tool once, feed the returned WRAPPER back as
-    // ctx.lastComponent (exactly what ToolExecutionComponent does each frame) so
-    // the SAME Box persists, and render again at the same width with unchanged
-    // child lines. On a cache hit Box returns the SAME lines array by reference
-    // (box.js returns `this.cache.lines`) — the observable proof the per-line
-    // paint was NOT re-run. Asserted purely through Box's own contract, no
-    // internal instrumentation.
-    const tool = linesTool(["settled-line-a", "settled-line-b"]);
-    const ctx: RenderCtx = { isPartial: false };
-    const first = wrappedResult(tool, slotTheme, ctx);
-    const out1 = first.render(40);
-    // Reuse the same Box via lastComponent = the previous wrapper.
-    const second = wrappedResult(tool, slotTheme, ctx, first);
-    const out2 = second.render(40);
-    expect(out2).toBe(out1); // same array reference → Box cache hit (paint skipped)
-    // Sanity: the cached content is the real painted row, not an empty collapse.
-    expect(out1.length).toBe(2);
-    for (const l of out1) expect(l).toContain(slotMarker("toolSuccessBg"));
-
-    // A CHANGED child block (different lines) must NOT return the stale cache.
-    const changed = wrappedResult(linesTool(["settled-line-a", "DIFFERENT"]), slotTheme, ctx, second);
-    const out3 = changed.render(40);
-    expect(out3).not.toBe(out1);
-    expect(out3.join("\n")).toContain("DIFFERENT");
-  });
-
-  it("reused Box repaints on a state/slot transition: a pending row settling to success drops the stale tone", () => {
-    // The reuse-across-frames design relies on box.setBgFn + Box's bgSample
-    // re-sampling to force a repaint when the tone changes (pending→success),
-    // even though the child lines are unchanged. Without it a settled row would
-    // keep painting the stale pending tone. Same Box (threaded via lastComponent),
-    // same content, only the state changes.
-    const tool = linesTool(["row-a", "row-b"]);
-    const first = wrappedResult(tool, slotTheme, { isPartial: true }); // pending
-    const outPending = first.render(40);
-    for (const l of outPending) expect(l).toContain(slotMarker("toolPendingBg"));
-    const second = wrappedResult(tool, slotTheme, { isPartial: false }, first); // reuse Box, settled
-    const outSuccess = second.render(40);
-    expect(outSuccess).not.toBe(outPending); // cache NOT served across the tone change
-    for (const l of outSuccess) {
-      expect(l).toContain(slotMarker("toolSuccessBg")); // new tone painted
-      expect(l).not.toContain(slotMarker("toolPendingBg")); // no stale pending tone
+    const ctx: RenderCtx = { state: {}, isPartial: false };
+    const callComponent = call(wrapped, {}, ctx);
+    const resultComponent = result(wrapped, { content: [] }, ctx);
+    for (let pass = 0; pass < 2; pass++) {
+      expect(callComponent.render(40).map(stripAnsi)).toEqual(["● call", "  call-more"]);
+      expect(resultComponent.render(40).map(stripAnsi)).toEqual(["  result", "  result-more"]);
     }
+  });
+
+  it("moves ownership from a hidden settled call and supports marker-only edge states", () => {
+    const wrapped = wrapForSelfShell({
+      name: "Demo",
+      renderCall: () => ({ render: () => [] }),
+      renderResult: () => ({ render: () => ["summary"] }),
+    });
+    const ctx: RenderCtx = { state: {}, isPartial: false };
+    const callComponent = call(wrapped, {}, ctx);
+    const resultComponent = result(wrapped, { content: [] }, ctx);
+    expect(callComponent.render(20)).toEqual([]);
+    expect(resultComponent.render(20).map(stripAnsi)).toEqual(["● summary"]);
+
+    const pending = wrapForSelfShell({ name: "Pending", renderCall: () => ({ render: () => [] }) });
+    expect(call(pending, {}, { state: {}, isPartial: true }).render(20).map(stripAnsi)).toEqual(["○"]);
+    const empty = wrapForSelfShell({ name: "Empty", renderResult: () => ({ render: () => [] }) });
+    expect(result(empty, { content: [] }, { state: {}, isPartial: false }).render(20).map(stripAnsi)).toEqual(["●"]);
+  });
+
+  it("separates direct-result and later HTML-style phases from rendered calls", () => {
+    const retained: RenderCtx[] = [];
+    const wrapped = wrapForSelfShell({
+      name: "Phase",
+      renderCall: (_a: unknown, _t: unknown, ctx: RenderCtx) => { retained.push(ctx); return { render: () => [] }; },
+      renderResult: () => ({ render: () => ["detail"] }),
+    });
+    const ctx: RenderCtx = { state: {}, isPartial: true };
+    expect(call(wrapped, {}, ctx).render(80).map(stripAnsi)).toEqual(["○"]);
+    ctx.isPartial = false;
+    expect(result(wrapped, { content: [] }, ctx).render(80).map(stripAnsi)).toEqual(["● detail"]);
+    expect(setToolRowOutcome(retained[0], "failure")).toBe(false);
+    expect(result(wrapped, { content: [] }, { state: {}, isPartial: false, isError: true }).render(80).map(stripAnsi)).toEqual(["✗ detail"]);
+  });
+
+  it("brands only the exact active derived context and clears overrides", () => {
+    const retained: RenderCtx[] = [];
+    const accepted: boolean[] = [];
+    const wrapped = wrapForSelfShell({
+      name: "Special",
+      renderCall: (args: Record<string, unknown>, _theme: unknown, ctx: RenderCtx) => {
+        retained.push(ctx);
+        accepted.push(setToolRowOutcome({ ...ctx }, "stopped"));
+        if (args.special) accepted.push(setToolRowOutcome(ctx, "stopped"));
+        return { render: () => ["row"] };
+      },
+    });
+    const state = {};
+    expect(call(wrapped, { special: true }, { state, isPartial: false }).render(30).map(stripAnsi)).toEqual(["■ row"]);
+    expect(accepted).toEqual([false, true]);
+    expect(setToolRowOutcome(retained[0], "failure")).toBe(false);
+    expect(setToolRowOutcome({}, "invalid" as ToolRowOutcome)).toBe(false);
+    const coercionTrap = new Proxy({}, { get() { throw new Error("must not coerce"); } });
+    expect(setToolRowOutcome({}, coercionTrap as ToolRowOutcome)).toBe(false);
+    expect(call(wrapped, {}, { state, isPartial: false }).render(30).map(stripAnsi)).toEqual(["● row"]);
+  });
+
+  it("keeps interleaved, neighboring-generation, and hostile contexts isolated", () => {
+    const retained: RenderCtx[] = [];
+    const attempts: boolean[] = [];
+    const wrapped = wrapForSelfShell({
+      name: "Interleaved",
+      renderCall: (args: Record<string, unknown>, _theme: unknown, ctx: RenderCtx) => {
+        retained.push(ctx);
+        attempts.push(setToolRowOutcome({ state: ctx.state }, "stopped"));
+        if (args.fail) setToolRowOutcome(ctx, "failure");
+        return { render: () => [String(args.name)] };
+      },
+    });
+    const sharedState = {};
+    const a = call(wrapped, { name: "a", fail: true }, { state: sharedState, isPartial: false });
+    const b = call(wrapped, { name: "b" }, { state: sharedState, isPartial: false });
+    expect(setToolRowOutcome(retained[0], "stopped")).toBe(false);
+    expect(a.render(20).map(stripAnsi)).toEqual(["✗ a"]);
+    expect(b.render(20).map(stripAnsi)).toEqual(["● b"]);
+    expect(attempts).toEqual([false, false]);
+    expect(setToolRowOutcome({ state: sharedState }, "stopped")).toBe(false);
+    expect(setToolRowOutcome(new Proxy({}, { get() { throw new Error("hostile"); } }), "stopped")).toBe(false);
+    const hostile = new Proxy({}, { get() { throw new Error("hostile"); }, ownKeys() { throw new Error("hostile"); } });
+    expect(call(wrapped, { name: "safe" }, hostile as RenderCtx).render(20).map(stripAnsi)).toEqual(["● safe"]);
+    expect(call(wrapped, { name: "after" }, { state: sharedState, isPartial: false }).render(20).map(stripAnsi))
+      .toEqual(["● after"]);
+  });
+
+  it("accepts only safely reset exact glyph styling and never calls theme.bg", () => {
+    let receiverOk = false;
+    let backgrounds = 0;
+    const safeTheme = {
+      fg(this: unknown, _slot: string, text: string) { receiverOk = this === safeTheme; return `${ESC}[31m${text}${ESC}[39m`; },
+      bg() { backgrounds++; return "bad"; },
+    };
+    const wrapped = wrapForSelfShell({ name: "Theme" });
+    expect(call(wrapped, {}, { state: {}, isPartial: false }, safeTheme).render(20)[0]).toContain(`${ESC}[31m●${ESC}[39m`);
+    expect(receiverOk).toBe(true);
+    for (const malicious of [
+      `${ESC}]0;owned\u0007●${ESC}[39m`, `${ESC}[2J●${ESC}[39m`,
+      `${ESC}[31m●extra${ESC}[39m`, `${ESC}[31m●`,
+      `${ESC}[41m●${ESC}[39m`, `${ESC}[5m●${ESC}[39m`, `${ESC}[7m●${ESC}[39m`,
+      `${ESC}[8m●${ESC}[39m`, `${ESC}[1m●${ESC}[39m`, `${ESC}[1;31m●${ESC}[39m`,
+    ]) {
+      expect(call(wrapped, {}, { state: {}, isPartial: false }, { fg: () => malicious, bg: () => backgrounds++ }).render(20)[0]).toBe("● Theme");
+    }
+    for (const hostile of [
+      null,
+      {},
+      { get fg() { throw new Error("getter"); } },
+      { fg: "not a function" },
+      { fg() { throw new Error("function"); } },
+    ]) expect(call(wrapped, {}, { state: {}, isPartial: false }, hostile).render(20)[0]).toBe("● Theme");
+    expect(backgrounds).toBe(0);
+  });
+
+  it("preserves balanced generic foreground/bold styling and rejects leaking attributes", () => {
+    const safe = {
+      bold: (text: string) => `${ESC}[1m${text}${ESC}[22m`,
+      fg: (_slot: string, text: string) => `${ESC}[38;5;42m${text}${ESC}[39m`,
+    };
+    expect(genericCallComponent("Styled", safe).render(80)).toEqual([
+      `${ESC}[38;5;42m${ESC}[1mStyled${ESC}[22m${ESC}[39m`,
+    ]);
+    expect(genericResultComponent({ content: [{ type: "text", text: "output" }] }, safe, {}).render(80))
+      .toEqual([`${ESC}[38;5;42moutput${ESC}[39m`]);
+
+    for (const hostile of [
+      { bold: (text: string) => `${ESC}[1m${text}`, fg: (_slot: string, text: string) => text },
+      { bold: (text: string) => `${ESC}[3m${text}${ESC}[23m`, fg: (_slot: string, text: string) => text },
+      { bold: (text: string) => text, fg: (_slot: string, text: string) => `${ESC}[31m${text}` },
+      { bold: (text: string) => text, fg: (_slot: string, text: string) => `${ESC}[41m${text}${ESC}[49m` },
+    ]) expect(genericCallComponent("Styled", hostile).render(80)).toEqual(["Styled"]);
+  });
+
+  it.each([Number.NaN, Infinity, -Infinity, -4, 0])("returns no lines for invalid width %s", (width) => {
+    expect(call(wrapForSelfShell({ name: "Width" }), {}, { state: {}, isPartial: false }).render(width)).toEqual([]);
+  });
+
+  it("normalizes exact widths and keeps Unicode/tab continuations aligned", () => {
+    const wrapped = wrapForSelfShell({ name: "Width" });
+    const ctx: RenderCtx = { state: {}, isPartial: false };
+    const callComponent = call(wrapped, {}, ctx, undefined);
+    const resultComponent = result(wrapped, {
+      content: [{ type: "text", text: "界e\u0301🙂\twide\n二列" }],
+    }, ctx, undefined);
+    const atThree = [...callComponent.render(3), ...resultComponent.render(3)];
+    expect([...callComponent.render(3.9), ...resultComponent.render(3.9)]).toEqual(atThree);
+
+    for (const width of [1, 2, 3, 3.9, 20, 200]) {
+      const lines = [...callComponent.render(width), ...resultComponent.render(width)].map(stripAnsi);
+      expect(lines.every((line) => tuiVisibleWidth(line) <= Math.floor(width))).toBe(true);
+      if (width === 1) expect(lines).toEqual(["●"]);
+      if (width === 2) expect(lines).toEqual(["● "]);
+      if (width >= 20) {
+        expect(lines).toEqual(["● Width", "  界e\u0301🙂   wide", "  二列"]);
+        expect(lines.slice(1).every((line) => line.startsWith("  ") && !line.startsWith("   "))).toBe(true);
+      }
+    }
+  });
+
+  it("preserves trusted ANSI, interior blanks, and continuation alignment", () => {
+    const trusted = `${ESC}[35mcolored${ESC}[39m`;
+    const wrapped = wrapForSelfShell({ name: "Ansi", renderCall: () => ({ render: () => ["", trusted, "", "tail", ""] }) });
+    const lines = call(wrapped, {}, { state: {}, isPartial: false }).render(40);
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toContain(trusted);
+    expect(stripAnsi(lines[1]!)).toBe("  ");
+    expect(stripAnsi(lines[2]!)).toBe("  tail");
+  });
+
+  it("restores ordinary call outcome when an override precedes a throw", () => {
+    const args = Object.freeze({ secret: Object.freeze({ nested: "arg" }) });
+    const wrapped = wrapForSelfShell({
+      name: "ThrowingCall",
+      renderCall: (_args: unknown, _theme: unknown, ctx: RenderCtx) => {
+        expect(setToolRowOutcome(ctx, "failure")).toBe(true);
+        throw new Error("call");
+      },
+    });
+    expect(call(wrapped, args, { state: {}, isPartial: false }).render(80).map(stripAnsi))
+      .toEqual(["● ThrowingCall"]);
+    expect(args).toEqual({ secret: { nested: "arg" } });
+  });
+
+  it("uses a local result fallback when its constructor throws without mutating frozen inputs", () => {
+    const block = Object.freeze({ type: "text", text: "throw result" });
+    const content = Object.freeze([block]);
+    const details = Object.freeze({ secret: Object.freeze({ nested: "detail" }) });
+    const value = Object.freeze({ content, details });
+    const options = Object.freeze({ expanded: false, isPartial: false });
+    const wrapped = wrapForSelfShell({
+      name: "ThrowingResult",
+      renderResult: (receivedValue: unknown, receivedOptions: unknown, _theme: unknown, ctx: RenderCtx) => {
+        expect(receivedValue).toBe(value);
+        expect(receivedOptions).toBe(options);
+        expect(setToolRowOutcome(ctx, "failure")).toBe(true);
+        throw new Error("result");
+      },
+    });
+    const component = (wrapped.renderResult as Function)(value, options, theme, { state: {}, isPartial: false }) as Renderer;
+    expect(component.render(80).map(stripAnsi)).toEqual(["● throw result"]);
+    expect(block).toEqual({ type: "text", text: "throw result" });
+    expect(content).toEqual([{ type: "text", text: "throw result" }]);
+    expect(details).toEqual({ secret: { nested: "detail" } });
+    expect(options).toEqual({ expanded: false, isPartial: false });
+    expect(value).toEqual({ content: [{ type: "text", text: "throw result" }], details: { secret: { nested: "detail" } } });
+  });
+
+  it("restores ordinary result outcome when an override returns an invalid component", () => {
+    const block = Object.freeze({ type: "text", text: "result text" });
+    const content = Object.freeze([block]);
+    const details = Object.freeze({ secret: Object.freeze({ nested: "detail" }) });
+    const value = Object.freeze({ content, details });
+    const options = Object.freeze({ expanded: false, isPartial: false });
+    const wrapped = wrapForSelfShell({
+      name: "InvalidResult",
+      renderCall: () => ({ render: () => [] }),
+      renderResult: (receivedValue: unknown, received: unknown, _theme: unknown, ctx: RenderCtx) => {
+        expect(receivedValue).toBe(value);
+        expect(received).toBe(options);
+        expect(setToolRowOutcome(ctx, "stopped")).toBe(true);
+        return null;
+      },
+    });
+    const state = {};
+    call(wrapped, {}, { state, isPartial: false });
+    const component = (wrapped.renderResult as Function)(value, options, theme, { state, isPartial: false }) as Renderer;
+    expect(component.render(80).map(stripAnsi)).toEqual(["● result text"]);
+    expect(block).toEqual({ type: "text", text: "result text" });
+    expect(content).toEqual([{ type: "text", text: "result text" }]);
+    expect(details).toEqual({ secret: { nested: "detail" } });
+    expect(options).toEqual({ expanded: false, isPartial: false });
+    expect(value).toEqual({ content: [{ type: "text", text: "result text" }], details: { secret: { nested: "detail" } } });
+  });
+
+  it("threads previous inner call/result components independently", () => {
+    const seenCall: unknown[] = [], seenResult: unknown[] = [];
+    const calls: Renderer[] = [], results: Renderer[] = [];
+    const wrapped = wrapForSelfShell({
+      name: "Incremental",
+      renderCall: (_a: unknown, _t: unknown, ctx: RenderCtx) => { seenCall.push(ctx.lastComponent); const c = { render: () => ["call"] }; calls.push(c); return c; },
+      renderResult: (_r: unknown, _o: unknown, _t: unknown, ctx: RenderCtx) => { seenResult.push(ctx.lastComponent); const c = { render: () => ["result"] }; results.push(c); return c; },
+    });
+    const firstCall = call(wrapped, {}, { state: {}, isPartial: true });
+    const firstResult = result(wrapped, { content: [] }, { state: {}, isPartial: true });
+    call(wrapped, {}, { state: {}, isPartial: true, lastComponent: firstCall });
+    result(wrapped, { content: [] }, { state: {}, isPartial: true, lastComponent: firstResult });
+    expect(seenCall).toEqual([undefined, calls[0]]);
+    expect(seenResult).toEqual([undefined, results[0]]);
+  });
+
+  it("renders reused mutable inners before reusing shell framing", () => {
+    let text = "one";
+    let renders = 0;
+    const inner = { render: () => { renders++; return [text]; } };
+    const wrapped = wrapForSelfShell({ name: "Cached", renderCall: () => inner });
+    const state = {};
+    const firstComponent = call(wrapped, {}, { state, isPartial: false });
+    const first = firstComponent.render(40);
+    expect(firstComponent.render(40)).toBe(first);
+    text = "two";
+    const reconstructed = call(wrapped, {}, { state, isPartial: false, lastComponent: firstComponent });
+    expect(reconstructed.render(40).map(stripAnsi)).toEqual(["● two"]);
+    expect(renders).toBe(3);
+  });
+
+  it("invalidates shell output for content, outcome, registration, ownership, and width changes", () => {
+    let text = "same";
+    const inner = { render: () => [text] };
+    const wrapped = wrapForSelfShell({
+      name: "Matrix",
+      renderCall: () => inner,
+      renderResult: () => ({ render: () => ["result"] }),
+    });
+    const state = {};
+    const pending = call(wrapped, {}, { state, isPartial: true });
+    const pendingOutput = pending.render(20);
+    text = "changed";
+    expect(pending.render(20)).not.toBe(pendingOutput);
+    const settled = call(wrapped, {}, { state, isPartial: false, lastComponent: pending });
+    const settledOutput = settled.render(20);
+    expect(settledOutput.map(stripAnsi)).toEqual(["● changed"]);
+    expect(settled.render(21)).not.toBe(settledOutput);
+
+    const registeredState = {};
+    const registeredCall = call(wrapped, {}, { state: registeredState, isPartial: false });
+    const registeredResult = result(wrapped, { content: [] }, { state: registeredState, isPartial: false });
+    expect(registeredCall.render(20).map(stripAnsi)).toEqual(["● changed"]);
+    expect(registeredResult.render(20).map(stripAnsi)).toEqual(["  result"]);
+  });
+
+  it("preserves execution and definition identities without mutating canonical inputs", async () => {
+    const execute = async () => ({ content: [] });
+    const parameters = Object.freeze({ kind: "schema" });
+    const metadata = Object.freeze({ arbitrary: Object.freeze({ token: 1 }) });
+    const source = { name: "Identity", execute, parameters, metadata, arbitrary: metadata.arbitrary };
+    const wrapped = wrapForSelfShell(source);
+    expect(wrapped.execute).toBe(execute);
+    expect(wrapped.parameters).toBe(parameters);
+    expect(wrapped.metadata).toBe(metadata);
+    expect(wrapped.arbitrary).toBe(metadata.arbitrary);
+    expect(await (wrapped.execute as typeof execute)()).toEqual({ content: [] });
+  });
+
+  it("keeps generic tab, CRLF, control, and image fallback behavior", () => {
+    const component = genericResultComponent({ content: [
+      { type: "text", text: "before\tafter\r\ncontrol\u0000safe" },
+      { type: "image", data: "Zm9v", mimeType: "image/png" },
+    ] }, undefined, { showImages: false });
+    const text = component.render(100).join("\n");
+    expect(text).toContain("before   after\ncontrolsafe");
+    expect(text).toContain("Image");
+    expect(text).not.toContain("\r");
   });
 });

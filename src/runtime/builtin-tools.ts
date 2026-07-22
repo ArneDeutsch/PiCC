@@ -2,15 +2,10 @@
  * Single source of truth for constructing PiCC's seven built-in tools
  * (bash, read, write, edit, grep, find, ls).
  *
- * This is the shared source the main session and the subagent path both build
- * their built-ins from, by calling {@link buildStockBuiltinTools}, so the two
- * paths run the exact same tool implementations and differ only in *which* tools
- * a session is permitted to use — never in *how* any given tool behaves.
- *
- * The factory returns the merged defs RAW (unwrapped): it does NOT call
- * `wrapForSelfShell` and does NOT register with Pi. Both remain the caller's
- * concern, because the self-shell reframing and registration are session-shell
- * decisions, not tool-construction decisions.
+ * This is the shared source of raw execution and renderer construction for the
+ * main session and subagents. The main path adds routine rendering, collapse,
+ * glyph framing, checkpoint handling, and registration. Subagent paths consume
+ * the raw definitions selected by their grants.
  */
 import { open as fsOpen, readFile as fsReadFile, stat as fsStat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -344,8 +339,10 @@ async function routeReadExecute(
  *   renderCall/renderResult are cwd-light (the render ctx supplies cwd), so one
  *   instance is pulled at construction.
  *
- * Returns the merged defs RAW — the caller applies `wrapForSelfShell` and
- * `pi.registerTool`. `cwdRef.get()` is read live inside `execute`.
+ * Returns the merged defs raw. Main-session callers add their presentation and
+ * checkpoint decorators before registration; subagent callers consume the raw
+ * definitions allowed by their grants. `cwdRef.get()` is read live inside
+ * `execute`.
  *
  * @see BuiltinToolSdk for why the SDK param is this narrow type, not `PiSdk`.
  */
