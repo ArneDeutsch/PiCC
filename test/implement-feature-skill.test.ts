@@ -1231,6 +1231,55 @@ describe("current-feature proportional review triage", () => {
     expect(principles).toContain("otherwise preserve findings for the phase's close presentation");
   });
 
+  it("keeps the resident ticketless summary truthful about both close paths", () => {
+    const router = collapse("SKILL.md");
+    const phase0 = between(router, "## phase 0", "## write discipline");
+    expect(phase0).toContain("phase 8 always presents eligible findings");
+    expect(phase0).toContain("assessed and fileable when github is reachable");
+    expect(phase0).toContain("unassessed and non-fileable when it is not");
+  });
+
+  it("keeps ticket creation's Phase 8 handoff on always-surface semantics", () => {
+    const ticketCreation = collapse("references/ticket-creation.md");
+    expect(ticketCreation).toContain("still presents every eligible finding at close");
+    expect(ticketCreation).toContain("otherwise explicitly unassessed and non-fileable");
+    expect(ticketCreation).not.toContain("may still surface later if github becomes reachable");
+    const decline = between(ticketCreation, "## decline", "## rule 5");
+    expect(decline).toContain("phase 8 still presents eligible findings at close");
+    expect(decline).toContain("only when its reachability preconditions succeed");
+    expect(decline).toContain("include a filing/tracking opportunity");
+    expect(decline).not.toContain("the remaining tracking opportunity");
+  });
+
+  it("keeps the ticket floor and cleanup truthful for reachable and unavailable close paths", () => {
+    const integration = collapse("references/ticket-integration.md");
+    const lifecycle = between(integration, "the **ticket-linked** hooks", "resolve `<owner/repo>`");
+    expect(lifecycle).toContain("phase 8 always presents eligible findings on the ticketless path");
+    expect(lifecycle).toContain("when github is reachable this includes the optional *issue-filing offer*");
+    expect(lifecycle).toContain("when github is unavailable");
+    expect(lifecycle).toContain("eligible findings unassessed and non-fileable");
+    expect(lifecycle).toContain("no github write is attempted");
+    expect(lifecycle).not.toContain("whenever github is reachable");
+
+    const handoff = collapse("references/phase-9-handoff.md");
+    const cleanup = between(handoff, "heads-up before the cleanup", "these two next-steps bullets");
+    expect(cleanup).toContain("user-approved issues filed at close are durable");
+    expect(cleanup).toContain("every unfiled finding remains only in those run-local review/observation records");
+    for (const reason of ["unassessed offline", "gate-dropped", "not selected for filing"]) {
+      expect(cleanup, reason).toContain(reason);
+    }
+    expect(cleanup).toContain("disappears at cleanup");
+    expect(cleanup).not.toContain("anything worth keeping should already have been filed");
+
+    const forkHandoff = collapse("references/phase-9-fork-handoff.md");
+    const forkSummary = between(forkHandoff, "4. **present the final summary", "5. **linking form");
+    expect(forkSummary).toContain("its cleanup-loss warning");
+    expect(forkSummary).toContain("user-approved filed issues are durable");
+    expect(forkSummary).toContain("every unfiled finding remains only in the run-local review/observation records");
+    expect(forkSummary).toContain("disappears at cleanup");
+    expect(forkSummary).toContain("do not reuse either maintainer-only next-steps bullet");
+  });
+
   it("orders safe verification, obligation classification, then remedy judgement", () => {
     const canonical = collapse("references/review-triage.md");
     const ordered = between(canonical, "## ordered decision", "## decision-ready review evidence");
@@ -1350,6 +1399,23 @@ describe("current-feature proportional review triage", () => {
     expect(dispositions).toContain("never authorize weakening or deleting unrelated existing");
     for (const defense of ["security", "permission", "path", "ticket", "public-write", "other safety defenses"]) {
       expect(dispositions, defense).toContain(defense);
+    }
+  });
+
+  it("section-scopes each router review phase's ordered fail-closed wiring", () => {
+    const router = collapse("SKILL.md");
+    const phases = [
+      ["## phase 6", "## phase 7", "references/phase-6-plan-review.md", "fan reviewers"],
+      ["## phase 7", "## phase 8", "references/phase-7-implementation.md", "review fan-out"],
+      ["## phase 8", "## phase 9", "references/phase-8-close-review.md", "review the whole feature"],
+    ] as const;
+    for (const [start, end, phaseReference, dispatchMarker] of phases) {
+      const section = between(router, start, end);
+      expectBefore(section, phaseReference, "references/review-triage.md");
+      expectBefore(section, "references/review-triage.md", "if either is unreadable");
+      expect(section).toMatch(/if either is unreadable, refuse both review-driven writes and scope expansion/);
+      expectBefore(section, "if either is unreadable", "before review dispatch or triage");
+      expectBefore(section, "if either is unreadable", dispatchMarker);
     }
   });
 
@@ -1491,23 +1557,49 @@ describe("current-feature proportional review triage", () => {
     );
   });
 
+  it("gives a concrete failed-precondition remedy and cleanup-bounded retry", () => {
+    const filing = collapse("references/phase-8-file-finding.md");
+    const intro = between(filing, "# phase 8", "## the offer");
+    expect(intro).toContain("the findings presentation runs on **either path**");
+    expect(intro).toContain("when every reachability precondition succeeds");
+    expect(intro).toContain("optional filing branch");
+    expect(intro).not.toContain("ticketless run's only close-time github touch");
+    const unavailable = between(filing, "## reachability preconditions", "## gate through evaluate's proposal-gate");
+    expect(unavailable).toContain("missing `gh` → install the github cli");
+    expect(unavailable).toContain("failed `gh auth status` → run `gh auth login`");
+    expect(unavailable).toContain("unresolved `target` → repair the checkout's remote configuration or resolve the intended target remote");
+    expect(unavailable).toContain("filing offer may be retried before worktree cleanup");
+  });
+
+  it("keeps offline items actionable without assessment or online mechanics", () => {
+    const filing = collapse("references/phase-8-file-finding.md");
+    const unavailable = between(filing, "## reachability preconditions", "## gate through evaluate's proposal-gate");
+    expect(unavailable).toContain("each item still states the problem, its impact, and a likely remedy with rough scope");
+    expect(unavailable).toContain("include no score, gate disposition, evidence anchor, existing-issue search, or filing action");
+    expect(unavailable).toContain("marking every item explicitly **unassessed**");
+  });
+
   it("orders and terminates the section-scoped unavailable-reachability branch", () => {
     const filing = collapse("references/phase-8-file-finding.md");
     const unavailable = between(filing, "## reachability preconditions", "## gate through evaluate's proposal-gate");
     const failure = "if any reachability precondition fails";
+    const remedy = "identify the failed prerequisite and give its concrete remedy";
+    const retry = "filing offer may be retried before worktree cleanup";
     const disable = "disable github existing-issue search, proposal-gate/evaluator scoring, and issue filing";
     const forbidGate = "do not invoke the proposal gate, apply its clear-slop dropping, or otherwise score or suppress findings";
     const eligible = "every still-actionable deferred or follow-up entry";
     const present = "present each eligible item exactly once";
     const unassessed = "marking every item explicitly **unassessed**";
-    const unavailableMarker = "mark filing visibly unavailable";
+    const unavailableMarker = "filing visibly unavailable";
     const runLocal = "honest run-local presentation";
     const terminate = "stop this branch here";
     const onlineScope = "the remainder of this file applies only after **every** reachability precondition succeeds";
     const offerCompletion = "complete the offer now";
     const featureCompletion = "feature completion";
 
-    expectBefore(unavailable, failure, disable);
+    expectBefore(unavailable, failure, remedy);
+    expectBefore(unavailable, remedy, retry);
+    expectBefore(unavailable, retry, disable);
     expectBefore(unavailable, disable, forbidGate);
     expectBefore(unavailable, forbidGate, eligible);
     expect(unavailable).toContain("`review.md`'s **bugs discovered** and **proposed follow-ups** sections");

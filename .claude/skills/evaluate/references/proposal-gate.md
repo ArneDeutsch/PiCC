@@ -132,7 +132,8 @@ here). The no-hit direction is symmetric: a missing hit is **not** a novelty sig
 tracked signal (no hit ≠ novel, no hit ≠ tracked); it never flips the score toward drop or write.
 keep-open-under-uncertainty governs both directions.
 
-**Advisory + visible degrade.** The search is strictly advisory and a pure read. If `gh` is
+**Advisory + visible degrade.** This degrade applies only to an invoker that has actually entered
+proposal-gate. For such an invocation, the search is strictly advisory and a pure read. If `gh` is
 absent / unauthenticated / rate-limited / errors / times out, the gate **proceeds without a
 `github_verified` anchor** — but the degrade is **visible**, never silent: mark the novelty read as
 not-cross-checked ("existing-issue check unavailable — novelty not cross-checked against GitHub").
@@ -140,6 +141,8 @@ not-cross-checked ("existing-issue check unavailable — novelty not cross-check
 unauthenticated, so *no* finding can be cross-checked — emit that notice **once for the batch**, not
 once per finding; repeat it **per-finding only for a per-call failure** (a rate-limit or timeout on a
 specific search). A missing anchor never lowers novelty and never suppresses a finding.
+`implement-feature` Phase 8 does not enter proposal-gate after a failed reachability precondition; it
+uses its terminating offline branch instead.
 
 ## Bounded structured return — the evaluator returns fields, the coordinator composes
 

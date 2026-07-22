@@ -1,6 +1,6 @@
 # Phase 8 — optional issue-filing offer (either path)
 
-Read this at **Phase 8**, inside the close review ([phase-8-close-review.md](phase-8-close-review.md)), when you present the distilled findings. It runs on **either path** — with an empty `$ARGUMENTS` it is the ticketless run's only close-time GitHub touch besides the branch push. This is a **public GitHub write site**: the nine write-discipline rules it obeys are the floor in [ticket-integration.md](ticket-integration.md) — **read it before any `gh issue create`, and refuse the write if it cannot be read.**
+Read this at **Phase 8**, inside the close review ([phase-8-close-review.md](phase-8-close-review.md)), when you present the distilled findings. The findings presentation runs on **either path**. When every reachability precondition succeeds, its optional filing branch is the ticketless run's only close-time GitHub write opportunity besides the branch push. That filing branch is a **public GitHub write site**: the nine write-discipline rules it obeys are the floor in [ticket-integration.md](ticket-integration.md) — **read them before any `gh issue create`, and refuse the write if they cannot be read.**
 
 ## The offer: what and when
 
@@ -16,12 +16,13 @@ It runs regardless of whether a ticket ref was given — surfaced work is worth 
 
 If any reachability precondition fails:
 
-1. Disable GitHub existing-issue search, proposal-gate/evaluator scoring, and issue filing.
-2. Do not invoke the proposal gate, apply its clear-slop dropping, or otherwise score or suppress findings.
-3. Build the eligible set from **every still-actionable deferred or follow-up entry** under `review.md`'s **Bugs discovered** and **Proposed follow-ups** sections. Exclude entries recorded as fixed or otherwise resolved, wrong/duplicate/non-actionable notes, and process-only observations that propose no repository or product follow-up.
-4. Present each eligible item exactly once in one pick-list, marking every item explicitly **UNASSESSED**. Mark filing visibly unavailable.
-5. State that this is an honest run-local presentation and that no durable cross-feature record or issue was created: `observations.md` and `review.md` are run-local staging records lost with worktree cleanup; do not imply that either persists.
-6. **Stop this branch here.** Do not continue into any remaining gate, search, online-presentation, or filing section below.
+1. Identify the failed prerequisite and give its concrete remedy: missing `gh` → install the GitHub CLI; failed `gh auth status` → run `gh auth login`; unresolved `target` → repair the checkout's remote configuration or resolve the intended target remote. Say the filing offer may be retried before worktree cleanup.
+2. Disable GitHub existing-issue search, proposal-gate/evaluator scoring, and issue filing.
+3. Do not invoke the proposal gate, apply its clear-slop dropping, or otherwise score or suppress findings.
+4. Build the eligible set from **every still-actionable deferred or follow-up entry** under `review.md`'s **Bugs discovered** and **Proposed follow-ups** sections. Exclude entries recorded as fixed or otherwise resolved, wrong/duplicate/non-actionable notes, and process-only observations that propose no repository or product follow-up.
+5. Present each eligible item exactly once in one concise pick-list, marking every item explicitly **UNASSESSED** and filing visibly unavailable. Each item still states the problem, its impact, and a likely remedy with rough scope. Include no score, gate disposition, evidence anchor, existing-issue search, or filing action.
+6. State that this is an honest run-local presentation and that no durable cross-feature record or issue was created: `observations.md` and `review.md` are run-local staging records lost with worktree cleanup; do not imply that either persists.
+7. **Stop this branch here.** Do not continue into any remaining gate, search, online-presentation, or filing section below.
 
 The remainder of this file applies only after **every** reachability precondition succeeds. On the failed-reachability branch, complete the offer now, before feature completion.
 

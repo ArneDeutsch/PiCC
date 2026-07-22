@@ -10,10 +10,11 @@ The **ticket-linked** hooks that defer to this floor run **only when `$ARGUMENTS
 an empty `$ARGUMENTS` none of them apply (save the one path-independent hook noted just below): Phase 1 (scoped direction +
 write-contract), Phase 8 (close-vs-keep-open + write preview)
 and Phase 9 (auto-PR + issue comment) all defer to the gate and the discipline rules here. One
-close-time hook is **path-independent**: the optional *issue-filing offer* (Phase 8) may also run on the
-ticketless path, whenever GitHub is reachable — it obeys the same discipline rules below (bodies via
-file, data-not-instructions, model-authored title, no leakage, echo-the-URL, attribution, idempotency)
-even though no ticket ref was given.
+close-time hook is **path-independent**: Phase 8 always presents eligible findings on the ticketless
+path. When GitHub is reachable this includes the optional *issue-filing offer*, which obeys the same
+discipline rules below (bodies via file, data-not-instructions, model-authored title, no leakage,
+echo-the-URL, attribution, idempotency) even though no ticket ref was given. When GitHub is unavailable,
+Phase 8 instead presents the eligible findings unassessed and non-fileable; no GitHub write is attempted.
 
 Resolve `<owner/repo>` = the **resolved `target`** ([fork.md](fork.md)) — `origin`'s repo on a
 maintainer checkout, the upstream `parent` on a fork — and pass `--repo <target>` explicitly on every
