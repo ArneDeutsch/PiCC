@@ -11,6 +11,7 @@ import {
 import { withDefaultCollapsedToolRendering } from "../src/runtime/default-collapsed-tool-render.js";
 import { withRoutineToolRendering } from "../src/runtime/routine-tool-render.js";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
+import { waitUntil } from "./helpers/async.js";
 
 function stripAnsi(value: string): string {
   return value
@@ -106,14 +107,21 @@ describe("real Pi default-collapse contracts", () => {
         const row = new sdk.ToolExecutionComponent(
           "edit", "edit-contract", args, {},
           wrapForSelfShell(withDefaultCollapsedToolRendering(
-            withRoutineToolRendering(sdk.createEditToolDefinition(directory)),
+            withRoutineToolRendering(sdk.createEditToolDefinition(directory), {
+              resolveEditRenderCwd: () => directory,
+            }),
           )),
           { requestRender() {} }, directory.replace(/\\/g, "/"),
         );
         row.setArgsComplete();
         row.render(100);
-        await vi.waitFor(() => expect((row.render(100) as string[]).map(stripAnsi).join("\n"))
-          .toMatch(/ENOENT|no such file|could not/iu));
+        const renderedPreview = () => (row.render(100) as string[]).map(stripAnsi).join("\n");
+        await waitUntil({
+          description: "the native missing-file Edit preview to settle",
+          predicate: () => /ENOENT|no such file|could not/iu.test(renderedPreview()),
+          describeObserved: renderedPreview,
+          timeoutMs: 15_000,
+        });
         row.updateResult({
           content: [{ type: "text", text: "Successfully replaced 1 block(s) in missing.txt." }],
           details: { diff: "-1 OLD_STORED\n+1 NEW_STORED", patch: "stored", firstChangedLine: 1 },
@@ -160,6 +168,73 @@ describe("real Pi default-collapse contracts", () => {
         expect(expanded).toContain("output-secret");
       } finally { vi.useRealTimers(); }
     });
+  });
+
+  it("leaves Edit HTML and reconstructed history on their supplied cwd", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    const directory = mkdtempSync(join(tmpdir(), "picc-edit-nonlive-"));
+    try {
+      writeFileSync(join(directory, "html-edit.txt"), "before\n");
+      const resolver = vi.fn(() => { throw new Error("live resolver must not run"); });
+      const htmlCallContexts: any[] = [];
+      const htmlResultContexts: any[] = [];
+      const htmlDefinition = withRoutineToolRendering({
+        name: "edit",
+        renderCall(_args: unknown, _theme: unknown, context: any) {
+          htmlCallContexts.push(context);
+          return { render: () => [`HTML_CALL_CWD=${context.cwd}`] };
+        },
+        renderResult(_result: unknown, options: any, _theme: unknown, context: any) {
+          htmlResultContexts.push(context);
+          return { render: () => [`HTML_RESULT_${options.expanded ? "EXPANDED" : "COLLAPSED"}_CWD=${context.cwd}`] };
+        },
+      } as any, { resolveEditRenderCwd: resolver });
+      const historyDefinition = withRoutineToolRendering(sdk.createEditToolDefinition(directory), {
+        resolveEditRenderCwd: resolver,
+      });
+      const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+      const distIndex = mainUrl.indexOf("/dist/");
+      const html = await import(`${mainUrl.slice(0, distIndex)}/dist/core/export-html/tool-renderer.js`) as any;
+      const renderer = html.createToolHtmlRenderer({
+        getToolDefinition: (name: string) => name === "edit" ? htmlDefinition : undefined,
+        theme: { fg: (_slot: string, text: string) => text, bold: (text: string) => text,
+          bg: (_slot: string, text: string) => text },
+        cwd: directory,
+      });
+      expect(renderer.renderCall("html-edit", "edit", {
+        path: "html-edit.txt", edits: [{ oldText: "before", newText: "after" }],
+      })).toContain(`HTML_CALL_CWD=${directory}`);
+      const htmlResult = renderer.renderResult(
+        "html-edit", "edit", [{ type: "text", text: "html settled" }],
+        { diff: "-before\n+after", firstChangedLine: 1 }, false,
+      );
+      expect(htmlResult.collapsed).toContain(`HTML_RESULT_COLLAPSED_CWD=${directory}`);
+      expect(htmlResult.expanded).toContain(`HTML_RESULT_EXPANDED_CWD=${directory}`);
+      expect(htmlCallContexts).toHaveLength(1);
+      expect(htmlResultContexts).toHaveLength(2);
+      expect([...htmlCallContexts, ...htmlResultContexts].every(({ cwd }) => cwd === directory)).toBe(true);
+      expect(htmlResultContexts.every(({ state }) => state === htmlCallContexts[0].state)).toBe(true);
+      expect(resolver).not.toHaveBeenCalled();
+
+      const historyArgs = {
+        path: "history-edit.txt", edits: [{ oldText: "HISTORY_OLD", newText: "HISTORY_NEW" }],
+      };
+      const row = new sdk.ToolExecutionComponent(
+        "edit", "history-edit", historyArgs, {}, historyDefinition,
+        { requestRender() {} }, directory.replace(/\\/g, "/"),
+      );
+      row.updateResult({
+        content: [{ type: "text", text: "Successfully replaced 1 block(s) in history-edit.txt." }],
+        details: { diff: "-HISTORY_OLD\n+HISTORY_NEW", patch: "stored", firstChangedLine: 1 },
+      }, false);
+      const reconstructed = (row.render(100) as string[]).map(stripAnsi).join("\n");
+      expect(reconstructed).toContain("HISTORY_OLD");
+      expect(reconstructed).toContain("HISTORY_NEW");
+      expect(resolver).not.toHaveBeenCalled();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("leaves stock Read and custom MultiEdit HTML routes on native detail", async () => {

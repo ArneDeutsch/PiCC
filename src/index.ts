@@ -1510,6 +1510,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       for (const { def } of builtins) {
         const routineRendered = withRoutineToolRendering(
           def as unknown as ToolDefinition,
+          { resolveEditRenderCwd: getCwd },
         );
         const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
         pi.registerTool(mainCheckpointGate.wrapTool(
