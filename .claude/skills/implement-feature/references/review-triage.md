@@ -27,16 +27,18 @@ For a removal or reversion, the reviewer must also establish what approved behav
 
 ## Proportional remedy gate
 
-A discretionary remedy joins current-feature work only when the coordinator can establish all of the following:
+For an **addition or change**, a discretionary remedy joins current-feature work only when the coordinator can establish all of the following:
 
 - direct linkage to the approved outcome or a contract invalidated by the current feature;
 - a realistic path to observable impact;
 - value or risk reduction proportionate to implementation, review, and maintenance cost;
 - proof at the nearest sufficient layer;
 - justified marginal durable surface and maintenance burden; and
-- a successful removal test: without this remedy, the approved outcome or required proof would be materially incomplete, unsafe, incompatible, cross-platform-broken, or untruthful.
+- a successful omission/removal counterfactual: without the remedy, the current feature would materially lose value or risk reduction.
 
-End-to-end proof remains appropriate when the claim genuinely crosses that boundary. A remedy is not rejected merely because it has a cost; discretionary work that clearly passes the full gate is admitted.
+This discretionary-admission counterfactual is not a definition of, or substitute for, the mandatory blocker floor below. For a **removal or reversion**, establish instead that accepted behavior and required proof remain afterward while the operation eliminates unjustified burden owned by the current feature. In every case, use the smallest sufficient addition/change or smallest safe removal/reversion.
+
+End-to-end proof remains appropriate when the claim genuinely crosses that boundary. A remedy is not rejected merely because it has a cost; discretionary work that clearly passes the operation-appropriate full gate is admitted.
 
 ## Floors and default dispositions
 
@@ -51,4 +53,4 @@ Existing verified aggregate excess in feature-owned changes remains an obligatio
 
 ## Deferral path
 
-Immediately append useful deferred or unresolved findings to the run-local `observations.md` as dated bullets, including the phase and disposition. Interrupt immediately only when a finding requires a current direction, blocker, or safety decision under the workflow's existing escalation boundary. In Phase 8, capture ordinary follow-ups without presenting them early; reserve their presentation for one close pick-list: proposal-gated and assessed when the GitHub path is available, or every eligible still-actionable finding explicitly unassessed when it is unavailable. At close, carry every still-useful Phase 6, 7, or 8 finding warranting follow-up into `review.md` under `Bugs discovered` or `Proposed follow-ups` before the completion summary and agreement, then run the existing per-item filing offer. These files are run-local staging records; only a user-approved filed GitHub issue is durable cross-feature tracking.
+Immediately append useful deferred or unresolved findings to the run-local `observations.md` as dated bullets, including the phase and disposition. Interrupt immediately only when a finding requires a current direction, blocker, or safety decision under the workflow's existing escalation boundary. In Phase 8, capture ordinary follow-ups without presenting them early; reserve their presentation for one close pick-list: proposal-gated and assessed when the GitHub path is available, or every eligible still-actionable finding explicitly unassessed when it is unavailable. At close, carry every still-useful Phase 6, 7, or 8 finding warranting follow-up into `review.md` under `Bugs discovered` or `Proposed follow-ups` before the completion summary and agreement, then run the existing per-item filing offer. These files are run-local staging records. Durable cross-feature tracking requires either a new GitHub issue filed with user approval or an existing issue the user explicitly confirms is equivalent and the workflow reuses under Rule 9. A candidate near-match or search hit alone is not durable tracking; a finding with neither durable outcome remains run-local and is lost with cleanup.

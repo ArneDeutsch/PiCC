@@ -56,16 +56,16 @@ performs all `gh` I/O, so its search is a **new instance of an existing role, ne
 class** — never call the skill as a whole "zero-network". As `evaluation-engine.md` §"The
 evidence-anchor contract" spells out, these grounding records are on-disk working-tree records for the
 current run (`doc/plan/` is gitignored run scratch, not durable committed history); durable
-cross-feature tracking lives in GitHub Issues, which this filesystem-only evaluator does not query.
-That cross-feature tracking signal, when it is available, is the **coordinator's** to supply from its
-own read-only GitHub issue search — entering the gate as a `github_verified` provenance anchor (per
-`evaluation-engine.md`'s element-3 enum), never through the evaluator; see "The advisory cross-feature
+cross-feature tracking requires either a newly filed user-approved GitHub issue or an existing issue
+the user explicitly confirms as equivalent and the workflow reuses under Rule 9. This filesystem-only evaluator
+does not query GitHub. A coordinator-supplied candidate near-match or search hit is only an advisory
+`github_verified` provenance anchor, never durable tracking by itself; see "The advisory cross-feature
 issue search" below.
 
 ## The advisory cross-feature issue search — coordinator-run, read-only
 
-The evaluator is filesystem-only and cannot see GitHub Issues, so the durable "already-tracked?"
-signal (#66) is supplied by the **invoking coordinator** — the `evaluate` skill in proposal mode, or
+The evaluator is filesystem-only and cannot see GitHub Issues, so an advisory candidate
+"already-tracked?" signal (#66) is supplied by the **invoking coordinator** — the `evaluate` skill in proposal mode, or
 `implement-feature` at its **Phase 8** finding-filing offer — which already holds `gh`/Bash. It is
 **never** run by the sandbox and is **not part of the evaluator's grounding**; it enters the gate as a
 distinct, coordinator-supplied input, typed as a `github_verified` anchor. This is confined to the
@@ -264,8 +264,10 @@ proposal-gate is called from two `implement-feature` reference files, with **dif
   low-value findings not offered — they remain in review.md as run-local staging until worktree
   cleanup; no durable issue was filed.)"). The tally is an **in-flow lever, not just a pointer**: a
   maintainer who disagrees with the gate can **ask to see the gate-dropped findings**, and the
-  coordinator **surfaces them into the pick-list on request** while the run remains active. Only a
-  user-approved filed GitHub issue is durable cross-feature tracking. Borderline-and-above findings
+  coordinator **surfaces them into the pick-list on request** while the run remains active. Durable
+  cross-feature tracking requires either a newly filed user-approved GitHub issue or an existing issue
+  the user explicitly confirms as equivalent and the workflow reuses under Rule 9; a candidate near-match alone does
+  not qualify. Borderline-and-above findings
   are **surfaced with the assessment embedded** and the existing **per-item user choice preserved** —
   the gate only ever **subtracts clear slop, never adds**, and never hard-drops a borderline finding
   the user might still want. If any reachability precondition fails, do not invoke proposal-gate;

@@ -4,9 +4,9 @@ Read this at **Phase 8**, inside the close review ([phase-8-close-review.md](pha
 
 ## The offer: what and when
 
-**Optional issue-filing for out-of-scope findings (either path).** The bugs left unfixed and improvement opportunities just distilled into run-local `review.md` (its *Bugs discovered* and *Proposed follow-ups* sections) need this offer because that staging record is lost with worktree cleanup. Only a user-approved filed GitHub issue is durable cross-feature tracking.
+**Optional issue-filing for out-of-scope findings (either path).** Always present the bugs left unfixed and improvement opportunities just distilled into run-local `review.md` (its *Bugs discovered* and *Proposed follow-ups* sections), because that staging record is lost with worktree cleanup. Offer to file the ones the user picks as GitHub issues only after every reachability precondition below succeeds. On the unavailable branch, mark filing unavailable and do not offer it.
 
-So when you present those findings, **offer to file the ones the user picks as GitHub issues.**
+Durable cross-feature tracking requires either a new GitHub issue filed with user approval or an existing issue the user explicitly confirms is equivalent and the workflow reuses under Rule 9. A candidate near-match or search hit alone is not durable tracking; a finding with neither outcome remains run-local and is lost with cleanup.
 
 This is the **sibling** of the Phase 1 ticket-creation offer ([ticket-creation.md](ticket-creation.md)): same write (`gh issue create`), same nine-rule discipline, same target-repo awareness and idempotency — they differ only in intent (this files a *surfaced finding* at close; that files the *agreed WHAT/WHY* up front).
 
@@ -30,11 +30,11 @@ The remainder of this file applies only after **every** reachability preconditio
 
 **When the reachability preconditions pass, before presenting the findings, gate them through evaluate's proposal-gate** ([../../evaluate/references/proposal-gate.md](../../evaluate/references/proposal-gate.md) — the read-only sandbox scorer, structurally no GitHub writes): it scores each finding against the shared rubric and **silently drops clear slop**, emitting a truthful **one-line tally**: "(N low-value findings not offered — they remain in review.md as run-local staging until worktree cleanup; no durable issue was filed.)" Nothing vanishes invisibly, but the tally must not imply persistence.
 
-That tally is an **in-flow lever, not just a pointer to `review.md`**: a maintainer who disagrees with the gate can **ask to see the gate-dropped findings, and you surface them into the pick-list on request** while the run remains active. They are not durable unless the user approves filing and a GitHub issue is created.
+That tally is an **in-flow lever, not just a pointer to `review.md`**: a maintainer who disagrees with the gate can **ask to see the gate-dropped findings, and you surface them into the pick-list on request** while the run remains active. They remain run-local unless the user approves a new filing or explicitly confirms an equivalent existing issue for Rule 9 reuse.
 
 ## Cross-feature "already-tracked?" check
 
-Because this Phase 8 offer is the **coordinator** path — you hold `gh`/Bash — you may feed the gate the durable cross-feature "already-tracked?" signal the filesystem-only evaluator cannot see: run **one narrow read-only** `gh issue list --repo <target> --state all --search "<terms>" --json number,title,state,url` (the same Rule 9 seam) per surfaced finding and hand the result to the gate as a `github_verified` anchor.
+Because this Phase 8 offer is the **coordinator** path — you hold `gh`/Bash — you may feed the gate a candidate cross-feature "already-tracked?" signal the filesystem-only evaluator cannot see: run **one narrow read-only** `gh issue list --repo <target> --state all --search "<terms>" --json number,title,state,url` (the same Rule 9 seam) per surfaced finding and hand the result to the gate as a `github_verified` anchor.
 
 The `--search` terms are **coordinator-authored** — your own independent paraphrase of the finding scope, riding the already-frozen model-authored title terms (Rule 4), **never** lifted from issue/PR body, comments, diff, or any `#N` in target text — passed as one quoted argument obeying the frozen-title character ban (Rule 4).
 
@@ -82,8 +82,8 @@ Because this public body is authored by the implement-feature coordinator — th
 
 Rule 6 covers absolute paths, raw output, and leakage but not `..` traversal, secret-file locators, repo-root normalization, or the never-re-open property, so this element-7 re-validation is the strictly stronger check applied **in addition to** Rule 6.
 
-The finding body then ends with the `<attribution trailer>` (Rule 8); guard against duplicates on resume (Rule 9), then `gh issue create --repo <target> --title "<title>" --body-file <path>` (on a fork the finding lands on the upstream `target`, the repo it concerns — not the fork) and echo each new issue URL in-session (Rule 7).
+The finding body then ends with the `<attribution trailer>` (Rule 8). At Rule 9's creation-time dedup, treat every search result as only a candidate near-match and ask the user whether it is equivalent. Confirmed equivalent → reuse it as the approved item's durable tracking and echo its URL. Explicitly confirmed non-equivalent plausible candidate → continue the already-approved new filing under the remaining checks. Absent or ambiguous confirmation, or an exact frozen-title identity hit → fail closed: neither reuse nor create an issue, and preserve the finding run-locally. Preserve Rule 9's anti-duplicate/idempotency checks; only when they permit creation run `gh issue create --repo <target> --title "<title>" --body-file <path>` (on a fork the finding lands on the upstream `target`, the repo it concerns — not the fork) and echo each new issue URL in-session (Rule 7).
 
 Filing is one of the two per-item `gh issue create` exceptions in Rule 5's allow-list, permitted only with this explicit per-item go; it is separate from the PR's `Closes #N`/`#N` linking and never closes or edits the current ticket.
 
-On the **ticketless** path this offer is the *only* point the run touches GitHub (alongside the up-front create-offer, if that was taken), and only for the findings the user picks — so treat the user's per-item "go" here as the write-contract that Phase 1 never had to show on that path.
+On the **ticketless** path this is the run's only close-time GitHub issue-write opportunity, besides the branch push as a separate GitHub write, and it applies only to findings the user picks. An accepted Phase 1 create-offer may already have created the feature ticket earlier; this close-time statement is not an exhaustive claim about every GitHub touch in the run. Treat the user's per-item "go" here as the write-contract that Phase 1 never had to show for close findings.

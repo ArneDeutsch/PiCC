@@ -1517,6 +1517,21 @@ describe("advisory coordinator gh issue search -> github_verified anchor", () =>
     expect(body).toContain("keep-open-under-uncertainty governs both directions");
   });
 
+  it("does not treat an advisory candidate hit as durable tracking", () => {
+    const body = collapse(PROPOSAL_GATE_PATH);
+    const grounding = body.slice(
+      body.indexOf("grounding records are on-disk working-tree records"),
+      body.indexOf("## the advisory cross-feature issue search"),
+    );
+    expect(grounding).toMatch(/durable cross-feature tracking requires either a newly filed user-approved github issue or an existing issue the user explicitly confirms as equivalent and the workflow reuses under rule 9/);
+    expect(grounding).not.toMatch(/durable cross-feature tracking (?:does not|never) require/);
+    expect(grounding).toContain("candidate near-match or search hit");
+    expect(grounding).toContain("never durable tracking by itself");
+
+    const wiring = body.slice(body.indexOf("- **phase 8 issue-filing offer**"));
+    expect(wiring).toContain("candidate near-match alone does not qualify");
+  });
+
   it("proposal-gate visibly degrades unavailable search only after an invoker enters the gate", () => {
     const body = collapse(PROPOSAL_GATE_PATH);
     expect(body).toContain("applies only to an invoker that has actually entered proposal-gate");

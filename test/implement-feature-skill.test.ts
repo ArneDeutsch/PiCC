@@ -1251,6 +1251,41 @@ describe("current-feature proportional review triage", () => {
     expect(decline).not.toContain("the remaining tracking opportunity");
   });
 
+  it("describes GitHub Issues as selected, non-exhaustive prior learning", () => {
+    const direction = collapse("references/phase-1-direction.md");
+    const scouting = between(direction, "in the background you may scout", "converge, then present");
+    expect(scouting).toContain("durable follow-ups users chose to file or explicitly confirmed as equivalent and reused");
+    expect(scouting).toContain("issues are not an exhaustive record of prior learning");
+    expect(scouting).toContain("untracked run-local findings disappear at cleanup");
+  });
+
+  it("uses new-or-confirmed/reused durability in shared and close consumers", () => {
+    const canonical = collapse("references/review-triage.md");
+    const deferral = canonical.slice(canonical.indexOf("## deferral path"));
+    const close = collapse("references/phase-8-close-review.md");
+    const closeRecord = between(close, "before asking the user to close the feature", "the ticket-path close hooks");
+    const filing = collapse("references/phase-8-file-finding.md");
+    const offer = between(filing, "## the offer", "## reachability preconditions");
+
+    for (const section of [deferral, closeRecord, offer]) {
+      expect(section).toMatch(
+        /durable cross-feature tracking requires either a new github issue filed with user approval or an existing issue the user explicitly confirms (?:is|as) equivalent and the workflow reuses (?:it )?under rule 9/,
+      );
+      expect(section).not.toMatch(/durable cross-feature tracking (?:does not|never) require/);
+      expect(section).toMatch(/candidate near-match(?: or search hit)?[^.]+not durable tracking/);
+      expect(section).toMatch(/neither (?:durable )?outcome[^.]+run-local[^.]+lost with cleanup/);
+    }
+
+    const integration = collapse("references/ticket-integration.md");
+    const rule9 = integration.slice(integration.indexOf("9. **idempotent on resume"));
+    expect(rule9).toContain("treat every result as a candidate near-match");
+    expect(rule9).toContain("surface it to the user");
+    expect(rule9).toMatch(/if the user explicitly confirms that it is equivalent, reuse it as[^.]+durable tracking and echo its url/);
+    expect(rule9).toMatch(/if the user explicitly confirms that a plausible candidate is non-equivalent, continue the already-approved new filing/);
+    expect(rule9).toMatch(/with absent or ambiguous confirmation, or an exact frozen-title identity hit, fail closed:[^.]+neither reuse nor create an issue/);
+    expect(rule9).not.toMatch(/absent or ambiguous confirmation[^.]+continue[^.]+filing/);
+  });
+
   it("keeps the ticket floor and cleanup truthful for reachable and unavailable close paths", () => {
     const integration = collapse("references/ticket-integration.md");
     const lifecycle = between(integration, "the **ticket-linked** hooks", "resolve `<owner/repo>`");
@@ -1263,19 +1298,23 @@ describe("current-feature proportional review triage", () => {
 
     const handoff = collapse("references/phase-9-handoff.md");
     const cleanup = between(handoff, "heads-up before the cleanup", "these two next-steps bullets");
-    expect(cleanup).toContain("user-approved issues filed at close are durable");
-    expect(cleanup).toContain("every unfiled finding remains only in those run-local review/observation records");
+    expect(cleanup).toContain("new issue filed with user approval");
+    expect(cleanup).toContain("existing issue the user explicitly confirmed as equivalent and the workflow reused under rule 9");
+    expect(cleanup).toContain("every finding with neither outcome remains only in those run-local review/observation records");
     for (const reason of ["unassessed offline", "gate-dropped", "not selected for filing"]) {
       expect(cleanup, reason).toContain(reason);
     }
+    expect(cleanup).toContain("candidate near-match or search hit alone is not durable");
     expect(cleanup).toContain("disappears at cleanup");
     expect(cleanup).not.toContain("anything worth keeping should already have been filed");
 
     const forkHandoff = collapse("references/phase-9-fork-handoff.md");
     const forkSummary = between(forkHandoff, "4. **present the final summary", "5. **linking form");
     expect(forkSummary).toContain("its cleanup-loss warning");
-    expect(forkSummary).toContain("user-approved filed issues are durable");
-    expect(forkSummary).toContain("every unfiled finding remains only in the run-local review/observation records");
+    expect(forkSummary).toContain("new issue filed with user approval");
+    expect(forkSummary).toContain("existing issue the user explicitly confirmed as equivalent and the workflow reused under rule 9");
+    expect(forkSummary).toContain("every finding with neither outcome remains only in the run-local review/observation records");
+    expect(forkSummary).toContain("candidate near-match or search hit alone is not durable");
     expect(forkSummary).toContain("disappears at cleanup");
     expect(forkSummary).toContain("do not reuse either maintainer-only next-steps bullet");
   });
@@ -1334,19 +1373,34 @@ describe("current-feature proportional review triage", () => {
     ]) expect(evidence, marker).toContain(marker);
   });
 
-  it("pins the full qualitative remedy gate, positive admission, and boundary-appropriate proof", () => {
+  it("pins the additive discretionary gate and its omission/removal counterfactual", () => {
     const canonical = collapse("references/review-triage.md");
     const gate = between(canonical, "## proportional remedy gate", "## floors and default dispositions");
+    const additive = between(gate, "for an **addition or change**", "for a **removal or reversion**");
+    expect(additive).toMatch(/a discretionary remedy joins current-feature work only when the coordinator can establish all of the following/);
+    expect(additive).not.toMatch(/a discretionary remedy (?:does not|never) join current-feature work/);
     for (const marker of [
       "direct linkage to the approved outcome or a contract invalidated by the current feature",
       "realistic path to observable impact",
       "value or risk reduction proportionate to implementation, review, and maintenance cost",
       "proof at the nearest sufficient layer",
       "justified marginal durable surface and maintenance burden",
-      "successful removal test",
-      "end-to-end proof remains appropriate when the claim genuinely crosses that boundary",
-    ]) expect(gate, marker).toContain(marker);
-    expect(gate).toMatch(/discretionary work that clearly passes the full gate is admitted/);
+      "without the remedy, the current feature would materially lose value or risk reduction",
+    ]) expect(additive, marker).toContain(marker);
+    expect(additive).toContain("discretionary-admission counterfactual is not a definition of, or substitute for, the mandatory blocker floor");
+    expect(gate).toMatch(/discretionary work that clearly passes the operation-appropriate full gate is admitted/);
+  });
+
+  it("pins the removal/reversion counterfactual separately from mandatory floors", () => {
+    const canonical = collapse("references/review-triage.md");
+    const gate = between(canonical, "## proportional remedy gate", "## floors and default dispositions");
+    const removal = gate.slice(gate.indexOf("for a **removal or reversion**"));
+    expect(removal).toMatch(/for a \*\*removal or reversion\*\*, establish instead that accepted behavior and required proof remain afterward while the operation eliminates unjustified burden owned by the current feature/);
+    expect(removal).not.toMatch(/(?:do not|never) establish[^.]+accepted behavior and required proof remain/);
+    expect(removal).toContain("smallest safe removal/reversion");
+    expect(removal).toContain("end-to-end proof remains appropriate when the claim genuinely crosses that boundary");
+    const floors = between(canonical, "## floors and default dispositions", "## deferral path");
+    expect(floors).toContain("cannot be waived as disproportionate");
     expect(canonical).toContain("applies only to review-driven decisions inside the implement-feature workflow");
     expect(canonical).toContain("qualitative");
     expect(canonical).toContain("do not invent scores, numeric thresholds, or change/testing quotas");
@@ -1557,13 +1611,24 @@ describe("current-feature proportional review triage", () => {
     );
   });
 
-  it("gives a concrete failed-precondition remedy and cleanup-bounded retry", () => {
+  it("always presents but offers filing only after successful reachability", () => {
     const filing = collapse("references/phase-8-file-finding.md");
     const intro = between(filing, "# phase 8", "## the offer");
     expect(intro).toContain("the findings presentation runs on **either path**");
     expect(intro).toContain("when every reachability precondition succeeds");
     expect(intro).toContain("optional filing branch");
     expect(intro).not.toContain("ticketless run's only close-time github touch");
+    const offer = between(filing, "## the offer", "## reachability preconditions");
+    expect(offer).toContain("always present");
+    expect(offer).toMatch(/offer to file[^.]+only after every reachability precondition[^.]+succeeds/);
+    expect(offer).not.toMatch(/(?:do not|never) offer to file[^.]+only after every reachability precondition/);
+    expect(offer).toContain("on the unavailable branch, mark filing unavailable and do not offer it");
+    const unavailable = between(filing, "## reachability preconditions", "## gate through evaluate's proposal-gate");
+    expect(unavailable).toContain("filing visibly unavailable");
+  });
+
+  it("gives a concrete failed-precondition remedy and cleanup-bounded retry", () => {
+    const filing = collapse("references/phase-8-file-finding.md");
     const unavailable = between(filing, "## reachability preconditions", "## gate through evaluate's proposal-gate");
     expect(unavailable).toContain("missing `gh` → install the github cli");
     expect(unavailable).toContain("failed `gh auth status` → run `gh auth login`");
@@ -1650,8 +1715,24 @@ describe("current-feature proportional review triage", () => {
     expect(online).not.toContain("unassessed");
     expect(online).toContain("remain in review.md as run-local staging until worktree cleanup");
     expect(online).toContain("no durable issue was filed");
-    expect(online).toContain("not durable unless the user approves filing and a github issue is created");
-    expect(filing).toContain("only a user-approved filed github issue is durable cross-feature tracking");
+    expect(online).toContain("remain run-local unless the user approves a new filing or explicitly confirms an equivalent existing issue for rule 9 reuse");
+    const mechanics = online.slice(online.indexOf("## filing mechanics"));
+    expect(mechanics).toContain("treat every search result as only a candidate near-match");
+    expect(mechanics).toContain("ask the user whether it is equivalent");
+    expect(mechanics).toMatch(/confirmed equivalent → reuse it as[^.]+durable tracking and echo its url/);
+    expect(mechanics).toMatch(/explicitly confirmed non-equivalent plausible candidate → continue the already-approved new filing/);
+    expect(mechanics).toMatch(/absent or ambiguous confirmation, or an exact frozen-title identity hit → fail closed:[^.]+neither reuse nor create an issue/);
+    expect(mechanics).toContain("preserve rule 9's anti-duplicate/idempotency checks");
+  });
+
+  it("states the corrected ticketless close-time GitHub write scope", () => {
+    const filing = collapse("references/phase-8-file-finding.md");
+    const mechanics = filing.slice(filing.indexOf("## filing mechanics"));
+    expect(mechanics).toContain("only close-time github issue-write opportunity");
+    expect(mechanics).toContain("besides the branch push as a separate github write");
+    expect(mechanics).toContain("accepted phase 1 create-offer may already have created the feature ticket earlier");
+    expect(mechanics).toContain("not an exhaustive claim about every github touch in the run");
+    expect(mechanics).not.toContain("only point the run touches github");
   });
 
   it("qualifies proposal-gate Phase 8 wiring as online and defers offline", () => {
@@ -1663,7 +1744,9 @@ describe("current-feature proportional review triage", () => {
     expectBefore(phase8Wiring, "when every reachability precondition succeeds", "clear slop is dropped");
     expect(phase8Wiring).toMatch(/remain in `review\.md` only as run-local staging[^.]+lost with worktree cleanup/);
     expect(phase8Wiring).toContain("no durable issue was filed");
-    expect(phase8Wiring).toContain("only a user-approved filed github issue is durable cross-feature tracking");
+    expect(phase8Wiring).toContain("newly filed user-approved github issue");
+    expect(phase8Wiring).toContain("existing issue the user explicitly confirms as equivalent and the workflow reuses under rule 9");
+    expect(phase8Wiring).toContain("candidate near-match alone does not qualify");
     expectBefore(phase8Wiring, "if any reachability precondition fails", "do not invoke proposal-gate");
     expect(phase8Wiring).toContain(
       "defer to implement-feature's branch that presents every eligible still-actionable finding **unassessed** instead",

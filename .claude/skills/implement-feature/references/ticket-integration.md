@@ -130,8 +130,12 @@ path-independent issue-filing offer, on the ticketless path too. Phases 1, 8 and
    outside the Rule 5 allow-list) instead of creating a second one. Before filing a user-approved issue
    (Phase 8), run `gh issue list --repo <owner/repo> --state all --search "<the model-authored title>"
    --json number,title,state,url` — **all** states, so a finding filed then closed on a prior run is
-   still recognised — and, because `--search` is fuzzy, **surface any near-match to the user** and reuse
-   it rather than filing a duplicate. A re-run must never double-post the issue comment, error on "PR
+   still recognised — and, because `--search` is fuzzy, treat every result as a candidate near-match
+   and **surface it to the user**. If the user explicitly confirms that it is equivalent, reuse it as
+   the approved finding's durable tracking and echo its URL. If the user explicitly confirms that a
+   plausible candidate is non-equivalent, continue the already-approved new filing under the remaining
+   checks. With absent or ambiguous confirmation, or an exact frozen-title identity hit, fail closed:
+   neither reuse nor create an issue, and preserve the finding run-locally. A re-run must never double-post the issue comment, error on "PR
    already exists", or file the same finding twice. The **ticketless ticket-creation offer**
    ([ticket-creation.md](ticket-creation.md)) is guarded on two levels: the same `gh issue list --repo
    <target> --state all --search "<Title>"` keyword dedup runs before its Phase 3 create; that
