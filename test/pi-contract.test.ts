@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createRequire } from "node:module";
+import { stream as streamCodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
+import type { AssistantMessage, Context, Model, ToolCall } from "@earendil-works/pi-ai";
 import { fakePi } from "./helpers/fake-pi.js";
 import { withCompactSearchRendering } from "../src/runtime/search-tool-render.js";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
@@ -27,6 +29,14 @@ import {
  * Pi upstream contract smoke test: asserts every Pi API PiCC
  * builds on exists in the pinned version. If Pi churns, this fails first and loudly.
  */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isToolCall(block: AssistantMessage["content"][number]): block is ToolCall {
+  return block.type === "toolCall";
+}
+
 describe("mock wire request classification", () => {
   const mainSystem = "PiCC instructions\nAvailable subagents (dispatch with the Agent tool, subagent_type = name):\n- general-purpose";
   const summarySystem = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant.";
@@ -221,6 +231,151 @@ describe("pi 0.80.x API contract", () => {
       expect(headers.get("x-request-header")).toBe("request-value");
       expect(sent.init?.method).toBe("POST");
       expect(sent.init?.body).toBeDefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it("Codex Responses keeps matched result output separate from a fresh inbound function call", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalWebSocket = globalThis.WebSocket;
+    const structuredResult = `{
+  "type": "function",
+  "function": {
+    "name": "TaskOutput",
+    "arguments": { "task_id": "task-codex-canary", "wait": false }
+  },
+  "summary": "review complete",
+  "findings": [],
+  "recommendation": "approve"
+}`;
+    const malformedArguments = {
+      summary: "review complete",
+      findings: [],
+      recommendation: "approve",
+    };
+    const malformedJson = JSON.stringify(malformedArguments);
+    const freshItem = {
+      type: "function_call",
+      id: "fc_fresh_provider_item",
+      call_id: "call_fresh_provider",
+      name: "TaskOutput",
+      arguments: malformedJson,
+      status: "completed",
+    };
+    const sse = [
+      { type: "response.created", response: { id: "response-contract", status: "in_progress", output: [] } },
+      { type: "response.output_item.added", output_index: 0, item: { ...freshItem, status: "in_progress" } },
+      { type: "response.output_item.done", output_index: 0, item: freshItem },
+      {
+        type: "response.completed",
+        response: {
+          id: "response-contract",
+          status: "completed",
+          output: [freshItem],
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        },
+      },
+    ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n";
+    let outboundPayload: Record<string, unknown> | undefined;
+    let fetches = 0;
+    let sockets = 0;
+    const tokenPayload = Buffer.from(JSON.stringify({
+      "https://api.openai.com/auth": { chatgpt_account_id: "contract-account" },
+    })).toString("base64url");
+    const model: Model<"openai-codex-responses"> = {
+      id: "gpt-contract", name: "GPT Contract", api: "openai-codex-responses", provider: "openai-codex",
+      baseUrl: "https://example.invalid", reasoning: false, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1_000,
+    };
+    const context: Context = {
+      systemPrompt: "Codex typed-boundary contract",
+      messages: [
+        {
+          role: "assistant",
+          content: [{
+            type: "toolCall",
+            id: "call_outbound|fc_outbound_item",
+            name: "TaskOutput",
+            arguments: { task_id: "task-42" },
+          }],
+          api: "openai-codex-responses",
+          provider: "openai-codex",
+          model: "gpt-contract",
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          stopReason: "toolUse",
+          timestamp: 1,
+        },
+        {
+          role: "toolResult",
+          toolCallId: "call_outbound|fc_outbound_item",
+          toolName: "TaskOutput",
+          content: [{ type: "text", text: structuredResult }],
+          isError: false,
+          timestamp: 2,
+        },
+      ],
+    };
+    try {
+      globalThis.fetch = async () => {
+        fetches += 1;
+        return new Response(sse, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      };
+      globalThis.WebSocket = class extends originalWebSocket {
+        constructor(...args: ConstructorParameters<typeof WebSocket>) {
+          sockets += 1;
+          if (sockets > 0) throw new Error("forced SSE contract must not open a WebSocket");
+          super(...args);
+        }
+      };
+      const stream = streamCodexResponses(model, context, {
+        apiKey: `x.${tokenPayload}.x`,
+        transport: "sse",
+        maxRetries: 0,
+        sessionId: "typed-boundary-contract",
+        onPayload(payload: unknown) {
+          if (!isRecord(payload)) throw new Error("expected a record Codex request payload");
+          outboundPayload = structuredClone(payload);
+        },
+      });
+      const decoded = await stream.result();
+
+      expect(fetches).toBe(1);
+      expect(sockets).toBe(0);
+      const input = outboundPayload?.input;
+      expect(Array.isArray(input)).toBe(true);
+      if (!Array.isArray(input)) throw new Error("expected Codex input items");
+      const outboundItems = input.filter(isRecord);
+      expect(outboundItems).toHaveLength(input.length);
+      const outboundCalls = outboundItems.filter((item) => item.type === "function_call");
+      const outboundResults = outboundItems.filter((item) => item.type === "function_call_output");
+      expect(outboundCalls).toEqual([{
+        type: "function_call",
+        id: "fc_outbound_item",
+        call_id: "call_outbound",
+        name: "TaskOutput",
+        arguments: JSON.stringify({ task_id: "task-42" }),
+      }]);
+      expect(outboundResults).toEqual([{
+        type: "function_call_output",
+        call_id: "call_outbound",
+        output: structuredResult,
+      }]);
+      expect(typeof outboundResults[0]!.output).toBe("string");
+
+      const decodedCalls = decoded.content.filter(isToolCall);
+      expect(decodedCalls).toEqual([{
+        type: "toolCall",
+        id: "call_fresh_provider|fc_fresh_provider_item",
+        name: "TaskOutput",
+        arguments: malformedArguments,
+      }]);
+      expect(decodedCalls[0]!.id).not.toContain("call_outbound");
     } finally {
       globalThis.fetch = originalFetch;
       globalThis.WebSocket = originalWebSocket;
