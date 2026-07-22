@@ -377,6 +377,8 @@ describe.skipIf(cliMissing)(
         expectStructuredTaskOutputResult(exchange!.result);
 
         expect(result.stdout).toContain("background retrieved");
+        // Print mode does not run TUI renderers, so TUI-only completion-record markers
+        // must not enter canonical print output.
         expect(result.stdout).not.toContain(RECORD_EXPAND_HINT);
         expect(result.stdout).not.toContain(RECORD_FORK_MARKER);
         expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|unhandledRejection|FATAL/i);
