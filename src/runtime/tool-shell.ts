@@ -165,7 +165,7 @@ function resultGeneration(ctx: unknown, owner: object): Generation {
 }
 
 /**
- * Set a specialized terminal outcome only while an inner renderer is synchronously being built.
+ * Set a specialized row outcome only while an inner renderer is synchronously being built.
  * The exact derived context is closure-branded; retained, cloned, stale, or foreign contexts fail closed.
  */
 export function setToolRowOutcome(context: unknown, outcome: ToolRowOutcome): boolean {
@@ -454,6 +454,7 @@ export function genericResultComponent(
       if (!output) return [];
       const lines: string[] = [];
       for (const segment of output.split("\n")) {
+        // Match Pi's Text.render order: it normalizes each tab to three spaces before wrapping.
         const tabbed = segment.replace(/\t/gu, "   ");
         for (const line of wrapTextWithAnsi(safeGenericStyle(theme, "toolOutput", tabbed), Math.max(1, width))) {
           lines.push(line);
