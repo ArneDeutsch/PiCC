@@ -134,8 +134,10 @@ path-independent issue-filing offer, on the ticketless path too. Phases 1, 8 and
    and **surface it to the user**. If the user explicitly confirms that it is equivalent, reuse it as
    the approved finding's durable tracking and echo its URL. If the user explicitly confirms that a
    plausible candidate is non-equivalent, continue the already-approved new filing under the remaining
-   checks. With absent or ambiguous confirmation, or an exact frozen-title identity hit, fail closed:
-   neither reuse nor create an issue, and preserve the finding run-locally. A re-run must never double-post the issue comment, error on "PR
+   checks. With absent or ambiguous confirmation, fail closed: neither reuse nor create an issue, and
+   preserve the finding run-locally. An exact frozen-title identity hit is never permission to create;
+   pending explicit equivalence confirmation it follows that same fail-closed branch, and after explicit
+   equivalence confirmation it follows the reuse branch above. A re-run must never double-post the issue comment, error on "PR
    already exists", or file the same finding twice. The **ticketless ticket-creation offer**
    ([ticket-creation.md](ticket-creation.md)) is guarded on two levels: the same `gh issue list --repo
    <target> --state all --search "<Title>"` keyword dedup runs before its Phase 3 create; that

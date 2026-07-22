@@ -1282,7 +1282,8 @@ describe("current-feature proportional review triage", () => {
     expect(rule9).toContain("surface it to the user");
     expect(rule9).toMatch(/if the user explicitly confirms that it is equivalent, reuse it as[^.]+durable tracking and echo its url/);
     expect(rule9).toMatch(/if the user explicitly confirms that a plausible candidate is non-equivalent, continue the already-approved new filing/);
-    expect(rule9).toMatch(/with absent or ambiguous confirmation, or an exact frozen-title identity hit, fail closed:[^.]+neither reuse nor create an issue/);
+    expect(rule9).toMatch(/with absent or ambiguous confirmation, fail closed:[^.]+neither reuse nor create an issue/);
+    expect(rule9).toMatch(/an exact frozen-title identity hit is never permission to create; pending explicit equivalence confirmation it follows that same fail-closed branch, and after explicit equivalence confirmation it follows the reuse branch above/);
     expect(rule9).not.toMatch(/absent or ambiguous confirmation[^.]+continue[^.]+filing/);
   });
 
@@ -1721,7 +1722,8 @@ describe("current-feature proportional review triage", () => {
     expect(mechanics).toContain("ask the user whether it is equivalent");
     expect(mechanics).toMatch(/confirmed equivalent → reuse it as[^.]+durable tracking and echo its url/);
     expect(mechanics).toMatch(/explicitly confirmed non-equivalent plausible candidate → continue the already-approved new filing/);
-    expect(mechanics).toMatch(/absent or ambiguous confirmation, or an exact frozen-title identity hit → fail closed:[^.]+neither reuse nor create an issue/);
+    expect(mechanics).toMatch(/absent or ambiguous confirmation → fail closed:[^.]+neither reuse nor create an issue/);
+    expect(mechanics).toMatch(/an exact frozen-title identity hit is never permission to create; pending explicit equivalence confirmation it follows that fail-closed branch, and after explicit equivalence confirmation it follows the reuse branch above/);
     expect(mechanics).toContain("preserve rule 9's anti-duplicate/idempotency checks");
   });
 
