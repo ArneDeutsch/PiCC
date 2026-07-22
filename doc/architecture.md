@@ -409,10 +409,11 @@ These are the choices where "close enough" breaks real projects.
   subagent e2e (which runs a real subprocess), not the settings-manager backstop.
 
 - **Verbatim subagent return.** A subagent's final message body is returned exactly as produced — no
-  summarizing, no wrapping. The one addition: a **resumable** dispatch appends a clearly-delimited
-  in-band identity/resume trailer to the model-visible text (Claude-faithful; the human TUI strips
-  it). A skill that parses the message directly — often a locked-YAML verdict block — must therefore
-  use a one-shot dispatch or account for the trailer.
+  summarizing, no wrapping. Eligible resumable results append clearly delimited identity framing
+  outside that body (the human TUI strips it), and settled `TaskOutput` retrieval may append compact
+  usage metadata outside the body. A strict JSON/YAML consumer must parse the body and account for
+  this documented surrounding metadata, or use a foreground one-shot dispatch when it needs no
+  resume framing; background consumers must still account for retrieval metadata.
 
 - **Subagent error contract.** Every dispatch is classified into exactly one outcome, and the
   classification — never a normal-looking success — is what reaches the coordinator:
