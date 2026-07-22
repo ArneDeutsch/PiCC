@@ -74,10 +74,14 @@ function makeHarness(opts: {
       };
     },
   } as unknown as Parameters<typeof createWorktreeTools>[0]["hookRunner"];
-  const tools = createWorktreeTools({ worktrees, cwdState, hookRunner }) as unknown as Tool[];
+  let universalStops = 0;
+  const tools = createWorktreeTools({
+    worktrees, cwdState, hookRunner,
+    captureUniversalStop: () => () => { universalStops += 1; return true; },
+  }) as unknown as Tool[];
   const enter = tools.find((t) => t.name === "EnterWorktree")!;
   const exit = tools.find((t) => t.name === "ExitWorktree")!;
-  return { calls, hookCalls, cwdState, enter, exit, wtPath, base };
+  return { calls, hookCalls, cwdState, enter, exit, wtPath, base, universalStops: () => universalStops };
 }
 
 function text(res: ToolResult): string {
@@ -138,6 +142,7 @@ describe("EnterWorktree tool: previous-worktree handling", () => {
     expect(text(res)).toContain("Created and entered");
     expect(text(res)).toContain("create policy stopped");
     expect(res.details).toMatchObject({ stoppedByHook: true, stopReason: "create policy stopped" });
+    expect(h.universalStops()).toBe(1);
   });
 });
 
@@ -200,6 +205,7 @@ describe("ExitWorktree tool: truthful reporting", () => {
     expect(text(res)).toContain("Exited and removed worktree");
     expect(text(res)).toContain("remove policy stopped");
     expect(res.details).toMatchObject({ stoppedByHook: true, stopReason: "remove policy stopped", removed: true });
+    expect(h.universalStops()).toBe(1);
   });
 
   it("keeps the orphaned wording for blocked-but-orphaned removals", async () => {

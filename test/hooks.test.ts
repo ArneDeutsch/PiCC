@@ -637,6 +637,7 @@ describe("HookRunner output contract", () => {
   it("scopes exit-2 blocking: SessionStart exit 2 degrades to a warning, not a block", async () => {
     const { runner } = makeRunner({
       SessionStart: [{ hooks: ["echo not-blockable-here >&2; exit 2"] }],
+      SubagentStart: [{ hooks: ["echo subagent-start-not-blockable >&2; exit 2"] }],
       Stop: [{ hooks: ["echo stop-me >&2; exit 2"] }],
     });
     const start = await runner.fire("SessionStart", { source: "startup" });
@@ -649,6 +650,10 @@ describe("HookRunner output contract", () => {
           d.message.includes("not-blockable-here"),
       ),
     ).toBe(true);
+
+    const subagentStart = await runner.fire("SubagentStart", { agent_type: "plugin:reviewer" });
+    expect(subagentStart.block).toBe(false);
+    expect(subagentStart.diagnostics.some((d) => d.message.includes("subagent-start-not-blockable"))).toBe(true);
 
     // Blockable events keep the exit-2 block contract.
     const stop = await runner.fire("Stop", {});

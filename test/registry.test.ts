@@ -359,19 +359,15 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(stop?.note).toContain("#15098");
   });
 
-  // Subagent hook payloads carry agent_id + agent_type; transcript_path stays MAIN
-  // (Claude Code parity — verified against src/runtime/subagents.ts fireSubagentStop).
-  it("documents SubagentStart/SubagentStop carrying agent_id/agent_type with transcript_path = MAIN", () => {
+  it("documents canonical SubagentStart/SubagentStop identity with transcript_path = MAIN", () => {
     for (const ev of ["SubagentStart", "SubagentStop"]) {
       const entry = lookupCapability(`hook.event.${ev}`);
       expect(entry?.tier, ev).toBe("full");
-      expect(entry?.note, ev).toContain("agent_id + agent_type");
+      expect(entry?.note, ev).toContain("agent_id + canonical agent_type");
+      expect(entry?.note, ev).toContain("<plugin>:<agent>");
       expect(entry?.note, ev).toContain("MAIN session transcript");
-      // The parity claim is softened re plugin agent_type — the note
-      // must state agent_type is the bare frontmatter name (no plugin-scoped id),
-      // so "full"/"parity" no longer rests on an unverified plugin assumption.
-      expect(entry?.note.toLowerCase(), ev).toContain("plugin");
     }
+    expect(lookupCapability("hook.event.SubagentStart")?.note).toContain("exit 2 is diagnostic and non-blocking");
   });
 
   // Notification stays a degraded no-op; the note must record that settlement does
@@ -1112,14 +1108,23 @@ describe("renderDoctorReport", () => {
     expect(doctor).toContain("subagents.enabled=false");
   });
 
-  it("echoes the resolved compaction knob values when a compaction config is supplied", () => {
+  it("reports active API truth with resolved compaction knob values", () => {
     const project = makeProject();
-    const doctor = renderDoctorReport(project, buildCompatReport(project), undefined, {
-      proactiveCompactPercent: 70,
-      clipMaxTokens: 5000,
-    });
-    expect(doctor).toContain("proactiveCompactPercent=70");
-    expect(doctor).toContain("clipMaxTokens=5000");
+    const config = { proactiveCompactPercent: 70, clipMaxTokens: 5000 };
+    const supported = renderDoctorReport(project, buildCompatReport(project), {
+      api: "openai-responses",
+    }, config);
+    expect(supported).toContain("proactive checkpointing active");
+    expect(supported).toContain("openai-responses");
+    expect(supported).toContain("proactiveCompactPercent=70");
+    expect(supported).toContain("clipMaxTokens=5000");
+
+    const unsupported = renderDoctorReport(project, buildCompatReport(project), {
+      api: "anthropic-messages",
+    }, config);
+    expect(unsupported).toContain("current model transport/API (anthropic-messages) is unsupported");
+    expect(unsupported).toContain("openai-completions, openai-responses, and openai-codex-responses");
+    expect(unsupported).toContain("switch to a model using one of them");
   });
 
   it("omits the compaction line when no compaction config is supplied", () => {

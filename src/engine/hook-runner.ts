@@ -45,8 +45,8 @@ const MATCHER_SUBJECT_KEYS: Readonly<Record<string, readonly string[]>> = {
   SessionStart: ["source"],
   PreCompact: ["trigger", "reason"],
   PostCompact: ["trigger"],
-  SubagentStart: ["subagent_type", "agent_type"],
-  SubagentStop: ["subagent_type", "agent_type"],
+  SubagentStart: ["agent_type", "subagent_type"],
+  SubagentStop: ["agent_type", "subagent_type"],
   SessionEnd: ["reason"],
 };
 
@@ -75,7 +75,6 @@ const EXIT2_BLOCKABLE_EVENTS: ReadonlySet<string> = new Set([
   "PostToolUseFailure",
   "UserPromptSubmit",
   "Stop",
-  "SubagentStart",
   "SubagentStop",
   "PreCompact",
 ]);

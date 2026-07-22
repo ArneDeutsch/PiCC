@@ -1,6 +1,7 @@
 /** Session-local coordination for proactive mid-run context checkpoints. */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { isProactiveCompactionApi } from "../registry/capability-registry.js";
 import { toolResultHasGuardClipping } from "./guard.js";
 
 export interface ContextUsageShape {
@@ -119,7 +120,7 @@ export interface ResumedRunOwnership {
   cancelAndJoin(kind: CancellationKind, context: ResumeContext): void | Promise<void>;
 }
 
-export type OrdinaryInputDisposition = "accept" | "quarantine" | "reject-recoverable" | "reject-restoration" | "reject-closed";
+export type OrdinaryInputDisposition = "accept" | "quarantine" | "reject-recoverable" | "reject-restoration" | "reject-closed" | "reject-stopped";
 export type ManualCompactionDisposition = "allow" | "already-active" | "unavailable";
 
 export interface CancellationOutcome {
@@ -796,12 +797,6 @@ export class MidRunCompactionController {
   }
 }
 
-const GUARDED_OPENAI_APIS = new Set([
-  "openai-completions",
-  "openai-responses",
-  "openai-codex-responses",
-]);
-
 interface MainGateContext {
   model?: { api?: string };
   mode?: string;
@@ -883,8 +878,17 @@ export class MainSessionCheckpointGate {
   private acceptedBeforeArm: ExpectedInput[] = [];
   private ambiguousInput = false;
   private sessionEpoch: object = {};
+  /** Opaque identity of the user-visible logical run; physical checkpoint runs retain it. */
+  private logicalRunIdentity: object = {};
   private transition: Promise<void> = Promise.resolve();
   private resumeBarrier: { generation: number; promise: Promise<void> } | undefined;
+  private logicalRunStop: {
+    controller: MidRunCompactionController;
+    epoch: object;
+    generation: number;
+    run: object;
+    join: Promise<void>;
+  } | undefined;
 
   constructor(sessionId: string, private readonly threshold: number) {
     this.controller = this.createController(sessionId);
@@ -896,6 +900,56 @@ export class MainSessionCheckpointGate {
 
   currentController(): MidRunCompactionController {
     return this.controller;
+  }
+
+  /** Capture opaque authority for the current controller generation and logical run. */
+  captureLogicalRunStop(): () => boolean {
+    const controller = this.controller;
+    const epoch = this.sessionEpoch;
+    const generation = controller.snapshot().generation;
+    const run = this.logicalRunIdentity;
+    return () => {
+      if (controller !== this.controller || epoch !== this.sessionEpoch || run !== this.logicalRunIdentity ||
+          generation !== controller.snapshot().generation || this.logicalRunStop) return false;
+      // Publish the latch before cancellation can re-enter lifecycle handlers. Hook
+      // call sites must unwind immediately; agent_settled owns the eventual join.
+      const stopped = { controller, epoch, generation, run, join: Promise.resolve() };
+      this.logicalRunStop = stopped;
+      const join = this.cancelCurrent("replacement");
+      stopped.join = join;
+      this.transition = join.catch(() => undefined);
+      return true;
+    };
+  }
+
+  /** Rotate authority when a genuine user input has been accepted as the next run. */
+  acceptedLogicalRun(): void {
+    this.logicalRunIdentity = {};
+  }
+
+  /** Revoke run-scoped authority only at a true user-visible settlement. */
+  logicalRunSettled(): void {
+    this.logicalRunIdentity = {};
+  }
+
+  isLogicalRunStopped(): boolean {
+    return this.logicalRunStop !== undefined;
+  }
+
+  stoppedRunMatches(controller: MidRunCompactionController, generation: number): boolean {
+    const stopped = this.logicalRunStop;
+    return stopped?.controller === controller && stopped.epoch === this.sessionEpoch &&
+      stopped.run === this.logicalRunIdentity && stopped.generation === generation;
+  }
+
+  /** Join and consume a stop only from the host agent_settled boundary. */
+  async settleLogicalRunStop(): Promise<boolean> {
+    const stopped = this.logicalRunStop;
+    if (!stopped) return false;
+    await stopped.join;
+    if (this.logicalRunStop !== stopped) return false;
+    this.resetStoppedLogicalRun();
+    return true;
   }
 
   async beforeSessionSwitch(): Promise<{ cancel: true } | undefined> {
@@ -960,6 +1014,10 @@ export class MainSessionCheckpointGate {
     } catch {
       pending = true;
     }
+    if (this.logicalRunStop) {
+      this.abortAfterBatch(ctx);
+      return undefined;
+    }
     if (this.batch.ids.length === 0 && !pending) return undefined;
     this.arm(ctx);
     if (this.generation === undefined) return undefined;
@@ -984,6 +1042,10 @@ export class MainSessionCheckpointGate {
   }
 
   async defensiveLatch(ctx: MainGateContext): Promise<void> {
+    if (this.logicalRunStop) {
+      this.abortAfterBatch(ctx);
+      return;
+    }
     const generation = this.generation;
     if (generation === undefined || this.controller.isCompactionSummaryActive(generation)) return;
     const snapshot = this.controller.snapshot();
@@ -1023,6 +1085,7 @@ export class MainSessionCheckpointGate {
   }
 
   settlementGeneration(ctx: MainGateContext): number | undefined {
+    if (this.logicalRunStop) return undefined;
     this.resetCompletedGeneration();
     if (this.generation !== undefined) {
       return this.controller.snapshot().phase === "awaiting-settlement" ? this.generation : undefined;
@@ -1039,7 +1102,7 @@ export class MainSessionCheckpointGate {
   }
 
   ordinaryInputDisposition(): OrdinaryInputDisposition {
-    return this.controller.ordinaryInputDisposition();
+    return this.logicalRunStop ? "reject-stopped" : this.controller.ordinaryInputDisposition();
   }
 
   async cancel(kind: CancellationKind): Promise<CancellationOutcome> {
@@ -1056,7 +1119,8 @@ export class MainSessionCheckpointGate {
 
   withReplayAuthorization<T>(input: QueuedInputShadow, operation: () => T, source = "extension"): T {
     const current = this.controller.queuedInputSnapshot().find((entry) => entry === input);
-    if (!current || input.sessionId !== this.controller.sessionId || input.generation !== this.generation) {
+    if (this.controller.snapshot().phase !== "resuming" || !current ||
+        input.sessionId !== this.controller.sessionId || input.generation !== this.generation) {
       throw new Error("Cannot authorize stale checkpoint replay");
     }
     return replayAuthorization.run({
@@ -1080,7 +1144,7 @@ export class MainSessionCheckpointGate {
     const authorization = replayAuthorization.getStore();
     const phase = this.controller.snapshot().phase;
     if (!authorization || authorization.used || authorization.gate !== this.sessionEpoch ||
-        phase === "cancelled" || phase === "exhausted" ||
+        phase !== "resuming" ||
         authorization.sessionId !== this.controller.sessionId || authorization.generation !== this.generation ||
         event.source !== authorization.source || event.streamingBehavior !== authorization.mode ||
         canonical(acceptedContent(String(event.text ?? ""), event.images)) !== authorization.canonical ||
@@ -1095,7 +1159,7 @@ export class MainSessionCheckpointGate {
     images: readonly unknown[] | undefined,
     delivery: QueueDeliveryMode | undefined,
   ): QueuedInputShadow | undefined {
-    if (!GUARDED_OPENAI_APIS.has(ctx.model?.api ?? "")) return undefined;
+    if (!isProactiveCompactionApi(ctx.model?.api)) return undefined;
     const content = acceptedContent(text, images);
     this.arm(ctx);
     const effectiveDelivery = delivery ?? (this.generation === undefined ? undefined : "followUp");
@@ -1152,7 +1216,7 @@ export class MainSessionCheckpointGate {
 
   private arm(ctx: MainGateContext): void {
     this.resetCompletedGeneration();
-    if (this.generation !== undefined || !GUARDED_OPENAI_APIS.has(ctx.model?.api ?? "")) return;
+    if (this.logicalRunStop || this.generation !== undefined || !isProactiveCompactionApi(ctx.model?.api)) return;
     let usage: ContextUsageShape | undefined;
     try {
       usage = ctx.getContextUsage?.();
@@ -1236,7 +1300,16 @@ export class MainSessionCheckpointGate {
     if (snapshot.phase !== "idle") await this.controller.cancel(snapshot.generation, kind);
   }
 
+  private resetStoppedLogicalRun(): void {
+    const sessionId = this.controller.sessionId;
+    this.controller = this.createController(sessionId);
+    this.logicalRunStop = undefined;
+    this.invalidateSessionState();
+  }
+
   private invalidateSessionState(): void {
+    this.logicalRunStop = undefined;
+    this.logicalRunIdentity = {};
     this.generation = undefined;
     this.handle = undefined;
     this.batch = { run: {}, ids: [], final: new Map(), successful: new Map() };

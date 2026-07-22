@@ -500,11 +500,20 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           const claudeDir = path.join(fixtureDir, ".claude");
           writeCheckpointConfig(fixtureDir);
           fs.writeFileSync(path.join(claudeDir, "settings.json"), JSON.stringify({ permissions: { deny: ["Write(blocked.txt)"] } }));
+          const extensionsDir = path.join(fixtureDir, ".pi", "extensions");
+          fs.mkdirSync(extensionsDir, { recursive: true });
+          fs.writeFileSync(path.join(extensionsDir, "throwing-sibling.ts"), [
+            'import { Type } from "typebox";',
+            "export default function throwingSibling(pi: any) {",
+            "  pi.registerTool({ name: 'ThrowingSibling', label: 'ThrowingSibling', description: 'throws for fallback coverage', parameters: Type.Object({}), execute: async () => { throw new Error('real throwing sibling'); } });",
+            "}",
+          ].join("\n"));
         },
         script: [
           { toolCalls: [
             { name: "write", args: { path: "fallback-sibling.txt", content: "completed sibling" } },
             { name: "write", args: { path: "blocked.txt", content: "must not land" } },
+            { name: "ThrowingSibling", args: {} },
             { name: "not_a_registered_tool", args: { malformed: true } },
           ], usage: CHECKPOINT_USAGE },
           { text: "FALLBACK_PERMISSION_INVALID_SUMMARY_T05" },
@@ -520,6 +529,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       const summaryInput = allText(result.requests[1]!);
       expect(summaryInput).toContain("Successfully wrote");
       expect(summaryInput).toMatch(/blocked|denied/i);
+      expect(summaryInput).toMatch(/real throwing sibling/i);
       expect(summaryInput).toMatch(/not_a_registered_tool|not found|unknown/i);
       expect(result.stdout.match(/FALLBACK_PERMISSION_INVALID_FINAL_T05/g)).toHaveLength(1);
     },

@@ -62,8 +62,8 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
   bridge), auto memory, and `.claude/rules/`.
 - **Settings & permissions** — `settings.json` precedence and merge semantics, with `deny` rules
   as a hard block.
-- **Compaction resilience** — proactive checkpointing and preservation: project instructions and
-  rules are rebuilt, while latest active skills are restored within PiCC's heuristic character budget.
+- **Compaction resilience** — proactive checkpointing on supported model transports, with
+  instruction preservation and bounded recovery; see the [user guide](doc/user-guide.md).
 - **Plugins** — content from already-installed plugins and project-bundled `.claude-plugin/`.
 - **Images & notebooks** — `Read` delivers image files and cell-aware `.ipynb` output (plots
   included) as real image blocks on a vision-capable model, degrading to a text placeholder on a

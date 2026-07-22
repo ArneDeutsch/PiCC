@@ -22,6 +22,7 @@ interface ChildHarness {
   sessionCreations(): number;
   disposed(): boolean;
   aborted(): boolean;
+  abortCalls(): number;
   recoveryCompactStarted(): Promise<void>;
   releaseRecoveryCompact(): void;
   resumeCalls(): number;
@@ -40,6 +41,7 @@ interface CheckpointSdkOptions {
   activateSkill?: boolean;
   reExhaustWithRestorationFailure?: boolean;
   replayReject?: boolean;
+  resumedToolHook?: boolean;
 }
 
 function checkpointSdk({
@@ -51,12 +53,14 @@ function checkpointSdk({
   activateSkill = false,
   reExhaustWithRestorationFailure = false,
   replayReject = false,
+  resumedToolHook = false,
 }: CheckpointSdkOptions): ChildHarness {
   const base = fakeSdk().sdk;
   let compactions = 0;
   let creations = 0;
   let disposed = false;
   let aborted = false;
+  let abortCalls = 0;
   let resumeCalls = 0;
   const events: string[] = [];
   const customMessages: Array<{ customType: string; content: unknown }> = [];
@@ -91,6 +95,9 @@ function checkpointSdk({
           childRegistry.registerProvider(name, config);
           providerRegistrations.push({ name, config });
         },
+        sendMessage(message: { customType: string; content: unknown }) {
+          customMessages.push({ customType: message.customType, content: message.content });
+        },
       };
       for (const entry of loader.options.extensionFactories as Array<{
         factory(pi: typeof extensionPi): unknown;
@@ -112,6 +119,7 @@ function checkpointSdk({
         hasPendingMessages: () => false,
         abort: () => {
           aborted = true;
+          abortCalls += 1;
           if (resumed) activeResumeAborted = true;
         },
       };
@@ -120,6 +128,16 @@ function checkpointSdk({
       const runResumed = async (): Promise<void> => {
         await emit("turn_start", {}, ctx);
         await emit("before_provider_request", {}, ctx);
+        if (activateSkill) {
+          await emit("tool_call", {
+            toolName: "read", toolCallId: "post-compact-touch", input: { path: "sub/note.txt" },
+          }, ctx);
+        }
+        if (resumedToolHook) {
+          await emit("tool_call", {
+            toolName: "CheckpointTool", toolCallId: "resumed-hook", input: {},
+          }, ctx);
+        }
         if (activeResumeAborted) {
           await emit("agent_settled", {}, ctx);
           return;
@@ -192,6 +210,9 @@ function checkpointSdk({
             guardResults.push(...await emit("tool_call", {
               toolName: "bash", toolCallId: "hook-check", input: { command: "echo child" },
             }, ctx));
+            await emit("tool_call", {
+              toolName: "read", toolCallId: "pre-compact-touch", input: { path: "sub/note.txt" },
+            }, ctx);
           }
           await emit("turn_end", {}, ctx);
           await emit("agent_settled", {}, ctx);
@@ -244,6 +265,7 @@ function checkpointSdk({
         followUp() {},
         abort() {
           aborted = true;
+          abortCalls += 1;
           if (resumed) activeResumeAborted = true;
         },
         abortCompaction() { releaseRecoveryCompact(); },
@@ -260,6 +282,7 @@ function checkpointSdk({
     sessionCreations: () => creations,
     disposed: () => disposed,
     aborted: () => aborted,
+    abortCalls: () => abortCalls,
     recoveryCompactStarted: () => recoveryCompactStarted,
     releaseRecoveryCompact: () => releaseRecoveryCompact(),
     resumeCalls: () => resumeCalls,
@@ -276,9 +299,20 @@ function runtimeFor(
   subagentRegistry?: SubagentRegistry,
   failPostCompactAttempt?: number,
   customHookRunner?: { fire(eventName: string): Promise<any> },
+  capturedStopFactories?: Array<() => () => boolean>,
+  enableResume = false,
 ) {
   let postCompactAttempts = 0;
-  return makeSubagentRuntime([agent], harness.sdk, {
+  const transcriptPath = path.join(process.cwd(), "package.json");
+  const sdk = enableResume
+    ? {
+        ...harness.sdk,
+        persistedSessionManager: () => ({ getSessionFile: () => transcriptPath }),
+        reopenSessionManager: () => ({ getSessionFile: () => transcriptPath }),
+      }
+    : harness.sdk;
+  return makeSubagentRuntime([agent], sdk, {
+    ...(enableResume ? { getMainSessionFile: () => transcriptPath } : {}),
     proactiveCompactPercent: 90,
     allKnownToolNames: () => ["CheckpointTool"],
     subagentRegistry,
@@ -288,7 +322,9 @@ function runtimeFor(
         return { block, blockReason: block ? "restoration rejected" : undefined, askDowngraded: false, diagnostics: [] };
       },
     }),
-    customToolsFor: () => [
+    customToolsFor: (_agent, _granted, _depth, _owner, _fork, _cwd, _activation, captureStop) => {
+      if (captureStop && capturedStopFactories) capturedStopFactories.push(captureStop);
+      return [
       {
         name: "CheckpointTool",
         async execute() { return { content: [{ type: "text", text: "tool complete" }] }; },
@@ -305,7 +341,8 @@ function runtimeFor(
         name: "MalformedTool",
         async execute() { return { malformed: true }; },
       },
-    ],
+    ];
+    },
   });
 }
 
@@ -397,6 +434,23 @@ describe("subagent mid-run compaction", () => {
     ]));
   });
 
+  it("unwinds a resumed child PreToolUse universal stop before deferred cancellation join", async () => {
+    const harness = checkpointSdk({ failures: 0, resumedToolHook: true });
+    const hooks = {
+      async fire(eventName: string) {
+        return eventName === "PreToolUse"
+          ? { stop: true, stopReason: "resumed child stopped", block: false, askDowngraded: false, diagnostics: [] }
+          : { block: false, askDowngraded: false, diagnostics: [] };
+      },
+    };
+    const result = await runtimeFor(harness, makeAgent(), undefined, undefined, hooks).dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1,
+    });
+    expect(result.outcome).toBe("aborted");
+    expect(result.error).toContain("universal hook");
+    expect(harness.events()).not.toContain("resumed-provider");
+  });
+
   it("preserves child-local Skill activation through real extension tool assembly and compaction", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-child-skill-"));
     const priorCwd = process.cwd();
@@ -408,6 +462,8 @@ describe("subagent mid-run compaction", () => {
     };
     const hookLog = path.join(dir, "hook.json");
     write("CLAUDE.md", "parent instructions\n");
+    write("sub/CLAUDE.md", "CHILD-NESTED-INSTRUCTIONS\n");
+    write("sub/note.txt", "touch\n");
     write(".claude/agents/reviewer.md", "---\ndescription: reviewer\ntools: Skill, WebFetch, Bash\n---\nreview\n");
     write("hook.mjs", `import fs from "node:fs";let s="";for await(const c of process.stdin)s+=c;fs.writeFileSync(${JSON.stringify(hookLog)},s);`);
     write(".claude/settings.json", JSON.stringify({ env: {
@@ -444,6 +500,9 @@ describe("subagent mid-run compaction", () => {
       expect(child.outcome).toBe("completed");
       expect(harness.customMessages().find((message) => message.customType === "picc-preserved")?.content)
         .toContain("CHILD-SKILL-BODY example.com");
+      expect(harness.customMessages().filter((message) =>
+        message.customType === "picc-context" && String(message.content).includes("CHILD-NESTED-INSTRUCTIONS"),
+      )).toHaveLength(2);
       expect(harness.guardResults().some((result: any) => result?.block === true)).toBe(true);
       const hookPayload = JSON.parse(fs.readFileSync(hookLog, "utf8"));
       expect(hookPayload).toMatchObject({ agent_id: child.agentId, agent_type: "reviewer", cwd: dir });
@@ -573,6 +632,92 @@ describe("subagent mid-run compaction", () => {
     expect(registry.get(exhausted.agentId)?.state).toBe("settled");
   });
 
+  it("revokes the original paused generation after SendMessage recovery cleanup", async () => {
+    const harness = checkpointSdk({ failures: 3 });
+    const registry = new SubagentRegistry();
+    const stopFactories: Array<() => () => boolean> = [];
+    const runtime = runtimeFor(harness, makeAgent(), registry, undefined, undefined, stopFactories);
+    const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
+    const oldAuthority = stopFactories[0]!();
+    const send = createSendMessageToolDefinition(runtime, {
+      registry,
+      backgroundTasks: new BackgroundTaskRegistry(),
+    });
+
+    const recovered = await (send.execute as Function)("send", {
+      to: exhausted.agentId,
+      message: "finish retained recovery",
+    });
+    expect(recovered.details.outcome).toBe("completed");
+
+    const later = await runtime.dispatch({ subagentType: "reviewer", prompt: "later run", depth: 1 });
+    const abortsBeforeLateStop = harness.abortCalls();
+    expect(oldAuthority()).toBe(false);
+    expect(harness.abortCalls()).toBe(abortsBeforeLateStop);
+    expect(later.outcome).toBe("completed");
+    expect(stopFactories).toHaveLength(2);
+  });
+
+  it("scopes SendMessage resume authority to each active generation until true settlement", async () => {
+    const harness = checkpointSdk({ failures: 0 });
+    const registry = new SubagentRegistry();
+    const stopFactories: Array<() => () => boolean> = [];
+    let initialAuthority!: () => boolean;
+    let settledResumeAuthority!: () => boolean;
+    let activeResumeAuthority!: () => boolean;
+    let stopCount = 0;
+    let enterSecond!: () => void;
+    let releaseSecond!: () => void;
+    let enterThird!: () => void;
+    let releaseThird!: () => void;
+    const secondEntered = new Promise<void>((resolve) => { enterSecond = resolve; });
+    const secondRelease = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const thirdEntered = new Promise<void>((resolve) => { enterThird = resolve; });
+    const thirdRelease = new Promise<void>((resolve) => { releaseThird = resolve; });
+    const hooks = {
+      async fire(eventName: string) {
+        if (eventName === "SubagentStop") {
+          stopCount += 1;
+          if (stopCount === 1) {
+            initialAuthority = stopFactories[0]!();
+          } else if (stopCount === 2) {
+            settledResumeAuthority = stopFactories[1]!();
+            enterSecond();
+            await secondRelease;
+          } else if (stopCount === 3) {
+            activeResumeAuthority = stopFactories[2]!();
+            enterThird();
+            await thirdRelease;
+          }
+        }
+        return { block: false, askDowngraded: false, diagnostics: [] };
+      },
+    };
+    const runtime = runtimeFor(harness, makeAgent(), registry, undefined, hooks, stopFactories, true);
+    const initial = await runtime.dispatch({ subagentType: "reviewer", prompt: "initial", depth: 1 });
+    const background = new BackgroundTaskRegistry();
+    const send = createSendMessageToolDefinition(runtime, { registry, backgroundTasks: background });
+
+    const firstResume = await (send.execute as Function)("send-1", {
+      to: initial.agentId,
+      message: "first resumed generation",
+    });
+    await secondEntered;
+    releaseSecond();
+    await background.wait(firstResume.details.taskId);
+    expect(initialAuthority()).toBe(false);
+    expect(settledResumeAuthority()).toBe(false);
+
+    const secondResume = await (send.execute as Function)("send-2", {
+      to: initial.agentId,
+      message: "second resumed generation",
+    });
+    await thirdEntered;
+    expect(activeResumeAuthority()).toBe(true);
+    releaseThird();
+    await background.wait(secondResume.details.taskId);
+  });
+
   it.each(["before", "after"] as const)(
     "closes recovery when sendCustomMessage rejects %s turn_start after commit",
     async (when) => {
@@ -672,6 +817,25 @@ describe("subagent mid-run compaction", () => {
     expect(harness.aborted()).toBe(true);
     expect(harness.disposed()).toBe(true);
     expect(registry.get(exhausted.agentId)?.state).toBe("settled");
+  });
+
+  it("revokes the original paused generation after TaskStop abandonment cleanup", async () => {
+    const harness = checkpointSdk({ failures: 3 });
+    const registry = new SubagentRegistry();
+    const stopFactories: Array<() => () => boolean> = [];
+    const runtime = runtimeFor(harness, makeAgent(), registry, undefined, undefined, stopFactories);
+    const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
+    const oldAuthority = stopFactories[0]!();
+
+    await (createTaskStopTool(new BackgroundTaskRegistry(), registry).execute as Function)("stop", {
+      task_id: exhausted.agentId,
+    });
+    const later = await runtime.dispatch({ subagentType: "reviewer", prompt: "replacement run", depth: 1 });
+    const abortsBeforeLateStop = harness.abortCalls();
+    expect(oldAuthority()).toBe(false);
+    expect(harness.abortCalls()).toBe(abortsBeforeLateStop);
+    expect(later.outcome).toBe("completed");
+    expect(stopFactories).toHaveLength(2);
   });
 
   it("TaskStop during manual recovery joins it and forbids a late continuation", async () => {

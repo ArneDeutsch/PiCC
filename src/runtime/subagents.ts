@@ -106,6 +106,7 @@ export interface SubagentRuntimeDeps {
     dispatcherIsFork: boolean,
     subCwd: CwdState | undefined,
     activation: SkillActivationState,
+    captureUniversalStop?: () => () => boolean,
   ) => unknown[];
   /** All Claude tool names the harness knows (for gateTools' allKnown). */
   allKnownToolNames: () => string[];
@@ -144,7 +145,10 @@ export interface SubagentRuntimeDeps {
    * state. Sharing the parent's injector would let a subagent's file touches consume
    * the orchestrator's one-shot nested-CLAUDE.md/path-rule injections (and vice versa).
    */
-  makeContextInjector?: (getCwd: () => string) => (filePath: string) => string | undefined;
+  makeContextInjector?: (getCwd: () => string) => {
+    inject: (filePath: string) => string | undefined;
+    reset: () => void;
+  };
   /** Legacy shared injector — used only when makeContextInjector is absent. */
   contextForTouchedFile?: (filePath: string) => string | undefined;
   /** Resolve "provider/model" (or undefined) to a Pi Model object, or undefined to inherit. */
@@ -595,6 +599,7 @@ class ChildCheckpointCoordinator {
   private hookBlocked = false;
   private restorationFailed = false;
   private manualRecovery = false;
+  private stoppedRunSettled = false;
   private compactOperation: {
     controller: import("./mid-run-compaction.js").MidRunCompactionController;
     generation: number;
@@ -623,6 +628,7 @@ class ChildCheckpointCoordinator {
     sessionId: string,
     threshold: number,
     private readonly agentName: string,
+    private readonly hookAgentType: string,
     private readonly agentId: string,
     private readonly cwd: CwdState,
     hooks: HookRunnerLike,
@@ -632,7 +638,7 @@ class ChildCheckpointCoordinator {
     const identityWrap = (runner: HookRunnerLike): HookRunnerLike => ({
       fire: (eventName, payload, toolCall) => runner.fire(
         eventName,
-        { ...payload, agent_id: agentId, agent_type: agentName },
+        { ...payload, agent_id: agentId, agent_type: this.hookAgentType },
         toolCall,
       ),
     });
@@ -646,8 +652,14 @@ class ChildCheckpointCoordinator {
     });
   }
 
+  private resetContextInjection: (() => void) | undefined;
+
   attach(session: PiSession): void {
     this.session = session;
+  }
+
+  attachContextReset(reset: (() => void) | undefined): void {
+    this.resetContextInjection = reset;
   }
 
   wrapTools(tools: unknown[]): unknown[] {
@@ -701,6 +713,12 @@ class ChildCheckpointCoordinator {
     const controller = this.gate.currentController();
     const snapshot = controller.snapshot();
     await controller.stableBarrier(snapshot.generation);
+  }
+
+  consumeStoppedRun(): boolean {
+    const stopped = this.stoppedRunSettled;
+    this.stoppedRunSettled = false;
+    return stopped;
   }
 
   exhausted(): boolean {
@@ -849,6 +867,19 @@ class ChildCheckpointCoordinator {
   private async settled(ctx: any): Promise<void> {
     const controller = this.gate.currentController();
     const resume = this.activeResume;
+    if (this.gate.isLogicalRunStopped()) {
+      this.stoppedRunSettled = true;
+      if (resume && this.gate.stoppedRunMatches(controller, controller.snapshot().generation) &&
+          resume.generation === controller.snapshot().generation) {
+        // The SDK run may not resolve until this handler returns. Signal only the
+        // settlement capability here; cancellation joins in the background and
+        // dispatch classification waits on the controller's stable barrier.
+        resume.agentSettled = true;
+        resume.settled.resolve();
+      }
+      void this.gate.settleLogicalRunStop().catch(() => undefined);
+      return;
+    }
     if (resume && resume.generation === controller.snapshot().generation &&
         controller.snapshot().phase === "resuming") {
       resume.agentSettled = true;
@@ -982,22 +1013,23 @@ class ChildCheckpointCoordinator {
     const controller = this.gate.currentController();
     const generation = controller.snapshot().generation;
     const proactive = controller.isCompactionSummaryActive(generation);
-    if ((!proactive && !this.manualRecovery) || this.compactOperation) return { cancel: true };
-    const operation = {
-      controller, generation, proactive,
-      trigger: (proactive ? "auto" : "manual") as "auto" | "manual",
-    };
+    const trigger = proactive ? "auto" : event?.reason === "manual" ? "manual" : "auto";
+    if ((!proactive && trigger === "manual" && !this.manualRecovery) || this.compactOperation) return { cancel: true };
+    const operation = { controller, generation, proactive, trigger } as const;
     this.compactOperation = operation;
     const isCurrent = () => this.compactOperation === operation &&
       this.gate.currentController() === controller && controller.snapshot().generation === generation &&
-      (proactive ? controller.isCompactionSummaryActive(generation) : this.manualRecovery);
+      (proactive ? controller.isCompactionSummaryActive(generation) :
+        operation.trigger === "auto" ? controller.snapshot().phase === "idle" : this.manualRecovery);
+    const stopRun = this.gate.captureLogicalRunStop();
     const outcome = await this.hooks.fire("PreCompact", {
       trigger: operation.trigger,
       custom_instructions: String(event?.customInstructions ?? ""),
       cwd: this.cwd.get(),
     }).catch(() => undefined);
     if (!isCurrent() || !outcome || outcome.block || outcome.stop) {
-      if (isCurrent()) this.hookBlocked = true;
+      if (isCurrent() && outcome?.stop) stopRun();
+      if (isCurrent() && !outcome?.stop) this.hookBlocked = true;
       if (this.compactOperation === operation) this.compactOperation = undefined;
       return { cancel: true };
     }
@@ -1013,7 +1045,9 @@ class ChildCheckpointCoordinator {
       operation.controller.snapshot().generation === operation.generation &&
       (operation.proactive
         ? operation.controller.isCompactionSummaryActive(operation.generation)
-        : this.manualRecovery);
+        : operation.trigger === "auto"
+          ? operation.controller.snapshot().phase === "idle"
+          : this.manualRecovery);
     if (!isCurrent()) return;
     try {
       let universalStop = false;
@@ -1060,6 +1094,15 @@ class ChildCheckpointCoordinator {
         this.restorationFailed = true;
       }
       if (!isCurrent()) return;
+      if (!universalStop) {
+        try {
+          if (!isCurrent()) return;
+          this.resetContextInjection?.();
+        } catch {
+          this.restorationFailed = true;
+        }
+      }
+      if (!isCurrent()) return;
       const preserved = budgetSkillReinjection([...this.activation.activeSkills.entries()]);
       if (!universalStop && preserved.text) {
         try {
@@ -1076,11 +1119,16 @@ class ChildCheckpointCoordinator {
         }
       }
     } finally {
+      if (!operation.proactive && operation.trigger === "auto" && this.restorationFailed && isCurrent()) {
+        await operation.controller.failAfterCommittedSummary(operation.generation);
+      }
       if (this.compactOperation === operation) this.compactOperation = undefined;
     }
   }
 
   private progress(event: CheckpointProgress): void {
+    const controller = this.gate.currentController();
+    if (this.gate.isLogicalRunStopped() && this.gate.stoppedRunMatches(controller, event.generation)) return;
     const activity = event.category === "checkpoint-retrying"
       ? `checkpoint retry ${Math.min((event.attempt ?? 1) + 1, 3)}/3`
       : event.category === "checkpoint-exhausted"
@@ -1297,6 +1345,8 @@ export class SubagentRuntime {
      * Requires the session to expose `subscribe`; a no-op when it does not.
      */
     onProgress?: (snapshot: ProgressSnapshot) => void;
+    /** Opaque dispatcher-run stop authority captured before the Agent tool awaits. */
+    captureUniversalStop?: () => boolean;
     /**
      * Resume a finished subagent (SendMessage). When set, dispatch takes the
      * SAME construction path (gated tools, guard, scoped hooks, system prompt +
@@ -1686,13 +1736,14 @@ export class SubagentRuntime {
     // runner. transcript_path is deliberately NOT injected — parity: subagent
     // hook events keep the MAIN session transcript_path (the runner's own
     // constructed default), never the subagent's own file.
+    const hookAgentType = agent.name;
     const injectIdentity = (runner: HookRunnerLike): HookRunnerLike => ({
       fire: (
         eventName: string,
         payload: Partial<HookPayload>,
         toolCall?: ToolCallDescriptor,
       ): Promise<HookOutcome> =>
-        runner.fire(eventName, { ...payload, agent_id: agentId, agent_type: agent.name }, toolCall),
+        runner.fire(eventName, { ...payload, agent_id: agentId, agent_type: hookAgentType }, toolCall),
     });
     const baseRunner = injectIdentity(this.deps.hookRunner);
     if (scopedHooks) scopedHooks = injectIdentity(scopedHooks);
@@ -1714,7 +1765,9 @@ export class SubagentRuntime {
       if (scopedHooks) {
         outcomes.push(await scopedHooks.fire("Stop", payload).catch(() => undefined));
       }
-      return mergeHookOutcomes(outcomes);
+      const outcome = mergeHookOutcomes(outcomes);
+      if (outcome.stop) opts.captureUniversalStop?.();
+      return outcome;
     };
 
     // Concurrency gate. Two nested-deadlock hazards, handled distinctly:
@@ -1753,6 +1806,13 @@ export class SubagentRuntime {
     let capturedUsage: DispatchUsage | undefined;
     let settledOutcome: DispatchOutcome | undefined;
     let checkpointPaused = false;
+    let dispatchCheckpointGate: MainSessionCheckpointGate | undefined;
+    let dispatchAuthoritySettled = false;
+    const settleDispatchAuthority = () => {
+      if (dispatchAuthoritySettled) return;
+      dispatchAuthoritySettled = true;
+      dispatchCheckpointGate?.logicalRunSettled();
+    };
     // The final answer text for the registry record (panel drill-down): the
     // completed final message, or a failed run's best-effort partial. Aborted
     // runs leave it unset — a deliberately stopped result is discarded by
@@ -1802,6 +1862,7 @@ export class SubagentRuntime {
         })
         .catch(() => undefined);
       if (startOutcome?.stop) {
+        opts.captureUniversalStop?.();
         const reason = startOutcome.stopReason ?? "SubagentStart hook requested stop";
         diagnostics.push({ severity: "warning", message: reason });
         settledOutcome = "aborted";
@@ -1927,6 +1988,7 @@ export class SubagentRuntime {
         `${this.deps.sessionId}:${agentId}`,
         this.deps.proactiveCompactPercent ?? 90,
         agent.name,
+        hookAgentType,
         agentId,
         subCwd,
         hookRunner,
@@ -1936,6 +1998,7 @@ export class SubagentRuntime {
           opts.onProgress?.(snapshot);
         },
       );
+      dispatchCheckpointGate = checkpoint.gate;
       hookRunner = checkpoint.hookFacade(hookRunner);
 
       const granted = this.deps.permissionEngine.gateTools(
@@ -1961,6 +2024,7 @@ export class SubagentRuntime {
         isFork,
         subCwd,
         checkpoint.activation,
+        () => checkpoint.gate.captureLogicalRunStop(),
       );
 
       const sdk = await this.sdk();
@@ -1994,9 +2058,9 @@ export class SubagentRuntime {
         if (grantedPiBuiltins.has(builtin.name)) customTools.push(builtin.def);
       }
       customTools = checkpoint.wrapTools(customTools) as unknown[];
-      const injector = this.deps.makeContextInjector
-        ? this.deps.makeContextInjector(() => subCwd.get())
-        : this.deps.contextForTouchedFile;
+      const contextInjection = this.deps.makeContextInjector?.(() => subCwd.get());
+      const injector = contextInjection?.inject ?? this.deps.contextForTouchedFile;
+      checkpoint.attachContextReset(contextInjection?.reset);
       const guard = createGuardExtension({
         engine: this.deps.permissionEngine,
         // Multiplexed runner: the agent's scoped PreToolUse/PostToolUse/
@@ -2008,6 +2072,7 @@ export class SubagentRuntime {
         label: `subagent:${agent.name}`,
         extraDenyRules: () => [...checkpoint.activation.denyRules.values()].flat(),
         ...(this.deps.clipMaxTokens !== undefined ? { clipMaxTokens: this.deps.clipMaxTokens } : {}),
+        captureUniversalStop: () => checkpoint.gate.captureLogicalRunStop(),
       });
       const extensionFactories: Array<{ name: string; factory: (pi: unknown) => unknown }> = [
         {
@@ -2348,22 +2413,29 @@ export class SubagentRuntime {
         return undefined;
       };
       const retainedCleanup = async (outcome: DispatchOutcome, finalText?: string): Promise<void> => {
-        if (abortListener && opts.abortSignal) {
-          try { opts.abortSignal.removeEventListener("abort", abortListener); } catch { /* floor */ }
-        }
-        try { progressUnsub?.(); } catch { /* presentation only */ }
-        // Session statistics must be sampled while the public session is live.
-        captureUsage();
-        try { session?.dispose(); } catch { /* disposal cannot mask recovery */ }
-        this.deps.subagentRegistry?.markSettled(agentId, { outcome, usage: capturedUsage, finalText });
-        // The retained initial dispatch owns its worktree through recovery. A
-        // recovery generation must not independently release that same checkout.
-        if (worktreePath && this.deps.worktrees && !opts.resume) {
-          await this.deps.worktrees.exit({ worktreePath, action: "keep" }).catch(() => undefined);
-        }
-        if (started && !stopFired) {
-          stopFired = true;
-          await fireSubagentStop({ subagent_type: agent.name, cwd: subCwd.get() }).catch(() => undefined);
+        try {
+          if (abortListener && opts.abortSignal) {
+            try { opts.abortSignal.removeEventListener("abort", abortListener); } catch { /* floor */ }
+          }
+          try { progressUnsub?.(); } catch { /* presentation only */ }
+          // Session statistics must be sampled while the public session is live.
+          captureUsage();
+          try { session?.dispose(); } catch { /* disposal cannot mask recovery */ }
+          this.deps.subagentRegistry?.markSettled(agentId, { outcome, usage: capturedUsage, finalText });
+          // The retained initial dispatch owns its worktree through recovery. A
+          // recovery generation must not independently release that same checkout.
+          if (worktreePath && this.deps.worktrees && !opts.resume) {
+            await this.deps.worktrees.exit({ worktreePath, action: "keep" }).catch(() => undefined);
+          }
+          if (started && !stopFired) {
+            stopFired = true;
+            await fireSubagentStop({ subagent_type: agent.name, cwd: subCwd.get() }).catch(() => undefined);
+          }
+        } finally {
+          // A paused dispatch remains authoritative through its final retained
+          // recovery/abandonment lifecycle, including SubagentStop. Revoke it
+          // even when cleanup fails so stale children cannot stop a later run.
+          settleDispatchAuthority();
         }
       };
 
@@ -2406,6 +2478,14 @@ export class SubagentRuntime {
         if (paused) return paused;
         const terminal = terminalOutcome();
         if (terminal) return terminal;
+        if (checkpoint.consumeStoppedRun()) {
+          settledOutcome = "aborted";
+          return {
+            ok: false, outcome: "aborted", finalMessage: "", agentId, transcriptPath,
+            resumable, agentName: agent.name, worktreePath, isFork, usage: captureUsage(),
+            error: `Subagent "${agent.name}" was stopped by a universal hook.`, diagnostics,
+          };
+        }
 
         // The returned assistant text is a verbatim contract: callers may parse
         // strict JSON/YAML, so classification must not summarize or wrap it.
@@ -2446,7 +2526,7 @@ export class SubagentRuntime {
           if (stopOutcome?.stop) {
             const reason = stopOutcome.stopReason ?? "SubagentStop hook requested stop";
             diagnostics.push({ severity: "warning", message: reason });
-            try { await Promise.resolve(session!.abort?.()); } catch { /* stop remains final */ }
+            try { void Promise.resolve(session!.abort?.()).catch(() => undefined); } catch { /* stop remains final */ }
             settledOutcome = "aborted";
             return {
               ok: false, outcome: "aborted", finalMessage: "", agentId, transcriptPath,
@@ -2552,6 +2632,9 @@ export class SubagentRuntime {
             cwd: dispatchCwd?.get() ?? this.deps.getCwd(),
           }).catch(() => undefined);
         }
+        // The dispatch and its final lifecycle hooks are now truly settled.
+        // Physical agent_settled events during checkpoint/reentry never rotate it.
+        settleDispatchAuthority();
       }
       release();
     }
@@ -2756,6 +2839,8 @@ export function createAgentToolDefinition(
      * orchestrator cwd. Never sourced from a tool parameter.
      */
     dispatchCwd?: () => string;
+    /** Captures opaque stop authority for the dispatching logical run. */
+    captureUniversalStop?: () => () => boolean;
   },
 ): Record<string, unknown> {
   return {
@@ -2808,6 +2893,7 @@ export function createAgentToolDefinition(
         content: Array<{ type: string; text: string }>;
         details?: Record<string, unknown>;
       }) => void,
+      ctx?: { abort?: () => void },
     ) {
       const subagentType = String(params.subagent_type ?? "");
       // Capture-time sanitization: the model-supplied
@@ -2819,8 +2905,18 @@ export function createAgentToolDefinition(
       // column) — sanitized at capture, before it is threaded anywhere.
       const description =
         sanitizeLine(String(params.description ?? ""), CAPTURED_LINE_CAP) || undefined;
+      const capturedStop = opts.captureUniversalStop?.();
       const dispatchOpts = {
         subagentType,
+        captureUniversalStop: capturedStop
+          ? () => {
+              const accepted = capturedStop();
+              if (accepted) {
+                try { ctx?.abort?.(); } catch { /* opaque stop authority remains final */ }
+              }
+              return accepted;
+            }
+          : undefined,
         prompt: String(params.prompt ?? ""),
         model: params.model ? String(params.model) : undefined,
         depth: opts.depth + 1,

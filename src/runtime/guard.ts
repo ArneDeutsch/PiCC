@@ -32,6 +32,8 @@ export interface GuardDeps {
    * facade carries no config — the clip then simply does not run.
    */
   clipMaxTokens?: number;
+  /** Captures generation-bound checkpoint stop authority before hook execution. */
+  captureUniversalStop?: () => () => boolean;
 }
 
 // Pi event payloads are typed loosely here; the pinned shapes are in doc/pi-integration.md.
@@ -142,6 +144,7 @@ export function createGuardExtension(deps: GuardDeps) {
       const denied = evaluateDeny(call);
       if (denied) return { block: true, reason: denied.reason };
 
+      const stopRun = deps.captureUniversalStop?.();
       const outcome = await deps.hooks.fire(
         "PreToolUse",
         {
@@ -155,7 +158,10 @@ export function createGuardExtension(deps: GuardDeps) {
       if (outcome.stop) {
         const reason = outcome.stopReason ?? "PreToolUse hook requested stop";
         console.error(`[picc]${where} ${reason}`);
-        try { ctx?.abort?.(); } catch { /* hook stop remains authoritative */ }
+        const accepted = stopRun?.() ?? false;
+        if (accepted) {
+          try { ctx?.abort?.(); } catch { /* hook stop remains authoritative */ }
+        }
         return { block: true, reason: `PiCC: tool cancelled because the hook stopped the run: ${reason}` };
       }
       if (outcome.block) {
@@ -246,6 +252,7 @@ export function createGuardExtension(deps: GuardDeps) {
               .join("\n")
           : undefined;
       }
+      const stopRun = deps.captureUniversalStop?.();
       const outcome = await deps.hooks.fire(
         eventName,
         {
@@ -260,7 +267,10 @@ export function createGuardExtension(deps: GuardDeps) {
       if (outcome.stop) {
         const reason = outcome.stopReason ?? `${eventName} hook requested stop`;
         console.error(`[picc]${where} ${reason}`);
-        try { ctx?.abort?.(); } catch { /* hook stop remains authoritative */ }
+        const accepted = stopRun?.() ?? false;
+        if (accepted) {
+          try { ctx?.abort?.(); } catch { /* hook stop remains authoritative */ }
+        }
         return clipped
           ? { content: clipContent, details: event.details, isError: event.isError }
           : undefined;

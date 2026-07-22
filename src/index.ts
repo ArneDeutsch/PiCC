@@ -456,8 +456,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    */
   const makeContextInjector = (getCwdFn: () => string) => {
     const subState = newSessionContextState(project.claudeMd);
-    return (filePath: string) =>
-      contextForTouchedFile({
+    return {
+      inject: (filePath: string) => contextForTouchedFile({
         filePath,
         cwd: getCwdFn(),
         projectRoot: project.root,
@@ -465,7 +465,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         settings: project.settings,
         state: subState,
         skills: project.skills,
-      });
+      }),
+      reset: () => resetInjectionState(subState, project.claudeMd),
+    };
   };
 
   // ---------------------------------------------------------------------------
@@ -690,6 +692,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   function buildCwdBoundTools(
     cwdRef: CwdState,
     taskBundle: { tools: unknown[] },
+    captureUniversalStop?: () => () => boolean,
   ): Record<string, unknown>[] {
     const get = () => cwdRef.get();
     return [
@@ -699,7 +702,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       createGlobTool(get) as unknown as Record<string, unknown>,
       createMultiEditTool(get) as unknown as Record<string, unknown>,
       ...(taskBundle.tools as unknown as Record<string, unknown>[]),
-      ...createWorktreeTools({ worktrees, cwdState: cwdRef, hookRunner: hookRunnerFacade }),
+      ...createWorktreeTools({ worktrees, cwdState: cwdRef, hookRunner: hookRunnerFacade, captureUniversalStop }),
       ...DEGRADED_TOOLS.map(
         (d) =>
           createDegradeStub(d.name, d.note, { redirect: d.redirect }) as unknown as Record<
@@ -847,13 +850,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const subagentRuntime = new SubagentRuntime({
     getAgents: () => project.agents,
     buildSystemPrompt: buildSubagentSystemPrompt,
-    customToolsFor: (agent, granted, depth, ownerAgentId, dispatcherIsFork, subCwd, activation) => {
+    customToolsFor: (agent, granted, depth, ownerAgentId, dispatcherIsFork, subCwd, activation, captureUniversalStop) => {
       // Per-dispatch instances (fresh TaskStore, dispatch-local cwd binding).
       // NOTE: SendMessage is deliberately NEVER built here — it is
       // parent-initiated only (no subagent→subagent or subagent→parent channel).
       // Even a future "inherit all tools" change must not add it to this set.
       const tools: Record<string, unknown>[] = [];
-      for (const tool of buildCwdBoundTools(subCwd ?? cwdState, createTaskTools())) {
+      for (const tool of buildCwdBoundTools(subCwd ?? cwdState, createTaskTools(), captureUniversalStop)) {
         const name = (tool as { name: string }).name;
         if (granted.includes(name)) tools.push(tool);
       }
@@ -906,8 +909,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // moment the child is dispatched, so a worktree the parent enters mid-run
         // is reflected.
         const dispatchCwd = () => (subCwd ?? cwdState).get();
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd }));
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd }));
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd, captureUniversalStop }));
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd, captureUniversalStop }));
       }
       return tools;
     },
@@ -1032,6 +1035,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   };
 
   const publishCheckpoint = (event: CheckpointProgress, ctx = checkpointContext): void => {
+    const progressController = mainCheckpointGate.currentController();
+    if (mainCheckpointGate.isLogicalRunStopped() &&
+        mainCheckpointGate.stoppedRunMatches(progressController, event.generation)) return;
     const mode = ctx?.mode;
     const baseText = checkpointText(event);
     const recoverableHeadlessExhaustion = event.category === "checkpoint-exhausted" &&
@@ -1251,7 +1257,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Tool registration
   // ---------------------------------------------------------------------------
   const getCwd = () => cwdState.get();
-  claudeNamedTools.push(...buildCwdBoundTools(cwdState, taskToolBundle));
+  claudeNamedTools.push(...buildCwdBoundTools(cwdState, taskToolBundle, () => mainCheckpointGate.captureLogicalRunStop()));
 
   /**
    * The single skill-activation path shared by the Skill and SlashCommand tools
@@ -1405,8 +1411,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // The built-in agent types guarantee dispatchable agents even when the
     // project defines none — so Agent/Task always register when subagents are on.
     claudeNamedTools.push(
-      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Agent", backgroundTasks }),
-      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Task", backgroundTasks }),
+      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Agent", backgroundTasks, captureUniversalStop: () => mainCheckpointGate.captureLogicalRunStop() }),
+      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Task", backgroundTasks, captureUniversalStop: () => mainCheckpointGate.captureLogicalRunStop() }),
       // SendMessage: the coordinator's channel back into its subagents —
       // resume a finished one (same id, full context, background) or steer a
       // running background one. Parent-session only (never in customToolsFor).
@@ -1523,6 +1529,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     extraDenyRules: () => [...activeSkillDenyRules.values()].flat(),
     // Backstop: clip a single oversized tool result before it enters context.
     clipMaxTokens: config.compaction.clipMaxTokens,
+    captureUniversalStop: () => mainCheckpointGate.captureLogicalRunStop(),
   })(pi);
 
   // ---------------------------------------------------------------------------
@@ -1696,6 +1703,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         : event.reason === "reload"
           ? "startup"
           : event.reason;
+      const stopRun = mainCheckpointGate.captureLogicalRunStop();
       const outcome = await hooks.fire("SessionStart", {
         source: sessionStartSource,
         cwd: cwdState.get(),
@@ -1709,6 +1717,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           else console.error(`PiCC: ${reason}`);
           ctx.abort?.();
         } catch { /* stop authority remains final */ }
+        stopRun();
         return;
       }
       const hookContext = [outcome.stdout, outcome.additionalContext].filter(Boolean).join("\n");
@@ -1809,12 +1818,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       }
       const inputDisposition = mainCheckpointGate.ordinaryInputDisposition();
       if (inputDisposition === "reject-recoverable" || inputDisposition === "reject-restoration" ||
-          inputDisposition === "reject-closed") {
+          inputDisposition === "reject-closed" || inputDisposition === "reject-stopped") {
         const text = inputDisposition === "reject-recoverable"
           ? "Work remains paused. Run /compact, then explicitly continue."
           : inputDisposition === "reject-restoration"
             ? "The compacted summary is committed, but restoration or continuation failed. Do not compact it again; start a new session and resend the retained input."
-            : "The prior checkpoint was cancelled. Run /compact to recover this session, or start a new session.";
+            : inputDisposition === "reject-stopped"
+              ? "The stopped run is still terminating. Wait for it to settle before sending another prompt."
+              : "The prior checkpoint was cancelled. Run /compact to recover this session, or start a new session.";
         try {
           if (ctx.mode === "print") console.error(`PiCC: ${text}`);
           else if (ctx.mode === "tui") ctx.ui?.notify?.(text, "warning");
@@ -1869,6 +1880,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       const accept = <T extends { action: "continue" } | TransformResult>(result: T): T | { action: "handled" } => {
         const text = result.action === "transform" ? result.text : String(event.text ?? "");
         const images = result.action === "transform" ? result.images : event.images;
+        // This is the next genuine accepted user run. Rotate lifecycle authority
+        // after UserPromptSubmit admission, never for extension replay/continuation.
+        mainCheckpointGate.acceptedLogicalRun();
         const shadow = mainCheckpointGate.captureAcceptedInput(ctx, text, images, event.streamingBehavior);
         // Quarantine is an admission decision, not a consequence of successful
         // shadow capture. A settled fallback cannot queue input, but it still must
@@ -1907,6 +1921,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       }
 
       // 1) UserPromptSubmit hook on the raw prompt (Claude order).
+      const stopRun = mainCheckpointGate.captureLogicalRunStop();
       const outcome = await hooks.fire("UserPromptSubmit", {
         prompt: event.text,
         cwd: cwdState.get(),
@@ -1918,6 +1933,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           else console.error(`PiCC: ${reason}`);
           ctx.abort?.();
         } catch { /* hook stop remains final */ }
+        stopRun();
         return { action: "handled" };
       }
       if (outcome.block) {
@@ -2088,6 +2104,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       } catch {
         /* optional Stop payload field */
       }
+      const stopRun = mainCheckpointGate.captureLogicalRunStop();
       const outcome = await hooks.fire("Stop", {
         cwd: cwdState.get(),
         stop_hook_active: stopHookIterations > 0,
@@ -2100,6 +2117,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           else console.error(`PiCC: ${reason}`);
           ctx?.abort?.();
         } catch { /* universal stop remains terminal */ }
+        stopRun();
         stopHookIterations = 0;
         return true;
       }
@@ -2165,8 +2183,26 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     await writing;
   };
 
+  const settleStoppedMainRun = async (): Promise<boolean> => {
+    if (!mainCheckpointGate.isLogicalRunStopped()) return false;
+    const controller = mainCheckpointGate.currentController();
+    const generation = controller.snapshot().generation;
+    const resume = activeMainResume;
+    if (resume && mainCheckpointGate.stoppedRunMatches(controller, generation) &&
+        resume.generation === generation && resume.epoch === checkpointSessionEpoch &&
+        resume.token.generation === generation) {
+      // cancelAndJoin waits for this exact physical run's settlement. Release it
+      // before joining cancellation so agent_settled never waits on itself.
+      resume.resolveSettled();
+      activeMainResume = undefined;
+    }
+    await mainCheckpointGate.settleLogicalRunStop();
+    return true;
+  };
+
   pi.on("agent_settled", async (_event: any, ctx: any) => {
     checkpointContext = ctx;
+    if (await settleStoppedMainRun()) return;
     const controller = mainCheckpointGate.currentController();
     const resume = activeMainResume;
     if (resume?.generation === controller.snapshot().generation &&
@@ -2178,10 +2214,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       if (controller.snapshot().phase === "cancelled") {
         resume.resolveSettled();
         activeMainResume = undefined;
+        mainCheckpointGate.logicalRunSettled();
         return;
       }
       if (controller.snapshot().phase === "resuming") {
         if (!await runStopHook(ctx)) return;
+        if (await settleStoppedMainRun()) return;
         const current = mainCheckpointGate.currentController();
         const snapshot = current.snapshot();
         if (current === controller && activeMainResume === resume &&
@@ -2212,6 +2250,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         controller.resumedSettled(resume.token);
         resume.resolveSettled();
         activeMainResume = undefined;
+        mainCheckpointGate.logicalRunSettled();
         if (ctx?.mode === "tui") ctx.ui?.setStatus?.("picc-checkpoint", undefined);
         return;
       }
@@ -2224,7 +2263,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       const phase = controller.snapshot().phase;
       if (phase === "exhausted" || phase === "cancelled" || checkpointWasArmed) return;
     }
-    await runStopHook(ctx);
+    const trulySettled = await runStopHook(ctx);
+    if (await settleStoppedMainRun()) return;
+    // A Stop-blocked continuation remains the same logical run. Only the
+    // accepted final boundary revokes lifecycle callbacks captured by it.
+    if (trulySettled) mainCheckpointGate.logicalRunSettled();
   });
 
   pi.on("session_before_compact", async (event: any) => {
@@ -2255,6 +2298,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       operation.recovery = controller.recoveryToken(generation);
     }
     try {
+      const stopRun = mainCheckpointGate.captureLogicalRunStop();
       const outcome = await hooks.fire("PreCompact", {
         trigger,
         custom_instructions: typeof event.customInstructions === "string" ? event.customInstructions : "",
@@ -2269,7 +2313,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
             ? operation.recovery !== controller.recoveryToken(generation)
             : snapshot.phase !== "idle");
       if (stale || outcome.block || outcome.stop) {
-        if (!stale && proactive && checkpointAttempt === attempt) attempt.hookBlocked = true;
+        if (!stale && outcome.stop) stopRun();
+        if (!stale && proactive && checkpointAttempt === attempt && !outcome.stop) attempt.hookBlocked = true;
         if (activeCompactionOperation === operation) activeCompactionOperation = undefined;
         return { cancel: true };
       }
@@ -2361,11 +2406,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (proactive && attempt && checkpointAttempt === attempt && attempt.operation === operation.identity) {
       attempt.restorationFailed = restorationFailed;
     }
-    if (!proactive && event.reason === "manual") {
+    if (!proactive) {
       if (restorationFailed) {
         const rejected = await controller.failAfterCommittedSummary(generation);
         reportRejectedShadows(rejected, checkpointContext);
-      } else if (operation.recovery && operation.recovery === controller.recoveryToken(generation)) {
+      } else if (event.reason === "manual" && operation.recovery && operation.recovery === controller.recoveryToken(generation)) {
         const recovered = controller.recoverAfterManualCompaction(operation.recovery);
         if (recovered.recovered) {
           publishCheckpoint({ category: "checkpoint-recovered", generation, action: "manual-recovery" }, checkpointContext);

@@ -18,10 +18,18 @@ export function createWorktreeTools(deps: {
   };
   cwdState: CwdState;
   hookRunner: HookRunner;
+  captureUniversalStop?: () => () => boolean;
 }): Record<string, unknown>[] {
-  const applyUniversalStop = (outcome: HookOutcome, ctx?: Pick<ExtensionContext, "abort">) => {
+  const applyUniversalStop = (
+    outcome: HookOutcome,
+    stopRun: (() => boolean) | undefined,
+    ctx?: Pick<ExtensionContext, "abort">,
+  ) => {
     if (!outcome.stop) return undefined;
-    try { ctx?.abort(); } catch { /* lifecycle cleanup and its result remain authoritative */ }
+    const accepted = stopRun?.() ?? false;
+    if (accepted) {
+      try { ctx?.abort(); } catch { /* lifecycle cleanup and its result remain authoritative */ }
+    }
     return outcome.stopReason ?? "Worktree hook requested stop";
   };
 
@@ -58,12 +66,13 @@ export function createWorktreeTools(deps: {
       const created = (result as { created?: boolean }).created ?? false;
       let stopReason: string | undefined;
       if (created) {
+        const stopRun = deps.captureUniversalStop?.();
         const outcome = await deps.hookRunner.fire("WorktreeCreate", {
           worktree_path: result.worktreePath,
           branch: (result as { branch?: string }).branch,
           cwd: result.worktreePath,
         });
-        stopReason = applyUniversalStop(outcome, ctx);
+        stopReason = applyUniversalStop(outcome, stopRun, ctx);
       }
       const seeded = (result as { seededFiles?: string[] }).seededFiles ?? [];
       const lines = [
@@ -105,11 +114,12 @@ export function createWorktreeTools(deps: {
       }
       let stopReason: string | undefined;
       if (params.action === "remove") {
+        const stopRun = deps.captureUniversalStop?.();
         const outcome = await deps.hookRunner.fire("WorktreeRemove", {
           worktree_path: worktreePath,
           cwd: deps.cwdState.getBase(),
         });
-        stopReason = applyUniversalStop(outcome, ctx);
+        stopReason = applyUniversalStop(outcome, stopRun, ctx);
       }
       const result = (await deps.worktrees.exit({ worktreePath, action: params.action })) as {
         removed?: boolean;
