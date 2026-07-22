@@ -3,9 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createRequire } from "node:module";
+import { stream as streamCodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
+import type { AssistantMessage, Context, Model, ToolCall } from "@earendil-works/pi-ai";
 import { fakePi } from "./helpers/fake-pi.js";
 import { withCompactSearchRendering } from "../src/runtime/search-tool-render.js";
-import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
+import { genericCallComponent, wrapForSelfShell, type RenderCtx } from "../src/runtime/tool-shell.js";
 import { codexAbortGuardStreamSimple } from "../src/runtime/codex-abort-guard.js";
 import picc from "../src/index.js";
 import { classifyRequest, createResponseGate, startMockModel, type CapturedRequest } from "./helpers/mock-openai.js";
@@ -27,6 +29,14 @@ import {
  * Pi upstream contract smoke test: asserts every Pi API PiCC
  * builds on exists in the pinned version. If Pi churns, this fails first and loudly.
  */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isToolCall(block: AssistantMessage["content"][number]): block is ToolCall {
+  return block.type === "toolCall";
+}
+
 describe("mock wire request classification", () => {
   const mainSystem = "PiCC instructions\nAvailable subagents (dispatch with the Agent tool, subagent_type = name):\n- general-purpose";
   const summarySystem = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant.";
@@ -221,6 +231,151 @@ describe("pi 0.80.x API contract", () => {
       expect(headers.get("x-request-header")).toBe("request-value");
       expect(sent.init?.method).toBe("POST");
       expect(sent.init?.body).toBeDefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it("Codex Responses keeps matched result output separate from a fresh inbound function call", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalWebSocket = globalThis.WebSocket;
+    const structuredResult = `{
+  "type": "function",
+  "function": {
+    "name": "TaskOutput",
+    "arguments": { "task_id": "task-codex-canary", "wait": false }
+  },
+  "summary": "review complete",
+  "findings": [],
+  "recommendation": "approve"
+}`;
+    const malformedArguments = {
+      summary: "review complete",
+      findings: [],
+      recommendation: "approve",
+    };
+    const malformedJson = JSON.stringify(malformedArguments);
+    const freshItem = {
+      type: "function_call",
+      id: "fc_fresh_provider_item",
+      call_id: "call_fresh_provider",
+      name: "TaskOutput",
+      arguments: malformedJson,
+      status: "completed",
+    };
+    const sse = [
+      { type: "response.created", response: { id: "response-contract", status: "in_progress", output: [] } },
+      { type: "response.output_item.added", output_index: 0, item: { ...freshItem, status: "in_progress" } },
+      { type: "response.output_item.done", output_index: 0, item: freshItem },
+      {
+        type: "response.completed",
+        response: {
+          id: "response-contract",
+          status: "completed",
+          output: [freshItem],
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        },
+      },
+    ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n";
+    let outboundPayload: Record<string, unknown> | undefined;
+    let fetches = 0;
+    let sockets = 0;
+    const tokenPayload = Buffer.from(JSON.stringify({
+      "https://api.openai.com/auth": { chatgpt_account_id: "contract-account" },
+    })).toString("base64url");
+    const model: Model<"openai-codex-responses"> = {
+      id: "gpt-contract", name: "GPT Contract", api: "openai-codex-responses", provider: "openai-codex",
+      baseUrl: "https://example.invalid", reasoning: false, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1_000,
+    };
+    const context: Context = {
+      systemPrompt: "Codex typed-boundary contract",
+      messages: [
+        {
+          role: "assistant",
+          content: [{
+            type: "toolCall",
+            id: "call_outbound|fc_outbound_item",
+            name: "TaskOutput",
+            arguments: { task_id: "task-42" },
+          }],
+          api: "openai-codex-responses",
+          provider: "openai-codex",
+          model: "gpt-contract",
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          stopReason: "toolUse",
+          timestamp: 1,
+        },
+        {
+          role: "toolResult",
+          toolCallId: "call_outbound|fc_outbound_item",
+          toolName: "TaskOutput",
+          content: [{ type: "text", text: structuredResult }],
+          isError: false,
+          timestamp: 2,
+        },
+      ],
+    };
+    try {
+      globalThis.fetch = async () => {
+        fetches += 1;
+        return new Response(sse, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      };
+      globalThis.WebSocket = class extends originalWebSocket {
+        constructor(...args: ConstructorParameters<typeof WebSocket>) {
+          sockets += 1;
+          if (sockets > 0) throw new Error("forced SSE contract must not open a WebSocket");
+          super(...args);
+        }
+      };
+      const stream = streamCodexResponses(model, context, {
+        apiKey: `x.${tokenPayload}.x`,
+        transport: "sse",
+        maxRetries: 0,
+        sessionId: "typed-boundary-contract",
+        onPayload(payload: unknown) {
+          if (!isRecord(payload)) throw new Error("expected a record Codex request payload");
+          outboundPayload = structuredClone(payload);
+        },
+      });
+      const decoded = await stream.result();
+
+      expect(fetches).toBe(1);
+      expect(sockets).toBe(0);
+      const input = outboundPayload?.input;
+      expect(Array.isArray(input)).toBe(true);
+      if (!Array.isArray(input)) throw new Error("expected Codex input items");
+      const outboundItems = input.filter(isRecord);
+      expect(outboundItems).toHaveLength(input.length);
+      const outboundCalls = outboundItems.filter((item) => item.type === "function_call");
+      const outboundResults = outboundItems.filter((item) => item.type === "function_call_output");
+      expect(outboundCalls).toEqual([{
+        type: "function_call",
+        id: "fc_outbound_item",
+        call_id: "call_outbound",
+        name: "TaskOutput",
+        arguments: JSON.stringify({ task_id: "task-42" }),
+      }]);
+      expect(outboundResults).toEqual([{
+        type: "function_call_output",
+        call_id: "call_outbound",
+        output: structuredResult,
+      }]);
+      expect(typeof outboundResults[0]!.output).toBe("string");
+
+      const decodedCalls = decoded.content.filter(isToolCall);
+      expect(decodedCalls).toEqual([{
+        type: "toolCall",
+        id: "call_fresh_provider|fc_fresh_provider_item",
+        name: "TaskOutput",
+        arguments: malformedArguments,
+      }]);
+      expect(decodedCalls[0]!.id).not.toContain("call_outbound");
     } finally {
       globalThis.fetch = originalFetch;
       globalThis.WebSocket = originalWebSocket;
@@ -767,7 +922,7 @@ describe("real Pi compact-search composition", () => {
   it.each(cases)("renders equivalent compact $name status and feedback through the real HTML renderer", async (search) => {
     const { renderer } = await htmlHarness(search);
     const id = `html-${search.name}`;
-    expect(renderer.renderCall(id, search.name, search.args)).toBe("");
+    renderer.renderCall(id, search.name, search.args);
     const rendered = renderer.renderResult(
       id, search.name, search.status.content, search.status.details, false,
     );
@@ -823,7 +978,6 @@ describe("real Pi compact-search composition", () => {
 
       expect(JSON.stringify(canonicalResult?.message?.content)).toContain(search.hidden);
       expect(rendered).toBeDefined();
-      expect(rendered.callHtml).toBeUndefined();
       expect(rendered.resultHtmlExpanded).toContain(search.name);
       expect(rendered.resultHtmlExpanded).toMatch(search.statusText);
       expect(rendered.resultHtmlExpanded).toContain(`Post-processing ${search.name} feedback.`);
@@ -835,6 +989,51 @@ describe("real Pi compact-search composition", () => {
       expect(html).not.toContain(search.hidden);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("real Pi glyph-shell image and spacing ownership", () => {
+  it("keeps binary images Pi-owned and aligns textual image fallbacks", async () => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    const tui: any = await import("@earendil-works/pi-tui");
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const piDist = mainUrl.slice(0, mainUrl.indexOf("/dist/"));
+    const nestedTui: any = await import(`${piDist}/node_modules/@earendil-works/pi-tui/dist/index.js`);
+    sdk.initTheme();
+    const previous = tui.getCapabilities();
+    const nestedPrevious = nestedTui.getCapabilities();
+    const definition = wrapForSelfShell({ name: "ImageProbe" });
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    const build = (id: string) => new sdk.ToolExecutionComponent(
+      "ImageProbe", id, {}, { showImages: true }, definition,
+      { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+    );
+    try {
+      tui.setCapabilities({ ...previous, images: "kitty" });
+      nestedTui.setCapabilities({ ...nestedPrevious, images: "kitty" });
+      const binary = build("binary-image");
+      binary.updateResult({ content: [{ type: "image", data: png, mimeType: "image/png" }], details: undefined }, false);
+      const binaryLines = binary.render(40) as string[];
+      expect(binaryLines[0]).toBe("");
+      expect(binaryLines[1]?.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")).toBe("● ImageProbe");
+      expect(binaryLines[2]).toBe(""); // Pi-owned text/image separator
+      expect(binaryLines.slice(3).join("\n")).toContain("_G");
+      expect(binaryLines.join("\n").match(/[○●✗■]/gu)).toHaveLength(1);
+
+      tui.setCapabilities({ ...previous, images: null });
+      nestedTui.setCapabilities({ ...nestedPrevious, images: null });
+      const fallback = build("fallback-image");
+      fallback.updateResult({ content: [{ type: "image", data: png, mimeType: "image/png" }], details: undefined }, false);
+      const fallbackText = (fallback.render(80) as string[]).join("\n").replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+      expect(fallbackText).toContain("● ImageProbe");
+      expect(fallbackText).toMatch(/\n  \[Image/iu);
+      expect(fallbackText.match(/[○●✗■]/gu)).toHaveLength(1);
+
+      for (const row of [binary, fallback]) expect((row.render(80) as string[])[0]).toBe("");
+    } finally {
+      tui.setCapabilities(previous);
+      nestedTui.setCapabilities(nestedPrevious);
     }
   });
 });
@@ -993,14 +1192,85 @@ describe("real Pi lifecycle row ownership", () => {
   });
 });
 
+describe("real Pi glyph-shell construction and render ordering", () => {
+  it("shares exact state, renders call before result repeatedly, and preserves adjacent separators", async () => {
+    const { ToolExecutionComponent, initTheme } = (await import(
+      "@earendil-works/pi-coding-agent"
+    )) as any;
+    initTheme();
+    const constructed: Array<{ kind: "call" | "result"; state: unknown }> = [];
+    const rendered: string[] = [];
+    const definition = wrapForSelfShell({
+      name: "OrderProbe",
+      renderCall: (_args: unknown, _theme: unknown, ctx: RenderCtx) => {
+        constructed.push({ kind: "call", state: ctx.state });
+        return { render: () => { rendered.push("call"); return ["call"]; } };
+      },
+      renderResult: (_result: unknown, _options: unknown, _theme: unknown, ctx: RenderCtx) => {
+        constructed.push({ kind: "result", state: ctx.state });
+        return { render: () => { rendered.push("result"); return ["result"]; } };
+      },
+    });
+    const build = (id: string) => new ToolExecutionComponent(
+      "OrderProbe", id, {}, {}, definition, { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+    );
+    const first = build("order-a");
+    constructed.length = 0;
+    first.updateResult({ content: [{ type: "text", text: "canonical" }], details: undefined }, false);
+    expect(constructed.map(({ kind }) => kind)).toEqual(["call", "result"]);
+    expect(constructed[0]?.state).toBe(constructed[1]?.state);
+    const invocationState = constructed[0]?.state;
+    expect(rendered).toEqual([]);
+
+    const firstPaint = first.render(80) as string[];
+    expect(rendered).toEqual(["call", "result"]);
+
+    constructed.length = 0;
+    rendered.length = 0;
+    first.updateResult({ content: [{ type: "text", text: "updated" }], details: undefined }, false);
+    expect(constructed.map(({ kind }) => kind)).toEqual(["call", "result"]);
+    expect(constructed[0]?.state).toBe(constructed[1]?.state);
+    expect(constructed[0]?.state).toBe(invocationState);
+    expect(rendered).toEqual([]);
+
+    const secondPaint = first.render(80) as string[];
+    expect(rendered).toEqual(["call", "result"]);
+    for (const paint of [firstPaint, secondPaint]) {
+      expect(paint[0]).toBe("");
+      expect(paint.join("\n").match(/[○●✗■]/gu)).toHaveLength(1);
+    }
+
+    const adjacent = build("order-b");
+    adjacent.updateResult({ content: [{ type: "text", text: "neighbor" }], details: undefined }, false);
+    const adjacentPaint = adjacent.render(80) as string[];
+    const stripAnsi = (line: string) => line.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+    const combined = [...firstPaint, ...adjacentPaint].map(stripAnsi);
+    expect(combined).toEqual(["", "● call", "  result", "", "● call", "  result"]);
+    expect(combined.flatMap((line, index) => line === "" ? [index] : [])).toEqual([0, 3]);
+    expect(combined.at(-1)).not.toBe("");
+    expect(combined.join("\n").match(/[○●✗■]/gu)).toHaveLength(2);
+  });
+
+  it("preserves the real theme's generic bold toolTitle composition", async () => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    sdk.initTheme();
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const piDist = mainUrl.slice(0, mainUrl.indexOf("/dist/"));
+    const { theme }: any = await import(`${piDist}/dist/modes/interactive/theme/theme.js`);
+    const expected = theme.fg("toolTitle", theme.bold("GenericProbe"));
+    expect(genericCallComponent("GenericProbe", theme).render(80)).toEqual([expected]);
+  });
+});
+
 /**
  * Pin Pi's `ctx.lastComponent` threading with a contract
  * test that drives the REAL, publicly-exported `ToolExecutionComponent`.
  *
- * The de-padded built-ins depend on Pi caching the component our wrapper returns
- * and handing it back as `ctx.lastComponent` on the next render (the `__inner`
- * threading exists precisely to survive this; `edit`'s `instanceof Box`
- * incremental reuse breaks if the wrong component is threaded). PiCC's OWN
+ * The glyph-framed built-ins depend on Pi caching the outer component our wrapper
+ * returns and handing it back as `ctx.lastComponent` on the next render. PiCC's
+ * `wrapperMetadata` WeakMap resolves that outer component to its retained previous
+ * inner component; `edit`'s `instanceof Box` incremental reuse breaks if the wrong
+ * component is threaded. PiCC's own
  * threading is unit-tested against a fake ctx (`test/runtime-core.test.ts`); this
  * asserts PI's side of the contract, so a Pi upgrade that stops threading the
  * prior component fails loudly here instead of degrading incremental rendering

@@ -28,6 +28,46 @@ import { createResponseGate, type Turn } from "./helpers/mock-openai.js";
 const { startPi, runPi, cleanup } = createE2ELive();
 afterEach(cleanup);
 
+const TOOL_ROW_PRESENTATION = /[○●✗■]|\u001b\[[0-?]*[ -/]*[@-~]/u;
+
+function expectNoToolRowPresentation(value: unknown, source: string): void {
+  if (typeof value === "string") {
+    expect(value, source).not.toMatch(TOOL_ROW_PRESENTATION);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => expectNoToolRowPresentation(entry, `${source}[${index}]`));
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const [key, entry] of Object.entries(value)) {
+      expectNoToolRowPresentation(entry, `${source}.${key}`);
+    }
+  }
+}
+
+function expectCanonicalWriteResult(
+  records: any[],
+  expectedText: string,
+): void {
+  const writeResults = records.filter((record) => record.type === "message_end" &&
+    record.message?.role === "toolResult" && record.message?.toolName === "write");
+  expect(writeResults).toHaveLength(1);
+  const message = writeResults[0].message;
+  const keys = ["content", "isError", "role", "timestamp", "toolCallId", "toolName"];
+  if (message.terminate !== undefined) keys.push("terminate");
+  expect(Object.keys(message).sort()).toEqual(keys.sort());
+  expect(message).toEqual({
+    role: "toolResult",
+    toolCallId: expect.any(String),
+    toolName: "write",
+    content: [{ type: "text", text: expectedText }],
+    isError: false,
+    timestamp: expect.any(Number),
+    ...(message.terminate === undefined ? {} : { terminate: true }),
+  });
+}
+
 describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenAI model", () => {
   if (cliMissing) {
     // eslint-disable-next-line no-console
@@ -98,11 +138,14 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       expect(nextToolMessage).toBe(expected);
       expect(nextToolMessage).not.toContain("Grep “MODEL_BOUNDARY_NEEDLE”");
       expect(nextToolMessage).not.toContain("2/2 entries");
+      expect(nextToolMessage).not.toMatch(TOOL_ROW_PRESENTATION);
 
       const stdout = result.stdout.replace(/\r\n/g, "\n");
       expect(stdout).toContain("SEARCH_BOUNDARY_COMPLETE");
       expect(stdout).not.toContain("Grep “MODEL_BOUNDARY_NEEDLE”");
       expect(stdout).not.toContain("2/2 entries");
+      expect(stdout).not.toMatch(TOOL_ROW_PRESENTATION);
+      expect(result.stderr).not.toMatch(TOOL_ROW_PRESENTATION);
     },
     TEST_TIMEOUT_MS,
   );
@@ -295,6 +338,10 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       expect(result.code).toBe(0);
       expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction", "ordinary"]);
       const records = result.stdout.trim().split(/\r?\n/).map((line) => JSON.parse(line) as any);
+      expect(result.stdout).not.toMatch(TOOL_ROW_PRESENTATION);
+      expect(result.stderr).not.toMatch(TOOL_ROW_PRESENTATION);
+      expectNoToolRowPresentation(records, "decoded JSON output");
+      expectCanonicalWriteResult(records, "Successfully wrote 8 bytes to json-cycle.txt");
       const resumedLifecycle = records.findIndex((record) =>
         record.type === "entry_appended" && record.entry?.customType === "picc-checkpoint-lifecycle" &&
         record.entry?.data?.category === "checkpoint-resumed");
@@ -357,6 +404,10 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         }
         expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction", "ordinary"]);
         const records = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line) as any);
+        expect(result.stdout).not.toMatch(TOOL_ROW_PRESENTATION);
+        expect(result.stderr).not.toMatch(TOOL_ROW_PRESENTATION);
+        expectNoToolRowPresentation(records, "decoded RPC output");
+        expectCanonicalWriteResult(records, "Successfully wrote 8 bytes to rpc-cycle.txt");
         const lifecycle = records.filter((record) => record.type === "entry_appended" &&
           record.entry?.customType === "picc-checkpoint-lifecycle");
         expect(lifecycle.map((record) => record.entry.data.category)).toEqual([

@@ -1432,12 +1432,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   );
   for (const tool of claudeNamedTools) {
     try {
-      // Main-session presentation composes in this order: specialized search,
-      // routine mutation, safe settled-success collapse, then self-shell framing.
-      // The final frame removes vertical padding while preserving execute and all
-      // metadata. `customToolsFor` intentionally skips the entire presentation
-      // chain because subagent rows belong to their own transcripts, not the
-      // parent interactive TUI.
+      // Main-session definitions pass through specialized search → routine/Edit
+      // rendering → safe settled-success collapse → foreground-glyph self-shell.
+      // The checkpoint gate then wraps execute exactly once, outside every
+      // presentation decorator, before registration so canonical results retain
+      // its terminate metadata. `customToolsFor` skips this parent-TUI chain.
       const mainSessionTool: Record<string, unknown> = tool.name === "Grep" || tool.name === "Glob"
         ? withCompactSearchRendering(tool as unknown as ToolDefinition) as unknown as Record<string, unknown>
         : tool;
@@ -1485,9 +1484,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   // Cwd-swapping overrides of Pi built-ins. Execute is sourced from the
-  // ctx-dropping create*Tool factory (byte-identical). Main-session presentation
-  // composes routine mutation → safe default collapse → self-shell framing around
-  // the native create*ToolDefinition renderers; subagent stock definitions stay raw.
+  // ctx-dropping create*Tool factory (byte-identical). Main-session definitions
+  // pass through routine/Edit rendering → safe default collapse → foreground-glyph
+  // self-shell → the one outer checkpoint gate → registration; subagent stock
+  // definitions stay raw.
   // The IIFE promise is captured (not `void`ed) so the readiness seam can await
   // built-in registration settlement via onInitializationSettled.
   const builtInRegistration = (async () => {
@@ -1500,8 +1500,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // create*ToolDefinition), the bash spawnHook/env, Git-Bash pinning, and the
       // live-cwd execute rebind live in the shared factory so the main session and
       // subagents construct byte-identical raw tools. Only this registration loop
-      // adds routine mutation → safe default collapse → self-shell framing; keeping
-      // that composition here prevents parent-TUI policy from entering subagents.
+      // adds routine/Edit rendering → safe default collapse → foreground-glyph
+      // self-shell before the outer checkpoint gate and registration; keeping that
+      // composition here prevents parent-TUI policy from entering subagents.
       const builtins = buildStockBuiltinTools(sdk as BuiltinToolSdk, cwdState, {
         settingsEnv: project.settings.env ?? {},
         projectRoot: project.root,

@@ -23,6 +23,16 @@ type ToolLike = {
 };
 
 const API_DEATH = /Agent terminated early due to an API error/;
+const CALL_SHAPED_RESULT = `{
+  "type": "function",
+  "function": {
+    "name": "TaskOutput",
+    "arguments": {
+      "task_id": "task-review-17",
+      "wait": false
+    }
+  }
+}`;
 
 describe("dispatch outcome classification", () => {
   it("stopReason 'error' with no prior output → failed with the error named, never an empty success", async () => {
@@ -406,6 +416,15 @@ describe("Agent tool failure mapping (Claude 2.1.200 semantics)", () => {
     const tool = createAgentToolDefinition(runtime, { depth: 0 }) as unknown as ToolLike;
     const res = await tool.execute("t", { subagent_type: "reviewer", prompt: "p" });
     expect(res.content[0]!.text).toBe("```yaml\nverdict: approve\n```");
+    expect(res.details.outcome).toBe("completed");
+  });
+
+  it("keeps a valid TaskOutput-call-shaped final message opaque on foreground delivery", async () => {
+    const h = fakeSdk({ replies: [CALL_SHAPED_RESULT] });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk);
+    const tool = createAgentToolDefinition(runtime, { depth: 0 }) as unknown as ToolLike;
+    const res = await tool.execute("t", { subagent_type: "reviewer", prompt: "p" });
+    expect(res.content).toEqual([{ type: "text", text: CALL_SHAPED_RESULT }]);
     expect(res.details.outcome).toBe("completed");
   });
 });

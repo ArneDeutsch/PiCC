@@ -65,7 +65,7 @@ Two objects matter:
 | Goal | Verdict | Mechanism |
 |---|---|---|
 | Custom framing of **our own** tool call/result | **Easy** | `renderCall`/`renderResult` + `renderShell: "self"` on the `ToolDefinition` |
-| Remove vertical padding / blank rows around a tool row | **Done (generic wrapper, plus Edit inner adapter) · Impossible (inter-block)** | `renderShell: "self"` + per-line `theme.bg` re-apply in `wrapForSelfShell`; the one-column horizontal gutter remains; Edit's renderer adds nested padding removed by `withRoutineToolRendering`, then safely recognized settled rows pass through `withDefaultCollapsedToolRendering`; inter-block spacing is render-loop-internal |
+| Replace state-background tool rows with one foreground state glyph | **Done (generic wrapper, plus Edit inner adapter) · Impossible (inter-block)** | Specialized/routine rendering → `withDefaultCollapsedToolRendering` → `wrapForSelfShell`; the shell removes outer padding/background, prefixes one glyph, and aligns continuations; inter-block spacing remains render-loop-internal |
 | Colors in our own components | **Easy** | `theme.fg("<slot>", text)`, `theme.bg`, `theme.bold/italic/...`, or raw ANSI |
 | Re-skin the whole UI / switch themes | **Medium** | `ctx.ui.setTheme`, `new Theme(...)`, ship theme JSON via `resources_discover` |
 | Add a **new named color role** | **Impossible** | `ThemeColor` union is closed |
@@ -110,54 +110,64 @@ argument **is** Pi's `Theme` (see "Colors and themes").
 
 ### 3.2 `renderShell` — this is how you control blank lines and framing
 
-`ToolExecutionComponent` (in `dist/modes/interactive/components/tool-execution.js`) wraps a tool
-row in a standard **colored shell** — a `Box(paddingX=1, paddingY=1, bgFn)` giving the 1-column
-gutter (`paddingX`) and the colored blank line above **and** below the content (`paddingY`) you see
-around every tool row. `renderShell: "self"` swaps that `Box` for a bare `selfRenderContainer` and
-hands *all* framing to your component — you emit exactly the lines you want, no more, no less. The
-catch: self mode **drops Pi's colored `Box` entirely** — plain container, exactly one plain `""`
-inter-block separator prepended, **no background**. So `renderShell: "self"` is the only lever that
-removes the padding, but any row that takes it must re-apply the state background itself.
+`ToolExecutionComponent` (in `dist/modes/interactive/components/tool-execution.js`) normally wraps
+a row in a state-background `Box` with horizontal and vertical padding. `renderShell: "self"` swaps
+that Box for Pi's bare self-render container; Pi still owns the single blank separator between
+transcript blocks, but the component owns every tool-row line.
 
-PiCC uses this today to de-pad **every** tool row (all Claude-named tools *and* the re-registered
-built-ins). A generic **self-shell wrapper** (`wrapForSelfShell` in `src/runtime/tool-shell.ts`) is
-applied at both tool-registration seams. Lowercase Edit is the exception inside that generic frame:
-Pi's call renderer returns its own padded `Box`, so `withRoutineToolRendering` first removes only
-that Box's verified outer padding pair while retaining its interior spacer and state. The
-`withDefaultCollapsedToolRendering` adapter compacts only recognized settled interactive
-successes. The configured `app.tools.expand` action restores native call/result detail. Live,
-exceptional, unfamiliar, and unbound-action rows remain elaborated; malformed display fields fall
-back to a concise warning. For any tool
-the generic wrapper sets `renderShell: "self"`, strips the leading/trailing blank lines, keeps the
-1-column gutter, and **re-applies `theme.bg` per line** — self-render drops the tint deliberately, so PiCC
-frames the row with a real pi-tui `Box(paddingY=0)` (content clamped to `width - 2*gutter`, then
-gutter + width-fill, painted via the theme's own `bg`) — byte-exact with Pi's default row, minus the
-padding, and inheriting Box's render cache. Read `tool-shell.ts` before touching this:
-the framing step order (strip/clamp before the Box paints) and the throw-guards on `theme.bg` are load-bearing — self-render is *not*
-wrapped in Pi's try/catch, so an unguarded throw (unknown bg slot, absent theme, a negative
-`repeat`) kills Pi's whole render loop; a headless / no-theme render degrades to plain text.
+PiCC applies `wrapForSelfShell` to every main-session Claude-named tool and re-registered built-in.
+It strips outer blank lines, clamps native content to `width - 2`, and prefixes exactly one state
+glyph on the first visible line: muted `○` while running, green `●` after meaningful success, red
+`✗` after failure, or `■` for stopped/aborted lifecycle work. Continuation lines use two spaces, so
+wrapped text, diffs, and textual image fallbacks align beneath content. It never calls `theme.bg`;
+main-session invocation rows therefore have no state background. Foreground styling is accepted
+only when it is balanced and safe, and a missing or hostile theme degrades to a plain glyph.
+
+The construction order is load-bearing: search specialization → routine/Edit rendering →
+`withDefaultCollapsedToolRendering` → `wrapForSelfShell` → the outer checkpoint gate →
+registration. Presentation decorators leave the raw built-in `execute` unchanged. Only the outer
+checkpoint gate wraps it, and that gate may alter the returned result by adding `terminate`. The
+collapse adapter recognizes only settled ordinary successes. The configured `app.tools.expand`
+action changes native detail without changing the glyph; live, exceptional, unfamiliar, and unbound-action rows keep their native detail
+inside the same outer glyph frame, while malformed display fields use a concise warning.
+
+Lowercase Edit needs one inner exception. Pi's call renderer retains a stateful padded `Box` through
+`ctx.lastComponent`; `withRoutineToolRendering` keeps that exact Box in a WeakMap, removes only its
+recognized outer padding pair, and neutralizes its background immediately before every render
+because Pi can reapply a state background during updates. Native diff colors and the interior spacer
+remain. Binary image components are added outside the textual self-render container and remain
+Pi-owned and unmodified; only their textual fallbacks participate in continuation alignment.
+
+HTML export is a separate Pi-owned surface, not TUI visual parity. Pi retains outer
+`.tool-execution.pending|success|error` cards and template-renders its built-in tools. Eligible
+custom renderer fragments can inherit phase-local glyphs through Pi's shared TUI-to-HTML renderer;
+escaping and canonical session data remain Pi-owned. PiCC does not patch the exporter to make those
+fragments uniform.
 
 - **Own tools with a renderer:** the wrapper invokes the tool's own `renderCall`/`renderResult`,
-  including renderers added by a registration-time decorator, then frames the result via the Box.
+  including renderers added by a registration-time decorator, then adds foreground glyph framing.
 - **Own tools without a renderer:** the wrapper injects a **generic fallback** reproducing Pi's own
   `createCallFallback` (bold tool title) and `createResultFallback` (`getTextOutput` result text),
-  so a renderer-less tool de-pads without anyone writing a bespoke renderer.
+  so a renderer-less tool gets the same glyph frame without a bespoke renderer.
 - **Built-ins** (`bash`/`read`/`write`/`edit`/`grep`/`find`/`ls`): **wrapped, not reimplemented.** PiCC
   re-registers these for cwd-swap (`src/index.ts`, the "Cwd-swapping overrides" block). Their
   renderers are sourced from the public `create*ToolDefinition` factories — the plain `create*Tool`
   factory strips `renderCall`/`renderResult` via `wrapToolDefinition` — while **`execute` stays
-  sourced from the plain factory unchanged**. Edit's narrow call adapter preserves the inner Box in
-  `ctx.lastComponent`; MultiEdit delegates a detached successful diff snapshot to the public Edit
-  result renderer instead of implementing another diff path. The settled-collapse adapter composes
+  sourced from the plain factory until the one outer checkpoint wrapper**. Edit's narrow call
+  adapter preserves the inner Box in `ctx.lastComponent`; MultiEdit delegates a detached successful
+  diff snapshot to the public Edit result renderer instead of implementing another diff path. The
+  settled-collapse adapter composes
   those native renderers rather than replacing them and is installed only on main-session
-  definitions; subagent built-ins remain raw. Execution remains byte-identical (live-cwd
-  re-resolution, bash spawnHook/env, and `read`'s `ctx?.model` non-vision note all preserved).
+  definitions; subagent built-ins remain raw. Presentation leaves raw built-in execution
+  byte-identical (live-cwd re-resolution, bash spawnHook/env, and `read`'s `ctx?.model` non-vision
+  note all preserved); only the outer checkpoint gate may add `terminate` to the returned result.
 - **`ctx.lastComponent` threading is the load-bearing coupling.** `ToolExecutionComponent` caches
-  the component we return and hands it back as `ctx.lastComponent` on the next render; the built-ins
-  reuse it for incremental state (`read`/`bash` via `?? new …`, `edit` via an `instanceof Box`
-  reuse). A naive wrap would hand the inner renderer *our* wrapper and silently lose that state
-  (`edit` especially), so the wrapper stashes the inner component (`__inner`) and threads the
-  *previous inner* component back. This couples to Pi's render contract, and the coupling is
+  the outer component we return and hands it back as `ctx.lastComponent` on the next render; the
+  built-ins reuse their inner components for incremental state (`read`/`bash` via `?? new …`,
+  `edit` via an `instanceof Box` reuse). A naive wrap would hand the inner renderer the outer
+  wrapper and silently lose that state. PiCC instead records outer → inner metadata in the
+  `wrapperMetadata` WeakMap and threads the retained previous inner component back. This couples to
+  Pi's render contract, and the coupling is
   **pinned**: a contract test drives the real `ToolExecutionComponent` and asserts Pi hands the
   previously-returned component back as `ctx.lastComponent` on the next render (undefined on the
   first), for both the `renderCall` and `renderResult` slots (`test/pi-contract.test.ts`). PiCC's
@@ -367,9 +377,10 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
   tool rows, `src/runtime/subagent-panel-render.ts` (+ `subagent-panel-model.ts`,
   `render-util.ts`) for a pure widget/component view.
 - Tool-row framing: specialized/routine adapters → `withDefaultCollapsedToolRendering` →
-  `wrapForSelfShell` (`src/runtime/tool-shell.ts`). This de-pads every main-session row while compacting
-  only safely recognized settled successes; expansion restores native detail. Live, exceptional,
-  unfamiliar, and unbound rows remain elaborated; malformed display fields fall back to a concise
+  `wrapForSelfShell` (`src/runtime/tool-shell.ts`). This removes main-session state backgrounds and
+  adds one lifecycle glyph while compacting only safely recognized settled successes; expansion
+  changes native detail without changing the marker. Live, exceptional, unfamiliar, and unbound
+  rows retain native detail inside the frame; malformed display fields fall back to a concise
   warning (see "`renderShell` — this is how you control blank lines and framing").
 
 **Untapped but available right now:** `ctx.ui.setFooter`/`setHeader`, `ctx.ui.setStatus`,
@@ -402,8 +413,9 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
    there; don't assume ambient access.
 3. **Rendering:** width-clamp with pi-tui's own measure, sanitize untrusted text before the clamp,
    null-guard the theme, never mutate `result.content`. (Copy `subagent-render.ts`.)
-4. **Framing:** use `renderShell: "self"` only when you truly want to own every line; otherwise the
-   default shell gives you gutter + diffs + truncation for free.
+4. **Framing:** use `renderShell: "self"` only when you truly want to own every line. The default
+   shell supplies padded state-background framing only; renderers still own content, diffs, and
+   width safety.
 5. **Color:** prefer an existing `ThemeColor` slot over raw ANSI so themes keep working; there are
    no new slots.
 6. **Keys:** add via `registerShortcut` or handle inside your own component; do not try to reassign

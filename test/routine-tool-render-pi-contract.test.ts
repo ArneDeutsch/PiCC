@@ -109,7 +109,10 @@ describe("real Pi routine rendering composition", () => {
         expect(stripAnsi(lines[lines.length - 1] ?? "").trim()).not.toBe("");
         expect(lines.filter((line) => stripAnsi(line).trim() === "")).toHaveLength(2);
       }
-      expect(settled.map(stripAnsi)).toEqual(preview.map(stripAnsi));
+      expect(stripAnsi(preview.join("\n"))).toContain("○ ");
+      expect(stripAnsi(settled.join("\n"))).toContain("● ");
+      expect(settled.map(stripAnsi).map((line) => line.replace("●", "○")))
+        .toEqual(preview.map(stripAnsi));
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -234,7 +237,8 @@ describe("real Pi routine rendering composition", () => {
     component.setArgsComplete();
     const stripAnsi = (line: string) => line.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
     const pending = component.render(200) as string[];
-    expect(pending).toEqual([]);
+    expect(pending).toHaveLength(2);
+    expect(stripAnsi(pending[1] ?? "").trim()).toBe("○");
     expect(pending.join("\n")).not.toContain(entry.pending);
     expect(pending.join("\n")).not.toContain(entry.canonical);
 
@@ -244,7 +248,7 @@ describe("real Pi routine rendering composition", () => {
       const lines = component.render(200) as string[];
       expect(lines).toHaveLength(2);
       expect(lines[0]).toBe("");
-      expect(stripAnsi(lines[1] ?? "").trim()).toBe(entry.row);
+      expect(stripAnsi(lines[1] ?? "").trim()).toBe(`● ${entry.row}`);
       expect(lines.join("\n")).not.toContain(entry.pending);
       expect(lines.join("\n")).not.toContain(entry.canonical);
     }
@@ -335,7 +339,7 @@ describe("real Pi routine rendering composition", () => {
   it.each(cases)("keeps ordinary $name HTML result compact while malformed/error results remain visible", async (entry) => {
     const { renderer } = await htmlHarness(entry);
     const id = `html-${entry.name}`;
-    expect(renderer.renderCall(id, entry.name, entry.args)).toBe("");
+    renderer.renderCall(id, entry.name, entry.args);
     const rendered = renderer.renderResult(
       id,
       entry.name,
@@ -388,7 +392,7 @@ describe("real Pi routine rendering composition", () => {
     };
     const { renderer } = await htmlHarness(entry, hostileTheme);
     const id = `html-degraded-${entry.name}`;
-    expect(renderer.renderCall(id, entry.name, entry.args)).toBe("");
+    renderer.renderCall(id, entry.name, entry.args);
     const rendered = renderer.renderResult(
       id,
       entry.name,
@@ -418,7 +422,7 @@ describe("real Pi routine rendering composition", () => {
       width: 100,
     });
     const enterId = "html-enter-worktree";
-    expect(renderer.renderCall(enterId, "EnterWorktree", { name: "html" })).toBe("");
+    renderer.renderCall(enterId, "EnterWorktree", { name: "html" });
     const ordinary = renderer.renderResult(
       enterId,
       "EnterWorktree",
@@ -603,7 +607,6 @@ describe("real Pi routine rendering composition", () => {
       const rendered = data.renderedTools?.[toolCallId];
 
       expect(JSON.stringify(canonical?.message?.content)).toContain(entry.hidden);
-      expect(rendered?.callHtml).toBeUndefined();
       expect(rendered?.resultHtmlExpanded).toContain(entry.invocation);
       expect(rendered?.resultHtmlExpanded).not.toContain(entry.hidden);
       expect(rendered?.resultHtmlCollapsed).toBeUndefined();

@@ -1,10 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
+import { createRequire } from "node:module";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { initTheme, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { withRoutineToolRendering } from "../src/runtime/routine-tool-render.js";
+import {
+  adaptedEditPreviewError,
+  withRoutineToolRendering,
+} from "../src/runtime/routine-tool-render.js";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 import { createWebFetchTool, createWebSearchTool } from "../src/runtime/tools/web-tools.js";
+
+const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+const piTuiEntry = requireFromPi.resolve("@earendil-works/pi-tui");
+const { Box: PiBox } = await import(pathToFileURL(piTuiEntry).href) as typeof import("@earendil-works/pi-tui");
 
 interface Component {
   render(width: number): string[];
@@ -552,6 +561,56 @@ describe("routine tool rendering decorator", () => {
     expect(seen[0]).toBeUndefined();
     expect(seen[2]).toBe(inners[1]);
     expect((tool as any).renderResult).toBe((source as any).renderResult);
+  });
+
+  it("neutralizes the exact retained Edit Box before every render without breaking identity evidence", () => {
+    const stateBackgrounds = ["pending", "success", "error"];
+    const box = Object.assign(new PiBox(0, 1, (text) => `pending:${text}`), {
+      preview: { error: "preview refused" },
+    });
+    box.addChild({ render: () => ["path", "- old", "+ new"], invalidate() {} });
+    const seen: unknown[] = [];
+    const source = {
+      name: "edit",
+      renderCall(_args: unknown, _theme: unknown, context: { lastComponent?: unknown }) {
+        seen.push(context.lastComponent);
+        return context.lastComponent ?? box;
+      },
+      renderResult() { return { render: () => ["result"] }; },
+    } as unknown as ToolDefinition;
+    const tool = decorate(source);
+    const adapted = tool.renderCall({}, undefined, {});
+    const setBgFn = vi.spyOn(box, "setBgFn");
+
+    for (const state of stateBackgrounds) {
+      box.setBgFn((text) => `${state}:${text}`);
+      expect(adapted.render(20).map((line) => line.trimEnd())).toEqual(["path", "- old", "+ new"]);
+    }
+    const neutralizers = setBgFn.mock.calls
+      .map(([background]) => background)
+      .filter((background) => !stateBackgrounds.some((state) => background?.("") === `${state}:`));
+    expect(neutralizers).toHaveLength(3);
+    expect(new Set(neutralizers).size).toBe(1);
+    expect(adaptedEditPreviewError(adapted)).toBe("preview refused");
+
+    const reused = tool.renderCall({}, undefined, { lastComponent: adapted });
+    expect(seen).toEqual([undefined, box]);
+    expect(reused.render(20).map((line) => line.trimEnd())).toEqual(["path", "- old", "+ new"]);
+    expect(adaptedEditPreviewError(reused)).toBe("preview refused");
+  });
+
+  it("does not treat Box-like objects as public Edit Boxes", () => {
+    const setBgFn = vi.fn();
+    const boxLike = {
+      setBgFn,
+      render: (width: number) => [" ".repeat(width), "path", " ".repeat(width)],
+    };
+    const tool = decorate({
+      name: "edit",
+      renderCall: () => boxLike,
+    } as unknown as ToolDefinition);
+    expect(tool.renderCall({}, undefined, {}).render(8)).toEqual(["path"]);
+    expect(setBgFn).not.toHaveBeenCalled();
   });
 
   it("keeps Edit edge rows unless both are exactly the known full-width padding", () => {
