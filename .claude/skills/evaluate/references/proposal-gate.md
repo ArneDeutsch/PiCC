@@ -254,17 +254,20 @@ one of:
 proposal-gate is called from two `implement-feature` reference files, with **different force**:
 
 - **Phase 8 issue-filing offer** —
-  [phase-8-file-finding.md](../../implement-feature/references/phase-8-file-finding.md). It **gates**
-  the machine-surfaced findings: **clear slop is dropped**, but with a
-  **one-line tally that says dropped findings remain in `review.md` only as run-local staging lost with
-  worktree cleanup and that no durable issue was filed** (e.g. "(N low-value findings not offered — they remain
-  in review.md as run-local staging until worktree cleanup; no durable issue was filed.)"). The tally is
-  an **in-flow lever, not just a pointer**: a maintainer who disagrees with the gate can **ask to see the
-  gate-dropped findings**, and the coordinator **surfaces them into the pick-list on request** while the
-  run remains active. Only a user-approved filed GitHub issue is durable cross-feature tracking.
-  Borderline-and-above findings are **surfaced with the assessment embedded** and the existing
-  **per-item user choice preserved** — the gate only ever **subtracts clear slop, never adds**, and
-  never hard-drops a borderline finding the user might still want.
+  [phase-8-file-finding.md](../../implement-feature/references/phase-8-file-finding.md). When every
+  reachability precondition succeeds, it **gates** the machine-surfaced findings: **clear slop is
+  dropped**, but with a **one-line tally that says dropped findings remain in `review.md` only as
+  run-local staging lost with worktree cleanup and that no durable issue was filed** (e.g. "(N
+  low-value findings not offered — they remain in review.md as run-local staging until worktree
+  cleanup; no durable issue was filed.)"). The tally is an **in-flow lever, not just a pointer**: a
+  maintainer who disagrees with the gate can **ask to see the gate-dropped findings**, and the
+  coordinator **surfaces them into the pick-list on request** while the run remains active. Only a
+  user-approved filed GitHub issue is durable cross-feature tracking. Borderline-and-above findings
+  are **surfaced with the assessment embedded** and the existing **per-item user choice preserved** —
+  the gate only ever **subtracts clear slop, never adds**, and never hard-drops a borderline finding
+  the user might still want. If any reachability precondition fails, do not invoke proposal-gate;
+  defer to implement-feature's branch that presents every eligible still-actionable finding
+  **UNASSESSED** instead.
 - **Phase 1 ticket-creation offer** —
   [ticket-creation.md](../../implement-feature/references/ticket-creation.md). proposal-gate **only
   annotates**: it rates whether the human's just-converged scope looks valuable and the assessment is

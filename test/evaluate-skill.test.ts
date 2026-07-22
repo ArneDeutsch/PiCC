@@ -260,6 +260,26 @@ describe("proposal-gate mode floor markers", () => {
     expect(routerBody).toContain("no github writes");
     expect(routerBody).toContain("read-only `evaluator` sandbox agent");
   });
+
+  it("qualifies both resident Phase 8 descriptions as online-only and defers offline handling", () => {
+    const { skills } = loadSkills([{ dir: SKILLS_DIR, scope: "project" }], []);
+    const skill = skills.find((s) => s.name === "evaluate");
+    const routerBody = loadSkillBody(skill!).toLowerCase().replace(/\s+/g, " ");
+    const intro = routerBody.slice(0, routerBody.indexOf("## the three modes"));
+    const modeStart = routerBody.indexOf("- **proposal-gate**");
+    const modeEnd = routerBody.indexOf("- **pr-eval**", modeStart);
+    expect(modeStart).toBeGreaterThanOrEqual(0);
+    expect(modeEnd).toBeGreaterThan(modeStart);
+    const mode = routerBody.slice(modeStart, modeEnd);
+
+    for (const description of [intro, mode]) {
+      expect(description).toContain("only after successful reachability");
+      expect(description).toContain("on reachability failure");
+      expect(description).toContain("defer to implement-feature's offline branch");
+      expect(description).toContain("skips proposal scoring/slop dropping");
+      expect(description).toContain("presents every eligible still-actionable finding unassessed");
+    }
+  });
 });
 
 describe("proposal-gate grounding + evidence anchors", () => {

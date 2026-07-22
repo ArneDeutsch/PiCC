@@ -1,6 +1,6 @@
 # Phase 6 — Plan review & approval
 
-Before review dispatch or triage, read or re-read [review-triage.md](review-triage.md), the canonical current-feature gate. If it is unreadable, refuse review-driven plan writes or scope expansion and stop. Dispatch prompts are governed by [dispatch-discipline.md](dispatch-discipline.md) — read it before your first fan-out; if it cannot be read, do not dispatch.
+Before review dispatch or triage, read or re-read [review-triage.md](review-triage.md), the canonical current-feature gate. If it is unreadable, refuse both review-driven plan writes and scope expansion, then stop. Dispatch prompts are governed by [dispatch-discipline.md](dispatch-discipline.md) — read it before your first fan-out; if it cannot be read, do not dispatch.
 
 Fan out reviewers over the whole plan folder `doc/plan/<feature-slug>/` (its `feature.md` + all `tasks/` specs), in parallel, in review mode. Before findings are collected, require every reviewer to follow the canonical reference's **Safe verification** rule while gathering its **Decision-ready review evidence** for every proposed remedy affecting accepted scope or a durable surface:
 

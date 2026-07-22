@@ -14,11 +14,20 @@ This is the **sibling** of the Phase 1 ticket-creation offer ([ticket-creation.m
 
 It runs regardless of whether a ticket ref was given — surfaced work is worth tracking either way — so first confirm GitHub is reachable with the gate's own preconditions (`gh` installed, `gh auth status` authenticated, and a resolvable `target` repo — [fork.md](fork.md), `origin`'s repo on a maintainer checkout, the upstream `parent` on a fork).
 
-If any reachability precondition fails, disable only GitHub existing-issue search and issue filing; the filesystem-only proposal gate and finding presentation still run. First assess the findings through the gate, then present its assessed pick-list with filing visibly marked unavailable, and only then complete the offer. Say that no durable cross-feature record was created: `observations.md` and `review.md` remain run-local staging records and are lost with worktree cleanup; do not imply that either persists.
+If any reachability precondition fails:
+
+1. Disable GitHub existing-issue search, proposal-gate/evaluator scoring, and issue filing.
+2. Do not invoke the proposal gate, apply its clear-slop dropping, or otherwise score or suppress findings.
+3. Build the eligible set from **every still-actionable deferred or follow-up entry** under `review.md`'s **Bugs discovered** and **Proposed follow-ups** sections. Exclude entries recorded as fixed or otherwise resolved, wrong/duplicate/non-actionable notes, and process-only observations that propose no repository or product follow-up.
+4. Present each eligible item exactly once in one pick-list, marking every item explicitly **UNASSESSED**. Mark filing visibly unavailable.
+5. State that this is an honest run-local presentation and that no durable cross-feature record or issue was created: `observations.md` and `review.md` are run-local staging records lost with worktree cleanup; do not imply that either persists.
+6. **Stop this branch here.** Do not continue into any remaining gate, search, online-presentation, or filing section below.
+
+The remainder of this file applies only after **every** reachability precondition succeeds. On the failed-reachability branch, complete the offer now, before feature completion.
 
 ## Gate through evaluate's proposal-gate
 
-**Before presenting the findings, gate them through evaluate's proposal-gate** ([../../evaluate/references/proposal-gate.md](../../evaluate/references/proposal-gate.md) — the read-only sandbox scorer, structurally no GitHub writes): it scores each finding against the shared rubric and **silently drops clear slop**, emitting a truthful **one-line tally**: "(N low-value findings not offered — they remain in review.md as run-local staging until worktree cleanup; no durable issue was filed.)" Nothing vanishes invisibly, but the tally must not imply persistence.
+**When the reachability preconditions pass, before presenting the findings, gate them through evaluate's proposal-gate** ([../../evaluate/references/proposal-gate.md](../../evaluate/references/proposal-gate.md) — the read-only sandbox scorer, structurally no GitHub writes): it scores each finding against the shared rubric and **silently drops clear slop**, emitting a truthful **one-line tally**: "(N low-value findings not offered — they remain in review.md as run-local staging until worktree cleanup; no durable issue was filed.)" Nothing vanishes invisibly, but the tally must not imply persistence.
 
 That tally is an **in-flow lever, not just a pointer to `review.md`**: a maintainer who disagrees with the gate can **ask to see the gate-dropped findings, and you surface them into the pick-list on request** while the run remains active. They are not durable unless the user approves filing and a GitHub issue is created.
 
@@ -30,7 +39,7 @@ The `--search` terms are **coordinator-authored** — your own independent parap
 
 This is a pure **read** — it files, closes, comments on, and labels nothing, so the Rule 5 allow-list is unchanged and no write verb is added.
 
-Per [../../evaluate/references/proposal-gate.md](../../evaluate/references/proposal-gate.md)'s **#66 novelty rule + anti-suppression floor**, an already-tracked hit **lowers** a finding's novelty but **never by itself** drops it below the file/keep-open threshold; surface it to the human as a **candidate** near-match ("possible existing coverage: <url> — verify before acting"), never an overclaimed "already tracked", and if the search cannot run (gh absent/unauth/rate-limited/error) degrade **visibly** ("existing-issue check unavailable — novelty not cross-checked against GitHub"), never silently.
+Per [../../evaluate/references/proposal-gate.md](../../evaluate/references/proposal-gate.md)'s **#66 novelty rule + anti-suppression floor**, an already-tracked hit **lowers** a finding's novelty but **never by itself** drops it below the file/keep-open threshold; surface it to the human as a **candidate** near-match ("possible existing coverage: <url> — verify before acting"), never an overclaimed "already tracked". After successful reachability preflight, a per-call search failure such as a rate limit, error, or timeout degrades **visibly** ("existing-issue check unavailable — novelty not cross-checked against GitHub"), never silently; globally absent or unauthenticated `gh` has already taken the terminating offline branch above.
 
 Populate `github_verified` **only** from that JSON's `number`/`url`, never from a target-body `#N`, and validate the anchor URL in its own lane (`github.com` on `<target>`, reject foreign-repo).
 
