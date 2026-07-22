@@ -1,7 +1,9 @@
 import path from "node:path";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { HookRunner } from "../../engine/hook-runner.js";
+import type { HookOutcome } from "../../types.js";
 import type { CwdState } from "../cwd-state.js";
 import type { WorktreeManagerLike } from "../subagents.js";
 
@@ -16,7 +18,21 @@ export function createWorktreeTools(deps: {
   };
   cwdState: CwdState;
   hookRunner: HookRunner;
+  captureUniversalStop?: () => () => boolean;
 }): Record<string, unknown>[] {
+  const applyUniversalStop = (
+    outcome: HookOutcome,
+    stopRun: (() => boolean) | undefined,
+    ctx?: Pick<ExtensionContext, "abort">,
+  ) => {
+    if (!outcome.stop) return undefined;
+    const accepted = stopRun?.() ?? false;
+    if (accepted) {
+      try { ctx?.abort(); } catch { /* lifecycle cleanup and its result remain authoritative */ }
+    }
+    return outcome.stopReason ?? "Worktree hook requested stop";
+  };
+
   const enterTool = {
     name: "EnterWorktree",
     label: "EnterWorktree",
@@ -26,7 +42,13 @@ export function createWorktreeTools(deps: {
       name: Type.Optional(Type.String({ description: "New worktree name (branch worktree-<name>)" })),
       path: Type.Optional(Type.String({ description: "Existing worktree path to re-enter" })),
     }),
-    async execute(_id: string, params: { name?: string; path?: string }) {
+    async execute(
+      _id: string,
+      params: { name?: string; path?: string },
+      _signal?: AbortSignal,
+      _onUpdate?: unknown,
+      ctx?: Pick<ExtensionContext, "abort">,
+    ) {
       const previous = deps.cwdState.getWorktree();
       const result = await deps.worktrees.enter({ name: params.name, path: params.path });
       if (!result.ok || !result.worktreePath) {
@@ -51,12 +73,15 @@ export function createWorktreeTools(deps: {
       }
       deps.cwdState.enterWorktree(result.worktreePath);
       const created = (result as { created?: boolean }).created ?? false;
+      let stopReason: string | undefined;
       if (created) {
-        await deps.hookRunner.fire("WorktreeCreate", {
+        const stopRun = deps.captureUniversalStop?.();
+        const outcome = await deps.hookRunner.fire("WorktreeCreate", {
           worktree_path: result.worktreePath,
           branch: (result as { branch?: string }).branch,
           cwd: result.worktreePath,
         });
+        stopReason = applyUniversalStop(outcome, stopRun, ctx);
       }
       const seeded = (result as { seededFiles?: string[] }).seededFiles ?? [];
       const lines = [
@@ -65,6 +90,7 @@ export function createWorktreeTools(deps: {
         seeded.length ? `Seeded from .worktreeinclude: ${seeded.join(", ")}` : undefined,
         releasedLine,
         "The session working directory is now inside the worktree; all relative paths and shell commands run there.",
+        stopReason ? `WorktreeCreate hook stopped further model processing: ${stopReason}` : undefined,
       ].filter(Boolean);
       return {
         content: [{ type: "text", text: lines.join("\n") }],
@@ -81,6 +107,7 @@ export function createWorktreeTools(deps: {
                 ...(previousKeepError !== undefined ? { previousKeepError } : {}),
               }
             : {}),
+          ...(stopReason ? { stoppedByHook: true, stopReason } : {}),
         },
       };
     },
@@ -94,7 +121,13 @@ export function createWorktreeTools(deps: {
     parameters: Type.Object({
       action: StringEnum(["keep", "remove"] as const),
     }),
-    async execute(_id: string, params: { action: "keep" | "remove" }) {
+    async execute(
+      _id: string,
+      params: { action: "keep" | "remove" },
+      _signal?: AbortSignal,
+      _onUpdate?: unknown,
+      ctx?: Pick<ExtensionContext, "abort">,
+    ) {
       const worktreePath = deps.cwdState.getWorktree();
       if (!worktreePath) {
         return {
@@ -102,11 +135,14 @@ export function createWorktreeTools(deps: {
           details: { outcome: "none", restorePath: deps.cwdState.getBase() },
         };
       }
+      let stopReason: string | undefined;
       if (params.action === "remove") {
-        await deps.hookRunner.fire("WorktreeRemove", {
+        const stopRun = deps.captureUniversalStop?.();
+        const outcome = await deps.hookRunner.fire("WorktreeRemove", {
           worktree_path: worktreePath,
           cwd: deps.cwdState.getBase(),
         });
+        stopReason = applyUniversalStop(outcome, stopRun, ctx);
       }
       const result = (await deps.worktrees.exit({ worktreePath, action: params.action })) as {
         ok?: boolean;
@@ -132,8 +168,9 @@ export function createWorktreeTools(deps: {
           : result.orphaned === true
             ? "deferred-removal"
             : "removal-failed";
+      const stopped = stopReason ? `${text}\nWorktreeRemove hook stopped further model processing: ${stopReason}` : text;
       return {
-        content: [{ type: "text", text }],
+        content: [{ type: "text", text: stopped }],
         details: {
           ok: result.ok,
           removed: result.removed,
@@ -143,6 +180,7 @@ export function createWorktreeTools(deps: {
           worktreePath,
           outcome,
           restorePath: deps.cwdState.getBase(),
+          ...(stopReason ? { stoppedByHook: true, stopReason } : {}),
         },
       };
     },

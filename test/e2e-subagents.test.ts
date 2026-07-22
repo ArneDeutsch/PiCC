@@ -5,12 +5,15 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   BASH_AVAILABLE,
+  CHECKPOINT_CONTEXT_WINDOW,
+  CHECKPOINT_USAGE,
   cliMissing,
   createE2ELive,
   systemText,
   TEST_TIMEOUT_MS,
   toolNames,
   toolResultText,
+  writeCheckpointConfig,
   CLI_PATH,
 } from "./helpers/e2e-live.js";
 import type { CapturedRequest } from "./helpers/mock-openai.js";
@@ -62,6 +65,101 @@ describe.skipIf(cliMissing)(
     }
 
     it(
+      "retries and commits one real foreground-child compaction before returning one parent result",
+      async () => {
+        const child = (request: CapturedRequest) => request.sessionKind === "child";
+        const parent = (request: CapturedRequest) => request.sessionKind === "main";
+        const childErrorSentinels = ["CHILD_SUMMARY_SECRET_T05", "C:/private/child/session.jsonl", "CHILD_TRANSCRIPT_T05"];
+        const result = await runPi({
+          persistSession: true,
+          classifier: {
+            childUserMessages: ["finish all child reads"],
+            childSystemMarkers: ["You are a read-only exploration agent"],
+          },
+          contextWindow: CHECKPOINT_CONTEXT_WINDOW,
+          piSettings: { compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 1 } },
+          setup(fixtureDir) {
+            writeCheckpointConfig(fixtureDir);
+            fs.writeFileSync(path.join(fixtureDir, "child-a.txt"), "a".repeat(24_000));
+            fs.writeFileSync(path.join(fixtureDir, "child-b.txt"), "b".repeat(24_000));
+            fs.writeFileSync(path.join(fixtureDir, "child-c.txt"), "c".repeat(24_000));
+            fs.writeFileSync(path.join(fixtureDir, "child-d.txt"), "d".repeat(24_000));
+          },
+          script: [
+            {
+              toolCalls: [{
+                name: "Agent",
+                args: { subagent_type: "Explore", prompt: "finish all child reads", run_in_background: false },
+              }],
+            },
+            {
+              when: child,
+              toolCalls: [
+                { name: "read", args: { path: "child-a.txt" } },
+                { name: "read", args: { path: "child-b.txt" } },
+              ],
+            },
+            {
+              when: child,
+              toolCalls: [
+                { name: "read", args: { path: "child-c.txt" } },
+                { name: "read", args: { path: "child-d.txt" } },
+              ],
+              usage: CHECKPOINT_USAGE,
+            },
+            {
+              when: (request) => child(request) && request.requestKind === "compaction",
+              error: { status: 400, sticky: false, message: childErrorSentinels.join(" ") },
+            },
+            { when: (request) => child(request) && request.requestKind === "compaction", text: "CHILD_SUMMARY_T05" },
+            { when: child, text: "CHILD_RESUMED_FINAL_T05" },
+            { when: parent, text: "PARENT_RECEIVED_CHILD_T05" },
+          ],
+          prompt: "run the foreground child",
+          modeArgs: ["--mode", "json", "-p", "run the foreground child"],
+        });
+
+        expect(result.code).toBe(0);
+        expect(result.requests.map((request) => `${request.sessionKind}/${request.requestKind}`)).toEqual([
+          "main/ordinary",
+          "child/ordinary",
+          "child/ordinary",
+          "child/compaction",
+          "child/compaction",
+          "child/ordinary",
+          "main/ordinary",
+        ]);
+        expect(fs.readFileSync(path.join(result.fixture, "child-a.txt"), "utf8")).toHaveLength(24_000);
+        expect(fs.readFileSync(path.join(result.fixture, "child-b.txt"), "utf8")).toHaveLength(24_000);
+        expect(fs.readFileSync(path.join(result.fixture, "child-c.txt"), "utf8")).toHaveLength(24_000);
+        expect(fs.readFileSync(path.join(result.fixture, "child-d.txt"), "utf8")).toHaveLength(24_000);
+        expect(toolResultText(result.requests[6]!)).toContain("CHILD_RESUMED_FINAL_T05");
+        const childSessionFiles: string[] = [];
+        const walkSessions = (dir: string) => {
+          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) walkSessions(full);
+            else if (entry.name.endsWith(".jsonl") && full.includes(".subagents")) childSessionFiles.push(full);
+          }
+        };
+        walkSessions(path.join(result.agentDir, "sessions"));
+        expect(childSessionFiles).toHaveLength(1);
+        const childEntries = SessionManager.open(childSessionFiles[0]!).getEntries();
+        const childCompactions = childEntries.filter((entry) => entry.type === "compaction");
+        expect(childCompactions).toHaveLength(1);
+        expect((childCompactions[0] as { summary: string }).summary).toContain("CHILD_SUMMARY_T05");
+        const visible = `${result.stdout}\n${result.stderr}\n${JSON.stringify(childEntries)}`;
+        for (const sentinel of childErrorSentinels) expect(visible).not.toContain(sentinel);
+        const jsonEvents = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line) as any);
+        const terminalParentMessages = jsonEvents.filter((event) =>
+          event.type === "message_end" && event.message?.role === "assistant" &&
+          JSON.stringify(event.message.content).includes("PARENT_RECEIVED_CHILD_T05"));
+        expect(terminalParentMessages).toHaveLength(1);
+      },
+      TEST_TIMEOUT_MS,
+    );
+
+    it(
       "resolves an explicit child model synchronously with eager parent/child tools and no stored-credential leak",
       async () => {
         const defaultCredentialCanary = "synthetic-default-credential-canary-e2e";
@@ -107,8 +205,7 @@ describe.skipIf(cliMissing)(
         expect(childFirst, "the explicit model must receive the child's first request").toBeDefined();
 
         const eagerParentTools = [
-          "read", "write", "edit", "bash", "grep", "find", "ls",
-          "Grep", "Glob", "MultiEdit", "WebFetch", "WebSearch",
+          "read", "write", "edit", "bash", "grep", "find", "ls", "Grep", "Glob", "MultiEdit", "WebFetch", "WebSearch",
           "Agent", "Task", "SendMessage", "Skill", "SlashCommand",
           "EnterWorktree", "ExitWorktree", "TaskCreate", "TaskUpdate",
           "TaskList", "TaskGet", "TodoWrite", "TaskOutput", "TaskStop",
@@ -550,6 +647,9 @@ describe.skipIf(cliMissing)(
         const isExplore = (r: CapturedRequest) =>
           systemText(r).includes("read-only exploration agent");
         const isParent = (r: CapturedRequest) => !isExplore(r);
+        const providerSecret = "PROVIDER_SECRET_SENTINEL_T05";
+        const providerPath = "C:/private/provider/session.jsonl";
+        const providerTranscript = "TRANSCRIPT_SENTINEL_T05";
         const result = await runPi({
           script: [
             // 0) parent dispatches the Explore subagent synchronously (first request
@@ -573,7 +673,7 @@ describe.skipIf(cliMissing)(
               when: isExplore,
               error: {
                 status: 429,
-                message: "insufficient_quota: mock usage limit drained (E2E-API-DEATH)",
+                message: `insufficient_quota: mock usage limit drained (E2E-API-DEATH) ${"safe-filler-".repeat(60)} ${providerSecret} ${providerPath} ${providerTranscript}`,
               },
             },
             // parent's follow-up once the failed tool result is in
@@ -592,6 +692,11 @@ describe.skipIf(cliMissing)(
         expect(result.stdout).toContain("saw the failure");
         // No crash noise from the failed dispatch.
         expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|unhandledRejection|FATAL/i);
+        const everyVisibleSurface = [result.stdout, result.stderr,
+          ...result.requests.map((request) => toolResultText(request))].join("\n");
+        for (const sentinel of [providerSecret, providerPath, providerTranscript]) {
+          expect(everyVisibleSurface).not.toContain(sentinel);
+        }
       },
       TEST_TIMEOUT_MS,
     );

@@ -565,7 +565,7 @@ describe("HookRunner output contract", () => {
     expect(outcome.updatedInput).toEqual({ command: "npm run lint", description: "lint" });
   });
 
-  it("blocks on Stop-hook style top-level decision/reason and continue:false", async () => {
+  it("keeps event-specific block separate from universal continue:false", async () => {
     const stopJson = '{"decision":"block","reason":"tests not run"}';
     const { runner } = makeRunner({ Stop: [{ hooks: [`echo '${stopJson}'`] }] });
     const outcome = await runner.fire("Stop", {});
@@ -575,8 +575,17 @@ describe("HookRunner output contract", () => {
     const contJson = '{"continue":false,"stopReason":"build failed"}';
     const { runner: runner2 } = makeRunner({ Stop: [{ hooks: [`echo '${contJson}'`] }] });
     const outcome2 = await runner2.fire("Stop", {});
-    expect(outcome2.block).toBe(true);
-    expect(outcome2.blockReason).toBe("build failed");
+    expect(outcome2.block).toBe(false);
+    expect(outcome2.blockReason).toBeUndefined();
+    expect(outcome2.stop).toBe(true);
+    expect(outcome2.stopReason).toBe("build failed");
+
+    const { runner: compactRunner } = makeRunner({
+      PostCompact: [{ hooks: [`echo '${stopJson}'`, `echo '${contJson}'`] }],
+    });
+    const compact = await compactRunner.fire("PostCompact", { trigger: "auto" });
+    expect(compact.block).toBe(false);
+    expect(compact.stop).toBe(true);
   });
 
   it("captures plain stdout for UserPromptSubmit but ignores it for PreToolUse", async () => {
@@ -628,6 +637,7 @@ describe("HookRunner output contract", () => {
   it("scopes exit-2 blocking: SessionStart exit 2 degrades to a warning, not a block", async () => {
     const { runner } = makeRunner({
       SessionStart: [{ hooks: ["echo not-blockable-here >&2; exit 2"] }],
+      SubagentStart: [{ hooks: ["echo subagent-start-not-blockable >&2; exit 2"] }],
       Stop: [{ hooks: ["echo stop-me >&2; exit 2"] }],
     });
     const start = await runner.fire("SessionStart", { source: "startup" });
@@ -640,6 +650,10 @@ describe("HookRunner output contract", () => {
           d.message.includes("not-blockable-here"),
       ),
     ).toBe(true);
+
+    const subagentStart = await runner.fire("SubagentStart", { agent_type: "plugin:reviewer" });
+    expect(subagentStart.block).toBe(false);
+    expect(subagentStart.diagnostics.some((d) => d.message.includes("subagent-start-not-blockable"))).toBe(true);
 
     // Blockable events keep the exit-2 block contract.
     const stop = await runner.fire("Stop", {});

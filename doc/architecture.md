@@ -36,7 +36,7 @@ in see [`doc/testing.md`](testing.md).
 ### The Pi ⇄ PiCC boundary
 
 PiCC is **not a fork** of Pi. Pi is an ordinary npm dependency, and PiCC attaches as a single
-extension whose entry is `src/index.ts`; the pinned packages and versions are recorded in
+extension whose entry is `src/index.ts`; the accepted package range and lockfile-tested versions are recorded in
 [`doc/pi-integration.md`](pi-integration.md). Pi supplies everything model- and UI-related; PiCC
 supplies Claude Code compatibility and **never** reimplements auth, the provider layer, or the TUI
 shell. A change that would duplicate a Pi responsibility inside `src/` is the wrong change — extend
@@ -180,8 +180,10 @@ where to start reading, not the extent of its cluster.
 
 - **Context assembly** (`context-assembly.ts`) — assembles the instruction set into the system-prompt
   suffix. Rebuilt every turn, the suffix is never compacted away: **this is the primary
-  compaction-preservation mechanism**. Its interaction-posture block is main-session-only — a
-  dispatched subagent returns a report, and has no user to converse with.
+  compaction-preservation mechanism**. Resident skill bodies are restored most-recent-first within
+  PiCC's heuristic character budget, which approximates rather than reproduces Claude Code's
+  token-counted policy. Its interaction-posture block is main-session-only — a dispatched subagent
+  returns a report, and has no user to converse with.
 
 - **Subagent dispatch** (`subagents.ts`, plus the registry, progress/render, and background-task
   modules beside it) — one story: spawn a **fresh-context** session per dispatch, gate it per agent,
@@ -198,10 +200,12 @@ where to start reading, not the extent of its cluster.
   of caller — **except `agentName`**, deliberately raw as the registry's name-index key and therefore
   sanitized at every render; render-time sanitization stays as a backstop for the rest. Dispatch mirrors each session's condensed
   progress and per-turn usage accumulation into the registry, which makes the registry the single
-  data source for the status panel and drill-down below. A **user-initiated stop** (from the panel)
-  is permanent: the record carries the marker and `SendMessage` refuses to steer or resume a
-  user-stopped agent — distinct from a model `TaskStop`, after which PiCC still allows resume (the
-  divergence is recorded in the capability registry).
+  data source for the status panel and drill-down below. Registry addresses, including the stable
+  agent id accepted by `TaskStop` for a checkpoint-retained child, exist only for the originating
+  process lifetime. A **user-initiated stop** (from the panel) is permanent: the record carries the
+  marker and `SendMessage` refuses to steer or resume a user-stopped agent — distinct from a model
+  `TaskStop`, after which PiCC still allows resume (the divergence is recorded in the capability
+  registry).
 
 - **Subagent status panel** (`subagent-panel-model.ts`, `subagent-panel-render.ts`,
   `subagent-panel-widget.ts`, `subagent-panel-focus.ts`, with the shared width/theme helpers
@@ -228,6 +232,16 @@ where to start reading, not the extent of its cluster.
 
 - **Skill activation** (`skill-activation.ts`) — the one pipeline (lazy body load → substitution →
   `!`-injection) behind the `Skill` tool, slash commands, and `context: fork` dispatch.
+
+- **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
+  in `subagents.ts`) — a session-local controller owns threshold sampling, complete-tool-batch
+  stopping, bounded compaction retries, queued-input reconciliation, resume, cancellation, and
+  exhaustion. Operational or hook exhaustion remains recoverable in-session; any post-commit
+  restoration, replay, or continuation-start failure is terminal for that session. Clean PiCC-owned tool batches terminate after
+  every requested result;
+  mixed or ambiguous paths abort, while provider guards remain the final fail-closed boundary.
+  Compaction and resume are awaited re-entrant lifecycle work, so the original logical run does not
+  settle between its physical runs. A separate settled-run check remains as a non-resuming fallback.
 
 - **Steering** (`steering.ts`) — per-model steering text and the effort→thinking-level mapping, read
   from a config **outside the project** — outside **because harness state must not touch the target
@@ -339,17 +353,22 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    subagent by agent id or steers a running background one — never a user-stopped one; a panel stop
    is permanent.
 
-7. **`agent_settled` / compaction / shutdown.** `agent_settled` fires the `Stop` hook (exit 2
-   re-prompts the agent, capped to bound a loop). `session_before_compact` / `session_compact` fire
-   `PreCompact`/`PostCompact` and re-inject active skill bodies for mid-turn continuity under
-   Claude's carryover budgets; the system-prompt suffix already preserves the instruction set.
-   At the `agent_settled` boundary PiCC also proactively triggers `ctx.compact()` once usage
-   crosses a configurable percent of the window (`proactiveCompactPercent`) — the
-   extension-side substitute for raising Pi's `reserveTokens`, keeping the session off the edge.
-   PiCC does not retry Pi's own overflow-recovery summarization when it fails (the seam exposes no
-   authed transport to re-run it — an upstream-Pi concern); this proactive early compaction is the
-   resilience mechanism instead. `session_shutdown` fires `SessionEnd`, with the shutdown reason as
-   the matcher subject.
+7. **Cycle boundary / compaction / shutdown.** After a complete assistant/tool cycle reaches
+   `proactiveCompactPercent`, the session-local controller stops another ordinary request, awaits
+   `ctx.compact()` (or the child SDK equivalent), retries operational failures, and resumes the same
+   logical run only after restoration and queued-input reconciliation. The controller permits its
+   own summary request through the provider gate. Mixed, blocked, malformed, or queued tool paths
+   abort and settle before compaction; a separate `agent_settled` sample is a non-resuming fallback.
+   `session_before_compact` / `session_compact` fire compact hooks and restore bounded
+   SessionStart(compact) context followed by recent active skill bodies within PiCC's heuristic
+   character budget; PostCompact output is diagnostic-only, and the system-prompt
+   suffix preserves durable instructions. SessionStart(compact) and PostCompact ordinary block output
+   is diagnostic-only, while universal hook stop closes the committed-summary session. Operational or
+   hook exhaustion leaves admission paused and recoverable; any post-commit failure closes the session
+   and requires replacement. Pi's internally
+   owned overflow recovery remains outside this controller and is not retried by PiCC. `Stop` runs
+   at the logical settlement boundary, and `session_shutdown` joins checkpoint work before firing
+   `SessionEnd`.
 
 ## Mechanical-fidelity decisions (load-bearing)
 
@@ -398,9 +417,10 @@ These are the choices where "close enough" breaks real projects.
 - **Subagent error contract.** Every dispatch is classified into exactly one outcome, and the
   classification — never a normal-looking success — is what reaches the coordinator:
   - **completed** — the run finished; its verbatim final message is returned.
-  - **failed** — the run ended on a terminal API error (e.g. a drained usage limit). The tool reports
-    a **loud failure naming the cause**. An empty success here is the exact failure mode that lets a
-    coordinator commit under-reviewed work believing a subagent approved it.
+  - **failed** — the run ended on a terminal API or session error. The tool reports a **loud,
+    category-authored failure** without exposing raw provider/session error text. An empty success
+    here is the exact failure mode that lets a coordinator commit under-reviewed work believing a
+    subagent approved it.
   - **aborted** — the run was stopped on purpose (Esc, `TaskStop`); distinct from a failure. A signal
     wins on every settle path, and a deliberately stopped background result discards its output.
   - **Partial output is preserved,** delivered inside an explicit cut-off frame rather than dropped;

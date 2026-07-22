@@ -7,6 +7,32 @@ import {
   substituteVariables,
 } from "../claude/skills.js";
 import { preprocessShellInjection } from "../engine/shell-inject.js";
+import type { HookRunnerLike } from "../engine/hook-runner.js";
+
+/** Mutable preservation state owned by one main session or one child dispatch. */
+export interface SkillActivationState {
+  activeSkills: Map<string, string>;
+  denyRules: Map<string, string[]>;
+  scopedHookSkills: Set<string>;
+  hookRunners: HookRunnerLike[];
+  lastRenderHash: Map<string, string>;
+  /** Child dispatches identity-wrap runners created by later skill activations. */
+  wrapHookRunner?: (runner: HookRunnerLike) => HookRunnerLike;
+}
+
+export function newSkillActivationState(
+  activeSkills = new Map<string, string>(),
+  wrapHookRunner?: (runner: HookRunnerLike) => HookRunnerLike,
+): SkillActivationState {
+  return {
+    activeSkills,
+    denyRules: new Map(),
+    scopedHookSkills: new Set(),
+    hookRunners: [],
+    lastRenderHash: new Map(),
+    ...(wrapHookRunner ? { wrapHookRunner } : {}),
+  };
+}
 
 /** The `${CLAUDE_*}` variable set a skill activation substitutes (body + tool rules). */
 export function skillActivationVars(opts: {
@@ -107,9 +133,15 @@ export function skillActivationMessage(skill: ClaudeSkill, rendered: string): st
   ].join("\n");
 }
 
-/** Per-skill compaction re-injection cap (~5k tokens, Claude's carryover budget). */
+/** Replace a resident skill while moving its latest rendering to activation-recency order. */
+export function recordResidentSkill(active: Map<string, string>, name: string, rendered: string): void {
+  active.delete(name);
+  active.set(name, rendered);
+}
+
+/** PiCC heuristic character cap for each latest rendered skill body restored after compaction. */
 export const REINJECT_PER_SKILL_MAX_CHARS = 20_000;
-/** Combined compaction re-injection cap (~25k tokens). */
+/** PiCC heuristic combined character cap for restored latest rendered skill bodies. */
 export const REINJECT_COMBINED_MAX_CHARS = 100_000;
 
 /**

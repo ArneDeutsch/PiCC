@@ -62,6 +62,8 @@ describe("mock OpenAI authorization boundary", () => {
           "messages",
           "model",
           "path",
+          "requestKind",
+          "sessionKind",
           "tools",
         ]);
         expect(

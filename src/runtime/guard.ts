@@ -32,6 +32,8 @@ export interface GuardDeps {
    * facade carries no config — the clip then simply does not run.
    */
   clipMaxTokens?: number;
+  /** Captures generation-bound checkpoint stop authority before hook execution. */
+  captureUniversalStop?: () => () => boolean;
 }
 
 // Pi event payloads are typed loosely here; the pinned shapes are in doc/pi-integration.md.
@@ -42,6 +44,21 @@ type PiApi = {
 
 /** Cap on the serialized structured tool_response delivered to PostToolUse hooks. */
 const TOOL_RESPONSE_MAX_CHARS = 50_000;
+
+// Object identity makes this metadata impossible for model/tool output to forge, while
+// leaving the canonical result details and permission-facing payload unchanged.
+const guardClippedContent = new WeakSet<object>();
+
+/** Whether the guard clipped the canonical content carried by this result. */
+export function toolResultHasGuardClipping(result: unknown): boolean {
+  if (!result || typeof result !== "object") return false;
+  const content = (result as { content?: unknown }).content;
+  return (typeof content === "object" && content !== null) ? guardClippedContent.has(content) : false;
+}
+
+function markGuardClipped(content: unknown): void {
+  if (typeof content === "object" && content !== null) guardClippedContent.add(content);
+}
 
 /** Claude payload `tool_use_id`, when the Pi event carries a tool-call id. */
 function toolUseIdField(event: any): { tool_use_id?: string } {
@@ -120,13 +137,14 @@ export function createGuardExtension(deps: GuardDeps) {
   };
 
   return (pi: PiApi) => {
-    pi.on("tool_call", async (event: any) => {
+    pi.on("tool_call", async (event: any, ctx: any) => {
       const input = (event.input ?? {}) as Record<string, unknown>;
       const call = toClaudeCall(event.toolName, input, deps.getCwd());
 
       const denied = evaluateDeny(call);
       if (denied) return { block: true, reason: denied.reason };
 
+      const stopRun = deps.captureUniversalStop?.();
       const outcome = await deps.hooks.fire(
         "PreToolUse",
         {
@@ -137,6 +155,15 @@ export function createGuardExtension(deps: GuardDeps) {
         },
         call,
       );
+      if (outcome.stop) {
+        const reason = outcome.stopReason ?? "PreToolUse hook requested stop";
+        console.error(`[picc]${where} ${reason}`);
+        const accepted = stopRun?.() ?? false;
+        if (accepted) {
+          try { ctx?.abort?.(); } catch { /* hook stop remains authoritative */ }
+        }
+        return { block: true, reason: `PiCC: tool cancelled because the hook stopped the run: ${reason}` };
+      }
       if (outcome.block) {
         return {
           block: true,
@@ -178,7 +205,7 @@ export function createGuardExtension(deps: GuardDeps) {
       return undefined;
     });
 
-    pi.on("tool_result", async (event: any) => {
+    pi.on("tool_result", async (event: any, ctx: any) => {
       const eventName = event.isError ? "PostToolUseFailure" : "PostToolUse";
       // Clip oversized tool-result text BEFORE the hasHooks gate below, so the
       // backstop fires even for the common project that has no PostToolUse hooks.
@@ -191,6 +218,7 @@ export function createGuardExtension(deps: GuardDeps) {
           ? clipOversizedToolResult(event.content, deps.clipMaxTokens, event.toolName, event.input ?? {})
           : event.content;
       const clipped = clipContent !== event.content;
+      if (clipped) markGuardClipped(clipContent);
       // No hooks configured for this event: skip the payload construction
       // (including the serializability probe over a possibly huge result) and
       // the fire() entirely. Facades without hasHooks degrade to always-fire.
@@ -224,6 +252,7 @@ export function createGuardExtension(deps: GuardDeps) {
               .join("\n")
           : undefined;
       }
+      const stopRun = deps.captureUniversalStop?.();
       const outcome = await deps.hooks.fire(
         eventName,
         {
@@ -235,6 +264,17 @@ export function createGuardExtension(deps: GuardDeps) {
         },
         call,
       );
+      if (outcome.stop) {
+        const reason = outcome.stopReason ?? `${eventName} hook requested stop`;
+        console.error(`[picc]${where} ${reason}`);
+        const accepted = stopRun?.() ?? false;
+        if (accepted) {
+          try { ctx?.abort?.(); } catch { /* hook stop remains authoritative */ }
+        }
+        return clipped
+          ? { content: clipContent, details: event.details, isError: event.isError }
+          : undefined;
+      }
       // Claude semantics: a blocking PostToolUse hook (exit 2 / decision "block")
       // feeds its reason back to the model — this is the post-edit lint-and-fix loop.
       const feedback: string[] = [];
@@ -248,6 +288,7 @@ export function createGuardExtension(deps: GuardDeps) {
       if (feedback.length) {
         const content = Array.isArray(clipContent) ? [...clipContent] : [];
         content.push({ type: "text", text: `\n${feedback.join("\n")}` });
+        if (clipped) markGuardClipped(content);
         return { content, details: event.details, isError: event.isError };
       }
       if (clipped) {

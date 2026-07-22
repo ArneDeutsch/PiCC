@@ -29,7 +29,7 @@ export interface PiCCConfig {
   /**
    * Compaction-resilience knob: percent of the context window at which PiCC
    * proactively triggers Pi's own compaction. **0–100 scale** (NOT a 0–1 fraction) so it
-   * compares directly against Pi's `ContextUsage.percent`. Default 85; valid range 50–95.
+   * compares directly against Pi's `ContextUsage.percent`. Default 90; valid range 50–95.
    * Raw pre-validation file value (a number, or a numeric string from JSON) — validated once
    * via {@link resolveCompactionConfig}; production readers use {@link compaction} instead.
    */
@@ -63,7 +63,7 @@ const DEFAULT_EFFORT_MAP: Record<string, string> = {
 };
 
 /** Percent of the context window at which PiCC proactively compacts (0–100 scale). */
-export const DEFAULT_PROACTIVE_COMPACT_PERCENT = 85;
+export const DEFAULT_PROACTIVE_COMPACT_PERCENT = 90;
 /** Per-text-block token budget above which a single tool result is clipped. */
 export const DEFAULT_CLIP_MAX_TOKENS = 20000;
 
@@ -73,7 +73,7 @@ const PROACTIVE_COMPACT_PERCENT_MIN = 50;
 const PROACTIVE_COMPACT_PERCENT_MAX = 95;
 const CLIP_MAX_TOKENS_MIN = 1000;
 
-/** Fully-defaulted, validated compaction knobs — the seam the proactive-compaction and clip paths read from. */
+/** Fully-defaulted, validated compaction knobs used by checkpoint and clipping paths. */
 export interface ResolvedCompactionConfig {
   /** 0–100 scale (matches Pi `ContextUsage.percent`). Always within [50, 95]. */
   proactiveCompactPercent: number;
@@ -138,7 +138,7 @@ function resolveNumeric(
 /**
  * The single, validated resolver for the compaction-resilience knobs. Called exactly once
  * at load by {@link loadPiCCConfig} (which stores the result on `config.compaction`); the
- * proactive-compaction and clip paths read that field and never re-parse or re-default.
+ * checkpoint and clipping paths read that field and never re-parse or re-default.
  * Invalid values fail closed to the documented defaults with a diagnostic appended to
  * `config.diagnostics`; it never throws.
  */

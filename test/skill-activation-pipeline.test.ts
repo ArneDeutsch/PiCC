@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   budgetSkillReinjection,
+  recordResidentSkill,
   renderSkillForActivation,
   skillActivationMessage,
 } from "../src/runtime/skill-activation.js";
@@ -191,6 +192,14 @@ describe("renderSkillForActivation", () => {
 // ---------------------------------------------------------------------------
 
 describe("budgetSkillReinjection", () => {
+  it("moves a reactivated skill to newest order with only its latest rendering", () => {
+    const active = new Map<string, string>([["first", "OLD"], ["second", "SECOND"]]);
+    recordResidentSkill(active, "first", "NEW");
+    expect([...active.entries()]).toEqual([["second", "SECOND"], ["first", "NEW"]]);
+    expect(budgetSkillReinjection([...active.entries()]).text.indexOf("NEW"))
+      .toBeLessThan(budgetSkillReinjection([...active.entries()]).text.indexOf("SECOND"));
+  });
+
   it("passes small bodies through untouched, most recently activated first", () => {
     const { text, dropped } = budgetSkillReinjection([
       ["oldest", "OLD BODY"],

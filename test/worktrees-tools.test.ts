@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { CwdState } from "../src/runtime/cwd-state.js";
 import { withRoutineToolRendering } from "../src/runtime/routine-tool-render.js";
 import { createWorktreeTools } from "../src/runtime/tools/worktree-tools.js";
+import type { HookOutcome } from "../src/types.js";
 
 /**
  * Tool-layer tests for EnterWorktree / ExitWorktree against a stub
@@ -13,7 +14,13 @@ import { createWorktreeTools } from "../src/runtime/tools/worktree-tools.js";
 type ToolResult = { content: { type: string; text: string }[]; details: Record<string, unknown> };
 type Tool = {
   name: string;
-  execute: (id: string, params: Record<string, unknown>) => Promise<ToolResult>;
+  execute: (
+    id: string,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+    onUpdate?: unknown,
+    ctx?: { abort(): void },
+  ) => Promise<ToolResult>;
 };
 
 interface Call {
@@ -32,8 +39,13 @@ interface ExitStub {
   restorePath?: string;
 }
 
-function makeHarness(opts: { exitResult?: ExitStub; seededFiles?: string[] } = {}) {
+function makeHarness(opts: {
+  exitResult?: ExitStub;
+  seededFiles?: string[];
+  hookOutcomes?: Partial<Record<"WorktreeCreate" | "WorktreeRemove", Partial<HookOutcome>>>;
+} = {}) {
   const calls: Call[] = [];
+  const hookCalls: string[] = [];
   const base = path.resolve(path.sep, "proj-base");
   const wtPath = (name: string) => path.join(base, ".claude", "worktrees", name);
   const worktrees = {
@@ -62,12 +74,24 @@ function makeHarness(opts: { exitResult?: ExitStub; seededFiles?: string[] } = {
   };
   const cwdState = new CwdState(base);
   const hookRunner = {
-    fire: async () => undefined,
+    fire: async (event: "WorktreeCreate" | "WorktreeRemove") => {
+      hookCalls.push(event);
+      return {
+        block: false,
+        askDowngraded: false,
+        diagnostics: [],
+        ...opts.hookOutcomes?.[event],
+      };
+    },
   } as unknown as Parameters<typeof createWorktreeTools>[0]["hookRunner"];
-  const tools = createWorktreeTools({ worktrees, cwdState, hookRunner }) as unknown as Tool[];
+  let universalStops = 0;
+  const tools = createWorktreeTools({
+    worktrees, cwdState, hookRunner,
+    captureUniversalStop: () => () => { universalStops += 1; return true; },
+  }) as unknown as Tool[];
   const enter = tools.find((t) => t.name === "EnterWorktree")!;
   const exit = tools.find((t) => t.name === "ExitWorktree")!;
-  return { calls, cwdState, enter, exit, wtPath, base };
+  return { calls, hookCalls, cwdState, enter, exit, wtPath, base, universalStops: () => universalStops };
 }
 
 function text(res: ToolResult): string {
@@ -167,6 +191,38 @@ describe("EnterWorktree tool: previous-worktree handling", () => {
       previousUnlockAttempted: false,
     });
   });
+
+  it("keeps ordinary WorktreeCreate block output nonblocking", async () => {
+    const h = makeHarness({
+      hookOutcomes: { WorktreeCreate: { block: true, blockReason: "ordinary output" } },
+    });
+    let aborts = 0;
+    const res = await h.enter.execute("t1", { name: "wt-a" }, undefined, undefined, {
+      abort: () => { aborts += 1; },
+    });
+
+    expect(aborts).toBe(0);
+    expect(h.cwdState.getWorktree()).toBe(h.wtPath("wt-a"));
+    expect(text(res)).not.toContain("ordinary output");
+  });
+
+  it("aborts further model processing on a universal WorktreeCreate stop after entering truthfully", async () => {
+    const h = makeHarness({
+      hookOutcomes: { WorktreeCreate: { stop: true, stopReason: "create policy stopped" } },
+    });
+    let aborts = 0;
+    const res = await h.enter.execute("t1", { name: "wt-a" }, undefined, undefined, {
+      abort: () => { aborts += 1; },
+    });
+
+    expect(aborts).toBe(1);
+    expect(h.hookCalls).toEqual(["WorktreeCreate"]);
+    expect(h.cwdState.getWorktree()).toBe(h.wtPath("wt-a"));
+    expect(text(res)).toContain("Created and entered");
+    expect(text(res)).toContain("create policy stopped");
+    expect(res.details).toMatchObject({ stoppedByHook: true, stopReason: "create policy stopped" });
+    expect(h.universalStops()).toBe(1);
+  });
 });
 
 describe("ExitWorktree tool: truthful reporting", () => {
@@ -211,6 +267,44 @@ describe("ExitWorktree tool: truthful reporting", () => {
       outcome: "removed",
       restorePath: h.base,
     });
+  });
+
+  it("keeps ordinary WorktreeRemove block output nonblocking", async () => {
+    const h = makeHarness({
+      hookOutcomes: { WorktreeRemove: { block: true, blockReason: "ordinary output" } },
+    });
+    await h.enter.execute("t1", { name: "wt-a" });
+    let aborts = 0;
+    const res = await h.exit.execute("t2", { action: "remove" }, undefined, undefined, {
+      abort: () => { aborts += 1; },
+    });
+
+    expect(aborts).toBe(0);
+    expect(h.cwdState.getWorktree()).toBeUndefined();
+    expect(text(res)).toContain("Exited and removed worktree");
+    expect(text(res)).not.toContain("ordinary output");
+  });
+
+  it("aborts further model processing on a universal WorktreeRemove stop but still removes and exits", async () => {
+    const h = makeHarness({
+      hookOutcomes: { WorktreeRemove: { stop: true, stopReason: "remove policy stopped" } },
+    });
+    await h.enter.execute("t1", { name: "wt-a" });
+    let aborts = 0;
+    const res = await h.exit.execute("t2", { action: "remove" }, undefined, undefined, {
+      abort: () => { aborts += 1; },
+    });
+
+    expect(aborts).toBe(1);
+    expect(h.hookCalls).toEqual(["WorktreeCreate", "WorktreeRemove"]);
+    expect(h.calls.at(-1)).toEqual({
+      method: "exit", args: { worktreePath: h.wtPath("wt-a"), action: "remove" },
+    });
+    expect(h.cwdState.getWorktree()).toBeUndefined();
+    expect(text(res)).toContain("Exited and removed worktree");
+    expect(text(res)).toContain("remove policy stopped");
+    expect(res.details).toMatchObject({ stoppedByHook: true, stopReason: "remove policy stopped", removed: true });
+    expect(h.universalStops()).toBe(1);
   });
 
   it("keeps the orphaned wording for blocked-but-orphaned removals", async () => {

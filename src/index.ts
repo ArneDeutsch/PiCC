@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -7,15 +8,8 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { HookOutcome, HookPayload, ToolCallDescriptor } from "./types.js";
 import { findByName, loadClaudeProject, type LoadedProject } from "./project.js";
 import { loadPiCCConfig, mapEffort, steeringForModel } from "./runtime/steering.js";
-import {
-  decideProactiveCompaction,
-  initialPendingState,
-  pendingStateAfterCompaction,
-  type ContextUsageShape,
-  type ProactivePendingState,
-} from "./runtime/proactive-compaction.js";
 import { CwdState } from "./runtime/cwd-state.js";
-import { HookRunner } from "./engine/hook-runner.js";
+import { HookRunner, mergeHookOutcomes } from "./engine/hook-runner.js";
 import { PermissionEngine } from "./engine/permissions.js";
 import { parseHookConfig } from "./claude/hooks.js";
 import { WorktreeManager } from "./runtime/worktrees.js";
@@ -48,9 +42,12 @@ import {
 } from "./runtime/context-assembly.js";
 import {
   budgetSkillReinjection,
+  newSkillActivationState,
+  recordResidentSkill,
   renderSkillForActivation,
   skillActivationMessage,
   skillActivationVars,
+  type SkillActivationState,
 } from "./runtime/skill-activation.js";
 import { createWorktreeTools } from "./runtime/tools/worktree-tools.js";
 import { createWebFetchTool, createWebSearchTool } from "./runtime/tools/web-tools.js";
@@ -72,6 +69,14 @@ import { withCompactSearchRendering } from "./runtime/search-tool-render.js";
 import { withRoutineToolRendering } from "./runtime/routine-tool-render.js";
 import { withDefaultCollapsedToolRendering } from "./runtime/default-collapsed-tool-render.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
+import {
+  MainSessionCheckpointGate,
+  callbackCompactionAttempt,
+  type CheckpointProgress,
+  type MidRunCompactionController,
+  type ResumeToken,
+} from "./runtime/mid-run-compaction.js";
+import { registerCodexAbortGuard } from "./runtime/codex-abort-guard.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
@@ -114,25 +119,7 @@ class HookMultiplexer {
     for (const extra of this.extras) {
       outcomes.push(await extra.fire(eventName, payload, toolCall));
     }
-    const merged: HookOutcome = { block: false, askDowngraded: false, diagnostics: [] };
-    for (const o of outcomes) {
-      if (o.block && !merged.block) {
-        merged.block = true;
-        merged.blockReason = o.blockReason;
-      }
-      merged.askDowngraded = merged.askDowngraded || o.askDowngraded;
-      if (o.additionalContext) {
-        merged.additionalContext = merged.additionalContext
-          ? `${merged.additionalContext}\n${o.additionalContext}`
-          : o.additionalContext;
-      }
-      if (o.updatedInput) merged.updatedInput = { ...merged.updatedInput, ...o.updatedInput };
-      if (o.stdout) merged.stdout = merged.stdout ? `${merged.stdout}\n${o.stdout}` : o.stdout;
-      if (o.systemMessages?.length) {
-        merged.systemMessages = [...(merged.systemMessages ?? []), ...o.systemMessages];
-      }
-      merged.diagnostics.push(...o.diagnostics);
-    }
+    const merged = mergeHookOutcomes(outcomes);
     this.surface(eventName, merged);
     return merged;
   }
@@ -253,6 +240,7 @@ export interface PiccTestSeam {
      * stop-all confirmation windows are observable under the same clock rule.
      */
     subagentPanelFocus: SubagentPanelFocusController;
+    mainCheckpointGate: MainSessionCheckpointGate;
   }) => void;
   /**
    * TEST-ONLY subagent SDK override: replaces the real Pi SDK the session's
@@ -265,6 +253,45 @@ export interface PiccTestSeam {
    * guarantee as `onWired` above (see the SECURITY note).
    */
   sdk?: PiSdk;
+}
+
+const codexProviderRegistries = new WeakSet<object>();
+
+type FdWriter = (
+  fd: number,
+  buffer: Buffer,
+  offset: number,
+  length: number,
+  position: null,
+  callback: (error: NodeJS.ErrnoException | null, bytesWritten: number) => void,
+) => void;
+
+export async function writeFdFully(
+  fd: number,
+  data: Buffer,
+  write: FdWriter = fs.write.bind(fs),
+  wait: (delayMs: number) => Promise<void> = (delayMs) =>
+    new Promise<void>((resolve) => setTimeout(resolve, delayMs)),
+): Promise<void> {
+  let offset = 0;
+  let transientAttempts = 0;
+  while (offset < data.length) {
+    try {
+      const bytesWritten = await new Promise<number>((resolve, reject) => {
+        write(fd, data, offset, data.length - offset, null, (error, written) => {
+          if (error) reject(error);
+          else resolve(written);
+        });
+      });
+      if (bytesWritten <= 0) throw Object.assign(new Error("fd write made no progress"), { code: "EIO" });
+      offset += bytesWritten;
+      transientAttempts = 0;
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+      if (!["EAGAIN", "EWOULDBLOCK", "ENOBUFS"].includes(code) || transientAttempts >= 5) throw error;
+      await wait(2 ** transientAttempts++);
+    }
+  }
 }
 
 export default function picc(pi: any, testSeam?: PiccTestSeam) {
@@ -293,6 +320,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     console.error(`PiCC config: ${d.message}`);
   }
   const sessionId = randomUUID();
+  const mainCheckpointGate = new MainSessionCheckpointGate(
+    `pre-session:${sessionId}`,
+    config.compaction.proactiveCompactPercent,
+  );
+  // PiCC is the sole owner of this API handler while loaded. Supplying only these
+  // fields preserves Pi's built-in models, OAuth, credentials, options, and headers;
+  // arbitrary custom handlers for the same API are outside the guarded scope.
+  if (!codexProviderRegistries.has(pi)) {
+    codexProviderRegistries.add(pi);
+    registerCodexAbortGuard(pi);
+  }
   const cwdState = new CwdState(project.cwd);
   // Hook payload `transcript_path`: Pi's session manager (captured on
   // session_start) exposes the session file — the closest analog to Claude's
@@ -353,16 +391,46 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   let currentModel: unknown; // the orchestrator's active model — inherited by subagents
   let steeringText: string | undefined;
   let stopHookIterations = 0;
-  // Anti-thrash state for proactive early compaction: set when a compaction has been
-  // requested at a turn boundary, reset on `session_compact` success (which also opens the
-  // cooldown window) OR by the bounded turn-count fallback inside decideProactiveCompaction
-  // (compaction failure fires no event).
-  let proactivePending: ProactivePendingState = initialPendingState();
-  // One-shot marker: a PiCC-initiated proactive `ctx.compact()` reaches Pi as reason:"manual",
-  // but to hooks it is an AUTOMATIC compaction. Set right before ctx.compact(), consumed by the
-  // very next session_before_compact to present PreCompact as trigger:"auto" (Claude fidelity:
-  // manual is reserved for a user /compact).
-  let proactiveCompactInFlight = false;
+  let checkpointContext: any;
+  let checkpointSessionEpoch: object = {};
+  let printedResumeToken: ResumeToken | undefined;
+  let printWriteTail: Promise<void> = Promise.resolve();
+  interface StopContinuationCapability {
+    readonly epoch: object;
+    readonly controller: MidRunCompactionController;
+    readonly generation: number;
+    readonly resumeToken: ResumeToken;
+    readonly text: string;
+    consumed: boolean;
+  }
+  const stopContinuationAdmission = new AsyncLocalStorage<StopContinuationCapability>();
+  interface CompactionLifecycleOperation {
+    identity: object;
+    epoch: object;
+    controller: MidRunCompactionController;
+    generation: number;
+    proactive: boolean;
+    trigger: "auto" | "manual";
+    recovery?: import("./runtime/mid-run-compaction.js").RecoveryToken;
+  }
+  let activeCompactionOperation: CompactionLifecycleOperation | undefined;
+  let checkpointAttempt: {
+    epoch: object;
+    controller: MidRunCompactionController;
+    generation: number;
+    hookBlocked: boolean;
+    operation?: object;
+    restorationFailed: boolean;
+  } | undefined;
+  let activeMainResume: {
+    generation: number;
+    token: ResumeToken;
+    epoch: object;
+    context: any;
+    settled: Promise<void>;
+    resolveSettled(): void;
+    replayCompleted: boolean;
+  } | undefined;
   const quotaHeaders: Record<string, string> = {};
 
   const hookRunnerFacade = {
@@ -390,8 +458,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    */
   const makeContextInjector = (getCwdFn: () => string) => {
     const subState = newSessionContextState(project.claudeMd);
-    return (filePath: string) =>
-      contextForTouchedFile({
+    return {
+      inject: (filePath: string) => contextForTouchedFile({
         filePath,
         cwd: getCwdFn(),
         projectRoot: project.root,
@@ -399,7 +467,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         settings: project.settings,
         state: subState,
         skills: project.skills,
-      });
+      }),
+      reset: () => resetInjectionState(subState, project.claudeMd),
+    };
   };
 
   // ---------------------------------------------------------------------------
@@ -412,73 +482,59 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return plugin ? { root: plugin.root, data: plugin.dataDir } : {};
   }
 
-  /** Skills whose scoped hooks are already registered (re-activation must not stack duplicates). */
-  const scopedHookSkills = new Set<string>();
-  /** Active skills' disallowed-tools, enforced by the guard while the skill is resident. */
-  const activeSkillDenyRules = new Set<string>();
+  const mainActivation = newSkillActivationState(state.activeSkills);
+  const activeSkillDenyRules = mainActivation.denyRules;
 
   async function activateSkill(
     skill: ClaudeSkill,
     argsText: string,
-    opts: { fork?: boolean; recordActivation?: boolean } = {},
+    opts: { fork?: boolean; activation?: SkillActivationState; cwd?: string } = {},
   ): Promise<string> {
-    const record = opts.recordActivation ?? true;
-    if (skill.hooks && Object.keys(skill.hooks).length) {
-      if (!record) {
-        // Subagent-side activation: scoped hooks are session-wide state and must
-        // not leak across the fresh-context boundary (visible degrade).
-        debug(`skill ${skill.name}: scoped hooks not registered for a subagent-side activation`);
-      } else if (!scopedHookSkills.has(skill.name)) {
-        // Register once per skill: re-activation must not duplicate side effects
-        // (and reusing the runner preserves its `once:` tracking).
-        scopedHookSkills.add(skill.name);
-        const parsed = parseHookConfig(skill.hooks, skill.source.path);
-        hooks.addScoped(
-          new HookRunner({
-            config: parsed.config,
-            projectDir: project.root,
-            sessionId,
-            env: project.settings.env,
-            disableAllHooks: project.settings.disableAllHooks,
-            pluginRoots: project.pluginRoots,
-            pluginDataDirs,
-            transcriptPath,
-          }),
-        );
-      }
+    const activation = opts.activation ?? mainActivation;
+    if (skill.hooks && Object.keys(skill.hooks).length && !activation.scopedHookSkills.has(skill.name)) {
+      activation.scopedHookSkills.add(skill.name);
+      const parsed = parseHookConfig(skill.hooks, skill.source.path);
+      const runner = new HookRunner({
+        config: parsed.config,
+        projectDir: project.root,
+        sessionId,
+        env: project.settings.env,
+        disableAllHooks: project.settings.disableAllHooks,
+        pluginRoots: project.pluginRoots,
+        pluginDataDirs,
+        transcriptPath,
+      });
+      if (activation === mainActivation) hooks.addScoped(runner);
+      else activation.hookRunners.push(activation.wrapHookRunner?.(runner) ?? runner);
     }
     const plugin = pluginContextFor(skill);
     const rendered = await renderSkillForActivation({
       skill,
       argsText,
       projectRoot: project.root,
-      cwd: cwdState.get(),
+      cwd: opts.cwd ?? cwdState.get(),
       sessionId,
       effort: skill.effort ?? config.effort,
       settings: project.settings,
       pluginRoot: plugin.root,
       pluginData: plugin.data,
     });
-    // context:fork bodies go to the FORK only — keeping them resident in the
+    // context:fork bodies go to the fork only. Keeping them resident in the
     // parent would defeat the fork's token-efficiency purpose.
-    if (record && !opts.fork) {
-      state.activeSkills.set(skill.name, rendered.text);
-      // Use the per-activation substituted copies (${CLAUDE_*}/$ARGUMENTS) so
-      // deny rules like Bash(${CLAUDE_SKILL_DIR}/*) gate the real path.
-      for (const rule of rendered.disallowedTools ?? skill.disallowedTools ?? []) {
-        activeSkillDenyRules.add(rule);
-      }
+    if (!opts.fork) {
+      recordResidentSkill(activation.activeSkills, skill.name, rendered.text);
+      activation.denyRules.set(
+        skill.name,
+        [...(rendered.disallowedTools ?? skill.disallowedTools ?? [])],
+      );
     }
     return rendered.text;
   }
 
   /**
-   * Re-invocation dedup: fingerprint of the last rendered body per skill name.
-   * A re-invocation whose rendering is byte-identical substitutes a
-   * short note instead of a second full copy. FNV-1a 32-bit + length — cheap,
-   * dependency-free, and sufficient for change detection.
+   * FNV-1a 32-bit plus length is dependency-free and sufficient for detecting
+   * byte-identical re-invocations without retaining another full skill body.
    */
-  const lastSkillRenderHash = new Map<string, string>();
   function skillRenderFingerprint(text: string): string {
     let h = 0x811c9dc5;
     for (let i = 0; i < text.length; i++) {
@@ -488,12 +544,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return `${text.length}:${(h >>> 0).toString(16)}`;
   }
   /** Returns the dedup note when `rendered` is byte-identical to the last copy, else records it. */
-  function skillDedupNote(skill: ClaudeSkill, rendered: string): string | undefined {
+  function skillDedupNote(
+    skill: ClaudeSkill,
+    rendered: string,
+    activation: SkillActivationState = mainActivation,
+  ): string | undefined {
     const fp = skillRenderFingerprint(rendered);
-    if (lastSkillRenderHash.get(skill.name) === fp) {
+    if (activation.lastRenderHash.get(skill.name) === fp) {
       return `Skill "${skill.name}" was invoked again; its content is unchanged from the earlier copy above.`;
     }
-    lastSkillRenderHash.set(skill.name, fp);
+    activation.lastRenderHash.set(skill.name, fp);
     return undefined;
   }
 
@@ -634,6 +694,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   function buildCwdBoundTools(
     cwdRef: CwdState,
     taskBundle: { tools: unknown[] },
+    captureUniversalStop?: () => () => boolean,
   ): Record<string, unknown>[] {
     const get = () => cwdRef.get();
     return [
@@ -643,7 +704,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       createGlobTool(get) as unknown as Record<string, unknown>,
       createMultiEditTool(get) as unknown as Record<string, unknown>,
       ...(taskBundle.tools as unknown as Record<string, unknown>[]),
-      ...createWorktreeTools({ worktrees, cwdState: cwdRef, hookRunner: hookRunnerFacade }),
+      ...createWorktreeTools({ worktrees, cwdState: cwdRef, hookRunner: hookRunnerFacade, captureUniversalStop }),
       ...DEGRADED_TOOLS.map(
         (d) =>
           createDegradeStub(d.name, d.note, { redirect: d.redirect }) as unknown as Record<
@@ -791,33 +852,43 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const subagentRuntime = new SubagentRuntime({
     getAgents: () => project.agents,
     buildSystemPrompt: buildSubagentSystemPrompt,
-    customToolsFor: (agent, granted, depth, ownerAgentId, dispatcherIsFork, subCwd) => {
+    customToolsFor: (agent, granted, depth, ownerAgentId, dispatcherIsFork, subCwd, activation, captureUniversalStop) => {
       // Per-dispatch instances (fresh TaskStore, dispatch-local cwd binding).
       // NOTE: SendMessage is deliberately NEVER built here — it is
       // parent-initiated only (no subagent→subagent or subagent→parent channel).
       // Even a future "inherit all tools" change must not add it to this set.
       const tools: Record<string, unknown>[] = [];
-      for (const tool of buildCwdBoundTools(subCwd ?? cwdState, createTaskTools())) {
+      for (const tool of buildCwdBoundTools(subCwd ?? cwdState, createTaskTools(), captureUniversalStop)) {
         const name = (tool as { name: string }).name;
         if (granted.includes(name)) tools.push(tool);
       }
       if (granted.includes("Skill")) {
         // Per-dispatch Skill tool: carries the caller's depth into context:fork
         // dispatches (depth cap holds) and never mutates the parent session state.
-        tools.push(createSkillTool({ depth, forSubagent: true }) as Record<string, unknown>);
+        tools.push(createSkillTool({
+          depth,
+          forSubagent: true,
+          activation,
+          getCwd: () => (subCwd ?? cwdState).get(),
+        }) as Record<string, unknown>);
       }
       if (granted.includes("SlashCommand")) {
         // Per-dispatch SlashCommand tool: a thin alias over the same shared
         // skill-activation path as the Skill tool — carries the caller's depth
         // into context:fork dispatches and leaves parent session state alone.
-        tools.push(createSlashCommandTool({ depth, forSubagent: true }) as Record<string, unknown>);
+        tools.push(createSlashCommandTool({
+          depth,
+          forSubagent: true,
+          activation,
+          getCwd: () => (subCwd ?? cwdState).get(),
+        }) as Record<string, unknown>);
       }
       // Background-task tools are SCOPED to this dispatcher's own tasks: built
       // over `backgroundTasks.scopedTo(ownerAgentId)`, so a subagent's
       // TaskOutput/TaskStop reach only the tasks it itself dispatched — a sibling's
       // or the coordinator's task is indistinguishable from an unknown id. The
       // coordinator keeps the full registry (below), retaining reach to every task.
-      const scoped = scopedBackgroundTools(backgroundTasks, ownerAgentId);
+      const scoped = scopedBackgroundTools(backgroundTasks, ownerAgentId, subagentRegistry);
       if (granted.includes("TaskOutput")) {
         tools.push(scoped.taskOutput);
       }
@@ -840,8 +911,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // moment the child is dispatched, so a worktree the parent enters mid-run
         // is reflected.
         const dispatchCwd = () => (subCwd ?? cwdState).get();
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd }));
-        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd }));
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Agent", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd, captureUniversalStop }));
+        tools.push(createAgentToolDefinition(subagentRuntime, { depth, name: "Task", backgroundTasks, ownerAgentId, dispatcherIsFork, dispatchCwd, captureUniversalStop }));
       }
       return tools;
     },
@@ -862,6 +933,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // Same oversized-tool-result backstop the main guard runs, threaded into every
     // subagent's guard (config is not in scope at the subagent install site).
     clipMaxTokens: config.compaction.clipMaxTokens,
+    proactiveCompactPercent: config.compaction.proactiveCompactPercent,
     makeContextInjector,
     // Agent-scoped hooks: per-dispatch runner with the SAME deps as the
     // session's base runner; the runtime multiplexes and discards it. Its
@@ -894,6 +966,276 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     ...(testSeam?.sdk ? { sdk: testSeam.sdk } : {}),
   });
 
+  const checkpointText = (event: CheckpointProgress): string => {
+    switch (event.category) {
+      case "checkpoint-armed": return "Pausing for proactive context compaction.";
+      case "checkpoint-retrying": return `Context compaction failed; retrying (attempt ${Math.min((event.attempt ?? 1) + 1, 3)} of 3).`;
+      case "checkpoint-complete": return event.action === "settled-fallback"
+        ? "Context compaction completed."
+        : "Context compacted; reconnecting the paused work.";
+      case "checkpoint-exhausted": return event.failureCategory === "hook-blocked"
+        ? "Automatic context compaction was blocked by a PreCompact hook. Work is paused and no continuation ran. Repair or disable the hook, or allow a manual compact trigger; then run /compact and explicitly continue."
+        : event.failureCategory === "restoration-paused"
+          ? "Context was compacted, but mandatory restoration or continuation failed. Work is paused and no continuation ran. Do not compact the committed summary again; start a new session and resend the retained input."
+          : "Automatic context compaction could not complete. Work is paused and no continuation ran. Run /compact, then explicitly continue.";
+      case "checkpoint-cancelled": return event.action === "new-session"
+        ? "Proactive context compaction stopped with the old session; resend input in the new session."
+        : "Proactive context compaction was cancelled. Run /compact to recover this session, or start a new session.";
+      case "checkpoint-recovered": return "Manual compaction recovered the paused session; explicitly continue when ready.";
+    }
+  };
+
+  const appendCheckpointEntry = (data: Record<string, unknown>): void => {
+    try { pi.appendEntry("picc-checkpoint-lifecycle", data); } catch { /* presentation only */ }
+  };
+
+  const reportRejectedShadows = (rejected: readonly import("./runtime/mid-run-compaction.js").QueuedInputShadow[], ctx: any): void => {
+    if (rejected.length === 0) return;
+    const representable: string[] = [];
+    let unrepresentable = 0;
+    for (const shadow of rejected) {
+      if (typeof shadow.content === "string") {
+        representable.push(shadow.content);
+        continue;
+      }
+      const text = shadow.content
+        .filter((part) => part && typeof part === "object" &&
+          (part as { type?: unknown }).type === "text" &&
+          typeof (part as { text?: unknown }).text === "string")
+        .map((part) => (part as { text: string }).text)
+        .join("");
+      if (text) representable.push(text);
+      if (shadow.content.some((part) => !part || typeof part !== "object" ||
+          (part as { type?: unknown }).type !== "text")) unrepresentable += 1;
+    }
+    let restoredTextCount = 0;
+    let guidance = `${rejected.length} queued input${rejected.length === 1 ? " was" : "s were"} not replayed. Resend ${representable.length} text input${representable.length === 1 ? "" : "s"}${unrepresentable ? ` and ${unrepresentable} image/unrepresentable input${unrepresentable === 1 ? "" : "s"}` : ""}.`;
+    if (ctx?.mode === "tui") {
+      try {
+        if (representable.length && typeof ctx.ui?.setEditorText === "function") {
+          const draft = String(ctx.ui?.getEditorText?.() ?? "");
+          ctx.ui.setEditorText(`${representable.join("\n")}\n${draft}`);
+          restoredTextCount = representable.length;
+        }
+        guidance = `${rejected.length} queued input${rejected.length === 1 ? " was" : "s were"} not replayed; ${restoredTextCount} text input${restoredTextCount === 1 ? " was" : "s were"} restored${representable.length > restoredTextCount || unrepresentable ? "; remaining input must be resent" : ""}.`;
+        ctx.ui?.notify?.(guidance, representable.length > restoredTextCount || unrepresentable ? "warning" : "info");
+      } catch {
+        restoredTextCount = 0;
+        guidance = `${rejected.length} queued input${rejected.length === 1 ? " was" : "s were"} not replayed. Resend ${representable.length} text input${representable.length === 1 ? "" : "s"}${unrepresentable ? ` and ${unrepresentable} image/unrepresentable input${unrepresentable === 1 ? "" : "s"}` : ""}.`;
+      }
+    } else if (ctx?.mode === "print") {
+      console.error(`PiCC: ${guidance}`);
+    }
+    appendCheckpointEntry({
+      category: "checkpoint-input-recovery",
+      count: rejected.length,
+      restoredTextCount,
+      unrepresentableCount: unrepresentable,
+      action: representable.length > restoredTextCount || unrepresentable ? "resend-input" : "review-restored-text",
+      notice: guidance,
+    });
+  };
+
+  const publishCheckpoint = (event: CheckpointProgress, ctx = checkpointContext): void => {
+    const progressController = mainCheckpointGate.currentController();
+    if (mainCheckpointGate.isLogicalRunStopped() &&
+        mainCheckpointGate.stoppedRunMatches(progressController, event.generation)) return;
+    const mode = ctx?.mode;
+    const baseText = checkpointText(event);
+    const recoverableHeadlessExhaustion = event.category === "checkpoint-exhausted" &&
+      event.failureCategory !== "restoration-paused" && mode !== "tui";
+    const persisted = transcriptPath() !== undefined;
+    const headlessCause = event.failureCategory === "hook-blocked"
+      ? "Automatic context compaction was blocked by a PreCompact hook. Work is paused and no continuation ran. Repair or disable the hook, or allow a manual compact trigger first."
+      : "Automatic context compaction could not complete. Work is paused and no continuation ran.";
+    const recoveryGuidance = persisted
+      ? `If this process exits, reopen the exact persisted session before /compact.${mode === "rpc" ? " RPC acknowledgements are uncorrelated." : ""} Run /compact, then explicitly continue.`
+      : "This headless session is ephemeral and cannot be reopened; start a replacement session and resend the retained input.";
+    const text = recoverableHeadlessExhaustion ? `${headlessCause} ${recoveryGuidance}` : baseText;
+    if (mode === "tui") {
+      try {
+        ctx.ui?.setStatus?.("picc-checkpoint", event.category === "checkpoint-recovered" ? undefined : text);
+        if (event.category === "checkpoint-exhausted") ctx.ui?.notify?.(text, "error");
+        if (event.category === "checkpoint-recovered") ctx.ui?.notify?.(text, "info");
+      } catch {
+        // Presentation cannot own checkpoint state.
+      }
+    } else if (mode === "print") {
+      console.error(`PiCC: ${text}`);
+    }
+    if (mode === "json" || mode === "rpc" || event.category === "checkpoint-exhausted") {
+      appendCheckpointEntry({
+        category: event.category,
+        generation: event.generation,
+        notice: text,
+        ...(event.attempt === undefined ? {} : { attempt: event.attempt }),
+        ...(event.action === undefined ? {} : { action: event.action }),
+        ...(event.failureCategory === undefined ? {} : { failureCategory: event.failureCategory }),
+        ...(event.category === "checkpoint-exhausted" ? {
+          recovery: event.failureCategory === "restoration-paused"
+            ? "start a new session and resend retained input; do not compact the committed summary again"
+            : !persisted
+              ? "start a replacement session and resend retained input; this ephemeral session cannot be reopened"
+              : event.failureCategory === "hook-blocked"
+                ? "repair or disable the hook, or allow manual compaction; then run /compact and explicitly continue"
+                : "/compact, then explicitly continue",
+        } : {}),
+      });
+    }
+    if (event.category === "checkpoint-cancelled") {
+      const controller = mainCheckpointGate.currentController();
+      void controller.cancel(event.generation, event.action === "new-session" ? "replacement" : "user")
+        .then((outcome) => reportRejectedShadows(outcome.rejected, ctx))
+        .catch(() => undefined);
+    }
+  };
+
+  mainCheckpointGate.attachExecution({
+    progress: publishCheckpoint,
+    compact: async (_attempt, signal) => {
+      const ctx = checkpointContext;
+      const epoch = checkpointSessionEpoch;
+      const controller = mainCheckpointGate.currentController();
+      const generation = controller.snapshot().generation;
+      const summary = controller.beginCompactionSummary(generation);
+      if (!summary || typeof ctx?.compact !== "function") {
+        return { ok: false, category: "operational" };
+      }
+      const attempt = {
+        epoch,
+        controller,
+        generation,
+        hookBlocked: false,
+        operation: undefined as object | undefined,
+        restorationFailed: false,
+      };
+      checkpointAttempt = attempt;
+      const abortHost = () => {
+        try { ctx.abort?.(); } catch { /* controller cancellation remains authoritative */ }
+      };
+      signal.addEventListener("abort", abortHost, { once: true });
+      try {
+        return await callbackCompactionAttempt(generation, (_token, complete) => {
+          ctx.compact({
+            onComplete: () => complete(_token, attempt.restorationFailed
+              ? { ok: false, category: "restoration-paused" }
+              : epoch !== checkpointSessionEpoch || controller !== mainCheckpointGate.currentController()
+                ? { ok: false, category: "stale-generation" }
+                : { ok: true }),
+            onError: (error: unknown) => {
+              let hostCancelled = false;
+              try {
+                hostCancelled = error instanceof Error &&
+                  (error.name === "AbortError" || error.message === "Compaction cancelled");
+              } catch { /* hostile error objects classify as operational */ }
+              // A failed physical attempt has no session_compact event to release
+              // its lifecycle identity. Release only this attempt's identity so a
+              // bounded retry can enter without weakening another in-flight compact.
+              if (activeCompactionOperation?.identity === attempt.operation) {
+                activeCompactionOperation = undefined;
+              }
+              complete(_token, {
+                ok: false,
+                category: checkpointAttempt === attempt && attempt.hookBlocked
+                  ? "hook-blocked"
+                  : signal.aborted || epoch !== checkpointSessionEpoch || hostCancelled
+                    ? "cancelled"
+                    : "operational",
+              });
+            },
+          });
+        }, signal);
+      } finally {
+        signal.removeEventListener("abort", abortHost);
+        controller.endCompactionSummary(summary);
+        if (checkpointAttempt === attempt) checkpointAttempt = undefined;
+      }
+    },
+    resume: (resumeContext) => {
+      const ctx = checkpointContext;
+      let openProvider!: () => void;
+      let rejectProvider!: (reason?: unknown) => void;
+      // The hidden continuation starts the run, but queued steering must be
+      // installed before its first ordinary provider request or it lands one turn late.
+      const providerBarrier = new Promise<void>((resolve, reject) => {
+        openProvider = resolve;
+        rejectProvider = reject;
+      });
+      void providerBarrier.catch(() => undefined);
+      if (!mainCheckpointGate.installResumeBarrier(resumeContext.generation, providerBarrier)) {
+        throw new Error("Cannot install the resumed provider barrier");
+      }
+      let resolveSettled!: () => void;
+      const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+      activeMainResume = {
+        generation: resumeContext.generation,
+        token: resumeContext.token,
+        epoch: checkpointSessionEpoch,
+        context: ctx,
+        settled,
+        resolveSettled,
+        replayCompleted: false,
+      };
+      const resume = activeMainResume;
+      const isCurrent = () => {
+        const controller = mainCheckpointGate.currentController();
+        const snapshot = controller.snapshot();
+        return activeMainResume === resume && resume.epoch === checkpointSessionEpoch &&
+          resume.generation === snapshot.generation && resume.token === resumeContext.token &&
+          snapshot.phase === "resuming" && !resumeContext.signal.aborted;
+      };
+      try {
+        if (!isCurrent()) throw new Error("checkpoint resume lost authority before startup");
+        pi.sendMessage(
+          {
+            customType: "picc-checkpoint-continuation",
+            content: "Continue the paused work.",
+            display: false,
+          },
+          { triggerTurn: true },
+        );
+      } catch (error) {
+        if (activeMainResume === resume) activeMainResume = undefined;
+        mainCheckpointGate.clearResumeBarrier(resumeContext.generation, providerBarrier);
+        rejectProvider(error);
+        resolveSettled();
+        throw error;
+      }
+      return {
+        replay: (input: any) => {
+          mainCheckpointGate.withReplayAuthorization(input, () => {
+            pi.sendUserMessage(input.content as any, { deliverAs: input.delivery });
+          });
+          return { delivered: true } as const;
+        },
+        replayComplete: () => {
+          if (!isCurrent() || resume.replayCompleted) {
+            throw new Error("checkpoint resume cannot release the provider twice");
+          }
+          resume.replayCompleted = true;
+          openProvider();
+          const text = "Context compacted; resumed the paused work.";
+          if (ctx?.mode === "tui") ctx.ui?.setStatus?.("picc-checkpoint", text);
+          else if (ctx?.mode === "print") console.error(`PiCC: ${text}`);
+          else if (ctx?.mode === "json" || ctx?.mode === "rpc") {
+            appendCheckpointEntry({
+              category: "checkpoint-resumed",
+              generation: resumeContext.generation,
+              notice: text,
+            });
+          }
+        },
+        cancelAndJoin: async () => {
+          rejectProvider(new Error("checkpoint cancelled"));
+          mainCheckpointGate.clearResumeBarrier(resumeContext.generation, providerBarrier);
+          try { ctx?.abort?.(); } catch { /* join below remains authoritative */ }
+          await settled;
+          if (activeMainResume === resume) activeMainResume = undefined;
+        },
+      };
+    },
+  });
+
   // TEST-ONLY seam: hand the real in-process registries AND the runtime to a
   // test that drives the settlement-notice delivery path (or the dispatcher-owner
   // threading) through an offline dispatch (fake SDK injected via
@@ -907,6 +1249,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       subagentRuntime,
       subagentPanel,
       subagentPanelFocus,
+      mainCheckpointGate,
     });
   } catch (err) {
     console.error(`PiCC test seam onWired failed: ${(err as Error).message}`);
@@ -916,7 +1259,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Tool registration
   // ---------------------------------------------------------------------------
   const getCwd = () => cwdState.get();
-  claudeNamedTools.push(...buildCwdBoundTools(cwdState, taskToolBundle));
+  claudeNamedTools.push(...buildCwdBoundTools(cwdState, taskToolBundle, () => mainCheckpointGate.captureLogicalRunStop()));
 
   /**
    * The single skill-activation path shared by the Skill and SlashCommand tools
@@ -932,7 +1275,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   async function runSkillActivation(
     skill: ClaudeSkill,
     argsText: string,
-    opts: { forSubagent: boolean; depth: number; invokedName: string; signal?: AbortSignal },
+    opts: {
+      forSubagent: boolean;
+      depth: number;
+      invokedName: string;
+      signal?: AbortSignal;
+      activation?: SkillActivationState;
+      cwd?: string;
+    },
   ): Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }> {
     if (skill.disableModelInvocation) {
       throw new Error(`Skill "${opts.invokedName}" is user-only (disable-model-invocation). Ask the user to run /${opts.invokedName}.`);
@@ -940,7 +1290,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (skill.contextFork) {
       const rendered = await activateSkill(skill, argsText, {
         fork: true,
-        recordActivation: !opts.forSubagent,
+        activation: opts.activation,
+        cwd: opts.cwd,
       });
       const result = await forkDispatch(skill, rendered, opts.depth + 1, argsText, opts.signal);
       // Forks are non-resumable: suppress every resume trailer. The shared
@@ -956,12 +1307,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       };
     }
     const rendered = await activateSkill(skill, argsText, {
-      recordActivation: !opts.forSubagent,
+      activation: opts.activation,
+      cwd: opts.cwd,
     });
-    // Re-invocation with byte-identical content → short note instead of a
-    // second copy. Subagent instances keep their own context and never consult
-    // the parent-session fingerprints.
-    const note = opts.forSubagent ? undefined : skillDedupNote(skill, rendered);
+    const note = skillDedupNote(skill, rendered, opts.activation);
     if (note) {
       return {
         content: [{ type: "text", text: note }],
@@ -979,7 +1328,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    * activations (resident body, disallowed-tools gate, scoped hooks); subagent
    * instances carry their dispatch depth into forks and leave parent state alone.
    */
-  function createSkillTool(opts: { depth: number; forSubagent: boolean }) {
+  function createSkillTool(opts: {
+    depth: number;
+    forSubagent: boolean;
+    activation?: SkillActivationState;
+    getCwd?: () => string;
+  }) {
     return {
       name: "Skill",
       label: "Skill",
@@ -1002,6 +1356,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           depth: opts.depth,
           invokedName: params.name,
           signal,
+          activation: opts.activation,
+          cwd: opts.getCwd?.(),
         });
       },
     };
@@ -1019,7 +1375,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    * skills still activate) — the NON-stacking single-command counterpart of the
    * user-typed `/name` prompt transform.
    */
-  function createSlashCommandTool(opts: { depth: number; forSubagent: boolean }) {
+  function createSlashCommandTool(opts: {
+    depth: number;
+    forSubagent: boolean;
+    activation?: SkillActivationState;
+    getCwd?: () => string;
+  }) {
     return {
       name: "SlashCommand",
       label: "SlashCommand",
@@ -1039,6 +1400,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           depth: opts.depth,
           invokedName: parsed.name,
           signal,
+          activation: opts.activation,
+          cwd: opts.getCwd?.(),
         });
       },
     };
@@ -1050,8 +1413,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // The built-in agent types guarantee dispatchable agents even when the
     // project defines none — so Agent/Task always register when subagents are on.
     claudeNamedTools.push(
-      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Agent", backgroundTasks }),
-      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Task", backgroundTasks }),
+      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Agent", backgroundTasks, captureUniversalStop: () => mainCheckpointGate.captureLogicalRunStop() }),
+      createAgentToolDefinition(subagentRuntime, { depth: 0, name: "Task", backgroundTasks, captureUniversalStop: () => mainCheckpointGate.captureLogicalRunStop() }),
       // SendMessage: the coordinator's channel back into its subagents —
       // resume a finished one (same id, full context, background) or steer a
       // running background one. Parent-session only (never in customToolsFor).
@@ -1065,7 +1428,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // no background task was ever started.
   claudeNamedTools.push(
     createTaskOutputTool(backgroundTasks) as Record<string, unknown>,
-    createTaskStopTool(backgroundTasks) as Record<string, unknown>,
+    createTaskStopTool(backgroundTasks, subagentRegistry) as Record<string, unknown>,
   );
   for (const tool of claudeNamedTools) {
     try {
@@ -1082,7 +1445,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         mainSessionTool as unknown as ToolDefinition,
       );
       const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
-      pi.registerTool(wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>));
+      pi.registerTool(mainCheckpointGate.wrapTool(
+        wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
+      ));
     } catch (err) {
       console.error(`PiCC: failed to register tool: ${(err as Error).message}`);
     }
@@ -1147,7 +1512,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           def as unknown as ToolDefinition,
         );
         const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
-        pi.registerTool(wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>));
+        pi.registerTool(mainCheckpointGate.wrapTool(
+          wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
+        ));
       }
       // `!` user-bash commands also get the pinned Git Bash (and the effective cwd).
       if (shellPath && typeof sdk.createLocalBashOperations === "function") {
@@ -1170,9 +1537,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     getCwd,
     contextForTouchedFile: injectForFile,
     // Active skills' disallowed-tools: enforced while the skill is resident.
-    extraDenyRules: () => [...activeSkillDenyRules],
+    extraDenyRules: () => [...activeSkillDenyRules.values()].flat(),
     // Backstop: clip a single oversized tool result before it enters context.
     clipMaxTokens: config.compaction.clipMaxTokens,
+    captureUniversalStop: () => mainCheckpointGate.captureLogicalRunStop(),
   })(pi);
 
   // ---------------------------------------------------------------------------
@@ -1283,7 +1651,28 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // ---------------------------------------------------------------------------
   // Session lifecycle
   // ---------------------------------------------------------------------------
+  pi.on("session_before_switch", async () => {
+    // The controller cancels first; the old nested agent_settled or host callback
+    // is the only authority that can confirm the logical run has joined.
+    const result = await mainCheckpointGate.beforeSessionSwitch();
+    if (!result?.cancel) {
+      // Invalidate lifecycle authority at switch acceptance, not only at the next
+      // session_start, so an old manual completion in that gap is inert.
+      checkpointSessionEpoch = {};
+      activeCompactionOperation = undefined;
+    }
+    return result;
+  });
+
   pi.on("session_start", async (event: any, ctx: any) => {
+    await mainCheckpointGate.startSession(randomUUID());
+    checkpointContext = ctx;
+    checkpointSessionEpoch = {};
+    const sessionStartEpoch = checkpointSessionEpoch;
+    const sessionStartController = mainCheckpointGate.currentController();
+    activeCompactionOperation = undefined;
+    printedResumeToken = undefined;
+    stopHookIterations = 0;
     try {
       modelRegistryRef = ctx.modelRegistry;
       sessionManagerRef = ctx.sessionManager;
@@ -1292,6 +1681,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // reports hasUI: true), so a hasUI gate would install the panel into an
       // RPC client; print/RPC output must stay unchanged.
       if (ctx.mode === "tui") {
+        ctx.ui?.setStatus?.("picc-checkpoint", undefined);
         subagentPanel.attach(ctx.ui);
         // Arms the one-time panel hint: the TUI gate is "a TUI ui was seen",
         // so print/RPC sessions never emit it (and never consume its gate).
@@ -1319,10 +1709,28 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           await pi.exec("git", ["config", "core.hooksPath", ".githooks"], {}).catch(() => undefined);
         }
       }
+      const sessionStartSource = event.reason === "new"
+        ? "clear"
+        : event.reason === "reload"
+          ? "startup"
+          : event.reason;
+      const stopRun = mainCheckpointGate.captureLogicalRunStop();
       const outcome = await hooks.fire("SessionStart", {
-        source: event.reason,
+        source: sessionStartSource,
         cwd: cwdState.get(),
       });
+      if (checkpointSessionEpoch !== sessionStartEpoch ||
+          mainCheckpointGate.currentController() !== sessionStartController) return;
+      if (outcome.stop) {
+        const reason = outcome.stopReason ?? "SessionStart hook requested stop";
+        try {
+          if (ctx.hasUI) ctx.ui?.notify?.(reason, "warning");
+          else console.error(`PiCC: ${reason}`);
+          ctx.abort?.();
+        } catch { /* stop authority remains final */ }
+        stopRun();
+        return;
+      }
       const hookContext = [outcome.stdout, outcome.additionalContext].filter(Boolean).join("\n");
       if (hookContext.trim()) {
         pi.sendMessage(
@@ -1348,8 +1756,45 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   });
 
+  pi.on("message_end", (event: any) => {
+    mainCheckpointGate.assistantMessageEnded(event?.message);
+  });
+
+  pi.on("message_start", (event: any) => {
+    mainCheckpointGate.userMessageStarted(
+      event?.message,
+      event?.streamingBehavior ?? event?.delivery ?? event?.message?.delivery,
+    );
+  });
+
+  pi.on("tool_execution_end", (event: any) => {
+    mainCheckpointGate.toolExecutionEnded(event);
+  });
+
+  pi.on("turn_end", (_event: any, ctx: any) => {
+    checkpointContext = ctx;
+    mainCheckpointGate.turnEnded(ctx);
+  });
+
+  pi.on("turn_start", async (_event: any, ctx: any) => {
+    await mainCheckpointGate.defensiveLatch(ctx);
+  });
+
+  pi.on("before_provider_request", async (_event: any, ctx: any) => {
+    await mainCheckpointGate.defensiveLatch(ctx);
+  });
+
   pi.on("session_shutdown", async (event: any) => {
     try {
+      // Cancellation owns abort-before-join; never manufacture nested settlement.
+      await mainCheckpointGate.cancel("shutdown");
+      // This registry/runtime pair is session-local: claim any linked background
+      // generations first (suppressing stale output/notices), then join every
+      // retained child before SessionEnd and process shutdown proceed.
+      await Promise.allSettled(subagentRegistry.list()
+        .filter((record) => record.state === "running" && record.checkpointPaused)
+        .map((record) => backgroundTasks.stopAgentAndWait(record.agentId)));
+      await subagentRuntime.shutdownCheckpointPaused();
       // `reason` is the matcher subject for SessionEnd (Claude wire contract).
       await hooks.fire("SessionEnd", { cwd: cwdState.get(), reason: event?.reason ?? "other" });
     } catch {
@@ -1359,7 +1804,72 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   pi.on("input", async (event: any, ctx: any) => {
     try {
-      if (event.source === "extension") return { action: "continue" };
+      if (mainCheckpointGate.authorizeReplay(event)) return { action: "continue" };
+      const stopCapability = stopContinuationAdmission.getStore();
+      if (stopCapability) {
+        if (!stopCapability.consumed && event.source === "extension" &&
+            event.text === stopCapability.text && event.images === undefined &&
+            event.streamingBehavior === undefined) {
+          const controller = mainCheckpointGate.currentController();
+          const snapshot = controller.snapshot();
+          const resume = activeMainResume;
+          if (stopCapability.epoch === checkpointSessionEpoch &&
+              stopCapability.controller === controller &&
+              stopCapability.generation === snapshot.generation &&
+              stopCapability.resumeToken === resume?.token &&
+              resume.epoch === stopCapability.epoch &&
+              resume.generation === stopCapability.generation &&
+              resume.token.generation === stopCapability.generation &&
+              snapshot.phase === "resuming") {
+            stopCapability.consumed = true;
+            return { action: "continue" };
+          }
+        }
+        return { action: "handled" };
+      }
+      const inputDisposition = mainCheckpointGate.ordinaryInputDisposition();
+      if (inputDisposition === "reject-recoverable" || inputDisposition === "reject-restoration" ||
+          inputDisposition === "reject-closed" || inputDisposition === "reject-stopped") {
+        const text = inputDisposition === "reject-recoverable"
+          ? "Work remains paused. Run /compact, then explicitly continue."
+          : inputDisposition === "reject-restoration"
+            ? "The compacted summary is committed, but restoration or continuation failed. Do not compact it again; start a new session and resend the retained input."
+            : inputDisposition === "reject-stopped"
+              ? "The stopped run is still terminating. Wait for it to settle before sending another prompt."
+              : "The prior checkpoint was cancelled. Run /compact to recover this session, or start a new session.";
+        try {
+          if (ctx.mode === "print") console.error(`PiCC: ${text}`);
+          else if (ctx.mode === "tui") ctx.ui?.notify?.(text, "warning");
+        } catch { /* admission was already decided */ }
+        const controller = mainCheckpointGate.currentController();
+        const content = Array.isArray(event.images) && event.images.length > 0
+          ? [{ type: "text", text: String(event.text ?? "") }, ...event.images]
+          : String(event.text ?? "");
+        reportRejectedShadows([{
+          id: -1,
+          generation: controller.snapshot().generation,
+          sessionId: controller.sessionId,
+          content,
+          delivery: event.streamingBehavior === "steer" ? "steer" : "followUp",
+        }], ctx);
+        return { action: "handled" };
+      }
+      if (event.source === "extension") {
+        if (inputDisposition === "quarantine") {
+          const controller = mainCheckpointGate.currentController();
+          const images = Array.isArray(event.images) ? event.images : [];
+          reportRejectedShadows([{
+            id: 0,
+            generation: controller.snapshot().generation,
+            sessionId: controller.sessionId,
+            content: images.length > 0
+              ? [{ type: "text", text: String(event.text ?? "") }, ...images]
+              : String(event.text ?? ""),
+            delivery: event.streamingBehavior === "steer" ? "steer" : "followUp",
+          }], ctx);
+        }
+        return inputDisposition === "accept" ? { action: "continue" } : { action: "handled" };
+      }
 
       // Every transforming path below rewrites the turn text, but Pi may have
       // already captured images the user pasted or dropped onto this input
@@ -1367,10 +1877,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // assemble a text-only turn, silently losing the image. Carry the
       // captured blocks forward on every transform — unchanged and in order,
       // additive (prepend any images the branch itself produced; none do
-      // today, but keep it composable). This forwards genuine user captures
-      // only: `source === "extension"` (model/extension-synthesized text)
-      // already returned above, so every remaining source (interactive/rpc)
-      // is genuine user/host input, not model-synthesized. This does NOT
+      // today, but keep it composable). Only genuine user captures enter this
+      // pipeline; an authenticated replay already completed it and returned above.
+      // This does NOT
       // scrape image paths out of prose — the model `Read`s those (a
       // deliberate non-goal).
       type TransformResult = { action: "transform"; text: string; images?: unknown[] };
@@ -1378,6 +1887,33 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         const captured = Array.isArray(event.images) ? event.images : [];
         if (captured.length === 0) return result;
         return { ...result, images: [...(result.images ?? []), ...captured] };
+      };
+      const accept = <T extends { action: "continue" } | TransformResult>(result: T): T | { action: "handled" } => {
+        const text = result.action === "transform" ? result.text : String(event.text ?? "");
+        const images = result.action === "transform" ? result.images : event.images;
+        // This is the next genuine accepted user run. Rotate lifecycle authority
+        // after UserPromptSubmit admission, never for extension replay/continuation.
+        mainCheckpointGate.acceptedLogicalRun();
+        const shadow = mainCheckpointGate.captureAcceptedInput(ctx, text, images, event.streamingBehavior);
+        // Quarantine is an admission decision, not a consequence of successful
+        // shadow capture. A settled fallback cannot queue input, but it still must
+        // retain/report it rather than allowing provider work.
+        if (inputDisposition === "quarantine" && !shadow) {
+          const content = Array.isArray(images) && images.length > 0
+            ? [{ type: "text", text }, ...images]
+            : text;
+          const controller = mainCheckpointGate.currentController();
+          reportRejectedShadows([{
+            id: 0,
+            generation: controller.snapshot().generation,
+            sessionId: controller.sessionId,
+            content,
+            delivery: event.streamingBehavior === "steer" ? "steer" : "followUp",
+          }], ctx);
+        }
+        // Any quarantined input is handled even when shadow capture is unavailable;
+        // otherwise it could start a second turn before or during compaction.
+        return shadow || inputDisposition === "quarantine" ? { action: "handled" } : result;
       };
 
       // 0) PiCC control commands (/doctor /compat /quota /skills /agents /usage).
@@ -1396,14 +1932,32 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       }
 
       // 1) UserPromptSubmit hook on the raw prompt (Claude order).
+      const stopRun = mainCheckpointGate.captureLogicalRunStop();
       const outcome = await hooks.fire("UserPromptSubmit", {
         prompt: event.text,
         cwd: cwdState.get(),
       });
-      if (outcome.block) {
-        if (ctx.hasUI) ctx.ui.notify(`Prompt blocked by hook: ${outcome.blockReason ?? ""}`, "warning");
+      if (outcome.stop) {
+        const reason = outcome.stopReason ?? "UserPromptSubmit hook requested stop";
+        try {
+          if (ctx.hasUI) ctx.ui.notify(`Prompt stopped by hook: ${reason}`, "warning");
+          else console.error(`PiCC: ${reason}`);
+          ctx.abort?.();
+        } catch { /* hook stop remains final */ }
+        stopRun();
         return { action: "handled" };
       }
+      if (outcome.block) {
+        const reason = outcome.blockReason ?? "";
+        try {
+          if (ctx.hasUI) ctx.ui.notify(`Prompt blocked by hook: ${reason}`, "warning");
+        } catch { /* hook admission remains blocked */ }
+        return { action: "handled" };
+      }
+      // Activation-scoped effects belong to one logical user turn. Only a new,
+      // accepted human input expires them; replay and synthetic continuations
+      // returned above must preserve the effects across physical turns.
+      activeSkillDenyRules.clear();
       const extra = [outcome.stdout, outcome.additionalContext].filter(Boolean).join("\n").trim();
       const hookSuffix = extra ? `\n\n<hook-context>\n${extra}\n</hook-context>` : "";
 
@@ -1509,152 +2063,343 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // The trailing text is NOT re-appended as its own part: the last
         // skill's rendered activation already carries it as $ARGUMENTS (or via
         // the ARGUMENTS: fallback), so a second copy would duplicate the request.
-        return withCapturedImages({ action: "transform", text: parts.join("\n\n") + hookSuffix });
+        return accept(withCapturedImages({ action: "transform", text: parts.join("\n\n") + hookSuffix }));
       }
 
       if (hookSuffix) {
-        return withCapturedImages({ action: "transform", text: `${text}${hookSuffix}` });
+        return accept(withCapturedImages({ action: "transform", text: `${text}${hookSuffix}` }));
       }
-      return { action: "continue" };
+      return accept({ action: "continue" });
     } catch (err) {
       debug(`input handler error: ${(err as Error).message}`);
-      return { action: "continue" };
+      // Once a checkpoint has closed admission, capture/hook/pipeline failures
+      // cannot reopen transport by falling through to Pi. If quarantine could not
+      // reach the normal capture path, preserve/report the raw input here.
+      const disposition = mainCheckpointGate.ordinaryInputDisposition();
+      if (disposition === "quarantine") {
+        const controller = mainCheckpointGate.currentController();
+        const images = Array.isArray(event.images) ? event.images : [];
+        reportRejectedShadows([{
+          id: 0,
+          generation: controller.snapshot().generation,
+          sessionId: controller.sessionId,
+          content: images.length > 0
+            ? [{ type: "text", text: String(event.text ?? "") }, ...images]
+            : String(event.text ?? ""),
+          delivery: event.streamingBehavior === "steer" ? "steer" : "followUp",
+        }], ctx);
+      }
+      return disposition === "accept" ? { action: "continue" } : { action: "handled" };
     }
   });
 
-  pi.on("agent_settled", async (_event: any, ctx: any) => {
-    // Proactive early compaction: at this settled turn boundary (nothing in-flight, so
-    // ctx.compact()'s abort is benign), compact via Pi's own authed transport once usage
-    // crosses the configured percent of the window — the extension-side substitute for a
-    // larger reserveTokens, and the primary resilience lever. Degrade, never throw:
-    // getContextUsage() may be undefined and percent/tokens may be null.
+  const runStopHook = async (ctx: any): Promise<boolean> => {
     try {
-      // A prior proactive compaction's in-flight marker never legitimately survives to the
-      // next settled turn (its session_before_compact fires during that compaction, before the
-      // retried turn settles), so any marker still set here is stale — clear it so a later user
-      // /compact is never misread as auto.
-      proactiveCompactInFlight = false;
-      let usage: ContextUsageShape | undefined;
-      try {
-        usage = ctx?.getContextUsage?.();
-      } catch {
-        usage = undefined;
-      }
-      const threshold = config.compaction.proactiveCompactPercent;
-      const decision = decideProactiveCompaction(usage, threshold, proactivePending);
-      proactivePending = decision.pending;
-      if (decision.compact) {
-        const at =
-          typeof usage?.percent === "number" ? `${Math.round(usage.percent)}%` : `${threshold}%`;
-        const notice = `PiCC: compacting context early at ${at} of the context window (threshold ${threshold}%, configurable via proactiveCompactPercent)`;
-        // Always-visible notice (NOT PICC_DEBUG-only debug()): same channel as the startup
-        // compat notice; doubles as discovery of the proactiveCompactPercent knob. Mirror the
-        // emitControlOutput pattern: notify the interactive toast, persist an entry that the
-        // registered renderer shows in the TUI transcript, and — where there is no UI (print/
-        // headless) — emit the notice to stdout so it still leaves a visible trace.
-        ctx?.ui?.notify?.(notice, "info");
-        pi.appendEntry("picc-proactive-compact", { notice });
-        if (!ctx?.hasUI) console.log(notice);
-        // Consumed by the next session_before_compact → PreCompact trigger:"auto".
-        proactiveCompactInFlight = true;
-        ctx?.compact?.();
-      }
-    } catch {
-      /* floor: proactive compaction is best-effort and must never break the turn */
-    }
-    try {
-      // Stop payload `last_assistant_message` (Claude wire contract): the
-      // settled event carries no messages, so read the session branch via ctx
-      // (best-effort — the field is simply absent when the host exposes none).
       let lastAssistantMessage: string | undefined;
       try {
-        const sm = ctx?.sessionManager;
-        const entries: any[] = sm?.getBranch?.() ?? sm?.getEntries?.() ?? [];
+        // agent_settled carries no messages, so derive Claude's
+        // last_assistant_message from Pi's active session branch.
+        // getEntries() is only the fallback for doubles without branch selection.
+        const entries: any[] = ctx?.sessionManager?.getBranch?.() ?? ctx?.sessionManager?.getEntries?.() ?? [];
         for (let i = entries.length - 1; i >= 0; i--) {
           const entry = entries[i];
           if (entry?.type !== "message" || entry.message?.role !== "assistant") continue;
           const content = entry.message.content;
-          lastAssistantMessage =
-            typeof content === "string"
-              ? content
-              : Array.isArray(content)
-                ? content
-                    .filter((c: any) => c?.type === "text")
-                    .map((c: any) => String(c.text ?? ""))
-                    .join("")
-                : undefined;
+          lastAssistantMessage = typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content.filter((part: any) => part?.type === "text").map((part: any) => String(part.text ?? "")).join("")
+              : undefined;
           break;
         }
       } catch {
-        /* best-effort field */
+        /* optional Stop payload field */
       }
+      const stopRun = mainCheckpointGate.captureLogicalRunStop();
       const outcome = await hooks.fire("Stop", {
         cwd: cwdState.get(),
         stop_hook_active: stopHookIterations > 0,
-        ...(lastAssistantMessage !== undefined
-          ? { last_assistant_message: lastAssistantMessage }
-          : {}),
+        ...(lastAssistantMessage === undefined ? {} : { last_assistant_message: lastAssistantMessage }),
       });
-      // Claude caps consecutive Stop-hook blocks at 8, then stops anyway.
-      if (outcome.block && stopHookIterations < 8) {
-        stopHookIterations++;
-        pi.sendUserMessage(
-          `[Stop hook] Continue working: ${outcome.blockReason ?? "the stop condition is not met yet"}`,
-        );
-      } else {
+      if (outcome.stop) {
+        const reason = outcome.stopReason ?? "Stop hook requested termination";
+        try {
+          if (ctx?.hasUI) ctx.ui?.notify?.(reason, "warning");
+          else console.error(`PiCC: ${reason}`);
+          ctx?.abort?.();
+        } catch { /* universal stop remains terminal */ }
+        stopRun();
         stopHookIterations = 0;
+        return true;
       }
+      // Claude caps consecutive Stop-hook blocks at 8; carry that same bound
+      // across checkpoint resume so the internal physical turn cannot reset it.
+      if (outcome.block && stopHookIterations < 8) {
+        stopHookIterations += 1;
+        const continuation = `[Stop hook] Continue working: ${outcome.stopReason ?? outcome.blockReason ?? "the stop condition is not met yet"}`;
+        const controller = mainCheckpointGate.currentController();
+        const snapshot = controller.snapshot();
+        const resume = activeMainResume;
+        if (resume && resume.epoch === checkpointSessionEpoch &&
+            resume.generation === snapshot.generation &&
+            resume.token.generation === snapshot.generation && snapshot.phase === "resuming") {
+          const capability: StopContinuationCapability = {
+            epoch: checkpointSessionEpoch,
+            controller,
+            generation: snapshot.generation,
+            resumeToken: resume.token,
+            text: continuation,
+            consumed: false,
+          };
+          stopContinuationAdmission.run(capability, () => pi.sendUserMessage(continuation));
+        } else {
+          pi.sendUserMessage(continuation);
+        }
+        return false;
+      }
+      stopHookIterations = 0;
+      return true;
     } catch {
-      /* floor */
+      return true;
     }
+  };
+
+  const emitResumedPrintResult = async (
+    ctx: any,
+    token: ResumeToken,
+    hasAuthority: () => boolean,
+  ): Promise<void> => {
+    if (ctx?.mode !== "print" || printedResumeToken === token) return;
+    const entries: any[] = ctx.sessionManager?.getBranch?.() ?? ctx.sessionManager?.getEntries?.() ?? [];
+    const entry = [...entries].reverse().find((candidate) =>
+      candidate?.type === "message" && candidate.message?.role === "assistant");
+    const message = entry?.message;
+    if (!message || message.stopReason === "error" || message.stopReason === "aborted") return;
+    const blocks = Array.isArray(message.content)
+      ? message.content.filter((part: any) => part?.type === "text" && typeof part.text === "string")
+      : [];
+    if (blocks.length === 0) return;
+    const data = Buffer.from(blocks.map((part: any) => `${part.text}\n`).join(""), "utf8");
+    const writing = printWriteTail.then(async () => {
+      if (printedResumeToken === token || !hasAuthority()) return;
+      await writeFdFully(process.stdout.fd, data);
+      printedResumeToken = token;
+      pi.sendMessage({
+        customType: "picc-checkpoint-print-result",
+        content: "",
+        display: false,
+      });
+    });
+    printWriteTail = writing.catch(() => undefined);
+    await writing;
+  };
+
+  const settleStoppedMainRun = async (): Promise<boolean> => {
+    if (!mainCheckpointGate.isLogicalRunStopped()) return false;
+    const controller = mainCheckpointGate.currentController();
+    const generation = controller.snapshot().generation;
+    const resume = activeMainResume;
+    if (resume && mainCheckpointGate.stoppedRunMatches(controller, generation) &&
+        resume.generation === generation && resume.epoch === checkpointSessionEpoch &&
+        resume.token.generation === generation) {
+      // cancelAndJoin waits for this exact physical run's settlement. Release it
+      // before joining cancellation so agent_settled never waits on itself.
+      resume.resolveSettled();
+      activeMainResume = undefined;
+    }
+    await mainCheckpointGate.settleLogicalRunStop();
+    return true;
+  };
+
+  pi.on("agent_settled", async (_event: any, ctx: any) => {
+    checkpointContext = ctx;
+    if (await settleStoppedMainRun()) return;
+    const controller = mainCheckpointGate.currentController();
+    const resume = activeMainResume;
+    if (resume?.generation === controller.snapshot().generation &&
+        resume.epoch === checkpointSessionEpoch) {
+      if (controller.snapshot().phase === "terminalizing") {
+        resume.resolveSettled();
+        return;
+      }
+      if (controller.snapshot().phase === "cancelled") {
+        resume.resolveSettled();
+        activeMainResume = undefined;
+        mainCheckpointGate.logicalRunSettled();
+        return;
+      }
+      if (controller.snapshot().phase === "resuming") {
+        if (!await runStopHook(ctx)) return;
+        if (await settleStoppedMainRun()) return;
+        const current = mainCheckpointGate.currentController();
+        const snapshot = current.snapshot();
+        if (current === controller && activeMainResume === resume &&
+            resume.epoch === checkpointSessionEpoch && snapshot.phase === "cancelled") {
+          resume.resolveSettled();
+          activeMainResume = undefined;
+          return;
+        }
+        if (current !== controller || activeMainResume !== resume ||
+            resume.generation !== snapshot.generation || resume.epoch !== checkpointSessionEpoch ||
+            resume.token.generation !== snapshot.generation || snapshot.phase !== "resuming") return;
+        const hasPrintAuthority = () => {
+          const authorityController = mainCheckpointGate.currentController();
+          const authoritySnapshot = authorityController.snapshot();
+          const authorityResume = activeMainResume;
+          return authorityController === controller && authorityResume === resume &&
+            authorityResume.token === resume.token && resume.epoch === checkpointSessionEpoch &&
+            resume.generation === authoritySnapshot.generation &&
+            resume.token.generation === authoritySnapshot.generation &&
+            authoritySnapshot.phase === "resuming";
+        };
+        try {
+          await emitResumedPrintResult(ctx, resume.token, hasPrintAuthority);
+        } catch {
+          // Leave the assistant entry last: Pi's native print-mode selector can
+          // still emit it once this outer settlement barrier is released.
+        }
+        controller.resumedSettled(resume.token);
+        resume.resolveSettled();
+        activeMainResume = undefined;
+        mainCheckpointGate.logicalRunSettled();
+        if (ctx?.mode === "tui") ctx.ui?.setStatus?.("picc-checkpoint", undefined);
+        return;
+      }
+    }
+
+    const checkpointWasArmed = mainCheckpointGate.isActive();
+    const generation = mainCheckpointGate.settlementGeneration(ctx);
+    if (generation !== undefined) {
+      await controller.checkpoint(generation);
+      const phase = controller.snapshot().phase;
+      if (phase === "exhausted" || phase === "cancelled" || checkpointWasArmed) return;
+    }
+    const trulySettled = await runStopHook(ctx);
+    if (await settleStoppedMainRun()) return;
+    // A Stop-blocked continuation remains the same logical run. Only the
+    // accepted final boundary revokes lifecycle callbacks captured by it.
+    if (trulySettled) mainCheckpointGate.logicalRunSettled();
   });
 
   pi.on("session_before_compact", async (event: any) => {
-    // A PiCC-initiated proactive compaction reaches Pi via ctx.compact(), which reports
-    // reason:"manual" here — but Claude Code fires PreCompact with trigger:"auto" for any
-    // automatic/threshold compaction and reserves "manual" for a user /compact. Consume the
-    // one-shot in-flight marker so the proactive path maps to "auto" while a genuine user
-    // /compact (marker unset) stays "manual".
-    const proactive = proactiveCompactInFlight;
-    proactiveCompactInFlight = false;
+    const epoch = checkpointSessionEpoch;
+    const controller = mainCheckpointGate.currentController();
+    const generation = controller.snapshot().generation;
+    const attempt = checkpointAttempt;
+    const proactive = controller.isCompactionSummaryActive(generation) &&
+      attempt?.epoch === epoch && attempt.controller === controller && attempt.generation === generation;
+    const replacingStaleManual = event.reason === "manual" && !proactive &&
+      activeCompactionOperation !== undefined && !activeCompactionOperation.proactive &&
+      activeCompactionOperation.epoch === epoch && activeCompactionOperation.controller === controller &&
+      activeCompactionOperation.generation === generation;
+    if ((activeCompactionOperation && !replacingStaleManual) ||
+        (!proactive && controller.manualCompactionDisposition() !== "allow")) {
+      return { cancel: true };
+    }
+    // Pi labels extension-initiated compact() as manual; controller summary
+    // authority is what maps that physical host request to Claude's auto trigger.
+    const trigger = proactive ? "auto" : event.reason === "manual" ? "manual" : "auto";
+    const operation: CompactionLifecycleOperation = {
+      identity: {}, epoch, controller, generation, proactive, trigger,
+    };
+    activeCompactionOperation = operation;
+    if (attempt && proactive) {
+      attempt.operation = operation.identity;
+    } else if (event.reason === "manual") {
+      operation.recovery = controller.recoveryToken(generation);
+    }
     try {
-      // `trigger` (manual|auto) is the matcher subject Claude documents for PreCompact.
-      await hooks.fire("PreCompact", {
-        reason: event.reason,
-        trigger: proactive ? "auto" : event.reason === "manual" ? "manual" : "auto",
+      const stopRun = mainCheckpointGate.captureLogicalRunStop();
+      const outcome = await hooks.fire("PreCompact", {
+        trigger,
+        custom_instructions: typeof event.customInstructions === "string" ? event.customInstructions : "",
         cwd: cwdState.get(),
       });
+      const snapshot = controller.snapshot();
+      const stale = activeCompactionOperation !== operation || checkpointSessionEpoch !== epoch ||
+        mainCheckpointGate.currentController() !== controller || snapshot.generation !== generation ||
+        (proactive
+          ? !controller.isCompactionSummaryActive(generation)
+          : operation.recovery
+            ? operation.recovery !== controller.recoveryToken(generation)
+            : snapshot.phase !== "idle");
+      if (stale || outcome.block || outcome.stop) {
+        if (!stale && outcome.stop) stopRun();
+        if (!stale && proactive && checkpointAttempt === attempt && !outcome.stop) attempt.hookBlocked = true;
+        if (activeCompactionOperation === operation) activeCompactionOperation = undefined;
+        return { cancel: true };
+      }
     } catch {
-      /* floor */
+      if (proactive && checkpointAttempt === attempt) attempt.hookBlocked = true;
+      if (activeCompactionOperation === operation) activeCompactionOperation = undefined;
+      return { cancel: true };
     }
-    return undefined; // let Pi's compaction run; preservation happens via system prompt + below
+    return undefined;
   });
 
-  pi.on("session_compact", async () => {
-    // Compaction succeeded (this event is success-only): clear the proactive pending flag and
-    // open the cooldown window so the next few turns can't back-to-back re-compact if usage
-    // stayed at/above threshold (a silent failure fires no event and instead re-fires via the
-    // bounded pending fallback).
-    proactivePending = pendingStateAfterCompaction();
+  pi.on("session_compact", async (event: any) => {
+    const operation = activeCompactionOperation;
+    if (!operation) return;
+    const { controller, generation, proactive, trigger, epoch } = operation;
+    const attempt = checkpointAttempt;
+    const isCurrent = () => operation === activeCompactionOperation && epoch === checkpointSessionEpoch &&
+      controller === mainCheckpointGate.currentController() && controller.snapshot().generation === generation &&
+      (proactive
+        ? controller.isCompactionSummaryActive(generation) &&
+          attempt?.operation === operation.identity && attempt.controller === controller
+        : operation.recovery
+          ? operation.recovery === controller.recoveryToken(generation)
+          : controller.snapshot().phase === "idle");
+    if (!isCurrent()) {
+      if (activeCompactionOperation === operation) activeCompactionOperation = undefined;
+      return;
+    }
+
+    let restorationFailed = false;
+    let universalStop = false;
     try {
-      await hooks.fire("PostCompact", { cwd: cwdState.get() });
-      // Path-scoped artifacts reload on next relevant access: compaction
-      // summarized their transcript messages away, so the once-only markers reset.
+      const started = await hooks.fire("SessionStart", { source: "compact", cwd: cwdState.get() });
+      if (!isCurrent()) return;
+      if (started.stop) {
+        restorationFailed = true;
+        universalStop = true;
+      }
+      const startedContext = [started.stdout, started.additionalContext].filter(Boolean).join("\n").trim();
+      if (!universalStop && startedContext) {
+        if (!isCurrent()) return;
+        pi.sendMessage(
+          { customType: "picc-hook-context", content: startedContext, display: true },
+          { deliverAs: "steer" },
+        );
+      }
+    } catch {
+      restorationFailed = true;
+    }
+    if (!isCurrent()) return;
+    if (!universalStop) try {
+      const post = await hooks.fire("PostCompact", {
+        trigger,
+        compact_summary: String(event.compactionEntry?.summary ?? ""),
+        cwd: cwdState.get(),
+      });
+      if (!isCurrent()) return;
+      if (post.stop) {
+        restorationFailed = true;
+        universalStop = true;
+      }
+    } catch {
+      restorationFailed = true;
+    }
+    if (!isCurrent()) return;
+    if (!universalStop) try {
       resetInjectionState(state, project.claudeMd);
-      // Re-inject active skill bodies for mid-turn continuity. Auto-compaction
-      // happens MID-RUN and the aborted turn is retried immediately, so this must
-      // deliver before the next LLM call ("steer") — "nextTurn" would sit queued
-      // until the next user prompt.
-      // Budgeted like Claude's carryover: ~5k tokens per skill, ~25k combined,
-      // most recently activated first.
       if (state.activeSkills.size) {
         const budgeted = budgetSkillReinjection([...state.activeSkills.entries()]);
         for (const name of budgeted.dropped) {
-          debug(
-            `compaction: active skill "${name}" dropped from re-injection (combined budget exceeded)`,
-          );
+          debug(`compaction: active skill "${name}" dropped from re-injection (combined budget exceeded)`);
         }
         if (budgeted.text) {
+          if (!isCurrent()) return;
           pi.sendMessage(
             {
               customType: "picc-preserved",
@@ -1666,8 +2411,25 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         }
       }
     } catch {
-      /* floor */
+      restorationFailed = true;
     }
+    if (!isCurrent()) return;
+    if (proactive && attempt && checkpointAttempt === attempt && attempt.operation === operation.identity) {
+      attempt.restorationFailed = restorationFailed;
+    }
+    if (!proactive) {
+      if (restorationFailed) {
+        const rejected = await controller.failAfterCommittedSummary(generation);
+        reportRejectedShadows(rejected, checkpointContext);
+      } else if (event.reason === "manual" && operation.recovery && operation.recovery === controller.recoveryToken(generation)) {
+        const recovered = controller.recoverAfterManualCompaction(operation.recovery);
+        if (recovered.recovered) {
+          publishCheckpoint({ category: "checkpoint-recovered", generation, action: "manual-recovery" }, checkpointContext);
+          reportRejectedShadows(recovered.rejected, checkpointContext);
+        }
+      }
+    }
+    if (activeCompactionOperation === operation) activeCompactionOperation = undefined;
   });
 
   pi.on("model_select", (event: any) => {

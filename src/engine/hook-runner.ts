@@ -33,9 +33,8 @@ const PLAIN_STDOUT_IGNORED_EVENTS: ReadonlySet<string> = new Set([
 /**
  * Payload key(s) the `matcher` is compared against, per event: tool events
  * match the tool name; SessionStart the source
- * (startup|resume|clear|compact); PreCompact the trigger (manual|auto) —
- * PiCC call sites currently deliver it as `reason`, so that is accepted as a
- * fallback; Subagent* the agent type; SessionEnd the reason. Events not
+ * (startup|resume|clear|compact); PreCompact and PostCompact the trigger
+ * (manual|auto); Subagent* the agent type; SessionEnd the reason. Events not
  * listed here document no matcher subject and Claude ignores `matcher` there
  * (entries fire unconditionally).
  */
@@ -45,8 +44,9 @@ const MATCHER_SUBJECT_KEYS: Readonly<Record<string, readonly string[]>> = {
   PostToolUseFailure: ["tool_name"],
   SessionStart: ["source"],
   PreCompact: ["trigger", "reason"],
-  SubagentStart: ["subagent_type", "agent_type"],
-  SubagentStop: ["subagent_type", "agent_type"],
+  PostCompact: ["trigger"],
+  SubagentStart: ["agent_type", "subagent_type"],
+  SubagentStop: ["agent_type", "subagent_type"],
   SessionEnd: ["reason"],
 };
 
@@ -75,10 +75,35 @@ const EXIT2_BLOCKABLE_EVENTS: ReadonlySet<string> = new Set([
   "PostToolUseFailure",
   "UserPromptSubmit",
   "Stop",
-  "SubagentStart",
   "SubagentStop",
   "PreCompact",
 ]);
+
+export function mergeHookOutcomes(outcomes: readonly (HookOutcome | undefined)[]): HookOutcome {
+  const merged: HookOutcome = { block: false, askDowngraded: false, diagnostics: [] };
+  for (const outcome of outcomes) {
+    if (!outcome) continue;
+    if (outcome.block && !merged.block) {
+      merged.block = true;
+      merged.blockReason = outcome.blockReason;
+    }
+    if (outcome.stop && !merged.stop) {
+      merged.stop = true;
+      merged.stopReason = outcome.stopReason;
+    }
+    merged.askDowngraded ||= outcome.askDowngraded;
+    if (outcome.additionalContext) {
+      merged.additionalContext = [merged.additionalContext, outcome.additionalContext].filter(Boolean).join("\n");
+    }
+    if (outcome.updatedInput) merged.updatedInput = { ...merged.updatedInput, ...outcome.updatedInput };
+    if (outcome.stdout) merged.stdout = [merged.stdout, outcome.stdout].filter(Boolean).join("\n");
+    if (outcome.systemMessages?.length) {
+      merged.systemMessages = [...(merged.systemMessages ?? []), ...outcome.systemMessages];
+    }
+    merged.diagnostics.push(...outcome.diagnostics);
+  }
+  return merged;
+}
 
 export interface HookRunnerOptions {
   config: HookConfig;
@@ -768,7 +793,7 @@ export class HookRunner {
     }
 
     const decision = hso?.["permissionDecision"];
-    if (decision === "deny") {
+    if (decision === "deny" && EXIT2_BLOCKABLE_EVENTS.has(eventName)) {
       const reason = hso?.["permissionDecisionReason"];
       this.setBlock(outcome, typeof reason === "string" ? reason : undefined);
     } else if (decision === "ask") {
@@ -784,14 +809,17 @@ export class HookRunner {
     const updated = asRecord(hso?.["updatedInput"]) ?? asRecord(json["updatedInput"]);
     if (updated) outcome.updatedInput = { ...outcome.updatedInput, ...updated };
 
-    // Stop-hook style top-level block.
-    if (json["decision"] === "block") {
+    // Event-specific blocking and universal hook stop are separate authorities.
+    // Compact post-events ignore ordinary block decisions, but continue:false
+    // still stops restoration/resume after the committed summary.
+    if (json["decision"] === "block" && EXIT2_BLOCKABLE_EVENTS.has(eventName)) {
       const reason = json["reason"];
       this.setBlock(outcome, typeof reason === "string" ? reason : undefined);
     }
-    if (json["continue"] === false) {
+    if (json["continue"] === false && !outcome.stop) {
       const stopReason = json["stopReason"];
-      this.setBlock(outcome, typeof stopReason === "string" ? stopReason : undefined);
+      outcome.stop = true;
+      if (typeof stopReason === "string") outcome.stopReason = stopReason;
     }
   }
 

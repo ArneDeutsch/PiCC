@@ -10,12 +10,13 @@ import type {
   HookPayload,
   ToolCallDescriptor,
 } from "../types.js";
-import type { HookRunner, HookRunnerLike } from "../engine/hook-runner.js";
+import { mergeHookOutcomes, type HookRunner, type HookRunnerLike } from "../engine/hook-runner.js";
 import { PermissionEngine } from "../engine/permissions.js";
 import { builtinAgents, resolveAgent } from "../claude/agents.js";
 import { parseHookConfig } from "../claude/hooks.js";
 import { claudeToolsToPiBuiltins } from "./tool-map.js";
 import { createGuardExtension } from "./guard.js";
+import { registerCodexAbortGuard } from "./codex-abort-guard.js";
 import { CwdState } from "./cwd-state.js";
 import { findByName } from "../project.js";
 import type { BackgroundTaskRegistry, UsageLike } from "./background-tasks.js";
@@ -48,6 +49,20 @@ import {
 } from "./subagent-render.js";
 import { formatBackgroundTaskIdentity } from "./background-identity.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./builtin-tools.js";
+import {
+  MainSessionCheckpointGate,
+  promiseCompactionAttempt,
+  type CancellationKind,
+  type CheckpointProgress,
+  type QueuedInputShadow,
+  type ResumeContext,
+  type ResumeToken,
+} from "./mid-run-compaction.js";
+import {
+  budgetSkillReinjection,
+  newSkillActivationState,
+  type SkillActivationState,
+} from "./skill-activation.js";
 
 /**
  * Subagent dispatch runtime: spawns fresh-context Pi sessions per dispatch,
@@ -94,7 +109,9 @@ export interface SubagentRuntimeDeps {
     depth: number,
     ownerAgentId: string,
     dispatcherIsFork: boolean,
-    subCwd?: CwdState,
+    subCwd: CwdState | undefined,
+    activation: SkillActivationState,
+    captureUniversalStop?: () => () => boolean,
   ) => unknown[];
   /** All Claude tool names the harness knows (for gateTools' allKnown). */
   allKnownToolNames: () => string[];
@@ -126,12 +143,17 @@ export interface SubagentRuntimeDeps {
    * when unset the clip simply does not run for subagents.
    */
   clipMaxTokens?: number;
+  /** Child sessions use the same resolved proactive threshold as the main session. */
+  proactiveCompactPercent?: number;
   /**
    * Preferred: builds a PER-DISPATCH context injector with its own fresh injection
    * state. Sharing the parent's injector would let a subagent's file touches consume
    * the orchestrator's one-shot nested-CLAUDE.md/path-rule injections (and vice versa).
    */
-  makeContextInjector?: (getCwd: () => string) => (filePath: string) => string | undefined;
+  makeContextInjector?: (getCwd: () => string) => {
+    inject: (filePath: string) => string | undefined;
+    reset: () => void;
+  };
   /** Legacy shared injector — used only when makeContextInjector is absent. */
   contextForTouchedFile?: (filePath: string) => string | undefined;
   /** Resolve "provider/model" (or undefined) to a Pi Model object, or undefined to inherit. */
@@ -314,6 +336,13 @@ interface PiSession {
   prompt(text: string): Promise<void>;
   messages: PiSessionMessage[];
   dispose(): void;
+  getContextUsage?(): { percent?: number; tokens?: number; contextWindow?: number } | undefined;
+  compact?(customInstructions?: string): Promise<unknown>;
+  abortCompaction?(): void;
+  sendCustomMessage?(
+    message: { customType: string; content: unknown; display: boolean; details?: unknown },
+    options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+  ): Promise<void>;
   setThinkingLevel?(level: string): void;
   /** Cooperative abort (real Pi sessions expose it; TaskStop uses it best-effort). */
   abort?(): Promise<void> | void;
@@ -394,6 +423,8 @@ export interface DispatchResult {
    * `finalMessage` (the verbatim-return contract is untouched).
    */
   usage?: DispatchUsage;
+  /** True when exhaustion retained this exact live guarded session for recovery/stop. */
+  checkpointPaused?: boolean;
   /** The single error channel: present iff `outcome !== "completed"`, names the cause. */
   error?: string;
   diagnostics: Diagnostic[];
@@ -524,31 +555,6 @@ function isEnvTruthy(value: string | undefined): boolean {
   return v !== "" && v !== "0" && v !== "false" && v !== "no" && v !== "off";
 }
 
-/** Merge hook outcomes: any block wins (first reason), context/diagnostics accumulate. */
-function mergeHookOutcomes(outcomes: Array<HookOutcome | undefined>): HookOutcome {
-  const merged: HookOutcome = { block: false, askDowngraded: false, diagnostics: [] };
-  for (const o of outcomes) {
-    if (!o) continue;
-    if (o.block && !merged.block) {
-      merged.block = true;
-      merged.blockReason = o.blockReason;
-    }
-    merged.askDowngraded = merged.askDowngraded || o.askDowngraded;
-    if (o.additionalContext) {
-      merged.additionalContext = merged.additionalContext
-        ? `${merged.additionalContext}\n${o.additionalContext}`
-        : o.additionalContext;
-    }
-    if (o.updatedInput) merged.updatedInput = { ...merged.updatedInput, ...o.updatedInput };
-    if (o.stdout) merged.stdout = merged.stdout ? `${merged.stdout}\n${o.stdout}` : o.stdout;
-    if (o.systemMessages?.length) {
-      merged.systemMessages = [...(merged.systemMessages ?? []), ...o.systemMessages];
-    }
-    merged.diagnostics.push(...o.diagnostics);
-  }
-  return merged;
-}
-
 /**
  * HookRunner-shaped facade multiplexing the session runner with an agent's
  * scoped runner — same pattern as index.ts's HookMultiplexer,
@@ -566,6 +572,583 @@ function multiplexHookRunners(base: HookRunnerLike, scoped: HookRunnerLike): Hoo
         await scoped.fire(eventName, payload, toolCall),
       ]),
   };
+}
+
+interface ChildDeferred<T = void> {
+  promise: Promise<T>;
+  resolve(value?: T): void;
+  reject(reason?: unknown): void;
+}
+
+function childDeferred<T = void>(): ChildDeferred<T> {
+  let resolvePromise!: (value: T | PromiseLike<T>) => void;
+  let rejectPromise!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolvePromise = done;
+    rejectPromise = fail;
+  });
+  return {
+    promise,
+    resolve: (value) => resolvePromise(value as T),
+    reject: rejectPromise,
+  };
+}
+
+/** Adapts one live child AgentSession to the shared checkpoint state machine. */
+class ChildCheckpointCoordinator {
+  readonly activation: SkillActivationState;
+  readonly gate: MainSessionCheckpointGate;
+
+  private session: PiSession | undefined;
+  private readonly hooks: HookRunnerLike;
+  private hookBlocked = false;
+  private restorationFailed = false;
+  private manualRecovery = false;
+  private stoppedRunSettled = false;
+  private compactOperation: {
+    controller: import("./mid-run-compaction.js").MidRunCompactionController;
+    generation: number;
+    proactive: boolean;
+    trigger: "auto" | "manual";
+  } | undefined;
+  private retained: {
+    recover: (text: string) => Promise<DispatchResult>;
+    cleanup: (outcome: DispatchOutcome, finalText?: string) => Promise<void>;
+    operation?: Promise<DispatchResult>;
+    cleanupPromise?: Promise<void>;
+    stopping: boolean;
+  } | undefined;
+  private activeResume: {
+    generation: number;
+    token: ResumeToken;
+    started: ChildDeferred;
+    providerOpen: ChildDeferred;
+    settled: ChildDeferred;
+    run: Promise<void>;
+    agentSettled: boolean;
+    runCompleted: boolean;
+  } | undefined;
+
+  constructor(
+    sessionId: string,
+    threshold: number,
+    private readonly agentName: string,
+    private readonly hookAgentType: string,
+    private readonly agentId: string,
+    private readonly cwd: CwdState,
+    hooks: HookRunnerLike,
+    private readonly diagnostics: Diagnostic[],
+    private readonly emitProgress?: (snapshot: ProgressSnapshot) => void,
+  ) {
+    const identityWrap = (runner: HookRunnerLike): HookRunnerLike => ({
+      fire: (eventName, payload, toolCall) => runner.fire(
+        eventName,
+        { ...payload, agent_id: agentId, agent_type: this.hookAgentType },
+        toolCall,
+      ),
+    });
+    this.activation = newSkillActivationState(new Map(), identityWrap);
+    this.hooks = this.hookFacade(hooks);
+    this.gate = new MainSessionCheckpointGate(sessionId, threshold);
+    this.gate.attachExecution({
+      progress: (event) => this.progress(event),
+      compact: (attempt, signal) => this.compact(attempt, signal),
+      resume: (context) => this.resume(context),
+    });
+  }
+
+  private resetContextInjection: (() => void) | undefined;
+
+  attach(session: PiSession): void {
+    this.session = session;
+  }
+
+  attachContextReset(reset: (() => void) | undefined): void {
+    this.resetContextInjection = reset;
+  }
+
+  wrapTools(tools: unknown[]): unknown[] {
+    return tools.map((tool) => this.gate.wrapTool(tool as Record<string, unknown>));
+  }
+
+  hookFacade(base: HookRunnerLike): HookRunnerLike {
+    return {
+      fire: async (eventName, payload, toolCall) => {
+        const outcome = mergeHookOutcomes([
+          await base.fire(eventName, payload, toolCall),
+          ...await Promise.all(this.activation.hookRunners.map((runner) =>
+            runner.fire(eventName, payload, toolCall))),
+        ]);
+        if (eventName === "SessionStart" || eventName === "PostCompact") {
+          this.diagnostics.push(...outcome.diagnostics);
+          for (const message of outcome.systemMessages ?? []) {
+            this.diagnostics.push({ severity: "info", message: `hook (${eventName}): ${message}` });
+          }
+        }
+        return outcome;
+      },
+    };
+  }
+
+  extensionFactory() {
+    const child = this;
+    return (pi: { on(event: string, handler: (event: any, ctx: any) => unknown): void }) => {
+      pi.on("message_end", (event) => child.gate.assistantMessageEnded(event?.message));
+      pi.on("message_start", (event) => child.gate.userMessageStarted(
+        event?.message,
+        event?.streamingBehavior ?? event?.delivery ?? event?.message?.delivery,
+      ));
+      pi.on("tool_execution_end", (event) => child.gate.toolExecutionEnded(event));
+      pi.on("turn_end", (_event, ctx) => child.gate.turnEnded(ctx));
+      pi.on("turn_start", async (_event, ctx) => {
+        child.activeResume?.started.resolve();
+        await child.gate.defensiveLatch(ctx);
+      });
+      pi.on("before_provider_request", async (_event, ctx) => {
+        await child.gate.defensiveLatch(ctx);
+      });
+      pi.on("agent_settled", async (_event, ctx) => child.settled(ctx));
+      pi.on("session_before_compact", async (event) => child.beforeCompact(event));
+      pi.on("session_compact", async (event) => child.afterCompact(event));
+      pi.on("session_shutdown", async () => child.cancel("shutdown"));
+    };
+  }
+
+  async join(): Promise<void> {
+    const controller = this.gate.currentController();
+    const snapshot = controller.snapshot();
+    await controller.stableBarrier(snapshot.generation);
+  }
+
+  consumeStoppedRun(): boolean {
+    const stopped = this.stoppedRunSettled;
+    this.stoppedRunSettled = false;
+    return stopped;
+  }
+
+  exhausted(): boolean {
+    return this.gate.currentController().snapshot().phase === "exhausted";
+  }
+
+  failureMessage(): string {
+    const snapshot = this.gate.currentController().snapshot();
+    if (snapshot.failureCategory === "restoration-paused") {
+      return `Automatic context compaction for subagent "${this.agentName}" committed, but restoration or continuation failed. The agent is paused and no continuation ran. Do not compact it again or retry SendMessage; abandon it with TaskStop using agent id ${this.agentId}, then dispatch a replacement agent with the retained input.`;
+    }
+    if (snapshot.failureCategory === "hook-blocked") {
+      return `Automatic context compaction for subagent "${this.agentName}" paused because a PreCompact hook blocked the attempt. The agent is paused and no continuation ran; before this process exits, repair or disable the hook and use SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
+    }
+    return `Automatic context compaction for subagent "${this.agentName}" failed after up to three attempts. The agent is paused and no continuation ran; before this process exits, use SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
+  }
+
+  retain(
+    recover: (text: string) => Promise<DispatchResult>,
+    cleanup: (outcome: DispatchOutcome, finalText?: string) => Promise<void>,
+  ): void {
+    // Re-exhaustion happens inside the original retained owner's recovery
+    // operation. Keep that owner (and therefore its operation/cleanup chain)
+    // stable so TaskStop and shutdown can still join the whole chain.
+    if (this.retained) return;
+    this.retained = { recover, cleanup, stopping: false };
+  }
+
+  private claimRetainedCleanup(
+    retained: NonNullable<ChildCheckpointCoordinator["retained"]>,
+    outcome: DispatchOutcome,
+    finalText?: string,
+  ): Promise<void> {
+    // This synchronous claim is the sole entrance to disposal, registry
+    // settlement, worktree release, and the final SubagentStop hook. `stopping`
+    // is reserved for an external cancellation so recovery can distinguish a
+    // normal terminal cleanup from a concurrent stop that must suppress output.
+    if (!retained.cleanupPromise) retained.cleanupPromise = retained.cleanup(outcome, finalText);
+    return retained.cleanupPromise;
+  }
+
+  async cancel(kind: CancellationKind): Promise<void> {
+    const retained = this.retained;
+    if (retained) retained.stopping = true;
+    const session = this.session;
+    const controller = this.gate.currentController();
+    const generation = controller.snapshot().generation;
+    const cancellation = this.gate.cancel(kind);
+    this.compactOperation = undefined;
+    try { session?.abortCompaction?.(); } catch { /* cancellation still joins the run */ }
+    const resume = this.activeResume;
+    this.activeResume = undefined;
+    resume?.started.resolve();
+    resume?.providerOpen.resolve();
+    resume?.settled.reject(new Error("checkpoint cancelled"));
+    try { await Promise.resolve(session?.abort?.()); } catch { /* controller join remains authoritative */ }
+    await resume?.run.catch(() => undefined);
+    await retained?.operation?.catch(() => undefined);
+    await cancellation;
+    await controller.stableBarrier(generation);
+    if (retained) await this.claimRetainedCleanup(retained, "aborted");
+  }
+
+  steer(text: string): Promise<void> | void {
+    const controller = this.gate.currentController();
+    const snapshot = controller.snapshot();
+    if (snapshot.phase === "exhausted") throw new Error(this.failureMessage());
+    if (snapshot.phase !== "idle" && snapshot.phase !== "cancelled") {
+      const retained = controller.shadowInput(snapshot.generation, text, "steer");
+      if (retained) return;
+    }
+    return this.session?.steer?.(text);
+  }
+
+  recover(text: string): Promise<DispatchResult> {
+    const retained = this.retained;
+    if (!retained || retained.stopping || retained.cleanupPromise) {
+      return Promise.reject(new Error(`${this.failureMessage()} Recovery adapter is unavailable for this retained session.`));
+    }
+    if (retained.operation) {
+      return Promise.reject(new Error(`Checkpoint recovery for subagent "${this.agentName}" is already in progress; await that SendMessage attempt.`));
+    }
+    // Publish ownership synchronously: TaskStop/shutdown can now observe and
+    // join the complete manual-compact + continuation + classification promise.
+    const operation = this.runRecovery(retained, text);
+    retained.operation = operation;
+    void operation.finally(() => {
+      if (retained.operation === operation) retained.operation = undefined;
+    }).catch(() => undefined);
+    return operation;
+  }
+
+  private async runRecovery(
+    retained: NonNullable<ChildCheckpointCoordinator["retained"]>,
+    text: string,
+  ): Promise<DispatchResult> {
+    const session = this.session;
+    const controller = this.gate.currentController();
+    const generation = controller.snapshot().generation;
+    const token = controller.recoveryToken(generation);
+    if (!token || !session?.compact || !session.sendCustomMessage) {
+      throw new Error(`${this.failureMessage()} Recovery adapter is unavailable for this retained session.`);
+    }
+    this.hookBlocked = false;
+    this.restorationFailed = false;
+    this.manualRecovery = true;
+    try {
+      await session.compact();
+    } catch (error) {
+      const category = this.hookBlocked ? "PreCompact hook" : "manual compaction";
+      void error;
+      throw new Error(`${category} failed for recovery attempt on subagent "${this.agentName}". The agent remains paused; retry SendMessage after repairing the cause.`);
+    } finally {
+      this.manualRecovery = false;
+    }
+    if (retained.stopping || this.retained !== retained) throw new Error("checkpoint recovery was cancelled");
+    if (this.restorationFailed) {
+      await controller.failAfterCommittedSummary(generation);
+      throw new Error(`Context or skill restoration failed after compaction committed for subagent "${this.agentName}". Do not compact it again; abandon it with TaskStop using agent id ${this.agentId}, then dispatch a replacement agent with the retained input.`);
+    }
+    const recovered = controller.recoverAfterManualCompaction(token);
+    if (!recovered.recovered || retained.stopping) throw new Error("checkpoint recovery was cancelled");
+    try {
+      const result = await retained.recover(text);
+      // Classification may itself re-exhaust or race a stop. Authenticate the
+      // original owner again before either returning the paused result or
+      // claiming terminal cleanup; cancellation always wins this boundary.
+      if (this.retained !== retained || retained.stopping) throw new Error("checkpoint recovery was cancelled");
+      if (!result.checkpointPaused) {
+        await this.claimRetainedCleanup(retained, result.outcome, result.finalMessage);
+        if (this.retained !== retained || retained.stopping) throw new Error("checkpoint recovery was cancelled");
+      }
+      return result;
+    } catch (error) {
+      if (retained.stopping) throw new Error("checkpoint recovery was cancelled");
+      const snapshot = controller.snapshot();
+      if (snapshot.phase === "exhausted" && snapshot.failureCategory === "restoration-paused") {
+        throw new Error(this.failureMessage());
+      }
+      const currentController = this.gate.currentController();
+      await currentController.failAfterCommittedSummary(currentController.snapshot().generation);
+      throw new Error(this.failureMessage());
+    }
+  }
+
+  private async settled(ctx: any): Promise<void> {
+    const controller = this.gate.currentController();
+    const resume = this.activeResume;
+    if (this.gate.isLogicalRunStopped()) {
+      this.stoppedRunSettled = true;
+      if (resume && this.gate.stoppedRunMatches(controller, controller.snapshot().generation) &&
+          resume.generation === controller.snapshot().generation) {
+        // The SDK run may not resolve until this handler returns. Signal only the
+        // settlement capability here; cancellation joins in the background and
+        // dispatch classification waits on the controller's stable barrier.
+        resume.agentSettled = true;
+        resume.settled.resolve();
+      }
+      void this.gate.settleLogicalRunStop().catch(() => undefined);
+      return;
+    }
+    if (resume && resume.generation === controller.snapshot().generation &&
+        controller.snapshot().phase === "resuming") {
+      resume.agentSettled = true;
+      // sendCustomMessage is the public ownership promise. agent_settled may
+      // precede a later rejection, so success is committed only after both.
+      if (resume.runCompleted) {
+        controller.resumedSettled(resume.token);
+        resume.settled.resolve();
+        this.activeResume = undefined;
+      }
+      return;
+    }
+    const generation = this.gate.settlementGeneration(ctx);
+    if (generation !== undefined) await controller.checkpoint(generation);
+  }
+
+  private async compact(_attempt: number, signal: AbortSignal) {
+    const session = this.session;
+    const controller = this.gate.currentController();
+    const generation = controller.snapshot().generation;
+    const token = controller.beginCompactionSummary(generation);
+    if (!session?.compact || !token) return { ok: false as const, category: "operational" as const };
+    this.hookBlocked = false;
+    this.restorationFailed = false;
+    const operation = Promise.resolve().then(() => session.compact!());
+    const abort = () => {
+      try { session.abortCompaction?.(); } catch { /* operation settlement classifies */ }
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    try {
+      let result = await promiseCompactionAttempt(() => operation, signal);
+      if (signal.aborted) await operation.catch(() => undefined);
+      if (!result.ok && this.hookBlocked) result = { ok: false, category: "hook-blocked" };
+      if (result.ok && this.restorationFailed) result = { ok: false, category: "restoration-paused" };
+      return result;
+    } finally {
+      signal.removeEventListener("abort", abort);
+      if (this.compactOperation?.controller === controller &&
+          this.compactOperation.generation === generation) this.compactOperation = undefined;
+      controller.endCompactionSummary(token);
+    }
+  }
+
+  private resume(context: ResumeContext) {
+    const session = this.session;
+    if (!session?.sendCustomMessage) throw new Error("Child session cannot resume through the public SDK");
+    const started = childDeferred();
+    const providerOpen = childDeferred();
+    const settled = childDeferred();
+    let resume!: NonNullable<ChildCheckpointCoordinator["activeResume"]>;
+    const isCurrent = (): boolean => {
+      const controller = this.gate.currentController();
+      const snapshot = controller.snapshot();
+      return this.activeResume === resume && !context.signal.aborted &&
+        snapshot.generation === context.generation && snapshot.phase === "resuming";
+    };
+    // Defer the SDK call by one microtask so ownership is installed first, then
+    // authenticate again immediately before the public send side effect.
+    const run = Promise.resolve().then(() => {
+      if (!isCurrent()) throw new Error("checkpoint resume lost authority before startup");
+      return session.sendCustomMessage!({
+        customType: "picc-checkpoint-resume",
+        content: "Context was compacted. Continue the same pending task from the preserved state.",
+        display: false,
+      }, { triggerTurn: true });
+    });
+    resume = {
+      generation: context.generation,
+      token: context.token,
+      started,
+      providerOpen,
+      settled,
+      run,
+      agentSettled: false,
+      runCompleted: false,
+    };
+    this.activeResume = resume;
+    if (!this.gate.installResumeBarrier(context.generation, providerOpen.promise)) {
+      this.activeResume = undefined;
+      void run.catch(() => undefined);
+      throw new Error("Cannot install child resumed provider barrier");
+    }
+    void run.then(() => {
+      resume.runCompleted = true;
+      if (resume.agentSettled && this.activeResume === resume) {
+        this.gate.currentController().resumedSettled(resume.token);
+        resume.settled.resolve();
+        this.activeResume = undefined;
+      }
+    }, (error) => {
+      // A rejection before or after turn_start must open every local wait while
+      // rejecting controller settlement; otherwise replay can hang or finish as
+      // a false successful/empty continuation.
+      started.resolve();
+      providerOpen.resolve();
+      this.gate.clearResumeBarrier(context.generation, providerOpen.promise);
+      settled.reject(error);
+      if (this.activeResume === resume) this.activeResume = undefined;
+    });
+    let replayCompleted = false;
+    return {
+      settled: settled.promise,
+      replay: async (input: QueuedInputShadow) => {
+        await started.promise;
+        // Cancellation settles `started` to release this waiter; it never grants
+        // replay authority. Re-authenticate immediately before touching Pi.
+        if (!isCurrent()) return { delivered: false as const };
+        await session.sendCustomMessage!({
+          customType: "picc-retained-parent-input",
+          content: input.content,
+          display: false,
+        }, { deliverAs: input.delivery });
+        return { delivered: isCurrent() as true | false };
+      },
+      replayComplete: () => {
+        if (!isCurrent() || replayCompleted) throw new Error("checkpoint resume provider release is not current");
+        replayCompleted = true;
+        providerOpen.resolve();
+      },
+      cancelAndJoin: async () => {
+        started.resolve();
+        providerOpen.resolve();
+        this.gate.clearResumeBarrier(context.generation, providerOpen.promise);
+        try { await Promise.resolve(session.abort?.()); } finally { await run.catch(() => undefined); }
+        if (this.activeResume === resume) this.activeResume = undefined;
+      },
+    };
+  }
+
+  private async beforeCompact(event: any): Promise<{ cancel: true } | undefined> {
+    const controller = this.gate.currentController();
+    const generation = controller.snapshot().generation;
+    const proactive = controller.isCompactionSummaryActive(generation);
+    const trigger = proactive ? "auto" : event?.reason === "manual" ? "manual" : "auto";
+    if ((!proactive && trigger === "manual" && !this.manualRecovery) || this.compactOperation) return { cancel: true };
+    const operation = { controller, generation, proactive, trigger } as const;
+    this.compactOperation = operation;
+    const isCurrent = () => this.compactOperation === operation &&
+      this.gate.currentController() === controller && controller.snapshot().generation === generation &&
+      (proactive ? controller.isCompactionSummaryActive(generation) :
+        operation.trigger === "auto" ? controller.snapshot().phase === "idle" : this.manualRecovery);
+    const stopRun = this.gate.captureLogicalRunStop();
+    const outcome = await this.hooks.fire("PreCompact", {
+      trigger: operation.trigger,
+      custom_instructions: String(event?.customInstructions ?? ""),
+      cwd: this.cwd.get(),
+    }).catch(() => undefined);
+    if (!isCurrent() || !outcome || outcome.block || outcome.stop) {
+      if (isCurrent() && outcome?.stop) stopRun();
+      if (isCurrent() && !outcome?.stop) this.hookBlocked = true;
+      if (this.compactOperation === operation) this.compactOperation = undefined;
+      return { cancel: true };
+    }
+    return undefined;
+  }
+
+  private async afterCompact(event: any): Promise<void> {
+    const operation = this.compactOperation;
+    const session = this.session;
+    if (!operation || !session) return;
+    const isCurrent = () => this.compactOperation === operation &&
+      this.gate.currentController() === operation.controller &&
+      operation.controller.snapshot().generation === operation.generation &&
+      (operation.proactive
+        ? operation.controller.isCompactionSummaryActive(operation.generation)
+        : operation.trigger === "auto"
+          ? operation.controller.snapshot().phase === "idle"
+          : this.manualRecovery);
+    if (!isCurrent()) return;
+    try {
+      let universalStop = false;
+      let startedContext = "";
+      try {
+        const started = await this.hooks.fire("SessionStart", { source: "compact", cwd: this.cwd.get() });
+        if (!isCurrent()) return;
+        if (started.stop) {
+          this.restorationFailed = true;
+          universalStop = true;
+        }
+        startedContext = [started.stdout, started.additionalContext].filter(Boolean).join("\n").trim();
+      } catch {
+        this.restorationFailed = true;
+      }
+      if (!isCurrent()) return;
+      if (!universalStop && startedContext) {
+        try {
+          if (!isCurrent()) return;
+          if (!session.sendCustomMessage) throw new Error("child hook restoration unavailable");
+          await session.sendCustomMessage({
+            customType: "picc-hook-context",
+            content: startedContext,
+            display: true,
+          }, { deliverAs: "steer" });
+          if (!isCurrent()) return;
+        } catch {
+          this.restorationFailed = true;
+        }
+      }
+      if (!isCurrent()) return;
+      if (!universalStop) try {
+        const post = await this.hooks.fire("PostCompact", {
+          trigger: operation.trigger,
+          compact_summary: String(event?.compactionEntry?.summary ?? ""),
+          cwd: this.cwd.get(),
+        });
+        if (!isCurrent()) return;
+        if (post.stop) {
+          this.restorationFailed = true;
+          universalStop = true;
+        }
+      } catch {
+        this.restorationFailed = true;
+      }
+      if (!isCurrent()) return;
+      if (!universalStop) {
+        try {
+          if (!isCurrent()) return;
+          this.resetContextInjection?.();
+        } catch {
+          this.restorationFailed = true;
+        }
+      }
+      if (!isCurrent()) return;
+      const preserved = budgetSkillReinjection([...this.activation.activeSkills.entries()]);
+      if (!universalStop && preserved.text) {
+        try {
+          if (!isCurrent()) return;
+          if (!session.sendCustomMessage) throw new Error("child skill restoration unavailable");
+          await session.sendCustomMessage({
+            customType: "picc-preserved",
+            content: `Context preserved across compaction (PiCC):\n\n${preserved.text}`,
+            display: false,
+          }, { deliverAs: "steer" });
+          if (!isCurrent()) return;
+        } catch {
+          this.restorationFailed = true;
+        }
+      }
+    } finally {
+      if (!operation.proactive && operation.trigger === "auto" && this.restorationFailed && isCurrent()) {
+        await operation.controller.failAfterCommittedSummary(operation.generation);
+      }
+      if (this.compactOperation === operation) this.compactOperation = undefined;
+    }
+  }
+
+  private progress(event: CheckpointProgress): void {
+    const controller = this.gate.currentController();
+    if (this.gate.isLogicalRunStopped() && this.gate.stoppedRunMatches(controller, event.generation)) return;
+    const activity = event.category === "checkpoint-retrying"
+      ? `checkpoint retry ${Math.min((event.attempt ?? 1) + 1, 3)}/3`
+      : event.category === "checkpoint-exhausted"
+        ? "checkpoint paused: recovery required"
+        : event.category === "checkpoint-recovered"
+          ? "checkpoint recovered: resuming"
+          : `checkpoint: ${event.category}`;
+    this.emitProgress?.({ tail: [activity], activity });
+    if (event.category === "checkpoint-retrying") {
+      this.diagnostics.push({ severity: "warning", message: `subagent context compaction retry ${Math.min((event.attempt ?? 1) + 1, 3)} of 3` });
+    }
+    if (event.category === "checkpoint-exhausted") {
+      this.diagnostics.push({ severity: "warning", message: this.failureMessage() });
+    }
+  }
 }
 
 export function extractText(content: unknown): string {
@@ -630,6 +1213,22 @@ export class SubagentRuntime {
    */
   setSdkForTest(sdk: PiSdk): void {
     this.deps.sdk = sdk;
+  }
+
+  /** Stop one retained child owned by this runtime and join its cleanup. */
+  async stopCheckpoint(agentId: string): Promise<void> {
+    const record = this.deps.subagentRegistry?.get(agentId);
+    if (record?.state === "running" && record.checkpointPaused) {
+      await record.session?.stopCheckpoint?.();
+    }
+  }
+
+  /** Session-local shutdown barrier for every retained child of this runtime. */
+  async shutdownCheckpointPaused(): Promise<void> {
+    const records = this.deps.subagentRegistry?.list() ?? [];
+    await Promise.allSettled(records
+      .filter((record) => record.state === "running" && record.checkpointPaused)
+      .map((record) => record.session?.stopCheckpoint?.() ?? Promise.resolve()));
   }
 
   /**
@@ -751,6 +1350,8 @@ export class SubagentRuntime {
      * Requires the session to expose `subscribe`; a no-op when it does not.
      */
     onProgress?: (snapshot: ProgressSnapshot) => void;
+    /** Opaque dispatcher-run stop authority captured before the Agent tool awaits. */
+    captureUniversalStop?: () => boolean;
     /**
      * Resume a finished subagent (SendMessage). When set, dispatch takes the
      * SAME construction path (gated tools, guard, scoped hooks, system prompt +
@@ -1140,17 +1741,18 @@ export class SubagentRuntime {
     // runner. transcript_path is deliberately NOT injected — parity: subagent
     // hook events keep the MAIN session transcript_path (the runner's own
     // constructed default), never the subagent's own file.
+    const hookAgentType = agent.name;
     const injectIdentity = (runner: HookRunnerLike): HookRunnerLike => ({
       fire: (
         eventName: string,
         payload: Partial<HookPayload>,
         toolCall?: ToolCallDescriptor,
       ): Promise<HookOutcome> =>
-        runner.fire(eventName, { ...payload, agent_id: agentId, agent_type: agent.name }, toolCall),
+        runner.fire(eventName, { ...payload, agent_id: agentId, agent_type: hookAgentType }, toolCall),
     });
     const baseRunner = injectIdentity(this.deps.hookRunner);
     if (scopedHooks) scopedHooks = injectIdentity(scopedHooks);
-    const hookRunner = scopedHooks
+    let hookRunner = scopedHooks
       ? multiplexHookRunners(baseRunner, scopedHooks)
       : baseRunner;
     // Agent frontmatter `Stop` hooks map to SubagentStop time for this dispatch.
@@ -1168,7 +1770,9 @@ export class SubagentRuntime {
       if (scopedHooks) {
         outcomes.push(await scopedHooks.fire("Stop", payload).catch(() => undefined));
       }
-      return mergeHookOutcomes(outcomes);
+      const outcome = mergeHookOutcomes(outcomes);
+      if (outcome.stop) opts.captureUniversalStop?.();
+      return outcome;
     };
 
     // Concurrency gate. Two nested-deadlock hazards, handled distinctly:
@@ -1191,6 +1795,7 @@ export class SubagentRuntime {
       : await this.budgetForDepth(opts.depth).acquire();
     let worktreePath: string | undefined;
     let session: PiSession | undefined;
+    let dispatchCwd: CwdState | undefined;
     let started = false;
     let stopFired = false;
     let abortListener: (() => void) | undefined;
@@ -1205,6 +1810,14 @@ export class SubagentRuntime {
     // `settledOutcome` records the fate for the registry's per-subagent report.
     let capturedUsage: DispatchUsage | undefined;
     let settledOutcome: DispatchOutcome | undefined;
+    let checkpointPaused = false;
+    let dispatchCheckpointGate: MainSessionCheckpointGate | undefined;
+    let dispatchAuthoritySettled = false;
+    const settleDispatchAuthority = () => {
+      if (dispatchAuthoritySettled) return;
+      dispatchAuthoritySettled = true;
+      dispatchCheckpointGate?.logicalRunSettled();
+    };
     // The final answer text for the registry record (panel drill-down): the
     // completed final message, or a failed run's best-effort partial. Aborted
     // runs leave it unset — a deliberately stopped result is discarded by
@@ -1254,6 +1867,22 @@ export class SubagentRuntime {
           cwd: this.deps.getCwd(),
         })
         .catch(() => undefined);
+      if (startOutcome?.stop) {
+        opts.captureUniversalStop?.();
+        const reason = startOutcome.stopReason ?? "SubagentStart hook requested stop";
+        diagnostics.push({ severity: "warning", message: reason });
+        settledOutcome = "aborted";
+        return {
+          ok: false,
+          outcome: "aborted",
+          finalMessage: "",
+          agentId,
+          resumable: false,
+          agentName: agent.name,
+          error: `Subagent "${agent.name}" was stopped by its SubagentStart hook: ${reason}`,
+          diagnostics,
+        };
+      }
       if (startOutcome?.block) {
         settledOutcome = "failed";
         return {
@@ -1357,9 +1986,26 @@ export class SubagentRuntime {
         }
       }
 
-      // Dispatch-local cwd state: the subagent's tools (and its own EnterWorktree
-      // use) must never swap the ORCHESTRATOR's cwd.
+      // Dispatch-local cwd, activation, and checkpoint state must never be shared
+      // with the orchestrator or a sibling dispatch.
       const subCwd = new CwdState(cwd);
+      dispatchCwd = subCwd;
+      const checkpoint = new ChildCheckpointCoordinator(
+        `${this.deps.sessionId}:${agentId}`,
+        this.deps.proactiveCompactPercent ?? 90,
+        agent.name,
+        hookAgentType,
+        agentId,
+        subCwd,
+        hookRunner,
+        diagnostics,
+        (snapshot) => {
+          this.deps.subagentRegistry?.noteProgress(agentId, snapshot);
+          opts.onProgress?.(snapshot);
+        },
+      );
+      dispatchCheckpointGate = checkpoint.gate;
+      hookRunner = checkpoint.hookFacade(hookRunner);
 
       const granted = this.deps.permissionEngine.gateTools(
         agent.tools,
@@ -1376,7 +2022,16 @@ export class SubagentRuntime {
       // the fork's granted Agent/Task tools refuse a fork-spawns-fork. A degraded
       // fork is `isFork === false`, so its tools stay unmarked and its own nested
       // dispatches are not mis-refused.
-      const customTools = this.deps.customToolsFor(agent, granted, opts.depth, agentId, isFork, subCwd);
+      let customTools = this.deps.customToolsFor(
+        agent,
+        granted,
+        opts.depth,
+        agentId,
+        isFork,
+        subCwd,
+        checkpoint.activation,
+        () => checkpoint.gate.captureLogicalRunStop(),
+      );
 
       const sdk = await this.sdk();
 
@@ -1408,9 +2063,10 @@ export class SubagentRuntime {
       for (const builtin of factoryBuiltins) {
         if (grantedPiBuiltins.has(builtin.name)) customTools.push(builtin.def);
       }
-      const injector = this.deps.makeContextInjector
-        ? this.deps.makeContextInjector(() => subCwd.get())
-        : this.deps.contextForTouchedFile;
+      customTools = checkpoint.wrapTools(customTools) as unknown[];
+      const contextInjection = this.deps.makeContextInjector?.(() => subCwd.get());
+      const injector = contextInjection?.inject ?? this.deps.contextForTouchedFile;
+      checkpoint.attachContextReset(contextInjection?.reset);
       const guard = createGuardExtension({
         engine: this.deps.permissionEngine,
         // Multiplexed runner: the agent's scoped PreToolUse/PostToolUse/
@@ -1420,10 +2076,21 @@ export class SubagentRuntime {
         getCwd: () => subCwd.get(),
         contextForTouchedFile: injector,
         label: `subagent:${agent.name}`,
+        extraDenyRules: () => [...checkpoint.activation.denyRules.values()].flat(),
         ...(this.deps.clipMaxTokens !== undefined ? { clipMaxTokens: this.deps.clipMaxTokens } : {}),
+        captureUniversalStop: () => checkpoint.gate.captureLogicalRunStop(),
       });
       const extensionFactories: Array<{ name: string; factory: (pi: unknown) => unknown }> = [
+        {
+          name: "picc-codex-provider",
+          factory: ((pi: { registerProvider?: (name: string, config: Record<string, unknown>) => void }) => {
+            if (typeof pi.registerProvider === "function") {
+              registerCodexAbortGuard({ registerProvider: pi.registerProvider.bind(pi) });
+            }
+          }) as (pi: unknown) => unknown,
+        },
         { name: `picc-guard-${agent.name}`, factory: guard as (pi: unknown) => unknown },
+        { name: `picc-checkpoint-${agent.name}`, factory: checkpoint.extensionFactory() as (pi: unknown) => unknown },
       ];
       if (agent.maxTurns && agent.maxTurns > 0) {
         extensionFactories.push({
@@ -1600,6 +2267,7 @@ export class SubagentRuntime {
 
       const created = await sdk.createAgentSession(sessionOptions);
       session = created.session;
+      checkpoint.attach(session);
       if (thinking && session.setThinkingLevel) session.setThinkingLevel(thinking);
 
       // Dispatch registry: record this live run so SendMessage can steer it
@@ -1626,7 +2294,12 @@ export class SubagentRuntime {
         // keeps the registry record honest even if that ever changes).
         resumable: overrideDispatch || isFork ? false : resumable,
         oneShot,
-        session: session as SteerableSession,
+        session: {
+          steer: (text: string) => checkpoint.steer(text),
+          recoverCheckpoint: (text: string) => checkpoint.recover(text),
+          stopCheckpoint: () => checkpoint.cancel("task-stop"),
+          followUp: (text: string) => session?.followUp?.(text),
+        },
         // Set-once in the registry: on a fresh dispatch these reconfirm the
         // minimal register's values; on a resume the original prompt/
         // description/parent/color are preserved (opts.prompt is the follow-up
@@ -1640,12 +2313,9 @@ export class SubagentRuntime {
       // Cooperative stop: a TaskStop-triggered signal aborts the
       // live session best-effort (real Pi sessions expose abort()).
       if (opts.abortSignal) {
-        const live = session;
         abortListener = () => {
           try {
-            // Promise.resolve absorbs both sync returns and promises; the catch
-            // keeps a rejecting abort() from becoming an unhandled rejection.
-            Promise.resolve(live.abort?.()).catch(() => {});
+            void checkpoint.cancel("task-stop").catch(() => undefined);
           } catch {
             // best-effort — an abort failure must not corrupt the dispatch
           }
@@ -1754,107 +2424,173 @@ export class SubagentRuntime {
         }
         return undefined;
       };
+      const retainedCleanup = async (outcome: DispatchOutcome, finalText?: string): Promise<void> => {
+        try {
+          if (abortListener && opts.abortSignal) {
+            try { opts.abortSignal.removeEventListener("abort", abortListener); } catch { /* floor */ }
+          }
+          try { progressUnsub?.(); } catch { /* presentation only */ }
+          // Session statistics must be sampled while the public session is live.
+          captureUsage();
+          try { session?.dispose(); } catch { /* disposal cannot mask recovery */ }
+          this.deps.subagentRegistry?.markSettled(agentId, {
+            outcome,
+            usage: capturedUsage,
+            finalText,
+            assistantIdentityText: session ? lastAssistantText(session) : undefined,
+          });
+          // The retained initial dispatch owns its worktree through recovery. A
+          // recovery generation must not independently release that same checkout.
+          if (worktreePath && this.deps.worktrees && !opts.resume) {
+            await this.deps.worktrees.exit({ worktreePath, action: "keep" }).catch(() => undefined);
+          }
+          if (started && !stopFired) {
+            stopFired = true;
+            await fireSubagentStop({ subagent_type: agent.name, cwd: subCwd.get() }).catch(() => undefined);
+          }
+        } finally {
+          // A paused dispatch remains authoritative through its final retained
+          // recovery/abandonment lifecycle, including SubagentStop. Revoke it
+          // even when cleanup fails so stale children cannot stop a later run.
+          settleDispatchAuthority();
+        }
+      };
 
-      await session.prompt(fullPrompt);
-      {
-        const terminal = terminalOutcome();
-        if (terminal) return terminal;
-      }
-
-      // Verbatim final assistant message (hard contract — no wrapping/summarizing).
-      let finalMessage = lastAssistantText(session);
-
-      // One-retry-on-empty convention: a single re-prompt when nothing
-      // came back — only for genuinely successful empty stops. Error/abort stops
-      // returned above (retrying them just repeated the failure and doubled latency).
-      if (!finalMessage.trim()) {
-        await session.prompt(
-          "Your previous reply was empty. Reply now with your final answer in the requested format.",
+      const checkpointOutcome = async (): Promise<DispatchResult | undefined> => {
+        await checkpoint.join();
+        if (!checkpoint.exhausted()) return undefined;
+        checkpointPaused = true;
+        settledOutcome = "failed";
+        this.deps.subagentRegistry?.markCheckpointPaused(agentId);
+        checkpoint.retain(
+          async (text) => {
+            await session!.sendCustomMessage!({
+              customType: "picc-subagent-recovery-input",
+              content: text,
+              display: false,
+            }, { triggerTurn: true });
+            return classifyCompletedTurn();
+          },
+          retainedCleanup,
         );
+        return {
+          ok: false,
+          outcome: "failed",
+          finalMessage: "",
+          agentId,
+          transcriptPath,
+          resumable: false,
+          agentName: agent.name,
+          worktreePath,
+          isFork,
+          usage: captureUsage(),
+          checkpointPaused: true,
+          error: checkpoint.failureMessage(),
+          diagnostics,
+        };
+      };
+
+      async function classifyCompletedTurn(): Promise<DispatchResult> {
+        const paused = await checkpointOutcome();
+        if (paused) return paused;
         const terminal = terminalOutcome();
         if (terminal) return terminal;
-        finalMessage = lastAssistantText(session);
-        diagnostics.push({ severity: "info", message: "subagent returned empty; retried once" });
-      }
-
-      // SubagentStop validation loop ("don't stop until validated"):
-      // a blocking hook re-prompts the subagent with its reason, bounded like the
-      // main-session Stop loop.
-      for (let iteration = 0; ; iteration++) {
-        const stopOutcome = await fireSubagentStop({
-          subagent_type: agent.name,
-          cwd: subCwd.get(),
-          stop_hook_active: iteration > 0,
-        });
-        stopFired = true;
-        if (opts.abortSignal?.aborted) {
-          // Abort-race consistency: a signal firing during
-          // SubagentStop-hook evaluation classifies aborted — the same way a
-          // signal firing while prompt() settles does (terminalOutcome). Aborted
-          // results are discarded by contract, so breaking out to a
-          // completed-looking result here would leak past the abort.
+        if (checkpoint.consumeStoppedRun()) {
           settledOutcome = "aborted";
           return {
-            ok: false,
-            outcome: "aborted",
-            finalMessage: "",
-            agentId,
-            transcriptPath,
-            resumable,
-            agentName: agent.name,
-            worktreePath,
-            isFork,
-            usage: captureUsage(),
-            error: `Subagent "${agent.name}" was aborted before completing its task.`,
-            diagnostics,
+            ok: false, outcome: "aborted", finalMessage: "", agentId, transcriptPath,
+            resumable, agentName: agent.name, worktreePath, isFork, usage: captureUsage(),
+            error: `Subagent "${agent.name}" was stopped by a universal hook.`, diagnostics,
           };
         }
-        if (!stopOutcome?.block) break;
-        if (iteration >= 3) {
-          diagnostics.push({
-            severity: "warning",
-            message: `SubagentStop hook still blocking after ${iteration} continuation(s): ${stopOutcome.blockReason ?? "(no reason)"}`,
-          });
-          break;
+
+        // The returned assistant text is a verbatim contract: callers may parse
+        // strict JSON/YAML, so classification must not summarize or wrap it.
+        let finalMessage = lastAssistantText(session!);
+        // Retry only a genuinely successful empty reply. terminalOutcome() above
+        // has already classified API errors/aborts, which must not be re-prompted.
+        if (!finalMessage.trim()) {
+          await session!.prompt(
+            "Your previous reply was empty. Reply now with your final answer in the requested format.",
+          );
+          const retryPaused = await checkpointOutcome();
+          if (retryPaused) return retryPaused;
+          const retryTerminal = terminalOutcome();
+          if (retryTerminal) return retryTerminal;
+          finalMessage = lastAssistantText(session!);
+          diagnostics.push({ severity: "info", message: "subagent returned empty; retried once" });
         }
-        await session.prompt(
-          `[SubagentStop hook] Continue working: ${stopOutcome.blockReason ?? "the stop condition is not met yet"}`,
-        );
-        const terminal = terminalOutcome();
-        if (terminal) return terminal;
-        finalMessage = lastAssistantText(session);
+
+        // SubagentStop continuation is part of the same logical recovery
+        // generation, so the awaiting SendMessage owns its eventual result too.
+        for (let iteration = 0; ; iteration++) {
+          const stopOutcome = await fireSubagentStop({
+            subagent_type: agent.name,
+            cwd: subCwd.get(),
+            stop_hook_active: iteration > 0,
+          });
+          stopFired = true;
+          // A parent abort racing the awaited hook still wins: returning the
+          // previously completed text here would leak a false success past cancellation.
+          if (opts.abortSignal?.aborted) {
+            settledOutcome = "aborted";
+            return {
+              ok: false, outcome: "aborted", finalMessage: "", agentId, transcriptPath,
+              resumable, agentName: agent.name, worktreePath, isFork, usage: captureUsage(),
+              error: `Subagent "${agent.name}" was aborted before completing its task.`, diagnostics,
+            };
+          }
+          if (stopOutcome?.stop) {
+            const reason = stopOutcome.stopReason ?? "SubagentStop hook requested stop";
+            diagnostics.push({ severity: "warning", message: reason });
+            try { void Promise.resolve(session!.abort?.()).catch(() => undefined); } catch { /* stop remains final */ }
+            settledOutcome = "aborted";
+            return {
+              ok: false, outcome: "aborted", finalMessage: "", agentId, transcriptPath,
+              resumable, agentName: agent.name, worktreePath, isFork, usage: captureUsage(),
+              error: `Subagent "${agent.name}" was stopped by its SubagentStop hook: ${reason}`,
+              diagnostics,
+            };
+          }
+          if (!stopOutcome?.block) break;
+          if (iteration >= 3) {
+            diagnostics.push({
+              severity: "warning",
+              message: `SubagentStop hook still blocking after ${iteration} continuation(s): ${stopOutcome.blockReason ?? "(no reason)"}`,
+            });
+            break;
+          }
+          await session!.prompt(
+            `[SubagentStop hook] Continue working: ${stopOutcome.blockReason ?? "the stop condition is not met yet"}`,
+          );
+          const continuationPaused = await checkpointOutcome();
+          if (continuationPaused) return continuationPaused;
+          const continuationTerminal = terminalOutcome();
+          if (continuationTerminal) return continuationTerminal;
+          finalMessage = lastAssistantText(session!);
+        }
+
+        // Preserve the actual assistant turn before display-only cut-off decoration
+        // so registry/render deduplication still keys on provider output identity.
+        settledAssistantIdentityText = finalMessage;
+        const cutOff = truncated && finalMessage.trim() !== "";
+        if (cutOff) {
+          finalMessage = appendCutOffNote(
+            finalMessage,
+            `The reply was truncated at the model's output token limit (stop reason "length"); the output above may be incomplete.`,
+          );
+        }
+        settledOutcome = "completed";
+        settledFinalText = finalMessage;
+        return {
+          ok: true, outcome: "completed", finalMessage, agentId, transcriptPath, resumable,
+          truncated: cutOff, isFork, agentName: agent.name, worktreePath,
+          usage: captureUsage(), diagnostics,
+        };
       }
 
-      // Preserve the terminal assistant turn's identity before any display-only
-      // cut-off decoration; the registry stores the decoration but deduplicates
-      // against this raw source.
-      settledAssistantIdentityText = finalMessage;
-      // A truncated completion ends with the cut-off frame; `cutOff` records
-      // that so the model-visible ID trailer rides INSIDE that frame instead of
-      // opening a second `---` frame.
-      const cutOff = truncated && finalMessage.trim() !== "";
-      if (cutOff) {
-        finalMessage = appendCutOffNote(
-          finalMessage,
-          `The reply was truncated at the model's output token limit (stop reason "length"); the output above may be incomplete.`,
-        );
-      }
-      settledOutcome = "completed";
-      settledFinalText = finalMessage;
-      return {
-        ok: true,
-        outcome: "completed",
-        finalMessage,
-        agentId,
-        transcriptPath,
-        resumable,
-        truncated: cutOff,
-        isFork,
-        agentName: agent.name,
-        worktreePath,
-        usage: captureUsage(),
-        diagnostics,
-      };
+      await session.prompt(fullPrompt);
+      return await classifyCompletedTurn();
     } catch (err) {
       // Catch-all: covers createAgentSession itself throwing — the "API dead
       // before the session exists" case — and any other dispatch-internal error.
@@ -1877,52 +2613,51 @@ export class SubagentRuntime {
         diagnostics,
       };
     } finally {
-      if (abortListener && opts.abortSignal) {
-        try {
-          opts.abortSignal.removeEventListener("abort", abortListener);
-        } catch {
-          // floor
-        }
-      }
-      try {
-        progressUnsub?.();
-      } catch {
-        // unsubscribe must not mask results
-      }
-      // Usage safety-net: capture stats one last time while the session is
-      // still alive (before dispose), so the registry record carries usage even
-      // if some future return path forgets to capture. Idempotent with the
-      // per-return captures above (same session, same value).
+      // Capture while the public session is still live: dispose may release the
+      // aggregate stats that failed/aborted results still need to report.
       captureUsage();
-      try {
-        session?.dispose();
-      } catch {
-        // dispose failures must not mask results
-      }
-      // Dispatch registry: the session is disposed — drop the live
-      // handle and flip the record to settled, keeping name/ID/state/transcript-
-      // path so a later SendMessage can still resume it, and recording the run's
-      // fate + per-subagent usage for the /usage control command. No-op for
-      // never-registered ids.
-      this.deps.subagentRegistry?.markSettled(agentId, {
-        outcome: settledOutcome,
-        usage: capturedUsage,
-        // Sanitized+capped by the registry; conversation content, never for
-        // error/log interpolation.
-        finalText: settledFinalText,
-        assistantIdentityText: settledAssistantIdentityText,
-      });
-      if (worktreePath && this.deps.worktrees && !opts.resume) {
-        // Keep the worktree (the project's own merge flow owns its lifecycle); just unlock.
-        // On resume we reused an existing worktree we never entered — leave its lock alone.
-        await this.deps.worktrees.exit({ worktreePath, action: "keep" }).catch(() => undefined);
-      }
-      if (started && !stopFired) {
-        // Error paths still fire SubagentStop once (informational; block is moot here).
-        await fireSubagentStop({
-          subagent_type: agent.name,
-          cwd: this.deps.getCwd(),
-        }).catch(() => undefined);
+      if (!checkpointPaused) {
+        if (abortListener && opts.abortSignal) {
+          try {
+            opts.abortSignal.removeEventListener("abort", abortListener);
+          } catch {
+            // floor
+          }
+        }
+        try {
+          progressUnsub?.();
+        } catch {
+          // unsubscribe must not mask results
+        }
+        try {
+          session?.dispose();
+        } catch {
+          // dispose failures must not mask results
+        }
+        this.deps.subagentRegistry?.markSettled(agentId, {
+          outcome: settledOutcome,
+          usage: capturedUsage,
+          // Sanitized+capped by the registry; conversation content, never for
+          // error/log interpolation.
+          finalText: settledFinalText,
+          assistantIdentityText: settledAssistantIdentityText,
+        });
+        // A resumed run reused a worktree owned by its original dispatch and
+        // must not unlock or release ownership it never acquired.
+        if (worktreePath && this.deps.worktrees && !opts.resume) {
+          await this.deps.worktrees.exit({ worktreePath, action: "keep" }).catch(() => undefined);
+        }
+        // Error/abort paths still fire SubagentStop once for observability;
+        // blocking is moot because no continuation can safely recover this dispatch.
+        if (started && !stopFired) {
+          await fireSubagentStop({
+            subagent_type: agent.name,
+            cwd: dispatchCwd?.get() ?? this.deps.getCwd(),
+          }).catch(() => undefined);
+        }
+        // The dispatch and its final lifecycle hooks are now truly settled.
+        // Physical agent_settled events during checkpoint/reentry never rotate it.
+        settleDispatchAuthority();
       }
       release();
     }
@@ -2127,6 +2862,8 @@ export function createAgentToolDefinition(
      * orchestrator cwd. Never sourced from a tool parameter.
      */
     dispatchCwd?: () => string;
+    /** Captures opaque stop authority for the dispatching logical run. */
+    captureUniversalStop?: () => () => boolean;
   },
 ): Record<string, unknown> {
   return {
@@ -2180,6 +2917,7 @@ export function createAgentToolDefinition(
         content: Array<{ type: string; text: string }>;
         details?: Record<string, unknown>;
       }) => void,
+      ctx?: { abort?: () => void },
     ) {
       const subagentType = String(params.subagent_type ?? "");
       // Capture-time sanitization: the model-supplied
@@ -2191,8 +2929,18 @@ export function createAgentToolDefinition(
       // column) — sanitized at capture, before it is threaded anywhere.
       const description =
         sanitizeLine(String(params.description ?? ""), CAPTURED_LINE_CAP) || undefined;
+      const capturedStop = opts.captureUniversalStop?.();
       const dispatchOpts = {
         subagentType,
+        captureUniversalStop: capturedStop
+          ? () => {
+              const accepted = capturedStop();
+              if (accepted) {
+                try { ctx?.abort?.(); } catch { /* opaque stop authority remains final */ }
+              }
+              return accepted;
+            }
+          : undefined,
         prompt: String(params.prompt ?? ""),
         model: params.model ? String(params.model) : undefined,
         depth: opts.depth + 1,
@@ -2262,7 +3010,10 @@ export function createAgentToolDefinition(
             abortSignal: controller.signal,
             onProgress,
           }),
-          () => controller.abort(),
+          async () => {
+            controller.abort();
+            await runtime.stopCheckpoint(agentId);
+          },
           agentId,
           label,
           // Owner tag: the dispatcher's id (a subagent's own id, or
@@ -2446,7 +3197,7 @@ export function createSendMessageToolDefinition(
     name: "SendMessage",
     label: "SendMessage",
     description:
-      "Send a follow-up message to a subagent you previously dispatched. Address it by its agent id (agent-…) or name (`to`). A finished subagent resumes in the background under the same id with its full prior context; a still-running background subagent receives the message as a mid-task course correction. Returns an acknowledgment; a resumed run's result arrives via TaskOutput.",
+      "Send a follow-up message to a subagent you previously dispatched. Address it by its agent id (agent-…) or name (`to`). A finished subagent resumes in the background under the same id with its full prior context; a still-running background subagent receives the message as a mid-task course correction. Ordinarily this returns an acknowledgment and a resumed run's result arrives via TaskOutput. Checkpoint-paused exception: the awaited call recovers the retained agent and returns its result directly, with no TaskOutput or new task generation.",
     parameters: Type.Object({
       to: Type.String({
         description: "Agent id (e.g. agent-3fa9c2d1b4e5) or the agent name from a prior dispatch",
@@ -2467,6 +3218,34 @@ export function createSendMessageToolDefinition(
       const resolved = opts.registry.resolve(to);
       if (!resolved.ok) throw new Error(resolved.error);
       const record = resolved.record;
+
+      // A checkpoint-paused record is "running" only because it retains the
+      // exact guarded session. This coordinator-authenticated path deliberately
+      // precedes ordinary one-shot steering refusal; normal one-shot steer/resume
+      // remains forbidden below.
+      if (record.state === "running" && record.checkpointPaused) {
+        const recover = record.session?.recoverCheckpoint;
+        if (!recover) {
+          throw new Error(`Agent ${record.agentId} ("${record.agentName}") lost its live checkpoint recovery adapter; stop it and dispatch a new agent.`);
+        }
+        const result = await recover(message);
+        const text = result.outcome === "completed"
+          ? result.finalMessage
+          : [result.error ?? `Subagent "${record.agentName}" ${result.outcome}.`, result.finalMessage]
+              .filter(Boolean)
+              .join("\n\n");
+        return {
+          content: [{ type: "text", text }],
+          details: {
+            agentId: record.agentId,
+            agent: record.agentName,
+            delivery: "checkpoint-recovery",
+            outcome: result.outcome,
+            recovered: result.outcome === "completed",
+            truncated: result.truncated === true,
+          },
+        };
+      }
 
       // Running background dispatch → steer (mid-task course correction). The
       // refusal predicates (one-shot, user-stopped, no live steerable handle)
@@ -2579,7 +3358,10 @@ export function createSendMessageToolDefinition(
           abortSignal: controller.signal,
           onProgress,
         }),
-        () => controller.abort(),
+        async () => {
+          controller.abort();
+          await runtime.stopCheckpoint(record.agentId);
+        },
         record.agentId,
         agentLabel,
         undefined,

@@ -69,6 +69,7 @@ import {
   type SubagentRuntime,
 } from "../src/runtime/subagents.js";
 import { BackgroundTaskRegistry, createTaskOutputTool } from "../src/runtime/background-tasks.js";
+import { MainSessionCheckpointGate } from "../src/runtime/mid-run-compaction.js";
 import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import { visibleWidth as tuiVisibleWidth, Text as TuiText } from "@earendil-works/pi-tui";
 import type { ProgressSnapshot } from "../src/runtime/subagent-progress.js";
@@ -229,7 +230,7 @@ describe("resolveCompactionConfig", () => {
     const cfg = baseConfig();
     const resolved = resolveCompactionConfig(cfg);
     expect(resolved.proactiveCompactPercent).toBe(DEFAULT_PROACTIVE_COMPACT_PERCENT);
-    expect(resolved.proactiveCompactPercent).toBe(85);
+    expect(resolved.proactiveCompactPercent).toBe(90);
     expect(resolved.clipMaxTokens).toBe(DEFAULT_CLIP_MAX_TOKENS);
     expect(resolved.clipMaxTokens).toBe(20000);
     expect(cfg.diagnostics).toHaveLength(0);
@@ -272,7 +273,7 @@ describe("resolveCompactionConfig", () => {
     // it fails closed to the 0–100-scale default so proactive compaction never thrashes.
     const cfg = baseConfig({ proactiveCompactPercent: 0.85 });
     const resolved = resolveCompactionConfig(cfg);
-    expect(resolved.proactiveCompactPercent).toBe(85);
+    expect(resolved.proactiveCompactPercent).toBe(90);
     expect(
       cfg.diagnostics.some((d) => d.severity === "warning" && d.message.includes("proactiveCompactPercent")),
     ).toBe(true);
@@ -1229,6 +1230,143 @@ describe("SubagentRuntime (fake SDK)", () => {
     await expect(deep.execute("t3", { subagent_type: "reviewer", prompt: "go" })).rejects.toThrow(/depth/);
   });
 
+  it.each(["SubagentStart", "SubagentStop"])(
+    "%s universal stop propagates through the Agent tool to its dispatching gate",
+    async (stopEvent) => {
+      const hookRunner = {
+        async fire(event: string) {
+          return event === stopEvent
+            ? { stop: true, stopReason: `${event} stopped`, block: false, askDowngraded: false, diagnostics: [] }
+            : { block: false, askDowngraded: false, diagnostics: [] };
+        },
+      };
+      const { runtime } = makeRuntime([makeAgent()], ["done"], { hookRunner });
+      let captures = 0;
+      let stops = 0;
+      let aborts = 0;
+      const tool = createAgentToolDefinition(runtime, {
+        depth: 0,
+        captureUniversalStop: () => {
+          captures += 1;
+          return () => { stops += 1; return true; };
+        },
+      }) as { execute(...args: unknown[]): Promise<unknown> };
+      await expect(tool.execute(
+        "t", { subagent_type: "reviewer", prompt: "go", run_in_background: false },
+        undefined, undefined, { abort: () => { aborts += 1; } },
+      )).rejects.toThrow(/stopped/);
+      expect({ captures, stops, aborts }).toEqual({ captures: 1, stops: 1, aborts: 1 });
+    },
+  );
+
+  it.each([
+    { scope: "root", depth: 0, lifecycleEvent: "SubagentStart" },
+    { scope: "root", depth: 0, lifecycleEvent: "SubagentStop" },
+  ] as const)("ignores a late $scope background $lifecycleEvent after its parent settles and a new run begins", async ({ scope, depth, lifecycleEvent }) => {
+    let releaseStop!: () => void;
+    const stopEntered = new Promise<void>((resolveEntered) => {
+      releaseStop = () => resolveEntered();
+    });
+    let enteredResolve!: () => void;
+    const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
+    const hookRunner = {
+      async fire(event: string) {
+        if (event !== lifecycleEvent) {
+          return { block: false, askDowngraded: false, diagnostics: [] };
+        }
+        enteredResolve();
+        await stopEntered;
+        return { stop: true, stopReason: `late ${lifecycleEvent}`, block: false, askDowngraded: false, diagnostics: [] };
+      },
+    };
+    const { runtime } = makeRuntime([makeAgent()], ["done"], { hookRunner });
+    const gate = new MainSessionCheckpointGate(`parent-${scope}`, 90);
+    const backgroundTasks = new BackgroundTaskRegistry();
+    let aborts = 0;
+    const tool = createAgentToolDefinition(runtime, {
+      depth,
+      backgroundTasks,
+      captureUniversalStop: () => gate.captureLogicalRunStop(),
+    }) as { execute(...args: unknown[]): Promise<{ details: { taskId: string } }> };
+
+    const started = await tool.execute(
+      "t", { subagent_type: "reviewer", prompt: "go", run_in_background: true },
+      undefined, undefined, { abort: () => { aborts += 1; } },
+    );
+    await entered;
+    gate.logicalRunSettled();
+    gate.acceptedLogicalRun();
+    releaseStop();
+    await backgroundTasks.wait(started.details.taskId);
+    expect(aborts).toBe(0);
+    expect(gate.isLogicalRunStopped()).toBe(false);
+  });
+
+  it("production-wired nested Agent/Task cannot stop its parent after true settlement", async () => {
+    const nestedTasks = new BackgroundTaskRegistry();
+    let releaseNestedStop!: () => void;
+    let nestedStopEntered!: () => void;
+    const stopRelease = new Promise<void>((resolve) => { releaseNestedStop = resolve; });
+    const stopEntered = new Promise<void>((resolve) => { nestedStopEntered = resolve; });
+    let parentAborts = 0;
+    let nestedTaskId: string | undefined;
+    const agents = [makeAgent({ name: "parent" }), makeAgent({ name: "leaf" })];
+    const { sdk } = fakeSdk({
+      onPrompt: async (text, session) => {
+        if (text === "dispatch nested") {
+          const agent = session.customTools.find((tool) => tool.name === "Agent")!;
+          const started = await (agent.execute as (...args: any[]) => Promise<any>)(
+            "nested", { subagent_type: "leaf", prompt: "leaf work", run_in_background: true },
+            undefined, undefined, { abort: () => { parentAborts += 1; } },
+          );
+          nestedTaskId = String(started.details.taskId);
+          return "parent settled";
+        }
+        return text === "later parent run" ? "later settled" : "leaf settled";
+      },
+    });
+    const hookRunner = {
+      async fire(event: string, payload: Record<string, unknown>) {
+        if (event === "SubagentStop" && payload.subagent_type === "leaf") {
+          nestedStopEntered();
+          await stopRelease;
+          return { stop: true, stopReason: "late nested stop", block: false, askDowngraded: false, diagnostics: [] };
+        }
+        return { block: false, askDowngraded: false, diagnostics: [] };
+      },
+    };
+    let runtime!: SubagentRuntime;
+    runtime = makeSubagentRuntime(agents, sdk, {
+      hookRunner,
+      maxDepth: 2,
+      allKnownToolNames: () => ["Agent", "Task"],
+      customToolsFor: (_agent, _granted, depth, ownerAgentId, dispatcherIsFork, _cwd, _activation, captureUniversalStop) =>
+        depth === 1
+          ? [
+              createAgentToolDefinition(runtime, {
+                depth, name: "Agent", backgroundTasks: nestedTasks, ownerAgentId,
+                dispatcherIsFork, captureUniversalStop,
+              }),
+              createAgentToolDefinition(runtime, {
+                depth, name: "Task", backgroundTasks: nestedTasks, ownerAgentId,
+                dispatcherIsFork, captureUniversalStop,
+              }),
+            ]
+          : [],
+    });
+
+    const parent = await runtime.dispatch({ subagentType: "parent", prompt: "dispatch nested", depth: 1 });
+    await stopEntered;
+    expect(parent.outcome).toBe("completed");
+    expect(nestedTaskId).toBeTruthy();
+    const later = await runtime.dispatch({ subagentType: "parent", prompt: "later parent run", depth: 1 });
+    expect(later.outcome).toBe("completed");
+
+    releaseNestedStop();
+    await nestedTasks.wait(nestedTaskId!);
+    expect(parentAborts).toBe(0);
+  });
+
   it("extractText joins text blocks only", () => {
     expect(extractText([{ type: "text", text: "a" }, { type: "thinking", thinking: "x" }, { type: "text", text: "b" }])).toBe("ab");
     expect(extractText("plain")).toBe("plain");
@@ -1401,6 +1539,24 @@ describe("SubagentRuntime (fake SDK)", () => {
     expect(result.ok).toBe(true);
     expect(result.finalMessage).toBe("validated answer");
     expect(stops).toBeGreaterThanOrEqual(2);
+  });
+
+  it("uses canonical plugin identity for subagent lifecycle payloads without renaming dispatch", async () => {
+    const payloads: Array<Record<string, unknown>> = [];
+    const hookRunner = {
+      fire: async (event: string, payload: Record<string, unknown>) => {
+        if (event === "SubagentStart" || event === "SubagentStop") payloads.push(payload);
+        return { block: false, askDowngraded: false, diagnostics: [] };
+      },
+    };
+    const agent = makeAgent({ name: "quality:reviewer" });
+    agent.source = { ...agent.source, pluginName: "quality" };
+    const { runtime } = makeRuntime([agent], ["done"], { hookRunner });
+    const result = await runtime.dispatch({ subagentType: "quality:reviewer", prompt: "p", depth: 1 });
+    expect(result.agentName).toBe("quality:reviewer");
+    expect(payloads).toHaveLength(2);
+    expect(payloads.every((payload) => payload.agent_type === "quality:reviewer")).toBe(true);
+    expect(payloads.some((payload) => payload.agent_type === "quality:quality:reviewer")).toBe(false);
   });
 
   it("SubagentStart block aborts the dispatch before any session is created", async () => {

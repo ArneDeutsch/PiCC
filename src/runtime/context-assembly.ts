@@ -20,8 +20,9 @@ import {
  * Assembles the PiCC system-prompt suffix appended to Pi's prompt each turn (at
  * Pi's `before_agent_start`). Because the system prompt is rebuilt every turn and
  * never compacted away, this is ALSO the primary compaction-preservation
- * mechanism: root CLAUDE.md, unconditional rules, the skill listing, the agent
- * catalog, and rendered active skills always survive.
+ * mechanism: root CLAUDE.md, unconditional rules, the skill listing, and the agent
+ * catalog survive. Latest rendered active-skill bodies survive only within PiCC's
+ * heuristic character caps.
  */
 export interface SessionContextState {
   /** Skill name -> rendered body (stays resident once activated). */
@@ -50,7 +51,8 @@ export function newSessionContextState(claudeMd: ClaudeMdFile[]): SessionContext
  * Reset the once-only injection markers after compaction: nested
  * CLAUDE.md and path-scoped rules/skills were delivered as ordinary transcript
  * messages that compaction summarizes away, so they must re-inject on the next
- * relevant access. Active skills survive via the system-prompt suffix and stay.
+ * relevant access. Latest rendered active-skill bodies retained by PiCC's heuristic
+ * character caps survive via the system-prompt suffix and stay active.
  */
 export function resetInjectionState(state: SessionContextState, claudeMd: ClaudeMdFile[]): void {
   state.loadedClaudeMd = new Set(claudeMd.map((f) => f.path));

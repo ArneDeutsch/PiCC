@@ -38,6 +38,13 @@ beforeAll(async () => {
     JSON.stringify({
       permissions: { ask: ["Bash(git push *)"] },
       hooks: {
+        SessionStart: ["startup", "resume", "clear", "fork"].map((source) => ({
+          matcher: source,
+          hooks: [{
+            type: "command",
+            command: `echo '${source}' >> "$CLAUDE_PROJECT_DIR/.claude/.session-start-log"`,
+          }],
+        })),
         Stop: [{ hooks: [{ type: "command", command: "echo 'LW-not-done' >&2; exit 2" }] }],
         SessionEnd: [
           {
@@ -159,10 +166,83 @@ describe("lifecycle wiring", () => {
     expect(String(continuations[0]?.content)).toContain("LW-not-done");
   });
 
+  it("resets blocked Stop iteration state when the session is replaced", async () => {
+    pi.userMessages.length = 0;
+    for (let i = 0; i < 8; i++) await pi.fire("agent_settled", {}, pi.ctx());
+    expect(pi.userMessages.filter((m) => String(m.content).includes("[Stop hook]")).length).toBe(8);
+
+    await pi.fire("session_start", { reason: "switch" }, pi.ctx());
+    await pi.fire("agent_settled", {}, pi.ctx());
+    expect(pi.userMessages.filter((m) => String(m.content).includes("[Stop hook]")).length).toBe(9);
+  });
+
+  it("maps Pi 0.80.10 session reasons to Claude SessionStart sources", async () => {
+    const log = path.join(dir, ".claude", ".session-start-log");
+    fs.rmSync(log, { force: true });
+    for (const reason of ["startup", "reload", "new", "resume", "fork"]) {
+      await pi.fire("session_start", { reason }, pi.ctx());
+    }
+    expect(fs.readFileSync(log, "utf8").trim().split(/\r?\n/u)).toEqual([
+      "startup", "startup", "clear", "resume", "fork",
+    ]);
+  });
+
   it("session_shutdown fires the SessionEnd hook", async () => {
     const log = path.join(dir, ".claude", ".session-end-log");
     fs.rmSync(log, { force: true });
     await pi.fire("session_shutdown", { reason: "other" });
+    expect(fs.existsSync(log)).toBe(true);
+  });
+
+  it("production session_shutdown joins retained child cleanup before worktree release and SessionEnd", async () => {
+    const shutdownPi = fakePi();
+    type Seam = NonNullable<Parameters<typeof picc>[1]>;
+    let internals!: Parameters<NonNullable<Seam["onWired"]>>[0];
+    picc(shutdownPi.api as never, {
+      onInitializationSettled: shutdownPi.captureInitialization,
+      onWired: (value) => { internals = value; },
+    });
+    await shutdownPi.waitForInitialization();
+    const log = path.join(dir, ".claude", ".session-end-log");
+    fs.rmSync(log, { force: true });
+    const cleanup = deferred<void>();
+    let worktreeReleased = false;
+    const agentId = "agent-444444444444";
+    const taskId = internals.backgroundTasks.start(
+      "agent:reviewer",
+      Promise.resolve({
+        ok: false, outcome: "failed" as const, finalMessage: "", agentId,
+        agentName: "reviewer", checkpointPaused: true, error: "paused",
+      }),
+      async () => {
+        await cleanup.promise;
+        worktreeReleased = true;
+      },
+      agentId,
+      "reviewer",
+    );
+    await internals.backgroundTasks.wait(taskId);
+    internals.subagentRegistry.register({
+      agentId, agentName: "reviewer", depth: 1, cwd: dir, resumable: true, oneShot: false,
+      checkpointPaused: true,
+      session: {
+        recoverCheckpoint: async () => { throw new Error("unused"); },
+        stopCheckpoint: async () => cleanup.promise,
+      },
+    });
+
+    let shutdownSettled = false;
+    const shutdown = shutdownPi.fire("session_shutdown", { reason: "other" })
+      .then(() => { shutdownSettled = true; });
+    await Promise.resolve();
+    expect(shutdownSettled).toBe(false);
+    expect(worktreeReleased).toBe(false);
+    expect(fs.existsSync(log)).toBe(false);
+    expect(internals.backgroundTasks.drainSettlementNotices(() => true, () => {})).toEqual([]);
+
+    cleanup.resolve();
+    await shutdown;
+    expect(worktreeReleased).toBe(true);
     expect(fs.existsSync(log)).toBe(true);
   });
 
@@ -195,6 +275,7 @@ describe("lifecycle wiring", () => {
     await pi.fire("tool_call", { toolName: "read", toolCallId: "c3", input: { path: path.join(dir, "src", "b.ts") } });
     expect(pi.messages.map((m) => String(m.message.content)).join("\n")).not.toContain("LW-NESTED-SRC");
 
+    await pi.fire("session_before_compact", { reason: "threshold" });
     await pi.fire("session_compact", { reason: "threshold" });
 
     // Root CLAUDE.md + unconditional rules survive via the per-turn suffix.

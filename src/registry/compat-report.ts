@@ -23,6 +23,8 @@ import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 import {
   CAPABILITY_REGISTRY,
   CLAUDE_BASELINE,
+  PROACTIVE_COMPACTION_APIS,
+  isProactiveCompactionApi,
   capabilityForToolName,
   lookupCapability,
 } from "./capability-registry.js";
@@ -479,8 +481,18 @@ function subagentPostureLine(project: ClaudeProject): string {
  * `proactiveCompactPercent`/`clipMaxTokens` overrides actually took effect
  * (an out-of-range value fails closed to the default and is reported here as-resolved).
  */
-function compactionKnobsLine(compaction: ResolvedCompactionConfig): string {
-  return `Compaction: proactiveCompactPercent=${compaction.proactiveCompactPercent} (of context window), clipMaxTokens=${compaction.clipMaxTokens} (per tool-result block).`;
+function compactionKnobsLine(compaction: ResolvedCompactionConfig, activeModel: unknown): string {
+  const api = activeModel && typeof activeModel === "object"
+    ? (activeModel as { api?: unknown }).api
+    : undefined;
+  const apiLabel = typeof api === "string" && api.length > 0 ? api : "unknown API";
+  const knobs = `proactiveCompactPercent=${compaction.proactiveCompactPercent} (of context window), clipMaxTokens=${compaction.clipMaxTokens} (per tool-result block)`;
+  if (isProactiveCompactionApi(api)) {
+    return `Compaction: proactive checkpointing active for current model (${apiLabel}); ${knobs}.`;
+  }
+  const supported = [...PROACTIVE_COMPACTION_APIS];
+  const supportedLabel = `${supported.slice(0, -1).join(", ")}, and ${supported.at(-1)}`;
+  return `Compaction: current model transport/API (${apiLabel}) is unsupported for proactive checkpointing. Supported API ids are ${supportedLabel}; switch to a model using one of them. ${knobs}.`;
 }
 
 /** Full /doctor breakdown, generated from the registry. */
@@ -495,7 +507,7 @@ export function renderDoctorReport(
     `Project: ${project.root}`,
     activeModelVisionLine(activeModel),
     subagentPostureLine(project),
-    ...(compaction ? [compactionKnobsLine(compaction)] : []),
+    ...(compaction ? [compactionKnobsLine(compaction, activeModel)] : []),
     "",
   ];
 

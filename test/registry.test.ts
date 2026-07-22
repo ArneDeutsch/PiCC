@@ -170,10 +170,22 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("setting.permissions.allow")?.tier).toBe("partial");
   });
 
-  it("covers all 13 supported hook events as full", () => {
+  it("keeps supported hooks full except the explicit lifecycle partials", () => {
+    const partial = new Set(["SessionStart", "PreCompact", "PostCompact", "WorktreeCreate"]);
     for (const ev of SUPPORTED_HOOK_EVENTS) {
-      expect(lookupCapability(`hook.event.${ev}`)?.tier, ev).toBe("full");
+      expect(lookupCapability(`hook.event.${ev}`)?.tier, ev).toBe(partial.has(ev) ? "partial" : "full");
     }
+    const sessionStart = lookupCapability("hook.event.SessionStart")?.note ?? "";
+    expect(sessionStart).toContain("startup|resume|clear|compact|fork");
+    expect(sessionStart).toContain("startup and reload reasons map to startup");
+    expect(sessionStart).toContain("new maps to clear");
+    expect(sessionStart).not.toContain("fork source is missing");
+
+    const worktreeCreate = lookupCapability("hook.event.WorktreeCreate")?.note ?? "";
+    expect(worktreeCreate).toContain("after worktree creation and entry");
+    expect(worktreeCreate).toContain("ordinary nonzero/exit-2 hook outcomes cannot abort creation");
+    expect(worktreeCreate).toContain("Universal continue:false aborts subsequent run processing");
+    expect(worktreeCreate).toContain("tool result remain truthful");
   });
 
   it("marks MCP tools degraded-noop with safetyRelevant false", () => {
@@ -254,7 +266,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(sm?.note).toContain("Claude 2.1.x");
     expect(sm?.note).toContain("resume after TaskStop");
     expect(sm?.note).toContain("Claude Code 2.1.x reference refuses stopped-agent resume");
-    expect(sm?.note).toContain("new task id");
+    expect(sm?.note).toContain("returns its result directly, with no TaskOutput or new task generation");
+    expect(sm?.note).toContain("For ordinary resume, the acknowledgment includes the new task id");
     expect(sm?.note).toContain("resolved registry name");
     expect(sm?.note).toContain("stable agent id");
     expect(sm?.note).toContain("PiCC-defined model-visible wording");
@@ -346,19 +359,15 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(stop?.note).toContain("#15098");
   });
 
-  // Subagent hook payloads carry agent_id + agent_type; transcript_path stays MAIN
-  // (Claude Code parity — verified against src/runtime/subagents.ts fireSubagentStop).
-  it("documents SubagentStart/SubagentStop carrying agent_id/agent_type with transcript_path = MAIN", () => {
+  it("documents canonical SubagentStart/SubagentStop identity with transcript_path = MAIN", () => {
     for (const ev of ["SubagentStart", "SubagentStop"]) {
       const entry = lookupCapability(`hook.event.${ev}`);
       expect(entry?.tier, ev).toBe("full");
-      expect(entry?.note, ev).toContain("agent_id + agent_type");
+      expect(entry?.note, ev).toContain("agent_id + canonical agent_type");
+      expect(entry?.note, ev).toContain("<plugin>:<agent>");
       expect(entry?.note, ev).toContain("MAIN session transcript");
-      // The parity claim is softened re plugin agent_type — the note
-      // must state agent_type is the bare frontmatter name (no plugin-scoped id),
-      // so "full"/"parity" no longer rests on an unverified plugin assumption.
-      expect(entry?.note.toLowerCase(), ev).toContain("plugin");
     }
+    expect(lookupCapability("hook.event.SubagentStart")?.note).toContain("exit 2 is diagnostic and non-blocking");
   });
 
   // Notification stays a degraded no-op; the note must record that settlement does
@@ -1099,14 +1108,23 @@ describe("renderDoctorReport", () => {
     expect(doctor).toContain("subagents.enabled=false");
   });
 
-  it("echoes the resolved compaction knob values when a compaction config is supplied", () => {
+  it("reports active API truth with resolved compaction knob values", () => {
     const project = makeProject();
-    const doctor = renderDoctorReport(project, buildCompatReport(project), undefined, {
-      proactiveCompactPercent: 70,
-      clipMaxTokens: 5000,
-    });
-    expect(doctor).toContain("proactiveCompactPercent=70");
-    expect(doctor).toContain("clipMaxTokens=5000");
+    const config = { proactiveCompactPercent: 70, clipMaxTokens: 5000 };
+    const supported = renderDoctorReport(project, buildCompatReport(project), {
+      api: "openai-responses",
+    }, config);
+    expect(supported).toContain("proactive checkpointing active");
+    expect(supported).toContain("openai-responses");
+    expect(supported).toContain("proactiveCompactPercent=70");
+    expect(supported).toContain("clipMaxTokens=5000");
+
+    const unsupported = renderDoctorReport(project, buildCompatReport(project), {
+      api: "anthropic-messages",
+    }, config);
+    expect(unsupported).toContain("current model transport/API (anthropic-messages) is unsupported");
+    expect(unsupported).toContain("openai-completions, openai-responses, and openai-codex-responses");
+    expect(unsupported).toContain("switch to a model using one of them");
   });
 
   it("omits the compaction line when no compaction config is supplied", () => {

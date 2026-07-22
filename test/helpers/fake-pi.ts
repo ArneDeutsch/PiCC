@@ -58,6 +58,9 @@ export interface FakePi {
   notifications: Array<{ text: string; severity?: string }>;
   modelSets: unknown[];
   thinkingLevels: string[];
+  providerRegistrations: Array<{ name: string; config: any }>;
+  abortCalls: number;
+  editorText: string;
   /** Shortcuts registered via `pi.registerShortcut`, keyed by KeyId. */
   shortcuts: Map<string, { description?: string; handler: (ctx: any) => unknown }>;
   /** Currently-installed widgets by key (removed keys are deleted). */
@@ -120,6 +123,7 @@ export function fakePi(): FakePi {
   const notifications: Array<{ text: string; severity?: string }> = [];
   const modelSets: unknown[] = [];
   const thinkingLevels: string[] = [];
+  const providerRegistrations: Array<{ name: string; config: any }> = [];
   const shortcuts = new Map<string, { description?: string; handler: (ctx: any) => unknown }>();
   const widgets = new Map<string, FakeWidgetInstance>();
   const widgetCalls: FakeWidgetCall[] = [];
@@ -288,6 +292,10 @@ export function fakePi(): FakePi {
   const recordingUi = () => ({
     notify: (text: string, severity?: string) => notifications.push({ text, severity }),
     setStatus: () => undefined,
+    getEditorText: () => self.editorText,
+    setEditorText: (text: string) => {
+      self.editorText = text;
+    },
     setWidget,
     custom,
     onTerminalInput,
@@ -305,6 +313,9 @@ export function fakePi(): FakePi {
     notifications,
     modelSets,
     thinkingLevels,
+    providerRegistrations,
+    abortCalls: 0,
+    editorText: "",
     shortcuts,
     widgets,
     widgetCalls,
@@ -328,6 +339,7 @@ export function fakePi(): FakePi {
         notifyToolWaiters();
       },
       registerCommand: (name: string, options: any) => commands.set(name, options),
+      registerProvider: (name: string, config: any) => providerRegistrations.push({ name, config }),
       registerShortcut: (shortcut: string, options: any) => shortcuts.set(shortcut, options),
       on: (event: string, handler: (event: any, ctx: any) => unknown) => {
         handlers.set(event, [...(handlers.get(event) ?? []), handler]);
@@ -375,6 +387,10 @@ export function fakePi(): FakePi {
         // proactive compaction override getContextUsage with an above-threshold percent.
         getContextUsage: () => ({ tokens: 1234, contextWindow: 400000, percent: (1234 / 400000) * 100 }),
         compact: (options?: unknown) => compactCalls.push(options),
+        abort: () => {
+          self.abortCalls += 1;
+        },
+        hasPendingMessages: () => false,
         sessionManager: { getEntries: () => [] },
         ...overrides,
       };
