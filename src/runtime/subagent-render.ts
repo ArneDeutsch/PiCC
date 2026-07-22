@@ -8,6 +8,7 @@ import {
 import { clampLines, pushColored, pushWrapped, themedBold, themedFg } from "./render-util.js";
 import { formatElapsed } from "./subagent-panel-render.js";
 import { FORK_DEGRADE_PREFIX, isAgentId } from "../util/subagent-transcripts.js";
+import { genericResultComponent, setToolRowOutcome, type ToolRowOutcome } from "./tool-shell.js";
 import type { Diagnostic } from "../types.js";
 
 // --- live-progress + result rendering helpers ---
@@ -43,6 +44,7 @@ export interface SubagentLifecycleRenderState {
 /** Structural subset of Pi's ToolRenderContext used by lifecycle renderers. */
 export interface SubagentLifecycleRenderContext {
   state?: SubagentLifecycleRenderState;
+  [key: string]: unknown;
 }
 
 /** Complete details-only contract consumed by subagent lifecycle renderers. */
@@ -382,6 +384,7 @@ function outcomeBadgeLine(
   agentName: unknown,
   taskChipLabel?: string,
   userStopped?: boolean,
+  suppressSymbol = false,
 ): string {
   // SECURITY: agentName is model-supplied (subagent_type) OR project-file-supplied
   // (agent `name:` frontmatter) — sanitize before it reaches the parent terminal.
@@ -412,7 +415,7 @@ function outcomeBadgeLine(
     color = "warning";
     word = "stopped by user";
   }
-  return themedFg(theme, color, themedBold(theme, `${symbol} ${subject} ${word}`));
+  return themedFg(theme, color, themedBold(theme, `${suppressSymbol ? "" : `${symbol} `}${subject} ${word}`));
 }
 
 /** `details.durationMs` formatted for display, or undefined when absent/invalid. */
@@ -530,6 +533,7 @@ function collapsedRecordLines(
   outcome: "completed" | "failed" | "aborted",
   chip: string | undefined,
   width: number,
+  suppressSymbol = false,
 ): string[] {
   if (outcome === "completed") {
     const optional: LifecycleSegment[] = [];
@@ -591,7 +595,7 @@ function collapsedRecordLines(
       ...(chip ? { chip } : {}),
       state,
       agentPlacement: "after-task",
-      prefix: `${symbol} `,
+      prefix: suppressSymbol ? "" : `${symbol} `,
       cue: RECORD_EXPAND_HINT,
       required,
       optional,
@@ -612,6 +616,7 @@ function referenceRecordLines(
   outcome: "completed" | "failed" | "aborted",
   chip: string | undefined,
   width: number,
+  suppressSymbol = false,
 ): string[] {
   const userStopped = details.userStopped === true;
   const state =
@@ -635,7 +640,7 @@ function referenceRecordLines(
       ...(exceptional
         ? {
             agentPlacement: "after-task" as const,
-            prefix: outcome === "failed" && !userStopped ? "✗ " : "■ ",
+            prefix: suppressSymbol ? "" : outcome === "failed" && !userStopped ? "✗ " : "■ ",
           }
         : {}),
       cue: RECORD_REFERENCE_NOTE,
@@ -739,6 +744,20 @@ export function renderAgentCall(
   };
 }
 
+function lifecycleToolRowOutcome(
+  details: SubagentRenderDetails,
+  isPartial: boolean,
+): ToolRowOutcome | undefined {
+  if (details.userStopped === true) return "stopped";
+  if (isPartial) return "running";
+  if (details.background === true) return "success";
+  if (details.taskId !== undefined && details.status === "running") return "running";
+  if (details.outcome === "completed") return "success";
+  if (details.outcome === "failed") return "failure";
+  if (details.outcome === "aborted") return "stopped";
+  return undefined;
+}
+
 /**
  * renderResult (REQUIRED). Two modes:
  *  - PARTIAL (streaming): ONE identity/state/metadata line; the status panel
@@ -765,6 +784,10 @@ export function renderAgentResult(
   const details = normalizeSubagentRenderDetails(safeField(result, "details")) ?? {};
   const isPartial = safeField(options, "isPartial") === true;
   const expanded = safeField(options, "expanded");
+  const lifecycleOutcome = lifecycleToolRowOutcome(details, isPartial);
+  const shellOwnsSymbol = lifecycleOutcome === undefined
+    ? false
+    : setToolRowOutcome(context, lifecycleOutcome);
   return {
     render(width: number): string[] {
       const lines: string[] = [];
@@ -774,6 +797,13 @@ export function renderAgentResult(
         // A background live view leads with the Task chip + agent type;
         // the foreground view (no taskId) keeps the bare `Agent(<type>)` header.
         const chip = taskChip(details);
+        if (details.userStopped === true) {
+          return lifecycleLine(
+            theme,
+            { agent, ...(chip ? { chip } : {}), state: "stopped by user", tone: "warning" },
+            width,
+          );
+        }
         return runningStatusLines(theme, chip, agent, details, width);
       }
       // Final result.
@@ -816,7 +846,7 @@ export function renderAgentResult(
       // already emitted (settlement notice, or an earlier collection) renders
       // only a minimal reference line — never a second full record.
       if (outcome && details.alreadyReported === true) {
-        return referenceRecordLines(theme, details, outcome, chip, width);
+        return referenceRecordLines(theme, details, outcome, chip, width, shellOwnsSymbol);
       }
       // Collapsed by default in the interactive transcript: Pi always passes a
       // BOOLEAN `expanded` (false until the global Ctrl+O toggle), so the
@@ -824,7 +854,7 @@ export function renderAgentResult(
       // option gets the full record — print/RPC never run renderers, so this
       // only widens compatibility for direct callers.
       if (outcome && expanded === false) {
-        return collapsedRecordLines(theme, details, outcome, chip, width);
+        return collapsedRecordLines(theme, details, outcome, chip, width, shellOwnsSymbol);
       }
       if (outcome) {
         // `chip` leads the badge for background outcomes; the badge word flips
@@ -837,6 +867,7 @@ export function renderAgentResult(
             details.agent,
             chip,
             details.userStopped === true,
+            shellOwnsSymbol,
           ),
         );
         // Identity subline at the SETTLED surface — SUPPRESSED when the resumable
@@ -935,6 +966,72 @@ export function renderTaskOutputCall(
       );
     },
   };
+}
+
+type LifecycleControlResult = {
+  content?: Array<{ type?: string; text?: string }>;
+  details?: Record<string, unknown>;
+};
+
+function lifecycleControlComponent(
+  result: LifecycleControlResult,
+  theme: unknown,
+  context: SubagentLifecycleRenderContext | undefined,
+  outcome: ToolRowOutcome | undefined,
+) {
+  if (outcome !== undefined) setToolRowOutcome(context, outcome);
+  return genericResultComponent(result, theme, context ?? {});
+}
+
+/** Preserve SendMessage's generic text presentation while mapping only retained checkpoint recovery. */
+export function renderSendMessageResult(
+  result: LifecycleControlResult,
+  theme: unknown,
+  context?: SubagentLifecycleRenderContext,
+) {
+  const details = safeField(result, "details");
+  const outcome = safeField(details, "delivery") === "checkpoint-recovery"
+    ? safeField(details, "outcome")
+    : undefined;
+  return lifecycleControlComponent(
+    result,
+    theme,
+    context,
+    outcome === "completed"
+      ? "success"
+      : outcome === "failed"
+        ? "failure"
+        : outcome === "aborted"
+          ? "stopped"
+          : undefined,
+  );
+}
+
+/** Preserve TaskStop's generic text presentation while mapping exact task/checkpoint lifecycle records. */
+export function renderTaskStopResult(
+  result: LifecycleControlResult,
+  theme: unknown,
+  context?: SubagentLifecycleRenderContext,
+) {
+  const details = safeField(result, "details");
+  const taskId = safeField(details, "taskId");
+  const agentId = safeField(details, "agentId");
+  const taskRecord = typeof taskId === "string" && /^task-[1-9]\d*$/u.test(taskId);
+  const checkpointRecord = safeField(details, "checkpointPaused") === true &&
+    typeof agentId === "string" && isAgentId(agentId);
+  const status = taskRecord || checkpointRecord ? safeField(details, "status") : undefined;
+  return lifecycleControlComponent(
+    result,
+    theme,
+    context,
+    status === "completed"
+      ? "success"
+      : status === "failed"
+        ? "failure"
+        : status === "stopped"
+          ? "stopped"
+          : undefined,
+  );
 }
 
 /**

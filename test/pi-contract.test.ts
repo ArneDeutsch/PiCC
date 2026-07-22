@@ -7,7 +7,7 @@ import { stream as streamCodexResponses } from "@earendil-works/pi-ai/api/openai
 import type { AssistantMessage, Context, Model, ToolCall } from "@earendil-works/pi-ai";
 import { fakePi } from "./helpers/fake-pi.js";
 import { withCompactSearchRendering } from "../src/runtime/search-tool-render.js";
-import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
+import { genericCallComponent, wrapForSelfShell, type RenderCtx } from "../src/runtime/tool-shell.js";
 import { codexAbortGuardStreamSimple } from "../src/runtime/codex-abort-guard.js";
 import picc from "../src/index.js";
 import { classifyRequest, createResponseGate, startMockModel, type CapturedRequest } from "./helpers/mock-openai.js";
@@ -922,7 +922,7 @@ describe("real Pi compact-search composition", () => {
   it.each(cases)("renders equivalent compact $name status and feedback through the real HTML renderer", async (search) => {
     const { renderer } = await htmlHarness(search);
     const id = `html-${search.name}`;
-    expect(renderer.renderCall(id, search.name, search.args)).toBe("");
+    renderer.renderCall(id, search.name, search.args);
     const rendered = renderer.renderResult(
       id, search.name, search.status.content, search.status.details, false,
     );
@@ -978,7 +978,6 @@ describe("real Pi compact-search composition", () => {
 
       expect(JSON.stringify(canonicalResult?.message?.content)).toContain(search.hidden);
       expect(rendered).toBeDefined();
-      expect(rendered.callHtml).toBeUndefined();
       expect(rendered.resultHtmlExpanded).toContain(search.name);
       expect(rendered.resultHtmlExpanded).toMatch(search.statusText);
       expect(rendered.resultHtmlExpanded).toContain(`Post-processing ${search.name} feedback.`);
@@ -990,6 +989,51 @@ describe("real Pi compact-search composition", () => {
       expect(html).not.toContain(search.hidden);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("real Pi glyph-shell image and spacing ownership", () => {
+  it("keeps binary images Pi-owned and aligns textual image fallbacks", async () => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    const tui: any = await import("@earendil-works/pi-tui");
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const piDist = mainUrl.slice(0, mainUrl.indexOf("/dist/"));
+    const nestedTui: any = await import(`${piDist}/node_modules/@earendil-works/pi-tui/dist/index.js`);
+    sdk.initTheme();
+    const previous = tui.getCapabilities();
+    const nestedPrevious = nestedTui.getCapabilities();
+    const definition = wrapForSelfShell({ name: "ImageProbe" });
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    const build = (id: string) => new sdk.ToolExecutionComponent(
+      "ImageProbe", id, {}, { showImages: true }, definition,
+      { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+    );
+    try {
+      tui.setCapabilities({ ...previous, images: "kitty" });
+      nestedTui.setCapabilities({ ...nestedPrevious, images: "kitty" });
+      const binary = build("binary-image");
+      binary.updateResult({ content: [{ type: "image", data: png, mimeType: "image/png" }], details: undefined }, false);
+      const binaryLines = binary.render(40) as string[];
+      expect(binaryLines[0]).toBe("");
+      expect(binaryLines[1]?.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")).toBe("● ImageProbe");
+      expect(binaryLines[2]).toBe(""); // Pi-owned text/image separator
+      expect(binaryLines.slice(3).join("\n")).toContain("_G");
+      expect(binaryLines.join("\n").match(/[○●✗■]/gu)).toHaveLength(1);
+
+      tui.setCapabilities({ ...previous, images: null });
+      nestedTui.setCapabilities({ ...nestedPrevious, images: null });
+      const fallback = build("fallback-image");
+      fallback.updateResult({ content: [{ type: "image", data: png, mimeType: "image/png" }], details: undefined }, false);
+      const fallbackText = (fallback.render(80) as string[]).join("\n").replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+      expect(fallbackText).toContain("● ImageProbe");
+      expect(fallbackText).toMatch(/\n  \[Image/iu);
+      expect(fallbackText.match(/[○●✗■]/gu)).toHaveLength(1);
+
+      for (const row of [binary, fallback]) expect((row.render(80) as string[])[0]).toBe("");
+    } finally {
+      tui.setCapabilities(previous);
+      nestedTui.setCapabilities(nestedPrevious);
     }
   });
 });
@@ -1148,14 +1192,85 @@ describe("real Pi lifecycle row ownership", () => {
   });
 });
 
+describe("real Pi glyph-shell construction and render ordering", () => {
+  it("shares exact state, renders call before result repeatedly, and preserves adjacent separators", async () => {
+    const { ToolExecutionComponent, initTheme } = (await import(
+      "@earendil-works/pi-coding-agent"
+    )) as any;
+    initTheme();
+    const constructed: Array<{ kind: "call" | "result"; state: unknown }> = [];
+    const rendered: string[] = [];
+    const definition = wrapForSelfShell({
+      name: "OrderProbe",
+      renderCall: (_args: unknown, _theme: unknown, ctx: RenderCtx) => {
+        constructed.push({ kind: "call", state: ctx.state });
+        return { render: () => { rendered.push("call"); return ["call"]; } };
+      },
+      renderResult: (_result: unknown, _options: unknown, _theme: unknown, ctx: RenderCtx) => {
+        constructed.push({ kind: "result", state: ctx.state });
+        return { render: () => { rendered.push("result"); return ["result"]; } };
+      },
+    });
+    const build = (id: string) => new ToolExecutionComponent(
+      "OrderProbe", id, {}, {}, definition, { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+    );
+    const first = build("order-a");
+    constructed.length = 0;
+    first.updateResult({ content: [{ type: "text", text: "canonical" }], details: undefined }, false);
+    expect(constructed.map(({ kind }) => kind)).toEqual(["call", "result"]);
+    expect(constructed[0]?.state).toBe(constructed[1]?.state);
+    const invocationState = constructed[0]?.state;
+    expect(rendered).toEqual([]);
+
+    const firstPaint = first.render(80) as string[];
+    expect(rendered).toEqual(["call", "result"]);
+
+    constructed.length = 0;
+    rendered.length = 0;
+    first.updateResult({ content: [{ type: "text", text: "updated" }], details: undefined }, false);
+    expect(constructed.map(({ kind }) => kind)).toEqual(["call", "result"]);
+    expect(constructed[0]?.state).toBe(constructed[1]?.state);
+    expect(constructed[0]?.state).toBe(invocationState);
+    expect(rendered).toEqual([]);
+
+    const secondPaint = first.render(80) as string[];
+    expect(rendered).toEqual(["call", "result"]);
+    for (const paint of [firstPaint, secondPaint]) {
+      expect(paint[0]).toBe("");
+      expect(paint.join("\n").match(/[○●✗■]/gu)).toHaveLength(1);
+    }
+
+    const adjacent = build("order-b");
+    adjacent.updateResult({ content: [{ type: "text", text: "neighbor" }], details: undefined }, false);
+    const adjacentPaint = adjacent.render(80) as string[];
+    const stripAnsi = (line: string) => line.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+    const combined = [...firstPaint, ...adjacentPaint].map(stripAnsi);
+    expect(combined).toEqual(["", "● call", "  result", "", "● call", "  result"]);
+    expect(combined.flatMap((line, index) => line === "" ? [index] : [])).toEqual([0, 3]);
+    expect(combined.at(-1)).not.toBe("");
+    expect(combined.join("\n").match(/[○●✗■]/gu)).toHaveLength(2);
+  });
+
+  it("preserves the real theme's generic bold toolTitle composition", async () => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    sdk.initTheme();
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const piDist = mainUrl.slice(0, mainUrl.indexOf("/dist/"));
+    const { theme }: any = await import(`${piDist}/dist/modes/interactive/theme/theme.js`);
+    const expected = theme.fg("toolTitle", theme.bold("GenericProbe"));
+    expect(genericCallComponent("GenericProbe", theme).render(80)).toEqual([expected]);
+  });
+});
+
 /**
  * Pin Pi's `ctx.lastComponent` threading with a contract
  * test that drives the REAL, publicly-exported `ToolExecutionComponent`.
  *
- * The de-padded built-ins depend on Pi caching the component our wrapper returns
- * and handing it back as `ctx.lastComponent` on the next render (the `__inner`
- * threading exists precisely to survive this; `edit`'s `instanceof Box`
- * incremental reuse breaks if the wrong component is threaded). PiCC's OWN
+ * The glyph-framed built-ins depend on Pi caching the outer component our wrapper
+ * returns and handing it back as `ctx.lastComponent` on the next render. PiCC's
+ * `wrapperMetadata` WeakMap resolves that outer component to its retained previous
+ * inner component; `edit`'s `instanceof Box` incremental reuse breaks if the wrong
+ * component is threaded. PiCC's own
  * threading is unit-tested against a fake ctx (`test/runtime-core.test.ts`); this
  * asserts PI's side of the contract, so a Pi upgrade that stops threading the
  * prior component fails loudly here instead of degrading incremental rendering

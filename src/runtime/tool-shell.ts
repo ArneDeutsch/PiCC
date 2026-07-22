@@ -1,5 +1,4 @@
 import {
-  Box,
   getCapabilities,
   getImageDimensions,
   imageFallback,
@@ -8,74 +7,15 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 
-// ---------------------------------------------------------------------------
-// The single self-shell seam.
-//
-// Pi's default tool shell wraps each row in a Box(paddingX=1, paddingY=1, bgFn):
-// paddingY=1 is the colored blank line above AND below the content this feature
-// removes. The only lever that drops that padding is `renderShell:"self"`, but
-// self mode also drops Pi's colored Box entirely (self renders a plain
-// Container, prepends exactly ONE plain "" as the inter-block separator, and
-// applies no background). So every row that goes self-shell must RE-APPLY the
-// per-line background itself, byte-exact via the theme's own `theme.bg`.
-//
-// `wrapForSelfShell` does that for any tool without editing its renderers: it
-// sets `renderShell:"self"`, wraps the tool's own renderCall/renderResult (or
-// injects a generic fallback that reproduces Pi's createCallFallback /
-// createResultFallback when the tool has none), and frames the resulting lines
-// with a REAL pi-tui `Box(paddingX=1, paddingY=0, bgFn)` — the very component
-// Pi's default shell uses, minus the two blank padding lines (`paddingY=0`). We
-// delegate to Box so rows stay
-// compact AND inherit Box's built-in render cache: a settled row re-rendered
-// unchanged returns Box's cached lines without re-running the per-line paint,
-// which is what removes the per-frame CPU spin. The gutter (Box's `leftPad` from
-// `paddingX=1`), the inner content width (`width - 2*paddingX`), and the per-line
-// background (our `bgFn` -> guarded `themedBg`) are all Box's, matching the old
-// paint byte-for-byte. The state/slot decision lives HERE (once), so it can never
-// diverge between a tool's call and result line. The wrapper sits OUTSIDE the
-// individual renderers.
-//
-// Box does NOT strip blank edges and does NOT clamp an over-wide child line, so a
-// tiny persistent adapter child sits between the Box and the inner renderer: it
-// strips leading/trailing blank inner lines and clamps each line to
-// `clampContentWidth(width)` before Box paints, so output stays byte-identical to
-// Pi's default Box row minus the padding (including at degenerate widths 1
-// and 2, where an un-clamped gutter+content would overflow the row).
-//
-// Everything is null-/throw-guarded: `ToolExecutionComponent` calls these
-// renderers from a self-render path that is NOT wrapped in try/catch, so an
-// unguarded throw (unknown bg slot, absent theme, a negative `repeat`) would
-// kill Pi's whole render loop. A no-theme / headless render degrades to plain
-// text and never throws.
-// ---------------------------------------------------------------------------
-
-/** The colored gutter Pi's default Box adds via `paddingX=1` — one leading col. */
-const GUTTER = 1;
-
-/**
- * The width the adapter CLAMPS a content line to before Box adds the gutter. Same
- * `width - 2*GUTTER` as the width Box lays the inner out at (`box.js`
- * `contentWidth = width - paddingX*2`), but floored at 0 rather than Box's floor
- * of 1: at a degenerate width (1 or 2) the 1-col gutter alone already fills the
- * row, so the clamped content must be 0 cols — otherwise `gutter + content` would
- * exceed `width` and overflow the painted line past the terminal (Box does NOT
- * truncate an over-wide child line, so the crash-invariant guard lives here).
- * Flooring at 0 keeps `gutter + content <= width` at every width, so the painted
- * line always ends within the terminal. This is why the adapter needs the OUTER
- * width, not the `width-2`-floored-at-1 that Box passes its child: those two
- * differ precisely at widths 1 and 2.
- */
-function clampContentWidth(width: number): number {
-  return Math.max(0, width - 2 * GUTTER);
-}
-
 type Component = { render(width: number): string[] };
 
-/** The render context Pi threads to renderCall/renderResult (`getRenderContext`). */
+/** The render context Pi threads to renderCall/renderResult. */
 export interface RenderCtx {
   isPartial?: boolean;
   isError?: boolean;
   showImages?: boolean;
+  state?: unknown;
+  lastComponent?: unknown;
   [key: string]: unknown;
 }
 
@@ -84,67 +24,279 @@ type ResultShape = {
   details?: Record<string, unknown>;
 };
 
-/** Pi's tool-result content block, exposed for the local `getTextOutput` mirror. */
 type ContentBlock = { type?: string; text?: string; data?: string; mimeType?: string };
 
-/** The theme's background slot for a row's state (`toolPendingBg` / …Error… / …Success…). */
-export type BgSlot = "toolPendingBg" | "toolErrorBg" | "toolSuccessBg";
+type CallRenderer = (args: Record<string, unknown>, theme: unknown, ctx: RenderCtx) => Component;
+type ResultRenderer = (
+  result: ResultShape,
+  options: Record<string, unknown>,
+  theme: unknown,
+  ctx: RenderCtx,
+) => Component;
 
-/**
- * The single-tone background slot for a row, from the render ctx — identical for
- * the call line and the result line so a row is one tone in every state (pinned
- * to Pi's `tool-execution.js:206-210`: pending → error → success). Tolerant of a
- * missing ctx (unit callers): defaults to the success tone.
- */
-export function bgSlotForCtx(ctx: RenderCtx | undefined): BgSlot {
-  const c = ctx ?? {};
-  return c.isPartial ? "toolPendingBg" : c.isError ? "toolErrorBg" : "toolSuccessBg";
+export type ToolRowOutcome = "running" | "success" | "failure" | "stopped";
+
+type ThemeColor = "muted" | "success" | "error" | "warning";
+
+const OUTCOME_PRESENTATION: Record<ToolRowOutcome, { glyph: string; color: ThemeColor }> = {
+  running: { glyph: "○", color: "muted" },
+  success: { glyph: "●", color: "success" },
+  failure: { glyph: "✗", color: "error" },
+  stopped: { glyph: "■", color: "warning" },
+};
+
+interface Generation {
+  readonly state?: object;
+  outcome: ToolRowOutcome;
+  resultRegistered: boolean;
+  callRendered: boolean;
+  callClaimed: boolean;
+  active: boolean;
 }
 
-// --- theme accessors (null- and throw-guarded) ---
-
-function themedFg(theme: unknown, color: string, text: string): string {
-  const t = theme as { fg?: (c: string, s: string) => string } | undefined;
-  return typeof t?.fg === "function" ? t.fg(color, text) : text;
+interface Coordinator {
+  current?: Generation;
 }
 
-function themedBold(theme: unknown, text: string): string {
-  const t = theme as { bold?: (s: string) => string } | undefined;
-  return typeof t?.bold === "function" ? t.bold(text) : text;
+interface ContextBrand {
+  generation: Generation;
+  active: boolean;
 }
 
-/**
- * Paint `text` with the given background slot via the theme's OWN `theme.bg`
- * (byte-exact with Pi's default shell). Guarded with try/catch — NOT a mere
- * typeof check like themedFg — because `theme.bg` THROWS on an unknown slot or an
- * absent/partial theme, and this runs on a call site Pi does not try/catch. On
- * any failure (no theme, unknown slot, throw) it returns `text` unpainted so the
- * render loop can never die and a headless/no-theme run degrades to plain text.
- */
-export function themedBg(theme: unknown, slot: BgSlot, text: string): string {
-  const t = theme as { bg?: (s: string, txt: string) => string } | undefined;
-  if (typeof t?.bg !== "function") return text;
+interface ShellCache {
+  width: number;
+  outcome: ToolRowOutcome;
+  continuation: boolean;
+  registered: boolean;
+  theme: unknown;
+  lines: string[];
+  innerLines: string[];
+}
+
+interface WrapperMetadata {
+  owner: object;
+  kind: "call" | "result";
+  inner: Component;
+  cache?: ShellCache;
+}
+
+const coordinators = new WeakMap<object, WeakMap<object, Coordinator>>();
+const contextBrands = new WeakMap<object, ContextBrand>();
+const wrapperMetadata = new WeakMap<object, WrapperMetadata>();
+
+function objectKey(value: unknown): object | undefined {
+  return (typeof value === "object" && value !== null) || typeof value === "function"
+    ? value as object
+    : undefined;
+}
+
+function safeGet(value: unknown, key: PropertyKey): unknown {
+  const object = objectKey(value);
+  if (!object) return undefined;
   try {
-    return t.bg(slot, text);
+    return Reflect.get(object, key, object);
   } catch {
-    return text;
+    return undefined;
   }
 }
 
-// --- width-aware line helpers (pi-tui's OWN measure — NEVER String.length) ---
-//
-// pi-tui throws an uncaughtException — killing the process — if a rendered line
-// exceeds the terminal, and decides that with visibleWidth() (grapheme +
-// East-Asian-width + tabs). We MUST clamp with the same function so the adapter
-// agrees exactly with the check pi-tui enforces.
+function ordinaryOutcome(ctx: unknown): ToolRowOutcome {
+  return safeGet(ctx, "isPartial") === true
+    ? "running"
+    : safeGet(ctx, "isError") === true
+      ? "failure"
+      : "success";
+}
 
-/** A line is blank iff its VISIBLE width (after ANSI strip) is 0 — never `=== ""` (a bg-filled pad line is a non-empty raw string). */
+function coordinatorFor(state: object | undefined, owner: object): Coordinator | undefined {
+  if (!state) return undefined;
+  let byOwner = coordinators.get(state);
+  if (!byOwner) {
+    byOwner = new WeakMap<object, Coordinator>();
+    coordinators.set(state, byOwner);
+  }
+  let coordinator = byOwner.get(owner);
+  if (!coordinator) {
+    coordinator = {};
+    byOwner.set(owner, coordinator);
+  }
+  return coordinator;
+}
+
+function freshGeneration(ctx: unknown, state: object | undefined, coordinator?: Coordinator): Generation {
+  const generation: Generation = {
+    state,
+    outcome: ordinaryOutcome(ctx),
+    resultRegistered: false,
+    callRendered: false,
+    callClaimed: false,
+    active: true,
+  };
+  if (coordinator) {
+    if (coordinator.current) coordinator.current.active = false;
+    coordinator.current = generation;
+  }
+  return generation;
+}
+
+function callGeneration(ctx: unknown, owner: object): Generation {
+  const state = objectKey(safeGet(ctx, "state"));
+  return freshGeneration(ctx, state, coordinatorFor(state, owner));
+}
+
+function resultGeneration(ctx: unknown, owner: object): Generation {
+  const state = objectKey(safeGet(ctx, "state"));
+  const coordinator = coordinatorFor(state, owner);
+  const current = coordinator?.current;
+  if (current?.active && !current.callRendered) {
+    current.resultRegistered = true;
+    return current;
+  }
+  const generation = freshGeneration(ctx, state, coordinator);
+  generation.resultRegistered = true;
+  // A result-only phase must never make a later result join it as though a call were pending.
+  generation.callRendered = true;
+  return generation;
+}
+
+/**
+ * Set a specialized row outcome only while an inner renderer is synchronously being built.
+ * The exact derived context is closure-branded; retained, cloned, stale, or foreign contexts fail closed.
+ */
+export function setToolRowOutcome(context: unknown, outcome: ToolRowOutcome): boolean {
+  if (typeof outcome !== "string" || !Object.hasOwn(OUTCOME_PRESENTATION, outcome)) return false;
+  const key = objectKey(context);
+  if (!key) return false;
+  const brand = contextBrands.get(key);
+  if (!brand?.active || !brand.generation.active) return false;
+  brand.generation.outcome = outcome;
+  return true;
+}
+
+function themed(theme: unknown, method: "fg" | "bold", args: string[], fallback: string): string {
+  const receiver = objectKey(theme);
+  if (!receiver) return fallback;
+  try {
+    const fn = Reflect.get(receiver, method, receiver);
+    return typeof fn === "function" ? String(Reflect.apply(fn, receiver, args)) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function themedFg(theme: unknown, color: string, text: string): string {
+  return themed(theme, "fg", [color, text], text);
+}
+
+function themedBold(theme: unknown, text: string): string {
+  return themed(theme, "bold", [text], text);
+}
+
+const SGR_RE = /\u001b\[[0-9;]*m/gu;
+
+function foregroundSequence(parameters: string): "open" | "reset" | undefined {
+  const parts = (parameters === "" ? [0] : parameters.split(";").map(Number));
+  if (parts.length === 1 && (parts[0] === 0 || parts[0] === 39)) return "reset";
+  if (parts.length === 1 && parts[0] !== undefined &&
+    ((parts[0] >= 30 && parts[0] <= 37) || (parts[0] >= 90 && parts[0] <= 97))) return "open";
+  if (parts[0] === 38 && ((parts.length === 3 && parts[1] === 5) || (parts.length === 5 && parts[1] === 2)) &&
+    parts.slice(2).every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) return "open";
+  return undefined;
+}
+
+function safeStyledText(value: string, expected: string): string | undefined {
+  if (value === expected) return value;
+  const plain = value.replace(SGR_RE, "");
+  if (plain !== expected || value.includes("\u001b]") || /[\u0000-\u0008\u000b-\u001a\u001c-\u001f\u007f]/u.test(value) ||
+    plain.includes("\u001b")) return undefined;
+
+  const visibleStart = value.indexOf(expected);
+  const visibleEnd = visibleStart + expected.length;
+  let foregroundOpen = false;
+  let openedBeforeText = false;
+  let resetAfterText = false;
+  let lastEnd = 0;
+  for (const match of value.matchAll(SGR_RE)) {
+    const index = match.index ?? 0;
+    const sequence = foregroundSequence(match[0].slice(2, -1));
+    if (!sequence) return undefined;
+    foregroundOpen = sequence === "open";
+    if (foregroundOpen && index < visibleStart) openedBeforeText = true;
+    if (!foregroundOpen && index >= visibleEnd) resetAfterText = true;
+    lastEnd = index + match[0].length;
+  }
+  return openedBeforeText && resetAfterText && !foregroundOpen && lastEnd === value.length ? value : undefined;
+}
+
+function genericStyleSequence(parameters: string, modes: { foreground: boolean; bold: boolean }): boolean {
+  const parts = (parameters === "" ? [0] : parameters.split(";").map(Number));
+  if (parts.some((part) => !Number.isInteger(part))) return false;
+  for (let index = 0; index < parts.length; index++) {
+    const part = parts[index];
+    if (part === 0) {
+      modes.foreground = false;
+      modes.bold = false;
+    } else if (part === 1) {
+      modes.bold = true;
+    } else if (part === 22) {
+      modes.bold = false;
+    } else if (part === 39) {
+      modes.foreground = false;
+    } else if (part !== undefined && ((part >= 30 && part <= 37) || (part >= 90 && part <= 97))) {
+      modes.foreground = true;
+    } else if (part === 38) {
+      const mode = parts[index + 1];
+      const valueCount = mode === 5 ? 1 : mode === 2 ? 3 : 0;
+      const values = parts.slice(index + 2, index + 2 + valueCount);
+      if (valueCount === 0 || values.length !== valueCount ||
+        values.some((value) => value === undefined || value < 0 || value > 255)) return false;
+      modes.foreground = true;
+      index += valueCount + 1;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+function safeGenericStyledText(value: string, expected: string): string | undefined {
+  if (value === expected) return value;
+  const plain = value.replace(SGR_RE, "");
+  if (plain !== expected || value.includes("\u001b]") || /[\u0000-\u0008\u000b-\u001a\u001c-\u001f\u007f]/u.test(value) ||
+    plain.includes("\u001b")) return undefined;
+
+  const modes = { foreground: false, bold: false };
+  for (const match of value.matchAll(SGR_RE)) {
+    if (!genericStyleSequence(match[0].slice(2, -1), modes)) return undefined;
+  }
+  return !modes.foreground && !modes.bold ? value : undefined;
+}
+
+function safeGenericStyle(theme: unknown, color: string, text: string, bold = false): string {
+  const emphasized = bold ? themedBold(theme, text) : text;
+  return safeGenericStyledText(themedFg(theme, color, emphasized), text) ?? text;
+}
+
+function markerFor(theme: unknown, outcome: ToolRowOutcome): string {
+  const { glyph, color } = OUTCOME_PRESENTATION[outcome];
+  const styled = safeStyledText(themedFg(theme, color, glyph), glyph);
+  if (!styled) return glyph;
+  try {
+    return visibleWidth(styled) === 1 ? styled : glyph;
+  } catch {
+    return glyph;
+  }
+}
+
+function normalizedWidth(width: number): number {
+  return Number.isFinite(width) && width > 0 ? Math.floor(width) : 0;
+}
+
 function isBlank(line: string): boolean {
   return visibleWidth(line) === 0;
 }
 
-/** Drop ONLY leading and trailing blank lines (interior blanks are content, kept). */
-function stripBlankEdges(lines: string[]): string[] {
+function visibleLines(lines: string[]): string[] {
   let start = 0;
   let end = lines.length;
   while (start < end && isBlank(lines[start] ?? "")) start++;
@@ -152,50 +304,138 @@ function stripBlankEdges(lines: string[]): string[] {
   return lines.slice(start, end);
 }
 
-/** Clamp one line to `width` VISIBLE columns (pi-tui truncate); "" at width<=0. */
 function clampLine(line: string, width: number): string {
   if (width <= 0) return "";
   return visibleWidth(line) > width ? truncateToWidth(line, width, "…") : line;
 }
 
-// --- generic fallback renderer (renderer-less tools) ---
-
-/**
- * The generic call renderer for a tool with no renderCall — byte-identical to
- * Pi's `createCallFallback` (`tool-execution.js:107`): the bold, toolTitle-colored
- * tool name on one line. The Box adds the gutter + background.
- */
-export function genericCallComponent(toolName: string, theme: unknown): Component {
-  return {
-    render(): string[] {
-      return [themedFg(theme, "toolTitle", themedBold(theme, toolName))];
-    },
-  };
+function frameOwned(lines: string[], marker: string, width: number): string[] {
+  if (width === 1) return [marker];
+  if (width === 2) return [`${marker} `];
+  const contentWidth = width - 2;
+  if (lines.length === 0) return [marker];
+  return lines.map((line, index) => `${index === 0 ? `${marker} ` : "  "}${clampLine(line, contentWidth)}`);
 }
 
-/**
- * The generic result renderer for a tool with no renderResult — reproduces Pi's
- * `createResultFallback` (`tool-execution.js:109-115`): the result's text output
- * colored `toolOutput`, or nothing when empty. The text transform mirrors Pi's
- * `getTextOutput` (`render-utils.js:35-53`) EXACTLY (not a sanitizeProgressText
- * join, which diverges): strip ANSI, sanitize binary/control bytes, remove ALL
- * `\r` (a CRLF payload would otherwise return the cursor to col 0 and corrupt the
- * row), and append `[image WxH]` fallback indicators for image blocks that can't
- * be shown. Pi's own `getTextOutput` is not importable (blocked by the package
- * `exports` map — the deep `dist/core/tools/render-utils.js` path does not
- * resolve), so the transform is reproduced here.
- *
- * Tabs are then normalized to three spaces — exactly what Pi's own fallback does.
- * Pi renders a renderer-less result via `new Text(...)`, and pi-tui `Text.render`
- * runs `this.text.replace(/\t/g, "   ")` (a flat 3-space replace, confirmed in
- * `@earendil-works/pi-tui/dist/components/text.js`) BEFORE `wrapTextWithAnsi`.
- * `getTextOutput`/`sanitizeBinaryOutput` preserve `\t`, so without this the raw
- * tab would render instead of Pi's 3-space form — a small divergence from the
- * "content visually unchanged" promise. Done on the raw segment before coloring
- * (color spans the whole segment, so a pre-color replace is equivalent) and before
- * wrapping, matching Pi's order. ONLY the generic fallback path needs this; the
- * own-renderer and built-in paths delegate to Pi's renderers, which handle tabs.
- */
+function frameContinuation(lines: string[], width: number): string[] {
+  if (width < 3) return [];
+  const contentWidth = width - 2;
+  return lines.map((line) => `  ${clampLine(line, contentWidth)}`);
+}
+
+function previousMetadata(ctx: unknown, owner: object, kind: "call" | "result"): WrapperMetadata | undefined {
+  // Pi returns our outer component, but native renderers (especially Edit's Box) must reuse the prior inner component.
+  const previous = objectKey(safeGet(ctx, "lastComponent"));
+  if (!previous) return undefined;
+  const metadata = wrapperMetadata.get(previous);
+  return metadata?.owner === owner && metadata.kind === kind ? metadata : undefined;
+}
+
+function derivedContext(ctx: unknown, lastComponent: Component | undefined): RenderCtx {
+  try {
+    return { ...(ctx as RenderCtx), lastComponent };
+  } catch {
+    // A proxy-failing context cannot safely share invocation state; preserve only the prior component.
+    return { lastComponent };
+  }
+}
+
+function constructInner(
+  renderer: ((ctx: RenderCtx) => Component) | undefined,
+  fallback: () => Component,
+  context: RenderCtx,
+  generation: Generation,
+): Component {
+  if (!renderer) return fallback();
+  const key = objectKey(context);
+  const exactState = objectKey(safeGet(context, "state"));
+  const brandable = key !== undefined && generation.state !== undefined && exactState === generation.state;
+  const brand: ContextBrand = { generation, active: brandable };
+  if (brandable && key) contextBrands.set(key, brand);
+  const ordinary = generation.outcome;
+  try {
+    const component = renderer(context);
+    if (objectKey(component) && typeof safeGet(component, "render") === "function") return component;
+    generation.outcome = ordinary;
+    return fallback();
+  } catch {
+    generation.outcome = ordinary;
+    return fallback();
+  } finally {
+    brand.active = false;
+    if (brandable && key) contextBrands.delete(key);
+  }
+}
+
+function shellComponent(
+  inner: Component,
+  theme: unknown,
+  generation: Generation,
+  kind: "call" | "result",
+  owner: object,
+  previousCache?: ShellCache,
+): Component {
+  let cache = previousCache;
+  const metadata: WrapperMetadata = { owner, kind, inner, cache };
+  const component: Component = {
+    render(rawWidth: number): string[] {
+      const width = normalizedWidth(rawWidth);
+      if (width === 0) return [];
+
+      if (kind === "call") {
+        generation.callRendered = true;
+        generation.callClaimed = false;
+      }
+      const continuation = kind === "result" && generation.callClaimed;
+      const reusable = cache;
+      const sameFrame = generation.outcome !== "running" && reusable !== undefined && reusable.width === width &&
+        reusable.outcome === generation.outcome && reusable.continuation === continuation &&
+        reusable.registered === generation.resultRegistered && reusable.theme === theme;
+      const lines = visibleLines(inner.render(Math.max(1, width - 2)));
+
+      let claims = lines.length > 0;
+      if (kind === "call" && !claims) {
+        claims = generation.outcome === "running" && !generation.resultRegistered;
+      } else if (kind === "result" && !claims && !continuation) {
+        claims = true;
+      }
+      if (kind === "call") generation.callClaimed = claims;
+
+      if (sameFrame && reusable && reusable.innerLines.length === lines.length &&
+        reusable.innerLines.every((line, index) => line === lines[index])) {
+        return reusable.lines;
+      }
+      const output = continuation
+        ? frameContinuation(lines, width)
+        : claims
+          ? frameOwned(lines, markerFor(theme, generation.outcome), width)
+          : [];
+
+      if (generation.outcome !== "running") {
+        cache = {
+          width,
+          outcome: generation.outcome,
+          continuation,
+          registered: generation.resultRegistered,
+          theme,
+          lines: output,
+          innerLines: lines,
+        };
+        metadata.cache = cache;
+      }
+      return output;
+    },
+  };
+  wrapperMetadata.set(component, metadata);
+  return component;
+}
+
+/** Pi-compatible generic call fallback for renderer-less or failed renderer construction. */
+export function genericCallComponent(toolName: string, theme: unknown): Component {
+  return { render: () => [safeGenericStyle(theme, "toolTitle", toolName, true)] };
+}
+
+/** Pi-compatible generic textual result fallback. */
 export function genericResultComponent(
   result: ResultShape,
   theme: unknown,
@@ -207,13 +447,11 @@ export function genericResultComponent(
       const output = getTextOutput(result, showImages);
       if (!output) return [];
       const lines: string[] = [];
-      for (const seg of output.split("\n")) {
-        // Normalize tabs to 3 spaces to match Pi's Text.render (which replaces
-        // \t with "   " before wrapping), then color THEN wrap —
-        // wrapTextWithAnsi carries the active ANSI across breaks.
-        const tabbed = seg.replace(/\t/g, "   ");
-        for (const l of wrapTextWithAnsi(themedFg(theme, "toolOutput", tabbed), Math.max(1, width))) {
-          lines.push(l);
+      for (const segment of output.split("\n")) {
+        // Match Pi's Text.render order: it normalizes each tab to three spaces before wrapping.
+        const tabbed = segment.replace(/\t/gu, "   ");
+        for (const line of wrapTextWithAnsi(safeGenericStyle(theme, "toolOutput", tabbed), Math.max(1, width))) {
+          lines.push(line);
         }
       }
       return lines;
@@ -221,14 +459,11 @@ export function genericResultComponent(
   };
 }
 
-// --- Pi getTextOutput transform, reproduced (see genericResultComponent) ---
-
-// Reproduced from pi-coding-agent `utils/ansi.js` (derived from strip-ansi, MIT).
-// Kept byte-for-byte so the generic fallback matches Pi's own strip.
+// Pi's renderer utility is exports-blocked, so keep its display-only transform local and contract-tested.
 function ansiRegex(): RegExp {
   const ST = "(?:\\u0007|\\u001B\\u005C|\\u009C)";
   const osc = `(?:\\u001B\\][\\s\\S]*?${ST})`;
-  const csi = "[\\u001B\\u009B][[\\]()#;?]*(?:\\d{1,4}(?:[;:]\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]";
+  const csi = "[\\u001B\\u009B][[\\]\\()#;?]*(?:\\d{1,4}(?:[;:]\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]";
   return new RegExp(`${osc}|${csi}`, "g");
 }
 const ANSI_RE = ansiRegex();
@@ -238,231 +473,69 @@ function stripAnsi(value: string): string {
   return value.replace(ANSI_RE, "");
 }
 
-// Reproduced from pi-coding-agent `utils/shell.js` `sanitizeBinaryOutput`: drop
-// control chars (except \t \n \r) and Unicode format chars that crash width
-// measurement, iterating by code point so surrogate pairs survive.
-function sanitizeBinaryOutput(str: string): string {
-  return Array.from(str)
-    .filter((char) => {
-      const code = char.codePointAt(0);
+function sanitizeBinaryOutput(value: string): string {
+  return Array.from(value)
+    .filter((character) => {
+      const code = character.codePointAt(0);
       if (code === undefined) return false;
       if (code === 0x09 || code === 0x0a || code === 0x0d) return true;
       if (code <= 0x1f) return false;
-      if (code >= 0xfff9 && code <= 0xfffb) return false;
-      return true;
+      // Interlinear annotation controls U+FFF9–U+FFFB break terminal width measurement.
+      return code < 0xfff9 || code > 0xfffb;
     })
     .join("");
 }
 
-/**
- * Mirror of Pi's `render-utils.js` `getTextOutput(result, showImages)`. Exported
- * so the Pi-contract smoke test can pin this reproduction against Pi's own
- * `getTextOutput` (imported via an absolute `file://` URL, the deep path being
- * `exports`-blocked) — a Pi version bump that changes the transform fails loudly.
- */
+/** Mirror of Pi's `getTextOutput(result, showImages)`. */
 export function getTextOutput(result: ResultShape | undefined, showImages: boolean): string {
   if (!result) return "";
-  const content = Array.isArray(result.content) ? (result.content as ContentBlock[]) : [];
-  const textBlocks = content.filter((c) => c && c.type === "text");
-  const imageBlocks = content.filter((c) => c && c.type === "image");
+  const content = Array.isArray(result.content) ? result.content as ContentBlock[] : [];
+  const textBlocks = content.filter((block) => block?.type === "text");
+  const imageBlocks = content.filter((block) => block?.type === "image");
   let output = textBlocks
-    .map((c) => sanitizeBinaryOutput(stripAnsi(String(c.text || ""))).replace(/\r/g, ""))
+    // Remove every CR (including CRLF's CR) so output cannot return the cursor to column zero.
+    .map((block) => sanitizeBinaryOutput(stripAnsi(String(block.text || ""))).replace(/\r/gu, ""))
     .join("\n");
-  const caps = getCapabilities();
-  if (imageBlocks.length > 0 && (!caps.images || !showImages)) {
-    const imageIndicators = imageBlocks
-      .map((img) => {
-        const mimeType = img.mimeType ?? "image/unknown";
-        const dims =
-          img.data && img.mimeType
-            ? (getImageDimensions(img.data, img.mimeType) ?? undefined)
-            : undefined;
-        return imageFallback(mimeType, dims);
+  const capabilities = getCapabilities();
+  if (imageBlocks.length > 0 && (!capabilities.images || !showImages)) {
+    const indicators = imageBlocks
+      .map((image) => {
+        const mimeType = image.mimeType ?? "image/unknown";
+        const dimensions = image.data && image.mimeType
+          ? getImageDimensions(image.data, image.mimeType) ?? undefined
+          : undefined;
+        return imageFallback(mimeType, dimensions);
       })
       .join("\n");
-    output = output ? `${output}\n${imageIndicators}` : imageIndicators;
+    output = output ? `${output}\n${indicators}` : indicators;
   }
   return output;
 }
 
-// --- the wrapper ---
-
-type CallRenderer = (args: Record<string, unknown>, theme: unknown, ctx: RenderCtx) => Component;
-type ResultRenderer = (
-  result: ResultShape,
-  options: Record<string, unknown>,
-  theme: unknown,
-  ctx: RenderCtx,
-) => Component;
-
 /**
- * The component the wrapper returns to Pi. It carries the INNER component under
- * `__inner` so the next render can thread `ctx.lastComponent` back to the inner
- * renderer (see `innerCtxForLastComponent`); it also carries the persistent
- * pi-tui `Box` (`__box`) and its blank-edge adapter (`__adapter`) so the SAME Box
- * survives across frames and its render cache can actually hit (a fresh Box per
- * frame would never match its own cache).
- */
-type WrapperComponent = Component & {
-  __inner?: Component;
-  __box?: Box;
-  __adapter?: BlankEdgeAdapter;
-};
-
-/**
- * The single persistent child of the Box. Box neither strips blank edges nor
- * clamps an over-wide child line, so this adapter does BOTH before Box paints —
- * the framing's step (a) strip + step (b) clamp:
- *   - `inner.render(w)` renders at Box's `contentWidth` (`w = max(1, width-2)`),
- *     the same width the inner saw before;
- *   - leading/trailing blank inner lines are dropped (Pi still prepends its one
- *     plain "" separator in self mode, so we must not add our own);
- *   - each surviving line is clamped to `clampContentWidth(outerWidth)`
- *     (`max(0, width-2)`), NOT to `w` — the two differ at widths 1 and 2, where
- *     content must clamp to 0 so `gutter + content` never overflows the row.
- * `inner` and `outerWidth` are MUTABLE fields updated in place each frame so the
- * adapter object identity — and therefore `Box.children` — never changes (Box's
- * `addChild`/`removeChild` invalidate its cache; a field swap does not).
- *
- * `invalidate()` satisfies pi-tui's `Component` contract (required by
- * `Box.addChild`). Nothing invokes it in this design: the Box is not part of Pi's
- * component tree — our wrapper calls `box.render` directly — so `Box.invalidate`
- * (which would forward to children) never fires here, and tone/theme changes are
- * caught by Box's `bgSample` re-sampling, not by invalidation. It is a
- * type-satisfaction stub that forwards to the inner renderer if it exposes one.
- */
-type BlankEdgeAdapter = Component & {
-  inner: Component;
-  outerWidth: number;
-  invalidate(): void;
-};
-
-function makeBlankEdgeAdapter(inner: Component): BlankEdgeAdapter {
-  return {
-    inner,
-    outerWidth: 0,
-    render(contentWidth: number): string[] {
-      const clampTo = clampContentWidth(this.outerWidth);
-      return stripBlankEdges(this.inner.render(contentWidth)).map((line) =>
-        clampLine(line, clampTo),
-      );
-    },
-    invalidate(): void {
-      (this.inner as { invalidate?: () => void }).invalidate?.();
-    },
-  };
-}
-
-/**
- * Thread `ctx.lastComponent` for the built-ins' incremental renderers.
- *
- * `ToolExecutionComponent` caches the component WE return and hands it back as
- * `ctx.lastComponent` on the next render (`tool-execution.js:226,248`). The
- * built-in renderers reuse THAT for incremental state — `read.js:259,267`
- * (`?? new Text`), `bash.js:335,351` (`?? new BashResultRenderComponent`),
- * `edit.js:66,224,270` (`instanceof Box` reuse). A naive wrap hands the inner
- * renderer OUR wrapper; `edit.js:66`'s `instanceof Box` cast then misfires and
- * silently loses the incremental state (`read` tolerates it via `?? new Text`,
- * `edit` does not). So we stash the inner component on the wrapper (`__inner`)
- * and hand the inner renderer the PREVIOUS INNER component, preserving every
- * other ctx field.
- */
-function innerCtxForLastComponent(ctx: RenderCtx): RenderCtx {
-  const prev = ctx?.lastComponent as WrapperComponent | undefined;
-  return { ...ctx, lastComponent: prev?.__inner };
-}
-
-/**
- * Build the self-shell wrapper component: frame the inner with a real pi-tui
- * `Box(paddingX=GUTTER, paddingY=0, bgFn)` (Pi's own row component, minus the
- * blank padding lines). The Box lays the adapter out at `width - 2*GUTTER`, adds
- * the 1-col gutter (`leftPad`), pads to `width`, and paints every line via `bgFn`
- * — byte-identical to Pi's default Box row (minus the blank padding), and with
- * Box's built-in render cache (an unchanged re-render returns cached lines without
- * re-running the per-line paint).
- *
- * The Box + adapter are REUSED across frames when the previous wrapper is handed
- * back (`prev`, from `ctx.lastComponent`), because Box's cache only helps if the
- * SAME Box instance persists. On reuse we swap `adapter.inner` (a field, so
- * `Box.children` is untouched and the cache is not invalidated) and refresh the
- * `bgFn` via `setBgFn` (its identity changes each frame but its OUTPUT is stable
- * for an unchanged state/theme, so Box's bgSample check still matches). This swap
- * happens at BUILD time, but is safe under Pi's build-then-render lifecycle: only
- * the wrapper we return here is rendered next, so the mutation targets exactly the
- * Box that render will use.
- *
- * `bgFn` routes through the guarded `themedBg`, so it never throws (the render
- * loop is not try/catch-wrapped) and a headless/no-theme run degrades to plain
- * text (bgFn returns its input unpainted).
- */
-function selfShellComponent(
-  inner: Component,
-  theme: unknown,
-  slot: BgSlot,
-  prev: WrapperComponent | undefined,
-): WrapperComponent {
-  const bgFn = (text: string): string => themedBg(theme, slot, text);
-  let box = prev?.__box;
-  let adapter = prev?.__adapter;
-  if (box && adapter) {
-    adapter.inner = inner; // swap child content WITHOUT touching Box.children
-    box.setBgFn(bgFn); // detected via bgSample, not an invalidation
-  } else {
-    adapter = makeBlankEdgeAdapter(inner);
-    box = new Box(GUTTER, 0, bgFn);
-    box.addChild(adapter);
-  }
-  const persistentBox = box;
-  const persistentAdapter = adapter;
-  return {
-    // Stash the inner so the NEXT render can pass it back as ctx.lastComponent
-    // (incremental-render threading — see innerCtxForLastComponent), plus the Box
-    // + adapter so the SAME Box (and its cache) persists across frames.
-    __inner: inner,
-    __box: persistentBox,
-    __adapter: persistentAdapter,
-    render(width: number): string[] {
-      // The adapter needs the OUTER width to clamp content (Box only hands its
-      // child `width - 2*GUTTER`); set it before delegating to Box.render.
-      persistentAdapter.outerWidth = width;
-      return persistentBox.render(width);
-    },
-  };
-}
-
-/**
- * Wrap a tool so its row renders self-shell (no top/bottom padding) with the
- * background re-applied per line. Sets `renderShell:"self"` and installs a
- * renderCall/renderResult that:
- *   - invoke the tool's own renderer when present, else install the generic
- *     fallback without maintaining a separate tool-name inventory;
- *   - thread `ctx.lastComponent` to the PREVIOUS INNER component so the built-ins'
- *     incremental rendering (diffs, streamed output) survives the wrap, and reuse
- *     the previous wrapper's persistent Box so its render cache survives too;
- *   - frame the inner lines with a pi-tui Box at render(width) time (width is
- *     unavailable earlier) with the single-tone slot from ctx.
- * Every other field — `execute`, `name`, `parameters`, … — passes through
- * unchanged; `result.content` is never mutated (the generic renderer reads a
- * local display string only).
+ * Put a tool behind Pi's public self-render shell and add one foreground state glyph to the
+ * invocation's first visible textual line. The wrapper preserves every non-rendering field.
  */
 export function wrapForSelfShell(tool: Record<string, unknown>): Record<string, unknown> {
+  const owner = {};
   const toolName = typeof tool.name === "string" ? tool.name : "";
-  const innerCall =
-    typeof tool.renderCall === "function" ? (tool.renderCall as CallRenderer) : undefined;
-  const innerResult =
-    typeof tool.renderResult === "function" ? (tool.renderResult as ResultRenderer) : undefined;
+  const innerCall = typeof tool.renderCall === "function" ? tool.renderCall as CallRenderer : undefined;
+  const innerResult = typeof tool.renderResult === "function" ? tool.renderResult as ResultRenderer : undefined;
 
   return {
     ...tool,
     renderShell: "self",
     renderCall(args: Record<string, unknown>, theme: unknown, ctx: RenderCtx): Component {
-      const slot = bgSlotForCtx(ctx);
-      const innerCtx = innerCtxForLastComponent(ctx);
-      const inner = innerCall
-        ? innerCall(args, theme, innerCtx)
-        : genericCallComponent(toolName, theme);
-      const prev = ctx?.lastComponent as WrapperComponent | undefined;
-      return selfShellComponent(inner, theme, slot, prev);
+      const generation = callGeneration(ctx, owner);
+      const previous = previousMetadata(ctx, owner, "call");
+      const context = derivedContext(ctx, previous?.inner);
+      const inner = constructInner(
+        innerCall ? (derived) => innerCall(args, theme, derived) : undefined,
+        () => genericCallComponent(toolName, theme),
+        context,
+        generation,
+      );
+      return shellComponent(inner, theme, generation, "call", owner, previous?.cache);
     },
     renderResult(
       result: ResultShape,
@@ -470,13 +543,16 @@ export function wrapForSelfShell(tool: Record<string, unknown>): Record<string, 
       theme: unknown,
       ctx: RenderCtx,
     ): Component {
-      const slot = bgSlotForCtx(ctx);
-      const innerCtx = innerCtxForLastComponent(ctx);
-      const inner = innerResult
-        ? innerResult(result, options, theme, innerCtx)
-        : genericResultComponent(result, theme, innerCtx);
-      const prev = ctx?.lastComponent as WrapperComponent | undefined;
-      return selfShellComponent(inner, theme, slot, prev);
+      const generation = resultGeneration(ctx, owner);
+      const previous = previousMetadata(ctx, owner, "result");
+      const context = derivedContext(ctx, previous?.inner);
+      const inner = constructInner(
+        innerResult ? (derived) => innerResult(result, options, theme, derived) : undefined,
+        () => genericResultComponent(result, theme, context),
+        context,
+        generation,
+      );
+      return shellComponent(inner, theme, generation, "result", owner, previous?.cache);
     },
   };
 }
