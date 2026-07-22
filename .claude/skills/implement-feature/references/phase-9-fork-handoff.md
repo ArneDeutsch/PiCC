@@ -49,8 +49,13 @@ the body until the rules are available** — do not distill a body with the rule
 4. **Present the final summary.** This **replaces** [phase-9-handoff.md](phase-9-handoff.md) step 4's next-steps
    bullets — both the ticketless "open a Pull Request yourself" line **and** the ticket-path "the
    ready-for-review PR is already open" line: on the fork path a ticket run has **no** open PR, so
-   neither of those bullets is true here. Reuse only phase-9-handoff.md step 4's framing (what was
-   implemented, decisions/deviations, test status). Then give the fork next-steps:
+   neither of those bullets is true here. Reuse phase-9-handoff.md step 4's framing (what was
+   implemented, decisions/deviations, test status) **and its cleanup-loss warning**: durable tracking
+   requires either a new issue filed with user approval or an existing issue the user explicitly
+   confirmed as equivalent and the workflow reused under Rule 9. Every finding with neither outcome remains only in
+   the run-local review/observation records and disappears at cleanup; a candidate near-match or search
+   hit alone is not durable. Do not reuse either maintainer-only next-steps bullet. Then give
+   the fork next-steps:
    - The working **compare URL** (from step 3).
    - The PR **title** on its own line, copyable — the stable printable-ASCII `<Title>` from confirmed
      scope (Rule 4), with no identifier prefix.

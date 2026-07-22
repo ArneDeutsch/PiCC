@@ -17,8 +17,9 @@ filing offer uses**: `gh` installed and on PATH, `gh auth status` authenticated,
 `target` repo ([fork.md](fork.md) — `origin`'s repo on a maintainer checkout, the upstream `parent`
 on a fork). If **any** fails, **silently skip the offer** — do not error, do not nudge the user to
 install `gh` or log in, do not mention that an offer was suppressed. The user did not ask for a
-ticket; a missing precondition just means the run stays plain ticketless (the Phase 8 findings offer
-may still surface later if GitHub becomes reachable).
+ticket; a missing precondition just means the run stays plain ticketless. The Phase 8 findings offer
+still presents every eligible finding at close: assessed and fileable when GitHub is reachable,
+otherwise explicitly unassessed and non-fileable.
 
 ## The offer — a preview, its own exchange, before the build "go"
 
@@ -57,8 +58,9 @@ eventual "go" is never read as "yes, file the issue". Present:
 - **Where it writes, plainly**, and that a public artifact appears once filed. On a **fork** name the
   **upstream `target`** explicitly and that it is a repo **the user does not own** — filing puts a
   public issue on someone else's project.
-- **A genuine choice:** no nudge, no default-yes, no re-offer if declined. Declining does **not** cost
-  all tracking — the Phase 8 findings offer still stands at close.
+- **A genuine choice:** no nudge, no default-yes, no re-offer if declined. Declining does **not** suppress
+  close presentation — the Phase 8 findings offer still presents eligible findings at close, with
+  filing available only when GitHub is reachable.
 
 ## Timing — consent now (Phase 1), FILE at Phase 3
 
@@ -155,8 +157,9 @@ resident Aborting qualification in `SKILL.md`, and
 
 ## Decline
 
-One line — "staying ticketless — nothing filed" — then proceed to the build "go". **No re-offer** later
-in the run; the Phase 8 findings offer is the remaining tracking opportunity.
+One line — "staying ticketless — nothing filed" — then proceed to the build "go". **No re-offer** of
+this feature-ticket creation later in the run. Phase 8 still presents eligible findings at close; only
+when its reachability preconditions succeed does that presentation include a filing/tracking opportunity.
 
 ## Rule 5
 

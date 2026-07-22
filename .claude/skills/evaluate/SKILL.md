@@ -24,7 +24,9 @@ rate, and drive a confidence-gated close-or-keep-open) and
 verification evidence, then post an **advisory** assessment comment; **never merges**) and
 [references/proposal-gate.md](references/proposal-gate.md) (the proposal-gate mode — score a would-be,
 not-yet-filed issue against the rubric with **structurally zero GitHub writes**; agent-invoked by
-`implement-feature` to gate Phase 8 findings and annotate the Phase 1 converged feature).
+`implement-feature` to gate Phase 8 findings only after successful reachability and annotate the Phase
+1 converged feature. On reachability failure, defer to implement-feature's offline branch, which skips
+proposal scoring/slop dropping and presents every eligible still-actionable finding unassessed).
 
 ## The three modes
 
@@ -39,9 +41,11 @@ not-yet-filed issue against the rubric with **structurally zero GitHub writes**;
   **runs as the read-only `evaluator` sandbox agent**, which physically cannot write, so there is no
   close, no comment, and no `<N>`/target to write to: it **grounds its score in project evidence**
   (investigating the repo before rating), scores against the rubric, and returns a bounded assessment
-  carrying evidence anchors. Used by `implement-feature` in two ways — it **gates** Phase 8 machine-surfaced
-  findings (clear slop dropped with a one-line tally that says the dropped findings remain in
-  `review.md`, the rest surfaced with the assessment embedded and per-item choice preserved) but only
+  carrying evidence anchors. Used by `implement-feature` in two ways — only after successful reachability,
+  it **gates** Phase 8 machine-surfaced findings (clear slop dropped with a one-line tally that says the
+  dropped findings remain in `review.md`, the rest surfaced with the assessment embedded and per-item
+  choice preserved); on reachability failure, defer to implement-feature's offline branch, which skips
+  proposal scoring/slop dropping and presents every eligible still-actionable finding unassessed. It only
   **annotates** the Phase 1 human-converged feature (it never suppresses the user's own offer).
 - **pr-eval** — given a pull request: assess the diff, whether it fulfils its ticket *and* whether the
   ticket was worth doing, and the verification evidence; post an **advisory** assessment comment (full

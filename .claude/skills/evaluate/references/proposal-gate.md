@@ -56,16 +56,16 @@ performs all `gh` I/O, so its search is a **new instance of an existing role, ne
 class** — never call the skill as a whole "zero-network". As `evaluation-engine.md` §"The
 evidence-anchor contract" spells out, these grounding records are on-disk working-tree records for the
 current run (`doc/plan/` is gitignored run scratch, not durable committed history); durable
-cross-feature tracking lives in GitHub Issues, which this filesystem-only evaluator does not query.
-That cross-feature tracking signal, when it is available, is the **coordinator's** to supply from its
-own read-only GitHub issue search — entering the gate as a `github_verified` provenance anchor (per
-`evaluation-engine.md`'s element-3 enum), never through the evaluator; see "The advisory cross-feature
+cross-feature tracking requires either a newly filed user-approved GitHub issue or an existing issue
+the user explicitly confirms as equivalent and the workflow reuses under Rule 9. This filesystem-only evaluator
+does not query GitHub. A coordinator-supplied candidate near-match or search hit is only an advisory
+`github_verified` provenance anchor, never durable tracking by itself; see "The advisory cross-feature
 issue search" below.
 
 ## The advisory cross-feature issue search — coordinator-run, read-only
 
-The evaluator is filesystem-only and cannot see GitHub Issues, so the durable "already-tracked?"
-signal (#66) is supplied by the **invoking coordinator** — the `evaluate` skill in proposal mode, or
+The evaluator is filesystem-only and cannot see GitHub Issues, so an advisory candidate
+"already-tracked?" signal (#66) is supplied by the **invoking coordinator** — the `evaluate` skill in proposal mode, or
 `implement-feature` at its **Phase 8** finding-filing offer — which already holds `gh`/Bash. It is
 **never** run by the sandbox and is **not part of the evaluator's grounding**; it enters the gate as a
 distinct, coordinator-supplied input, typed as a `github_verified` anchor. This is confined to the
@@ -132,7 +132,8 @@ here). The no-hit direction is symmetric: a missing hit is **not** a novelty sig
 tracked signal (no hit ≠ novel, no hit ≠ tracked); it never flips the score toward drop or write.
 keep-open-under-uncertainty governs both directions.
 
-**Advisory + visible degrade.** The search is strictly advisory and a pure read. If `gh` is
+**Advisory + visible degrade.** This degrade applies only to an invoker that has actually entered
+proposal-gate. For such an invocation, the search is strictly advisory and a pure read. If `gh` is
 absent / unauthenticated / rate-limited / errors / times out, the gate **proceeds without a
 `github_verified` anchor** — but the degrade is **visible**, never silent: mark the novelty read as
 not-cross-checked ("existing-issue check unavailable — novelty not cross-checked against GitHub").
@@ -140,6 +141,8 @@ not-cross-checked ("existing-issue check unavailable — novelty not cross-check
 unauthenticated, so *no* finding can be cross-checked — emit that notice **once for the batch**, not
 once per finding; repeat it **per-finding only for a per-call failure** (a rate-limit or timeout on a
 specific search). A missing anchor never lowers novelty and never suppresses a finding.
+`implement-feature` Phase 8 does not enter proposal-gate after a failed reachability precondition; it
+uses its terminating offline branch instead.
 
 ## Bounded structured return — the evaluator returns fields, the coordinator composes
 
@@ -254,16 +257,22 @@ one of:
 proposal-gate is called from two `implement-feature` reference files, with **different force**:
 
 - **Phase 8 issue-filing offer** —
-  [phase-8-file-finding.md](../../implement-feature/references/phase-8-file-finding.md). It **gates**
-  the machine-surfaced findings: **clear slop is dropped**, but with a
-  **one-line tally that also says the dropped findings remain in `review.md`** so nothing is lost (e.g.
-  "(N low-value findings not offered — they remain in review.md)"). The tally is an **in-flow lever, not
-  just a pointer**: a maintainer who disagrees with the gate can **ask to see the gate-dropped
-  findings**, and the coordinator **surfaces them into the pick-list on request** (they stay in
-  `review.md` as the durable record either way). Borderline-and-above findings are **surfaced with the
-  assessment embedded** and the existing **per-item user choice preserved** — the gate only ever
-  **subtracts clear slop, never adds**, and never hard-drops a borderline finding the user might still
-  want.
+  [phase-8-file-finding.md](../../implement-feature/references/phase-8-file-finding.md). When every
+  reachability precondition succeeds, it **gates** the machine-surfaced findings: **clear slop is
+  dropped**, but with a **one-line tally that says dropped findings remain in `review.md` only as
+  run-local staging lost with worktree cleanup and that no durable issue was filed** (e.g. "(N
+  low-value findings not offered — they remain in review.md as run-local staging until worktree
+  cleanup; no durable issue was filed.)"). The tally is an **in-flow lever, not just a pointer**: a
+  maintainer who disagrees with the gate can **ask to see the gate-dropped findings**, and the
+  coordinator **surfaces them into the pick-list on request** while the run remains active. Durable
+  cross-feature tracking requires either a newly filed user-approved GitHub issue or an existing issue
+  the user explicitly confirms as equivalent and the workflow reuses under Rule 9; a candidate near-match alone does
+  not qualify. Borderline-and-above findings
+  are **surfaced with the assessment embedded** and the existing **per-item user choice preserved** —
+  the gate only ever **subtracts clear slop, never adds**, and never hard-drops a borderline finding
+  the user might still want. If any reachability precondition fails, do not invoke proposal-gate;
+  defer to implement-feature's branch that presents every eligible still-actionable finding
+  **UNASSESSED** instead.
 - **Phase 1 ticket-creation offer** —
   [ticket-creation.md](../../implement-feature/references/ticket-creation.md). proposal-gate **only
   annotates**: it rates whether the human's just-converged scope looks valuable and the assessment is

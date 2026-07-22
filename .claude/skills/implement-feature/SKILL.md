@@ -26,8 +26,9 @@ This router is the always-loaded trunk; each phase skeleton names the `reference
 - **Late decisions.** Decide in the plan only what tasks need to compose (seams, interfaces, ordering); leave the rest to the implementer as explicit left-open items.
 - **No status bookkeeping.** State = the git log + the on-disk plan folder. **Classify resume before new naming**, and on classifying a resume you MUST read `references/resume-and-aborting.md` before the confirmation gate — if it cannot be read, stop. Validate the frozen title against the on-disk `feature.md` heading (exact agreement) and show it verbatim at explicit human confirmation of scope/phase/identity/ticket/writes and fresh anchor/issue-host agreement. **Anchor reader:** before create-offer, read `feature.md`'s `Ticket:` — blank/placeholder → offer; valid sanitized ref → ticket path, re-resolve identities/cache (`references/ticket-creation.md`).
 - **Structural escalation boundary.** A gap inside the current task's own spec → adapt and continue; anything touching another task's contract, feature scope, or the WHAT/WHY → stop and ask.
-- **Observe while you build.** Capture friction, planning errors, and latent bugs as they appear (implementers in task logs, you in `observations.md`); surface major ones at once; distill into `review.md` at close.
+- **Observe while you build.** Capture friction, planning errors, and latent bugs as they appear (implementers in task logs, you in `observations.md`); surface immediately when a current direction, blocker, or safety decision is required, otherwise preserve findings for the phase's close presentation; distill into `review.md` at close.
 - **Verify claims.** When reports conflict or a claim is load-bearing, read the code yourself first.
+- **Proportional review triage.** Reviewer severity is evidence, not authorization: you verify and classify findings before expanding current-feature work, then apply [references/review-triage.md](references/review-triage.md). Explicit acceptance and verified correctness, security, compatibility, cross-platform, and truthfulness obligations cannot be waived as disproportionate.
 - **Portable surface only.** This skill also runs under PiCC (GPT models): plain-prose questions, standard dispatch, EnterWorktree/ExitWorktree isolation.
 
 ## Subagent roster
@@ -54,7 +55,7 @@ Two more do the non-specialist work. Both are **non-dispatching** — no roster 
 
 ## Phase 0 — GitHub reachability gate
 
-A ticket ref engages the ticket-linked hooks — all defer to this gate and `references/ticket-integration.md`; ticketless runs plain except the two `gh issue create` offers above (Phase 8's runs on either path, GitHub reachable). **When a git remote exists, first resolve target vs. push repo per `references/fork.md`.**
+A ticket ref engages the ticket-linked hooks — all defer to this gate and `references/ticket-integration.md`; ticketless runs plain except the two `gh issue create` offers above. Phase 8 always presents eligible findings: assessed and fileable when GitHub is reachable, unassessed and non-fileable when it is not. **When a git remote exists, first resolve target vs. push repo per `references/fork.md`.**
 
 Run the gate **as Phase 0 — at ref-parse time, before Phase 1 uses the reads and before any worktree is created.** With a ticket ref, verify each and **STOP** (no worktree, no write) on the first failure:
 
@@ -110,15 +111,15 @@ Entry: the technical picture stands. Split into implementer-sized tasks, write e
 
 ## Phase 6 — Plan review & approval
 
-Entry: all task specs written. Fan reviewers over the whole plan folder in parallel (relevant specialists, an adversarial `generalist`, a `user-experience` walkthrough); integrate, fix what's clearly right, escalate WHAT/WHY changes or major HOW tradeoffs, iterate to mutual acceptance. Phase 6 ends **uncommitted**. You MUST read `references/phase-6-plan-review.md` before dispatching the review fan-out.
+Entry: all task specs written. You MUST read `references/phase-6-plan-review.md`, then read or re-read `references/review-triage.md`; if either is unreadable, refuse both review-driven writes and scope expansion and stop before review dispatch or triage. Fan reviewers over the whole plan folder in parallel (relevant specialists, an adversarial `generalist`, a `user-experience` walkthrough); integrate through the canonical gate, escalate WHAT/WHY changes or major HOW tradeoffs, and iterate to mutual acceptance. Phase 6 ends **uncommitted**.
 
 ## Phase 7 — Implementation loop
 
-Entry: plan accepted. For each task, in planned order: **dispatch** a fresh `implementer` with feature.md + task spec + the standing rules; apply the escalation boundary; run the **review fan-out** yourself; **triage and fix**; **distill** into `observations.md`; then **gate on green and commit** `<feature-slug>: t<task-number> — <description>` — never a blank `git add -A`; before every commit re-check the staged set for scope and the working tree for freshness (`git status --short`). The standing rules, fan-out staging, and the full loop: `references/phase-7-implementation.md` — you MUST read it before dispatching.
+Entry: plan accepted. You MUST read `references/phase-7-implementation.md`, then read or re-read `references/review-triage.md`; if either is unreadable, refuse both review-driven writes and scope expansion and stop before review dispatch or triage. For each task, in planned order: **dispatch** a fresh `implementer` with feature.md + task spec + the standing rules; apply the escalation boundary; run the **review fan-out** yourself; **triage and fix** through the canonical gate; **distill** into `observations.md`; then **gate on green and commit** `<feature-slug>: t<task-number> — <description>` — never a blank `git add -A`; before every commit re-check the staged set for scope and the working tree for freshness (`git status --short`). The phase reference owns the standing rules, fan-out staging, and full loop.
 
 ## Phase 8 — Feature close review
 
-Entry: all tasks complete and all retained tracked outputs committed. Review the whole feature against feature.md (relevant roster over the feature diff + adversarial `generalist`); fix small things, spec real gaps as new tasks through Phase 7; write `review.md` to disk, **uncommitted**. You MUST read `references/phase-8-close-review.md` on entry; the either-path issue-filing offer is `references/phase-8-file-finding.md`, and the ticket-only close-vs-keep-open judgement is `references/phase-8-ticket-close.md` (ticket path only — the ticketless close never loads it). Read `references/ticket-integration.md` (the nine-rules floor) before any hook write; refuse if it cannot be read.
+Entry: all tasks complete and all retained tracked outputs committed. You MUST read `references/phase-8-close-review.md`, then read or re-read `references/review-triage.md`; if either is unreadable, refuse both review-driven writes and scope expansion and stop before review dispatch or triage. Review the whole feature against feature.md (relevant roster over the feature diff + adversarial `generalist`); apply the canonical gate before close fixes, removals, or new tasks; write `review.md` to disk, **uncommitted**. The either-path issue-filing offer is `references/phase-8-file-finding.md`, and the ticket-only close-vs-keep-open judgement is `references/phase-8-ticket-close.md` (ticket path only — the ticketless close never loads it). Read `references/ticket-integration.md` (the nine-rules floor) before any hook write; refuse if it cannot be read.
 
 ## Phase 9 — Integrate, push, hand off
 

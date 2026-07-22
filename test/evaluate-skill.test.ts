@@ -15,6 +15,8 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SKILLS_DIR = path.join(ROOT, ".claude", "skills");
 const SKILL_DIR = path.join(SKILLS_DIR, "evaluate");
 const REFERENCES_DIR = path.join(SKILL_DIR, "references");
+const IMPLEMENT_SKILL_DIR = path.join(SKILLS_DIR, "implement-feature");
+const IMPLEMENT_REFERENCES_DIR = path.join(IMPLEMENT_SKILL_DIR, "references");
 const AGENTS_DIR = path.join(ROOT, ".claude", "agents");
 const SETTINGS_PATH = path.join(ROOT, ".claude", "settings.json");
 
@@ -259,6 +261,26 @@ describe("proposal-gate mode floor markers", () => {
     const routerBody = loadSkillBody(skill!).toLowerCase().replace(/\s+/g, " ");
     expect(routerBody).toContain("no github writes");
     expect(routerBody).toContain("read-only `evaluator` sandbox agent");
+  });
+
+  it("qualifies both resident Phase 8 descriptions as online-only and defers offline handling", () => {
+    const { skills } = loadSkills([{ dir: SKILLS_DIR, scope: "project" }], []);
+    const skill = skills.find((s) => s.name === "evaluate");
+    const routerBody = loadSkillBody(skill!).toLowerCase().replace(/\s+/g, " ");
+    const intro = routerBody.slice(0, routerBody.indexOf("## the three modes"));
+    const modeStart = routerBody.indexOf("- **proposal-gate**");
+    const modeEnd = routerBody.indexOf("- **pr-eval**", modeStart);
+    expect(modeStart).toBeGreaterThanOrEqual(0);
+    expect(modeEnd).toBeGreaterThan(modeStart);
+    const mode = routerBody.slice(modeStart, modeEnd);
+
+    for (const description of [intro, mode]) {
+      expect(description).toContain("only after successful reachability");
+      expect(description).toContain("on reachability failure");
+      expect(description).toContain("defer to implement-feature's offline branch");
+      expect(description).toContain("skips proposal scoring/slop dropping");
+      expect(description).toContain("presents every eligible still-actionable finding unassessed");
+    }
   });
 });
 
@@ -1495,16 +1517,45 @@ describe("advisory coordinator gh issue search -> github_verified anchor", () =>
     expect(body).toContain("keep-open-under-uncertainty governs both directions");
   });
 
-  it("proposal-gate makes the unavailable-search degrade VISIBLE, never silent", () => {
+  it("does not treat an advisory candidate hit as durable tracking", () => {
     const body = collapse(PROPOSAL_GATE_PATH);
+    const grounding = body.slice(
+      body.indexOf("grounding records are on-disk working-tree records"),
+      body.indexOf("## the advisory cross-feature issue search"),
+    );
+    expect(grounding).toMatch(/durable cross-feature tracking requires either a newly filed user-approved github issue or an existing issue the user explicitly confirms as equivalent and the workflow reuses under rule 9/);
+    expect(grounding).not.toMatch(/durable cross-feature tracking (?:does not|never) require/);
+    expect(grounding).toContain("candidate near-match or search hit");
+    expect(grounding).toContain("never durable tracking by itself");
+
+    const wiring = body.slice(body.indexOf("- **phase 8 issue-filing offer**"));
+    expect(wiring).toContain("candidate near-match alone does not qualify");
+  });
+
+  it("proposal-gate visibly degrades unavailable search only after an invoker enters the gate", () => {
+    const body = collapse(PROPOSAL_GATE_PATH);
+    expect(body).toContain("applies only to an invoker that has actually entered proposal-gate");
+    expect(body).toContain("for such an invocation");
     expect(body).toContain("proceeds without a");
     expect(body).toContain("the degrade is **visible**, never silent");
     expect(body).toContain("novelty not cross-checked against github");
-    // A global cause (gh absent/unauthenticated) degrades ONCE per batch; only a per-call failure
-    // (rate-limit/timeout) repeats the notice per finding.
+    // Once proposal-gate is invoked, a global cause degrades once per batch; only a per-call
+    // failure repeats the notice per finding. This generic mode coverage intentionally remains.
     expect(body).toContain("degrade once per batch when the cause is global");
     expect(body).toContain("once for the batch");
     expect(body).toContain("per-finding only for a per-call failure");
+  });
+
+  it("pins implement-feature's resident/reference wiring outside the invoked-gate degrade", () => {
+    const implementRouter = collapse(path.join(IMPLEMENT_SKILL_DIR, "SKILL.md"));
+    const offlineReference = collapse(path.join(IMPLEMENT_REFERENCES_DIR, "phase-8-file-finding.md"));
+    const gate = collapse(PROPOSAL_GATE_PATH);
+
+    expect(implementRouter).toContain("unassessed and non-fileable when it is not");
+    expect(offlineReference).toContain("do not invoke the proposal gate");
+    expect(offlineReference).toContain("**stop this branch here.**");
+    expect(gate).toContain("`implement-feature` phase 8 does not enter proposal-gate after a failed reachability precondition");
+    expect(gate).toContain("uses its terminating offline branch instead");
   });
 
   it("proposal-gate re-scopes 'no new gh for grounding' while keeping the envelope-unchanged half true", () => {
@@ -1632,10 +1683,10 @@ describe("close-review coherence fixes (evaluate-scoring-contract)", () => {
     expect(body).toContain("fixed per-item line order in the pick-list");
   });
 
-  it("close-review residual — the degrade's two cardinalities have one decide-once placement", () => {
-    // The (4c) per-item slot carries ONLY the per-call failure; the global degrade renders once as
-    // a batch-level banner above the pick-list and is NOT stamped into each finding's slot. Both the
-    // proposal-gate per-item passage and the engine skeleton must say this consistently, so the
+  it("invoked proposal-gate keeps the degrade's two cardinalities in one decide-once placement", () => {
+    // Once an invoker enters proposal-gate, the (4c) per-item slot carries ONLY the per-call failure;
+    // the global degrade renders once as a batch-level banner above the pick-list and is NOT stamped
+    // into each finding's slot. Both the proposal-gate passage and engine skeleton must agree, so the
     // "once for the batch" rule and the "a rider always occupies its slot" rule no longer conflict.
     const gate = collapse(PROPOSAL_GATE_PATH);
     // The (4c) slot is the per-call rider only.

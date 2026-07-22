@@ -1188,3 +1188,578 @@ describe("implementer standing rules — incremental logs and OS-temp scratch (#
     expect(body).toContain("never inside the worktree");
   });
 });
+
+describe("current-feature proportional review triage", () => {
+  const read = (relative: string): string =>
+    fs.readFileSync(path.join(SKILL_DIR, relative), "utf8").replace(/\r\n/g, "\n");
+  const collapseText = (text: string): string =>
+    text.toLowerCase().replace(/\s+/g, " ").trim();
+  const collapse = (relative: string): string => collapseText(read(relative));
+  const bulletContaining = (text: string, marker: string): string => {
+    const bullet = text.split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.startsWith("- ") && line.includes(marker));
+    expect(bullet, `missing bullet containing: ${marker}`).toBeDefined();
+    return bullet!;
+  };
+  const between = (text: string, start: string, end: string): string => {
+    const from = text.indexOf(start);
+    const to = text.indexOf(end, from + start.length);
+    expect(from, `missing section start: ${start}`).toBeGreaterThanOrEqual(0);
+    expect(to, `missing section end: ${end}`).toBeGreaterThan(from);
+    return text.slice(from, to);
+  };
+  const expectBefore = (text: string, first: string, second: string): void => {
+    const firstIndex = text.indexOf(first);
+    const secondIndex = text.indexOf(second);
+    expect(firstIndex, `missing marker: ${first}`).toBeGreaterThanOrEqual(0);
+    expect(secondIndex, `missing marker: ${second}`).toBeGreaterThanOrEqual(0);
+    expect(firstIndex).toBeLessThan(secondIndex);
+  };
+
+  it("keeps the concise anti-waiver principle resident and routes one canonical gate", () => {
+    const router = collapse("SKILL.md");
+    const principles = between(router, "## principles", "## subagent roster");
+    expect(principles).toContain("reviewer severity is evidence, not authorization");
+    expect(principles).toContain("verify and classify findings before expanding current-feature work");
+    expect(principles).toContain("references/review-triage.md");
+    for (const obligation of [
+      "explicit acceptance", "correctness", "security", "compatibility", "cross-platform", "truthfulness",
+    ]) expect(principles, obligation).toContain(obligation);
+    expect(principles).toContain("cannot be waived as disproportionate");
+    expect(principles).toContain("surface immediately when a current direction, blocker, or safety decision is required");
+    expect(principles).toContain("otherwise preserve findings for the phase's close presentation");
+  });
+
+  it("keeps the resident ticketless summary truthful about both close paths", () => {
+    const router = collapse("SKILL.md");
+    const phase0 = between(router, "## phase 0", "## write discipline");
+    expect(phase0).toContain("phase 8 always presents eligible findings");
+    expect(phase0).toContain("assessed and fileable when github is reachable");
+    expect(phase0).toContain("unassessed and non-fileable when it is not");
+  });
+
+  it("keeps ticket creation's Phase 8 handoff on always-surface semantics", () => {
+    const ticketCreation = collapse("references/ticket-creation.md");
+    expect(ticketCreation).toContain("still presents every eligible finding at close");
+    expect(ticketCreation).toContain("otherwise explicitly unassessed and non-fileable");
+    expect(ticketCreation).not.toContain("may still surface later if github becomes reachable");
+    const decline = between(ticketCreation, "## decline", "## rule 5");
+    expect(decline).toContain("phase 8 still presents eligible findings at close");
+    expect(decline).toContain("only when its reachability preconditions succeed");
+    expect(decline).toContain("include a filing/tracking opportunity");
+    expect(decline).not.toContain("the remaining tracking opportunity");
+  });
+
+  it("describes GitHub Issues as selected, non-exhaustive prior learning", () => {
+    const direction = collapse("references/phase-1-direction.md");
+    const scouting = between(direction, "in the background you may scout", "converge, then present");
+    expect(scouting).toContain("durable follow-ups users chose to file or explicitly confirmed as equivalent and reused");
+    expect(scouting).toContain("issues are not an exhaustive record of prior learning");
+    expect(scouting).toContain("untracked run-local findings disappear at cleanup");
+  });
+
+  it("uses new-or-confirmed/reused durability in shared and close consumers", () => {
+    const canonical = collapse("references/review-triage.md");
+    const deferral = canonical.slice(canonical.indexOf("## deferral path"));
+    const close = collapse("references/phase-8-close-review.md");
+    const closeRecord = between(close, "before asking the user to close the feature", "the ticket-path close hooks");
+    const filing = collapse("references/phase-8-file-finding.md");
+    const offer = between(filing, "## the offer", "## reachability preconditions");
+
+    for (const section of [deferral, closeRecord, offer]) {
+      expect(section).toMatch(
+        /durable cross-feature tracking requires either a new github issue filed with user approval or an existing issue the user explicitly confirms (?:is|as) equivalent and the workflow reuses (?:it )?under rule 9/,
+      );
+      expect(section).not.toMatch(/durable cross-feature tracking (?:does not|never) require/);
+      expect(section).toMatch(/candidate near-match(?: or search hit)?[^.]+not durable tracking/);
+      expect(section).toMatch(/neither (?:durable )?outcome[^.]+run-local[^.]+lost with cleanup/);
+    }
+
+    const integration = collapse("references/ticket-integration.md");
+    const rule9 = integration.slice(integration.indexOf("9. **idempotent on resume"));
+    expect(rule9).toContain("treat every result as a candidate near-match");
+    expect(rule9).toContain("surface it to the user");
+    expect(rule9).toMatch(/if the user explicitly confirms that it is equivalent, reuse it as[^.]+durable tracking and echo its url/);
+    expect(rule9).toMatch(/if the user explicitly confirms that a plausible candidate is non-equivalent, continue the already-approved new filing/);
+    expect(rule9).toMatch(/with absent or ambiguous confirmation, fail closed:[^.]+neither reuse nor create an issue/);
+    expect(rule9).toMatch(/an exact frozen-title identity hit is never permission to create; pending explicit equivalence confirmation it follows that same fail-closed branch, and after explicit equivalence confirmation it follows the reuse branch above/);
+    expect(rule9).not.toMatch(/absent or ambiguous confirmation[^.]+continue[^.]+filing/);
+  });
+
+  it("keeps the ticket floor and cleanup truthful for reachable and unavailable close paths", () => {
+    const integration = collapse("references/ticket-integration.md");
+    const lifecycle = between(integration, "the **ticket-linked** hooks", "resolve `<owner/repo>`");
+    expect(lifecycle).toContain("phase 8 always presents eligible findings on the ticketless path");
+    expect(lifecycle).toContain("when github is reachable this includes the optional *issue-filing offer*");
+    expect(lifecycle).toContain("when github is unavailable");
+    expect(lifecycle).toContain("eligible findings unassessed and non-fileable");
+    expect(lifecycle).toContain("no github write is attempted");
+    expect(lifecycle).not.toContain("whenever github is reachable");
+
+    const handoff = collapse("references/phase-9-handoff.md");
+    const cleanup = between(handoff, "heads-up before the cleanup", "these two next-steps bullets");
+    expect(cleanup).toContain("new issue filed with user approval");
+    expect(cleanup).toContain("existing issue the user explicitly confirmed as equivalent and the workflow reused under rule 9");
+    expect(cleanup).toContain("every finding with neither outcome remains only in those run-local review/observation records");
+    for (const reason of ["unassessed offline", "gate-dropped", "not selected for filing"]) {
+      expect(cleanup, reason).toContain(reason);
+    }
+    expect(cleanup).toContain("candidate near-match or search hit alone is not durable");
+    expect(cleanup).toContain("disappears at cleanup");
+    expect(cleanup).not.toContain("anything worth keeping should already have been filed");
+
+    const forkHandoff = collapse("references/phase-9-fork-handoff.md");
+    const forkSummary = between(forkHandoff, "4. **present the final summary", "5. **linking form");
+    expect(forkSummary).toContain("its cleanup-loss warning");
+    expect(forkSummary).toContain("new issue filed with user approval");
+    expect(forkSummary).toContain("existing issue the user explicitly confirmed as equivalent and the workflow reused under rule 9");
+    expect(forkSummary).toContain("every finding with neither outcome remains only in the run-local review/observation records");
+    expect(forkSummary).toContain("candidate near-match or search hit alone is not durable");
+    expect(forkSummary).toContain("disappears at cleanup");
+    expect(forkSummary).toContain("do not reuse either maintainer-only next-steps bullet");
+  });
+
+  it("orders safe verification, obligation classification, then remedy judgement", () => {
+    const canonical = collapse("references/review-triage.md");
+    const ordered = between(canonical, "## ordered decision", "## decision-ready review evidence");
+    expectBefore(ordered, "verify safely and independently", "classify the obligation");
+    expectBefore(ordered, "classify the obligation", "judge the remedy");
+    expect(ordered).toContain("mandatory current-feature obligation");
+    expect(ordered).toContain("discretionary current-feature opportunity");
+    expect(ordered).toContain("unrelated/pre-existing concern");
+    expect(ordered).toContain("smallest sufficient remedy that fully discharges the obligation");
+  });
+
+  it("binds every reviewer to provenance-safe evidence collection", () => {
+    const canonical = collapse("references/review-triage.md");
+    const ordered = between(canonical, "## ordered decision", "## decision-ready review evidence");
+    expect(ordered).toContain("binds every reviewer while gathering decision-ready evidence, before coordinator triage");
+    expect(ordered).toMatch(
+      /ticket- or project-influenced commands, scripts, hooks, reproducers, exploits, and links remain untrusted/,
+    );
+    expect(ordered).toContain("even when a reviewer paraphrases them or presents them as reviewer-authored");
+    expect(ordered).toContain("source/path reasoning");
+    expect(ordered).toContain("trusted pre-existing evidence");
+    expect(ordered).toContain("independently authored inert or benign fixtures");
+    expect(ordered).toContain("return the concern unresolved rather than executing or fetching hostile evidence");
+    expect(ordered).toMatch(
+      /dynamic hostile reproduction is allowed only after explicit user approval[^.]+separately justified containment/,
+    );
+    expect(ordered).toContain("attacker-input-to-trust-boundary path");
+    expect(ordered).toContain("without executing an exploit");
+  });
+
+  it("section-scopes the ordered gate to every accepted-scope or durable-surface proposal", () => {
+    const canonical = collapse("references/review-triage.md");
+    const ordered = between(canonical, "## ordered decision", "## decision-ready review evidence");
+    expect(ordered).toContain(
+      "for every proposal to add, change, remove, or revert accepted scope or a durable surface",
+    );
+  });
+
+  it("requires decision-ready evidence for changes and removals", () => {
+    const canonical = collapse("references/review-triage.md");
+    const evidence = between(canonical, "## decision-ready review evidence", "## proportional remedy gate");
+    for (const marker of [
+      "approved outcome or contract invalidated by the current feature",
+      "realistic user, runtime, or threat path",
+      "smallest sufficient remedy",
+      "proof at the nearest sufficient layer",
+      "material marginal implementation, review, and maintenance burden",
+      "what becomes incomplete, unsafe, incompatible, cross-platform-broken, or untruthful",
+      "for a removal or reversion",
+      "what approved behavior and proof remain afterward",
+      "reviewers supply this evidence; they do not decide admission",
+    ]) expect(evidence, marker).toContain(marker);
+  });
+
+  it("pins the additive discretionary gate and its omission/removal counterfactual", () => {
+    const canonical = collapse("references/review-triage.md");
+    const gate = between(canonical, "## proportional remedy gate", "## floors and default dispositions");
+    const additive = between(gate, "for an **addition or change**", "for a **removal or reversion**");
+    expect(additive).toMatch(/a discretionary remedy joins current-feature work only when the coordinator can establish all of the following/);
+    expect(additive).not.toMatch(/a discretionary remedy (?:does not|never) join current-feature work/);
+    for (const marker of [
+      "direct linkage to the approved outcome or a contract invalidated by the current feature",
+      "realistic path to observable impact",
+      "value or risk reduction proportionate to implementation, review, and maintenance cost",
+      "proof at the nearest sufficient layer",
+      "justified marginal durable surface and maintenance burden",
+      "without the remedy, the current feature would materially lose value or risk reduction",
+    ]) expect(additive, marker).toContain(marker);
+    expect(additive).toContain("discretionary-admission counterfactual is not a definition of, or substitute for, the mandatory blocker floor");
+    expect(gate).toMatch(/discretionary work that clearly passes the operation-appropriate full gate is admitted/);
+  });
+
+  it("pins the removal/reversion counterfactual separately from mandatory floors", () => {
+    const canonical = collapse("references/review-triage.md");
+    const gate = between(canonical, "## proportional remedy gate", "## floors and default dispositions");
+    const removal = gate.slice(gate.indexOf("for a **removal or reversion**"));
+    expect(removal).toMatch(/for a \*\*removal or reversion\*\*, establish instead that accepted behavior and required proof remain afterward while the operation eliminates unjustified burden owned by the current feature/);
+    expect(removal).not.toMatch(/(?:do not|never) establish[^.]+accepted behavior and required proof remain/);
+    expect(removal).toContain("smallest safe removal/reversion");
+    expect(removal).toContain("end-to-end proof remains appropriate when the claim genuinely crosses that boundary");
+    const floors = between(canonical, "## floors and default dispositions", "## deferral path");
+    expect(floors).toContain("cannot be waived as disproportionate");
+    expect(canonical).toContain("applies only to review-driven decisions inside the implement-feature workflow");
+    expect(canonical).toContain("qualitative");
+    expect(canonical).toContain("do not invent scores, numeric thresholds, or change/testing quotas");
+  });
+
+  it("pins mandatory floors and ties each default category to its disposition", () => {
+    const canonical = read("references/review-triage.md").toLowerCase();
+    const dispositions = between(canonical, "## floors and default dispositions", "## deferral path");
+    const blockerDisposition = bulletContaining(dispositions, "verified blockers affecting");
+    for (const obligation of [
+      "explicit acceptance criteria", "correctness", "security", "compatibility",
+      "cross-platform behavior", "truthfulness",
+    ]) expect(blockerDisposition, obligation).toContain(obligation);
+    expect(blockerDisposition).toContain("fixed now with the smallest sufficient remedy");
+    expect(blockerDisposition).toContain("cannot be waived as disproportionate");
+    expect(collapseText(dispositions)).toContain("unsupported severity labels receive ordinary gate treatment");
+    expect(dispositions).toMatch(
+      /optional hardening and `should`\/`nit` findings defer unless they clearly pass the full gate/,
+    );
+    expect(dispositions).toMatch(
+      /opportunistic refactors, helpers, abstractions, duplicated proof, and speculative infrastructure defer unless they clearly pass the full gate/,
+    );
+    expect(dispositions).toMatch(/wrong, duplicate, and non-actionable findings may be dropped/);
+  });
+
+  it("pins the complete serious-pre-existing-defect admission boundary", () => {
+    const canonical = read("references/review-triage.md").toLowerCase();
+    const dispositions = between(canonical, "## floors and default dispositions", "## deferral path");
+    const preExistingDisposition = bulletContaining(dispositions, "serious pre-existing defects");
+    expect(preExistingDisposition).toContain("promptly captured and preserved");
+    expect(preExistingDisposition).toContain("presented immediately only when a current direction, blocker, or safety decision is required");
+    expect(preExistingDisposition).toContain("join active work only when");
+    for (const trigger of [
+      "creates or materially widens their realistic user/runtime/threat reachability",
+      "depends on them", "worsens them", "cannot safely and truthfully ship because of them",
+    ]) expect(preExistingDisposition, trigger).toContain(trigger);
+    expect(preExistingDisposition).toContain("discovery during review alone does not qualify");
+  });
+
+  it("requires safe corrective removal without weakening unrelated defenses", () => {
+    const canonical = collapse("references/review-triage.md");
+    const dispositions = between(canonical, "## floors and default dispositions", "## deferral path");
+    expect(dispositions).toContain("existing verified aggregate excess");
+    expect(dispositions).toContain("obligation to remove during close review");
+    expect(dispositions).toContain("smallest safe corrective removal");
+    expect(dispositions).toContain("confirm accepted behavior and proof remain");
+    expect(dispositions).toContain(
+      "proportionality and removal apply only to the proposed remedy or feature-owned change",
+    );
+    expect(dispositions).toContain("never authorize weakening or deleting unrelated existing");
+    for (const defense of ["security", "permission", "path", "ticket", "public-write", "other safety defenses"]) {
+      expect(dispositions, defense).toContain(defense);
+    }
+  });
+
+  it("section-scopes each router review phase's ordered fail-closed wiring", () => {
+    const router = collapse("SKILL.md");
+    const phases = [
+      ["## phase 6", "## phase 7", "references/phase-6-plan-review.md", "fan reviewers"],
+      ["## phase 7", "## phase 8", "references/phase-7-implementation.md", "review fan-out"],
+      ["## phase 8", "## phase 9", "references/phase-8-close-review.md", "review the whole feature"],
+    ] as const;
+    for (const [start, end, phaseReference, dispatchMarker] of phases) {
+      const section = between(router, start, end);
+      expectBefore(section, phaseReference, "references/review-triage.md");
+      expectBefore(section, "references/review-triage.md", "if either is unreadable");
+      expect(section).toMatch(/if either is unreadable, refuse both review-driven writes and scope expansion/);
+      expectBefore(section, "if either is unreadable", "before review dispatch or triage");
+      expectBefore(section, "if either is unreadable", dispatchMarker);
+    }
+  });
+
+  it("loads the canonical reference fail-closed in Phases 6, 7, and 8", () => {
+    const phases = [
+      ["phase-6-plan-review.md", "fan out reviewers"],
+      ["phase-7-implementation.md", "3. **review fan-out**"],
+      ["phase-8-close-review.md", "fan out the full relevant roster"],
+    ] as const;
+    for (const [phase, dispatchMarker] of phases) {
+      const body = collapse(`references/${phase}`);
+      expect(body, phase).toContain("before review dispatch or triage");
+      expect(body, phase).toContain("read or re-read [review-triage.md](review-triage.md)");
+      expect(body, phase).toContain("if it is unreadable");
+      expect(body, phase).toMatch(
+        /if it is unreadable, refuse both review-driven[^.]*writes and scope expansion/,
+      );
+      expectBefore(body, "review-triage.md", dispatchMarker);
+    }
+    const phase8 = collapse("references/phase-8-close-review.md");
+    for (const refusal of ["removals", "new tasks"]) {
+      expect(between(phase8, "if it is unreadable", "dispatch prompts"), refusal).toContain(refusal);
+    }
+  });
+
+  it("binds all three pre-collection dispatch regions to safe, decision-ready evidence", () => {
+    const affirmativeBinding =
+      /before findings are collected, require every reviewer to follow.*?\*\*safe verification\*\*.*?while gathering.*?\*\*decision-ready review evidence\*\*.*?(?:every|each) proposed remedy affecting accepted scope or a durable surface/;
+
+    const phase6 = collapse("references/phase-6-plan-review.md");
+    const preCollection6 = between(phase6, "fan out reviewers", "after collecting findings");
+    expect(preCollection6).toMatch(affirmativeBinding);
+
+    const phase7 = collapse("references/phase-7-implementation.md");
+    const preCollection7 = between(phase7, "3. **review fan-out**", "4. **triage and fix**");
+    expect(preCollection7).toMatch(affirmativeBinding);
+
+    const phase8 = collapse("references/phase-8-close-review.md");
+    const preCollection8 = between(phase8, "when all tasks are complete", "integrate. after collecting findings");
+    expect(preCollection8).toMatch(affirmativeBinding);
+  });
+
+  it("gates each phase before expanding current-feature work", () => {
+    const phase6 = collapse("references/phase-6-plan-review.md");
+    const review6 = between(phase6, "fan out reviewers", "surface major findings");
+    expectBefore(review6, "decision-ready review evidence", "after collecting findings");
+    expectBefore(review6, "verify, classify, and judge each remedy", "changing task scope, dependencies, rationales, or writable surfaces");
+
+    const phase7 = collapse("references/phase-7-implementation.md");
+    const review7 = between(phase7, "3. **review fan-out**", "5. **distill observations**");
+    expectBefore(review7, "decision-ready review evidence", "after collecting findings");
+    expectBefore(review7, "apply the canonical remedy gate", "accepting any fix, refactor, reversion, or new durable surface");
+
+    const phase8 = collapse("references/phase-8-close-review.md");
+    const review8 = between(phase8, "when all tasks are complete", "also make sure the repo's own records");
+    expectBefore(review8, "decision-ready review evidence", "after collecting findings");
+    expectBefore(review8, "apply the canonical remedy gate", "before any close fix, corrective removal, new durable surface, or new task");
+    expect(review8).toContain("corrective removal remains mandatory");
+    expect(review8).toContain("no accepted obligation or proof is lost");
+    expect(review8).toContain("verified current-feature blocker cannot remain unresolved at completion");
+  });
+
+  it("captures useful deferrals at each triage decision before corrective loops", () => {
+    const phase6 = collapse("references/phase-6-plan-review.md");
+    const review6 = between(phase6, "fan out reviewers", "surface major findings");
+    expectBefore(review6, "judge each remedy", "at the moment triage decides");
+    expectBefore(review6, "at the moment triage decides", "fix admitted findings");
+    expect(review6).toMatch(/immediately append[^.]+run-local `observations\.md`/);
+    expect(review6).toContain("yyyy-mm-dd — phase 6 deferred: <finding and disposition>");
+
+    const phase7 = collapse("references/phase-7-implementation.md");
+    const review7 = between(phase7, "3. **review fan-out**", "5. **distill observations**");
+    expectBefore(review7, "apply the canonical remedy gate", "at the moment triage decides");
+    expectBefore(review7, "at the moment triage decides", "drop what's wrong");
+    expect(review7).toMatch(/immediately append[^.]+run-local `observations\.md`/);
+    expect(review7).toContain("yyyy-mm-dd — phase 7 deferred: <finding and disposition>");
+    const distill7 = between(phase7, "5. **distill observations**", "6. **gate and commit**");
+    expect(distill7).toContain("triage did not already capture");
+    expect(distill7).toContain("do not postpone or duplicate");
+    expect(distill7).toContain("capture major observations promptly");
+    expect(distill7).toMatch(
+      /capture major observations promptly, but present one immediately only when it requires a current direction, blocker, or safety decision/,
+    );
+    expect(distill7).toContain("ordinary deferred and pre-existing follow-ups wait for the close presentation");
+    expect(distill7).not.toMatch(/do not present one immediately only when/);
+    expect(distill7).not.toMatch(/(?:surface|present) (?:anything|every|all) major[^.]+(?:right away|immediately)/);
+
+    const phase8 = collapse("references/phase-8-close-review.md");
+    const review8 = between(phase8, "when all tasks are complete", "also make sure the repo's own records");
+    expectBefore(review8, "apply the canonical remedy gate", "at the moment triage decides");
+    expectBefore(review8, "at the moment triage decides", "remove already committed aggregate excess");
+    expect(review8).toMatch(/immediately append[^.]+run-local `observations\.md`/);
+    expect(review8).toContain("yyyy-mm-dd — phase 8 deferred: <finding and disposition>");
+    expect(review8).toContain("before corrective work or new-task creation");
+  });
+
+  it("carries every useful phase finding through one online-assessed or offline-unassessed presentation", () => {
+    const phase8 = collapse("references/phase-8-close-review.md");
+    const close = between(phase8, "before asking the user to close the feature", "the ticket-path close hooks");
+    expectBefore(close, "write the feature's `review.md`", "by distilling `observations.md`");
+    expect(close).toContain("every still-useful deferred phase 6, 7, or 8 finding that warrants follow-up");
+    expectBefore(close, "write the feature's `review.md`", "`bugs discovered` or `proposed follow-ups`");
+    expectBefore(close, "`bugs discovered` or `proposed follow-ups`", "invoke the existing per-item offer");
+    expect(close).toContain("when its github path is available");
+    expectBefore(close, "proposal gate assesses the findings", "one coherent assessed pick-list");
+    expect(close).toContain(
+      "when unavailable, the offer skips scoring and presents every eligible still-actionable finding once",
+    );
+    expect(close).toContain("one coherent explicitly unassessed pick-list with filing unavailable");
+    expect(close).not.toMatch(/present[^.]+(?:then|before)[^.]+(?:run|invoke)[^.]+per-item offer/);
+    expectBefore(phase8, "per-item offer", "completion summary");
+    expectBefore(phase8, "completion summary", "agrees");
+  });
+
+  it("reserves Phase 8 follow-ups for the single availability-specific close pick-list", () => {
+    const phase8 = collapse("references/phase-8-close-review.md");
+    const triage = between(phase8, "integrate. after collecting findings", "also make sure the repo's own records");
+    expect(triage).toContain("do not ordinarily present a deferred or follow-up finding yet");
+    expect(triage).toContain("reserve ordinary follow-up presentation for one close pick-list");
+    expect(triage).toContain("proposal-gated and assessed when the github path is available");
+    expect(triage).toContain(
+      "every eligible still-actionable finding explicitly unassessed when it is unavailable",
+    );
+    expect(triage).toMatch(
+      /surface a finding immediately only when it requires a current direction, blocker, or safety decision[^.]+after capturing it in `observations\.md`/,
+    );
+    expectBefore(phase8, "do not ordinarily present", "invoke the existing per-item offer");
+
+    const canonical = collapse("references/review-triage.md");
+    const deferralStart = canonical.indexOf("## deferral path");
+    expect(deferralStart).toBeGreaterThanOrEqual(0);
+    const deferral = canonical.slice(deferralStart);
+    expect(deferral).toContain("interrupt immediately only when a finding requires a current direction, blocker, or safety decision");
+    expect(deferral).toContain("in phase 8, capture ordinary follow-ups without presenting them early");
+    expect(deferral).toContain("reserve their presentation for one close pick-list");
+    expect(deferral).toContain("proposal-gated and assessed when the github path is available");
+    expect(deferral).toContain(
+      "every eligible still-actionable finding explicitly unassessed when it is unavailable",
+    );
+  });
+
+  it("always presents but offers filing only after successful reachability", () => {
+    const filing = collapse("references/phase-8-file-finding.md");
+    const intro = between(filing, "# phase 8", "## the offer");
+    expect(intro).toContain("the findings presentation runs on **either path**");
+    expect(intro).toContain("when every reachability precondition succeeds");
+    expect(intro).toContain("optional filing branch");
+    expect(intro).not.toContain("ticketless run's only close-time github touch");
+    const offer = between(filing, "## the offer", "## reachability preconditions");
+    expect(offer).toContain("always present");
+    expect(offer).toMatch(/offer to file[^.]+only after every reachability precondition[^.]+succeeds/);
+    expect(offer).not.toMatch(/(?:do not|never) offer to file[^.]+only after every reachability precondition/);
+    expect(offer).toContain("on the unavailable branch, mark filing unavailable and do not offer it");
+    const unavailable = between(filing, "## reachability preconditions", "## gate through evaluate's proposal-gate");
+    expect(unavailable).toContain("filing visibly unavailable");
+  });
+
+  it("gives a concrete failed-precondition remedy and cleanup-bounded retry", () => {
+    const filing = collapse("references/phase-8-file-finding.md");
+    const unavailable = between(filing, "## reachability preconditions", "## gate through evaluate's proposal-gate");
+    expect(unavailable).toContain("missing `gh` → install the github cli");
+    expect(unavailable).toContain("failed `gh auth status` → run `gh auth login`");
+    expect(unavailable).toContain("unresolved `target` → repair the checkout's remote configuration or resolve the intended target remote");
+    expect(unavailable).toContain("filing offer may be retried before worktree cleanup");
+  });
+
+  it("keeps offline items actionable without assessment or online mechanics", () => {
+    const filing = collapse("references/phase-8-file-finding.md");
+    const unavailable = between(filing, "## reachability preconditions", "## gate through evaluate's proposal-gate");
+    expect(unavailable).toContain("each item still states the problem, its impact, and a likely remedy with rough scope");
+    expect(unavailable).toContain("include no score, gate disposition, evidence anchor, existing-issue search, or filing action");
+    expect(unavailable).toContain("marking every item explicitly **unassessed**");
+  });
+
+  it("orders and terminates the section-scoped unavailable-reachability branch", () => {
+    const filing = collapse("references/phase-8-file-finding.md");
+    const unavailable = between(filing, "## reachability preconditions", "## gate through evaluate's proposal-gate");
+    const failure = "if any reachability precondition fails";
+    const remedy = "identify the failed prerequisite and give its concrete remedy";
+    const retry = "filing offer may be retried before worktree cleanup";
+    const disable = "disable github existing-issue search, proposal-gate/evaluator scoring, and issue filing";
+    const forbidGate = "do not invoke the proposal gate, apply its clear-slop dropping, or otherwise score or suppress findings";
+    const eligible = "every still-actionable deferred or follow-up entry";
+    const present = "present each eligible item exactly once";
+    const unassessed = "marking every item explicitly **unassessed**";
+    const unavailableMarker = "filing visibly unavailable";
+    const runLocal = "honest run-local presentation";
+    const terminate = "stop this branch here";
+    const onlineScope = "the remainder of this file applies only after **every** reachability precondition succeeds";
+    const offerCompletion = "complete the offer now";
+    const featureCompletion = "feature completion";
+
+    expectBefore(unavailable, failure, remedy);
+    expectBefore(unavailable, remedy, retry);
+    expectBefore(unavailable, retry, disable);
+    expectBefore(unavailable, disable, forbidGate);
+    expectBefore(unavailable, forbidGate, eligible);
+    expect(unavailable).toContain("`review.md`'s **bugs discovered** and **proposed follow-ups** sections");
+    const exclusions = [
+      "fixed or otherwise resolved", "wrong/duplicate/non-actionable", "process-only observations",
+    ];
+    for (const exclusion of exclusions) {
+      expect(unavailable, exclusion).toContain(exclusion);
+      expectBefore(unavailable, eligible, exclusion);
+      expectBefore(unavailable, exclusion, present);
+    }
+    expectBefore(unavailable, present, unassessed);
+    expectBefore(unavailable, unassessed, unavailableMarker);
+    expectBefore(unavailable, unavailableMarker, runLocal);
+    expect(unavailable).toContain("no durable cross-feature record or issue was created");
+    expect(unavailable).toContain("run-local staging records lost with worktree cleanup");
+    expectBefore(unavailable, runLocal, terminate);
+    expect(unavailable).toContain("do not continue into any remaining gate, search, online-presentation, or filing section");
+    expectBefore(unavailable, terminate, onlineScope);
+    expectBefore(unavailable, onlineScope, offerCompletion);
+    expectBefore(unavailable, offerCompletion, featureCompletion);
+  });
+
+  it("section-scopes one coherent successful-reachability online contract", () => {
+    const filing = collapse("references/phase-8-file-finding.md");
+    const onlineStart = filing.indexOf("## gate through evaluate's proposal-gate");
+    expect(onlineStart).toBeGreaterThanOrEqual(0);
+    const online = filing.slice(onlineStart);
+    const reachable = "when the reachability preconditions pass";
+    const scoring = "it scores each finding against the shared rubric";
+    const slop = "silently drops clear slop";
+    const search = "run **one narrow read-only** `gh issue list";
+    const assessed = "everything **borderline and above is presented with its assessment embedded**";
+    const consent = "each borderline-or-better finding is its own per-item decision";
+    const filingMechanics = "## filing mechanics";
+
+    expectBefore(online, reachable, scoring);
+    expectBefore(online, reachable, search);
+    expectBefore(online, scoring, slop);
+    expectBefore(online, slop, assessed);
+    expectBefore(online, search, assessed);
+    expectBefore(online, assessed, consent);
+    expect(online).toContain("after successful reachability preflight, a per-call search failure");
+    expect(online).toContain("globally absent or unauthenticated `gh` has already taken the terminating offline branch");
+    expectBefore(online, consent, filingMechanics);
+    expect(online).toContain("for each approved item");
+    expect(online).toContain("gh issue create --repo <target>");
+    expect(online).not.toContain("unassessed");
+    expect(online).toContain("remain in review.md as run-local staging until worktree cleanup");
+    expect(online).toContain("no durable issue was filed");
+    expect(online).toContain("remain run-local unless the user approves a new filing or explicitly confirms an equivalent existing issue for rule 9 reuse");
+    const mechanics = online.slice(online.indexOf("## filing mechanics"));
+    expect(mechanics).toContain("treat every search result as only a candidate near-match");
+    expect(mechanics).toContain("ask the user whether it is equivalent");
+    expect(mechanics).toMatch(/confirmed equivalent → reuse it as[^.]+durable tracking and echo its url/);
+    expect(mechanics).toMatch(/explicitly confirmed non-equivalent plausible candidate → continue the already-approved new filing/);
+    expect(mechanics).toMatch(/absent or ambiguous confirmation → fail closed:[^.]+neither reuse nor create an issue/);
+    expect(mechanics).toMatch(/an exact frozen-title identity hit is never permission to create; pending explicit equivalence confirmation it follows that fail-closed branch, and after explicit equivalence confirmation it follows the reuse branch above/);
+    expect(mechanics).toContain("preserve rule 9's anti-duplicate/idempotency checks");
+  });
+
+  it("states the corrected ticketless close-time GitHub write scope", () => {
+    const filing = collapse("references/phase-8-file-finding.md");
+    const mechanics = filing.slice(filing.indexOf("## filing mechanics"));
+    expect(mechanics).toContain("only close-time github issue-write opportunity");
+    expect(mechanics).toContain("besides the branch push as a separate github write");
+    expect(mechanics).toContain("accepted phase 1 create-offer may already have created the feature ticket earlier");
+    expect(mechanics).toContain("not an exhaustive claim about every github touch in the run");
+    expect(mechanics).not.toContain("only point the run touches github");
+  });
+
+  it("qualifies proposal-gate Phase 8 wiring as online and defers offline", () => {
+    const proposal = collapseText(fs.readFileSync(
+      path.join(EVALUATE_DIR, "references", "proposal-gate.md"),
+      "utf8",
+    ));
+    const phase8Wiring = between(proposal, "- **phase 8 issue-filing offer**", "- **phase 1 ticket-creation offer**");
+    expectBefore(phase8Wiring, "when every reachability precondition succeeds", "clear slop is dropped");
+    expect(phase8Wiring).toMatch(/remain in `review\.md` only as run-local staging[^.]+lost with worktree cleanup/);
+    expect(phase8Wiring).toContain("no durable issue was filed");
+    expect(phase8Wiring).toContain("newly filed user-approved github issue");
+    expect(phase8Wiring).toContain("existing issue the user explicitly confirms as equivalent and the workflow reuses under rule 9");
+    expect(phase8Wiring).toContain("candidate near-match alone does not qualify");
+    expectBefore(phase8Wiring, "if any reachability precondition fails", "do not invoke proposal-gate");
+    expect(phase8Wiring).toContain(
+      "defer to implement-feature's branch that presents every eligible still-actionable finding **unassessed** instead",
+    );
+    expect(phase8Wiring).not.toContain("`review.md` as the durable record");
+  });
+
+  it("keeps the plan layout truthful when observations begin in Phase 6", () => {
+    const templates = collapse("references/templates.md");
+    expect(templates).toContain("observations.md");
+    expect(templates).toContain("begins when needed in phase 6");
+    expect(templates).toContain("continues through phases 7–8");
+  });
+});
