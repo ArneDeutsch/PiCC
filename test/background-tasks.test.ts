@@ -1467,7 +1467,7 @@ describe("settlement notices", () => {
     }) as unknown as ToolLike;
     const started = await agentTool.execute("t1", { subagent_type: hostileType, prompt: "go" });
     // Default → background: returns a task id immediately.
-    expect(started.content[0]!.text).toMatch(/Background task task-\d+ started/);
+    expect(started.content[0]!.text).toMatch(/Background task task-\d+ accepted/);
     const taskId = String(started.details.taskId);
     const agentId = String(started.details.agentId);
     expect(bg.get(taskId)?.status).toBe("running");
@@ -1506,7 +1506,7 @@ describe("settlement notices", () => {
       backgroundTasks: bg,
     }) as unknown as ToolLike;
     const failStarted = await failTool.execute("t3", { subagent_type: hostileType, prompt: "go" });
-    expect(failStarted.content[0]!.text).toMatch(/Background task task-\d+ started/); // defaulted → background
+    expect(failStarted.content[0]!.text).toMatch(/Background task task-\d+ accepted/); // defaulted → background
     const failId = String(failStarted.details.taskId);
     await bg.wait(failId);
     const failOut = await taskOutput.execute("t4", { task_id: failId });
@@ -1534,7 +1534,7 @@ describe("Agent tool run_in_background", () => {
     // Immediate return while the dispatch is still gated. The start message is
     // the background channel's model-visible agent-ID delivery.
     expect(started.content[0]!.text).toMatch(
-      /Background task task-\d+ started \(agent: worker, agent id: agent-[0-9a-f]{12}\)/,
+      /Background task task-\d+ accepted \(agent: worker, agent id: agent-[0-9a-f]{12}\)/,
     );
     expect(started.content[0]!.text).toContain("TaskOutput");
     expect(String(started.details.agentId)).toMatch(/^agent-[0-9a-f]{12}$/);
@@ -1559,7 +1559,7 @@ describe("Agent tool run_in_background", () => {
     }) as unknown as ToolLike;
     // No run_in_background param — the frontmatter forces background dispatch.
     const started = await agentTool.execute("t1", { subagent_type: "worker", prompt: "go" });
-    expect(started.content[0]!.text).toMatch(/Background task task-\d+ started/);
+    expect(started.content[0]!.text).toMatch(/Background task task-\d+ accepted/);
     expect(started.details.background).toBe(true);
     const taskId = String(started.details.taskId);
     expect(registry.get(taskId)?.status).toBe("running");
@@ -1579,7 +1579,7 @@ describe("Agent tool run_in_background", () => {
       backgroundTasks: registry,
     }) as unknown as ToolLike;
     const started = await agentTool.execute("t1", { subagent_type: "worker", prompt: "go" });
-    expect(started.content[0]!.text).toMatch(/Background task task-\d+ started/);
+    expect(started.content[0]!.text).toMatch(/Background task task-\d+ accepted/);
     expect(started.details.background).toBe(true);
     const taskId = String(started.details.taskId);
     expect(registry.get(taskId)?.status).toBe("running"); // still gated → running
@@ -1647,7 +1647,7 @@ describe("Agent tool run_in_background", () => {
       prompt: "go",
       run_in_background: false,
     });
-    expect(started.content[0]!.text).toMatch(/Background task task-\d+ started/);
+    expect(started.content[0]!.text).toMatch(/Background task task-\d+ accepted/);
     expect(started.details.background).toBe(true);
     const taskId = String(started.details.taskId);
     expect(registry.get(taskId)?.status).toBe("running");
@@ -1688,7 +1688,7 @@ describe("Agent tool run_in_background", () => {
       backgroundTasks: registry,
     }) as unknown as ToolLike;
     const started = await agentTool.execute("t1", { subagent_type: "Explore", prompt: "look" });
-    expect(started.content[0]!.text).toMatch(/Background task task-\d+ started \(agent: Explore/);
+    expect(started.content[0]!.text).toMatch(/Background task task-\d+ accepted \(agent: Explore/);
     const taskId = String(started.details.taskId);
     expect(registry.get(taskId)?.status).toBe("running");
     release();
@@ -1696,33 +1696,43 @@ describe("Agent tool run_in_background", () => {
     expect(registry.get(taskId)?.status).toBe("completed");
   });
 
-  it("Agent tool description states the new default and the run_in_background: false opt-out", () => {
+  it("Agent and Task descriptions state acceptance/capacity, the opt-out, and the foreground-forcing exception", () => {
     const runtime = makeRuntime([makeAgent()], fakeSdk({ replies: [{ text: "x" }] }).sdk);
-    const agentTool = createAgentToolDefinition(runtime, { depth: 0 }) as unknown as {
-      description: string;
-      parameters: { properties?: Record<string, { description?: string }> };
-    };
-    const desc = agentTool.description;
-    // No opt-in framing left ("Run the dispatch in the background" / bare "Returns
-    // the subagent's final message verbatim." as the whole contract).
-    expect(desc).toMatch(/background by default/i);
-    expect(desc).toContain("run_in_background: false");
-    expect(desc).toContain("TaskOutput");
-    // A later notice is conditional, not promised after terminal collection.
-    expect(desc).toContain("latest task generation for an agent");
-    expect(desc).toContain("remains uncollected and unnotified");
-    expect(desc).toContain("later interactive turn starts");
-    expect(desc).toContain("one bounded notice");
-    expect(desc).toContain("running TaskOutput poll preserves eligibility");
-    expect(desc).toContain("terminal collection suppresses a not-yet-sent notice");
-    expect(desc).not.toContain("a settlement notice also arrives");
+    for (const name of ["Agent", "Task"] as const) {
+      const agentTool = createAgentToolDefinition(runtime, { depth: 0, name }) as unknown as {
+        description: string;
+        parameters: { properties?: Record<string, { description?: string }> };
+      };
+      const desc = agentTool.description;
+      expect(desc).toMatch(/background by default/i);
+      expect(desc).toContain("accepted immediately");
+      expect(desc).toContain("configured concurrency capacity");
+      expect(desc).toContain("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS");
+      expect(desc).toContain("forces dispatches to run in the foreground");
+      expect(desc).toContain("run_in_background: false");
+      expect(desc).toContain("TaskOutput");
+      expect(desc).not.toMatch(/\b(?:started|starts immediately|has started)\b/iu);
+      // A later notice is conditional, not promised after terminal collection.
+      expect(desc).toContain("latest task generation for an agent");
+      expect(desc).toContain("remains uncollected and unnotified");
+      expect(desc).toContain("later interactive turn starts");
+      expect(desc).toContain("one bounded notice");
+      expect(desc).toContain("running TaskOutput poll preserves eligibility");
+      expect(desc).toContain("terminal collection suppresses a not-yet-sent notice");
+      expect(desc).not.toContain("a settlement notice also arrives");
 
-    const runInBackground = agentTool.parameters.properties?.run_in_background?.description ?? "";
-    expect(runInBackground).toContain("latest generation gets one bounded");
-    expect(runInBackground).toContain("later-interactive-turn notice");
-    expect(runInBackground).toContain("only if it settles and remains uncollected and unnotified");
-    expect(runInBackground).toContain("running poll preserves eligibility");
-    expect(runInBackground).toContain("terminal collection suppresses a not-yet-sent notice");
+      const runInBackground = agentTool.parameters.properties?.run_in_background?.description ?? "";
+      expect(runInBackground).toContain("accept the dispatch immediately");
+      expect(runInBackground).toContain("configured concurrency capacity");
+      expect(runInBackground).toContain("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS");
+      expect(runInBackground).toContain("forces foreground execution");
+      expect(runInBackground).not.toMatch(/\b(?:started|starts immediately|has started)\b/iu);
+      expect(runInBackground).toContain("latest generation gets one bounded");
+      expect(runInBackground).toContain("later-interactive-turn notice");
+      expect(runInBackground).toContain("only if it settles and remains uncollected and unnotified");
+      expect(runInBackground).toContain("running poll preserves eligibility");
+      expect(runInBackground).toContain("terminal collection suppresses a not-yet-sent notice");
+    }
   });
 
   it("TaskOutput with wait:false polls the running status without blocking", async () => {
@@ -1973,6 +1983,78 @@ describe("Agent tool run_in_background", () => {
     await expect(empty.execute("t", { task_id: "task-1" })).rejects.toThrow(/none/);
   });
 
+  it("production Agent and Task-alias wiring mirrors saturated admission and repaints on grant without progress", async () => {
+    const releases = new Map<string, () => void>();
+    const entered = new Map<string, () => void>();
+    const enteredPromises = new Map(
+      ["holder", "agent-waiter", "task-waiter"].map((prompt) => [
+        prompt,
+        new Promise<void>((resolve) => entered.set(prompt, resolve)),
+      ]),
+    );
+    const { sdk } = fakeSdk({
+      onPrompt: async (prompt) => {
+        entered.get(prompt)?.();
+        await new Promise<void>((resolve) => releases.set(prompt, resolve));
+        return `${prompt}-done`;
+      },
+    });
+    const tasks = new BackgroundTaskRegistry();
+    const agents = new SubagentRegistry();
+    const runtime = makeRuntime([makeAgent()], sdk, { concurrency: 1, subagentRegistry: agents });
+    const agentTool = createAgentToolDefinition(runtime, { depth: 0, backgroundTasks: tasks }) as unknown as ToolLike;
+    const taskAlias = createAgentToolDefinition(runtime, {
+      depth: 0,
+      name: "Task",
+      backgroundTasks: tasks,
+    }) as unknown as ToolLike;
+
+    const holder = await agentTool.execute("holder", { subagent_type: "worker", prompt: "holder" });
+    await enteredPromises.get("holder");
+    const waitingAgent = await agentTool.execute("agent", {
+      subagent_type: "worker",
+      prompt: "agent-waiter",
+    });
+    const waitingTask = await taskAlias.execute("task", {
+      subagent_type: "worker",
+      prompt: "task-waiter",
+    });
+    for (const ack of [waitingAgent, waitingTask]) {
+      expect(ack.content[0]!.text).toContain("accepted");
+      expect(ack.content[0]!.text).toContain("configured concurrency capacity");
+      expect(ack.content[0]!.text).not.toMatch(/\bstarted\b/iu);
+      expect(ack.details.admission).toBe("waiting");
+      expect(tasks.get(String(ack.details.taskId))?.admission).toBe("waiting");
+      expect(agents.get(String(ack.details.agentId))?.admission).toBe("waiting");
+    }
+
+    const updates: ToolUpdate[] = [];
+    const output = createTaskOutputTool(tasks) as unknown as StreamTool;
+    const awaiting = output.execute(
+      "await-agent",
+      { task_id: String(waitingAgent.details.taskId) },
+      undefined,
+      (update) => updates.push(update),
+    );
+    expect(updates.at(-1)?.details?.admission).toBe("waiting");
+
+    releases.get("holder")!();
+    await enteredPromises.get("agent-waiter");
+    expect(tasks.get(String(waitingAgent.details.taskId))?.admission).toBe("admitted");
+    expect(agents.get(String(waitingAgent.details.agentId))?.admission).toBe("admitted");
+    expect(updates.at(-1)?.details).toMatchObject({ admission: "admitted", status: "running" });
+    expect(updates.at(-1)?.details?.subagentProgress).toBeUndefined();
+
+    releases.get("agent-waiter")!();
+    await awaiting;
+    await enteredPromises.get("task-waiter");
+    expect(tasks.get(String(waitingTask.details.taskId))?.admission).toBe("admitted");
+    expect(agents.get(String(waitingTask.details.agentId))?.admission).toBe("admitted");
+    releases.get("task-waiter")!();
+    await Promise.all(tasks.ids().map((id) => tasks.wait(id)));
+    expect(tasks.get(String(holder.details.taskId))?.status).toBe("completed");
+  });
+
   it("TaskStop marks the task stopped and aborts the live session cooperatively", async () => {
     const { sdk, abortCalls, waitForPromptCalls } = gatedSdk("never-used");
     const registry = new BackgroundTaskRegistry();
@@ -2067,58 +2149,117 @@ describe("Agent tool run_in_background", () => {
     expect(out.content[0]!.text).toContain("depth");
   });
 
-  it("TaskStop while queued behind the concurrency cap prevents the session from ever starting", async () => {
-    let releaseGate!: () => void;
-    const gate = new Promise<void>((resolve) => (releaseGate = resolve));
-    const handle = fakeSdk({ replies: [{ text: "gate-done", gate }] });
-    const sessions = () => handle.created.length;
+  it("real TaskStop wakes an awaited queued task immediately but preserves gated cleanup and later FIFO release", async () => {
+    let releaseHolder!: () => void;
+    const holderGate = new Promise<void>((resolve) => (releaseHolder = resolve));
+    let laterEntered!: () => void;
+    const laterStarted = new Promise<void>((resolve) => (laterEntered = resolve));
+    const handle = fakeSdk({
+      onPrompt: async (prompt) => {
+        if (prompt === "hold the slot") await holderGate;
+        if (prompt === "later work") laterEntered();
+        return `${prompt}-done`;
+      },
+    });
+    let queuedAgentId = "";
+    let cleanupEntered!: () => void;
+    const cleanupStarted = new Promise<void>((resolve) => (cleanupEntered = resolve));
+    let releaseCleanup!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => (releaseCleanup = resolve));
+    const events: string[] = [];
+    const starts: string[] = [];
+    const stops: string[] = [];
+    const worktreeEntries: string[] = [];
     const registry = new BackgroundTaskRegistry();
     const subagentRegistry = new SubagentRegistry();
-    const runtime = makeRuntime([makeAgent()], handle.sdk, {
+    const runtime = makeRuntime([makeAgent({ isolation: "worktree" })], handle.sdk, {
       concurrency: 1,
       subagentRegistry,
+      hookRunner: {
+        fire: async (event: string, payload: Record<string, unknown>) => {
+          const id = String(payload.agent_id ?? "");
+          if (event === "SubagentStart") {
+            starts.push(id);
+            events.push(`start:${id}`);
+          }
+          if (event === "SubagentStop") {
+            stops.push(id);
+            if (id === queuedAgentId) {
+              events.push("queued-cleanup-enter");
+              cleanupEntered();
+              await cleanupGate;
+              events.push("queued-cleanup-exit");
+            }
+          }
+          return { block: false, askDowngraded: false, diagnostics: [] };
+        },
+      },
+      worktrees: {
+        enter: async ({ name }: { name?: string }) => {
+          worktreeEntries.push(name ?? "");
+          events.push(`worktree:${name ?? ""}`);
+          return { ok: true as const, worktreePath: `/worktrees/${name ?? "agent"}`, diagnostics: [] };
+        },
+        exit: async () => ({ diagnostics: [] }),
+      },
     });
     const agentTool = createAgentToolDefinition(runtime, {
       depth: 0,
       backgroundTasks: registry,
     }) as unknown as ToolLike;
 
-    // Task 1 occupies the single slot (its prompt blocks on the gate).
     const first = await agentTool.execute("t1", {
       subagent_type: "worker",
       prompt: "hold the slot",
-      run_in_background: true,
     });
-    await handle.waitForPromptCalls(1); // holder owns the slot while its gate stays closed
-
-    // Task 2 registers and queues on the semaphore — no session yet.
+    await handle.waitForPromptCalls(1);
     const second = await agentTool.execute("t2", {
       subagent_type: "worker",
       prompt: "queued work",
-      run_in_background: true,
     });
+    queuedAgentId = String(second.details.agentId);
     const secondId = String(second.details.taskId);
-    const holderId = String(first.details.agentId);
-    const waiterId = String(second.details.agentId);
-    const dispatches = subagentRegistry.list();
-    expect(dispatches).toHaveLength(2);
-    expect(subagentRegistry.get(holderId)?.session).toBeDefined();
-    expect(subagentRegistry.get(waiterId)?.session).toBeUndefined();
-    expect(dispatches.filter((record) => record.session === undefined)).toHaveLength(1);
-    expect(sessions()).toBe(1); // only the gated task created a session
+    const third = await agentTool.execute("t3", {
+      subagent_type: "worker",
+      prompt: "later work",
+    });
+    const thirdAgentId = String(third.details.agentId);
+    expect(registry.get(secondId)?.admission).toBe("waiting");
+    expect(handle.created).toHaveLength(1);
 
-    // Stop the QUEUED task, then release the gate so it dequeues.
+    const updates: ToolUpdate[] = [];
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    const awaiting = taskOutput.execute("await", { task_id: secondId }, undefined, (update) => updates.push(update));
+    expect(updates.at(-1)?.details?.admission).toBe("waiting");
+    expect(registry.subscriberCount(secondId)).toBe(1);
+    expect(registry.changeSubscriberCount(secondId)).toBe(1);
+
     const taskStop = createTaskStopTool(registry) as unknown as ToolLike;
-    await taskStop.execute("t3", { task_id: secondId });
-    releaseGate();
-    await registry.wait(String(first.details.taskId));
-    await registry.wait(secondId);
+    await taskStop.execute("stop", { task_id: secondId });
+    const stopped = await awaiting;
+    expect(stopped.details.status).toBe("stopped");
+    expect(stopped.content[0]!.text).toContain("was aborted");
+    expect(stopped.content[0]!.text).not.toContain("waiting for configured concurrency capacity");
+    expect(registry.subscriberCount(secondId)).toBe(0);
+    expect(registry.changeSubscriberCount(secondId)).toBe(0);
+    expect(handle.created).toHaveLength(1);
 
-    expect(sessions()).toBe(1); // the stopped dispatch never created a session, even after dequeue
-    const taskOutput = createTaskOutputTool(registry) as unknown as ToolLike;
-    const out = await taskOutput.execute("t4", { task_id: secondId });
-    expect(out.details.status).toBe("stopped");
-    expect(out.content[0]!.text).toContain("was aborted"); // aborted vocabulary
+    releaseHolder();
+    await registry.wait(String(first.details.taskId));
+    await cleanupStarted;
+    expect(handle.created).toHaveLength(1);
+    expect(starts).not.toContain(queuedAgentId);
+    expect(worktreeEntries).toHaveLength(1);
+    expect(events).not.toContain(`start:${thirdAgentId}`);
+
+    releaseCleanup();
+    await laterStarted;
+    await Promise.all([registry.wait(secondId), registry.wait(String(third.details.taskId))]);
+    expect(stops.filter((id) => id === queuedAgentId)).toHaveLength(1);
+    expect(starts).not.toContain(queuedAgentId);
+    expect(worktreeEntries).toHaveLength(2);
+    expect(handle.created).toHaveLength(2);
+    expect(events.indexOf("queued-cleanup-exit")).toBeLessThan(events.indexOf(`start:${thirdAgentId}`));
   });
 });
 
@@ -2183,6 +2324,10 @@ describe("nested background bound — per-depth budgets", () => {
     await barrier; // C children are concurrently parked at the gate
     // With the gate still closed, no more than C can have reached onPrompt.
     expect(live).toBe(CONCURRENCY);
+    expect(nestedRegistry.ids().map((id) => nestedRegistry.get(id)?.admission)).toEqual([
+      ...Array.from({ length: CONCURRENCY }, () => "admitted"),
+      ...Array.from({ length: N - CONCURRENCY }, () => "waiting"),
+    ]);
     releaseLeaf();
     await outerDone;
     // Join every child through the nested registry — their presence there is
@@ -2236,6 +2381,54 @@ describe("nested background bound — per-depth budgets", () => {
     expect(result.ok).toBe(true);
     expect(result.finalMessage).toContain("child-done"); // did not hang
   }, 10_000);
+});
+
+describe("BackgroundTaskRegistry change notifications", () => {
+  it("notifies after creation, admission, stop, and settlement while isolating throwing listeners", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const snapshots: Array<{ status?: string; admission?: string }> = [];
+    registry.onChange(() => { throw new Error("hostile listener"); });
+    registry.onChange(() => {
+      const task = registry.get("task-1");
+      snapshots.push({ status: task?.status, admission: task?.admission });
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const id = registry.start("agent:worker", (async () => {
+      await gate;
+      return result();
+    })());
+    registry.noteAdmission(id, "waiting");
+    registry.noteAdmission(id, "admitted");
+    registry.stop(id);
+    release();
+    await registry.wait(id);
+    expect(snapshots).toEqual(expect.arrayContaining([
+      { status: "running", admission: "admitted" },
+      { status: "running", admission: "waiting" },
+      { status: "stopped", admission: "admitted" },
+    ]));
+  });
+
+  it("scopes task subscriptions and makes unsubscribe idempotent", () => {
+    const registry = new BackgroundTaskRegistry();
+    const own = registry.start("agent:own", new Promise(() => {}), undefined, undefined, undefined, "owner-a");
+    const foreign = registry.start("agent:foreign", new Promise(() => {}), undefined, undefined, undefined, "owner-b");
+    const scoped = registry.scopedTo("owner-a");
+    let seen = 0;
+    const unsubscribe = scoped.subscribe?.(own, () => seen++) ?? (() => {});
+    const foreignUnsubscribe = scoped.subscribe?.(foreign, () => seen++) ?? (() => {});
+    expect(registry.changeSubscriberCount(own)).toBe(1);
+    expect(registry.changeSubscriberCount(foreign)).toBe(0);
+    registry.noteAdmission(foreign, "waiting");
+    expect(seen).toBe(0);
+    registry.noteAdmission(own, "waiting");
+    expect(seen).toBe(1);
+    unsubscribe();
+    unsubscribe();
+    foreignUnsubscribe();
+    expect(registry.changeSubscriberCount(own)).toBe(0);
+  });
 });
 
 describe("TaskOutput live streaming", () => {
@@ -2299,6 +2492,43 @@ describe("TaskOutput live streaming", () => {
     expect(final.details.outcome).toBe("completed");
     // Leak guard (deterministic hook, no sleep): the set is empty after settle.
     expect(registry.subscriberCount(id)).toBe(0);
+    expect(registry.changeSubscriberCount(id)).toBe(0);
+  });
+
+  it("repaints waiting to running on admission without child progress and tears down both subscriptions", async () => {
+    const { registry, id, release } = runningTask();
+    registry.noteAdmission(id, "waiting");
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    const partials: ToolUpdate[] = [];
+    const pending = taskOutput.execute("t", { task_id: id }, undefined, (update) => partials.push(update));
+    expect(registry.subscriberCount(id)).toBe(1);
+    expect(registry.changeSubscriberCount(id)).toBe(1);
+    expect(renderUpdate(partials.at(-1)!)).toContain("waiting for capacity");
+    expect(partials.at(-1)?.content[0]?.text).toContain("Waiting for configured concurrency capacity");
+
+    registry.noteAdmission(id, "admitted");
+    expect(renderUpdate(partials.at(-1)!)).toContain("running");
+    expect(partials.at(-1)?.details?.subagentProgress).toBeUndefined();
+    release();
+    await pending;
+    expect(registry.subscriberCount(id)).toBe(0);
+    expect(registry.changeSubscriberCount(id)).toBe(0);
+  });
+
+  it("polling reports waiting without subscribing and stopped status overrides admission", async () => {
+    const { registry, id, release } = runningTask();
+    registry.noteAdmission(id, "waiting");
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    const polled = await taskOutput.execute("poll", { task_id: id, wait: false });
+    expect(polled.content[0]!.text).toContain("waiting for configured concurrency capacity");
+    expect(polled.details).toMatchObject({ status: "running", admission: "waiting" });
+    expect(registry.changeSubscriberCount(id)).toBe(0);
+    registry.stop(id);
+    const stopped = await taskOutput.execute("stopped", { task_id: id, wait: false });
+    expect(stopped.content[0]!.text).toContain("was aborted");
+    expect(stopped.content[0]!.text).not.toContain("waiting for configured concurrency capacity");
+    release();
+    await registry.wait(id);
   });
 
   it("an already-settled task emits NO partial and never subscribes", async () => {
@@ -2316,6 +2546,7 @@ describe("TaskOutput live streaming", () => {
     const out = await taskOutput.execute("t", { task_id: id }, undefined, (u) => partials.push(u));
     expect(partials).toEqual([]);
     expect(registry.subscriberCount(id)).toBe(0);
+    expect(registry.changeSubscriberCount(id)).toBe(0);
     expect(out.content[0]!.text).toBe("done");
   });
 
@@ -2331,7 +2562,20 @@ describe("TaskOutput live streaming", () => {
     );
     expect(partials).toEqual([]);
     expect(registry.subscriberCount(id)).toBe(0);
+    expect(registry.changeSubscriberCount(id)).toBe(0);
     expect(polled.details.status).toBe("running");
+    release();
+    await registry.wait(id);
+  });
+
+  it("a throwing initial onUpdate tears down both subscriptions", async () => {
+    const { registry, id, release } = runningTask();
+    const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
+    await expect(taskOutput.execute("t", { task_id: id }, undefined, () => {
+      throw new Error("paint failed");
+    })).rejects.toThrow("paint failed");
+    expect(registry.subscriberCount(id)).toBe(0);
+    expect(registry.changeSubscriberCount(id)).toBe(0);
     release();
     await registry.wait(id);
   });
@@ -2392,6 +2636,7 @@ describe("TaskOutput live streaming", () => {
     const res = await pending; // resolves cleanly — settled never rejects
     expect(res.details.status).toBe("running"); // current status, still running
     expect(registry.subscriberCount(id)).toBe(0); // torn down in finally
+    expect(registry.changeSubscriberCount(id)).toBe(0);
     // The task itself keeps running (abort only stops the stream) — clean it up.
     release();
     await registry.wait(id);

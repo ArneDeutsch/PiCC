@@ -1660,6 +1660,22 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(renderer!(nested, { expanded: false }, undefined)).toBeUndefined();
   });
 
+  it("registers Agent and Task with accepted/capacity wording and the foreground-forcing exception", () => {
+    for (const name of ["Agent", "Task"] as const) {
+      const tool = pi.tools.get(name) as unknown as {
+        description: string;
+        parameters: { properties?: Record<string, { description?: string }> };
+      };
+      const parameter = tool.parameters.properties?.run_in_background?.description ?? "";
+      for (const text of [tool.description, parameter]) {
+        expect(text).toMatch(/accept(?:ed)? (?:the dispatch )?immediately/iu);
+        expect(text).toContain("configured concurrency capacity");
+        expect(text).toContain("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS");
+        expect(text).not.toMatch(/\b(?:started|starts immediately|has started)\b/iu);
+      }
+    }
+  });
+
   it("registered Agent threads a background description through the real TaskOutput wiring", async () => {
     const handle = fakeSdk({ replies: ["BACKGROUND-DONE"] });
     const { p, internals } = await wire();
@@ -1674,7 +1690,7 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(started.content).toEqual([
       {
         type: "text",
-        text: `Background task ${started.details.taskId} started (agent: reviewer, agent id: ${started.details.agentId}). Use TaskOutput with task_id "${started.details.taskId}" to retrieve the result before finalizing.`,
+        text: `Background task ${started.details.taskId} accepted (agent: reviewer, agent id: ${started.details.agentId}); it will run when configured concurrency capacity is available. Use TaskOutput with task_id "${started.details.taskId}" to retrieve the result before finalizing.`,
       },
     ]);
     expect(started.details.description).toBe("Review authentication");

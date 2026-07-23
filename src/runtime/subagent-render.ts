@@ -10,6 +10,7 @@ import { formatElapsed } from "./subagent-panel-render.js";
 import { FORK_DEGRADE_PREFIX, isAgentId } from "../util/subagent-transcripts.js";
 import { genericResultComponent, setToolRowOutcome, type ToolRowOutcome } from "./tool-shell.js";
 import type { Diagnostic } from "../types.js";
+import type { SubagentAdmission } from "./subagent-registry.js";
 
 // --- live-progress + result rendering helpers ---
 //
@@ -53,6 +54,7 @@ export interface SubagentRenderDetails {
   background?: boolean;
   taskId?: string;
   status?: "running" | "completed" | "failed" | "stopped";
+  admission?: SubagentAdmission;
   outcome?: "completed" | "failed" | "aborted";
   agent?: string;
   agentId?: string;
@@ -200,6 +202,8 @@ function normalizeSubagentRenderDetails(value: unknown): SubagentRenderDetails |
   if (status === "running" || status === "completed" || status === "failed" || status === "stopped") {
     normalized.status = status;
   }
+  const admission = safeField(value, "admission");
+  if (admission === "waiting" || admission === "admitted") normalized.admission = admission;
   const outcome = safeField(value, "outcome");
   if (outcome === "completed" || outcome === "failed" || outcome === "aborted") normalized.outcome = outcome;
   const delivery = safeField(value, "delivery");
@@ -677,7 +681,13 @@ function runningStatusLines(
   if (usage) optional.push({ separator: " · ", text: usage });
   return lifecycleLine(
     theme,
-    { agent, ...(chip ? { chip } : {}), state: "running", optional, tone: "toolTitle" },
+    {
+      agent,
+      ...(chip ? { chip } : {}),
+      state: details.admission === "waiting" ? "waiting for capacity" : "running",
+      optional,
+      tone: "toolTitle",
+    },
     width,
   );
 }

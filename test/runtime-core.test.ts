@@ -1078,6 +1078,124 @@ describe("SubagentRuntime (fake SDK)", () => {
     expect(results.every((r) => r.ok)).toBe(true);
   });
 
+  it("emits waiting only on actual FIFO queueing and restores admitted before startup", async () => {
+    const releases = new Map<string, () => void>();
+    const entered: string[] = [];
+    const waitForEntry = new Map<string, () => void>();
+    const enteredPromises = new Map(
+      ["holder", "A", "B"].map((name) => [
+        name,
+        new Promise<void>((resolve) => waitForEntry.set(name, resolve)),
+      ]),
+    );
+    const { sdk } = fakeSdk({
+      onPrompt: async (text) => {
+        entered.push(text);
+        waitForEntry.get(text)?.();
+        await new Promise<void>((resolve) => releases.set(text, resolve));
+        if (text === "holder") throw new Error("predecessor failed");
+        return `${text}-done`;
+      },
+    });
+    const registry = new SubagentRegistry();
+    let healthyNotifications = 0;
+    registry.onChange(() => { throw new Error("hostile presentation listener"); });
+    registry.onChange(() => healthyNotifications++);
+    const runtime = makeSubagentRuntime([makeAgent()], sdk, {
+      concurrency: 1,
+      subagentRegistry: registry,
+    });
+    const phases = new Map<string, string[]>();
+    const dispatch = (name: string, agentId: string) => runtime.dispatch({
+      subagentType: "reviewer",
+      prompt: name,
+      depth: 1,
+      agentId,
+      onAdmission: (phase) => phases.set(name, [...(phases.get(name) ?? []), phase]),
+    });
+
+    const holder = dispatch("holder", "agent-000000000001");
+    await enteredPromises.get("holder");
+    const a = dispatch("A", "agent-000000000002");
+    const b = dispatch("B", "agent-000000000003");
+    expect(phases.get("holder")).toEqual(["admitted"]);
+    expect(phases.get("A")).toEqual(["waiting"]);
+    expect(phases.get("B")).toEqual(["waiting"]);
+    expect(registry.get("agent-000000000002")?.admission).toBe("waiting");
+
+    releases.get("holder")!();
+    await enteredPromises.get("A");
+    expect(entered).toEqual(["holder", "A"]);
+    expect(phases.get("A")).toEqual(["waiting", "admitted"]);
+    releases.get("A")!();
+    await enteredPromises.get("B");
+    expect(entered).toEqual(["holder", "A", "B"]);
+    expect(phases.get("B")).toEqual(["waiting", "admitted"]);
+    releases.get("B")!();
+    const [holderResult, aResult, bResult] = await Promise.all([holder, a, b]);
+    expect(holderResult.outcome).toBe("failed");
+    expect(aResult.outcome).toBe("completed");
+    expect(bResult.outcome).toBe("completed");
+    expect(healthyNotifications).toBeGreaterThan(0);
+  });
+
+  it("preserves FIFO when a synchronous waiting observer reentrantly queues another dispatch", async () => {
+    const releases = new Map<string, () => void>();
+    const entered: string[] = [];
+    const enteredGates = new Map<string, () => void>();
+    const enteredPromises = new Map(
+      ["holder", "A", "B"].map((name) => [
+        name,
+        new Promise<void>((resolve) => enteredGates.set(name, resolve)),
+      ]),
+    );
+    const { sdk } = fakeSdk({
+      onPrompt: async (text) => {
+        entered.push(text);
+        enteredGates.get(text)?.();
+        await new Promise<void>((resolve) => releases.set(text, resolve));
+        return `${text}-done`;
+      },
+    });
+    const runtime = makeSubagentRuntime([makeAgent()], sdk, { concurrency: 1 });
+    const holder = runtime.dispatch({ subagentType: "reviewer", prompt: "holder", depth: 1 });
+    await enteredPromises.get("holder");
+    let b: ReturnType<typeof runtime.dispatch> | undefined;
+    const a = runtime.dispatch({
+      subagentType: "reviewer",
+      prompt: "A",
+      depth: 1,
+      onAdmission: (phase) => {
+        if (phase === "waiting" && !b) {
+          b = runtime.dispatch({ subagentType: "reviewer", prompt: "B", depth: 1 });
+        }
+      },
+    });
+    expect(b).toBeDefined();
+
+    releases.get("holder")!();
+    await enteredPromises.get("A");
+    expect(entered).toEqual(["holder", "A"]);
+    releases.get("A")!();
+    await enteredPromises.get("B");
+    expect(entered).toEqual(["holder", "A", "B"]);
+    releases.get("B")!();
+    expect((await Promise.all([holder, a, b!])).every((result) => result.ok)).toBe(true);
+  });
+
+  it("foreground nested bypass reports admitted without queueing", async () => {
+    const phases: string[] = [];
+    const { runtime } = makeRuntime([makeAgent()], ["done"], { concurrency: 1 });
+    const result = await runtime.dispatch({
+      subagentType: "reviewer",
+      prompt: "nested",
+      depth: 2,
+      onAdmission: (phase) => phases.push(phase),
+    });
+    expect(result.ok).toBe(true);
+    expect(phases).toEqual(["admitted"]);
+  });
+
   it("case-insensitive agent resolution", async () => {
     const { runtime } = makeRuntime([makeAgent({ name: "Reviewer" })], ["ok"]);
     const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
@@ -2374,7 +2492,7 @@ describe("Subagent live progress", () => {
     const result = tool
       .renderResult(
         {
-          content: [{ type: "text", text: "Background task task-1 started" }],
+          content: [{ type: "text", text: "Background task task-1 accepted" }],
           details: { background: true, taskId: "task-1", agent: "reviewer", description: "Review auth" },
         },
         { isPartial: false },
@@ -2383,7 +2501,7 @@ describe("Subagent live progress", () => {
       .render(120)
       .join("\n");
     expect(result).toBe("Agent(reviewer) → Task(task-1) background - Review auth");
-    expect(result).not.toContain("Background task task-1 started");
+    expect(result).not.toContain("Background task task-1 accepted");
   });
 
   it("unsubscribes from the session event stream after dispatch settles (FIX-B)", async () => {
@@ -2509,7 +2627,7 @@ describe("TaskOutput identity render", () => {
       taskId: "task-2",
       agent: "reviewer",
       agentId: "agent-0123456789ab",
-    }, "Background task task-2 started");
+    }, "Background task task-2 accepted");
     expect(out).toBe("Agent(reviewer) → Task(task-2) background");
     expect(out).not.toContain("agent-0123456789ab");
     expect(out).not.toContain("TaskOutput");

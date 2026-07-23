@@ -364,9 +364,9 @@ describe.skipIf(cliMissing)(
 
         expect(result.code).toBe(0);
         const startResult = result.requests.find((r) =>
-          /Background task task-\d+ started/.test(toolResultText(r)),
+          /Background task task-\d+ accepted/.test(toolResultText(r)),
         );
-        expect(startResult, "expected the immediate background-start tool result").toBeDefined();
+        expect(startResult, "expected the immediate background-acceptance tool result").toBeDefined();
 
         const taskOutputCalls = uniqueAssistantToolCalls(result.requests, "TaskOutput");
         expect(taskOutputCalls).toHaveLength(1);
