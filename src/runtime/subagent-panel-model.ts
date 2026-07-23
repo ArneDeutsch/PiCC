@@ -55,6 +55,8 @@ export interface PanelTaskInfo {
   status: "running" | "completed" | "failed" | "stopped";
   /** Runtime-derived concurrency admission; absent compatibility data is admitted. */
   admission?: "waiting" | "admitted";
+  /** Failed task retained a live checkpoint-paused child and remains stoppable. */
+  checkpointPaused?: boolean;
   /** Task-side terminal timestamp, including an immediate queued-stop timestamp. */
   settledAt?: number;
   /** The dispatched child's identity — the join key against registry records. */

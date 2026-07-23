@@ -705,15 +705,19 @@ export class BackgroundTaskRegistry {
    * marks the record user-stopped, then performs the same best-effort stop
    * transition as {@link stop}. The marker is what lets TaskOutput details
    * consumers distinguish "stopped by user" from a model stop; callers pair
-   * it with `SubagentRegistry.markUserStopped`, which makes the
-   * stop permanent for the agent id. The marker is set only when the task is
-   * running (or already stopped): a completed/failed task cannot be
-   * retroactively claimed as user-stopped.
+   * it with `SubagentRegistry.markUserStopped`, which makes the stop permanent
+   * for the agent id. A failed generation explicitly retaining a
+   * checkpoint-paused child remains user-stoppable; ordinary completed/failed
+   * tasks cannot be retroactively claimed as user-stopped.
    */
   markUserStopped(id: string): { found: boolean; alreadySettled: boolean; abortRequested: boolean } {
     const task = this.tasks.get(id);
     if (!task) return { found: false, alreadySettled: false, abortRequested: false };
-    if (task.status === "running" || task.status === "stopped") {
+    if (
+      task.status === "running" ||
+      task.status === "stopped" ||
+      (task.status === "failed" && task.checkpointPaused === true)
+    ) {
       task.userStopped = true;
       this.notifyChange(id);
     }

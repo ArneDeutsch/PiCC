@@ -621,9 +621,9 @@ export function oneShotRefusal(record: SubagentRegistryRecord): string {
  * so the refusal rules cannot drift per caller. On `ok` it hands back the
  * bound steer entry point, so a caller cannot pass the guard and then reach a
  * different session. Refusals, in order: one-shot builtins, user-stopped
- * agents (permanent), not-running records, and running records without a live
- * steerable handle (the transient minimal-register window, or a fake/older
- * SDK session).
+ * agents (permanent), not-running records, capacity-waiting records, and
+ * running records without a live steerable handle (the transient
+ * minimal-register window, or a fake/older SDK session).
  */
 export function guardSteer(record: SubagentRegistryRecord): SteerGuardResult {
   if (record.oneShot) {

@@ -2641,6 +2641,27 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     await invocation.result;
   });
 
+  it("x stops the newest failed checkpoint-paused generation exactly once", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a");
+    s.tasks.push({ id: "task-old", status: "running", agentId: "agent-a" });
+    s.tasks.push({
+      id: "task-paused",
+      status: "failed",
+      checkpointPaused: true,
+      agentId: "agent-a",
+    });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input("x");
+    expect(s.stopped).toEqual(["task-paused"]);
+    expect(s.stopped.filter((id) => id === "task-paused")).toHaveLength(1);
+    expect(s.registry.get("agent-a")!.userStopped).toBe(true);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
   it("x on a settled row dismisses panel-locally; model-facing state stays untouched", async () => {
     const s = focusSetup();
     reg(s.registry, "agent-a");
@@ -2777,6 +2798,41 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     expect(s.notices()).toContain(panelNoticeStopAllDone(2));
     // The settled FAILED row was never cleared by stop-all.
     expect(invocation.render(160).join("\n")).toContain("failure evidence");
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("stop-all targets only newest failed checkpoint-paused generations exactly once", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a");
+    s.tasks.push({ id: "task-a-old", status: "running", agentId: "agent-a" });
+    s.tasks.push({
+      id: "task-a-paused",
+      status: "failed",
+      checkpointPaused: true,
+      agentId: "agent-a",
+    });
+    reg(s.registry, "agent-b");
+    s.tasks.push({ id: "task-b-failed", status: "failed", agentId: "agent-b" });
+    reg(s.registry, "agent-c");
+    s.tasks.push({
+      id: "task-c-stopped",
+      status: "stopped",
+      checkpointPaused: true,
+      agentId: "agent-c",
+    });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input("X");
+    expect(s.notices()).toContain(panelNoticeStopAllArmed(1));
+    invocation.input("X");
+    expect(s.stopped).toEqual(["task-a-paused"]);
+    expect(s.stopped.filter((id) => id === "task-a-paused")).toHaveLength(1);
+    expect(s.stopped).not.toContain("task-a-old");
+    expect(s.registry.get("agent-a")!.userStopped).toBe(true);
+    expect(s.registry.get("agent-b")!.userStopped).toBeUndefined();
+    expect(s.registry.get("agent-c")!.userStopped).toBeUndefined();
     invocation.input(ESC);
     await invocation.result;
   });

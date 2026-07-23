@@ -326,12 +326,24 @@ describe("dispatch outcome classification", () => {
     const cleanupStarted = new Promise<void>((resolve) => (cleanupEntered = resolve));
     let releaseCleanup!: () => void;
     const cleanupGate = new Promise<void>((resolve) => (releaseCleanup = resolve));
-    const h = fakeSdk({ replies: [{ text: "slot-holder done", gate }] });
+    let releaseB!: () => void;
+    const gateB = new Promise<void>((resolve) => (releaseB = resolve));
+    let releaseC!: () => void;
+    const gateC = new Promise<void>((resolve) => (releaseC = resolve));
+    const h = fakeSdk({
+      replies: [
+        { text: "slot-holder done", gate },
+        { text: "B done", gate: gateB },
+        { text: "C done", gate: gateC },
+      ],
+    });
     const registry = new SubagentRegistry();
     const starts: string[] = [];
     const stops: string[] = [];
     const worktreeEntries: string[] = [];
     const queuedId = "agent-000000000002";
+    const bId = "agent-000000000003";
+    const cId = "agent-000000000004";
     const hookRunner = {
       fire: async (event: string, payload: Record<string, unknown>) => {
         const id = String(payload.agent_id ?? "");
@@ -374,7 +386,10 @@ describe("dispatch outcome classification", () => {
       onAdmission: (phase) => phases.push(phase),
     });
     const third = runtime.dispatch({
-      subagentType: "reviewer", prompt: "later", depth: 1, agentId: "agent-000000000003",
+      subagentType: "reviewer", prompt: "B", depth: 1, agentId: bId,
+    });
+    const fourth = runtime.dispatch({
+      subagentType: "reviewer", prompt: "C", depth: 1, agentId: cId,
     });
     expect(registry.get(queuedId)?.admission).toBe("waiting");
     expect(h.created).toHaveLength(1);
@@ -387,14 +402,26 @@ describe("dispatch outcome classification", () => {
     expect(worktreeEntries).toHaveLength(1);
     releaseCleanup();
     await h.waitForPromptCalls(2);
-    const [r1, r2, r3] = await Promise.all([first, second, third]);
+    expect(starts).toContain(bId);
+    expect(starts).not.toContain(cId);
+    expect(registry.get(cId)?.admission).toBe("waiting");
+    expect(worktreeEntries).toHaveLength(2);
+    expect(h.created).toHaveLength(2);
+
+    releaseB();
+    await h.waitForPromptCalls(3);
+    expect(starts).toContain(cId);
+    expect(worktreeEntries).toHaveLength(3);
+    expect(h.created).toHaveLength(3);
+    releaseC();
+
+    const [r1, r2, r3, r4] = await Promise.all([first, second, third, fourth]);
     expect(r1.outcome).toBe("completed");
     expect(r2.outcome).toBe("aborted");
     expect(r3.outcome).toBe("completed");
+    expect(r4.outcome).toBe("completed");
     expect(stops.filter((id) => id === queuedId)).toHaveLength(1);
     expect(starts).not.toContain(queuedId);
-    expect(worktreeEntries).toHaveLength(2);
-    expect(h.created).toHaveLength(2);
   });
 });
 

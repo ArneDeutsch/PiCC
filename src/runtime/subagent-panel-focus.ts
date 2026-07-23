@@ -169,6 +169,11 @@ type ResolvedTarget =
   | { kind: "settled"; record: SubagentRegistryRecord; keyId: string }
   | { kind: "stale" };
 
+function isStoppableTask(task: PanelTaskInfo): boolean {
+  return task.status === "running" ||
+    (task.status === "failed" && task.checkpointPaused === true);
+}
+
 export class SubagentPanelFocusController {
   private readonly deps: SubagentPanelFocusDeps;
   private nowFn: () => number;
@@ -360,7 +365,7 @@ export class SubagentPanelFocusController {
         if (byAgent.get(task.agentId)?.id !== task.id) return { kind: "stale" };
         const record = this.deps.registry.get(task.agentId);
         if (!record) return { kind: "stale" };
-        return record.state === "running" && task.status === "running"
+        return record.state === "running" && isStoppableTask(task)
           ? { kind: "running-background", record, taskId: task.id }
           : { kind: "settled", record, keyId: selectionKeyId(key) };
       }
@@ -456,7 +461,7 @@ export class SubagentPanelFocusController {
     for (const record of this.deps.registry.list()) {
       if (!record || record.state !== "running" || record.userStopped) continue;
       const task = byAgent.get(record.agentId);
-      if (!task || task.status !== "running") continue; // foreground/terminal task
+      if (!task || !isStoppableTask(task)) continue; // foreground/terminal task
       targets.push({ record, taskId: task.id });
     }
     return targets;

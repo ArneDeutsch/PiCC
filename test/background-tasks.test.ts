@@ -3172,16 +3172,72 @@ describe("BackgroundTaskRegistry.markUserStopped", () => {
     expect(out.details.status).toBe("stopped");
   });
 
-  it("never claims a completed task, and a model TaskStop/stop() sets no user marker", async () => {
+  it("marks a failed checkpoint-paused generation and claims retained cleanup exactly once", async () => {
     const registry = new BackgroundTaskRegistry();
-    const done = registry.start("agent:worker", Promise.resolve(result()));
-    await registry.wait(done);
-    expect(registry.markUserStopped(done)).toEqual({
+    let cleanupCalls = 0;
+    let releaseCleanup!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => (releaseCleanup = resolve));
+    const id = registry.start(
+      "agent:worker",
+      Promise.resolve(result({
+        ok: false,
+        outcome: "failed",
+        error: "checkpoint recovery exhausted",
+        checkpointPaused: true,
+      })),
+      () => {
+        cleanupCalls++;
+        return cleanupGate;
+      },
+    );
+    await registry.wait(id);
+    expect(registry.get(id)).toMatchObject({ status: "failed", checkpointPaused: true });
+
+    expect(registry.markUserStopped(id)).toEqual({
       found: true,
-      alreadySettled: true,
-      abortRequested: false,
+      alreadySettled: false,
+      abortRequested: true,
     });
-    expect(registry.get(done)!.userStopped).toBeUndefined();
+    expect(registry.get(id)).toMatchObject({ status: "stopped", userStopped: true });
+    expect(cleanupCalls).toBe(1);
+    expect(registry.markUserStopped(id)).toEqual({
+      found: true,
+      alreadySettled: false,
+      abortRequested: true,
+    });
+    expect(cleanupCalls).toBe(1);
+    releaseCleanup();
+    await registry.stopAndWait(id);
+    expect(cleanupCalls).toBe(1);
+
+    const out = await (createTaskOutputTool(registry) as unknown as ToolLike).execute("x", {
+      task_id: id,
+    });
+    expect(out.details).toMatchObject({ status: "stopped", userStopped: true });
+    const rendered = renderAgentResult(out, { expanded: false, isPartial: false }, undefined)
+      .render(120)
+      .join("\n");
+    expect(rendered).toContain("stopped by user");
+  });
+
+  it("never claims ordinary completed/failed tasks, and a model TaskStop/stop() sets no user marker", async () => {
+    const registry = new BackgroundTaskRegistry();
+    const terminal = [
+      registry.start("agent:worker", Promise.resolve(result())),
+      registry.start(
+        "agent:worker",
+        Promise.resolve(result({ ok: false, outcome: "failed", error: "boom" })),
+      ),
+    ];
+    for (const id of terminal) {
+      await registry.wait(id);
+      expect(registry.markUserStopped(id)).toEqual({
+        found: true,
+        alreadySettled: true,
+        abortRequested: false,
+      });
+      expect(registry.get(id)!.userStopped).toBeUndefined();
+    }
     expect(registry.markUserStopped("task-999")).toEqual({
       found: false,
       alreadySettled: false,

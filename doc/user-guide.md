@@ -198,8 +198,8 @@ Every subagent is visible, both to you and to the coordinating model:
   deviation: Claude Code keeps finished agents listed until dismissed. An expired row is not lost:
   `alt+a` reopens the panel with every finished agent still listed, and the condensed record in
   the chat (below) arrives once the conversation continues. While the panel has keyboard focus,
-  no row expires on its own (dismissing with `d` still removes). When several agents run at once,
-  a one-time hint names the entry key.
+  no row expires on its own (dismissing with `d` still removes). When multiple agents are accepted,
+  including capacity waiters, a one-time hint names the entry key.
 - **Panel navigation (`alt+a`).** Press `alt+a` to focus the panel; a `❯` marker shows the
   selection, and the footer hint lists the keys: `↑↓ select · enter open · x stop · X stop all ·
   d dismiss · esc close`. Stopping from the panel is **background-only** — a foreground agent is
@@ -208,14 +208,15 @@ Every subagent is visible, both to you and to the coordinating model:
   user-stopped agent cannot be steered or resumed afterwards, not even by the model.
 - **Drill-down.** Enter opens the selected agent: its initial prompt (collapsed; `ctrl+p`
   expands), bounded structured live detail (auto-following; `↑↓` scrolls, scrolling back stops
-  the follow), and — once settled — its final answer. `ctrl+x` stops a running background agent
-  (on a settled one it dismisses). While a background agent runs, type a steering message
-  directly into the drill-down and press Enter to send; it is delivered before the agent's next
-  model call (the confirmation is optimistic — a delivery failure replaces it). **Caveat:**
-  drill-down steering does not fire the project's `UserPromptSubmit` hooks — a PiCC decision.
-  Esc steps back one layer: drill-down → list → editor (with typed steer text, the first Esc
-  clears the text; where steering is unavailable — foreground, one-shot, user-stopped — the view
-  says so instead of offering an input line).
+  the follow), and — once settled — its final answer. `ctrl+x` stops an admitted running or
+  capacity-waiting background agent (on a settled one it dismisses). While an admitted background
+  agent runs, type a steering message directly into the drill-down and press Enter to send; it is
+  delivered before the agent's next model call (the confirmation is optimistic — a delivery failure
+  replaces it). **Caveat:** drill-down steering does not fire the project's `UserPromptSubmit`
+  hooks — a PiCC decision. Esc steps back one layer: drill-down → list → editor (with typed steer
+  text, the first Esc clears the text; where steering is unavailable — waiting for capacity until
+  admission, foreground, one-shot, or user-stopped — the view says so instead of offering an input
+  line).
 - **Condensed transcript records.** Subagent output does not stream into the chat; selected-agent
   detail owns the live view. Each depth-1 normal-path result replaces its pending call in the same
   tool row; background completion adds one collapsed record — outcome, duration, tokens — that
