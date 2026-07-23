@@ -33,8 +33,22 @@ describe("buildMcpProxyTools proxy construction", () => {
       sourceFor([toolInfo({ serverName: "files", toolName: "list-dir", description: "lists a dir" })]),
     );
     expect(proxy?.name).toBe("mcp__files__list-dir");
-    expect(proxy?.label).toBe("mcp__files__list-dir");
+    expect(proxy?.label).toBe("list-dir (files MCP)");
     expect(proxy?.description).toBe("lists a dir");
+  });
+
+  it("derives labels from authoritative component metadata, including ambiguous wire names", () => {
+    const components = [
+      { serverName: "Srv.Name_", toolName: "_find__Item-", label: "_find__Item- (Srv.Name_ MCP)" },
+      { serverName: "srv_", toolName: "echo", label: "echo (srv_ MCP)" },
+      { serverName: "srv", toolName: "_echo", label: "_echo (srv MCP)" },
+    ];
+    const proxies = buildMcpProxyTools(sourceFor(components.map((component) => toolInfo(component))));
+    expect(proxies.map(({ name, label }) => ({ name, label }))).toEqual([
+      { name: "mcp__Srv.Name____find__Item-", label: "_find__Item- (Srv.Name_ MCP)" },
+      { name: "mcp__srv___echo", label: "echo (srv_ MCP)" },
+      { name: "mcp__srv___echo", label: "_echo (srv MCP)" },
+    ]);
   });
 
   it("never sets promptSnippet or promptGuidelines (zero-context hard invariant)", () => {

@@ -1625,7 +1625,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           const routineRendered = withRoutineToolRendering(proxy);
           const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
           pi.registerTool(mainCheckpointGate.wrapTool(
-            wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
+            wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>, {
+              fallbackCallDisplayName: proxy.label,
+            }),
           ));
         } catch (err) {
           console.error(`PiCC: failed to register MCP tool "${proxy.name}": ${(err as Error).message}`);

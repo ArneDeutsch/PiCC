@@ -10,6 +10,10 @@ import { formatToolDisplayName } from "./tool-display.js";
 
 type Component = { render(width: number): string[] };
 
+interface SelfShellOptions {
+  fallbackCallDisplayName?: string;
+}
+
 /** The render context Pi threads to renderCall/renderResult. */
 export interface RenderCtx {
   isPartial?: boolean;
@@ -431,10 +435,13 @@ function shellComponent(
   return component;
 }
 
+function genericDisplayCallComponent(displayName: string, theme: unknown): Component {
+  return { render: () => [safeGenericStyle(theme, "text", displayName, true)] };
+}
+
 /** Pi-compatible generic call fallback for renderer-less or failed renderer construction. */
 export function genericCallComponent(toolName: string, theme: unknown): Component {
-  const displayName = formatToolDisplayName(toolName);
-  return { render: () => [safeGenericStyle(theme, "text", displayName, true)] };
+  return genericDisplayCallComponent(formatToolDisplayName(toolName), theme);
 }
 
 /** Pi-compatible generic textual result fallback. */
@@ -518,9 +525,13 @@ export function getTextOutput(result: ResultShape | undefined, showImages: boole
  * Put a tool behind Pi's public self-render shell and add one foreground state glyph to the
  * invocation's first visible textual line. The wrapper preserves every non-rendering field.
  */
-export function wrapForSelfShell(tool: Record<string, unknown>): Record<string, unknown> {
+export function wrapForSelfShell(
+  tool: Record<string, unknown>,
+  options: SelfShellOptions = {},
+): Record<string, unknown> {
   const owner = {};
   const toolName = typeof tool.name === "string" ? tool.name : "";
+  const fallbackCallDisplayName = options.fallbackCallDisplayName;
   const innerCall = typeof tool.renderCall === "function" ? tool.renderCall as CallRenderer : undefined;
   const innerResult = typeof tool.renderResult === "function" ? tool.renderResult as ResultRenderer : undefined;
 
@@ -533,7 +544,9 @@ export function wrapForSelfShell(tool: Record<string, unknown>): Record<string, 
       const context = derivedContext(ctx, previous?.inner);
       const inner = constructInner(
         innerCall ? (derived) => innerCall(args, theme, derived) : undefined,
-        () => genericCallComponent(toolName, theme),
+        () => fallbackCallDisplayName === undefined
+          ? genericCallComponent(toolName, theme)
+          : genericDisplayCallComponent(fallbackCallDisplayName, theme),
         context,
         generation,
       );

@@ -4,12 +4,14 @@ import { defineConfig } from "vitest/config";
  * Two projects share one config so a single `vitest run` covers both lanes:
  *
  *  - `unit`  — everything except the real-Pi e2e files (`**​/e2e-*.test.ts`).
- *  - `e2e`   — the `test/e2e-*.test.ts` files, each of which spawns the real Pi
- *              CLI plus nested subagent children. Their fork count is capped
- *              (`maxWorkers`, vitest 4's replacement for the removed
- *              `poolOptions.forks.maxForks`) so concurrent real-process spawns
- *              never oversubscribe a small CI runner and trip the run-timeout
- *              kill. The cap is the contention lever — we do NOT raise timeouts.
+ *  - `e2e`   — the `test/e2e-*.test.ts` files, each of which runs the real Pi
+ *              CLI with mock-model infrastructure; subagent scenarios also
+ *              spawn nested Pi children.
+ *
+ * Both projects retain fork parallelism but cap `maxWorkers` at two. Unit tests
+ * also include real Git, hook, and MCP children, so bounding each lane limits
+ * process multiplication and reduces oversubscription risk on small runners.
+ * The cap is the contention lever — we do NOT raise timeouts.
  *
  * `coverage` stays at the config ROOT (it is a root-only option in vitest 4 and
  * instruments only in-process code, i.e. the non-e2e lane); `test:coverage`
@@ -45,6 +47,7 @@ export default defineConfig({
           testTimeout: 30000,
           hookTimeout: 30000,
           pool: "forks",
+          maxWorkers: 2,
         },
       },
       {
@@ -54,15 +57,14 @@ export default defineConfig({
           testTimeout: 30000,
           hookTimeout: 30000,
           pool: "forks",
-          // Each e2e file's Pi child spawns more children (subagent Pi + mock
-          // server), so real-process count is multiplicative — keep this small.
+          // Every e2e file runs a real Pi CLI with mock-model infrastructure;
+          // subagent scenarios add nested Pi children, so bounded concurrency
+          // keeps the multiplicative process count small.
           // vitest 4 has no per-project (or top-level) `minWorkers`; the cap is
           // `maxWorkers`, which replaced the removed poolOptions.forks.maxForks.
-          // Validated on the 2-core CI runner (Phase 9).
           maxWorkers: 2,
-          // vitest requires projects with a distinct maxWorkers to run in their
-          // own group; a later groupOrder runs the capped e2e lane after the
-          // unit lane under a full `vitest run`.
+          // Keep the real-Pi lane after the unit lane so their bounded worker
+          // pools do not multiply the suite's child-process load.
           sequence: { groupOrder: 1 },
         },
       },
