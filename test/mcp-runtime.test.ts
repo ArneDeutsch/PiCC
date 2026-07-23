@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { McpRuntime, type McpRuntimeDeps } from "../src/runtime/mcp.js";
+import { renderMcpStatusReport } from "../src/registry/compat-report.js";
 import type { ResolvedMcpConfig, ResolvedMcpServer } from "../src/types.js";
 import { waitUntil } from "./helpers/async.js";
 import { createMcpProcessFixture, processIsAlive } from "./helpers/mcp-process.js";
@@ -115,12 +116,15 @@ describe("McpRuntime zero-enabled path", () => {
     const fixture = createMcpProcessFixture(makeTempDir());
     // Default MCP_TIMEOUT (30 s): what settles this test is shutdown(), not the
     // connect bound — pinning the non-blocking start contract.
-    const runtime = McpRuntime.start(
-      makeConfig(
-        makeServer({ name: "hang", args: [fixture.serverScript, "hang-initialize"], env: fixture.env }),
-      ),
-      makeDeps(),
+    const config = makeConfig(
+      makeServer({
+        name: "hang",
+        args: [fixture.serverScript, "hang-initialize", "ARG_CANARY"],
+        env: { ...fixture.env, TOKEN: "ENV_CANARY" },
+        rawCommand: "SHUTDOWN_RAW_COMMAND_CANARY",
+      }),
     );
+    const runtime = McpRuntime.start(config, makeDeps());
     try {
       expect(runtime.tools()).toEqual([]);
       expect(runtime.serverStates()).toEqual([
@@ -131,7 +135,19 @@ describe("McpRuntime zero-enabled path", () => {
       await runtime.shutdown();
       await runtime.whenSettled();
       await waitForDeath(pid, "hanging server after shutdown");
-      expect(runtime.serverStates()[0]?.state).toBe("failed");
+      expect(runtime.serverStates()[0]).toMatchObject({
+        state: "failed",
+        statusSummary: "Connection stopped because the session shut down.",
+      });
+      const report = renderMcpStatusReport(config, runtime.serverStates());
+      for (const canary of [
+        "hang-initialize",
+        "ARG_CANARY",
+        "ENV_CANARY",
+        "SHUTDOWN_RAW_COMMAND_CANARY",
+      ]) {
+        expect(report).not.toContain(canary);
+      }
     } finally {
       await runtime.shutdown();
       await fixture.cleanup();
@@ -291,6 +307,156 @@ describe("McpRuntime stdio lifecycle", () => {
 // ---------------------------------------------------------------------------
 
 describe("McpRuntime degrade paths", () => {
+  it("publishes an independent safe summary when the optional SDK fails to load", async () => {
+    const config = makeConfig(
+      makeServer({
+        name: "sdk-failure",
+        command: "C:/EXPANDED_PATH_CANARY/server.exe",
+        args: ["ARG_CANARY"],
+        env: { TOKEN: "ENV_CANARY" },
+        rawCommand: "RAW_COMMAND_CANARY",
+      }),
+    );
+    const runtime = McpRuntime.start(
+      config,
+      makeDeps({
+        loadSdk: async () => {
+          throw new Error("EXCEPTION_CANARY C:/PRIVATE_PATH_CANARY");
+        },
+      }),
+    );
+    try {
+      await runtime.whenSettled();
+      const state = runtime.serverStates()[0];
+      expect(state?.statusSummary).toBe(
+        "MCP support is unavailable because its SDK could not be loaded.",
+      );
+      expect(state?.diagnostic).toContain("sdk failed to load (Error)");
+      const report = renderMcpStatusReport(config, runtime.serverStates());
+      expect(report).toContain(state!.statusSummary!);
+      for (const canary of [
+        "EXPANDED_PATH_CANARY",
+        "ARG_CANARY",
+        "ENV_CANARY",
+        "RAW_COMMAND_CANARY",
+        "EXCEPTION_CANARY",
+        "PRIVATE_PATH_CANARY",
+      ]) {
+        expect(report).not.toContain(canary);
+        expect(state?.statusSummary).not.toContain(canary);
+      }
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("reports a safe umbrella failure when tool discovery rejects after initialization", async () => {
+    let initialized = false;
+    let discoveryAttempted = false;
+    class FakeTransport {
+      readonly pid = undefined;
+      readonly stderr = undefined;
+      constructor(_options: unknown) {}
+    }
+    class RejectingDiscoveryClient {
+      constructor(_clientInfo: unknown, _options: unknown) {}
+      async connect(_transport: unknown): Promise<void> {
+        initialized = true;
+      }
+      async listTools(_params: unknown): Promise<never> {
+        discoveryAttempted = true;
+        throw new Error("LIST_TOOLS_EXCEPTION_CANARY C:/PRIVATE_DISCOVERY_PATH");
+      }
+      async close(): Promise<void> {}
+    }
+    const config = makeConfig(
+      makeServer({ name: "discovery-reject", rawCommand: "DISCOVERY_RAW_COMMAND_CANARY" }),
+    );
+    const runtime = McpRuntime.start(
+      config,
+      makeDeps({
+        loadSdk: async () =>
+          ({
+            Client: RejectingDiscoveryClient,
+            StdioClientTransport: FakeTransport,
+          }) as unknown as Awaited<ReturnType<NonNullable<McpRuntimeDeps["loadSdk"]>>>,
+      }),
+    );
+    try {
+      await runtime.whenSettled();
+      expect(initialized).toBe(true);
+      expect(discoveryAttempted).toBe(true);
+      const state = runtime.serverStates()[0];
+      expect(state).toMatchObject({
+        state: "failed",
+        statusSummary:
+          "MCP startup failed during connection, initialization, or tool discovery; run /doctor for details.",
+      });
+      const report = renderMcpStatusReport(config, runtime.serverStates());
+      expect(report).toContain(state!.statusSummary!);
+      expect(report).not.toContain("LIST_TOOLS_EXCEPTION_CANARY");
+      expect(report).not.toContain("PRIVATE_DISCOVERY_PATH");
+      expect(report).not.toContain("DISCOVERY_RAW_COMMAND_CANARY");
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("reports a safe umbrella timeout when tool discovery does not settle after initialization", async () => {
+    let initialized = false;
+    let discoveryAttempted = false;
+    let closed = false;
+    class FakeTransport {
+      readonly pid = undefined;
+      readonly stderr = undefined;
+      constructor(_options: unknown) {}
+    }
+    class HangingDiscoveryClient {
+      constructor(_clientInfo: unknown, _options: unknown) {}
+      async connect(_transport: unknown): Promise<void> {
+        initialized = true;
+      }
+      listTools(_params: unknown): Promise<never> {
+        discoveryAttempted = true;
+        return new Promise<never>(() => {});
+      }
+      async close(): Promise<void> {
+        closed = true;
+      }
+    }
+    const config = makeConfig(
+      makeServer({ name: "discovery-timeout", rawCommand: "DISCOVERY_TIMEOUT_RAW_CANARY" }),
+    );
+    const runtime = McpRuntime.start(
+      config,
+      makeDeps({
+        env: { ...cleanBaseEnv(), MCP_TIMEOUT: "20" },
+        loadSdk: async () =>
+          ({
+            Client: HangingDiscoveryClient,
+            StdioClientTransport: FakeTransport,
+          }) as unknown as Awaited<ReturnType<NonNullable<McpRuntimeDeps["loadSdk"]>>>,
+      }),
+    );
+    try {
+      await runtime.whenSettled();
+      expect(initialized).toBe(true);
+      expect(discoveryAttempted).toBe(true);
+      expect(closed).toBe(true);
+      const state = runtime.serverStates()[0];
+      expect(state).toMatchObject({
+        state: "failed",
+        statusSummary:
+          "MCP startup timed out during connection, initialization, or tool discovery after 20 ms; run /doctor for details.",
+      });
+      const report = renderMcpStatusReport(config, runtime.serverStates());
+      expect(report).toContain(state!.statusSummary!);
+      expect(report).not.toContain("DISCOVERY_TIMEOUT_RAW_CANARY");
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
   it("times out a hung initialize, kills its tree, and leaves other servers unaffected", async () => {
     const fixture = createMcpProcessFixture(makeTempDir());
     const runtime = McpRuntime.start(
@@ -311,6 +477,17 @@ describe("McpRuntime degrade paths", () => {
       expect(states.get("hung")).toMatchObject({ state: "failed" });
       expect(states.get("hung")?.diagnostic).toMatch(/failed to connect within 8000 ms/);
       expect(states.get("hung")?.diagnostic).toContain("hang-cmd");
+      expect(states.get("hung")?.statusSummary).toBe(
+        "MCP startup timed out during connection, initialization, or tool discovery after 8000 ms; run /doctor for details.",
+      );
+      const status = renderMcpStatusReport(
+        makeConfig(makeServer({ name: "hung", rawCommand: "hang-cmd" })),
+        runtime.serverStates(),
+      );
+      expect(status).toContain(
+        "MCP startup timed out during connection, initialization, or tool discovery after 8000 ms; run /doctor for details.",
+      );
+      expect(status).not.toContain("hang-cmd");
       expect(runtime.diagnostics().some((d) => d.includes('"hung"'))).toBe(true);
       // Only the healthy server's tools are exposed.
       expect(runtime.tools().every((t) => t.serverName === "healthy")).toBe(true);
@@ -335,7 +512,12 @@ describe("McpRuntime degrade paths", () => {
     try {
       await runtime.whenSettled();
       expect(runtime.serverStates()).toEqual([
-        expect.objectContaining({ name: "quitter", state: "failed" }),
+        expect.objectContaining({
+          name: "quitter",
+          state: "failed",
+          statusSummary:
+            "MCP startup failed during connection, initialization, or tool discovery; run /doctor for details.",
+        }),
       ]);
       expect(runtime.diagnostics().join("\n")).toContain('"quitter"');
       expect(runtime.tools()).toEqual([]);
@@ -388,6 +570,11 @@ describe("McpRuntime degrade paths", () => {
       expect(diagnostic).not.toMatch(/[\n\r\t]/);
       expect(diagnostic).not.toContain("y".repeat(500));
       expect(diagnostic.length).toBeLessThanOrEqual(700);
+      expect(runtime.serverStates()[0]?.statusSummary).toBe(
+        "MCP startup timed out during connection, initialization, or tool discovery after 4000 ms; run /doctor for details.",
+      );
+      expect(renderMcpStatusReport(makeConfig(makeServer({ name: "garbage" })), runtime.serverStates()))
+        .not.toContain("GARBAGE_STDERR_TAIL_MARKER");
       pid = Number(fs.readFileSync(pidFile, "utf8"));
       await waitForDeath(pid, "garbage server after connect timeout");
     } finally {
@@ -425,6 +612,15 @@ describe("McpRuntime degrade paths", () => {
       expect(all).not.toContain("picc-secret-expanded-value");
       const state = runtime.serverStates()[0];
       expect(state?.diagnostic ?? "").not.toContain("picc-secret-expanded-value");
+      expect(state?.statusSummary).toBe(
+        "MCP startup failed during connection, initialization, or tool discovery; run /doctor for details.",
+      );
+      const report = renderMcpStatusReport(
+        makeConfig(makeServer({ name: "leaky", command: expandedSecret })),
+        runtime.serverStates(),
+      );
+      expect(report).not.toContain("picc-secret-expanded-value");
+      expect(report).not.toContain("${MCP_SERVER_BIN}");
     } finally {
       await runtime.shutdown();
     }
@@ -615,12 +811,15 @@ describe("McpRuntime kill discipline", () => {
 
   it("shutdown is idempotent, safe to call twice concurrently, and truthful afterwards", async () => {
     const fixture = createMcpProcessFixture(makeTempDir());
-    const runtime = McpRuntime.start(
-      makeConfig(
-        makeServer({ name: "fixture", args: [fixture.serverScript, "serve"], env: fixture.env }),
-      ),
-      makeDeps(),
+    const config = makeConfig(
+      makeServer({
+        name: "fixture",
+        args: [fixture.serverScript, "serve"],
+        env: fixture.env,
+        rawCommand: "CONNECTED_SHUTDOWN_RAW_CANARY",
+      }),
     );
+    const runtime = McpRuntime.start(config, makeDeps());
     try {
       await runtime.whenSettled();
       const pid = fixture.pidOf("serve.pid");
@@ -634,9 +833,13 @@ describe("McpRuntime kill discipline", () => {
           name: "fixture",
           state: "failed",
           diagnostic: expect.stringMatching(/shut down/),
+          statusSummary: "Connection closed because the session shut down.",
         }),
       ]);
       expect(runtime.tools()).toEqual([]);
+      expect(renderMcpStatusReport(config, runtime.serverStates())).not.toContain(
+        "CONNECTED_SHUTDOWN_RAW_CANARY",
+      );
     } finally {
       await runtime.shutdown();
       await fixture.cleanup();

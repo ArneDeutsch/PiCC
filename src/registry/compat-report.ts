@@ -15,6 +15,7 @@ import type {
 import { SUPPORTED_HOOK_EVENTS } from "../types.js";
 import { loadPluginHooks, type InstalledPlugin } from "../claude/plugins.js";
 import { modelSupportsImages } from "../util/model.js";
+import { neutralizeControlChars } from "../util/neutralize-text.js";
 import type { ResolvedCompactionConfig } from "../runtime/steering.js";
 import {
   CAPABILITY_REGISTRY,
@@ -43,10 +44,10 @@ export interface CompatReport {
   /** Inputs unknown at the baseline — surfaced as unassessed. */
   unassessed: string[];
   /**
-   * Pending-approval MCP servers, as a single short line for the one-time
+   * Pending-approval MCP servers, as one bounded terminal-safe line for the
    * session-start `ctx.ui.notify(...)`. Pending servers are ACTIONABLE STATE,
    * not a compat finding, so this survives the otherwise-quiet startup; the
-   * full enable/decline edit lives in the `/doctor` pending finding.
+   * bounded enable/decline guidance lives in the human-facing reports.
    */
   mcpPendingNotice?: string;
 }
@@ -295,10 +296,8 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
   if (pendingNames.length > 0) {
     const cap = lookupCapability("feature.mcp-project-approval");
     if (cap) {
-      // With the startup compat surface gone, this /doctor finding is the ONE
-      // canonical carrier of the exact enable/decline settings edit; the
-      // one-time session-start notify (mcpPendingNotice below) only names the
-      // servers and points here.
+      // The one-time session-start notice carries only bounded approval/decline
+      // direction; report surfaces carry the complete least-authority guidance.
       addFinding(
         cap,
         `MCP server(s) pending approval: ${mcpNameList(pendingNames)} — ${mcpPendingEditDetail(pendingNames)}`,
@@ -350,19 +349,27 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
 }
 
 // ---------------------------------------------------------------------------
-// MCP surfaces — pending notice + /doctor posture line
+// MCP surfaces — pending notice + status renderer + /doctor posture line
 // ---------------------------------------------------------------------------
 
 const EMPTY_MCP: ResolvedMcpConfig = { servers: [], diagnostics: [] };
 
 /** Cap on server names quoted in one list — a hostile config must not flood a line. */
 const MCP_NAME_LIST_MAX = 8;
+const MCP_PENDING_COPY_NAME_MAX = 128;
 
 /** Bound on a per-server diagnostic quoted on the /doctor posture line. */
 const MCP_POSTURE_DIAG_MAX_CHARS = 240;
 
+function quotedMcpName(name: string, max: number): string {
+  return JSON.stringify(mcpStatusScalar(name, max) || "(unnamed)");
+}
+
 function mcpNameList(names: string[]): string {
-  const shown = names.slice(0, MCP_NAME_LIST_MAX).join(", ");
+  const shown = names
+    .slice(0, MCP_NAME_LIST_MAX)
+    .map((name) => quotedMcpName(name, MCP_PENDING_COPY_NAME_MAX))
+    .join(", ");
   const rest = names.length - MCP_NAME_LIST_MAX;
   return rest > 0 ? `${shown}, and ${rest} more` : shown;
 }
@@ -374,34 +381,38 @@ function boundPostureDiag(text: string): string {
 }
 
 /**
- * The exact enable/decline settings edit for pending project servers — the
- * body of the /doctor pending finding's evidence.
- * Bounding: past the name-list cap a verbatim JSON enumeration would flood the
- * line — recommend the blanket key instead of listing every name.
+ * Bounded least-authority enable/decline guidance for pending project servers.
+ * Small sets can carry a copyable explicit allowlist; larger sets direct the
+ * user back to configuration rather than turning blanket approval into a
+ * list-bounding shortcut.
  */
 function mcpPendingEditDetail(pendingNames: string[]): string {
   const enable =
-    pendingNames.length > MCP_NAME_LIST_MAX
-      ? `add "enableAllProjectMcpServers": true (or list a subset in "enabledMcpjsonServers")`
-      : `add "enabledMcpjsonServers": ${JSON.stringify(pendingNames)} (or ` +
-        `"enableAllProjectMcpServers": true)`;
+    pendingNames.length <= MCP_NAME_LIST_MAX &&
+    pendingNames.every(
+      (name) => mcpStatusScalar(name, MCP_PENDING_COPY_NAME_MAX) === name,
+    )
+      ? `add "enabledMcpjsonServers": ${JSON.stringify(pendingNames)} for only the server names you explicitly trust`
+      : `inspect your MCP configuration, then add only server names you explicitly trust to "enabledMcpjsonServers"`;
   return (
-    `${enable} in .claude/settings.local.json to start them; list a server in ` +
-    `"disabledMcpjsonServers" to decline it and silence the session-start notice`
+    `${enable} in your user-controlled, untracked .claude/settings.local.json; add names to ` +
+    `"disabledMcpjsonServers" to decline them. Changes apply after reload or in a new session; ` +
+    `this guidance does not change settings. Do not set "enableAllProjectMcpServers": true as a shortcut: ` +
+    `it approves all current and future project servers.`
   );
 }
 
 /**
- * ONE short, self-contained line (toast-truncation-safe): count, capped names,
- * the enabling key, and the /doctor pointer. Startup is otherwise quiet, so
- * this deliberately does NOT carry the full settings edit — the /doctor
- * pending finding (mcpPendingEditDetail) is the canonical carrier of that.
+ * One bounded, terminal-safe line: count, capped structurally quoted names,
+ * approval/decline keys, and the /doctor pointer. Startup is otherwise quiet,
+ * so this deliberately does NOT carry the full settings edit — the bounded
+ * human-facing reports provide the approval and decline guidance.
  */
 function buildMcpPendingNotice(pendingNames: string[]): string {
   return (
     `MCP: ${pendingNames.length} server(s) pending approval (${mcpNameList(pendingNames)}) — ` +
-    `enable with enabledMcpjsonServers in .claude/settings.local.json; run /doctor for the ` +
-    `exact edit and the decline path.`
+    `approve selected names with enabledMcpjsonServers or decline them with disabledMcpjsonServers ` +
+    `in .claude/settings.local.json; run /doctor for details.`
   );
 }
 
@@ -415,6 +426,7 @@ export interface McpServerLiveState {
   state: "connecting" | "connected" | "failed";
   toolCount?: number;
   diagnostic?: string;
+  statusSummary?: string;
 }
 
 /**
@@ -442,8 +454,7 @@ function mcpPostureLine(
       }
       case "pending-approval":
         // No enable/decline hint here — the pending finding rendered below
-        // (registry note + evidence) is the canonical carrier of the edit;
-        // repeating it on the posture line would duplicate it.
+        // carries the bounded guidance; repeating it would duplicate it.
         return `${server.name}: pending approval`;
       case "disabled":
         return `${server.name}: disabled (disabledMcpjsonServers)`;
@@ -460,6 +471,171 @@ function mcpPostureLine(
     }
   });
   return `MCP servers: ${parts.join("; ")}.`;
+}
+
+const MCP_STATUS_DETAIL_MAX = 32;
+const MCP_STATUS_NAME_MAX = 120;
+const MCP_STATUS_SUMMARY_MAX = 180;
+const MCP_STATUS_REPORT_MAX = 16_384;
+
+type McpRenderedState =
+  | "enabled"
+  | "connecting"
+  | "connected"
+  | "failed"
+  | "pending approval"
+  | "disabled"
+  | "skipped";
+
+const MCP_RENDERED_STATE_ORDER: readonly McpRenderedState[] = [
+  "enabled",
+  "connecting",
+  "connected",
+  "failed",
+  "pending approval",
+  "disabled",
+  "skipped",
+];
+
+function mcpStatusScalar(text: string, max: number): string {
+  const wellFormed = text.replace(/\p{Cs}/gu, "�");
+  const oneLine = neutralizeControlChars(wellFormed).replace(/\s+/gu, " ").trim();
+  if (oneLine.length <= max) return oneLine;
+  let slice = oneLine.slice(0, max);
+  if (/[\uD800-\uDBFF]$/.test(slice)) slice = slice.slice(0, -1);
+  return `${slice}…`;
+}
+
+function mcpLiveByName(
+  liveStates: readonly McpServerLiveState[],
+): ReadonlyMap<string, McpServerLiveState> {
+  const byName = new Map<string, McpServerLiveState>();
+  for (const live of liveStates) {
+    if (!byName.has(live.name)) byName.set(live.name, live);
+  }
+  return byName;
+}
+
+function mcpEffectiveState(
+  server: ResolvedMcpConfig["servers"][number],
+  live: McpServerLiveState | undefined,
+): McpRenderedState {
+  if (server.status !== "enabled") {
+    return server.status === "pending-approval" ? "pending approval" : server.status;
+  }
+  return live?.state ?? "enabled";
+}
+
+function mcpStatusRow(
+  server: ResolvedMcpConfig["servers"][number],
+  live: McpServerLiveState | undefined,
+): string {
+  const name = quotedMcpName(server.name, MCP_STATUS_NAME_MAX);
+  switch (mcpEffectiveState(server, live)) {
+    case "enabled":
+      return `- ${name}: enabled; runtime state unavailable`;
+    case "connecting":
+      return `- ${name}: connecting`;
+    case "connected": {
+      const rawCount = live?.toolCount;
+      const count = Number.isSafeInteger(rawCount) && (rawCount ?? -1) >= 0 ? rawCount! : 0;
+      return `- ${name}: connected (${count} ${count === 1 ? "tool" : "tools"})`;
+    }
+    case "failed": {
+      const summary = mcpStatusScalar(live?.statusSummary ?? "", MCP_STATUS_SUMMARY_MAX);
+      return `- ${name}: failed — ${summary || "Connection failed; no safe summary is available; run /doctor for details."}`;
+    }
+    case "pending approval":
+      return `- ${name}: pending approval`;
+    case "disabled":
+      return `- ${name}: disabled`;
+    case "skipped":
+      return `- ${name}: skipped — configuration is unusable; run /doctor for details`;
+  }
+}
+
+function mcpStatusPendingGuidance(
+  pendingNames: readonly string[],
+  allPendingDisplayed: boolean,
+): string[] {
+  if (pendingNames.length === 0) return [];
+  const exactNames = pendingNames.every(
+    (name) => mcpStatusScalar(name, MCP_PENDING_COPY_NAME_MAX) === name,
+  );
+  const explicit =
+    pendingNames.length <= MCP_NAME_LIST_MAX && allPendingDisplayed && exactNames;
+  const enable = explicit
+    ? `Add "enabledMcpjsonServers": ${JSON.stringify(pendingNames)} for only the server names you explicitly trust.`
+    : `Inspect your MCP configuration, then add only server names you explicitly trust to "enabledMcpjsonServers".`;
+  return [
+    "Pending-server guidance (read-only):",
+    `${enable} Put approval in your user-controlled, untracked .claude/settings.local.json.`,
+    `Add server names to "disabledMcpjsonServers" to decline them. Changes apply after reload or in a new session; /mcp did not change settings.`,
+    `Do not set "enableAllProjectMcpServers": true as a shortcut: it approves all current and future project servers.`,
+  ];
+}
+
+/**
+ * Read-only, aggregate-bounded MCP status report. Arbitrary diagnostics and
+ * configuration values are never interpolated; names are normalized and
+ * failure summaries come only from the runtime's independently safe field.
+ */
+export function renderMcpStatusReport(
+  mcp: ResolvedMcpConfig | undefined,
+  liveStates: readonly McpServerLiveState[],
+): string {
+  const config = mcp ?? EMPTY_MCP;
+  const lines = ["MCP status (read-only)"];
+  if (config.servers.length === 0) {
+    lines.push(
+      config.diagnostics.length > 0
+        ? "No usable MCP servers were resolved."
+        : "No MCP servers are configured.",
+    );
+  } else {
+    lines.push(`Configured servers: ${config.servers.length}`);
+  }
+
+  const liveByName = mcpLiveByName(liveStates);
+  const detailCount = Math.min(config.servers.length, MCP_STATUS_DETAIL_MAX);
+  for (let index = 0; index < detailCount; index += 1) {
+    const server = config.servers[index]!;
+    lines.push(mcpStatusRow(server, liveByName.get(server.name)));
+  }
+
+  if (config.servers.length > detailCount) {
+    const omitted = new Map<McpRenderedState, number>();
+    for (let index = detailCount; index < config.servers.length; index += 1) {
+      const server = config.servers[index]!;
+      const state = mcpEffectiveState(server, liveByName.get(server.name));
+      omitted.set(state, (omitted.get(state) ?? 0) + 1);
+    }
+    const groups = MCP_RENDERED_STATE_ORDER.flatMap((state) => {
+      const count = omitted.get(state);
+      return count === undefined ? [] : [`${state}: ${count}`];
+    });
+    lines.push(`Omitted ${config.servers.length - detailCount} servers (${groups.join(", ")}).`);
+  }
+
+  if (
+    config.diagnostics.length > 0 ||
+    config.servers.some((server) => server.diagnostics.length > 0)
+  ) {
+    lines.push("Some MCP configuration was malformed, ignored, or unusable; run /doctor for details.");
+  }
+
+  const pending = config.servers.filter((server) => server.status === "pending-approval");
+  const allPendingDisplayed = !config.servers
+    .slice(MCP_STATUS_DETAIL_MAX)
+    .some((server) => server.status === "pending-approval");
+  lines.push(...mcpStatusPendingGuidance(pending.map((server) => server.name), allPendingDisplayed));
+
+  const report = lines.join("\n");
+  // Per-row/scalar bounds keep this unreachable; retain a fail-closed ceiling
+  // in case future fixed prose grows without revisiting the aggregate contract.
+  return report.length <= MCP_STATUS_REPORT_MAX
+    ? report
+    : `${report.slice(0, MCP_STATUS_REPORT_MAX - 1)}…`;
 }
 
 // ---------------------------------------------------------------------------
