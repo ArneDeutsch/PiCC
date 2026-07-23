@@ -616,7 +616,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(userInvocable?.tier).toBe("partial");
     expect(userInvocable?.note).toContain("ASCII alphanumeric first");
     expect(userInvocable?.note).toContain("optional colon-separated nested-alias segments");
-    expect(userInvocable?.note).toContain("Prompt-palette stubs use the narrower single-segment filename-safe form");
+    expect(userInvocable?.note).toContain("Prompt-palette stubs use the narrower single-segment ASCII token form");
     expect(userInvocable?.note).toContain("Reserved Pi/PiCC names are shadowed case-insensitively");
     expect(userInvocable?.note).toContain("precedence is PiCC-defined and unverified against Claude Code");
     expect(userInvocable?.note).toContain("direct model invocation remains governed separately");
