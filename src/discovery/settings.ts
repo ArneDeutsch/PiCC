@@ -91,7 +91,7 @@ function createDefaultSettings(): ClaudeSettings {
     // subscription with little operator visibility. Opt into nesting explicitly via
     // `subagents.maxDepth: 2..5` (a PiCC extension key, not Claude-settings parity).
     subagentMaxDepth: 1,
-    subagentConcurrency: 4,
+    subagentConcurrency: 10,
     enabledPlugins: undefined,
     unknownKeys: [],
     deferredKeys: [],

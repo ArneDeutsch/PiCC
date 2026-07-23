@@ -12,7 +12,7 @@ import { formatElapsed } from "../src/runtime/subagent-panel-render.js";
 import { createGlobTool, createGrepTool } from "../src/runtime/tools/search-tools.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/fake-sdk.js";
-import { waitUntil } from "./helpers/async.js";
+import { deferred, waitUntil } from "./helpers/async.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 
 /**
@@ -45,6 +45,86 @@ beforeAll(async () => {
 afterAll(() => {
   process.chdir(originalCwd);
   cleanupFixture(dir);
+});
+
+async function proveRuntimeAdmissionCapacity(options: {
+  expectedCapacity: number;
+  override?: number;
+}): Promise<void> {
+  const fixture = materializeFixture("hello-claude");
+  const previousCwd = process.cwd();
+  const hadPreviousUserDir = Object.hasOwn(process.env, "PICC_CLAUDE_USER_DIR");
+  const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+  const release = deferred<void>();
+  const handle = fakeSdk({ replies: [{ text: "capacity-complete", gate: release.promise }] });
+  let dispatches: Array<Promise<unknown>> = [];
+
+  try {
+    const userDir = path.join(fixture, ".picc-hermetic-user");
+    fs.mkdirSync(userDir, { recursive: true });
+    if (options.override !== undefined) {
+      const settingsDir = path.join(fixture, ".claude");
+      fs.mkdirSync(settingsDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(settingsDir, "settings.json"),
+        `${JSON.stringify({ subagents: { concurrency: options.override } }, null, 2)}\n`,
+      );
+    }
+
+    process.chdir(fixture);
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    const capacityPi = fakePi();
+    picc(capacityPi.api as never, {
+      sdk: handle.sdk,
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      onInitializationSettled: capacityPi.captureInitialization,
+    });
+    await capacityPi.waitForInitialization();
+    await capacityPi.waitForTools(["Agent"]);
+
+    const agent = capacityPi.tools.get("Agent");
+    dispatches = Array.from({ length: options.expectedCapacity + 1 }, (_, index) =>
+      agent.execute(`capacity-${index}`, {
+        subagent_type: "general-purpose",
+        prompt: `held dispatch ${index}`,
+        run_in_background: false,
+      }) as Promise<unknown>,
+    );
+
+    await handle.waitForPromptCalls(options.expectedCapacity);
+    expect(handle.promptCalls()).toBe(options.expectedCapacity);
+    expect(handle.sessions).toHaveLength(options.expectedCapacity);
+
+    release.resolve();
+    const settled = await Promise.allSettled(dispatches);
+    for (const result of settled) {
+      expect(result.status).toBe("fulfilled");
+      if (result.status === "fulfilled") {
+        expect((result.value as { details?: { outcome?: string } }).details?.outcome).toBe("completed");
+      }
+    }
+    expect(handle.promptCalls()).toBe(options.expectedCapacity + 1);
+    expect(handle.sessions).toHaveLength(options.expectedCapacity + 1);
+  } finally {
+    release.resolve();
+    await Promise.allSettled(dispatches);
+    dispatches = [];
+    process.chdir(previousCwd);
+    if (hadPreviousUserDir) process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+    else delete process.env.PICC_CLAUDE_USER_DIR;
+    cleanupFixture(fixture);
+  }
+}
+
+describe("settings-to-runtime subagent concurrency wiring", () => {
+  it("admits ten root dispatches by default while an eleventh waits", async () => {
+    await proveRuntimeAdmissionCapacity({ expectedCapacity: 10 });
+  });
+
+  it("honors an effective override of two while a third dispatch waits", async () => {
+    await proveRuntimeAdmissionCapacity({ expectedCapacity: 2, override: 2 });
+  });
 });
 
 describe("tool surface registration", () => {

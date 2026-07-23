@@ -253,6 +253,10 @@ export interface PiccTestSeam {
    * guarantee as `onWired` above (see the SECURITY note).
    */
   sdk?: PiSdk;
+  /** TEST-ONLY managed settings locations passed directly to project loading. */
+  managedSettingsPaths?: string[];
+  /** TEST-ONLY managed artifact directories passed directly to project loading. */
+  managedArtifactDirs?: string[];
 }
 
 const codexProviderRegistries = new WeakSet<object>();
@@ -305,6 +309,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     project = loadClaudeProject({
       cwd: process.cwd(),
       userDir: process.env.PICC_CLAUDE_USER_DIR || undefined,
+      ...(testSeam?.managedSettingsPaths
+        ? { managedSettingsPaths: testSeam.managedSettingsPaths }
+        : {}),
+      ...(testSeam?.managedArtifactDirs
+        ? { managedArtifactDirs: testSeam.managedArtifactDirs }
+        : {}),
     });
   } catch (err) {
     // Completeness floor: a broken project must never crash the harness.
