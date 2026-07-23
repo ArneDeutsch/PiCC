@@ -53,6 +53,34 @@ export function writeCheckpointConfig(fixtureDir: string): void {
   fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ proactiveCompactPercent: 90 }));
 }
 
+export function findSessionFiles(agentDir: string): string[] {
+  const files: string[] = [];
+  const walk = (dir: string): void => {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith(".jsonl")) files.push(full);
+    }
+  };
+  walk(path.join(agentDir, "sessions"));
+  return files;
+}
+
+export interface JsonLineObject {
+  readonly [key: string]: unknown;
+}
+
+export function readJsonLines(text: string): JsonLineObject[] {
+  return text.trim().split(/\r?\n/u).filter(Boolean).map((line) => {
+    const value: unknown = JSON.parse(line);
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("Expected each JSONL record to be an object");
+    }
+    return value as JsonLineObject;
+  });
+}
+
 export interface RunResult {
   code: number | null;
   stdout: string;
