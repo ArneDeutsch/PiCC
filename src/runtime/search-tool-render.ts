@@ -15,6 +15,13 @@ import {
   type GrepResultDetails,
 } from "./tools/search-tools.js";
 import { genericResultComponent, type RenderCtx } from "./tool-shell.js";
+import {
+  formatDisplayPath,
+  formatToolDisplayName,
+  resolveDisplayRoot,
+  type DisplayRootResolver,
+} from "./tool-display.js";
+import { themedFg } from "./render-util.js";
 const LINE_BREAK_RE = /\r\n?|\n|\u2028|\u2029/;
 
 interface Component {
@@ -173,25 +180,7 @@ function safeGet(value: unknown, key: PropertyKey): unknown {
 }
 
 function safeFg(theme: unknown, color: string, text: string): string {
-  try {
-    const fg = safeGet(theme, "fg");
-    if (typeof fg !== "function") return text;
-    const rendered = (fg as (slot: string, value: string) => unknown).call(theme, color, text);
-    return typeof rendered === "string" ? rendered : text;
-  } catch {
-    return text;
-  }
-}
-
-function safeBold(theme: unknown, text: string): string {
-  try {
-    const bold = safeGet(theme, "bold");
-    if (typeof bold !== "function") return text;
-    const rendered = (bold as (value: string) => unknown).call(theme, text);
-    return typeof rendered === "string" ? rendered : text;
-  } catch {
-    return text;
-  }
+  return themedFg(theme, color, text);
 }
 
 function measuredWidth(line: string): number {
@@ -335,10 +324,10 @@ function styledCore(
   recovery: string,
   theme: unknown,
 ): SummaryCore {
-  const title = safeFg(theme, "toolTitle", safeBold(theme, toolName));
+  const title = safeFg(theme, "text", formatToolDisplayName(toolName));
   const statusText = status ? ` · ${status}${recovery}` : "";
   return {
-    line: title + (expression ? ` ${safeFg(theme, "accent", expression)}` : "") +
+    line: title + (expression ? ` ${safeFg(theme, "toolOutput", expression)}` : "") +
       (statusText ? safeFg(theme, "muted", statusText) : ""),
     hasStatus: Boolean(status),
   };
@@ -353,7 +342,8 @@ function selectSummaryCore(
   requireRecovery: boolean,
 ): SummaryCore | undefined {
   if (!Number.isFinite(width) || width <= 0) return undefined;
-  const titleWidth = measuredWidth(toolName);
+  const displayName = formatToolDisplayName(toolName);
+  const titleWidth = measuredWidth(displayName);
   const statuses = state?.status
     ? [state.status, state.compactStatus].filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index)
     : [""];
@@ -364,7 +354,7 @@ function selectSummaryCore(
   for (const status of statuses) {
     const suffix = status ? ` · ${status}${recovery}` : "";
     const complete = quote(expression);
-    if (measuredWidth(`${toolName} ${complete}${suffix}`) <= width) {
+    if (measuredWidth(`${displayName} ${complete}${suffix}`) <= width) {
       return styledCore(toolName, complete, status, recovery, theme);
     }
   }
@@ -392,7 +382,7 @@ function summaryLine(
   const parts = invocationParts(toolName, args);
   const inline = selectSummaryCore(toolName, parts.expression, state, theme, width, true);
   const core = inline ?? selectSummaryCore(toolName, parts.expression, state, theme, width, false);
-  let line = core?.line ?? safeFg(theme, "toolTitle", safeBold(theme, toolName));
+  let line = core?.line ?? safeFg(theme, "text", formatToolDisplayName(toolName));
   if (state?.status && !core?.hasStatus) return clamp(line, width);
   if (state?.count) {
     for (const countText of [state.count, state.compactCount].filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index)) {
@@ -554,7 +544,7 @@ function recoveryComponent(toolName: SearchName, args: Snapshot, state: SummaryS
     render(width: number): string[] {
       if (!snapshot || selectSummaryCore(toolName, expression, state, theme, width, true)) return [];
       if (width <= 0) return [""];
-      return wrapTextWithAnsi(safeFg(theme, "warning", snapshot), Math.max(1, width));
+      return wrapTextWithAnsi(safeFg(theme, "toolOutput", snapshot), Math.max(1, width));
     },
   }, "Recovery unavailable");
 }
@@ -569,19 +559,37 @@ function combinedComponent(components: readonly Component[]): Component {
   });
 }
 
+export interface CompactSearchRenderingDependencies {
+  resolveDisplayRoot?: DisplayRootResolver;
+}
+
 // HTML serializes the call before the result, so renderResult owns the settled summary;
 // the empty call also avoids a second TUI content row.
-export function withCompactSearchRendering<T extends ToolDefinition>(tool: T): T {
+export function withCompactSearchRendering<T extends ToolDefinition>(
+  tool: T,
+  dependencies: CompactSearchRenderingDependencies = {},
+): T {
   if (tool.name !== "Grep" && tool.name !== "Glob") throw new TypeError("compact search rendering accepts only Grep or Glob tools");
   const toolName = tool.name;
+  const roots = new WeakMap<object, string | undefined>();
+  const rootFor = (context: unknown): string | undefined => {
+    const state = safeGet(context, "state");
+    if ((typeof state !== "object" && typeof state !== "function") || state === null) {
+      return resolveDisplayRoot(dependencies.resolveDisplayRoot, context);
+    }
+    if (!roots.has(state as object)) roots.set(state as object, resolveDisplayRoot(dependencies.resolveDisplayRoot, context));
+    return roots.get(state as object);
+  };
   return {
     ...tool,
-    renderCall(): Component {
+    renderCall(_args: unknown, _theme: unknown, context: RenderContext): Component {
+      rootFor(context);
       return { render: () => [] };
     },
     renderResult(result: ResultShape, options: { isPartial?: boolean }, theme: unknown, context: RenderContext): Component {
       try {
         const args = snapshotArgs(safeGet(context, "args"));
+        if (typeof args.path === "string") args.path = formatDisplayPath(args.path, rootFor(context));
         if (safeGet(context, "isError") === true) {
           const failed: SummaryState = { status: "failed", compactStatus: "fail" };
           return combinedComponent([

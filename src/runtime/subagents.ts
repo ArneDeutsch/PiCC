@@ -1296,6 +1296,16 @@ export class SubagentRuntime {
     return this.resolveAgentDefinition(requested)?.background === true;
   }
 
+  /** Resolve validated frontmatter color for human rendering only. */
+  agentDisplayColor(agentId: string | undefined, subagentType: string | undefined): unknown {
+    if (agentId) {
+      const captured = this.deps.subagentRegistry?.get(agentId)?.color;
+      if (captured) return captured;
+    }
+    const requested = subagentType?.trim() || "general-purpose";
+    return this.resolveAgentDefinition(requested)?.color;
+  }
+
   async dispatch(opts: {
     subagentType: string;
     prompt: string;
@@ -1432,7 +1442,7 @@ export class SubagentRuntime {
     // SubagentStart-block, and abort-after-worktree gates: an aborted or hook-blocked
     // fork must never leave an on-disk copy behind. It still runs BEFORE customTools/
     // identity are finalized, so a `forkFrom` throw resolves to a plain
-    // general-purpose (isFork=false, unmarked tools, honest badge) before either is
+    // general-purpose (isFork=false, unmarked tools, honest lifecycle identity) before either is
     // fixed. Undefined ⇒ this dispatch is not (or no longer) an inheriting fork.
     let forkSession: PiSessionManagerLike | undefined;
     // The deferred `forkFrom` call. Set (in the interception below) ONLY
@@ -1538,7 +1548,7 @@ export class SubagentRuntime {
         // SubagentStart-block gates, so an aborted or hook-blocked dispatch never
         // creates the on-disk copy. Tentatively mark isFork so the gates + the
         // SubagentStart payload use the fork identity; the deferred attempt settles
-        // the FINAL isFork/identity/badge (a throw there re-resolves to
+        // the FINAL isFork/operational identity/lifecycle presentation (a throw there re-resolves to
         // general-purpose) BEFORE the child tools + identity are built.
         // The env=0 / nested / no-transcript / SDK-can't-fork / fork-spawns-fork
         // degrades stay resolved at interception — none of them need `forkFrom`.
@@ -1557,11 +1567,11 @@ export class SubagentRuntime {
       }
 
       if (isFork) {
-        // Reads as a fork (agentName "fork" → an honest `Agent(fork)` badge).
+        // Reads as a fork (agentName "fork" → an honest `fork` identity).
         resolved = buildForkAgent();
       } else {
         // Degrade: run as fresh general-purpose (a fresh IDENTITY, so success vs.
-        // degrade are distinguishable in the rendered badge) with a fork-SPECIFIC
+        // degrade are distinguishable in the rendered lifecycle row) with a fork-SPECIFIC
         // notice — never the generic unknown-type warning, never inheriting.
         resolved = resolveAgent(builtins, "general-purpose");
         emitForkDegrade(forkDegrade!.tone, forkDegrade!.modelReason, forkDegrade!.devReason);
@@ -1598,8 +1608,8 @@ export class SubagentRuntime {
       };
     }
     // `let` (not `const`): a DEFERRED forkFrom throw (just before customToolsFor,
-    // after the gates) re-resolves this to general-purpose so the RESULT badge and
-    // the post-gate hook identity are honest (`Agent(general-purpose)`). Typed
+    // after the gates) re-resolves this to general-purpose so the result row and
+    // post-gate hook identity honestly use `general-purpose`. Typed
     // explicitly (ClaudeAgent, not `| undefined`) off the guarded `resolvedAgent` so
     // control-flow narrowing survives the reassignment across the later awaits.
     let agent: ClaudeAgent = resolvedAgent;
@@ -1979,21 +1989,21 @@ export class SubagentRuntime {
       // on-disk copy behind (the env=0/nested/no-transcript/SDK-can't-fork/
       // fork-spawns-fork degrades were already resolved at interception — they don't
       // need `forkFrom`). It still runs BEFORE `customToolsFor` so the FINAL isFork +
-      // resolved identity/badge are settled before the child tools + identity are
+      // resolved operational identity/lifecycle presentation are settled before the child tools + identity are
       // built. The constructed manager is reused by the session-manager
       // stage (never re-forked), keeping `forkCalls()` at 1.
       if (attemptForkSession) {
         try {
           forkSession = attemptForkSession(cwd);
-          // Success: isFork stays true; the fork identity/badge stand.
+          // Success: isFork stays true; the fork identity and lifecycle presentation stand.
         } catch (err) {
           // Degrade to a plain general-purpose run: flip isFork false so
           // `customToolsFor` builds UNMARKED tools, re-resolve the identity so the
-          // RESULT badge is honest (`Agent(general-purpose)`), and emit the generic
+          // result row honestly uses `general-purpose`, and emit the generic
           // model reason. SECURITY: the raw error can embed the main session's
           // ABSOLUTE PATH, so the capped detail rides the developer diagnostic only.
           // Accepted cosmetic: the SubagentStart hook already fired with the "fork"
-          // subagent_type (before this throw was known); the badge stays honest.
+          // subagent_type (before this throw was known); the lifecycle identity stays honest.
           isFork = false;
           agent = resolveAgent(builtins, "general-purpose") ?? agent;
           emitForkDegrade(
@@ -2224,7 +2234,7 @@ export class SubagentRuntime {
         // ALREADY forkFrom-seeded just before `customToolsFor` — `isFork` here
         // therefore reflects the FINAL post-fork-attempt state, so a forkFrom
         // throw already degraded to fresh (isFork=false, unmarked tools,
-        // general-purpose badge) and never reaches this branch. REUSE the
+        // general-purpose lifecycle identity) and never reaches this branch. REUSE the
         // constructed manager (a BRAND-NEW file seeded with
         // the parent history; the parent transcript is untouched); never re-fork.
         if (forkSession) {
@@ -2238,9 +2248,8 @@ export class SubagentRuntime {
           // Defensive degrade: `isFork` is only set true alongside a constructed
           // `forkSession`, so this is unreachable — run fresh rather than un-forked
           // silently if that invariant is ever violated. Re-resolve the identity
-          // (mirroring the forkFrom-throw path) so the RESULT badge is honest
-          // (`Agent(general-purpose)`) and never reads `Agent(fork)` while the
-          // footer says it ran fresh.
+          // (mirroring the forkFrom-throw path) so the result row honestly uses
+          // `general-purpose` and never reads `fork` while the footer says it ran fresh.
           isFork = false;
           agent = resolveAgent(builtins, "general-purpose") ?? agent;
           resumable = false;
@@ -2917,7 +2926,10 @@ export function createAgentToolDefinition(
       theme: unknown,
       context: SubagentLifecycleRenderContext,
     ) {
-      return renderAgentCall(args, theme, context);
+      return renderAgentCall(args, theme, context, {
+        surface: "agent",
+        resolveAgentColor: (agentId, agentName) => runtime.agentDisplayColor(agentId, agentName),
+      });
     },
     // Result display owns normal rows once a partial or final result exists;
     // expansion retains full output and transcript access.
@@ -2927,7 +2939,10 @@ export function createAgentToolDefinition(
       theme: unknown,
       context: SubagentLifecycleRenderContext,
     ) {
-      return renderAgentResult(result, options, theme, context);
+      return renderAgentResult(result, options, theme, context, {
+        surface: "agent",
+        resolveAgentColor: (agentId, agentName) => runtime.agentDisplayColor(agentId, agentName),
+      });
     },
     async execute(
       _toolCallId: string,
@@ -3167,8 +3182,8 @@ export function createAgentToolDefinition(
           worktreePath: result.worktreePath,
           diagnostics: result.diagnostics,
           outcome: result.outcome,
-          // A turn-capped SUCCESS is truncated — surface it so the badge
-          // renders `completed (truncated)` instead of a clean `● completed`
+          // A turn-capped SUCCESS is truncated — surface it so the lifecycle row
+          // renders `completed (truncated)` instead of a clean completed state
           // (`presentation.cutOff === result.truncated === true` on this path).
           cutOff: presentation.cutOff,
           ...identityDetails,

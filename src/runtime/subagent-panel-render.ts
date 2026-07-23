@@ -1,8 +1,8 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { AGENT_COLOR_ANSI, tintAgentColor } from "./agent-color.js";
 import {
   DETAIL_FIELD_MAX_LENGTH,
   DETAIL_LOG_MAX_ENTRIES,
-  formatUsageCompact,
   sanitizeDetailScalar,
   sanitizeLine,
   sanitizeProgressText,
@@ -18,6 +18,8 @@ import {
   type SubagentRegistryRecord,
 } from "./subagent-registry.js";
 
+export { AGENT_COLOR_ANSI, tintAgentColor } from "./agent-color.js";
+
 /**
  * Subagent status-panel renderer: pure PanelViewModel → clamped string lines.
  * Every emitted line is <= width in pi-tui `visibleWidth` terms (the
@@ -27,7 +29,7 @@ import {
  * is deliberately raw in the record and is sanitized ONLY here).
  */
 
-// --- glyphs and animation frames shared by the passive and focused panels ---
+// --- glyphs and animation frames (exported so t04's widget and docs share them) ---
 
 /** Spinner frames for a running row; the caller supplies the current frame. */
 export const PANEL_RUNNING_FRAMES: readonly string[] = [
@@ -42,7 +44,7 @@ export const PANEL_RUNNING_FRAMES: readonly string[] = [
   "⠇",
   "⠏",
 ];
-/** Finished-state bubbles — distinct glyphs, not color-alone. */
+/** Waiting/finished-state bubbles — distinct glyphs, not color-alone. */
 export const PANEL_GLYPH_WAITING = "◌";
 export const PANEL_GLYPH_SUCCESS = "●";
 export const PANEL_GLYPH_FAILED = "✗";
@@ -72,59 +74,19 @@ function stateGlyph(state: PanelRowView["state"], runningFrame: string | undefin
   }
 }
 
-// --- Claude agent-color tinting ---
-
-// Raw ANSI, because Pi's `theme.fg` takes a CLOSED union of theme slots and
-// cannot express Claude's fixed agent color names; emitting raw ANSI inside a
-// component we own is the sanctioned escape hatch (see "Colors and themes" in
-// doc/tui-extension-guide.md). ESC built from a code point so the source stays
-// pure ASCII.
-const ESC = String.fromCharCode(27);
-/** Default-foreground reset — resets only the color this map set. */
-const FG_RESET = `${ESC}[39m`;
-
-/**
- * Claude's fixed agent-frontmatter color set → ANSI foreground codes. Capture
- * validation (`AGENT_COLOR_NAMES` in subagent-registry.ts) guarantees only
- * these names reach a record — a test pins the two sets equal so capture and
- * render cannot drift — but the map is still consulted defensively: an
- * unknown value falls back to no tint, never a throw.
- */
-export const AGENT_COLOR_ANSI: Readonly<Record<string, string>> = {
-  red: `${ESC}[31m`,
-  blue: `${ESC}[34m`,
-  green: `${ESC}[32m`,
-  yellow: `${ESC}[33m`,
-  purple: `${ESC}[35m`,
-  orange: `${ESC}[38;5;208m`,
-  pink: `${ESC}[38;5;205m`,
-  cyan: `${ESC}[36m`,
-};
-
-/**
- * Tint `text` with a Claude agent color name; unknown/absent → untinted. The
- * own-key check matters: a plain-object lookup would resolve inherited
- * prototype keys ("constructor", "toString") to truthy functions and
- * interpolate them into the row.
- */
-export function tintAgentColor(color: string | undefined, text: string): string {
-  const code = color && Object.hasOwn(AGENT_COLOR_ANSI, color) ? AGENT_COLOR_ANSI[color] : undefined;
-  return code ? `${code}${text}${FG_RESET}` : text;
-}
-
-// --- hint / affordance lines shared across panel surfaces ---
+// --- hint / affordance lines (t05 and the docs reuse these exact strings) ---
 
 /**
  * The unfocused footer hint. CONTRACT: it names the entry chord — for a
  * single-agent run this line is the user's only discovery path into the panel
  * (the one-time status-line hint fires only for >1 agent). The chord string is
- * injected by the caller, whose shortcut registration owns the constant.
+ * injected by the caller (t04 owns the chord constant).
  */
 export function panelHintUnfocused(entryChord: string): string {
   return `${entryChord}: agent panel`;
 }
 
-/** The focused footer hint: the focused component's key map. */
+/** The focused footer hint: the panel's key map (t05 binds these keys). */
 export const PANEL_HINT_FOCUSED =
   "↑↓ select · enter open · x stop · X stop all · d dismiss · esc close";
 
@@ -135,9 +97,6 @@ export function panelMoreAbove(n: number): string {
 export function panelMoreBelow(n: number): string {
   return `… ${n} more`;
 }
-
-/** Below this width the whole panel degrades to a single summary line. */
-export const PANEL_NARROW_WIDTH = 40;
 
 /** `12s` / `4m12s` / `1h04m` — the row's elapsed column. */
 export function formatElapsed(ms: number): string {
@@ -161,205 +120,206 @@ export interface PanelRenderOptions {
   entryChord: string;
 }
 
-/** A measured display segment: plain for width math, styled for output. */
-interface Seg {
-  plain: string;
-  styled: string;
-}
-
-function segWidth(segs: readonly (Seg | undefined)[]): number {
-  let w = 0;
-  for (const s of segs) if (s) w += visibleWidth(s.plain);
-  return w;
-}
-
-function segJoin(segs: readonly (Seg | undefined)[]): string {
-  let out = "";
-  for (const s of segs) if (s) out += s.styled;
-  return out;
-}
-
 /** Visual indent cap: deeper trees stay valid but stop eating row width. */
 const MAX_INDENT_LEVELS = 6;
-/** Render-side caps for row fields (records are already capture-capped). */
 const TYPE_RENDER_CAP = 60;
-const TASK_ID_RENDER_CAP = 60;
-const TASK_ID_SANITIZE_CAP = TASK_ID_RENDER_CAP * 4;
 const LABEL_RENDER_CAP = 160;
+const COLUMN_GAP = "  ";
+const DESCRIPTION_GAP = " ";
+const MIN_USEFUL_IDENTITY_WIDTH = 3;
+const MIN_USEFUL_DESCRIPTION_WIDTH = 3;
 
-function taskIdDisplay(taskId: string): string {
-  const flat = sanitizeProgressText(taskId).replace(/\s+/gu, " ").trim();
-  if (flat.length <= TASK_ID_SANITIZE_CAP) {
-    return truncateToWidth(flat, TASK_ID_RENDER_CAP, "…");
+type MetricKey = "elapsed" | "input" | "output" | "cacheRead" | "cacheWrite" | "cost";
+const METRIC_ORDER: readonly MetricKey[] = [
+  "elapsed",
+  "input",
+  "output",
+  "cacheRead",
+  "cacheWrite",
+  "cost",
+];
+const DROP_ORDER: readonly MetricKey[] = [
+  "cacheWrite",
+  "cacheRead",
+  "cost",
+  "output",
+  "input",
+  "elapsed",
+];
+
+interface PlainPanelRow {
+  source: PanelRowView;
+  marker: string;
+  indent: string;
+  glyph: string;
+  identity: string;
+  status: string;
+  chip: string;
+  description: string;
+  metrics: Record<MetricKey, string | undefined>;
+}
+
+function panelFg(theme: unknown, color: string, text: string): string {
+  try {
+    return themedFg(theme, color, text);
+  } catch {
+    return text;
   }
-  let prefix = "";
-  for (const scalar of flat) {
-    if (prefix.length + scalar.length > TASK_ID_SANITIZE_CAP - 1) break;
-    prefix += scalar;
+}
+
+function finiteUsageValue(row: PanelRowView, key: keyof NonNullable<PanelRowView["usage"]>): number | undefined {
+  try {
+    const value = row.usage?.[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  } catch {
+    return undefined;
   }
-  return truncateToWidth(`${prefix}…`, TASK_ID_RENDER_CAP, "…");
+}
+
+function preparePanelRow(row: PanelRowView, opts: PanelRenderOptions, focused: boolean): PlainPanelRow {
+  const identity = scalarSafeText(sanitizeLine(row.agentType, TYPE_RENDER_CAP)) || "agent";
+  const label = scalarSafeText(sanitizeLine(row.label, LABEL_RENDER_CAP));
+  const cacheRead = finiteUsageValue(row, "cacheReadTokens");
+  const cacheWrite = finiteUsageValue(row, "cacheWriteTokens");
+  const input = finiteUsageValue(row, "inputTokens");
+  const output = finiteUsageValue(row, "outputTokens");
+  const cost = finiteUsageValue(row, "costUsd");
+  return {
+    source: row,
+    marker: focused ? (row.selected ? "❯ " : "  ") : "",
+    indent: "  ".repeat(Math.min(Math.max(0, row.treeDepth), MAX_INDENT_LEVELS)),
+    glyph: stateGlyph(row.state, opts.runningFrame),
+    identity,
+    status: row.state === "waiting" ? " [waiting]" : "",
+    chip: row.hiddenDescendants > 0 ? ` (+${row.hiddenDescendants})` : "",
+    description: label && label !== identity ? label : "",
+    metrics: {
+      elapsed: formatElapsed(row.elapsedMs),
+      input: input === undefined ? undefined : `in ${input}`,
+      output: output === undefined ? undefined : `out ${output}`,
+      cacheRead: cacheRead !== undefined && cacheRead > 0 ? `c/read ${cacheRead}` : undefined,
+      cacheWrite: cacheWrite !== undefined && cacheWrite > 0 ? `c/write ${cacheWrite}` : undefined,
+      cost: cost === undefined ? undefined : `$${cost}`,
+    },
+  };
+}
+
+function leftPad(text: string, width: number): string {
+  return `${" ".repeat(Math.max(0, width - visibleWidth(text)))}${text}`;
+}
+
+function rightPad(text: string, width: number): string {
+  return `${text}${" ".repeat(Math.max(0, width - visibleWidth(text)))}`;
+}
+
+function renderAggregate(view: PanelViewModel, opts: PanelRenderOptions): string[] {
+  const allEntries: Array<{ state: PanelRowView["state"]; count: number; word: string }> = [
+    { state: "failed", count: view.failedCount, word: "failed" },
+    { state: "stopped", count: view.stoppedCount, word: "stopped" },
+    { state: "running", count: view.runningCount, word: "running" },
+    { state: "waiting", count: view.waitingCount, word: "waiting" },
+    { state: "success", count: view.completedCount, word: "completed" },
+  ];
+  const entries = allEntries.filter((entry) => entry.count > 0);
+  const rendered = entries.map(({ state, count, word }) => {
+    const glyph = stateGlyph(state, opts.runningFrame);
+    return `${panelFg(opts.theme, STATE_COLOR[state], glyph)} ${panelFg(opts.theme, "muted", `${count} ${word}`)}`;
+  });
+  const joined = rendered.join(panelFg(opts.theme, "muted", " · "));
+  const lines = visibleWidth(joined) <= opts.width
+    ? [joined]
+    : rendered.map((line, index) => visibleWidth(line) <= opts.width
+      ? line
+      : panelFg(opts.theme, STATE_COLOR[entries[index]!.state], stateGlyph(entries[index]!.state, opts.runningFrame)));
+  const hint = view.focused ? PANEL_HINT_FOCUSED : panelHintUnfocused(opts.entryChord);
+  if (visibleWidth(hint) <= opts.width) lines.push(panelFg(opts.theme, "muted", hint));
+  return clampLines(lines, opts.width);
 }
 
 /**
- * One panel row as a single line. Identity, state, elapsed time, and known
- * usage are fixed metadata; only the description is elastic. Returns absent
- * when even a syntactically complete fixed-metadata row cannot fit, allowing
- * the whole panel to use its existing aggregate summary instead.
- */
-function renderPanelRow(
-  row: PanelRowView,
-  opts: PanelRenderOptions,
-  focused: boolean,
-): string | undefined {
-  const { width, theme } = opts;
-  const muted = (text: string): Seg => ({ plain: text, styled: themedFg(theme, "muted", text) });
-
-  const marker: Seg | undefined = focused
-    ? row.selected
-      ? { plain: "❯ ", styled: themedFg(theme, "accent", "❯ ") }
-      : { plain: "  ", styled: "  " }
-    : undefined;
-  const indentText = "  ".repeat(Math.min(Math.max(0, row.treeDepth), MAX_INDENT_LEVELS));
-  const indent: Seg = { plain: indentText, styled: indentText };
-  const glyphText = stateGlyph(row.state, opts.runningFrame);
-  const glyph: Seg = {
-    plain: `${glyphText} `,
-    styled: `${themedFg(theme, STATE_COLOR[row.state], glyphText)} `,
-  };
-  // SECURITY: agentName is the ONE record field deliberately unsanitized at
-  // capture (it is the registry's name-index key) — hostile project
-  // frontmatter `name:` must be sanitized at EVERY render, here.
-  const typeText = sanitizeLine(row.agentType, TYPE_RENDER_CAP) || "agent";
-  // Tint only when a theme is present — themeless renders degrade to plain
-  // text everywhere else (render-util's convention), so the tint follows suit.
-  const type: Seg = {
-    plain: typeText,
-    styled: theme ? tintAgentColor(row.color, typeText) : typeText,
-  };
-  // sanitizeLine bounds hostile input first; pi-tui then owns the display
-  // boundary so task-id truncation cannot split a grapheme or surrogate pair.
-  const taskText = row.taskId ? taskIdDisplay(row.taskId) : "";
-  const task: Seg | undefined = taskText ? muted(` [${taskText}]`) : undefined;
-  const chip: Seg | undefined =
-    row.hiddenDescendants > 0 ? muted(` (+${row.hiddenDescendants})`) : undefined;
-
-  const labelText = sanitizeLine(row.label, LABEL_RENDER_CAP);
-  // The description falls back to agentName; when it IS the agent name the
-  // type segment already shows it — render no duplicate.
-  const hasLabel = labelText !== "" && labelText !== typeText;
-  const stateLabel: Seg | undefined = row.state === "waiting" ? muted(" · waiting") : undefined;
-  const elapsed: Seg = muted(` · ${formatElapsed(row.elapsedMs)}`);
-  // Usage is absent until known — a fake zero is worse than no figure.
-  const usageText = row.usage ? formatUsageCompact(row.usage) : undefined;
-  const usage: Seg | undefined = usageText ? muted(` · ${usageText}`) : undefined;
-
-  const labelSeg = (text: string): Seg => muted(` · ${text}`);
-  const fixed = [marker, indent, glyph, type, task, chip, stateLabel, elapsed, usage];
-  if (segWidth(fixed) <= width) {
-    if (!hasLabel) return segJoin(fixed);
-    const room = width - segWidth(fixed) - 3; // description separator
-    if (room <= 0) return segJoin(fixed);
-    const fitted = truncateToWidth(labelText, room, "…");
-    return segJoin([...fixed, labelSeg(fitted)]);
-  }
-
-  // Constrained fixed-metadata fallback. Fit identity inside its own measured
-  // slot; never let the final clamp splice usage directly into a type or id.
-  const surrounding = [marker, indent, glyph, chip, stateLabel, elapsed, usage];
-  const identityRoom = width - segWidth(surrounding);
-  const taskSyntaxWidth = task ? visibleWidth(" []") : 0;
-  const minimumIdentityWidth = task ? taskSyntaxWidth + 2 : 1;
-  if (identityRoom < minimumIdentityWidth) return undefined;
-
-  if (!task) {
-    const fittedType = truncateToWidth(typeText, identityRoom, "…");
-    const fitted: Seg = {
-      plain: fittedType,
-      styled: theme ? tintAgentColor(row.color, fittedType) : fittedType,
-    };
-    return segJoin([marker, indent, glyph, fitted, chip, stateLabel, elapsed, usage]);
-  }
-
-  const contentRoom = identityRoom - taskSyntaxWidth;
-  const taskRoom = Math.min(visibleWidth(taskText), Math.max(1, Math.ceil(contentRoom / 2)));
-  const typeRoom = contentRoom - taskRoom;
-  const fittedTypeText = truncateToWidth(typeText, typeRoom, "…");
-  const fittedTaskText = truncateToWidth(taskText, taskRoom, "…");
-  const fittedType: Seg = {
-    plain: fittedTypeText,
-    styled: theme ? tintAgentColor(row.color, fittedTypeText) : fittedTypeText,
-  };
-  return segJoin([
-    marker,
-    indent,
-    glyph,
-    fittedType,
-    muted(` [${fittedTaskText}]`),
-    chip,
-    stateLabel,
-    elapsed,
-    usage,
-  ]);
-}
-
-/** The whole-panel single line for very narrow terminals. */
-function renderSummaryLine(view: PanelViewModel, opts: PanelRenderOptions): string {
-  const glyphText = view.runningCount > 0
-    ? stateGlyph("running", opts.runningFrame)
-    : view.waitingCount > 0
-      ? PANEL_GLYPH_WAITING
-      : PANEL_GLYPH_SUCCESS;
-  const glyphColor = view.runningCount > 0 ? "accent" : view.waitingCount > 0 ? "warning" : "success";
-  const parts: string[] = [];
-  if (view.runningCount > 0) parts.push(`${view.runningCount} running`);
-  if (view.waitingCount > 0) parts.push(`${view.waitingCount} waiting`);
-  if (view.settledCount > 0) parts.push(`${view.settledCount} done`);
-  return (
-    `${themedFg(opts.theme, glyphColor, glyphText)} ` +
-    themedFg(opts.theme, "muted", parts.join(" · ") || "agents")
-  );
-}
-
-/**
- * Render the status panel: windowed rows, overflow affordances, and the muted
- * footer hint. Returns [] when the view is empty (the panel disappears).
+ * Render one shared table profile for the complete visible row window. Plain
+ * cells are sanitized and measured before any styling is applied.
  */
 export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptions): string[] {
   if (view.empty) return [];
-  const width = opts.width;
-  if (width < PANEL_NARROW_WIDTH) {
-    return clampLines([renderSummaryLine(view, opts)], width);
+  const rows = view.rows.map((row) => preparePanelRow(row, opts, view.focused));
+  const gutterWidth = Math.max(...rows.map((row) => visibleWidth(`${row.marker}${row.indent}${row.glyph} `)));
+  const identityNaturalWidth = Math.max(...rows.map((row) => visibleWidth(`${row.identity}${row.status}${row.chip}`)));
+  const descriptionNaturalWidth = Math.max(...rows.map((row) => visibleWidth(row.description)));
+
+  const metricWidths = new Map<MetricKey, number>();
+  for (const key of METRIC_ORDER) {
+    const eligible = rows.map((row) => row.metrics[key]).filter((value): value is string => value !== undefined);
+    if (eligible.length > 0) metricWidths.set(key, Math.max(...eligible.map(visibleWidth)));
   }
-  const renderedRows = view.rows.map((row) => renderPanelRow(row, opts, view.focused));
-  if (renderedRows.some((row) => row === undefined)) {
-    return clampLines([renderSummaryLine(view, opts)], width);
+  const active = new Set(metricWidths.keys());
+  const metricTotal = (): number =>
+    [...active].reduce((sum, key) => sum + visibleWidth(COLUMN_GAP) + metricWidths.get(key)!, 0);
+  const hasDescription = descriptionNaturalWidth > 0;
+  const descriptionGapWidth = hasDescription ? visibleWidth(DESCRIPTION_GAP) : 0;
+  const naturalWidth = (): number =>
+    gutterWidth + identityNaturalWidth + descriptionGapWidth + descriptionNaturalWidth + metricTotal();
+  for (const key of DROP_ORDER) {
+    if (naturalWidth() <= opts.width) break;
+    active.delete(key);
   }
 
+  const availableLeft = Math.max(0, opts.width - metricTotal());
+  const minimumIdentityWidth = Math.max(...rows.map((row) =>
+    visibleWidth(row.status) + visibleWidth(row.chip) +
+      Math.min(MIN_USEFUL_IDENTITY_WIDTH, visibleWidth(row.identity))
+  ));
+  const minimumLeftWidth = gutterWidth + minimumIdentityWidth +
+    (hasDescription ? descriptionGapWidth + MIN_USEFUL_DESCRIPTION_WIDTH : 0);
+  if (availableLeft < minimumLeftWidth) return renderAggregate(view, opts);
+
+  const identityWidth = hasDescription
+    ? Math.min(identityNaturalWidth,
+      availableLeft - gutterWidth - descriptionGapWidth - MIN_USEFUL_DESCRIPTION_WIDTH)
+    : availableLeft - gutterWidth;
+  const descriptionWidth = hasDescription
+    ? availableLeft - gutterWidth - identityWidth - descriptionGapWidth
+    : 0;
+  const hasDescriptionCell = hasDescription;
+
+  const renderedRows = rows.map((row) => {
+    const marker = row.source.selected
+      ? panelFg(opts.theme, "accent", row.marker)
+      : row.marker;
+    const glyph = panelFg(opts.theme, STATE_COLOR[row.source.state], row.glyph);
+    const gutterPlain = `${row.marker}${row.indent}${row.glyph} `;
+    const gutterPad = " ".repeat(Math.max(0, gutterWidth - visibleWidth(gutterPlain)));
+    const suffixWidth = visibleWidth(row.status) + visibleWidth(row.chip);
+    const fittedIdentity = truncateToWidth(row.identity, Math.max(0, identityWidth - suffixWidth), "…");
+    const identityPlain = `${fittedIdentity}${row.status}${row.chip}`;
+    let line = `${marker}${row.indent}${glyph} ${gutterPad}`;
+    line += opts.theme ? tintAgentColor(row.source.color, fittedIdentity) : fittedIdentity;
+    line += panelFg(opts.theme, "muted", row.status + row.chip);
+    line += " ".repeat(Math.max(0, identityWidth - visibleWidth(identityPlain)));
+    if (hasDescriptionCell) {
+      const description = truncateToWidth(row.description, descriptionWidth, "…");
+      line += DESCRIPTION_GAP + panelFg(opts.theme, "text", rightPad(description, descriptionWidth));
+    } else if (active.size > 0) {
+      line += " ".repeat(Math.max(0, availableLeft - gutterWidth - identityWidth));
+    }
+    for (const key of METRIC_ORDER) {
+      if (!active.has(key)) continue;
+      const value = row.metrics[key] ?? "";
+      line += panelFg(opts.theme, "muted", COLUMN_GAP + leftPad(value, metricWidths.get(key)!));
+    }
+    return line;
+  });
+
   const lines: string[] = [];
-  if (view.hiddenAbove > 0) {
-    lines.push(themedFg(opts.theme, "muted", panelMoreAbove(view.hiddenAbove)));
-  }
-  lines.push(...renderedRows.filter((row): row is string => row !== undefined));
-  if (view.hiddenBelow > 0) {
-    lines.push(themedFg(opts.theme, "muted", panelMoreBelow(view.hiddenBelow)));
-  }
+  if (view.hiddenAbove > 0) lines.push(panelFg(opts.theme, "muted", panelMoreAbove(view.hiddenAbove)));
+  lines.push(...renderedRows);
+  if (view.hiddenBelow > 0) lines.push(panelFg(opts.theme, "muted", panelMoreBelow(view.hiddenBelow)));
   if (view.waitingCount > 0) {
-    lines.push(
-      themedFg(
-        opts.theme,
-        "muted",
-        `${view.runningCount} running · ${view.waitingCount} waiting`,
-      ),
-    );
+    lines.push(panelFg(opts.theme, "muted", `${view.runningCount} running · ${view.waitingCount} waiting`));
   }
-  lines.push(
-    themedFg(
-      opts.theme,
-      "muted",
-      view.focused ? PANEL_HINT_FOCUSED : panelHintUnfocused(opts.entryChord),
-    ),
-  );
-  return clampLines(lines, width);
+  const hint = view.focused ? PANEL_HINT_FOCUSED : panelHintUnfocused(opts.entryChord);
+  lines.push(panelFg(opts.theme, "muted", hint));
+  return clampLines(lines, opts.width);
 }
 
 // --- drill-down detail view --------------------------------------------------
@@ -573,7 +533,7 @@ function tailToWidth(text: string, maxCols: number): string {
 
 /**
  * Steer availability for display. The authoritative predicate is
- * guardSteer (the send path uses ONLY its bound steer fn); this maps the same
+ * guardSteer() (the send path uses ONLY its bound steer fn); this maps the same
  * ordering onto short display reasons, and the foreground case names the real
  * alternative rather than a dead end.
  */

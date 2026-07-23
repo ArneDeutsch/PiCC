@@ -79,6 +79,8 @@ export const PANEL_NOTICE_FOREGROUND =
   "Foreground agents cannot be stopped from the panel — Esc in the editor cancels the whole turn.";
 export const PANEL_NOTICE_RUNNING_DISMISS = "Still running — press x to stop it first.";
 export const PANEL_NOTICE_STOP_ALL_NONE = "No active background agents to stop.";
+/** Refuse row actions when responsive fallback has hidden the selected target. */
+export const PANEL_NOTICE_RESIZE_ACTION = "Resize wider to show an agent row before acting.";
 
 export function panelNoticeStopRequested(label: string): string {
   return `Stop requested for ${label} — it will settle as aborted.`;
@@ -481,6 +483,8 @@ export class SubagentPanelFocusController {
     let viewMode: "list" | "detail" = "list";
     let detail: DetailState | undefined;
     let stopAllArmedAt: number | undefined;
+    // Fail closed until a focused list render proves its selected row is visible.
+    let selectedRowVisible = false;
     let interval: ReturnType<typeof setInterval> | undefined;
     let unsubscribeRegistry: (() => void) | undefined;
     let unsubscribeTasks: (() => void) | undefined;
@@ -640,12 +644,14 @@ export class SubagentPanelFocusController {
         lastMaxScroll: 0,
       };
       viewMode = "detail";
+      selectedRowVisible = false;
     };
 
     /** Leave the drill-down for the list. */
     const exitDetail = (): void => {
       detail = undefined;
       viewMode = "list";
+      selectedRowVisible = false;
     };
 
     const scrollDetail = (delta: number): void => {
@@ -812,21 +818,28 @@ export class SubagentPanelFocusController {
         // Defensive render: pi-tui kills the process on a throwing render.
         try {
           if (viewMode === "detail" && detail) {
+            selectedRowVisible = false;
             return renderDetailView(width);
           }
           const view = computeView();
           if (view.empty) {
+            selectedRowVisible = false;
             // Every row dismissed/gone while focused: keep a visible line so
             // the user is never left holding focus on an invisible component.
             return clampLines([themedFg(theme, "muted", PANEL_FOCUSED_EMPTY_LINE)], width);
           }
-          return renderSubagentPanel(view, {
+          const lines = renderSubagentPanel(view, {
             width,
             theme,
             runningFrame: PANEL_RUNNING_FRAMES[frame],
             entryChord: PANEL_ENTRY_CHORD,
           });
+          // The marker is emitted only by the real row profile and survives
+          // the final clamp only when the selected target is actually visible.
+          selectedRowVisible = lines.some((line) => line.includes("❯"));
+          return lines;
         } catch (err) {
+          selectedRowVisible = false;
           console.error(`PiCC subagent panel render failed: ${(err as Error).message}`);
           // Same rationale as the empty view: never leave the user holding
           // focus on an INVISIBLE component — plain text, no theme call that
@@ -876,14 +889,22 @@ export class SubagentPanelFocusController {
           if (matches("tui.select.up")) {
             computeView();
             model.moveSelection(-1);
+            selectedRowVisible = false;
             return;
           }
           if (matches("tui.select.down")) {
             computeView();
             model.moveSelection(1);
+            selectedRowVisible = false;
             return;
           }
-          if (matches("tui.select.confirm")) {
+          const confirm = matches("tui.select.confirm");
+          const rowAction = confirm || data === "x" || data === "X" || data === "d";
+          if (rowAction && !selectedRowVisible) {
+            notify(PANEL_NOTICE_RESIZE_ACTION);
+            return;
+          }
+          if (confirm) {
             enter();
             return;
           }

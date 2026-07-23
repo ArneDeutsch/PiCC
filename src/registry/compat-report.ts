@@ -1,11 +1,7 @@
 /**
- * Compatibility report — generated from the capability registry so it cannot
- * drift from actual behavior.
- *
- * On config load, buildCompatReport() scans the assembled project for
- * declared-but-not-fully-honored usage. renderStartupNotice() emits ONE
- * consolidated, suppressible notice per session; renderDoctorReport() gives
- * the full /doctor breakdown on demand. Never silent, never nagging.
+ * Compatibility report — derived from the capability registry so `/doctor` and
+ * the generated matrix share the same support claims. buildCompatReport() scans
+ * the assembled project; renderDoctorReport() gives a project-specific report.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -14,12 +10,12 @@ import type {
   CapabilityEntry,
   ClaudeProject,
   HookConfig,
+  ResolvedMcpConfig,
 } from "../types.js";
 import { SUPPORTED_HOOK_EVENTS } from "../types.js";
 import { loadPluginHooks, type InstalledPlugin } from "../claude/plugins.js";
 import { modelSupportsImages } from "../util/model.js";
 import type { ResolvedCompactionConfig } from "../runtime/steering.js";
-import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 import {
   CAPABILITY_REGISTRY,
   CLAUDE_BASELINE,
@@ -46,6 +42,13 @@ export interface CompatReport {
   safetyFindings: CompatFinding[];
   /** Inputs unknown at the baseline — surfaced as unassessed. */
   unassessed: string[];
+  /**
+   * Pending-approval MCP servers, as a single short line for the one-time
+   * session-start `ctx.ui.notify(...)`. Pending servers are ACTIONABLE STATE,
+   * not a compat finding, so this survives the otherwise-quiet startup; the
+   * full enable/decline edit lives in the `/doctor` pending finding.
+   */
+  mcpPendingNotice?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -277,14 +280,53 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     }
   }
 
-  // --- .mcp.json at the project root (filesystem check) --------------------
-  try {
-    if (fs.statSync(path.join(project.root, ".mcp.json")).isFile()) {
-      const cap = lookupCapability("feature.mcp");
-      if (cap) addFinding(cap, ".mcp.json present at project root — MCP servers will not start");
+  // --- MCP discovery results ----------------------------------------------
+  // Discovery-fed, not a filesystem probe: findings mirror what the resolver
+  // actually decided. Findings cover ACTIONABLE/DEGRADED states — the pending
+  // gate, plus EVERY server's stored diagnostics regardless of status (an
+  // enabled server's unset-${VAR} warning or ignored-field notice is degraded
+  // state too; a CLEAN enabled server stays posture-line data in /doctor,
+  // never a finding). Display hygiene: server NAMES and raw (pre-expansion)
+  // diagnostics only; expanded command/args/env values never reach a finding.
+  const mcp = project.mcp ?? EMPTY_MCP;
+  const pendingNames = mcp.servers
+    .filter((s) => s.status === "pending-approval")
+    .map((s) => s.name);
+  if (pendingNames.length > 0) {
+    const cap = lookupCapability("feature.mcp-project-approval");
+    if (cap) {
+      // With the startup compat surface gone, this /doctor finding is the ONE
+      // canonical carrier of the exact enable/decline settings edit; the
+      // one-time session-start notify (mcpPendingNotice below) only names the
+      // servers and points here.
+      addFinding(
+        cap,
+        `MCP server(s) pending approval: ${mcpNameList(pendingNames)} — ${mcpPendingEditDetail(pendingNames)}`,
+      );
     }
-  } catch {
-    // absent or unreadable — nothing to report (completeness floor)
+  }
+  for (const server of mcp.servers) {
+    const cap = lookupCapability("feature.mcp");
+    if (!cap) continue;
+    if (server.diagnostics.length > 0) {
+      // Most stored diagnostics already quote the server name; the resolver's
+      // unset-${VAR} warnings do not — prefix those so every finding names its
+      // server (never expanded values, the diagnostics are raw-only).
+      const named = server.diagnostics.map((d) =>
+        d.includes(`"${server.name}"`) ? d : `MCP server "${server.name}": ${d}`,
+      );
+      addFinding(cap, named.join("; "));
+    } else if (server.status === "skipped") {
+      // A skipped server without stored diagnostics still surfaces, never silently.
+      addFinding(cap, `MCP server "${server.name}" (${server.source}) skipped: invalid entry`);
+    }
+  }
+  // Config-level diagnostics (malformed .mcp.json, ignored project-scope
+  // approvals, git-tracked settings.local.json demotion) carry their own
+  // remedy text — surface each verbatim under the umbrella MCP entry.
+  for (const diag of mcp.diagnostics) {
+    const cap = lookupCapability("feature.mcp");
+    if (cap) addFinding(cap, diag);
   }
 
   // De-duplicate findings (same capability + same evidence) and unassessed.
@@ -296,11 +338,128 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     return true;
   });
 
+  const mcpPendingNotice =
+    pendingNames.length > 0 ? buildMcpPendingNotice(pendingNames) : undefined;
+
   return {
     findings: deduped.filter((f) => f.capability.safetyRelevant !== true),
     safetyFindings: deduped.filter((f) => f.capability.safetyRelevant === true),
     unassessed: [...new Set(unassessed)],
+    ...(mcpPendingNotice !== undefined ? { mcpPendingNotice } : {}),
   };
+}
+
+// ---------------------------------------------------------------------------
+// MCP surfaces — pending notice + /doctor posture line
+// ---------------------------------------------------------------------------
+
+const EMPTY_MCP: ResolvedMcpConfig = { servers: [], diagnostics: [] };
+
+/** Cap on server names quoted in one list — a hostile config must not flood a line. */
+const MCP_NAME_LIST_MAX = 8;
+
+/** Bound on a per-server diagnostic quoted on the /doctor posture line. */
+const MCP_POSTURE_DIAG_MAX_CHARS = 240;
+
+function mcpNameList(names: string[]): string {
+  const shown = names.slice(0, MCP_NAME_LIST_MAX).join(", ");
+  const rest = names.length - MCP_NAME_LIST_MAX;
+  return rest > 0 ? `${shown}, and ${rest} more` : shown;
+}
+
+function boundPostureDiag(text: string): string {
+  return text.length > MCP_POSTURE_DIAG_MAX_CHARS
+    ? `${text.slice(0, MCP_POSTURE_DIAG_MAX_CHARS)}…`
+    : text;
+}
+
+/**
+ * The exact enable/decline settings edit for pending project servers — the
+ * body of the /doctor pending finding's evidence.
+ * Bounding: past the name-list cap a verbatim JSON enumeration would flood the
+ * line — recommend the blanket key instead of listing every name.
+ */
+function mcpPendingEditDetail(pendingNames: string[]): string {
+  const enable =
+    pendingNames.length > MCP_NAME_LIST_MAX
+      ? `add "enableAllProjectMcpServers": true (or list a subset in "enabledMcpjsonServers")`
+      : `add "enabledMcpjsonServers": ${JSON.stringify(pendingNames)} (or ` +
+        `"enableAllProjectMcpServers": true)`;
+  return (
+    `${enable} in .claude/settings.local.json to start them; list a server in ` +
+    `"disabledMcpjsonServers" to decline it and silence the session-start notice`
+  );
+}
+
+/**
+ * ONE short, self-contained line (toast-truncation-safe): count, capped names,
+ * the enabling key, and the /doctor pointer. Startup is otherwise quiet, so
+ * this deliberately does NOT carry the full settings edit — the /doctor
+ * pending finding (mcpPendingEditDetail) is the canonical carrier of that.
+ */
+function buildMcpPendingNotice(pendingNames: string[]): string {
+  return (
+    `MCP: ${pendingNames.length} server(s) pending approval (${mcpNameList(pendingNames)}) — ` +
+    `enable with enabledMcpjsonServers in .claude/settings.local.json; run /doctor for the ` +
+    `exact edit and the decline path.`
+  );
+}
+
+/**
+ * Live per-server state as the runtime reports it. Structural (not imported
+ * from runtime/mcp.ts) so the registry layer keeps no runtime dependency;
+ * `McpRuntime.serverStates()` satisfies it.
+ */
+export interface McpServerLiveState {
+  name: string;
+  state: "connecting" | "connected" | "failed";
+  toolCount?: number;
+  diagnostic?: string;
+}
+
+/**
+ * Always-present MCP posture line for `/doctor` (the subagent-posture-line
+ * pattern): live state per ENABLED server from the runtime, gate state per
+ * pending/disabled/skipped server from discovery. Positive/live state lives
+ * HERE — never as a finding.
+ */
+function mcpPostureLine(
+  mcp: ResolvedMcpConfig,
+  liveStates: readonly McpServerLiveState[],
+): string {
+  if (mcp.servers.length === 0) return "MCP: no servers configured.";
+  const liveByName = new Map(liveStates.map((s) => [s.name, s]));
+  const parts = mcp.servers.map((server) => {
+    switch (server.status) {
+      case "enabled": {
+        const live = liveByName.get(server.name);
+        // Enabled but unknown to the runtime (states not supplied — e.g. a
+        // report rendered without a running session): claim only enablement.
+        if (!live) return `${server.name}: enabled`;
+        if (live.state === "connected") return `${server.name}: connected (${live.toolCount ?? 0} tool(s))`;
+        if (live.state === "connecting") return `${server.name}: connecting`;
+        return `${server.name}: failed — ${boundPostureDiag(live.diagnostic ?? "no diagnostic")}`;
+      }
+      case "pending-approval":
+        // No enable/decline hint here — the pending finding rendered below
+        // (registry note + evidence) is the canonical carrier of the edit;
+        // repeating it on the posture line would duplicate it.
+        return `${server.name}: pending approval`;
+      case "disabled":
+        return `${server.name}: disabled (disabledMcpjsonServers)`;
+      case "skipped": {
+        const reason = server.diagnostics[0];
+        return `${server.name}: skipped${reason ? ` — ${boundPostureDiag(reason)}` : ""}`;
+      }
+      default: {
+        // Exhaustiveness backstop: a new ResolvedMcpServer status must be
+        // rendered deliberately, never silently mislabeled as skipped.
+        const unreachable: never = server.status;
+        return `${server.name}: ${String(unreachable)}`;
+      }
+    }
+  });
+  return `MCP servers: ${parts.join("; ")}.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -326,10 +485,10 @@ function groupByCapability(findings: CompatFinding[]): Array<{
 //
 // This line is derived from the ACTIVE model's input modalities (via
 // `modelSupportsImages`), NOT from the static capability registry and NOT from
-// the terminal's render capability. It tells a user whether their model can
-// actually see image inputs (image files, pasted/dropped images, notebook image outputs), so a
-// non-vision GPT/Codex user is never silently misled into thinking a pasted
-// screenshot or notebook plot reached the model.
+// the terminal's render capability. When `/doctor` is requested, it tells the
+// user whether their model can actually see image inputs (image files,
+// pasted/dropped images, notebook image outputs), so the report makes explicit
+// whether a screenshot or notebook plot reached the model.
 // ---------------------------------------------------------------------------
 
 /** Display id for the active model (`provider/id` or `id`), or undefined when opaque. */
@@ -373,77 +532,6 @@ function activeModelVisionLine(model: unknown): string {
     `Active model: ${label} — vision: no. Image inputs (image files, pasted/dropped images, notebook image outputs) are ` +
     "sent as text placeholders, not seen by the model; use a vision-capable model to have images seen."
   );
-}
-
-/**
- * The high-value startup warning: emitted ONLY when the active model is known
- * and definitively non-vision (a readable `input` array that lacks "image").
- * Returns undefined for a vision-capable model (the positive line is
- * `/doctor`-only), for an opaque/absent model, and for a model with an `id` but
- * no readable modality array (don't nag when we can't tell — `/doctor` still
- * reports "unknown"). The FIRST line is short and self-contained with the remedy
- * so it survives toast truncation on a narrow terminal; a second, fuller line
- * carries the detail for the notice body / `/doctor`.
- */
-function nonVisionStartupWarning(model: unknown): string | undefined {
-  const id = activeModelId(model);
-  if (id === undefined) return undefined;
-  if (!modelHasVisionAxis(model)) return undefined;
-  if (modelSupportsImages(model)) return undefined;
-  return (
-    `Active model ${id} is not vision-capable — images sent as text; use a vision-capable model.\n` +
-    "Image inputs (image files, pasted/dropped images, notebook image outputs) are sent as text placeholders, not seen by the model."
-  );
-}
-
-/**
- * ONE consolidated startup notice per session.
- * Returns undefined when suppressed or when there is nothing to report.
- */
-export function renderStartupNotice(
-  report: CompatReport,
-  opts: { suppressed: boolean; activeModel?: unknown },
-): string | undefined {
-  // The non-vision active-model warning is DECOUPLED from project-findings
-  // suppression. `/compat suppress` acknowledges this project's compat findings,
-  // but whether the ACTIVE model can see images is a separate, safety-relevant
-  // axis (a user may suppress on a vision model, then later switch to a non-vision
-  // one). So it is computed independent of `suppressed`, and when present it is
-  // always the FIRST line — the emission site builds the toast from that line.
-  const visionWarning = nonVisionStartupWarning(opts.activeModel);
-
-  // Suppression silences only the project-findings body/header. A non-vision model
-  // still surfaces its warning through suppression; a vision-capable or opaque
-  // model stays fully silent (undefined).
-  if (opts.suppressed) return visionWarning;
-
-  const safety = groupByCapability(report.safetyFindings);
-  const functionality = groupByCapability(report.findings);
-  const degradedCount = safety.length + functionality.length + report.unassessed.length;
-
-  if (degradedCount === 0 && visionWarning === undefined) return undefined;
-
-  const lines: string[] = [];
-  if (visionWarning !== undefined) lines.push(visionWarning);
-  if (degradedCount > 0) {
-    lines.push(`PiCC compatibility: ${degradedCount} feature(s) degraded for this project`);
-  }
-  if (safety.length > 0) {
-    lines.push("SAFETY:");
-    for (const g of safety) {
-      lines.push(`  - ${g.capability.id}: ${g.capability.note} [${g.evidence.join("; ")}]`);
-    }
-  }
-  for (const g of functionality) {
-    lines.push(`- ${g.capability.id}: ${g.capability.note} [${g.evidence.join("; ")}]`);
-  }
-  if (report.unassessed.length > 0) {
-    lines.push(
-      `- unassessed (unknown at baseline ${CLAUDE_BASELINE}): ${report.unassessed.length} item(s)`,
-    );
-  }
-  lines.push("Run /doctor for details. (Suppress with /compat suppress)");
-  return lines.join("\n");
 }
 
 const TIER_ORDER = ["partial", "degraded-noop", "not-supported", "na", "full"] as const;
@@ -494,25 +582,27 @@ function compactionKnobsLine(compaction: ResolvedCompactionConfig, activeModel: 
   return `Compaction: current model transport/API (${apiLabel}) is unsupported for proactive checkpointing. Supported API ids are ${supportedLabel}; switch to a model using one of them. ${knobs}.`;
 }
 
-/** Full /doctor breakdown, generated from the registry. */
+/** Project-specific /doctor compatibility report, generated from the registry. */
 export function renderDoctorReport(
   project: ClaudeProject,
   report: CompatReport,
   activeModel?: unknown,
   compaction?: ResolvedCompactionConfig,
+  mcpStates?: readonly McpServerLiveState[],
 ): string {
   const lines: string[] = [
     `PiCC compatibility report — baseline ${CLAUDE_BASELINE}`,
     `Project: ${project.root}`,
     activeModelVisionLine(activeModel),
     subagentPostureLine(project),
+    mcpPostureLine(project.mcp ?? EMPTY_MCP, mcpStates ?? []),
     ...(compaction ? [compactionKnobsLine(compaction, activeModel)] : []),
     "",
   ];
 
   const grouped = groupByCapability([...report.safetyFindings, ...report.findings]);
   if (grouped.length === 0) {
-    lines.push("No compatibility findings: everything this project declares is fully honored.");
+    lines.push("No compatibility findings detected.");
   } else {
     lines.push("Findings (declared by this project, not fully honored):");
     for (const tier of TIER_ORDER) {
@@ -547,35 +637,4 @@ export function renderDoctorReport(
   }
 
   return lines.join("\n");
-}
-
-// ---------------------------------------------------------------------------
-// Suppression persistence — suppressible once acknowledged
-// ---------------------------------------------------------------------------
-
-/**
- * Harness-owned, non-tracked location: `.claude/.picc/` is PiCC state, never a
- * tracked project file.
- */
-function suppressionPath(projectRoot: string): string {
-  return path.join(projectRoot, ".claude", ".picc", "compat-ack.json");
-}
-
-/** True when the startup notice has been acknowledged/suppressed for this project. */
-export function readSuppression(projectRoot: string): boolean {
-  const data = parseJsonSafe<{ suppressed?: unknown }>(
-    readTextSafe(suppressionPath(projectRoot)),
-  );
-  return data?.suppressed === true;
-}
-
-/** Persist the suppression flag (creates `.claude/.picc/` as needed). Never throws. */
-export function writeSuppression(projectRoot: string, v: boolean): void {
-  const file = suppressionPath(projectRoot);
-  try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, `${JSON.stringify({ suppressed: v }, null, 2)}\n`, "utf8");
-  } catch {
-    // completeness floor: suppression is a convenience, never fatal
-  }
 }

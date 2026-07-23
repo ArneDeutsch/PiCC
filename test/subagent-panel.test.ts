@@ -48,7 +48,6 @@ import {
   PANEL_GLYPH_WAITING,
   PANEL_GLYPH_SUCCESS,
   PANEL_HINT_FOCUSED,
-  PANEL_NARROW_WIDTH,
   PANEL_RUNNING_FRAMES,
   panelHintUnfocused,
   panelMoreAbove,
@@ -65,6 +64,7 @@ import {
 } from "../src/runtime/subagent-progress.js";
 import {
   AGENT_COLOR_NAMES,
+  normalizeAgentColor,
   SubagentRegistry,
   type RegisterInput,
   type SubagentRegistryRecord,
@@ -83,6 +83,7 @@ import {
   PANEL_NOTICE_ALL_DISMISSED,
   PANEL_NOTICE_EMPTY,
   PANEL_NOTICE_FOREGROUND,
+  PANEL_NOTICE_RESIZE_ACTION,
   PANEL_NOTICE_RUNNING_DISMISS,
   PANEL_NOTICE_STALE,
   PANEL_NOTICE_STOP_ALL_NONE,
@@ -97,6 +98,8 @@ import {
 const ESC = String.fromCharCode(27);
 const BEL = String.fromCharCode(7);
 const CHORD = "alt+a";
+const ANSI_RE = /\x1b\[[0-9;]*m/gu;
+const stripAnsi = (value: string): string => value.replace(ANSI_RE, "");
 
 /** Minimal registry record with the panel-relevant fields overridable. */
 function rec(
@@ -590,481 +593,427 @@ describe("overflow windowing", () => {
   });
 });
 
-describe("row rendering", () => {
-  const LABEL = "build the entire frontend and wire the API layer";
+describe("responsive panel table", () => {
   const ASSISTANT_CANARY = "ASSISTANT_STREAM_CANARY";
-  const TOOL_CALL_CANARY = "TOOL_CALL_CANARY";
-  const TOOL_OUTCOME_CANARY = "TOOL_OUTCOME_CANARY";
-  const richRecords = () => [
-    rec({
-      agentId: "agent-a",
-      agentName: "coder",
-      description: LABEL,
-      startedAt: 0,
-      color: "red",
-      progress: {
-        tail: [TOOL_CALL_CANARY, TOOL_OUTCOME_CANARY],
-        activity: ASSISTANT_CANARY,
-        usage: { inputTokens: 1200, outputTokens: 340 },
-      },
-    }),
-  ];
+  const rowsOnly = (lines: string[]) => lines.filter((line) => !line.includes("agent panel"));
 
-  function renderAt(width: number, focused = false, withTask = true): string[] {
+  function mixedView(widthRows = 8): PanelViewModel {
     const clock = { t: 12_000 };
-    const model = makeModel(clock);
-    const v = view(model, richRecords(), {
-      focused,
-      tasks: withTask ? [{ id: "task-7", status: "running", agentId: "agent-a" }] : undefined,
-    });
-    return renderSubagentPanel(v, { width, entryChord: CHORD });
+    const model = makeModel(clock, widthRows);
+    return view(model, [
+      rec({
+        agentId: "agent-a", agentName: "coder", description: "build frontend", color: "red",
+        progress: { tail: [], activity: ASSISTANT_CANARY, usage: {
+          inputTokens: 1200, outputTokens: 340, cacheReadTokens: 80,
+          cacheWriteTokens: 20, costUsd: 0.125,
+        } },
+      }),
+      rec({
+        agentId: "agent-b", agentName: "reviewer", description: "review changes", startedAt: 2_000,
+        progress: { tail: [], activity: "", usage: { outputTokens: 7, costUsd: 0 } },
+      }),
+      rec({ agentId: "agent-c", agentName: "tester", description: "run checks", startedAt: 4_000 }),
+    ], { tasks: [
+      { id: "task-secret-a", status: "running", agentId: "agent-a" },
+      { id: "task-secret-b", status: "running", agentId: "agent-b" },
+    ] });
   }
 
-  it("renders task identity and stable metadata, never live activity, at generous width", () => {
-    for (const focused of [false, true]) {
-      const row = renderAt(200, focused)[0]!;
-      expect(row).toContain("coder");
-      expect(row).toContain("task-7");
-      expect(row).toContain(LABEL);
-      expect(row).toContain("12s");
-      expect(row).toContain("in 1200");
-      expect(row).toContain("out 340");
-      for (const canary of [ASSISTANT_CANARY, TOOL_CALL_CANARY, TOOL_OUTCOME_CANARY]) {
-        expect(row).not.toContain(canary);
-      }
-    }
-  });
-
-  it("preserves metadata-first rows across focus, nested selection, and lifecycle state", () => {
-    const cases = [
-      { name: "passive", focused: false, selectedChild: false },
-      { name: "focused root", focused: true, selectedChild: false },
-      { name: "focused nested child", focused: true, selectedChild: true },
-    ] as const;
-
-    for (const testCase of cases) {
-      const clock = { t: 12_000 };
-      const model = makeModel(clock);
-      const records = [
-        rec({
-          agentId: "agent-root",
-          agentName: "rooter",
-          description: `running ${LABEL}`,
-          progress: {
-            tail: [TOOL_CALL_CANARY, TOOL_OUTCOME_CANARY],
-            activity: ASSISTANT_CANARY,
-            usage: { inputTokens: 120, outputTokens: 30 },
-          },
-        }),
-        rec({
-          agentId: "agent-child",
-          parentAgentId: "agent-root",
-          agentName: "child",
-          description: `settled ${LABEL}`,
-          startedAt: 2_000,
-          state: "settled",
-          outcome: "completed",
-          settledAt: 9_000,
-          usage: { inputTokens: 80, outputTokens: 20 },
-          progress: { tail: [TOOL_CALL_CANARY], activity: ASSISTANT_CANARY },
-        }),
-      ];
-      const input = {
-        focused: testCase.focused,
-        tasks: [
-          { id: "task-root", status: "running" as const, agentId: "agent-root" },
-          { id: "task-child", status: "completed" as const, agentId: "agent-child" },
-        ],
-      };
-      view(model, records, input);
-      if (testCase.selectedChild) model.moveSelection(1);
-
-      const wide = renderSubagentPanel(view(model, records, input), {
-        width: 200,
-        entryChord: CHORD,
-      });
-      const constrained = renderSubagentPanel(view(model, records, input), {
-        width: 48,
-        entryChord: CHORD,
-      });
-      const wideText = wide.join("\n");
-      const constrainedText = constrained.join("\n");
-
-      expect(wideText, testCase.name).toContain(`running ${LABEL}`);
-      expect(wideText, testCase.name).toContain(`settled ${LABEL}`);
-      expect(constrainedText, testCase.name).not.toContain(LABEL);
-      expect(constrainedText, testCase.name).toContain("12s");
-      expect(constrainedText, testCase.name).toContain("7s");
-      expect(constrainedText, testCase.name).toContain("in 120");
-      expect(constrainedText, testCase.name).toContain("out 30");
-      expect(constrainedText, testCase.name).toContain("in 80");
-      expect(constrainedText, testCase.name).toContain("out 20");
-      expect(constrainedText, testCase.name).toContain("task-root");
-      expect(constrainedText, testCase.name).toContain("task-child");
-      for (const canary of [ASSISTANT_CANARY, TOOL_CALL_CANARY, TOOL_OUTCOME_CANARY]) {
-        expect(wideText, testCase.name).not.toContain(canary);
-        expect(constrainedText, testCase.name).not.toContain(canary);
-      }
-
-      if (testCase.focused) {
-        const selectedIdentity = testCase.selectedChild ? "task-child" : "task-root";
-        expect(constrained.find((line) => line.includes(selectedIdentity)), testCase.name).toContain("❯");
-      } else {
-        expect(constrainedText, testCase.name).not.toContain("❯");
-      }
-    }
-  });
-
-  it("renders task ids only when present", () => {
-    expect(renderAt(120)[0]).toContain("task-7");
-    expect(renderAt(120, false, false)[0]).not.toContain("task-7");
-  });
-
-  it("never invents a zero token figure (blank until known)", () => {
-    const clock = { t: 5000 };
-    const model = makeModel(clock);
-    const v = view(model, [rec({ agentId: "agent-a", description: "quiet work" })]);
-    const row = renderSubagentPanel(v, { width: 120, entryChord: CHORD })[0]!;
-    expect(row).not.toMatch(
-      /\b(?:in|out|cache(?: read| write)?)\s+\d|\b\d+ tokens?\b|\$\d/i,
-    );
-  });
-
-  it("does not duplicate the agent name when the label falls back to it", () => {
-    const clock = { t: 5000 };
-    const model = makeModel(clock);
-    const v = view(model, [rec({ agentId: "agent-a", agentName: "reviewer" })]);
-    const row = renderSubagentPanel(v, { width: 120, entryChord: CHORD })[0]!;
-    expect(row.match(/reviewer/g)).toHaveLength(1);
-  });
-
-  it("uses distinct glyphs per state (not color-alone) and the caller's frame", () => {
-    const clock = { t: 2000 };
-    const model = makeModel(clock);
-    const v = view(model, [
-      rec({ agentId: "agent-run", startedAt: 0 }),
-      rec({ agentId: "agent-ok", startedAt: 1, state: "settled", outcome: "completed", settledAt: 1500 }),
-      rec({ agentId: "agent-bad", startedAt: 2, state: "settled", outcome: "failed", settledAt: 1500 }),
-      rec({ agentId: "agent-st", startedAt: 3, state: "settled", outcome: "aborted", settledAt: 1500 }),
-    ]);
-    const lines = renderSubagentPanel(v, { width: 120, entryChord: CHORD, runningFrame: PANEL_RUNNING_FRAMES[3] });
-    expect(lines[0]).toContain(PANEL_RUNNING_FRAMES[3]!);
-    expect(lines[1]).toContain(PANEL_GLYPH_SUCCESS);
-    expect(lines[2]).toContain(PANEL_GLYPH_FAILED);
-    expect(lines[3]).toContain(PANEL_GLYPH_STOPPED);
-    const glyphs = [PANEL_RUNNING_FRAMES[3]!, PANEL_GLYPH_SUCCESS, PANEL_GLYPH_FAILED, PANEL_GLYPH_STOPPED];
-    expect(new Set(glyphs).size).toBe(4);
-  });
-
-  it("tints the agent type with the record color, no tint for unknown values", () => {
-    expect(tintAgentColor("red", "coder")).toBe(`${AGENT_COLOR_ANSI.red}coder${ESC}[39m`);
-    expect(tintAgentColor("blood", "coder")).toBe("coder");
-    expect(tintAgentColor(undefined, "coder")).toBe("coder");
-    // The row tint is theme-gated (themeless renders degrade to plain text),
-    // so a themed render carries the tint...
-    const clock = { t: 12_000 };
-    const model = makeModel(clock);
-    const v = view(model, richRecords());
-    const themed = renderSubagentPanel(v, {
-      width: 200,
-      entryChord: CHORD,
-      theme: { fg: (_c: string, s: string) => s, bold: (s: string) => s },
+  it("aligns identity, description, elapsed, sparse usage, positive cache, and cost columns", () => {
+    const lines = rowsOnly(renderSubagentPanel(mixedView(), { width: 180, entryChord: CHORD }));
+    expect(lines).toHaveLength(3);
+    const starts = (line: string) => ({
+      description: Math.min(...["build frontend", "review changes", "run checks"].map((value) => {
+        const at = line.indexOf(value); return at < 0 ? Number.POSITIVE_INFINITY : at;
+      })),
+      elapsedEnd: line.search(/\d+s/) + (line.match(/\d+s/)?.[0].length ?? 0),
+      outputEnd: line.indexOf("out ") + (line.match(/out \d+(?:\.\d+)?/)?.[0].length ?? 0),
+      costEnd: line.indexOf("$") + (line.match(/\$\d+(?:\.\d+)?/)?.[0].length ?? 0),
     });
-    expect(themed[0]).toContain(AGENT_COLOR_ANSI.red);
-    // ...and a themeless one does not.
-    expect(renderAt(200)[0]!).not.toContain(AGENT_COLOR_ANSI.red);
+    const positions = lines.map(starts);
+    expect(new Set(positions.map((position) => position.description)).size).toBe(1);
+    expect(new Set(positions.map((position) => position.elapsedEnd)).size).toBe(1);
+    expect(positions[0]!.outputEnd).toBe(positions[1]!.outputEnd);
+    expect(positions[0]!.costEnd).toBe(positions[1]!.costEnd);
+    expect(lines[0]).toContain("in 1200");
+    expect(lines[0]).toContain("c/read 80");
+    expect(lines[0]).toContain("c/write 20");
+    expect(positions[0]!.costEnd).toBe(180);
+    expect(lines.map(visibleWidth)).toEqual([180, 180, 180]);
+    expect(lines.join("\n")).not.toContain(ASSISTANT_CANARY);
   });
 
-  it("DRIFT GUARD: the render palette's names equal the capture-side color whitelist", () => {
-    // Capture (subagent-registry) whitelists color names; render (this map)
-    // assigns them ANSI codes. A name added to one side only would silently
-    // drop the tint (or dead-code the ANSI entry) — pin the sets equal.
-    expect(Object.keys(AGENT_COLOR_ANSI).sort()).toEqual([...AGENT_COLOR_NAMES].sort());
+  it("reserves output-only, cost-only, and neither rows while omitting all-missing metrics", () => {
+    const clock = { t: 1000 };
+    const sparse = view(makeModel(clock), [
+      rec({ agentId: "out", agentName: "outputter", description: "output only", progress: { tail: [], activity: "", usage: { outputTokens: 7 } } }),
+      rec({ agentId: "cost", agentName: "costing", description: "cost only", progress: { tail: [], activity: "", usage: { costUsd: 0.5 } } }),
+      rec({ agentId: "none", agentName: "quiet", description: "neither" }),
+    ], { focused: true });
+    const lines = rowsOnly(renderSubagentPanel(sparse, { width: 100, entryChord: CHORD })).slice(0, 3);
+    expect(lines[0]).toContain("out 7");
+    expect(lines[0]).not.toContain("$");
+    expect(lines[1]).not.toContain("out ");
+    expect(lines[1]).toContain("$0.5");
+    expect(lines[2]).not.toMatch(/out |\$/u);
+    expect(lines.map(visibleWidth)).toEqual([100, 100, 100]);
+    expect(lines[0]!.indexOf("out 7") + "out 7".length).toBe(100 - 2 - "$0.5".length);
+    expect(lines[1]!.indexOf("$0.5") + "$0.5".length).toBe(100);
+
+    const model = makeModel(clock);
+    const zeroCache = view(model, [
+      rec({ agentId: "agent-z", description: "zero", progress: { tail: [], activity: "", usage: { cacheReadTokens: 0, cacheWriteTokens: -1 } } }),
+      rec({ agentId: "agent-n", description: "none" }),
+    ]);
+    const text = renderSubagentPanel(zeroCache, { width: 100, entryChord: CHORD }).join("\n");
+    expect(text).not.toContain("c/read");
+    expect(text).not.toContain("c/write");
   });
 
-  it("marks the selected row only while focused", () => {
-    const focusedRow = renderAt(200, true)[0]!;
-    expect(focusedRow).toContain("❯");
-    const unfocusedRow = renderAt(200, false)[0]!;
-    expect(unfocusedRow).not.toContain("❯");
+  it("drops eligible metadata in order with one shared panel profile", () => {
+    type Presence = {
+      cacheWrite: boolean;
+      cacheRead: boolean;
+      cost: boolean;
+      output: boolean;
+      input: boolean;
+      elapsed: boolean;
+    };
+    const presence = (lines: string[]): Presence => ({
+      cacheWrite: lines.some((line) => line.includes("c/write")),
+      cacheRead: lines.some((line) => line.includes("c/read")),
+      cost: lines.some((line) => line.includes("$")),
+      output: lines.some((line) => line.includes("out ")),
+      input: lines.some((line) => line.includes("in ")),
+      elapsed: lines.some((line) => /\b\d+s\b/.test(line)),
+    });
+    const transitionWidths: { [K in keyof Presence]: number | undefined } = {
+      cacheWrite: undefined,
+      cacheRead: undefined,
+      cost: undefined,
+      output: undefined,
+      input: undefined,
+      elapsed: undefined,
+    };
+    const full: Presence = {
+      cacheWrite: true, cacheRead: true, cost: true, output: true, input: true, elapsed: true,
+    };
+    const empty: Presence = {
+      cacheWrite: false, cacheRead: false, cost: false, output: false, input: false, elapsed: false,
+    };
+    let previous = full;
+    let firstProfile: Presence | undefined;
+    let lastProfile: Presence | undefined;
+    for (let width = 180; width >= 1; width--) {
+      const lines = rowsOnly(renderSubagentPanel(mixedView(), { width, entryChord: CHORD })).slice(0, 3);
+      if (lines.length !== 3 || lines.some((line) => /(?:failed|stopped|running|completed)/.test(line))) continue;
+      const current = presence(lines);
+      firstProfile ??= current;
+      lastProfile = current;
+      if (previous.cacheWrite && !current.cacheWrite) transitionWidths.cacheWrite = width;
+      if (previous.cacheRead && !current.cacheRead) transitionWidths.cacheRead = width;
+      if (previous.cost && !current.cost) transitionWidths.cost = width;
+      if (previous.output && !current.output) transitionWidths.output = width;
+      if (previous.input && !current.input) transitionWidths.input = width;
+      if (previous.elapsed && !current.elapsed) transitionWidths.elapsed = width;
+      expect(previous.cacheWrite || !current.cacheWrite).toBe(true);
+      expect(previous.cacheRead || !current.cacheRead).toBe(true);
+      expect(previous.cost || !current.cost).toBe(true);
+      expect(previous.output || !current.output).toBe(true);
+      expect(previous.input || !current.input).toBe(true);
+      expect(previous.elapsed || !current.elapsed).toBe(true);
+      previous = current;
+
+      const occurrences = {
+        cacheWrite: lines.filter((line) => line.includes("c/write")).length,
+        cacheRead: lines.filter((line) => line.includes("c/read")).length,
+        cost: lines.filter((line) => line.includes("$")).length,
+        output: lines.filter((line) => line.includes("out ")).length,
+        input: lines.filter((line) => line.includes("in ")).length,
+        elapsed: lines.filter((line) => /\b\d+s\b/.test(line)).length,
+      };
+      expect(occurrences.cacheWrite).toBe(current.cacheWrite ? 1 : 0);
+      expect(occurrences.cacheRead).toBe(current.cacheRead ? 1 : 0);
+      expect(occurrences.cost).toBe(current.cost ? 2 : 0);
+      expect(occurrences.output).toBe(current.output ? 2 : 0);
+      expect(occurrences.input).toBe(current.input ? 1 : 0);
+      expect(occurrences.elapsed).toBe(current.elapsed ? 3 : 0);
+      expect(new Set(lines.map(visibleWidth))).toEqual(new Set([width]));
+      for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+    }
+    expect(firstProfile).toEqual(full);
+    expect(lastProfile).toEqual(empty);
+    expect(transitionWidths.cacheWrite).toBeGreaterThan(transitionWidths.cacheRead!);
+    expect(transitionWidths.cacheRead).toBeGreaterThan(transitionWidths.cost!);
+    expect(transitionWidths.cost).toBeGreaterThan(transitionWidths.output!);
+    expect(transitionWidths.output).toBeGreaterThan(transitionWidths.input!);
+    expect(transitionWidths.input).toBeGreaterThan(transitionWidths.elapsed!);
+
+    const focusedPanel = mixedView();
+    focusedPanel.focused = true;
+    focusedPanel.rows[0]!.selected = true;
+    const focusedWide = renderSubagentPanel(focusedPanel, { width: 180, entryChord: CHORD }).slice(0, 3);
+    expect(presence(focusedWide)).toEqual(full);
+    expect(focusedWide.every((line) => visibleWidth(line) === 180)).toBe(true);
+  });
+
+  it("keeps descriptions until telemetry is gone, then truncates the elastic description", () => {
+    let firstDroppedWidth: number | undefined;
+    for (let width = 180; width >= 1; width--) {
+      const lines = rowsOnly(renderSubagentPanel(mixedView(), { width, entryChord: CHORD }));
+      if (!lines[0]?.includes("c/write")) { firstDroppedWidth = width; break; }
+    }
+    expect(firstDroppedWidth).toBeDefined();
+    const atDrop = rowsOnly(renderSubagentPanel(mixedView(), { width: firstDroppedWidth!, entryChord: CHORD }));
+    expect(atDrop[0]).toContain("build frontend");
+    expect(atDrop[1]).toContain("review changes");
+
+    const narrow = rowsOnly(renderSubagentPanel(mixedView(), { width: 22, entryChord: CHORD }));
+    expect(narrow.join("\n")).not.toMatch(/\b(?:in|out|c\/read|c\/write)\b|\$/);
+    expect(narrow.some((line) => line.includes("…"))).toBe(true);
+  });
+
+  it("keeps useful long custom identity and distinct description cells or aggregates truthfully", () => {
+    const panel = view(makeModel({ t: 1000 }), [rec({
+      agentId: "custom", agentName: "custom-agent-identity-that-is-very-long",
+      description: "distinct-dispatch-description-that-is-also-long",
+      progress: { tail: [], activity: "", usage: { inputTokens: 99, outputTokens: 7 } },
+    })]);
+    let sawRow = false;
+    let sawAggregate = false;
+    for (let width = 1; width <= 80; width++) {
+      const first = stripAnsi(renderSubagentPanel(panel, { width, entryChord: CHORD })[0] ?? "");
+      if (/\b1 running\b/u.test(first) || first === PANEL_RUNNING_FRAMES[0]) {
+        sawAggregate = true;
+        continue;
+      }
+      if (!first) continue;
+      sawRow = true;
+      expect(first, `width=${width}`).toMatch(/custom|cus|cu…/u);
+      expect(first, `width=${width}`).toMatch(/distinct|dis|di…/u);
+    }
+    expect({ sawRow, sawAggregate }).toEqual({ sawRow: true, sawAggregate: true });
+  });
+
+  it("never renders task ids while retaining distinct hidden keys for duplicate visible rows", () => {
+    const clock = { t: 1000 };
+    const model = makeModel(clock);
+    const records = [
+      rec({ agentId: "agent-a", agentName: "coder", description: "same work", startedAt: 0 }),
+      rec({ agentId: "agent-b", agentName: "coder", description: "same work", startedAt: 0 }),
+    ];
+    const tasks = [
+      { id: "task-secret-a", status: "running" as const, agentId: "agent-a" },
+      { id: "task-secret-b", status: "running" as const, agentId: "agent-b" },
+    ];
+    const panel = view(model, records, { tasks });
+    expect(panel.rows.map((row) => row.keyId)).toEqual(["task:task-secret-a", "task:task-secret-b"]);
+    for (let width = 0; width <= 140; width++) {
+      const text = renderSubagentPanel(panel, { width, entryChord: CHORD }).join("\n");
+      expect(text).not.toContain("task-secret");
+    }
+    const passive = rowsOnly(renderSubagentPanel(panel, { width: 100, entryChord: CHORD }));
+    expect(passive[0]).toBe(passive[1]);
+  });
+
+  it("preserves every hidden-descendant chip completely or uses the truthful aggregate", () => {
+    const clock = { t: 100 };
+    const model = makeModel(clock, 1);
+    const panel = view(model, [
+      rec({ agentId: "parent", agentName: "long-parent-identity", description: "parent description" }),
+      rec({ agentId: "child", parentAgentId: "parent", startedAt: 1 }),
+    ], { focused: true });
+    expect(panel.rows[0]?.hiddenDescendants).toBe(1);
+    let sawAggregate = false;
+    let sawCompleteChip = false;
+    for (let width = 0; width <= 60; width++) {
+      const first = renderSubagentPanel(panel, { width, entryChord: CHORD })[0] ?? "";
+      const plain = stripAnsi(first);
+      if (/\b(?:running|failed|stopped|completed)\b/u.test(plain) || [PANEL_RUNNING_FRAMES[0], PANEL_GLYPH_FAILED, PANEL_GLYPH_STOPPED, PANEL_GLYPH_SUCCESS].includes(plain) || plain === "") {
+        if (plain !== "") sawAggregate = true;
+        continue;
+      }
+      expect(plain, `width=${width}`).toContain("(+1)");
+      expect(plain, `width=${width}`).not.toMatch(/\(\+?$|\(\+1$/u);
+      sawCompleteChip = true;
+    }
+    expect({ sawAggregate, sawCompleteChip }).toEqual({ sawAggregate: true, sawCompleteChip: true });
+  });
+
+  it("preserves focus/tree/state gutters and hidden-descendant chips", () => {
+    const clock = { t: 100 };
+    const model = makeModel(clock, 2);
+    const records = [
+      rec({ agentId: "agent-p", description: "parent" }),
+      rec({ agentId: "agent-c1", parentAgentId: "agent-p", description: "child one", startedAt: 1 }),
+      rec({ agentId: "agent-c2", parentAgentId: "agent-p", description: "child two", startedAt: 2 }),
+    ];
+    const panel = view(model, records, { focused: true });
+    const lines = rowsOnly(renderSubagentPanel(panel, { width: 100, entryChord: CHORD }));
+    expect(lines[0]).toContain("❯");
+    expect(lines[0]).toContain("(+1)");
+    expect(lines[1]!.indexOf(PANEL_RUNNING_FRAMES[0]!)).toBeGreaterThan(lines[0]!.indexOf(PANEL_RUNNING_FRAMES[0]!));
   });
 });
 
-describe("panel chrome (hints, overflow lines, summary, empty)", () => {
-  it("returns no lines for an empty view (the panel disappears)", () => {
-    const clock = { t: 0 };
-    const model = makeModel(clock);
-    const v = view(model, []);
-    expect(renderSubagentPanel(v, { width: 80, entryChord: CHORD })).toEqual([]);
-  });
+describe("panel aggregate, palette, and width safety", () => {
+  function forcedAggregate(records: SubagentRegistryRecord[], maxRows = 8): PanelViewModel {
+    const clock = { t: 1000 };
+    const panel = view(makeModel(clock, maxRows), records, { focused: false });
+    for (const row of panel.rows) row.treeDepth = 6;
+    return panel;
+  }
 
-  it("ends with the unfocused hint NAMING the entry chord (discovery path)", () => {
-    expect(panelHintUnfocused(CHORD)).toContain(CHORD);
-    const clock = { t: 0 };
-    const model = makeModel(clock);
-    const v = view(model, [rec({ agentId: "agent-a" })]);
-    const lines = renderSubagentPanel(v, { width: 80, entryChord: CHORD });
-    expect(lines[lines.length - 1]).toContain(CHORD);
-  });
-
-  it("renders waiting with a static distinct glyph and literal label", () => {
-    const clock = { t: 2000 };
-    const model = makeModel(clock);
-    const v = view(model, [rec({ agentId: "agent-w", admission: "waiting" })]);
-    const row = renderSubagentPanel(v, {
+  it("renders waiting with a static glyph, literal label, and separate responsive count", () => {
+    const panel = view(makeModel({ t: 1000 }), [
+      rec({ agentId: "running" }),
+      rec({ agentId: "waiting", admission: "waiting" }),
+    ]);
+    const lines = renderSubagentPanel(panel, {
       width: 120,
       entryChord: CHORD,
       runningFrame: PANEL_RUNNING_FRAMES[4],
-    })[0]!;
-    expect(row).toContain(PANEL_GLYPH_WAITING);
-    expect(row).toContain("waiting");
-    expect(row).not.toContain(PANEL_RUNNING_FRAMES[4]);
-    const lines = renderSubagentPanel(
-      view(model, [
-        rec({ agentId: "agent-run" }),
-        rec({ agentId: "agent-w", admission: "waiting" }),
-      ]),
-      { width: 120, entryChord: CHORD },
-    );
+    });
+    const waitingRow = lines.find((line) => line.includes("[waiting]"));
+    expect(waitingRow).toContain(PANEL_GLYPH_WAITING);
+    expect(waitingRow).not.toContain(PANEL_RUNNING_FRAMES[4]);
     expect(lines).toContain("1 running · 1 waiting");
   });
 
-  it("ends with the focused key-map hint while focused", () => {
-    const clock = { t: 0 };
-    const model = makeModel(clock);
-    const v = view(model, [rec({ agentId: "agent-a" })], { focused: true });
-    const lines = renderSubagentPanel(v, { width: 120, entryChord: CHORD });
-    expect(lines[lines.length - 1]).toContain(PANEL_HINT_FOCUSED);
+  it.each([
+    ["failed", rec({ agentId: "a", state: "settled", outcome: "failed", settledAt: 900 }), PANEL_GLYPH_FAILED],
+    ["stopped", rec({ agentId: "a", state: "settled", outcome: "aborted", settledAt: 900 }), PANEL_GLYPH_STOPPED],
+    ["completed", rec({ agentId: "a", state: "settled", outcome: "completed", settledAt: 900 }), PANEL_GLYPH_SUCCESS],
+    ["running", rec({ agentId: "a" }), PANEL_RUNNING_FRAMES[0]],
+  ] as const)("distinguishes a %s-only aggregate", (word, record, glyph) => {
+    const lines = renderSubagentPanel(forcedAggregate([record]), { width: 16, entryChord: "a" });
+    expect(lines.join("\n")).toContain(`1 ${word}`);
+    expect(lines.join("\n")).toContain(glyph);
+    expect(lines).toContain("a: agent panel");
   });
 
-  it("shows … N more affordances for rows outside the window", () => {
-    const clock = { t: 100 };
-    const model = makeModel(clock, 3);
-    const records = Array.from({ length: 8 }, (_, i) =>
-      rec({ agentId: `agent-${i}`, startedAt: i }),
-    );
-    const below = renderSubagentPanel(view(model, records), { width: 80, entryChord: CHORD });
-    expect(below).toContain(panelMoreBelow(5));
+  it("uses complete pre-window counts when failures and stops lie outside the row window", () => {
+    const clock = { t: 1000 };
+    const model = makeModel(clock, 1);
+    const panel = view(model, [
+      rec({ agentId: "run", startedAt: 0 }),
+      rec({ agentId: "failed", state: "settled", outcome: "failed", settledAt: 900, startedAt: 1 }),
+      rec({ agentId: "stopped", state: "settled", outcome: "aborted", settledAt: 900, startedAt: 2 }),
+      rec({ agentId: "done", state: "settled", outcome: "completed", settledAt: 900, startedAt: 3 }),
+    ]);
+    panel.rows[0]!.treeDepth = 6;
+    expect(panel.rows.map((row) => row.agentId)).toEqual(["run"]);
+    expect(panel).toMatchObject({ runningCount: 1, failedCount: 1, stoppedCount: 1, completedCount: 1 });
+    const text = renderSubagentPanel(panel, { width: 16, entryChord: CHORD }).join("\n");
+    for (const state of ["1 running", "1 failed", "1 stopped", "1 completed"]) expect(text).toContain(state);
+    expect(text).not.toContain("done");
+  });
 
-    view(model, records, { focused: true });
-    for (let i = 0; i < 7; i++) {
-      model.moveSelection(1);
-      view(model, records, { focused: true });
+  it("pins the shared palette, normalization, prototype rejection, and foreground-only reset", () => {
+    const accepted = ["red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"];
+    expect([...AGENT_COLOR_NAMES]).toEqual(accepted);
+    expect(Object.keys(AGENT_COLOR_ANSI)).toEqual(accepted);
+    for (const color of accepted) {
+      expect(normalizeAgentColor(` ${color.toUpperCase()} `)).toBe(color);
+      expect(tintAgentColor(color, "coder")).toBe(`${AGENT_COLOR_ANSI[color as keyof typeof AGENT_COLOR_ANSI]}coder${ESC}[39m`);
     }
-    const above = renderSubagentPanel(view(model, records, { focused: true }), {
-      width: 80,
-      entryChord: CHORD,
-    });
-    expect(above).toContain(panelMoreAbove(5));
-  });
-
-  it("pins the narrow threshold: one column below summarizes, the boundary is coherent", () => {
-    const clock = { t: 2000 };
-    const model = makeModel(clock);
-    const records = [
-      rec({
-        agentId: "agent-a",
-        progress: { tail: [], activity: "", usage: { inputTokens: 12, outputTokens: 3 } },
-      }),
-      rec({ agentId: "agent-b", admission: "waiting" }),
-      rec({ agentId: "agent-c", state: "settled", outcome: "completed", settledAt: 1500 }),
-    ];
-    const tasks = [{ id: "task-7", status: "running" as const, agentId: "agent-a" }];
-    const v = view(model, records, { tasks });
-    const below = renderSubagentPanel(v, {
-      width: PANEL_NARROW_WIDTH - 1,
-      entryChord: CHORD,
-    });
-    expect(below).toHaveLength(1);
-    expect(below[0]).toContain("1 running");
-    expect(below[0]).toContain("1 waiting");
-    expect(below[0]).toContain("1 done");
-
-    const boundary = renderSubagentPanel(v, { width: PANEL_NARROW_WIDTH, entryChord: CHORD });
-    expect(boundary.length).toBeGreaterThan(1);
-    expect(boundary[0]).toMatch(/coder \[task-7\] · 2s · in 12 · out 3/);
-    expect(boundary[0]).not.toMatch(/(?:out 3|task-7)coder/);
-  });
-});
-
-describe("width-clamp invariant (pi-tui visibleWidth on every line)", () => {
-  const hostileRecords = () => [
-    rec({
-      agentId: "agent-a",
-      agentName: `evil${ESC}[31m名前\tagent`,
-      description: "宽字符宽字符宽字符宽字符宽字符宽字符宽字符宽字符",
-      color: "cyan",
-      progress: { tail: [], activity: "running 一个非常长的工具名字…", usage: { inputTokens: 123456 } },
-    }),
-    rec({ agentId: "agent-b", parentAgentId: "agent-a", description: "child\ttask" }),
-    rec({
-      agentId: "agent-c",
-      state: "settled",
-      outcome: "failed",
-      settledAt: 0,
-      description: "x".repeat(400),
-    }),
-    // A chain deeper than the visual indent cap (6): proves the crash
-    // invariant holds at depth and the indent stops growing.
-    ...Array.from({ length: 9 }, (_, i) =>
-      rec({
-        agentId: `agent-d${i}`,
-        parentAgentId: i === 0 ? "agent-b" : `agent-d${i - 1}`,
-        startedAt: 10 + i,
-        description: `deep ${i}`,
-      }),
-    ),
-  ];
-  const fakeTheme = {
-    fg: (_c: string, s: string) => `${ESC}[36m${s}${ESC}[39m`,
-    bold: (s: string) => `${ESC}[1m${s}${ESC}[22m`,
-  };
-
-  it("keeps every emitted line <= width for widths 1..90, ANSI/CJK/tab content", () => {
-    for (const focused of [false, true]) {
-      for (let width = 1; width <= 90; width++) {
-        const clock = { t: 90_000 };
-        const model = makeModel(clock);
-        const v = view(model, hostileRecords(), { focused });
-        const lines = renderSubagentPanel(v, {
-          width,
-          theme: fakeTheme,
-          entryChord: CHORD,
-          runningFrame: PANEL_RUNNING_FRAMES[0],
-        });
-        for (const line of lines) {
-          expect(
-            visibleWidth(line),
-            `focused=${focused} width=${width} line=${JSON.stringify(line)}`,
-          ).toBeLessThanOrEqual(width);
-        }
-      }
+    for (const evil of [undefined, null, {}, "constructor", "toString", "blood"]) {
+      expect(normalizeAgentColor(evil)).toBeUndefined();
+      expect(tintAgentColor(evil, "coder")).toBe("coder");
     }
-  });
-
-  it("emits only empty lines at width 0", () => {
-    const clock = { t: 90_000 };
-    const model = makeModel(clock);
-    const v = view(model, hostileRecords());
-    const lines = renderSubagentPanel(v, { width: 0, entryChord: CHORD });
-    expect(lines.length).toBeGreaterThan(0); // never vacuous: rows exist to emit
-    for (const line of lines) {
-      expect(line).toBe("");
+    const mutableCompatibilitySet = AGENT_COLOR_NAMES as Set<string>;
+    const hadBlood = mutableCompatibilitySet.has("blood");
+    try {
+      mutableCompatibilitySet.add("blood");
+      expect(normalizeAgentColor("blood")).toBeUndefined();
+    } finally {
+      if (!hadBlood) mutableCompatibilitySet.delete("blood");
     }
+    expect(tintAgentColor("red", "coder").replace(/\x1b\[[0-9;]*m/gu, "")).toBe("coder");
+
+    const clock = { t: 1000 };
+    const colored = view(makeModel(clock), [rec({
+      agentId: "agent-color", color: "red", description: "stable work",
+      progress: { tail: [], activity: "", usage: { inputTokens: 4 } },
+    })]);
+    const row = renderSubagentPanel(colored, {
+      width: 100, entryChord: CHORD,
+      theme: { fg: (_color: string, text: string) => text },
+    })[0]!;
+    expect(row).toContain(`${AGENT_COLOR_ANSI.red}coder${ESC}[39m stable work`);
+    expect(row.match(new RegExp(AGENT_COLOR_ANSI.red.replace("[", "\\["), "g"))).toHaveLength(1);
+    const fixedTint = row.slice(row.indexOf(AGENT_COLOR_ANSI.red) + AGENT_COLOR_ANSI.red.length, row.indexOf(`${ESC}[39m`));
+    expect(fixedTint).toBe("coder");
+    const themeless = renderSubagentPanel(colored, { width: 100, entryChord: CHORD });
+    expect(themeless.join("\n")).not.toContain(ESC);
+    const ansiTheme = { fg: (_color: string, text: string) => `${ESC}[36m${text}${ESC}[39m` };
+    const themed = renderSubagentPanel(colored, { width: 100, entryChord: CHORD, theme: ansiTheme });
+    expect(themed.map(stripAnsi)).toEqual(themeless);
   });
 
-  it("keeps waiting row and detail hostile ANSI/CJK/control input safe at widths 0..90", () => {
-    const hostile = rec({
-      agentId: "agent-wait",
-      agentName: `等待${ESC}[2J\u0001`,
-      description: `队列${ESC}]0;pwn${BEL}\t名字`,
-      prompt: `提示${ESC}[31m\r\n第二行\u0002`,
-      admission: "waiting",
-    });
-    const tasks: PanelTaskInfo[] = [{
-      id: `task-${ESC}[2J-任务`,
-      status: "running",
-      admission: "waiting",
-      agentId: "agent-wait",
-    }];
-    const dangerous = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/u;
-    for (let width = 0; width <= 90; width++) {
-      const panelLines = view(makeModel({ t: 5000 }), [hostile], { tasks });
-      const row = renderSubagentPanel(panelLines, { width, entryChord: CHORD });
-      const detail = renderSubagentDetail(
-        {
-          record: hostile,
-          taskId: tasks[0]!.id,
-          taskStatus: "running",
-          taskAdmission: "waiting",
-          nowMs: 5000,
-        },
-        detailUi(),
-        { width },
-      ).lines;
-      for (const line of [...row, ...detail]) {
-        expect(visibleWidth(line)).toBeLessThanOrEqual(width);
-        expect(line).not.toContain("[2J");
-        expect(line).not.toContain("]0;pwn");
-        expect(line.replaceAll(ESC, "")).not.toMatch(dangerous);
-      }
-    }
-  });
-
-  it("caps the visual indent: depths past MAX_INDENT_LEVELS share the level-6 indentation", () => {
+  it("keeps every line width-safe for hostile text, ANSI/themeless/throwing themes, and widths 0..120", () => {
     const clock = { t: 90_000 };
     const model = makeModel(clock, 20);
-    const v = view(model, hostileRecords());
-    const lines = renderSubagentPanel(v, { width: 200, entryChord: CHORD });
-    const lineFor = (label: string) => lines.find((l) => l.includes(label))!;
-    const indentOf = (l: string) => l.length - l.trimStart().length;
-    // agent-d5 sits at treeDepth 7, agent-d8 at treeDepth 10 — both beyond the
-    // cap, so their indentation must be identical (and finite).
-    expect(indentOf(lineFor("deep 5"))).toBe(indentOf(lineFor("deep 8")));
-  });
-
-  it("tintAgentColor refuses prototype keys and unknown names; tint is theme-gated in rows", () => {
-    for (const evil of ["constructor", "toString", "hasOwnProperty", "blood"]) {
-      expect(tintAgentColor(evil, "text")).toBe("text");
-    }
-    expect(tintAgentColor("red", "text")).toContain("text");
-    // Themeless render of a colored record emits no ANSI at all (degrade symmetry).
-    const clock = { t: 90_000 };
-    const model = makeModel(clock);
-    const v = view(model, [rec({ agentId: "agent-a", color: "red" })]);
-    for (const line of renderSubagentPanel(v, { width: 120, entryChord: CHORD })) {
-      expect(line.includes(ESC)).toBe(false);
-    }
-  });
-
-  it("keeps zero-width-padded task-id truncation scalar-safe", () => {
-    const unpairedSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
-    const paddedTaskId = `t${"\u0301".repeat(238)}😀x`;
-    const clock = { t: 90_000 };
-    const model = makeModel(clock);
-    const v = view(model, [rec({ agentId: "agent-a" })], {
-      tasks: [{ id: paddedTaskId, status: "running", agentId: "agent-a" }],
+    const records = [
+      rec({
+        agentId: "agent-a", agentName: `evil${ESC}[31m\u0001名\tÁ👨‍👩‍👧‍👦\uD800`,
+        description: `宽字符 ${"👨‍👩‍👧‍👦".repeat(20)} ${"x".repeat(300)}`, color: "cyan",
+        progress: { tail: [], activity: "", usage: { inputTokens: 123456, cacheReadTokens: 0 } },
+      }),
+      ...Array.from({ length: 9 }, (_, i) => rec({
+        agentId: `agent-${i}`, parentAgentId: i === 0 ? "agent-a" : `agent-${i - 1}`,
+        startedAt: i + 1, description: `deep ${i} \t Á 名`,
+      })),
+    ];
+    const panel = view(model, records, {
+      tasks: [{ id: `task${ESC}[2J-secret`, status: "running", agentId: "agent-a" }],
     });
-    const rendered = renderSubagentPanel(v, { width: 120, entryChord: CHORD }).join("\n");
-    expect(rendered).not.toMatch(unpairedSurrogate);
-    expect(rendered).toContain("…");
-  });
-
-  it("sanitizes hostile task ids at all widths without unsafe grapheme boundaries", () => {
+    const themes = [
+      undefined,
+      { fg: (_color: string, text: string) => `${ESC}[36m${text}${ESC}[39m` },
+      { fg: () => { throw new Error("hostile theme"); } },
+      { fg: "malformed" },
+    ];
     const dangerousControls = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/u;
     const unpairedSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
-    const hostileTaskId =
-      `task${ESC}[2J${ESC}]0;pwn${BEL}-名字-🙂-\t-\r-\u0001-` + "👨‍👩‍👧‍👦".repeat(20);
-
-    for (const focused of [false, true]) {
-      for (const width of Array.from({ length: 121 }, (_, value) => value)) {
-        const clock = { t: 90_000 };
-        const model = makeModel(clock);
-        const v = view(
-          model,
-          [
-            rec({
-              agentId: "agent-a",
-              agentName: `${ESC}[2Jevil${ESC}]0;pwn${BEL}name`,
-              description: `d${ESC}[31mescription`,
-              progress: { tail: [], activity: `${ESC}]8;;http://x${BEL}act` },
-            }),
-          ],
-          {
-            focused,
-            tasks: [{ id: hostileTaskId, status: "running", agentId: "agent-a" }],
-          },
-        );
-        const lines = renderSubagentPanel(v, { width, entryChord: CHORD });
+    for (const theme of themes) {
+      for (let width = 0; width <= 120; width++) {
+        const lines = renderSubagentPanel(panel, { width, theme, entryChord: CHORD });
         for (const line of lines) {
-          const withoutSafeResets = line.replaceAll(`${ESC}[0m`, "").replaceAll(`${ESC}[39m`, "");
-          expect(visibleWidth(line), `focused=${focused} width=${width}`).toBeLessThanOrEqual(width);
-          expect(withoutSafeResets, `focused=${focused} width=${width}`).not.toMatch(dangerousControls);
-          expect(withoutSafeResets, `focused=${focused} width=${width}`).not.toMatch(unpairedSurrogate);
-          expect(withoutSafeResets, `focused=${focused} width=${width}`).not.toContain("‍…");
+          expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+          const plain = stripAnsi(line);
+          expect(plain).not.toMatch(dangerousControls);
+          expect(plain).not.toMatch(unpairedSurrogate);
+          expect(plain).not.toContain("‍…");
         }
+        expect(lines.join("\n")).not.toContain("task-secret");
       }
     }
+  });
+
+  it("preserves ordinary state glyphs, overflow affordances, empty view, and passive entry hint", () => {
+    const clock = { t: 2000 };
+    const model = makeModel(clock, 2);
+    const records = [
+      rec({ agentId: "run", startedAt: 0 }),
+      rec({ agentId: "ok", startedAt: 1, state: "settled", outcome: "completed", settledAt: 1500 }),
+      rec({ agentId: "bad", startedAt: 2, state: "settled", outcome: "failed", settledAt: 1500 }),
+      rec({ agentId: "stop", startedAt: 3, state: "settled", outcome: "aborted", settledAt: 1500 }),
+    ];
+    const first = renderSubagentPanel(view(model, records), { width: 100, entryChord: CHORD, runningFrame: PANEL_RUNNING_FRAMES[3] });
+    expect(first[0]).toContain(PANEL_RUNNING_FRAMES[3]);
+    expect(first[1]).toContain(PANEL_GLYPH_SUCCESS);
+    expect(first).toContain(panelMoreBelow(2));
+    expect(first.at(-1)).toBe(panelHintUnfocused(CHORD));
+
+    view(model, records, { focused: true });
+    model.moveSelection(3);
+    const lastView = view(model, records, { focused: true });
+    const last = renderSubagentPanel(lastView, { width: 100, entryChord: CHORD });
+    expect(last).toContain(panelMoreAbove(2));
+    expect(last.some((line) => line.includes(PANEL_GLYPH_FAILED))).toBe(true);
+    expect(last.some((line) => line.includes(PANEL_GLYPH_STOPPED))).toBe(true);
+    expect(renderSubagentPanel(view(makeModel(clock), []), { width: 100, entryChord: CHORD })).toEqual([]);
   });
 });
 
@@ -1188,6 +1137,23 @@ describe("drill-down detail rendering (pure)", () => {
     expect(lines[lines.length - 1]).toContain(
       detailHint({ steerable: true, stoppable: true }),
     );
+  });
+
+  it("themes only validated drill-down identity tint while stripped state/detail stays readable", () => {
+    const record = rec({
+      agentId: "agent-themed", agentName: "reviewer", color: "red",
+      description: "inspect output", detailLog: [{ kind: "status", text: "checking evidence" }],
+    });
+    const theme = { fg: (_slot: string, text: string) => `${ESC}[36m${text}${ESC}[39m` };
+    const rendered = renderSubagentDetail(
+      { record, taskId: "task-themed", nowMs: 2000 }, detailUi(), { width: 100, theme },
+    ).lines.join("\n");
+    expect(rendered).toContain(`${AGENT_COLOR_ANSI.red}reviewer${ESC}[39m`);
+    expect(rendered.indexOf(AGENT_COLOR_ANSI.red)).toBe(rendered.lastIndexOf(AGENT_COLOR_ANSI.red));
+    const plain = stripAnsi(rendered);
+    expect(plain).toContain("reviewer · inspect output");
+    expect(plain).toContain("running");
+    expect(plain).toContain("status: checking evidence");
   });
 
   it("finished layout: final answer leads, then collapsed prompt, tail below; no steer line", () => {
@@ -2147,9 +2113,9 @@ describe("panel widget wiring (offline integration: fake-pi + fake-sdk)", () => 
     expect(waitingTask.admission).toBe("admitted");
     expect(pi.renderRequests).toBeGreaterThan(beforeAdmission);
     const admittedSummary = pi.widgets.get(SUBAGENT_PANEL_WIDGET_KEY)!.render(39).join("\n");
-    expect(admittedSummary).toContain("10 running");
-    expect(admittedSummary).toContain("1 done");
+    expect(admittedSummary).toContain("general-purpose");
     expect(admittedSummary).not.toContain("waiting");
+    expect(admittedSummary).toContain("… 3 more");
     internals.subagentPanel.setSuppressed(true);
   });
 
@@ -2183,8 +2149,9 @@ describe("panel widget wiring (offline integration: fake-pi + fake-sdk)", () => 
     expect(internals.backgroundTasks.get(waitingTaskId)?.status).toBe("stopped");
     expect(pi.renderRequests).toBeGreaterThan(beforeStop);
     const stoppedSummary = pi.widgets.get(SUBAGENT_PANEL_WIDGET_KEY)!.render(39).join("\n");
-    expect(stoppedSummary).toContain("1 done");
+    expect(stoppedSummary).toContain("general-purpose");
     expect(stoppedSummary).not.toContain("waiting");
+    expect(stoppedSummary).toContain("… 3 more");
     releaseFirst();
     await stopping;
     internals.subagentPanel.setSuppressed(true);
@@ -2567,6 +2534,73 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     expect(selectedLine()).toContain("second row");
     invocation.input(KEY_UP);
     expect(selectedLine()).toContain("first row");
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("aggregate fallback refuses open and stop actions until a visible row render", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", "first target");
+    reg(s.registry, "agent-b", "second target");
+    s.tasks.push({ id: "task-a", status: "running", agentId: "agent-a" });
+    s.tasks.push({ id: "task-b", status: "running", agentId: "agent-b" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+
+    // Initial state and the actual aggregate profile both fail closed.
+    invocation.input(KEY_ENTER);
+    expect(s.notices()).toContain(PANEL_NOTICE_RESIZE_ACTION);
+    expect(invocation.render(1).join("\n")).not.toContain("❯");
+    invocation.input(KEY_DOWN); // selection may move, but remains invisible
+    invocation.render(1);
+    invocation.input(KEY_ENTER);
+    invocation.input("x");
+    invocation.input("X");
+    invocation.input("X");
+    expect(s.stopped).toEqual([]);
+    expect(s.registry.get("agent-a")!.userStopped).toBeUndefined();
+    expect(s.registry.get("agent-b")!.userStopped).toBeUndefined();
+
+    // A row-profile render exposes the same authoritative selection.
+    const wide = invocation.render(120).find((line) => line.includes("❯"));
+    expect(wide).toContain("second target");
+    invocation.input(KEY_ENTER);
+    expect(invocation.render(120).join("\n")).toContain("agent-b");
+    invocation.input(ESC); // detail → list; requires a fresh visible-row proof
+    invocation.render(120);
+    invocation.input("x");
+    expect(s.stopped).toEqual(["task-b"]);
+
+    invocation.render(120);
+    invocation.input("X");
+    invocation.input("X");
+    expect(s.stopped).toEqual(["task-b", "task-a"]);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("aggregate fallback refuses dismiss and preserves the selected settled target across resize", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", "first settled");
+    reg(s.registry, "agent-b", "second settled");
+    s.tasks.push({ id: "task-a", status: "completed", agentId: "agent-a" });
+    s.tasks.push({ id: "task-b", status: "completed", agentId: "agent-b" });
+    s.registry.markSettled("agent-a", { outcome: "completed" });
+    s.registry.markSettled("agent-b", { outcome: "completed" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+
+    invocation.render(1);
+    invocation.input(KEY_DOWN);
+    invocation.render(1);
+    invocation.input("d");
+    expect(s.controller.dismissedKeyIds()).toEqual([]);
+    expect(s.notices()).toContain(PANEL_NOTICE_RESIZE_ACTION);
+
+    const selected = invocation.render(120).find((line) => line.includes("❯"));
+    expect(selected).toContain("second settled");
+    invocation.input("d");
+    expect(s.controller.dismissedKeyIds()).toEqual(["task:task-b"]);
     invocation.input(ESC);
     await invocation.result;
   });

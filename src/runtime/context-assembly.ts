@@ -68,7 +68,6 @@ export interface AssemblyInputs {
   settings: ClaudeSettings;
   state: SessionContextState;
   steeringText?: string;
-  compatNotice?: string;
   /**
    * Per-session native-safe scratch dir literal path. When set, a
    * scratchpad section is injected on ALL platforms (mirroring Claude Code) naming
@@ -240,10 +239,6 @@ export function buildSystemPromptSuffix(inputs: AssemblyInputs): string {
 
   if (inputs.steeringText) {
     sections.push(`## Harness guidance\n\n${inputs.steeringText}`);
-  }
-
-  if (inputs.compatNotice) {
-    sections.push(`## Compatibility\n\n${inputs.compatNotice}`);
   }
 
   if (inputs.scratchDir) {

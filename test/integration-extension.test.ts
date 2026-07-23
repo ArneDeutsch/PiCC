@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import picc, { type PiccTestSeam } from "../src/index.js";
 import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
@@ -14,6 +15,7 @@ import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/fake-sdk.js";
 import { deferred, waitUntil } from "./helpers/async.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
+import { loadSkills } from "../src/claude/skills.js";
 
 /**
  * Integration + NFR tests: the whole extension wired against
@@ -24,6 +26,7 @@ import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 let dir: string;
 let pi: FakePi;
 const originalCwd = process.cwd();
+const compatAckSentinel = '{"suppressed":true,"sentinel":"KEEP-BYTES"}\n';
 
 beforeAll(async () => {
   dir = materializeFixture("full-surface");
@@ -31,6 +34,9 @@ beforeAll(async () => {
   fs.writeFileSync(path.join(dir, ".env.local"), "SECRET=1\n");
   fs.mkdirSync(path.join(dir, "config"), { recursive: true });
   fs.writeFileSync(path.join(dir, "config", "app.secret"), "s\n");
+  const ack = path.join(dir, ".claude", ".picc", "compat-ack.json");
+  fs.mkdirSync(path.dirname(ack), { recursive: true });
+  fs.writeFileSync(ack, compatAckSentinel, "utf8");
   // Hermetic user scope: don't absorb the developer's real ~/.claude.
   const userDir = path.join(dir, ".claude-user");
   fs.mkdirSync(userDir, { recursive: true });
@@ -172,7 +178,7 @@ describe("tool surface registration", () => {
         { content: [{ type: "text", text: "REGISTERED_DETAIL_ONE\nREGISTERED_DETAIL_TWO" }], details: undefined },
         { expanded: false, isPartial: false }, theme, context,
       ).render(160).join("\n");
-      expect(rendered).toContain("Read registered.txt · 2 lines hidden");
+      expect(rendered).toContain("read registered.txt · 2 lines hidden · ctrl+o to expand");
       expect(rendered).not.toContain("REGISTERED_DETAIL");
 
       const multiEdit = pi.tools.get("MultiEdit");
@@ -197,7 +203,7 @@ describe("tool surface registration", () => {
         },
         { expanded: false, isPartial: false }, theme, multiEditContext,
       ).render(160).join("\n");
-      expect(multiEditRendered).toContain("MultiEdit registered-multi.txt · 1 edit applied · 2 diff lines hidden");
+      expect(multiEditRendered).toContain("multi edit registered-multi.txt · 1 edit applied · 2 diff lines hidden · ctrl+o to expand");
       expect(multiEditRendered).not.toContain("REGISTERED_MULTIEDIT_DETAIL");
     } finally {
       setKeybindings(previousBindings);
@@ -439,7 +445,7 @@ describe("tool surface registration", () => {
         const lines = renderedResult.render(80);
         expect(lines).toHaveLength(1);
         expect(lines[0]!.trim()).not.toBe("");
-        expect(lines[0]).toContain(search.name);
+        expect(lines[0]).toContain(search.name.toLowerCase());
         expect(lines[0]).toContain(search.args.pattern);
       }
       expect(result).toEqual(beforeRender);
@@ -449,7 +455,7 @@ describe("tool surface registration", () => {
   it("keeps unrelated Claude and lowercase built-in rendering outside compact specialization", async () => {
     const todo = pi.tools.get("TodoWrite");
     const lowerGrep = pi.tools.get("grep");
-    expect(todo.renderCall({}, undefined, { state: {} }).render(80).join("\n")).toContain("TodoWrite");
+    expect(todo.renderCall({}, undefined, { state: {} }).render(80).join("\n")).toContain("todo write");
 
     const args = { pattern: "T02-LOWERCASE-STOCK", path: "t02-lowercase.txt" };
     fs.writeFileSync(path.join(dir, "t02-lowercase.txt"), "T02-LOWERCASE-STOCK complete stock result\n");
@@ -479,14 +485,15 @@ describe("tool surface registration", () => {
     const ctx = { isPartial: false, isError: false, showImages: false };
     const todo = pi.tools.get("TodoWrite");
     const callLines = todo.renderCall({}, theme, ctx).render(60);
-    expect(callLines).toEqual(["● TodoWrite"]);
+    expect(callLines).toEqual(["● todo write"]);
     expect(backgroundCalls).toBe(0);
   });
 
-  it("registers the /doctor, /compat, /quota, /skills, /agents control commands", () => {
-    for (const name of ["doctor", "compat", "quota", "skills", "agents"]) {
+  it("registers retained control commands but not /compat", () => {
+    for (const name of ["doctor", "quota", "skills", "agents"]) {
       expect(pi.commands.has(name), `missing command ${name}`).toBe(true);
     }
+    expect(pi.commands.has("compat")).toBe(false);
   });
 
   it("exposes user-invocable skills in the / palette via prompt-template stubs (resources_discover)", async () => {
@@ -642,6 +649,19 @@ describe("skill activation", () => {
   });
 
   it("background dispatch + TaskOutput path is exercisable: bg agent loads, /bg-research expands", async () => {
+    const fixtureSource = fs.readFileSync(path.join(dir, ".claude", "commands", "bg-research.md"), "utf8").replace(/\r\n/gu, "\n");
+    const frontmatter = `---
+description: Dispatch the async-researcher in the background and retrieve it with TaskOutput.
+argument-hint: "<topic>"
+---`;
+    expect(fixtureSource.slice(0, fixtureSource.indexOf("\n\n"))).toBe(frontmatter);
+    const loaded = loadSkills([], [{ dir: path.join(dir, ".claude", "commands"), scope: "project" }]);
+    const command = loaded.skills.find((skill) => skill.name === "bg-research");
+    expect(command).toMatchObject({
+      description: "Dispatch the async-researcher in the background and retrieve it with TaskOutput.",
+      argumentHint: "<topic>",
+      legacyCommand: true,
+    });
     // The async-researcher background agent (background: true) reaches the routing catalog…
     const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" })).systemPrompt as string;
     expect(prompt).toMatch(/- async-researcher( \(read-only\))?: Researches a question in the background/);
@@ -653,11 +673,14 @@ describe("skill activation", () => {
     expect(expanded.text).toContain("FS-BG-TASKOUTPUT");
     expect(expanded.text).toContain("run_in_background");
     expect(expanded.text).toContain("TaskOutput");
+    expect(expanded.text).toContain("Passive lifecycle rows emphasize the agent and state, while explicit task actions retain the target ID.");
+    expect(expanded.text).toContain("shows running status and available metadata; bounded live activity belongs to the subagent panel drill-down.");
     expect(expanded.text).toContain("running poll keeps the task eligible");
     expect(expanded.text).toContain("one bounded next-turn settlement notice");
     expect(expanded.text).toContain("terminal return is already delivery and suppresses");
     expect(expanded.text).toContain("do not call TaskOutput again");
-    expect(expanded.text).toContain("WASM ABI"); // $ARGUMENTS substituted
+    expect(expanded.text).toContain("Research this topic without blocking: WASM ABI");
+    expect(expanded.text).not.toContain("$ARGUMENTS");
   });
 });
 
@@ -769,6 +792,30 @@ describe("permission + hook enforcement (guard)", () => {
       input: { command: "git status && curl http://evil" },
     });
     expect(blocked?.block).toBe(true);
+  });
+
+  it("keeps matching permissions.ask diagnostics at point of use without executing the tool", async () => {
+    const bashExecute = vi.spyOn(pi.tools.get("bash"), "execute");
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      for (const toolCallId of ["ask-1", "ask-2"]) {
+        const outcome = await pi.fire("tool_call", {
+          toolName: "bash",
+          toolCallId,
+          input: { command: "git push origin main" },
+        });
+        expect(outcome?.block ?? false).toBe(false);
+      }
+      const diagnostics = errorSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes('ask rule "Bash(git push *)" downgraded to allow'));
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]).toContain("default-permissive posture");
+      expect(bashExecute).not.toHaveBeenCalled();
+    } finally {
+      bashExecute.mockRestore();
+      errorSpy.mockRestore();
+    }
   });
 
   it("runs the warn-only PreToolUse write-guard: allows and injects additionalContext", async () => {
@@ -912,21 +959,62 @@ describe("session lifecycle hooks", () => {
     expect(result).toEqual({ action: "continue" });
   });
 
-  it("SessionStart hook stdout reaches the model + compat notice raised", async () => {
+  it("keeps noisy non-vision startup quiet while delivering SessionStart context and preserving old ack state", async () => {
     pi.messages.length = 0;
     pi.entries.length = 0;
-    await pi.fire("session_start", { reason: "startup" }, pi.ctx());
-    const sent = pi.messages.map((m) => String(m.message.content)).join("\n");
-    expect(sent).toContain("FS-SESSION-START-HOOK-CONTEXT");
-    // compat: fixture declares ask rules, defaultMode, .mcp.json, unknown settings → one notice
-    const noticeEntry = pi.entries.find((e) => e.customType === "picc-compat");
-    expect(noticeEntry).toBeDefined();
-    const notice = String(noticeEntry?.data?.notice ?? "");
-    expect(notice).toContain("SAFETY");
-    expect(notice.toLowerCase()).toContain("ask");
+    pi.notifications.length = 0;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx({
+        model: { provider: "openai", id: "gpt-text", input: ["text"] },
+      }));
+      const sent = pi.messages.map((m) => String(m.message.content)).join("\n");
+      expect(sent).toContain("FS-SESSION-START-HOOK-CONTEXT");
+      expect(pi.entries.some((e) => e.customType === "picc-compat")).toBe(false);
+      const notificationText = pi.notifications.map((notification) => notification.text).join("\n");
+      expect(notificationText).not.toContain("PiCC compatibility:");
+      expect(notificationText).not.toContain("Run /doctor");
+      expect(notificationText).not.toContain("is not vision-capable");
+      // The ONE deliberate exception to quiet startup: the fixture's unapproved
+      // .mcp.json server is ACTIONABLE state, so exactly one MCP pending toast
+      // fires (asserted in detail in its own test below).
+      expect(pi.notifications).toHaveLength(1);
+      expect(pi.notifications[0]!.text).toContain("pending approval");
+
+      const consoleText = [...logSpy.mock.calls, ...errorSpy.mock.calls].flat().join("\n");
+      expect(consoleText).not.toContain("PiCC compatibility:");
+      expect(consoleText).not.toContain("Run /doctor");
+      expect(consoleText).not.toContain("is not vision-capable");
+      expect(consoleText).not.toContain("images sent as text");
+      expect(fs.readFileSync(path.join(dir, ".claude", ".picc", "compat-ack.json"), "utf8"))
+        .toBe(compatAckSentinel);
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
   });
 
-  it("/doctor renders the registry-generated breakdown", async () => {
+  it("toasts the MCP pending-approval line once at startup — actionable state survives quiet startup", async () => {
+    pi.notifications.length = 0;
+    await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx());
+    const pendingToasts = pi.notifications.filter((n) => n.text.includes("pending approval"));
+    expect(pendingToasts).toHaveLength(1);
+    const text = pendingToasts[0]!.text;
+    // One short self-contained line: server name, the enabling key, the
+    // /doctor pointer for the exact edit and the decline path.
+    expect(text).not.toContain("\n");
+    expect(text).toContain("example-server");
+    expect(text).toContain("enabledMcpjsonServers");
+    expect(text).toContain(".claude/settings.local.json");
+    expect(text).toContain("/doctor");
+    // A non-startup session_start (e.g. /new) must not re-toast it.
+    pi.notifications.length = 0;
+    await pi.fire("session_start", { reason: "new" }, pi.tuiCtx());
+    expect(pi.notifications.filter((n) => n.text.includes("pending approval"))).toHaveLength(0);
+  });
+
+  it("/doctor renders the registry-generated breakdown with the MCP posture line", async () => {
     pi.entries.length = 0;
     await pi.commands.get("doctor").handler("", pi.ctx());
     const doctor = pi.entries
@@ -934,7 +1022,43 @@ describe("session lifecycle hooks", () => {
       .map((e) => String(e.data?.output ?? ""))
       .join("\n");
     expect(doctor).toContain("claude-code-2.1.x");
-    expect(doctor.toLowerCase()).toContain("mcp");
+    // Always-present MCP posture line, fed by real discovery: the fixture's
+    // unapproved server renders as pending, and the retired static
+    // ".mcp.json present" wording must be gone.
+    expect(doctor).toContain("example-server: pending approval");
+    // De-duplicated: the posture line carries no enable/decline hint — the
+    // pending finding (registry note + evidence) is the canonical carrier of
+    // the exact edit now that startup is quiet.
+    const postureLine = doctor.split("\n").find((l) => l.startsWith("MCP servers:")) ?? "";
+    expect(postureLine).not.toContain("enabledMcpjsonServers");
+    expect(doctor).toContain('"enabledMcpjsonServers": ["example-server"]');
+    expect(doctor).toContain("disabledMcpjsonServers");
+    expect(doctor).not.toContain("MCP servers will not start");
+  });
+
+  it("handles headless /doctor immediately with findings and active-model vision state", async () => {
+    await pi.fire("session_start", { reason: "startup" }, pi.printCtx({
+      model: { provider: "openai", id: "gpt-text", input: ["text"] },
+    }));
+    pi.entries.length = 0;
+    pi.messages.length = 0;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const outcome = await pi.fire("input", { text: "/doctor", source: "print" }, pi.printCtx());
+      expect(outcome).toEqual({ action: "handled" });
+      const entry = pi.entries.find(
+        (e) => e.customType === "picc-control" && e.data?.command === "doctor",
+      );
+      const output = String(entry?.data?.output ?? "");
+      expect(output).toContain("SAFETY setting.permissions.ask");
+      expect(output).toContain("Active model: openai/gpt-text — vision: no");
+      const stdout = logSpy.mock.calls.flat().join("\n");
+      expect(stdout).toContain("SAFETY setting.permissions.ask");
+      expect(stdout).toContain("Active model: openai/gpt-text — vision: no");
+      expect(pi.messages).toHaveLength(0);
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   it("compaction: PostCompact re-injects active skills mid-run via steer", async () => {
@@ -1157,6 +1281,42 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     }
   });
 
+  it("renders active-worktree paths relatively without changing canonical Read/Bash bytes", async () => {
+    const previousBindings = getKeybindings();
+    setKeybindings(new KeybindingsManager({
+      ...TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    }));
+    const entered = await pi.tools.get("EnterWorktree").execute("t02-display-wt", { name: `it/display-${Date.now()}` });
+    const wt = entered.details.worktreePath as string;
+    try {
+      const absoluteFile = path.join(wt, "display-proof.txt");
+      fs.writeFileSync(absoluteFile, "alpha\nbeta", "utf8");
+      const theme = { fg: (_slot: string, text: string) => text, bold: (text: string) => text };
+      const cases = [
+        { name: "read", args: { path: absoluteFile }, expected: "read display-proof.txt" },
+        { name: "bash", args: { command: "printf 'BYTE-STABLE'" }, expected: "printf 'BYTE-STABLE'" },
+      ] as const;
+      for (const entry of cases) {
+        const tool = pi.tools.get(entry.name);
+        const argsBefore = structuredClone(entry.args);
+        const state = {};
+        const context = { args: entry.args, state, cwd: dir, isPartial: false, isError: false, expanded: false };
+        tool.renderCall(entry.args, theme, context);
+        const result = await tool.execute(`t02-${entry.name}-display`, entry.args);
+        const resultBefore = structuredClone(result);
+        const row = tool.renderResult(result, { expanded: false, isPartial: false }, theme, context).render(120).join("\n");
+        expect(row).toContain(entry.expected);
+        expect(row).not.toContain(wt);
+        expect(entry.args).toEqual(argsBefore);
+        expect(result).toEqual(resultBefore);
+      }
+    } finally {
+      await pi.tools.get("ExitWorktree").execute("t02-display-wt-exit", { action: "remove" });
+      setKeybindings(previousBindings);
+    }
+  });
+
   it("re-registered built-in execute re-resolves the live cwd after a worktree swap", async () => {
     // Proves the wrap did NOT drop the factory(cwdState.get()) re-resolution: call
     // a built-in's execute, swap cwdState via EnterWorktree, call again, and observe
@@ -1259,6 +1419,136 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(settlements(p)).toHaveLength(0);
     await p.fire("before_agent_start", { systemPrompt: "B" });
     expect(settlements(p)).toHaveLength(0);
+  });
+
+  it("resolves recorded agent color through registered Agent, TaskOutput, and settlement surfaces", async () => {
+    const handle = fakeSdk({ replies: ["COLOR-WIRED-RESULT"] });
+    const { p, internals } = await wire();
+    internals.subagentRuntime.setSdkForTest(handle.sdk);
+    const agent = p.tools.get("Agent");
+    const args = { subagent_type: "reviewer", prompt: "check color wiring", run_in_background: true };
+    const started = await agent.execute("color-agent", args);
+    const taskId = String(started.details.taskId);
+    const agentId = String(started.details.agentId);
+    await internals.backgroundTasks.wait(taskId);
+    expect(internals.subagentRegistry.get(agentId)?.color).toBe("red");
+
+    const taskOutput = p.tools.get("TaskOutput");
+    const outputArgs = { task_id: taskId };
+    const output = await taskOutput.execute("color-output", outputArgs);
+    const agentText = agent.renderResult(
+      started, { expanded: false, isPartial: false }, undefined, { state: {}, args },
+    ).render(100).join("\n");
+    const outputText = taskOutput.renderResult(
+      output, { expanded: false, isPartial: false }, undefined, { state: {}, args: outputArgs },
+    ).render(100).join("\n");
+    const settlement = p.messageRenderers.get("picc-settlement")!(
+      {
+        details: {
+          record: "subagent-completion",
+          outcome: "completed",
+          agent: "reviewer",
+          agentId,
+          finalText: "COLOR-WIRED-RESULT",
+        },
+      },
+      { expanded: false },
+      undefined,
+    ).render(100).join("\n");
+
+    for (const text of [agentText, outputText, settlement]) {
+      expect(text.match(/\u001b\[31mreviewer\u001b\[39m/gu)).toHaveLength(1);
+      expect(text.replace(/\u001b\[[0-9;]*m/gu, "")).toContain("reviewer");
+      expect(text).not.toMatch(/\u001b\[31m\s*\[(?:background|completed)\]/u);
+    }
+    expect(agentText.replace(/\u001b\[[0-9;]*m/gu, "")).toContain("reviewer [background]");
+    for (const text of [outputText, settlement]) {
+      expect(text.replace(/\u001b\[[0-9;]*m/gu, "")).toContain("reviewer [completed]");
+    }
+  });
+
+  it("keeps Agent, TaskOutput, and TaskStop canonical data presentation-free in print/RPC contexts", async () => {
+    const canonicalText = `MACHINE-CANONICAL-RESULT ${dir}`;
+    const handle = fakeSdk({ replies: [canonicalText, canonicalText] });
+    const { p, internals } = await wire();
+    internals.subagentRuntime.setSdkForTest(handle.sdk);
+    const agent = p.tools.get("Agent");
+    const taskOutput = p.tools.get("TaskOutput");
+    const taskStop = p.tools.get("TaskStop");
+    const theme = { fg: (_slot: string, text: string) => `\u001b[36m${text}\u001b[39m`, bold: (text: string) => text };
+
+    for (const mode of ["print", "rpc"] as const) {
+      const machineContext = mode === "print" ? p.printCtx() : p.rpcCtx();
+      const agentArgs = { subagent_type: "reviewer", prompt: "machine boundary", run_in_background: true };
+      const agentBefore = structuredClone(agentArgs);
+      const started = await agent.execute(`${mode}-agent`, agentArgs, undefined, undefined, machineContext);
+      expect(agentArgs).toEqual(agentBefore);
+      const taskId = String(started.details.taskId);
+      const outputArgs = { task_id: taskId };
+      const output = await taskOutput.execute(`${mode}-output`, outputArgs, undefined, undefined, machineContext);
+      const stopArgs = { task_id: taskId };
+      const stop = await taskStop.execute(`${mode}-stop`, stopArgs, undefined, undefined, machineContext);
+      const agentId = String(started.details.agentId);
+      const record = internals.backgroundTasks.get(taskId)!;
+      const expectedCanonical = {
+        started: {
+          content: [{
+            type: "text",
+            text: `Background task ${taskId} accepted (agent: reviewer, agent id: ${agentId}); it will run when configured concurrency capacity is available. Use TaskOutput with task_id "${taskId}" to retrieve the result before finalizing.`,
+          }],
+          details: {
+            background: true,
+            taskId,
+            agent: "reviewer",
+            agentId,
+            description: undefined,
+            admission: "admitted",
+          },
+        },
+        output: {
+          content: [{ type: "text", text: canonicalText }],
+          details: {
+            taskId,
+            status: "completed",
+            admission: "admitted",
+            outcome: "completed",
+            agent: "reviewer",
+            agentId,
+            cutOff: false,
+            transcriptPath: undefined,
+            resumable: false,
+            usage: record.usage,
+            lastActivity: record.lastActivity,
+            diagnostics: [{
+              severity: "info",
+              message: "main session has no transcript file (print/no-session mode?); subagent transcript not persisted — this agent will not be resumable",
+            }],
+            description: undefined,
+            durationMs: record.settledAt! - record.startedAt!,
+            settledAt: record.settledAt,
+          },
+        },
+        stop: {
+          content: [{
+            type: "text",
+            text: `Task(${taskId}) · Agent(reviewer) · ${agentId} — already finished with status "completed"; nothing to stop.`,
+          }],
+          details: { taskId, status: "completed" },
+        },
+      };
+      expect({ started, output, stop }).toEqual(expectedCanonical);
+      expect(path.isAbsolute(dir)).toBe(true);
+      expect(expectedCanonical.output.content[0]!.text).toContain(dir);
+      agent.renderResult(started, { expanded: false, isPartial: false }, theme, { state: {}, args: agentArgs }).render(80);
+      taskOutput.renderResult(output, { expanded: false, isPartial: false }, theme, { state: {}, args: outputArgs }).render(80);
+      taskStop.renderResult(stop, {}, theme, { state: {}, args: stopArgs }).render(80);
+      expect({ started, output, stop }).toEqual(expectedCanonical);
+      const machineBytes = JSON.stringify(expectedCanonical);
+      expect(machineBytes).toContain(taskId);
+      expect(machineBytes).toContain("MACHINE-CANONICAL-RESULT");
+      expect(machineBytes).not.toContain("\u001b");
+      expect(machineBytes).not.toContain(RECORD_EXPAND_HINT);
+    }
   });
 
   it("production pre-send validity skips a notice collected after selection", async () => {
@@ -1648,8 +1938,9 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(component, "registered renderer fell back to the default box").toBeTruthy();
     const lines = component.render(200) as string[];
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain(`Task(${taskId})`);
-    expect(lines[0]).toContain(`Agent(reviewer) → Task(${taskId}) completed`);
+    expect(lines[0]).toContain("reviewer");
+    expect(lines[0]).toContain("[completed]");
+    expect(lines[0]).not.toContain(taskId);
     expect(lines[0]).not.toContain(".jsonl");
     expect(lines[0]).toContain(RECORD_EXPAND_HINT);
     expect(lines[0]).not.toContain("WIRED-RECORD-REPORT"); // body stays behind expand
@@ -1949,7 +2240,7 @@ describe("degradation floor", () => {
     // a prompt-type PreCompact handler, futureUnknownSetting, outputStyle, .mcp.json,
     // future-agent with mcpServers/memory, and unknown skill frontmatter.
     expect(pi.tools.size).toBeGreaterThan(15);
-    expect(pi.commands.size).toBeGreaterThanOrEqual(3); // doctor, compat, quota
+    expect(pi.commands.size).toBeGreaterThanOrEqual(3); // doctor, quota, skills
   });
 
   it("future-agent (memory/mcpServers/unknown keys) is still dispatchable via the catalog", async () => {
@@ -2268,5 +2559,113 @@ describe("child worktree stops through the production extension assembly", () =>
         cleanupFixture(fixture);
       }
     },
+  );
+});
+
+describe("MCP failed-connect surfacing (dedicated temp project)", () => {
+  // The full-surface fixture's .mcp.json deliberately stays UNAPPROVED (the
+  // standing pending case), so the failed-connect path gets its own minimal
+  // project: an approved server whose command cannot spawn. The approval rides
+  // an UNTRACKED settings.local.json (no git repo → the tracked probe fails
+  // open), so the enablement gate itself is exercised for real.
+  function makeFailingMcpProject(): string {
+    const mcpDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-fail-"));
+    fs.writeFileSync(
+      path.join(mcpDir, ".mcp.json"),
+      JSON.stringify({
+        mcpServers: { "failing-server": { command: "picc-no-such-command-t05" } },
+      }),
+      "utf8",
+    );
+    fs.mkdirSync(path.join(mcpDir, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(mcpDir, ".claude", "settings.local.json"),
+      JSON.stringify({ enabledMcpjsonServers: ["failing-server"] }),
+      "utf8",
+    );
+    return mcpDir;
+  }
+
+  function cleanupFailingMcpProject(mcpDir: string): void {
+    process.chdir(dir);
+    // Best-effort: Windows can EPERM a just-vacated cwd (handle release lag).
+    try {
+      fs.rmSync(mcpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } catch {
+      /* leftover temp dir is harmless */
+    }
+  }
+
+  it(
+    "a failed server reaches the /doctor posture line, fires the one-time warning notify, and drains diagnostics to stderr",
+    async () => {
+      const mcpDir = makeFailingMcpProject();
+      process.chdir(mcpDir);
+      // Installed BEFORE wiring: the settle-time diagnostics drain runs inside
+      // the detached registration step, any time after connect settles.
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const p = fakePi();
+      try {
+        picc(p.api as never, { onInitializationSettled: p.captureInitialization });
+        await p.waitForInitialization();
+        // The first-turn barrier awaits MCP settle + registration, so after this
+        // fire the spawn failure has been classified.
+        await p.fire("before_agent_start", { systemPrompt: "B" });
+        const warnings = p.notifications.filter((n) => n.text.includes("MCP"));
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]!.text).toContain("failing-server");
+        expect(warnings[0]!.text).toContain("/doctor");
+        expect(warnings[0]!.severity).toBe("warning");
+        // One-time: a later turn must not re-notify.
+        await p.fire("before_agent_start", { systemPrompt: "B" });
+        expect(p.notifications.filter((n) => n.text.includes("MCP"))).toHaveLength(1);
+        // Settle-time stderr drain: the runtime's connect-failure diagnostic
+        // reaches console.error — the stderr surface the registry note claims.
+        const drained = errSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+        expect(drained).toContain("PiCC: MCP:");
+        expect(drained).toContain("failing-server");
+
+        p.entries.length = 0;
+        await p.commands.get("doctor").handler("", p.ctx());
+        const doctor = p.entries
+          .filter((e) => e.customType === "picc-control")
+          .map((e) => String(e.data?.output ?? ""))
+          .join("\n");
+        expect(doctor).toContain("failing-server: failed");
+        // The diagnostic quotes the RAW command, never a resolved path.
+        expect(doctor).toContain("picc-no-such-command-t05");
+      } finally {
+        errSpy.mockRestore();
+        await p.fire("session_shutdown", { reason: "other" });
+        cleanupFailingMcpProject(mcpDir);
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "the one-time failure notice falls back to stderr when the ctx has no UI",
+    async () => {
+      const mcpDir = makeFailingMcpProject();
+      process.chdir(mcpDir);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const p = fakePi();
+      try {
+        picc(p.api as never, { onInitializationSettled: p.captureInitialization });
+        await p.waitForInitialization();
+        // printCtx models real Pi print mode: hasUI false → stderr fallback.
+        await p.fire("before_agent_start", { systemPrompt: "B" }, p.printCtx());
+        expect(p.notifications.filter((n) => n.text.includes("MCP"))).toHaveLength(0);
+        const errText = errSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+        expect(errText).toContain("MCP server(s) failed to connect");
+        expect(errText).toContain("failing-server");
+        expect(errText).toContain("run /doctor for details");
+      } finally {
+        errSpy.mockRestore();
+        await p.fire("session_shutdown", { reason: "other" });
+        cleanupFailingMcpProject(mcpDir);
+      }
+    },
+    60_000,
   );
 });

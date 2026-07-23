@@ -27,13 +27,13 @@ Coverage map (each canary string is asserted by tests):
 | Read-only gating / web tools / locked YAML | `agents/reviewer.md`, `researcher.md` | — |
 | isolation: worktree | `agents/isolated-worker.md` | — |
 | Deferred agent fields degrade | `agents/future-agent.md` | — |
-| Permissions: allow globs, deny, ask (compat notice) | `.claude/settings.json` | — |
+| Permissions: allow globs, deny, ask (`/doctor` report) | `.claude/settings.json` | — |
 | Hook events incl. unknown event + degraded handler type | `.claude/settings.json` | `FS-*-HOOK*` |
 | stdin JSON + additionalContext hook | `tools/write-guard.sh` | `FS-WRITE-GUARD` |
 | Worktree seeding | `.worktreeinclude`, WorktreeCreate hook | `.worktree-seeded` |
 | cwd-swap detectability | `tools/preflight.sh` | `mode=worktree` |
 | Unknown settings keys | `futureUnknownSetting`, `outputStyle` | compat report |
-| `.mcp.json` degradation | `.mcp.json` | compat report |
+| MCP pending-approval gate (unapproved project server) | `.mcp.json` (`example-server`) | compat report + pending notice |
 | Project-bundled plugin | `.claude-plugin/` | `FS-PLUGIN-SKILL-BODY` |
 
 The background command documents the directional settlement guidance (focused runtime tests prove the

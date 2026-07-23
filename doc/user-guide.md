@@ -133,6 +133,7 @@ managed):
 | Agents | `.claude/agents/*.md` (+ user scope) plus the built-in `general-purpose`, `Explore`, and `Plan` types — dispatchable via the `Agent` tool |
 | Settings | `.claude/settings.json`, `settings.local.json`, `~/.claude/settings.json`, managed policy |
 | Hooks | `settings.json` `hooks` (+ plugin hooks, + skill- and agent-scoped `hooks:`) |
+| MCP servers | `.mcp.json` + settings `mcpServers`; project-scope servers pending until approved |
 | Plugins | already-installed plugins from `~/.claude/plugins` + project-bundled `.claude-plugin/` |
 
 > **Auto memory is conservative by default.** PiCC loads `MEMORY.md` every session but writes to
@@ -172,9 +173,13 @@ outcome even when their transport call succeeds. Ordinary settled Read, Write, E
 Bash successes use compact detail; the configured `app.tools.expand` action (Ctrl+O by default)
 reveals native detail without changing the marker. Live, exceptional, and unfamiliar rows retain
 native detail inside the same glyph frame, while malformed display data uses a concise warning.
-Binary images remain native. HTML export may retain Pi's state-background cards and built-in
-presentation, and eligible custom fragments may include phase-local glyphs; non-interactive output
-has no renderer glyphs. None of these presentations changes model-facing results or execution.
+Binary images remain native. In PiCC compact summaries, paths within the invocation-time working
+directory or worktree root are relative to that root; descendants stay relative and outside paths
+remain absolute. HTML export may
+retain Pi's state-background cards and built-in presentation, and eligible custom
+fragments may include phase-local glyphs; non-interactive output has no renderer glyphs. None of
+these presentations changes model-facing results or execution. Passive Agent lifecycle and panel
+rows omit internal task IDs; explicit `TaskOutput` and `TaskStop` rows retain their requested targets.
 
 ### Observing subagents
 
@@ -185,14 +190,15 @@ Every subagent is visible, both to you and to the coordinating model:
   (`~/.pi/agent/sessions/…`). The agent id appears in the dispatch result, so you can find the run's
   full record without guessing. These files are not reaped automatically.
 - **Status panel.** While agents run, a panel below the input shows the whole agent tree live —
-  no `TaskOutput` await needed. One row per agent, nested children indented: a status bubble
-  (`◌` while waiting for configured capacity, a spinner while running, `●` done, `✗` failed, `■`
-  stopped), the agent type (tinted with the agent's `color:` frontmatter when set), your dispatch
-  description, elapsed time, and token usage once known (blank until then — never a fake zero).
-  Elapsed time runs from dispatch acceptance until completion or stop, so it includes any queue
-  time. The panel shows at most eight rows at once; overflow markers and `↑↓` navigation move the
-  window through the full tree. Aggregate running/waiting counts remain visible whenever work is
-  waiting, even if a waiting row is off-screen. Finished rows
+  no `TaskOutput` await needed. When width permits, each agent has an indented row with a status
+  bubble (`◌` while waiting for configured capacity, a spinner while running, `●` done, `✗` failed,
+  `■` stopped), agent type, and dispatch description. Recognized `color:` frontmatter values tint
+  the type; other values do not. State, identity, and description take priority as width narrows;
+  elapsed time and token usage appear only when known and terminal width permits. Elapsed time runs
+  from dispatch acceptance until completion or stop, so it includes any queue time. The panel shows
+  at most eight rows at once; overflow markers and `↑↓` navigation move the window through the full
+  tree. Very narrow widths replace per-agent rows with aggregate state counts, including separate
+  running and waiting counts. Finished rows
   linger briefly — ~10 s
   for successes, ~60 s for failures and stops — then leave on their own. That auto-expiry is a deliberate PiCC
   deviation: Claude Code keeps finished agents listed until dismissed. An expired row is not lost:
@@ -200,11 +206,13 @@ Every subagent is visible, both to you and to the coordinating model:
   the chat (below) arrives once the conversation continues. While the panel has keyboard focus,
   no row expires on its own (dismissing with `d` still removes). When multiple agents are accepted,
   including capacity waiters, a one-time hint names the entry key.
-- **Panel navigation (`alt+a`).** Press `alt+a` to focus the panel; a `❯` marker shows the
-  selection, and the footer hint lists the keys: `↑↓ select · enter open · x stop · X stop all ·
-  d dismiss · esc close`. Stopping from the panel is **background-only** — a foreground agent is
-  cancelled with Esc in the editor, as before (that cancels the whole turn). `X` (stop-all) asks
-  for a second press within ~3 s to confirm. A user-initiated stop is **permanent**: a
+- **Panel navigation (`alt+a`).** Press `alt+a` to focus the panel. On row layouts, a `❯` marker
+  shows the selection and, when width permits, the footer hints at the available navigation, open,
+  stop, dismiss, and close keys; hints may be omitted as the terminal narrows. An aggregate-only
+  layout has no visible target, so open, stop, stop-all, and dismiss ask you to resize wider instead
+  of acting on a hidden selection. Stopping from the panel is **background-only** — a foreground
+  agent is cancelled with Esc in the editor, as before (that cancels the whole turn). `X` (stop-all)
+  asks for a second press within ~3 s to confirm. A user-initiated stop is **permanent**: a
   user-stopped agent cannot be steered or resumed afterwards, not even by the model.
 - **Drill-down.** Enter opens the selected agent: its initial prompt (collapsed; `ctrl+p`
   expands), bounded structured live detail (auto-following; `↑↓` scrolls, scrolling back stops
@@ -271,15 +279,15 @@ to prevent a parent/child deadlock, so total active work can be higher.
 |---|---|
 | `/skills` | List every loaded skill — invocable-as-slash-command, model-invocable-only, and user-only — with descriptions and source (project / user / plugin) |
 | `/agents` | List every subagent available for dispatch — project/user agents and the built-in `general-purpose`/`Explore`/`Plan` types — with tools, read-only marker, model, and worktree-isolation |
-| `/doctor` | Full compatibility breakdown for this project (generated from the capability registry) |
-| `/compat [suppress\|show]` | Show the consolidated compatibility notice; suppress/unsuppress it |
+| `/doctor` | Explicit compatibility report for this project (generated from the capability registry) |
 | `/usage` | Per-subagent token/cost breakdown for this session, plus a subagents total. **Subagent-scoped only** — a PiCC-additive surface, *not* Claude Code's whole-session `/usage`/`/cost`: the Pi extension API exposes no parent-session cost, so the main agent's own spend is not included |
 | `/quota` | Context usage + provider rate-limit/quota headers from the last response (best-effort) |
 | `/model`, `/login`, `/settings` | Pi built-ins: model switching, auth, Pi settings |
 
-**Slash autocomplete.** Every user-invocable skill appears in the `/` menu with its description and
-argument hint — type `/` to browse, or start typing a name to filter. Selecting one expands the
-skill into your turn exactly as Claude Code does.
+**Slash autocomplete.** Eligible user-invocable skills whose names do not conflict with Pi or PiCC
+built-ins appear in the `/` menu with their description and argument hint — type `/` to browse, or
+start typing a name to filter. Selecting one expands the skill into your turn exactly as Claude Code
+does.
 
 ### Harness configuration
 
@@ -295,7 +303,6 @@ tracked project files):
     "openai/*": "When a skill specifies a locked output format, reproduce it exactly. Prefer dispatching subagents over doing everything inline when the skill says to fan out."
   },
   "effortMap": { "ultra": "max" },
-  "suppressCompatNotice": false,
   "proactiveCompactPercent": 90,
   "clipMaxTokens": 20000
 }
@@ -378,15 +385,19 @@ tracked project files):
 | `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | Force **every** `Agent`/`Task` dispatch to the foreground (background is otherwise the default). `SendMessage` resume is inherently async and is **not** governed by this switch |
 | `CLAUDE_CODE_FORK_SUBAGENT` | Gate `subagent_type: "fork"` dispatch (inherit the parent conversation instead of starting fresh): `1` forces it on, `0` off. **Left unset it is enabled** — a deliberate PiCC choice. Inheritance is honored only for a **main-session** dispatch; nested, print-mode, and `isolation: worktree` forks run with fresh context and say so on the result |
 | `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` | Remove the built-in `Explore`/`Plan` agent types (`general-purpose` always stays) |
+| `MCP_TIMEOUT` | MCP server connect timeout in ms (default `30000` — 30 s, Claude parity) |
+| `MCP_TOOL_TIMEOUT` | MCP tool-call timeout in ms when a server entry sets no `timeout` (default ~28 h, Claude parity; values clamped to [1 s, ~24.8 d]) |
 | `SLASH_COMMAND_TOOL_CHAR_BUDGET` | Override the startup skill-listing character budget |
 
 ## 6. Security & permission posture
 
 PiCC's posture is deliberately partial: it runs permissive by default, enforces `permissions.deny`
-and agent `tools:` gating for real, and parses-and-reports the rest rather than enforcing it. The
-startup notice and `/doctor` call out every safety-relevant divergence — never silent. For *why* it
-is drawn this way, see "Security & permission posture" in
-[`doc/architecture.md`](architecture.md).
+and agent `tools:` gating for real, and leaves other Claude permission controls unenforced. Before
+relying on a project's permissions or hooks, run `/doctor`: it reports project-specific
+compatibility findings and labels detected safety-relevant divergences. For the exhaustive registry
+view, the [supported-features matrix](supported-features.md) marks every safety-relevant entry,
+including entries the current project does not declare. For *why* the posture is drawn this way,
+see "Security & permission posture" in [`doc/architecture.md`](architecture.md).
 
 What that means when you write rules:
 
@@ -413,12 +424,19 @@ argument, which makes it best-effort — Claude Code's own limit, not a PiCC gap
 3. **A shell read needs its own `Bash(...)` deny.** `Bash(cat secrets/x)` is not covered by any
    `Read` rule.
 
+**MCP servers.** Project-scope MCP servers (`.mcp.json`, or `mcpServers` in the committed
+`.claude/settings.json`) are pending by default and never start until you approve them. Approve in
+`.claude/settings.local.json` with `"enableAllProjectMcpServers": true` or a named
+`"enabledMcpjsonServers"` list; decline with `"disabledMcpjsonServers"`, which always wins and
+silences the pending notice. If `settings.local.json` is git-tracked, its approvals are ignored —
+untrack it (`git rm --cached .claude/settings.local.json`) to restore them.
+
 ## 7. What is and isn't supported
 
-The capability registry is the single source of truth, and is what `/doctor` renders. The generated
-[`doc/supported-features.md`](supported-features.md) records every current capability tier and the
-exact limit for partial support. Unknown or future fields degrade safely and are reported as
-unassessed.
+The capability registry is the single source of truth. `/doctor` uses it to describe detected
+project-specific findings; the generated [`doc/supported-features.md`](supported-features.md) is the
+exhaustive view of every current capability tier and the exact limit for partial support. Unknown or
+future fields degrade safely and are reported as unassessed when detected.
 
 ## 8. Windows specifics
 
@@ -453,12 +471,12 @@ behaviors worth knowing:
 | Skill shell injection prints `[shell execution disabled: …]` | project set `disableSkillShellExecution`; that's the project's intent |
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
-| Startup notice keeps appearing | `/compat suppress` (per-project, stored in `.claude/.picc/`) |
+| MCP pending-approval notice at every startup | Approve the server(s) — `enabledMcpjsonServers` (or `enableAllProjectMcpServers`) in `.claude/settings.local.json` — or list them in `disabledMcpjsonServers` to decline; `/doctor` shows the exact edit |
 | Session died at high context / "input exceeds the context window" | Lower `proactiveCompactPercent` in `.claude/.picc/config.json` so PiCC compacts earlier (see Harness configuration above) |
 | Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | Reopen the exact persisted session before recovery; an ephemeral headless session instead requires a replacement session and resent input. For operational exhaustion, run `/compact`, then explicitly continue. For a hook block, repair/disable the hook or allow manual compaction first. For any post-commit restoration/startup failure, do **not** compact again; start a new session and resend retained input. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories `checkpoint-exhausted` and `checkpoint-resumed`; RPC acknowledgement, print stdout, and print exit status do not prove logical completion. |
 | `picc -p` finished but a subagent's output never appeared | Background is the default and a one-shot print run has no next turn to deliver it on. Set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for scripted runs, or collect with `TaskOutput` before the run ends. |
 | Subagents can't spawn subagents / nested fan-out flattened | PiCC defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Set `subagents.maxDepth` to a positive integer greater than 1 in `.claude/settings.json`; see "Subagent dispatch controls" above. `/doctor` also shows the current nesting posture. |
-| Unexpected skills/agents from plugins | PiCC loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. `/doctor` and the startup info notice report how many are available but disabled. |
+| Unexpected skills/agents from plugins | PiCC loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. `/doctor` reports how many are available but disabled. |
 | A plugin you enabled isn't loading | Confirm it's listed truthy in `enabledPlugins` as `name@marketplace`, and that it isn't in `~/.claude/plugins/blocklist.json`. |
 | Want to see why a fan-out routed the way it did | agent descriptions are the routing surface — inspect the "Available subagents" catalog in the session, and the dispatch tool calls in the transcript |
 | Agent finished, its panel row is gone, and no record shows in the chat | Press `alt+a` — finished agents stay reachable in the panel after their rows expire. Or continue the conversation: the condensed record rides the next turn. |

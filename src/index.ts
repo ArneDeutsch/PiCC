@@ -78,9 +78,11 @@ import {
   type ResumeToken,
 } from "./runtime/mid-run-compaction.js";
 import { registerCodexAbortGuard } from "./runtime/codex-abort-guard.js";
-import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
+import { buildCompatReport, renderDoctorReport, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
+import { McpRuntime } from "./runtime/mcp.js";
+import { buildMcpProxyTools } from "./runtime/mcp-tools.js";
 import { applyUnicodeSafeProcessEnv, computeSessionScratchDir } from "./util/env.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
 
@@ -91,7 +93,7 @@ import type { ClaudeAgent, ClaudeSkill } from "./types.js";
  * system-prompt assembly each turn (also the compaction-preservation mechanism),
  * deny/hook enforcement on tool events, the Claude tool surface (Agent, Skill,
  * worktrees, web, tasks, degrade stubs), cwd-swapping built-in tool overrides,
- * skill slash commands, and the /doctor–/compat–/quota control surface.
+ * skill slash commands, and the /doctor–/quota control surface.
  */
 
 /** Delegates hook fire() to the base (settings+plugins) runner plus dynamic scoped runners. */
@@ -396,7 +398,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     console.error(`PiCC compatibility scan failed (continuing): ${(err as Error).message}`);
     compat = { findings: [], safetyFindings: [], unassessed: [] };
   }
-  let compatSuppressed = readSuppression(project.root) || config.suppressCompatNotice === true;
+  // One-shot latch for the post-settle MCP connect-failure warning (see the
+  // before_agent_start handler).
+  let mcpFailureChecked = false;
 
   let currentModelRef = "";
   let currentModel: unknown; // the orchestrator's active model — inherited by subagents
@@ -829,6 +833,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return sections.join("\n\n");
   }
 
+  // MCP stdio runtime: session-global, started non-blocking at load (zero
+  // enabled servers ⇒ nothing spawned, immediate settle). Declared above
+  // allKnownToolNames so dispatch-time closures over MCP state can never hit a
+  // TDZ. Model-facing registration happens in the detached mcpRegistration
+  // step below; shutdown joins session_shutdown.
+  const mcpRuntime = McpRuntime.start(project.mcp, {
+    projectRoot: project.root,
+    sessionId,
+  });
+
   function allKnownToolNames(): string[] {
     return [
       "Read",
@@ -855,6 +869,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       "TaskStop",
       "MultiEdit",
       ...DEGRADED_TOOLS.map((d) => d.name),
+      // Live MCP wire names (`mcp__<server>__<tool>`): gateTools already speaks
+      // the MCP grammar (bare `mcp__server` fan-out, bare-name deny removal), so
+      // appending the connected servers' names is all that agent
+      // `tools:`/`disallowedTools:` gating needs to cover MCP. Possibly
+      // incomplete (initially empty) before the runtime settles — servers
+      // settle individually; dispatches happen inside turns, after the first-turn
+      // barrier below, so they always see the settled set. An over-long name
+      // (>64 chars) stays in this universe but has no proxy instance (the
+      // builder drops it from the wire), so granting it is inert.
+      ...mcpRuntime.tools().map((t) => `mcp__${t.serverName}__${t.toolName}`),
     ];
   }
 
@@ -874,6 +898,18 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       for (const tool of buildCwdBoundTools(subCwd ?? cwdState, createTaskTools(), captureUniversalStop)) {
         const name = (tool as { name: string }).name;
         if (granted.includes(name)) tools.push(tool);
+      }
+      // Fresh per-dispatch MCP proxy instances over the SESSION-GLOBAL runtime:
+      // the ToolDefinitions are dispatch-local (never shared across sessions)
+      // while the stdio client connections stay session-global — the intended
+      // split (cf. buildCwdBoundTools above; proxies hold no cwd/TaskStore
+      // state, so freshness here is about never sharing tool OBJECTS). The same
+      // granted-name filter as the cwd-bound tools applies: `granted` already
+      // went through gateTools over the MCP-extended universe, so `tools:`
+      // restriction (incl. bare `mcp__server` fan-out), `disallowedTools:`, and
+      // bare-name deny removal have all been decided by the time we get here.
+      for (const proxy of buildMcpProxyTools(mcpRuntime)) {
+        if (granted.includes(proxy.name)) tools.push(proxy as unknown as Record<string, unknown>);
       }
       if (granted.includes("Skill")) {
         // Per-dispatch Skill tool: carries the caller's depth into context:fork
@@ -1440,7 +1476,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Registered unconditionally: TaskOutput/TaskStop answer helpfully even when
   // no background task was ever started.
   claudeNamedTools.push(
-    createTaskOutputTool(backgroundTasks) as Record<string, unknown>,
+    createTaskOutputTool(backgroundTasks, {
+      resolveAgentColor: (agentId, agentName) => subagentRuntime.agentDisplayColor(agentId, agentName),
+    }) as Record<string, unknown>,
     createTaskStopTool(backgroundTasks, subagentRegistry) as Record<string, unknown>,
   );
   for (const tool of claudeNamedTools) {
@@ -1451,12 +1489,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // presentation decorator, before registration so canonical results retain
       // its terminate metadata. `customToolsFor` skips this parent-TUI chain.
       const mainSessionTool: Record<string, unknown> = tool.name === "Grep" || tool.name === "Glob"
-        ? withCompactSearchRendering(tool as unknown as ToolDefinition) as unknown as Record<string, unknown>
+        ? withCompactSearchRendering(tool as unknown as ToolDefinition, { resolveDisplayRoot: getCwd }) as unknown as Record<string, unknown>
         : tool;
       const routineRendered = withRoutineToolRendering(
         mainSessionTool as unknown as ToolDefinition,
+        { resolveDisplayRoot: getCwd },
       );
-      const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
+      const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered, { resolveDisplayRoot: getCwd });
       pi.registerTool(mainCheckpointGate.wrapTool(
         wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
       ));
@@ -1524,9 +1563,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       for (const { def } of builtins) {
         const routineRendered = withRoutineToolRendering(
           def as unknown as ToolDefinition,
-          { resolveEditRenderCwd: getCwd },
+          { resolveEditRenderCwd: getCwd, resolveDisplayRoot: getCwd },
         );
-        const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
+        const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered, { resolveDisplayRoot: getCwd });
         pi.registerTool(mainCheckpointGate.wrapTool(
           wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
         ));
@@ -1542,6 +1581,54 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   })();
   void builtInRegistration;
+
+  // ---------------------------------------------------------------------------
+  // MCP tool exposure (detached; the first-turn barrier below awaits it)
+  // ---------------------------------------------------------------------------
+  // After the non-blocking connect settles, each connected server's tools
+  // register as `mcp__<server>__<tool>` proxies through the same decoration
+  // pipeline as every other main-session custom tool; Pi auto-activates newly
+  // registered names (the main session has no tool allowlist), so post-load
+  // registration reaches the model on the next turn. Bare-name and server-level
+  // deny rules remove matching tools from the model's context entirely (Claude
+  // parity — gateTools already owns that removal grammar); the guard's
+  // call-time deny stays the backstop for everything else. Zero enabled
+  // servers: whenSettled is pre-resolved and zero proxies build — nothing
+  // registers, nothing is printed, the model's context is untouched.
+  const mcpRegistration = (async () => {
+    try {
+      await mcpRuntime.whenSettled();
+      // Settle-time stderr drain: the runtime's accumulated diagnostics
+      // (connect failures, timeouts, dropped tools — each already bounded and
+      // control-stripped) go to stderr one line each. /doctor and the one-time
+      // notify below stay the user-visible truth; this is the stderr surface
+      // the registry's feature.mcp note claims.
+      for (const diag of mcpRuntime.diagnostics()) {
+        console.error(`PiCC: MCP: ${diag}`);
+      }
+      const proxies = buildMcpProxyTools(mcpRuntime);
+      if (proxies.length === 0) return;
+      const admitted = new Set(
+        permissionEngine.gateTools(undefined, undefined, proxies.map((t) => t.name)),
+      );
+      for (const proxy of proxies) {
+        if (!admitted.has(proxy.name)) continue;
+        // Per-tool catch (same idiom as the claudeNamedTools loop): one
+        // throwing registerTool must not drop the sibling tools behind it.
+        try {
+          const routineRendered = withRoutineToolRendering(proxy);
+          const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
+          pi.registerTool(mainCheckpointGate.wrapTool(
+            wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
+          ));
+        } catch (err) {
+          console.error(`PiCC: failed to register MCP tool "${proxy.name}": ${(err as Error).message}`);
+        }
+      }
+    } catch (err) {
+      console.error(`PiCC: MCP tool registration failed: ${(err as Error).message}`);
+    }
+  })();
 
   // ---------------------------------------------------------------------------
   // Guard: deny rules + PreToolUse/PostToolUse hooks + on-touch context injection
@@ -1566,8 +1653,36 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const reportListingDegradation = createTierChangeReporter((message) =>
     console.error(`PiCC: ${message}`),
   );
-  pi.on("before_agent_start", async (event: any) => {
+  pi.on("before_agent_start", async (event: any, ctx: any) => {
     deliverSettlementNotices();
+    // First-turn MCP settle barrier: Pi awaits this handler before snapshotting
+    // the run's tools, so waiting for the registration step (itself bounded by
+    // MCP_TIMEOUT via whenSettled) makes the first request deterministically
+    // carry connected servers' tools. Registration, not bare whenSettled: settle
+    // alone would race Pi's snapshot against the detached registerTool calls.
+    // Resolved-promise no-op after the first settle and on the zero-enabled
+    // path; never rejects (its own try/catch degrades to stderr).
+    await mcpRegistration;
+    // One-time MCP failure warning: every enabled server has settled behind the
+    // barrier above, so the FIRST turn after settle is the one honest moment to
+    // report connect failures. Checked exactly once per session — a "failed"
+    // state a later shutdown synthesizes must never re-trigger it. stderr is
+    // the no-UI fallback, never the only surface (/doctor stays the record).
+    if (!mcpFailureChecked) {
+      mcpFailureChecked = true;
+      try {
+        const failed = mcpRuntime.serverStates().filter((s) => s.state === "failed");
+        if (failed.length > 0) {
+          const message =
+            `MCP server(s) failed to connect: ${failed.map((s) => s.name).join(", ")} — ` +
+            "run /doctor for details.";
+          if (ctx?.hasUI) ctx.ui?.notify?.(message, "warning");
+          else console.error(`PiCC: ${message}`);
+        }
+      } catch (err) {
+        console.error(`PiCC: MCP failure notice failed: ${(err as Error).message}`);
+      }
+    }
     try {
       const suffix = buildSystemPromptSuffix({
         claudeMd: project.claudeMd,
@@ -1753,18 +1868,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           { deliverAs: "nextTurn" },
         );
       }
-      if (event.reason === "startup") {
-        // Pass the live suppression flag: when compat is suppressed, the notice is
-        // silent EXCEPT for a model-derived non-vision safety warning, which is
-        // decoupled from project-findings suppression and still surfaces here.
-        const notice = renderStartupNotice(compat, {
-          suppressed: compatSuppressed,
-          activeModel: currentModel,
-        });
-        if (notice && ctx.hasUI) ctx.ui.notify(notice.split("\n")[0] + " — run /doctor", "warning");
-        if (notice) {
-          pi.appendEntry("picc-compat", { notice });
-        }
+      // One-time MCP pending-approval notice: pending servers are ACTIONABLE
+      // STATE (an edit the user may want to make), not a compat finding, so it
+      // survives the otherwise-quiet startup as a single toast line; the exact
+      // enable/decline edit lives in /doctor. Startup only — /new and reload
+      // must not re-toast state the user already saw.
+      if (event.reason === "startup" && compat.mcpPendingNotice) {
+        if (ctx.hasUI) ctx.ui?.notify?.(compat.mcpPendingNotice, "warning");
+        else console.error(`PiCC: ${compat.mcpPendingNotice}`);
       }
     } catch (err) {
       console.error(`PiCC session_start failed: ${(err as Error).message}`);
@@ -1810,6 +1921,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         .filter((record) => record.state === "running" && record.checkpointPaused)
         .map((record) => backgroundTasks.stopAgentAndWait(record.agentId)));
       await subagentRuntime.shutdownCheckpointPaused();
+      // MCP servers die with the session — after the subagent joins above
+      // (an in-flight subagent MCP call must not lose its server mid-call),
+      // before SessionEnd fires. Never throws; grace-bounded per server.
+      await mcpRuntime.shutdown();
       // `reason` is the matcher subject for SessionEnd (Claude wire contract).
       await hooks.fire("SessionEnd", { cwd: cwdState.get(), reason: event?.reason ?? "other" });
     } catch {
@@ -1931,11 +2046,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         return shadow || inputDisposition === "quarantine" ? { action: "handled" } : result;
       };
 
-      // 0) PiCC control commands (/doctor /compat /quota /skills /agents /usage).
+      // 0) PiCC control commands (/doctor /quota /skills /agents /usage).
       //    In interactive mode Pi's own command router intercepts these before
       //    the input event; this branch covers the other modes so a control
       //    command is never sent to the model.
-      const cmd = /^\/(doctor|compat|quota|skills|agents|usage)(?:[ \t]+([\s\S]*))?$/.exec(
+      const cmd = /^\/(doctor|quota|skills|agents|usage)(?:[ \t]+([\s\S]*))?$/.exec(
         (event.text ?? "").trim(),
       );
       if (cmd) {
@@ -2470,7 +2585,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   // ---------------------------------------------------------------------------
-  // Control commands: /doctor /compat /quota /skills /agents /usage.
+  // Control commands: /doctor /quota /skills /agents /usage.
   //
   // Rendered by shared functions so BOTH the registered command (interactive
   // path, where Pi intercepts extension commands before the model) and the
@@ -2597,8 +2712,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   /**
-   * Renders control-command output (and the compat notice) as a TUI-only
-   * transcript entry. Pi's `Component` contract is structural
+   * Renders control-command output as a TUI-only transcript entry. Pi's
+   * `Component` contract is structural
    * ({ render(width) => lines }), so no pi-tui import is needed.
    */
   function controlOutputComponent(title: string, body: string, theme: any) {
@@ -2619,9 +2734,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   pi.registerEntryRenderer("picc-control", (entry: any, _opts: any, theme: any) =>
     controlOutputComponent(`/${entry.data?.command ?? "picc"}`, entry.data?.output ?? "", theme),
   );
-  pi.registerEntryRenderer("picc-compat", (entry: any, _opts: any, theme: any) =>
-    controlOutputComponent("PiCC compatibility", entry.data?.notice ?? "", theme),
-  );
   pi.registerEntryRenderer("picc-proactive-compact", (entry: any, _opts: any, theme: any) =>
     controlOutputComponent("PiCC proactive compaction", entry.data?.notice ?? "", theme),
   );
@@ -2638,7 +2750,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     } catch {
       return undefined;
     }
-    return renderSettlementRecord(details, opts, theme);
+    return renderSettlementRecord(details, opts, theme, {
+      resolveAgentColor: (agentId, agentName) => subagentRuntime.agentDisplayColor(agentId, agentName),
+    });
   });
 
   /**
@@ -2655,7 +2769,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   function runControlCommand(name: string, args: string, ctx: any): string | undefined {
     switch (name) {
       case "doctor":
-        return renderDoctorReport(project, compat, currentModel, config.compaction);
+        // Live MCP server states feed the always-present posture line.
+        return renderDoctorReport(project, compat, currentModel, config.compaction, mcpRuntime.serverStates());
       case "skills":
         return renderSkillsList();
       case "agents":
@@ -2664,27 +2779,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         return renderUsageReport();
       case "quota":
         return renderQuota(ctx);
-      case "compat": {
-        const arg = (args ?? "").trim();
-        if (arg === "suppress") {
-          writeSuppression(project.root, true);
-          compatSuppressed = true;
-          return "Compatibility notice suppressed for this project.";
-        }
-        if (arg === "show") {
-          writeSuppression(project.root, false);
-          compatSuppressed = false;
-        }
-        return renderStartupNotice(compat, { suppressed: false, activeModel: currentModel }) ?? "No compatibility findings for this project.";
-      }
       default:
         return undefined;
     }
   }
 
   const CONTROL_COMMANDS: Record<string, string> = {
-    doctor: "PiCC: full compatibility breakdown for this project",
-    compat: "PiCC: show or suppress the compatibility notice (usage: /compat [suppress|show])",
+    doctor: "PiCC: project-specific compatibility report",
     quota: "PiCC: subscription/rate-limit info from the last provider response",
     skills: "PiCC: list the project's Claude skills (invocable + model-only)",
     agents: "PiCC: list the subagents available for dispatch",
@@ -2737,7 +2838,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // would duplicate or be shadowed by these (the skill still executes via the
   // input handler if the name is typed and not intercepted as a built-in).
   const RESERVED_NAMES = new Set([
-    "doctor", "compat", "quota", "skills", "agents", "usage",
+    "doctor", "quota", "skills", "agents", "usage",
     "changelog", "clone", "compact", "copy", "export", "fork", "hotkeys", "import",
     "login", "logout", "model", "name", "new", "quit", "reload", "resume",
     "scoped-models", "session", "settings", "share", "tree", "trust", "help",

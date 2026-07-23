@@ -27,7 +27,7 @@ in see [`doc/testing.md`](testing.md).
 │            engine (permissions · hooks · shell-inject)              │
 │                    │                                                 │
 │   runtime (context-assembly · subagents · worktrees · guard ·      │
-│            cwd-state · tools · skill-activation · steering)         │
+│            cwd-state · tools · skill-activation · steering · mcp)   │
 │                    │                                                 │
 │            registry (capability registry · compat report)          │
 └──────────────────────────────────────────────────────────────────────┘
@@ -106,13 +106,20 @@ hierarchies, and they are not the same set:
 recognized-but-deferred and keys that are unknown are split out for the compatibility report rather
 than dropped.
 
+**MCP server config** is a third input: the project `.mcp.json` plus scope-tagged `mcpServers`
+blocks from the settings hierarchy, resolved here (`discovery/mcp.ts`) by whole-entry precedence
+and the enablement gate — project-origin servers stay pending until approved from a user-authored
+scope, and a git-tracked `settings.local.json` is demoted to project scope so a cloned repo can
+never self-approve.
+
 **Placement:** new scopes, precedence rules, or settings-shape handling. Nothing that interprets an
 artifact's *content*.
 
 ### `claude/` — parse each artifact format (loaders only, no runtime)
 
 One loader per Claude artifact format — skills and commands, agents, rules, the CLAUDE.md hierarchy
-with `@import` expansion, memory, hooks config, and installed-plugin content. `src/project.ts` — at
+with `@import` expansion, memory, hooks config, MCP server entries (`.mcp.json` and settings
+`mcpServers` blocks, `mcp-config.ts`), and installed-plugin content. `src/project.ts` — at
 the source root, *above* the loaders, importing both `discovery/` and `claude/` — orchestrates them
 into one loaded project model. It sits outside this folder precisely because it depends on both:
 a loader knows one format and nothing else.
@@ -209,9 +216,10 @@ where to start reading, not the extent of its cluster.
   registry).
 
 - **Subagent status panel** (`subagent-panel-model.ts`, `subagent-panel-render.ts`,
-  `subagent-panel-widget.ts`, `subagent-panel-focus.ts`, with the shared width/theme helpers
-  extracted into `render-util.ts`) — the interactive-TUI observability surface over the dispatch
-  registry: a pure view model and pure renderer, a thin `setWidget` shell for the passive
+  `subagent-panel-widget.ts`, `subagent-panel-focus.ts`, with shared width/theme helpers in
+  `render-util.ts` and validated agent presentation colors in `agent-color.ts`) — the
+  interactive-TUI observability surface over the dispatch registry: a pure view model and pure
+  renderer, a thin `setWidget` shell for the passive
   below-editor panel, and a `ctx.ui.custom` focus controller for list navigation, the drill-down
   (prompt / structured live detail / final answer), stop/dismiss/stop-all, and steering. TUI-only by
   construction — the controllers are constructed unconditionally but attached only when
@@ -234,6 +242,15 @@ where to start reading, not the extent of its cluster.
 - **Skill activation** (`skill-activation.ts`) — the one pipeline (lazy body load → substitution →
   `!`-injection) behind the `Skill` tool, slash commands, and `context: fork` dispatch.
 
+- **MCP runtime** (`mcp.ts`, `mcp-tools.ts`) — runs the **enabled** stdio servers of the
+  discovery-resolved config as session-global child processes and exposes their tools as
+  `mcp__<server>__<tool>` proxies through the same guard/decoration pipeline as every other tool.
+  Its invariants: the enablement gate is enforced by construction (only `enabled` servers ever
+  spawn); session load is non-blocking with a bounded first-turn settle, so the first request
+  deterministically carries connected servers' tools; server processes die with the session,
+  process trees included; and when nothing is both configured and enabled the model receives **no
+  MCP-related context of any kind** — no tool definitions, no prompt additions.
+
 - **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
   in `subagents.ts`) — a session-local controller owns threshold sampling, complete-tool-batch
   stopping, bounded compaction retries, queued-input reconciliation, resume, cancellation, and
@@ -249,9 +266,10 @@ where to start reading, not the extent of its cluster.
   project**.
 
 - **Tool-row rendering** (`tool-shell.ts`, `search-tool-render.ts`, `routine-tool-render.ts`,
-  `default-collapsed-tool-render.ts`) — the self-shell framing seam plus guarded main-session human
-  renderers for specialized and safely classified settled tool rows; decoration changes only
-  presentation and never canonical model-facing results.
+  `default-collapsed-tool-render.ts`, with display-name/path formatting in `tool-display.ts`) — the
+  self-shell framing seam plus guarded main-session human renderers for specialized and safely
+  classified settled tool rows; decoration changes only presentation and never canonical
+  model-facing results.
 
 - **`tools/`** — the **self-contained** Claude-named tools, and the degrade stubs: names that resolve
   for gating but no-op with a notice. A tool that fronts a runtime subsystem lives with that
@@ -286,11 +304,10 @@ filesystem outside the guard is a hole.
 `capability-registry.ts` holds every known tool, hook event, setting, frontmatter field, and feature
 with a support tier, an optional `safetyRelevant` flag, and a one-line note. Anything unassessed
 synthesizes a `not-supported` entry, so **unknown names still resolve for gating**.
-`compat-report.ts` scans the loaded project against the registry and renders the startup notice and
-the `/doctor` report. Because both the report and
-[`doc/supported-features.md`](supported-features.md) are generated from the registry (by
-[`scripts/gen-capability-matrix.mjs`](../scripts/gen-capability-matrix.mjs)), docs and behavior
-cannot drift.
+`compat-report.ts` scans the loaded project against the registry and renders the `/doctor` report.
+The generated [`doc/supported-features.md`](supported-features.md) reads the same registry through
+[`scripts/gen-capability-matrix.mjs`](../scripts/gen-capability-matrix.mjs), keeping both surfaces
+anchored to the same support claims.
 
 **Placement:** every support claim, and the evidence behind a partial tier. Never restate a tier
 claim in prose — state it here and link. Run `npm run gen:capabilities` after a registry change.
@@ -308,7 +325,8 @@ subsystem — moving it here to be tidy makes every folder depend on every folde
 
 Never-throwing filesystem reads and repo-root detection; the shared gitignore-flavored glob engine
 used by `paths:`, permission globs, `claudeMdExcludes`, and `.worktreeinclude`; frontmatter/body
-splitting with lenient YAML; UTF-8 subprocess env; agent-id minting and transcript-path derivation.
+splitting with lenient YAML; UTF-8 subprocess env; process-tree listing and killing; agent-id
+minting and transcript-path derivation.
 
 **Placement:** a pure helper with more than one consumer and no knowledge of the project model.
 Single-consumer logic stays with its consumer.
@@ -319,10 +337,12 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
 
 1. **Extension load.** The process env is made UTF-8-safe, then `loadClaudeProject()` assembles the
    project model. `CwdState`, `PermissionEngine`, `WorktreeManager`, `HookRunner` (behind a
-   multiplexer so skill-scoped hooks can be added dynamically), and `SubagentRuntime` are
-   constructed. All Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered,
+   multiplexer so skill-scoped hooks can be added dynamically), `SubagentRuntime`, and `McpRuntime`
+   (enabled MCP servers begin connecting in the background, non-blocking) are constructed. All
+   Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered,
    the guard extension is installed on tool events, and prompt-template stubs are written for each
-   user-invocable skill so it appears in the `/` palette. The per-session scratch dir is created
+   user-invocable skill with an eligible, non-reserved name so it appears in the `/` palette. The
+   per-session scratch dir is created
    eagerly here and its literal path held for injection.
 
    Load is **not** fully synchronous: the cwd-swapping overrides need Pi's SDK, so they register
@@ -331,10 +351,10 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    built-ins — losing the cwd swap, not the session.
 
 2. **`session_start`.** Captures the model registry and active model, applies the configured
-   model/effort, self-heals `core.hooksPath` when `.githooks/` exists, fires the `SessionStart`
-   hook, and emits the one-per-session compatibility notice unless suppressed. Steering text is
-   derived from the active model here and **re-derived on `model_select`**, so a mid-session model
-   switch re-steers — steering follows the model, it is not a startup snapshot.
+   model/effort, self-heals `core.hooksPath` when `.githooks/` exists, and fires the `SessionStart`
+   hook. Steering text is derived from the active model here and **re-derived on `model_select`**,
+   so a mid-session model switch re-steers — steering follows the model, it is not a startup
+   snapshot.
 
 3. **`before_agent_start` (every turn).** Appends the system-prompt suffix, re-asserting the full
    instruction set and the scratchpad section each turn.
@@ -368,8 +388,8 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    hook exhaustion leaves admission paused and recoverable; any post-commit failure closes the session
    and requires replacement. Pi's internally
    owned overflow recovery remains outside this controller and is not retried by PiCC. `Stop` runs
-   at the logical settlement boundary, and `session_shutdown` joins checkpoint work before firing
-   `SessionEnd`.
+   at the logical settlement boundary, and `session_shutdown` joins checkpoint work and shuts down
+   the MCP servers before firing `SessionEnd`.
 
 ## Mechanical-fidelity decisions (load-bearing)
 

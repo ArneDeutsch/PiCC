@@ -460,7 +460,6 @@ describe("loadSettings — robustness (completeness floor)", () => {
   it("records deferred-subsystem keys in deferredKeys (recognized, no-op)", () => {
     const scopes = makeScopes();
     writeJson(path.join(scopes.userDir, "settings.json"), {
-      mcpServers: { github: { command: "gh-mcp" } },
       outputStyle: "explanatory",
     });
     writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
@@ -469,7 +468,6 @@ describe("loadSettings — robustness (completeness floor)", () => {
     });
 
     const settings = load(scopes);
-    expect(settings.deferredKeys).toContainEqual({ key: "mcpServers", scope: "user" });
     expect(settings.deferredKeys).toContainEqual({ key: "outputStyle", scope: "user" });
     expect(settings.deferredKeys).toContainEqual({ key: "statusLine", scope: "project" });
     expect(settings.deferredKeys).toContainEqual({ key: "permissions.defaultMode", scope: "project" });
@@ -672,6 +670,105 @@ describe("loadSettings — recognized toggles", () => {
   });
 });
 
+describe("loadSettings — MCP settings capture (graduated keys)", () => {
+  it("no longer reports the four MCP keys as deferred or unknown", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), {
+      mcpServers: { github: { command: "gh-mcp" } },
+      enableAllProjectMcpServers: true,
+      enabledMcpjsonServers: ["a"],
+      disabledMcpjsonServers: ["b"],
+    });
+
+    const settings = load(scopes);
+    expect(settings.deferredKeys).toHaveLength(0);
+    expect(settings.unknownKeys).toHaveLength(0);
+  });
+
+  it("captures MCP keys scope-tagged per file, never merged across scopes", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), {
+      mcpServers: { github: { command: "gh-mcp" } },
+    });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+      enableAllProjectMcpServers: true,
+      enabledMcpjsonServers: ["one", "two"],
+    });
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.local.json"), {
+      disabledMcpjsonServers: ["two"],
+      mcpServers: { local: { command: "local-mcp" } },
+    });
+
+    const settings = load(scopes);
+    const entries = settings.mcpSettings ?? [];
+    expect(entries).toHaveLength(3);
+    // Ascending precedence order: user, project, local — one entry per file.
+    expect(entries[0]).toMatchObject({
+      scope: "user",
+      sourcePath: path.join(scopes.userDir, "settings.json"),
+    });
+    expect(entries[0]?.servers?.github).toEqual({ command: "gh-mcp" });
+    expect(entries[1]).toMatchObject({
+      scope: "project",
+      sourcePath: path.join(scopes.projectRoot, ".claude", "settings.json"),
+      enableAllProjectMcpServers: true,
+      enabledMcpjsonServers: ["one", "two"],
+    });
+    // No cross-scope merge: the project entry has no servers, the local one no enable flag.
+    expect(entries[1]?.servers).toBeUndefined();
+    expect(entries[2]).toMatchObject({
+      scope: "local",
+      sourcePath: path.join(scopes.projectRoot, ".claude", "settings.local.json"),
+      disabledMcpjsonServers: ["two"],
+    });
+    expect(entries[2]?.servers?.local).toEqual({ command: "local-mcp" });
+    expect(entries[2]?.enableAllProjectMcpServers).toBeUndefined();
+  });
+
+  it('captures a "__proto__" server name safely (null-prototype record, no pollution)', () => {
+    const scopes = makeScopes();
+    // NOTE: raw JSON text — a JS object literal would interpret __proto__ itself.
+    writeText(
+      path.join(scopes.projectRoot, ".claude", "settings.json"),
+      `{ "mcpServers": { "__proto__": { "command": "evil" }, "good": { "command": "ok" } } }`,
+    );
+
+    const settings = load(scopes);
+    const servers = settings.mcpSettings?.[0]?.servers;
+    expect(servers).toBeDefined();
+    expect(Object.getPrototypeOf(servers)).toBeNull();
+    expect(Object.keys(servers!)).toEqual(["__proto__", "good"]);
+    expect(({} as Record<string, unknown>)["command"]).toBeUndefined();
+    expect(Object.prototype.toString).toBeTypeOf("function"); // untouched
+  });
+
+  it("degrades malformed MCP key shapes with diagnostics", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+      mcpServers: ["not", "an", "object"],
+      enableAllProjectMcpServers: "definitely",
+      enabledMcpjsonServers: "srv",
+      disabledMcpjsonServers: [1, "ok"],
+    });
+
+    const settings = load(scopes);
+    expect(settings.diagnostics.some((d) => d.message.includes('"mcpServers" is not an object'))).toBe(true);
+    expect(settings.diagnostics.some((d) => d.message.includes('"enableAllProjectMcpServers" is not a boolean'))).toBe(true);
+    expect(settings.diagnostics.some((d) => d.message.includes('"enabledMcpjsonServers" is not an array'))).toBe(true);
+    expect(settings.diagnostics.some((d) => d.message.includes('Non-string entry in "disabledMcpjsonServers"'))).toBe(true);
+    // Only the valid list value lands in the capture.
+    const entry = settings.mcpSettings?.[0];
+    expect(entry?.servers).toBeUndefined();
+    expect(entry?.enableAllProjectMcpServers).toBeUndefined();
+    expect(entry?.enabledMcpjsonServers).toBeUndefined();
+    expect(entry?.disabledMcpjsonServers).toEqual(["ok"]);
+  });
+
+  it("defaults to an empty mcpSettings capture when no file carries MCP keys", () => {
+    expect(load(makeScopes()).mcpSettings).toEqual([]);
+  });
+});
+
 describe("stripJsonc / expandEnvVars", () => {
   it("strips comments and trailing commas but preserves string contents", () => {
     const input = '{\n  "a": "//not-a-comment", // real comment\n  "b": [1, 2,],\n}';
@@ -686,6 +783,49 @@ describe("stripJsonc / expandEnvVars", () => {
     } finally {
       delete process.env.PCD_TEST_EXPAND;
     }
+  });
+
+  it("expands ${VAR:-default}: default on unset ONLY — an empty value is SET (Claude semantics, not bash)", () => {
+    const env = { SET_VAR: "value", EMPTY_VAR: "" } as NodeJS.ProcessEnv;
+    expect(expandEnvVars("${SET_VAR:-fallback}", env)).toBe("value");
+    expect(expandEnvVars("${EMPTY_VAR:-fallback}", env)).toBe("");
+    expect(expandEnvVars("${UNSET_VAR:-fallback}", env)).toBe("fallback");
+    expect(expandEnvVars("${UNSET_VAR:-}", env)).toBe("");
+  });
+
+  it("pins the ${A:-{x}} parse: the default ends at the FIRST closing brace", () => {
+    // "${A:-{x}}" matches through the first "}" (default = "{x"), leaving the
+    // final "}" literal — so an unset A yields "{x}".
+    expect(expandEnvVars("${PCD_UNSET_BRACE:-{x}}", {} as NodeJS.ProcessEnv)).toBe("{x}");
+  });
+
+  it("reports unset-without-default variable NAMES via onUnset; defaults never report", () => {
+    const seen: string[] = [];
+    const env = { PRESENT: "p" } as NodeJS.ProcessEnv;
+    const out = expandEnvVars("${PRESENT} ${GONE} ${ALSO_GONE:-d}", env, (name) => seen.push(name));
+    expect(out).toBe("p ${GONE} d");
+    expect(seen).toEqual(["GONE"]);
+  });
+
+  it("is immune to replacement-pattern injection in env values ($& stays literal)", () => {
+    const env = { PCD_INJ: "a$&b$'c" } as NodeJS.ProcessEnv;
+    expect(expandEnvVars("v=${PCD_INJ}", env)).toBe("v=a$&b$'c");
+  });
+
+  it("existing consumers (env/model) gain :-default support without other changes", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
+      env: { WITH_DEFAULT: "${PCD_DEFINITELY_UNSET_VAR:-fallback}", KEPT: "${PCD_DEFINITELY_UNSET_VAR}" },
+      model: "${PCD_DEFINITELY_UNSET_MODEL:-model-default}",
+    });
+
+    const settings = load(scopes);
+    expect(settings.env.WITH_DEFAULT).toBe("fallback");
+    expect(settings.env.KEPT).toBe("${PCD_DEFINITELY_UNSET_VAR}");
+    expect(settings.model).toBe("model-default");
+    // Pins the onUnset gating: settings consumers pass no onUnset, so an unset
+    // var yields NO diagnostic here (only MCP resolution surfaces warnings).
+    expect(settings.diagnostics.some((d) => d.message.includes("PCD_DEFINITELY_UNSET"))).toBe(false);
   });
 });
 
