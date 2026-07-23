@@ -24,6 +24,8 @@ interface ChildHarness {
   disposed(): boolean;
   aborted(): boolean;
   abortCalls(): number;
+  compactionAbortCalls(): number;
+  compactionAbortObserved(): Promise<void>;
   recoveryCompactStarted(): Promise<void>;
   releaseRecoveryCompact(): void;
   resumeCalls(): number;
@@ -44,6 +46,8 @@ interface CheckpointSdkOptions {
   replayReject?: boolean;
   resumedToolHook?: boolean;
   cancelBeforeCompactLifecycle?: boolean;
+  gateProactiveCompact?: boolean;
+  rejectAfterCompactEvent?: "proactive" | "manual";
 }
 
 function checkpointSdk({
@@ -57,6 +61,8 @@ function checkpointSdk({
   replayReject = false,
   resumedToolHook = false,
   cancelBeforeCompactLifecycle = false,
+  gateProactiveCompact = false,
+  rejectAfterCompactEvent,
 }: CheckpointSdkOptions): ChildHarness {
   const base = fakeSdk().sdk;
   let compactions = 0;
@@ -64,6 +70,7 @@ function checkpointSdk({
   let disposed = false;
   let aborted = false;
   let abortCalls = 0;
+  let compactionAbortCalls = 0;
   let resumeCalls = 0;
   const events: string[] = [];
   const customMessages: Array<{ customType: string; content: unknown }> = [];
@@ -71,8 +78,10 @@ function checkpointSdk({
   const providerRegistrations: Array<{ name: string; config: Record<string, unknown> }> = [];
   let releaseRecoveryCompact!: () => void;
   let markRecoveryCompactStarted!: () => void;
+  let markCompactionAbortObserved!: () => void;
   const recoveryCompactGate = new Promise<void>((resolve) => { releaseRecoveryCompact = resolve; });
   const recoveryCompactStarted = new Promise<void>((resolve) => { markRecoveryCompactStarted = resolve; });
+  const compactionAbortObserved = new Promise<void>((resolve) => { markCompactionAbortObserved = resolve; });
 
   class Loader {
     constructor(readonly options: Record<string, unknown>) {}
@@ -113,7 +122,11 @@ function checkpointSdk({
       const ctx = {
         model: { api: "openai-responses" },
         mode: "json",
-        getContextUsage: () => compactions >= (reExhaustOnce ? 8 : reExhaustWithRestorationFailure ? 5 : 4)
+        getContextUsage: () => compactions >= (reExhaustOnce
+          ? 4
+          : reExhaustWithRestorationFailure
+            ? 3
+            : failures >= 3 ? 2 : 1)
           ? ({ percent: 10, tokens: 100, contextWindow: 1000 })
           : ({ percent: 95, tokens: 950, contextWindow: 1000 }),
         hasPendingMessages: () => false,
@@ -125,6 +138,7 @@ function checkpointSdk({
       };
       let resumed = false;
       let rejectedRecovery = false;
+      let compactionAborted = false;
       const runResumed = async (): Promise<void> => {
         await emit("turn_start", {}, ctx);
         await emit("before_provider_request", {}, ctx);
@@ -223,13 +237,19 @@ function checkpointSdk({
           if (before.some((result) => (result as { cancel?: boolean } | undefined)?.cancel)) {
             throw new Error("compaction cancelled");
           }
-          if (compactions <= failures || (reExhaustOnce && compactions >= 5 && compactions <= 7)) {
-            throw new Error("transient compaction failure");
+          // A single session.compact() transaction represents Pi's complete
+          // inner retry policy. `failures < 3` therefore recovers within this
+          // invocation; `failures >= 3` exhausts it. Manual recovery is the next
+          // invocation, and re-exhaustion is a later checkpoint transaction.
+          if ((compactions === 1 && failures >= 3) || (reExhaustOnce && compactions === 3)) {
+            throw new Error("compaction transaction failed");
           }
-          if (gateRecoveryCompact && compactions === failures + 1) {
+          if ((gateRecoveryCompact && compactions === (failures >= 3 ? 2 : 1)) ||
+              (gateProactiveCompact && compactions === 1)) {
             events.push("compact-started");
             markRecoveryCompactStarted();
             await recoveryCompactGate;
+            if (compactionAborted) throw new Error("compaction physically aborted");
           }
           if (cancelBeforeCompactLifecycle) {
             void emit("session_shutdown", {}, ctx);
@@ -240,7 +260,12 @@ function checkpointSdk({
             }, ctx);
             return { summary: "stale summary" };
           }
+          events.push("compact-commit");
           await emit("session_compact", { compactionEntry: { summary: "summary" } }, ctx);
+          const manualRecoveryCompact = failures >= 3 && compactions === 2;
+          if (rejectAfterCompactEvent === (manualRecoveryCompact ? "manual" : "proactive")) {
+            throw new Error("compact rejected after committed event");
+          }
           return { summary: "summary" };
         },
         async sendCustomMessage(
@@ -277,7 +302,12 @@ function checkpointSdk({
           abortCalls += 1;
           if (resumed) activeResumeAborted = true;
         },
-        abortCompaction() { releaseRecoveryCompact(); },
+        abortCompaction() {
+          compactionAbortCalls += 1;
+          compactionAborted = true;
+          markCompactionAbortObserved();
+          if (!gateProactiveCompact) releaseRecoveryCompact();
+        },
         dispose() { disposed = true; },
       };
       void resumed;
@@ -292,6 +322,8 @@ function checkpointSdk({
     disposed: () => disposed,
     aborted: () => aborted,
     abortCalls: () => abortCalls,
+    compactionAbortCalls: () => compactionAbortCalls,
+    compactionAbortObserved: () => compactionAbortObserved,
     recoveryCompactStarted: () => recoveryCompactStarted,
     releaseRecoveryCompact: () => releaseRecoveryCompact(),
     resumeCalls: () => resumeCalls,
@@ -356,7 +388,52 @@ function runtimeFor(
 }
 
 describe("subagent mid-run compaction", () => {
-  it("retries, compacts, and resumes on the same live child session before classification", async () => {
+  it("physically aborts and joins a child scheduled retry without a late commit or continuation", async () => {
+    const harness = checkpointSdk({ failures: 0, gateProactiveCompact: true });
+    const abort = new AbortController();
+    const running = runtimeFor(harness).dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1, abortSignal: abort.signal,
+    });
+    await harness.recoveryCompactStarted();
+    let settled = false;
+    const settlement = running.then((result) => {
+      settled = true;
+      return result;
+    });
+    abort.abort();
+    await harness.compactionAbortObserved();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(harness.compactionAbortCalls()).toBeGreaterThanOrEqual(1);
+    expect(harness.events()).not.toContain("compact-commit");
+    expect(harness.events()).not.toContain("resumed-provider");
+    harness.releaseRecoveryCompact();
+    const result = await settlement;
+
+    expect(result.outcome).toBe("aborted");
+    expect(harness.compactCalls()).toBe(1);
+    expect(harness.compactionAbortCalls()).toBeGreaterThanOrEqual(1);
+    expect(harness.resumeCalls()).toBe(0);
+    expect(harness.events()).not.toContain("compact-commit");
+    expect(harness.events()).not.toContain("resumed-provider");
+    expect(harness.customMessages().some((message) =>
+      message.customType === "picc-checkpoint-resume" || message.customType === "picc-preserved")).toBe(false);
+  });
+
+  it("terminalizes a child proactive commit before a later compact rejection", async () => {
+    const harness = checkpointSdk({ failures: 0, rejectAfterCompactEvent: "proactive" });
+    const result = await runtimeFor(harness).dispatch({
+      subagentType: "reviewer", prompt: "review", depth: 1,
+    });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toMatch(/replacement|Do not compact/iu);
+    expect(harness.compactCalls()).toBe(1);
+    expect(harness.resumeCalls()).toBe(0);
+    expect(harness.events()).not.toContain("resumed-provider");
+  });
+
+  it("delegates Pi-owned retries within one compact transaction and resumes the same child", async () => {
     const harness = checkpointSdk({ failures: 1 });
     const result = await runtimeFor(harness).dispatch({
       subagentType: "reviewer",
@@ -366,7 +443,7 @@ describe("subagent mid-run compaction", () => {
 
     expect(result.outcome).toBe("completed");
     expect(result.finalMessage).toBe("resumed final");
-    expect(harness.compactCalls()).toBe(2);
+    expect(harness.compactCalls()).toBe(1);
     expect(harness.sessionCreations()).toBe(1);
     expect(harness.providerRegistrations()).toEqual([
       expect.objectContaining({
@@ -615,13 +692,11 @@ describe("subagent mid-run compaction", () => {
     expect(result.outcome).toBe("failed");
     expect(progress).toEqual([
       "checkpoint: checkpoint-armed",
-      "checkpoint retry 2/3",
-      "checkpoint retry 3/3",
       "checkpoint paused: recovery required",
     ]);
     expect(result.checkpointPaused).toBe(true);
     expect(result.error).toContain("paused and no continuation ran");
-    expect(harness.compactCalls()).toBe(3);
+    expect(harness.compactCalls()).toBe(1);
     expect(harness.sessionCreations()).toBe(1);
     expect(harness.disposed()).toBe(false);
     expect(harness.aborted()).toBe(false);
@@ -662,7 +737,7 @@ describe("subagent mid-run compaction", () => {
     expect(rendered.join("\n").match(/[○●✗■]/gu) ?? []).toHaveLength(1);
     expect(recovered).toEqual(canonicalRecovered);
     expect(background.ids()).toEqual([]);
-    expect(harness.compactCalls()).toBe(4);
+    expect(harness.compactCalls()).toBe(2);
     expect(harness.disposed()).toBe(true);
     expect(registry.get(exhausted.agentId)?.state).toBe("settled");
   });
@@ -753,6 +828,28 @@ describe("subagent mid-run compaction", () => {
     await background.wait(secondResume.details.taskId);
   });
 
+  it("terminalizes manual child recovery when session_compact commits before compact rejects", async () => {
+    const harness = checkpointSdk({ failures: 3, rejectAfterCompactEvent: "manual" });
+    const registry = new SubagentRegistry();
+    const runtime = runtimeFor(harness, makeAgent(), registry);
+    const exhausted = await runtime.dispatch({ subagentType: "reviewer", prompt: "review", depth: 1 });
+    const send = createSendMessageToolDefinition(runtime, {
+      registry,
+      backgroundTasks: new BackgroundTaskRegistry(),
+    });
+
+    await expect((send.execute as Function)("send-1", {
+      to: exhausted.agentId,
+      message: "recover once",
+    })).rejects.toThrow(/Do not compact it again/iu);
+    expect(harness.compactCalls()).toBe(2);
+    await expect((send.execute as Function)("send-2", {
+      to: exhausted.agentId,
+      message: "must not compact twice",
+    })).rejects.toThrow(/Do not compact it again|replacement/iu);
+    expect(harness.compactCalls()).toBe(2);
+  });
+
   it.each(["before", "after"] as const)(
     "closes recovery when sendCustomMessage rejects %s turn_start after commit",
     async (when) => {
@@ -771,13 +868,13 @@ describe("subagent mid-run compaction", () => {
       })).rejects.toThrow(/Do not compact it again or retry SendMessage/);
       expect(registry.get(exhausted.agentId)?.checkpointPaused).toBe(true);
       expect(harness.disposed()).toBe(false);
-      expect(harness.compactCalls()).toBe(4);
+      expect(harness.compactCalls()).toBe(2);
 
       await expect((tool.execute as Function)("send-2", {
         to: exhausted.agentId,
         message: "retry recovery",
       })).rejects.toThrow(/Do not compact it again or retry SendMessage/);
-      expect(harness.compactCalls()).toBe(4);
+      expect(harness.compactCalls()).toBe(2);
     },
   );
 
@@ -820,7 +917,7 @@ describe("subagent mid-run compaction", () => {
     });
     expect(recovered.details).toMatchObject({ outcome: "completed", recovered: true });
     expect(harness.sessionCreations()).toBe(1);
-    expect(harness.compactCalls()).toBe(8);
+    expect(harness.compactCalls()).toBe(4);
     expect(harness.disposed()).toBe(true);
   });
 
@@ -893,7 +990,7 @@ describe("subagent mid-run compaction", () => {
     expect(message).not.toContain("Recovery continuation failed");
     expect(message).not.toContain("The agent remains paused; retry SendMessage");
     expect(registry.get(exhausted.agentId)?.checkpointPaused).toBe(true);
-    expect(harness.compactCalls()).toBe(5);
+    expect(harness.compactCalls()).toBe(3);
     expect(harness.disposed()).toBe(false);
   });
 

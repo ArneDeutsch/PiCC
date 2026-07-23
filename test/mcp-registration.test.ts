@@ -157,10 +157,18 @@ describe("MCP main-session tool exposure (wired)", () => {
       expect(tool.promptSnippet).toBeUndefined();
       expect(tool.promptGuidelines).toBeUndefined();
     }
-    expect(pi.tools.get("mcp__fixture__echo").description).toBe("echoes text back");
+    const echo = pi.tools.get("mcp__fixture__echo");
+    expect(echo.description).toBe("echoes text back");
+    expect(echo.label).toBe("echo (fixture MCP)");
+    const rendered = (echo.renderCall as Function)({}, undefined, { state: {}, isPartial: true })
+      .render(120)
+      .join("\n")
+      .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+    expect(rendered).toContain("echo (fixture MCP)");
+    expect(rendered).not.toContain("mcp__fixture__echo");
   });
 
-  it("keeps path-shaped arguments on an actually registered inert proxy generic", () => {
+  it("keeps path-shaped arguments out of an actually registered inert proxy presentation", () => {
     const tool = pi.tools.get("mcp__fixture__echo");
     const pathArgument = path.join(dir, "nested", "secret.txt");
     const context = { state: {}, args: { path: pathArgument }, cwd: dir, isError: false, isPartial: false };
@@ -171,7 +179,8 @@ describe("MCP main-session tool exposure (wired)", () => {
       undefined,
       context,
     ).render(100).join("\n");
-    expect(call).toContain("mcp fixture echo");
+    expect(call).toContain("echo (fixture MCP)");
+    expect(call).not.toContain("mcp__fixture__echo");
     expect(call).not.toContain(pathArgument);
     expect(call).not.toContain("nested/secret.txt");
     expect(result).toContain("inert proxy evidence");

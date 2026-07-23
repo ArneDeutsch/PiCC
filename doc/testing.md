@@ -12,10 +12,11 @@ and the synchronization contracts that keep async tests deterministic.
 branch through e2e. The unit lane — not the full suite — is the pre-commit gate
 (`.githooks/pre-commit`).
 
-**The trade-off is speed against coverage.** Each e2e scenario spawns a real Pi CLI which spawns
-further children, on a lane that must stay small enough to survive a 2-core runner; the same branch
-tested at the unit layer costs milliseconds and pins the behavior just as precisely. Do not reach
-for the highest-fidelity layer because it feels more convincing.
+**The trade-off is speed against coverage.** Each e2e scenario runs a real Pi CLI with mock-model
+infrastructure, and applicable scenarios spawn further children, on a lane that must stay small
+enough to survive a 2-core runner; the same branch tested at the unit layer costs milliseconds and
+pins the behavior just as precisely. Do not reach for the highest-fidelity layer because it feels
+more convincing.
 
 The decision, in order:
 
@@ -52,11 +53,12 @@ npm run test:watch     # vitest in watch mode
 ```
 
 The suite is split into two vitest projects (`vitest.config.ts`): a `unit` project (everything
-except `test/e2e-*.test.ts`) and an `e2e` project (the real-Pi files). The e2e project caps its fork
-count (`maxWorkers`) so the concurrent real-process spawns don't oversubscribe a small CI runner —
-the cap is the contention lever, not raised timeouts. `test:coverage` instruments only in-process
-code, so it reports the unit lane's coverage of `src/**` and cannot measure the real-Pi child
-process; it is a guidance signal with no thresholds.
+except `test/e2e-*.test.ts`) and an `e2e` project (the real-Pi files). Both projects retain fork
+parallelism while capping `maxWorkers` at two. Unit and e2e tests both spawn real child processes,
+so the shared bound limits process multiplication and reduces oversubscription risk on small
+runners; the cap is the contention lever, not raised timeouts. `test:coverage` instruments only
+in-process code, so it reports the unit lane's coverage of `src/**` and cannot measure the real-Pi
+child process; it is a guidance signal with no thresholds.
 
 CI never runs `npm test`: it type-checks with `typecheck:all` and runs `test:unit` and `test:e2e`
 as separate lanes, across Windows/Linux. The pre-commit hook (`.githooks/pre-commit`) runs

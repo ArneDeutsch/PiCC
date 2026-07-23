@@ -5,7 +5,12 @@
  * excludes test/), so a Pi type-surface change fails the contract suite
  * loudly with the tsc message.
  */
-import type { AssistantMessage, StopReason } from "@earendil-works/pi-ai";
+import type {
+  AssistantMessage,
+  RetryCallbacks,
+  RetryPolicy,
+  StopReason,
+} from "@earendil-works/pi-ai";
 import type {
   AgentSession,
   AgentSessionEvent,
@@ -14,9 +19,13 @@ import type {
   SessionStats,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-// Value import of the CLASS (for its static side); still never executed —
+// Value imports for public static/function surfaces; still never executed —
 // this file is only ever compiled.
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  generateSummary,
+  SessionManager,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 
 // Exact StopReason vocabulary — a missing or extra member fails to compile.
 // PiCC's outcome classification keys off "error" / "aborted" / "length".
@@ -144,3 +153,54 @@ export const retryEnd: Extract<AgentSessionEvent, { type: "auto_retry_end" }> = 
   success: true,
   attempt: 1,
 };
+
+// --- public summarization retry surface ---
+
+export const summaryStream: Parameters<typeof generateSummary>[9] = () => {
+  throw new Error("compile-only stream pin");
+};
+export const summaryRetryPolicy: Parameters<typeof generateSummary>[11] = {
+  enabled: true,
+  maxRetries: 1,
+  baseDelayMs: 0,
+} satisfies RetryPolicy;
+export const summaryRetryCallbacks: Parameters<typeof generateSummary>[12] = {
+  onRetryScheduled: (_attempt, _maxAttempts, _delayMs, _errorMessage) => {},
+  onRetryAttemptStart: () => {},
+  onRetryFinished: (_success, _attempt, _finalError) => {},
+} satisfies RetryCallbacks;
+
+const freshSettings = SettingsManager.inMemory();
+export const retrySettings: ReturnType<typeof freshSettings.getRetrySettings> = {
+  enabled: true,
+  maxRetries: 3,
+  baseDelayMs: 2000,
+};
+export const providerRetrySettings: ReturnType<typeof freshSettings.getProviderRetrySettings> = {
+  timeoutMs: undefined,
+  maxRetries: undefined,
+  maxRetryDelayMs: 60_000,
+};
+
+export const summarizationRetryScheduled: Extract<
+  AgentSessionEvent,
+  { type: "summarization_retry_scheduled" }
+> = {
+  type: "summarization_retry_scheduled",
+  attempt: 1,
+  maxAttempts: 3,
+  delayMs: 2000,
+  errorMessage: "socket closed",
+};
+export const compactionRetryAttemptStart: Extract<
+  AgentSessionEvent,
+  { type: "summarization_retry_attempt_start"; source: "compaction" }
+> = {
+  type: "summarization_retry_attempt_start",
+  source: "compaction",
+  reason: "threshold",
+};
+export const summarizationRetryFinished: Extract<
+  AgentSessionEvent,
+  { type: "summarization_retry_finished" }
+> = { type: "summarization_retry_finished" };
