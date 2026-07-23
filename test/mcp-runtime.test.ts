@@ -104,6 +104,13 @@ describe("McpRuntime zero-enabled path", () => {
     await runtime.shutdown();
   });
 
+  it("resolves the connect-timeout default to 30 000 ms with MCP_TIMEOUT unset", async () => {
+    // Zero enabled servers: the resolved bound is observable with no spawn.
+    const runtime = McpRuntime.start(makeConfig(), makeDeps());
+    expect(runtime.resolvedConnectTimeoutMs).toBe(30_000);
+    await runtime.shutdown();
+  });
+
   it("returns [] from tools() immediately after start with a never-connecting server, and shutdown settles it", async () => {
     const fixture = createMcpProcessFixture(makeTempDir());
     // Default MCP_TIMEOUT (30 s): what settles this test is shutdown(), not the
@@ -375,6 +382,10 @@ describe("McpRuntime degrade paths", () => {
       // stays small.
       const diagnostic = runtime.serverStates()[0]?.diagnostic ?? "";
       expect(diagnostic).toContain("GARBAGE_STDERR_TAIL_MARKER");
+      // The fixture's stderr is multi-line (flood\nmarker\n); the excerpt must
+      // stay ONE line — /doctor's posture line and the stderr drain splice it
+      // into a sentence.
+      expect(diagnostic).not.toMatch(/[\n\r\t]/);
       expect(diagnostic).not.toContain("y".repeat(500));
       expect(diagnostic.length).toBeLessThanOrEqual(700);
       pid = Number(fs.readFileSync(pidFile, "utf8"));

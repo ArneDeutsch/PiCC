@@ -27,6 +27,9 @@ import type {
  *   diagnostic. `disabledMcpjsonServers` is honored from every scope and
  *   always wins. List keys accumulate-and-dedupe across honored scopes
  *   (the `permissions.allow/deny` idiom); the boolean is nearest-wins.
+ *   List membership compares SANITIZED names on both sides (Claude parity —
+ *   see {@link sanitizeForListMatch}), so `"my_server"` in a list matches a
+ *   server named `my.server`.
  * - Git-tracked local demotion (mandatory gate rule): a `settings.local.json`
  *   that is tracked in the project repository is attacker-committable, so its
  *   MCP contribution is treated as PROJECT scope (approvals ignored, servers
@@ -74,6 +77,17 @@ interface Candidate {
   /** Global discovery index; among equal ranks the later (nearer) file wins. */
   order: number;
   source: string;
+}
+
+/**
+ * Claude-parity list matching (binary-verified 2.1.218): Claude runs BOTH the
+ * `enabledMcpjsonServers`/`disabledMcpjsonServers` entries and the server name
+ * through its name sanitizer (`[^a-zA-Z0-9_-]` → `_`) before comparing. An
+ * exact compare would miss the deny direction: `"my_server"` in
+ * disabledMcpjsonServers must still catch a server named `my.server`.
+ */
+function sanitizeForListMatch(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "_");
 }
 
 function defaultGitTrackedProbe(filePath: string, projectRoot: string): boolean | undefined {
@@ -164,7 +178,9 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
   const disabledNames = new Set<string>();
   for (const { entry, origin, demoted } of entries) {
     // disabledMcpjsonServers is honored from EVERY scope and always wins.
-    for (const name of entry.disabledMcpjsonServers ?? []) disabledNames.add(name);
+    for (const name of entry.disabledMcpjsonServers ?? []) {
+      disabledNames.add(sanitizeForListMatch(name));
+    }
     const honored = origin === "local" || origin === "user" || origin === "managed";
     if (!honored) {
       if (entry.enableAllProjectMcpServers !== undefined || entry.enabledMcpjsonServers !== undefined) {
@@ -188,7 +204,9 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
     }
     // Ascending-precedence file order: the last honored value is nearest-wins.
     if (entry.enableAllProjectMcpServers !== undefined) enableAll = entry.enableAllProjectMcpServers;
-    for (const name of entry.enabledMcpjsonServers ?? []) enabledNames.add(name);
+    for (const name of entry.enabledMcpjsonServers ?? []) {
+      enabledNames.add(sanitizeForListMatch(name));
+    }
   }
 
   // --- Candidates & whole-entry precedence ---------------------------------
@@ -232,24 +250,31 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
     for (const [key, value] of Object.entries(entry.env)) {
       expandedEnv[key] = expandEnvVars(value, env, onUnset);
     }
-    for (const name of unset) {
-      perDiags.push(
-        neutralizeControlChars(
-          `environment variable "${name}" is not set and has no default; "\${${name}}" kept as literal text`,
-        ),
-      );
-    }
-
     let status: McpServerStatus;
     if (entry.skipped) {
       status = "skipped";
-    } else if (disabledNames.has(entry.name)) {
+    } else if (disabledNames.has(sanitizeForListMatch(entry.name))) {
       status = "disabled";
     } else if (origin === "mcpjson" || origin === "project") {
-      status = enableAll === true || enabledNames.has(entry.name) ? "enabled" : "pending-approval";
+      status =
+        enableAll === true || enabledNames.has(sanitizeForListMatch(entry.name))
+          ? "enabled"
+          : "pending-approval";
     } else {
       // user / managed / untracked local — user-authored, enabled by default.
       status = "enabled";
+    }
+
+    // A declined server's command never runs, so warning about its unset
+    // ${VAR}s would break the promised quiet path of disabledMcpjsonServers.
+    if (status !== "disabled") {
+      for (const name of unset) {
+        perDiags.push(
+          neutralizeControlChars(
+            `environment variable "${name}" is not set and has no default; "\${${name}}" kept as literal text`,
+          ),
+        );
+      }
     }
 
     servers.push({

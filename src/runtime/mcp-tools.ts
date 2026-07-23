@@ -33,7 +33,12 @@ const WIRE_NAME_MAX_CHARS = 64;
 /** Bound on a tool name/value quoted inside a diagnostic (mirrors mcp.ts's sliceForDiag). */
 const DIAG_NAME_MAX_CHARS = 200;
 
-/** Bounded, neutralized quoting of a name or value inside a diagnostic. */
+/**
+ * Bounded, neutralized quoting of a name or value inside a diagnostic. Unlike
+ * runtime/mcp.ts's bound-only sliceForDiag (that module neutralizes once at
+ * its diagnostic store), this one neutralizes inline: its outputs feed several
+ * sinks with no single store choke point.
+ */
 function sliceForDiag(value: string): string {
   const clean = neutralizeControlChars(value);
   return clean.length > DIAG_NAME_MAX_CHARS ? `${clean.slice(0, DIAG_NAME_MAX_CHARS)}…` : clean;

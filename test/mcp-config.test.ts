@@ -411,6 +411,42 @@ describe("resolveMcpConfig — enablement gate", () => {
     expect(server(cfg, "u-srv")?.source).toBe("settings:user");
   });
 
+  it("matches disable-list entries through the name sanitizer (Claude parity)", () => {
+    // Claude sanitizes BOTH sides ([^a-zA-Z0-9_-] → "_") before comparing, so
+    // a "my_server" decline entry must catch a server named "my.server" —
+    // an exact compare would miss the deny direction.
+    const cfg = resolve({
+      mcpJson: mcpJsonOf({ "my.server": { command: "x" } }),
+      entries: [
+        entry("local", local, {
+          enableAllProjectMcpServers: true,
+          disabledMcpjsonServers: ["my_server"],
+        }),
+      ],
+    });
+    expect(server(cfg, "my.server")?.status).toBe("disabled");
+  });
+
+  it("matches enable-list entries through the name sanitizer too", () => {
+    const cfg = resolve({
+      mcpJson: mcpJsonOf({ "my.server": { command: "x" } }),
+      entries: [entry("local", local, { enabledMcpjsonServers: ["my_server"] })],
+    });
+    expect(server(cfg, "my.server")?.status).toBe("enabled");
+  });
+
+  it("attaches no unset-variable warning to a disabled server (quiet decline path)", () => {
+    // The declined command never runs; warning about its unset ${VAR}s would
+    // break the promised quiet path of disabledMcpjsonServers.
+    const cfg = resolve({
+      mcpJson: mcpJsonOf({ srv: { command: "${UNSET_MCP_VAR}" } }),
+      entries: [entry("local", local, { disabledMcpjsonServers: ["srv"] })],
+    });
+    const declined = server(cfg, "srv");
+    expect(declined?.status).toBe("disabled");
+    expect(declined?.diagnostics).toEqual([]);
+  });
+
   it("still applies disabledMcpjsonServers to user-authored servers", () => {
     const cfg = resolve({
       entries: [

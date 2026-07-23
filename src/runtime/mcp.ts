@@ -195,6 +195,11 @@ export class McpRuntime {
     return this.settlePromise;
   }
 
+  /** Resolved connect bound (`MCP_TIMEOUT`, else the 30 s Claude default) — read-only. */
+  get resolvedConnectTimeoutMs(): number {
+    return this.connectTimeoutMs;
+  }
+
   /** Tools of already-connected servers — possibly incomplete (initially `[]`) before settle; servers settle individually. */
   tools(): McpToolInfo[] {
     const out: McpToolInfo[] = [];
@@ -429,12 +434,12 @@ export class McpRuntime {
   }
 
   /**
-   * Validate server-supplied tool metadata, Claude-style (binary-verified
-   * 2.1.218): names are SANITIZED (`[^A-Za-z0-9_-]` → `_`) and kept, not
-   * dropped — only a name empty after sanitizing is dropped; duplicate names
-   * (including post-sanitize collisions) dedupe first-wins; descriptions are
-   * bounded and control-stripped. All diagnostics quote bounded name slices
-   * and are capped per server.
+   * Validate server-supplied tool metadata, Claude-style: names are SANITIZED
+   * (`[^A-Za-z0-9_-]` → `_`, binary-verified 2.1.218) and kept, not dropped —
+   * only a name empty after sanitizing is dropped; duplicate names (including
+   * post-sanitize collisions) dedupe first-wins, a PiCC-chosen direction, not
+   * binary-verified; descriptions are bounded and control-stripped. All
+   * diagnostics quote bounded name slices and are capped per server.
    */
   private validateTools(serverName: string, rawTools: unknown[]): McpToolInfo[] {
     const out: McpToolInfo[] = [];
@@ -530,6 +535,8 @@ export class McpRuntime {
       await Promise.race([client.close().catch(() => {}), sleep(SHUTDOWN_GRACE_MS)]);
     }
     // Sweep the pre-close snapshot (POSIX grandchildren; win32 backstop).
+    // pid-reuse inside the grace window could kill an unrelated process —
+    // accepted, same class as the hook-runner taskkill pattern.
     for (const target of snapshot) {
       try {
         process.kill(target, "SIGKILL");
@@ -569,7 +576,13 @@ export class McpRuntime {
   }
 
   private stderrExcerpt(handle: ServerHandle): string {
-    const tail = handle.stderrRing.slice(-STDERR_EXCERPT_MAX_CHARS).trim();
+    // The excerpt splices into ONE-LINE surfaces (the /doctor posture line,
+    // the stderr drain), which multi-line stderr — stack traces, Windows cmd
+    // errors — would split mid-sentence; collapse whitespace runs to a space.
+    const tail = handle.stderrRing
+      .slice(-STDERR_EXCERPT_MAX_CHARS)
+      .replace(/[\n\r\t]+/g, " ")
+      .trim();
     if (tail === "") return "";
     return `; stderr: ${neutralizeControlChars(tail)}`;
   }
@@ -615,7 +628,12 @@ function clampToolTimeout(ms: number): number {
   return Math.min(Math.max(ms, TOOL_TIMEOUT_MIN_MS), TOOL_TIMEOUT_MAX_MS);
 }
 
-/** Bounded slice of a server-supplied name for diagnostic text. */
+/**
+ * Bounded slice of a server-supplied name for diagnostic text. Bound-only,
+ * unlike mcp-tools.ts's sliceForDiag: here every diagnostic is neutralized
+ * once at its store point (settleHandle / validateTools' diag), so
+ * neutralizing per slice would be redundant.
+ */
 function sliceForDiag(name: string): string {
   return name.length > DIAG_NAME_MAX_CHARS ? `${name.slice(0, DIAG_NAME_MAX_CHARS)}…` : name;
 }

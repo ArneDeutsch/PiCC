@@ -406,6 +406,13 @@ argument, which makes it best-effort — Claude Code's own limit, not a PiCC gap
 3. **A shell read needs its own `Bash(...)` deny.** `Bash(cat secrets/x)` is not covered by any
    `Read` rule.
 
+**MCP servers.** Project-scope MCP servers (`.mcp.json`, or `mcpServers` in the committed
+`.claude/settings.json`) are pending by default and never start until you approve them. Approve in
+`.claude/settings.local.json` with `"enableAllProjectMcpServers": true` or a named
+`"enabledMcpjsonServers"` list; decline with `"disabledMcpjsonServers"`, which always wins and
+silences the pending notice. If `settings.local.json` is git-tracked, its approvals are ignored —
+untrack it (`git rm --cached .claude/settings.local.json`) to restore them.
+
 ## 7. What is and isn't supported
 
 The capability registry is the single source of truth, and is what `/doctor` renders. The generated

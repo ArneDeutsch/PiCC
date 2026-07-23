@@ -227,7 +227,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(mcp?.note).toContain("case-sensitive");
     // Subagent freeze divergence.
     expect(mcp?.note).toContain("FROZEN at dispatch");
-    // Schema & content divergences (binary-verified in t03 review).
+    // Schema & content divergences (binary-verified).
     expect(mcp?.note).toContain("permissive object schema");
     expect(mcp?.note).toContain("STDERR-ONLY");
     expect(mcp?.note).toContain("Claude passes schemas through verbatim");
@@ -241,6 +241,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("setting.enabledMcpjsonServers")?.tier).toBe("partial");
     // Honored from every scope, always wins — nothing partial about it.
     expect(lookupCapability("setting.disabledMcpjsonServers")?.tier).toBe("full");
+    // Sanitized-compare parity (binary-verified) is stated on both list keys.
+    expect(lookupCapability("setting.enabledMcpjsonServers")?.note).toContain("name sanitizer");
+    expect(lookupCapability("setting.disabledMcpjsonServers")?.note).toContain("name sanitizer");
 
     const mcp = lookupCapability("feature.mcp");
     expect(mcp?.tier).toBe("partial");
@@ -1285,6 +1288,42 @@ describe("renderStartupNotice", () => {
   it("returns undefined when suppressed", () => {
     const report = buildCompatReport(noisyProject);
     expect(renderStartupNotice(report, { suppressed: true })).toBeUndefined();
+  });
+
+  it("renders MCP findings as short evidence lines — the ~2 KB registry note stays in /doctor", () => {
+    const project = makeProject({
+      mcp: makeMcp({
+        servers: [
+          makeMcpServer({
+            name: "remote",
+            status: "skipped",
+            diagnostics: [
+              'MCP server "remote" in .mcp.json uses remote transport "sse" — remote MCP transports (HTTP/SSE/WebSocket) are not supported yet; server skipped',
+            ],
+          }),
+          makeMcpServer({
+            name: "live",
+            status: "enabled",
+            diagnostics: [
+              'environment variable "MCP_BIN" is not set and has no default; "${MCP_BIN}" kept as literal text',
+            ],
+          }),
+        ],
+      }),
+    });
+    const notice = renderStartupNotice(buildCompatReport(project), { suppressed: false }) as string;
+    // The evidence (the actionable fact) is present…
+    expect(notice).toContain("remote transport");
+    expect(notice).toContain('"MCP_BIN"');
+    // …but the full feature.mcp registry note is not spliced in per finding.
+    expect(notice).not.toContain("stdio MCP servers run for real");
+    // Bound: a two-server remote-skipped + unset-var config keeps the findings
+    // section short (the pre-fix rendering produced ~3.4 KB).
+    const findingsSection = notice
+      .split("\n")
+      .filter((l) => l.startsWith("- "))
+      .join("\n");
+    expect(findingsSection.length).toBeLessThan(600);
   });
 
   it("returns undefined when there are no findings", () => {

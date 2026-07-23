@@ -464,6 +464,24 @@ function mcpPostureLine(
 // Rendering
 // ---------------------------------------------------------------------------
 
+/**
+ * Startup-notice line(s) for one grouped finding. MCP capabilities render
+ * SHORT — one line per evidence item, no registry note: their notes run to
+ * ~2 KB each (a two-server project produced a 3.4 KB notice), and the
+ * evidence already carries the actionable fact. The full note remains a
+ * /doctor surface; every other capability keeps the note-bearing format.
+ */
+function noticeFindingLines(
+  group: { capability: CapabilityEntry; evidence: string[] },
+  indent: string,
+): string[] {
+  const { capability, evidence } = group;
+  if (capability.id.startsWith("feature.mcp") || capability.id.startsWith("tool.mcp__")) {
+    return evidence.map((ev) => `${indent}- ${capability.id}: ${ev}`);
+  }
+  return [`${indent}- ${capability.id}: ${capability.note} [${evidence.join("; ")}]`];
+}
+
 /** Group findings by capability id, merging evidence, preserving order. */
 function groupByCapability(findings: CompatFinding[]): Array<{
   capability: CapabilityEntry;
@@ -599,11 +617,11 @@ export function renderStartupNotice(
   if (safety.length > 0) {
     lines.push("SAFETY:");
     for (const g of safety) {
-      lines.push(`  - ${g.capability.id}: ${g.capability.note} [${g.evidence.join("; ")}]`);
+      lines.push(...noticeFindingLines(g, "  "));
     }
   }
   for (const g of functionality) {
-    lines.push(`- ${g.capability.id}: ${g.capability.note} [${g.evidence.join("; ")}]`);
+    lines.push(...noticeFindingLines(g, ""));
   }
   if (report.unassessed.length > 0) {
     lines.push(
