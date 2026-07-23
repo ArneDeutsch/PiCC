@@ -697,6 +697,36 @@ describe("compact search rendering decorator", () => {
     }
   });
 
+  it("uses semantic text for search keywords and secondary roles for query, status, and recovery", () => {
+    const calls: Array<{ slot: string; text: string }> = [];
+    const theme = {
+      fg(slot: string, text: string) {
+        calls.push({ slot, text });
+        return text;
+      },
+    };
+    const rendered = callAndFinalize(
+      grepTool(),
+      { pattern: "semantic-query", path: "/project/src", head_limit: 1 },
+      textResult("one", { ...grepDetails, totalEntries: 4, returnedEntries: 1 }),
+      28,
+      false,
+      theme,
+    );
+    const keywords = calls.filter((call) => call.text.includes("grep"));
+    const queries = calls.filter((call) => call.text.includes("semantic-query"));
+    const statuses = calls.filter((call) => /(?:^|[ [·])(?:limited|lim)(?:$|[\] ])/u.test(call.text));
+    const recoveries = calls.filter((call) => call.text.includes("Recovery:"));
+    expect(keywords).toEqual([{ slot: "text", text: "grep" }]);
+    expect(queries.length).toBeGreaterThan(0);
+    expect(queries.every((call) => call.slot === "toolOutput")).toBe(true);
+    expect(statuses.length).toBeGreaterThan(0);
+    expect(statuses.every((call) => call.slot === "muted")).toBe(true);
+    expect(recoveries.length).toBeGreaterThan(0);
+    expect(recoveries.every((call) => call.slot === "toolOutput")).toBe(true);
+    expectBounded(rendered.result, 28);
+  });
+
   it("keeps actionable status ahead of count and path at narrow widths", () => {
     const rendered = callAndFinalize(
       grepTool(),

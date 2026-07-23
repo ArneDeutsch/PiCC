@@ -121,7 +121,7 @@ describe("Edit state glyph production composition", () => {
       }, false);
       const collapsed = row.render(100);
       expectOneGlyph(collapsed, "●");
-      expect(stripAnsi(collapsed.join("\n"))).toContain("Edit target.ts · 1 edit applied");
+      expect(stripAnsi(collapsed.join("\n"))).toContain("edit target.ts · 1 edit applied");
       expect(stripAnsi(collapsed.join("\n"))).not.toContain("const before");
 
       for (const expanded of [true, false, true]) {
@@ -227,7 +227,7 @@ describe("Edit state glyph production composition", () => {
       row.updateResult(result as unknown as Parameters<ToolExecutionComponent["updateResult"]>[0], false);
       const collapsed = row.render(100);
       expectOneGlyph(collapsed, "●");
-      expect(stripAnsi(collapsed.join("\n"))).toContain("MultiEdit src/multi.ts · 1 edit applied");
+      expect(stripAnsi(collapsed.join("\n"))).toMatch(/multi edit src[\\/]multi\.ts · 1 edit applied/u);
       expect(stripAnsi(collapsed.join("\n"))).not.toContain("-1 old");
 
       row.setExpanded(true);

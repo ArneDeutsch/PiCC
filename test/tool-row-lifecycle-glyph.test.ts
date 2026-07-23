@@ -5,6 +5,7 @@ import {
   RECORD_REFERENCE_NOTE,
   renderSendMessageResult,
   renderSettlementRecord,
+  renderTaskStopCall,
   renderTaskStopResult,
   type SubagentLifecycleRenderContext,
 } from "../src/runtime/subagent-render.js";
@@ -96,7 +97,7 @@ describe("subagent lifecycle glyph ownership", () => {
   it.each(["Agent", "Task", "TaskOutput"] as const)("shows one running marker for pending %s", (name) => {
     const lines = renderPending(name);
     expectSingleMarker(lines, "○");
-    expect(lines.join("\n")).toContain(name === "TaskOutput" ? "TaskOutput(task-7) awaiting" : "Agent(reviewer)");
+    expect(lines.join("\n")).toContain(name === "TaskOutput" ? "task output task-7 [awaiting]" : "reviewer");
   });
 
   it.each(["Agent", "Task", "TaskOutput"] as const)("uses shell failure for unstructured final %s errors", (name) => {
@@ -130,7 +131,7 @@ describe("subagent lifecycle glyph ownership", () => {
     ] as const) {
       const lines = renderLifecycle(name, result({ outcome: scenario.outcome }));
       expectSingleMarker(lines, scenario.glyph);
-      expect(lines.join("\n")).toContain(`Agent(reviewer) ${scenario.word}`);
+      expect(lines.join("\n")).toContain(`reviewer [${scenario.word}]`);
       expect(lines.join("\n")).toContain(RECORD_EXPAND_HINT);
     }
   });
@@ -147,15 +148,15 @@ describe("subagent lifecycle glyph ownership", () => {
   it("maps successful background dispatch, foreground partial output, and a running poll", () => {
     const background = renderLifecycle("Agent", result({ background: true, taskId: "task-7", description: "Check lifecycle" }, "started"));
     expectSingleMarker(background, "●");
-    expect(background.join("\n")).toContain("Task(task-7) background");
+    expect(background.join("\n")).toContain("reviewer [background] - Check lifecycle");
 
     const partial = renderLifecycle("Agent", result({ live: true }, "working"), { expanded: false, isPartial: true });
     expectSingleMarker(partial, "○");
-    expect(partial.join("\n")).toContain("Agent(reviewer) running");
+    expect(partial.join("\n")).toContain("reviewer [running]");
 
     const poll = renderLifecycle("TaskOutput", result({ taskId: "task-7", status: "running", lastActivity: "reading" }));
     expectSingleMarker(poll, "○");
-    expect(poll.join("\n")).toContain("Task(task-7)");
+    expect(poll.join("\n")).toContain("task output task-7");
     expect(poll.join("\n")).toContain("running");
   });
 
@@ -168,7 +169,7 @@ describe("subagent lifecycle glyph ownership", () => {
     const lines = renderLifecycle("TaskOutput", result({ taskId: "task-7", ...scenario }));
     expectSingleMarker(lines, scenario.glyph);
     expect(lines.join("\n")).toContain(scenario.word);
-    expect(lines.join("\n")).toContain("Task(task-7)");
+    expect(lines.join("\n")).toContain("task output task-7");
   });
 
   it.each([
@@ -242,7 +243,7 @@ describe("unwrapped settlement symbols", () => {
     const expanded = renderSettlementRecord(settlement("completed"), { expanded: true }, theme)!.render(100).map(stripAnsi);
     const reference = renderSettlementRecord(settlement("completed", true), { expanded: false }, theme)!.render(100).map(stripAnsi);
     expect(stateGlyphCount(collapsed)).toBe(0);
-    expect(expanded[0]).toMatch(/^● Task\(task-7\)/);
+    expect(expanded[0]).toMatch(/^● reviewer \[completed\]/);
     expect(stateGlyphCount(expanded)).toBe(1);
     expect(stateGlyphCount(reference)).toBe(0);
   });
@@ -293,6 +294,28 @@ describe("lifecycle control result discriminators", () => {
     expectSingleMarker(renderControl("SendMessage", { delivery, outcome: "failed" }), "●");
   });
 
+  it("lets a settled TaskStop result replace its pending target header without a second shell glyph", () => {
+    const state = {};
+    const context: SubagentLifecycleRenderContext = { state, args: { task_id: "task-requested-123456789" } };
+    const callTool = wrapForSelfShell({
+      name: "TaskStop",
+      renderCall: (args: Record<string, unknown>, selectedTheme: unknown, ctx: SubagentLifecycleRenderContext) =>
+        renderTaskStopCall(args, selectedTheme, ctx),
+      renderResult: (value: Result, _options: unknown, selectedTheme: unknown, ctx: SubagentLifecycleRenderContext) =>
+        renderTaskStopResult(value, selectedTheme, ctx),
+    });
+    const call = (callTool.renderCall as Function)(context.args, theme, context) as Component;
+    const canonical = { content: [{ type: "text", text: "canonical acknowledgement" }], details: { taskId: "task-7", status: "stopped" } };
+    const before = structuredClone(canonical);
+    const resultComponent = (callTool.renderResult as Function)(canonical, {}, theme, context) as Component;
+    expect(call.render(80)).toEqual([]);
+    const settled = resultComponent.render(24).map(stripAnsi);
+    expect(settled.join("\n").replace(/\s/gu, "")).toContain("task-requested-123456789");
+    expect(settled.join("\n").match(/task stop/gu)).toHaveLength(1);
+    expectSingleMarker(settled, "■");
+    expect(canonical).toEqual(before);
+  });
+
   it.each([
     { status: "completed", glyph: "●" },
     { status: "failed", glyph: "✗" },
@@ -331,7 +354,7 @@ describe("lifecycle control result discriminators", () => {
         }
         if (width === 100) {
           expect(lines.join("\n")).toContain(testCase.semantic);
-          expect(lines.join("\n")).toMatch(/(?:Agent\(reviewer\)|Task\(task-7\)|first line)/u);
+          expect(lines.join("\n")).toMatch(/(?:reviewer|task output task-7|first line)/u);
         }
       }
     }

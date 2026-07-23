@@ -92,7 +92,7 @@ describe("tool surface registration", () => {
         { content: [{ type: "text", text: "REGISTERED_DETAIL_ONE\nREGISTERED_DETAIL_TWO" }], details: undefined },
         { expanded: false, isPartial: false }, theme, context,
       ).render(160).join("\n");
-      expect(rendered).toContain("Read registered.txt · 2 lines hidden");
+      expect(rendered).toContain("read registered.txt · ctrl+o to expand · 2 lines hidden");
       expect(rendered).not.toContain("REGISTERED_DETAIL");
 
       const multiEdit = pi.tools.get("MultiEdit");
@@ -117,7 +117,7 @@ describe("tool surface registration", () => {
         },
         { expanded: false, isPartial: false }, theme, multiEditContext,
       ).render(160).join("\n");
-      expect(multiEditRendered).toContain("MultiEdit registered-multi.txt · 1 edit applied · 2 diff lines hidden");
+      expect(multiEditRendered).toContain("multi edit registered-multi.txt · 1 edit applied · ctrl+o to expand · 2 diff lines hidden");
       expect(multiEditRendered).not.toContain("REGISTERED_MULTIEDIT_DETAIL");
     } finally {
       setKeybindings(previousBindings);
@@ -359,7 +359,7 @@ describe("tool surface registration", () => {
         const lines = renderedResult.render(80);
         expect(lines).toHaveLength(1);
         expect(lines[0]!.trim()).not.toBe("");
-        expect(lines[0]).toContain(search.name);
+        expect(lines[0]).toContain(search.name.toLowerCase());
         expect(lines[0]).toContain(search.args.pattern);
       }
       expect(result).toEqual(beforeRender);
@@ -369,7 +369,7 @@ describe("tool surface registration", () => {
   it("keeps unrelated Claude and lowercase built-in rendering outside compact specialization", async () => {
     const todo = pi.tools.get("TodoWrite");
     const lowerGrep = pi.tools.get("grep");
-    expect(todo.renderCall({}, undefined, { state: {} }).render(80).join("\n")).toContain("TodoWrite");
+    expect(todo.renderCall({}, undefined, { state: {} }).render(80).join("\n")).toContain("todo write");
 
     const args = { pattern: "T02-LOWERCASE-STOCK", path: "t02-lowercase.txt" };
     fs.writeFileSync(path.join(dir, "t02-lowercase.txt"), "T02-LOWERCASE-STOCK complete stock result\n");
@@ -399,7 +399,7 @@ describe("tool surface registration", () => {
     const ctx = { isPartial: false, isError: false, showImages: false };
     const todo = pi.tools.get("TodoWrite");
     const callLines = todo.renderCall({}, theme, ctx).render(60);
-    expect(callLines).toEqual(["● TodoWrite"]);
+    expect(callLines).toEqual(["● todo write"]);
     expect(backgroundCalls).toBe(0);
   });
 
@@ -562,6 +562,22 @@ describe("skill activation", () => {
   });
 
   it("background dispatch + TaskOutput path is exercisable: bg agent loads, /bg-research expands", async () => {
+    const fixtureSource = fs.readFileSync(path.join(dir, ".claude", "commands", "bg-research.md"), "utf8").replace(/\r\n/gu, "\n");
+    const expectedFixture = `---
+description: Dispatch the async-researcher in the background and retrieve it with TaskOutput.
+argument-hint: "<topic>"
+---
+
+Research this topic without blocking: $ARGUMENTS — canary FS-BG-TASKOUTPUT
+
+1. Dispatch the \`async-researcher\` subagent via the **Agent** tool with \`run_in_background: true\`
+   (it also carries \`background: true\` frontmatter), passing the topic above as its prompt.
+2. Keep working while it runs; the background task is named \`task-N\`. Passive lifecycle rows emphasize the agent and state, while explicit task actions retain the target ID.
+3. Retrieve the result with the **TaskOutput** tool — \`TaskOutput(task_id: "task-1")\` — which shows running status and available metadata; bounded live activity belongs to the subagent panel drill-down. It resolves to the finished outcome + transcript + usage when it settles. A running poll keeps the task eligible for
+   one bounded next-turn settlement notice; a terminal return is already delivery and suppresses
+   that redundant notice, so do not call TaskOutput again expecting a missing continuation.
+`;
+    expect(fixtureSource).toBe(expectedFixture);
     // The async-researcher background agent (background: true) reaches the routing catalog…
     const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" })).systemPrompt as string;
     expect(prompt).toMatch(/- async-researcher( \(read-only\))?: Researches a question in the background/);
@@ -573,11 +589,19 @@ describe("skill activation", () => {
     expect(expanded.text).toContain("FS-BG-TASKOUTPUT");
     expect(expanded.text).toContain("run_in_background");
     expect(expanded.text).toContain("TaskOutput");
+    expect(expanded.text).toContain("Passive lifecycle rows emphasize the agent and state, while explicit task actions retain the target ID.");
+    expect(expanded.text).toContain("shows running status and available metadata; bounded live activity belongs to the subagent panel drill-down.");
     expect(expanded.text).toContain("running poll keeps the task eligible");
     expect(expanded.text).toContain("one bounded next-turn settlement notice");
     expect(expanded.text).toContain("terminal return is already delivery and suppresses");
     expect(expanded.text).toContain("do not call TaskOutput again");
-    expect(expanded.text).toContain("WASM ABI"); // $ARGUMENTS substituted
+    expect(expanded.text).not.toContain("$ARGUMENTS");
+    const expectedExpanded = expectedFixture
+      .slice(expectedFixture.indexOf("\n\n") + 2)
+      .replace("$ARGUMENTS", "WASM ABI");
+    const normalizedExpanded = String(expanded.text).replace(/\r\n/gu, "\n");
+    const expandedBody = normalizedExpanded.match(/^<skill[^\n]*>\n([\s\S]*?)\n<\/skill>/u)?.[1];
+    expect(expandedBody).toBe(expectedExpanded.trimEnd());
   });
 });
 
@@ -1077,6 +1101,42 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     }
   });
 
+  it("renders active-worktree paths relatively without changing canonical Read/Bash bytes", async () => {
+    const previousBindings = getKeybindings();
+    setKeybindings(new KeybindingsManager({
+      ...TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    }));
+    const entered = await pi.tools.get("EnterWorktree").execute("t02-display-wt", { name: `it/display-${Date.now()}` });
+    const wt = entered.details.worktreePath as string;
+    try {
+      const absoluteFile = path.join(wt, "display-proof.txt");
+      fs.writeFileSync(absoluteFile, "alpha\nbeta", "utf8");
+      const theme = { fg: (_slot: string, text: string) => text, bold: (text: string) => text };
+      const cases = [
+        { name: "read", args: { path: absoluteFile }, expected: "read display-proof.txt" },
+        { name: "bash", args: { command: "printf 'BYTE-STABLE'" }, expected: "printf 'BYTE-STABLE'" },
+      ] as const;
+      for (const entry of cases) {
+        const tool = pi.tools.get(entry.name);
+        const argsBefore = structuredClone(entry.args);
+        const state = {};
+        const context = { args: entry.args, state, cwd: dir, isPartial: false, isError: false, expanded: false };
+        tool.renderCall(entry.args, theme, context);
+        const result = await tool.execute(`t02-${entry.name}-display`, entry.args);
+        const resultBefore = structuredClone(result);
+        const row = tool.renderResult(result, { expanded: false, isPartial: false }, theme, context).render(120).join("\n");
+        expect(row).toContain(entry.expected);
+        expect(row).not.toContain(wt);
+        expect(entry.args).toEqual(argsBefore);
+        expect(result).toEqual(resultBefore);
+      }
+    } finally {
+      await pi.tools.get("ExitWorktree").execute("t02-display-wt-exit", { action: "remove" });
+      setKeybindings(previousBindings);
+    }
+  });
+
   it("re-registered built-in execute re-resolves the live cwd after a worktree swap", async () => {
     // Proves the wrap did NOT drop the factory(cwdState.get()) re-resolution: call
     // a built-in's execute, swap cwdState via EnterWorktree, call again, and observe
@@ -1179,6 +1239,134 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(settlements(p)).toHaveLength(0);
     await p.fire("before_agent_start", { systemPrompt: "B" });
     expect(settlements(p)).toHaveLength(0);
+  });
+
+  it("resolves recorded agent color through registered Agent, TaskOutput, and settlement surfaces", async () => {
+    const handle = fakeSdk({ replies: ["COLOR-WIRED-RESULT"] });
+    const { p, internals } = await wire();
+    internals.subagentRuntime.setSdkForTest(handle.sdk);
+    const agent = p.tools.get("Agent");
+    const args = { subagent_type: "reviewer", prompt: "check color wiring", run_in_background: true };
+    const started = await agent.execute("color-agent", args);
+    const taskId = String(started.details.taskId);
+    const agentId = String(started.details.agentId);
+    await internals.backgroundTasks.wait(taskId);
+    expect(internals.subagentRegistry.get(agentId)?.color).toBe("red");
+
+    const taskOutput = p.tools.get("TaskOutput");
+    const outputArgs = { task_id: taskId };
+    const output = await taskOutput.execute("color-output", outputArgs);
+    const agentText = agent.renderResult(
+      started, { expanded: false, isPartial: false }, undefined, { state: {}, args },
+    ).render(100).join("\n");
+    const outputText = taskOutput.renderResult(
+      output, { expanded: false, isPartial: false }, undefined, { state: {}, args: outputArgs },
+    ).render(100).join("\n");
+    const settlement = p.messageRenderers.get("picc-settlement")!(
+      {
+        details: {
+          record: "subagent-completion",
+          outcome: "completed",
+          agent: "reviewer",
+          agentId,
+          finalText: "COLOR-WIRED-RESULT",
+        },
+      },
+      { expanded: false },
+      undefined,
+    ).render(100).join("\n");
+
+    for (const text of [agentText, outputText, settlement]) {
+      expect(text.match(/\u001b\[31mreviewer\u001b\[39m/gu)).toHaveLength(1);
+      expect(text.replace(/\u001b\[[0-9;]*m/gu, "")).toContain("reviewer");
+      expect(text).not.toMatch(/\u001b\[31m\s*\[(?:background|completed)\]/u);
+    }
+    expect(agentText.replace(/\u001b\[[0-9;]*m/gu, "")).toContain("reviewer [background]");
+    for (const text of [outputText, settlement]) {
+      expect(text.replace(/\u001b\[[0-9;]*m/gu, "")).toContain("reviewer [completed]");
+    }
+  });
+
+  it("keeps Agent, TaskOutput, and TaskStop canonical data presentation-free in print/RPC contexts", async () => {
+    const canonicalText = `MACHINE-CANONICAL-RESULT ${dir}`;
+    const handle = fakeSdk({ replies: [canonicalText, canonicalText] });
+    const { p, internals } = await wire();
+    internals.subagentRuntime.setSdkForTest(handle.sdk);
+    const agent = p.tools.get("Agent");
+    const taskOutput = p.tools.get("TaskOutput");
+    const taskStop = p.tools.get("TaskStop");
+    const theme = { fg: (_slot: string, text: string) => `\u001b[36m${text}\u001b[39m`, bold: (text: string) => text };
+
+    for (const mode of ["print", "rpc"] as const) {
+      const machineContext = mode === "print" ? p.printCtx() : p.rpcCtx();
+      const agentArgs = { subagent_type: "reviewer", prompt: "machine boundary", run_in_background: true };
+      const agentBefore = structuredClone(agentArgs);
+      const started = await agent.execute(`${mode}-agent`, agentArgs, undefined, undefined, machineContext);
+      expect(agentArgs).toEqual(agentBefore);
+      const taskId = String(started.details.taskId);
+      const outputArgs = { task_id: taskId };
+      const output = await taskOutput.execute(`${mode}-output`, outputArgs, undefined, undefined, machineContext);
+      const stopArgs = { task_id: taskId };
+      const stop = await taskStop.execute(`${mode}-stop`, stopArgs, undefined, undefined, machineContext);
+      const agentId = String(started.details.agentId);
+      const record = internals.backgroundTasks.get(taskId)!;
+      const expectedCanonical = {
+        started: {
+          content: [{
+            type: "text",
+            text: `Background task ${taskId} started (agent: reviewer, agent id: ${agentId}). Use TaskOutput with task_id "${taskId}" to retrieve the result before finalizing.`,
+          }],
+          details: {
+            background: true,
+            taskId,
+            agent: "reviewer",
+            agentId,
+            description: undefined,
+          },
+        },
+        output: {
+          content: [{ type: "text", text: canonicalText }],
+          details: {
+            taskId,
+            status: "completed",
+            outcome: "completed",
+            agent: "reviewer",
+            agentId,
+            cutOff: false,
+            transcriptPath: undefined,
+            resumable: false,
+            usage: record.usage,
+            lastActivity: record.lastActivity,
+            diagnostics: [{
+              severity: "info",
+              message: "main session has no transcript file (print/no-session mode?); subagent transcript not persisted — this agent will not be resumable",
+            }],
+            description: undefined,
+            durationMs: record.settledAt! - record.startedAt!,
+            settledAt: record.settledAt,
+          },
+        },
+        stop: {
+          content: [{
+            type: "text",
+            text: `Task(${taskId}) · Agent(reviewer) · ${agentId} — already finished with status "completed"; nothing to stop.`,
+          }],
+          details: { taskId, status: "completed" },
+        },
+      };
+      expect({ started, output, stop }).toEqual(expectedCanonical);
+      expect(path.isAbsolute(dir)).toBe(true);
+      expect(expectedCanonical.output.content[0]!.text).toContain(dir);
+      agent.renderResult(started, { expanded: false, isPartial: false }, theme, { state: {}, args: agentArgs }).render(80);
+      taskOutput.renderResult(output, { expanded: false, isPartial: false }, theme, { state: {}, args: outputArgs }).render(80);
+      taskStop.renderResult(stop, {}, theme, { state: {}, args: stopArgs }).render(80);
+      expect({ started, output, stop }).toEqual(expectedCanonical);
+      const machineBytes = JSON.stringify(expectedCanonical);
+      expect(machineBytes).toContain(taskId);
+      expect(machineBytes).toContain("MACHINE-CANONICAL-RESULT");
+      expect(machineBytes).not.toContain("\u001b");
+      expect(machineBytes).not.toContain(RECORD_EXPAND_HINT);
+    }
   });
 
   it("production pre-send validity skips a notice collected after selection", async () => {
@@ -1568,8 +1756,9 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(component, "registered renderer fell back to the default box").toBeTruthy();
     const lines = component.render(200) as string[];
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain(`Task(${taskId})`);
-    expect(lines[0]).toContain(`Agent(reviewer) → Task(${taskId}) completed`);
+    expect(lines[0]).toContain("reviewer");
+    expect(lines[0]).toContain("[completed]");
+    expect(lines[0]).not.toContain(taskId);
     expect(lines[0]).not.toContain(".jsonl");
     expect(lines[0]).toContain(RECORD_EXPAND_HINT);
     expect(lines[0]).not.toContain("WIRED-RECORD-REPORT"); // body stays behind expand

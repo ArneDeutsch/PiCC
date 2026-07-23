@@ -9,6 +9,7 @@ import {
   withRoutineToolRendering,
 } from "../src/runtime/routine-tool-render.js";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
+import { formatToolDisplayName } from "../src/runtime/tool-display.js";
 import { createWebFetchTool, createWebSearchTool } from "../src/runtime/tools/web-tools.js";
 
 const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
@@ -92,21 +93,36 @@ describe("routine tool rendering decorator", () => {
       for (const expanded of [false, true]) {
         const lines = renderResult(tool, args, result, { expanded });
         expect(lines).toHaveLength(1);
-        expect(lines[0]).toContain(tool.name);
+        expect(lines[0]).toContain(formatToolDisplayName(tool.name));
         expect(lines[0]).toContain(invocation);
         expect(lines.join("\n")).not.toContain(hidden);
       }
     }
   });
 
+  it("uses semantic text only for routine keywords and toolOutput for invocation context", () => {
+    const calls: Array<{ slot: string; text: string }> = [];
+    const theme = {
+      fg(slot: string, text: string) {
+        calls.push({ slot, text });
+        return text;
+      },
+    };
+    const tool = decorate(createWebSearchTool(() => "."));
+    renderResult(tool, searchArgs, searchResult, { theme });
+    expect(calls).toContainEqual({ slot: "text", text: "web search" });
+    expect(calls).toContainEqual({ slot: "toolOutput", text: `“${searchArgs.query}”` });
+    expect(calls).not.toContainEqual({ slot: "muted", text: "web search" });
+  });
+
   it("compacts redirects, truncation, empty results, and backend fallback without suffixes", () => {
     const fetch = renderResult(decorate(createWebFetchTool(() => ".")), fetchArgs, fetchResult).join("\n");
-    expect(fetch).toBe(`WebFetch ${fetchArgs.url}`);
+    expect(fetch).toBe(`web fetch ${fetchArgs.url}`);
     expect(fetch).not.toContain("redirect.test");
     expect(fetch).not.toMatch(/trunc/i);
 
     const search = renderResult(decorate(createWebSearchTool(() => ".")), searchArgs, searchResult).join("\n");
-    expect(search).toBe(`WebSearch “${searchArgs.query}”`);
+    expect(search).toBe(`web search “${searchArgs.query}”`);
     expect(search).not.toMatch(/duck|result|trunc/i);
   });
 
@@ -123,12 +139,12 @@ describe("routine tool rendering decorator", () => {
     ];
     for (const [result, flags] of cases) {
       const text = renderResult(tool, fetchArgs, result, flags).join("\n");
-      expect(text).not.toBe(`WebFetch ${fetchArgs.url}`);
+      expect(text).not.toBe(`web fetch ${fetchArgs.url}`);
       expect(text.length).toBeGreaterThan(0);
       if (result === fetchResult || (result as typeof fetchResult).content?.[0]?.type === "text") {
         expect(text).toContain("SECRET FETCH BODY");
       } else {
-        expect(text).toContain("Unfamiliar WebFetch presentation format");
+        expect(text).toContain("Unfamiliar web fetch presentation format");
       }
     }
   });
@@ -185,7 +201,7 @@ describe("routine tool rendering decorator", () => {
     for (const [args, result] of cases) {
       const text = renderResult(tool, args, result).join("\n");
       expect(text).toContain("SECRET SEARCH TITLE");
-      expect(text).not.toBe(`WebSearch “${searchArgs.query}”`);
+      expect(text).not.toBe(`web search “${searchArgs.query}”`);
     }
   });
 
@@ -199,7 +215,7 @@ describe("routine tool rendering decorator", () => {
     };
     const lines = renderResult(decorate(createWebSearchTool(() => ".")), args, result, { width: 18 });
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("wide界");
+    expect(lines[0]).toContain("wide");
     expect(lines[0]).not.toContain("[31m");
     expect(lines[0]).not.toContain("]0;pwn");
     expect(lines[0]).not.toMatch(/[\u0007\n\r]/u);
@@ -231,7 +247,7 @@ describe("routine tool rendering decorator", () => {
       details: { ...fetchResult.details, url: args.url },
     };
     const text = renderResult(tool, args, result).join("\n");
-    expect(text).toContain("Unfamiliar WebFetch presentation format");
+    expect(text).toContain("Unfamiliar web fetch presentation format");
     expect(text).toContain("SECRET FETCH BODY");
     expect(text).not.toBe("WebFetch ");
   });
@@ -327,13 +343,13 @@ describe("routine tool rendering decorator", () => {
       [accessor({ query: searchArgs.query }, "allowed_domains", ["example.test"]), searchResult, "SECRET SEARCH TITLE"],
       [accessor({ query: searchArgs.query }, "query", searchArgs.query), searchResult, "SECRET SEARCH TITLE"],
       [searchArgs, { ...searchResult, details: accessor({}, "query", searchArgs.query) }, "SECRET SEARCH TITLE"],
-      [searchArgs, { ...searchResult, content: [accessor({ type: "text" }, "text", "secret")] }, "Unfamiliar WebSearch presentation format"],
+      [searchArgs, { ...searchResult, content: [accessor({ type: "text" }, "text", "secret")] }, "Unfamiliar web search presentation format"],
       [{ query: searchArgs.query, allowed_domains: domainArray }, searchResult, "SECRET SEARCH TITLE"],
     ];
     for (const [args, result, expected] of cases) {
       const output = renderResult(tool, args, result).join("\n");
       expect(output).toContain(expected);
-      expect(output).not.toBe(`WebSearch “${searchArgs.query}”`);
+      expect(output).not.toBe(`web search “${searchArgs.query}”`);
     }
     expect(getterCalls).toBe(0);
   });
@@ -349,7 +365,7 @@ describe("routine tool rendering decorator", () => {
       details: noGet({ ...searchResult.details }),
     };
     expect(renderResult(decorate(createWebSearchTool(() => ".")), args, result)).toEqual([
-      `WebSearch “${searchArgs.query}”`,
+      `web search “${searchArgs.query}”`,
     ]);
     expect(propertyGets).toBe(0);
   });
@@ -363,13 +379,13 @@ describe("routine tool rendering decorator", () => {
     const cases: Array<[unknown, unknown, string]> = [
       [hostile({ query: searchArgs.query }), searchResult, "SECRET SEARCH TITLE"],
       [searchArgs, { ...searchResult, details: hostile({ ...searchResult.details }) }, "SECRET SEARCH TITLE"],
-      [searchArgs, { ...searchResult, content: [hostile({ type: "text", text: "secret" })] }, "Unfamiliar WebSearch presentation format"],
+      [searchArgs, { ...searchResult, content: [hostile({ type: "text", text: "secret" })] }, "Unfamiliar web search presentation format"],
       [{ query: searchArgs.query, allowed_domains: hostile(["example.test"]) }, searchResult, "SECRET SEARCH TITLE"],
     ];
     for (const [args, result, expected] of cases) {
       const output = renderResult(decorate(createWebSearchTool(() => ".")), args, result).join("\n");
       expect(output).toContain(expected);
-      expect(output).not.toBe(`WebSearch “${searchArgs.query}”`);
+      expect(output).not.toBe(`web search “${searchArgs.query}”`);
     }
     expect(propertyGets).toBe(0);
   });
@@ -382,13 +398,13 @@ describe("routine tool rendering decorator", () => {
     });
     const lines = renderResult(decorate(createWebFetchTool(() => ".")), fetchArgs, result);
     expect(contentReads).toBe(0);
-    expect(lines.join("\n")).toContain("Unfamiliar WebFetch presentation format");
+    expect(lines.join("\n")).toContain("Unfamiliar web fetch presentation format");
   });
 
-  it("renders ordinary Skill and SlashCommand activations from snapshotted call arguments only", () => {
+  it("renders ordinary Skill and slash command activations from snapshotted call arguments only", () => {
     const cases = [
-      [decorate({ name: "Skill" } as ToolDefinition), skillArgs, "Skill deploy — staging 1.2.3"],
-      [decorate({ name: "SlashCommand" } as ToolDefinition), slashArgs, "SlashCommand /deploy staging 1.2.3"],
+      [decorate({ name: "Skill" } as ToolDefinition), skillArgs, "skill deploy — staging 1.2.3"],
+      [decorate({ name: "SlashCommand" } as ToolDefinition), slashArgs, "slash command /deploy staging 1.2.3"],
     ] as const;
     for (const [tool, args, expected] of cases) {
       expect(tool.renderCall(args, undefined, { args }).render(80)).toEqual([]);
@@ -400,10 +416,10 @@ describe("routine tool rendering decorator", () => {
     }
   });
 
-  it("renders no-argument Skill and SlashCommand activations without a dangling separator or body", () => {
+  it("renders no-argument Skill and slash command activations without a dangling separator or body", () => {
     const cases = [
-      [decorate({ name: "Skill" } as ToolDefinition), { name: "deploy" }, "Skill deploy"],
-      [decorate({ name: "SlashCommand" } as ToolDefinition), { command: "/deploy" }, "SlashCommand /deploy"],
+      [decorate({ name: "Skill" } as ToolDefinition), { name: "deploy" }, "skill deploy"],
+      [decorate({ name: "SlashCommand" } as ToolDefinition), { command: "/deploy" }, "slash command /deploy"],
     ] as const;
     for (const [tool, args, expected] of cases) {
       for (const expanded of [false, true]) {
@@ -417,10 +433,10 @@ describe("routine tool rendering decorator", () => {
 
   it("compacts only activation results whose canonical identity matches the invocation", () => {
     const compactCases: Array<[RenderTool, unknown, unknown, string]> = [
-      [decorate({ name: "Skill" } as ToolDefinition), { name: "plugin:deploy" }, { ...activationResult, details: { skill: "plugin:deploy" } }, "Skill plugin:deploy"],
-      [decorate({ name: "Skill" } as ToolDefinition), { name: "deploy" }, { ...activationResult, details: { skill: "plugin:deploy" } }, "Skill deploy"],
-      [decorate({ name: "SlashCommand" } as ToolDefinition), { command: "/plugin:deploy now" }, { ...activationResult, details: { skill: "plugin:deploy" } }, "SlashCommand /plugin:deploy now"],
-      [decorate({ name: "SlashCommand" } as ToolDefinition), { command: "deploy now" }, { ...activationResult, details: { skill: "plugin:deploy" } }, "SlashCommand deploy now"],
+      [decorate({ name: "Skill" } as ToolDefinition), { name: "plugin:deploy" }, { ...activationResult, details: { skill: "plugin:deploy" } }, "skill plugin:deploy"],
+      [decorate({ name: "Skill" } as ToolDefinition), { name: "deploy" }, { ...activationResult, details: { skill: "plugin:deploy" } }, "skill deploy"],
+      [decorate({ name: "SlashCommand" } as ToolDefinition), { command: "/plugin:deploy now" }, { ...activationResult, details: { skill: "plugin:deploy" } }, "slash command /plugin:deploy now"],
+      [decorate({ name: "SlashCommand" } as ToolDefinition), { command: "deploy now" }, { ...activationResult, details: { skill: "plugin:deploy" } }, "slash command deploy now"],
     ];
     for (const [tool, args, result, expected] of compactCases) {
       expect(renderResult(tool, args, result)).toEqual([expected]);
@@ -447,12 +463,12 @@ describe("routine tool rendering decorator", () => {
       [activationResult, { error: true }, "SECRET INJECTED INSTRUCTION BODY"],
       [{ ...activationResult, content: [...activationResult.content, { type: "text", text: "VISIBLE EXTRA" }] }, {}, "SECRET INJECTED INSTRUCTION BODY"],
       [{ ...activationResult, details: { skill: "deploy", future: true } }, {}, "SECRET INJECTED INSTRUCTION BODY"],
-      [{ content: [{ type: "future", payload: "VISIBLE FUTURE" }], details: { skill: "deploy" } }, {}, "Unfamiliar Skill presentation format"],
+      [{ content: [{ type: "future", payload: "VISIBLE FUTURE" }], details: { skill: "deploy" } }, {}, "Unfamiliar skill presentation format"],
     ];
     for (const [result, flags, visible] of cases) {
       const text = renderResult(tool, skillArgs, result, flags).join("\n");
       expect(text).toContain(visible);
-      expect(text).not.toBe("Skill deploy — staging 1.2.3");
+      expect(text).not.toBe("skill deploy — staging 1.2.3");
     }
   });
 
@@ -497,7 +513,7 @@ describe("routine tool rendering decorator", () => {
     for (const [args, result, options] of cases) {
       const text = renderRaw(tool, result, options, { args, isError: false }).join("\n");
       expect(text).toContain("SECRET INJECTED INSTRUCTION BODY");
-      expect(text).not.toBe(`SlashCommand ${slashArgs.command}`);
+      expect(text).not.toBe(`slash command ${slashArgs.command}`);
     }
     expect(getterCalls).toBe(0);
   });
@@ -513,7 +529,7 @@ describe("routine tool rendering decorator", () => {
       details: noGet({ skill: "部署" }),
     });
     const lines = renderResult(decorate({ name: "Skill" } as ToolDefinition), args, result, { width: 80 });
-    expect(lines).toEqual(["Skill 部署 — é🙂"]);
+    expect(lines).toEqual(["skill 部署 — é🙂"]);
     expect(propertyGets).toBe(0);
   });
 
@@ -532,7 +548,7 @@ describe("routine tool rendering decorator", () => {
       const lines = renderResult(tool, args, result, { theme, width: 18 });
       expect(lines).toHaveLength(1);
       expectBounded(lines, 18);
-      expect(lines.join("\n")).toContain("SlashCommand");
+      expect(lines.join("\n")).toContain("slash command");
       expect(lines.join("\n")).not.toContain("FROZEN SECRET BODY");
     }
   });
@@ -1062,7 +1078,7 @@ describe("routine tool rendering decorator", () => {
         },
       }) },
     ) as unknown as RenderTool;
-    expect(tool.renderCall(args, undefined, { args }).render(80).join("\n")).toContain("MultiEdit �");
+    expect(tool.renderCall(args, undefined, { args }).render(80).join("\n")).toContain("multi edit �");
     expect(renderResult(tool, args, result)).toEqual([trusted]);
     const dto = seen[0] as { details: { diff: string }; content: Array<{ text: string }> };
     expect(dto.details.diff.split("\n")).toEqual([
@@ -1186,12 +1202,12 @@ describe("routine tool rendering decorator", () => {
       [
         { name: "a" },
         { worktreePath: "/repo/wt", branch: "worktree-a", created: true, seeded: [], previousUnlockAttempted: false },
-        "EnterWorktree(/repo/wt) on branch worktree-a",
+        "enter worktree(/repo/wt) on branch worktree-a",
       ],
       [
         { path: "/repo/wt" },
         { worktreePath: "/repo/wt", branch: "worktree-a", created: false, seeded: [], previousUnlockAttempted: false },
-        "EnterWorktree(/repo/wt) on branch worktree-a",
+        "enter worktree(/repo/wt) on branch worktree-a",
       ],
       [
         { name: "a" },
@@ -1199,7 +1215,7 @@ describe("routine tool rendering decorator", () => {
           worktreePath: "/repo/wt", branch: "worktree-a", created: true,
           seeded: ["a", "b"], previousUnlockAttempted: false,
         },
-        "EnterWorktree(/repo/wt) on branch worktree-a; seeded 2 files",
+        "enter worktree(/repo/wt) on branch worktree-a; seeded 2 files",
       ],
       [
         { name: "a" },
@@ -1208,7 +1224,7 @@ describe("routine tool rendering decorator", () => {
           seeded: [], previousUnlockAttempted: true, previousWorktreePath: "/repo/old",
           previousKeepOutcome: "kept",
         },
-        "EnterWorktree(/repo/wt) on branch worktree-a; previous /repo/old kept; unlock attempted",
+        "enter worktree(/repo/wt) on branch worktree-a; previous /repo/old kept; unlock attempted",
       ],
       [
         { name: "a" },
@@ -1217,7 +1233,7 @@ describe("routine tool rendering decorator", () => {
           seeded: ["a", "b"], previousUnlockAttempted: true, previousWorktreePath: "/repo/old",
           previousKeepOutcome: "kept",
         },
-        "EnterWorktree(/repo/wt) on branch worktree-a; seeded 2 files; previous /repo/old kept; unlock attempted",
+        "enter worktree(/repo/wt) on branch worktree-a; seeded 2 files; previous /repo/old kept; unlock attempted",
       ],
       [
         { name: "a" },
@@ -1226,7 +1242,7 @@ describe("routine tool rendering decorator", () => {
           seeded: [], previousUnlockAttempted: true, previousWorktreePath: "/repo/old",
           previousKeepOutcome: "keep-failed", previousKeepError: "unlock denied",
         },
-        "EnterWorktree(/repo/wt) on branch worktree-a; previous /repo/old keep failed: unlock denied; previous worktree state unknown",
+        "enter worktree(/repo/wt) on branch worktree-a; previous /repo/old keep failed: unlock denied; previous worktree state unknown",
       ],
       [
         { name: "a" },
@@ -1235,7 +1251,7 @@ describe("routine tool rendering decorator", () => {
           seeded: [], previousUnlockAttempted: true, previousWorktreePath: "/repo/old",
           previousKeepOutcome: "keep-failed",
         },
-        "EnterWorktree(/repo/wt) on branch worktree-a; previous /repo/old keep failed; previous worktree state unknown",
+        "enter worktree(/repo/wt) on branch worktree-a; previous /repo/old keep failed; previous worktree state unknown",
       ],
     ] as const;
     for (const [args, details, expected] of enterCases) {
@@ -1248,14 +1264,14 @@ describe("routine tool rendering decorator", () => {
     const exit = decorate({ name: "ExitWorktree" } as ToolDefinition);
     const base = { worktreePath: "/repo/wt", restorePath: "/repo", diagnostics: [] };
     const exitCases = [
-      [{ outcome: "none", restorePath: "/repo" }, "ExitWorktree(no active worktree); already at /repo"],
-      [{ ...base, outcome: "kept", ok: true, removed: false, orphaned: false }, "ExitWorktree(/repo/wt) kept; restored /repo"],
-      [{ ...base, outcome: "keep-failed", ok: false, removed: false, orphaned: false, error: "unlock denied" }, "ExitWorktree(/repo/wt) keep failed: unlock denied; worktree state unknown; restored /repo"],
-      [{ ...base, outcome: "keep-failed", ok: false, removed: false, orphaned: false }, "ExitWorktree(/repo/wt) keep failed; worktree state unknown; restored /repo"],
-      [{ ...base, outcome: "removed", ok: true, removed: true, orphaned: false }, "ExitWorktree(/repo/wt) removed; restored /repo"],
-      [{ ...base, outcome: "deferred-removal", ok: true, removed: false, orphaned: true }, "ExitWorktree(/repo/wt) removal deferred; restored /repo"],
-      [{ ...base, outcome: "removal-failed", ok: false, removed: false, orphaned: false, error: "boom" }, "ExitWorktree(/repo/wt) removal failed: boom; worktree state unknown; restored /repo"],
-      [{ ...base, outcome: "removal-failed", ok: false, removed: false, orphaned: false }, "ExitWorktree(/repo/wt) removal failed; worktree state unknown; restored /repo"],
+      [{ outcome: "none", restorePath: "/repo" }, "exit worktree (no active worktree); already at /repo"],
+      [{ ...base, outcome: "kept", ok: true, removed: false, orphaned: false }, "exit worktree(/repo/wt) kept; restored /repo"],
+      [{ ...base, outcome: "keep-failed", ok: false, removed: false, orphaned: false, error: "unlock denied" }, "exit worktree(/repo/wt) keep failed: unlock denied; worktree state unknown; restored /repo"],
+      [{ ...base, outcome: "keep-failed", ok: false, removed: false, orphaned: false }, "exit worktree(/repo/wt) keep failed; worktree state unknown; restored /repo"],
+      [{ ...base, outcome: "removed", ok: true, removed: true, orphaned: false }, "exit worktree(/repo/wt) removed; restored /repo"],
+      [{ ...base, outcome: "deferred-removal", ok: true, removed: false, orphaned: true }, "exit worktree(/repo/wt) removal deferred; restored /repo"],
+      [{ ...base, outcome: "removal-failed", ok: false, removed: false, orphaned: false, error: "boom" }, "exit worktree(/repo/wt) removal failed: boom; worktree state unknown; restored /repo"],
+      [{ ...base, outcome: "removal-failed", ok: false, removed: false, orphaned: false }, "exit worktree(/repo/wt) removal failed; worktree state unknown; restored /repo"],
     ] as const;
     for (const [details, expected] of exitCases) {
       const result = canonical("CANONICAL EXIT BODY", details);
@@ -1317,7 +1333,7 @@ describe("routine tool rendering decorator", () => {
       if (width >= 40) expect(plain).toContain("removal failed");
       if (width === 200) {
         expect(plain).toBe(
-          "ExitWorktree(/repo/界🙂éwt) removal failed: 鎖🙂é retry failed; worktree state unknown; restored /base/恢復🙂",
+          "exit worktree(/repo/界🙂éwt) removal failed: 鎖🙂é retry failed; worktree state unknown; restored /base/恢復🙂",
         );
       }
     }
@@ -1393,7 +1409,7 @@ describe("routine tool rendering decorator", () => {
     for (const [result, flags] of cases) {
       const output = renderResult(exit, { action: "remove" }, result, flags).join("\n");
       expect(output).toContain("VISIBLE WORKTREE RESULT");
-      expect(output).not.toBe("ExitWorktree(/repo/wt) removed; restored /repo");
+      expect(output).not.toBe("exit worktree(/repo/wt) removed; restored /repo");
     }
     expect(reads).toBe(0);
 
@@ -1432,7 +1448,7 @@ describe("routine tool rendering decorator", () => {
     });
     const result = Object.freeze({ content, details });
     expect(renderResult(enter, args, result)).toEqual([
-      "EnterWorktree(/repo/frozen) on branch worktree-frozen",
+      "enter worktree(/repo/frozen) on branch worktree-frozen",
     ]);
     const exit = decorate({ name: "ExitWorktree" } as ToolDefinition);
     const exitDetails = noGet({
@@ -1442,7 +1458,7 @@ describe("routine tool rendering decorator", () => {
     expect(renderResult(exit, Object.freeze({ action: "keep" }), {
       content: Object.freeze([Object.freeze({ type: "text", text: "FROZEN EXIT CANONICAL" })]),
       details: exitDetails,
-    })).toEqual(["ExitWorktree(/repo/frozen) kept; restored /repo"]);
+    })).toEqual(["exit worktree(/repo/frozen) kept; restored /repo"]);
     expect(propertyReads).toBe(0);
     expect(content[0]?.text).toBe("FROZEN CANONICAL");
 

@@ -6,6 +6,7 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { formatToolDisplayName } from "./tool-display.js";
 
 type Component = { render(width: number): string[] };
 
@@ -432,7 +433,8 @@ function shellComponent(
 
 /** Pi-compatible generic call fallback for renderer-less or failed renderer construction. */
 export function genericCallComponent(toolName: string, theme: unknown): Component {
-  return { render: () => [safeGenericStyle(theme, "toolTitle", toolName, true)] };
+  const displayName = formatToolDisplayName(toolName);
+  return { render: () => [safeGenericStyle(theme, "text", displayName, true)] };
 }
 
 /** Pi-compatible generic textual result fallback. */

@@ -5,6 +5,14 @@ import {
   recognizeMultiEditSuccess,
   type MultiEditSnapshot,
 } from "./routine-tool-render.js";
+import {
+  priorityDisplayRow,
+  formatDisplayPath,
+  formatToolDisplayName,
+  resolveDisplayRoot,
+  type DisplayRootResolver,
+} from "./tool-display.js";
+import { themedFg } from "./render-util.js";
 
 interface Component { render(width: number): string[] }
 type ToolName = "read" | "write" | "edit" | "MultiEdit" | "bash";
@@ -17,12 +25,14 @@ interface Lifecycle {
   call?: Component;
   result?: Component;
   editPreviewError?: string;
+  displayRoot?: string;
+  displayRootResolved?: boolean;
   settledCall: boolean;
 }
 
-interface FileSummary { kind: "file"; path: string; lines: number; range?: string }
+interface FileSummary { kind: "file"; path: string; lines: number; range?: string; remaining?: number; nextOffset?: number }
 interface MutationSummary { kind: "mutation"; path: string; edits: number; diffLines?: number; noNet: boolean }
-interface BashSummary { kind: "bash"; outputLines: number; commandLines: number; duration?: string }
+interface BashSummary { kind: "bash"; outputLines: number; commandPreview: string; additionalCommandLines: number; duration?: string }
 type Summary = FileSummary | MutationSummary | BashSummary;
 
 const MAX_PATH = 16_384;
@@ -84,7 +94,9 @@ function displayArgs(toolName: ToolName, value: unknown): Data | undefined {
     if (!args || !Object.keys(args).every((key) => key === "command" || key === "timeout") ||
       typeof args.command !== "string" || args.command.length > MAX_TEXT ||
       (args.timeout !== undefined && (typeof args.timeout !== "number" || !Number.isFinite(args.timeout)))) return undefined;
-    return { command: sanitize(args.command, MAX_TEXT), ...(args.timeout === undefined ? {} : { timeout: args.timeout }) };
+    const command = args.command.split(/\r\n|\n|\r|\u2028|\u2029/u)
+      .map((line) => sanitize(line, MAX_TEXT, true)).join("\n");
+    return { command, ...(args.timeout === undefined ? {} : { timeout: args.timeout }) };
   }
   if (toolName === "edit") {
     const args = exact(value, ["path", "edits"]);
@@ -267,6 +279,35 @@ function finalAgreement(options: unknown, context: unknown): boolean {
     booleanField(context, "isError") === false;
 }
 
+function readContinuationSummary(args: Data, result: unknown): FileSummary | undefined {
+  const limit = args.limit;
+  if (!Number.isSafeInteger(limit) || (limit as number) < 1) return undefined;
+  const envelope = data(result);
+  if (!envelope || !canonicalEnvelope(result) || envelope.details !== undefined ||
+    (envelope.isError !== undefined && envelope.isError !== false) || !Array.isArray(envelope.content) ||
+    envelope.content.length !== 1) return undefined;
+  const block = exact(envelope.content[0], ["type", "text"]);
+  if (!block || block.type !== "text" || typeof block.text !== "string") return undefined;
+  const match = /\n\n\[([1-9]\d*) more lines in file\. Use offset=([1-9]\d*) to continue\.\]$/u.exec(block.text);
+  if (!match) return undefined;
+  const remaining = Number(match[1]);
+  const nextOffset = Number(match[2]);
+  const start = typeof args.offset === "number" ? args.offset : 1;
+  if (!Number.isSafeInteger(remaining) || !Number.isSafeInteger(nextOffset) ||
+    nextOffset !== start + (limit as number)) return undefined;
+  const payload = block.text.slice(0, match.index);
+  if (/\[[1-9]\d* more lines in file\. Use offset=[1-9]\d* to continue\.\]/u.test(payload) ||
+    payload.split("\n").length !== limit) return undefined;
+  return {
+    kind: "file",
+    path: args.path as string,
+    lines: limit as number,
+    range: `:${start}-${start + (limit as number) - 1}`,
+    remaining,
+    nextOffset,
+  };
+}
+
 function recognize(toolName: ToolName, args: Data, result: unknown, context: unknown): Summary | undefined {
   const envelope = data(result);
   if (!canonicalEnvelope(result) || !envelope || (envelope.isError !== undefined && envelope.isError !== false)) return undefined;
@@ -274,7 +315,10 @@ function recognize(toolName: ToolName, args: Data, result: unknown, context: unk
   const text = oneText(result);
   if (!text) return undefined;
   if (toolName === "read") {
-    if (text.details !== undefined || /(?:^|\n)\[(?:Showing lines |Line \d+ is |\d+ more lines in file\.|PiCC clipped |Truncated:|First line exceeds)/u.test(text.text) ||
+    const continuation = readContinuationSummary(args, result);
+    if (continuation) return continuation;
+    if (text.details !== undefined || /(?:^|\n)\[(?:Showing lines |Line \d+ is |\d+ more lines in file\.|\d+ more lines in file\. Use offset=|PiCC clipped |Truncated:|First line exceeds)/u.test(text.text) ||
+      /\[[^\]\n]*more\s+lines\s+in\s+file[^\]\n]*\]/iu.test(text.text) ||
       text.text.startsWith("Read image file [")) return undefined;
     const offset = typeof args.offset === "number" ? args.offset : 1;
     return { kind: "file", path: args.path as string, lines: fileLineCount(text.text),
@@ -293,9 +337,10 @@ function recognize(toolName: ToolName, args: Data, result: unknown, context: unk
       Number.isFinite(startedAt) && Number.isFinite(endedAt) && endedAt >= startedAt
       ? `${((endedAt - startedAt) / 1000).toFixed(1)}s`
       : undefined;
-    // Stock Bash displays an ellipsis for an empty command, so its summary retains one command line.
+    const commandLines = (args.command as string).split("\n").filter((line) => line.trim().length > 0);
     return { kind: "bash", outputLines: text.text === "(no output)" ? 0 : bashLineCount(text.text),
-      commandLines: Math.max(1, bashLineCount(args.command as string)), ...(duration ? { duration } : {}) };
+      commandPreview: commandLines[0] ?? "...", additionalCommandLines: Math.max(0, commandLines.length - 1),
+      ...(duration ? { duration } : {}) };
   }
   const editArgs = args.edits as unknown[];
   const details = exact(text.details, ["diff", "patch", "firstChangedLine"]);
@@ -314,15 +359,6 @@ function multiSummary(snapshot: MultiEditSnapshot): MutationSummary {
     ...(snapshot.diff.length === 0 ? { noNet: true } : { noNet: false, diffLines: fileLineCount(snapshot.diff) }) };
 }
 
-function themed(theme: unknown, method: "fg" | "bold", args: string[], fallback: string): string {
-  try {
-    const fn = data(theme)?.[method];
-    return typeof fn === "function" ? Reflect.apply(fn, theme, args) as string : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
 function clamp(line: string, width: number): string {
   if (!Number.isFinite(width) || width <= 0) return "";
   const columns = Math.floor(width);
@@ -330,24 +366,41 @@ function clamp(line: string, width: number): string {
   catch { return sanitize(line, columns, true).slice(0, columns); }
 }
 
-function summaryComponent(toolName: ToolName, summary: Summary, hint: string, theme: unknown): Component {
-  const title = toolName === "read" ? "Read" : toolName === "write" ? "Write" : toolName === "edit" ? "Edit" : toolName === "bash" ? "Bash" : toolName;
-  let plain: string;
+function summaryComponent(
+  toolName: ToolName,
+  summary: Summary,
+  hint: string,
+  theme: unknown,
+  displayRoot: string | undefined,
+): Component {
+  const title = formatToolDisplayName(toolName);
   if (summary.kind === "bash") {
-    const output = summary.outputLines === 0 ? "(no output)" : `${summary.outputLines} output ${summary.outputLines === 1 ? "line" : "lines"} hidden`;
-    plain = `${title} · ${output} · ${hint} to expand${summary.duration ? ` · ${summary.duration}` : ""} · ${summary.commandLines} command ${summary.commandLines === 1 ? "line" : "lines"} hidden`;
-  } else if (summary.kind === "mutation") {
-    const detail = summary.noNet ? "no net change" : `${summary.diffLines} diff ${summary.diffLines === 1 ? "line" : "lines"} hidden`;
-    plain = `${title} ${sanitize(summary.path, MAX_PATH, true)} · ${summary.edits} ${summary.edits === 1 ? "edit" : "edits"} applied · ${detail} · ${hint} to expand`;
-  } else {
-    plain = `${title} ${sanitize(summary.path, MAX_PATH, true)}${summary.range ?? ""} · ${summary.lines} ${summary.lines === 1 ? "line" : "lines"} hidden · ${hint} to expand`;
+    const optional = [
+      ...(summary.additionalCommandLines > 0
+        ? [`${summary.additionalCommandLines} more command ${summary.additionalCommandLines === 1 ? "line" : "lines"}`]
+        : []),
+      summary.outputLines === 0 ? "no output" : `${summary.outputLines} output ${summary.outputLines === 1 ? "line" : "lines"} hidden`,
+      ...(summary.duration ? [summary.duration] : []),
+    ];
+    return priorityDisplayRow(title, summary.commandPreview, [`${hint} to expand`], optional, theme, " · ");
   }
-  return { render: (width) => [clamp(themed(theme, "fg", ["toolOutput", plain], plain), width)] };
+  const path = formatDisplayPath(sanitize(summary.path, MAX_PATH, true), displayRoot);
+  if (summary.kind === "mutation") {
+    const detail = summary.noNet ? "no net change" : `${summary.diffLines} diff ${summary.diffLines === 1 ? "line" : "lines"} hidden`;
+    return priorityDisplayRow(title, path,
+      [`${summary.edits} ${summary.edits === 1 ? "edit" : "edits"} applied`, `${hint} to expand`], [detail], theme);
+  }
+  if (summary.remaining !== undefined && summary.nextOffset !== undefined) {
+    return priorityDisplayRow(title, `${path}${summary.range ?? ""}`,
+      [`next offset ${summary.nextOffset}`, `${hint} to expand`], [`${summary.remaining} more lines`], theme);
+  }
+  return priorityDisplayRow(title, `${path}${summary.range ?? ""}`,
+    [`${hint} to expand`], [`${summary.lines} ${summary.lines === 1 ? "line" : "lines"} hidden`], theme);
 }
 
 function messageComponent(message: string, theme: unknown): Component {
   const safe = sanitize(message, 512, true);
-  return { render: (width) => [clamp(themed(theme, "fg", ["warning", safe], safe), width)] };
+  return { render: (width) => [clamp(themedFg(theme, "warning", safe), width)] };
 }
 
 function combined(components: readonly Component[], theme: unknown): Component {
@@ -357,11 +410,18 @@ function combined(components: readonly Component[], theme: unknown): Component {
   } };
 }
 
+export interface DefaultCollapsedRenderingDependencies {
+  resolveDisplayRoot?: DisplayRootResolver;
+}
+
 /**
  * Collapse only recognized settled main-session successes. Display-safe live and nonordinary states
  * delegate natively, while malformed display data gets concise warnings.
  */
-export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool: T): T {
+export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(
+  tool: T,
+  dependencies: DefaultCollapsedRenderingDependencies = {},
+): T {
   const toolName = tool.name as ToolName;
   if (!["read", "write", "edit", "MultiEdit", "bash"].includes(toolName) ||
     typeof tool.renderCall !== "function" || typeof tool.renderResult !== "function") return tool;
@@ -371,6 +431,10 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
   const decorated = { ...tool } as T;
   decorated.renderCall = ((argsValue: unknown, theme: unknown, context: unknown): Component => {
     const current = lifecycle(context);
+    if (current && current.displayRootResolved !== true) {
+      current.displayRoot = resolveDisplayRoot(dependencies.resolveDisplayRoot, context);
+      current.displayRootResolved = true;
+    }
     const settled = booleanField(context, "isPartial") === false;
     const args = settled ? displayArgs(toolName, argsValue) : liveDisplayArgs(toolName, argsValue);
     if (!args) return messageComponent("Unfamiliar arguments", theme);
@@ -445,7 +509,12 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(tool
     }
 
     const ownsRow = current.settledCall && current.call;
-    if (ordinary && hint && !requestedExpanded && ownsRow) return summaryComponent(toolName, ordinary, hint, theme);
+    if (ordinary && hint && !requestedExpanded && ownsRow) {
+      const displayRoot = current.displayRootResolved === true
+        ? current.displayRoot
+        : resolveDisplayRoot(dependencies.resolveDisplayRoot, context);
+      return summaryComponent(toolName, ordinary, hint, theme, displayRoot);
+    }
 
     let call = current.call;
     if (ownsRow && (forceExpanded || requestedExpanded)) {

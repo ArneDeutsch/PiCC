@@ -14,9 +14,11 @@ import {
 import {
   renderAgentResult,
   renderTaskOutputCall,
+  renderTaskStopCall,
   renderTaskStopResult,
   type SubagentLifecycleRenderContext,
   type SubagentRenderDetails,
+  type SubagentRenderingOptions,
 } from "./subagent-render.js";
 import {
   formatBackgroundTaskIdentity,
@@ -930,7 +932,10 @@ type ToolUpdate = {
 };
 
 /** The `TaskOutput` tool: retrieve a background task's result (waits by default). */
-export function createTaskOutputTool(registry: BackgroundTaskView): Record<string, unknown> {
+export function createTaskOutputTool(
+  registry: BackgroundTaskView,
+  presentation: SubagentRenderingOptions = {},
+): Record<string, unknown> {
   return {
     name: "TaskOutput",
     label: "TaskOutput",
@@ -959,7 +964,7 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
       theme: unknown,
       context: SubagentLifecycleRenderContext,
     ) {
-      return renderAgentResult(result, options, theme, context);
+      return renderAgentResult(result, options, theme, context, { ...presentation, surface: "task-output" });
     },
     async execute(
       _toolCallId: string,
@@ -1090,8 +1095,8 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
       if (usageLine && task.status !== "running") {
         text += `\nusage: ${usageLine}`;
       }
-      // Render outcome: map the background status to the badge outcome
-      // (stopped → aborted) so renderResult shows the outcome chip. Only for a
+      // Render outcome: map the background status to the lifecycle outcome
+      // (stopped → aborted) so renderResult shows the terminal state. Only for a
       // SETTLED task — a running poll carries no outcome (renderResult keys the
       // poll frame on status:"running" instead).
       const outcome = task.status === "running" ? undefined : noticeOutcome(task.status);
@@ -1117,7 +1122,7 @@ export function createTaskOutputTool(registry: BackgroundTaskView): Record<strin
           ...(outcome ? { outcome } : {}),
           agent,
           agentId: task.agentId,
-          // Truncated completed/failed runs carry a cut-off frame → badge suffix.
+          // Truncated completed/failed runs carry a cut-off frame → state suffix.
           cutOff: task.truncated === true,
           transcriptPath: task.transcriptPath,
           resumable: task.resumable,
@@ -1203,6 +1208,13 @@ export function createTaskStopTool(
         description: 'Task id returned at start (normally "task-*"), or the "agent-*" id of a live checkpoint-paused child in this process',
       }),
     }),
+    renderCall(
+      args: Record<string, unknown>,
+      theme: unknown,
+      context: SubagentLifecycleRenderContext,
+    ) {
+      return renderTaskStopCall(args, theme, context);
+    },
     renderResult(
       result: { content?: Array<{ type?: string; text?: string }>; details?: Record<string, unknown> },
       _options: Record<string, unknown>,
