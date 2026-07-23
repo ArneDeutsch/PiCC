@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { SessionManager, initTheme } from "@earendil-works/pi-coding-agent";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
+import { buildMcpProxyTools } from "../src/runtime/mcp-tools.js";
 import { renderAgentCall, renderAgentResult, renderTaskOutputCall } from "../src/runtime/subagent-render.js";
 
 type HtmlExportModule = {
@@ -60,6 +61,18 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
         return textComponent(result.content?.[0]?.text ?? "");
       },
     });
+    const mcpProxy = buildMcpProxyTools({
+      tools: () => [{
+        serverName: "fixture",
+        toolName: "echo",
+        description: "echoes text back",
+        inputSchema: { type: "object", properties: { text: { type: "string" } } },
+      }],
+      callTool: async () => ({ content: [{ type: "text", text: "unused" }] }),
+    })[0]!;
+    const mcpDefinition = wrapForSelfShell(mcpProxy as unknown as Record<string, unknown>, {
+      fallbackCallDisplayName: mcpProxy.label,
+    });
     const lifecycleDefinitions: Record<string, Record<string, unknown>> = {
       Agent: wrapForSelfShell({
         name: "Agent",
@@ -77,7 +90,11 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
     const toolRenderer = htmlRendererModule.createToolHtmlRenderer({
       getToolDefinition: (name) => {
         requestedDefinitions.push(name);
-        return name === "CustomBoundary" ? customDefinition : lifecycleDefinitions[name];
+        return name === "CustomBoundary"
+          ? customDefinition
+          : name === mcpProxy.name
+            ? mcpDefinition
+            : lifecycleDefinitions[name];
       },
       theme: themeModule.theme,
       cwd: process.cwd(),
@@ -93,6 +110,7 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
         content: [
           { type: "toolCall", id: "stock-read", name: "read", arguments: { path: HOSTILE } },
           { type: "toolCall", id: "custom-boundary", name: "CustomBoundary", arguments: { query: HOSTILE } },
+          { type: "toolCall", id: "mcp-friendly", name: mcpProxy.name, arguments: { text: HOSTILE } },
           { type: "toolCall", id: "agent-lifecycle", name: "Agent", arguments: { subagent_type: "reviewer", description: "Review HTML" } },
           { type: "toolCall", id: "task-lifecycle", name: "TaskOutput", arguments: { task_id: "task-7" } },
         ],
@@ -112,6 +130,14 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
         toolName: "CustomBoundary",
         content: [{ type: "text", text: HOSTILE }],
         details: { preserved: HOSTILE },
+        isError: false,
+      } as never);
+      session.appendMessage({
+        role: "toolResult",
+        toolCallId: "mcp-friendly",
+        toolName: mcpProxy.name,
+        content: [{ type: "text", text: HOSTILE }],
+        details: { server: "fixture", tool: "echo" },
         isError: false,
       } as never);
       session.appendMessage({
@@ -156,8 +182,16 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
       expect(Buffer.from(JSON.stringify(data.entries), "utf8")).toEqual(canonicalBytes);
       expect(JSON.stringify(data.entries)).toContain('"name":"read"');
       expect(requestedDefinitions).toContain("CustomBoundary");
+      expect(requestedDefinitions).toContain("mcp__fixture__echo");
       expect(requestedDefinitions).not.toContain("read");
       expect(data.renderedTools?.["stock-read"]).toBeUndefined();
+
+      const mcp = data.renderedTools?.["mcp-friendly"];
+      expect(mcp?.callHtml).toContain("echo (fixture MCP)");
+      expect(mcp?.callHtml).not.toContain("mcp__fixture__echo");
+      expect(mcp?.resultHtmlExpanded).toContain("&lt;img src=x onerror=&quot;boom&quot;&gt;&amp; hostile");
+      expect(JSON.stringify(data.entries)).toContain('"name":"mcp__fixture__echo"');
+      expect(JSON.stringify(data.entries)).toContain('"toolName":"mcp__fixture__echo"');
 
       const custom = data.renderedTools?.["custom-boundary"];
       expect(custom?.callHtml).toContain("○");
