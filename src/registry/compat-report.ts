@@ -1,7 +1,7 @@
 /**
- * Compatibility report — generated from the capability registry so it cannot
- * drift from actual behavior. buildCompatReport() scans the assembled project;
- * renderDoctorReport() gives a project-specific /doctor report on demand.
+ * Compatibility report — derived from the capability registry so `/doctor` and
+ * the generated matrix share the same support claims. buildCompatReport() scans
+ * the assembled project; renderDoctorReport() gives a project-specific report.
  */
 import fs from "node:fs";
 import path from "node:path";
