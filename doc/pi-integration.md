@@ -1,9 +1,9 @@
 # PiCC ↔ Pi integration contracts
 
-> **Status:** Contract record for the coordinated Pi 0.80.10 suite
+> **Status:** Contract record for the coordinated Pi 0.81.1 suite
 > (`@earendil-works/pi-agent-core`, `pi-ai`, `pi-coding-agent`, and `pi-tui`). `package.json`
-> declares `^0.80.10`; `package-lock.json` resolves every direct and coding-agent-nested copy to
-> exactly 0.80.10. Pi directly declares Node ≥ 22.19.0.
+> declares `^0.81.1`; `package-lock.json` resolves every direct and coding-agent-nested copy to
+> exactly 0.81.1. Installed package metadata declares Node ≥ 22.19.0.
 > Source of truth for every Pi API PiCC builds on. If Pi churns, update here first.
 >
 > Fork vs. depend: **depend + extension bundle**. Pi is a regular npm dependency;
@@ -45,7 +45,8 @@ Launch modes we support:
 | Subagent status panel, drill-down & condensed settlement records (interactive TUI only) | `ctx.ui.setWidget(key, factory, { placement: "belowEditor" })` — factory invoked synchronously, replaced/removed components disposed; `ctx.ui.custom(factory)` — focused component, Pi saves/restores the editor draft around it; `pi.registerShortcut(keyId, { description, handler })` — dispatches only while the default editor has focus; `ctx.ui.onTerminalInput` — raw listeners run BEFORE the focused component, so PiCC's fork-Esc watcher yields a lone Esc while the panel is open; `pi.registerMessageRenderer(customType, renderer)` + `pi.sendMessage(…, details)` — rendered by Pi's `CustomMessageComponent` with a boolean `expanded` (Ctrl+O toggle); `undefined`/throw falls back to Pi's default box. Mode gating is on `ctx.mode === "tui"`, never `hasUI`: print's `noOpUIContext` implements the full ui interface with `hasUI` false, while RPC flips `hasUI` true. |
 | MCP tool exposure (proxies registered AFTER extension load, once the non-blocking stdio connect settles) | Post-load `pi.registerTool` of a NEW name: with no `tools:` allowlist (the main-session reality) Pi's registry refresh auto-activates the name on the next request, and a snippet-less tool leaves the base system prompt byte-identical — the Pi half of the MCP zero-context guarantee. Pinned against the real Pi dist in `test/mcp-registration.test.ts`. |
 | Skill listing and Claude-format slash commands | We do **not** feed `.claude/skills` through Pi's own skill discovery (Pi's XML listing + `/skill:` semantics differ from Claude's budgeted listing, `$ARGUMENTS`, shell-injection, `context: fork`). PiCC owns the Claude skill pipeline end-to-end: listing text appended in `before_agent_start`; activation via our own `Skill` tool or a `pi.on("input")` transform; palette visibility via `resources_discover` prompt paths. Pi's native skill/command discovery of `.pi/`/`.agents/` stays untouched. |
-| Mid-run proactive checkpoint | `turn_end` observes the completed tool batch; tool results may set `terminate: true`, and `ctx.abort()` is the fail-closed fallback. Main compaction uses `ctx.compact({ onComplete, onError })`; child sessions use public `AgentSession.compact()`, `abortCompaction()`, `sendCustomMessage()`, `abort()`, and `subscribe()`. Hidden `pi.sendMessage(..., { triggerTurn: true })` / child `sendCustomMessage(..., { triggerTurn: true })` starts the synthetic continuation; lifecycle handlers await its re-entrant settlement while `before_provider_request` guards ordinary transport. |
+| Mid-run proactive checkpoint | `turn_end` observes the completed tool batch; tool results may set `terminate: true`, and `ctx.abort()` is the fail-closed ordinary-run fallback. Each generation invokes one main `ctx.compact({ onComplete, onError })` or child `AgentSession.compact()` transaction. Main logical cancellation blocks continuation and joins callback settlement; the extension API cannot abort compaction, so configured summary retries may finish. Child cancellation calls public `abortCompaction()` and joins settlement. Children also use `sendCustomMessage()`, `abort()`, and `subscribe()`; summary retry events are condensed without copying `errorMessage`. Hidden `pi.sendMessage(..., { triggerTurn: true })` / child `sendCustomMessage(..., { triggerTurn: true })` starts the synthetic continuation while `before_provider_request` guards ordinary transport. |
+| Pi retry contracts | `SettingsManager.inMemory()` supplies child defaults through `getRetrySettings()` and `getProviderRetrySettings()`; PiCC does not copy them into production. Public `generateSummary(..., retryPolicy, retryCallbacks)` pins eligible summary retry, fail-fast categories, callback order, and cancellation. Main compaction inherits the host's configured `retry` and `retry.provider` settings. |
 | Guarded provider APIs | The checkpoint gate recognizes only model API ids `openai-completions`, `openai-responses`, and `openai-codex-responses`. Pi's OpenAI Completions/Responses streams honor a pre-aborted signal. PiCC owns the public `openai-codex-responses` registration while loaded and delegates to Pi's public compat loader; it preserves normal automatic transport, but forces abort-aware SSE for an already-aborted request so a cached Codex WebSocket cannot send. Compaction-summary authority is session/generation scoped; arbitrary competing custom API handlers are outside scope. |
 
 ## 3. Key mechanics decisions
@@ -124,36 +125,46 @@ confirms only synchronous enqueue acceptance, so later delivery failure is not o
 
 `proactiveCompactPercent` defaults to 90. At `turn_end`, PiCC waits for every requested tool result.
 A clean PiCC-owned batch uses `terminate`; any mixed, blocked, malformed, truncated, pending, or
-ambiguous path uses `ctx.abort()` and the provider guard. The controller then awaits compaction and
-the re-entrant synthetic continuation before the original logical run settles. Operational
-PiCC-initiated compaction failures use up to three attempts. A blocked `PreCompact` is policy, not
-an operational failure: PiCC fails closed and pauses rather than continuing uncompacted, which
-differs from Claude Code. The settled-idle sample remains a non-resuming fallback.
+ambiguous path uses `ctx.abort()` and the provider guard. The controller invokes exactly one Pi
+compaction transaction and awaits it plus the re-entrant synthetic continuation before the logical
+run settles. Pi owns retry eligibility and backoff inside that transaction. Main sessions inherit
+the host's configured retry settings; PiCC-created children use fresh public in-memory settings with
+only PiCC's existing compaction and shell overrides, so their effective retry defaults remain Pi's.
+A configured retry budget therefore changes inner provider attempts, never the number of PiCC
+checkpoint transactions. Main cancellation is logical: it blocks ordinary work and continuation
+while joining bounded Pi settlement, which may finish configured summary retries. Child cancellation
+physically aborts compaction through the SDK and joins it. Split summarization operations qualify
+independently under Pi's policy; PiCC neither pools nor multiplies their retry budgets. A blocked
+`PreCompact` remains policy exhaustion and is not made retryable. The settled-idle sample remains a
+non-resuming fallback.
 
-This is PiCC-only hardening built entirely on the public APIs listed above; no Pi patch is needed.
-It covers the main session and every PiCC-created child session, but only for models using Pi's
-`openai-completions`, `openai-responses`, or `openai-codex-responses` APIs. The continuation is a
-synthetic persisted, model-visible custom message, not a documented Claude threshold/retry/resume
-mechanism. Operational or hook exhaustion retains a manually recoverable paused boundary. Any
-restoration, replay, provider release, continuation-start, or settlement failure after commit
-instead requires a new session and must not compact the committed summary again. Print stdout/exit
-status and RPC command acknowledgement remain Pi-owned; JSON/RPC lifecycle entries are uncorrelated. Pi
-0.80.10 also emits a native physical `agent_end` for the intentionally stopped pre-compaction run
-and can expose a native RPC compaction error before PiCC lifecycle handling; extensions cannot
-suppress, correlate, or redact those native records.
+This is PiCC reliability hardening, not verified Claude threshold/retry/continuation parity. It
+covers main sessions and PiCC-created children using Pi's `openai-completions`, `openai-responses`,
+or `openai-codex-responses` APIs. Eligible transient summary transport failures can recover inside
+Pi; deterministic provider, quota, authentication, initial cancellation, and hook failures fail
+fast or terminate by category. Operational or hook exhaustion retains a manually recoverable
+pre-commit boundary. Authoritative observation of the current generation's `session_compact` marks
+the summary committed; every later callback error, rejection, cancellation ambiguity, stale
+settlement, restoration, replay, provider release, or continuation failure then requires replacement
+and must not mint recovery authority or compact that summary again.
 
-Pi's internally owned overflow-recovery summarization remains distinct. It uses Pi's private authed
-stream and exposes neither retry ownership nor a public replacement transport to extensions, so
-PiCC does not retry it. `compaction.reserveTokens` likewise remains a Pi settings-file boundary.
+Pi's native summary retry callbacks and child `summarization_retry_scheduled`,
+`summarization_retry_attempt_start`, and `summarization_retry_finished` events are observability
+seams. Child progress exposes only bounded category/attempt activity and never raw provider
+`errorMessage`; main retry presentation and native JSON/RPC compaction errors remain Pi-owned and
+may contain provider diagnostics outside PiCC's transcript/lifecycle records. Pi 0.81.1 continues
+to emit a native physical `agent_end` for the intentionally stopped pre-compaction run; extensions
+cannot suppress or correlate it. Pi's overflow recovery remains a separate Pi-owned transaction,
+and `compaction.reserveTokens` remains a settings-file boundary.
 
 ### 3.6 What stays Pi-native
 Auth (`/login` ChatGPT/Codex OAuth), provider abstraction, retry, session persistence/tree,
-TUI, `/model`, project trust. Pi 0.80.10's auth/model/catalog internals and base-prompt date removal
+TUI, `/model`, project trust. Pi 0.81.1's auth/model/catalog internals and base-prompt date removal
 are inherited behavior, not PiCC compatibility features. PiCC keeps complete eager tool sets and does
 not adopt deferred tool activation. We do not reimplement these Pi-native surfaces.
 
 ## 4. Risks / churn watchpoints
-- Pre-1.0 API churn: the manifest keeps the coordinated `^0.80.10` policy while the lockfile is the
+- Pre-1.0 API churn: the manifest keeps the coordinated `^0.81.1` policy while the lockfile is the
   exact resolution boundary; this doc + a smoke test (`test/pi-contract.test.ts`) asserts the
   imports/exports we rely on exist.
 - `before_agent_start` system-prompt chaining: other extensions may also modify; we append, not replace.
