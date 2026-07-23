@@ -348,7 +348,7 @@ Treat true global rebinding as **out of scope** — it fights Pi's own model and
 ## 8. Other adaptable surfaces (for completeness)
 
 - **Slash commands** — `pi.registerCommand(name, { description, handler, getArgumentCompletions })`.
-  PiCC's `/doctor`, `/usage`, `/quota`, `/skills`, and `/agents` live here (`src/index.ts`).
+  PiCC's control commands live here (`src/index.ts`).
 - **Custom transcript entries** — `pi.appendEntry(customType, data)` + `pi.registerEntryRenderer`
   (PiCC uses these for control-command output and appends checkpoint lifecycle records; entries do
   **not** enter LLM context). For custom *messages* that do participate, `pi.sendMessage` +
