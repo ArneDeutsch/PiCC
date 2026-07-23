@@ -499,11 +499,11 @@ describe("loadSettings — robustness (completeness floor)", () => {
     expect(settings.hooks).toEqual({});
     expect(settings.worktree.baseRef).toBe("head");
     expect(settings.subagentsEnabled).toBe(true);
-    // Main-session-only by default — a deliberate PiCC divergence from Claude
-    // Code's up-to-5 contract. Depth-1 fan-out is on; nesting is opt-in
-    // via `subagents.maxDepth: 2..5`.
+    // Positive integers are valid, but nesting requires maxDepth > 1. Keep
+    // main-session-only as the default to avoid unexpected recursive fan-out
+    // draining subscription capacity.
     expect(settings.subagentMaxDepth).toBe(1);
-    expect(settings.subagentConcurrency).toBe(4);
+    expect(settings.subagentConcurrency).toBe(10);
     expect(settings.disableAllHooks).toBe(false);
     expect(settings.disableSkillShellExecution).toBe(false);
     expect(settings.diagnostics).toEqual([]);
@@ -536,9 +536,9 @@ describe("loadSettings — recognized toggles", () => {
     ["subagents.maxDepth", "subagentMaxDepth", 1, 0],
     ["subagents.maxDepth", "subagentMaxDepth", 1, -2],
     ["subagents.maxDepth", "subagentMaxDepth", 1, 1.5],
-    ["subagents.concurrency", "subagentConcurrency", 4, 0],
-    ["subagents.concurrency", "subagentConcurrency", 4, -2],
-    ["subagents.concurrency", "subagentConcurrency", 4, 1.5],
+    ["subagents.concurrency", "subagentConcurrency", 10, 0],
+    ["subagents.concurrency", "subagentConcurrency", 10, -2],
+    ["subagents.concurrency", "subagentConcurrency", 10, 1.5],
   ] as const)(
     "rejects %s=%s (keeps default) with a diagnostic",
     (keyLabel, effectiveKey, defaultValue, badValue) => {
@@ -573,7 +573,7 @@ describe("loadSettings — recognized toggles", () => {
     });
     settings = load(scopes);
     expect(settings.subagentMaxDepth).toBe(1);
-    expect(settings.subagentConcurrency).toBe(4);
+    expect(settings.subagentConcurrency).toBe(10);
     expect(
       settings.diagnostics.filter((d) => d.message.includes("must be a positive integer")),
     ).toHaveLength(2);

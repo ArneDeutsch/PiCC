@@ -157,7 +157,15 @@ describe("MCP main-session tool exposure (wired)", () => {
       expect(tool.promptSnippet).toBeUndefined();
       expect(tool.promptGuidelines).toBeUndefined();
     }
-    expect(pi.tools.get("mcp__fixture__echo").description).toBe("echoes text back");
+    const echo = pi.tools.get("mcp__fixture__echo");
+    expect(echo.description).toBe("echoes text back");
+    expect(echo.label).toBe("echo (fixture MCP)");
+    const rendered = (echo.renderCall as Function)({}, undefined, { state: {}, isPartial: true })
+      .render(120)
+      .join("\n")
+      .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+    expect(rendered).toContain("echo (fixture MCP)");
+    expect(rendered).not.toContain("mcp__fixture__echo");
   });
 
   it("round-trips a real tool call through the registered proxy", async () => {

@@ -44,7 +44,8 @@ export const PANEL_RUNNING_FRAMES: readonly string[] = [
   "⠇",
   "⠏",
 ];
-/** Finished-state bubbles — distinct glyphs, not color-alone. */
+/** Waiting/finished-state bubbles — distinct glyphs, not color-alone. */
+export const PANEL_GLYPH_WAITING = "◌";
 export const PANEL_GLYPH_SUCCESS = "●";
 export const PANEL_GLYPH_FAILED = "✗";
 export const PANEL_GLYPH_STOPPED = "■";
@@ -52,6 +53,7 @@ export const PANEL_GLYPH_STOPPED = "■";
 /** Theme slot per row state (bubble color). */
 const STATE_COLOR: Record<PanelRowView["state"], string> = {
   running: "accent",
+  waiting: "warning",
   success: "success",
   failed: "error",
   stopped: "warning",
@@ -61,6 +63,8 @@ function stateGlyph(state: PanelRowView["state"], runningFrame: string | undefin
   switch (state) {
     case "running":
       return runningFrame || PANEL_RUNNING_FRAMES[0]!;
+    case "waiting":
+      return PANEL_GLYPH_WAITING;
     case "success":
       return PANEL_GLYPH_SUCCESS;
     case "failed":
@@ -149,6 +153,7 @@ interface PlainPanelRow {
   indent: string;
   glyph: string;
   identity: string;
+  status: string;
   chip: string;
   description: string;
   metrics: Record<MetricKey, string | undefined>;
@@ -185,6 +190,7 @@ function preparePanelRow(row: PanelRowView, opts: PanelRenderOptions, focused: b
     indent: "  ".repeat(Math.min(Math.max(0, row.treeDepth), MAX_INDENT_LEVELS)),
     glyph: stateGlyph(row.state, opts.runningFrame),
     identity,
+    status: row.state === "waiting" ? " [waiting]" : "",
     chip: row.hiddenDescendants > 0 ? ` (+${row.hiddenDescendants})` : "",
     description: label && label !== identity ? label : "",
     metrics: {
@@ -211,6 +217,7 @@ function renderAggregate(view: PanelViewModel, opts: PanelRenderOptions): string
     { state: "failed", count: view.failedCount, word: "failed" },
     { state: "stopped", count: view.stoppedCount, word: "stopped" },
     { state: "running", count: view.runningCount, word: "running" },
+    { state: "waiting", count: view.waitingCount, word: "waiting" },
     { state: "success", count: view.completedCount, word: "completed" },
   ];
   const entries = allEntries.filter((entry) => entry.count > 0);
@@ -237,7 +244,7 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
   if (view.empty) return [];
   const rows = view.rows.map((row) => preparePanelRow(row, opts, view.focused));
   const gutterWidth = Math.max(...rows.map((row) => visibleWidth(`${row.marker}${row.indent}${row.glyph} `)));
-  const identityNaturalWidth = Math.max(...rows.map((row) => visibleWidth(`${row.identity}${row.chip}`)));
+  const identityNaturalWidth = Math.max(...rows.map((row) => visibleWidth(`${row.identity}${row.status}${row.chip}`)));
   const descriptionNaturalWidth = Math.max(...rows.map((row) => visibleWidth(row.description)));
 
   const metricWidths = new Map<MetricKey, number>();
@@ -259,7 +266,8 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
 
   const availableLeft = Math.max(0, opts.width - metricTotal());
   const minimumIdentityWidth = Math.max(...rows.map((row) =>
-    visibleWidth(row.chip) + Math.min(MIN_USEFUL_IDENTITY_WIDTH, visibleWidth(row.identity))
+    visibleWidth(row.status) + visibleWidth(row.chip) +
+      Math.min(MIN_USEFUL_IDENTITY_WIDTH, visibleWidth(row.identity))
   ));
   const minimumLeftWidth = gutterWidth + minimumIdentityWidth +
     (hasDescription ? descriptionGapWidth + MIN_USEFUL_DESCRIPTION_WIDTH : 0);
@@ -281,12 +289,12 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
     const glyph = panelFg(opts.theme, STATE_COLOR[row.source.state], row.glyph);
     const gutterPlain = `${row.marker}${row.indent}${row.glyph} `;
     const gutterPad = " ".repeat(Math.max(0, gutterWidth - visibleWidth(gutterPlain)));
-    const chipWidth = visibleWidth(row.chip);
-    const fittedIdentity = truncateToWidth(row.identity, Math.max(0, identityWidth - chipWidth), "…");
-    const identityPlain = `${fittedIdentity}${row.chip}`;
+    const suffixWidth = visibleWidth(row.status) + visibleWidth(row.chip);
+    const fittedIdentity = truncateToWidth(row.identity, Math.max(0, identityWidth - suffixWidth), "…");
+    const identityPlain = `${fittedIdentity}${row.status}${row.chip}`;
     let line = `${marker}${row.indent}${glyph} ${gutterPad}`;
     line += opts.theme ? tintAgentColor(row.source.color, fittedIdentity) : fittedIdentity;
-    line += panelFg(opts.theme, "muted", row.chip);
+    line += panelFg(opts.theme, "muted", row.status + row.chip);
     line += " ".repeat(Math.max(0, identityWidth - visibleWidth(identityPlain)));
     if (hasDescriptionCell) {
       const description = truncateToWidth(row.description, descriptionWidth, "…");
@@ -306,6 +314,9 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
   if (view.hiddenAbove > 0) lines.push(panelFg(opts.theme, "muted", panelMoreAbove(view.hiddenAbove)));
   lines.push(...renderedRows);
   if (view.hiddenBelow > 0) lines.push(panelFg(opts.theme, "muted", panelMoreBelow(view.hiddenBelow)));
+  if (view.waitingCount > 0) {
+    lines.push(panelFg(opts.theme, "muted", `${view.runningCount} running · ${view.waitingCount} waiting`));
+  }
   const hint = view.focused ? PANEL_HINT_FOCUSED : panelHintUnfocused(opts.entryChord);
   lines.push(panelFg(opts.theme, "muted", hint));
   return clampLines(lines, opts.width);
@@ -349,6 +360,7 @@ export function detailPromptCollapsed(lineCount: number): string {
   return `initial prompt (${lineCount} line${lineCount === 1 ? "" : "s"}) — ${DETAIL_PROMPT_KEY} to expand`;
 }
 export const DETAIL_PROMPT_EXPANDED = `initial prompt — ${DETAIL_PROMPT_KEY} to collapse`;
+export const DETAIL_WAITING = "Waiting for configured concurrency capacity; no agent session has started yet.";
 export const DETAIL_NO_ACTIVITY = "(no detail events captured yet)";
 export const DETAIL_NO_FINAL_ANSWER = "(no final answer captured)";
 export const DETAIL_NO_PARTIAL_OUTPUT = "(no partial output captured before failure)";
@@ -477,6 +489,9 @@ export interface PanelDetailData {
   record?: SubagentRegistryRecord;
   /** Newest-generation background task id, when the agent has one. */
   taskId?: string;
+  taskStatus?: "running" | "completed" | "failed" | "stopped";
+  taskAdmission?: "waiting" | "admitted";
+  taskSettledAt?: number;
   nowMs: number;
 }
 
@@ -524,8 +539,13 @@ function tailToWidth(text: string, maxCols: number): string {
  */
 type DetailSteerSlot = { kind: "input" } | { kind: "notice"; text: string } | { kind: "none" };
 
-function detailSteerSlot(record: SubagentRegistryRecord): DetailSteerSlot {
-  if (record.state !== "running") return { kind: "none" };
+function detailSteerSlot(
+  record: SubagentRegistryRecord,
+  operational: boolean,
+  waiting: boolean,
+): DetailSteerSlot {
+  if (!operational) return { kind: "none" };
+  if (waiting) return { kind: "notice", text: detailSteerUnavailable("waiting for capacity") };
   if (guardSteer(record).ok) return { kind: "input" };
   if (record.oneShot) return { kind: "notice", text: detailSteerUnavailable("one-shot agent") };
   if (record.userStopped) {
@@ -566,14 +586,20 @@ export function renderSubagentDetail(
     return { lines: clampLines(lines, width), maxScroll: 0 };
   }
 
-  const running = record.state === "running";
-  const rowState: PanelRowView["state"] = running
-    ? "running"
-    : record.userStopped || record.outcome === "aborted"
-      ? "stopped"
-      : record.outcome === "failed"
-        ? "failed"
-        : "success";
+  const taskStopped = data.taskStatus === "stopped";
+  const operational = record.state === "running" && !taskStopped;
+  const waiting = operational && (data.taskAdmission ?? record.admission) === "waiting";
+  const rowState: PanelRowView["state"] = taskStopped
+    ? "stopped"
+    : waiting
+      ? "waiting"
+      : operational
+        ? "running"
+        : record.userStopped || record.outcome === "aborted"
+          ? "stopped"
+          : record.outcome === "failed"
+            ? "failed"
+            : "success";
   const glyphText = stateGlyph(rowState, opts.runningFrame);
   // agentName is the one deliberately-raw record field — sanitize at render.
   const typeText = sanitizeLine(record.agentName, TYPE_RENDER_CAP) || "agent";
@@ -583,15 +609,23 @@ export function renderSubagentDetail(
       (theme ? tintAgentColor(record.color, typeText) : typeText) +
       (labelText && labelText !== typeText ? muted(` · ${labelText}`) : ""),
   );
-  const elapsedEnd = running ? data.nowMs : (record.settledAt ?? record.startedAt);
+  const elapsedEnd = operational
+    ? data.nowMs
+    : (taskStopped && data.taskSettledAt !== undefined
+      ? data.taskSettledAt
+      : (record.settledAt ?? record.startedAt));
   // Defense-in-depth consistency: agentId and the outcome word are typed
   // unions/ids today, but the meta line sanitizes every interpolated field
   // like the rest of the view instead of trusting record shape.
-  const statusWord = running
-    ? "running"
-    : record.userStopped
-      ? "stopped by user"
-      : sanitizeLine(record.outcome ?? "settled", 60);
+  const statusWord = taskStopped
+    ? record.userStopped ? "stopped by user" : "stopped"
+    : waiting
+      ? "waiting"
+      : operational
+        ? "running"
+        : record.userStopped
+          ? "stopped by user"
+          : sanitizeLine(record.outcome ?? "settled", 60);
   const meta: string[] = [sanitizeLine(record.agentId, 60)];
   if (data.taskId) meta.push(sanitizeLine(data.taskId, 60));
   meta.push(formatElapsed(Math.max(0, elapsedEnd - record.startedAt)), statusWord);
@@ -669,7 +703,10 @@ export function renderSubagentDetail(
       }
     }
   };
-  if (running) {
+  if (waiting) {
+    body.push(muted(DETAIL_WAITING));
+    pushPrompt();
+  } else if (operational) {
     // The collapsed one-liner stays pinned above the following viewport.
     if (promptLines.length > 0 && !ui.promptExpanded) {
       lines.push(muted(detailPromptCollapsed(promptLines.length)));
@@ -677,7 +714,7 @@ export function renderSubagentDetail(
     if (ui.promptExpanded) pushPrompt();
     pushDetailEntries();
   } else {
-    const stopped = record.userStopped || record.outcome === "aborted";
+    const stopped = taskStopped || record.userStopped || record.outcome === "aborted";
     const failed = record.outcome === "failed";
     const outputLabel = stopped
       ? DETAIL_DISCARDED_LABEL
@@ -706,7 +743,7 @@ export function renderSubagentDetail(
   if (ui.notice) {
     lines.push(themedFg(theme, "warning", sanitizeLine(ui.notice, DETAIL_FIELD_MAX_LENGTH)));
   }
-  const slot = detailSteerSlot(record);
+  const slot = detailSteerSlot(record, operational, waiting);
   if (slot.kind === "input") {
     const avail = Math.max(0, width - visibleWidth(DETAIL_STEER_PREFIX));
     lines.push(themedFg(theme, "accent", DETAIL_STEER_PREFIX) + tailToWidth(ui.steerBuffer, avail));
@@ -717,7 +754,7 @@ export function renderSubagentDetail(
     muted(
       detailHint({
         steerable: slot.kind === "input",
-        stoppable: running && data.taskId !== undefined,
+        stoppable: operational && data.taskId !== undefined,
       }),
     ),
   );

@@ -205,10 +205,11 @@ where to start reading, not the extent of its cluster.
   untrusted-framed notice. Everything model-visible is bounded and **sanitized at capture** — the
   registry sanitizes on store and the progress condenser at capture, so records are clean regardless
   of caller — **except `agentName`**, deliberately raw as the registry's name-index key and therefore
-  sanitized at every render; render-time sanitization stays as a backstop for the rest. Dispatch mirrors each session's condensed
-  progress and per-turn usage accumulation into the registry, which makes the registry the single
-  data source for the status panel and drill-down below. Registry addresses, including the stable
-  agent id accepted by `TaskStop` for a checkpoint-retained child, exist only for the originating
+  sanitized at every render; render-time sanitization stays as a backstop for the rest. The scheduler
+  owns admission, `SubagentRegistry` owns dispatch lifecycle and progress, and
+  `BackgroundTaskRegistry` owns task-generation admission and stop data consumed by `TaskOutput` and
+  joined into the status panel. Registry addresses, including the stable agent id accepted by
+  `TaskStop` for a checkpoint-retained child, exist only for the originating
   process lifetime. A **user-initiated stop** (from the panel) is permanent: the record carries the
   marker and `SendMessage` refuses to steer or resume a user-stopped agent — distinct from a model
   `TaskStop`, after which PiCC still allows resume (the divergence is recorded in the capability
@@ -252,7 +253,7 @@ where to start reading, not the extent of its cluster.
 
 - **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
   in `subagents.ts`) — a session-local controller owns threshold sampling, complete-tool-batch
-  stopping, bounded compaction retries, queued-input reconciliation, resume, cancellation, and
+  stopping, one Pi-owned compaction transaction, queued-input reconciliation, resume, cancellation, and
   exhaustion. Operational or hook exhaustion remains recoverable in-session; any post-commit
   restoration, replay, or continuation-start failure is terminal for that session. Clean PiCC-owned tool batches terminate after
   every requested result;
@@ -379,7 +380,7 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
 
 7. **Cycle boundary / compaction / shutdown.** After a complete assistant/tool cycle reaches
    `proactiveCompactPercent`, the session-local controller stops another ordinary request, awaits
-   `ctx.compact()` (or the child SDK equivalent), retries operational failures, and resumes the same
+   one `ctx.compact()` transaction (or the child SDK equivalent), lets Pi own eligible retries inside it, and resumes the same
    logical run only after restoration and queued-input reconciliation. The controller permits its
    own summary request through the provider gate. Mixed, blocked, malformed, or queued tool paths
    abort and settle before compaction; a separate `agent_settled` sample is a non-resuming fallback.
@@ -461,13 +462,12 @@ These are the choices where "close enough" breaks real projects.
   foreground. The residual divergences (notably settlement *timing*) and the upstream evidence for
   them are recorded in the capability registry — do not restate them here.
 
-- **Nested background fan-out is concurrency-bounded, and that diverges from Claude.** Each depth
-  gets its own `concurrency`-sized budget, so the total is bounded by `maxDepth × concurrency` and a
-  parent blocked in `TaskOutput` awaiting a child cannot deadlock against it. Claude's parallel-agent
-  cap is instead a *single global*. The per-depth budget is a deliberately conservative, deadlock-free
-  PiCC choice, **not** parity: it makes nested background **bounded-wait**, not infinite parallelism
-  at every depth. The foreground nested path is left unbounded by behavioral choice — it is
-  parent-blocking and rare — not by deadlock necessity.
+- **Nested background fan-out is concurrency-bounded.** Each depth gets its own
+  `concurrency`-sized budget, so `maxDepth × concurrency` bounds the background pools. This
+  per-depth design lets a parent blocked in `TaskOutput` await a child without competing for the
+  same pool. Foreground nested dispatch bypasses those pools to prevent the corresponding
+  parent/child deadlock, so total active work can exceed that product. The per-depth budget is a
+  deliberately conservative, deadlock-free PiCC choice, **not** Claude Code parity.
 
 - **Deny matches any command segment.** The matcher is shell-operator aware, so a deny like
   `Bash(rm *)` cannot be evaded by chaining (`git status && rm -rf /`) — every segment is matched

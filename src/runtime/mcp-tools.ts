@@ -269,7 +269,7 @@ export function buildMcpProxyTools(runtime: McpToolSource): ToolDefinition[] {
     if (normalized.diagnostic) reportBuilderDiagnostic(normalized.diagnostic);
     const definition: ToolDefinition = {
       name,
-      label: name,
+      label: `${toolName} (${serverName} MCP)`,
       description: info.description,
       parameters: normalized.schema,
       async execute(_toolCallId, params) {

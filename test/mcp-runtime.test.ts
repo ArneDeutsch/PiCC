@@ -201,6 +201,45 @@ describe("McpRuntime stdio lifecycle", () => {
     }
   }, 25_000);
 
+  it("starts and shuts down concurrent benign servers without leaking children or exit listeners", async () => {
+    const firstFixture = createMcpProcessFixture(makeTempDir());
+    const secondFixture = createMcpProcessFixture(makeTempDir());
+    const exitListenerBaseline = process.listenerCount("exit");
+    const runtime = McpRuntime.start(
+      makeConfig(
+        makeServer({ name: "first", args: [firstFixture.serverScript, "serve"], env: firstFixture.env }),
+        makeServer({ name: "second", args: [secondFixture.serverScript, "serve"], env: secondFixture.env }),
+      ),
+      makeDeps(),
+    );
+    try {
+      expect(runtime.tools()).toEqual([]);
+      expect(runtime.serverStates()).toEqual([
+        { name: "first", state: "connecting" },
+        { name: "second", state: "connecting" },
+      ]);
+      await Promise.all([
+        firstFixture.waitFor(["serve.pid"], "first concurrent server to spawn"),
+        secondFixture.waitFor(["serve.pid"], "second concurrent server to spawn"),
+      ]);
+      const pids = [
+        firstFixture.pidOf("serve.pid"),
+        secondFixture.pidOf("serve.pid"),
+      ];
+      expect(pids.every(processIsAlive)).toBe(true);
+      expect(process.listenerCount("exit")).toBe(exitListenerBaseline + 1);
+
+      await runtime.shutdown();
+      await runtime.whenSettled();
+      await Promise.all(pids.map((pid) => waitForDeath(pid, "concurrent server after shutdown")));
+      expect(pids.every(processIsAlive)).toBe(false);
+      expect(process.listenerCount("exit")).toBe(exitListenerBaseline);
+    } finally {
+      await runtime.shutdown();
+      await Promise.all([firstFixture.cleanup(), secondFixture.cleanup()]);
+    }
+  }, 25_000);
+
   it("rejects callTool for unknown servers and unknown tools with descriptive errors", async () => {
     const fixture = createMcpProcessFixture(makeTempDir());
     const runtime = McpRuntime.start(

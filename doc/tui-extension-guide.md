@@ -9,10 +9,10 @@ For the broader integration contracts see [`doc/pi-integration.md`](pi-integrati
 for the module map see [`doc/architecture.md`](architecture.md). This guide is the TUI-specific
 companion to both.
 
-> **Baseline:** the declared and tested Pi `@earendil-works/pi-*` 0.80.10 suite
-> (`package.json` uses `^0.80.10`; the lockfile resolves 0.80.10 exactly). The public extension,
+> **Baseline:** the declared and tested Pi `@earendil-works/pi-*` 0.81.1 suite
+> (`package.json` uses `^0.81.1`; the lockfile resolves 0.81.1 exactly). The public extension,
 > renderer, mode, widget/input, shortcut/message-renderer, and theme declarations below were
-> re-verified against `pi-coding-agent` 0.80.10. Their authoritative declarations are
+> re-verified against `pi-coding-agent` 0.81.1. Their authoritative declarations are
 > `dist/core/extensions/types.d.ts` and `dist/modes/interactive/theme/theme.d.ts`; re-verify them
 > on every Pi upgrade because this is a pre-1.0 surface.
 
@@ -301,8 +301,9 @@ Several dedicated hooks — all low-risk:
   visibility of the "working" row shown during streaming.
 - **`ctx.ui.setStatus(key, text)`** — footer status line (see "Persistent panes and chrome").
 - **Per-tool live progress** — the tool's `onUpdate` callback drives `renderResult(…, { isPartial:
-  true })`. **PiCC already does this** for subagent lifecycle status and API-retry waits
-  (`src/runtime/subagent-progress.ts` → `subagent-render.ts`); bounded structured live detail lives
+  true })`. **PiCC already does this** for subagent lifecycle status, ordinary API retries, and
+  sanitized summary-retry activity (`src/runtime/subagent-progress.ts` → `subagent-render.ts`);
+  bounded structured live detail lives
   in the selected-agent view, not list or tool rows. Copy the pattern for any long tool.
 - **A persistent progress pane** — `setWidget` (see "Persistent panes and chrome"); the subagent
   status panel (`src/runtime/subagent-panel-widget.ts`) is the shipped example, including the

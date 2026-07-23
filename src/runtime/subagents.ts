@@ -22,6 +22,7 @@ import { findByName } from "../project.js";
 import type { BackgroundTaskRegistry, UsageLike } from "./background-tasks.js";
 import type {
   SteerableSession,
+  SubagentAdmission,
   SubagentRegistry,
   SubagentUsage,
 } from "./subagent-registry.js";
@@ -493,16 +494,27 @@ class Semaphore {
   private queue: Array<() => void> = [];
   private active = 0;
   constructor(private readonly limit: number) {}
-  async acquire(): Promise<() => void> {
+  async acquire(onAdmission?: (admission: SubagentAdmission) => void): Promise<() => void> {
+    const notify = (admission: SubagentAdmission) => {
+      try {
+        onAdmission?.(admission);
+      } catch {
+        // Admission observers are metadata-only and never scheduler authority.
+      }
+    };
     if (this.active < this.limit) {
       this.active++;
+      notify("admitted");
       return () => this.release();
     }
     return new Promise((resolve) => {
-      this.queue.push(() => {
+      const waiter = () => {
         this.active++;
+        notify("admitted");
         resolve(() => this.release());
-      });
+      };
+      this.queue.push(waiter);
+      notify("waiting");
     });
   }
   private release() {
@@ -604,6 +616,7 @@ class ChildCheckpointCoordinator {
   private readonly hooks: HookRunnerLike;
   private hookBlocked = false;
   private restorationFailed = false;
+  private summaryCommitted = false;
   private manualRecovery = false;
   private stoppedRunSettled = false;
   private compactOperation: {
@@ -653,7 +666,7 @@ class ChildCheckpointCoordinator {
     this.gate = new MainSessionCheckpointGate(sessionId, threshold);
     this.gate.attachExecution({
       progress: (event) => this.progress(event),
-      compact: (attempt, signal) => this.compact(attempt, signal),
+      compact: (signal) => this.compact(signal),
       resume: (context) => this.resume(context),
     });
   }
@@ -739,7 +752,7 @@ class ChildCheckpointCoordinator {
     if (snapshot.failureCategory === "hook-blocked") {
       return `Automatic context compaction for subagent "${this.agentName}" paused because a PreCompact hook blocked the attempt. The agent is paused and no continuation ran; before this process exits, repair or disable the hook and use SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
     }
-    return `Automatic context compaction for subagent "${this.agentName}" failed after up to three attempts. The agent is paused and no continuation ran; before this process exits, use SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
+    return `Automatic context compaction for subagent "${this.agentName}" could not complete. The agent is paused and no continuation ran; before this process exits, use SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
   }
 
   retain(
@@ -830,12 +843,18 @@ class ChildCheckpointCoordinator {
     }
     this.hookBlocked = false;
     this.restorationFailed = false;
+    this.summaryCommitted = false;
     this.manualRecovery = true;
     try {
       await session.compact();
     } catch (error) {
-      const category = this.hookBlocked ? "PreCompact hook" : "manual compaction";
       void error;
+      if (retained.stopping || this.retained !== retained) throw new Error("checkpoint recovery was cancelled");
+      if (this.summaryCommitted) {
+        await controller.failAfterCommittedSummary(generation);
+        throw new Error(`Compaction committed before recovery failed for subagent "${this.agentName}". Do not compact it again; abandon it with TaskStop using agent id ${this.agentId}, then dispatch a replacement agent with the retained input.`);
+      }
+      const category = this.hookBlocked ? "PreCompact hook" : "manual compaction";
       throw new Error(`${category} failed for recovery attempt on subagent "${this.agentName}". The agent remains paused; retry SendMessage after repairing the cause.`);
     } finally {
       this.manualRecovery = false;
@@ -902,7 +921,7 @@ class ChildCheckpointCoordinator {
     if (generation !== undefined) await controller.checkpoint(generation);
   }
 
-  private async compact(_attempt: number, signal: AbortSignal) {
+  private async compact(signal: AbortSignal) {
     const session = this.session;
     const controller = this.gate.currentController();
     const generation = controller.snapshot().generation;
@@ -910,6 +929,7 @@ class ChildCheckpointCoordinator {
     if (!session?.compact || !token) return { ok: false as const, category: "operational" as const };
     this.hookBlocked = false;
     this.restorationFailed = false;
+    this.summaryCommitted = false;
     const operation = Promise.resolve().then(() => session.compact!());
     const abort = () => {
       try { session.abortCompaction?.(); } catch { /* operation settlement classifies */ }
@@ -918,7 +938,8 @@ class ChildCheckpointCoordinator {
     try {
       let result = await promiseCompactionAttempt(() => operation, signal);
       if (signal.aborted) await operation.catch(() => undefined);
-      if (!result.ok && this.hookBlocked) result = { ok: false, category: "hook-blocked" };
+      if (!result.ok && this.summaryCommitted) result = { ok: false, category: "restoration-paused" };
+      else if (!result.ok && this.hookBlocked) result = { ok: false, category: "hook-blocked" };
       if (result.ok && this.restorationFailed) result = { ok: false, category: "restoration-paused" };
       return result;
     } finally {
@@ -1055,6 +1076,8 @@ class ChildCheckpointCoordinator {
           ? operation.controller.snapshot().phase === "idle"
           : this.manualRecovery);
     if (!isCurrent()) return;
+    this.summaryCommitted = true;
+    if (operation.proactive) operation.controller.observeCompactionCommit(operation.generation);
     try {
       let universalStop = false;
       let startedContext = "";
@@ -1135,17 +1158,12 @@ class ChildCheckpointCoordinator {
   private progress(event: CheckpointProgress): void {
     const controller = this.gate.currentController();
     if (this.gate.isLogicalRunStopped() && this.gate.stoppedRunMatches(controller, event.generation)) return;
-    const activity = event.category === "checkpoint-retrying"
-      ? `checkpoint retry ${Math.min((event.attempt ?? 1) + 1, 3)}/3`
-      : event.category === "checkpoint-exhausted"
-        ? "checkpoint paused: recovery required"
-        : event.category === "checkpoint-recovered"
-          ? "checkpoint recovered: resuming"
-          : `checkpoint: ${event.category}`;
+    const activity = event.category === "checkpoint-exhausted"
+      ? "checkpoint paused: recovery required"
+      : event.category === "checkpoint-recovered"
+        ? "checkpoint recovered: resuming"
+        : `checkpoint: ${event.category}`;
     this.emitProgress?.({ tail: [activity], activity });
-    if (event.category === "checkpoint-retrying") {
-      this.diagnostics.push({ severity: "warning", message: `subagent context compaction retry ${Math.min((event.attempt ?? 1) + 1, 3)} of 3` });
-    }
     if (event.category === "checkpoint-exhausted") {
       this.diagnostics.push({ severity: "warning", message: this.failureMessage() });
     }
@@ -1172,9 +1190,10 @@ export class SubagentRuntime {
    * a slot in pool `d`, e.g. while blocked in a `TaskOutput(wait)` on a child)
    * never holds the slot a descendant at depth `d+1` is waiting on — no cross-depth
    * wait-for cycle, hence deadlock-free even at `concurrency = 1`. A single shared
-   * pool would deadlock exactly there (see the acquire gate comment). Total nested
-   * concurrency is bounded by `maxDepth × concurrency`, both finite. Depth ≤ 1
-   * stays on the existing root `semaphore` so root behaviour/tests are unchanged.
+   * pool would deadlock exactly there (see the acquire gate comment). The background
+   * pools are bounded by `maxDepth × concurrency`; foreground nested dispatch bypasses
+   * them, so total active work can be higher. Depth ≤ 1 stays on the existing root
+   * `semaphore` so root behaviour/tests are unchanged.
    */
   private readonly nestedBudgets = new Map<number, Semaphore>();
   private sdkPromise: Promise<PiSdk> | undefined;
@@ -1361,6 +1380,8 @@ export class SubagentRuntime {
      * Requires the session to expose `subscribe`; a no-op when it does not.
      */
     onProgress?: (snapshot: ProgressSnapshot) => void;
+    /** Runtime-only concurrency admission sink for task-record mirroring. */
+    onAdmission?: (admission: SubagentAdmission) => void;
     /** Opaque dispatcher-run stop authority captured before the Agent tool awaits. */
     captureUniversalStop?: () => boolean;
     /**
@@ -1606,7 +1627,7 @@ export class SubagentRuntime {
         agentId,
         resumable: false,
         agentName: agent.name,
-        error: `Subagent nesting depth ${opts.depth} exceeds the configured maximum (subagents.maxDepth) of ${this.deps.maxDepth}. Raise subagents.maxDepth to 2..5 in .claude/settings.json to allow nested delegation.`,
+        error: `Subagent nesting depth ${opts.depth} exceeds the configured maximum (subagents.maxDepth) of ${this.deps.maxDepth}. Set subagents.maxDepth to a larger positive integer in .claude/settings.json to allow nested delegation.`,
         diagnostics,
       };
     }
@@ -1801,9 +1822,13 @@ export class SubagentRuntime {
     //     cycle → deadlock-free even at concurrency 1.
     // Root (`depth ≤ 1`) always acquires its own (root) pool, exactly as before.
     const foregroundNested = opts.depth > 1 && !opts.background;
+    const noteAdmission = (admission: SubagentAdmission) => {
+      try { this.deps.subagentRegistry?.noteAdmission(agentId, admission); } catch { /* metadata only */ }
+      try { opts.onAdmission?.(admission); } catch { /* metadata only */ }
+    };
     const release = foregroundNested
-      ? () => {}
-      : await this.budgetForDepth(opts.depth).acquire();
+      ? (noteAdmission("admitted"), () => {})
+      : await this.budgetForDepth(opts.depth).acquire(noteAdmission);
     let worktreePath: string | undefined;
     let session: PiSession | undefined;
     let dispatchCwd: CwdState | undefined;
@@ -2880,7 +2905,7 @@ export function createAgentToolDefinition(
     name: opts.name ?? "Agent",
     label: "Agent",
     description:
-      "Launch a subagent to handle a task. Pick subagent_type from the 'Available subagents' catalog by matching the task to the agent descriptions (omit it for a general-purpose agent). Subagents run in the background by default: the call returns a task id immediately and runs concurrently with any other dispatch in this turn, so collect the result with TaskOutput before you rely on it or finalize an answer. If the latest task generation for an agent settles and remains uncollected and unnotified when a later interactive turn starts, it gets one bounded notice; a running TaskOutput poll preserves eligibility, while terminal collection suppresses a not-yet-sent notice. Pass run_in_background: false for a synchronous run that blocks this turn and returns the subagent's final message verbatim inline.",
+      "Launch a subagent to handle a task. Pick subagent_type from the 'Available subagents' catalog by matching the task to the agent descriptions (omit it for a general-purpose agent). Background by default: work is accepted immediately and runs when configured concurrency capacity is available; collect its result with TaskOutput before you rely on it or finalize an answer. CLAUDE_CODE_DISABLE_BACKGROUND_TASKS is the exception: it forces dispatches to run in the foreground. If the latest task generation for an agent settles and remains uncollected and unnotified when a later interactive turn starts, it gets one bounded notice; a running TaskOutput poll preserves eligibility, while terminal collection suppresses a not-yet-sent notice. Pass run_in_background: false for a synchronous run that blocks this turn and returns the subagent's final message verbatim inline.",
     parameters: Type.Object({
       subagent_type: Type.String({ description: "Name of the agent to dispatch" }),
       prompt: Type.String({ description: "The task for the subagent" }),
@@ -2890,7 +2915,7 @@ export function createAgentToolDefinition(
       run_in_background: Type.Optional(
         Type.Boolean({
           description:
-            "Background is the default: omit (or pass true) to background the dispatch — it returns a task id immediately, to be collected with TaskOutput. The latest generation gets one bounded later-interactive-turn notice only if it settles and remains uncollected and unnotified; a running poll preserves eligibility, while terminal collection suppresses a not-yet-sent notice. Pass false for a synchronous run that blocks this turn and returns the final message inline.",
+            "Background is the default: omit (or pass true) to accept the dispatch immediately; it runs when configured concurrency capacity is available and returns a task id to collect with TaskOutput. CLAUDE_CODE_DISABLE_BACKGROUND_TASKS is the exception and forces foreground execution. The latest generation gets one bounded later-interactive-turn notice only if it settles and remains uncollected and unnotified; a running poll preserves eligibility, while terminal collection suppresses a not-yet-sent notice. Pass false for a synchronous run that blocks this turn and returns the final message inline.",
         }),
       ),
       description: Type.Optional(
@@ -3009,6 +3034,7 @@ export function createAgentToolDefinition(
         // TaskOutput shows the background subagent is alive. `taskId` is assigned
         // synchronously by start() below, long before any event fires.
         let taskId: string | undefined;
+        let admission: SubagentAdmission = "admitted";
         // Hand the whole condensed snapshot to noteProgress, which stores it,
         // derives lastActivity, and fans out to any waiting TaskOutput subscriber.
         const onProgress = (snapshot: ProgressSnapshot) => {
@@ -3025,6 +3051,10 @@ export function createAgentToolDefinition(
             agentId,
             abortSignal: controller.signal,
             onProgress,
+            onAdmission: (next) => {
+              admission = next;
+              if (taskId) registry.noteAdmission(taskId, next);
+            },
           }),
           async () => {
             controller.abort();
@@ -3037,6 +3067,7 @@ export function createAgentToolDefinition(
           // exactly the tasks that dispatcher started.
           opts.ownerAgentId,
           description,
+          admission,
         );
         taskId = id;
         // Identity-at-start: the agent id appears for EVERY background
@@ -3046,7 +3077,7 @@ export function createAgentToolDefinition(
           content: [
             {
               type: "text",
-              text: `Background task ${id} started (agent: ${label}, agent id: ${agentId}). Use TaskOutput with task_id "${id}" to retrieve the result before finalizing.`,
+              text: `Background task ${id} accepted (agent: ${label}, agent id: ${agentId}); it will run when configured concurrency capacity is available. Use TaskOutput with task_id "${id}" to retrieve the result before finalizing.`,
             },
           ],
           details: {
@@ -3054,6 +3085,7 @@ export function createAgentToolDefinition(
             taskId: id,
             agent: label,
             agentId,
+            admission,
             description,
           } satisfies SubagentRenderDetails,
         };
@@ -3213,7 +3245,7 @@ export function createSendMessageToolDefinition(
     name: "SendMessage",
     label: "SendMessage",
     description:
-      "Send a follow-up message to a subagent you previously dispatched. Address it by its agent id (agent-…) or name (`to`). A finished subagent resumes in the background under the same id with its full prior context; a still-running background subagent receives the message as a mid-task course correction. Ordinarily this returns an acknowledgment and a resumed run's result arrives via TaskOutput. Checkpoint-paused exception: the awaited call recovers the retained agent and returns its result directly, with no TaskOutput or new task generation.",
+      "Send a follow-up message to a subagent you previously dispatched. Address it by its agent id (agent-…) or name (`to`). A finished subagent resume is accepted in the background and runs when configured concurrency capacity is available; only a still-running, admitted, steerable background subagent receives the message as a mid-task course correction. Ordinarily this returns an acknowledgment and a resumed run's result arrives via TaskOutput. Checkpoint-paused exception: the awaited call recovers the retained agent and returns its result directly, with no TaskOutput or new task generation.",
     parameters: Type.Object({
       to: Type.String({
         description: "Agent id (e.g. agent-3fa9c2d1b4e5) or the agent name from a prior dispatch",
@@ -3352,6 +3384,7 @@ export function createSendMessageToolDefinition(
       opts.registry.markResuming(record.agentId);
       const controller = new AbortController();
       let taskId: string | undefined;
+      let admission: SubagentAdmission = "admitted";
       const onProgress = (snapshot: ProgressSnapshot) => {
         if (taskId) opts.backgroundTasks.noteProgress(taskId, snapshot);
       };
@@ -3381,6 +3414,10 @@ export function createSendMessageToolDefinition(
           },
           abortSignal: controller.signal,
           onProgress,
+          onAdmission: (next) => {
+            admission = next;
+            if (taskId) opts.backgroundTasks.noteAdmission(taskId, next);
+          },
         }),
         async () => {
           controller.abort();
@@ -3390,6 +3427,7 @@ export function createSendMessageToolDefinition(
         agentLabel,
         undefined,
         record.description,
+        admission,
       );
       taskId = id;
       const identity = formatBackgroundTaskIdentity(id, record.agentName, record.agentId);
@@ -3397,13 +3435,14 @@ export function createSendMessageToolDefinition(
         content: [
           {
             type: "text",
-            text: `${identity} — resume started in background with prior context; result pending. Retrieve it with TaskOutput (task_id "${id}").`,
+            text: `${identity} — resume accepted in background with prior context; it will run when configured concurrency capacity is available. Retrieve it with TaskOutput (task_id "${id}").`,
           },
         ],
         details: {
           agentId: record.agentId,
           agent: record.agentName,
           taskId: id,
+          admission,
           description: record.description,
           delivery: "resume",
           resumed: true,

@@ -24,6 +24,7 @@ import { SubagentRegistry } from "./runtime/subagent-registry.js";
 import type { SubagentRegistryRecord } from "./runtime/subagent-registry.js";
 import {
   createPanelHintEmitter,
+  panelAgentCounts,
   PANEL_ENTRY_CHORD,
   SubagentPanelWidgetController,
 } from "./runtime/subagent-panel-widget.js";
@@ -277,6 +278,10 @@ export interface PiccTestSeam {
     render?: typeof renderMcpStatusReport;
     writeText?: (output: string) => void | Promise<void>;
   };
+  /** TEST-ONLY managed settings locations passed directly to project loading. */
+  managedSettingsPaths?: string[];
+  /** TEST-ONLY managed artifact directories passed directly to project loading. */
+  managedArtifactDirs?: string[];
 }
 
 const codexProviderRegistries = new WeakSet<object>();
@@ -329,6 +334,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     project = loadClaudeProject({
       cwd: process.cwd(),
       userDir: process.env.PICC_CLAUDE_USER_DIR || undefined,
+      ...(testSeam?.managedSettingsPaths
+        ? { managedSettingsPaths: testSeam.managedSettingsPaths }
+        : {}),
+      ...(testSeam?.managedArtifactDirs
+        ? { managedArtifactDirs: testSeam.managedArtifactDirs }
+        : {}),
     });
   } catch (err) {
     // Completeness floor: a broken project must never crash the harness.
@@ -446,6 +457,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     generation: number;
     hookBlocked: boolean;
     operation?: object;
+    committed: boolean;
     restorationFailed: boolean;
   } | undefined;
   let activeMainResume: {
@@ -664,6 +676,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const subagentPanel = new SubagentPanelWidgetController({
     registry: subagentRegistry,
     tasks: panelTaskJoin,
+    onTasksChange: (listener) => backgroundTasks.onChange(listener),
     // Lazy closure over the focus controller declared just below: the widget
     // reads dismissals only at view time (session_start and later), never
     // during construction.
@@ -674,6 +687,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const subagentPanelFocus = new SubagentPanelFocusController({
     registry: subagentRegistry,
     tasks: panelTaskJoin,
+    onTasksChange: (listener) => backgroundTasks.onChange(listener),
     stopTask: (taskId) => {
       backgroundTasks.markUserStopped(taskId);
     },
@@ -688,7 +702,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     });
   }
   // One-time status-line hint (ui.notify) advertising the chord, emitted only
-  // once >1 agent runs concurrently in a TUI session (the ui handle is
+  // once >1 agent is admitted or waiting in a TUI session (the ui handle is
   // captured at session_start).
   let panelHintUi: any;
   const emitPanelHint = createPanelHintEmitter({
@@ -696,11 +710,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     isTui: () => panelHintUi !== undefined,
     emit: (text) => panelHintUi?.notify?.(text, "info"),
   });
-  subagentRegistry.onChange(() => {
-    let running = 0;
-    for (const record of subagentRegistry.list()) if (record.state === "running") running++;
-    emitPanelHint(running);
-  });
+  const refreshPanelHint = (): void => {
+    emitPanelHint(panelAgentCounts(subagentRegistry.list(), panelTaskJoin()));
+  };
+  subagentRegistry.onChange(refreshPanelHint);
+  backgroundTasks.onChange(refreshPanelHint);
   // Built-in agent types: general-purpose/Explore/Plan, appended AFTER
   // project/user/plugin agents so a same-named project agent wins (an
   // overridden built-in is dropped from the catalog — dispatch resolves the
@@ -1027,7 +1041,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const checkpointText = (event: CheckpointProgress): string => {
     switch (event.category) {
       case "checkpoint-armed": return "Pausing for proactive context compaction.";
-      case "checkpoint-retrying": return `Context compaction failed; retrying (attempt ${Math.min((event.attempt ?? 1) + 1, 3)} of 3).`;
       case "checkpoint-complete": return event.action === "settled-fallback"
         ? "Context compaction completed."
         : "Context compacted; reconnecting the paused work.";
@@ -1126,7 +1139,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         category: event.category,
         generation: event.generation,
         notice: text,
-        ...(event.attempt === undefined ? {} : { attempt: event.attempt }),
         ...(event.action === undefined ? {} : { action: event.action }),
         ...(event.failureCategory === undefined ? {} : { failureCategory: event.failureCategory }),
         ...(event.category === "checkpoint-exhausted" ? {
@@ -1150,7 +1162,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   mainCheckpointGate.attachExecution({
     progress: publishCheckpoint,
-    compact: async (_attempt, signal) => {
+    compact: async (signal) => {
       const ctx = checkpointContext;
       const epoch = checkpointSessionEpoch;
       const controller = mainCheckpointGate.currentController();
@@ -1165,6 +1177,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         generation,
         hookBlocked: false,
         operation: undefined as object | undefined,
+        committed: false,
         restorationFailed: false,
       };
       checkpointAttempt = attempt;
@@ -1175,30 +1188,36 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       try {
         return await callbackCompactionAttempt(generation, (_token, complete) => {
           ctx.compact({
-            onComplete: () => complete(_token, attempt.restorationFailed
-              ? { ok: false, category: "restoration-paused" }
-              : epoch !== checkpointSessionEpoch || controller !== mainCheckpointGate.currentController()
-                ? { ok: false, category: "stale-generation" }
-                : { ok: true }),
+            onComplete: () => {
+              const stale = epoch !== checkpointSessionEpoch || controller !== mainCheckpointGate.currentController();
+              complete(_token, attempt.committed && (attempt.restorationFailed || stale || signal.aborted)
+                ? { ok: false, category: "restoration-paused" }
+                : attempt.restorationFailed
+                  ? { ok: false, category: "restoration-paused" }
+                  : stale
+                    ? { ok: false, category: "stale-generation" }
+                    : { ok: true });
+            },
             onError: (error: unknown) => {
               let hostCancelled = false;
               try {
                 hostCancelled = error instanceof Error &&
                   (error.name === "AbortError" || error.message === "Compaction cancelled");
               } catch { /* hostile error objects classify as operational */ }
-              // A failed physical attempt has no session_compact event to release
-              // its lifecycle identity. Release only this attempt's identity so a
-              // bounded retry can enter without weakening another in-flight compact.
+              // A failed transaction has no session_compact event to release its
+              // lifecycle identity. Release only this operation's identity.
               if (activeCompactionOperation?.identity === attempt.operation) {
                 activeCompactionOperation = undefined;
               }
               complete(_token, {
                 ok: false,
-                category: checkpointAttempt === attempt && attempt.hookBlocked
-                  ? "hook-blocked"
-                  : signal.aborted || epoch !== checkpointSessionEpoch || hostCancelled
-                    ? "cancelled"
-                    : "operational",
+                category: attempt.committed
+                  ? "restoration-paused"
+                  : checkpointAttempt === attempt && attempt.hookBlocked
+                    ? "hook-blocked"
+                    : signal.aborted || epoch !== checkpointSessionEpoch || hostCancelled
+                      ? "cancelled"
+                      : "operational",
               });
             },
           });
@@ -1637,7 +1656,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           const routineRendered = withRoutineToolRendering(proxy);
           const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
           pi.registerTool(mainCheckpointGate.wrapTool(
-            wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
+            wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>, {
+              fallbackCallDisplayName: proxy.label,
+            }),
           ));
         } catch (err) {
           console.error(`PiCC: failed to register MCP tool "${proxy.name}": ${(err as Error).message}`);
@@ -1976,18 +1997,20 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       const inputDisposition = mainCheckpointGate.ordinaryInputDisposition();
       if (inputDisposition === "reject-recoverable" || inputDisposition === "reject-restoration" ||
           inputDisposition === "reject-closed" || inputDisposition === "reject-stopped") {
+        const controller = mainCheckpointGate.currentController();
         const text = inputDisposition === "reject-recoverable"
           ? "Work remains paused. Run /compact, then explicitly continue."
           : inputDisposition === "reject-restoration"
             ? "The compacted summary is committed, but restoration or continuation failed. Do not compact it again; start a new session and resend the retained input."
             : inputDisposition === "reject-stopped"
               ? "The stopped run is still terminating. Wait for it to settle before sending another prompt."
-              : "The prior checkpoint was cancelled. Run /compact to recover this session, or start a new session.";
+              : controller.manualCompactionDisposition() === "allow"
+                ? "The prior checkpoint was cancelled. Run /compact to recover this session, or start a new session."
+                : "Checkpoint cancellation is still settling. Wait before sending another prompt or attempting recovery.";
         try {
           if (ctx.mode === "print") console.error(`PiCC: ${text}`);
           else if (ctx.mode === "tui") ctx.ui?.notify?.(text, "warning");
         } catch { /* admission was already decided */ }
-        const controller = mainCheckpointGate.currentController();
         const content = Array.isArray(event.images) && event.images.length > 0
           ? [{ type: "text", text: String(event.text ?? "") }, ...event.images]
           : String(event.text ?? "");
@@ -2486,18 +2509,26 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (!operation) return;
     const { controller, generation, proactive, trigger, epoch } = operation;
     const attempt = checkpointAttempt;
-    const isCurrent = () => operation === activeCompactionOperation && epoch === checkpointSessionEpoch &&
+    const operationMatches = () => operation === activeCompactionOperation && epoch === checkpointSessionEpoch &&
       controller === mainCheckpointGate.currentController() && controller.snapshot().generation === generation &&
       (proactive
-        ? controller.isCompactionSummaryActive(generation) &&
-          attempt?.operation === operation.identity && attempt.controller === controller
+        ? attempt?.operation === operation.identity && attempt.controller === controller && attempt.generation === generation
         : operation.recovery
           ? operation.recovery === controller.recoveryToken(generation)
           : controller.snapshot().phase === "idle");
-    if (!isCurrent()) {
+    if (!operationMatches()) {
       if (activeCompactionOperation === operation) activeCompactionOperation = undefined;
       return;
     }
+    if (proactive && attempt) {
+      attempt.committed = true;
+      controller.observeCompactionCommit(generation);
+    }
+    const isCurrent = () => operationMatches() && (proactive
+      ? attempt?.committed === true || controller.isCompactionSummaryActive(generation)
+      : operation.recovery
+        ? operation.recovery === controller.recoveryToken(generation)
+        : controller.snapshot().phase === "idle");
 
     let restorationFailed = false;
     let universalStop = false;

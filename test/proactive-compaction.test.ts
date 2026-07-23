@@ -129,18 +129,15 @@ describe("MidRunCompactionController", () => {
     expect(controller.isCheckpointAbort(generation)).toBe(true);
   });
 
-  it("retries operational failure three times with bounded backoff", async () => {
-    const attempts: number[] = [];
-    const backoffs: number[] = [];
+  it("delegates one operational compaction transaction and pauses on failure", async () => {
+    let compactions = 0;
     const controller = createController({
       sessionId: "s", threshold: 90,
-      compact: async (attempt) => { attempts.push(attempt); return attempt < 3 ? { ok: false, category: "operational" } : { ok: true }; },
-      delay: async (milliseconds) => { backoffs.push(milliseconds); },
+      compact: async () => { compactions += 1; return { ok: false, category: "operational" }; },
     });
     await controller.checkpoint(controller.sample(usage(90), "settled")!);
-    expect(attempts).toEqual([1, 2, 3]);
-    expect(backoffs).toEqual([25, 100]);
-    expect(controller.snapshot().phase).toBe("idle");
+    expect(compactions).toBe(1);
+    expect(controller.snapshot().phase).toBe("exhausted");
   });
 
   it.each(["hook-blocked", "stale-generation"] as const)("exhausts without retry for %s", async (category) => {
@@ -162,7 +159,7 @@ describe("MidRunCompactionController", () => {
   it("retains exhaustion input under a generation-bound recovery token", async () => {
     const controller = createController({
       sessionId: "s", threshold: 90, compact: async () => ({ ok: false, category: "operational" }),
-      delay: async () => undefined, resume: () => owned(),
+      resume: () => owned(),
     });
     const { generation, handle } = arm(controller);
     controller.completeToolBatch(handle);
@@ -239,20 +236,15 @@ describe("MidRunCompactionController", () => {
     expect(controller.snapshot()).toMatchObject({ phase: "exhausted", queuedInputs: 1 });
   });
 
-  it.each(["compacting", "backoff"] as const)("cancellation during %s joins active work", async (phase) => {
+  it("cancellation during the delegated compaction joins active work", async () => {
     const compactGate = deferred<void>();
     const controller = createController({
       sessionId: "s", threshold: 90,
-      compact: phase === "compacting"
-        ? (_attempt, signal) => promiseCompactionAttempt(() => compactGate.promise, signal)
-        : async () => ({ ok: false, category: "operational" }),
-      delay: (_milliseconds, signal) => new Promise<void>((_resolve, reject) => {
-        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-      }),
+      compact: (signal) => promiseCompactionAttempt(() => compactGate.promise, signal),
     });
     const generation = controller.sample(usage(90), "settled")!;
     const stable = controller.checkpoint(generation);
-    await waitUntil({ description: `controller ${phase}`, predicate: () => controller.snapshot().phase === phase });
+    await waitUntil({ description: "controller compaction", predicate: () => controller.snapshot().phase === "compacting" });
     const cancellation = controller.cancel(generation, "user");
     await stable;
     await expect(cancellation).resolves.toEqual({ cancelled: true, rejected: [] });
@@ -1031,7 +1023,7 @@ describe("MainSessionCheckpointGate", () => {
     const { controller, gate } = setup();
     let compactCalls = 0;
     gate.attachExecution({
-      compact: async (_attempt, _signal) => {
+      compact: async (_signal) => {
         compactCalls += 1;
         const generation = controller.snapshot().generation;
         const token = controller.beginCompactionSummary(generation)!;
@@ -1913,7 +1905,105 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation")).toBe(false);
   });
 
-  it("retries callback failures three times and leaves print recovery persisted on exhaustion", async () => {
+  it(
+    "joins main logical cancellation and lets commit dominate onError plus stale onComplete",
+    async () => {
+      await mainCheckpointGate.startSession("main-late-commit-callbacks");
+      pi.compactCalls.length = 0;
+      pi.entries.length = 0;
+      pi.messages.length = 0;
+      const scheduled = deferred<void>();
+      const releaseCommit = deferred<void>();
+      const commitHandled = deferred<void>();
+      const releaseCallback = deferred<void>();
+      const ctx = pi.ctx({
+        mode: "tui",
+        hasUI: true,
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        compact: (options: any) => {
+          pi.compactCalls.push(options);
+          void (async () => {
+            const before = await pi.fire("session_before_compact", { reason: "manual" }, ctx);
+            if (before?.cancel) return options.onError(new Error("unexpected pre-commit cancellation"));
+            scheduled.resolve();
+            await releaseCommit.promise;
+            await pi.fire("session_compact", {
+              reason: "manual", compactionEntry: { summary: "committed after logical cancellation" },
+            }, ctx);
+            commitHandled.resolve();
+            await releaseCallback.promise;
+            options.onError(new Error("private late callback failure"));
+            options.onComplete({ summary: "stale callback completion" });
+          })();
+        },
+      });
+
+      let checkpointSettled = false;
+      const checkpoint = pi.fire("agent_settled", {}, ctx).then(() => { checkpointSettled = true; });
+      await scheduled.promise;
+      const controller = mainCheckpointGate.currentController();
+      let barrierSettled = false;
+      const barrier = controller.stableBarrier(controller.snapshot().generation).then(() => { barrierSettled = true; });
+      let cancellationSettled = false;
+      const cancellation = mainCheckpointGate.cancel("user").then((outcome) => {
+        cancellationSettled = true;
+        return outcome;
+      });
+      await Promise.resolve();
+      expect(cancellationSettled).toBe(false);
+      expect(checkpointSettled).toBe(false);
+      expect(barrierSettled).toBe(false);
+      expect(pi.entries.some((entry) => entry.data.category === "checkpoint-cancelled")).toBe(false);
+      await expect(pi.fire("input", {
+        text: "ordinary request must stay blocked", source: "interactive", streamingBehavior: "steer",
+      }, ctx)).resolves.toEqual({ action: "handled" });
+      const preCommitNotices = pi.notifications.splice(0);
+      expect(preCommitNotices.some(({ text }) => text.includes("still settling"))).toBe(true);
+      expect(preCommitNotices.every(({ text }) => !text.includes("/compact"))).toBe(true);
+
+      releaseCommit.resolve();
+      await commitHandled.promise;
+      await Promise.resolve();
+      expect(cancellationSettled).toBe(false);
+      expect(checkpointSettled).toBe(false);
+      expect(barrierSettled).toBe(false);
+      expect(controller.snapshot().phase).toBe("cancelled");
+      expect(controller.recoveryToken(controller.snapshot().generation)).toBeUndefined();
+      expect(controller.manualCompactionDisposition()).toBe("unavailable");
+      expect(pi.entries.some((entry) => entry.data.category === "checkpoint-cancelled")).toBe(false);
+      expect(pi.entries.some((entry) => entry.data.category === "checkpoint-exhausted")).toBe(false);
+      expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation")).toBe(false);
+      await expect(pi.fire("input", {
+        text: "still blocked after commit", source: "interactive", streamingBehavior: "steer",
+      }, ctx)).resolves.toEqual({ action: "handled" });
+      const postCommitNotices = pi.notifications.splice(0);
+      expect(postCommitNotices.some(({ text }) => text.includes("still settling"))).toBe(true);
+      expect(postCommitNotices.every(({ text }) => !text.includes("/compact"))).toBe(true);
+
+      releaseCallback.resolve();
+      await expect(cancellation).resolves.toMatchObject({ cancelled: true });
+      await checkpoint;
+      await barrier;
+      await Promise.resolve();
+
+      expect(pi.compactCalls).toHaveLength(1);
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+      });
+      expect(controller.recoveryToken(controller.snapshot().generation)).toBeUndefined();
+      expect(controller.manualCompactionDisposition()).toBe("unavailable");
+      expect(pi.entries.some((entry) => entry.data.category === "checkpoint-cancelled")).toBe(false);
+      expect(pi.entries.find((entry) => entry.data.category === "checkpoint-exhausted")?.data)
+        .toMatchObject({ action: "new-session", failureCategory: "restoration-paused" });
+      expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation")).toBe(false);
+      expect(JSON.stringify(pi.entries)).not.toContain("private late callback failure");
+      await expect(pi.fire("session_before_compact", { reason: "manual" }, ctx))
+        .resolves.toEqual({ cancel: true });
+    },
+  );
+
+  it("pauses after one failed callback transaction and leaves print recovery persisted", async () => {
     await mainCheckpointGate.startSession("main-exhaustion");
     pi.compactCalls.length = 0;
     pi.entries.length = 0;
@@ -1936,8 +2026,8 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     });
     await pi.fire("session_start", { reason: "startup" }, ctx);
     await pi.fire("agent_settled", {}, ctx);
-    expect(pi.compactCalls).toHaveLength(3);
-    expect(enteredOperations).toBe(3);
+    expect(pi.compactCalls).toHaveLength(1);
+    expect(enteredOperations).toBe(1);
     expect(mainCheckpointGate.currentController().snapshot().phase).toBe("exhausted");
     const failure = pi.entries.find((entry) =>
       entry.customType === "picc-checkpoint-lifecycle" && entry.data.category === "checkpoint-exhausted");
@@ -2185,12 +2275,17 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(outerDone).toBe(true);
   });
 
-  it("replacement aborts outstanding host compaction and suppresses stale post-commit hooks", async () => {
+  it("replacement joins authenticated late commit handling before callback settlement", async () => {
     await mainCheckpointGate.startSession("replacement-host-compact");
-    fs.rmSync(path.join(dir, ".claude", ".compact-trace"), { force: true });
-    const release = deferred<void>();
+    pi.entries.length = 0;
+    pi.messages.length = 0;
+    const started = deferred<void>();
+    const releaseCommit = deferred<void>();
+    const commitHandled = deferred<void>();
+    const releaseCallback = deferred<void>();
     let aborts = 0;
-    const ctx = pi.printCtx({
+    const ctx = pi.ctx({
+      mode: "json",
       model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       abort: () => { aborts += 1; },
@@ -2200,19 +2295,23 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
             reason: "manual", customInstructions: undefined,
           }, ctx);
           if (before?.cancel) return options.onError(new Error("cancelled"));
-          await release.promise;
+          started.resolve();
+          await releaseCommit.promise;
           await pi.fire("session_compact", {
             reason: "manual", compactionEntry: { summary: "summary" },
           }, ctx);
+          commitHandled.resolve();
+          await releaseCallback.promise;
           options.onComplete({ summary: "summary" });
         })();
       },
     });
-    const settlement = pi.fire("agent_settled", {}, ctx);
-    await waitUntil({
-      description: "host compact before replacement",
-      predicate: () => fs.existsSync(path.join(dir, ".claude", ".compact-trace")),
-    });
+    let settlementDone = false;
+    const settlement = pi.fire("agent_settled", {}, ctx).then(() => { settlementDone = true; });
+    await started.promise;
+    const oldController = mainCheckpointGate.currentController();
+    let barrierSettled = false;
+    const barrier = oldController.stableBarrier(oldController.snapshot().generation).then(() => { barrierSettled = true; });
     let switched = false;
     const switching = pi.fire("session_before_switch", {}, ctx).then((value) => {
       switched = true;
@@ -2221,12 +2320,40 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await Promise.resolve();
     expect(aborts).toBe(1);
     expect(switched).toBe(false);
+    expect(settlementDone).toBe(false);
+    expect(barrierSettled).toBe(false);
+    expect(pi.entries.some((entry) => entry.data.category === "checkpoint-cancelled")).toBe(false);
 
-    release.resolve();
+    releaseCommit.resolve();
+    await commitHandled.promise;
+    await Promise.resolve();
+    expect(switched).toBe(false);
+    expect(settlementDone).toBe(false);
+    expect(barrierSettled).toBe(false);
+    expect(oldController.snapshot().phase).toBe("cancelled");
+    expect(oldController.recoveryToken(oldController.snapshot().generation)).toBeUndefined();
+    expect(oldController.manualCompactionDisposition()).toBe("unavailable");
+    expect(pi.entries.some((entry) => entry.data.category === "checkpoint-cancelled")).toBe(false);
+    expect(pi.entries.some((entry) => entry.data.category === "checkpoint-exhausted")).toBe(false);
+    expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation")).toBe(false);
+    await expect(pi.fire("input", {
+      text: "replacement-pending work", source: "interactive", streamingBehavior: "steer",
+    }, ctx)).resolves.toEqual({ action: "handled" });
+
+    releaseCallback.resolve();
     await expect(switching).resolves.toBeUndefined();
     await settlement;
-    expect(fs.readFileSync(path.join(dir, ".claude", ".compact-trace"), "utf8").trim().split(/\s+/))
-      .toEqual(["pre"]);
+    await barrier;
+    await Promise.resolve();
+    expect(oldController.snapshot()).toMatchObject({
+      phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+    });
+    expect(oldController.recoveryToken(oldController.snapshot().generation)).toBeUndefined();
+    expect(oldController.manualCompactionDisposition()).toBe("unavailable");
+    expect(pi.entries.some((entry) => entry.data.category === "checkpoint-cancelled")).toBe(false);
+    expect(pi.entries.find((entry) => entry.data.category === "checkpoint-exhausted")?.data)
+      .toMatchObject({ action: "new-session", failureCategory: "restoration-paused" });
+    expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation")).toBe(false);
   });
 
   it("session lifecycle events reject old shadows and install a fresh controller", async () => {
