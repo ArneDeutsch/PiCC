@@ -435,6 +435,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     generation: number;
     hookBlocked: boolean;
     operation?: object;
+    committed: boolean;
     restorationFailed: boolean;
   } | undefined;
   let activeMainResume: {
@@ -1018,7 +1019,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const checkpointText = (event: CheckpointProgress): string => {
     switch (event.category) {
       case "checkpoint-armed": return "Pausing for proactive context compaction.";
-      case "checkpoint-retrying": return `Context compaction failed; retrying (attempt ${Math.min((event.attempt ?? 1) + 1, 3)} of 3).`;
       case "checkpoint-complete": return event.action === "settled-fallback"
         ? "Context compaction completed."
         : "Context compacted; reconnecting the paused work.";
@@ -1117,7 +1117,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         category: event.category,
         generation: event.generation,
         notice: text,
-        ...(event.attempt === undefined ? {} : { attempt: event.attempt }),
         ...(event.action === undefined ? {} : { action: event.action }),
         ...(event.failureCategory === undefined ? {} : { failureCategory: event.failureCategory }),
         ...(event.category === "checkpoint-exhausted" ? {
@@ -1141,7 +1140,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   mainCheckpointGate.attachExecution({
     progress: publishCheckpoint,
-    compact: async (_attempt, signal) => {
+    compact: async (signal) => {
       const ctx = checkpointContext;
       const epoch = checkpointSessionEpoch;
       const controller = mainCheckpointGate.currentController();
@@ -1156,6 +1155,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         generation,
         hookBlocked: false,
         operation: undefined as object | undefined,
+        committed: false,
         restorationFailed: false,
       };
       checkpointAttempt = attempt;
@@ -1166,30 +1166,36 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       try {
         return await callbackCompactionAttempt(generation, (_token, complete) => {
           ctx.compact({
-            onComplete: () => complete(_token, attempt.restorationFailed
-              ? { ok: false, category: "restoration-paused" }
-              : epoch !== checkpointSessionEpoch || controller !== mainCheckpointGate.currentController()
-                ? { ok: false, category: "stale-generation" }
-                : { ok: true }),
+            onComplete: () => {
+              const stale = epoch !== checkpointSessionEpoch || controller !== mainCheckpointGate.currentController();
+              complete(_token, attempt.committed && (attempt.restorationFailed || stale || signal.aborted)
+                ? { ok: false, category: "restoration-paused" }
+                : attempt.restorationFailed
+                  ? { ok: false, category: "restoration-paused" }
+                  : stale
+                    ? { ok: false, category: "stale-generation" }
+                    : { ok: true });
+            },
             onError: (error: unknown) => {
               let hostCancelled = false;
               try {
                 hostCancelled = error instanceof Error &&
                   (error.name === "AbortError" || error.message === "Compaction cancelled");
               } catch { /* hostile error objects classify as operational */ }
-              // A failed physical attempt has no session_compact event to release
-              // its lifecycle identity. Release only this attempt's identity so a
-              // bounded retry can enter without weakening another in-flight compact.
+              // A failed transaction has no session_compact event to release its
+              // lifecycle identity. Release only this operation's identity.
               if (activeCompactionOperation?.identity === attempt.operation) {
                 activeCompactionOperation = undefined;
               }
               complete(_token, {
                 ok: false,
-                category: checkpointAttempt === attempt && attempt.hookBlocked
-                  ? "hook-blocked"
-                  : signal.aborted || epoch !== checkpointSessionEpoch || hostCancelled
-                    ? "cancelled"
-                    : "operational",
+                category: attempt.committed
+                  ? "restoration-paused"
+                  : checkpointAttempt === attempt && attempt.hookBlocked
+                    ? "hook-blocked"
+                    : signal.aborted || epoch !== checkpointSessionEpoch || hostCancelled
+                      ? "cancelled"
+                      : "operational",
               });
             },
           });
@@ -1960,18 +1966,20 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       const inputDisposition = mainCheckpointGate.ordinaryInputDisposition();
       if (inputDisposition === "reject-recoverable" || inputDisposition === "reject-restoration" ||
           inputDisposition === "reject-closed" || inputDisposition === "reject-stopped") {
+        const controller = mainCheckpointGate.currentController();
         const text = inputDisposition === "reject-recoverable"
           ? "Work remains paused. Run /compact, then explicitly continue."
           : inputDisposition === "reject-restoration"
             ? "The compacted summary is committed, but restoration or continuation failed. Do not compact it again; start a new session and resend the retained input."
             : inputDisposition === "reject-stopped"
               ? "The stopped run is still terminating. Wait for it to settle before sending another prompt."
-              : "The prior checkpoint was cancelled. Run /compact to recover this session, or start a new session.";
+              : controller.manualCompactionDisposition() === "allow"
+                ? "The prior checkpoint was cancelled. Run /compact to recover this session, or start a new session."
+                : "Checkpoint cancellation is still settling. Wait before sending another prompt or attempting recovery.";
         try {
           if (ctx.mode === "print") console.error(`PiCC: ${text}`);
           else if (ctx.mode === "tui") ctx.ui?.notify?.(text, "warning");
         } catch { /* admission was already decided */ }
-        const controller = mainCheckpointGate.currentController();
         const content = Array.isArray(event.images) && event.images.length > 0
           ? [{ type: "text", text: String(event.text ?? "") }, ...event.images]
           : String(event.text ?? "");
@@ -2472,18 +2480,26 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (!operation) return;
     const { controller, generation, proactive, trigger, epoch } = operation;
     const attempt = checkpointAttempt;
-    const isCurrent = () => operation === activeCompactionOperation && epoch === checkpointSessionEpoch &&
+    const operationMatches = () => operation === activeCompactionOperation && epoch === checkpointSessionEpoch &&
       controller === mainCheckpointGate.currentController() && controller.snapshot().generation === generation &&
       (proactive
-        ? controller.isCompactionSummaryActive(generation) &&
-          attempt?.operation === operation.identity && attempt.controller === controller
+        ? attempt?.operation === operation.identity && attempt.controller === controller && attempt.generation === generation
         : operation.recovery
           ? operation.recovery === controller.recoveryToken(generation)
           : controller.snapshot().phase === "idle");
-    if (!isCurrent()) {
+    if (!operationMatches()) {
       if (activeCompactionOperation === operation) activeCompactionOperation = undefined;
       return;
     }
+    if (proactive && attempt) {
+      attempt.committed = true;
+      controller.observeCompactionCommit(generation);
+    }
+    const isCurrent = () => operationMatches() && (proactive
+      ? attempt?.committed === true || controller.isCompactionSummaryActive(generation)
+      : operation.recovery
+        ? operation.recovery === controller.recoveryToken(generation)
+        : controller.snapshot().phase === "idle");
 
     let restorationFailed = false;
     let universalStop = false;

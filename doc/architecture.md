@@ -253,7 +253,7 @@ where to start reading, not the extent of its cluster.
 
 - **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
   in `subagents.ts`) — a session-local controller owns threshold sampling, complete-tool-batch
-  stopping, bounded compaction retries, queued-input reconciliation, resume, cancellation, and
+  stopping, one Pi-owned compaction transaction, queued-input reconciliation, resume, cancellation, and
   exhaustion. Operational or hook exhaustion remains recoverable in-session; any post-commit
   restoration, replay, or continuation-start failure is terminal for that session. Clean PiCC-owned tool batches terminate after
   every requested result;
@@ -376,7 +376,7 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
 
 7. **Cycle boundary / compaction / shutdown.** After a complete assistant/tool cycle reaches
    `proactiveCompactPercent`, the session-local controller stops another ordinary request, awaits
-   `ctx.compact()` (or the child SDK equivalent), retries operational failures, and resumes the same
+   one `ctx.compact()` transaction (or the child SDK equivalent), lets Pi own eligible retries inside it, and resumes the same
    logical run only after restoration and queued-input reconciliation. The controller permits its
    own summary request through the provider gate. Mixed, blocked, malformed, or queued tool paths
    abort and settle before compaction; a separate `agent_settled` sample is a non-resuming fallback.

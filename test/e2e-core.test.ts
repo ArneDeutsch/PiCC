@@ -229,10 +229,9 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   );
 
   it(
-    "retries one failed real Pi compaction, commits only the successful model summary, then resumes once",
+    "fails fast after one deterministic HTTP 400 compaction transaction without resuming",
     async () => {
       const errorSentinels = ["COMPACT_ERROR_SECRET_T05", "C:/private/compact/session.jsonl", "COMPACT_TRANSCRIPT_T05"];
-      const summaryCanary = "TRANSIENT_SUCCESS_SUMMARY_T05";
       const result = await runPi({
         persistSession: true,
         contextWindow: CHECKPOINT_CONTEXT_WINDOW,
@@ -241,17 +240,16 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           writeCheckpointConfig(fixtureDir);
         },
         script: [
-          { toolCalls: [{ name: "write", args: { path: "transient.txt", content: "complete" } }], usage: CHECKPOINT_USAGE },
+          { toolCalls: [{ name: "write", args: { path: "deterministic.txt", content: "complete" } }], usage: CHECKPOINT_USAGE },
           { when: (request) => request.requestKind === "compaction", error: { status: 400, sticky: false, message: errorSentinels.join(" ") } },
-          { when: (request) => request.requestKind === "compaction", text: summaryCanary },
-          { text: "TRANSIENT_RESUMED_FINAL_T05" },
+          { text: "ORDINARY_MUST_NOT_RUN_AFTER_HTTP_400" },
         ],
-        prompt: "run transient compaction retry",
+        prompt: "run deterministic compaction failure",
       });
 
-      expect(result.code).toBe(0);
-      expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction", "compaction", "ordinary"]);
-      expect(result.stdout.match(/TRANSIENT_RESUMED_FINAL_T05/g)).toHaveLength(1);
+      expect(result.code).toBe(1);
+      expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction"]);
+      expect(`${result.stdout}\n${result.stderr}`).not.toContain("ORDINARY_MUST_NOT_RUN_AFTER_HTTP_400");
       const files: string[] = [];
       const walk = (dir: string) => {
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -262,9 +260,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       };
       walk(path.join(result.agentDir, "sessions"));
       const entries = SessionManager.open(files[0]!).getEntries();
-      const compactions = entries.filter((entry) => entry.type === "compaction");
-      expect(compactions).toHaveLength(1);
-      expect((compactions[0] as { summary: string }).summary).toContain(summaryCanary);
+      expect(entries.filter((entry) => entry.type === "compaction")).toHaveLength(0);
       const visible = `${result.stdout}\n${result.stderr}\n${JSON.stringify(entries)}`;
       for (const sentinel of errorSentinels) expect(visible).not.toContain(sentinel);
     },
@@ -272,13 +268,13 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   );
 
   it(
-    "exhausts three real Pi compactions without a summary or ordinary resume and keeps print exit semantics Pi-owned",
+    "exhausts one real Pi compaction transaction without a summary or ordinary resume",
     async () => {
       const errorSentinels = ["EXHAUST_SECRET_T05", "C:/private/exhaust/session.jsonl", "EXHAUST_TRANSCRIPT_T05"];
-      const failures: Turn[] = Array.from({ length: 3 }, () => ({
+      const failure: Turn = {
         when: (request) => request.requestKind === "compaction",
         error: { status: 400, sticky: false, message: errorSentinels.join(" ") },
-      }));
+      };
       const result = await runPi({
         persistSession: true,
         contextWindow: CHECKPOINT_CONTEXT_WINDOW,
@@ -288,16 +284,15 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         },
         script: [
           { toolCalls: [{ name: "write", args: { path: "exhausted.txt", content: "complete" } }], usage: CHECKPOINT_USAGE },
-          ...failures,
+          failure,
           { text: "ORDINARY_MUST_NOT_RUN_AFTER_EXHAUSTION" },
         ],
         prompt: "run exhausted compaction",
       });
 
-      // Pi 0.80.10 owns print exit status and currently maps this exhausted
-      // terminal API-error boundary to 1; PiCC only guarantees settlement.
+      // Pi owns print exit status; PiCC guarantees checkpoint settlement.
       expect(result.code).toBe(1);
-      expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction", "compaction", "compaction"]);
+      expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction"]);
       expect(`${result.stdout}\n${result.stderr}`).not.toContain("ORDINARY_MUST_NOT_RUN_AFTER_EXHAUSTION");
       expect(result.stderr).toContain("Run /compact, then explicitly continue");
       const files: string[] = [];
@@ -438,12 +433,12 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   );
 
   it(
-    "gates a subsequent real RPC prompt after three-attempt compaction exhaustion",
+    "gates a subsequent real RPC prompt after one compaction transaction fails",
     async () => {
-      const failures: Turn[] = Array.from({ length: 3 }, () => ({
+      const failure: Turn = {
         when: (request) => request.requestKind === "compaction",
         error: { status: 400, sticky: false, message: "RPC_EXHAUST_SECRET C:/private/rpc/session.jsonl RPC_TRANSCRIPT_SENTINEL" },
-      }));
+      };
       const live = await startPi({
         contextWindow: CHECKPOINT_CONTEXT_WINDOW,
         piSettings: CHECKPOINT_PI_SETTINGS,
@@ -452,7 +447,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         },
         script: [
           { toolCalls: [{ name: "write", args: { path: "rpc-exhaust.txt", content: "complete" } }], usage: CHECKPOINT_USAGE },
-          ...failures,
+          failure,
           { text: "RPC_ORDINARY_MUST_STAY_GATED" },
         ],
         prompt: "unused",
@@ -466,7 +461,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         await live.waitForOutput((record) => record.type === "response" && record.id === "rpc-gated", 30_000);
         live.closeInput();
         const result = await live.completion;
-        expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction", "compaction", "compaction"]);
+        expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction"]);
         expect(`${result.stdout}\n${result.stderr}`).not.toContain("RPC_ORDINARY_MUST_STAY_GATED");
         const records = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line) as any);
         expect(records.filter((record) => record.type === "response" && record.id === "rpc-gated")).toHaveLength(1);
@@ -475,9 +470,7 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         expect(JSON.stringify(piccLifecycle)).not.toMatch(/RPC_EXHAUST_SECRET|private\/rpc|RPC_TRANSCRIPT_SENTINEL/);
         const nativeFailures = records.filter((record) => record.type === "compaction_end" && record.errorMessage);
         expect(JSON.stringify(nativeFailures)).toMatch(/RPC_EXHAUST_SECRET|private\/rpc|RPC_TRANSCRIPT_SENTINEL/);
-        expect(result.code, result.stderr).toBe(0);
       } finally {
-        live.closeInput();
         await live.stop();
       }
     },

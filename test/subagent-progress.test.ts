@@ -145,6 +145,28 @@ describe("SubagentProgressCondenser", () => {
     expect(c.snapshot().activity).toBe("retry succeeded; resuming…");
   });
 
+  it("condenses summary retries distinctly without retaining provider diagnostics", () => {
+    const c = new SubagentProgressCondenser();
+    const sentinel = "PRIVATE_PROVIDER_DIAGNOSTIC";
+    expect(c.consume({
+      type: "summarization_retry_scheduled",
+      attempt: 1,
+      maxAttempts: 4,
+      delayMs: 2_000,
+      errorMessage: sentinel,
+    })).toBe(true);
+    expect(c.snapshot().activity).toBe("waiting: summary retry 1/4");
+    expect(c.consume({ type: "summarization_retry_attempt_start", source: "compaction", reason: "threshold" })).toBe(true);
+    expect(c.snapshot().activity).toBe("retrying summary…");
+    expect(c.consume({ type: "auto_retry_start", attempt: 2, maxAttempts: 3, errorMessage: sentinel })).toBe(true);
+    expect(c.snapshot().activity).toBe("waiting: API retry 2/3");
+    expect(c.consume({ type: "summarization_retry_finished" })).toBe(true);
+    expect(c.snapshot().activity).toBe("summary retry finished");
+    expect(c.snapshot().activity).not.toMatch(/success|resum/iu);
+    expect(JSON.stringify({ snapshot: c.snapshot(), detail: c.detailLog() })).not.toContain(sentinel);
+    expect(c.consume({ type: "summarization_retry_finished" })).toBe(false);
+  });
+
   it("covers the retry-failed and attempt-less retry branches (FIX-B)", () => {
     const c = new SubagentProgressCondenser();
     // Fallback wording when the event carries no attempt/maxAttempts.
