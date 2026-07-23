@@ -24,8 +24,6 @@ export interface PiCCConfig {
   steering: Record<string, string>;
   /** Map Claude "effort" prose/values onto thinking levels; merged over defaults. */
   effortMap: Record<string, string>;
-  /** Suppress the startup compatibility notice. */
-  suppressCompatNotice?: boolean;
   /**
    * Compaction-resilience knob: percent of the context window at which PiCC
    * proactively triggers Pi's own compaction. **0–100 scale** (NOT a 0–1 fraction) so it
@@ -201,7 +199,6 @@ export function loadPiCCConfig(projectRoot: string): PiCCConfig {
     }
     if (typeof parsed.model === "string") result.model = parsed.model;
     if (typeof parsed.effort === "string") result.effort = parsed.effort;
-    if (typeof parsed.suppressCompatNotice === "boolean") result.suppressCompatNotice = parsed.suppressCompatNotice;
     // Compaction knobs: store the raw file value (number or numeric string) so the
     // single validator, resolveCompactionConfig, is the one place range/type is enforced.
     if (typeof parsed.proactiveCompactPercent === "number" || typeof parsed.proactiveCompactPercent === "string") {

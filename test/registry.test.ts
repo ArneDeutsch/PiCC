@@ -16,10 +16,7 @@ import {
 } from "../src/registry/capability-registry.js";
 import {
   buildCompatReport,
-  readSuppression,
   renderDoctorReport,
-  renderStartupNotice,
-  writeSuppression,
 } from "../src/registry/compat-report.js";
 import { DEGRADED_TOOLS } from "../src/runtime/tools/degrade-stubs.js";
 import { sniffImageMime } from "../src/runtime/image-ingest.js";
@@ -1016,61 +1013,6 @@ describe("buildCompatReport", () => {
 });
 
 // ---------------------------------------------------------------------------
-// renderStartupNotice
-// ---------------------------------------------------------------------------
-
-describe("renderStartupNotice", () => {
-  const noisyProject = makeProject({
-    settings: makeSettings({
-      permissions: {
-        allow: [],
-        deny: [],
-        ask: ["Bash(rm *)"],
-        additionalDirectories: [],
-      },
-      deferredKeys: [{ key: "outputStyle", scope: "project" }],
-      unknownKeys: [{ key: "futureThing", scope: "project" }],
-    }),
-  });
-
-  it("emits one consolidated notice with SAFETY first, then functionality, then the doctor hint", () => {
-    const report = buildCompatReport(noisyProject);
-    const notice = renderStartupNotice(report, { suppressed: false });
-    expect(notice).toBeDefined();
-    const text = notice as string;
-
-    // Exactly one notice header.
-    const headers = text.match(/PiCC compatibility: \d+ feature\(s\) degraded for this project/g);
-    expect(headers).toHaveLength(1);
-    expect(text.startsWith("PiCC compatibility:")).toBe(true);
-
-    // SAFETY block precedes functionality lines; ask divergence is called out.
-    const safetyIdx = text.indexOf("SAFETY:");
-    const askIdx = text.indexOf("setting.permissions.ask");
-    const funcIdx = text.indexOf("setting.outputStyle");
-    expect(safetyIdx).toBeGreaterThan(-1);
-    expect(askIdx).toBeGreaterThan(safetyIdx);
-    expect(funcIdx).toBeGreaterThan(askIdx);
-    expect(text).toContain("ask rules will NOT prompt");
-    expect(text).toContain("default-permissive posture");
-
-    // Unassessed inputs are surfaced, and the notice ends with the doctor hint.
-    expect(text).toContain("unassessed");
-    expect(text.trimEnd().endsWith("Run /doctor for details. (Suppress with /compat suppress)")).toBe(true);
-  });
-
-  it("returns undefined when suppressed", () => {
-    const report = buildCompatReport(noisyProject);
-    expect(renderStartupNotice(report, { suppressed: true })).toBeUndefined();
-  });
-
-  it("returns undefined when there are no findings", () => {
-    const report = buildCompatReport(makeProject());
-    expect(renderStartupNotice(report, { suppressed: false })).toBeUndefined();
-  });
-});
-
-// ---------------------------------------------------------------------------
 // renderDoctorReport
 // ---------------------------------------------------------------------------
 
@@ -1101,7 +1043,8 @@ describe("renderDoctorReport", () => {
   it("renders cleanly for a project with nothing to report", () => {
     const project = makeProject();
     const doctor = renderDoctorReport(project, buildCompatReport(project));
-    expect(doctor).toContain("No compatibility findings");
+    expect(doctor.split(/\r?\n/)).toContain("No compatibility findings detected.");
+    expect(doctor).not.toContain("everything this project declares is fully honored");
     expect(doctor).toContain("Unassessed: none.");
     expect(doctor).toContain(CLAUDE_BASELINE);
   });
@@ -1166,7 +1109,7 @@ describe("renderDoctorReport", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Active-model vision surface (/doctor + startup notice)
+// Active-model vision surface (/doctor)
 // ---------------------------------------------------------------------------
 
 const VISION_MODEL = { provider: "openai", id: "gpt-see", input: ["text", "image"] };
@@ -1206,133 +1149,6 @@ describe("active-model vision line in /doctor", () => {
     const doctor = renderDoctorReport(project, buildCompatReport(project), { id: "gpt-opaque" });
     expect(doctor).toContain("vision: unknown");
     expect(doctor).not.toContain("vision: no");
-  });
-});
-
-describe("active-model vision warning in the startup notice", () => {
-  const cleanProject = makeProject();
-
-  it("surfaces the non-vision warning on a ZERO-findings project and puts it on the first line (the toast)", () => {
-    const report = buildCompatReport(cleanProject);
-    // Sanity: this project has nothing to report on its own.
-    expect(report.findings).toEqual([]);
-    expect(report.safetyFindings).toEqual([]);
-    expect(report.unassessed).toEqual([]);
-
-    const notice = renderStartupNotice(report, {
-      suppressed: false,
-      activeModel: NON_VISION_MODEL,
-    });
-    expect(notice).toBeDefined();
-    const text = notice as string;
-    // The warning is the FIRST line — the emission site builds the toast from it.
-    const firstLine = text.split("\n")[0];
-    expect(firstLine).toContain("openai/gpt-text is not vision-capable");
-    expect(firstLine).toMatch(/use a vision-capable model/i);
-  });
-
-  it("stays quiet on a clean project for a vision-capable model", () => {
-    const report = buildCompatReport(cleanProject);
-    expect(
-      renderStartupNotice(report, { suppressed: false, activeModel: VISION_MODEL }),
-    ).toBeUndefined();
-  });
-
-  it("stays quiet on a clean project when the active model is unknown/opaque", () => {
-    const report = buildCompatReport(cleanProject);
-    expect(
-      renderStartupNotice(report, { suppressed: false, activeModel: {} }),
-    ).toBeUndefined();
-    expect(renderStartupNotice(report, { suppressed: false })).toBeUndefined();
-  });
-
-  it("fires no non-vision warning for a model with an id but no input array", () => {
-    const report = buildCompatReport(cleanProject);
-    // Opaque on the vision axis (no readable modalities) — don't nag; /doctor still
-    // reports "unknown" for it.
-    expect(
-      renderStartupNotice(report, { suppressed: false, activeModel: { id: "gpt-opaque" } }),
-    ).toBeUndefined();
-  });
-
-  it("prepends the non-vision warning above the compat header when the project also has findings", () => {
-    const noisy = makeProject({
-      settings: makeSettings({
-        permissions: { allow: [], deny: [], ask: ["Bash(rm *)"], additionalDirectories: [] },
-      }),
-    });
-    const report = buildCompatReport(noisy);
-    const text = renderStartupNotice(report, {
-      suppressed: false,
-      activeModel: NON_VISION_MODEL,
-    }) as string;
-    const warnIdx = text.indexOf("is not vision-capable");
-    const headerIdx = text.indexOf("PiCC compatibility:");
-    expect(warnIdx).toBeGreaterThan(-1);
-    expect(headerIdx).toBeGreaterThan(warnIdx);
-  });
-
-  it("surfaces the non-vision warning through suppression, but drops the findings body", () => {
-    // `/compat suppress` acknowledges PROJECT findings; a non-vision model is a
-    // separate safety axis that must still surface (a user may suppress on a vision
-    // model, then switch to a non-vision one). The findings header/body stay hidden.
-    const noisy = makeProject({
-      settings: makeSettings({
-        permissions: { allow: [], deny: [], ask: ["Bash(rm *)"], additionalDirectories: [] },
-      }),
-    });
-    const report = buildCompatReport(noisy);
-    const notice = renderStartupNotice(report, {
-      suppressed: true,
-      activeModel: NON_VISION_MODEL,
-    });
-    expect(notice).toBeDefined();
-    const text = notice as string;
-    expect(text.split("\n")[0]).toContain("openai/gpt-text is not vision-capable");
-    expect(text.split("\n")[0]).toMatch(/use a vision-capable model/i);
-    // Suppression still silences the project-findings header/body and footer.
-    expect(text).not.toContain("PiCC compatibility:");
-    expect(text).not.toContain("Run /doctor for details");
-  });
-
-  it("stays silent under suppression for a vision-capable or opaque model", () => {
-    const report = buildCompatReport(cleanProject);
-    expect(
-      renderStartupNotice(report, { suppressed: true, activeModel: VISION_MODEL }),
-    ).toBeUndefined();
-    expect(
-      renderStartupNotice(report, { suppressed: true, activeModel: {} }),
-    ).toBeUndefined();
-    expect(
-      renderStartupNotice(report, { suppressed: true, activeModel: { id: "gpt-opaque" } }),
-    ).toBeUndefined();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Suppression persistence
-// ---------------------------------------------------------------------------
-
-describe("suppression persistence", () => {
-  it("round-trips through .claude/.picc/compat-ack.json", () => {
-    const root = makeTempDir();
-    expect(readSuppression(root)).toBe(false);
-
-    writeSuppression(root, true);
-    expect(readSuppression(root)).toBe(true);
-    expect(fs.existsSync(path.join(root, ".claude", ".picc", "compat-ack.json"))).toBe(true);
-
-    writeSuppression(root, false);
-    expect(readSuppression(root)).toBe(false);
-  });
-
-  it("treats a missing or malformed file as not suppressed", () => {
-    const root = makeTempDir();
-    expect(readSuppression(root)).toBe(false);
-    const file = path.join(root, ".claude", ".picc", "compat-ack.json");
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, "not json at all", "utf8");
-    expect(readSuppression(root)).toBe(false);
   });
 });
 

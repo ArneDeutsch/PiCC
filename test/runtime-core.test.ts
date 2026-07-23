@@ -378,6 +378,24 @@ describe("loadPiCCConfig compaction knobs (real file)", () => {
     }
   });
 
+  it("ignores the removed suppressCompatNotice key without retaining or diagnosing it", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "picc-home-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-cfg-"));
+    const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(home);
+    try {
+      const file = projectConfigPath(dir);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify({ suppressCompatNotice: true }), "utf8");
+      const config = loadPiCCConfig(dir);
+      expect("suppressCompatNotice" in config).toBe(false);
+      expect(config.diagnostics.some((d) => d.message.includes("suppressCompatNotice"))).toBe(false);
+    } finally {
+      homeSpy.mockRestore();
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("resolves only once at load (no double diagnostics) on a malformed value in the file", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-cfg-"));
     try {

@@ -287,11 +287,10 @@ filesystem outside the guard is a hole.
 `capability-registry.ts` holds every known tool, hook event, setting, frontmatter field, and feature
 with a support tier, an optional `safetyRelevant` flag, and a one-line note. Anything unassessed
 synthesizes a `not-supported` entry, so **unknown names still resolve for gating**.
-`compat-report.ts` scans the loaded project against the registry and renders the startup notice and
-the `/doctor` report. Because both the report and
-[`doc/supported-features.md`](supported-features.md) are generated from the registry (by
-[`scripts/gen-capability-matrix.mjs`](../scripts/gen-capability-matrix.mjs)), docs and behavior
-cannot drift.
+`compat-report.ts` scans the loaded project against the registry and renders the `/doctor` report.
+The generated [`doc/supported-features.md`](supported-features.md) reads the same registry through
+[`scripts/gen-capability-matrix.mjs`](../scripts/gen-capability-matrix.mjs), keeping both surfaces
+anchored to the same support claims.
 
 **Placement:** every support claim, and the evidence behind a partial tier. Never restate a tier
 claim in prose — state it here and link. Run `npm run gen:capabilities` after a registry change.
@@ -323,7 +322,8 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    multiplexer so skill-scoped hooks can be added dynamically), and `SubagentRuntime` are
    constructed. All Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered,
    the guard extension is installed on tool events, and prompt-template stubs are written for each
-   user-invocable skill so it appears in the `/` palette. The per-session scratch dir is created
+   user-invocable skill with an eligible, non-reserved name so it appears in the `/` palette. The
+   per-session scratch dir is created
    eagerly here and its literal path held for injection.
 
    Load is **not** fully synchronous: the cwd-swapping overrides need Pi's SDK, so they register
@@ -332,10 +332,10 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    built-ins — losing the cwd swap, not the session.
 
 2. **`session_start`.** Captures the model registry and active model, applies the configured
-   model/effort, self-heals `core.hooksPath` when `.githooks/` exists, fires the `SessionStart`
-   hook, and emits the one-per-session compatibility notice unless suppressed. Steering text is
-   derived from the active model here and **re-derived on `model_select`**, so a mid-session model
-   switch re-steers — steering follows the model, it is not a startup snapshot.
+   model/effort, self-heals `core.hooksPath` when `.githooks/` exists, and fires the `SessionStart`
+   hook. Steering text is derived from the active model here and **re-derived on `model_select`**,
+   so a mid-session model switch re-steers — steering follows the model, it is not a startup
+   snapshot.
 
 3. **`before_agent_start` (every turn).** Appends the system-prompt suffix, re-asserting the full
    instruction set and the scratchpad section each turn.

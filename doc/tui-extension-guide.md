@@ -353,10 +353,11 @@ Treat true global rebinding as **out of scope** — it fights Pi's own model and
 ## 8. Other adaptable surfaces (for completeness)
 
 - **Slash commands** — `pi.registerCommand(name, { description, handler, getArgumentCompletions })`.
-  PiCC's `/doctor`, `/compat`, `/quota` live here (`src/index.ts`).
+  PiCC's control commands live here (`src/index.ts`).
 - **Custom transcript entries** — `pi.appendEntry(customType, data)` + `pi.registerEntryRenderer`
-  (PiCC uses this for the compat notice; entries do **not** enter LLM context). For custom *messages*
-  that do participate, `pi.sendMessage` + `pi.registerMessageRenderer`.
+  (PiCC uses these for control-command output and appends checkpoint lifecycle records; entries do
+  **not** enter LLM context). For custom *messages* that do participate, `pi.sendMessage` +
+  `pi.registerMessageRenderer`.
 - **CLI flags** — `pi.registerFlag(name, { type, default })` + `pi.getFlag(name)`.
 - **Terminal title** — `ctx.ui.setTitle(title)`.
 - **Autocomplete** — `ctx.ui.addAutocompleteProvider(factory)` stacks on the built-in provider.

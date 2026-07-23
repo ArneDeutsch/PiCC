@@ -99,8 +99,8 @@ export function renderCapabilityMatrix(entries, baseline) {
   lines.push(
     `> **Generated file — do not edit by hand.** This matrix is generated from the living ` +
       `capability registry (\`src/registry/capability-registry.ts\`), the single source of truth ` +
-      `for what PiCC supports. The same registry drives the runtime \`/doctor\` ` +
-      `report and the startup compatibility notice, so this document cannot drift from actual behavior.`,
+      `for what PiCC supports. The same registry drives the runtime \`/doctor\` report and this ` +
+      `generated matrix, keeping both surfaces anchored to the same support claims.`,
   );
   lines.push(">");
   lines.push(`> **Claude Code baseline:** \`${baseline}\`. Every support claim is stated relative to this`);
@@ -118,7 +118,8 @@ export function renderCapabilityMatrix(entries, baseline) {
   lines.push("");
   lines.push(
     "A ⚠ marker on an ID means the divergence is **safety-relevant**: something a project intended " +
-      "to restrict now runs freely. These are always surfaced at startup and in `/doctor`, never silent.",
+      "to restrict now runs freely. The matrix marks every safety-relevant registry entry; `/doctor` " +
+      "labels detected project-specific safety findings.",
   );
   lines.push("");
 
@@ -151,8 +152,8 @@ export function renderCapabilityMatrix(entries, baseline) {
   lines.push(
     `The registry enumerates **${entries.length} capabilities** against baseline \`${baseline}\`: ` +
       `${tierPhrases.join(", ")}. ` +
-      `${safetyCount} entr${safetyCount === 1 ? "y is" : "ies are"} safety-relevant (marked ⚠) — ` +
-      "a divergence where a project's restriction is not enforced and is therefore reported prominently. " +
+      `${safetyCount} entr${safetyCount === 1 ? "y is" : "ies are"} safety-relevant — ` +
+      "a divergence where a project's restriction is not enforced, marked ⚠ in this matrix. " +
       "Unknown inputs outside this registry are not counted here: they are unassessed by definition and " +
       "degrade safely at runtime.",
   );
