@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import picc, { type PiccTestSeam } from "../src/index.js";
 import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
@@ -12,7 +13,7 @@ import { formatElapsed } from "../src/runtime/subagent-panel-render.js";
 import { createGlobTool, createGrepTool } from "../src/runtime/tools/search-tools.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/fake-sdk.js";
-import { waitUntil } from "./helpers/async.js";
+import { deferred, waitUntil } from "./helpers/async.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import { loadSkills } from "../src/claude/skills.js";
 
@@ -50,6 +51,86 @@ beforeAll(async () => {
 afterAll(() => {
   process.chdir(originalCwd);
   cleanupFixture(dir);
+});
+
+async function proveRuntimeAdmissionCapacity(options: {
+  expectedCapacity: number;
+  override?: number;
+}): Promise<void> {
+  const fixture = materializeFixture("hello-claude");
+  const previousCwd = process.cwd();
+  const hadPreviousUserDir = Object.hasOwn(process.env, "PICC_CLAUDE_USER_DIR");
+  const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+  const release = deferred<void>();
+  const handle = fakeSdk({ replies: [{ text: "capacity-complete", gate: release.promise }] });
+  let dispatches: Array<Promise<unknown>> = [];
+
+  try {
+    const userDir = path.join(fixture, ".picc-hermetic-user");
+    fs.mkdirSync(userDir, { recursive: true });
+    if (options.override !== undefined) {
+      const settingsDir = path.join(fixture, ".claude");
+      fs.mkdirSync(settingsDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(settingsDir, "settings.json"),
+        `${JSON.stringify({ subagents: { concurrency: options.override } }, null, 2)}\n`,
+      );
+    }
+
+    process.chdir(fixture);
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    const capacityPi = fakePi();
+    picc(capacityPi.api as never, {
+      sdk: handle.sdk,
+      managedSettingsPaths: [],
+      managedArtifactDirs: [],
+      onInitializationSettled: capacityPi.captureInitialization,
+    });
+    await capacityPi.waitForInitialization();
+    await capacityPi.waitForTools(["Agent"]);
+
+    const agent = capacityPi.tools.get("Agent");
+    dispatches = Array.from({ length: options.expectedCapacity + 1 }, (_, index) =>
+      agent.execute(`capacity-${index}`, {
+        subagent_type: "general-purpose",
+        prompt: `held dispatch ${index}`,
+        run_in_background: false,
+      }) as Promise<unknown>,
+    );
+
+    await handle.waitForPromptCalls(options.expectedCapacity);
+    expect(handle.promptCalls()).toBe(options.expectedCapacity);
+    expect(handle.sessions).toHaveLength(options.expectedCapacity);
+
+    release.resolve();
+    const settled = await Promise.allSettled(dispatches);
+    for (const result of settled) {
+      expect(result.status).toBe("fulfilled");
+      if (result.status === "fulfilled") {
+        expect((result.value as { details?: { outcome?: string } }).details?.outcome).toBe("completed");
+      }
+    }
+    expect(handle.promptCalls()).toBe(options.expectedCapacity + 1);
+    expect(handle.sessions).toHaveLength(options.expectedCapacity + 1);
+  } finally {
+    release.resolve();
+    await Promise.allSettled(dispatches);
+    dispatches = [];
+    process.chdir(previousCwd);
+    if (hadPreviousUserDir) process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+    else delete process.env.PICC_CLAUDE_USER_DIR;
+    cleanupFixture(fixture);
+  }
+}
+
+describe("settings-to-runtime subagent concurrency wiring", () => {
+  it("admits ten root dispatches by default while an eleventh waits", async () => {
+    await proveRuntimeAdmissionCapacity({ expectedCapacity: 10 });
+  });
+
+  it("honors an effective override of two while a third dispatch waits", async () => {
+    await proveRuntimeAdmissionCapacity({ expectedCapacity: 2, override: 2 });
+  });
 });
 
 describe("tool surface registration", () => {
@@ -895,6 +976,11 @@ describe("session lifecycle hooks", () => {
       expect(notificationText).not.toContain("PiCC compatibility:");
       expect(notificationText).not.toContain("Run /doctor");
       expect(notificationText).not.toContain("is not vision-capable");
+      // The ONE deliberate exception to quiet startup: the fixture's unapproved
+      // .mcp.json server is ACTIONABLE state, so exactly one MCP pending toast
+      // fires (asserted in detail in its own test below).
+      expect(pi.notifications).toHaveLength(1);
+      expect(pi.notifications[0]!.text).toContain("pending approval");
 
       const consoleText = [...logSpy.mock.calls, ...errorSpy.mock.calls].flat().join("\n");
       expect(consoleText).not.toContain("PiCC compatibility:");
@@ -909,7 +995,26 @@ describe("session lifecycle hooks", () => {
     }
   });
 
-  it("/doctor renders the registry-generated breakdown", async () => {
+  it("toasts the MCP pending-approval line once at startup — actionable state survives quiet startup", async () => {
+    pi.notifications.length = 0;
+    await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx());
+    const pendingToasts = pi.notifications.filter((n) => n.text.includes("pending approval"));
+    expect(pendingToasts).toHaveLength(1);
+    const text = pendingToasts[0]!.text;
+    // One short self-contained line: server name, the enabling key, the
+    // /doctor pointer for the exact edit and the decline path.
+    expect(text).not.toContain("\n");
+    expect(text).toContain("example-server");
+    expect(text).toContain("enabledMcpjsonServers");
+    expect(text).toContain(".claude/settings.local.json");
+    expect(text).toContain("/doctor");
+    // A non-startup session_start (e.g. /new) must not re-toast it.
+    pi.notifications.length = 0;
+    await pi.fire("session_start", { reason: "new" }, pi.tuiCtx());
+    expect(pi.notifications.filter((n) => n.text.includes("pending approval"))).toHaveLength(0);
+  });
+
+  it("/doctor renders the registry-generated breakdown with the MCP posture line", async () => {
     pi.entries.length = 0;
     await pi.commands.get("doctor").handler("", pi.ctx());
     const doctor = pi.entries
@@ -917,7 +1022,18 @@ describe("session lifecycle hooks", () => {
       .map((e) => String(e.data?.output ?? ""))
       .join("\n");
     expect(doctor).toContain("claude-code-2.1.x");
-    expect(doctor.toLowerCase()).toContain("mcp");
+    // Always-present MCP posture line, fed by real discovery: the fixture's
+    // unapproved server renders as pending, and the retired static
+    // ".mcp.json present" wording must be gone.
+    expect(doctor).toContain("example-server: pending approval");
+    // De-duplicated: the posture line carries no enable/decline hint — the
+    // pending finding (registry note + evidence) is the canonical carrier of
+    // the exact edit now that startup is quiet.
+    const postureLine = doctor.split("\n").find((l) => l.startsWith("MCP servers:")) ?? "";
+    expect(postureLine).not.toContain("enabledMcpjsonServers");
+    expect(doctor).toContain('"enabledMcpjsonServers": ["example-server"]');
+    expect(doctor).toContain("disabledMcpjsonServers");
+    expect(doctor).not.toContain("MCP servers will not start");
   });
 
   it("handles headless /doctor immediately with findings and active-model vision state", async () => {
@@ -1378,7 +1494,7 @@ describe("background settlement delivery (offline integration via the seam)", ()
         started: {
           content: [{
             type: "text",
-            text: `Background task ${taskId} started (agent: reviewer, agent id: ${agentId}). Use TaskOutput with task_id "${taskId}" to retrieve the result before finalizing.`,
+            text: `Background task ${taskId} accepted (agent: reviewer, agent id: ${agentId}); it will run when configured concurrency capacity is available. Use TaskOutput with task_id "${taskId}" to retrieve the result before finalizing.`,
           }],
           details: {
             background: true,
@@ -1386,6 +1502,7 @@ describe("background settlement delivery (offline integration via the seam)", ()
             agent: "reviewer",
             agentId,
             description: undefined,
+            admission: "admitted",
           },
         },
         output: {
@@ -1393,6 +1510,7 @@ describe("background settlement delivery (offline integration via the seam)", ()
           details: {
             taskId,
             status: "completed",
+            admission: "admitted",
             outcome: "completed",
             agent: "reviewer",
             agentId,
@@ -1833,6 +1951,22 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(renderer!(nested, { expanded: false }, undefined)).toBeUndefined();
   });
 
+  it("registers Agent and Task with accepted/capacity wording and the foreground-forcing exception", () => {
+    for (const name of ["Agent", "Task"] as const) {
+      const tool = pi.tools.get(name) as unknown as {
+        description: string;
+        parameters: { properties?: Record<string, { description?: string }> };
+      };
+      const parameter = tool.parameters.properties?.run_in_background?.description ?? "";
+      for (const text of [tool.description, parameter]) {
+        expect(text).toMatch(/accept(?:ed)? (?:the dispatch )?immediately/iu);
+        expect(text).toContain("configured concurrency capacity");
+        expect(text).toContain("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS");
+        expect(text).not.toMatch(/\b(?:started|starts immediately|has started)\b/iu);
+      }
+    }
+  });
+
   it("registered Agent threads a background description through the real TaskOutput wiring", async () => {
     const handle = fakeSdk({ replies: ["BACKGROUND-DONE"] });
     const { p, internals } = await wire();
@@ -1847,7 +1981,7 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(started.content).toEqual([
       {
         type: "text",
-        text: `Background task ${started.details.taskId} started (agent: reviewer, agent id: ${started.details.agentId}). Use TaskOutput with task_id "${started.details.taskId}" to retrieve the result before finalizing.`,
+        text: `Background task ${started.details.taskId} accepted (agent: reviewer, agent id: ${started.details.agentId}); it will run when configured concurrency capacity is available. Use TaskOutput with task_id "${started.details.taskId}" to retrieve the result before finalizing.`,
       },
     ]);
     expect(started.details.description).toBe("Review authentication");
@@ -2425,5 +2559,113 @@ describe("child worktree stops through the production extension assembly", () =>
         cleanupFixture(fixture);
       }
     },
+  );
+});
+
+describe("MCP failed-connect surfacing (dedicated temp project)", () => {
+  // The full-surface fixture's .mcp.json deliberately stays UNAPPROVED (the
+  // standing pending case), so the failed-connect path gets its own minimal
+  // project: an approved server whose command cannot spawn. The approval rides
+  // an UNTRACKED settings.local.json (no git repo → the tracked probe fails
+  // open), so the enablement gate itself is exercised for real.
+  function makeFailingMcpProject(): string {
+    const mcpDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-fail-"));
+    fs.writeFileSync(
+      path.join(mcpDir, ".mcp.json"),
+      JSON.stringify({
+        mcpServers: { "failing-server": { command: "picc-no-such-command-t05" } },
+      }),
+      "utf8",
+    );
+    fs.mkdirSync(path.join(mcpDir, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(mcpDir, ".claude", "settings.local.json"),
+      JSON.stringify({ enabledMcpjsonServers: ["failing-server"] }),
+      "utf8",
+    );
+    return mcpDir;
+  }
+
+  function cleanupFailingMcpProject(mcpDir: string): void {
+    process.chdir(dir);
+    // Best-effort: Windows can EPERM a just-vacated cwd (handle release lag).
+    try {
+      fs.rmSync(mcpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } catch {
+      /* leftover temp dir is harmless */
+    }
+  }
+
+  it(
+    "a failed server reaches the /doctor posture line, fires the one-time warning notify, and drains diagnostics to stderr",
+    async () => {
+      const mcpDir = makeFailingMcpProject();
+      process.chdir(mcpDir);
+      // Installed BEFORE wiring: the settle-time diagnostics drain runs inside
+      // the detached registration step, any time after connect settles.
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const p = fakePi();
+      try {
+        picc(p.api as never, { onInitializationSettled: p.captureInitialization });
+        await p.waitForInitialization();
+        // The first-turn barrier awaits MCP settle + registration, so after this
+        // fire the spawn failure has been classified.
+        await p.fire("before_agent_start", { systemPrompt: "B" });
+        const warnings = p.notifications.filter((n) => n.text.includes("MCP"));
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]!.text).toContain("failing-server");
+        expect(warnings[0]!.text).toContain("/doctor");
+        expect(warnings[0]!.severity).toBe("warning");
+        // One-time: a later turn must not re-notify.
+        await p.fire("before_agent_start", { systemPrompt: "B" });
+        expect(p.notifications.filter((n) => n.text.includes("MCP"))).toHaveLength(1);
+        // Settle-time stderr drain: the runtime's connect-failure diagnostic
+        // reaches console.error — the stderr surface the registry note claims.
+        const drained = errSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+        expect(drained).toContain("PiCC: MCP:");
+        expect(drained).toContain("failing-server");
+
+        p.entries.length = 0;
+        await p.commands.get("doctor").handler("", p.ctx());
+        const doctor = p.entries
+          .filter((e) => e.customType === "picc-control")
+          .map((e) => String(e.data?.output ?? ""))
+          .join("\n");
+        expect(doctor).toContain("failing-server: failed");
+        // The diagnostic quotes the RAW command, never a resolved path.
+        expect(doctor).toContain("picc-no-such-command-t05");
+      } finally {
+        errSpy.mockRestore();
+        await p.fire("session_shutdown", { reason: "other" });
+        cleanupFailingMcpProject(mcpDir);
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "the one-time failure notice falls back to stderr when the ctx has no UI",
+    async () => {
+      const mcpDir = makeFailingMcpProject();
+      process.chdir(mcpDir);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const p = fakePi();
+      try {
+        picc(p.api as never, { onInitializationSettled: p.captureInitialization });
+        await p.waitForInitialization();
+        // printCtx models real Pi print mode: hasUI false → stderr fallback.
+        await p.fire("before_agent_start", { systemPrompt: "B" }, p.printCtx());
+        expect(p.notifications.filter((n) => n.text.includes("MCP"))).toHaveLength(0);
+        const errText = errSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+        expect(errText).toContain("MCP server(s) failed to connect");
+        expect(errText).toContain("failing-server");
+        expect(errText).toContain("run /doctor for details");
+      } finally {
+        errSpy.mockRestore();
+        await p.fire("session_shutdown", { reason: "other" });
+        cleanupFailingMcpProject(mcpDir);
+      }
+    },
+    60_000,
   );
 });

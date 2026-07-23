@@ -71,6 +71,9 @@ export interface SubagentUsage {
   costUsd?: number;
 }
 
+/** Runtime-derived concurrency admission, orthogonal to the running/settled lifecycle. */
+export type SubagentAdmission = "waiting" | "admitted";
+
 /** Settled fate of a dispatch, recorded for the /usage report. */
 export type SubagentOutcome = "completed" | "failed" | "aborted";
 
@@ -124,6 +127,8 @@ export interface SubagentRegistryRecord {
   oneShot: boolean;
   /** Whether the dispatch is currently running (steerable) or has settled. */
   state: "running" | "settled";
+  /** Runtime-derived concurrency admission; absent compatibility records are admitted. */
+  admission?: SubagentAdmission;
   /**
    * Recorded at settlement so the /usage control command can report each
    * subagent's outcome. Undefined while running (or for a settle that could not
@@ -313,6 +318,7 @@ export class SubagentRegistry {
       resumable: input.resumable,
       oneShot: input.oneShot,
       state: "running",
+      admission: "admitted",
       session: input.session,
       checkpointPaused: input.checkpointPaused,
       settledNoticeConsumed: false,
@@ -365,6 +371,14 @@ export class SubagentRegistry {
       };
     }
     if (detailLog) record.detailLog = detailLog.map((entry) => ({ ...entry }));
+    this.notifyChange();
+  }
+
+  /** Mirror runtime concurrency admission without changing lifecycle state. */
+  noteAdmission(agentId: string, admission: SubagentAdmission): void {
+    const record = this.records.get(agentId);
+    if (!record || record.state !== "running") return;
+    record.admission = admission;
     this.notifyChange();
   }
 
@@ -438,6 +452,7 @@ export class SubagentRegistry {
     const record = this.records.get(agentId);
     if (!record || record.userStopped) return;
     record.state = "running";
+    record.admission = "admitted";
     record.settledNoticeConsumed = false;
     record.startedAt = Date.now();
     record.finalText = undefined;
@@ -586,9 +601,9 @@ export function oneShotRefusal(record: SubagentRegistryRecord): string {
  * so the refusal rules cannot drift per caller. On `ok` it hands back the
  * bound steer entry point, so a caller cannot pass the guard and then reach a
  * different session. Refusals, in order: one-shot builtins, user-stopped
- * agents (permanent), not-running records, and running records without a live
- * steerable handle (the transient minimal-register window, or a fake/older
- * SDK session).
+ * agents (permanent), not-running records, capacity-waiting records, and
+ * running records without a live steerable handle (the transient
+ * minimal-register window, or a fake/older SDK session).
  */
 export function guardSteer(record: SubagentRegistryRecord): SteerGuardResult {
   if (record.oneShot) {
@@ -603,6 +618,15 @@ export function guardSteer(record: SubagentRegistryRecord): SteerGuardResult {
       refusal:
         `Agent ${record.agentId} ("${record.agentName}") is not running — ` +
         `there is no live dispatch to steer.`,
+    };
+  }
+  if (record.admission === "waiting") {
+    const agentName = sanitizeLine(record.agentName, DESCRIPTION_CAP) || "subagent";
+    return {
+      ok: false,
+      refusal:
+        `Agent ${record.agentId} ("${agentName}") is waiting for configured concurrency capacity ` +
+        `and cannot be steered before execution is admitted.`,
     };
   }
   const session = record.session;

@@ -10,6 +10,7 @@ import type {
   CapabilityEntry,
   ClaudeProject,
   HookConfig,
+  ResolvedMcpConfig,
 } from "../types.js";
 import { SUPPORTED_HOOK_EVENTS } from "../types.js";
 import { loadPluginHooks, type InstalledPlugin } from "../claude/plugins.js";
@@ -41,6 +42,13 @@ export interface CompatReport {
   safetyFindings: CompatFinding[];
   /** Inputs unknown at the baseline — surfaced as unassessed. */
   unassessed: string[];
+  /**
+   * Pending-approval MCP servers, as a single short line for the one-time
+   * session-start `ctx.ui.notify(...)`. Pending servers are ACTIONABLE STATE,
+   * not a compat finding, so this survives the otherwise-quiet startup; the
+   * full enable/decline edit lives in the `/doctor` pending finding.
+   */
+  mcpPendingNotice?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -272,14 +280,53 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     }
   }
 
-  // --- .mcp.json at the project root (filesystem check) --------------------
-  try {
-    if (fs.statSync(path.join(project.root, ".mcp.json")).isFile()) {
-      const cap = lookupCapability("feature.mcp");
-      if (cap) addFinding(cap, ".mcp.json present at project root — MCP servers will not start");
+  // --- MCP discovery results ----------------------------------------------
+  // Discovery-fed, not a filesystem probe: findings mirror what the resolver
+  // actually decided. Findings cover ACTIONABLE/DEGRADED states — the pending
+  // gate, plus EVERY server's stored diagnostics regardless of status (an
+  // enabled server's unset-${VAR} warning or ignored-field notice is degraded
+  // state too; a CLEAN enabled server stays posture-line data in /doctor,
+  // never a finding). Display hygiene: server NAMES and raw (pre-expansion)
+  // diagnostics only; expanded command/args/env values never reach a finding.
+  const mcp = project.mcp ?? EMPTY_MCP;
+  const pendingNames = mcp.servers
+    .filter((s) => s.status === "pending-approval")
+    .map((s) => s.name);
+  if (pendingNames.length > 0) {
+    const cap = lookupCapability("feature.mcp-project-approval");
+    if (cap) {
+      // With the startup compat surface gone, this /doctor finding is the ONE
+      // canonical carrier of the exact enable/decline settings edit; the
+      // one-time session-start notify (mcpPendingNotice below) only names the
+      // servers and points here.
+      addFinding(
+        cap,
+        `MCP server(s) pending approval: ${mcpNameList(pendingNames)} — ${mcpPendingEditDetail(pendingNames)}`,
+      );
     }
-  } catch {
-    // absent or unreadable — nothing to report (completeness floor)
+  }
+  for (const server of mcp.servers) {
+    const cap = lookupCapability("feature.mcp");
+    if (!cap) continue;
+    if (server.diagnostics.length > 0) {
+      // Most stored diagnostics already quote the server name; the resolver's
+      // unset-${VAR} warnings do not — prefix those so every finding names its
+      // server (never expanded values, the diagnostics are raw-only).
+      const named = server.diagnostics.map((d) =>
+        d.includes(`"${server.name}"`) ? d : `MCP server "${server.name}": ${d}`,
+      );
+      addFinding(cap, named.join("; "));
+    } else if (server.status === "skipped") {
+      // A skipped server without stored diagnostics still surfaces, never silently.
+      addFinding(cap, `MCP server "${server.name}" (${server.source}) skipped: invalid entry`);
+    }
+  }
+  // Config-level diagnostics (malformed .mcp.json, ignored project-scope
+  // approvals, git-tracked settings.local.json demotion) carry their own
+  // remedy text — surface each verbatim under the umbrella MCP entry.
+  for (const diag of mcp.diagnostics) {
+    const cap = lookupCapability("feature.mcp");
+    if (cap) addFinding(cap, diag);
   }
 
   // De-duplicate findings (same capability + same evidence) and unassessed.
@@ -291,11 +338,128 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
     return true;
   });
 
+  const mcpPendingNotice =
+    pendingNames.length > 0 ? buildMcpPendingNotice(pendingNames) : undefined;
+
   return {
     findings: deduped.filter((f) => f.capability.safetyRelevant !== true),
     safetyFindings: deduped.filter((f) => f.capability.safetyRelevant === true),
     unassessed: [...new Set(unassessed)],
+    ...(mcpPendingNotice !== undefined ? { mcpPendingNotice } : {}),
   };
+}
+
+// ---------------------------------------------------------------------------
+// MCP surfaces — pending notice + /doctor posture line
+// ---------------------------------------------------------------------------
+
+const EMPTY_MCP: ResolvedMcpConfig = { servers: [], diagnostics: [] };
+
+/** Cap on server names quoted in one list — a hostile config must not flood a line. */
+const MCP_NAME_LIST_MAX = 8;
+
+/** Bound on a per-server diagnostic quoted on the /doctor posture line. */
+const MCP_POSTURE_DIAG_MAX_CHARS = 240;
+
+function mcpNameList(names: string[]): string {
+  const shown = names.slice(0, MCP_NAME_LIST_MAX).join(", ");
+  const rest = names.length - MCP_NAME_LIST_MAX;
+  return rest > 0 ? `${shown}, and ${rest} more` : shown;
+}
+
+function boundPostureDiag(text: string): string {
+  return text.length > MCP_POSTURE_DIAG_MAX_CHARS
+    ? `${text.slice(0, MCP_POSTURE_DIAG_MAX_CHARS)}…`
+    : text;
+}
+
+/**
+ * The exact enable/decline settings edit for pending project servers — the
+ * body of the /doctor pending finding's evidence.
+ * Bounding: past the name-list cap a verbatim JSON enumeration would flood the
+ * line — recommend the blanket key instead of listing every name.
+ */
+function mcpPendingEditDetail(pendingNames: string[]): string {
+  const enable =
+    pendingNames.length > MCP_NAME_LIST_MAX
+      ? `add "enableAllProjectMcpServers": true (or list a subset in "enabledMcpjsonServers")`
+      : `add "enabledMcpjsonServers": ${JSON.stringify(pendingNames)} (or ` +
+        `"enableAllProjectMcpServers": true)`;
+  return (
+    `${enable} in .claude/settings.local.json to start them; list a server in ` +
+    `"disabledMcpjsonServers" to decline it and silence the session-start notice`
+  );
+}
+
+/**
+ * ONE short, self-contained line (toast-truncation-safe): count, capped names,
+ * the enabling key, and the /doctor pointer. Startup is otherwise quiet, so
+ * this deliberately does NOT carry the full settings edit — the /doctor
+ * pending finding (mcpPendingEditDetail) is the canonical carrier of that.
+ */
+function buildMcpPendingNotice(pendingNames: string[]): string {
+  return (
+    `MCP: ${pendingNames.length} server(s) pending approval (${mcpNameList(pendingNames)}) — ` +
+    `enable with enabledMcpjsonServers in .claude/settings.local.json; run /doctor for the ` +
+    `exact edit and the decline path.`
+  );
+}
+
+/**
+ * Live per-server state as the runtime reports it. Structural (not imported
+ * from runtime/mcp.ts) so the registry layer keeps no runtime dependency;
+ * `McpRuntime.serverStates()` satisfies it.
+ */
+export interface McpServerLiveState {
+  name: string;
+  state: "connecting" | "connected" | "failed";
+  toolCount?: number;
+  diagnostic?: string;
+}
+
+/**
+ * Always-present MCP posture line for `/doctor` (the subagent-posture-line
+ * pattern): live state per ENABLED server from the runtime, gate state per
+ * pending/disabled/skipped server from discovery. Positive/live state lives
+ * HERE — never as a finding.
+ */
+function mcpPostureLine(
+  mcp: ResolvedMcpConfig,
+  liveStates: readonly McpServerLiveState[],
+): string {
+  if (mcp.servers.length === 0) return "MCP: no servers configured.";
+  const liveByName = new Map(liveStates.map((s) => [s.name, s]));
+  const parts = mcp.servers.map((server) => {
+    switch (server.status) {
+      case "enabled": {
+        const live = liveByName.get(server.name);
+        // Enabled but unknown to the runtime (states not supplied — e.g. a
+        // report rendered without a running session): claim only enablement.
+        if (!live) return `${server.name}: enabled`;
+        if (live.state === "connected") return `${server.name}: connected (${live.toolCount ?? 0} tool(s))`;
+        if (live.state === "connecting") return `${server.name}: connecting`;
+        return `${server.name}: failed — ${boundPostureDiag(live.diagnostic ?? "no diagnostic")}`;
+      }
+      case "pending-approval":
+        // No enable/decline hint here — the pending finding rendered below
+        // (registry note + evidence) is the canonical carrier of the edit;
+        // repeating it on the posture line would duplicate it.
+        return `${server.name}: pending approval`;
+      case "disabled":
+        return `${server.name}: disabled (disabledMcpjsonServers)`;
+      case "skipped": {
+        const reason = server.diagnostics[0];
+        return `${server.name}: skipped${reason ? ` — ${boundPostureDiag(reason)}` : ""}`;
+      }
+      default: {
+        // Exhaustiveness backstop: a new ResolvedMcpServer status must be
+        // rendered deliberately, never silently mislabeled as skipped.
+        const unreachable: never = server.status;
+        return `${server.name}: ${String(unreachable)}`;
+      }
+    }
+  });
+  return `MCP servers: ${parts.join("; ")}.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -374,8 +538,7 @@ const TIER_ORDER = ["partial", "degraded-noop", "not-supported", "na", "full"] a
 
 /**
  * Always-present subagent nesting-posture line for `/doctor`. `subagents.*` are
- * PiCC extensions (not Claude-settings parity); the main-session-only default is
- * a deliberate divergence from Claude Code (nests up to 5). Reads the *effective*
+ * PiCC extensions (not Claude-settings parity). Reads the *effective*
  * `subagentMaxDepth` — at render time we cannot tell an explicit value from the
  * default, so we branch on the number and never claim more than is true.
  */
@@ -385,7 +548,7 @@ function subagentPostureLine(project: ClaudeProject): string {
     return "Subagent nesting: subagent dispatch disabled (subagents.enabled=false / disableSubagents:true); no delegation.";
   }
   if (subagentMaxDepth === 1) {
-    return "Subagent nesting: main-session-only (subagents.maxDepth=1, PiCC default; Claude Code nests up to 5). Raise subagents.maxDepth to 2..5 in .claude/settings.json to allow nested delegation.";
+    return "Subagent nesting: main-session-only (subagents.maxDepth=1, PiCC default). Set subagents.maxDepth to any positive integer greater than 1 in .claude/settings.json to allow nested delegation.";
   }
   if (subagentMaxDepth >= 2) {
     return `Subagent nesting: up to ${subagentMaxDepth} levels below the main session (subagents.maxDepth=${subagentMaxDepth}).`;
@@ -397,7 +560,7 @@ function subagentPostureLine(project: ClaudeProject): string {
   // loader — e.g. registry tests), and we still report the actual number
   // truthfully instead of claiming the default. Never asserts "=1, PiCC default"
   // for a value that isn't 1.
-  return `Subagent nesting: subagents.maxDepth=${subagentMaxDepth} (a PiCC extension). Set it to 1 for main-session-only, or 2..5 to allow nested delegation.`;
+  return `Subagent nesting: subagents.maxDepth=${subagentMaxDepth} (a PiCC extension). Set it to 1 for main-session-only, or another positive integer to allow nested delegation.`;
 }
 
 /**
@@ -425,12 +588,14 @@ export function renderDoctorReport(
   report: CompatReport,
   activeModel?: unknown,
   compaction?: ResolvedCompactionConfig,
+  mcpStates?: readonly McpServerLiveState[],
 ): string {
   const lines: string[] = [
     `PiCC compatibility report — baseline ${CLAUDE_BASELINE}`,
     `Project: ${project.root}`,
     activeModelVisionLine(activeModel),
     subagentPostureLine(project),
+    mcpPostureLine(project.mcp ?? EMPTY_MCP, mcpStates ?? []),
     ...(compaction ? [compactionKnobsLine(compaction, activeModel)] : []),
     "",
   ];

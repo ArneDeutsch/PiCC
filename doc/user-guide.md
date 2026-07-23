@@ -133,6 +133,7 @@ managed):
 | Agents | `.claude/agents/*.md` (+ user scope) plus the built-in `general-purpose`, `Explore`, and `Plan` types — dispatchable via the `Agent` tool |
 | Settings | `.claude/settings.json`, `settings.local.json`, `~/.claude/settings.json`, managed policy |
 | Hooks | `settings.json` `hooks` (+ plugin hooks, + skill- and agent-scoped `hooks:`) |
+| MCP servers | `.mcp.json` + settings `mcpServers`; project-scope servers pending until approved |
 | Plugins | already-installed plugins from `~/.claude/plugins` + project-bundled `.claude-plugin/` |
 
 > **Auto memory is conservative by default.** PiCC loads `MEMORY.md` every session but writes to
@@ -189,31 +190,41 @@ Every subagent is visible, both to you and to the coordinating model:
   (`~/.pi/agent/sessions/…`). The agent id appears in the dispatch result, so you can find the run's
   full record without guessing. These files are not reaped automatically.
 - **Status panel.** While agents run, a panel below the input shows the whole agent tree live —
-  no `TaskOutput` await needed. Each row prioritizes state, agent type (tinted with recognized
-  `color:` frontmatter), and the dispatch description; elapsed time and usage appear only when
-  available and terminal width permits. Finished rows linger briefly — ~10 s
+  no `TaskOutput` await needed. When width permits, each agent has an indented row with a status
+  bubble (`◌` while waiting for configured capacity, a spinner while running, `●` done, `✗` failed,
+  `■` stopped), agent type, and dispatch description. Recognized `color:` frontmatter values tint
+  the type; other values do not. State, identity, and description take priority as width narrows;
+  elapsed time and token usage appear only when known and terminal width permits. Elapsed time runs
+  from dispatch acceptance until completion or stop, so it includes any queue time. The panel shows
+  at most eight rows at once; overflow markers and `↑↓` navigation move the window through the full
+  tree. Very narrow widths replace per-agent rows with aggregate state counts, including separate
+  running and waiting counts. Finished rows
+  linger briefly — ~10 s
   for successes, ~60 s for failures and stops — then leave on their own. That auto-expiry is a deliberate PiCC
   deviation: Claude Code keeps finished agents listed until dismissed. An expired row is not lost:
   `alt+a` reopens the panel with every finished agent still listed, and the condensed record in
   the chat (below) arrives once the conversation continues. While the panel has keyboard focus,
-  no row expires on its own (dismissing with `d` still removes). When several agents run at once,
-  a one-time hint names the entry key.
-- **Panel navigation (`alt+a`).** Press `alt+a` to focus the panel; a `❯` marker shows the
-  selection, and the footer hint lists the keys: `↑↓ select · enter open · x stop · X stop all ·
-  d dismiss · esc close`. Stopping from the panel is **background-only** — a foreground agent is
-  cancelled with Esc in the editor, as before (that cancels the whole turn). `X` (stop-all) asks
-  for a second press within ~3 s to confirm. A user-initiated stop is **permanent**: a
+  no row expires on its own (dismissing with `d` still removes). When multiple agents are accepted,
+  including capacity waiters, a one-time hint names the entry key.
+- **Panel navigation (`alt+a`).** Press `alt+a` to focus the panel. On row layouts, a `❯` marker
+  shows the selection and, when width permits, the footer hints at the available navigation, open,
+  stop, dismiss, and close keys; hints may be omitted as the terminal narrows. An aggregate-only
+  layout has no visible target, so open, stop, stop-all, and dismiss ask you to resize wider instead
+  of acting on a hidden selection. Stopping from the panel is **background-only** — a foreground
+  agent is cancelled with Esc in the editor, as before (that cancels the whole turn). `X` (stop-all)
+  asks for a second press within ~3 s to confirm. A user-initiated stop is **permanent**: a
   user-stopped agent cannot be steered or resumed afterwards, not even by the model.
 - **Drill-down.** Enter opens the selected agent: its initial prompt (collapsed; `ctrl+p`
   expands), bounded structured live detail (auto-following; `↑↓` scrolls, scrolling back stops
-  the follow), and — once settled — its final answer. `ctrl+x` stops a running background agent
-  (on a settled one it dismisses). While a background agent runs, type a steering message
-  directly into the drill-down and press Enter to send; it is delivered before the agent's next
-  model call (the confirmation is optimistic — a delivery failure replaces it). **Caveat:**
-  drill-down steering does not fire the project's `UserPromptSubmit` hooks — a PiCC decision.
-  Esc steps back one layer: drill-down → list → editor (with typed steer text, the first Esc
-  clears the text; where steering is unavailable — foreground, one-shot, user-stopped — the view
-  says so instead of offering an input line).
+  the follow), and — once settled — its final answer. `ctrl+x` stops an admitted running or
+  capacity-waiting background agent (on a settled one it dismisses). While an admitted background
+  agent runs, type a steering message directly into the drill-down and press Enter to send; it is
+  delivered before the agent's next model call (the confirmation is optimistic — a delivery failure
+  replaces it). **Caveat:** drill-down steering does not fire the project's `UserPromptSubmit`
+  hooks — a PiCC decision. Esc steps back one layer: drill-down → list → editor (with typed steer
+  text, the first Esc clears the text; where steering is unavailable — waiting for capacity until
+  admission, foreground, one-shot, or user-stopped — the view says so instead of offering an input
+  line).
 - **Condensed transcript records.** Subagent output does not stream into the chat; selected-agent
   detail owns the live view. Each depth-1 normal-path result replaces its pending call in the same
   tool row; background completion adds one collapsed record — outcome, duration, tokens — that
@@ -241,17 +252,21 @@ Every subagent is visible, both to you and to the coordinating model:
 
 ### Subagent dispatch controls (`.claude/settings.json`)
 
-Three project settings shape subagent dispatch, under a `subagents` key (they also read at user
-scope; project overrides user). These are PiCC extensions with no Claude-settings equivalent.
+Three settings shape subagent dispatch under a `subagents` key. The effective merged value is
+binding: project and local settings may override user scope, while managed policy has highest
+precedence. These are PiCC extensions with no Claude-settings equivalent.
 
 | Key | Default | Effect |
 |---|---|---|
 | `subagents.enabled` | `true` | Gates **all** subagent delegation. `false` (or the inverse alias `disableSubagents: true`) removes `Agent`/`Task` from the main session entirely. |
-| `subagents.maxDepth` | `1` | Caps subagent **nesting** depth. Default `1` = main-session-only. Raise to `2..5` to let each further generation dispatch. |
-| `subagents.concurrency` | `4` | Caps parallel subagent fan-out. |
+| `subagents.maxDepth` | `1` | Caps subagent **nesting** depth. Any positive integer is valid; default `1` = main-session-only, and nesting requires a value greater than `1`. |
+| `subagents.concurrency` | `10` | Bounds admitted root dispatches and, separately, each opted-in nested-background depth. Additional accepted work waits FIFO with no separate queue-size cap. |
 
 The main conversation is **depth 0**; the subagents it dispatches are depth 1. So the default
-`maxDepth: 1` allows normal fan-out but blocks a subagent from dispatching its own.
+`maxDepth: 1` allows normal fan-out but blocks a subagent from dispatching its own. When nesting is
+enabled, each background depth has its own configured-capacity pool; `maxDepth × concurrency`
+bounds those background pools, not total active work. Foreground nested dispatch bypasses the pools
+to prevent a parent/child deadlock, so total active work can be higher.
 
 **The two "off" states are different.** If your goal is "no runaway recursion," use `maxDepth` —
 `enabled: false` removes delegation entirely, including ordinary depth-1 fan-out.
@@ -374,6 +389,8 @@ tracked project files):
 | `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | Force **every** `Agent`/`Task` dispatch to the foreground (background is otherwise the default). `SendMessage` resume is inherently async and is **not** governed by this switch |
 | `CLAUDE_CODE_FORK_SUBAGENT` | Gate `subagent_type: "fork"` dispatch (inherit the parent conversation instead of starting fresh): `1` forces it on, `0` off. **Left unset it is enabled** — a deliberate PiCC choice. Inheritance is honored only for a **main-session** dispatch; nested, print-mode, and `isolation: worktree` forks run with fresh context and say so on the result |
 | `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` | Remove the built-in `Explore`/`Plan` agent types (`general-purpose` always stays) |
+| `MCP_TIMEOUT` | MCP server connect timeout in ms (default `30000` — 30 s, Claude parity) |
+| `MCP_TOOL_TIMEOUT` | MCP tool-call timeout in ms when a server entry sets no `timeout` (default ~28 h, Claude parity; values clamped to [1 s, ~24.8 d]) |
 | `SLASH_COMMAND_TOOL_CHAR_BUDGET` | Override the startup skill-listing character budget |
 
 ## 6. Security & permission posture
@@ -410,6 +427,13 @@ argument, which makes it best-effort — Claude Code's own limit, not a PiCC gap
    `MultiEdit`; the cross in rule 1 applies to a path-scoped rule only.
 3. **A shell read needs its own `Bash(...)` deny.** `Bash(cat secrets/x)` is not covered by any
    `Read` rule.
+
+**MCP servers.** Project-scope MCP servers (`.mcp.json`, or `mcpServers` in the committed
+`.claude/settings.json`) are pending by default and never start until you approve them. Approve in
+`.claude/settings.local.json` with `"enableAllProjectMcpServers": true` or a named
+`"enabledMcpjsonServers"` list; decline with `"disabledMcpjsonServers"`, which always wins and
+silences the pending notice. If `settings.local.json` is git-tracked, its approvals are ignored —
+untrack it (`git rm --cached .claude/settings.local.json`) to restore them.
 
 ## 7. What is and isn't supported
 
@@ -451,11 +475,12 @@ behaviors worth knowing:
 | Skill shell injection prints `[shell execution disabled: …]` | project set `disableSkillShellExecution`; that's the project's intent |
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
+| MCP pending-approval notice at every startup | Approve the server(s) — `enabledMcpjsonServers` (or `enableAllProjectMcpServers`) in `.claude/settings.local.json` — or list them in `disabledMcpjsonServers` to decline; `/doctor` shows the exact edit |
 | Session died at high context / "input exceeds the context window" | Lower `proactiveCompactPercent` in `.claude/.picc/config.json` so PiCC compacts earlier (see Harness configuration above) |
 | Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | Reopen the exact persisted session before recovery; an ephemeral headless session instead requires a replacement session and resent input. For operational exhaustion, run `/compact`, then explicitly continue. For a hook block, repair/disable the hook or allow manual compaction first. For any post-commit restoration/startup failure, do **not** compact again; start a new session and resend retained input. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories `checkpoint-exhausted` and `checkpoint-resumed`; RPC acknowledgement, print stdout, and print exit status do not prove logical completion. |
 | `picc -p` finished but a subagent's output never appeared | Background is the default and a one-shot print run has no next turn to deliver it on. Set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for scripted runs, or collect with `TaskOutput` before the run ends. |
-| Subagents can't spawn subagents / nested fan-out flattened | PiCC defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Raise `subagents.maxDepth` to `2..5` in `.claude/settings.json`; see "Subagent dispatch controls" above. `/doctor` also shows the current nesting posture. |
-| Unexpected skills/agents from plugins | PiCC loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. |
+| Subagents can't spawn subagents / nested fan-out flattened | PiCC defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Set `subagents.maxDepth` to a positive integer greater than 1 in `.claude/settings.json`; see "Subagent dispatch controls" above. `/doctor` also shows the current nesting posture. |
+| Unexpected skills/agents from plugins | PiCC loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. `/doctor` reports how many are available but disabled. |
 | A plugin you enabled isn't loading | Confirm it's listed truthy in `enabledPlugins` as `name@marketplace`, and that it isn't in `~/.claude/plugins/blocklist.json`. |
 | Want to see why a fan-out routed the way it did | agent descriptions are the routing surface — inspect the "Available subagents" catalog in the session, and the dispatch tool calls in the transcript |
 | Agent finished, its panel row is gone, and no record shows in the chat | Press `alt+a` — finished agents stay reachable in the panel after their rows expire. Or continue the conversation: the condensed record rides the next turn. |

@@ -6,6 +6,7 @@ import type {
   HookHandler,
   HookHandlerType,
   HookMatcherEntry,
+  McpSettingsEntry,
   Scope,
 } from "../types.js";
 
@@ -24,6 +25,9 @@ import type {
  * - `env` merges key-wise, higher precedence wins.
  * - `enabledPlugins` merges key-wise, higher precedence wins per plugin key.
  * - `claudeMdExcludes` accumulates (arrays merge across layers, per Claude docs).
+ * - MCP keys (`mcpServers`, `enableAllProjectMcpServers`, `enabled/disabledMcpjsonServers`)
+ *   are captured scope-tagged per file in `mcpSettings`, never merged here —
+ *   precedence and the enablement gate resolve in `discovery/mcp.ts`.
  * - Scalar settings follow precedence (higher scope wins; a malformed value at a
  *   higher scope is ignored with a diagnostic, keeping the lower-scope value).
  *
@@ -44,10 +48,6 @@ export interface LoadSettingsOptions {
 
 /** Keys recognized but gating DEFERRED subsystems — recorded, no-op. */
 const DEFERRED_TOP_KEYS = new Set([
-  "mcpServers",
-  "enableAllProjectMcpServers",
-  "enabledMcpjsonServers",
-  "disabledMcpjsonServers",
   "outputStyle",
   "statusLine",
   "forceLoginMethod",
@@ -84,15 +84,13 @@ function createDefaultSettings(): ClaudeSettings {
     autoMemoryEnabled: true,
     worktree: { baseRef: "head" },
     subagentsEnabled: true,
-    // Main-session-only by default: the main conversation may spawn depth-1
-    // subagents, but those subagents cannot recurse. This is a deliberate PiCC
-    // divergence from Claude Code's "up to 5 nesting levels" contract:
-    // recursive fan-out under a depth-5 default drains a personal ChatGPT/Codex
-    // subscription with little operator visibility. Opt into nesting explicitly via
-    // `subagents.maxDepth: 2..5` (a PiCC extension key, not Claude-settings parity).
+    // maxDepth accepts positive integers, but nesting requires a value greater than 1.
+    // Main-session-only remains the default to avoid unexpected recursive fan-out
+    // draining subscription capacity (a PiCC extension, not Claude-settings parity).
     subagentMaxDepth: 1,
-    subagentConcurrency: 4,
+    subagentConcurrency: 10,
     enabledPlugins: undefined,
+    mcpSettings: [],
     unknownKeys: [],
     deferredKeys: [],
     diagnostics: [],
@@ -172,9 +170,36 @@ export function stripJsonc(text: string): string {
   return out;
 }
 
-/** Expand `${VAR}` from the process environment; unknown vars are left intact. */
-export function expandEnvVars(value: string, env: NodeJS.ProcessEnv = process.env): string {
-  return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (match, name: string) => env[name] ?? match);
+/**
+ * Expand `${VAR}` and `${VAR:-default}` from the process environment.
+ * - `${VAR}` with an unset variable keeps the literal text and reports the
+ *   variable name via `onUnset` (callers surface it as a warning diagnostic).
+ * - `${VAR:-default}` substitutes the default ONLY when the variable is unset;
+ *   an empty-string value counts as set and yields `""` (Claude Code
+ *   semantics — NOT bash `:-`, which would also default on empty). The default
+ *   ends at the first `}`, so it cannot itself contain `}`.
+ */
+export function expandEnvVars(
+  value: string,
+  env: NodeJS.ProcessEnv = process.env,
+  onUnset?: (name: string) => void,
+): string {
+  // The FUNCTION replacer form is load-bearing: a string replacement would let
+  // env values containing `$&`/`$'`-style replacement patterns inject text.
+  return value.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*)(:-([^}]*))?\}/g,
+    (match, name: string, defaultPart?: string, defaultValue?: string) => {
+      const current = env[name];
+      if (defaultPart !== undefined) {
+        return current !== undefined ? current : (defaultValue ?? "");
+      }
+      if (current === undefined) {
+        onUnset?.(name);
+        return match;
+      }
+      return current;
+    },
+  );
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -527,6 +552,20 @@ function applySubagents(value: unknown, scope: Scope, source: string, out: Claud
   }
 }
 
+/**
+ * Find-or-create the scope-tagged MCP entry for the settings file currently
+ * being applied. MCP keys are captured per file and NEVER merged across
+ * scopes: the enablement gate (discovery/mcp.ts) needs each value's origin.
+ */
+function mcpEntryFor(out: ClaudeSettings, scope: Scope, source: string): McpSettingsEntry {
+  const list = (out.mcpSettings ??= []);
+  const last = list[list.length - 1];
+  if (last !== undefined && last.sourcePath === source) return last;
+  const entry: McpSettingsEntry = { scope, sourcePath: source };
+  list.push(entry);
+  return entry;
+}
+
 /** Apply one parsed settings file onto the accumulating result (called in ascending precedence). */
 function applySettingsFile(
   raw: Record<string, unknown>,
@@ -691,6 +730,42 @@ function applySettingsFile(
       case "subagents":
         applySubagents(value, scope, source, out);
         break;
+      case "mcpServers": {
+        if (!isPlainObject(value)) {
+          out.diagnostics.push({
+            severity: "warning",
+            message: `Setting "mcpServers" is not an object; ignored`,
+            source,
+          });
+          break;
+        }
+        // Null-prototype copy: server names are JSON-controlled and may
+        // collide with Object.prototype members ("constructor", "toString").
+        const servers: Record<string, unknown> = Object.create(null);
+        for (const [name, entryRaw] of Object.entries(value)) servers[name] = entryRaw;
+        mcpEntryFor(out, scope, source).servers = servers;
+        break;
+      }
+      case "enableAllProjectMcpServers": {
+        const b = expectBool(value, "enableAllProjectMcpServers", source, out.diagnostics);
+        if (b !== undefined) mcpEntryFor(out, scope, source).enableAllProjectMcpServers = b;
+        break;
+      }
+      case "enabledMcpjsonServers":
+      case "disabledMcpjsonServers": {
+        // Deliberately stricter than toStringArray alone: a bare string is NOT
+        // coerced to a one-element list for these security-gating keys.
+        if (!Array.isArray(value)) {
+          out.diagnostics.push({
+            severity: "warning",
+            message: `Setting "${key}" is not an array; ignored`,
+            source,
+          });
+          break;
+        }
+        mcpEntryFor(out, scope, source)[key] = toStringArray(value, key, source, out.diagnostics);
+        break;
+      }
       case "disableSubagents": {
         const b = expectBool(value, "disableSubagents", source, out.diagnostics);
         if (b !== undefined) out.subagentsEnabled = !b;

@@ -15,6 +15,7 @@ import {
   DETAIL_BANNER_VANISHED,
   DETAIL_STEER_SENT,
   detailSteerFailed,
+  detailSteerUnavailable,
   PANEL_RUNNING_FRAMES,
   renderSubagentDetail,
   renderSubagentPanel,
@@ -77,16 +78,18 @@ export const PANEL_NOTICE_STALE = "That agent row changed — no action taken.";
 export const PANEL_NOTICE_FOREGROUND =
   "Foreground agents cannot be stopped from the panel — Esc in the editor cancels the whole turn.";
 export const PANEL_NOTICE_RUNNING_DISMISS = "Still running — press x to stop it first.";
-export const PANEL_NOTICE_STOP_ALL_NONE = "No running background agents to stop.";
+export const PANEL_NOTICE_STOP_ALL_NONE = "No active background agents to stop.";
+/** Refuse row actions when responsive fallback has hidden the selected target. */
+export const PANEL_NOTICE_RESIZE_ACTION = "Resize wider to show an agent row before acting.";
 
 export function panelNoticeStopRequested(label: string): string {
   return `Stop requested for ${label} — it will settle as aborted.`;
 }
 export function panelNoticeStopAllArmed(n: number): string {
-  return `Press X again to stop ${n} running background agent${n === 1 ? "" : "s"}.`;
+  return `Press X again to stop ${n} active background agent${n === 1 ? "" : "s"}.`;
 }
 export function panelNoticeStopAllDone(n: number): string {
-  return `Stop requested for ${n} background agent${n === 1 ? "" : "s"}.`;
+  return `Stop requested for ${n} active background agent${n === 1 ? "" : "s"}.`;
 }
 
 /** The one line shown when every row is gone while the panel holds focus. */
@@ -125,6 +128,8 @@ export interface SubagentPanelFocusDeps {
   registry: SubagentRegistry;
   /** Background-task join info in registration order (newest generation last). */
   tasks: () => readonly PanelTaskInfo[];
+  /** Task-registry notification for status/admission-only presentation changes. */
+  onTasksChange?: (listener: () => void) => () => void;
   /**
    * Task-side user stop (`BackgroundTaskRegistry.markUserStopped` in
    * production) — every panel stop pairs it with
@@ -140,8 +145,8 @@ export interface SubagentPanelFocusDeps {
 }
 
 /**
- * Per-open drill-down state. The selection KEY keeps t05's stale-refusal
- * action semantics for the chorded stop; the agent id is what the view itself
+ * Per-open drill-down state. The selection key keeps stale-refusal action
+ * semantics for the chorded stop; the agent id is what the view itself
  * re-resolves each render (registry records never evict, so the record
  * outlives generation changes and keeps rendering through them).
  */
@@ -152,8 +157,6 @@ interface DetailState {
   lastObservedState: "running" | "settled" | "gone";
   /** Max scroll reported by the last render — what scroll keys clamp against. */
   lastMaxScroll: number;
-  /** Live-repaint registry subscription; called on view exit and dispose. */
-  unsubscribe?: () => void;
 }
 
 /**
@@ -167,6 +170,11 @@ type ResolvedTarget =
   | { kind: "running-foreground"; record: SubagentRegistryRecord }
   | { kind: "settled"; record: SubagentRegistryRecord; keyId: string }
   | { kind: "stale" };
+
+function isStoppableTask(task: PanelTaskInfo): boolean {
+  return task.status === "running" ||
+    (task.status === "failed" && task.checkpointPaused === true);
+}
 
 export class SubagentPanelFocusController {
   private readonly deps: SubagentPanelFocusDeps;
@@ -277,18 +285,29 @@ export class SubagentPanelFocusController {
       // sits in one try, and the return value goes through Promise.resolve: a
       // broken host whose `custom` throws OR returns a non-thenable must never
       // strand `openFlag`/suppression (that would suppress the widget and the
-      // fork-Esc watch for the rest of the session).
+      // fork-Esc watch for the rest of the session). Keep the component outside
+      // the try because a host may invoke the factory synchronously, then throw.
+      let component: PanelFocusComponentShape | undefined;
       try {
         const opened = Promise.resolve(
-          ui.custom((tui, theme, keybindings, done) =>
-            this.createComponent({ tui, theme, keybindings, done, notify }),
-          ),
+          ui.custom((tui, theme, keybindings, done) => {
+            component = this.createComponent({ tui, theme, keybindings, done, notify });
+            return component;
+          }),
         );
-        opened.then(cleanup, (err) => {
-          cleanup();
-          console.error(`PiCC subagent panel closed with an error: ${(err as Error).message}`);
-        });
+        opened.then(
+          () => {
+            component?.dispose();
+            cleanup();
+          },
+          (err) => {
+            component?.dispose();
+            cleanup();
+            console.error(`PiCC subagent panel closed with an error: ${(err as Error).message}`);
+          },
+        );
       } catch (err) {
+        component?.dispose();
         cleanup();
         console.error(`PiCC subagent panel open failed: ${(err as Error).message}`);
         return;
@@ -348,7 +367,7 @@ export class SubagentPanelFocusController {
         if (byAgent.get(task.agentId)?.id !== task.id) return { kind: "stale" };
         const record = this.deps.registry.get(task.agentId);
         if (!record) return { kind: "stale" };
-        return record.state === "running"
+        return record.state === "running" && isStoppableTask(task)
           ? { kind: "running-background", record, taskId: task.id }
           : { kind: "settled", record, keyId: selectionKeyId(key) };
       }
@@ -364,15 +383,63 @@ export class SubagentPanelFocusController {
   }
 
   /**
+   * Resolve steering through the selected current generation. Task identity,
+   * running status, and effective admission are checked before the registry
+   * guard so a render/send race cannot deliver buffered text to a superseding
+   * session. A still-taskless selection uses the same guard as its rendering.
+   */
+  private resolveSteerTarget(key: PanelSelectionKey):
+    | { ok: true; steer: (text: string) => Promise<void> | void }
+    | { ok: false; refusal: string } {
+    try {
+      const tasks = this.deps.tasks();
+      const byAgent = newestTaskByAgent(tasks);
+      if (key.kind !== "task") {
+        if (byAgent.has(key.agentId)) return { ok: false, refusal: PANEL_NOTICE_STALE };
+        const record = this.deps.registry.get(key.agentId);
+        if (!record) return { ok: false, refusal: PANEL_NOTICE_STALE };
+        return guardSteer(record);
+      }
+      const task = tasks.find((candidate) => candidate.id === key.taskId);
+      if (!task?.agentId || byAgent.get(task.agentId)?.id !== task.id) {
+        return { ok: false, refusal: PANEL_NOTICE_STALE };
+      }
+      if (task.status !== "running") {
+        return { ok: false, refusal: detailSteerUnavailable("agent is no longer running") };
+      }
+      const record = this.deps.registry.get(task.agentId);
+      if (!record) return { ok: false, refusal: PANEL_NOTICE_STALE };
+      if ((task.admission ?? record.admission ?? "admitted") !== "admitted") {
+        return { ok: false, refusal: detailSteerUnavailable("waiting for capacity") };
+      }
+      return guardSteer(record);
+    } catch {
+      return { ok: false, refusal: PANEL_NOTICE_STALE };
+    }
+  }
+
+  /**
    * Re-resolve the drill-down's record + newest-generation task each render.
    * A poisoned join degrades to "no record" (→ the vanished banner) — the
    * detail view never throws or freezes on registry state.
    */
-  private detailData(agentId: string): { record?: SubagentRegistryRecord; taskId?: string } {
+  private detailData(agentId: string): {
+    record?: SubagentRegistryRecord;
+    taskId?: string;
+    taskStatus?: PanelTaskInfo["status"];
+    taskAdmission?: PanelTaskInfo["admission"];
+    taskSettledAt?: number;
+  } {
     try {
       const record = this.deps.registry.get(agentId);
       const task = newestTaskByAgent(this.deps.tasks()).get(agentId);
-      return { record, taskId: task?.id };
+      return {
+        record,
+        taskId: task?.id,
+        taskStatus: task?.status,
+        taskAdmission: task?.admission,
+        taskSettledAt: task?.settledAt,
+      };
     } catch {
       return {};
     }
@@ -389,14 +456,14 @@ export class SubagentPanelFocusController {
     this.deps.stopTask(taskId);
   }
 
-  /** Running background agents (newest generation each) — stop-all's targets. */
+  /** Active background agents (newest generation each) — stop-all's targets. */
   private collectStopAllTargets(): Array<{ record: SubagentRegistryRecord; taskId: string }> {
     const byAgent = newestTaskByAgent(this.deps.tasks());
     const targets: Array<{ record: SubagentRegistryRecord; taskId: string }> = [];
     for (const record of this.deps.registry.list()) {
       if (!record || record.state !== "running" || record.userStopped) continue;
       const task = byAgent.get(record.agentId);
-      if (!task) continue; // foreground — panel stop is background-only in v1
+      if (!task || !isStoppableTask(task)) continue; // foreground/terminal task
       targets.push({ record, taskId: task.id });
     }
     return targets;
@@ -416,6 +483,27 @@ export class SubagentPanelFocusController {
     let viewMode: "list" | "detail" = "list";
     let detail: DetailState | undefined;
     let stopAllArmedAt: number | undefined;
+    // Fail closed until a focused list render proves its selected row is visible.
+    let selectedRowVisible = false;
+    let interval: ReturnType<typeof setInterval> | undefined;
+    let unsubscribeRegistry: (() => void) | undefined;
+    let unsubscribeTasks: (() => void) | undefined;
+    let tornDown = false;
+
+    const teardown = (): void => {
+      if (tornDown) return;
+      tornDown = true;
+      if (interval) clearInterval(interval);
+      for (const unsubscribe of [unsubscribeRegistry, unsubscribeTasks]) {
+        try {
+          unsubscribe?.();
+        } catch {
+          // Display subscription teardown must not trap focus.
+        }
+      }
+      unsubscribeRegistry = undefined;
+      unsubscribeTasks = undefined;
+    };
 
     const close = (): void => {
       if (closed) return;
@@ -425,6 +513,7 @@ export class SubagentPanelFocusController {
       try {
         done(undefined);
         closed = true;
+        teardown();
       } catch (err) {
         console.error(`PiCC subagent panel close failed: ${(err as Error).message}`);
       }
@@ -447,7 +536,7 @@ export class SubagentPanelFocusController {
     // Repaint tick (spinner + elapsed), same discipline as the widget shell:
     // the interval lives exactly as long as the component, and unref keeps a
     // repaint timer from holding the process open.
-    const interval = setInterval(() => {
+    interval = setInterval(() => {
       try {
         frame = (frame + 1) % PANEL_RUNNING_FRAMES.length;
         tui.requestRender?.();
@@ -456,6 +545,25 @@ export class SubagentPanelFocusController {
       }
     }, this.tickMs);
     interval.unref?.();
+
+    const requestRepaint = (): void => {
+      if (tornDown) return;
+      try {
+        tui.requestRender?.();
+      } catch {
+        // repaint is best-effort
+      }
+    };
+    try {
+      unsubscribeRegistry = this.deps.registry.onChange(requestRepaint);
+    } catch {
+      // The periodic tick remains a display-only fallback.
+    }
+    try {
+      unsubscribeTasks = this.deps.onTasksChange?.(requestRepaint);
+    } catch {
+      // The periodic tick remains a display-only fallback.
+    }
 
     /**
      * Action shared by `x`/`d` in the list and `ctrl+x` in the drill-down —
@@ -495,7 +603,7 @@ export class SubagentPanelFocusController {
 
     const stopAll = (): void => {
       // Targets are collected at THIS keypress, so the confirming press stops
-      // exactly what is running now, not what was running when it armed.
+      // exactly what is active now, not what was active when it armed.
       const targets = this.collectStopAllTargets();
       if (targets.length === 0) {
         stopAllArmedAt = undefined;
@@ -521,20 +629,6 @@ export class SubagentPanelFocusController {
         notify(PANEL_NOTICE_STALE);
         return;
       }
-      // Live repaint while the drill-down is open: progress events land on
-      // the registry between ticks, and a 1s tick alone would lag structured detail.
-      let unsubscribe: (() => void) | undefined;
-      try {
-        unsubscribe = this.deps.registry.onChange(() => {
-          try {
-            tui.requestRender?.();
-          } catch {
-            // repaint is best-effort
-          }
-        });
-      } catch {
-        // no live repaint — the tick still refreshes the view
-      }
       detail = {
         key,
         agentId: target.record.agentId,
@@ -548,20 +642,16 @@ export class SubagentPanelFocusController {
         },
         lastObservedState: target.record.state,
         lastMaxScroll: 0,
-        unsubscribe,
       };
       viewMode = "detail";
+      selectedRowVisible = false;
     };
 
-    /** Leave the drill-down for the list, releasing its subscription. */
+    /** Leave the drill-down for the list. */
     const exitDetail = (): void => {
-      try {
-        detail?.unsubscribe?.();
-      } catch {
-        // an unsubscribing throw must not trap the Esc ladder
-      }
       detail = undefined;
       viewMode = "list";
+      selectedRowVisible = false;
     };
 
     const scrollDetail = (delta: number): void => {
@@ -579,9 +669,10 @@ export class SubagentPanelFocusController {
       const d = detail!;
       const text = d.ui.steerBuffer;
       if (!text.trim()) return;
-      const record = this.deps.registry.get(d.agentId);
-      if (!record) {
-        d.ui.notice = DETAIL_BANNER_VANISHED;
+      const guarded = this.resolveSteerTarget(d.key);
+      if (!guarded.ok) {
+        d.ui.steerBuffer = "";
+        d.ui.notice = sanitizeLine(guarded.refusal, DETAIL_NOTICE_CAP);
         return;
       }
       // Deliberately NO UserPromptSubmit hook here — a PiCC decision, not a
@@ -589,11 +680,6 @@ export class SubagentPanelFocusController {
       // (the `input` handler in src/index.ts), and Claude Code leaves its
       // steering hook behavior undocumented, so PiCC pins "steer text goes
       // straight to the running session" rather than inventing a contract.
-      const guarded = guardSteer(record);
-      if (!guarded.ok) {
-        d.ui.notice = sanitizeLine(guarded.refusal, DETAIL_NOTICE_CAP);
-        return;
-      }
       try {
         // The ONLY delivery path is the guard's bound steer fn — a caller
         // that passed the guard cannot reach a different session.
@@ -673,8 +759,11 @@ export class SubagentPanelFocusController {
       // available; otherwise the rendered "steering unavailable (…)" line
       // explains the inert keys — text is never accepted into a buffer that
       // cannot send.
-      const record = this.deps.registry.get(d.agentId);
-      if (!record || !guardSteer(record).ok) return;
+      const guarded = this.resolveSteerTarget(d.key);
+      if (!guarded.ok) {
+        d.ui.notice = sanitizeLine(guarded.refusal, DETAIL_NOTICE_CAP);
+        return;
+      }
       d.ui.notice = undefined;
       d.ui.steerBuffer = [...`${d.ui.steerBuffer}${text}`].slice(0, STEER_INPUT_CAP).join("");
     };
@@ -685,7 +774,7 @@ export class SubagentPanelFocusController {
       // Live state changes while open are narrated, never a crash/freeze: the
       // banner pins the transition and the layout/anchor follow the new state.
       const observed: DetailState["lastObservedState"] = data.record
-        ? data.record.state
+        ? data.taskStatus === "stopped" ? "settled" : data.record.state
         : "gone";
       if (observed !== d.lastObservedState) {
         if (observed === "gone") {
@@ -695,7 +784,7 @@ export class SubagentPanelFocusController {
           // there is nothing to send it to anyway.
           d.ui.steerBuffer = "";
         } else if (observed === "settled") {
-          d.ui.banner = data.record?.userStopped || data.record?.outcome === "aborted"
+          d.ui.banner = data.taskStatus === "stopped" || data.record?.userStopped || data.record?.outcome === "aborted"
             ? DETAIL_BANNER_STOPPED
             : data.record?.outcome === "failed"
               ? DETAIL_BANNER_FAILED
@@ -710,13 +799,13 @@ export class SubagentPanelFocusController {
           // generation (when one resolves): the header shows the new task id
           // and the banner announces the resume, so the advertised
           // `ctrl+x stop` must act on the DISPLAYED generation — the old key
-          // would hit t05's stale refusal instead.
+          // would hit the stale-generation refusal instead.
           if (data.taskId) d.key = { kind: "task", taskId: data.taskId };
         }
         d.lastObservedState = observed;
       }
       const rendered = renderSubagentDetail(
-        { record: data.record, taskId: data.taskId, nowMs: this.nowFn() },
+        { ...data, nowMs: this.nowFn() },
         d.ui,
         { width, theme, runningFrame: PANEL_RUNNING_FRAMES[frame] },
       );
@@ -729,21 +818,28 @@ export class SubagentPanelFocusController {
         // Defensive render: pi-tui kills the process on a throwing render.
         try {
           if (viewMode === "detail" && detail) {
+            selectedRowVisible = false;
             return renderDetailView(width);
           }
           const view = computeView();
           if (view.empty) {
+            selectedRowVisible = false;
             // Every row dismissed/gone while focused: keep a visible line so
             // the user is never left holding focus on an invisible component.
             return clampLines([themedFg(theme, "muted", PANEL_FOCUSED_EMPTY_LINE)], width);
           }
-          return renderSubagentPanel(view, {
+          const lines = renderSubagentPanel(view, {
             width,
             theme,
             runningFrame: PANEL_RUNNING_FRAMES[frame],
             entryChord: PANEL_ENTRY_CHORD,
           });
+          // The marker is emitted only by the real row profile and survives
+          // the final clamp only when the selected target is actually visible.
+          selectedRowVisible = lines.some((line) => line.includes("❯"));
+          return lines;
         } catch (err) {
+          selectedRowVisible = false;
           console.error(`PiCC subagent panel render failed: ${(err as Error).message}`);
           // Same rationale as the empty view: never leave the user holding
           // focus on an INVISIBLE component — plain text, no theme call that
@@ -793,14 +889,22 @@ export class SubagentPanelFocusController {
           if (matches("tui.select.up")) {
             computeView();
             model.moveSelection(-1);
+            selectedRowVisible = false;
             return;
           }
           if (matches("tui.select.down")) {
             computeView();
             model.moveSelection(1);
+            selectedRowVisible = false;
             return;
           }
-          if (matches("tui.select.confirm")) {
+          const confirm = matches("tui.select.confirm");
+          const rowAction = confirm || data === "x" || data === "X" || data === "d";
+          if (rowAction && !selectedRowVisible) {
+            notify(PANEL_NOTICE_RESIZE_ACTION);
+            return;
+          }
+          if (confirm) {
             enter();
             return;
           }
@@ -813,12 +917,7 @@ export class SubagentPanelFocusController {
         }
       },
       dispose: (): void => {
-        clearInterval(interval);
-        try {
-          detail?.unsubscribe?.();
-        } catch {
-          // dispose must complete even if the unsubscribe throws
-        }
+        teardown();
       },
     };
   }

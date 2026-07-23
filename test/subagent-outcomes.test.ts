@@ -319,37 +319,109 @@ describe("dispatch outcome classification", () => {
     expect(h.created).toHaveLength(0); // no session was ever created
   });
 
-  it("abort while queued behind the concurrency cap → aborted without a session", async () => {
+  it("abort while queued preserves delayed cleanup and releases the next waiter only afterward", async () => {
     let releaseGate!: () => void;
     const gate = new Promise<void>((resolve) => (releaseGate = resolve));
-    const h = fakeSdk({ replies: [{ text: "slot-holder done", gate }] });
+    let cleanupEntered!: () => void;
+    const cleanupStarted = new Promise<void>((resolve) => (cleanupEntered = resolve));
+    let releaseCleanup!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => (releaseCleanup = resolve));
+    let releaseB!: () => void;
+    const gateB = new Promise<void>((resolve) => (releaseB = resolve));
+    let releaseC!: () => void;
+    const gateC = new Promise<void>((resolve) => (releaseC = resolve));
+    const h = fakeSdk({
+      replies: [
+        { text: "slot-holder done", gate },
+        { text: "B done", gate: gateB },
+        { text: "C done", gate: gateC },
+      ],
+    });
     const registry = new SubagentRegistry();
-    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+    const starts: string[] = [];
+    const stops: string[] = [];
+    const worktreeEntries: string[] = [];
+    const queuedId = "agent-000000000002";
+    const bId = "agent-000000000003";
+    const cId = "agent-000000000004";
+    const hookRunner = {
+      fire: async (event: string, payload: Record<string, unknown>) => {
+        const id = String(payload.agent_id ?? "");
+        if (event === "SubagentStart") starts.push(id);
+        if (event === "SubagentStop") {
+          stops.push(id);
+          if (id === queuedId) {
+            cleanupEntered();
+            await cleanupGate;
+          }
+        }
+        return { block: false, askDowngraded: false, diagnostics: [] };
+      },
+    };
+    const runtime = makeSubagentRuntime([makeAgent({ isolation: "worktree" })], h.sdk, {
       concurrency: 1,
       subagentRegistry: registry,
+      hookRunner,
+      worktrees: {
+        enter: async ({ name }: { name?: string }) => {
+          worktreeEntries.push(name ?? "");
+          return { ok: true as const, worktreePath: `/worktrees/${name}`, diagnostics: [] };
+        },
+        exit: async () => ({ diagnostics: [] }),
+      },
     });
-    const first = runtime.dispatch({ subagentType: "reviewer", prompt: "hold", depth: 1 });
-    await h.waitForPromptCalls(1); // holder owns the only slot while its gate is closed
+    const first = runtime.dispatch({
+      subagentType: "reviewer", prompt: "hold", depth: 1, agentId: "agent-000000000001",
+    });
+    await h.waitForPromptCalls(1);
 
     const controller = new AbortController();
+    const phases: string[] = [];
     const second = runtime.dispatch({
       subagentType: "reviewer",
       prompt: "queued",
       depth: 1,
+      agentId: queuedId,
       abortSignal: controller.signal,
+      onAdmission: (phase) => phases.push(phase),
     });
-    // dispatch() registers synchronously before awaiting the semaphore: this proves
-    // the waiter entered dispatch while still proving it created no session.
-    expect(registry.list()).toHaveLength(2);
-    expect(registry.list().filter((record) => record.session === undefined)).toHaveLength(1);
+    const third = runtime.dispatch({
+      subagentType: "reviewer", prompt: "B", depth: 1, agentId: bId,
+    });
+    const fourth = runtime.dispatch({
+      subagentType: "reviewer", prompt: "C", depth: 1, agentId: cId,
+    });
+    expect(registry.get(queuedId)?.admission).toBe("waiting");
     expect(h.created).toHaveLength(1);
     controller.abort();
     releaseGate();
-    const [r1, r2] = await Promise.all([first, second]);
+    await cleanupStarted;
+    expect(phases).toEqual(["waiting", "admitted"]);
+    expect(h.created).toHaveLength(1);
+    expect(starts).not.toContain(queuedId);
+    expect(worktreeEntries).toHaveLength(1);
+    releaseCleanup();
+    await h.waitForPromptCalls(2);
+    expect(starts).toContain(bId);
+    expect(starts).not.toContain(cId);
+    expect(registry.get(cId)?.admission).toBe("waiting");
+    expect(worktreeEntries).toHaveLength(2);
+    expect(h.created).toHaveLength(2);
+
+    releaseB();
+    await h.waitForPromptCalls(3);
+    expect(starts).toContain(cId);
+    expect(worktreeEntries).toHaveLength(3);
+    expect(h.created).toHaveLength(3);
+    releaseC();
+
+    const [r1, r2, r3, r4] = await Promise.all([first, second, third, fourth]);
     expect(r1.outcome).toBe("completed");
     expect(r2.outcome).toBe("aborted");
-    expect(r2.error).toContain("stopped before it started");
-    expect(h.created).toHaveLength(1); // the aborted dispatch never created a session, even after dequeue
+    expect(r3.outcome).toBe("completed");
+    expect(r4.outcome).toBe("completed");
+    expect(stops.filter((id) => id === queuedId)).toHaveLength(1);
+    expect(starts).not.toContain(queuedId);
   });
 });
 

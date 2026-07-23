@@ -27,7 +27,7 @@ in see [`doc/testing.md`](testing.md).
 │            engine (permissions · hooks · shell-inject)              │
 │                    │                                                 │
 │   runtime (context-assembly · subagents · worktrees · guard ·      │
-│            cwd-state · tools · skill-activation · steering)         │
+│            cwd-state · tools · skill-activation · steering · mcp)   │
 │                    │                                                 │
 │            registry (capability registry · compat report)          │
 └──────────────────────────────────────────────────────────────────────┘
@@ -106,13 +106,20 @@ hierarchies, and they are not the same set:
 recognized-but-deferred and keys that are unknown are split out for the compatibility report rather
 than dropped.
 
+**MCP server config** is a third input: the project `.mcp.json` plus scope-tagged `mcpServers`
+blocks from the settings hierarchy, resolved here (`discovery/mcp.ts`) by whole-entry precedence
+and the enablement gate — project-origin servers stay pending until approved from a user-authored
+scope, and a git-tracked `settings.local.json` is demoted to project scope so a cloned repo can
+never self-approve.
+
 **Placement:** new scopes, precedence rules, or settings-shape handling. Nothing that interprets an
 artifact's *content*.
 
 ### `claude/` — parse each artifact format (loaders only, no runtime)
 
 One loader per Claude artifact format — skills and commands, agents, rules, the CLAUDE.md hierarchy
-with `@import` expansion, memory, hooks config, and installed-plugin content. `src/project.ts` — at
+with `@import` expansion, memory, hooks config, MCP server entries (`.mcp.json` and settings
+`mcpServers` blocks, `mcp-config.ts`), and installed-plugin content. `src/project.ts` — at
 the source root, *above* the loaders, importing both `discovery/` and `claude/` — orchestrates them
 into one loaded project model. It sits outside this folder precisely because it depends on both:
 a loader knows one format and nothing else.
@@ -198,10 +205,11 @@ where to start reading, not the extent of its cluster.
   untrusted-framed notice. Everything model-visible is bounded and **sanitized at capture** — the
   registry sanitizes on store and the progress condenser at capture, so records are clean regardless
   of caller — **except `agentName`**, deliberately raw as the registry's name-index key and therefore
-  sanitized at every render; render-time sanitization stays as a backstop for the rest. Dispatch mirrors each session's condensed
-  progress and per-turn usage accumulation into the registry, which makes the registry the single
-  data source for the status panel and drill-down below. Registry addresses, including the stable
-  agent id accepted by `TaskStop` for a checkpoint-retained child, exist only for the originating
+  sanitized at every render; render-time sanitization stays as a backstop for the rest. The scheduler
+  owns admission, `SubagentRegistry` owns dispatch lifecycle and progress, and
+  `BackgroundTaskRegistry` owns task-generation admission and stop data consumed by `TaskOutput` and
+  joined into the status panel. Registry addresses, including the stable agent id accepted by
+  `TaskStop` for a checkpoint-retained child, exist only for the originating
   process lifetime. A **user-initiated stop** (from the panel) is permanent: the record carries the
   marker and `SendMessage` refuses to steer or resume a user-stopped agent — distinct from a model
   `TaskStop`, after which PiCC still allows resume (the divergence is recorded in the capability
@@ -233,6 +241,15 @@ where to start reading, not the extent of its cluster.
 
 - **Skill activation** (`skill-activation.ts`) — the one pipeline (lazy body load → substitution →
   `!`-injection) behind the `Skill` tool, slash commands, and `context: fork` dispatch.
+
+- **MCP runtime** (`mcp.ts`, `mcp-tools.ts`) — runs the **enabled** stdio servers of the
+  discovery-resolved config as session-global child processes and exposes their tools as
+  `mcp__<server>__<tool>` proxies through the same guard/decoration pipeline as every other tool.
+  Its invariants: the enablement gate is enforced by construction (only `enabled` servers ever
+  spawn); session load is non-blocking with a bounded first-turn settle, so the first request
+  deterministically carries connected servers' tools; server processes die with the session,
+  process trees included; and when nothing is both configured and enabled the model receives **no
+  MCP-related context of any kind** — no tool definitions, no prompt additions.
 
 - **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
   in `subagents.ts`) — a session-local controller owns threshold sampling, complete-tool-batch
@@ -308,7 +325,8 @@ subsystem — moving it here to be tidy makes every folder depend on every folde
 
 Never-throwing filesystem reads and repo-root detection; the shared gitignore-flavored glob engine
 used by `paths:`, permission globs, `claudeMdExcludes`, and `.worktreeinclude`; frontmatter/body
-splitting with lenient YAML; UTF-8 subprocess env; agent-id minting and transcript-path derivation.
+splitting with lenient YAML; UTF-8 subprocess env; process-tree listing and killing; agent-id
+minting and transcript-path derivation.
 
 **Placement:** a pure helper with more than one consumer and no knowledge of the project model.
 Single-consumer logic stays with its consumer.
@@ -319,8 +337,9 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
 
 1. **Extension load.** The process env is made UTF-8-safe, then `loadClaudeProject()` assembles the
    project model. `CwdState`, `PermissionEngine`, `WorktreeManager`, `HookRunner` (behind a
-   multiplexer so skill-scoped hooks can be added dynamically), and `SubagentRuntime` are
-   constructed. All Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered,
+   multiplexer so skill-scoped hooks can be added dynamically), `SubagentRuntime`, and `McpRuntime`
+   (enabled MCP servers begin connecting in the background, non-blocking) are constructed. All
+   Claude-named tools plus cwd-swapping overrides of Pi's built-ins are registered,
    the guard extension is installed on tool events, and prompt-template stubs are written for each
    user-invocable skill with an eligible, non-reserved name so it appears in the `/` palette. The
    per-session scratch dir is created
@@ -369,8 +388,8 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    hook exhaustion leaves admission paused and recoverable; any post-commit failure closes the session
    and requires replacement. Pi's internally
    owned overflow recovery remains outside this controller and is not retried by PiCC. `Stop` runs
-   at the logical settlement boundary, and `session_shutdown` joins checkpoint work before firing
-   `SessionEnd`.
+   at the logical settlement boundary, and `session_shutdown` joins checkpoint work and shuts down
+   the MCP servers before firing `SessionEnd`.
 
 ## Mechanical-fidelity decisions (load-bearing)
 
@@ -439,13 +458,12 @@ These are the choices where "close enough" breaks real projects.
   foreground. The residual divergences (notably settlement *timing*) and the upstream evidence for
   them are recorded in the capability registry — do not restate them here.
 
-- **Nested background fan-out is concurrency-bounded, and that diverges from Claude.** Each depth
-  gets its own `concurrency`-sized budget, so the total is bounded by `maxDepth × concurrency` and a
-  parent blocked in `TaskOutput` awaiting a child cannot deadlock against it. Claude's parallel-agent
-  cap is instead a *single global*. The per-depth budget is a deliberately conservative, deadlock-free
-  PiCC choice, **not** parity: it makes nested background **bounded-wait**, not infinite parallelism
-  at every depth. The foreground nested path is left unbounded by behavioral choice — it is
-  parent-blocking and rare — not by deadlock necessity.
+- **Nested background fan-out is concurrency-bounded.** Each depth gets its own
+  `concurrency`-sized budget, so `maxDepth × concurrency` bounds the background pools. This
+  per-depth design lets a parent blocked in `TaskOutput` await a child without competing for the
+  same pool. Foreground nested dispatch bypasses those pools to prevent the corresponding
+  parent/child deadlock, so total active work can exceed that product. The per-depth budget is a
+  deliberately conservative, deadlock-free PiCC choice, **not** Claude Code parity.
 
 - **Deny matches any command segment.** The matcher is shell-operator aware, so a deny like
   `Bash(rm *)` cannot be evaded by chaining (`git status && rm -rf /`) — every segment is matched

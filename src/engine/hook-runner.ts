@@ -4,6 +4,7 @@ import path from "node:path";
 import { evaluateIfCondition } from "./permissions.js";
 import { isDirectory } from "../util/fs.js";
 import { unicodeSafeSubprocessEnv } from "../util/env.js";
+import { killProcessTree } from "../util/process-tree.js";
 import type {
   Diagnostic,
   HookConfig,
@@ -895,33 +896,4 @@ function errText(err: unknown): string {
 function quoteArg(arg: string, shellKind: "bash" | "powershell"): string {
   if (shellKind === "powershell") return `'${arg.replace(/'/g, "''")}'`;
   return `'${arg.replace(/'/g, `'\\''`)}'`;
-}
-
-/** Kill a hook process and its children; never throws. */
-function killProcessTree(child: ChildProcess): void {
-  try {
-    if (process.platform === "win32" && child.pid) {
-      // taskkill /T kills the whole tree (bash + whatever it spawned).
-      const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
-        stdio: "ignore",
-        windowsHide: true,
-      });
-      killer.on("error", () => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          /* already gone */
-        }
-      });
-      killer.unref();
-      return;
-    }
-  } catch {
-    /* fall through to plain kill */
-  }
-  try {
-    child.kill("SIGKILL");
-  } catch {
-    /* already gone */
-  }
 }

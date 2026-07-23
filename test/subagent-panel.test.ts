@@ -37,6 +37,7 @@ import {
   DETAIL_PROMPT_EXPANDED,
   DETAIL_STEER_PREFIX,
   DETAIL_STEER_SENT,
+  DETAIL_WAITING,
   detailHint,
   detailPromptCollapsed,
   detailSteerFailed,
@@ -44,6 +45,7 @@ import {
   formatElapsed,
   PANEL_GLYPH_FAILED,
   PANEL_GLYPH_STOPPED,
+  PANEL_GLYPH_WAITING,
   PANEL_GLYPH_SUCCESS,
   PANEL_HINT_FOCUSED,
   PANEL_RUNNING_FRAMES,
@@ -70,6 +72,7 @@ import {
 import { HookRunner } from "../src/engine/hook-runner.js";
 import {
   createPanelHintEmitter,
+  panelAgentCounts,
   PANEL_ENTRY_CHORD,
   panelHintText,
   SUBAGENT_PANEL_WIDGET_KEY,
@@ -80,6 +83,7 @@ import {
   PANEL_NOTICE_ALL_DISMISSED,
   PANEL_NOTICE_EMPTY,
   PANEL_NOTICE_FOREGROUND,
+  PANEL_NOTICE_RESIZE_ACTION,
   PANEL_NOTICE_RUNNING_DISMISS,
   PANEL_NOTICE_STALE,
   PANEL_NOTICE_STOP_ALL_NONE,
@@ -181,15 +185,48 @@ describe("tree flattening", () => {
     ]);
   });
 
-  it("orders running before settled within a sibling group (stable by startedAt)", () => {
+  it("orders admitted, waiting, then settled within each sibling group without breaking tree adjacency", () => {
     const clock = { t: 100 };
     const model = makeModel(clock);
     const v = view(model, [
-      rec({ agentId: "agent-a", startedAt: 0, state: "settled", outcome: "completed", settledAt: 50 }),
-      rec({ agentId: "agent-b", startedAt: 10 }),
-      rec({ agentId: "agent-c", startedAt: 5 }),
+      rec({ agentId: "settled", startedAt: 0, state: "settled", outcome: "completed", settledAt: 50 }),
+      rec({ agentId: "waiting-1", startedAt: 1, admission: "waiting" }),
+      rec({ agentId: "admitted", startedAt: 10 }),
+      rec({ agentId: "child-waiting", parentAgentId: "admitted", startedAt: 11, admission: "waiting" }),
+      rec({ agentId: "waiting-2", startedAt: 1, admission: "waiting" }),
     ]);
-    expect(v.rows.map((r) => r.agentId)).toEqual(["agent-c", "agent-b", "agent-a"]);
+    expect(v.rows.map((r) => r.agentId)).toEqual([
+      "admitted",
+      "child-waiting",
+      "waiting-1",
+      "waiting-2",
+      "settled",
+    ]);
+    expect(v.rows.map((r) => r.treeDepth)).toEqual([0, 1, 0, 0, 0]);
+  });
+
+  it("orders admitted, waiting, and settled siblings under one parent", () => {
+    const clock = { t: 100 };
+    const parentId = "agent-parent";
+    const model = makeModel(clock);
+    const v = view(model, [
+      rec({ agentId: parentId, startedAt: 0 }),
+      rec({
+        agentId: "child-settled",
+        parentAgentId: parentId,
+        state: "settled",
+        outcome: "completed",
+        settledAt: 90,
+      }),
+      rec({ agentId: "child-waiting", parentAgentId: parentId, admission: "waiting" }),
+      rec({ agentId: "child-admitted", parentAgentId: parentId }),
+    ]);
+    expect(v.rows.map((row) => [row.agentId, row.treeDepth])).toEqual([
+      [parentId, 0],
+      ["child-admitted", 1],
+      ["child-waiting", 1],
+      ["child-settled", 1],
+    ]);
   });
 
   it("re-roots a child whose parent expired (nearest visible ancestor)", () => {
@@ -323,6 +360,63 @@ describe("row state classification", () => {
     expect(states.get("agent-uk")).toBe("stopped");
   });
 
+  it("classifies admission as waiting, treats absent admission as admitted, and counts separately", () => {
+    const clock = { t: 5000 };
+    const model = makeModel(clock);
+    const v = view(model, [
+      rec({ agentId: "agent-run", startedAt: 1000 }),
+      rec({ agentId: "agent-wait", startedAt: 500, admission: "waiting" }),
+    ]);
+    expect(v.rows.map((row) => [row.agentId, row.state])).toEqual([
+      ["agent-run", "running"],
+      ["agent-wait", "waiting"],
+    ]);
+    expect(v).toMatchObject({ runningCount: 1, waitingCount: 1, settledCount: 0 });
+    expect(v.rows[1]?.elapsedMs).toBe(4500);
+  });
+
+  it("task-side stopped overrides a still-running queued dispatch, freezes, and expires during cleanup", () => {
+    const clock = { t: 10_000 };
+    const model = makeModel(clock);
+    const record = rec({ agentId: "agent-wait", startedAt: 1000, admission: "waiting" });
+    const tasks: PanelTaskInfo[] = [{
+      id: "task-wait",
+      status: "stopped",
+      admission: "waiting",
+      agentId: "agent-wait",
+      settledAt: 7000,
+    }];
+    const v = view(model, [record], { tasks });
+    expect(v.rows[0]).toMatchObject({ state: "stopped", elapsedMs: 6000 });
+    expect(v).toMatchObject({ runningCount: 0, waitingCount: 0, settledCount: 1 });
+    clock.t = 7000 + LINGER_FAILURE_MS;
+    expect(view(model, [record], { tasks }).empty).toBe(true);
+  });
+
+  it("keeps task stop time authoritative after the dispatch registry settles later", () => {
+    const clock = { t: 55_000 };
+    const model = makeModel(clock);
+    const record = rec({
+      agentId: "agent-stopped",
+      startedAt: 1000,
+      state: "settled",
+      outcome: "completed",
+      settledAt: 50_000,
+    });
+    const tasks: PanelTaskInfo[] = [{
+      id: "task-stopped",
+      status: "stopped",
+      agentId: "agent-stopped",
+      settledAt: 7000,
+    }];
+    expect(view(model, [record], { tasks }).rows[0]).toMatchObject({
+      state: "stopped",
+      elapsedMs: 6000,
+    });
+    clock.t = 7000 + LINGER_FAILURE_MS;
+    expect(view(model, [record], { tasks }).empty).toBe(true);
+  });
+
   it("reports elapsed from the injected clock while running, frozen once settled", () => {
     const clock = { t: 5000 };
     const model = makeModel(clock);
@@ -442,6 +536,25 @@ describe("overflow windowing", () => {
     expect(v.totalRows).toBe(12);
     expect(v.hiddenAbove).toBe(0);
     expect(v.hiddenBelow).toBe(12 - MAX_PANEL_ROWS);
+  });
+
+  it("keeps the row bound and aggregate counts when more than MAX_PANEL_ROWS include waiters", () => {
+    const clock = { t: 100 };
+    const model = makeModel(clock);
+    const records = Array.from({ length: MAX_PANEL_ROWS + 4 }, (_, index) =>
+      rec({
+        agentId: `agent-${index}`,
+        startedAt: index,
+        admission: index >= 3 ? "waiting" : "admitted",
+      }));
+    const v = view(model, records);
+    expect(v.rows).toHaveLength(MAX_PANEL_ROWS);
+    expect(v).toMatchObject({
+      totalRows: MAX_PANEL_ROWS + 4,
+      hiddenBelow: 4,
+      runningCount: 3,
+      waitingCount: MAX_PANEL_ROWS + 1,
+    });
   });
 
   it("scrolls the window to keep the selection visible", () => {
@@ -751,6 +864,22 @@ describe("panel aggregate, palette, and width safety", () => {
     return panel;
   }
 
+  it("renders waiting with a static glyph, literal label, and separate responsive count", () => {
+    const panel = view(makeModel({ t: 1000 }), [
+      rec({ agentId: "running" }),
+      rec({ agentId: "waiting", admission: "waiting" }),
+    ]);
+    const lines = renderSubagentPanel(panel, {
+      width: 120,
+      entryChord: CHORD,
+      runningFrame: PANEL_RUNNING_FRAMES[4],
+    });
+    const waitingRow = lines.find((line) => line.includes("[waiting]"));
+    expect(waitingRow).toContain(PANEL_GLYPH_WAITING);
+    expect(waitingRow).not.toContain(PANEL_RUNNING_FRAMES[4]);
+    expect(lines).toContain("1 running · 1 waiting");
+  });
+
   it.each([
     ["failed", rec({ agentId: "a", state: "settled", outcome: "failed", settledAt: 900 }), PANEL_GLYPH_FAILED],
     ["stopped", rec({ agentId: "a", state: "settled", outcome: "aborted", settledAt: 900 }), PANEL_GLYPH_STOPPED],
@@ -921,6 +1050,55 @@ describe("drill-down detail rendering (pure)", () => {
     Array.from({ length: n }, (_, i) =>
       detailAssistant(`tail line ${String(i + 1).padStart(2, "0")}`),
     );
+
+  it("waiting detail says capacity/session startup is pending and offers no steering", () => {
+    const record = rec({
+      agentId: "agent-w",
+      admission: "waiting",
+      prompt: "inspect the queue",
+      session: { steer: () => undefined },
+    });
+    const rendered = renderSubagentDetail(
+      {
+        record,
+        taskId: "task-w",
+        taskStatus: "running",
+        taskAdmission: "waiting",
+        nowMs: 5000,
+      },
+      detailUi(),
+      { width: 120, runningFrame: PANEL_RUNNING_FRAMES[2] },
+    ).lines.join("\n");
+    expect(rendered).toContain(PANEL_GLYPH_WAITING);
+    expect(rendered).toContain("waiting");
+    expect(rendered).toContain(DETAIL_WAITING);
+    expect(rendered).toContain(detailSteerUnavailable("waiting for capacity"));
+    expect(rendered).not.toContain(DETAIL_STEER_PREFIX);
+  });
+
+  it("task-side stopped uses discarded-output copy and task elapsed after dispatch settlement", () => {
+    const rendered = renderSubagentDetail(
+      {
+        record: rec({
+          agentId: "agent-stopped",
+          state: "settled",
+          outcome: "completed",
+          startedAt: 1000,
+          settledAt: 20_000,
+          finalText: "must not be called a final answer",
+        }),
+        taskId: "task-stopped",
+        taskStatus: "stopped",
+        taskSettledAt: 7000,
+        nowMs: 30_000,
+      },
+      detailUi({ follow: false }),
+      { width: 160 },
+    ).lines.join("\n");
+    expect(rendered).toContain("6s · stopped");
+    expect(rendered).toContain(DETAIL_DISCARDED_LABEL);
+    expect(rendered).not.toContain(DETAIL_FINAL_LABEL);
+  });
 
   it("running layout: header, collapsed prompt, auto-following tail, steer line, hint", () => {
     const record = rec({
@@ -1495,6 +1673,22 @@ describe("panel-entry chord constant", () => {
 });
 
 describe("one-time panel hint emitter", () => {
+  it("derives mixed capacity-one counts from newest tasks, not transient registry admission", () => {
+    const records = [
+      rec({ agentId: "agent-running", admission: "admitted" }),
+      rec({ agentId: "agent-waiting", admission: "admitted" }),
+      rec({ agentId: "agent-transient", admission: "admitted" }),
+      rec({ agentId: "agent-foreground", session: { steer: () => undefined } }),
+    ];
+    const tasks: PanelTaskInfo[] = [
+      { id: "old", status: "completed", admission: "admitted", agentId: "agent-running" },
+      { id: "new", status: "running", admission: "admitted", agentId: "agent-running" },
+      { id: "waiting", status: "running", admission: "waiting", agentId: "agent-waiting" },
+    ];
+    expect(panelAgentCounts(records.slice(0, 3), tasks)).toEqual({ running: 1, waiting: 1 });
+    expect(panelAgentCounts(records, tasks)).toEqual({ running: 2, waiting: 1 });
+  });
+
   it("emits once (with the injected chord) when more than one agent runs, never again", () => {
     const emitted: string[] = [];
     const emit = createPanelHintEmitter({
@@ -1502,11 +1696,11 @@ describe("one-time panel hint emitter", () => {
       isTui: () => true,
       emit: (text) => emitted.push(text),
     });
-    emit(3);
-    expect(emitted).toEqual([panelHintText(3, "ctrl+t")]);
+    emit({ running: 2, waiting: 1 });
+    expect(emitted).toEqual([panelHintText({ running: 2, waiting: 1 }, "ctrl+t")]);
     expect(emitted[0]).toContain("ctrl+t");
-    expect(emitted[0]).toContain("3 agents running");
-    emit(5); // once per session: a later, larger fan-out stays silent
+    expect(emitted[0]).toContain("2 running · 1 waiting");
+    emit({ running: 4, waiting: 1 }); // once per session: a later, larger fan-out stays silent
     expect(emitted).toHaveLength(1);
   });
 
@@ -1517,11 +1711,11 @@ describe("one-time panel hint emitter", () => {
       isTui: () => true,
       emit: (text) => emitted.push(text),
     });
-    emit(0);
-    emit(1);
+    emit({ running: 0, waiting: 0 });
+    emit({ running: 1, waiting: 0 });
     expect(emitted).toEqual([]);
-    emit(2); // the single-agent calls did not consume the gate
-    expect(emitted).toEqual([panelHintText(2, PANEL_ENTRY_CHORD)]);
+    emit({ running: 1, waiting: 1 }); // the single-agent calls did not consume the gate
+    expect(emitted).toEqual([panelHintText({ running: 1, waiting: 1 }, PANEL_ENTRY_CHORD)]);
   });
 
   it("emits nothing outside TUI mode, without consuming the once-gate", () => {
@@ -1532,11 +1726,11 @@ describe("one-time panel hint emitter", () => {
       isTui: () => tui,
       emit: (text) => emitted.push(text),
     });
-    emit(4); // print/RPC: silent
+    emit({ running: 2, waiting: 2 }); // print/RPC: silent
     expect(emitted).toEqual([]);
     tui = true;
-    emit(4);
-    expect(emitted).toEqual([panelHintText(4, PANEL_ENTRY_CHORD)]);
+    emit({ running: 2, waiting: 2 });
+    expect(emitted).toEqual([panelHintText({ running: 2, waiting: 2 }, PANEL_ENTRY_CHORD)]);
   });
 });
 
@@ -1591,7 +1785,41 @@ describe("panel widget controller (unit, fake-pi ui)", () => {
     }
   });
 
-  it("suppression (the t05 focused-panel seam) hides the widget and re-shows it", () => {
+  it("task-registry notification repaints status changes without waiting for the tick", () => {
+    let notifyTask!: () => void;
+    const tasks: PanelTaskInfo[] = [{
+      id: "task-a",
+      status: "running",
+      admission: "waiting",
+      agentId: "agent-a",
+    }];
+    const { registry, pi, ui, controller } = setup({
+      tasks: () => tasks,
+      onTasksChange: (listener) => {
+        notifyTask = listener;
+        return () => {};
+      },
+      tickMs: 3_600_000,
+    });
+    try {
+      registerRunning(registry, "agent-a");
+      registry.noteAdmission("agent-a", "waiting");
+      controller.attach(ui);
+      expect(pi.widgets.get(SUBAGENT_PANEL_WIDGET_KEY)!.render(120).join("\n")).toContain("waiting");
+      const before = pi.renderRequests;
+      tasks[0]!.status = "stopped";
+      tasks[0]!.settledAt = Date.now();
+      notifyTask();
+      expect(pi.renderRequests).toBe(before + 1);
+      const stopped = pi.widgets.get(SUBAGENT_PANEL_WIDGET_KEY)!.render(120).join("\n");
+      expect(stopped).toContain(PANEL_GLYPH_STOPPED);
+      expect(stopped).not.toContain("waiting");
+    } finally {
+      controller.setSuppressed(true);
+    }
+  });
+
+  it("suppression from the focused panel hides the widget and re-shows it", () => {
     const { registry, pi, ui, controller } = setup();
     try {
       registerRunning(registry, "agent-a");
@@ -1758,6 +1986,45 @@ describe("panel widget wiring (offline integration: fake-pi + fake-sdk)", () => 
     return { pi, internals };
   }
 
+  it("does not consume the one-time hint on pre-task records and reports capacity-one mixed counts", async () => {
+    const localSettings = path.join(dir, ".claude", "settings.local.json");
+    fs.writeFileSync(localSettings, JSON.stringify({ subagents: { concurrency: 1 } }));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    try {
+      const handle = fakeSdk({ replies: [{ text: "first done", gate }, { text: "second done" }] });
+      const { pi } = await boot(handle);
+      await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx());
+      const agentTool = pi.tools.get("Agent");
+      await agentTool.execute("hint-1", {
+        subagent_type: "general-purpose",
+        prompt: "FIRST",
+        run_in_background: true,
+      });
+      await handle.waitForPromptCalls(1);
+      await agentTool.execute("hint-2", {
+        subagent_type: "general-purpose",
+        prompt: "SECOND",
+        run_in_background: true,
+      });
+      await waitUntil({
+        description: "mixed admitted/waiting panel hint",
+        predicate: () => pi.notifications.some((notice) =>
+          notice.text === panelHintText({ running: 1, waiting: 1 }, PANEL_ENTRY_CHORD)),
+      });
+      expect(pi.notifications.filter((notice) => notice.text.includes("manage agents"))).toEqual([
+        expect.objectContaining({
+          text: panelHintText({ running: 1, waiting: 1 }, PANEL_ENTRY_CHORD),
+        }),
+      ]);
+      release();
+      await handle.waitForPromptCalls(2);
+    } finally {
+      release?.();
+      fs.rmSync(localSettings, { force: true });
+    }
+  });
+
   it("dispatch installs the belowEditor widget; settlement flips the row; linger expiry (injected clock) removes it", async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
@@ -1811,6 +2078,83 @@ describe("panel widget wiring (offline integration: fake-pi + fake-sdk)", () => 
       key: SUBAGENT_PANEL_WIDGET_KEY,
       content: undefined,
     });
+  });
+
+  it("carries runtime waiting admission into the assembled panel and repaints when admitted", async () => {
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
+    const never = new Promise<void>(() => {});
+    const handle = fakeSdk({
+      replies: Array.from({ length: 11 }, (_, index) => ({
+        text: `reply-${index}`,
+        gate: index === 0 ? firstGate : never,
+      })),
+    });
+    const { pi, internals } = await boot(handle);
+    internals.subagentPanel.configureForTest({ tickMs: 3_600_000 });
+    await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx());
+    const agentTool = pi.tools.get("Agent");
+    const taskIds: string[] = [];
+    for (let index = 0; index < 11; index++) {
+      const result = await agentTool.execute(`t${index}`, {
+        subagent_type: "general-purpose",
+        prompt: `GO ${index}`,
+        run_in_background: true,
+      });
+      taskIds.push(result.details.taskId as string);
+    }
+    await handle.waitForPromptCalls(10);
+    const waitingTask = internals.backgroundTasks.get(taskIds[10]!)!;
+    expect(waitingTask.admission).toBe("waiting");
+    expect(pi.widgets.get(SUBAGENT_PANEL_WIDGET_KEY)!.render(39).join("\n")).toContain("1 waiting");
+    const beforeAdmission = pi.renderRequests;
+    releaseFirst();
+    await handle.waitForPromptCalls(11);
+    expect(waitingTask.admission).toBe("admitted");
+    expect(pi.renderRequests).toBeGreaterThan(beforeAdmission);
+    const admittedSummary = pi.widgets.get(SUBAGENT_PANEL_WIDGET_KEY)!.render(39).join("\n");
+    expect(admittedSummary).toContain("general-purpose");
+    expect(admittedSummary).not.toContain("waiting");
+    expect(admittedSummary).toContain("… 3 more");
+    internals.subagentPanel.setSuppressed(true);
+  });
+
+  it("queued TaskStop requests an immediate task-notification repaint before the periodic tick", async () => {
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
+    const never = new Promise<void>(() => {});
+    const handle = fakeSdk({
+      replies: Array.from({ length: 11 }, (_, index) => ({
+        text: `reply-${index}`,
+        gate: index === 0 ? firstGate : never,
+      })),
+    });
+    const { pi, internals } = await boot(handle);
+    internals.subagentPanel.configureForTest({ tickMs: 3_600_000 });
+    await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx());
+    const agentTool = pi.tools.get("Agent");
+    let waitingTaskId = "";
+    for (let index = 0; index < 11; index++) {
+      const result = await agentTool.execute(`t${index}`, {
+        subagent_type: "general-purpose",
+        prompt: `GO ${index}`,
+        run_in_background: true,
+      });
+      if (index === 10) waitingTaskId = result.details.taskId as string;
+    }
+    await handle.waitForPromptCalls(10);
+    expect(internals.backgroundTasks.get(waitingTaskId)?.admission).toBe("waiting");
+    const beforeStop = pi.renderRequests;
+    const stopping = pi.tools.get("TaskStop").execute("stop-waiting", { task_id: waitingTaskId });
+    expect(internals.backgroundTasks.get(waitingTaskId)?.status).toBe("stopped");
+    expect(pi.renderRequests).toBeGreaterThan(beforeStop);
+    const stoppedSummary = pi.widgets.get(SUBAGENT_PANEL_WIDGET_KEY)!.render(39).join("\n");
+    expect(stoppedSummary).toContain("general-purpose");
+    expect(stoppedSummary).not.toContain("waiting");
+    expect(stoppedSummary).toContain("… 3 more");
+    releaseFirst();
+    await stopping;
+    internals.subagentPanel.setSuppressed(true);
   });
 
   it("never installs the widget from a print- or RPC-mode session (mode gate, not hasUI)", async () => {
@@ -1994,6 +2338,188 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     await reopened.result;
   });
 
+  it("subscribes to both registries per open and tears the pair down idempotently", async () => {
+    const registry = new SubagentRegistry();
+    registerRunning(registry, "agent-a");
+    const registryListeners = new Set<() => void>();
+    const taskListeners = new Set<() => void>();
+    let registryUnsubscribes = 0;
+    let taskUnsubscribes = 0;
+    vi.spyOn(registry, "onChange").mockImplementation((listener) => {
+      registryListeners.add(listener);
+      let active = true;
+      return () => {
+        if (!active) return;
+        active = false;
+        registryUnsubscribes++;
+        registryListeners.delete(listener);
+      };
+    });
+    const pi = fakePi();
+    const controller = new SubagentPanelFocusController({
+      registry,
+      tasks: () => [],
+      onTasksChange: (listener) => {
+        taskListeners.add(listener);
+        let active = true;
+        return () => {
+          if (!active) return;
+          active = false;
+          taskUnsubscribes++;
+          taskListeners.delete(listener);
+        };
+      },
+      stopTask: () => {},
+      widget: { setSuppressed: () => {} },
+      tickMs: 3_600_000,
+    });
+
+    controller.open(pi.tuiCtx() as never);
+    const first = pi.customs[0]!;
+    await first.ready;
+    expect([registryListeners.size, taskListeners.size]).toEqual([1, 1]);
+    first.input(ESC);
+    await first.result;
+    first.component?.dispose?.();
+    first.component?.dispose?.();
+    expect([registryUnsubscribes, taskUnsubscribes]).toEqual([1, 1]);
+    const rendersAfterClose = pi.renderRequests;
+    for (const listener of [...registryListeners, ...taskListeners]) listener();
+    expect(pi.renderRequests).toBe(rendersAfterClose);
+
+    controller.open(pi.tuiCtx() as never);
+    const reopened = pi.customs[1]!;
+    await reopened.ready;
+    expect([registryListeners.size, taskListeners.size]).toEqual([1, 1]);
+    const beforeNotifications = pi.renderRequests;
+    for (const listener of [...registryListeners, ...taskListeners]) listener();
+    expect(pi.renderRequests).toBe(beforeNotifications + 2);
+    reopened.input(ESC);
+    await reopened.result;
+    expect([registryUnsubscribes, taskUnsubscribes]).toEqual([2, 2]);
+  });
+
+  it("tears down the focused timer and both subscriptions when the custom promise rejects", async () => {
+    const registry = new SubagentRegistry();
+    registerRunning(registry, "agent-a");
+    const taskListeners = new Set<() => void>();
+    let registryUnsubscribes = 0;
+    let taskUnsubscribes = 0;
+    const originalOnChange = registry.onChange.bind(registry);
+    vi.spyOn(registry, "onChange").mockImplementation((listener) => {
+      const unsubscribe = originalOnChange(listener);
+      return () => {
+        registryUnsubscribes++;
+        unsubscribe();
+      };
+    });
+    let renders = 0;
+    let rejectCustom!: (error: Error) => void;
+    const customResult = new Promise<unknown>((_resolve, reject) => (rejectCustom = reject));
+    const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+    const controller = new SubagentPanelFocusController({
+      registry,
+      tasks: () => [],
+      onTasksChange: (listener) => {
+        taskListeners.add(listener);
+        return () => {
+          taskUnsubscribes++;
+          taskListeners.delete(listener);
+        };
+      },
+      stopTask: () => {},
+      widget: { setSuppressed: () => {} },
+      tickMs: 3_600_000,
+    });
+    const ctx = {
+      mode: "tui",
+      ui: {
+        custom: (factory: any) => {
+          factory({ requestRender: () => renders++ }, undefined, undefined, () => {});
+          return customResult;
+        },
+      },
+    };
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      controller.open(ctx);
+      expect(controller.isOpen()).toBe(true);
+      rejectCustom(new Error("host rejected"));
+      await customResult.catch(() => undefined);
+      await Promise.resolve();
+      expect(controller.isOpen()).toBe(false);
+      expect([registryUnsubscribes, taskUnsubscribes]).toEqual([1, 1]);
+      expect(clearIntervalSpy).toHaveBeenCalledTimes(1);
+      const afterRejection = renders;
+      registerRunning(registry, "agent-b");
+      for (const listener of taskListeners) listener();
+      expect(renders).toBe(afterRejection);
+    } finally {
+      clearIntervalSpy.mockRestore();
+      errors.mockRestore();
+    }
+  });
+
+  it("tears down a synchronously created component when custom then throws", () => {
+    vi.useFakeTimers();
+    const registry = new SubagentRegistry();
+    registerRunning(registry, "agent-a");
+    const registryListeners = new Set<() => void>();
+    const taskListeners = new Set<() => void>();
+    const subscribedCallbacks: Array<() => void> = [];
+    let registryUnsubscribes = 0;
+    let taskUnsubscribes = 0;
+    vi.spyOn(registry, "onChange").mockImplementation((listener) => {
+      registryListeners.add(listener);
+      subscribedCallbacks.push(listener);
+      return () => {
+        registryUnsubscribes++;
+        registryListeners.delete(listener);
+      };
+    });
+    let renders = 0;
+    const controller = new SubagentPanelFocusController({
+      registry,
+      tasks: () => [],
+      onTasksChange: (listener) => {
+        taskListeners.add(listener);
+        subscribedCallbacks.push(listener);
+        return () => {
+          taskUnsubscribes++;
+          taskListeners.delete(listener);
+        };
+      },
+      stopTask: () => {},
+      widget: { setSuppressed: () => {} },
+      tickMs: 100,
+    });
+    const ctx = {
+      mode: "tui",
+      ui: {
+        custom: (factory: any) => {
+          factory({ requestRender: () => renders++ }, undefined, undefined, () => {});
+          throw new Error("host threw after factory");
+        },
+      },
+    };
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      controller.open(ctx);
+      expect(controller.isOpen()).toBe(false);
+      expect([registryUnsubscribes, taskUnsubscribes]).toEqual([1, 1]);
+      expect([registryListeners.size, taskListeners.size]).toEqual([0, 0]);
+      const afterThrow = renders;
+      registerRunning(registry, "agent-b");
+      for (const listener of subscribedCallbacks) listener();
+      vi.advanceTimersByTime(500);
+      expect(renders).toBe(afterThrow);
+      expect([registryUnsubscribes, taskUnsubscribes]).toEqual([1, 1]);
+    } finally {
+      errors.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("arrow keys move the selection over the rendered rows", async () => {
     const s = focusSetup();
     reg(s.registry, "agent-a", "first row");
@@ -2012,6 +2538,73 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     await invocation.result;
   });
 
+  it("aggregate fallback refuses open and stop actions until a visible row render", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", "first target");
+    reg(s.registry, "agent-b", "second target");
+    s.tasks.push({ id: "task-a", status: "running", agentId: "agent-a" });
+    s.tasks.push({ id: "task-b", status: "running", agentId: "agent-b" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+
+    // Initial state and the actual aggregate profile both fail closed.
+    invocation.input(KEY_ENTER);
+    expect(s.notices()).toContain(PANEL_NOTICE_RESIZE_ACTION);
+    expect(invocation.render(1).join("\n")).not.toContain("❯");
+    invocation.input(KEY_DOWN); // selection may move, but remains invisible
+    invocation.render(1);
+    invocation.input(KEY_ENTER);
+    invocation.input("x");
+    invocation.input("X");
+    invocation.input("X");
+    expect(s.stopped).toEqual([]);
+    expect(s.registry.get("agent-a")!.userStopped).toBeUndefined();
+    expect(s.registry.get("agent-b")!.userStopped).toBeUndefined();
+
+    // A row-profile render exposes the same authoritative selection.
+    const wide = invocation.render(120).find((line) => line.includes("❯"));
+    expect(wide).toContain("second target");
+    invocation.input(KEY_ENTER);
+    expect(invocation.render(120).join("\n")).toContain("agent-b");
+    invocation.input(ESC); // detail → list; requires a fresh visible-row proof
+    invocation.render(120);
+    invocation.input("x");
+    expect(s.stopped).toEqual(["task-b"]);
+
+    invocation.render(120);
+    invocation.input("X");
+    invocation.input("X");
+    expect(s.stopped).toEqual(["task-b", "task-a"]);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("aggregate fallback refuses dismiss and preserves the selected settled target across resize", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a", "first settled");
+    reg(s.registry, "agent-b", "second settled");
+    s.tasks.push({ id: "task-a", status: "completed", agentId: "agent-a" });
+    s.tasks.push({ id: "task-b", status: "completed", agentId: "agent-b" });
+    s.registry.markSettled("agent-a", { outcome: "completed" });
+    s.registry.markSettled("agent-b", { outcome: "completed" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+
+    invocation.render(1);
+    invocation.input(KEY_DOWN);
+    invocation.render(1);
+    invocation.input("d");
+    expect(s.controller.dismissedKeyIds()).toEqual([]);
+    expect(s.notices()).toContain(PANEL_NOTICE_RESIZE_ACTION);
+
+    const selected = invocation.render(120).find((line) => line.includes("❯"));
+    expect(selected).toContain("second settled");
+    invocation.input("d");
+    expect(s.controller.dismissedKeyIds()).toEqual(["task:task-b"]);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
   it("x on a running background row applies the PAIRED user stop and notifies", async () => {
     const s = focusSetup();
     reg(s.registry, "agent-a");
@@ -2023,6 +2616,82 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     expect(s.stopped).toEqual(["task-1"]); // task-side marker+abort
     expect(s.registry.get("agent-a")!.userStopped).toBe(true); // agent-side marker
     expect(s.notices()).toContain(panelNoticeStopRequested("coder"));
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("task admission changes repaint the focused list immediately", async () => {
+    const registry = new SubagentRegistry();
+    registerRunning(registry, "agent-a");
+    const tasks: PanelTaskInfo[] = [{
+      id: "task-a",
+      status: "running",
+      admission: "waiting",
+      agentId: "agent-a",
+    }];
+    let notifyTask!: () => void;
+    const pi = fakePi();
+    const controller = new SubagentPanelFocusController({
+      registry,
+      tasks: () => tasks,
+      onTasksChange: (listener) => {
+        notifyTask = listener;
+        return () => {};
+      },
+      stopTask: () => {},
+      widget: { setSuppressed: () => {} },
+      tickMs: 3_600_000,
+    });
+    controller.open(pi.tuiCtx() as never);
+    const invocation = pi.customs[0]!;
+    await invocation.ready;
+    expect(invocation.render(120).join("\n")).toContain("waiting");
+    const before = pi.renderRequests;
+    tasks[0]!.admission = "admitted";
+    notifyTask();
+    expect(pi.renderRequests).toBe(before + 1);
+    expect(invocation.render(120).join("\n")).not.toContain("waiting");
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("a waiting background row remains selectable and stoppable through the existing task id", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a");
+    s.registry.noteAdmission("agent-a", "waiting");
+    s.tasks.push({
+      id: "task-wait",
+      status: "running",
+      admission: "waiting",
+      agentId: "agent-a",
+    });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    expect(invocation.render(120).join("\n")).toContain("waiting");
+    invocation.input("x");
+    expect(s.stopped).toEqual(["task-wait"]);
+    expect(s.registry.get("agent-a")!.userStopped).toBe(true);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("x stops the newest failed checkpoint-paused generation exactly once", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a");
+    s.tasks.push({ id: "task-old", status: "running", agentId: "agent-a" });
+    s.tasks.push({
+      id: "task-paused",
+      status: "failed",
+      checkpointPaused: true,
+      agentId: "agent-a",
+    });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input("x");
+    expect(s.stopped).toEqual(["task-paused"]);
+    expect(s.stopped.filter((id) => id === "task-paused")).toHaveLength(1);
+    expect(s.registry.get("agent-a")!.userStopped).toBe(true);
     invocation.input(ESC);
     await invocation.result;
   });
@@ -2141,8 +2810,9 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     const s = focusSetup();
     reg(s.registry, "agent-a");
     reg(s.registry, "agent-b");
+    s.registry.noteAdmission("agent-b", "waiting");
     s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
-    s.tasks.push({ id: "task-2", status: "running", agentId: "agent-b" });
+    s.tasks.push({ id: "task-2", status: "running", admission: "waiting", agentId: "agent-b" });
     reg(s.registry, "agent-c", "failure evidence");
     s.tasks.push({ id: "task-3", status: "failed", agentId: "agent-c" });
     s.registry.markSettled("agent-c", { outcome: "failed" });
@@ -2162,6 +2832,41 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     expect(s.notices()).toContain(panelNoticeStopAllDone(2));
     // The settled FAILED row was never cleared by stop-all.
     expect(invocation.render(160).join("\n")).toContain("failure evidence");
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("stop-all targets only newest failed checkpoint-paused generations exactly once", async () => {
+    const s = focusSetup();
+    reg(s.registry, "agent-a");
+    s.tasks.push({ id: "task-a-old", status: "running", agentId: "agent-a" });
+    s.tasks.push({
+      id: "task-a-paused",
+      status: "failed",
+      checkpointPaused: true,
+      agentId: "agent-a",
+    });
+    reg(s.registry, "agent-b");
+    s.tasks.push({ id: "task-b-failed", status: "failed", agentId: "agent-b" });
+    reg(s.registry, "agent-c");
+    s.tasks.push({
+      id: "task-c-stopped",
+      status: "stopped",
+      checkpointPaused: true,
+      agentId: "agent-c",
+    });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input("X");
+    expect(s.notices()).toContain(panelNoticeStopAllArmed(1));
+    invocation.input("X");
+    expect(s.stopped).toEqual(["task-a-paused"]);
+    expect(s.stopped.filter((id) => id === "task-a-paused")).toHaveLength(1);
+    expect(s.stopped).not.toContain("task-a-old");
+    expect(s.registry.get("agent-a")!.userStopped).toBe(true);
+    expect(s.registry.get("agent-b")!.userStopped).toBeUndefined();
+    expect(s.registry.get("agent-c")!.userStopped).toBeUndefined();
     invocation.input(ESC);
     await invocation.result;
   });
@@ -2391,6 +3096,123 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     await invocation.result;
   });
 
+  it("steers a still-current taskless running record through guardSteer", async () => {
+    const steered: string[] = [];
+    const s = focusSetup();
+    reg(s.registry, "agent-a", "taskless steer target", {
+      session: { steer: (text: string) => void steered.push(text) },
+    });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    invocation.input("deliver taskless");
+    expect(invocation.render(120).join("\n")).toContain(`${DETAIL_STEER_PREFIX}deliver taskless`);
+    invocation.input(KEY_ENTER);
+    expect(steered).toEqual(["deliver taskless"]);
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("does not buffer text for a waiting task even when the registry already has a session", async () => {
+    const steered: string[] = [];
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, {
+      session: { steer: (text: string) => void steered.push(text) },
+    });
+    s.tasks.push({
+      id: "task-1",
+      status: "running",
+      admission: "waiting",
+      agentId: "agent-a",
+    });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    invocation.input("must not buffer");
+    invocation.input(KEY_ENTER);
+    const detail = invocation.render(160).join("\n");
+    expect(detail).not.toContain(`${DETAIL_STEER_PREFIX}must not buffer`);
+    expect(detail).toContain(detailSteerUnavailable("waiting for capacity"));
+    expect(steered).toEqual([]);
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("uses waiting registry admission when task admission is absent", async () => {
+    const steered: string[] = [];
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, {
+      session: { steer: (text: string) => void steered.push(text) },
+    });
+    s.registry.noteAdmission("agent-a", "waiting");
+    s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    invocation.input("must not buffer or send");
+    invocation.input(KEY_ENTER);
+    const detail = invocation.render(160).join("\n");
+    expect(detail).not.toContain(`${DETAIL_STEER_PREFIX}must not buffer or send`);
+    expect(detail).toContain(detailSteerUnavailable("waiting for capacity"));
+    expect(steered).toEqual([]);
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("refuses text when a task stops after detail entry but before the next render", async () => {
+    const steered: string[] = [];
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, {
+      session: { steer: (text: string) => void steered.push(text) },
+    });
+    s.tasks.push({ id: "task-1", status: "running", admission: "admitted", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    s.tasks[0]!.status = "stopped";
+    invocation.input("must not buffer");
+    invocation.input(KEY_ENTER);
+    expect(steered).toEqual([]);
+    const stoppedDetail = invocation.render(160).join("\n");
+    expect(stoppedDetail).not.toContain(`${DETAIL_STEER_PREFIX}must not buffer`);
+    expect(stoppedDetail).toContain(DETAIL_BANNER_STOPPED);
+    expect(stoppedDetail).toContain(DETAIL_DISCARDED_LABEL);
+    expect(stoppedDetail).not.toContain(DETAIL_FINAL_LABEL);
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
+  it("does not deliver old buffered text across a resumed task-generation race", async () => {
+    const steered: string[] = [];
+    const s = focusSetup();
+    reg(s.registry, "agent-a", undefined, {
+      session: { steer: (text: string) => void steered.push(text) },
+    });
+    s.tasks.push({ id: "task-1", status: "running", admission: "admitted", agentId: "agent-a" });
+    const invocation = s.openPanel()!;
+    await invocation.ready;
+    invocation.render(120);
+    invocation.input(KEY_ENTER);
+    invocation.input("old generation text");
+    s.tasks.push({ id: "task-2", status: "running", admission: "admitted", agentId: "agent-a" });
+    invocation.input(KEY_ENTER);
+    expect(steered).toEqual([]);
+    const refused = invocation.render(160).join("\n");
+    expect(refused).toContain(PANEL_NOTICE_STALE);
+    expect(refused).not.toContain(`${DETAIL_STEER_PREFIX}old generation text`);
+    invocation.input(ESC);
+    invocation.input(ESC);
+    await invocation.result;
+  });
+
   it("caps the steer buffer at STEER_INPUT_CAP", async () => {
     const steered: string[] = [];
     const s = focusSetup();
@@ -2432,7 +3254,7 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     expect(invocation.closed).toBe(true);
   });
 
-  it("ctrl+x in the drill-down stops a running background agent with t05's paired semantics", async () => {
+  it("ctrl+x in the drill-down stops a running background agent with paired stop semantics", async () => {
     const s = focusSetup();
     reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
     s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
@@ -2621,7 +3443,7 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     await invocation.result;
   });
 
-  it("subscribes for live repaints only while the drill-down is open (unsubscribed on view exit)", async () => {
+  it("keeps live repaint subscriptions across detail exit until the focused component closes", async () => {
     const s = focusSetup();
     reg(s.registry, "agent-a", undefined, { session: { steer: () => undefined } });
     s.tasks.push({ id: "task-1", status: "running", agentId: "agent-a" });
@@ -2632,10 +3454,10 @@ describe("panel focus controller (unit, fake-pi ui)", () => {
     const inDetail = s.pi.renderRequests;
     reg(s.registry, "agent-b"); // registry change while the detail is open
     expect(s.pi.renderRequests).toBeGreaterThan(inDetail);
-    invocation.input(ESC); // detail → list releases the subscription
+    invocation.input(ESC); // detail → list; list transitions still repaint immediately
     const afterExit = s.pi.renderRequests;
     reg(s.registry, "agent-c");
-    expect(s.pi.renderRequests).toBe(afterExit);
+    expect(s.pi.renderRequests).toBeGreaterThan(afterExit);
     invocation.input(ESC);
     await invocation.result;
   });
@@ -3015,7 +3837,9 @@ describe("panel focus (offline integration: fake-pi + fake-sdk)", () => {
 
       // The one-time status-line hint fired once when the fan-out reached 2
       // agents, naming the real chord.
-      const hints = pi.notifications.filter((n) => n.text === panelHintText(2, PANEL_ENTRY_CHORD));
+      const hints = pi.notifications.filter((n) =>
+        n.text === panelHintText({ running: 2, waiting: 0 }, PANEL_ENTRY_CHORD),
+      );
       expect(hints).toHaveLength(1);
 
       pi.shortcuts.get(PANEL_ENTRY_CHORD)!.handler(pi.tuiCtx());

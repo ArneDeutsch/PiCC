@@ -379,7 +379,36 @@ describe("guardSteer — the shared steer guard", () => {
     if (!guard.ok) expect(guard.refusal).toMatch(/not running/i);
   });
 
-  it("refuses a running record with no live steerable handle", () => {
+  it("refuses a waiting record specifically instead of treating missing session as admission", () => {
+    const r = new SubagentRegistry();
+    const id = mintAgentId();
+    r.register({ agentId: id, agentName: "reviewer", ...base });
+    r.noteAdmission(id, "waiting");
+    const guard = guardSteer(r.get(id)!);
+    expect(guard.ok).toBe(false);
+    if (!guard.ok) expect(guard.refusal).toMatch(/waiting for configured concurrency capacity/i);
+  });
+
+  it("sanitizes and caps the project-controlled name only in the waiting refusal", () => {
+    const r = new SubagentRegistry();
+    const id = mintAgentId();
+    const rawName = `hostile\n\u001b[31m${"x".repeat(300)}`;
+    r.register({ agentId: id, agentName: rawName, ...base });
+    r.noteAdmission(id, "waiting");
+    const guard = guardSteer(r.get(id)!);
+    expect(guard.ok).toBe(false);
+    if (!guard.ok) {
+      expect(guard.refusal).not.toMatch(/[\n\r\u001b]/u);
+      expect(guard.refusal.length).toBeLessThan(300);
+      expect(guard.refusal).toContain("waiting for configured concurrency capacity");
+    }
+    expect(r.get(id)?.agentName).toBe(rawName);
+    const resolved = r.resolve(rawName);
+    expect(resolved.ok).toBe(true);
+    if (resolved.ok) expect(resolved.record.agentId).toBe(id);
+  });
+
+  it("refuses an admitted running record with no live steerable handle", () => {
     const r = new SubagentRegistry();
     const id = mintAgentId();
     r.register({ agentId: id, agentName: "reviewer", ...base }); // minimal register: no session yet
@@ -414,6 +443,16 @@ describe("guardSteer — the shared steer guard", () => {
 // ---------------------------------------------------------------------------
 
 describe("SendMessage tool — steer + refusals", () => {
+  it("describes correction delivery as admitted and steerable only", () => {
+    const registry = new SubagentRegistry();
+    const runtime = makeSubagentRuntime([makeAgent()], fakeSdk().sdk, { subagentRegistry: registry });
+    const tool = createSendMessageToolDefinition(runtime, {
+      registry,
+      backgroundTasks: new BackgroundTaskRegistry(),
+    }) as unknown as { description: string };
+    expect(tool.description).toContain("only a still-running, admitted, steerable background subagent");
+  });
+
   it("steers a RUNNING background subagent as a mid-task course correction and acks", async () => {
     const registry = new SubagentRegistry();
     const backgroundTasks = new BackgroundTaskRegistry();
@@ -831,8 +870,8 @@ describe("SendMessage resume — offline integration (real SessionManager)", () 
     expect(taskId).not.toBe(lifecycleTaskId);
     const identity = `Task(${taskId}) · Agent(reviewer) · ${agentId}`;
     expect(ack.content[0]!.text.split(identity)).toHaveLength(2);
-    expect(ack.content[0]!.text).toContain("resume started in background with prior context");
-    expect(ack.content[0]!.text).toContain("result pending");
+    expect(ack.content[0]!.text).toContain("resume accepted in background with prior context");
+    expect(ack.content[0]!.text).toContain("configured concurrency capacity is available");
     expect(ack.content[0]!.text).toContain(`TaskOutput (task_id "${taskId}")`);
     expect(ack.content[0]!.text).not.toContain("FOLLOW-UP WORK");
     expect(ack.content[0]!.text).not.toContain("ORIGINAL TASK");
@@ -847,6 +886,8 @@ describe("SendMessage resume — offline integration (real SessionManager)", () 
       agentId,
       agent: "reviewer",
       taskId,
+      admission: "admitted",
+      description: undefined,
       delivery: "resume",
       resumed: true,
     });
@@ -859,7 +900,7 @@ describe("SendMessage resume — offline integration (real SessionManager)", () 
       { state: {}, isPartial: false },
     ).render(120) as string[];
     expect(renderedAck[0]).toMatch(/^● /u);
-    expect(renderedAck.join("\n")).toContain("resume started in background with prior context");
+    expect(renderedAck.join("\n")).toContain("resume accepted in background with prior context");
     expect(renderedAck.join("\n").match(/[○●✗■]/gu) ?? []).toHaveLength(1);
     expect(ack).toEqual(canonicalAck);
     // Status flipped back to running synchronously (Claude 2.1.205).
@@ -1082,6 +1123,8 @@ describe("SendMessage resume — nested background bound", () => {
     let releaseHolder!: () => void;
     const holderGate = new Promise<void>((r) => (releaseHolder = r));
     let resumeReachedOnPrompt = false;
+    const resumeEntered = deferred<void>();
+    const resumeGate = deferred<void>();
     const h = fakeSdk({
       onPrompt: async (text) => {
         if (text.includes("HOLD-TASK")) {
@@ -1091,6 +1134,8 @@ describe("SendMessage resume — nested background bound", () => {
         }
         if (text.includes("RESUME-WORK")) {
           resumeReachedOnPrompt = true;
+          resumeEntered.resolve();
+          await resumeGate.promise;
           return "resumed";
         }
         return "seeded";
@@ -1153,16 +1198,42 @@ describe("SendMessage resume — nested background bound", () => {
     // fires SubagentStart synchronously during the dispatch → resumeStarted() true here.
     expect(resumeStarted()).toBe(false);
     expect(resumeReachedOnPrompt).toBe(false);
+    expect(ack.content[0]!.text).toContain("resume accepted in background");
+    expect(ack.content[0]!.text).toContain("configured concurrency capacity");
+    expect(ack.content[0]!.text).not.toMatch(/\bstarted\b/iu);
+    expect(ack.details.admission).toBe("waiting");
+    expect(backgroundTasks.get(taskId)?.admission).toBe("waiting");
+    expect(registry.get(agentId)).toMatchObject({ state: "running", admission: "waiting" });
     expect(registry.get(agentId)!.session).toBeUndefined();
-    expect(registry.get(agentId)!.state).toBe("running");
 
-    // Free the slot → the queued resume acquires, starts, runs to completion.
+    const updates: Array<{ content: Array<{ text: string }>; details: Record<string, unknown> }> = [];
+    const taskOutput = createTaskOutputTool(backgroundTasks) as unknown as {
+      execute(
+        id: string,
+        params: Record<string, unknown>,
+        signal?: AbortSignal,
+        onUpdate?: (update: { content: Array<{ text: string }>; details: Record<string, unknown> }) => void,
+      ): Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
+    };
+    const awaiting = taskOutput.execute("await", { task_id: taskId }, undefined, (update) => updates.push(update));
+    expect(updates.at(-1)?.details.admission).toBe("waiting");
+
+    // Free the slot, but gate the admitted child before it emits any progress.
+    // Both registries and TaskOutput must flip from waiting to admitted/running.
     releaseHolder();
     await holderDispatch;
-    const rec = await backgroundTasks.wait(taskId);
-    expect(rec?.status).toBe("completed");
-    expect(resumeStarted()).toBe(true); // it ran only AFTER the slot freed
+    await resumeEntered.promise;
+    expect(backgroundTasks.get(taskId)?.admission).toBe("admitted");
+    expect(registry.get(agentId)?.admission).toBe("admitted");
+    expect(updates.at(-1)?.details).toMatchObject({ admission: "admitted", status: "running" });
+    expect(updates.at(-1)?.details.subagentProgress).toBeUndefined();
+    expect(resumeStarted()).toBe(true);
     expect(resumeReachedOnPrompt).toBe(true);
+
+    resumeGate.resolve();
+    const [rec, output] = await Promise.all([backgroundTasks.wait(taskId), awaiting]);
+    expect(rec?.status).toBe("completed");
+    expect(output.details.status).toBe("completed");
     expect(registry.get(agentId)!.state).toBe("settled");
   });
 });

@@ -1,8 +1,10 @@
 import os from "node:os";
 import path from "node:path";
-import type { ClaudeProject, ClaudeSkill, Diagnostic, HookConfig } from "./types.js";
+import type { ClaudeProject, ClaudeSkill, Diagnostic, HookConfig, ResolvedMcpConfig } from "./types.js";
 import { discoverArtifactDirs, resolveProjectRoot, dedupeByName } from "./discovery/locations.js";
 import { loadSettings } from "./discovery/settings.js";
+import { resolveMcpConfig } from "./discovery/mcp.js";
+import { loadMcpJson } from "./claude/mcp-config.js";
 import { loadSkills } from "./claude/skills.js";
 import { loadAgents } from "./claude/agents.js";
 import { loadRules } from "./claude/rules.js";
@@ -22,6 +24,8 @@ import {
  * content folded into the same registries.
  */
 export interface LoadedProject extends ClaudeProject {
+  /** Resolved MCP servers (always present here; empty config => `servers: []`). */
+  mcp: ResolvedMcpConfig;
   /** Fully merged hook config: settings hooks + plugin hooks. */
   mergedHooks: HookConfig;
   plugins: InstalledPlugin[];
@@ -121,6 +125,15 @@ export function loadClaudeProject(opts: {
   // Auto memory, read side: undefined when disabled by setting or env.
   const autoMemory = loadAutoMemory(root, userDir, settings);
 
+  // MCP config discovery: `.mcp.json` + scope-tagged settings captures,
+  // resolved through precedence and the enablement gate. Pure data — server
+  // processes are the runtime's job.
+  const mcp = resolveMcpConfig({
+    projectRoot: root,
+    mcpJson: loadMcpJson(root),
+    mcpSettings: settings.mcpSettings ?? [],
+  });
+
   const hookConfigs: HookConfig[] = [settings.hooks];
   for (const plugin of plugins) {
     const rawHooks = loadPluginHooks(plugin);
@@ -141,6 +154,7 @@ export function loadClaudeProject(opts: {
     agents,
     rules: rulesResult.rules,
     claudeMd: claudeMdResult.files,
+    mcp,
     diagnostics,
     mergedHooks: mergeHookConfigs(...hookConfigs),
     plugins,
