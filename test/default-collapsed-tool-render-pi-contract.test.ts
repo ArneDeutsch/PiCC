@@ -92,6 +92,7 @@ describe("real Pi default-collapse contracts", () => {
       const piContextRoot = process.platform === "win32" ? "C:\\pi-context" : "/pi-context";
       const joinFor = (root: string, file: string) => `${root}${root.includes("\\") ? "\\" : "/"}${file}`;
       let activeRoot = rootA;
+      const resolver = vi.fn(() => activeRoot);
       const native = {
         name: "read",
         label: "read",
@@ -104,30 +105,37 @@ describe("real Pi default-collapse contracts", () => {
         },
       };
       const decorated = wrapForSelfShell(withDefaultCollapsedToolRendering(native as any, {
-        resolveDisplayRoot: () => activeRoot,
+        resolveDisplayRoot: resolver,
       }));
       const makeRow = (id: string, root: string) => new sdk.ToolExecutionComponent(
         "read", id, { path: joinFor(root, "src/a.ts") }, {}, decorated,
         { requestRender() {} }, piContextRoot,
       );
       const first = makeRow("freeze-a", rootA);
-      first.setArgsComplete();
-      first.markExecutionStarted();
       first.render(100);
+      expect(resolver).not.toHaveBeenCalled();
+      first.setArgsComplete();
+      first.render(100);
+      first.render(100);
+      expect(resolver).toHaveBeenCalledTimes(1);
+      first.markExecutionStarted();
       activeRoot = rootB;
       first.updateResult({ content: [{ type: "text", text: "body" }], details: undefined }, false);
       const historical = (first.render(100) as string[]).map(stripAnsi).join("\n");
       expect(historical).toContain(process.platform === "win32" ? "src\\a.ts" : "src/a.ts");
       expect(historical).not.toContain("repo-a");
+      expect(resolver).toHaveBeenCalledTimes(1);
 
       const second = makeRow("freeze-b", rootB);
       second.setArgsComplete();
-      second.markExecutionStarted();
       second.render(100);
+      expect(resolver).toHaveBeenCalledTimes(2);
+      second.markExecutionStarted();
       second.updateResult({ content: [{ type: "text", text: "body" }], details: undefined }, false);
       const fresh = (second.render(100) as string[]).map(stripAnsi).join("\n");
       expect(fresh).toContain(process.platform === "win32" ? "src\\a.ts" : "src/a.ts");
       expect(fresh).not.toContain("repo-b");
+      expect(resolver).toHaveBeenCalledTimes(2);
     });
   });
 

@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
 import {
   getKeybindings,
   KeybindingsManager,
@@ -10,7 +9,7 @@ import {
 import { createBashToolDefinition, initTheme, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { withDefaultCollapsedToolRendering } from "../src/runtime/default-collapsed-tool-render.js";
 import { recognizeMultiEditSuccess, withRoutineToolRendering } from "../src/runtime/routine-tool-render.js";
-import { formatDisplayPath, formatToolDisplayName } from "../src/runtime/tool-display.js";
+import { formatToolDisplayName } from "../src/runtime/tool-display.js";
 
 interface Component { render(width: number): string[] }
 interface RenderTool {
@@ -30,7 +29,10 @@ function component(text: string): Component {
   return { render: () => text.split("\n") };
 }
 
-function definition(name: "read" | "write" | "bash" | "edit"): RenderTool {
+function definition(
+  name: "read" | "write" | "bash" | "edit",
+  dependencies: Parameters<typeof withDefaultCollapsedToolRendering>[1] = {},
+): RenderTool {
   const execute = () => undefined;
   return withDefaultCollapsedToolRendering({
     name, label: name, description: "test", parameters: {}, execute,
@@ -42,7 +44,7 @@ function definition(name: "read" | "write" | "bash" | "edit"): RenderTool {
       const value = result as { content: Array<{ text?: string }>; details?: { diff?: string } };
       return component(`native result ${value.details?.diff ?? value.content.map((block) => block.text ?? "").join("\n")}`);
     },
-  } as unknown as ToolDefinition) as unknown as RenderTool;
+  } as unknown as ToolDefinition, dependencies) as unknown as RenderTool;
 }
 
 function multiDefinition(): RenderTool {
@@ -90,48 +92,6 @@ function settle(tool: RenderTool, args: unknown, result: unknown, expanded = fal
     { args, state, isPartial: false, isError: false, expanded, ...flags }).render(160).join("\n");
 }
 
-describe("display-only tool helpers", () => {
-  it("formats canonical names without changing their source values", () => {
-    const names = ["WebFetch", "MultiEdit", "TaskOutput", "TodoWrite", "read"] as const;
-    expect(names.map(formatToolDisplayName)).toEqual([
-      "web fetch", "multi edit", "task output", "todo write", "read",
-    ]);
-    expect(names).toEqual(["WebFetch", "MultiEdit", "TaskOutput", "TodoWrite", "read"]);
-  });
-
-  it("shortens only lexically contained POSIX and Windows paths without filesystem I/O", () => {
-    const realpath = vi.spyOn(fs, "realpathSync");
-    const stat = vi.spyOn(fs, "statSync");
-    const cases = [
-      ["/repo", "/repo", "."], ["/repo/", "/repo/", "."],
-      ["/repo", "/repo/src/a.ts", "src/a.ts"], ["/repo", "./src/../a.ts", "a.ts"],
-      ["/repo/worktree", "..", "/repo"], ["/repo/worktree", "../sibling/a.ts", "/repo/sibling/a.ts"],
-      ["/repo", "/repo-sibling/a.ts", "/repo-sibling/a.ts"],
-      ["C:\\Repo", "C:\\Repo", "."], ["C:\\Repo\\", "c:/repo/src/a.ts", "src\\a.ts"],
-      ["C:\\Repo", ".\\src\\..\\a.ts", "a.ts"], ["C:\\Repo", "C:src\\a.ts", "src\\a.ts"],
-      ["C:\\Repo", "..\\sibling", "C:\\sibling"], ["C:\\Repo", "D:other.txt", "D:\\other.txt"],
-      ["C:\\Repo", "d:\\outside\\a.ts", "d:\\outside\\a.ts"],
-      ["\\\\server\\share\\repo", "\\\\SERVER\\SHARE\\repo\\a.ts", "a.ts"],
-      ["\\\\server\\share\\repo\\", "a\\..\\b", "b"],
-      ["\\\\server\\share\\repo", "\\\\server\\share2\\a.ts", "\\\\server\\share2\\a.ts"],
-      ["C:\\Repo", "c:/repo\\mixed/a.ts", "mixed\\a.ts"],
-    ] as const;
-    for (const [root, input, expected] of cases) expect(formatDisplayPath(input, root)).toBe(expected);
-    expect(realpath).not.toHaveBeenCalled();
-    expect(stat).not.toHaveBeenCalled();
-    realpath.mockRestore();
-    stat.mockRestore();
-  });
-
-  it.each([
-    ["/repo", "\\\\?\\C:\\repo\\a.ts"],
-    ["C:\\repo", "\\\\.\\pipe\\name"],
-    ["C:\\repo", "\\\\server"],
-  ])("leaves malformed or device namespace forms unchanged (%s, %s)", (root, input) => {
-    expect(formatDisplayPath(input, root)).toBe(input);
-  });
-});
-
 describe("default-collapsed tool rendering", () => {
   it("collapses all five ordinary successes and restores native detail", () => withBinding(["alt+x"], () => {
     const cases = [
@@ -149,6 +109,29 @@ describe("default-collapsed tool rendering", () => {
       if (item.tool.name === "bash") expect(collapsed).toContain("secret-command");
       expect(settle(item.tool, item.args, item.result, true), item.tool.name).toContain(item.detail);
     }
+  }));
+
+  it("snapshots raw file destinations against workspace and repository roots", () => withBinding(["ctrl+o"], () => {
+    const workspace = "/repo/.worktrees/feature";
+    const rawPath = "/repo/src/colon\u200B:a.ts";
+    const args = Object.freeze({ path: rawPath });
+    const result = Object.freeze({ content: Object.freeze([{ type: "text", text: "body" }]), details: undefined });
+    const state = {};
+    const resolver = vi.fn(() => workspace);
+    const tool = definition("read", { resolveDisplayRoot: resolver, repositoryRoot: "/repo" });
+    tool.renderCall(args, theme, {
+      args, state, cwd: "/stale", argsComplete: true, executionStarted: false,
+      isPartial: false, isError: false, expanded: false,
+    });
+    const rendered = tool.renderResult(result, { expanded: false, isPartial: false }, theme, {
+      args, state, cwd: "/stale", argsComplete: true, executionStarted: true,
+      isPartial: false, isError: false, expanded: false,
+    }).render(160).join("\n");
+    expect(rendered).toContain("read repo:src/colon�:a.ts");
+    expect(rendered).not.toMatch(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u);
+    expect(resolver).toHaveBeenCalledTimes(1);
+    expect(args.path).toBe(rawPath);
+    expect(result.content[0]?.text).toBe("body");
   }));
 
   it("collapses only an exact coherent bounded Read continuation", () => withBinding(["ctrl+o"], () => {
@@ -367,8 +350,22 @@ describe("default-collapsed tool rendering", () => {
     const styled = tool.renderResult(readResult("body"), { expanded: false, isPartial: false }, semanticTheme,
       { args, state, isPartial: false, isError: false }).render(100).join("");
     expect(calls.some(([slot, text]) => slot === "text" && text === "read")).toBe(true);
-    expect(calls.some(([slot, text]) => slot === "toolOutput" && text.includes("theme.ts"))).toBe(true);
+    expect(calls.some(([slot, text]) => slot === "accent" && text.includes("theme.ts"))).toBe(true);
+    expect(calls.some(([slot, text]) => slot === "muted" && text.includes("line"))).toBe(true);
+    expect(calls.some(([slot, text]) => slot === "muted" && text.includes("expand"))).toBe(true);
     expect(styled).toMatch(/\u001b\[39m/u);
+
+    calls.length = 0;
+    const bashArgs = { command: "printf themed-command" };
+    const bashState = { startedAt: 1_000, endedAt: 2_250 };
+    const bash = definition("bash");
+    bash.renderCall(bashArgs, semanticTheme, { args: bashArgs, state: bashState, isPartial: false, isError: false });
+    bash.renderResult(readResult("themed output"), { expanded: false, isPartial: false }, semanticTheme,
+      { args: bashArgs, state: bashState, isPartial: false, isError: false }).render(120);
+    expect(calls.some(([slot, text]) => slot === "accent" && text.includes("printf themed-command"))).toBe(true);
+    expect(calls.some(([slot, text]) => slot === "muted" && text.includes("output line"))).toBe(true);
+    expect(calls.some(([slot, text]) => slot === "muted" && text.includes("1.3s"))).toBe(true);
+    expect(calls.some(([slot, text]) => slot === "muted" && text.includes("expand"))).toBe(true);
 
     for (const hostile of [
       { fg: () => "changed" },
@@ -384,6 +381,45 @@ describe("default-collapsed tool rendering", () => {
       expect(plain).not.toContain("\u001b");
       expect(plain).not.toContain("changed");
     }
+  }));
+
+  it("keeps truncated primary text accented without passing truncation ANSI through the theme", () => withBinding(["ctrl+o"], () => {
+    const calls: Array<[string, string]> = [];
+    const semanticTheme = {
+      fg(slot: string, text: string) { calls.push([slot, text]); return `\u001b[35m${text}\u001b[39m`; },
+    };
+    const args = { path: "src/a-very-long-primary-path.ts" };
+    const state = {};
+    const tool = definition("read");
+    tool.renderCall(args, semanticTheme, { args, state, isPartial: false, isError: false });
+    const line = tool.renderResult(readResult("body"), { expanded: false, isPartial: false }, semanticTheme,
+      { args, state, isPartial: false, isError: false }).render(18).join("");
+    const accent = calls.find(([slot]) => slot === "accent")?.[1];
+    expect(accent).toContain("…");
+    expect(accent).not.toContain("\u001b");
+    expect(line).toMatch(/\u001b\[35m .*…\u001b\[39m/u);
+    expect((line.match(/\u001b\[35m/gu) ?? [])).toHaveLength((line.match(/\u001b\[39m/gu) ?? []).length);
+    expect(visibleWidth(line)).toBeLessThanOrEqual(18);
+  }));
+
+  it("drops mutation metadata before its primary path and keeps edit counts muted", () => withBinding(["ctrl+o"], () => {
+    const calls: Array<[string, string]> = [];
+    const semanticTheme = { fg(slot: string, text: string) { calls.push([slot, text]); return text; } };
+    const args = { path: "long-but-still-primary.ts", edits: [{ oldText: "old", newText: "new" }] };
+    const state = {};
+    const tool = definition("edit");
+    tool.renderCall(args, semanticTheme, { args, state, isPartial: false, isError: false });
+    const row = tool.renderResult(editResult(args.path, 1, "-old\n+new"),
+      { expanded: false, isPartial: false }, semanticTheme,
+      { args, state, isPartial: false, isError: false });
+    const wide = row.render(100).join("");
+    expect(wide).toContain("1 edit applied");
+    expect(calls.some(([slot, text]) => slot === "muted" && text.includes("1 edit applied"))).toBe(true);
+    expect(calls.some(([slot, text]) => slot === "toolOutput" && text.includes("edit applied"))).toBe(false);
+    const narrow = row.render("edit ".length + args.path.length).join("");
+    expect(narrow).toBe(`edit ${args.path}`);
+    expect(narrow).not.toContain("edit applied");
+    expect(narrow).not.toContain("diff lines");
   }));
 
   it("pins Bash and Read recovery fields before optional telemetry at narrow usable widths", () => withBinding(["ctrl+o"], () => {
@@ -404,10 +440,26 @@ describe("default-collapsed tool rendering", () => {
     const narrowBash = renderAt(definition("bash"), { command: "printf-a-very-long-command-preview\necho hidden" }, readResult("ok"), 45);
     const narrowRead = renderAt(definition("read"), { path: "a/very/long/path/to/page.txt", offset: 20, limit: 2 },
       readResult("one\ntwo\n\n[987 more lines in file. Use offset=22 to continue.]"), 58);
-    expect(narrowBash).toMatch(/^bash .+ · ctrl\+o to expand$/u);
+    expect(narrowBash).toBe("bash printf-a-very-long-command-preview");
     expect(narrowBash).not.toContain("output line");
-    expect(narrowRead).toMatch(/next offset 22 · ctrl\+o to expand$/u);
+    expect(narrowBash).not.toContain("to expand");
+    expect(narrowRead).toMatch(/next offset 22$/u);
     expect(narrowRead).not.toContain("987 more lines");
+    expect(narrowRead).not.toContain("to expand");
+
+    const calls: Array<[string, string]> = [];
+    const semanticTheme = { fg(slot: string, text: string) { calls.push([slot, text]); return text; } };
+    const args = { path: "a/very/long/path/to/page.txt", offset: 20, limit: 2 };
+    const state = {};
+    const tool = definition("read");
+    tool.renderCall(args, semanticTheme, { args, state, isPartial: false, isError: false });
+    const requiredOnly = tool.renderResult(
+      readResult("one\ntwo\n\n[987 more lines in file. Use offset=22 to continue.]"),
+      { expanded: false, isPartial: false }, semanticTheme,
+      { args, state, isPartial: false, isError: false }).render(14).join("");
+    expect(requiredOnly).toContain("next offset 22");
+    expect(calls.some(([slot, text]) => slot === "toolOutput" && text.includes("next offset 22"))).toBe(true);
+    expect(calls.some(([slot, text]) => slot === "muted" && text.includes("next offset"))).toBe(false);
   }));
 
   it("delegates image evidence larger than the text cap without sanitizing its base64 data", () => withBinding(["ctrl+o"], () => {

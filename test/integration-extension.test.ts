@@ -1301,7 +1301,16 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
         const tool = pi.tools.get(entry.name);
         const argsBefore = structuredClone(entry.args);
         const state = {};
-        const context = { args: entry.args, state, cwd: dir, isPartial: false, isError: false, expanded: false };
+        const context = {
+          args: entry.args,
+          state,
+          cwd: dir,
+          argsComplete: true,
+          executionStarted: false,
+          isPartial: false,
+          isError: false,
+          expanded: false,
+        };
         tool.renderCall(entry.args, theme, context);
         const result = await tool.execute(`t02-${entry.name}-display`, entry.args);
         const resultBefore = structuredClone(result);

@@ -7,10 +7,11 @@ import {
 } from "./routine-tool-render.js";
 import {
   priorityDisplayRow,
-  formatDisplayPath,
+  formatDisplayPathFromRoots,
   formatToolDisplayName,
-  resolveDisplayRoot,
+  resolveDisplayRoots,
   type DisplayRootResolver,
+  type DisplayRoots,
 } from "./tool-display.js";
 import { themedFg } from "./render-util.js";
 
@@ -25,8 +26,9 @@ interface Lifecycle {
   call?: Component;
   result?: Component;
   editPreviewError?: string;
-  displayRoot?: string;
-  displayRootResolved?: boolean;
+  displayRoots?: DisplayRoots;
+  displayRootsResolved?: boolean;
+  displayPath?: string;
   settledCall: boolean;
 }
 
@@ -69,7 +71,7 @@ export function sanitize(value: string, limit: number, inline = false): string {
     .replace(/(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c|$)/gu, "�")
     .replace(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]?/gu, "�")
     .replace(/\u001b(?:[ -/]*[@-~]?|.)?/gu, "�")
-    .replace(/\r/gu, "")
+    .replace(/\r/gu, "�")
     .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) => {
       if (!inline && character === "\n") return "\n";
       return character === "\t" ? "   " : "�";
@@ -377,7 +379,8 @@ function summaryComponent(
   summary: Summary,
   hint: string,
   theme: unknown,
-  displayRoot: string | undefined,
+  displayRoots: DisplayRoots,
+  snapshottedPath?: string,
 ): Component {
   const title = formatToolDisplayName(toolName);
   if (summary.kind === "bash") {
@@ -390,11 +393,11 @@ function summaryComponent(
     ];
     return priorityDisplayRow(title, summary.commandPreview, [], optional, `${hint} to expand`, theme);
   }
-  const path = formatDisplayPath(sanitize(summary.path, MAX_PATH, true), displayRoot);
+  const path = snapshottedPath ?? sanitize(formatDisplayPathFromRoots(summary.path, displayRoots), MAX_PATH, true);
   if (summary.kind === "mutation") {
     const detail = summary.noNet ? "no net change" : `${summary.diffLines} diff ${summary.diffLines === 1 ? "line" : "lines"} hidden`;
-    return priorityDisplayRow(title, path,
-      [`${summary.edits} ${summary.edits === 1 ? "edit" : "edits"} applied`], [detail], `${hint} to expand`, theme);
+    return priorityDisplayRow(title, path, [],
+      [`${summary.edits} ${summary.edits === 1 ? "edit" : "edits"} applied`, detail], `${hint} to expand`, theme);
   }
   if (summary.remaining !== undefined && summary.nextOffset !== undefined) {
     return priorityDisplayRow(title, `${path}${summary.range ?? ""}`,
@@ -418,6 +421,7 @@ function combined(components: readonly Component[], theme: unknown): Component {
 
 export interface DefaultCollapsedRenderingDependencies {
   resolveDisplayRoot?: DisplayRootResolver;
+  repositoryRoot?: string;
 }
 
 /**
@@ -437,9 +441,14 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(
   const decorated = { ...tool } as T;
   decorated.renderCall = ((argsValue: unknown, theme: unknown, context: unknown): Component => {
     const current = lifecycle(context);
-    if (current && current.displayRootResolved !== true) {
-      current.displayRoot = resolveDisplayRoot(dependencies.resolveDisplayRoot, context);
-      current.displayRootResolved = true;
+    if (current && current.displayRootsResolved !== true && booleanField(context, "argsComplete") !== false) {
+      current.displayRoots = resolveDisplayRoots(dependencies.resolveDisplayRoot, dependencies.repositoryRoot, context);
+      const rawArgs = data(argsValue);
+      const rawPath = toolName === "MultiEdit" ? rawArgs?.file_path : rawArgs?.path;
+      if (typeof rawPath === "string") {
+        current.displayPath = sanitize(formatDisplayPathFromRoots(rawPath, current.displayRoots), MAX_PATH, true);
+      }
+      current.displayRootsResolved = true;
     }
     const settled = booleanField(context, "isPartial") === false;
     const args = settled ? displayArgs(toolName, argsValue) : liveDisplayArgs(toolName, argsValue);
@@ -516,10 +525,10 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(
 
     const ownsRow = current.settledCall && current.call;
     if (ordinary && hint && !requestedExpanded && ownsRow) {
-      const displayRoot = current.displayRootResolved === true
-        ? current.displayRoot
-        : resolveDisplayRoot(dependencies.resolveDisplayRoot, context);
-      return summaryComponent(toolName, ordinary, hint, theme, displayRoot);
+      const displayRoots = current.displayRootsResolved === true
+        ? current.displayRoots ?? {}
+        : resolveDisplayRoots(dependencies.resolveDisplayRoot, dependencies.repositoryRoot, context);
+      return summaryComponent(toolName, ordinary, hint, theme, displayRoots, current.displayPath);
     }
 
     let call = current.call;

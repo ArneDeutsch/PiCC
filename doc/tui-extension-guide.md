@@ -127,8 +127,8 @@ The construction order is load-bearing: search specialization → routine/Edit r
 `withDefaultCollapsedToolRendering` → `wrapForSelfShell` → the outer checkpoint gate →
 registration. Presentation decorators leave the raw built-in `execute` unchanged. Only the outer
 checkpoint gate wraps it, and that gate may alter the returned result by adding `terminate`. The
-collapse adapter snapshots the display-only path root when the invocation first renders, so later
-cwd changes cannot rewrite an existing row. It recognizes an ordinary bounded Read continuation
+collapse adapter snapshots display-only roots and the raw path when complete invocation arguments
+first render, so later cwd changes cannot rewrite an existing row. It recognizes an ordinary bounded Read continuation
 only when the canonical notice agrees exactly with the requested range; unknown and exceptional
 families fail open to native detail. The configured `app.tools.expand` action changes native detail
 without changing the glyph; live, exceptional, unfamiliar, and unbound-action rows keep their native
