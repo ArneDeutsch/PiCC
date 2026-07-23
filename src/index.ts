@@ -80,6 +80,8 @@ import { registerCodexAbortGuard } from "./runtime/codex-abort-guard.js";
 import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
+import { McpRuntime } from "./runtime/mcp.js";
+import { buildMcpProxyTools } from "./runtime/mcp-tools.js";
 import { applyUnicodeSafeProcessEnv, computeSessionScratchDir } from "./util/env.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
 
@@ -816,6 +818,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return sections.join("\n\n");
   }
 
+  // MCP stdio runtime: session-global, started non-blocking at load (zero
+  // enabled servers ⇒ nothing spawned, immediate settle). Declared above
+  // allKnownToolNames so dispatch-time closures over MCP state can never hit a
+  // TDZ. Model-facing registration happens in the detached mcpRegistration
+  // step below; shutdown joins session_shutdown.
+  const mcpRuntime = McpRuntime.start(project.mcp, {
+    projectRoot: project.root,
+    sessionId,
+  });
+
   function allKnownToolNames(): string[] {
     return [
       "Read",
@@ -1531,6 +1543,46 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   void builtInRegistration;
 
   // ---------------------------------------------------------------------------
+  // MCP tool exposure (detached; the first-turn barrier below awaits it)
+  // ---------------------------------------------------------------------------
+  // After the non-blocking connect settles, each connected server's tools
+  // register as `mcp__<server>__<tool>` proxies through the same decoration
+  // pipeline as every other main-session custom tool; Pi auto-activates newly
+  // registered names (the main session has no tool allowlist), so post-load
+  // registration reaches the model on the next turn. Bare-name and server-level
+  // deny rules remove matching tools from the model's context entirely (Claude
+  // parity — gateTools already owns that removal grammar); the guard's
+  // call-time deny stays the backstop for everything else. Zero enabled
+  // servers: whenSettled is pre-resolved and zero proxies build — nothing
+  // registers, nothing is printed, the model's context is untouched.
+  const mcpRegistration = (async () => {
+    try {
+      await mcpRuntime.whenSettled();
+      const proxies = buildMcpProxyTools(mcpRuntime);
+      if (proxies.length === 0) return;
+      const admitted = new Set(
+        permissionEngine.gateTools(undefined, undefined, proxies.map((t) => t.name)),
+      );
+      for (const proxy of proxies) {
+        if (!admitted.has(proxy.name)) continue;
+        // Per-tool catch (same idiom as the claudeNamedTools loop): one
+        // throwing registerTool must not drop the sibling tools behind it.
+        try {
+          const routineRendered = withRoutineToolRendering(proxy);
+          const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
+          pi.registerTool(mainCheckpointGate.wrapTool(
+            wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
+          ));
+        } catch (err) {
+          console.error(`PiCC: failed to register MCP tool "${proxy.name}": ${(err as Error).message}`);
+        }
+      }
+    } catch (err) {
+      console.error(`PiCC: MCP tool registration failed: ${(err as Error).message}`);
+    }
+  })();
+
+  // ---------------------------------------------------------------------------
   // Guard: deny rules + PreToolUse/PostToolUse hooks + on-touch context injection
   // ---------------------------------------------------------------------------
   createGuardExtension({
@@ -1555,6 +1607,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   );
   pi.on("before_agent_start", async (event: any) => {
     deliverSettlementNotices();
+    // First-turn MCP settle barrier: Pi awaits this handler before snapshotting
+    // the run's tools, so waiting for the registration step (itself bounded by
+    // MCP_TIMEOUT via whenSettled) makes the first request deterministically
+    // carry connected servers' tools. Registration, not bare whenSettled: settle
+    // alone would race Pi's snapshot against the detached registerTool calls.
+    // Resolved-promise no-op after the first settle and on the zero-enabled
+    // path; never rejects (its own try/catch degrades to stderr).
+    await mcpRegistration;
     try {
       const suffix = buildSystemPromptSuffix({
         claudeMd: project.claudeMd,
@@ -1797,6 +1857,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         .filter((record) => record.state === "running" && record.checkpointPaused)
         .map((record) => backgroundTasks.stopAgentAndWait(record.agentId)));
       await subagentRuntime.shutdownCheckpointPaused();
+      // MCP servers die with the session — after the subagent joins above
+      // (an in-flight subagent MCP call must not lose its server mid-call),
+      // before SessionEnd fires. Never throws; grace-bounded per server.
+      await mcpRuntime.shutdown();
       // `reason` is the matcher subject for SessionEnd (Claude wire contract).
       await hooks.fire("SessionEnd", { cwd: cwdState.get(), reason: event?.reason ?? "other" });
     } catch {
