@@ -24,6 +24,7 @@ import { SubagentRegistry } from "./runtime/subagent-registry.js";
 import type { SubagentRegistryRecord } from "./runtime/subagent-registry.js";
 import {
   createPanelHintEmitter,
+  panelAgentCounts,
   PANEL_ENTRY_CHORD,
   SubagentPanelWidgetController,
 } from "./runtime/subagent-panel-widget.js";
@@ -255,6 +256,10 @@ export interface PiccTestSeam {
    * guarantee as `onWired` above (see the SECURITY note).
    */
   sdk?: PiSdk;
+  /** TEST-ONLY managed settings locations passed directly to project loading. */
+  managedSettingsPaths?: string[];
+  /** TEST-ONLY managed artifact directories passed directly to project loading. */
+  managedArtifactDirs?: string[];
 }
 
 const codexProviderRegistries = new WeakSet<object>();
@@ -307,6 +312,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     project = loadClaudeProject({
       cwd: process.cwd(),
       userDir: process.env.PICC_CLAUDE_USER_DIR || undefined,
+      ...(testSeam?.managedSettingsPaths
+        ? { managedSettingsPaths: testSeam.managedSettingsPaths }
+        : {}),
+      ...(testSeam?.managedArtifactDirs
+        ? { managedArtifactDirs: testSeam.managedArtifactDirs }
+        : {}),
     });
   } catch (err) {
     // Completeness floor: a broken project must never crash the harness.
@@ -642,6 +653,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const subagentPanel = new SubagentPanelWidgetController({
     registry: subagentRegistry,
     tasks: panelTaskJoin,
+    onTasksChange: (listener) => backgroundTasks.onChange(listener),
     // Lazy closure over the focus controller declared just below: the widget
     // reads dismissals only at view time (session_start and later), never
     // during construction.
@@ -652,6 +664,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const subagentPanelFocus = new SubagentPanelFocusController({
     registry: subagentRegistry,
     tasks: panelTaskJoin,
+    onTasksChange: (listener) => backgroundTasks.onChange(listener),
     stopTask: (taskId) => {
       backgroundTasks.markUserStopped(taskId);
     },
@@ -666,7 +679,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     });
   }
   // One-time status-line hint (ui.notify) advertising the chord, emitted only
-  // once >1 agent runs concurrently in a TUI session (the ui handle is
+  // once >1 agent is admitted or waiting in a TUI session (the ui handle is
   // captured at session_start).
   let panelHintUi: any;
   const emitPanelHint = createPanelHintEmitter({
@@ -674,11 +687,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     isTui: () => panelHintUi !== undefined,
     emit: (text) => panelHintUi?.notify?.(text, "info"),
   });
-  subagentRegistry.onChange(() => {
-    let running = 0;
-    for (const record of subagentRegistry.list()) if (record.state === "running") running++;
-    emitPanelHint(running);
-  });
+  const refreshPanelHint = (): void => {
+    emitPanelHint(panelAgentCounts(subagentRegistry.list(), panelTaskJoin()));
+  };
+  subagentRegistry.onChange(refreshPanelHint);
+  backgroundTasks.onChange(refreshPanelHint);
   // Built-in agent types: general-purpose/Explore/Plan, appended AFTER
   // project/user/plugin agents so a same-named project agent wins (an
   // overridden built-in is dropped from the catalog — dispatch resolves the

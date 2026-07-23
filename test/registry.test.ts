@@ -39,6 +39,12 @@ import { SUPPORTED_HOOK_EVENTS } from "../src/types.js";
 
 const SOURCE: SourceRef = { path: "<virtual>", scope: "project" };
 
+function expectCurrentNestedSpawningNote(note: string | undefined): void {
+  expect(note).toMatch(/(?:disables nested spawning|nested spawning (?:is )?disabled) by default/i);
+  expect(note).not.toMatch(/\b2\s*(?:\.\.|-|to)\s*5\b/i);
+  expect(note).not.toMatch(/five-level nesting is fixed|fixed five-level nesting|fixed and not configurable|nesting (?:is )?non-configurable/i);
+}
+
 function makeSettings(overrides: Partial<ClaudeSettings> = {}): ClaudeSettings {
   return {
     permissions: {
@@ -332,6 +338,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(agent?.note).toContain("official docs define neither notification consumption nor exact mid-turn/next-turn timing");
     expect(agent?.note).toContain("not verified parity");
     expect(agent?.note).toContain("2.1.198");
+    expect(agent?.note).toContain("Claude Code 2.1.217");
+    expect(agent?.note).toContain("CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH");
+    expectCurrentNestedSpawningNote(agent?.note);
     const task = lookupCapability("tool.Task");
     expect(task?.tier).toBe("partial");
     expect(task?.note).toContain("alias");
@@ -340,6 +349,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(task?.note).toContain("running polls preserve it");
     expect(task?.note).toContain("terminal TaskOutput collection suppresses it");
     expect(task?.note).toContain("PiCC UX hardening rather than verified parity");
+    expect(task?.note).toContain("Claude Code 2.1.217");
+    expect(task?.note).toContain("CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH");
+    expectCurrentNestedSpawningNote(task?.note);
   });
 
   // The tool-output clip backstop is a deliberate directional divergence (a HIGH
@@ -382,6 +394,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(sm?.note).toContain("eligible uncollected current resumed task");
     expect(sm?.note).toContain("terminal TaskOutput collection suppresses it");
     expect(sm?.note).toContain("running polls do not");
+    expect(sm?.note).toContain("waiting for configured capacity visibly refuses steering until admitted");
+    expect(sm?.note).toContain("PiCC-defined because Claude's queue behavior is undocumented");
     for (const gap of ["no cross-restart resume", "steering is background-only", "next-turn"]) {
       expect(sm?.note).toContain(gap);
     }
@@ -423,7 +437,17 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     const out = lookupCapability("tool.TaskOutput");
     expect(out?.tier).toBe("partial");
     expect(out?.note).toContain("failed status");
-    expect(out?.note).toContain("retains the explicitly requested target ID");
+    expect(out?.note).toContain("waiting for configured capacity");
+    expect(out?.note).toContain("in-progress await shows waiting in human/streaming partial output");
+    expect(out?.note).toContain("polling, or an interrupted await, returns waiting to the model");
+    expect(out?.note).toContain("completed await instead returns the canonical terminal result");
+    expect(out?.note).not.toMatch(/completed await[^.]*waiting/i);
+    // TaskOutput is INHERITED by subagents but SCOPED to the dispatcher's
+    // own tasks — the old inverted "Claude hides TaskOutput; PiCC's session-wide
+    // registry does not" wording is gone. The note must state the scoped behavior
+    // and the honest #15098 hardening (not a blanket "non-divergent" claim).
+    expect(out?.note).toContain("status line that retains the explicitly requested target ID");
+    expect(out?.note).not.toContain("status line retains");
     expect(out?.note).toContain("passive Agent/settlement lifecycle rows omit task ID chips");
     expect(out?.note).toContain("registry and canonical identity remain unchanged");
     // Claude removes TaskOutput from named subagents; PiCC deliberately exposes
@@ -541,26 +565,50 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     // not the removed "PiCC defaults foreground" gap, and name the residual timing gap.
     expect(bg?.note).toContain("background-by-default");
     expect(bg?.note).not.toContain("PiCC defaults foreground");
-    // The nested-concurrency model is machine-readable — per-depth budgets
-    // bound nested fan-out and diverge from Claude's single global parallel-agent cap.
-    expect(bg?.note).toContain("per-depth budgets");
-    expect(bg?.note).toContain("maxDepth × concurrency");
-    expect(bg?.note).toContain("Claude's single global (~10) parallel-agent cap");
-    // TaskOutput exposure is a documented PiCC extension with own-dispatch scope;
-    // the coordinator still has session-wide reach.
+    // PiCC's scheduler and current official Claude facts stay distinct.
+    expect(bg?.note).toContain("root dispatches up to the effective configured concurrency");
+    expect(bg?.note).not.toContain("root background work");
+    expect(bg?.note).toContain("queues additional accepted work FIFO");
+    expect(bg?.note).toContain("no separate waiter cap");
+    expect(bg?.note).toContain("each nested-background depth has a separate configured-capacity pool");
+    expect(bg?.note).toContain("maxDepth × concurrency bounds the background pools only");
+    expect(bg?.note).toContain("Foreground nested dispatch bypasses those pools");
+    expect(bg?.note).toContain("total active work can be higher");
+    expect(bg?.note).toContain("Claude Code 2.1.217");
+    expect(bg?.note).toContain("default 20");
+    expect(bg?.note).toContain("CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS");
+    expect(bg?.note).toContain("CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH");
+    expect(bg?.note).toContain("subagents.maxDepth greater than 1");
+    expectCurrentNestedSpawningNote(bg?.note);
+    expect(bg?.note).toContain("does not establish queue-versus-rejection behavior or precise concurrency scope");
+    expect(bg?.note).toContain("Claude Code 2.1.212");
+    expect(bg?.note).toContain("default-200 per-session subagent-spawn cap");
+    expect(bg?.note).toContain("CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION");
+    expect(bg?.note).toContain("reset by /clear");
+    expect(bg?.note).toContain("PiCC has no corresponding per-session spawn budget");
+    expect(bg?.note).toContain("Waiting status in TaskOutput and the interactive panel is PiCC-defined UX");
+    expect(bg?.note).not.toContain("global (~10) parallel-agent cap");
+    expect(bg?.note).not.toContain("Claude's single global");
+    const maxDepth = lookupCapability("setting.subagentMaxDepth");
+    expect(maxDepth?.note).toContain("accepts any positive integer");
+    expect(maxDepth?.note).not.toContain("2..5");
+    expect(maxDepth?.note).not.toContain("five-level");
+    const concurrency = lookupCapability("setting.subagentConcurrency");
+    expect(concurrency?.tier).toBe("full");
+    expect(concurrency?.note).toContain("root dispatches");
+    expect(concurrency?.note).toContain("separately to each nested-background depth");
+    expect(concurrency?.note).toContain("foreground nested dispatch bypasses");
+    expect(concurrency?.note).toContain("not a total or session ceiling");
+    expect(concurrency?.note).not.toContain("root background");
+    // The subagent-scoping clause must survive future edits to this entry.
+    expect(bg?.note).toContain("scoped to the subagent's own dispatched tasks");
     expect(bg?.note).toContain("PiCC EXTENSION/DIVERGENCE");
     expect(bg?.note).toContain("official Claude Code subagent documentation removes TaskOutput");
-    expect(bg?.note).toContain("even when it is listed in `tools:`");
-    expect(bg?.note).toContain("scoped to their own dispatched tasks");
-    expect(bg?.note).toContain("coordinator retains full session-wide reach");
-    expect(bg?.note).not.toContain("see tool.TaskOutput for #15098");
     expect(bg?.note).toContain("individual always-expanded tree rows when a useful identity/description row fits");
-    expect(bg?.note).toContain("prioritizing those fields after state");
     expect(bg?.note).toContain("dropping optional telemetry columns panel-wide as width narrows");
     expect(bg?.note).toContain("very narrow widths use truthful state aggregates");
-    expect(bg?.note).toContain("passive panel/lifecycle rows omit internal task ID chips");
-    expect(bg?.note).toContain("explicit TaskOutput/TaskStop targeting rows retain the requested target");
-    expect(bg?.note).toContain("canonical registry/model-visible identity is unchanged");
+    expect(bg?.note).toContain("waiting keeps a static glyph plus literal label. The panel also provides");
+    expect(bg?.note).not.toContain("literal label, a keyboard-entered drill-down");
     // The in-session Agent View gap is closed by the status panel; the honest
     // residuals must be named instead of the retired "no always-on Agent View".
     expect(bg?.note).not.toContain("no always-on Agent View");
@@ -787,6 +835,23 @@ describe("capability matrix freshness", () => {
     const committed = fs.readFileSync(committedPath, "utf8");
     const norm = (s: string) => s.replace(/\r\n/g, "\n");
     expect(norm(committed)).toBe(norm(regenerated));
+  });
+
+  it("keeps the architecture ownership and nested-pool bounds precise", () => {
+    const architecturePath = fileURLToPath(new URL("../doc/architecture.md", import.meta.url));
+    const architecture = fs.readFileSync(architecturePath, "utf8");
+    const normalized = architecture.replace(/\s+/g, " ").trim();
+    const plain = normalized.replace(/[*_]/g, "");
+    expect(normalized).toContain("The scheduler owns admission");
+    expect(normalized).toContain("`SubagentRegistry` owns dispatch lifecycle and progress");
+    expect(normalized).toContain("`BackgroundTaskRegistry` owns task-generation admission and stop data");
+    expect(normalized).toContain("`maxDepth × concurrency` bounds the background pools");
+    expect(normalized).toContain("Foreground nested dispatch bypasses those pools");
+    expect(normalized).toContain("total active work can exceed that product");
+    expect(plain).toContain("not Claude Code parity");
+    expect(normalized).not.toContain("registry the single data source for the status panel");
+    expect(normalized).not.toContain("Claude Code 2.1.217");
+    expect(normalized).not.toContain("CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS");
   });
 });
 
@@ -1317,7 +1382,9 @@ describe("renderDoctorReport", () => {
     expect(doctor).toContain("Subagent nesting: main-session-only");
     expect(doctor).toContain("subagents.maxDepth=1");
     expect(doctor).toContain("PiCC default");
-    expect(doctor).toContain("2..5");
+    expect(doctor).toContain("any positive integer greater than 1");
+    expect(doctor).not.toMatch(/\b2\s*(?:\.\.|-|to)\s*5\b/i);
+    expect(doctor).not.toContain("nests up to 5");
   });
 
   it("reflects a raised subagents.maxDepth in the posture line", () => {
@@ -1332,6 +1399,8 @@ describe("renderDoctorReport", () => {
     const project = makeProject({ settings: makeSettings({ subagentMaxDepth: 0 }) });
     const doctor = renderDoctorReport(project, buildCompatReport(project));
     expect(doctor).toContain("subagents.maxDepth=0");
+    expect(doctor).toContain("another positive integer to allow nested delegation");
+    expect(doctor).not.toMatch(/\b2\s*(?:\.\.|-|to)\s*5\b/i);
     // must NOT mislabel a non-1 value as the default
     expect(doctor).not.toContain("subagents.maxDepth=1, PiCC default");
     expect(doctor).not.toContain("Subagent nesting: main-session-only");

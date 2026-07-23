@@ -24,6 +24,7 @@ import {
   formatBackgroundTaskIdentity,
   normalizeBackgroundTaskId,
 } from "./background-identity.js";
+import type { SubagentAdmission } from "./subagent-registry.js";
 
 /**
  * Background task runtime: a background dispatch from the Agent tool registers
@@ -115,6 +116,8 @@ export interface BackgroundTaskRecord {
   id: string;
   label: string;
   status: BackgroundTaskStatus;
+  /** Runtime-derived concurrency admission; absent compatibility records are admitted. */
+  admission?: SubagentAdmission;
   /**
    * The dispatcher that started this task: the agent id of the
    * subagent whose Agent-tool dispatch created it, or `undefined` for the
@@ -230,6 +233,8 @@ export interface BackgroundTaskView {
   /** Mark a terminal task result as collected through TaskOutput. */
   markCollected(id: string): boolean;
   subscribeProgress(id: string, listener: (snapshot: ProgressSnapshot) => void): () => void;
+  /** Subscribe only to this owned task's presentation-relevant mutations. */
+  subscribe?(id: string, listener: () => void): () => void;
 }
 
 export class BackgroundTaskRegistry {
@@ -260,6 +265,50 @@ export class BackgroundTaskRegistry {
     string,
     Set<(snapshot: ProgressSnapshot) => void>
   >();
+  private readonly changeListeners = new Set<() => void>();
+  private readonly taskChangeListeners = new Map<string, Set<() => void>>();
+
+  /** Global mutation listener for assembled presentation surfaces. */
+  onChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.changeListeners.delete(listener);
+    };
+  }
+
+  subscribe(id: string, listener: () => void): () => void {
+    if (!this.tasks.has(id)) return () => {};
+    let listeners = this.taskChangeListeners.get(id);
+    if (!listeners) {
+      listeners = new Set();
+      this.taskChangeListeners.set(id, listeners);
+    }
+    listeners.add(listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      const current = this.taskChangeListeners.get(id);
+      current?.delete(listener);
+      if (current?.size === 0) this.taskChangeListeners.delete(id);
+    };
+  }
+
+  private notifyChange(id: string): void {
+    for (const listener of [
+      ...this.changeListeners,
+      ...(this.taskChangeListeners.get(id) ?? []),
+    ]) {
+      try {
+        listener();
+      } catch {
+        // Presentation observers never become task or scheduler authority.
+      }
+    }
+  }
 
   private setAgentIdentity(record: BackgroundTaskRecord, agentId: string | undefined): void {
     const oldLink = this.identityLinks.get(record.id);
@@ -322,6 +371,7 @@ export class BackgroundTaskRegistry {
     agentType?: string,
     owner?: string,
     description?: string,
+    admission: SubagentAdmission = "admitted",
   ): string {
     const generation = ++this.counter;
     const id = `task-${generation}`;
@@ -333,6 +383,7 @@ export class BackgroundTaskRegistry {
       id,
       label: sanitizeLine(label, CAPTURED_LINE_CAP),
       status: "running",
+      admission,
       agentId,
       agentType:
         agentType === undefined
@@ -378,6 +429,7 @@ export class BackgroundTaskRegistry {
             severity: "info",
             message: "task was stopped before completion; its result was discarded",
           });
+          this.notifyChange(id);
           return;
         }
         if (result.outcome === "completed") {
@@ -394,6 +446,7 @@ export class BackgroundTaskRegistry {
           // Preserve best-effort partial output for TaskOutput to surface.
           if (result.finalMessage.trim()) record.result = result.finalMessage;
         }
+        this.notifyChange(id);
       },
       (err) => {
         record.settledAt ??= Date.now();
@@ -401,6 +454,7 @@ export class BackgroundTaskRegistry {
           record.status = "failed";
           record.error = capErrorText(err instanceof Error ? err.message : String(err));
         }
+        this.notifyChange(id);
       },
     );
     // Listener teardown on EVERY settle path: both handlers above
@@ -412,7 +466,16 @@ export class BackgroundTaskRegistry {
     });
     this.tasks.set(id, record);
     this.setAgentIdentity(record, agentId);
+    this.notifyChange(id);
     return id;
+  }
+
+  /** Mirror runtime concurrency admission without changing task status. */
+  noteAdmission(id: string, admission: SubagentAdmission): void {
+    const task = this.tasks.get(id);
+    if (!task || task.status !== "running") return;
+    task.admission = admission;
+    this.notifyChange(id);
   }
 
   /**
@@ -474,6 +537,11 @@ export class BackgroundTaskRegistry {
    */
   subscriberCount(id: string): number {
     return this.progressListeners.get(id)?.size ?? 0;
+  }
+
+  /** Test/diagnostic hook for task-scoped change-listener teardown. */
+  changeSubscriberCount(id: string): number {
+    return this.taskChangeListeners.get(id)?.size ?? 0;
   }
 
   /**
@@ -556,6 +624,7 @@ export class BackgroundTaskRegistry {
     if (!task || task.status === "running") return false;
     if ((task.settlementDelivery ?? "pending") === "pending") {
       task.settlementDelivery = "collected";
+      this.notifyChange(id);
     }
     return true;
   }
@@ -582,6 +651,7 @@ export class BackgroundTaskRegistry {
     // cooperative promise settlement.
     task.settledAt ??= Date.now();
     let abortRequested = false;
+    this.notifyChange(id);
     if (task.abort) {
       try {
         const claimed = Promise.resolve(task.abort()).catch(() => undefined);
@@ -637,15 +707,22 @@ export class BackgroundTaskRegistry {
    * marks the record user-stopped, then performs the same best-effort stop
    * transition as {@link stop}. The marker is what lets TaskOutput details
    * consumers distinguish "stopped by user" from a model stop; callers pair
-   * it with `SubagentRegistry.markUserStopped`, which makes the
-   * stop permanent for the agent id. The marker is set only when the task is
-   * running (or already stopped): a completed/failed task cannot be
-   * retroactively claimed as user-stopped.
+   * it with `SubagentRegistry.markUserStopped`, which makes the stop permanent
+   * for the agent id. A failed generation explicitly retaining a
+   * checkpoint-paused child remains user-stoppable; ordinary completed/failed
+   * tasks cannot be retroactively claimed as user-stopped.
    */
   markUserStopped(id: string): { found: boolean; alreadySettled: boolean; abortRequested: boolean } {
     const task = this.tasks.get(id);
     if (!task) return { found: false, alreadySettled: false, abortRequested: false };
-    if (task.status === "running" || task.status === "stopped") task.userStopped = true;
+    if (
+      task.status === "running" ||
+      task.status === "stopped" ||
+      (task.status === "failed" && task.checkpointPaused === true)
+    ) {
+      task.userStopped = true;
+      this.notifyChange(id);
+    }
     return this.stop(id);
   }
 
@@ -687,6 +764,7 @@ export class BackgroundTaskRegistry {
       markCollected: (id) => (owns(id) ? this.markCollected(id) : false),
       subscribeProgress: (id, listener) =>
         owns(id) ? this.subscribeProgress(id, listener) : () => {},
+      subscribe: (id, listener) => owns(id) ? this.subscribe(id, listener) : () => {},
     };
   }
 }
@@ -987,31 +1065,49 @@ export function createTaskOutputTool(
       if (task.status === "running" && params.wait !== false) {
         const partial = (snap: ProgressSnapshot | undefined): ToolUpdate => ({
           // Mirror the foreground partial: print/RPC legibility rides in content.
-          content: [{ type: "text", text: snap ? renderProgressText(snap) : "" }],
+          content: [{
+            type: "text",
+            text: task.admission === "waiting"
+              ? "Waiting for configured concurrency capacity."
+              : snap
+                ? renderProgressText(snap)
+                : "",
+          }],
           details: {
             subagentProgress: snap,
+            admission: task.admission ?? "admitted",
+            status: task.status,
             agent,
             taskId: id,
             agentId: task.agentId,
             live: true,
           } satisfies SubagentRenderDetails,
         });
-        let unsub = () => {};
+        let unsubProgress = () => {};
+        let unsubTask = () => {};
         let removeAbort = () => {};
+        let wakeForStatusChange = () => {};
+        const statusChanged = new Promise<void>((resolve) => (wakeForStatusChange = resolve));
         try {
+          // Status changes are operational for an awaited TaskOutput: TaskStop
+          // must wake it immediately even though queued dispatch cleanup remains
+          // deliberately delayed. Admission-only changes repaint when possible.
+          unsubTask = registry.subscribe?.(id, () => {
+            if (task.status === "running") onUpdate?.(partial(task.progress));
+            else wakeForStatusChange();
+          }) ?? (() => {});
           if (onUpdate) {
             // Subscribe FIRST — subscribe-after-settle is a no-op returning a
             // no-op unsub (no race, no leak) — then emit an initial
             // paint (… starting… when no snapshot yet) so it is never blank. Both
             // run INSIDE the try so a throwing initial paint still hits the finally
             // teardown (no leaked listener).
-            unsub = registry.subscribeProgress(id, (snap) => onUpdate(partial(snap)));
+            unsubProgress = registry.subscribeProgress(id, (snap) => onUpdate(partial(snap)));
             onUpdate(partial(task.progress));
           }
-          // `settled` never rejects; race it against abort so an aborted signal
-          // stops streaming and returns the current-status result (no throw). The
-          // abort listener is removed on EVERY exit (finally) so a reused session
-          // signal never accumulates once-listeners across TaskOutput calls.
+          // Physical settlement, a logical stop, or caller abort ends the wait.
+          // The abort listener is removed on EVERY exit (finally) so a reused
+          // session signal never accumulates listeners across TaskOutput calls.
           if (signal?.aborted) {
             // Already aborted → return current status without waiting.
           } else if (signal) {
@@ -1019,13 +1115,14 @@ export function createTaskOutputTool(
               const onAbort = () => resolve();
               signal.addEventListener("abort", onAbort, { once: true });
               removeAbort = () => signal.removeEventListener("abort", onAbort);
-              void registry.wait(id).then(() => resolve(), () => resolve());
+              void Promise.race([registry.wait(id), statusChanged]).then(() => resolve(), () => resolve());
             });
           } else {
-            await registry.wait(id);
+            await Promise.race([registry.wait(id), statusChanged]);
           }
         } finally {
-          unsub();
+          unsubProgress();
+          unsubTask();
           removeAbort();
         }
         // On abort mid-wait the task may still be "running": fall through to build
@@ -1079,12 +1176,11 @@ export function createTaskOutputTool(
           text = `${subject} was aborted — it was stopped before completing, so its result was discarded.`;
           break;
         default:
-          // Liveness: surface the last observed activity so a polled
-          // (wait: false) running task doesn't look inert.
-          text =
-            `${subject} is still running` +
-            (task.lastActivity ? ` — ${task.lastActivity}` : "") +
-            ". Call TaskOutput again (wait defaults to true) to await its result.";
+          text = task.admission === "waiting"
+            ? `${subject} is waiting for configured concurrency capacity. Call TaskOutput again (wait defaults to true) to await its result.`
+            : `${subject} is still running` +
+              (task.lastActivity ? ` — ${task.lastActivity}` : "") +
+              ". Call TaskOutput again (wait defaults to true) to await its result.";
           break;
       }
       // Usage line: a compact, clearly-separated metadata line for any settled
@@ -1119,6 +1215,7 @@ export function createTaskOutputTool(
         details: {
           taskId: id,
           status: task.status,
+          admission: task.admission ?? "admitted",
           ...(outcome ? { outcome } : {}),
           agent,
           agentId: task.agentId,
