@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import picc, { type PiccTestSeam } from "../src/index.js";
 import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
@@ -844,9 +845,34 @@ describe("session lifecycle hooks", () => {
     const notice = String(noticeEntry?.data?.notice ?? "");
     expect(notice).toContain("SAFETY");
     expect(notice.toLowerCase()).toContain("ask");
+    // MCP pending-approval notice: the fixture's unapproved .mcp.json server is
+    // the STANDING pending case — the notice names the server, the enabling
+    // key, and the decline path, so one settings edit resolves it either way.
+    expect(notice).toContain("example-server");
+    expect(notice).toContain("enabledMcpjsonServers");
+    expect(notice).toContain("disabledMcpjsonServers");
+    expect(notice).toContain(".claude/settings.local.json");
   });
 
-  it("/doctor renders the registry-generated breakdown", async () => {
+  it("MCP pending notice survives /compat suppress", async () => {
+    await pi.commands.get("compat").handler("suppress", pi.ctx());
+    try {
+      pi.entries.length = 0;
+      await pi.fire("session_start", { reason: "startup" }, pi.ctx());
+      const noticeEntry = pi.entries.find((e) => e.customType === "picc-compat");
+      expect(noticeEntry).toBeDefined();
+      const notice = String(noticeEntry?.data?.notice ?? "");
+      expect(notice).toContain("example-server");
+      expect(notice).toContain("enabledMcpjsonServers");
+      expect(notice).toContain("disabledMcpjsonServers");
+      // Suppression still silences the findings body.
+      expect(notice).not.toContain("PiCC compatibility:");
+    } finally {
+      await pi.commands.get("compat").handler("show", pi.ctx());
+    }
+  });
+
+  it("/doctor renders the registry-generated breakdown with the MCP posture line", async () => {
     pi.entries.length = 0;
     await pi.commands.get("doctor").handler("", pi.ctx());
     const doctor = pi.entries
@@ -854,7 +880,19 @@ describe("session lifecycle hooks", () => {
       .map((e) => String(e.data?.output ?? ""))
       .join("\n");
     expect(doctor).toContain("claude-code-2.1.x");
-    expect(doctor.toLowerCase()).toContain("mcp");
+    // Always-present MCP posture line, fed by real discovery: the fixture's
+    // unapproved server renders as pending, and the retired static
+    // ".mcp.json present" wording must be gone.
+    expect(doctor).toContain("example-server: pending approval");
+    // De-triplicated: the posture line carries no enable/decline hint — the
+    // pending finding (registry note + evidence) teaches the keys and points
+    // at the startup notice, the canonical carrier of the exact edit.
+    const postureLine = doctor.split("\n").find((l) => l.startsWith("MCP servers:")) ?? "";
+    expect(postureLine).not.toContain("enabledMcpjsonServers");
+    expect(doctor).toContain("enabledMcpjsonServers");
+    expect(doctor).toContain("disabledMcpjsonServers");
+    expect(doctor).toContain("startup notice");
+    expect(doctor).not.toContain("MCP servers will not start");
   });
 
   it("compaction: PostCompact re-injects active skills mid-run via steer", async () => {
@@ -2172,5 +2210,113 @@ describe("child worktree stops through the production extension assembly", () =>
         cleanupFixture(fixture);
       }
     },
+  );
+});
+
+describe("MCP failed-connect surfacing (dedicated temp project)", () => {
+  // The full-surface fixture's .mcp.json deliberately stays UNAPPROVED (the
+  // standing pending case), so the failed-connect path gets its own minimal
+  // project: an approved server whose command cannot spawn. The approval rides
+  // an UNTRACKED settings.local.json (no git repo → the tracked probe fails
+  // open), so the enablement gate itself is exercised for real.
+  function makeFailingMcpProject(): string {
+    const mcpDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-fail-"));
+    fs.writeFileSync(
+      path.join(mcpDir, ".mcp.json"),
+      JSON.stringify({
+        mcpServers: { "failing-server": { command: "picc-no-such-command-t05" } },
+      }),
+      "utf8",
+    );
+    fs.mkdirSync(path.join(mcpDir, ".claude"), { recursive: true });
+    fs.writeFileSync(
+      path.join(mcpDir, ".claude", "settings.local.json"),
+      JSON.stringify({ enabledMcpjsonServers: ["failing-server"] }),
+      "utf8",
+    );
+    return mcpDir;
+  }
+
+  function cleanupFailingMcpProject(mcpDir: string): void {
+    process.chdir(dir);
+    // Best-effort: Windows can EPERM a just-vacated cwd (handle release lag).
+    try {
+      fs.rmSync(mcpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } catch {
+      /* leftover temp dir is harmless */
+    }
+  }
+
+  it(
+    "a failed server reaches the /doctor posture line, fires the one-time warning notify, and drains diagnostics to stderr",
+    async () => {
+      const mcpDir = makeFailingMcpProject();
+      process.chdir(mcpDir);
+      // Installed BEFORE wiring: the settle-time diagnostics drain runs inside
+      // the detached registration step, any time after connect settles.
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const p = fakePi();
+      try {
+        picc(p.api as never, { onInitializationSettled: p.captureInitialization });
+        await p.waitForInitialization();
+        // The first-turn barrier awaits MCP settle + registration, so after this
+        // fire the spawn failure has been classified.
+        await p.fire("before_agent_start", { systemPrompt: "B" });
+        const warnings = p.notifications.filter((n) => n.text.includes("MCP"));
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]!.text).toContain("failing-server");
+        expect(warnings[0]!.text).toContain("/doctor");
+        expect(warnings[0]!.severity).toBe("warning");
+        // One-time: a later turn must not re-notify.
+        await p.fire("before_agent_start", { systemPrompt: "B" });
+        expect(p.notifications.filter((n) => n.text.includes("MCP"))).toHaveLength(1);
+        // Settle-time stderr drain: the runtime's connect-failure diagnostic
+        // reaches console.error — the stderr surface the registry note claims.
+        const drained = errSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+        expect(drained).toContain("PiCC: MCP:");
+        expect(drained).toContain("failing-server");
+
+        p.entries.length = 0;
+        await p.commands.get("doctor").handler("", p.ctx());
+        const doctor = p.entries
+          .filter((e) => e.customType === "picc-control")
+          .map((e) => String(e.data?.output ?? ""))
+          .join("\n");
+        expect(doctor).toContain("failing-server: failed");
+        // The diagnostic quotes the RAW command, never a resolved path.
+        expect(doctor).toContain("picc-no-such-command-t05");
+      } finally {
+        errSpy.mockRestore();
+        await p.fire("session_shutdown", { reason: "other" });
+        cleanupFailingMcpProject(mcpDir);
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "the one-time failure notice falls back to stderr when the ctx has no UI",
+    async () => {
+      const mcpDir = makeFailingMcpProject();
+      process.chdir(mcpDir);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const p = fakePi();
+      try {
+        picc(p.api as never, { onInitializationSettled: p.captureInitialization });
+        await p.waitForInitialization();
+        // printCtx models real Pi print mode: hasUI false → stderr fallback.
+        await p.fire("before_agent_start", { systemPrompt: "B" }, p.printCtx());
+        expect(p.notifications.filter((n) => n.text.includes("MCP"))).toHaveLength(0);
+        const errText = errSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+        expect(errText).toContain("MCP server(s) failed to connect");
+        expect(errText).toContain("failing-server");
+        expect(errText).toContain("run /doctor for details");
+      } finally {
+        errSpy.mockRestore();
+        await p.fire("session_shutdown", { reason: "other" });
+        cleanupFailingMcpProject(mcpDir);
+      }
+    },
+    60_000,
   );
 });

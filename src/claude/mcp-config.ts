@@ -25,6 +25,16 @@ import { neutralizeControlChars } from "../util/neutralize-text.js";
  */
 const SERVER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
+/**
+ * Server-name length gate (PiCC-only): names ride into tool names, deny rules,
+ * findings, and the /doctor posture line — rejecting over-long names here keeps
+ * every downstream line bounded without per-consumer truncation.
+ */
+const MAX_SERVER_NAME_CHARS = 128;
+
+/** Slice of an over-long name quoted inside its rejection diagnostic. */
+const NAME_DIAG_SLICE_CHARS = 32;
+
 /** Entry fields we understand; anything else is ignored with a diagnostic. */
 const KNOWN_ENTRY_FIELDS = new Set(["command", "args", "env", "type", "timeout", "url", "alwaysLoad", "role"]);
 
@@ -39,7 +49,10 @@ const MIN_TIMEOUT_MS = 1000;
 
 /** A normalized (but unexpanded, un-gated) MCP server entry. */
 export interface RawMcpEntry {
-  /** Server name (neutralized for storage; validation happens against the raw key). */
+  /**
+   * Server name (neutralized for storage, truncated when over the length gate;
+   * validation happens against the raw key).
+   */
   name: string;
   /** Raw command ("" when the entry is skipped without one). */
   command: string;
@@ -81,7 +94,12 @@ export function normalizeMcpServerBlock(
 ): RawMcpEntry[] {
   const out: RawMcpEntry[] = [];
   for (const [rawName, rawEntry] of Object.entries(block)) {
-    const name = clean(rawName);
+    // An over-long name is stored TRUNCATED (display-only on a skipped entry)
+    // so no downstream line ever carries the full hostile-length name.
+    const overLongName = rawName.length > MAX_SERVER_NAME_CHARS;
+    const name = overLongName
+      ? `${clean(rawName).slice(0, NAME_DIAG_SLICE_CHARS)}…`
+      : clean(rawName);
     const entry: RawMcpEntry = {
       name,
       command: "",
@@ -95,6 +113,14 @@ export function normalizeMcpServerBlock(
       entry.diagnostics.push(clean(msg));
     };
 
+    if (overLongName) {
+      entry.skipped = true;
+      push(
+        `Invalid MCP server name "${name}" in ${sourceLabel} ` +
+          `(${rawName.length} chars exceeds the ${MAX_SERVER_NAME_CHARS}-char limit); server skipped`,
+      );
+      continue;
+    }
     if (!SERVER_NAME_RE.test(rawName) || rawName.includes("__")) {
       entry.skipped = true;
       push(

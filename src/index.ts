@@ -388,6 +388,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     compat = { findings: [], safetyFindings: [], unassessed: [] };
   }
   let compatSuppressed = readSuppression(project.root) || config.suppressCompatNotice === true;
+  // One-shot latch for the post-settle MCP connect-failure warning (see the
+  // before_agent_start handler).
+  let mcpFailureChecked = false;
 
   let currentModelRef = "";
   let currentModel: unknown; // the orchestrator's active model — inherited by subagents
@@ -1580,6 +1583,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const mcpRegistration = (async () => {
     try {
       await mcpRuntime.whenSettled();
+      // Settle-time stderr drain: the runtime's accumulated diagnostics
+      // (connect failures, timeouts, dropped tools — each already bounded and
+      // control-stripped) go to stderr one line each. /doctor and the one-time
+      // notify below stay the user-visible truth; this is the stderr surface
+      // the registry's feature.mcp note claims.
+      for (const diag of mcpRuntime.diagnostics()) {
+        console.error(`PiCC: MCP: ${diag}`);
+      }
       const proxies = buildMcpProxyTools(mcpRuntime);
       if (proxies.length === 0) return;
       const admitted = new Set(
@@ -1627,7 +1638,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const reportListingDegradation = createTierChangeReporter((message) =>
     console.error(`PiCC: ${message}`),
   );
-  pi.on("before_agent_start", async (event: any) => {
+  pi.on("before_agent_start", async (event: any, ctx: any) => {
     deliverSettlementNotices();
     // First-turn MCP settle barrier: Pi awaits this handler before snapshotting
     // the run's tools, so waiting for the registration step (itself bounded by
@@ -1637,6 +1648,26 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // Resolved-promise no-op after the first settle and on the zero-enabled
     // path; never rejects (its own try/catch degrades to stderr).
     await mcpRegistration;
+    // One-time MCP failure warning: every enabled server has settled behind the
+    // barrier above, so the FIRST turn after settle is the one honest moment to
+    // report connect failures. Checked exactly once per session — a "failed"
+    // state a later shutdown synthesizes must never re-trigger it. stderr is
+    // the no-UI fallback, never the only surface (/doctor stays the record).
+    if (!mcpFailureChecked) {
+      mcpFailureChecked = true;
+      try {
+        const failed = mcpRuntime.serverStates().filter((s) => s.state === "failed");
+        if (failed.length > 0) {
+          const message =
+            `MCP server(s) failed to connect: ${failed.map((s) => s.name).join(", ")} — ` +
+            "run /doctor for details.";
+          if (ctx?.hasUI) ctx.ui?.notify?.(message, "warning");
+          else console.error(`PiCC: ${message}`);
+        }
+      } catch (err) {
+        console.error(`PiCC: MCP failure notice failed: ${(err as Error).message}`);
+      }
+    }
     try {
       const suffix = buildSystemPromptSuffix({
         claudeMd: project.claudeMd,
@@ -2728,7 +2759,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   function runControlCommand(name: string, args: string, ctx: any): string | undefined {
     switch (name) {
       case "doctor":
-        return renderDoctorReport(project, compat, currentModel, config.compaction);
+        // Live MCP server states feed the always-present posture line.
+        return renderDoctorReport(project, compat, currentModel, config.compaction, mcpRuntime.serverStates());
       case "skills":
         return renderSkillsList();
       case "agents":

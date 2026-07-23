@@ -62,6 +62,9 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
   bridge), auto memory, and `.claude/rules/`.
 - **Settings & permissions** — `settings.json` precedence and merge semantics, with `deny` rules
   as a hard block.
+- **MCP servers** — local stdio servers from `.mcp.json` and settings `mcpServers`, exposed under
+  Claude's `mcp__<server>__<tool>` naming with a project-server approval gate; see the capability
+  matrix for the deferred MCP surfaces.
 - **Compaction resilience** — proactive checkpointing on supported model transports, with
   instruction preservation and bounded recovery; see the [user guide](doc/user-guide.md).
 - **Plugins** — content from already-installed plugins and project-bundled `.claude-plugin/`.

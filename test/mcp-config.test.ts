@@ -293,6 +293,32 @@ describe("normalizeMcpServerBlock — entry validation", () => {
     expect(({} as Record<string, unknown>)["command"]).toBeUndefined();
   });
 
+  it("skips a server name over 128 chars with a bounded diagnostic (name never quoted in full)", () => {
+    const longName = "a".repeat(200);
+    const servers = normalizeMcpServerBlock(
+      { [longName]: { command: "x" } },
+      ".mcp.json",
+    );
+    expect(servers).toHaveLength(1);
+    const s = servers[0]!;
+    expect(s.skipped).toBe(true);
+    // The stored name is truncated so every downstream line stays bounded.
+    expect(s.name.length).toBeLessThan(64);
+    expect(s.name).toContain("…");
+    expect(s.diagnostics[0]).toContain("Invalid MCP server name");
+    expect(s.diagnostics[0]).toContain("128-char limit");
+    expect(s.diagnostics[0]).toContain("200 chars");
+    expect(s.diagnostics[0]).not.toContain(longName);
+    expect(s.diagnostics[0]!.length).toBeLessThan(300);
+  });
+
+  it("accepts a 128-char name at the limit (charset-valid)", () => {
+    const edgeName = "b".repeat(128);
+    const servers = normalizeMcpServerBlock({ [edgeName]: { command: "x" } }, ".mcp.json");
+    expect(servers[0]?.skipped).toBe(false);
+    expect(servers[0]?.name).toBe(edgeName);
+  });
+
   it('accepts "constructor" and "toString" as real server names (valid charset)', () => {
     const servers = normalizeMcpServerBlock(
       { constructor: { command: "c-mcp" }, toString: { command: "t-mcp" } },

@@ -33,7 +33,7 @@ const SHUTDOWN_GRACE_MS = 5_000;
 const STDERR_RING_MAX_CHARS = 4_096;
 /** Slice of the stderr ring quoted inside a failure diagnostic. */
 const STDERR_EXCERPT_MAX_CHARS = 400;
-/** Tool description bound (2 KB, Claude parity). */
+/** Tool description bound (2 KB — a PiCC-only bound, not Claude parity). */
 const DESCRIPTION_MAX_CHARS = 2_048;
 /** Bound on server-supplied error text quoted in a callTool rejection. */
 const CALL_ERROR_MAX_CHARS = 1_000;
@@ -204,7 +204,11 @@ export class McpRuntime {
     return out;
   }
 
-  /** Connect failures, timeouts, dropped tools, stderr excerpts — all bounded. */
+  /**
+   * Connect failures, timeouts, dropped tools, stderr excerpts — all bounded.
+   * This is the stderr feed: the registration wiring (src/index.ts) drains it
+   * to console.error once settle completes, one line per diagnostic.
+   */
   diagnostics(): string[] {
     return [...this.diags];
   }
