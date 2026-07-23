@@ -123,6 +123,7 @@ const LABEL_RENDER_CAP = 160;
 const COLUMN_GAP = "  ";
 const DESCRIPTION_GAP = " ";
 const MIN_USEFUL_IDENTITY_WIDTH = 3;
+const MIN_USEFUL_DESCRIPTION_WIDTH = 3;
 
 type MetricKey = "elapsed" | "input" | "output" | "cacheRead" | "cacheWrite" | "cost";
 const METRIC_ORDER: readonly MetricKey[] = [
@@ -260,18 +261,18 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
   const minimumIdentityWidth = Math.max(...rows.map((row) =>
     visibleWidth(row.chip) + Math.min(MIN_USEFUL_IDENTITY_WIDTH, visibleWidth(row.identity))
   ));
-  if (availableLeft < gutterWidth + minimumIdentityWidth) return renderAggregate(view, opts);
+  const minimumLeftWidth = gutterWidth + minimumIdentityWidth +
+    (hasDescription ? descriptionGapWidth + MIN_USEFUL_DESCRIPTION_WIDTH : 0);
+  if (availableLeft < minimumLeftWidth) return renderAggregate(view, opts);
 
-  let identityWidth = Math.min(identityNaturalWidth, availableLeft - gutterWidth);
-  let descriptionWidth = 0;
-  const hasDescriptionCell = hasDescription &&
-    availableLeft >= gutterWidth + identityWidth + descriptionGapWidth;
-  if (hasDescriptionCell) {
-    descriptionWidth = availableLeft - gutterWidth - identityWidth - descriptionGapWidth;
-  }
-  if (descriptionWidth === 0 && identityWidth < identityNaturalWidth) {
-    identityWidth = availableLeft - gutterWidth;
-  }
+  const identityWidth = hasDescription
+    ? Math.min(identityNaturalWidth,
+      availableLeft - gutterWidth - descriptionGapWidth - MIN_USEFUL_DESCRIPTION_WIDTH)
+    : availableLeft - gutterWidth;
+  const descriptionWidth = hasDescription
+    ? availableLeft - gutterWidth - identityWidth - descriptionGapWidth
+    : 0;
+  const hasDescriptionCell = hasDescription;
 
   const renderedRows = rows.map((row) => {
     const marker = row.source.selected
@@ -516,8 +517,8 @@ function tailToWidth(text: string, maxCols: number): string {
 }
 
 /**
- * Steer availability for display. The authoritative predicate is t01's
- * guardSteer (the send path uses ONLY its bound steer fn); this maps the same
+ * Steer availability for display. The authoritative predicate is
+ * guardSteer() (the send path uses ONLY its bound steer fn); this maps the same
  * ordering onto short display reasons, and the foreground case names the real
  * alternative rather than a dead end.
  */

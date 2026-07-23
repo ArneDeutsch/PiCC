@@ -451,8 +451,10 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(bg?.note).toContain("scoped to their own dispatched tasks");
     expect(bg?.note).toContain("coordinator retains full session-wide reach");
     expect(bg?.note).not.toContain("see tool.TaskOutput for #15098");
-    expect(bg?.note).toContain("prioritizes state, agent identity, and stable dispatch description");
-    expect(bg?.note).toContain("drops optional telemetry columns panel-wide as width narrows");
+    expect(bg?.note).toContain("individual always-expanded tree rows when a useful identity/description row fits");
+    expect(bg?.note).toContain("prioritizing those fields after state");
+    expect(bg?.note).toContain("dropping optional telemetry columns panel-wide as width narrows");
+    expect(bg?.note).toContain("very narrow widths use truthful state aggregates");
     expect(bg?.note).toContain("passive panel/lifecycle rows omit internal task ID chips");
     expect(bg?.note).toContain("explicit TaskOutput/TaskStop targeting rows retain the requested target");
     expect(bg?.note).toContain("canonical registry/model-visible identity is unchanged");

@@ -100,6 +100,55 @@ describe("routine tool rendering decorator", () => {
     }
   });
 
+  it("freezes path-bearing routine roots per invocation and falls back to context cwd", () => {
+    const rootA = "/workspace/a";
+    const rootB = "/workspace/b";
+    let liveRoot = rootA;
+    const args = { file_path: `${rootA}/src/file.ts`, edits: [{ old_string: "old", new_string: "new" }] };
+    const result = {
+      content: [{ type: "text", text: `Successfully applied 1 edit(s) to ${rootA}/src/file.ts.` }],
+      details: { filePath: `${rootA}/src/file.ts`, edits: 1, created: false, diff: "-old\n+new", firstChangedLine: 1 },
+    };
+    const argsBefore = structuredClone(args);
+    const resultBefore = structuredClone(result);
+    const relativeEditDefinition = (cwd: string) => ({
+      renderResult(_result: unknown, _options: unknown, _theme: unknown, context: unknown) {
+        const detachedArgs = (context as { args: { path: string } }).args;
+        const displayPath = path.posix.relative(cwd, detachedArgs.path);
+        return { render: () => [`multi edit ${displayPath}`] };
+      },
+    });
+    const tool = withRoutineToolRendering({ name: "MultiEdit" } as ToolDefinition, {
+      resolveDisplayRoot: () => liveRoot,
+      createEditDefinition: relativeEditDefinition,
+    }) as unknown as RenderTool;
+    const ctx = { args, state: {}, cwd: rootA, isPartial: false, isError: false };
+    expect(tool.renderCall(args, undefined, ctx).render(120).join(" ")).toContain("src/file.ts");
+    liveRoot = rootB;
+    const settled = tool.renderResult(result, { expanded: false, isPartial: false }, undefined, ctx).render(120);
+    expect(settled).toEqual(["multi edit src/file.ts"]);
+    expect(settled.join("\n")).not.toContain(rootA);
+    expect(settled.join("\n")).not.toContain(rootB);
+    expect(tool.renderCall(args, undefined, ctx).render(120).join(" ")).toContain("src/file.ts");
+    expect(args).toEqual(argsBefore);
+    expect(result).toEqual(resultBefore);
+
+    const fallback = withRoutineToolRendering({ name: "MultiEdit" } as ToolDefinition, {
+      resolveDisplayRoot: () => { throw new Error("resolver unavailable"); },
+      createEditDefinition: relativeEditDefinition,
+    }) as unknown as RenderTool;
+    const fallbackCtx = { args, state: {}, cwd: rootA, isPartial: false, isError: false };
+    expect(fallback.renderCall(args, undefined, fallbackCtx).render(120).join(" ")).toContain("src/file.ts");
+    const fallbackSettled = fallback
+      .renderResult(result, { expanded: false, isPartial: false }, undefined, fallbackCtx)
+      .render(120);
+    expect(fallbackSettled).toEqual(["multi edit src/file.ts"]);
+    expect(fallbackSettled.join("\n")).not.toContain(rootA);
+    expect(fallbackSettled.join("\n")).not.toContain(rootB);
+    expect(args).toEqual(argsBefore);
+    expect(result).toEqual(resultBefore);
+  });
+
   it("uses semantic text only for routine keywords and toolOutput for invocation context", () => {
     const calls: Array<{ slot: string; text: string }> = [];
     const theme = {

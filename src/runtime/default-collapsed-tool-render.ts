@@ -382,20 +382,20 @@ function summaryComponent(
       summary.outputLines === 0 ? "no output" : `${summary.outputLines} output ${summary.outputLines === 1 ? "line" : "lines"} hidden`,
       ...(summary.duration ? [summary.duration] : []),
     ];
-    return priorityDisplayRow(title, summary.commandPreview, [`${hint} to expand`], optional, theme, " · ");
+    return priorityDisplayRow(title, summary.commandPreview, [], optional, `${hint} to expand`, theme);
   }
   const path = formatDisplayPath(sanitize(summary.path, MAX_PATH, true), displayRoot);
   if (summary.kind === "mutation") {
     const detail = summary.noNet ? "no net change" : `${summary.diffLines} diff ${summary.diffLines === 1 ? "line" : "lines"} hidden`;
     return priorityDisplayRow(title, path,
-      [`${summary.edits} ${summary.edits === 1 ? "edit" : "edits"} applied`, `${hint} to expand`], [detail], theme);
+      [`${summary.edits} ${summary.edits === 1 ? "edit" : "edits"} applied`], [detail], `${hint} to expand`, theme);
   }
   if (summary.remaining !== undefined && summary.nextOffset !== undefined) {
     return priorityDisplayRow(title, `${path}${summary.range ?? ""}`,
-      [`next offset ${summary.nextOffset}`, `${hint} to expand`], [`${summary.remaining} more lines`], theme);
+      [`next offset ${summary.nextOffset}`], [`${summary.remaining} more lines`], `${hint} to expand`, theme);
   }
   return priorityDisplayRow(title, `${path}${summary.range ?? ""}`,
-    [`${hint} to expand`], [`${summary.lines} ${summary.lines === 1 ? "line" : "lines"} hidden`], theme);
+    [], [`${summary.lines} ${summary.lines === 1 ? "line" : "lines"} hidden`], `${hint} to expand`, theme);
 }
 
 function messageComponent(message: string, theme: unknown): Component {
@@ -525,11 +525,9 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(
     }
     if (!ownsRow || !call) return native;
     if (current.editPreviewError) {
-      return combined([messageComponent(`Edit preview failed: ${current.editPreviewError} · settled result elaborated`, theme), call, native], theme);
+      return combined([messageComponent(`Edit preview failed: ${current.editPreviewError}`, theme), call, native], theme);
     }
-    return ordinary
-      ? combined([call, native], theme)
-      : combined([messageComponent("Elaborated result", theme), call, native], theme);
+    return combined([call, native], theme);
   }) as T["renderResult"];
 
   return decorated;

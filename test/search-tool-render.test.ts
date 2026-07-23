@@ -31,6 +31,7 @@ interface ResultShape {
 interface RenderContext {
   args: Record<string, unknown>;
   state: Record<string, unknown>;
+  cwd?: string;
   isError?: boolean;
   isPartial?: boolean;
 }
@@ -100,6 +101,41 @@ describe("compact search rendering decorator", () => {
     expect(() =>
       withCompactSearchRendering({ ...source, name: "Other" } as typeof source),
     ).toThrow(/only Grep or Glob/);
+  });
+
+  it("freezes search roots per invocation and uses context cwd when the resolver throws", () => {
+    const rootA = "/workspace/a";
+    const rootB = "/workspace/b";
+    for (const entry of [
+      { source: createGrepTool(() => ".", { forceJs: true }), args: { pattern: "needle", path: `${rootA}/src` }, result: textResult("a.ts", { ...grepDetails, totalEntries: 1, returnedEntries: 1 }) },
+      { source: createGlobTool(() => "."), args: { pattern: "*.ts", path: `${rootA}/src` }, result: textResult("a.ts", { ...globDetails, totalMatches: 1, returned: 1 }) },
+    ]) {
+      let liveRoot = rootA;
+      const tool = withCompactSearchRendering(entry.source, { resolveDisplayRoot: () => liveRoot }) as unknown as RenderTool;
+      const argsBefore = structuredClone(entry.args);
+      const resultBefore = structuredClone(entry.result);
+      const ctx = context(entry.args, { cwd: rootA });
+      tool.renderCall(entry.args, undefined, ctx);
+      liveRoot = rootB;
+      const historical = tool.renderResult(entry.result, { expanded: false, isPartial: false }, undefined, ctx).render(120).join(" ");
+      expect(historical).toContain("src");
+      expect(historical).not.toContain(rootA);
+      expect(historical).not.toContain(rootB);
+      expect(entry.args).toEqual(argsBefore);
+      expect(entry.result).toEqual(resultBefore);
+
+      const fallback = withCompactSearchRendering(entry.source, {
+        resolveDisplayRoot: () => { throw new Error("resolver unavailable"); },
+      }) as unknown as RenderTool;
+      const fallbackCtx = context(entry.args, { cwd: rootA });
+      fallback.renderCall(entry.args, undefined, fallbackCtx);
+      const fallbackRow = fallback.renderResult(entry.result, { expanded: false, isPartial: false }, undefined, fallbackCtx)
+        .render(120).join(" ");
+      expect(fallbackRow).toContain("src");
+      expect(fallbackRow).not.toContain(rootA);
+      expect(entry.args).toEqual(argsBefore);
+      expect(entry.result).toEqual(resultBefore);
+    }
   });
 
   it("emits no persisted call content before the result is available", () => {

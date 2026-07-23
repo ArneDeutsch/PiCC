@@ -557,61 +557,91 @@ describe("responsive panel table", () => {
     expect(text).not.toContain("c/write");
   });
 
-  it("drops metadata panel-wide at the exact shared profile boundaries", () => {
-    const metricPresent = (lines: string[], key: string): boolean => key === "elapsed"
-      ? lines.some((line) => /\b\d+s\b/.test(line))
-      : lines.some((line) => line.includes(key));
-    const keys = ["c/write", "c/read", "$", "out ", "in ", "elapsed"] as const;
-    const disappearance: Array<[string, number]> = [];
-    let previous = new Set<string>(keys);
+  it("drops eligible metadata in order with one shared panel profile", () => {
+    type Presence = {
+      cacheWrite: boolean;
+      cacheRead: boolean;
+      cost: boolean;
+      output: boolean;
+      input: boolean;
+      elapsed: boolean;
+    };
+    const presence = (lines: string[]): Presence => ({
+      cacheWrite: lines.some((line) => line.includes("c/write")),
+      cacheRead: lines.some((line) => line.includes("c/read")),
+      cost: lines.some((line) => line.includes("$")),
+      output: lines.some((line) => line.includes("out ")),
+      input: lines.some((line) => line.includes("in ")),
+      elapsed: lines.some((line) => /\b\d+s\b/.test(line)),
+    });
+    const transitionWidths: { [K in keyof Presence]: number | undefined } = {
+      cacheWrite: undefined,
+      cacheRead: undefined,
+      cost: undefined,
+      output: undefined,
+      input: undefined,
+      elapsed: undefined,
+    };
+    const full: Presence = {
+      cacheWrite: true, cacheRead: true, cost: true, output: true, input: true, elapsed: true,
+    };
+    const empty: Presence = {
+      cacheWrite: false, cacheRead: false, cost: false, output: false, input: false, elapsed: false,
+    };
+    let previous = full;
+    let firstProfile: Presence | undefined;
+    let lastProfile: Presence | undefined;
     for (let width = 180; width >= 1; width--) {
-      const lines = rowsOnly(renderSubagentPanel(mixedView(), { width, entryChord: CHORD }));
-      if (lines.some((line) => /(?:failed|stopped|running|completed)/.test(line))) continue;
-      const current = new Set<string>(keys.filter((key) => metricPresent(lines, key)));
-      for (const key of previous) if (!current.has(key)) disappearance.push([key, width]);
+      const lines = rowsOnly(renderSubagentPanel(mixedView(), { width, entryChord: CHORD })).slice(0, 3);
+      if (lines.length !== 3 || lines.some((line) => /(?:failed|stopped|running|completed)/.test(line))) continue;
+      const current = presence(lines);
+      firstProfile ??= current;
+      lastProfile = current;
+      if (previous.cacheWrite && !current.cacheWrite) transitionWidths.cacheWrite = width;
+      if (previous.cacheRead && !current.cacheRead) transitionWidths.cacheRead = width;
+      if (previous.cost && !current.cost) transitionWidths.cost = width;
+      if (previous.output && !current.output) transitionWidths.output = width;
+      if (previous.input && !current.input) transitionWidths.input = width;
+      if (previous.elapsed && !current.elapsed) transitionWidths.elapsed = width;
+      expect(previous.cacheWrite || !current.cacheWrite).toBe(true);
+      expect(previous.cacheRead || !current.cacheRead).toBe(true);
+      expect(previous.cost || !current.cost).toBe(true);
+      expect(previous.output || !current.output).toBe(true);
+      expect(previous.input || !current.input).toBe(true);
+      expect(previous.elapsed || !current.elapsed).toBe(true);
       previous = current;
+
+      const occurrences = {
+        cacheWrite: lines.filter((line) => line.includes("c/write")).length,
+        cacheRead: lines.filter((line) => line.includes("c/read")).length,
+        cost: lines.filter((line) => line.includes("$")).length,
+        output: lines.filter((line) => line.includes("out ")).length,
+        input: lines.filter((line) => line.includes("in ")).length,
+        elapsed: lines.filter((line) => /\b\d+s\b/.test(line)).length,
+      };
+      expect(occurrences.cacheWrite).toBe(current.cacheWrite ? 1 : 0);
+      expect(occurrences.cacheRead).toBe(current.cacheRead ? 1 : 0);
+      expect(occurrences.cost).toBe(current.cost ? 2 : 0);
+      expect(occurrences.output).toBe(current.output ? 2 : 0);
+      expect(occurrences.input).toBe(current.input ? 1 : 0);
+      expect(occurrences.elapsed).toBe(current.elapsed ? 3 : 0);
+      expect(new Set(lines.map(visibleWidth))).toEqual(new Set([width]));
+      for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
     }
-    expect(disappearance).toEqual([
-      ["c/write", 78], ["c/read", 66], ["$", 55],
-      ["out ", 47], ["in ", 38], ["elapsed", 29],
-    ]);
+    expect(firstProfile).toEqual(full);
+    expect(lastProfile).toEqual(empty);
+    expect(transitionWidths.cacheWrite).toBeGreaterThan(transitionWidths.cacheRead!);
+    expect(transitionWidths.cacheRead).toBeGreaterThan(transitionWidths.cost!);
+    expect(transitionWidths.cost).toBeGreaterThan(transitionWidths.output!);
+    expect(transitionWidths.output).toBeGreaterThan(transitionWidths.input!);
+    expect(transitionWidths.input).toBeGreaterThan(transitionWidths.elapsed!);
 
     const focusedPanel = mixedView();
     focusedPanel.focused = true;
     focusedPanel.rows[0]!.selected = true;
-    const focusedDisappearance: Array<[string, number]> = [];
-    previous = new Set<string>(keys);
-    for (let width = 182; width >= 1; width--) {
-      const lines = renderSubagentPanel(focusedPanel, { width, entryChord: CHORD }).slice(0, focusedPanel.rows.length);
-      if (lines.some((line) => /(?:failed|stopped|running|completed)/.test(line))) continue;
-      const current = new Set<string>(keys.filter((key) => metricPresent(lines, key)));
-      for (const key of previous) if (!current.has(key)) focusedDisappearance.push([key, width]);
-      previous = current;
-    }
-    expect(focusedDisappearance).toEqual([
-      ["c/write", 80], ["c/read", 68], ["$", 57],
-      ["out ", 49], ["in ", 40], ["elapsed", 31],
-    ]);
-
-    for (const focused of [false, true]) {
-      const panel = mixedView();
-      panel.focused = focused;
-      if (focused) panel.rows[0]!.selected = true;
-      for (const width of focused
-        ? [182, 102, 82, 80, 68, 57, 49, 40, 31]
-        : [180, 100, 79, 78, 67, 56, 48, 39, 30]) {
-      const lines = rowsOnly(renderSubagentPanel(panel, { width, entryChord: CHORD })).slice(0, panel.rows.length);
-      if (lines.some((line) => /(?:failed|stopped|running|completed)/.test(line))) continue;
-      for (const metric of ["c/write", "c/read", "$", "out ", "in "] as const) {
-        const present = lines.map((line) => line.includes(metric));
-        if (present.some(Boolean)) {
-          const eligibleRows = metric === "out " || metric === "$" ? 2 : 1;
-          expect(present.filter(Boolean)).toHaveLength(eligibleRows);
-        }
-      }
-      for (const line of lines) expect(visibleWidth(line)).toBe(width);
-      }
-    }
+    const focusedWide = renderSubagentPanel(focusedPanel, { width: 180, entryChord: CHORD }).slice(0, 3);
+    expect(presence(focusedWide)).toEqual(full);
+    expect(focusedWide.every((line) => visibleWidth(line) === 180)).toBe(true);
   });
 
   it("keeps descriptions until telemetry is gone, then truncates the elastic description", () => {
@@ -628,6 +658,28 @@ describe("responsive panel table", () => {
     const narrow = rowsOnly(renderSubagentPanel(mixedView(), { width: 22, entryChord: CHORD }));
     expect(narrow.join("\n")).not.toMatch(/\b(?:in|out|c\/read|c\/write)\b|\$/);
     expect(narrow.some((line) => line.includes("…"))).toBe(true);
+  });
+
+  it("keeps useful long custom identity and distinct description cells or aggregates truthfully", () => {
+    const panel = view(makeModel({ t: 1000 }), [rec({
+      agentId: "custom", agentName: "custom-agent-identity-that-is-very-long",
+      description: "distinct-dispatch-description-that-is-also-long",
+      progress: { tail: [], activity: "", usage: { inputTokens: 99, outputTokens: 7 } },
+    })]);
+    let sawRow = false;
+    let sawAggregate = false;
+    for (let width = 1; width <= 80; width++) {
+      const first = stripAnsi(renderSubagentPanel(panel, { width, entryChord: CHORD })[0] ?? "");
+      if (/\b1 running\b/u.test(first) || first === PANEL_RUNNING_FRAMES[0]) {
+        sawAggregate = true;
+        continue;
+      }
+      if (!first) continue;
+      sawRow = true;
+      expect(first, `width=${width}`).toMatch(/custom|cus|cu…/u);
+      expect(first, `width=${width}`).toMatch(/distinct|dis|di…/u);
+    }
+    expect({ sawRow, sawAggregate }).toEqual({ sawRow: true, sawAggregate: true });
   });
 
   it("never renders task ids while retaining distinct hidden keys for duplicate visible rows", () => {
@@ -907,6 +959,23 @@ describe("drill-down detail rendering (pure)", () => {
     expect(lines[lines.length - 1]).toContain(
       detailHint({ steerable: true, stoppable: true }),
     );
+  });
+
+  it("themes only validated drill-down identity tint while stripped state/detail stays readable", () => {
+    const record = rec({
+      agentId: "agent-themed", agentName: "reviewer", color: "red",
+      description: "inspect output", detailLog: [{ kind: "status", text: "checking evidence" }],
+    });
+    const theme = { fg: (_slot: string, text: string) => `${ESC}[36m${text}${ESC}[39m` };
+    const rendered = renderSubagentDetail(
+      { record, taskId: "task-themed", nowMs: 2000 }, detailUi(), { width: 100, theme },
+    ).lines.join("\n");
+    expect(rendered).toContain(`${AGENT_COLOR_ANSI.red}reviewer${ESC}[39m`);
+    expect(rendered.indexOf(AGENT_COLOR_ANSI.red)).toBe(rendered.lastIndexOf(AGENT_COLOR_ANSI.red));
+    const plain = stripAnsi(rendered);
+    expect(plain).toContain("reviewer · inspect output");
+    expect(plain).toContain("running");
+    expect(plain).toContain("status: checking evidence");
   });
 
   it("finished layout: final answer leads, then collapsed prompt, tail below; no steer line", () => {

@@ -68,7 +68,7 @@ describe("real Pi default-collapse contracts", () => {
       row.setExpanded(false);
       row.updateResult({ content: [{ type: "text", text: "first\nsecond" }], details: undefined }, false);
       const collapsed = (row.render(80) as string[]).map(stripAnsi).join("\n");
-      expect(collapsed).toContain("read contract.txt · ctrl+k to expand · 2 lines hidden");
+      expect(collapsed).toContain("read contract.txt · 2 lines hidden · ctrl+k to expand");
       expect(collapsed).not.toContain("first");
       expect(glyphs(collapsed)).toEqual(["●"]);
       row.setExpanded(true);
@@ -232,8 +232,7 @@ describe("real Pi default-collapse contracts", () => {
         vi.setSystemTime(11_250);
         row.updateResult({ content: [{ type: "text", text: "output-secret" }], details: undefined }, false);
         const collapsed = (row.render(100) as string[]).map(stripAnsi).join("\n");
-        expect(collapsed).toContain("bash · TOKEN=command-secret printf command-output · ctrl+o to expand");
-        expect(collapsed).toContain("1 output line hidden · 1.3s");
+        expect(collapsed).toContain("bash TOKEN=command-secret printf command-output · 1 output line hidden · 1.3s · ctrl+o to expand");
         expect(collapsed).toContain("command-secret");
         expect(collapsed).not.toContain("output-secret");
         expect(glyphs(collapsed)).toEqual(["●"]);

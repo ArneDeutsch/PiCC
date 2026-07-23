@@ -106,8 +106,9 @@ function clamp(line: string, width: number): string {
 export function priorityDisplayRow(
   keyword: string,
   elastic: string,
-  pinned: readonly string[],
+  required: readonly string[],
   optional: readonly string[],
+  cue: string,
   theme: unknown,
   elasticSeparator = " ",
 ): DisplayComponent {
@@ -115,7 +116,7 @@ export function priorityDisplayRow(
     if (!Number.isFinite(width) || width <= 0) return [""];
     const columns = Math.floor(width);
     const extras = [...optional];
-    const suffix = () => [...pinned, ...extras].filter(Boolean);
+    const suffix = () => [...required, ...extras, cue].filter(Boolean);
     const fixedPlain = () => [keyword, ...suffix()].filter(Boolean).join(" · ");
     const fullPlain = () => `${keyword}${elastic ? `${elasticSeparator}${elastic}` : ""}` +
       suffix().map((segment) => ` · ${segment}`).join("");
@@ -130,8 +131,9 @@ export function priorityDisplayRow(
         : "";
       let line = themedFg(theme, "text", keyword);
       if (fittedElastic) line += themedFg(theme, "toolOutput", `${elasticSeparator}${fittedElastic}`);
-      for (const segment of pinned) if (segment) line += themedFg(theme, "toolOutput", ` · ${segment}`);
+      for (const segment of required) if (segment) line += themedFg(theme, "toolOutput", ` · ${segment}`);
       for (const segment of extras) if (segment) line += themedFg(theme, "muted", ` · ${segment}`);
+      if (cue) line += themedFg(theme, "toolOutput", ` · ${cue}`);
       return [clamp(line, columns)];
     } catch {
       return [clamp(elastic ? fullPlain() : fixedPlain(), columns)];

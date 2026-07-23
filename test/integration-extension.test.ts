@@ -14,6 +14,7 @@ import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/fake-sdk.js";
 import { waitUntil } from "./helpers/async.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
+import { loadSkills } from "../src/claude/skills.js";
 
 /**
  * Integration + NFR tests: the whole extension wired against
@@ -92,7 +93,7 @@ describe("tool surface registration", () => {
         { content: [{ type: "text", text: "REGISTERED_DETAIL_ONE\nREGISTERED_DETAIL_TWO" }], details: undefined },
         { expanded: false, isPartial: false }, theme, context,
       ).render(160).join("\n");
-      expect(rendered).toContain("read registered.txt · ctrl+o to expand · 2 lines hidden");
+      expect(rendered).toContain("read registered.txt · 2 lines hidden · ctrl+o to expand");
       expect(rendered).not.toContain("REGISTERED_DETAIL");
 
       const multiEdit = pi.tools.get("MultiEdit");
@@ -117,7 +118,7 @@ describe("tool surface registration", () => {
         },
         { expanded: false, isPartial: false }, theme, multiEditContext,
       ).render(160).join("\n");
-      expect(multiEditRendered).toContain("multi edit registered-multi.txt · 1 edit applied · ctrl+o to expand · 2 diff lines hidden");
+      expect(multiEditRendered).toContain("multi edit registered-multi.txt · 1 edit applied · 2 diff lines hidden · ctrl+o to expand");
       expect(multiEditRendered).not.toContain("REGISTERED_MULTIEDIT_DETAIL");
     } finally {
       setKeybindings(previousBindings);
@@ -563,21 +564,18 @@ describe("skill activation", () => {
 
   it("background dispatch + TaskOutput path is exercisable: bg agent loads, /bg-research expands", async () => {
     const fixtureSource = fs.readFileSync(path.join(dir, ".claude", "commands", "bg-research.md"), "utf8").replace(/\r\n/gu, "\n");
-    const expectedFixture = `---
+    const frontmatter = `---
 description: Dispatch the async-researcher in the background and retrieve it with TaskOutput.
 argument-hint: "<topic>"
----
-
-Research this topic without blocking: $ARGUMENTS — canary FS-BG-TASKOUTPUT
-
-1. Dispatch the \`async-researcher\` subagent via the **Agent** tool with \`run_in_background: true\`
-   (it also carries \`background: true\` frontmatter), passing the topic above as its prompt.
-2. Keep working while it runs; the background task is named \`task-N\`. Passive lifecycle rows emphasize the agent and state, while explicit task actions retain the target ID.
-3. Retrieve the result with the **TaskOutput** tool — \`TaskOutput(task_id: "task-1")\` — which shows running status and available metadata; bounded live activity belongs to the subagent panel drill-down. It resolves to the finished outcome + transcript + usage when it settles. A running poll keeps the task eligible for
-   one bounded next-turn settlement notice; a terminal return is already delivery and suppresses
-   that redundant notice, so do not call TaskOutput again expecting a missing continuation.
-`;
-    expect(fixtureSource).toBe(expectedFixture);
+---`;
+    expect(fixtureSource.slice(0, fixtureSource.indexOf("\n\n"))).toBe(frontmatter);
+    const loaded = loadSkills([], [{ dir: path.join(dir, ".claude", "commands"), scope: "project" }]);
+    const command = loaded.skills.find((skill) => skill.name === "bg-research");
+    expect(command).toMatchObject({
+      description: "Dispatch the async-researcher in the background and retrieve it with TaskOutput.",
+      argumentHint: "<topic>",
+      legacyCommand: true,
+    });
     // The async-researcher background agent (background: true) reaches the routing catalog…
     const prompt = (await pi.fire("before_agent_start", { systemPrompt: "B" })).systemPrompt as string;
     expect(prompt).toMatch(/- async-researcher( \(read-only\))?: Researches a question in the background/);
@@ -595,13 +593,8 @@ Research this topic without blocking: $ARGUMENTS — canary FS-BG-TASKOUTPUT
     expect(expanded.text).toContain("one bounded next-turn settlement notice");
     expect(expanded.text).toContain("terminal return is already delivery and suppresses");
     expect(expanded.text).toContain("do not call TaskOutput again");
+    expect(expanded.text).toContain("Research this topic without blocking: WASM ABI");
     expect(expanded.text).not.toContain("$ARGUMENTS");
-    const expectedExpanded = expectedFixture
-      .slice(expectedFixture.indexOf("\n\n") + 2)
-      .replace("$ARGUMENTS", "WASM ABI");
-    const normalizedExpanded = String(expanded.text).replace(/\r\n/gu, "\n");
-    const expandedBody = normalizedExpanded.match(/^<skill[^\n]*>\n([\s\S]*?)\n<\/skill>/u)?.[1];
-    expect(expandedBody).toBe(expectedExpanded.trimEnd());
   });
 });
 

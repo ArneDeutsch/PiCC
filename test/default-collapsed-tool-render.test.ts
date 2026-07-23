@@ -135,15 +135,15 @@ describe("display-only tool helpers", () => {
 describe("default-collapsed tool rendering", () => {
   it("collapses all five ordinary successes and restores native detail", () => withBinding(["alt+x"], () => {
     const cases = [
-      { tool: definition("read"), args: { path: "src/read.ts" }, result: readResult("one\ntwo"), summary: "read src/read.ts · alt+x to expand · 2 lines hidden", detail: "one" },
-      { tool: definition("write"), args: { path: "src/write.ts", content: "alpha\nbeta" }, result: writeResult("src/write.ts", "alpha\nbeta"), summary: "write src/write.ts · alt+x to expand · 2 lines hidden", detail: "alpha" },
-      { tool: definition("edit"), args: { path: "src/edit.ts", edits: [{ oldText: "old", newText: "new" }] }, result: editResult("src/edit.ts", 1, "-old\n+new"), summary: "edit src/edit.ts · 1 edit applied", detail: "-old" },
-      { tool: multiDefinition(), args: { file_path: "src/multi.ts", edits: [{ old_string: "old", new_string: "new" }] }, result: multiResult("src/multi.ts", 1, "-old\n+new"), summary: "multi edit src/multi.ts · 1 edit applied", detail: "-old" },
-      { tool: definition("bash"), args: { command: "printf secret-command" }, result: readResult("secret-output"), summary: "bash · printf secret-command · alt+x to expand", detail: "secret-output" },
+      { tool: definition("read"), args: { path: "src/read.ts" }, result: readResult("one\ntwo"), summary: "read src/read.ts · 2 lines hidden · alt+x to expand", detail: "one" },
+      { tool: definition("write"), args: { path: "src/write.ts", content: "alpha\nbeta" }, result: writeResult("src/write.ts", "alpha\nbeta"), summary: "write src/write.ts · 2 lines hidden · alt+x to expand", detail: "alpha" },
+      { tool: definition("edit"), args: { path: "src/edit.ts", edits: [{ oldText: "old", newText: "new" }] }, result: editResult("src/edit.ts", 1, "-old\n+new"), summary: "edit src/edit.ts · 1 edit applied · 2 diff lines hidden · alt+x to expand", detail: "-old" },
+      { tool: multiDefinition(), args: { file_path: "src/multi.ts", edits: [{ old_string: "old", new_string: "new" }] }, result: multiResult("src/multi.ts", 1, "-old\n+new"), summary: "multi edit src/multi.ts · 1 edit applied · 2 diff lines hidden · alt+x to expand", detail: "-old" },
+      { tool: definition("bash"), args: { command: "printf secret-command" }, result: readResult("secret-output"), summary: "bash printf secret-command · 1 output line hidden · alt+x to expand", detail: "secret-output" },
     ];
     for (const item of cases) {
       const collapsed = settle(item.tool, item.args, item.result);
-      expect(collapsed, item.tool.name).toContain(item.summary);
+      expect(collapsed, item.tool.name).toBe(item.summary);
       expect(collapsed, item.tool.name).toContain("alt+x to expand");
       expect(collapsed, item.tool.name).not.toContain(item.detail);
       if (item.tool.name === "bash") expect(collapsed).toContain("secret-command");
@@ -157,7 +157,10 @@ describe("default-collapsed tool rendering", () => {
     const ordinary = readResult("one\ntwo\n\n[7 more lines in file. Use offset=6 to continue.]");
     const compact = settle(tool, args, ordinary);
     expect(compact).toContain("read page.txt:4-5");
-    expect(compact).toContain("next offset 6 · ctrl+o to expand · 7 more lines");
+    expect(compact).toBe("read page.txt:4-5 · next offset 6 · 7 more lines · ctrl+o to expand");
+    expect(settle(definition("read"), { path: "blank.txt", limit: 3 },
+      readResult("one\n\nthree\n\n[4 more lines in file. Use offset=4 to continue.]")))
+      .toBe("read blank.txt:1-3 · next offset 4 · 4 more lines · ctrl+o to expand");
     const exceptional = [
       readResult("one\n\n[7 more lines in file. Use offset=6 to continue.]"),
       readResult("one\ntwo\n\n[7 more lines in file. Use offset=9 to continue.]"),
@@ -169,7 +172,9 @@ describe("default-collapsed tool rendering", () => {
     ];
     for (const result of exceptional) {
       const detailed = settle(definition("read"), args, result);
-      expect(detailed).toContain("Elaborated result");
+      expect(detailed).toContain("native read page.txt");
+      expect(detailed).toContain("native result");
+      expect(detailed).not.toContain("Elaborated result");
       expect(detailed).not.toContain("next offset 6");
     }
   }));
@@ -241,9 +246,11 @@ describe("default-collapsed tool rendering", () => {
       const expanded = tool.renderResult(result, { expanded: true, isPartial: false }, theme,
         { args, state, isPartial: false, isError: false }).render(120).join("\n");
       expect(expanded).toContain("native result out");
+      expect(expanded).toContain("echo hidden");
       const recollapsed = tool.renderResult(result, { expanded: false, isPartial: false }, theme,
         { args, state, isPartial: false, isError: false }).render(120).join("\n");
       expect(recollapsed).toContain("ctrl+o to expand");
+      expect(recollapsed).not.toContain("echo hidden");
     }
   }));
 
@@ -259,7 +266,7 @@ describe("default-collapsed tool rendering", () => {
       },
       {
         rendered: settle(definition("bash"), { command: " \n command \n\t" }, readResult("\n output \n\t")),
-        expected: "bash · command · ctrl+o to expand · 1 output line hidden",
+        expected: "bash command · 1 output line hidden · ctrl+o to expand",
       },
     ];
     for (const entry of cases) expect(entry.rendered).toContain(entry.expected);
@@ -270,8 +277,8 @@ describe("default-collapsed tool rendering", () => {
       { path: "edit.ts", edits: [{ oldText: "same", newText: "same" }] }, editResult("edit.ts", 1, ""));
     const multi = settle(multiDefinition(),
       { file_path: "multi.ts", edits: [{ old_string: "same", new_string: "same" }] }, multiResult("multi.ts", 1, ""));
-    expect(edit).toContain("1 edit applied · ctrl+o to expand · no net change");
-    expect(multi).toContain("1 edit applied · ctrl+o to expand · no net change");
+    expect(edit).toContain("1 edit applied · no net change · ctrl+o to expand");
+    expect(multi).toContain("1 edit applied · no net change · ctrl+o to expand");
   }));
 
   it("forces visible native detail for each distinct nonordinary family", () => withBinding(["ctrl+o"], () => {
@@ -285,6 +292,8 @@ describe("default-collapsed tool rendering", () => {
     for (const item of cases) {
       const rendered = settle(item.tool, item.args, item.result, false, item.flags ?? {});
       expect(rendered, item.tool.name).toContain(item.evidence);
+      expect(rendered, item.tool.name).toContain(formatToolDisplayName(item.tool.name));
+      expect(rendered, item.tool.name).not.toContain("Elaborated result");
       expect(rendered, item.tool.name).not.toContain("diff lines hidden");
     }
   }));
@@ -395,9 +404,9 @@ describe("default-collapsed tool rendering", () => {
     const narrowBash = renderAt(definition("bash"), { command: "printf-a-very-long-command-preview\necho hidden" }, readResult("ok"), 45);
     const narrowRead = renderAt(definition("read"), { path: "a/very/long/path/to/page.txt", offset: 20, limit: 2 },
       readResult("one\ntwo\n\n[987 more lines in file. Use offset=22 to continue.]"), 58);
-    expect(narrowBash).toMatch(/^bash · .+ · ctrl\+o to expand$/u);
+    expect(narrowBash).toMatch(/^bash .+ · ctrl\+o to expand$/u);
     expect(narrowBash).not.toContain("output line");
-    expect(narrowRead).toContain("next offset 22 · ctrl+o to expand");
+    expect(narrowRead).toMatch(/next offset 22 · ctrl\+o to expand$/u);
     expect(narrowRead).not.toContain("987 more lines");
   }));
 

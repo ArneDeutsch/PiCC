@@ -172,8 +172,9 @@ outcome even when their transport call succeeds. Ordinary settled Read, Write, E
 Bash successes use compact detail; the configured `app.tools.expand` action (Ctrl+O by default)
 reveals native detail without changing the marker. Live, exceptional, and unfamiliar rows retain
 native detail inside the same glyph frame, while malformed display data uses a concise warning.
-Binary images remain native. In PiCC compact summaries, paths within the project or worktree active
-when the tool started are relative to that root; outside paths remain absolute. HTML export may
+Binary images remain native. In PiCC compact summaries, paths within the invocation-time working
+directory or worktree root are relative to that root; descendants stay relative and outside paths
+remain absolute. HTML export may
 retain Pi's state-background cards and built-in presentation, and eligible custom
 fragments may include phase-local glyphs; non-interactive output has no renderer glyphs. None of
 these presentations changes model-facing results or execution. Passive Agent lifecycle and panel

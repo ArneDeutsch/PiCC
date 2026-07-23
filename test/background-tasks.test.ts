@@ -3377,12 +3377,18 @@ describe("settlement completion record (details + exactly-once)", () => {
     expect(collapsedLines[0]).toContain(RECORD_EXPAND_HINT);
     expect(collapsedLines[0]).not.toContain(".jsonl");
     expect(collapsedLines[0]).not.toContain("the review report");
-    const expanded = renderSettlementRecord(details, { expanded: true }, undefined)!
-      .render(200)
-      .join("\n");
+    const expandedLines = renderSettlementRecord(details, { expanded: true }, undefined)!.render(200);
+    const expanded = expandedLines.join("\n");
+    expect(expandedLines[0]).toContain("worker [completed]");
+    expect(expandedLines[0]).not.toContain(id);
     expect(expanded).toContain("the review report");
     expect(expanded).toContain("transcript: /x/sessions/");
     expect(expanded).toContain("usage:");
+    const referenceLines = renderSettlementRecord({ ...details, alreadyReported: true }, { expanded: false }, undefined)!
+      .render(200);
+    expect(referenceLines[0]).toContain("worker [completed]");
+    expect(referenceLines[0]).not.toContain(id);
+    expect(referenceLines[0]).toContain(RECORD_REFERENCE_NOTE);
   });
 
   it("caps settlement UI final text at a scalar boundary without changing the task result", async () => {

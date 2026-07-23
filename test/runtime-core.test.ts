@@ -2066,6 +2066,7 @@ describe("Subagent live progress", () => {
       content: [{ type: "text", text: "the answer" }],
       details: {
         outcome: "completed",
+        taskId: "task-passive-completed",
         agent: "reviewer",
         transcriptPath: "/x/agent-abc.jsonl",
         resumable: true,
@@ -2076,6 +2077,7 @@ describe("Subagent live progress", () => {
     expect(completed).toContain("/x/agent-abc.jsonl");
     expect(completed).toContain("resumable");
     expect(completed).not.toContain("usage:");
+    expect(completed.split("\n")[0]).not.toContain("task-passive-completed");
 
     // Usage slot renders defensively when the field is present.
     const withUsage = render({
@@ -2088,10 +2090,11 @@ describe("Subagent live progress", () => {
     // Failed-with-partial shows a failed badge and preserves the partial body.
     const failed = render({
       content: [{ type: "text", text: "partial work" }],
-      details: { outcome: "failed", cutOff: true, agent: "reviewer" },
+      details: { outcome: "failed", cutOff: true, agent: "reviewer", taskId: "task-passive-failed" },
     });
     expect(failed).toContain("failed");
     expect(failed).toContain("partial work");
+    expect(failed.split("\n")[0]).not.toContain("task-passive-failed");
 
     // Partial/streaming shows only stable identity/state; live activity stays in detail.
     const partial = render(
@@ -2920,6 +2923,18 @@ describe("condensed completion records", () => {
     expect(lines[0]).not.toContain(".jsonl");
     expect(lines[0]).not.toContain("foreground answer");
     expect(lines[0]).toContain(RECORD_EXPAND_HINT);
+  });
+
+  it("omits task IDs from passive Agent collapsed, expanded, and reference headers", () => {
+    const details = { ...completedDetails, taskId: "task-passive-secret" };
+    for (const [expanded, alreadyReported] of [[false, false], [true, false], [false, true]] as const) {
+      const lines = renderAgentResult(
+        { content: [{ type: "text", text: "answer" }], details: { ...details, alreadyReported } },
+        { isPartial: false, expanded }, undefined, undefined, { surface: "agent" },
+      ).render(200);
+      expect(lines[0]).toContain("coder [completed]");
+      expect(lines[0]).not.toContain("task-passive-secret");
+    }
   });
 
   it("tints only passive agent identity with each validated palette color", () => {
