@@ -854,6 +854,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       "TaskStop",
       "MultiEdit",
       ...DEGRADED_TOOLS.map((d) => d.name),
+      // Live MCP wire names (`mcp__<server>__<tool>`): gateTools already speaks
+      // the MCP grammar (bare `mcp__server` fan-out, bare-name deny removal), so
+      // appending the connected servers' names is all that agent
+      // `tools:`/`disallowedTools:` gating needs to cover MCP. Possibly
+      // incomplete (initially empty) before the runtime settles — servers
+      // settle individually; dispatches happen inside turns, after the first-turn
+      // barrier below, so they always see the settled set. An over-long name
+      // (>64 chars) stays in this universe but has no proxy instance (the
+      // builder drops it from the wire), so granting it is inert.
+      ...mcpRuntime.tools().map((t) => `mcp__${t.serverName}__${t.toolName}`),
     ];
   }
 
@@ -873,6 +883,18 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       for (const tool of buildCwdBoundTools(subCwd ?? cwdState, createTaskTools(), captureUniversalStop)) {
         const name = (tool as { name: string }).name;
         if (granted.includes(name)) tools.push(tool);
+      }
+      // Fresh per-dispatch MCP proxy instances over the SESSION-GLOBAL runtime:
+      // the ToolDefinitions are dispatch-local (never shared across sessions)
+      // while the stdio client connections stay session-global — the intended
+      // split (cf. buildCwdBoundTools above; proxies hold no cwd/TaskStore
+      // state, so freshness here is about never sharing tool OBJECTS). The same
+      // granted-name filter as the cwd-bound tools applies: `granted` already
+      // went through gateTools over the MCP-extended universe, so `tools:`
+      // restriction (incl. bare `mcp__server` fan-out), `disallowedTools:`, and
+      // bare-name deny removal have all been decided by the time we get here.
+      for (const proxy of buildMcpProxyTools(mcpRuntime)) {
+        if (granted.includes(proxy.name)) tools.push(proxy as unknown as Record<string, unknown>);
       }
       if (granted.includes("Skill")) {
         // Per-dispatch Skill tool: carries the caller's depth into context:fork

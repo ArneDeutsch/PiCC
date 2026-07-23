@@ -195,7 +195,7 @@ export class McpRuntime {
     return this.settlePromise;
   }
 
-  /** Tools of connected servers; `[]` before settle. */
+  /** Tools of already-connected servers — possibly incomplete (initially `[]`) before settle; servers settle individually. */
   tools(): McpToolInfo[] {
     const out: McpToolInfo[] = [];
     for (const handle of this.handles) {
