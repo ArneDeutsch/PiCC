@@ -1,10 +1,22 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it, vi } from "vitest";
 import { createRequire } from "node:module";
 import { stream as streamCodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
-import type { AssistantMessage, Context, Model, ToolCall } from "@earendil-works/pi-ai";
+import {
+  createAssistantMessageEventStream,
+  type AssistantMessage,
+  type Context,
+  type Model,
+  type RetryCallbacks,
+  type ToolCall,
+} from "@earendil-works/pi-ai";
+import {
+  generateSummary,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 import { fakePi } from "./helpers/fake-pi.js";
 import { withCompactSearchRendering } from "../src/runtime/search-tool-render.js";
 import { genericCallComponent, wrapForSelfShell, type RenderCtx } from "../src/runtime/tool-shell.js";
@@ -86,7 +98,240 @@ describe("mock wire request classification", () => {
   });
 });
 
-describe("pi 0.80.x API contract", () => {
+describe("pi 0.81.1 API contract", () => {
+  const coordinatedPackages = [
+    "@earendil-works/pi-agent-core",
+    "@earendil-works/pi-ai",
+    "@earendil-works/pi-coding-agent",
+    "@earendil-works/pi-tui",
+  ] as const;
+
+  it("declares and resolves one coordinated Pi 0.81.1 runtime graph", () => {
+    const root = fileURLToPath(new URL("..", import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
+      dependencies: Record<string, string>;
+      engines: { node: string };
+    };
+    const lock = JSON.parse(readFileSync(join(root, "package-lock.json"), "utf8")) as {
+      packages: Record<string, { version?: string; dependencies?: Record<string, string> }>;
+    };
+
+    for (const name of coordinatedPackages) {
+      expect(manifest.dependencies[name]).toBe("^0.81.1");
+    }
+    expect(manifest.engines.node).toBe(">=22.19.0");
+
+    const assertInstalledMetadata = (label: string, packageJsonPath: string, name: string) => {
+      const installed = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+        name: string;
+        version: string;
+        engines?: { node?: string };
+      };
+      expect(installed, label).toMatchObject({
+        name,
+        version: "0.81.1",
+        engines: { node: ">=22.19.0" },
+      });
+    };
+    for (const name of coordinatedPackages) {
+      const directPath = `node_modules/${name}`;
+      expect(lock.packages[directPath]?.version, `${name} direct lock`).toBe("0.81.1");
+      assertInstalledMetadata(
+        `${name} direct installed metadata`,
+        join(root, directPath, "package.json"),
+        name,
+      );
+    }
+
+    const coordinatedResolutions = Object.entries(lock.packages).flatMap(([path, entry]) => {
+      const name = coordinatedPackages.find((candidate) => path.endsWith(`node_modules/${candidate}`));
+      return name ? [{ path, entry, name }] : [];
+    });
+    for (const { path, entry, name } of coordinatedResolutions) {
+      expect(entry.version, `${path} lock resolution`).toBe("0.81.1");
+      const packageJsonPath = join(root, path, "package.json");
+      expect(existsSync(packageJsonPath), `${path} exact installed manifest`).toBe(true);
+      assertInstalledMetadata(`${path} installed metadata`, packageJsonPath, name);
+    }
+
+    const codingAgent = lock.packages["node_modules/@earendil-works/pi-coding-agent"];
+    expect(codingAgent?.dependencies).toMatchObject(Object.fromEntries(
+      coordinatedPackages
+        .filter((name) => name !== "@earendil-works/pi-coding-agent")
+        .map((name) => [name, "^0.81.1"]),
+    ));
+  });
+
+  it("pins fresh in-memory summarization and provider retry defaults through public getters", () => {
+    const settings = SettingsManager.inMemory();
+    expect(settings.getRetrySettings()).toEqual({
+      enabled: true,
+      maxRetries: 3,
+      baseDelayMs: 2000,
+    });
+    expect(settings.getProviderRetrySettings()).toEqual({
+      timeoutMs: undefined,
+      maxRetries: undefined,
+      maxRetryDelayMs: 60_000,
+    });
+  });
+
+  const summaryModel: Model<"openai-completions"> = {
+    id: "summary-contract",
+    name: "Summary Contract",
+    api: "openai-completions",
+    provider: "contract",
+    baseUrl: "https://example.invalid",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 100_000,
+    maxTokens: 4_096,
+  };
+  const summaryInput = [{
+    role: "user" as const,
+    content: [{ type: "text" as const, text: "Summarize this contract conversation." }],
+    timestamp: 1,
+  }];
+  const summaryUsage = {
+    input: 1,
+    output: 1,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 2,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+  const summaryResponse = (stopReason: AssistantMessage["stopReason"], text: string, errorMessage?: string): AssistantMessage => ({
+    role: "assistant",
+    content: text ? [{ type: "text", text }] : [],
+    api: summaryModel.api,
+    provider: summaryModel.provider,
+    model: summaryModel.id,
+    usage: summaryUsage,
+    stopReason,
+    errorMessage,
+    timestamp: Date.now(),
+  });
+  type SummaryStreamFn = NonNullable<Parameters<typeof generateSummary>[9]>;
+  const scriptedSummaryStream = (responses: AssistantMessage[], calls: { count: number }): SummaryStreamFn =>
+    () => {
+      calls.count += 1;
+      const stream = createAssistantMessageEventStream();
+      const response = responses.shift();
+      if (!response) throw new Error("summary stream script exhausted");
+      stream.end(response);
+      return stream;
+    };
+  const runSummary = (
+    streamFn: SummaryStreamFn,
+    options: { signal?: AbortSignal; callbacks?: RetryCallbacks; baseDelayMs?: number } = {},
+  ) => generateSummary(
+    summaryInput,
+    summaryModel,
+    1_000,
+    undefined,
+    undefined,
+    options.signal,
+    undefined,
+    undefined,
+    undefined,
+    streamFn,
+    undefined,
+    { enabled: true, maxRetries: 1, baseDelayMs: options.baseDelayMs ?? 0 },
+    options.callbacks,
+  );
+
+  it("retries a transient summarization transport failure inside one public summary operation", async () => {
+    const calls = { count: 0 };
+    const scheduled: Array<[number, number, number, string]> = [];
+    const started: number[] = [];
+    const finished: Array<[boolean, number, string?]> = [];
+    const result = await runSummary(scriptedSummaryStream([
+      summaryResponse("error", "", "socket connection was closed"),
+      summaryResponse("stop", "usable summary"),
+    ], calls), {
+      callbacks: {
+        onRetryScheduled: (...event) => { scheduled.push(event); },
+        onRetryAttemptStart: () => { started.push(calls.count); },
+        onRetryFinished: (...event) => { finished.push(event); },
+      },
+    });
+
+    expect(result).toBe("usable summary");
+    expect(calls.count).toBe(2);
+    expect(scheduled).toEqual([[1, 1, 0, "socket connection was closed"]]);
+    expect(started).toEqual([1]);
+    expect(finished).toEqual([[true, 1]]);
+  });
+
+  it("fails fast when the initial summary response is aborted", async () => {
+    const calls = { count: 0 };
+    const scheduled: number[] = [];
+    await expect(runSummary(scriptedSummaryStream([
+      summaryResponse("aborted", ""),
+    ], calls), {
+      callbacks: { onRetryScheduled: (attempt) => { scheduled.push(attempt); } },
+    })).resolves.toBe("");
+    expect(calls.count).toBe(1);
+    expect(scheduled).toEqual([]);
+  });
+
+  it.each([
+    ["deterministic HTTP 400", "Provider returned HTTP 400 Bad Request: invalid request shape"],
+    ["overlapping HTTP 429 quota/billing", "HTTP 429 Too Many Requests: insufficient_quota billing quota exceeded"],
+    ["authentication", "HTTP 401 Unauthorized: authentication failed, invalid API key"],
+  ])("does not retry a %s summarization failure", async (_category, errorMessage) => {
+    const calls = { count: 0 };
+    const scheduled: number[] = [];
+    await expect(runSummary(scriptedSummaryStream([
+      summaryResponse("error", "", errorMessage),
+    ], calls), {
+      callbacks: { onRetryScheduled: (attempt) => { scheduled.push(attempt); } },
+    })).rejects.toThrow(`Summarization failed: ${errorMessage}`);
+    expect(calls.count).toBe(1);
+    expect(scheduled).toEqual([]);
+  });
+
+  it("cancels a scheduled summarization retry without a surviving timer or provider call", async () => {
+    vi.useFakeTimers();
+    try {
+      const calls = { count: 0 };
+      const abort = new AbortController();
+      const attemptStarts: number[] = [];
+      const finished: Array<[boolean, number, string?]> = [];
+      let retryScheduled!: () => void;
+      const scheduled = new Promise<void>((resolve) => { retryScheduled = resolve; });
+      const settlement = runSummary(scriptedSummaryStream([
+        summaryResponse("error", "", "terminated while reading summary stream"),
+      ], calls), {
+        signal: abort.signal,
+        baseDelayMs: 60_000,
+        callbacks: {
+          onRetryScheduled: () => { retryScheduled(); },
+          onRetryAttemptStart: () => { attemptStarts.push(calls.count); },
+          onRetryFinished: (...event) => { finished.push(event); },
+        },
+      });
+
+      await scheduled;
+      await Promise.resolve();
+      expect(vi.getTimerCount()).toBe(1);
+      abort.abort();
+      const result = await settlement;
+      expect(result).toBe("");
+      expect(abort.signal.aborted).toBe(true);
+      expect(calls.count).toBe(1);
+      expect(attemptStarts).toEqual([]);
+      expect(finished).toEqual([[false, 1, "terminated while reading summary stream"]]);
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.runAllTimersAsync();
+      expect(calls.count).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("exports the SDK surface PiCC uses", async () => {
     const sdk: Record<string, unknown> = await import("@earendil-works/pi-coding-agent");
     for (const name of [

@@ -604,6 +604,7 @@ class ChildCheckpointCoordinator {
   private readonly hooks: HookRunnerLike;
   private hookBlocked = false;
   private restorationFailed = false;
+  private summaryCommitted = false;
   private manualRecovery = false;
   private stoppedRunSettled = false;
   private compactOperation: {
@@ -653,7 +654,7 @@ class ChildCheckpointCoordinator {
     this.gate = new MainSessionCheckpointGate(sessionId, threshold);
     this.gate.attachExecution({
       progress: (event) => this.progress(event),
-      compact: (attempt, signal) => this.compact(attempt, signal),
+      compact: (signal) => this.compact(signal),
       resume: (context) => this.resume(context),
     });
   }
@@ -739,7 +740,7 @@ class ChildCheckpointCoordinator {
     if (snapshot.failureCategory === "hook-blocked") {
       return `Automatic context compaction for subagent "${this.agentName}" paused because a PreCompact hook blocked the attempt. The agent is paused and no continuation ran; before this process exits, repair or disable the hook and use SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
     }
-    return `Automatic context compaction for subagent "${this.agentName}" failed after up to three attempts. The agent is paused and no continuation ran; before this process exits, use SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
+    return `Automatic context compaction for subagent "${this.agentName}" could not complete. The agent is paused and no continuation ran; before this process exits, use SendMessage with agent id ${this.agentId} to recover that same live agent, or abandon it with TaskStop using that agent id.`;
   }
 
   retain(
@@ -830,12 +831,18 @@ class ChildCheckpointCoordinator {
     }
     this.hookBlocked = false;
     this.restorationFailed = false;
+    this.summaryCommitted = false;
     this.manualRecovery = true;
     try {
       await session.compact();
     } catch (error) {
-      const category = this.hookBlocked ? "PreCompact hook" : "manual compaction";
       void error;
+      if (retained.stopping || this.retained !== retained) throw new Error("checkpoint recovery was cancelled");
+      if (this.summaryCommitted) {
+        await controller.failAfterCommittedSummary(generation);
+        throw new Error(`Compaction committed before recovery failed for subagent "${this.agentName}". Do not compact it again; abandon it with TaskStop using agent id ${this.agentId}, then dispatch a replacement agent with the retained input.`);
+      }
+      const category = this.hookBlocked ? "PreCompact hook" : "manual compaction";
       throw new Error(`${category} failed for recovery attempt on subagent "${this.agentName}". The agent remains paused; retry SendMessage after repairing the cause.`);
     } finally {
       this.manualRecovery = false;
@@ -902,7 +909,7 @@ class ChildCheckpointCoordinator {
     if (generation !== undefined) await controller.checkpoint(generation);
   }
 
-  private async compact(_attempt: number, signal: AbortSignal) {
+  private async compact(signal: AbortSignal) {
     const session = this.session;
     const controller = this.gate.currentController();
     const generation = controller.snapshot().generation;
@@ -910,6 +917,7 @@ class ChildCheckpointCoordinator {
     if (!session?.compact || !token) return { ok: false as const, category: "operational" as const };
     this.hookBlocked = false;
     this.restorationFailed = false;
+    this.summaryCommitted = false;
     const operation = Promise.resolve().then(() => session.compact!());
     const abort = () => {
       try { session.abortCompaction?.(); } catch { /* operation settlement classifies */ }
@@ -918,7 +926,8 @@ class ChildCheckpointCoordinator {
     try {
       let result = await promiseCompactionAttempt(() => operation, signal);
       if (signal.aborted) await operation.catch(() => undefined);
-      if (!result.ok && this.hookBlocked) result = { ok: false, category: "hook-blocked" };
+      if (!result.ok && this.summaryCommitted) result = { ok: false, category: "restoration-paused" };
+      else if (!result.ok && this.hookBlocked) result = { ok: false, category: "hook-blocked" };
       if (result.ok && this.restorationFailed) result = { ok: false, category: "restoration-paused" };
       return result;
     } finally {
@@ -1055,6 +1064,8 @@ class ChildCheckpointCoordinator {
           ? operation.controller.snapshot().phase === "idle"
           : this.manualRecovery);
     if (!isCurrent()) return;
+    this.summaryCommitted = true;
+    if (operation.proactive) operation.controller.observeCompactionCommit(operation.generation);
     try {
       let universalStop = false;
       let startedContext = "";
@@ -1135,17 +1146,12 @@ class ChildCheckpointCoordinator {
   private progress(event: CheckpointProgress): void {
     const controller = this.gate.currentController();
     if (this.gate.isLogicalRunStopped() && this.gate.stoppedRunMatches(controller, event.generation)) return;
-    const activity = event.category === "checkpoint-retrying"
-      ? `checkpoint retry ${Math.min((event.attempt ?? 1) + 1, 3)}/3`
-      : event.category === "checkpoint-exhausted"
-        ? "checkpoint paused: recovery required"
-        : event.category === "checkpoint-recovered"
-          ? "checkpoint recovered: resuming"
-          : `checkpoint: ${event.category}`;
+    const activity = event.category === "checkpoint-exhausted"
+      ? "checkpoint paused: recovery required"
+      : event.category === "checkpoint-recovered"
+        ? "checkpoint recovered: resuming"
+        : `checkpoint: ${event.category}`;
     this.emitProgress?.({ tail: [activity], activity });
-    if (event.category === "checkpoint-retrying") {
-      this.diagnostics.push({ severity: "warning", message: `subagent context compaction retry ${Math.min((event.attempt ?? 1) + 1, 3)} of 3` });
-    }
     if (event.category === "checkpoint-exhausted") {
       this.diagnostics.push({ severity: "warning", message: this.failureMessage() });
     }

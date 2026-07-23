@@ -4,8 +4,8 @@ import { createHash } from "node:crypto";
  * Subagent live-progress condenser.
  *
  * A subagent runs a full Pi `AgentSession`; its `subscribe(listener)` stream
- * emits `turn_start/end`, `message_update`, `tool_execution_start/update/end`,
- * and `auto_retry_start/end` events. This module turns that (chatty, unbounded)
+ * emits turn, message, tool, ordinary API retry, and summary-retry events.
+ * This module turns that (chatty, unbounded)
  * stream into a small, BOUNDED, SANITIZED snapshot the parent can display live
  * via the Agent tool's `onUpdate` channel (interactive TUI + print/RPC alike):
  *
@@ -632,6 +632,24 @@ export class SubagentProgressCondenser {
       }
       case "auto_retry_end":
         this.activity = e.success === true ? "retry succeeded; resuming…" : "retry failed";
+        this.pushDetail({ kind: "status", text: this.activity });
+        break;
+      case "summarization_retry_scheduled": {
+        const attempt = asNumber(e.attempt);
+        const max = asNumber(e.maxAttempts);
+        this.activity = attempt !== undefined && max !== undefined
+          ? `waiting: summary retry ${attempt}/${max}`
+          : "waiting: summary retry";
+        this.push(this.activity);
+        this.pushDetail({ kind: "status", text: this.activity });
+        break;
+      }
+      case "summarization_retry_attempt_start":
+        this.activity = "retrying summary…";
+        this.pushDetail({ kind: "status", text: this.activity });
+        break;
+      case "summarization_retry_finished":
+        this.activity = "summary retry finished";
         this.pushDetail({ kind: "status", text: this.activity });
         break;
       case "tool_execution_start": {

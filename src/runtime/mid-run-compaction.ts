@@ -16,7 +16,6 @@ export type CheckpointPhase =
   | "stopping"
   | "awaiting-settlement"
   | "compacting"
-  | "backoff"
   | "resuming"
   | "terminalizing"
   | "exhausted"
@@ -35,7 +34,6 @@ export type CompactionFailureCategory =
   | "shutdown";
 export type CheckpointDiagnosticCategory =
   | "checkpoint-armed"
-  | "checkpoint-retrying"
   | "checkpoint-complete"
   | "checkpoint-exhausted"
   | "checkpoint-cancelled"
@@ -56,7 +54,6 @@ export interface QueuedInputShadow {
 export interface CheckpointProgress {
   category: CheckpointDiagnosticCategory;
   generation: number;
-  attempt?: number;
   action?: "resume" | "settled-fallback" | "manual-recovery" | "new-session";
   failureCategory?: CompactionFailureCategory;
 }
@@ -64,7 +61,6 @@ export interface CheckpointProgress {
 export interface CheckpointSnapshot {
   generation: number;
   phase: CheckpointPhase;
-  attempt: number;
   checkpointAbortRequested: boolean;
   queuedInputs: number;
   admission: "open" | "checkpoint-only" | "recoverable-rejection" | "closed";
@@ -131,10 +127,8 @@ export interface CancellationOutcome {
 export interface MidRunCompactionOptions {
   sessionId: string;
   threshold: number;
-  compact(attempt: number, signal: AbortSignal): Promise<CompactionAttemptResult>;
+  compact(signal: AbortSignal): Promise<CompactionAttemptResult>;
   resume?(context: ResumeContext): ResumedRunOwnership | Promise<ResumedRunOwnership>;
-  delay?(milliseconds: number, signal: AbortSignal): Promise<void>;
-  backoffMs?: readonly number[];
   progress?(event: CheckpointProgress): void;
 }
 
@@ -181,20 +175,6 @@ interface RunOwnership {
   settled: Deferred<void>;
 }
 
-function defaultDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      reject(signal.reason);
-      return;
-    }
-    const timer = setTimeout(resolve, milliseconds);
-    signal.addEventListener("abort", () => {
-      clearTimeout(timer);
-      reject(signal.reason);
-    }, { once: true });
-  });
-}
-
 function usageIsKnown(usage: ContextUsageShape | undefined): usage is ContextUsageShape & { percent: number } {
   return typeof usage?.percent === "number" && Number.isFinite(usage.percent);
 }
@@ -203,14 +183,6 @@ function usageMeetsThreshold(usage: ContextUsageShape | undefined, threshold: nu
   return usageIsKnown(usage) && usage.percent >= threshold;
 }
 
-const NON_RETRYABLE = new Set<CompactionFailureCategory>([
-  "cancelled",
-  "hook-blocked",
-  "restoration-paused",
-  "stale-generation",
-  "shutdown",
-]);
-
 /** Coordinates one session's checkpoint generation and leaves Pi-specific wiring to callers. */
 export class MidRunCompactionController {
   readonly sessionId: string;
@@ -218,7 +190,6 @@ export class MidRunCompactionController {
 
   private generation = 0;
   private phase: CheckpointPhase = "idle";
-  private attempt = 0;
   private activeBatch: ActiveBatch | undefined;
   private queue: QueuedInputShadow[] = [];
   private nextQueueId = 1;
@@ -235,6 +206,7 @@ export class MidRunCompactionController {
   private resumeContext: ResumeContext | undefined;
   private cancellation: CancellationState | undefined;
   private compactionSummary: CompactionSummaryToken | undefined;
+  private committedGeneration: number | undefined;
   private terminalFailure: CompactionFailureCategory | undefined;
   private terminalization: Promise<readonly QueuedInputShadow[]> | undefined;
 
@@ -247,7 +219,6 @@ export class MidRunCompactionController {
     return {
       generation: this.generation,
       phase: this.phase,
-      attempt: this.attempt,
       checkpointAbortRequested: this.checkpointAbortRequested,
       queuedInputs: this.queue.length,
       admission: this.phase === "exhausted"
@@ -267,7 +238,6 @@ export class MidRunCompactionController {
     }
     this.generation += 1;
     this.phase = source === "tool" ? "armed" : "awaiting-settlement";
-    this.attempt = 0;
     this.activeBatch = undefined;
     this.checkpointAbortRequested = false;
     this.runAbort = new AbortController();
@@ -281,6 +251,7 @@ export class MidRunCompactionController {
     this.resumeContext = undefined;
     this.cancellation = undefined;
     this.compactionSummary = undefined;
+    this.committedGeneration = undefined;
     this.terminalFailure = undefined;
     this.terminalization = undefined;
     this.emit("checkpoint-armed");
@@ -359,6 +330,13 @@ export class MidRunCompactionController {
   endCompactionSummary(token: CompactionSummaryToken): boolean {
     if (token !== this.compactionSummary || token.generation !== this.generation) return false;
     this.compactionSummary = undefined;
+    return true;
+  }
+
+  /** Irrevocably records commit without publishing settlement ahead of the physical operation. */
+  observeCompactionCommit(generation: number): boolean {
+    if (generation !== this.generation || this.phase === "idle" || this.phase === "terminalizing") return false;
+    this.committedGeneration = generation;
     return true;
   }
 
@@ -471,9 +449,6 @@ export class MidRunCompactionController {
     this.runAbort.abort(kind);
     this.queueChanged.resolve();
     this.startCancelAndJoin(generation);
-    this.emit("checkpoint-cancelled", generation, undefined, {
-      action: kind === "user" ? "manual-recovery" : "new-session",
-    });
     const generationBarrier = this.stable ??= deferred();
     this.scheduleCancellationFinish(generation, generationBarrier);
     return this.cancellation.outcome.promise;
@@ -495,6 +470,7 @@ export class MidRunCompactionController {
     const rejected = this.queue.splice(0);
     this.phase = "idle";
     this.checkpointAbortRequested = false;
+    this.committedGeneration = undefined;
     this.recovery = undefined;
     this.emit("checkpoint-recovered");
     return { recovered: true, rejected };
@@ -511,50 +487,39 @@ export class MidRunCompactionController {
   }
 
   private async run(generation: number): Promise<void> {
-    const backoffs = this.options.backoffMs ?? [25, 100];
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      if (!this.isCurrent(generation)) return;
-      this.phase = "compacting";
-      this.attempt = attempt;
-      let result: CompactionAttemptResult;
-      try {
-        result = await this.options.compact(attempt, this.runAbort.signal);
-      } catch {
-        result = this.runAbort.signal.aborted
-          ? { ok: false, category: "cancelled" }
-          : { ok: false, category: "operational" };
-      } finally {
-        // The adapter normally closes its token; this floor keeps a failed adapter
-        // from authorizing ordinary transport during backoff or a later attempt.
-        this.compactionSummary = undefined;
-      }
-      if (!this.isCurrent(generation)) return;
-      if (result.ok) {
-        this.phase = "awaiting-settlement";
-        this.emit("checkpoint-complete", generation, attempt, {
-          action: this.fallback ? "settled-fallback" : "resume",
-        });
-        await this.resumeOrFinish(generation);
-        return;
-      }
-      if (NON_RETRYABLE.has(result.category) || attempt === 3) {
-        if (result.category === "cancelled" || result.category === "shutdown") {
-          void this.cancel(generation, result.category === "shutdown" ? "shutdown" : "user");
-        } else if (result.category === "restoration-paused") {
-          await this.terminalizeAfterCommittedSummary(generation);
-        } else {
-          this.exhaust(generation, result.category);
-        }
-        return;
-      }
-      this.phase = "backoff";
-      this.emit("checkpoint-retrying", generation, attempt);
-      try {
-        await (this.options.delay ?? defaultDelay)(backoffs[attempt - 1] ?? 100, this.runAbort.signal);
-      } catch {
-        if (this.isCurrent(generation)) void this.cancel(generation, "user");
-        return;
-      }
+    if (!this.isCurrent(generation)) return;
+    this.phase = "compacting";
+    let result: CompactionAttemptResult;
+    try {
+      result = await this.options.compact(this.runAbort.signal);
+    } catch {
+      result = this.runAbort.signal.aborted
+        ? { ok: false, category: "cancelled" }
+        : { ok: false, category: "operational" };
+    } finally {
+      // The adapter normally closes its token; this floor prevents ordinary
+      // transport from inheriting summary authority after adapter settlement.
+      this.compactionSummary = undefined;
+    }
+    if (!result.ok && this.committedGeneration === generation) {
+      await this.terminalizeAfterCommittedSummary(generation);
+      return;
+    }
+    if (!this.isCurrent(generation)) return;
+    if (result.ok) {
+      this.phase = "awaiting-settlement";
+      this.emit("checkpoint-complete", generation, {
+        action: this.fallback ? "settled-fallback" : "resume",
+      });
+      await this.resumeOrFinish(generation);
+      return;
+    }
+    if (result.category === "cancelled" || result.category === "shutdown") {
+      void this.cancel(generation, result.category === "shutdown" ? "shutdown" : "user");
+    } else if (result.category === "restoration-paused") {
+      await this.terminalizeAfterCommittedSummary(generation);
+    } else {
+      this.exhaust(generation, result.category);
     }
   }
 
@@ -663,9 +628,8 @@ export class MidRunCompactionController {
   }
 
   private terminalizeAfterCommittedSummary(generation: number): Promise<readonly QueuedInputShadow[]> {
-    if (generation !== this.generation || this.phase === "cancelled" || this.phase === "exhausted") {
-      return Promise.resolve([]);
-    }
+    if (generation !== this.generation ||
+        (this.phase === "exhausted" && this.terminalFailure === "restoration-paused")) return Promise.resolve([]);
     if (this.phase === "terminalizing") return this.terminalization ?? Promise.resolve([]);
 
     const ownership = this.resumedOwnership;
@@ -697,7 +661,10 @@ export class MidRunCompactionController {
       const rejected = this.queue.splice(0);
       this.phase = "exhausted";
       generationBarrier?.resolve();
-      this.emit("checkpoint-exhausted", generation, this.attempt, {
+      if (this.cancellation?.generation === generation) {
+        this.cancellation.outcome.resolve({ cancelled: true, rejected });
+      }
+      this.emit("checkpoint-exhausted", generation, {
         action: "new-session",
         failureCategory: "restoration-paused",
       });
@@ -716,6 +683,7 @@ export class MidRunCompactionController {
     this.phase = "idle";
     this.checkpointAbortRequested = false;
     this.compactionSummary = undefined;
+    this.committedGeneration = undefined;
     generationBarrier?.resolve();
   }
 
@@ -728,7 +696,7 @@ export class MidRunCompactionController {
     this.terminalFailure = failureCategory;
     this.recovery = failureCategory === "restoration-paused" ? undefined : { generation, token: {} };
     generationBarrier?.resolve();
-    this.emit("checkpoint-exhausted", generation, this.attempt, {
+    this.emit("checkpoint-exhausted", generation, {
       action: failureCategory === "restoration-paused" ? "new-session" : "manual-recovery",
       failureCategory,
     });
@@ -759,6 +727,10 @@ export class MidRunCompactionController {
   private async finishCancellation(generation: number, generationBarrier: Deferred<void>): Promise<void> {
     const cancellation = this.cancellation;
     if (!cancellation || cancellation.generation !== generation) return;
+    if (this.phase === "terminalizing") {
+      await this.terminalization;
+      return;
+    }
     this.startCancelAndJoin(generation);
     try {
       await cancellation.join;
@@ -768,8 +740,23 @@ export class MidRunCompactionController {
       cancellation.outcome.reject(failure);
       return;
     }
+    if (this.snapshot().phase === "terminalizing") {
+      await this.terminalization;
+      return;
+    }
+    if (this.committedGeneration === generation) {
+      await this.terminalizeAfterCommittedSummary(generation);
+      return;
+    }
+    if (this.phase === "exhausted") {
+      cancellation.outcome.resolve({ cancelled: true, rejected: [] });
+      return;
+    }
     const rejected = this.queue.splice(0);
     if (cancellation.kind === "user") this.recovery = { generation, token: {} };
+    this.emit("checkpoint-cancelled", generation, {
+      action: cancellation.kind === "user" ? "manual-recovery" : "new-session",
+    });
     generationBarrier.resolve();
     cancellation.outcome.resolve({ cancelled: true, rejected });
   }
@@ -786,11 +773,10 @@ export class MidRunCompactionController {
   private emit(
     category: CheckpointDiagnosticCategory,
     generation = this.generation,
-    attempt?: number,
     details: Pick<CheckpointProgress, "action" | "failureCategory"> = {},
   ): void {
     try {
-      this.options.progress?.({ category, generation, ...(attempt === undefined ? {} : { attempt }), ...details });
+      this.options.progress?.({ category, generation, ...details });
     } catch {
       // Observers cannot own checkpoint transitions or barriers.
     }
@@ -814,9 +800,8 @@ interface MainBatchObservation {
 }
 
 export interface CheckpointExecutionAdapter {
-  compact(attempt: number, signal: AbortSignal): Promise<CompactionAttemptResult>;
+  compact(signal: AbortSignal): Promise<CompactionAttemptResult>;
   resume?(context: ResumeContext): ResumedRunOwnership | Promise<ResumedRunOwnership>;
-  delay?(milliseconds: number, signal: AbortSignal): Promise<void>;
   progress?(event: CheckpointProgress): void;
 }
 
@@ -1281,17 +1266,14 @@ export class MainSessionCheckpointGate {
     return new MidRunCompactionController({
       sessionId,
       threshold: this.threshold,
-      compact: (attempt, signal) => this.execution
-        ? this.execution.compact(attempt, signal)
+      compact: (signal) => this.execution
+        ? this.execution.compact(signal)
         : Promise.resolve({ ok: false, category: "operational" }),
       resume: (context) => {
         const resume = this.execution?.resume;
         if (!resume) throw new Error("Checkpoint resume adapter is not attached");
         return resume(context);
       },
-      delay: (milliseconds, signal) => this.execution?.delay
-        ? this.execution.delay(milliseconds, signal)
-        : defaultDelay(milliseconds, signal),
       progress: (event) => this.execution?.progress?.(event),
     });
   }

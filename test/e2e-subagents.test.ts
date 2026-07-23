@@ -156,7 +156,7 @@ describe.skipIf(cliMissing)(
     }
 
     it(
-      "retries and commits one real foreground-child compaction before returning one parent result",
+      "fails fast after one deterministic foreground-child compaction transaction",
       async () => {
         const child = (request: CapturedRequest) => request.sessionKind === "child";
         const parent = (request: CapturedRequest) => request.sessionKind === "main";
@@ -202,9 +202,7 @@ describe.skipIf(cliMissing)(
               when: (request) => child(request) && request.requestKind === "compaction",
               error: { status: 400, sticky: false, message: childErrorSentinels.join(" ") },
             },
-            { when: (request) => child(request) && request.requestKind === "compaction", text: "CHILD_SUMMARY_T05" },
-            { when: child, text: "CHILD_RESUMED_FINAL_T05" },
-            { when: parent, text: "PARENT_RECEIVED_CHILD_T05" },
+            { when: parent, text: "PARENT_RECEIVED_CHILD_FAILURE_T05" },
           ],
           prompt: "run the foreground child",
           modeArgs: ["--mode", "json", "-p", "run the foreground child"],
@@ -216,15 +214,13 @@ describe.skipIf(cliMissing)(
           "child/ordinary",
           "child/ordinary",
           "child/compaction",
-          "child/compaction",
-          "child/ordinary",
           "main/ordinary",
         ]);
         expect(fs.readFileSync(path.join(result.fixture, "child-a.txt"), "utf8")).toHaveLength(24_000);
         expect(fs.readFileSync(path.join(result.fixture, "child-b.txt"), "utf8")).toHaveLength(24_000);
         expect(fs.readFileSync(path.join(result.fixture, "child-c.txt"), "utf8")).toHaveLength(24_000);
         expect(fs.readFileSync(path.join(result.fixture, "child-d.txt"), "utf8")).toHaveLength(24_000);
-        expect(toolResultText(result.requests[6]!)).toContain("CHILD_RESUMED_FINAL_T05");
+        expect(toolResultText(result.requests[4]!)).toContain("paused and no continuation ran");
         const childSessionFiles: string[] = [];
         const walkSessions = (dir: string) => {
           for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -237,14 +233,13 @@ describe.skipIf(cliMissing)(
         expect(childSessionFiles).toHaveLength(1);
         const childEntries = SessionManager.open(childSessionFiles[0]!).getEntries();
         const childCompactions = childEntries.filter((entry) => entry.type === "compaction");
-        expect(childCompactions).toHaveLength(1);
-        expect((childCompactions[0] as { summary: string }).summary).toContain("CHILD_SUMMARY_T05");
+        expect(childCompactions).toHaveLength(0);
         const visible = `${result.stdout}\n${result.stderr}\n${JSON.stringify(childEntries)}`;
         for (const sentinel of childErrorSentinels) expect(visible).not.toContain(sentinel);
         const jsonEvents = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line) as any);
         const terminalParentMessages = jsonEvents.filter((event) =>
           event.type === "message_end" && event.message?.role === "assistant" &&
-          JSON.stringify(event.message.content).includes("PARENT_RECEIVED_CHILD_T05"));
+          JSON.stringify(event.message.content).includes("PARENT_RECEIVED_CHILD_FAILURE_T05"));
         expect(terminalParentMessages).toHaveLength(1);
       },
       TEST_TIMEOUT_MS,
