@@ -921,8 +921,8 @@ describe("session lifecycle hooks", () => {
     const pendingToasts = pi.notifications.filter((n) => n.text.includes("pending approval"));
     expect(pendingToasts).toHaveLength(1);
     const text = pendingToasts[0]!.text;
-    // One short self-contained line: server name, the enabling key, the
-    // /doctor pointer for the exact edit and the decline path.
+    // The bounded one-line notice carries the server name, least-authority keys,
+    // and /doctor pointer; /mcp also gives guidance.
     expect(text).not.toContain("\n");
     expect(text).toContain("example-server");
     expect(text).toContain("enabledMcpjsonServers");
@@ -946,9 +946,9 @@ describe("session lifecycle hooks", () => {
     // unapproved server renders as pending, and the retired static
     // ".mcp.json present" wording must be gone.
     expect(doctor).toContain("example-server: pending approval");
-    // De-duplicated: the posture line carries no enable/decline hint — the
-    // pending finding (registry note + evidence) is the canonical carrier of
-    // the exact edit now that startup is quiet.
+    // De-duplicated within /doctor: its posture line carries no enable/decline
+    // hint because the pending finding below carries that report's guidance.
+    // The dedicated /mcp report independently carries bounded guidance.
     const postureLine = doctor.split("\n").find((l) => l.startsWith("MCP servers:")) ?? "";
     expect(postureLine).not.toContain("enabledMcpjsonServers");
     expect(doctor).toContain('"enabledMcpjsonServers": ["example-server"]');
