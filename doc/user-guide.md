@@ -372,7 +372,7 @@ tracked project files):
 ## 6. Security & permission posture
 
 PiCC's posture is deliberately partial: it runs permissive by default, enforces `permissions.deny`
-and agent `tools:` gating for real, and parses-and-reports the rest rather than enforcing it. Before
+and agent `tools:` gating for real, and leaves other Claude permission controls unenforced. Before
 relying on a project's permissions or hooks, run `/doctor`: it reports project-specific
 compatibility findings and labels detected safety-relevant divergences. For the exhaustive registry
 view, the [supported-features matrix](supported-features.md) marks every safety-relevant entry,
