@@ -20,11 +20,11 @@ export const LINGER_FAILURE_MS = 60_000;
 export const MAX_PANEL_ROWS = 8;
 
 /** Display state of a panel row (drives glyph + bubble color + linger tier). */
-export type PanelRowState = "running" | "success" | "failed" | "stopped";
+export type PanelRowState = "running" | "waiting" | "success" | "failed" | "stopped";
 
 /**
  * Stable selection key. Discriminated: a background dispatch is addressed by
- * its task id (what t05's stop targets — and a resume mints a NEW generation,
+ * its task id (the stop authority — and a resume mints a NEW generation,
  * so a dismissed old generation never hides the new one), a task-less
  * (foreground/nested) dispatch by its agent id.
  */
@@ -47,12 +47,16 @@ export function selectionKeysEqual(
 
 /**
  * The background-task join info the model consumes: a structural subset of
- * `BackgroundTaskRecord`, so t04 can pass `registry.get(id)` results directly
- * without this module importing the task registry.
+ * `BackgroundTaskRecord`, so callers can pass `registry.get(id)` results
+ * directly without this module importing the task registry.
  */
 export interface PanelTaskInfo {
   id: string;
   status: "running" | "completed" | "failed" | "stopped";
+  /** Runtime-derived concurrency admission; absent compatibility data is admitted. */
+  admission?: "waiting" | "admitted";
+  /** Task-side terminal timestamp, including an immediate queued-stop timestamp. */
+  settledAt?: number;
   /** The dispatched child's identity — the join key against registry records. */
   agentId?: string;
 }
@@ -93,7 +97,7 @@ export interface PanelRowView {
   label: string;
   /** Validated Claude color name from agent frontmatter, when present. */
   color?: string;
-  /** Elapsed run time: now−startedAt while running, settledAt−startedAt after. */
+  /** End-to-end elapsed time: now−startedAt while active/waiting, frozen after stop/settle. */
   elapsedMs: number;
   /** Live-accumulated or settlement usage (settled wins); absent until known. */
   usage?: SubagentUsage;
@@ -113,6 +117,7 @@ export interface PanelViewModel {
   focused: boolean;
   /** Counts for the narrow-width summary line. */
   runningCount: number;
+  waitingCount: number;
   settledCount: number;
   /** True when nothing is running or lingering — the panel disappears. */
   empty: boolean;
@@ -131,7 +136,12 @@ export interface PanelComputeInput {
 
 /** Classified display state from the record + newest-generation task join. */
 function stateOf(record: SubagentRegistryRecord, task: PanelTaskInfo | undefined): PanelRowState {
-  if (record.state === "running") return "running";
+  // TaskStop publishes its terminal task-side status before a queued dispatch
+  // can settle its dispatch record. That stop must win presentation immediately.
+  if (task?.status === "stopped") return "stopped";
+  if (record.state === "running") {
+    return (task?.admission ?? record.admission) === "waiting" ? "waiting" : "running";
+  }
   if (record.userStopped) return "stopped";
   switch (record.outcome) {
     case "failed":
@@ -145,15 +155,29 @@ function stateOf(record: SubagentRegistryRecord, task: PanelTaskInfo | undefined
   }
   // Unclassified settle: fall back to the task-side status, else read as done.
   if (task?.status === "failed") return "failed";
-  if (task?.status === "stopped") return "stopped";
   return "success";
 }
 
-/** Linger deadline for a settled row; undefined while running or unsettled. */
-function expiryOf(record: SubagentRegistryRecord, state: PanelRowState): number | undefined {
-  if (state === "running" || record.settledAt === undefined) return undefined;
+/** Effective terminal endpoint; a task-side stop remains authoritative after dispatch cleanup. */
+function terminalAt(
+  record: SubagentRegistryRecord,
+  state: PanelRowState,
+  taskSettledAt: number | undefined,
+): number | undefined {
+  return state === "stopped" && taskSettledAt !== undefined ? taskSettledAt : record.settledAt;
+}
+
+/** Linger deadline for a terminal row; undefined while active or not yet timestamped. */
+function expiryOf(
+  record: SubagentRegistryRecord,
+  state: PanelRowState,
+  taskSettledAt: number | undefined,
+): number | undefined {
+  if (state === "running" || state === "waiting") return undefined;
+  const endpoint = terminalAt(record, state, taskSettledAt);
+  if (endpoint === undefined) return undefined;
   const linger = state === "success" ? LINGER_SUCCESS_MS : LINGER_FAILURE_MS;
-  return record.settledAt + linger;
+  return endpoint + linger;
 }
 
 /** Internal pre-window row: PanelRowView minus the window-dependent fields. */
@@ -162,6 +186,7 @@ interface FlatRow {
   key: PanelSelectionKey;
   keyId: string;
   taskId?: string;
+  taskSettledAt?: number;
   treeDepth: number;
   state: PanelRowState;
 }
@@ -248,7 +273,9 @@ export class SubagentPanelModel {
         if (j >= end) hiddenDescendants++;
       }
       const elapsedEnd =
-        flat.state === "running" ? nowMs : (record.settledAt ?? record.startedAt);
+        flat.state === "running" || flat.state === "waiting"
+          ? nowMs
+          : (terminalAt(record, flat.state, flat.taskSettledAt) ?? record.startedAt);
       rows.push({
         key: flat.key,
         keyId: flat.keyId,
@@ -267,7 +294,11 @@ export class SubagentPanelModel {
     }
 
     let runningCount = 0;
-    for (const r of flattened) if (r.state === "running") runningCount++;
+    let waitingCount = 0;
+    for (const r of flattened) {
+      if (r.state === "running") runningCount++;
+      else if (r.state === "waiting") waitingCount++;
+    }
     return {
       rows,
       totalRows: total,
@@ -275,7 +306,8 @@ export class SubagentPanelModel {
       hiddenBelow: total - end,
       focused: input.focused,
       runningCount,
-      settledCount: total - runningCount,
+      waitingCount,
+      settledCount: total - runningCount - waitingCount,
       empty: total === 0,
     };
   }
@@ -286,7 +318,7 @@ export class SubagentPanelModel {
    * freezes ALL removals). Tree: each visible record parents to its NEAREST
    * VISIBLE ancestor via the parentAgentId chain (an expired or dismissed
    * parent's still-visible children re-root rather than dangle); siblings sort
-   * running-before-settled, then by startedAt, then registration order
+   * admitted-running before waiting before settled, then by startedAt and registration order
    * (stable). Handles arbitrary depth; a parent cycle degrades to a root.
    */
   private flatten(input: PanelComputeInput): FlatRow[] {
@@ -310,9 +342,9 @@ export class SubagentPanelModel {
       const keyId = selectionKeyId(key);
       // Dismissal only hides non-running rows: dismissing a finished agent
       // must not hide it forever if it is later resumed (running again).
-      if (state !== "running" && dismissed?.has(keyId)) continue;
-      if (state !== "running" && !input.focused) {
-        const expiry = expiryOf(record, state);
+      if (state !== "running" && state !== "waiting" && dismissed?.has(keyId)) continue;
+      if (state !== "running" && state !== "waiting" && !input.focused) {
+        const expiry = expiryOf(record, state, task?.settledAt);
         if (expiry !== undefined && nowMs >= expiry) continue;
       }
       visible.set(record.agentId, {
@@ -320,6 +352,7 @@ export class SubagentPanelModel {
         key,
         keyId,
         taskId: task?.id,
+        taskSettledAt: task?.settledAt,
         treeDepth: 0,
         state,
         order: order++,
@@ -347,9 +380,10 @@ export class SubagentPanelModel {
       else children.set(parent, [row]);
     }
     const byGroupOrder = (a: FlatRow & { order: number }, b: FlatRow & { order: number }) => {
-      const aRun = a.state === "running" ? 0 : 1;
-      const bRun = b.state === "running" ? 0 : 1;
-      if (aRun !== bRun) return aRun - bRun;
+      const rank = (state: PanelRowState): number =>
+        state === "running" ? 0 : state === "waiting" ? 1 : 2;
+      const stateRank = rank(a.state) - rank(b.state);
+      if (stateRank !== 0) return stateRank;
       if (a.record.startedAt !== b.record.startedAt) return a.record.startedAt - b.record.startedAt;
       return a.order - b.order;
     };

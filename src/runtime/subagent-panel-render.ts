@@ -27,7 +27,7 @@ import {
  * is deliberately raw in the record and is sanitized ONLY here).
  */
 
-// --- glyphs and animation frames (exported so t04's widget and docs share them) ---
+// --- glyphs and animation frames shared by the passive and focused panels ---
 
 /** Spinner frames for a running row; the caller supplies the current frame. */
 export const PANEL_RUNNING_FRAMES: readonly string[] = [
@@ -43,6 +43,7 @@ export const PANEL_RUNNING_FRAMES: readonly string[] = [
   "⠏",
 ];
 /** Finished-state bubbles — distinct glyphs, not color-alone. */
+export const PANEL_GLYPH_WAITING = "◌";
 export const PANEL_GLYPH_SUCCESS = "●";
 export const PANEL_GLYPH_FAILED = "✗";
 export const PANEL_GLYPH_STOPPED = "■";
@@ -50,6 +51,7 @@ export const PANEL_GLYPH_STOPPED = "■";
 /** Theme slot per row state (bubble color). */
 const STATE_COLOR: Record<PanelRowView["state"], string> = {
   running: "accent",
+  waiting: "warning",
   success: "success",
   failed: "error",
   stopped: "warning",
@@ -59,6 +61,8 @@ function stateGlyph(state: PanelRowView["state"], runningFrame: string | undefin
   switch (state) {
     case "running":
       return runningFrame || PANEL_RUNNING_FRAMES[0]!;
+    case "waiting":
+      return PANEL_GLYPH_WAITING;
     case "success":
       return PANEL_GLYPH_SUCCESS;
     case "failed":
@@ -108,19 +112,19 @@ export function tintAgentColor(color: string | undefined, text: string): string 
   return code ? `${code}${text}${FG_RESET}` : text;
 }
 
-// --- hint / affordance lines (t05 and the docs reuse these exact strings) ---
+// --- hint / affordance lines shared across panel surfaces ---
 
 /**
  * The unfocused footer hint. CONTRACT: it names the entry chord — for a
  * single-agent run this line is the user's only discovery path into the panel
  * (the one-time status-line hint fires only for >1 agent). The chord string is
- * injected by the caller (t04 owns the chord constant).
+ * injected by the caller, whose shortcut registration owns the constant.
  */
 export function panelHintUnfocused(entryChord: string): string {
   return `${entryChord}: agent panel`;
 }
 
-/** The focused footer hint: the panel's key map (t05 binds these keys). */
+/** The focused footer hint: the focused component's key map. */
 export const PANEL_HINT_FOCUSED =
   "↑↓ select · enter open · x stop · X stop all · d dismiss · esc close";
 
@@ -153,7 +157,7 @@ export interface PanelRenderOptions {
   theme?: unknown;
   /** Current spinner frame for running rows (caller animates). */
   runningFrame?: string;
-  /** The panel entry chord string, e.g. "alt+a" (t04's constant). */
+  /** The panel entry chord string, e.g. "alt+a". */
   entryChord: string;
 }
 
@@ -243,13 +247,14 @@ function renderPanelRow(
   // The description falls back to agentName; when it IS the agent name the
   // type segment already shows it — render no duplicate.
   const hasLabel = labelText !== "" && labelText !== typeText;
+  const stateLabel: Seg | undefined = row.state === "waiting" ? muted(" · waiting") : undefined;
   const elapsed: Seg = muted(` · ${formatElapsed(row.elapsedMs)}`);
   // Usage is absent until known — a fake zero is worse than no figure.
   const usageText = row.usage ? formatUsageCompact(row.usage) : undefined;
   const usage: Seg | undefined = usageText ? muted(` · ${usageText}`) : undefined;
 
   const labelSeg = (text: string): Seg => muted(` · ${text}`);
-  const fixed = [marker, indent, glyph, type, task, chip, elapsed, usage];
+  const fixed = [marker, indent, glyph, type, task, chip, stateLabel, elapsed, usage];
   if (segWidth(fixed) <= width) {
     if (!hasLabel) return segJoin(fixed);
     const room = width - segWidth(fixed) - 3; // description separator
@@ -260,7 +265,7 @@ function renderPanelRow(
 
   // Constrained fixed-metadata fallback. Fit identity inside its own measured
   // slot; never let the final clamp splice usage directly into a type or id.
-  const surrounding = [marker, indent, glyph, chip, elapsed, usage];
+  const surrounding = [marker, indent, glyph, chip, stateLabel, elapsed, usage];
   const identityRoom = width - segWidth(surrounding);
   const taskSyntaxWidth = task ? visibleWidth(" []") : 0;
   const minimumIdentityWidth = task ? taskSyntaxWidth + 2 : 1;
@@ -272,7 +277,7 @@ function renderPanelRow(
       plain: fittedType,
       styled: theme ? tintAgentColor(row.color, fittedType) : fittedType,
     };
-    return segJoin([marker, indent, glyph, fitted, chip, elapsed, usage]);
+    return segJoin([marker, indent, glyph, fitted, chip, stateLabel, elapsed, usage]);
   }
 
   const contentRoom = identityRoom - taskSyntaxWidth;
@@ -291,6 +296,7 @@ function renderPanelRow(
     fittedType,
     muted(` [${fittedTaskText}]`),
     chip,
+    stateLabel,
     elapsed,
     usage,
   ]);
@@ -298,13 +304,15 @@ function renderPanelRow(
 
 /** The whole-panel single line for very narrow terminals. */
 function renderSummaryLine(view: PanelViewModel, opts: PanelRenderOptions): string {
-  const glyphText =
-    view.runningCount > 0
-      ? stateGlyph("running", opts.runningFrame)
+  const glyphText = view.runningCount > 0
+    ? stateGlyph("running", opts.runningFrame)
+    : view.waitingCount > 0
+      ? PANEL_GLYPH_WAITING
       : PANEL_GLYPH_SUCCESS;
-  const glyphColor = view.runningCount > 0 ? "accent" : "success";
+  const glyphColor = view.runningCount > 0 ? "accent" : view.waitingCount > 0 ? "warning" : "success";
   const parts: string[] = [];
   if (view.runningCount > 0) parts.push(`${view.runningCount} running`);
+  if (view.waitingCount > 0) parts.push(`${view.waitingCount} waiting`);
   if (view.settledCount > 0) parts.push(`${view.settledCount} done`);
   return (
     `${themedFg(opts.theme, glyphColor, glyphText)} ` +
@@ -334,6 +342,15 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
   lines.push(...renderedRows.filter((row): row is string => row !== undefined));
   if (view.hiddenBelow > 0) {
     lines.push(themedFg(opts.theme, "muted", panelMoreBelow(view.hiddenBelow)));
+  }
+  if (view.waitingCount > 0) {
+    lines.push(
+      themedFg(
+        opts.theme,
+        "muted",
+        `${view.runningCount} running · ${view.waitingCount} waiting`,
+      ),
+    );
   }
   lines.push(
     themedFg(
@@ -383,6 +400,7 @@ export function detailPromptCollapsed(lineCount: number): string {
   return `initial prompt (${lineCount} line${lineCount === 1 ? "" : "s"}) — ${DETAIL_PROMPT_KEY} to expand`;
 }
 export const DETAIL_PROMPT_EXPANDED = `initial prompt — ${DETAIL_PROMPT_KEY} to collapse`;
+export const DETAIL_WAITING = "Waiting for configured concurrency capacity; no agent session has started yet.";
 export const DETAIL_NO_ACTIVITY = "(no detail events captured yet)";
 export const DETAIL_NO_FINAL_ANSWER = "(no final answer captured)";
 export const DETAIL_NO_PARTIAL_OUTPUT = "(no partial output captured before failure)";
@@ -511,6 +529,9 @@ export interface PanelDetailData {
   record?: SubagentRegistryRecord;
   /** Newest-generation background task id, when the agent has one. */
   taskId?: string;
+  taskStatus?: "running" | "completed" | "failed" | "stopped";
+  taskAdmission?: "waiting" | "admitted";
+  taskSettledAt?: number;
   nowMs: number;
 }
 
@@ -551,15 +572,20 @@ function tailToWidth(text: string, maxCols: number): string {
 }
 
 /**
- * Steer availability for display. The authoritative predicate is t01's
+ * Steer availability for display. The authoritative predicate is
  * guardSteer (the send path uses ONLY its bound steer fn); this maps the same
  * ordering onto short display reasons, and the foreground case names the real
  * alternative rather than a dead end.
  */
 type DetailSteerSlot = { kind: "input" } | { kind: "notice"; text: string } | { kind: "none" };
 
-function detailSteerSlot(record: SubagentRegistryRecord): DetailSteerSlot {
-  if (record.state !== "running") return { kind: "none" };
+function detailSteerSlot(
+  record: SubagentRegistryRecord,
+  operational: boolean,
+  waiting: boolean,
+): DetailSteerSlot {
+  if (!operational) return { kind: "none" };
+  if (waiting) return { kind: "notice", text: detailSteerUnavailable("waiting for capacity") };
   if (guardSteer(record).ok) return { kind: "input" };
   if (record.oneShot) return { kind: "notice", text: detailSteerUnavailable("one-shot agent") };
   if (record.userStopped) {
@@ -600,14 +626,20 @@ export function renderSubagentDetail(
     return { lines: clampLines(lines, width), maxScroll: 0 };
   }
 
-  const running = record.state === "running";
-  const rowState: PanelRowView["state"] = running
-    ? "running"
-    : record.userStopped || record.outcome === "aborted"
-      ? "stopped"
-      : record.outcome === "failed"
-        ? "failed"
-        : "success";
+  const taskStopped = data.taskStatus === "stopped";
+  const operational = record.state === "running" && !taskStopped;
+  const waiting = operational && (data.taskAdmission ?? record.admission) === "waiting";
+  const rowState: PanelRowView["state"] = taskStopped
+    ? "stopped"
+    : waiting
+      ? "waiting"
+      : operational
+        ? "running"
+        : record.userStopped || record.outcome === "aborted"
+          ? "stopped"
+          : record.outcome === "failed"
+            ? "failed"
+            : "success";
   const glyphText = stateGlyph(rowState, opts.runningFrame);
   // agentName is the one deliberately-raw record field — sanitize at render.
   const typeText = sanitizeLine(record.agentName, TYPE_RENDER_CAP) || "agent";
@@ -617,15 +649,23 @@ export function renderSubagentDetail(
       (theme ? tintAgentColor(record.color, typeText) : typeText) +
       (labelText && labelText !== typeText ? muted(` · ${labelText}`) : ""),
   );
-  const elapsedEnd = running ? data.nowMs : (record.settledAt ?? record.startedAt);
+  const elapsedEnd = operational
+    ? data.nowMs
+    : (taskStopped && data.taskSettledAt !== undefined
+      ? data.taskSettledAt
+      : (record.settledAt ?? record.startedAt));
   // Defense-in-depth consistency: agentId and the outcome word are typed
   // unions/ids today, but the meta line sanitizes every interpolated field
   // like the rest of the view instead of trusting record shape.
-  const statusWord = running
-    ? "running"
-    : record.userStopped
-      ? "stopped by user"
-      : sanitizeLine(record.outcome ?? "settled", 60);
+  const statusWord = taskStopped
+    ? record.userStopped ? "stopped by user" : "stopped"
+    : waiting
+      ? "waiting"
+      : operational
+        ? "running"
+        : record.userStopped
+          ? "stopped by user"
+          : sanitizeLine(record.outcome ?? "settled", 60);
   const meta: string[] = [sanitizeLine(record.agentId, 60)];
   if (data.taskId) meta.push(sanitizeLine(data.taskId, 60));
   meta.push(formatElapsed(Math.max(0, elapsedEnd - record.startedAt)), statusWord);
@@ -703,7 +743,10 @@ export function renderSubagentDetail(
       }
     }
   };
-  if (running) {
+  if (waiting) {
+    body.push(muted(DETAIL_WAITING));
+    pushPrompt();
+  } else if (operational) {
     // The collapsed one-liner stays pinned above the following viewport.
     if (promptLines.length > 0 && !ui.promptExpanded) {
       lines.push(muted(detailPromptCollapsed(promptLines.length)));
@@ -711,7 +754,7 @@ export function renderSubagentDetail(
     if (ui.promptExpanded) pushPrompt();
     pushDetailEntries();
   } else {
-    const stopped = record.userStopped || record.outcome === "aborted";
+    const stopped = taskStopped || record.userStopped || record.outcome === "aborted";
     const failed = record.outcome === "failed";
     const outputLabel = stopped
       ? DETAIL_DISCARDED_LABEL
@@ -740,7 +783,7 @@ export function renderSubagentDetail(
   if (ui.notice) {
     lines.push(themedFg(theme, "warning", sanitizeLine(ui.notice, DETAIL_FIELD_MAX_LENGTH)));
   }
-  const slot = detailSteerSlot(record);
+  const slot = detailSteerSlot(record, operational, waiting);
   if (slot.kind === "input") {
     const avail = Math.max(0, width - visibleWidth(DETAIL_STEER_PREFIX));
     lines.push(themedFg(theme, "accent", DETAIL_STEER_PREFIX) + tailToWidth(ui.steerBuffer, avail));
@@ -751,7 +794,7 @@ export function renderSubagentDetail(
     muted(
       detailHint({
         steerable: slot.kind === "input",
-        stoppable: running && data.taskId !== undefined,
+        stoppable: operational && data.taskId !== undefined,
       }),
     ),
   );

@@ -1,4 +1,4 @@
-import type { SubagentRegistry } from "./subagent-registry.js";
+import type { SubagentRegistry, SubagentRegistryRecord } from "./subagent-registry.js";
 import {
   SubagentPanelModel,
   type PanelTaskInfo,
@@ -52,6 +52,8 @@ export interface SubagentPanelWidgetDeps {
   registry: SubagentRegistry;
   /** Background-task join info in registration order (newest generation last). */
   tasks: () => readonly PanelTaskInfo[];
+  /** Task-registry notification for status/admission-only presentation changes. */
+  onTasksChange?: (listener: () => void) => () => void;
   /** Injected clock (tests); defaults to Date.now. */
   now?: () => number;
   tickMs?: number;
@@ -105,13 +107,22 @@ export class SubagentPanelWidgetController {
     }
     if (!this.subscribed) {
       this.subscribed = true;
-      this.deps.registry.onChange(() => this.sync());
+      try {
+        this.deps.registry.onChange(() => this.sync());
+      } catch {
+        // A missing registry repaint source must not block the task source.
+      }
+      try {
+        this.deps.onTasksChange?.(() => this.sync());
+      } catch {
+        // The periodic tick remains a display-only fallback.
+      }
     }
     this.sync();
   }
 
   /**
-   * Suppression seam for the focused panel component (t05): while the
+   * Suppression seam for the focused panel component: while the
    * interactive list/drill-down is open the passive widget is hidden, so the
    * user never sees the agent list twice. Unsuppressing re-installs when rows
    * are visible.
@@ -227,9 +238,50 @@ export class SubagentPanelWidgetController {
   }
 }
 
+export interface PanelAgentCounts {
+  running: number;
+  waiting: number;
+}
+
+/**
+ * Count active agents from newest task generations. Background task admission
+ * is authoritative; the registry's pre-task running record is intentionally
+ * ignored unless it has a live session and therefore represents foreground
+ * work.
+ */
+export function panelAgentCounts(
+  records: readonly SubagentRegistryRecord[],
+  tasks: readonly PanelTaskInfo[],
+): PanelAgentCounts {
+  const newestByAgent = new Map<string, PanelTaskInfo>();
+  for (const task of tasks) {
+    if (task.agentId) newestByAgent.set(task.agentId, task);
+  }
+  let running = 0;
+  let waiting = 0;
+  for (const task of newestByAgent.values()) {
+    if (task.status !== "running") continue;
+    if ((task.admission ?? "admitted") === "waiting") waiting++;
+    else running++;
+  }
+  for (const record of records) {
+    if (
+      !newestByAgent.has(record.agentId) &&
+      record.state === "running" &&
+      !record.userStopped &&
+      record.session !== undefined
+    ) {
+      running++;
+    }
+  }
+  return { running, waiting };
+}
+
 /** The one-time status-line hint advertising the panel-entry chord. */
-export function panelHintText(runningCount: number, chord: string): string {
-  return `${runningCount} agents running — press ${chord} to manage`;
+export function panelHintText(counts: PanelAgentCounts, chord: string): string {
+  const parts = [`${counts.running} running`];
+  if (counts.waiting > 0) parts.push(`${counts.waiting} waiting`);
+  return `${parts.join(" · ")} — press ${chord} to manage agents`;
 }
 
 export interface PanelHintEmitterDeps {
@@ -242,20 +294,20 @@ export interface PanelHintEmitterDeps {
 }
 
 /**
- * Gated emitter for the one-time panel hint. Call it with the current running
- * agent count whenever that count may have grown; it emits at most once per
+ * Gated emitter for the one-time panel hint. Call it with the current admitted
+ * and waiting counts whenever either may have grown; it emits at most once per
  * emitter (= per session), only in TUI mode, and only when MORE THAN ONE agent
- * runs concurrently (a single dispatch needs no fan-out management, and the
+ * is accepted (a single dispatch needs no fan-out management, and the
  * unfocused panel hint line already advertises the chord). A gated-off call
  * does not consume the once-gate. Built here so the gating is testable; the
  * panel-focus task wires the call site — the hint must not appear before the
  * chord actually works.
  */
-export function createPanelHintEmitter(deps: PanelHintEmitterDeps): (runningCount: number) => void {
+export function createPanelHintEmitter(deps: PanelHintEmitterDeps): (counts: PanelAgentCounts) => void {
   let emitted = false;
-  return (runningCount: number): void => {
-    if (emitted || runningCount <= 1 || !deps.isTui()) return;
+  return (counts: PanelAgentCounts): void => {
+    if (emitted || counts.running + counts.waiting <= 1 || !deps.isTui()) return;
     emitted = true;
-    deps.emit(panelHintText(runningCount, deps.chord));
+    deps.emit(panelHintText(counts, deps.chord));
   };
 }
