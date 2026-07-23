@@ -111,8 +111,12 @@ export interface PanelViewModel {
   hiddenAbove: number;
   hiddenBelow: number;
   focused: boolean;
-  /** Counts for the narrow-width summary line. */
+  /** Pre-window state counts for the aggregate fallback. */
   runningCount: number;
+  failedCount: number;
+  stoppedCount: number;
+  completedCount: number;
+  /** Compatibility aggregate for consumers that only distinguish settled rows. */
   settledCount: number;
   /** True when nothing is running or lingering — the panel disappears. */
   empty: boolean;
@@ -267,7 +271,25 @@ export class SubagentPanelModel {
     }
 
     let runningCount = 0;
-    for (const r of flattened) if (r.state === "running") runningCount++;
+    let failedCount = 0;
+    let stoppedCount = 0;
+    let completedCount = 0;
+    for (const row of flattened) {
+      switch (row.state) {
+        case "running":
+          runningCount++;
+          break;
+        case "failed":
+          failedCount++;
+          break;
+        case "stopped":
+          stoppedCount++;
+          break;
+        case "success":
+          completedCount++;
+          break;
+      }
+    }
     return {
       rows,
       totalRows: total,
@@ -275,7 +297,10 @@ export class SubagentPanelModel {
       hiddenBelow: total - end,
       focused: input.focused,
       runningCount,
-      settledCount: total - runningCount,
+      failedCount,
+      stoppedCount,
+      completedCount,
+      settledCount: failedCount + stoppedCount + completedCount,
       empty: total === 0,
     };
   }

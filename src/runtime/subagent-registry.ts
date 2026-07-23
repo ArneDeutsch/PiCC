@@ -1,4 +1,5 @@
 import { isAgentId } from "../util/subagent-transcripts.js";
+import { normalizeAgentColor, type AgentColorName } from "./agent-color.js";
 import {
   assistantTextFingerprint,
   sanitizeLine,
@@ -7,6 +8,9 @@ import {
   type ProgressSnapshot,
   type SubagentDetailEntry,
 } from "./subagent-progress.js";
+
+export { AGENT_COLOR_NAMES, normalizeAgentColor } from "./agent-color.js";
+export type { AgentColorName } from "./agent-color.js";
 
 /**
  * Dispatch registry: the in-memory source of truth for what a subagent ID or
@@ -79,30 +83,6 @@ export const SUBAGENT_PROMPT_CAP = 4096;
 export const SUBAGENT_FINAL_TEXT_CAP = 16_384;
 /** Single-line cap for the stored Agent-tool `description` label. */
 const DESCRIPTION_CAP = 120;
-
-/**
- * Claude Code's fixed agent-frontmatter color-name set (the /agents picker
- * palette). Anything else is dropped at capture — hostile frontmatter must
- * never reach a renderer as a raw string. Exported as the whitelist the
- * render-side ANSI palette (`AGENT_COLOR_ANSI` in subagent-panel-render.ts)
- * is test-pinned against.
- */
-export const AGENT_COLOR_NAMES: ReadonlySet<string> = new Set([
-  "red",
-  "blue",
-  "green",
-  "yellow",
-  "purple",
-  "orange",
-  "pink",
-  "cyan",
-]);
-
-/** The validated (lowercased) color name, or undefined for anything off-palette. */
-function validAgentColor(color: string | undefined): string | undefined {
-  const normalized = color?.trim().toLowerCase();
-  return normalized && AGENT_COLOR_NAMES.has(normalized) ? normalized : undefined;
-}
 
 /**
  * Multi-line conversation content sanitized (escape/control stripping, newlines
@@ -201,7 +181,7 @@ export interface SubagentRegistryRecord {
    * Agent frontmatter `color:`, validated at capture against Claude's fixed
    * color-name set (off-palette values are dropped, never stored raw); set-once.
    */
-  color?: string;
+  color?: AgentColorName;
   /**
    * Latest bounded live-progress snapshot, mirrored via `noteProgress` from
    * EVERY dispatch's condenser subscription (foreground, background, nested,
@@ -319,7 +299,7 @@ export class SubagentRegistry {
       existing.parentAgentId ??= input.parentAgentId;
       existing.description ??= boundedDescription(input.description);
       existing.prompt ??= boundedContent(input.prompt, SUBAGENT_PROMPT_CAP);
-      existing.color ??= validAgentColor(input.color);
+      existing.color ??= normalizeAgentColor(input.color);
       this.notifyChange();
       return existing;
     }
@@ -340,7 +320,7 @@ export class SubagentRegistry {
       description: boundedDescription(input.description),
       startedAt: Date.now(),
       prompt: boundedContent(input.prompt, SUBAGENT_PROMPT_CAP),
-      color: validAgentColor(input.color),
+      color: normalizeAgentColor(input.color),
     };
     this.records.set(input.agentId, record);
     // Name → ID index with original-binding tracking. A name reused for a NEW
