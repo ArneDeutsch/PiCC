@@ -107,8 +107,9 @@ You can also dispatch any of them directly when you want one specialist's read o
 
 Deliberately out of scope — each for a reason, not from neglect:
 
-- **MCP.** Pi is MCP-averse by design, the surface is large, and the seam is clean enough that this
-  stays a decision we can revisit rather than one that leaks.
+- **Full MCP surface parity.** Local stdio MCP servers run with Claude-compatible tool exposure;
+  the remaining MCP surfaces (remote transports, prompts/resources, and more) are deferred — the
+  capability matrix ([doc/supported-features.md](doc/supported-features.md)) records each tier.
 - **Plan mode.** Users plan through their own skills, with review cycles that fit their project.
 - **`AskUserQuestion`.** Chat already suffices.
 - **Plugin installation / marketplace.** PiCC loads installed plugins' *content*; it does not

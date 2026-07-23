@@ -62,14 +62,15 @@
     "@earendil-works/pi-ai": "^0.80.10",
     "@earendil-works/pi-coding-agent": "^0.80.10",
     "@earendil-works/pi-tui": "^0.80.10",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "picomatch": "^4.0.5",
     "typebox": "1.1.38",
     "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
-    "@vitest/coverage-v8": "^4.1.10",
     "@types/picomatch": "^4.0.3",
+    "@vitest/coverage-v8": "^4.1.10",
     "tsx": "^4.23.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"

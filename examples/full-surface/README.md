@@ -33,7 +33,7 @@ Coverage map (each canary string is asserted by tests):
 | Worktree seeding | `.worktreeinclude`, WorktreeCreate hook | `.worktree-seeded` |
 | cwd-swap detectability | `tools/preflight.sh` | `mode=worktree` |
 | Unknown settings keys | `futureUnknownSetting`, `outputStyle` | compat report |
-| `.mcp.json` degradation | `.mcp.json` | compat report |
+| MCP pending-approval gate (unapproved project server) | `.mcp.json` (`example-server`) | compat report + pending notice |
 | Project-bundled plugin | `.claude-plugin/` | `FS-PLUGIN-SKILL-BODY` |
 
 The background command documents the directional settlement guidance (focused runtime tests prove the

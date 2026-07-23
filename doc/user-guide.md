@@ -133,6 +133,7 @@ managed):
 | Agents | `.claude/agents/*.md` (+ user scope) plus the built-in `general-purpose`, `Explore`, and `Plan` types — dispatchable via the `Agent` tool |
 | Settings | `.claude/settings.json`, `settings.local.json`, `~/.claude/settings.json`, managed policy |
 | Hooks | `settings.json` `hooks` (+ plugin hooks, + skill- and agent-scoped `hooks:`) |
+| MCP servers | `.mcp.json` + settings `mcpServers`; project-scope servers pending until approved |
 | Plugins | already-installed plugins from `~/.claude/plugins` + project-bundled `.claude-plugin/` |
 
 > **Auto memory is conservative by default.** PiCC loads `MEMORY.md` every session but writes to
@@ -370,6 +371,8 @@ tracked project files):
 | `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | Force **every** `Agent`/`Task` dispatch to the foreground (background is otherwise the default). `SendMessage` resume is inherently async and is **not** governed by this switch |
 | `CLAUDE_CODE_FORK_SUBAGENT` | Gate `subagent_type: "fork"` dispatch (inherit the parent conversation instead of starting fresh): `1` forces it on, `0` off. **Left unset it is enabled** — a deliberate PiCC choice. Inheritance is honored only for a **main-session** dispatch; nested, print-mode, and `isolation: worktree` forks run with fresh context and say so on the result |
 | `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` | Remove the built-in `Explore`/`Plan` agent types (`general-purpose` always stays) |
+| `MCP_TIMEOUT` | MCP server connect timeout in ms (default `30000` — 30 s, Claude parity) |
+| `MCP_TOOL_TIMEOUT` | MCP tool-call timeout in ms when a server entry sets no `timeout` (default ~28 h, Claude parity; values clamped to [1 s, ~24.8 d]) |
 | `SLASH_COMMAND_TOOL_CHAR_BUDGET` | Override the startup skill-listing character budget |
 
 ## 6. Security & permission posture
@@ -406,6 +409,13 @@ argument, which makes it best-effort — Claude Code's own limit, not a PiCC gap
    `MultiEdit`; the cross in rule 1 applies to a path-scoped rule only.
 3. **A shell read needs its own `Bash(...)` deny.** `Bash(cat secrets/x)` is not covered by any
    `Read` rule.
+
+**MCP servers.** Project-scope MCP servers (`.mcp.json`, or `mcpServers` in the committed
+`.claude/settings.json`) are pending by default and never start until you approve them. Approve in
+`.claude/settings.local.json` with `"enableAllProjectMcpServers": true` or a named
+`"enabledMcpjsonServers"` list; decline with `"disabledMcpjsonServers"`, which always wins and
+silences the pending notice. If `settings.local.json` is git-tracked, its approvals are ignored —
+untrack it (`git rm --cached .claude/settings.local.json`) to restore them.
 
 ## 7. What is and isn't supported
 
@@ -447,6 +457,7 @@ behaviors worth knowing:
 | Skill shell injection prints `[shell execution disabled: …]` | project set `disableSkillShellExecution`; that's the project's intent |
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
+| MCP pending-approval notice at every startup | Approve the server(s) — `enabledMcpjsonServers` (or `enableAllProjectMcpServers`) in `.claude/settings.local.json` — or list them in `disabledMcpjsonServers` to decline; `/doctor` shows the exact edit |
 | Session died at high context / "input exceeds the context window" | Lower `proactiveCompactPercent` in `.claude/.picc/config.json` so PiCC compacts earlier (see Harness configuration above) |
 | Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | Reopen the exact persisted session before recovery; an ephemeral headless session instead requires a replacement session and resent input. For operational exhaustion, run `/compact`, then explicitly continue. For a hook block, repair/disable the hook or allow manual compaction first. For any post-commit restoration/startup failure, do **not** compact again; start a new session and resend retained input. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories `checkpoint-exhausted` and `checkpoint-resumed`; RPC acknowledgement, print stdout, and print exit status do not prove logical completion. |
 | `picc -p` finished but a subagent's output never appeared | Background is the default and a one-shot print run has no next turn to deliver it on. Set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for scripted runs, or collect with `TaskOutput` before the run ends. |

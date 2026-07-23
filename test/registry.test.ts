@@ -26,6 +26,8 @@ import type {
   ClaudeProject,
   ClaudeSettings,
   ClaudeSkill,
+  ResolvedMcpConfig,
+  ResolvedMcpServer,
   SourceRef,
   SupportTier,
 } from "../src/types.js";
@@ -109,6 +111,24 @@ function makeProject(overrides: Partial<ClaudeProject> = {}): ClaudeProject {
   };
 }
 
+function makeMcpServer(
+  overrides: Partial<ResolvedMcpServer> & Pick<ResolvedMcpServer, "name" | "status">,
+): ResolvedMcpServer {
+  return {
+    source: ".mcp.json",
+    command: "",
+    args: [],
+    env: {},
+    rawCommand: "",
+    diagnostics: [],
+    ...overrides,
+  };
+}
+
+function makeMcp(overrides: Partial<ResolvedMcpConfig> = {}): ResolvedMcpConfig {
+  return { servers: [], diagnostics: [], ...overrides };
+}
+
 const tempDirs: string[] = [];
 function makeTempDir(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-registry-test-"));
@@ -185,10 +205,96 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(worktreeCreate).toContain("tool result remain truthful");
   });
 
-  it("marks MCP tools degraded-noop with safetyRelevant false", () => {
+  // Re-tiered by the stdio MCP slice: mcp__* names are LIVE, deny-enforced
+  // tools now, and safety-relevant because deny rules gate real calls.
+  it("marks MCP tools partial (live stdio tools) with safetyRelevant true", () => {
     const mcp = lookupCapability("tool.mcp__*");
-    expect(mcp?.tier).toBe("degraded-noop");
-    expect(mcp?.safetyRelevant).toBe(false);
+    expect(mcp?.tier).toBe("partial");
+    expect(mcp?.safetyRelevant).toBe(true);
+    expect(mcp?.note).toContain("stdio");
+    // Claude-parity naming vs PiCC's stricter server-name gate.
+    expect(mcp?.note).toContain("sanitized underscore-style like Claude");
+    // The empty-after-sanitize drop is PiCC's own floor, stated OUTSIDE the
+    // binary-verified parenthetical (Claude never drops a tool name).
+    expect(mcp?.note).toContain("PiCC's own floor");
+    expect(mcp?.note).toContain("drop-with-diagnostic");
+    // Deny-only posture and context removal.
+    expect(mcp?.note).toContain("REMOVE the tools from the model's context");
+    expect(mcp?.note).toContain("allow/ask stay no-ops");
+    expect(mcp?.note).toContain("case-sensitive");
+    // Subagent freeze divergence.
+    expect(mcp?.note).toContain("FROZEN at dispatch");
+    // Schema & content divergences (binary-verified).
+    expect(mcp?.note).toContain("permissive object schema");
+    expect(mcp?.note).toContain("STDERR-ONLY");
+    expect(mcp?.note).toContain("Claude passes schemas through verbatim");
+    expect(mcp?.note).toContain("NOT a containment guarantee");
+    expect(mcp?.note).toContain("structuredContent is ignored");
+  });
+
+  it("re-tiers the MCP settings keys and gate/runtime features truthfully", () => {
+    expect(lookupCapability("setting.mcpServers")?.tier).toBe("partial");
+    expect(lookupCapability("setting.enableAllProjectMcpServers")?.tier).toBe("partial");
+    expect(lookupCapability("setting.enabledMcpjsonServers")?.tier).toBe("partial");
+    // Honored from every scope, always wins — nothing partial about it.
+    expect(lookupCapability("setting.disabledMcpjsonServers")?.tier).toBe("full");
+    // Sanitized-compare parity (binary-verified) is stated on both list keys.
+    expect(lookupCapability("setting.enabledMcpjsonServers")?.note).toContain("name sanitizer");
+    expect(lookupCapability("setting.disabledMcpjsonServers")?.note).toContain("name sanitizer");
+
+    const mcp = lookupCapability("feature.mcp");
+    expect(mcp?.tier).toBe("partial");
+    // Binary-verified parity facts must be stated as parity, not PiCC additions.
+    expect(mcp?.note).toContain("CLAUDE_CODE_SESSION_ID");
+    expect(mcp?.note).toContain("NOT a PiCC addition");
+    expect(mcp?.note).toContain("binary-verified Claude parity");
+    expect(mcp?.note).toContain("main checkout");
+    // cwd-pinning is EFFECTIVE parity, not verified passed-cwd behavior.
+    expect(mcp?.note).toContain("Claude passes no cwd");
+    expect(mcp?.note).toContain("NO MCP context of any kind");
+
+    const gate = lookupCapability("feature.mcp-project-approval");
+    expect(gate?.tier).toBe("partial");
+    expect(gate?.note).toContain("not Claude Code's interactive trust dialog");
+    expect(gate?.note).toContain("git-tracked settings.local.json is demoted");
+    expect(gate?.note).toContain("one-time session-start notice");
+    expect(gate?.note).toContain("decline path");
+    // Plain-language rationale only — the "vision-warning precedent" insider
+    // phrase is a code-comment fact, not user-visible note text.
+    expect(gate?.note).not.toContain("vision-warning");
+  });
+
+  it("carries explicit deferred entries for the non-stdio MCP surfaces", () => {
+    for (const id of [
+      "feature.mcp-remote-transports",
+      "feature.mcp-oauth",
+      "feature.mcp-headers-helper",
+      "feature.mcp-prompts",
+      "feature.mcp-resources",
+      "feature.mcp-tool-search",
+      "feature.mcp-list-changed",
+      "feature.mcp-elicitation",
+      "feature.mcp-roots",
+      "feature.mcp-channels",
+      "feature.mcp-managed-config",
+      "feature.mcp-connectors",
+      "feature.mcp-claude-json-scopes",
+      "feature.mcp-output-token-cap",
+      "feature.mcp-idle-timeout",
+      "feature.mcp-auto-background",
+      "feature.mcp-plugin-servers",
+    ]) {
+      const entry = lookupCapability(id);
+      expect(entry, id).toBeDefined();
+      expect(entry?.tier, id).toBe("not-supported");
+    }
+    // The blanket "MCP deferred" wording is swept off entries whose surface now
+    // partially runs; each names its specific deferred surface instead.
+    expect(lookupCapability("hook.event.mcp__elicitation")?.note).toContain("feature.mcp-elicitation");
+    expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inherit the SESSION's MCP tools");
+    expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("stdio MCP tools themselves run");
+    // Plugin MCP servers: deferred entry + qualifying clause on the plugins claim.
+    expect(lookupCapability("feature.plugins-content")?.note).toContain("feature.mcp-plugin-servers");
   });
 
   it("covers the core tool surface as full and TodoWrite as partial", () => {
@@ -561,12 +667,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       expect(cap.tier, name).toBe("degraded-noop");
       expect(lookupCapability(`tool.${name}`), name).toBeDefined();
     }
-    // Every degraded-noop tool entry (except the MCP wildcard) describes a stub
-    // that actually ships — no notes about stubs that don't exist.
+    // Every degraded-noop tool entry describes a stub that actually ships — no
+    // notes about stubs that don't exist. (The MCP wildcard no longer needs an
+    // exemption: mcp__* is a live partial tool surface now, not a stub.)
     const stubNames = new Set(DEGRADED_TOOLS.map((d) => d.name));
     for (const entry of CAPABILITY_REGISTRY) {
       if (entry.kind !== "tool" || entry.tier !== "degraded-noop") continue;
-      if (entry.id === "tool.mcp__*") continue;
       expect(stubNames.has(entry.id.slice("tool.".length)), entry.id).toBe(true);
     }
     // TaskOutput/TaskStop are REAL tools now, though partial for
@@ -694,8 +800,8 @@ describe("capabilityForToolName", () => {
   it("resolves mcp__* names to the MCP wildcard entry", () => {
     const cap = capabilityForToolName("mcp__myserver__do_thing");
     expect(cap.id).toBe("tool.mcp__*");
-    expect(cap.tier).toBe("degraded-noop");
-    expect(cap.safetyRelevant).toBe(false);
+    expect(cap.tier).toBe("partial");
+    expect(cap.safetyRelevant).toBe(true);
   });
 
   it("synthesizes a safe not-supported entry for unknown tools without mutating the registry", () => {
@@ -844,7 +950,11 @@ describe("buildCompatReport", () => {
     });
     const report = buildCompatReport(project);
     expect(report.findings.some((f) => f.capability.id === "tool.NotebookEdit")).toBe(true);
-    expect(report.findings.some((f) => f.capability.id === "tool.mcp__*")).toBe(true);
+    // DELIBERATE TRANSITION: an mcp__* grant stopped being a finding when
+    // tool.mcp__* re-tiered to a live partial surface — a supported tool in
+    // tools: is as finding-free as Read.
+    expect(report.findings.some((f) => f.capability.id === "tool.mcp__*")).toBe(false);
+    expect(report.safetyFindings.some((f) => f.capability.id === "tool.mcp__*")).toBe(false);
     expect(report.findings.some((f) => f.capability.id === "tool.Read")).toBe(false);
     expect(report.unassessed.some((u) => u.includes('"TotallyNewTool"'))).toBe(true);
   });
@@ -946,7 +1056,10 @@ describe("buildCompatReport", () => {
     expect(notebook).toBeDefined();
     expect(notebook?.evidence).toContain('skill "gated-skill"');
     expect(notebook?.evidence).toContain("allowed-tools:");
-    expect(report.findings.some((f) => f.capability.id === "tool.mcp__*")).toBe(true);
+    // DELIBERATE TRANSITION: mcp__* in allowed-tools: is no longer a finding —
+    // the wildcard re-tiered to a live partial surface with the stdio slice.
+    expect(report.findings.some((f) => f.capability.id === "tool.mcp__*")).toBe(false);
+    expect(report.safetyFindings.some((f) => f.capability.id === "tool.mcp__*")).toBe(false);
     expect(report.unassessed.some((u) => u.includes('"TotallyNewTool"'))).toBe(true);
     // Fully-honored grants and specifier entries produce no finding/unassessed noise.
     expect(report.findings.some((f) => f.capability.id === "tool.Read")).toBe(false);
@@ -1002,13 +1115,162 @@ describe("buildCompatReport", () => {
     expect(buildCompatReport(project).findings).toEqual([]);
   });
 
-  it("flags a committed .mcp.json at the project root", () => {
+  // -------------------------------------------------------------------------
+  // MCP discovery-fed findings (replacing the retired static filesystem check)
+  // -------------------------------------------------------------------------
+
+  it("no longer flags .mcp.json by mere filesystem presence — findings come from discovery", () => {
     const root = makeTempDir();
     fs.writeFileSync(path.join(root, ".mcp.json"), '{ "mcpServers": {} }', "utf8");
+    // A project literal WITHOUT resolved discovery data (mcp undefined) must
+    // produce no MCP finding even though the file exists on disk.
     const report = buildCompatReport(makeProject({ root, cwd: root }));
-    const mcp = report.findings.find((f) => f.capability.id === "feature.mcp");
-    expect(mcp).toBeDefined();
-    expect(mcp?.evidence).toContain(".mcp.json");
+    expect(report.findings.some((f) => f.capability.id.includes("mcp"))).toBe(false);
+    expect(report.mcpPendingNotice).toBeUndefined();
+  });
+
+  it("pending-approval servers yield one finding carrying the exact enable/decline edit", () => {
+    const project = makeProject({
+      mcp: makeMcp({
+        servers: [
+          makeMcpServer({ name: "alpha", status: "pending-approval" }),
+          makeMcpServer({ name: "beta", status: "pending-approval" }),
+        ],
+      }),
+    });
+    const report = buildCompatReport(project);
+    const pending = report.findings.filter(
+      (f) => f.capability.id === "feature.mcp-project-approval",
+    );
+    expect(pending).toHaveLength(1);
+    // With startup quiet, the /doctor finding is the ONE canonical carrier of
+    // the exact settings edit — servers plus BOTH exits (enable and decline).
+    const evidence = pending[0]!.evidence;
+    expect(evidence).toContain("alpha");
+    expect(evidence).toContain("beta");
+    expect(evidence).toContain('"enabledMcpjsonServers": ["alpha","beta"]');
+    expect(evidence).toContain('"enableAllProjectMcpServers": true');
+    expect(evidence).toContain('"disabledMcpjsonServers"');
+    // In /doctor the evidence renders beside the gate entry's registry note,
+    // which still teaches all three keys.
+    const note = pending[0]!.capability.note;
+    expect(note).toContain("enableAllProjectMcpServers");
+    expect(note).toContain("enabledMcpjsonServers");
+    expect(note).toContain("disabledMcpjsonServers");
+    // The one-time notify line stays short: names + enabling key + /doctor
+    // pointer, never the JSON edit itself.
+    expect(report.mcpPendingNotice).toContain("alpha");
+    expect(report.mcpPendingNotice).toContain("enabledMcpjsonServers");
+    expect(report.mcpPendingNotice).not.toContain('"enabledMcpjsonServers":');
+    expect(report.mcpPendingNotice).toContain("/doctor");
+  });
+
+  it("surfaces an ENABLED server's diagnostics as findings — variable named, values never expanded", () => {
+    // Per-server diagnostics are findings for EVERY status, not only skipped:
+    // an enabled server's unset-${VAR} warning is degraded state the user must
+    // see without opening /doctor's posture line.
+    const project = makeProject({
+      mcp: makeMcp({
+        servers: [
+          makeMcpServer({
+            name: "live",
+            status: "enabled",
+            command: "/secret/expanded/bin",
+            rawCommand: "${MCP_BIN}",
+            diagnostics: [
+              'environment variable "MCP_BIN" is not set and has no default; "${MCP_BIN}" kept as literal text',
+            ],
+          }),
+        ],
+      }),
+    });
+    const report = buildCompatReport(project);
+    const diags = report.findings.filter((f) => f.capability.id === "feature.mcp");
+    expect(diags).toHaveLength(1);
+    // The finding names the server (the resolver's unset-var diagnostic does
+    // not embed it) and the variable — never the expanded value.
+    expect(diags[0]!.evidence).toContain('MCP server "live"');
+    expect(diags[0]!.evidence).toContain('"MCP_BIN"');
+    expect(diags[0]!.evidence).not.toContain("/secret/expanded/bin");
+  });
+
+  it("skipped servers yield findings carrying their one-line reasons", () => {
+    const project = makeProject({
+      mcp: makeMcp({
+        servers: [
+          makeMcpServer({
+            name: "remote",
+            status: "skipped",
+            diagnostics: [
+              'MCP server "remote" in .mcp.json uses remote transport "sse" — remote MCP transports (HTTP/SSE/WebSocket) are not supported yet; server skipped',
+            ],
+          }),
+          makeMcpServer({ name: "broken", status: "skipped" }),
+        ],
+      }),
+    });
+    const report = buildCompatReport(project);
+    const skipped = report.findings.filter((f) => f.capability.id === "feature.mcp");
+    expect(skipped.some((f) => f.evidence.includes("remote transport"))).toBe(true);
+    // A skipped server without stored diagnostics still surfaces, never silently.
+    expect(skipped.some((f) => f.evidence.includes('"broken"'))).toBe(true);
+  });
+
+  it("config-level diagnostics (ignored approvals, git-tracked demotion) surface verbatim", () => {
+    const project = makeProject({
+      mcp: makeMcp({
+        diagnostics: [
+          'MCP approvals ("enableAllProjectMcpServers"/"enabledMcpjsonServers") in project-scope settings are ignored — a cloned repo must not self-approve; move them to .claude/settings.local.json (.claude/settings.json)',
+          '".claude/settings.local.json" is tracked by git, so a cloned repo could have authored it; its MCP configuration is treated as project scope (approvals ignored, servers pending)',
+        ],
+      }),
+    });
+    const report = buildCompatReport(project);
+    const diags = report.findings.filter((f) => f.capability.id === "feature.mcp");
+    expect(diags.some((f) => f.evidence.includes("move them to .claude/settings.local.json"))).toBe(true);
+    expect(diags.some((f) => f.evidence.includes("tracked by git"))).toBe(true);
+  });
+
+  it("a working enabled server is never a finding (posture-line data instead)", () => {
+    const project = makeProject({
+      mcp: makeMcp({
+        servers: [
+          makeMcpServer({ name: "live", status: "enabled", command: "node", rawCommand: "node" }),
+          makeMcpServer({ name: "declined", status: "disabled" }),
+        ],
+      }),
+    });
+    const report = buildCompatReport(project);
+    expect(report.findings).toEqual([]);
+    expect(report.safetyFindings).toEqual([]);
+    expect(report.mcpPendingNotice).toBeUndefined();
+  });
+
+  it("never leaks expanded command/args/env values into MCP findings", () => {
+    // Display hygiene: findings quote names and stored (raw/pre-expansion)
+    // diagnostics only — the EXPANDED fields must never reach a finding.
+    const project = makeProject({
+      mcp: makeMcp({
+        servers: [
+          makeMcpServer({
+            name: "secretive",
+            status: "pending-approval",
+            command: "/secret/expanded/bin",
+            args: ["--token", "EXPANDED-SECRET-VALUE"],
+            env: { API_KEY: "EXPANDED-SECRET-VALUE" },
+            rawCommand: "${MCP_BIN}",
+          }),
+        ],
+      }),
+    });
+    const report = buildCompatReport(project);
+    const all = [...report.findings, ...report.safetyFindings]
+      .map((f) => f.evidence)
+      .concat(report.mcpPendingNotice ?? "")
+      .join("\n");
+    expect(all).toContain("secretive");
+    expect(all).not.toContain("EXPANDED-SECRET-VALUE");
+    expect(all).not.toContain("/secret/expanded/bin");
   });
 });
 
@@ -1109,6 +1371,97 @@ describe("renderDoctorReport", () => {
 });
 
 // ---------------------------------------------------------------------------
+// MCP posture line in /doctor — always present, live-state fed
+// ---------------------------------------------------------------------------
+
+describe("MCP posture line in /doctor", () => {
+  it("shows 'no servers configured' when nothing is discovered (and when mcp is absent)", () => {
+    const bare = makeProject();
+    expect(renderDoctorReport(bare, buildCompatReport(bare))).toContain(
+      "MCP: no servers configured.",
+    );
+    const empty = makeProject({ mcp: makeMcp() });
+    expect(renderDoctorReport(empty, buildCompatReport(empty))).toContain(
+      "MCP: no servers configured.",
+    );
+  });
+
+  it("renders connected/connecting/failed from live runtime states per enabled server", () => {
+    const project = makeProject({
+      mcp: makeMcp({
+        servers: [
+          makeMcpServer({ name: "up", status: "enabled" }),
+          makeMcpServer({ name: "starting", status: "enabled" }),
+          makeMcpServer({ name: "down", status: "enabled" }),
+        ],
+      }),
+    });
+    const doctor = renderDoctorReport(project, buildCompatReport(project), undefined, undefined, [
+      { name: "up", state: "connected", toolCount: 5 },
+      { name: "starting", state: "connecting" },
+      { name: "down", state: "failed", diagnostic: 'MCP server "down" failed to start (ENOENT) — command: broken-cmd' },
+    ]);
+    expect(doctor).toContain("up: connected (5 tool(s))");
+    expect(doctor).toContain("starting: connecting");
+    expect(doctor).toContain("down: failed — ");
+    expect(doctor).toContain("ENOENT");
+    // The failure diagnostic quotes the RAW command only.
+    expect(doctor).toContain("broken-cmd");
+  });
+
+  it("bounds a failed-server diagnostic on the posture line", () => {
+    const project = makeProject({
+      mcp: makeMcp({ servers: [makeMcpServer({ name: "noisy", status: "enabled" })] }),
+    });
+    const doctor = renderDoctorReport(project, buildCompatReport(project), undefined, undefined, [
+      { name: "noisy", state: "failed", diagnostic: `boom ${"x".repeat(2000)}` },
+    ]);
+    const line = doctor.split("\n").find((l) => l.startsWith("MCP servers:")) ?? "";
+    expect(line).toContain("noisy: failed");
+    expect(line.length).toBeLessThan(600);
+    expect(line).toContain("…");
+  });
+
+  it("renders pending/disabled/skipped gate states with NO hint sentence on the posture line", () => {
+    const project = makeProject({
+      mcp: makeMcp({
+        servers: [
+          makeMcpServer({ name: "waiting", status: "pending-approval" }),
+          makeMcpServer({ name: "declined", status: "disabled" }),
+          makeMcpServer({
+            name: "remote",
+            status: "skipped",
+            diagnostics: ["remote MCP transports (HTTP/SSE/WebSocket) are not supported yet; server skipped"],
+          }),
+        ],
+      }),
+    });
+    const doctor = renderDoctorReport(project, buildCompatReport(project));
+    expect(doctor).toContain("waiting: pending approval");
+    expect(doctor).toContain("declined: disabled (disabledMcpjsonServers)");
+    expect(doctor).toContain("remote: skipped — remote MCP transports");
+    // De-duplicated: the posture line itself carries no enable/decline hint —
+    // the pending finding below it (registry note + evidence) is the canonical
+    // carrier of the exact edit now that startup is quiet.
+    const postureLine = doctor.split("\n").find((l) => l.startsWith("MCP servers:")) ?? "";
+    expect(postureLine).not.toContain("enabledMcpjsonServers");
+    expect(postureLine).not.toContain("enableAllProjectMcpServers");
+    expect(doctor).toContain("enabledMcpjsonServers");
+    expect(doctor).toContain("enableAllProjectMcpServers");
+    expect(doctor).toContain("disabledMcpjsonServers");
+  });
+
+  it("claims only 'enabled' for an enabled server with no live state supplied", () => {
+    const project = makeProject({
+      mcp: makeMcp({ servers: [makeMcpServer({ name: "unknown-state", status: "enabled" })] }),
+    });
+    const doctor = renderDoctorReport(project, buildCompatReport(project));
+    expect(doctor).toContain("unknown-state: enabled");
+    expect(doctor).not.toContain("unknown-state: connected");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Active-model vision surface (/doctor)
 // ---------------------------------------------------------------------------
 
@@ -1149,6 +1502,68 @@ describe("active-model vision line in /doctor", () => {
     const doctor = renderDoctorReport(project, buildCompatReport(project), { id: "gpt-opaque" });
     expect(doctor).toContain("vision: unknown");
     expect(doctor).not.toContain("vision: no");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MCP pending-approval notify line — actionable state, survives quiet startup
+// ---------------------------------------------------------------------------
+
+describe("MCP pending-approval notify line (report.mcpPendingNotice)", () => {
+  const pendingProject = makeProject({
+    mcp: makeMcp({
+      servers: [makeMcpServer({ name: "example-server", status: "pending-approval" })],
+    }),
+  });
+
+  it("is ONE short self-contained line — count, names, the enabling key, the /doctor pointer", () => {
+    const notice = buildCompatReport(pendingProject).mcpPendingNotice;
+    expect(notice).toBeDefined();
+    const line = notice as string;
+    // A single toast line: the session-start notify emits it verbatim.
+    expect(line).not.toContain("\n");
+    expect(line).toContain("1 server(s) pending approval");
+    expect(line).toContain("example-server");
+    expect(line).toContain("enabledMcpjsonServers");
+    expect(line).toContain(".claude/settings.local.json");
+    expect(line).toContain("/doctor");
+  });
+
+  it("keeps the full enable/decline edit in /doctor (the canonical carrier)", () => {
+    const report = buildCompatReport(pendingProject);
+    const doctor = renderDoctorReport(pendingProject, report);
+    expect(doctor).toContain('"enabledMcpjsonServers": ["example-server"]');
+    expect(doctor).toContain('"enableAllProjectMcpServers": true');
+    expect(doctor).toContain('"disabledMcpjsonServers"');
+  });
+
+  it("stays absent with no pending servers", () => {
+    const enabledOnly = makeProject({
+      mcp: makeMcp({ servers: [makeMcpServer({ name: "live", status: "enabled" })] }),
+    });
+    expect(buildCompatReport(enabledOnly).mcpPendingNotice).toBeUndefined();
+  });
+
+  it("beyond 8 pending servers, caps the name list; the /doctor edit recommends the blanket key", () => {
+    const names = Array.from({ length: 9 }, (_, i) => `srv-${String(i + 1).padStart(2, "0")}`);
+    const project = makeProject({
+      mcp: makeMcp({
+        servers: names.map((name) => makeMcpServer({ name, status: "pending-approval" })),
+      }),
+    });
+    const report = buildCompatReport(project);
+    const notice = report.mcpPendingNotice;
+    expect(notice).toBeDefined();
+    expect(notice).toContain("9 server(s) pending approval");
+    expect(notice).toContain("and 1 more");
+    // The 9th name appears nowhere on the notify line.
+    expect(notice).not.toContain("srv-09");
+    // Bounded remedy in the /doctor finding: the blanket key instead of a
+    // JSON edit enumerating every server.
+    const doctor = renderDoctorReport(project, report);
+    expect(doctor).not.toContain(JSON.stringify(names));
+    expect(doctor).toContain('"enableAllProjectMcpServers": true');
+    expect(doctor).toContain('"disabledMcpjsonServers"');
   });
 });
 
