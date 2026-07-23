@@ -2639,7 +2639,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   const CONTROL_COMMANDS: Record<string, string> = {
-    doctor: "PiCC: full compatibility breakdown for this project",
+    doctor: "PiCC: project-specific compatibility report",
     quota: "PiCC: subscription/rate-limit info from the last provider response",
     skills: "PiCC: list the project's Claude skills (invocable + model-only)",
     agents: "PiCC: list the subagents available for dispatch",

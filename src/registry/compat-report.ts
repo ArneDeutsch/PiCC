@@ -1,7 +1,7 @@
 /**
  * Compatibility report — generated from the capability registry so it cannot
  * drift from actual behavior. buildCompatReport() scans the assembled project;
- * renderDoctorReport() gives the full /doctor breakdown on demand.
+ * renderDoctorReport() gives a project-specific /doctor report on demand.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -419,7 +419,7 @@ function compactionKnobsLine(compaction: ResolvedCompactionConfig, activeModel: 
   return `Compaction: current model transport/API (${apiLabel}) is unsupported for proactive checkpointing. Supported API ids are ${supportedLabel}; switch to a model using one of them. ${knobs}.`;
 }
 
-/** Full /doctor breakdown, generated from the registry. */
+/** Project-specific /doctor compatibility report, generated from the registry. */
 export function renderDoctorReport(
   project: ClaudeProject,
   report: CompatReport,
@@ -437,7 +437,7 @@ export function renderDoctorReport(
 
   const grouped = groupByCapability([...report.safetyFindings, ...report.findings]);
   if (grouped.length === 0) {
-    lines.push("No compatibility findings: everything this project declares is fully honored.");
+    lines.push("No compatibility findings detected.");
   } else {
     lines.push("Findings (declared by this project, not fully honored):");
     for (const tier of TIER_ORDER) {

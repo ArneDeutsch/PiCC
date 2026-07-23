@@ -1012,7 +1012,8 @@ describe("renderDoctorReport", () => {
   it("renders cleanly for a project with nothing to report", () => {
     const project = makeProject();
     const doctor = renderDoctorReport(project, buildCompatReport(project));
-    expect(doctor).toContain("No compatibility findings");
+    expect(doctor.split(/\r?\n/)).toContain("No compatibility findings detected.");
+    expect(doctor).not.toContain("everything this project declares is fully honored");
     expect(doctor).toContain("Unassessed: none.");
     expect(doctor).toContain(CLAUDE_BASELINE);
   });
