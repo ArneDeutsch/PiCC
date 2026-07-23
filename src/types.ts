@@ -304,11 +304,67 @@ export interface ClaudeSettings {
   subagentMaxDepth: number;
   subagentConcurrency: number;
   enabledPlugins: Record<string, boolean> | string[] | undefined;
+  /**
+   * Scope-tagged MCP contributions, one entry per settings file that carries
+   * any of the four MCP keys (never merged across scopes — the enablement gate
+   * in discovery/mcp.ts resolves them). Always populated by loadSettings;
+   * optional only so hand-built test literals stay valid.
+   */
+  mcpSettings?: McpSettingsEntry[];
   /** Every key we did not recognize, with the scope it came from (compat report). */
   unknownKeys: Array<{ key: string; scope: Scope }>;
   /** Keys recognized but gating deferred subsystems (compat report). */
   deferredKeys: Array<{ key: string; scope: Scope }>;
   diagnostics: Diagnostic[];
+}
+
+// ---------------------------------------------------------------------------
+// MCP servers (config discovery — consumed by discovery, runtime, registry)
+// ---------------------------------------------------------------------------
+
+/**
+ * One settings file's MCP contribution, captured scope-tagged and NEVER
+ * field-merged across scopes: the enablement gate needs to know which scope
+ * each value came from (project-scope approvals are ignored, and a git-tracked
+ * `settings.local.json` is demoted to project scope at assembly time).
+ */
+export interface McpSettingsEntry {
+  scope: Scope;
+  /** Absolute path of the settings file this entry came from. */
+  sourcePath: string;
+  /** Raw `mcpServers` block (null-prototype copy; entries stay unparsed here). */
+  servers?: Record<string, unknown>;
+  enableAllProjectMcpServers?: boolean;
+  enabledMcpjsonServers?: string[];
+  disabledMcpjsonServers?: string[];
+}
+
+export type McpServerStatus = "enabled" | "pending-approval" | "disabled" | "skipped";
+
+export interface ResolvedMcpServer {
+  name: string;
+  status: McpServerStatus;
+  /** Human-readable origin, e.g. ".mcp.json" | "settings:<scope>". */
+  source: string;
+  /** Expanded (`${VAR}` / `${VAR:-default}`). */
+  command: string;
+  /** Expanded. */
+  args: string[];
+  /** Expanded values. */
+  env: Record<string, string>;
+  /** Pre-expansion command, for display (never print expanded values). */
+  rawCommand: string;
+  /** Per-server tool-call timeout, validated >= 1000 ms. */
+  timeoutMs?: number;
+  /** Per-server findings (skip reasons, ignored fields, unset vars). */
+  diagnostics: string[];
+}
+
+export interface ResolvedMcpConfig {
+  /** Every discovered server, all statuses. */
+  servers: ResolvedMcpServer[];
+  /** Config-level findings (malformed file, ignored project-scope approvals). */
+  diagnostics: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -369,5 +425,11 @@ export interface ClaudeProject {
   agents: ClaudeAgent[];
   rules: ClaudeRule[];
   claudeMd: ClaudeMdFile[];
+  /**
+   * Resolved MCP server configuration (pure data — processes are the runtime's job).
+   * Always populated by loadClaudeProject (required on LoadedProject);
+   * optional only so hand-built test literals stay valid.
+   */
+  mcp?: ResolvedMcpConfig;
   diagnostics: Diagnostic[];
 }
