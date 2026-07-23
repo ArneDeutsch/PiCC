@@ -115,6 +115,30 @@ describe("main-session routine rendering registration", () => {
     expect(result.content[0]?.text).toBe(canonical);
   });
 
+  it("wires supplied workspace precedence and marked repository fallback into routine rows", () => {
+    const tool = pi.tools.get("EnterWorktree");
+    expect(tool).toBeDefined();
+    const workspace = path.join(directory, ".claude", "worktrees", "presentation");
+    const render = (worktreePath: string) => tool.renderResult(
+      {
+        content: [{ type: "text", text: "CANONICAL" }],
+        details: {
+          worktreePath, branch: "worktree-presentation", created: true,
+          seeded: [], previousUnlockAttempted: false,
+        },
+      },
+      { expanded: false, isPartial: false },
+      undefined,
+      {
+        args: { name: "presentation" }, state: {}, cwd: workspace,
+        executionStarted: true, argsComplete: true, isError: false,
+      },
+    ).render(200).join(" ") as string;
+
+    expect(render(path.join(workspace, "nested"))).toContain("enter worktree(nested)");
+    expect(render(path.join(directory, "shared"))).toContain("enter worktree(repo:shared)");
+  });
+
   it("executes and renders the registered MultiEdit with canonical content unchanged", async () => {
     initTheme();
     const filePath = "routine-multiedit.txt";

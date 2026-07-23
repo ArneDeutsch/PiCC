@@ -8,10 +8,12 @@ import {
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { themedFg } from "./render-util.js";
 import {
-  formatDisplayPath,
+  formatDisplayPathFromRoots,
   formatToolDisplayName,
-  resolveDisplayRoot,
+  priorityDisplayRow,
+  resolveDisplayRoots,
   type DisplayRootResolver,
+  type DisplayRoots,
 } from "./tool-display.js";
 
 const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
@@ -33,7 +35,8 @@ type WebToolName = "WebFetch" | "WebSearch";
 type ActivationToolName = "Skill" | "SlashCommand";
 type MutationToolName = "edit" | "MultiEdit";
 type WorktreeToolName = "EnterWorktree" | "ExitWorktree";
-type RoutineToolName = WebToolName | ActivationToolName | MutationToolName | WorktreeToolName;
+type TaskControlToolName = "TaskCreate" | "TaskUpdate" | "TaskGet";
+type RoutineToolName = WebToolName | ActivationToolName | MutationToolName | WorktreeToolName | TaskControlToolName;
 type DataSnapshot = Record<string, unknown>;
 
 const MAX_FAIL_OPEN_CHARS = 4_096;
@@ -156,10 +159,17 @@ function clamp(line: string, width: number): string {
   }
 }
 
+interface PriorityEvidence {
+  warning: string;
+  restoration?: string;
+  detail?: string;
+}
+
 function structuredRowComponent(
   literals: readonly string[],
   fields: readonly string[],
   theme: unknown,
+  priorityEvidence: PriorityEvidence | undefined,
 ): Component {
   return {
     render(width: number): string[] {
@@ -182,10 +192,25 @@ function structuredRowComponent(
         for (let index = 0; index < displayed.length; index++) {
           line += (displayed[index] ?? "") + (literals[index + 1] ?? "");
         }
-        const keyword = /^(?:enter worktree|exit worktree)/u.exec(line)?.[0] ?? "";
-        const styled = keyword
-          ? themedFg(theme, "text", keyword) + themedFg(theme, "toolOutput", line.slice(keyword.length))
-          : themedFg(theme, "toolOutput", line);
+        if (priorityEvidence && visibleWidth(line) > columns) {
+          const evidence = themedFg(theme, "warning", priorityEvidence.warning) +
+            (priorityEvidence.restoration
+              ? themedFg(theme, "muted", `; ${priorityEvidence.restoration}`)
+              : "") +
+            (priorityEvidence.detail
+              ? themedFg(theme, "warning", `; ${priorityEvidence.detail}`)
+              : "");
+          return [clamp(evidence, columns)];
+        }
+        const firstLiteral = literals[0] ?? "";
+        const keyword = /^(?:enter worktree|exit worktree)/u.exec(firstLiteral)?.[0] ?? "";
+        let styled = themedFg(theme, "text", keyword) + themedFg(theme, "muted", firstLiteral.slice(keyword.length));
+        for (let index = 0; index < displayed.length; index++) {
+          const preceding = literals[index] ?? "";
+          const slot = index === 0 ? "accent" : /fail(?:ed|ure)?:\s*$/iu.test(preceding) ? "warning" : "muted";
+          styled += themedFg(theme, slot, displayed[index] ?? "") +
+            themedFg(theme, /fail|unknown|deferred/iu.test(literals[index + 1] ?? "") ? "warning" : "muted", literals[index + 1] ?? "");
+        }
         return [clamp(styled, columns)];
       } catch {
         let line = literals[0] ?? "";
@@ -209,7 +234,7 @@ function commandComponent(toolName: RoutineToolName, invocation: string, theme: 
         const argument = safeThemeMethod(
           theme,
           "fg",
-          ["toolOutput", displayedInvocation],
+          ["accent", displayedInvocation],
           displayedInvocation,
         );
         const styled = `${title} ${argument}`;
@@ -382,7 +407,7 @@ function emptyInvocationReason(toolName: RoutineToolName, context: unknown): str
   const invocation = ownData(
     args,
     toolName === "WebFetch" ? "url" : toolName === "WebSearch" ? "query" :
-      toolName === "Skill" ? "name" : "command",
+      toolName === "Skill" ? "name" : toolName === "SlashCommand" ? "command" : "subject",
   );
   return typeof invocation === "string" && sanitizeText(invocation, true).length === 0
     ? unfamiliarFormatLabel(toolName)
@@ -471,13 +496,14 @@ function recognizeActivationSuccess(
 interface WorktreeRow {
   literals: string[];
   fields: string[];
+  priorityEvidence?: PriorityEvidence;
 }
 
 function recognizeEnterWorktree(
   result: unknown,
   options: unknown,
   context: unknown,
-  displayRoot?: string,
+  displayRoots: DisplayRoots,
 ): WorktreeRow | undefined {
   if (ownData(options, "isPartial") !== false || ownData(context, "isError") !== false) return undefined;
   const resultSnapshot = plainOwnData(result, ["content", "details"]) ??
@@ -515,10 +541,10 @@ function recognizeEnterWorktree(
       details.previousKeepOutcome !== "keep-failed") ||
     (hasPreviousError && (details.previousKeepOutcome !== "keep-failed" ||
       typeof details.previousKeepError !== "string"))) return undefined;
-  const worktreePath = formatDisplayPath(sanitizeText(details.worktreePath, true), displayRoot);
+  const worktreePath = sanitizeText(formatDisplayPathFromRoots(details.worktreePath, displayRoots), true);
   const branch = sanitizeText(details.branch, true);
   const previousPath = hasPrevious
-    ? formatDisplayPath(sanitizeText(details.previousWorktreePath, true), displayRoot)
+    ? sanitizeText(formatDisplayPathFromRoots(details.previousWorktreePath, displayRoots), true)
     : undefined;
   const previousError = hasPreviousError ? sanitizeText(details.previousKeepError, true) : undefined;
   if (!worktreePath || !branch || (hasPrevious && !previousPath) || (hasPreviousError && !previousError)) {
@@ -544,14 +570,20 @@ function recognizeEnterWorktree(
   } else {
     literals.push(suffix);
   }
-  return { literals, fields };
+  const priorityEvidence = details.previousKeepOutcome === "keep-failed"
+    ? {
+        warning: "entered; prior keep failed; state unknown",
+        ...(previousError ? { detail: `prior error: ${previousError}` } : {}),
+      }
+    : undefined;
+  return { literals, fields, ...(priorityEvidence ? { priorityEvidence } : {}) };
 }
 
 function recognizeExitWorktree(
   result: unknown,
   options: unknown,
   context: unknown,
-  displayRoot?: string,
+  displayRoots: DisplayRoots,
 ): WorktreeRow | undefined {
   if (ownData(options, "isPartial") !== false || ownData(context, "isError") !== false) return undefined;
   const resultSnapshot = plainOwnData(result, ["content", "details"]) ??
@@ -561,7 +593,7 @@ function recognizeExitWorktree(
   const none = plainOwnData(resultSnapshot.details, ["outcome", "restorePath"]);
   if (none) {
     if (none.outcome !== "none" || typeof none.restorePath !== "string") return undefined;
-    const restorePath = formatDisplayPath(sanitizeText(none.restorePath, true), displayRoot);
+    const restorePath = sanitizeText(formatDisplayPathFromRoots(none.restorePath, displayRoots), true);
     return restorePath
       ? { literals: ["exit worktree (no active worktree); already at ", ""], fields: [restorePath] }
       : undefined;
@@ -575,8 +607,8 @@ function recognizeExitWorktree(
     typeof details.ok !== "boolean" || typeof details.removed !== "boolean" ||
     typeof details.orphaned !== "boolean" ||
     !exactDataArray(details.diagnostics, MAX_WORKTREE_DIAGNOSTICS)) return undefined;
-  const worktreePath = formatDisplayPath(sanitizeText(details.worktreePath, true), displayRoot);
-  const restorePath = formatDisplayPath(sanitizeText(details.restorePath, true), displayRoot);
+  const worktreePath = sanitizeText(formatDisplayPathFromRoots(details.worktreePath, displayRoots), true);
+  const restorePath = sanitizeText(formatDisplayPathFromRoots(details.restorePath, displayRoots), true);
   if (!worktreePath || !restorePath) return undefined;
   if (details.outcome === "kept") {
     if (details.ok !== true || details.removed || details.orphaned || "error" in details) return undefined;
@@ -596,11 +628,17 @@ function recognizeExitWorktree(
           "; worktree state unknown; restored ", "",
         ],
         fields: [worktreePath, error, restorePath],
+        priorityEvidence: {
+          warning: "keep failed; state unknown",
+          restoration: "restored",
+          detail: `error: ${error}`,
+        },
       };
     }
     return {
       literals: ["exit worktree(", ") keep failed; worktree state unknown; restored ", ""],
       fields: [worktreePath, restorePath],
+      priorityEvidence: { warning: "keep failed; state unknown", restoration: "restored" },
     };
   }
   if (details.outcome === "removed") {
@@ -615,6 +653,7 @@ function recognizeExitWorktree(
     return {
       literals: ["exit worktree(", ") removal deferred; restored ", ""],
       fields: [worktreePath, restorePath],
+      priorityEvidence: { warning: "removal deferred", restoration: "restored" },
     };
   }
   if (details.outcome !== "removal-failed" || details.ok !== false || details.removed || details.orphaned) {
@@ -629,11 +668,17 @@ function recognizeExitWorktree(
         "; worktree state unknown; restored ", "",
       ],
       fields: [worktreePath, error, restorePath],
+      priorityEvidence: {
+        warning: "removal failed; state unknown",
+        restoration: "restored",
+        detail: `error: ${error}`,
+      },
     };
   }
   return {
     literals: ["exit worktree(", ") removal failed; worktree state unknown; restored ", ""],
     fields: [worktreePath, restorePath],
+    priorityEvidence: { warning: "removal failed; state unknown", restoration: "restored" },
   };
 }
 
@@ -646,7 +691,8 @@ function routineToolName(tool: unknown): RoutineToolName | undefined {
     return descriptor.value === "WebFetch" || descriptor.value === "WebSearch" ||
       descriptor.value === "Skill" || descriptor.value === "SlashCommand" ||
       descriptor.value === "edit" || descriptor.value === "MultiEdit" ||
-      descriptor.value === "EnterWorktree" || descriptor.value === "ExitWorktree"
+      descriptor.value === "EnterWorktree" || descriptor.value === "ExitWorktree" ||
+      descriptor.value === "TaskCreate" || descriptor.value === "TaskUpdate" || descriptor.value === "TaskGet"
       ? descriptor.value
       : undefined;
   } catch {
@@ -670,6 +716,7 @@ export interface RoutineRenderingDependencies {
   createEditDefinition?: (cwd: string) => EditRendererDefinition;
   resolveEditRenderCwd?: () => unknown;
   resolveDisplayRoot?: DisplayRootResolver;
+  repositoryRoot?: string;
 }
 
 function componentFrom(value: unknown): Component | undefined {
@@ -1148,12 +1195,17 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
 ): T {
   const toolName = routineToolName(tool);
   if (!toolName) return tool;
-  const displayRoots = new WeakMap<object, string | undefined>();
-  const displayRootFor = (context: unknown): string | undefined => {
+  const rootSnapshots = new WeakMap<object, DisplayRoots>();
+  const displayRootsFor = (context: unknown): DisplayRoots => {
     const state = liveEditState(context);
-    if (!state) return resolveDisplayRoot(dependencies.resolveDisplayRoot, context);
-    if (!displayRoots.has(state)) displayRoots.set(state, resolveDisplayRoot(dependencies.resolveDisplayRoot, context));
-    return displayRoots.get(state);
+    const resolved = () => resolveDisplayRoots(
+      dependencies.resolveDisplayRoot,
+      dependencies.repositoryRoot,
+      context,
+    );
+    if (!state || ownData(context, "argsComplete") === false) return resolved();
+    if (!rootSnapshots.has(state)) rootSnapshots.set(state, resolved());
+    return rootSnapshots.get(state) ?? {};
   };
 
   let descriptors: PropertyDescriptorMap;
@@ -1161,6 +1213,26 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
     descriptors = Object.getOwnPropertyDescriptors(tool);
   } catch {
     return tool;
+  }
+  if (toolName === "TaskCreate" || toolName === "TaskUpdate" || toolName === "TaskGet") {
+    const argsKey = toolName === "TaskCreate" ? "subject" : "taskId";
+    delete descriptors.renderCall;
+    const decoratedTask = Object.defineProperties({}, descriptors) as T;
+    Object.defineProperty(decoratedTask, "renderCall", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value(args: unknown, theme: unknown): Component {
+        const value = ownData(args, argsKey);
+        const primary = sanitizeText(value, true);
+        if (typeof value !== "string" || !primary) return commandComponent(toolName, "?", theme);
+        const optional = toolName === "TaskUpdate" && typeof ownData(args, "status") === "string"
+          ? [sanitizeText(ownData(args, "status"), true)]
+          : [];
+        return priorityDisplayRow(formatToolDisplayName(toolName), primary, [], optional, "", theme);
+      },
+    });
+    return decoratedTask;
   }
   const originalCall = descriptors.renderCall && "value" in descriptors.renderCall
     ? descriptors.renderCall.value as unknown
@@ -1201,11 +1273,11 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
       enumerable: true,
       writable: true,
       value(args: unknown, theme: unknown, context: unknown): Component {
-        const displayRoot = displayRootFor(context);
+        const displayRoots = displayRootsFor(context);
         if (toolName !== "MultiEdit") return { render: () => [] };
         const snapshot = plainOwnData(args, ["file_path", "edits"]);
         const displayed = snapshot
-          ? { ...snapshot, file_path: formatDisplayPath(snapshot.file_path, displayRoot) }
+          ? { ...snapshot, file_path: formatDisplayPathFromRoots(snapshot.file_path, displayRoots) }
           : args;
         return multiEditCall(displayed, theme);
       },
@@ -1216,17 +1288,17 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
       writable: true,
       value(result: ResultShape, options: unknown, theme: unknown, context: unknown): Component {
         try {
-          const displayRoot = displayRootFor(context);
+          const displayRoots = displayRootsFor(context);
           if (toolName === "MultiEdit") {
             return multiEditResult(result, options, theme, context, dependencies);
           }
           if (toolName === "EnterWorktree" || toolName === "ExitWorktree") {
             const row = toolName === "EnterWorktree"
-              ? recognizeEnterWorktree(result, options, context, displayRoot)
-              : recognizeExitWorktree(result, options, context, displayRoot);
+              ? recognizeEnterWorktree(result, options, context, displayRoots)
+              : recognizeExitWorktree(result, options, context, displayRoots);
             return row === undefined
               ? failOpenComponent(result, toolName, theme)
-              : structuredRowComponent(row.literals, row.fields, theme);
+              : structuredRowComponent(row.literals, row.fields, theme, row.priorityEvidence);
           }
           const invocation = toolName === "WebFetch" || toolName === "WebSearch"
             ? recognizeWebSuccess(toolName, result, options, context)

@@ -122,7 +122,10 @@ describe("routine tool rendering decorator", () => {
       resolveDisplayRoot: () => liveRoot,
       createEditDefinition: relativeEditDefinition,
     }) as unknown as RenderTool;
-    const ctx = { args, state: {}, cwd: rootA, isPartial: false, isError: false };
+    const ctx = {
+      args, state: {}, cwd: rootA, isPartial: false, isError: false,
+      argsComplete: true, executionStarted: false,
+    };
     expect(tool.renderCall(args, undefined, ctx).render(120).join(" ")).toContain("src/file.ts");
     liveRoot = rootB;
     const settled = tool.renderResult(result, { expanded: false, isPartial: false }, undefined, ctx).render(120);
@@ -137,7 +140,10 @@ describe("routine tool rendering decorator", () => {
       resolveDisplayRoot: () => { throw new Error("resolver unavailable"); },
       createEditDefinition: relativeEditDefinition,
     }) as unknown as RenderTool;
-    const fallbackCtx = { args, state: {}, cwd: rootA, isPartial: false, isError: false };
+    const fallbackCtx = {
+      args, state: {}, cwd: rootA, isPartial: false, isError: false,
+      argsComplete: true, executionStarted: false,
+    };
     expect(fallback.renderCall(args, undefined, fallbackCtx).render(120).join(" ")).toContain("src/file.ts");
     const fallbackSettled = fallback
       .renderResult(result, { expanded: false, isPartial: false }, undefined, fallbackCtx)
@@ -149,7 +155,93 @@ describe("routine tool rendering decorator", () => {
     expect(result).toEqual(resultBefore);
   });
 
-  it("uses semantic text only for routine keywords and toolOutput for invocation context", () => {
+  it("keeps incomplete routine roots ephemeral, then freezes them at argument completion", () => {
+    let workspace = "/workspace/a";
+    const resolver = vi.fn(() => workspace);
+    const tool = withRoutineToolRendering({ name: "MultiEdit" } as ToolDefinition, {
+      resolveDisplayRoot: resolver,
+    }) as unknown as RenderTool;
+    const args = Object.freeze({
+      file_path: "/workspace/b/src/file.ts",
+      edits: Object.freeze([{ old_string: "old", new_string: "new" }]),
+    });
+    const ctx = {
+      args, state: {}, cwd: "/workspace/a", isPartial: true, isError: false,
+      argsComplete: false, executionStarted: false,
+    };
+    expect(tool.renderCall(args, undefined, ctx).render(120).join(" ")).toContain("/workspace/b/src/file.ts");
+    expect(resolver).not.toHaveBeenCalled();
+
+    workspace = "/workspace/b";
+    ctx.argsComplete = true;
+    expect(tool.renderCall(args, undefined, ctx).render(120).join(" ")).toContain("src/file.ts");
+    workspace = "/workspace/c";
+    expect(tool.renderCall(args, undefined, ctx).render(120).join(" ")).toContain("src/file.ts");
+    expect(resolver).toHaveBeenCalledTimes(1);
+    expect(ctx.args).toBe(args);
+  });
+
+  it("uses workspace-first and marked repository fallback for worktree paths with frozen roots", () => {
+    let workspace = "/repo/worktree";
+    const resolver = vi.fn(() => workspace);
+    const tool = withRoutineToolRendering({ name: "EnterWorktree" } as ToolDefinition, {
+      resolveDisplayRoot: resolver,
+      repositoryRoot: "/repo",
+    }) as unknown as RenderTool;
+    const args = { name: "shared" };
+    const state = {};
+    const ctx = { args, state, cwd: workspace, argsComplete: true, executionStarted: false, isError: false };
+    tool.renderCall(args, undefined, ctx);
+    workspace = "/future";
+    const result = {
+      content: [{ type: "text", text: "CANONICAL" }],
+      details: {
+        worktreePath: "/repo/shared", branch: "worktree-shared", created: true,
+        seeded: [], previousUnlockAttempted: false,
+      },
+    };
+    const row = tool.renderResult(result, { expanded: false, isPartial: false }, undefined, ctx).render(120).join(" ");
+    expect(row).toContain("repo:shared");
+    expect(row).not.toContain("/future");
+    expect(resolver).toHaveBeenCalledTimes(1);
+
+    for (const lifecycle of [{ argsComplete: true, executionStarted: true }, {}]) {
+      const historicalResolver = vi.fn(() => "/mutable");
+      const historical = withRoutineToolRendering({ name: "ExitWorktree" } as ToolDefinition, {
+        resolveDisplayRoot: historicalResolver,
+        repositoryRoot: "/repo",
+      }) as unknown as RenderTool;
+      const historicalResult = {
+        content: [{ type: "text", text: "CANONICAL" }],
+        details: { outcome: "none", restorePath: "/repo/history" },
+      };
+      const historyRow = historical.renderResult(
+        historicalResult, { expanded: false, isPartial: false }, undefined,
+        { args: { action: "remove" }, state: {}, cwd: "/repo/history", isError: false, ...lifecycle },
+      ).render(120).join(" ");
+      expect(historyRow).toContain("already at .");
+      expect(historicalResolver).not.toHaveBeenCalled();
+    }
+  });
+
+  it("styles worktree targets as primary while preserving exceptional evidence roles", () => {
+    const calls: Array<{ slot: string; text: string }> = [];
+    const theme = { fg(slot: string, text: string) { calls.push({ slot, text }); return text; } };
+    const tool = decorate({ name: "ExitWorktree" } as ToolDefinition);
+    const result = {
+      content: [{ type: "text", text: "CANONICAL" }],
+      details: {
+        worktreePath: "/repo/wt", outcome: "removal-failed", restorePath: "/repo",
+        ok: false, removed: false, orphaned: false, diagnostics: [], error: "locked",
+      },
+    };
+    renderResult(tool, { action: "remove" }, result, { theme, width: 160 });
+    expect(calls).toContainEqual({ slot: "accent", text: "/repo/wt" });
+    expect(calls.some((call) => call.slot === "warning" && call.text.includes("locked"))).toBe(true);
+    expect(calls.some((call) => call.slot === "muted" && call.text.includes("/repo"))).toBe(true);
+  });
+
+  it("uses semantic text for routine keywords and accent for invocation context", () => {
     const calls: Array<{ slot: string; text: string }> = [];
     const theme = {
       fg(slot: string, text: string) {
@@ -160,7 +252,7 @@ describe("routine tool rendering decorator", () => {
     const tool = decorate(createWebSearchTool(() => "."));
     renderResult(tool, searchArgs, searchResult, { theme });
     expect(calls).toContainEqual({ slot: "text", text: "web search" });
-    expect(calls).toContainEqual({ slot: "toolOutput", text: `“${searchArgs.query}”` });
+    expect(calls).toContainEqual({ slot: "accent", text: `“${searchArgs.query}”` });
     expect(calls).not.toContainEqual({ slot: "muted", text: "web search" });
   });
 
@@ -448,6 +540,47 @@ describe("routine tool rendering decorator", () => {
     const lines = renderResult(decorate(createWebFetchTool(() => ".")), fetchArgs, result);
     expect(contentReads).toBe(0);
     expect(lines.join("\n")).toContain("Unfamiliar web fetch presentation format");
+  });
+
+  it("hardens task-control primaries while preserving canonical args and native results", () => {
+    for (const entry of [
+      {
+        name: "TaskCreate", args: { subject: "Implement\u001b[31m renderer\rnow", description: "detail" },
+        primary: "Implement", metadata: [] as string[],
+      },
+      {
+        name: "TaskUpdate", args: { taskId: "17\u001b]0;x\u0007", status: "completed" },
+        primary: "17", metadata: ["completed"],
+      },
+      {
+        name: "TaskGet", args: { taskId: "17\rhidden" },
+        primary: "17 hidden", metadata: [] as string[],
+      },
+    ] as const) {
+      const frozenArgs = Object.freeze(entry.args);
+      const nativeResult = () => ({ render: () => ["native task detail"] });
+      const execute = () => undefined;
+      const source = { name: entry.name, execute, renderResult: nativeResult } as unknown as ToolDefinition;
+      const tool = decorate(source);
+      const calls: Array<{ slot: string; text: string }> = [];
+      const theme = { fg(slot: string, text: string) { calls.push({ slot, text }); return text; } };
+      const wideLine = tool.renderCall(frozenArgs, theme, { args: frozenArgs }).render(120).join(" ");
+      expect(wideLine).toContain(entry.primary);
+      expect(wideLine).not.toMatch(/[\r\u001b\u0007]/u);
+      for (const metadata of entry.metadata) {
+        expect(wideLine).toContain(metadata);
+        expect(calls.some((call) => call.slot === "muted" && call.text.includes(metadata))).toBe(true);
+      }
+      const narrowLine = tool.renderCall(frozenArgs, theme, { args: frozenArgs }).render(22).join(" ");
+      expect(narrowLine).toContain(entry.primary);
+      expect(narrowLine).not.toContain("completed");
+      expect(calls.some((call) => call.slot === "accent" && call.text.includes(entry.primary))).toBe(true);
+      expect((tool as unknown as { renderResult: unknown }).renderResult).toBe(nativeResult);
+      expect((tool as unknown as { execute: unknown }).execute).toBe(execute);
+      expect(frozenArgs).toEqual(entry.args);
+    }
+    const generic = { name: "TaskList" } as ToolDefinition;
+    expect(withRoutineToolRendering(generic)).toBe(generic);
   });
 
   it("renders ordinary Skill and slash command activations from snapshotted call arguments only", () => {
@@ -1360,6 +1493,48 @@ describe("routine tool rendering decorator", () => {
         expect(lines[0]).toContain(" kept; unlock attempted");
       }
     }
+  });
+
+  it("keeps invariant exceptional evidence ahead of hostile detail and paths at narrow widths", () => {
+    const hostileError = `unlock denied ${"variable-detail-".repeat(40)}\u001b]0;pwn\u0007`;
+    const calls: Array<{ slot: string; text: string }> = [];
+    const theme = { fg(slot: string, text: string) { calls.push({ slot, text }); return text; } };
+    const enter = decorate({ name: "EnterWorktree" } as ToolDefinition);
+    const enterResult = {
+      content: [{ type: "text", text: "CANONICAL" }],
+      details: {
+        worktreePath: "/very/long/current/worktree", branch: "worktree-long", created: true, seeded: [],
+        previousUnlockAttempted: true, previousWorktreePath: "/very/long/previous/worktree",
+        previousKeepOutcome: "keep-failed", previousKeepError: hostileError,
+      },
+    };
+    const enterLine = renderResult(enter, { name: "next" }, enterResult, { width: 44, theme }).join(" ");
+    expect(enterLine).toContain("entered; prior keep failed; state unknown");
+    expect(enterLine).not.toContain("/very/long");
+    expect(enterLine).not.toContain("pwn");
+
+    const exit = decorate({ name: "ExitWorktree" } as ToolDefinition);
+    const base = {
+      worktreePath: "/very/long/current/worktree", restorePath: "/very/long/restoration/path",
+      ok: false, removed: false, orphaned: false, diagnostics: [],
+    };
+    const failed = renderResult(exit, { action: "remove" }, {
+      content: [{ type: "text", text: "CANONICAL" }],
+      details: { ...base, outcome: "removal-failed", error: hostileError },
+    }, { width: 44, theme }).join(" ");
+    expect(failed).toContain("removal failed; state unknown; restored");
+    expect(failed).not.toContain("/very/long");
+    expect(failed).not.toContain("variable-detail");
+
+    const deferred = renderResult(exit, { action: "remove" }, {
+      content: [{ type: "text", text: "CANONICAL" }],
+      details: { ...base, outcome: "deferred-removal", ok: true, orphaned: true },
+    }, { width: 28, theme }).join(" ");
+    expect(deferred).toContain("removal deferred; restored");
+    expect(deferred).not.toContain("/very/long");
+    expect(calls).toContainEqual({ slot: "warning", text: "removal failed; state unknown" });
+    expect(calls).toContainEqual({ slot: "warning", text: "removal deferred" });
+    expect(calls).toContainEqual({ slot: "muted", text: "; restored" });
   });
 
   it("keeps Exit removal failures to one safe bounded row across hostile Unicode widths", () => {

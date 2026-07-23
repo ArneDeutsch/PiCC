@@ -16,10 +16,12 @@ import {
 } from "./tools/search-tools.js";
 import { genericResultComponent, type RenderCtx } from "./tool-shell.js";
 import {
-  formatDisplayPath,
+  formatDisplayPathFromRoots,
   formatToolDisplayName,
-  resolveDisplayRoot,
+  priorityDisplayRow,
+  resolveDisplayRoots,
   type DisplayRootResolver,
+  type DisplayRoots,
 } from "./tool-display.js";
 import { themedFg } from "./render-util.js";
 const LINE_BREAK_RE = /\r\n?|\n|\u2028|\u2029/;
@@ -46,6 +48,7 @@ interface RenderContext extends RenderCtx {
 }
 
 type SearchName = "Grep" | "Glob";
+type StockSearchName = "grep" | "find" | "ls";
 type Snapshot = Record<string, unknown>;
 
 function safeOwn(value: unknown, key: PropertyKey): unknown {
@@ -81,7 +84,7 @@ function snapshotArgs(value: unknown): Snapshot {
   const snapshot: Snapshot = {};
   for (const key of [
     "pattern", "path", "glob", "type", "output_mode", "-i", "-n", "-o", "-A", "-B",
-    "-C", "context", "multiline", "head_limit", "offset",
+    "-C", "context", "multiline", "head_limit", "offset", "limit",
   ]) {
     const own = safeOwn(value, key);
     if (own !== undefined) snapshot[key] = own;
@@ -325,10 +328,13 @@ function styledCore(
   theme: unknown,
 ): SummaryCore {
   const title = safeFg(theme, "text", formatToolDisplayName(toolName));
-  const statusText = status ? ` · ${status}${recovery}` : "";
+  const failed = status === "failed" || status === "fail";
+  const statusText = status
+    ? safeFg(theme, "muted", " · ") + safeFg(theme, failed ? "error" : "muted", status) +
+      (recovery ? safeFg(theme, "muted", recovery) : "")
+    : "";
   return {
-    line: title + (expression ? ` ${safeFg(theme, "toolOutput", expression)}` : "") +
-      (statusText ? safeFg(theme, "muted", statusText) : ""),
+    line: title + (expression ? ` ${safeFg(theme, "accent", expression)}` : "") + statusText,
     hasStatus: Boolean(status),
   };
 }
@@ -561,35 +567,73 @@ function combinedComponent(components: readonly Component[]): Component {
 
 export interface CompactSearchRenderingDependencies {
   resolveDisplayRoot?: DisplayRootResolver;
+  repositoryRoot?: string;
 }
 
-// HTML serializes the call before the result, so renderResult owns the settled summary;
-// the empty call also avoids a second TUI content row.
+function stockSearchCall(
+  toolName: StockSearchName,
+  argsValue: unknown,
+  theme: unknown,
+  roots: DisplayRoots,
+): Component {
+  const args = snapshotArgs(argsValue);
+  const rawPath = typeof args.path === "string" ? args.path : ".";
+  const displayPath = sanitize(formatDisplayPathFromRoots(rawPath, roots), true) || ".";
+  const optional = [
+    ...(toolName === "grep" && typeof args.glob === "string" && sanitize(args.glob, true)
+      ? [`glob ${quote(sanitize(args.glob, true))}`] : []),
+    ...(typeof args.limit === "number" && Number.isFinite(args.limit) ? [`limit ${String(args.limit)}`] : []),
+  ];
+  if (toolName === "ls") {
+    return priorityDisplayRow("ls", displayPath, [], optional, "", theme);
+  }
+  const expression = sanitize(args.pattern, true) || "?";
+  return priorityDisplayRow(toolName, expression, [], [`in ${displayPath}`, ...optional], "", theme);
+}
+
+// HTML serializes custom calls before results, so PiCC compact rows are result-owned.
+// Pi's stock built-ins retain their native result renderer and only replace the call fragment.
 export function withCompactSearchRendering<T extends ToolDefinition>(
   tool: T,
   dependencies: CompactSearchRenderingDependencies = {},
 ): T {
-  if (tool.name !== "Grep" && tool.name !== "Glob") throw new TypeError("compact search rendering accepts only Grep or Glob tools");
   const toolName = tool.name;
-  const roots = new WeakMap<object, string | undefined>();
-  const rootFor = (context: unknown): string | undefined => {
+  if (toolName !== "Grep" && toolName !== "Glob" && toolName !== "grep" && toolName !== "find" && toolName !== "ls") {
+    throw new TypeError("compact search rendering accepts only Grep, Glob, grep, find, or ls tools");
+  }
+  const roots = new WeakMap<object, DisplayRoots>();
+  const rootsFor = (context: unknown): DisplayRoots => {
     const state = safeGet(context, "state");
-    if ((typeof state !== "object" && typeof state !== "function") || state === null) {
-      return resolveDisplayRoot(dependencies.resolveDisplayRoot, context);
-    }
-    if (!roots.has(state as object)) roots.set(state as object, resolveDisplayRoot(dependencies.resolveDisplayRoot, context));
-    return roots.get(state as object);
+    const resolved = () => resolveDisplayRoots(
+      dependencies.resolveDisplayRoot,
+      dependencies.repositoryRoot,
+      context,
+    );
+    if ((typeof state !== "object" && typeof state !== "function") || state === null) return resolved();
+    if (safeGet(context, "argsComplete") === false) return resolved();
+    if (!roots.has(state as object)) roots.set(state as object, resolved());
+    return roots.get(state as object) ?? {};
   };
+  if (toolName === "grep" || toolName === "find" || toolName === "ls") {
+    return {
+      ...tool,
+      renderCall(args: unknown, theme: unknown, context: RenderContext): Component {
+        return stockSearchCall(toolName, args, theme, rootsFor(context));
+      },
+    } as T;
+  }
   return {
     ...tool,
     renderCall(_args: unknown, _theme: unknown, context: RenderContext): Component {
-      rootFor(context);
+      rootsFor(context);
       return { render: () => [] };
     },
     renderResult(result: ResultShape, options: { isPartial?: boolean }, theme: unknown, context: RenderContext): Component {
       try {
         const args = snapshotArgs(safeGet(context, "args"));
-        if (typeof args.path === "string") args.path = formatDisplayPath(args.path, rootFor(context));
+        if (typeof args.path === "string") {
+          args.path = sanitize(formatDisplayPathFromRoots(args.path, rootsFor(context)), true);
+        }
         if (safeGet(context, "isError") === true) {
           const failed: SummaryState = { status: "failed", compactStatus: "fail" };
           return combinedComponent([

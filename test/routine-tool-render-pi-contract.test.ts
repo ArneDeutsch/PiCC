@@ -410,6 +410,7 @@ describe("real Pi routine rendering composition", () => {
     const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
     const piDist = mainUrl.slice(0, mainUrl.indexOf("/dist/"));
     const htmlModule = await import(`${piDist}/dist/core/export-html/tool-renderer.js`) as any;
+    const ansiModule = await import(`${piDist}/dist/core/export-html/ansi-to-html.js`) as any;
     const themeModule = await import(`${piDist}/dist/modes/interactive/theme/theme.js`) as any;
     const tools = new Map([
       ["EnterWorktree", wrapForSelfShell(withRoutineToolRendering({ name: "EnterWorktree" } as never))],
@@ -434,7 +435,15 @@ describe("real Pi routine rendering composition", () => {
       false,
     );
     expect(ordinary?.expanded).toContain(">enter worktree</span>");
-    expect(ordinary?.expanded).toContain(">(/repo/wt) on branch worktree-html</span>");
+    const spanStyle = (html: string, text: string) => Array.from(
+      html.matchAll(/<span style="([^"]*)">([^<]*)<\/span>/gu),
+      (match) => ({ style: match[1], text: match[2] }),
+    ).find((span) => span.text === text)?.style;
+    const targetStyle = spanStyle(ordinary?.expanded ?? "", "/repo/wt");
+    const branchStyle = spanStyle(ordinary?.expanded ?? "", "worktree-html");
+    expect(targetStyle).toBe(spanStyle(ansiModule.ansiToHtml(themeModule.theme.fg("accent", "/repo/wt")), "/repo/wt"));
+    expect(branchStyle).toBe(spanStyle(ansiModule.ansiToHtml(themeModule.theme.fg("muted", "worktree-html")), "worktree-html"));
+    expect(targetStyle).not.toBe(branchStyle);
     expect(ordinary?.expanded).not.toContain("HIDDEN ENTER CANONICAL");
 
     const exitId = "html-exit-worktree";

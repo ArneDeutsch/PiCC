@@ -422,15 +422,27 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
 4. **Framing:** use `renderShell: "self"` only when you truly want to own every line. The default
    shell supplies padded state-background framing only; renderers still own content, diffs, and
    width safety.
-5. **Color:** prefer an existing `ThemeColor` slot over raw ANSI so themes keep working; there are
+5. **Hierarchy and paths:** accent only an explicitly allowlisted primary field; keep counts,
+   filters, durations, and hints muted without overriding warning/error roles. Snapshot the active
+   workspace and stable repository once per invocation, then format raw paths workspace-relative
+   first, visibly marked repository-relative second, and absolute otherwise. Historical/export
+   contexts use their supplied `cwd`, not mutable session state; sanitize only after classification.
+6. **Machine-mode boundary:** presentation decorators may change human renderer components only.
+   They must not rewrite arguments, canonical results, transcripts, execution, or print/JSON/RPC
+   output. Interactive UI remains TUI-gated as described under "The one mental model."
+7. **HTML boundary:** Pi owns export cards and escaping. Eligible custom PiCC renderer fragments may
+   carry compatible ANSI hierarchy through Pi's conversion, but stock built-in cards remain
+   template-rendered by Pi; exact TUI parity and historical-workspace reconstruction are not
+   contracts.
+8. **Color:** prefer an existing `ThemeColor` slot over raw ANSI so themes keep working; there are
    no new slots.
-6. **Keys:** add via `registerShortcut` or handle inside your own component; do not try to reassign
+9. **Keys:** add via `registerShortcut` or handle inside your own component; do not try to reassign
    Pi's actions.
-7. **Upgrade safety:** if you touch `custom`/`widget`/`theme`/`setEditorComponent`, note it under
+10. **Upgrade safety:** if you touch `custom`/`widget`/`theme`/`setEditorComponent`, note it under
    "Risks / churn watchpoints" in [`doc/pi-integration.md`](pi-integration.md) and cover the
    import/shape in the Pi-contract smoke test — these are the newest, most-churning parts of the
    API.
-8. **Parity check:** a Claude Code project does not expect PiCC-specific persistent or interactive
+11. **Parity check:** a Claude Code project does not expect PiCC-specific persistent or interactive
    chrome. Make that UI additive and opt-in. Default tool-presentation adapters may apply
    automatically when they change only human rendering, preserve canonical results, and keep
    failures and unfamiliar outcomes visible.
