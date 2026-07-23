@@ -152,7 +152,13 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
       } as never);
       const canonicalBytes = Buffer.from(JSON.stringify(session.getEntries()), "utf8");
 
-      await htmlExportModule.exportSessionToHtml(session, undefined, { outputPath, toolRenderer });
+      await htmlExportModule.exportSessionToHtml(session, {
+        tools: [{
+          name: mcpProxy.name,
+          description: mcpProxy.description,
+          parameters: mcpProxy.parameters,
+        }],
+      }, { outputPath, toolRenderer });
 
       expect(Buffer.from(JSON.stringify(session.getEntries()), "utf8")).toEqual(canonicalBytes);
       const html = readFileSync(outputPath, "utf8");
@@ -173,6 +179,7 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
       expect(encoded).toBeDefined();
       const data = JSON.parse(Buffer.from(encoded!, "base64").toString("utf8")) as {
         entries: unknown[];
+        tools?: Array<{ name: string }>;
         renderedTools?: Record<string, {
           callHtml?: string;
           resultHtmlCollapsed?: string;
@@ -181,6 +188,8 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
       };
       expect(Buffer.from(JSON.stringify(data.entries), "utf8")).toEqual(canonicalBytes);
       expect(JSON.stringify(data.entries)).toContain('"name":"read"');
+      expect(data.tools?.map((tool) => tool.name)).toEqual(["mcp__fixture__echo"]);
+      expect(JSON.stringify(data.tools)).not.toContain("echo (fixture MCP)");
       expect(requestedDefinitions).toContain("CustomBoundary");
       expect(requestedDefinitions).toContain("mcp__fixture__echo");
       expect(requestedDefinitions).not.toContain("read");

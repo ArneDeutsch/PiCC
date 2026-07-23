@@ -4,8 +4,9 @@ import { defineConfig } from "vitest/config";
  * Two projects share one config so a single `vitest run` covers both lanes:
  *
  *  - `unit`  — everything except the real-Pi e2e files (`**​/e2e-*.test.ts`).
- *  - `e2e`   — the `test/e2e-*.test.ts` files, each of which spawns the real Pi
- *              CLI plus nested subagent children.
+ *  - `e2e`   — the `test/e2e-*.test.ts` files, each of which runs the real Pi
+ *              CLI with mock-model infrastructure; subagent scenarios also
+ *              spawn nested Pi children.
  *
  * Both projects retain fork parallelism but cap `maxWorkers` at two. Unit tests
  * also include real Git, hook, and MCP children, so bounding each lane limits
@@ -56,8 +57,9 @@ export default defineConfig({
           testTimeout: 30000,
           hookTimeout: 30000,
           pool: "forks",
-          // Each e2e file's Pi child spawns more children (subagent Pi + mock
-          // server), so real-process count is multiplicative — keep this small.
+          // Every e2e file runs a real Pi CLI with mock-model infrastructure;
+          // subagent scenarios add nested Pi children, so bounded concurrency
+          // keeps the multiplicative process count small.
           // vitest 4 has no per-project (or top-level) `minWorkers`; the cap is
           // `maxWorkers`, which replaced the removed poolOptions.forks.maxForks.
           maxWorkers: 2,

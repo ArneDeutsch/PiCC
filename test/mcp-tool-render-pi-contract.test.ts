@@ -88,8 +88,9 @@ describe("real Pi MCP tool-row contract", () => {
 
     const pending = row(definition, "mcp-pending");
     pending.setArgsComplete();
-    const pendingLines = plain(pending.render(80) as string[]);
-    expect(pendingLines.join("\n")).toContain("○ Echo__V2 (Srv.Name MCP)");
+    const pendingLines = plain(pending.render(80) as string[])
+      .filter((line) => visibleWidth(line) > 0);
+    expect(pendingLines).toEqual(["○ Echo__V2 (Srv.Name MCP)"]);
     expect(pendingLines.join("\n")).not.toContain(definition.name);
 
     const canonicalResult = Object.freeze({
