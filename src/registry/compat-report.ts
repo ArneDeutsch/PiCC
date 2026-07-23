@@ -1,11 +1,7 @@
 /**
  * Compatibility report — generated from the capability registry so it cannot
- * drift from actual behavior.
- *
- * On config load, buildCompatReport() scans the assembled project for
- * declared-but-not-fully-honored usage. renderStartupNotice() emits ONE
- * consolidated, suppressible notice per session; renderDoctorReport() gives
- * the full /doctor breakdown on demand. Never silent, never nagging.
+ * drift from actual behavior. buildCompatReport() scans the assembled project;
+ * renderDoctorReport() gives the full /doctor breakdown on demand.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -19,7 +15,6 @@ import { SUPPORTED_HOOK_EVENTS } from "../types.js";
 import { loadPluginHooks, type InstalledPlugin } from "../claude/plugins.js";
 import { modelSupportsImages } from "../util/model.js";
 import type { ResolvedCompactionConfig } from "../runtime/steering.js";
-import { parseJsonSafe, readTextSafe } from "../util/fs.js";
 import {
   CAPABILITY_REGISTRY,
   CLAUDE_BASELINE,
@@ -326,10 +321,10 @@ function groupByCapability(findings: CompatFinding[]): Array<{
 //
 // This line is derived from the ACTIVE model's input modalities (via
 // `modelSupportsImages`), NOT from the static capability registry and NOT from
-// the terminal's render capability. It tells a user whether their model can
-// actually see image inputs (image files, pasted/dropped images, notebook image outputs), so a
-// non-vision GPT/Codex user is never silently misled into thinking a pasted
-// screenshot or notebook plot reached the model.
+// the terminal's render capability. When `/doctor` is requested, it tells the
+// user whether their model can actually see image inputs (image files,
+// pasted/dropped images, notebook image outputs), so the report makes explicit
+// whether a screenshot or notebook plot reached the model.
 // ---------------------------------------------------------------------------
 
 /** Display id for the active model (`provider/id` or `id`), or undefined when opaque. */
@@ -373,77 +368,6 @@ function activeModelVisionLine(model: unknown): string {
     `Active model: ${label} — vision: no. Image inputs (image files, pasted/dropped images, notebook image outputs) are ` +
     "sent as text placeholders, not seen by the model; use a vision-capable model to have images seen."
   );
-}
-
-/**
- * The high-value startup warning: emitted ONLY when the active model is known
- * and definitively non-vision (a readable `input` array that lacks "image").
- * Returns undefined for a vision-capable model (the positive line is
- * `/doctor`-only), for an opaque/absent model, and for a model with an `id` but
- * no readable modality array (don't nag when we can't tell — `/doctor` still
- * reports "unknown"). The FIRST line is short and self-contained with the remedy
- * so it survives toast truncation on a narrow terminal; a second, fuller line
- * carries the detail for the notice body / `/doctor`.
- */
-function nonVisionStartupWarning(model: unknown): string | undefined {
-  const id = activeModelId(model);
-  if (id === undefined) return undefined;
-  if (!modelHasVisionAxis(model)) return undefined;
-  if (modelSupportsImages(model)) return undefined;
-  return (
-    `Active model ${id} is not vision-capable — images sent as text; use a vision-capable model.\n` +
-    "Image inputs (image files, pasted/dropped images, notebook image outputs) are sent as text placeholders, not seen by the model."
-  );
-}
-
-/**
- * ONE consolidated startup notice per session.
- * Returns undefined when suppressed or when there is nothing to report.
- */
-export function renderStartupNotice(
-  report: CompatReport,
-  opts: { suppressed: boolean; activeModel?: unknown },
-): string | undefined {
-  // The non-vision active-model warning is DECOUPLED from project-findings
-  // suppression. `/compat suppress` acknowledges this project's compat findings,
-  // but whether the ACTIVE model can see images is a separate, safety-relevant
-  // axis (a user may suppress on a vision model, then later switch to a non-vision
-  // one). So it is computed independent of `suppressed`, and when present it is
-  // always the FIRST line — the emission site builds the toast from that line.
-  const visionWarning = nonVisionStartupWarning(opts.activeModel);
-
-  // Suppression silences only the project-findings body/header. A non-vision model
-  // still surfaces its warning through suppression; a vision-capable or opaque
-  // model stays fully silent (undefined).
-  if (opts.suppressed) return visionWarning;
-
-  const safety = groupByCapability(report.safetyFindings);
-  const functionality = groupByCapability(report.findings);
-  const degradedCount = safety.length + functionality.length + report.unassessed.length;
-
-  if (degradedCount === 0 && visionWarning === undefined) return undefined;
-
-  const lines: string[] = [];
-  if (visionWarning !== undefined) lines.push(visionWarning);
-  if (degradedCount > 0) {
-    lines.push(`PiCC compatibility: ${degradedCount} feature(s) degraded for this project`);
-  }
-  if (safety.length > 0) {
-    lines.push("SAFETY:");
-    for (const g of safety) {
-      lines.push(`  - ${g.capability.id}: ${g.capability.note} [${g.evidence.join("; ")}]`);
-    }
-  }
-  for (const g of functionality) {
-    lines.push(`- ${g.capability.id}: ${g.capability.note} [${g.evidence.join("; ")}]`);
-  }
-  if (report.unassessed.length > 0) {
-    lines.push(
-      `- unassessed (unknown at baseline ${CLAUDE_BASELINE}): ${report.unassessed.length} item(s)`,
-    );
-  }
-  lines.push("Run /doctor for details. (Suppress with /compat suppress)");
-  return lines.join("\n");
 }
 
 const TIER_ORDER = ["partial", "degraded-noop", "not-supported", "na", "full"] as const;
@@ -548,35 +472,4 @@ export function renderDoctorReport(
   }
 
   return lines.join("\n");
-}
-
-// ---------------------------------------------------------------------------
-// Suppression persistence — suppressible once acknowledged
-// ---------------------------------------------------------------------------
-
-/**
- * Harness-owned, non-tracked location: `.claude/.picc/` is PiCC state, never a
- * tracked project file.
- */
-function suppressionPath(projectRoot: string): string {
-  return path.join(projectRoot, ".claude", ".picc", "compat-ack.json");
-}
-
-/** True when the startup notice has been acknowledged/suppressed for this project. */
-export function readSuppression(projectRoot: string): boolean {
-  const data = parseJsonSafe<{ suppressed?: unknown }>(
-    readTextSafe(suppressionPath(projectRoot)),
-  );
-  return data?.suppressed === true;
-}
-
-/** Persist the suppression flag (creates `.claude/.picc/` as needed). Never throws. */
-export function writeSuppression(projectRoot: string, v: boolean): void {
-  const file = suppressionPath(projectRoot);
-  try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, `${JSON.stringify({ suppressed: v }, null, 2)}\n`, "utf8");
-  } catch {
-    // completeness floor: suppression is a convenience, never fatal
-  }
 }

@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import picc from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
@@ -114,7 +115,7 @@ describe("control commands display immediately and never leak to the model", () 
   });
 
   it("every control command is registered and produces immediate entry output", async () => {
-    for (const name of ["doctor", "compat", "quota", "skills", "agents", "usage"]) {
+    for (const name of ["doctor", "quota", "skills", "agents", "usage"]) {
       reset();
       const command = pi.commands.get(name);
       expect(command, `expected /${name} to be registered`).toBeDefined();
@@ -140,14 +141,40 @@ describe("control commands display immediately and never leak to the model", () 
     expect(lines).toContain("second line");
   });
 
-  it("the picc-compat entry renderer renders the startup notice", () => {
-    const renderer = pi.entryRenderers.get("picc-compat");
-    expect(renderer, "expected an entry renderer for picc-compat").toBeDefined();
+  it("does not register or render /compat as a PiCC control surface", () => {
+    expect(pi.commands.has("compat")).toBe(false);
+    expect(pi.entryRenderers.has("picc-compat")).toBe(false);
+  });
 
-    const theme = { fg: (_color: string, text: string) => text };
-    const component = renderer!({ data: { notice: "4 feature(s) degraded" } }, { expanded: false }, theme);
-    const lines: string[] = component.render(80);
-    expect(lines.join("\n")).toContain("4 feature(s) degraded");
+  it("allows a project skill named compat into autocomplete and the ordinary slash transform", async () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), "picc-compat-skill-"));
+    const skillDir = path.join(project, ".claude", "skills", "compat");
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(path.join(project, "CLAUDE.md"), "Temporary compat-skill project.\n", "utf8");
+    fs.writeFileSync(
+      path.join(skillDir, "SKILL.md"),
+      "---\ndescription: User compat skill\nargument-hint: [topic]\n---\nCOMPAT-SKILL-BODY $ARGUMENTS\n",
+      "utf8",
+    );
+
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(project);
+      const fresh = fakePi();
+      picc(fresh.api as never, { onInitializationSettled: fresh.captureInitialization });
+      await fresh.waitForInitialization();
+      const resources = await fresh.fire("resources_discover", { reason: "startup" });
+      const promptDir = resources.promptPaths[0] as string;
+      expect(fs.existsSync(path.join(promptDir, "compat.md"))).toBe(true);
+      expect(fresh.commands.has("compat")).toBe(false);
+
+      const outcome = await fresh.fire("input", { text: "/compat details", source: "interactive" });
+      expect(outcome.action).toBe("transform");
+      expect(String(outcome.text)).toContain("COMPAT-SKILL-BODY details");
+    } finally {
+      process.chdir(previousCwd);
+      fs.rmSync(project, { recursive: true, force: true });
+    }
   });
 
   it("does not treat a real skill slash command as a control command (it transforms)", async () => {

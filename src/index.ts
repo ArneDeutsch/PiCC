@@ -77,7 +77,7 @@ import {
   type ResumeToken,
 } from "./runtime/mid-run-compaction.js";
 import { registerCodexAbortGuard } from "./runtime/codex-abort-guard.js";
-import { buildCompatReport, readSuppression, renderDoctorReport, renderStartupNotice, writeSuppression, type CompatReport } from "./registry/compat-report.js";
+import { buildCompatReport, renderDoctorReport, type CompatReport } from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
 import { applyUnicodeSafeProcessEnv, computeSessionScratchDir } from "./util/env.js";
@@ -90,7 +90,7 @@ import type { ClaudeAgent, ClaudeSkill } from "./types.js";
  * system-prompt assembly each turn (also the compaction-preservation mechanism),
  * deny/hook enforcement on tool events, the Claude tool surface (Agent, Skill,
  * worktrees, web, tasks, degrade stubs), cwd-swapping built-in tool overrides,
- * skill slash commands, and the /doctor–/compat–/quota control surface.
+ * skill slash commands, and the /doctor–/quota control surface.
  */
 
 /** Delegates hook fire() to the base (settings+plugins) runner plus dynamic scoped runners. */
@@ -385,8 +385,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     console.error(`PiCC compatibility scan failed (continuing): ${(err as Error).message}`);
     compat = { findings: [], safetyFindings: [], unassessed: [] };
   }
-  let compatSuppressed = readSuppression(project.root) || config.suppressCompatNotice === true;
-
   let currentModelRef = "";
   let currentModel: unknown; // the orchestrator's active model — inherited by subagents
   let steeringText: string | undefined;
@@ -1740,19 +1738,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           { deliverAs: "nextTurn" },
         );
       }
-      if (event.reason === "startup") {
-        // Pass the live suppression flag: when compat is suppressed, the notice is
-        // silent EXCEPT for a model-derived non-vision safety warning, which is
-        // decoupled from project-findings suppression and still surfaces here.
-        const notice = renderStartupNotice(compat, {
-          suppressed: compatSuppressed,
-          activeModel: currentModel,
-        });
-        if (notice && ctx.hasUI) ctx.ui.notify(notice.split("\n")[0] + " — run /doctor", "warning");
-        if (notice) {
-          pi.appendEntry("picc-compat", { notice });
-        }
-      }
     } catch (err) {
       console.error(`PiCC session_start failed: ${(err as Error).message}`);
     }
@@ -1918,11 +1903,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         return shadow || inputDisposition === "quarantine" ? { action: "handled" } : result;
       };
 
-      // 0) PiCC control commands (/doctor /compat /quota /skills /agents /usage).
+      // 0) PiCC control commands (/doctor /quota /skills /agents /usage).
       //    In interactive mode Pi's own command router intercepts these before
       //    the input event; this branch covers the other modes so a control
       //    command is never sent to the model.
-      const cmd = /^\/(doctor|compat|quota|skills|agents|usage)(?:[ \t]+([\s\S]*))?$/.exec(
+      const cmd = /^\/(doctor|quota|skills|agents|usage)(?:[ \t]+([\s\S]*))?$/.exec(
         (event.text ?? "").trim(),
       );
       if (cmd) {
@@ -2457,7 +2442,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   // ---------------------------------------------------------------------------
-  // Control commands: /doctor /compat /quota /skills /agents /usage.
+  // Control commands: /doctor /quota /skills /agents /usage.
   //
   // Rendered by shared functions so BOTH the registered command (interactive
   // path, where Pi intercepts extension commands before the model) and the
@@ -2584,8 +2569,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   /**
-   * Renders control-command output (and the compat notice) as a TUI-only
-   * transcript entry. Pi's `Component` contract is structural
+   * Renders control-command output as a TUI-only transcript entry. Pi's
+   * `Component` contract is structural
    * ({ render(width) => lines }), so no pi-tui import is needed.
    */
   function controlOutputComponent(title: string, body: string, theme: any) {
@@ -2605,9 +2590,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
   pi.registerEntryRenderer("picc-control", (entry: any, _opts: any, theme: any) =>
     controlOutputComponent(`/${entry.data?.command ?? "picc"}`, entry.data?.output ?? "", theme),
-  );
-  pi.registerEntryRenderer("picc-compat", (entry: any, _opts: any, theme: any) =>
-    controlOutputComponent("PiCC compatibility", entry.data?.notice ?? "", theme),
   );
   pi.registerEntryRenderer("picc-proactive-compact", (entry: any, _opts: any, theme: any) =>
     controlOutputComponent("PiCC proactive compaction", entry.data?.notice ?? "", theme),
@@ -2651,19 +2633,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         return renderUsageReport();
       case "quota":
         return renderQuota(ctx);
-      case "compat": {
-        const arg = (args ?? "").trim();
-        if (arg === "suppress") {
-          writeSuppression(project.root, true);
-          compatSuppressed = true;
-          return "Compatibility notice suppressed for this project.";
-        }
-        if (arg === "show") {
-          writeSuppression(project.root, false);
-          compatSuppressed = false;
-        }
-        return renderStartupNotice(compat, { suppressed: false, activeModel: currentModel }) ?? "No compatibility findings for this project.";
-      }
       default:
         return undefined;
     }
@@ -2671,7 +2640,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   const CONTROL_COMMANDS: Record<string, string> = {
     doctor: "PiCC: full compatibility breakdown for this project",
-    compat: "PiCC: show or suppress the compatibility notice (usage: /compat [suppress|show])",
     quota: "PiCC: subscription/rate-limit info from the last provider response",
     skills: "PiCC: list the project's Claude skills (invocable + model-only)",
     agents: "PiCC: list the subagents available for dispatch",
@@ -2724,7 +2692,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // would duplicate or be shadowed by these (the skill still executes via the
   // input handler if the name is typed and not intercepted as a built-in).
   const RESERVED_NAMES = new Set([
-    "doctor", "compat", "quota", "skills", "agents", "usage",
+    "doctor", "quota", "skills", "agents", "usage",
     "changelog", "clone", "compact", "copy", "export", "fork", "hotkeys", "import",
     "login", "logout", "model", "name", "new", "quit", "reload", "resume",
     "scoped-models", "session", "settings", "share", "tree", "trust", "help",

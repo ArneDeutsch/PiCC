@@ -24,6 +24,7 @@ import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 let dir: string;
 let pi: FakePi;
 const originalCwd = process.cwd();
+const compatAckSentinel = '{"suppressed":true,"sentinel":"KEEP-BYTES"}\n';
 
 beforeAll(async () => {
   dir = materializeFixture("full-surface");
@@ -31,6 +32,9 @@ beforeAll(async () => {
   fs.writeFileSync(path.join(dir, ".env.local"), "SECRET=1\n");
   fs.mkdirSync(path.join(dir, "config"), { recursive: true });
   fs.writeFileSync(path.join(dir, "config", "app.secret"), "s\n");
+  const ack = path.join(dir, ".claude", ".picc", "compat-ack.json");
+  fs.mkdirSync(path.dirname(ack), { recursive: true });
+  fs.writeFileSync(ack, compatAckSentinel, "utf8");
   // Hermetic user scope: don't absorb the developer's real ~/.claude.
   const userDir = path.join(dir, ".claude-user");
   fs.mkdirSync(userDir, { recursive: true });
@@ -403,10 +407,11 @@ describe("tool surface registration", () => {
     expect(backgroundCalls).toBe(0);
   });
 
-  it("registers the /doctor, /compat, /quota, /skills, /agents control commands", () => {
-    for (const name of ["doctor", "compat", "quota", "skills", "agents"]) {
+  it("registers retained control commands but not /compat", () => {
+    for (const name of ["doctor", "quota", "skills", "agents"]) {
       expect(pi.commands.has(name), `missing command ${name}`).toBe(true);
     }
+    expect(pi.commands.has("compat")).toBe(false);
   });
 
   it("exposes user-invocable skills in the / palette via prompt-template stubs (resources_discover)", async () => {
@@ -691,6 +696,30 @@ describe("permission + hook enforcement (guard)", () => {
     expect(blocked?.block).toBe(true);
   });
 
+  it("keeps matching permissions.ask diagnostics at point of use without executing the tool", async () => {
+    const bashExecute = vi.spyOn(pi.tools.get("bash"), "execute");
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      for (const toolCallId of ["ask-1", "ask-2"]) {
+        const outcome = await pi.fire("tool_call", {
+          toolName: "bash",
+          toolCallId,
+          input: { command: "git push origin main" },
+        });
+        expect(outcome?.block ?? false).toBe(false);
+      }
+      const diagnostics = errorSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes('ask rule "Bash(git push *)" downgraded to allow'));
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]).toContain("default-permissive posture");
+      expect(bashExecute).not.toHaveBeenCalled();
+    } finally {
+      bashExecute.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
   it("runs the warn-only PreToolUse write-guard: allows and injects additionalContext", async () => {
     pi.messages.length = 0;
     // NOTE: touch a file OUTSIDE src/ so this test does not consume the
@@ -832,18 +861,35 @@ describe("session lifecycle hooks", () => {
     expect(result).toEqual({ action: "continue" });
   });
 
-  it("SessionStart hook stdout reaches the model + compat notice raised", async () => {
+  it("keeps noisy non-vision startup quiet while delivering SessionStart context and preserving old ack state", async () => {
     pi.messages.length = 0;
     pi.entries.length = 0;
-    await pi.fire("session_start", { reason: "startup" }, pi.ctx());
-    const sent = pi.messages.map((m) => String(m.message.content)).join("\n");
-    expect(sent).toContain("FS-SESSION-START-HOOK-CONTEXT");
-    // compat: fixture declares ask rules, defaultMode, .mcp.json, unknown settings → one notice
-    const noticeEntry = pi.entries.find((e) => e.customType === "picc-compat");
-    expect(noticeEntry).toBeDefined();
-    const notice = String(noticeEntry?.data?.notice ?? "");
-    expect(notice).toContain("SAFETY");
-    expect(notice.toLowerCase()).toContain("ask");
+    pi.notifications.length = 0;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx({
+        model: { provider: "openai", id: "gpt-text", input: ["text"] },
+      }));
+      const sent = pi.messages.map((m) => String(m.message.content)).join("\n");
+      expect(sent).toContain("FS-SESSION-START-HOOK-CONTEXT");
+      expect(pi.entries.some((e) => e.customType === "picc-compat")).toBe(false);
+      const notificationText = pi.notifications.map((notification) => notification.text).join("\n");
+      expect(notificationText).not.toContain("PiCC compatibility:");
+      expect(notificationText).not.toContain("Run /doctor");
+      expect(notificationText).not.toContain("is not vision-capable");
+
+      const consoleText = [...logSpy.mock.calls, ...errorSpy.mock.calls].flat().join("\n");
+      expect(consoleText).not.toContain("PiCC compatibility:");
+      expect(consoleText).not.toContain("Run /doctor");
+      expect(consoleText).not.toContain("is not vision-capable");
+      expect(consoleText).not.toContain("images sent as text");
+      expect(fs.readFileSync(path.join(dir, ".claude", ".picc", "compat-ack.json"), "utf8"))
+        .toBe(compatAckSentinel);
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
   });
 
   it("/doctor renders the registry-generated breakdown", async () => {
@@ -855,6 +901,31 @@ describe("session lifecycle hooks", () => {
       .join("\n");
     expect(doctor).toContain("claude-code-2.1.x");
     expect(doctor.toLowerCase()).toContain("mcp");
+  });
+
+  it("handles headless /doctor immediately with findings and active-model vision state", async () => {
+    await pi.fire("session_start", { reason: "startup" }, pi.printCtx({
+      model: { provider: "openai", id: "gpt-text", input: ["text"] },
+    }));
+    pi.entries.length = 0;
+    pi.messages.length = 0;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const outcome = await pi.fire("input", { text: "/doctor", source: "print" }, pi.printCtx());
+      expect(outcome).toEqual({ action: "handled" });
+      const entry = pi.entries.find(
+        (e) => e.customType === "picc-control" && e.data?.command === "doctor",
+      );
+      const output = String(entry?.data?.output ?? "");
+      expect(output).toContain("SAFETY setting.permissions.ask");
+      expect(output).toContain("Active model: openai/gpt-text — vision: no");
+      const stdout = logSpy.mock.calls.flat().join("\n");
+      expect(stdout).toContain("SAFETY setting.permissions.ask");
+      expect(stdout).toContain("Active model: openai/gpt-text — vision: no");
+      expect(pi.messages).toHaveLength(0);
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   it("compaction: PostCompact re-injects active skills mid-run via steer", async () => {
@@ -1853,7 +1924,7 @@ describe("degradation floor", () => {
     // a prompt-type PreCompact handler, futureUnknownSetting, outputStyle, .mcp.json,
     // future-agent with mcpServers/memory, and unknown skill frontmatter.
     expect(pi.tools.size).toBeGreaterThan(15);
-    expect(pi.commands.size).toBeGreaterThanOrEqual(3); // doctor, compat, quota
+    expect(pi.commands.size).toBeGreaterThanOrEqual(3); // doctor, quota, skills
   });
 
   it("future-agent (memory/mcpServers/unknown keys) is still dispatchable via the catalog", async () => {
