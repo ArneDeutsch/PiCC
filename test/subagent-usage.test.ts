@@ -169,7 +169,7 @@ describe("foreground surfaces the usage", () => {
     expect(rendered).toContain("usage:");
     expect(rendered).toContain("in 100");
     expect(rendered).toContain("out 50");
-    expect(rendered).toContain("$0.0123");
+    expect(rendered).toContain("$0.01");
   });
 });
 

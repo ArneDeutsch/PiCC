@@ -2222,7 +2222,7 @@ describe("Subagent live progress", () => {
       details: { outcome: "completed", usage: { totalTokens: 1200, costUsd: 0.03 } },
     });
     expect(withUsage).toContain("usage:");
-    expect(withUsage).toContain("1200 tokens");
+    expect(withUsage).toContain("1.2k tokens");
 
     // Failed-with-partial shows a failed badge and preserves the partial body.
     const failed = render({
@@ -3120,7 +3120,7 @@ describe("condensed completion records", () => {
     expect(at120[0]).toContain(RECORD_EXPAND_HINT);
     // Nothing is lost: the expanded usage: footer keeps the full compact line.
     const expanded = renderLines(details, "the answer", true).join("\n");
-    expect(expanded).toContain("usage: in 10 · out 5 · cache read 2048 · cache write 1024 · $0.25");
+    expect(expanded).toContain("usage: in 10 · out 5 · cache read 2k · cache write 1k · $0.25");
   });
 
   it("compact success omits transcript filenames for both path separator styles", () => {

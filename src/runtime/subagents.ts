@@ -45,7 +45,9 @@ import {
 import {
   renderAgentCall,
   renderAgentResult,
+  renderSendMessageCall,
   renderSendMessageResult,
+  rememberSendMessageResult,
   type SubagentLifecycleRenderContext,
   type SubagentRenderDetails,
 } from "./subagent-render.js";
@@ -3248,6 +3250,13 @@ export function createSendMessageToolDefinition(
         description: "The follow-up instruction, delivered to the agent verbatim as a user turn",
       }),
     }),
+    renderCall(
+      args: Record<string, unknown>,
+      theme: unknown,
+      context: SubagentLifecycleRenderContext,
+    ) {
+      return renderSendMessageCall(args, theme, context);
+    },
     renderResult(
       result: { content?: Array<{ type?: string; text?: string }>; details?: Record<string, unknown> },
       _options: Record<string, unknown>,
@@ -3284,7 +3293,7 @@ export function createSendMessageToolDefinition(
           : [result.error ?? `Subagent "${record.agentName}" ${result.outcome}.`, result.finalMessage]
               .filter(Boolean)
               .join("\n\n");
-        return {
+        return rememberSendMessageResult({
           content: [{ type: "text", text }],
           details: {
             agentId: record.agentId,
@@ -3294,7 +3303,7 @@ export function createSendMessageToolDefinition(
             recovered: result.outcome === "completed",
             truncated: result.truncated === true,
           },
-        };
+        }, to);
       }
 
       // Running background dispatch → steer (mid-task course correction). The

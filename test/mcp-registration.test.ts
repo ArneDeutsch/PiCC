@@ -160,6 +160,23 @@ describe("MCP main-session tool exposure (wired)", () => {
     expect(pi.tools.get("mcp__fixture__echo").description).toBe("echoes text back");
   });
 
+  it("keeps path-shaped arguments on an actually registered inert proxy generic", () => {
+    const tool = pi.tools.get("mcp__fixture__echo");
+    const pathArgument = path.join(dir, "nested", "secret.txt");
+    const context = { state: {}, args: { path: pathArgument }, cwd: dir, isError: false, isPartial: false };
+    const call = tool.renderCall(context.args, undefined, context).render(100).join("\n");
+    const result = tool.renderResult(
+      { content: [{ type: "text", text: "inert proxy evidence" }] },
+      { expanded: false, isPartial: false },
+      undefined,
+      context,
+    ).render(100).join("\n");
+    expect(call).toContain("mcp fixture echo");
+    expect(call).not.toContain(pathArgument);
+    expect(call).not.toContain("nested/secret.txt");
+    expect(result).toContain("inert proxy evidence");
+  });
+
   it("round-trips a real tool call through the registered proxy", async () => {
     const result = await pi.tools.get("mcp__fixture__echo").execute("call-1", { text: "round-trip" });
     expect(result.content).toEqual([{ type: "text", text: "round-trip" }]);
