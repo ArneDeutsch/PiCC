@@ -1281,7 +1281,7 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     }
   });
 
-  it("renders active-worktree paths relatively without changing canonical Read/Bash bytes", async () => {
+  it("renders custom and rebuilt-stock paths workspace-first then repository-relative without changing canonical bytes", async () => {
     const previousBindings = getKeybindings();
     setKeybindings(new KeybindingsManager({
       ...TUI_KEYBINDINGS,
@@ -1291,17 +1291,30 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     const wt = entered.details.worktreePath as string;
     try {
       const absoluteFile = path.join(wt, "display-proof.txt");
+      const repositoryFile = path.join(dir, "repository-display-proof.txt");
       fs.writeFileSync(absoluteFile, "alpha\nbeta", "utf8");
+      fs.writeFileSync(repositoryFile, "repository proof", "utf8");
       const theme = { fg: (_slot: string, text: string) => text, bold: (text: string) => text };
       const cases = [
         { name: "read", args: { path: absoluteFile }, expected: "read display-proof.txt" },
-        { name: "bash", args: { command: "printf 'BYTE-STABLE'" }, expected: "printf 'BYTE-STABLE'" },
+        { name: "Grep", args: { pattern: "alpha", path: absoluteFile }, expected: "display-proof.txt" },
+        { name: "read", args: { path: repositoryFile }, expected: "read repo:repository-display-proof.txt" },
+        { name: "Grep", args: { pattern: "repository", path: repositoryFile }, expected: "repo:repository-display-proof.txt" },
       ] as const;
       for (const entry of cases) {
         const tool = pi.tools.get(entry.name);
         const argsBefore = structuredClone(entry.args);
         const state = {};
-        const context = { args: entry.args, state, cwd: dir, isPartial: false, isError: false, expanded: false };
+        const context = {
+          args: entry.args,
+          state,
+          cwd: dir,
+          argsComplete: true,
+          executionStarted: false,
+          isPartial: false,
+          isError: false,
+          expanded: false,
+        };
         tool.renderCall(entry.args, theme, context);
         const result = await tool.execute(`t02-${entry.name}-display`, entry.args);
         const resultBefore = structuredClone(result);
@@ -1313,6 +1326,7 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
       }
     } finally {
       await pi.tools.get("ExitWorktree").execute("t02-display-wt-exit", { action: "remove" });
+      fs.rmSync(path.join(dir, "repository-display-proof.txt"), { force: true });
       setKeybindings(previousBindings);
     }
   });
@@ -1467,7 +1481,7 @@ describe("background settlement delivery (offline integration via the seam)", ()
     }
   });
 
-  it("keeps Agent, TaskOutput, and TaskStop canonical data presentation-free in print/RPC contexts", async () => {
+  it("keeps execution-produced lifecycle and canonical SendMessage values unchanged after renderer calls", async () => {
     const canonicalText = `MACHINE-CANONICAL-RESULT ${dir}`;
     const handle = fakeSdk({ replies: [canonicalText, canonicalText] });
     const { p, internals } = await wire();
@@ -1475,10 +1489,11 @@ describe("background settlement delivery (offline integration via the seam)", ()
     const agent = p.tools.get("Agent");
     const taskOutput = p.tools.get("TaskOutput");
     const taskStop = p.tools.get("TaskStop");
+    const sendMessage = p.tools.get("SendMessage");
     const theme = { fg: (_slot: string, text: string) => `\u001b[36m${text}\u001b[39m`, bold: (text: string) => text };
 
-    for (const mode of ["print", "rpc"] as const) {
-      const machineContext = mode === "print" ? p.printCtx() : p.rpcCtx();
+    for (const mode of ["offline"] as const) {
+      const machineContext = p.printCtx();
       const agentArgs = { subagent_type: "reviewer", prompt: "machine boundary", run_in_background: true };
       const agentBefore = structuredClone(agentArgs);
       const started = await agent.execute(`${mode}-agent`, agentArgs, undefined, undefined, machineContext);
@@ -1542,12 +1557,64 @@ describe("background settlement delivery (offline integration via the seam)", ()
       agent.renderResult(started, { expanded: false, isPartial: false }, theme, { state: {}, args: agentArgs }).render(80);
       taskOutput.renderResult(output, { expanded: false, isPartial: false }, theme, { state: {}, args: outputArgs }).render(80);
       taskStop.renderResult(stop, {}, theme, { state: {}, args: stopArgs }).render(80);
+      const sendArgs = { to: "reviewer", message: "MACHINE-MESSAGE-BYTES" };
+      const exceptionalSend = {
+        content: [{ type: "text", text: "MACHINE-EXCEPTION-EVIDENCE" }],
+        details: { delivery: "checkpoint-recovery", outcome: "failed", recovered: false, truncated: false },
+      };
+      const sendBefore = structuredClone({ sendArgs, exceptionalSend });
+      const sendContext = { state: {}, args: sendArgs, isError: false };
+      sendMessage.renderCall(sendArgs, theme, sendContext).render(80);
+      sendMessage.renderResult(exceptionalSend, { expanded: false, isPartial: false }, theme, sendContext).render(80);
+      expect({ sendArgs, exceptionalSend }).toEqual(sendBefore);
       expect({ started, output, stop }).toEqual(expectedCanonical);
-      const machineBytes = JSON.stringify(expectedCanonical);
+      const machineBytes = JSON.stringify({ ...expectedCanonical, sendArgs, exceptionalSend });
       expect(machineBytes).toContain(taskId);
       expect(machineBytes).toContain("MACHINE-CANONICAL-RESULT");
+      expect(machineBytes).toContain("MACHINE-MESSAGE-BYTES");
+      expect(machineBytes).toContain("MACHINE-EXCEPTION-EVIDENCE");
       expect(machineBytes).not.toContain("\u001b");
       expect(machineBytes).not.toContain(RECORD_EXPAND_HINT);
+    }
+
+    const release = deferred<void>();
+    const steerHandle = fakeSdk({ replies: [{ text: "steered final", gate: release.promise }] });
+    const { p: steerPi, internals: steerInternals } = await wire();
+    steerInternals.subagentRuntime.setSdkForTest(steerHandle.sdk);
+    const steerAgent = steerPi.tools.get("Agent");
+    const registeredSendMessage = steerPi.tools.get("SendMessage");
+    const started = await steerAgent.execute("real-steer-agent", {
+      subagent_type: "reviewer",
+      prompt: "hold for ordinary SendMessage",
+      run_in_background: true,
+    });
+    try {
+      await steerHandle.waitForPromptCalls(1);
+      const args = { to: String(started.details.agentId), message: "REAL-ORDINARY-MESSAGE-BYTES" };
+      const produced = await registeredSendMessage.execute("real-ordinary-send", args);
+      const canonical = structuredClone({ args, produced });
+      const context = { state: {}, args, isError: false };
+      registeredSendMessage.renderCall(args, theme, context).render(80);
+      const rendered = registeredSendMessage.renderResult(
+        produced,
+        { expanded: false, isPartial: false },
+        theme,
+        context,
+      ).render(80);
+      expect(rendered).toHaveLength(1);
+      expect({ args, produced }).toEqual(canonical);
+      expect(produced.details).toEqual(expect.objectContaining({
+        agentId: started.details.agentId,
+        agent: "reviewer",
+        delivery: "steer",
+      }));
+      expect(produced.content[0].text).toContain("mid-task course correction");
+      expect(JSON.stringify({ args, produced })).toContain("REAL-ORDINARY-MESSAGE-BYTES");
+    } finally {
+      release.resolve();
+      await steerPi.tools.get("TaskOutput").execute("collect-real-steer", {
+        task_id: String(started.details.taskId),
+      });
     }
   });
 

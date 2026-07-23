@@ -1525,13 +1525,19 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // presentation decorator, before registration so canonical results retain
       // its terminate metadata. `customToolsFor` skips this parent-TUI chain.
       const mainSessionTool: Record<string, unknown> = tool.name === "Grep" || tool.name === "Glob"
-        ? withCompactSearchRendering(tool as unknown as ToolDefinition, { resolveDisplayRoot: getCwd }) as unknown as Record<string, unknown>
+        ? withCompactSearchRendering(tool as unknown as ToolDefinition, {
+            resolveDisplayRoot: getCwd,
+            repositoryRoot: project.root,
+          }) as unknown as Record<string, unknown>
         : tool;
       const routineRendered = withRoutineToolRendering(
         mainSessionTool as unknown as ToolDefinition,
-        { resolveDisplayRoot: getCwd },
+        { resolveDisplayRoot: getCwd, repositoryRoot: project.root },
       );
-      const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered, { resolveDisplayRoot: getCwd });
+      const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered, {
+        resolveDisplayRoot: getCwd,
+        repositoryRoot: project.root,
+      });
       pi.registerTool(mainCheckpointGate.wrapTool(
         wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
       ));
@@ -1597,11 +1603,20 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         ...(shellPath ? { shellPath } : {}),
       });
       for (const { def } of builtins) {
+        const searchRendered = def.name === "grep" || def.name === "find" || def.name === "ls"
+          ? withCompactSearchRendering(def as unknown as ToolDefinition, {
+              resolveDisplayRoot: getCwd,
+              repositoryRoot: project.root,
+            })
+          : def as unknown as ToolDefinition;
         const routineRendered = withRoutineToolRendering(
-          def as unknown as ToolDefinition,
-          { resolveEditRenderCwd: getCwd, resolveDisplayRoot: getCwd },
+          searchRendered,
+          { resolveEditRenderCwd: getCwd, resolveDisplayRoot: getCwd, repositoryRoot: project.root },
         );
-        const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered, { resolveDisplayRoot: getCwd });
+        const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered, {
+          resolveDisplayRoot: getCwd,
+          repositoryRoot: project.root,
+        });
         pi.registerTool(mainCheckpointGate.wrapTool(
           wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
         ));

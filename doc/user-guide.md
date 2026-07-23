@@ -173,11 +173,12 @@ outcome even when their transport call succeeds. Ordinary settled Read, Write, E
 Bash successes use compact detail; the configured `app.tools.expand` action (Ctrl+O by default)
 reveals native detail without changing the marker. Live, exceptional, and unfamiliar rows retain
 native detail inside the same glyph frame, while malformed display data uses a concise warning.
-Binary images remain native. In PiCC compact summaries, paths within the invocation-time working
-directory or worktree root are relative to that root; descendants stay relative and outside paths
-remain absolute. HTML export may
-retain Pi's state-background cards and built-in presentation, and eligible custom
-fragments may include phase-local glyphs; non-interactive output has no renderer glyphs. None of
+Binary images remain native. In PiCC compact summaries, paths within the invocation-time workspace
+are relative to it; paths elsewhere in the repository use a visibly marked repository-relative
+form, and external paths remain absolute. Eligible custom PiCC fragments in HTML exports use the
+export context available to them, while Pi owns stock built-in cards and their presentation.
+JSON and RPC have no renderer styling and retain canonical event and tool data. Plain print is
+renderer-free and uses Pi's final-text surface rather than emitting canonical tool records. None of
 these presentations changes model-facing results or execution. Passive Agent lifecycle and panel
 rows omit internal task IDs; explicit `TaskOutput` and `TaskStop` rows retain their requested targets.
 
@@ -193,12 +194,13 @@ Every subagent is visible, both to you and to the coordinating model:
   no `TaskOutput` await needed. When width permits, each agent has an indented row with a status
   bubble (`◌` while waiting for configured capacity, a spinner while running, `●` done, `✗` failed,
   `■` stopped), agent type, and dispatch description. Recognized `color:` frontmatter values tint
-  the type; other values do not. State, identity, and description take priority as width narrows;
-  elapsed time and token usage appear only when known and terminal width permits. Elapsed time runs
+  the type; other values do not. State and identity take priority as width narrows; the dispatch
+  description appears when space permits, and elapsed time and token usage appear only when known
+  and terminal width permits. Elapsed time runs
   from dispatch acceptance until completion or stop, so it includes any queue time. The panel shows
   at most eight rows at once; overflow markers and `↑↓` navigation move the window through the full
-  tree. Very narrow widths replace per-agent rows with aggregate state counts, including separate
-  running and waiting counts. Finished rows
+  tree. Below the minimum useful identity-row width, per-agent rows become aggregate state glyphs.
+  Finished rows
   linger briefly — ~10 s
   for successes, ~60 s for failures and stops — then leave on their own. That auto-expiry is a deliberate PiCC
   deviation: Claude Code keeps finished agents listed until dismissed. An expired row is not lost:

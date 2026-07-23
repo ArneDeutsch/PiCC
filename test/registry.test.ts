@@ -639,10 +639,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(bg?.note).toContain("scoped to the subagent's own dispatched tasks");
     expect(bg?.note).toContain("PiCC EXTENSION/DIVERGENCE");
     expect(bg?.note).toContain("official Claude Code subagent documentation removes TaskOutput");
-    expect(bg?.note).toContain("individual always-expanded tree rows when a useful identity/description row fits");
+    expect(bg?.note).toContain("individual always-expanded tree rows whenever a useful identity fits");
+    expect(bg?.note).toContain("showing the dispatch description when space permits");
     expect(bg?.note).toContain("dropping optional telemetry columns panel-wide as width narrows");
-    expect(bg?.note).toContain("very narrow widths use truthful state aggregates");
-    expect(bg?.note).toContain("waiting keeps a static glyph plus literal label. The panel also provides");
+    expect(bg?.note).toContain("widths below the explicit row minimum use truthful state aggregates");
+    expect(bg?.note).toContain("waiting keeps a static glyph while its literal label appears when space permits");
     expect(bg?.note).not.toContain("literal label, a keyboard-entered drill-down");
     // The in-session Agent View gap is closed by the status panel; the honest
     // residuals must be named instead of the retired "no always-on Agent View".

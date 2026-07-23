@@ -1,6 +1,6 @@
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
-  formatUsageCompact,
+  formatUsagePresentation,
   sanitizeProgressText,
   scalarSafeText,
   type ProgressSnapshot,
@@ -390,7 +390,7 @@ function forkDegradeLine(
 /**
  * Usage formatter for the renderResult footer.
  * Renders a string as-is, an explicit `text` override, otherwise delegates to
- * the shared `formatUsageCompact` (the `{ inputTokens, … costUsd }` shape, and
+ * the shared `formatUsagePresentation` (the `{ inputTokens, … costUsd }` shape, and
  * the legacy `totalTokens`/`cost` shape). Returns NOTHING when absent or an
  * unrecognized shape, so the footer line drops entirely.
  */
@@ -400,7 +400,7 @@ function formatUsageLine(usage: unknown): string | undefined {
   if (typeof usage === "object") {
     const u = usage as Record<string, unknown>;
     if (typeof u.text === "string") return sanitizeInline(u.text) || undefined;
-    return formatUsageCompact(u);
+    return formatUsagePresentation(u);
   }
   return undefined;
 }
@@ -435,10 +435,7 @@ function formatUsageBrief(usage: unknown): string | undefined {
   if (typeof usage !== "object") return undefined;
   const u = usage as Record<string, unknown>;
   if (typeof u.text === "string") return sanitizeInline(u.text) || undefined;
-  const brief: Record<string, unknown> = { ...u };
-  delete brief.cacheReadTokens;
-  delete brief.cacheWriteTokens;
-  return formatUsageCompact(brief);
+  return formatUsagePresentation(u, { includeCache: false });
 }
 
 type LifecycleSegment = {
@@ -551,10 +548,10 @@ function lifecycleLine(
       ? tintAgentColor(options.color, themedBold(theme, fittedAgent))
       : themedFg(theme, "text", fittedAgent);
     const action = themedFg(theme, options.tone, prefix) + themedFg(theme, "text", title) +
-      themedFg(theme, "toolOutput", ` ${options.chip} - `);
+      themedFg(theme, "accent", ` ${options.chip}`) + themedFg(theme, "muted", " - ");
     let remainder = identity;
     if (state) remainder += themedFg(theme, "muted", state);
-    if (description) remainder += themedFg(theme, "toolOutput", ` - ${description}`);
+    if (description) remainder += themedFg(theme, "accent", ` - ${description}`);
     for (const segment of required) remainder += themedFg(theme, segment.tone ?? "muted", `${segment.separator}${segment.text}`);
     for (const segment of optional) remainder += themedFg(theme, segment.tone ?? "muted", `${segment.separator}${segment.text}`);
     if (options.cue) remainder += themedFg(theme, "muted", ` · ${options.cue}`);
@@ -595,7 +592,7 @@ function lifecycleLine(
     : themedFg(theme, "text", fittedAgent);
   let line = themedFg(theme, options.tone, prefix) + identity;
   if (state) line += themedFg(theme, "muted", state);
-  if (fittedDescription) line += themedFg(theme, "toolOutput", ` - ${fittedDescription}`);
+  if (fittedDescription) line += themedFg(theme, "accent", ` - ${fittedDescription}`);
   for (const segment of required) line += themedFg(theme, segment.tone ?? "muted", `${segment.separator}${segment.text}`);
   for (const segment of optional) line += themedFg(theme, segment.tone ?? "muted", `${segment.separator}${segment.text}`);
   if (options.cue) line += themedFg(theme, "muted", ` · ${options.cue}`);
@@ -1071,7 +1068,7 @@ export function renderTaskOutputCall(
       if (!Number.isFinite(width) || width <= 0) return [];
       const target = taskId ? ` ${taskId}` : "";
       const line = themedFg(theme, "text", formatToolDisplayName("TaskOutput")) +
-        themedFg(theme, "muted", `${target} [${action}]`);
+        themedFg(theme, "accent", target) + themedFg(theme, "muted", ` [${action}]`);
       try { return wrapTextWithAnsi(line, Math.max(1, Math.floor(width))); }
       catch { return wrapTextWithAnsi(`${formatToolDisplayName("TaskOutput")}${target} [${action}]`, Math.max(1, Math.floor(width))); }
     },
@@ -1089,7 +1086,7 @@ export function renderTaskStopCall(
       if (safeField(safeField(context, "state"), "resultOwned") === true) return [];
       if (!Number.isFinite(width) || width <= 0) return [];
       const line = themedFg(theme, "text", formatToolDisplayName("TaskStop")) +
-        themedFg(theme, "muted", target ? ` ${target}` : "");
+        themedFg(theme, "accent", target ? ` ${target}` : "");
       try { return wrapTextWithAnsi(line, Math.max(1, Math.floor(width))); }
       catch { return wrapTextWithAnsi(`${formatToolDisplayName("TaskStop")}${target ? ` ${target}` : ""}`, Math.max(1, Math.floor(width))); }
     },
@@ -1111,28 +1108,323 @@ function lifecycleControlComponent(
   return genericResultComponent(result, theme, context ?? {});
 }
 
-/** Preserve SendMessage's generic text presentation while mapping only retained checkpoint recovery. */
+type SendMessageCallSnapshot = Readonly<{ valid: boolean; to?: string }>;
+
+type OrdinarySendMessage = Readonly<{
+  to: string;
+  delivery: "steer" | "resume";
+  admission?: SubagentAdmission;
+  taskId?: string;
+}>;
+
+type CheckpointRecoverySendMessage = Readonly<{
+  to: string;
+  outcome: "completed" | "failed" | "aborted";
+  recovered: boolean;
+  truncated: boolean;
+}>;
+
+type DescriptorSnapshot = Readonly<Record<PropertyKey, PropertyDescriptor>>;
+
+const sendMessageCalls = new WeakMap<object, SendMessageCallSnapshot>();
+const producedSendMessageResults = new WeakMap<object, SendMessageCallSnapshot>();
+
+/** Associate an execution-produced result with its already-resolved recipient without changing it. */
+export function rememberSendMessageResult<T extends object>(result: T, to: string): T {
+  producedSendMessageResults.set(result, Object.freeze({ valid: true, to }));
+  return result;
+}
+
+function invocationState(context: SubagentLifecycleRenderContext | undefined): object | undefined {
+  const state = safeField(context, "state");
+  if ((typeof state !== "object" && typeof state !== "function") || state === null) return undefined;
+  try {
+    const prototype = Reflect.getPrototypeOf(state);
+    return prototype === Object.prototype || prototype === null ? state : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Take one detached own-descriptor snapshot; validation never reads the source object again. */
+function descriptorSnapshot(value: unknown, prototype: object): DescriptorSnapshot | undefined {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
+  try {
+    if (Reflect.getPrototypeOf(value) !== prototype) return undefined;
+    return Object.getOwnPropertyDescriptors(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function exactDataDescriptors(
+  snapshot: DescriptorSnapshot | undefined,
+  expected: readonly string[],
+): snapshot is DescriptorSnapshot {
+  if (!snapshot) return false;
+  const keys = Reflect.ownKeys(snapshot);
+  if (keys.length !== expected.length || keys.some((key) => typeof key !== "string" || !expected.includes(key))) return false;
+  return expected.every((key) => {
+    const descriptor = snapshot[key];
+    return descriptor !== undefined && "value" in descriptor && descriptor.writable === true &&
+      descriptor.enumerable === true && descriptor.configurable === true;
+  });
+}
+
+function exactArraySnapshot(value: unknown): DescriptorSnapshot | undefined {
+  if (!safeArray(value)) return undefined;
+  const snapshot = descriptorSnapshot(value, Array.prototype);
+  if (!snapshot || !exactDataDescriptors(
+    Object.fromEntries(Object.entries(snapshot).filter(([key]) => key !== "length")),
+    ["0"],
+  )) return undefined;
+  const keys = Reflect.ownKeys(snapshot);
+  const length = snapshot.length;
+  if (keys.length !== 2 || keys.some((key) => key !== "0" && key !== "length") || !length || !("value" in length) ||
+    length.value !== 1 || length.writable !== true || length.enumerable !== false || length.configurable !== false) return undefined;
+  return snapshot;
+}
+
+/** Capture only recipient validity; message text remains solely in canonical arguments. */
+export function renderSendMessageCall(
+  args: Record<string, unknown>,
+  _theme: unknown,
+  context?: SubagentLifecycleRenderContext,
+) {
+  let snapshot: SendMessageCallSnapshot = Object.freeze({ valid: false });
+  const descriptors = descriptorSnapshot(args, Object.prototype);
+  if (exactDataDescriptors(descriptors, ["to", "message"])) {
+    const to = descriptors.to!.value;
+    const message = descriptors.message!.value;
+    if (typeof to === "string" && typeof message === "string") snapshot = Object.freeze({ valid: true, to });
+  }
+  const state = invocationState(context);
+  if (state) sendMessageCalls.set(state, snapshot);
+  return { render(_width: number): string[] { return []; } };
+}
+
+function exactSendMessageEnvelope(result: unknown): {
+  text: string;
+  details: DescriptorSnapshot;
+} | undefined {
+  const envelope = descriptorSnapshot(result, Object.prototype);
+  const envelopeKeys = envelope ? Reflect.ownKeys(envelope) : [];
+  const allowedKeys = new Set(["content", "details", "terminate", "isError"]);
+  if (!envelope || envelopeKeys.some((key) => typeof key !== "string" || !allowedKeys.has(key)) ||
+    !envelopeKeys.includes("content") || !envelopeKeys.includes("details") ||
+    !exactDataDescriptors(envelope, envelopeKeys as string[]) ||
+    (envelope.terminate !== undefined && envelope.terminate.value !== true) ||
+    (envelope.isError !== undefined && envelope.isError.value !== false)) return undefined;
+
+  const content = exactArraySnapshot(envelope.content!.value);
+  const block = content ? descriptorSnapshot(content["0"]!.value, Object.prototype) : undefined;
+  if (!exactDataDescriptors(block, ["type", "text"]) || block.type!.value !== "text" ||
+    typeof block.text!.value !== "string") return undefined;
+  const details = descriptorSnapshot(envelope.details!.value, Object.prototype);
+  return details ? { text: block.text!.value as string, details } : undefined;
+}
+
+function capturedSendMessageCall(
+  context: SubagentLifecycleRenderContext | undefined,
+  result?: unknown,
+): SendMessageCallSnapshot | undefined {
+  const state = invocationState(context);
+  const fromCall = state ? sendMessageCalls.get(state) : undefined;
+  if (fromCall) return fromCall;
+  return (typeof result === "object" && result !== null) ? producedSendMessageResults.get(result) : undefined;
+}
+
+function recognizeOrdinarySendMessage(
+  result: unknown,
+  context: SubagentLifecycleRenderContext | undefined,
+): OrdinarySendMessage | undefined {
+  if (safeField(context, "isError") !== false) return undefined;
+  const call = capturedSendMessageCall(context, result);
+  if (!call?.valid || typeof call.to !== "string") return undefined;
+  const envelope = exactSendMessageEnvelope(result);
+  if (!envelope) return undefined;
+
+  const { details, text } = envelope;
+  const delivery = details.delivery?.value;
+  const baseKeys = ["agentId", "agent", "delivery"];
+  const keys = delivery === "steer"
+    ? baseKeys
+    : delivery === "resume"
+      ? [...baseKeys, "taskId", "admission", "resumed"]
+      : [];
+  if (details.description) keys.push("description");
+  if (!exactDataDescriptors(details, keys)) return undefined;
+
+  const agentId = details.agentId!.value;
+  const agent = details.agent!.value;
+  const description = details.description?.value;
+  if (typeof agentId !== "string" || !isAgentId(agentId) || typeof agent !== "string" ||
+    (description !== undefined && typeof description !== "string") ||
+    (call.to !== agentId && call.to !== agent)) return undefined;
+
+  if (delivery === "steer") {
+    const expected = `Message delivered to running agent ${agentId} ("${agent}") as a mid-task course correction.`;
+    return text === expected ? { to: call.to, delivery } : undefined;
+  }
+  if (delivery === "resume") {
+    const taskId = details.taskId!.value;
+    const admission = details.admission!.value;
+    if (typeof taskId !== "string" || !/^task-[1-9]\d*$/u.test(taskId) ||
+      (admission !== "admitted" && admission !== "waiting") || details.resumed!.value !== true) return undefined;
+    const expected = `Task(${taskId}) · Agent(${agent}) · ${agentId} — resume accepted in background with prior context; it will run when configured concurrency capacity is available. Retrieve it with TaskOutput (task_id "${taskId}").`;
+    return text === expected ? { to: call.to, delivery, admission, taskId } : undefined;
+  }
+  return undefined;
+}
+
+/** Strictly recognize the descriptor shape emitted by checkpoint recovery without re-reading it. */
+function recognizeCheckpointRecoverySendMessage(
+  result: unknown,
+  context: SubagentLifecycleRenderContext | undefined,
+): CheckpointRecoverySendMessage | undefined {
+  if (safeField(context, "isError") === true) return undefined;
+  const call = capturedSendMessageCall(context, result);
+  if (!call?.valid || typeof call.to !== "string") return undefined;
+  const envelope = exactSendMessageEnvelope(result);
+  if (!envelope || !exactDataDescriptors(envelope.details, [
+    "agentId", "agent", "delivery", "outcome", "recovered", "truncated",
+  ])) return undefined;
+  const agentId = envelope.details.agentId!.value;
+  const agent = envelope.details.agent!.value;
+  const delivery = envelope.details.delivery!.value;
+  const outcome = envelope.details.outcome!.value;
+  const recovered = envelope.details.recovered!.value;
+  const truncated = envelope.details.truncated!.value;
+  if (typeof agentId !== "string" || !isAgentId(agentId) || typeof agent !== "string" ||
+    (call.to !== agentId && call.to !== agent) || delivery !== "checkpoint-recovery" ||
+    (outcome !== "completed" && outcome !== "failed" && outcome !== "aborted") ||
+    typeof recovered !== "boolean" || recovered !== (outcome === "completed") ||
+    typeof truncated !== "boolean") return undefined;
+  return { to: call.to, outcome, recovered, truncated };
+}
+
+function sendMessageSemanticRow(
+  theme: unknown,
+  ordinary: OrdinarySendMessage,
+) {
+  return {
+    render(width: number): string[] {
+      if (!Number.isFinite(width) || width <= 0) return [];
+      const columns = Math.floor(width);
+      const recipient = sanitizeInline(ordinary.to) || "subagent";
+      type Segment = Readonly<{ text: string; slot: "muted" | "warning" }>;
+      const candidates: readonly (readonly Segment[])[] = ordinary.delivery === "steer"
+        ? [
+            [{ text: "delivered", slot: "muted" }],
+            [],
+          ]
+        : ordinary.admission === "waiting"
+          ? [
+              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }, { text: "⚠ waiting", slot: "warning" }],
+              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }, { text: "⚠", slot: "warning" }],
+              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }],
+              [{ text: ordinary.taskId ?? "resume", slot: "muted" }],
+              [{ text: "resume", slot: "muted" }],
+              [],
+            ]
+          : [
+              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }, { text: "admitted", slot: "muted" }],
+              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }],
+              [{ text: ordinary.taskId ?? "resume", slot: "muted" }],
+              [{ text: "resume", slot: "muted" }],
+              [],
+            ];
+      const minimumRecipient = columns >= 12 ? 4 : 1;
+      const segments = candidates.find((candidate) =>
+        candidate.reduce((sum, segment) => sum + visibleWidth(` · ${segment.text}`), 0) + minimumRecipient <= columns,
+      ) ?? [];
+      const suffixWidth = segments.reduce((sum, segment) => sum + visibleWidth(` · ${segment.text}`), 0);
+      const recipientRoom = Math.max(1, columns - suffixWidth);
+      const fittedRecipient = visibleWidth(recipient) > recipientRoom
+        ? truncateToWidth(recipient, recipientRoom, "…")
+        : recipient;
+      const title = `${formatToolDisplayName("SendMessage")} `;
+      const includeTitle = visibleWidth(title) + visibleWidth(recipient) + suffixWidth <= columns;
+      let line = includeTitle ? themedFg(theme, "text", title) : "";
+      line += themedFg(theme, "accent", fittedRecipient);
+      for (const segment of segments) line += themedFg(theme, segment.slot, ` · ${segment.text}`);
+      return clampLines([line], columns);
+    },
+  };
+}
+
+function sendMessageTargetRow(theme: unknown, target: string, width: number): string[] {
+  if (!Number.isFinite(width) || width <= 0 || !target) return [];
+  const columns = Math.floor(width);
+  const title = `${formatToolDisplayName("SendMessage")} `;
+  const includeTitle = visibleWidth(title) + visibleWidth(target) <= columns;
+  const room = Math.max(1, columns - (includeTitle ? visibleWidth(title) : 0));
+  const fitted = visibleWidth(target) > room ? truncateToWidth(target, room, "…") : target;
+  return clampLines([
+    (includeTitle ? themedFg(theme, "text", title) : "") + themedFg(theme, "accent", fitted),
+  ], columns);
+}
+
+function checkpointRecoveryHeader(
+  theme: unknown,
+  checkpoint: CheckpointRecoverySendMessage,
+  width: number,
+): string[] {
+  if (!Number.isFinite(width) || width <= 0) return [];
+  const columns = Math.floor(width);
+  const target = sanitizeInline(checkpoint.to) || "subagent";
+  const state = checkpoint.truncated
+    ? "truncated"
+    : checkpoint.outcome === "completed"
+      ? "recovered"
+      : checkpoint.outcome;
+  const stateSlot = state === "recovered" ? "success" : state === "failed" ? "error" : "warning";
+  const suffix = ` · ${state}`;
+  const room = columns - visibleWidth(suffix);
+  if (room < 1) return clampLines([themedFg(theme, stateSlot, state)], columns);
+  const fitted = visibleWidth(target) > room ? truncateToWidth(target, room, "…") : target;
+  return clampLines([
+    themedFg(theme, "accent", fitted) + themedFg(theme, stateSlot, suffix),
+  ], columns);
+}
+
+/** Result-owned ordinary summary; every uncertain shape retains generic exceptional evidence. */
 export function renderSendMessageResult(
   result: LifecycleControlResult,
   theme: unknown,
   context?: SubagentLifecycleRenderContext,
 ) {
-  const details = safeField(result, "details");
-  const outcome = safeField(details, "delivery") === "checkpoint-recovery"
-    ? safeField(details, "outcome")
-    : undefined;
-  return lifecycleControlComponent(
-    result,
-    theme,
-    context,
-    outcome === "completed"
-      ? "success"
-      : outcome === "failed"
-        ? "failure"
-        : outcome === "aborted"
-          ? "stopped"
-          : undefined,
-  );
+  const ordinary = recognizeOrdinarySendMessage(result, context);
+  if (ordinary) {
+    setToolRowOutcome(context, "success");
+    return sendMessageSemanticRow(theme, ordinary);
+  }
+
+  const checkpoint = recognizeCheckpointRecoverySendMessage(result, context);
+  const checkpointOutcome = checkpoint?.outcome === "completed" && checkpoint.truncated === false
+    ? "success"
+    : checkpoint?.outcome === "aborted"
+      ? "stopped"
+      : "failure";
+  const body = lifecycleControlComponent(result, theme, context, checkpointOutcome);
+  const fallbackEvidence = boundedBodyText(result);
+  const requested = checkpoint ? undefined : capturedSendMessageCall(context, result)?.to;
+  const target = typeof requested === "string" ? sanitizeInline(requested) : "";
+  return {
+    render(width: number): string[] {
+      let bodyLines: string[];
+      try {
+        bodyLines = body.render(width);
+      } catch {
+        bodyLines = [];
+        pushColored(theme, "muted", fallbackEvidence || "unrecognized SendMessage result", width, bodyLines);
+      }
+      const header = checkpoint
+        ? checkpointRecoveryHeader(theme, checkpoint, width)
+        : sendMessageTargetRow(theme, target, width);
+      return clampLines([...header, ...bodyLines], width);
+    },
+  };
 }
 
 /** Preserve TaskStop's generic text presentation while mapping exact task/checkpoint lifecycle records. */
@@ -1171,7 +1463,7 @@ export function renderTaskStopResult(
     render(width: number): string[] {
       if (!Number.isFinite(width) || width <= 0) return [];
       const header = themedFg(theme, "text", formatToolDisplayName("TaskStop")) +
-        themedFg(theme, "muted", target ? ` ${target}` : "");
+        themedFg(theme, "accent", target ? ` ${target}` : "");
       let wrapped: string[];
       try { wrapped = wrapTextWithAnsi(header, Math.max(1, Math.floor(width))); }
       catch { wrapped = wrapTextWithAnsi(`${formatToolDisplayName("TaskStop")}${target ? ` ${target}` : ""}`, Math.max(1, Math.floor(width))); }

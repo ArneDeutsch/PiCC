@@ -48,6 +48,7 @@ import {
   PANEL_GLYPH_WAITING,
   PANEL_GLYPH_SUCCESS,
   PANEL_HINT_FOCUSED,
+  PANEL_MIN_ROW_WIDTH,
   PANEL_RUNNING_FRAMES,
   panelHintUnfocused,
   panelMoreAbove,
@@ -604,13 +605,13 @@ describe("responsive panel table", () => {
       rec({
         agentId: "agent-a", agentName: "coder", description: "build frontend", color: "red",
         progress: { tail: [], activity: ASSISTANT_CANARY, usage: {
-          inputTokens: 1200, outputTokens: 340, cacheReadTokens: 80,
-          cacheWriteTokens: 20, costUsd: 0.125,
+          inputTokens: 119219, outputTokens: 4936, cacheReadTokens: 80,
+          cacheWriteTokens: 20, costUsd: 1.082095,
         } },
       }),
       rec({
         agentId: "agent-b", agentName: "reviewer", description: "review changes", startedAt: 2_000,
-        progress: { tail: [], activity: "", usage: { outputTokens: 7, costUsd: 0 } },
+        progress: { tail: [], activity: "", usage: { outputTokens: 7, costUsd: 0.005 } },
       }),
       rec({ agentId: "agent-c", agentName: "tester", description: "run checks", startedAt: 4_000 }),
     ], { tasks: [
@@ -627,7 +628,7 @@ describe("responsive panel table", () => {
         const at = line.indexOf(value); return at < 0 ? Number.POSITIVE_INFINITY : at;
       })),
       elapsedEnd: line.search(/\d+s/) + (line.match(/\d+s/)?.[0].length ?? 0),
-      outputEnd: line.indexOf("out ") + (line.match(/out \d+(?:\.\d+)?/)?.[0].length ?? 0),
+      outputEnd: line.indexOf("out ") + (line.match(/out \d+(?:\.\d+)?[km]?/)?.[0].length ?? 0),
       costEnd: line.indexOf("$") + (line.match(/\$\d+(?:\.\d+)?/)?.[0].length ?? 0),
     });
     const positions = lines.map(starts);
@@ -635,7 +636,8 @@ describe("responsive panel table", () => {
     expect(new Set(positions.map((position) => position.elapsedEnd)).size).toBe(1);
     expect(positions[0]!.outputEnd).toBe(positions[1]!.outputEnd);
     expect(positions[0]!.costEnd).toBe(positions[1]!.costEnd);
-    expect(lines[0]).toContain("in 1200");
+    expect(lines[0]).toContain("in 119.2k");
+    expect(lines[0]).toContain("out 4.9k");
     expect(lines[0]).toContain("c/read 80");
     expect(lines[0]).toContain("c/write 20");
     expect(positions[0]!.costEnd).toBe(180);
@@ -654,11 +656,11 @@ describe("responsive panel table", () => {
     expect(lines[0]).toContain("out 7");
     expect(lines[0]).not.toContain("$");
     expect(lines[1]).not.toContain("out ");
-    expect(lines[1]).toContain("$0.5");
+    expect(lines[1]).toContain("$0.50");
     expect(lines[2]).not.toMatch(/out |\$/u);
     expect(lines.map(visibleWidth)).toEqual([100, 100, 100]);
-    expect(lines[0]!.indexOf("out 7") + "out 7".length).toBe(100 - 2 - "$0.5".length);
-    expect(lines[1]!.indexOf("$0.5") + "$0.5".length).toBe(100);
+    expect(lines[0]!.indexOf("out 7") + "out 7".length).toBe(100 - 2 - "$0.50".length);
+    expect(lines[1]!.indexOf("$0.50") + "$0.50".length).toBe(100);
 
     const model = makeModel(clock);
     const zeroCache = view(model, [
@@ -773,13 +775,49 @@ describe("responsive panel table", () => {
     expect(narrow.some((line) => line.includes("…"))).toBe(true);
   });
 
-  it("keeps useful long custom identity and distinct description cells or aggregates truthfully", () => {
+  it("uses the explicit row minimum and drops description before aggregate fallback", () => {
+    const panel = view(makeModel({ t: 1000 }), [rec({
+      agentId: "boundary", agentName: "coder", description: "optional detail",
+    })]);
+    const atMinimum = stripAnsi(renderSubagentPanel(panel, {
+      width: PANEL_MIN_ROW_WIDTH,
+      entryChord: CHORD,
+    })[0] ?? "");
+    expect(atMinimum).toContain(PANEL_RUNNING_FRAMES[0]);
+    expect(atMinimum).toMatch(/co…/u);
+    expect(atMinimum).not.toContain("optional");
+    const belowMinimum = stripAnsi(renderSubagentPanel(panel, {
+      width: PANEL_MIN_ROW_WIDTH - 1,
+      entryChord: CHORD,
+    })[0] ?? "");
+    expect(belowMinimum).not.toMatch(/co…|coder/u);
+    expect(belowMinimum).toContain(PANEL_RUNNING_FRAMES[0]);
+  });
+
+  it("keeps compact telemetry muted while preserving semantic identity and state styling", () => {
+    const fg = vi.fn((_slot: string, text: string) => `${ESC}[36m${text}${ESC}[39m`);
+    const themed = renderSubagentPanel(mixedView(), {
+      width: 180,
+      entryChord: CHORD,
+      theme: { fg },
+    }).join("\n");
+    expect(fg).toHaveBeenCalledWith("accent", PANEL_RUNNING_FRAMES[0]);
+    expect(fg).toHaveBeenCalledWith("text", expect.stringContaining("build frontend"));
+    expect(fg).toHaveBeenCalledWith("muted", expect.stringContaining("in 119.2k"));
+    expect(themed).toContain("$1.08");
+    expect(themed).toContain("<$0.01");
+    expect(themed).not.toContain("$0.00");
+    expect(themed).not.toContain("$1.082095");
+  });
+
+  it("keeps useful long custom identity, drops optional description, or aggregates truthfully", () => {
     const panel = view(makeModel({ t: 1000 }), [rec({
       agentId: "custom", agentName: "custom-agent-identity-that-is-very-long",
       description: "distinct-dispatch-description-that-is-also-long",
       progress: { tail: [], activity: "", usage: { inputTokens: 99, outputTokens: 7 } },
     })]);
     let sawRow = false;
+    let sawDescription = false;
     let sawAggregate = false;
     for (let width = 1; width <= 80; width++) {
       const first = stripAnsi(renderSubagentPanel(panel, { width, entryChord: CHORD })[0] ?? "");
@@ -790,9 +828,13 @@ describe("responsive panel table", () => {
       if (!first) continue;
       sawRow = true;
       expect(first, `width=${width}`).toMatch(/custom|cus|cu…/u);
-      expect(first, `width=${width}`).toMatch(/distinct|dis|di…/u);
+      if (/distinct|dis|di…/u.test(first)) sawDescription = true;
     }
-    expect({ sawRow, sawAggregate }).toEqual({ sawRow: true, sawAggregate: true });
+    expect({ sawRow, sawDescription, sawAggregate }).toEqual({
+      sawRow: true,
+      sawDescription: true,
+      sawAggregate: true,
+    });
   });
 
   it("never renders task ids while retaining distinct hidden keys for duplicate visible rows", () => {
@@ -816,28 +858,28 @@ describe("responsive panel table", () => {
     expect(passive[0]).toBe(passive[1]);
   });
 
-  it("preserves every hidden-descendant chip completely or uses the truthful aggregate", () => {
-    const clock = { t: 100 };
-    const model = makeModel(clock, 1);
-    const panel = view(model, [
-      rec({ agentId: "parent", agentName: "long-parent-identity", description: "parent description" }),
+  it("drops hidden-descendant chips before identity at their width boundary", () => {
+    const panel = view(makeModel({ t: 100 }, 1), [
+      rec({ agentId: "parent", agentName: "parent", description: "optional detail" }),
       rec({ agentId: "child", parentAgentId: "parent", startedAt: 1 }),
-    ], { focused: true });
+    ]);
     expect(panel.rows[0]?.hiddenDescendants).toBe(1);
-    let sawAggregate = false;
-    let sawCompleteChip = false;
-    for (let width = 0; width <= 60; width++) {
-      const first = renderSubagentPanel(panel, { width, entryChord: CHORD })[0] ?? "";
-      const plain = stripAnsi(first);
-      if (/\b(?:running|failed|stopped|completed)\b/u.test(plain) || [PANEL_RUNNING_FRAMES[0], PANEL_GLYPH_FAILED, PANEL_GLYPH_STOPPED, PANEL_GLYPH_SUCCESS].includes(plain) || plain === "") {
-        if (plain !== "") sawAggregate = true;
-        continue;
-      }
-      expect(plain, `width=${width}`).toContain("(+1)");
-      expect(plain, `width=${width}`).not.toMatch(/\(\+?$|\(\+1$/u);
-      sawCompleteChip = true;
-    }
-    expect({ sawAggregate, sawCompleteChip }).toEqual({ sawAggregate: true, sawCompleteChip: true });
+    const withChip = stripAnsi(renderSubagentPanel(panel, { width: 10, entryChord: CHORD })[0] ?? "");
+    expect(withChip).toContain("pa… (+1)");
+    const withoutChip = stripAnsi(renderSubagentPanel(panel, { width: 9, entryChord: CHORD })[0] ?? "");
+    expect(withoutChip).toContain("parent");
+    expect(withoutChip).not.toContain("(+1)");
+  });
+
+  it("drops the waiting label before identity at its width boundary", () => {
+    const panel = view(makeModel({ t: 100 }), [
+      rec({ agentId: "waiting", agentName: "coder", admission: "waiting" }),
+    ]);
+    const withLabel = stripAnsi(renderSubagentPanel(panel, { width: 15, entryChord: CHORD })[0] ?? "");
+    expect(withLabel).toContain("co… [waiting]");
+    const withoutLabel = stripAnsi(renderSubagentPanel(panel, { width: 14, entryChord: CHORD })[0] ?? "");
+    expect(withoutLabel).toContain("coder");
+    expect(withoutLabel).not.toContain("[waiting]");
   });
 
   it("preserves focus/tree/state gutters and hidden-descendant chips", () => {
@@ -857,13 +899,6 @@ describe("responsive panel table", () => {
 });
 
 describe("panel aggregate, palette, and width safety", () => {
-  function forcedAggregate(records: SubagentRegistryRecord[], maxRows = 8): PanelViewModel {
-    const clock = { t: 1000 };
-    const panel = view(makeModel(clock, maxRows), records, { focused: false });
-    for (const row of panel.rows) row.treeDepth = 6;
-    return panel;
-  }
-
   it("renders waiting with a static glyph, literal label, and separate responsive count", () => {
     const panel = view(makeModel({ t: 1000 }), [
       rec({ agentId: "running" }),
@@ -885,11 +920,11 @@ describe("panel aggregate, palette, and width safety", () => {
     ["stopped", rec({ agentId: "a", state: "settled", outcome: "aborted", settledAt: 900 }), PANEL_GLYPH_STOPPED],
     ["completed", rec({ agentId: "a", state: "settled", outcome: "completed", settledAt: 900 }), PANEL_GLYPH_SUCCESS],
     ["running", rec({ agentId: "a" }), PANEL_RUNNING_FRAMES[0]],
-  ] as const)("distinguishes a %s-only aggregate", (word, record, glyph) => {
-    const lines = renderSubagentPanel(forcedAggregate([record]), { width: 16, entryChord: "a" });
-    expect(lines.join("\n")).toContain(`1 ${word}`);
+  ] as const)("distinguishes a %s-only aggregate below the row minimum", (_word, record, glyph) => {
+    const panel = view(makeModel({ t: 1000 }), [record], { focused: false });
+    const lines = renderSubagentPanel(panel, { width: PANEL_MIN_ROW_WIDTH - 1, entryChord: "a" });
     expect(lines.join("\n")).toContain(glyph);
-    expect(lines).toContain("a: agent panel");
+    expect(lines.join("\n")).not.toContain("agent");
   });
 
   it("uses complete pre-window counts when failures and stops lie outside the row window", () => {
@@ -904,8 +939,13 @@ describe("panel aggregate, palette, and width safety", () => {
     panel.rows[0]!.treeDepth = 6;
     expect(panel.rows.map((row) => row.agentId)).toEqual(["run"]);
     expect(panel).toMatchObject({ runningCount: 1, failedCount: 1, stoppedCount: 1, completedCount: 1 });
-    const text = renderSubagentPanel(panel, { width: 16, entryChord: CHORD }).join("\n");
-    for (const state of ["1 running", "1 failed", "1 stopped", "1 completed"]) expect(text).toContain(state);
+    const text = renderSubagentPanel(panel, {
+      width: PANEL_MIN_ROW_WIDTH - 1,
+      entryChord: CHORD,
+    }).join("\n");
+    for (const glyph of [PANEL_RUNNING_FRAMES[0], PANEL_GLYPH_FAILED, PANEL_GLYPH_STOPPED, PANEL_GLYPH_SUCCESS]) {
+      expect(text).toContain(glyph);
+    }
     expect(text).not.toContain("done");
   });
 

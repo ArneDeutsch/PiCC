@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -34,6 +34,8 @@ interface RenderContext {
   cwd?: string;
   isError?: boolean;
   isPartial?: boolean;
+  argsComplete?: boolean;
+  executionStarted?: boolean;
 }
 
 const grepDetails = {
@@ -100,7 +102,7 @@ describe("compact search rendering decorator", () => {
     }
     expect(() =>
       withCompactSearchRendering({ ...source, name: "Other" } as typeof source),
-    ).toThrow(/only Grep or Glob/);
+    ).toThrow(/only Grep, Glob, grep, find, or ls/);
   });
 
   it("freezes search roots per invocation and uses context cwd when the resolver throws", () => {
@@ -136,6 +138,173 @@ describe("compact search rendering decorator", () => {
       expect(entry.args).toEqual(argsBefore);
       expect(entry.result).toEqual(resultBefore);
     }
+  });
+
+  it("keeps display-ready custom Grep and Glob paths compatibility-normalization invariant", () => {
+    const path = "K:/secret";
+    for (const entry of [
+      {
+        tool: grepTool(), args: Object.freeze({ pattern: "needle", path }),
+        result: textResult("a.ts", grepDetails),
+      },
+      {
+        tool: globTool(), args: Object.freeze({ pattern: "*.ts", path }),
+        result: textResult("a.ts", globDetails),
+      },
+    ]) {
+      const argsBefore = structuredClone(entry.args);
+      const resultBefore = structuredClone(entry.result);
+      const ctx = context(entry.args);
+      entry.tool.renderCall(entry.args, undefined, ctx);
+      const row = entry.tool.renderResult(entry.result, { expanded: false, isPartial: false }, undefined, ctx)
+        .render(120).join(" ");
+      expect(row).toContain(path);
+      expect(row).not.toContain("K:/secret");
+      expect(entry.args).toEqual(argsBefore);
+      expect(entry.result).toEqual(resultBefore);
+    }
+  });
+
+  it("keeps incomplete roots ephemeral, then freezes custom and stock searches at completion", () => {
+    for (const source of [
+      createGrepTool(() => ".", { forceJs: true }),
+      { name: "grep", renderResult: () => ({ render: () => ["native"] }) } as unknown as ToolDefinition,
+    ]) {
+      let workspace = "/workspace/a";
+      const resolver = vi.fn(() => workspace);
+      const tool = withCompactSearchRendering(source, { resolveDisplayRoot: resolver }) as unknown as RenderTool;
+      const args = { pattern: "needle", path: "/workspace/b/src" };
+      const ctx = context(args, {
+        cwd: "/workspace/a", argsComplete: false, executionStarted: false,
+      });
+      tool.renderCall(args, undefined, ctx).render(120);
+      expect(resolver).not.toHaveBeenCalled();
+
+      workspace = "/workspace/b";
+      ctx.argsComplete = true;
+      tool.renderCall(args, undefined, ctx).render(120);
+      workspace = "/workspace/c";
+      const row = source.name === "grep"
+        ? tool.renderCall(args, undefined, ctx).render(120).join(" ")
+        : tool.renderResult(
+            textResult("a.ts", { ...grepDetails, totalEntries: 1, returnedEntries: 1 }),
+            { expanded: false, isPartial: false }, undefined, ctx,
+          ).render(120).join(" ");
+      expect(row).toContain("src");
+      expect(row).not.toContain("/workspace/b");
+      expect(row).not.toContain("/workspace/c");
+      expect(resolver).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("uses supplied roots for started and reconstructed searches without consulting the live resolver", () => {
+    for (const lifecycle of [
+      { argsComplete: true, executionStarted: true },
+      {},
+    ]) {
+      const resolver = vi.fn(() => "/mutable");
+      const tool = withCompactSearchRendering(createGrepTool(() => ".", { forceJs: true }), {
+        resolveDisplayRoot: resolver,
+      }) as unknown as RenderTool;
+      const args = { pattern: "needle", path: "/history/src" };
+      const ctx = context(args, { cwd: "/history", ...lifecycle });
+      tool.renderCall(args, undefined, ctx);
+      const row = tool.renderResult(
+        textResult("a.ts", { ...grepDetails, totalEntries: 1, returnedEntries: 1 }),
+        { expanded: false, isPartial: false }, undefined, ctx,
+      ).render(120).join(" ");
+      expect(row).toContain("src");
+      expect(row).not.toContain("/history");
+      expect(resolver).not.toHaveBeenCalled();
+    }
+  });
+
+  it("uses workspace, marked repository fallback, external, and Windows display paths", () => {
+    const cases = [
+      { workspace: "/repo/worktree", repository: "/repo", path: "/repo/worktree/src", expected: "src" },
+      { workspace: "/repo/worktree", repository: "/repo", path: "/repo/shared", expected: "repo:shared" },
+      { workspace: "/repo/worktree", repository: "/repo", path: "/outside/src", expected: "/outside/src" },
+      { workspace: "/repo/worktree", repository: "/repo", path: "/repo/worktree/repo:literal", expected: "./repo:literal" },
+      { workspace: "/repo/worktree", repository: "/repo", path: "/repo/worktree/re\u200Bpo:literal", expected: "re�po:literal" },
+      { workspace: "C:\\repo\\worktree", repository: "C:\\repo", path: "C:\\repo\\shared", expected: "repo:shared" },
+    ];
+    for (const entry of cases) {
+      const tool = withCompactSearchRendering(createGrepTool(() => ".", { forceJs: true }), {
+        resolveDisplayRoot: () => entry.workspace,
+        repositoryRoot: entry.repository,
+      }) as unknown as RenderTool;
+      const args = { pattern: "needle", path: entry.path };
+      const ctx = context(args, { cwd: entry.workspace });
+      Object.assign(ctx, { argsComplete: true, executionStarted: false });
+      tool.renderCall(args, undefined, ctx);
+      const row = tool.renderResult(
+        textResult("a.ts", { ...grepDetails, totalEntries: 1, returnedEntries: 1 }),
+        { expanded: false, isPartial: false }, undefined, ctx,
+      ).render(160).join(" ");
+      expect(row).toContain(entry.expected);
+    }
+  });
+
+  it("hardens allowlisted stock search calls while preserving native results and canonical args", () => {
+    for (const entry of [
+      {
+        name: "grep", args: { pattern: "needle\u001b[31m", path: "/repo/src\rhidden", glob: "*.ts", limit: 5 },
+        primary: "needle", metadata: ["in src�hidden", "glob “*.ts”", "limit 5"],
+      },
+      {
+        name: "find", args: { pattern: "**/*.ts\u001b]0;x\u0007", path: "/repo/src\rhidden", limit: 5 },
+        primary: "**/*.ts", metadata: ["in src�hidden", "limit 5"],
+      },
+      {
+        name: "ls", args: { path: "/repo/src\rhidden", limit: 5 },
+        primary: "src�hidden", metadata: ["limit 5"],
+      },
+    ] as const) {
+      const frozenArgs = Object.freeze(entry.args);
+      const nativeResult = () => ({ render: () => ["native detail"] });
+      const execute = () => undefined;
+      const source = { name: entry.name, execute, renderCall() { return { render: () => ["native call"] }; }, renderResult: nativeResult } as unknown as ToolDefinition;
+      const tool = withCompactSearchRendering(source, {
+        resolveDisplayRoot: () => "/repo",
+        repositoryRoot: "/repo",
+      }) as unknown as RenderTool;
+      const calls: Array<{ slot: string; text: string }> = [];
+      const theme = { fg(slot: string, text: string) { calls.push({ slot, text }); return text; } };
+      const ctx = context(frozenArgs, { cwd: "/repo", argsComplete: true, executionStarted: false });
+      const wideLine = tool.renderCall(frozenArgs, theme, ctx).render(160).join(" ");
+      expect(wideLine).toContain(entry.primary);
+      expect(wideLine).not.toMatch(/[\r\u001b\u0007]/u);
+      for (const metadata of entry.metadata) {
+        expect(wideLine).toContain(metadata);
+        expect(calls.some((call) => call.slot === "muted" && call.text.includes(metadata))).toBe(true);
+      }
+      const narrowLine = tool.renderCall(frozenArgs, theme, ctx).render(18).join(" ");
+      expect(narrowLine).toContain(entry.primary);
+      expect(narrowLine).not.toContain("limit 5");
+      expect(calls.some((call) => call.slot === "accent" && call.text.includes(entry.primary))).toBe(true);
+      expect((tool as unknown as { renderResult: unknown }).renderResult).toBe(nativeResult);
+      expect((tool as unknown as { execute: unknown }).execute).toBe(execute);
+      expect(ctx.args).toBe(frozenArgs);
+    }
+  });
+
+  it("classifies hostile paths before visible replacement and leaves canonical args detached", () => {
+    const args = { pattern: "needle\u001b[31m", path: "/repo/worktree/../shared\rname" };
+    const before = structuredClone(args);
+    const tool = withCompactSearchRendering(createGrepTool(() => ".", { forceJs: true }), {
+      resolveDisplayRoot: () => "/repo/worktree",
+      repositoryRoot: "/repo",
+    }) as unknown as RenderTool;
+    const ctx = context(args, { cwd: "/repo/worktree" });
+    Object.assign(ctx, { argsComplete: true, executionStarted: false });
+    tool.renderCall(args, undefined, ctx);
+    const row = tool.renderResult(
+      textResult("a", { ...grepDetails, totalEntries: 1, returnedEntries: 1 }),
+      { expanded: false, isPartial: false }, undefined, ctx,
+    ).render(120).join(" ");
+    expect(row).toContain("repo:shared�name");
+    expect(row).not.toMatch(/[\r\u001b]/u);
+    expect(args).toEqual(before);
   });
 
   it("emits no persisted call content before the result is available", () => {
@@ -366,6 +535,26 @@ describe("compact search rendering decorator", () => {
     expect(final).toHaveLength(1);
     expect(final.join(" ")).toContain("2/2 entries");
     expect(final.join(" ")).not.toContain("final match");
+  });
+
+  it("uses error for failed search status while retaining accent and muted metadata roles", () => {
+    const calls: Array<{ slot: string; text: string }> = [];
+    const theme = { fg(slot: string, text: string) { calls.push({ slot, text }); return text; } };
+    for (const tool of [grepTool(), globTool()]) {
+      const args = { pattern: "primary", path: "/ordinary/path" };
+      const ctx = context(args, { isError: true });
+      tool.renderResult(
+        textResult("failure detail", undefined),
+        { expanded: false, isPartial: false }, theme, ctx,
+      ).render(120);
+    }
+    expect(calls.filter((call) => call.text === "failed")).toEqual([
+      { slot: "error", text: "failed" },
+      { slot: "error", text: "failed" },
+    ]);
+    expect(calls.filter((call) => call.text.includes("primary")).every((call) => call.slot === "accent")).toBe(true);
+    expect(calls.some((call) => call.slot === "muted" && call.text === " · ")).toBe(true);
+    expect(calls.some((call) => call.slot === "muted" && call.text.includes("in /ordinary/path"))).toBe(true);
   });
 
   it("keeps errors visible after pending or partial states", () => {
@@ -755,7 +944,7 @@ describe("compact search rendering decorator", () => {
     const recoveries = calls.filter((call) => call.text.includes("Recovery:"));
     expect(keywords).toEqual([{ slot: "text", text: "grep" }]);
     expect(queries.length).toBeGreaterThan(0);
-    expect(queries.every((call) => call.slot === "toolOutput")).toBe(true);
+    expect(queries.every((call) => call.slot === "accent")).toBe(true);
     expect(statuses.length).toBeGreaterThan(0);
     expect(statuses.every((call) => call.slot === "muted")).toBe(true);
     expect(recoveries.length).toBeGreaterThan(0);
