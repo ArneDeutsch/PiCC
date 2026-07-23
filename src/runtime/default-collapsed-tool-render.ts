@@ -47,7 +47,13 @@ function booleanField(value: unknown, key: string): boolean | undefined {
   return typeof field === "boolean" ? field : undefined;
 }
 
-function sanitize(value: string, limit: number, inline = false): string {
+/**
+ * Display-boundary escape stripping: OSC/CSI/lone-ESC sequences become "�" and
+ * remaining control/format characters are neutralized. Exported so the MCP
+ * proxy result renderer shares this one implementation instead of re-deriving
+ * the regexes.
+ */
+export function sanitize(value: string, limit: number, inline = false): string {
   let text = value.slice(0, limit).normalize("NFC");
   text = text
     .replace(/(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c|$)/gu, "�")

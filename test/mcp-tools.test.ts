@@ -193,6 +193,37 @@ describe("buildMcpProxyTools execute", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Result display rendering
+// ---------------------------------------------------------------------------
+
+describe("buildMcpProxyTools renderResult", () => {
+  it("strips ESC/OSC sequences from the display while the model-facing result keeps the original bytes", async () => {
+    // 7-bit OSC (title write), 7-bit CSI (color), and an 8-bit C1 OSC/ST pair
+    // that survives Pi's generic fallback stripping. Built from char codes so
+    // no raw control byte hides invisibly in this source file.
+    const [ESC, BEL, CSI8, OSC8, ST8] = [0x1b, 0x07, 0x9b, 0x9d, 0x9c].map((code) =>
+      String.fromCharCode(code),
+    ) as [string, string, string, string, string];
+    const hostile = `lead ${ESC}]0;owned${BEL}mid ${ESC}[31mred ${OSC8}clip${ST8} tail`;
+    const source = sourceFor([toolInfo()], async () => ({
+      content: [{ type: "text", text: hostile }],
+    }));
+    const [proxy] = buildMcpProxyTools(source);
+    const result = await proxy!.execute("id-1", {}, undefined, undefined, {} as never);
+    // Round trip to the model stays verbatim (Claude parity).
+    expect((result.content[0] as { text: string }).text).toBe(hostile);
+    const theme = { fg: (_color: string, text: string) => text };
+    const display = proxy!
+      .renderResult!(result as never, { expanded: true, isPartial: false }, theme as never, {} as never)
+      .render(120)
+      .join("\n");
+    for (const visible of ["lead", "mid", "red", "tail"]) expect(display).toContain(visible);
+    // No live escape introducer or terminator reaches the terminal.
+    for (const control of [ESC, BEL, CSI8, OSC8, ST8]) expect(display).not.toContain(control);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Schema normalization matrix
 // ---------------------------------------------------------------------------
 

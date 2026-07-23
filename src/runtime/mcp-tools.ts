@@ -1,7 +1,9 @@
 import { Compile } from "typebox/compile";
 import type { TSchema } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
+import { sanitize } from "./default-collapsed-tool-render.js";
 import type { McpRuntime } from "./mcp.js";
 
 /**
@@ -32,6 +34,8 @@ const SCHEMA_MAX_CHARS = 32_768;
 const WIRE_NAME_MAX_CHARS = 64;
 /** Bound on a tool name/value quoted inside a diagnostic (mirrors mcp.ts's sliceForDiag). */
 const DIAG_NAME_MAX_CHARS = 200;
+/** Display-sanitization cap, matching the tool-row renderers' per-text bound. */
+const DISPLAY_TEXT_MAX_CHARS = 1_000_000;
 
 /**
  * Bounded, neutralized quoting of a name or value inside a diagnostic. Unlike
@@ -281,6 +285,23 @@ export function buildMcpProxyTools(runtime: McpToolSource): ToolDefinition[] {
           content: [{ type: "text", text: mapped.text }],
           details: { server: serverName, tool: toolName },
         };
+      },
+      // DISPLAY-only sanitization of server-relayed result text. Pi's generic
+      // no-renderResult fallback strips 7-bit ANSI but lets 8-bit C1
+      // introducers (e.g. an OSC-starting U+009D) through to the terminal, so
+      // a hostile server could retitle/spoof it. The model-facing result from
+      // execute stays verbatim (Claude parity); only the rendered row changes,
+      // keeping the stock fallback layout: one toolOutput-styled Text.
+      renderResult(result, _options, theme) {
+        const text = result.content
+          .filter((block) => block.type === "text")
+          .map((block) => block.text ?? "")
+          .join("\n");
+        const safe = sanitize(text, DISPLAY_TEXT_MAX_CHARS);
+        // An empty output renders nothing, exactly like the stock fallback.
+        return safe.length === 0
+          ? { render: () => [], invalidate: () => {} }
+          : new Text(theme.fg("toolOutput", safe), 0, 0);
       },
     };
     out.push(definition);
