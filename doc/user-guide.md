@@ -261,15 +261,15 @@ The main conversation is **depth 0**; the subagents it dispatches are depth 1. S
 |---|---|
 | `/skills` | List every loaded skill — invocable-as-slash-command, model-invocable-only, and user-only — with descriptions and source (project / user / plugin) |
 | `/agents` | List every subagent available for dispatch — project/user agents and the built-in `general-purpose`/`Explore`/`Plan` types — with tools, read-only marker, model, and worktree-isolation |
-| `/doctor` | Full compatibility breakdown for this project (generated from the capability registry) |
-| `/compat [suppress\|show]` | Show the consolidated compatibility notice; suppress/unsuppress it |
+| `/doctor` | Explicit compatibility report for this project (generated from the capability registry) |
 | `/usage` | Per-subagent token/cost breakdown for this session, plus a subagents total. **Subagent-scoped only** — a PiCC-additive surface, *not* Claude Code's whole-session `/usage`/`/cost`: the Pi extension API exposes no parent-session cost, so the main agent's own spend is not included |
 | `/quota` | Context usage + provider rate-limit/quota headers from the last response (best-effort) |
 | `/model`, `/login`, `/settings` | Pi built-ins: model switching, auth, Pi settings |
 
-**Slash autocomplete.** Every user-invocable skill appears in the `/` menu with its description and
-argument hint — type `/` to browse, or start typing a name to filter. Selecting one expands the
-skill into your turn exactly as Claude Code does.
+**Slash autocomplete.** Eligible user-invocable skills whose names do not conflict with Pi or PiCC
+built-ins appear in the `/` menu with their description and argument hint — type `/` to browse, or
+start typing a name to filter. Selecting one expands the skill into your turn exactly as Claude Code
+does.
 
 ### Harness configuration
 
@@ -285,7 +285,6 @@ tracked project files):
     "openai/*": "When a skill specifies a locked output format, reproduce it exactly. Prefer dispatching subagents over doing everything inline when the skill says to fan out."
   },
   "effortMap": { "ultra": "max" },
-  "suppressCompatNotice": false,
   "proactiveCompactPercent": 90,
   "clipMaxTokens": 20000
 }
@@ -373,10 +372,12 @@ tracked project files):
 ## 6. Security & permission posture
 
 PiCC's posture is deliberately partial: it runs permissive by default, enforces `permissions.deny`
-and agent `tools:` gating for real, and parses-and-reports the rest rather than enforcing it. The
-startup notice and `/doctor` call out every safety-relevant divergence — never silent. For *why* it
-is drawn this way, see "Security & permission posture" in
-[`doc/architecture.md`](architecture.md).
+and agent `tools:` gating for real, and parses-and-reports the rest rather than enforcing it. Before
+relying on a project's permissions or hooks, run `/doctor`: it reports project-specific
+compatibility findings and labels detected safety-relevant divergences. For the exhaustive registry
+view, the [supported-features matrix](supported-features.md) marks every safety-relevant entry,
+including entries the current project does not declare. For *why* the posture is drawn this way,
+see "Security & permission posture" in [`doc/architecture.md`](architecture.md).
 
 What that means when you write rules:
 
@@ -405,10 +406,10 @@ argument, which makes it best-effort — Claude Code's own limit, not a PiCC gap
 
 ## 7. What is and isn't supported
 
-The capability registry is the single source of truth, and is what `/doctor` renders. The generated
-[`doc/supported-features.md`](supported-features.md) records every current capability tier and the
-exact limit for partial support. Unknown or future fields degrade safely and are reported as
-unassessed.
+The capability registry is the single source of truth. `/doctor` uses it to describe detected
+project-specific findings; the generated [`doc/supported-features.md`](supported-features.md) is the
+exhaustive view of every current capability tier and the exact limit for partial support. Unknown or
+future fields degrade safely and are reported as unassessed when detected.
 
 ## 8. Windows specifics
 
@@ -443,12 +444,11 @@ behaviors worth knowing:
 | Skill shell injection prints `[shell execution disabled: …]` | project set `disableSkillShellExecution`; that's the project's intent |
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
-| Startup notice keeps appearing | `/compat suppress` (per-project, stored in `.claude/.picc/`) |
 | Session died at high context / "input exceeds the context window" | Lower `proactiveCompactPercent` in `.claude/.picc/config.json` so PiCC compacts earlier (see Harness configuration above) |
 | Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | Reopen the exact persisted session before recovery; an ephemeral headless session instead requires a replacement session and resent input. For operational exhaustion, run `/compact`, then explicitly continue. For a hook block, repair/disable the hook or allow manual compaction first. For any post-commit restoration/startup failure, do **not** compact again; start a new session and resend retained input. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories `checkpoint-exhausted` and `checkpoint-resumed`; RPC acknowledgement, print stdout, and print exit status do not prove logical completion. |
 | `picc -p` finished but a subagent's output never appeared | Background is the default and a one-shot print run has no next turn to deliver it on. Set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for scripted runs, or collect with `TaskOutput` before the run ends. |
 | Subagents can't spawn subagents / nested fan-out flattened | PiCC defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Raise `subagents.maxDepth` to `2..5` in `.claude/settings.json`; see "Subagent dispatch controls" above. `/doctor` also shows the current nesting posture. |
-| Unexpected skills/agents from plugins | PiCC loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. `/doctor` and the startup info notice report how many are available but disabled. |
+| Unexpected skills/agents from plugins | PiCC loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. |
 | A plugin you enabled isn't loading | Confirm it's listed truthy in `enabledPlugins` as `name@marketplace`, and that it isn't in `~/.claude/plugins/blocklist.json`. |
 | Want to see why a fan-out routed the way it did | agent descriptions are the routing surface — inspect the "Available subagents" catalog in the session, and the dispatch tool calls in the transcript |
 | Agent finished, its panel row is gone, and no record shows in the chat | Press `alt+a` — finished agents stay reachable in the panel after their rows expire. Or continue the conversation: the condensed record rides the next turn. |
