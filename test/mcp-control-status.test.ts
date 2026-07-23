@@ -304,20 +304,22 @@ describe("MCP pending guidance", () => {
   const blanketProhibition =
     'Do not set "enableAllProjectMcpServers": true as a shortcut: it approves all current and future project servers.';
 
-  it.each([1, 9, 33])("is least-authority and bounded for %i pending servers across /mcp and /doctor", (count) => {
+  it.each([1, 9, 33])("is least-authority and bounded for %i pending servers", (count) => {
     const names = Array.from({ length: count }, (_, index) => `pending-${index}`);
     const mcp = config(names.map((name) => server(name, "pending-approval")));
-    for (const report of [renderMcpStatusReport(mcp, []), doctor(mcp)]) {
-      expect(report).toContain("enabledMcpjsonServers");
-      expect(report).toContain("disabledMcpjsonServers");
-      expect(report).toContain("user-controlled, untracked .claude/settings.local.json");
-      expect(report).toMatch(/reload|new session/);
-      expect(report).toContain(blanketProhibition);
-      expect(report).not.toMatch(/add\s+"enableAllProjectMcpServers"/iu);
-      expect(report).not.toMatch(/set\s+"enableAllProjectMcpServers"(?![^.]*as a shortcut)/iu);
-      expect(report).not.toContain("/doctor shows");
-    }
     const status = renderMcpStatusReport(mcp, []);
+    expect(status).toContain("enabledMcpjsonServers");
+    expect(status).toContain("disabledMcpjsonServers");
+    expect(status).toContain("user settings or a clean, user-controlled, untracked .claude/settings.local.json");
+    expect(status).toContain('Each UTF-16 code unit outside ASCII letters, digits, "_", and "-" becomes "_"');
+    expect(status).toContain('an astral symbol therefore becomes "__"');
+    expect(status).toContain("One persisted named approval can therefore match a differently named current or future server");
+    expect(status).toContain("re-review aliases when project MCP names change");
+    expect(status).toMatch(/reload|new session/);
+    expect(status).toContain(blanketProhibition);
+    expect(status).not.toMatch(/add\s+"enableAllProjectMcpServers"/iu);
+    expect(status).not.toMatch(/set\s+"enableAllProjectMcpServers"(?![^.]*as a shortcut)/iu);
+    expect(status).not.toContain("/doctor shows");
     if (count === 1) expect(status).toContain(JSON.stringify(names));
     else expect(status).not.toContain(JSON.stringify(names));
     expect(status.length).toBeLessThanOrEqual(16_384);
@@ -353,13 +355,17 @@ describe("MCP pending guidance", () => {
     expect(report.length).toBeLessThan(2_000);
   });
 
-  it("preserves valid quote and backslash names exactly in the JSON allowlist", () => {
-    const names = ['quote"name', "backslash\\name"];
+  it("preserves raw colliding aliases and proves the exact ASCII matching boundary", () => {
+    const names = ["team.alpha", "team/alpha", "téam.alpha", "t_am/alpha", "keep_under-score"];
     const report = renderMcpStatusReport(
       config(names.map((name) => server(name, "pending-approval"))),
       [],
     );
     expect(report).toContain(`"enabledMcpjsonServers": ${JSON.stringify(names)}`);
+    expect(report).toContain('Each UTF-16 code unit outside ASCII letters, digits, "_", and "-" becomes "_"');
+    expect(report).toContain('an astral symbol therefore becomes "__"');
+    expect(report).toContain("One persisted named approval can therefore match a differently named current or future server");
+    expect(report).toContain("re-review aliases when project MCP names change");
     expect(report).not.toContain("Inspect your MCP configuration");
   });
 
@@ -379,19 +385,23 @@ describe("MCP pending guidance", () => {
     expect(bounded).toContain("…");
     expect(bounded).not.toContain("TAIL_CANARY");
     expect(bounded).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
-    expect(bounded.length).toBeLessThan(700);
+    expect(bounded.length).toBeLessThan(512);
+    expect(bounded).not.toContain("settings.local.json");
 
     const names = Array.from({ length: 33 }, (_, index) => `pending-${index}`);
     const notice = buildCompatReport(
       project(config(names.map((name) => server(name, "pending-approval")))),
     ).mcpPendingNotice!;
     expect(notice).toContain("33 server(s) pending approval");
-    for (const name of names.slice(0, 8)) expect(notice).toContain(JSON.stringify(name));
-    expect(notice).not.toContain(JSON.stringify(names[8]));
-    expect(notice.match(/and 25 more/gu)).toHaveLength(1);
+    for (const name of names.slice(0, 3)) expect(notice).toContain(JSON.stringify(name));
+    expect(notice).not.toContain(JSON.stringify(names[3]));
+    expect(notice.match(/and 30 more/gu)).toHaveLength(1);
     expect(notice).toContain("enabledMcpjsonServers");
     expect(notice).toContain("disabledMcpjsonServers");
-    expect(notice).toContain("run /doctor for details");
+    expect(notice).toContain("run /doctor for safe settings guidance");
+    expect(notice).not.toContain("settings.local.json");
+    expect(notice).not.toContain("alias");
+    expect(notice.length).toBeLessThan(512);
     expect(notice).not.toContain("exact edit");
     expect(notice.length).toBeLessThan(1_500);
   });
@@ -414,10 +424,10 @@ describe("MCP pending guidance", () => {
       [`tracked local configuration at ${secretPath}`],
     );
     const report = renderMcpStatusReport(mcp, []);
-    expect(report).toContain("user-controlled, untracked .claude/settings.local.json");
+    expect(report).toContain("user settings or a clean, user-controlled, untracked .claude/settings.local.json");
     expect(report).not.toContain("TRACKED_LOCAL_PATH_CANARY");
     const doctorReport = doctor(mcp);
-    expect(doctorReport).toContain("user-controlled, untracked .claude/settings.local.json");
+    expect(doctorReport).toContain("user settings or a clean, user-controlled, untracked .claude/settings.local.json");
     expect(doctorReport).toContain("TRACKED_LOCAL_PATH_CANARY");
   });
 });

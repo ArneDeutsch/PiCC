@@ -440,6 +440,25 @@ describe("resolveMcpConfig — enablement gate", () => {
     expect(server(cfg, "my.server")?.status).toBe("enabled");
   });
 
+  it("sanitizes each UTF-16 code unit while preserving underscore and hyphen", () => {
+    const cfg = resolve({
+      mcpJson: mcpJsonOf({
+        "caf.": { command: "bmp" },
+        "a..b": { command: "astral" },
+        "keep_-x": { command: "preserved" },
+        "keep..x": { command: "near" },
+      }),
+      entries: [entry("user", user, {
+        enabledMcpjsonServers: ["café", "a💩b", "keep_-x"],
+      })],
+    });
+
+    expect(server(cfg, "caf.")?.status).toBe("enabled");
+    expect(server(cfg, "a..b")?.status).toBe("enabled");
+    expect(server(cfg, "keep_-x")?.status).toBe("enabled");
+    expect(server(cfg, "keep..x")?.status).toBe("pending-approval");
+  });
+
   it("attaches no unset-variable warning to a disabled server (quiet decline path)", () => {
     // The declined command never runs; warning about its unset ${VAR}s would
     // break the promised quiet path of disabledMcpjsonServers.

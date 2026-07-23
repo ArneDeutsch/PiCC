@@ -357,6 +357,8 @@ const EMPTY_MCP: ResolvedMcpConfig = { servers: [], diagnostics: [] };
 /** Cap on server names quoted in one list — a hostile config must not flood a line. */
 const MCP_NAME_LIST_MAX = 8;
 const MCP_PENDING_COPY_NAME_MAX = 128;
+const MCP_NOTICE_NAME_LIST_MAX = 3;
+const MCP_NOTICE_NAME_MAX = 40;
 
 /** Bound on a per-server diagnostic quoted on the /doctor posture line. */
 const MCP_POSTURE_DIAG_MAX_CHARS = 240;
@@ -365,12 +367,16 @@ function quotedMcpName(name: string, max: number): string {
   return JSON.stringify(mcpStatusScalar(name, max) || "(unnamed)");
 }
 
-function mcpNameList(names: string[]): string {
+function mcpNameList(
+  names: string[],
+  maxNames = MCP_NAME_LIST_MAX,
+  maxNameLength = MCP_PENDING_COPY_NAME_MAX,
+): string {
   const shown = names
-    .slice(0, MCP_NAME_LIST_MAX)
-    .map((name) => quotedMcpName(name, MCP_PENDING_COPY_NAME_MAX))
+    .slice(0, maxNames)
+    .map((name) => quotedMcpName(name, maxNameLength))
     .join(", ");
-  const rest = names.length - MCP_NAME_LIST_MAX;
+  const rest = names.length - maxNames;
   return rest > 0 ? `${shown}, and ${rest} more` : shown;
 }
 
@@ -392,13 +398,15 @@ function mcpPendingEditDetail(pendingNames: string[]): string {
     pendingNames.every(
       (name) => mcpStatusScalar(name, MCP_PENDING_COPY_NAME_MAX) === name,
     )
-      ? `add "enabledMcpjsonServers": ${JSON.stringify(pendingNames)} for only the server names you explicitly trust`
-      : `inspect your MCP configuration, then add only server names you explicitly trust to "enabledMcpjsonServers"`;
+      ? `add "enabledMcpjsonServers": ${JSON.stringify(pendingNames)} for the server names you explicitly trust`
+      : `inspect your MCP configuration, then add server names you explicitly trust to "enabledMcpjsonServers"`;
   return (
-    `${enable} in your user-controlled, untracked .claude/settings.local.json; add names to ` +
-    `"disabledMcpjsonServers" to decline them. Changes apply after reload or in a new session; ` +
-    `this guidance does not change settings. Do not set "enableAllProjectMcpServers": true as a shortcut: ` +
-    `it approves all current and future project servers.`
+    `${enable} in user settings or a clean, user-controlled, untracked .claude/settings.local.json; add names to ` +
+    `"disabledMcpjsonServers" to decline them. Each UTF-16 code unit outside ASCII letters, digits, ` +
+    `"_", and "-" becomes "_"; an astral symbol therefore becomes "__". One persisted named approval can therefore match a differently named current or ` +
+    `future server; re-review aliases when project MCP names change. Changes apply after reload or in a new session; this guidance does not ` +
+    `change settings. Do not set "enableAllProjectMcpServers": true as a shortcut: it approves all current ` +
+    `and future project servers.`
   );
 }
 
@@ -410,9 +418,10 @@ function mcpPendingEditDetail(pendingNames: string[]): string {
  */
 function buildMcpPendingNotice(pendingNames: string[]): string {
   return (
-    `MCP: ${pendingNames.length} server(s) pending approval (${mcpNameList(pendingNames)}) — ` +
-    `approve selected names with enabledMcpjsonServers or decline them with disabledMcpjsonServers ` +
-    `in .claude/settings.local.json; run /doctor for details.`
+    `MCP: ${pendingNames.length} server(s) pending approval (` +
+    `${mcpNameList(pendingNames, MCP_NOTICE_NAME_LIST_MAX, MCP_NOTICE_NAME_MAX)}) — ` +
+    `approve selected names with enabledMcpjsonServers or decline with disabledMcpjsonServers; ` +
+    `run /doctor for safe settings guidance.`
   );
 }
 
@@ -565,11 +574,12 @@ function mcpStatusPendingGuidance(
   const explicit =
     pendingNames.length <= MCP_NAME_LIST_MAX && allPendingDisplayed && exactNames;
   const enable = explicit
-    ? `Add "enabledMcpjsonServers": ${JSON.stringify(pendingNames)} for only the server names you explicitly trust.`
-    : `Inspect your MCP configuration, then add only server names you explicitly trust to "enabledMcpjsonServers".`;
+    ? `Add "enabledMcpjsonServers": ${JSON.stringify(pendingNames)} for the server names you explicitly trust.`
+    : `Inspect your MCP configuration, then add server names you explicitly trust to "enabledMcpjsonServers".`;
   return [
     "Pending-server guidance (read-only):",
-    `${enable} Put approval in your user-controlled, untracked .claude/settings.local.json.`,
+    `${enable} Put approvals in user settings or a clean, user-controlled, untracked .claude/settings.local.json.`,
+    `Each UTF-16 code unit outside ASCII letters, digits, "_", and "-" becomes "_"; an astral symbol therefore becomes "__". One persisted named approval can therefore match a differently named current or future server; re-review aliases when project MCP names change.`,
     `Add server names to "disabledMcpjsonServers" to decline them. Changes apply after reload or in a new session; /mcp did not change settings.`,
     `Do not set "enableAllProjectMcpServers": true as a shortcut: it approves all current and future project servers.`,
   ];

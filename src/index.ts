@@ -173,21 +173,32 @@ function debug(...args: unknown[]): void {
   if (process.env.PICC_DEBUG) console.error("[picc]", ...args);
 }
 
+const TYPED_SLASH_NAME_RE = /^[A-Za-z0-9][\w-]*(?::[\w-]+)*$/;
+const TYPED_SLASH_TOKEN_RE = /^\/([A-Za-z0-9][\w-]*(?::[\w-]+)*)(?=[ \t]|$)/;
+const PROMPT_STUB_NAME_RE = /^[A-Za-z0-9][\w-]*$/;
+
+function supportsTypedSlashName(name: string): boolean {
+  return TYPED_SLASH_NAME_RE.test(name);
+}
+
+function supportsPromptStubName(name: string): boolean {
+  return PROMPT_STUB_NAME_RE.test(name);
+}
+
 /**
  * Parse a `SlashCommand` string into a `(name, argsText)` pair. Single command,
  * NO stacking (unlike the user-typed transform): only the first `/name` token is
  * taken and the rest is the args string. Tolerant of a missing leading slash
- * (`deploy x` resolves like `/deploy x`). The name token shape matches the
- * transform (`[A-Za-z0-9][\w-]*(?::[\w-]+)*`) so plugin-namespaced `/plugin:name`
- * and `findByName`'s bare-name resolution behave identically. Whitespace between
- * name and args is `[ \t]` (cross-platform, matching the transform). Returns
- * undefined for empty / whitespace-only / bare `/` input (no name token).
+ * (`deploy x` resolves like `/deploy x`). The token grammar is shared with typed
+ * slash routing, including colon-qualified nested aliases. Whitespace between
+ * name and args is `[ \t]`. Returns undefined for empty input or a bare `/`.
  */
 function parseSlashCommand(command: string): { name: string; argsText: string } | undefined {
   const trimmed = command.trim();
-  const m = /^\/?([A-Za-z0-9][\w-]*(?::[\w-]+)*)(?=[ \t]|$)/.exec(trimmed);
+  const m = TYPED_SLASH_TOKEN_RE.exec(trimmed.startsWith("/") ? trimmed : `/${trimmed}`);
   if (!m) return undefined;
-  const argsText = trimmed.slice(m[0].length).replace(/^[ \t]+/, "");
+  const consumed = m[0].length - (trimmed.startsWith("/") ? 0 : 1);
+  const argsText = trimmed.slice(consumed).replace(/^[ \t]+/, "");
   return { name: m[1]!, argsText };
 }
 
@@ -2053,9 +2064,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
       // Pi routes registered TUI commands before this event; this second seam
       // keeps admitted print, JSON, and RPC input outside model context.
-      const commandInput = parseControlCommandInput(String(event.text ?? ""));
+      const admittedText = String(event.text ?? "");
+      const commandInput = parseControlCommandInput(admittedText);
       if (commandInput) {
-        await handleControlCommand(commandInput.name, commandInput.args, ctx, "input");
+        await handleControlCommand(commandInput.name, commandInput.args, ctx);
+        return { action: "handled" };
+      }
+      const admittedPiBuiltin = parseAdmittedPiBuiltin(admittedText);
+      if (admittedPiBuiltin) {
+        await emitPiBuiltinGuidance(admittedPiBuiltin, ctx);
         return { action: "handled" };
       }
 
@@ -2098,12 +2115,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       //    rendered activation carries the text (via $ARGUMENTS/$N markers, or
       //    the ARGUMENTS: fallback when the body has none).
       const text: string = event.text ?? "";
-      // Colons allowed: plugin-namespaced invocations (`/my-plugin:review`) are CC syntax.
-      const skillTokenRe = /^\/([A-Za-z0-9][\w-]*(?::[\w-]+)*)(?=[ \t]|$)/;
       let rest = text.trim();
       const stacked: ClaudeSkill[] = [];
       while (stacked.length < 5) {
-        const m = skillTokenRe.exec(rest);
+        const m = TYPED_SLASH_TOKEN_RE.exec(rest);
         if (!m) break;
         if (reservedBuiltinName(m[1]!)) break;
         const found = findByName(project.skills, m[1]!);
@@ -2589,12 +2604,31 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Pi routes registered commands before input in interactive use, while the
   // admitted-input route protects headless and protocol modes from model leakage.
   // ---------------------------------------------------------------------------
+  function isTypedSlashInvocable(skill: ClaudeSkill): boolean {
+    return skill.userInvocable && supportsTypedSlashName(skill.name) && !reservedBuiltinName(skill.name);
+  }
+
+  function isPromptStubEligible(skill: ClaudeSkill): boolean {
+    return isTypedSlashInvocable(skill) && supportsPromptStubName(skill.name);
+  }
+
+  function directSkillAvailability(skill: ClaudeSkill): string {
+    return skill.disableModelInvocation
+      ? "direct Skill invocation is not allowed (disable-model-invocation)"
+      : "direct Skill invocation remains allowed";
+  }
+
   function renderSkillsList(): string {
     const shadowed = project.skills.filter((s) => s.userInvocable && reservedBuiltinName(s.name));
-    const shadowedSet = new Set(shadowed);
-    const invocable = project.skills.filter((s) => s.userInvocable && !shadowedSet.has(s));
+    const unsupportedSlashNames = project.skills.filter(
+      (s) => s.userInvocable && !supportsTypedSlashName(s.name),
+    );
+    const excludedFromOrdinaryCategories = new Set([...shadowed, ...unsupportedSlashNames]);
+    const invocable = project.skills.filter(isTypedSlashInvocable);
     const modelOnly = project.skills.filter((s) => !s.userInvocable && !s.disableModelInvocation);
-    const userOnly = project.skills.filter((s) => s.disableModelInvocation && !shadowedSet.has(s));
+    const userOnly = project.skills.filter(
+      (s) => s.disableModelInvocation && !excludedFromOrdinaryCategories.has(s),
+    );
     const fmt = (s: ClaudeSkill) =>
       `  /${s.name}${s.argumentHint ? ` ${s.argumentHint}` : ""} — ${s.description}` +
       (s.source.pluginName ? ` [plugin: ${s.source.pluginName}]` : ` [${s.source.scope}]`);
@@ -2608,11 +2642,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       lines.push("", `Shadowed by reserved built-ins (${shadowed.length}) — not invocable as slash commands:`);
       lines.push(...shadowed.map((s) => {
         const winner = reservedBuiltinName(s.name)!;
-        const direct = s.disableModelInvocation
-          ? "direct Skill invocation is not allowed (disable-model-invocation)"
-          : "direct Skill invocation remains allowed";
-        return `  /${s.name} — built-in /${winner} wins; ${direct}`;
+        return `  /${s.name} — built-in /${winner} wins; ${directSkillAvailability(s)}`;
       }));
+    }
+    if (unsupportedSlashNames.length) {
+      lines.push("", `Unsupported slash names (${unsupportedSlashNames.length}) — loaded but not invocable as typed slash commands:`);
+      lines.push(...unsupportedSlashNames.map(
+        (s) => `  ${JSON.stringify(s.name)} — ${directSkillAvailability(s)}`,
+      ));
     }
     if (modelOnly.length) {
       lines.push("", `Model-invocable only (${modelOnly.length}) — the model activates these via the Skill tool:`);
@@ -2764,10 +2801,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     });
   });
 
-  type ControlInvocation = "registered" | "input";
   type ControlCommandEntry = {
     description: string;
-    render: (args: string, ctx: any, invocation: ControlInvocation) => string | Promise<string>;
+    render: (args: string, ctx: any) => string | Promise<string>;
   };
 
   const MCP_ARGUMENT_RESPONSE =
@@ -2798,7 +2834,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }],
     ["mcp", {
       description: "PiCC: read-only MCP server status",
-      render: async (args, ctx, invocation) => {
+      render: async (args, ctx) => {
         if (args.trim()) return MCP_ARGUMENT_RESPONSE;
         if (isTextPrintMode(ctx) || ctx?.mode === "json") {
           await (testSeam?.mcpControl?.whenSettled ?? (() => mcpRuntime.whenSettled()))();
@@ -2830,6 +2866,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return { name, args: trimmed.slice(match[0].length).replace(/^[ \t]+/, "") };
   }
 
+  function parseAdmittedPiBuiltin(text: string): string | undefined {
+    const match = /^\/([A-Za-z0-9][\w-]*)(?=[ \t]|$)/.exec(text.trim());
+    if (!match) return undefined;
+    const canonical = match[1]!.toLowerCase();
+    return piBuiltinNames.has(canonical) ? canonical : undefined;
+  }
+
   function isTextPrintMode(ctx: any): boolean {
     return ctx?.mode === "print" || (!ctx?.hasUI && ctx?.mode !== "json");
   }
@@ -2859,16 +2902,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   }
 
-  async function handleControlCommand(
-    name: string,
-    args: string,
-    ctx: any,
-    invocation: ControlInvocation,
-  ): Promise<void> {
+  async function emitPiBuiltinGuidance(name: string, ctx: any): Promise<void> {
+    const output = `Canonical /${name} is a Pi built-in but was not run from this input path. Use canonical /${name} in the interactive TUI; no project skill ran.`;
+    try {
+      await appendControlOutput(name, output, ctx);
+    } catch {
+      if (isTextPrintMode(ctx)) {
+        try { await writeTextControlOutput(output, ctx); } catch { /* fail closed */ }
+      } else if (ctx?.mode === "tui") {
+        try { ctx.ui?.notify?.(output, "warning"); } catch { /* fail closed */ }
+      }
+    }
+  }
+
+  async function handleControlCommand(name: string, args: string, ctx: any): Promise<void> {
     const command = controlCommands.get(name);
     if (!command) return;
     try {
-      const output = await command.render(args, ctx, invocation);
+      const output = await command.render(args, ctx);
       await appendControlOutput(name, output, ctx);
     } catch {
       // Recognition is final: processing and presentation faults cannot release
@@ -2881,7 +2932,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     pi.registerCommand(name, {
       description: command.description,
       handler: async (args: string, ctx: any) => {
-        await handleControlCommand(name, args, ctx, "registered");
+        await handleControlCommand(name, args, ctx);
       },
     });
   }
@@ -2925,9 +2976,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     fs.rmSync(promptStubDir, { recursive: true, force: true });
     fs.mkdirSync(promptStubDir, { recursive: true });
     for (const skill of project.skills) {
-      if (!skill.userInvocable) continue;
-      if (reservedBuiltinName(skill.name)) continue;
-      if (!/^[A-Za-z0-9][\w-]*$/.test(skill.name)) continue;
+      if (!isPromptStubEligible(skill)) continue;
       const fm = [
         "---",
         `description: ${JSON.stringify(skill.description || `Run the ${skill.name} skill`)}`,
@@ -2942,7 +2991,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
     debug(`wrote ${fs.readdirSync(promptStubDir).length} prompt stubs to ${promptStubDir}`);
   } catch (err) {
-    debug(`prompt-stub generation failed (ordinary non-reserved skills still work via input; reserved collisions remain shadowed): ${(err as Error).message}`);
+    debug(`prompt-stub generation failed (typed-slash-eligible skills still work via input; reserved collisions remain shadowed): ${(err as Error).message}`);
   }
 
   pi.on("resources_discover", () => ({ promptPaths: [promptStubDir] }));

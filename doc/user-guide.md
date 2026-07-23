@@ -263,7 +263,7 @@ The main conversation is **depth 0**; the subagents it dispatches are depth 1. S
 
 | Command | What it does |
 |---|---|
-| `/skills` | Categorize loaded skills by slash availability; shadowed rows name the winning built-in and whether direct `Skill` invocation remains allowed |
+| `/skills` | Categorize loaded skills by typed-slash availability; unsupported-name and reserved-shadowing rows separately state whether direct `Skill` invocation remains allowed |
 | `/agents` | List every subagent available for dispatch — project/user agents and the built-in `general-purpose`/`Explore`/`Plan` types — with tools, read-only marker, model, and worktree-isolation |
 | `/doctor` | Explicit compatibility report for this project (generated from the capability registry) |
 | `/mcp` | Bounded read-only MCP server status; interactive use is immediate, while one-shot text/JSON waits for servers to connect, initialize, and discover tools or time out. See [MCP server settings](#6-security--permission-posture) |
@@ -413,10 +413,14 @@ argument, which makes it best-effort — Claude Code's own limit, not a PiCC gap
 
 **MCP servers.** Project-scope MCP servers (`.mcp.json`, or `mcpServers` in the committed
 `.claude/settings.json`) are pending by default and never start until you approve them. Approve
-selected servers in `.claude/settings.local.json` with a named `"enabledMcpjsonServers"` list.
-`"enableAllProjectMcpServers": true` instead trusts all current and future project servers; do not
-use it as a shortcut for a large named list. Decline with `"disabledMcpjsonServers"`, which always
-wins and silences the pending notice. Approvals in a git-tracked `settings.local.json` cannot work.
+selected servers in user settings or a clean, user-controlled, untracked `.claude/settings.local.json`
+with a named `"enabledMcpjsonServers"` list. Each UTF-16 code unit outside ASCII letters, digits,
+`_`, and `-` becomes `_`; an astral symbol therefore becomes `__`. One persisted named approval can
+therefore match a differently named current or future server; re-review aliases when project MCP names change.
+`"enableAllProjectMcpServers": true` instead
+trusts all current and future project servers; do not use it as a shortcut for a large named list.
+Decline with `"disabledMcpjsonServers"`, which always wins and silences the pending notice.
+Approvals in a git-tracked `settings.local.json` cannot work.
 Immediately put explicit named approvals in user-level `~/.claude/settings.json`, or wait for a
 reviewed repository change to stop tracking or remove the local path, then create a fresh untracked
 file from scratch. Never reuse project-supplied MCP content.
@@ -461,7 +465,7 @@ behaviors worth knowing:
 | Skill shell injection prints `[shell execution disabled: …]` | project set `disableSkillShellExecution`; that's the project's intent |
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
-| MCP pending-approval notice at every startup | Approve selected servers with `enabledMcpjsonServers` in a clean untracked `.claude/settings.local.json`, or list them in `disabledMcpjsonServers` to decline. `/mcp` and `/doctor` provide bounded least-authority guidance; `enableAllProjectMcpServers` trusts all current and future servers and is not a shortcut |
+| MCP pending-approval notice at every startup | Approve selected servers with `enabledMcpjsonServers` in user settings or a clean, user-controlled, untracked local file, or list them in `disabledMcpjsonServers` to decline. Each UTF-16 code unit outside ASCII letters, digits, `_`, and `-` becomes `_`; an astral symbol therefore becomes `__`. One persisted named approval can match a differently named current or future server, so re-review aliases when project MCP names change. `/mcp` and `/doctor` provide bounded guidance; `enableAllProjectMcpServers` trusts all current and future servers and is not a shortcut |
 | Session died at high context / "input exceeds the context window" | Lower `proactiveCompactPercent` in `.claude/.picc/config.json` so PiCC compacts earlier (see Harness configuration above) |
 | Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | Reopen the exact persisted session before recovery; an ephemeral headless session instead requires a replacement session and resent input. For operational exhaustion, run `/compact`, then explicitly continue. For a hook block, repair/disable the hook or allow manual compaction first. For any post-commit restoration/startup failure, do **not** compact again; start a new session and resend retained input. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories `checkpoint-exhausted` and `checkpoint-resumed`; RPC acknowledgement, print stdout, and print exit status do not prove logical completion. |
 | `picc -p` finished but a subagent's output never appeared | Background is the default and a one-shot print run has no next turn to deliver it on. Set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for scripted runs, or collect with `TaskOutput` before the run ends. |
