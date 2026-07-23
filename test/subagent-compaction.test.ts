@@ -730,7 +730,10 @@ describe("subagent mid-run compaction", () => {
       undefined,
       { state: {}, isPartial: false },
     ).render(80) as string[];
-    expect(rendered).toEqual(["● resumed final"]);
+    expect(rendered).toEqual([
+      `● ${exhausted.agentId} · recovered`,
+      "  resumed final",
+    ]);
     expect(rendered.join("\n").match(/[○●✗■]/gu) ?? []).toHaveLength(1);
     expect(recovered).toEqual(canonicalRecovered);
     expect(background.ids()).toEqual([]);

@@ -5,7 +5,8 @@ import { describe, expect, it } from "vitest";
 import { SessionManager, initTheme } from "@earendil-works/pi-coding-agent";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 import { buildMcpProxyTools } from "../src/runtime/mcp-tools.js";
-import { renderAgentCall, renderAgentResult, renderTaskOutputCall } from "../src/runtime/subagent-render.js";
+import { withRoutineToolRendering } from "../src/runtime/routine-tool-render.js";
+import { renderAgentCall, renderAgentResult, renderSendMessageCall, renderSendMessageResult, renderTaskOutputCall } from "../src/runtime/subagent-render.js";
 
 type HtmlExportModule = {
   exportSessionToHtml(
@@ -51,6 +52,8 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
       `${piDist}/dist/modes/interactive/theme/theme.js`
     ) as { theme: unknown };
 
+    const directory = mkdtempSync(join(tmpdir(), "picc-html-boundary-"));
+    const outputPath = join(directory, "session.html");
     const requestedDefinitions: string[] = [];
     const customDefinition = wrapForSelfShell({
       name: "CustomBoundary",
@@ -60,6 +63,19 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
       renderResult(result: { content?: Array<{ type?: string; text?: string }> }) {
         return textComponent(result.content?.[0]?.text ?? "");
       },
+    });
+    const routineDefinition = wrapForSelfShell(withRoutineToolRendering({
+      name: "EnterWorktree", label: "EnterWorktree", description: "test", parameters: {},
+      async execute() { return { content: [] }; },
+    } as never, {
+      repositoryRoot: directory,
+      resolveDisplayRoot: () => { throw new Error("export must use its supplied context"); },
+    }) as unknown as Record<string, unknown>);
+    const sendMessageDefinition = wrapForSelfShell({
+      name: "SendMessage",
+      renderCall: renderSendMessageCall,
+      renderResult: (result: unknown, _options: unknown, theme: unknown, context: unknown) =>
+        renderSendMessageResult(result as never, theme, context as never),
     });
     const mcpProxy = buildMcpProxyTools({
       tools: () => [{
@@ -94,15 +110,17 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
           ? customDefinition
           : name === mcpProxy.name
             ? mcpDefinition
-            : lifecycleDefinitions[name];
+            : name === "EnterWorktree"
+              ? routineDefinition
+              : name === "SendMessage"
+                ? sendMessageDefinition
+                : lifecycleDefinitions[name];
       },
       theme: themeModule.theme,
-      cwd: process.cwd(),
+      cwd: join(directory, "workspace"),
       width: 100,
     });
 
-    const directory = mkdtempSync(join(tmpdir(), "picc-html-boundary-"));
-    const outputPath = join(directory, "session.html");
     try {
       const session = SessionManager.create(directory, directory, { id: "tool-row-html-boundary" });
       session.appendMessage({
@@ -113,6 +131,9 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
           { type: "toolCall", id: "mcp-friendly", name: mcpProxy.name, arguments: { text: HOSTILE } },
           { type: "toolCall", id: "agent-lifecycle", name: "Agent", arguments: { subagent_type: "reviewer", description: "Review HTML" } },
           { type: "toolCall", id: "task-lifecycle", name: "TaskOutput", arguments: { task_id: "task-7" } },
+          { type: "toolCall", id: "routine-worktree", name: "EnterWorktree", arguments: { name: "html-proof" } },
+          { type: "toolCall", id: "send-ordinary", name: "SendMessage", arguments: { to: "reviewer", message: "HTML-MESSAGE-MUST-STAY-HIDDEN" } },
+          { type: "toolCall", id: "send-exceptional", name: "SendMessage", arguments: { to: "reviewer", message: "HTML-EXCEPTION-MESSAGE-HIDDEN" } },
         ],
         stopReason: "toolUse",
       } as never);
@@ -149,6 +170,21 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
         role: "toolResult", toolCallId: "task-lifecycle", toolName: "TaskOutput",
         content: [{ type: "text", text: "task body" }],
         details: { taskId: "task-7", outcome: "failed", status: "failed", agent: "reviewer", error: "failed safely" }, isError: true,
+      } as never);
+      session.appendMessage({
+        role: "toolResult", toolCallId: "routine-worktree", toolName: "EnterWorktree",
+        content: [{ type: "text", text: "entered" }],
+        details: { worktreePath: join(directory, "other", HOSTILE), branch: "feature/html", created: true, seeded: [], previousUnlockAttempted: false }, isError: false,
+      } as never);
+      session.appendMessage({
+        role: "toolResult", toolCallId: "send-ordinary", toolName: "SendMessage",
+        content: [{ type: "text", text: 'Message delivered to running agent agent-aabbccddeeff ("reviewer") as a mid-task course correction.' }],
+        details: { agentId: "agent-aabbccddeeff", agent: "reviewer", description: "review", delivery: "steer" }, isError: false,
+      } as never);
+      session.appendMessage({
+        role: "toolResult", toolCallId: "send-exceptional", toolName: "SendMessage",
+        content: [{ type: "text", text: `EXCEPTIONAL ${HOSTILE}` }],
+        details: { delivery: "checkpoint-recovery", outcome: "failed", recovered: false, truncated: false }, isError: true,
       } as never);
       const canonicalBytes = Buffer.from(JSON.stringify(session.getEntries()), "utf8");
 
@@ -209,7 +245,28 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
         expect(fragment).toContain("&lt;img src=x onerror=&quot;boom&quot;&gt;&amp; hostile");
         expect(fragment).not.toContain("<img");
       }
-      for (const id of ["agent-lifecycle", "task-lifecycle"]) {
+      const routine = data.renderedTools?.["routine-worktree"];
+      expect(routine?.resultHtmlExpanded).toContain("repo:other");
+      expect(routine?.resultHtmlExpanded).toContain("&lt;img");
+      expect(routine?.resultHtmlExpanded).not.toContain("<img");
+
+      const ordinary = data.renderedTools?.["send-ordinary"];
+      expect(ordinary?.callHtml).toContain("○");
+      expect(ordinary?.callHtml ?? "").not.toMatch(/reviewer|HTML-MESSAGE|mid-task|delivered/u);
+      const ordinaryResultFragments = [ordinary?.resultHtmlCollapsed, ordinary?.resultHtmlExpanded].filter(Boolean) as string[];
+      expect(ordinaryResultFragments).toHaveLength(1);
+      expect(ordinaryResultFragments[0]).toContain("reviewer");
+      expect(ordinaryResultFragments[0]).not.toContain("HTML-MESSAGE-MUST-STAY-HIDDEN");
+      expect(ordinaryResultFragments[0]).not.toContain("Message delivered to running agent");
+      expect(ordinaryResultFragments.filter((fragment) => fragment.includes("send message"))).toHaveLength(1);
+
+      const exceptional = data.renderedTools?.["send-exceptional"];
+      const exceptionalFragments = [exceptional?.resultHtmlCollapsed, exceptional?.resultHtmlExpanded].filter(Boolean) as string[];
+      expect(exceptionalFragments).not.toHaveLength(0);
+      expect(exceptionalFragments.join("\n")).toContain("EXCEPTIONAL");
+      expect(exceptionalFragments.join("\n")).toContain("&lt;img src=x onerror=&quot;boom&quot;&gt;&amp; hostile");
+
+      for (const id of ["agent-lifecycle", "task-lifecycle", "routine-worktree", "send-ordinary", "send-exceptional"]) {
         const lifecycle = data.renderedTools?.[id];
         expect(lifecycle).toBeDefined();
         for (const fragment of [lifecycle?.callHtml, lifecycle?.resultHtmlCollapsed, lifecycle?.resultHtmlExpanded]) {

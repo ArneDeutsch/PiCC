@@ -5,6 +5,11 @@ import { themedFg } from "./render-util.js";
 export interface DisplayComponent { render(width: number): string[] }
 export type DisplayRootResolver = () => unknown;
 
+export interface DisplayRoots {
+  readonly workspace?: string;
+  readonly repository?: string;
+}
+
 const DISPLAY_NAMES: Readonly<Record<string, string>> = Object.freeze({
   WebFetch: "web fetch",
   WebSearch: "web search",
@@ -31,65 +36,184 @@ export function formatToolDisplayName(value: unknown): string {
     .toLowerCase();
 }
 
-function windowsNamespace(value: string): boolean {
-  return /^[A-Za-z]:/u.test(value) || /^[/\\]{2}[^/\\]+[/\\][^/\\]+/u.test(value);
+type PathImplementation = typeof path.posix | typeof path.win32;
+interface AbsolutePath {
+  readonly implementation: PathImplementation;
+  readonly normalized: string;
 }
 
-function insideRelative(relative: string, implementation: typeof path.posix | typeof path.win32): boolean {
-  return relative === "" || (relative !== ".." && !relative.startsWith(`..${implementation.sep}`) && !implementation.isAbsolute(relative));
+function windowsDevice(value: string): boolean {
+  return /^[/\\]+(?:\?{1,2}|\.)[/\\]/u.test(value);
 }
 
-function windowsResolved(input: string, root: string): string {
-  const driveRelative = /^([A-Za-z]):(?![/\\])(.*)$/u.exec(input);
-  if (!driveRelative) return path.win32.resolve(root, input);
-  const drive = `${driveRelative[1] ?? ""}:`;
-  const rootDrive = path.win32.parse(root).root.slice(0, 2);
-  return drive.toLowerCase() === rootDrive.toLowerCase()
-    ? path.win32.resolve(root, driveRelative[2] ?? "")
-    : path.win32.resolve(`${drive}\\`, driveRelative[2] ?? "");
+function windowsDriveAbsolute(value: string): boolean {
+  return /^[A-Za-z]:[/\\]/u.test(value);
 }
 
-/** Lexically shorten a path only when it is contained by the snapshotted display root. */
-export function formatDisplayPath(input: unknown, root: unknown): string {
-  if (typeof input !== "string" || input.length === 0) return typeof input === "string" ? input : "";
-  if (typeof root !== "string" || root.length === 0) return input;
-  const unsupportedNamespace = (value: string): boolean =>
-    /^[/\\]{2}[?.][/\\]/u.test(value) || (/^[/\\]{2}/u.test(value) && !windowsNamespace(value));
-  if (unsupportedNamespace(input) || unsupportedNamespace(root)) return input;
+function windowsDriveRelative(value: string): boolean {
+  return /^[A-Za-z]:(?![/\\])/u.test(value);
+}
+
+function validUncAuthorityPart(value: string): boolean {
+  return value !== "." && value !== ".." && !/[\p{Cc}\p{Cf}<>:"|?*]/u.test(value);
+}
+
+function windowsUncAbsolute(value: string): boolean {
+  const match = /^[/\\]{2}(?![/\\])([^/\\]+)[/\\]([^/\\]+)(?:[/\\]|$)/u.exec(value);
+  return Boolean(match && validUncAuthorityPart(match[1] ?? "") && validUncAuthorityPart(match[2] ?? ""));
+}
+
+function ambiguousNamespace(value: string): boolean {
+  if (windowsDevice(value) || windowsDriveRelative(value)) return true;
+  if (/^[/\\]{2}/u.test(value) && !windowsUncAbsolute(value)) return true;
+  return false;
+}
+
+function absolutePath(value: unknown): AbsolutePath | undefined {
+  if (typeof value !== "string" || value.length === 0 || ambiguousNamespace(value)) return undefined;
+  if (windowsDriveAbsolute(value) || windowsUncAbsolute(value)) {
+    return { implementation: path.win32, normalized: path.win32.normalize(value) };
+  }
+  if (path.posix.isAbsolute(value) && !value.startsWith("//")) {
+    return { implementation: path.posix, normalized: path.posix.normalize(value) };
+  }
+  return undefined;
+}
+
+function insideRelative(relative: string, implementation: PathImplementation): boolean {
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${implementation.sep}`) &&
+    !implementation.isAbsolute(relative));
+}
+
+function sameNamespace(left: AbsolutePath, right: AbsolutePath): boolean {
+  return left.implementation === right.implementation;
+}
+
+function samePath(left: AbsolutePath, right: AbsolutePath): boolean {
+  if (!sameNamespace(left, right)) return false;
+  return left.implementation === path.win32
+    ? left.normalized.toLowerCase() === right.normalized.toLowerCase()
+    : left.normalized === right.normalized;
+}
+
+function relativeInside(target: AbsolutePath, root: AbsolutePath): string | undefined {
+  if (!sameNamespace(target, root)) return undefined;
+  const relative = root.implementation.relative(root.normalized, target.normalized);
+  return insideRelative(relative, root.implementation) ? relative || "." : undefined;
+}
+
+/** Keep genuine relative names distinct from PiCC's generated repository marker. */
+export function escapeRepositoryDisplayCollision(value: string): string {
+  return value.startsWith("repo:") ? `./${value}` : value;
+}
+
+/** Neutralize terminal controls and line separators in an already-classified inline value. */
+export function sanitizeInlineDisplay(value: unknown, limit = 16_384): string {
+  if (typeof value !== "string" || !Number.isFinite(limit) || limit <= 0) return "";
+  let text: string;
+  try { text = value.slice(0, Math.floor(limit)); }
+  catch { return ""; }
+  return text
+    .replace(/(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c|$)/gu, "�")
+    .replace(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]?/gu, "�")
+    .replace(/\u001b(?:[ -/]*[@-~]?|.)?/gu, "�")
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "�");
+}
+
+function contextCwd(context: unknown): unknown {
+  try { return Reflect.get(context as object, "cwd"); }
+  catch { return undefined; }
+}
+
+export function isLivePreExecutionDisplayContext(context: unknown): boolean {
   try {
-    const rootIsWindows = windowsNamespace(root);
-    if (rootIsWindows) {
-      if (path.posix.isAbsolute(input) && !windowsNamespace(input)) return path.posix.normalize(input);
-      const base = path.win32.resolve(root);
-      const resolved = windowsResolved(input, base);
-      const relative = path.win32.relative(base, resolved);
-      return insideRelative(relative, path.win32) ? relative || "." : resolved;
+    return Reflect.get(context as object, "argsComplete") === true &&
+      Reflect.get(context as object, "executionStarted") === false;
+  } catch {
+    return false;
+  }
+}
+
+/** Snapshot validated workspace and repository roots without consulting process cwd. */
+export function resolveDisplayRoots(
+  workspaceResolver: DisplayRootResolver | undefined,
+  repositoryRoot: unknown,
+  context: unknown,
+): DisplayRoots {
+  let workspaceValue = contextCwd(context);
+  if (workspaceResolver && isLivePreExecutionDisplayContext(context)) {
+    try {
+      const resolved = workspaceResolver();
+      if (absolutePath(resolved)) workspaceValue = resolved;
+    } catch {
+      // The supplied render context is the stable fallback.
     }
-    if (windowsNamespace(input)) return windowsResolved(input, path.win32.parse(input).root || "C:\\");
-    const base = path.posix.resolve(root);
-    const resolved = path.posix.resolve(base, input);
-    const relative = path.posix.relative(base, resolved);
-    return insideRelative(relative, path.posix) ? relative || "." : resolved;
+  }
+  const workspace = absolutePath(workspaceValue)?.normalized;
+  const repository = absolutePath(repositoryRoot)?.normalized;
+  return Object.freeze({ ...(workspace ? { workspace } : {}), ...(repository ? { repository } : {}) });
+}
+
+/**
+ * Lexically classify an invocation path against an immutable root snapshot.
+ * Relative inputs are based only on a valid workspace, never the repository.
+ */
+export function formatDisplayPathFromRoots(input: unknown, roots: DisplayRoots): string {
+  if (typeof input !== "string" || input.length === 0) return typeof input === "string" ? input : "";
+  if (ambiguousNamespace(input)) return input;
+
+  try {
+    const workspace = absolutePath(roots.workspace);
+    const repository = absolutePath(roots.repository);
+    const windowsRoot = workspace?.implementation === path.win32 ||
+      (!workspace && repository?.implementation === path.win32);
+    if (windowsRoot && /^[/\\](?![/\\])/u.test(input)) return input;
+
+    let target = absolutePath(input);
+    if (!target) {
+      if (!workspace) return escapeRepositoryDisplayCollision(input);
+      target = {
+        implementation: workspace.implementation,
+        normalized: workspace.implementation.resolve(workspace.normalized, input),
+      };
+    }
+
+    if (workspace) {
+      const relative = relativeInside(target, workspace);
+      if (relative !== undefined) return escapeRepositoryDisplayCollision(relative);
+    }
+    if (repository) {
+      const relative = relativeInside(target, repository);
+      if (relative !== undefined) {
+        const rootsDiffer = !workspace || !samePath(workspace, repository);
+        return rootsDiffer ? `repo:${relative}` : relative;
+      }
+    }
+    return target.normalized;
   } catch {
     return input;
   }
 }
 
+/** Lexically shorten a path only when it is contained by the snapshotted display root. */
+export function formatDisplayPath(input: unknown, root: unknown): string {
+  return formatDisplayPathFromRoots(input, {
+    ...(typeof root === "string" ? { workspace: root } : {}),
+  });
+}
+
+/** Legacy workspace-only snapshot used by existing specialized renderers. */
 export function resolveDisplayRoot(resolver: DisplayRootResolver | undefined, context: unknown): string | undefined {
   if (resolver) {
     try {
       const value = resolver();
-      if (typeof value === "string" && value.length > 0 && (path.isAbsolute(value) || windowsNamespace(value))) return value;
+      const resolved = absolutePath(value);
+      if (resolved) return resolved.normalized;
     } catch {
       // Render-only context fallback below remains safe.
     }
   }
-  try {
-    const value = Reflect.get(context as object, "cwd");
-    return typeof value === "string" && value.length > 0 ? value : undefined;
-  } catch {
-    return undefined;
-  }
+  return absolutePath(contextCwd(context))?.normalized;
 }
 
 function clamp(line: string, width: number): string {
@@ -99,10 +223,11 @@ function clamp(line: string, width: number): string {
   catch { return ""; }
 }
 
-/**
- * Fit one elastic secondary field around pinned recovery fields. Optional
- * telemetry disappears first; only the tool keyword receives primary styling.
- */
+function truncatePlain(value: string, width: number): string {
+  return truncateToWidth(value, width, "…").replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+}
+
+/** Fit one emphasized elastic field around pinned recovery evidence and optional metadata. */
 export function priorityDisplayRow(
   keyword: string,
   elastic: string,
@@ -116,27 +241,32 @@ export function priorityDisplayRow(
     if (!Number.isFinite(width) || width <= 0) return [""];
     const columns = Math.floor(width);
     const extras = [...optional];
-    const suffix = () => [...required, ...extras, cue].filter(Boolean);
-    const fixedPlain = () => [keyword, ...suffix()].filter(Boolean).join(" · ");
+    let visibleCue = cue;
+    const suffix = () => [...required, ...extras, visibleCue].filter(Boolean);
     const fullPlain = () => `${keyword}${elastic ? `${elasticSeparator}${elastic}` : ""}` +
       suffix().map((segment) => ` · ${segment}`).join("");
     try {
       while (extras.length > 0 && visibleWidth(fullPlain()) > columns) extras.pop();
-      const reserved = visibleWidth(keyword) + (elastic ? visibleWidth(elasticSeparator) : 0) +
-        suffix().length * visibleWidth(" · ") +
+      if (visibleCue && visibleWidth(fullPlain()) > columns) visibleCue = "";
+
+      const requiredPlain = required.filter(Boolean).join(" · ");
+      const fixedWidth = visibleWidth(keyword) + suffix().length * visibleWidth(" · ") +
         suffix().reduce((sum, segment) => sum + visibleWidth(segment), 0);
-      const allowance = Math.max(0, columns - reserved);
+      if (fixedWidth > columns && requiredPlain) {
+        return [clamp(themedFg(theme, "toolOutput", requiredPlain), columns)];
+      }
+      const allowance = Math.max(0, columns - fixedWidth - (elastic ? visibleWidth(elasticSeparator) : 0));
       const fittedElastic = allowance > 0 && elastic
-        ? (visibleWidth(elastic) > allowance ? truncateToWidth(elastic, allowance, "…") : elastic)
+        ? (visibleWidth(elastic) > allowance ? truncatePlain(elastic, allowance) : elastic)
         : "";
       let line = themedFg(theme, "text", keyword);
-      if (fittedElastic) line += themedFg(theme, "toolOutput", `${elasticSeparator}${fittedElastic}`);
+      if (fittedElastic) line += themedFg(theme, "accent", `${elasticSeparator}${fittedElastic}`);
       for (const segment of required) if (segment) line += themedFg(theme, "toolOutput", ` · ${segment}`);
       for (const segment of extras) if (segment) line += themedFg(theme, "muted", ` · ${segment}`);
-      if (cue) line += themedFg(theme, "toolOutput", ` · ${cue}`);
+      if (visibleCue) line += themedFg(theme, "muted", ` · ${visibleCue}`);
       return [clamp(line, columns)];
     } catch {
-      return [clamp(elastic ? fullPlain() : fixedPlain(), columns)];
+      return [clamp(fullPlain(), columns)];
     }
   } };
 }
