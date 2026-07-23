@@ -20,6 +20,7 @@ import {
   formatToolDisplayName,
   priorityDisplayRow,
   resolveDisplayRoots,
+  sanitizeInlineDisplay,
   type DisplayRootResolver,
   type DisplayRoots,
 } from "./tool-display.js";
@@ -228,7 +229,8 @@ function invocationParts(toolName: SearchName, args: Snapshot): {
   modifiers: string[];
 } {
   const expression = sanitize(args.pattern, true) || "?";
-  const path = sanitize(args.path, true) || ".";
+  // The decorator has already classified and path-sanitized this detached snapshot.
+  const path = typeof args.path === "string" && args.path.length > 0 ? args.path : ".";
   if (toolName === "Glob") return { expression, path, filters: [], modifiers: [] };
   const filters: string[] = [];
   const glob = sanitize(args.glob, true);
@@ -578,7 +580,7 @@ function stockSearchCall(
 ): Component {
   const args = snapshotArgs(argsValue);
   const rawPath = typeof args.path === "string" ? args.path : ".";
-  const displayPath = sanitize(formatDisplayPathFromRoots(rawPath, roots), true) || ".";
+  const displayPath = sanitizeInlineDisplay(formatDisplayPathFromRoots(rawPath, roots)) || ".";
   const optional = [
     ...(toolName === "grep" && typeof args.glob === "string" && sanitize(args.glob, true)
       ? [`glob ${quote(sanitize(args.glob, true))}`] : []),
@@ -632,7 +634,7 @@ export function withCompactSearchRendering<T extends ToolDefinition>(
       try {
         const args = snapshotArgs(safeGet(context, "args"));
         if (typeof args.path === "string") {
-          args.path = sanitize(formatDisplayPathFromRoots(args.path, rootsFor(context)), true);
+          args.path = sanitizeInlineDisplay(formatDisplayPathFromRoots(args.path, rootsFor(context)));
         }
         if (safeGet(context, "isError") === true) {
           const failed: SummaryState = { status: "failed", compactStatus: "fail" };

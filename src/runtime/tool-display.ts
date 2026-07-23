@@ -102,6 +102,24 @@ function relativeInside(target: AbsolutePath, root: AbsolutePath): string | unde
   return insideRelative(relative, root.implementation) ? relative || "." : undefined;
 }
 
+/** Keep genuine relative names distinct from PiCC's generated repository marker. */
+export function escapeRepositoryDisplayCollision(value: string): string {
+  return value.startsWith("repo:") ? `./${value}` : value;
+}
+
+/** Neutralize terminal controls and line separators in an already-classified inline value. */
+export function sanitizeInlineDisplay(value: unknown, limit = 16_384): string {
+  if (typeof value !== "string" || !Number.isFinite(limit) || limit <= 0) return "";
+  let text: string;
+  try { text = value.slice(0, Math.floor(limit)); }
+  catch { return ""; }
+  return text
+    .replace(/(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c|$)/gu, "�")
+    .replace(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]?/gu, "�")
+    .replace(/\u001b(?:[ -/]*[@-~]?|.)?/gu, "�")
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "�");
+}
+
 function contextCwd(context: unknown): unknown {
   try { return Reflect.get(context as object, "cwd"); }
   catch { return undefined; }
@@ -153,7 +171,7 @@ export function formatDisplayPathFromRoots(input: unknown, roots: DisplayRoots):
 
     let target = absolutePath(input);
     if (!target) {
-      if (!workspace) return input;
+      if (!workspace) return escapeRepositoryDisplayCollision(input);
       target = {
         implementation: workspace.implementation,
         normalized: workspace.implementation.resolve(workspace.normalized, input),
@@ -162,7 +180,7 @@ export function formatDisplayPathFromRoots(input: unknown, roots: DisplayRoots):
 
     if (workspace) {
       const relative = relativeInside(target, workspace);
-      if (relative !== undefined) return relative;
+      if (relative !== undefined) return escapeRepositoryDisplayCollision(relative);
     }
     if (repository) {
       const relative = relativeInside(target, repository);

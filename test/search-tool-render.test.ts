@@ -140,6 +140,31 @@ describe("compact search rendering decorator", () => {
     }
   });
 
+  it("keeps display-ready custom Grep and Glob paths compatibility-normalization invariant", () => {
+    const path = "K:/secret";
+    for (const entry of [
+      {
+        tool: grepTool(), args: Object.freeze({ pattern: "needle", path }),
+        result: textResult("a.ts", grepDetails),
+      },
+      {
+        tool: globTool(), args: Object.freeze({ pattern: "*.ts", path }),
+        result: textResult("a.ts", globDetails),
+      },
+    ]) {
+      const argsBefore = structuredClone(entry.args);
+      const resultBefore = structuredClone(entry.result);
+      const ctx = context(entry.args);
+      entry.tool.renderCall(entry.args, undefined, ctx);
+      const row = entry.tool.renderResult(entry.result, { expanded: false, isPartial: false }, undefined, ctx)
+        .render(120).join(" ");
+      expect(row).toContain(path);
+      expect(row).not.toContain("K:/secret");
+      expect(entry.args).toEqual(argsBefore);
+      expect(entry.result).toEqual(resultBefore);
+    }
+  });
+
   it("keeps incomplete roots ephemeral, then freezes custom and stock searches at completion", () => {
     for (const source of [
       createGrepTool(() => ".", { forceJs: true }),
@@ -199,6 +224,8 @@ describe("compact search rendering decorator", () => {
       { workspace: "/repo/worktree", repository: "/repo", path: "/repo/worktree/src", expected: "src" },
       { workspace: "/repo/worktree", repository: "/repo", path: "/repo/shared", expected: "repo:shared" },
       { workspace: "/repo/worktree", repository: "/repo", path: "/outside/src", expected: "/outside/src" },
+      { workspace: "/repo/worktree", repository: "/repo", path: "/repo/worktree/repo:literal", expected: "./repo:literal" },
+      { workspace: "/repo/worktree", repository: "/repo", path: "/repo/worktree/re\u200Bpo:literal", expected: "re�po:literal" },
       { workspace: "C:\\repo\\worktree", repository: "C:\\repo", path: "C:\\repo\\shared", expected: "repo:shared" },
     ];
     for (const entry of cases) {
@@ -222,15 +249,15 @@ describe("compact search rendering decorator", () => {
     for (const entry of [
       {
         name: "grep", args: { pattern: "needle\u001b[31m", path: "/repo/src\rhidden", glob: "*.ts", limit: 5 },
-        primary: "needle", metadata: ["in src hidden", "glob “*.ts”", "limit 5"],
+        primary: "needle", metadata: ["in src�hidden", "glob “*.ts”", "limit 5"],
       },
       {
         name: "find", args: { pattern: "**/*.ts\u001b]0;x\u0007", path: "/repo/src\rhidden", limit: 5 },
-        primary: "**/*.ts", metadata: ["in src hidden", "limit 5"],
+        primary: "**/*.ts", metadata: ["in src�hidden", "limit 5"],
       },
       {
         name: "ls", args: { path: "/repo/src\rhidden", limit: 5 },
-        primary: "src hidden", metadata: ["limit 5"],
+        primary: "src�hidden", metadata: ["limit 5"],
       },
     ] as const) {
       const frozenArgs = Object.freeze(entry.args);
@@ -275,7 +302,7 @@ describe("compact search rendering decorator", () => {
       textResult("a", { ...grepDetails, totalEntries: 1, returnedEntries: 1 }),
       { expanded: false, isPartial: false }, undefined, ctx,
     ).render(120).join(" ");
-    expect(row).toContain("repo:shared name");
+    expect(row).toContain("repo:shared�name");
     expect(row).not.toMatch(/[\r\u001b]/u);
     expect(args).toEqual(before);
   });

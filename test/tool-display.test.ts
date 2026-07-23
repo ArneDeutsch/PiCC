@@ -2,11 +2,13 @@ import fs from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { sanitize } from "../src/runtime/default-collapsed-tool-render.js";
 import {
+  escapeRepositoryDisplayCollision,
   formatDisplayPath,
   formatDisplayPathFromRoots,
   formatToolDisplayName,
   isLivePreExecutionDisplayContext,
   resolveDisplayRoots,
+  sanitizeInlineDisplay,
 } from "../src/runtime/tool-display.js";
 
 describe("display-only tool helpers", () => {
@@ -71,11 +73,16 @@ describe("display-only tool helpers", () => {
     })).toBe("repo:src/a.ts");
   });
 
-  it("does not rebase relative input when no valid workspace exists", () => {
+  it("does not rebase relative input when no valid workspace exists and reserves generated repo markers", () => {
     expect(formatDisplayPathFromRoots("src/../a.ts", { repository: "/repo" })).toBe("src/../a.ts");
     expect(formatDisplayPathFromRoots("/repo/a.ts", { repository: "/repo" })).toBe("repo:a.ts");
     expect(formatDisplayPathFromRoots("relative.ts", { workspace: "relative", repository: "/repo" }))
       .toBe("relative.ts");
+    expect(formatDisplayPathFromRoots("repo:literal.ts", { repository: "/repo" })).toBe("./repo:literal.ts");
+    expect(formatDisplayPathFromRoots("repo:literal.ts", { workspace: "/workspace", repository: "/repo" }))
+      .toBe("./repo:literal.ts");
+    expect(escapeRepositoryDisplayCollision("repo:literal.ts")).toBe("./repo:literal.ts");
+    expect(escapeRepositoryDisplayCollision("repo-generated-elsewhere")).toBe("repo-generated-elsewhere");
   });
 
   it.each([
@@ -112,7 +119,7 @@ describe("display-only tool helpers", () => {
     ] as const;
     for (const [input, expected] of fixtures) {
       const classified = formatDisplayPathFromRoots(input, { workspace: "/repo" });
-      const safe = sanitize(classified, 16_384, true);
+      const safe = sanitizeInlineDisplay(classified);
       expect(safe).toBe(expected);
       expect(safe).not.toMatch(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u);
     }
@@ -125,10 +132,13 @@ describe("display-only tool helpers", () => {
       ["\u2028../outside", "�../outside"],
     ] as const;
     for (const [input, expected] of adversarialInline) {
-      const safe = sanitize(input, 16_384, true);
+      const safe = sanitizeInlineDisplay(input);
       expect(safe).toBe(expected);
       expect(safe).not.toMatch(/^(?:\.\.?[/\\]|[A-Za-z]:|[/\\]{2}[?.][/\\]|repo:\.\.)/u);
     }
+    expect(sanitizeInlineDisplay("a\u001b[31mb\u001b]0;title\u0007c\u009bd\u009de\u009cf\tg\u0085h"))
+      .toBe("a�b�c��f�g�h");
+    expect(sanitizeInlineDisplay("K:/secret")).toBe("K:/secret");
     expect(sanitize("first\nsecond\rthird", 16_384)).toBe("first\nsecond�third");
     expect(sanitize("first\nsecond\rthird", 16_384, true)).toBe("first�second�third");
   });

@@ -155,6 +155,37 @@ describe("routine tool rendering decorator", () => {
     expect(result).toEqual(resultBefore);
   });
 
+  it("passes a display-ready MultiEdit path through call layout without compatibility normalization", () => {
+    const path = "K:/secret";
+    const args = Object.freeze({
+      file_path: path,
+      edits: Object.freeze([{ old_string: "old", new_string: "new" }]),
+    });
+    const result = {
+      content: [{ type: "text", text: `Successfully applied 1 edit(s) to ${path}.` }],
+      details: { filePath: path, edits: 1, created: false, diff: "-old\n+new", firstChangedLine: 1 },
+    };
+    const before = structuredClone(args);
+    const resultBefore = structuredClone(result);
+    const tool = withRoutineToolRendering({ name: "MultiEdit" } as ToolDefinition, {
+      createEditDefinition: () => ({ renderResult(_result, _options, _theme, context) {
+        return { render: () => [(context as { args: { path: string } }).args.path] };
+      } }),
+    }) as unknown as RenderTool;
+    const ctx = {
+      args, state: {}, isPartial: false, isError: false, argsComplete: true, executionStarted: false,
+    };
+    const row = tool.renderCall(args, undefined, ctx).render(120).join(" ");
+    const settled = tool.renderResult(result, { expanded: false, isPartial: false }, undefined, ctx)
+      .render(120).join(" ");
+    expect(row).toContain(path);
+    expect(settled).toContain(path);
+    expect(row).not.toContain("K:/secret");
+    expect(settled).not.toContain("K:/secret");
+    expect(args).toEqual(before);
+    expect(result).toEqual(resultBefore);
+  });
+
   it("keeps incomplete routine roots ephemeral, then freezes them at argument completion", () => {
     let workspace = "/workspace/a";
     const resolver = vi.fn(() => workspace);
@@ -204,6 +235,13 @@ describe("routine tool rendering decorator", () => {
     expect(row).toContain("repo:shared");
     expect(row).not.toContain("/future");
     expect(resolver).toHaveBeenCalledTimes(1);
+
+    const literal = { ...result, details: { ...result.details, worktreePath: "/repo/worktree/repo:literal" } };
+    expect(tool.renderResult(literal, { expanded: false, isPartial: false }, undefined, ctx).render(120).join(" "))
+      .toContain("worktree(./repo:literal)");
+    const nonSynthesized = { ...result, details: { ...result.details, worktreePath: "/repo/worktree/re\u200Bpo:literal" } };
+    expect(tool.renderResult(nonSynthesized, { expanded: false, isPartial: false }, undefined, ctx).render(120).join(" "))
+      .toContain("worktree(re�po:literal)");
 
     for (const lifecycle of [{ argsComplete: true, executionStarted: true }, {}]) {
       const historicalResolver = vi.fn(() => "/mutable");
@@ -1463,6 +1501,31 @@ describe("routine tool rendering decorator", () => {
     }
   });
 
+  it("keeps ordinary worktree paths ahead of branch and restore prose at practical narrow widths", () => {
+    const enter = decorate({ name: "EnterWorktree" } as ToolDefinition);
+    const exit = decorate({ name: "ExitWorktree" } as ToolDefinition);
+    const path = "/very/recognizable/worktree-path";
+    const enterResult = {
+      content: [{ type: "text", text: "CANONICAL ENTER" }],
+      details: { worktreePath: path, branch: "worktree-secondary-branch", created: true, seeded: [], previousUnlockAttempted: false },
+    };
+    const exitResult = {
+      content: [{ type: "text", text: "CANONICAL EXIT" }],
+      details: { worktreePath: path, outcome: "removed", restorePath: "/secondary/restore/path", ok: true, removed: true, orphaned: false, diagnostics: [] },
+    };
+    for (const width of [20, 24, 32]) {
+      const entered = renderResult(enter, { name: "narrow" }, enterResult, { width }).join("");
+      const exited = renderResult(exit, { action: "remove" }, exitResult, { width }).join("");
+      expect(entered).toContain("/v");
+      expect(exited).toContain("/v");
+      expect(entered).not.toContain("worktree()");
+      expect(exited).not.toContain("worktree()");
+      expect(entered).not.toContain("secondary-branch");
+      expect(exited).not.toContain("secondary/restore");
+      expectBounded([entered, exited], width);
+    }
+  });
+
   it("keeps worktree calls empty and sanitizes settled field values without losing outcome wording", () => {
     const enter = decorate({ name: "EnterWorktree" } as ToolDefinition);
     const exit = decorate({ name: "ExitWorktree" } as ToolDefinition);
@@ -1489,8 +1552,9 @@ describe("routine tool rendering decorator", () => {
       expect(plain).not.toMatch(/[\r\n]/u);
       expect(plain).not.toContain("pwn");
       if (width === 100) {
-        expect(lines[0]).toContain("; seeded 1 files; previous ");
-        expect(lines[0]).toContain(" kept; unlock attempted");
+        expect(plain).toContain("enter worktree(/界🙂/long");
+        expect(plain).not.toContain("seeded 1 files");
+        expect(plain).not.toContain("unlock attempted");
       }
     }
   });
@@ -1557,7 +1621,7 @@ describe("routine tool rendering decorator", () => {
       if (width >= 40) expect(plain).toContain("removal failed");
       if (width === 200) {
         expect(plain).toBe(
-          "exit worktree(/repo/界🙂éwt) removal failed: 鎖🙂é retry failed; worktree state unknown; restored /base/恢復🙂",
+          "exit worktree(/repo/界🙂e\u0301�wt) removal failed: 鎖🙂é retry failed; worktree state unknown; restored /base/恢復🙂",
         );
       }
     }

@@ -10,6 +10,7 @@ import {
   formatDisplayPathFromRoots,
   formatToolDisplayName,
   resolveDisplayRoots,
+  sanitizeInlineDisplay,
   type DisplayRootResolver,
   type DisplayRoots,
 } from "./tool-display.js";
@@ -87,14 +88,14 @@ function displayArgs(toolName: ToolName, value: unknown): Data | undefined {
     for (const key of ["offset", "limit"] as const) {
       if (args[key] !== undefined && (!Number.isSafeInteger(args[key]) || (args[key] as number) < 1)) return undefined;
     }
-    return { path: sanitize(args.path, MAX_PATH, true), ...(args.offset === undefined ? {} : { offset: args.offset }),
+    return { path: sanitizeInlineDisplay(args.path, MAX_PATH), ...(args.offset === undefined ? {} : { offset: args.offset }),
       ...(args.limit === undefined ? {} : { limit: args.limit }) };
   }
   if (toolName === "write") {
     const args = exact(value, ["path", "content"]);
     return args && typeof args.path === "string" && args.path.length <= MAX_PATH &&
       typeof args.content === "string" && args.content.length <= MAX_TEXT
-      ? { path: sanitize(args.path, MAX_PATH, true), content: sanitize(args.content, MAX_TEXT) }
+      ? { path: sanitizeInlineDisplay(args.path, MAX_PATH), content: sanitize(args.content, MAX_TEXT) }
       : undefined;
   }
   if (toolName === "bash") {
@@ -117,7 +118,7 @@ function displayArgs(toolName: ToolName, value: unknown): Data | undefined {
         typeof edit.newText !== "string" || edit.newText.length > MAX_TEXT) return undefined;
       edits.push({ oldText: sanitize(edit.oldText, MAX_TEXT), newText: sanitize(edit.newText, MAX_TEXT) });
     }
-    return { path: sanitize(args.path, MAX_PATH, true), edits };
+    return { path: sanitizeInlineDisplay(args.path, MAX_PATH), edits };
   }
   const args = exact(value, ["file_path", "edits"]);
   if (!args || typeof args.file_path !== "string" || args.file_path.length > MAX_PATH ||
@@ -132,7 +133,7 @@ function displayArgs(toolName: ToolName, value: unknown): Data | undefined {
     edits.push({ old_string: sanitize(edit.old_string, MAX_TEXT), new_string: sanitize(edit.new_string, MAX_TEXT),
       ...(edit.replace_all === undefined ? {} : { replace_all: edit.replace_all }) });
   }
-  return { file_path: sanitize(args.file_path, MAX_PATH, true), edits };
+  return { file_path: sanitizeInlineDisplay(args.file_path, MAX_PATH), edits };
 }
 
 function liveDisplayArgs(toolName: ToolName, value: unknown): Data | undefined {
@@ -144,6 +145,13 @@ function liveDisplayArgs(toolName: ToolName, value: unknown): Data | undefined {
     const field = source[key];
     if (typeof field !== "string" || field.length > limit) return false;
     result[key] = sanitize(field, limit, inline);
+    return true;
+  };
+  const copyPath = (key: string): boolean => {
+    if (!(key in source)) return true;
+    const field = source[key];
+    if (typeof field !== "string" || field.length > MAX_PATH) return false;
+    result[key] = sanitizeInlineDisplay(field, MAX_PATH);
     return true;
   };
   const copyNumber = (key: string): boolean => {
@@ -179,18 +187,18 @@ function liveDisplayArgs(toolName: ToolName, value: unknown): Data | undefined {
   };
 
   if (toolName === "read") {
-    return copyString("path", MAX_PATH, true) && copyNumber("offset") && copyNumber("limit") ? result : undefined;
+    return copyPath("path") && copyNumber("offset") && copyNumber("limit") ? result : undefined;
   }
   if (toolName === "write") {
-    return copyString("path", MAX_PATH, true) && copyString("content", MAX_TEXT) ? result : undefined;
+    return copyPath("path") && copyString("content", MAX_TEXT) ? result : undefined;
   }
   if (toolName === "bash") {
     return copyString("command", MAX_TEXT) && copyNumber("timeout") ? result : undefined;
   }
   if (toolName === "edit") {
-    return copyString("path", MAX_PATH, true) && copyEdits("edits", "oldText", "newText") ? result : undefined;
+    return copyPath("path") && copyEdits("edits", "oldText", "newText") ? result : undefined;
   }
-  return copyString("file_path", MAX_PATH, true) && copyEdits("edits", "old_string", "new_string") ? result : undefined;
+  return copyPath("file_path") && copyEdits("edits", "old_string", "new_string") ? result : undefined;
 }
 
 function displayContent(value: unknown): Array<Data> | undefined {
@@ -214,7 +222,9 @@ function displayDetails(value: unknown): unknown {
   if (!source || Object.keys(source).length > 32) return undefined;
   const result: Data = {};
   for (const [key, field] of Object.entries(source)) {
-    if (typeof field === "string") result[key] = sanitize(field, key.toLowerCase().includes("path") ? MAX_PATH : MAX_TEXT, key !== "diff" && key !== "patch" && key !== "content");
+    if (typeof field === "string") result[key] = key.toLowerCase().includes("path")
+      ? sanitizeInlineDisplay(field, MAX_PATH)
+      : sanitize(field, MAX_TEXT, key !== "diff" && key !== "patch" && key !== "content");
     else if (typeof field === "number" || typeof field === "boolean" || field === null || field === undefined) result[key] = field;
     else if (key === "truncation" && data(field)) result[key] = displayDetails(field);
     else return undefined;
@@ -393,7 +403,7 @@ function summaryComponent(
     ];
     return priorityDisplayRow(title, summary.commandPreview, [], optional, `${hint} to expand`, theme);
   }
-  const path = snapshottedPath ?? sanitize(formatDisplayPathFromRoots(summary.path, displayRoots), MAX_PATH, true);
+  const path = snapshottedPath ?? sanitizeInlineDisplay(formatDisplayPathFromRoots(summary.path, displayRoots), MAX_PATH);
   if (summary.kind === "mutation") {
     const detail = summary.noNet ? "no net change" : `${summary.diffLines} diff ${summary.diffLines === 1 ? "line" : "lines"} hidden`;
     return priorityDisplayRow(title, path, [],
@@ -446,7 +456,7 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(
       const rawArgs = data(argsValue);
       const rawPath = toolName === "MultiEdit" ? rawArgs?.file_path : rawArgs?.path;
       if (typeof rawPath === "string") {
-        current.displayPath = sanitize(formatDisplayPathFromRoots(rawPath, current.displayRoots), MAX_PATH, true);
+        current.displayPath = sanitizeInlineDisplay(formatDisplayPathFromRoots(rawPath, current.displayRoots), MAX_PATH);
       }
       current.displayRootsResolved = true;
     }

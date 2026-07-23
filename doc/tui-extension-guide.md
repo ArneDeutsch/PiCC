@@ -117,9 +117,9 @@ transcript blocks, but the component owns every tool-row line.
 
 PiCC applies `wrapForSelfShell` to every main-session Claude-named tool and re-registered built-in.
 It strips outer blank lines, clamps native content to `width - 2`, and prefixes exactly one state
-glyph on the first visible line: muted `○` while running, green `●` after meaningful success, red
-`✗` after failure, or `■` for stopped/aborted lifecycle work. Continuation lines use two spaces, so
-wrapped text, diffs, and textual image fallbacks align beneath content. It never calls `theme.bg`;
+glyph on the first visible line: muted `○` while running, success-themed `●` after meaningful
+success, error-themed `✗` after failure, or `■` for stopped/aborted lifecycle work. Continuation
+lines use two spaces, so wrapped text, diffs, and textual image fallbacks align beneath content. It never calls `theme.bg`;
 main-session invocation rows therefore have no state background. Foreground styling is accepted
 only when it is balanced and safe, and a missing or hostile theme degrades to a plain glyph.
 
@@ -430,19 +430,15 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
 6. **Machine-mode boundary:** presentation decorators may change human renderer components only.
    They must not rewrite arguments, canonical results, transcripts, execution, or print/JSON/RPC
    output. Interactive UI remains TUI-gated as described under "The one mental model."
-7. **HTML boundary:** Pi owns export cards and escaping. Eligible custom PiCC renderer fragments may
-   carry compatible ANSI hierarchy through Pi's conversion, but stock built-in cards remain
-   template-rendered by Pi; exact TUI parity and historical-workspace reconstruction are not
-   contracts.
-8. **Color:** prefer an existing `ThemeColor` slot over raw ANSI so themes keep working; there are
+7. **Color:** prefer an existing `ThemeColor` slot over raw ANSI so themes keep working; there are
    no new slots.
-9. **Keys:** add via `registerShortcut` or handle inside your own component; do not try to reassign
+8. **Keys:** add via `registerShortcut` or handle inside your own component; do not try to reassign
    Pi's actions.
-10. **Upgrade safety:** if you touch `custom`/`widget`/`theme`/`setEditorComponent`, note it under
+9. **Upgrade safety:** if you touch `custom`/`widget`/`theme`/`setEditorComponent`, note it under
    "Risks / churn watchpoints" in [`doc/pi-integration.md`](pi-integration.md) and cover the
    import/shape in the Pi-contract smoke test — these are the newest, most-churning parts of the
    API.
-11. **Parity check:** a Claude Code project does not expect PiCC-specific persistent or interactive
+10. **Parity check:** a Claude Code project does not expect PiCC-specific persistent or interactive
    chrome. Make that UI additive and opt-in. Default tool-presentation adapters may apply
    automatically when they change only human rendering, preserve canonical results, and keep
    failures and unfamiliar outcomes visible.

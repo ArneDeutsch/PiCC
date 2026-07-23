@@ -1118,6 +1118,7 @@ type OrdinarySendMessage = Readonly<{
 }>;
 
 type CheckpointRecoverySendMessage = Readonly<{
+  to: string;
   outcome: "completed" | "failed" | "aborted";
   recovered: boolean;
   truncated: boolean;
@@ -1299,7 +1300,7 @@ function recognizeCheckpointRecoverySendMessage(
     (outcome !== "completed" && outcome !== "failed" && outcome !== "aborted") ||
     typeof recovered !== "boolean" || recovered !== (outcome === "completed") ||
     typeof truncated !== "boolean") return undefined;
-  return { outcome, recovered, truncated };
+  return { to: call.to, outcome, recovered, truncated };
 }
 
 function sendMessageSemanticRow(
@@ -1311,25 +1312,42 @@ function sendMessageSemanticRow(
       if (!Number.isFinite(width) || width <= 0) return [];
       const columns = Math.floor(width);
       const recipient = sanitizeInline(ordinary.to) || "subagent";
-      const mode = ordinary.delivery === "steer" ? "delivered" : "resume";
-      const task = ordinary.delivery === "resume" ? ordinary.taskId : undefined;
-      const waiting = ordinary.admission === "waiting";
-      const metadata = [mode, ...(task ? [task] : [])];
-      let warning = waiting ? "⚠ waiting" : undefined;
-      const metadataWidth = () => metadata.reduce((sum, value) => sum + visibleWidth(` · ${value}`), 0) +
-        (warning ? visibleWidth(` · ${warning}`) : 0);
-      if (warning && metadataWidth() + 4 > columns) warning = "⚠";
-      if (warning && metadataWidth() + 2 > columns) warning = undefined;
-      const room = Math.max(1, columns - metadataWidth());
-      const fittedRecipient = visibleWidth(recipient) > room
-        ? truncateToWidth(recipient, room, "…")
+      type Segment = Readonly<{ text: string; slot: "muted" | "warning" }>;
+      const candidates: readonly (readonly Segment[])[] = ordinary.delivery === "steer"
+        ? [
+            [{ text: "delivered", slot: "muted" }],
+            [],
+          ]
+        : ordinary.admission === "waiting"
+          ? [
+              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }, { text: "⚠ waiting", slot: "warning" }],
+              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }, { text: "⚠", slot: "warning" }],
+              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }],
+              [{ text: ordinary.taskId ?? "resume", slot: "muted" }],
+              [{ text: "resume", slot: "muted" }],
+              [],
+            ]
+          : [
+              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }, { text: "admitted", slot: "muted" }],
+              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }],
+              [{ text: ordinary.taskId ?? "resume", slot: "muted" }],
+              [{ text: "resume", slot: "muted" }],
+              [],
+            ];
+      const minimumRecipient = columns >= 12 ? 4 : 1;
+      const segments = candidates.find((candidate) =>
+        candidate.reduce((sum, segment) => sum + visibleWidth(` · ${segment.text}`), 0) + minimumRecipient <= columns,
+      ) ?? [];
+      const suffixWidth = segments.reduce((sum, segment) => sum + visibleWidth(` · ${segment.text}`), 0);
+      const recipientRoom = Math.max(1, columns - suffixWidth);
+      const fittedRecipient = visibleWidth(recipient) > recipientRoom
+        ? truncateToWidth(recipient, recipientRoom, "…")
         : recipient;
       const title = `${formatToolDisplayName("SendMessage")} `;
-      const includeTitle = visibleWidth(title) + visibleWidth(fittedRecipient) + metadataWidth() <= columns;
+      const includeTitle = visibleWidth(title) + visibleWidth(recipient) + suffixWidth <= columns;
       let line = includeTitle ? themedFg(theme, "text", title) : "";
       line += themedFg(theme, "accent", fittedRecipient);
-      for (const value of metadata) line += themedFg(theme, "muted", ` · ${value}`);
-      if (warning) line += themedFg(theme, "warning", ` · ${warning}`);
+      for (const segment of segments) line += themedFg(theme, segment.slot, ` · ${segment.text}`);
       return clampLines([line], columns);
     },
   };
@@ -1339,10 +1357,34 @@ function sendMessageTargetRow(theme: unknown, target: string, width: number): st
   if (!Number.isFinite(width) || width <= 0 || !target) return [];
   const columns = Math.floor(width);
   const title = `${formatToolDisplayName("SendMessage")} `;
-  const room = Math.max(1, columns - visibleWidth(title));
+  const includeTitle = visibleWidth(title) + visibleWidth(target) <= columns;
+  const room = Math.max(1, columns - (includeTitle ? visibleWidth(title) : 0));
   const fitted = visibleWidth(target) > room ? truncateToWidth(target, room, "…") : target;
   return clampLines([
-    themedFg(theme, "text", title) + themedFg(theme, "accent", fitted),
+    (includeTitle ? themedFg(theme, "text", title) : "") + themedFg(theme, "accent", fitted),
+  ], columns);
+}
+
+function checkpointRecoveryHeader(
+  theme: unknown,
+  checkpoint: CheckpointRecoverySendMessage,
+  width: number,
+): string[] {
+  if (!Number.isFinite(width) || width <= 0) return [];
+  const columns = Math.floor(width);
+  const target = sanitizeInline(checkpoint.to) || "subagent";
+  const state = checkpoint.truncated
+    ? "truncated"
+    : checkpoint.outcome === "completed"
+      ? "recovered"
+      : checkpoint.outcome;
+  const stateSlot = state === "recovered" ? "success" : state === "failed" ? "error" : "warning";
+  const suffix = ` · ${state}`;
+  const room = columns - visibleWidth(suffix);
+  if (room < 1) return clampLines([themedFg(theme, stateSlot, state)], columns);
+  const fitted = visibleWidth(target) > room ? truncateToWidth(target, room, "…") : target;
+  return clampLines([
+    themedFg(theme, "accent", fitted) + themedFg(theme, stateSlot, suffix),
   ], columns);
 }
 
@@ -1377,7 +1419,10 @@ export function renderSendMessageResult(
         bodyLines = [];
         pushColored(theme, "muted", fallbackEvidence || "unrecognized SendMessage result", width, bodyLines);
       }
-      return clampLines([...sendMessageTargetRow(theme, target, width), ...bodyLines], width);
+      const header = checkpoint
+        ? checkpointRecoveryHeader(theme, checkpoint, width)
+        : sendMessageTargetRow(theme, target, width);
+      return clampLines([...header, ...bodyLines], width);
     },
   };
 }

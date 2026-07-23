@@ -332,7 +332,7 @@ describe("lifecycle control result discriminators", () => {
 
   function renderCheckpoint(
     details: Record<string, unknown>,
-    options: { isError?: boolean; envelope?: Record<string, unknown>; blocks?: Result["content"] } = { isError: false },
+    options: { isError?: boolean; envelope?: Record<string, unknown>; blocks?: Result["content"]; width?: number } = { isError: false },
   ): string[] {
     const context: RenderCtx = { state: {}, ...(Object.hasOwn(options, "isError") ? { isError: options.isError } : {}) };
     const tool = wrapForSelfShell({
@@ -348,14 +348,14 @@ describe("lifecycle control result discriminators", () => {
       details,
       ...options.envelope,
     };
-    return ((tool.renderResult as Function)(value, {}, theme, context) as Component).render(100).map(stripAnsi);
+    return ((tool.renderResult as Function)(value, {}, theme, context) as Component).render(options.width ?? 100).map(stripAnsi);
   }
 
   it.each([
-    { outcome: "completed", recovered: true, truncated: false, glyph: "●" },
-    { outcome: "failed", recovered: false, truncated: false, glyph: "✗" },
-    { outcome: "aborted", recovered: false, truncated: false, glyph: "■" },
-    { outcome: "completed", recovered: true, truncated: true, glyph: "✗" },
+    { outcome: "completed", recovered: true, truncated: false, glyph: "●", state: "recovered" },
+    { outcome: "failed", recovered: false, truncated: false, glyph: "✗", state: "failed" },
+    { outcome: "aborted", recovered: false, truncated: false, glyph: "■", state: "aborted" },
+    { outcome: "completed", recovered: true, truncated: true, glyph: "✗", state: "truncated" },
   ] as const)("maps exact checkpoint-recovery $outcome (truncated=$truncated)", (scenario) => {
     const lines = renderCheckpoint({
       agentId: "agent-aabbccddeeff",
@@ -366,7 +366,25 @@ describe("lifecycle control result discriminators", () => {
       truncated: scenario.truncated,
     });
     expectSingleMarker(lines, scenario.glyph);
+    expect(lines.join("\n")).toContain("reviewer");
+    expect(lines.join("\n")).toContain(scenario.state);
     expect(lines.join("\n")).toContain("canonical checkpoint body evidence");
+  });
+
+  it("retains checkpoint recipient and decisive non-success state at practical widths", () => {
+    for (const scenario of [
+      { outcome: "failed", recovered: false, truncated: false, state: "failed" },
+      { outcome: "aborted", recovered: false, truncated: false, state: "aborted" },
+      { outcome: "completed", recovered: true, truncated: true, state: "truncated" },
+    ] as const) {
+      const lines = renderCheckpoint({
+        agentId: "agent-aabbccddeeff", agent: "reviewer", delivery: "checkpoint-recovery",
+        outcome: scenario.outcome, recovered: scenario.recovered, truncated: scenario.truncated,
+      }, { isError: false, width: 32 });
+      expect(lines[0]).toContain("reviewer");
+      expect(lines[0]).toContain(scenario.state);
+      expect(lines.join("\n").replace(/\s+/gu, " ")).toContain("canonical checkpoint body evidence");
+    }
   });
 
   it("fails malformed and incoherent checkpoint recovery closed while retaining body evidence", () => {
@@ -562,7 +580,7 @@ describe("lifecycle control result discriminators", () => {
 
   it("preserves ordinary operational cues over long recipients across narrow widths", () => {
     const scenarios = [
-      { admission: "admitted", required: ["resume", "task-123"] },
+      { admission: "admitted", required: ["resume", "task-123", "admitted"] },
       { admission: "waiting", required: ["resume", "task-123", "⚠ waiting"] },
     ] as const;
     for (const scenario of scenarios) {
@@ -577,11 +595,11 @@ describe("lifecycle control result discriminators", () => {
       for (const width of [18, 24, 32, 40, 48, 72]) {
         const rendered = renderSendMessageResult(value, theme, context).render(width);
         const text = rendered.map(stripAnsi).join("");
-        if (width >= 24) {
+        if (width >= 18) {
           expect(text).toContain("ver");
-          expect(text).toContain("resume");
           expect(text).toContain("task-123");
         }
+        if (width >= 24) expect(text).toContain("resume");
         if (scenario.admission === "waiting" && width >= 32) expect(text).toContain("⚠");
         if (width >= 40) for (const required of scenario.required) expect(text).toContain(required);
         expect(rendered).toHaveLength(1);
@@ -601,6 +619,8 @@ describe("lifecycle control result discriminators", () => {
     for (const width of [12, 18, 24, 36, 40, 48, 64, 100]) {
       const rendered = renderSendMessageResult(value, theme, context).render(width);
       const text = rendered.map(stripAnsi).join("");
+      expect(text).toContain("ver");
+      if (width === 12) expect(text).not.toContain("delivered");
       if (width >= 40) {
         expect(text).toContain("very-");
         expect(text).toContain("delivered");
@@ -679,6 +699,29 @@ describe("lifecycle control result discriminators", () => {
     expect(calls.some(({ slot, text }) => slot === "warning" && text.includes("waiting"))).toBe(true);
     expect(calls.filter(({ slot }) => slot === "warning").every(({ text }) => /waiting|⚠/u.test(text))).toBe(true);
     expect(calls.some(({ slot, text }) => slot === "warning" && /resume|task-9|reviewer/u.test(text))).toBe(false);
+  });
+
+  it("themes checkpoint recipients and decisive states semantically", () => {
+    const calls: Array<{ slot: string; text: string }> = [];
+    const spyTheme = { fg(slot: string, text: string) { calls.push({ slot, text }); return text; } };
+    for (const scenario of [
+      { outcome: "completed", recovered: true, truncated: false, state: "recovered", slot: "success" },
+      { outcome: "failed", recovered: false, truncated: false, state: "failed", slot: "error" },
+      { outcome: "aborted", recovered: false, truncated: false, state: "aborted", slot: "warning" },
+      { outcome: "completed", recovered: true, truncated: true, state: "truncated", slot: "warning" },
+    ] as const) {
+      const context: SubagentLifecycleRenderContext = { state: {}, isError: false };
+      renderSendMessageCall({ to: "reviewer", message: "recover" }, spyTheme, context);
+      renderSendMessageResult({
+        content: [{ type: "text", text: "canonical checkpoint evidence" }],
+        details: {
+          agentId: "agent-aabbccddeeff", agent: "reviewer", delivery: "checkpoint-recovery",
+          outcome: scenario.outcome, recovered: scenario.recovered, truncated: scenario.truncated,
+        },
+      }, spyTheme, context).render(48);
+      expect(calls).toContainEqual({ slot: "accent", text: "reviewer" });
+      expect(calls).toContainEqual({ slot: scenario.slot, text: ` · ${scenario.state}` });
+    }
   });
 
   it("lets a settled TaskStop result replace its pending target header without a second shell glyph", () => {

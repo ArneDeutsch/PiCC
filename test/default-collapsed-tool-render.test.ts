@@ -132,6 +132,11 @@ describe("default-collapsed tool rendering", () => {
     expect(resolver).toHaveBeenCalledTimes(1);
     expect(args.path).toBe(rawPath);
     expect(result.content[0]?.text).toBe("body");
+
+    expect(settle(definition("read"), { path: "repo:literal.ts" }, readResult("body")))
+      .toContain("read ./repo:literal.ts");
+    expect(settle(definition("read"), { path: "re\u200Bpo:literal.ts" }, readResult("body")))
+      .toContain("read re�po:literal.ts");
   }));
 
   it("collapses only an exact coherent bounded Read continuation", () => withBinding(["ctrl+o"], () => {
@@ -305,6 +310,30 @@ describe("default-collapsed tool rendering", () => {
       { args: { path: "streaming.ts" }, state: {}, isPartial: true, expanded: false }).render(80).join("\n");
     expect(writeCall).toContain("native write streaming.ts");
     expect(writeCall).not.toContain("Unfamiliar arguments");
+  }));
+
+  it("keeps compatibility path characters unchanged in live and settled default file rows", () => withBinding(["ctrl+o"], () => {
+    const path = "K:/secret";
+    for (const [name, extra] of [
+      ["read", {}],
+      ["write", { content: "body" }],
+      ["edit", { edits: [{ oldText: "a", newText: "b" }] }],
+    ] as const) {
+      const args = Object.freeze({ path, ...extra });
+      const before = structuredClone(args);
+      const tool = definition(name);
+      const live = tool.renderCall(args, theme, { args, state: {}, isPartial: true, expanded: false })
+        .render(80).join("\n");
+      expect(live).toContain(path);
+      expect(live).not.toContain("K:/secret");
+      expect(args).toEqual(before);
+    }
+
+    const settledArgs = Object.freeze({ path });
+    const settledResult = Object.freeze(readResult("body"));
+    expect(settle(definition("read"), settledArgs, settledResult)).toContain(path);
+    expect(settledArgs.path).toBe(path);
+    expect((settledResult as { content: Array<{ text: string }> }).content[0]?.text).toBe("body");
   }));
 
   it("delegates a shared partial state natively without hiding progress", () => withBinding(["ctrl+o"], () => {

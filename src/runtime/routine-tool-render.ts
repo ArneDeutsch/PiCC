@@ -12,6 +12,7 @@ import {
   formatToolDisplayName,
   priorityDisplayRow,
   resolveDisplayRoots,
+  sanitizeInlineDisplay,
   type DisplayRootResolver,
   type DisplayRoots,
 } from "./tool-display.js";
@@ -176,6 +177,26 @@ function structuredRowComponent(
       if (!Number.isFinite(width) || width <= 0) return [""];
       const columns = Math.max(0, Math.floor(width));
       try {
+        const fullPlain = (literals[0] ?? "") + fields.map((field, index) =>
+          field + (literals[index + 1] ?? "")).join("");
+        const firstLiteral = literals[0] ?? "";
+        const ordinaryWorktree = priorityEvidence === undefined &&
+          /^(?:enter worktree|exit worktree)\($/u.test(firstLiteral) && fields[0];
+        if (ordinaryWorktree && visibleWidth(fullPlain) > columns) {
+          const keyword = firstLiteral.slice(0, -1);
+          const framedRoom = columns - visibleWidth(firstLiteral) - visibleWidth(")");
+          if (framedRoom >= 2) {
+            const primary = visibleWidth(ordinaryWorktree) > framedRoom
+              ? truncateToWidth(ordinaryWorktree, framedRoom, "…")
+              : ordinaryWorktree;
+            return [clamp(
+              themedFg(theme, "text", firstLiteral) + themedFg(theme, "accent", primary) + themedFg(theme, "muted", ")"),
+              columns,
+            )];
+          }
+          return [clamp(themedFg(theme, "accent", ordinaryWorktree), columns)];
+        }
+
         const fixedWidth = literals.reduce((sum, literal) => sum + visibleWidth(literal), 0);
         let remaining = Math.max(0, columns - fixedWidth);
         const displayed: string[] = [];
@@ -202,7 +223,6 @@ function structuredRowComponent(
               : "");
           return [clamp(evidence, columns)];
         }
-        const firstLiteral = literals[0] ?? "";
         const keyword = /^(?:enter worktree|exit worktree)/u.exec(firstLiteral)?.[0] ?? "";
         let styled = themedFg(theme, "text", keyword) + themedFg(theme, "muted", firstLiteral.slice(keyword.length));
         for (let index = 0; index < displayed.length; index++) {
@@ -541,10 +561,10 @@ function recognizeEnterWorktree(
       details.previousKeepOutcome !== "keep-failed") ||
     (hasPreviousError && (details.previousKeepOutcome !== "keep-failed" ||
       typeof details.previousKeepError !== "string"))) return undefined;
-  const worktreePath = sanitizeText(formatDisplayPathFromRoots(details.worktreePath, displayRoots), true);
+  const worktreePath = sanitizeInlineDisplay(formatDisplayPathFromRoots(details.worktreePath, displayRoots));
   const branch = sanitizeText(details.branch, true);
   const previousPath = hasPrevious
-    ? sanitizeText(formatDisplayPathFromRoots(details.previousWorktreePath, displayRoots), true)
+    ? sanitizeInlineDisplay(formatDisplayPathFromRoots(details.previousWorktreePath, displayRoots))
     : undefined;
   const previousError = hasPreviousError ? sanitizeText(details.previousKeepError, true) : undefined;
   if (!worktreePath || !branch || (hasPrevious && !previousPath) || (hasPreviousError && !previousError)) {
@@ -593,7 +613,7 @@ function recognizeExitWorktree(
   const none = plainOwnData(resultSnapshot.details, ["outcome", "restorePath"]);
   if (none) {
     if (none.outcome !== "none" || typeof none.restorePath !== "string") return undefined;
-    const restorePath = sanitizeText(formatDisplayPathFromRoots(none.restorePath, displayRoots), true);
+    const restorePath = sanitizeInlineDisplay(formatDisplayPathFromRoots(none.restorePath, displayRoots));
     return restorePath
       ? { literals: ["exit worktree (no active worktree); already at ", ""], fields: [restorePath] }
       : undefined;
@@ -607,8 +627,8 @@ function recognizeExitWorktree(
     typeof details.ok !== "boolean" || typeof details.removed !== "boolean" ||
     typeof details.orphaned !== "boolean" ||
     !exactDataArray(details.diagnostics, MAX_WORKTREE_DIAGNOSTICS)) return undefined;
-  const worktreePath = sanitizeText(formatDisplayPathFromRoots(details.worktreePath, displayRoots), true);
-  const restorePath = sanitizeText(formatDisplayPathFromRoots(details.restorePath, displayRoots), true);
+  const worktreePath = sanitizeInlineDisplay(formatDisplayPathFromRoots(details.worktreePath, displayRoots));
+  const restorePath = sanitizeInlineDisplay(formatDisplayPathFromRoots(details.restorePath, displayRoots));
   if (!worktreePath || !restorePath) return undefined;
   if (details.outcome === "kept") {
     if (details.ok !== true || details.removed || details.orphaned || "error" in details) return undefined;
@@ -1085,12 +1105,12 @@ export function recognizeMultiEditSuccess(
     details.diff.length > MAX_MULTI_EDIT_DIFF_CHARS;
   if (oversized) {
     const boundedRawPath = details.filePath.slice(0, MAX_OVERSIZED_PATH_CHARS);
-    const path = sanitizeMutationText(boundedRawPath, true, MAX_OVERSIZED_PATH_CHARS) +
+    const path = sanitizeInlineDisplay(boundedRawPath, MAX_OVERSIZED_PATH_CHARS) +
       (details.filePath.length > MAX_OVERSIZED_PATH_CHARS ? "…" : "");
     return path.length > 0 ? { kind: "oversized", path } : undefined;
   }
   if (!validateMultiEditEntries(args.edits, editCount)) return undefined;
-  const path = sanitizeMutationText(details.filePath, true, MAX_MULTI_EDIT_PATH_CHARS);
+  const path = sanitizeInlineDisplay(details.filePath, MAX_MULTI_EDIT_PATH_CHARS);
   const diff = sanitizeMutationText(details.diff, false, MAX_MULTI_EDIT_DIFF_CHARS);
   if (path.length === 0 || (details.diff.length > 0 && diff.length === 0)) return undefined;
   return {
@@ -1105,10 +1125,8 @@ export function recognizeMultiEditSuccess(
   };
 }
 
-function multiEditCall(args: unknown, theme: unknown): Component {
-  const snapshot = plainOwnData(args, ["file_path", "edits"]);
-  const path = sanitizeMutationText(snapshot?.file_path, true, MAX_MULTI_EDIT_PATH_CHARS);
-  return commandComponent("MultiEdit", path, theme);
+function multiEditCall(displayPath: string, theme: unknown): Component {
+  return commandComponent("MultiEdit", displayPath, theme);
 }
 
 function textComponent(text: string, theme: unknown): Component {
@@ -1136,7 +1154,7 @@ function multiEditResult(
   }
   const fallback = failOpenComponent(result, "MultiEdit", theme);
   try {
-    const cwd = sanitizeText(ownData(context, "cwd"), true);
+    const cwd = sanitizeInlineDisplay(ownData(context, "cwd"));
     const createDefinition: (cwd: string) => EditRendererDefinition =
       dependencies.createEditDefinition ??
       ((definitionCwd) => createEditToolDefinition(definitionCwd) as unknown as EditRendererDefinition);
@@ -1276,10 +1294,10 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
         const displayRoots = displayRootsFor(context);
         if (toolName !== "MultiEdit") return { render: () => [] };
         const snapshot = plainOwnData(args, ["file_path", "edits"]);
-        const displayed = snapshot
-          ? { ...snapshot, file_path: formatDisplayPathFromRoots(snapshot.file_path, displayRoots) }
-          : args;
-        return multiEditCall(displayed, theme);
+        const displayPath = snapshot
+          ? sanitizeInlineDisplay(formatDisplayPathFromRoots(snapshot.file_path, displayRoots))
+          : "";
+        return multiEditCall(displayPath, theme);
       },
     },
     renderResult: {
