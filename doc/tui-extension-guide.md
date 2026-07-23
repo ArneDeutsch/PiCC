@@ -127,9 +127,12 @@ The construction order is load-bearing: search specialization → routine/Edit r
 `withDefaultCollapsedToolRendering` → `wrapForSelfShell` → the outer checkpoint gate →
 registration. Presentation decorators leave the raw built-in `execute` unchanged. Only the outer
 checkpoint gate wraps it, and that gate may alter the returned result by adding `terminate`. The
-collapse adapter recognizes only settled ordinary successes. The configured `app.tools.expand`
-action changes native detail without changing the glyph; live, exceptional, unfamiliar, and unbound-action rows keep their native detail
-inside the same outer glyph frame, while malformed display fields use a concise warning.
+collapse adapter snapshots the display-only path root when the invocation first renders, so later
+cwd changes cannot rewrite an existing row. It recognizes an ordinary bounded Read continuation
+only when the canonical notice agrees exactly with the requested range; unknown and exceptional
+families fail open to native detail. The configured `app.tools.expand` action changes native detail
+without changing the glyph; live, exceptional, unfamiliar, and unbound-action rows keep their native
+detail inside the same outer glyph frame, while malformed display fields use a concise warning.
 
 Lowercase Edit needs one inner exception. Pi's call renderer retains a stateful padded `Box` through
 `ctx.lastComponent`; `withRoutineToolRendering` keeps that exact Box in a WeakMap, removes only its
@@ -275,7 +278,9 @@ run *before* the focused component — so a raw listener must yield to an open c
 - **`ctx.ui.setWidget(key, content, { placement })`** — a keyed pane rendered `"aboveEditor"` or
   `"belowEditor"`. `content` is either a `string[]` or a `(tui, theme) => Component` factory (with
   optional `dispose`). Pass `undefined` for that key to remove it. Good for a live status pane or a
-  running-tasks strip that persists across turns.
+  running-tasks strip that persists across turns. The shipped subagent panel computes one shared
+  layout: optional telemetry columns disappear panel-wide before agent identity and dispatch
+  description, keeping rows aligned as width narrows.
 - **`ctx.ui.setFooter(factory)` / `ctx.ui.setHeader(factory)`** — replace the built-in footer/header
   with your own component; `undefined` restores the default. The footer factory receives a
   `ReadonlyFooterDataProvider` (git branch, `setStatus` values). Token/model stats come from

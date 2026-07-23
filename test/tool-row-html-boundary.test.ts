@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { SessionManager, initTheme } from "@earendil-works/pi-coding-agent";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
+import { renderAgentCall, renderAgentResult, renderTaskOutputCall } from "../src/runtime/subagent-render.js";
 
 type HtmlExportModule = {
   exportSessionToHtml(
@@ -59,10 +60,24 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
         return textComponent(result.content?.[0]?.text ?? "");
       },
     });
+    const lifecycleDefinitions: Record<string, Record<string, unknown>> = {
+      Agent: wrapForSelfShell({
+        name: "Agent",
+        renderCall: renderAgentCall,
+        renderResult: (result: unknown, options: unknown, theme: unknown, context: unknown) =>
+          renderAgentResult(result, options, theme, context as never, { surface: "agent", resolveAgentColor: () => "blue" }),
+      }),
+      TaskOutput: wrapForSelfShell({
+        name: "TaskOutput",
+        renderCall: renderTaskOutputCall,
+        renderResult: (result: unknown, options: unknown, theme: unknown, context: unknown) =>
+          renderAgentResult(result, options, theme, context as never, { surface: "task-output", resolveAgentColor: () => "magenta" }),
+      }),
+    };
     const toolRenderer = htmlRendererModule.createToolHtmlRenderer({
       getToolDefinition: (name) => {
         requestedDefinitions.push(name);
-        return name === "CustomBoundary" ? customDefinition : undefined;
+        return name === "CustomBoundary" ? customDefinition : lifecycleDefinitions[name];
       },
       theme: themeModule.theme,
       cwd: process.cwd(),
@@ -78,6 +93,8 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
         content: [
           { type: "toolCall", id: "stock-read", name: "read", arguments: { path: HOSTILE } },
           { type: "toolCall", id: "custom-boundary", name: "CustomBoundary", arguments: { query: HOSTILE } },
+          { type: "toolCall", id: "agent-lifecycle", name: "Agent", arguments: { subagent_type: "reviewer", description: "Review HTML" } },
+          { type: "toolCall", id: "task-lifecycle", name: "TaskOutput", arguments: { task_id: "task-7" } },
         ],
         stopReason: "toolUse",
       } as never);
@@ -96,6 +113,16 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
         content: [{ type: "text", text: HOSTILE }],
         details: { preserved: HOSTILE },
         isError: false,
+      } as never);
+      session.appendMessage({
+        role: "toolResult", toolCallId: "agent-lifecycle", toolName: "Agent",
+        content: [{ type: "text", text: "agent body" }],
+        details: { outcome: "completed", agent: "reviewer", agentId: "agent-aabbccddeeff" }, isError: false,
+      } as never);
+      session.appendMessage({
+        role: "toolResult", toolCallId: "task-lifecycle", toolName: "TaskOutput",
+        content: [{ type: "text", text: "task body" }],
+        details: { taskId: "task-7", outcome: "failed", status: "failed", agent: "reviewer", error: "failed safely" }, isError: true,
       } as never);
       const canonicalBytes = Buffer.from(JSON.stringify(session.getEntries()), "utf8");
 
@@ -138,6 +165,13 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
       for (const fragment of [custom?.callHtml, custom?.resultHtmlExpanded]) {
         expect(fragment).toContain("&lt;img src=x onerror=&quot;boom&quot;&gt;&amp; hostile");
         expect(fragment).not.toContain("<img");
+      }
+      for (const id of ["agent-lifecycle", "task-lifecycle"]) {
+        const lifecycle = data.renderedTools?.[id];
+        expect(lifecycle).toBeDefined();
+        for (const fragment of [lifecycle?.callHtml, lifecycle?.resultHtmlCollapsed, lifecycle?.resultHtmlExpanded]) {
+          expect(fragment ?? "").not.toContain("\u001b");
+        }
       }
     } finally {
       rmSync(directory, { recursive: true, force: true });

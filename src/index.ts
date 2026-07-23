@@ -1463,7 +1463,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Registered unconditionally: TaskOutput/TaskStop answer helpfully even when
   // no background task was ever started.
   claudeNamedTools.push(
-    createTaskOutputTool(backgroundTasks) as Record<string, unknown>,
+    createTaskOutputTool(backgroundTasks, {
+      resolveAgentColor: (agentId, agentName) => subagentRuntime.agentDisplayColor(agentId, agentName),
+    }) as Record<string, unknown>,
     createTaskStopTool(backgroundTasks, subagentRegistry) as Record<string, unknown>,
   );
   for (const tool of claudeNamedTools) {
@@ -1474,12 +1476,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // presentation decorator, before registration so canonical results retain
       // its terminate metadata. `customToolsFor` skips this parent-TUI chain.
       const mainSessionTool: Record<string, unknown> = tool.name === "Grep" || tool.name === "Glob"
-        ? withCompactSearchRendering(tool as unknown as ToolDefinition) as unknown as Record<string, unknown>
+        ? withCompactSearchRendering(tool as unknown as ToolDefinition, { resolveDisplayRoot: getCwd }) as unknown as Record<string, unknown>
         : tool;
       const routineRendered = withRoutineToolRendering(
         mainSessionTool as unknown as ToolDefinition,
+        { resolveDisplayRoot: getCwd },
       );
-      const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
+      const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered, { resolveDisplayRoot: getCwd });
       pi.registerTool(mainCheckpointGate.wrapTool(
         wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
       ));
@@ -1547,9 +1550,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       for (const { def } of builtins) {
         const routineRendered = withRoutineToolRendering(
           def as unknown as ToolDefinition,
-          { resolveEditRenderCwd: getCwd },
+          { resolveEditRenderCwd: getCwd, resolveDisplayRoot: getCwd },
         );
-        const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
+        const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered, { resolveDisplayRoot: getCwd });
         pi.registerTool(mainCheckpointGate.wrapTool(
           wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
         ));
@@ -2734,7 +2737,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     } catch {
       return undefined;
     }
-    return renderSettlementRecord(details, opts, theme);
+    return renderSettlementRecord(details, opts, theme, {
+      resolveAgentColor: (agentId, agentName) => subagentRuntime.agentDisplayColor(agentId, agentName),
+    });
   });
 
   /**

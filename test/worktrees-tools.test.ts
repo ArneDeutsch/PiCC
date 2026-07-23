@@ -459,7 +459,7 @@ describe("ExitWorktree tool: truthful reporting", () => {
       undefined,
       { args: { action: "remove" }, isError: false },
     ).render(120)).toEqual([
-      `ExitWorktree(${h.wtPath("wt-a")}) removed; restored ${h.base}`,
+      `exit worktree(${h.wtPath("wt-a")}) removed; restored ${h.base}`,
     ]);
     expect(text(result)).toBe(
       `Exited and removed worktree: ${h.wtPath("wt-a")}. Working directory restored.`,
@@ -510,21 +510,21 @@ describe("ExitWorktree tool: truthful reporting", () => {
       "The session working directory is now inside the worktree; all relative paths and shell commands run there.",
     ].join("\n"));
     expect(interactiveText(enterHarness.enter, uncertainEnter, { name: "wt-b" })).toBe(
-      `EnterWorktree(${enterHarness.wtPath("wt-b")}) on branch worktree-wt-b; previous ${enterHarness.wtPath("wt-a")} keep failed: ENTER_DIAGNOSTIC_SENTINEL; previous worktree state unknown`,
+      `enter worktree(${enterHarness.wtPath("wt-b")}) on branch worktree-wt-b; previous ${enterHarness.wtPath("wt-a")} keep failed: ENTER_DIAGNOSTIC_SENTINEL; previous worktree state unknown`,
     );
 
     expect(text(uncertainKeep)).toBe(
       `Exited worktree, but keep FAILED; final state of ${keepHarness.wtPath("wt-a")} is unknown. Working directory restored to ${keepHarness.base}.`,
     );
     expect(interactiveText(keepHarness.exit, uncertainKeep, { action: "keep" })).toBe(
-      `ExitWorktree(${keepHarness.wtPath("wt-a")}) keep failed: KEEP_DIAGNOSTIC_SENTINEL; worktree state unknown; restored ${keepHarness.base}`,
+      `exit worktree(${keepHarness.wtPath("wt-a")}) keep failed: KEEP_DIAGNOSTIC_SENTINEL; worktree state unknown; restored ${keepHarness.base}`,
     );
 
     expect(text(uncertainRemoval)).toBe(
       `Exited worktree, but removal FAILED (REMOVE_DIAGNOSTIC_SENTINEL) — final state of ${removeHarness.wtPath("wt-a")} is unknown. Working directory restored.`,
     );
     expect(interactiveText(removeHarness.exit, uncertainRemoval, { action: "remove" })).toBe(
-      `ExitWorktree(${removeHarness.wtPath("wt-a")}) removal failed: REMOVE_DIAGNOSTIC_SENTINEL; worktree state unknown; restored ${removeHarness.base}`,
+      `exit worktree(${removeHarness.wtPath("wt-a")}) removal failed: REMOVE_DIAGNOSTIC_SENTINEL; worktree state unknown; restored ${removeHarness.base}`,
     );
   });
 

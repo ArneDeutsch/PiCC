@@ -387,19 +387,26 @@ describe("TaskStop background identity", () => {
     const first = await tool.execute("stop", { task_id: id });
     const out = options.repeated ? await tool.execute("stop-again", { task_id: id }) : first;
     const canonical = structuredClone(out);
+    const args = { task_id: id };
+    const argsBefore = structuredClone(args);
     const wrapped = wrapForSelfShell(tool as unknown as Record<string, unknown>);
-    const rendered = (wrapped.renderResult as Function)(
+    const context = { state: {}, args, isPartial: false };
+    const pending = (wrapped.renderCall as Function)(args, undefined, context);
+    const resultComponent = (wrapped.renderResult as Function)(
       out,
       { expanded: false, isPartial: false },
       undefined,
-      { state: {}, isPartial: false },
-    ).render(500) as string[];
+      context,
+    );
+    expect(pending.render(500)).toEqual([]);
+    const rendered = resultComponent.render(500) as string[];
     expect(rendered.join("\n").match(/[○●✗■]/gu) ?? []).toHaveLength(1);
     if (!options.settled) {
       resolve(result({ outcome: "aborted", agentId: AGENT_ID }));
       await registry.wait(id);
     }
     expect(out).toEqual(canonical);
+    expect(args).toEqual(argsBefore);
     return { id, out, tool, rendered };
   }
 
@@ -410,7 +417,8 @@ describe("TaskStop background identity", () => {
     expect(out.content[0]!.text).toContain("already finished");
     expect(out.content[0]!.text).toContain("nothing to stop");
     expect(out.content[0]!.text).not.toContain("agent:INTERNAL-SENTINEL");
-    expect(rendered).toEqual([`● ${out.content[0]!.text}`]);
+    expect(rendered[0]).toBe(`● task stop ${id}`);
+    expect(rendered.slice(1).join("\n")).toContain(out.content[0]!.text);
     expect(tool.parameters.properties).toHaveProperty("task_id");
     expect(out.details).toEqual({ taskId: id, status: "completed" });
   });
@@ -420,13 +428,15 @@ describe("TaskStop background identity", () => {
     expect(failed.out.content[0]!.text).toContain('already finished with status "failed"');
     expect(failed.out.content[0]!.text).toContain("nothing to stop");
     expect(failed.out.details).toEqual({ taskId: failed.id, status: "failed" });
-    expect(failed.rendered).toEqual([`✗ ${failed.out.content[0]!.text}`]);
+    expect(failed.rendered[0]).toBe(`✗ task stop ${failed.id}`);
+    expect(failed.rendered.slice(1).join("\n")).toContain(failed.out.content[0]!.text);
 
     const stopped = await stopResult({ settled: "stopped", repeated: true });
     expect(stopped.out.content[0]!.text).toContain('already finished with status "stopped"');
     expect(stopped.out.content[0]!.text).toContain("nothing to stop");
     expect(stopped.out.details).toEqual({ taskId: stopped.id, status: "stopped" });
-    expect(stopped.rendered).toEqual([`■ ${stopped.out.content[0]!.text}`]);
+    expect(stopped.rendered[0]).toBe(`■ task stop ${stopped.id}`);
+    expect(stopped.rendered.slice(1).join("\n")).toContain(stopped.out.content[0]!.text);
   });
 
   it("identifies a cooperative abort request", async () => {
@@ -436,8 +446,41 @@ describe("TaskStop background identity", () => {
     expect(out.content[0]!.text).toContain("stop requested (cooperative abort)");
     expect(out.content[0]!.text).toContain("result will be discarded");
     expect(out.content[0]!.text).not.toContain("agent:INTERNAL-SENTINEL");
-    expect(rendered).toEqual([`■ ${out.content[0]!.text}`]);
+    expect(rendered[0]).toBe(`■ task stop ${id}`);
+    expect(rendered.slice(1).join("\n")).toContain(out.content[0]!.text);
     expect(out.details).toEqual({ taskId: id, status: "stopped" });
+  });
+
+  it("owns one complete requested target for a checkpoint-agent call/result lifecycle", async () => {
+    const agentId = "agent-112233445566";
+    const stopCheckpoint = vi.fn(async () => {});
+    const tool = createTaskStopTool(new BackgroundTaskRegistry(), {
+      get: (id: string) => id === agentId ? {
+        agentId, agentName: "checkpoint-worker", state: "running" as const,
+        checkpointPaused: true, session: { stopCheckpoint },
+      } : undefined,
+    }) as unknown as ToolLike;
+    const args = { task_id: agentId };
+    const beforeArgs = structuredClone(args);
+    const out = await tool.execute("checkpoint-stop", args);
+    const beforeOut = structuredClone(out);
+    expect(stopCheckpoint).toHaveBeenCalledTimes(1);
+    const wrapped = wrapForSelfShell(tool as unknown as Record<string, unknown>);
+    for (const width of [0, 1, 2, 12, 30, 100]) {
+      const context = { state: {}, args, isPartial: false };
+      const call = (wrapped.renderCall as Function)(args, undefined, context);
+      const resultComponent = (wrapped.renderResult as Function)(out, {}, undefined, context);
+      expect(call.render(width)).toEqual([]);
+      const lines = resultComponent.render(width) as string[];
+      for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
+      expect(lines.join("\n").match(/[○●✗■]/gu) ?? []).toHaveLength(width <= 0 ? 0 : 1);
+      if (width >= 12) {
+        expect(lines.join("").replace(/\s/gu, "")).toContain(agentId);
+        expect(lines.join("\n").match(/task stop/gu)).toHaveLength(1);
+      }
+    }
+    expect(args).toEqual(beforeArgs);
+    expect(out).toEqual(beforeOut);
   });
 
   it("leaves an unknown-id producer error on Pi's error state", async () => {
@@ -471,7 +514,8 @@ describe("TaskStop background identity", () => {
     expect(out.content[0]!.text).toContain("marked stopped");
     expect(out.content[0]!.text).toContain("Cooperative stop is not supported");
     expect(out.content[0]!.text).not.toContain("agent:INTERNAL-SENTINEL");
-    expect(rendered).toEqual([`■ ${out.content[0]!.text}`]);
+    expect(rendered[0]).toBe(`■ task stop ${id}`);
+    expect(rendered.slice(1).join("\n")).toContain(out.content[0]!.text);
     expect(out.details).toEqual({ taskId: id, status: "stopped" });
   });
 });
@@ -2282,9 +2326,9 @@ describe("TaskOutput live streaming", () => {
     const identified = partials.some((p) => {
       const r = renderUpdate(p);
       return (
-        r.includes("Task(" + id + ")") &&
-        r.includes("Agent(coder)") &&
-        r.includes("running") &&
+        r.includes("task output " + id) &&
+        r.includes("coder") &&
+        r.includes("[running]") &&
         !r.includes("Grep") &&
         !r.includes("\n") && // one status line, no tail
         (p.details?.subagentProgress as ProgressSnapshot | undefined)?.tail.includes("> Grep (x)") === true
@@ -2473,8 +2517,8 @@ describe("TaskOutput live streaming", () => {
       .renderCall({ task_id: id, wait: false }, undefined)
       .render(120)
       .join("\n");
-    expect(call).toBe(`TaskOutput(${id}) awaiting`);
-    expect(pollCall).toBe(`TaskOutput(${id}) polling`);
+    expect(call).toBe(`task output ${id} [awaiting]`);
+    expect(pollCall).toBe(`task output ${id} [polling]`);
     expect(call.includes(ESC)).toBe(false);
     release();
     await registry.wait(id);
@@ -2562,7 +2606,7 @@ describe("TaskOutput live streaming", () => {
     const failedHuman = taskOutput.renderResult(failed, { isPartial: false }, undefined).render(120).join("\n");
     expect(failedHuman).not.toContain(`Background task ${failedId}`); // not restated in the body
     expect(failedHuman).toContain("connection reset"); // reason kept
-    expect(failedHuman).toContain(`Task(${failedId})`); // badge chip
+    expect(failedHuman).toContain(`task output ${failedId}`); // explicit target
     expect(failedHuman).toContain(AGENT_ID); // identity subline (non-resumable)
 
     // Aborted (stopped): the "stopped before completing" clause is kept.
@@ -2581,7 +2625,7 @@ describe("TaskOutput live streaming", () => {
     const abHuman = taskOutput.renderResult(aborted, { isPartial: false }, undefined).render(120).join("\n");
     expect(abHuman).not.toContain(`Background task ${abId}`); // not restated in the body
     expect(abHuman).toContain("it was stopped before completing"); // reason clause kept
-    expect(abHuman).toContain(`Task(${abId})`); // badge chip
+    expect(abHuman).toContain(`task output ${abId}`); // explicit target
   });
 });
 
@@ -3248,11 +3292,7 @@ describe("settlement completion record (details + exactly-once)", () => {
       .renderResult(afterNotice, { isPartial: false, expanded: false }, undefined)
       .render(200);
     expect(noticeReference).toHaveLength(1);
-    expect(noticeReference[0]).toContain(
-      testCase.outcome === "completed"
-        ? `Agent(worker) → Task(${noticeTask.id}) completed`
-        : `Agent(worker) ${testCase.badge}`,
-    );
+    expect(noticeReference[0]).toContain(`task output ${noticeTask.id} - worker [${testCase.badge}]`);
     expect(noticeReference[0]).toContain(RECORD_REFERENCE_NOTE);
 
     const directTask = await makeTask();
@@ -3282,11 +3322,7 @@ describe("settlement completion record (details + exactly-once)", () => {
       .renderResult(second, { isPartial: false, expanded: false }, undefined)
       .render(200);
     expect(collectionReference).toHaveLength(1);
-    expect(collectionReference[0]).toContain(
-      testCase.outcome === "completed"
-        ? `Agent(worker) → Task(${directTask.id}) completed`
-        : `Agent(worker) ${testCase.badge}`,
-    );
+    expect(collectionReference[0]).toContain(`task output ${directTask.id} - worker [${testCase.badge}]`);
     expect(collectionReference[0]).toContain(RECORD_REFERENCE_NOTE);
   });
 
@@ -3336,17 +3372,23 @@ describe("settlement completion record (details + exactly-once)", () => {
     const collapsed = renderSettlementRecord(details, { expanded: false }, undefined)!;
     const collapsedLines = collapsed.render(200);
     expect(collapsedLines).toHaveLength(1);
-    expect(collapsedLines[0]).toContain(`Task(${id})`);
-    expect(collapsedLines[0]).toContain(`Agent(worker) → Task(${id}) completed`);
+    expect(collapsedLines[0]).toContain("worker [completed]");
+    expect(collapsedLines[0]).not.toContain(id);
     expect(collapsedLines[0]).toContain(RECORD_EXPAND_HINT);
     expect(collapsedLines[0]).not.toContain(".jsonl");
     expect(collapsedLines[0]).not.toContain("the review report");
-    const expanded = renderSettlementRecord(details, { expanded: true }, undefined)!
-      .render(200)
-      .join("\n");
+    const expandedLines = renderSettlementRecord(details, { expanded: true }, undefined)!.render(200);
+    const expanded = expandedLines.join("\n");
+    expect(expandedLines[0]).toContain("worker [completed]");
+    expect(expandedLines[0]).not.toContain(id);
     expect(expanded).toContain("the review report");
     expect(expanded).toContain("transcript: /x/sessions/");
     expect(expanded).toContain("usage:");
+    const referenceLines = renderSettlementRecord({ ...details, alreadyReported: true }, { expanded: false }, undefined)!
+      .render(200);
+    expect(referenceLines[0]).toContain("worker [completed]");
+    expect(referenceLines[0]).not.toContain(id);
+    expect(referenceLines[0]).toContain(RECORD_REFERENCE_NOTE);
   });
 
   it("caps settlement UI final text at a scalar boundary without changing the task result", async () => {

@@ -7,7 +7,12 @@ import {
   BackgroundTaskRegistry,
   createTaskOutputTool,
 } from "../src/runtime/background-tasks.js";
-import { RECORD_FORK_MARKER, renderAgentResult } from "../src/runtime/subagent-render.js";
+import {
+  RECORD_EXPAND_HINT,
+  RECORD_FORK_MARKER,
+  RECORD_REFERENCE_NOTE,
+  renderAgentResult,
+} from "../src/runtime/subagent-render.js";
 import { FORK_DEGRADE_PREFIX, subagentSessionDir } from "../src/util/subagent-transcripts.js";
 import {
   fakeSdk,
@@ -270,13 +275,14 @@ describe("fork dispatch — developer-facing rendering (renderAgentResult)", () 
     details: Record<string, unknown>,
     expanded: boolean,
     text = "answer",
+    width = 120,
   ): string[] {
     const comp = renderAgentResult(
       { content: [{ type: "text", text }], details },
       { expanded, isPartial: false },
       undefined,
     );
-    return comp.render(120);
+    return comp.render(width);
   }
   const degraded = {
     outcome: "completed",
@@ -290,29 +296,44 @@ describe("fork dispatch — developer-facing rendering (renderAgentResult)", () 
     ],
   };
 
-  it("a successful fork badges as Agent(fork) with no degrade marker, collapsed or expanded", () => {
+  it("a successful fork uses concise lifecycle grammar with no degrade marker, collapsed or expanded", () => {
     const clean = { outcome: "completed", agent: "fork", diagnostics: [] };
     const collapsed = renderLines(clean, false).join("\n");
-    expect(collapsed).toContain("Agent(fork) completed");
+    expect(collapsed).toContain("fork [completed]");
     expect(collapsed).not.toContain(RECORD_FORK_MARKER);
     const expanded = renderLines(clean, true).join("\n");
-    expect(expanded).toContain("Agent(fork) completed");
+    expect(expanded).toContain("fork [completed]");
     expect(expanded).not.toContain("fork ran with fresh context");
   });
 
   it("a degraded fork's COLLAPSED record carries the ⚠ marker — the warning is never expand-only", () => {
     const lines = renderLines(degraded, false);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("Agent(general-purpose) completed");
-    expect(lines[0]).not.toContain("Agent(fork)");
+    expect(lines[0]).toContain("general-purpose [completed]");
+    expect(lines[0]).not.toContain("fork [");
     expect(lines[0]).toContain(RECORD_FORK_MARKER);
   });
 
   it("a degraded fork EXPANDED badges as the fresh agent AND shows the full fork-degrade footer line", () => {
     const joined = renderLines(degraded, true).join("\n");
-    expect(joined).toContain("Agent(general-purpose) completed");
-    expect(joined).not.toContain("Agent(fork)");
+    expect(joined).toContain("general-purpose [completed]");
+    expect(joined).not.toContain("fork [");
     expect(joined).toContain("fork ran with fresh context: fork inheritance is disabled");
+  });
+
+  it("keeps one fork warning and required cue on practical collapsed/reference success/failure rows", () => {
+    for (const width of [72, 96]) {
+      for (const outcome of ["completed", "failed"] as const) {
+        for (const reference of [false, true]) {
+          const details = { ...degraded, outcome, ...(reference ? { alreadyReported: true } : {}) };
+          const joined = renderLines(details, false, "answer", width).join("\n");
+          const cue = reference ? RECORD_REFERENCE_NOTE : RECORD_EXPAND_HINT;
+          expect(joined.split(RECORD_FORK_MARKER)).toHaveLength(2);
+          expect(joined.split(cue)).toHaveLength(2);
+          expect(joined).toContain(`general-purpose [${outcome}]`);
+        }
+      }
+    }
   });
 });
 

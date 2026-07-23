@@ -215,9 +215,10 @@ where to start reading, not the extent of its cluster.
   registry).
 
 - **Subagent status panel** (`subagent-panel-model.ts`, `subagent-panel-render.ts`,
-  `subagent-panel-widget.ts`, `subagent-panel-focus.ts`, with the shared width/theme helpers
-  extracted into `render-util.ts`) — the interactive-TUI observability surface over the dispatch
-  registry: a pure view model and pure renderer, a thin `setWidget` shell for the passive
+  `subagent-panel-widget.ts`, `subagent-panel-focus.ts`, with shared width/theme helpers in
+  `render-util.ts` and validated agent presentation colors in `agent-color.ts`) — the
+  interactive-TUI observability surface over the dispatch registry: a pure view model and pure
+  renderer, a thin `setWidget` shell for the passive
   below-editor panel, and a `ctx.ui.custom` focus controller for list navigation, the drill-down
   (prompt / structured live detail / final answer), stop/dismiss/stop-all, and steering. TUI-only by
   construction — the controllers are constructed unconditionally but attached only when
@@ -264,9 +265,10 @@ where to start reading, not the extent of its cluster.
   project**.
 
 - **Tool-row rendering** (`tool-shell.ts`, `search-tool-render.ts`, `routine-tool-render.ts`,
-  `default-collapsed-tool-render.ts`) — the self-shell framing seam plus guarded main-session human
-  renderers for specialized and safely classified settled tool rows; decoration changes only
-  presentation and never canonical model-facing results.
+  `default-collapsed-tool-render.ts`, with display-name/path formatting in `tool-display.ts`) — the
+  self-shell framing seam plus guarded main-session human renderers for specialized and safely
+  classified settled tool rows; decoration changes only presentation and never canonical
+  model-facing results.
 
 - **`tools/`** — the **self-contained** Claude-named tools, and the degrade stubs: names that resolve
   for gating but no-op with a notice. A tool that fronts a runtime subsystem lives with that

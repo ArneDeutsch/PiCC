@@ -870,7 +870,7 @@ describe("real Pi compact-search composition", () => {
       const lines = paint(build(search.ordinary), expanded);
       expect(lines).toHaveLength(2); // shell-owned separator + one result-owned content row
       expect(lines[0]).toBe("");
-      expect(lines[1]).toContain(search.name);
+      expect(lines[1]).toContain(search.name.toLowerCase());
       expect(lines.join("\n")).not.toContain(search.hidden);
     }
     expect(paint(build(search.ordinary), true)).toEqual(paint(build(search.ordinary), false));
@@ -1016,7 +1016,7 @@ describe("real Pi glyph-shell image and spacing ownership", () => {
       binary.updateResult({ content: [{ type: "image", data: png, mimeType: "image/png" }], details: undefined }, false);
       const binaryLines = binary.render(40) as string[];
       expect(binaryLines[0]).toBe("");
-      expect(binaryLines[1]?.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")).toBe("● ImageProbe");
+      expect(binaryLines[1]?.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")).toBe("● image probe");
       expect(binaryLines[2]).toBe(""); // Pi-owned text/image separator
       expect(binaryLines.slice(3).join("\n")).toContain("_G");
       expect(binaryLines.join("\n").match(/[○●✗■]/gu)).toHaveLength(1);
@@ -1026,7 +1026,7 @@ describe("real Pi glyph-shell image and spacing ownership", () => {
       const fallback = build("fallback-image");
       fallback.updateResult({ content: [{ type: "image", data: png, mimeType: "image/png" }], details: undefined }, false);
       const fallbackText = (fallback.render(80) as string[]).join("\n").replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
-      expect(fallbackText).toContain("● ImageProbe");
+      expect(fallbackText).toContain("● image probe");
       expect(fallbackText).toMatch(/\n  \[Image/iu);
       expect(fallbackText.match(/[○●✗■]/gu)).toHaveLength(1);
 
@@ -1074,7 +1074,7 @@ describe("real Pi lifecycle row ownership", () => {
       description: "Review auth",
       run_in_background: true,
     });
-    expect(text(agent)).toContain("Agent(coder) - Review auth");
+    expect(text(agent)).toContain("coder - Review auth");
     expect(text(agent)).not.toContain("background");
     expect(semanticLines(text(agent))).toHaveLength(1);
     agent.updateResult(
@@ -1082,7 +1082,7 @@ describe("real Pi lifecycle row ownership", () => {
       true,
     );
     const running = text(agent);
-    expect(running).toContain("Agent(coder) running");
+    expect(running).toContain("coder [running]");
     expect(running).not.toContain("Review auth");
     expect(running).not.toContain("live assistant text");
     expect(semanticLines(running)).toHaveLength(1);
@@ -1102,7 +1102,7 @@ describe("real Pi lifecycle row ownership", () => {
       false,
     );
     const collapsed = text(agent);
-    expect(collapsed).toContain("Agent(coder) completed");
+    expect(collapsed).toContain("coder [completed]");
     expect(collapsed).toContain("07:05");
     expect(collapsed).not.toContain("Review auth");
     expect(collapsed).not.toContain("final answer");
@@ -1115,8 +1115,8 @@ describe("real Pi lifecycle row ownership", () => {
 
     const awaiting = build("TaskOutput", "task-await", { task_id: "task-1" });
     const polling = build("TaskOutput", "task-poll", { task_id: "task-2", wait: false });
-    expect(text(awaiting)).toContain("TaskOutput(task-1) awaiting");
-    expect(text(polling)).toContain("TaskOutput(task-2) polling");
+    expect(text(awaiting)).toContain("task output task-1 [awaiting]");
+    expect(text(polling)).toContain("task output task-2 [polling]");
     expect(semanticLines(text(awaiting))).toHaveLength(1);
     expect(semanticLines(text(polling))).toHaveLength(1);
     awaiting.updateResult(
@@ -1128,7 +1128,7 @@ describe("real Pi lifecycle row ownership", () => {
       true,
     );
     const taskRunning = text(awaiting);
-    expect(taskRunning).toContain("Agent(coder) → Task(task-1) running");
+    expect(taskRunning).toContain("task output task-1 - coder [running]");
     expect(taskRunning).not.toContain("awaiting");
     expect(taskRunning).not.toContain("Grep");
     expect(semanticLines(taskRunning)).toHaveLength(1);
@@ -1140,7 +1140,7 @@ describe("real Pi lifecycle row ownership", () => {
       },
       false,
     );
-    expect(text(awaiting)).toContain("Agent(coder) → Task(task-1) completed");
+    expect(text(awaiting)).toContain("task output task-1 - coder [completed]");
     expect(text(awaiting)).not.toContain("awaiting");
     expect(semanticLines(text(awaiting))).toHaveLength(1);
 
@@ -1150,7 +1150,7 @@ describe("real Pi lifecycle row ownership", () => {
       false,
     );
     expect(text(failed)).toContain("provider failed");
-    expect(text(failed)).not.toContain("Agent(coder)");
+    expect(text(failed)).not.toContain("coder [");
   });
 
   it("keeps ownership isolated across interleaved calls and a throwing result renderer", async () => {
@@ -1186,8 +1186,8 @@ describe("real Pi lifecycle row ownership", () => {
     const firstText = (first.render(100) as string[]).join("\n");
     const secondText = (second.render(100) as string[]).join("\n");
     expect(firstText).toContain("fallback result");
-    expect(firstText).not.toContain("Agent(coder)");
-    expect(secondText).toContain("Agent(reviewer)");
+    expect(firstText).not.toContain("coder [");
+    expect(secondText).toContain("reviewer");
     expect(secondText).not.toContain("fallback result");
   });
 });
@@ -1257,7 +1257,7 @@ describe("real Pi glyph-shell construction and render ordering", () => {
     const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
     const piDist = mainUrl.slice(0, mainUrl.indexOf("/dist/"));
     const { theme }: any = await import(`${piDist}/dist/modes/interactive/theme/theme.js`);
-    const expected = theme.fg("toolTitle", theme.bold("GenericProbe"));
+    const expected = theme.fg("text", theme.bold("generic probe"));
     expect(genericCallComponent("GenericProbe", theme).render(80)).toEqual([expected]);
   });
 });

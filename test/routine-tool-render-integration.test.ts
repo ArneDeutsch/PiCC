@@ -83,7 +83,7 @@ describe("main-session routine rendering registration", () => {
         worktreePath: "/repo/.claude/worktrees/registered", branch: "worktree-registered",
         created: true, seeded: [], previousUnlockAttempted: false,
       },
-      expected: "EnterWorktree(/repo/.claude/worktrees/registered) on branch worktree-registered",
+      expected: "enter worktree(/repo/.claude/worktrees/registered) on branch worktree-registered",
     },
     {
       name: "ExitWorktree",
@@ -92,7 +92,7 @@ describe("main-session routine rendering registration", () => {
         worktreePath: "/repo/.claude/worktrees/registered", outcome: "deferred-removal",
         restorePath: "/repo", ok: true, removed: false, orphaned: true, diagnostics: [],
       },
-      expected: "ExitWorktree(/repo/.claude/worktrees/registered) removal deferred; restored /repo",
+      expected: "exit worktree(/repo/.claude/worktrees/registered) removal deferred; restored /repo",
     },
   ])("registers $name with compact structured-result rendering", ({ name, args, details, expected }) => {
     const tool = pi.tools.get(name);

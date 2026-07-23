@@ -173,9 +173,13 @@ outcome even when their transport call succeeds. Ordinary settled Read, Write, E
 Bash successes use compact detail; the configured `app.tools.expand` action (Ctrl+O by default)
 reveals native detail without changing the marker. Live, exceptional, and unfamiliar rows retain
 native detail inside the same glyph frame, while malformed display data uses a concise warning.
-Binary images remain native. HTML export may retain Pi's state-background cards and built-in
-presentation, and eligible custom fragments may include phase-local glyphs; non-interactive output
-has no renderer glyphs. None of these presentations changes model-facing results or execution.
+Binary images remain native. In PiCC compact summaries, paths within the invocation-time working
+directory or worktree root are relative to that root; descendants stay relative and outside paths
+remain absolute. HTML export may
+retain Pi's state-background cards and built-in presentation, and eligible custom
+fragments may include phase-local glyphs; non-interactive output has no renderer glyphs. None of
+these presentations changes model-facing results or execution. Passive Agent lifecycle and panel
+rows omit internal task IDs; explicit `TaskOutput` and `TaskStop` rows retain their requested targets.
 
 ### Observing subagents
 
@@ -186,10 +190,9 @@ Every subagent is visible, both to you and to the coordinating model:
   (`~/.pi/agent/sessions/…`). The agent id appears in the dispatch result, so you can find the run's
   full record without guessing. These files are not reaped automatically.
 - **Status panel.** While agents run, a panel below the input shows the whole agent tree live —
-  no `TaskOutput` await needed. One row per agent, nested children indented: a status bubble
-  (spinner while running; `●` done, `✗` failed, `■` stopped), the agent type (tinted with the
-  agent's `color:` frontmatter when set), your dispatch description, elapsed time, and token usage
-  once known (blank until then — never a fake zero). Finished rows linger briefly — ~10 s
+  no `TaskOutput` await needed. Each row prioritizes state, agent type (tinted with recognized
+  `color:` frontmatter), and the dispatch description; elapsed time and usage appear only when
+  available and terminal width permits. Finished rows linger briefly — ~10 s
   for successes, ~60 s for failures and stops — then leave on their own. That auto-expiry is a deliberate PiCC
   deviation: Claude Code keeps finished agents listed until dismissed. An expired row is not lost:
   `alt+a` reopens the panel with every finished agent still listed, and the condensed record in
