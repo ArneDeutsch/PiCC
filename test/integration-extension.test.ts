@@ -25,6 +25,7 @@ import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 let dir: string;
 let pi: FakePi;
 const originalCwd = process.cwd();
+const compatAckSentinel = '{"suppressed":true,"sentinel":"KEEP-BYTES"}\n';
 
 beforeAll(async () => {
   dir = materializeFixture("full-surface");
@@ -32,6 +33,9 @@ beforeAll(async () => {
   fs.writeFileSync(path.join(dir, ".env.local"), "SECRET=1\n");
   fs.mkdirSync(path.join(dir, "config"), { recursive: true });
   fs.writeFileSync(path.join(dir, "config", "app.secret"), "s\n");
+  const ack = path.join(dir, ".claude", ".picc", "compat-ack.json");
+  fs.mkdirSync(path.dirname(ack), { recursive: true });
+  fs.writeFileSync(ack, compatAckSentinel, "utf8");
   // Hermetic user scope: don't absorb the developer's real ~/.claude.
   const userDir = path.join(dir, ".claude-user");
   fs.mkdirSync(userDir, { recursive: true });
@@ -404,10 +408,11 @@ describe("tool surface registration", () => {
     expect(backgroundCalls).toBe(0);
   });
 
-  it("registers the /doctor, /compat, /quota, /skills, /agents control commands", () => {
-    for (const name of ["doctor", "compat", "quota", "skills", "agents"]) {
+  it("registers retained control commands but not /compat", () => {
+    for (const name of ["doctor", "quota", "skills", "agents"]) {
       expect(pi.commands.has(name), `missing command ${name}`).toBe(true);
     }
+    expect(pi.commands.has("compat")).toBe(false);
   });
 
   it("exposes user-invocable skills in the / palette via prompt-template stubs (resources_discover)", async () => {
@@ -692,6 +697,30 @@ describe("permission + hook enforcement (guard)", () => {
     expect(blocked?.block).toBe(true);
   });
 
+  it("keeps matching permissions.ask diagnostics at point of use without executing the tool", async () => {
+    const bashExecute = vi.spyOn(pi.tools.get("bash"), "execute");
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      for (const toolCallId of ["ask-1", "ask-2"]) {
+        const outcome = await pi.fire("tool_call", {
+          toolName: "bash",
+          toolCallId,
+          input: { command: "git push origin main" },
+        });
+        expect(outcome?.block ?? false).toBe(false);
+      }
+      const diagnostics = errorSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes('ask rule "Bash(git push *)" downgraded to allow'));
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]).toContain("default-permissive posture");
+      expect(bashExecute).not.toHaveBeenCalled();
+    } finally {
+      bashExecute.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
   it("runs the warn-only PreToolUse write-guard: allows and injects additionalContext", async () => {
     pi.messages.length = 0;
     // NOTE: touch a file OUTSIDE src/ so this test does not consume the
@@ -833,43 +862,59 @@ describe("session lifecycle hooks", () => {
     expect(result).toEqual({ action: "continue" });
   });
 
-  it("SessionStart hook stdout reaches the model + compat notice raised", async () => {
+  it("keeps noisy non-vision startup quiet while delivering SessionStart context and preserving old ack state", async () => {
     pi.messages.length = 0;
     pi.entries.length = 0;
-    await pi.fire("session_start", { reason: "startup" }, pi.ctx());
-    const sent = pi.messages.map((m) => String(m.message.content)).join("\n");
-    expect(sent).toContain("FS-SESSION-START-HOOK-CONTEXT");
-    // compat: fixture declares ask rules, defaultMode, .mcp.json, unknown settings → one notice
-    const noticeEntry = pi.entries.find((e) => e.customType === "picc-compat");
-    expect(noticeEntry).toBeDefined();
-    const notice = String(noticeEntry?.data?.notice ?? "");
-    expect(notice).toContain("SAFETY");
-    expect(notice.toLowerCase()).toContain("ask");
-    // MCP pending-approval notice: the fixture's unapproved .mcp.json server is
-    // the STANDING pending case — the notice names the server, the enabling
-    // key, and the decline path, so one settings edit resolves it either way.
-    expect(notice).toContain("example-server");
-    expect(notice).toContain("enabledMcpjsonServers");
-    expect(notice).toContain("disabledMcpjsonServers");
-    expect(notice).toContain(".claude/settings.local.json");
+    pi.notifications.length = 0;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx({
+        model: { provider: "openai", id: "gpt-text", input: ["text"] },
+      }));
+      const sent = pi.messages.map((m) => String(m.message.content)).join("\n");
+      expect(sent).toContain("FS-SESSION-START-HOOK-CONTEXT");
+      expect(pi.entries.some((e) => e.customType === "picc-compat")).toBe(false);
+      const notificationText = pi.notifications.map((notification) => notification.text).join("\n");
+      expect(notificationText).not.toContain("PiCC compatibility:");
+      expect(notificationText).not.toContain("Run /doctor");
+      expect(notificationText).not.toContain("is not vision-capable");
+      // The ONE deliberate exception to quiet startup: the fixture's unapproved
+      // .mcp.json server is ACTIONABLE state, so exactly one MCP pending toast
+      // fires (asserted in detail in its own test below).
+      expect(pi.notifications).toHaveLength(1);
+      expect(pi.notifications[0]!.text).toContain("pending approval");
+
+      const consoleText = [...logSpy.mock.calls, ...errorSpy.mock.calls].flat().join("\n");
+      expect(consoleText).not.toContain("PiCC compatibility:");
+      expect(consoleText).not.toContain("Run /doctor");
+      expect(consoleText).not.toContain("is not vision-capable");
+      expect(consoleText).not.toContain("images sent as text");
+      expect(fs.readFileSync(path.join(dir, ".claude", ".picc", "compat-ack.json"), "utf8"))
+        .toBe(compatAckSentinel);
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
   });
 
-  it("MCP pending notice survives /compat suppress", async () => {
-    await pi.commands.get("compat").handler("suppress", pi.ctx());
-    try {
-      pi.entries.length = 0;
-      await pi.fire("session_start", { reason: "startup" }, pi.ctx());
-      const noticeEntry = pi.entries.find((e) => e.customType === "picc-compat");
-      expect(noticeEntry).toBeDefined();
-      const notice = String(noticeEntry?.data?.notice ?? "");
-      expect(notice).toContain("example-server");
-      expect(notice).toContain("enabledMcpjsonServers");
-      expect(notice).toContain("disabledMcpjsonServers");
-      // Suppression still silences the findings body.
-      expect(notice).not.toContain("PiCC compatibility:");
-    } finally {
-      await pi.commands.get("compat").handler("show", pi.ctx());
-    }
+  it("toasts the MCP pending-approval line once at startup — actionable state survives quiet startup", async () => {
+    pi.notifications.length = 0;
+    await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx());
+    const pendingToasts = pi.notifications.filter((n) => n.text.includes("pending approval"));
+    expect(pendingToasts).toHaveLength(1);
+    const text = pendingToasts[0]!.text;
+    // One short self-contained line: server name, the enabling key, the
+    // /doctor pointer for the exact edit and the decline path.
+    expect(text).not.toContain("\n");
+    expect(text).toContain("example-server");
+    expect(text).toContain("enabledMcpjsonServers");
+    expect(text).toContain(".claude/settings.local.json");
+    expect(text).toContain("/doctor");
+    // A non-startup session_start (e.g. /new) must not re-toast it.
+    pi.notifications.length = 0;
+    await pi.fire("session_start", { reason: "new" }, pi.tuiCtx());
+    expect(pi.notifications.filter((n) => n.text.includes("pending approval"))).toHaveLength(0);
   });
 
   it("/doctor renders the registry-generated breakdown with the MCP posture line", async () => {
@@ -884,15 +929,39 @@ describe("session lifecycle hooks", () => {
     // unapproved server renders as pending, and the retired static
     // ".mcp.json present" wording must be gone.
     expect(doctor).toContain("example-server: pending approval");
-    // De-triplicated: the posture line carries no enable/decline hint — the
-    // pending finding (registry note + evidence) teaches the keys and points
-    // at the startup notice, the canonical carrier of the exact edit.
+    // De-duplicated: the posture line carries no enable/decline hint — the
+    // pending finding (registry note + evidence) is the canonical carrier of
+    // the exact edit now that startup is quiet.
     const postureLine = doctor.split("\n").find((l) => l.startsWith("MCP servers:")) ?? "";
     expect(postureLine).not.toContain("enabledMcpjsonServers");
-    expect(doctor).toContain("enabledMcpjsonServers");
+    expect(doctor).toContain('"enabledMcpjsonServers": ["example-server"]');
     expect(doctor).toContain("disabledMcpjsonServers");
-    expect(doctor).toContain("startup notice");
     expect(doctor).not.toContain("MCP servers will not start");
+  });
+
+  it("handles headless /doctor immediately with findings and active-model vision state", async () => {
+    await pi.fire("session_start", { reason: "startup" }, pi.printCtx({
+      model: { provider: "openai", id: "gpt-text", input: ["text"] },
+    }));
+    pi.entries.length = 0;
+    pi.messages.length = 0;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const outcome = await pi.fire("input", { text: "/doctor", source: "print" }, pi.printCtx());
+      expect(outcome).toEqual({ action: "handled" });
+      const entry = pi.entries.find(
+        (e) => e.customType === "picc-control" && e.data?.command === "doctor",
+      );
+      const output = String(entry?.data?.output ?? "");
+      expect(output).toContain("SAFETY setting.permissions.ask");
+      expect(output).toContain("Active model: openai/gpt-text — vision: no");
+      const stdout = logSpy.mock.calls.flat().join("\n");
+      expect(stdout).toContain("SAFETY setting.permissions.ask");
+      expect(stdout).toContain("Active model: openai/gpt-text — vision: no");
+      expect(pi.messages).toHaveLength(0);
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   it("compaction: PostCompact re-injects active skills mid-run via steer", async () => {
@@ -1891,7 +1960,7 @@ describe("degradation floor", () => {
     // a prompt-type PreCompact handler, futureUnknownSetting, outputStyle, .mcp.json,
     // future-agent with mcpServers/memory, and unknown skill frontmatter.
     expect(pi.tools.size).toBeGreaterThan(15);
-    expect(pi.commands.size).toBeGreaterThanOrEqual(3); // doctor, compat, quota
+    expect(pi.commands.size).toBeGreaterThanOrEqual(3); // doctor, quota, skills
   });
 
   it("future-agent (memory/mcpServers/unknown keys) is still dispatchable via the catalog", async () => {

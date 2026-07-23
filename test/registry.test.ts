@@ -16,10 +16,7 @@ import {
 } from "../src/registry/capability-registry.js";
 import {
   buildCompatReport,
-  readSuppression,
   renderDoctorReport,
-  renderStartupNotice,
-  writeSuppression,
 } from "../src/registry/compat-report.js";
 import { DEGRADED_TOOLS } from "../src/runtime/tools/degrade-stubs.js";
 import { sniffImageMime } from "../src/runtime/image-ingest.js";
@@ -260,7 +257,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(gate?.tier).toBe("partial");
     expect(gate?.note).toContain("not Claude Code's interactive trust dialog");
     expect(gate?.note).toContain("git-tracked settings.local.json is demoted");
-    expect(gate?.note).toContain("survives /compat suppress");
+    expect(gate?.note).toContain("one-time session-start notice");
+    expect(gate?.note).toContain("decline path");
     // Plain-language rationale only — the "vision-warning precedent" insider
     // phrase is a code-comment fact, not user-visible note text.
     expect(gate?.note).not.toContain("vision-warning");
@@ -1100,7 +1098,7 @@ describe("buildCompatReport", () => {
     expect(report.mcpPendingNotice).toBeUndefined();
   });
 
-  it("pending-approval servers yield one names-only finding pointing at the canonical notice", () => {
+  it("pending-approval servers yield one finding carrying the exact enable/decline edit", () => {
     const project = makeProject({
       mcp: makeMcp({
         servers: [
@@ -1114,22 +1112,26 @@ describe("buildCompatReport", () => {
       (f) => f.capability.id === "feature.mcp-project-approval",
     );
     expect(pending).toHaveLength(1);
-    // De-triplicated: the startup notice is the ONE canonical carrier of the
-    // exact settings edit — the evidence names the servers and points there.
+    // With startup quiet, the /doctor finding is the ONE canonical carrier of
+    // the exact settings edit — servers plus BOTH exits (enable and decline).
     const evidence = pending[0]!.evidence;
     expect(evidence).toContain("alpha");
     expect(evidence).toContain("beta");
-    expect(evidence).toContain("startup notice");
-    expect(evidence).not.toContain('"enabledMcpjsonServers":');
+    expect(evidence).toContain('"enabledMcpjsonServers": ["alpha","beta"]');
+    expect(evidence).toContain('"enableAllProjectMcpServers": true');
+    expect(evidence).toContain('"disabledMcpjsonServers"');
     // In /doctor the evidence renders beside the gate entry's registry note,
     // which still teaches all three keys.
     const note = pending[0]!.capability.note;
     expect(note).toContain("enableAllProjectMcpServers");
     expect(note).toContain("enabledMcpjsonServers");
     expect(note).toContain("disabledMcpjsonServers");
-    // The full edit (with both exits) lives on the notice itself.
-    expect(report.mcpPendingNotice).toContain('"enabledMcpjsonServers": ["alpha","beta"]');
-    expect(report.mcpPendingNotice).toContain('"disabledMcpjsonServers"');
+    // The one-time notify line stays short: names + enabling key + /doctor
+    // pointer, never the JSON edit itself.
+    expect(report.mcpPendingNotice).toContain("alpha");
+    expect(report.mcpPendingNotice).toContain("enabledMcpjsonServers");
+    expect(report.mcpPendingNotice).not.toContain('"enabledMcpjsonServers":');
+    expect(report.mcpPendingNotice).toContain("/doctor");
   });
 
   it("surfaces an ENABLED server's diagnostics as findings — variable named, values never expanded", () => {
@@ -1242,97 +1244,6 @@ describe("buildCompatReport", () => {
 });
 
 // ---------------------------------------------------------------------------
-// renderStartupNotice
-// ---------------------------------------------------------------------------
-
-describe("renderStartupNotice", () => {
-  const noisyProject = makeProject({
-    settings: makeSettings({
-      permissions: {
-        allow: [],
-        deny: [],
-        ask: ["Bash(rm *)"],
-        additionalDirectories: [],
-      },
-      deferredKeys: [{ key: "outputStyle", scope: "project" }],
-      unknownKeys: [{ key: "futureThing", scope: "project" }],
-    }),
-  });
-
-  it("emits one consolidated notice with SAFETY first, then functionality, then the doctor hint", () => {
-    const report = buildCompatReport(noisyProject);
-    const notice = renderStartupNotice(report, { suppressed: false });
-    expect(notice).toBeDefined();
-    const text = notice as string;
-
-    // Exactly one notice header.
-    const headers = text.match(/PiCC compatibility: \d+ feature\(s\) degraded for this project/g);
-    expect(headers).toHaveLength(1);
-    expect(text.startsWith("PiCC compatibility:")).toBe(true);
-
-    // SAFETY block precedes functionality lines; ask divergence is called out.
-    const safetyIdx = text.indexOf("SAFETY:");
-    const askIdx = text.indexOf("setting.permissions.ask");
-    const funcIdx = text.indexOf("setting.outputStyle");
-    expect(safetyIdx).toBeGreaterThan(-1);
-    expect(askIdx).toBeGreaterThan(safetyIdx);
-    expect(funcIdx).toBeGreaterThan(askIdx);
-    expect(text).toContain("ask rules will NOT prompt");
-    expect(text).toContain("default-permissive posture");
-
-    // Unassessed inputs are surfaced, and the notice ends with the doctor hint.
-    expect(text).toContain("unassessed");
-    expect(text.trimEnd().endsWith("Run /doctor for details. (Suppress with /compat suppress)")).toBe(true);
-  });
-
-  it("returns undefined when suppressed", () => {
-    const report = buildCompatReport(noisyProject);
-    expect(renderStartupNotice(report, { suppressed: true })).toBeUndefined();
-  });
-
-  it("renders MCP findings as short evidence lines — the ~2 KB registry note stays in /doctor", () => {
-    const project = makeProject({
-      mcp: makeMcp({
-        servers: [
-          makeMcpServer({
-            name: "remote",
-            status: "skipped",
-            diagnostics: [
-              'MCP server "remote" in .mcp.json uses remote transport "sse" — remote MCP transports (HTTP/SSE/WebSocket) are not supported yet; server skipped',
-            ],
-          }),
-          makeMcpServer({
-            name: "live",
-            status: "enabled",
-            diagnostics: [
-              'environment variable "MCP_BIN" is not set and has no default; "${MCP_BIN}" kept as literal text',
-            ],
-          }),
-        ],
-      }),
-    });
-    const notice = renderStartupNotice(buildCompatReport(project), { suppressed: false }) as string;
-    // The evidence (the actionable fact) is present…
-    expect(notice).toContain("remote transport");
-    expect(notice).toContain('"MCP_BIN"');
-    // …but the full feature.mcp registry note is not spliced in per finding.
-    expect(notice).not.toContain("stdio MCP servers run for real");
-    // Bound: a two-server remote-skipped + unset-var config keeps the findings
-    // section short (the pre-fix rendering produced ~3.4 KB).
-    const findingsSection = notice
-      .split("\n")
-      .filter((l) => l.startsWith("- "))
-      .join("\n");
-    expect(findingsSection.length).toBeLessThan(600);
-  });
-
-  it("returns undefined when there are no findings", () => {
-    const report = buildCompatReport(makeProject());
-    expect(renderStartupNotice(report, { suppressed: false })).toBeUndefined();
-  });
-});
-
-// ---------------------------------------------------------------------------
 // renderDoctorReport
 // ---------------------------------------------------------------------------
 
@@ -1363,7 +1274,8 @@ describe("renderDoctorReport", () => {
   it("renders cleanly for a project with nothing to report", () => {
     const project = makeProject();
     const doctor = renderDoctorReport(project, buildCompatReport(project));
-    expect(doctor).toContain("No compatibility findings");
+    expect(doctor.split(/\r?\n/)).toContain("No compatibility findings detected.");
+    expect(doctor).not.toContain("everything this project declares is fully honored");
     expect(doctor).toContain("Unassessed: none.");
     expect(doctor).toContain(CLAUDE_BASELINE);
   });
@@ -1497,15 +1409,15 @@ describe("MCP posture line in /doctor", () => {
     expect(doctor).toContain("waiting: pending approval");
     expect(doctor).toContain("declined: disabled (disabledMcpjsonServers)");
     expect(doctor).toContain("remote: skipped — remote MCP transports");
-    // De-triplicated: the posture line itself carries no enable/decline hint —
-    // the pending finding below it (registry note + evidence) carries the keys,
-    // and the startup notice is the canonical carrier of the exact edit.
+    // De-duplicated: the posture line itself carries no enable/decline hint —
+    // the pending finding below it (registry note + evidence) is the canonical
+    // carrier of the exact edit now that startup is quiet.
     const postureLine = doctor.split("\n").find((l) => l.startsWith("MCP servers:")) ?? "";
     expect(postureLine).not.toContain("enabledMcpjsonServers");
     expect(postureLine).not.toContain("enableAllProjectMcpServers");
     expect(doctor).toContain("enabledMcpjsonServers");
     expect(doctor).toContain("enableAllProjectMcpServers");
-    expect(doctor).toContain("startup notice");
+    expect(doctor).toContain("disabledMcpjsonServers");
   });
 
   it("claims only 'enabled' for an enabled server with no live state supplied", () => {
@@ -1519,7 +1431,7 @@ describe("MCP posture line in /doctor", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Active-model vision surface (/doctor + startup notice)
+// Active-model vision surface (/doctor)
 // ---------------------------------------------------------------------------
 
 const VISION_MODEL = { provider: "openai", id: "gpt-see", input: ["text", "image"] };
@@ -1562,208 +1474,65 @@ describe("active-model vision line in /doctor", () => {
   });
 });
 
-describe("active-model vision warning in the startup notice", () => {
-  const cleanProject = makeProject();
-
-  it("surfaces the non-vision warning on a ZERO-findings project and puts it on the first line (the toast)", () => {
-    const report = buildCompatReport(cleanProject);
-    // Sanity: this project has nothing to report on its own.
-    expect(report.findings).toEqual([]);
-    expect(report.safetyFindings).toEqual([]);
-    expect(report.unassessed).toEqual([]);
-
-    const notice = renderStartupNotice(report, {
-      suppressed: false,
-      activeModel: NON_VISION_MODEL,
-    });
-    expect(notice).toBeDefined();
-    const text = notice as string;
-    // The warning is the FIRST line — the emission site builds the toast from it.
-    const firstLine = text.split("\n")[0];
-    expect(firstLine).toContain("openai/gpt-text is not vision-capable");
-    expect(firstLine).toMatch(/use a vision-capable model/i);
-  });
-
-  it("stays quiet on a clean project for a vision-capable model", () => {
-    const report = buildCompatReport(cleanProject);
-    expect(
-      renderStartupNotice(report, { suppressed: false, activeModel: VISION_MODEL }),
-    ).toBeUndefined();
-  });
-
-  it("stays quiet on a clean project when the active model is unknown/opaque", () => {
-    const report = buildCompatReport(cleanProject);
-    expect(
-      renderStartupNotice(report, { suppressed: false, activeModel: {} }),
-    ).toBeUndefined();
-    expect(renderStartupNotice(report, { suppressed: false })).toBeUndefined();
-  });
-
-  it("fires no non-vision warning for a model with an id but no input array", () => {
-    const report = buildCompatReport(cleanProject);
-    // Opaque on the vision axis (no readable modalities) — don't nag; /doctor still
-    // reports "unknown" for it.
-    expect(
-      renderStartupNotice(report, { suppressed: false, activeModel: { id: "gpt-opaque" } }),
-    ).toBeUndefined();
-  });
-
-  it("prepends the non-vision warning above the compat header when the project also has findings", () => {
-    const noisy = makeProject({
-      settings: makeSettings({
-        permissions: { allow: [], deny: [], ask: ["Bash(rm *)"], additionalDirectories: [] },
-      }),
-    });
-    const report = buildCompatReport(noisy);
-    const text = renderStartupNotice(report, {
-      suppressed: false,
-      activeModel: NON_VISION_MODEL,
-    }) as string;
-    const warnIdx = text.indexOf("is not vision-capable");
-    const headerIdx = text.indexOf("PiCC compatibility:");
-    expect(warnIdx).toBeGreaterThan(-1);
-    expect(headerIdx).toBeGreaterThan(warnIdx);
-  });
-
-  it("surfaces the non-vision warning through suppression, but drops the findings body", () => {
-    // `/compat suppress` acknowledges PROJECT findings; a non-vision model is a
-    // separate safety axis that must still surface (a user may suppress on a vision
-    // model, then switch to a non-vision one). The findings header/body stay hidden.
-    const noisy = makeProject({
-      settings: makeSettings({
-        permissions: { allow: [], deny: [], ask: ["Bash(rm *)"], additionalDirectories: [] },
-      }),
-    });
-    const report = buildCompatReport(noisy);
-    const notice = renderStartupNotice(report, {
-      suppressed: true,
-      activeModel: NON_VISION_MODEL,
-    });
-    expect(notice).toBeDefined();
-    const text = notice as string;
-    expect(text.split("\n")[0]).toContain("openai/gpt-text is not vision-capable");
-    expect(text.split("\n")[0]).toMatch(/use a vision-capable model/i);
-    // Suppression still silences the project-findings header/body and footer.
-    expect(text).not.toContain("PiCC compatibility:");
-    expect(text).not.toContain("Run /doctor for details");
-  });
-
-  it("stays silent under suppression for a vision-capable or opaque model", () => {
-    const report = buildCompatReport(cleanProject);
-    expect(
-      renderStartupNotice(report, { suppressed: true, activeModel: VISION_MODEL }),
-    ).toBeUndefined();
-    expect(
-      renderStartupNotice(report, { suppressed: true, activeModel: {} }),
-    ).toBeUndefined();
-    expect(
-      renderStartupNotice(report, { suppressed: true, activeModel: { id: "gpt-opaque" } }),
-    ).toBeUndefined();
-  });
-});
-
 // ---------------------------------------------------------------------------
-// MCP pending-approval notice — decoupled from /compat suppress
+// MCP pending-approval notify line — actionable state, survives quiet startup
 // ---------------------------------------------------------------------------
 
-describe("MCP pending-approval notice in the startup notice", () => {
+describe("MCP pending-approval notify line (report.mcpPendingNotice)", () => {
   const pendingProject = makeProject({
     mcp: makeMcp({
       servers: [makeMcpServer({ name: "example-server", status: "pending-approval" })],
     }),
   });
 
-  it("is short and self-contained on its lead line — server names + the enabling key", () => {
-    const report = buildCompatReport(pendingProject);
-    const notice = renderStartupNotice(report, { suppressed: false }) as string;
+  it("is ONE short self-contained line — count, names, the enabling key, the /doctor pointer", () => {
+    const notice = buildCompatReport(pendingProject).mcpPendingNotice;
     expect(notice).toBeDefined();
-    // No vision warning here, so the pending line IS the first line (the toast).
-    const firstLine = notice.split("\n")[0]!;
-    expect(firstLine).toContain("example-server");
-    expect(firstLine).toContain("enabledMcpjsonServers");
-    expect(firstLine).toContain(".claude/settings.local.json");
-    // The fuller body carries both exits.
-    expect(notice).toContain("enableAllProjectMcpServers");
-    expect(notice).toContain("disabledMcpjsonServers");
+    const line = notice as string;
+    // A single toast line: the session-start notify emits it verbatim.
+    expect(line).not.toContain("\n");
+    expect(line).toContain("1 server(s) pending approval");
+    expect(line).toContain("example-server");
+    expect(line).toContain("enabledMcpjsonServers");
+    expect(line).toContain(".claude/settings.local.json");
+    expect(line).toContain("/doctor");
   });
 
-  it("survives /compat suppress (new actionable state, like the vision warning)", () => {
+  it("keeps the full enable/decline edit in /doctor (the canonical carrier)", () => {
     const report = buildCompatReport(pendingProject);
-    const notice = renderStartupNotice(report, { suppressed: true }) as string;
-    expect(notice).toBeDefined();
-    expect(notice).toContain("example-server");
-    expect(notice).toContain("enabledMcpjsonServers");
-    expect(notice).toContain("disabledMcpjsonServers");
-    // Suppression still silences the findings header/body and footer.
-    expect(notice).not.toContain("PiCC compatibility:");
-    expect(notice).not.toContain("Run /doctor for details");
-  });
-
-  it("keeps the non-vision warning FIRST when both decoupled notices fire", () => {
-    const report = buildCompatReport(pendingProject);
-    const notice = renderStartupNotice(report, {
-      suppressed: true,
-      activeModel: NON_VISION_MODEL,
-    }) as string;
-    const visionIdx = notice.indexOf("is not vision-capable");
-    const pendingIdx = notice.indexOf("pending approval");
-    expect(visionIdx).toBeGreaterThan(-1);
-    expect(pendingIdx).toBeGreaterThan(visionIdx);
+    const doctor = renderDoctorReport(pendingProject, report);
+    expect(doctor).toContain('"enabledMcpjsonServers": ["example-server"]');
+    expect(doctor).toContain('"enableAllProjectMcpServers": true');
+    expect(doctor).toContain('"disabledMcpjsonServers"');
   });
 
   it("stays absent with no pending servers", () => {
     const enabledOnly = makeProject({
       mcp: makeMcp({ servers: [makeMcpServer({ name: "live", status: "enabled" })] }),
     });
-    const report = buildCompatReport(enabledOnly);
-    expect(report.mcpPendingNotice).toBeUndefined();
-    expect(renderStartupNotice(report, { suppressed: true })).toBeUndefined();
+    expect(buildCompatReport(enabledOnly).mcpPendingNotice).toBeUndefined();
   });
 
-  it("beyond 8 pending servers, caps the name list and recommends the blanket key over a full JSON list", () => {
+  it("beyond 8 pending servers, caps the name list; the /doctor edit recommends the blanket key", () => {
     const names = Array.from({ length: 9 }, (_, i) => `srv-${String(i + 1).padStart(2, "0")}`);
     const project = makeProject({
       mcp: makeMcp({
         servers: names.map((name) => makeMcpServer({ name, status: "pending-approval" })),
       }),
     });
-    const notice = buildCompatReport(project).mcpPendingNotice!;
+    const report = buildCompatReport(project);
+    const notice = report.mcpPendingNotice;
     expect(notice).toBeDefined();
     expect(notice).toContain("9 server(s) pending approval");
     expect(notice).toContain("and 1 more");
-    // The 9th name appears nowhere — neither in the list nor a JSON edit.
+    // The 9th name appears nowhere on the notify line.
     expect(notice).not.toContain("srv-09");
-    expect(notice).not.toContain(JSON.stringify(names));
-    // Bounded remedy: the blanket key instead of enumerating every server.
-    expect(notice).toContain('"enableAllProjectMcpServers": true');
-    expect(notice).toContain('"disabledMcpjsonServers"');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Suppression persistence
-// ---------------------------------------------------------------------------
-
-describe("suppression persistence", () => {
-  it("round-trips through .claude/.picc/compat-ack.json", () => {
-    const root = makeTempDir();
-    expect(readSuppression(root)).toBe(false);
-
-    writeSuppression(root, true);
-    expect(readSuppression(root)).toBe(true);
-    expect(fs.existsSync(path.join(root, ".claude", ".picc", "compat-ack.json"))).toBe(true);
-
-    writeSuppression(root, false);
-    expect(readSuppression(root)).toBe(false);
-  });
-
-  it("treats a missing or malformed file as not suppressed", () => {
-    const root = makeTempDir();
-    expect(readSuppression(root)).toBe(false);
-    const file = path.join(root, ".claude", ".picc", "compat-ack.json");
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, "not json at all", "utf8");
-    expect(readSuppression(root)).toBe(false);
+    // Bounded remedy in the /doctor finding: the blanket key instead of a
+    // JSON edit enumerating every server.
+    const doctor = renderDoctorReport(project, report);
+    expect(doctor).not.toContain(JSON.stringify(names));
+    expect(doctor).toContain('"enableAllProjectMcpServers": true');
+    expect(doctor).toContain('"disabledMcpjsonServers"');
   });
 });
 

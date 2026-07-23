@@ -11,8 +11,7 @@ import { fakePi, type FakePi } from "./helpers/fake-pi.js";
  * Wired-lifecycle coverage (review finding: zero tests fired after_provider_response,
  * model_select, agent_settled, session_shutdown): quota-header capture, steering
  * re-selection on model switch, the Stop-hook continuation loop incl. its cap,
- * SessionEnd dispatch, PostToolUse block feedback, compaction state reset,
- * and /compat suppression wiring.
+ * SessionEnd dispatch, PostToolUse block feedback, and compaction state reset.
  */
 
 let dir: string;
@@ -309,22 +308,5 @@ describe("lifecycle wiring", () => {
     });
     expect(after?.block).toBe(true);
     expect(String(after?.reason ?? "")).toContain("disallowed-tools");
-  });
-
-  it("/compat suppress persists, silences the startup notice, and /compat show re-enables", async () => {
-    const ack = path.join(dir, ".claude", ".picc", "compat-ack.json");
-    await pi.commands.get("compat").handler("suppress", pi.ctx());
-    expect(fs.existsSync(ack)).toBe(true);
-
-    pi.entries.length = 0;
-    pi.notifications.length = 0;
-    await pi.fire("session_start", { reason: "startup" }, pi.ctx());
-    expect(pi.entries.find((e) => e.customType === "picc-compat")).toBeUndefined();
-
-    await pi.commands.get("compat").handler("show", pi.ctx());
-    pi.entries.length = 0;
-    await pi.fire("session_start", { reason: "startup" }, pi.ctx());
-    // The fixture declares an ask rule, so a notice must reappear once un-suppressed.
-    expect(pi.entries.find((e) => e.customType === "picc-compat")).toBeDefined();
   });
 });

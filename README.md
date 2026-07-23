@@ -29,6 +29,7 @@ cd \path\to\your-claude-code-project
 picc
 # /login  → ChatGPT Plus/Pro (Codex subscription)   (one-time)
 # /model  → pick a GPT model
+# /doctor → review this project's compatibility findings
 # work as you would in Claude Code: /your-skill, subagent fan-outs, worktrees…
 ```
 
@@ -73,17 +74,17 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
   non-vision model; a genuinely unsupported binary (e.g. a PDF) returns a clean binary error.
 - **Git commits** — nudges richer, repo-style-matching commit messages by default.
 
-Everything unrecognized degrades safely and is surfaced — never a crash (the completeness floor).
+Everything unrecognized degrades safely instead of crashing (the completeness floor).
 The full, always-current compatibility matrix is in
 [doc/supported-features.md](doc/supported-features.md).
 
 ## Control surface
 
-Inside a session: `/skills` and `/agents` list the loaded corpus; `/doctor` gives the full
-compatibility breakdown; `/compat` shows/suppresses the startup notice; `/usage` reports a
-per-subagent token/cost breakdown; `/quota` reports provider quota headers; `alt+a` opens the
-subagent status panel.
-Every user-invocable skill appears in the `/` autocomplete menu. Model and per-model steering are
+Inside a session: `/skills` and `/agents` list the loaded corpus; `/doctor` gives an explicit
+project compatibility report; `/usage` reports a per-subagent token/cost breakdown; `/quota`
+reports provider quota headers; `alt+a` opens the subagent status panel.
+Eligible user-invocable skills whose names do not conflict with built-ins appear in the `/`
+autocomplete menu. Model and per-model steering are
 configured outside the project — see the [user guide](doc/user-guide.md#5-control-surface-project-external).
 
 ## Repository layout
