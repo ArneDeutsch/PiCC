@@ -12,10 +12,11 @@ and the synchronization contracts that keep async tests deterministic.
 branch through e2e. The unit lane — not the full suite — is the pre-commit gate
 (`.githooks/pre-commit`).
 
-**The trade-off is speed against coverage.** Each e2e scenario spawns a real Pi CLI which spawns
-further children, on a lane that must stay small enough to survive a 2-core runner; the same branch
-tested at the unit layer costs milliseconds and pins the behavior just as precisely. Do not reach
-for the highest-fidelity layer because it feels more convincing.
+**The trade-off is speed against coverage.** Each e2e scenario runs a real Pi CLI with mock-model
+infrastructure, and applicable scenarios spawn further children, on a lane that must stay small
+enough to survive a 2-core runner; the same branch tested at the unit layer costs milliseconds and
+pins the behavior just as precisely. Do not reach for the highest-fidelity layer because it feels
+more convincing.
 
 The decision, in order:
 
