@@ -213,6 +213,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(agent?.note).toContain("agent id");
     expect(agent?.note).toContain("BACKGROUND-BY-DEFAULT");
     expect(agent?.note).toContain("run_in_background:false");
+    expect(agent?.note).toContain("prioritizes state, agent identity, and the stable dispatch description before optional telemetry");
+    expect(agent?.note).toContain("passive Agent/settlement lifecycle rows omit task ID chips");
+    expect(agent?.note).toContain("model-visible background dispatch still returns the task ID");
     expect(agent?.note).toContain("eligible uncollected current task");
     expect(agent?.note).toContain("polling TaskOutput while running preserves eligibility");
     expect(agent?.note).toContain("terminal TaskOutput record counts as delivery");
@@ -314,12 +317,19 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     const out = lookupCapability("tool.TaskOutput");
     expect(out?.tier).toBe("partial");
     expect(out?.note).toContain("failed status");
-    // TaskOutput is INHERITED by subagents but SCOPED to the dispatcher's
-    // own tasks — the old inverted "Claude hides TaskOutput; PiCC's session-wide
-    // registry does not" wording is gone. The note must state the scoped behavior
-    // and the honest #15098 hardening (not a blanket "non-divergent" claim).
+    expect(out?.note).toContain("retains the explicitly requested target ID");
+    expect(out?.note).toContain("passive Agent/settlement lifecycle rows omit task ID chips");
+    expect(out?.note).toContain("registry and canonical identity remain unchanged");
+    // Claude removes TaskOutput from named subagents; PiCC deliberately exposes
+    // it with own-dispatch scope while preserving coordinator session-wide reach.
+    expect(out?.note).toContain("PiCC EXTENSION/DIVERGENCE");
+    expect(out?.note).toContain("official Claude Code subagent documentation removes TaskOutput");
+    expect(out?.note).toContain("even when it is listed in `tools:`");
     expect(out?.note).toContain("only tasks it dispatched");
-    expect(out?.note).toContain("#15098");
+    expect(out?.note).toContain("coordinator reaches every session task");
+    expect(out?.note).toContain("bracketed lifecycle state `[completed]`, `[failed]`, or `[aborted]`");
+    expect(out?.note).not.toContain("#15098");
+    expect(out?.note).not.toContain("#23154");
     expect(out?.note).toContain("poll (wait:false)");
     expect(out?.note).toContain("preserves settlement-notice eligibility");
     expect(out?.note).toContain("terminal record counts as delivery");
@@ -341,7 +351,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(out?.note).not.toContain("session-wide, so a subagent");
     const stop = lookupCapability("tool.TaskStop");
     expect(stop?.tier).toBe("partial");
-    expect(stop?.note).toContain("PiCC accepts only task_id");
+    expect(stop?.note).toContain("CHECKPOINT-PAUSED EXCEPTION");
+    expect(stop?.note).toContain("while the originating process remains alive");
+    expect(stop?.note).toContain("foreground or background dispatch retained after exhaustion");
+    expect(stop?.note).toContain("addressed through the process-lifetime registry by stable agent id");
+    expect(stop?.note).toContain("Otherwise PiCC accepts only task_id");
     expect(stop?.note).toContain("Claude 2.1.198+ also accepts agent id/name");
     expect(stop?.note).toContain("task record's stored display type");
     expect(stop?.note).toContain("stable agent id");
@@ -426,8 +440,21 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(bg?.note).toContain("per-depth budgets");
     expect(bg?.note).toContain("maxDepth × concurrency");
     expect(bg?.note).toContain("Claude's single global (~10) parallel-agent cap");
-    // The subagent-scoping clause must survive future edits to this entry.
-    expect(bg?.note).toContain("scoped to the subagent's own dispatched tasks");
+    // TaskOutput exposure is a documented PiCC extension with own-dispatch scope;
+    // the coordinator still has session-wide reach.
+    expect(bg?.note).toContain("PiCC EXTENSION/DIVERGENCE");
+    expect(bg?.note).toContain("official Claude Code subagent documentation removes TaskOutput");
+    expect(bg?.note).toContain("even when it is listed in `tools:`");
+    expect(bg?.note).toContain("scoped to their own dispatched tasks");
+    expect(bg?.note).toContain("coordinator retains full session-wide reach");
+    expect(bg?.note).not.toContain("see tool.TaskOutput for #15098");
+    expect(bg?.note).toContain("individual always-expanded tree rows when a useful identity/description row fits");
+    expect(bg?.note).toContain("prioritizing those fields after state");
+    expect(bg?.note).toContain("dropping optional telemetry columns panel-wide as width narrows");
+    expect(bg?.note).toContain("very narrow widths use truthful state aggregates");
+    expect(bg?.note).toContain("passive panel/lifecycle rows omit internal task ID chips");
+    expect(bg?.note).toContain("explicit TaskOutput/TaskStop targeting rows retain the requested target");
+    expect(bg?.note).toContain("canonical registry/model-visible identity is unchanged");
     // The in-session Agent View gap is closed by the status panel; the honest
     // residuals must be named instead of the retired "no always-on Agent View".
     expect(bg?.note).not.toContain("no always-on Agent View");
@@ -604,11 +631,15 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(mode?.safetyRelevant).toBe(true);
   });
 
-  it("agent color is a panel-tint-only partial and maxTurns a best-effort partial", () => {
+  it("agent color is a presentation-only partial and maxTurns a best-effort partial", () => {
     const color = lookupCapability("agent.frontmatter.color");
     expect(color?.tier).toBe("partial");
-    expect(color?.note).toContain("status panel");
-    expect(color?.note).toContain("untinted");
+    expect(color?.note).toContain("recognized documented color names");
+    expect(color?.note).toContain("status panel, drill-down, and Agent lifecycle rows");
+    expect(color?.note).toContain("exact hues, placement, and permissive normalization are PiCC-defined");
+    expect(color?.note).toContain("unrecognized values are ignored for rendering");
+    expect(color?.note).toContain("print/RPC remain uncolored");
+    expect(color?.note).toContain("does not claim Claude's exact palette or invalid-value behavior");
     const maxTurns = lookupCapability("agent.frontmatter.maxTurns");
     expect(maxTurns?.tier).toBe("partial");
     expect(maxTurns?.note).toContain("best-effort");

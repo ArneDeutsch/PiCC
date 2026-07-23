@@ -1,4 +1,4 @@
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
   formatUsageCompact,
   sanitizeProgressText,
@@ -10,6 +10,8 @@ import { formatElapsed } from "./subagent-panel-render.js";
 import { FORK_DEGRADE_PREFIX, isAgentId } from "../util/subagent-transcripts.js";
 import { genericResultComponent, setToolRowOutcome, type ToolRowOutcome } from "./tool-shell.js";
 import type { Diagnostic } from "../types.js";
+import { normalizeAgentColor, tintAgentColor, type AgentColorName } from "./agent-color.js";
+import { formatToolDisplayName } from "./tool-display.js";
 
 // --- live-progress + result rendering helpers ---
 //
@@ -45,6 +47,11 @@ export interface SubagentLifecycleRenderState {
 export interface SubagentLifecycleRenderContext {
   state?: SubagentLifecycleRenderState;
   [key: string]: unknown;
+}
+
+export interface SubagentRenderingOptions {
+  surface?: "agent" | "task-output" | "settlement";
+  resolveAgentColor?: (agentId: string | undefined, agentName: string | undefined) => unknown;
 }
 
 /** Complete details-only contract consumed by subagent lifecycle renderers. */
@@ -111,7 +118,7 @@ function safeField(value: unknown, key: PropertyKey): unknown {
 function boundedString(value: unknown, limit = RENDER_SCALAR_LIMIT): string | undefined {
   if (typeof value !== "string") return undefined;
   const inspected = value.slice(0, limit + 1);
-  const clean = scalarSafeText(sanitizeProgressText(inspected));
+  const clean = humanDisplayText(inspected, false);
   if (clean.length <= limit && value.length <= limit) return clean;
   let prefix = clean.slice(0, limit);
   if (/[\uD800-\uDBFF]$/u.test(prefix)) prefix = prefix.slice(0, -1);
@@ -267,27 +274,55 @@ function boundedBodyText(result: unknown): string {
  * start (same-line display spoofing), and `sanitizeProgressText` deliberately
  * preserves `\r`.
  */
-const LINE_BREAK_RE = /\r\n?|\n/;
+const LINE_BREAK_RE = /\r\n?|\n|\u2028|\u2029/;
 
-/** Push multi-line body text, breaking on \r\n / \r / \n before wrapping. */
+function humanDisplayText(text: string, inline: boolean): string {
+  const safe = scalarSafeText(sanitizeProgressText(String(text ?? "")))
+    .replace(/\p{Cf}/gu, "")
+    .replace(/[\u2028\u2029]/gu, inline ? " " : "\n");
+  return inline ? safe.replace(/\s+/gu, " ").trim() : safe;
+}
+
+/** Push multi-line body text after neutralizing every Unicode line boundary. */
 function pushBodyText(text: string, width: number, into: string[]): void {
   for (const line of String(text ?? "").split(LINE_BREAK_RE)) pushWrapped(line, width, into);
 }
 
 /** Flatten model-/file-supplied label text to a single sanitized display line. */
 function sanitizeInline(text: string): string {
-  return sanitizeProgressText(String(text ?? "")).replace(/\s+/g, " ").trim();
+  return humanDisplayText(text, true);
 }
 
 /**
- * The `Task(task-N)` chip when `details.taskId` is present — the gate
- * for EVERY background-identity addition below, so the foreground Agent view is
- * untouched. `undefined` when absent. `taskId` is registry-minted (`task-N`) but
- * sanitized anyway so the discipline is uniform.
+ * The explicit TaskOutput target when that surface has `details.taskId`.
+ * Passive Agent and settlement rows do not request this target. `taskId` is
+ * registry-minted (`task-N`) but sanitized anyway so the discipline is uniform.
  */
 function taskChip(details: SubagentRenderDetails): string | undefined {
   const taskId = typeof details.taskId === "string" ? sanitizeInline(details.taskId) : "";
-  return taskId ? `Task(${taskId})` : undefined;
+  return taskId || undefined;
+}
+
+/** The explicit action target belongs to the invocation, even when its result is foreign or malformed. */
+function taskOutputTarget(
+  context: SubagentLifecycleRenderContext | undefined,
+  details: SubagentRenderDetails,
+): string | undefined {
+  const requested = boundedString(safeField(safeField(context, "args"), "task_id"));
+  const sanitized = requested === undefined ? "" : sanitizeInline(requested);
+  return sanitized || taskChip(details);
+}
+
+function resolvedAgentColor(
+  options: SubagentRenderingOptions,
+  details: SubagentRenderDetails,
+  agentName: string,
+): AgentColorName | undefined {
+  try {
+    return normalizeAgentColor(options.resolveAgentColor?.(agentIdOf(details), agentName));
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -302,11 +337,8 @@ function agentIdOf(details: SubagentRenderDetails): string | undefined {
 }
 
 /**
- * The muted `agent-<id>` identity SUBLINE, emitted at EVERY task
- * surface (live / poll / settled) so a background task id is always traceable to
- * its agent and on-disk transcript — INDEPENDENT of `resumable`/`transcript` (a
- * non-resumable, transcript-less builtin still shows its id). Its own line so it
- * is never the element truncated out of a crowded header. No-op when absent.
+ * Add the agent ID only to expanded, settled explicit TaskOutput detail when no
+ * resumable footer already carries it. Passive and collapsed rows omit IDs.
  */
 function pushIdentitySubline(
   theme: unknown,
@@ -324,8 +356,8 @@ function pushIdentitySubline(
  * a fork-SPECIFIC diagnostic (never the generic unknown-type warning) whose
  * message starts with this sentinel. We surface it as a muted footer line so the
  * degrade is VISIBLE — distinguishing a genuine inherited fork (no such line,
- * honest `Agent(fork)` badge) from a degraded one (this line + a fresh-agent
- * badge). Read from `details.diagnostics`, the channel BOTH the foreground Agent
+ * honest `fork` identity) from a degraded one (this line + a fresh-agent
+ * identity). Read from `details.diagnostics`, the channel BOTH the foreground Agent
  * result and the background TaskOutput result already carry — so no extra
  * plumbing is needed. `FORK_DEGRADE_PREFIX` is the shared sentinel (imported from
  * the transcript util) that the emitter in subagents.ts writes.
@@ -369,55 +401,6 @@ function formatUsageLine(usage: unknown): string | undefined {
   return undefined;
 }
 
-/**
- * The outcome badge line: colored symbol + agent + fate word.
- * When `taskChipLabel` is present (the background surface), the badge leads
- * with the `Task(task-N)` chip — `● Task(task-3) · Agent(coder) completed` — so
- * completed / failed / aborted background outcomes are all self-identifying.
- * A USER-initiated stop (details.userStopped, panel action) overrides the fate
- * word — `■ … stopped by user` — so it is visually distinct from a model stop.
- */
-function outcomeBadgeLine(
-  theme: unknown,
-  outcome: string | undefined,
-  cutOff: boolean,
-  agentName: unknown,
-  taskChipLabel?: string,
-  userStopped?: boolean,
-  suppressSymbol = false,
-): string {
-  // SECURITY: agentName is model-supplied (subagent_type) OR project-file-supplied
-  // (agent `name:` frontmatter) — sanitize before it reaches the parent terminal.
-  const safeName = sanitizeInline(typeof agentName === "string" ? agentName : "");
-  const agent = safeName ? `Agent(${safeName})` : "Agent";
-  const subject = taskChipLabel ? `${taskChipLabel} · ${agent}` : agent;
-  let symbol = "•";
-  let color = "muted";
-  let word = sanitizeInline(outcome ?? "") || "done";
-  if (outcome === "completed") {
-    symbol = "●";
-    color = "success";
-    word = cutOff ? "completed (truncated)" : "completed";
-  } else if (outcome === "failed") {
-    symbol = "✗";
-    color = "error";
-    word = cutOff ? "failed (partial output preserved)" : "failed";
-  } else if (outcome === "aborted") {
-    // Reached by the background TaskOutput/settlement surfaces (a stopped
-    // task's outcome reads "aborted"); today's live foreground path throws
-    // aborted/failed-no-output before this renders.
-    symbol = "■";
-    color = "warning";
-    word = "aborted";
-  }
-  if (userStopped === true) {
-    symbol = "■";
-    color = "warning";
-    word = "stopped by user";
-  }
-  return themedFg(theme, color, themedBold(theme, `${suppressSymbol ? "" : `${symbol} `}${subject} ${word}`));
-}
-
 /** `details.durationMs` formatted for display, or undefined when absent/invalid. */
 function durationOf(details: SubagentRenderDetails): string | undefined {
   const ms = details.durationMs;
@@ -454,75 +437,170 @@ function formatUsageBrief(usage: unknown): string | undefined {
   return formatUsageCompact(brief);
 }
 
-type LifecycleSegment = { separator: " · " | " - "; text: string; tone?: string };
+type LifecycleSegment = {
+  separator: "" | " · " | " - ";
+  text: string;
+  tone?: string;
+  /** Summary text may shrink; state, warning markers, and recovery cues may not. */
+  elastic?: boolean;
+};
 
-/** Fit lifecycle rows by dropping optional detail, then fitting or removing the elastic agent. */
+function actionableDiagnostics(details: SubagentRenderDetails): Diagnostic[] {
+  return (details.diagnostics ?? []).filter((diagnostic) =>
+    diagnostic.severity !== "info" && !diagnostic.message.startsWith(FORK_DEGRADE_PREFIX),
+  );
+}
+
+function diagnosticSegments(details: SubagentRenderDetails): LifecycleSegment[] {
+  const diagnostics = actionableDiagnostics(details);
+  if (diagnostics.length === 0) return [];
+  const severity = diagnostics.some((diagnostic) => diagnostic.severity === "error")
+    ? "error"
+    : "warning";
+  const first = diagnostics[0]!;
+  const source = first.source ? `${sanitizeInline(first.source)}: ` : "";
+  return [
+    { separator: " · ", text: `⚠ diagnostic ${severity}`, tone: severity },
+    { separator: " - ", text: `${source}${sanitizeInline(first.message)}`, tone: severity, elastic: true },
+  ];
+}
+
+function pushDiagnosticDetails(
+  theme: unknown,
+  details: SubagentRenderDetails,
+  width: number,
+  into: string[],
+): void {
+  for (const diagnostic of details.diagnostics ?? []) {
+    if (diagnostic.message.startsWith(FORK_DEGRADE_PREFIX)) continue;
+    const source = diagnostic.source ? ` · ${sanitizeInline(diagnostic.source)}` : "";
+    const text = `diagnostic [${diagnostic.severity}]${source}: ${sanitizeInline(diagnostic.message)}`;
+    pushColored(theme, diagnostic.severity === "info" ? "muted" : diagnostic.severity, text, width, into);
+  }
+}
+
+/** Fit passive lifecycle rows; explicit task targets wrap instead of being truncated. */
 function lifecycleLine(
   theme: unknown,
   options: {
     agent: unknown;
     chip?: string;
     state: string;
-    agentPlacement?: "before-task" | "after-task";
     prefix?: string;
     cue?: string;
     required?: LifecycleSegment[];
     optional?: LifecycleSegment[];
+    description?: string;
     tone: string;
+    color?: AgentColorName;
   },
   width: number,
 ): string[] {
+  if (!Number.isFinite(width) || width <= 0) return [];
+  const columns = Math.floor(width);
   const safeAgent = sanitizeInline(typeof options.agent === "string" ? options.agent : "") || "subagent";
-  const required = options.required ?? [];
+  const required = (options.required ?? []).map((segment) => ({ ...segment }));
   const optional = [...(options.optional ?? [])];
-  const placement = options.agentPlacement ?? "before-task";
+  const description = sanitizeInline(options.description ?? "");
+  const state = options.state ? ` [${options.state}]` : "";
   const prefix = options.prefix ?? "";
-  const primaryText = (agent: string | undefined) => {
-    if (!options.chip) return `${prefix}Agent(${agent ?? safeAgent})${options.state ? ` ${options.state}` : ""}`;
-    if (placement === "after-task") {
-      return `${prefix}${options.chip}${agent === undefined ? "" : ` · Agent(${agent})`}${options.state ? ` ${options.state}` : ""}`;
+  const taskPrefix = options.chip
+    ? `${formatToolDisplayName("TaskOutput")} ${options.chip} - `
+    : "";
+  const suffixPlain = () =>
+    required.map((segment) => `${segment.separator}${segment.text}`).join("") +
+    optional.map((segment) => `${segment.separator}${segment.text}`).join("") +
+    (options.cue ? ` · ${options.cue}` : "");
+  const plain = (agent = safeAgent, detail = description) =>
+    `${prefix}${taskPrefix}${agent}${state}${detail ? ` - ${detail}` : ""}${suffixPlain()}`;
+
+  while (optional.length > 0 && visibleWidth(plain()) > columns) optional.pop();
+
+  // Reserve state, warning markers, and the recovery/reference cue before
+  // fitting diagnostic/error prose. Agent identity and summaries share the
+  // remaining room; summaries are elastic, but short actionable text survives.
+  const elastic = required.filter((candidate) => candidate.elastic);
+  const elasticWidth = elastic.reduce(
+    (sum, segment) => sum + visibleWidth(segment.separator + segment.text),
+    0,
+  );
+  let elasticRoom = Math.max(0, columns - (visibleWidth(plain("", "")) - elasticWidth) - 1);
+  for (const segment of elastic) {
+    const separatorWidth = visibleWidth(segment.separator);
+    const textRoom = Math.max(0, elasticRoom - separatorWidth);
+    if (visibleWidth(segment.text) > textRoom) {
+      segment.text = textRoom > 0 ? truncateToWidth(segment.text, textRoom, "…") : "";
     }
-    return `${prefix}${agent === undefined ? "" : `Agent(${agent}) → `}${options.chip}${options.state ? ` ${options.state}` : ""}`;
-  };
-  const plain = (agent: string | undefined) => {
-    let line = primaryText(agent);
-    for (const segment of required) line += `${segment.separator}${segment.text}`;
-    for (const segment of optional) line += `${segment.separator}${segment.text}`;
-    if (options.cue) line += ` · ${options.cue}`;
-    return line;
-  };
+    if (!segment.text) segment.separator = "";
+    elasticRoom -= visibleWidth(segment.separator + segment.text);
+  }
 
-  while (optional.length > 0 && visibleWidth(plain(safeAgent)) > width) optional.pop();
-
-  let fittedAgent: string | undefined = safeAgent;
-  if (visibleWidth(plain(fittedAgent)) > width) {
-    if (options.chip) {
-      const withoutAgentWidth = visibleWidth(plain(undefined));
-      const emptyAgentOverhead = visibleWidth(plain("")) - withoutAgentWidth;
-      const agentBudget = width - withoutAgentWidth - emptyAgentOverhead;
-      const truncated = agentBudget > 0 ? truncateToWidth(safeAgent, agentBudget, "…") : "";
-      fittedAgent = truncated && visibleWidth(plain(truncated)) <= width ? truncated : undefined;
-    } else {
-      const agentBudget = Math.max(0, width - visibleWidth(plain("")));
-      fittedAgent = truncateToWidth(safeAgent, agentBudget, agentBudget > 0 ? "…" : "");
+  if (options.chip) {
+    const title = formatToolDisplayName("TaskOutput");
+    const actionPlain = `${prefix}${title} ${options.chip} - `;
+    const remainderFixed = state + suffixPlain() + (description ? " - " : "");
+    const agentRoom = Math.max(1, columns - visibleWidth(remainderFixed));
+    const fittedAgent = visibleWidth(safeAgent) > agentRoom
+      ? truncateToWidth(safeAgent, agentRoom, "…")
+      : safeAgent;
+    const identity = options.color
+      ? tintAgentColor(options.color, themedBold(theme, fittedAgent))
+      : themedFg(theme, "text", fittedAgent);
+    const action = themedFg(theme, options.tone, prefix) + themedFg(theme, "text", title) +
+      themedFg(theme, "toolOutput", ` ${options.chip} - `);
+    let remainder = identity;
+    if (state) remainder += themedFg(theme, "muted", state);
+    if (description) remainder += themedFg(theme, "toolOutput", ` - ${description}`);
+    for (const segment of required) remainder += themedFg(theme, segment.tone ?? "muted", `${segment.separator}${segment.text}`);
+    for (const segment of optional) remainder += themedFg(theme, segment.tone ?? "muted", `${segment.separator}${segment.text}`);
+    if (options.cue) remainder += themedFg(theme, "muted", ` · ${options.cue}`);
+    try {
+      if (visibleWidth(action + remainder) <= columns) return [action + remainder];
+      return [
+        ...wrapTextWithAnsi(action, Math.max(1, columns)),
+        ...wrapTextWithAnsi(remainder, Math.max(1, columns)),
+      ];
+    } catch {
+      return [
+        ...wrapTextWithAnsi(actionPlain, Math.max(1, columns)),
+        ...wrapTextWithAnsi(`${fittedAgent}${state}${suffixPlain()}`, Math.max(1, columns)),
+      ];
     }
   }
+  const fixedWidth = visibleWidth(prefix + taskPrefix + state + suffixPlain());
+  const descriptionSeparator = description ? visibleWidth(" - ") : 0;
+  let available = Math.max(0, columns - fixedWidth - descriptionSeparator);
+  let fittedAgent = safeAgent;
+  let fittedDescription = description;
+  if (description) {
+    const minimumDescription = Math.min(2, visibleWidth(description));
+    const agentAllowance = Math.max(1, available - minimumDescription);
+    fittedAgent = visibleWidth(safeAgent) > agentAllowance
+      ? truncateToWidth(safeAgent, agentAllowance, "…") : safeAgent;
+    const descriptionAllowance = Math.max(0, available - visibleWidth(fittedAgent));
+    fittedDescription = descriptionAllowance > 0
+      ? (visibleWidth(description) > descriptionAllowance
+        ? truncateToWidth(description, descriptionAllowance, "…") : description)
+      : "";
+  } else if (visibleWidth(safeAgent) > available) {
+    fittedAgent = available > 0 ? truncateToWidth(safeAgent, available, "…") : "";
+  }
 
-  let line = themedFg(theme, options.tone, themedBold(theme, primaryText(fittedAgent)));
-  for (const segment of required) {
-    line += themedFg(theme, segment.tone ?? "muted", `${segment.separator}${segment.text}`);
-  }
-  for (const segment of optional) {
-    line += themedFg(theme, segment.tone ?? "muted", `${segment.separator}${segment.text}`);
-  }
+  const identity = options.color
+    ? tintAgentColor(options.color, themedBold(theme, fittedAgent))
+    : themedFg(theme, "text", fittedAgent);
+  let line = themedFg(theme, options.tone, prefix) + identity;
+  if (state) line += themedFg(theme, "muted", state);
+  if (fittedDescription) line += themedFg(theme, "toolOutput", ` - ${fittedDescription}`);
+  for (const segment of required) line += themedFg(theme, segment.tone ?? "muted", `${segment.separator}${segment.text}`);
+  for (const segment of optional) line += themedFg(theme, segment.tone ?? "muted", `${segment.separator}${segment.text}`);
   if (options.cue) line += themedFg(theme, "muted", ` · ${options.cue}`);
-  // Only widths narrower than the complete required row reach this final clamp.
-  return clampLines([line], width);
+  return clampLines([line], columns);
 }
 
 /**
- * The COLLAPSED completion record: one badge line — outcome glyph, chip +
- * agent, fate word, then (muted) the capped error summary for failures, the
+ * The collapsed completion record: one lifecycle line — optional outcome glyph,
+ * explicit target when requested, agent plus bracketed state, then the capped error summary for failures, the
  * condensed fork-degrade marker (never expand-only), duration, brief usage,
  * successful completion time, and the expand affordance. Transcript access and
  * complete metadata remain reachable via the existing Ctrl+O expansion.
@@ -534,6 +612,7 @@ function collapsedRecordLines(
   chip: string | undefined,
   width: number,
   suppressSymbol = false,
+  color?: AgentColorName,
 ): string[] {
   if (outcome === "completed") {
     const optional: LifecycleSegment[] = [];
@@ -551,9 +630,13 @@ function collapsedRecordLines(
         ...(chip ? { chip } : {}),
         state: details.cutOff === true ? "completed (truncated)" : "completed",
         cue: RECORD_EXPAND_HINT,
-        required: fork ? [{ separator: " · ", text: RECORD_FORK_MARKER }] : [],
+        required: [
+          ...(fork ? [{ separator: " · " as const, text: RECORD_FORK_MARKER }] : []),
+          ...diagnosticSegments(details),
+        ],
         optional,
         tone: "success",
+        color,
       },
       width,
     );
@@ -570,14 +653,16 @@ function collapsedRecordLines(
   const required: LifecycleSegment[] = [];
   const fork = forkDegradeLine(details);
   if (fork) required.push({ separator: " · ", text: RECORD_FORK_MARKER, tone: fork.tone });
+  required.push(...diagnosticSegments(details));
   const optional: LifecycleSegment[] = [];
   if (outcome === "failed") {
     const error = sanitizeInline(typeof details.error === "string" ? details.error : "");
     if (error) {
-      optional.push({
+      required.push({
         separator: " · ",
         text: truncateToWidth(error, COLLAPSED_ERROR_CAP, "…"),
         tone: "error",
+        elastic: true,
       });
     }
   }
@@ -594,12 +679,12 @@ function collapsedRecordLines(
       agent: details.agent,
       ...(chip ? { chip } : {}),
       state,
-      agentPlacement: "after-task",
       prefix: suppressSymbol ? "" : `${symbol} `,
       cue: RECORD_EXPAND_HINT,
       required,
       optional,
       tone,
+      color,
     },
     width,
   );
@@ -617,6 +702,7 @@ function referenceRecordLines(
   chip: string | undefined,
   width: number,
   suppressSymbol = false,
+  color?: AgentColorName,
 ): string[] {
   const userStopped = details.userStopped === true;
   const state =
@@ -631,6 +717,14 @@ function referenceRecordLines(
           : outcome;
   const exceptional = outcome !== "completed";
   const fork = forkDegradeLine(details);
+  const required: LifecycleSegment[] = [
+    ...(fork ? [{ separator: " · " as const, text: RECORD_FORK_MARKER, tone: fork.tone }] : []),
+    ...diagnosticSegments(details),
+  ];
+  if (outcome === "failed") {
+    const error = sanitizeInline(details.error ?? "");
+    if (error) required.push({ separator: " · ", text: error, tone: "error", elastic: true });
+  }
   return lifecycleLine(
     theme,
     {
@@ -638,21 +732,17 @@ function referenceRecordLines(
       ...(chip ? { chip } : {}),
       state,
       ...(exceptional
-        ? {
-            agentPlacement: "after-task" as const,
-            prefix: suppressSymbol ? "" : outcome === "failed" && !userStopped ? "✗ " : "■ ",
-          }
+        ? { prefix: suppressSymbol ? "" : outcome === "failed" && !userStopped ? "✗ " : "■ " }
         : {}),
       cue: RECORD_REFERENCE_NOTE,
-      required: fork
-        ? [{ separator: " · ", text: RECORD_FORK_MARKER, tone: fork.tone }]
-        : [],
+      required,
       tone:
         outcome === "completed"
           ? "success"
           : outcome === "failed" && !userStopped
             ? "error"
             : "warning",
+      color,
     },
     width,
   );
@@ -669,6 +759,7 @@ function runningStatusLines(
   agent: string,
   details: SubagentRenderDetails,
   width: number,
+  color?: AgentColorName,
 ): string[] {
   const optional: LifecycleSegment[] = [];
   const duration = durationOf(details);
@@ -677,7 +768,7 @@ function runningStatusLines(
   if (usage) optional.push({ separator: " · ", text: usage });
   return lifecycleLine(
     theme,
-    { agent, ...(chip ? { chip } : {}), state: "running", optional, tone: "toolTitle" },
+    { agent, ...(chip ? { chip } : {}), state: "running", optional, tone: "muted", color },
     width,
   );
 }
@@ -700,7 +791,7 @@ function stripAgentTrailerForDisplay(text: string): string {
 /**
  * Strip the leading self-identification (`Background task task-N (type,
  * agent-<id>) failed: ` / `… was aborted — `) from the DISPLAY body of a failed
- * or aborted TaskOutput result — the badge + agent-<id> subline already state it,
+ * or aborted TaskOutput result — the explicit lifecycle row + agent-ID subline already state it,
  * so the body would otherwise triple it. The reason/tail is kept (`connection
  * reset`, the `it was stopped before completing…` clause). Display-only: the
  * model-facing content stays self-identifying for print/RPC.
@@ -724,9 +815,11 @@ export function renderAgentCall(
   args: Record<string, unknown>,
   theme: unknown,
   context?: SubagentLifecycleRenderContext,
+  options: SubagentRenderingOptions = {},
 ) {
   const agentType = sanitizeInline(boundedString(safeField(args, "subagent_type")) ?? "") || "general-purpose";
   const description = sanitizeInline(boundedString(safeField(args, "description")) ?? "");
+  const color = resolvedAgentColor(options, {}, agentType);
   return {
     render(width: number): string[] {
       if (safeField(safeField(context, "state"), "resultOwned") === true) return [];
@@ -735,8 +828,9 @@ export function renderAgentCall(
         {
           agent: agentType,
           state: "",
-          optional: description ? [{ separator: " - ", text: description }] : [],
-          tone: "toolTitle",
+          description,
+          tone: "text",
+          color,
         },
         width,
       );
@@ -769,9 +863,10 @@ function lifecycleToolRowOutcome(
  */
 export function renderAgentResult(
   result: unknown,
-  options: unknown,
+  renderOptions: unknown,
   theme: unknown,
   context?: SubagentLifecycleRenderContext,
+  presentation: SubagentRenderingOptions = {},
 ) {
   const state = safeField(context, "state");
   if (isRecord(state)) {
@@ -782,71 +877,65 @@ export function renderAgentResult(
     }
   }
   const details = normalizeSubagentRenderDetails(safeField(result, "details")) ?? {};
-  const isPartial = safeField(options, "isPartial") === true;
-  const expanded = safeField(options, "expanded");
+  const isPartial = safeField(renderOptions, "isPartial") === true;
+  const expanded = safeField(renderOptions, "expanded");
   const lifecycleOutcome = lifecycleToolRowOutcome(details, isPartial);
   const shellOwnsSymbol = lifecycleOutcome === undefined
     ? false
     : setToolRowOutcome(context, lifecycleOutcome);
+  const agentName = sanitizeInline(typeof details.agent === "string" ? details.agent : "") || "subagent";
+  const color = resolvedAgentColor(presentation, details, agentName);
+  const explicitTask = presentation.surface === "task-output" ||
+    (presentation.surface === undefined && details.taskId !== undefined);
+  const explicitTarget = explicitTask ? taskOutputTarget(context, details) : undefined;
   return {
     render(width: number): string[] {
       const lines: string[] = [];
       if (isPartial) {
         // SECURITY: details.agent originates from the model-supplied subagent_type — sanitize.
         const agent = sanitizeInline(typeof details.agent === "string" ? details.agent : "") || "subagent";
-        // A background live view leads with the Task chip + agent type;
-        // the foreground view (no taskId) keeps the bare `Agent(<type>)` header.
-        const chip = taskChip(details);
+        const chip = explicitTarget;
         if (details.userStopped === true) {
           return lifecycleLine(
             theme,
-            { agent, ...(chip ? { chip } : {}), state: "stopped by user", tone: "warning" },
+            { agent, ...(chip ? { chip } : {}), state: "stopped by user", tone: "warning", color },
             width,
           );
         }
-        return runningStatusLines(theme, chip, agent, details, width);
+        return runningStatusLines(theme, chip, agent, details, width, color);
       }
       // Final result.
-      // A successful background dispatch is one task-targeted line. The normal
-      // producer always supplies taskId; the fallback below remains defensive.
-      if (details.background === true) {
-        const bgChip = taskChip(details);
-        if (bgChip) {
-          const agent =
-            sanitizeInline(typeof details.agent === "string" ? details.agent : "") || "subagent";
-          const taskId = sanitizeInline(String(details.taskId ?? ""));
-          const description = sanitizeInline(details.description ?? "");
-          return lifecycleLine(
-            theme,
-            {
-              agent,
-              chip: `Task(${taskId})`,
-              state: "background",
-              optional: description ? [{ separator: " - ", text: description }] : [],
-              tone: "accent",
-            },
-            width,
-          );
-        } else {
-          lines.push(themedFg(theme, "accent", themedBold(theme, "Agent → background")));
-        }
-        return clampLines(lines, width);
+      // A successful background dispatch is one passive agent/state line; the
+      // operational task id remains in canonical result data for explicit actions.
+      if (details.background === true && presentation.surface !== "task-output") {
+        const description = sanitizeInline(details.description ?? "");
+        return lifecycleLine(
+          theme,
+          {
+            agent: agentName,
+            state: "background",
+            description,
+            tone: "muted",
+            color,
+          },
+          width,
+        );
       }
       // A wait:false poll on a RUNNING task renders one self-identifying
       // state/metadata line, never activity or a rolling tail. Gated on taskId (a foreground
       // final never carries status:"running").
-      const chip = taskChip(details);
+      const chip = explicitTarget;
       if (chip && details.status === "running") {
         const agent =
           sanitizeInline(typeof details.agent === "string" ? details.agent : "") || "subagent";
-        return runningStatusLines(theme, chip, agent, details, width);
+        return runningStatusLines(theme, chip, agent, details, width, color);
       }
       const outcome = typeof details.outcome === "string" ? details.outcome : undefined;
       // Exactly-once reconciliation: a settlement whose completion record was
       // already emitted (settlement notice, or an earlier collection) renders
       // only a minimal reference line — never a second full record.
       if (outcome && details.alreadyReported === true) {
-        return referenceRecordLines(theme, details, outcome, chip, width, shellOwnsSymbol);
+        return referenceRecordLines(theme, details, outcome, chip, width, shellOwnsSymbol, color);
       }
       // Collapsed by default in the interactive transcript: Pi always passes a
       // BOOLEAN `expanded` (false until the global Ctrl+O toggle), so the
@@ -854,22 +943,36 @@ export function renderAgentResult(
       // option gets the full record — print/RPC never run renderers, so this
       // only widens compatibility for direct callers.
       if (outcome && expanded === false) {
-        return collapsedRecordLines(theme, details, outcome, chip, width, shellOwnsSymbol);
+        return collapsedRecordLines(theme, details, outcome, chip, width, shellOwnsSymbol, color);
+      }
+      if (!outcome && explicitTarget) {
+        lines.push(...lifecycleLine(theme, {
+          agent: agentName,
+          chip: explicitTarget,
+          state: details.status ?? "result",
+          tone: safeField(context, "isError") === true ? "error" : "muted",
+          color,
+        }, width));
       }
       if (outcome) {
-        // `chip` leads the badge for background outcomes; the badge word flips
-        // to "stopped by user" for a panel-stopped task (details.userStopped).
-        lines.push(
-          outcomeBadgeLine(
-            theme,
-            outcome,
-            details.cutOff === true,
-            details.agent,
-            chip,
-            details.userStopped === true,
-            shellOwnsSymbol,
-          ),
-        );
+        const userStopped = details.userStopped === true;
+        const lifecycleState = userStopped
+          ? "stopped by user"
+          : outcome === "completed" && details.cutOff === true
+            ? "completed (truncated)"
+            : outcome === "failed" && details.cutOff === true
+              ? "failed (partial output preserved)"
+              : outcome;
+        const tone = outcome === "completed" ? "success" : outcome === "failed" && !userStopped ? "error" : "warning";
+        const symbol = outcome === "completed" ? "● " : outcome === "failed" && !userStopped ? "✗ " : "■ ";
+        lines.push(...lifecycleLine(theme, {
+          agent: agentName,
+          ...(chip ? { chip } : {}),
+          state: lifecycleState,
+          prefix: shellOwnsSymbol ? "" : symbol,
+          tone,
+          color,
+        }, width));
         // Identity subline at the SETTLED surface — SUPPRESSED when the resumable
         // footer will already print "— agent <id>" (avoid showing the id twice).
         // Kept for non-resumable settled (its only occurrence).
@@ -893,12 +996,12 @@ export function renderAgentResult(
       if (details.taskId != null && details.usage != null) {
         displaySource = displaySource.replace(/\nusage:[^\n]*$/, "");
       }
-      // For a taskId'd failed/aborted result the badge + subline already
-      // state the identity — strip the leading self-identification from the body.
+      // For an explicit failed/aborted task result the lifecycle row + subline
+      // already state the identity — strip the leading self-identification from the body.
       if (chip && (outcome === "failed" || outcome === "aborted")) {
         displaySource = stripTaskIdentityPrefix(displaySource, String(details.taskId), outcome);
       }
-      const body = sanitizeProgressText(stripAgentTrailerForDisplay(displaySource));
+      const body = humanDisplayText(stripAgentTrailerForDisplay(displaySource), false);
       if (body) pushBodyText(body, width, lines);
       const footer: string[] = [];
       if (typeof details.transcriptPath === "string" && details.transcriptPath) {
@@ -931,10 +1034,11 @@ export function renderAgentResult(
       }
       // Wrap each footer line to width (word-wrap, ANSI-aware) as a final guard.
       for (const f of footer) pushColored(theme, "muted", f, width, lines);
+      pushDiagnosticDetails(theme, details, width, lines);
       // A degraded fork's fork-specific notice — its own footer line, toned
       // calm (muted) for an expected opt-out and `warning` for a genuine can't-do,
-      // so the developer sees WHY a "fork" ran with fresh context (the badge above
-      // already reads as the fresh agent, not `Agent(fork)`).
+      // so the developer sees WHY a "fork" ran with fresh context (the row above
+      // already uses the fresh agent identity, not `fork`).
       const forkLine = forkDegradeLine(details);
       if (forkLine) pushColored(theme, forkLine.tone, sanitizeInline(forkLine.text), width, lines);
       return clampLines(lines.length ? lines : [""], width);
@@ -942,13 +1046,7 @@ export function renderAgentResult(
   };
 }
 
-/**
- * renderCall for the TaskOutput tool: a self-identifying dispatch-time
- * line — `TaskOutput(task-N) · Agent(<type>)` — reusing this module's private
- * width-clamp/theme helpers so it inherits the same overflow + sanitize
- * discipline. `agentType` is looked up from the registry by the caller (it is
- * model-/file-supplied, so it is sanitized here before display).
- */
+/** Render a lowercase TaskOutput action row while preserving its complete target. */
 export function renderTaskOutputCall(
   args: Record<string, unknown>,
   theme: unknown,
@@ -959,11 +1057,30 @@ export function renderTaskOutputCall(
   return {
     render(width: number): string[] {
       if (safeField(safeField(context, "state"), "resultOwned") === true) return [];
-      const chip = taskId ? `TaskOutput(${taskId})` : "TaskOutput";
-      return clampLines(
-        [themedFg(theme, "toolTitle", themedBold(theme, `${chip} ${action}`))],
-        width,
-      );
+      if (!Number.isFinite(width) || width <= 0) return [];
+      const target = taskId ? ` ${taskId}` : "";
+      const line = themedFg(theme, "text", formatToolDisplayName("TaskOutput")) +
+        themedFg(theme, "muted", `${target} [${action}]`);
+      try { return wrapTextWithAnsi(line, Math.max(1, Math.floor(width))); }
+      catch { return wrapTextWithAnsi(`${formatToolDisplayName("TaskOutput")}${target} [${action}]`, Math.max(1, Math.floor(width))); }
+    },
+  };
+}
+
+export function renderTaskStopCall(
+  args: Record<string, unknown>,
+  theme: unknown,
+  context?: SubagentLifecycleRenderContext,
+) {
+  const target = sanitizeInline(boundedString(safeField(args, "task_id")) ?? "");
+  return {
+    render(width: number): string[] {
+      if (safeField(safeField(context, "state"), "resultOwned") === true) return [];
+      if (!Number.isFinite(width) || width <= 0) return [];
+      const line = themedFg(theme, "text", formatToolDisplayName("TaskStop")) +
+        themedFg(theme, "muted", target ? ` ${target}` : "");
+      try { return wrapTextWithAnsi(line, Math.max(1, Math.floor(width))); }
+      catch { return wrapTextWithAnsi(`${formatToolDisplayName("TaskStop")}${target ? ` ${target}` : ""}`, Math.max(1, Math.floor(width))); }
     },
   };
 }
@@ -1013,6 +1130,10 @@ export function renderTaskStopResult(
   theme: unknown,
   context?: SubagentLifecycleRenderContext,
 ) {
+  const state = safeField(context, "state");
+  if (isRecord(state)) {
+    try { Reflect.set(state, "resultOwned", true); } catch { /* Hostile state degrades to duplicate-safe result ownership where possible. */ }
+  }
   const details = safeField(result, "details");
   const taskId = safeField(details, "taskId");
   const agentId = safeField(details, "agentId");
@@ -1020,7 +1141,7 @@ export function renderTaskStopResult(
   const checkpointRecord = safeField(details, "checkpointPaused") === true &&
     typeof agentId === "string" && isAgentId(agentId);
   const status = taskRecord || checkpointRecord ? safeField(details, "status") : undefined;
-  return lifecycleControlComponent(
+  const body = lifecycleControlComponent(
     result,
     theme,
     context,
@@ -1032,6 +1153,20 @@ export function renderTaskStopResult(
           ? "stopped"
           : undefined,
   );
+  const requested = safeField(safeField(context, "args"), "task_id");
+  const target = sanitizeInline(typeof requested === "string" ? requested :
+    typeof taskId === "string" ? taskId : typeof agentId === "string" ? agentId : "");
+  return {
+    render(width: number): string[] {
+      if (!Number.isFinite(width) || width <= 0) return [];
+      const header = themedFg(theme, "text", formatToolDisplayName("TaskStop")) +
+        themedFg(theme, "muted", target ? ` ${target}` : "");
+      let wrapped: string[];
+      try { wrapped = wrapTextWithAnsi(header, Math.max(1, Math.floor(width))); }
+      catch { wrapped = wrapTextWithAnsi(`${formatToolDisplayName("TaskStop")}${target ? ` ${target}` : ""}`, Math.max(1, Math.floor(width))); }
+      return [...wrapped, ...body.render(width)];
+    },
+  };
 }
 
 /**
@@ -1049,6 +1184,7 @@ export function renderSettlementRecord(
   details: unknown,
   options: { expanded?: boolean } | undefined,
   theme: unknown,
+  presentation: SubagentRenderingOptions = {},
 ): { render(width: number): string[] } | undefined {
   const normalized = normalizeSubagentRenderDetails(details);
   if (normalized?.record !== "subagent-completion") return undefined;
@@ -1070,5 +1206,7 @@ export function renderSettlementRecord(
     // Normalize to an explicit boolean: expanded===false is the collapse key.
     { expanded: safeField(options, "expanded") === true, isPartial: false },
     theme,
+    undefined,
+    { ...presentation, surface: "settlement" },
   );
 }

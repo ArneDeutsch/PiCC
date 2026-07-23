@@ -6,6 +6,13 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { themedFg } from "./render-util.js";
+import {
+  formatDisplayPath,
+  formatToolDisplayName,
+  resolveDisplayRoot,
+  type DisplayRootResolver,
+} from "./tool-display.js";
 
 const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
 // Root and Pi-nested pi-tui can have distinct constructor identities.
@@ -42,7 +49,7 @@ const MUTATION_CONTROL_PLACEHOLDER = "�";
 const LINE_BREAK_RE = /\r\n?|\n|\u2028|\u2029/gu;
 
 function unfamiliarFormatLabel(toolName: RoutineToolName): string {
-  return `Unfamiliar ${toolName} presentation format`;
+  return `Unfamiliar ${formatToolDisplayName(toolName)} presentation format`;
 }
 
 function ownData(value: unknown, key: PropertyKey): unknown {
@@ -132,18 +139,11 @@ function sanitizeText(
 
 function safeThemeMethod(
   theme: unknown,
-  method: "fg" | "bold",
+  _method: "fg",
   args: readonly string[],
   fallback: string,
 ): string {
-  try {
-    const candidate = Reflect.get(theme as object, method);
-    if (typeof candidate !== "function") return fallback;
-    const rendered = Reflect.apply(candidate, theme, args);
-    return typeof rendered === "string" ? rendered : fallback;
-  } catch {
-    return fallback;
-  }
+  return themedFg(theme, args[0] ?? "text", args[1] ?? fallback);
 }
 
 function clamp(line: string, width: number): string {
@@ -182,7 +182,11 @@ function structuredRowComponent(
         for (let index = 0; index < displayed.length; index++) {
           line += (displayed[index] ?? "") + (literals[index + 1] ?? "");
         }
-        return [clamp(safeThemeMethod(theme, "fg", ["toolOutput", line], line), columns)];
+        const keyword = /^(?:enter worktree|exit worktree)/u.exec(line)?.[0] ?? "";
+        const styled = keyword
+          ? themedFg(theme, "text", keyword) + themedFg(theme, "toolOutput", line.slice(keyword.length))
+          : themedFg(theme, "toolOutput", line);
+        return [clamp(styled, columns)];
       } catch {
         let line = literals[0] ?? "";
         for (let index = 0; index < fields.length; index++) {
@@ -195,21 +199,17 @@ function structuredRowComponent(
 }
 
 function commandComponent(toolName: RoutineToolName, invocation: string, theme: unknown): Component {
+  const displayName = formatToolDisplayName(toolName);
   const displayedInvocation = toolName === "WebSearch" ? `“${invocation}”` : invocation;
-  const plain = `${toolName} ${displayedInvocation}`;
+  const plain = `${displayName} ${displayedInvocation}`;
   return {
     render(width: number): string[] {
       try {
-        const title = safeThemeMethod(
-          theme,
-          "fg",
-          ["toolTitle", safeThemeMethod(theme, "bold", [toolName], toolName)],
-          toolName,
-        );
+        const title = safeThemeMethod(theme, "fg", ["text", displayName], displayName);
         const argument = safeThemeMethod(
           theme,
           "fg",
-          ["accent", displayedInvocation],
+          ["toolOutput", displayedInvocation],
           displayedInvocation,
         );
         const styled = `${title} ${argument}`;
@@ -477,6 +477,7 @@ function recognizeEnterWorktree(
   result: unknown,
   options: unknown,
   context: unknown,
+  displayRoot?: string,
 ): WorktreeRow | undefined {
   if (ownData(options, "isPartial") !== false || ownData(context, "isError") !== false) return undefined;
   const resultSnapshot = plainOwnData(result, ["content", "details"]) ??
@@ -514,16 +515,18 @@ function recognizeEnterWorktree(
       details.previousKeepOutcome !== "keep-failed") ||
     (hasPreviousError && (details.previousKeepOutcome !== "keep-failed" ||
       typeof details.previousKeepError !== "string"))) return undefined;
-  const worktreePath = sanitizeText(details.worktreePath, true);
+  const worktreePath = formatDisplayPath(sanitizeText(details.worktreePath, true), displayRoot);
   const branch = sanitizeText(details.branch, true);
-  const previousPath = hasPrevious ? sanitizeText(details.previousWorktreePath, true) : undefined;
+  const previousPath = hasPrevious
+    ? formatDisplayPath(sanitizeText(details.previousWorktreePath, true), displayRoot)
+    : undefined;
   const previousError = hasPreviousError ? sanitizeText(details.previousKeepError, true) : undefined;
   if (!worktreePath || !branch || (hasPrevious && !previousPath) || (hasPreviousError && !previousError)) {
     return undefined;
   }
   const seededCount = ownData(details.seeded, "length") as number;
   if (!details.created && seededCount !== 0) return undefined;
-  const literals = ["EnterWorktree(", ") on branch "];
+  const literals = ["enter worktree(", ") on branch "];
   const fields = [worktreePath, branch];
   let suffix = seededCount > 0 ? `; seeded ${seededCount} files` : "";
   if (previousPath !== undefined) {
@@ -548,6 +551,7 @@ function recognizeExitWorktree(
   result: unknown,
   options: unknown,
   context: unknown,
+  displayRoot?: string,
 ): WorktreeRow | undefined {
   if (ownData(options, "isPartial") !== false || ownData(context, "isError") !== false) return undefined;
   const resultSnapshot = plainOwnData(result, ["content", "details"]) ??
@@ -557,9 +561,9 @@ function recognizeExitWorktree(
   const none = plainOwnData(resultSnapshot.details, ["outcome", "restorePath"]);
   if (none) {
     if (none.outcome !== "none" || typeof none.restorePath !== "string") return undefined;
-    const restorePath = sanitizeText(none.restorePath, true);
+    const restorePath = formatDisplayPath(sanitizeText(none.restorePath, true), displayRoot);
     return restorePath
-      ? { literals: ["ExitWorktree(no active worktree); already at ", ""], fields: [restorePath] }
+      ? { literals: ["exit worktree (no active worktree); already at ", ""], fields: [restorePath] }
       : undefined;
   }
   const baseKeys = [
@@ -571,13 +575,13 @@ function recognizeExitWorktree(
     typeof details.ok !== "boolean" || typeof details.removed !== "boolean" ||
     typeof details.orphaned !== "boolean" ||
     !exactDataArray(details.diagnostics, MAX_WORKTREE_DIAGNOSTICS)) return undefined;
-  const worktreePath = sanitizeText(details.worktreePath, true);
-  const restorePath = sanitizeText(details.restorePath, true);
+  const worktreePath = formatDisplayPath(sanitizeText(details.worktreePath, true), displayRoot);
+  const restorePath = formatDisplayPath(sanitizeText(details.restorePath, true), displayRoot);
   if (!worktreePath || !restorePath) return undefined;
   if (details.outcome === "kept") {
     if (details.ok !== true || details.removed || details.orphaned || "error" in details) return undefined;
     return {
-      literals: ["ExitWorktree(", ") kept; restored ", ""],
+      literals: ["exit worktree(", ") kept; restored ", ""],
       fields: [worktreePath, restorePath],
     };
   }
@@ -588,28 +592,28 @@ function recognizeExitWorktree(
       if (typeof details.error !== "string" || !error) return undefined;
       return {
         literals: [
-          "ExitWorktree(", ") keep failed: ",
+          "exit worktree(", ") keep failed: ",
           "; worktree state unknown; restored ", "",
         ],
         fields: [worktreePath, error, restorePath],
       };
     }
     return {
-      literals: ["ExitWorktree(", ") keep failed; worktree state unknown; restored ", ""],
+      literals: ["exit worktree(", ") keep failed; worktree state unknown; restored ", ""],
       fields: [worktreePath, restorePath],
     };
   }
   if (details.outcome === "removed") {
     if (details.ok !== true || details.removed !== true || details.orphaned || "error" in details) return undefined;
     return {
-      literals: ["ExitWorktree(", ") removed; restored ", ""],
+      literals: ["exit worktree(", ") removed; restored ", ""],
       fields: [worktreePath, restorePath],
     };
   }
   if (details.outcome === "deferred-removal") {
     if (details.ok !== true || details.removed || details.orphaned !== true || "error" in details) return undefined;
     return {
-      literals: ["ExitWorktree(", ") removal deferred; restored ", ""],
+      literals: ["exit worktree(", ") removal deferred; restored ", ""],
       fields: [worktreePath, restorePath],
     };
   }
@@ -621,14 +625,14 @@ function recognizeExitWorktree(
     if (typeof details.error !== "string" || !error) return undefined;
     return {
       literals: [
-        "ExitWorktree(", ") removal failed: ",
+        "exit worktree(", ") removal failed: ",
         "; worktree state unknown; restored ", "",
       ],
       fields: [worktreePath, error, restorePath],
     };
   }
   return {
-    literals: ["ExitWorktree(", ") removal failed; worktree state unknown; restored ", ""],
+    literals: ["exit worktree(", ") removal failed; worktree state unknown; restored ", ""],
     fields: [worktreePath, restorePath],
   };
 }
@@ -665,6 +669,7 @@ type EditRendererDefinition = {
 export interface RoutineRenderingDependencies {
   createEditDefinition?: (cwd: string) => EditRendererDefinition;
   resolveEditRenderCwd?: () => unknown;
+  resolveDisplayRoot?: DisplayRootResolver;
 }
 
 function componentFrom(value: unknown): Component | undefined {
@@ -1143,6 +1148,13 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
 ): T {
   const toolName = routineToolName(tool);
   if (!toolName) return tool;
+  const displayRoots = new WeakMap<object, string | undefined>();
+  const displayRootFor = (context: unknown): string | undefined => {
+    const state = liveEditState(context);
+    if (!state) return resolveDisplayRoot(dependencies.resolveDisplayRoot, context);
+    if (!displayRoots.has(state)) displayRoots.set(state, resolveDisplayRoot(dependencies.resolveDisplayRoot, context));
+    return displayRoots.get(state);
+  };
 
   let descriptors: PropertyDescriptorMap;
   try {
@@ -1188,10 +1200,14 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
       configurable: true,
       enumerable: true,
       writable: true,
-      value(args: unknown, theme: unknown): Component {
-        return toolName === "MultiEdit"
-          ? multiEditCall(args, theme)
-          : { render: () => [] };
+      value(args: unknown, theme: unknown, context: unknown): Component {
+        const displayRoot = displayRootFor(context);
+        if (toolName !== "MultiEdit") return { render: () => [] };
+        const snapshot = plainOwnData(args, ["file_path", "edits"]);
+        const displayed = snapshot
+          ? { ...snapshot, file_path: formatDisplayPath(snapshot.file_path, displayRoot) }
+          : args;
+        return multiEditCall(displayed, theme);
       },
     },
     renderResult: {
@@ -1200,13 +1216,14 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
       writable: true,
       value(result: ResultShape, options: unknown, theme: unknown, context: unknown): Component {
         try {
+          const displayRoot = displayRootFor(context);
           if (toolName === "MultiEdit") {
             return multiEditResult(result, options, theme, context, dependencies);
           }
           if (toolName === "EnterWorktree" || toolName === "ExitWorktree") {
             const row = toolName === "EnterWorktree"
-              ? recognizeEnterWorktree(result, options, context)
-              : recognizeExitWorktree(result, options, context);
+              ? recognizeEnterWorktree(result, options, context, displayRoot)
+              : recognizeExitWorktree(result, options, context, displayRoot);
             return row === undefined
               ? failOpenComponent(result, toolName, theme)
               : structuredRowComponent(row.literals, row.fields, theme);

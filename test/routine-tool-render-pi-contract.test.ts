@@ -140,7 +140,7 @@ describe("real Pi routine rendering composition", () => {
       .map((line) => line.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, ""))
       .join("\n");
     const pending = stripAnsi(component.render(100) as string[]);
-    expect(pending.match(/src\/lifecycle\.ts/g)).toHaveLength(1);
+    expect(pending.match(/src[\\/]lifecycle\.ts/g)).toHaveLength(1);
     expect(pending).not.toContain("OLD_LIFECYCLE");
     expect(pending).not.toContain("NEW_LIFECYCLE");
 
@@ -157,7 +157,7 @@ describe("real Pi routine rendering composition", () => {
     for (const expanded of [false, true]) {
       component.setExpanded(expanded);
       const settled = stripAnsi(component.render(100) as string[]);
-      expect(settled.match(/src\/lifecycle\.ts/g)).toHaveLength(1);
+      expect(settled.match(/src[\\/]lifecycle\.ts/g)).toHaveLength(1);
       expect(settled.match(/OLD_LIFECYCLE/g)).toHaveLength(1);
       expect(settled.match(/NEW_LIFECYCLE/g)).toHaveLength(1);
       expect(settled).not.toContain(canonical);
@@ -175,9 +175,9 @@ describe("real Pi routine rendering composition", () => {
           seeded: [], previousUnlockAttempted: false,
         },
       },
-      pending: "EnterWorktree(PENDING-ENTER-ONLY)",
+      pending: "enter worktree(PENDING-ENTER-ONLY)",
       canonical: "PENDING ENTER SENTINEL / CANONICAL ENTER PROSE",
-      row: "EnterWorktree(/repo/wt) on branch worktree-contract",
+      row: "enter worktree(/repo/wt) on branch worktree-contract",
     },
     {
       name: "ExitWorktree",
@@ -189,9 +189,9 @@ describe("real Pi routine rendering composition", () => {
           ok: true, removed: true, orphaned: false, diagnostics: [],
         },
       },
-      pending: "ExitWorktree(remove)",
+      pending: "exit worktree(remove)",
       canonical: "PENDING EXIT SENTINEL / CANONICAL EXIT PROSE",
-      row: "ExitWorktree(/repo/wt) removed; restored /repo",
+      row: "exit worktree(/repo/wt) removed; restored /repo",
     },
     {
       name: "ExitWorktree",
@@ -203,9 +203,9 @@ describe("real Pi routine rendering composition", () => {
           ok: false, removed: false, orphaned: false, diagnostics: [], error: "unlock denied\nretry",
         },
       },
-      pending: "ExitWorktree(keep)",
+      pending: "exit worktree(keep)",
       canonical: "Exited worktree (kept): /repo/wt. Working directory restored to /repo.",
-      row: "ExitWorktree(/repo/wt) keep failed: unlock denied retry; worktree state unknown; restored /repo",
+      row: "exit worktree(/repo/wt) keep failed: unlock denied retry; worktree state unknown; restored /repo",
     },
     {
       name: "EnterWorktree",
@@ -218,9 +218,9 @@ describe("real Pi routine rendering composition", () => {
           previousKeepOutcome: "keep-failed", previousKeepError: "unlock denied\nretry",
         },
       },
-      pending: "EnterWorktree(PENDING-ENTER-FAILED-PRIOR)",
+      pending: "enter worktree(PENDING-ENTER-FAILED-PRIOR)",
       canonical: "CANONICAL ENTER STILL CLAIMS PRIOR KEEP",
-      row: "EnterWorktree(/repo/new) on branch worktree-new; previous /repo/old keep failed: unlock denied retry; previous worktree state unknown",
+      row: "enter worktree(/repo/new) on branch worktree-new; previous /repo/old keep failed: unlock denied retry; previous worktree state unknown",
     },
   ])("keeps real Pi $name rows purely result-owned", async (entry) => {
     const sdk = await import("@earendil-works/pi-coding-agent") as any;
@@ -433,7 +433,8 @@ describe("real Pi routine rendering composition", () => {
       },
       false,
     );
-    expect(ordinary?.expanded).toContain("EnterWorktree(/repo/wt) on branch worktree-html");
+    expect(ordinary?.expanded).toContain(">enter worktree</span>");
+    expect(ordinary?.expanded).toContain(">(/repo/wt) on branch worktree-html</span>");
     expect(ordinary?.expanded).not.toContain("HIDDEN ENTER CANONICAL");
 
     const exitId = "html-exit-worktree";
@@ -474,7 +475,7 @@ describe("real Pi routine rendering composition", () => {
       firstChangedLine: 1,
     };
     const id = "html-MultiEdit";
-    expect(renderer.renderCall(id, "MultiEdit", args)).toContain("src/html.ts");
+    expect(renderer.renderCall(id, "MultiEdit", args)).toMatch(/src[\\/]html\.ts/u);
     const success = renderer.renderResult(
       id,
       "MultiEdit",

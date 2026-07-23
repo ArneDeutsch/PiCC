@@ -68,7 +68,7 @@ describe("real Pi default-collapse contracts", () => {
       row.setExpanded(false);
       row.updateResult({ content: [{ type: "text", text: "first\nsecond" }], details: undefined }, false);
       const collapsed = (row.render(80) as string[]).map(stripAnsi).join("\n");
-      expect(collapsed).toContain("Read contract.txt · 2 lines hidden · ctrl+k to expand");
+      expect(collapsed).toContain("read contract.txt · 2 lines hidden · ctrl+k to expand");
       expect(collapsed).not.toContain("first");
       expect(glyphs(collapsed)).toEqual(["●"]);
       row.setExpanded(true);
@@ -83,7 +83,55 @@ describe("real Pi default-collapse contracts", () => {
     });
   });
 
-  it("shows stock Read continuation evidence for a nonordinary settled result", async () => {
+  it("freezes the invocation display root across historical redraws", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    withBinding(["ctrl+o"], () => {
+      const rootA = process.platform === "win32" ? "C:\\repo-a" : "/repo-a";
+      const rootB = process.platform === "win32" ? "C:\\repo-b" : "/repo-b";
+      const piContextRoot = process.platform === "win32" ? "C:\\pi-context" : "/pi-context";
+      const joinFor = (root: string, file: string) => `${root}${root.includes("\\") ? "\\" : "/"}${file}`;
+      let activeRoot = rootA;
+      const native = {
+        name: "read",
+        label: "read",
+        description: "test",
+        parameters: {},
+        execute() {},
+        renderCall(args: { path: string }) { return { render: () => [`native ${args.path}`] }; },
+        renderResult(result: { content: Array<{ text: string }> }) {
+          return { render: () => [result.content[0]?.text ?? ""] };
+        },
+      };
+      const decorated = wrapForSelfShell(withDefaultCollapsedToolRendering(native as any, {
+        resolveDisplayRoot: () => activeRoot,
+      }));
+      const makeRow = (id: string, root: string) => new sdk.ToolExecutionComponent(
+        "read", id, { path: joinFor(root, "src/a.ts") }, {}, decorated,
+        { requestRender() {} }, piContextRoot,
+      );
+      const first = makeRow("freeze-a", rootA);
+      first.setArgsComplete();
+      first.markExecutionStarted();
+      first.render(100);
+      activeRoot = rootB;
+      first.updateResult({ content: [{ type: "text", text: "body" }], details: undefined }, false);
+      const historical = (first.render(100) as string[]).map(stripAnsi).join("\n");
+      expect(historical).toContain(process.platform === "win32" ? "src\\a.ts" : "src/a.ts");
+      expect(historical).not.toContain("repo-a");
+
+      const second = makeRow("freeze-b", rootB);
+      second.setArgsComplete();
+      second.markExecutionStarted();
+      second.render(100);
+      second.updateResult({ content: [{ type: "text", text: "body" }], details: undefined }, false);
+      const fresh = (second.render(100) as string[]).map(stripAnsi).join("\n");
+      expect(fresh).toContain(process.platform === "win32" ? "src\\a.ts" : "src/a.ts");
+      expect(fresh).not.toContain("repo-b");
+    });
+  });
+
+  it("collapses an ordinary stock Read continuation and restores its native notice", async () => {
     const sdk = await import("@earendil-works/pi-coding-agent") as any;
     sdk.initTheme();
     await withBindingAsync(["ctrl+o"], async () => {
@@ -103,10 +151,16 @@ describe("real Pi default-collapse contracts", () => {
         row.render(100);
         row.updateResult(result, false);
         const settled = (row.render(100) as string[]).map(stripAnsi).join("\n");
-        expect(settled).toContain("3 more lines in file");
+        expect(settled).toContain("read continued.txt:1-1");
+        expect(settled).toContain("3 more lines");
+        expect(settled).toContain("next offset 2");
         expect(glyphs(settled)).toEqual(["●"]);
-        expect(settled).toContain("offset=2 to continue");
-        expect(settled).not.toContain("lines hidden");
+        row.setExpanded(true);
+        const expanded = (row.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(expanded).toContain("3 more lines in file");
+        expect(expanded).toContain("offset=2 to continue");
+        row.setExpanded(false);
+        expect((row.render(100) as string[]).map(stripAnsi).join("\n")).toBe(settled);
       } finally {
         rmSync(directory, { recursive: true, force: true });
       }
@@ -161,7 +215,7 @@ describe("real Pi default-collapse contracts", () => {
       try {
         vi.setSystemTime(10_000);
         const row = new sdk.ToolExecutionComponent(
-          "bash", "bash-contract", { command: "TOKEN=command-secret printf output-secret" }, {},
+          "bash", "bash-contract", { command: "TOKEN=command-secret printf command-output" }, {},
           wrapForSelfShell(withDefaultCollapsedToolRendering(sdk.createBashToolDefinition(process.cwd()))),
           { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
         );
@@ -178,8 +232,8 @@ describe("real Pi default-collapse contracts", () => {
         vi.setSystemTime(11_250);
         row.updateResult({ content: [{ type: "text", text: "output-secret" }], details: undefined }, false);
         const collapsed = (row.render(100) as string[]).map(stripAnsi).join("\n");
-        expect(collapsed).toContain("Bash · 1 output line hidden · ctrl+o to expand · 1.3s");
-        expect(collapsed).not.toContain("command-secret");
+        expect(collapsed).toContain("bash TOKEN=command-secret printf command-output · 1 output line hidden · 1.3s · ctrl+o to expand");
+        expect(collapsed).toContain("command-secret");
         expect(collapsed).not.toContain("output-secret");
         expect(glyphs(collapsed)).toEqual(["●"]);
         expect(vi.getTimerCount()).toBe(0);
