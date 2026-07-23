@@ -77,7 +77,12 @@ import {
   type ResumeToken,
 } from "./runtime/mid-run-compaction.js";
 import { registerCodexAbortGuard } from "./runtime/codex-abort-guard.js";
-import { buildCompatReport, renderDoctorReport, type CompatReport } from "./registry/compat-report.js";
+import {
+  buildCompatReport,
+  renderDoctorReport,
+  renderMcpStatusReport,
+  type CompatReport,
+} from "./registry/compat-report.js";
 import { loadSkillBody, substituteToolRules, substituteVariables } from "./claude/skills.js";
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
 import { McpRuntime } from "./runtime/mcp.js";
@@ -92,7 +97,7 @@ import type { ClaudeAgent, ClaudeSkill } from "./types.js";
  * system-prompt assembly each turn (also the compaction-preservation mechanism),
  * deny/hook enforcement on tool events, the Claude tool surface (Agent, Skill,
  * worktrees, web, tasks, degrade stubs), cwd-swapping built-in tool overrides,
- * skill slash commands, and the /doctor–/quota control surface.
+ * skill slash commands, and the PiCC control-command surface.
  */
 
 /** Delegates hook fire() to the base (settings+plugins) runner plus dynamic scoped runners. */
@@ -255,6 +260,12 @@ export interface PiccTestSeam {
    * guarantee as `onWired` above (see the SECURITY note).
    */
   sdk?: PiSdk;
+  /** TEST-ONLY fault/timing seams for the MCP control-command boundary. */
+  mcpControl?: {
+    whenSettled?: () => Promise<void>;
+    render?: typeof renderMcpStatusReport;
+    writeText?: (output: string) => void | Promise<void>;
+  };
 }
 
 const codexProviderRegistries = new WeakSet<object>();
@@ -1304,8 +1315,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
    * and byte-identical re-invocation dedup. Returns the tool result or throws a
    * model-visible error. `invokedName` is the CALLER-supplied name (which for a
    * bare name resolving to a plugin-namespaced skill differs from `skill.name`);
-   * the refusal message is built from it so each tool's wording is preserved.
-   * `signal` is Pi's per-call Esc signal: threaded into the fork dispatch so
+   * ordinary non-reserved refusal wording is built from it so each tool's wording
+   * is preserved. Reserved collisions instead name the normalized built-in owner
+   * and deliberately do not reflect the caller's spelling. `signal` is Pi's
+   * per-call Esc signal: threaded into the fork dispatch so
    * an Esc'd model-invoked fork (Skill OR SlashCommand tool) reports as aborted.
    */
   async function runSkillActivation(
@@ -1321,6 +1334,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     },
   ): Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }> {
     if (skill.disableModelInvocation) {
+      const reserved = reservedBuiltinName(skill.name);
+      if (reserved) {
+        throw new Error(
+          `Direct Skill invocation is disabled. Built-in /${reserved} owns this reserved name, and no slash fallback can activate the skill.`,
+        );
+      }
       throw new Error(`Skill "${opts.invokedName}" is user-only (disable-model-invocation). Ask the user to run /${opts.invokedName}.`);
     }
     if (skill.contextFork) {
@@ -1403,13 +1422,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   /**
    * The SlashCommand tool, per session scope: Claude's mechanism for a MODEL to
-   * run a custom `/name args` command mid-conversation. A thin alias over the
-   * shared skill-activation path — parse the leading `/name` (optional slash;
-   * plugin-namespaced `/plugin:name` allowed), treat the rest as the skill's
-   * arguments, resolve, and activate. Model-invocability matches the Skill tool
-   * (only `disable-model-invocation` blocks; `user-invocable: false` model-only
-   * skills still activate) — the NON-stacking single-command counterpart of the
-   * user-typed `/name` prompt transform.
+   * run a custom `/name args` command mid-conversation. For non-reserved names,
+   * it is a thin alias over the shared skill-activation path. Reserved built-in
+   * names are rejected before lookup and cannot activate colliding skills.
    */
   function createSlashCommandTool(opts: {
     depth: number;
@@ -1421,13 +1436,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       name: "SlashCommand",
       label: "SlashCommand",
       description:
-        'Run a slash command like "/name args". The name must be one from the "Available skills" listing (plugin-namespaced "/plugin:name" also works); the trailing text is passed to the skill as its arguments. Equivalent to the Skill tool for "/name args" command strings.',
+        'Run a slash command like "/name args". For non-reserved skill names, this is equivalent to the Skill tool and passes trailing text as arguments (plugin-namespaced "/plugin:name" also works). Reserved built-in names cannot activate skills through SlashCommand.',
       parameters: Type.Object({
         command: Type.String({ description: 'A slash command such as "/deploy staging 1.2.3"' }),
       }),
       async execute(_id: string, params: { command: string }, signal?: AbortSignal) {
         const parsed = parseSlashCommand(params.command);
         if (!parsed) throw new Error(`SlashCommand requires a command like "/name args".`);
+        const reserved = reservedBuiltinName(parsed.name);
+        if (reserved) {
+          throw new Error(`Slash command /${reserved} is reserved by a built-in and cannot activate a skill.`);
+        }
         // findByName resolves plugin-namespaced skills by bare name when unique.
         const skill = findByName(project.skills, parsed.name);
         if (!skill) throw new Error(`Unknown slash command: /${parsed.name}`);
@@ -1587,9 +1606,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       await mcpRuntime.whenSettled();
       // Settle-time stderr drain: the runtime's accumulated diagnostics
       // (connect failures, timeouts, dropped tools — each already bounded and
-      // control-stripped) go to stderr one line each. /doctor and the one-time
-      // notify below stay the user-visible truth; this is the stderr surface
-      // the registry's feature.mcp note claims.
+      // control-stripped) go to stderr one line each. These verbose operational
+      // diagnostics complement the bounded human-facing status/report surfaces
+      // and one-time startup notice; this is the stderr surface the registry's
+      // feature.mcp note claims.
       for (const diag of mcpRuntime.diagnostics()) {
         console.error(`PiCC: MCP: ${diag}`);
       }
@@ -1855,11 +1875,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           { deliverAs: "nextTurn" },
         );
       }
-      // One-time MCP pending-approval notice: pending servers are ACTIONABLE
-      // STATE (an edit the user may want to make), not a compat finding, so it
-      // survives the otherwise-quiet startup as a single toast line; the exact
-      // enable/decline edit lives in /doctor. Startup only — /new and reload
-      // must not re-toast state the user already saw.
+      // Pending servers require a bounded approval or decline decision, so this
+      // actionable state survives quiet startup as one notice. Startup only —
+      // /new and reload must not re-toast state the user already saw.
       if (event.reason === "startup" && compat.mcpPendingNotice) {
         if (ctx.hasUI) ctx.ui?.notify?.(compat.mcpPendingNotice, "warning");
         else console.error(`PiCC: ${compat.mcpPendingNotice}`);
@@ -2033,19 +2051,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         return shadow || inputDisposition === "quarantine" ? { action: "handled" } : result;
       };
 
-      // 0) PiCC control commands (/doctor /quota /skills /agents /usage).
-      //    In interactive mode Pi's own command router intercepts these before
-      //    the input event; this branch covers the other modes so a control
-      //    command is never sent to the model.
-      const cmd = /^\/(doctor|quota|skills|agents|usage)(?:[ \t]+([\s\S]*))?$/.exec(
-        (event.text ?? "").trim(),
-      );
-      if (cmd) {
-        const output = runControlCommand(cmd[1]!, cmd[2] ?? "", ctx);
-        if (output !== undefined) {
-          emitControlOutput(cmd[1]!, output, ctx);
-          return { action: "handled" };
-        }
+      // Pi routes registered TUI commands before this event; this second seam
+      // keeps admitted print, JSON, and RPC input outside model context.
+      const commandInput = parseControlCommandInput(String(event.text ?? ""));
+      if (commandInput) {
+        await handleControlCommand(commandInput.name, commandInput.args, ctx, "input");
+        return { action: "handled" };
       }
 
       // 1) UserPromptSubmit hook on the raw prompt (Claude order).
@@ -2094,6 +2105,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       while (stacked.length < 5) {
         const m = skillTokenRe.exec(rest);
         if (!m) break;
+        if (reservedBuiltinName(m[1]!)) break;
         const found = findByName(project.skills, m[1]!);
         // Stop at the first token that doesn't resolve to a user-invocable skill.
         if (!found?.userInvocable) break;
@@ -2572,17 +2584,17 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   // ---------------------------------------------------------------------------
-  // Control commands: /doctor /quota /skills /agents /usage.
+  // Control commands
   //
-  // Rendered by shared functions so BOTH the registered command (interactive
-  // path, where Pi intercepts extension commands before the model) and the
-  // `input` handler (all other modes, so a control command never leaks to the
-  // model) produce identical output.
+  // Pi routes registered commands before input in interactive use, while the
+  // admitted-input route protects headless and protocol modes from model leakage.
   // ---------------------------------------------------------------------------
   function renderSkillsList(): string {
-    const invocable = project.skills.filter((s) => s.userInvocable);
+    const shadowed = project.skills.filter((s) => s.userInvocable && reservedBuiltinName(s.name));
+    const shadowedSet = new Set(shadowed);
+    const invocable = project.skills.filter((s) => s.userInvocable && !shadowedSet.has(s));
     const modelOnly = project.skills.filter((s) => !s.userInvocable && !s.disableModelInvocation);
-    const userOnly = project.skills.filter((s) => s.disableModelInvocation);
+    const userOnly = project.skills.filter((s) => s.disableModelInvocation && !shadowedSet.has(s));
     const fmt = (s: ClaudeSkill) =>
       `  /${s.name}${s.argumentHint ? ` ${s.argumentHint}` : ""} — ${s.description}` +
       (s.source.pluginName ? ` [plugin: ${s.source.pluginName}]` : ` [${s.source.scope}]`);
@@ -2592,6 +2604,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       `Invocable as slash commands (${invocable.length}):`,
       ...invocable.map(fmt),
     ];
+    if (shadowed.length) {
+      lines.push("", `Shadowed by reserved built-ins (${shadowed.length}) — not invocable as slash commands:`);
+      lines.push(...shadowed.map((s) => {
+        const winner = reservedBuiltinName(s.name)!;
+        const direct = s.disableModelInvocation
+          ? "direct Skill invocation is not allowed (disable-model-invocation)"
+          : "direct Skill invocation remains allowed";
+        return `  /${s.name} — built-in /${winner} wins; ${direct}`;
+      }));
+    }
     if (modelOnly.length) {
       lines.push("", `Model-invocable only (${modelOnly.length}) — the model activates these via the Skill tool:`);
       lines.push(...modelOnly.map((s) => `  ${s.name} — ${s.description}`));
@@ -2742,48 +2764,124 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     });
   });
 
-  /**
-   * Shows control-command output immediately. An appended entry renders in the
-   * TUI transcript right away and never enters LLM context (a control command is
-   * user-facing status, not model input); headless modes get it on stdout.
-   */
-  function emitControlOutput(name: string, output: string, ctx: any): void {
-    pi.appendEntry("picc-control", { command: name, output });
-    if (!ctx?.hasUI) console.log(output);
+  type ControlInvocation = "registered" | "input";
+  type ControlCommandEntry = {
+    description: string;
+    render: (args: string, ctx: any, invocation: ControlInvocation) => string | Promise<string>;
+  };
+
+  const MCP_ARGUMENT_RESPONSE =
+    "/mcp is status-only; no action occurred. Run bare /mcp for status. Use /doctor or the documented MCP settings for configuration guidance.";
+  const CONTROL_ERROR_RESPONSE =
+    "PiCC could not produce that control-command report. No action occurred; try again or run /doctor.";
+
+  const controlCommands = new Map<string, ControlCommandEntry>([
+    ["doctor", {
+      description: "PiCC: project-specific compatibility report",
+      render: async () => renderDoctorReport(project, compat, currentModel, config.compaction, mcpRuntime.serverStates()),
+    }],
+    ["quota", {
+      description: "PiCC: subscription/rate-limit info from the last provider response",
+      render: async (_args, ctx) => renderQuota(ctx),
+    }],
+    ["skills", {
+      description: "PiCC: list loaded Claude skills and their invocation availability, including shadowed skills",
+      render: async () => renderSkillsList(),
+    }],
+    ["agents", {
+      description: "PiCC: list the subagents available for dispatch",
+      render: async () => renderAgentsList(),
+    }],
+    ["usage", {
+      description: "PiCC: per-subagent token/cost this session (subagents only — not the main agent's own usage), with a total",
+      render: async () => renderUsageReport(),
+    }],
+    ["mcp", {
+      description: "PiCC: read-only MCP server status",
+      render: async (args, ctx, invocation) => {
+        if (args.trim()) return MCP_ARGUMENT_RESPONSE;
+        if (isTextPrintMode(ctx) || ctx?.mode === "json") {
+          await (testSeam?.mcpControl?.whenSettled ?? (() => mcpRuntime.whenSettled()))();
+        }
+        const render = testSeam?.mcpControl?.render ?? renderMcpStatusReport;
+        return render(project.mcp, mcpRuntime.serverStates());
+      },
+    }],
+  ]);
+
+  const piBuiltinNames = new Set([
+    "changelog", "clone", "compact", "copy", "export", "fork", "hotkeys", "import",
+    "login", "logout", "model", "name", "new", "quit", "reload", "resume",
+    "scoped-models", "session", "settings", "share", "tree", "trust", "help",
+  ]);
+
+  function reservedBuiltinName(name: string): string | undefined {
+    const normalized = name.toLowerCase();
+    if (controlCommands.has(normalized)) return normalized;
+    return piBuiltinNames.has(normalized) ? normalized : undefined;
   }
 
-  /** Runs a control command by name; returns its output text, or undefined if not one. */
-  function runControlCommand(name: string, args: string, ctx: any): string | undefined {
-    switch (name) {
-      case "doctor":
-        // Live MCP server states feed the always-present posture line.
-        return renderDoctorReport(project, compat, currentModel, config.compaction, mcpRuntime.serverStates());
-      case "skills":
-        return renderSkillsList();
-      case "agents":
-        return renderAgentsList();
-      case "usage":
-        return renderUsageReport();
-      case "quota":
-        return renderQuota(ctx);
-      default:
-        return undefined;
+  function parseControlCommandInput(text: string): { name: string; args: string } | undefined {
+    const trimmed = text.trim();
+    const match = /^\/([A-Za-z0-9][\w-]*)(?=[ \t]|$)/.exec(trimmed);
+    if (!match) return undefined;
+    const name = match[1]!.toLowerCase();
+    if (!controlCommands.has(name)) return undefined;
+    return { name, args: trimmed.slice(match[0].length).replace(/^[ \t]+/, "") };
+  }
+
+  function isTextPrintMode(ctx: any): boolean {
+    return ctx?.mode === "print" || (!ctx?.hasUI && ctx?.mode !== "json");
+  }
+
+  async function writeTextControlOutput(output: string, ctx: any): Promise<void> {
+    const write = testSeam?.mcpControl?.writeText;
+    if (write) await write(output);
+    else if (testSeam) console.log(output);
+    else await writeFdFully(process.stdout.fd, Buffer.from(`${output}\n`, "utf8"));
+  }
+
+  async function appendControlOutput(name: string, output: string, ctx: any): Promise<void> {
+    pi.appendEntry("picc-control", { command: name, output });
+    // JSON and RPC must remain protocol-owned streams; only text print receives raw stdout.
+    if (isTextPrintMode(ctx)) await writeTextControlOutput(output, ctx);
+  }
+
+  async function emitFixedControlError(name: string, ctx: any): Promise<void> {
+    try {
+      await appendControlOutput(name, CONTROL_ERROR_RESPONSE, ctx);
+    } catch {
+      if (isTextPrintMode(ctx)) {
+        try { await writeTextControlOutput(CONTROL_ERROR_RESPONSE, ctx); } catch { /* fail closed */ }
+      } else if (ctx?.mode === "tui") {
+        try { ctx.ui?.notify?.(CONTROL_ERROR_RESPONSE, "error"); } catch { /* fail closed */ }
+      }
     }
   }
 
-  const CONTROL_COMMANDS: Record<string, string> = {
-    doctor: "PiCC: project-specific compatibility report",
-    quota: "PiCC: subscription/rate-limit info from the last provider response",
-    skills: "PiCC: list the project's Claude skills (invocable + model-only)",
-    agents: "PiCC: list the subagents available for dispatch",
-    usage: "PiCC: per-subagent token/cost this session (subagents only — not the main agent's own usage), with a total",
-  };
-  for (const [name, description] of Object.entries(CONTROL_COMMANDS)) {
+  async function handleControlCommand(
+    name: string,
+    args: string,
+    ctx: any,
+    invocation: ControlInvocation,
+  ): Promise<void> {
+    const command = controlCommands.get(name);
+    if (!command) return;
+    try {
+      const output = await command.render(args, ctx, invocation);
+      await appendControlOutput(name, output, ctx);
+    } catch {
+      // Recognition is final: processing and presentation faults cannot release
+      // the original slash input to hooks, skills, or provider context.
+      await emitFixedControlError(name, ctx);
+    }
+  }
+
+  for (const [name, command] of controlCommands) {
     pi.registerCommand(name, {
-      description,
+      description: command.description,
       handler: async (args: string, ctx: any) => {
-        const output = runControlCommand(name, args, ctx);
-        if (output !== undefined) emitControlOutput(name, output, ctx);
+        await handleControlCommand(name, args, ctx, "registered");
       },
     });
   }
@@ -2795,13 +2893,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // ---------------------------------------------------------------------------
   // Slash-command visibility for user-invocable skills.
   //
-  // Skills are EXECUTED by the `input` handler above (transform → the skill body
-  // becomes the user turn — Claude Code's slash semantics, works in every mode,
-  // and lets a project skill win over a same-named plugin command). They are made
-  // VISIBLE in the `/` palette by contributing one Pi prompt-template stub per
-  // skill via `resources_discover`. The `input` transform runs before prompt-
-  // template expansion, so the stub body is only a fallback and never normally
-  // used — it exists purely so `/name` shows up with its description and hint.
+  // Ordinary non-reserved user-invocable skills are EXECUTED by the `input`
+  // handler above (transform → the skill body becomes the user turn — Claude
+  // Code's slash semantics, works in every mode, and lets a project skill win
+  // over a same-named plugin command). Reserved collisions are intentionally
+  // shadowed. Eligible skills are made VISIBLE in the `/` palette by contributing
+  // one Pi prompt-template stub each via `resources_discover`. The `input`
+  // transform runs before prompt-template expansion, so the stub body is only a
+  // fallback and never normally used — it exists purely so `/name` shows up with
+  // its description and hint.
   // ---------------------------------------------------------------------------
   // Ensure the harness-owned dir never appears as untracked in the project.
   try {
@@ -2821,21 +2921,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   const promptStubDir = path.join(project.root, ".claude", ".picc", "prompts");
-  // Our own commands + Pi built-in slash commands — don't advertise stubs that
-  // would duplicate or be shadowed by these (the skill still executes via the
-  // input handler if the name is typed and not intercepted as a built-in).
-  const RESERVED_NAMES = new Set([
-    "doctor", "quota", "skills", "agents", "usage",
-    "changelog", "clone", "compact", "copy", "export", "fork", "hotkeys", "import",
-    "login", "logout", "model", "name", "new", "quit", "reload", "resume",
-    "scoped-models", "session", "settings", "share", "tree", "trust", "help",
-  ]);
   try {
     fs.rmSync(promptStubDir, { recursive: true, force: true });
     fs.mkdirSync(promptStubDir, { recursive: true });
     for (const skill of project.skills) {
       if (!skill.userInvocable) continue;
-      if (RESERVED_NAMES.has(skill.name)) continue;
+      if (reservedBuiltinName(skill.name)) continue;
       if (!/^[A-Za-z0-9][\w-]*$/.test(skill.name)) continue;
       const fm = [
         "---",
@@ -2851,7 +2942,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
     debug(`wrote ${fs.readdirSync(promptStubDir).length} prompt stubs to ${promptStubDir}`);
   } catch (err) {
-    debug(`prompt-stub generation failed (skills still work via input): ${(err as Error).message}`);
+    debug(`prompt-stub generation failed (ordinary non-reserved skills still work via input; reserved collisions remain shadowed): ${(err as Error).message}`);
   }
 
   pi.on("resources_discover", () => ({ promptPaths: [promptStubDir] }));

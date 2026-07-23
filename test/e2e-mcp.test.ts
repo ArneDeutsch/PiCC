@@ -148,6 +148,48 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
     TEST_TIMEOUT_MS * 2,
   );
 
+  it.each(["text", "json"] as const)(
+    "one-shot %s /mcp waits for settled status without a provider request",
+    async (mode) => {
+      let barrier: McpProcessFixture | undefined;
+      try {
+        const result = await runPi({
+          script: [],
+          prompt: "/mcp",
+          ...(mode === "json" ? { modeArgs: ["--mode", "json", "-p", "/mcp"] } : {}),
+          setup(dir) {
+            barrier = createMcpProcessFixture(dir);
+            fs.writeFileSync(
+              path.join(dir, ".mcp.json"),
+              JSON.stringify({ mcpServers: { fixture: serverEntry(barrier) } }, null, 2),
+            );
+            fs.writeFileSync(
+              path.join(dir, ".claude", "settings.local.json"),
+              JSON.stringify({ enabledMcpjsonServers: ["fixture"] }, null, 2),
+            );
+          },
+        });
+
+        expect(result.code).toBe(0);
+        expect(result.requests).toEqual([]);
+        if (mode === "text") {
+          expect(result.stdout).toContain('"fixture": connected (3 tools)');
+        } else {
+          const records = result.stdout.trim().split(/\r?\n/).filter(Boolean)
+            .map((line) => JSON.parse(line) as any);
+          const entry = records.find((record) =>
+            record.type === "entry_appended" && record.entry?.customType === "picc-control" &&
+            record.entry?.data?.command === "mcp");
+          expect(entry).toBeDefined();
+          expect(String(entry.entry.data.output)).toContain('"fixture": connected (3 tools)');
+        }
+      } finally {
+        await barrier?.cleanup();
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
   it(
     "round-trip: an enabled server's tool is advertised on the first request, callable, and the server dies with the session",
     async () => {

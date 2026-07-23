@@ -2,25 +2,16 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import picc from "../src/index.js";
+import picc, { type PiccTestSeam } from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
+import { deferred } from "./helpers/async.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 
 /**
- * Control commands must display their output IMMEDIATELY and must NEVER leak
- * to the model.
- *
- * Regression guard: the first implementation delivered control output via
- * pi.sendMessage({...}, { deliverAs: "nextTurn" }) — Pi queues such messages
- * for the NEXT user prompt, so running /doctor appeared to do nothing (and the
- * report was silently injected into the model's context one turn later). The
- * fix renders a TUI-only custom entry (pi.appendEntry + registerEntryRenderer),
- * which shows up in the transcript right away and never enters LLM context.
- *
- * Two paths produce the output and must behave identically:
- *  - interactive mode: Pi's command router calls the registered command handler
- *  - all other modes: the `input` event handler catches the command and
- *    short-circuits with { action: "handled" } — never producing a turn.
+ * Control commands render through transcript entries outside model context.
+ * Registered routing serves Pi-owned command handling; admitted-input routing
+ * protects headless and protocol modes. Each mode may impose distinct timing
+ * and output-transport requirements.
  */
 
 let dir: string;
@@ -57,7 +48,22 @@ function controlEntry(command: string) {
   return pi.entries.find((e) => e.customType === "picc-control" && e.data?.command === command);
 }
 
-describe("control commands display immediately and never leak to the model", () => {
+async function freshControlPi(seam?: PiccTestSeam): Promise<{ fresh: FakePi; root: string }> {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-control-"));
+  fs.writeFileSync(path.join(root, "CLAUDE.md"), "Temporary control-command project.\n", "utf8");
+  const userDir = path.join(root, ".claude-user");
+  fs.mkdirSync(userDir, { recursive: true });
+  const previousCwd = process.cwd();
+  process.chdir(root);
+  process.env.PICC_CLAUDE_USER_DIR = userDir;
+  const fresh = fakePi();
+  picc(fresh.api as never, { ...seam, onInitializationSettled: fresh.captureInitialization });
+  await fresh.waitForInitialization();
+  process.chdir(previousCwd);
+  return { fresh, root };
+}
+
+describe("control commands render transcript output outside model context", () => {
   it("/skills via the input event renders a picc-control entry and short-circuits", async () => {
     reset();
     const outcome = await pi.fire("input", { text: "/skills", source: "interactive" });
@@ -114,12 +120,12 @@ describe("control commands display immediately and never leak to the model", () 
     expect(pi.messages).toHaveLength(0);
   });
 
-  it("every control command is registered and produces immediate entry output", async () => {
-    for (const name of ["doctor", "quota", "skills", "agents", "usage"]) {
+  it("every control command is registered and produces transcript entry output", async () => {
+    for (const name of ["doctor", "quota", "skills", "agents", "usage", "mcp"]) {
       reset();
       const command = pi.commands.get(name);
       expect(command, `expected /${name} to be registered`).toBeDefined();
-      await command.handler("", pi.ctx());
+      await command.handler("", pi.tuiCtx());
       expect(controlEntry(name), `expected /${name} to append a picc-control entry`).toBeDefined();
       expect(pi.messages, `/${name} must not send LLM-context messages`).toHaveLength(0);
     }
@@ -183,5 +189,273 @@ describe("control commands display immediately and never leak to the model", () 
     const outcome = await pi.fire("input", { text: "/deploy staging 1.0", source: "interactive" });
     expect(outcome.action).toBe("transform");
     expect(String(outcome.text ?? "")).toContain("FS-SKILL-ARGS-BODY");
+  });
+});
+
+describe("/mcp timing, transport, exactness, and fail-closed handling", () => {
+  it("registered TUI and admitted RPC render immediate snapshots without settlement or raw text", async () => {
+    let waits = 0;
+    const settlement = deferred<void>();
+    const writes: string[] = [];
+    const { fresh, root } = await freshControlPi({
+      mcpControl: {
+        whenSettled: async () => { waits += 1; await settlement.promise; },
+        render: () => "MCP status (read-only)\n- fixture: connecting",
+        writeText: (output) => { writes.push(output); },
+      },
+    });
+    try {
+      await fresh.commands.get("mcp").handler("", fresh.tuiCtx());
+      expect(String(fresh.entries.at(-1)?.data.output)).toContain("connecting");
+      const rpc = await fresh.fire("input", { text: "/MCP", source: "rpc" }, fresh.rpcCtx());
+      expect(rpc).toEqual({ action: "handled" });
+      expect(String(fresh.entries.at(-1)?.data.output)).toContain("connecting");
+      expect(waits).toBe(0);
+      expect(writes).toEqual([]);
+      expect(fresh.messages).toEqual([]);
+    } finally {
+      settlement.resolve();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["print", "json"] as const)("bare %s input waits for settlement before reporting", async (mode) => {
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const writes: string[] = [];
+    const { fresh, root } = await freshControlPi({
+      mcpControl: {
+        whenSettled: async () => { entered.resolve(); await release.promise; },
+        render: () => "MCP status (read-only)\n- fixture: connected; 3 tools",
+        writeText: (output) => { writes.push(output); },
+      },
+    });
+    try {
+      const firing = fresh.fire(
+        "input",
+        { text: "  /mCp  ", source: mode },
+        fresh.ctx({ mode, hasUI: false }),
+      );
+      await entered.promise;
+      expect(fresh.entries.filter((entry) => entry.data?.command === "mcp")).toEqual([]);
+      expect(writes).toEqual([]);
+      release.resolve();
+      expect(await firing).toEqual({ action: "handled" });
+      expect(String(fresh.entries.at(-1)?.data.output)).toContain("3 tools");
+      expect(writes).toEqual(mode === "print" ? [expect.stringContaining("3 tools")] : []);
+      expect(fresh.messages).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects arguments immediately in every transport without reflection, waiting, or rendering", async () => {
+    let waits = 0;
+    let renders = 0;
+    const writes: string[] = [];
+    const { fresh, root } = await freshControlPi({
+      mcpControl: {
+        whenSettled: async () => { waits += 1; },
+        render: () => { renders += 1; return "unexpected"; },
+        writeText: (output) => { writes.push(output); },
+      },
+    });
+    const secret = "ARGUMENT_SECRET_CANARY";
+    try {
+      await fresh.commands.get("mcp").handler(secret, fresh.tuiCtx());
+      for (const [mode, ctx] of [
+        ["print", fresh.printCtx()],
+        ["json", fresh.ctx({ mode: "json", hasUI: false })],
+        ["rpc", fresh.rpcCtx()],
+      ] as const) {
+        const outcome = await fresh.fire("input", { text: `/mCp\t${secret}`, source: mode }, ctx);
+        expect(outcome).toEqual({ action: "handled" });
+      }
+      expect(waits).toBe(0);
+      expect(renders).toBe(0);
+      const outputs = fresh.entries.map((entry) => String(entry.data?.output ?? ""));
+      expect(outputs).toHaveLength(4);
+      expect(outputs.every((output) => output.includes("status-only") && !output.includes(secret))).toBe(true);
+      expect(writes).toHaveLength(1);
+      expect(writes[0]).not.toContain(secret);
+      expect(fresh.messages).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts whitespace-only tails and mixed case but does not intercept /mcpx", async () => {
+    const { fresh, root } = await freshControlPi({ mcpControl: { render: () => "MCP SNAPSHOT" } });
+    try {
+      expect(await fresh.fire("input", { text: " \t/McP\t  ", source: "rpc" }, fresh.rpcCtx()))
+        .toEqual({ action: "handled" });
+      expect(String(fresh.entries.at(-1)?.data.output)).toBe("MCP SNAPSHOT");
+      expect(await fresh.fire("input", { text: "/mcpx", source: "rpc" }, fresh.rpcCtx()))
+        .toEqual({ action: "continue" });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["settlement", "json"],
+    ["renderer", "json"],
+    ["renderer", "rpc"],
+  ] as const)("fails closed when %s fails in %s without raw text", async (fault, mode) => {
+    const writes: string[] = [];
+    const { fresh, root } = await freshControlPi({
+      mcpControl: {
+        whenSettled: async () => { if (fault === "settlement") throw new Error("SETTLEMENT_FAULT_CANARY"); },
+        render: () => { if (fault === "renderer") throw new Error("RENDER_FAULT_CANARY"); return "status"; },
+        writeText: (output) => { writes.push(output); },
+      },
+    });
+    try {
+      const ctx = mode === "json" ? fresh.ctx({ mode: "json", hasUI: false }) : fresh.rpcCtx();
+      const outcome = await fresh.fire("input", { text: "/mcp", source: mode }, ctx);
+      expect(outcome).toEqual({ action: "handled" });
+      expect(String(fresh.entries.at(-1)?.data.output)).toContain("could not produce");
+      expect(JSON.stringify(fresh.entries)).not.toMatch(/(?:SETTLEMENT|RENDER)_FAULT_CANARY/);
+      expect(writes).toEqual([]);
+      expect(fresh.messages).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed under append and stdout faults, including compound fallback faults", async () => {
+    const writes: string[] = [];
+    let writeAttempts = 0;
+    let stdoutThrows = false;
+    const { fresh, root } = await freshControlPi({
+      mcpControl: {
+        render: () => "status",
+        writeText: (output) => {
+          writeAttempts += 1;
+          if (stdoutThrows) throw new Error("STDOUT_FAULT_CANARY");
+          writes.push(output);
+        },
+      },
+    });
+    const append = fresh.api.appendEntry as (...args: unknown[]) => void;
+    try {
+      fresh.api.appendEntry = () => { throw new Error("APPEND_FAULT_CANARY"); };
+      expect(await fresh.fire("input", { text: "/mcp", source: "print" }, fresh.printCtx()))
+        .toEqual({ action: "handled" });
+      expect(writes).toEqual([expect.stringContaining("could not produce")]);
+
+      fresh.api.appendEntry = append;
+      stdoutThrows = true;
+      expect(await fresh.fire("input", { text: "/mcp", source: "print" }, fresh.printCtx()))
+        .toEqual({ action: "handled" });
+      expect(fresh.entries.some((entry) => String(entry.data?.output).includes("could not produce"))).toBe(true);
+
+      const textWriteAttempts = writeAttempts;
+      fresh.api.appendEntry = () => { throw new Error("APPEND_AND_FALLBACK_FAULT_CANARY"); };
+      for (const ctx of [fresh.ctx({ mode: "json", hasUI: false }), fresh.rpcCtx()]) {
+        expect(await fresh.fire("input", { text: "/mcp", source: ctx.mode }, ctx))
+          .toEqual({ action: "handled" });
+        expect(writeAttempts).toBe(textWriteAttempts);
+      }
+
+      const throwingCtx = fresh.tuiCtx({ ui: { notify: () => { throw new Error("FALLBACK_FAULT_CANARY"); } } });
+      expect(await fresh.fire("input", { text: "/mcp", source: "interactive" }, throwingCtx))
+        .toEqual({ action: "handled" });
+      expect(writeAttempts).toBe(textWriteAttempts);
+      expect(JSON.stringify({ entries: fresh.entries, messages: fresh.messages, writes }))
+        .not.toMatch(/(?:STDOUT|APPEND|FALLBACK)_FAULT_CANARY/);
+      expect(fresh.messages).toEqual([]);
+    } finally {
+      fresh.api.appendEntry = append;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("reserved-name skill collisions", () => {
+  async function collisionProject(mcpName: string): Promise<{ fresh: FakePi; root: string }> {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-collision-"));
+    fs.writeFileSync(path.join(root, "CLAUDE.md"), "Collision fixture.\n");
+    const skills: Array<[string, string, string]> = [
+      [mcpName, "description: MCP collision", "MCP-COLLISION-BODY"],
+      ["MoDeL", "description: model collision\ndisable-model-invocation: true", "MODEL-COLLISION-BODY"],
+      ["ordinary", "description: ordinary skill", "ORDINARY-SKILL-BODY"],
+    ];
+    for (const [name, frontmatter, body] of skills) {
+      const skillDir = path.join(root, ".claude", "skills", name);
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(path.join(skillDir, "SKILL.md"), `---\n${frontmatter}\n---\n${body}\n`);
+    }
+    const userDir = path.join(root, ".claude-user");
+    fs.mkdirSync(userDir, { recursive: true });
+    const previousCwd = process.cwd();
+    process.chdir(root);
+    process.env.PICC_CLAUDE_USER_DIR = userDir;
+    const fresh = fakePi();
+    picc(fresh.api as never, { onInitializationSettled: fresh.captureInitialization });
+    await fresh.waitForInitialization();
+    process.chdir(previousCwd);
+    return { fresh, root };
+  }
+
+  it.each(["mcp", "McP"])("classifies %s and Pi built-in collisions truthfully without changing ordinary skills", async (mcpName) => {
+    const { fresh, root } = await collisionProject(mcpName);
+    try {
+      const resources = await fresh.fire("resources_discover", { reason: "startup" });
+      const promptDir = resources.promptPaths[0] as string;
+      expect(fs.existsSync(path.join(promptDir, `${mcpName}.md`))).toBe(false);
+      expect(fs.existsSync(path.join(promptDir, "MoDeL.md"))).toBe(false);
+      expect(fs.existsSync(path.join(promptDir, "ordinary.md"))).toBe(true);
+
+      expect(fresh.commands.get("skills").description).toContain("invocation availability");
+      await fresh.commands.get("skills").handler("", fresh.tuiCtx());
+      const listing = String(fresh.entries.at(-1)?.data.output ?? "");
+      expect(listing).toContain("Shadowed by reserved built-ins");
+      expect(listing).toContain(`/${mcpName} — built-in /mcp wins; direct Skill invocation remains allowed`);
+      expect(listing).toContain("/MoDeL — built-in /model wins; direct Skill invocation is not allowed");
+      expect(listing).toContain("/ordinary");
+      expect(listing.slice(listing.indexOf("Invocable as slash commands"), listing.indexOf("Shadowed")))
+        .not.toMatch(/\/mcp|\/model/i);
+
+      const slash = fresh.tools.get("SlashCommand");
+      expect(slash.description).toContain("Reserved built-in names cannot activate skills");
+      await expect(slash.execute("slash-reserved", { command: `/${mcpName} ARG_SECRET` }))
+        .rejects.toThrow("reserved by a built-in");
+      await expect(slash.execute("slash-pi-reserved", { command: "/MODEL ARG_SECRET" }))
+        .rejects.toThrow("reserved by a built-in");
+      await expect(slash.execute("slash-no-reflection", { command: `/${mcpName} ARG_SECRET` }))
+        .rejects.not.toThrow("ARG_SECRET");
+
+      const skill = fresh.tools.get("Skill");
+      expect(JSON.stringify(await skill.execute("skill-direct", { name: mcpName })))
+        .toContain("MCP-COLLISION-BODY");
+      const denied = await skill.execute("skill-denied", { name: "MoDeL" })
+        .then(() => undefined, (error: unknown) => error as Error);
+      expect(denied?.message).toBe(
+        "Direct Skill invocation is disabled. Built-in /model owns this reserved name, and no slash fallback can activate the skill.",
+      );
+      expect(denied?.message).not.toContain("Ask the user");
+      expect(denied?.message).not.toContain("MoDeL");
+
+      expect(await fresh.fire("input", { text: `/${mcpName} ARG_SECRET`, source: "interactive" }, fresh.tuiCtx()))
+        .toEqual({ action: "handled" });
+      expect(JSON.stringify(fresh.messages)).not.toContain("ARG_SECRET");
+
+      const piOwned = await fresh.fire(
+        "input",
+        { text: "/MODEL MODEL_TYPED_ARGUMENT_CANARY", source: "interactive" },
+        fresh.tuiCtx(),
+      );
+      expect(piOwned).toEqual({ action: "continue" });
+      expect(JSON.stringify({ piOwned, entries: fresh.entries, messages: fresh.messages }))
+        .not.toMatch(/MODEL-COLLISION-BODY|MODEL_TYPED_ARGUMENT_CANARY/);
+      expect(fresh.messages).toEqual([]);
+
+      const ordinary = await fresh.fire("input", { text: "/ordinary", source: "interactive" }, fresh.tuiCtx());
+      expect(ordinary.action).toBe("transform");
+      expect(String(ordinary.text)).toContain("ORDINARY-SKILL-BODY");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

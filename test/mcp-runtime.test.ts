@@ -447,7 +447,7 @@ describe("McpRuntime degrade paths", () => {
       expect(state).toMatchObject({
         state: "failed",
         statusSummary:
-          "MCP startup timed out during connection, initialization, or tool discovery after 20 ms; run /doctor for details.",
+          "MCP startup timed out during connection, initialization, or tool discovery; run /doctor for details.",
       });
       const report = renderMcpStatusReport(config, runtime.serverStates());
       expect(report).toContain(state!.statusSummary!);
@@ -478,14 +478,14 @@ describe("McpRuntime degrade paths", () => {
       expect(states.get("hung")?.diagnostic).toMatch(/failed to connect within 8000 ms/);
       expect(states.get("hung")?.diagnostic).toContain("hang-cmd");
       expect(states.get("hung")?.statusSummary).toBe(
-        "MCP startup timed out during connection, initialization, or tool discovery after 8000 ms; run /doctor for details.",
+        "MCP startup timed out during connection, initialization, or tool discovery; run /doctor for details.",
       );
       const status = renderMcpStatusReport(
         makeConfig(makeServer({ name: "hung", rawCommand: "hang-cmd" })),
         runtime.serverStates(),
       );
       expect(status).toContain(
-        "MCP startup timed out during connection, initialization, or tool discovery after 8000 ms; run /doctor for details.",
+        "MCP startup timed out during connection, initialization, or tool discovery; run /doctor for details.",
       );
       expect(status).not.toContain("hang-cmd");
       expect(runtime.diagnostics().some((d) => d.includes('"hung"'))).toBe(true);
@@ -571,7 +571,7 @@ describe("McpRuntime degrade paths", () => {
       expect(diagnostic).not.toContain("y".repeat(500));
       expect(diagnostic.length).toBeLessThanOrEqual(700);
       expect(runtime.serverStates()[0]?.statusSummary).toBe(
-        "MCP startup timed out during connection, initialization, or tool discovery after 4000 ms; run /doctor for details.",
+        "MCP startup timed out during connection, initialization, or tool discovery; run /doctor for details.",
       );
       expect(renderMcpStatusReport(makeConfig(makeServer({ name: "garbage" })), runtime.serverStates()))
         .not.toContain("GARBAGE_STDERR_TAIL_MARKER");

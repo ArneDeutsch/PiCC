@@ -412,7 +412,7 @@ export class McpRuntime {
           "failed",
           `MCP server "${server.name}" failed to connect within ${this.connectTimeoutMs} ms ` +
             `(MCP_TIMEOUT) — command: ${server.rawCommand}${this.stderrExcerpt(handle)}`,
-          `MCP startup timed out during connection, initialization, or tool discovery after ${this.connectTimeoutMs} ms; run /doctor for details.`,
+          "MCP startup timed out during connection, initialization, or tool discovery; run /doctor for details.",
         );
         return;
       }
