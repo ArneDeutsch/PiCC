@@ -186,9 +186,14 @@ Every subagent is visible, both to you and to the coordinating model:
   full record without guessing. These files are not reaped automatically.
 - **Status panel.** While agents run, a panel below the input shows the whole agent tree live —
   no `TaskOutput` await needed. One row per agent, nested children indented: a status bubble
-  (spinner while running; `●` done, `✗` failed, `■` stopped), the agent type (tinted with the
-  agent's `color:` frontmatter when set), your dispatch description, elapsed time, and token usage
-  once known (blank until then — never a fake zero). Finished rows linger briefly — ~10 s
+  (`◌` while waiting for configured capacity, a spinner while running, `●` done, `✗` failed, `■`
+  stopped), the agent type (tinted with the agent's `color:` frontmatter when set), your dispatch
+  description, elapsed time, and token usage once known (blank until then — never a fake zero).
+  Elapsed time runs from dispatch acceptance until completion or stop, so it includes any queue
+  time. The panel shows at most eight rows at once; overflow markers and `↑↓` navigation move the
+  window through the full tree. Aggregate running/waiting counts remain visible whenever work is
+  waiting, even if a waiting row is off-screen. Finished rows
+  linger briefly — ~10 s
   for successes, ~60 s for failures and stops — then leave on their own. That auto-expiry is a deliberate PiCC
   deviation: Claude Code keeps finished agents listed until dismissed. An expired row is not lost:
   `alt+a` reopens the panel with every finished agent still listed, and the condensed record in
@@ -238,17 +243,21 @@ Every subagent is visible, both to you and to the coordinating model:
 
 ### Subagent dispatch controls (`.claude/settings.json`)
 
-Three project settings shape subagent dispatch, under a `subagents` key (they also read at user
-scope; project overrides user). These are PiCC extensions with no Claude-settings equivalent.
+Three settings shape subagent dispatch under a `subagents` key. The effective merged value is
+binding: project and local settings may override user scope, while managed policy has highest
+precedence. These are PiCC extensions with no Claude-settings equivalent.
 
 | Key | Default | Effect |
 |---|---|---|
 | `subagents.enabled` | `true` | Gates **all** subagent delegation. `false` (or the inverse alias `disableSubagents: true`) removes `Agent`/`Task` from the main session entirely. |
-| `subagents.maxDepth` | `1` | Caps subagent **nesting** depth. Default `1` = main-session-only. Raise to `2..5` to let each further generation dispatch. |
-| `subagents.concurrency` | `4` | Caps parallel subagent fan-out. |
+| `subagents.maxDepth` | `1` | Caps subagent **nesting** depth. Any positive integer is valid; default `1` = main-session-only, and nesting requires a value greater than `1`. |
+| `subagents.concurrency` | `10` | Bounds admitted root dispatches and, separately, each opted-in nested-background depth. Additional accepted work waits FIFO with no separate queue-size cap. |
 
 The main conversation is **depth 0**; the subagents it dispatches are depth 1. So the default
-`maxDepth: 1` allows normal fan-out but blocks a subagent from dispatching its own.
+`maxDepth: 1` allows normal fan-out but blocks a subagent from dispatching its own. When nesting is
+enabled, each background depth has its own configured-capacity pool; `maxDepth × concurrency`
+bounds those background pools, not total active work. Foreground nested dispatch bypasses the pools
+to prevent a parent/child deadlock, so total active work can be higher.
 
 **The two "off" states are different.** If your goal is "no runaway recursion," use `maxDepth` —
 `enabled: false` removes delegation entirely, including ordinary depth-1 fan-out.
@@ -447,7 +456,7 @@ behaviors worth knowing:
 | Session died at high context / "input exceeds the context window" | Lower `proactiveCompactPercent` in `.claude/.picc/config.json` so PiCC compacts earlier (see Harness configuration above) |
 | Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | Reopen the exact persisted session before recovery; an ephemeral headless session instead requires a replacement session and resent input. For operational exhaustion, run `/compact`, then explicitly continue. For a hook block, repair/disable the hook or allow manual compaction first. For any post-commit restoration/startup failure, do **not** compact again; start a new session and resend retained input. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories `checkpoint-exhausted` and `checkpoint-resumed`; RPC acknowledgement, print stdout, and print exit status do not prove logical completion. |
 | `picc -p` finished but a subagent's output never appeared | Background is the default and a one-shot print run has no next turn to deliver it on. Set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for scripted runs, or collect with `TaskOutput` before the run ends. |
-| Subagents can't spawn subagents / nested fan-out flattened | PiCC defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Raise `subagents.maxDepth` to `2..5` in `.claude/settings.json`; see "Subagent dispatch controls" above. `/doctor` also shows the current nesting posture. |
+| Subagents can't spawn subagents / nested fan-out flattened | PiCC defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Set `subagents.maxDepth` to a positive integer greater than 1 in `.claude/settings.json`; see "Subagent dispatch controls" above. `/doctor` also shows the current nesting posture. |
 | Unexpected skills/agents from plugins | PiCC loads a plugin's content only when that plugin is **enabled** in Claude Code (settings `enabledPlugins`). A cloned marketplace under `~/.claude/plugins/marketplaces/` is just a catalog — its plugins stay dormant until enabled. `/doctor` and the startup info notice report how many are available but disabled. |
 | A plugin you enabled isn't loading | Confirm it's listed truthy in `enabledPlugins` as `name@marketplace`, and that it isn't in `~/.claude/plugins/blocklist.json`. |
 | Want to see why a fan-out routed the way it did | agent descriptions are the routing surface — inspect the "Available subagents" catalog in the session, and the dispatch tool calls in the transcript |

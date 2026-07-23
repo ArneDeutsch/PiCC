@@ -1184,9 +1184,10 @@ export class SubagentRuntime {
    * a slot in pool `d`, e.g. while blocked in a `TaskOutput(wait)` on a child)
    * never holds the slot a descendant at depth `d+1` is waiting on — no cross-depth
    * wait-for cycle, hence deadlock-free even at `concurrency = 1`. A single shared
-   * pool would deadlock exactly there (see the acquire gate comment). Total nested
-   * concurrency is bounded by `maxDepth × concurrency`, both finite. Depth ≤ 1
-   * stays on the existing root `semaphore` so root behaviour/tests are unchanged.
+   * pool would deadlock exactly there (see the acquire gate comment). The background
+   * pools are bounded by `maxDepth × concurrency`; foreground nested dispatch bypasses
+   * them, so total active work can be higher. Depth ≤ 1 stays on the existing root
+   * `semaphore` so root behaviour/tests are unchanged.
    */
   private readonly nestedBudgets = new Map<number, Semaphore>();
   private sdkPromise: Promise<PiSdk> | undefined;
@@ -1610,7 +1611,7 @@ export class SubagentRuntime {
         agentId,
         resumable: false,
         agentName: agent.name,
-        error: `Subagent nesting depth ${opts.depth} exceeds the configured maximum (subagents.maxDepth) of ${this.deps.maxDepth}. Raise subagents.maxDepth to 2..5 in .claude/settings.json to allow nested delegation.`,
+        error: `Subagent nesting depth ${opts.depth} exceeds the configured maximum (subagents.maxDepth) of ${this.deps.maxDepth}. Set subagents.maxDepth to a larger positive integer in .claude/settings.json to allow nested delegation.`,
         diagnostics,
       };
     }

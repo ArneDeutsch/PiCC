@@ -501,9 +501,9 @@ describe("loadSettings — robustness (completeness floor)", () => {
     expect(settings.hooks).toEqual({});
     expect(settings.worktree.baseRef).toBe("head");
     expect(settings.subagentsEnabled).toBe(true);
-    // Main-session-only by default — a deliberate PiCC divergence from Claude
-    // Code's up-to-5 contract. Depth-1 fan-out is on; nesting is opt-in
-    // via `subagents.maxDepth: 2..5`.
+    // Positive integers are valid, but nesting requires maxDepth > 1. Keep
+    // main-session-only as the default to avoid unexpected recursive fan-out
+    // draining subscription capacity.
     expect(settings.subagentMaxDepth).toBe(1);
     expect(settings.subagentConcurrency).toBe(10);
     expect(settings.disableAllHooks).toBe(false);

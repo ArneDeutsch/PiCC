@@ -959,7 +959,8 @@ describe("SubagentRuntime (fake SDK)", () => {
     expect(result.ok).toBe(false);
     expect(result.error).toContain("depth");
     expect(result.error).toContain("subagents.maxDepth");
-    expect(result.error).toContain("2..5");
+    expect(result.error).toContain("larger positive integer");
+    expect(result.error).not.toContain("2..5");
   });
 
   it('subagent_type "fork" is RESERVED — it never hits the generic unknown-type fallback', async () => {
