@@ -374,7 +374,7 @@ describe("resolveMcpConfig — enablement gate", () => {
     expect(server(cfg, "b")?.status).toBe("pending-approval");
   });
 
-  it("ignores approvals in PROJECT-scope settings with a diagnostic naming the fix", () => {
+  it("ignores project-scope approvals and requires independently reviewed named approvals", () => {
     const cfg = resolve({
       mcpJson: mcpJsonOf({ srv: { command: "x" } }),
       entries: [
@@ -383,7 +383,12 @@ describe("resolveMcpConfig — enablement gate", () => {
     });
     expect(server(cfg, "srv")?.status).toBe("pending-approval");
     const diag = cfg.diagnostics.find((d) => d.includes("ignored"));
-    expect(diag).toContain(".claude/settings.local.json");
+    expect(diag).toContain("Independently review server definitions");
+    expect(diag).toContain("only explicitly trusted server names");
+    expect(diag).toContain("~/.claude/settings.json, or the configured user directory");
+    expect(diag).toContain("clean untracked .claude/settings.local.json");
+    expect(diag).toContain("never copy project-supplied mcpServers, approval keys, or blanket approval");
+    expect(diag).not.toContain("move them");
   });
 
   it("honors disabledMcpjsonServers from EVERY scope, winning over all approvals", () => {
@@ -433,6 +438,25 @@ describe("resolveMcpConfig — enablement gate", () => {
       entries: [entry("local", local, { enabledMcpjsonServers: ["my_server"] })],
     });
     expect(server(cfg, "my.server")?.status).toBe("enabled");
+  });
+
+  it("sanitizes each UTF-16 code unit while preserving underscore and hyphen", () => {
+    const cfg = resolve({
+      mcpJson: mcpJsonOf({
+        "caf.": { command: "bmp" },
+        "a..b": { command: "astral" },
+        "keep_-x": { command: "preserved" },
+        "keep..x": { command: "near" },
+      }),
+      entries: [entry("user", user, {
+        enabledMcpjsonServers: ["café", "a💩b", "keep_-x"],
+      })],
+    });
+
+    expect(server(cfg, "caf.")?.status).toBe("enabled");
+    expect(server(cfg, "a..b")?.status).toBe("enabled");
+    expect(server(cfg, "keep_-x")?.status).toBe("enabled");
+    expect(server(cfg, "keep..x")?.status).toBe("pending-approval");
   });
 
   it("attaches no unset-variable warning to a disabled server (quiet decline path)", () => {
@@ -539,7 +563,7 @@ describe("resolveMcpConfig — git-tracked settings.local.json demotion", () => 
     expect(cfg.diagnostics.some((d) => d.includes("tracked by git"))).toBe(true);
   });
 
-  it("advises UNTRACKING (not 'move to settings.local.json') when the demoted file has approvals", () => {
+  it("does not recommend untracking or reusing a tracked local file with approvals", () => {
     const cfg = resolve({
       mcpJson: mcpJsonOf({ srv: { command: "x" } }),
       entries: [entry("local", local, { enabledMcpjsonServers: ["srv"] })],
@@ -547,9 +571,12 @@ describe("resolveMcpConfig — git-tracked settings.local.json demotion", () => 
     });
     expect(server(cfg, "srv")?.status).toBe("pending-approval");
     const approvalDiag = cfg.diagnostics.find((d) => d.includes("MCP approvals"));
-    expect(approvalDiag).toContain("git rm --cached .claude/settings.local.json");
-    // The generic project-scope advice would be nonsense for THIS file.
-    expect(approvalDiag).not.toContain("move them to");
+    expect(approvalDiag).toContain("cannot work while the file is tracked by git");
+    expect(approvalDiag).toContain("only explicitly trusted server names");
+    expect(approvalDiag).toContain("~/.claude/settings.json, or the configured user directory");
+    expect(approvalDiag).toContain("from scratch only after a reviewed repository change");
+    expect(approvalDiag).toContain("do not reuse project-supplied MCP content");
+    expect(approvalDiag).not.toContain("git rm --cached");
   });
 
   it("suppresses the demotion diagnostic when the tracked local file only disables servers", () => {

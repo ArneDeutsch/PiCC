@@ -185,18 +185,21 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
     if (!honored) {
       if (entry.enableAllProjectMcpServers !== undefined || entry.enabledMcpjsonServers !== undefined) {
         if (demoted) {
-          // The file IS settings.local.json — "move them to settings.local.json"
-          // would be nonsense advice; the fix is to untrack the file.
           pushDiag(
             `MCP approvals ("enableAllProjectMcpServers"/"enabledMcpjsonServers") in ` +
-              `${entry.sourcePath} are ignored while the file is tracked by git; untrack it ` +
-              `(git rm --cached .claude/settings.local.json) to restore local approvals`,
+              `${entry.sourcePath} cannot work while the file is tracked by git. Approve only explicitly ` +
+              `trusted server names with "enabledMcpjsonServers" in user settings (~/.claude/settings.json, ` +
+              `or the configured user directory). Create a local file from scratch only after a reviewed ` +
+              `repository change stops tracking or removes the path; do not reuse project-supplied MCP content`,
           );
         } else {
           pushDiag(
             `MCP approvals ("enableAllProjectMcpServers"/"enabledMcpjsonServers") in project-scope ` +
-              `settings are ignored — a cloned repo must not self-approve; move them to ` +
-              `.claude/settings.local.json (${entry.sourcePath})`,
+              `settings are ignored — a cloned repo must not self-approve. Independently review server ` +
+              `definitions, then add only explicitly trusted server names to "enabledMcpjsonServers" in ` +
+              `user settings (~/.claude/settings.json, or the configured user directory) or a clean untracked ` +
+              `.claude/settings.local.json; never copy project-supplied mcpServers, approval keys, or blanket ` +
+              `approval (${entry.sourcePath})`,
           );
         }
       }

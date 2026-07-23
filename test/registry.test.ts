@@ -240,13 +240,23 @@ describe("CAPABILITY_REGISTRY invariants", () => {
 
   it("re-tiers the MCP settings keys and gate/runtime features truthfully", () => {
     expect(lookupCapability("setting.mcpServers")?.tier).toBe("partial");
-    expect(lookupCapability("setting.enableAllProjectMcpServers")?.tier).toBe("partial");
+    const blanketApproval = lookupCapability("setting.enableAllProjectMcpServers");
+    expect(blanketApproval?.tier).toBe("partial");
+    expect(blanketApproval?.note).toContain("approves every current and future project server");
+    expect(blanketApproval?.note).toContain("NOT a shortcut for a large pending set");
+    expect(blanketApproval?.note).toContain("prefer explicitly named enabledMcpjsonServers approvals");
     expect(lookupCapability("setting.enabledMcpjsonServers")?.tier).toBe("partial");
     // Honored from every scope, always wins — nothing partial about it.
     expect(lookupCapability("setting.disabledMcpjsonServers")?.tier).toBe("full");
     // Sanitized-compare parity (binary-verified) is stated on both list keys.
-    expect(lookupCapability("setting.enabledMcpjsonServers")?.note).toContain("name sanitizer");
-    expect(lookupCapability("setting.disabledMcpjsonServers")?.note).toContain("name sanitizer");
+    for (const id of ["setting.enabledMcpjsonServers", "setting.disabledMcpjsonServers"]) {
+      const note = lookupCapability(id)?.note ?? "";
+      expect(note).toContain("Each UTF-16 code unit outside ASCII letters, digits, '_', and '-'");
+      expect(note).toContain("becomes '_'");
+      expect(note).toContain("astral symbol therefore becomes '__'");
+    }
+    expect(lookupCapability("setting.enabledMcpjsonServers")?.note)
+      .toContain("one persisted named approval can therefore match a differently named current or future server");
 
     const mcp = lookupCapability("feature.mcp");
     expect(mcp?.tier).toBe("partial");
@@ -258,16 +268,41 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     // cwd-pinning is EFFECTIVE parity, not verified passed-cwd behavior.
     expect(mcp?.note).toContain("Claude passes no cwd");
     expect(mcp?.note).toContain("NO MCP context of any kind");
+    expect(mcp?.note).toContain("failures surface in /mcp");
 
     const gate = lookupCapability("feature.mcp-project-approval");
     expect(gate?.tier).toBe("partial");
     expect(gate?.note).toContain("not Claude Code's interactive trust dialog");
     expect(gate?.note).toContain("git-tracked settings.local.json is demoted");
-    expect(gate?.note).toContain("one-time session-start notice");
-    expect(gate?.note).toContain("decline path");
-    // Plain-language rationale only — the "vision-warning precedent" insider
-    // phrase is a code-comment fact, not user-visible note text.
+    expect(gate?.note).toContain("bounded one-time session-start notice");
+    expect(gate?.note).toContain("/mcp and the /doctor pending finding");
+    expect(gate?.note).toContain("bounded approval and decline guidance");
+    expect(gate?.note).toContain("Each UTF-16 code unit outside ASCII letters, digits, '_', and '-'");
+    expect(gate?.note).toContain("astral symbol therefore becomes '__'");
+    expect(gate?.note).toContain("one persisted named approval can therefore match a differently named current or future server");
+    expect(gate?.note).toContain("re-review aliases when project MCP names change");
+    expect(gate?.note).not.toContain("carries the exact");
     expect(gate?.note).not.toContain("vision-warning");
+
+    const remote = lookupCapability("feature.mcp-remote-transports");
+    expect(remote?.note).toContain("/mcp shows a safe skipped state");
+  });
+
+  it("discloses bounded read-only /mcp status and its PiCC-defined mode behavior", () => {
+    const status = lookupCapability("feature.mcp-control-status");
+    expect(status, "feature.mcp-control-status must exist").toBeDefined();
+    expect(status?.tier).toBe("partial");
+    expect(status?.note).toContain("bounded read-only /mcp status");
+    expect(status?.note).toContain("at most 32 detailed rows");
+    expect(status?.note).toContain("omitted-state accounting");
+    expect(status?.note).toContain("safe failed/skipped summaries");
+    expect(status?.note).toContain("least-authority pending guidance");
+    expect(status?.note).toContain("Interactive and RPC use an immediate live snapshot");
+    expect(status?.note).toContain("one-shot text and JSON await bounded MCP startup settlement");
+    expect(status?.note).toContain("never enters model context");
+    expect(status?.note).toContain("Claude Code 2.1.205+ documents no-argument /mcp in -p as textual status");
+    expect(status?.note).toContain("JSON event, RPC entry, report formatting, aggregate bounds, safety redaction, and timing are PiCC-defined");
+    expect(status?.note).toContain("rather than Claude Code's interactive management UI or individual-tool view");
   });
 
   it("carries explicit deferred entries for the non-stdio MCP surfaces", () => {
@@ -624,14 +659,25 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     }
   });
 
-  // SlashCommand is a real thin-alias tool at partial tier; the note must
-  // name the shared skill-activation path and the built-in-command gap.
-  it("carries a SlashCommand entry as partial naming the alias path and the built-in gap", () => {
+  it("qualifies skill slash availability and SlashCommand for reserved built-in names", () => {
+    const userInvocable = lookupCapability("skill.frontmatter.user-invocable");
+    expect(userInvocable, "skill.frontmatter.user-invocable must exist").toBeDefined();
+    expect(userInvocable?.tier).toBe("partial");
+    expect(userInvocable?.note).toContain("ASCII alphanumeric first");
+    expect(userInvocable?.note).toContain("optional colon-separated nested-alias segments");
+    expect(userInvocable?.note).toContain("Prompt-palette stubs use the narrower single-segment ASCII token form");
+    expect(userInvocable?.note).toContain("Reserved Pi/PiCC names are shadowed case-insensitively");
+    expect(userInvocable?.note).toContain("precedence is PiCC-defined and unverified against Claude Code");
+    expect(userInvocable?.note).toContain("direct model invocation remains governed separately");
+
     const sc = lookupCapability("tool.SlashCommand");
     expect(sc, "tool.SlashCommand must exist").toBeDefined();
     expect(sc?.tier).toBe("partial");
     expect(sc?.note).toContain("thin alias over the skill-activation path");
     expect(sc?.note).toContain("/plugin:name");
+    expect(sc?.note).toContain("Reserved Pi/PiCC names are rejected case-insensitively");
+    expect(sc?.note).toContain("colliding skill remains available only through direct Skill invocation");
+    expect(sc?.note).toContain("when its model-invocation metadata permits");
     expect(sc?.note).toContain("PARTIAL:");
     expect(sc?.note).toContain("built-in commands");
     // Must NOT lead with the degraded-noop em-dash pattern.
@@ -1195,7 +1241,7 @@ describe("buildCompatReport", () => {
     expect(report.mcpPendingNotice).toBeUndefined();
   });
 
-  it("pending-approval servers yield one finding carrying the exact enable/decline edit", () => {
+  it("pending-approval servers yield one finding with bounded approval and decline guidance", () => {
     const project = makeProject({
       mcp: makeMcp({
         servers: [
@@ -1209,22 +1255,16 @@ describe("buildCompatReport", () => {
       (f) => f.capability.id === "feature.mcp-project-approval",
     );
     expect(pending).toHaveLength(1);
-    // With startup quiet, the /doctor finding is the ONE canonical carrier of
-    // the exact settings edit — servers plus BOTH exits (enable and decline).
     const evidence = pending[0]!.evidence;
     expect(evidence).toContain("alpha");
     expect(evidence).toContain("beta");
-    expect(evidence).toContain('"enabledMcpjsonServers": ["alpha","beta"]');
-    expect(evidence).toContain('"enableAllProjectMcpServers": true');
-    expect(evidence).toContain('"disabledMcpjsonServers"');
-    // In /doctor the evidence renders beside the gate entry's registry note,
-    // which still teaches all three keys.
+    expect(evidence).toContain("enabledMcpjsonServers");
+    expect(evidence).toContain("disabledMcpjsonServers");
     const note = pending[0]!.capability.note;
-    expect(note).toContain("enableAllProjectMcpServers");
-    expect(note).toContain("enabledMcpjsonServers");
-    expect(note).toContain("disabledMcpjsonServers");
-    // The one-time notify line stays short: names + enabling key + /doctor
-    // pointer, never the JSON edit itself.
+    expect(note).toContain("/mcp and the /doctor pending finding");
+    expect(note).toContain("bounded approval and decline guidance");
+    // The one-time notify line stays bounded: names + enabling key + /doctor
+    // pointer, never a JSON settings payload.
     expect(report.mcpPendingNotice).toContain("alpha");
     expect(report.mcpPendingNotice).toContain("enabledMcpjsonServers");
     expect(report.mcpPendingNotice).not.toContain('"enabledMcpjsonServers":');
@@ -1282,19 +1322,17 @@ describe("buildCompatReport", () => {
     expect(skipped.some((f) => f.evidence.includes('"broken"'))).toBe(true);
   });
 
-  it("config-level diagnostics (ignored approvals, git-tracked demotion) surface verbatim", () => {
-    const project = makeProject({
-      mcp: makeMcp({
-        diagnostics: [
-          'MCP approvals ("enableAllProjectMcpServers"/"enabledMcpjsonServers") in project-scope settings are ignored — a cloned repo must not self-approve; move them to .claude/settings.local.json (.claude/settings.json)',
-          '".claude/settings.local.json" is tracked by git, so a cloned repo could have authored it; its MCP configuration is treated as project scope (approvals ignored, servers pending)',
-        ],
-      }),
-    });
+  it("config-level safe approval diagnostics surface verbatim", () => {
+    const diagnostics = [
+      'MCP approvals ("enableAllProjectMcpServers"/"enabledMcpjsonServers") in project-scope settings are ignored — a cloned repo must not self-approve. Independently review server definitions, then add only explicitly trusted server names to "enabledMcpjsonServers" in user settings (~/.claude/settings.json, or the configured user directory) or a clean untracked .claude/settings.local.json; never copy project-supplied mcpServers, approval keys, or blanket approval (.claude/settings.json)',
+      'MCP approvals ("enableAllProjectMcpServers"/"enabledMcpjsonServers") in .claude/settings.local.json cannot work while the file is tracked by git. Approve only explicitly trusted server names with "enabledMcpjsonServers" in user settings (~/.claude/settings.json, or the configured user directory). Create a local file from scratch only after a reviewed repository change stops tracking or removes the path; do not reuse project-supplied MCP content',
+    ];
+    const project = makeProject({ mcp: makeMcp({ diagnostics }) });
     const report = buildCompatReport(project);
     const diags = report.findings.filter((f) => f.capability.id === "feature.mcp");
-    expect(diags.some((f) => f.evidence.includes("move them to .claude/settings.local.json"))).toBe(true);
-    expect(diags.some((f) => f.evidence.includes("tracked by git"))).toBe(true);
+    for (const diagnostic of diagnostics) {
+      expect(diags.some((f) => f.evidence.includes(diagnostic))).toBe(true);
+    }
   });
 
   it("a working enabled server is never a finding (posture-line data instead)", () => {
@@ -1510,9 +1548,8 @@ describe("MCP posture line in /doctor", () => {
     expect(doctor).toContain("waiting: pending approval");
     expect(doctor).toContain("declined: disabled (disabledMcpjsonServers)");
     expect(doctor).toContain("remote: skipped — remote MCP transports");
-    // De-duplicated: the posture line itself carries no enable/decline hint —
-    // the pending finding below it (registry note + evidence) is the canonical
-    // carrier of the exact edit now that startup is quiet.
+    // The posture line stays status-only; bounded least-authority approval and
+    // decline guidance is available from both /mcp and the /doctor finding.
     const postureLine = doctor.split("\n").find((l) => l.startsWith("MCP servers:")) ?? "";
     expect(postureLine).not.toContain("enabledMcpjsonServers");
     expect(postureLine).not.toContain("enableAllProjectMcpServers");
@@ -1595,16 +1632,54 @@ describe("MCP pending-approval notify line (report.mcpPendingNotice)", () => {
     expect(line).toContain("1 server(s) pending approval");
     expect(line).toContain("example-server");
     expect(line).toContain("enabledMcpjsonServers");
-    expect(line).toContain(".claude/settings.local.json");
-    expect(line).toContain("/doctor");
+    expect(line).not.toContain("settings.local.json");
+    expect(line).not.toContain("alias");
+    expect(line).toContain("disabledMcpjsonServers");
+    expect(line).toContain("/doctor for safe settings guidance");
+    expect(line.length).toBeLessThan(512);
+
+    const trackedLocal = makeProject({
+      mcp: makeMcp({
+        servers: [makeMcpServer({ name: "tracked", status: "pending-approval" })],
+        diagnostics: ["tracked settings.local.json was demoted"],
+      }),
+    });
+    const trackedNotice = buildCompatReport(trackedLocal).mcpPendingNotice ?? "";
+    expect(trackedNotice).not.toContain("settings.local.json");
+    expect(trackedNotice).not.toContain("alias");
   });
 
-  it("keeps the full enable/decline edit in /doctor (the canonical carrier)", () => {
+  it("provides bounded named-approval and decline guidance through /doctor", () => {
     const report = buildCompatReport(pendingProject);
-    const doctor = renderDoctorReport(pendingProject, report);
-    expect(doctor).toContain('"enabledMcpjsonServers": ["example-server"]');
-    expect(doctor).toContain('"enableAllProjectMcpServers": true');
-    expect(doctor).toContain('"disabledMcpjsonServers"');
+    const pending = report.findings.find(
+      (finding) => finding.capability.id === "feature.mcp-project-approval",
+    );
+    const evidence = pending?.evidence ?? "";
+    expect(evidence).toContain('"enabledMcpjsonServers": ["example-server"]');
+    expect(evidence).toContain("the server names you explicitly trust");
+    expect(evidence).toContain("user settings or a clean, user-controlled, untracked .claude/settings.local.json");
+    expect(evidence).toContain('Each UTF-16 code unit outside ASCII letters, digits, "_", and "-"');
+    expect(evidence).toContain('astral symbol therefore becomes "__"');
+    expect(evidence).toContain("One persisted named approval can therefore match a differently named current or future server");
+    expect(evidence).toContain("re-review aliases when project MCP names change");
+    expect(evidence).toContain("disabledMcpjsonServers");
+    expect(evidence).toContain('Do not set "enableAllProjectMcpServers": true as a shortcut');
+    expect(evidence).toContain("it approves all current and future project servers");
+  });
+
+  it("keeps raw colliding names copyable while /doctor states the exact ASCII alias boundary", () => {
+    const names = ["team.alpha", "team/alpha", "téam.alpha", "t_am/alpha", "keep_under-score"];
+    const project = makeProject({
+      mcp: makeMcp({
+        servers: names.map((name) => makeMcpServer({ name, status: "pending-approval" })),
+      }),
+    });
+    const doctor = renderDoctorReport(project, buildCompatReport(project));
+    expect(doctor).toContain(`"enabledMcpjsonServers": ${JSON.stringify(names)}`);
+    expect(doctor).toContain('Each UTF-16 code unit outside ASCII letters, digits, "_", and "-"');
+    expect(doctor).toContain('astral symbol therefore becomes "__"');
+    expect(doctor).toContain("One persisted named approval can therefore match a differently named current or future server");
+    expect(doctor).toContain("re-review aliases when project MCP names change");
   });
 
   it("stays absent with no pending servers", () => {
@@ -1614,7 +1689,7 @@ describe("MCP pending-approval notify line (report.mcpPendingNotice)", () => {
     expect(buildCompatReport(enabledOnly).mcpPendingNotice).toBeUndefined();
   });
 
-  it("beyond 8 pending servers, caps the name list; the /doctor edit recommends the blanket key", () => {
+  it("beyond 3 pending servers, keeps notice and /doctor guidance bounded", () => {
     const names = Array.from({ length: 9 }, (_, i) => `srv-${String(i + 1).padStart(2, "0")}`);
     const project = makeProject({
       mcp: makeMcp({
@@ -1625,15 +1700,23 @@ describe("MCP pending-approval notify line (report.mcpPendingNotice)", () => {
     const notice = report.mcpPendingNotice;
     expect(notice).toBeDefined();
     expect(notice).toContain("9 server(s) pending approval");
-    expect(notice).toContain("and 1 more");
-    // The 9th name appears nowhere on the notify line.
+    expect(notice).toContain("and 6 more");
+    // Names after the third appear nowhere on the notify line.
+    expect(notice).not.toContain("srv-04");
     expect(notice).not.toContain("srv-09");
-    // Bounded remedy in the /doctor finding: the blanket key instead of a
-    // JSON edit enumerating every server.
+    expect(notice!.length).toBeLessThan(512);
+    const pending = report.findings.find(
+      (finding) => finding.capability.id === "feature.mcp-project-approval",
+    );
+    const evidence = pending?.evidence ?? "";
+    expect(evidence).not.toContain(JSON.stringify(names));
+    expect(evidence).toContain("inspect your MCP configuration");
+    expect(evidence).toContain("server names you explicitly trust");
+    expect(evidence).toContain("disabledMcpjsonServers");
+    expect(evidence).toContain('Do not set "enableAllProjectMcpServers": true as a shortcut');
+    expect(evidence).toContain("it approves all current and future project servers");
     const doctor = renderDoctorReport(project, report);
-    expect(doctor).not.toContain(JSON.stringify(names));
-    expect(doctor).toContain('"enableAllProjectMcpServers": true');
-    expect(doctor).toContain('"disabledMcpjsonServers"');
+    expect(doctor).toContain("enableAllProjectMcpServers");
   });
 });
 

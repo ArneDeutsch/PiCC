@@ -359,9 +359,13 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
 3. **`before_agent_start` (every turn).** Appends the system-prompt suffix, re-asserting the full
    instruction set and the scratchpad section each turn.
 
-4. **`input`.** In order: intercept PiCC control commands so they never reach the model; fire the
-   `UserPromptSubmit` hook (block or inject context); expand `/skill [args]` slash commands by
-   activating the skills and **transforming the user turn** into the rendered bodies.
+4. **`input`.** Checkpoint replay/disposition and extension-sourced input handling run first. For
+   admitted non-extension user input, in order: intercept PiCC control commands; handle the fallback
+   for Pi built-ins; fire the `UserPromptSubmit` hook (block or inject context); expand `/skill
+   [args]` slash commands by activating the skills and **transforming the user turn** into the
+   rendered bodies; then checkpoint-capture accepted input before model delivery. Pi's exact router
+   normally owns canonical interactive built-ins; any reserved Pi token reaching this admitted user
+   path receives fixed canonical guidance outside hooks, skills, and model context.
 
 5. **Tool calls → `guard`.** Each call is translated to its Claude name, checked against deny rules,
    run through PreToolUse hooks, and — on file-touching tools — triggers nested-CLAUDE.md and

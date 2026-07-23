@@ -234,6 +234,14 @@ describe("MCP main-session tool exposure (wired)", () => {
     expect(fs.existsSync(log)).toBe(false);
   });
 
+  it("/mcp reports the connected fixture's live tool count", async () => {
+    await pi.commands.get("mcp").handler("", pi.tuiCtx());
+    const entry = pi.entries.find((candidate) => candidate.customType === "picc-control" && candidate.data?.command === "mcp");
+    expect(entry).toBeDefined();
+    expect(String(entry?.data?.output)).toContain('"fixture": connected (3 tools)');
+    expect(pi.messages).toEqual([]);
+  });
+
   it("the clip backstop marks an oversized MCP tool result", async () => {
     const big = await pi.tools.get("mcp__fixture__big-output").execute("clip-1", { bytes: 200_000 });
     expect((big.content[0] as { text: string }).text).toHaveLength(200_000);

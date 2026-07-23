@@ -84,6 +84,11 @@ export interface McpToolInfo {
   inputSchema: unknown;
 }
 
+type McpSdk = {
+  Client: typeof import("@modelcontextprotocol/sdk/client/index.js").Client;
+  StdioClientTransport: typeof import("@modelcontextprotocol/sdk/client/stdio.js").StdioClientTransport;
+};
+
 export interface McpRuntimeDeps {
   /**
    * Spawn cwd and `CLAUDE_PROJECT_DIR` — deliberately the project root, never
@@ -97,6 +102,8 @@ export interface McpRuntimeDeps {
    * `MCP_TOOL_TIMEOUT`. Defaults to `process.env`; injectable for tests.
    */
   env?: Record<string, string | undefined>;
+  /** Test seam for exercising an SDK load/import failure. */
+  loadSdk?: () => Promise<McpSdk>;
 }
 
 export interface McpServerState {
@@ -104,6 +111,8 @@ export interface McpServerState {
   state: "connecting" | "connected" | "failed";
   toolCount?: number;
   diagnostic?: string;
+  /** Bounded, non-secret failure class safe for direct status output. */
+  statusSummary?: string;
 }
 
 interface ServerHandle {
@@ -116,6 +125,7 @@ interface ServerHandle {
   pidPoller?: NodeJS.Timeout;
   tools: McpToolInfo[];
   diagnostic?: string;
+  statusSummary?: string;
   stderrRing: string;
   /** True once shutdown() has processed (or pre-empted) this server. */
   stopped: boolean;
@@ -225,6 +235,7 @@ export class McpRuntime {
       state: handle.state,
       ...(handle.state === "connected" ? { toolCount: handle.tools.length } : {}),
       ...(handle.diagnostic !== undefined ? { diagnostic: handle.diagnostic } : {}),
+      ...(handle.statusSummary !== undefined ? { statusSummary: handle.statusSummary } : {}),
     }));
   }
 
@@ -288,21 +299,20 @@ export class McpRuntime {
   // -------------------------------------------------------------------------
 
   private async connectAll(): Promise<void> {
-    let sdk:
-      | {
-          Client: typeof import("@modelcontextprotocol/sdk/client/index.js").Client;
-          StdioClientTransport: typeof import("@modelcontextprotocol/sdk/client/stdio.js").StdioClientTransport;
-        }
-      | undefined;
+    let sdk: McpSdk;
     try {
       // Lazy import (not top-level): a broken @modelcontextprotocol/sdk
       // install must degrade this session to MCP-unavailable diagnostics
       // instead of failing extension load.
-      const [clientMod, stdioMod] = await Promise.all([
-        import("@modelcontextprotocol/sdk/client/index.js"),
-        import("@modelcontextprotocol/sdk/client/stdio.js"),
-      ]);
-      sdk = { Client: clientMod.Client, StdioClientTransport: stdioMod.StdioClientTransport };
+      if (this.deps.loadSdk) {
+        sdk = await this.deps.loadSdk();
+      } else {
+        const [clientMod, stdioMod] = await Promise.all([
+          import("@modelcontextprotocol/sdk/client/index.js"),
+          import("@modelcontextprotocol/sdk/client/stdio.js"),
+        ]);
+        sdk = { Client: clientMod.Client, StdioClientTransport: stdioMod.StdioClientTransport };
+      }
     } catch (err) {
       const summary = errSummary(err);
       for (const handle of this.handles) {
@@ -310,19 +320,17 @@ export class McpRuntime {
           handle,
           "failed",
           `MCP server "${handle.server.name}": @modelcontextprotocol/sdk failed to load (${summary}); MCP support unavailable`,
+          "MCP support is unavailable because its SDK could not be loaded.",
         );
       }
       return;
     }
-    await Promise.all(this.handles.map((handle) => this.connectOne(handle, sdk!)));
+    await Promise.all(this.handles.map((handle) => this.connectOne(handle, sdk)));
   }
 
   private async connectOne(
     handle: ServerHandle,
-    sdk: {
-      Client: typeof import("@modelcontextprotocol/sdk/client/index.js").Client;
-      StdioClientTransport: typeof import("@modelcontextprotocol/sdk/client/stdio.js").StdioClientTransport;
-    },
+    sdk: McpSdk,
   ): Promise<void> {
     const server = handle.server;
     // connectAll yields at the SDK import(); a shutdown() in that window has
@@ -404,6 +412,7 @@ export class McpRuntime {
           "failed",
           `MCP server "${server.name}" failed to connect within ${this.connectTimeoutMs} ms ` +
             `(MCP_TIMEOUT) — command: ${server.rawCommand}${this.stderrExcerpt(handle)}`,
+          "MCP startup timed out during connection, initialization, or tool discovery; run /doctor for details.",
         );
         return;
       }
@@ -429,6 +438,7 @@ export class McpRuntime {
         "failed",
         `MCP server "${server.name}" failed to start (${errSummary(err)}) — ` +
           `command: ${server.rawCommand}${this.stderrExcerpt(handle)}`,
+        "MCP startup failed during connection, initialization, or tool discovery; run /doctor for details.",
       );
     }
   }
@@ -514,6 +524,7 @@ export class McpRuntime {
         handle,
         "failed",
         `MCP server "${handle.server.name}" was shut down before its connect completed`,
+        "Connection stopped because the session shut down.",
       );
     }
     // Backstop for the sub-poll-tick window: prefer the captured pid, fall
@@ -545,12 +556,13 @@ export class McpRuntime {
       }
     }
     // Post-shutdown truthfulness: a killed server must not keep reporting
-    // "connected" to /doctor. "failed" is the minimal honest state within the
-    // fixed contract union; the diagnostic stays out of diagnostics() because
-    // a deliberate shutdown is not an error.
+    // "connected" to the bounded status surfaces. "failed" is the minimal
+    // honest state within the fixed contract union; the diagnostic stays out
+    // of diagnostics() because a deliberate shutdown is not an error.
     if (handle.state === "connected") {
       handle.state = "failed";
       handle.diagnostic = `MCP server "${handle.server.name}" shut down`;
+      handle.statusSummary = "Connection closed because the session shut down.";
     }
   }
 
@@ -562,6 +574,7 @@ export class McpRuntime {
     handle: ServerHandle,
     state: "connected" | "failed",
     diagnostic?: string,
+    statusSummary?: string,
   ): void {
     if (handle.settled) return;
     handle.settled = true;
@@ -571,6 +584,7 @@ export class McpRuntime {
       handle.diagnostic = bounded;
       this.diags.push(bounded);
     }
+    if (statusSummary !== undefined) handle.statusSummary = statusSummary;
     this.unsettledCount -= 1;
     if (this.unsettledCount <= 0) this.settleResolve?.();
   }
