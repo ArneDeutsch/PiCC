@@ -1,6 +1,6 @@
 # Supported features
 
-> **Generated file — do not edit by hand.** This matrix is generated from the living capability registry (`src/registry/capability-registry.ts`), the single source of truth for what PiCC supports. The same registry drives the runtime `/doctor` report and the startup compatibility notice, so this document cannot drift from actual behavior.
+> **Generated file — do not edit by hand.** This matrix is generated from the living capability registry (`src/registry/capability-registry.ts`), the single source of truth for what PiCC supports. The same registry drives the runtime `/doctor` report and this generated matrix, keeping both surfaces anchored to the same support claims.
 >
 > **Claude Code baseline:** `claude-code-2.1.x (mid-2026)`. Every support claim is stated relative to this
 > baseline; anything upstream added after it is treated as *unassessed* and degrades safely.
@@ -17,7 +17,7 @@
 | not-supported | Out of scope; the name still resolves for gating and degrades safely. |
 | n/a | Not applicable to this harness. |
 
-A ⚠ marker on an ID means the divergence is **safety-relevant**: something a project intended to restrict now runs freely. These are always surfaced at startup and in `/doctor`, never silent.
+A ⚠ marker on an ID means the divergence is **safety-relevant**: something a project intended to restrict now runs freely. The matrix marks every safety-relevant registry entry; `/doctor` labels detected project-specific safety findings.
 
 ## Tools (36)
 
@@ -212,4 +212,4 @@ Cross-cutting runtime subsystems and behaviors.
 
 ## Summary
 
-The registry enumerates **156 capabilities** against baseline `claude-code-2.1.x (mid-2026)`: **74 full**, **32 partial**, **40 degraded-noop**, **10 not-supported**. 5 entries are safety-relevant (marked ⚠) — a divergence where a project's restriction is not enforced and is therefore reported prominently. Unknown inputs outside this registry are not counted here: they are unassessed by definition and degrade safely at runtime.
+The registry enumerates **156 capabilities** against baseline `claude-code-2.1.x (mid-2026)`: **74 full**, **32 partial**, **40 degraded-noop**, **10 not-supported**. 5 entries are safety-relevant — a divergence where a project's restriction is not enforced, marked ⚠ in this matrix. Unknown inputs outside this registry are not counted here: they are unassessed by definition and degrade safely at runtime.
