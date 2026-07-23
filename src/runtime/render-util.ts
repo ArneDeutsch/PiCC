@@ -92,7 +92,7 @@ export function pushColored(theme: unknown, color: string, text: string, width: 
   pushWrapped(themedFg(theme, color, String(text ?? "")), width, into);
 }
 
-/** Final Pi-width clamp for every line returned by a renderer. */
+/** Final Pi-width clamp only; sanitize untrusted text before calling because valid ANSI is preserved. */
 export function clampLines(lines: string[], width: number): string[] {
   if (!Number.isFinite(width) || width <= 0) return lines.map(() => "");
   const columns = Math.floor(width);
