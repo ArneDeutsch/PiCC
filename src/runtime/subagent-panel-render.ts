@@ -3,6 +3,8 @@ import { AGENT_COLOR_ANSI, tintAgentColor } from "./agent-color.js";
 import {
   DETAIL_FIELD_MAX_LENGTH,
   DETAIL_LOG_MAX_ENTRIES,
+  formatPresentationCostUsd,
+  formatPresentationCount,
   sanitizeDetailScalar,
   sanitizeLine,
   sanitizeProgressText,
@@ -128,6 +130,8 @@ const COLUMN_GAP = "  ";
 const DESCRIPTION_GAP = " ";
 const MIN_USEFUL_IDENTITY_WIDTH = 3;
 const MIN_USEFUL_DESCRIPTION_WIDTH = 3;
+/** Smallest ordinary row: state glyph + space + a useful identity fragment. */
+export const PANEL_MIN_ROW_WIDTH = 5;
 
 type MetricKey = "elapsed" | "input" | "output" | "cacheRead" | "cacheWrite" | "cost";
 const METRIC_ORDER: readonly MetricKey[] = [
@@ -179,11 +183,17 @@ function finiteUsageValue(row: PanelRowView, key: keyof NonNullable<PanelRowView
 function preparePanelRow(row: PanelRowView, opts: PanelRenderOptions, focused: boolean): PlainPanelRow {
   const identity = scalarSafeText(sanitizeLine(row.agentType, TYPE_RENDER_CAP)) || "agent";
   const label = scalarSafeText(sanitizeLine(row.label, LABEL_RENDER_CAP));
-  const cacheRead = finiteUsageValue(row, "cacheReadTokens");
-  const cacheWrite = finiteUsageValue(row, "cacheWriteTokens");
-  const input = finiteUsageValue(row, "inputTokens");
-  const output = finiteUsageValue(row, "outputTokens");
-  const cost = finiteUsageValue(row, "costUsd");
+  const rawCacheRead = finiteUsageValue(row, "cacheReadTokens");
+  const rawCacheWrite = finiteUsageValue(row, "cacheWriteTokens");
+  const cacheRead = rawCacheRead !== undefined && rawCacheRead > 0
+    ? formatPresentationCount(rawCacheRead)
+    : undefined;
+  const cacheWrite = rawCacheWrite !== undefined && rawCacheWrite > 0
+    ? formatPresentationCount(rawCacheWrite)
+    : undefined;
+  const input = formatPresentationCount(finiteUsageValue(row, "inputTokens"));
+  const output = formatPresentationCount(finiteUsageValue(row, "outputTokens"));
+  const cost = formatPresentationCostUsd(finiteUsageValue(row, "costUsd"));
   return {
     source: row,
     marker: focused ? (row.selected ? "❯ " : "  ") : "",
@@ -197,9 +207,9 @@ function preparePanelRow(row: PanelRowView, opts: PanelRenderOptions, focused: b
       elapsed: formatElapsed(row.elapsedMs),
       input: input === undefined ? undefined : `in ${input}`,
       output: output === undefined ? undefined : `out ${output}`,
-      cacheRead: cacheRead !== undefined && cacheRead > 0 ? `c/read ${cacheRead}` : undefined,
-      cacheWrite: cacheWrite !== undefined && cacheWrite > 0 ? `c/write ${cacheWrite}` : undefined,
-      cost: cost === undefined ? undefined : `$${cost}`,
+      cacheRead: cacheRead === undefined ? undefined : `c/read ${cacheRead}`,
+      cacheWrite: cacheWrite === undefined ? undefined : `c/write ${cacheWrite}`,
+      cost,
     },
   };
 }
@@ -243,8 +253,9 @@ function renderAggregate(view: PanelViewModel, opts: PanelRenderOptions): string
 export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptions): string[] {
   if (view.empty) return [];
   const rows = view.rows.map((row) => preparePanelRow(row, opts, view.focused));
-  const gutterWidth = Math.max(...rows.map((row) => visibleWidth(`${row.marker}${row.indent}${row.glyph} `)));
-  const identityNaturalWidth = Math.max(...rows.map((row) => visibleWidth(`${row.identity}${row.status}${row.chip}`)));
+  const fullGutterWidth = Math.max(...rows.map((row) => visibleWidth(`${row.marker}${row.indent}${row.glyph} `)));
+  const identityNaturalWidth = Math.max(...rows.map((row) => visibleWidth(row.identity)));
+  const suffixNaturalWidth = Math.max(...rows.map((row) => visibleWidth(row.status) + visibleWidth(row.chip)));
   const descriptionNaturalWidth = Math.max(...rows.map((row) => visibleWidth(row.description)));
 
   const metricWidths = new Map<MetricKey, number>();
@@ -258,43 +269,52 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
   const hasDescription = descriptionNaturalWidth > 0;
   const descriptionGapWidth = hasDescription ? visibleWidth(DESCRIPTION_GAP) : 0;
   const naturalWidth = (): number =>
-    gutterWidth + identityNaturalWidth + descriptionGapWidth + descriptionNaturalWidth + metricTotal();
+    fullGutterWidth + identityNaturalWidth + suffixNaturalWidth +
+      descriptionGapWidth + descriptionNaturalWidth + metricTotal();
   for (const key of DROP_ORDER) {
     if (naturalWidth() <= opts.width) break;
     active.delete(key);
   }
 
+  if (opts.width < PANEL_MIN_ROW_WIDTH) return renderAggregate(view, opts);
+
   const availableLeft = Math.max(0, opts.width - metricTotal());
   const minimumIdentityWidth = Math.max(...rows.map((row) =>
-    visibleWidth(row.status) + visibleWidth(row.chip) +
-      Math.min(MIN_USEFUL_IDENTITY_WIDTH, visibleWidth(row.identity))
+    Math.min(MIN_USEFUL_IDENTITY_WIDTH, visibleWidth(row.identity))
   ));
-  const minimumLeftWidth = gutterWidth + minimumIdentityWidth +
-    (hasDescription ? descriptionGapWidth + MIN_USEFUL_DESCRIPTION_WIDTH : 0);
-  if (availableLeft < minimumLeftWidth) return renderAggregate(view, opts);
-
-  const identityWidth = hasDescription
-    ? Math.min(identityNaturalWidth,
+  const descriptionFits = hasDescription && availableLeft >=
+    fullGutterWidth + minimumIdentityWidth + suffixNaturalWidth +
+      descriptionGapWidth + MIN_USEFUL_DESCRIPTION_WIDTH;
+  const suffixFits = availableLeft >=
+    fullGutterWidth + minimumIdentityWidth + suffixNaturalWidth;
+  const fullGutterFits = availableLeft >=
+    fullGutterWidth + minimumIdentityWidth + (suffixFits ? suffixNaturalWidth : 0);
+  const gutterWidth = fullGutterFits ? fullGutterWidth : 2;
+  const suffixWidth = suffixFits ? suffixNaturalWidth : 0;
+  const identityWidth = descriptionFits
+    ? Math.min(identityNaturalWidth + suffixWidth,
       availableLeft - gutterWidth - descriptionGapWidth - MIN_USEFUL_DESCRIPTION_WIDTH)
     : availableLeft - gutterWidth;
-  const descriptionWidth = hasDescription
+  const descriptionWidth = descriptionFits
     ? availableLeft - gutterWidth - identityWidth - descriptionGapWidth
     : 0;
-  const hasDescriptionCell = hasDescription;
+  const hasDescriptionCell = descriptionFits;
 
   const renderedRows = rows.map((row) => {
+    const markerPlain = fullGutterFits ? row.marker : "";
     const marker = row.source.selected
-      ? panelFg(opts.theme, "accent", row.marker)
-      : row.marker;
+      ? panelFg(opts.theme, "accent", markerPlain)
+      : markerPlain;
+    const indent = fullGutterFits ? row.indent : "";
     const glyph = panelFg(opts.theme, STATE_COLOR[row.source.state], row.glyph);
-    const gutterPlain = `${row.marker}${row.indent}${row.glyph} `;
+    const gutterPlain = `${markerPlain}${indent}${row.glyph} `;
     const gutterPad = " ".repeat(Math.max(0, gutterWidth - visibleWidth(gutterPlain)));
-    const suffixWidth = visibleWidth(row.status) + visibleWidth(row.chip);
-    const fittedIdentity = truncateToWidth(row.identity, Math.max(0, identityWidth - suffixWidth), "…");
-    const identityPlain = `${fittedIdentity}${row.status}${row.chip}`;
-    let line = `${marker}${row.indent}${glyph} ${gutterPad}`;
+    const suffix = suffixFits ? row.status + row.chip : "";
+    const fittedIdentity = truncateToWidth(row.identity, Math.max(0, identityWidth - visibleWidth(suffix)), "…");
+    const identityPlain = `${fittedIdentity}${suffix}`;
+    let line = `${marker}${indent}${glyph} ${gutterPad}`;
     line += opts.theme ? tintAgentColor(row.source.color, fittedIdentity) : fittedIdentity;
-    line += panelFg(opts.theme, "muted", row.status + row.chip);
+    line += panelFg(opts.theme, "muted", suffix);
     line += " ".repeat(Math.max(0, identityWidth - visibleWidth(identityPlain)));
     if (hasDescriptionCell) {
       const description = truncateToWidth(row.description, descriptionWidth, "…");

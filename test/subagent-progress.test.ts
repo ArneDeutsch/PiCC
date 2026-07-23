@@ -7,7 +7,10 @@ import {
   DETAIL_LOG_MAX_ENTRIES,
   TOOL_OUTCOME_BLOCK_INSPECTION_LIMIT,
   TOOL_OUTCOME_RAW_INSPECTION_LIMIT,
+  formatPresentationCostUsd,
+  formatPresentationCount,
   formatUsageCompact,
+  formatUsagePresentation,
   renderProgressText,
   sanitizeDetailScalar,
   sanitizeLine,
@@ -282,6 +285,62 @@ function piUsage(
 function assistantWithUsage(text: string, usage: ReturnType<typeof piUsage>) {
   return { role: "assistant", content: [{ type: "text", text }], usage };
 }
+
+describe("presentation-only usage formatting", () => {
+  it("compacts counts deterministically across suffix boundaries", () => {
+    expect(formatPresentationCount(0)).toBe("0");
+    expect(formatPresentationCount(999)).toBe("999");
+    expect(formatPresentationCount(1000)).toBe("1k");
+    expect(formatPresentationCount(4936)).toBe("4.9k");
+    expect(formatPresentationCount(119219)).toBe("119.2k");
+    expect(formatPresentationCount(999949)).toBe("999.9k");
+    expect(formatPresentationCount(999950)).toBe("1000k");
+    expect(formatPresentationCount(999999)).toBe("1000k");
+    expect(formatPresentationCount(1_000_000)).toBe("1m");
+    expect(formatPresentationCount(1_050_000)).toBe("1.1m");
+  });
+
+  it("omits invalid counts and costs while keeping cost precision truthful", () => {
+    for (const invalid of [-1, Number.NaN, Number.POSITIVE_INFINITY, "1000", undefined]) {
+      expect(formatPresentationCount(invalid)).toBeUndefined();
+      expect(formatPresentationCostUsd(invalid)).toBeUndefined();
+    }
+    expect(formatPresentationCostUsd(0)).toBe("$0.00");
+    expect(formatPresentationCostUsd(0.00001)).toBe("<$0.01");
+    expect(formatPresentationCostUsd(0.0099)).toBe("<$0.01");
+    expect(formatPresentationCostUsd(0.01)).toBe("$0.01");
+    expect(formatPresentationCostUsd(1.082095)).toBe("$1.08");
+  });
+
+  it("composes modern sparse usage and can omit cache fields in brief rows", () => {
+    const usage = {
+      inputTokens: 119219,
+      outputTokens: 4936,
+      cacheReadTokens: 1000,
+      costUsd: 1.082095,
+    };
+    expect(formatUsagePresentation(usage)).toBe(
+      "in 119.2k · out 4.9k · cache read 1k · $1.08",
+    );
+    expect(formatUsagePresentation(usage, { includeCache: false })).toBe(
+      "in 119.2k · out 4.9k · $1.08",
+    );
+    expect(formatUsagePresentation({ cacheWriteTokens: 0 }, { includeCache: false })).toBeUndefined();
+  });
+
+  it("uses legacy totals only when modern usage is absent and accepts legacy cost", () => {
+    expect(formatUsagePresentation({ totalTokens: 4936, cost: 0.005 })).toBe(
+      "4.9k tokens · <$0.01",
+    );
+    expect(formatUsagePresentation({ tokens: 119219 })).toBe("119.2k tokens");
+    expect(formatUsagePresentation({ totalTokens: 4936, tokens: 119219 })).toBe("4.9k tokens");
+    expect(formatUsagePresentation({ costUsd: 1.25, cost: 9.5 })).toBe("$1.25");
+    expect(formatUsagePresentation({ inputTokens: 0, totalTokens: 9999 })).toBe("in 0");
+    expect(formatUsagePresentation({ inputTokens: -1, totalTokens: 1000 })).toBe("1k tokens");
+    expect(formatUsagePresentation({ costUsd: -1, cost: 0.5 })).toBe("$0.50");
+    expect(formatUsagePresentation({})).toBeUndefined();
+  });
+});
 
 describe("SubagentProgressCondenser usage accumulation", () => {
   it("stays absent through zero-filled mid-stream events (never a fake 0 display)", () => {

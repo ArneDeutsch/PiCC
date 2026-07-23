@@ -193,12 +193,13 @@ Every subagent is visible, both to you and to the coordinating model:
   no `TaskOutput` await needed. When width permits, each agent has an indented row with a status
   bubble (`◌` while waiting for configured capacity, a spinner while running, `●` done, `✗` failed,
   `■` stopped), agent type, and dispatch description. Recognized `color:` frontmatter values tint
-  the type; other values do not. State, identity, and description take priority as width narrows;
-  elapsed time and token usage appear only when known and terminal width permits. Elapsed time runs
+  the type; other values do not. State and identity take priority as width narrows; the dispatch
+  description appears when space permits, and elapsed time and token usage appear only when known
+  and terminal width permits. Elapsed time runs
   from dispatch acceptance until completion or stop, so it includes any queue time. The panel shows
   at most eight rows at once; overflow markers and `↑↓` navigation move the window through the full
-  tree. Very narrow widths replace per-agent rows with aggregate state counts, including separate
-  running and waiting counts. Finished rows
+  tree. Below the minimum useful identity-row width, per-agent rows become aggregate state glyphs.
+  Finished rows
   linger briefly — ~10 s
   for successes, ~60 s for failures and stops — then leave on their own. That auto-expiry is a deliberate PiCC
   deviation: Claude Code keeps finished agents listed until dismissed. An expired row is not lost:

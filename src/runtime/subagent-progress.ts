@@ -33,8 +33,8 @@ import { createHash } from "node:crypto";
  * identical to `SubagentUsage` (subagent-registry.ts) and `DispatchUsage`
  * (subagents.ts) — declared locally to keep this module import-free of both;
  * the compile-time drift guard in subagents.ts breaks tsc the moment the
- * shapes diverge. One shape everywhere means `formatUsageCompact` and the
- * status panel read live and settlement usage identically.
+ * shapes diverge. Canonical/model-visible consumers own `formatUsageCompact`;
+ * TUI consumers format the same stored values through presentation-only helpers.
  */
 export interface SnapshotUsage {
   inputTokens?: number;
@@ -789,13 +789,13 @@ export function progressActivityLine(snapshot: ProgressSnapshot): string {
   return snapshot.activity || snapshot.tail[snapshot.tail.length - 1] || "";
 }
 
-// --- per-subagent usage formatting (shared display helper) ---
+// --- canonical/model-visible per-subagent usage formatting ---
 //
-// The single home of the compact usage-line format, used by the foreground
-// Agent tool result, the background TaskOutput text, and the /usage control
-// command — so every human-visible surface reads identically. Lives here (the
-// neutral display-text util already imported by subagents.ts and
-// background-tasks.ts) to stay free of an import cycle between those modules.
+// `formatUsageCompact` remains the stable formatter for canonical TaskOutput
+// text and control summaries such as /usage. TUI-only compact-count and
+// two-decimal-cost helpers live below it so presentation can evolve without
+// changing model-visible or machine-facing output. Keeping both here avoids an
+// import cycle between subagents.ts and background-tasks.ts.
 
 /**
  * `$0.03`, trailing zeros trimmed; `$0.00` for an EXACT zero cost. A nonzero
@@ -849,5 +849,67 @@ export function formatUsageCompact(usage: unknown): string | undefined {
   }
   const cost = finiteNumber(u.costUsd) ?? finiteNumber(u.cost);
   if (cost !== undefined) parts.push(formatCostUsd(cost));
+  return parts.length ? parts.join(" · ") : undefined;
+}
+
+function presentationNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function oneDecimal(value: number): string {
+  return value.toFixed(1).replace(/\.0$/u, "");
+}
+
+/** Compact token/count formatting for TUI presentation only. */
+export function formatPresentationCount(value: unknown): string | undefined {
+  const count = presentationNumber(value);
+  if (count === undefined) return undefined;
+  if (count < 1_000) return String(count);
+  if (count < 1_000_000) return `${oneDecimal(count / 1_000)}k`;
+  return `${oneDecimal(count / 1_000_000)}m`;
+}
+
+/** Stable, truthful cost formatting for TUI presentation only. */
+export function formatPresentationCostUsd(value: unknown): string | undefined {
+  const cost = presentationNumber(value);
+  if (cost === undefined) return undefined;
+  if (cost > 0 && cost < 0.01) return "<$0.01";
+  return `$${cost.toFixed(2)}`;
+}
+
+export interface UsagePresentationOptions {
+  /** Include cache read/write fields; brief lifecycle rows may omit them. */
+  includeCache?: boolean;
+}
+
+/** Presentation-only counterpart to formatUsageCompact with compact counts. */
+export function formatUsagePresentation(
+  usage: unknown,
+  options: UsagePresentationOptions = {},
+): string | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const u = usage as Record<string, unknown>;
+  const parts: string[] = [];
+  const input = formatPresentationCount(u.inputTokens);
+  const output = formatPresentationCount(u.outputTokens);
+  const cacheRead = formatPresentationCount(u.cacheReadTokens);
+  const cacheWrite = formatPresentationCount(u.cacheWriteTokens);
+  const hasModernUsage = input !== undefined || output !== undefined ||
+    cacheRead !== undefined || cacheWrite !== undefined;
+  if (hasModernUsage) {
+    if (input !== undefined) parts.push(`in ${input}`);
+    if (output !== undefined) parts.push(`out ${output}`);
+    if (options.includeCache !== false) {
+      if (cacheRead !== undefined) parts.push(`cache read ${cacheRead}`);
+      if (cacheWrite !== undefined) parts.push(`cache write ${cacheWrite}`);
+    }
+  } else {
+    const total = formatPresentationCount(u.totalTokens) ?? formatPresentationCount(u.tokens);
+    if (total !== undefined) parts.push(`${total} tokens`);
+  }
+  const cost = formatPresentationCostUsd(u.costUsd) ?? formatPresentationCostUsd(u.cost);
+  if (cost !== undefined) parts.push(cost);
   return parts.length ? parts.join(" · ") : undefined;
 }
