@@ -91,9 +91,10 @@ npm install            # also fetches Pi, whose CLI the e2e layer drives
 npm run typecheck      # strict TypeScript over src/**, no emit
 npm run typecheck:test # type-check the test suite (test/** + vitest.config.ts)
 npm run typecheck:all  # both of the above — part of the pre-commit gate
-npm test               # vitest run — the whole suite (unit + e2e lanes)
+npm test               # authoritative complete suite: test:unit, then preflight-backed test:e2e
+npm run verify          # typecheck:all, then the authoritative complete suite
 npm run test:unit      # everything except the real-Pi e2e files — the test half of the pre-commit gate
-npm run test:e2e       # only the real-Pi e2e files (fork-capped)
+npm run test:e2e       # installed-Pi preflight, then only the real-Pi e2e files (fork-capped)
 npm run test:coverage  # unit lane, with a src/** coverage report
 npm run test:watch     # vitest in watch mode
 ```
@@ -106,14 +107,31 @@ runners; the cap is the contention lever, not raised timeouts. `test:coverage` i
 in-process code, so it reports the unit lane's coverage of `src/**` and cannot measure the real-Pi
 child process; it is a guidance signal with no thresholds.
 
-CI never runs `npm test`: it type-checks with `typecheck:all` and runs `test:unit` and `test:e2e`
-as separate lanes, across Windows/Linux. The pre-commit hook (`.githooks/pre-commit`) runs
-`typecheck:all` then `test:unit` before every commit.
+CI type-checks with `typecheck:all` and runs `test:unit` and `test:e2e` as separate lanes across
+Windows/Linux. The pre-commit hook (`.githooks/pre-commit`) keeps the faster `typecheck:all` then
+`test:unit` gate. Run `npm run verify` before integration; it is the complete local authority.
+
+For a focused inner loop, pass an exact file through npm:
+
+```bash
+npm run test:unit -- test/permissions.test.ts
+```
+
+To select one test, pass an anchored regular expression containing the full Vitest name, including
+its `describe` ancestry:
+
+```bash
+npm run test:unit -- test/permissions.test.ts -t "^parseRule parses bare tool names$"
+```
+
+Vitest's `-t` is a regular-expression filter, so an unanchored leaf name is not exact.
 
 The runner is [vitest](https://vitest.dev). Tests are TypeScript run through `tsx`/vitest — there
 is no build step to run first. The e2e layer needs Pi's compiled CLI at
-`node_modules/@earendil-works/pi-coding-agent/dist/cli.js`; `npm install` provides it. If it is
-missing those tests **skip** (they do not fail) with a console warning.
+`node_modules/@earendil-works/pi-coding-agent/dist/cli.js`; `npm install` provides it.
+`test:e2e` fails before Vitest with reinstall/version guidance when that CLI is missing, preventing
+CI and complete local verification from silently skipping the real-Pi lane. Direct Vitest runs may
+still skip the E2E files gracefully, which is useful for narrow development commands.
 
 ## Layer 1 — unit tests (per subsystem)
 
