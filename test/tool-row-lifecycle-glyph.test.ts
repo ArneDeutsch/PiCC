@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
   RECORD_EXPAND_HINT,
-  RECORD_REFERENCE_NOTE,
   renderAgentCall,
   renderSendMessageCall,
   renderSendMessageResult,
@@ -29,7 +28,7 @@ const theme = {
 
 type Component = { render(width: number): string[] };
 type Tool = Record<string, unknown>;
-type Result = { content: Array<{ type: string; text: string }>; details?: Record<string, unknown> };
+type Result = { content: Array<{ type: string; text: string }>; details?: Record<string, unknown>; isError?: boolean };
 
 function lifecycleTool(name: "Agent" | "Task" | "TaskOutput"): Tool {
   if (name === "TaskOutput") {
@@ -67,7 +66,12 @@ function renderLifecycle(
   const args = name === "TaskOutput" ? { task_id: "task-7" } : { subagent_type: "reviewer" };
   const call = (tool.renderCall as Function)(args, theme, context) as Component;
   const canonical = structuredClone(result);
-  const rendered = (tool.renderResult as Function)(result, options, theme, context) as Component;
+  const rendered = (tool.renderResult as Function)(
+    result,
+    { ...options, isPartial: options.isPartial === true },
+    theme,
+    context,
+  ) as Component;
   expect(call.render(width)).toEqual([]);
   const lines = rendered.render(width).map(stripAnsi);
   expect(result).toEqual(canonical);
@@ -119,8 +123,9 @@ describe("subagent lifecycle glyph ownership", () => {
       }, "defensive partial");
       const canonical = structuredClone(defensive);
       const lines = renderLifecycle(name, defensive, { expanded: false, isPartial: true });
-      expectSingleMarker(lines, "■");
-      expect(lines.join("\n")).toContain("stopped by user");
+      const contradictoryTaskFailure = name === "TaskOutput" && outcome === "failed";
+      expectSingleMarker(lines, contradictoryTaskFailure ? "✗" : "■");
+      if (name !== "TaskOutput") expect(lines.join("\n")).toContain("stopped by user");
       expect(lines.join("\n")).not.toContain("running");
       expect(defensive).toEqual(canonical);
     }
@@ -148,10 +153,23 @@ describe("subagent lifecycle glyph ownership", () => {
     expect(lines.join("\n")).toContain("usage: in 12 · out 4");
   });
 
-  it("maps successful background dispatch, foreground partial output, and a running poll", () => {
-    const background = renderLifecycle("Agent", result({ background: true, taskId: "task-7", description: "Check lifecycle" }, "started"));
-    expectSingleMarker(background, "●");
-    expect(background.join("\n")).toContain("reviewer [background] - Check lifecycle");
+  it("hides both canonical background admissions with or without descriptions while retaining live rows", () => {
+    for (const admission of ["admitted", "waiting"] as const) {
+      for (const description of ["Check lifecycle", undefined]) {
+        const background = renderLifecycle("Agent", {
+          content: [{ type: "text", text: "started" }],
+          details: {
+            background: true,
+            taskId: "task-7",
+            agent: "reviewer",
+            agentId: "agent-aabbccddeeff",
+            admission,
+            ...(description === undefined ? {} : { description }),
+          },
+        });
+        expect(background).toEqual([]);
+      }
+    }
 
     const partial = renderLifecycle("Agent", result({ live: true }, "working"), { expanded: false, isPartial: true });
     expectSingleMarker(partial, "○");
@@ -163,39 +181,138 @@ describe("subagent lifecycle glyph ownership", () => {
     expect(poll.join("\n")).toContain("running");
   });
 
+  it("fails open for every malformed, partial, foreground, or error acceptance shape", () => {
+    const valid = {
+      background: true,
+      taskId: "task-7",
+      agent: "reviewer",
+      agentId: "agent-aabbccddeeff",
+      admission: "waiting",
+      description: "Check lifecycle",
+    };
+    for (const details of [
+      { ...valid, background: undefined },
+      { ...valid, background: false },
+      { ...valid, taskId: undefined },
+      { ...valid, taskId: "task-0" },
+      { ...valid, agent: undefined },
+      { ...valid, agent: " \t " },
+      { ...valid, agentId: undefined },
+      { ...valid, agentId: "agent-AABBCCDDEEFF" },
+      { ...valid, admission: undefined },
+      { ...valid, admission: "queued" },
+      { ...valid, description: 7 },
+      { ...valid, status: "completed" },
+      { ...valid, outcome: "completed" },
+      { ...valid, alreadyReported: true },
+      { ...valid, error: "unexpected" },
+      { ...valid, userStopped: false },
+      { ...valid, cutOff: false },
+      { ...valid, resumable: false },
+      { ...valid, durationMs: 1 },
+      { ...valid, settledAt: 1 },
+      { ...valid, transcriptPath: "/tmp/transcript.jsonl" },
+      { ...valid, lastActivity: "working" },
+      { ...valid, usage: { inputTokens: 1 } },
+      { ...valid, diagnostics: [] },
+      { ...valid, subagentProgress: { activity: "working", tail: [] } },
+      { ...valid, record: "subagent-completion" },
+      { ...valid, finalText: "done" },
+      { ...valid, nested: false },
+      { ...valid, live: false },
+      { ...valid, worktreePath: "/tmp/worktree" },
+      { ...valid, note: "note" },
+      { ...valid, delivery: "steer" },
+      { ...valid, resumed: false },
+      { ...valid, future: "field" },
+    ]) {
+      const lines = renderLifecycle("Agent", {
+        content: [{ type: "text", text: "acceptance evidence" }],
+        details,
+      });
+      expectSingleMarker(lines, "error" in details ? "✗" : "●");
+      expect(lines.join("\n")).toContain("acceptance evidence");
+      expect(lines.join("\n")).not.toContain("[background]");
+    }
+    for (const malformed of [
+      { content: [], details: valid },
+      { content: [{ type: "text", text: "" }], details: valid },
+      { content: [{ type: "image", text: "acceptance evidence" }], details: valid },
+      { content: [{ type: "text", text: 7 }], details: valid },
+      { content: [{ type: "text", text: "acceptance evidence", extra: true }], details: valid },
+      { content: [{ type: "text", text: "acceptance evidence" }, { type: "text", text: "extra" }], details: valid },
+      { content: [{ type: "text", text: "acceptance evidence" }], details: valid, future: true },
+    ]) {
+      const lines = renderLifecycle("Agent", malformed as Result);
+      expect(lines.length).toBeGreaterThan(0);
+    }
+    const canonical = { content: [{ type: "text", text: "acceptance evidence" }], details: valid };
+    const partial = renderLifecycle("Agent", canonical, { expanded: false, isPartial: true });
+    expectSingleMarker(partial, "○");
+    expect(partial.join("\n")).toContain("acceptance evidence");
+    const contextError = renderLifecycle("Agent", { content: [{ type: "text", text: "context error evidence" }], details: valid }, { expanded: false, isError: true });
+    expectSingleMarker(contextError, "✗");
+    expect(contextError.join("\n")).toContain("context error evidence");
+    const envelopeError = renderLifecycle("Agent", { ...result(valid, "envelope error evidence"), isError: true });
+    expectSingleMarker(envelopeError, "✗");
+    expect(envelopeError.join("\n")).toContain("envelope error evidence");
+  });
+
+  it("sanitizes malformed lifecycle fail-open evidence without changing its truthful marker", () => {
+    const hostile = `SAFE\u202e${ESC}[31m RED${ESC}[0m${String.fromCharCode(7)}\rNEXT\u2028LS\u2029PS\ud800END`;
+    const lines = renderLifecycle("Agent", {
+      content: [{ type: "text", text: hostile }],
+      details: {
+        background: true,
+        taskId: "task-7",
+        agent: "reviewer",
+        agentId: "agent-aabbccddeeff",
+        admission: "admitted",
+        future: true,
+      },
+    });
+    const text = lines.join("\n");
+    expectSingleMarker(lines, "●");
+    expect(text).toContain("SAFE RED");
+    expect(text).toContain("NEXT");
+    expect(text).toContain("LS");
+    expect(text).toContain("PS");
+    expect(text).toContain("PSEND");
+    expect(text).not.toMatch(/[\u001b\u0007\r\u2028\u2029\u202e\ud800]/u);
+  });
+
   it.each([
     { status: "completed", outcome: "completed", glyph: "●", word: "completed" },
     { status: "failed", outcome: "failed", glyph: "✗", word: "failed" },
     { status: "stopped", outcome: "aborted", glyph: "■", word: "aborted" },
     { status: "stopped", outcome: "aborted", glyph: "■", word: "stopped by user", userStopped: true },
   ] as const)("maps TaskOutput $word", (scenario) => {
-    const lines = renderLifecycle("TaskOutput", result({ taskId: "task-7", ...scenario }));
-    expectSingleMarker(lines, scenario.glyph);
+    const { glyph, word: _word, ...terminal } = scenario;
+    const lines = renderLifecycle("TaskOutput", result({ taskId: "task-7", admission: "admitted", ...terminal }));
+    expectSingleMarker(lines, glyph);
     expect(lines.join("\n")).toContain(scenario.word);
-    expect(lines.join("\n")).toContain("task output task-7");
+    expect(lines.join("\n")).not.toContain("task output");
+    expect(lines.join("\n")).not.toContain("task-7");
   });
 
   it.each([
-    { name: "collapsed", options: { expanded: false }, alreadyReported: false },
-    { name: "expanded", options: { expanded: true }, alreadyReported: false },
-    { name: "reference", options: { expanded: false }, alreadyReported: true },
-  ])("keeps one marker and semantic metadata in the $name variant", ({ options, alreadyReported }) => {
-    const lines = renderLifecycle("Agent", result({ outcome: "failed", error: "provider stopped", alreadyReported }), options);
+    { name: "collapsed", options: { expanded: false } },
+    { name: "expanded", options: { expanded: true } },
+  ])("keeps one marker and semantic metadata in the $name variant", ({ options }) => {
+    const lines = renderLifecycle("Agent", result({ outcome: "failed", error: "provider stopped" }), options);
     expectSingleMarker(lines, "✗");
     expect(lines.join("\n")).toContain("failed");
-    expect(lines.join("\n")).toContain(alreadyReported ? RECORD_REFERENCE_NOTE : options.expanded ? "semantic body" : "provider stopped");
+    expect(lines.join("\n")).toContain(options.expanded ? "semantic body" : "provider stopped");
   });
 
   it.each([
-    { name: "collapsed", options: { expanded: false }, alreadyReported: false },
-    { name: "expanded", options: { expanded: true }, alreadyReported: false },
-    { name: "reference", options: { expanded: false }, alreadyReported: true },
-  ])("gives failed-plus-user-stopped precedence in the $name variant", ({ options, alreadyReported }) => {
+    { name: "collapsed", options: { expanded: false } },
+    { name: "expanded", options: { expanded: true } },
+  ])("gives failed-plus-user-stopped precedence in the $name variant", ({ options }) => {
     const lines = renderLifecycle("Agent", result({
       outcome: "failed",
       userStopped: true,
       error: "provider stopped",
-      alreadyReported,
     }), options);
     expectSingleMarker(lines, "■");
     expect(lines.join("\n")).toContain("stopped by user");
@@ -231,32 +348,22 @@ describe("subagent lifecycle glyph ownership", () => {
 });
 
 describe("unwrapped settlement symbols", () => {
-  const settlement = (outcome: "completed" | "failed" | "aborted", alreadyReported = false) => ({
+  const settlement = (outcome: "completed" | "failed" | "aborted") => ({
     record: "subagent-completion",
     taskId: "task-7",
     agent: "reviewer",
     outcome,
-    alreadyReported,
     error: outcome === "failed" ? "provider stopped" : undefined,
     finalText: "settled body",
   });
 
-  it("retains completed collapsed/reference omission and expanded symbol", () => {
-    const collapsed = renderSettlementRecord(settlement("completed"), { expanded: false }, theme)!.render(100).map(stripAnsi);
-    const expanded = renderSettlementRecord(settlement("completed"), { expanded: true }, theme)!.render(100).map(stripAnsi);
-    const reference = renderSettlementRecord(settlement("completed", true), { expanded: false }, theme)!.render(100).map(stripAnsi);
-    expect(stateGlyphCount(collapsed)).toBe(0);
-    expect(expanded[0]).toMatch(/^● reviewer \[completed\]/);
-    expect(stateGlyphCount(expanded)).toBe(1);
-    expect(stateGlyphCount(reference)).toBe(0);
-  });
-
   it.each([
+    { outcome: "completed", glyph: "●" },
     { outcome: "failed", glyph: "✗" },
     { outcome: "aborted", glyph: "■" },
-  ] as const)("retains $outcome symbols in collapsed, expanded, and reference records", ({ outcome, glyph }) => {
-    for (const [expanded, alreadyReported] of [[false, false], [true, false], [false, true]] as const) {
-      const lines = renderSettlementRecord(settlement(outcome, alreadyReported), { expanded }, theme)!.render(100).map(stripAnsi);
+  ] as const)("retains one truthful $outcome symbol when collapsed and expanded", ({ outcome, glyph }) => {
+    for (const expanded of [false, true]) {
+      const lines = renderSettlementRecord(settlement(outcome), { expanded }, theme)!.render(100).map(stripAnsi);
       expect(lines[0]).toMatch(new RegExp(`^${glyph} `));
       expect(stateGlyphCount(lines)).toBe(1);
     }
