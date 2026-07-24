@@ -112,6 +112,8 @@ export interface RunPiOptions {
   piSettings?: Record<string, unknown>;
   /** CLI mode arguments replacing print `-p <prompt>` (RPC/JSON contract tests). */
   modeArgs?: string[];
+  /** Run an installed PiCC launcher instead of the source Pi CLI + explicit extension. */
+  launcherPath?: string;
 }
 
 export interface StartedPi {
@@ -252,9 +254,9 @@ export function createE2ELive(): E2ELive {
       child = spawn(
         process.execPath,
         [
-          CLI_PATH,
-          "-e",
-          EXTENSION_PATH,
+          ...(opts.launcherPath
+            ? [opts.launcherPath]
+            : [CLI_PATH, "-e", EXTENSION_PATH]),
           ...(opts.persistSession ? [] : ["--no-session"]),
           ...(opts.modeArgs ?? ["-p", opts.prompt]),
         ],

@@ -406,7 +406,7 @@ describe("shared launcher graph policy", () => {
     const started = performance.now();
     const result = await validate(repoRoot);
     const elapsed = performance.now() - started;
-    expect(result).toMatchObject({ ok: true, version: "0.81.1" });
+    expect(result).toMatchObject({ ok: true, version: "0.82.0" });
     expect(result.scannedNodeModules).toBeTypeOf("number");
     expect(result.scannedNodeModules as number).toBeLessThan(100);
     expect(elapsed).toBeLessThan(5_000);

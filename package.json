@@ -55,13 +55,15 @@
     "test:coverage": "vitest run --coverage --exclude \"**/e2e-*.test.ts\"",
     "gen:capabilities": "node scripts/gen-capability-matrix.mjs",
     "prepare": "git config core.hooksPath .githooks || exit 0",
-    "prepublishOnly": "npm run typecheck:all"
+    "prepublishOnly": "npm run typecheck:all && npm run test:source && node scripts/verify-release.mjs source --event manual",
+    "test:source": "vitest run --exclude \"**/e2e-packaged-launcher.test.ts\"",
+    "test:packaged": "vitest run test/e2e-packaged-launcher.test.ts"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.81.1",
-    "@earendil-works/pi-ai": "^0.81.1",
-    "@earendil-works/pi-coding-agent": "^0.81.1",
-    "@earendil-works/pi-tui": "^0.81.1",
+    "@earendil-works/pi-agent-core": "0.82.0",
+    "@earendil-works/pi-ai": "0.82.0",
+    "@earendil-works/pi-coding-agent": "0.82.0",
+    "@earendil-works/pi-tui": "0.82.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "picomatch": "^4.0.5",
     "typebox": "1.1.38",

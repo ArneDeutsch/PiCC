@@ -36,7 +36,7 @@ in see [`doc/testing.md`](testing.md).
 ### The Pi ⇄ PiCC boundary
 
 PiCC is **not a fork** of Pi. Pi is an ordinary npm dependency, and PiCC attaches as a single
-extension whose entry is `src/index.ts`; the accepted package range and lockfile-tested versions are recorded in
+extension whose entry is `src/index.ts`; the pinned, tested dependency graph is recorded in
 [`doc/pi-integration.md`](pi-integration.md). Pi supplies everything model- and UI-related; PiCC
 supplies Claude Code compatibility and **never** reimplements auth, the provider layer, or the TUI
 shell. A change that would duplicate a Pi responsibility inside `src/` is the wrong change — extend

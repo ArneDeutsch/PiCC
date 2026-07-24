@@ -129,6 +129,48 @@ describe("lifecycle wiring", () => {
     }
   });
 
+  it("keeps direct-launch suppression through extension input, then clears it before admitted input or user Bash", async () => {
+    const saved = {
+      pid: process.env.PICC_LAUNCHER_PID,
+      kind: process.env.PICC_INSTALL_KIND,
+      version: process.env.PICC_VERSION,
+      skip: process.env.PI_SKIP_VERSION_CHECK,
+    };
+    const initializeDirect = async () => {
+      process.env.PICC_LAUNCHER_PID = String(process.ppid);
+      process.env.PICC_INSTALL_KIND = "source";
+      process.env.PICC_VERSION = "0.1.0";
+      process.env.PI_SKIP_VERSION_CHECK = "1";
+      const directPi = fakePi();
+      picc(directPi.api as never, { onInitializationSettled: directPi.captureInitialization });
+      await directPi.waitForInitialization();
+      return directPi;
+    };
+    try {
+      const inputPi = await initializeDirect();
+      expect(process.env.PICC_LAUNCHER_PID).toBeUndefined();
+      expect(process.env.PI_SKIP_VERSION_CHECK).toBe("1");
+      await inputPi.fire("input", { text: "internal", source: "extension" });
+      expect(process.env.PI_SKIP_VERSION_CHECK).toBe("1");
+      await inputPi.fire("input", { text: "admitted", source: "interactive" });
+      expect(process.env.PI_SKIP_VERSION_CHECK).toBeUndefined();
+
+      const bashPi = await initializeDirect();
+      expect(process.env.PI_SKIP_VERSION_CHECK).toBe("1");
+      await bashPi.fire("user_bash", { command: "printf probe" });
+      expect(process.env.PI_SKIP_VERSION_CHECK).toBeUndefined();
+    } finally {
+      const restore = (name: string, value: string | undefined) => {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      };
+      restore("PICC_LAUNCHER_PID", saved.pid);
+      restore("PICC_INSTALL_KIND", saved.kind);
+      restore("PICC_VERSION", saved.version);
+      restore("PI_SKIP_VERSION_CHECK", saved.skip);
+    }
+  });
+
   it("captures quota headers from after_provider_response and reports them in /quota", async () => {
     await pi.fire("after_provider_response", {
       headers: { "x-ratelimit-remaining-tokens": "1234", "content-type": "application/json" },
@@ -175,7 +217,7 @@ describe("lifecycle wiring", () => {
     expect(pi.userMessages.filter((m) => String(m.content).includes("[Stop hook]")).length).toBe(9);
   });
 
-  it("maps Pi 0.81.1 session reasons to Claude SessionStart sources", async () => {
+  it("maps Pi 0.82.0 session reasons to Claude SessionStart sources", async () => {
     const log = path.join(dir, ".claude", ".session-start-log");
     fs.rmSync(log, { force: true });
     for (const reason of ["startup", "reload", "new", "resume", "fork"]) {
