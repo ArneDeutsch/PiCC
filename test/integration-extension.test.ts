@@ -158,6 +158,51 @@ describe("tool surface registration", () => {
     }
   });
 
+  it.each([
+    {
+      name: "WebFetch",
+      args: { url: "https://example.test/invoked" },
+      result: {
+        content: [{ type: "text", text: "registered fetch body" }],
+        details: {
+          url: "https://example.test/invoked",
+          finalUrl: "https://redirect.test/final",
+          status: 200,
+          contentType: "text/plain",
+          truncated: false,
+        },
+      },
+      invocation: "https://example.test/invoked",
+      hidden: "registered fetch body",
+    },
+    {
+      name: "WebSearch",
+      args: { query: "registered query" },
+      result: {
+        content: [{ type: "text", text: "registered search title and snippet" }],
+        details: { query: "registered query", backend: "brave", resultCount: 1, truncated: false },
+      },
+      invocation: "registered query",
+      hidden: "registered search title",
+    },
+  ])("compactly renders registered $name without changing canonical payloads", ({ name, args, result, invocation, hidden }) => {
+    const tool = pi.tools.get(name);
+    const argsBefore = structuredClone(args);
+    const resultBefore = structuredClone(result);
+    expect(tool.renderCall(args, undefined, { args }).render(80)).toEqual([]);
+    const lines = tool.renderResult(
+      result,
+      { expanded: false, isPartial: false },
+      undefined,
+      { args, isError: false },
+    ).render(80) as string[];
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(invocation);
+    expect(lines.join("\n")).not.toContain(hidden);
+    expect(args).toEqual(argsBefore);
+    expect(result).toEqual(resultBefore);
+  });
+
   it("installs collapse only on main-session tool definitions", async () => {
     for (const name of ["read", "write", "edit", "MultiEdit", "bash"]) {
       expect(pi.tools.get(name).renderShell, name).toBe("self");
