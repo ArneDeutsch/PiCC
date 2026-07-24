@@ -25,4 +25,8 @@ For a normal existing consumer, independently confirm that it belongs to the ver
 
 Do not infer authority when containment, platform representation, path kind, symlink behavior, aliasing, or the required operation is ambiguous. Record the candidate as unresolved in the inventory and escalate it during planning; never silently omit it or turn it into a writable path. Carry the classified, verified inventory into the integrated technical picture for Phase 5; do not create a separate inventory artifact or task-template section.
 
+## Intentional behavior-pin discovery
+
+Whenever the agreed technical picture intentionally changes behavior, identify known tests, fixtures, snapshots, and assertions that directly pin that behavior. This applies beyond removals and renames, including additive behavior changes, but it is a bounded direct-pin search—not an exhaustive consumer inventory for every additive change. Independently verify each candidate's direct relationship to the changed behavior and its exact coordinator-worktree path under the same locator-provenance, containment, alias, symlink, and ambiguity safeguards above. Carry verified direct pins and their expected behavioral delta into Phase 5; keep uncertain candidates unresolved rather than inferring authority.
+
 Decide what you can; escalate to the user only what is direction-deciding. Small technical questions: batch them rather than interrupting repeatedly.
