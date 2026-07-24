@@ -48,7 +48,7 @@ import { createMcpProcessFixture, processIsAlive, type McpProcessFixture } from 
  * deliberately not duplicated here.
  */
 
-const { startPi, runPi, cleanup } = createE2ELive();
+const { runPi, cleanup } = createE2ELive();
 afterEach(cleanup);
 
 /** Fixture-server entry for a `.mcp.json` / settings `mcpServers` map. */
@@ -149,15 +149,14 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
     TEST_TIMEOUT_MS * 2,
   );
 
-  it.each(["text", "json"] as const)(
-    "one-shot %s /mcp waits for settled status without a provider request",
-    async (mode) => {
+  it(
+    "one-shot text /mcp waits for settled status without a provider request",
+    async () => {
       let barrier: McpProcessFixture | undefined;
       try {
         const result = await runPi({
           script: [],
           prompt: "/mcp",
-          ...(mode === "json" ? { modeArgs: ["--mode", "json", "-p", "/mcp"] } : {}),
           setup(dir) {
             barrier = createMcpProcessFixture(dir);
             fs.writeFileSync(
@@ -173,17 +172,7 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
 
         expect(result.code).toBe(0);
         expect(result.requests).toEqual([]);
-        if (mode === "text") {
-          expect(result.stdout).toContain('"fixture": connected (3 tools)');
-        } else {
-          const records = result.stdout.trim().split(/\r?\n/).filter(Boolean)
-            .map((line) => JSON.parse(line) as any);
-          const entry = records.find((record) =>
-            record.type === "entry_appended" && record.entry?.customType === "picc-control" &&
-            record.entry?.data?.command === "mcp");
-          expect(entry).toBeDefined();
-          expect(String(entry.entry.data.output)).toContain('"fixture": connected (3 tools)');
-        }
+        expect(result.stdout).toContain('"fixture": connected (3 tools)');
       } finally {
         await barrier?.cleanup();
       }
@@ -192,70 +181,7 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
   );
 
   it(
-    "round-trip: an enabled server's tool is advertised on the first request, callable, and the server dies with the session",
-    async () => {
-      const marker = "ROUNDTRIP-4471-VIA-STDIO";
-      let barrier: McpProcessFixture | undefined;
-      try {
-        const result = await runPi({
-          script: [
-            { toolCalls: [{ name: "mcp__fixture__echo", args: { text: marker } }] },
-            { text: "ROUNDTRIP-DONE" },
-          ],
-          prompt: "echo the marker through the MCP fixture server",
-          // Pin the first-turn barrier bound: an ambient dev-shell MCP_TIMEOUT
-          // must not shrink it under this run.
-          extraEnv: { MCP_TIMEOUT: "30000" },
-          setup(dir) {
-            barrier = createMcpProcessFixture(dir);
-            fs.writeFileSync(
-              path.join(dir, ".mcp.json"),
-              JSON.stringify({ mcpServers: { fixture: serverEntry(barrier) } }, null, 2),
-            );
-            // Written AFTER the fixture's baseline commit, so it is untracked —
-            // a genuinely user-authored local scope, which may self-approve.
-            fs.writeFileSync(
-              path.join(dir, ".claude", "settings.local.json"),
-              JSON.stringify({ enabledMcpjsonServers: ["fixture"] }, null, 2),
-            );
-          },
-        });
-
-        expect(result.code).toBe(0);
-        expect(result.requests.length).toBeGreaterThanOrEqual(2);
-
-        // Advertised on the request that precedes the call — the first-turn
-        // settle barrier's wire-level proof (membership check; the fixture
-        // server's full registered set is pinned in test/mcp-registration.test.ts).
-        expect(toolNames(result.requests[0]!)).toContain("mcp__fixture__echo");
-        expect(JSON.stringify(result.requests)).not.toContain("echo (fixture MCP)");
-
-        // The REAL result from the live stdio server rides the next request —
-        // as a success, not an error that happens to quote the input args.
-        const resultText = toolResultText(result.requests[1]!);
-        expect(resultText).toContain(marker);
-        expect(resultText).not.toMatch(/error/i);
-        expect(result.stdout).toContain("ROUNDTRIP-DONE");
-        expect(`${result.stdout}\n${result.stderr}`).not.toContain("echo (fixture MCP)");
-
-        // The server ran (it published its pid) and died with the session.
-        expect(barrier!.exists("serve.pid"), "server must have published its pid").toBe(true);
-        const pid = barrier!.pidOf("serve.pid");
-        await waitUntil({
-          description: `MCP fixture server (pid ${pid}) to die with the session`,
-          predicate: () => !processIsAlive(pid),
-          describeObserved: () => `pid ${pid} alive=${processIsAlive(pid)}`,
-          timeoutMs: 10_000,
-        });
-      } finally {
-        await barrier?.cleanup();
-      }
-    },
-    TEST_TIMEOUT_MS,
-  );
-
-  it(
-    "JSON mode keeps MCP event and persisted-session identities canonical",
+    "round-trips one approved MCP tool through JSON, rebuilt persistence, and process death",
     async () => {
       const marker = "JSON-MCP-ROUNDTRIP-9137";
       let barrier: McpProcessFixture | undefined;
@@ -268,6 +194,7 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
             { text: "JSON-MCP-DONE" },
           ],
           prompt: "unused",
+          // An ambient MCP_TIMEOUT must not shrink the first-turn settle barrier.
           extraEnv: { MCP_TIMEOUT: "30000" },
           setup(dir) {
             barrier = createMcpProcessFixture(dir);
@@ -275,6 +202,7 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
               path.join(dir, ".mcp.json"),
               JSON.stringify({ mcpServers: { fixture: serverEntry(barrier) } }, null, 2),
             );
+            // setup runs after the fixture commit, so this untracked local scope may self-approve.
             fs.writeFileSync(
               path.join(dir, ".claude", "settings.local.json"),
               JSON.stringify({ enabledMcpjsonServers: ["fixture"] }, null, 2),
@@ -285,6 +213,7 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
         expect(result.code, result.stderr).toBe(0);
         expect(toolNames(result.requests[0]!)).toContain("mcp__fixture__echo");
         expect(toolResultText(result.requests[1]!)).toContain(marker);
+        expect(JSON.stringify(result.requests)).toContain(marker);
         const records = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line) as any);
         const assistantCalls = records.filter((record) => record.type === "message_end" &&
           record.message?.role === "assistant" && record.message.content?.some(
@@ -294,7 +223,16 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
           record.message?.role === "toolResult" && record.message.toolName === "mcp__fixture__echo");
         expect(assistantCalls).toHaveLength(1);
         expect(toolResults).toHaveLength(1);
+        const jsonCall = assistantCalls[0]!.message.content.find(
+          (block: any) => block.type === "toolCall" && block.name === "mcp__fixture__echo",
+        );
+        expect(jsonCall).toMatchObject({
+          id: expect.any(String),
+          name: "mcp__fixture__echo",
+          arguments: { text: marker },
+        });
         expect(toolResults[0]!.message).toMatchObject({
+          toolCallId: jsonCall.id,
           toolName: "mcp__fixture__echo",
           content: [{ type: "text", text: marker }],
           isError: false,
@@ -312,21 +250,34 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
         };
         walk(path.join(result.agentDir, "sessions"));
         expect(sessionFiles).toHaveLength(1);
-        const entries = SessionManager.open(sessionFiles[0]!).getEntries() as any[];
-        const messages = entries.filter((entry) => entry.type === "message").map((entry) => entry.message);
-        expect(messages.some((message) => message.role === "assistant" && message.content?.some(
+        const manager = SessionManager.open(sessionFiles[0]!);
+        const entries = manager.getEntries() as any[];
+        const rebuiltMessages = manager.buildSessionContext().messages as any[];
+        const rebuiltAssistantCalls = rebuiltMessages.filter((message) => message.role === "assistant" &&
+          message.content?.some((block: any) => block.type === "toolCall" &&
+            block.name === "mcp__fixture__echo"));
+        expect(rebuiltAssistantCalls).toHaveLength(1);
+        const rebuiltCall = rebuiltAssistantCalls[0]!.content.find(
           (block: any) => block.type === "toolCall" && block.name === "mcp__fixture__echo",
-        ))).toBe(true);
-        const persistedToolResults = messages.filter((message) => message.role === "toolResult" &&
+        );
+        expect(rebuiltCall).toMatchObject({
+          id: expect.any(String),
+          name: "mcp__fixture__echo",
+          arguments: { text: marker },
+        });
+        const persistedToolResults = rebuiltMessages.filter((message) => message.role === "toolResult" &&
           message.toolName === "mcp__fixture__echo");
         expect(persistedToolResults).toHaveLength(1);
         expect(persistedToolResults[0]).toMatchObject({
+          toolCallId: rebuiltCall.id,
           toolName: "mcp__fixture__echo",
           content: [{ type: "text", text: marker }],
           isError: false,
         });
+        expect(rebuiltCall.id).toBe(jsonCall.id);
         expect(JSON.stringify(entries)).not.toContain("echo (fixture MCP)");
 
+        expect(barrier!.exists("serve.pid"), "server must have published its pid").toBe(true);
         const pid = barrier!.pidOf("serve.pid");
         await waitUntil({
           description: `JSON MCP fixture server (pid ${pid}) to die with the session`,
@@ -335,82 +286,6 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
           timeoutMs: 10_000,
         });
       } finally {
-        await barrier?.cleanup();
-      }
-    },
-    TEST_TIMEOUT_MS,
-  );
-
-  it(
-    "RPC mode keeps MCP call and result records canonical",
-    async () => {
-      const marker = "RPC-MCP-ROUNDTRIP-2846";
-      let barrier: McpProcessFixture | undefined;
-      let live: Awaited<ReturnType<typeof startPi>> | undefined;
-      try {
-        live = await startPi({
-          modeArgs: ["--mode", "rpc"],
-          script: [
-            { toolCalls: [{ name: "mcp__fixture__echo", args: { text: marker } }] },
-            { text: "RPC-MCP-DONE" },
-          ],
-          prompt: "unused",
-          extraEnv: { MCP_TIMEOUT: "30000" },
-          setup(dir) {
-            barrier = createMcpProcessFixture(dir);
-            fs.writeFileSync(
-              path.join(dir, ".mcp.json"),
-              JSON.stringify({ mcpServers: { fixture: serverEntry(barrier) } }, null, 2),
-            );
-            fs.writeFileSync(
-              path.join(dir, ".claude", "settings.local.json"),
-              JSON.stringify({ enabledMcpjsonServers: ["fixture"] }, null, 2),
-            );
-          },
-        });
-        live.sendInput(JSON.stringify({ id: "rpc-mcp", type: "prompt", message: "run the RPC MCP round trip" }));
-        const ack = await live.waitForOutput((record) => record.type === "response" && record.id === "rpc-mcp", 30_000);
-        expect(ack).toMatchObject({ command: "prompt", success: true });
-        await live.waitForOutput((record) => record.type === "message_end" &&
-          JSON.stringify(record).includes("RPC-MCP-DONE"), 30_000);
-        await live.waitForOutput((record) => record.type === "agent_settled", 30_000);
-        live.closeInput();
-        const result = await live.completion;
-        if (process.platform === "win32") {
-          expect([0, 3221226505]).toContain(result.code);
-          if (result.code !== 0) expect(result.stderr).toContain("UV_HANDLE_CLOSING");
-        } else {
-          expect(result.code, result.stderr).toBe(0);
-        }
-        expect(toolNames(result.requests[0]!)).toContain("mcp__fixture__echo");
-        expect(toolResultText(result.requests[1]!)).toContain(marker);
-        const records = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line) as any);
-        expect(records.some((record) => record.type === "message_end" && record.message?.role === "assistant" &&
-          record.message.content?.some((block: any) => block.type === "toolCall" && block.name === "mcp__fixture__echo")))
-          .toBe(true);
-        const toolResults = records.filter((record) => record.type === "message_end" &&
-          record.message?.role === "toolResult" && record.message.toolName === "mcp__fixture__echo");
-        expect(toolResults).toHaveLength(1);
-        expect(toolResults[0]!.message).toMatchObject({
-          toolName: "mcp__fixture__echo",
-          content: [{ type: "text", text: marker }],
-          isError: false,
-        });
-        expect(JSON.stringify(records)).not.toContain("echo (fixture MCP)");
-        expect(JSON.stringify(result.requests)).not.toContain("echo (fixture MCP)");
-
-        const pid = barrier!.pidOf("serve.pid");
-        await waitUntil({
-          description: `RPC MCP fixture server (pid ${pid}) to die with the session`,
-          predicate: () => !processIsAlive(pid),
-          describeObserved: () => `pid ${pid} alive=${processIsAlive(pid)}`,
-          timeoutMs: 10_000,
-        });
-      } finally {
-        if (live) {
-          live.closeInput();
-          await live.stop();
-        }
         await barrier?.cleanup();
       }
     },

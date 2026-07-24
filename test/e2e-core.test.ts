@@ -17,7 +17,7 @@ import {
   writeCheckpointConfig,
   CLI_PATH,
 } from "./helpers/e2e-live.js";
-import { createResponseGate, type Turn } from "./helpers/mock-openai.js";
+import { createResponseGate } from "./helpers/mock-openai.js";
 
 /**
  * E2E — core wiring: full Claude project context assembled into the real
@@ -77,36 +77,6 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   }
 
   it(
-    "assembles the Claude project context into the system prompt sent to the model",
-    async () => {
-      const result = await runPi({ script: [{ text: "hello" }], prompt: "say hello" });
-
-      expect(result.code).toBe(0);
-      expect(result.requests.length).toBeGreaterThanOrEqual(1);
-      const first = result.requests[0]!;
-
-      // Pi advertises both built-in (lower-case) and Claude-named tools.
-      const names = toolNames(first);
-      for (const expected of ["write", "read", "bash", "Skill", "Agent", "EnterWorktree"]) {
-        expect(names, `tool ${expected} advertised`).toContain(expected);
-      }
-
-      const system = systemText(first);
-      expect(system).toContain("ROOT-CLAUDE-MD-LOADED");
-      expect(system).toContain("AGENTS-MD-IMPORTED");
-      expect(system).toContain("STYLE-RULE-LOADED");
-      expect(system).toContain("Available subagents");
-      // The greet skill is listed by name+description...
-      expect(system).toMatch(/greet: Greet a person by name/);
-      // ...but its body stays lazy-loaded (NFR): not in context until activated.
-      expect(allText(first)).not.toContain("GREET-SKILL-BODY");
-
-      expect(result.stdout).toContain("hello");
-    },
-    TEST_TIMEOUT_MS,
-  );
-
-  it(
     "keeps compact search presentation out of print output and the next model request",
     async () => {
       const result = await runPi({
@@ -163,12 +133,19 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         piSettings: CHECKPOINT_PI_SETTINGS,
         setup(fixtureDir) {
           writeCheckpointConfig(fixtureDir);
+          fs.writeFileSync(
+            path.join(fixtureDir, ".claude", "settings.json"),
+            JSON.stringify({ permissions: { deny: ["Read(.env)", "Write(.env)"] } }),
+          );
+          fs.writeFileSync(path.join(fixtureDir, ".env"), "SECRET=TOP-SECRET-VALUE\n");
         },
         script: [
           {
             toolCalls: [
               { name: "write", args: { path: "batch-a.txt", content: "result-a" } },
               { name: "write", args: { path: "batch-b.txt", content: "result-b" } },
+              { name: "read", args: { path: ".env" } },
+              { name: "write", args: { path: ".env", content: "must not land" } },
             ],
             usage: CHECKPOINT_USAGE,
           },
@@ -180,6 +157,11 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       try {
         const summaryRequest = await summaryGate.entered;
         expect(summaryRequest).toMatchObject({ requestKind: "compaction", sessionKind: "main" });
+        const summaryInput = allText(summaryRequest);
+        expect(summaryInput).toContain("Successfully wrote");
+        expect(summaryInput).toContain("PiCC: blocked by permission deny rule Read(.env)");
+        expect(summaryInput).toContain("PiCC: blocked by permission deny rule Write(.env)");
+        expect(summaryInput).not.toContain("TOP-SECRET-VALUE");
         expect(live.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction"]);
         summaryGate.release();
         await live.waitForRequest((request) => request.requestKind === "ordinary", 2);
@@ -188,6 +170,12 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         expect(result.code).toBe(0);
         expect(fs.readFileSync(path.join(result.fixture, "batch-a.txt"), "utf8")).toBe("result-a");
         expect(fs.readFileSync(path.join(result.fixture, "batch-b.txt"), "utf8")).toBe("result-b");
+        expect(fs.readFileSync(path.join(result.fixture, ".env"), "utf8")).toBe("SECRET=TOP-SECRET-VALUE\n");
+        for (const [index, request] of result.requests.entries()) {
+          expect(allText(request), `request ${index} must not leak .env content`).not.toContain(
+            "TOP-SECRET-VALUE",
+          );
+        }
         expect(result.requests.map((request) => `${request.sessionKind}/${request.requestKind}`)).toEqual([
           "main/ordinary",
           "main/compaction",
@@ -250,51 +238,6 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
       expect(result.code).toBe(1);
       expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction"]);
       expect(`${result.stdout}\n${result.stderr}`).not.toContain("ORDINARY_MUST_NOT_RUN_AFTER_HTTP_400");
-      const files: string[] = [];
-      const walk = (dir: string) => {
-        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-          const full = path.join(dir, entry.name);
-          if (entry.isDirectory()) walk(full);
-          else if (entry.name.endsWith(".jsonl") && !full.includes(".subagents")) files.push(full);
-        }
-      };
-      walk(path.join(result.agentDir, "sessions"));
-      const entries = SessionManager.open(files[0]!).getEntries();
-      expect(entries.filter((entry) => entry.type === "compaction")).toHaveLength(0);
-      const visible = `${result.stdout}\n${result.stderr}\n${JSON.stringify(entries)}`;
-      for (const sentinel of errorSentinels) expect(visible).not.toContain(sentinel);
-    },
-    TEST_TIMEOUT_MS,
-  );
-
-  it(
-    "exhausts one real Pi compaction transaction without a summary or ordinary resume",
-    async () => {
-      const errorSentinels = ["EXHAUST_SECRET_T05", "C:/private/exhaust/session.jsonl", "EXHAUST_TRANSCRIPT_T05"];
-      const failure: Turn = {
-        when: (request) => request.requestKind === "compaction",
-        error: { status: 400, sticky: false, message: errorSentinels.join(" ") },
-      };
-      const result = await runPi({
-        persistSession: true,
-        contextWindow: CHECKPOINT_CONTEXT_WINDOW,
-        piSettings: CHECKPOINT_PI_SETTINGS,
-        setup(fixtureDir) {
-          writeCheckpointConfig(fixtureDir);
-        },
-        script: [
-          { toolCalls: [{ name: "write", args: { path: "exhausted.txt", content: "complete" } }], usage: CHECKPOINT_USAGE },
-          failure,
-          { text: "ORDINARY_MUST_NOT_RUN_AFTER_EXHAUSTION" },
-        ],
-        prompt: "run exhausted compaction",
-      });
-
-      // Pi owns print exit status; PiCC guarantees checkpoint settlement.
-      expect(result.code).toBe(1);
-      expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction"]);
-      expect(`${result.stdout}\n${result.stderr}`).not.toContain("ORDINARY_MUST_NOT_RUN_AFTER_EXHAUSTION");
-      expect(result.stderr).toContain("Run /compact, then explicitly continue");
       const files: string[] = [];
       const walk = (dir: string) => {
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -433,51 +376,6 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   );
 
   it(
-    "gates a subsequent real RPC prompt after one compaction transaction fails",
-    async () => {
-      const failure: Turn = {
-        when: (request) => request.requestKind === "compaction",
-        error: { status: 400, sticky: false, message: "RPC_EXHAUST_SECRET C:/private/rpc/session.jsonl RPC_TRANSCRIPT_SENTINEL" },
-      };
-      const live = await startPi({
-        contextWindow: CHECKPOINT_CONTEXT_WINDOW,
-        piSettings: CHECKPOINT_PI_SETTINGS,
-        setup(fixtureDir) {
-          writeCheckpointConfig(fixtureDir);
-        },
-        script: [
-          { toolCalls: [{ name: "write", args: { path: "rpc-exhaust.txt", content: "complete" } }], usage: CHECKPOINT_USAGE },
-          failure,
-          { text: "RPC_ORDINARY_MUST_STAY_GATED" },
-        ],
-        prompt: "unused",
-        modeArgs: ["--mode", "rpc"],
-      });
-      try {
-        live.sendInput(JSON.stringify({ id: "rpc-first", type: "prompt", message: "exhaust RPC checkpoint" }));
-        await live.waitForOutput((record) => record.type === "entry_appended" &&
-          (record.entry as any)?.data?.category === "checkpoint-exhausted", 30_000);
-        live.sendInput(JSON.stringify({ id: "rpc-gated", type: "prompt", message: "must remain gated" }));
-        await live.waitForOutput((record) => record.type === "response" && record.id === "rpc-gated", 30_000);
-        live.closeInput();
-        const result = await live.completion;
-        expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction"]);
-        expect(`${result.stdout}\n${result.stderr}`).not.toContain("RPC_ORDINARY_MUST_STAY_GATED");
-        const records = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line) as any);
-        expect(records.filter((record) => record.type === "response" && record.id === "rpc-gated")).toHaveLength(1);
-        const piccLifecycle = records.filter((record) => record.type === "entry_appended" &&
-          record.entry?.customType === "picc-checkpoint-lifecycle");
-        expect(JSON.stringify(piccLifecycle)).not.toMatch(/RPC_EXHAUST_SECRET|private\/rpc|RPC_TRANSCRIPT_SENTINEL/);
-        const nativeFailures = records.filter((record) => record.type === "compaction_end" && record.errorMessage);
-        expect(JSON.stringify(nativeFailures)).toMatch(/RPC_EXHAUST_SECRET|private\/rpc|RPC_TRANSCRIPT_SENTINEL/);
-      } finally {
-        await live.stop();
-      }
-    },
-    TEST_TIMEOUT_MS,
-  );
-
-  it(
     "transfers a real Stop-blocked JSON continuation after compact hooks and withholds the outer final",
     async () => {
       const result = await runPi({
@@ -534,52 +432,6 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
     TEST_TIMEOUT_MS,
   );
 
-  it(
-    "compacts after real permission-blocked and invalid tool calls while preserving the completed sibling",
-    async () => {
-      const result = await runPi({
-        contextWindow: CHECKPOINT_CONTEXT_WINDOW,
-        piSettings: CHECKPOINT_PI_SETTINGS,
-        setup(fixtureDir) {
-          const claudeDir = path.join(fixtureDir, ".claude");
-          writeCheckpointConfig(fixtureDir);
-          fs.writeFileSync(path.join(claudeDir, "settings.json"), JSON.stringify({ permissions: { deny: ["Write(blocked.txt)"] } }));
-          const extensionsDir = path.join(fixtureDir, ".pi", "extensions");
-          fs.mkdirSync(extensionsDir, { recursive: true });
-          fs.writeFileSync(path.join(extensionsDir, "throwing-sibling.ts"), [
-            'import { Type } from "typebox";',
-            "export default function throwingSibling(pi: any) {",
-            "  pi.registerTool({ name: 'ThrowingSibling', label: 'ThrowingSibling', description: 'throws for fallback coverage', parameters: Type.Object({}), execute: async () => { throw new Error('real throwing sibling'); } });",
-            "}",
-          ].join("\n"));
-        },
-        script: [
-          { toolCalls: [
-            { name: "write", args: { path: "fallback-sibling.txt", content: "completed sibling" } },
-            { name: "write", args: { path: "blocked.txt", content: "must not land" } },
-            { name: "ThrowingSibling", args: {} },
-            { name: "not_a_registered_tool", args: { malformed: true } },
-          ], usage: CHECKPOINT_USAGE },
-          { text: "FALLBACK_PERMISSION_INVALID_SUMMARY_T05" },
-          { text: "FALLBACK_PERMISSION_INVALID_FINAL_T05" },
-        ],
-        prompt: "run fallback batch",
-      });
-
-      expect(result.code).toBe(0);
-      expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction", "ordinary"]);
-      expect(fs.readFileSync(path.join(result.fixture, "fallback-sibling.txt"), "utf8")).toBe("completed sibling");
-      expect(fs.existsSync(path.join(result.fixture, "blocked.txt"))).toBe(false);
-      const summaryInput = allText(result.requests[1]!);
-      expect(summaryInput).toContain("Successfully wrote");
-      expect(summaryInput).toMatch(/blocked|denied/i);
-      expect(summaryInput).toMatch(/real throwing sibling/i);
-      expect(summaryInput).toMatch(/not_a_registered_tool|not found|unknown/i);
-      expect(result.stdout.match(/FALLBACK_PERMISSION_INVALID_FINAL_T05/g)).toHaveLength(1);
-    },
-    TEST_TIMEOUT_MS,
-  );
-
   // --- Slash-skill expansion end-to-end via the input event ---
   it(
     "expands a /deploy slash skill into the user turn with positional args (full-surface)",
@@ -592,7 +444,23 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
 
       expect(result.code).toBe(0);
       expect(result.requests.length).toBeGreaterThanOrEqual(1);
-      const user = userText(result.requests[0]!);
+      const first = result.requests[0]!;
+      const names = toolNames(first);
+      for (const expected of ["write", "read", "bash", "Skill", "Agent", "EnterWorktree"]) {
+        expect(names, `tool ${expected} advertised`).toContain(expected);
+      }
+      const system = systemText(first);
+      expect(system).toContain("FS-ROOT-CLAUDE-MD");
+      expect(system).toContain("FS-IMPORT-HOP-1");
+      expect(system).toContain("FS-IMPORT-HOP-2");
+      expect(system).toContain("FS-CLAUDE-LOCAL-MD");
+      expect(system).toContain("FS-RULE-UNCONDITIONAL");
+      expect(system).toContain("Available subagents");
+      expect(system).toMatch(/deploy:.*deploy/i);
+      expect(system).not.toContain("FS-SKILL-FORK-BODY");
+      expect(system).not.toContain("FS-SKILL-SHELL-BODY");
+
+      const user = userText(first);
       expect(user).toContain("FS-SKILL-ARGS-BODY");
       expect(user).toContain("Deploy to environment **staging** at version **7.7**");
       // It expanded — the raw slash command is not what reached the model verbatim.

@@ -305,15 +305,37 @@ describe.skipIf(cliMissing)(
         expect(new Set(toolNames(parentFirst!))).toEqual(new Set(eagerParentTools));
         expect(new Set(toolNames(childFirst!))).toEqual(new Set(eagerChildTools));
 
+        const trailerRe = /\[agent (agent-[0-9a-f]{12}) completed — resumable via SendMessage\]/;
+        const withTrailer = result.requests.find((request) => trailerRe.test(toolResultText(request)));
+        expect(withTrailer, "parent must receive the explicit-model child's agent-ID trailer").toBeDefined();
+        const trailerText = toolResultText(withTrailer!);
+        expect(trailerText).toContain("EXPLICIT-CHILD-MODEL-DONE");
+        const agentId = trailerRe.exec(trailerText)![1]!;
+
+        const sessionsRoot = path.join(result.agentDir, "sessions");
+        const mainFiles: string[] = [];
         const transcriptText: string[] = [];
-        const collectTranscripts = (dir: string) => {
+        const collectTranscripts = (dir: string): void => {
           for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
             const full = path.join(dir, entry.name);
             if (entry.isDirectory()) collectTranscripts(full);
-            else if (entry.name.endsWith(".jsonl")) transcriptText.push(fs.readFileSync(full, "utf8"));
+            else if (entry.name.endsWith(".jsonl")) {
+              transcriptText.push(fs.readFileSync(full, "utf8"));
+              if (!dir.endsWith(".subagents")) mainFiles.push(full);
+            }
           }
         };
-        collectTranscripts(path.join(result.agentDir, "sessions"));
+        collectTranscripts(sessionsRoot);
+        expect(mainFiles).toHaveLength(1);
+        const resolved = resolveSubagentTranscript(mainFiles[0]!, agentId);
+        expect(resolved, "resolver must map the delivered agent ID to the child transcript").toBeDefined();
+        expect(fs.readFileSync(resolved!, "utf8")).toContain("EXPLICIT-CHILD-MODEL-DONE");
+        const reopened = SessionManager.open(resolved!);
+        expect(reopened.getSessionId()).toBe(agentId);
+        const restored = JSON.stringify(reopened.buildSessionContext().messages);
+        expect(restored).toContain("verify the explicit model boundary");
+        expect(restored).toContain("EXPLICIT-CHILD-MODEL-DONE");
+
         const persistedTranscripts = transcriptText.join("\n");
         for (const credentialCanary of credentialCanaries) {
           expect(result.stdout).not.toContain(credentialCanary);
@@ -331,59 +353,10 @@ describe.skipIf(cliMissing)(
 
     // --- Scenario: run_in_background + TaskOutput retrieval ---
     it(
-      "keeps structured background output attached to one valid TaskOutput call",
+      "retrieves structured background output, rejects malformed TaskOutput, and continues safely",
       async () => {
-        // The child and the parent's continuation can reach the mock concurrently,
-        // so routing is pinned to the real request shape rather than script order.
-        const isExplore = (r: CapturedRequest) =>
-          systemText(r).includes("read-only exploration agent");
-        const isParent = (r: CapturedRequest) => !isExplore(r);
-        const result = await runPi({
-          script: [
-            {
-              toolCalls: [{
-                name: "Agent",
-                args: {
-                  subagent_type: "Explore",
-                  prompt: "return the structured review result",
-                  run_in_background: true,
-                },
-              }],
-            },
-            { when: isExplore, text: STRUCTURED_SUBAGENT_RESULT },
-            { when: isParent, toolCalls: [{ name: "TaskOutput", args: { task_id: "task-1" } }] },
-            { when: isParent, text: "background retrieved" },
-          ],
-          prompt: "explore in the background",
-        });
-
-        expect(result.code).toBe(0);
-        const startResult = result.requests.find((r) =>
-          /Background task task-\d+ accepted/.test(toolResultText(r)),
-        );
-        expect(startResult, "expected the immediate background-acceptance tool result").toBeDefined();
-
-        const taskOutputCalls = uniqueAssistantToolCalls(result.requests, "TaskOutput");
-        expect(taskOutputCalls).toHaveLength(1);
-        expect(JSON.parse(taskOutputCalls[0]!.arguments)).toEqual({ task_id: "task-1" });
-        const parentHistory = cumulativeParentHistory(result.requests, [taskOutputCalls[0]!.id]);
-        const [exchange] = orderedToolExchanges(parentHistory, "TaskOutput");
-        expect(exchange!.call).toEqual(taskOutputCalls[0]);
-        expectStructuredTaskOutputResult(exchange!.result);
-
-        expect(result.stdout).toContain("background retrieved");
-        // Print mode does not run TUI renderers, so TUI-only completion-record markers
-        // must not enter canonical print output.
-        expect(result.stdout).not.toContain(RECORD_EXPAND_HINT);
-        expect(result.stdout).not.toContain(RECORD_FORK_MARKER);
-        expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|unhandledRejection|FATAL/i);
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    it(
-      "rejects a distinct malformed provider TaskOutput call after structured result delivery",
-      async () => {
+        // Child completion and the parent's continuation can reach the mock
+        // concurrently, so route by real request shape rather than script order.
         const isExplore = (r: CapturedRequest) =>
           systemText(r).includes("read-only exploration agent");
         const isParent = (r: CapturedRequest) => !isExplore(r);
@@ -413,6 +386,10 @@ describe.skipIf(cliMissing)(
         });
 
         expect(result.code).toBe(0);
+        const startResult = result.requests.find((request) =>
+          /Background task task-\d+ accepted/.test(toolResultText(request)),
+        );
+        expect(startResult, "expected the immediate background-acceptance tool result").toBeDefined();
         const calls = uniqueAssistantToolCalls(result.requests, "TaskOutput");
         expect(calls).toHaveLength(2);
         const valid = calls.find((call) => "task_id" in (JSON.parse(call.arguments) as Record<string, unknown>));
@@ -435,8 +412,11 @@ describe.skipIf(cliMissing)(
         expect(malformedExchange.result).toContain('Validation failed for tool "TaskOutput"');
         expect(malformedExchange.result).toMatch(/(?:task_id.*(?:required|missing)|(?:required|missing).*task_id)/is);
         expect(malformedExchange.result).not.toMatch(/Unknown task_id|task-structured-canary/);
-        // The validation result is model-visible in parentHistory; stdout only proves the loop continued.
+        // The validation result is model-visible in parentHistory; stdout proves safe continuation.
         expect(result.stdout).toContain("malformed call rejected");
+        expect(result.stdout).not.toContain(RECORD_EXPAND_HINT);
+        expect(result.stdout).not.toContain(RECORD_FORK_MARKER);
+        expect(result.stderr).not.toMatch(/UnhandledPromiseRejection|unhandledRejection|FATAL/i);
       },
       TEST_TIMEOUT_MS,
     );
@@ -552,9 +532,9 @@ describe.skipIf(cliMissing)(
       TEST_TIMEOUT_MS,
     );
 
-    // --- Scenario 13 (E2E-4): subagent with isolation: worktree writes only in ITS worktree ---
+    // --- Frontmatter worktree isolation, write placement, and Bash environment ---
     it.skipIf(!BASH_AVAILABLE)(
-      "dispatches the iso-writer agent into its own worktree and keeps the main tree clean",
+      "keeps an isolated worker's writes and real Bash environment inside its frontmatter worktree",
       async () => {
         const result = await runPi({
           fixture: "full-surface",
@@ -567,7 +547,7 @@ describe.skipIf(cliMissing)(
                 {
                   name: "Agent",
                   args: {
-                    subagent_type: "iso-writer",
+                    subagent_type: "isolated-worker",
                     prompt: "create out.txt with the canary",
                     run_in_background: false,
                   },
@@ -576,25 +556,34 @@ describe.skipIf(cliMissing)(
             },
             // 1) the subagent (own session, cwd = its worktree) writes the file
             { toolCalls: [{ name: "write", args: { path: "out.txt", content: "ISO-WT-CONTENT" } }] },
-            // 2) the subagent's final answer
+            // 2) the same isolated child crosses the real model → Bash boundary.
+            {
+              toolCalls: [{
+                name: "bash",
+                args: {
+                  command: 'echo "FSVAR=[$FS_FIXTURE]"; echo "PROJDIR=[$CLAUDE_PROJECT_DIR]"; echo "CWD=[$(pwd)]"',
+                },
+              }],
+            },
+            // 3) the subagent's final answer
             { text: "DONE-ISO" },
-            // 3) orchestrator's follow-up
+            // 4) orchestrator's follow-up
             { text: "isolation verified" },
           ],
-          prompt: "have iso-writer create out.txt",
+          prompt: "have isolated-worker create out.txt",
         });
 
         expect(result.code).toBe(0);
         // The file exists inside the agent's worktree...
         const worktreesRoot = path.join(result.fixture, ".claude", "worktrees");
         const isoDirs = fs.existsSync(worktreesRoot)
-          ? fs.readdirSync(worktreesRoot).filter((n) => n.startsWith("agent-iso-writer-"))
+          ? fs.readdirSync(worktreesRoot).filter((n) => n.startsWith("agent-isolated-worker-"))
           : [];
-        expect(isoDirs.length, `expected an agent-iso-writer-* worktree under ${worktreesRoot}`).toBeGreaterThanOrEqual(1);
+        expect(isoDirs.length, `expected an agent-isolated-worker-* worktree under ${worktreesRoot}`).toBeGreaterThanOrEqual(1);
         const outInWorktree = isoDirs
           .map((n) => path.join(worktreesRoot, n, "out.txt"))
           .filter((p) => fs.existsSync(p));
-        expect(outInWorktree.length, "out.txt must exist in the iso-writer worktree").toBeGreaterThanOrEqual(1);
+        expect(outInWorktree.length, "out.txt must exist in the isolated-worker worktree").toBeGreaterThanOrEqual(1);
         expect(fs.readFileSync(outInWorktree[0]!, "utf8")).toBe("ISO-WT-CONTENT");
         // ...and NOT at the fixture root (isolation held).
         expect(fs.existsSync(path.join(result.fixture, "out.txt"))).toBe(false);
@@ -603,83 +592,29 @@ describe.skipIf(cliMissing)(
         const worktreeList = execFileSync("git", ["-C", result.fixture, "worktree", "list"], {
           encoding: "utf8",
         });
-        expect(worktreeList).toContain("agent-iso-writer-");
+        expect(worktreeList).toContain("agent-isolated-worker-");
+
+        const bashResult = result.requests
+          .map((request) => toolResultText(request))
+          .find((text) => /FSVAR=\[full-surface\]/.test(text));
+        expect(bashResult, "parent history must retain the isolated Bash result").toBeDefined();
+        expect(bashResult).toMatch(/CWD=\[[^\]]+\]/);
+        expect(bashResult).toMatch(/PROJDIR=\[[^\]]+\]/);
+        expect(bashResult).not.toMatch(/\b\d+ (?:output |command )?lines? hidden\b/iu);
+        expect(bashResult).not.toMatch(/\bto expand\b/iu);
+        const bashCwd = firstGroup(result.requests, /CWD=\[([^\]]*)\]/);
+        expect(bashCwd, "subagent Bash must report its worktree cwd").toBeDefined();
+        expect(bashCwd!.replace(/\\/g, "/")).toContain("worktrees");
+        // Claude's project variable intentionally remains the main checkout even
+        // while the isolated child's real Bash process runs in its own worktree.
+        const projectDir = firstGroup(result.requests, /PROJDIR=\[([^\]]*)\]/);
+        expect(projectDir, "subagent Bash must receive CLAUDE_PROJECT_DIR").toBeDefined();
+        expect(normPath(projectDir!)).toBe(normPath(result.fixture));
+        expect(projectDir!.replace(/\\/g, "/")).not.toContain("worktrees");
 
         // The subagent's final message came back to the orchestrator verbatim.
         const done = result.requests.some((r) => toolResultText(r).includes("DONE-ISO"));
         expect(done, "parent tool result must contain DONE-ISO").toBe(true);
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    // --- Scenario: worktree-isolated subagent bash sees settings.env + CLAUDE_PROJECT_DIR ---
-    // Proves the REAL shared bash factory honors its spawn env hook inside a real
-    // subagent subprocess: a settings.env value reaches the subagent shell, and the
-    // built-in CLAUDE_PROJECT_DIR points at the MAIN checkout — not the agent's own
-    // isolation worktree (the parity semantic).
-    it.skipIf(!BASH_AVAILABLE)(
-      "delivers settings.env and CLAUDE_PROJECT_DIR (the project root, not the worktree) to a worktree-isolated subagent's bash",
-      async () => {
-        const result = await runPi({
-          fixture: "full-surface",
-          script: [
-            // 0) orchestrator dispatches the worktree-isolated agent (foreground)
-            {
-              toolCalls: [
-                {
-                  name: "Agent",
-                  args: {
-                    subagent_type: "isolated-worker",
-                    prompt: "print the project env",
-                    run_in_background: false,
-                  },
-                },
-              ],
-            },
-            // 1) the subagent echoes the settings.env var and the built-in project dir
-            {
-              toolCalls: [
-                {
-                  name: "bash",
-                  args: {
-                    command:
-                      'echo "FSVAR=[$FS_FIXTURE]"; echo "PROJDIR=[$CLAUDE_PROJECT_DIR]"; echo "CWD=[$(pwd)]"',
-                  },
-                },
-              ],
-            },
-            // 2) the subagent's final answer
-            { text: "ENV-PROBE-DONE" },
-            // 3) orchestrator's follow-up
-            { text: "env verified" },
-          ],
-          prompt: "have isolated-worker print the project env",
-        });
-
-        expect(result.code).toBe(0);
-
-        // settings.env (FS_FIXTURE) reached the subagent shell.
-        const fsVarSeen = result.requests.some((r) =>
-          /FSVAR=\[full-surface\]/.test(toolResultText(r)),
-        );
-        expect(fsVarSeen, "subagent bash must see settings.env FS_FIXTURE").toBe(true);
-
-        // Self-containment: the discriminator below (PROJDIR==root, not the worktree)
-        // only bites if the agent's bash really runs in a worktree. Assert cwd != root
-        // so a silent isolation degrade can't make PROJDIR==root pass vacuously.
-        const bashCwd = firstGroup(result.requests, /CWD=\[([^\]]*)\]/);
-        expect(bashCwd, "subagent bash must report its cwd").toBeDefined();
-        expect(bashCwd!.replace(/\\/g, "/")).toContain("worktrees");
-
-        // CLAUDE_PROJECT_DIR reached the subagent shell and points at the main
-        // checkout, NOT the agent's isolation worktree.
-        const projDir = firstGroup(result.requests, /PROJDIR=\[([^\]]*)\]/);
-        expect(projDir, "subagent bash must see CLAUDE_PROJECT_DIR").toBeDefined();
-        expect(normPath(projDir!)).toBe(normPath(result.fixture));
-        expect(projDir!.replace(/\\/g, "/")).not.toContain("worktrees");
-
-        // The subagent's final message came back to the orchestrator verbatim.
-        expect(result.requests.some((r) => toolResultText(r).includes("ENV-PROBE-DONE"))).toBe(true);
       },
       TEST_TIMEOUT_MS,
     );
@@ -835,84 +770,6 @@ describe.skipIf(cliMissing)(
         for (const sentinel of [providerSecret, providerPath, providerTranscript]) {
           expect(everyVisibleSurface).not.toContain(sentinel);
         }
-      },
-      TEST_TIMEOUT_MS,
-    );
-
-    // --- Scenario: persisted subagent transcript + model-visible agent ID (real stack) ---
-    it(
-      "persists the subagent transcript next to the main session and delivers the agent ID trailer to the parent",
-      async () => {
-        // The child is the general-purpose builtin — its PERSONA body appears
-        // only in the child's system prompt (the parent catalog carries just
-        // the description).
-        const isChild = (r: CapturedRequest) =>
-          systemText(r).includes("You are a general-purpose agent");
-        const isParent = (r: CapturedRequest) => !isChild(r);
-        const result = await runPi({
-          persistSession: true, // NOT --no-session: the main session file must exist
-          script: [
-            {
-              when: isParent,
-              toolCalls: [
-                {
-                  name: "Agent",
-                  args: {
-                    subagent_type: "general-purpose",
-                    prompt: "summarize the project",
-                    // Pin run_in_background: false — this scenario tests the
-                    // inline agent-ID trailer delivery, foreground is incidental.
-                    run_in_background: false,
-                  },
-                },
-              ],
-            },
-            { when: isChild, text: "SUBAGENT-TRANSCRIPT-CANARY: summary done" },
-            { when: isParent, text: "delegated fine" },
-          ],
-          prompt: "delegate a summary to a general-purpose agent",
-        });
-
-        expect(result.code).toBe(0);
-
-        // 1) The parent MODEL received the delimited agent-ID trailer in the
-        //    tool result content (details would never reach it).
-        const trailerRe = /\[agent (agent-[0-9a-f]{12}) completed — resumable via SendMessage\]/;
-        const withTrailer = result.requests.find((r) => trailerRe.test(toolResultText(r)));
-        expect(withTrailer, "parent must receive the agent-ID trailer").toBeDefined();
-        const trailerText = toolResultText(withTrailer!);
-        expect(trailerText).toContain("SUBAGENT-TRANSCRIPT-CANARY: summary done");
-        const agentId = trailerRe.exec(trailerText)![1]!;
-
-        // 2) The subagent transcript exists in the <mainBase>.subagents sibling
-        //    directory of the REAL main session transcript, written by the REAL
-        //    Pi AgentSession, and the exported resolver maps the ID to it.
-        const sessionsRoot = path.join(result.agentDir, "sessions");
-        const mainFiles: string[] = [];
-        const walk = (dir: string) => {
-          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-            const full = path.join(dir, entry.name);
-            if (entry.isDirectory()) walk(full);
-            else if (entry.name.endsWith(".jsonl") && !dir.endsWith(".subagents")) {
-              mainFiles.push(full);
-            }
-          }
-        };
-        walk(sessionsRoot);
-        expect(mainFiles.length, `expected a main session transcript under ${sessionsRoot}`).toBeGreaterThanOrEqual(1);
-        const resolved = mainFiles
-          .map((main) => resolveSubagentTranscript(main, agentId))
-          .find((p): p is string => p !== undefined);
-        expect(resolved, "resolver must locate the subagent transcript from the main session").toBeDefined();
-        expect(fs.readFileSync(resolved!, "utf8")).toContain("SUBAGENT-TRANSCRIPT-CANARY");
-
-        // 3) Dispose→reopen round-trip on the real file: the session reopens
-        //    under the same ID with the run's messages intact.
-        const reopened = SessionManager.open(resolved!);
-        expect(reopened.getSessionId()).toBe(agentId);
-        const restored = JSON.stringify(reopened.buildSessionContext().messages);
-        expect(restored).toContain("summarize the project");
-        expect(restored).toContain("SUBAGENT-TRANSCRIPT-CANARY: summary done");
       },
       TEST_TIMEOUT_MS,
     );
