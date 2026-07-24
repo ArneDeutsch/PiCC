@@ -19,7 +19,7 @@ PiCC is **one extension bundle** with an entry `src/index.ts` that registers eve
 Launch modes we support:
 - `pi -e <path-to-picc>` in the target project (dev/test).
 - `"extensions": ["<path>"]` in `~/.pi/agent/settings.json` or `.pi/settings.json` (persistent).
-- A `picc` launcher (thin wrapper) that runs Pi with the extension preloaded.
+- A `picc` launcher that owns PiCC administration routing, validates one coherent installed Pi suite, then runs its coding-agent CLI with the extension preloaded. Resolution starts from PiCC's package tree rather than the target cwd: Pi's import-only exports map does not expose `dist/cli.js`, while npm may hoist the package to PiCC's containing `node_modules`.
 
 ## 2. Pi API surface we use (tested baseline)
 

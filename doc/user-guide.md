@@ -481,7 +481,7 @@ behaviors worth knowing:
 
 | Symptom | Fix |
 |---|---|
-| "could not resolve the Pi CLI" | `npm install` inside the PiCC checkout |
+| "embedded Pi runtime is incomplete or inconsistent" | run `picc update`; if that cannot repair the installation, reinstall PiCC |
 | Skill shell injection prints `[shell execution disabled: …]` | project set `disableSkillShellExecution`; that's the project's intent |
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
