@@ -89,6 +89,20 @@ type McpSdk = {
   StdioClientTransport: typeof import("@modelcontextprotocol/sdk/client/stdio.js").StdioClientTransport;
 };
 
+export type McpTimeoutOutcome<T> =
+  | { timedOut: true }
+  | { timedOut: false; value: T };
+
+export type McpTimeoutRace = <T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+) => Promise<McpTimeoutOutcome<T>>;
+
+export interface McpTimeoutPolicy {
+  connectTimeoutMs: number;
+  environmentToolTimeoutMs: number | undefined;
+}
+
 export interface McpRuntimeDeps {
   /**
    * Spawn cwd and `CLAUDE_PROJECT_DIR` — deliberately the project root, never
@@ -104,6 +118,8 @@ export interface McpRuntimeDeps {
   env?: Record<string, string | undefined>;
   /** Test seam for exercising an SDK load/import failure. */
   loadSdk?: () => Promise<McpSdk>;
+  /** Test seam for deterministic connect-timeout settlement after test-owned readiness. */
+  raceWithTimeout?: McpTimeoutRace;
 }
 
 export interface McpServerState {
@@ -166,9 +182,9 @@ export class McpRuntime {
 
   private constructor(config: ResolvedMcpConfig, deps: McpRuntimeDeps) {
     this.deps = deps;
-    const env = deps.env ?? process.env;
-    this.connectTimeoutMs = parsePositiveInt(env["MCP_TIMEOUT"]) ?? DEFAULT_CONNECT_TIMEOUT_MS;
-    this.toolTimeoutMs = parsePositiveInt(env["MCP_TOOL_TIMEOUT"]);
+    const timeoutPolicy = resolveMcpTimeoutPolicy(deps.env ?? process.env);
+    this.connectTimeoutMs = timeoutPolicy.connectTimeoutMs;
+    this.toolTimeoutMs = timeoutPolicy.environmentToolTimeoutMs;
     for (const server of config.servers) {
       if (server.status !== "enabled") continue;
       this.handles.push({
@@ -262,9 +278,7 @@ export class McpRuntime {
     }
     // Per-server `timeout` wins; else MCP_TOOL_TIMEOUT; else Claude's unset
     // default — the resolved value clamped exactly as Claude clamps it.
-    const timeoutMs = clampToolTimeout(
-      handle.server.timeoutMs ?? this.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS,
-    );
+    const timeoutMs = resolveMcpToolTimeoutMs(handle.server.timeoutMs, this.toolTimeoutMs);
     try {
       const callArgs =
         typeof args === "object" && args !== null && !Array.isArray(args)
@@ -396,7 +410,10 @@ export class McpRuntime {
       // an unhandled rejection.
       connectPromise.catch(() => {});
 
-      const outcome = await raceWithTimeout(connectPromise, this.connectTimeoutMs);
+      const outcome = await (this.deps.raceWithTimeout ?? raceWithTimeout)(
+        connectPromise,
+        this.connectTimeoutMs,
+      );
       this.clearPidPoller(handle);
       if (typeof transport.pid === "number") handle.pid = transport.pid;
 
@@ -628,6 +645,25 @@ export class McpRuntime {
 // Helpers
 // ---------------------------------------------------------------------------
 
+export function resolveMcpTimeoutPolicy(
+  env: Record<string, string | undefined>,
+): McpTimeoutPolicy {
+  return {
+    connectTimeoutMs: parsePositiveInt(env["MCP_TIMEOUT"]) ?? DEFAULT_CONNECT_TIMEOUT_MS,
+    environmentToolTimeoutMs: parsePositiveInt(env["MCP_TOOL_TIMEOUT"]),
+  };
+}
+
+/** Resolve per-server precedence and Claude's exact tool-timeout clamp. */
+export function resolveMcpToolTimeoutMs(
+  serverTimeoutMs: number | undefined,
+  environmentToolTimeoutMs: number | undefined,
+): number {
+  return clampToolTimeout(
+    serverTimeoutMs ?? environmentToolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS,
+  );
+}
+
 function parsePositiveInt(value: string | undefined): number | undefined {
   if (value === undefined || value.trim() === "") return undefined;
   const parsed = Number(value);
@@ -662,7 +698,7 @@ function sleep(ms: number): Promise<void> {
 async function raceWithTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
-): Promise<{ timedOut: true } | { timedOut: false; value: T }> {
+): Promise<McpTimeoutOutcome<T>> {
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([

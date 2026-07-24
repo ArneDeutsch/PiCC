@@ -505,9 +505,8 @@ behaviors worth knowing:
   live validation on a real ChatGPT/Codex subscription, covering slash commands with argument
   substitution, description-routed subagent dispatch, worktree entry detected as `mode=worktree` by
   a project's own git-plumbing probe, `.worktreeinclude` seeding, and hooks.
-- **Linux**: the code is platform-guarded and expected to work (POSIX is the simpler path for
-  every Windows-special case), but has not yet been exercised in CI — run `npm test` on your
-  Linux machine before relying on it there.
+- **Linux**: the automated suite, including the real-Pi CLI lane with a local mock model, runs in
+  CI. Live ChatGPT/Codex subscription validation remains Windows-only.
 
 ## 11. Example projects
 

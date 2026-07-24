@@ -2,10 +2,16 @@ import { afterAll, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { McpRuntime, type McpRuntimeDeps } from "../src/runtime/mcp.js";
+import { PassThrough } from "node:stream";
+import {
+  McpRuntime,
+  resolveMcpTimeoutPolicy,
+  resolveMcpToolTimeoutMs,
+  type McpRuntimeDeps,
+} from "../src/runtime/mcp.js";
 import { renderMcpStatusReport } from "../src/registry/compat-report.js";
 import type { ResolvedMcpConfig, ResolvedMcpServer } from "../src/types.js";
-import { waitUntil } from "./helpers/async.js";
+import { deferred, waitUntil } from "./helpers/async.js";
 import { createMcpProcessFixture, processIsAlive } from "./helpers/mcp-process.js";
 
 // ---------------------------------------------------------------------------
@@ -84,6 +90,91 @@ async function waitForDeath(pid: number, what: string): Promise<void> {
     timeoutMs: 10_000,
   });
 }
+
+function fakeToolSdk(options: {
+  forwardedTimeouts: number[];
+  callError?: unknown;
+}): Awaited<ReturnType<NonNullable<McpRuntimeDeps["loadSdk"]>>> {
+  class FakeTransport {
+    readonly pid = undefined;
+    readonly stderr = undefined;
+    constructor(_options: unknown) {}
+  }
+  class FakeClient {
+    constructor(_clientInfo: unknown, _options: unknown) {}
+    async connect(_transport: unknown): Promise<void> {}
+    async listTools(_params: unknown): Promise<{ tools: Array<{ name: string }> }> {
+      return { tools: [{ name: "fake-tool" }] };
+    }
+    async callTool(
+      _params: unknown,
+      _resultSchema: unknown,
+      requestOptions: { timeout: number },
+    ): Promise<{ content: never[] }> {
+      options.forwardedTimeouts.push(requestOptions.timeout);
+      if (options.callError !== undefined) throw options.callError;
+      return { content: [] };
+    }
+    async close(): Promise<void> {}
+  }
+  return {
+    Client: FakeClient,
+    StdioClientTransport: FakeTransport,
+  } as unknown as Awaited<ReturnType<NonNullable<McpRuntimeDeps["loadSdk"]>>>;
+}
+
+// ---------------------------------------------------------------------------
+// Timeout policy
+// ---------------------------------------------------------------------------
+
+describe("MCP timeout policy", () => {
+  it("resolves connect defaults, environment values, and invalid fallbacks without timers", () => {
+    expect(resolveMcpTimeoutPolicy({})).toEqual({
+      connectTimeoutMs: 30_000,
+      environmentToolTimeoutMs: undefined,
+    });
+    for (const invalid of ["", "0", "-1", "1.5", "not-a-number"]) {
+      expect(resolveMcpTimeoutPolicy({ MCP_TIMEOUT: invalid }).connectTimeoutMs).toBe(30_000);
+    }
+    expect(resolveMcpTimeoutPolicy({ MCP_TIMEOUT: "42" }).connectTimeoutMs).toBe(42);
+    expect(resolveMcpTimeoutPolicy({ MCP_TIMEOUT: "9999999999" }).connectTimeoutMs).toBe(
+      2_147_483_647,
+    );
+  });
+
+  it("resolves tool defaults, environment fallback, per-server precedence, and clamps", () => {
+    const defaultPolicy = resolveMcpTimeoutPolicy({});
+    expect(
+      resolveMcpToolTimeoutMs(undefined, defaultPolicy.environmentToolTimeoutMs),
+    ).toBe(100_000_000);
+
+    const environmentPolicy = resolveMcpTimeoutPolicy({ MCP_TOOL_TIMEOUT: "2500" });
+    expect(
+      resolveMcpToolTimeoutMs(undefined, environmentPolicy.environmentToolTimeoutMs),
+    ).toBe(2_500);
+    expect(resolveMcpToolTimeoutMs(3_500, environmentPolicy.environmentToolTimeoutMs)).toBe(3_500);
+    expect(resolveMcpToolTimeoutMs(1, undefined)).toBe(1_000);
+    expect(
+      resolveMcpToolTimeoutMs(
+        undefined,
+        resolveMcpTimeoutPolicy({ MCP_TOOL_TIMEOUT: "1" }).environmentToolTimeoutMs,
+      ),
+    ).toBe(1_000);
+    expect(resolveMcpToolTimeoutMs(9_999_999_999, undefined)).toBe(2_147_483_647);
+    expect(
+      resolveMcpToolTimeoutMs(
+        undefined,
+        resolveMcpTimeoutPolicy({ MCP_TOOL_TIMEOUT: "9999999999" }).environmentToolTimeoutMs,
+      ),
+    ).toBe(2_147_483_647);
+    expect(
+      resolveMcpToolTimeoutMs(
+        undefined,
+        resolveMcpTimeoutPolicy({ MCP_TOOL_TIMEOUT: "invalid" }).environmentToolTimeoutMs,
+      ),
+    ).toBe(100_000_000);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Zero-cost path
@@ -567,33 +658,56 @@ describe("McpRuntime degrade paths", () => {
     }
   }, 25_000);
 
-  it("degrades a garbage-stdout server via the connect bound and kills it", async () => {
-    const dir = makeTempDir();
-    const pidFile = path.join(dir, "garbage.pid");
-    const script = path.join(dir, "garbage-server.mjs");
-    // Deliberately SDK-free broken server: publishes its pid, floods stderr
-    // (>4 KB, tail marker last) to prove the diagnostic excerpt stays a
-    // bounded tail, then floods stdout with non-JSON-RPC noise and stays
-    // alive.
-    fs.writeFileSync(
-      script,
-      [
-        'import fs from "node:fs";',
-        `fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
-        'process.stderr.write("y".repeat(5000));',
-        'process.stderr.write("\\nGARBAGE_STDERR_TAIL_MARKER\\n");',
-        'setInterval(() => process.stdout.write("this is not JSON-RPC\\n"), 20);',
-      ].join("\n"),
-    );
+  it("retains a bounded stderr tail before reporting an injected connect timeout", async () => {
+    const stderrMarkerObserved = deferred<void>();
+    let closed = false;
+    class FakeTransport {
+      readonly pid = undefined;
+      readonly stderr = new PassThrough();
+      constructor(_options: unknown) {
+        // This parent-owned observer resolves during the same synchronous data
+        // emission as McpRuntime's ring handler. Promise continuations cannot
+        // run until every listener for that emission has returned.
+        this.stderr.on("data", (chunk: Buffer) => {
+          if (chunk.toString("utf8").includes("GARBAGE_STDERR_TAIL_MARKER")) {
+            stderrMarkerObserved.resolve();
+          }
+        });
+      }
+    }
+    class GarbageStreamClient {
+      constructor(_clientInfo: unknown, _options: unknown) {}
+      async connect(transport: FakeTransport): Promise<void> {
+        transport.stderr.write("y".repeat(5_000));
+        transport.stderr.write("\nGARBAGE_STDERR_TAIL_MARKER\n");
+        return new Promise<void>(() => {});
+      }
+      async listTools(_params: unknown): Promise<never> {
+        throw new Error("unreachable");
+      }
+      async close(): Promise<void> {
+        closed = true;
+      }
+    }
     const runtime = McpRuntime.start(
-      makeConfig(makeServer({ name: "garbage", args: [script], rawCommand: "garbage-cmd" })),
-      // Load-tolerant bound: the child must get to write its pid file before
-      // the runtime's timeout kill lands, even on a contended runner.
-      makeDeps({ env: { ...cleanBaseEnv(), MCP_TIMEOUT: "4000" } }),
+      makeConfig(makeServer({ name: "garbage", rawCommand: "garbage-cmd" })),
+      makeDeps({
+        env: { ...cleanBaseEnv(), MCP_TIMEOUT: "4000" },
+        loadSdk: async () =>
+          ({
+            Client: GarbageStreamClient,
+            StdioClientTransport: FakeTransport,
+          }) as unknown as Awaited<ReturnType<NonNullable<McpRuntimeDeps["loadSdk"]>>>,
+        raceWithTimeout: async (_promise, timeoutMs) => {
+          expect(timeoutMs).toBe(4_000);
+          await stderrMarkerObserved.promise;
+          return { timedOut: true };
+        },
+      }),
     );
-    let pid: number | undefined;
     try {
       await runtime.whenSettled();
+      expect(closed).toBe(true);
       expect(runtime.serverStates()).toEqual([
         expect.objectContaining({ name: "garbage", state: "failed" }),
       ]);
@@ -603,9 +717,6 @@ describe("McpRuntime degrade paths", () => {
       // stays small.
       const diagnostic = runtime.serverStates()[0]?.diagnostic ?? "";
       expect(diagnostic).toContain("GARBAGE_STDERR_TAIL_MARKER");
-      // The fixture's stderr is multi-line (flood\nmarker\n); the excerpt must
-      // stay ONE line — /doctor's posture line and the stderr drain splice it
-      // into a sentence.
       expect(diagnostic).not.toMatch(/[\n\r\t]/);
       expect(diagnostic).not.toContain("y".repeat(500));
       expect(diagnostic.length).toBeLessThanOrEqual(700);
@@ -614,19 +725,10 @@ describe("McpRuntime degrade paths", () => {
       );
       expect(renderMcpStatusReport(makeConfig(makeServer({ name: "garbage" })), runtime.serverStates()))
         .not.toContain("GARBAGE_STDERR_TAIL_MARKER");
-      pid = Number(fs.readFileSync(pidFile, "utf8"));
-      await waitForDeath(pid, "garbage server after connect timeout");
     } finally {
       await runtime.shutdown();
-      if (pid !== undefined && processIsAlive(pid)) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {
-          /* already gone */
-        }
-      }
     }
-  }, 25_000);
+  });
 
   it("never leaks expanded command values into diagnostics", async () => {
     const dir = makeTempDir();
@@ -728,7 +830,7 @@ describe("McpRuntime degrade paths", () => {
 // ---------------------------------------------------------------------------
 
 describe("McpRuntime tool-call timeouts", () => {
-  it("rejects a slow call at the per-server timeout (which beats MCP_TOOL_TIMEOUT) without a result", async () => {
+  it("applies the minimum clamp through the real SDK timeout while the tool stays gated", async () => {
     const fixture = createMcpProcessFixture(makeTempDir());
     const runtime = McpRuntime.start(
       makeConfig(
@@ -736,81 +838,92 @@ describe("McpRuntime tool-call timeouts", () => {
           name: "slowpoke",
           args: [fixture.serverScript, "slow-tool"],
           env: fixture.env,
-          timeoutMs: 1_000,
+          timeoutMs: 1,
         }),
       ),
-      // A large MCP_TOOL_TIMEOUT that would exceed the test window: the call
-      // rejecting at all (with the gate still closed) proves the per-server
-      // value won — no wall-clock assertion needed.
-      makeDeps({ env: { ...cleanBaseEnv(), MCP_TOOL_TIMEOUT: "600000" } }),
+      makeDeps(),
     );
     try {
       await runtime.whenSettled();
-      expect(runtime.serverStates()).toEqual([
-        { name: "slowpoke", state: "connected", toolCount: 1 },
-      ]);
       const call = runtime.callTool("slowpoke", "slow", {});
-      await fixture.waitFor(["slow.entered"], "slow tool to enter before timeout");
-      await expect(call).rejects.toThrow(/timed out after 1000 ms/);
-      // The rejection was timeout-driven, not result-driven: the handler is
-      // still gated, so no result marker can exist yet.
+      await fixture.waitFor(["slow.entered"], "slow tool to enter before its SDK timeout");
+      await expect(call).rejects.toThrow(
+        'MCP tool "slow" on server "slowpoke" timed out after 1000 ms',
+      );
       expect(fixture.exists("slow.done")).toBe(false);
       fixture.release("slow");
-      await fixture.waitFor(["slow.done"], "slow tool to finish after release");
+      await fixture.waitFor(["slow.done"], "slow tool to finish after timeout release");
     } finally {
       await runtime.shutdown();
       await fixture.cleanup("slow");
     }
   }, 25_000);
 
-  it("bounds a slow call by MCP_TOOL_TIMEOUT alone when no per-server timeout is set", async () => {
-    const fixture = createMcpProcessFixture(makeTempDir());
-    const runtime = McpRuntime.start(
-      makeConfig(
-        makeServer({ name: "slowpoke", args: [fixture.serverScript, "slow-tool"], env: fixture.env }),
-      ),
-      // The middle branch of the timeout resolution: no per-server timeoutMs,
-      // MCP_TOOL_TIMEOUT alone must bound the call (gate-based proof, no
-      // wall-clock assertion).
-      makeDeps({ env: { ...cleanBaseEnv(), MCP_TOOL_TIMEOUT: "1000" } }),
-    );
-    try {
-      await runtime.whenSettled();
-      expect(runtime.serverStates()).toEqual([
-        { name: "slowpoke", state: "connected", toolCount: 1 },
-      ]);
-      const call = runtime.callTool("slowpoke", "slow", {});
-      await fixture.waitFor(["slow.entered"], "slow tool to enter before timeout");
-      await expect(call).rejects.toThrow(/timed out after 1000 ms/);
-      expect(fixture.exists("slow.done")).toBe(false);
-      fixture.release("slow");
-      await fixture.waitFor(["slow.done"], "slow tool to finish after release");
-    } finally {
-      await runtime.shutdown();
-      await fixture.cleanup("slow");
-    }
-  }, 25_000);
+  it("forwards each resolved timeout policy value to the SDK without elapsed waits", async () => {
+    const cases = [
+      { label: "default", env: {}, expected: 100_000_000 },
+      { label: "environment", env: { MCP_TOOL_TIMEOUT: "2500" }, expected: 2_500 },
+      {
+        label: "per-server precedence",
+        env: { MCP_TOOL_TIMEOUT: "2500" },
+        serverTimeoutMs: 3_500,
+        expected: 3_500,
+      },
+      { label: "minimum clamp", env: {}, serverTimeoutMs: 1, expected: 1_000 },
+      { label: "maximum clamp", env: {}, serverTimeoutMs: 9_999_999_999, expected: 2_147_483_647 },
+    ] as const;
 
-  it("clamps an over-max MCP_TOOL_TIMEOUT instead of letting the timer overflow", async () => {
-    const fixture = createMcpProcessFixture(makeTempDir());
+    for (const row of cases) {
+      const forwardedTimeouts: number[] = [];
+      const runtime = McpRuntime.start(
+        makeConfig(
+          makeServer({
+            name: "fake",
+            ...("serverTimeoutMs" in row ? { timeoutMs: row.serverTimeoutMs } : {}),
+          }),
+        ),
+        makeDeps({
+          env: { ...cleanBaseEnv(), ...row.env },
+          loadSdk: async () => fakeToolSdk({ forwardedTimeouts }),
+        }),
+      );
+      try {
+        await runtime.whenSettled();
+        await runtime.callTool("fake", "fake-tool", { label: row.label });
+        expect(forwardedTimeouts, row.label).toEqual([row.expected]);
+      } finally {
+        await runtime.shutdown();
+      }
+    }
+  });
+
+  it("classifies the SDK timeout code with the resolved timeout and no upstream text", async () => {
+    const forwardedTimeouts: number[] = [];
+    const timeoutError = Object.assign(new Error("UPSTREAM_TIMEOUT_CANARY"), { code: -32_001 });
     const runtime = McpRuntime.start(
-      makeConfig(
-        makeServer({ name: "fixture", args: [fixture.serverScript, "serve"], env: fixture.env }),
-      ),
-      // > 2^31-1: unclamped this would exceed Node's TIMEOUT_MAX, overflow the
-      // SDK's setTimeout, and fire at ~1 ms — instantly rejecting even a fast
-      // call. The call succeeding at all proves the clamp.
-      makeDeps({ env: { ...cleanBaseEnv(), MCP_TOOL_TIMEOUT: "9999999999" } }),
+      makeConfig(makeServer({ name: "fake" })),
+      makeDeps({
+        env: { ...cleanBaseEnv(), MCP_TOOL_TIMEOUT: "2500" },
+        loadSdk: async () => fakeToolSdk({ forwardedTimeouts, callError: timeoutError }),
+      }),
     );
     try {
       await runtime.whenSettled();
-      const result = await runtime.callTool("fixture", "echo", { text: "clamped" });
-      expect(firstText(result)).toBe("clamped");
+      const rejection = await runtime.callTool("fake", "fake-tool", {}).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(rejection).toBeInstanceOf(Error);
+      expect((rejection as Error).message).toBe(
+        'MCP tool "fake-tool" on server "fake" timed out after 2500 ms',
+      );
+      expect((rejection as Error).message).not.toContain("UPSTREAM_TIMEOUT_CANARY");
+      expect(forwardedTimeouts).toEqual([2_500]);
+      expect(runtime.diagnostics().join("\n")).not.toContain("UPSTREAM_TIMEOUT_CANARY");
     } finally {
       await runtime.shutdown();
-      await fixture.cleanup();
     }
-  }, 25_000);
+  });
 });
 
 // ---------------------------------------------------------------------------
