@@ -118,7 +118,7 @@ export interface McpRuntimeDeps {
   env?: Record<string, string | undefined>;
   /** Test seam for exercising an SDK load/import failure. */
   loadSdk?: () => Promise<McpSdk>;
-  /** Test seam for settling timeout branches from observable process markers. */
+  /** Test seam for deterministic connect-timeout settlement after test-owned readiness. */
   raceWithTimeout?: McpTimeoutRace;
 }
 
