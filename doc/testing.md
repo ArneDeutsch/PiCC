@@ -36,6 +36,52 @@ Non-functional requirements — progressive disclosure / lazy loading, context p
 compaction, cross-platform execution — get explicit acceptance criteria and tests of their own.
 *"Looks right" is not "is right."*
 
+## Test value and cost checklist
+
+Apply this checklist when adding, reviewing, consolidating, or removing tests. Related cases may
+share one rationale; do not require a comment on every test.
+
+1. **Name the regression.** State the realistic user, security, compatibility, or operational
+   outcome that would break. A test must not compare an implementation with itself. Independent
+   authorities such as security allow-lists, compatibility policy, generated-artifact freshness,
+   conformance fixtures, observable wire/parser/model shapes, and otherwise-unobservable NFRs are
+   legitimate comparisons.
+2. **Find the owner.** Search for existing coverage before adding a scenario or file. Extend the
+   cohesive owner when possible; use a standalone suite only for a distinct seam, isolation need,
+   or failure domain.
+3. **Choose the cheapest sufficient layer.** Additional cross-layer proof must exercise a boundary
+   the cheaper owner cannot instantiate. Preserve the distinction between a cheap semantic matrix
+   and its smallest representative real-process, process-tree, SDK, persistence, HTML, or agent-loop
+   witness.
+4. **Justify brittle pins.** Private dependency layout, exact wording or markup, and large snapshots
+   are exceptional. Retain them only for an externally meaningful wire, parser, security,
+   model-visible, compatibility, or otherwise-unobservable NFR contract.
+5. **Make it deterministic.** Prefer policy and state seams over production-scale waits. Keep a
+   representative high-fidelity witness only where replacing the boundary with a fake would erase
+   the contract.
+6. **Account for material cost.** When a change adds or substantially expands external launches,
+   real waits, Git/worktree setup, or another plausibly costly high-fidelity witness, compare the
+   same focused file or lane before and after under comparable conditions where practical. Record
+   deterministic Pi or real-process launch deltas; repeat only when process noise affects the
+   decision. Reused fixtures and fake-time seams may report `no material cost change`. Measurements
+   are review evidence, never duration gates or platform budgets.
+7. **Map retired proof.** For consolidation or removal, record the assertion or property and boundary
+   retired, its disposition, the surviving owner/test (or `N/A`), and why that owner fails for the
+   same regression. If no behavioral contract exists, state the editorial or incidental rationale.
+   Preserve negative security/non-egress and platform-distinct process-tree properties rather than
+   mapping only a destination filename.
+8. **Check aggregate cost.** Review the suite's total permutations and setup burden, not only whether
+   each assertion is reasonable alone. Prefer replacement or merging over monotonic growth.
+9. **Protect compatibility authorities.** Treat the capability registry, verified Claude semantics,
+   and executable conformance fixtures as authoritative. Before retiring compatibility proof, name
+   the capability and surviving executable witness; preserve defaults, precedence, error/degrade
+   behavior, and model-visible contracts. Review registry claims when support changes, and escalate
+   uncertainty rather than deleting proof for cost alone.
+
+In implementation and review evidence, group related cases and record: **regression protected**,
+**existing or surviving owner**, **chosen layer**, and **high-cost delta** when applicable. Removal
+mappings still include the richer property-and-boundary evidence required above.
+
 ## Running the tests
 
 This is the canonical list of lanes.
