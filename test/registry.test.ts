@@ -360,8 +360,21 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(agent?.note).toContain("agent id");
     expect(agent?.note).toContain("BACKGROUND-BY-DEFAULT");
     expect(agent?.note).toContain("run_in_background:false");
-    expect(agent?.note).toContain("prioritizes state, agent identity, and the stable dispatch description before optional telemetry");
-    expect(agent?.note).toContain("passive Agent/settlement lifecycle rows omit task ID chips");
+    expect(agent?.note).toContain("main-session/depth-1 background work");
+    expect(agent?.note).toContain("successful acceptance is transient in human chat");
+    expect(agent?.note).toContain("first terminal delivery through TaskOutput or settlement");
+    expect(agent?.note).toContain("PiCC-defined collapsed, ctrl+o-expandable semantic record");
+    expect(agent?.note).toContain("truthful outcome marker, agent identity and textual state");
+    expect(agent?.note).toContain("actionable exceptional evidence");
+    expect(agent?.note).toContain("stable dispatch description");
+    expect(agent?.note).toContain("expansion cue, and duration as width permits");
+    expect(agent?.note).toContain("Expanded detail owns the task and agent IDs");
+    expect(agent?.note).toContain("usage, and applicable diagnostics");
+    expect(agent?.note).toContain("later already-reported retrieval adds no human row");
+    expect(agent?.note).toContain("Nested work at depth >= 2");
+    expect(agent?.note).toContain("default notice box");
+    expect(agent?.note).toContain("panel tree and its parent's transcript");
+    expect(agent?.note).toContain("responsive status panel remains the waiting/running surface");
     expect(agent?.note).toContain("model-visible background dispatch still returns the task ID");
     expect(agent?.note).toContain("eligible uncollected current task");
     expect(agent?.note).toContain("polling TaskOutput while running preserves eligibility");
@@ -483,7 +496,16 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     // and the honest #15098 hardening (not a blanket "non-divergent" claim).
     expect(out?.note).toContain("status line that retains the explicitly requested target ID");
     expect(out?.note).not.toContain("status line retains");
-    expect(out?.note).toContain("passive Agent/settlement lifecycle rows omit task ID chips");
+    expect(out?.note).toContain("main-session retrieval of depth-1 work");
+    expect(out?.note).toContain("FIRST terminal delivery renders one bounded PiCC-defined semantic record");
+    expect(out?.note).toContain("truthful outcome marker, agent identity and textual state");
+    expect(out?.note).toContain("actionable exceptional evidence");
+    expect(out?.note).toContain("dispatch description, expansion cue, and duration as width permits");
+    expect(out?.note).toContain("Ctrl+o expands to the task and agent IDs");
+    expect(out?.note).toContain("available retained output, transcript location");
+    expect(out?.note).toContain("per-subagent usage, and applicable diagnostics");
+    expect(out?.note).toContain("suppressed from the main-session human TUI");
+    expect(out?.note).toContain("never adding a reference or duplicate row");
     expect(out?.note).toContain("registry and canonical identity remain unchanged");
     // Claude removes TaskOutput from named subagents; PiCC deliberately exposes
     // it with own-dispatch scope while preserving coordinator session-wide reach.
@@ -492,7 +514,6 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(out?.note).toContain("even when it is listed in `tools:`");
     expect(out?.note).toContain("only tasks it dispatched");
     expect(out?.note).toContain("coordinator reaches every session task");
-    expect(out?.note).toContain("bracketed lifecycle state `[completed]`, `[failed]`, or `[aborted]`");
     expect(out?.note).not.toContain("#15098");
     expect(out?.note).not.toContain("#23154");
     expect(out?.note).toContain("poll (wait:false)");
@@ -645,6 +666,20 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(bg?.note).toContain("widths below the explicit row minimum use truthful state aggregates");
     expect(bg?.note).toContain("waiting keeps a static glyph while its literal label appears when space permits");
     expect(bg?.note).not.toContain("literal label, a keyboard-entered drill-down");
+    expect(bg?.note).toContain("main-session/depth-1 background work");
+    expect(bg?.note).toContain("successful acceptance is transient in human chat");
+    expect(bg?.note).toContain("awaiting/polling TaskOutput retains its requested task ID");
+    expect(bg?.note).toContain("first terminal delivery through TaskOutput or settlement");
+    expect(bg?.note).toContain("one bounded PiCC-defined semantic, ctrl+o-expandable record");
+    expect(bg?.note).toContain("actionable exceptional evidence");
+    expect(bg?.note).toContain("dispatch description, expansion cue, and duration as width permits");
+    expect(bg?.note).toContain("settlement output remains bounded");
+    expect(bg?.note).toContain("usage, and applicable diagnostics");
+    expect(bg?.note).toContain("later already-reported TaskOutput retrieval adds no human row");
+    expect(bg?.note).toContain("Nested work at depth >= 2");
+    expect(bg?.note).toContain("default notice box");
+    expect(bg?.note).toContain("panel tree and its parent's transcript");
+    expect(bg?.note).toContain("canonical/model-visible results and print/RPC output remain unchanged");
     // The in-session Agent View gap is closed by the status panel; the honest
     // residuals must be named instead of the retired "no always-on Agent View".
     expect(bg?.note).not.toContain("no always-on Agent View");
