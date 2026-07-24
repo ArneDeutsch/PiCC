@@ -1957,6 +1957,8 @@ describe("background settlement delivery (offline integration via the seam)", ()
       undefined,
       agentId,
       "reviewer",
+      undefined,
+      "Review authentication boundaries",
     );
     await internals.backgroundTasks.wait(taskId);
     internals.subagentRegistry.markSettled(agentId);
@@ -1995,6 +1997,7 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(top!.details!.record).toBe("subagent-completion");
     expect(typeof top!.details!.settledAt).toBe("number");
     expect(typeof top!.details!.durationMs).toBe("number");
+    expect(top!.details!.description).toBe("Review authentication boundaries");
     expect(top!.content).toContain("settled: completed"); // model-facing text untouched
 
     // The RECORDED registered renderer, driven with the actual sent message at
@@ -2005,7 +2008,8 @@ describe("background settlement delivery (offline integration via the seam)", ()
     const lines = component.render(200) as string[];
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("reviewer");
-    expect(lines[0]).toContain("[completed]");
+    expect(lines[0]).toContain("[completed] - Review authentication boundaries");
+    expect(lines[0]).toContain(formatElapsed(top!.details!.durationMs as number));
     expect(lines[0]).not.toContain(taskId);
     expect(lines[0]).not.toContain(".jsonl");
     expect(lines[0]).toContain(RECORD_EXPAND_HINT);

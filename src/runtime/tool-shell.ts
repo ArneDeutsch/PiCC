@@ -182,7 +182,7 @@ export function setToolRowOutcome(context: unknown, outcome: ToolRowOutcome): bo
   return true;
 }
 
-/** Suppress this generation only while a trusted inner renderer is synchronously being built. */
+/** Authorize suppression only during trusted synchronous renderer construction; once authorized, it hides this generation's row. */
 export function suppressToolRow(context: unknown): boolean {
   const key = objectKey(context);
   if (!key) return false;

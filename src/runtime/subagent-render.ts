@@ -610,7 +610,7 @@ function durationOf(details: SubagentRenderDetails): string | undefined {
     : undefined;
 }
 
-/** Foreground Agent records retain their established local completion clock. */
+/** Foreground Agent records show local completion time alongside collapsed telemetry. */
 function completionTimeOf(details: SubagentRenderDetails): string | undefined {
   if (typeof details.settledAt !== "number" || !Number.isFinite(details.settledAt)) return undefined;
   const date = new Date(details.settledAt);
@@ -1225,9 +1225,10 @@ export function renderAgentResult(
         }
         return runningStatusLines(theme, chip, agent, details, width, color);
       }
-      // Final result. Valid Agent acceptance was suppressed above; a malformed
-      // Agent acceptance already returned generic evidence. Legacy non-Agent
-      // background records retain their passive status presentation.
+      // Final result. Valid Agent acceptance disappears only when trusted
+      // suppression succeeded above; unbranded/direct callers retain fail-open
+      // evidence. Malformed acceptance already returned generic evidence, while
+      // legacy non-Agent background records retain passive status presentation.
       if (details.background === true && presentation.surface === undefined) {
         return lifecycleLine(theme, {
           agent: agentName,

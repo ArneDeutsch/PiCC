@@ -3019,6 +3019,123 @@ describe("condensed completion records", () => {
     expect(out).not.toContain("the answer");
   });
 
+  it("uses the same full ordinary-width grammar for first TaskOutput and settlement records", () => {
+    const description = "Review authentication boundaries";
+    const taskDetails = { ...completedDetails, description };
+    const taskLine = renderAgentResult(
+      { content: [{ type: "text", text: "the answer" }], details: taskDetails, isError: false },
+      { isPartial: false, expanded: false },
+      undefined,
+      { args: { task_id: "task-3" }, isError: false },
+      { surface: "task-output" },
+    ).render(160);
+    const settlementLine = renderSettlementRecord(
+      { ...taskDetails, record: "subagent-completion", finalText: "the answer" },
+      { expanded: false },
+      undefined,
+    )!.render(160);
+
+    expect(taskLine).toEqual(settlementLine);
+    expect(settlementLine).toHaveLength(1);
+    expect(settlementLine[0]).toContain(`coder [completed] - ${description}`);
+    expect(settlementLine[0]).toContain("4m02s");
+    expect(settlementLine[0]).toContain(RECORD_EXPAND_HINT);
+  });
+
+  it.each([
+    {
+      label: "completed truncation",
+      status: "completed",
+      outcome: "completed",
+      state: "completed (truncated)",
+      error: undefined,
+      output: "retained completed output",
+      narrowWidth: 31,
+    },
+    {
+      label: "failed partial output",
+      status: "failed",
+      outcome: "failed",
+      state: "failed (partial output preserved)",
+      error: "provider failure",
+      output: "retained partial output",
+      narrowWidth: 43,
+    },
+  ] as const)("keeps cut-off $label truthful across first TaskOutput and settlement surfaces", ({
+    status, outcome, state, error, output, narrowWidth,
+  }) => {
+    const taskDetails = {
+      ...completedDetails,
+      status,
+      outcome,
+      cutOff: true,
+      description: "Inspect authentication boundaries",
+      ...(error === undefined ? {} : { error }),
+    };
+    const surfaces = (expanded: boolean, width: number) => {
+      const taskOutput = renderAgentResult(
+        { content: [{ type: "text", text: output }], details: taskDetails, isError: false },
+        { isPartial: false, expanded },
+        undefined,
+        { args: { task_id: "task-3" }, isError: false },
+        { surface: "task-output" },
+      ).render(width);
+      const settlement = renderSettlementRecord(
+        { ...taskDetails, record: "subagent-completion", finalText: output },
+        { expanded },
+        undefined,
+      )!.render(width);
+      return [taskOutput, settlement] as const;
+    };
+
+    for (const lines of surfaces(false, 160)) {
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(`coder [${state}]`);
+      expect(lines[0]).toContain("Inspect authentication boundaries");
+      expect(lines[0]).toContain("4m02s");
+      expect(lines[0]).not.toContain("task-3");
+      expect(lines[0]).not.toContain(output);
+      expect(tuiVisibleWidth(lines[0]!)).toBeLessThanOrEqual(160);
+    }
+    for (const lines of surfaces(false, narrowWidth)) {
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(`[${state}]`);
+      expect(lines[0]).not.toContain("Inspect authentication boundaries");
+      expect(lines[0]).not.toContain("4m02s");
+      expect(lines[0]).not.toContain("task-3");
+      expect(tuiVisibleWidth(lines[0]!)).toBeLessThanOrEqual(narrowWidth);
+    }
+    for (const width of [160, narrowWidth]) {
+      for (const lines of surfaces(true, width)) {
+        const text = lines.join("\n");
+        expect(text).toContain(state);
+        expect(text).toContain("retained");
+        expect(text).toContain("output");
+        expect(text.match(/task: task-3/gu)).toHaveLength(1);
+        expect(text.match(new RegExp(`agent: ${AGENT_ID}`, "gu"))).toHaveLength(1);
+        for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
+      }
+    }
+
+    const duplicateTool = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
+    for (const expanded of [false, true]) {
+      const context = { state: {}, args: { task_id: "task-3" }, isError: false };
+      const call = duplicateTool.renderCall(context.args, undefined, context);
+      const result = duplicateTool.renderResult(
+        {
+          content: [{ type: "text", text: output }],
+          details: { ...taskDetails, alreadyReported: true },
+          isError: false,
+        },
+        { isPartial: false, expanded },
+        undefined,
+        context,
+      );
+      expect(call.render(160)).toEqual([]);
+      expect(result.render(160)).toEqual([]);
+    }
+  });
+
   it("keeps terminal task IDs out of collapsed rows at every width", () => {
     const longAgent = "project-security-reviewer-with-an-extra-long-name";
     for (const width of [1, 2, 8, 20, 60, 80]) {
