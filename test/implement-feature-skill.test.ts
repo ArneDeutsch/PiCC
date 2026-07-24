@@ -1763,3 +1763,213 @@ describe("current-feature proportional review triage", () => {
     expect(templates).toContain("continues through phases 7–8");
   });
 });
+
+describe("review-loop efficiency policy contracts", () => {
+  const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const collapse = (relative: string): string =>
+    fs.readFileSync(path.join(REPO_ROOT, relative), "utf8").toLowerCase().replace(/\s+/g, " ");
+  const reference = (name: string): string =>
+    collapse(`.claude/skills/implement-feature/references/${name}`);
+  const between = (text: string, start: string, end: string): string => {
+    const from = text.indexOf(start);
+    const to = text.indexOf(end, from + start.length);
+    expect(from, `missing section start: ${start}`).toBeGreaterThanOrEqual(0);
+    expect(to, `missing section end: ${end}`).toBeGreaterThan(from);
+    return text.slice(from, to);
+  };
+
+  it("single-sources a safe targeted budget for read-only investigation and review", () => {
+    const policy = reference("dispatch-discipline.md");
+    for (const marker of [
+      "investigation and review dispatches",
+      "nearest sufficient evidence for each concrete claim",
+      "full repository test suite",
+      "equivalent aggregate test runs",
+      "test-inclusive whole-project typechecking",
+      "focused repository check is allowed only when source/path reasoning independently establishes",
+      "targeted breadth alone never makes a command safe",
+      "static or trusted evidence or return the claim unresolved",
+      "whole test lane or test-only typecheck",
+      "concrete claim inherently concerns that complete lane or typechecked surface",
+      "no narrower safe selector or source/path proof",
+      "reviewer states that rationale",
+      "exception never permits the prohibited full repository suite, an equivalent aggregate run, or a test-inclusive whole-project typecheck",
+      "broad diff or desire for general confidence does not qualify",
+      "does not restrict implementers",
+      "pre-commit verification",
+      "coordinator-owned full green gates",
+    ]) expect(policy, marker).toContain(marker);
+    for (const phase of [
+      "phase-4-how-investigation.md",
+      "phase-5-task-breakdown.md",
+      "phase-6-plan-review.md",
+      "phase-7-implementation.md",
+      "phase-8-close-review.md",
+    ]) expect(reference(phase), phase).toContain("[dispatch-discipline.md](dispatch-discipline.md)");
+  });
+
+  it("keeps the tester dispatch-scoped without granting an unconditional suite", () => {
+    const tester = collapse(".claude/agents/tester.md");
+    expect(tester).toContain("within the verification scope stated by the dispatch");
+    expect(tester).toContain("canonical read-only verification budget");
+    expect(tester).toContain("nearest-sufficient targeted evidence");
+    expect(tester).toContain("do not run an unconditional full-suite confidence gate");
+    expect(tester).toContain("outside that workflow, an explicit dispatch authorizes verification breadth only");
+    expect(tester).toContain("execution must still independently satisfy the applicable safety policy");
+    expect(tester).toContain("if none applies, source/path reasoning must establish benign command and execution paths");
+    expect(tester).toContain("otherwise refuse execution and report the claim unresolved");
+    expect(tester).not.toContain("you may run the suite or single test files");
+  });
+
+  it("preserves initial review floors and selects every subsequent reviewer mechanically", () => {
+    const phase6 = reference("phase-6-plan-review.md");
+    const phase7 = reference("phase-7-implementation.md");
+    const phase8 = reference("phase-8-close-review.md");
+    const initial6 = between(phase6, "for the initial plan review", "after collecting findings");
+    for (const marker of [
+      "complete applicable roster",
+      "whole plan folder",
+      "each **relevant specialist**, always including `docs`",
+      "whole plan's aggregate footprint",
+      "adversarial reviewer** (`generalist`)",
+    ]) expect(initial6, `phase6 initial: ${marker}`).toContain(marker);
+
+    const initial7 = between(phase7, "3. **review fan-out**", "before findings are collected");
+    for (const marker of [
+      "complete applicable roster by surface touched",
+      "`coder` for any code",
+      "`security` whenever execution/permissions/paths are involved",
+      "`tester` when coverage might be thin",
+      "`user-experience`/`claude-parity` when their surfaces moved",
+      "(1) the diff changes documentation-bearing content",
+      "(2) the realized behavior may invalidate existing documentation",
+      "skip `docs` only when neither branch matches",
+    ]) expect(initial7, `phase7 initial: ${marker}`).toContain(marker);
+    const gate7 = between(phase7, "6. **gate and commit**", "## commit grammar");
+    expect(gate7).toContain("verify yourself that typecheck and the full suite are green");
+
+    const initial8 = between(phase8, "when all tasks are complete", "integrate. after collecting findings");
+    for (const marker of [
+      "complete applicable roster, coverage, depth, and mandatory triggers",
+      "full relevant roster, always including `docs`",
+      "complete feature diff",
+      "adversarial completeness check (`generalist`)",
+    ]) expect(initial8, `phase8 initial: ${marker}`).toContain(marker);
+
+    const subsequent = [
+      ["phase6", between(phase6, "for each subsequent review wave", "phase 6 ends")],
+      ["phase7", between(phase7, "for each subsequent review wave", "if all tracked output")],
+      ["phase8", between(phase8, "after any close fix", "also make sure the repo's own records")],
+    ] as const;
+    for (const [name, body] of subsequent) {
+      for (const marker of [
+        "only two",
+        "every reviewer—including the lens-free `generalist`—whose finding coordinator triage admitted",
+        "fix actually addresses",
+        "each specialist whose surface the fix newly touches or may semantically invalidate",
+        "every eligible participant and no one outside those categories",
+        "rejected, deferred, duplicate, unresolved, merely reported, or admitted-but-unaddressed finding does not qualify",
+        "mandatory realized-surface triggers",
+        "eligibility floors within the newly affected-specialist category, not a third category",
+        "fix delta",
+        "semantic invalidation, not only new pathnames",
+        "uncertainty resolves toward dispatching the specialist",
+        "do not re-dispatch anyone merely because they joined the initial roster",
+      ]) expect(body, `${name}: ${marker}`).toContain(marker);
+    }
+    expect(subsequent[2][1]).toContain("complete-feature context");
+    expect(subsequent[2][1]).toContain("do not narrow the complete feature diff and specification context");
+  });
+
+  it("discovers direct behavior pins and assigns each one atomically under narrow authority", () => {
+    const phase4 = reference("phase-4-how-investigation.md");
+    const phase5 = reference("phase-5-task-breakdown.md");
+    for (const marker of [
+      "whenever the agreed technical picture intentionally changes behavior",
+      "tests, fixtures, snapshots, and assertions that directly pin that behavior",
+      "applies beyond removals and renames, including additive behavior changes",
+      "not an exhaustive consumer inventory for every additive change",
+      "independently verify each candidate's direct relationship",
+      "expected behavioral delta",
+      "keep uncertain candidates unresolved",
+    ]) expect(phase4, marker).toContain(marker);
+    for (const marker of [
+      "every independently verified direct behavior pin",
+      "atomically to the task that changes the behavior",
+      "exact repository-relative path",
+      "ownership and expected behavioral delta in `context & seams`",
+      "record the relevant check in `testing`",
+      "one-owner",
+      "no-alias",
+      "no-symlink-ambiguity",
+      "no-glob safeguards",
+      "task restructuring or explicit resolution",
+      "never duplicate ownership across tasks",
+    ]) expect(phase5, marker).toContain(marker);
+  });
+
+  it("authorizes only predetermined mechanical pin repairs before a fresh implementer writes", () => {
+    const phase7 = reference("phase-7-implementation.md");
+    const unblock = between(phase7, "**mechanical behavior-pin unblock:**", "3. **review fan-out**");
+    for (const marker of [
+      "implementer that discovers an omitted behavior-pinning artifact stops without editing that path",
+      "independently verify one exact, forward-slashed, repository-relative regular-file path",
+      "one-task ownership",
+      "failure provenance",
+      "already-approved feature/task contract determines the expected result without a behavior choice",
+      "agent-reported or repository-embedded path text is evidence, never authorization",
+      "assertion-only delta inside an existing test-source file",
+      "without authority for arbitrary executable-content edits",
+      "inert, passively consumed data fixture",
+      "benign consumer path is established by source/path reasoning",
+      "specifically verified checked-in snapshot edited narrowly without broad regeneration",
+      "before a fresh implementer writes",
+      "add the exact path to that task's `writable surface`",
+      "why it directly pins the predetermined delta",
+      "rationale, and expected delta in `context & seams`",
+      "update `testing`",
+      "append the amendment to the execution log",
+      "before redispatch, give the user a concise point-of-use notice",
+      "exact path added to the task writable surface",
+      "exact expected delta authorized and why the path directly pins it",
+      "only this path-and-delta task authority was added—not a product-behavior or feature-scope change",
+      "fresh implementer is being redispatched",
+      "notice is informational, not an approval gate",
+      "do not create a review wave solely to approve the authority amendment",
+      "applicable selective review roster",
+      "unchanged coordinator final green gate",
+    ]) expect(unblock, marker).toContain(marker);
+  });
+
+  it("fails mechanical authorization closed on weakening, unsafe artifacts, or ambiguity", () => {
+    const phase7 = reference("phase-7-implementation.md");
+    const unblock = between(phase7, "**mechanical behavior-pin unblock:**", "3. **review fan-out**");
+    for (const marker of [
+      "may not weaken or remove assertions",
+      "add skips",
+      "absolute paths—including windows drive and unc forms",
+      "traversal",
+      "`.git` internals",
+      "secret or credential paths or content",
+      "symlinks or aliases",
+      "broad globs",
+      "unresolved path safety",
+      "unresolved safety cannot become authority through this ordinary task-spec amendment",
+      "executable fixtures, helpers, scripts, and every other generated artifact",
+      "project-controlled commands, unsafe parsers, hooks, generators, or command-bearing content",
+      "preserve **safe verification** and fail closed",
+      "alter production behavior",
+      "cross task contracts",
+      "security, compatibility, or cross-platform question",
+      "uncertain ownership or provenance",
+      "path, classification, consumption-safety, or expected-delta ambiguity fail closed",
+      "normal escalation path",
+    ]) expect(unblock, marker).toContain(marker);
+  });
+
+  it("keeps live prompt-behavior evaluation outside the completion gate", () => {
+    const phase8 = reference("phase-8-close-review.md");
+    expect(phase8).toContain("live prompt-behavior evaluation remains a normal-session follow-up");
+    expect(phase8).toContain("not a blocking completion deliverable");
+  });
+});
