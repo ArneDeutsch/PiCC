@@ -254,8 +254,18 @@ function trustedCwd(cwd, trustedRoots) {
   return actual;
 }
 
-export function runAdministrativeChild(executable, args, { cwd, trustedRoots, stdio = "pipe" } = {}) {
+function trustedAdministrativeOverlay(environmentOverlay) {
+  if (environmentOverlay === undefined) return undefined;
+  const entries = Object.entries(environmentOverlay);
+  if (entries.length !== 1 || entries[0][0] !== "NODE_AUTH_TOKEN") throw new Error("Administrative environment overlay is not permitted");
+  const token = entries[0][1];
+  if (typeof token !== "string" || token.length === 0 || token.length > 4096 || !/^[!-~]+$/.test(token)) throw new Error("NODE_AUTH_TOKEN is malformed");
+  return { NODE_AUTH_TOKEN: token };
+}
+
+export function runAdministrativeChild(executable, args, { cwd, trustedRoots, stdio = "pipe", environmentOverlay } = {}) {
   if (!path.isAbsolute(executable)) throw new Error("Administrative executables must be absolute");
+  const overlay = trustedAdministrativeOverlay(environmentOverlay);
   const root = ensureAdministrationRoot();
   const defaultCwd = path.dirname(canonicalPath(process.execPath));
   const childCwd = trustedCwd(cwd ?? defaultCwd, trustedRoots ?? [defaultCwd, root]);
@@ -264,7 +274,7 @@ export function runAdministrativeChild(executable, args, { cwd, trustedRoots, st
   try {
     child = spawn(executable, args, {
       cwd: childCwd,
-      env: administrativeEnvironment(),
+      env: { ...administrativeEnvironment(), ...overlay },
       detached: process.platform !== "win32",
       shell: false,
       stdio,
@@ -364,6 +374,10 @@ export function runTrustedNpm(args, options) {
   const npmCli = discoverTrustedNpmCli();
   if (!npmCli) throw new Error("Trusted npm CLI is unavailable");
   return runAdministrativeChild(process.execPath, [npmCli, ...args], options);
+}
+
+export function runAuthenticatedTrustedNpm(args, { token, ...options } = {}) {
+  return runTrustedNpm(args, { ...options, environmentOverlay: { NODE_AUTH_TOKEN: token } });
 }
 
 function runAdministrativeSync(executable, args, cwd) {

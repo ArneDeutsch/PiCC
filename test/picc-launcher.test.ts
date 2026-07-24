@@ -514,6 +514,23 @@ describe("shared provenance and administrative subprocess policy", () => {
     await expect(callAdmin("admin.runAdministrativeChild(process.execPath, [], { cwd: process.argv[1] })", cwd)).rejects.toThrow(/outside trusted roots/);
   });
 
+  it("admits only a validated child-only npm authentication overlay", async () => {
+    const cwd = await tempDir("authenticated admin cwd ");
+    const result = await callAdmin(`new Promise((resolve) => {
+      process.env.NODE_AUTH_TOKEN = "parent-poison"; process.env.NPM_TOKEN = "parent-npm-poison";
+      const child = admin.runAdministrativeChild(process.execPath, ["-e", "console.log(JSON.stringify({ token: process.env.NODE_AUTH_TOKEN, npm: process.env.NPM_TOKEN, keys: Object.keys(process.env).sort() }))"], {
+        cwd: process.argv[1], trustedRoots: [process.argv[1]], environmentOverlay: { NODE_AUTH_TOKEN: "child-token" },
+      });
+      let out = ""; child.stdout.on("data", chunk => out += chunk); child.on("close", code => resolve({ code, value: JSON.parse(out) }));
+    })`, cwd) as { code: number; value: { token: string; npm?: string; keys: string[] } };
+    expect(result).toMatchObject({ code: 0, value: { token: "child-token" } });
+    expect(result.value.npm).toBeUndefined();
+    expect(result.value.keys).toEqual(expect.arrayContaining(["HOME", "NODE_AUTH_TOKEN", "PATH", "npm_config_userconfig"]));
+    expect(result.value.keys).not.toContain("NODE_OPTIONS");
+    await expect(callAdmin("admin.runAdministrativeChild(process.execPath, [], { environmentOverlay: { NODE_AUTH_TOKEN: 'bad token' } })")).rejects.toThrow(/malformed/);
+    await expect(callAdmin("admin.runAdministrativeChild(process.execPath, [], { environmentOverlay: { OTHER: 'token' } })")).rejects.toThrow(/not permitted/);
+  });
+
   it("enforces a real deadline and stops a delayed descendant before resolving", async () => {
     const cwd = await tempDir("administrative tree deadline ");
     const ready = path.join(cwd, "descendant-ready");

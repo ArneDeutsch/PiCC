@@ -92,7 +92,9 @@ node scripts/update-pi-suite.mjs <newer-stable-exact-version>
 The helper preflights the exact public release, updates dependency state without lifecycle scripts,
 and validates the resulting graph. It does not make compatibility decisions: adapt PiCC semantics
 and documentation, run `npm run typecheck:all` and `npm test`, then submit the result as a
-human-reviewed pull request. Do not automate release detection, adoption, merging, or publication.
+human-reviewed pull request. Never couple Pi release detection or adoption to automatic merging or
+publication. After human review, a human-created release tag may invoke the sanctioned verified
+release workflow.
 
 ## Guiding principles
 
