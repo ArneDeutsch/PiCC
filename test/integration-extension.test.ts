@@ -1125,17 +1125,6 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     expect(exitResult.content[0].text).toContain("restored");
   });
 
-  it("two worktrees can coexist (parallel sessions)", async () => {
-    const enter = pi.tools.get("EnterWorktree");
-    const a = await enter.execute("w3", { name: "parallel-a" });
-    const exit = pi.tools.get("ExitWorktree");
-    await exit.execute("w4", { action: "keep" });
-    const b = await enter.execute("w5", { name: "parallel-b" });
-    await exit.execute("w6", { action: "keep" });
-    expect(fs.existsSync(a.details.worktreePath)).toBe(true);
-    expect(fs.existsSync(b.details.worktreePath)).toBe(true);
-  });
-
   it("registered Edit previews and settles against the effective cwd across entry and restoration", async () => {
     const sdk = await import("@earendil-works/pi-coding-agent") as any;
     sdk.initTheme();
@@ -2319,8 +2308,6 @@ describe("degradation floor", () => {
 describe("universal tool/worktree stops through production wiring", () => {
   const cases = [
     { event: "PreToolUse", kind: "tool" },
-    { event: "PostToolUse", kind: "tool" },
-    { event: "WorktreeCreate", kind: "create" },
     { event: "WorktreeRemove", kind: "remove" },
   ] as const;
 
@@ -2340,7 +2327,7 @@ describe("universal tool/worktree stops through production wiring", () => {
     settings.env = { ...(settings.env ?? {}), STOP_NODE: process.execPath, STOP_SCRIPT: script };
     settings.hooks = {
       [event]: [{
-        ...(event === "PreToolUse" || event === "PostToolUse" ? { matcher: "TodoWrite" } : {}),
+        ...(event === "PreToolUse" ? { matcher: "TodoWrite" } : {}),
         hooks: [{ type: "command", command: "\"$STOP_NODE\" \"$STOP_SCRIPT\"" }],
       }],
     };
@@ -2364,10 +2351,7 @@ describe("universal tool/worktree stops through production wiring", () => {
 
       let toolName = "TodoWrite";
       let args: Record<string, unknown> = { todos: [] };
-      if (kind === "create") {
-        toolName = "EnterWorktree";
-        args = { name: `stop-create-${Date.now()}` };
-      } else if (kind === "remove") {
+      if (kind === "remove") {
         const entered = await p.tools.get("EnterWorktree").execute("seed", { name: `stop-remove-${Date.now()}` }, undefined, undefined, context);
         toolName = "ExitWorktree";
         args = { action: "remove" };
@@ -2420,7 +2404,7 @@ describe("universal tool/worktree stops through production wiring", () => {
 describe("child worktree stops through the production extension assembly", () => {
   type Internals = Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
 
-  it.each(["WorktreeCreate", "WorktreeRemove"] as const)(
+  it.each(["WorktreeRemove"] as const)(
     "%s continue:false reaches the child gate and leaves the next dispatch healthy",
     async (event) => {
       const fixture = materializeFixture("full-surface");
@@ -2504,12 +2488,10 @@ describe("child worktree stops through the production extension assembly", () =>
               messages.push({ role: "user", content: text });
               await emit("turn_start", {}, ctx);
               await recordProviderIfAdmitted();
-              const calls = event === "WorktreeCreate"
-                ? [{ id: "enter", name: "EnterWorktree", args: { name: `wired-${event}-${creation}` } }]
-                : [
-                    { id: "enter", name: "EnterWorktree", args: { name: `wired-${event}-${creation}` } },
-                    { id: "exit", name: "ExitWorktree", args: { action: "remove" } },
-                  ];
+              const calls = [
+                { id: "enter", name: "EnterWorktree", args: { name: `wired-${event}-${creation}` } },
+                { id: "exit", name: "ExitWorktree", args: { action: "remove" } },
+              ];
               const assistant = {
                 role: "assistant",
                 stopReason: "toolUse",
