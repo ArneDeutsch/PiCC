@@ -10,7 +10,6 @@ import {
 import {
   RECORD_EXPAND_HINT,
   RECORD_FORK_MARKER,
-  RECORD_REFERENCE_NOTE,
   renderAgentResult,
 } from "../src/runtime/subagent-render.js";
 import { FORK_DEGRADE_PREFIX, subagentSessionDir } from "../src/util/subagent-transcripts.js";
@@ -321,17 +320,13 @@ describe("fork dispatch — developer-facing rendering (renderAgentResult)", () 
     expect(joined).toContain("fork ran with fresh context: fork inheritance is disabled");
   });
 
-  it("keeps one fork warning and required cue on practical collapsed/reference success/failure rows", () => {
+  it("keeps one fork warning and expansion cue on practical collapsed success/failure rows", () => {
     for (const width of [72, 96]) {
       for (const outcome of ["completed", "failed"] as const) {
-        for (const reference of [false, true]) {
-          const details = { ...degraded, outcome, ...(reference ? { alreadyReported: true } : {}) };
-          const joined = renderLines(details, false, "answer", width).join("\n");
-          const cue = reference ? RECORD_REFERENCE_NOTE : RECORD_EXPAND_HINT;
-          expect(joined.split(RECORD_FORK_MARKER)).toHaveLength(2);
-          expect(joined.split(cue)).toHaveLength(2);
-          expect(joined).toContain(`general-purpose [${outcome}]`);
-        }
+        const joined = renderLines({ ...degraded, outcome }, false, "answer", width).join("\n");
+        expect(joined.split(RECORD_FORK_MARKER)).toHaveLength(2);
+        expect(joined.split(RECORD_EXPAND_HINT)).toHaveLength(2);
+        expect(joined).toContain(`general-purpose [${outcome}]`);
       }
     }
   });

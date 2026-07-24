@@ -224,9 +224,11 @@ where to start reading, not the extent of its cluster.
   (prompt / structured live detail / final answer), stop/dismiss/stop-all, and steering. TUI-only by
   construction — the controllers are constructed unconditionally but attached only when
   `ctx.mode === "tui"`; print/RPC runs never touch a UI verb. The flip side is transcript slimming:
-  normal-path results replace pending calls in the same tool row, while background completion renders
-  as a condensed, expandable record (`subagent-render.ts`, settlement records via
-  `pi.registerMessageRenderer`), and subagent output no longer streams into the chat.
+  for main-session/depth-1 background work, the panel owns live waiting/running state, successful
+  acceptance is transient in human chat, and the first terminal delivery owns one semantic,
+  expandable record. Nested work at depth ≥ 2 instead keeps Pi's default notice box and appears in
+  the panel tree and its parent's transcript. Normal-path results still replace pending calls in the
+  same tool row, and subagent output does not stream into chat.
 
 - **Session state** (`cwd-state.ts`, `worktrees.ts`) — `CwdState` is **the single mutable source of
   truth for the effective cwd**; every tool resolves through it at execute time (see *The cwd swap is

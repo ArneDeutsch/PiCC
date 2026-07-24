@@ -1198,8 +1198,8 @@ export function createTaskOutputTool(
       const outcome = task.status === "running" ? undefined : noticeOutcome(task.status);
       // Exactly-once reconciliation flag: the completion record was already
       // emitted for this task generation (settlement notice delivered, or an
-      // earlier collection), so this result renders only a minimal reference
-      // line. Read BEFORE the markCollected transition below flips the state.
+      // earlier collection), so this result adds no second human row. Read
+      // BEFORE the markCollected transition below flips the state.
       const alreadyReported =
         task.status !== "running" && (task.settlementDelivery ?? "pending") !== "pending";
       const timing = task.status === "running" ? {} : terminalTiming(task);

@@ -122,6 +122,27 @@ describe("small stable prompt security kernels", () => {
     ]);
   });
 
+  it("retains the review loop's trust-boundary kernel", () => {
+    const dispatch = compact(implementFile("dispatch-discipline.md"));
+    const implementation = compact(implementFile("phase-7-implementation.md"));
+    contains(dispatch, [
+      "git --no-pager diff --no-ext-diff --no-textconv ...",
+      "must prohibit the full repository test suite",
+      "both the command and its execution path are benign",
+      "coordinator-owned full green gates",
+    ]);
+    contains(implementation, [
+      "`security` whenever execution/permissions/paths are involved",
+      "coordinator must not add the unforeseen path to implementer writable authority",
+      "git --no-pager --literal-pathspecs diff --no-ext-diff --no-textconv head -- <exact-path>",
+      "before any subsequent project-controlled command or check",
+      "any failed check or mismatch stops with no push or further project-controlled execution",
+      "reject absolute paths", "traversal", "`.git` internals", "secret or credential paths or content",
+      "symlinks or aliases", "broad globs", "unresolved path safety",
+      "reject executable fixtures", "command-bearing content",
+    ]);
+  });
+
   it("keeps the compact untrusted-ticket order and structured preflight", () => {
     const queryStart = implementRouter.indexOf("gh api repos/<issue-host>/issues/<n>");
     const queryEnd = implementRouter.indexOf("}'", queryStart);

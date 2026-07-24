@@ -293,12 +293,50 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   });
 
   it.each<DisclosureContract>([
-    { id: "tool.Agent", tier: "partial", core: [/subagent dispatch/, /final message is returned verbatim/, /dispatched subagents do NOT recurse/], gap: [/PARTIAL residual/, /notice is next-turn/], precedence: [/BACKGROUND-BY-DEFAULT/, /run_in_background:false/, /DISABLE_BACKGROUND_TASKS/, /MAIN-SESSION-ONLY BY DEFAULT/, /default subagents\.maxDepth/, /subagents\.maxDepth of 1/, /positive integer greater than 1/, /nested generations/], visibility: [/model-visible text/, /human TUI strips it/], parity: [/Claude-faithful/, /not verified parity/, /Claude Code 2\.1\.217/, /disables nested spawning by default/, /CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH/], split: [/feature\.background-agents/, /tool\.Agent\.fork/] },
+    {
+      id: "tool.Agent",
+      tier: "partial",
+      core: [
+        /subagent dispatch/,
+        /final message is returned verbatim/,
+        /main-session\/depth-1 background work/,
+        /successful acceptance is transient in human chat/,
+        /first terminal delivery through TaskOutput or settlement/,
+        /semantic record/,
+        /later already-reported retrieval adds no human row/,
+        /Nested work at depth >= 2/,
+        /default notice box/,
+        /panel tree/,
+        /parent's transcript/,
+        /responsive status panel remains the waiting\/running surface/,
+        /dispatched subagents do NOT recurse/,
+      ],
+      gap: [/PARTIAL residual/, /notice is next-turn/],
+      precedence: [/BACKGROUND-BY-DEFAULT/, /run_in_background:false/, /DISABLE_BACKGROUND_TASKS/, /MAIN-SESSION-ONLY BY DEFAULT/, /default subagents\.maxDepth/, /subagents\.maxDepth of 1/, /positive integer greater than 1/, /nested generations/],
+      visibility: [/model-visible text/, /human TUI strips it/, /model-visible background dispatch still returns the task ID/, /print\/RPC rendering unchanged/],
+      parity: [/Claude-faithful/, /PiCC-defined/, /not verified parity/, /Claude Code 2\.1\.217/, /disables nested spawning by default/, /CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH/],
+      split: [/feature\.background-agents/, /tool\.Agent\.fork/],
+    },
     { id: "tool.Task", tier: "partial", core: [/alias of the Agent subagent-dispatch tool/, /loud-failure/], gap: [/conditional/, /remaining uncollected/], precedence: [/background-by-default/, /terminal TaskOutput collection suppresses/], visibility: [/settlement notice/], parity: [/PiCC UX hardening rather than verified parity/], split: [/tool\.Agent\.fork/] },
     { id: "feature.tool-output-clip", tier: "partial", core: [/tool-result clip backstop/, /head \+ tail kept, middle dropped/], gap: [/Built-in Read\/Bash keep Pi's OWN 50 KB truncation/], precedence: [/clipMaxTokens, default 20k tokens/], visibility: [/model-visible/, /human rendering summarizes/], parity: [/PiCC HARDENING, NOT Claude parity/, /DIRECTIONAL DIVERGENCE/], split: [/tool\.Read \/ tool\.Bash/] },
     { id: "tool.SendMessage", tier: "partial", core: [/resumes a completed/, /steers a running background one/, /PiCC allows resume after TaskStop/], gap: [/no cross-restart resume/, /steering is background-only/, /Claude Code 2\.1\.x reference refuses stopped-agent resume/], precedence: [/newest generation wins/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's queue behavior is undocumented/], split: [/tool\.Agent\.fork/] },
     { id: "tool.Agent.fork", tier: "partial", core: [/inherits the parent conversation/, /OUTPUT ISOLATION IS KEPT/], gap: [/NON-RESUMABLE/, /CANNOT SPAWN ANOTHER FORK/], precedence: [/CLAUDE_CODE_FORK_SUBAGENT/, /UNSET ⇒ ENABLED/, /CLAUDE_CODE_SUBAGENT_MODEL/, /per-call `model`/], visibility: [/visibly degrades/, /footer notice/], parity: [/VERIFIED behavior/, /PiCC-DEFINED \/ INFERRED/], split: [/SendMessage/] },
-    { id: "tool.TaskOutput", tier: "partial", core: [/retrieves background subagent results/, /canonical terminal result/], gap: [/PRE-EXISTING SCHEMA GAP/, /PiCC exposes wait/], precedence: [/FIRST terminal retrieval/, /AFTER an emitted settlement record/, /subagent reaches only tasks it dispatched/, /coordinator reaches every session task/], visibility: [/human\/streaming partial output/, /returns waiting to the model/], parity: [/PiCC EXTENSION\/DIVERGENCE/, /official Claude Code/] },
+    {
+      id: "tool.TaskOutput",
+      tier: "partial",
+      core: [
+        /retrieves background subagent results/,
+        /canonical terminal result/,
+        /main-session retrieval of depth-1 work/,
+        /FIRST terminal delivery/,
+        /semantic record/,
+        /never adding a reference or duplicate row/,
+      ],
+      gap: [/PRE-EXISTING SCHEMA GAP/, /PiCC exposes wait/],
+      precedence: [/FIRST terminal delivery/, /AFTER an emitted terminal record/, /terminal record counts as delivery/, /subagent reaches only tasks it dispatched/, /coordinator reaches every session task/],
+      visibility: [/human\/streaming partial output/, /returns waiting to the model/, /suppressed from the main-session human TUI/, /model-visible settled retrieval/],
+      parity: [/PiCC-defined collection-aware lifecycle/, /PiCC EXTENSION\/DIVERGENCE/, /official Claude Code/],
+    },
     { id: "tool.TaskStop", tier: "partial", core: [/stops a background subagent/, /TaskStop abandons it/], gap: [/PiCC accepts only task_id/, /Claude 2\.1\.198\+ also accepts agent id\/name/], precedence: [/subagent's TaskStop reaches only tasks it dispatched/, /coordinator can stop any session task/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's post-stop result semantics are undocumented/], split: [/tool\.TaskOutput/] },
   ])("retains $id semantic disclosure", (contract) => {
     expectDisclosure(contract);
@@ -337,7 +375,28 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   });
 
   it.each<DisclosureContract>([
-    { id: "feature.background-agents", tier: "partial", core: [/background-by-default dispatch/, /always-on status panel/], gap: [/idle parents are not re-invoked/, /no remote\/cloud agents/, /PiCC has no corresponding per-session spawn budget/], precedence: [/newest-generation-wins/, /effective configured concurrency/, /queues additional accepted work FIFO/, /each nested-background depth/, /separate configured-capacity pool/, /Foreground nested dispatch bypasses those pools/], visibility: [/interactive TUI/, /print\/RPC observability is unchanged/, /model-visible/], parity: [/NOT verified parity/, /PiCC EXTENSION\/DIVERGENCE/, /Claude Code 2\.1\.217/, /concurrently-running subagent cap/, /default 20/, /CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS/, /nested spawning disabled by default/, /CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH/, /does not establish queue-versus-rejection behavior/, /precise concurrency scope/, /Claude Code 2\.1\.212/, /default-200/, /per-session subagent-spawn cap/, /CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION/, /reset by \/clear/], split: [/tool\.SendMessage/, /tool\.TaskOutput/, /tool\.Agent\.fork/] },
+    {
+      id: "feature.background-agents",
+      tier: "partial",
+      core: [
+        /background-by-default dispatch/,
+        /always-on status panel/,
+        /main-session\/depth-1 background work/,
+        /successful acceptance is transient in human chat/,
+        /first terminal delivery through TaskOutput or settlement/,
+        /semantic.*record/,
+        /later already-reported TaskOutput retrieval adds no human row/,
+        /Nested work at depth >= 2/,
+        /default notice box/,
+        /panel tree/,
+        /parent's transcript/,
+      ],
+      gap: [/idle parents are not re-invoked/, /one-shot print mode/, /no cross-session agent view/, /no remote\/cloud agents/, /PiCC has no corresponding per-session spawn budget/],
+      precedence: [/first terminal delivery/, /later already-reported TaskOutput retrieval/, /Nested work at depth >= 2/, /newest-generation-wins/, /effective configured concurrency/, /queues additional accepted work FIFO/, /each nested-background depth/, /separate configured-capacity pool/, /Foreground nested dispatch bypasses those pools/],
+      visibility: [/interactive TUI/, /canonical\/model-visible results/, /print\/RPC output remain unchanged/],
+      parity: [/PiCC-defined semantic/, /NOT verified parity/, /PiCC EXTENSION\/DIVERGENCE/, /Claude Code 2\.1\.217/, /concurrently-running subagent cap/, /default 20/, /CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS/, /nested spawning disabled by default/, /CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH/, /does not establish queue-versus-rejection behavior/, /precise concurrency scope/, /Claude Code 2\.1\.212/, /default-200/, /per-session subagent-spawn cap/, /CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION/, /reset by \/clear/],
+      split: [/tool\.SendMessage/, /tool\.TaskOutput/, /tool\.Agent\.fork/],
+    },
     { id: "setting.subagentMaxDepth", tier: "full", core: [/caps subagent nesting depth/, /accepts any positive integer/], precedence: [/default 1/, /MAIN-SESSION-ONLY/], parity: [/PiCC extension/, /NOT Claude parity/] },
     { id: "setting.subagentConcurrency", tier: "full", core: [/configured capacity applies to root dispatches/, /separately/, /each nested-background depth/], gap: [/foreground nested dispatch bypasses those pools/, /not a total/, /session ceiling/], parity: [/PiCC extension/, /no Claude-settings equivalent/] },
   ])("retains $id semantic disclosure", (contract) => {
