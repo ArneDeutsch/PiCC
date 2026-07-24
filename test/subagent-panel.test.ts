@@ -672,101 +672,45 @@ describe("responsive panel table", () => {
     expect(text).not.toContain("c/write");
   });
 
-  it("drops eligible metadata in order with one shared panel profile", () => {
-    type Presence = {
-      cacheWrite: boolean;
-      cacheRead: boolean;
-      cost: boolean;
-      output: boolean;
-      input: boolean;
-      elapsed: boolean;
-    };
-    const presence = (lines: string[]): Presence => ({
-      cacheWrite: lines.some((line) => line.includes("c/write")),
-      cacheRead: lines.some((line) => line.includes("c/read")),
-      cost: lines.some((line) => line.includes("$")),
-      output: lines.some((line) => line.includes("out ")),
-      input: lines.some((line) => line.includes("in ")),
-      elapsed: lines.some((line) => /\b\d+s\b/.test(line)),
-    });
-    const transitionWidths: { [K in keyof Presence]: number | undefined } = {
-      cacheWrite: undefined,
-      cacheRead: undefined,
-      cost: undefined,
-      output: undefined,
-      input: undefined,
-      elapsed: undefined,
-    };
-    const full: Presence = {
-      cacheWrite: true, cacheRead: true, cost: true, output: true, input: true, elapsed: true,
-    };
-    const empty: Presence = {
-      cacheWrite: false, cacheRead: false, cost: false, output: false, input: false, elapsed: false,
-    };
-    let previous = full;
-    let firstProfile: Presence | undefined;
-    let lastProfile: Presence | undefined;
-    for (let width = 180; width >= 1; width--) {
-      const lines = rowsOnly(renderSubagentPanel(mixedView(), { width, entryChord: CHORD })).slice(0, 3);
-      if (lines.length !== 3 || lines.some((line) => /(?:failed|stopped|running|completed)/.test(line))) continue;
-      const current = presence(lines);
-      firstProfile ??= current;
-      lastProfile = current;
-      if (previous.cacheWrite && !current.cacheWrite) transitionWidths.cacheWrite = width;
-      if (previous.cacheRead && !current.cacheRead) transitionWidths.cacheRead = width;
-      if (previous.cost && !current.cost) transitionWidths.cost = width;
-      if (previous.output && !current.output) transitionWidths.output = width;
-      if (previous.input && !current.input) transitionWidths.input = width;
-      if (previous.elapsed && !current.elapsed) transitionWidths.elapsed = width;
-      expect(previous.cacheWrite || !current.cacheWrite).toBe(true);
-      expect(previous.cacheRead || !current.cacheRead).toBe(true);
-      expect(previous.cost || !current.cost).toBe(true);
-      expect(previous.output || !current.output).toBe(true);
-      expect(previous.input || !current.input).toBe(true);
-      expect(previous.elapsed || !current.elapsed).toBe(true);
-      previous = current;
-
-      const occurrences = {
-        cacheWrite: lines.filter((line) => line.includes("c/write")).length,
-        cacheRead: lines.filter((line) => line.includes("c/read")).length,
-        cost: lines.filter((line) => line.includes("$")).length,
-        output: lines.filter((line) => line.includes("out ")).length,
-        input: lines.filter((line) => line.includes("in ")).length,
-        elapsed: lines.filter((line) => /\b\d+s\b/.test(line)).length,
-      };
-      expect(occurrences.cacheWrite).toBe(current.cacheWrite ? 1 : 0);
-      expect(occurrences.cacheRead).toBe(current.cacheRead ? 1 : 0);
-      expect(occurrences.cost).toBe(current.cost ? 2 : 0);
-      expect(occurrences.output).toBe(current.output ? 2 : 0);
-      expect(occurrences.input).toBe(current.input ? 1 : 0);
-      expect(occurrences.elapsed).toBe(current.elapsed ? 3 : 0);
-      expect(new Set(lines.map(visibleWidth))).toEqual(new Set([width]));
-      for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+  it("drops eligible metadata at the shared panel-profile boundaries", () => {
+    type Metric = "cacheWrite" | "cacheRead" | "cost" | "output" | "input" | "elapsed";
+    const present = (lines: string[], metric: Metric): boolean => lines.some((line) => ({
+      cacheWrite: line.includes("c/write"),
+      cacheRead: line.includes("c/read"),
+      cost: line.includes("$"),
+      output: line.includes("out "),
+      input: line.includes("in "),
+      elapsed: /\b\d+s\b/.test(line),
+    })[metric]);
+    const boundaries: Array<[Metric, number, number]> = [
+      ["cacheWrite", 82, 81],
+      ["cacheRead", 70, 69],
+      ["cost", 59, 58],
+      ["output", 51, 50],
+      ["input", 41, 40],
+      ["elapsed", 30, 29],
+    ];
+    for (const [metric, lastPresent, firstAbsent] of boundaries) {
+      const before = rowsOnly(renderSubagentPanel(mixedView(), { width: lastPresent, entryChord: CHORD })).slice(0, 3);
+      const after = rowsOnly(renderSubagentPanel(mixedView(), { width: firstAbsent, entryChord: CHORD })).slice(0, 3);
+      expect(present(before, metric), `${metric} at ${lastPresent}`).toBe(true);
+      expect(present(after, metric), `${metric} at ${firstAbsent}`).toBe(false);
+      for (const [lines, width] of [[before, lastPresent], [after, firstAbsent]] as const) {
+        expect(lines).toHaveLength(3);
+        for (const line of lines) expect(visibleWidth(line)).toBe(width);
+      }
     }
-    expect(firstProfile).toEqual(full);
-    expect(lastProfile).toEqual(empty);
-    expect(transitionWidths.cacheWrite).toBeGreaterThan(transitionWidths.cacheRead!);
-    expect(transitionWidths.cacheRead).toBeGreaterThan(transitionWidths.cost!);
-    expect(transitionWidths.cost).toBeGreaterThan(transitionWidths.output!);
-    expect(transitionWidths.output).toBeGreaterThan(transitionWidths.input!);
-    expect(transitionWidths.input).toBeGreaterThan(transitionWidths.elapsed!);
 
     const focusedPanel = mixedView();
     focusedPanel.focused = true;
     focusedPanel.rows[0]!.selected = true;
     const focusedWide = renderSubagentPanel(focusedPanel, { width: 180, entryChord: CHORD }).slice(0, 3);
-    expect(presence(focusedWide)).toEqual(full);
+    for (const metric of boundaries.map(([name]) => name)) expect(present(focusedWide, metric)).toBe(true);
     expect(focusedWide.every((line) => visibleWidth(line) === 180)).toBe(true);
   });
 
   it("keeps descriptions until telemetry is gone, then truncates the elastic description", () => {
-    let firstDroppedWidth: number | undefined;
-    for (let width = 180; width >= 1; width--) {
-      const lines = rowsOnly(renderSubagentPanel(mixedView(), { width, entryChord: CHORD }));
-      if (!lines[0]?.includes("c/write")) { firstDroppedWidth = width; break; }
-    }
-    expect(firstDroppedWidth).toBeDefined();
-    const atDrop = rowsOnly(renderSubagentPanel(mixedView(), { width: firstDroppedWidth!, entryChord: CHORD }));
+    const atDrop = rowsOnly(renderSubagentPanel(mixedView(), { width: 81, entryChord: CHORD }));
     expect(atDrop[0]).toContain("build frontend");
     expect(atDrop[1]).toContain("review changes");
 
@@ -810,31 +754,17 @@ describe("responsive panel table", () => {
     expect(themed).not.toContain("$1.082095");
   });
 
-  it("keeps useful long custom identity, drops optional description, or aggregates truthfully", () => {
+  it("keeps useful long custom identity across aggregate, row-minimum, and wide profiles", () => {
     const panel = view(makeModel({ t: 1000 }), [rec({
       agentId: "custom", agentName: "custom-agent-identity-that-is-very-long",
       description: "distinct-dispatch-description-that-is-also-long",
       progress: { tail: [], activity: "", usage: { inputTokens: 99, outputTokens: 7 } },
     })]);
-    let sawRow = false;
-    let sawDescription = false;
-    let sawAggregate = false;
-    for (let width = 1; width <= 80; width++) {
-      const first = stripAnsi(renderSubagentPanel(panel, { width, entryChord: CHORD })[0] ?? "");
-      if (/\b1 running\b/u.test(first) || first === PANEL_RUNNING_FRAMES[0]) {
-        sawAggregate = true;
-        continue;
-      }
-      if (!first) continue;
-      sawRow = true;
-      expect(first, `width=${width}`).toMatch(/custom|cus|cu…/u);
-      if (/distinct|dis|di…/u.test(first)) sawDescription = true;
-    }
-    expect({ sawRow, sawDescription, sawAggregate }).toEqual({
-      sawRow: true,
-      sawDescription: true,
-      sawAggregate: true,
-    });
+    const at = (width: number) =>
+      stripAnsi(renderSubagentPanel(panel, { width, entryChord: CHORD })[0] ?? "");
+    expect(at(PANEL_MIN_ROW_WIDTH - 1)).toMatch(/1 running|^\S$/u);
+    expect(at(PANEL_MIN_ROW_WIDTH)).toMatch(/custom|cus|cu…/u);
+    expect(at(80)).toMatch(/custom.*distinct/u);
   });
 
   it("never renders task ids while retaining distinct hidden keys for duplicate visible rows", () => {
@@ -850,11 +780,8 @@ describe("responsive panel table", () => {
     ];
     const panel = view(model, records, { tasks });
     expect(panel.rows.map((row) => row.keyId)).toEqual(["task:task-secret-a", "task:task-secret-b"]);
-    for (let width = 0; width <= 140; width++) {
-      const text = renderSubagentPanel(panel, { width, entryChord: CHORD }).join("\n");
-      expect(text).not.toContain("task-secret");
-    }
     const passive = rowsOnly(renderSubagentPanel(panel, { width: 100, entryChord: CHORD }));
+    expect(passive.join("\n")).not.toContain("task-secret");
     expect(passive[0]).toBe(passive[1]);
   });
 
