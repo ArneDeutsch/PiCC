@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect } from "vitest";
-import { loadSkillBody, loadSkills } from "../../src/claude/skills.js";
+import { loadSkillBody, loadSkills, substituteArguments } from "../../src/claude/skills.js";
 import { REINJECT_PER_SKILL_MAX_CHARS } from "../../src/runtime/skill-activation.js";
 import { walkFiles } from "../../src/util/fs.js";
 
@@ -64,14 +64,26 @@ export function resolveMarkdownLinks(source: string): ResolvedMarkdownLink[] {
   });
 }
 
+export interface ShippedSkillContractOptions {
+  approvedExternalFiles?: readonly string[];
+  representativeArguments?: string;
+}
+
 /** Assert loader, budget, graph-closure, and canonical containment for one shipped skill. */
-export function expectShippedSkillContract(paths: ShippedArtifactPaths, name: string): string {
+export function expectShippedSkillContract(
+  paths: ShippedArtifactPaths,
+  name: string,
+  options: ShippedSkillContractOptions = {},
+): string {
   const repoRoot = expectCanonicalRealpath(paths.root, "repository root");
   const shippedRoots = [paths.evaluate, paths.implementFeature, paths.agents].map((root) => {
     const real = expectCanonicalRealpath(root, `shipped root ${root}`);
     expect(isInside(real, repoRoot), `${root} must remain in the repository`).toBe(true);
     return real;
   });
+  const approvedExternalFiles = (options.approvedExternalFiles ?? []).map((file) =>
+    expectCanonicalRealpath(file, `approved external artifact ${file}`),
+  );
   const skillRootPath = path.join(paths.skills, name);
   const skillRoot = expectCanonicalRealpath(skillRootPath, `skill root ${name}`);
   expect(shippedRoots.some((root) => normalized(root) === normalized(skillRoot))).toBe(true);
@@ -92,13 +104,23 @@ export function expectShippedSkillContract(paths: ShippedArtifactPaths, name: st
   const body = loadSkillBody(skill!);
   expect(body.length).toBeGreaterThan(0);
   expect(body.length).toBeLessThanOrEqual(REINJECT_PER_SKILL_MAX_CHARS);
+  if (options.representativeArguments !== undefined) {
+    const rendered = substituteArguments(body, options.representativeArguments, skill!.arguments);
+    expect(rendered.text).toContain(options.representativeArguments);
+    expect(rendered.text.length).toBeLessThanOrEqual(REINJECT_PER_SKILL_MAX_CHARS);
+  }
 
-  const skillFiles = walkFiles(skillRootPath, (entry) => entry === "SKILL.md");
+  const skillFiles = walkFiles(skillRootPath, (entry) => entry.toLowerCase() === "skill.md");
   expect(skillFiles.map((file) => normalized(fs.realpathSync(file)))).toEqual([
     normalized(canonicalSkillFile),
   ]);
 
-  const linkedLocalReferences = new Set<string>();
+  const linkedLocalReferences = new Set<string>(body.match(/references\/[A-Za-z0-9_-]+\.md/gi) ?? []);
+  for (const localReference of linkedLocalReferences) {
+    const file = path.resolve(skillRootPath, localReference);
+    expect(isInside(file, skillRoot), `router reference escapes skill root: ${localReference}`).toBe(true);
+    expectCanonicalRealpath(file, `router reference ${localReference}`);
+  }
   for (const source of walkFiles(skillRootPath, (entry) => entry.toLowerCase().endsWith(".md"))) {
     const sourceReal = fs.realpathSync(source);
     expect(isInside(sourceReal, skillRoot), `Markdown source escapes skill root: ${source}`).toBe(true);
@@ -108,10 +130,22 @@ export function expectShippedSkillContract(paths: ShippedArtifactPaths, name: st
     for (const link of resolveMarkdownLinks(source)) {
       const { target, lexicalPath: lexical, realPath: resolved } = link;
       const lexicalRoot = shippedRoots.find((root) => isInside(lexical, root));
-      expect(lexicalRoot, `link lexically escapes allowlisted shipped roots: ${target}`).toBeDefined();
-      expect(isInside(resolved, lexicalRoot!), `link resolves outside its shipped root: ${target}`).toBe(
-        true,
+      const approvedExternal = approvedExternalFiles.find(
+        (file) => normalized(file) === normalized(lexical),
       );
+      expect(
+        lexicalRoot ?? approvedExternal,
+        `link lexically escapes allowlisted shipped roots/files: ${target}`,
+      ).toBeDefined();
+      if (lexicalRoot) {
+        expect(isInside(resolved, lexicalRoot), `link resolves outside its shipped root: ${target}`).toBe(
+          true,
+        );
+      } else {
+        expect(normalized(resolved), `external link resolves outside its allowlisted file: ${target}`).toBe(
+          normalized(approvedExternal!),
+        );
+      }
       if (isInside(resolved, skillRoot) && normalized(sourceReal) === normalized(canonicalSkillFile)) {
         linkedLocalReferences.add(path.relative(skillRoot, resolved).replace(/\\/g, "/"));
       }
@@ -121,7 +155,7 @@ export function expectShippedSkillContract(paths: ShippedArtifactPaths, name: st
   const referencesPath = path.join(skillRootPath, "references");
   const referencesRoot = expectCanonicalRealpath(referencesPath, `${name}/references`);
   expect(isInside(referencesRoot, skillRoot)).toBe(true);
-  const onDiskReferences = walkFiles(referencesPath, (entry) => entry.endsWith(".md"))
+  const onDiskReferences = walkFiles(referencesPath, (entry) => entry.toLowerCase().endsWith(".md"))
     .map((file) => {
       const real = fs.realpathSync(file);
       expect(isInside(real, referencesRoot), `reference escapes references root: ${file}`).toBe(true);
