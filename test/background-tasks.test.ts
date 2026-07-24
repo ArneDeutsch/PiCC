@@ -13,7 +13,6 @@ import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
 import { createAgentToolDefinition, type PiSessionStats } from "../src/runtime/subagents.js";
 import {
   RECORD_EXPAND_HINT,
-  RECORD_REFERENCE_NOTE,
   renderAgentResult,
   renderSettlementRecord,
 } from "../src/runtime/subagent-render.js";
@@ -50,6 +49,7 @@ type StreamTool = {
     r: { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> },
     o: { expanded?: boolean; isPartial?: boolean },
     theme: unknown,
+    context?: { state?: Record<string, unknown>; args?: Record<string, unknown>; isError?: boolean },
   ) => { render: (w: number) => string[] };
 };
 /** Render a captured partial/final the way Pi would, and flatten to one string. */
@@ -2714,7 +2714,9 @@ describe("TaskOutput live streaming", () => {
     // No live tail leaked into the settled content.
     expect(out.content[0]!.text).not.toContain("Grep");
     // Human render: neither the raw agent-ID trailer nor a duplicated usage line.
-    const human = taskOutput.renderResult(out, { isPartial: false }, undefined).render(120).join("\n");
+    const human = taskOutput.renderResult(out, { isPartial: false }, undefined, {
+      state: {}, args: { task_id: id }, isError: false,
+    }).render(120).join("\n");
     expect(human).toContain("the answer");
     expect(human).not.toContain("---");
     expect(human).not.toMatch(/\[agent /);
@@ -2822,7 +2824,9 @@ describe("TaskOutput live streaming", () => {
     const out = await taskOutput.execute("t", { task_id: id, wait: false });
     expect(out.details.status).toBe("completed");
     expect(out.details.outcome).toBe("completed");
-    const human = taskOutput.renderResult(out, { isPartial: false }, undefined).render(120).join("\n");
+    const human = taskOutput.renderResult(out, { isPartial: false }, undefined, {
+      state: {}, args: { task_id: id }, isError: false,
+    }).render(120).join("\n");
     expect(human).toContain("completed"); // settled badge
     expect(human).not.toContain("still running"); // not the running poll frame
     expect(human).not.toContain("… starting…");
@@ -2848,11 +2852,13 @@ describe("TaskOutput live streaming", () => {
     expect(failed.content[0]!.text).toBe(
       `Background task ${failedId} (coder, ${AGENT_ID}) failed: connection reset`,
     );
-    const failedHuman = taskOutput.renderResult(failed, { isPartial: false }, undefined).render(120).join("\n");
+    const failedHuman = taskOutput.renderResult(failed, { isPartial: false }, undefined, {
+      state: {}, args: { task_id: failedId }, isError: false,
+    }).render(120).join("\n");
     expect(failedHuman).not.toContain(`Background task ${failedId}`); // not restated in the body
     expect(failedHuman).toContain("connection reset"); // reason kept
-    expect(failedHuman).toContain(`task output ${failedId}`); // explicit target
-    expect(failedHuman).toContain(AGENT_ID); // identity subline (non-resumable)
+    expect(failedHuman).toContain(`task: ${failedId}`); // operational target in expanded detail
+    expect(failedHuman).toContain(`agent: ${AGENT_ID}`);
 
     // Aborted (stopped): the "stopped before completing" clause is kept.
     let resolve!: (v: ReturnType<typeof result>) => void;
@@ -2867,10 +2873,12 @@ describe("TaskOutput live streaming", () => {
     resolve(result({ outcome: "aborted", finalMessage: "discard me", agentId: "agent-ccddeeff0011" }));
     await registry.wait(abId);
     const aborted = await taskOutput.execute("t2", { task_id: abId });
-    const abHuman = taskOutput.renderResult(aborted, { isPartial: false }, undefined).render(120).join("\n");
+    const abHuman = taskOutput.renderResult(aborted, { isPartial: false }, undefined, {
+      state: {}, args: { task_id: abId }, isError: false,
+    }).render(120).join("\n");
     expect(abHuman).not.toContain(`Background task ${abId}`); // not restated in the body
     expect(abHuman).toContain("it was stopped before completing"); // reason clause kept
-    expect(abHuman).toContain(`task output ${abId}`); // explicit target
+    expect(abHuman).toContain(`task: ${abId}`); // operational target in expanded detail
   });
 });
 
@@ -3474,6 +3482,18 @@ describe("settlement completion record (details + exactly-once)", () => {
       (a) => sub.get(a) !== undefined,
     );
 
+  function renderTaskOutputResult(
+    tool: StreamTool,
+    value: unknown,
+    taskId: string,
+    expanded = false,
+  ): string[] {
+    const wrapped = wrapForSelfShell(tool as unknown as Record<string, unknown>) as any;
+    const context = { state: {}, args: { task_id: taskId }, isPartial: false, isError: false };
+    wrapped.renderCall(context.args, undefined, context);
+    return wrapped.renderResult(value, { isPartial: false, expanded }, undefined, context).render(200);
+  }
+
   it.each([
     {
       name: "completed",
@@ -3589,12 +3609,7 @@ describe("settlement completion record (details + exactly-once)", () => {
       alreadyReported: true,
     });
     expect(afterNotice.details.userStopped).toBe(testCase.userStopped ? true : undefined);
-    const noticeReference = noticeTool
-      .renderResult(afterNotice, { isPartial: false, expanded: false }, undefined)
-      .render(200);
-    expect(noticeReference).toHaveLength(1);
-    expect(noticeReference[0]).toContain(`task output ${noticeTask.id} - worker [${testCase.badge}]`);
-    expect(noticeReference[0]).toContain(RECORD_REFERENCE_NOTE);
+    expect(renderTaskOutputResult(noticeTool, afterNotice, noticeTask.id)).toEqual([]);
 
     const directTask = await makeTask();
     const directTool = createTaskOutputTool(directTask.bg) as unknown as StreamTool;
@@ -3619,12 +3634,7 @@ describe("settlement completion record (details + exactly-once)", () => {
       alreadyReported: true,
     });
     expect(second.details.userStopped).toBe(testCase.userStopped ? true : undefined);
-    const collectionReference = directTool
-      .renderResult(second, { isPartial: false, expanded: false }, undefined)
-      .render(200);
-    expect(collectionReference).toHaveLength(1);
-    expect(collectionReference[0]).toContain(`task output ${directTask.id} - worker [${testCase.badge}]`);
-    expect(collectionReference[0]).toContain(RECORD_REFERENCE_NOTE);
+    expect(renderTaskOutputResult(directTool, second, directTask.id)).toEqual([]);
   });
 
   it("a never-awaited settlement's notice carries the UI record details; the registered renderer draws ONE collapsed record", async () => {
@@ -3685,11 +3695,9 @@ describe("settlement completion record (details + exactly-once)", () => {
     expect(expanded).toContain("the review report");
     expect(expanded).toContain("transcript: /x/sessions/");
     expect(expanded).toContain("usage:");
-    const referenceLines = renderSettlementRecord({ ...details, alreadyReported: true }, { expanded: false }, undefined)!
-      .render(200);
-    expect(referenceLines[0]).toContain("worker [completed]");
-    expect(referenceLines[0]).not.toContain(id);
-    expect(referenceLines[0]).toContain(RECORD_REFERENCE_NOTE);
+    expect(expanded).toContain(`task: ${id}`);
+    expect(expanded).toContain(`agent: ${AGENT_ID}`);
+    expect(expanded.match(new RegExp(AGENT_ID, "gu"))).toHaveLength(2); // transcript basename plus one identity footer
   });
 
   it("caps settlement UI final text at a scalar boundary without changing the task result", async () => {
@@ -3807,7 +3815,7 @@ describe("settlement completion record (details + exactly-once)", () => {
     expect(malformed.render(200)).toEqual([""]);
   });
 
-  it("exactly-once: settlement record delivered first → a later TaskOutput renders ONLY the reference line", async () => {
+  it("exactly-once: settlement record delivered first → a later TaskOutput has no human row", async () => {
     const bg = new BackgroundTaskRegistry();
     const id = bg.start(
       "agent:worker",
@@ -3827,18 +3835,13 @@ describe("settlement completion record (details + exactly-once)", () => {
     // Model-facing content stays the full verbatim result (print/RPC unchanged)…
     expect(out.content[0]!.text).toBe("the review report");
     expect(out.details.alreadyReported).toBe(true);
-    // …but the render is the minimal reference line, collapsed AND expanded.
+    // …but trusted interactive rendering suppresses both collapsed and expanded rows.
     for (const expanded of [false, true]) {
-      const lines = taskOutput
-        .renderResult(out, { isPartial: false, expanded }, undefined)
-        .render(200);
-      expect(lines).toHaveLength(1);
-      expect(lines[0]).toContain(RECORD_REFERENCE_NOTE);
-      expect(lines[0]).not.toContain("the review report");
+      expect(renderTaskOutputResult(taskOutput, out, id, expanded)).toEqual([]);
     }
   });
 
-  it("exactly-once, other order: TaskOutput collects first → full record once, then reference; no settlement notice", async () => {
+  it("exactly-once, other order: TaskOutput collects first → full record once, then no duplicate row; no settlement notice", async () => {
     const bg = new BackgroundTaskRegistry();
     const id = bg.start(
       "agent:worker",
@@ -3855,22 +3858,17 @@ describe("settlement completion record (details + exactly-once)", () => {
     const first = await taskOutput.execute("t", { task_id: id }, undefined, undefined);
     expect(first.details.alreadyReported).toBeUndefined();
     expect(typeof first.details.durationMs).toBe("number");
-    const collapsed = taskOutput
-      .renderResult(first, { isPartial: false, expanded: false }, undefined)
-      .render(200);
+    const collapsed = renderTaskOutputResult(taskOutput, first, id);
     expect(collapsed).toHaveLength(1);
     expect(collapsed[0]).toContain(RECORD_EXPAND_HINT);
+    expect(collapsed[0]).not.toContain(id);
     // The settlement notice is suppressed (collection already reported it).
     expect(drainOnce(bg, sub)).toEqual([]);
 
-    // A second collection renders only the reference line.
+    // A second collection remains canonical but adds no human row.
     const second = await taskOutput.execute("t2", { task_id: id }, undefined, undefined);
     expect(second.details.alreadyReported).toBe(true);
-    const ref = taskOutput
-      .renderResult(second, { isPartial: false, expanded: false }, undefined)
-      .render(200);
-    expect(ref).toHaveLength(1);
-    expect(ref[0]).toContain(RECORD_REFERENCE_NOTE);
+    expect(renderTaskOutputResult(taskOutput, second, id)).toEqual([]);
   });
 
   it("TaskOutput details: durationMs only when settled; error only when failed; a running poll has neither", async () => {

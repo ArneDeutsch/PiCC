@@ -8,7 +8,13 @@ import {
 import { clampLines, pushColored, pushWrapped, themedBold, themedFg } from "./render-util.js";
 import { formatElapsed } from "./subagent-panel-render.js";
 import { FORK_DEGRADE_PREFIX, isAgentId } from "../util/subagent-transcripts.js";
-import { genericResultComponent, setToolRowOutcome, type ToolRowOutcome } from "./tool-shell.js";
+import {
+  genericResultComponent,
+  setToolRowOutcome,
+  suppressToolRow,
+  useTightToolRowMarker,
+  type ToolRowOutcome,
+} from "./tool-shell.js";
 import type { Diagnostic } from "../types.js";
 import { normalizeAgentColor, tintAgentColor, type AgentColorName } from "./agent-color.js";
 import { formatToolDisplayName } from "./tool-display.js";
@@ -36,8 +42,6 @@ import type { SubagentAdmission } from "./subagent-registry.js";
 export const RECORD_EXPAND_HINT = "ctrl+o to expand";
 /** The condensed fork-degrade warning — NEVER expand-only on a degraded fork. */
 export const RECORD_FORK_MARKER = "⚠ fork degraded";
-/** Suffix of the minimal reference line for an already-reported settlement. */
-export const RECORD_REFERENCE_NOTE = "full record above";
 
 /** Per-tool-call state shared by Pi across call/result renderer slots. */
 export interface SubagentLifecycleRenderState {
@@ -111,9 +115,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function safeField(value: unknown, key: PropertyKey): unknown {
   if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
   try {
-    return Reflect.get(value, key);
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
   } catch {
     return undefined;
+  }
+}
+
+function hasOwnField(value: unknown, key: PropertyKey): boolean {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return false;
+  try {
+    return Object.getOwnPropertyDescriptor(value, key) !== undefined;
+  } catch {
+    return true;
   }
 }
 
@@ -129,12 +143,8 @@ function boundedString(value: unknown, limit = RENDER_SCALAR_LIMIT): string | un
 
 function arrayLength(value: unknown, limit: number): number {
   if (!safeArray(value)) return 0;
-  try {
-    const length = value.length;
-    return Number.isSafeInteger(length) && length > 0 ? Math.min(length, limit) : 0;
-  } catch {
-    return 0;
-  }
+  const length = safeField(value, "length");
+  return Number.isSafeInteger(length) && (length as number) > 0 ? Math.min(length as number, limit) : 0;
 }
 
 function normalizeDiagnostics(value: unknown): Diagnostic[] | undefined {
@@ -317,6 +327,207 @@ function taskOutputTarget(
   return sanitized || taskChip(details);
 }
 
+function isTaskId(value: unknown): value is string {
+  return typeof value === "string" && /^task-[1-9]\d*$/u.test(value);
+}
+
+interface OwnDataSnapshot {
+  readonly values: ReadonlyMap<PropertyKey, unknown>;
+}
+
+function ownDataSnapshot(value: unknown, prototype?: object): OwnDataSnapshot | undefined {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
+  try {
+    if (prototype !== undefined && Object.getPrototypeOf(value) !== prototype) return undefined;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const values = new Map<PropertyKey, unknown>();
+    for (const key of Reflect.ownKeys(descriptors)) {
+      const descriptor = descriptors[key as keyof typeof descriptors];
+      if (!descriptor || !("value" in descriptor)) return undefined;
+      values.set(key, descriptor.value);
+    }
+    return { values };
+  } catch {
+    return undefined;
+  }
+}
+
+function exactSnapshot(
+  value: unknown,
+  prototype: object,
+  allowed: ReadonlySet<PropertyKey>,
+): OwnDataSnapshot | undefined {
+  const snapshot = ownDataSnapshot(value, prototype);
+  if (!snapshot || [...snapshot.values.keys()].some((key) => !allowed.has(key))) return undefined;
+  return snapshot;
+}
+
+function snapshotField(snapshot: OwnDataSnapshot, key: PropertyKey): unknown {
+  return snapshot.values.get(key);
+}
+
+function hasSnapshotField(snapshot: OwnDataSnapshot, key: PropertyKey): boolean {
+  return snapshot.values.has(key);
+}
+
+const TEXT_BLOCK_KEYS = new Set<PropertyKey>(["type", "text"]);
+const RESULT_ENVELOPE_KEYS = new Set<PropertyKey>(["content", "details", "isError"]);
+const DIAGNOSTIC_KEYS = new Set<PropertyKey>(["severity", "message", "source"]);
+const USAGE_KEYS = new Set<PropertyKey>([
+  "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "costUsd",
+]);
+const AGENT_ACCEPTANCE_KEYS = new Set<PropertyKey>([
+  "background", "taskId", "agent", "agentId", "admission", "description",
+]);
+const TASK_OUTPUT_RESULT_KEYS = new Set<PropertyKey>([
+  "taskId", "status", "admission", "outcome", "agent", "agentId", "cutOff",
+  "transcriptPath", "resumable", "usage", "lastActivity", "diagnostics", "description",
+  "durationMs", "settledAt", "error", "userStopped", "alreadyReported",
+]);
+const ARRAY_SINGLE_KEYS = new Set<PropertyKey>(["0", "length"]);
+
+function canonicalTextEnvelopeSnapshot(result: unknown): {
+  envelope: OwnDataSnapshot;
+  details: OwnDataSnapshot;
+} | undefined {
+  const envelope = exactSnapshot(result, Object.prototype, RESULT_ENVELOPE_KEYS);
+  if (!envelope || !hasSnapshotField(envelope, "content") || !hasSnapshotField(envelope, "details")) return undefined;
+  const envelopeError = snapshotField(envelope, "isError");
+  if (hasSnapshotField(envelope, "isError") && envelopeError !== false) return undefined;
+  const content = exactSnapshot(snapshotField(envelope, "content"), Array.prototype, ARRAY_SINGLE_KEYS);
+  if (!content || snapshotField(content, "length") !== 1) return undefined;
+  const block = exactSnapshot(snapshotField(content, "0"), Object.prototype, TEXT_BLOCK_KEYS);
+  if (!block || block.values.size !== 2 || snapshotField(block, "type") !== "text" ||
+    typeof snapshotField(block, "text") !== "string" || snapshotField(block, "text") === "") return undefined;
+  const details = ownDataSnapshot(snapshotField(envelope, "details"), Object.prototype);
+  return details ? { envelope, details } : undefined;
+}
+
+function canonicalDiagnosticsSnapshot(value: unknown): boolean {
+  const array = ownDataSnapshot(value, Array.prototype);
+  if (!array) return false;
+  const length = snapshotField(array, "length");
+  if (!Number.isSafeInteger(length) || (length as number) > RENDER_DIAGNOSTIC_LIMIT || (length as number) < 0) return false;
+  const expected = new Set<PropertyKey>(["length", ...Array.from({ length: length as number }, (_, index) => String(index))]);
+  if ([...array.values.keys()].some((key) => !expected.has(key)) || array.values.size !== expected.size) return false;
+  for (let index = 0; index < (length as number); index++) {
+    const diagnostic = exactSnapshot(snapshotField(array, String(index)), Object.prototype, DIAGNOSTIC_KEYS);
+    if (!diagnostic || !hasSnapshotField(diagnostic, "severity") || !hasSnapshotField(diagnostic, "message")) return false;
+    const severity = snapshotField(diagnostic, "severity");
+    const source = snapshotField(diagnostic, "source");
+    if ((severity !== "info" && severity !== "warning" && severity !== "error") ||
+      typeof snapshotField(diagnostic, "message") !== "string" ||
+      (hasSnapshotField(diagnostic, "source") && typeof source !== "string")) return false;
+  }
+  return true;
+}
+
+function canonicalUsageSnapshot(value: unknown): boolean {
+  const usage = exactSnapshot(value, Object.prototype, USAGE_KEYS);
+  if (!usage || usage.values.size === 0) return false;
+  for (const field of usage.values.values()) {
+    if (typeof field !== "number" || !Number.isFinite(field) || field < 0) return false;
+  }
+  return true;
+}
+
+function canonicalFinalContext(renderOptions: unknown, context: SubagentLifecycleRenderContext | undefined): OwnDataSnapshot | undefined {
+  const options = ownDataSnapshot(renderOptions, Object.prototype);
+  const renderContext = ownDataSnapshot(context);
+  if (!options || snapshotField(options, "isPartial") !== false ||
+    !renderContext || snapshotField(renderContext, "isError") !== false) return undefined;
+  return renderContext;
+}
+
+function canonicalRequestedTarget(context: OwnDataSnapshot, taskId: string): boolean {
+  if (!hasSnapshotField(context, "args")) return true;
+  const args = ownDataSnapshot(snapshotField(context, "args"), Object.prototype);
+  if (!args) return false;
+  if (!hasSnapshotField(args, "task_id")) return true;
+  return typeof snapshotField(args, "task_id") === "string" && snapshotField(args, "task_id") === taskId;
+}
+
+function validLifecycleIdentitySnapshot(details: OwnDataSnapshot): boolean {
+  const agent = snapshotField(details, "agent");
+  const agentId = snapshotField(details, "agentId");
+  const description = snapshotField(details, "description");
+  return typeof agent === "string" && sanitizeInline(agent) !== "" &&
+    typeof agentId === "string" && isAgentId(agentId) &&
+    (!hasSnapshotField(details, "description") || description === undefined || typeof description === "string");
+}
+
+function validTaskOutputOptionalsSnapshot(details: OwnDataSnapshot): boolean {
+  const optional = (key: string, accepts: (value: unknown) => boolean) =>
+    !hasSnapshotField(details, key) || snapshotField(details, key) === undefined || accepts(snapshotField(details, key));
+  return optional("error", (value) => typeof value === "string") &&
+    optional("userStopped", (value) => typeof value === "boolean") &&
+    optional("cutOff", (value) => typeof value === "boolean") &&
+    optional("resumable", (value) => typeof value === "boolean") &&
+    optional("durationMs", (value) => typeof value === "number" && Number.isFinite(value) && value >= 0) &&
+    optional("settledAt", (value) => typeof value === "number" && Number.isFinite(value)) &&
+    optional("transcriptPath", (value) => typeof value === "string") &&
+    optional("lastActivity", (value) => typeof value === "string") &&
+    optional("diagnostics", canonicalDiagnosticsSnapshot) &&
+    optional("usage", canonicalUsageSnapshot);
+}
+
+function suppressibleAgentAcceptance(
+  result: unknown,
+  _details: unknown,
+  renderOptions: unknown,
+  context: SubagentLifecycleRenderContext | undefined,
+  surface: SubagentRenderingOptions["surface"],
+): boolean {
+  if (surface !== "agent" || !canonicalFinalContext(renderOptions, context)) return false;
+  const canonical = canonicalTextEnvelopeSnapshot(result);
+  if (!canonical || [...canonical.details.values.keys()].some((key) => !AGENT_ACCEPTANCE_KEYS.has(key))) return false;
+  const details = canonical.details;
+  return snapshotField(details, "background") === true && isTaskId(snapshotField(details, "taskId")) &&
+    validLifecycleIdentitySnapshot(details) &&
+    (snapshotField(details, "admission") === "admitted" || snapshotField(details, "admission") === "waiting");
+}
+
+type CanonicalTaskOutputDelivery = "first" | "reported";
+
+function canonicalTaskOutputDelivery(
+  result: unknown,
+  renderOptions: unknown,
+  context: SubagentLifecycleRenderContext | undefined,
+  surface: SubagentRenderingOptions["surface"],
+): CanonicalTaskOutputDelivery | undefined {
+  if (surface !== "task-output") return undefined;
+  const renderContext = canonicalFinalContext(renderOptions, context);
+  const canonical = canonicalTextEnvelopeSnapshot(result);
+  if (!renderContext || !canonical ||
+    [...canonical.details.values.keys()].some((key) => !TASK_OUTPUT_RESULT_KEYS.has(key))) return undefined;
+  const details = canonical.details;
+  const alreadyReported = snapshotField(details, "alreadyReported");
+  let delivery: CanonicalTaskOutputDelivery | undefined;
+  if (hasSnapshotField(details, "alreadyReported")) {
+    if (alreadyReported === true) delivery = "reported";
+  } else {
+    delivery = "first";
+  }
+  if (!delivery || !validLifecycleIdentitySnapshot(details) || !validTaskOutputOptionalsSnapshot(details) ||
+    (snapshotField(details, "admission") !== "admitted" && snapshotField(details, "admission") !== "waiting")) return undefined;
+  const taskId = snapshotField(details, "taskId");
+  if (!isTaskId(taskId) || !canonicalRequestedTarget(renderContext, taskId)) return undefined;
+  const status = snapshotField(details, "status");
+  const outcome = snapshotField(details, "outcome");
+  const error = snapshotField(details, "error");
+  const userStopped = snapshotField(details, "userStopped");
+  if (status === "completed" && outcome === "completed") {
+    return error === undefined && userStopped === undefined ? delivery : undefined;
+  }
+  if (status === "failed" && outcome === "failed") return userStopped === undefined ? delivery : undefined;
+  if (status === "stopped" && outcome === "aborted") {
+    const runtimeAbort = typeof error === "string" && userStopped === undefined;
+    const userAbort = error === undefined && userStopped === true;
+    return (error === undefined && userStopped === undefined) || runtimeAbort || userAbort ? delivery : undefined;
+  }
+  return undefined;
+}
+
 function resolvedAgentColor(
   options: SubagentRenderingOptions,
   details: SubagentRenderDetails,
@@ -338,20 +549,6 @@ function agentIdOf(details: SubagentRenderDetails): string | undefined {
   return typeof details.agentId === "string" && isAgentId(details.agentId)
     ? details.agentId
     : undefined;
-}
-
-/**
- * Add the agent ID only to expanded, settled explicit TaskOutput detail when no
- * resumable footer already carries it. Passive and collapsed rows omit IDs.
- */
-function pushIdentitySubline(
-  theme: unknown,
-  details: SubagentRenderDetails,
-  width: number,
-  into: string[],
-): void {
-  const id = agentIdOf(details);
-  if (id) pushColored(theme, "muted", id, width, into);
 }
 
 /**
@@ -413,7 +610,7 @@ function durationOf(details: SubagentRenderDetails): string | undefined {
     : undefined;
 }
 
-/** Local wall-clock completion time, after JavaScript Date TimeClip validation. */
+/** Foreground Agent records retain their established local completion clock. */
 function completionTimeOf(details: SubagentRenderDetails): string | undefined {
   if (typeof details.settledAt !== "number" || !Number.isFinite(details.settledAt)) return undefined;
   const date = new Date(details.settledAt);
@@ -424,11 +621,7 @@ function completionTimeOf(details: SubagentRenderDetails): string | undefined {
 /** Collapsed-line error summary cap — the full error stays behind expand. */
 const COLLAPSED_ERROR_CAP = 80;
 
-/**
- * Collapsed-line usage: in/out tokens (+cost) ONLY. The cache read/write
- * counts live EXCLUSIVELY in the expanded `usage:` footer so the normal row
- * stays concise. Same shape tolerance as {@link formatUsageLine} otherwise.
- */
+/** Running-status usage: in/out tokens (+cost) only; complete usage stays in expanded detail. */
 function formatUsageBrief(usage: unknown): string | undefined {
   if (usage == null) return undefined;
   if (typeof usage === "string") return sanitizeInline(usage) || undefined;
@@ -499,6 +692,9 @@ function lifecycleLine(
 ): string[] {
   if (!Number.isFinite(width) || width <= 0) return [];
   const columns = Math.floor(width);
+  if (options.prefix && columns <= 2) {
+    return clampLines([themedFg(theme, options.tone, options.prefix.trim())], columns);
+  }
   const safeAgent = sanitizeInline(typeof options.agent === "string" ? options.agent : "") || "subagent";
   const required = (options.required ?? []).map((segment) => ({ ...segment }));
   const optional = [...(options.optional ?? [])];
@@ -517,8 +713,8 @@ function lifecycleLine(
 
   while (optional.length > 0 && visibleWidth(plain()) > columns) optional.pop();
 
-  // Reserve state, warning markers, and the recovery/reference cue before
-  // fitting diagnostic/error prose. Agent identity and summaries share the
+  // Reserve state, warning markers, and the expansion cue before fitting
+  // diagnostic/error prose on legacy and non-terminal lifecycle rows. Identity and summaries share the
   // remaining room; summaries are elastic, but short actionable text survives.
   const elastic = required.filter((candidate) => candidate.elastic);
   const elasticWidth = elastic.reduce(
@@ -599,47 +795,182 @@ function lifecycleLine(
   return clampLines([line], columns);
 }
 
-/**
- * The collapsed completion record: one lifecycle line — optional outcome glyph,
- * explicit target when requested, agent plus bracketed state, then the capped error summary for failures, the
- * condensed fork-degrade marker (never expand-only), duration, brief usage,
- * successful completion time, and the expand affordance. Transcript access and
- * complete metadata remain reachable via the existing Ctrl+O expansion.
- */
+function meaningfulIdentityFragment(text: string, width: number): string {
+  if (width <= 0) return "";
+  const fitted = truncateToWidth(text, width, "…");
+  const fittedPlain = fitted.replace(/\u001b\[[0-9;]*m/gu, "");
+  if (fittedPlain.replace(/…/gu, "").trim()) return fitted;
+  try {
+    const first = new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)[Symbol.iterator]().next().value?.segment ?? "";
+    return first.trim() && visibleWidth(first) <= width ? first : "";
+  } catch {
+    return "";
+  }
+}
+
+function semanticTerminalLine(
+  theme: unknown,
+  details: SubagentRenderDetails,
+  state: string,
+  prefix: string,
+  tone: string,
+  exceptional: LifecycleSegment[],
+  width: number,
+  color?: AgentColorName,
+): string[] {
+  if (!Number.isFinite(width) || width <= 0) return [];
+  const columns = Math.floor(width);
+  const marker = prefix.trim();
+  if (marker && columns <= visibleWidth(marker)) return clampLines([themedFg(theme, tone, marker)], columns);
+
+  const safeAgent = sanitizeInline(details.agent ?? "") || "subagent";
+  const stateText = `[${state}]`;
+  const markerText = prefix.trim();
+  const styledMarker = markerText ? themedFg(theme, tone, markerText) : "";
+  const markerGap = markerText ? " " : "";
+  const fullIdentityState = `${markerGap}${safeAgent} ${stateText}`;
+  let line = styledMarker;
+  let used = visibleWidth(markerText);
+
+  if (visibleWidth(fullIdentityState) <= columns - used) {
+    const styledIdentity = color
+      ? tintAgentColor(color, themedBold(theme, safeAgent))
+      : themedFg(theme, "text", safeAgent);
+    line += markerGap + styledIdentity + themedFg(theme, "muted", ` ${stateText}`);
+    used += visibleWidth(fullIdentityState);
+  } else {
+    const stateOnly = `${markerGap}${stateText}`;
+    if (visibleWidth(stateOnly) <= columns - used) {
+      const identityRoom = columns - used - visibleWidth(markerGap + ` ${stateText}`);
+      const fittedAgent = meaningfulIdentityFragment(safeAgent, identityRoom);
+      if (fittedAgent) {
+        const styledIdentity = color
+          ? tintAgentColor(color, themedBold(theme, fittedAgent))
+          : themedFg(theme, "text", fittedAgent);
+        line += markerGap + styledIdentity + themedFg(theme, "muted", ` ${stateText}`);
+        used += visibleWidth(markerGap + fittedAgent + ` ${stateText}`);
+      } else {
+        line += themedFg(theme, "muted", stateOnly);
+        used += visibleWidth(stateOnly);
+      }
+    } else {
+      let identityGap = markerGap;
+      let identityRoom = columns - used - visibleWidth(identityGap);
+      let fittedAgent = meaningfulIdentityFragment(safeAgent, identityRoom);
+      if (!fittedAgent && identityGap) {
+        identityGap = "";
+        identityRoom = columns - used;
+        fittedAgent = meaningfulIdentityFragment(safeAgent, identityRoom);
+      }
+      if (!fittedAgent) return clampLines([line], columns);
+      const styledIdentity = color
+        ? tintAgentColor(color, themedBold(theme, fittedAgent))
+        : themedFg(theme, "text", fittedAgent);
+      line += identityGap + styledIdentity;
+      return clampLines([line], columns);
+    }
+  }
+
+  // Fit each priority class before considering the next. If a textual class
+  // needs truncation, it consumes the remaining room and all lower classes drop.
+  const appendText = (separator: string, text: string, slot: string, elastic: boolean): boolean => {
+    const remaining = columns - used;
+    const full = separator + text;
+    if (visibleWidth(full) <= remaining) {
+      line += themedFg(theme, slot, full);
+      used += visibleWidth(full);
+      return true;
+    }
+    if (!elastic || remaining <= visibleWidth(separator)) return false;
+    const fitted = truncateToWidth(text, remaining - visibleWidth(separator), "…");
+    const meaningful = fitted.replace(/\u001b\[[0-9;]*m/gu, "").replace(/…/gu, "").trim();
+    if (meaningful) line += themedFg(theme, slot, separator + fitted);
+    used = columns;
+    return false;
+  };
+
+  for (const segment of exceptional) {
+    if (!appendText(segment.separator, segment.text, segment.tone ?? "muted", true)) {
+      return clampLines([line], columns);
+    }
+  }
+  const description = sanitizeInline(details.description ?? "");
+  if (description && !appendText(" - ", description, "accent", true)) return clampLines([line], columns);
+
+  const remaining = columns - used;
+  const cue = [RECORD_EXPAND_HINT, "ctrl+o"].find((candidate) =>
+    visibleWidth(` · ${candidate}`) <= remaining,
+  );
+  const cueWidth = cue ? visibleWidth(` · ${cue}`) : 0;
+  const duration = durationOf(details);
+  const includeDuration = cue !== undefined && duration !== undefined &&
+    visibleWidth(` · ${duration}`) <= remaining - cueWidth;
+  // Selection gives the cue priority, while full rows retain the established
+  // description · duration · cue reading order.
+  if (includeDuration && duration) appendText(" · ", duration, "muted", false);
+  if (cue) appendText(" · ", cue, "muted", false);
+  return clampLines([line], columns);
+}
+
+/** Semantic collapsed grammar for terminal TaskOutput and settlement records. */
 function collapsedRecordLines(
   theme: unknown,
   details: SubagentRenderDetails,
   outcome: "completed" | "failed" | "aborted",
-  chip: string | undefined,
+  _chip: string | undefined,
   width: number,
   suppressSymbol = false,
   color?: AgentColorName,
+  semanticTerminal = true,
 ): string[] {
-  if (outcome === "completed") {
-    const optional: LifecycleSegment[] = [];
+  if (!semanticTerminal) {
+    const userStopped = details.userStopped === true;
+    const state = userStopped
+      ? "stopped by user"
+      : outcome === "completed" && details.cutOff === true
+        ? "completed (truncated)"
+        : outcome === "failed" && details.cutOff === true
+          ? "failed (partial output preserved)"
+          : outcome;
+    const required: LifecycleSegment[] = [];
     const fork = forkDegradeLine(details);
+    if (fork) required.push({ separator: " · ", text: RECORD_FORK_MARKER, tone: fork.tone });
+    required.push(...diagnosticSegments(details));
+    if (outcome === "failed" && details.error) {
+      required.push({ separator: " · ", text: truncateToWidth(sanitizeInline(details.error), COLLAPSED_ERROR_CAP, "…"), tone: "error", elastic: true });
+    }
+    const optional: LifecycleSegment[] = [];
     const duration = durationOf(details);
     if (duration) optional.push({ separator: " · ", text: duration });
     const usage = formatUsageBrief(details.usage);
     if (usage) optional.push({ separator: " · ", text: usage });
     const completionTime = completionTimeOf(details);
     if (completionTime) optional.push({ separator: " · ", text: completionTime });
-    return lifecycleLine(
+    return lifecycleLine(theme, {
+      agent: details.agent,
+      state,
+      ...((outcome !== "completed" || userStopped) ? { prefix: suppressSymbol ? "" : outcome === "failed" && !userStopped ? "✗ " : "■ " } : {}),
+      cue: RECORD_EXPAND_HINT,
+      required,
+      optional,
+      tone: outcome === "completed" ? "success" : outcome === "failed" && !userStopped ? "error" : "warning",
+      color,
+    }, width);
+  }
+  if (outcome === "completed") {
+    const fork = forkDegradeLine(details);
+    return semanticTerminalLine(
       theme,
-      {
-        agent: details.agent,
-        ...(chip ? { chip } : {}),
-        state: details.cutOff === true ? "completed (truncated)" : "completed",
-        cue: RECORD_EXPAND_HINT,
-        required: [
-          ...(fork ? [{ separator: " · " as const, text: RECORD_FORK_MARKER }] : []),
-          ...diagnosticSegments(details),
-        ],
-        optional,
-        tone: "success",
-        color,
-      },
+      details,
+      details.cutOff === true ? "completed (truncated)" : "completed",
+      suppressSymbol ? "" : "● ",
+      "success",
+      [
+        ...(fork ? [{ separator: " · " as const, text: RECORD_FORK_MARKER }] : []),
+        ...diagnosticSegments(details),
+      ],
       width,
+      color,
     );
   }
 
@@ -655,7 +986,6 @@ function collapsedRecordLines(
   const fork = forkDegradeLine(details);
   if (fork) required.push({ separator: " · ", text: RECORD_FORK_MARKER, tone: fork.tone });
   required.push(...diagnosticSegments(details));
-  const optional: LifecycleSegment[] = [];
   if (outcome === "failed") {
     const error = sanitizeInline(typeof details.error === "string" ? details.error : "");
     if (error) {
@@ -667,85 +997,16 @@ function collapsedRecordLines(
       });
     }
   }
-  const duration = durationOf(details);
-  if (duration) optional.push({ separator: " · ", text: duration });
-  const usage = formatUsageBrief(details.usage);
-  if (usage) optional.push({ separator: " · ", text: usage });
-  const completionTime = completionTimeOf(details);
-  if (completionTime) optional.push({ separator: " · ", text: completionTime });
 
-  return lifecycleLine(
+  return semanticTerminalLine(
     theme,
-    {
-      agent: details.agent,
-      ...(chip ? { chip } : {}),
-      state,
-      prefix: suppressSymbol ? "" : `${symbol} `,
-      cue: RECORD_EXPAND_HINT,
-      required,
-      optional,
-      tone,
-      color,
-    },
+    details,
+    state,
+    suppressSymbol ? "" : `${symbol} `,
+    tone,
+    required,
     width,
-  );
-}
-
-/**
- * The minimal non-expandable reference for a settlement whose completion
- * record was already emitted. A later TaskOutput collection never re-renders a
- * second full record or repeats transcript plumbing.
- */
-function referenceRecordLines(
-  theme: unknown,
-  details: SubagentRenderDetails,
-  outcome: "completed" | "failed" | "aborted",
-  chip: string | undefined,
-  width: number,
-  suppressSymbol = false,
-  color?: AgentColorName,
-): string[] {
-  const userStopped = details.userStopped === true;
-  const state =
-    outcome === "completed"
-      ? details.cutOff === true
-        ? "completed (truncated)"
-        : "completed"
-      : userStopped
-        ? "stopped by user"
-        : outcome === "failed" && details.cutOff === true
-          ? "failed (partial output preserved)"
-          : outcome;
-  const exceptional = outcome !== "completed";
-  const fork = forkDegradeLine(details);
-  const required: LifecycleSegment[] = [
-    ...(fork ? [{ separator: " · " as const, text: RECORD_FORK_MARKER, tone: fork.tone }] : []),
-    ...diagnosticSegments(details),
-  ];
-  if (outcome === "failed") {
-    const error = sanitizeInline(details.error ?? "");
-    if (error) required.push({ separator: " · ", text: error, tone: "error", elastic: true });
-  }
-  return lifecycleLine(
-    theme,
-    {
-      agent: details.agent,
-      ...(chip ? { chip } : {}),
-      state,
-      ...(exceptional
-        ? { prefix: suppressSymbol ? "" : outcome === "failed" && !userStopped ? "✗ " : "■ " }
-        : {}),
-      cue: RECORD_REFERENCE_NOTE,
-      required,
-      tone:
-        outcome === "completed"
-          ? "success"
-          : outcome === "failed" && !userStopped
-            ? "error"
-            : "warning",
-      color,
-    },
-    width,
+    color,
   );
 }
 
@@ -799,8 +1060,8 @@ function stripAgentTrailerForDisplay(text: string): string {
 /**
  * Strip the leading self-identification (`Background task task-N (type,
  * agent-<id>) failed: ` / `… was aborted — `) from the DISPLAY body of a failed
- * or aborted TaskOutput result — the explicit lifecycle row + agent-ID subline already state it,
- * so the body would otherwise triple it. The reason/tail is kept (`connection
+ * or aborted TaskOutput result — the lifecycle header and expanded identity footer already state it,
+ * so the body would otherwise repeat it. The reason/tail is kept (`connection
  * reset`, the `it was stopped before completing…` clause). Display-only: the
  * model-facing content stays self-identifying for print/RPC.
  */
@@ -864,10 +1125,9 @@ function lifecycleToolRowOutcome(
  * renderResult (REQUIRED). Two modes:
  *  - PARTIAL (streaming): ONE identity/state/metadata line; the status panel
  *    and its drill-down own live activity.
- *  - FINAL: the collapsed completion record by default (identity + duration +
- *    usage + local completion time + expand affordance), expanding via Ctrl+O
- *    mechanism to the full body + metadata footer. Every field is optional and
- *    rendered only when present.
+ *  - FINAL: terminal TaskOutput/settlement rows use the semantic priority
+ *    grammar; foreground Agent rows retain their established telemetry grammar.
+ *    Ctrl+O exposes the applicable body and operational footer.
  */
 export function renderAgentResult(
   result: unknown,
@@ -884,13 +1144,65 @@ export function renderAgentResult(
       // Per-call renderer state is an optimization; hostile state degrades safely.
     }
   }
-  const details = normalizeSubagentRenderDetails(safeField(result, "details")) ?? {};
+  const rawDetails = safeField(result, "details");
+  const details = normalizeSubagentRenderDetails(rawDetails) ?? {};
   const isPartial = safeField(renderOptions, "isPartial") === true;
   const expanded = safeField(renderOptions, "expanded");
-  const lifecycleOutcome = lifecycleToolRowOutcome(details, isPartial);
+  const acceptedBackground = suppressibleAgentAcceptance(
+    result, rawDetails, renderOptions, context, presentation.surface,
+  );
+  const taskOutputDelivery = canonicalTaskOutputDelivery(result, renderOptions, context, presentation.surface);
+  const reportedTerminal = taskOutputDelivery === "reported";
+  const firstTerminal = taskOutputDelivery === "first";
+  const malformedBackground = presentation.surface === "agent" && safeField(rawDetails, "background") === true &&
+    !acceptedBackground;
+  const terminalTaskStatus = details.status === "completed" || details.status === "failed" || details.status === "stopped";
+  const malformedTaskOutput = presentation.surface === "task-output" && !firstTerminal && !reportedTerminal &&
+    (terminalTaskStatus || hasOwnField(rawDetails, "outcome") || hasOwnField(rawDetails, "alreadyReported") ||
+      (hasOwnField(result, "details") && ownDataSnapshot(rawDetails, Object.prototype) === undefined));
+  if (malformedBackground || malformedTaskOutput) {
+    const failedEvidence = safeField(context, "isError") === true || safeField(result, "isError") === true ||
+      safeField(result, "error") === true || typeof safeField(result, "error") === "string" ||
+      details.status === "failed" || details.outcome === "failed" || typeof safeField(rawDetails, "error") === "string";
+    const stoppedEvidence = details.status === "stopped" || details.outcome === "aborted" || details.userStopped === true;
+    const failOpenOutcome: ToolRowOutcome | undefined = failedEvidence
+      ? "failure"
+      : stoppedEvidence ? "stopped" : undefined;
+    if (failOpenOutcome) setToolRowOutcome(context, failOpenOutcome);
+    const requestedTarget = taskOutputTarget(context, {});
+    return {
+      render(width: number): string[] {
+        try {
+          const lines: string[] = [];
+          if (presentation.surface === "task-output" && requestedTarget) {
+            lines.push(...lifecycleLine(theme, {
+              agent: "subagent",
+              chip: requestedTarget,
+              state: "result",
+              tone: failOpenOutcome === "failure" ? "error" : failOpenOutcome === "stopped" ? "warning" : "muted",
+            }, width));
+          }
+          const evidence = humanDisplayText(boundedBodyText(result), false);
+          if (evidence) pushBodyText(evidence, width, lines);
+          else pushWrapped("unrecognized lifecycle result", width, lines);
+          return clampLines(lines, width);
+        } catch {
+          const fallback = humanDisplayText("unrecognized lifecycle result", false);
+          return clampLines([truncateToWidth(fallback, Math.max(0, width), "…")], width);
+        }
+      },
+    };
+  }
+  const lifecycleOutcome = presentation.surface === "task-output" && !isPartial && details.outcome !== undefined && !firstTerminal
+    ? undefined
+    : lifecycleToolRowOutcome(details, isPartial);
   const shellOwnsSymbol = lifecycleOutcome === undefined
     ? false
     : setToolRowOutcome(context, lifecycleOutcome);
+  if (presentation.surface === "task-output" && typeof details.outcome === "string") {
+    useTightToolRowMarker(context);
+  }
+  const rowSuppressed = (acceptedBackground || reportedTerminal) && suppressToolRow(context);
   const agentName = sanitizeInline(typeof details.agent === "string" ? details.agent : "") || "subagent";
   const color = resolvedAgentColor(presentation, details, agentName);
   const explicitTask = presentation.surface === "task-output" ||
@@ -898,6 +1210,7 @@ export function renderAgentResult(
   const explicitTarget = explicitTask ? taskOutputTarget(context, details) : undefined;
   return {
     render(width: number): string[] {
+      if (rowSuppressed) return [];
       const lines: string[] = [];
       if (isPartial) {
         // SECURITY: details.agent originates from the model-supplied subagent_type — sanitize.
@@ -912,22 +1225,17 @@ export function renderAgentResult(
         }
         return runningStatusLines(theme, chip, agent, details, width, color);
       }
-      // Final result.
-      // A successful background dispatch is one passive agent/state line; the
-      // operational task id remains in canonical result data for explicit actions.
-      if (details.background === true && presentation.surface !== "task-output") {
-        const description = sanitizeInline(details.description ?? "");
-        return lifecycleLine(
-          theme,
-          {
-            agent: agentName,
-            state: "background",
-            description,
-            tone: "muted",
-            color,
-          },
-          width,
-        );
+      // Final result. Valid Agent acceptance was suppressed above; a malformed
+      // Agent acceptance already returned generic evidence. Legacy non-Agent
+      // background records retain their passive status presentation.
+      if (details.background === true && presentation.surface === undefined) {
+        return lifecycleLine(theme, {
+          agent: agentName,
+          state: "background",
+          description: details.description,
+          tone: "muted",
+          color,
+        }, width);
       }
       // A wait:false poll on a RUNNING task renders one self-identifying
       // state/metadata line, never activity or a rolling tail. Gated on taskId (a foreground
@@ -939,19 +1247,15 @@ export function renderAgentResult(
         return runningStatusLines(theme, chip, agent, details, width, color);
       }
       const outcome = typeof details.outcome === "string" ? details.outcome : undefined;
-      // Exactly-once reconciliation: a settlement whose completion record was
-      // already emitted (settlement notice, or an earlier collection) renders
-      // only a minimal reference line — never a second full record.
-      if (outcome && details.alreadyReported === true) {
-        return referenceRecordLines(theme, details, outcome, chip, width, shellOwnsSymbol, color);
-      }
       // Collapsed by default in the interactive transcript: Pi always passes a
       // BOOLEAN `expanded` (false until the global Ctrl+O toggle), so the
       // collapse keys on the EXPLICIT false. A structural caller that omits the
       // option gets the full record — print/RPC never run renderers, so this
       // only widens compatibility for direct callers.
       if (outcome && expanded === false) {
-        return collapsedRecordLines(theme, details, outcome, chip, width, shellOwnsSymbol, color);
+        const semanticTerminal = (presentation.surface === "task-output" && firstTerminal) || presentation.surface === "settlement" ||
+          (presentation.surface === undefined && details.taskId !== undefined);
+        return collapsedRecordLines(theme, details, outcome, undefined, width, shellOwnsSymbol, color, semanticTerminal);
       }
       if (!outcome && explicitTarget) {
         lines.push(...lifecycleLine(theme, {
@@ -973,25 +1277,20 @@ export function renderAgentResult(
               : outcome;
         const tone = outcome === "completed" ? "success" : outcome === "failed" && !userStopped ? "error" : "warning";
         const symbol = outcome === "completed" ? "● " : outcome === "failed" && !userStopped ? "✗ " : "■ ";
+        const semanticTerminal = (presentation.surface === "task-output" && firstTerminal) || presentation.surface === "settlement" ||
+          (presentation.surface === undefined && details.taskId !== undefined);
         lines.push(...lifecycleLine(theme, {
           agent: agentName,
-          ...(chip ? { chip } : {}),
           state: lifecycleState,
           prefix: shellOwnsSymbol ? "" : symbol,
+          ...(semanticTerminal ? { description: details.description } : {}),
           tone,
           color,
         }, width));
-        // Identity subline at the SETTLED surface — SUPPRESSED when the resumable
-        // footer will already print "— agent <id>" (avoid showing the id twice).
-        // Kept for non-resumable settled (its only occurrence).
-        const resumableFooterShowsId =
-          details.resumable === true && agentIdOf(details) !== undefined;
-        if (chip && !resumableFooterShowsId) pushIdentitySubline(theme, details, width, lines);
       }
-      // SECURITY: the model reads result.content verbatim (with the agent-ID
-      // trailer); the HUMAN view strips that trailer (the footer carries the ID
-      // + a single resumable hint) and sanitizes control sequences. This builds
-      // a local display string only — result.content is never mutated.
+      // SECURITY: the model reads result.content verbatim. The human copy strips
+      // the machine-facing identity trailer and sanitizes controls; the applicable
+      // expanded footer retains the identity without mutating canonical content.
       // TaskOutput's completed content appends a
       // `\nusage: …` line AFTER the agent-ID trailer, which would defeat the
       // end-anchored trailer strip (raw trailer shown + usage rendered twice).
@@ -1004,14 +1303,19 @@ export function renderAgentResult(
       if (details.taskId != null && details.usage != null) {
         displaySource = displaySource.replace(/\nusage:[^\n]*$/, "");
       }
-      // For an explicit failed/aborted task result the lifecycle row + subline
-      // already state the identity — strip the leading self-identification from the body.
+      // Terminal TaskOutput headers already carry semantic identity, so remove
+      // the canonical failed/aborted prose prefix from this display-only body.
       if (chip && (outcome === "failed" || outcome === "aborted")) {
         displaySource = stripTaskIdentityPrefix(displaySource, String(details.taskId), outcome);
       }
       const body = humanDisplayText(stripAgentTrailerForDisplay(displaySource), false);
       if (body) pushBodyText(body, width, lines);
       const footer: string[] = [];
+      const semanticTerminal = (presentation.surface === "task-output" && firstTerminal) || presentation.surface === "settlement" ||
+        (presentation.surface === undefined && details.taskId !== undefined);
+      const stableAgentId = agentIdOf(details);
+      if (semanticTerminal && isTaskId(details.taskId)) footer.push(`task: ${details.taskId}`);
+      if (semanticTerminal && stableAgentId) footer.push(`agent: ${stableAgentId}`);
       if (typeof details.transcriptPath === "string" && details.transcriptPath) {
         // UX: a full session path is often far wider than the terminal and wraps
         // into unreadable, hard-sliced fragments. Show it whole only when it fits;
@@ -1033,12 +1337,9 @@ export function renderAgentResult(
       const usage = formatUsageLine(details.usage);
       if (usage) footer.push(`usage: ${usage}`);
       if (details.resumable === true) {
-        // The ID rides in the footer (not a duplicated raw trailer frame).
-        const id =
-          typeof details.agentId === "string" && isAgentId(details.agentId)
-            ? details.agentId
-            : undefined;
-        footer.push(id ? `resumable via SendMessage — agent ${id}` : "resumable via SendMessage");
+        footer.push(!semanticTerminal && stableAgentId
+          ? `resumable via SendMessage — agent ${stableAgentId}`
+          : "resumable via SendMessage");
       }
       // Wrap each footer line to width (word-wrap, ANSI-aware) as a final guard.
       for (const f of footer) pushColored(theme, "muted", f, width, lines);
