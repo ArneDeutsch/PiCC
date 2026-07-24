@@ -86,7 +86,7 @@ Run Pi upgrades through an explicit `/implement-feature` workflow. After inspect
 notes and changed contracts, update the complete direct Pi suite in the feature worktree:
 
 ```bash
-node scripts/update-pi-suite.mjs <newer-stable-exact-version>
+node scripts/update-pi-suite.mjs <stable-exact-version>
 ```
 
 The helper runs one exact, scripts-disabled npm transaction using your normal npm configuration,
@@ -94,8 +94,10 @@ then validates the resulting graph. If it fails, inspect or restore `package.jso
 `package-lock.json` with Git and run `npm ci --ignore-scripts`. It does not make compatibility
 decisions: adapt PiCC semantics and documentation, run `npm run typecheck:all` and `npm test`, then
 submit the result as a human-reviewed pull request. Never couple Pi release detection or adoption to
-automatic merging or publication. After human review, a human-created release tag may invoke the
-sanctioned verified release workflow.
+automatic merging or publication. After human review, tag the exact package version as
+`v<package version>` to run tagged release handling. Manual dispatch produces only a seven-day
+Actions artifact; missing `NPM_TOKEN` skips npm publication. Before retrying a partial tagged
+release, inspect the existing GitHub Release and npm publication state to avoid duplicating a sink.
 
 ## Guiding principles
 

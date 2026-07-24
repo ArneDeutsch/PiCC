@@ -23,6 +23,7 @@ import {
 const REGISTRY_URL = "https://registry.npmjs.org/picc/latest";
 const REGISTRY_TIMEOUT_MS = 5_000;
 const MAX_REGISTRY_BYTES = 64 * 1024;
+const RETAINED_RECOVERY_POLICY = "The referenced npm policy files were created and retained for recovery.";
 const HELP = `Usage: picc update [--check|--help]
 
 Checks or synchronizes PiCC as one compatible product. It never updates embedded Pi independently.`;
@@ -265,9 +266,10 @@ export function recoveryNpmPolicyArgs(platform = process.platform) {
 }
 
 export function cleanupRecoveryNpmPolicy() {
-  if (!recoveryConfigDirectory) return;
+  if (!recoveryConfigDirectory) return false;
   fs.rmSync(recoveryConfigDirectory, { recursive: true, force: true });
   recoveryConfigDirectory = undefined;
+  return true;
 }
 
 function globalPrefix(globalRoot) {
@@ -285,11 +287,14 @@ function shellQuote(value, platform = process.platform) {
   return platform === "win32" ? `'${value.replaceAll("'", "''")}'` : `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-export function reinstallGuidance(version, prefix, platform = process.platform, policy = recoveryNpmPolicyArgs(platform)) {
+export function reinstallGuidance(version, prefix, platform = process.platform, policy) {
   if (!parseStableExactVersion(version) || /[\x00-\x1f\x7f]/.test(prefix)) throw new Error("unsafe recovery input");
-  const args = ["install", "--global", `picc@${version}`, `--prefix=${prefix}`, ...policy];
+  const createdPolicy = policy === undefined;
+  const recoveryPolicy = policy ?? recoveryNpmPolicyArgs(platform);
+  const args = ["install", "--global", `picc@${version}`, `--prefix=${prefix}`, ...recoveryPolicy];
   const label = platform === "win32" ? "PowerShell recovery command" : "POSIX shell recovery command";
-  return `${label}: npm ${args.map((value) => shellQuote(value, platform)).join(" ")}`;
+  const command = `${label}: npm ${args.map((value) => shellQuote(value, platform)).join(" ")}`;
+  return createdPolicy ? `${RETAINED_RECOVERY_POLICY}\n${command}` : command;
 }
 
 function childFailure(stage, result) {
@@ -298,7 +303,7 @@ function childFailure(stage, result) {
 
 function sourceNpmGuidance(args, next, platform = process.platform) {
   const label = platform === "win32" ? "PowerShell diagnostic command" : "POSIX shell diagnostic command";
-  return `${label} (run from the PiCC checkout): npm ${args.map((value) => shellQuote(value, platform)).join(" ")}\nAfter that command succeeds, run \`${next}\`.`;
+  return `${RETAINED_RECOVERY_POLICY}\n${label} (run from the PiCC checkout): npm ${args.map((value) => shellQuote(value, platform)).join(" ")}\nAfter that command succeeds, run \`${next}\`.`;
 }
 
 async function handleGlobal({ action, root, globalRoot, manifest, suite, output, dependencies }) {
@@ -314,11 +319,10 @@ async function handleGlobal({ action, root, globalRoot, manifest, suite, output,
     return 1;
   }
   const compared = compareStableVersions(latest, manifest.version);
-  const recoveryVersion = compared > 0 ? latest : manifest.version;
-  const recovery = reinstallGuidance(recoveryVersion, prefix);
+  const recovery = () => reinstallGuidance(compared > 0 ? latest : manifest.version, prefix);
   if (!suite.ok && (action === "check" || compared <= 0)) {
     output.error("Outcome: the installed PiCC package has an incoherent embedded Pi suite and is not up to date.");
-    output.error(recovery);
+    output.error(recovery());
     return 1;
   }
   if (compared <= 0) {
@@ -334,7 +338,7 @@ async function handleGlobal({ action, root, globalRoot, manifest, suite, output,
   try { result = await collectChild(dependencies.runNpm(args)); } catch { result = { ok: false, category: "spawn error" }; }
   if (!result.ok) {
     output.error(`${childFailure("global update", result)} The global install may now be incomplete.`);
-    output.error(recovery);
+    output.error(recovery());
     return 1;
   }
   const nextManifest = readManifest(root);
@@ -342,17 +346,17 @@ async function handleGlobal({ action, root, globalRoot, manifest, suite, output,
   const nextOrigin = dependencies.classify({ packageRoot: root, globalRoot });
   if (nextManifest?.version !== latest) {
     output.error("PiCC: npm completed, but the installed PiCC version did not match the requested exact version.");
-    output.error(recovery);
+    output.error(recovery());
     return 1;
   }
   if (nextOrigin !== "verified public-registry global npm") {
     output.error("PiCC: npm completed, but public-registry provenance could not be reverified.");
-    output.error(recovery);
+    output.error(recovery());
     return 1;
   }
   if (!nextSuite.ok) {
     output.error("PiCC: npm completed, but the embedded Pi suite remained incomplete or inconsistent.");
-    output.error(recovery);
+    output.error(recovery());
     return 1;
   }
   output.log(`Outcome: updated the complete PiCC product to ${latest} (embedded Pi ${nextSuite.version}).`);

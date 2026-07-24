@@ -98,10 +98,12 @@ export interface McpRuntimeDeps {
   /** `CLAUDE_CODE_SESSION_ID` for the servers — binary-verified Claude behavior (2.1.218; undocumented). */
   sessionId: string;
   /**
-   * Base environment for the servers AND the source of `MCP_TIMEOUT` /
-   * `MCP_TOOL_TIMEOUT`. Defaults to `process.env`; injectable for tests.
+   * Ambient environment for the servers and timeout settings. Defaults to
+   * `process.env`; launcher-only values are removed before any overlay.
    */
   env?: Record<string, string | undefined>;
+  /** Project `settings.env`, applied after sanitized ambient inheritance. */
+  settingsEnv?: Record<string, string | undefined>;
   /** Test seam for exercising an SDK load/import failure. */
   loadSdk?: () => Promise<McpSdk>;
 }
@@ -166,7 +168,7 @@ export class McpRuntime {
 
   private constructor(config: ResolvedMcpConfig, deps: McpRuntimeDeps) {
     this.deps = deps;
-    const env = deps.env ?? process.env;
+    const env = sanitizedSubprocessEnv(deps.env ?? process.env, deps.settingsEnv);
     this.connectTimeoutMs = parsePositiveInt(env["MCP_TIMEOUT"]) ?? DEFAULT_CONNECT_TIMEOUT_MS;
     this.toolTimeoutMs = parsePositiveInt(env["MCP_TOOL_TIMEOUT"]);
     for (const server of config.servers) {
@@ -339,16 +341,19 @@ export class McpRuntime {
     if (handle.stopped) return;
     try {
       // Claude parity (binary-verified 2.1.218): sanitized inheritance →
-      // injected Claude defaults → configured server env last.
-      const env = unicodeSafeSubprocessEnv(sanitizedSubprocessEnv(
-        this.deps.env ?? process.env,
-        {
-          CLAUDE_PROJECT_DIR: this.deps.projectRoot,
-          CLAUDECODE: "1",
-          CLAUDE_CODE_SESSION_ID: this.deps.sessionId,
-        },
-        server.env,
-      ));
+      // project settings → injected Claude defaults → server env last.
+      const env = unicodeSafeSubprocessEnv({
+        ...sanitizedSubprocessEnv(
+          this.deps.env ?? process.env,
+          this.deps.settingsEnv,
+          {
+            CLAUDE_PROJECT_DIR: this.deps.projectRoot,
+            CLAUDECODE: "1",
+            CLAUDE_CODE_SESSION_ID: this.deps.sessionId,
+          },
+        ),
+        ...server.env,
+      });
       const transport = new sdk.StdioClientTransport({
         command: server.command,
         args: server.args,

@@ -112,6 +112,14 @@ describe("McpRuntime zero-enabled path", () => {
     await runtime.shutdown();
   });
 
+  it("resolves MCP_TIMEOUT from project settings.env", async () => {
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      settingsEnv: { MCP_TIMEOUT: "1234" },
+    }));
+    expect(runtime.resolvedConnectTimeoutMs).toBe(1_234);
+    await runtime.shutdown();
+  });
+
   it("returns [] from tools() immediately after start with a never-connecting server, and shutdown settles it", async () => {
     const fixture = createMcpProcessFixture(makeTempDir());
     // Default MCP_TIMEOUT (30 s): what settles this test is shutdown(), not the
@@ -262,12 +270,13 @@ describe("McpRuntime stdio lifecycle", () => {
     }
   }, 25_000);
 
-  it("composes config env over Claude defaults over sanitized inheritance, unicode-safe", async () => {
+  it("composes server env over Claude defaults over project settings over sanitized inheritance", async () => {
     const fixture = createMcpProcessFixture(makeTempDir());
     const projectRoot = makeTempDir();
     const base: Record<string, string | undefined> = {
       ...cleanBaseEnv(),
       MCP_FIXTURE_VAR: "from-base",
+      PROJECT_SETTING: "from-inherited-base",
       PICC_LAUNCHER_PID: "99",
       PICC_INSTALL_KIND: "source",
       PICC_VERSION: "1.2.3",
@@ -290,7 +299,16 @@ describe("McpRuntime stdio lifecycle", () => {
           },
         }),
       ),
-      makeDeps({ projectRoot, sessionId: "env-proof-session", env: base }),
+      makeDeps({
+        projectRoot,
+        sessionId: "env-proof-session",
+        env: base,
+        settingsEnv: {
+          PROJECT_SETTING: "from-project-settings",
+          MCP_FIXTURE_VAR: "from-settings",
+          CLAUDE_CODE_SESSION_ID: "settings-must-lose-to-default",
+        },
+      }),
     );
     try {
       await runtime.whenSettled();
@@ -299,6 +317,7 @@ describe("McpRuntime stdio lifecycle", () => {
         "CLAUDECODE",
         "CLAUDE_CODE_SESSION_ID",
         "MCP_FIXTURE_VAR",
+        "PROJECT_SETTING",
         "PYTHONIOENCODING",
         "PICC_LAUNCHER_PID",
         "PICC_INSTALL_KIND",
@@ -312,6 +331,7 @@ describe("McpRuntime stdio lifecycle", () => {
         CLAUDECODE: "0",
         CLAUDE_CODE_SESSION_ID: "env-proof-session",
         MCP_FIXTURE_VAR: "from-config",
+        PROJECT_SETTING: "from-project-settings",
         PYTHONIOENCODING: "utf-8",
         PICC_LAUNCHER_PID: null,
         PICC_INSTALL_KIND: null,
@@ -783,9 +803,9 @@ describe("McpRuntime tool-call timeouts", () => {
         makeServer({ name: "slowpoke", args: [fixture.serverScript, "slow-tool"], env: fixture.env }),
       ),
       // The middle branch of the timeout resolution: no per-server timeoutMs,
-      // MCP_TOOL_TIMEOUT alone must bound the call (gate-based proof, no
-      // wall-clock assertion).
-      makeDeps({ env: { ...cleanBaseEnv(), MCP_TOOL_TIMEOUT: "1000" } }),
+      // settings.env MCP_TOOL_TIMEOUT alone must bound the call (gate-based
+      // proof, no wall-clock assertion).
+      makeDeps({ settingsEnv: { MCP_TOOL_TIMEOUT: "1000" } }),
     );
     try {
       await runtime.whenSettled();

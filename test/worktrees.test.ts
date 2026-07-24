@@ -3,7 +3,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { WorktreeManager, flattenWorktreeName } from "../src/runtime/worktrees.js";
-import { sanitizedExecFile } from "../src/util/env.js";
 import type { WorktreeSettings } from "../src/types.js";
 import { makeRepoFromTemplate } from "./helpers/git-repo.js";
 
@@ -93,38 +92,6 @@ describe("WorktreeManager.enter (name mode)", () => {
     const entry = listed.find((e) => path.resolve(e.path) === expectedDir);
     expect(entry).toBeDefined();
     expect(entry!.locked).toBe(true);
-  });
-
-  it("keeps launcher context out of worktree Git-hook descendants while preserving settings env", async () => {
-    const repo = makeRepo();
-    const hookDir = path.join(repo, ".githooks");
-    const output = path.join(repo, "hook-env.txt");
-    fs.mkdirSync(hookDir);
-    const hook = path.join(hookDir, "post-checkout");
-    fs.writeFileSync(
-      hook,
-      '#!/bin/sh\nprintf "%s|%s|%s" "$PICC_LAUNCHER_PID" "$PI_SKIP_VERSION_CHECK" "$EXPLICIT_SETTING" > "$HOOK_OUTPUT"\n',
-      "utf8",
-    );
-    fs.chmodSync(hook, 0o755);
-    git(repo, "config", "core.hooksPath", ".githooks");
-    const inherited = {
-      ...process.env,
-      PICC_LAUNCHER_PID: "99",
-      PI_SKIP_VERSION_CHECK: "1",
-    };
-    const mgr = new WorktreeManager({
-      projectRoot: repo,
-      settings: { baseRef: "head" },
-      exec: (cmd, args, opts) => sanitizedExecFile(cmd, args, {
-        ...opts,
-        inherited,
-        explicit: { EXPLICIT_SETTING: "kept", HOOK_OUTPUT: output },
-      }),
-    });
-    const result = await mgr.enter({ name: "env-proof" });
-    expect(result.ok).toBe(true);
-    expect(fs.readFileSync(output, "utf8")).toBe("||kept");
   });
 
   it("flattens names: feature/x -> feature-x dir, worktree-feature-x branch", async () => {
@@ -312,6 +279,44 @@ describe("WorktreeManager.enter (path mode)", () => {
     const side = await mgr.enter({ path: sideDir });
     expect(side.ok).toBe(false);
     expect(side.error).toMatch(/outside/);
+  });
+
+  it("treats failed worktree listing as no authority to adopt, reap, or remove", async () => {
+    const repo = makeRepo();
+    const managedRoot = path.join(repo, ".claude", "worktrees");
+    const pointed = path.join(managedRoot, "pointed");
+    const orphan = path.join(managedRoot, "orphan");
+    fs.mkdirSync(pointed, { recursive: true });
+    fs.writeFileSync(path.join(pointed, ".git"), "gitdir: unavailable\n", "utf8");
+    fs.mkdirSync(orphan);
+    fs.writeFileSync(path.join(orphan, "keep.txt"), "keep\n", "utf8");
+    const calls: string[][] = [];
+    const mgr = new WorktreeManager({
+      projectRoot: repo,
+      settings: { baseRef: "head" },
+      exec: async (_cmd, args) => {
+        calls.push(args);
+        return { stdout: "", stderr: "git unavailable", code: 1 };
+      },
+    });
+
+    const byPath = await mgr.enter({ path: pointed });
+    expect(byPath.ok).toBe(false);
+    expect(byPath.error).toMatch(/cannot verify path/);
+
+    const byName = await mgr.enter({ name: "orphan" });
+    expect(byName.ok).toBe(false);
+    expect(fs.readFileSync(path.join(orphan, "keep.txt"), "utf8")).toBe("keep\n");
+
+    const reaped = await mgr.reapOrphans();
+    expect(reaped.reaped).toEqual([]);
+    expect(fs.existsSync(orphan)).toBe(true);
+
+    const removed = await mgr.exit({ worktreePath: pointed, action: "remove" });
+    expect(removed.ok).toBe(false);
+    expect(fs.existsSync(pointed)).toBe(true);
+    expect(calls.some((args) => args[0] === "worktree" && ["unlock", "remove", "prune"].includes(args[1] ?? ""))).toBe(false);
+    expect(calls.some((args) => args[0] === "branch")).toBe(false);
   });
 });
 

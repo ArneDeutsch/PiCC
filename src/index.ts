@@ -298,6 +298,8 @@ export interface PiccTestSeam {
   loadBuiltinSdk?: () => Promise<any>;
   /** TEST-ONLY bounded replacement for the public-registry advisory request. */
   checkPiccRelease?: typeof checkForNewerPiccRelease;
+  /** TEST-ONLY in-process override for trusted-Git unavailability. */
+  resolveTrustedGit?: () => Promise<string | undefined>;
 }
 
 const codexProviderRegistries = new WeakSet<object>();
@@ -344,6 +346,20 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // removed inside this call; PI_SKIP_VERSION_CHECK remains only for Pi's
   // adjacent interactive startup work and is cleared at first user admission.
   const launchContext = capturePiccLaunchContext();
+  let trustedGitPromise: Promise<string | undefined> | undefined;
+  const resolveTrustedGit = (): Promise<string | undefined> => {
+    trustedGitPromise ??= Promise.resolve()
+      .then(async () => {
+        if (testSeam?.resolveTrustedGit) return await testSeam.resolveTrustedGit();
+        const adminModule: unknown = await import(new URL("../bin/picc-admin.mjs", import.meta.url).href);
+        const capability = (adminModule as { discoverTrustedGit?: unknown }).discoverTrustedGit;
+        if (typeof capability !== "function") return undefined;
+        const discovered: unknown = capability();
+        return typeof discovered === "string" ? discovered : undefined;
+      })
+      .catch(() => undefined);
+    return trustedGitPromise;
+  };
   const releaseAdvisory = createPiccReleaseAdvisory({
     context: launchContext,
     ...(testSeam?.checkPiccRelease ? { check: testSeam.checkPiccRelease } : {}),
@@ -443,12 +459,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     projectRoot: project.root,
     settings: project.settings.worktree,
     cleanupPeriodDays: project.settings.cleanupPeriodDays,
-    // Worktree setup/reaping can run before first input, so it cannot rely on
-    // ambient cleanup. Explicit settings env is restored after launcher stripping.
-    exec: (cmd, args, opts) => sanitizedExecFile(cmd, args, {
-      ...opts,
-      explicit: project.settings.env,
-    }),
+    // Worktree setup/reaping can run before first input, so sanitize inherited
+    // launcher context without admitting project-controlled environment policy.
+    // Only the manager's expected command may cross this administration seam.
+    exec: async (cmd, args, opts) => {
+      const trustedGit = cmd === "git" ? await resolveTrustedGit() : undefined;
+      if (!trustedGit) {
+        return { stdout: "", stderr: "Trusted Git is unavailable", code: 1 };
+      }
+      return await sanitizedExecFile(trustedGit, args, opts);
+    },
   });
   // Reap orphaned worktree dirs from crashed sessions — fire-and-forget.
   const orphanReaping = worktrees.reapOrphans().catch(() => undefined);
@@ -906,7 +926,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const mcpRuntime = McpRuntime.start(project.mcp, {
     projectRoot: project.root,
     sessionId,
-    env: sanitizedSubprocessEnv(process.env),
+    env: process.env,
+    settingsEnv: project.settings.env,
   });
 
   function allKnownToolNames(): string[] {
@@ -1932,10 +1953,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // but a clone installed with --ignore-scripts never ran the `prepare` that
       // sets core.hooksPath. (Worktrees inherit it from the shared config.)
       if (fs.existsSync(path.join(project.root, ".githooks"))) {
-        const startupEnv = sanitizedSubprocessEnv(process.env, project.settings.env);
-        const current = await pi.exec("git", ["config", "core.hooksPath"], { env: startupEnv }).catch(() => ({ stdout: "" }));
-        if (!String(current.stdout ?? "").trim()) {
-          await pi.exec("git", ["config", "core.hooksPath", ".githooks"], { env: startupEnv }).catch(() => undefined);
+        const trustedGit = await resolveTrustedGit();
+        if (trustedGit) {
+          const current = await sanitizedExecFile(trustedGit, ["config", "core.hooksPath"], {
+            cwd: project.root,
+          }).catch(() => ({ stdout: "" }));
+          if (!String(current.stdout ?? "").trim()) {
+            await sanitizedExecFile(trustedGit, ["config", "core.hooksPath", ".githooks"], {
+              cwd: project.root,
+            }).catch(() => undefined);
+          }
         }
       }
       const sessionStartSource = event.reason === "new"

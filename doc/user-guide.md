@@ -73,8 +73,8 @@ npm link    # may need: sudo npm link — or configure a user-level npm prefix
 
 ### Alternatives to `npm link` (any OS)
 
-- Install the published product globally: `npm install --global picc`. A verified public-registry
-  global install can update itself with `picc update`.
+- Once PiCC is published, install it globally with `npm install --global picc`. A verified
+  public-registry global install can update itself with `picc update`.
 - Run without installing anything globally — from your target project directory:
   ```powershell
   node <path-to-picc>\bin\picc.mjs
@@ -90,8 +90,10 @@ npm link    # may need: sudo npm link — or configure a user-level npm prefix
 ### Check and update PiCC
 
 `picc --version` reports the PiCC version, embedded Pi version and validation mode, and detected
-installation kind. `picc update --check` checks without changing anything. The update path depends
-on who owns the installation:
+installation kind. `picc update --check` does not mutate the installation. Healthy global checks,
+including an available-version result, create no persistent recovery files; a failure that prints a
+runnable recovery command creates and retains the npm policy files named by that command. The update
+path depends on who owns the installation:
 
 - **Verified public-registry global npm:** `picc update` installs and validates the complete PiCC
   product, including its compatible embedded Pi runtime. Exit active sessions first.
@@ -414,6 +416,10 @@ tracked project files):
 
 ### Environment variables
 
+Values in Claude `settings.env` reach project-owned Bash, hooks, skills, and MCP servers. PiCC does
+not apply them to its own startup or worktree Git administration, so settings such as `GIT_DIR`
+cannot redirect those maintenance operations.
+
 | Variable | Effect |
 |---|---|
 | `PICC_CLAUDE_USER_DIR` | Override the user-scope Claude dir (default `~/.claude`) — useful for isolated profiles or CI |
@@ -504,17 +510,17 @@ behaviors worth knowing:
   mangled into a Windows path and the skill won't resolve. Run slash-command-as-argument invocations
   from **PowerShell or cmd**, or just type `/greet Ada` inside the **interactive TUI** (where no
   MSYS mangling applies). Normal interactive use is unaffected.
-- **Long paths & worktrees.** `core.longpaths` is enabled on the repo automatically. Worktree
-  removal is best-effort: a file-lock failure never fails your merge; the orphan is reaped later
-  (`git worktree prune` + a directory sweep on the next session).
+- **Long paths & worktrees.** When trusted Git is available, PiCC attempts to enable
+  `core.longpaths` on the repo. Worktree removal is best-effort: a file-lock failure never fails your
+  merge. A later session
+  retries orphan cleanup only after trusted Git and registered-worktree state are verified; otherwise
+  PiCC leaves managed directories untouched.
 - **Hook payloads** deliver Windows paths with doubled backslashes in JSON, as Claude Code does.
 
 ## 9. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| "embedded Pi runtime is incomplete or inconsistent" | run `picc update`; if that cannot repair the installation, reinstall PiCC |
-| Source update refuses dirty, detached, or in-progress state | Finish or abort the Git operation, select the intended branch, and review/clean all staged, unstaged, unmerged, and untracked files. PiCC will not discard or reconcile source changes for you |
 | `/picc-update` is absent | The extension is hosted by an external Pi or the direct-launch lineage did not agree. Use that installation's owner and `picc --version`; do not send `/picc-update` as model input |
 | Skill shell injection prints `[shell execution disabled: …]` | project set `disableSkillShellExecution`; that's the project's intent |
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |

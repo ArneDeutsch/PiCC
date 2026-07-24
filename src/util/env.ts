@@ -49,7 +49,6 @@ export function sanitizedExecFile(
   });
 }
 
-/** Remove the captured PiCC markers immediately during extension initialization. */
 export function clearPiccLauncherMarkers(env: NodeJS.ProcessEnv = process.env): void {
   delete env.PICC_LAUNCHER_PID;
   delete env.PICC_INSTALL_KIND;

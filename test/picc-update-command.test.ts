@@ -223,6 +223,19 @@ describe("verified global PiCC updates", () => {
     expect(seen).toHaveLength(0);
   });
 
+  it("keeps healthy and available global checks from allocating recovery policy", async () => {
+    expect(cleanupRecoveryNpmPolicy()).toBe(false);
+    for (const latest of ["1.2.3", "1.2.4"]) {
+      const fixture = await globalFixture();
+      expect(await runUpdate({ action: "check", ...fixture, requestLatest: async () => latest, output: output().sink })).toBe(0);
+      expect(cleanupRecoveryNpmPolicy()).toBe(false);
+    }
+
+    recoveryNpmPolicyArgs();
+    expect(cleanupRecoveryNpmPolicy()).toBe(true);
+    expect(cleanupRecoveryNpmPolicy()).toBe(false);
+  });
+
   it("does not invoke npm for equal or older plain updates", async () => {
     for (const latest of ["1.2.3", "1.2.2"]) {
       const fixture = await globalFixture();
@@ -285,6 +298,7 @@ describe("verified global PiCC updates", () => {
       expect(await runUpdate({ action: "update", ...fixture, requestLatest: async () => "1.2.4", runNpm: makeChild, output: capture.sink })).toBe(1);
       expect(capture.stderr.join("\n")).toContain(category);
       expect(capture.stderr.join("\n")).not.toContain("secret path");
+      expect(capture.stderr.join("\n")).toContain("policy files were created and retained");
       expect(capture.stderr.join("\n")).toContain("recovery command");
     }
 

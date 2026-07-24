@@ -270,8 +270,8 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(mcp?.note).toContain("NO MCP context of any kind");
     expect(mcp?.note).toContain("failures surface in /mcp");
     expect(mcp?.note).toContain("launcher-only markers are removed");
-    expect(mcp?.note).toContain("configured server env last");
-    expect(mcp?.note).toContain("deliberate overrides of CLAUDE_PROJECT_DIR, CLAUDECODE, CLAUDE_CODE_SESSION_ID, or a removed launcher key");
+    expect(mcp?.note).toContain("then receive project settings.env, then Claude defaults, then configured server env last");
+    expect(mcp?.note).toContain("deliberate server overrides of CLAUDE_PROJECT_DIR, CLAUDECODE, CLAUDE_CODE_SESSION_ID, or a removed launcher key");
 
     const gate = lookupCapability("feature.mcp-project-approval");
     expect(gate?.tier).toBe("partial");
@@ -812,7 +812,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     }
   });
 
-  it("settings honored by real consumers stay full", () => {
+  it("settings tiers match their production consumers", () => {
     for (const id of [
       "setting.skillOverrides",
       "setting.enabledPlugins",
@@ -820,11 +820,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       expect(lookupCapability(id)?.tier, id).toBe("full");
     }
     const env = lookupCapability("setting.env");
-    expect(env?.tier).toBe("full");
-    expect(env?.note).toContain("after inherited launcher-only context is removed");
-    expect(env?.note).toContain("configured values win inherited collisions");
-    expect(env?.note).toContain("may deliberately reintroduce a removed key");
-    expect(env?.note).toContain("forces CLAUDE_PROJECT_DIR to the project root");
+    expect(env?.tier).toBe("partial");
+    expect(env?.note).toContain("main/subagent Bash, hooks, skills, and MCP");
+    expect(env?.note).toContain("excluded from PiCC-owned startup and worktree Git administration");
+    expect(env?.note).toContain("cannot redirect it");
+    expect(env?.note).toContain("MCP server values retain later precedence");
 
     const bash = lookupCapability("tool.Bash");
     for (const variable of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"]) {
