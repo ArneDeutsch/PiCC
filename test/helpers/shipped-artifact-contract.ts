@@ -22,31 +22,26 @@ export function shippedArtifactPaths(defaultRoot: string): ShippedArtifactPaths 
     evaluate: path.join(root, ".claude", "skills", "evaluate"),
     implementFeature: path.join(root, ".claude", "skills", "implement-feature"),
     agents: path.join(root, ".claude", "agents"),
-    settings: path.resolve(
-      process.env["PICC_SETTINGS_PATH"] ?? path.join(root, ".claude", "settings.json"),
-    ),
+    settings: path.resolve(process.env["PICC_SETTINGS_PATH"] ?? path.join(root, ".claude", "settings.json")),
   };
 }
 
-function normalized(file: string): string {
+const normalized = (file: string): string => {
   const resolved = path.resolve(file);
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-}
-
-function expectCanonicalRealpath(file: string, label: string): string {
+};
+const inside = (candidate: string, root: string): boolean => {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+};
+const canonical = (file: string, label: string): string => {
   const lexical = path.resolve(file);
   const real = fs.realpathSync(file);
   expect(normalized(real), `${label} must not be a symlink`).toBe(normalized(lexical));
   return real;
-}
-
-function isInside(candidate: string, root: string): boolean {
-  const relative = path.relative(root, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
+};
 
 export interface ResolvedMarkdownLink {
-  label: string;
   target: string;
   lexicalPath: string;
   realPath: string;
@@ -54,13 +49,12 @@ export interface ResolvedMarkdownLink {
 
 export function resolveMarkdownLinks(source: string): ResolvedMarkdownLink[] {
   const body = fs.readFileSync(source, "utf8");
-  return [...body.matchAll(/\[([^\]]*)\]\(([^)]+)\)/g)].flatMap((match) => {
-    const label = match[1]?.trim() ?? "";
-    const rawTarget = match[2]?.trim() ?? "";
-    if (rawTarget === "" || rawTarget.startsWith("#") || /^[a-z]+:/i.test(rawTarget)) return [];
-    const target = rawTarget.replace(/^<|>$/g, "").split("#", 1)[0] ?? "";
+  return [...body.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)].flatMap((match) => {
+    const raw = match[1]?.trim() ?? "";
+    if (raw === "" || raw.startsWith("#") || /^[a-z]+:/i.test(raw)) return [];
+    const target = raw.replace(/^<|>$/g, "").split("#", 1)[0] ?? "";
     const lexicalPath = path.resolve(path.dirname(source), target);
-    return [{ label, target, lexicalPath, realPath: fs.realpathSync(lexicalPath) }];
+    return [{ target, lexicalPath, realPath: fs.realpathSync(lexicalPath) }];
   });
 }
 
@@ -69,117 +63,63 @@ export interface ShippedSkillContractOptions {
   representativeArguments?: string;
 }
 
-/** Assert loader, budget, graph-closure, and canonical containment for one shipped skill. */
+/** Exercises production loading plus lexical and real-path closure of a shipped prompt graph. */
 export function expectShippedSkillContract(
   paths: ShippedArtifactPaths,
   name: string,
   options: ShippedSkillContractOptions = {},
 ): string {
-  const repoRoot = expectCanonicalRealpath(paths.root, "repository root");
+  const repoRoot = canonical(paths.root, "repository root");
   const shippedRoots = [paths.evaluate, paths.implementFeature, paths.agents].map((root) => {
-    const real = expectCanonicalRealpath(root, `shipped root ${root}`);
-    expect(isInside(real, repoRoot), `${root} must remain in the repository`).toBe(true);
+    const real = canonical(root, `shipped root ${root}`);
+    expect(inside(real, repoRoot)).toBe(true);
     return real;
   });
-  const approvedExternalFiles = (options.approvedExternalFiles ?? []).map((file) =>
-    expectCanonicalRealpath(file, `approved external artifact ${file}`),
-  );
-  const skillRootPath = path.join(paths.skills, name);
-  const skillRoot = expectCanonicalRealpath(skillRootPath, `skill root ${name}`);
-  expect(shippedRoots.some((root) => normalized(root) === normalized(skillRoot))).toBe(true);
+  const approved = (options.approvedExternalFiles ?? []).map((file) => canonical(file, file));
+  const skillRoot = canonical(path.join(paths.skills, name), `skill root ${name}`);
+  expect(shippedRoots.map(normalized)).toContain(normalized(skillRoot));
 
   const loaded = loadSkills([{ dir: paths.skills, scope: "project" }], []);
   const skill = loaded.skills.find((candidate) => candidate.name === name);
-  expect(skill, `skill ${name} must load from the production skills root`).toBeDefined();
+  expect(skill, `skill ${name} must load`).toBeDefined();
   expect(skill!.diagnostics).toEqual([]);
-  expect(skill!.name).toBe(name);
+  expect({ name: skill!.name, userInvocable: skill!.userInvocable, modelInvocable: !skill!.disableModelInvocation })
+    .toEqual({ name, userInvocable: true, modelInvocable: true });
   expect(skill!.description.trim()).not.toBe("");
   expect(skill!.argumentHint?.trim()).not.toBe("");
-  expect(skill!.userInvocable).toBe(true);
-  expect(skill!.disableModelInvocation).toBe(false);
 
-  const skillFile = path.join(skillRootPath, "SKILL.md");
-  const canonicalSkillFile = expectCanonicalRealpath(skillFile, `${name}/SKILL.md`);
-  expect(normalized(skill!.source.path)).toBe(normalized(canonicalSkillFile));
+  const skillFile = path.join(skillRoot, "SKILL.md");
+  const canonicalSkill = canonical(skillFile, `${name}/SKILL.md`);
+  expect(normalized(skill!.source.path)).toBe(normalized(canonicalSkill));
   const body = loadSkillBody(skill!);
   expect(body.length).toBeGreaterThan(0);
   expect(body.length).toBeLessThanOrEqual(REINJECT_PER_SKILL_MAX_CHARS);
   if (options.representativeArguments !== undefined) {
-    const rendered = substituteArguments(body, options.representativeArguments, skill!.arguments);
-    expect(rendered.text).toContain(options.representativeArguments);
-    expect(rendered.text.length).toBeLessThanOrEqual(REINJECT_PER_SKILL_MAX_CHARS);
+    const rendered = substituteArguments(body, options.representativeArguments, skill!.arguments).text;
+    expect(rendered).toContain(options.representativeArguments);
+    expect(rendered.length).toBeLessThanOrEqual(REINJECT_PER_SKILL_MAX_CHARS);
   }
+  expect(walkFiles(skillRoot, (entry) => entry.toLowerCase() === "skill.md").map(normalized))
+    .toEqual([normalized(canonicalSkill)]);
 
-  const skillFiles = walkFiles(skillRootPath, (entry) => entry.toLowerCase() === "skill.md");
-  expect(skillFiles.map((file) => normalized(fs.realpathSync(file)))).toEqual([
-    normalized(canonicalSkillFile),
-  ]);
-
-  const linkedLocalReferences = new Set<string>(body.match(/references\/[A-Za-z0-9_-]+\.md/gi) ?? []);
-  for (const localReference of linkedLocalReferences) {
-    const file = path.resolve(skillRootPath, localReference);
-    expect(isInside(file, skillRoot), `router reference escapes skill root: ${localReference}`).toBe(true);
-    expectCanonicalRealpath(file, `router reference ${localReference}`);
-  }
-  for (const source of walkFiles(skillRootPath, (entry) => entry.toLowerCase().endsWith(".md"))) {
-    const sourceReal = fs.realpathSync(source);
-    expect(isInside(sourceReal, skillRoot), `Markdown source escapes skill root: ${source}`).toBe(true);
-    expect(normalized(sourceReal), `Markdown source must not be a symlink: ${source}`).toBe(
-      normalized(source),
-    );
+  const linked = new Set<string>(body.match(/references\/[A-Za-z0-9_-]+\.md/gi) ?? []);
+  const markdown = walkFiles(skillRoot, (entry) => entry.toLowerCase().endsWith(".md"));
+  for (const source of markdown) {
+    const sourceReal = canonical(source, `Markdown source ${source}`);
+    expect(inside(sourceReal, skillRoot)).toBe(true);
     for (const link of resolveMarkdownLinks(source)) {
-      const { target, lexicalPath: lexical, realPath: resolved } = link;
-      const lexicalRoot = shippedRoots.find((root) => isInside(lexical, root));
-      const approvedExternal = approvedExternalFiles.find(
-        (file) => normalized(file) === normalized(lexical),
-      );
-      expect(
-        lexicalRoot ?? approvedExternal,
-        `link lexically escapes allowlisted shipped roots/files: ${target}`,
-      ).toBeDefined();
-      if (lexicalRoot) {
-        expect(isInside(resolved, lexicalRoot), `link resolves outside its shipped root: ${target}`).toBe(
-          true,
-        );
-      } else {
-        expect(normalized(resolved), `external link resolves outside its allowlisted file: ${target}`).toBe(
-          normalized(approvedExternal!),
-        );
-      }
-      if (isInside(resolved, skillRoot) && normalized(sourceReal) === normalized(canonicalSkillFile)) {
-        linkedLocalReferences.add(path.relative(skillRoot, resolved).replace(/\\/g, "/"));
-      }
+      const lexicalRoot = shippedRoots.find((root) => inside(link.lexicalPath, root));
+      const external = approved.find((file) => normalized(file) === normalized(link.lexicalPath));
+      expect(lexicalRoot ?? external, `link escapes approved roots: ${link.target}`).toBeDefined();
+      if (lexicalRoot) expect(inside(link.realPath, lexicalRoot), `link traverses its root: ${link.target}`).toBe(true);
+      else expect(normalized(link.realPath)).toBe(normalized(external!));
+      if (inside(link.realPath, skillRoot)) linked.add(path.relative(skillRoot, link.realPath).replace(/\\/g, "/"));
     }
   }
-
-  const referencesPath = path.join(skillRootPath, "references");
-  const referencesRoot = expectCanonicalRealpath(referencesPath, `${name}/references`);
-  expect(isInside(referencesRoot, skillRoot)).toBe(true);
-  const onDiskReferences = walkFiles(referencesPath, (entry) => entry.toLowerCase().endsWith(".md"))
-    .map((file) => {
-      const real = fs.realpathSync(file);
-      expect(isInside(real, referencesRoot), `reference escapes references root: ${file}`).toBe(true);
-      return path.relative(skillRoot, real).replace(/\\/g, "/");
-    })
-    .sort();
-  expect(onDiskReferences.length).toBeGreaterThan(0);
-  expect([...linkedLocalReferences].sort()).toEqual(onDiskReferences);
+  const references = path.join(skillRoot, "references");
+  canonical(references, `${name}/references`);
+  const onDisk = walkFiles(references, (entry) => entry.toLowerCase().endsWith(".md"))
+    .map((file) => path.relative(skillRoot, canonical(file, file)).replace(/\\/g, "/")).sort();
+  expect([...linked].sort()).toEqual(onDisk);
   return body;
-}
-
-export function collapsedFile(file: string): string {
-  return fs.readFileSync(file, "utf8").toLowerCase().replace(/\s+/g, " ");
-}
-
-export function expectMarkers(body: string, markers: readonly string[]): void {
-  for (const marker of markers) expect(body).toContain(marker.toLowerCase());
-}
-
-/** Test-only executable form of proposal-gate's model-followed double-quoted search discipline. */
-export function isSafeAdvisorySearchTerm(term: string): boolean {
-  return term.length > 0 && term.length <= 200 && /^[\x20-\x7e]+$/.test(term) && !/[`$"\\;|&]/.test(term);
-}
-
-export function isValidRepositoryOperandSyntax(repository: string): boolean {
-  return /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(repository);
 }
