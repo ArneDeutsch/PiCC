@@ -89,12 +89,13 @@ notes and changed contracts, update the complete direct Pi suite in the feature 
 node scripts/update-pi-suite.mjs <newer-stable-exact-version>
 ```
 
-The helper preflights the exact public release, updates dependency state without lifecycle scripts,
-and validates the resulting graph. It does not make compatibility decisions: adapt PiCC semantics
-and documentation, run `npm run typecheck:all` and `npm test`, then submit the result as a
-human-reviewed pull request. Never couple Pi release detection or adoption to automatic merging or
-publication. After human review, a human-created release tag may invoke the sanctioned verified
-release workflow.
+The helper runs one exact, scripts-disabled npm transaction using your normal npm configuration,
+then validates the resulting graph. If it fails, inspect or restore `package.json` and
+`package-lock.json` with Git and run `npm ci --ignore-scripts`. It does not make compatibility
+decisions: adapt PiCC semantics and documentation, run `npm run typecheck:all` and `npm test`, then
+submit the result as a human-reviewed pull request. Never couple Pi release detection or adoption to
+automatic merging or publication. After human review, a human-created release tag may invoke the
+sanctioned verified release workflow.
 
 ## Guiding principles
 
