@@ -5,7 +5,7 @@ import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanupRecoveryNpmPolicy, recoveryNpmPolicyArgs, reinstallGuidance, requestLatestFromRegistry, runUpdate } from "../bin/picc-update.mjs";
 import { discoverTrustedGit, discoverTrustedNpmCli } from "../bin/picc-admin.mjs";
 
@@ -14,6 +14,7 @@ const git = discoverTrustedGit();
 const npmCli = discoverTrustedNpmCli();
 
 afterEach(async () => {
+  vi.useRealTimers();
   cleanupRecoveryNpmPolicy();
   await Promise.all(cleanup.splice(0).map((entry) => rm(entry, { recursive: true, force: true })));
 });
@@ -162,6 +163,53 @@ describe("bounded public registry metadata", () => {
 });
 
 describe("verified global PiCC updates", () => {
+  it("leaves installed npm and Git collection explicitly unbounded", async () => {
+    const fixture = await globalFixture();
+    const sourceRoot = await sourceFixture();
+    vi.useFakeTimers();
+    const capture = output();
+    const updating = runUpdate({
+      action: "update", ...fixture, requestLatest: async () => "1.2.4", output: capture.sink,
+      runNpm: () => {
+        const process = pendingChild();
+        setTimeout(() => {
+          writeFileSync(path.join(fixture.packageRoot, "package.json"), JSON.stringify({ name: "picc", version: "1.2.4" }));
+          process.emit("close", 0, null);
+        }, 31_000);
+        return process;
+      },
+    });
+    await vi.advanceTimersByTimeAsync(31_000);
+    await expect(updating).resolves.toBe(0);
+    expect(capture.stdout.join("\n")).toContain("updated the complete PiCC product");
+
+    let gitCalls = 0;
+    const sourceCapture = output();
+    let sourceSettled = false;
+    const sourceUpdating = runUpdate({
+      action: "update", packageRoot: sourceRoot, globalRoot: undefined, output: sourceCapture.sink,
+      classify: () => "source", validateSuite: () => ({ ok: true, version: "0.81.1" }),
+      runNpm: () => child(),
+      runGit: (args: string[]) => {
+        gitCalls++;
+        const process = pendingChild();
+        setTimeout(() => {
+          const stdout = args.includes("--show-toplevel") ? `${sourceRoot}\n`
+            : args.includes("--absolute-git-dir") ? `${path.join(sourceRoot, ".git")}\n`
+              : args.includes("extensions.worktreeConfig") ? "false\n"
+                : args.includes("symbolic-ref") ? "refs/heads/main\n" : "";
+          if (stdout) process.stdout.write(stdout);
+          process.emit("close", 0, null);
+        }, 31_000);
+        return process;
+      },
+    }).finally(() => { sourceSettled = true; });
+    for (let turns = 0; turns < 20 && !sourceSettled; turns++) await vi.advanceTimersByTimeAsync(31_000);
+    await expect(sourceUpdating).resolves.toBe(0);
+    expect(gitCalls).toBeGreaterThan(0);
+    expect(sourceCapture.stdout.join("\n")).toContain("synchronized ignored dependencies");
+  });
+
   it.each([
     ["1.2.4", "available"], ["1.2.3", "up to date"], ["1.2.2", "up to date"],
   ])("reports the conclusive check outcome for registry version %s", async (latest, phrase) => {

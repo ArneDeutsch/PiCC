@@ -484,6 +484,19 @@ describe("shared provenance and administrative subprocess policy", () => {
     if (result.prefix) expect(result.prefix.toLowerCase()).toBe(path.join(expectedAppData, "npm").toLowerCase());
   });
 
+  it("does not allocate an administrative environment when both npm config paths are explicit", async () => {
+    const result = await callAdmin(`(() => {
+      admin.cleanupAdministrativeEnvironment();
+      const args = admin.fixedNpmPolicyArgs({ userConfig: "/explicit/user.npmrc", globalConfig: "/explicit/global.npmrc" });
+      return { args, cleanupCreatedEnvironment: admin.cleanupAdministrativeEnvironment() };
+    })()`) as { args: string[]; cleanupCreatedEnvironment: boolean };
+    expect(result.args).toEqual(expect.arrayContaining([
+      "--userconfig=/explicit/user.npmrc",
+      "--globalconfig=/explicit/global.npmrc",
+    ]));
+    expect(result.cleanupCreatedEnvironment).toBe(false);
+  });
+
   it("sanitizes child environment, restricts cwd, and removes its temporary administration tree", async () => {
     const cwd = await tempDir("admin cwd ");
     const result = await callAdmin(`new Promise((resolve) => {
@@ -499,6 +512,24 @@ describe("shared provenance and administrative subprocess policy", () => {
     expect(path.isAbsolute(result.env.HOME!)).toBe(true);
     expect(existsSync(result.root)).toBe(false);
     await expect(callAdmin("admin.runAdministrativeChild(process.execPath, [], { cwd: process.argv[1] })", cwd)).rejects.toThrow(/outside trusted roots/);
+  });
+
+  it("enforces a real deadline and stops a delayed descendant before resolving", async () => {
+    const cwd = await tempDir("administrative tree deadline ");
+    const ready = path.join(cwd, "descendant-ready");
+    const canary = path.join(cwd, "descendant-canary");
+    const descendant = `require("node:fs").writeFileSync(${JSON.stringify(ready)}, "ready"); setTimeout(() => require("node:fs").writeFileSync(${JSON.stringify(canary)}, "late"), 1500); setInterval(() => {}, 1000);`;
+    const parent = `require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], { stdio: "ignore" }); setInterval(() => {}, 1000);`;
+    const child = admin.runAdministrativeChild(process.execPath, ["-e", parent], { cwd, trustedRoots: [cwd] } as never);
+    const collecting = admin.collectAdministrativeChild(child, { deadlineMs: 700 });
+    await waitUntil({ predicate: () => existsSync(ready), description: "administrative descendant ready marker", timeoutMs: 5_000 });
+    const result = await collecting;
+    expect(result).toMatchObject({ ok: false, category: "deadline exceeded" });
+    await new Promise<void>((resolve, reject) => {
+      const ceiling = setTimeout(() => reject(new Error("descendant canary safety ceiling exceeded")), 5_000);
+      setTimeout(() => { clearTimeout(ceiling); resolve(); }, 1_700);
+    });
+    expect(existsSync(canary)).toBe(false);
   });
 
   it("runs trusted npm and Git benign probes when available and refuses unavailable forms", async () => {

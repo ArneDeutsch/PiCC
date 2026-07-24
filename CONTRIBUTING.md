@@ -80,6 +80,20 @@ The roster is deliberately heterogeneous — different viewpoints is the point:
 
 You can also dispatch any of them directly when you want one specialist's read on a change.
 
+### Upgrading the embedded Pi suite
+
+Run Pi upgrades through an explicit `/implement-feature` workflow. After inspecting Pi's release
+notes and changed contracts, update the complete direct Pi suite in the feature worktree:
+
+```bash
+node scripts/update-pi-suite.mjs <newer-stable-exact-version>
+```
+
+The helper preflights the exact public release, updates dependency state without lifecycle scripts,
+and validates the resulting graph. It does not make compatibility decisions: adapt PiCC semantics
+and documentation, run `npm run typecheck:all` and `npm test`, then submit the result as a
+human-reviewed pull request. Do not automate release detection, adoption, merging, or publication.
+
 ## Guiding principles
 
 - **Completeness floor.** No project input may crash the harness. Every artifact/field/tool/hook is

@@ -35,6 +35,9 @@ const VERSION_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const PUBLIC_REGISTRY_RE = /^https:\/\/registry\.npmjs\.org\/picc\/-\/picc-(\d+\.\d+\.\d+)\.tgz$/;
 const MAX_NODE_MODULES_DIRS = 4096;
 const MAX_NODE_MODULES_DEPTH = 64;
+const MAX_ADMINISTRATIVE_OUTPUT_BYTES = 256 * 1024;
+const DEFAULT_ADMINISTRATIVE_DEADLINE_MS = 30_000;
+const TERMINATION_GRACE_MS = 1_000;
 
 export function parseStableExactVersion(value) {
   if (typeof value !== "string") return undefined;
@@ -196,6 +199,33 @@ export function administrativeEnvironment() {
   return env;
 }
 
+export function fixedNpmPolicyArgs({ userConfig, globalConfig } = {}) {
+  const environment = userConfig === undefined || globalConfig === undefined
+    ? administrativeEnvironment()
+    : undefined;
+  return [
+    "--ignore-scripts", "--audit=false", "--fund=false",
+    "--registry=https://registry.npmjs.org/",
+    `--userconfig=${userConfig ?? environment?.npm_config_userconfig}`,
+    `--globalconfig=${globalConfig ?? environment?.npm_config_globalconfig}`,
+    "--proxy=null", "--https-proxy=null", "--noproxy=*", "--strict-ssl=true",
+    "--cafile=null", "--ca=null", "--cert=null", "--key=null",
+  ];
+}
+
+export function hardenedGitArgs(args) {
+  const environment = administrativeEnvironment();
+  const administrativeRoot = canonicalPath(path.dirname(environment.npm_config_userconfig));
+  const hooks = path.join(administrativeRoot, "empty-git-hooks");
+  fs.mkdirSync(hooks, { recursive: true, mode: 0o700 });
+  const verifiedHooks = canonicalPath(hooks);
+  if (!fs.statSync(verifiedHooks).isDirectory() || !isPathInside(verifiedHooks, administrativeRoot)) throw new Error("unsafe hooks directory");
+  return [
+    "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", `core.hooksPath=${verifiedHooks}`,
+    "-c", "filter.lfs.clean=", "-c", "filter.lfs.process=", ...args,
+  ];
+}
+
 export function wireChildLifecycle(child, { onSpawnError, onExitCode, onSignal }) {
   let spawnFailed = false;
   child.once("error", () => {
@@ -235,6 +265,7 @@ export function runAdministrativeChild(executable, args, { cwd, trustedRoots, st
     child = spawn(executable, args, {
       cwd: childCwd,
       env: administrativeEnvironment(),
+      detached: process.platform !== "win32",
       shell: false,
       stdio,
       windowsHide: true,
@@ -249,6 +280,84 @@ export function runAdministrativeChild(executable, args, { cwd, trustedRoots, st
     cleanupAdministrativeEnvironment();
   });
   return child;
+}
+
+function taskkillPath() {
+  const systemRoot = trustedWindowsSystemRoot();
+  if (!systemRoot) return undefined;
+  const candidate = path.join(systemRoot, "System32", "taskkill.exe");
+  return fs.statSync(candidate, { throwIfNoEntry: false })?.isFile() ? candidate : undefined;
+}
+
+function waitForClose(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => child.once("close", resolve));
+}
+
+export async function terminateAdministrativeChildTree(child) {
+  const pid = child.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    child.kill?.("SIGKILL");
+    await waitForClose(child);
+    return;
+  }
+  if (process.platform === "win32") {
+    const taskkill = taskkillPath();
+    if (!taskkill) throw new Error("Trusted process-tree termination is unavailable");
+    const killer = spawn(taskkill, ["/PID", String(pid), "/T", "/F"], {
+      cwd: path.dirname(taskkill), env: administrativeEnvironment(), shell: false, windowsHide: true, stdio: "ignore",
+    });
+    await Promise.all([waitForClose(killer), waitForClose(child)]);
+    return;
+  }
+  try { process.kill(-pid, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
+  const closed = waitForClose(child);
+  await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, TERMINATION_GRACE_MS))]);
+  try { process.kill(-pid, "SIGKILL"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
+  await closed;
+}
+
+export function collectAdministrativeChild(child, {
+  captureStdout = false,
+  deadlineMs = DEFAULT_ADMINISTRATIVE_DEADLINE_MS,
+  maxOutputBytes = MAX_ADMINISTRATIVE_OUTPUT_BYTES,
+  stderrConsumer,
+  acceptedCodes = [0],
+} = {}) {
+  return new Promise((resolve) => {
+    let bytes = 0;
+    let stdout = "";
+    let closed = false;
+    let forcedCategory;
+    let stopping;
+    let deadline;
+    const stop = (category) => {
+      forcedCategory ??= category;
+      stopping ??= terminateAdministrativeChildTree(child).catch(() => undefined);
+    };
+    if (deadlineMs !== null) deadline = setTimeout(() => stop("deadline exceeded"), deadlineMs);
+    const consume = (chunk, capture) => {
+      bytes += chunk.length;
+      if (bytes > maxOutputBytes) stop("output overflow");
+      else if (capture) stdout += String(chunk);
+    };
+    child.stdout?.on("data", (chunk) => consume(chunk, captureStdout));
+    child.stderr?.on("data", (chunk) => {
+      consume(chunk, false);
+      if (bytes <= maxOutputBytes) stderrConsumer?.(chunk);
+    });
+    child.once("error", () => stop("spawn error"));
+    child.once("close", async (code, signal) => {
+      if (closed) return;
+      closed = true;
+      if (deadline !== undefined) clearTimeout(deadline);
+      if (stopping) await stopping;
+      if (forcedCategory) resolve({ ok: false, category: forcedCategory, stdout: "", code });
+      else if (signal) resolve({ ok: false, category: "termination signal", stdout: "", code });
+      else if (!acceptedCodes.includes(code)) resolve({ ok: false, category: "nonzero exit", stdout: "", code });
+      else resolve({ ok: true, category: "success", stdout, code });
+    });
+  });
 }
 
 export function runTrustedNpm(args, options) {

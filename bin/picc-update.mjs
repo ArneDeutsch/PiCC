@@ -6,13 +6,14 @@ import path from "node:path";
 import { rootCertificates } from "node:tls";
 import {
   VALIDATION_MODES,
-  administrativeEnvironment,
   canonicalPath,
+  collectAdministrativeChild,
   classifyInstallation,
   compareStableVersions,
   discoverGlobalNpmRoot,
   findPackageRoot,
-  isPathInside,
+  fixedNpmPolicyArgs,
+  hardenedGitArgs,
   parseStableExactVersion,
   runTrustedGit,
   runTrustedNpm,
@@ -22,7 +23,6 @@ import {
 const REGISTRY_URL = "https://registry.npmjs.org/picc/latest";
 const REGISTRY_TIMEOUT_MS = 5_000;
 const MAX_REGISTRY_BYTES = 64 * 1024;
-const MAX_CHILD_OUTPUT_BYTES = 256 * 1024;
 const HELP = `Usage: picc update [--check|--help]
 
 Checks or synchronizes PiCC as one compatible product. It never updates embedded Pi independently.`;
@@ -166,53 +166,17 @@ function npmCodeScanner() {
   };
 }
 
-function collectChild(child, { npmErrorCode = false } = {}) {
-  return new Promise((resolve) => {
-    let settled = false;
-    let bytes = 0;
-    let overflow = false;
-    const scanner = npmErrorCode ? npmCodeScanner() : undefined;
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      resolve(result);
-    };
-    const consume = (chunk) => {
-      bytes += chunk.length;
-      if (bytes > MAX_CHILD_OUTPUT_BYTES && !overflow) {
-        overflow = true;
-        child.kill();
-      }
-    };
-    child.stdout?.on("data", consume);
-    child.stderr?.on("data", (chunk) => {
-      consume(chunk);
-      scanner?.consume(chunk);
-    });
-    child.once("error", () => finish({ ok: false, category: "spawn error" }));
-    child.once("close", (code, signal) => {
-      if (overflow) finish({ ok: false, category: "output overflow" });
-      else if (signal) finish({ ok: false, category: "termination signal" });
-      else if (code !== 0) {
-        const code = scanner?.code();
-        finish({ ok: false, category: code ? `npm ${code}` : "nonzero exit" });
-      }
-      else finish({ ok: true, category: "success" });
-    });
+async function collectChild(child, { npmErrorCode = false } = {}) {
+  const scanner = npmErrorCode ? npmCodeScanner() : undefined;
+  const result = await collectAdministrativeChild(child, {
+    deadlineMs: null,
+    stderrConsumer: (chunk) => scanner?.consume(chunk),
   });
-}
-
-function hardenedGitArgs(args) {
-  const env = administrativeEnvironment();
-  const administrativeRoot = canonicalPath(path.dirname(env.npm_config_userconfig));
-  const hooks = path.join(administrativeRoot, "empty-git-hooks");
-  fs.mkdirSync(hooks, { recursive: true, mode: 0o700 });
-  const verifiedHooks = canonicalPath(hooks);
-  if (!fs.statSync(verifiedHooks).isDirectory() || !isPathInside(verifiedHooks, administrativeRoot)) throw new Error("unsafe hooks directory");
-  return [
-    "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", `core.hooksPath=${verifiedHooks}`,
-    "-c", "filter.lfs.clean=", "-c", "filter.lfs.process=", ...args,
-  ];
+  if (!result.ok && result.category === "nonzero exit") {
+    const code = scanner?.code();
+    if (code) return { ...result, category: `npm ${code}` };
+  }
+  return result;
 }
 
 async function runGit(args, root, dependencies, acceptedCodes = [0]) {
@@ -222,27 +186,7 @@ async function runGit(args, root, dependencies, acceptedCodes = [0]) {
     hardenedArgs = hardenedGitArgs(args);
     child = dependencies.runGit(hardenedArgs, { cwd: root, trustedRoots: [root] });
   } catch { return { ok: false, stdout: "" }; }
-  let stdout = "";
-  let bytes = 0;
-  let settled = false;
-  return new Promise((resolve) => {
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      resolve(result);
-    };
-    child.stdout?.on("data", (chunk) => {
-      bytes += chunk.length;
-      if (bytes <= MAX_CHILD_OUTPUT_BYTES) stdout += String(chunk);
-      else child.kill();
-    });
-    child.stderr?.on("data", (chunk) => {
-      bytes += chunk.length;
-      if (bytes > MAX_CHILD_OUTPUT_BYTES) child.kill();
-    });
-    child.once("error", () => finish({ ok: false, stdout: "" }));
-    child.once("close", (code, signal) => finish({ ok: bytes <= MAX_CHILD_OUTPUT_BYTES && acceptedCodes.includes(code) && !signal, stdout, code }));
-  });
+  return collectAdministrativeChild(child, { captureStdout: true, deadlineMs: null, acceptedCodes });
 }
 
 function configuredFilterCommands(stdout) {
@@ -295,17 +239,8 @@ async function inspectSource(root, dependencies) {
   return { ok: true, detached: !branch.ok };
 }
 
-function fixedNpmPolicyArgs(userConfig) {
-  return [
-    "--ignore-scripts", "--audit=false", "--fund=false",
-    "--registry=https://registry.npmjs.org/", `--userconfig=${userConfig}`,
-    "--proxy=null", "--https-proxy=null", "--noproxy=*", "--strict-ssl=true",
-    "--cafile=null", "--ca=null", "--cert=null", "--key=null",
-  ];
-}
-
 function npmPolicyArgs() {
-  return fixedNpmPolicyArgs(administrativeEnvironment().npm_config_userconfig);
+  return fixedNpmPolicyArgs();
 }
 
 let recoveryConfigDirectory;
@@ -323,10 +258,10 @@ export function recoveryNpmPolicyArgs(platform = process.platform) {
       fs.closeSync(descriptor);
     }
   }
-  return [
-    ...fixedNpmPolicyArgs(path.join(recoveryConfigDirectory, "user.npmrc")),
-    `--globalconfig=${path.join(recoveryConfigDirectory, "global.npmrc")}`,
-  ];
+  return fixedNpmPolicyArgs({
+    userConfig: path.join(recoveryConfigDirectory, "user.npmrc"),
+    globalConfig: path.join(recoveryConfigDirectory, "global.npmrc"),
+  });
 }
 
 export function cleanupRecoveryNpmPolicy() {
