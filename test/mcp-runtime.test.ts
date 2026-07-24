@@ -262,10 +262,17 @@ describe("McpRuntime stdio lifecycle", () => {
     }
   }, 25_000);
 
-  it("composes config env over the injected Claude vars over inherited env, unicode-safe", async () => {
+  it("composes config env over Claude defaults over sanitized inheritance, unicode-safe", async () => {
     const fixture = createMcpProcessFixture(makeTempDir());
     const projectRoot = makeTempDir();
-    const base: Record<string, string | undefined> = { ...cleanBaseEnv(), MCP_FIXTURE_VAR: "from-base" };
+    const base: Record<string, string | undefined> = {
+      ...cleanBaseEnv(),
+      MCP_FIXTURE_VAR: "from-base",
+      PICC_LAUNCHER_PID: "99",
+      PICC_INSTALL_KIND: "source",
+      PICC_VERSION: "1.2.3",
+      PI_SKIP_VERSION_CHECK: "1",
+    };
     // Prove unicodeSafeSubprocessEnv participates: the default only applies
     // when the base does not already set it.
     delete base["PYTHONIOENCODING"];
@@ -277,8 +284,7 @@ describe("McpRuntime stdio lifecycle", () => {
           env: {
             ...fixture.env,
             MCP_FIXTURE_VAR: "from-config",
-            // Claude parity (binary-verified 2.1.218): config `env` is spread
-            // LAST — it wins even over the injected Claude vars.
+            // Claude parity: configured server env is applied last.
             CLAUDECODE: "0",
             CLAUDE_PROJECT_DIR: "/config-wins",
           },
@@ -294,16 +300,23 @@ describe("McpRuntime stdio lifecycle", () => {
         "CLAUDE_CODE_SESSION_ID",
         "MCP_FIXTURE_VAR",
         "PYTHONIOENCODING",
+        "PICC_LAUNCHER_PID",
+        "PICC_INSTALL_KIND",
+        "PICC_VERSION",
+        "PI_SKIP_VERSION_CHECK",
       ];
       const result = await runtime.callTool("fixture", "report-env", { names });
       const reported = JSON.parse(firstText(result)) as Record<string, string | null>;
       expect(reported).toEqual({
         CLAUDE_PROJECT_DIR: "/config-wins",
         CLAUDECODE: "0",
-        // Not set in config env, so the injected value survives.
         CLAUDE_CODE_SESSION_ID: "env-proof-session",
         MCP_FIXTURE_VAR: "from-config",
         PYTHONIOENCODING: "utf-8",
+        PICC_LAUNCHER_PID: null,
+        PICC_INSTALL_KIND: null,
+        PICC_VERSION: null,
+        PI_SKIP_VERSION_CHECK: null,
       });
     } finally {
       await runtime.shutdown();

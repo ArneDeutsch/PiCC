@@ -1,4 +1,4 @@
-import { unicodeSafeSubprocessEnv } from "../util/env.js";
+import { sanitizedSubprocessEnv, unicodeSafeSubprocessEnv } from "../util/env.js";
 import { killProcessTreeByPid, listDescendantPids } from "../util/process-tree.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
 import type { ResolvedMcpConfig, ResolvedMcpServer } from "../types.js";
@@ -338,16 +338,17 @@ export class McpRuntime {
     // check is complete: there is no await between here and the spawn.
     if (handle.stopped) return;
     try {
-      // Spread order is binary-verified Claude parity (2.1.218): base env →
-      // injected Claude vars → config `env` LAST — config wins over everything,
-      // including the injected vars.
-      const env = unicodeSafeSubprocessEnv({
-        ...(this.deps.env ?? process.env),
-        CLAUDE_PROJECT_DIR: this.deps.projectRoot,
-        CLAUDECODE: "1",
-        CLAUDE_CODE_SESSION_ID: this.deps.sessionId,
-        ...server.env,
-      });
+      // Claude parity (binary-verified 2.1.218): sanitized inheritance →
+      // injected Claude defaults → configured server env last.
+      const env = unicodeSafeSubprocessEnv(sanitizedSubprocessEnv(
+        this.deps.env ?? process.env,
+        {
+          CLAUDE_PROJECT_DIR: this.deps.projectRoot,
+          CLAUDECODE: "1",
+          CLAUDE_CODE_SESSION_ID: this.deps.sessionId,
+        },
+        server.env,
+      ));
       const transport = new sdk.StdioClientTransport({
         command: server.command,
         args: server.args,

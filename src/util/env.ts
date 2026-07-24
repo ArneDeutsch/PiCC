@@ -1,3 +1,70 @@
+import { execFile } from "node:child_process";
+
+const LAUNCHER_ONLY_ENV_KEYS = [
+  "PICC_LAUNCHER_PID",
+  "PICC_INSTALL_KIND",
+  "PICC_VERSION",
+  "PI_SKIP_VERSION_CHECK",
+] as const;
+
+/**
+ * Build a managed-child environment in the required precedence order: inherit,
+ * remove PiCC launcher context, apply deliberate settings, then surface-required
+ * values. Launcher markers are process lineage hints, not child authority.
+ */
+export function sanitizedSubprocessEnv(
+  inherited: Record<string, string | undefined>,
+  explicit: Record<string, string | undefined> = {},
+  required: Record<string, string | undefined> = {},
+): Record<string, string | undefined> {
+  const out = { ...inherited };
+  for (const key of LAUNCHER_ONLY_ENV_KEYS) delete out[key];
+  return { ...out, ...explicit, ...required };
+}
+
+export function sanitizedExecFile(
+  command: string,
+  args: string[],
+  options: {
+    cwd: string;
+    timeoutMs?: number;
+    inherited?: NodeJS.ProcessEnv;
+    explicit?: Record<string, string | undefined>;
+  },
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  return new Promise((resolve) => {
+    execFile(command, args, {
+      cwd: options.cwd,
+      timeout: options.timeoutMs ?? 60_000,
+      windowsHide: true,
+      maxBuffer: 16 * 1024 * 1024,
+      encoding: "utf8",
+      env: sanitizedSubprocessEnv(options.inherited ?? process.env, options.explicit),
+    }, (error, stdout, stderr) => {
+      const code = typeof (error as { code?: unknown } | null)?.code === "number"
+        ? (error as { code: number }).code
+        : error ? 1 : 0;
+      resolve({ stdout: stdout ?? "", stderr: stderr ?? "", code });
+    });
+  });
+}
+
+/** Remove the captured PiCC markers immediately during extension initialization. */
+export function clearPiccLauncherMarkers(env: NodeJS.ProcessEnv = process.env): void {
+  delete env.PICC_LAUNCHER_PID;
+  delete env.PICC_INSTALL_KIND;
+  delete env.PICC_VERSION;
+}
+
+/**
+ * Remove Pi's bounded startup suppression at the first user/user-Bash boundary.
+ * This is deliberately separate from immediate PICC_* marker cleanup because Pi
+ * has no callback between reading this flag and its adjacent interactive startup.
+ */
+export function clearPiStartupSuppression(env: NodeJS.ProcessEnv = process.env): void {
+  delete env.PI_SKIP_VERSION_CHECK;
+}
+
 /**
  * Subprocess environment defaults for cross-platform Unicode safety.
  *

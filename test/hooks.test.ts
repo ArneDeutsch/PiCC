@@ -795,17 +795,45 @@ describe("HookRunner placeholders and environment", () => {
     expect(outcome.stdout).toBe(`${projectDir}\n${projectDir}`);
   });
 
-  it("exposes CLAUDE_* env vars and settings env to the hook process", async () => {
-    const { runner } = makeRunner(
-      {
-        UserPromptSubmit: [
-          { hooks: [`printf '%s|%s|%s' "$CLAUDE_HOOK_EVENT" "$CLAUDE_SESSION_ID" "$MY_SETTING"`] },
-        ],
-      },
-      { sessionId: "sess-42", env: { MY_SETTING: "from-settings" } },
-    );
-    const outcome = await runner.fire("UserPromptSubmit", {});
-    expect(outcome.stdout).toBe("UserPromptSubmit|sess-42|from-settings");
+  it("exposes CLAUDE/settings env while stripping inherited launcher context", async () => {
+    const previous = {
+      PICC_LAUNCHER_PID: process.env.PICC_LAUNCHER_PID,
+      PI_SKIP_VERSION_CHECK: process.env.PI_SKIP_VERSION_CHECK,
+    };
+    process.env.PICC_LAUNCHER_PID = "99";
+    process.env.PI_SKIP_VERSION_CHECK = "1";
+    try {
+      const { runner } = makeRunner(
+        {
+          UserPromptSubmit: [
+            { hooks: [`printf '%s|%s|%s|%s|%s' "$CLAUDE_HOOK_EVENT" "$CLAUDE_SESSION_ID" "$MY_SETTING" "$PICC_LAUNCHER_PID" "$PI_SKIP_VERSION_CHECK"`] },
+          ],
+        },
+        { sessionId: "sess-42", env: { MY_SETTING: "from-settings" } },
+      );
+      const outcome = await runner.fire("UserPromptSubmit", {});
+      expect(outcome.stdout).toBe("UserPromptSubmit|sess-42|from-settings||");
+    } finally {
+      if (previous.PICC_LAUNCHER_PID === undefined) delete process.env.PICC_LAUNCHER_PID;
+      else process.env.PICC_LAUNCHER_PID = previous.PICC_LAUNCHER_PID;
+      if (previous.PI_SKIP_VERSION_CHECK === undefined) delete process.env.PI_SKIP_VERSION_CHECK;
+      else process.env.PI_SKIP_VERSION_CHECK = previous.PI_SKIP_VERSION_CHECK;
+    }
+  });
+
+  it("sanitizes a SessionStart hook before first user admission", async () => {
+    process.env.PICC_VERSION = "1.2.3";
+    process.env.PI_SKIP_VERSION_CHECK = "1";
+    try {
+      const { runner } = makeRunner({
+        SessionStart: [{ hooks: [`printf '%s|%s' "$PICC_VERSION" "$PI_SKIP_VERSION_CHECK"`] }],
+      });
+      const outcome = await runner.fire("SessionStart", { source: "startup" });
+      expect(outcome.stdout).toBe("|");
+    } finally {
+      delete process.env.PICC_VERSION;
+      delete process.env.PI_SKIP_VERSION_CHECK;
+    }
   });
 
   it("expands ${CLAUDE_PLUGIN_ROOT} for plugin-contributed handlers", async () => {

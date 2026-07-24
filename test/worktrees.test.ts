@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { WorktreeManager, flattenWorktreeName } from "../src/runtime/worktrees.js";
+import { sanitizedExecFile } from "../src/util/env.js";
 import type { WorktreeSettings } from "../src/types.js";
 import { makeRepoFromTemplate } from "./helpers/git-repo.js";
 
@@ -92,6 +93,38 @@ describe("WorktreeManager.enter (name mode)", () => {
     const entry = listed.find((e) => path.resolve(e.path) === expectedDir);
     expect(entry).toBeDefined();
     expect(entry!.locked).toBe(true);
+  });
+
+  it("keeps launcher context out of worktree Git-hook descendants while preserving settings env", async () => {
+    const repo = makeRepo();
+    const hookDir = path.join(repo, ".githooks");
+    const output = path.join(repo, "hook-env.txt");
+    fs.mkdirSync(hookDir);
+    const hook = path.join(hookDir, "post-checkout");
+    fs.writeFileSync(
+      hook,
+      '#!/bin/sh\nprintf "%s|%s|%s" "$PICC_LAUNCHER_PID" "$PI_SKIP_VERSION_CHECK" "$EXPLICIT_SETTING" > "$HOOK_OUTPUT"\n',
+      "utf8",
+    );
+    fs.chmodSync(hook, 0o755);
+    git(repo, "config", "core.hooksPath", ".githooks");
+    const inherited = {
+      ...process.env,
+      PICC_LAUNCHER_PID: "99",
+      PI_SKIP_VERSION_CHECK: "1",
+    };
+    const mgr = new WorktreeManager({
+      projectRoot: repo,
+      settings: { baseRef: "head" },
+      exec: (cmd, args, opts) => sanitizedExecFile(cmd, args, {
+        ...opts,
+        inherited,
+        explicit: { EXPLICIT_SETTING: "kept", HOOK_OUTPUT: output },
+      }),
+    });
+    const result = await mgr.enter({ name: "env-proof" });
+    expect(result.ok).toBe(true);
+    expect(fs.readFileSync(output, "utf8")).toBe("||kept");
   });
 
   it("flattens names: feature/x -> feature-x dir, worktree-feature-x branch", async () => {

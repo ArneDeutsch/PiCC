@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { createGrepTool } from "../src/runtime/tools/search-tools.js";
+import { clearPiStartupSuppression } from "../src/util/env.js";
 
 /**
  * Ripgrep-engine coverage: runs the same queries through the real
@@ -72,6 +73,18 @@ describe.skipIf(!rgAvailable)("Grep tool (ripgrep engine, parity with JS fallbac
 
   afterAll(() => {
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("runs the non-Bash ripgrep descendant only after admission cleanup", async () => {
+    process.env.PI_SKIP_VERSION_CHECK = "1";
+    clearPiStartupSuppression();
+    try {
+      const result = await run(rgGrep, { pattern: "hello", path: "." });
+      expect(result.details.engine).toBe("rg");
+      expect(process.env.PI_SKIP_VERSION_CHECK).toBeUndefined();
+    } finally {
+      delete process.env.PI_SKIP_VERSION_CHECK;
+    }
   });
 
   it("files_with_matches: engines agree and both skip hidden + gitignored files", async () => {

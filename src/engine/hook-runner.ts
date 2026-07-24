@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { evaluateIfCondition } from "./permissions.js";
 import { isDirectory } from "../util/fs.js";
-import { unicodeSafeSubprocessEnv } from "../util/env.js";
+import { sanitizedSubprocessEnv, unicodeSafeSubprocessEnv } from "../util/env.js";
 import { killProcessTree } from "../util/process-tree.js";
 import type {
   Diagnostic,
@@ -471,13 +471,15 @@ export class HookRunner {
       argv = ["-c", commandStr];
     }
 
-    const env: NodeJS.ProcessEnv = unicodeSafeSubprocessEnv({
-      ...process.env,
-      ...this.opts.env,
-      CLAUDE_PROJECT_DIR: this.opts.projectDir,
-      CLAUDE_SESSION_ID: this.opts.sessionId,
-      CLAUDE_HOOK_EVENT: eventName,
-    });
+    const env: NodeJS.ProcessEnv = unicodeSafeSubprocessEnv(sanitizedSubprocessEnv(
+      process.env,
+      this.opts.env,
+      {
+        CLAUDE_PROJECT_DIR: this.opts.projectDir,
+        CLAUDE_SESSION_ID: this.opts.sessionId,
+        CLAUDE_HOOK_EVENT: eventName,
+      },
+    ));
     const timeoutSec = effectiveTimeoutSeconds(handler, eventName);
 
     // Hooks run in the payload's cwd (Claude semantics): a WorktreeCreate hook

@@ -4,6 +4,7 @@ import path from "node:path";
 import { expandEnvVars } from "./settings.js";
 import { normalizeMcpServerBlock, type McpJsonResult, type RawMcpEntry } from "../claude/mcp-config.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
+import { sanitizedSubprocessEnv } from "../util/env.js";
 import type {
   McpServerStatus,
   McpSettingsEntry,
@@ -90,6 +91,12 @@ function sanitizeForListMatch(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_");
 }
 
+export function mcpGitProbeEnv(
+  inherited: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return sanitizedSubprocessEnv(inherited);
+}
+
 function defaultGitTrackedProbe(filePath: string, projectRoot: string): boolean | undefined {
   try {
     // Probe the CANONICAL on-disk spelling, not the lexical lookup path: on a
@@ -105,7 +112,7 @@ function defaultGitTrackedProbe(filePath: string, projectRoot: string): boolean 
     const result = spawnSync(
       "git",
       ["-C", realRoot, "ls-files", "--error-unmatch", "--", rel.split(path.sep).join("/")],
-      { stdio: "ignore", timeout: 5000, windowsHide: true },
+      { stdio: "ignore", timeout: 5000, windowsHide: true, env: mcpGitProbeEnv() },
     );
     if (result.error) return undefined;
     if (result.status === 0) return true;

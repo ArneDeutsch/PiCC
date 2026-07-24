@@ -3,10 +3,61 @@ import { execFileSync } from "node:child_process";
 import {
   applyUnicodeSafeProcessEnv,
   computeSessionScratchDir,
+  sanitizedExecFile,
+  sanitizedSubprocessEnv,
   toNativeSafeTempForm,
   unicodeSafeSubprocessEnv,
   type ScratchDirIo,
 } from "../src/util/env.js";
+
+describe("sanitizedSubprocessEnv", () => {
+  it("strips launcher-only inheritance before overlays and preserves explicit settings", () => {
+    const inherited = {
+      PATH: "/bin",
+      PICC_LAUNCHER_PID: "10",
+      PICC_INSTALL_KIND: "source",
+      PICC_VERSION: "1.2.3",
+      PI_SKIP_VERSION_CHECK: "1",
+      SETTING: "inherited",
+    };
+    const out = sanitizedSubprocessEnv(
+      inherited,
+      { SETTING: "explicit", PI_SKIP_VERSION_CHECK: "deliberate-setting" },
+      { CLAUDE_PROJECT_DIR: "/project" },
+    );
+    expect(out).toMatchObject({
+      PATH: "/bin",
+      SETTING: "explicit",
+      PI_SKIP_VERSION_CHECK: "deliberate-setting",
+      CLAUDE_PROJECT_DIR: "/project",
+    });
+    expect(out.PICC_LAUNCHER_PID).toBeUndefined();
+    expect(out.PICC_INSTALL_KIND).toBeUndefined();
+    expect(out.PICC_VERSION).toBeUndefined();
+  });
+
+  it("lets surface-required values win after explicit settings", () => {
+    expect(sanitizedSubprocessEnv({}, { REQUIRED: "setting" }, { REQUIRED: "surface" }).REQUIRED)
+      .toBe("surface");
+  });
+
+  it("runs startup/worktree executors with sanitized inheritance and explicit settings", async () => {
+    const result = await sanitizedExecFile(process.execPath, [
+      "-e",
+      "process.stdout.write(JSON.stringify({pid:process.env.PICC_LAUNCHER_PID,skip:process.env.PI_SKIP_VERSION_CHECK,setting:process.env.EXPLICIT_SETTING}))",
+    ], {
+      cwd: process.cwd(),
+      inherited: {
+        ...process.env,
+        PICC_LAUNCHER_PID: "99",
+        PI_SKIP_VERSION_CHECK: "1",
+      },
+      explicit: { EXPLICIT_SETTING: "kept" },
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({ setting: "kept" });
+  });
+});
 
 describe("unicodeSafeSubprocessEnv", () => {
   it("sets Python UTF-8 defaults when unset", () => {
