@@ -583,6 +583,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     committed: boolean;
     restorationFailed: boolean;
   } | undefined;
+  /**
+   * How a resumed run ended. `completed` is the only conclusion that may claim the
+   * paused work was delivered; `abandoned` is a post-commit give-up that closes the
+   * session; `superseded` hands the terminal to whatever authority the controller
+   * has already moved to — a cancellation, a terminalization, a stopped logical run,
+   * or the replacement installed by an epoch rotation.
+   */
+  type ResumeConclusion = "completed" | "abandoned" | "superseded";
   let activeMainResume: {
     generation: number;
     token: ResumeToken;
@@ -591,7 +599,32 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     /** The run's own cancellation authority, so a resumed emission can be released. */
     signal: AbortSignal;
     settled: Promise<void>;
-    resolveSettled(): void;
+    /**
+     * True while some owner is expected to publish `settled`: a physical turn PiCC
+     * dispatched through an API whose completion Pi announces (see the `triggerTurn`
+     * note at the send site for the one precondition that carries), or the
+     * `agent_settled` handler invocation currently deciding this run's ending. It
+     * goes false at exactly one place — the Stop-continuation hand-off, where PiCC
+     * has bet on a `pi.sendUserMessage` that returns void and that Pi may drop
+     * without ever starting a turn.
+     *
+     * It is a claim about who owes a settlement, not a proof: the handler
+     * invocation's own coverage has one exception, named at the `agent_settled`
+     * ownership comment. `cancelAndJoin` reads it to decide whether to conclude the
+     * run itself before joining.
+     */
+    settlementOwned: boolean;
+    /**
+     * True once a `cancelAndJoin` has parked on `settled`. It pairs with
+     * `settlementOwned` to make the hand-off race-free: the join publishes this flag
+     * and then samples ownership, and the hand-off clears ownership and then samples
+     * this flag, so whichever of the two runs second sees the other and publishes the
+     * ending. Without it, a join that sampled ownership one tick before the hand-off
+     * cleared it would wait forever on a settlement nobody owes.
+     */
+    joinParked: boolean;
+    /** Publishes this run's settlement, whole, exactly once, on every ending. */
+    conclude(conclusion: ResumeConclusion): void;
     replayCompleted: boolean;
   } | undefined;
   const quotaHeaders: Record<string, string> = {};
@@ -1357,6 +1390,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     },
     resume: (resumeContext) => {
       const ctx = checkpointContext;
+      const owner = mainCheckpointGate.currentController();
       let openProvider!: () => void;
       let rejectProvider!: (reason?: unknown) => void;
       // The hidden continuation starts the run, but queued steering must be
@@ -1371,6 +1405,45 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       }
       let resolveSettled!: () => void;
       const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+      let concluded: ResumeConclusion | undefined;
+      /**
+       * The single publisher of this run's settlement. Every ending goes through it,
+       * so no exit can settle the local wait while leaving the provider barrier
+       * pending, or unpark a waiter while leaving the controller in `resuming` with
+       * its generation barrier unpublished.
+       */
+      const conclude = (conclusion: ResumeConclusion): void => {
+        if (concluded) return;
+        concluded = conclusion;
+        if (conclusion === "completed") {
+          // Success is claimed here and nowhere else, and only for a turn that ran.
+          owner.resumedSettled(resumeContext.token);
+          openProvider();
+        } else {
+          // `defensiveLatch` captured the promise itself, so dropping the gate's
+          // reference is not enough — the barrier has to be settled as well.
+          rejectProvider(new Error(`checkpoint resume ${conclusion}`));
+        }
+        // Every ending withdraws the gate's reference, success included: an open
+        // barrier that outlives its run is a latch `defensiveLatch` would wake from
+        // and re-authenticate against a still-`resuming` phase, granting transport to
+        // a run that has already settled. (Reachable only when `replayComplete` never
+        // ran, so it is a hazard rather than an observed defect.)
+        mainCheckpointGate.clearResumeBarrier(resumeContext.generation, providerBarrier);
+        resolveSettled();
+        if (activeMainResume === resume) activeMainResume = undefined;
+        // Resume only ever runs after the summary committed, so work that cannot be
+        // delivered is a post-commit failure: terminal, no recovery token, and never
+        // recompactable. This also publishes the generation barrier the settling
+        // agent_settled handler is parked on. Keep it last: terminalization re-enters
+        // cancelAndJoin, which joins the `settled` resolved above. Today that
+        // re-entrancy is void-ed rather than awaited, so the ordering is a guard
+        // against a future awaited terminalization rather than a present necessity.
+        if (conclusion === "abandoned" && mainCheckpointGate.currentController() === owner &&
+            owner.snapshot().generation === resumeContext.generation) {
+          void owner.failAfterCommittedSummary(resumeContext.generation).catch(() => undefined);
+        }
+      };
       activeMainResume = {
         generation: resumeContext.generation,
         token: resumeContext.token,
@@ -1378,7 +1451,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         context: ctx,
         signal: resumeContext.signal,
         settled,
-        resolveSettled,
+        // The continuation below is delivered with `triggerTurn`, which reaches Pi's
+        // agent run whose settlement is always announced — but only while Pi is not
+        // streaming; a streaming session queues it as steering instead and starts no
+        // turn. That precondition holds here because resume is driven from inside
+        // `agent_settled`, which Pi emits after clearing its run-active flag.
+        settlementOwned: true,
+        joinParked: false,
+        conclude,
         replayCompleted: false,
       };
       const resume = activeMainResume;
@@ -1400,10 +1480,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           { triggerTurn: true },
         );
       } catch (error) {
-        if (activeMainResume === resume) activeMainResume = undefined;
-        mainCheckpointGate.clearResumeBarrier(resumeContext.generation, providerBarrier);
-        rejectProvider(error);
-        resolveSettled();
+        // resumeOrFinish turns this throw into the post-commit terminal, so publish
+        // the settlement without claiming a second one here.
+        conclude("superseded");
         throw error;
       }
       return {
@@ -1434,6 +1513,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           rejectProvider(new Error("checkpoint cancelled"));
           mainCheckpointGate.clearResumeBarrier(resumeContext.generation, providerBarrier);
           try { ctx?.abort?.(); } catch { /* join below remains authoritative */ }
+          // Publish the park BEFORE sampling ownership: the Stop-continuation
+          // hand-off clears ownership and then reads this flag, so the two orders
+          // interlock and whichever runs second concludes. Sampling first would let a
+          // hand-off that lands between this read and the await strand the join.
+          resume.joinParked = true;
+          // Join a settlement only while someone is still obliged to publish it.
+          // After the hand-off nobody is: Pi can drop that continuation with no turn
+          // and no event, so waiting here is what turns a dropped continuation into a
+          // session that can never be replaced.
+          if (!resume.settlementOwned) conclude("abandoned");
           await settled;
           if (activeMainResume === resume) activeMainResume = undefined;
         },
@@ -1964,6 +2053,23 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // ---------------------------------------------------------------------------
   // Session lifecycle
   // ---------------------------------------------------------------------------
+  /**
+   * Rotate the checkpoint session epoch, concluding any resume that survived it.
+   *
+   * The narrow reason: every settlement path *inside the `agent_settled` handler* is
+   * guarded on `resume.epoch === checkpointSessionEpoch`, so a resume that outlives
+   * the rotation can no longer be ended by the lifecycle event that would normally
+   * end it. `conclude` itself carries no epoch check, so `cancelAndJoin` could still
+   * reach it — but only if something later cancels, and the rotation sites are
+   * exactly where a session stops being cancellable. Cancellation normally concludes
+   * the resume before the rotation runs; this makes that an invariant of the helper
+   * instead of an ordering an unrelated change could silently break.
+   */
+  const rotateCheckpointSessionEpoch = (): void => {
+    activeMainResume?.conclude("superseded");
+    checkpointSessionEpoch = {};
+  };
+
   pi.on("session_before_switch", async () => {
     // The controller cancels first; the old nested agent_settled or host callback
     // is the only authority that can confirm the logical run has joined.
@@ -1971,7 +2077,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (!result?.cancel) {
       // Invalidate lifecycle authority at switch acceptance, not only at the next
       // session_start, so an old manual completion in that gap is inert.
-      checkpointSessionEpoch = {};
+      rotateCheckpointSessionEpoch();
       activeCompactionOperation = undefined;
     }
     return result;
@@ -1980,7 +2086,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   pi.on("session_start", async (event: any, ctx: any) => {
     await mainCheckpointGate.startSession(randomUUID());
     checkpointContext = ctx;
-    checkpointSessionEpoch = {};
+    rotateCheckpointSessionEpoch();
     const sessionStartEpoch = checkpointSessionEpoch;
     const sessionStartController = mainCheckpointGate.currentController();
     activeCompactionOperation = undefined;
@@ -2421,7 +2527,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
   });
 
-  const runStopHook = async (ctx: any): Promise<boolean> => {
+  /**
+   * `settled` false means a Stop hook blocked and a continuation was issued instead.
+   * `continuationAdmitted` then reports PiCC's own admission decision, which is the
+   * one way a continuation can fail to start a turn that PiCC can actually see —
+   * Pi's `sendUserMessage` returns void, and its other ways of ending without a turn
+   * (no model, expired credentials, a pre-turn throw) are invisible from here.
+   *
+   * It is reported as refused whenever a resumed run is live and the continuation
+   * went out without a capability, because PiCC then refuses it in its own `input`
+   * handler: with no capability in the store the handler falls through to
+   * `ordinaryInputDisposition`, which returns a refusal for every phase except
+   * `idle`, and a live resume means the controller is not idle.
+   */
+  type StopHookOutcome =
+    | { settled: true }
+    | { settled: false; continuationAdmitted: boolean };
+
+  const runStopHook = async (ctx: any): Promise<StopHookOutcome> => {
     try {
       let lastAssistantMessage: string | undefined;
       try {
@@ -2458,7 +2581,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         } catch { /* universal stop remains terminal */ }
         stopRun();
         stopHookIterations = 0;
-        return true;
+        return { settled: true };
       }
       // Claude caps consecutive Stop-hook blocks at 8; carry that same bound
       // across checkpoint resume so the internal physical turn cannot reset it.
@@ -2479,16 +2602,30 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
             text: continuation,
             consumed: false,
           };
+          // Pi reaches the `input` event synchronously from `sendUserMessage`, and
+          // PiCC's own admission decides in that handler's synchronous prefix, so
+          // `consumed` is already final when the send returns. That depends on PiCC
+          // being the first extension registering an `input` handler: Pi awaits each
+          // handler in extension order, so an extension ahead of PiCC whose handler
+          // awaits would defer this decision past the send and make `consumed` read a
+          // stale `false` — abandoning a run that is in fact healthy.
           stopContinuationAdmission.run(capability, () => pi.sendUserMessage(continuation));
-        } else {
-          pi.sendUserMessage(continuation);
+          return { settled: false, continuationAdmitted: capability.consumed };
         }
-        return false;
+        // No capability could be minted — either no resumed run is carrying this
+        // continuation, or authority moved while the hook ran. In the first case
+        // nothing's settlement depends on the answer; in the second the answer is
+        // provably "refused", because the `input` handler has no capability to match
+        // and every non-idle disposition is a refusal. Reporting admission there
+        // would strand the resumed run.
+        const admitted = activeMainResume === undefined;
+        pi.sendUserMessage(continuation);
+        return { settled: false, continuationAdmitted: admitted };
       }
       stopHookIterations = 0;
-      return true;
+      return { settled: true };
     } catch {
-      return true;
+      return { settled: true };
     }
   };
 
@@ -2537,9 +2674,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         resume.generation === generation && resume.epoch === checkpointSessionEpoch &&
         resume.token.generation === generation) {
       // cancelAndJoin waits for this exact physical run's settlement. Release it
-      // before joining cancellation so agent_settled never waits on itself.
-      resume.resolveSettled();
-      activeMainResume = undefined;
+      // before joining cancellation so agent_settled never waits on itself. The
+      // universal stop below owns the terminal, so this conclusion claims nothing.
+      resume.conclude("superseded");
     }
     await mainCheckpointGate.settleLogicalRunStop();
     return true;
@@ -2553,29 +2690,65 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (resume?.generation === controller.snapshot().generation &&
         resume.epoch === checkpointSessionEpoch) {
       if (controller.snapshot().phase === "terminalizing") {
-        resume.resolveSettled();
+        // Terminalization joins this exact settlement, so it has to be published
+        // here or the two wait on each other.
+        resume.conclude("superseded");
         return;
       }
       if (controller.snapshot().phase === "cancelled") {
-        resume.resolveSettled();
-        activeMainResume = undefined;
+        resume.conclude("superseded");
         mainCheckpointGate.logicalRunSettled();
         return;
       }
       if (controller.snapshot().phase === "resuming") {
-        if (!await runStopHook(ctx)) return;
+        // From here until this invocation returns, it is the owner: every exit
+        // below either concludes the run or hands ownership off explicitly, with
+        // one exception — `settleStoppedMainRun()` below returns true without
+        // concluding when the stopped run does not match this resume. No reachable
+        // interleaving produces that: while a logical run is stopped
+        // `ordinaryInputDisposition` is `reject-stopped`, so no accepted input can
+        // rotate the run identity, and a controller or epoch replacement parks
+        // behind the very join this settlement releases. It is stated rather than
+        // guaranteed, because it rests on that reasoning and not on the structure.
+        resume.settlementOwned = true;
+        const stop = await runStopHook(ctx);
+        if (!stop.settled) {
+          // A Stop hook blocked and a continuation went out instead. This invocation
+          // is no longer deciding the ending, and Pi guarantees nothing about the
+          // continuation, so release ownership rather than record a settlement
+          // nobody owes.
+          resume.settlementOwned = false;
+          if (stop.continuationAdmitted && !resume.joinParked) return;
+          // Either PiCC refused its own continuation, so no turn can follow it, or a
+          // cancelAndJoin parked on this settlement while this invocation still held
+          // ownership and would now wait on a settlement the line above just
+          // disowned. Both mean the resumed work is over. The summary is already
+          // committed, so ending it here is a post-commit give-up — unless some other
+          // authority has already taken the terminal, which owns the ending instead.
+          const current = mainCheckpointGate.currentController();
+          const snapshot = current.snapshot();
+          const stillOurs = current === controller && activeMainResume === resume &&
+            resume.epoch === checkpointSessionEpoch && resume.generation === snapshot.generation &&
+            resume.token.generation === snapshot.generation && snapshot.phase === "resuming";
+          resume.conclude(stillOurs ? "abandoned" : "superseded");
+          return;
+        }
         if (await settleStoppedMainRun()) return;
         const current = mainCheckpointGate.currentController();
         const snapshot = current.snapshot();
         if (current === controller && activeMainResume === resume &&
             resume.epoch === checkpointSessionEpoch && snapshot.phase === "cancelled") {
-          resume.resolveSettled();
-          activeMainResume = undefined;
+          resume.conclude("superseded");
           return;
         }
         if (current !== controller || activeMainResume !== resume ||
             resume.generation !== snapshot.generation || resume.epoch !== checkpointSessionEpoch ||
-            resume.token.generation !== snapshot.generation || snapshot.phase !== "resuming") return;
+            resume.token.generation !== snapshot.generation || snapshot.phase !== "resuming") {
+          // Authority moved on while the Stop hook ran — most often to
+          // terminalization, which is itself joining this settlement.
+          resume.conclude("superseded");
+          return;
+        }
         const hasPrintAuthority = () => {
           const authorityController = mainCheckpointGate.currentController();
           const authoritySnapshot = authorityController.snapshot();
@@ -2596,9 +2769,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           // print-mode selector can still emit it once this outer settlement
           // barrier is released.
         }
-        controller.resumedSettled(resume.token);
-        resume.resolveSettled();
-        activeMainResume = undefined;
+        resume.conclude("completed");
         mainCheckpointGate.logicalRunSettled();
         if (ctx?.mode === "tui") ctx.ui?.setStatus?.("picc-checkpoint", undefined);
         return;
@@ -2616,7 +2787,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (await settleStoppedMainRun()) return;
     // A Stop-blocked continuation remains the same logical run. Only the
     // accepted final boundary revokes lifecycle callbacks captured by it.
-    if (trulySettled) mainCheckpointGate.logicalRunSettled();
+    if (trulySettled.settled) mainCheckpointGate.logicalRunSettled();
   });
 
   pi.on("session_before_compact", async (event: any) => {

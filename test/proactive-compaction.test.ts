@@ -1708,6 +1708,303 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(mainCheckpointGate.currentController().snapshot().phase).toBe("idle");
   });
 
+  /**
+   * Drives one proactive checkpoint through the registered handlers until the resumed
+   * run exists and is waiting for its physical turn. The returned promise is the
+   * settling `agent_settled` handler parked on the generation barrier — exactly where
+   * real Pi parks it, inside the `_runAgentPrompt` finally that owns the user's run.
+   */
+  const driveResumeToResuming = async (sessionId: string, ctx: any): Promise<{ outer: Promise<unknown> }> => {
+    await mainCheckpointGate.startSession(sessionId);
+    mainCheckpointGate.assistantMessageEnded({
+      role: "assistant",
+      content: [{ type: "toolCall", id: sessionId, name: "probe", arguments: {} }],
+    });
+    const wrapped: any = mainCheckpointGate.wrapTool({
+      name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+    });
+    const result = await wrapped.execute(sessionId, {}, undefined, undefined, ctx);
+    mainCheckpointGate.toolExecutionEnded({ toolCallId: sessionId, result, isError: false });
+    mainCheckpointGate.turnEnded(ctx);
+    const outer = pi.fire("agent_settled", {}, ctx);
+    await waitUntil({
+      description: `${sessionId} resumed generation`,
+      predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming",
+    });
+    return { outer };
+  };
+
+  /**
+   * A print-mode context whose `compact` completes the transaction directly. It never
+   * fires `session_compact`, so `observeCompactionCommit` never runs and the
+   * controller's `committedGeneration` stays unset — a cancellation reached from here
+   * therefore classifies as an ordinary cancellation, where production (having seen
+   * the commit) would terminalize as `restoration-paused`. The resume endings below
+   * do not depend on that: resume is structurally post-commit, so they carry their
+   * own post-commit category rather than inferring one from the controller.
+   */
+  const resumeCtx = (overrides: Record<string, unknown> = {}) => pi.printCtx({
+    model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+    getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+    hasPendingMessages: () => false,
+    sessionManager: { getBranch: () => [] },
+    compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+    abort: () => undefined,
+    ...overrides,
+  });
+
+  it("abandons a resumed run when PiCC's own admission refuses its Stop continuation", async () => {
+    const marker = path.join(dir, ".claude", "block-stop");
+    const originalSendUserMessage = pi.api.sendUserMessage as (...args: any[]) => void;
+    const admissions: Array<Promise<unknown>> = [];
+    const ctx = resumeCtx();
+    // Pi reaches the input event synchronously from sendUserMessage, so the fake
+    // delivers it the same way. A queued `followUp` is a shape PiCC's own capability
+    // check will not admit, and that refusal is the one way a continuation's death is
+    // observable at all.
+    pi.api.sendUserMessage = (content: any, options: any) => {
+      originalSendUserMessage(content, options);
+      if (typeof content !== "string" || !content.startsWith("[Stop hook]")) return;
+      admissions.push(pi.fire("input", {
+        text: content, source: "extension", images: undefined, streamingBehavior: "followUp",
+      }, ctx));
+    };
+    let outer: Promise<unknown> | undefined;
+    let nested: Promise<unknown> | undefined;
+    fs.writeFileSync(marker, "block");
+    try {
+      ({ outer } = await driveResumeToResuming("stop-continuation-refused", ctx));
+      const stranded = mainCheckpointGate.currentController();
+      const generation = stranded.snapshot().generation;
+      const printMarkersBefore = pi.messages
+        .filter((entry) => entry.message.customType === "picc-checkpoint-print-result").length;
+      const entriesBefore = pi.entries.length;
+
+      nested = pi.fire("agent_settled", {}, ctx);
+      await settlement(nested, { description: "the refused continuation's settlement handler" });
+      await expect(nested).resolves.toBeUndefined();
+      await settlement(outer, { description: "the checkpoint generation barrier" });
+      await expect(outer).resolves.toBeUndefined();
+
+      expect(await Promise.all(admissions)).toEqual([{ action: "handled" }]);
+      expect(stranded.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+      });
+      expect(stranded.recoveryToken(generation)).toBeUndefined();
+      expect(stranded.manualCompactionDisposition()).toBe("unavailable");
+      expect(pi.entries.slice(entriesBefore)
+        .filter((entry) => entry.data.category === "checkpoint-exhausted")
+        .map((entry) => entry.data))
+        .toEqual([expect.objectContaining({ action: "new-session", failureCategory: "restoration-paused" })]);
+      // Success is never claimed for work that was not delivered.
+      expect(pi.messages.filter((entry) => entry.message.customType === "picc-checkpoint-print-result"))
+        .toHaveLength(printMarkersBefore);
+      // A later provider request must not park on the abandoned run's barrier.
+      await expect(pi.fire("turn_start", {}, ctx)).resolves.toBeUndefined();
+
+      const replacement = mainCheckpointGate.startSession("after-refused-continuation");
+      await settlement(replacement, { description: "a replacement session after the abandoned resume" });
+      await expect(replacement).resolves.toBeUndefined();
+      expect(mainCheckpointGate.currentController().snapshot())
+        .toMatchObject({ phase: "idle", admission: "open" });
+    } finally {
+      pi.api.sendUserMessage = originalSendUserMessage;
+      fs.rmSync(marker, { force: true });
+      // Absorb rejections without joining: a product hang must still report through
+      // the settlement ceilings above rather than through this finally.
+      for (const pending of [nested, outer, ...admissions]) void pending?.catch(() => undefined);
+    }
+  });
+
+  it("ends a resumed run whose admitted Stop continuation never starts a turn", async () => {
+    const marker = path.join(dir, ".claude", "block-stop");
+    const originalSendUserMessage = pi.api.sendUserMessage as (...args: any[]) => void;
+    const admissions: Array<Promise<unknown>> = [];
+    const ctx = resumeCtx();
+    // PiCC admits the continuation, and then Pi never starts the turn — no model,
+    // expired credentials, or a pre-turn throw, all of which Pi swallows and none of
+    // which PiCC can see. Nothing further ever arrives for this run.
+    pi.api.sendUserMessage = (content: any, options: any) => {
+      originalSendUserMessage(content, options);
+      if (typeof content !== "string" || !content.startsWith("[Stop hook]")) return;
+      admissions.push(pi.fire("input", {
+        text: content, source: "extension", images: undefined, streamingBehavior: undefined,
+      }, ctx));
+    };
+    let outer: Promise<unknown> | undefined;
+    let nested: Promise<unknown> | undefined;
+    fs.writeFileSync(marker, "block");
+    try {
+      ({ outer } = await driveResumeToResuming("stop-continuation-dropped", ctx));
+      const stranded = mainCheckpointGate.currentController();
+      const generation = stranded.snapshot().generation;
+      const entriesBefore = pi.entries.length;
+
+      nested = pi.fire("agent_settled", {}, ctx);
+      await settlement(nested, { description: "the handed-off continuation's settlement handler" });
+      await expect(nested).resolves.toBeUndefined();
+      expect(await Promise.all(admissions)).toEqual([{ action: "continue" }]);
+      // The continuation was admitted, so nothing observable distinguishes this from
+      // a turn that is about to start. The run is still open at this point.
+      expect(stranded.snapshot().phase).toBe("resuming");
+
+      const switching = pi.fire("session_before_switch", {}, ctx);
+      await settlement(switching, { description: "the session switch behind the dropped continuation" });
+      await expect(switching).resolves.toBeUndefined();
+      await settlement(outer, { description: "the checkpoint generation barrier" });
+      await expect(outer).resolves.toBeUndefined();
+
+      expect(stranded.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+      });
+      expect(stranded.recoveryToken(generation)).toBeUndefined();
+      expect(stranded.manualCompactionDisposition()).toBe("unavailable");
+      expect(pi.entries.slice(entriesBefore)
+        .filter((entry) => entry.data.category === "checkpoint-exhausted")
+        .map((entry) => entry.data))
+        .toEqual([expect.objectContaining({ action: "new-session", failureCategory: "restoration-paused" })]);
+      await expect(pi.fire("turn_start", {}, ctx)).resolves.toBeUndefined();
+
+      // The switch rotated the checkpoint session epoch. Every settlement path in the
+      // agent_settled handler is keyed on that epoch, so a resume surviving the
+      // rotation could no longer be ended by the lifecycle event that normally ends
+      // it; the replacement below is what proves nothing was left holding the gate.
+      await pi.fire("session_start", { reason: "switch" }, ctx);
+      expect(mainCheckpointGate.currentController()).not.toBe(stranded);
+      expect(mainCheckpointGate.currentController().snapshot())
+        .toMatchObject({ phase: "idle", admission: "open" });
+      const replacement = mainCheckpointGate.startSession("after-dropped-continuation");
+      await settlement(replacement, { description: "a replacement session after the dropped continuation" });
+      await expect(replacement).resolves.toBeUndefined();
+    } finally {
+      pi.api.sendUserMessage = originalSendUserMessage;
+      fs.rmSync(marker, { force: true });
+      for (const pending of [nested, outer, ...admissions]) void pending?.catch(() => undefined);
+    }
+  });
+
+  it("settles a resumed run against the terminalization that is joining it", async () => {
+    const gate = path.join(dir, ".claude", "gate-stop");
+    const block = path.join(dir, ".claude", "block-stop");
+    const entered = path.join(dir, ".claude", "stop-entered");
+    const release = path.join(dir, ".claude", "release-stop");
+    const ctx = resumeCtx();
+    let outer: Promise<unknown> | undefined;
+    let nested: Promise<unknown> | undefined;
+    let terminal: Promise<unknown> | undefined;
+    // Blocking, not merely slow: a Stop hook that blocks is the ordinary Claude
+    // configuration, and it is what makes the handler take its continuation exit —
+    // the exit that has to hand its settlement over to the terminalization racing it.
+    fs.writeFileSync(gate, "gate");
+    fs.writeFileSync(block, "block");
+    try {
+      ({ outer } = await driveResumeToResuming("resume-phase-mismatch", ctx));
+      const stranded = mainCheckpointGate.currentController();
+      const generation = stranded.snapshot().generation;
+      const continuations = () => pi.userMessages
+        .filter((entry) => typeof entry.content === "string" && entry.content.startsWith("[Stop hook]")).length;
+      const continuationsBefore = continuations();
+
+      nested = pi.fire("agent_settled", {}, ctx);
+      await waitUntil({ description: "Stop hook gate entry", predicate: () => fs.existsSync(entered) });
+      // A post-commit failure terminalizes while that handler is still inside the
+      // Stop hook. Terminalization joins the resumed run's settlement, and the
+      // handler is about to find the phase past `resuming` — the mutual wait.
+      let terminalDone = false;
+      terminal = stranded.failAfterCommittedSummary(generation).then((rejected) => {
+        terminalDone = true;
+        return rejected;
+      });
+      await Promise.resolve();
+      expect(terminalDone).toBe(false);
+      expect(stranded.snapshot().phase).toBe("terminalizing");
+
+      fs.writeFileSync(release, "release");
+      await settlement(nested, { description: "the settlement handler that lost its phase" });
+      await expect(nested).resolves.toBeUndefined();
+      await settlement(terminal, { description: "the terminalization joining that handler" });
+      await expect(terminal).resolves.toEqual([]);
+      await settlement(outer, { description: "the checkpoint generation barrier" });
+      await expect(outer).resolves.toBeUndefined();
+
+      // The hook really blocked: a continuation went out, so the handler took the
+      // exit that owes the settlement rather than the plain "run finished" one.
+      expect(continuations()).toBe(continuationsBefore + 1);
+      expect(stranded.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+      });
+      expect(stranded.recoveryToken(generation)).toBeUndefined();
+      await expect(pi.fire("turn_start", {}, ctx)).resolves.toBeUndefined();
+      const replacement = mainCheckpointGate.startSession("after-phase-mismatch");
+      await settlement(replacement, { description: "a replacement session after the phase mismatch" });
+      await expect(replacement).resolves.toBeUndefined();
+    } finally {
+      // `release` has to exist before the join, or the gated hook child never exits.
+      // Only the gated handler is joined; joining the barrier promises would turn a
+      // described ceiling failure into an opaque runner timeout.
+      fs.writeFileSync(release, "release");
+      await nested?.catch(() => undefined);
+      for (const pending of [terminal, outer]) void pending?.catch(() => undefined);
+      for (const file of [gate, block, entered, release]) fs.rmSync(file, { force: true });
+    }
+  });
+
+  it("releases a provider request parked on the resumed barrier when the run ends", async () => {
+    const originalSendUserMessage = pi.api.sendUserMessage as (...args: any[]) => void;
+    let latched: Promise<unknown> | undefined;
+    let aborts = 0;
+    const ctx = resumeCtx({ abort: () => { aborts += 1; } });
+    // Replay runs before replayComplete opens the barrier, so this is the one window
+    // where a provider request genuinely parks in defensiveLatch. Ending the run from
+    // inside it is what a user pressing Esc mid-replay does.
+    pi.api.sendUserMessage = (content: any, options: any) => {
+      originalSendUserMessage(content, options);
+      if (latched || content !== "retained while resuming") return;
+      latched = pi.fire("turn_start", {}, ctx);
+      const controller = mainCheckpointGate.currentController();
+      void controller.cancel(controller.snapshot().generation, "user").catch(() => undefined);
+    };
+    let outer: Promise<unknown> | undefined;
+    let nested: Promise<unknown> | undefined;
+    try {
+      await mainCheckpointGate.startSession("resume-barrier-release");
+      mainCheckpointGate.assistantMessageEnded({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "barrier", name: "probe", arguments: {} }],
+      });
+      const wrapped: any = mainCheckpointGate.wrapTool({
+        name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+      });
+      const result = await wrapped.execute("barrier", {}, undefined, undefined, ctx);
+      mainCheckpointGate.toolExecutionEnded({ toolCallId: "barrier", result, isError: false });
+      mainCheckpointGate.turnEnded(ctx);
+      mainCheckpointGate.captureAcceptedInput(ctx, "retained while resuming", undefined, "followUp");
+      const stranded = mainCheckpointGate.currentController();
+      outer = pi.fire("agent_settled", {}, ctx);
+      await waitUntil({ description: "a provider request parked on the resumed barrier", predicate: () => latched !== undefined });
+
+      await settlement(latched!, { description: "the parked provider request" });
+      await expect(latched).resolves.toBeUndefined();
+      // The ending revoked the turn rather than admitting it.
+      expect(aborts).toBeGreaterThan(0);
+      expect(stranded.snapshot().phase).not.toBe("resuming");
+
+      nested = pi.fire("agent_settled", {}, ctx);
+      await settlement(nested, { description: "the cancelled run's settlement handler" });
+      await expect(nested).resolves.toBeUndefined();
+      await settlement(outer, { description: "the checkpoint generation barrier" });
+      await expect(outer).resolves.toBeUndefined();
+      expect(stranded.snapshot()).toMatchObject({ phase: "cancelled", admission: "closed" });
+
+      const replacement = mainCheckpointGate.startSession("after-barrier-release");
+      await settlement(replacement, { description: "a replacement session after the released barrier" });
+      await expect(replacement).resolves.toBeUndefined();
+    } finally {
+      pi.api.sendUserMessage = originalSendUserMessage;
+      for (const pending of [latched, nested, outer]) void pending?.catch(() => undefined);
+    }
+  });
+
   it("drops queued resumed print output when session replacement revokes its serialized-write authority", async () => {
     await mainCheckpointGate.startSession("queued-print-authority");
     const ctx = pi.printCtx({
