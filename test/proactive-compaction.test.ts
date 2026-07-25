@@ -481,6 +481,180 @@ describe("MidRunCompactionController", () => {
     },
   );
 
+  // The three cases below share one regression: a generation that reaches a terminal must
+  // publish every surface it handed out exactly once, and must never re-open the recovery
+  // capability a committed summary revoked. The controller is the cheapest layer that can
+  // drive the interleavings — each needs a settlement and a post-commit failure landing in
+  // the same turn, which the Pi-level owners cannot schedule.
+  it("settles both surfaces when a post-commit failure lands in the turn the resumed run settles", async () => {
+    const settled = deferred<void>();
+    const join = deferred<void>();
+    let joinCalls = 0;
+    const events: string[] = [];
+    const controller = createController({
+      sessionId: "race", threshold: 90, compact: async () => ({ ok: true }),
+      resume: () => ({
+        settled: settled.promise,
+        replay: async () => ({ delivered: true }),
+        cancelAndJoin: () => {
+          joinCalls += 1;
+          return join.promise;
+        },
+      }),
+      progress: (event) => events.push(`${event.category}:${event.failureCategory ?? "-"}`),
+    });
+    const { generation, handle } = arm(controller);
+    controller.completeToolBatch(handle);
+    const stable = controller.checkpoint(generation);
+    try {
+      await waitUntil({ description: "the resumed run", predicate: () => controller.snapshot().phase === "resuming" });
+      // Drain microtasks so the replay loop is parked on its settlement/queue race before
+      // the race is run against it; the loop uses no timer, so this is its quiescent point.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      // Order is load-bearing: `settled` must resolve *before* the terminalization so the
+      // parked race takes its settled arm and `finishGeneration` is actually entered. Arm
+      // the terminalization first and the loop never reaches the guard under test, leaving
+      // this case green while it covers nothing.
+      settled.resolve();
+      const terminal = controller.failAfterCommittedSummary(generation);
+      join.resolve();
+
+      await settlement(stable, { description: "the generation barrier of the raced generation" });
+      await expect(stable).resolves.toBeUndefined();
+      await settlement(terminal, { description: "the post-commit terminalization racing settlement" });
+      await expect(terminal).resolves.toEqual([]);
+      // The settlement must not be able to claim the generation completed: a committed
+      // summary was never restored, so admission stays closed and no token permits a
+      // second compaction of it.
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused", queuedInputs: 0,
+      });
+      expect(controller.recoveryToken(generation)).toBeUndefined();
+      expect(controller.manualCompactionDisposition()).toBe("unavailable");
+      expect(controller.ordinaryInputDisposition()).toBe("reject-restoration");
+      expect(events).toEqual(["checkpoint-armed:-", "checkpoint-complete:-", "checkpoint-exhausted:restoration-paused"]);
+      expect(joinCalls).toBe(1);
+    } finally {
+      settled.resolve();
+      join.resolve();
+    }
+  });
+
+  it.each([
+    ["recoverable", "recoverable-rejection", "hook-blocked"],
+    ["post-commit", "closed", "restoration-paused"],
+  ] as const)("refuses to re-enter a %s exhausted generation", async (ending, admission, failureCategory) => {
+    const replayGate = deferred<void>();
+    let replayEntered = false;
+    const events: string[] = [];
+    const controller = createController({
+      sessionId: "exhausted", threshold: 90,
+      compact: async () => ending === "recoverable" ? { ok: false, category: "hook-blocked" } : { ok: true },
+      resume: () => ({
+        settled: new Promise<void>(() => undefined),
+        replay: async () => {
+          replayEntered = true;
+          await replayGate.promise;
+          // Undelivered replay is terminal after the summary committed.
+          return { delivered: false };
+        },
+        cancelAndJoin: async () => undefined,
+      }),
+      progress: (event) => events.push(`${event.category}:${event.failureCategory ?? "-"}`),
+    });
+    const { generation, handle } = arm(controller);
+    controller.completeToolBatch(handle);
+    const queued = controller.shadowInput(generation, "retained", "steer")!;
+    const stable = controller.checkpoint(generation);
+    try {
+      if (ending === "post-commit") {
+        await waitUntil({ description: "replay to enter", predicate: () => replayEntered });
+        replayGate.resolve();
+      }
+      await settlement(stable, { description: `the ${ending} generation barrier` });
+      await expect(stable).resolves.toBeUndefined();
+      const token = controller.recoveryToken(generation);
+      expect(token === undefined).toBe(ending === "post-commit");
+
+      const cancellation = controller.cancel(generation, "user");
+      await settlement(cancellation, { description: `cancelling the ${ending} exhausted generation` });
+      // The terminal the generation already chose stands: re-entering would mint the
+      // `user` recovery token a committed summary revoked, and announce a second ending.
+      expect(controller.manualCompactionDisposition()).toBe(ending === "post-commit" ? "unavailable" : "allow");
+      expect(controller.snapshot()).toMatchObject({ phase: "exhausted", admission, failureCategory });
+      expect(controller.recoveryToken(generation)).toBe(token);
+      expect(events.filter((event) => event.startsWith("checkpoint-exhausted"))).toEqual([`checkpoint-exhausted:${failureCategory}`]);
+      // Filter rather than `not.toContain("checkpoint-cancelled:-")`: pinning the `-`
+      // placeholder would pass vacuously if the category ever started carrying a value.
+      expect(events.filter((event) => event.startsWith("checkpoint-cancelled"))).toEqual([]);
+      // Nothing was cancelled, so the retained input keeps the disposition its own
+      // ending chose rather than being drained by a caller that changed nothing.
+      await expect(cancellation).resolves.toEqual({ cancelled: false, rejected: [] });
+      expect(controller.queuedInputSnapshot()).toEqual(ending === "post-commit" ? [] : [queued]);
+    } finally {
+      replayGate.resolve();
+    }
+  });
+
+  it("records a commit once and terminalizes idempotently for concurrent post-commit callers", async () => {
+    const join = deferred<void>();
+    const replayGate = deferred<void>();
+    let replayEntered = false;
+    let joinCalls = 0;
+    const events: string[] = [];
+    const controller = createController({
+      sessionId: "committed", threshold: 90, compact: async () => ({ ok: true }),
+      resume: () => ({
+        settled: new Promise<void>(() => undefined),
+        replay: async () => {
+          replayEntered = true;
+          await replayGate.promise;
+          return { delivered: true };
+        },
+        cancelAndJoin: () => {
+          joinCalls += 1;
+          return join.promise;
+        },
+      }),
+      progress: (event) => events.push(`${event.category}:${event.failureCategory ?? "-"}`),
+    });
+    const { generation, handle } = arm(controller);
+    controller.completeToolBatch(handle);
+    const queued = controller.shadowInput(generation, "retained", "steer")!;
+    const stable = controller.checkpoint(generation);
+    try {
+      await waitUntil({ description: "replay to enter", predicate: () => replayEntered });
+      expect(controller.observeCompactionCommit(generation + 1)).toBe(false);
+      expect(controller.observeCompactionCommit(generation)).toBe(true);
+
+      const first = controller.failAfterCommittedSummary(generation);
+      const second = controller.failAfterCommittedSummary(generation);
+      // A commit cannot be recorded against a generation that is already unwinding it.
+      expect(controller.observeCompactionCommit(generation)).toBe(false);
+      expect(joinCalls).toBe(1);
+      join.resolve();
+
+      await settlement(stable, { description: "the committed generation barrier" });
+      await expect(stable).resolves.toBeUndefined();
+      await expect(first).resolves.toEqual([queued]);
+      await expect(second).resolves.toEqual([queued]);
+      const third = controller.failAfterCommittedSummary(generation);
+      await settlement(third, { description: "a post-commit failure after the terminal" });
+      await expect(third).resolves.toEqual([]);
+      expect(joinCalls).toBe(1);
+      expect(controller.recoveryToken(generation)).toBeUndefined();
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused", queuedInputs: 0,
+      });
+      expect(events.filter((event) => event.startsWith("checkpoint-exhausted")))
+        .toEqual(["checkpoint-exhausted:restoration-paused"]);
+    } finally {
+      replayGate.resolve();
+      join.resolve();
+    }
+  });
+
   it("cancellation while resume Promise starts waits for abort and join", async () => {
     const join = deferred<void>();
     let observedAbort = false;
@@ -584,15 +758,19 @@ describe("MidRunCompactionController", () => {
       cancellationSettled = true;
       return outcome;
     });
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    // Drain to quiescence rather than counting microtask turns: the claim is that
+    // nothing but the in-flight compaction can publish generation N+1, and a fixed
+    // number of turns would also pass for a publication that is merely a few turns
+    // late. Nothing here is timer-driven, so a macrotask boundary is that point.
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(cancellationSettled).toBe(false);
     expect(stabilitySettled).toBe(false);
 
     nextRun.resolve({ ok: true });
+    await settlement(cancellation, { description: "the cancellation of generation N+1" });
     await expect(cancellation).resolves.toEqual({ cancelled: true, rejected: [] });
-    await currentStable;
+    await settlement(currentStable, { description: "the generation N+1 barrier held across recovery" });
+    expect(stabilitySettled).toBe(true);
   });
 
   it("omitted or stale generation callbacks cannot act on the current checkpoint", async () => {
