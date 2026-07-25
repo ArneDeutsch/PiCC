@@ -1421,89 +1421,97 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         text: content, source: "extension", images: undefined, streamingBehavior: undefined,
       }, high));
     };
-    high = pi.printCtx({
-      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
-      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
-      compact: (options: any) => {
-        pi.compactCalls.push(options);
-        void (async () => {
-          const before = await pi.fire("session_before_compact", {
-            reason: "manual", customInstructions: undefined,
-          }, high);
-          if (before?.cancel) options.onError(new Error("cancelled"));
-          else {
-            await pi.fire("session_compact", {
-              reason: "manual", compactionEntry: { summary: "summary" },
+    try {
+      high = pi.printCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        compact: (options: any) => {
+          pi.compactCalls.push(options);
+          void (async () => {
+            const before = await pi.fire("session_before_compact", {
+              reason: "manual", customInstructions: undefined,
             }, high);
-            options.onComplete({ summary: "summary" });
-          }
-        })();
-      },
-    });
-    const trace = path.join(dir, ".claude", ".compact-trace");
-    const inputHookCount = path.join(dir, "input-hook-count");
-    fs.rmSync(trace, { force: true });
-    fs.rmSync(inputHookCount, { force: true });
-    mainCheckpointGate.assistantMessageEnded({
-      role: "assistant",
-      content: [{ type: "toolCall", id: "tool", name: "probe", arguments: {} }],
-    });
-    const wrapped = mainCheckpointGate.wrapTool({
-      name: "probe",
-      execute: async () => ({ content: [{ type: "text", text: "done" }] }),
-    }) as any;
-    const result = await wrapped.execute("tool", {}, undefined, undefined, high);
-    mainCheckpointGate.toolExecutionEnded({ toolCallId: "tool", result, isError: false });
-    expect(mainCheckpointGate.turnEnded(high)?.stop).toBe("terminate");
-    const controller = mainCheckpointGate.currentController();
-    const image = { type: "image", data: "aW1hZ2U=", mimeType: "image/png" };
-    mainCheckpointGate.captureAcceptedInput(high, "queued after checkpoint", undefined, "steer");
-    mainCheckpointGate.captureAcceptedInput(high, "duplicate", undefined, "followUp");
-    mainCheckpointGate.captureAcceptedInput(high, "duplicate", [image], "steer");
+            if (before?.cancel) options.onError(new Error("cancelled"));
+            else {
+              await pi.fire("session_compact", {
+                reason: "manual", compactionEntry: { summary: "summary" },
+              }, high);
+              options.onComplete({ summary: "summary" });
+            }
+          })();
+        },
+      });
+      const trace = path.join(dir, ".claude", ".compact-trace");
+      const inputHookCount = path.join(dir, "input-hook-count");
+      fs.rmSync(trace, { force: true });
+      fs.rmSync(inputHookCount, { force: true });
+      mainCheckpointGate.assistantMessageEnded({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "tool", name: "probe", arguments: {} }],
+      });
+      const wrapped = mainCheckpointGate.wrapTool({
+        name: "probe",
+        execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+      }) as any;
+      const result = await wrapped.execute("tool", {}, undefined, undefined, high);
+      mainCheckpointGate.toolExecutionEnded({ toolCallId: "tool", result, isError: false });
+      expect(mainCheckpointGate.turnEnded(high)?.stop).toBe("terminate");
+      const controller = mainCheckpointGate.currentController();
+      const image = { type: "image", data: "aW1hZ2U=", mimeType: "image/png" };
+      mainCheckpointGate.captureAcceptedInput(high, "queued after checkpoint", undefined, "steer");
+      mainCheckpointGate.captureAcceptedInput(high, "duplicate", undefined, "followUp");
+      mainCheckpointGate.captureAcceptedInput(high, "duplicate", [image], "steer");
 
-    let outerDone = false;
-    const outer = pi.fire("agent_settled", {}, high).then(() => { outerDone = true; });
-    await waitUntil({
-      description: "hidden checkpoint continuation",
-      predicate: () => pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation"),
-    });
-    expect(outerDone).toBe(false);
-    const hidden = pi.messages.find((entry) => entry.message.customType === "picc-checkpoint-continuation")!;
-    expect(hidden.message).toMatchObject({ content: "Continue the paused work.", display: false });
-    expect(hidden.options).toEqual({ triggerTurn: true });
-    expect(order.indexOf("picc-checkpoint-continuation")).toBeLessThan(order.indexOf("user-replay"));
-    expect(pi.userMessages.slice(-3)).toEqual([
-      { content: "queued after checkpoint", options: { deliverAs: "steer" } },
-      { content: "duplicate", options: { deliverAs: "followUp" } },
-      { content: [{ type: "text", text: "duplicate" }, image], options: { deliverAs: "steer" } },
-    ]);
-
-    const stopMarker = path.join(dir, ".claude", "block-stop");
-    fs.writeFileSync(stopMarker, "block");
-    const predictableContinuation = "[Stop hook] Continue working: continue test work";
-    await expect(pi.fire("input", {
-      text: predictableContinuation, source: "extension", images: undefined, streamingBehavior: undefined,
-    }, high)).resolves.toEqual({ action: "handled" });
-    for (let iteration = 1; iteration <= 8; iteration += 1) {
-      await pi.fire("agent_settled", {}, high);
+      let outerDone = false;
+      const outer = pi.fire("agent_settled", {}, high).then(() => { outerDone = true; });
+      await waitUntil({
+        description: "hidden checkpoint continuation",
+        predicate: () => pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation"),
+      });
       expect(outerDone).toBe(false);
-      expect(String(pi.userMessages.at(-1)?.content)).toContain("[Stop hook] Continue working");
+      const hidden = pi.messages.find((entry) => entry.message.customType === "picc-checkpoint-continuation")!;
+      expect(hidden.message).toMatchObject({ content: "Continue the paused work.", display: false });
+      expect(hidden.options).toEqual({ triggerTurn: true });
+      expect(order.indexOf("picc-checkpoint-continuation")).toBeLessThan(order.indexOf("user-replay"));
+      expect(pi.userMessages.slice(-3)).toEqual([
+        { content: "queued after checkpoint", options: { deliverAs: "steer" } },
+        { content: "duplicate", options: { deliverAs: "followUp" } },
+        { content: [{ type: "text", text: "duplicate" }, image], options: { deliverAs: "steer" } },
+      ]);
+
+      const stopMarker = path.join(dir, ".claude", "block-stop");
+      // Same guard as the other hook markers: a surviving `block-stop` makes later
+      // Stop hooks in this file block with a continuation instead of settling.
+      fs.writeFileSync(stopMarker, "block");
+      try {
+        const predictableContinuation = "[Stop hook] Continue working: continue test work";
+        await expect(pi.fire("input", {
+          text: predictableContinuation, source: "extension", images: undefined, streamingBehavior: undefined,
+        }, high)).resolves.toEqual({ action: "handled" });
+        for (let iteration = 1; iteration <= 8; iteration += 1) {
+          await pi.fire("agent_settled", {}, high);
+          expect(outerDone).toBe(false);
+          expect(String(pi.userMessages.at(-1)?.content)).toContain("[Stop hook] Continue working");
+        }
+        // The ninth logical stop attempt exhausts the eight-continuation bound.
+        await pi.fire("agent_settled", {}, high);
+      } finally {
+        fs.rmSync(stopMarker, { force: true });
+      }
+      await outer;
+      await mainCheckpointGate.startSession("stop-admission-stale-epoch");
+      staleStopInput.resolve();
+      const admission = await Promise.all(stopAdmissionResults);
+      expect(admission.filter((result) => (result as any)?.action === "continue")).toHaveLength(8);
+      expect(admission.filter((result) => (result as any)?.action === "handled")).toHaveLength(11);
+      expect(outerDone).toBe(true);
+      expect(fs.existsSync(inputHookCount)).toBe(false);
+      expect(controller.snapshot().phase).toBe("idle");
+      expect(fs.readFileSync(trace, "utf8").trim().split(/\r?\n/)).toEqual(["pre", "start", "post"]);
+    } finally {
+      pi.api.sendMessage = originalSendMessage;
+      pi.api.sendUserMessage = originalSendUserMessage;
     }
-    // The ninth logical stop attempt exhausts the eight-continuation bound.
-    await pi.fire("agent_settled", {}, high);
-    fs.rmSync(stopMarker, { force: true });
-    await outer;
-    await mainCheckpointGate.startSession("stop-admission-stale-epoch");
-    staleStopInput.resolve();
-    const admission = await Promise.all(stopAdmissionResults);
-    expect(admission.filter((result) => (result as any)?.action === "continue")).toHaveLength(8);
-    expect(admission.filter((result) => (result as any)?.action === "handled")).toHaveLength(11);
-    expect(outerDone).toBe(true);
-    expect(fs.existsSync(inputHookCount)).toBe(false);
-    expect(controller.snapshot().phase).toBe("idle");
-    expect(fs.readFileSync(trace, "utf8").trim().split(/\r?\n/)).toEqual(["pre", "start", "post"]);
-    pi.api.sendMessage = originalSendMessage;
-    pi.api.sendUserMessage = originalSendUserMessage;
   });
 
   it("bridges a successful resumed print result exactly once and hides every unsafe settlement", async () => {
@@ -1622,6 +1630,10 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await waitUntil({ description: "cancel test resume", predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming" });
     const staleWrites: string[] = [];
     const originalWrite = fs.write.bind(fs);
+    const gate = path.join(dir, ".claude", "gate-stop");
+    const entered = path.join(dir, ".claude", "stop-entered");
+    const release = path.join(dir, ".claude", "release-stop");
+    let nested: Promise<unknown> | undefined;
     const writeSpy = vi.spyOn(fs, "write").mockImplementation(((fd: any, data: any, offset: any, length: any, position: any, callback: any) => {
       if (fd === process.stdout.fd && Buffer.isBuffer(data)) {
         staleWrites.push(data.subarray(offset, offset + length).toString("utf8"));
@@ -1631,21 +1643,27 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       return originalWrite(fd, data, offset, length, position, callback);
     }) as typeof fs.write);
 
-    const gate = path.join(dir, ".claude", "gate-stop");
-    const entered = path.join(dir, ".claude", "stop-entered");
-    const release = path.join(dir, ".claude", "release-stop");
-    fs.writeFileSync(gate, "gate");
-    const nested = pi.fire("agent_settled", {}, { ...ctx });
-    await waitUntil({ description: "Stop hook gate entry", predicate: () => fs.existsSync(entered) });
-    const replacement = mainCheckpointGate.startSession("replacement-during-stop");
-    fs.writeFileSync(release, "release");
-    await nested;
-    await replacement;
-    await outer;
-    writeSpy.mockRestore();
-    fs.rmSync(gate, { force: true });
-    fs.rmSync(entered, { force: true });
-    fs.rmSync(release, { force: true });
+    try {
+      fs.writeFileSync(gate, "gate");
+      nested = pi.fire("agent_settled", {}, { ...ctx });
+      await waitUntil({ description: "Stop hook gate entry", predicate: () => fs.existsSync(entered) });
+      const replacement = mainCheckpointGate.startSession("replacement-during-stop");
+      fs.writeFileSync(release, "release");
+      await nested;
+      await replacement;
+      await outer;
+    } finally {
+      // None of this may depend on the awaits above succeeding. The spy is global, and a
+      // surviving `gate-stop` parks every later Stop hook in the hook script's polling
+      // loop for the full hook timeout — that live `sh` child is also what makes the
+      // afterAll rmSync of the fixture directory fail on Windows. The one ordering
+      // constraint the statements below do not show: `release` must be written before the
+      // join, or the gated hook never exits and `await nested` never completes.
+      writeSpy.mockRestore();
+      fs.writeFileSync(release, "release");
+      await nested?.catch(() => undefined);
+      for (const file of [gate, entered, release]) fs.rmSync(file, { force: true });
+    }
 
     expect(staleWrites).toEqual([]);
     expect(pi.messages.filter((entry) => entry.message.customType === "picc-checkpoint-print-result")).toHaveLength(markerCountBefore);
@@ -1655,29 +1673,32 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
   it("unwinds a resumed Stop universal stop before joining its exact resume settlement", async () => {
     await mainCheckpointGate.startSession("resumed-stop-deadlock");
     const marker = path.join(dir, ".claude", "universal-stop");
+    // The marker arms every Stop hook in the fixture, so the guard has to start here:
+    // anything between writing it and the awaits below can throw, and a surviving
+    // marker universally stops the Stop lifecycle for the rest of the worker.
     fs.writeFileSync(marker, "stop");
-    const ctx = pi.printCtx({
-      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
-      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
-      hasPendingMessages: () => false,
-      sessionManager: { getBranch: () => [] },
-      compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
-    });
-    mainCheckpointGate.assistantMessageEnded({
-      role: "assistant", content: [{ type: "toolCall", id: "stop-tool", name: "probe", arguments: {} }],
-    });
-    const wrapped: any = mainCheckpointGate.wrapTool({
-      name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
-    });
-    const toolResult = await wrapped.execute("stop-tool", {}, undefined, undefined, ctx);
-    mainCheckpointGate.toolExecutionEnded({ toolCallId: "stop-tool", result: toolResult, isError: false });
-    mainCheckpointGate.turnEnded(ctx);
-    const outer = pi.fire("agent_settled", {}, ctx);
-    await waitUntil({
-      description: "resumed Stop deadlock setup",
-      predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming",
-    });
     try {
+      const ctx = pi.printCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [] },
+        compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+      });
+      mainCheckpointGate.assistantMessageEnded({
+        role: "assistant", content: [{ type: "toolCall", id: "stop-tool", name: "probe", arguments: {} }],
+      });
+      const wrapped: any = mainCheckpointGate.wrapTool({
+        name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+      });
+      const toolResult = await wrapped.execute("stop-tool", {}, undefined, undefined, ctx);
+      mainCheckpointGate.toolExecutionEnded({ toolCallId: "stop-tool", result: toolResult, isError: false });
+      mainCheckpointGate.turnEnded(ctx);
+      const outer = pi.fire("agent_settled", {}, ctx);
+      await waitUntil({
+        description: "resumed Stop deadlock setup",
+        predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming",
+      });
       await pi.fire("agent_settled", {}, ctx);
       await outer;
     } finally {
@@ -1919,8 +1940,13 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     const failedWrite = vi.spyOn(fs, "write").mockImplementation(((_fd: any, _data: any, _offset: any, _length: any, _position: any, callback: any) => {
       queueMicrotask(() => callback(permanent, 0));
     }) as typeof fs.write);
-    await expect(pi.fire("agent_settled", {}, { ...ctx })).resolves.toBeUndefined();
-    failedWrite.mockRestore();
+    try {
+      await expect(pi.fire("agent_settled", {}, { ...ctx })).resolves.toBeUndefined();
+    } finally {
+      // The spy ignores the fd and fails every `fs.write` in the worker; an unmet
+      // expectation here must not hand that to every later test.
+      failedWrite.mockRestore();
+    }
     await outer;
     expect(markerCount()).toBe(before);
     expect((ctx.sessionManager as any).getBranch().at(-1)).toBe(assistantEntry);
@@ -2330,12 +2356,16 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     const entered = path.join(dir, ".claude", "precompact-entered");
     const release = path.join(dir, ".claude", "release-precompact");
     const compactTrace = path.join(dir, ".claude", ".compact-trace");
+    // `gate-precompact` is the polled kind: a survivor parks every later PreCompact hook in an `sh`
+    // poll loop for the full hook timeout, so the guard has to start at the write, not after it.
+    // `rmSync` below is force-d against ENOENT only — EPERM/EBUSY on Windows still throws here.
     fs.writeFileSync(gate, "gate");
-    fs.rmSync(compactTrace, { force: true });
-    const sentBefore = pi.messages.length;
-    const ctx = pi.tuiCtx();
-    const before = pi.fire("session_before_compact", { reason: "manual" }, ctx);
+    let before: Promise<unknown> | undefined;
     try {
+      fs.rmSync(compactTrace, { force: true });
+      const sentBefore = pi.messages.length;
+      const ctx = pi.tuiCtx();
+      before = pi.fire("session_before_compact", { reason: "manual" }, ctx);
       await waitUntil({
         description: "PreCompact hook to enter",
         predicate: () => fs.existsSync(entered),
@@ -2356,7 +2386,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       expect(pi.messages).toHaveLength(sentBefore);
     } finally {
       fs.writeFileSync(release, "release");
-      await before.catch(() => undefined);
+      await before?.catch(() => undefined);
       for (const file of [gate, entered, release, compactTrace]) fs.rmSync(file, { force: true });
     }
   });
