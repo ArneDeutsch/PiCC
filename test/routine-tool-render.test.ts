@@ -1229,7 +1229,11 @@ describe("routine tool rendering decorator", () => {
     const lines = renderResult(tool, args, ordinary, { width: 80 });
     expect(lines.join("\n")).toContain("old");
     expect(lines.join("\n")).toContain("new");
-    expect(lines.join("\n").match(/-1 old/g)).toHaveLength(1);
+    // Pi's Edit renderer highlights the changed word inline, so `-1 old` is split
+    // by an inverse-video CSI. Match the visible text, not the escaped bytes.
+    const csi = new RegExp(String.fromCharCode(27) + "\\[[0-?]*[ -/]*[@-~]", "gu");
+    const visible = lines.join("\n").replace(csi, "");
+    expect(visible.match(/-1 old/g)).toHaveLength(1);
 
     const creationArgs = { file_path: "new.ts", edits: [{ old_string: "", new_string: "hello" }] };
     const creation = {
