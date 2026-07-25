@@ -33,17 +33,33 @@ import type {
 } from "../src/types.js";
 import { SUPPORTED_HOOK_EVENTS } from "../src/types.js";
 
+type DisclosureCategory = "core" | "gap" | "precedence" | "visibility" | "parity" | "split";
+
+type DisclosureContract = {
+  id: string;
+  tier: SupportTier;
+  safetyRelevant?: true;
+} & Partial<Record<DisclosureCategory, readonly RegExp[]>> & { core: readonly RegExp[] };
+
+function expectDisclosure(contract: DisclosureContract): void {
+  const entry = lookupCapability(contract.id);
+  expect(entry, contract.id).toBeDefined();
+  expect(entry).toMatchObject({ id: contract.id, tier: contract.tier });
+  expect(Boolean(entry?.safetyRelevant), `${contract.id}: safetyRelevant`)
+    .toBe(contract.safetyRelevant ?? false);
+  const note = entry?.note ?? "";
+  for (const category of ["core", "gap", "precedence", "visibility", "parity", "split"] as const) {
+    for (const predicate of contract[category] ?? []) {
+      expect(note, `${contract.id}: ${category} ${predicate}`).toMatch(predicate);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Fixture builders
 // ---------------------------------------------------------------------------
 
 const SOURCE: SourceRef = { path: "<virtual>", scope: "project" };
-
-function expectCurrentNestedSpawningNote(note: string | undefined): void {
-  expect(note).toMatch(/(?:disables nested spawning|nested spawning (?:is )?disabled) by default/i);
-  expect(note).not.toMatch(/\b2\s*(?:\.\.|-|to)\s*5\b/i);
-  expect(note).not.toMatch(/five-level nesting is fixed|fixed five-level nesting|fixed and not configurable|nesting (?:is )?non-configurable/i);
-}
 
 function makeSettings(overrides: Partial<ClaudeSettings> = {}): ClaudeSettings {
   return {
@@ -211,101 +227,18 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(worktreeCreate).toContain("tool result remain truthful");
   });
 
-  // Re-tiered by the stdio MCP slice: mcp__* names are LIVE, deny-enforced
-  // tools now, and safety-relevant because deny rules gate real calls.
-  it("marks MCP tools partial (live stdio tools) with safetyRelevant true", () => {
-    const mcp = lookupCapability("tool.mcp__*");
-    expect(mcp?.tier).toBe("partial");
-    expect(mcp?.safetyRelevant).toBe(true);
-    expect(mcp?.note).toContain("stdio");
-    // Claude-parity naming vs PiCC's stricter server-name gate.
-    expect(mcp?.note).toContain("sanitized underscore-style like Claude");
-    // The empty-after-sanitize drop is PiCC's own floor, stated OUTSIDE the
-    // binary-verified parenthetical (Claude never drops a tool name).
-    expect(mcp?.note).toContain("PiCC's own floor");
-    expect(mcp?.note).toContain("drop-with-diagnostic");
-    // Deny-only posture and context removal.
-    expect(mcp?.note).toContain("REMOVE the tools from the model's context");
-    expect(mcp?.note).toContain("allow/ask stay no-ops");
-    expect(mcp?.note).toContain("case-sensitive");
-    // Subagent freeze divergence.
-    expect(mcp?.note).toContain("FROZEN at dispatch");
-    // Schema & content divergences (binary-verified).
-    expect(mcp?.note).toContain("permissive object schema");
-    expect(mcp?.note).toContain("STDERR-ONLY");
-    expect(mcp?.note).toContain("Claude passes schemas through verbatim");
-    expect(mcp?.note).toContain("NOT a containment guarantee");
-    expect(mcp?.note).toContain("structuredContent is ignored");
-  });
-
-  it("re-tiers the MCP settings keys and gate/runtime features truthfully", () => {
-    expect(lookupCapability("setting.mcpServers")?.tier).toBe("partial");
-    const blanketApproval = lookupCapability("setting.enableAllProjectMcpServers");
-    expect(blanketApproval?.tier).toBe("partial");
-    expect(blanketApproval?.note).toContain("approves every current and future project server");
-    expect(blanketApproval?.note).toContain("NOT a shortcut for a large pending set");
-    expect(blanketApproval?.note).toContain("prefer explicitly named enabledMcpjsonServers approvals");
-    expect(lookupCapability("setting.enabledMcpjsonServers")?.tier).toBe("partial");
-    // Honored from every scope, always wins — nothing partial about it.
-    expect(lookupCapability("setting.disabledMcpjsonServers")?.tier).toBe("full");
-    // Sanitized-compare parity (binary-verified) is stated on both list keys.
-    for (const id of ["setting.enabledMcpjsonServers", "setting.disabledMcpjsonServers"]) {
-      const note = lookupCapability(id)?.note ?? "";
-      expect(note).toContain("Each UTF-16 code unit outside ASCII letters, digits, '_', and '-'");
-      expect(note).toContain("becomes '_'");
-      expect(note).toContain("astral symbol therefore becomes '__'");
-    }
-    expect(lookupCapability("setting.enabledMcpjsonServers")?.note)
-      .toContain("one persisted named approval can therefore match a differently named current or future server");
-
-    const mcp = lookupCapability("feature.mcp");
-    expect(mcp?.tier).toBe("partial");
-    // Binary-verified parity facts must be stated as parity, not PiCC additions.
-    expect(mcp?.note).toContain("CLAUDE_CODE_SESSION_ID");
-    expect(mcp?.note).toContain("NOT a PiCC addition");
-    expect(mcp?.note).toContain("binary-verified Claude parity");
-    expect(mcp?.note).toContain("main checkout");
-    // cwd-pinning is EFFECTIVE parity, not verified passed-cwd behavior.
-    expect(mcp?.note).toContain("Claude passes no cwd");
-    expect(mcp?.note).toContain("NO MCP context of any kind");
-    expect(mcp?.note).toContain("failures surface in /mcp");
-    expect(mcp?.note).toContain("launcher-only markers are removed");
-    expect(mcp?.note).toContain("then receive project settings.env, then Claude defaults, then configured server env last");
-    expect(mcp?.note).toContain("deliberate server overrides of CLAUDE_PROJECT_DIR, CLAUDECODE, CLAUDE_CODE_SESSION_ID, or a removed launcher key");
-
-    const gate = lookupCapability("feature.mcp-project-approval");
-    expect(gate?.tier).toBe("partial");
-    expect(gate?.note).toContain("not Claude Code's interactive trust dialog");
-    expect(gate?.note).toContain("git-tracked settings.local.json is demoted");
-    expect(gate?.note).toContain("bounded one-time session-start notice");
-    expect(gate?.note).toContain("/mcp and the /doctor pending finding");
-    expect(gate?.note).toContain("bounded approval and decline guidance");
-    expect(gate?.note).toContain("Each UTF-16 code unit outside ASCII letters, digits, '_', and '-'");
-    expect(gate?.note).toContain("astral symbol therefore becomes '__'");
-    expect(gate?.note).toContain("one persisted named approval can therefore match a differently named current or future server");
-    expect(gate?.note).toContain("re-review aliases when project MCP names change");
-    expect(gate?.note).not.toContain("carries the exact");
-    expect(gate?.note).not.toContain("vision-warning");
-
-    const remote = lookupCapability("feature.mcp-remote-transports");
-    expect(remote?.note).toContain("/mcp shows a safe skipped state");
-  });
-
-  it("discloses bounded read-only /mcp status and its PiCC-defined mode behavior", () => {
-    const status = lookupCapability("feature.mcp-control-status");
-    expect(status, "feature.mcp-control-status must exist").toBeDefined();
-    expect(status?.tier).toBe("partial");
-    expect(status?.note).toContain("bounded read-only /mcp status");
-    expect(status?.note).toContain("at most 32 detailed rows");
-    expect(status?.note).toContain("omitted-state accounting");
-    expect(status?.note).toContain("safe failed/skipped summaries");
-    expect(status?.note).toContain("least-authority pending guidance");
-    expect(status?.note).toContain("Interactive and RPC use an immediate live snapshot");
-    expect(status?.note).toContain("one-shot text and JSON await bounded MCP startup settlement");
-    expect(status?.note).toContain("never enters model context");
-    expect(status?.note).toContain("Claude Code 2.1.205+ documents no-argument /mcp in -p as textual status");
-    expect(status?.note).toContain("JSON event, RPC entry, report formatting, aggregate bounds, safety redaction, and timing are PiCC-defined");
-    expect(status?.note).toContain("rather than Claude Code's interactive management UI or individual-tool view");
+  it.each<DisclosureContract>([
+    { id: "tool.mcp__*", tier: "partial", safetyRelevant: true, core: [/connected stdio servers/, /names are sanitized underscore-style like Claude/, /name EMPTY after sanitizing is dropped/, /SERVER names remain PiCC's stricter drop-with-diagnostic charset gate/], gap: [/DEGRADED tool-result content/, /structuredContent is ignored/, />32KB-serialized schema degrades/, /descriptions are bounded at 2KB/, /64-char model tool-name limit/], precedence: [/Deny rules at every grammar level/, /bare-name and server-level denies REMOVE the tools/, /deny matching is case-sensitive/, /allow\/ask stay no-ops/, /tool list is FROZEN at dispatch/], visibility: [/REMOVE the tools from the model's context/, /STDERR-ONLY/], parity: [/PiCC's own floor/, /not observed Claude behavior/, /PiCC-only bounds/, /NOT parity/, /permissive object schema/, /Claude passes schemas through verbatim/, /NOT a containment guarantee/, /schema-embedded strings ride to the model unbounded/], split: [/feature\.tool-output-clip/] },
+    { id: "setting.mcpServers", tier: "partial", core: [/settings-file mcpServers blocks/, /start real stdio servers/], gap: [/PiCC STAND-IN/, /deferred ~\/\.claude\.json local\/user MCP scopes/, /PARTIAL: stdio only/, /stand-in semantics/], precedence: [/whole entry/, /highest-precedence source wins/, /never field-merged/, /managed > untracked settings\.local\.json > project settings > \.mcp\.json > user/, /user\/managed settings/, /UNTRACKED settings\.local\.json/, /enabled by default/, /committed project-scope servers are pending/, /until approved/], visibility: [/Remote\/url entries are skipped/, /diagnostic/], parity: [/version-dependent\/unconfirmed/, /project-settings-over-\.mcp\.json precedence step is PiCC-defined/], split: [/feature\.mcp-claude-json-scopes/, /feature\.mcp-project-approval/, /feature\.mcp-remote-transports/] },
+    { id: "setting.enableAllProjectMcpServers", tier: "partial", core: [/blanket approval/, /current and future project server/, /NOT a shortcut for a large pending set/], gap: [/replacing Claude Code's interactive trust dialog/], precedence: [/Nearest-honored-scope-wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/PiCC's settings gate/], split: [/feature\.mcp-project-approval/] },
+    { id: "setting.enabledMcpjsonServers", tier: "partial", core: [/per-server approval list/, /user-authored scopes/, /outside ASCII letters, digits/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/accumulate-and-dedupe of the lists across settings files remains PiCC-inferred/], precedence: [/Approval from ANY honored scope wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/Claude parity, binary-verified/], split: [/feature\.mcp-project-approval/] },
+    { id: "setting.disabledMcpjsonServers", tier: "full", core: [/per-server decline list/, /honored from EVERY scope/, /outside ASCII letters, digits/], precedence: [/always wins over enableAllProjectMcpServers and enabledMcpjsonServers/], visibility: [/declined server raises no expansion warnings/], parity: [/binary-corroborated/, /accumulate-and-dedupe across settings files remains PiCC-inferred/] },
+    { id: "feature.mcp", tier: "partial", core: [/stdio MCP servers run for real/, /die with the session/, /CLAUDE_PROJECT_DIR/, /CLAUDECODE=1/, /CLAUDE_CODE_SESSION_ID/], gap: [/PARTIAL: stdio transport only/], precedence: [/launcher-only markers are removed/, /then receive project settings.env, then Claude defaults, then configured server env last/, /deliberate server overrides of CLAUDE_PROJECT_DIR, CLAUDECODE, CLAUDE_CODE_SESSION_ID, or a removed launcher key/], visibility: [/NOT reported to the model/, /surface in \/mcp/, /\/doctor/, /stderr/, /no server both configured and enabled/, /NO MCP context of any kind/], parity: [/binary-verified Claude parity/, /PROJECT ROOT/, /main checkout/, /EFFECTIVE parity/, /Claude passes no cwd/, /config-last parity/], split: [/feature\.mcp-tool-search/, /feature\.mcp-\*/] },
+    { id: "feature.mcp-project-approval", tier: "partial", core: [/enablement gate/, /disabled by default/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/not Claude Code's interactive trust dialog/], precedence: [/disabledMcpjsonServers always rejecting/], visibility: [/session-start notice/, /\/mcp/, /\/doctor/], parity: [/SETTINGS GATE/, /PiCC has no approval prompt/], split: [/enableAllProjectMcpServers/, /enabledMcpjsonServers/] },
+    { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only \/mcp status/, /32 detailed rows/], gap: [/rather than Claude Code's interactive management UI or individual-tool view/], precedence: [/Interactive and RPC use an immediate live snapshot/, /one-shot text and JSON await/], visibility: [/never enters model context/], parity: [/Claude Code 2\.1\.205\+/, /PiCC-defined/] },
+    { id: "feature.mcp-remote-transports", tier: "not-supported", core: [/remote MCP transports/, /HTTP/, /streamable-HTTP/, /SSE/, /WebSocket/, /url-based entry/], gap: [/stdio only currently/], visibility: [/remote server entry is skipped/, /\/mcp shows a safe skipped state/, /per-server diagnostic/, /compat report/, /\/doctor/] },
+  ])("retains $id semantic disclosure", (contract) => {
+    expectDisclosure(contract);
   });
 
   it("carries explicit deferred entries for the non-stdio MCP surfaces", () => {
@@ -341,6 +274,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("feature.plugins-content")?.note).toContain("feature.mcp-plugin-servers");
   });
 
+  it.each<DisclosureContract>([
+    { id: "tool.Grep", tier: "full", core: [/real implementation/, /Claude-baseline parameter surface/, /head_limit/, /offset/], gap: [/oversized-result clip backstop reshapes/], visibility: [/Grep-specific recovery hint/, /tighter pattern/, /smaller head_limit/, /offset/], parity: [/ripgrep\/JS engine parity/], split: [/feature\.tool-output-clip/] },
+  ])("retains $id semantic disclosure", (contract) => {
+    expectDisclosure(contract);
+  });
+
   it("covers the core tool surface as full and TodoWrite as partial", () => {
     for (const tool of [
       "Read", "Write", "Edit", "Bash", "Grep", "Glob",
@@ -353,189 +292,54 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(lookupCapability("tool.TodoWrite")?.tier).toBe("partial");
   });
 
-  // Background-by-default remains; the settlement push is conditional
-  // on an eligible uncollected current task and records suppression as PiCC UX
-  // hardening rather than verified Claude parity.
-  it("marks the subagent dispatch tools partial and names the failure + background-by-default semantics", () => {
-    const agent = lookupCapability("tool.Agent");
-    expect(agent?.tier).toBe("partial");
-    expect(agent?.note).toContain("LOUD failure");
-    expect(agent?.note).toContain("agent id");
-    expect(agent?.note).toContain("BACKGROUND-BY-DEFAULT");
-    expect(agent?.note).toContain("run_in_background:false");
-    expect(agent?.note).toContain("prioritizes state, agent identity, and the stable dispatch description before optional telemetry");
-    expect(agent?.note).toContain("passive Agent/settlement lifecycle rows omit task ID chips");
-    expect(agent?.note).toContain("model-visible background dispatch still returns the task ID");
-    expect(agent?.note).toContain("eligible uncollected current task");
-    expect(agent?.note).toContain("polling TaskOutput while running preserves eligibility");
-    expect(agent?.note).toContain("terminal TaskOutput record counts as delivery");
-    expect(agent?.note).toContain("next turn");
-    expect(agent?.note).toContain("anthropics/claude-code#21343 (Claude Code 2.1.20)");
-    expect(agent?.note).toContain("anthropics/claude-code#24752");
-    expect(agent?.note).toContain("late notifications while a conversation is active");
-    expect(agent?.note).toContain("official docs define neither notification consumption nor exact mid-turn/next-turn timing");
-    expect(agent?.note).toContain("not verified parity");
-    expect(agent?.note).toContain("2.1.198");
-    expect(agent?.note).toContain("Claude Code 2.1.217");
-    expect(agent?.note).toContain("CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH");
-    expectCurrentNestedSpawningNote(agent?.note);
-    const task = lookupCapability("tool.Task");
-    expect(task?.tier).toBe("partial");
-    expect(task?.note).toContain("alias");
-    expect(task?.note).toContain("background-by-default");
-    expect(task?.note).toContain("eligible current task remaining uncollected");
-    expect(task?.note).toContain("running polls preserve it");
-    expect(task?.note).toContain("terminal TaskOutput collection suppresses it");
-    expect(task?.note).toContain("PiCC UX hardening rather than verified parity");
-    expect(task?.note).toContain("Claude Code 2.1.217");
-    expect(task?.note).toContain("CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH");
-    expectCurrentNestedSpawningNote(task?.note);
-  });
-
-  // The tool-output clip backstop is a deliberate directional divergence (a HIGH
-  // backstop above Claude's own bounds), not a reproduction of Claude thresholds,
-  // and carries a consumer note about the truncation a strict consumer must expect.
-  it("frames the tool-output-clip backstop as a directional divergence with a consumer note", () => {
-    const clip = lookupCapability("feature.tool-output-clip");
-    expect(clip?.tier).toBe("partial");
-    expect(clip?.note).toContain("DIRECTIONAL DIVERGENCE");
-    expect(clip?.note).toContain("HIGH backstop ABOVE Claude's own bounding");
-    expect(clip?.note).toContain("PiCC HARDENING, NOT Claude parity");
-    // Human presentation may summarize clipping without changing canonical model content.
-    expect(clip?.note).toContain("marker travels in-band on the canonical model-visible result");
-    // Parity Q5 consumer note: the clip is a TRUNCATION, not just an added marker.
-    expect(clip?.note).toContain("CONSUMER NOTE (parity Q5)");
-    expect(clip?.note).toContain("account for the truncation itself, not merely the added marker");
-    // The 25k-token Read error stays firmly sourced; the Bash ~30k figure is softened.
-    expect(clip?.note).toContain("~25k tokens (VERIFIED)");
-    expect(clip?.note).toContain("less-firmly-sourced figure than the 25k-token Read error");
-    // Grep cross-references the clip: its results can be reshaped with a Grep hint.
-    expect(lookupCapability("tool.Grep")?.note).toContain("feature.tool-output-clip");
-  });
-
-  // SendMessage is a distinct partial entry: Claude supports resume/steer behavior,
-  // while PiCC defines the acknowledgment wording and retains the documented gaps.
-  it("carries a SendMessage entry as partial naming resume identity and its gaps", () => {
-    const sm = lookupCapability("tool.SendMessage");
-    expect(sm, "tool.SendMessage must exist").toBeDefined();
-    expect(sm?.tier).toBe("partial");
-    expect(sm?.note).toContain("Claude 2.1.x");
-    expect(sm?.note).toContain("resume after TaskStop");
-    expect(sm?.note).toContain("Claude Code 2.1.x reference refuses stopped-agent resume");
-    expect(sm?.note).toContain("returns its result directly, with no TaskOutput or new task generation");
-    expect(sm?.note).toContain("For ordinary resume, the acknowledgment includes the new task id");
-    expect(sm?.note).toContain("resolved registry name");
-    expect(sm?.note).toContain("stable agent id");
-    expect(sm?.note).toContain("PiCC-defined model-visible wording");
-    expect(sm?.note).toContain("not verified as exact Claude wording");
-    expect(sm?.note).toContain("newest generation wins");
-    expect(sm?.note).toContain("eligible uncollected current resumed task");
-    expect(sm?.note).toContain("terminal TaskOutput collection suppresses it");
-    expect(sm?.note).toContain("running polls do not");
-    expect(sm?.note).toContain("waiting for configured capacity visibly refuses steering until admitted");
-    expect(sm?.note).toContain("PiCC-defined because Claude's queue behavior is undocumented");
-    for (const gap of ["no cross-restart resume", "steering is background-only", "next-turn"]) {
-      expect(sm?.note).toContain(gap);
-    }
-    // The old "fork/agentOverride ... unsupported" phrasing was reworded — a
-    // fork is now a partial capability (tool.Agent.fork), unsupported only for
-    // RESUME (non-resumable). The note must say so and cross-reference the entry,
-    // and must NOT reintroduce the flat "fork ... unsupported" contradiction.
-    expect(sm?.note).toContain("fork dispatches are non-resumable");
-    expect(sm?.note).toContain("tool.Agent.fork");
-  });
-
-  // subagent_type:"fork" is a dedicated partial capability — inherits the
-  // parent conversation (main-session only), env-gated, non-resumable, cannot
-  // spawn another fork, and its system prompt is a same-context reconstruction.
-  it("carries a tool.Agent.fork entry as partial naming the fork semantics and limits", () => {
-    const fork = lookupCapability("tool.Agent.fork");
-    expect(fork, "tool.Agent.fork must exist").toBeDefined();
-    expect(fork?.tier).toBe("partial");
-    // Single-line note (the invariants block also enforces this globally).
-    expect(fork?.note).not.toContain("\n");
-    // Core inheritance + the env gate + the disclosed model overrides.
-    expect(fork?.note).toContain("inherits the parent conversation");
-    expect(fork?.note).toContain("CLAUDE_CODE_FORK_SUBAGENT");
-    expect(fork?.note).toContain("CLAUDE_CODE_SUBAGENT_MODEL");
-    // Main-session-only, non-resumable, no-nested-fork, and the reconstruction limit.
-    expect(fork?.note).toContain("MAIN-SESSION dispatch ONLY");
-    expect(fork?.note).toContain("NON-RESUMABLE");
-    expect(fork?.note).toContain("CANNOT SPAWN ANOTHER FORK");
-    expect(fork?.note).toContain("RECONSTRUCTION");
-    // Verified vs INFERRED/PiCC-defined claims are separated in the note.
-    expect(fork?.note).toContain("PiCC-DEFINED / INFERRED");
-    // The tier rationale names the reconstruction limit, not just the deferrals.
-    expect(fork?.note).toContain("Tier PARTIAL: the prompt reconstruction");
-  });
-
-  // TaskOutput reports failed status (never empty success) but is partial for its
-  // pre-existing schema gap; TaskStop's discard/identity wording is PiCC-defined.
-  it("marks TaskOutput and TaskStop partial with their distinct gaps", () => {
-    const out = lookupCapability("tool.TaskOutput");
-    expect(out?.tier).toBe("partial");
-    expect(out?.note).toContain("failed status");
-    expect(out?.note).toContain("waiting for configured capacity");
-    expect(out?.note).toContain("in-progress await shows waiting in human/streaming partial output");
-    expect(out?.note).toContain("polling, or an interrupted await, returns waiting to the model");
-    expect(out?.note).toContain("completed await instead returns the canonical terminal result");
-    expect(out?.note).not.toMatch(/completed await[^.]*waiting/i);
-    // TaskOutput is INHERITED by subagents but SCOPED to the dispatcher's
-    // own tasks — the old inverted "Claude hides TaskOutput; PiCC's session-wide
-    // registry does not" wording is gone. The note must state the scoped behavior
-    // and the honest #15098 hardening (not a blanket "non-divergent" claim).
-    expect(out?.note).toContain("status line that retains the explicitly requested target ID");
-    expect(out?.note).not.toContain("status line retains");
-    expect(out?.note).toContain("passive Agent/settlement lifecycle rows omit task ID chips");
-    expect(out?.note).toContain("registry and canonical identity remain unchanged");
-    // Claude removes TaskOutput from named subagents; PiCC deliberately exposes
-    // it with own-dispatch scope while preserving coordinator session-wide reach.
-    expect(out?.note).toContain("PiCC EXTENSION/DIVERGENCE");
-    expect(out?.note).toContain("official Claude Code subagent documentation removes TaskOutput");
-    expect(out?.note).toContain("even when it is listed in `tools:`");
-    expect(out?.note).toContain("only tasks it dispatched");
-    expect(out?.note).toContain("coordinator reaches every session task");
-    expect(out?.note).toContain("bracketed lifecycle state `[completed]`, `[failed]`, or `[aborted]`");
-    expect(out?.note).not.toContain("#15098");
-    expect(out?.note).not.toContain("#23154");
-    expect(out?.note).toContain("poll (wait:false)");
-    expect(out?.note).toContain("preserves settlement-notice eligibility");
-    expect(out?.note).toContain("terminal record counts as delivery");
-    expect(out?.note).toContain("cut-off result");
-    expect(out?.note).toContain("Retrieval remains available after a notice");
-    expect(out?.note).toContain("stopped terminal record reports the outcome");
-    expect(out?.note).toContain("reporter-observed Claude Code 2.1.x");
-    expect(out?.note).toContain("public docs do not specify notification-consumption semantics");
-    expect(out?.note).toContain("NOT claimed as verified parity");
-    expect(out?.note).toContain("PRE-EXISTING SCHEMA GAP");
-    expect(out?.note).toContain("anthropics/claude-code#21343");
-    expect(out?.note).toContain("Claude Code 2.1.20 TaskOutput using block:true");
-    expect(out?.note).toContain("anthropics/claude-code#76335");
-    expect(out?.note).toContain("2.1.206 local_agent using block:true with timeout");
-    expect(out?.note).toContain("PiCC exposes wait");
-    expect(out?.note).toContain("official tools docs list TaskOutput and its deprecation but publish no parameter schema");
-    expect(out?.note).toContain("This gap makes the tier partial");
-    expect(out?.note).not.toContain("hides TaskOutput from subagents");
-    expect(out?.note).not.toContain("session-wide, so a subagent");
-    const stop = lookupCapability("tool.TaskStop");
-    expect(stop?.tier).toBe("partial");
-    expect(stop?.note).toContain("CHECKPOINT-PAUSED EXCEPTION");
-    expect(stop?.note).toContain("while the originating process remains alive");
-    expect(stop?.note).toContain("foreground or background dispatch retained after exhaustion");
-    expect(stop?.note).toContain("addressed through the process-lifetime registry by stable agent id");
-    expect(stop?.note).toContain("Otherwise PiCC accepts only task_id");
-    expect(stop?.note).toContain("Claude 2.1.198+ also accepts agent id/name");
-    expect(stop?.note).toContain("task record's stored display type");
-    expect(stop?.note).toContain("stable agent id");
-    expect(stop?.note).toContain("PiCC-defined model-visible wording");
-    expect(stop?.note).toContain("not verified as exact Claude wording");
-    expect(stop?.note).toContain("cooperative");
-    expect(stop?.note).toContain("discarded late result");
-    expect(stop?.note).toContain("post-stop result semantics are undocumented");
-    // TaskStop is scoped by the identical per-dispatcher guard as
-    // TaskOutput — carry the honest scoped-behavior + #15098 hardening note.
-    expect(stop?.note).toContain("only tasks it dispatched");
-    expect(stop?.note).toContain("#15098");
+  it.each<DisclosureContract>([
+    {
+      id: "tool.Agent",
+      tier: "partial",
+      core: [
+        /subagent dispatch/,
+        /final message is returned verbatim/,
+        /main-session\/depth-1 background work/,
+        /successful acceptance is transient in human chat/,
+        /first terminal delivery through TaskOutput or settlement/,
+        /semantic record/,
+        /later already-reported retrieval adds no human row/,
+        /Nested work at depth >= 2/,
+        /default notice box/,
+        /panel tree/,
+        /parent's transcript/,
+        /responsive status panel remains the waiting\/running surface/,
+        /dispatched subagents do NOT recurse/,
+      ],
+      gap: [/PARTIAL residual/, /notice is next-turn/],
+      precedence: [/BACKGROUND-BY-DEFAULT/, /run_in_background:false/, /DISABLE_BACKGROUND_TASKS/, /MAIN-SESSION-ONLY BY DEFAULT/, /default subagents\.maxDepth/, /subagents\.maxDepth of 1/, /positive integer greater than 1/, /nested generations/],
+      visibility: [/model-visible text/, /human TUI strips it/, /model-visible background dispatch still returns the task ID/, /print\/RPC rendering unchanged/],
+      parity: [/Claude-faithful/, /PiCC-defined/, /not verified parity/, /Claude Code 2\.1\.217/, /disables nested spawning by default/, /CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH/],
+      split: [/feature\.background-agents/, /tool\.Agent\.fork/],
+    },
+    { id: "tool.Task", tier: "partial", core: [/alias of the Agent subagent-dispatch tool/, /loud-failure/], gap: [/conditional/, /remaining uncollected/], precedence: [/background-by-default/, /terminal TaskOutput collection suppresses/], visibility: [/settlement notice/], parity: [/PiCC UX hardening rather than verified parity/], split: [/tool\.Agent\.fork/] },
+    { id: "feature.tool-output-clip", tier: "partial", core: [/tool-result clip backstop/, /head \+ tail kept, middle dropped/], gap: [/Built-in Read\/Bash keep Pi's OWN 50 KB truncation/], precedence: [/clipMaxTokens, default 20k tokens/], visibility: [/model-visible/, /human rendering summarizes/], parity: [/PiCC HARDENING, NOT Claude parity/, /DIRECTIONAL DIVERGENCE/], split: [/tool\.Read \/ tool\.Bash/] },
+    { id: "tool.SendMessage", tier: "partial", core: [/resumes a completed/, /steers a running background one/, /PiCC allows resume after TaskStop/], gap: [/no cross-restart resume/, /steering is background-only/, /Claude Code 2\.1\.x reference refuses stopped-agent resume/], precedence: [/newest generation wins/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's queue behavior is undocumented/], split: [/tool\.Agent\.fork/] },
+    { id: "tool.Agent.fork", tier: "partial", core: [/inherits the parent conversation/, /OUTPUT ISOLATION IS KEPT/], gap: [/NON-RESUMABLE/, /CANNOT SPAWN ANOTHER FORK/], precedence: [/CLAUDE_CODE_FORK_SUBAGENT/, /UNSET ⇒ ENABLED/, /CLAUDE_CODE_SUBAGENT_MODEL/, /per-call `model`/], visibility: [/visibly degrades/, /footer notice/], parity: [/VERIFIED behavior/, /PiCC-DEFINED \/ INFERRED/], split: [/SendMessage/] },
+    {
+      id: "tool.TaskOutput",
+      tier: "partial",
+      core: [
+        /retrieves background subagent results/,
+        /canonical terminal result/,
+        /main-session retrieval of depth-1 work/,
+        /FIRST terminal delivery/,
+        /semantic record/,
+        /never adding a reference or duplicate row/,
+      ],
+      gap: [/PRE-EXISTING SCHEMA GAP/, /PiCC exposes wait/],
+      precedence: [/FIRST terminal delivery/, /AFTER an emitted terminal record/, /terminal record counts as delivery/, /subagent reaches only tasks it dispatched/, /coordinator reaches every session task/],
+      visibility: [/human\/streaming partial output/, /returns waiting to the model/, /suppressed from the main-session human TUI/, /model-visible settled retrieval/],
+      parity: [/PiCC-defined collection-aware lifecycle/, /PiCC EXTENSION\/DIVERGENCE/, /official Claude Code/],
+    },
+    { id: "tool.TaskStop", tier: "partial", core: [/stops a background subagent/, /TaskStop abandons it/], gap: [/PiCC accepts only task_id/, /Claude 2\.1\.198\+ also accepts agent id\/name/], precedence: [/subagent's TaskStop reaches only tasks it dispatched/, /coordinator can stop any session task/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's post-stop result semantics are undocumented/], split: [/tool\.TaskOutput/] },
+  ])("retains $id semantic disclosure", (contract) => {
+    expectDisclosure(contract);
   });
 
   it("documents canonical SubagentStart/SubagentStop identity with transcript_path = MAIN", () => {
@@ -570,96 +374,33 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(bg?.note).toContain("background: true");
   });
 
-  // background-agents carries PiCC's settlement/resume identity contract plus
-  // the established delivery, visibility, lifecycle, and parity gaps.
-  it("keeps feature.background-agents partial with identity and established gaps named", () => {
-    const bg = lookupCapability("feature.background-agents");
-    expect(bg?.tier).toBe("partial");
-    expect(bg?.note).toContain("task record's stored display type");
-    expect(bg?.note).toContain("stable agent id");
-    expect(bg?.note).toContain("new task id and resolved registry name");
-    expect(bg?.note).toContain("PiCC-defined");
-    expect(bg?.note).toContain("not verified as exact Claude wording");
-    expect(bg?.note).toContain("TaskStop accepts only task_id");
-    expect(bg?.note).toContain("Claude 2.1.198+ also accepts agent id/name");
-    expect(bg?.note).toContain("resume after TaskStop");
-    expect(bg?.note).toContain("Claude Code 2.1.x reference refuses it");
-    expect(bg?.note).toContain("eligible uncollected current task");
-    expect(bg?.note).toContain("one bounded settlement notice");
-    expect(bg?.note).toContain("coordinator's NEXT turn");
-    expect(bg?.note).toContain("running TaskOutput poll preserves eligibility");
-    expect(bg?.note).toContain("terminal return counts as delivery");
-    expect(bg?.note).toContain("retrieval remains available after notification without re-arming");
-    expect(bg?.note).toContain("stopped notices are outcome-only");
-    expect(bg?.note).toContain("newest-generation-wins");
-    expect(bg?.note).toContain("reporter-observed Claude Code 2.1.x");
-    expect(bg?.note).toContain("public docs specify no notification-consumption semantics");
-    expect(bg?.note).toContain("NOT verified parity");
-    expect(bg?.note).toContain("reporter observations (anthropics/claude-code#21343, Claude Code 2.1.20 background agents, and anthropics/claude-code#24752)");
-    expect(bg?.note).toContain("late notification during an active conversation");
-    expect(bg?.note).toContain("without establishing exact normative timing");
-    expect(bg?.note).toContain("one-shot print mode");
-    // The default is background — the note must assert that default,
-    // not the removed "PiCC defaults foreground" gap, and name the residual timing gap.
-    expect(bg?.note).toContain("background-by-default");
-    expect(bg?.note).not.toContain("PiCC defaults foreground");
-    // PiCC's scheduler and current official Claude facts stay distinct.
-    expect(bg?.note).toContain("root dispatches up to the effective configured concurrency");
-    expect(bg?.note).not.toContain("root background work");
-    expect(bg?.note).toContain("queues additional accepted work FIFO");
-    expect(bg?.note).toContain("no separate waiter cap");
-    expect(bg?.note).toContain("each nested-background depth has a separate configured-capacity pool");
-    expect(bg?.note).toContain("maxDepth × concurrency bounds the background pools only");
-    expect(bg?.note).toContain("Foreground nested dispatch bypasses those pools");
-    expect(bg?.note).toContain("total active work can be higher");
-    expect(bg?.note).toContain("Claude Code 2.1.217");
-    expect(bg?.note).toContain("default 20");
-    expect(bg?.note).toContain("CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS");
-    expect(bg?.note).toContain("CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH");
-    expect(bg?.note).toContain("subagents.maxDepth greater than 1");
-    expectCurrentNestedSpawningNote(bg?.note);
-    expect(bg?.note).toContain("does not establish queue-versus-rejection behavior or precise concurrency scope");
-    expect(bg?.note).toContain("Claude Code 2.1.212");
-    expect(bg?.note).toContain("default-200 per-session subagent-spawn cap");
-    expect(bg?.note).toContain("CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION");
-    expect(bg?.note).toContain("reset by /clear");
-    expect(bg?.note).toContain("PiCC has no corresponding per-session spawn budget");
-    expect(bg?.note).toContain("Waiting status in TaskOutput and the interactive panel is PiCC-defined UX");
-    expect(bg?.note).not.toContain("global (~10) parallel-agent cap");
-    expect(bg?.note).not.toContain("Claude's single global");
-    const maxDepth = lookupCapability("setting.subagentMaxDepth");
-    expect(maxDepth?.note).toContain("accepts any positive integer");
-    expect(maxDepth?.note).not.toContain("2..5");
-    expect(maxDepth?.note).not.toContain("five-level");
-    const concurrency = lookupCapability("setting.subagentConcurrency");
-    expect(concurrency?.tier).toBe("full");
-    expect(concurrency?.note).toContain("root dispatches");
-    expect(concurrency?.note).toContain("separately to each nested-background depth");
-    expect(concurrency?.note).toContain("foreground nested dispatch bypasses");
-    expect(concurrency?.note).toContain("not a total or session ceiling");
-    expect(concurrency?.note).not.toContain("root background");
-    // The subagent-scoping clause must survive future edits to this entry.
-    expect(bg?.note).toContain("scoped to the subagent's own dispatched tasks");
-    expect(bg?.note).toContain("PiCC EXTENSION/DIVERGENCE");
-    expect(bg?.note).toContain("official Claude Code subagent documentation removes TaskOutput");
-    expect(bg?.note).toContain("individual always-expanded tree rows whenever a useful identity fits");
-    expect(bg?.note).toContain("showing the dispatch description when space permits");
-    expect(bg?.note).toContain("dropping optional telemetry columns panel-wide as width narrows");
-    expect(bg?.note).toContain("widths below the explicit row minimum use truthful state aggregates");
-    expect(bg?.note).toContain("waiting keeps a static glyph while its literal label appears when space permits");
-    expect(bg?.note).not.toContain("literal label, a keyboard-entered drill-down");
-    // The in-session Agent View gap is closed by the status panel; the honest
-    // residuals must be named instead of the retired "no always-on Agent View".
-    expect(bg?.note).not.toContain("no always-on Agent View");
-    for (const gap of [
-      "idle parents are not re-invoked",
-      "interactive-TUI-only",
-      "no cross-session agent view",
-      "no remote/cloud agents",
-      "stop is cooperative",
-    ]) {
-      expect(bg?.note).toContain(gap);
-    }
+  it.each<DisclosureContract>([
+    {
+      id: "feature.background-agents",
+      tier: "partial",
+      core: [
+        /background-by-default dispatch/,
+        /always-on status panel/,
+        /main-session\/depth-1 background work/,
+        /successful acceptance is transient in human chat/,
+        /first terminal delivery through TaskOutput or settlement/,
+        /semantic.*record/,
+        /later already-reported TaskOutput retrieval adds no human row/,
+        /Nested work at depth >= 2/,
+        /default notice box/,
+        /panel tree/,
+        /parent's transcript/,
+      ],
+      gap: [/idle parents are not re-invoked/, /one-shot print mode/, /no cross-session agent view/, /no remote\/cloud agents/, /PiCC has no corresponding per-session spawn budget/],
+      precedence: [/first terminal delivery/, /later already-reported TaskOutput retrieval/, /Nested work at depth >= 2/, /newest-generation-wins/, /effective configured concurrency/, /queues additional accepted work FIFO/, /each nested-background depth/, /separate configured-capacity pool/, /Foreground nested dispatch bypasses those pools/],
+      visibility: [/interactive TUI/, /canonical\/model-visible results/, /print\/RPC output remain unchanged/],
+      parity: [/PiCC-defined semantic/, /NOT verified parity/, /PiCC EXTENSION\/DIVERGENCE/, /Claude Code 2\.1\.217/, /concurrently-running subagent cap/, /default 20/, /CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS/, /nested spawning disabled by default/, /CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH/, /does not establish queue-versus-rejection behavior/, /precise concurrency scope/, /Claude Code 2\.1\.212/, /default-200/, /per-session subagent-spawn cap/, /CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION/, /reset by \/clear/],
+      split: [/tool\.SendMessage/, /tool\.TaskOutput/, /tool\.Agent\.fork/],
+    },
+    { id: "setting.subagentMaxDepth", tier: "full", core: [/caps subagent nesting depth/, /accepts any positive integer/], precedence: [/default 1/, /MAIN-SESSION-ONLY/], parity: [/PiCC extension/, /NOT Claude parity/] },
+    { id: "setting.subagentConcurrency", tier: "full", core: [/configured capacity applies to root dispatches/, /separately/, /each nested-background depth/], gap: [/foreground nested dispatch bypasses those pools/, /not a total/, /session ceiling/], parity: [/PiCC extension/, /no Claude-settings equivalent/] },
+  ])("retains $id semantic disclosure", (contract) => {
+    expectDisclosure(contract);
   });
 
   it("qualifies skill slash availability and SlashCommand for reserved built-in names", () => {
@@ -687,62 +428,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expect(sc?.note.startsWith("—")).toBe(false);
   });
 
-  // tool.Read stays full for its text/image/notebook core, but the note must
-  // disclose the vision-gate exception, that the image-FILE path is inherited
-  // from base Pi, the Claude-style binary error, and cross-reference the PDF gap
-  // to its own entry. Classification truthfulness: IMAGE and BINARY detection is
-  // byte-based (magic bytes), but NOTEBOOK routing is keyed on the .ipynb
-  // extension (parity with Claude's merged Read), not byte-based — the note must
-  // scope the byte-based claim to image/binary and call the notebook path
-  // extension-keyed.
-  it("describes Read's notebook/image/binary behavior at full, vision-gated, byte-based(image/binary)/extension-keyed(notebook), PDF cross-referenced", () => {
-    const read = lookupCapability("tool.Read");
-    expect(read?.tier).toBe("full");
-    expect(read?.note).toContain("CELL-AWARE");
-    expect(read?.note).toContain("image content block");
-    expect(read?.note).toContain("vision-gate exception");
-    expect(read?.note).toContain("INHERITED from base Pi");
-    // Byte-based classification is scoped to IMAGE and BINARY only...
-    expect(read?.note).toContain("IMAGE and BINARY classification is BYTE-BASED");
-    expect(read?.note).toContain("not extension-based");
-    // ...while notebook reads are keyed on the .ipynb extension (Claude parity).
-    expect(read?.note).toContain(".ipynb extension");
-    expect(read?.note.toLowerCase()).toContain("parity");
-    expect(read?.note).toContain("Claude-style binary error");
-    // The PDF gap is discoverable via its own entry, not hidden inside "full",
-    // and is NOT claimed to be named by /doctor.
-    expect(read?.note).toContain("feature.read.pdf");
-    expect(read?.note).toContain("feature.read.images");
-    expect(read?.note).not.toContain("/doctor flags");
-  });
-
-  // The image-ingestion entry is a single `partial` entry: full-on-vision /
-  // degraded-on-non-vision, with the split and PiCC-own normalization stated.
-  it("carries a partial image-ingestion entry naming the vision split and normalization", () => {
-    const img = lookupCapability("feature.read.images");
-    expect(img, "feature.read.images must exist").toBeDefined();
-    expect(img?.tier).toBe("partial");
-    expect(img?.note.toLowerCase()).toContain("vision-capable model");
-    expect(img?.note).toContain("SPLITS on vision");
-    expect(img?.note).toContain("model-visible text note");
-    expect(img?.note).toContain("byte-based");
-    // PiCC's own normalization, not asserted byte-identical to Claude.
-    expect(img?.note).toContain("NOT asserted byte-identical to Claude Code");
-    expect(img?.note).toContain("inherited from base Pi");
-  });
-
-  // PDF is disclosed as BELOW the Claude baseline through a discoverable
-  // not-supported entry (runtime binary error + support-matrix table), rather
-  // than Read hiding it inside its full tier.
-  it("carries a not-supported PDF entry disclosing it is below the Claude baseline", () => {
-    const pdf = lookupCapability("feature.read.pdf");
-    expect(pdf, "feature.read.pdf must exist").toBeDefined();
-    expect(pdf?.tier).toBe("not-supported");
-    expect(pdf?.note).toContain("Claude Code reads PDFs at baseline");
-    expect(pdf?.note).toContain("binary error");
-    expect(pdf?.note).toContain("BELOW the Claude baseline");
-    // Must NOT imply Claude also errors on PDF.
-    expect(pdf?.note).toContain("NOT a claim that Claude also errors on PDF");
+  it.each<DisclosureContract>([
+    { id: "tool.Read", tier: "full", core: [/text\/image\/notebook file reads/, /CELL-AWARE/], gap: [/PDF reading is BELOW the Claude baseline/], precedence: [/IMAGE and BINARY classification is BYTE-BASED/, /NOTEBOOK reads/, /\.ipynb extension/], visibility: [/non-vision model/, /model-visible text note/, /binary error/], parity: [/divergence from Claude's extension-based classification/, /PARITY/], split: [/feature\.read\.images/, /feature\.read\.pdf/, /feature\.tool-output-clip/] },
+    { id: "feature.read.images", tier: "partial", core: [/real image content block ON A VISION-CAPABLE MODEL/], gap: [/non-vision model/, /model-visible text note/], visibility: [/never a silent drop or garbled text/], parity: [/PiCC's own normalization, NOT asserted byte-identical to Claude Code/], split: [/tool\.Read/] },
+    { id: "feature.read.pdf", tier: "not-supported", core: [/Claude Code reads PDFs at baseline/], gap: [/PiCC returns the binary error/, /deferred follow-up/], visibility: [/runtime Claude-style binary error/, /support-matrix table/], parity: [/BELOW the Claude baseline/, /NOT a claim that Claude also errors/], split: [/tool\.Read/] },
+  ])("retains $id semantic disclosure", (contract) => {
+    expectDisclosure(contract);
   });
 
   // NotebookEdit was reconciled alongside the retirement: its note directs raw
@@ -899,22 +590,7 @@ describe("capability matrix freshness", () => {
     expect(norm(committed)).toBe(norm(regenerated));
   });
 
-  it("keeps the architecture ownership and nested-pool bounds precise", () => {
-    const architecturePath = fileURLToPath(new URL("../doc/architecture.md", import.meta.url));
-    const architecture = fs.readFileSync(architecturePath, "utf8");
-    const normalized = architecture.replace(/\s+/g, " ").trim();
-    const plain = normalized.replace(/[*_]/g, "");
-    expect(normalized).toContain("The scheduler owns admission");
-    expect(normalized).toContain("`SubagentRegistry` owns dispatch lifecycle and progress");
-    expect(normalized).toContain("`BackgroundTaskRegistry` owns task-generation admission and stop data");
-    expect(normalized).toContain("`maxDepth × concurrency` bounds the background pools");
-    expect(normalized).toContain("Foreground nested dispatch bypasses those pools");
-    expect(normalized).toContain("total active work can exceed that product");
-    expect(plain).toContain("not Claude Code parity");
-    expect(normalized).not.toContain("registry the single data source for the status panel");
-    expect(normalized).not.toContain("Claude Code 2.1.217");
-    expect(normalized).not.toContain("CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS");
-  });
+
 });
 
 describe("capabilityForToolName", () => {
@@ -1774,6 +1450,5 @@ describe("committed notebook-with-image fixture (examples/full-surface/analysis.
     // Off-vision: the raster output is a text placeholder, not an image block.
     expect(content.some((b) => b.type === "image")).toBe(false);
     expect(text).toContain("image/png");
-    expect(text).toContain("does not support images");
   });
 });

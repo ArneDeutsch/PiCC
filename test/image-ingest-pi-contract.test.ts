@@ -1,14 +1,9 @@
-import { readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { NON_VISION_IMAGE_NOTE, sniffImageMime } from "../src/runtime/image-ingest.js";
+import { sniffImageMime } from "../src/runtime/image-ingest.js";
 
 /**
- * Pi-contract pins for the helpers image-ingest.ts REPRODUCES (the package
- * `exports` map blocks the deep paths, so — like tool-shell.ts's getTextOutput
- * pin — the concrete files are imported via an absolute file:// URL). A Pi
- * version bump that changes the magic-byte sniff or the non-vision wording fails
- * loudly here instead of diverging silently.
+ * Pi-contract pin for the MIME helper image-ingest.ts reproduces. Pi's package
+ * exports block the deep path, so the concrete file is imported by file URL.
  */
 function piDistFileUrl(relFromDist: string): string {
   const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
@@ -84,12 +79,4 @@ describe("image-ingest Pi contract", () => {
     }
   });
 
-  it("NON_VISION_IMAGE_NOTE is the exact literal Pi's read.js emits", async () => {
-    // getNonVisionImageNote is NOT exported, so pin the wording against the
-    // source text of Pi's own read.js — a Pi wording change fails here.
-    const source = await readFile(fileURLToPath(piDistFileUrl("core/tools/read.js")), "utf-8");
-    expect(source, "Pi moved core/tools/read.js or changed the non-vision wording").toContain(
-      NON_VISION_IMAGE_NOTE,
-    );
-  });
 });

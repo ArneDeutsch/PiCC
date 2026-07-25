@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { cleanupFixture, materializeFixture } from "./fixture.js";
 import { startMockModel, type CapturedRequest, type RequestClassifierOptions, type Turn } from "./mock-openai.js";
+import { resolveRealPiCli } from "../../scripts/resolve-real-pi-cli.mjs";
 import { resolveShellBinary } from "../../src/engine/shell-inject.js";
 
 /**
@@ -23,18 +24,13 @@ import { resolveShellBinary } from "../../src/engine/shell-inject.js";
  */
 
 // This file lives in test/helpers/, so REPO_ROOT is two levels up (mirrors
-// test/helpers/fixture.ts). CLI_PATH/EXTENSION_PATH/cliMissing cascade from it.
+// test/helpers/fixture.ts). The package preflight and this direct-Vitest skip
+// resolve the real Pi CLI through the same module.
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-export const CLI_PATH = path.join(
-  REPO_ROOT,
-  "node_modules",
-  "@earendil-works",
-  "pi-coding-agent",
-  "dist",
-  "cli.js",
-);
+const realPiCli = resolveRealPiCli({ repoRoot: REPO_ROOT });
+export const CLI_PATH = realPiCli.cliPath;
 export const EXTENSION_PATH = path.join(REPO_ROOT, "src", "index.ts");
-export const cliMissing = !fs.existsSync(CLI_PATH);
+export const cliMissing = realPiCli.missing;
 export const RUN_TIMEOUT_MS = 90_000;
 export const TEST_TIMEOUT_MS = 120_000;
 export const CHECKPOINT_USAGE = Object.freeze({

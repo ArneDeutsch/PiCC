@@ -34,9 +34,16 @@ node <path-to-picc>/bin/picc.mjs
 The dev loop:
 
 ```bash
-npm run typecheck:all   # strict TypeScript over src + tests, no emit
-npm run test:unit       # the fast lane — both are also what the pre-commit hook runs
+npm run typecheck:all                              # strict TypeScript over src + tests, no emit
+npm run test:unit                                  # complete non-E2E lane
+npm run test:unit -- test/permissions.test.ts      # focused exact file
+npm run test:unit -- test/permissions.test.ts -t "^parseRule parses bare tool names$"
+npm run verify                                     # authoritative complete check before integration
 ```
+
+Vitest's `-t` is a regular expression; anchor the full name, including `describe` ancestry, for an
+exact match. The pre-commit hook runs the first two commands. Use the focused commands while
+iterating and `verify` before integration.
 
 [`doc/architecture.md`](doc/architecture.md) is the map of `src/` — the layering, what each module
 owns, and where new code belongs. Read it before changing the harness.
@@ -144,9 +151,9 @@ Deliberately out of scope — each for a reason, not from neglect:
 ## Pull requests
 
 - Keep changes focused; match the surrounding code style.
-- Add or update tests for behavior changes — prefer an end-to-end scenario for anything a user
-  would observe.
-- Run `npm run typecheck:all` and `npm test` before opening the PR. CI runs `test:unit` and
+- Add or update tests for behavior changes at the cheapest sufficient layer; reserve end-to-end
+  scenarios for boundaries that require the real Pi CLI or agent loop.
+- Run `npm run verify` before opening the PR. CI runs `test:unit` and
   `test:e2e` as separate lanes on Windows and Linux — unit on Node 22 and 24, e2e on Node 22.
 - Note any capability-registry or documentation updates in the PR description.
 

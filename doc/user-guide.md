@@ -212,8 +212,9 @@ form, and external paths remain absolute. Eligible custom PiCC fragments in HTML
 export context available to them, while Pi owns stock built-in cards and their presentation.
 JSON and RPC have no renderer styling and retain canonical event and tool data. Plain print is
 renderer-free and uses Pi's final-text surface rather than emitting canonical tool records. None of
-these presentations changes model-facing results or execution. Passive Agent lifecycle and panel
-rows omit internal task IDs; explicit `TaskOutput` and `TaskStop` rows retain their requested targets.
+these presentations changes model-facing results or execution. Panel rows and terminal semantic
+records omit internal task IDs; active waiting/running `TaskOutput` rows and `TaskStop` rows retain
+their requested targets, while terminal record expansion carries the operational IDs.
 
 ### Observing subagents
 
@@ -262,13 +263,16 @@ Every subagent is visible, both to you and to the coordinating model:
   line).
 - **Condensed transcript records.** Subagent output does not stream into the chat; selected-agent
   detail owns the live view. Each depth-1 normal-path result replaces its pending call in the same
-  tool row; background completion adds one collapsed record — outcome, duration, tokens — that
-  Ctrl+O expands to the outcome-appropriate retained output, if any, plus the transcript path, usage, and any warnings. Background
-  agents get their record even if never awaited; an agent that settles while you are away from the prompt gets it
-  when the conversation next continues (the record rides the next turn). A later `TaskOutput`
-  collection adds only a minimal reference line, never a duplicate. Nested agents (depth ≥ 2) get
-  no record of their own — they keep Pi's default notice box and appear in the panel tree and
-  their parent's transcript only.
+  tool row. A successful background acceptance is transient in human chat rather than a durable row;
+  its first terminal delivery, whether from `TaskOutput` or next-turn settlement, creates a separate
+  semantic record instead of mutating the earlier call. That single bounded line prioritizes the
+  outcome, agent identity and textual state, actionable exceptional evidence, and dispatch description, then an
+  expansion cue and duration as space permits. Ctrl+O expands it to the task and agent IDs, available
+  retained output, transcript location, usage, and applicable diagnostics. A terminal `TaskOutput`
+  retrieval after that record was already delivered adds no human row. Background agents still get
+  the record if never awaited; an agent that settles while you are away from the prompt gets it when
+  the conversation next continues. Nested agents (depth ≥ 2) get no record of their own — they keep
+  Pi's default notice box and appear in the panel tree and their parent's transcript only.
 - **Esc** cancels a running *foreground* dispatch (it reports as aborted). Esc while *awaiting* a
   background task only detaches the wait — the task keeps running; retrieve it with `TaskOutput`.
 - **`SendMessage`** continues a finished subagent with its context intact, or redirects a running
@@ -541,9 +545,8 @@ behaviors worth knowing:
   live validation on a real ChatGPT/Codex subscription, covering slash commands with argument
   substitution, description-routed subagent dispatch, worktree entry detected as `mode=worktree` by
   a project's own git-plumbing probe, `.worktreeinclude` seeding, and hooks.
-- **Linux**: the code is platform-guarded and expected to work (POSIX is the simpler path for
-  every Windows-special case), but has not yet been exercised in CI — run `npm test` on your
-  Linux machine before relying on it there.
+- **Linux**: the automated suite, including the real-Pi CLI lane with a local mock model, runs in
+  CI. Live ChatGPT/Codex subscription validation remains Windows-only.
 
 ## 11. Example projects
 

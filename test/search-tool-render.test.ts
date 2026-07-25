@@ -3,7 +3,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+  createFindToolDefinition,
+  createGrepToolDefinition,
+  createLsToolDefinition,
+  type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { withCompactSearchRendering } from "../src/runtime/search-tool-render.js";
 import { createGlobTool, createGrepTool } from "../src/runtime/tools/search-tools.js";
 
@@ -88,6 +93,18 @@ function expectBounded(lines: string[], width: number): void {
 }
 
 describe("compact search rendering decorator", () => {
+  it("pins the real Pi grep/find/ls input fields PiCC consumes", () => {
+    const cases = [
+      [createGrepToolDefinition("/repo"), ["pattern", "path", "glob", "limit"]],
+      [createFindToolDefinition("/repo"), ["pattern", "path", "limit"]],
+      [createLsToolDefinition("/repo"), ["path", "limit"]],
+    ] as const;
+    for (const [definition, fields] of cases) {
+      const properties = (definition.parameters as { properties: Record<string, unknown> }).properties;
+      for (const field of fields) expect(properties).toHaveProperty(field);
+    }
+  });
+
   it("preserves execute and every non-render field", () => {
     const source = createGrepTool(() => ".", { forceJs: true });
     const decorated = withCompactSearchRendering(source);

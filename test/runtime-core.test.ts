@@ -76,7 +76,6 @@ import type { ProgressSnapshot } from "../src/runtime/subagent-progress.js";
 import {
   RECORD_EXPAND_HINT,
   RECORD_FORK_MARKER,
-  RECORD_REFERENCE_NOTE,
   renderAgentCall,
   renderAgentResult,
   renderSettlementRecord,
@@ -86,6 +85,7 @@ import {
   genericCallComponent,
   genericResultComponent,
   setToolRowOutcome,
+  suppressToolRow,
   wrapForSelfShell,
   type RenderCtx,
   type ToolRowOutcome,
@@ -2504,7 +2504,7 @@ describe("Subagent live progress", () => {
     expect(rendered).toContain("aborted");
   });
 
-  it("renderCall stays mode-neutral and a background result owns one compact row", () => {
+  it("renderCall stays mode-neutral and malformed background-shaped results retain generic evidence", () => {
     const tool = renderTool();
     const call = tool
       .renderCall({ subagent_type: "reviewer", run_in_background: true }, undefined)
@@ -2522,8 +2522,8 @@ describe("Subagent live progress", () => {
       )
       .render(120)
       .join("\n");
-    expect(result).toBe("reviewer [background] - Review auth");
-    expect(result).not.toContain("Background task task-1 started");
+    expect(result).toBe("Background task task-1 accepted");
+    expect(result).not.toContain("reviewer [background]");
   });
 
   it("neutralizes Unicode format controls and separators at every human lifecycle boundary only", () => {
@@ -2641,7 +2641,7 @@ describe("TaskOutput identity render", () => {
       .render(width)
       .join("\n");
 
-  it("completed / failed / aborted badges each carry the Task chip + agent-<id> subline", () => {
+  it("completed / failed / aborted expanded records use semantic headers and identifier footers", () => {
     const agentId = "agent-aabbccddeeff";
     const completed = render({
       taskId: "task-3",
@@ -2653,7 +2653,8 @@ describe("TaskOutput identity render", () => {
       resumable: true,
       usage: { inputTokens: 10, outputTokens: 5, costUsd: 0.01 },
     }, "the answer");
-    expect(completed).toContain("task output task-3");
+    expect(completed).not.toContain("task output");
+    expect(completed).toContain("task: task-3");
     expect(completed).toContain("coder");
     expect(completed).toContain("completed");
     expect(completed).toContain(agentId); // identity subline
@@ -2668,7 +2669,8 @@ describe("TaskOutput identity render", () => {
       agent: "coder",
       agentId,
     }, "partial");
-    expect(failed).toContain("task output task-4");
+    expect(failed).not.toContain("task output");
+    expect(failed).toContain("task: task-4");
     expect(failed).toMatch(/✗|failed/);
     expect(failed).toContain(agentId);
 
@@ -2679,7 +2681,8 @@ describe("TaskOutput identity render", () => {
       agent: "coder",
       agentId,
     });
-    expect(aborted).toContain("task output task-5");
+    expect(aborted).not.toContain("task output");
+    expect(aborted).toContain("task: task-5");
     expect(aborted).toContain("aborted");
     expect(aborted).toContain(agentId);
   });
@@ -2919,7 +2922,7 @@ describe("TaskOutput identity render", () => {
     expect(out).toContain("Here is the result.");
   });
 
-  it("settled resumable SUPPRESSES the standalone agent-<id> subline; non-resumable keeps it", () => {
+  it("settled detail prints the stable agent ID once regardless of resumability", () => {
     const agentId = "agent-aabbccddeeff";
     const settled = (resumable: boolean) =>
       renderAgentResult(
@@ -2937,15 +2940,14 @@ describe("TaskOutput identity render", () => {
         { isPartial: false },
         undefined,
       ).render(120);
-    // Resumable: the footer already prints "— agent <id>", so the standalone
-    // subline (a line that is EXACTLY the id) is suppressed — id shown once.
-    const res = settled(true);
-    expect(res.filter((l) => l.trim() === agentId)).toHaveLength(0);
-    expect(res.join("\n")).toContain(`resumable via SendMessage — agent ${agentId}`);
-    // Non-resumable: the standalone identity subline is its ONLY occurrence — kept.
-    const nonres = settled(false);
-    expect(nonres.filter((l) => l.trim() === agentId)).toHaveLength(1);
-    expect(nonres.join("\n")).not.toContain("resumable via SendMessage");
+    const res = settled(true).join("\n");
+    expect(res).toContain(`agent: ${agentId}`);
+    expect(res.match(new RegExp(agentId, "gu"))).toHaveLength(1);
+    expect(res).toContain("resumable via SendMessage");
+    const nonres = settled(false).join("\n");
+    expect(nonres).toContain(`agent: ${agentId}`);
+    expect(nonres.match(new RegExp(agentId, "gu"))).toHaveLength(1);
+    expect(nonres).not.toContain("resumable via SendMessage");
   });
 
   it("cross-platform: the transcript footer basename is derived for both \\\\ and / separators", () => {
@@ -2970,10 +2972,8 @@ describe("TaskOutput identity render", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Condensed completion records — the collapsed-by-default final render
-// (identity + duration + usage + local time + expand affordance), the Ctrl+O
-// expanded full body, the exactly-once reference line, and the \r line-break
-// discipline. Pure renderer unit tests over renderAgentResult.
+// Semantic completion records — the collapsed one-line grammar, expanded
+// operational detail, trusted duplicate suppression, and line-break discipline.
 // ---------------------------------------------------------------------------
 
 describe("condensed completion records", () => {
@@ -2983,6 +2983,7 @@ describe("condensed completion records", () => {
   const completedDetails = {
     taskId: "task-3",
     status: "completed",
+    admission: "admitted",
     outcome: "completed",
     agent: "coder",
     agentId: AGENT_ID,
@@ -3004,35 +3005,148 @@ describe("condensed completion records", () => {
       undefined,
     ).render(width);
 
-  it("collapsed success is one Agent-to-Task completion line with metadata, local time, and expand affordance", () => {
-    const lines = renderLines(completedDetails, "the answer", false);
+  it("collapsed success is one semantic line with description, duration, and expand affordance", () => {
+    const lines = renderLines({ ...completedDetails, description: "Review authentication" }, "the answer", false);
     expect(lines).toHaveLength(1);
     const out = lines[0]!;
-    expect(out).toContain("task output task-3 - coder [completed]");
+    expect(out).toContain("coder [completed] - Review authentication");
     expect(out).toContain("4m02s");
-    expect(out).toContain("in 10");
-    expect(out).toContain("07:05");
-    expect(out).not.toContain(".jsonl");
-    expect(out).not.toContain("/x/sessions/");
     expect(out).toContain(RECORD_EXPAND_HINT);
+    expect(out).not.toContain("task output");
+    expect(out).not.toContain("task-3");
+    expect(out).not.toContain("in 10");
+    expect(out).not.toContain("07:05");
     expect(out).not.toContain("the answer");
-    const order = ["4m02s", "in 10", "07:05", RECORD_EXPAND_HINT].map((s) => out.indexOf(s));
-    expect(order.every((i) => i >= 0)).toBe(true);
-    expect([...order].sort((a, b) => a - b)).toEqual(order);
   });
 
-  it("wraps complete explicit TaskOutput targets while keeping lifecycle text readable", () => {
+  it("uses the same full ordinary-width grammar for first TaskOutput and settlement records", () => {
+    const description = "Review authentication boundaries";
+    const taskDetails = { ...completedDetails, description };
+    const taskLine = renderAgentResult(
+      { content: [{ type: "text", text: "the answer" }], details: taskDetails, isError: false },
+      { isPartial: false, expanded: false },
+      undefined,
+      { args: { task_id: "task-3" }, isError: false },
+      { surface: "task-output" },
+    ).render(160);
+    const settlementLine = renderSettlementRecord(
+      { ...taskDetails, record: "subagent-completion", finalText: "the answer" },
+      { expanded: false },
+      undefined,
+    )!.render(160);
+
+    expect(taskLine).toEqual(settlementLine);
+    expect(settlementLine).toHaveLength(1);
+    expect(settlementLine[0]).toContain(`coder [completed] - ${description}`);
+    expect(settlementLine[0]).toContain("4m02s");
+    expect(settlementLine[0]).toContain(RECORD_EXPAND_HINT);
+  });
+
+  it.each([
+    {
+      label: "completed truncation",
+      status: "completed",
+      outcome: "completed",
+      state: "completed (truncated)",
+      error: undefined,
+      output: "retained completed output",
+      narrowWidth: 31,
+    },
+    {
+      label: "failed partial output",
+      status: "failed",
+      outcome: "failed",
+      state: "failed (partial output preserved)",
+      error: "provider failure",
+      output: "retained partial output",
+      narrowWidth: 43,
+    },
+  ] as const)("keeps cut-off $label truthful across first TaskOutput and settlement surfaces", ({
+    status, outcome, state, error, output, narrowWidth,
+  }) => {
+    const taskDetails = {
+      ...completedDetails,
+      status,
+      outcome,
+      cutOff: true,
+      description: "Inspect authentication boundaries",
+      ...(error === undefined ? {} : { error }),
+    };
+    const surfaces = (expanded: boolean, width: number) => {
+      const taskOutput = renderAgentResult(
+        { content: [{ type: "text", text: output }], details: taskDetails, isError: false },
+        { isPartial: false, expanded },
+        undefined,
+        { args: { task_id: "task-3" }, isError: false },
+        { surface: "task-output" },
+      ).render(width);
+      const settlement = renderSettlementRecord(
+        { ...taskDetails, record: "subagent-completion", finalText: output },
+        { expanded },
+        undefined,
+      )!.render(width);
+      return [taskOutput, settlement] as const;
+    };
+
+    for (const lines of surfaces(false, 160)) {
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(`coder [${state}]`);
+      expect(lines[0]).toContain("Inspect authentication boundaries");
+      expect(lines[0]).toContain("4m02s");
+      expect(lines[0]).not.toContain("task-3");
+      expect(lines[0]).not.toContain(output);
+      expect(tuiVisibleWidth(lines[0]!)).toBeLessThanOrEqual(160);
+    }
+    for (const lines of surfaces(false, narrowWidth)) {
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(`[${state}]`);
+      expect(lines[0]).not.toContain("Inspect authentication boundaries");
+      expect(lines[0]).not.toContain("4m02s");
+      expect(lines[0]).not.toContain("task-3");
+      expect(tuiVisibleWidth(lines[0]!)).toBeLessThanOrEqual(narrowWidth);
+    }
+    for (const width of [160, narrowWidth]) {
+      for (const lines of surfaces(true, width)) {
+        const text = lines.join("\n");
+        expect(text).toContain(state);
+        expect(text).toContain("retained");
+        expect(text).toContain("output");
+        expect(text.match(/task: task-3/gu)).toHaveLength(1);
+        expect(text.match(new RegExp(`agent: ${AGENT_ID}`, "gu"))).toHaveLength(1);
+        for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
+      }
+    }
+
+    const duplicateTool = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
+    for (const expanded of [false, true]) {
+      const context = { state: {}, args: { task_id: "task-3" }, isError: false };
+      const call = duplicateTool.renderCall(context.args, undefined, context);
+      const result = duplicateTool.renderResult(
+        {
+          content: [{ type: "text", text: output }],
+          details: { ...taskDetails, alreadyReported: true },
+          isError: false,
+        },
+        { isPartial: false, expanded },
+        undefined,
+        context,
+      );
+      expect(call.render(160)).toEqual([]);
+      expect(result.render(160)).toEqual([]);
+    }
+  });
+
+  it("keeps terminal task IDs out of collapsed rows at every width", () => {
     const longAgent = "project-security-reviewer-with-an-extra-long-name";
-    for (const width of [8, 20, 60, 80]) {
+    for (const width of [1, 2, 8, 20, 60, 80]) {
       const lines = renderLines({ ...completedDetails, agent: longAgent }, "answer", false, width);
-      const plain = lines.join("");
-      expect(plain).toContain("task-3");
-      expect(plain).toContain("[completed]");
+      expect(lines).toHaveLength(1);
+      expect(lines.join("")).not.toContain("task-3");
       for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
     }
   });
 
-  it("keeps failed, aborted, user-stopped, and reference states textual", () => {
+  it("keeps failed, aborted, and user-stopped states textual without operational task IDs", () => {
     const cases = [
       { taskId: "task-4", status: "failed", outcome: "failed", agent: "coder", state: "[failed]" },
       { taskId: "task-5", status: "stopped", outcome: "aborted", agent: "coder", state: "[aborted]" },
@@ -3040,26 +3154,29 @@ describe("condensed completion records", () => {
     ];
     for (const details of cases) {
       const collapsed = renderLines(details, "partial output", false).join("\n");
-      expect(collapsed).toContain(`task output ${details.taskId} - coder ${details.state}`);
+      expect(collapsed).toContain(`coder ${details.state}`);
       expect(collapsed).toContain(RECORD_EXPAND_HINT);
-      const reference = renderLines({ ...details, alreadyReported: true }, "partial output", false).join("\n");
-      expect(reference).toContain(details.state);
-      expect(reference).toContain(RECORD_REFERENCE_NOTE);
+      expect(collapsed).not.toContain(details.taskId);
     }
   });
 
-  it("foreground success uses the same grammar without a Task target", () => {
-    const lines = renderLines(
-      { ...completedDetails, taskId: undefined, transcriptPath: "/x/foreground.jsonl" },
-      "foreground answer",
-      false,
-    );
+  it("pins pre-feature foreground Agent collapsed telemetry and expanded identity layout", () => {
+    const details = { ...completedDetails, taskId: undefined, transcriptPath: "/x/foreground.jsonl", description: "not terminal grammar" };
+    const lines = renderLines(details, "foreground answer", false);
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("coder [completed]");
+    expect(lines[0]).toContain("4m02s");
+    expect(lines[0]).toContain("in 10 · out 5 · $0.01");
+    expect(lines[0]).toContain("07:05");
+    expect(lines[0]).not.toContain("not terminal grammar");
     expect(lines[0]).not.toContain("Task(");
     expect(lines[0]).not.toContain(".jsonl");
     expect(lines[0]).not.toContain("foreground answer");
     expect(lines[0]).toContain(RECORD_EXPAND_HINT);
+    const expanded = renderLines(details, "foreground answer", true).join("\n");
+    expect(expanded).toContain(`resumable via SendMessage — agent ${AGENT_ID}`);
+    expect(expanded).not.toContain(`task:`);
+    expect(expanded).not.toContain(`agent: ${AGENT_ID}`);
   });
 
   it("omits task IDs from passive Agent collapsed, expanded, and reference headers", () => {
@@ -3095,7 +3212,7 @@ describe("condensed completion records", () => {
     expect(unknown).not.toContain("\u001b");
   });
 
-  it("collapsed tokens are in/out (+cost) ONLY — cache read/write counts live exclusively in the expanded usage: footer", () => {
+  it("collapsed rows omit all usage while expanded detail retains complete usage", () => {
     const details = {
       ...completedDetails,
       usage: {
@@ -3108,9 +3225,9 @@ describe("condensed completion records", () => {
     };
     const collapsed = renderLines(details, "the answer", false);
     expect(collapsed).toHaveLength(1);
-    expect(collapsed[0]).toContain("in 10");
-    expect(collapsed[0]).toContain("out 5");
-    expect(collapsed[0]).toContain("$0.25");
+    expect(collapsed[0]).not.toContain("in 10");
+    expect(collapsed[0]).not.toContain("out 5");
+    expect(collapsed[0]).not.toContain("$0.25");
     expect(collapsed[0]).not.toContain("cache read");
     expect(collapsed[0]).not.toContain("cache write");
     // At an ordinary 120-column terminal the sole expand cue survives optional metadata.
@@ -3149,43 +3266,11 @@ describe("condensed completion records", () => {
     expect(out).toContain("transcript: /x/sessions/");
     expect(out).toContain("duration: 4m02s");
     expect(out).toContain("usage:");
-    expect(out).toContain(`resumable via SendMessage — agent ${AGENT_ID}`);
+    expect(out).toContain(`task: task-3`);
+    expect(out).toContain(`agent: ${AGENT_ID}`);
+    expect(out).toContain("resumable via SendMessage");
+    expect(out).not.toContain(`SendMessage — agent ${AGENT_ID}`);
     expect(out).not.toContain(RECORD_EXPAND_HINT);
-  });
-
-  it("formats only Date-TimeClip-valid settlement timestamps as local HH:MM", () => {
-    const hhmm = (value: number) => {
-      const date = new Date(value);
-      return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
-    };
-    const valid = [
-      0,
-      -1,
-      new Date(2026, 0, 2, 7, 5).getTime(),
-      new Date(2026, 0, 2, 23, 59).getTime(),
-      -8.64e15,
-      8.64e15,
-    ];
-    for (const settledAt of valid) {
-      const out = renderLines({ ...completedDetails, settledAt }, "answer", false, 300).join("\n");
-      expect(out).toContain(hhmm(settledAt));
-    }
-
-    for (const settledAt of [undefined, Number.NaN, Number.POSITIVE_INFINITY, -8.64e15 - 1, 8.64e15 + 1]) {
-      const details = { ...completedDetails, settledAt };
-      const out = renderLines(details, "answer", false, 300).join("\n");
-      expect(out).not.toMatch(/ · \d{2}:\d{2} · ctrl\+o to expand$/);
-    }
-  });
-
-  it("uses settlement time rather than render time", () => {
-    const settledAt = new Date(2024, 4, 6, 7, 5).getTime();
-    const before = renderLines({ ...completedDetails, settledAt }, "answer", false).join("\n");
-    const now = vi.spyOn(Date, "now").mockReturnValue(new Date(2035, 0, 1, 23, 59).getTime());
-    const later = renderLines({ ...completedDetails, settledAt }, "answer", false).join("\n");
-    now.mockRestore();
-    expect(before).toBe(later);
-    expect(later).toContain("07:05");
   });
 
   it("a structural caller that OMITS the expanded option gets the full record (Pi always passes a boolean)", () => {
@@ -3194,37 +3279,160 @@ describe("condensed completion records", () => {
     expect(out).toContain("transcript:");
   });
 
-  it("reserves lifecycle state, actionable markers, and cues before long summaries and telemetry", () => {
-    const longError = `provider failure ${"x".repeat(400)}`;
-    const diagnostics = [
-      { severity: "warning" as const, source: "hook", message: `degraded ${"y".repeat(300)}` },
+  it("selects terminal segments strictly by semantic priority across width thresholds", () => {
+    const details = {
+      ...completedDetails,
+      outcome: "failed",
+      status: "failed",
+      agent: "reviewer",
+      error: "provider failure evidence",
+      description: "Review authentication boundaries",
+      diagnostics: [{ severity: "warning" as const, source: "hook", message: "degraded runtime" }],
+      durationMs: 123_000,
+    };
+    for (let width = 1; width <= 140; width++) {
+      const lines = renderLines(details, "body", false, width);
+      expect(lines).toHaveLength(1);
+      expect(tuiVisibleWidth(lines[0]!)).toBeLessThanOrEqual(width);
+      expect(lines[0]).not.toContain("task-3");
+    }
+    const markerOnly = renderLines(details, "body", false, 1)[0]!;
+    expect(markerOnly).toBe("✗");
+    const exceptionalBeforeDescription = renderLines(details, "body", false, 58)[0]!;
+    expect(exceptionalBeforeDescription).toContain("[failed]");
+    expect(exceptionalBeforeDescription).toContain("diagnostic");
+    expect(exceptionalBeforeDescription).not.toContain("Review authentication");
+    expect(exceptionalBeforeDescription).not.toContain(RECORD_EXPAND_HINT);
+    expect(exceptionalBeforeDescription).not.toContain("2m03s");
+    const wide = renderLines(details, "body", false, 180)[0]!;
+    expect(wide).toContain("provider failure evidence");
+    expect(wide).toContain("Review authentication boundaries");
+    expect(wide).toContain(RECORD_EXPAND_HINT);
+    expect(wide).toContain("2m03s");
+  });
+
+  it("pins tiny marker/identity thresholds and priority invariants for ASCII, CJK, emoji, and combining text", () => {
+    const identities = [
+      { agent: "coder", direct: ["●", "●c", "● c"] },
+      { agent: "审查", direct: ["●", "●", "●审"] },
+      { agent: "😀bot", direct: ["●", "●", "●😀"] },
+      { agent: "e\u0301ditor", direct: ["●", "●e\u0301", "● e\u0301"] },
     ];
-    const cases = [
-      { outcome: "completed", state: "completed" },
-      { outcome: "failed", status: "failed", error: longError, state: "failed" },
-      { outcome: "aborted", status: "stopped", state: "aborted" },
-      { outcome: "aborted", status: "stopped", userStopped: true, state: "stopped by user" },
-      { outcome: "failed", status: "failed", error: longError, alreadyReported: true, state: "failed", cue: RECORD_REFERENCE_NOTE },
+    for (const { agent, direct } of identities) {
+      for (const [index, expected] of direct.entries()) {
+        expect(renderLines({ ...completedDetails, agent }, "body", false, index + 1)[0]).toBe(expected);
+      }
+      for (let width = 1; width <= 100; width++) {
+        const line = renderLines({ ...completedDetails, agent, description: "description", durationMs: 1_000 }, "body", false, width)[0]!;
+        expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
+        expect(line.startsWith("●")).toBe(true);
+        expect(line).not.toContain("↕");
+        if (line.includes("description")) expect(line).toContain("[completed]");
+        if (line.includes("1s")) expect(line).toMatch(/ctrl\+o/u);
+        expect(line.replace(/^●\s?/u, "")).not.toBe("…");
+      }
+    }
+
+    const wrapped = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
+    const wrappedResult = (agent: string, width: number) => {
+      const context = { state: {}, args: { task_id: "task-3" }, isError: false };
+      wrapped.renderCall(context.args, undefined, context);
+      return (wrapped.renderResult(
+        { content: [{ type: "text", text: "body" }], details: { ...completedDetails, agent }, isError: false },
+        { isPartial: false, expanded: false }, undefined, context,
+      ).render(width) as string[])[0];
+    };
+    expect([1, 2, 3].map((width) => wrappedResult("coder", width))).toEqual(["●", "●c", "● c"]);
+    expect([1, 2, 3, 4].map((width) => wrappedResult("审查", width))).toEqual(["●", "●", "●审", "● 审"]);
+    expect([1, 2, 3, 4].map((width) => wrappedResult("😀bot", width))).toEqual(["●", "●", "●😀", "● 😀"]);
+  });
+
+  it.each([
+    { status: "completed", outcome: "completed", marker: "●" },
+    { status: "failed", outcome: "failed", marker: "✗" },
+    { status: "stopped", outcome: "aborted", marker: "■" },
+  ] as const)("uses the full production width three for wrapped CJK and emoji $status identities", ({ status, outcome, marker }) => {
+    const wrapped = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
+    const render = (agent: string, width: number) => {
+      const context = { state: {}, args: { task_id: "task-3" }, isError: false };
+      wrapped.renderCall(context.args, undefined, context);
+      return (wrapped.renderResult(
+        {
+          content: [{ type: "text", text: "body" }],
+          details: { ...completedDetails, status, outcome, agent },
+          isError: false,
+        },
+        { isPartial: false, expanded: false }, undefined, context,
+      ).render(width) as string[])[0];
+    };
+    expect(render("审查", 3)).toBe(`${marker}审`);
+    expect(render("😀bot", 3)).toBe(`${marker}😀`);
+    expect(render("审查", 4)).toBe(`${marker} 审`);
+    expect(render("😀bot", 4)).toBe(`${marker} 😀`);
+  });
+
+  it.each([
+    { status: "completed", outcome: "completed", marker: "●", state: "completed", exactWidth: 13 },
+    { status: "failed", outcome: "failed", marker: "✗", state: "failed", exactWidth: 10 },
+    { status: "stopped", outcome: "aborted", marker: "■", state: "aborted", exactWidth: 11 },
+  ] as const)("reserves the complete $status state before identity at exact direct and production thresholds", ({ status, outcome, marker, state, exactWidth }) => {
+    const details = { ...completedDetails, status, outcome, agent: "coder" };
+    const exact = renderLines(details, "body", false, exactWidth)[0]!;
+    expect(exact).toBe(`${marker} [${state}]`);
+    expect(renderLines(details, "body", false, exactWidth + 1)[0]).toBe(`${marker} [${state}]`);
+    expect(renderLines(details, "body", false, exactWidth + 2)[0]).toBe(`${marker} c [${state}]`);
+    expect(renderLines(details, "body", false, exactWidth + 6)[0]).toBe(`${marker} coder [${state}]`);
+
+    const wrapped = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
+    const production = (width: number) => {
+      const context = { state: {}, args: { task_id: "task-3" }, isError: false };
+      wrapped.renderCall(context.args, undefined, context);
+      return (wrapped.renderResult(
+        { content: [{ type: "text", text: "body" }], details, isError: false },
+        { isPartial: false, expanded: false }, undefined, context,
+      ).render(width) as string[])[0];
+    };
+    expect(production(exactWidth)).toBe(`${marker} [${state}]`);
+    expect(production(exactWidth + 1)).toBe(`${marker} [${state}]`);
+    expect(production(exactWidth + 2)).toBe(`${marker} c [${state}]`);
+    expect(production(exactWidth + 6)).toBe(`${marker} coder [${state}]`);
+  });
+
+  it("uses only actionable cue transitions and admits duration only after a cue", () => {
+    const details = { ...completedDetails, agent: "a", description: "d", durationMs: 1_000 };
+    const rows = Array.from({ length: 80 }, (_, index) => renderLines(details, "body", false, index + 1)[0]!);
+    const shortAt = rows.findIndex((line) => line.includes("ctrl+o")) + 1;
+    const fullAt = rows.findIndex((line) => line.includes(RECORD_EXPAND_HINT)) + 1;
+    const durationAt = rows.findIndex((line) => line.includes("1s")) + 1;
+    expect(shortAt).toBeGreaterThan(0);
+    expect(fullAt).toBeGreaterThan(shortAt);
+    expect(durationAt).toBeGreaterThanOrEqual(shortAt);
+    expect(rows[shortAt - 2]).not.toMatch(/ctrl\+o|↕/u);
+    expect(rows[shortAt - 1]).toContain("ctrl+o");
+    expect(rows[fullAt - 1]).toContain(RECORD_EXPAND_HINT);
+    expect(rows[durationAt - 1]).toMatch(/1s · ctrl\+o(?: to expand)?/u);
+    const fullWithDurationAt = rows.findIndex((line) => line.includes("1s") && line.includes(RECORD_EXPAND_HINT)) + 1;
+    expect(fullWithDurationAt).toBeGreaterThanOrEqual(fullAt);
+    expect(rows.every((line) => !line.includes("↕"))).toBe(true);
+  });
+
+  it("keeps completed, failed, stopped, diagnostic, and fork records scalar-safe through Unicode width sweeps", () => {
+    const identities = ["ascii-reviewer", "审查员", "agent-😀", "re\u0301viewer"];
+    const scenarios = [
+      { ...completedDetails, outcome: "completed", status: "completed", description: "ASCII description" },
+      { ...completedDetails, outcome: "failed", status: "failed", error: "action required", description: "" },
+      { ...completedDetails, outcome: "aborted", status: "stopped", userStopped: true, description: "停止 😀 e\u0301" },
+      { ...completedDetails, outcome: "completed", status: "completed", diagnostics: [{ severity: "error" as const, message: "诊断 😀 e\u0301" }] },
+      { ...completedDetails, outcome: "completed", status: "completed", diagnostics: [{ severity: "warning" as const, message: `${FORK_DEGRADE_PREFIX} unavailable` }] },
     ];
-    for (const width of [72, 88, 104, 120]) {
-      for (const scenario of cases) {
-        const lines = renderLines({
-          ...completedDetails,
-          ...scenario,
-          agent: "long-project-security-reviewer-identity",
-          diagnostics,
-          durationMs: 123_000,
-          usage: { inputTokens: 99_999, outputTokens: 88_888, costUsd: 123.45 },
-        }, "body", false, width);
-        const text = lines.join("");
-        expect(text).toContain(`[${scenario.state}]`);
-        expect(text).toContain("⚠ diagnostic warning");
-        expect(text).toContain(scenario.cue ?? RECORD_EXPAND_HINT);
-        expect(text).toContain("task-3");
-        for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
-        if (width === 72) {
-          expect(text).not.toContain("in 99999");
-          expect(text).not.toContain("2m03s");
+    for (const agent of identities) {
+      for (const scenario of scenarios) {
+        for (let width = 1; width <= 100; width++) {
+          const lines = renderLines({ ...scenario, agent }, "body", false, width);
+          expect(lines).toHaveLength(1);
+          expect(tuiVisibleWidth(lines[0]!)).toBeLessThanOrEqual(width);
+          expect(lines[0]).not.toMatch(/[\uD800-\uDFFF]/u);
+          expect(lines[0]).not.toContain("\n");
         }
       }
     }
@@ -3315,7 +3523,7 @@ describe("condensed completion records", () => {
     );
     expect(lines).toHaveLength(1);
     const out = lines[0]!;
-    expect(out).toContain("✗ task output task-4 - coder [failed]");
+    expect(out).toContain("✗ coder [failed]");
     expect(out).toContain("connection reset");
     expect(out).toContain("…"); // capped, not the full 200-char error
     expect(out).not.toContain("x".repeat(100));
@@ -3338,7 +3546,7 @@ describe("condensed completion records", () => {
     };
     const collapsed = renderLines(details, "", false);
     expect(collapsed).toHaveLength(1);
-    expect(collapsed[0]).toContain("■ task output task-5 - coder [stopped by user]");
+    expect(collapsed[0]).toContain("■ coder [stopped by user]");
     expect(renderLines(details, "", true).join("\n")).toContain("stopped by user");
     // A plain model stop keeps the "aborted" wording.
     const modelStop = renderLines(
@@ -3350,24 +3558,287 @@ describe("condensed completion records", () => {
     expect(modelStop[0]).not.toContain("stopped by user");
   });
 
-  it("exactly-once: alreadyReported renders ONLY the reference line — collapsed AND expanded, never a second record", () => {
-    const details = { ...completedDetails, alreadyReported: true };
-    for (const expanded of [false, true]) {
-      const lines = renderLines(details, "the answer", expanded);
-      expect(lines).toHaveLength(1);
-      expect(lines[0]).toContain("task output task-3 - coder [completed]");
-      expect(lines[0]).toContain(RECORD_REFERENCE_NOTE);
-      expect(lines[0]).not.toContain(".jsonl");
-      expect(lines[0]).not.toContain("/x/sessions/");
-      expect(lines[0]).not.toContain("the answer");
-      expect(lines[0]).not.toContain(RECORD_EXPAND_HINT);
+  it("admits only complete, non-error, internally consistent already-reported TaskOutput records", () => {
+    const valid = { ...completedDetails, alreadyReported: true };
+    const render = (
+      details: Record<string, unknown>,
+      args: Record<string, unknown> = { task_id: "task-3" },
+      phase: { isPartial?: boolean; isError?: boolean; resultError?: unknown; content?: unknown; envelopeExtra?: boolean } = {},
+    ) => {
+      const tool = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
+      const context = { state: {}, args, isPartial: phase.isPartial === true, isError: phase.isError === true };
+      const call = tool.renderCall(args, undefined, context);
+      const result = tool.renderResult(
+        {
+          content: Object.hasOwn(phase, "content")
+            ? phase.content
+            : [{ type: "text", text: "truthful duplicate evidence" }],
+          details,
+          ...(phase.resultError === undefined ? {} : { isError: phase.resultError }),
+          ...(phase.envelopeExtra ? { future: true } : {}),
+        },
+        { isPartial: phase.isPartial === true, expanded: false }, undefined, context,
+      );
+      return [...call.render(120), ...result.render(120)];
+    };
+    const expectVisibleEvidence = (details: Record<string, unknown>, args?: Record<string, unknown>, phase?: Parameters<typeof render>[2]) => {
+      const lines = render(details, args, phase);
+      expect(lines.join("\n")).toContain("truthful duplicate evidence");
+      return lines;
+    };
+
+    for (const admission of ["admitted", "waiting"] as const) {
+      expect(render({ ...valid, admission })).toEqual([]);
+      expect(render({ ...valid, admission, description: undefined })).toEqual([]);
     }
-    // A missing transcript path has no effect on the compact reference.
-    const { transcriptPath: _tp, ...noPath } = details;
-    const bare = renderLines(noPath, "the answer", false);
-    expect(bare).toHaveLength(1);
-    expect(bare[0]).toContain(RECORD_REFERENCE_NOTE);
-    expect(bare[0]).not.toContain(".jsonl");
+    for (const key of ["taskId", "agent", "agentId", "admission", "status", "outcome", "alreadyReported"] as const) {
+      const missing = { ...valid };
+      delete missing[key];
+      const lines = render(missing);
+      expect(lines.length).toBeGreaterThan(0);
+      if (key !== "alreadyReported") expect(lines.join("\n")).toContain("truthful duplicate evidence");
+    }
+    const pairs = ["completed", "failed", "stopped"].flatMap((status) =>
+      ["completed", "failed", "aborted"].map((outcome) => ({ status, outcome })),
+    );
+    for (const pair of pairs) {
+      const canonical = (pair.status === "completed" && pair.outcome === "completed") ||
+        (pair.status === "failed" && pair.outcome === "failed") ||
+        (pair.status === "stopped" && pair.outcome === "aborted");
+      const details = { ...valid, ...pair };
+      expect(canonical ? render(details) : expectVisibleEvidence(details)).toEqual(canonical ? [] : expect.any(Array));
+    }
+    for (const malformed of [
+      { ...valid, taskId: "task-0" },
+      { ...valid, agentId: "agent-UPPER" },
+      { ...valid, agent: "" },
+      { ...valid, description: 42 },
+      { ...valid, admission: "queued" },
+      { ...valid, error: 42 },
+      { ...valid, userStopped: "yes" },
+      { ...valid, cutOff: "false" },
+      { ...valid, resumable: "yes" },
+      { ...valid, durationMs: "soon" },
+      { ...valid, durationMs: -1 },
+      { ...valid, settledAt: "later" },
+      { ...valid, transcriptPath: 42 },
+      { ...valid, lastActivity: false },
+      { ...valid, diagnostics: {} },
+      { ...valid, diagnostics: [null] },
+      { ...valid, diagnostics: [{ severity: "future", message: "bad" }] },
+      { ...valid, diagnostics: [{ severity: "warning", message: 42 }] },
+      { ...valid, diagnostics: [{ severity: "warning", message: "bad", source: 42 }] },
+      { ...valid, diagnostics: [{ severity: "warning", message: "bad", future: true }] },
+      { ...valid, usage: 42 },
+      { ...valid, usage: {} },
+      { ...valid, usage: { text: "legacy" } },
+      { ...valid, usage: { inputTokens: "ten" } },
+      { ...valid, usage: { inputTokens: -1 } },
+      { ...valid, usage: { inputTokens: 1, future: 2 } },
+      { ...valid, background: false },
+      { ...valid, record: "subagent-completion" },
+      { ...valid, nested: false },
+      { ...valid, finalText: "answer" },
+      { ...valid, live: false },
+      { ...valid, subagentProgress: { activity: "working", tail: [] } },
+      { ...valid, worktreePath: "/tmp/worktree" },
+      { ...valid, note: "note" },
+      { ...valid, delivery: "steer" },
+      { ...valid, resumed: false },
+      { ...valid, future: "field" },
+      { ...valid, error: "contradiction" },
+      { ...valid, userStopped: true },
+      { ...valid, userStopped: false },
+      { ...valid, status: "failed", outcome: "failed", userStopped: true },
+      { ...valid, status: "stopped", outcome: "aborted", error: "runtime abort", userStopped: true },
+    ]) expectVisibleEvidence(malformed);
+    expect(render({ ...valid, alreadyReported: false }).length).toBeGreaterThan(0);
+    expect(render({ ...valid, status: "failed", outcome: "failed", error: "runtime failure" })).toEqual([]);
+    expect(render({ ...valid, status: "stopped", outcome: "aborted", error: "runtime abort" })).toEqual([]);
+    expect(render({ ...valid, status: "stopped", outcome: "aborted", userStopped: true })).toEqual([]);
+    expectVisibleEvidence(valid, { task_id: "task-4" });
+    for (const content of [
+      [],
+      [{ type: "text", text: "" }],
+      [{ type: "image", text: "truthful duplicate evidence" }],
+      [{ type: "text", text: 42 }],
+      [{ type: "text", text: "truthful duplicate evidence", extra: true }],
+      [{ type: "text", text: "truthful duplicate evidence" }, { type: "text", text: "extra" }],
+    ]) expect(render(valid, { task_id: "task-3" }, { content }).length).toBeGreaterThan(0);
+    expectVisibleEvidence(valid, { task_id: "task-3" }, { envelopeExtra: true });
+    expect(expectVisibleEvidence(valid, { task_id: "task-3" }, { isPartial: true }).join("\n")).toContain("○");
+    expect(expectVisibleEvidence(valid, { task_id: "task-3" }, { isError: true }).join("\n")).toContain("✗");
+    expect(expectVisibleEvidence(valid, { task_id: "task-3" }, { resultError: true }).join("\n")).toContain("✗");
+    expectVisibleEvidence(valid, { task_id: "task-3" }, { resultError: "yes" });
+  });
+
+  it("gates first-delivery TaskOutput semantics on the complete producer snapshot", () => {
+    const canonicalDetails = { ...completedDetails, admission: "admitted" };
+    const render = (
+      details: unknown,
+      renderOptions: unknown = { isPartial: false, expanded: false },
+      context: Record<string, unknown> = { state: {}, args: { task_id: "task-3" }, isError: false },
+      envelope: Record<string, unknown> = {},
+    ) => {
+      const tool = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
+      const call = tool.renderCall(context.args ?? {}, undefined, context);
+      const result = tool.renderResult({
+        content: [{ type: "text", text: "first-delivery body evidence" }],
+        details,
+        isError: false,
+        ...envelope,
+      }, renderOptions, undefined, context);
+      return [...call.render(120), ...result.render(120)].join("\n");
+    };
+
+    const canonical = render(structuredClone(canonicalDetails));
+    expect(canonical).toContain("coder [completed]");
+    expect(canonical).not.toContain("first-delivery body evidence");
+    expect(canonical).not.toContain("task output");
+
+    for (const malformed of [
+      { ...canonicalDetails, alreadyReported: false },
+      { ...canonicalDetails, status: "failed", outcome: "completed" },
+      { ...canonicalDetails, status: "stopped", outcome: "completed" },
+      { ...canonicalDetails, error: "contradictory error" },
+      { ...canonicalDetails, userStopped: true },
+      { ...canonicalDetails, usage: { inputTokens: 1, future: 2 } },
+      { ...canonicalDetails, diagnostics: [{ severity: "warning", message: "bad", future: true }] },
+    ]) {
+      const visible = render(malformed);
+      expect(visible).toContain("task output task-3");
+      expect(visible).toContain("first-delivery body evidence");
+      expect(visible).not.toContain("coder [completed]");
+    }
+    expect(render({ ...canonicalDetails, status: "failed", outcome: "completed" })).toMatch(/^✗/u);
+    expect(render({ ...canonicalDetails, status: "stopped", outcome: "completed" })).toMatch(/^■/u);
+    expect(render({ ...canonicalDetails, status: "stopped", outcome: "failed" })).toMatch(/^✗/u);
+    for (const [status, marker] of [["completed", "●"], ["failed", "✗"], ["stopped", "■"]] as const) {
+      const missingOutcome: Record<string, unknown> = { ...canonicalDetails, status };
+      delete missingOutcome.outcome;
+      const visible = render(missingOutcome);
+      expect(visible.startsWith(marker)).toBe(true);
+      expect(visible).toContain("task output task-3");
+      expect(visible).toContain("first-delivery body evidence");
+    }
+    for (const outcome of [undefined, null, 42, "future"]) {
+      const visible = render({ ...canonicalDetails, outcome });
+      expect(visible).toMatch(/^●/u);
+      expect(visible).toContain("task output task-3");
+      expect(visible).toContain("first-delivery body evidence");
+    }
+  });
+
+  it("requires own readable phase/error fields and never invokes lifecycle getters", () => {
+    const accepted = {
+      background: true, taskId: "task-7", agent: "reviewer", agentId: AGENT_ID, admission: "admitted",
+    };
+    const terminal = { ...completedDetails, admission: "admitted" };
+    const wrapped = (name: "Agent" | "TaskOutput") => name === "Agent"
+      ? wrapForSelfShell(createAgentToolDefinition(
+        makeSubagentRuntime([makeAgent()], fakeSdk({ replies: [{ text: "done" }] }).sdk),
+        { depth: 0, name: "Agent" },
+      )) as any
+      : wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
+    const render = (name: "Agent" | "TaskOutput", result: unknown, options: unknown, context: Record<string, unknown>) => {
+      const tool = wrapped(name);
+      const args = name === "Agent" ? { subagent_type: "reviewer" } : { task_id: "task-3" };
+      const call = tool.renderCall(args, undefined, context);
+      const output = tool.renderResult(result, options, undefined, context);
+      return [...call.render(120), ...output.render(120)].join("\n");
+    };
+    const resultFor = (name: "Agent" | "TaskOutput", details: unknown) => ({
+      content: [{ type: "text", text: `${name} visible evidence` }], details, isError: false,
+    });
+
+    for (const name of ["Agent", "TaskOutput"] as const) {
+      const details = name === "Agent" ? accepted : terminal;
+      for (const options of [{}, { isPartial: null }, { isPartial: "false" }]) {
+        expect(render(name, resultFor(name, details), options, { state: {}, isError: false })).toContain("visible evidence");
+      }
+      for (const context of [{ state: {} }, { state: {}, isError: null }, { state: {}, isError: "false" }]) {
+        expect(render(name, resultFor(name, details), { isPartial: false, expanded: false }, context)).toContain("visible evidence");
+      }
+    }
+
+    let getterCalls = 0;
+    const accessor = (value: unknown, key: string) => Object.defineProperty({}, key, {
+      enumerable: true,
+      get() { getterCalls++; return value; },
+    });
+    const hostile = new Proxy({}, { ownKeys() { throw new Error("descriptor hostile"); } });
+    const hostileEnvelope = new Proxy({
+      content: [{ type: "text", text: "hostile envelope evidence" }], details: terminal, isError: false,
+    }, { ownKeys() { throw new Error("descriptor hostile envelope"); } });
+    const inheritedEnvelope = Object.create({
+      content: [{ type: "text", text: "inherited envelope evidence" }], details: terminal,
+    });
+    Object.assign(inheritedEnvelope, { isError: false });
+    const malformedResults: unknown[] = [
+      hostileEnvelope,
+      inheritedEnvelope,
+      Object.defineProperty({ details: terminal, isError: false }, "content", {
+        enumerable: true, get() { getterCalls++; return [{ type: "text", text: "hidden" }]; },
+      }),
+      { content: [Object.defineProperty({ type: "text" }, "text", {
+        enumerable: true, get() { getterCalls++; return "hidden"; },
+      })], details: terminal, isError: false },
+      { content: [{ type: "text", text: "details accessor evidence" }], details: Object.defineProperty({ ...terminal }, "outcome", {
+        enumerable: true, get() { getterCalls++; return "completed"; },
+      }), isError: false },
+      { content: [{ type: "text", text: "diagnostic accessor evidence" }], details: {
+        ...terminal, diagnostics: [Object.defineProperty({ severity: "warning" }, "message", {
+          enumerable: true, get() { getterCalls++; return "hidden"; },
+        })],
+      }, isError: false },
+      { content: [{ type: "text", text: "usage accessor evidence" }], details: {
+        ...terminal, usage: Object.defineProperty({}, "inputTokens", {
+          enumerable: true, get() { getterCalls++; return 1; },
+        }),
+      }, isError: false },
+      { content: [{ type: "text", text: "hostile diagnostics evidence" }], details: {
+        ...terminal, diagnostics: new Proxy([], { ownKeys() { throw new Error("descriptor hostile diagnostics"); } }),
+      }, isError: false },
+      { content: [{ type: "text", text: "hostile usage evidence" }], details: {
+        ...terminal, usage: new Proxy({}, { ownKeys() { throw new Error("descriptor hostile usage"); } }),
+      }, isError: false },
+      { content: [{ type: "text", text: "hostile details evidence" }], details: hostile, isError: false },
+    ];
+    for (const result of malformedResults) {
+      const output = render("TaskOutput", result, { isPartial: false, expanded: false }, {
+        state: {}, args: { task_id: "task-3" }, isError: false,
+      });
+      expect(output.length).toBeGreaterThan(0);
+    }
+    const inherited = Object.create({ taskId: "task-3", status: "completed", outcome: "completed" });
+    Object.assign(inherited, { admission: "admitted", agent: "coder", agentId: AGENT_ID });
+    expect(render("TaskOutput", resultFor("TaskOutput", inherited), { isPartial: false, expanded: false }, {
+      state: {}, args: { task_id: "task-3" }, isError: false,
+    })).toContain("visible evidence");
+    expect(render("Agent", resultFor("Agent", Object.assign(Object.create({ background: true }), {
+      taskId: "task-7", agent: "reviewer", agentId: AGENT_ID, admission: "admitted",
+    })), { isPartial: false, expanded: false }, { state: {}, isError: false })).toContain("visible evidence");
+    expect(render("TaskOutput", resultFor("TaskOutput", terminal), { isPartial: false, expanded: false }, {
+      state: {}, args: accessor("task-3", "task_id"), isError: false,
+    })).toContain("visible evidence");
+    expect(render("TaskOutput", resultFor("TaskOutput", terminal), { isPartial: false, expanded: false }, {
+      state: {}, args: hostile, isError: false,
+    })).toContain("visible evidence");
+    const inheritedArgs = Object.create({ task_id: "task-3" });
+    expect(render("TaskOutput", resultFor("TaskOutput", terminal), { isPartial: false, expanded: false }, {
+      state: {}, args: inheritedArgs, isError: false,
+    })).toContain("visible evidence");
+    expect(getterCalls).toBe(0);
+  });
+
+  it("omits exact ellipsis-only evidence and description thresholds with their separators", () => {
+    const plain = (value: string | undefined) => value?.replace(/\u001b\[[0-9;]*m/gu, "");
+    const success = { ...completedDetails, agent: "a", description: "abc" };
+    expect(plain(renderLines(success, "body", false, 19)[0])).toBe("● a [completed]");
+    expect(plain(renderLines(success, "body", false, 20)[0])).toBe("● a [completed] - a…");
+    const failed = { ...completedDetails, agent: "a", status: "failed", outcome: "failed", error: "boom", description: undefined };
+    expect(plain(renderLines(failed, "body", false, 16)[0])).toBe("✗ a [failed]");
+    expect(plain(renderLines(failed, "body", false, 17)[0])).toBe("✗ a [failed] · b…");
   });
 
   it.each([
@@ -3384,7 +3855,8 @@ describe("condensed completion records", () => {
       undefined,
     ).render(200).join("\n");
     const expanded = renderLines({ ...completedDetails, usage }, "answer", true, 80).join("\n");
-    for (const output of [collapsed, running, expanded]) {
+    expect(collapsed).not.toContain("SAFE RED OVER");
+    for (const output of [running, expanded]) {
       expect(output).toContain("SAFE RED OVER");
       expect(output).not.toContain(ESC);
       expect(output).not.toContain(BEL);
@@ -3491,11 +3963,9 @@ describe("condensed completion records", () => {
     expect(scalarSafe).not.toMatch(/[\uD800-\uDFFF]/u);
   });
 
-  it("keeps compact paths content-inert and bounds primitive-only expanded extraction", () => {
+  it("keeps recognized compact paths content-inert and avoids proxy getters during expanded extraction", () => {
     for (const details of [
-      { background: true, taskId: "task-1", agent: "coder" },
       { taskId: "task-1", status: "running", agent: "coder" },
-      { taskId: "task-1", outcome: "completed", alreadyReported: true, agent: "coder" },
       { taskId: "task-1", outcome: "completed", agent: "coder" },
     ]) {
       let contentReads = 0;
@@ -3528,9 +3998,9 @@ describe("condensed completion records", () => {
       { expanded: true },
       undefined,
     ).render(120).join("\n");
-    expect(expanded).toContain("safe body");
+    expect(expanded).not.toContain("safe body");
     expect(expanded).not.toContain("late sentinel");
-    expect(slots).toBeLessThanOrEqual(256);
+    expect(slots).toBe(0);
 
     const bodyLimit = 1_048_576;
     for (const content of [
@@ -3649,7 +4119,7 @@ describe("condensed completion records", () => {
     expect(out).toBe("coder");
   });
 
-  it("keeps the task-id-less background fallback content-inert", () => {
+  it("keeps task-id-less background-shaped Agent evidence visible", () => {
     let contentReads = 0;
     const result = Object.defineProperty({ details: { background: true } }, "content", {
       get() {
@@ -3661,8 +4131,10 @@ describe("condensed completion records", () => {
       result,
       { isPartial: false, expanded: false },
       undefined,
+      { state: {}, isError: false },
+      { surface: "agent" },
     ).render(80);
-    expect(lines).toEqual(["subagent [background]"]);
+    expect(lines).toEqual(["unrecognized lifecycle result"]);
     expect(contentReads).toBe(0);
   });
 });
@@ -3913,6 +4385,39 @@ describe("self-shell glyph wrapper", () => {
     const coercionTrap = new Proxy({}, { get() { throw new Error("must not coerce"); } });
     expect(setToolRowOutcome({}, coercionTrap as ToolRowOutcome)).toBe(false);
     expect(call(wrapped, {}, { state, isPartial: false }).render(30).map(stripAnsi)).toEqual(["● row"]);
+  });
+
+  it("suppresses only the exact active generation and fails open after throw or invalid construction", () => {
+    const retained: RenderCtx[] = [];
+    const hidden = wrapForSelfShell({
+      name: "Hidden",
+      renderResult: (_value: unknown, _options: unknown, _theme: unknown, ctx: RenderCtx) => {
+        retained.push(ctx);
+        expect(suppressToolRow({ ...ctx })).toBe(false);
+        expect(suppressToolRow(ctx)).toBe(true);
+        return { render: () => ["must stay hidden"] };
+      },
+    });
+    const state = {};
+    const hiddenCall = call(hidden, {}, { state, isPartial: false });
+    const hiddenResult = result(hidden, { content: [{ type: "text", text: "canonical" }] }, { state, isPartial: false });
+    expect(hiddenCall.render(40)).toEqual([]);
+    expect(hiddenResult.render(40)).toEqual([]);
+    expect(suppressToolRow(retained[0])).toBe(false);
+
+    for (const mode of ["throw", "invalid"] as const) {
+      const visible = wrapForSelfShell({
+        name: "Visible",
+        renderResult: (_value: unknown, _options: unknown, _theme: unknown, ctx: RenderCtx) => {
+          expect(suppressToolRow(ctx)).toBe(true);
+          if (mode === "throw") throw new Error("boom");
+          return null;
+        },
+      });
+      const component = result(visible, { content: [{ type: "text", text: "evidence" }] }, { state: {}, isPartial: false });
+      expect(component.render(40).map(stripAnsi)).toEqual(["● evidence"]);
+    }
+    expect(suppressToolRow(new Proxy({}, { get() { throw new Error("hostile"); } }))).toBe(false);
   });
 
   it("keeps interleaved, neighboring-generation, and hostile contexts isolated", () => {

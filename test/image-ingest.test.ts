@@ -2,11 +2,9 @@ import zlib from "node:zlib";
 import { describe, expect, it } from "vitest";
 import {
   BINARY_READ_ERROR,
-  NON_VISION_IMAGE_NOTE,
   SUPPORTED_IMAGE_MIMES,
   isBinaryBuffer,
   modelSupportsImages,
-  nonVisionImageNote,
   sniffImageMime,
   toImageContent,
 } from "../src/runtime/image-ingest.js";
@@ -222,7 +220,7 @@ describe("isBinaryBuffer — byte-based, locale-independent", () => {
   });
 });
 
-describe("modelSupportsImages / nonVisionImageNote", () => {
+describe("modelSupportsImages", () => {
   it("true for a vision model double, false for a non-vision one", () => {
     expect(modelSupportsImages({ input: ["text", "image"] })).toBe(true);
     expect(modelSupportsImages({ input: ["text"] })).toBe(false);
@@ -233,12 +231,6 @@ describe("modelSupportsImages / nonVisionImageNote", () => {
     expect(modelSupportsImages(null)).toBe(false);
     expect(modelSupportsImages({})).toBe(false);
     expect(modelSupportsImages("not-a-model")).toBe(false);
-  });
-
-  it("nonVisionImageNote returns the reproduced Pi wording", () => {
-    expect(nonVisionImageNote()).toBe(NON_VISION_IMAGE_NOTE);
-    expect(nonVisionImageNote({ input: ["text"] })).toBe(NON_VISION_IMAGE_NOTE);
-    expect(NON_VISION_IMAGE_NOTE).toContain("does not support images");
   });
 
   it("BINARY_READ_ERROR is the stable Claude-faithful prefix", () => {

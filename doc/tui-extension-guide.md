@@ -118,10 +118,12 @@ transcript blocks, but the component owns every tool-row line.
 PiCC applies `wrapForSelfShell` to every main-session Claude-named tool and re-registered built-in.
 It strips outer blank lines, clamps native content to `width - 2`, and prefixes exactly one state
 glyph on the first visible line: muted `○` while running, success-themed `●` after meaningful
-success, error-themed `✗` after failure, or `■` for stopped/aborted lifecycle work. Continuation
-lines use two spaces, so wrapped text, diffs, and textual image fallbacks align beneath content. It never calls `theme.bg`;
-main-session invocation rows therefore have no state background. Foreground styling is accepted
-only when it is balanced and safe, and a missing or hostile theme degrades to a plain glyph.
+success, error-themed `✗` after failure, or `■` for stopped/aborted lifecycle work. The narrow
+exception is an exact, branded suppression from a recognized lifecycle renderer: it intentionally
+omits that human row and therefore its glyph. Continuation lines use two spaces, so wrapped text,
+diffs, and textual image fallbacks align beneath content. It never calls `theme.bg`; main-session
+invocation rows therefore have no state background. Foreground styling is accepted only when it is
+balanced and safe, and a missing or hostile theme degrades to a plain glyph.
 
 The construction order is load-bearing: search specialization → routine/Edit rendering →
 `withDefaultCollapsedToolRendering` → `wrapForSelfShell` → the outer checkpoint gate →

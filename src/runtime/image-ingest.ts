@@ -11,16 +11,11 @@ export { modelSupportsImages } from "../util/model.js";
 // seam the notebook renderer, the Read routing, and the model-vision surface
 // build on.
 //
-// Two Pi helpers this feature needs are NOT reachable through the package
-// `exports` map (only `.` and `./rpc-entry` resolve), so they are REPRODUCED
-// here — the same pattern `tool-shell.ts` uses for `getTextOutput`/`ansiRegex`:
-//   - the magic-byte image sniff (`detectSupportedImageMimeType`, dist/utils/mime.js),
-//     reproduced as `sniffImageMime`;
-//   - the non-vision note wording (`getNonVisionImageNote`, dist/core/tools/read.js),
-//     reproduced as `NON_VISION_IMAGE_NOTE`.
-// Both are pinned to Pi's own via a `file://` smoke test (test/image-ingest-pi-contract
-// .test.ts) so a Pi version bump that changes either fails loudly instead of
-// silently diverging.
+// Pi's magic-byte image sniff is not reachable through the package `exports`
+// map, so `sniffImageMime` reproduces it here. Its byte behavior is pinned to
+// Pi's `detectSupportedImageMimeType` by the Pi-contract test. The non-vision
+// explanation is instead stable PiCC behavior, owned behaviorally by Read routing;
+// it is not pinned to a private Pi source file.
 //
 // `resizeImage` and `convertToPng` ARE reachable from the package root and are
 // imported (never reproduced) — the normalization pipeline stays Pi's own.
@@ -53,9 +48,8 @@ export type SupportedImageMime = (typeof SUPPORTED_IMAGE_MIMES)[number];
 export const BINARY_READ_ERROR = "This tool cannot read binary files." as const;
 
 /**
- * The non-vision note wording, reproduced verbatim from Pi's
- * `getNonVisionImageNote` (dist/core/tools/read.js). Pinned by the `file://`
- * contract test so a Pi wording change fails loudly.
+ * Stable PiCC wording for Read's model-visible non-vision degradation. The Read
+ * routing tests own this behavioral contract; it is not private-source parity.
  */
 export const NON_VISION_IMAGE_NOTE =
   "[Current model does not support images. The image will be omitted from this request.]" as const;
@@ -240,9 +234,8 @@ export function isBinaryBuffer(buffer: Buffer): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * The reproduced Pi non-vision note. Returns the wording so callers use it
- * instead of inventing a thinner placeholder. The `model` param is accepted for
- * call-site symmetry; the returned wording is constant.
+ * Returns PiCC's stable non-vision explanation. The `model` parameter is accepted
+ * for call-site symmetry; Read routing owns the model-visible behavior.
  */
 export function nonVisionImageNote(_model?: unknown): string {
   return NON_VISION_IMAGE_NOTE;

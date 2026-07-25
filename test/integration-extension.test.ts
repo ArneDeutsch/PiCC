@@ -158,6 +158,51 @@ describe("tool surface registration", () => {
     }
   });
 
+  it.each([
+    {
+      name: "WebFetch",
+      args: { url: "https://example.test/invoked" },
+      result: {
+        content: [{ type: "text", text: "registered fetch body" }],
+        details: {
+          url: "https://example.test/invoked",
+          finalUrl: "https://redirect.test/final",
+          status: 200,
+          contentType: "text/plain",
+          truncated: false,
+        },
+      },
+      invocation: "https://example.test/invoked",
+      hidden: "registered fetch body",
+    },
+    {
+      name: "WebSearch",
+      args: { query: "registered query" },
+      result: {
+        content: [{ type: "text", text: "registered search title and snippet" }],
+        details: { query: "registered query", backend: "brave", resultCount: 1, truncated: false },
+      },
+      invocation: "registered query",
+      hidden: "registered search title",
+    },
+  ])("compactly renders registered $name without changing canonical payloads", ({ name, args, result, invocation, hidden }) => {
+    const tool = pi.tools.get(name);
+    const argsBefore = structuredClone(args);
+    const resultBefore = structuredClone(result);
+    expect(tool.renderCall(args, undefined, { args }).render(80)).toEqual([]);
+    const lines = tool.renderResult(
+      result,
+      { expanded: false, isPartial: false },
+      undefined,
+      { args, isError: false },
+    ).render(80) as string[];
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(invocation);
+    expect(lines.join("\n")).not.toContain(hidden);
+    expect(args).toEqual(argsBefore);
+    expect(result).toEqual(resultBefore);
+  });
+
   it("installs collapse only on main-session tool definitions", async () => {
     for (const name of ["read", "write", "edit", "MultiEdit", "bash"]) {
       expect(pi.tools.get(name).renderShell, name).toBe("self");
@@ -673,11 +718,12 @@ argument-hint: "<topic>"
     expect(expanded.text).toContain("FS-BG-TASKOUTPUT");
     expect(expanded.text).toContain("run_in_background");
     expect(expanded.text).toContain("TaskOutput");
-    expect(expanded.text).toContain("Passive lifecycle rows emphasize the agent and state, while explicit task actions retain the target ID.");
+    expect(expanded.text).toContain("Waiting/running TaskOutput actions retain that target ID; the first delivered terminal outcome leaves one semantic agent record without it.");
     expect(expanded.text).toContain("shows running status and available metadata; bounded live activity belongs to the subagent panel drill-down.");
     expect(expanded.text).toContain("running poll keeps the task eligible");
     expect(expanded.text).toContain("one bounded next-turn settlement notice");
     expect(expanded.text).toContain("terminal return is already delivery and suppresses");
+    expect(expanded.text).toContain("later retrieval adds no human row");
     expect(expanded.text).toContain("do not call TaskOutput again");
     expect(expanded.text).toContain("Research this topic without blocking: WASM ABI");
     expect(expanded.text).not.toContain("$ARGUMENTS");
@@ -1125,17 +1171,6 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     expect(exitResult.content[0].text).toContain("restored");
   });
 
-  it("two worktrees can coexist (parallel sessions)", async () => {
-    const enter = pi.tools.get("EnterWorktree");
-    const a = await enter.execute("w3", { name: "parallel-a" });
-    const exit = pi.tools.get("ExitWorktree");
-    await exit.execute("w4", { action: "keep" });
-    const b = await enter.execute("w5", { name: "parallel-b" });
-    await exit.execute("w6", { action: "keep" });
-    expect(fs.existsSync(a.details.worktreePath)).toBe(true);
-    expect(fs.existsSync(b.details.worktreePath)).toBe(true);
-  });
-
   it("registered Edit previews and settles against the effective cwd across entry and restoration", async () => {
     const sdk = await import("@earendil-works/pi-coding-agent") as any;
     sdk.initTheme();
@@ -1435,7 +1470,7 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(settlements(p)).toHaveLength(0);
   });
 
-  it("resolves recorded agent color through registered Agent, TaskOutput, and settlement surfaces", async () => {
+  it("hides registered Agent acceptance and resolves recorded color through terminal surfaces", async () => {
     const handle = fakeSdk({ replies: ["COLOR-WIRED-RESULT"] });
     const { p, internals } = await wire();
     internals.subagentRuntime.setSdkForTest(handle.sdk);
@@ -1451,10 +1486,10 @@ describe("background settlement delivery (offline integration via the seam)", ()
     const outputArgs = { task_id: taskId };
     const output = await taskOutput.execute("color-output", outputArgs);
     const agentText = agent.renderResult(
-      started, { expanded: false, isPartial: false }, undefined, { state: {}, args },
+      started, { expanded: false, isPartial: false }, undefined, { state: {}, args, isError: false },
     ).render(100).join("\n");
     const outputText = taskOutput.renderResult(
-      output, { expanded: false, isPartial: false }, undefined, { state: {}, args: outputArgs },
+      output, { expanded: false, isPartial: false }, undefined, { state: {}, args: outputArgs, isError: false },
     ).render(100).join("\n");
     const settlement = p.messageRenderers.get("picc-settlement")!(
       {
@@ -1470,13 +1505,10 @@ describe("background settlement delivery (offline integration via the seam)", ()
       undefined,
     ).render(100).join("\n");
 
-    for (const text of [agentText, outputText, settlement]) {
-      expect(text.match(/\u001b\[31mreviewer\u001b\[39m/gu)).toHaveLength(1);
-      expect(text.replace(/\u001b\[[0-9;]*m/gu, "")).toContain("reviewer");
-      expect(text).not.toMatch(/\u001b\[31m\s*\[(?:background|completed)\]/u);
-    }
-    expect(agentText.replace(/\u001b\[[0-9;]*m/gu, "")).toContain("reviewer [background]");
+    expect(agentText).toBe("");
     for (const text of [outputText, settlement]) {
+      expect(text.match(/\u001b\[31mreviewer\u001b\[39m/gu)).toHaveLength(1);
+      expect(text).not.toMatch(/\u001b\[31m\s*\[completed\]/u);
       expect(text.replace(/\u001b\[[0-9;]*m/gu, "")).toContain("reviewer [completed]");
     }
   });
@@ -1959,6 +1991,8 @@ describe("background settlement delivery (offline integration via the seam)", ()
       undefined,
       agentId,
       "reviewer",
+      undefined,
+      "Review authentication boundaries",
     );
     await internals.backgroundTasks.wait(taskId);
     internals.subagentRegistry.markSettled(agentId);
@@ -1997,20 +2031,31 @@ describe("background settlement delivery (offline integration via the seam)", ()
     expect(top!.details!.record).toBe("subagent-completion");
     expect(typeof top!.details!.settledAt).toBe("number");
     expect(typeof top!.details!.durationMs).toBe("number");
+    expect(top!.details!.description).toBe("Review authentication boundaries");
     expect(top!.content).toContain("settled: completed"); // model-facing text untouched
 
     // The RECORDED registered renderer, driven with the actual sent message at
     // Pi's collapsed default ({ expanded: false }) → the one-line record.
+    const topCanonical = structuredClone(top);
     const component = renderer!(top, { expanded: false }, undefined);
     expect(component, "registered renderer fell back to the default box").toBeTruthy();
     const lines = component.render(200) as string[];
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("reviewer");
-    expect(lines[0]).toContain("[completed]");
+    expect(lines[0]).toContain("[completed] - Review authentication boundaries");
+    expect(lines[0]).toContain(formatElapsed(top!.details!.durationMs as number));
     expect(lines[0]).not.toContain(taskId);
     expect(lines[0]).not.toContain(".jsonl");
     expect(lines[0]).toContain(RECORD_EXPAND_HINT);
     expect(lines[0]).not.toContain("WIRED-RECORD-REPORT"); // body stays behind expand
+    const expandedRecord = renderer!(top, { expanded: true }, undefined)!.render(200).join("\n");
+    expect(expandedRecord).toContain("WIRED-RECORD-REPORT");
+    expect(expandedRecord).toContain(`task: ${taskId}`);
+    expect(expandedRecord).toContain(`agent: ${agentId}`);
+    const reconstructed = structuredClone(top);
+    expect(renderer!(reconstructed, { expanded: false }, undefined)!.render(200)).toEqual(lines);
+    expect(top).toEqual(topCanonical);
+    expect(reconstructed).toEqual(topCanonical);
 
     // Nested settlement: the renderer returns undefined → Pi's default box,
     // no main-chat completion record for depth ≥ 2 tasks.
@@ -2034,17 +2079,18 @@ describe("background settlement delivery (offline integration via the seam)", ()
     }
   });
 
-  it("registered Agent threads a background description through the real TaskOutput wiring", async () => {
+  it("registered Agent acceptance is hidden, first TaskOutput is semantic, and later retrieval is human-hidden", async () => {
     const handle = fakeSdk({ replies: ["BACKGROUND-DONE"] });
     const { p, internals } = await wire();
     internals.subagentRuntime.setSdkForTest(handle.sdk);
     const agent = p.tools.get("Agent");
-    const started = await agent.execute("bg-description", {
+    const agentArgs = {
       subagent_type: "reviewer",
       prompt: "review in background",
       description: "Review authentication",
       run_in_background: true,
-    });
+    };
+    const started = await agent.execute("bg-description", agentArgs);
     expect(started.content).toEqual([
       {
         type: "text",
@@ -2052,12 +2098,51 @@ describe("background settlement delivery (offline integration via the seam)", ()
       },
     ]);
     expect(started.details.description).toBe("Review authentication");
-    await internals.backgroundTasks.wait(String(started.details.taskId));
-    const output = await p.tools.get("TaskOutput").execute("collect-description", {
-      task_id: started.details.taskId,
-    });
+    const startedCanonical = structuredClone({ args: agentArgs, result: started });
+    const agentContext = { state: {}, args: agentArgs, isPartial: false, isError: false };
+    const agentCall = agent.renderCall(agentArgs, undefined, agentContext);
+    const accepted = agent.renderResult(
+      started, { isPartial: false, expanded: false }, undefined, agentContext,
+    );
+    expect(agentCall.render(120)).toEqual([]);
+    expect(accepted.render(120)).toEqual([]);
+    expect({ args: agentArgs, result: started }).toEqual(startedCanonical);
+
+    const taskId = String(started.details.taskId);
+    await internals.backgroundTasks.wait(taskId);
+    const taskOutput = p.tools.get("TaskOutput");
+    const outputArgs = { task_id: taskId };
+    const output = await taskOutput.execute("collect-description", outputArgs);
     expect(output.content[0]!.text).toContain("BACKGROUND-DONE");
     expect(output.details.description).toBe("Review authentication");
+    const outputCanonical = structuredClone({ args: outputArgs, result: output });
+    const outputContext = { state: {}, args: outputArgs, isPartial: false, isError: false };
+    taskOutput.renderCall(outputArgs, undefined, outputContext);
+    const collapsed = taskOutput.renderResult(
+      output, { isPartial: false, expanded: false }, undefined, outputContext,
+    ).render(120).join("\n");
+    const collapsedPlain = collapsed.replace(/\u001b\[[0-9;]*m/gu, "");
+    expect(collapsedPlain).toContain("reviewer [completed] - Review authentication");
+    expect(collapsedPlain).not.toContain("task output");
+    expect(collapsed).not.toContain(taskId);
+    const expanded = taskOutput.renderResult(
+      output, { isPartial: false, expanded: true }, undefined, outputContext,
+    ).render(120).join("\n");
+    expect(expanded).toContain(`task: ${taskId}`);
+    expect(expanded).toContain(`agent: ${started.details.agentId}`);
+    expect({ args: outputArgs, result: output }).toEqual(outputCanonical);
+
+    const duplicate = await taskOutput.execute("collect-description-again", outputArgs);
+    expect(duplicate.details.alreadyReported).toBe(true);
+    const duplicateCanonical = structuredClone(duplicate);
+    const duplicateContext = { state: {}, args: structuredClone(outputArgs), isPartial: false, isError: false };
+    const duplicateCall = taskOutput.renderCall(duplicateContext.args, undefined, duplicateContext);
+    const duplicateResult = taskOutput.renderResult(
+      structuredClone(duplicate), { isPartial: false, expanded: false }, undefined, duplicateContext,
+    );
+    expect(duplicateCall.render(120)).toEqual([]);
+    expect(duplicateResult.render(120)).toEqual([]);
+    expect(duplicate).toEqual(duplicateCanonical);
   });
 
   it("a FOREGROUND completed dispatch carries durationMs; its collapsed record shows a duration segment", async () => {
@@ -2319,8 +2404,6 @@ describe("degradation floor", () => {
 describe("universal tool/worktree stops through production wiring", () => {
   const cases = [
     { event: "PreToolUse", kind: "tool" },
-    { event: "PostToolUse", kind: "tool" },
-    { event: "WorktreeCreate", kind: "create" },
     { event: "WorktreeRemove", kind: "remove" },
   ] as const;
 
@@ -2340,7 +2423,7 @@ describe("universal tool/worktree stops through production wiring", () => {
     settings.env = { ...(settings.env ?? {}), STOP_NODE: process.execPath, STOP_SCRIPT: script };
     settings.hooks = {
       [event]: [{
-        ...(event === "PreToolUse" || event === "PostToolUse" ? { matcher: "TodoWrite" } : {}),
+        ...(event === "PreToolUse" ? { matcher: "TodoWrite" } : {}),
         hooks: [{ type: "command", command: "\"$STOP_NODE\" \"$STOP_SCRIPT\"" }],
       }],
     };
@@ -2364,10 +2447,7 @@ describe("universal tool/worktree stops through production wiring", () => {
 
       let toolName = "TodoWrite";
       let args: Record<string, unknown> = { todos: [] };
-      if (kind === "create") {
-        toolName = "EnterWorktree";
-        args = { name: `stop-create-${Date.now()}` };
-      } else if (kind === "remove") {
+      if (kind === "remove") {
         const entered = await p.tools.get("EnterWorktree").execute("seed", { name: `stop-remove-${Date.now()}` }, undefined, undefined, context);
         toolName = "ExitWorktree";
         args = { action: "remove" };
@@ -2420,7 +2500,7 @@ describe("universal tool/worktree stops through production wiring", () => {
 describe("child worktree stops through the production extension assembly", () => {
   type Internals = Parameters<NonNullable<PiccTestSeam["onWired"]>>[0];
 
-  it.each(["WorktreeCreate", "WorktreeRemove"] as const)(
+  it.each(["WorktreeRemove"] as const)(
     "%s continue:false reaches the child gate and leaves the next dispatch healthy",
     async (event) => {
       const fixture = materializeFixture("full-surface");
@@ -2504,12 +2584,10 @@ describe("child worktree stops through the production extension assembly", () =>
               messages.push({ role: "user", content: text });
               await emit("turn_start", {}, ctx);
               await recordProviderIfAdmitted();
-              const calls = event === "WorktreeCreate"
-                ? [{ id: "enter", name: "EnterWorktree", args: { name: `wired-${event}-${creation}` } }]
-                : [
-                    { id: "enter", name: "EnterWorktree", args: { name: `wired-${event}-${creation}` } },
-                    { id: "exit", name: "ExitWorktree", args: { action: "remove" } },
-                  ];
+              const calls = [
+                { id: "enter", name: "EnterWorktree", args: { name: `wired-${event}-${creation}` } },
+                { id: "exit", name: "ExitWorktree", args: { action: "remove" } },
+              ];
               const assistant = {
                 role: "assistant",
                 stopReason: "toolUse",

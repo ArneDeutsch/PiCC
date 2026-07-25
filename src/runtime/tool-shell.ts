@@ -53,6 +53,8 @@ const OUTCOME_PRESENTATION: Record<ToolRowOutcome, { glyph: string; color: Theme
 interface Generation {
   readonly state?: object;
   outcome: ToolRowOutcome;
+  suppressed: boolean;
+  tightMarker: boolean;
   resultRegistered: boolean;
   callRendered: boolean;
   callClaimed: boolean;
@@ -132,6 +134,8 @@ function freshGeneration(ctx: unknown, state: object | undefined, coordinator?: 
   const generation: Generation = {
     state,
     outcome: ordinaryOutcome(ctx),
+    suppressed: false,
+    tightMarker: false,
     resultRegistered: false,
     callRendered: false,
     callClaimed: false,
@@ -153,7 +157,7 @@ function resultGeneration(ctx: unknown, owner: object): Generation {
   const state = objectKey(safeGet(ctx, "state"));
   const coordinator = coordinatorFor(state, owner);
   const current = coordinator?.current;
-  if (current?.active && !current.callRendered) {
+  if (current?.active && !current.callRendered && !current.resultRegistered) {
     current.resultRegistered = true;
     return current;
   }
@@ -175,6 +179,26 @@ export function setToolRowOutcome(context: unknown, outcome: ToolRowOutcome): bo
   const brand = contextBrands.get(key);
   if (!brand?.active || !brand.generation.active) return false;
   brand.generation.outcome = outcome;
+  return true;
+}
+
+/** Authorize suppression only during trusted synchronous renderer construction; once authorized, it hides this generation's row. */
+export function suppressToolRow(context: unknown): boolean {
+  const key = objectKey(context);
+  if (!key) return false;
+  const brand = contextBrands.get(key);
+  if (!brand?.active || !brand.generation.active) return false;
+  brand.generation.suppressed = true;
+  return true;
+}
+
+/** Let a trusted compact renderer close the marker gap at narrow semantic cutoffs. */
+export function useTightToolRowMarker(context: unknown): boolean {
+  const key = objectKey(context);
+  if (!key) return false;
+  const brand = contextBrands.get(key);
+  if (!brand?.active || !brand.generation.active) return false;
+  brand.generation.tightMarker = true;
   return true;
 }
 
@@ -351,20 +375,30 @@ function constructInner(
   context: RenderCtx,
   generation: Generation,
 ): Component {
+  const ordinary = ordinaryOutcome(context);
+  // A generation may build a call and result before either paints. Each inner
+  // construction starts ordinary so an earlier renderer cannot lend its trusted
+  // disposition to a later renderer in that generation.
+  generation.outcome = ordinary;
+  generation.suppressed = false;
+  generation.tightMarker = false;
   if (!renderer) return fallback();
   const key = objectKey(context);
   const exactState = objectKey(safeGet(context, "state"));
   const brandable = key !== undefined && generation.state !== undefined && exactState === generation.state;
   const brand: ContextBrand = { generation, active: brandable };
   if (brandable && key) contextBrands.set(key, brand);
-  const ordinary = generation.outcome;
   try {
     const component = renderer(context);
     if (objectKey(component) && typeof safeGet(component, "render") === "function") return component;
     generation.outcome = ordinary;
+    generation.suppressed = false;
+    generation.tightMarker = false;
     return fallback();
   } catch {
     generation.outcome = ordinary;
+    generation.suppressed = false;
+    generation.tightMarker = false;
     return fallback();
   } finally {
     brand.active = false;
@@ -385,7 +419,7 @@ function shellComponent(
   const component: Component = {
     render(rawWidth: number): string[] {
       const width = normalizedWidth(rawWidth);
-      if (width === 0) return [];
+      if (width === 0 || generation.suppressed) return [];
 
       if (kind === "call") {
         generation.callRendered = true;
@@ -396,7 +430,16 @@ function shellComponent(
       const sameFrame = generation.outcome !== "running" && reusable !== undefined && reusable.width === width &&
         reusable.outcome === generation.outcome && reusable.continuation === continuation &&
         reusable.registered === generation.resultRegistered && reusable.theme === theme;
-      const lines = visibleLines(inner.render(Math.max(1, width - 2)));
+      let lines = visibleLines(inner.render(Math.max(1, width - 2)));
+      let usesTwoColumnIdentity = false;
+      if (width === 3 && generation.tightMarker && lines.length === 0) {
+        const candidate = visibleLines(inner.render(2));
+        if (candidate.length === 1 && visibleWidth(candidate[0]!) === 2 &&
+          visibleWidth(truncateToWidth(candidate[0]!, 1, "")) === 0) {
+          lines = candidate;
+          usesTwoColumnIdentity = true;
+        }
+      }
 
       let claims = lines.length > 0;
       if (kind === "call" && !claims) {
@@ -413,7 +456,11 @@ function shellComponent(
       const output = continuation
         ? frameContinuation(lines, width)
         : claims
-          ? frameOwned(lines, markerFor(theme, generation.outcome), width)
+          ? generation.tightMarker && (width === 2 || usesTwoColumnIdentity)
+            ? [lines.length > 0
+              ? `${markerFor(theme, generation.outcome)}${truncateToWidth(lines[0]!, width - 1, "")}`
+              : markerFor(theme, generation.outcome)]
+            : frameOwned(lines, markerFor(theme, generation.outcome), width)
           : [];
 
       if (generation.outcome !== "running") {
@@ -522,8 +569,8 @@ export function getTextOutput(result: ResultShape | undefined, showImages: boole
 }
 
 /**
- * Put a tool behind Pi's public self-render shell and add one foreground state glyph to the
- * invocation's first visible textual line. The wrapper preserves every non-rendering field.
+ * Put a tool behind Pi's public self-render shell and foreground-frame visible, non-suppressed
+ * invocation output with its truthful state marker. The wrapper preserves every non-rendering field.
  */
 export function wrapForSelfShell(
   tool: Record<string, unknown>,

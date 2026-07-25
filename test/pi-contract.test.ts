@@ -19,7 +19,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { fakePi } from "./helpers/fake-pi.js";
 import { withCompactSearchRendering } from "../src/runtime/search-tool-render.js";
-import { genericCallComponent, wrapForSelfShell, type RenderCtx } from "../src/runtime/tool-shell.js";
+import {
+  genericCallComponent,
+  setToolRowOutcome,
+  suppressToolRow,
+  wrapForSelfShell,
+  type RenderCtx,
+} from "../src/runtime/tool-shell.js";
 import { codexAbortGuardStreamSimple } from "../src/runtime/codex-abort-guard.js";
 import picc from "../src/index.js";
 import { classifyRequest, createResponseGate, startMockModel, type CapturedRequest } from "./helpers/mock-openai.js";
@@ -1315,6 +1321,33 @@ describe("real Pi lifecycle row ownership", () => {
 
     const semanticLines = (rendered: string) => rendered.split("\n").filter((line) => line.trim());
 
+    const acceptedArgs = {
+      subagent_type: "coder",
+      description: "Review auth",
+      run_in_background: true,
+    };
+    const acceptedResult = {
+      content: [{ type: "text", text: "canonical acceptance" }],
+      details: {
+        background: true,
+        taskId: "task-9",
+        agent: "coder",
+        agentId: "agent-aabbccddeeff",
+        admission: "admitted",
+        description: "Review auth",
+      },
+      isError: false,
+    };
+    const acceptedCanonical = structuredClone(acceptedResult);
+    const accepted = build("Agent", "accepted-row", structuredClone(acceptedArgs));
+    accepted.updateResult(structuredClone(acceptedResult), false);
+    expect(text(accepted)).toBe("");
+    expect(text(accepted, true)).toBe("");
+    expect(acceptedResult).toEqual(acceptedCanonical);
+    const acceptedReconstructed = build("Agent", "accepted-reconstructed", structuredClone(acceptedArgs));
+    acceptedReconstructed.updateResult(structuredClone(acceptedResult), false);
+    expect(text(acceptedReconstructed)).toBe("");
+
     const agent = build("Agent", "agent-row", {
       subagent_type: "coder",
       description: "Review auth",
@@ -1349,6 +1382,7 @@ describe("real Pi lifecycle row ownership", () => {
     );
     const collapsed = text(agent);
     expect(collapsed).toContain("coder [completed]");
+    expect(collapsed).toContain("1s");
     expect(collapsed).toContain("07:05");
     expect(collapsed).not.toContain("Review auth");
     expect(collapsed).not.toContain("final answer");
@@ -1378,17 +1412,57 @@ describe("real Pi lifecycle row ownership", () => {
     expect(taskRunning).not.toContain("awaiting");
     expect(taskRunning).not.toContain("Grep");
     expect(semanticLines(taskRunning)).toHaveLength(1);
-    awaiting.updateResult(
-      {
-        content: [{ type: "text", text: "task answer" }],
-        details: { taskId: "task-1", status: "completed", outcome: "completed", agent: "coder" },
-        isError: false,
+    const terminalResult = {
+      content: [{ type: "text", text: "task answer" }],
+      details: {
+        taskId: "task-1",
+        status: "completed",
+        admission: "admitted",
+        outcome: "completed",
+        agent: "coder",
+        agentId: "agent-aabbccddeeff",
+        description: "Review authentication",
       },
-      false,
-    );
-    expect(text(awaiting)).toContain("task output task-1 - coder [completed]");
-    expect(text(awaiting)).not.toContain("awaiting");
-    expect(semanticLines(text(awaiting))).toHaveLength(1);
+      isError: false,
+    };
+    awaiting.updateResult(structuredClone(terminalResult), false);
+    const firstTerminal = text(awaiting);
+    expect(firstTerminal).toContain("coder [completed] - Review authentication");
+    expect(firstTerminal).not.toContain("task output");
+    expect(firstTerminal).not.toContain("task-1");
+    expect(firstTerminal).not.toContain("awaiting");
+    expect(semanticLines(firstTerminal)).toHaveLength(1);
+    const firstExpanded = text(awaiting, true);
+    expect(firstExpanded).toContain("task: task-1");
+    expect(firstExpanded).toContain("agent: agent-aabbccddeeff");
+    const firstReconstructed = build("TaskOutput", "task-first-reconstructed", { task_id: "task-1" });
+    firstReconstructed.updateResult(structuredClone(terminalResult), false);
+    expect(text(firstReconstructed)).toContain("coder [completed] - Review authentication");
+    expect(text(firstReconstructed, true)).toContain("task: task-1");
+
+    const duplicate = structuredClone({
+      content: [{ type: "text", text: "task answer" }],
+      details: {
+        taskId: "task-1",
+        status: "completed",
+        admission: "admitted",
+        outcome: "completed",
+        agent: "coder",
+        agentId: "agent-aabbccddeeff",
+        description: "Review authentication",
+        alreadyReported: true,
+      },
+      isError: false,
+    });
+    const duplicateCanonical = structuredClone(duplicate);
+    awaiting.updateResult(duplicate, false);
+    expect(text(awaiting)).toBe("");
+    expect(text(awaiting, true)).toBe("");
+    expect(duplicate).toEqual(duplicateCanonical);
+
+    const reconstructed = build("TaskOutput", "task-reconstructed", { task_id: "task-1" });
+    reconstructed.updateResult(structuredClone(duplicateCanonical), false);
+    expect(text(reconstructed)).toBe("");
 
     const failed = build("Agent", "agent-error", { subagent_type: "coder" });
     failed.updateResult(
@@ -1397,6 +1471,104 @@ describe("real Pi lifecycle row ownership", () => {
     );
     expect(text(failed)).toContain("provider failed");
     expect(text(failed)).not.toContain("coder [");
+  });
+
+  it("resets trusted disposition for each pre-paint renderer construction and each result generation", async () => {
+    const { ToolExecutionComponent, initTheme } = (await import("@earendil-works/pi-coding-agent")) as any;
+    initTheme();
+    const ui = { requestRender() {} };
+    const cwd = process.cwd().replace(/\\/g, "/");
+    const renderText = (component: any) => (component.render(100) as string[]).join("\n")
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, "");
+
+    const accepted = {
+      content: [{ type: "text", text: "accepted evidence" }],
+      details: {
+        background: true, taskId: "task-7", agent: "coder", agentId: "agent-aabbccddeeff",
+        admission: "admitted",
+      },
+      isError: false,
+    };
+    const malformed = {
+      content: [{ type: "text", text: "malformed decisive evidence" }],
+      details: { background: true, taskId: "task-7", agent: "coder" },
+      isError: true,
+    };
+    const ordinary = { content: [{ type: "text", text: "ordinary evidence" }], details: {}, isError: false };
+    const agentDefinition = wrapForSelfShell(createAgentToolDefinition({} as SubagentRuntime, { depth: 0 }));
+    const buildAgent = (id: string) => new ToolExecutionComponent(
+      "Agent", id, { subagent_type: "coder" }, {}, agentDefinition, ui, cwd,
+    );
+    const transitions = [
+      [accepted, malformed, "malformed decisive evidence"],
+      [malformed, accepted, ""],
+      [accepted, ordinary, "ordinary evidence"],
+      [ordinary, accepted, ""],
+    ] as const;
+    for (const [index, [first, second, expected]] of transitions.entries()) {
+      const component = buildAgent(`prepaint-${index}`);
+      component.updateResult(structuredClone(first), false);
+      component.updateResult(structuredClone(second), false);
+      const text = renderText(component);
+      if (expected) {
+        expect(text).toContain(expected);
+        expect(text.match(/[○●✗■]/gu)).toHaveLength(1);
+      } else {
+        expect(text).toBe("");
+      }
+    }
+
+    const reported = {
+      content: [{ type: "text", text: "reported evidence" }],
+      details: {
+        taskId: "task-7", status: "completed", admission: "admitted", outcome: "completed",
+        agent: "coder", agentId: "agent-aabbccddeeff", alreadyReported: true,
+      },
+      isError: false,
+    };
+    const malformedReported = {
+      content: [{ type: "text", text: "malformed reported evidence" }],
+      details: { ...reported.details, background: false },
+      isError: false,
+    };
+    const taskDefinition = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry()));
+    const buildTaskOutput = (id: string) => new ToolExecutionComponent(
+      "TaskOutput", id, { task_id: "task-7" }, {}, taskDefinition, ui, cwd,
+    );
+    const taskTransitions = [
+      [reported, malformedReported, "malformed reported evidence"],
+      [malformedReported, reported, ""],
+      [reported, ordinary, "ordinary evidence"],
+      [ordinary, reported, ""],
+    ] as const;
+    for (const [index, [first, second, expected]] of taskTransitions.entries()) {
+      const component = buildTaskOutput(`task-prepaint-${index}`);
+      component.updateResult(structuredClone(first), false);
+      component.updateResult(structuredClone(second), false);
+      const text = renderText(component);
+      if (expected) {
+        expect(text).toContain(expected);
+        expect(text.match(/[○●✗■]/gu)).toHaveLength(1);
+      } else {
+        expect(text).toBe("");
+      }
+    }
+
+    const dispositionProbe = wrapForSelfShell({
+      name: "DispositionProbe",
+      renderCall: (_args: unknown, _theme: unknown, ctx: RenderCtx) => {
+        suppressToolRow(ctx);
+        setToolRowOutcome(ctx, "failure");
+        return { render: () => ["call"] };
+      },
+      renderResult: () => ({ render: () => ["ordinary result"] }),
+    });
+    const probe = new ToolExecutionComponent("DispositionProbe", "probe", {}, {}, dispositionProbe, ui, cwd);
+    probe.updateResult(ordinary, false);
+    const probeText = renderText(probe);
+    expect(probeText).toContain("ordinary result");
+    expect(probeText).toContain("●");
+    expect(probeText).not.toContain("✗");
   });
 
   it("keeps ownership isolated across interleaved calls and a throwing result renderer", async () => {
