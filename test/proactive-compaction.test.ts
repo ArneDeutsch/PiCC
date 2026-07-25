@@ -2,9 +2,9 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import picc, { writeFdFully } from "../src/index.js";
+import picc, { FdWriteReleasedError, writeFdFully } from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
-import { deferred, waitUntil } from "./helpers/async.js";
+import { deferred, settlement, waitUntil } from "./helpers/async.js";
 import {
   MainSessionCheckpointGate,
   MidRunCompactionController,
@@ -48,6 +48,96 @@ describe("public async fd writer", () => {
         callback(Object.assign(new Error("again"), { code: "EWOULDBLOCK" }), 0);
       }), async () => undefined)).rejects.toMatchObject({ code: "EWOULDBLOCK" });
     expect(attempts).toBe(6);
+  });
+
+  it("releases every abortable state through one error identity and never double-settles", async () => {
+    // The identity a caller observes is part of the contract: whatever announces the
+    // ending of a compaction must be able to tell a released write from an OS write
+    // error without matching on prose.
+    const expectReleased = async (promise: Promise<void>, reason: unknown) => {
+      const error = await promise.then(() => undefined, (caught: unknown) => caught);
+      expect(error).toBeInstanceOf(FdWriteReleasedError);
+      expect(error).toMatchObject({ code: "ABORT_ERR", cause: reason });
+    };
+
+    // Abort before the call: no physical write is issued at all.
+    const before = new AbortController();
+    before.abort("replacement");
+    let beforeWrites = 0;
+    const preAborted = writeFdFully(1, Buffer.from("never issued"),
+      (() => { beforeWrites += 1; }), undefined, before.signal);
+    await settlement(preAborted, { description: "a pre-aborted fd write to settle" });
+    await expectReleased(preAborted, "replacement");
+    expect(beforeWrites).toBe(0);
+
+    // Abort while a callback is pending, then deliver that callback late: the caller
+    // is released once, and the late arrival neither double-settles nor throws.
+    const pending = new AbortController();
+    let lateCallback!: (error: NodeJS.ErrnoException | null, written: number) => void;
+    const parked = writeFdFully(1, Buffer.from("parked"), ((_fd, _buffer, _offset, _length, _position, callback) => {
+      lateCallback = callback;
+    }), undefined, pending.signal);
+    await waitUntil({ description: "the parked write to enter", predicate: () => lateCallback !== undefined });
+    pending.abort("user");
+    await settlement(parked, { description: "an aborted pending fd write to settle" });
+    await expectReleased(parked, "user");
+    expect(() => lateCallback(null, 6)).not.toThrow();
+    await expectReleased(parked, "user");
+
+    // Abort mid-loop, after a partial write has already been DELIVERED: the physical
+    // write settles normally on its own callback, so only the loop-top release can
+    // end the caller, and the remaining 13 bytes are never issued. Delivering before
+    // aborting is what makes this case distinct from the pending-callback one above —
+    // abort it first and the listener wins the latch, the loop is never re-entered,
+    // and the guard this case exists for is never reached with a non-zero offset.
+    const midLoop = new AbortController();
+    const issued: number[] = [];
+    const partial = writeFdFully(1, Buffer.from("partial-then-aborted"),
+      ((_fd, _buffer, _offset, length, _position, callback) => {
+        issued.push(length);
+        queueMicrotask(() => {
+          callback(null, 7);
+          midLoop.abort("shutdown");
+        });
+      }), undefined, midLoop.signal);
+    await settlement(partial, { description: "a mid-loop aborted fd write to settle" });
+    await expectReleased(partial, "shutdown");
+    expect(issued).toEqual([20]);
+
+    // Abort during the transient back-off: the retry loop is bounded by the same
+    // loop-top release, through the same identity, and issues nothing further.
+    const transient = new AbortController();
+    const transientWrites: number[] = [];
+    const backoffs: number[] = [];
+    const retrying = writeFdFully(1, Buffer.from("transient-then-aborted"),
+      ((_fd, _buffer, _offset, length, _position, callback) => {
+        transientWrites.push(length);
+        queueMicrotask(() => callback(Object.assign(new Error("busy"), { code: "EAGAIN" }), 0));
+      }), async (delay) => {
+        backoffs.push(delay);
+        transient.abort("task-stop");
+      }, transient.signal);
+    await settlement(retrying, { description: "an fd write aborted during transient back-off to settle" });
+    await expectReleased(retrying, "task-stop");
+    expect(transientWrites).toEqual([22]);
+    expect(backoffs).toEqual([1]);
+
+    // Abort after completion: no effect, no double-settle, and the write still
+    // reports success — a delivered emission stays delivered.
+    const after = new AbortController();
+    const completed: Buffer[] = [];
+    const done = writeFdFully(1, Buffer.from("complete"),
+      ((_fd, buffer, offset, length, _position, callback) => {
+        queueMicrotask(() => {
+          completed.push(Buffer.from(buffer.subarray(offset, offset + length)));
+          callback(null, length);
+        });
+      }), undefined, after.signal);
+    await settlement(done, { description: "a completed fd write to settle" });
+    await expect(done).resolves.toBeUndefined();
+    after.abort("replacement");
+    await expect(done).resolves.toBeUndefined();
+    expect(Buffer.concat(completed).toString("utf8")).toBe("complete");
   });
 });
 
@@ -1624,7 +1714,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     });
 
     const attemptedWrites: string[] = [];
-    let releaseWrite!: () => void;
+    let releaseWrite: (() => void) | undefined;
     const writeEntered = deferred<void>();
     const markerCount = () => pi.messages.filter(
       (entry) => entry.message.customType === "picc-checkpoint-print-result",
@@ -1665,15 +1755,17 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         predicate: () => queuedBranchRead,
       });
 
+      // The revocation this test is about is observable as the replacement completing.
+      // Waiting on the transient `cancelled` phase is not: a stalled write no longer
+      // parks the replacement there, so a poll can miss the phase entirely. The
+      // assertions below still prove the queued emission lost authority before writing.
       const replacement = mainCheckpointGate.startSession("replacement-before-queued-print-write");
-      await waitUntil({
-        description: "queued print authority cancellation",
-        predicate: () => mainCheckpointGate.currentController().snapshot().phase === "cancelled",
-      });
-      releaseWrite();
+      await settlement(replacement, { description: "queued print authority replacement" });
+      await expect(replacement).resolves.toBeUndefined();
       await Promise.all([firstSettlement, queuedSettlement, outer, replacement]);
     } finally {
       writeSpy.mockRestore();
+      releaseWrite?.();
     }
 
     expect(attemptedWrites).toEqual(["tail blocker\n"]);
@@ -1681,6 +1773,120 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(markerCount()).toBe(markersBefore);
     expect(mainCheckpointGate.currentController().snapshot().phase).toBe("idle");
     expect(mainCheckpointGate.currentController().snapshot().admission).toBe("open");
+  });
+
+  it("releases a never-completing resumed print write and leaves the next session's emission clean", async () => {
+    // The whole deadlock chain, end to end: a stdout write whose callback never fires
+    // must not park `agent_settled` inside the print-write chain — that parks the
+    // resume, which parks the cancellation join, which leaves every later
+    // startSession / beforeSessionSwitch on this gate hanging. The write callback is
+    // captured and NEVER invoked here, so the run's own cancellation authority is the
+    // only thing that can release it, and the next session must get its own chain.
+    const stdoutWrites: string[] = [];
+    let strandedCallback: ((error: NodeJS.ErrnoException | null, written: number) => void) | undefined;
+    const strandedWriteEntered = deferred<void>();
+    let strandWrite = true;
+    const originalWrite = fs.write.bind(fs);
+    const writeSpy = vi.spyOn(fs, "write").mockImplementation(((fd: any, data: any, offset: any,
+      length: any, position: any, callback: any) => {
+      if (fd === process.stdout.fd && Buffer.isBuffer(data)) {
+        stdoutWrites.push(data.subarray(offset, offset + length).toString("utf8"));
+        if (strandWrite) {
+          strandedCallback = callback;
+          strandedWriteEntered.resolve();
+          return;
+        }
+        queueMicrotask(() => callback(null, length, data));
+        return;
+      }
+      return originalWrite(fd, data, offset, length, position, callback);
+    }) as typeof fs.write);
+
+    const armResumedPrint = async (id: string, text: string) => {
+      const ctx = pi.printCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: {
+          getBranch: () => [{
+            type: "message",
+            message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" },
+          }],
+        },
+        compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+      });
+      mainCheckpointGate.assistantMessageEnded({
+        role: "assistant", content: [{ type: "toolCall", id, name: "probe", arguments: {} }],
+      });
+      const wrapped: any = mainCheckpointGate.wrapTool({
+        name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+      });
+      const result = await wrapped.execute(id, {}, undefined, undefined, ctx);
+      mainCheckpointGate.toolExecutionEnded({ toolCallId: id, result, isError: false });
+      mainCheckpointGate.turnEnded(ctx);
+      const outer = pi.fire("agent_settled", {}, ctx);
+      await waitUntil({
+        description: `${id} resumed run`,
+        predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming",
+      });
+      return { ctx, outer };
+    };
+    const markerCount = () => pi.messages.filter(
+      (entry) => entry.message.customType === "picc-checkpoint-print-result",
+    ).length;
+
+    try {
+      await mainCheckpointGate.startSession("stranded-print-write");
+      const stranded = await armResumedPrint("stranded", "stranded answer");
+      const strandedSettlement = pi.fire("agent_settled", {}, { ...stranded.ctx });
+      await strandedWriteEntered.promise;
+      const markersBefore = markerCount();
+
+      // Abandon that session through the REGISTERED handler, not the gate method: a
+      // reset that hangs off session_start is invisible to a gate-method assertion.
+      const replacement = pi.fire("session_start", { reason: "new" }, pi.printCtx());
+      await settlement(replacement, {
+        description: "session_start to replace the session owning the stranded write",
+        describeObserved: () => `controller phase: ${mainCheckpointGate.currentController().snapshot().phase}`,
+      });
+      await expect(replacement).resolves.toBeUndefined();
+      await settlement(strandedSettlement, {
+        description: "the stranded resumed print settlement to unwind",
+      });
+      await expect(strandedSettlement).resolves.toBeUndefined();
+      await settlement(stranded.outer, { description: "the stranded run's outer agent_settled to unwind" });
+      await expect(stranded.outer).resolves.toBeUndefined();
+      expect(markerCount()).toBe(markersBefore);
+
+      // A second resumed print emission on the same extension instance, with a
+      // working write, while the first session's write callback is still outstanding.
+      strandWrite = false;
+      const fresh = await armResumedPrint("fresh", "fresh answer");
+      const freshSettlement = pi.fire("agent_settled", {}, { ...fresh.ctx });
+      await settlement(freshSettlement, { description: "the fresh session's resumed print settlement" });
+      await expect(freshSettlement).resolves.toBeUndefined();
+      await settlement(fresh.outer, { description: "the fresh run's outer agent_settled to unwind" });
+      await expect(fresh.outer).resolves.toBeUndefined();
+
+      expect(stdoutWrites).toEqual(["stranded answer\n", "fresh answer\n"]);
+      expect(markerCount()).toBe(markersBefore + 1);
+
+      const switching = pi.fire("session_before_switch", {}, pi.printCtx());
+      await settlement(switching, { description: "session_before_switch after the stranded write" });
+      await expect(switching).resolves.toBeUndefined();
+      const restarting = pi.fire("session_start", { reason: "switch" }, pi.printCtx());
+      await settlement(restarting, { description: "session_start after the stranded write" });
+      await expect(restarting).resolves.toBeUndefined();
+      expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({
+        phase: "idle", admission: "open",
+      });
+    } finally {
+      // Restore the global spy before anything that could throw: a failure here would
+      // otherwise leave `strandWrite` stranding stdout for every later test in the file
+      // and hide whatever actually failed above.
+      writeSpy.mockRestore();
+      strandedCallback?.(Object.assign(new Error("released after the assertions"), { code: "EPIPE" }), 0);
+    }
   });
 
   it("settles a permanent print-write failure without a marker so Pi's native last-assistant printer can run", async () => {

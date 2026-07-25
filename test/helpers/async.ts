@@ -22,6 +22,12 @@ export interface WaitUntilOptions {
   timeoutMs?: number;
 }
 
+export interface SettlementOptions {
+  description: string;
+  describeObserved?: () => string;
+  timeoutMs?: number;
+}
+
 const RETRY_INTERVAL_MS = 10;
 
 /**
@@ -81,5 +87,28 @@ export function waitUntil({
     };
 
     void check();
+  });
+}
+
+/**
+ * Wait for `promise` to reach a terminal state, and report the described state at
+ * `waitUntil`'s safety ceiling when it never gets there. Use it wherever the claim
+ * under test is that something settles *at all* — a bare `await` on a promise that
+ * parks reports only an opaque runner timeout.
+ *
+ * Both arms are armed here, once, on purpose. A rejection is a terminal settlement,
+ * so a single-armed predicate would mislabel a legitimate failure ending as a
+ * predicate error, and would leave the rejection unhandled besides. That also means
+ * this wait says nothing about *which* ending occurred: always assert the outcome as
+ * well (`await expect(promise).resolves…` / `.rejects…`), or a swallowed rejection
+ * passes for success.
+ */
+export function settlement(promise: Promise<unknown>, options: SettlementOptions): Promise<void> {
+  const terminal = promise.then(() => true, () => true);
+  return waitUntil({
+    description: options.description,
+    predicate: () => terminal,
+    describeObserved: options.describeObserved ?? (() => "promise still pending"),
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
   });
 }

@@ -313,19 +313,65 @@ type FdWriter = (
   callback: (error: NodeJS.ErrnoException | null, bytesWritten: number) => void,
 ) => void;
 
+/**
+ * The one identity a caller observes when a run's abort authority releases its fd
+ * write. It is deliberately distinct from every OS write error: a released write
+ * ended because the run was abandoned, not because the fd failed, and callers that
+ * announce the ending need to tell the two apart without matching on prose. `cause`
+ * carries the controller's abort reason, which is either a cancellation kind
+ * (`user` / `task-stop` / `shutdown` / `replacement`) or the post-commit failure
+ * abort, so the announcement can say why.
+ */
+export class FdWriteReleasedError extends Error {
+  readonly code = "ABORT_ERR";
+
+  constructor(reason: unknown) {
+    super("fd write released by run abort", { cause: reason });
+    this.name = "FdWriteReleasedError";
+  }
+}
+
+/**
+ * `signal` is a parameter rather than a caller-side race because only the loop can
+ * stop: a wrapper could stop *waiting* but not stop the next physical write or the
+ * transient-retry loop, and an in-flight OS write cannot be recalled in any case.
+ * Aborting therefore releases the awaiting caller and issues nothing further; bytes
+ * already handed to the OS may still land, which is why the caller treats a released
+ * write as "not delivered" rather than "delivered nothing".
+ */
 export async function writeFdFully(
   fd: number,
   data: Buffer,
   write: FdWriter = fs.write.bind(fs),
   wait: (delayMs: number) => Promise<void> = (delayMs) =>
     new Promise<void>((resolve) => setTimeout(resolve, delayMs)),
+  signal?: AbortSignal,
 ): Promise<void> {
+  // Aliased so the abort wiring below exists only when there is an authority to
+  // release the write, instead of guarding a dead optional chain at every use.
+  const releaseAuthority = signal;
   let offset = 0;
   let transientAttempts = 0;
   while (offset < data.length) {
+    if (releaseAuthority?.aborted) throw new FdWriteReleasedError(releaseAuthority.reason);
     try {
       const bytesWritten = await new Promise<number>((resolve, reject) => {
+        let settled = false;
+        let detachRelease: (() => void) | undefined;
+        if (releaseAuthority) {
+          const release = () => {
+            if (settled) return;
+            settled = true;
+            reject(new FdWriteReleasedError(releaseAuthority.reason));
+          };
+          releaseAuthority.addEventListener("abort", release, { once: true });
+          detachRelease = () => releaseAuthority.removeEventListener("abort", release);
+        }
         write(fd, data, offset, data.length - offset, null, (error, written) => {
+          if (settled) return;
+          settled = true;
+          // A completed write must not leave a listener on a signal that outlives it.
+          detachRelease?.();
           if (error) reject(error);
           else resolve(written);
         });
@@ -493,7 +539,22 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   let checkpointContext: any;
   let checkpointSessionEpoch: object = {};
   let printedResumeToken: ResumeToken | undefined;
-  let printWriteTail: Promise<void> = Promise.resolve();
+  /**
+   * Serializes resumed print emissions **within one session epoch only**. What stops
+   * a stalled write from parking a later emission is the abort release in
+   * `writeFdFully`; keying the chain to the epoch that owns it is a structural
+   * backstop, so the chain cannot outlive the session that built it even if that
+   * release is ever restructured away. `checkpointSessionEpoch` is replaced at both
+   * session boundaries (session_start and an accepted session_before_switch), so the
+   * next session builds a fresh chain rather than queueing behind a dead one.
+   *
+   * The trade this accepts: a released emission returns to its caller while the OS
+   * write it issued may still be in flight, so two writes can be concurrent on fd 1
+   * across a session boundary. Cross-epoch stdout ordering is therefore deliberately
+   * unguaranteed — deadlock-freedom is worth more than ordering between a session
+   * that was abandoned and its successor.
+   */
+  let printWriteChain: { epoch: object; tail: Promise<void> } | undefined;
   interface StopContinuationCapability {
     readonly epoch: object;
     readonly controller: MidRunCompactionController;
@@ -527,6 +588,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     token: ResumeToken;
     epoch: object;
     context: any;
+    /** The run's own cancellation authority, so a resumed emission can be released. */
+    signal: AbortSignal;
     settled: Promise<void>;
     resolveSettled(): void;
     replayCompleted: boolean;
@@ -1313,6 +1376,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         token: resumeContext.token,
         epoch: checkpointSessionEpoch,
         context: ctx,
+        signal: resumeContext.signal,
         settled,
         resolveSettled,
         replayCompleted: false,
@@ -2431,7 +2495,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const emitResumedPrintResult = async (
     ctx: any,
     token: ResumeToken,
+    epoch: object,
     hasAuthority: () => boolean,
+    signal: AbortSignal,
   ): Promise<void> => {
     if (ctx?.mode !== "print" || printedResumeToken === token) return;
     const entries: any[] = ctx.sessionManager?.getBranch?.() ?? ctx.sessionManager?.getEntries?.() ?? [];
@@ -2444,9 +2510,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       : [];
     if (blocks.length === 0) return;
     const data = Buffer.from(blocks.map((part: any) => `${part.text}\n`).join(""), "utf8");
-    const writing = printWriteTail.then(async () => {
+    const chain = printWriteChain?.epoch === epoch
+      ? printWriteChain
+      : { epoch, tail: Promise.resolve() };
+    printWriteChain = chain;
+    const writing = chain.tail.then(async () => {
       if (printedResumeToken === token || !hasAuthority()) return;
-      await writeFdFully(process.stdout.fd, data);
+      await writeFdFully(process.stdout.fd, data, undefined, undefined, signal);
       printedResumeToken = token;
       pi.sendMessage({
         customType: "picc-checkpoint-print-result",
@@ -2454,7 +2524,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         display: false,
       });
     });
-    printWriteTail = writing.catch(() => undefined);
+    chain.tail = writing.catch(() => undefined);
     await writing;
   };
 
@@ -2517,10 +2587,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
             authoritySnapshot.phase === "resuming";
         };
         try {
-          await emitResumedPrintResult(ctx, resume.token, hasPrintAuthority);
+          await emitResumedPrintResult(ctx, resume.token, resume.epoch, hasPrintAuthority, resume.signal);
         } catch {
-          // Leave the assistant entry last: Pi's native print-mode selector can
-          // still emit it once this outer settlement barrier is released.
+          // The ordinary ending for an answer that could not be delivered: a
+          // permanent write error, or a write released by the run's abort authority
+          // (FdWriteReleasedError). Either way the emission is abandoned without a
+          // marker, and the assistant entry is left last: Pi's native
+          // print-mode selector can still emit it once this outer settlement
+          // barrier is released.
         }
         controller.resumedSettled(resume.token);
         resume.resolveSettled();
@@ -3011,6 +3085,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return ctx?.mode === "print" || (!ctx?.hasUI && ctx?.mode !== "json");
   }
 
+  // Deliberately passes no signal: a control command is not run-scoped work and has
+  // no cancellation authority to release it, so it keeps the plain unbounded write.
   async function writeTextControlOutput(output: string, ctx: any): Promise<void> {
     const write = testSeam?.mcpControl?.writeText;
     if (write) await write(output);
