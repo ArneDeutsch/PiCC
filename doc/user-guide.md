@@ -73,6 +73,8 @@ npm link    # may need: sudo npm link — or configure a user-level npm prefix
 
 ### Alternatives to `npm link` (any OS)
 
+- Once PiCC is published, install it globally with `npm install --global picc`. A verified
+  public-registry global install can update itself with `picc update`.
 - Run without installing anything globally — from your target project directory:
   ```powershell
   node <path-to-picc>\bin\picc.mjs
@@ -84,6 +86,37 @@ npm link    # may need: sudo npm link — or configure a user-level npm prefix
   ```json
   { "extensions": ["<path-to-picc>/src/index.ts"] }
   ```
+
+### Check and update PiCC
+
+`picc --version` reports the PiCC version, embedded Pi version and validation mode, and detected
+installation kind. `picc update --check` does not mutate the installation. Healthy global checks,
+including an available-version result, create no persistent recovery files; a failure that prints a
+runnable recovery command creates and retains the npm policy files named by that command. The update
+path depends on who owns the installation:
+
+- **Verified public-registry global npm:** `picc update` installs and validates the complete PiCC
+  product, including its compatible embedded Pi runtime. Exit active sessions first.
+- **Source checkout / `npm link`:** `picc update` only synchronizes ignored dependency state for the
+  currently checked-out revision. It refuses dirty, detached, ambiguous, or in-progress Git state
+  and never adopts newer tracked source. Update tracked source through your reviewed Git workflow,
+  then run `picc update` and `picc update --check`.
+- **Tarball, local package, or unknown ownership:** PiCC refuses automatic mutation. Update or
+  reinstall through the package owner that placed it, then verify with `picc --version`.
+
+Pi is an embedded, coordinated dependency of the `picc` product; do not update that nested Pi
+independently. A direct verified public-registry global `picc` TUI launch may show one bounded
+notification when a newer stable PiCC release exists. It makes one fixed outbound request to
+`https://registry.npmjs.org/picc/latest`; set `PICC_SKIP_UPDATE_CHECK=1` to suppress this advisory or
+`PI_OFFLINE=1` to disable it with other Pi network checks. `/picc-update` repeats fixed,
+installation-aware guidance and never changes the running installation. It is available only when
+the extension recognizes a direct launcher lineage; this bounded check is not an authentication
+claim.
+
+Deliberately hosting PiCC through an external Pi (`pi -e <path-to-picc>/src/index.ts`) leaves update
+ownership with that Pi installation. PiCC does not register `/picc-update` there, and Pi's native
+update behavior remains available. A project skill named `/update` is likewise independent and is
+never shadowed by PiCC.
 
 ## 3. Authenticate (spend your subscription)
 
@@ -287,6 +320,7 @@ to prevent a parent/child deadlock, so total active work can be higher.
 | `/agents` | List every subagent available for dispatch — project/user agents and the built-in `general-purpose`/`Explore`/`Plan` types — with tools, read-only marker, model, and worktree-isolation |
 | `/doctor` | Explicit compatibility report for this project (generated from the capability registry) |
 | `/mcp` | Bounded read-only MCP server status; interactive use is immediate, while one-shot text/JSON waits for servers to connect, initialize, and discover tools or time out. See [MCP server settings](#6-security--permission-posture) |
+| `/picc-update` | In a direct `picc` launch, show fixed installation-aware exit-and-update guidance; never mutates the running installation. External Pi hosting does not register it |
 | `/usage` | Per-subagent token/cost breakdown for this session, plus a subagents total. **Subagent-scoped only** — a PiCC-additive surface, *not* Claude Code's whole-session `/usage`/`/cost`: the Pi extension API exposes no parent-session cost, so the main agent's own spend is not included |
 | `/quota` | Context usage + provider rate-limit/quota headers from the last response (best-effort) |
 | `/model`, `/login`, `/settings` | Pi built-ins: model switching, auth, Pi settings |
@@ -386,6 +420,10 @@ tracked project files):
 
 ### Environment variables
 
+Values in Claude `settings.env` reach project-owned Bash, hooks, skills, and MCP servers. PiCC does
+not apply them to its own startup or worktree Git administration, so settings such as `GIT_DIR`
+cannot redirect those maintenance operations.
+
 | Variable | Effect |
 |---|---|
 | `PICC_CLAUDE_USER_DIR` | Override the user-scope Claude dir (default `~/.claude`) — useful for isolated profiles or CI |
@@ -476,16 +514,18 @@ behaviors worth knowing:
   mangled into a Windows path and the skill won't resolve. Run slash-command-as-argument invocations
   from **PowerShell or cmd**, or just type `/greet Ada` inside the **interactive TUI** (where no
   MSYS mangling applies). Normal interactive use is unaffected.
-- **Long paths & worktrees.** `core.longpaths` is enabled on the repo automatically. Worktree
-  removal is best-effort: a file-lock failure never fails your merge; the orphan is reaped later
-  (`git worktree prune` + a directory sweep on the next session).
+- **Long paths & worktrees.** When trusted Git is available, PiCC attempts to enable
+  `core.longpaths` on the repo. Worktree removal is best-effort: a file-lock failure never fails your
+  merge. A later session
+  retries orphan cleanup only after trusted Git and registered-worktree state are verified; otherwise
+  PiCC leaves managed directories untouched.
 - **Hook payloads** deliver Windows paths with doubled backslashes in JSON, as Claude Code does.
 
 ## 9. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| "could not resolve the Pi CLI" | `npm install` inside the PiCC checkout |
+| `/picc-update` is absent | The extension is hosted by an external Pi or the direct-launch lineage did not agree. Use that installation's owner and `picc --version`; do not send `/picc-update` as model input |
 | Skill shell injection prints `[shell execution disabled: …]` | project set `disableSkillShellExecution`; that's the project's intent |
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |

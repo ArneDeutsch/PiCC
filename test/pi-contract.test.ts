@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,6 +42,11 @@ import {
   BackgroundTaskRegistry,
   createTaskOutputTool,
 } from "../src/runtime/background-tasks.js";
+import {
+  PI_SUITE_PACKAGES,
+  VALIDATION_MODES,
+  validatePiSuite,
+} from "../bin/picc-admin.mjs";
 
 /**
  * Pi upstream contract smoke test: asserts every Pi API PiCC
@@ -104,68 +109,64 @@ describe("mock wire request classification", () => {
   });
 });
 
-describe("pi 0.81.1 API contract", () => {
-  const coordinatedPackages = [
-    "@earendil-works/pi-agent-core",
-    "@earendil-works/pi-ai",
-    "@earendil-works/pi-coding-agent",
-    "@earendil-works/pi-tui",
-  ] as const;
-
-  it("declares and resolves one coordinated Pi 0.81.1 runtime graph", () => {
+describe("pi 0.82.0 API contract", () => {
+  it("declares and resolves the shared strict coherent Pi 0.82.0 graph", () => {
     const root = fileURLToPath(new URL("..", import.meta.url));
     const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
       dependencies: Record<string, string>;
       engines: { node: string };
     };
-    const lock = JSON.parse(readFileSync(join(root, "package-lock.json"), "utf8")) as {
-      packages: Record<string, { version?: string; dependencies?: Record<string, string> }>;
-    };
 
-    for (const name of coordinatedPackages) {
-      expect(manifest.dependencies[name]).toBe("^0.81.1");
-    }
+    expect(Object.fromEntries(PI_SUITE_PACKAGES.map((name) => [name, manifest.dependencies[name]])))
+      .toEqual(Object.fromEntries(PI_SUITE_PACKAGES.map((name) => [name, "0.82.0"])));
     expect(manifest.engines.node).toBe(">=22.19.0");
+    expect(validatePiSuite({ packageRoot: root, ...{ mode: VALIDATION_MODES.STRICT_EXACT } }))
+      .toMatchObject({ ok: true, version: "0.82.0", mode: "strict-exact", source: true });
 
-    const assertInstalledMetadata = (label: string, packageJsonPath: string, name: string) => {
-      const installed = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+    for (const name of PI_SUITE_PACKAGES) {
+      const installed = JSON.parse(readFileSync(join(root, "node_modules", name, "package.json"), "utf8")) as {
         name: string;
         version: string;
         engines?: { node?: string };
       };
-      expect(installed, label).toMatchObject({
+      expect(installed, name).toMatchObject({
         name,
-        version: "0.81.1",
+        version: "0.82.0",
         engines: { node: ">=22.19.0" },
       });
-    };
-    for (const name of coordinatedPackages) {
-      const directPath = `node_modules/${name}`;
-      expect(lock.packages[directPath]?.version, `${name} direct lock`).toBe("0.81.1");
-      assertInstalledMetadata(
-        `${name} direct installed metadata`,
-        join(root, directPath, "package.json"),
-        name,
-      );
     }
+  });
 
-    const coordinatedResolutions = Object.entries(lock.packages).flatMap(([path, entry]) => {
-      const name = coordinatedPackages.find((candidate) => path.endsWith(`node_modules/${candidate}`));
-      return name ? [{ path, entry, name }] : [];
-    });
-    for (const { path, entry, name } of coordinatedResolutions) {
-      expect(entry.version, `${path} lock resolution`).toBe("0.81.1");
-      const packageJsonPath = join(root, path, "package.json");
-      expect(existsSync(packageJsonPath), `${path} exact installed manifest`).toBe(true);
-      assertInstalledMetadata(`${path} installed metadata`, packageJsonPath, name);
+  it("honors Pi's startup checker suppression while an external host without it retains the checker", async () => {
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const distIndex = mainUrl.indexOf("/dist/");
+    expect(distIndex, "unexpected Pi dist layout").toBeGreaterThan(0);
+    const versionCheck: {
+      checkForNewPiVersion(currentVersion: string): Promise<{ version: string } | undefined>;
+    } = await import(`${mainUrl.slice(0, distIndex)}/dist/utils/version-check.js`);
+    const previousFetch = globalThis.fetch;
+    const previousSkip = process.env.PI_SKIP_VERSION_CHECK;
+    let requests = 0;
+    globalThis.fetch = (async () => {
+      requests += 1;
+      return new Response(JSON.stringify({ version: "999.0.0" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      process.env.PI_SKIP_VERSION_CHECK = "1";
+      await expect(versionCheck.checkForNewPiVersion("0.82.0")).resolves.toBeUndefined();
+      expect(requests).toBe(0);
+
+      delete process.env.PI_SKIP_VERSION_CHECK;
+      await expect(versionCheck.checkForNewPiVersion("0.82.0")).resolves.toMatchObject({ version: "999.0.0" });
+      expect(requests).toBe(1);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousSkip === undefined) delete process.env.PI_SKIP_VERSION_CHECK;
+      else process.env.PI_SKIP_VERSION_CHECK = previousSkip;
     }
-
-    const codingAgent = lock.packages["node_modules/@earendil-works/pi-coding-agent"];
-    expect(codingAgent?.dependencies).toMatchObject(Object.fromEntries(
-      coordinatedPackages
-        .filter((name) => name !== "@earendil-works/pi-coding-agent")
-        .map((name) => [name, "^0.81.1"]),
-    ));
   });
 
   it("pins fresh in-memory summarization and provider retry defaults through public getters", () => {

@@ -203,6 +203,14 @@ describe("McpRuntime zero-enabled path", () => {
     await runtime.shutdown();
   });
 
+  it("resolves MCP_TIMEOUT from project settings.env", async () => {
+    const runtime = McpRuntime.start(makeConfig(), makeDeps({
+      settingsEnv: { MCP_TIMEOUT: "1234" },
+    }));
+    expect(runtime.resolvedConnectTimeoutMs).toBe(1_234);
+    await runtime.shutdown();
+  });
+
   it("returns [] from tools() immediately after start with a never-connecting server, and shutdown settles it", async () => {
     const fixture = createMcpProcessFixture(makeTempDir());
     // Default MCP_TIMEOUT (30 s): what settles this test is shutdown(), not the
@@ -353,10 +361,18 @@ describe("McpRuntime stdio lifecycle", () => {
     }
   }, 25_000);
 
-  it("composes config env over the injected Claude vars over inherited env, unicode-safe", async () => {
+  it("composes server env over Claude defaults over project settings over sanitized inheritance", async () => {
     const fixture = createMcpProcessFixture(makeTempDir());
     const projectRoot = makeTempDir();
-    const base: Record<string, string | undefined> = { ...cleanBaseEnv(), MCP_FIXTURE_VAR: "from-base" };
+    const base: Record<string, string | undefined> = {
+      ...cleanBaseEnv(),
+      MCP_FIXTURE_VAR: "from-base",
+      PROJECT_SETTING: "from-inherited-base",
+      PICC_LAUNCHER_PID: "99",
+      PICC_INSTALL_KIND: "source",
+      PICC_VERSION: "1.2.3",
+      PI_SKIP_VERSION_CHECK: "1",
+    };
     // Prove unicodeSafeSubprocessEnv participates: the default only applies
     // when the base does not already set it.
     delete base["PYTHONIOENCODING"];
@@ -368,14 +384,22 @@ describe("McpRuntime stdio lifecycle", () => {
           env: {
             ...fixture.env,
             MCP_FIXTURE_VAR: "from-config",
-            // Claude parity (binary-verified 2.1.218): config `env` is spread
-            // LAST — it wins even over the injected Claude vars.
+            // Claude parity: configured server env is applied last.
             CLAUDECODE: "0",
             CLAUDE_PROJECT_DIR: "/config-wins",
           },
         }),
       ),
-      makeDeps({ projectRoot, sessionId: "env-proof-session", env: base }),
+      makeDeps({
+        projectRoot,
+        sessionId: "env-proof-session",
+        env: base,
+        settingsEnv: {
+          PROJECT_SETTING: "from-project-settings",
+          MCP_FIXTURE_VAR: "from-settings",
+          CLAUDE_CODE_SESSION_ID: "settings-must-lose-to-default",
+        },
+      }),
     );
     try {
       await runtime.whenSettled();
@@ -384,17 +408,26 @@ describe("McpRuntime stdio lifecycle", () => {
         "CLAUDECODE",
         "CLAUDE_CODE_SESSION_ID",
         "MCP_FIXTURE_VAR",
+        "PROJECT_SETTING",
         "PYTHONIOENCODING",
+        "PICC_LAUNCHER_PID",
+        "PICC_INSTALL_KIND",
+        "PICC_VERSION",
+        "PI_SKIP_VERSION_CHECK",
       ];
       const result = await runtime.callTool("fixture", "report-env", { names });
       const reported = JSON.parse(firstText(result)) as Record<string, string | null>;
       expect(reported).toEqual({
         CLAUDE_PROJECT_DIR: "/config-wins",
         CLAUDECODE: "0",
-        // Not set in config env, so the injected value survives.
         CLAUDE_CODE_SESSION_ID: "env-proof-session",
         MCP_FIXTURE_VAR: "from-config",
+        PROJECT_SETTING: "from-project-settings",
         PYTHONIOENCODING: "utf-8",
+        PICC_LAUNCHER_PID: null,
+        PICC_INSTALL_KIND: null,
+        PICC_VERSION: null,
+        PI_SKIP_VERSION_CHECK: null,
       });
     } finally {
       await runtime.shutdown();
@@ -859,18 +892,18 @@ describe("McpRuntime tool-call timeouts", () => {
     }
   }, 25_000);
 
-  it("forwards each resolved timeout policy value to the SDK without elapsed waits", async () => {
+  it("forwards settings.env and per-server timeout precedence to the SDK without elapsed waits", async () => {
     const cases = [
-      { label: "default", env: {}, expected: 100_000_000 },
-      { label: "environment", env: { MCP_TOOL_TIMEOUT: "2500" }, expected: 2_500 },
+      { label: "default", settingsEnv: {}, expected: 100_000_000 },
+      { label: "settings environment", settingsEnv: { MCP_TOOL_TIMEOUT: "2500" }, expected: 2_500 },
       {
         label: "per-server precedence",
-        env: { MCP_TOOL_TIMEOUT: "2500" },
+        settingsEnv: { MCP_TOOL_TIMEOUT: "2500" },
         serverTimeoutMs: 3_500,
         expected: 3_500,
       },
-      { label: "minimum clamp", env: {}, serverTimeoutMs: 1, expected: 1_000 },
-      { label: "maximum clamp", env: {}, serverTimeoutMs: 9_999_999_999, expected: 2_147_483_647 },
+      { label: "minimum clamp", settingsEnv: {}, serverTimeoutMs: 1, expected: 1_000 },
+      { label: "maximum clamp", settingsEnv: {}, serverTimeoutMs: 9_999_999_999, expected: 2_147_483_647 },
     ] as const;
 
     for (const row of cases) {
@@ -883,7 +916,7 @@ describe("McpRuntime tool-call timeouts", () => {
           }),
         ),
         makeDeps({
-          env: { ...cleanBaseEnv(), ...row.env },
+          settingsEnv: row.settingsEnv,
           loadSdk: async () => fakeToolSdk({ forwardedTimeouts }),
         }),
       );
@@ -903,7 +936,7 @@ describe("McpRuntime tool-call timeouts", () => {
     const runtime = McpRuntime.start(
       makeConfig(makeServer({ name: "fake" })),
       makeDeps({
-        env: { ...cleanBaseEnv(), MCP_TOOL_TIMEOUT: "2500" },
+        settingsEnv: { MCP_TOOL_TIMEOUT: "2500" },
         loadSdk: async () => fakeToolSdk({ forwardedTimeouts, callError: timeoutError }),
       }),
     );

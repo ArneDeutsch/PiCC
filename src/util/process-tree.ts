@@ -1,4 +1,11 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { sanitizedSubprocessEnv } from "./env.js";
+
+export function processTreeSpawnEnv(
+  inherited: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return sanitizedSubprocessEnv(inherited);
+}
 
 /**
  * Process-tree kill helpers shared by the hook runner (timed-out hook
@@ -15,6 +22,7 @@ export function killProcessTree(child: ChildProcess): void {
       const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
         stdio: "ignore",
         windowsHide: true,
+        env: processTreeSpawnEnv(),
       });
       killer.on("error", () => {
         try {
@@ -51,6 +59,7 @@ export function killProcessTreeByPid(pid: number): void {
       const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
         stdio: "ignore",
         windowsHide: true,
+        env: processTreeSpawnEnv(),
       });
       killer.on("error", () => {
         try {
@@ -91,6 +100,7 @@ export function listDescendantPids(pid: number): number[] {
       encoding: "utf8",
       timeout: 2_000,
       windowsHide: true,
+      env: processTreeSpawnEnv(),
     });
     if (typeof out.stdout !== "string") return [];
     const childrenOf = new Map<number, number[]>();

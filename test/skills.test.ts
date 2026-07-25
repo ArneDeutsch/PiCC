@@ -735,6 +735,21 @@ describe("shell injection env inheritance", () => {
     }
   });
 
+  it.runIf(hasBash())("strips launcher inheritance while preserving an explicit skill-shell value", async () => {
+    process.env.PICC_LAUNCHER_PID = "99";
+    process.env.PI_SKIP_VERSION_CHECK = "1";
+    try {
+      const { text } = await preprocessShellInjection(
+        'V: !`printf "%s|%s|%s" "$PICC_LAUNCHER_PID" "$PI_SKIP_VERSION_CHECK" "$SKILL_SETTING"`',
+        { ...baseOpts, env: { SKILL_SETTING: "kept" }, shell: "bash" },
+      );
+      expect(text).toBe("V: ||kept");
+    } finally {
+      delete process.env.PICC_LAUNCHER_PID;
+      delete process.env.PI_SKIP_VERSION_CHECK;
+    }
+  });
+
   it.runIf(hasBash())("overlay vars win over inherited process.env", async () => {
     process.env.PICC_TEST_LAYER = "from-process";
     try {

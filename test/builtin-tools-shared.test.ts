@@ -21,6 +21,10 @@ describe("built-in bash spawnHook env matrix (shared factory)", () => {
     INHERITED_ONLY: "keep-me",
     SHARED_KEY: "from-inherited",
     PATH: "/usr/bin",
+    PICC_LAUNCHER_PID: "99",
+    PICC_INSTALL_KIND: "source",
+    PICC_VERSION: "1.2.3",
+    PI_SKIP_VERSION_CHECK: "1",
   };
 
   function spawnEnv() {
@@ -51,6 +55,15 @@ describe("built-in bash spawnHook env matrix (shared factory)", () => {
     expect(env.PATH).toBe("/usr/bin");
   });
 
+  it("strips inherited launcher context while preserving settings", () => {
+    const env = spawnEnv();
+    expect(env.PICC_LAUNCHER_PID).toBeUndefined();
+    expect(env.PICC_INSTALL_KIND).toBeUndefined();
+    expect(env.PICC_VERSION).toBeUndefined();
+    expect(env.PI_SKIP_VERSION_CHECK).toBeUndefined();
+    expect(env.PROJECT_SETTING).toBe("yes");
+  });
+
   it("lets settings win over inherited on a key collision", () => {
     expect(spawnEnv().SHARED_KEY).toBe("from-settings");
   });
@@ -70,8 +83,9 @@ describe("built-in bash spawnHook env matrix (shared factory)", () => {
 });
 
 describe("built-in bash options shellPath pin", () => {
-  it("omits shellPath when none is provided", () => {
+  it("pins no session-environment exposure while omitting an absent shellPath", () => {
     const opts = makeBuiltinBashOptions({ settingsEnv: {}, projectRoot: PROJECT_ROOT });
+    expect(opts.exposeSessionEnvironment).toBe(false);
     expect("shellPath" in opts).toBe(false);
   });
 
@@ -164,11 +178,17 @@ describe("buildStockBuiltinTools structure (main + subagent shared path)", () =>
     expect(typeof read.def.renderResult).toBe("function");
   });
 
-  it("only bash receives the bash options", () => {
+  it("pins the Bash options on both main and subagent factory invocations", () => {
     const { sdk, bashOptions } = fakeSdk();
-    buildStockBuiltinTools(sdk, new CwdState("/base"), { settingsEnv: {}, projectRoot: PROJECT_ROOT });
-    expect(bashOptions.length).toBe(1);
-    expect(bashOptions[0]).toMatchObject({ spawnHook: expect.any(Function) });
+    buildStockBuiltinTools(sdk, new CwdState("/main"), { settingsEnv: {}, projectRoot: PROJECT_ROOT });
+    buildStockBuiltinTools(sdk, new CwdState("/subagent"), { settingsEnv: {}, projectRoot: PROJECT_ROOT });
+    expect(bashOptions).toHaveLength(2);
+    for (const options of bashOptions) {
+      expect(options).toMatchObject({
+        exposeSessionEnvironment: false,
+        spawnHook: expect.any(Function),
+      });
+    }
   });
 
   it("execute rebinds against the LIVE cwd on every call", async () => {

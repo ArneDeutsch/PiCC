@@ -1,9 +1,8 @@
 # PiCC ↔ Pi integration contracts
 
-> **Status:** Contract record for the coordinated Pi 0.81.1 suite
-> (`@earendil-works/pi-agent-core`, `pi-ai`, `pi-coding-agent`, and `pi-tui`). `package.json`
-> declares `^0.81.1`; `package-lock.json` resolves every direct and coding-agent-nested copy to
-> exactly 0.81.1. Installed package metadata declares Node ≥ 22.19.0.
+> **Status:** Contract record for the coordinated Pi 0.82.0 suite. `package.json` pins every direct
+> suite declaration to exactly 0.82.0; strict admission verifies every lockfile and installed
+> occurrence is coherent at that version. Installed package metadata declares Node ≥ 22.19.0.
 > Source of truth for every Pi API PiCC builds on. If Pi churns, update here first.
 >
 > Fork vs. depend: **depend + extension bundle**. Pi is a regular npm dependency;
@@ -19,7 +18,15 @@ PiCC is **one extension bundle** with an entry `src/index.ts` that registers eve
 Launch modes we support:
 - `pi -e <path-to-picc>` in the target project (dev/test).
 - `"extensions": ["<path>"]` in `~/.pi/agent/settings.json` or `.pi/settings.json` (persistent).
-- A `picc` launcher (thin wrapper) that runs Pi with the extension preloaded.
+- A `picc` launcher that owns PiCC administration routing, validates one coherent installed Pi suite, then runs its coding-agent CLI with the extension preloaded. Resolution starts from PiCC's package tree rather than the target cwd: Pi's import-only exports map does not expose `dist/cli.js`, while npm may hoist the package to PiCC's containing `node_modules`.
+
+The launcher sets `PI_SKIP_VERSION_CHECK=1` only for its adjacent embedded-Pi startup and supplies a
+parent-PID/install-kind/PiCC-version tuple. PiCC accepts that tuple only when it matches the direct
+parent and local package metadata: this is a direct-parent lineage check, not authentication. It
+removes the PiCC markers immediately, retains suppression through Pi's startup checker, then removes
+suppression before the first admitted user input or user-Bash command so descendants cannot inherit
+it. An external `pi -e <picc>` host has no launcher tuple; PiCC neither claims update ownership nor
+disables Pi's checker. An externally configured `PI_SKIP_VERSION_CHECK` remains the host's setting.
 
 ## 2. Pi API surface we use (tested baseline)
 
@@ -39,7 +46,7 @@ Launch modes we support:
 | Subagent runtime (fresh context, parallel, per-agent tools/model, verbatim return — see "Verbatim subagent return" in [`architecture.md`](architecture.md)) | SDK: `createAgentSession({ cwd, tools, customTools, resourceLoader, sessionManager, settingsManager, model?, thinkingLevel? })` — the options **PiCC passes**; Pi's own option set is wider. `resourceLoader` is `new DefaultResourceLoader({ cwd, agentDir, systemPromptOverride, agentsFilesOverride, skillsOverride, promptsOverride, extensionFactories })` (`await loader.reload()` before use). Final assistant message read as the last `role: "assistant"` entry of `session.messages`. Per-session `sessionManager` — see "Session managers" below. |
 | Session managers (subagent transcripts) | `SessionManager.create(cwd, sessionDir, { id })` — persisted transcript, the default (Pi names the file `<stamp>_<id>.jsonl`); `SessionManager.open(path, sessionDir, cwd)` — reopen the same file to resume and append; `SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id })` — read a source transcript and write a **brand-new** file, so a `subagent_type: "fork"` child inherits the parent conversation without touching the parent's history; `SessionManager.inMemory(cwd)` — the non-resumable fallback when no transcript is available (no main-session file, a failed `create`, or an SDK without persisted sessions). Settings: `SettingsManager.inMemory(settings)`. |
 | Model/effort control | `pi.setModel(model)`, `ctx.modelRegistry.find(provider,id)`, `pi.setThinkingLevel("off"…"max")` — Claude `effort` maps onto thinking levels |
-| Env & exec | `pi.exec(cmd, args, { signal, timeout })` for git/hook commands; hooks additionally need shell execution via `node:child_process` (stdin JSON contract Pi's exec doesn't cover: we use `spawn` directly) |
+| Env & exec | PiCC-owned startup/worktree Git administration uses `node:child_process.execFile` with sanitized inherited environment because Pi 0.82's `pi.exec` options do not accept `env`; hooks use `spawn` for their shell/stdin JSON contract. Pi 0.82 Bash factories default to exposing `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`; PiCC passes `exposeSessionEnvironment:false`, then overlays sanitized `setting.env` and the required project-root `CLAUDE_PROJECT_DIR`. |
 | Quota | `ctx.getContextUsage()`; subscription quota via provider headers on `after_provider_response` (rate-limit headers) + `/login`-stored auth; degrade gracefully if absent |
 | Control output, checkpoint records, and status notifications | `ctx.ui.notify` for TUI status; `pi.appendEntry` records entries across modes, while `pi.registerEntryRenderer` supplies their TUI presentation. Raw control text is written only in text print mode; JSON and RPC remain protocol-safe entry streams |
 | Subagent status panel, drill-down & condensed settlement records (interactive TUI only) | `ctx.ui.setWidget(key, factory, { placement: "belowEditor" })` — factory invoked synchronously, replaced/removed components disposed; `ctx.ui.custom(factory)` — focused component, Pi saves/restores the editor draft around it; `pi.registerShortcut(keyId, { description, handler })` — dispatches only while the default editor has focus; `ctx.ui.onTerminalInput` — raw listeners run BEFORE the focused component, so PiCC's fork-Esc watcher yields a lone Esc while the panel is open; `pi.registerMessageRenderer(customType, renderer)` + `pi.sendMessage(…, details)` — rendered by Pi's `CustomMessageComponent` with a boolean `expanded` (Ctrl+O toggle); `undefined`/throw falls back to Pi's default box. Mode gating is on `ctx.mode === "tui"`, never `hasUI`: print's `noOpUIContext` implements the full ui interface with `hasUI` false, while RPC flips `hasUI` true. |
@@ -152,21 +159,21 @@ Pi's native summary retry callbacks and child `summarization_retry_scheduled`,
 `summarization_retry_attempt_start`, and `summarization_retry_finished` events are observability
 seams. Child progress exposes only bounded category/attempt activity and never raw provider
 `errorMessage`; main retry presentation and native JSON/RPC compaction errors remain Pi-owned and
-may contain provider diagnostics outside PiCC's transcript/lifecycle records. Pi 0.81.1 continues
+may contain provider diagnostics outside PiCC's transcript/lifecycle records. Pi 0.82.0 continues
 to emit a native physical `agent_end` for the intentionally stopped pre-compaction run; extensions
 cannot suppress or correlate it. Pi's overflow recovery remains a separate Pi-owned transaction,
 and `compaction.reserveTokens` remains a settings-file boundary.
 
 ### 3.6 What stays Pi-native
 Auth (`/login` ChatGPT/Codex OAuth), provider abstraction, retry, session persistence/tree,
-TUI, `/model`, project trust. Pi 0.81.1's auth/model/catalog internals and base-prompt date removal
+TUI, `/model`, project trust. Pi 0.82.0's auth/model/catalog internals and base-prompt date removal
 are inherited behavior, not PiCC compatibility features. PiCC keeps complete eager tool sets and does
 not adopt deferred tool activation. We do not reimplement these Pi-native surfaces.
 
 ## 4. Risks / churn watchpoints
-- Pre-1.0 API churn: the manifest keeps the coordinated `^0.81.1` policy while the lockfile is the
-  exact resolution boundary; this doc + a smoke test (`test/pi-contract.test.ts`) asserts the
-  imports/exports we rely on exist.
+- Pre-1.0 API churn: the manifest pins the complete coordinated suite exactly, while shared strict
+  graph admission checks every lockfile and installed occurrence; this doc + the version-sensitive
+  smoke probes in `test/pi-contract.test.ts` assert the imports/exports and behavior PiCC relies on.
 - `before_agent_start` system-prompt chaining: other extensions may also modify; we append, not replace.
 - Mid-run checkpoint watchpoints: `turn_end` must remain after all sibling tool results; `terminate`
   must retain the all-results rule; `ctx.abort()` must stop before another ordinary provider request;

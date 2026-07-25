@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { Diagnostic } from "../types.js";
-import { unicodeSafeSubprocessEnv } from "../util/env.js";
+import { sanitizedSubprocessEnv, unicodeSafeSubprocessEnv } from "../util/env.js";
 
 /**
  * Dynamic context injection for skill bodies:
@@ -271,8 +271,8 @@ function runCommand(cmd: string, opts: ShellInjectionOptions): Promise<RunResult
         args,
         {
           cwd: opts.cwd,
-          // Inherit the full harness env; opts.env is only the Claude overlay.
-          env: unicodeSafeSubprocessEnv({ ...process.env, ...opts.env }),
+          // Explicit Claude/settings values win after launcher-only inheritance is stripped.
+          env: unicodeSafeSubprocessEnv(sanitizedSubprocessEnv(process.env, opts.env)),
           timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
           maxBuffer: MAX_OUTPUT_BYTES,
           windowsHide: true,

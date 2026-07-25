@@ -88,7 +88,19 @@ import { loadSkillBody, substituteToolRules, substituteVariables } from "./claud
 import { resolveGitBashPath, shellNamespaceDiffersFromNative } from "./engine/shell-inject.js";
 import { McpRuntime } from "./runtime/mcp.js";
 import { buildMcpProxyTools } from "./runtime/mcp-tools.js";
-import { applyUnicodeSafeProcessEnv, computeSessionScratchDir } from "./util/env.js";
+import {
+  capturePiccLaunchContext,
+  checkForNewerPiccRelease,
+  createPiccReleaseAdvisory,
+  piccUpdateGuidance,
+} from "./runtime/picc-update.js";
+import {
+  applyUnicodeSafeProcessEnv,
+  clearPiStartupSuppression,
+  computeSessionScratchDir,
+  sanitizedExecFile,
+  sanitizedSubprocessEnv,
+} from "./util/env.js";
 import type { ClaudeAgent, ClaudeSkill } from "./types.js";
 
 /**
@@ -282,6 +294,12 @@ export interface PiccTestSeam {
   managedSettingsPaths?: string[];
   /** TEST-ONLY managed artifact directories passed directly to project loading. */
   managedArtifactDirs?: string[];
+  /** TEST-ONLY bounded replacement for detached built-in SDK loading. */
+  loadBuiltinSdk?: () => Promise<any>;
+  /** TEST-ONLY bounded replacement for the public-registry advisory request. */
+  checkPiccRelease?: typeof checkForNewerPiccRelease;
+  /** TEST-ONLY in-process override for trusted-Git unavailability. */
+  resolveTrustedGit?: () => Promise<string | undefined>;
 }
 
 const codexProviderRegistries = new WeakSet<object>();
@@ -324,6 +342,40 @@ export async function writeFdFully(
 }
 
 export default function picc(pi: any, testSeam?: PiccTestSeam) {
+  // Capture once before project loading can spawn or inspect anything. PICC_* is
+  // removed inside this call; PI_SKIP_VERSION_CHECK remains only for Pi's
+  // adjacent interactive startup work and is cleared at first user admission.
+  const launchContext = capturePiccLaunchContext();
+  let trustedGitPromise: Promise<string | undefined> | undefined;
+  const resolveTrustedGit = (): Promise<string | undefined> => {
+    trustedGitPromise ??= Promise.resolve()
+      .then(async () => {
+        if (testSeam?.resolveTrustedGit) return await testSeam.resolveTrustedGit();
+        const adminModule: unknown = await import(new URL("../bin/picc-admin.mjs", import.meta.url).href);
+        const capability = (adminModule as { discoverTrustedGit?: unknown }).discoverTrustedGit;
+        if (typeof capability !== "function") return undefined;
+        const discovered: unknown = capability();
+        return typeof discovered === "string" ? discovered : undefined;
+      })
+      .catch(() => undefined);
+    return trustedGitPromise;
+  };
+  const releaseAdvisory = createPiccReleaseAdvisory({
+    context: launchContext,
+    ...(testSeam?.checkPiccRelease ? { check: testSeam.checkPiccRelease } : {}),
+  });
+  let startupSuppressionCleared = false;
+  const clearStartupSuppression = (): void => {
+    if (startupSuppressionCleared || !launchContext.direct) return;
+    startupSuppressionCleared = true;
+    clearPiStartupSuppression();
+  };
+  // Admission cleanup cannot depend on the later optional SDK import. Register
+  // it synchronously even when built-in replacement setup degrades or stalls.
+  pi.on("user_bash", () => {
+    clearStartupSuppression();
+  });
+
   // UTF-8 stdio for any child process (fixes Windows cp1252 UnicodeEncodeError,
   // e.g. Python printing `→`). Set before any subprocess can be spawned.
   applyUnicodeSafeProcessEnv();
@@ -407,6 +459,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     projectRoot: project.root,
     settings: project.settings.worktree,
     cleanupPeriodDays: project.settings.cleanupPeriodDays,
+    // Worktree setup/reaping can run before first input, so sanitize inherited
+    // launcher context without admitting project-controlled environment policy.
+    // Only the manager's expected command may cross this administration seam.
+    exec: async (cmd, args, opts) => {
+      const trustedGit = cmd === "git" ? await resolveTrustedGit() : undefined;
+      if (!trustedGit) {
+        return { stdout: "", stderr: "Trusted Git is unavailable", code: 1 };
+      }
+      return await sanitizedExecFile(trustedGit, args, opts);
+    },
   });
   // Reap orphaned worktree dirs from crashed sessions — fire-and-forget.
   const orphanReaping = worktrees.reapOrphans().catch(() => undefined);
@@ -864,6 +926,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const mcpRuntime = McpRuntime.start(project.mcp, {
     projectRoot: project.root,
     sessionId,
+    env: process.env,
+    settingsEnv: project.settings.env,
   });
 
   function allKnownToolNames(): string[] {
@@ -1586,7 +1650,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // built-in registration settlement via onInitializationSettled.
   const builtInRegistration = (async () => {
     try {
-      const sdk: any = await import("@earendil-works/pi-coding-agent");
+      const sdk: any = await (testSeam?.loadBuiltinSdk?.() ?? import("@earendil-works/pi-coding-agent"));
       // Pin the shell to real Git Bash on Windows — Pi's default `bash` lookup can
       // land on the System32 WSL stub (WSL_E_DEFAULT_DISTRO_NOT_FOUND without a distro).
       const shellPath = resolveGitBashPath();
@@ -1621,7 +1685,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
         ));
       }
-      // `!` user-bash commands also get the pinned Git Bash (and the effective cwd).
+      // The optional operations replacement only pins the local shell. The
+      // synchronous admission handler above is the sole cleanup owner.
       if (shellPath && typeof sdk.createLocalBashOperations === "function") {
         pi.on("user_bash", () => ({
           operations: sdk.createLocalBashOperations({ shellPath }),
@@ -1888,9 +1953,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // but a clone installed with --ignore-scripts never ran the `prepare` that
       // sets core.hooksPath. (Worktrees inherit it from the shared config.)
       if (fs.existsSync(path.join(project.root, ".githooks"))) {
-        const current = await pi.exec("git", ["config", "core.hooksPath"], {}).catch(() => ({ stdout: "" }));
-        if (!String(current.stdout ?? "").trim()) {
-          await pi.exec("git", ["config", "core.hooksPath", ".githooks"], {}).catch(() => undefined);
+        const trustedGit = await resolveTrustedGit();
+        if (trustedGit) {
+          const current = await sanitizedExecFile(trustedGit, ["config", "core.hooksPath"], {
+            cwd: project.root,
+          }).catch(() => ({ stdout: "" }));
+          if (!String(current.stdout ?? "").trim()) {
+            await sanitizedExecFile(trustedGit, ["config", "core.hooksPath", ".githooks"], {
+              cwd: project.root,
+            }).catch(() => undefined);
+          }
         }
       }
       const sessionStartSource = event.reason === "new"
@@ -1928,6 +2000,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       if (event.reason === "startup" && compat.mcpPendingNotice) {
         if (ctx.hasUI) ctx.ui?.notify?.(compat.mcpPendingNotice, "warning");
         else console.error(`PiCC: ${compat.mcpPendingNotice}`);
+      }
+      // Advisory only: TUI + direct verified registry launch. The detached,
+      // bounded checker never delays session_start or emits machine-mode output.
+      if (event.reason === "startup" && ctx.mode === "tui") {
+        releaseAdvisory.start((message) => {
+          try { ctx.ui?.notify?.(message, "info"); } catch { /* advisory only */ }
+        });
       }
     } catch (err) {
       console.error(`PiCC session_start failed: ${(err as Error).message}`);
@@ -1986,6 +2065,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
 
   pi.on("input", async (event: any, ctx: any) => {
     try {
+      // Extension continuations are internal. Every other admitted input is a
+      // user boundary and clears the retained Pi startup flag before processing.
+      if (event.source !== "extension") clearStartupSuppression();
       if (mainCheckpointGate.authorizeReplay(event)) return { action: "continue" };
       const stopCapability = stopContinuationAdmission.getStore();
       if (stopCapability) {
@@ -2890,6 +2972,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       },
     }],
   ]);
+  if (launchContext.direct) {
+    controlCommands.set("picc-update", {
+      description: "PiCC: show non-mutating product update guidance",
+      render: async () => piccUpdateGuidance(launchContext),
+    });
+  }
 
   const piBuiltinNames = new Set([
     "changelog", "clone", "compact", "copy", "export", "fork", "hotkeys", "import",
@@ -2962,6 +3050,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   }
 
   async function handleControlCommand(name: string, args: string, ctx: any): Promise<void> {
+    clearStartupSuppression();
     const command = controlCommands.get(name);
     if (!command) return;
     try {

@@ -233,7 +233,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     { id: "setting.enableAllProjectMcpServers", tier: "partial", core: [/blanket approval/, /current and future project server/, /NOT a shortcut for a large pending set/], gap: [/replacing Claude Code's interactive trust dialog/], precedence: [/Nearest-honored-scope-wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/PiCC's settings gate/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.enabledMcpjsonServers", tier: "partial", core: [/per-server approval list/, /user-authored scopes/, /outside ASCII letters, digits/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/accumulate-and-dedupe of the lists across settings files remains PiCC-inferred/], precedence: [/Approval from ANY honored scope wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/Claude parity, binary-verified/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.disabledMcpjsonServers", tier: "full", core: [/per-server decline list/, /honored from EVERY scope/, /outside ASCII letters, digits/], precedence: [/always wins over enableAllProjectMcpServers and enabledMcpjsonServers/], visibility: [/declined server raises no expansion warnings/], parity: [/binary-corroborated/, /accumulate-and-dedupe across settings files remains PiCC-inferred/] },
-    { id: "feature.mcp", tier: "partial", core: [/stdio MCP servers run for real/, /die with the session/, /CLAUDE_PROJECT_DIR/, /CLAUDECODE=1/, /CLAUDE_CODE_SESSION_ID/], gap: [/PARTIAL: stdio transport only/], precedence: [/config env winning over the injected vars/], visibility: [/NOT reported to the model/, /surface in \/mcp/, /\/doctor/, /stderr/, /no server both configured and enabled/, /NO MCP context of any kind/], parity: [/binary-verified Claude parity/, /PROJECT ROOT/, /main checkout/, /EFFECTIVE parity/, /Claude passes no cwd/], split: [/feature\.mcp-tool-search/, /feature\.mcp-\*/] },
+    { id: "feature.mcp", tier: "partial", core: [/stdio MCP servers run for real/, /die with the session/, /CLAUDE_PROJECT_DIR/, /CLAUDECODE=1/, /CLAUDE_CODE_SESSION_ID/], gap: [/PARTIAL: stdio transport only/], precedence: [/launcher-only markers are removed/, /then receive project settings.env, then Claude defaults, then configured server env last/, /deliberate server overrides of CLAUDE_PROJECT_DIR, CLAUDECODE, CLAUDE_CODE_SESSION_ID, or a removed launcher key/], visibility: [/NOT reported to the model/, /surface in \/mcp/, /\/doctor/, /stderr/, /no server both configured and enabled/, /NO MCP context of any kind/], parity: [/binary-verified Claude parity/, /PROJECT ROOT/, /main checkout/, /EFFECTIVE parity/, /Claude passes no cwd/, /config-last parity/], split: [/feature\.mcp-tool-search/, /feature\.mcp-\*/] },
     { id: "feature.mcp-project-approval", tier: "partial", core: [/enablement gate/, /disabled by default/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/not Claude Code's interactive trust dialog/], precedence: [/disabledMcpjsonServers always rejecting/], visibility: [/session-start notice/, /\/mcp/, /\/doctor/], parity: [/SETTINGS GATE/, /PiCC has no approval prompt/], split: [/enableAllProjectMcpServers/, /enabledMcpjsonServers/] },
     { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only \/mcp status/, /32 detailed rows/], gap: [/rather than Claude Code's interactive management UI or individual-tool view/], precedence: [/Interactive and RPC use an immediate live snapshot/, /one-shot text and JSON await/], visibility: [/never enters model context/], parity: [/Claude Code 2\.1\.205\+/, /PiCC-defined/] },
     { id: "feature.mcp-remote-transports", tier: "not-supported", core: [/remote MCP transports/, /HTTP/, /streamable-HTTP/, /SSE/, /WebSocket/, /url-based entry/], gap: [/stdio only currently/], visibility: [/remote server entry is skipped/, /\/mcp shows a safe skipped state/, /per-server diagnostic/, /compat report/, /\/doctor/] },
@@ -503,13 +503,25 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     }
   });
 
-  it("settings honored by real consumers stay full", () => {
+  it("settings tiers match their production consumers", () => {
     for (const id of [
       "setting.skillOverrides",
       "setting.enabledPlugins",
     ]) {
       expect(lookupCapability(id)?.tier, id).toBe("full");
     }
+    const env = lookupCapability("setting.env");
+    expect(env?.tier).toBe("partial");
+    expect(env?.note).toContain("main/subagent Bash, hooks, skills, and MCP");
+    expect(env?.note).toContain("excluded from PiCC-owned startup and worktree Git administration");
+    expect(env?.note).toContain("cannot redirect it");
+    expect(env?.note).toContain("MCP server values retain later precedence");
+
+    const bash = lookupCapability("tool.Bash");
+    for (const variable of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"]) {
+      expect(bash?.note, variable).toContain(variable);
+    }
+    expect(bash?.note).toContain("deliberately disables Pi 0.82");
   });
 
   // cleanupPeriodDays reaps orphaned WORKTREES only — there is no subagent

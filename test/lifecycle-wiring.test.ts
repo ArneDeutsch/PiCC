@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -19,6 +20,17 @@ let pi: FakePi;
 const originalCwd = process.cwd();
 const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
 
+function installProjectRootGitCanary(projectRoot: string): string {
+  const canary = path.join(projectRoot, process.platform === "win32" ? "git.exe" : "git");
+  if (process.platform === "win32") {
+    fs.copyFileSync(process.execPath, canary);
+  } else {
+    fs.writeFileSync(canary, "#!/bin/sh\nexit 97\n");
+    fs.chmodSync(canary, 0o755);
+  }
+  return canary;
+}
+
 beforeAll(async () => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-lw-"));
   const w = (rel: string, content: string) => {
@@ -32,9 +44,11 @@ beforeAll(async () => {
   w("src/CLAUDE.md", "LW-NESTED-SRC\n");
   w("src/a.ts", "export {};\n");
   w("src/b.ts", "export {};\n");
+  w(".githooks/pre-commit", "#!/bin/sh\nexit 0\n");
   w(
     ".claude/settings.json",
     JSON.stringify({
+      env: { GIT_DIR: "project-controlled-git-dir", PROJECT_GIT_CANARY: "project-setting" },
       permissions: { ask: ["Bash(git push *)"] },
       hooks: {
         SessionStart: ["startup", "resume", "clear", "fork"].map((source) => ({
@@ -129,6 +143,207 @@ describe("lifecycle wiring", () => {
     }
   });
 
+  it("keeps direct-launch suppression through extension input, then clears it before admitted input or user Bash", async () => {
+    const saved = {
+      pid: process.env.PICC_LAUNCHER_PID,
+      kind: process.env.PICC_INSTALL_KIND,
+      version: process.env.PICC_VERSION,
+      skip: process.env.PI_SKIP_VERSION_CHECK,
+    };
+    const initializeDirect = async () => {
+      process.env.PICC_LAUNCHER_PID = String(process.ppid);
+      process.env.PICC_INSTALL_KIND = "source";
+      process.env.PICC_VERSION = "0.1.0";
+      process.env.PI_SKIP_VERSION_CHECK = "1";
+      const directPi = fakePi();
+      picc(directPi.api as never, { onInitializationSettled: directPi.captureInitialization });
+      await directPi.waitForInitialization();
+      return directPi;
+    };
+    try {
+      const inputPi = await initializeDirect();
+      expect(process.env.PICC_LAUNCHER_PID).toBeUndefined();
+      expect(process.env.PI_SKIP_VERSION_CHECK).toBe("1");
+      await inputPi.fire("input", { text: "internal", source: "extension" });
+      expect(process.env.PI_SKIP_VERSION_CHECK).toBe("1");
+      await inputPi.fire("input", { text: "admitted", source: "interactive" });
+      expect(process.env.PI_SKIP_VERSION_CHECK).toBeUndefined();
+
+      const bashPi = await initializeDirect();
+      expect(process.env.PI_SKIP_VERSION_CHECK).toBe("1");
+      await bashPi.fire("user_bash", { command: "printf probe" });
+      expect(process.env.PI_SKIP_VERSION_CHECK).toBeUndefined();
+    } finally {
+      const restore = (name: string, value: string | undefined) => {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      };
+      restore("PICC_LAUNCHER_PID", saved.pid);
+      restore("PICC_INSTALL_KIND", saved.kind);
+      restore("PICC_VERSION", saved.version);
+      restore("PI_SKIP_VERSION_CHECK", saved.skip);
+    }
+  });
+
+  it("self-heals hooks with real sanitized Git rather than unsupported pi.exec", async () => {
+    const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "picc-startup-git-"));
+    const userDir = path.join(fixture, ".claude-user");
+    const redirectedGitDir = path.join(fixture, "redirected.git");
+    const previousCwd = process.cwd();
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const savedPid = process.env.PICC_LAUNCHER_PID;
+    const savedSkip = process.env.PI_SKIP_VERSION_CHECK;
+    try {
+      fs.mkdirSync(path.join(fixture, ".claude"), { recursive: true });
+      fs.mkdirSync(path.join(fixture, ".githooks"));
+      fs.mkdirSync(userDir);
+      fs.writeFileSync(path.join(fixture, "README.md"), "fixture\n");
+      fs.writeFileSync(path.join(fixture, ".claude", "settings.json"), JSON.stringify({
+        env: { GIT_DIR: redirectedGitDir, PROJECT_GIT_CANARY: "must-not-reach-git" },
+      }));
+      execFileSync("git", ["init"], { cwd: fixture, stdio: "ignore" });
+      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: fixture });
+      execFileSync("git", ["config", "user.name", "PiCC Test"], { cwd: fixture });
+      execFileSync("git", ["add", "."], { cwd: fixture });
+      execFileSync("git", ["commit", "-m", "fixture"], { cwd: fixture, stdio: "ignore" });
+      const projectGitCanary = installProjectRootGitCanary(fixture);
+
+      process.chdir(fixture);
+      process.env.PICC_CLAUDE_USER_DIR = userDir;
+      const startupPi = fakePi();
+      startupPi.api.exec = async () => { throw new Error("Pi 0.82 pi.exec env path must not be used"); };
+      picc(startupPi.api as never, { onInitializationSettled: startupPi.captureInitialization });
+      await startupPi.waitForInitialization();
+      process.env.PICC_LAUNCHER_PID = "991";
+      process.env.PI_SKIP_VERSION_CHECK = "1";
+
+      await startupPi.fire("session_start", { reason: "startup" }, startupPi.ctx());
+      expect(fs.readFileSync(path.join(fixture, ".git", "config"), "utf8")).toMatch(/hooksPath\s*=\s*\.githooks/);
+      expect(fs.existsSync(projectGitCanary)).toBe(true);
+      expect(fs.existsSync(redirectedGitDir)).toBe(false);
+    } finally {
+      process.chdir(previousCwd);
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+      if (savedPid === undefined) delete process.env.PICC_LAUNCHER_PID;
+      else process.env.PICC_LAUNCHER_PID = savedPid;
+      if (savedSkip === undefined) delete process.env.PI_SKIP_VERSION_CHECK;
+      else process.env.PI_SKIP_VERSION_CHECK = savedSkip;
+      fs.rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves managed directories untouched when production trusted Git is unavailable", async () => {
+    const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "picc-unavailable-git-"));
+    const userDir = path.join(fixture, ".claude-user");
+    const managed = path.join(fixture, ".claude", "worktrees", "registered");
+    const marker = path.join(managed, "keep.txt");
+    const previousCwd = process.cwd();
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    let resolverCalls = 0;
+    try {
+      fs.mkdirSync(userDir, { recursive: true });
+      fs.mkdirSync(path.join(fixture, ".githooks"), { recursive: true });
+      fs.mkdirSync(managed, { recursive: true });
+      fs.writeFileSync(path.join(fixture, "README.md"), "fixture\n");
+      fs.writeFileSync(path.join(managed, ".git"), "gitdir: unavailable\n");
+      fs.writeFileSync(marker, "untouched\n");
+      execFileSync("git", ["init"], { cwd: fixture, stdio: "ignore" });
+      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: fixture });
+      execFileSync("git", ["config", "user.name", "PiCC Test"], { cwd: fixture });
+      execFileSync("git", ["add", "README.md"], { cwd: fixture });
+      execFileSync("git", ["commit", "-m", "fixture"], { cwd: fixture, stdio: "ignore" });
+
+      process.chdir(fixture);
+      process.env.PICC_CLAUDE_USER_DIR = userDir;
+      const unavailablePi = fakePi();
+      picc(unavailablePi.api as never, {
+        onInitializationSettled: unavailablePi.captureInitialization,
+        resolveTrustedGit: async () => {
+          resolverCalls += 1;
+          throw new Error("admin module evaluation failed");
+        },
+      });
+      await unavailablePi.waitForInitialization();
+      await unavailablePi.fire("session_start", { reason: "startup" }, unavailablePi.ctx());
+
+      await expect(
+        unavailablePi.tools.get("EnterWorktree").execute("unavailable-git", { path: managed }),
+      ).rejects.toThrow(/cannot verify path/);
+      expect(fs.readFileSync(marker, "utf8")).toBe("untouched\n");
+      expect(fs.existsSync(path.join(managed, ".git"))).toBe(true);
+      expect(resolverCalls).toBe(1);
+    } finally {
+      process.chdir(previousCwd);
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+      fs.rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it("drives registered EnterWorktree with sanitized production Git composition", async () => {
+    const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "picc-wired-worktree-"));
+    const userDir = path.join(fixture, ".claude-user");
+    const hookDir = path.join(fixture, ".githooks");
+    const hookOutput = path.join(fixture, "worktree-hook-env.txt");
+    const redirectedGitDir = path.join(fixture, "redirected.git");
+    const previousCwd = process.cwd();
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const savedPid = process.env.PICC_LAUNCHER_PID;
+    const savedSkip = process.env.PI_SKIP_VERSION_CHECK;
+    const shellQuote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
+    let wiredPi: FakePi | undefined;
+    try {
+      fs.mkdirSync(path.join(fixture, ".claude"), { recursive: true });
+      fs.mkdirSync(hookDir);
+      fs.mkdirSync(userDir);
+      fs.writeFileSync(path.join(fixture, "README.md"), "fixture\n");
+      fs.writeFileSync(path.join(fixture, ".claude", "settings.json"), JSON.stringify({
+        env: { GIT_DIR: redirectedGitDir, WORKTREE_SETTING_CANARY: "project-setting" },
+      }));
+      fs.writeFileSync(
+        path.join(hookDir, "post-checkout"),
+        `#!/bin/sh\nprintf '%s|%s|%s|%s' "$GIT_DIR" "$WORKTREE_SETTING_CANARY" "$PICC_LAUNCHER_PID" "$PI_SKIP_VERSION_CHECK" > ${shellQuote(hookOutput.replaceAll("\\", "/"))}\n`,
+      );
+      fs.chmodSync(path.join(hookDir, "post-checkout"), 0o755);
+      execFileSync("git", ["init"], { cwd: fixture, stdio: "ignore" });
+      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: fixture });
+      execFileSync("git", ["config", "user.name", "PiCC Test"], { cwd: fixture });
+      execFileSync("git", ["config", "core.hooksPath", ".githooks"], { cwd: fixture });
+      execFileSync("git", ["add", "."], { cwd: fixture });
+      execFileSync("git", ["commit", "-m", "fixture"], { cwd: fixture, stdio: "ignore" });
+      const projectGitCanary = installProjectRootGitCanary(fixture);
+
+      process.chdir(fixture);
+      process.env.PICC_CLAUDE_USER_DIR = userDir;
+      wiredPi = fakePi();
+      picc(wiredPi.api as never, { onInitializationSettled: wiredPi.captureInitialization });
+      await wiredPi.waitForInitialization();
+      process.env.PICC_LAUNCHER_PID = "992";
+      process.env.PI_SKIP_VERSION_CHECK = "1";
+
+      const entered = await wiredPi.tools.get("EnterWorktree").execute("wired-env", { name: "wired-env-proof" });
+      expect(entered.details.created).toBe(true);
+      expect(fs.readFileSync(hookOutput, "utf8")).toBe("|||");
+      expect(fs.existsSync(projectGitCanary)).toBe(true);
+      expect(fs.existsSync(redirectedGitDir)).toBe(false);
+
+      const exited = await wiredPi.tools.get("ExitWorktree").execute("wired-env-exit", { action: "remove" });
+      expect(exited.details.restorePath).toBe(fixture);
+      expect(exited.details.removed).toBe(true);
+      expect(fs.existsSync(entered.details.worktreePath)).toBe(false);
+    } finally {
+      process.chdir(previousCwd);
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+      if (savedPid === undefined) delete process.env.PICC_LAUNCHER_PID;
+      else process.env.PICC_LAUNCHER_PID = savedPid;
+      if (savedSkip === undefined) delete process.env.PI_SKIP_VERSION_CHECK;
+      else process.env.PI_SKIP_VERSION_CHECK = savedSkip;
+      fs.rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
   it("captures quota headers from after_provider_response and reports them in /quota", async () => {
     await pi.fire("after_provider_response", {
       headers: { "x-ratelimit-remaining-tokens": "1234", "content-type": "application/json" },
@@ -175,7 +390,7 @@ describe("lifecycle wiring", () => {
     expect(pi.userMessages.filter((m) => String(m.content).includes("[Stop hook]")).length).toBe(9);
   });
 
-  it("maps Pi 0.81.1 session reasons to Claude SessionStart sources", async () => {
+  it("maps Pi 0.82.0 session reasons to Claude SessionStart sources", async () => {
     const log = path.join(dir, ".claude", ".session-start-log");
     fs.rmSync(log, { force: true });
     for (const reason of ["startup", "reload", "new", "resume", "fork"]) {

@@ -10,7 +10,7 @@
 import { open as fsOpen, readFile as fsReadFile, stat as fsStat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, resolve as resolvePath } from "node:path";
-import { unicodeSafeSubprocessEnv } from "../util/env.js";
+import { sanitizedSubprocessEnv, unicodeSafeSubprocessEnv } from "../util/env.js";
 import type { CwdState } from "./cwd-state.js";
 import { BINARY_READ_ERROR, isBinaryBuffer, sniffImageMime } from "./image-ingest.js";
 // NOTE: `./notebook-render.js` is imported dynamically inside the notebook branch
@@ -93,11 +93,11 @@ export function buildBashSpawnEnv(
   settingsEnv: Record<string, string | undefined>,
   projectRoot: string,
 ): Record<string, string> {
-  return unicodeSafeSubprocessEnv({
-    ...inherited,
-    ...settingsEnv,
-    CLAUDE_PROJECT_DIR: projectRoot,
-  });
+  return unicodeSafeSubprocessEnv(sanitizedSubprocessEnv(
+    inherited,
+    settingsEnv,
+    { CLAUDE_PROJECT_DIR: projectRoot },
+  ));
 }
 
 /**
@@ -108,6 +108,7 @@ export function buildBashSpawnEnv(
  */
 export function makeBuiltinBashOptions(deps: BuiltinToolDeps): {
   shellPath?: string;
+  exposeSessionEnvironment: false;
   spawnHook(args: { command: unknown; cwd: unknown; env: Record<string, string | undefined> }): {
     command: unknown;
     cwd: unknown;
@@ -116,6 +117,8 @@ export function makeBuiltinBashOptions(deps: BuiltinToolDeps): {
 } {
   return {
     ...(deps.shellPath ? { shellPath: deps.shellPath } : {}),
+    // Pi 0.82+ must not project the ambient session environment into Bash.
+    exposeSessionEnvironment: false,
     spawnHook: ({ command, cwd, env }) => ({
       command,
       cwd,

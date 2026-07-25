@@ -50,6 +50,10 @@ export interface WorktreeListEntry {
   locked: boolean;
 }
 
+type VerifiedWorktreeList =
+  | { ok: true; entries: WorktreeListEntry[] }
+  | { ok: false; error: string };
+
 export interface WorktreeReapResult {
   reaped: string[];
   diagnostics: Diagnostic[];
@@ -228,9 +232,17 @@ export class WorktreeManager {
         return { ok: false, removed: false, orphaned: false, diagnostics, error };
       }
 
-      // Look up the checked-out branch before unregistering anything.
-      let branch = (await this.list()).find((e) => canonical(e.path) === canonical(dir))?.branch;
-      if (branch === undefined) branch = `worktree-${path.basename(dir)}`;
+      let branch: string | undefined;
+      if (opts.action === "remove") {
+        const listed = await this.listVerified();
+        if (!listed.ok) {
+          const error = `ExitWorktree: refusing to remove ${dir} because git worktree state is unavailable (${listed.error})`;
+          diagnostics.push(diag("error", error));
+          return { ok: false, removed: false, orphaned: false, diagnostics, error };
+        }
+        branch = listed.entries.find((e) => canonical(e.path) === canonical(dir))?.branch;
+        if (branch === undefined) branch = `worktree-${path.basename(dir)}`;
+      }
 
       // Unlock in both modes (ignore failures — may not be locked).
       await this.git(["worktree", "unlock", dir]);
@@ -270,7 +282,7 @@ export class WorktreeManager {
       const stillPresent = fs.existsSync(dir);
 
       // Delete the leftover base branch if fully merged (ignore failure).
-      if (branch.startsWith("worktree-")) {
+      if (branch?.startsWith("worktree-")) {
         await this.git(["branch", "-d", branch]);
       }
 
@@ -301,8 +313,22 @@ export class WorktreeManager {
       await this.ready;
       const maxAgeDays = options?.maxAgeDays ?? this.cleanupPeriodDays ?? 0;
       const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-      await this.git(["worktree", "prune"]);
-      const registered = new Set((await this.list()).map((e) => canonical(e.path)));
+      const beforePrune = await this.listVerified();
+      if (!beforePrune.ok) {
+        diagnostics.push(diag("warning", `orphan reaping skipped: ${beforePrune.error}`));
+        return { reaped, diagnostics };
+      }
+      const prune = await this.git(["worktree", "prune"]);
+      if (prune.code !== 0) {
+        diagnostics.push(diag("warning", `orphan reaping skipped: git worktree prune failed (${prune.stderr.trim() || `exit ${prune.code}`})`));
+        return { reaped, diagnostics };
+      }
+      const listed = await this.listVerified();
+      if (!listed.ok) {
+        diagnostics.push(diag("warning", `orphan reaping skipped: ${listed.error}`));
+        return { reaped, diagnostics };
+      }
+      const registered = new Set(listed.entries.map((e) => canonical(e.path)));
       const worktreesRoot = this.worktreesRoot();
       let entries: fs.Dirent[] = [];
       try {
@@ -343,14 +369,8 @@ export class WorktreeManager {
   }
 
   async list(): Promise<WorktreeListEntry[]> {
-    try {
-      await this.ready;
-      const res = await this.git(["worktree", "list", "--porcelain"]);
-      if (res.code !== 0) return [];
-      return parsePorcelain(res.stdout);
-    } catch {
-      return [];
-    }
+    const result = await this.listVerified();
+    return result.ok ? result.entries : [];
   }
 
   // -------------------------------------------------------------------------
@@ -367,7 +387,13 @@ export class WorktreeManager {
     const dir = path.join(this.projectRoot, ".claude", "worktrees", flat);
 
     if (isDirectory(dir)) {
-      const entry = (await this.list()).find((e) => canonical(e.path) === canonical(dir));
+      const listed = await this.listVerified();
+      if (!listed.ok) {
+        const error = `EnterWorktree: cannot verify existing worktree ${dir} (${listed.error})`;
+        diagnostics.push(diag("error", error));
+        return { ok: false, created: false, seededFiles: [], diagnostics, error };
+      }
+      const entry = listed.entries.find((e) => canonical(e.path) === canonical(dir));
       if (entry) {
         // Reuse the existing REGISTERED worktree — create nothing, seed nothing.
         await this.ensureWorktreesIgnored(diagnostics);
@@ -411,7 +437,13 @@ export class WorktreeManager {
       return { ok: false, created: false, seededFiles: [], diagnostics, error };
     }
 
-    const { branch, reuseBranch } = await this.pickBranch(flat);
+    const branchChoice = await this.pickBranch(flat);
+    if (branchChoice === undefined) {
+      const error = "EnterWorktree: could not verify worktree state before selecting a branch";
+      diagnostics.push(diag("error", error));
+      return { ok: false, created: false, seededFiles: [], diagnostics, error };
+    }
+    const { branch, reuseBranch } = branchChoice;
     if (reuseBranch) {
       diagnostics.push(diag("info", `reusing existing branch ${branch} (its worktree dir is gone)`));
       await this.git(["worktree", "prune"]); // clear any stale admin entry holding the branch
@@ -483,9 +515,14 @@ export class WorktreeManager {
       diagnostics.push(diag("error", error));
       return { ok: false, created: false, seededFiles: [], diagnostics, error };
     }
-    const entry = (await this.list()).find((e) => canonical(e.path) === canonical(dir));
-    const hasGitPointer = fs.existsSync(path.join(dir, ".git"));
-    if (!entry && !hasGitPointer) {
+    const listed = await this.listVerified();
+    if (!listed.ok) {
+      const error = `EnterWorktree: cannot verify path ${dir} as a registered git worktree (${listed.error})`;
+      diagnostics.push(diag("error", error));
+      return { ok: false, created: false, seededFiles: [], diagnostics, error };
+    }
+    const entry = listed.entries.find((e) => canonical(e.path) === canonical(dir));
+    if (!entry) {
       const error = `EnterWorktree: path ${dir} is not a registered git worktree`;
       diagnostics.push(diag("error", error));
       return { ok: false, created: false, seededFiles: [], diagnostics, error };
@@ -494,7 +531,7 @@ export class WorktreeManager {
     return {
       ok: true,
       worktreePath: dir,
-      branch: entry?.branch,
+      branch: entry.branch,
       baseCommit: readBaseCommitFile(dir),
       created: false,
       seededFiles: [],
@@ -530,6 +567,18 @@ export class WorktreeManager {
     }
   }
 
+  private async listVerified(): Promise<VerifiedWorktreeList> {
+    await this.ready;
+    const res = await this.git(["worktree", "list", "--porcelain"]);
+    if (res.code !== 0) {
+      return {
+        ok: false,
+        error: `git worktree list failed (${res.stderr.trim() || `exit ${res.code}`})`,
+      };
+    }
+    return { ok: true, entries: parsePorcelain(res.stdout) };
+  }
+
   /**
    * Resolve worktree.baseRef to a concrete SHA before creating anything.
    * "head" -> HEAD; "fresh" -> origin/HEAD, then origin/main, origin/master, then HEAD.
@@ -552,9 +601,11 @@ export class WorktreeManager {
    * already exists, reuse it when its worktree dir is gone (not checked out in
    * any still-existing worktree); otherwise suffix -2, -3, ...
    */
-  private async pickBranch(flat: string): Promise<{ branch: string; reuseBranch: boolean }> {
+  private async pickBranch(flat: string): Promise<{ branch: string; reuseBranch: boolean } | undefined> {
+    const listed = await this.listVerified();
+    if (!listed.ok) return undefined;
     const inUse = new Set<string>();
-    for (const entry of await this.list()) {
+    for (const entry of listed.entries) {
       if (entry.branch !== undefined && isDirectory(entry.path)) inUse.add(entry.branch);
     }
     let candidate = `worktree-${flat}`;

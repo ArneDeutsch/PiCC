@@ -1,4 +1,4 @@
-import { unicodeSafeSubprocessEnv } from "../util/env.js";
+import { sanitizedSubprocessEnv, unicodeSafeSubprocessEnv } from "../util/env.js";
 import { killProcessTreeByPid, listDescendantPids } from "../util/process-tree.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
 import type { ResolvedMcpConfig, ResolvedMcpServer } from "../types.js";
@@ -112,10 +112,12 @@ export interface McpRuntimeDeps {
   /** `CLAUDE_CODE_SESSION_ID` for the servers — binary-verified Claude behavior (2.1.218; undocumented). */
   sessionId: string;
   /**
-   * Base environment for the servers AND the source of `MCP_TIMEOUT` /
-   * `MCP_TOOL_TIMEOUT`. Defaults to `process.env`; injectable for tests.
+   * Ambient environment for the servers and timeout settings. Defaults to
+   * `process.env`; launcher-only values are removed before any overlay.
    */
   env?: Record<string, string | undefined>;
+  /** Project `settings.env`, applied after sanitized ambient inheritance. */
+  settingsEnv?: Record<string, string | undefined>;
   /** Test seam for exercising an SDK load/import failure. */
   loadSdk?: () => Promise<McpSdk>;
   /** Test seam for deterministic connect-timeout settlement after test-owned readiness. */
@@ -182,7 +184,9 @@ export class McpRuntime {
 
   private constructor(config: ResolvedMcpConfig, deps: McpRuntimeDeps) {
     this.deps = deps;
-    const timeoutPolicy = resolveMcpTimeoutPolicy(deps.env ?? process.env);
+    const timeoutPolicy = resolveMcpTimeoutPolicy(
+      sanitizedSubprocessEnv(deps.env ?? process.env, deps.settingsEnv),
+    );
     this.connectTimeoutMs = timeoutPolicy.connectTimeoutMs;
     this.toolTimeoutMs = timeoutPolicy.environmentToolTimeoutMs;
     for (const server of config.servers) {
@@ -352,14 +356,18 @@ export class McpRuntime {
     // check is complete: there is no await between here and the spawn.
     if (handle.stopped) return;
     try {
-      // Spread order is binary-verified Claude parity (2.1.218): base env →
-      // injected Claude vars → config `env` LAST — config wins over everything,
-      // including the injected vars.
+      // Claude parity (binary-verified 2.1.218): sanitized inheritance →
+      // project settings → injected Claude defaults → server env last.
       const env = unicodeSafeSubprocessEnv({
-        ...(this.deps.env ?? process.env),
-        CLAUDE_PROJECT_DIR: this.deps.projectRoot,
-        CLAUDECODE: "1",
-        CLAUDE_CODE_SESSION_ID: this.deps.sessionId,
+        ...sanitizedSubprocessEnv(
+          this.deps.env ?? process.env,
+          this.deps.settingsEnv,
+          {
+            CLAUDE_PROJECT_DIR: this.deps.projectRoot,
+            CLAUDECODE: "1",
+            CLAUDE_CODE_SESSION_ID: this.deps.sessionId,
+          },
+        ),
         ...server.env,
       });
       const transport = new sdk.StdioClientTransport({

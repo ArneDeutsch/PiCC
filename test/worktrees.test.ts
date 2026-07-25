@@ -280,6 +280,44 @@ describe("WorktreeManager.enter (path mode)", () => {
     expect(side.ok).toBe(false);
     expect(side.error).toMatch(/outside/);
   });
+
+  it("treats failed worktree listing as no authority to adopt, reap, or remove", async () => {
+    const repo = makeRepo();
+    const managedRoot = path.join(repo, ".claude", "worktrees");
+    const pointed = path.join(managedRoot, "pointed");
+    const orphan = path.join(managedRoot, "orphan");
+    fs.mkdirSync(pointed, { recursive: true });
+    fs.writeFileSync(path.join(pointed, ".git"), "gitdir: unavailable\n", "utf8");
+    fs.mkdirSync(orphan);
+    fs.writeFileSync(path.join(orphan, "keep.txt"), "keep\n", "utf8");
+    const calls: string[][] = [];
+    const mgr = new WorktreeManager({
+      projectRoot: repo,
+      settings: { baseRef: "head" },
+      exec: async (_cmd, args) => {
+        calls.push(args);
+        return { stdout: "", stderr: "git unavailable", code: 1 };
+      },
+    });
+
+    const byPath = await mgr.enter({ path: pointed });
+    expect(byPath.ok).toBe(false);
+    expect(byPath.error).toMatch(/cannot verify path/);
+
+    const byName = await mgr.enter({ name: "orphan" });
+    expect(byName.ok).toBe(false);
+    expect(fs.readFileSync(path.join(orphan, "keep.txt"), "utf8")).toBe("keep\n");
+
+    const reaped = await mgr.reapOrphans();
+    expect(reaped.reaped).toEqual([]);
+    expect(fs.existsSync(orphan)).toBe(true);
+
+    const removed = await mgr.exit({ worktreePath: pointed, action: "remove" });
+    expect(removed.ok).toBe(false);
+    expect(fs.existsSync(pointed)).toBe(true);
+    expect(calls.some((args) => args[0] === "worktree" && ["unlock", "remove", "prune"].includes(args[1] ?? ""))).toBe(false);
+    expect(calls.some((args) => args[0] === "branch")).toBe(false);
+  });
 });
 
 describe(".worktreeinclude seeding", () => {
