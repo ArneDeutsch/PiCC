@@ -74,6 +74,7 @@ import {
   MainSessionCheckpointGate,
   callbackCompactionAttempt,
   type CheckpointProgress,
+  type CheckpointSnapshot,
   type MidRunCompactionController,
   type ResumeToken,
 } from "./runtime/mid-run-compaction.js";
@@ -303,6 +304,14 @@ export interface PiccTestSeam {
 }
 
 const codexProviderRegistries = new WeakSet<object>();
+
+/**
+ * Process status for a non-interactive run whose proactive checkpoint ended without
+ * delivering the paused work. Distinct from `0` (the work finished) and from `1`, which
+ * Pi's own print mode already uses for its failures, so a wrapper can tell a PiCC
+ * give-up from either. Pi overrides it only when print mode itself returns nonzero.
+ */
+const CHECKPOINT_GAVE_UP_EXIT_CODE = 3;
 
 type FdWriter = (
   fd: number,
@@ -1209,15 +1218,67 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         : event.failureCategory === "restoration-paused"
           ? "Context was compacted, but mandatory restoration or continuation failed. Work is paused and no continuation ran. Do not compact the committed summary again; start a new session and resend the retained input."
           : "Automatic context compaction could not complete. Work is paused and no continuation ran. Run /compact, then explicitly continue.";
+      // Each action names a different thing the reader can still do, because for these
+      // endings "start a new session" is either impossible or already happening.
       case "checkpoint-cancelled": return event.action === "new-session"
         ? "Proactive context compaction stopped with the old session; resend input in the new session."
-        : "Proactive context compaction was cancelled. Run /compact to recover this session, or start a new session.";
+        : event.action === "session-ended"
+          ? "Proactive context compaction stopped when the session ended. The paused work did not resume and was not delivered."
+          : event.action === "restart-process"
+            ? "Proactive context compaction was cancelled, but PiCC could not confirm the paused work stopped. This session cannot be continued or replaced; exit PiCC and start it again."
+            : "Proactive context compaction was cancelled. Run /compact to recover this session, or start a new session.";
       case "checkpoint-recovered": return "Manual compaction recovered the paused session; explicitly continue when ready.";
     }
   };
 
   const appendCheckpointEntry = (data: Record<string, unknown>): void => {
     try { pi.appendEntry("picc-checkpoint-lifecycle", data); } catch { /* presentation only */ }
+  };
+
+  /**
+   * What a cancelled checkpoint can still do for the reader, decided once. Two refusals ask
+   * this — an ordinary prompt and a `/compact` — and when they derived it separately they
+   * drifted: the reader's own Esc, still parked on the host join, was told by one that the
+   * cancellation was settling and by the other to throw the session away, seconds before
+   * PiCC offered `/compact`. Callers decide `manualCompactionDisposition()` first; every
+   * state reaching here mints no recovery for this generation.
+   */
+  type CancelledCheckpointOutlook =
+    | "settling" | "settling-committed" | "unconfirmed" | "replaced" | "session-ended";
+
+  const cancelledCheckpointOutlook = (snapshot: CheckpointSnapshot): CancelledCheckpointOutlook =>
+    snapshot.cancellationQuiescence === "unconfirmed"
+      ? "unconfirmed"
+      : snapshot.cancellationKind === "user"
+        // A `user` cancellation mints recovery when its join lands — unless the summary is
+        // already committed, where the same join terminalizes post-commit instead.
+        ? snapshot.cancellationCommitted ? "settling-committed" : "settling"
+        : snapshot.cancellationKind === "replacement" ? "replaced" : "session-ended";
+
+  /**
+   * Set when Pi is tearing this session down for good. Pi stops the TUI *before* it emits
+   * `session_shutdown` ("so extension UI cleanup cannot repaint the final frame"), so from
+   * that moment every render verb is a no-op: a notification is painted into a frame that
+   * never renders, and text handed back to the editor is discarded with it. Announcements
+   * leave through stderr instead, and the transcript must not record a restore that the
+   * reader never received.
+   */
+  let sessionRenderingStopped = false;
+
+  /**
+   * `ctx.mode` is a getter that calls Pi's `assertActive()` and throws once the extension
+   * runner is stale. Every read below happens inside the controller's `emit`, whose catch
+   * would swallow the announcement — and the give-up status with it — for a checkpoint that
+   * ended while the runner was going away.
+   */
+  const contextMode = (ctx: any): string | undefined => {
+    try { return ctx?.mode; } catch { return undefined; }
+  };
+
+  /** The surface a checkpoint announcement can still reach, which is not always `ctx.mode`. */
+  const checkpointSurface = (ctx: any): string | undefined => {
+    const mode = contextMode(ctx);
+    return mode === "tui" && sessionRenderingStopped ? "stderr" : mode;
   };
 
   const reportRejectedShadows = (rejected: readonly import("./runtime/mid-run-compaction.js").QueuedInputShadow[], ctx: any): void => {
@@ -1241,7 +1302,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
     let restoredTextCount = 0;
     let guidance = `${rejected.length} queued input${rejected.length === 1 ? " was" : "s were"} not replayed. Resend ${representable.length} text input${representable.length === 1 ? "" : "s"}${unrepresentable ? ` and ${unrepresentable} image/unrepresentable input${unrepresentable === 1 ? "" : "s"}` : ""}.`;
-    if (ctx?.mode === "tui") {
+    // Never the editor once the renderer is stopped: `setEditorText` still returns, so
+    // taking that branch would persist `restoredTextCount: 1` for text the reader was never
+    // handed back — a record that says the loss was repaired when it was not.
+    const surface = checkpointSurface(ctx);
+    if (surface === "tui") {
       try {
         if (representable.length && typeof ctx.ui?.setEditorText === "function") {
           const draft = String(ctx.ui?.getEditorText?.() ?? "");
@@ -1254,7 +1319,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         restoredTextCount = 0;
         guidance = `${rejected.length} queued input${rejected.length === 1 ? " was" : "s were"} not replayed. Resend ${representable.length} text input${representable.length === 1 ? "" : "s"}${unrepresentable ? ` and ${unrepresentable} image/unrepresentable input${unrepresentable === 1 ? "" : "s"}` : ""}.`;
       }
-    } else if (ctx?.mode === "print") {
+    } else if (surface === "print" || surface === "stderr") {
       console.error(`PiCC: ${guidance}`);
     }
     appendCheckpointEntry({
@@ -1271,27 +1336,45 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     const progressController = mainCheckpointGate.currentController();
     if (mainCheckpointGate.isLogicalRunStopped() &&
         mainCheckpointGate.stoppedRunMatches(progressController, event.generation)) return;
-    const mode = ctx?.mode;
+    const mode = contextMode(ctx);
+    // `stderr` is the TUI once Pi has stopped it: the ending still has to reach the reader,
+    // and their scrollback is what survives the teardown.
+    const surface = mode === "tui" && sessionRenderingStopped ? "stderr" : mode;
     const baseText = checkpointText(event);
-    const recoverableHeadlessExhaustion = event.category === "checkpoint-exhausted" &&
-      event.failureCategory !== "restoration-paused" && mode !== "tui";
-    const persisted = transcriptPath() !== undefined;
-    const headlessCause = event.failureCategory === "hook-blocked"
-      ? "Automatic context compaction was blocked by a PreCompact hook. Work is paused and no continuation ran. Repair or disable the hook, or allow a manual compact trigger first."
-      : "Automatic context compaction could not complete. Work is paused and no continuation ran.";
-    const recoveryGuidance = persisted
-      ? `If this process exits, reopen the exact persisted session before /compact.${mode === "rpc" ? " RPC acknowledgements are uncorrelated." : ""} Run /compact, then explicitly continue.`
-      : "This headless session is ephemeral and cannot be reopened; start a replacement session and resend the retained input.";
-    const text = recoverableHeadlessExhaustion ? `${headlessCause} ${recoveryGuidance}` : baseText;
-    if (mode === "tui") {
+    // Every headless exhaustion is rephrased, the post-commit one included: it is the
+    // ending most likely to hit a one-shot `picc -p`, and the TUI wording ("start a new
+    // session") describes an affordance a headless caller does not have.
+    const headlessExhaustion = event.category === "checkpoint-exhausted" && mode !== "tui";
+    const postCommit = event.failureCategory === "restoration-paused";
+    const session = transcriptPath();
+    const persisted = session !== undefined;
+    const headlessCause = postCommit
+      ? "Context was compacted, but mandatory restoration or continuation failed. Work is paused and no continuation ran."
+      : event.failureCategory === "hook-blocked"
+        ? "Automatic context compaction was blocked by a PreCompact hook. Work is paused and no continuation ran. Repair or disable the hook, or allow a manual compact trigger first."
+        : "Automatic context compaction could not complete. Work is paused and no continuation ran.";
+    const recoveryGuidance = postCommit
+      ? "Do not compact the committed summary again. This session cannot continue the paused work; start a replacement session and resend the retained input."
+      : persisted
+        ? `If this process exits, reopen the exact persisted session (${session}) before /compact.${mode === "rpc" ? " RPC acknowledgements are uncorrelated." : ""} Run /compact, then explicitly continue.`
+        : "This headless session is ephemeral and cannot be reopened; start a replacement session and resend the retained input.";
+    const text = headlessExhaustion ? `${headlessCause} ${recoveryGuidance}` : baseText;
+    if (surface === "tui") {
       try {
         ctx.ui?.setStatus?.("picc-checkpoint", event.category === "checkpoint-recovered" ? undefined : text);
         if (event.category === "checkpoint-exhausted") ctx.ui?.notify?.(text, "error");
+        // A terminal cancellation used to leave only a status line, which the next status
+        // write overwrites — an ending the reader can miss entirely is not announced.
+        // `restart-process` is an error rather than a warning: nothing in this session
+        // works afterwards.
+        if (event.category === "checkpoint-cancelled") {
+          ctx.ui?.notify?.(text, event.action === "restart-process" ? "error" : "warning");
+        }
         if (event.category === "checkpoint-recovered") ctx.ui?.notify?.(text, "info");
       } catch {
         // Presentation cannot own checkpoint state.
       }
-    } else if (mode === "print") {
+    } else if (surface === "print" || surface === "stderr") {
       console.error(`PiCC: ${text}`);
     }
     if (mode === "json" || mode === "rpc" || event.category === "checkpoint-exhausted") {
@@ -1312,16 +1395,29 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         } : {}),
       });
     }
-    if (event.category === "checkpoint-cancelled") {
-      const controller = mainCheckpointGate.currentController();
-      void controller.cancel(event.generation, event.action === "new-session" ? "replacement" : "user")
-        .then((outcome) => reportRejectedShadows(outcome.rejected, ctx))
-        .catch(() => undefined);
+    // A non-interactive caller must be able to tell "finished" from "gave up" without
+    // reading prose: both terminal categories mean the paused work never resumed, and a
+    // wrapper that only saw Pi's own status would consume a partial answer as success.
+    // Never in the TUI, where the reader is the one who sees the notice. Not cleared by a
+    // later recovery: the process did give up on that checkpoint, and `/compact` recovery
+    // still leaves the original continuation unrun.
+    //
+    // Named modes rather than "not the TUI", with one deliberate exception: a mode that
+    // could not be read at all (a stale runner throws) still sets it, because a give-up
+    // whose notice could not be delivered is exactly when a caller has nothing but the
+    // status left — and Pi's interactive quit calls `process.exit(0)` explicitly, so a
+    // status set from a stale TUI context cannot leak out of an interactive run.
+    if ((mode === "print" || mode === "json" || mode === "rpc" || mode === undefined) &&
+        (event.category === "checkpoint-exhausted" || event.category === "checkpoint-cancelled")) {
+      process.exitCode = CHECKPOINT_GAVE_UP_EXIT_CODE;
     }
   };
 
   mainCheckpointGate.attachExecution({
     progress: publishCheckpoint,
+    // The controller drains a terminal generation's queue and hands it here; nothing
+    // else names those shadows, so this is the single reporter for every ending.
+    inputDropped: (rejected) => reportRejectedShadows(rejected, checkpointContext),
     compact: async (signal) => {
       const ctx = checkpointContext;
       const epoch = checkpointSessionEpoch;
@@ -2084,6 +2180,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("session_start", async (event: any, ctx: any) => {
+    // A session being installed has a live runner behind it — before the outgoing
+    // controller hands back what it could not deliver, which is the first thing that has
+    // to reach the reader's editor. Pi never starts a session after a `quit` teardown, so
+    // this only ever clears a latch that no longer describes anything.
+    sessionRenderingStopped = false;
     await mainCheckpointGate.startSession(randomUUID());
     checkpointContext = ctx;
     rotateCheckpointSessionEpoch();
@@ -2212,9 +2313,23 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("session_shutdown", async (event: any) => {
+    // `quit` is the one reason Pi has already stopped the renderer for (`dispose()`); the
+    // switch reasons (`new`/`resume`/`fork`) and `reload` all leave a live UI behind.
+    // Latched before the cancellation, because the cancellation is what announces the
+    // ending and hands back the input this session will never deliver.
+    if (event?.reason === "quit") sessionRenderingStopped = true;
     try {
       // Cancellation owns abort-before-join; never manufacture nested settlement.
-      await mainCheckpointGate.cancel("shutdown");
+      try {
+        await mainCheckpointGate.cancel("shutdown");
+      } catch {
+        // A cancellation that could not confirm quiescence rejects. That is a checkpoint
+        // outcome, not a licence to skip the retained subagent joins, MCP shutdown, and
+        // the project's SessionEnd hook below. Caught here rather than with a `.catch()`
+        // on the call: the latter inserts an extra microtask before the joins, and
+        // `test/lifecycle-wiring.test.ts` pins that this handler claims a paused child's
+        // settlement notice before yielding.
+      }
       // This registry/runtime pair is session-local: claim any linked background
       // generations first (suppressing stale output/notices), then join every
       // retained child before SessionEnd and process shutdown proceed.
@@ -2265,6 +2380,23 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       if (inputDisposition === "reject-recoverable" || inputDisposition === "reject-restoration" ||
           inputDisposition === "reject-closed" || inputDisposition === "reject-stopped") {
         const controller = mainCheckpointGate.currentController();
+        // Waiting is only ever the answer for the reader's own cancellation while it is
+        // still settling into a recoverable one; for every other outlook the wait the old
+        // wording asked for never ends, and what to do instead differs per outlook.
+        const cancelledText = (): string => {
+          switch (cancelledCheckpointOutlook(controller.snapshot())) {
+            case "unconfirmed":
+              return "The prior checkpoint was cancelled and PiCC could not confirm the paused work stopped. This session cannot be continued or replaced; exit PiCC and start it again.";
+            case "settling":
+              return "Checkpoint cancellation is still settling. Wait before sending another prompt or attempting recovery.";
+            case "settling-committed":
+              return "Checkpoint cancellation is still settling, and this session's summary is already committed, so it will not become recoverable. Do not compact it again; start a new session and resend this input.";
+            case "replaced":
+              return "The prior checkpoint was cancelled with the session it belonged to and cannot be recovered here. Resend this input in the new session.";
+            case "session-ended":
+              return "The prior checkpoint stopped when the session it belonged to ended, and cannot be recovered here. The paused work did not resume and was not delivered.";
+          }
+        };
         const text = inputDisposition === "reject-recoverable"
           ? "Work remains paused. Run /compact, then explicitly continue."
           : inputDisposition === "reject-restoration"
@@ -2273,7 +2405,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
               ? "The stopped run is still terminating. Wait for it to settle before sending another prompt."
               : controller.manualCompactionDisposition() === "allow"
                 ? "The prior checkpoint was cancelled. Run /compact to recover this session, or start a new session."
-                : "Checkpoint cancellation is still settling. Wait before sending another prompt or attempting recovery.";
+                : cancelledText();
         try {
           if (ctx.mode === "print") console.error(`PiCC: ${text}`);
           else if (ctx.mode === "tui") ctx.ui?.notify?.(text, "warning");
@@ -2790,7 +2922,56 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (trulySettled.settled) mainCheckpointGate.logicalRunSettled();
   });
 
-  pi.on("session_before_compact", async (event: any) => {
+  /**
+   * Say why PiCC declined a compaction the reader asked for. Deliberately never repeats
+   * Pi's own cancellation line — Pi prints "Compaction cancelled" itself, unattributed —
+   * and never claims a recovery the controller would refuse: a committed summary must not
+   * be compacted again, and a transaction already in flight is a wait rather than a
+   * failure. `inFlight` is decided by the caller: a manual request that supersedes a stale
+   * operation is not blocked by the operation it replaces.
+   */
+  const explainRefusedCompaction = (
+    controller: MidRunCompactionController, ctx: any, inFlight: boolean,
+  ): void => {
+    const snapshot = controller.snapshot();
+    const cancelledReason = (): string => {
+      switch (cancelledCheckpointOutlook(snapshot)) {
+        case "unconfirmed":
+          return "the cancelled checkpoint's paused work could not be confirmed stopped. This session cannot be continued or replaced; exit PiCC and start it again.";
+        // The reader's own Esc, still settling. Telling them to abandon the session here is
+        // what made PiCC contradict itself seconds later, when the join landed and the same
+        // checkpoint became recoverable.
+        case "settling":
+          return "the cancellation you asked for has not finished settling yet; try again in a moment.";
+        case "settling-committed":
+          return "the cancellation you asked for is still settling, and this session's summary is already committed, so no compaction can release it. Start a new session and resend the retained input.";
+        // Reachable only while the replacement is in flight: a switch PiCC refuses rejects
+        // its cancellation, which classifies as `unconfirmed` above — so the new session
+        // this points at is genuinely coming.
+        case "replaced":
+          return "this checkpoint was cancelled for a session replacement, so compacting again would not release it. Resend the retained input in the new session.";
+        case "session-ended":
+          return "the cancelled checkpoint stopped with the session it belonged to, so compacting again would not release it. Start a new session and resend the retained input.";
+      }
+    };
+    const reason = inFlight
+      ? "a context compaction is already running for this session; wait for it to finish."
+      : snapshot.failureCategory === "restoration-paused"
+        ? "this session's summary is already committed and must never be compacted again. Start a new session and resend the retained input."
+        : controller.manualCompactionDisposition() === "already-active"
+          ? "a proactive context checkpoint owns this session's compaction; it will report when it settles."
+          : cancelledReason();
+    // Self-attributed in both modes, which is the whole point: Pi's own line carries no
+    // author, so an unprefixed complement would read as more of the same host message. The
+    // prefix is the one every other PiCC diagnostic uses, so `^PiCC: ` finds this too.
+    const notice = `PiCC: this compaction did not run — ${reason}`;
+    try {
+      if (contextMode(ctx) === "tui") ctx.ui?.notify?.(notice, "warning");
+      else console.error(notice);
+    } catch { /* the refusal is already decided */ }
+  };
+
+  pi.on("session_before_compact", async (event: any, ctx: any) => {
     const epoch = checkpointSessionEpoch;
     const controller = mainCheckpointGate.currentController();
     const generation = controller.snapshot().generation;
@@ -2803,6 +2984,15 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       activeCompactionOperation.generation === generation;
     if ((activeCompactionOperation && !replacingStaleManual) ||
         (!proactive && controller.manualCompactionDisposition() !== "allow")) {
+      // A refused user-initiated compaction is the one wordless ending left, and Pi
+      // already renders `{cancel:true}` as an unattributed "Compaction cancelled" that
+      // reads as if the reader withdrew it. Complement that line with the reason PiCC
+      // declined rather than repeating that it was cancelled. Only for a request the
+      // reader made: a refused proactive attempt announces itself as an exhaustion.
+      if (!proactive) {
+        explainRefusedCompaction(controller, ctx,
+          activeCompactionOperation !== undefined && !replacingStaleManual);
+      }
       return { cancel: true };
     }
     // Pi labels extension-initiated compact() as manual; controller summary
@@ -2936,8 +3126,10 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
     if (!proactive) {
       if (restorationFailed) {
-        const rejected = await controller.failAfterCommittedSummary(generation);
-        reportRejectedShadows(rejected, checkpointContext);
+        // The terminalization reports its own drained queue now, so forwarding the
+        // return value here would report the same shadows twice — and restore the same
+        // text into the TUI editor twice.
+        await controller.failAfterCommittedSummary(generation);
       } else if (event.reason === "manual" && operation.recovery && operation.recovery === controller.recoveryToken(generation)) {
         const recovered = controller.recoverAfterManualCompaction(operation.recovery);
         if (recovered.recovered) {

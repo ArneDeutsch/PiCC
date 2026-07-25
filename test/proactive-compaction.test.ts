@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,8 +10,10 @@ import {
   MidRunCompactionController,
   callbackCompactionAttempt,
   promiseCompactionAttempt,
+  type CheckpointProgress,
   type CompactionAttemptResult,
   type MidRunCompactionOptions,
+  type QueuedInputShadow,
 } from "../src/runtime/mid-run-compaction.js";
 
 describe("public async fd writer", () => {
@@ -391,8 +393,12 @@ describe("MidRunCompactionController", () => {
     const replay = deferred<{ delivered: false }>();
     let replayEntered = false;
     let joinCalls = 0;
+    const events: CheckpointProgress[] = [];
+    const dropped: Array<readonly QueuedInputShadow[]> = [];
     const controller = createController({
       sessionId: "s", threshold: 90, compact: async () => ({ ok: true }),
+      progress: (event) => events.push(event),
+      inputDropped: (rejected) => dropped.push(rejected),
       resume: () => ({
         settled: new Promise<void>(() => undefined),
         replay: () => {
@@ -417,6 +423,24 @@ describe("MidRunCompactionController", () => {
     await expect(controller.cancel(generation, "user")).rejects.toThrow("could not confirm quiescence");
     expect(joinCalls).toBe(1);
     expect(controller.snapshot()).toMatchObject({ phase: "cancelled", admission: "closed", queuedInputs: 1 });
+
+    // Both surfaces reject and every consumer swallows a rejection, so without these the
+    // ending is terminal in silence: no notice, no entry, and retained input nobody names.
+    expect(events.map((event) => [event.category, event.action])).toEqual([
+      ["checkpoint-armed", undefined], ["checkpoint-complete", "resume"],
+      ["checkpoint-cancelled", "restart-process"],
+    ]);
+    expect(dropped).toEqual([[expect.objectContaining({ content: "retained" })]]);
+    // `restart-process`, not `new-session`: a replacement cancellation — which is what the
+    // gate awaits inside `startSession` before installing a fresh controller — re-rejects
+    // for this generation forever, so telling the reader to start a new session would name
+    // the one action the controller refuses.
+    await expect(controller.cancel(generation, "replacement")).rejects.toThrow("could not confirm quiescence");
+    expect(controller.snapshot()).toMatchObject({
+      cancellationKind: "user", cancellationQuiescence: "unconfirmed",
+    });
+    expect(controller.manualCompactionDisposition()).toBe("unavailable");
+    expect(controller.recoveryToken(generation)).toBeUndefined();
   });
 
   it.each(["replay", "release", "settlement"] as const)(
@@ -1416,6 +1440,18 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  // A checkpoint that gives up in a non-interactive mode sets this worker's own
+  // `process.exitCode`, which is the product behaviour under test — and would otherwise
+  // leak out of whichever case happened to run last.
+  let savedExitCode: typeof process.exitCode;
+  beforeEach(() => {
+    savedExitCode = process.exitCode;
+    process.exitCode = undefined;
+  });
+  afterEach(() => {
+    process.exitCode = savedExitCode;
+  });
+
   it("rejects genuine input until a universally stopped host run settles, then accepts a real tool cycle", async () => {
     await mainCheckpointGate.startSession("stopped-input-wiring");
     const hookCount = path.join(dir, "input-hook-count");
@@ -2183,6 +2219,460 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     }
   });
 
+  /**
+   * Arms one checkpoint generation through the registered handlers and stops there. Only
+   * `agent_settled` hands a generation to the controller's run, so this reaches every
+   * ending a *transition* decides without starting a host transaction — and therefore
+   * without the fixture's real hook children. `session_start` is fired rather than calling
+   * the gate directly so `sessionManagerRef` is this context's, which decides whether the
+   * headless recovery guidance names a persisted session or calls the session ephemeral.
+   */
+  const armCheckpoint = async (ctx: any, id: string, queued?: string) => {
+    await pi.fire("session_start", { reason: "new" }, ctx);
+    mainCheckpointGate.assistantMessageEnded({
+      role: "assistant", content: [{ type: "toolCall", id, name: "probe", arguments: {} }],
+    });
+    const wrapped: any = mainCheckpointGate.wrapTool({
+      name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+    });
+    const result = await wrapped.execute(id, {}, undefined, undefined, ctx);
+    mainCheckpointGate.toolExecutionEnded({ toolCallId: id, result, isError: false });
+    mainCheckpointGate.turnEnded(ctx);
+    if (queued !== undefined) mainCheckpointGate.captureAcceptedInput(ctx, queued, undefined, "followUp");
+    const controller = mainCheckpointGate.currentController();
+    expect(controller.snapshot()).toMatchObject({
+      phase: "awaiting-settlement", queuedInputs: queued === undefined ? 0 : 1,
+    });
+    return { controller, generation: controller.snapshot().generation };
+  };
+
+  interface EndingCase {
+    /** Does this ending take the retained input away, or hold it for `/compact`? */
+    drops: boolean;
+    category: "checkpoint-cancelled" | "checkpoint-exhausted";
+    /**
+     * Pi stops the TUI renderer before it emits this ending's event, so in `tui` mode the
+     * reader's only remaining surface is stderr and there is no editor to restore into.
+     */
+    rendererStopped?: boolean;
+    drive(ctx: any, controller: MidRunCompactionController, generation: number): Promise<unknown>;
+    /** The claim the reader must be able to act on, which is not the same in every mode. */
+    guidance(mode: string): string;
+  }
+
+  /**
+   * A UI whose verbs are inert but present — Pi's `ui.stop()` state, where every render path
+   * returns early and `setEditorText` silently discards. The recording fake cannot model this
+   * (it keeps accepting notifications after shutdown), which is exactly why the shutdown row
+   * used to pass while the reader saw nothing.
+   */
+  const stoppedUi = {
+    notify: () => undefined,
+    setStatus: () => undefined,
+    getEditorText: () => "",
+    setEditorText: () => undefined,
+  };
+
+  const endings: Array<[string, EndingCase]> = [
+    ["a user cancellation", {
+      drops: true,
+      category: "checkpoint-cancelled",
+      drive: (_ctx, controller, generation) => controller.cancel(generation, "user"),
+      guidance: () => "Run /compact to recover this session",
+    }],
+    ["a replacement cancellation", {
+      drops: true,
+      category: "checkpoint-cancelled",
+      drive: (_ctx, controller, generation) => controller.cancel(generation, "replacement"),
+      guidance: () => "resend input in the new session",
+    }],
+    ["a shutdown cancellation", {
+      drops: true,
+      category: "checkpoint-cancelled",
+      // Through the registered handler, because the reader is quitting: the old wording
+      // sent them to a new session that will never exist. `quit` is the exact reason Pi's
+      // `dispose()` emits, and the one it has already stopped the renderer for.
+      rendererStopped: true,
+      drive: (ctx) => pi.fire("session_shutdown", { reason: "quit" }, ctx),
+      guidance: () => "stopped when the session ended",
+    }],
+    ["a post-commit failure", {
+      drops: true,
+      category: "checkpoint-exhausted",
+      drive: (_ctx, controller, generation) => controller.failAfterCommittedSummary(generation),
+      guidance: (mode) => mode === "tui"
+        ? "start a new session and resend the retained input"
+        : "start a replacement session and resend the retained input",
+    }],
+    ["an operational exhaustion", {
+      // The one ending that keeps the queue: it is still recoverable, and `/compact`
+      // is what rejects the retained input.
+      drops: false,
+      category: "checkpoint-exhausted",
+      drive: (ctx) => pi.fire("agent_settled", {}, ctx),
+      guidance: (mode) => mode === "tui"
+        ? "Run /compact, then explicitly continue"
+        : "This headless session is ephemeral and cannot be reopened",
+    }],
+  ];
+
+  const modes = ["tui", "print", "json"] as const;
+
+  it.each(endings.flatMap(([name, ending]) =>
+    modes.map((mode) => [`${name} in ${mode} mode`, mode, ending] as const)))(
+    "announces %s and reports what it cost",
+    async (_label, mode, ending) => {
+      const errors: string[] = [];
+      const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+        errors.push(args.map(String).join(" "));
+      });
+      try {
+        const base = {
+          model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+          getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+          hasPendingMessages: () => false,
+          // No `getSessionFile`: this session is ephemeral, which is the guidance the
+          // headless rows assert.
+          sessionManager: { getBranch: () => [] },
+          abort: () => undefined,
+          compact: (options: any) => queueMicrotask(() => options.onError(new Error("no summary"))),
+        };
+        const ctx = mode === "tui"
+          ? pi.tuiCtx(ending.rendererStopped ? { ...base, ui: stoppedUi } : base)
+          : mode === "print" ? pi.printCtx(base) : pi.printCtx({ ...base, mode: "json" });
+        // The channel this mode still has when the ending arrives. A stopped TUI has none
+        // of its own left: `notify` and `setEditorText` return without doing anything.
+        const channel = mode === "json"
+          ? "lifecycle"
+          : mode === "tui" && !ending.rendererStopped ? "notification" : "stderr";
+        const { controller, generation } = await armCheckpoint(ctx, `ending-${mode}`, "retained by the ending");
+        // After arming, not before: starting this session replaces the previous case's
+        // controller, and a recoverable exhaustion that still held input reports it right
+        // there — which is the behaviour a later case in this file owns.
+        pi.entries.length = 0;
+        pi.notifications.length = 0;
+        pi.editorText = "";
+        errors.length = 0;
+
+        await ending.drive(ctx, controller, generation);
+
+        const entries = pi.entries.filter((entry) => entry.customType === "picc-checkpoint-lifecycle");
+        const lifecycle = entries.filter((entry) => entry.data.category === ending.category);
+        // The ending reached the channel this mode actually has. A status-bar line the
+        // reader may never look at is not an announcement of a terminal, and neither is a
+        // notification handed to a renderer that has stopped.
+        if (channel === "notification") {
+          expect(pi.notifications.map((note) => note.text).join("\n"))
+            .toContain(ending.guidance(mode));
+        } else if (channel === "stderr") {
+          expect(errors.filter((line) => line.startsWith("PiCC: ")).join("\n"))
+            .toContain(ending.guidance(mode));
+        } else {
+          expect(lifecycle.map((entry) => String(entry.data.notice)).join("\n"))
+            .toContain(ending.guidance(mode));
+        }
+        // Persistence is unchanged for this ending's own category: json/rpc carry every
+        // category, print/TUI carry only exhaustion.
+        expect(lifecycle.length)
+          .toBe(mode === "json" || ending.category === "checkpoint-exhausted" ? 1 : 0);
+        // And nothing else widened it behind that filter: the ending's own record, plus at
+        // most the input-recovery report, which every mode persists.
+        expect(entries.length).toBe(lifecycle.length + (ending.drops ? 1 : 0));
+
+        // What the ending cost, named rather than implied — and where there is still an
+        // editor, handed back into it instead of only counted. A stopped renderer must
+        // report a restore of nothing rather than record text it silently discarded.
+        const recovery = entries.filter((entry) => entry.data.category === "checkpoint-input-recovery");
+        const restores = channel === "notification";
+        expect(recovery.map((entry) => entry.data.count)).toEqual(ending.drops ? [1] : []);
+        expect(recovery.map((entry) => entry.data.restoredTextCount))
+          .toEqual(ending.drops ? [restores ? 1 : 0] : []);
+        expect(pi.editorText).toBe(restores && ending.drops ? "retained by the ending\n" : "");
+
+        // Finished versus gave up, without parsing prose. Never in the TUI, where the
+        // reader is the one who saw the notice.
+        expect(process.exitCode).toBe(mode === "tui" ? undefined : 3);
+      } finally {
+        errorSpy.mockRestore();
+        pi.editorText = "";
+      }
+    },
+  );
+
+  it("refuses input after a session-ended cancellation without promising a wait or a new session", async () => {
+    const errors: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    try {
+      const ctx = pi.printCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [] },
+        abort: () => undefined,
+      });
+      const { controller } = await armCheckpoint(ctx, "shutdown-refusal");
+      await pi.fire("session_shutdown", { reason: "quit" }, ctx);
+      // The state the notice has to describe: cancelled by something other than the reader,
+      // settled, and holding no recovery capability.
+      expect(controller.snapshot()).toMatchObject({
+        phase: "cancelled", cancellationKind: "shutdown", cancellationQuiescence: "confirmed",
+      });
+      expect(controller.manualCompactionDisposition()).toBe("unavailable");
+      errors.length = 0;
+
+      await expect(pi.fire("input", { text: "still typing", source: "interactive" }, ctx))
+        .resolves.toEqual({ action: "handled" });
+
+      const refusal = errors.filter((line) => line.startsWith("PiCC: ")).join("\n");
+      expect(refusal).toContain("cannot be recovered here");
+      // Neither falsehood the endings themselves stopped telling: a wait that never ends,
+      // and a new session that will never carry this input.
+      expect(refusal).not.toContain("Wait before");
+      expect(refusal).not.toContain("Start a new session and resend this input");
+
+      // `/compact` in the same state answers from the same classification, so the two
+      // refusals cannot drift apart again.
+      errors.length = 0;
+      await expect(pi.fire("session_before_compact", { reason: "manual" }, ctx))
+        .resolves.toEqual({ cancel: true });
+      const declined = errors.filter((line) => line.startsWith("PiCC: ")).join("\n");
+      expect(declined).toContain("stopped with the session it belonged to");
+      // Says why PiCC declined; never offers the recovery this ending has no token for.
+      expect(declined).not.toContain("Run /compact");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("tells a reader whose own cancellation is still settling to wait, and never to abandon the session", async () => {
+    let aborts = 0;
+    const ctx = pi.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      hasPendingMessages: () => false,
+      sessionManager: { getBranch: () => [] },
+      compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+      abort: () => { aborts += 1; },
+    });
+    let outer: Promise<unknown> | undefined;
+    let nested: Promise<unknown> | undefined;
+    let cancelling: Promise<unknown> | undefined;
+    try {
+      // Esc during a resumed run — the most common cancellation there is. The real adapter's
+      // `cancelAndJoin` parks on the run's settlement while the `agent_settled` handler
+      // still owes it, which is the window the reader types `/compact` in.
+      ({ outer } = await driveResumeToResuming("esc-while-settling", ctx));
+      const controller = mainCheckpointGate.currentController();
+      const generation = controller.snapshot().generation;
+      cancelling = controller.cancel(generation, "user");
+      await waitUntil({
+        description: "the cancellation parked on the host join",
+        predicate: () => aborts > 0,
+      });
+      expect(controller.snapshot()).toMatchObject({
+        phase: "cancelled", cancellationKind: "user", cancellationQuiescence: "pending",
+        cancellationCommitted: false,
+      });
+      pi.notifications.length = 0;
+
+      await expect(pi.fire("session_before_compact", { reason: "manual" }, ctx))
+        .resolves.toEqual({ cancel: true });
+
+      // PiCC used to tell the reader here to throw the session away — seconds before the
+      // join landed and it offered `/compact` on the same checkpoint.
+      const refusal = pi.notifications.map((note) => note.text).join("\n");
+      expect(refusal).toContain("has not finished settling yet");
+      expect(refusal).not.toContain("Start a new session");
+      expect(refusal).not.toContain("exit PiCC");
+
+      // The wait it asked for is one that actually ends in the recovery it implies.
+      nested = pi.fire("agent_settled", {}, ctx);
+      await settlement(nested, { description: "the cancelled run's settlement handler" });
+      await settlement(cancelling, { description: "the parked user cancellation" });
+      await settlement(outer, { description: "the checkpoint generation barrier" });
+      expect(controller.manualCompactionDisposition()).toBe("allow");
+    } finally {
+      for (const pending of [nested, cancelling, outer]) void pending?.catch(() => undefined);
+    }
+  });
+
+  it("supersedes the resumed-work record when the resumed run gives up", async () => {
+    const ctx = resumeCtx({ mode: "json", sessionManager: { getBranch: () => [] } });
+    let outer: Promise<unknown> | undefined;
+    let nested: Promise<unknown> | undefined;
+    let terminal: Promise<unknown> | undefined;
+    try {
+      // Before the drive, not after: `replayComplete` appends the resumed-work record
+      // while this helper is still running, and clearing afterwards would delete the very
+      // record this case is about.
+      pi.entries.length = 0;
+      ({ outer } = await driveResumeToResuming("give-up-supersedes-resumed", ctx));
+      const stranded = mainCheckpointGate.currentController();
+      const generation = stranded.snapshot().generation;
+      // `replayComplete` runs unconditionally, so the documented success signal is
+      // already out before anything can go wrong with the resumed run.
+      await waitUntil({
+        description: "the resumed-work lifecycle record",
+        predicate: () => pi.entries.some((entry) => entry.data.category === "checkpoint-resumed"),
+      });
+
+      terminal = stranded.failAfterCommittedSummary(generation);
+      nested = pi.fire("agent_settled", {}, ctx);
+      await settlement(nested, { description: "the settlement handler the terminalization joins" });
+      await expect(nested).resolves.toBeUndefined();
+      await settlement(terminal, { description: "the post-commit terminalization" });
+      await settlement(outer, { description: "the checkpoint generation barrier" });
+      await expect(outer).resolves.toBeUndefined();
+
+      // `doc/user-guide.md` tells machine consumers to read `checkpoint-resumed` as proof
+      // the work resumed. It must never be the last word about a run that gave up.
+      // Input recovery is a different report with its own owner, and starting this
+      // session released what the previous case left retained.
+      const lifecycle = pi.entries.filter((entry) => entry.customType === "picc-checkpoint-lifecycle" &&
+        entry.data.category !== "checkpoint-input-recovery");
+      const categories = lifecycle.map((entry) => String(entry.data.category));
+      expect(categories).toContain("checkpoint-resumed");
+      expect(categories.at(-1)).toBe("checkpoint-exhausted");
+      expect(lifecycle.at(-1)?.data).toMatchObject({
+        category: "checkpoint-exhausted", failureCategory: "restoration-paused", action: "new-session",
+      });
+      expect(process.exitCode).toBe(3);
+    } finally {
+      for (const pending of [nested, terminal, outer]) void pending?.catch(() => undefined);
+    }
+  });
+
+  it.each([
+    ["a stopped logical run", async (ctx: any) => {
+      // The Stop/SessionStart/UserPromptSubmit hook stop path, at the seam all three use.
+      expect(mainCheckpointGate.captureLogicalRunStop()()).toBe(true);
+      await pi.fire("agent_settled", {}, ctx);
+    }, true],
+    ["a session switch", async (ctx: any) => {
+      await expect(pi.fire("session_before_switch", {}, ctx)).resolves.toBeUndefined();
+    }, false],
+    ["a new session", async (ctx: any) => {
+      await pi.fire("session_start", { reason: "new" }, ctx);
+    }, false],
+  ])(
+    "reports the queued input %s takes away",
+    async (_label, drive, suppressesNotice) => {
+      const ctx = pi.tuiCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [] },
+        abort: () => undefined,
+      });
+      await armCheckpoint(ctx, "dropped-input", "typed while paused");
+      pi.entries.length = 0;
+      pi.notifications.length = 0;
+      pi.editorText = "";
+
+      await drive(ctx);
+
+      expect(pi.entries.filter((entry) => entry.data.category === "checkpoint-input-recovery")
+        .map((entry) => entry.data.count)).toEqual([1]);
+      expect(pi.editorText).toBe("typed while paused\n");
+      // A run the reader already stopped must not narrate its own checkpoint — but the
+      // input they typed is theirs, and suppressing the notice used to suppress that too.
+      if (suppressesNotice) {
+        expect(pi.notifications.map((note) => note.text)
+          .filter((text) => text.startsWith("Proactive context compaction"))).toEqual([]);
+      }
+      pi.editorText = "";
+    },
+  );
+
+  it("reports queued input a recoverable exhaustion still held when the session is replaced", async () => {
+    const ctx = pi.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      hasPendingMessages: () => false,
+      sessionManager: { getBranch: () => [] },
+      abort: () => undefined,
+      compact: (options: any) => queueMicrotask(() => options.onError(new Error("no summary"))),
+    });
+    try {
+      const { controller } = await armCheckpoint(ctx, "exhausted-retained", "held for /compact");
+      pi.entries.length = 0;
+      pi.editorText = "";
+      await pi.fire("agent_settled", {}, ctx);
+      // A recoverable exhaustion deliberately keeps its queue, and nothing cancels it: the
+      // controller refuses to re-enter a terminal generation. Replacing the session is
+      // therefore the moment that input stops being reachable, and the only moment left to
+      // name it.
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "recoverable-rejection", queuedInputs: 1,
+      });
+      expect(pi.entries.filter((entry) => entry.data.category === "checkpoint-input-recovery")).toEqual([]);
+
+      await pi.fire("session_before_switch", {}, ctx);
+      expect(pi.entries.filter((entry) => entry.data.category === "checkpoint-input-recovery")
+        .map((entry) => entry.data.count)).toEqual([1]);
+      expect(pi.editorText).toBe("held for /compact\n");
+
+      // Exactly once: the switch drained what it reported, so the session start behind it
+      // finds nothing left and does not restore the same text a second time.
+      await pi.fire("session_start", { reason: "switch" }, ctx);
+      expect(pi.entries.filter((entry) => entry.data.category === "checkpoint-input-recovery")).toHaveLength(1);
+      expect(pi.editorText).toBe("held for /compact\n");
+    } finally {
+      pi.editorText = "";
+    }
+  });
+
+  it("explains a refused /compact instead of leaving Pi's unattributed cancellation alone", async () => {
+    const errors: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    try {
+      const tui = pi.tuiCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [] },
+        abort: () => undefined,
+      });
+      const { controller, generation } = await armCheckpoint(tui, "refused-compact");
+      await controller.failAfterCommittedSummary(generation);
+      pi.notifications.length = 0;
+
+      await expect(pi.fire("session_before_compact", { reason: "manual" }, tui))
+        .resolves.toEqual({ cancel: true });
+      // Complements Pi's own `Compaction cancelled`, which carries no author and reads as
+      // if the reader withdrew the request. It never repeats that word, it never offers the
+      // one recovery this ending forbids, and it carries the same `PiCC: ` prefix as every
+      // other diagnostic so one predicate finds them all.
+      const refusal = pi.notifications.map((note) => note.text)
+        .filter((text) => text.startsWith("PiCC: "));
+      expect(refusal).toHaveLength(1);
+      expect(refusal[0]).toContain("this compaction did not run");
+      expect(refusal[0]).toContain("must never be compacted again");
+      expect(refusal[0]).not.toContain("cancelled");
+
+      // Same refusal, headless: stderr rather than a toast, still self-attributed.
+      const print = pi.printCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [] },
+        abort: () => undefined,
+      });
+      const paused = await armCheckpoint(print, "refused-compact-headless");
+      await paused.controller.failAfterCommittedSummary(paused.generation);
+      errors.length = 0;
+      await expect(pi.fire("session_before_compact", { reason: "manual" }, print))
+        .resolves.toEqual({ cancel: true });
+      expect(errors.filter((line) => line.startsWith("PiCC: this compaction did not run"))).toHaveLength(1);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it("drops queued resumed print output when session replacement revokes its serialized-write authority", async () => {
     await mainCheckpointGate.startSession("queued-print-authority");
     const ctx = pi.printCtx({
@@ -2738,7 +3228,10 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(mainCheckpointGate.currentController().snapshot().phase).toBe("exhausted");
     const failure = pi.entries.find((entry) =>
       entry.customType === "picc-checkpoint-lifecycle" && entry.data.category === "checkpoint-exhausted");
-    expect(failure?.data.notice).toContain("reopen the exact persisted session before /compact");
+    // "the exact persisted session" is only actionable if the reader can tell which one
+    // it is, and a headless caller has no session picker to browse.
+    expect(failure?.data.notice).toContain(
+      `reopen the exact persisted session (${path.join(dir, "persisted-session.jsonl")}) before /compact`);
     expect(failure?.data.notice).toContain("Run /compact, then explicitly continue");
     expect(String(failure?.data.notice)).not.toContain("provider detail");
     expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation")).toBe(false);
