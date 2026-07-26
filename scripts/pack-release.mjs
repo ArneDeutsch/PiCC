@@ -1,86 +1,82 @@
 #!/usr/bin/env node
 
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { pathToFileURL } from "node:url";
-import {
-  administrativeEnvironment,
-  canonicalPath,
-  cleanupAdministrativeEnvironment,
-  collectAdministrativeChild,
-  findPackageRoot,
-  fixedNpmPolicyArgs,
-  isPathInside,
-  runTrustedNpm,
-} from "../bin/picc-admin.mjs";
+import { fileURLToPath } from "node:url";
+import { canonicalPath, findPackageRoot, isPathInside, parseStableExactVersion, spawnNpm } from "../bin/picc-admin.mjs";
 
-const USAGE = "Usage: node scripts/pack-release.mjs --output-dir <canonical-out-of-tree-directory>";
-const PACK_DEADLINE_MS = 120_000;
+const USAGE = "Usage: node scripts/pack-release.mjs --output-dir <empty-out-of-tree-directory>";
 
 function parseCli(argv) {
   if (argv.length !== 2 || argv[0] !== "--output-dir") throw new Error(USAGE);
   return { outputDir: argv[1] };
 }
 
-function canonicalEmptyDirectory(outputDir, packageRoot) {
-  const resolvedInput = path.resolve(outputDir);
-  const comparable = process.platform === "win32" ? resolvedInput.toLowerCase() : resolvedInput;
-  const canonical = canonicalPath(resolvedInput);
-  const stat = fs.lstatSync(resolvedInput, { throwIfNoEntry: false });
-  if (!stat?.isDirectory() || stat.isSymbolicLink() || canonical !== comparable) throw new Error("Pack output directory must be a canonical regular directory");
-  if (isPathInside(canonical, packageRoot) || isPathInside(packageRoot, canonical)) throw new Error("Pack output directory must be outside the project tree");
+function collect(child) {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => { stdout += Buffer.from(chunk).toString("utf8"); });
+    child.stderr?.on("data", (chunk) => { stderr += Buffer.from(chunk).toString("utf8"); });
+    child.once("error", (error) => resolve({ ok: false, stdout, stderr, error }));
+    child.once("close", (code, signal) => resolve({ ok: code === 0 && signal === null, stdout, stderr }));
+  });
+}
+
+function emptyOutputDirectory(outputDir, packageRoot) {
+  const resolved = path.resolve(outputDir);
+  const canonical = canonicalPath(resolved);
+  const stat = fs.lstatSync(resolved, { throwIfNoEntry: false });
+  if (!stat?.isDirectory() || stat.isSymbolicLink()) throw new Error("Pack output must be a regular directory");
+  if (isPathInside(canonical, packageRoot) || isPathInside(packageRoot, canonical)) throw new Error("Pack output must be outside the project tree");
   if (fs.readdirSync(canonical).length !== 0) throw new Error("Pack output directory must be empty");
   return canonical;
 }
 
-/** @param {any} [options] @returns {Promise<any>} */
+function sha256(filename) {
+  return createHash("sha256").update(fs.readFileSync(filename)).digest("hex");
+}
+
 export async function packRelease({
   outputDir,
   packageRoot = findPackageRoot(import.meta.url),
-  runNpm = runTrustedNpm,
-  collect = collectAdministrativeChild,
+  runNpm = spawnNpm,
 } = {}) {
   const root = canonicalPath(packageRoot);
-  const destination = canonicalEmptyDirectory(outputDir, root);
-  let allocated = false;
-  try {
-    const environment = administrativeEnvironment();
-    allocated = true;
-    fs.writeFileSync(environment.npm_config_userconfig, "", { mode: 0o600 });
-    fs.writeFileSync(environment.npm_config_globalconfig, "", { mode: 0o600 });
-    const administrativeRoot = canonicalPath(path.dirname(environment.npm_config_userconfig));
-    const args = [
-      "pack", root, "--json", `--pack-destination=${destination}`,
-      ...fixedNpmPolicyArgs({ userConfig: environment.npm_config_userconfig, globalConfig: environment.npm_config_globalconfig }),
-    ];
-    const child = runNpm(args, { cwd: administrativeRoot, trustedRoots: [administrativeRoot], stdio: "pipe" });
-    const result = await collect(child, { captureStdout: true, deadlineMs: PACK_DEADLINE_MS });
-    if (!result?.ok) throw new Error(`Sanitized npm pack failed: ${result?.category ?? "unknown error"}`);
-    let parsed;
-    try { parsed = JSON.parse(result.stdout); } catch { throw new Error("Sanitized npm pack returned malformed JSON"); }
-    if (!Array.isArray(parsed) || parsed.length !== 1 || typeof parsed[0]?.filename !== "string" || path.basename(parsed[0].filename) !== parsed[0].filename || !parsed[0].filename.endsWith(".tgz")) {
-      throw new Error("Sanitized npm pack did not return exactly one canonical tarball");
-    }
-    const tarball = canonicalPath(path.join(destination, parsed[0].filename));
-    if (!isPathInside(tarball, destination) || !fs.statSync(tarball).isFile()) throw new Error("Sanitized npm pack output escaped its destination");
-    const tgz = fs.readdirSync(destination).filter((entry) => entry.endsWith(".tgz"));
-    if (tgz.length !== 1 || canonicalPath(path.join(destination, tgz[0])) !== tarball) throw new Error("Sanitized npm pack produced an ambiguous artifact set");
-    return { tarball };
-  } finally {
-    if (allocated) cleanupAdministrativeEnvironment();
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  if (manifest?.name !== "picc" || !parseStableExactVersion(manifest.version)) throw new Error("Source package identity is invalid");
+  const destination = emptyOutputDirectory(outputDir, root);
+  const child = runNpm([
+    "pack", root, "--json", "--ignore-scripts", `--pack-destination=${destination}`,
+  ], { cwd: root, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+  const result = await collect(child);
+  if (!result.ok) throw new Error(`npm pack failed${result.stderr.trim() ? `: ${result.stderr.trim()}` : ""}`);
+  let records;
+  try { records = JSON.parse(result.stdout); } catch { throw new Error("npm pack returned malformed JSON"); }
+  const record = Array.isArray(records) && records.length === 1 ? records[0] : undefined;
+  if (record?.name !== "picc" || record.version !== manifest.version ||
+      typeof record.filename !== "string" || path.basename(record.filename) !== record.filename ||
+      !record.filename.endsWith(".tgz")) {
+    throw new Error("npm pack did not return one matching picc artifact");
   }
+  const tarball = canonicalPath(path.join(destination, record.filename));
+  if (!isPathInside(tarball, destination) || !fs.statSync(tarball).isFile()) throw new Error("npm pack artifact escaped its destination");
+  if (fs.readdirSync(destination).filter((entry) => entry.endsWith(".tgz")).length !== 1) throw new Error("npm pack produced an ambiguous artifact set");
+  return { name: "picc", version: manifest.version, tarball, sha256: sha256(tarball) };
 }
 
 export async function runPackReleaseCli(argv = process.argv.slice(2), output = console) {
   try {
-    const result = await packRelease(parseCli(argv));
-    output.log(JSON.stringify(result));
+    output.log(JSON.stringify(await packRelease(parseCli(argv))));
     return 0;
   } catch (error) {
-    output.error(error instanceof Error ? error.message : "Sanitized npm pack failed");
+    output.error(error instanceof Error ? error.message : "npm pack failed");
     return 1;
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) process.exitCode = await runPackReleaseCli();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.exitCode = await runPackReleaseCli();
+}

@@ -91,8 +91,6 @@ import { McpRuntime } from "./runtime/mcp.js";
 import { buildMcpProxyTools } from "./runtime/mcp-tools.js";
 import {
   capturePiccLaunchContext,
-  checkForNewerPiccRelease,
-  createPiccReleaseAdvisory,
   piccUpdateGuidance,
 } from "./runtime/picc-update.js";
 import {
@@ -297,8 +295,6 @@ export interface PiccTestSeam {
   managedArtifactDirs?: string[];
   /** TEST-ONLY bounded replacement for detached built-in SDK loading. */
   loadBuiltinSdk?: () => Promise<any>;
-  /** TEST-ONLY bounded replacement for the public-registry advisory request. */
-  checkPiccRelease?: typeof checkForNewerPiccRelease;
   /** TEST-ONLY in-process override for trusted-Git unavailability. */
   resolveTrustedGit?: () => Promise<string | undefined>;
 }
@@ -415,10 +411,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       .catch(() => undefined);
     return trustedGitPromise;
   };
-  const releaseAdvisory = createPiccReleaseAdvisory({
-    context: launchContext,
-    ...(testSeam?.checkPiccRelease ? { check: testSeam.checkPiccRelease } : {}),
-  });
   let startupSuppressionCleared = false;
   const clearStartupSuppression = (): void => {
     if (startupSuppressionCleared || !launchContext.direct) return;
@@ -520,7 +512,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     exec: async (cmd, args, opts) => {
       const trustedGit = cmd === "git" ? await resolveTrustedGit() : undefined;
       if (!trustedGit) {
-        return { stdout: "", stderr: "Trusted Git is unavailable", code: 1 };
+        return {
+          stdout: "",
+          stderr: "Git was not found on PATH; install Git or set PICC_GIT to its absolute path",
+          code: 1,
+        };
       }
       return await sanitizedExecFile(trustedGit, args, opts);
     },
@@ -2220,9 +2216,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         const level = mapEffort(config, config.effort);
         if (level) pi.setThinkingLevel(level);
       }
-      // core.hooksPath self-heal: a project shipping .githooks expects them live,
-      // but a clone installed with --ignore-scripts never ran the `prepare` that
-      // sets core.hooksPath. (Worktrees inherit it from the shared config.)
+      // A project shipping .githooks expects them live. Worktrees inherit this
+      // repository-local setting from the shared Git configuration.
       if (fs.existsSync(path.join(project.root, ".githooks"))) {
         const trustedGit = await resolveTrustedGit();
         if (trustedGit) {
@@ -2271,13 +2266,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       if (event.reason === "startup" && compat.mcpPendingNotice) {
         if (ctx.hasUI) ctx.ui?.notify?.(compat.mcpPendingNotice, "warning");
         else console.error(`PiCC: ${compat.mcpPendingNotice}`);
-      }
-      // Advisory only: TUI + direct verified registry launch. The detached,
-      // bounded checker never delays session_start or emits machine-mode output.
-      if (event.reason === "startup" && ctx.mode === "tui") {
-        releaseAdvisory.start((message) => {
-          try { ctx.ui?.notify?.(message, "info"); } catch { /* advisory only */ }
-        });
       }
     } catch (err) {
       console.error(`PiCC session_start failed: ${(err as Error).message}`);

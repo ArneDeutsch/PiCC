@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { discoverTrustedNpmCli, VALIDATION_MODES, validatePiSuite } from "../bin/picc-admin.mjs";
+import { PI_SUITE_PACKAGES, discoverNpmCommand, validatePiSuite } from "../bin/picc-admin.mjs";
 import {
   BASH_AVAILABLE,
   createE2ELive,
@@ -13,6 +13,14 @@ import {
 } from "./helpers/e2e-live.js";
 
 const { runPi, cleanup } = createE2ELive();
+const sourceManifest = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8")) as {
+  name: string;
+  version: string;
+  bin: { picc: string };
+  dependencies: Record<string, string>;
+};
+const expectedPiPins = PI_SUITE_PACKAGES.map((name) => sourceManifest.dependencies[name]);
+const expectedPiVersion = expectedPiPins[0]!;
 const tempDirs: string[] = [];
 let tarball: string;
 let packageRoot: string;
@@ -53,10 +61,10 @@ beforeAll(() => {
     version: "1.0.0",
     private: true,
   }));
-  const npmCli = discoverTrustedNpmCli();
-  if (!npmCli) throw new Error("trusted npm CLI is unavailable");
-  execFileSync(process.execPath, [
-    npmCli,
+  const npm = discoverNpmCommand();
+  if (!npm) throw new Error("npm is unavailable");
+  execFileSync(npm.command, [
+    ...npm.args,
     "install",
     "--prefix", prefix,
     tarball,
@@ -78,19 +86,31 @@ afterAll(() => {
 
 describe("installed release tarball", () => {
   it.skipIf(!BASH_AVAILABLE)(
-    "installs scripts-disabled and runs the packaged launcher through Pi 0.82 with a sanitized real Bash child",
+    `installs scripts-disabled and runs the packaged launcher through Pi ${expectedPiVersion} with a real Bash child`,
     async () => {
-      const graph = validatePiSuite({ packageRoot, ...{ mode: VALIDATION_MODES.STRICT_EXACT } });
-      expect(graph).toMatchObject({ ok: true, version: "0.82.0", mode: "strict-exact", source: false });
+      const installedManifest = JSON.parse(
+        fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"),
+      ) as typeof sourceManifest;
+      expect(installedManifest).toMatchObject({
+        name: "picc",
+        version: sourceManifest.version,
+        bin: { picc: "bin/picc.mjs" },
+      });
+      expect(PI_SUITE_PACKAGES.map((name) => installedManifest.dependencies[name]))
+        .toEqual(expectedPiPins);
+      expect(new Set(expectedPiPins)).toEqual(new Set([expectedPiVersion]));
+
+      const suite = validatePiSuite({ packageRoot });
+      expect(suite).toMatchObject({ ok: true, version: expectedPiVersion });
 
       const version = execFileSync(process.execPath, [launcher, "--version"], {
         cwd: packageRoot,
         encoding: "utf8",
         timeout: 30_000,
       });
-      expect(version).toContain("PiCC 0.1.0");
-      expect(version).toContain("Embedded Pi 0.82.0 (strict-exact)");
-      expect(version).toContain("Install known local package");
+      expect(version).toContain(`PiCC ${sourceManifest.version}`);
+      expect(version).toContain(`Embedded Pi ${expectedPiVersion}`);
+      expect(version).toContain("Install installed");
 
       const command = "node -e 'const e=process.env; console.log(JSON.stringify({sessionId:e.PI_SESSION_ID??null,sessionFile:e.PI_SESSION_FILE??null,provider:e.PI_PROVIDER??null,model:e.PI_MODEL??null,reasoning:e.PI_REASONING_LEVEL??null,project:e.CLAUDE_PROJECT_DIR??null,setting:e.PACKAGED_SETTING??null,skip:e.PI_SKIP_VERSION_CHECK??null,launcher:e.PICC_LAUNCHER_PID??null}))'";
       const result = await runPi({

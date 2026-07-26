@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 export const PI_SUITE_PACKAGES = Object.freeze([
@@ -10,64 +10,31 @@ export const PI_SUITE_PACKAGES = Object.freeze([
   "@earendil-works/pi-coding-agent",
   "@earendil-works/pi-tui",
 ]);
-export const VALIDATION_MODES = Object.freeze({
-  COHERENT_BOOTSTRAP: "coherent-bootstrap",
-  STRICT_EXACT: "strict-exact",
-});
-export const SAFE_ADMIN_ERROR_CODE = "PICC_SAFE_ADMIN_ERROR";
-
-export function safeAdministrativeError(message) {
-  const error = new Error(message);
-  error.code = SAFE_ADMIN_ERROR_CODE;
-  error.safeMessage = message;
-  return error;
-}
-
-export function isSafeAdministrativeError(value) {
-  return value?.code === SAFE_ADMIN_ERROR_CODE
-    && typeof value.safeMessage === "string"
-    && value.safeMessage.length > 0
-    && value.safeMessage.length <= 500
-    && !/[\r\n]/.test(value.safeMessage);
-}
 
 const VERSION_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
-const PUBLIC_REGISTRY_RE = /^https:\/\/registry\.npmjs\.org\/picc\/-\/picc-(\d+\.\d+\.\d+)\.tgz$/;
-const MAX_NODE_MODULES_DIRS = 4096;
-const MAX_NODE_MODULES_DEPTH = 64;
-const MAX_ADMINISTRATIVE_OUTPUT_BYTES = 256 * 1024;
-const DEFAULT_ADMINISTRATIVE_DEADLINE_MS = 30_000;
-const TERMINATION_GRACE_MS = 1_000;
 
 export function parseStableExactVersion(value) {
-  if (typeof value !== "string") return undefined;
-  const match = VERSION_RE.exec(value);
-  if (!match) return undefined;
-  // Decimal strings avoid silently rounding versions above Number.MAX_SAFE_INTEGER.
-  return Object.freeze({ raw: value, parts: Object.freeze(match.slice(1)) });
+  return typeof value === "string" && VERSION_RE.test(value) ? value : undefined;
 }
 
 function compareDecimal(left, right) {
-  return left.length === right.length ? (left < right ? -1 : left > right ? 1 : 0) : left.length < right.length ? -1 : 1;
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 export function compareStableVersions(left, right) {
-  const a = typeof left === "string" ? parseStableExactVersion(left) : left;
-  const b = typeof right === "string" ? parseStableExactVersion(right) : right;
-  if (!a || !b) throw new TypeError("PiCC requires stable exact semantic versions");
-  for (let index = 0; index < 3; index += 1) {
-    const compared = compareDecimal(a.parts[index], b.parts[index]);
+  const a = typeof left === "string" ? VERSION_RE.exec(left) : undefined;
+  const b = typeof right === "string" ? VERSION_RE.exec(right) : undefined;
+  if (!a || !b) return undefined;
+  for (let index = 1; index <= 3; index += 1) {
+    const compared = compareDecimal(a[index], b[index]);
     if (compared !== 0) return compared;
   }
   return 0;
 }
 
 function readJson(filename) {
-  try {
-    return JSON.parse(fs.readFileSync(filename, "utf8"));
-  } catch {
-    return undefined;
-  }
+  try { return JSON.parse(fs.readFileSync(filename, "utf8")); } catch { return undefined; }
 }
 
 export function canonicalPath(filename) {
@@ -83,604 +50,206 @@ export function isPathInside(candidate, parent) {
 export function findPackageRoot(moduleUrl = import.meta.url) {
   let current = path.dirname(fileURLToPath(moduleUrl));
   for (;;) {
-    const manifest = readJson(path.join(current, "package.json"));
-    if (manifest?.name === "picc") return canonicalPath(current);
+    if (readJson(path.join(current, "package.json"))?.name === "picc") return canonicalPath(current);
     const parent = path.dirname(current);
-    if (parent === current) throw new Error("PiCC package metadata is unavailable");
+    if (parent === current) throw new Error("PiCC package root is unavailable");
     current = parent;
   }
 }
 
-function executableCandidates(relativeCandidates) {
-  const executableDir = path.dirname(canonicalPath(process.execPath));
-  return relativeCandidates.map((candidate) => path.resolve(executableDir, candidate));
+function envPath(env) {
+  if (process.platform !== "win32") return env.PATH ?? "";
+  const key = Object.keys(env).find((name) => name.toLowerCase() === "path");
+  return key ? env[key] ?? "" : "";
 }
 
-function trustedWindowsUserPaths() {
-  if (process.platform !== "win32") return undefined;
-  const supplied = os.userInfo().homedir;
-  if (!path.isAbsolute(supplied)) throw new Error("The OS user profile is unavailable");
-  const home = canonicalPath(supplied);
-  const derive = (...segments) => {
-    const candidate = canonicalPath(path.join(home, ...segments));
-    if (!isPathInside(candidate, home)) throw new Error("The OS user profile is malformed");
-    return candidate;
-  };
-  return Object.freeze({
-    home,
-    appData: derive("AppData", "Roaming"),
-    localAppData: derive("AppData", "Local"),
-    temp: derive("AppData", "Local", "Temp"),
-  });
-}
-
-function trustedWindowsSystemRoot() {
-  if (process.platform !== "win32") return undefined;
-  const fixed = "C:\\Windows";
+function executableFile(filename) {
   try {
-    const actual = canonicalPath(fixed);
-    return actual === path.resolve(fixed).toLowerCase() && fs.statSync(actual).isDirectory() ? actual : undefined;
-  } catch {
-    return undefined;
+    if (!fs.statSync(filename).isFile()) return undefined;
+    if (process.platform !== "win32") fs.accessSync(filename, fs.constants.X_OK);
+    return canonicalPath(filename);
+  } catch { return undefined; }
+}
+
+export function findExecutableOnPath(name, env = process.env) {
+  if (typeof name !== "string" || name.length === 0 || path.isAbsolute(name) || name.includes("/") || name.includes("\\")) return undefined;
+  const extensions = process.platform === "win32"
+    ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";")
+      .filter((extension) => [".com", ".exe"].includes(extension.toLowerCase()))
+    : [""];
+  const hasExtension = process.platform === "win32" && path.extname(name) !== "";
+  for (const directory of envPath(env).split(path.delimiter)) {
+    if (!directory) continue;
+    for (const extension of hasExtension ? [""] : extensions) {
+      const found = executableFile(path.join(directory, `${name}${extension}`));
+      if (found) return found;
+    }
   }
+  return undefined;
 }
 
-export function discoverTrustedNpmCli() {
-  const candidates = executableCandidates([
-    "node_modules/npm/bin/npm-cli.js",
-    "../lib/node_modules/npm/bin/npm-cli.js",
-    "../node_modules/npm/bin/npm-cli.js",
-  ]);
-  return candidates.find((candidate) => fs.statSync(candidate, { throwIfNoEntry: false })?.isFile());
+export function discoverTrustedGit(env = process.env) {
+  const override = env.PICC_GIT;
+  if (override !== undefined) {
+    if (process.platform === "win32" && ![".com", ".exe"].includes(path.extname(override).toLowerCase())) return undefined;
+    return path.isAbsolute(override) ? executableFile(override) : undefined;
+  }
+  return findExecutableOnPath("git", env);
 }
 
-export function discoverTrustedGit() {
-  const candidates = process.platform === "win32"
-    ? [
-        path.join(trustedWindowsUserPaths().localAppData, "Programs", "Git", "cmd", "git.exe"),
-        "C:\\Program Files\\Git\\cmd\\git.exe",
-        "C:\\Program Files (x86)\\Git\\cmd\\git.exe",
-      ]
-    : ["/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"];
-  return candidates.find((candidate) => path.isAbsolute(candidate) && fs.statSync(candidate, { throwIfNoEntry: false })?.isFile());
-}
-
-function trustedTemporaryRoot() {
-  const windows = process.platform === "win32" ? trustedWindowsUserPaths() : undefined;
-  const systemRoot = trustedWindowsSystemRoot();
-  const candidates = process.platform === "win32"
-    ? [windows.temp, ...(systemRoot ? [path.join(systemRoot, "Temp")] : [])]
-    : ["/tmp", "/var/tmp"];
+export function discoverNpmCommand({ env = process.env, execPath = process.execPath } = {}) {
+  const candidates = [];
+  if (typeof env.npm_execpath === "string" && path.isAbsolute(env.npm_execpath)) candidates.push(env.npm_execpath);
+  const nodeDir = path.dirname(execPath);
+  candidates.push(
+    path.join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js"),
+    path.resolve(nodeDir, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+    path.resolve(nodeDir, "..", "node_modules", "npm", "bin", "npm-cli.js"),
+  );
   for (const candidate of candidates) {
-    try {
-      if (path.isAbsolute(candidate) && fs.statSync(candidate).isDirectory()) return canonicalPath(candidate);
-    } catch { /* try the next fixed platform location */ }
+    const cli = executableFile(candidate);
+    if (cli) return { command: canonicalPath(execPath), args: [cli] };
   }
-  throw new Error("A trusted administrative temporary directory is unavailable");
-}
-
-const TRUSTED_TEMP_ROOT = trustedTemporaryRoot();
-let administrationRoot;
-let administrationUsers = 0;
-
-function ensureAdministrationRoot() {
-  if (!administrationRoot) administrationRoot = fs.mkdtempSync(path.join(TRUSTED_TEMP_ROOT, "picc-administration-"));
-  return administrationRoot;
-}
-
-export function administrativeEnvironment() {
-  const root = ensureAdministrationRoot();
-  const home = path.join(root, "home");
-  const temp = path.join(root, "temp");
-  const windows = process.platform === "win32" ? trustedWindowsUserPaths() : undefined;
-  const appData = windows?.appData ?? path.join(home, "AppData", "Roaming");
-  const localAppData = windows?.localAppData ?? path.join(home, "AppData", "Local");
-  for (const directory of [home, temp, path.join(root, "npm-cache")]) fs.mkdirSync(directory, { recursive: true });
-  const env = {
-    HOME: home,
-    USERPROFILE: home,
-    APPDATA: appData,
-    LOCALAPPDATA: localAppData,
-    TEMP: temp,
-    TMP: temp,
-    TMPDIR: temp,
-    npm_config_cache: path.join(root, "npm-cache"),
-    npm_config_userconfig: path.join(root, "npmrc"),
-    npm_config_globalconfig: path.join(root, "global-npmrc"),
-    NO_PROXY: "*",
-    no_proxy: "*",
-    PATH: [path.dirname(canonicalPath(process.execPath)), path.dirname(discoverTrustedGit() ?? process.execPath)].join(path.delimiter),
-  };
-  const systemRoot = trustedWindowsSystemRoot();
-  if (systemRoot) {
-    env.SystemRoot = systemRoot;
-    env.WINDIR = systemRoot;
+  if (process.platform !== "win32") {
+    const npm = findExecutableOnPath("npm", env);
+    if (npm) return { command: npm, args: [] };
   }
-  return env;
+  return undefined;
 }
 
-export function fixedNpmPolicyArgs({ userConfig, globalConfig } = {}) {
-  const environment = userConfig === undefined || globalConfig === undefined
-    ? administrativeEnvironment()
-    : undefined;
-  return [
-    "--ignore-scripts", "--audit=false", "--fund=false",
-    "--registry=https://registry.npmjs.org/",
-    `--userconfig=${userConfig ?? environment?.npm_config_userconfig}`,
-    `--globalconfig=${globalConfig ?? environment?.npm_config_globalconfig}`,
-    "--proxy=null", "--https-proxy=null", "--noproxy=*", "--strict-ssl=true",
-    "--cafile=null", "--ca=null", "--cert=null", "--key=null",
-  ];
-}
-
-export function hardenedGitArgs(args) {
-  const environment = administrativeEnvironment();
-  const administrativeRoot = canonicalPath(path.dirname(environment.npm_config_userconfig));
-  const hooks = path.join(administrativeRoot, "empty-git-hooks");
-  fs.mkdirSync(hooks, { recursive: true, mode: 0o700 });
-  const verifiedHooks = canonicalPath(hooks);
-  if (!fs.statSync(verifiedHooks).isDirectory() || !isPathInside(verifiedHooks, administrativeRoot)) throw new Error("unsafe hooks directory");
-  return [
-    "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", `core.hooksPath=${verifiedHooks}`,
-    "-c", "filter.lfs.clean=", "-c", "filter.lfs.process=", ...args,
-  ];
-}
-
-export function wireChildLifecycle(child, { onSpawnError, onExitCode, onSignal }) {
-  let spawnFailed = false;
-  child.once("error", () => {
-    spawnFailed = true;
-    onSpawnError();
-  });
-  child.once("exit", (code, signal) => {
-    if (spawnFailed) return;
-    if (signal) onSignal(signal);
-    else onExitCode(code ?? 1);
-  });
-}
-
-export function cleanupAdministrativeEnvironment() {
-  if (!administrationRoot || administrationUsers !== 0) return false;
-  const root = administrationRoot;
-  administrationRoot = undefined;
-  fs.rmSync(root, { recursive: true, force: true });
-  return !fs.existsSync(root);
-}
-
-function trustedCwd(cwd, trustedRoots) {
-  const actual = canonicalPath(cwd);
-  const roots = trustedRoots.map(canonicalPath);
-  if (!roots.some((root) => isPathInside(actual, root))) throw new Error("Administrative cwd is outside trusted roots");
-  return actual;
-}
-
-function trustedAdministrativeOverlay(environmentOverlay) {
-  if (environmentOverlay === undefined) return undefined;
-  const entries = Object.entries(environmentOverlay);
-  if (entries.length !== 1 || entries[0][0] !== "NODE_AUTH_TOKEN") throw new Error("Administrative environment overlay is not permitted");
-  const token = entries[0][1];
-  if (typeof token !== "string" || token.length === 0 || token.length > 4096 || !/^[!-~]+$/.test(token)) throw new Error("NODE_AUTH_TOKEN is malformed");
-  return { NODE_AUTH_TOKEN: token };
-}
-
-export function runAdministrativeChild(executable, args, { cwd, trustedRoots, stdio = "pipe", environmentOverlay } = {}) {
-  if (!path.isAbsolute(executable)) throw new Error("Administrative executables must be absolute");
-  const overlay = trustedAdministrativeOverlay(environmentOverlay);
-  const root = ensureAdministrationRoot();
-  const defaultCwd = path.dirname(canonicalPath(process.execPath));
-  const childCwd = trustedCwd(cwd ?? defaultCwd, trustedRoots ?? [defaultCwd, root]);
-  administrationUsers += 1;
-  let child;
-  try {
-    child = spawn(executable, args, {
-      cwd: childCwd,
-      env: { ...administrativeEnvironment(), ...overlay },
-      detached: process.platform !== "win32",
-      shell: false,
-      stdio,
-      windowsHide: true,
-    });
-  } catch (error) {
-    administrationUsers -= 1;
-    cleanupAdministrativeEnvironment();
-    throw error;
-  }
-  child.once("close", () => {
-    administrationUsers -= 1;
-    cleanupAdministrativeEnvironment();
-  });
-  return child;
-}
-
-function taskkillPath() {
-  const systemRoot = trustedWindowsSystemRoot();
-  if (!systemRoot) return undefined;
-  const candidate = path.join(systemRoot, "System32", "taskkill.exe");
-  return fs.statSync(candidate, { throwIfNoEntry: false })?.isFile() ? candidate : undefined;
-}
-
-function waitForClose(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
-  return new Promise((resolve) => child.once("close", resolve));
-}
-
-export async function terminateAdministrativeChildTree(child) {
-  const pid = child.pid;
-  if (!Number.isSafeInteger(pid) || pid <= 0) {
-    child.kill?.("SIGKILL");
-    await waitForClose(child);
-    return;
-  }
-  if (process.platform === "win32") {
-    const taskkill = taskkillPath();
-    if (!taskkill) throw new Error("Trusted process-tree termination is unavailable");
-    const killer = spawn(taskkill, ["/PID", String(pid), "/T", "/F"], {
-      cwd: path.dirname(taskkill), env: administrativeEnvironment(), shell: false, windowsHide: true, stdio: "ignore",
-    });
-    await Promise.all([waitForClose(killer), waitForClose(child)]);
-    return;
-  }
-  try { process.kill(-pid, "SIGTERM"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
-  const closed = waitForClose(child);
-  await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, TERMINATION_GRACE_MS))]);
-  try { process.kill(-pid, "SIGKILL"); } catch (error) { if (error?.code !== "ESRCH") throw error; }
-  await closed;
-}
-
-export function collectAdministrativeChild(child, {
-  captureStdout = false,
-  deadlineMs = DEFAULT_ADMINISTRATIVE_DEADLINE_MS,
-  maxOutputBytes = MAX_ADMINISTRATIVE_OUTPUT_BYTES,
-  stderrConsumer,
-  acceptedCodes = [0],
-} = {}) {
-  return new Promise((resolve) => {
-    let bytes = 0;
-    let stdout = "";
-    let closed = false;
-    let forcedCategory;
-    let stopping;
-    let deadline;
-    const stop = (category) => {
-      forcedCategory ??= category;
-      stopping ??= terminateAdministrativeChildTree(child).catch(() => undefined);
-    };
-    if (deadlineMs !== null) deadline = setTimeout(() => stop("deadline exceeded"), deadlineMs);
-    const consume = (chunk, capture) => {
-      bytes += chunk.length;
-      if (bytes > maxOutputBytes) stop("output overflow");
-      else if (capture) stdout += String(chunk);
-    };
-    child.stdout?.on("data", (chunk) => consume(chunk, captureStdout));
-    child.stderr?.on("data", (chunk) => {
-      consume(chunk, false);
-      if (bytes <= maxOutputBytes) stderrConsumer?.(chunk);
-    });
-    child.once("error", () => stop("spawn error"));
-    child.once("close", async (code, signal) => {
-      if (closed) return;
-      closed = true;
-      if (deadline !== undefined) clearTimeout(deadline);
-      if (stopping) await stopping;
-      if (forcedCategory) resolve({ ok: false, category: forcedCategory, stdout: "", code });
-      else if (signal) resolve({ ok: false, category: "termination signal", stdout: "", code });
-      else if (!acceptedCodes.includes(code)) resolve({ ok: false, category: "nonzero exit", stdout: "", code });
-      else resolve({ ok: true, category: "success", stdout, code });
-    });
-  });
-}
-
-export function runTrustedNpm(args, options) {
-  const npmCli = discoverTrustedNpmCli();
-  if (!npmCli) throw new Error("Trusted npm CLI is unavailable");
-  return runAdministrativeChild(process.execPath, [npmCli, ...args], options);
-}
-
-export function runAuthenticatedTrustedNpm(args, { token, ...options } = {}) {
-  return runTrustedNpm(args, { ...options, environmentOverlay: { NODE_AUTH_TOKEN: token } });
-}
-
-function runAdministrativeSync(executable, args, cwd) {
-  const root = ensureAdministrationRoot();
-  try {
-    return spawnSync(executable, args, {
-      cwd: trustedCwd(cwd, [cwd]),
-      env: administrativeEnvironment(),
-      encoding: "utf8",
-      shell: false,
-      windowsHide: true,
-    });
-  } finally {
-    cleanupAdministrativeEnvironment();
-    if (administrationRoot === root) cleanupAdministrativeEnvironment();
-  }
+export function spawnNpm(args, options = {}) {
+  const npm = discoverNpmCommand({ env: options.env ?? process.env });
+  if (!npm) throw new Error("npm was not found; install npm or run the equivalent npm command directly");
+  return spawn(npm.command, [...npm.args, ...args], { shell: false, windowsHide: true, ...options });
 }
 
 export function discoverGlobalNpmRoot() {
-  const npmCli = discoverTrustedNpmCli();
-  if (!npmCli) return undefined;
-  const result = runAdministrativeSync(process.execPath, [npmCli, "root", "--global"], path.dirname(canonicalPath(process.execPath)));
-  const output = result.status === 0 ? result.stdout.trim() : "";
+  const npm = discoverNpmCommand();
+  if (!npm) return undefined;
+  const result = spawnSync(npm.command, [...npm.args, "root", "--global"], {
+    env: process.env, encoding: "utf8", windowsHide: true, shell: false,
+  });
+  const output = result.status === 0 ? result.stdout?.trim() : "";
   try {
-    return path.isAbsolute(output) && fs.statSync(output, { throwIfNoEntry: false })?.isDirectory() ? canonicalPath(output) : undefined;
-  } catch {
-    return undefined;
-  }
+    return output && path.isAbsolute(output) && fs.statSync(output).isDirectory() ? canonicalPath(output) : undefined;
+  } catch { return undefined; }
 }
 
-export function runTrustedGit(args, options) {
-  const git = discoverTrustedGit();
-  if (!git) throw new Error("Trusted Git is unavailable");
-  return runAdministrativeChild(git, args, options);
-}
-
-function gitOwnedCheckout(packageRoot) {
-  const git = discoverTrustedGit();
-  if (!git) return false;
-  const root = canonicalPath(packageRoot);
-  const result = runAdministrativeSync(git, ["-C", root, "rev-parse", "--show-toplevel"], root);
-  if (result.status !== 0) return false;
+export function classifyInstallation({ packageRoot } = {}) {
   try {
-    const top = canonicalPath(result.stdout.trim());
-    return isPathInside(root, top);
-  } catch {
-    return false;
-  }
+    const root = canonicalPath(packageRoot ?? findPackageRoot());
+    const git = fs.lstatSync(path.join(root, ".git"), { throwIfNoEntry: false });
+    const lock = fs.lstatSync(path.join(root, "package-lock.json"), { throwIfNoEntry: false });
+    return git && (git.isFile() || git.isDirectory()) && lock?.isFile() ? "source" : "installed";
+  } catch { return "installed"; }
 }
 
-function findContainingNodeModules(packageRoot) {
+function containingNodeModules(packageRoot) {
   let current = canonicalPath(packageRoot);
   for (;;) {
     const parent = path.dirname(current);
-    if (path.basename(parent) === "node_modules") return parent;
-    if (path.basename(path.dirname(parent)) === "node_modules" && path.basename(parent).startsWith("@")) return path.dirname(parent);
+    if (path.basename(parent).toLowerCase() === "node_modules") return parent;
+    if (path.basename(path.dirname(parent)).toLowerCase() === "node_modules" && path.basename(parent).startsWith("@")) return path.dirname(parent);
     if (parent === current) return undefined;
     current = parent;
   }
 }
 
-function registryProof(packageRoot, version) {
-  const nodeModules = findContainingNodeModules(packageRoot);
-  if (!nodeModules) return false;
-  const lock = readJson(path.join(nodeModules, ".package-lock.json"));
-  const entry = lock?.packages?.["node_modules/picc"];
-  const match = typeof entry?.resolved === "string" ? PUBLIC_REGISTRY_RE.exec(entry.resolved) : undefined;
-  return entry?.version === version && match?.[1] === version && typeof entry?.integrity === "string" && entry.integrity.length > 0;
-}
-
-export function classifyInstallation({ packageRoot, globalRoot } = {}) {
-  let root;
+function admissibleNodeModules(packageRoot) {
+  const roots = [];
   try {
-    root = canonicalPath(packageRoot ?? findPackageRoot());
-  } catch {
-    return "unknown/other";
-  }
-  const manifest = readJson(path.join(root, "package.json"));
-  if (!manifest || !parseStableExactVersion(manifest.version)) return "unknown/other";
-  if (gitOwnedCheckout(root)) return "source";
-  if (globalRoot) {
+    const local = path.join(packageRoot, "node_modules");
+    if (fs.statSync(local).isDirectory()) roots.push(canonicalPath(local));
+  } catch { /* dependencies may be missing */ }
+  const containing = containingNodeModules(packageRoot);
+  if (containing) {
     try {
-      const nodeModules = findContainingNodeModules(root);
-      const expectedGlobalRoot = canonicalPath(globalRoot);
-      if (nodeModules && canonicalPath(nodeModules) === expectedGlobalRoot && isPathInside(root, expectedGlobalRoot)) {
-        return registryProof(root, manifest.version) ? "verified public-registry global npm" : "unknown/other";
-      }
-    } catch {
-      return "unknown/other";
-    }
+      const canonical = canonicalPath(containing);
+      if (!roots.includes(canonical)) roots.push(canonical);
+    } catch { /* ignore unusable containing root */ }
   }
-  const nodeModules = findContainingNodeModules(root);
-  if (!nodeModules) return "unknown/other";
-  try {
-    return readJson(path.join(path.dirname(nodeModules), "package.json")) && isPathInside(root, canonicalPath(nodeModules))
-      ? "known local package"
-      : "unknown/other";
-  } catch {
-    return "unknown/other";
-  }
+  return roots;
 }
 
-function declarationVersion(value) {
-  const exact = parseStableExactVersion(value);
-  if (exact) return { exact: true, version: exact.raw };
-  if (typeof value === "string" && value.startsWith("^")) {
-    const parsed = parseStableExactVersion(value.slice(1));
-    if (parsed) return { exact: false, version: parsed.raw };
+function resolveSuitePackage(name, roots) {
+  for (const nodeModules of roots) {
+    const logicalRoot = path.join(nodeModules, ...name.split("/"));
+    let logicalStat;
+    try { logicalStat = fs.lstatSync(logicalRoot, { throwIfNoEntry: false }); }
+    catch { return { problem: "is unreadable" }; }
+    if (!logicalStat) continue;
+    if (!logicalStat.isDirectory() && !logicalStat.isSymbolicLink()) {
+      return { problem: "has an invalid package directory" };
+    }
+    try {
+      const packageRoot = canonicalPath(logicalRoot);
+      if (!isPathInside(packageRoot, nodeModules)) return { problem: "escapes its dependency root" };
+      const manifestPath = path.join(logicalRoot, "package.json");
+      const stat = fs.lstatSync(manifestPath, { throwIfNoEntry: false });
+      if (!stat?.isFile() || stat.isSymbolicLink()) return { problem: "has missing or invalid package metadata" };
+      const manifest = readJson(manifestPath);
+      return manifest
+        ? { packageRoot, manifest }
+        : { problem: "has unreadable package metadata" };
+    } catch { return { problem: "is unreadable" }; }
   }
   return undefined;
 }
 
-function satisfiesDeclaration(version, declaration) {
-  if (declaration.exact) return version === declaration.version;
-  const actual = parseStableExactVersion(version);
-  const minimum = parseStableExactVersion(declaration.version);
-  if (!actual || !minimum || compareStableVersions(actual, minimum) < 0) return false;
-  const [major, minor, patch] = minimum.parts;
-  if (major !== "0") return actual.parts[0] === major;
-  if (minor !== "0") return actual.parts[0] === "0" && actual.parts[1] === minor;
-  return actual.parts[0] === "0" && actual.parts[1] === "0" && actual.parts[2] === patch;
+function suiteFailure(reason) {
+  return { ok: false, reason: `${reason}. Run \`picc update\` or reinstall PiCC.` };
 }
 
-function suitePath(nodeModules, name) {
-  return path.join(nodeModules, ...name.split("/"));
-}
-
-function candidateNodeModules(packageRoot) {
-  const root = canonicalPath(packageRoot);
-  const candidates = [];
-  const owned = path.join(root, "node_modules");
-  if (fs.statSync(owned, { throwIfNoEntry: false })?.isDirectory()) candidates.push(canonicalPath(owned));
-  // npm hoists dependencies to the node_modules that physically contains picc.
-  // Do not continue into unrelated ancestors (notably a checkout that stores worktrees below itself).
-  const containing = findContainingNodeModules(root);
-  if (containing && fs.statSync(containing, { throwIfNoEntry: false })?.isDirectory()) candidates.push(canonicalPath(containing));
-  return [...new Set(candidates)];
-}
-
-function installedOccurrence(name, logicalRoot, admissibleNodeModules) {
-  try {
-    const root = canonicalPath(logicalRoot);
-    if (!admissibleNodeModules.some((nodeModules) => isPathInside(root, nodeModules))) return undefined;
-    const manifest = readJson(path.join(root, "package.json"));
-    return manifest?.name === name && parseStableExactVersion(manifest.version) ? { name, root, version: manifest.version } : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function resolveInstalledSuite(packageRoot, nodeModulesRoots) {
-  const resolved = new Map();
-  for (const name of PI_SUITE_PACKAGES) {
-    let occurrence;
-    for (const nodeModules of nodeModulesRoots) {
-      const candidate = suitePath(nodeModules, name);
-      if (!fs.statSync(candidate, { throwIfNoEntry: false })?.isDirectory()) continue;
-      occurrence = installedOccurrence(name, candidate, nodeModulesRoots);
-      if (occurrence) break;
-      return undefined;
-    }
-    if (!occurrence) return undefined;
-    resolved.set(name, occurrence.root);
-  }
-  return resolved;
-}
-
-function validLockPath(relative) {
-  if (typeof relative !== "string" || relative.includes("\\")) return undefined;
-  if (relative === "") return "";
-  if (path.posix.isAbsolute(relative) || /^[A-Za-z]:/.test(relative) || relative.startsWith("//")) return undefined;
-  const segments = relative.split("/");
-  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) return undefined;
-  return segments.join("/");
-}
-
-function lockOccurrences(packageRoot, lock, admissibleNodeModules) {
-  if (!lock?.packages || typeof lock.packages !== "object" || Array.isArray(lock.packages)) return undefined;
-  const occurrences = [];
-  for (const [relative, metadata] of Object.entries(lock.packages)) {
-    const normalized = validLockPath(relative);
-    if (normalized === undefined) return undefined;
-    for (const name of PI_SUITE_PACKAGES) {
-      if (normalized === `node_modules/${name}` || normalized.endsWith(`/node_modules/${name}`)) {
-        const logicalRoot = path.resolve(packageRoot, ...normalized.split("/"));
-        const expectedParent = path.resolve(packageRoot, ...normalized.slice(0, -name.length).split("/").filter(Boolean));
-        let parent;
-        try {
-          parent = canonicalPath(expectedParent);
-        } catch {
-          return undefined;
-        }
-        if (!admissibleNodeModules.some((root) => isPathInside(parent, root))) return undefined;
-        const installed = installedOccurrence(name, logicalRoot, admissibleNodeModules);
-        occurrences.push({ name, metadata, installed });
-      }
-    }
-  }
-  return occurrences;
-}
-
-function scanPhysicalOccurrences(nodeModulesRoots) {
-  const pending = nodeModulesRoots.map((root) => ({ root, depth: 0 }));
-  const visited = new Set();
-  const occurrences = [];
-  while (pending.length > 0) {
-    const { root, depth } = pending.pop();
-    let identity;
-    try {
-      identity = canonicalPath(root);
-    } catch {
-      return undefined;
-    }
-    if (visited.has(identity)) continue;
-    if (visited.size >= MAX_NODE_MODULES_DIRS || depth > MAX_NODE_MODULES_DEPTH) return undefined;
-    visited.add(identity);
-    for (const name of PI_SUITE_PACKAGES) {
-      const candidate = suitePath(root, name);
-      if (!fs.statSync(candidate, { throwIfNoEntry: false })?.isDirectory()) continue;
-      const occurrence = installedOccurrence(name, candidate, nodeModulesRoots);
-      if (!occurrence) return undefined;
-      occurrences.push(occurrence);
-    }
-    let entries;
-    try {
-      entries = fs.readdirSync(root, { withFileTypes: true });
-    } catch {
-      return undefined;
-    }
-    const packageRoots = [];
-    for (const entry of entries) {
-      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-      const entryPath = path.join(root, entry.name);
-      if (entry.name.startsWith("@")) {
-        let scoped;
-        try { scoped = fs.readdirSync(entryPath, { withFileTypes: true }); } catch { return undefined; }
-        for (const child of scoped) if (child.isDirectory() || child.isSymbolicLink()) packageRoots.push(path.join(entryPath, child.name));
-      } else packageRoots.push(entryPath);
-    }
-    for (const packageRoot of packageRoots) {
-      const nested = path.join(packageRoot, "node_modules");
-      if (fs.statSync(nested, { throwIfNoEntry: false })?.isDirectory()) pending.push({ root: nested, depth: depth + 1 });
-    }
-  }
-  return { occurrences, scannedNodeModules: visited.size };
-}
-
-export function validatePiSuite({ packageRoot = findPackageRoot(), mode } = {}) {
+export function validatePiSuite({ packageRoot = findPackageRoot() } = {}) {
   let root;
-  try { root = canonicalPath(packageRoot); } catch { return { ok: false, reason: "PiCC package metadata is invalid" }; }
+  try { root = canonicalPath(packageRoot); } catch { return suiteFailure("The PiCC package root is unavailable"); }
   const manifest = readJson(path.join(root, "package.json"));
-  if (!manifest?.dependencies) return { ok: false, reason: "PiCC package metadata is invalid" };
-  const declarations = PI_SUITE_PACKAGES.map((name) => [name, declarationVersion(manifest.dependencies[name])]);
-  if (declarations.some(([, declaration]) => !declaration)) return { ok: false, reason: "PiCC has malformed Pi suite declarations" };
-  const exactDeclarations = declarations.every(([, declaration]) => declaration.exact);
-  const selectedMode = mode ?? (exactDeclarations ? VALIDATION_MODES.STRICT_EXACT : VALIDATION_MODES.COHERENT_BOOTSTRAP);
-  if (!Object.values(VALIDATION_MODES).includes(selectedMode)) return { ok: false, reason: "Unknown Pi suite policy" };
-  if (selectedMode === VALIDATION_MODES.STRICT_EXACT && !exactDeclarations) return { ok: false, reason: "PiCC requires exact Pi suite declarations" };
-  if (new Set(declarations.map(([, declaration]) => declaration.version)).size !== 1 || new Set(declarations.map(([, declaration]) => declaration.exact)).size !== 1) {
-    return { ok: false, reason: "PiCC has mixed Pi suite declarations" };
+  if (!manifest) return suiteFailure("PiCC package metadata is unreadable");
+  const declarations = new Map();
+  for (const name of PI_SUITE_PACKAGES) {
+    const declared = parseStableExactVersion(manifest.dependencies?.[name]);
+    if (!declared) return suiteFailure(`${name} must be declared at one stable exact version`);
+    declarations.set(name, declared);
   }
-  const source = gitOwnedCheckout(root);
-  if (selectedMode === VALIDATION_MODES.COHERENT_BOOTSTRAP && !source) return { ok: false, reason: "Non-source PiCC installs require exact Pi suite declarations" };
-
-  const nodeModulesRoots = candidateNodeModules(root);
-  const resolved = resolveInstalledSuite(root, nodeModulesRoots);
-  if (!resolved) return { ok: false, reason: "The embedded Pi suite is incomplete" };
-  const scan = scanPhysicalOccurrences(nodeModulesRoots);
-  if (!scan) return { ok: false, reason: "The installed dependency graph is malformed or too large" };
-  const occurrences = [...scan.occurrences];
-
-  const lock = readJson(path.join(root, "package-lock.json"));
-  if (source && !lock) return { ok: false, reason: "The source lockfile is missing or malformed" };
-  if (lock) {
-    const recorded = lockOccurrences(root, lock, nodeModulesRoots);
-    if (!recorded) return { ok: false, reason: "The PiCC lockfile is malformed" };
-    if (PI_SUITE_PACKAGES.some((name) => !recorded.some((entry) => entry.name === name))) return { ok: false, reason: "The PiCC lockfile has an incomplete Pi suite" };
-    for (const entry of recorded) {
-      if (!parseStableExactVersion(entry.metadata?.version)) return { ok: false, reason: "The PiCC lockfile has malformed Pi versions" };
-      if (!entry.installed || entry.installed.version !== entry.metadata.version) return { ok: false, reason: "The installed Pi suite is stale; run `picc update`" };
-      occurrences.push(entry.installed);
-    }
+  if (new Set(declarations.values()).size !== 1) {
+    return suiteFailure(`Pi package declarations disagree (${[...declarations].map(([name, version]) => `${name}=${version}`).join(", ")})`);
   }
-  if (occurrences.length === 0) return { ok: false, reason: "The embedded Pi suite is incomplete" };
-  const versions = new Set(occurrences.map(({ version }) => version));
-  if (versions.size !== 1) return { ok: false, reason: "The installed Pi suite contains mixed versions" };
-  const version = occurrences[0].version;
-  if (declarations.some(([, declaration]) => !satisfiesDeclaration(version, declaration))) return { ok: false, reason: "The installed Pi suite does not satisfy PiCC's declarations" };
-  return { ok: true, version, mode: selectedMode, resolved, source, scannedNodeModules: scan.scannedNodeModules, admissibleNodeModules: nodeModulesRoots };
+  const roots = admissibleNodeModules(root);
+  const resolved = {};
+  for (const name of PI_SUITE_PACKAGES) {
+    const expected = declarations.get(name);
+    const installed = resolveSuitePackage(name, roots);
+    if (!installed) return suiteFailure(`${name} is missing (expected ${expected})`);
+    if (installed.problem) return suiteFailure(`${name} ${installed.problem} (expected ${expected})`);
+    if (installed.manifest.name !== name) return suiteFailure(`${name} has invalid package metadata`);
+    if (installed.manifest.version !== expected) return suiteFailure(`${name} is ${installed.manifest.version ?? "unknown"}; expected ${expected}`);
+    resolved[name] = installed.packageRoot;
+  }
+  return { ok: true, version: [...declarations.values()][0], resolved };
 }
 
 export function resolvePiCli(packageRoot = findPackageRoot()) {
   const suite = validatePiSuite({ packageRoot });
   if (!suite.ok) return suite;
-  const codingAgent = suite.resolved.get("@earendil-works/pi-coding-agent");
-  const logicalCli = path.join(codingAgent, "dist", "cli.js");
+  const codingRoot = suite.resolved["@earendil-works/pi-coding-agent"];
   try {
-    const cli = canonicalPath(logicalCli);
-    if (!fs.statSync(cli).isFile() || !isPathInside(cli, codingAgent) || !suite.admissibleNodeModules.some((root) => isPathInside(cli, root))) {
-      return { ok: false, reason: "The embedded Pi CLI is unavailable" };
-    }
+    const cli = canonicalPath(path.join(codingRoot, "dist", "cli.js"));
+    if (!fs.statSync(cli).isFile() || !isPathInside(cli, codingRoot)) return suiteFailure("The embedded Pi CLI escaped its package root");
     return { ...suite, cli };
-  } catch {
-    return { ok: false, reason: "The embedded Pi CLI is unavailable" };
-  }
+  } catch { return suiteFailure("The embedded Pi CLI is unavailable"); }
+}
+
+export function wireChildLifecycle(child, { onSpawnError, onExitCode, onSignal }) {
+  let settled = false;
+  child.once("error", () => {
+    if (settled) return;
+    settled = true;
+    onSpawnError();
+  });
+  child.once("exit", (code, signal) => {
+    if (settled) return;
+    settled = true;
+    if (signal) onSignal(signal);
+    else onExitCode(code ?? 1);
+  });
 }

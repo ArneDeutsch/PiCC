@@ -13,3 +13,5 @@ We don't need 100% Claude Code parity - just enough fidelity that real Claude Co
 ## Approach
 
 Build on a minimal, model-agnostic base harness (Pi) that already supports OpenAI models and ChatGPT-subscription auth, and extend it with the missing Claude Code compatibility: loaders for Claude skills/agents, a subagent dispatch tool, worktree isolation, a permission engine, and hook support.
+
+Use [`doc/threat-model.md`](doc/threat-model.md) as the boundary policy for security decisions.

@@ -5,13 +5,13 @@
   "type": "module",
   "license": "MIT",
   "author": "Arne <arne@idedeluxe.com>",
-  "homepage": "https://github.com/arne/picc#readme",
+  "homepage": "https://github.com/ArneDeutsch/PiCC#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/arne/picc.git"
+    "url": "git+https://github.com/ArneDeutsch/PiCC.git"
   },
   "bugs": {
-    "url": "https://github.com/arne/picc/issues"
+    "url": "https://github.com/ArneDeutsch/PiCC/issues"
   },
   "keywords": [
     "claude-code",
@@ -55,8 +55,11 @@
     "test:e2e": "node scripts/check-real-pi.mjs && vitest run test/e2e-",
     "test:coverage": "vitest run --coverage --exclude \"**/e2e-*.test.ts\"",
     "gen:capabilities": "node scripts/gen-capability-matrix.mjs",
-    "prepare": "git config core.hooksPath .githooks || exit 0",
-    "prepublishOnly": "npm run typecheck:all && npm run test:source && node scripts/verify-release.mjs source --event manual",
+    "setup": "npm ci && npm link",
+    "hooks:install": "git config core.hooksPath .githooks",
+    "update:pi": "node scripts/update-pi-suite.mjs",
+    "preversion": "npm run verify",
+    "prepublishOnly": "npm run verify",
     "test:source": "vitest run --exclude \"**/e2e-packaged-launcher.test.ts\"",
     "test:packaged": "vitest run test/e2e-packaged-launcher.test.ts"
   },

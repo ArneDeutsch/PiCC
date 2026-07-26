@@ -430,12 +430,15 @@ export class WorktreeManager {
 
     // Resolve the base commit to a concrete SHA BEFORE `git worktree add` —
     // worktree base-commit resolution, claude-code issue #60588.
-    const baseCommit = await this.resolveBaseCommit(diagnostics);
-    if (baseCommit === undefined) {
-      const error = "EnterWorktree: could not resolve a base commit (repo has no commits?)";
+    const baseResolution = await this.resolveBaseCommit(diagnostics);
+    if (baseResolution.sha === undefined) {
+      const error = baseResolution.error
+        ? `EnterWorktree: could not resolve a base commit (${baseResolution.error})`
+        : "EnterWorktree: could not resolve a base commit (repo has no commits?)";
       diagnostics.push(diag("error", error));
       return { ok: false, created: false, seededFiles: [], diagnostics, error };
     }
+    const baseCommit = baseResolution.sha;
 
     const branchChoice = await this.pickBranch(flat);
     if (branchChoice === undefined) {
@@ -583,17 +586,22 @@ export class WorktreeManager {
    * Resolve worktree.baseRef to a concrete SHA before creating anything.
    * "head" -> HEAD; "fresh" -> origin/HEAD, then origin/main, origin/master, then HEAD.
    */
-  private async resolveBaseCommit(diagnostics: Diagnostic[]): Promise<string | undefined> {
+  private async resolveBaseCommit(
+    diagnostics: Diagnostic[],
+  ): Promise<{ sha?: string; error?: string }> {
+    let lastError: string | undefined;
     if (this.settings.baseRef === "fresh") {
       for (const ref of ["origin/HEAD", "origin/main", "origin/master"]) {
         const res = await this.git(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
-        if (res.code === 0 && res.stdout.trim() !== "") return res.stdout.trim();
+        if (res.code === 0 && res.stdout.trim() !== "") return { sha: res.stdout.trim() };
+        if (res.stderr.trim()) lastError = res.stderr.trim();
       }
       diagnostics.push(diag("info", 'baseRef "fresh": no usable origin ref; falling back to HEAD'));
     }
     const res = await this.git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
-    if (res.code === 0 && res.stdout.trim() !== "") return res.stdout.trim();
-    return undefined;
+    if (res.code === 0 && res.stdout.trim() !== "") return { sha: res.stdout.trim() };
+    if (res.stderr.trim()) lastError = res.stderr.trim();
+    return lastError ? { error: lastError } : {};
   }
 
   /**

@@ -1,6 +1,6 @@
 # PiCC
 
-[![CI](https://github.com/arne/picc/actions/workflows/ci.yml/badge.svg)](https://github.com/arne/picc/actions/workflows/ci.yml)
+[![CI](https://github.com/ArneDeutsch/PiCC/actions/workflows/ci.yml/badge.svg)](https://github.com/ArneDeutsch/PiCC/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Run projects built for Claude Code — unchanged — on GPT/Codex models, from your ChatGPT
@@ -17,15 +17,14 @@ the model provider. PiCC adds the Claude Code compatibility layer on top.
 
 ## Quick start
 
-One command per line — works the same in PowerShell, cmd, and bash:
+Install and link a source checkout with one setup command:
 
 ```powershell
-git clone <this-repo> picc
-cd picc
-npm install --ignore-scripts
-npm link
+git clone https://github.com/ArneDeutsch/PiCC.git
+cd PiCC
+npm run setup
 
-cd \path\to\your-claude-code-project
+cd <path-to-your-claude-code-project>
 picc
 # /login  → ChatGPT Plus/Pro (Codex subscription)   (one-time)
 # /model  → pick a GPT model
@@ -33,12 +32,14 @@ picc
 # work as you would in Claude Code: /your-skill, subagent fan-outs, worktrees…
 ```
 
-Windows notes: Git Bash (from Git for Windows) must be installed; if PowerShell blocks the
+`npm run setup` installs the locked dependencies and globally links this checkout. It requires a
+writable npm global prefix; the user guide gives a no-global-link alternative. Windows notes: Git
+Bash (from Git for Windows) must be installed; if PowerShell blocks the
 `picc` script shim, use `picc.cmd` or `Set-ExecutionPolicy -Scope CurrentUser
 RemoteSigned`. Details per shell/OS in the guide.
 
-Prefer a package install? Once published, `npm install -g picc` gives you the same
-`picc` command; or install a release tarball with `npm install -g picc-0.1.0.tgz`.
+Once published, `npm install --global picc` gives you the same `picc` command without a source
+checkout.
 PiCC ships as TypeScript source that Pi loads via jiti — there is no build step.
 
 **→ Full documentation: [doc/user-guide.md](doc/user-guide.md)** ·
