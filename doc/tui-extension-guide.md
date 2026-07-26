@@ -378,7 +378,7 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
   `pi.registerEntryRenderer`, `pi.registerMessageRenderer` (subagent settlement records),
   `pi.registerShortcut` (the panel entry chord), `pi.sendMessage`, `pi.appendEntry`,
   `pi.sendUserMessage`, `pi.setModel`, `pi.setThinkingLevel`, `pi.exec`.
-- UI: `ctx.ui.notify`, `ctx.ui.setWidget` (the passive subagent status panel), `ctx.ui.custom`
+- UI: `ctx.ui.notify`, `ctx.ui.setStatus`, `ctx.ui.setWidget` (the passive subagent status panel), `ctx.ui.custom`
   (the focused panel list + drill-down), `ctx.ui.onTerminalInput` (Esc-cancel of forks — the
   watcher yields a lone Esc to the open panel, since raw listeners run before the focused
   component).
@@ -392,7 +392,7 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
   rows retain native detail inside the frame; malformed display fields fall back to a concise
   warning (see "`renderShell` — this is how you control blank lines and framing").
 
-**Untapped but available right now:** `ctx.ui.setFooter`/`setHeader`, `ctx.ui.setStatus`,
+**Untapped but available right now:** `ctx.ui.setFooter`/`setHeader`,
 `ctx.ui.setWorkingIndicator`/`setWorkingMessage`, full `ctx.ui.setTheme`,
 `ctx.ui.addAutocompleteProvider`, `ctx.ui.setTitle`, `ctx.ui.setToolsExpanded`.
 
