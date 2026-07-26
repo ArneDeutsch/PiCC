@@ -2707,6 +2707,73 @@ describe("child worktree stops through the production extension assembly", () =>
   );
 });
 
+describe("MCP timeout diagnostic delivery (zero-enabled project)", () => {
+  it("drains each rejected variable once to stderr without leaking values or entering other surfaces", async () => {
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-mcp-timeout-diag-"));
+    const userDir = path.join(projectDir, ".claude-user");
+    fs.mkdirSync(userDir, { recursive: true });
+    const previousCwd = process.cwd();
+    const previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+    const previousConnectTimeout = process.env.MCP_TIMEOUT;
+    const previousToolTimeout = process.env.MCP_TOOL_TIMEOUT;
+    const connectCanary = "CONNECT_TIMEOUT_REJECTED_VALUE_CANARY";
+    const toolCanary = "TOOL_TIMEOUT_REJECTED_VALUE_CANARY";
+    const connectDiagnostic =
+      "MCP_TIMEOUT was rejected; using the 30000 ms fallback. Set MCP_TIMEOUT to a positive integer number of milliseconds or unset it.";
+    const toolDiagnostic =
+      "MCP_TOOL_TIMEOUT was rejected; per-server timeout remains authoritative, otherwise the 100000000 ms default applies. Set MCP_TOOL_TIMEOUT to a positive integer number of milliseconds or unset it.";
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const p = fakePi();
+    try {
+      process.chdir(projectDir);
+      process.env.PICC_CLAUDE_USER_DIR = userDir;
+      process.env.MCP_TIMEOUT = connectCanary;
+      process.env.MCP_TOOL_TIMEOUT = toolCanary;
+      picc(p.api as never, {
+        managedSettingsPaths: [],
+        managedArtifactDirs: [],
+        onInitializationSettled: p.captureInitialization,
+      });
+      await p.waitForInitialization();
+      const promptResult = await p.fire("before_agent_start", { systemPrompt: "BASE_PROMPT" });
+
+      const stderr = errSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(stderr.split(connectDiagnostic)).toHaveLength(2);
+      expect(stderr.split(toolDiagnostic)).toHaveLength(2);
+      expect(stderr).not.toContain(connectCanary);
+      expect(stderr).not.toContain(toolCanary);
+
+      await p.commands.get("doctor").handler("", p.ctx());
+      await p.commands.get("mcp").handler("", p.ctx());
+      const observedNonStderr = [
+        logSpy.mock.calls.map((call) => call.join(" ")).join("\n"),
+        p.notifications.map((notification) => notification.text).join("\n"),
+        JSON.stringify(p.messages),
+        JSON.stringify(p.entries),
+        [...p.tools.keys()].join("\n"),
+        JSON.stringify(promptResult),
+      ].join("\n");
+      for (const forbidden of [connectDiagnostic, toolDiagnostic, connectCanary, toolCanary]) {
+        expect(observedNonStderr).not.toContain(forbidden);
+      }
+      expect([...p.tools.keys()].filter((name) => name.startsWith("mcp__"))).toEqual([]);
+    } finally {
+      await p.fire("session_shutdown", { reason: "other" });
+      errSpy.mockRestore();
+      logSpy.mockRestore();
+      process.chdir(previousCwd);
+      if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+      else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+      if (previousConnectTimeout === undefined) delete process.env.MCP_TIMEOUT;
+      else process.env.MCP_TIMEOUT = previousConnectTimeout;
+      if (previousToolTimeout === undefined) delete process.env.MCP_TOOL_TIMEOUT;
+      else process.env.MCP_TOOL_TIMEOUT = previousToolTimeout;
+      fs.rmSync(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  }, 60_000);
+});
+
 describe("MCP failed-connect surfacing (dedicated temp project)", () => {
   // The full-surface fixture's .mcp.json deliberately stays UNAPPROVED (the
   // standing pending case), so the failed-connect path gets its own minimal

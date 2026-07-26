@@ -128,27 +128,32 @@ function fakeToolSdk(options: {
 // ---------------------------------------------------------------------------
 
 describe("MCP timeout policy", () => {
-  it("resolves connect defaults, environment values, and invalid fallbacks without timers", () => {
+  it("resolves connect defaults, coercions, and invalid fallbacks without changing the public shape", () => {
     expect(resolveMcpTimeoutPolicy({})).toEqual({
       connectTimeoutMs: 30_000,
       environmentToolTimeoutMs: undefined,
     });
-    for (const invalid of ["", "0", "-1", "1.5", "not-a-number"]) {
+    for (const invalid of ["", "   ", "0", "-1", "1.5", "not-a-number"]) {
       expect(resolveMcpTimeoutPolicy({ MCP_TIMEOUT: invalid }).connectTimeoutMs).toBe(30_000);
     }
-    expect(resolveMcpTimeoutPolicy({ MCP_TIMEOUT: "42" }).connectTimeoutMs).toBe(42);
+    for (const [value, expected] of [[" 42.0 ", 42], ["1e3", 1_000], ["0x10", 16]] as const) {
+      expect(resolveMcpTimeoutPolicy({ MCP_TIMEOUT: value }).connectTimeoutMs).toBe(expected);
+    }
     expect(resolveMcpTimeoutPolicy({ MCP_TIMEOUT: "9999999999" }).connectTimeoutMs).toBe(
       2_147_483_647,
     );
   });
 
-  it("resolves tool defaults, environment fallback, per-server precedence, and clamps", () => {
+  it("resolves tool defaults, coercions, environment fallback, per-server precedence, and clamps", () => {
     const defaultPolicy = resolveMcpTimeoutPolicy({});
     expect(
       resolveMcpToolTimeoutMs(undefined, defaultPolicy.environmentToolTimeoutMs),
     ).toBe(100_000_000);
 
     const environmentPolicy = resolveMcpTimeoutPolicy({ MCP_TOOL_TIMEOUT: "2500" });
+    for (const [value, expected] of [[" 2500.0 ", 2_500], ["2.5e3", 2_500], ["0x10", 16]] as const) {
+      expect(resolveMcpTimeoutPolicy({ MCP_TOOL_TIMEOUT: value }).environmentToolTimeoutMs).toBe(expected);
+    }
     expect(
       resolveMcpToolTimeoutMs(undefined, environmentPolicy.environmentToolTimeoutMs),
     ).toBe(2_500);
@@ -173,6 +178,76 @@ describe("MCP timeout policy", () => {
         resolveMcpTimeoutPolicy({ MCP_TOOL_TIMEOUT: "invalid" }).environmentToolTimeoutMs,
       ),
     ).toBe(100_000_000);
+  });
+
+  it("emits one fixed redacted constructor diagnostic per rejected non-empty variable", async () => {
+    const cases = [
+      {
+        env: {},
+        expected: [],
+      },
+      {
+        env: { MCP_TIMEOUT: "   ", MCP_TOOL_TIMEOUT: "" },
+        expected: [],
+      },
+      {
+        env: { MCP_TIMEOUT: "CONNECT_REJECTED_CANARY" },
+        expected: [
+          "MCP_TIMEOUT was rejected; using the 30000 ms fallback. Set MCP_TIMEOUT to a positive integer number of milliseconds or unset it.",
+        ],
+      },
+      {
+        env: { MCP_TOOL_TIMEOUT: "TOOL_REJECTED_CANARY" },
+        expected: [
+          "MCP_TOOL_TIMEOUT was rejected; per-server timeout remains authoritative, otherwise the 100000000 ms default applies. Set MCP_TOOL_TIMEOUT to a positive integer number of milliseconds or unset it.",
+        ],
+      },
+      {
+        env: { MCP_TIMEOUT: "CONNECT_REJECTED_CANARY", MCP_TOOL_TIMEOUT: "TOOL_REJECTED_CANARY" },
+        expected: [
+          "MCP_TIMEOUT was rejected; using the 30000 ms fallback. Set MCP_TIMEOUT to a positive integer number of milliseconds or unset it.",
+          "MCP_TOOL_TIMEOUT was rejected; per-server timeout remains authoritative, otherwise the 100000000 ms default applies. Set MCP_TOOL_TIMEOUT to a positive integer number of milliseconds or unset it.",
+        ],
+      },
+    ] as const;
+
+    for (const row of cases) {
+      const runtime = McpRuntime.start(
+        makeConfig(
+          makeServer({ name: "enabled-one" }),
+          makeServer({ name: "enabled-two" }),
+        ),
+        makeDeps({
+          env: { ...cleanBaseEnv(), ...row.env },
+          loadSdk: async () => fakeToolSdk({ forwardedTimeouts: [] }),
+        }),
+      );
+      try {
+        await runtime.whenSettled();
+        expect(runtime.diagnostics()).toEqual(row.expected);
+        expect(runtime.diagnostics()).toEqual(row.expected);
+        expect(runtime.diagnostics().join("\n")).not.toContain("REJECTED_CANARY");
+      } finally {
+        await runtime.shutdown();
+      }
+    }
+  });
+
+  it("keeps accepted and clamped timeout values warning-free at runtime", async () => {
+    const accepted = [
+      { MCP_TIMEOUT: " 42.0 ", MCP_TOOL_TIMEOUT: "2.5e3" },
+      { MCP_TIMEOUT: "0x10", MCP_TOOL_TIMEOUT: "1" },
+      { MCP_TIMEOUT: "9999999999", MCP_TOOL_TIMEOUT: "9999999999" },
+    ];
+    for (const env of accepted) {
+      const runtime = McpRuntime.start(makeConfig(), makeDeps({ env: { ...cleanBaseEnv(), ...env } }));
+      try {
+        await runtime.whenSettled();
+        expect(runtime.diagnostics()).toEqual([]);
+      } finally {
+        await runtime.shutdown();
+      }
+    }
   });
 });
 
@@ -664,11 +739,170 @@ describe("McpRuntime degrade paths", () => {
     }
   }, 25_000);
 
+  it("requires phase, local-close ordering, and the matching SDK code for closure classification", async () => {
+    const cases = [
+      { label: "server lookalike stays open", event: "server-error" },
+      { label: "server lookalike then cleanup close", event: "server-error-close" },
+      { label: "pre-handshake close with nonmatching code", event: "close-nonmatching" },
+      { label: "post-handshake close during discovery", event: "post-handshake-close" },
+      { label: "unknown numeric error", event: "unknown-numeric" },
+      { label: "ordinary error", event: "ordinary" },
+    ] as const;
+
+    for (const row of cases) {
+      class FakeTransport {
+        readonly pid = undefined;
+        readonly stderr = undefined;
+        onclose?: () => void;
+        onmessage?: (message: unknown) => void;
+        constructor(_options: unknown) {}
+      }
+      class FakeClient {
+        private transport: FakeTransport | undefined;
+        constructor(_clientInfo: unknown, _options: unknown) {}
+        async connect(transport: FakeTransport): Promise<void> {
+          this.transport = transport;
+          const lookalike = {
+            jsonrpc: "2.0",
+            id: 0,
+            error: { code: -32_000, message: "SERVER_ERROR_MESSAGE_CANARY", data: "SERVER_ERROR_DATA_CANARY" },
+          };
+          if (row.event === "server-error" || row.event === "server-error-close") {
+            transport.onmessage?.(lookalike);
+            if (row.event === "server-error-close") transport.onclose?.();
+            throw Object.assign(new Error("SERVER_REJECTION_CANARY"), { code: -32_000 });
+          }
+          if (row.event === "close-nonmatching") {
+            transport.onclose?.();
+            throw Object.assign(new Error("NONMATCHING_CANARY"), { code: -32_001 });
+          }
+          if (row.event === "unknown-numeric") {
+            throw Object.assign(new Error("UNKNOWN_NUMERIC_CANARY"), { code: -32_099 });
+          }
+          if (row.event === "ordinary") throw new Error("ORDINARY_ERROR_CANARY");
+        }
+        async listTools(_params: unknown): Promise<{ tools: never[] }> {
+          this.transport?.onclose?.();
+          throw Object.assign(new Error("DISCOVERY_CLOSE_CANARY"), { code: -32_000 });
+        }
+        async close(): Promise<void> {}
+      }
+      const config = makeConfig(
+        makeServer({ name: "ambiguous", rawCommand: "GENERIC_RAW_COMMAND_CANARY" }),
+      );
+      const runtime = McpRuntime.start(
+        config,
+        makeDeps({
+          loadSdk: async () => ({
+            Client: FakeClient,
+            StdioClientTransport: FakeTransport,
+          }) as unknown as Awaited<ReturnType<NonNullable<McpRuntimeDeps["loadSdk"]>>>,
+        }),
+      );
+      try {
+        await runtime.whenSettled();
+        const state = runtime.serverStates()[0];
+        expect(state?.statusSummary, row.label).toBe(
+          "MCP startup failed during connection, initialization, or tool discovery; run /doctor for details.",
+        );
+        expect(state?.diagnostic, row.label).not.toContain(
+          "connection closed before MCP initialization completed",
+        );
+        const surfaces = `${state?.diagnostic ?? ""}\n${state?.statusSummary ?? ""}`;
+        for (const canary of [
+          "SERVER_ERROR_MESSAGE_CANARY",
+          "SERVER_ERROR_DATA_CANARY",
+          "SERVER_REJECTION_CANARY",
+          "NONMATCHING_CANARY",
+          "UNKNOWN_NUMERIC_CANARY",
+          "ORDINARY_ERROR_CANARY",
+          "DISCOVERY_CLOSE_CANARY",
+        ]) {
+          expect(surfaces, `${row.label}: ${canary}`).not.toContain(canary);
+        }
+      } finally {
+        await runtime.shutdown();
+      }
+    }
+  });
+
+  it("classifies only a locally observed pre-initialization close with fixed redacted text", async () => {
+    class FakeTransport {
+      readonly pid = undefined;
+      readonly stderr = new PassThrough();
+      onclose?: () => void;
+      constructor(_options: unknown) {}
+    }
+    class ClosingClient {
+      constructor(_clientInfo: unknown, _options: unknown) {}
+      async connect(transport: FakeTransport): Promise<never> {
+        transport.stderr.write("STDERR_CLOSE_CANARY");
+        transport.onclose?.();
+        throw Object.assign(new Error("RAW_ERROR_MESSAGE_CANARY"), {
+          code: -32_000,
+          data: "RAW_ERROR_DATA_CANARY",
+        });
+      }
+      async listTools(_params: unknown): Promise<never> {
+        throw new Error("unreachable");
+      }
+      async close(): Promise<void> {}
+    }
+    const config = makeConfig(
+      makeServer({
+        name: "closing",
+        command: "C:/EXPANDED_COMMAND_PATH_CANARY/server.exe",
+        args: ["ARG_CLOSE_CANARY"],
+        env: { TOKEN: "ENV_CLOSE_CANARY" },
+        rawCommand: "RAW_COMMAND_CLOSE_CANARY",
+      }),
+    );
+    const runtime = McpRuntime.start(
+      config,
+      makeDeps({
+        loadSdk: async () => ({
+          Client: ClosingClient,
+          StdioClientTransport: FakeTransport,
+        }) as unknown as Awaited<ReturnType<NonNullable<McpRuntimeDeps["loadSdk"]>>>,
+      }),
+    );
+    try {
+      await runtime.whenSettled();
+      const state = runtime.serverStates()[0];
+      expect(state?.diagnostic).toBe(
+        'MCP server "closing": connection closed before MCP initialization completed.',
+      );
+      expect(state?.statusSummary).toBe("Connection closed before MCP initialization completed.");
+      const statusReport = renderMcpStatusReport(config, runtime.serverStates());
+      expect(statusReport).toContain("Connection closed before MCP initialization completed.");
+      const surfaces = `${runtime.diagnostics().join("\n")}\n${state?.statusSummary ?? ""}\n${statusReport}`;
+      expect(surfaces).not.toContain("-32000");
+      for (const canary of [
+        "RAW_ERROR_MESSAGE_CANARY",
+        "RAW_ERROR_DATA_CANARY",
+        "EXPANDED_COMMAND_PATH_CANARY",
+        "ARG_CLOSE_CANARY",
+        "ENV_CLOSE_CANARY",
+        "RAW_COMMAND_CLOSE_CANARY",
+        "STDERR_CLOSE_CANARY",
+      ]) {
+        expect(surfaces).not.toContain(canary);
+      }
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
   it("degrades an exiting-early server to failed without throwing", async () => {
     const fixture = createMcpProcessFixture(makeTempDir());
     const runtime = McpRuntime.start(
       makeConfig(
-        makeServer({ name: "quitter", args: [fixture.serverScript, "exit-early"], env: fixture.env, rawCommand: "quitter-cmd" }),
+        makeServer({
+          name: "quitter",
+          args: [fixture.serverScript, "exit-early", "EXIT_ARG_CANARY"],
+          env: { ...fixture.env, TOKEN: "EXIT_ENV_CANARY" },
+          rawCommand: "EXIT_RAW_COMMAND_CANARY",
+        }),
       ),
       makeDeps(),
     );
@@ -678,11 +912,18 @@ describe("McpRuntime degrade paths", () => {
         expect.objectContaining({
           name: "quitter",
           state: "failed",
-          statusSummary:
-            "MCP startup failed during connection, initialization, or tool discovery; run /doctor for details.",
+          statusSummary: "Connection closed before MCP initialization completed.",
         }),
       ]);
-      expect(runtime.diagnostics().join("\n")).toContain('"quitter"');
+      const diagnostics = runtime.diagnostics().join("\n");
+      expect(diagnostics).toContain(
+        'MCP server "quitter": connection closed before MCP initialization completed.',
+      );
+      expect(diagnostics).not.toContain("-32000");
+      for (const canary of ["EXIT_ARG_CANARY", "EXIT_ENV_CANARY", "EXIT_RAW_COMMAND_CANARY"]) {
+        expect(diagnostics).not.toContain(canary);
+        expect(runtime.serverStates()[0]?.statusSummary).not.toContain(canary);
+      }
       expect(runtime.tools()).toEqual([]);
       await expect(runtime.callTool("quitter", "echo", {})).rejects.toThrow(/not connected/);
     } finally {
