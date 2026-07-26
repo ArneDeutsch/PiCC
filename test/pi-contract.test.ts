@@ -44,7 +44,6 @@ import {
 } from "../src/runtime/background-tasks.js";
 import {
   PI_SUITE_PACKAGES,
-  VALIDATION_MODES,
   validatePiSuite,
 } from "../bin/picc-admin.mjs";
 
@@ -110,7 +109,7 @@ describe("mock wire request classification", () => {
 });
 
 describe("pi 0.82.0 API contract", () => {
-  it("declares and resolves the shared strict coherent Pi 0.82.0 graph", () => {
+  it("declares and resolves the four direct Pi 0.82.0 packages", () => {
     const root = fileURLToPath(new URL("..", import.meta.url));
     const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
       dependencies: Record<string, string>;
@@ -120,8 +119,8 @@ describe("pi 0.82.0 API contract", () => {
     expect(Object.fromEntries(PI_SUITE_PACKAGES.map((name) => [name, manifest.dependencies[name]])))
       .toEqual(Object.fromEntries(PI_SUITE_PACKAGES.map((name) => [name, "0.82.0"])));
     expect(manifest.engines.node).toBe(">=22.19.0");
-    expect(validatePiSuite({ packageRoot: root, ...{ mode: VALIDATION_MODES.STRICT_EXACT } }))
-      .toMatchObject({ ok: true, version: "0.82.0", mode: "strict-exact", source: true });
+    expect(validatePiSuite({ packageRoot: root }))
+      .toMatchObject({ ok: true, version: "0.82.0" });
 
     for (const name of PI_SUITE_PACKAGES) {
       const installed = JSON.parse(readFileSync(join(root, "node_modules", name, "package.json"), "utf8")) as {

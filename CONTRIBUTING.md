@@ -6,18 +6,18 @@ unchanged on GPT/Codex models. This guide covers the essentials.
 ## Setup
 
 ```bash
-git clone <this-repo> picc
-cd picc
-npm install --ignore-scripts
-git config core.hooksPath .githooks   # only after --ignore-scripts; see below
+git clone https://github.com/ArneDeutsch/PiCC.git
+cd PiCC
+npm ci
 ```
 
 Requirements: Node ≥ 22.19 (Pi's bundled undici 8.x does not run on Node 20) and git. On
-Windows, Git Bash must be on PATH — see [`doc/user-guide.md`](doc/user-guide.md).
+Windows, install Git for Windows; PiCC resolves its Git Bash installation automatically — see
+[`doc/user-guide.md`](doc/user-guide.md).
 
-The pre-commit hook (`.githooks/pre-commit`) runs `npm run typecheck:all` and then
-`npm run test:unit` before every commit. A plain `npm install`/`npm ci` wires it automatically via
-the `prepare` script; after an `--ignore-scripts` install, run the `git config` line above yourself.
+Installing dependencies does not change the checkout's Git configuration. To opt into the bundled
+pre-commit hook, run `npm run hooks:install`; it runs `npm run typecheck:all` and then
+`npm run test:unit` before every commit.
 
 ## Develop
 
@@ -25,8 +25,8 @@ The harness is TypeScript loaded by Pi via jiti — there is **no build step**. 
 Claude Code project from inside that project's directory:
 
 ```bash
-node <path-to-picc>/bin/picc.mjs
-# or: pi -e <path-to-picc>/src/index.ts
+node <path-to-PiCC>/bin/picc.mjs
+# or: pi -e <path-to-PiCC>/src/index.ts
 ```
 
 `PICC_DEBUG=1` traces load/skill/routing decisions to stderr.
@@ -59,7 +59,7 @@ workflows are yours to drive, and they are the shortest path in.
 
 ### Working with the skills & agents
 
-Two skills carry the work. Invoke either from a picc session (`node bin/picc.mjs` at the checkout
+Two skills carry the work. Invoke either from a PiCC session (`node bin/picc.mjs` at the checkout
 root):
 
 - **`/implement-feature [#N | issue-url]`** — the full cycle for anything that deserves a plan and
@@ -93,18 +93,37 @@ Run Pi upgrades through an explicit `/implement-feature` workflow. After inspect
 notes and changed contracts, update the complete direct Pi suite in the feature worktree:
 
 ```bash
-node scripts/update-pi-suite.mjs <stable-exact-version>
+npm run update:pi -- <stable-exact-version>
 ```
 
 The helper runs one exact, scripts-disabled npm transaction using your normal npm configuration,
-then validates the resulting graph. If it fails, inspect or restore `package.json` and
-`package-lock.json` with Git and run `npm ci --ignore-scripts`. It does not make compatibility
-decisions: adapt PiCC semantics and documentation, run `npm run typecheck:all` and `npm test`, then
-submit the result as a human-reviewed pull request. Never couple Pi release detection or adoption to
-automatic merging or publication. After human review, tag the exact package version as
-`v<package version>` to run tagged release handling. Manual dispatch produces only a seven-day
-Actions artifact; missing `NPM_TOKEN` skips npm publication. Before retrying a partial tagged
-release, inspect the existing GitHub Release and npm publication state to avoid duplicating a sink.
+then validates the four direct Pi package manifests. If it fails, inspect or restore `package.json` and
+`package-lock.json` with Git and run `npm ci`. It does not make compatibility decisions: adapt PiCC
+semantics and documentation, run `npm run verify`, then submit the result as a human-reviewed pull
+request. Never couple Pi release detection or adoption to automatic merging or publication.
+
+### Cutting a PiCC release
+
+Release only a reviewed, clean default branch. Choose `patch`, `minor`, `major`, or an exact stable
+version:
+
+```bash
+npm version patch
+git push origin HEAD --follow-tags
+```
+
+`npm version` runs the complete verification gate before it updates `package.json` and
+`package-lock.json`, commits them, and creates the matching `v<version>` tag. The tag workflow uses
+one job: it packs once, verifies and tests that exact tarball, then hands the same bytes to the
+GitHub Release and npm publication steps. A manual workflow run stops after producing its temporary
+artifact; it does not publish a release.
+
+If a tagged workflow fails after either publication step, inspect all three identities before doing
+anything else: the verified SHA-256 in the workflow log, the asset on the GitHub Release for the tag,
+and `npm view picc@<version> dist`. Never rebuild or retag the version, and never publish bytes with a
+different hash. If neither destination exists, rerun the tagged workflow. If one or both exist,
+reconcile the missing destination from the already verified artifact; do not repeat an immutable npm
+publication that already succeeded.
 
 ## Guiding principles
 

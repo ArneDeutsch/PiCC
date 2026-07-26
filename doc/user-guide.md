@@ -39,19 +39,21 @@ Nothing is written to your project's tracked files. For the full design see
 
 ## 2. Install
 
-One line per step — paste them one at a time. They work identically in **PowerShell**, **cmd**, and
-**bash** (nothing in this guide uses `&&` chaining, which Windows PowerShell 5.1 does not support).
+### Source checkout with a global command
 
-### Windows (PowerShell or cmd)
+These commands work in PowerShell, cmd, and POSIX shells:
 
 ```powershell
-git clone <this-repo> picc
-cd picc
-npm install --ignore-scripts
-npm link
+git clone https://github.com/ArneDeutsch/PiCC.git
+cd PiCC
+npm run setup
 ```
 
-`npm link` makes the global `picc` command available. Notes for Windows:
+`npm run setup` installs the locked dependencies and globally links that checkout, so edits and
+pulls continue to drive the `picc` command. The npm global prefix must be writable. Configure a
+user-level prefix rather than running the setup as an administrator.
+
+On Windows:
 
 - If running `picc` in PowerShell fails with *"running scripts is disabled on this
   system"*, either call the cmd shim `picc.cmd` instead, or allow local scripts once:
@@ -62,26 +64,23 @@ npm link
   Claude Code projects' scripts assume bash; PiCC finds Git Bash automatically and never
   uses the WSL `bash.exe` stub in System32.
 
-### Linux / macOS (bash or zsh)
+### Published package
 
-```bash
-git clone <this-repo> picc
-cd picc
-npm install --ignore-scripts
-npm link    # may need: sudo npm link — or configure a user-level npm prefix
+Once PiCC is published, install the global command without a source checkout:
+
+```powershell
+npm install --global picc
 ```
 
-### Alternatives to `npm link` (any OS)
+### No global link
 
-- Once PiCC is published, install it globally with `npm install --global picc`. A verified
-  public-registry global install can update itself with `picc update`.
-- Run without installing anything globally — from your target project directory:
+- Contributors and users without a writable npm global prefix can run `npm ci` in the checkout,
+  then launch it from the target project directory:
   ```powershell
-  node <path-to-picc>\bin\picc.mjs
+  node <path-to-PiCC>/bin/picc.mjs
   ```
-  (forward slashes work too, in every shell)
 - Or, if you already use Pi, load the extension directly:
-  `pi -e <path-to-picc>/src/index.ts`
+  `pi -e <path-to-PiCC>/src/index.ts`
 - Or add it permanently to Pi's config (`~/.pi/agent/settings.json`):
   ```json
   { "extensions": ["<path-to-picc>/src/index.ts"] }
@@ -89,31 +88,27 @@ npm link    # may need: sudo npm link — or configure a user-level npm prefix
 
 ### Check and update PiCC
 
-`picc --version` reports the PiCC version, embedded Pi version and validation mode, and detected
-installation kind. `picc update --check` does not mutate the installation. Healthy global checks,
-including an available-version result, create no persistent recovery files; a failure that prints a
-runnable recovery command creates and retains the npm policy files named by that command. The update
-path depends on who owns the installation:
+`picc --version` reports the PiCC version, embedded Pi version, and whether PiCC is running from a
+source checkout or an installed package. `picc update --check` reports the current state without
+changing the installation; a global npm installation asks npm for the current published version.
+The update path depends on who owns the installation:
 
-- **Verified public-registry global npm:** `picc update` installs and validates the complete PiCC
-  product, including its compatible embedded Pi runtime. Exit active sessions first.
-- **Source checkout / `npm link`:** `picc update` only synchronizes ignored dependency state for the
-  currently checked-out revision. It refuses dirty, detached, ambiguous, or in-progress Git state
-  and never adopts newer tracked source. Update tracked source through your reviewed Git workflow,
-  then run `picc update` and `picc update --check`.
-- **Tarball, local package, or unknown ownership:** PiCC refuses automatic mutation. Update or
-  reinstall through the package owner that placed it, then verify with `picc --version`.
+- **Source checkout / global link:** `picc update` first requires a clean `git status`, using your
+  normal Git configuration and global ignores. It then runs `npm ci --ignore-scripts --no-audit
+  --no-fund` and revalidates the four coordinated Pi packages. It never pulls or changes tracked
+  source; update that through your normal reviewed Git workflow first.
+- **Global npm installation:** PiCC updates itself only when its package root is contained by npm's
+  reported global root. The npm child inherits your proxy, CA, registry, and other npm settings.
+  Exit active sessions before updating.
+- **Other installed forms:** PiCC does not guess which package manager or parent project owns the
+  files. It prints the command or owner guidance to use and makes no changes.
 
-Pi is an embedded, coordinated dependency of the `picc` product; do not update that nested Pi
-independently. A direct verified public-registry global `picc` TUI launch may show one bounded
-notification when a newer stable PiCC release exists. It makes one fixed outbound request to
-`https://registry.npmjs.org/picc/latest`; set `PICC_SKIP_UPDATE_CHECK=1` to suppress this advisory or
-`PI_OFFLINE=1` to disable it with other Pi network checks. `/picc-update` repeats fixed,
-installation-aware guidance and never changes the running installation. It is available only when
-the extension recognizes a direct launcher lineage; this bounded check is not an authentication
-claim.
+Pi is a coordinated dependency of the `picc` product; do not update the nested Pi packages
+independently. `/picc-update` repeats installation-aware guidance and never changes the running
+installation. It is available only when the extension recognizes a direct launcher lineage; that
+lineage check is not authentication.
 
-Deliberately hosting PiCC through an external Pi (`pi -e <path-to-picc>/src/index.ts`) leaves update
+Deliberately hosting PiCC through an external Pi (`pi -e <path-to-PiCC>/src/index.ts`) leaves update
 ownership with that Pi installation. PiCC does not register `/picc-update` there, and Pi's native
 update behavior remains available. A project skill named `/update` is likewise independent and is
 never shadowed by PiCC.
@@ -126,7 +121,7 @@ Auth is Pi's, not ours, and is a one-time interactive step. Step by step (any sh
    ```powershell
    picc
    ```
-   (or `node <path-to-picc>/bin/picc.mjs` if you skipped `npm link`)
+   (or `node <path-to-PiCC>/bin/picc.mjs` if you did not install or link the command)
 2. In the input box at the bottom, type `/login` and press Enter.
 3. Select **"ChatGPT Plus/Pro (Codex Subscription)"** with the arrow keys and press Enter.
 4. Your browser opens an OpenAI login page (if not, Pi prints a URL to copy). Log in with the
@@ -438,6 +433,7 @@ cannot redirect those maintenance operations.
 | Variable | Effect |
 |---|---|
 | `PICC_CLAUDE_USER_DIR` | Override the user-scope Claude dir (default `~/.claude`) — useful for isolated profiles or CI |
+| `PICC_GIT` | Absolute path to the Git executable for PiCC-owned source-update and worktree operations; overrides PATH discovery |
 | `BRAVE_API_KEY` | Use the Brave Search API for `WebSearch` (otherwise a keyless DuckDuckGo fallback is used) |
 | `PI_CODING_AGENT_DIR` | Pi's own config dir override (auth, models, Pi settings) |
 | `CLAUDE_CODE_SUBAGENT_MODEL` | Highest-priority model override for every subagent dispatch (`inherit` = unset) |
@@ -525,10 +521,10 @@ behaviors worth knowing:
   mangled into a Windows path and the skill won't resolve. Run slash-command-as-argument invocations
   from **PowerShell or cmd**, or just type `/greet Ada` inside the **interactive TUI** (where no
   MSYS mangling applies). Normal interactive use is unaffected.
-- **Long paths & worktrees.** When trusted Git is available, PiCC attempts to enable
+- **Long paths & worktrees.** When Git is resolved from `PICC_GIT` or PATH, PiCC attempts to enable
   `core.longpaths` on the repo. Worktree removal is best-effort: a file-lock failure never fails your
   merge. A later session
-  retries orphan cleanup only after trusted Git and registered-worktree state are verified; otherwise
+  retries orphan cleanup only after Git and registered-worktree state are verified; otherwise
   PiCC leaves managed directories untouched.
 - **Hook payloads** deliver Windows paths with doubled backslashes in JSON, as Claude Code does.
 
@@ -537,6 +533,7 @@ behaviors worth knowing:
 | Symptom | Fix |
 |---|---|
 | `/picc-update` is absent | The extension is hosted by an external Pi or the direct-launch lineage did not agree. Use that installation's owner and `picc --version`; do not send `/picc-update` as model input |
+| Worktree commands say Git is unavailable | Ensure Git is on PATH, or set `PICC_GIT` to its absolute executable path before starting PiCC |
 | Skill shell injection prints `[shell execution disabled: …]` | project set `disableSkillShellExecution`; that's the project's intent |
 | A tool you expected is missing | check `/doctor` — the project may gate it via agent `tools:` or a deny rule |
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |

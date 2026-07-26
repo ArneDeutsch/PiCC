@@ -5,16 +5,11 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import picc from "../src/index.js";
 import {
-  PICC_REGISTRY_LATEST_URL,
   capturePiccLaunchContext,
-  checkForNewerPiccRelease,
-  compareStableVersions,
-  createPiccReleaseAdvisory,
   piccUpdateGuidance,
   type PiccInstallKind,
 } from "../src/runtime/picc-update.js";
 import { fakePi } from "./helpers/fake-pi.js";
-import { deferred } from "./helpers/async.js";
 import { HookRunner } from "../src/engine/hook-runner.js";
 import { resolveGitBashPath } from "../src/engine/shell-inject.js";
 
@@ -27,26 +22,11 @@ afterEach(() => {
 function directEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     PICC_LAUNCHER_PID: "41",
-    PICC_INSTALL_KIND: "verified public-registry global npm",
+    PICC_INSTALL_KIND: "installed",
     PICC_VERSION: "1.2.3",
     PI_SKIP_VERSION_CHECK: "1",
     ...overrides,
   };
-}
-
-function registryResponse(value: unknown, url = PICC_REGISTRY_LATEST_URL): Response {
-  const response = new Response(JSON.stringify(value), { status: 200 });
-  Object.defineProperty(response, "url", { value: url });
-  return response;
-}
-
-function rawRegistryResponse(
-  body: ConstructorParameters<typeof Response>[0],
-  init: ConstructorParameters<typeof Response>[1] = {},
-): Response {
-  const response = new Response(body, init);
-  Object.defineProperty(response, "url", { value: PICC_REGISTRY_LATEST_URL });
-  return response;
 }
 
 describe("PiCC direct launch context", () => {
@@ -56,7 +36,7 @@ describe("PiCC direct launch context", () => {
     expect(context).toEqual({
       direct: true,
       version: "1.2.3",
-      installKind: "verified public-registry global npm",
+      installKind: "installed",
     });
     expect(env.PICC_LAUNCHER_PID).toBeUndefined();
     expect(env.PICC_INSTALL_KIND).toBeUndefined();
@@ -86,10 +66,8 @@ describe("PiCC direct launch context", () => {
   });
 
   it.each([
-    "verified public-registry global npm",
     "source",
-    "known local package",
-    "unknown/other",
+    "installed",
   ] as const)("accepts the known install kind %s", (installKind) => {
     const env = directEnv({ PICC_INSTALL_KIND: installKind });
     expect(capturePiccLaunchContext({ env, parentPid: 41, localVersion: "1.2.3" })).toMatchObject({
@@ -103,24 +81,12 @@ describe("PiCC direct launch context", () => {
     expect(capturePiccLaunchContext({ env, parentPid: 41, localVersion: "1.2.3" }).direct).toBe(false);
     expect(env.PI_SKIP_VERSION_CHECK).toBe("1");
   });
-
-  it("compares stable versions without numeric overflow or prerelease acceptance", () => {
-    expect(compareStableVersions("999999999999999999999.0.0", "2.0.0")).toBe(1);
-    expect(compareStableVersions("1.2.3", "1.2.3")).toBe(0);
-    expect(compareStableVersions("1.2.2", "1.2.3")).toBe(-1);
-    expect(compareStableVersions("1.2.4-beta", "1.2.3")).toBeUndefined();
-    expect(compareStableVersions("01.2.3", "1.2.3")).toBeUndefined();
-    expect(compareStableVersions("1.02.3", "1.2.3")).toBeUndefined();
-    expect(compareStableVersions("1.2.03", "1.2.3")).toBeUndefined();
-  });
 });
 
-describe("fixed provenance guidance", () => {
+describe("installation guidance", () => {
   const expected: Record<PiccInstallKind, string[]> = {
-    "verified public-registry global npm": ["Exit this session", "`picc update`", "not modified"],
     source: ["synchronize ignored dependencies", "does not adopt newer source", "Git"],
-    "known local package": ["installer or package owner", "will not mutate", "`picc --version`"],
-    "unknown/other": ["ownership is unknown", "will not mutate", "installation owner"],
+    installed: ["installed package", "Exit this session", "`picc update`", "package owner"],
   };
   for (const [installKind, fragments] of Object.entries(expected) as Array<[PiccInstallKind, string[]]>) {
     it(`renders ${installKind}`, () => {
@@ -129,149 +95,6 @@ describe("fixed provenance guidance", () => {
       expect(text).not.toContain("/update");
     });
   }
-});
-
-describe("bounded public release check", () => {
-  it("returns only a newer stable release from the fixed response origin", async () => {
-    const seen: string[] = [];
-    const version = await checkForNewerPiccRelease({
-      currentVersion: "1.2.3",
-      fetch: async (url, init) => {
-        seen.push(String(url));
-        expect(init?.redirect).toBe("error");
-        return registryResponse({ name: "picc", version: "1.2.4" });
-      },
-    });
-    expect(seen).toEqual([PICC_REGISTRY_LATEST_URL]);
-    expect(version).toBe("1.2.4");
-  });
-
-  it.each([
-    ["equal", { name: "picc", version: "1.2.3" }, PICC_REGISTRY_LATEST_URL],
-    ["older", { name: "picc", version: "1.2.2" }, PICC_REGISTRY_LATEST_URL],
-    ["prerelease", { name: "picc", version: "1.2.4-beta.1" }, PICC_REGISTRY_LATEST_URL],
-    ["wrong schema", { name: "other", version: "9.0.0" }, PICC_REGISTRY_LATEST_URL],
-    ["wrong origin", { name: "picc", version: "9.0.0" }, "https://example.com/latest"],
-  ])("keeps %s responses quiet", async (_label, body, url) => {
-    await expect(checkForNewerPiccRelease({
-      currentVersion: "1.2.3",
-      fetch: async () => registryResponse(body, url),
-    })).resolves.toBeUndefined();
-  });
-
-  it("rejects an unavailable current version without fetching", async () => {
-    const fetcher = vi.fn<typeof fetch>();
-    await expect(checkForNewerPiccRelease({
-      currentVersion: "unknown",
-      fetch: fetcher,
-    })).resolves.toBeUndefined();
-    expect(fetcher).not.toHaveBeenCalled();
-  });
-
-  it("honors offline and the distinct PiCC skip knob without fetching", async () => {
-    const fetcher = vi.fn<typeof fetch>();
-    await expect(checkForNewerPiccRelease({
-      currentVersion: "1.2.3", env: { PI_OFFLINE: "1" }, fetch: fetcher,
-    })).resolves.toBeUndefined();
-    await expect(checkForNewerPiccRelease({
-      currentVersion: "1.2.3", env: { PICC_SKIP_UPDATE_CHECK: "1" }, fetch: fetcher,
-    })).resolves.toBeUndefined();
-    expect(fetcher).not.toHaveBeenCalled();
-
-    await expect(checkForNewerPiccRelease({
-      currentVersion: "1.2.3",
-      env: { PI_OFFLINE: "0", PICC_SKIP_UPDATE_CHECK: "false" },
-      fetch: async () => registryResponse({ name: "picc", version: "1.2.4" }),
-    })).resolves.toBe("1.2.4");
-  });
-
-  it.each([
-    ["malformed JSON", rawRegistryResponse("{"), undefined],
-    ["schema mismatch", rawRegistryResponse(JSON.stringify({ name: "picc", version: 4 })), undefined],
-    ["non-OK status", rawRegistryResponse("no", { status: 503 }), undefined],
-    ["missing body", rawRegistryResponse(null), undefined],
-    ["invalid UTF-8", rawRegistryResponse(new Uint8Array([0xff])), undefined],
-  ])("rejects %s", async (_label, response, expected) => {
-    await expect(checkForNewerPiccRelease({
-      currentVersion: "1.2.3",
-      fetch: async () => response,
-    })).resolves.toBe(expected);
-  });
-
-  it("silently rejects fetch failures", async () => {
-    await expect(checkForNewerPiccRelease({
-      currentVersion: "1.2.3",
-      fetch: async () => { throw new Error("network down"); },
-    })).resolves.toBeUndefined();
-  });
-
-  it("rejects an oversized body", async () => {
-    await expect(checkForNewerPiccRelease({
-      currentVersion: "1.2.3",
-      maxBytes: 8,
-      fetch: async () => registryResponse({ name: "picc", version: "9.0.0" }),
-    })).resolves.toBeUndefined();
-  });
-
-  it("aborts a timed-out request and stays quiet", async () => {
-    let aborted = false;
-    const fetcher = vi.fn<typeof fetch>(async (_url, init) => new Promise<Response>((_resolve, reject) => {
-      init?.signal?.addEventListener("abort", () => {
-        aborted = true;
-        reject(new DOMException("aborted", "AbortError"));
-      });
-    }));
-    await expect(checkForNewerPiccRelease({
-      currentVersion: "1.2.3", timeoutMs: 5, fetch: fetcher,
-    })).resolves.toBeUndefined();
-    expect(aborted).toBe(true);
-  });
-
-  it("returns at the deadline and ignores a late fetch that does not honor abort", async () => {
-    const late = deferred<Response>();
-    const checking = checkForNewerPiccRelease({
-      currentVersion: "1.2.3",
-      timeoutMs: 5,
-      fetch: async () => late.promise,
-    });
-    await expect(checking).resolves.toBeUndefined();
-    late.resolve(registryResponse({ name: "picc", version: "9.0.0" }));
-    await late.promise;
-  });
-
-  it.each([
-    { direct: false, version: "1.2.3" },
-    { direct: true, version: "1.2.3", installKind: "source" as const },
-    { direct: true, version: "1.2.3", installKind: "known local package" as const },
-    { direct: true, version: "1.2.3", installKind: "unknown/other" as const },
-  ])("does not check an ineligible launch context: $installKind", async (context) => {
-    const check = vi.fn(async () => "9.0.0");
-    createPiccReleaseAdvisory({ context, check }).start(vi.fn());
-    await Promise.resolve();
-    expect(check).not.toHaveBeenCalled();
-  });
-
-  it("starts detached and checks/notifies at most once", async () => {
-    const result = deferred<string | undefined>();
-    const check = vi.fn(async () => result.promise);
-    const notify = vi.fn();
-    const advisory = createPiccReleaseAdvisory({
-      context: {
-        direct: true,
-        version: "1.2.3",
-        installKind: "verified public-registry global npm",
-      },
-      check,
-    });
-    advisory.start(notify);
-    advisory.start(notify);
-    expect(check).toHaveBeenCalledTimes(1);
-    expect(notify).not.toHaveBeenCalled();
-    result.resolve("1.2.4");
-    await result.promise;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(notify).toHaveBeenCalledOnce();
-  });
 });
 
 describe("extension command boundary", () => {
@@ -441,43 +264,6 @@ describe("extension command boundary", () => {
         { encoding: "utf8" },
       )) as { pid?: string; skip?: string };
       expect(nested).toEqual({});
-      await pi.waitForInitialization();
-    } finally {
-      process.chdir(savedCwd);
-      for (const key of Object.keys(process.env)) delete process.env[key];
-      Object.assign(process.env, saved);
-    }
-  });
-
-  it("starts one detached advisory only for verified-registry TUI startup", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "picc-update-wiring-"));
-    roots.push(root);
-    fs.writeFileSync(path.join(root, "CLAUDE.md"), "fixture\n", "utf8");
-    const savedCwd = process.cwd();
-    const saved = { ...process.env };
-    try {
-      process.chdir(root);
-      Object.assign(process.env, directEnv({
-        PICC_LAUNCHER_PID: String(process.ppid),
-        PICC_VERSION: "0.1.0",
-      }));
-      const release = deferred<string | undefined>();
-      const check = vi.fn(async () => release.promise);
-      const pi = fakePi();
-      picc(pi.api as never, { checkPiccRelease: check, onInitializationSettled: pi.captureInitialization });
-      await pi.fire("session_start", { reason: "startup" }, pi.printCtx());
-      await pi.fire("session_start", { reason: "startup" }, pi.ctx({ mode: "json", hasUI: false }));
-      await pi.fire("session_start", { reason: "startup" }, pi.rpcCtx());
-      await pi.fire("session_start", { reason: "new" }, pi.tuiCtx());
-      expect(check).not.toHaveBeenCalled();
-      await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx());
-      await pi.fire("session_start", { reason: "startup" }, pi.tuiCtx());
-      expect(check).toHaveBeenCalledTimes(1);
-      expect(pi.notifications.filter((item) => item.text.includes("9.0.0"))).toHaveLength(0);
-      release.resolve("9.0.0");
-      await release.promise;
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(pi.notifications.filter((item) => item.text.includes("9.0.0"))).toHaveLength(1);
       await pi.waitForInitialization();
     } finally {
       process.chdir(savedCwd);

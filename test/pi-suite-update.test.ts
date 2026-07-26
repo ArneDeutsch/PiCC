@@ -7,7 +7,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { PI_SUITE_PACKAGES, VALIDATION_MODES } from "../bin/picc-admin.mjs";
+import { PI_SUITE_PACKAGES, canonicalPath } from "../bin/picc-admin.mjs";
 import { runPiSuiteUpdate } from "../scripts/update-pi-suite.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -15,11 +15,6 @@ const script = path.join(repoRoot, "scripts", "update-pi-suite.mjs");
 const cleanup: string[] = [];
 const npmCli = path.join(repoRoot, "fake", "npm-cli.js");
 const gitCli = path.join(repoRoot, "fake", "git");
-const recovery = [
-  "Inspect changes with: git diff -- package.json package-lock.json",
-  "Restore package.json and package-lock.json with Git if needed.",
-  "Then run: npm ci --ignore-scripts",
-].join("\n");
 
 type FakeChild = EventEmitter & { stdout: PassThrough };
 
@@ -52,7 +47,7 @@ async function fixture(): Promise<string> {
   cleanup.push(root);
   await writeFile(path.join(root, "package.json"), JSON.stringify({ name: "picc" }));
   await writeFile(path.join(root, "package-lock.json"), JSON.stringify({ lockfileVersion: 3 }));
-  return fs.realpathSync(root);
+  return canonicalPath(fs.realpathSync(root));
 }
 
 function baseOptions(root: string, spawnProcess: (...args: any[]) => FakeChild) {
@@ -60,7 +55,7 @@ function baseOptions(root: string, spawnProcess: (...args: any[]) => FakeChild) 
     argv: ["0.82.0"],
     packageRoot: root,
     discoverGit: () => gitCli,
-    discoverNpm: () => npmCli,
+    discoverNpm: () => ({ command: process.execPath, args: [npmCli] }),
     spawnProcess,
     validateSuite: () => ({ ok: true, version: "0.82.0" }),
   };
@@ -82,7 +77,7 @@ describe("coordinated Pi-suite update", () => {
       discoverGit: () => { discovered = true; return gitCli; },
     })).toBe(1);
     expect(discovered).toBe(false);
-    expect(capture.stderr.join("\n")).toContain("one stable exact version");
+    expect(capture.stderr.join("\n")).toContain("<stable-exact-version>");
   });
 
   it.each([
@@ -103,14 +98,13 @@ describe("coordinated Pi-suite update", () => {
       args: failAt === 0
         ? ["diff", "--quiet", "--", "package.json", "package-lock.json"]
         : ["diff", "--cached", "--quiet", "--", "package.json", "package-lock.json"],
-      options: { cwd: root, stdio: "inherit" },
+      options: { cwd: root, env: process.env, stdio: "inherit", shell: false },
     });
     expect(calls.every(({ command }) => command === gitCli)).toBe(true);
-    expect(capture.stderr.join("\n")).toContain("staged or unstaged changes");
-    expect(capture.stderr.join("\n")).toContain(recovery);
+    expect(capture.stderr.join("\n")).toContain("package.json or package-lock.json is dirty");
   });
 
-  it("runs exactly one visible complete npm transaction and strict validation", async () => {
+  it("runs one visible npm transaction with inherited configuration, then validates direct packages", async () => {
     const root = await fixture();
     const calls: Array<{ command: string; args: string[]; options: any }> = [];
     const validations: any[] = [];
@@ -128,12 +122,12 @@ describe("coordinated Pi-suite update", () => {
       {
         command: gitCli,
         args: ["diff", "--quiet", "--", "package.json", "package-lock.json"],
-        options: { cwd: root, stdio: "inherit" },
+        options: { cwd: root, env: process.env, stdio: "inherit", shell: false },
       },
       {
         command: gitCli,
         args: ["diff", "--cached", "--quiet", "--", "package.json", "package-lock.json"],
-        options: { cwd: root, stdio: "inherit" },
+        options: { cwd: root, env: process.env, stdio: "inherit", shell: false },
       },
       {
         command: process.execPath,
@@ -143,11 +137,13 @@ describe("coordinated Pi-suite update", () => {
           ...PI_SUITE_PACKAGES.map((name) => `${name}@0.82.0`),
           "--save-exact",
           "--ignore-scripts",
+          "--no-audit",
+          "--no-fund",
         ],
-        options: { cwd: root, stdio: "inherit" },
+        options: { cwd: root, env: process.env, stdio: "inherit", shell: false },
       },
     ]);
-    expect(validations).toEqual([{ packageRoot: root, mode: VALIDATION_MODES.STRICT_EXACT }]);
+    expect(validations).toEqual([{ packageRoot: root }]);
     expect(capture.stdout).toEqual(["Outcome: updated the complete direct Pi suite to 0.82.0."]);
   });
 
@@ -157,20 +153,21 @@ describe("coordinated Pi-suite update", () => {
     ["npm failure", 2, () => child(1)],
     ["npm signal", 2, () => child(0, "", "SIGTERM")],
     ["npm spawn failure", 2, () => spawnError()],
-  ] as const)("reports fixed recovery guidance for %s", async (_label, failAt, failedChild) => {
+  ] as const)("reports the failed lean transaction for %s", async (_label, failAt, failedChild) => {
     const root = await fixture();
     let call = 0;
     const capture = output();
     const spawnProcess = () => call++ === failAt ? failedChild() : child();
     expect(await runPiSuiteUpdate({ ...baseOptions(root, spawnProcess), output: capture.sink })).toBe(1);
-    expect(capture.stderr.join("\n")).toContain(recovery);
+    expect(capture.stderr.join("\n")).toContain(
+      failAt < 2 ? "package.json or package-lock.json is dirty" : "npm install failed",
+    );
   });
 
   it.each([
-    ["false result", () => ({ ok: false, version: "0.82.0" })],
-    ["wrong version", () => ({ ok: true, version: "0.82.1" })],
-    ["throw", () => { throw new Error("validation detail"); }],
-  ])("fails closed after strict validation: %s", async (_label, validateSuite) => {
+    ["package mismatch", () => ({ ok: false, reason: "direct package mismatch" }), "direct package mismatch"],
+    ["wrong version", () => ({ ok: true, version: "0.82.1" }), "Pi suite validation failed"],
+  ] as const)("fails after direct-package validation: %s", async (_label, validateSuite, expected) => {
     const root = await fixture();
     const capture = output();
     expect(await runPiSuiteUpdate({
@@ -178,12 +175,10 @@ describe("coordinated Pi-suite update", () => {
       output: capture.sink,
       validateSuite,
     })).toBe(1);
-    expect(capture.stderr.join("\n")).toContain("strict Pi-suite validation failed");
-    expect(capture.stderr.join("\n")).toContain(recovery);
-    expect(capture.stderr.join("\n")).not.toContain("validation detail");
+    expect(capture.stderr.join("\n")).toContain(expected);
   });
 
-  it("fails before Git when the verified npm CLI is unavailable", async () => {
+  it("fails before Git when npm is unavailable", async () => {
     const root = await fixture();
     let spawned = false;
     const capture = output();
@@ -193,7 +188,7 @@ describe("coordinated Pi-suite update", () => {
       output: capture.sink,
     })).toBe(1);
     expect(spawned).toBe(false);
-    expect(capture.stderr.join("\n")).toContain(recovery);
+    expect(capture.stderr.join("\n")).toContain("Git and npm are required");
   });
 
   it("real entrypoint rejects malformed argv without starting npm", async () => {
@@ -204,6 +199,6 @@ describe("coordinated Pi-suite update", () => {
       });
     });
     expect(result).toMatchObject({ code: 1, stdout: "" });
-    expect(result.stderr).toContain("one stable exact version");
+    expect(result.stderr).toContain("<stable-exact-version>");
   });
 });

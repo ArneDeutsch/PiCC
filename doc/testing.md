@@ -87,7 +87,7 @@ mappings still include the richer property-and-boundary evidence required above.
 This is the canonical list of lanes.
 
 ```bash
-npm install            # also fetches Pi, whose CLI the e2e layer drives
+npm ci                 # installs the lockfile, including Pi's CLI for the e2e layer
 npm run typecheck      # strict TypeScript over src/**, no emit
 npm run typecheck:test # type-check the test suite (test/** + vitest.config.ts)
 npm run typecheck:all  # both of the above — part of the pre-commit gate
@@ -108,8 +108,9 @@ in-process code, so it reports the unit lane's coverage of `src/**` and cannot m
 child process; it is a guidance signal with no thresholds.
 
 CI type-checks with `typecheck:all` and runs `test:unit` and `test:e2e` as separate lanes across
-Windows/Linux. The pre-commit hook (`.githooks/pre-commit`) keeps the faster `typecheck:all` then
-`test:unit` gate. Run `npm run verify` before integration; it is the complete local authority.
+Windows/Linux. Contributors who opt in with `npm run hooks:install` get the faster
+`typecheck:all` then `test:unit` pre-commit gate. Run `npm run verify` before integration; it is the
+complete local authority.
 
 For a focused inner loop, pass an exact file through npm:
 
@@ -128,7 +129,7 @@ Vitest's `-t` is a regular-expression filter, so an unanchored leaf name is not 
 
 The runner is [vitest](https://vitest.dev). Tests are TypeScript run through `tsx`/vitest — there
 is no build step to run first. The e2e layer needs Pi's compiled CLI at
-`node_modules/@earendil-works/pi-coding-agent/dist/cli.js`; `npm install` provides it.
+`node_modules/@earendil-works/pi-coding-agent/dist/cli.js`; `npm ci` provides it.
 `test:e2e` fails before Vitest with reinstall/version guidance when that CLI is missing, preventing
 CI and complete local verification from silently skipping the real-Pi lane. Direct Vitest runs may
 still skip the E2E files gracefully, which is useful for narrow development commands.

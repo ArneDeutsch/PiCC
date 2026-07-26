@@ -233,8 +233,8 @@ where to start reading, not the extent of its cluster.
 - **Session state** (`cwd-state.ts`, `worktrees.ts`) — `CwdState` is **the single mutable source of
   truth for the effective cwd**; every tool resolves through it at execute time (see *The cwd swap is
   load-bearing*). `WorktreeManager` resolves a base ref to a concrete SHA **before** creating the
-  worktree and removes Windows-tolerantly. Orphan cleanup is best-effort and runs only after trusted
-  Git and registered-worktree state are verified; unavailable state is left untouched. Public methods
+  worktree and removes Windows-tolerantly. Orphan cleanup is best-effort and runs only after the Git
+  executable and registered-worktree state are verified; unavailable state is left untouched. Public methods
   do not throw.
 
 - **Enforcement wiring** (`guard.ts`, `tool-map.ts`) — the guard applies engine decisions to real
@@ -354,7 +354,7 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    built-ins — losing the cwd swap, not the session.
 
 2. **`session_start`.** Captures the model registry and active model, applies the configured
-   model/effort, attempts to self-heal `core.hooksPath` when `.githooks/` and trusted Git are
+   model/effort, attempts to self-heal `core.hooksPath` when `.githooks/` and a resolved Git executable are
    available (otherwise skips it), and fires the `SessionStart` hook. Steering text is derived from
    the active model here and **re-derived on `model_select`**,
    so a mid-session model switch re-steers — steering follows the model, it is not a startup

@@ -1,8 +1,8 @@
 # PiCC ↔ Pi integration contracts
 
 > **Status:** Contract record for the coordinated Pi 0.82.0 suite. `package.json` pins every direct
-> suite declaration to exactly 0.82.0; strict admission verifies every lockfile and installed
-> occurrence is coherent at that version. Installed package metadata declares Node ≥ 22.19.0.
+> suite declaration to exactly 0.82.0; launcher admission resolves the four direct package manifests
+> from PiCC's package tree and requires that exact version. Installed package metadata declares Node ≥ 22.19.0.
 > Source of truth for every Pi API PiCC builds on. If Pi churns, update here first.
 >
 > Fork vs. depend: **depend + extension bundle**. Pi is a regular npm dependency;
@@ -16,7 +16,7 @@ Pi extensions are TS modules (loaded via jiti, no compilation) exporting
 PiCC is **one extension bundle** with an entry `src/index.ts` that registers everything.
 
 Launch modes we support:
-- `pi -e <path-to-picc>` in the target project (dev/test).
+- `pi -e <path-to-PiCC>/src/index.ts` in the target project (dev/test).
 - `"extensions": ["<path>"]` in `~/.pi/agent/settings.json` or `.pi/settings.json` (persistent).
 - A `picc` launcher that owns PiCC administration routing, validates one coherent installed Pi suite, then runs its coding-agent CLI with the extension preloaded. Resolution starts from PiCC's package tree rather than the target cwd: Pi's import-only exports map does not expose `dist/cli.js`, while npm may hoist the package to PiCC's containing `node_modules`.
 
@@ -46,7 +46,7 @@ disables Pi's checker. An externally configured `PI_SKIP_VERSION_CHECK` remains 
 | Subagent runtime (fresh context, parallel, per-agent tools/model, verbatim return — see "Verbatim subagent return" in [`architecture.md`](architecture.md)) | SDK: `createAgentSession({ cwd, tools, customTools, resourceLoader, sessionManager, settingsManager, model?, thinkingLevel? })` — the options **PiCC passes**; Pi's own option set is wider. `resourceLoader` is `new DefaultResourceLoader({ cwd, agentDir, systemPromptOverride, agentsFilesOverride, skillsOverride, promptsOverride, extensionFactories })` (`await loader.reload()` before use). Final assistant message read as the last `role: "assistant"` entry of `session.messages`. Per-session `sessionManager` — see "Session managers" below. |
 | Session managers (subagent transcripts) | `SessionManager.create(cwd, sessionDir, { id })` — persisted transcript, the default (Pi names the file `<stamp>_<id>.jsonl`); `SessionManager.open(path, sessionDir, cwd)` — reopen the same file to resume and append; `SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id })` — read a source transcript and write a **brand-new** file, so a `subagent_type: "fork"` child inherits the parent conversation without touching the parent's history; `SessionManager.inMemory(cwd)` — the non-resumable fallback when no transcript is available (no main-session file, a failed `create`, or an SDK without persisted sessions). Settings: `SettingsManager.inMemory(settings)`. |
 | Model/effort control | `pi.setModel(model)`, `ctx.modelRegistry.find(provider,id)`, `pi.setThinkingLevel("off"…"max")` — Claude `effort` maps onto thinking levels |
-| Env & exec | PiCC-owned startup/worktree Git administration uses `node:child_process.execFile` with sanitized inherited environment because Pi 0.82's `pi.exec` options do not accept `env`; hooks use `spawn` for their shell/stdin JSON contract. Pi 0.82 Bash factories default to exposing `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`; PiCC passes `exposeSessionEnvironment:false`, then overlays sanitized `setting.env` and the required project-root `CLAUDE_PROJECT_DIR`. |
+| Env & exec | PiCC resolves its Git executable from the absolute `PICC_GIT` override or PATH. Startup/worktree Git uses `node:child_process.execFile` with sanitized inherited environment because Pi 0.82's `pi.exec` options do not accept `env`; hooks use `spawn` for their shell/stdin JSON contract. Pi 0.82 Bash factories default to exposing `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`; PiCC passes `exposeSessionEnvironment:false`, then overlays sanitized `setting.env` and the required project-root `CLAUDE_PROJECT_DIR`. |
 | Quota | `ctx.getContextUsage()`; subscription quota via provider headers on `after_provider_response` (rate-limit headers) + `/login`-stored auth; degrade gracefully if absent |
 | Control output, checkpoint records, and status notifications | `ctx.ui.notify` for TUI status; `pi.appendEntry` records entries across modes, while `pi.registerEntryRenderer` supplies their TUI presentation. Raw control text is written only in text print mode; JSON and RPC remain protocol-safe entry streams |
 | Subagent status panel, drill-down & condensed settlement records (interactive TUI only) | `ctx.ui.setWidget(key, factory, { placement: "belowEditor" })` — factory invoked synchronously, replaced/removed components disposed; `ctx.ui.custom(factory)` — focused component, Pi saves/restores the editor draft around it; `pi.registerShortcut(keyId, { description, handler })` — dispatches only while the default editor has focus; `ctx.ui.onTerminalInput` — raw listeners run BEFORE the focused component, so PiCC's fork-Esc watcher yields a lone Esc while the panel is open; `pi.registerMessageRenderer(customType, renderer)` + `pi.sendMessage(…, details)` — rendered by Pi's `CustomMessageComponent` with a boolean `expanded` (Ctrl+O toggle); `undefined`/throw falls back to Pi's default box. Mode gating is on `ctx.mode === "tui"`, never `hasUI`: print's `noOpUIContext` implements the full ui interface with `hasUI` false, while RPC flips `hasUI` true. |
@@ -171,8 +171,8 @@ are inherited behavior, not PiCC compatibility features. PiCC keeps complete eag
 not adopt deferred tool activation. We do not reimplement these Pi-native surfaces.
 
 ## 4. Risks / churn watchpoints
-- Pre-1.0 API churn: the manifest pins the complete coordinated suite exactly, while shared strict
-  graph admission checks every lockfile and installed occurrence; this doc + the version-sensitive
+- Pre-1.0 API churn: the manifest pins the complete coordinated suite exactly, while launcher
+  admission resolves and verifies each direct package manifest; this doc + the version-sensitive
   smoke probes in `test/pi-contract.test.ts` assert the imports/exports and behavior PiCC relies on.
 - `before_agent_start` system-prompt chaining: other extensions may also modify; we append, not replace.
 - Mid-run checkpoint watchpoints: `turn_end` must remain after all sibling tool results; `terminate`
