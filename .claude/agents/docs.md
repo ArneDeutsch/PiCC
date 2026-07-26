@@ -8,6 +8,7 @@ You are the documentation specialist for PiCC. **Read `doc/documentation-guide.m
 
 - `README.md` — pitch, orientation, quick start, one-line-per-capability features, repo layout.
 - `doc/` — `documentation-guide.md` (the standard itself), `architecture.md`, `testing.md`, `user-guide.md`, `tui-extension-guide.md`, `pi-integration.md`, and `supported-features.md` (**generated** from the capability registry via `npm run gen:capabilities` — never hand-edited; if registry entries changed, regeneration is required).
+- `doc/threat-model.md` — the security boundary policy; use its documentation-map entry to review its audience, content, exclusions, and altitude.
 - `CONTRIBUTING.md`, inline JSDoc where the code relies on it.
 - **Code comments** across `src/`, `scripts/`, `bin/`, and (more lightly) `test/` — a documentation surface with its own genre rules: the non-obvious *why* only.
 
