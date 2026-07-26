@@ -50,6 +50,51 @@ async function shutdownExtension(pi: FakePi): Promise<void> {
   await pi.fire("session_shutdown", { reason: "other" }, pi.printCtx());
 }
 
+function startGatedExtension(identity: string, serverMode: string): {
+  fixture: McpProcessFixture;
+  pi: FakePi;
+} {
+  const dir = makeTempDir(`picc-${identity}-`);
+  const fixture = createMcpProcessFixture(makeTempDir(`picc-${identity}-fx-`));
+  const wrapper = path.join(fixture.dir, "gated-server.mjs");
+  fs.writeFileSync(
+    wrapper,
+    [
+      'import fs from "node:fs";',
+      'import path from "node:path";',
+      "const dir = process.env.MCP_BARRIER_DIR;",
+      `fs.writeFileSync(path.join(dir, ${JSON.stringify(`${identity}.pid`)}), JSON.stringify({ pid: process.pid }));`,
+      "await new Promise((resolve) => {",
+      `  const check = () => (fs.existsSync(path.join(dir, ${JSON.stringify(`${identity}.release`)})) ? resolve() : setTimeout(check, 10));`,
+      "  check();",
+      "});",
+      // Import by file URL so the committed fixture's SDK/package imports resolve from test/helpers, not the temp wrapper directory.
+      `await import(${JSON.stringify(pathToFileURL(fixture.serverScript).href)});`,
+    ].join("\n"),
+  );
+  writeProjectFile(dir, "CLAUDE.md", `MCP-${identity.toUpperCase()}-PROJECT\n`);
+  writeProjectFile(
+    dir,
+    ".mcp.json",
+    JSON.stringify({
+      mcpServers: {
+        [identity]: {
+          command: fixture.nodeCommand,
+          args: [wrapper, serverMode],
+          env: fixture.env,
+        },
+      },
+    }),
+  );
+  const userDir = makeTempDir(`picc-${identity}-user-`);
+  writeProjectFile(userDir, "settings.json", JSON.stringify({ enabledMcpjsonServers: [identity] }));
+  process.env.PICC_CLAUDE_USER_DIR = userDir;
+  process.chdir(dir);
+  const pi = fakePi();
+  picc(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+  return { fixture, pi };
+}
+
 const originalCwd = process.cwd();
 const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
 
@@ -282,52 +327,13 @@ describe("MCP main-session tool exposure (wired)", () => {
 // ---------------------------------------------------------------------------
 
 describe("MCP first-turn settle barrier (wired)", () => {
-  let dir: string;
   let fixture: McpProcessFixture;
   let pi: FakePi;
 
   beforeAll(() => {
-    dir = makeTempDir("picc-mcpgate-");
-    fixture = createMcpProcessFixture(makeTempDir("picc-mcpgate-fx-"));
-    // Gate wrapper in the fixture dir: publish a pid marker, wait for the
-    // release marker, then run the COMMITTED fixture server module (imported by
-    // file URL so its SDK imports resolve from test/helpers, not this temp dir).
-    const wrapper = path.join(fixture.dir, "gated-server.mjs");
-    fs.writeFileSync(
-      wrapper,
-      [
-        'import fs from "node:fs";',
-        'import path from "node:path";',
-        "const dir = process.env.MCP_BARRIER_DIR;",
-        'fs.writeFileSync(path.join(dir, "gated.pid"), JSON.stringify({ pid: process.pid }));',
-        "await new Promise((resolve) => {",
-        '  const check = () => (fs.existsSync(path.join(dir, "gated.release")) ? resolve() : setTimeout(check, 10));',
-        "  check();",
-        "});",
-        `await import(${JSON.stringify(pathToFileURL(fixture.serverScript).href)});`,
-      ].join("\n"),
-    );
-    writeProjectFile(dir, "CLAUDE.md", "MCP-GATE-PROJECT\n");
-    writeProjectFile(
-      dir,
-      ".mcp.json",
-      JSON.stringify({
-        mcpServers: {
-          gated: {
-            command: fixture.nodeCommand,
-            // argv[2] = "serve" reaches the imported committed module's mode switch.
-            args: [wrapper, "serve"],
-            env: fixture.env,
-          },
-        },
-      }),
-    );
-    const userDir = makeTempDir("picc-mcpgate-user-");
-    writeProjectFile(userDir, "settings.json", JSON.stringify({ enabledMcpjsonServers: ["gated"] }));
-    process.env.PICC_CLAUDE_USER_DIR = userDir;
-    process.chdir(dir);
-    pi = fakePi();
-    picc(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+    const started = startGatedExtension("gated", "serve");
+    fixture = started.fixture;
+    pi = started.pi;
   });
 
   afterAll(async () => {
@@ -339,29 +345,180 @@ describe("MCP first-turn settle barrier (wired)", () => {
     }
   }, 30_000);
 
-  it("before_agent_start does not return until the gated server settles, then carries its tools", async () => {
+  it("shows and clears TUI startup status around the barrier without changing machine modes", async () => {
     await fixture.waitFor(["gated.pid"], "gated server to spawn");
     let settled = false;
     const firing = pi
-      .fire("before_agent_start", { systemPrompt: "BASE" }, pi.printCtx())
+      .fire("before_agent_start", { systemPrompt: "BASE" }, pi.tuiCtx())
       .then((result) => {
         settled = true;
         return result;
       });
-    // Observation window only — the deterministic proof is that RELEASING the
-    // gate is what lets the fire settle (below); nothing here asserts elapsed time.
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await waitUntil({
+      description: "TUI MCP startup status to be recorded",
+      predicate: () => pi.statusCalls.length === 1,
+      describeObserved: () => JSON.stringify(pi.statusCalls),
+    });
+    expect(pi.statusCalls).toEqual([{
+      key: "picc-mcp-startup",
+      text: "Waiting for MCP servers to start…",
+    }]);
     expect(settled).toBe(false);
     expect(pi.tools.has("mcp__gated__echo")).toBe(false);
 
+    const throwingStatusCalls: Array<{ key: string; text: string | undefined }> = [];
+    const throwingFiring = pi.fire(
+      "before_agent_start",
+      { systemPrompt: "THROWING-UI" },
+      pi.tuiCtx({
+        ui: {
+          setStatus: (key: string, text: string | undefined) => {
+            throwingStatusCalls.push({ key, text });
+            throw new Error("setStatus fixture failure");
+          },
+        },
+      }),
+    );
+    const machineFirings = [
+      pi.fire("before_agent_start", { systemPrompt: "PRINT" }, pi.printCtx()),
+      pi.fire("before_agent_start", { systemPrompt: "JSON" }, pi.ctx({ mode: "json", hasUI: false })),
+      pi.fire("before_agent_start", { systemPrompt: "RPC" }, pi.rpcCtx()),
+    ];
+    expect(throwingStatusCalls).toEqual([{
+      key: "picc-mcp-startup",
+      text: "Waiting for MCP servers to start…",
+    }]);
+    expect(pi.statusCalls).toHaveLength(1);
+    expect(pi.messages).toEqual([]);
+    expect(pi.entries).toEqual([]);
+
     fixture.release("gated");
-    const result = await firing;
+    const [result, throwingResult, ...machineResults] = await Promise.all([
+      firing,
+      throwingFiring,
+      ...machineFirings,
+    ]);
     expect(settled).toBe(true);
+    expect(pi.statusCalls).toEqual([
+      { key: "picc-mcp-startup", text: "Waiting for MCP servers to start…" },
+      { key: "picc-mcp-startup", text: undefined },
+    ]);
     // Registration completed BEFORE the handler returned: Pi snapshots the
     // run's tools after awaiting before_agent_start, so the first request
     // deterministically carries the connected server's tools.
+    expect(throwingStatusCalls).toEqual([
+      { key: "picc-mcp-startup", text: "Waiting for MCP servers to start…" },
+      { key: "picc-mcp-startup", text: undefined },
+    ]);
     expect(pi.tools.has("mcp__gated__echo")).toBe(true);
     expect(String(result?.systemPrompt ?? "")).toContain("BASE");
+    expect(String(result?.systemPrompt ?? "")).not.toContain("Waiting for MCP");
+    expect(String(throwingResult?.systemPrompt ?? "")).toContain("THROWING-UI");
+    expect(String(throwingResult?.systemPrompt ?? "")).not.toContain("Waiting for MCP");
+    for (const machineResult of machineResults) {
+      expect(String(machineResult?.systemPrompt ?? "")).not.toContain("Waiting for MCP");
+    }
+    expect(JSON.stringify(pi.messages)).not.toContain("Waiting for MCP");
+    expect(JSON.stringify(pi.entries)).not.toContain("Waiting for MCP");
+    expect(JSON.stringify(pi.notifications)).not.toContain("Waiting for MCP");
+
+    await pi.fire("before_agent_start", { systemPrompt: "LATER" }, pi.tuiCtx());
+    expect(pi.statusCalls).toHaveLength(2);
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// Terminal cleanup paths: failed settlement and shutdown while connecting.
+// ---------------------------------------------------------------------------
+
+describe("MCP startup status terminal cleanup (wired)", () => {
+  it("contains throwing set/clear calls and clears before the failure warning", async () => {
+    const { fixture, pi } = startGatedExtension("failed", "exit-early");
+    const events: string[] = [];
+    const ctx = pi.tuiCtx({
+      ui: {
+        setStatus: (_key: string, text: string | undefined) => {
+          events.push(text === undefined ? "clear" : "set");
+          throw new Error("setStatus fixture failure");
+        },
+        notify: (text: string, severity?: string) => {
+          events.push("notify");
+          pi.notifications.push({ text, severity });
+        },
+      },
+    });
+    const firing = pi.fire("before_agent_start", { systemPrompt: "FAIL" }, ctx);
+    try {
+      await fixture.waitFor(["failed.pid"], "failed server to reach its gate");
+      await waitUntil({
+        description: "throwing failure-path status set attempt",
+        predicate: () => events.length === 1,
+        describeObserved: () => JSON.stringify(events),
+      });
+      fixture.release("failed");
+      const result = await firing;
+      expect(String(result?.systemPrompt ?? "")).toContain("FAIL");
+      expect(events).toEqual(["set", "clear", "notify"]);
+      expect(pi.notifications).toEqual([{
+        text: "MCP server(s) failed to connect: failed — run /doctor for details.",
+        severity: "warning",
+      }]);
+      expect(pi.tools.has("mcp__failed__echo")).toBe(false);
+
+      await pi.fire("before_agent_start", { systemPrompt: "LATER" }, ctx);
+      expect(events).toEqual(["set", "clear", "notify"]);
+      expect(pi.notifications).toHaveLength(1);
+    } finally {
+      try {
+        await shutdownExtension(pi);
+      } finally {
+        try {
+          await firing.catch(() => undefined);
+        } finally {
+          try {
+            await fixture.cleanup("failed");
+          } finally {
+            process.chdir(originalCwd);
+          }
+        }
+      }
+    }
+  }, 30_000);
+
+  it("clears the status when shutdown settles a pending connection", async () => {
+    const { fixture, pi } = startGatedExtension("shutdown", "serve");
+    const firing = pi.fire("before_agent_start", { systemPrompt: "SHUTDOWN" }, pi.tuiCtx());
+    try {
+      await fixture.waitFor(["shutdown.pid"], "shutdown server to reach its gate");
+      await waitUntil({
+        description: "pending-shutdown status set",
+        predicate: () => pi.statusCalls.length === 1,
+        describeObserved: () => JSON.stringify(pi.statusCalls),
+      });
+      expect(pi.tools.has("mcp__shutdown__echo")).toBe(false);
+      await shutdownExtension(pi);
+      const result = await firing;
+      expect(String(result?.systemPrompt ?? "")).toContain("SHUTDOWN");
+      expect(pi.statusCalls).toEqual([
+        { key: "picc-mcp-startup", text: "Waiting for MCP servers to start…" },
+        { key: "picc-mcp-startup", text: undefined },
+      ]);
+      expect(pi.tools.has("mcp__shutdown__echo")).toBe(false);
+    } finally {
+      try {
+        await shutdownExtension(pi);
+      } finally {
+        try {
+          await firing.catch(() => undefined);
+        } finally {
+          try {
+            await fixture.cleanup("shutdown");
+          } finally {
+            process.chdir(originalCwd);
+          }
+        }
+      }
+    }
   }, 30_000);
 });
 
@@ -393,8 +550,9 @@ describe("MCP zero-enabled path (wired)", () => {
       const baseline = await baselinePi.fire(
         "before_agent_start",
         { systemPrompt: "BASE" },
-        baselinePi.printCtx(),
+        baselinePi.tuiCtx(),
       );
+      expect(baselinePi.statusCalls).toEqual([]);
       await shutdownExtension(baselinePi);
 
       // Same project, .mcp.json present but NOTHING enabled (pending approval).
@@ -413,8 +571,9 @@ describe("MCP zero-enabled path (wired)", () => {
       const withPending = await mcpPi.fire(
         "before_agent_start",
         { systemPrompt: "BASE" },
-        mcpPi.printCtx(),
+        mcpPi.tuiCtx(),
       );
+      expect(mcpPi.statusCalls).toEqual([]);
       const mcpTools = [...mcpPi.tools.keys()].filter((name) => name.startsWith("mcp__"));
       expect(mcpTools).toEqual([]);
 

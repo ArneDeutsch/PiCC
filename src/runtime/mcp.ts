@@ -60,6 +60,8 @@ const TOOL_TIMEOUT_MIN_MS = 1_000;
 const TOOL_TIMEOUT_MAX_MS = 2_147_483_647;
 /** Poll cadence while capturing the transport's pid during connect. */
 const PID_POLL_MS = 25;
+/** SDK McpError code accepted only with independent local closure provenance. */
+const MCP_ERROR_CONNECTION_CLOSED = -32_000;
 /** SDK McpError code for a timed-out request. */
 const MCP_ERROR_REQUEST_TIMEOUT = -32_001;
 
@@ -184,11 +186,14 @@ export class McpRuntime {
 
   private constructor(config: ResolvedMcpConfig, deps: McpRuntimeDeps) {
     this.deps = deps;
-    const timeoutPolicy = resolveMcpTimeoutPolicy(
+    const timeoutResolution = resolveMcpTimeoutPolicyInternal(
       sanitizedSubprocessEnv(deps.env ?? process.env, deps.settingsEnv),
     );
-    this.connectTimeoutMs = timeoutPolicy.connectTimeoutMs;
-    this.toolTimeoutMs = timeoutPolicy.environmentToolTimeoutMs;
+    this.connectTimeoutMs = timeoutResolution.policy.connectTimeoutMs;
+    this.toolTimeoutMs = timeoutResolution.policy.environmentToolTimeoutMs;
+    for (const rejected of timeoutResolution.rejected) {
+      this.diags.push(timeoutRejectionDiagnostic(rejected));
+    }
     for (const server of config.servers) {
       if (server.status !== "enabled") continue;
       this.handles.push({
@@ -355,6 +360,10 @@ export class McpRuntime {
     // already settled this handle and must not be raced into a spawn. This
     // check is complete: there is no await between here and the spawn.
     if (handle.stopped) return;
+    let initializationComplete = false;
+    let localCloseObserved = false;
+    let localTransportErrorObserved = false;
+    let serverErrorObservedBeforeInitialization = false;
     try {
       // Claude parity (binary-verified 2.1.218): sanitized inheritance →
       // project settings → injected Claude defaults → server env last.
@@ -385,6 +394,20 @@ export class McpRuntime {
           -STDERR_RING_MAX_CHARS,
         );
       });
+      // Protocol.connect preserves preinstalled callbacks and invokes them before
+      // its own handlers. That ordering distinguishes a transport-driven close
+      // from a server error response whose later cleanup also closes transport.
+      transport.onclose = () => {
+        localCloseObserved = true;
+      };
+      transport.onerror = () => {
+        localTransportErrorObserved = true;
+      };
+      transport.onmessage = (message) => {
+        if (!initializationComplete && isJsonRpcErrorResponse(message)) {
+          serverErrorObservedBeforeInitialization = true;
+        }
+      };
       const client = new sdk.Client({ name: "picc", version: "0.1.0" }, { capabilities: {} });
       handle.client = client;
       this.ensureExitHook();
@@ -402,6 +425,7 @@ export class McpRuntime {
 
       const connectPromise = (async () => {
         await client.connect(transport);
+        initializationComplete = true;
         const tools: unknown[] = [];
         let cursor: string | undefined;
         // Bounded pagination: a hostile server must not hold connect forever
@@ -444,6 +468,14 @@ export class McpRuntime {
       handle.tools = this.validateTools(server.name, outcome.value);
       this.settleHandle(handle, "connected");
     } catch (err) {
+      // Snapshot before catch-path cleanup: client.close() also closes the
+      // transport and must never manufacture closure provenance.
+      const recognizedPreInitializationClose =
+        !initializationComplete &&
+        localCloseObserved &&
+        !localTransportErrorObserved &&
+        !serverErrorObservedBeforeInitialization &&
+        errCode(err) === MCP_ERROR_CONNECTION_CLOSED;
       this.clearPidPoller(handle);
       // Fast-fail backstop: a spawn that errors within the first poll tick can
       // beat the pid poller — re-capture from the transport before deciding
@@ -454,10 +486,17 @@ export class McpRuntime {
       if (handle.stopped || handle.settled) return;
       if (handle.pid !== undefined) killProcessTreeByPid(handle.pid);
       if (handle.client) void handle.client.close().catch(() => {});
-      // Diagnostics reference the server NAME and rawCommand only — a raw
-      // spawn err.message embeds the EXPANDED command path (`spawn C:\...\x
-      // ENOENT`), which `${VAR}` expansion may have derived from values that
-      // must not surface. errSummary keeps only the error code/name.
+      if (recognizedPreInitializationClose) {
+        this.settleHandle(
+          handle,
+          "failed",
+          `MCP server "${server.name}": connection closed before MCP initialization completed.`,
+          "Connection closed before MCP initialization completed.",
+        );
+        return;
+      }
+      // Raw exception text can embed expanded command values or server speech;
+      // only code/name identity reaches the generic diagnostic.
       this.settleHandle(
         handle,
         "failed",
@@ -656,9 +695,30 @@ export class McpRuntime {
 export function resolveMcpTimeoutPolicy(
   env: Record<string, string | undefined>,
 ): McpTimeoutPolicy {
+  return resolveMcpTimeoutPolicyInternal(env).policy;
+}
+
+type RejectedTimeoutVariable = "MCP_TIMEOUT" | "MCP_TOOL_TIMEOUT";
+
+interface McpTimeoutPolicyResolution {
+  policy: McpTimeoutPolicy;
+  rejected: RejectedTimeoutVariable[];
+}
+
+function resolveMcpTimeoutPolicyInternal(
+  env: Record<string, string | undefined>,
+): McpTimeoutPolicyResolution {
+  const connect = parseTimeoutEnvironmentValue(env["MCP_TIMEOUT"]);
+  const tool = parseTimeoutEnvironmentValue(env["MCP_TOOL_TIMEOUT"]);
+  const rejected: RejectedTimeoutVariable[] = [];
+  if (connect.rejected) rejected.push("MCP_TIMEOUT");
+  if (tool.rejected) rejected.push("MCP_TOOL_TIMEOUT");
   return {
-    connectTimeoutMs: parsePositiveInt(env["MCP_TIMEOUT"]) ?? DEFAULT_CONNECT_TIMEOUT_MS,
-    environmentToolTimeoutMs: parsePositiveInt(env["MCP_TOOL_TIMEOUT"]),
+    policy: {
+      connectTimeoutMs: connect.value ?? DEFAULT_CONNECT_TIMEOUT_MS,
+      environmentToolTimeoutMs: tool.value,
+    },
+    rejected,
   };
 }
 
@@ -672,13 +732,26 @@ export function resolveMcpToolTimeoutMs(
   );
 }
 
-function parsePositiveInt(value: string | undefined): number | undefined {
-  if (value === undefined || value.trim() === "") return undefined;
+type ParsedTimeoutEnvironmentValue =
+  | { value: undefined; rejected: false }
+  | { value: undefined; rejected: true }
+  | { value: number; rejected: false };
+
+function parseTimeoutEnvironmentValue(value: string | undefined): ParsedTimeoutEnvironmentValue {
+  if (value === undefined || value.trim() === "") return { value: undefined, rejected: false };
   const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed <= 0) return undefined;
+  if (!Number.isInteger(parsed) || parsed <= 0) return { value: undefined, rejected: true };
   // Cap at 2^31-1 (Node's TIMEOUT_MAX): an over-max env value must clamp, not
   // overflow a timer into firing at ~1 ms.
-  return Math.min(parsed, TOOL_TIMEOUT_MAX_MS);
+  return { value: Math.min(parsed, TOOL_TIMEOUT_MAX_MS), rejected: false };
+}
+
+function timeoutRejectionDiagnostic(variable: RejectedTimeoutVariable): string {
+  const remedy = `Set ${variable} to a positive integer number of milliseconds or unset it.`;
+  if (variable === "MCP_TIMEOUT") {
+    return `MCP_TIMEOUT was rejected; using the 30000 ms fallback. ${remedy}`;
+  }
+  return `MCP_TOOL_TIMEOUT was rejected; per-server timeout remains authoritative, otherwise the 100000000 ms default applies. ${remedy}`;
 }
 
 /** Claude's exact tool-timeout clamp (binary-verified 2.1.218). */
@@ -719,6 +792,12 @@ async function raceWithTimeout<T>(
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+function isJsonRpcErrorResponse(message: unknown): boolean {
+  if (typeof message !== "object" || message === null) return false;
+  const candidate = message as { id?: unknown; error?: unknown };
+  return candidate.id !== undefined && typeof candidate.error === "object" && candidate.error !== null;
 }
 
 /** `code` property when a numeric MCP error code is present. */

@@ -1,5 +1,11 @@
 import { deferred, waitUntil, type Deferred } from "./async.js";
 
+/** One recorded `ctx.ui.setStatus` call (clears record `text: undefined`). */
+export interface FakeStatusCall {
+  key: string;
+  text: string | undefined;
+}
+
 /** One recorded `ctx.ui.setWidget` call (removals record `content: undefined`). */
 export interface FakeWidgetCall {
   key: string;
@@ -56,6 +62,8 @@ export interface FakePi {
    */
   messageRenderers: Map<string, (message: any, options: any, theme: any) => any>;
   notifications: Array<{ text: string; severity?: string }>;
+  /** Every `ctx.ui.setStatus` call in order, including clears. */
+  statusCalls: FakeStatusCall[];
   modelSets: unknown[];
   thinkingLevels: string[];
   providerRegistrations: Array<{ name: string; config: any }>;
@@ -121,6 +129,7 @@ export function fakePi(): FakePi {
   const entryRenderers = new Map<string, (entry: any, options: any, theme: any) => any>();
   const messageRenderers = new Map<string, (message: any, options: any, theme: any) => any>();
   const notifications: Array<{ text: string; severity?: string }> = [];
+  const statusCalls: FakeStatusCall[] = [];
   const modelSets: unknown[] = [];
   const thinkingLevels: string[] = [];
   const providerRegistrations: Array<{ name: string; config: any }> = [];
@@ -291,7 +300,7 @@ export function fakePi(): FakePi {
    */
   const recordingUi = () => ({
     notify: (text: string, severity?: string) => notifications.push({ text, severity }),
-    setStatus: () => undefined,
+    setStatus: (key: string, text: string | undefined) => statusCalls.push({ key, text }),
     getEditorText: () => self.editorText,
     setEditorText: (text: string) => {
       self.editorText = text;
@@ -311,6 +320,7 @@ export function fakePi(): FakePi {
     entryRenderers,
     messageRenderers,
     notifications,
+    statusCalls,
     modelSets,
     thinkingLevels,
     providerRegistrations,

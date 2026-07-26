@@ -536,6 +536,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // One-shot latch for the post-settle MCP connect-failure warning (see the
   // before_agent_start handler).
   let mcpFailureChecked = false;
+  const MCP_STARTUP_STATUS_KEY = "picc-mcp-startup";
+  const MCP_STARTUP_STATUS_TEXT = "Waiting for MCP servers to start…";
 
   let currentModelRef = "";
   let currentModel: unknown; // the orchestrator's active model — inherited by subagents
@@ -2026,7 +2028,33 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // alone would race Pi's snapshot against the detached registerTool calls.
     // Resolved-promise no-op after the first settle and on the zero-enabled
     // path; never rejects (its own try/catch degrades to stderr).
-    await mcpRegistration;
+    let showsMcpStartupStatus = false;
+    if (ctx?.mode === "tui") {
+      // RPC also reports hasUI, so mode is the protocol boundary for footer-only chrome.
+      try {
+        showsMcpStartupStatus = mcpRuntime.serverStates().some((state) => state.state === "connecting");
+      } catch {
+        /* presentation detection must not affect prompt admission */
+      }
+      if (showsMcpStartupStatus) {
+        try {
+          ctx.ui?.setStatus?.(MCP_STARTUP_STATUS_KEY, MCP_STARTUP_STATUS_TEXT);
+        } catch {
+          /* presentation must not affect MCP registration */
+        }
+      }
+    }
+    try {
+      await mcpRegistration;
+    } finally {
+      if (showsMcpStartupStatus) {
+        try {
+          ctx.ui?.setStatus?.(MCP_STARTUP_STATUS_KEY, undefined);
+        } catch {
+          /* cleanup failure must not affect MCP registration */
+        }
+      }
+    }
     // One-time MCP failure warning: every enabled server has settled behind the
     // barrier above, so the FIRST turn after settle is the one honest moment to
     // report connect failures. Checked exactly once per session — a "failed"
