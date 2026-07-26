@@ -1,17 +1,19 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import picc, { writeFdFully } from "../src/index.js";
+import picc, { FdWriteReleasedError, writeFdFully } from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
-import { deferred, waitUntil } from "./helpers/async.js";
+import { deferred, settlement, waitUntil } from "./helpers/async.js";
 import {
   MainSessionCheckpointGate,
   MidRunCompactionController,
   callbackCompactionAttempt,
   promiseCompactionAttempt,
+  type CheckpointProgress,
   type CompactionAttemptResult,
   type MidRunCompactionOptions,
+  type QueuedInputShadow,
 } from "../src/runtime/mid-run-compaction.js";
 
 describe("public async fd writer", () => {
@@ -48,6 +50,96 @@ describe("public async fd writer", () => {
         callback(Object.assign(new Error("again"), { code: "EWOULDBLOCK" }), 0);
       }), async () => undefined)).rejects.toMatchObject({ code: "EWOULDBLOCK" });
     expect(attempts).toBe(6);
+  });
+
+  it("releases every abortable state through one error identity and never double-settles", async () => {
+    // The identity a caller observes is part of the contract: whatever announces the
+    // ending of a compaction must be able to tell a released write from an OS write
+    // error without matching on prose.
+    const expectReleased = async (promise: Promise<void>, reason: unknown) => {
+      const error = await promise.then(() => undefined, (caught: unknown) => caught);
+      expect(error).toBeInstanceOf(FdWriteReleasedError);
+      expect(error).toMatchObject({ code: "ABORT_ERR", cause: reason });
+    };
+
+    // Abort before the call: no physical write is issued at all.
+    const before = new AbortController();
+    before.abort("replacement");
+    let beforeWrites = 0;
+    const preAborted = writeFdFully(1, Buffer.from("never issued"),
+      (() => { beforeWrites += 1; }), undefined, before.signal);
+    await settlement(preAborted, { description: "a pre-aborted fd write to settle" });
+    await expectReleased(preAborted, "replacement");
+    expect(beforeWrites).toBe(0);
+
+    // Abort while a callback is pending, then deliver that callback late: the caller
+    // is released once, and the late arrival neither double-settles nor throws.
+    const pending = new AbortController();
+    let lateCallback!: (error: NodeJS.ErrnoException | null, written: number) => void;
+    const parked = writeFdFully(1, Buffer.from("parked"), ((_fd, _buffer, _offset, _length, _position, callback) => {
+      lateCallback = callback;
+    }), undefined, pending.signal);
+    await waitUntil({ description: "the parked write to enter", predicate: () => lateCallback !== undefined });
+    pending.abort("user");
+    await settlement(parked, { description: "an aborted pending fd write to settle" });
+    await expectReleased(parked, "user");
+    expect(() => lateCallback(null, 6)).not.toThrow();
+    await expectReleased(parked, "user");
+
+    // Abort mid-loop, after a partial write has already been DELIVERED: the physical
+    // write settles normally on its own callback, so only the loop-top release can
+    // end the caller, and the remaining 13 bytes are never issued. Delivering before
+    // aborting is what makes this case distinct from the pending-callback one above —
+    // abort it first and the listener wins the latch, the loop is never re-entered,
+    // and the guard this case exists for is never reached with a non-zero offset.
+    const midLoop = new AbortController();
+    const issued: number[] = [];
+    const partial = writeFdFully(1, Buffer.from("partial-then-aborted"),
+      ((_fd, _buffer, _offset, length, _position, callback) => {
+        issued.push(length);
+        queueMicrotask(() => {
+          callback(null, 7);
+          midLoop.abort("shutdown");
+        });
+      }), undefined, midLoop.signal);
+    await settlement(partial, { description: "a mid-loop aborted fd write to settle" });
+    await expectReleased(partial, "shutdown");
+    expect(issued).toEqual([20]);
+
+    // Abort during the transient back-off: the retry loop is bounded by the same
+    // loop-top release, through the same identity, and issues nothing further.
+    const transient = new AbortController();
+    const transientWrites: number[] = [];
+    const backoffs: number[] = [];
+    const retrying = writeFdFully(1, Buffer.from("transient-then-aborted"),
+      ((_fd, _buffer, _offset, length, _position, callback) => {
+        transientWrites.push(length);
+        queueMicrotask(() => callback(Object.assign(new Error("busy"), { code: "EAGAIN" }), 0));
+      }), async (delay) => {
+        backoffs.push(delay);
+        transient.abort("task-stop");
+      }, transient.signal);
+    await settlement(retrying, { description: "an fd write aborted during transient back-off to settle" });
+    await expectReleased(retrying, "task-stop");
+    expect(transientWrites).toEqual([22]);
+    expect(backoffs).toEqual([1]);
+
+    // Abort after completion: no effect, no double-settle, and the write still
+    // reports success — a delivered emission stays delivered.
+    const after = new AbortController();
+    const completed: Buffer[] = [];
+    const done = writeFdFully(1, Buffer.from("complete"),
+      ((_fd, buffer, offset, length, _position, callback) => {
+        queueMicrotask(() => {
+          completed.push(Buffer.from(buffer.subarray(offset, offset + length)));
+          callback(null, length);
+        });
+      }), undefined, after.signal);
+    await settlement(done, { description: "a completed fd write to settle" });
+    await expect(done).resolves.toBeUndefined();
+    after.abort("replacement");
+    await expect(done).resolves.toBeUndefined();
+    expect(Buffer.concat(completed).toString("utf8")).toBe("complete");
   });
 });
 
@@ -301,8 +393,12 @@ describe("MidRunCompactionController", () => {
     const replay = deferred<{ delivered: false }>();
     let replayEntered = false;
     let joinCalls = 0;
+    const events: CheckpointProgress[] = [];
+    const dropped: Array<readonly QueuedInputShadow[]> = [];
     const controller = createController({
       sessionId: "s", threshold: 90, compact: async () => ({ ok: true }),
+      progress: (event) => events.push(event),
+      inputDropped: (rejected) => dropped.push(rejected),
       resume: () => ({
         settled: new Promise<void>(() => undefined),
         replay: () => {
@@ -327,6 +423,24 @@ describe("MidRunCompactionController", () => {
     await expect(controller.cancel(generation, "user")).rejects.toThrow("could not confirm quiescence");
     expect(joinCalls).toBe(1);
     expect(controller.snapshot()).toMatchObject({ phase: "cancelled", admission: "closed", queuedInputs: 1 });
+
+    // Both surfaces reject and every consumer swallows a rejection, so without these the
+    // ending is terminal in silence: no notice, no entry, and retained input nobody names.
+    expect(events.map((event) => [event.category, event.action])).toEqual([
+      ["checkpoint-armed", undefined], ["checkpoint-complete", "resume"],
+      ["checkpoint-cancelled", "restart-process"],
+    ]);
+    expect(dropped).toEqual([[expect.objectContaining({ content: "retained" })]]);
+    // `restart-process`, not `new-session`: a replacement cancellation — which is what the
+    // gate awaits inside `startSession` before installing a fresh controller — re-rejects
+    // for this generation forever, so telling the reader to start a new session would name
+    // the one action the controller refuses.
+    await expect(controller.cancel(generation, "replacement")).rejects.toThrow("could not confirm quiescence");
+    expect(controller.snapshot()).toMatchObject({
+      cancellationKind: "user", cancellationQuiescence: "unconfirmed",
+    });
+    expect(controller.manualCompactionDisposition()).toBe("unavailable");
+    expect(controller.recoveryToken(generation)).toBeUndefined();
   });
 
   it.each(["replay", "release", "settlement"] as const)(
@@ -390,6 +504,180 @@ describe("MidRunCompactionController", () => {
       expect(joinCalls).toBe(1);
     },
   );
+
+  // The three cases below share one regression: a generation that reaches a terminal must
+  // publish every surface it handed out exactly once, and must never re-open the recovery
+  // capability a committed summary revoked. The controller is the cheapest layer that can
+  // drive the interleavings — each needs a settlement and a post-commit failure landing in
+  // the same turn, which the Pi-level owners cannot schedule.
+  it("settles both surfaces when a post-commit failure lands in the turn the resumed run settles", async () => {
+    const settled = deferred<void>();
+    const join = deferred<void>();
+    let joinCalls = 0;
+    const events: string[] = [];
+    const controller = createController({
+      sessionId: "race", threshold: 90, compact: async () => ({ ok: true }),
+      resume: () => ({
+        settled: settled.promise,
+        replay: async () => ({ delivered: true }),
+        cancelAndJoin: () => {
+          joinCalls += 1;
+          return join.promise;
+        },
+      }),
+      progress: (event) => events.push(`${event.category}:${event.failureCategory ?? "-"}`),
+    });
+    const { generation, handle } = arm(controller);
+    controller.completeToolBatch(handle);
+    const stable = controller.checkpoint(generation);
+    try {
+      await waitUntil({ description: "the resumed run", predicate: () => controller.snapshot().phase === "resuming" });
+      // Drain microtasks so the replay loop is parked on its settlement/queue race before
+      // the race is run against it; the loop uses no timer, so this is its quiescent point.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      // Order is load-bearing: `settled` must resolve *before* the terminalization so the
+      // parked race takes its settled arm and `finishGeneration` is actually entered. Arm
+      // the terminalization first and the loop never reaches the guard under test, leaving
+      // this case green while it covers nothing.
+      settled.resolve();
+      const terminal = controller.failAfterCommittedSummary(generation);
+      join.resolve();
+
+      await settlement(stable, { description: "the generation barrier of the raced generation" });
+      await expect(stable).resolves.toBeUndefined();
+      await settlement(terminal, { description: "the post-commit terminalization racing settlement" });
+      await expect(terminal).resolves.toEqual([]);
+      // The settlement must not be able to claim the generation completed: a committed
+      // summary was never restored, so admission stays closed and no token permits a
+      // second compaction of it.
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused", queuedInputs: 0,
+      });
+      expect(controller.recoveryToken(generation)).toBeUndefined();
+      expect(controller.manualCompactionDisposition()).toBe("unavailable");
+      expect(controller.ordinaryInputDisposition()).toBe("reject-restoration");
+      expect(events).toEqual(["checkpoint-armed:-", "checkpoint-complete:-", "checkpoint-exhausted:restoration-paused"]);
+      expect(joinCalls).toBe(1);
+    } finally {
+      settled.resolve();
+      join.resolve();
+    }
+  });
+
+  it.each([
+    ["recoverable", "recoverable-rejection", "hook-blocked"],
+    ["post-commit", "closed", "restoration-paused"],
+  ] as const)("refuses to re-enter a %s exhausted generation", async (ending, admission, failureCategory) => {
+    const replayGate = deferred<void>();
+    let replayEntered = false;
+    const events: string[] = [];
+    const controller = createController({
+      sessionId: "exhausted", threshold: 90,
+      compact: async () => ending === "recoverable" ? { ok: false, category: "hook-blocked" } : { ok: true },
+      resume: () => ({
+        settled: new Promise<void>(() => undefined),
+        replay: async () => {
+          replayEntered = true;
+          await replayGate.promise;
+          // Undelivered replay is terminal after the summary committed.
+          return { delivered: false };
+        },
+        cancelAndJoin: async () => undefined,
+      }),
+      progress: (event) => events.push(`${event.category}:${event.failureCategory ?? "-"}`),
+    });
+    const { generation, handle } = arm(controller);
+    controller.completeToolBatch(handle);
+    const queued = controller.shadowInput(generation, "retained", "steer")!;
+    const stable = controller.checkpoint(generation);
+    try {
+      if (ending === "post-commit") {
+        await waitUntil({ description: "replay to enter", predicate: () => replayEntered });
+        replayGate.resolve();
+      }
+      await settlement(stable, { description: `the ${ending} generation barrier` });
+      await expect(stable).resolves.toBeUndefined();
+      const token = controller.recoveryToken(generation);
+      expect(token === undefined).toBe(ending === "post-commit");
+
+      const cancellation = controller.cancel(generation, "user");
+      await settlement(cancellation, { description: `cancelling the ${ending} exhausted generation` });
+      // The terminal the generation already chose stands: re-entering would mint the
+      // `user` recovery token a committed summary revoked, and announce a second ending.
+      expect(controller.manualCompactionDisposition()).toBe(ending === "post-commit" ? "unavailable" : "allow");
+      expect(controller.snapshot()).toMatchObject({ phase: "exhausted", admission, failureCategory });
+      expect(controller.recoveryToken(generation)).toBe(token);
+      expect(events.filter((event) => event.startsWith("checkpoint-exhausted"))).toEqual([`checkpoint-exhausted:${failureCategory}`]);
+      // Filter rather than `not.toContain("checkpoint-cancelled:-")`: pinning the `-`
+      // placeholder would pass vacuously if the category ever started carrying a value.
+      expect(events.filter((event) => event.startsWith("checkpoint-cancelled"))).toEqual([]);
+      // Nothing was cancelled, so the retained input keeps the disposition its own
+      // ending chose rather than being drained by a caller that changed nothing.
+      await expect(cancellation).resolves.toEqual({ cancelled: false, rejected: [] });
+      expect(controller.queuedInputSnapshot()).toEqual(ending === "post-commit" ? [] : [queued]);
+    } finally {
+      replayGate.resolve();
+    }
+  });
+
+  it("records a commit once and terminalizes idempotently for concurrent post-commit callers", async () => {
+    const join = deferred<void>();
+    const replayGate = deferred<void>();
+    let replayEntered = false;
+    let joinCalls = 0;
+    const events: string[] = [];
+    const controller = createController({
+      sessionId: "committed", threshold: 90, compact: async () => ({ ok: true }),
+      resume: () => ({
+        settled: new Promise<void>(() => undefined),
+        replay: async () => {
+          replayEntered = true;
+          await replayGate.promise;
+          return { delivered: true };
+        },
+        cancelAndJoin: () => {
+          joinCalls += 1;
+          return join.promise;
+        },
+      }),
+      progress: (event) => events.push(`${event.category}:${event.failureCategory ?? "-"}`),
+    });
+    const { generation, handle } = arm(controller);
+    controller.completeToolBatch(handle);
+    const queued = controller.shadowInput(generation, "retained", "steer")!;
+    const stable = controller.checkpoint(generation);
+    try {
+      await waitUntil({ description: "replay to enter", predicate: () => replayEntered });
+      expect(controller.observeCompactionCommit(generation + 1)).toBe(false);
+      expect(controller.observeCompactionCommit(generation)).toBe(true);
+
+      const first = controller.failAfterCommittedSummary(generation);
+      const second = controller.failAfterCommittedSummary(generation);
+      // A commit cannot be recorded against a generation that is already unwinding it.
+      expect(controller.observeCompactionCommit(generation)).toBe(false);
+      expect(joinCalls).toBe(1);
+      join.resolve();
+
+      await settlement(stable, { description: "the committed generation barrier" });
+      await expect(stable).resolves.toBeUndefined();
+      await expect(first).resolves.toEqual([queued]);
+      await expect(second).resolves.toEqual([queued]);
+      const third = controller.failAfterCommittedSummary(generation);
+      await settlement(third, { description: "a post-commit failure after the terminal" });
+      await expect(third).resolves.toEqual([]);
+      expect(joinCalls).toBe(1);
+      expect(controller.recoveryToken(generation)).toBeUndefined();
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused", queuedInputs: 0,
+      });
+      expect(events.filter((event) => event.startsWith("checkpoint-exhausted")))
+        .toEqual(["checkpoint-exhausted:restoration-paused"]);
+    } finally {
+      replayGate.resolve();
+      join.resolve();
+    }
+  });
 
   it("cancellation while resume Promise starts waits for abort and join", async () => {
     const join = deferred<void>();
@@ -494,15 +782,19 @@ describe("MidRunCompactionController", () => {
       cancellationSettled = true;
       return outcome;
     });
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    // Drain to quiescence rather than counting microtask turns: the claim is that
+    // nothing but the in-flight compaction can publish generation N+1, and a fixed
+    // number of turns would also pass for a publication that is merely a few turns
+    // late. Nothing here is timer-driven, so a macrotask boundary is that point.
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(cancellationSettled).toBe(false);
     expect(stabilitySettled).toBe(false);
 
     nextRun.resolve({ ok: true });
+    await settlement(cancellation, { description: "the cancellation of generation N+1" });
     await expect(cancellation).resolves.toEqual({ cancelled: true, rejected: [] });
-    await currentStable;
+    await settlement(currentStable, { description: "the generation N+1 barrier held across recovery" });
+    expect(stabilitySettled).toBe(true);
   });
 
   it("omitted or stale generation callbacks cannot act on the current checkpoint", async () => {
@@ -1148,6 +1440,18 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  // A checkpoint that gives up in a non-interactive mode sets this worker's own
+  // `process.exitCode`, which is the product behaviour under test — and would otherwise
+  // leak out of whichever case happened to run last.
+  let savedExitCode: typeof process.exitCode;
+  beforeEach(() => {
+    savedExitCode = process.exitCode;
+    process.exitCode = undefined;
+  });
+  afterEach(() => {
+    process.exitCode = savedExitCode;
+  });
+
   it("rejects genuine input until a universally stopped host run settles, then accepts a real tool cycle", async () => {
     await mainCheckpointGate.startSession("stopped-input-wiring");
     const hookCount = path.join(dir, "input-hook-count");
@@ -1331,89 +1635,97 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         text: content, source: "extension", images: undefined, streamingBehavior: undefined,
       }, high));
     };
-    high = pi.printCtx({
-      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
-      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
-      compact: (options: any) => {
-        pi.compactCalls.push(options);
-        void (async () => {
-          const before = await pi.fire("session_before_compact", {
-            reason: "manual", customInstructions: undefined,
-          }, high);
-          if (before?.cancel) options.onError(new Error("cancelled"));
-          else {
-            await pi.fire("session_compact", {
-              reason: "manual", compactionEntry: { summary: "summary" },
+    try {
+      high = pi.printCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        compact: (options: any) => {
+          pi.compactCalls.push(options);
+          void (async () => {
+            const before = await pi.fire("session_before_compact", {
+              reason: "manual", customInstructions: undefined,
             }, high);
-            options.onComplete({ summary: "summary" });
-          }
-        })();
-      },
-    });
-    const trace = path.join(dir, ".claude", ".compact-trace");
-    const inputHookCount = path.join(dir, "input-hook-count");
-    fs.rmSync(trace, { force: true });
-    fs.rmSync(inputHookCount, { force: true });
-    mainCheckpointGate.assistantMessageEnded({
-      role: "assistant",
-      content: [{ type: "toolCall", id: "tool", name: "probe", arguments: {} }],
-    });
-    const wrapped = mainCheckpointGate.wrapTool({
-      name: "probe",
-      execute: async () => ({ content: [{ type: "text", text: "done" }] }),
-    }) as any;
-    const result = await wrapped.execute("tool", {}, undefined, undefined, high);
-    mainCheckpointGate.toolExecutionEnded({ toolCallId: "tool", result, isError: false });
-    expect(mainCheckpointGate.turnEnded(high)?.stop).toBe("terminate");
-    const controller = mainCheckpointGate.currentController();
-    const image = { type: "image", data: "aW1hZ2U=", mimeType: "image/png" };
-    mainCheckpointGate.captureAcceptedInput(high, "queued after checkpoint", undefined, "steer");
-    mainCheckpointGate.captureAcceptedInput(high, "duplicate", undefined, "followUp");
-    mainCheckpointGate.captureAcceptedInput(high, "duplicate", [image], "steer");
+            if (before?.cancel) options.onError(new Error("cancelled"));
+            else {
+              await pi.fire("session_compact", {
+                reason: "manual", compactionEntry: { summary: "summary" },
+              }, high);
+              options.onComplete({ summary: "summary" });
+            }
+          })();
+        },
+      });
+      const trace = path.join(dir, ".claude", ".compact-trace");
+      const inputHookCount = path.join(dir, "input-hook-count");
+      fs.rmSync(trace, { force: true });
+      fs.rmSync(inputHookCount, { force: true });
+      mainCheckpointGate.assistantMessageEnded({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "tool", name: "probe", arguments: {} }],
+      });
+      const wrapped = mainCheckpointGate.wrapTool({
+        name: "probe",
+        execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+      }) as any;
+      const result = await wrapped.execute("tool", {}, undefined, undefined, high);
+      mainCheckpointGate.toolExecutionEnded({ toolCallId: "tool", result, isError: false });
+      expect(mainCheckpointGate.turnEnded(high)?.stop).toBe("terminate");
+      const controller = mainCheckpointGate.currentController();
+      const image = { type: "image", data: "aW1hZ2U=", mimeType: "image/png" };
+      mainCheckpointGate.captureAcceptedInput(high, "queued after checkpoint", undefined, "steer");
+      mainCheckpointGate.captureAcceptedInput(high, "duplicate", undefined, "followUp");
+      mainCheckpointGate.captureAcceptedInput(high, "duplicate", [image], "steer");
 
-    let outerDone = false;
-    const outer = pi.fire("agent_settled", {}, high).then(() => { outerDone = true; });
-    await waitUntil({
-      description: "hidden checkpoint continuation",
-      predicate: () => pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation"),
-    });
-    expect(outerDone).toBe(false);
-    const hidden = pi.messages.find((entry) => entry.message.customType === "picc-checkpoint-continuation")!;
-    expect(hidden.message).toMatchObject({ content: "Continue the paused work.", display: false });
-    expect(hidden.options).toEqual({ triggerTurn: true });
-    expect(order.indexOf("picc-checkpoint-continuation")).toBeLessThan(order.indexOf("user-replay"));
-    expect(pi.userMessages.slice(-3)).toEqual([
-      { content: "queued after checkpoint", options: { deliverAs: "steer" } },
-      { content: "duplicate", options: { deliverAs: "followUp" } },
-      { content: [{ type: "text", text: "duplicate" }, image], options: { deliverAs: "steer" } },
-    ]);
-
-    const stopMarker = path.join(dir, ".claude", "block-stop");
-    fs.writeFileSync(stopMarker, "block");
-    const predictableContinuation = "[Stop hook] Continue working: continue test work";
-    await expect(pi.fire("input", {
-      text: predictableContinuation, source: "extension", images: undefined, streamingBehavior: undefined,
-    }, high)).resolves.toEqual({ action: "handled" });
-    for (let iteration = 1; iteration <= 8; iteration += 1) {
-      await pi.fire("agent_settled", {}, high);
+      let outerDone = false;
+      const outer = pi.fire("agent_settled", {}, high).then(() => { outerDone = true; });
+      await waitUntil({
+        description: "hidden checkpoint continuation",
+        predicate: () => pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation"),
+      });
       expect(outerDone).toBe(false);
-      expect(String(pi.userMessages.at(-1)?.content)).toContain("[Stop hook] Continue working");
+      const hidden = pi.messages.find((entry) => entry.message.customType === "picc-checkpoint-continuation")!;
+      expect(hidden.message).toMatchObject({ content: "Continue the paused work.", display: false });
+      expect(hidden.options).toEqual({ triggerTurn: true });
+      expect(order.indexOf("picc-checkpoint-continuation")).toBeLessThan(order.indexOf("user-replay"));
+      expect(pi.userMessages.slice(-3)).toEqual([
+        { content: "queued after checkpoint", options: { deliverAs: "steer" } },
+        { content: "duplicate", options: { deliverAs: "followUp" } },
+        { content: [{ type: "text", text: "duplicate" }, image], options: { deliverAs: "steer" } },
+      ]);
+
+      const stopMarker = path.join(dir, ".claude", "block-stop");
+      // Same guard as the other hook markers: a surviving `block-stop` makes later
+      // Stop hooks in this file block with a continuation instead of settling.
+      fs.writeFileSync(stopMarker, "block");
+      try {
+        const predictableContinuation = "[Stop hook] Continue working: continue test work";
+        await expect(pi.fire("input", {
+          text: predictableContinuation, source: "extension", images: undefined, streamingBehavior: undefined,
+        }, high)).resolves.toEqual({ action: "handled" });
+        for (let iteration = 1; iteration <= 8; iteration += 1) {
+          await pi.fire("agent_settled", {}, high);
+          expect(outerDone).toBe(false);
+          expect(String(pi.userMessages.at(-1)?.content)).toContain("[Stop hook] Continue working");
+        }
+        // The ninth logical stop attempt exhausts the eight-continuation bound.
+        await pi.fire("agent_settled", {}, high);
+      } finally {
+        fs.rmSync(stopMarker, { force: true });
+      }
+      await outer;
+      await mainCheckpointGate.startSession("stop-admission-stale-epoch");
+      staleStopInput.resolve();
+      const admission = await Promise.all(stopAdmissionResults);
+      expect(admission.filter((result) => (result as any)?.action === "continue")).toHaveLength(8);
+      expect(admission.filter((result) => (result as any)?.action === "handled")).toHaveLength(11);
+      expect(outerDone).toBe(true);
+      expect(fs.existsSync(inputHookCount)).toBe(false);
+      expect(controller.snapshot().phase).toBe("idle");
+      expect(fs.readFileSync(trace, "utf8").trim().split(/\r?\n/)).toEqual(["pre", "start", "post"]);
+    } finally {
+      pi.api.sendMessage = originalSendMessage;
+      pi.api.sendUserMessage = originalSendUserMessage;
     }
-    // The ninth logical stop attempt exhausts the eight-continuation bound.
-    await pi.fire("agent_settled", {}, high);
-    fs.rmSync(stopMarker, { force: true });
-    await outer;
-    await mainCheckpointGate.startSession("stop-admission-stale-epoch");
-    staleStopInput.resolve();
-    const admission = await Promise.all(stopAdmissionResults);
-    expect(admission.filter((result) => (result as any)?.action === "continue")).toHaveLength(8);
-    expect(admission.filter((result) => (result as any)?.action === "handled")).toHaveLength(11);
-    expect(outerDone).toBe(true);
-    expect(fs.existsSync(inputHookCount)).toBe(false);
-    expect(controller.snapshot().phase).toBe("idle");
-    expect(fs.readFileSync(trace, "utf8").trim().split(/\r?\n/)).toEqual(["pre", "start", "post"]);
-    pi.api.sendMessage = originalSendMessage;
-    pi.api.sendUserMessage = originalSendUserMessage;
   });
 
   it("bridges a successful resumed print result exactly once and hides every unsafe settlement", async () => {
@@ -1532,6 +1844,10 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await waitUntil({ description: "cancel test resume", predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming" });
     const staleWrites: string[] = [];
     const originalWrite = fs.write.bind(fs);
+    const gate = path.join(dir, ".claude", "gate-stop");
+    const entered = path.join(dir, ".claude", "stop-entered");
+    const release = path.join(dir, ".claude", "release-stop");
+    let nested: Promise<unknown> | undefined;
     const writeSpy = vi.spyOn(fs, "write").mockImplementation(((fd: any, data: any, offset: any, length: any, position: any, callback: any) => {
       if (fd === process.stdout.fd && Buffer.isBuffer(data)) {
         staleWrites.push(data.subarray(offset, offset + length).toString("utf8"));
@@ -1541,21 +1857,27 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       return originalWrite(fd, data, offset, length, position, callback);
     }) as typeof fs.write);
 
-    const gate = path.join(dir, ".claude", "gate-stop");
-    const entered = path.join(dir, ".claude", "stop-entered");
-    const release = path.join(dir, ".claude", "release-stop");
-    fs.writeFileSync(gate, "gate");
-    const nested = pi.fire("agent_settled", {}, { ...ctx });
-    await waitUntil({ description: "Stop hook gate entry", predicate: () => fs.existsSync(entered) });
-    const replacement = mainCheckpointGate.startSession("replacement-during-stop");
-    fs.writeFileSync(release, "release");
-    await nested;
-    await replacement;
-    await outer;
-    writeSpy.mockRestore();
-    fs.rmSync(gate, { force: true });
-    fs.rmSync(entered, { force: true });
-    fs.rmSync(release, { force: true });
+    try {
+      fs.writeFileSync(gate, "gate");
+      nested = pi.fire("agent_settled", {}, { ...ctx });
+      await waitUntil({ description: "Stop hook gate entry", predicate: () => fs.existsSync(entered) });
+      const replacement = mainCheckpointGate.startSession("replacement-during-stop");
+      fs.writeFileSync(release, "release");
+      await nested;
+      await replacement;
+      await outer;
+    } finally {
+      // None of this may depend on the awaits above succeeding. The spy is global, and a
+      // surviving `gate-stop` parks every later Stop hook in the hook script's polling
+      // loop for the full hook timeout — that live `sh` child is also what makes the
+      // afterAll rmSync of the fixture directory fail on Windows. The one ordering
+      // constraint the statements below do not show: `release` must be written before the
+      // join, or the gated hook never exits and `await nested` never completes.
+      writeSpy.mockRestore();
+      fs.writeFileSync(release, "release");
+      await nested?.catch(() => undefined);
+      for (const file of [gate, entered, release]) fs.rmSync(file, { force: true });
+    }
 
     expect(staleWrites).toEqual([]);
     expect(pi.messages.filter((entry) => entry.message.customType === "picc-checkpoint-print-result")).toHaveLength(markerCountBefore);
@@ -1565,29 +1887,32 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
   it("unwinds a resumed Stop universal stop before joining its exact resume settlement", async () => {
     await mainCheckpointGate.startSession("resumed-stop-deadlock");
     const marker = path.join(dir, ".claude", "universal-stop");
+    // The marker arms every Stop hook in the fixture, so the guard has to start here:
+    // anything between writing it and the awaits below can throw, and a surviving
+    // marker universally stops the Stop lifecycle for the rest of the worker.
     fs.writeFileSync(marker, "stop");
-    const ctx = pi.printCtx({
-      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
-      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
-      hasPendingMessages: () => false,
-      sessionManager: { getBranch: () => [] },
-      compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
-    });
-    mainCheckpointGate.assistantMessageEnded({
-      role: "assistant", content: [{ type: "toolCall", id: "stop-tool", name: "probe", arguments: {} }],
-    });
-    const wrapped: any = mainCheckpointGate.wrapTool({
-      name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
-    });
-    const toolResult = await wrapped.execute("stop-tool", {}, undefined, undefined, ctx);
-    mainCheckpointGate.toolExecutionEnded({ toolCallId: "stop-tool", result: toolResult, isError: false });
-    mainCheckpointGate.turnEnded(ctx);
-    const outer = pi.fire("agent_settled", {}, ctx);
-    await waitUntil({
-      description: "resumed Stop deadlock setup",
-      predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming",
-    });
     try {
+      const ctx = pi.printCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [] },
+        compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+      });
+      mainCheckpointGate.assistantMessageEnded({
+        role: "assistant", content: [{ type: "toolCall", id: "stop-tool", name: "probe", arguments: {} }],
+      });
+      const wrapped: any = mainCheckpointGate.wrapTool({
+        name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+      });
+      const toolResult = await wrapped.execute("stop-tool", {}, undefined, undefined, ctx);
+      mainCheckpointGate.toolExecutionEnded({ toolCallId: "stop-tool", result: toolResult, isError: false });
+      mainCheckpointGate.turnEnded(ctx);
+      const outer = pi.fire("agent_settled", {}, ctx);
+      await waitUntil({
+        description: "resumed Stop deadlock setup",
+        predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming",
+      });
       await pi.fire("agent_settled", {}, ctx);
       await outer;
     } finally {
@@ -1595,6 +1920,757 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     }
     expect(mainCheckpointGate.isLogicalRunStopped()).toBe(false);
     expect(mainCheckpointGate.currentController().snapshot().phase).toBe("idle");
+  });
+
+  /**
+   * Drives one proactive checkpoint through the registered handlers until the resumed
+   * run exists and is waiting for its physical turn. The returned promise is the
+   * settling `agent_settled` handler parked on the generation barrier — exactly where
+   * real Pi parks it, inside the `_runAgentPrompt` finally that owns the user's run.
+   */
+  const driveResumeToResuming = async (sessionId: string, ctx: any): Promise<{ outer: Promise<unknown> }> => {
+    await mainCheckpointGate.startSession(sessionId);
+    mainCheckpointGate.assistantMessageEnded({
+      role: "assistant",
+      content: [{ type: "toolCall", id: sessionId, name: "probe", arguments: {} }],
+    });
+    const wrapped: any = mainCheckpointGate.wrapTool({
+      name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+    });
+    const result = await wrapped.execute(sessionId, {}, undefined, undefined, ctx);
+    mainCheckpointGate.toolExecutionEnded({ toolCallId: sessionId, result, isError: false });
+    mainCheckpointGate.turnEnded(ctx);
+    const outer = pi.fire("agent_settled", {}, ctx);
+    await waitUntil({
+      description: `${sessionId} resumed generation`,
+      predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming",
+    });
+    return { outer };
+  };
+
+  /**
+   * A print-mode context whose `compact` completes the transaction directly. It never
+   * fires `session_compact`, so `observeCompactionCommit` never runs and the
+   * controller's `committedGeneration` stays unset — a cancellation reached from here
+   * therefore classifies as an ordinary cancellation, where production (having seen
+   * the commit) would terminalize as `restoration-paused`. The resume endings below
+   * do not depend on that: resume is structurally post-commit, so they carry their
+   * own post-commit category rather than inferring one from the controller.
+   */
+  const resumeCtx = (overrides: Record<string, unknown> = {}) => pi.printCtx({
+    model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+    getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+    hasPendingMessages: () => false,
+    sessionManager: { getBranch: () => [] },
+    compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+    abort: () => undefined,
+    ...overrides,
+  });
+
+  it("abandons a resumed run when PiCC's own admission refuses its Stop continuation", async () => {
+    const marker = path.join(dir, ".claude", "block-stop");
+    const originalSendUserMessage = pi.api.sendUserMessage as (...args: any[]) => void;
+    const admissions: Array<Promise<unknown>> = [];
+    const ctx = resumeCtx();
+    // Pi reaches the input event synchronously from sendUserMessage, so the fake
+    // delivers it the same way. A queued `followUp` is a shape PiCC's own capability
+    // check will not admit, and that refusal is the one way a continuation's death is
+    // observable at all.
+    pi.api.sendUserMessage = (content: any, options: any) => {
+      originalSendUserMessage(content, options);
+      if (typeof content !== "string" || !content.startsWith("[Stop hook]")) return;
+      admissions.push(pi.fire("input", {
+        text: content, source: "extension", images: undefined, streamingBehavior: "followUp",
+      }, ctx));
+    };
+    let outer: Promise<unknown> | undefined;
+    let nested: Promise<unknown> | undefined;
+    fs.writeFileSync(marker, "block");
+    try {
+      ({ outer } = await driveResumeToResuming("stop-continuation-refused", ctx));
+      const stranded = mainCheckpointGate.currentController();
+      const generation = stranded.snapshot().generation;
+      const printMarkersBefore = pi.messages
+        .filter((entry) => entry.message.customType === "picc-checkpoint-print-result").length;
+      const entriesBefore = pi.entries.length;
+
+      nested = pi.fire("agent_settled", {}, ctx);
+      await settlement(nested, { description: "the refused continuation's settlement handler" });
+      await expect(nested).resolves.toBeUndefined();
+      await settlement(outer, { description: "the checkpoint generation barrier" });
+      await expect(outer).resolves.toBeUndefined();
+
+      expect(await Promise.all(admissions)).toEqual([{ action: "handled" }]);
+      expect(stranded.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+      });
+      expect(stranded.recoveryToken(generation)).toBeUndefined();
+      expect(stranded.manualCompactionDisposition()).toBe("unavailable");
+      expect(pi.entries.slice(entriesBefore)
+        .filter((entry) => entry.data.category === "checkpoint-exhausted")
+        .map((entry) => entry.data))
+        .toEqual([expect.objectContaining({ action: "new-session", failureCategory: "restoration-paused" })]);
+      // Success is never claimed for work that was not delivered.
+      expect(pi.messages.filter((entry) => entry.message.customType === "picc-checkpoint-print-result"))
+        .toHaveLength(printMarkersBefore);
+      // A later provider request must not park on the abandoned run's barrier.
+      await expect(pi.fire("turn_start", {}, ctx)).resolves.toBeUndefined();
+
+      const replacement = mainCheckpointGate.startSession("after-refused-continuation");
+      await settlement(replacement, { description: "a replacement session after the abandoned resume" });
+      await expect(replacement).resolves.toBeUndefined();
+      expect(mainCheckpointGate.currentController().snapshot())
+        .toMatchObject({ phase: "idle", admission: "open" });
+    } finally {
+      pi.api.sendUserMessage = originalSendUserMessage;
+      fs.rmSync(marker, { force: true });
+      // Absorb rejections without joining: a product hang must still report through
+      // the settlement ceilings above rather than through this finally.
+      for (const pending of [nested, outer, ...admissions]) void pending?.catch(() => undefined);
+    }
+  });
+
+  it("ends a resumed run whose admitted Stop continuation never starts a turn", async () => {
+    const marker = path.join(dir, ".claude", "block-stop");
+    const originalSendUserMessage = pi.api.sendUserMessage as (...args: any[]) => void;
+    const admissions: Array<Promise<unknown>> = [];
+    const ctx = resumeCtx();
+    // PiCC admits the continuation, and then Pi never starts the turn — no model,
+    // expired credentials, or a pre-turn throw, all of which Pi swallows and none of
+    // which PiCC can see. Nothing further ever arrives for this run.
+    pi.api.sendUserMessage = (content: any, options: any) => {
+      originalSendUserMessage(content, options);
+      if (typeof content !== "string" || !content.startsWith("[Stop hook]")) return;
+      admissions.push(pi.fire("input", {
+        text: content, source: "extension", images: undefined, streamingBehavior: undefined,
+      }, ctx));
+    };
+    let outer: Promise<unknown> | undefined;
+    let nested: Promise<unknown> | undefined;
+    fs.writeFileSync(marker, "block");
+    try {
+      ({ outer } = await driveResumeToResuming("stop-continuation-dropped", ctx));
+      const stranded = mainCheckpointGate.currentController();
+      const generation = stranded.snapshot().generation;
+      const entriesBefore = pi.entries.length;
+
+      nested = pi.fire("agent_settled", {}, ctx);
+      await settlement(nested, { description: "the handed-off continuation's settlement handler" });
+      await expect(nested).resolves.toBeUndefined();
+      expect(await Promise.all(admissions)).toEqual([{ action: "continue" }]);
+      // The continuation was admitted, so nothing observable distinguishes this from
+      // a turn that is about to start. The run is still open at this point.
+      expect(stranded.snapshot().phase).toBe("resuming");
+
+      const switching = pi.fire("session_before_switch", {}, ctx);
+      await settlement(switching, { description: "the session switch behind the dropped continuation" });
+      await expect(switching).resolves.toBeUndefined();
+      await settlement(outer, { description: "the checkpoint generation barrier" });
+      await expect(outer).resolves.toBeUndefined();
+
+      expect(stranded.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+      });
+      expect(stranded.recoveryToken(generation)).toBeUndefined();
+      expect(stranded.manualCompactionDisposition()).toBe("unavailable");
+      expect(pi.entries.slice(entriesBefore)
+        .filter((entry) => entry.data.category === "checkpoint-exhausted")
+        .map((entry) => entry.data))
+        .toEqual([expect.objectContaining({ action: "new-session", failureCategory: "restoration-paused" })]);
+      await expect(pi.fire("turn_start", {}, ctx)).resolves.toBeUndefined();
+
+      // The switch rotated the checkpoint session epoch. Every settlement path in the
+      // agent_settled handler is keyed on that epoch, so a resume surviving the
+      // rotation could no longer be ended by the lifecycle event that normally ends
+      // it; the replacement below is what proves nothing was left holding the gate.
+      await pi.fire("session_start", { reason: "switch" }, ctx);
+      expect(mainCheckpointGate.currentController()).not.toBe(stranded);
+      expect(mainCheckpointGate.currentController().snapshot())
+        .toMatchObject({ phase: "idle", admission: "open" });
+      const replacement = mainCheckpointGate.startSession("after-dropped-continuation");
+      await settlement(replacement, { description: "a replacement session after the dropped continuation" });
+      await expect(replacement).resolves.toBeUndefined();
+    } finally {
+      pi.api.sendUserMessage = originalSendUserMessage;
+      fs.rmSync(marker, { force: true });
+      for (const pending of [nested, outer, ...admissions]) void pending?.catch(() => undefined);
+    }
+  });
+
+  it("settles a resumed run against the terminalization that is joining it", async () => {
+    const gate = path.join(dir, ".claude", "gate-stop");
+    const block = path.join(dir, ".claude", "block-stop");
+    const entered = path.join(dir, ".claude", "stop-entered");
+    const release = path.join(dir, ".claude", "release-stop");
+    const ctx = resumeCtx();
+    let outer: Promise<unknown> | undefined;
+    let nested: Promise<unknown> | undefined;
+    let terminal: Promise<unknown> | undefined;
+    // Blocking, not merely slow: a Stop hook that blocks is the ordinary Claude
+    // configuration, and it is what makes the handler take its continuation exit —
+    // the exit that has to hand its settlement over to the terminalization racing it.
+    fs.writeFileSync(gate, "gate");
+    fs.writeFileSync(block, "block");
+    try {
+      ({ outer } = await driveResumeToResuming("resume-phase-mismatch", ctx));
+      const stranded = mainCheckpointGate.currentController();
+      const generation = stranded.snapshot().generation;
+      const continuations = () => pi.userMessages
+        .filter((entry) => typeof entry.content === "string" && entry.content.startsWith("[Stop hook]")).length;
+      const continuationsBefore = continuations();
+
+      nested = pi.fire("agent_settled", {}, ctx);
+      await waitUntil({ description: "Stop hook gate entry", predicate: () => fs.existsSync(entered) });
+      // A post-commit failure terminalizes while that handler is still inside the
+      // Stop hook. Terminalization joins the resumed run's settlement, and the
+      // handler is about to find the phase past `resuming` — the mutual wait.
+      let terminalDone = false;
+      terminal = stranded.failAfterCommittedSummary(generation).then((rejected) => {
+        terminalDone = true;
+        return rejected;
+      });
+      await Promise.resolve();
+      expect(terminalDone).toBe(false);
+      expect(stranded.snapshot().phase).toBe("terminalizing");
+
+      fs.writeFileSync(release, "release");
+      await settlement(nested, { description: "the settlement handler that lost its phase" });
+      await expect(nested).resolves.toBeUndefined();
+      await settlement(terminal, { description: "the terminalization joining that handler" });
+      await expect(terminal).resolves.toEqual([]);
+      await settlement(outer, { description: "the checkpoint generation barrier" });
+      await expect(outer).resolves.toBeUndefined();
+
+      // The hook really blocked: a continuation went out, so the handler took the
+      // exit that owes the settlement rather than the plain "run finished" one.
+      expect(continuations()).toBe(continuationsBefore + 1);
+      expect(stranded.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+      });
+      expect(stranded.recoveryToken(generation)).toBeUndefined();
+      await expect(pi.fire("turn_start", {}, ctx)).resolves.toBeUndefined();
+      const replacement = mainCheckpointGate.startSession("after-phase-mismatch");
+      await settlement(replacement, { description: "a replacement session after the phase mismatch" });
+      await expect(replacement).resolves.toBeUndefined();
+    } finally {
+      // `release` has to exist before the join, or the gated hook child never exits.
+      // Only the gated handler is joined; joining the barrier promises would turn a
+      // described ceiling failure into an opaque runner timeout.
+      fs.writeFileSync(release, "release");
+      await nested?.catch(() => undefined);
+      for (const pending of [terminal, outer]) void pending?.catch(() => undefined);
+      for (const file of [gate, block, entered, release]) fs.rmSync(file, { force: true });
+    }
+  });
+
+  it("releases a provider request parked on the resumed barrier when the run ends", async () => {
+    const originalSendUserMessage = pi.api.sendUserMessage as (...args: any[]) => void;
+    let latched: Promise<unknown> | undefined;
+    let aborts = 0;
+    const ctx = resumeCtx({ abort: () => { aborts += 1; } });
+    // Replay runs before replayComplete opens the barrier, so this is the one window
+    // where a provider request genuinely parks in defensiveLatch. Ending the run from
+    // inside it is what a user pressing Esc mid-replay does.
+    pi.api.sendUserMessage = (content: any, options: any) => {
+      originalSendUserMessage(content, options);
+      if (latched || content !== "retained while resuming") return;
+      latched = pi.fire("turn_start", {}, ctx);
+      const controller = mainCheckpointGate.currentController();
+      void controller.cancel(controller.snapshot().generation, "user").catch(() => undefined);
+    };
+    let outer: Promise<unknown> | undefined;
+    let nested: Promise<unknown> | undefined;
+    try {
+      await mainCheckpointGate.startSession("resume-barrier-release");
+      mainCheckpointGate.assistantMessageEnded({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "barrier", name: "probe", arguments: {} }],
+      });
+      const wrapped: any = mainCheckpointGate.wrapTool({
+        name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+      });
+      const result = await wrapped.execute("barrier", {}, undefined, undefined, ctx);
+      mainCheckpointGate.toolExecutionEnded({ toolCallId: "barrier", result, isError: false });
+      mainCheckpointGate.turnEnded(ctx);
+      mainCheckpointGate.captureAcceptedInput(ctx, "retained while resuming", undefined, "followUp");
+      const stranded = mainCheckpointGate.currentController();
+      outer = pi.fire("agent_settled", {}, ctx);
+      await waitUntil({ description: "a provider request parked on the resumed barrier", predicate: () => latched !== undefined });
+
+      await settlement(latched!, { description: "the parked provider request" });
+      await expect(latched).resolves.toBeUndefined();
+      // The ending revoked the turn rather than admitting it.
+      expect(aborts).toBeGreaterThan(0);
+      expect(stranded.snapshot().phase).not.toBe("resuming");
+
+      nested = pi.fire("agent_settled", {}, ctx);
+      await settlement(nested, { description: "the cancelled run's settlement handler" });
+      await expect(nested).resolves.toBeUndefined();
+      await settlement(outer, { description: "the checkpoint generation barrier" });
+      await expect(outer).resolves.toBeUndefined();
+      expect(stranded.snapshot()).toMatchObject({ phase: "cancelled", admission: "closed" });
+
+      const replacement = mainCheckpointGate.startSession("after-barrier-release");
+      await settlement(replacement, { description: "a replacement session after the released barrier" });
+      await expect(replacement).resolves.toBeUndefined();
+    } finally {
+      pi.api.sendUserMessage = originalSendUserMessage;
+      for (const pending of [latched, nested, outer]) void pending?.catch(() => undefined);
+    }
+  });
+
+  /**
+   * Arms one checkpoint generation through the registered handlers and stops there. Only
+   * `agent_settled` hands a generation to the controller's run, so this reaches every
+   * ending a *transition* decides without starting a host transaction — and therefore
+   * without the fixture's real hook children. `session_start` is fired rather than calling
+   * the gate directly so `sessionManagerRef` is this context's, which decides whether the
+   * headless recovery guidance names a persisted session or calls the session ephemeral.
+   */
+  const armCheckpoint = async (ctx: any, id: string, queued?: string) => {
+    await pi.fire("session_start", { reason: "new" }, ctx);
+    mainCheckpointGate.assistantMessageEnded({
+      role: "assistant", content: [{ type: "toolCall", id, name: "probe", arguments: {} }],
+    });
+    const wrapped: any = mainCheckpointGate.wrapTool({
+      name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+    });
+    const result = await wrapped.execute(id, {}, undefined, undefined, ctx);
+    mainCheckpointGate.toolExecutionEnded({ toolCallId: id, result, isError: false });
+    mainCheckpointGate.turnEnded(ctx);
+    if (queued !== undefined) mainCheckpointGate.captureAcceptedInput(ctx, queued, undefined, "followUp");
+    const controller = mainCheckpointGate.currentController();
+    expect(controller.snapshot()).toMatchObject({
+      phase: "awaiting-settlement", queuedInputs: queued === undefined ? 0 : 1,
+    });
+    return { controller, generation: controller.snapshot().generation };
+  };
+
+  interface EndingCase {
+    /** Does this ending take the retained input away, or hold it for `/compact`? */
+    drops: boolean;
+    category: "checkpoint-cancelled" | "checkpoint-exhausted";
+    /**
+     * Pi stops the TUI renderer before it emits this ending's event, so in `tui` mode the
+     * reader's only remaining surface is stderr and there is no editor to restore into.
+     */
+    rendererStopped?: boolean;
+    drive(ctx: any, controller: MidRunCompactionController, generation: number): Promise<unknown>;
+    /** The claim the reader must be able to act on, which is not the same in every mode. */
+    guidance(mode: string): string;
+  }
+
+  /**
+   * A UI whose verbs are inert but present — Pi's `ui.stop()` state, where every render path
+   * returns early and `setEditorText` silently discards. The recording fake cannot model this
+   * (it keeps accepting notifications after shutdown), which is exactly why the shutdown row
+   * used to pass while the reader saw nothing.
+   */
+  const stoppedUi = {
+    notify: () => undefined,
+    setStatus: () => undefined,
+    getEditorText: () => "",
+    setEditorText: () => undefined,
+  };
+
+  const endings: Array<[string, EndingCase]> = [
+    ["a user cancellation", {
+      drops: true,
+      category: "checkpoint-cancelled",
+      drive: (_ctx, controller, generation) => controller.cancel(generation, "user"),
+      guidance: () => "Run /compact to recover this session",
+    }],
+    ["a replacement cancellation", {
+      drops: true,
+      category: "checkpoint-cancelled",
+      drive: (_ctx, controller, generation) => controller.cancel(generation, "replacement"),
+      guidance: () => "resend input in the new session",
+    }],
+    ["a shutdown cancellation", {
+      drops: true,
+      category: "checkpoint-cancelled",
+      // Through the registered handler, because the reader is quitting: the old wording
+      // sent them to a new session that will never exist. `quit` is the exact reason Pi's
+      // `dispose()` emits, and the one it has already stopped the renderer for.
+      rendererStopped: true,
+      drive: (ctx) => pi.fire("session_shutdown", { reason: "quit" }, ctx),
+      guidance: () => "stopped when the session ended",
+    }],
+    ["a post-commit failure", {
+      drops: true,
+      category: "checkpoint-exhausted",
+      drive: (_ctx, controller, generation) => controller.failAfterCommittedSummary(generation),
+      guidance: (mode) => mode === "tui"
+        ? "start a new session and resend the retained input"
+        : "start a replacement session and resend the retained input",
+    }],
+    ["an operational exhaustion", {
+      // The one ending that keeps the queue: it is still recoverable, and `/compact`
+      // is what rejects the retained input.
+      drops: false,
+      category: "checkpoint-exhausted",
+      drive: (ctx) => pi.fire("agent_settled", {}, ctx),
+      guidance: (mode) => mode === "tui"
+        ? "Run /compact, then explicitly continue"
+        : "This headless session is ephemeral and cannot be reopened",
+    }],
+  ];
+
+  const modes = ["tui", "print", "json"] as const;
+
+  it.each(endings.flatMap(([name, ending]) =>
+    modes.map((mode) => [`${name} in ${mode} mode`, mode, ending] as const)))(
+    "announces %s and reports what it cost",
+    async (_label, mode, ending) => {
+      const errors: string[] = [];
+      const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+        errors.push(args.map(String).join(" "));
+      });
+      try {
+        const base = {
+          model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+          getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+          hasPendingMessages: () => false,
+          // No `getSessionFile`: this session is ephemeral, which is the guidance the
+          // headless rows assert.
+          sessionManager: { getBranch: () => [] },
+          abort: () => undefined,
+          compact: (options: any) => queueMicrotask(() => options.onError(new Error("no summary"))),
+        };
+        const ctx = mode === "tui"
+          ? pi.tuiCtx(ending.rendererStopped ? { ...base, ui: stoppedUi } : base)
+          : mode === "print" ? pi.printCtx(base) : pi.printCtx({ ...base, mode: "json" });
+        // The channel this mode still has when the ending arrives. A stopped TUI has none
+        // of its own left: `notify` and `setEditorText` return without doing anything.
+        const channel = mode === "json"
+          ? "lifecycle"
+          : mode === "tui" && !ending.rendererStopped ? "notification" : "stderr";
+        const { controller, generation } = await armCheckpoint(ctx, `ending-${mode}`, "retained by the ending");
+        // After arming, not before: starting this session replaces the previous case's
+        // controller, and a recoverable exhaustion that still held input reports it right
+        // there — which is the behaviour a later case in this file owns.
+        pi.entries.length = 0;
+        pi.notifications.length = 0;
+        pi.editorText = "";
+        errors.length = 0;
+
+        await ending.drive(ctx, controller, generation);
+
+        const entries = pi.entries.filter((entry) => entry.customType === "picc-checkpoint-lifecycle");
+        const lifecycle = entries.filter((entry) => entry.data.category === ending.category);
+        // The ending reached the channel this mode actually has. A status-bar line the
+        // reader may never look at is not an announcement of a terminal, and neither is a
+        // notification handed to a renderer that has stopped.
+        if (channel === "notification") {
+          expect(pi.notifications.map((note) => note.text).join("\n"))
+            .toContain(ending.guidance(mode));
+        } else if (channel === "stderr") {
+          expect(errors.filter((line) => line.startsWith("PiCC: ")).join("\n"))
+            .toContain(ending.guidance(mode));
+        } else {
+          expect(lifecycle.map((entry) => String(entry.data.notice)).join("\n"))
+            .toContain(ending.guidance(mode));
+        }
+        // Persistence is unchanged for this ending's own category: json/rpc carry every
+        // category, print/TUI carry only exhaustion.
+        expect(lifecycle.length)
+          .toBe(mode === "json" || ending.category === "checkpoint-exhausted" ? 1 : 0);
+        // And nothing else widened it behind that filter: the ending's own record, plus at
+        // most the input-recovery report, which every mode persists.
+        expect(entries.length).toBe(lifecycle.length + (ending.drops ? 1 : 0));
+
+        // What the ending cost, named rather than implied — and where there is still an
+        // editor, handed back into it instead of only counted. A stopped renderer must
+        // report a restore of nothing rather than record text it silently discarded.
+        const recovery = entries.filter((entry) => entry.data.category === "checkpoint-input-recovery");
+        const restores = channel === "notification";
+        expect(recovery.map((entry) => entry.data.count)).toEqual(ending.drops ? [1] : []);
+        expect(recovery.map((entry) => entry.data.restoredTextCount))
+          .toEqual(ending.drops ? [restores ? 1 : 0] : []);
+        expect(pi.editorText).toBe(restores && ending.drops ? "retained by the ending\n" : "");
+
+        // Finished versus gave up, without parsing prose. Never in the TUI, where the
+        // reader is the one who saw the notice.
+        expect(process.exitCode).toBe(mode === "tui" ? undefined : 3);
+      } finally {
+        errorSpy.mockRestore();
+        pi.editorText = "";
+      }
+    },
+  );
+
+  it("refuses input after a session-ended cancellation without promising a wait or a new session", async () => {
+    const errors: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    try {
+      const ctx = pi.printCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [] },
+        abort: () => undefined,
+      });
+      const { controller } = await armCheckpoint(ctx, "shutdown-refusal");
+      await pi.fire("session_shutdown", { reason: "quit" }, ctx);
+      // The state the notice has to describe: cancelled by something other than the reader,
+      // settled, and holding no recovery capability.
+      expect(controller.snapshot()).toMatchObject({
+        phase: "cancelled", cancellationKind: "shutdown", cancellationQuiescence: "confirmed",
+      });
+      expect(controller.manualCompactionDisposition()).toBe("unavailable");
+      errors.length = 0;
+
+      await expect(pi.fire("input", { text: "still typing", source: "interactive" }, ctx))
+        .resolves.toEqual({ action: "handled" });
+
+      const refusal = errors.filter((line) => line.startsWith("PiCC: ")).join("\n");
+      expect(refusal).toContain("cannot be recovered here");
+      // Neither falsehood the endings themselves stopped telling: a wait that never ends,
+      // and a new session that will never carry this input.
+      expect(refusal).not.toContain("Wait before");
+      expect(refusal).not.toContain("Start a new session and resend this input");
+
+      // `/compact` in the same state answers from the same classification, so the two
+      // refusals cannot drift apart again.
+      errors.length = 0;
+      await expect(pi.fire("session_before_compact", { reason: "manual" }, ctx))
+        .resolves.toEqual({ cancel: true });
+      const declined = errors.filter((line) => line.startsWith("PiCC: ")).join("\n");
+      expect(declined).toContain("stopped with the session it belonged to");
+      // Says why PiCC declined; never offers the recovery this ending has no token for.
+      expect(declined).not.toContain("Run /compact");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("tells a reader whose own cancellation is still settling to wait, and never to abandon the session", async () => {
+    let aborts = 0;
+    const ctx = pi.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      hasPendingMessages: () => false,
+      sessionManager: { getBranch: () => [] },
+      compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+      abort: () => { aborts += 1; },
+    });
+    let outer: Promise<unknown> | undefined;
+    let nested: Promise<unknown> | undefined;
+    let cancelling: Promise<unknown> | undefined;
+    try {
+      // Esc during a resumed run — the most common cancellation there is. The real adapter's
+      // `cancelAndJoin` parks on the run's settlement while the `agent_settled` handler
+      // still owes it, which is the window the reader types `/compact` in.
+      ({ outer } = await driveResumeToResuming("esc-while-settling", ctx));
+      const controller = mainCheckpointGate.currentController();
+      const generation = controller.snapshot().generation;
+      cancelling = controller.cancel(generation, "user");
+      await waitUntil({
+        description: "the cancellation parked on the host join",
+        predicate: () => aborts > 0,
+      });
+      expect(controller.snapshot()).toMatchObject({
+        phase: "cancelled", cancellationKind: "user", cancellationQuiescence: "pending",
+        cancellationCommitted: false,
+      });
+      pi.notifications.length = 0;
+
+      await expect(pi.fire("session_before_compact", { reason: "manual" }, ctx))
+        .resolves.toEqual({ cancel: true });
+
+      // PiCC used to tell the reader here to throw the session away — seconds before the
+      // join landed and it offered `/compact` on the same checkpoint.
+      const refusal = pi.notifications.map((note) => note.text).join("\n");
+      expect(refusal).toContain("has not finished settling yet");
+      expect(refusal).not.toContain("Start a new session");
+      expect(refusal).not.toContain("exit PiCC");
+
+      // The wait it asked for is one that actually ends in the recovery it implies.
+      nested = pi.fire("agent_settled", {}, ctx);
+      await settlement(nested, { description: "the cancelled run's settlement handler" });
+      await settlement(cancelling, { description: "the parked user cancellation" });
+      await settlement(outer, { description: "the checkpoint generation barrier" });
+      expect(controller.manualCompactionDisposition()).toBe("allow");
+    } finally {
+      for (const pending of [nested, cancelling, outer]) void pending?.catch(() => undefined);
+    }
+  });
+
+  it("supersedes the resumed-work record when the resumed run gives up", async () => {
+    const ctx = resumeCtx({ mode: "json", sessionManager: { getBranch: () => [] } });
+    let outer: Promise<unknown> | undefined;
+    let nested: Promise<unknown> | undefined;
+    let terminal: Promise<unknown> | undefined;
+    try {
+      // Before the drive, not after: `replayComplete` appends the resumed-work record
+      // while this helper is still running, and clearing afterwards would delete the very
+      // record this case is about.
+      pi.entries.length = 0;
+      ({ outer } = await driveResumeToResuming("give-up-supersedes-resumed", ctx));
+      const stranded = mainCheckpointGate.currentController();
+      const generation = stranded.snapshot().generation;
+      // `replayComplete` runs unconditionally, so the documented success signal is
+      // already out before anything can go wrong with the resumed run.
+      await waitUntil({
+        description: "the resumed-work lifecycle record",
+        predicate: () => pi.entries.some((entry) => entry.data.category === "checkpoint-resumed"),
+      });
+
+      terminal = stranded.failAfterCommittedSummary(generation);
+      nested = pi.fire("agent_settled", {}, ctx);
+      await settlement(nested, { description: "the settlement handler the terminalization joins" });
+      await expect(nested).resolves.toBeUndefined();
+      await settlement(terminal, { description: "the post-commit terminalization" });
+      await settlement(outer, { description: "the checkpoint generation barrier" });
+      await expect(outer).resolves.toBeUndefined();
+
+      // `doc/user-guide.md` tells machine consumers to read `checkpoint-resumed` as proof
+      // the work resumed. It must never be the last word about a run that gave up.
+      // Input recovery is a different report with its own owner, and starting this
+      // session released what the previous case left retained.
+      const lifecycle = pi.entries.filter((entry) => entry.customType === "picc-checkpoint-lifecycle" &&
+        entry.data.category !== "checkpoint-input-recovery");
+      const categories = lifecycle.map((entry) => String(entry.data.category));
+      expect(categories).toContain("checkpoint-resumed");
+      expect(categories.at(-1)).toBe("checkpoint-exhausted");
+      expect(lifecycle.at(-1)?.data).toMatchObject({
+        category: "checkpoint-exhausted", failureCategory: "restoration-paused", action: "new-session",
+      });
+      expect(process.exitCode).toBe(3);
+    } finally {
+      for (const pending of [nested, terminal, outer]) void pending?.catch(() => undefined);
+    }
+  });
+
+  it.each([
+    ["a stopped logical run", async (ctx: any) => {
+      // The Stop/SessionStart/UserPromptSubmit hook stop path, at the seam all three use.
+      expect(mainCheckpointGate.captureLogicalRunStop()()).toBe(true);
+      await pi.fire("agent_settled", {}, ctx);
+    }, true],
+    ["a session switch", async (ctx: any) => {
+      await expect(pi.fire("session_before_switch", {}, ctx)).resolves.toBeUndefined();
+    }, false],
+    ["a new session", async (ctx: any) => {
+      await pi.fire("session_start", { reason: "new" }, ctx);
+    }, false],
+  ])(
+    "reports the queued input %s takes away",
+    async (_label, drive, suppressesNotice) => {
+      const ctx = pi.tuiCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [] },
+        abort: () => undefined,
+      });
+      await armCheckpoint(ctx, "dropped-input", "typed while paused");
+      pi.entries.length = 0;
+      pi.notifications.length = 0;
+      pi.editorText = "";
+
+      await drive(ctx);
+
+      expect(pi.entries.filter((entry) => entry.data.category === "checkpoint-input-recovery")
+        .map((entry) => entry.data.count)).toEqual([1]);
+      expect(pi.editorText).toBe("typed while paused\n");
+      // A run the reader already stopped must not narrate its own checkpoint — but the
+      // input they typed is theirs, and suppressing the notice used to suppress that too.
+      if (suppressesNotice) {
+        expect(pi.notifications.map((note) => note.text)
+          .filter((text) => text.startsWith("Proactive context compaction"))).toEqual([]);
+      }
+      pi.editorText = "";
+    },
+  );
+
+  it("reports queued input a recoverable exhaustion still held when the session is replaced", async () => {
+    const ctx = pi.tuiCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      hasPendingMessages: () => false,
+      sessionManager: { getBranch: () => [] },
+      abort: () => undefined,
+      compact: (options: any) => queueMicrotask(() => options.onError(new Error("no summary"))),
+    });
+    try {
+      const { controller } = await armCheckpoint(ctx, "exhausted-retained", "held for /compact");
+      pi.entries.length = 0;
+      pi.editorText = "";
+      await pi.fire("agent_settled", {}, ctx);
+      // A recoverable exhaustion deliberately keeps its queue, and nothing cancels it: the
+      // controller refuses to re-enter a terminal generation. Replacing the session is
+      // therefore the moment that input stops being reachable, and the only moment left to
+      // name it.
+      expect(controller.snapshot()).toMatchObject({
+        phase: "exhausted", admission: "recoverable-rejection", queuedInputs: 1,
+      });
+      expect(pi.entries.filter((entry) => entry.data.category === "checkpoint-input-recovery")).toEqual([]);
+
+      await pi.fire("session_before_switch", {}, ctx);
+      expect(pi.entries.filter((entry) => entry.data.category === "checkpoint-input-recovery")
+        .map((entry) => entry.data.count)).toEqual([1]);
+      expect(pi.editorText).toBe("held for /compact\n");
+
+      // Exactly once: the switch drained what it reported, so the session start behind it
+      // finds nothing left and does not restore the same text a second time.
+      await pi.fire("session_start", { reason: "switch" }, ctx);
+      expect(pi.entries.filter((entry) => entry.data.category === "checkpoint-input-recovery")).toHaveLength(1);
+      expect(pi.editorText).toBe("held for /compact\n");
+    } finally {
+      pi.editorText = "";
+    }
+  });
+
+  it("explains a refused /compact instead of leaving Pi's unattributed cancellation alone", async () => {
+    const errors: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    try {
+      const tui = pi.tuiCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [] },
+        abort: () => undefined,
+      });
+      const { controller, generation } = await armCheckpoint(tui, "refused-compact");
+      await controller.failAfterCommittedSummary(generation);
+      pi.notifications.length = 0;
+
+      await expect(pi.fire("session_before_compact", { reason: "manual" }, tui))
+        .resolves.toEqual({ cancel: true });
+      // Complements Pi's own `Compaction cancelled`, which carries no author and reads as
+      // if the reader withdrew the request. It never repeats that word, it never offers the
+      // one recovery this ending forbids, and it carries the same `PiCC: ` prefix as every
+      // other diagnostic so one predicate finds them all.
+      const refusal = pi.notifications.map((note) => note.text)
+        .filter((text) => text.startsWith("PiCC: "));
+      expect(refusal).toHaveLength(1);
+      expect(refusal[0]).toContain("this compaction did not run");
+      expect(refusal[0]).toContain("must never be compacted again");
+      expect(refusal[0]).not.toContain("cancelled");
+
+      // Same refusal, headless: stderr rather than a toast, still self-attributed.
+      const print = pi.printCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: { getBranch: () => [] },
+        abort: () => undefined,
+      });
+      const paused = await armCheckpoint(print, "refused-compact-headless");
+      await paused.controller.failAfterCommittedSummary(paused.generation);
+      errors.length = 0;
+      await expect(pi.fire("session_before_compact", { reason: "manual" }, print))
+        .resolves.toEqual({ cancel: true });
+      expect(errors.filter((line) => line.startsWith("PiCC: this compaction did not run"))).toHaveLength(1);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it("drops queued resumed print output when session replacement revokes its serialized-write authority", async () => {
@@ -1624,7 +2700,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     });
 
     const attemptedWrites: string[] = [];
-    let releaseWrite!: () => void;
+    let releaseWrite: (() => void) | undefined;
     const writeEntered = deferred<void>();
     const markerCount = () => pi.messages.filter(
       (entry) => entry.message.customType === "picc-checkpoint-print-result",
@@ -1665,15 +2741,17 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         predicate: () => queuedBranchRead,
       });
 
+      // The revocation this test is about is observable as the replacement completing.
+      // Waiting on the transient `cancelled` phase is not: a stalled write no longer
+      // parks the replacement there, so a poll can miss the phase entirely. The
+      // assertions below still prove the queued emission lost authority before writing.
       const replacement = mainCheckpointGate.startSession("replacement-before-queued-print-write");
-      await waitUntil({
-        description: "queued print authority cancellation",
-        predicate: () => mainCheckpointGate.currentController().snapshot().phase === "cancelled",
-      });
-      releaseWrite();
+      await settlement(replacement, { description: "queued print authority replacement" });
+      await expect(replacement).resolves.toBeUndefined();
       await Promise.all([firstSettlement, queuedSettlement, outer, replacement]);
     } finally {
       writeSpy.mockRestore();
+      releaseWrite?.();
     }
 
     expect(attemptedWrites).toEqual(["tail blocker\n"]);
@@ -1681,6 +2759,120 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(markerCount()).toBe(markersBefore);
     expect(mainCheckpointGate.currentController().snapshot().phase).toBe("idle");
     expect(mainCheckpointGate.currentController().snapshot().admission).toBe("open");
+  });
+
+  it("releases a never-completing resumed print write and leaves the next session's emission clean", async () => {
+    // The whole deadlock chain, end to end: a stdout write whose callback never fires
+    // must not park `agent_settled` inside the print-write chain — that parks the
+    // resume, which parks the cancellation join, which leaves every later
+    // startSession / beforeSessionSwitch on this gate hanging. The write callback is
+    // captured and NEVER invoked here, so the run's own cancellation authority is the
+    // only thing that can release it, and the next session must get its own chain.
+    const stdoutWrites: string[] = [];
+    let strandedCallback: ((error: NodeJS.ErrnoException | null, written: number) => void) | undefined;
+    const strandedWriteEntered = deferred<void>();
+    let strandWrite = true;
+    const originalWrite = fs.write.bind(fs);
+    const writeSpy = vi.spyOn(fs, "write").mockImplementation(((fd: any, data: any, offset: any,
+      length: any, position: any, callback: any) => {
+      if (fd === process.stdout.fd && Buffer.isBuffer(data)) {
+        stdoutWrites.push(data.subarray(offset, offset + length).toString("utf8"));
+        if (strandWrite) {
+          strandedCallback = callback;
+          strandedWriteEntered.resolve();
+          return;
+        }
+        queueMicrotask(() => callback(null, length, data));
+        return;
+      }
+      return originalWrite(fd, data, offset, length, position, callback);
+    }) as typeof fs.write);
+
+    const armResumedPrint = async (id: string, text: string) => {
+      const ctx = pi.printCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        sessionManager: {
+          getBranch: () => [{
+            type: "message",
+            message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" },
+          }],
+        },
+        compact: (options: any) => queueMicrotask(() => options.onComplete({ summary: "ok" })),
+      });
+      mainCheckpointGate.assistantMessageEnded({
+        role: "assistant", content: [{ type: "toolCall", id, name: "probe", arguments: {} }],
+      });
+      const wrapped: any = mainCheckpointGate.wrapTool({
+        name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+      });
+      const result = await wrapped.execute(id, {}, undefined, undefined, ctx);
+      mainCheckpointGate.toolExecutionEnded({ toolCallId: id, result, isError: false });
+      mainCheckpointGate.turnEnded(ctx);
+      const outer = pi.fire("agent_settled", {}, ctx);
+      await waitUntil({
+        description: `${id} resumed run`,
+        predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming",
+      });
+      return { ctx, outer };
+    };
+    const markerCount = () => pi.messages.filter(
+      (entry) => entry.message.customType === "picc-checkpoint-print-result",
+    ).length;
+
+    try {
+      await mainCheckpointGate.startSession("stranded-print-write");
+      const stranded = await armResumedPrint("stranded", "stranded answer");
+      const strandedSettlement = pi.fire("agent_settled", {}, { ...stranded.ctx });
+      await strandedWriteEntered.promise;
+      const markersBefore = markerCount();
+
+      // Abandon that session through the REGISTERED handler, not the gate method: a
+      // reset that hangs off session_start is invisible to a gate-method assertion.
+      const replacement = pi.fire("session_start", { reason: "new" }, pi.printCtx());
+      await settlement(replacement, {
+        description: "session_start to replace the session owning the stranded write",
+        describeObserved: () => `controller phase: ${mainCheckpointGate.currentController().snapshot().phase}`,
+      });
+      await expect(replacement).resolves.toBeUndefined();
+      await settlement(strandedSettlement, {
+        description: "the stranded resumed print settlement to unwind",
+      });
+      await expect(strandedSettlement).resolves.toBeUndefined();
+      await settlement(stranded.outer, { description: "the stranded run's outer agent_settled to unwind" });
+      await expect(stranded.outer).resolves.toBeUndefined();
+      expect(markerCount()).toBe(markersBefore);
+
+      // A second resumed print emission on the same extension instance, with a
+      // working write, while the first session's write callback is still outstanding.
+      strandWrite = false;
+      const fresh = await armResumedPrint("fresh", "fresh answer");
+      const freshSettlement = pi.fire("agent_settled", {}, { ...fresh.ctx });
+      await settlement(freshSettlement, { description: "the fresh session's resumed print settlement" });
+      await expect(freshSettlement).resolves.toBeUndefined();
+      await settlement(fresh.outer, { description: "the fresh run's outer agent_settled to unwind" });
+      await expect(fresh.outer).resolves.toBeUndefined();
+
+      expect(stdoutWrites).toEqual(["stranded answer\n", "fresh answer\n"]);
+      expect(markerCount()).toBe(markersBefore + 1);
+
+      const switching = pi.fire("session_before_switch", {}, pi.printCtx());
+      await settlement(switching, { description: "session_before_switch after the stranded write" });
+      await expect(switching).resolves.toBeUndefined();
+      const restarting = pi.fire("session_start", { reason: "switch" }, pi.printCtx());
+      await settlement(restarting, { description: "session_start after the stranded write" });
+      await expect(restarting).resolves.toBeUndefined();
+      expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({
+        phase: "idle", admission: "open",
+      });
+    } finally {
+      // Restore the global spy before anything that could throw: a failure here would
+      // otherwise leave `strandWrite` stranding stdout for every later test in the file
+      // and hide whatever actually failed above.
+      writeSpy.mockRestore();
+      strandedCallback?.(Object.assign(new Error("released after the assertions"), { code: "EPIPE" }), 0);
+    }
   });
 
   it("settles a permanent print-write failure without a marker so Pi's native last-assistant printer can run", async () => {
@@ -1713,8 +2905,13 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     const failedWrite = vi.spyOn(fs, "write").mockImplementation(((_fd: any, _data: any, _offset: any, _length: any, _position: any, callback: any) => {
       queueMicrotask(() => callback(permanent, 0));
     }) as typeof fs.write);
-    await expect(pi.fire("agent_settled", {}, { ...ctx })).resolves.toBeUndefined();
-    failedWrite.mockRestore();
+    try {
+      await expect(pi.fire("agent_settled", {}, { ...ctx })).resolves.toBeUndefined();
+    } finally {
+      // The spy ignores the fd and fails every `fs.write` in the worker; an unmet
+      // expectation here must not hand that to every later test.
+      failedWrite.mockRestore();
+    }
     await outer;
     expect(markerCount()).toBe(before);
     expect((ctx.sessionManager as any).getBranch().at(-1)).toBe(assistantEntry);
@@ -2031,7 +3228,10 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(mainCheckpointGate.currentController().snapshot().phase).toBe("exhausted");
     const failure = pi.entries.find((entry) =>
       entry.customType === "picc-checkpoint-lifecycle" && entry.data.category === "checkpoint-exhausted");
-    expect(failure?.data.notice).toContain("reopen the exact persisted session before /compact");
+    // "the exact persisted session" is only actionable if the reader can tell which one
+    // it is, and a headless caller has no session picker to browse.
+    expect(failure?.data.notice).toContain(
+      `reopen the exact persisted session (${path.join(dir, "persisted-session.jsonl")}) before /compact`);
     expect(failure?.data.notice).toContain("Run /compact, then explicitly continue");
     expect(String(failure?.data.notice)).not.toContain("provider detail");
     expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-continuation")).toBe(false);
@@ -2124,12 +3324,16 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     const entered = path.join(dir, ".claude", "precompact-entered");
     const release = path.join(dir, ".claude", "release-precompact");
     const compactTrace = path.join(dir, ".claude", ".compact-trace");
+    // `gate-precompact` is the polled kind: a survivor parks every later PreCompact hook in an `sh`
+    // poll loop for the full hook timeout, so the guard has to start at the write, not after it.
+    // `rmSync` below is force-d against ENOENT only — EPERM/EBUSY on Windows still throws here.
     fs.writeFileSync(gate, "gate");
-    fs.rmSync(compactTrace, { force: true });
-    const sentBefore = pi.messages.length;
-    const ctx = pi.tuiCtx();
-    const before = pi.fire("session_before_compact", { reason: "manual" }, ctx);
+    let before: Promise<unknown> | undefined;
     try {
+      fs.rmSync(compactTrace, { force: true });
+      const sentBefore = pi.messages.length;
+      const ctx = pi.tuiCtx();
+      before = pi.fire("session_before_compact", { reason: "manual" }, ctx);
       await waitUntil({
         description: "PreCompact hook to enter",
         predicate: () => fs.existsSync(entered),
@@ -2150,7 +3354,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       expect(pi.messages).toHaveLength(sentBefore);
     } finally {
       fs.writeFileSync(release, "release");
-      await before.catch(() => undefined);
+      await before?.catch(() => undefined);
       for (const file of [gate, entered, release, compactTrace]) fs.rmSync(file, { force: true });
     }
   });

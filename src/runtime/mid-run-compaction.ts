@@ -51,12 +51,29 @@ export interface QueuedInputShadow {
   delivery: QueueDeliveryMode;
 }
 
+/**
+ * What the reader can still do after this ending. `session-ended` and `restart-process`
+ * exist because "start a new session" is false for a session that is shutting down and
+ * for a cancellation whose join never confirmed the host went quiet — the latter leaves
+ * a controller that refuses replacement as well as recovery.
+ */
+export type CheckpointAction =
+  | "resume"
+  | "settled-fallback"
+  | "manual-recovery"
+  | "new-session"
+  | "session-ended"
+  | "restart-process";
+
 export interface CheckpointProgress {
   category: CheckpointDiagnosticCategory;
   generation: number;
-  action?: "resume" | "settled-fallback" | "manual-recovery" | "new-session";
+  action?: CheckpointAction;
   failureCategory?: CompactionFailureCategory;
 }
+
+/** Whether a cancellation established that the host stopped; `unconfirmed` is terminal. */
+export type CancellationQuiescence = "pending" | "confirmed" | "unconfirmed";
 
 export interface CheckpointSnapshot {
   generation: number;
@@ -65,6 +82,15 @@ export interface CheckpointSnapshot {
   queuedInputs: number;
   admission: "open" | "checkpoint-only" | "recoverable-rejection" | "closed";
   failureCategory?: CompactionFailureCategory;
+  /** Present only while a cancellation owns this generation; all three fields travel together. */
+  cancellationKind?: CancellationKind;
+  cancellationQuiescence?: CancellationQuiescence;
+  /**
+   * Whether this generation's summary is already committed. A cancellation of a committed
+   * generation terminalizes post-commit and mints no recovery capability, whatever its
+   * kind — so `cancellationKind === "user"` alone does not mean the wait ends recoverably.
+   */
+  cancellationCommitted?: boolean;
 }
 
 export interface ToolBatchDisposition {
@@ -130,6 +156,14 @@ export interface MidRunCompactionOptions {
   compact(signal: AbortSignal): Promise<CompactionAttemptResult>;
   resume?(context: ResumeContext): ResumedRunOwnership | Promise<ResumedRunOwnership>;
   progress?(event: CheckpointProgress): void;
+  /**
+   * Report input a terminal transition has taken out of the queue. Every splice that
+   * ends a generation hands its shadows here, so this — not a return value some caller
+   * has to remember to forward — is where retained input survives an ending. The
+   * diagnostic for that ending is emitted first, so a reader sees what happened before
+   * what it cost them.
+   */
+  inputDropped?(rejected: readonly QueuedInputShadow[]): void;
 }
 
 interface ToolState {
@@ -165,9 +199,16 @@ function deferred<T = void>(): Deferred<T> {
 interface CancellationState {
   generation: number;
   kind: CancellationKind;
+  quiescence: CancellationQuiescence;
   outcome: Deferred<CancellationOutcome>;
   join?: Promise<void>;
-  finishing?: Promise<void>;
+  /**
+   * Set by the one branch that reports dropped input without draining it (a failed join
+   * must decide nothing about a generation whose quiescence it could not establish). It
+   * makes "reported exactly once" a fact this file enforces rather than an argument about
+   * which caller the rejection happens to stop.
+   */
+  reported?: boolean;
 }
 
 interface RunOwnership {
@@ -229,6 +270,17 @@ export class MidRunCompactionController {
             ? "open"
             : "checkpoint-only",
       ...(this.terminalFailure === undefined ? {} : { failureCategory: this.terminalFailure }),
+      // Read by the admission-refusal notice: "wait for the cancellation to settle" is
+      // true only for a `user` cancellation that is still pending, and no wait ever
+      // helps once a join has reported `unconfirmed`. `cancellationCommitted` is what
+      // separates a wait that ends in `/compact` from one that ends in `restoration-paused`
+      // (`finishCancellation` terminalizes a committed generation instead of minting the
+      // token), which kind alone cannot tell apart.
+      ...(this.cancellation === undefined ? {} : {
+        cancellationKind: this.cancellation.kind,
+        cancellationQuiescence: this.cancellation.quiescence,
+        cancellationCommitted: this.committedGeneration === this.cancellation.generation,
+      }),
     };
   }
 
@@ -379,6 +431,21 @@ export class MidRunCompactionController {
     return [...this.queue];
   }
 
+  /**
+   * Hand back input this generation can no longer deliver. A terminal generation keeps
+   * its queue on purpose — a recoverable exhaustion holds it for `/compact` — so the
+   * moment the controller is replaced or its session left is when those shadows stop
+   * being reachable, and the last moment a report can still name them. Draining here is
+   * what keeps that report exactly once: the replacement path finds nothing left when a
+   * cancellation already drained and reported the same shadows — and for the one branch
+   * that reports without draining, `reported` says so, so these shadows are released
+   * without being named twice.
+   */
+  releaseQueuedInput(): readonly QueuedInputShadow[] {
+    const released = this.queue.splice(0);
+    return this.cancellation?.reported ? [] : released;
+  }
+
   ordinaryInputDisposition(): OrdinaryInputDisposition {
     if (this.phase === "idle") return "accept";
     if (this.phase === "exhausted") {
@@ -442,16 +509,34 @@ export class MidRunCompactionController {
         ? this.cancellation.outcome.promise
         : Promise.resolve({ cancelled: false, rejected: [] });
     }
+    if (this.phase === "exhausted") {
+      // An exhausted generation already chose its terminal: its barrier is published,
+      // its diagnostic is emitted, and its recovery capability is either minted or
+      // deliberately withheld. Re-entering would announce a second ending and, after a
+      // post-commit terminal, mint the `user` recovery token that permits re-compacting
+      // an already committed summary — the one lie this machinery must never tell.
+      return Promise.resolve({ cancelled: false, rejected: [] });
+    }
+    // Every remaining phase is live, so this is the only place a cancellation state is
+    // created and the finish that publishes it is scheduled unconditionally below.
+    const cancellation: CancellationState = {
+      generation, kind, quiescence: "pending", outcome: deferred<CancellationOutcome>(),
+    };
     this.phase = "cancelled";
-    this.cancellation = { generation, kind, outcome: deferred<CancellationOutcome>() };
+    this.cancellation = cancellation;
     this.checkpointAbortRequested = false;
     this.compactionSummary = undefined;
     this.runAbort.abort(kind);
     this.queueChanged.resolve();
     this.startCancelAndJoin(generation);
     const generationBarrier = this.stable ??= deferred();
-    this.scheduleCancellationFinish(generation, generationBarrier);
-    return this.cancellation.outcome.promise;
+    const activeRun = this.runOwnership?.generation === generation ? this.runOwnership.settled.promise : undefined;
+    // Not retained: the finish publishes both of this cancellation's surfaces itself, so a
+    // caller waits on `outcome`/the barrier rather than on the finish. `outcome` rejects if
+    // the join cannot confirm quiescence, which is why nothing has to await this chain.
+    void Promise.resolve(activeRun)
+      .then(() => this.finishCancellation(cancellation, generationBarrier));
+    return cancellation.outcome.promise;
   }
 
   recoveryToken(generation: number): RecoveryToken | undefined {
@@ -472,6 +557,13 @@ export class MidRunCompactionController {
     this.checkpointAbortRequested = false;
     this.committedGeneration = undefined;
     this.recovery = undefined;
+    // Recovery is the one transition from a terminal back to a live phase, so it is also
+    // the only place a cancellation could outlive the phase that owns it. Dropping it keeps
+    // "a live phase never carries a cancellation" true by construction, which is what lets
+    // `publishExit` force `cancelled: true`. An in-flight `finishCancellation` is unaffected:
+    // it publishes through the state it was handed and its identity guard already declines
+    // to mutate a controller that replaced it.
+    this.cancellation = undefined;
     this.emit("checkpoint-recovered");
     return { recovered: true, rejected };
   }
@@ -526,7 +618,7 @@ export class MidRunCompactionController {
   private async resumeOrFinish(generation: number): Promise<void> {
     if (!this.isCurrent(generation)) return;
     if (this.fallback) {
-      if (this.queue.length === 0) this.finishGeneration();
+      if (this.queue.length === 0) this.finishGeneration(generation);
       else this.exhaust(generation);
       return;
     }
@@ -610,7 +702,7 @@ export class MidRunCompactionController {
       }
       if (!this.isCurrent(generation)) return;
       if (settled) {
-        this.finishGeneration();
+        this.finishGeneration(generation);
         return;
       }
       this.queueChanged = deferred();
@@ -620,7 +712,9 @@ export class MidRunCompactionController {
         this.queueChanged.promise.then(() => "queue" as const),
       ]);
       if (event === "settled") {
-        if (this.queue.length === 0) this.finishGeneration();
+        // A terminalization started while this race was parked owns the ending, and
+        // `finishGeneration` declines it; the queued branch joins that same promise.
+        if (this.queue.length === 0) this.finishGeneration(generation);
         else await this.terminalizeAfterCommittedSummary(generation);
         return;
       }
@@ -643,63 +737,130 @@ export class MidRunCompactionController {
     this.runAbort.abort("post-commit failure");
     this.queueChanged.resolve();
 
+    let rejected: readonly QueuedInputShadow[] = [];
     const terminalization = (async (): Promise<readonly QueuedInputShadow[]> => {
-      if (ownership && context) {
-        try {
-          await ownership.cancelAndJoin("replacement", context);
-        } catch {
-          // The adapter has already revoked provider/replay authority. A failed
-          // host join cannot reopen this generation, but stable publication must
-          // still wait for that exact join attempt to settle.
+      try {
+        if (ownership && context) {
+          try {
+            await ownership.cancelAndJoin("replacement", context);
+          } catch {
+            // The adapter has already revoked provider/replay authority. A failed
+            // host join cannot reopen this generation, but stable publication must
+            // still wait for that exact join attempt to settle.
+          }
         }
+        // Nothing else can leave `terminalizing`: `sample` needs `idle`, `cancel` and a
+        // re-entrant terminalization return this promise, and `exhaust`/`finishGeneration`
+        // refuse a generation that is no longer live. The guard is a floor for a future
+        // transition rather than a reachable path, and the `finally` is what keeps it
+        // from becoming a strand if one ever appears.
+        if (generation !== this.generation || this.phase !== "terminalizing") return [];
+        this.resumedOwnership = undefined;
+        this.resumeContext = undefined;
+        this.resumeToken = undefined;
+        this.resumedSettlement = undefined;
+        rejected = this.queue.splice(0);
+        this.phase = "exhausted";
+        this.emit("checkpoint-exhausted", generation, {
+          action: "new-session",
+          failureCategory: "restoration-paused",
+        });
+        // The ending tells the reader to resend the retained input; this is what names
+        // it. Every internal caller of this transition discards the return value, so the
+        // report cannot depend on one of them forwarding it.
+        this.reportDropped(rejected);
+        return rejected;
+      } finally {
+        this.publishExit(generation, generationBarrier, rejected);
       }
-      if (generation !== this.generation || this.phase !== "terminalizing") return [];
-      this.resumedOwnership = undefined;
-      this.resumeContext = undefined;
-      this.resumeToken = undefined;
-      this.resumedSettlement = undefined;
-      const rejected = this.queue.splice(0);
-      this.phase = "exhausted";
-      generationBarrier?.resolve();
-      if (this.cancellation?.generation === generation) {
-        this.cancellation.outcome.resolve({ cancelled: true, rejected });
-      }
-      this.emit("checkpoint-exhausted", generation, {
-        action: "new-session",
-        failureCategory: "restoration-paused",
-      });
-      return rejected;
     })();
     this.terminalization = terminalization;
     return terminalization;
   }
 
-  private finishGeneration(): void {
+  private finishGeneration(generation: number): void {
+    // A generation that has left the live phases belongs to the transition that took it
+    // there; completing it from behind would resolve its barrier while a terminalization
+    // is still joining the host, and strand that terminalization's own surfaces.
+    if (!this.isCurrent(generation)) return;
     if (this.queue.length !== 0) {
-      this.exhaust(this.generation);
+      this.exhaust(generation);
       return;
     }
     const generationBarrier = this.stable;
-    this.phase = "idle";
-    this.checkpointAbortRequested = false;
-    this.compactionSummary = undefined;
-    this.committedGeneration = undefined;
-    generationBarrier?.resolve();
+    try {
+      this.phase = "idle";
+      this.checkpointAbortRequested = false;
+      this.compactionSummary = undefined;
+      this.committedGeneration = undefined;
+    } finally {
+      this.publishExit(generation, generationBarrier);
+    }
   }
 
   private exhaust(generation: number, failureCategory: CompactionFailureCategory = "operational"): void {
     if (!this.isCurrent(generation)) return;
     const generationBarrier = this.stable;
-    this.phase = "exhausted";
-    this.checkpointAbortRequested = false;
-    this.compactionSummary = undefined;
-    this.terminalFailure = failureCategory;
-    this.recovery = failureCategory === "restoration-paused" ? undefined : { generation, token: {} };
+    try {
+      this.phase = "exhausted";
+      this.checkpointAbortRequested = false;
+      this.compactionSummary = undefined;
+      // A terminal generation retains no adapter ownership. Terminalization drops the same
+      // four fields; dropping them here too makes that a property of every terminal instead
+      // of a cross-file invariant about which adapter published its own settlement first —
+      // which is what the `exhausted` guard in `cancel()` would otherwise have to rest on.
+      this.resumedOwnership = undefined;
+      this.resumeContext = undefined;
+      this.resumeToken = undefined;
+      this.resumedSettlement = undefined;
+      this.terminalFailure = failureCategory;
+      this.recovery = failureCategory === "restoration-paused" ? undefined : { generation, token: {} };
+      this.emit("checkpoint-exhausted", generation, {
+        action: failureCategory === "restoration-paused" ? "new-session" : "manual-recovery",
+        failureCategory,
+      });
+    } finally {
+      this.publishExit(generation, generationBarrier);
+    }
+  }
+
+  /**
+   * Publish everything one generation hands out: the barrier held by `checkpoint()` and
+   * `stableBarrier()` callers, the outcome held by `cancel()` callers, and the replay
+   * loop's queue wait. Every transition out of a live phase calls this from a `finally`,
+   * so an early return added to one of those bodies later cannot strand a caller — the
+   * body decides the terminal, this decides that it is published, and both promise
+   * surfaces settle exactly once because the first settlement wins.
+   *
+   * The barrier — and, where the caller holds one, the cancellation — is passed in because
+   * both are *handed-out* surfaces: a generation that has been overtaken must still release
+   * its own callers and not the successor's. `queueChanged` is deliberately the opposite: it
+   * is read live off the controller because it is a wake-up that every loop re-arms, and the
+   * point is to wake whoever is parked *now*, not the generation that captured it. Capturing
+   * it would poke a deferred nobody is waiting on and leave the current waiter parked.
+   *
+   * `cancelled: true` is truthful wherever a cancellation for `generation` exists: only
+   * `cancel()` creates one, it leaves the live phases synchronously, and every transition
+   * back to a live phase clears it — so a completing transition can never observe one.
+   *
+   * The boundary of the guarantee, stated because it cannot be closed here: the
+   * controller publishes exactly once *whenever every adapter promise it awaits settles*.
+   * It cannot make `compact`, `replay`, `replayComplete`, or `cancelAndJoin` return, so a
+   * host that never answers still parks the transition joining it. Totality of those
+   * waits belongs to the resume adapter's `conclude` in `src/index.ts`, which ends the
+   * resumed run on every exit instead of waiting for a host event that may never arrive.
+   */
+  private publishExit(
+    generation: number,
+    generationBarrier: Deferred<void> | undefined,
+    rejected: readonly QueuedInputShadow[] = [],
+    cancellation = this.cancellation,
+  ): void {
     generationBarrier?.resolve();
-    this.emit("checkpoint-exhausted", generation, {
-      action: failureCategory === "restoration-paused" ? "new-session" : "manual-recovery",
-      failureCategory,
-    });
+    if (cancellation?.generation === generation) {
+      cancellation.outcome.resolve({ cancelled: true, rejected });
+    }
+    this.queueChanged.resolve();
   }
 
   private startCancelAndJoin(generation: number): void {
@@ -716,49 +877,68 @@ export class MidRunCompactionController {
     }
   }
 
-  private scheduleCancellationFinish(generation: number, generationBarrier: Deferred<void>): void {
-    const cancellation = this.cancellation;
-    if (!cancellation || cancellation.generation !== generation || cancellation.finishing) return;
-    const activeRun = this.runOwnership?.generation === generation ? this.runOwnership.settled.promise : undefined;
-    cancellation.finishing = Promise.resolve(activeRun)
-      .then(() => this.finishCancellation(generation, generationBarrier));
-  }
-
-  private async finishCancellation(generation: number, generationBarrier: Deferred<void>): Promise<void> {
-    const cancellation = this.cancellation;
-    if (!cancellation || cancellation.generation !== generation) return;
-    if (this.phase === "terminalizing") {
-      await this.terminalization;
-      return;
-    }
-    this.startCancelAndJoin(generation);
+  private async finishCancellation(cancellation: CancellationState, generationBarrier: Deferred<void>): Promise<void> {
+    const generation = cancellation.generation;
+    let rejected: readonly QueuedInputShadow[] = [];
     try {
-      await cancellation.join;
-    } catch {
-      const failure = new Error("Checkpoint cancellation could not confirm quiescence");
-      generationBarrier.reject(failure);
-      cancellation.outcome.reject(failure);
-      return;
+      // Identity, not fields: a cancellation the controller has already replaced no
+      // longer owns the terminal, but its own callers are still published in `finally`.
+      if (this.cancellation !== cancellation) return;
+      if (this.phase === "terminalizing") {
+        await this.terminalization;
+        return;
+      }
+      this.startCancelAndJoin(generation);
+      try {
+        await cancellation.join;
+      } catch {
+        // A rejection is a terminal answer: a caller that awaits either surface learns
+        // quiescence could not be confirmed instead of waiting forever for one.
+        cancellation.quiescence = "unconfirmed";
+        // Both surfaces reject, and every consumer of a rejection swallows it, so this
+        // ending had no words in any mode. Emitted before the rejections, so the
+        // diagnostic is out before any awaiting caller wakes. `restart-process` rather
+        // than `new-session`: this generation mints no recovery capability, and the same
+        // rejection comes back out of controller replacement, so a replacement session is
+        // refused too. The queue is reported but deliberately NOT drained — this branch
+        // must not decide anything about a generation whose quiescence it could not
+        // establish. `reported` is what keeps it exactly once: controller replacement
+        // still drains this queue, and must not name the same shadows again.
+        this.emit("checkpoint-cancelled", generation, { action: "restart-process" });
+        cancellation.reported = true;
+        this.reportDropped(this.queuedInputSnapshot());
+        const failure = new Error("Checkpoint cancellation could not confirm quiescence");
+        generationBarrier.reject(failure);
+        cancellation.outcome.reject(failure);
+        return;
+      }
+      cancellation.quiescence = "confirmed";
+      // Read through `snapshot()`: the join can drive the very transition the guard
+      // above excluded, which narrowing on `this.phase` would then declare impossible.
+      if (this.snapshot().phase === "terminalizing") {
+        await this.terminalization;
+        return;
+      }
+      if (this.committedGeneration === generation) {
+        await this.terminalizeAfterCommittedSummary(generation);
+        return;
+      }
+      if (this.phase === "exhausted") return;
+      rejected = this.queue.splice(0);
+      if (cancellation.kind === "user") this.recovery = { generation, token: {} };
+      // Only `replacement` puts the reader in a new session. `shutdown` is the process
+      // leaving and `task-stop` is a child task being abandoned: telling either to resend
+      // input in a session that will never exist is the guidance this task exists to
+      // delete.
+      this.emit("checkpoint-cancelled", generation, {
+        action: cancellation.kind === "user"
+          ? "manual-recovery"
+          : cancellation.kind === "replacement" ? "new-session" : "session-ended",
+      });
+      this.reportDropped(rejected);
+    } finally {
+      this.publishExit(generation, generationBarrier, rejected, cancellation);
     }
-    if (this.snapshot().phase === "terminalizing") {
-      await this.terminalization;
-      return;
-    }
-    if (this.committedGeneration === generation) {
-      await this.terminalizeAfterCommittedSummary(generation);
-      return;
-    }
-    if (this.phase === "exhausted") {
-      cancellation.outcome.resolve({ cancelled: true, rejected: [] });
-      return;
-    }
-    const rejected = this.queue.splice(0);
-    if (cancellation.kind === "user") this.recovery = { generation, token: {} };
-    this.emit("checkpoint-cancelled", generation, {
-      action: cancellation.kind === "user" ? "manual-recovery" : "new-session",
-    });
-    generationBarrier.resolve();
-    cancellation.outcome.resolve({ cancelled: true, rejected });
   }
 
   private isCurrent(generation: number): boolean {
@@ -777,6 +957,15 @@ export class MidRunCompactionController {
   ): void {
     try {
       this.options.progress?.({ category, generation, ...details });
+    } catch {
+      // Observers cannot own checkpoint transitions or barriers.
+    }
+  }
+
+  private reportDropped(rejected: readonly QueuedInputShadow[]): void {
+    if (rejected.length === 0) return;
+    try {
+      this.options.inputDropped?.(rejected);
     } catch {
       // Observers cannot own checkpoint transitions or barriers.
     }
@@ -803,6 +992,8 @@ export interface CheckpointExecutionAdapter {
   compact(signal: AbortSignal): Promise<CompactionAttemptResult>;
   resume?(context: ResumeContext): ResumedRunOwnership | Promise<ResumedRunOwnership>;
   progress?(event: CheckpointProgress): void;
+  /** Input an ending, or the replacement of this gate's controller, can no longer deliver. */
+  inputDropped?(rejected: readonly QueuedInputShadow[]): void;
 }
 
 function toolCallIds(message: unknown): string[] {
@@ -951,6 +1142,9 @@ export class MainSessionCheckpointGate {
     } catch {
       return { cancel: true };
     }
+    // Only after the switch is accepted: a refused switch leaves the session, and its
+    // retained input, exactly where they were.
+    this.releaseRetainedInput();
     this.invalidateSessionState();
     return undefined;
   }
@@ -958,6 +1152,7 @@ export class MainSessionCheckpointGate {
   async startSession(sessionId: string): Promise<void> {
     const operation = this.transition.then(async () => {
       await this.cancelCurrent("replacement");
+      this.releaseRetainedInput();
       this.controller = this.createController(sessionId);
       this.invalidateSessionState();
     });
@@ -1275,6 +1470,7 @@ export class MainSessionCheckpointGate {
         return resume(context);
       },
       progress: (event) => this.execution?.progress?.(event),
+      inputDropped: (rejected) => this.execution?.inputDropped?.(rejected),
     });
   }
 
@@ -1283,8 +1479,25 @@ export class MainSessionCheckpointGate {
     if (snapshot.phase !== "idle") await this.controller.cancel(snapshot.generation, kind);
   }
 
+  /**
+   * Report what the outgoing controller still held. A cancellation drains and reports
+   * its own queue, so this speaks only for the generations no cancellation reaches: an
+   * exhausted one, whose queue is deliberately retained for `/compact` right up to the
+   * moment the session it belongs to is replaced or left.
+   */
+  private releaseRetainedInput(): void {
+    const retained = this.controller.releaseQueuedInput();
+    if (retained.length === 0) return;
+    try {
+      this.execution?.inputDropped?.(retained);
+    } catch {
+      // Presentation cannot own session replacement.
+    }
+  }
+
   private resetStoppedLogicalRun(): void {
     const sessionId = this.controller.sessionId;
+    this.releaseRetainedInput();
     this.controller = this.createController(sessionId);
     this.logicalRunStop = undefined;
     this.invalidateSessionState();

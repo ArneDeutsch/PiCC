@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { deferred, waitUntil } from "./helpers/async.js";
+import { deferred, settlement, waitUntil } from "./helpers/async.js";
 import { fakePi } from "./helpers/fake-pi.js";
 import { fakeSdk } from "./helpers/fake-sdk.js";
 
@@ -111,6 +111,45 @@ describe("async test readiness helpers", () => {
 
     event.reject(sentinel);
     await expect(waiting).rejects.toBe(sentinel);
+  });
+
+  it("settlement accepts either terminal arm and never mislabels a rejection", async () => {
+    const resolving = deferred<number>();
+    const resolvingSettled = settlement(resolving.promise, { description: "resolved work" });
+    resolving.resolve(7);
+    await resolvingSettled;
+    await expect(resolving.promise).resolves.toBe(7);
+
+    // The reason single-arming is wrong: this ending is terminal, not a predicate failure.
+    const sentinel = new Error("terminal rejection");
+    const rejecting = deferred<number>();
+    const rejectingSettled = settlement(rejecting.promise, { description: "rejected work" });
+    rejecting.reject(sentinel);
+    await rejectingSettled;
+    await expect(rejecting.promise).rejects.toBe(sentinel);
+  });
+
+  it("settlement reports a promise that never settles at its safety ceiling", async () => {
+    const parked = deferred<void>();
+    const waiting = settlement(parked.promise, { description: "parked work", timeoutMs: 25 });
+    const rejection = expect(waiting).rejects.toThrow(
+      "Timed out after 25ms waiting for parked work; observed: promise still pending",
+    );
+
+    await vi.advanceTimersByTimeAsync(25);
+    await rejection;
+    parked.resolve();
+
+    const described = deferred<void>();
+    const describing = settlement(described.promise, {
+      description: "described work", describeObserved: () => "write callback captured", timeoutMs: 25,
+    });
+    const describedRejection = expect(describing).rejects.toThrow(
+      "Timed out after 25ms waiting for described work; observed: write callback captured",
+    );
+    await vi.advanceTimersByTimeAsync(25);
+    await describedRejection;
+    described.resolve();
   });
 
   it("FakeSdkHandle observes prompt entry before a scripted gate", async () => {

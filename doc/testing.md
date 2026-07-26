@@ -228,7 +228,7 @@ fixed interval or require work to finish within a narrow elapsed-time threshold.
 under `test/` import the shared synchronization and process helpers with:
 
 ```ts
-import { deferred, waitUntil } from "./helpers/async.js";
+import { deferred, settlement, waitUntil } from "./helpers/async.js";
 import { createHookProcessFixture } from "./helpers/hook-process.js";
 ```
 
@@ -238,6 +238,10 @@ The shared helpers have these contracts:
 - `waitUntil(options: WaitUntilOptions): Promise<void>` observes a predicate and rejects with the
   described state at its safety ceiling (`options.timeoutMs`, default 10s). Configure that ceiling
   here rather than adding a second timer around the caller.
+- `settlement(promise, options: SettlementOptions): Promise<void>` waits for `promise` to reach a
+  terminal state, arming both arms so a rejection is a satisfied wait rather than a predicate error.
+  It says nothing about *which* ending occurred, so always follow it with an outcome assertion
+  (`await expect(promise).resolves…` / `.rejects…`).
 - `FakeSdkHandle.waitForPromptCalls(count: number): Promise<void>` settles when that many prompts
   have entered **and their user messages have been recorded**.
 - `FakePi.waitForTools(names: readonly string[]): Promise<void>` settles when the named tools are

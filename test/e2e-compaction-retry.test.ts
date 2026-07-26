@@ -236,9 +236,12 @@ describe.skipIf(cliMissing)("e2e compaction retries through the real Pi stack", 
       ],
     });
 
-    // Pi's JSON mode owns its successful process status; the PiCC lifecycle
-    // and recovery guidance below prove the paused checkpoint outcome.
-    expect(result.code, result.stderr).toBe(0);
+    // A non-interactive caller has to tell "finished" from "gave up" without reading
+    // prose, and a partial answer on stdout with status 0 is what a CI wrapper consumes
+    // as success. Outside the TUI, a checkpoint that ends paused sets status 3 —
+    // deliberately not 0, and not the 1 Pi's own print-mode failures use. The finished
+    // side of the same contract is the status 0 asserted by the recovering scenario above.
+    expect(result.code, result.stderr).toBe(3);
     expect(result.requests.map((request) => request.requestKind)).toEqual([
       "ordinary", "compaction", "compaction",
     ]);
