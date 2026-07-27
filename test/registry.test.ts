@@ -241,6 +241,43 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expectDisclosure(contract);
   });
 
+  it("keeps summary recovery scoped and separate from proactive admission", () => {
+    expectDisclosure({
+      id: "feature.compaction-summary-recovery",
+      tier: "partial",
+      core: [
+        /Default provider-backed/,
+        /automatic/,
+        /manual/,
+        /split-turn/,
+        /branch Codex summaries/,
+        /shared summarization seam/,
+        /summary-only SSE/,
+        /provider maxRetries: 0/,
+        /configured bounded summarization loop/,
+        /sole owner/,
+        /transient transport\/provider-overload classification/,
+        /attempts/,
+        /abortable exponential backoff/,
+        /retry lifecycle events/,
+      ],
+      gap: [/cancellation and deterministic failures stop category-appropriately/],
+      precedence: [/Ordinary PiCC Agent turns/, /non-Codex summaries/, /retain their configured transport and provider retry behavior/],
+      visibility: [
+        /COMPATIBILITY BOUNDARY/,
+        /public request fields cannot prove provenance/,
+        /exact-signature custom caller/,
+        /until Pi exposes a purpose marker/,
+      ],
+      parity: [/PiCC reliability hardening/, /NOT Claude Code transport\/retry parity/],
+    });
+    const proactive = lookupCapability("feature.proactive-compaction-policy")?.note ?? "";
+    expect(proactive).toContain("feature.compaction-summary-recovery");
+    expect(proactive).not.toMatch(
+      /automatic, manual|split-turn|branch Codex|shared summarization seam|summary-only SSE|force(?:s|d)? SSE|provider(?:-internal)? (?:maxRetries|retr(?:y|ies))|configured (?:bounded )?summarization loop|sole (?:retry )?owner|transport\/provider-overload|abortable exponential backoff|retry lifecycle events|public request fields|prove provenance|exact-signature|purpose marker/,
+    );
+  });
+
   it("carries explicit deferred entries for the non-stdio MCP surfaces", () => {
     for (const id of [
       "feature.mcp-remote-transports",

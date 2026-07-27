@@ -1,10 +1,15 @@
+import { randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { createRequire } from "node:module";
-import { stream as streamCodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
+import {
+  closeOpenAICodexWebSocketSessions,
+  resetOpenAICodexWebSocketDebugStats,
+  stream as streamCodexResponses,
+} from "@earendil-works/pi-ai/api/openai-codex-responses";
 import {
   createAssistantMessageEventStream,
   type AssistantMessage,
@@ -14,6 +19,7 @@ import {
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import {
+  generateBranchSummary,
   generateSummary,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -1051,6 +1057,355 @@ describe("pi 0.82.0 API contract", () => {
     }
     expect(failed, `Pi type contract broken:\n${output}`).toBe(false);
   }, 30_000);
+});
+
+describe("Codex standalone-summary transport contract", () => {
+  const summaryPrompt = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+  const apiKey = `x.${Buffer.from(JSON.stringify({
+    "https://api.openai.com/auth": { chatgpt_account_id: "summary-contract" },
+  })).toString("base64url")}.x`;
+  const model: Model<"openai-codex-responses"> = {
+    id: "gpt-summary-contract", name: "GPT Summary Contract", api: "openai-codex-responses", provider: "openai-codex",
+    baseUrl: "https://example.invalid", reasoning: false, input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 4_096,
+  };
+  const userMessage = (text: string, timestamp = 1) => ({
+    role: "user" as const,
+    content: [{ type: "text" as const, text }],
+    timestamp,
+  });
+  const summaryContext = (overrides: Partial<Context> = {}): Context => ({
+    systemPrompt: summaryPrompt,
+    messages: [userMessage("opaque summary input")],
+    ...overrides,
+  });
+  const freshUuidV7 = () => {
+    const bytes = randomBytes(16);
+    let timestamp = BigInt(Date.now());
+    for (let index = 5; index >= 0; index -= 1) {
+      bytes[index] = Number(timestamp & 0xffn);
+      timestamp >>= 8n;
+    }
+    bytes[6] = (bytes[6]! & 0x0f) | 0x70;
+    bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+    const hex = bytes.toString("hex");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  };
+  const summaryOptions = (overrides: Record<string, unknown> = {}) => ({
+    apiKey,
+    cacheRetention: "none" as const,
+    sessionId: freshUuidV7(),
+    transport: "websocket-cached" as const,
+    maxRetries: 4,
+    ...overrides,
+  });
+  const completedSse = (text = "summary ok") => {
+    const output = [{
+      type: "message", id: "msg-summary", role: "assistant", status: "completed",
+      content: [{ type: "output_text", text, annotations: [] }],
+    }];
+    return [
+      { type: "response.created", response: { id: "response-summary", status: "in_progress", output: [] } },
+      { type: "response.output_item.added", output_index: 0, item: { ...output[0], status: "in_progress" } },
+      { type: "response.output_item.done", output_index: 0, item: output[0] },
+      { type: "response.completed", response: {
+        id: "response-summary", status: "completed", output,
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      } },
+    ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n";
+  };
+  const okResponse = (text = "summary ok") => new Response(completedSse(text), {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
+  const truncatedSseResponse = () => new Response([
+    { type: "response.created", response: { id: "response-truncated", status: "in_progress", output: [] } },
+    { type: "response.output_item.added", output_index: 0, item: {
+      type: "message", id: "msg-truncated", role: "assistant", status: "in_progress", content: [],
+    } },
+  ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
+  const overloadResponse = () => new Response("temporarily overloaded", {
+    status: 429,
+    headers: { "content-type": "text/plain", "retry-after": "0" },
+  });
+  const quotaResponse = () => new Response("insufficient_quota billing quota exceeded", {
+    status: 429,
+    headers: { "content-type": "text/plain", "retry-after": "0" },
+  });
+  const deterministicResponse = () => new Response("invalid request shape", {
+    status: 400,
+    headers: { "content-type": "text/plain" },
+  });
+  type ResponseFactory = () => Response;
+  async function withCodexWire<T>(responses: ResponseFactory[], run: (wire: {
+    fetches: Array<{ input: unknown; init?: RequestInit }>;
+    sockets: { count: number };
+  }) => Promise<T>): Promise<T> {
+    const originalFetch = globalThis.fetch;
+    const originalWebSocket = globalThis.WebSocket;
+    const fetches: Array<{ input: unknown; init?: RequestInit }> = [];
+    const sockets = { count: 0 };
+    globalThis.fetch = (async (input, init) => {
+      fetches.push({ input, init });
+      const response = responses.shift();
+      if (!response) throw new Error("Codex response script exhausted");
+      return response();
+    }) as typeof fetch;
+    globalThis.WebSocket = class {
+      constructor() {
+        sockets.count += 1;
+        throw new Error("deterministic WebSocket probe");
+      }
+    } as never;
+    try {
+      return await run({ fetches, sockets });
+    } finally {
+      try {
+        closeOpenAICodexWebSocketSessions();
+      } finally {
+        try {
+          resetOpenAICodexWebSocketDebugStats();
+        } finally {
+          globalThis.fetch = originalFetch;
+          globalThis.WebSocket = originalWebSocket;
+        }
+      }
+    }
+  }
+  async function resultWithProviderTimers(stream: ReturnType<typeof codexAbortGuardStreamSimple>) {
+    vi.useFakeTimers();
+    try {
+      const result = stream.result();
+      await vi.runAllTimersAsync();
+      return await result;
+    } finally {
+      try {
+        await vi.runAllTimersAsync();
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  }
+  const runGeneratedSummary = (
+    retry: { enabled: boolean; maxRetries: number; baseDelayMs: number },
+    callbacks?: RetryCallbacks,
+  ) => generateSummary(
+    [userMessage("public generateSummary input")], model, 1_000, apiKey, undefined, undefined,
+    undefined, undefined, undefined, codexAbortGuardStreamSimple as never, undefined, retry, callbacks,
+  );
+
+  it("routes public compaction and branch summary producers through forced SSE without provider retries", async () => {
+    await withCodexWire([() => okResponse("history summary"), () => okResponse("branch summary")], async (wire) => {
+      await expect(runGeneratedSummary({ enabled: true, maxRetries: 0, baseDelayMs: 0 }))
+        .resolves.toBe("history summary");
+      const branch = await generateBranchSummary([{
+        type: "message", id: "entry-1", parentId: null, timestamp: new Date(0).toISOString(),
+        message: userMessage("public generateBranchSummary input"),
+      }], {
+        model,
+        apiKey,
+        signal: new AbortController().signal,
+        streamFn: codexAbortGuardStreamSimple as never,
+        retry: { enabled: true, maxRetries: 0, baseDelayMs: 0 },
+      });
+      expect(branch.summary).toContain("branch summary");
+      expect(wire.fetches).toHaveLength(2);
+      expect(wire.sockets.count).toBe(0);
+    });
+  });
+
+  it("leaves overload recovery to Pi's one outer summary retry loop", async () => {
+    await withCodexWire([overloadResponse, () => okResponse("recovered")], async (wire) => {
+      const scheduled: number[] = [];
+      const started: number[] = [];
+      const finished: Array<[boolean, number, string?]> = [];
+      await expect(runGeneratedSummary(
+        { enabled: true, maxRetries: 1, baseDelayMs: 0 },
+        {
+          onRetryScheduled: (attempt) => { scheduled.push(attempt); },
+          onRetryAttemptStart: () => { started.push(scheduled.length); },
+          onRetryFinished: (...event) => { finished.push(event); },
+        },
+      )).resolves.toBe("recovered");
+      expect(wire.fetches).toHaveLength(2);
+      expect(wire.sockets.count).toBe(0);
+      expect(scheduled).toEqual([1]);
+      expect(started).toEqual([1]);
+      expect(finished).toEqual([[true, 1]]);
+    });
+  });
+
+  it("recovers a truncated Codex SSE stream through exactly one public-summary retry lifecycle", async () => {
+    await withCodexWire([truncatedSseResponse, () => okResponse("recovered after truncation")], async (wire) => {
+      const scheduled: number[] = [];
+      const started: number[] = [];
+      const finished: Array<[boolean, number, string?]> = [];
+      await expect(runGeneratedSummary(
+        { enabled: true, maxRetries: 1, baseDelayMs: 0 },
+        {
+          onRetryScheduled: (attempt) => { scheduled.push(attempt); },
+          onRetryAttemptStart: () => { started.push(scheduled.length); },
+          onRetryFinished: (...event) => { finished.push(event); },
+        },
+      )).resolves.toBe("recovered after truncation");
+      expect(wire.fetches).toHaveLength(2);
+      expect(wire.sockets.count).toBe(0);
+      expect(scheduled).toEqual([1]);
+      expect(started).toEqual([1]);
+      expect(finished).toEqual([[true, 1]]);
+    });
+  });
+
+  it("exhausts overloads at the outer budget while quota and deterministic failures fail fast", async () => {
+    await withCodexWire([overloadResponse, overloadResponse, overloadResponse], async (wire) => {
+      const scheduled: number[] = [];
+      await expect(runGeneratedSummary(
+        { enabled: true, maxRetries: 2, baseDelayMs: 0 },
+        { onRetryScheduled: (attempt) => { scheduled.push(attempt); } },
+      )).rejects.toThrow(/Summarization failed:.*overloaded/i);
+      expect(wire.fetches).toHaveLength(3);
+      expect(wire.sockets.count).toBe(0);
+      expect(scheduled).toEqual([1, 2]);
+    });
+    for (const response of [quotaResponse, deterministicResponse]) {
+      await withCodexWire([response], async (wire) => {
+        const scheduled: number[] = [];
+        await expect(runGeneratedSummary(
+          { enabled: true, maxRetries: 2, baseDelayMs: 0 },
+          { onRetryScheduled: (attempt) => { scheduled.push(attempt); } },
+        )).rejects.toThrow(/Summarization failed/);
+        expect(wire.fetches).toHaveLength(1);
+        expect(scheduled).toEqual([]);
+      });
+    }
+  });
+
+  it("delegates the original summary UUID and unrelated scalar while overriding only transport and retries", async () => {
+    const delegated = vi.fn(() => createAssistantMessageEventStream());
+    vi.resetModules();
+    vi.doMock("@earendil-works/pi-ai/compat", () => ({
+      openAICodexResponsesApi: () => ({ streamSimple: delegated }),
+    }));
+    try {
+      const isolated = await import("../src/runtime/codex-abort-guard.js");
+      const context = summaryContext({ tools: [] });
+      const sessionId = freshUuidV7();
+      const options = summaryOptions({ sessionId, temperature: 0.37 });
+      isolated.codexAbortGuardStreamSimple(model, context, options);
+
+      expect(delegated).toHaveBeenCalledOnce();
+      expect(delegated).toHaveBeenCalledWith(model, context, {
+        ...options,
+        sessionId,
+        temperature: 0.37,
+        transport: "sse",
+        maxRetries: 0,
+      });
+    } finally {
+      vi.doUnmock("@earendil-works/pi-ai/compat");
+      vi.resetModules();
+    }
+  });
+
+  it("forces an exact-signature custom summary to one SSE provider attempt and preserves unrelated callbacks", async () => {
+    await withCodexWire([overloadResponse], async (wire) => {
+      const abort = new AbortController();
+      const payloads: unknown[] = [];
+      const responses: number[] = [];
+      const stream = codexAbortGuardStreamSimple(model, summaryContext({ tools: [] }), summaryOptions({
+        signal: abort.signal,
+        headers: { "x-summary-contract": "preserved" },
+        onPayload: (payload: unknown) => { payloads.push(payload); },
+        onResponse: (response: { status: number }) => { responses.push(response.status); },
+      }));
+      const result = await stream.result();
+      expect(result.stopReason).toBe("error");
+      expect(wire.fetches).toHaveLength(1);
+      expect(wire.sockets.count).toBe(0);
+      expect(payloads).toHaveLength(1);
+      expect(responses).toEqual([429]);
+      expect(new Headers(wire.fetches[0]!.init?.headers).get("x-summary-contract")).toBe("preserved");
+      expect(wire.fetches[0]!.init?.signal?.aborted).toBe(false);
+    });
+  });
+
+  it.each([
+    ["cache retention", { options: { cacheRetention: "short" } }],
+    ["UUIDv7 session shape", { options: { sessionId: "018f22e2-7c9b-4cc1-8c2a-123456789abc" } }],
+    ["fixed system prompt", { context: { systemPrompt: `${summaryPrompt} changed` } }],
+    ["tool absence", { context: { tools: [{ name: "probe", description: "probe", parameters: {} as never }] } }],
+    ["one user-role message", { context: { messages: [userMessage("one"), userMessage("two", 2)] } }],
+  ] as const)("treats a call with mutated %s as ordinary and preserves its provider retry budget", async (_name, mutation) => {
+    await withCodexWire([overloadResponse, () => okResponse()], async (wire) => {
+      const context = summaryContext("context" in mutation ? mutation.context as Partial<Context> : {});
+      const options = summaryOptions("options" in mutation ? mutation.options : {});
+      const result = await resultWithProviderTimers(
+        codexAbortGuardStreamSimple(model, context, { ...options, transport: "sse", maxRetries: 1 }),
+      );
+      expect(result.stopReason).toBe("stop");
+      expect(wire.fetches).toHaveLength(2);
+      expect(wire.sockets.count).toBe(0);
+    });
+  });
+
+  it.each([
+    ["omitted", undefined, 1, 1],
+    ["automatic", "auto", 1, 1],
+    ["WebSocket-cached", "websocket-cached", 1, 1],
+    ["SSE", "sse", 0, 1],
+  ] as const)("preserves ordinary %s transport selection", async (_name, transport, expectedSockets, expectedFetches) => {
+    await withCodexWire([() => okResponse()], async (wire) => {
+      const options = {
+        apiKey,
+        sessionId: `ordinary-${_name}`,
+        maxRetries: 0,
+        ...(transport === undefined ? {} : { transport }),
+      };
+      await codexAbortGuardStreamSimple(model, { systemPrompt: "ordinary", messages: [] }, options).result();
+      expect(wire.sockets.count).toBe(expectedSockets);
+      expect(wire.fetches).toHaveLength(expectedFetches);
+    });
+  });
+
+  it("preserves omitted and explicit nonzero provider retry budgets on ordinary SSE calls", async () => {
+    await withCodexWire([overloadResponse], async (wire) => {
+      const result = await codexAbortGuardStreamSimple(model, { systemPrompt: "ordinary", messages: [] }, {
+        apiKey, transport: "sse", cacheRetention: "none", sessionId: "ordinary-retries-omitted",
+      }).result();
+      expect(result.stopReason).toBe("error");
+      expect(wire.fetches).toHaveLength(1);
+    });
+    await withCodexWire([overloadResponse, () => okResponse()], async (wire) => {
+      const result = await resultWithProviderTimers(
+        codexAbortGuardStreamSimple(model, { systemPrompt: "ordinary", messages: [] }, {
+          apiKey, transport: "sse", maxRetries: 1, cacheRetention: "none",
+          sessionId: "ordinary-cache-none-is-insufficient",
+        }),
+      );
+      expect(result.stopReason).toBe("stop");
+      expect(wire.fetches).toHaveLength(2);
+      expect(wire.sockets.count).toBe(0);
+    });
+  });
+
+  it("pre-aborted ordinary and summary calls perform no network work while summaries keep the collision policy", async () => {
+    await withCodexWire([], async (wire) => {
+      for (const [context, options] of [
+        [{ systemPrompt: "ordinary", messages: [] }, { apiKey, sessionId: "aborted-ordinary", maxRetries: 3 }],
+        [summaryContext(), summaryOptions()],
+      ]) {
+        const abort = new AbortController();
+        abort.abort();
+        const result = await codexAbortGuardStreamSimple(model, context as Context, { ...options, signal: abort.signal }).result();
+        expect(result.stopReason).toBe("aborted");
+      }
+      expect(wire.fetches).toHaveLength(0);
+      expect(wire.sockets.count).toBe(0);
+    });
+  });
 });
 
 describe("real Pi compact-search composition", () => {

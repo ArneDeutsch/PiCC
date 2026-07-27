@@ -392,8 +392,9 @@ tracked project files):
   cycle. The complete requested tool batch finishes first. Once the threshold is reached,
   PiCC pauses ordinary model requests, starts one Pi compaction transaction, and resumes the same
   logical work; completed results and queued input remain pending. Pi can automatically recover an
-  eligible transient summary transport failure inside that transaction. Main sessions use your Pi
-  retry configuration; PiCC-created subagents use Pi's in-memory defaults. Cancelling a main
+  eligible transient summary transport failure inside that transaction. Summary retries stay
+  bounded by Pi's configured summarization retry policy; PiCC-created subagents use Pi's in-memory
+  defaults. Cancelling a main
   checkpoint stops PiCC continuation but may wait for Pi's configured summary retries to settle;
   cancelling a subagent checkpoint aborts its compaction. Quota, authentication, cancellation,
   deterministic provider errors, and PreCompact policy blocks are not made broadly retryable. If
