@@ -1,7 +1,9 @@
+import { createRequire } from "node:module";
 import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   getKeybindings,
   KeybindingsManager,
@@ -13,6 +15,9 @@ import { withRoutineToolRendering } from "../src/runtime/routine-tool-render.js"
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 import { waitUntil } from "./helpers/async.js";
 
+const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+const piTui = await import(pathToFileURL(requireFromPi.resolve("@earendil-works/pi-tui")).href) as typeof import("@earendil-works/pi-tui");
+
 function stripAnsi(value: string): string {
   return value
     .replace(/\u001b\].*?(?:\u0007|\u001b\\)/gu, "")
@@ -23,22 +28,29 @@ function glyphs(value: string): string[] {
   return stripAnsi(value).match(/[○●✗■]/gu) ?? [];
 }
 
-function withBinding<T>(keys: string[], run: () => T): T {
-  const previous = getKeybindings();
-  setKeybindings(new KeybindingsManager({
+function installBinding(keys: string[]): () => void {
+  const previousRoot = getKeybindings();
+  const previousPi = piTui.getKeybindings();
+  const definitions = {
     ...TUI_KEYBINDINGS,
-    "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
-  }, { "app.tools.expand": keys as never }));
-  try { return run(); } finally { setKeybindings(previous); }
+    "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
+  };
+  setKeybindings(new KeybindingsManager(definitions, { "app.tools.expand": ["root-only"] as never }));
+  piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": keys as never }));
+  return () => {
+    piTui.setKeybindings(previousPi);
+    setKeybindings(previousRoot);
+  };
+}
+
+function withBinding<T>(keys: string[], run: () => T): T {
+  const restore = installBinding(keys);
+  try { return run(); } finally { restore(); }
 }
 
 async function withBindingAsync<T>(keys: string[], run: () => Promise<T>): Promise<T> {
-  const previous = getKeybindings();
-  setKeybindings(new KeybindingsManager({
-    ...TUI_KEYBINDINGS,
-    "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
-  }, { "app.tools.expand": keys as never }));
-  try { return await run(); } finally { setKeybindings(previous); }
+  const restore = installBinding(keys);
+  try { return await run(); } finally { restore(); }
 }
 
 describe("real Pi default-collapse contracts", () => {
@@ -68,7 +80,7 @@ describe("real Pi default-collapse contracts", () => {
       row.setExpanded(false);
       row.updateResult({ content: [{ type: "text", text: "first\nsecond" }], details: undefined }, false);
       const collapsed = (row.render(80) as string[]).map(stripAnsi).join("\n");
-      expect(collapsed).toContain("read contract.txt · 2 lines hidden · ctrl+k to expand");
+      expect(collapsed).toContain("read contract.txt");
       expect(collapsed).not.toContain("first");
       expect(glyphs(collapsed)).toEqual(["●"]);
       row.setExpanded(true);
@@ -80,6 +92,56 @@ describe("real Pi default-collapse contracts", () => {
       const recollapsed = (row.render(80) as string[]).map(stripAnsi).join("\n");
       expect(recollapsed).not.toContain("first");
       expect(glyphs(recollapsed)).toEqual(["●"]);
+    });
+  });
+
+  it("renders incremental Read/Bash arguments and honors mismatched expansion fields", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    withBinding(["ctrl+o"], () => {
+      for (const [name, partialArgs, finalArgs, expected] of [
+        ["read", { path: "part" }, { path: "partial.txt" }, "read partial.txt"],
+        ["bash", { command: "echo par" }, { command: "echo partial" }, "bash $ echo partial"],
+      ] as const) {
+        const native = name === "read"
+          ? sdk.createReadToolDefinition(process.cwd())
+          : sdk.createBashToolDefinition(process.cwd());
+        const decorated = wrapForSelfShell(withDefaultCollapsedToolRendering(native));
+        const row = new sdk.ToolExecutionComponent(name, `${name}-incremental`, {}, {}, decorated,
+          { requestRender() {} }, process.cwd().replace(/\\/g, "/"));
+        expect((row.render(100) as string[]).map(stripAnsi).join("\n")).toContain(`${name}${name === "bash" ? " $" : ""} ...`);
+        row.updateArgs(partialArgs);
+        expect((row.render(100) as string[]).map(stripAnsi).join("\n")).not.toContain("undefined");
+        row.updateArgs(finalArgs);
+        row.setArgsComplete();
+        row.markExecutionStarted();
+        row.updateResult({ content: [{ type: "text", text: "retained" }], details: undefined }, false);
+        expect((row.render(100) as string[]).map(stripAnsi).join("\n")).toContain(expected);
+
+        const definition = decorated as any;
+        for (const [optionExpanded, contextExpanded] of [[true, false], [false, true]] as const) {
+          const context = { args: finalArgs, state: {}, isPartial: false, isError: false, expanded: contextExpanded,
+            argsComplete: true, executionStarted: true, cwd: process.cwd(), showImages: false, invalidate() {} };
+          const realTheme = { fg: (_slot: string, text: string) => text, bold: (text: string) => text,
+            bg: (_slot: string, text: string) => text };
+          const call = definition.renderCall(finalArgs, realTheme, context);
+          const callIdentity = call;
+          const detail = definition.renderResult({ content: [{ type: "text", text: "MISMATCH VISIBLE" }], details: undefined },
+            { expanded: optionExpanded, isPartial: false }, realTheme, context);
+          const composed = [...call.render(100), ...detail.render(100)].map(stripAnsi).join("\n");
+          expect(call).toBe(callIdentity);
+          expect(composed.match(/MISMATCH VISIBLE/gu)).toHaveLength(1);
+          expect(composed).toContain(name === "read" ? "partial.txt" : "echo partial");
+          const collapsedContext = { ...context, expanded: false };
+          definition.renderCall(finalArgs, realTheme, collapsedContext);
+          const collapsedDetail = definition.renderResult(
+            { content: [{ type: "text", text: "MISMATCH VISIBLE" }], details: undefined },
+            { expanded: false, isPartial: false }, realTheme, collapsedContext,
+          );
+          expect([...call.render(100), ...collapsedDetail.render(100)].map(stripAnsi).join("\n"))
+            .not.toContain("MISMATCH VISIBLE");
+        }
+      }
     });
   });
 
@@ -233,14 +295,14 @@ describe("real Pi default-collapse contracts", () => {
         expect(glyphs(pending)).toEqual(["○"]);
         row.updateResult({ content: [{ type: "text", text: "rolling-output" }], details: undefined }, true);
         const partial = (row.render(100) as string[]).map(stripAnsi).join("\n");
-        expect(partial).toContain("rolling-output");
-        expect(partial.split("\n").find((line) => line.includes("rolling-output"))).toMatch(/^  /u);
+        expect(partial).not.toContain("rolling-output");
+        expect(partial).toContain("bash $ TOKEN=command-secret printf command-output");
         expect(glyphs(partial)).toEqual(["○"]);
         expect(vi.getTimerCount()).toBe(1);
         vi.setSystemTime(11_250);
         row.updateResult({ content: [{ type: "text", text: "output-secret" }], details: undefined }, false);
         const collapsed = (row.render(100) as string[]).map(stripAnsi).join("\n");
-        expect(collapsed).toContain("bash TOKEN=command-secret printf command-output · 1 output line hidden · 1.3s · ctrl+o to expand");
+        expect(collapsed).toContain("bash $ TOKEN=command-secret printf command-output");
         expect(collapsed).toContain("command-secret");
         expect(collapsed).not.toContain("output-secret");
         expect(glyphs(collapsed)).toEqual(["●"]);
@@ -253,6 +315,141 @@ describe("real Pi default-collapse contracts", () => {
         row.setExpanded(false);
         expect(glyphs((row.render(100) as string[]).join("\n"))).toEqual(["●"]);
       } finally { vi.useRealTimers(); }
+    });
+  });
+
+  it("drives Read and Bash through real Pi slot identity and transient renderer recovery", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    withBinding(["ctrl+o"], () => {
+      for (const name of ["read", "bash"] as const) {
+        let callThrows = false;
+        let resultThrows = false;
+        const callContexts: any[] = [];
+        const resultContexts: any[] = [];
+        const native = {
+          name, execute() {},
+          renderCall(args: any, _theme: unknown, context: any) {
+            callContexts.push(context);
+            if (callThrows) throw new Error("call failed");
+            return { render: () => [`native ${name} ${args.path ?? args.command ?? "..."}`] };
+          },
+          renderResult(result: any, _options: unknown, _theme: unknown, context: any) {
+            resultContexts.push(context);
+            if (resultThrows) throw new Error("result failed");
+            return { render: () => [`native body ${result.content?.[0]?.text ?? ""}`] };
+          },
+        };
+        const args = name === "read" ? { path: "matrix.txt" } : { command: "printf matrix" };
+        const row = new sdk.ToolExecutionComponent(name, "reused-matrix-id", args, {},
+          wrapForSelfShell(withDefaultCollapsedToolRendering(native as any)),
+          { requestRender() {} }, process.cwd().replace(/\\/g, "/"));
+        row.setArgsComplete();
+        const pending = (row.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(glyphs(pending)).toEqual(["○"]);
+        expect(pending.split("\n").filter(Boolean)).toHaveLength(1);
+        row.setExpanded(true);
+        const expandedPending = (row.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(expandedPending).toContain(`native ${name}`);
+        row.markExecutionStarted();
+        row.updateResult({ content: [{ type: "text", text: "streaming" }], details: undefined }, true);
+        const streaming = (row.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(streaming.match(/streaming/gu)).toHaveLength(1);
+        expect(glyphs(streaming)).toEqual(["○"]);
+        expect(callContexts.at(-1).state).toBe(resultContexts.at(-1).state);
+        expect(callContexts.at(-1).lastComponent).not.toBe(resultContexts.at(-1).lastComponent);
+
+        callThrows = true;
+        resultThrows = true;
+        row.updateResult({ content: [{ type: "text", text: "failure evidence" }], details: undefined }, false);
+        const failed = (row.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(failed).toContain(name === "read" ? "read ..." : "bash $ ...");
+        expect(failed).toContain("failure evidence");
+        callThrows = false;
+        resultThrows = false;
+        row.setExpanded(true);
+        const recovered = (row.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(recovered).toContain(`native ${name}`);
+        expect(recovered).toContain("failure evidence");
+        expect(callContexts.at(-1).lastComponent).toBeUndefined();
+        expect(resultContexts.at(-1).lastComponent).toBeUndefined();
+        row.setExpanded(false);
+        row.updateResult({ content: [{ type: "text", text: "ordinary history" }], details: undefined }, false);
+        const recollapsed = (row.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(recollapsed).not.toContain("ordinary history");
+        expect(glyphs(recollapsed)).toEqual(["●"]);
+      }
+    });
+  });
+
+  it("isolates four fresh real-Pi rows with reused IDs across pending, history, expansion, and errors", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    withBinding(["ctrl+o"], () => {
+      const callRecords = new Map<string, Array<{ last: unknown; returned: unknown }>>();
+      const instrument = (native: any) => ({
+        ...native,
+        renderCall(args: any, theme: unknown, context: any) {
+          const returned = native.renderCall(args, theme, context);
+          const key = args.path ?? args.command ?? "...";
+          const records = callRecords.get(key) ?? [];
+          records.push({ last: context.lastComponent, returned });
+          callRecords.set(key, records);
+          return returned;
+        },
+      });
+      const read = wrapForSelfShell(withDefaultCollapsedToolRendering(instrument(sdk.createReadToolDefinition(process.cwd()))));
+      const bash = wrapForSelfShell(withDefaultCollapsedToolRendering(instrument(sdk.createBashToolDefinition(process.cwd()))));
+      const make = (name: "read" | "bash", args: any) => new sdk.ToolExecutionComponent(
+        name, "deliberately-reused-id", args, {}, name === "read" ? read : bash,
+        { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+      );
+      const rows = [
+        { row: make("read", { path: "read-a.txt" }), key: "read-a.txt", body: "READ_A" },
+        { row: make("read", { path: "read-b.txt" }), key: "read-b.txt", body: "READ_B" },
+        { row: make("bash", { command: "printf bash-a", timeout: 1 }), key: "printf bash-a", body: "BASH_A" },
+        { row: make("bash", { command: "printf bash-b", timeout: 9 }), key: "printf bash-b", body: "BASH_B" },
+      ];
+      for (const entry of rows) {
+        entry.row.setArgsComplete();
+        expect(glyphs((entry.row.render(100) as string[]).join("\n"))).toEqual(["○"]);
+      }
+      for (const entry of [rows[0]!, rows[2]!]) {
+        entry.row.setExpanded(true);
+        entry.row.render(100);
+        const firstNative = callRecords.get(entry.key)?.at(-1)?.returned;
+        entry.row.markExecutionStarted();
+        entry.row.updateResult({ content: [{ type: "text", text: `${entry.body}_PARTIAL` }], details: undefined }, true);
+        const partial = (entry.row.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(partial).toContain(`${entry.body}_PARTIAL`);
+        expect(callRecords.get(entry.key)?.at(-1)?.last).toBe(firstNative);
+      }
+      for (const entry of rows) {
+        entry.row.setExpanded(false);
+        entry.row.markExecutionStarted();
+        entry.row.updateResult({ content: [{ type: "text", text: entry.body }], details: undefined }, false);
+        const collapsed = (entry.row.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(collapsed).toContain(entry.key);
+        expect(collapsed).not.toContain(entry.body);
+      }
+      rows[1]!.row.setExpanded(true);
+      const readB = (rows[1]!.row.render(100) as string[]).map(stripAnsi).join("\n");
+      expect(readB).toContain("READ_B");
+      expect(readB).not.toContain("READ_A");
+      rows[1]!.row.setExpanded(false);
+      expect((rows[1]!.row.render(100) as string[]).map(stripAnsi).join("\n")).not.toContain("READ_B");
+
+      for (const [name, args, status] of [
+        ["read", { path: "read-error.txt" }, "Read failed: isolated"],
+        ["bash", { command: "exit 7", timeout: 7 }, "Command exited with code 7"],
+      ] as const) {
+        const reconstructed = make(name, args);
+        reconstructed.updateResult({ content: [{ type: "text", text: status }], details: undefined, isError: true }, false);
+        const rendered = (reconstructed.render(100) as string[]).map(stripAnsi).join("\n");
+        expect(rendered).toContain(status);
+        expect(glyphs(rendered)).toEqual(["✗"]);
+        expect(rows.every((entry) => !rendered.includes(entry.body))).toBe(true);
+      }
     });
   });
 
@@ -337,6 +534,30 @@ describe("real Pi default-collapse contracts", () => {
       expect(errorText).toContain("read failed visibly");
       expect(glyphs(errorText)).toEqual(["✗"]);
 
+      for (const [text, command] of [
+        ["Command timed out after 1 seconds", "sleep 2"],
+        ["Command exited with code 7", "exit 7"],
+      ] as const) {
+        const bashFailure = new sdk.ToolExecutionComponent("bash", `bash-${command}`, { command, timeout: 1 }, {},
+          wrapForSelfShell(withDefaultCollapsedToolRendering(sdk.createBashToolDefinition(process.cwd()))),
+          { requestRender() {} }, process.cwd().replace(/\\/g, "/"));
+        bashFailure.updateResult({ content: [{ type: "text", text }], details: undefined, isError: true }, false);
+        const failureText = (bashFailure.render(80) as string[]).map(stripAnsi).join("\n");
+        expect(failureText).toContain(text);
+        expect(glyphs(failureText)).toEqual(["✗"]);
+      }
+
+      for (const [name, args] of [["read", { path: "stopped.txt" }], ["bash", { command: "sleep 9" }]] as const) {
+        const native = name === "read" ? sdk.createReadToolDefinition(process.cwd()) : sdk.createBashToolDefinition(process.cwd());
+        const stopped = new sdk.ToolExecutionComponent(name, `${name}-stopped`, args, {},
+          wrapForSelfShell(withDefaultCollapsedToolRendering(native)),
+          { requestRender() {} }, process.cwd().replace(/\\/g, "/"));
+        stopped.updateResult({ content: [{ type: "text", text: "Command aborted by user" }], details: undefined, isError: true }, false);
+        const stoppedText = (stopped.render(80) as string[]).map(stripAnsi).join("\n");
+        expect(stoppedText).toContain("aborted by user");
+        expect(glyphs(stoppedText)).toEqual(["■"]);
+      }
+
       const malformed = new sdk.ToolExecutionComponent(
         "read", "read-malformed", { path: 42 }, {},
         wrapForSelfShell(withDefaultCollapsedToolRendering(sdk.createReadToolDefinition(process.cwd()))),
@@ -344,9 +565,20 @@ describe("real Pi default-collapse contracts", () => {
       );
       malformed.updateResult({ content: [{ type: "text", text: "ignored" }], details: undefined }, false);
       const malformedText = (malformed.render(80) as string[]).map(stripAnsi).join("\n");
-      expect(malformedText).toContain("Unfamiliar arguments");
-      expect(malformedText.match(/Unfamiliar arguments/gu)?.length).toBeLessThanOrEqual(2);
-      expect(glyphs(malformedText)).toEqual(["●"]);
+      expect(malformedText).toContain("unfamiliar arguments");
+      expect(malformedText.match(/unfamiliar arguments/gu)).toHaveLength(1);
+      expect(glyphs(malformedText)).toEqual(["✗"]);
+
+      const malformedResult = new sdk.ToolExecutionComponent(
+        "read", "read-malformed-result", { path: "broken-envelope.txt" }, {},
+        wrapForSelfShell(withDefaultCollapsedToolRendering(sdk.createReadToolDefinition(process.cwd()))),
+        { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+      );
+      malformedResult.updateResult({ content: [{ type: "future", payload: "unknown" }], details: undefined }, false);
+      const malformedResultText = (malformedResult.render(80) as string[]).map(stripAnsi).join("\n");
+      expect(malformedResultText.match(/unfamiliar result/gu)).toHaveLength(1);
+      expect(malformedResultText.split("\n").filter(Boolean)).toHaveLength(1);
+      expect(glyphs(malformedResultText)).toEqual(["✗"]);
     });
   });
 

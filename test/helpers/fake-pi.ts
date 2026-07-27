@@ -47,6 +47,8 @@ export interface FakeCustomInvocation {
 export interface FakePi {
   api: Record<string, unknown>;
   tools: Map<string, any>;
+  /** Active names are separate from registered definitions, as in Pi's registry. */
+  activeTools: Set<string>;
   commands: Map<string, any>;
   handlers: Map<string, Array<(event: any, ctx: any) => unknown>>;
   messages: Array<{ message: any; options?: any }>;
@@ -121,6 +123,7 @@ export interface FakePi {
 
 export function fakePi(): FakePi {
   const tools = new Map<string, any>();
+  const activeTools = new Set<string>();
   const commands = new Map<string, any>();
   const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
   const messages: Array<{ message: any; options?: any }> = [];
@@ -312,6 +315,7 @@ export function fakePi(): FakePi {
 
   const self: FakePi = {
     tools,
+    activeTools,
     commands,
     handlers,
     messages,
@@ -346,6 +350,7 @@ export function fakePi(): FakePi {
     api: {
       registerTool: (t: any) => {
         tools.set(t.name, t);
+        activeTools.add(t.name);
         notifyToolWaiters();
       },
       registerCommand: (name: string, options: any) => commands.set(name, options),
@@ -368,9 +373,12 @@ export function fakePi(): FakePi {
       setThinkingLevel: (level: string) => thinkingLevels.push(level),
       exec: async () => ({ stdout: "", stderr: "", code: 0 }),
       events: { on: () => undefined, emit: () => undefined },
-      getActiveTools: () => [...tools.keys()],
+      getActiveTools: () => [...activeTools],
       getAllTools: () => [...tools.values()],
-      setActiveTools: () => undefined,
+      setActiveTools: (names: string[]) => {
+        activeTools.clear();
+        for (const name of names) activeTools.add(name);
+      },
     },
     async fire(event: string, evt: any = {}, ctx?: any) {
       let result: any;

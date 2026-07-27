@@ -127,6 +127,8 @@ describe("MCP main-session tool exposure (wired)", () => {
   let userDir: string;
   let fixture: McpProcessFixture;
   let pi: FakePi;
+  const checkpointWrapCounts = new Map<string, number>();
+  const checkpointOutputs = new Map<string, object>();
   const FIXTURE_TOOLS = ["mcp__fixture__echo", "mcp__fixture__report-env", "mcp__fixture__big-output"];
 
   beforeAll(async () => {
@@ -179,7 +181,21 @@ describe("MCP main-session tool exposure (wired)", () => {
     process.env.PICC_CLAUDE_USER_DIR = userDir;
     process.chdir(dir);
     pi = fakePi();
-    picc(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+    picc(pi.api as never, {
+      onInitializationSettled: pi.captureInitialization,
+      onWired: ({ mainCheckpointGate }) => {
+        const realWrap = mainCheckpointGate.wrapTool.bind(mainCheckpointGate);
+        mainCheckpointGate.wrapTool = ((definition: Record<string, unknown>) => {
+          const wrapped = realWrap(definition);
+          const name = String(definition.name);
+          if (name.startsWith("mcp__fixture__")) {
+            checkpointWrapCounts.set(name, (checkpointWrapCounts.get(name) ?? 0) + 1);
+            checkpointOutputs.set(name, wrapped);
+          }
+          return wrapped;
+        }) as typeof mainCheckpointGate.wrapTool;
+      },
+    });
     await pi.waitForInitialization();
     // Late registration lands after the non-blocking connect settles.
     await pi.waitForTools(FIXTURE_TOOLS);
@@ -201,6 +217,8 @@ describe("MCP main-session tool exposure (wired)", () => {
       // Zero-context hard invariant survives the whole decoration pipeline.
       expect(tool.promptSnippet).toBeUndefined();
       expect(tool.promptGuidelines).toBeUndefined();
+      expect(checkpointWrapCounts.get(name), name).toBe(1);
+      expect(tool, name).toBe(checkpointOutputs.get(name));
     }
     const echo = pi.tools.get("mcp__fixture__echo");
     expect(echo.description).toBe("echoes text back");

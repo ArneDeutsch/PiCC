@@ -3,7 +3,7 @@ import type { TSchema } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
-import { sanitize } from "./default-collapsed-tool-render.js";
+import { sanitizeDisplayText } from "./render-util.js";
 import type { McpRuntime } from "./mcp.js";
 
 /**
@@ -297,7 +297,7 @@ export function buildMcpProxyTools(runtime: McpToolSource): ToolDefinition[] {
           .filter((block) => block.type === "text")
           .map((block) => block.text ?? "")
           .join("\n");
-        const safe = sanitize(text, DISPLAY_TEXT_MAX_CHARS);
+        const safe = sanitizeDisplayText(text, DISPLAY_TEXT_MAX_CHARS);
         // An empty output renders nothing, exactly like the stock fallback.
         return safe.length === 0
           ? { render: () => [], invalidate: () => {} }

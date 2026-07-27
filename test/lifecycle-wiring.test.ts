@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import picc from "../src/index.js";
+import { renderMainSessionTool } from "../src/runtime/main-session-tool-render.js";
 import { WorktreeManager } from "../src/runtime/worktrees.js";
 import { deferred } from "./helpers/async.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
@@ -105,6 +106,322 @@ afterAll(() => {
 });
 
 describe("lifecycle wiring", () => {
+  it("uses one real outer checkpoint wrap for Claude and stock main-session definitions", async () => {
+    const wired = fakePi();
+    const wrapCounts = new Map<string, number>();
+    const actualGateOutputs = new WeakSet<object>();
+    picc(wired.api as never, {
+      onInitializationSettled: wired.captureInitialization,
+      onWired: ({ mainCheckpointGate }) => {
+        const realWrap = mainCheckpointGate.wrapTool.bind(mainCheckpointGate);
+        mainCheckpointGate.wrapTool = ((definition: Record<string, unknown>) => {
+          const name = String(definition.name);
+          wrapCounts.set(name, (wrapCounts.get(name) ?? 0) + 1);
+          const wrapped = realWrap(definition);
+          actualGateOutputs.add(wrapped);
+          return wrapped;
+        }) as typeof mainCheckpointGate.wrapTool;
+      },
+    });
+    await wired.waitForInitialization();
+
+    for (const name of ["Grep", "WebFetch", "bash", "read", "write", "edit", "grep", "find", "ls"]) {
+      expect(wrapCounts.get(name), name).toBe(1);
+      expect(actualGateOutputs.has(wired.tools.get(name)), name).toBe(true);
+      expect(wired.tools.get(name).renderShell, name).toBe("self");
+    }
+  });
+  it("holds ordinary input until all seven routed replacements are registered", async () => {
+    const sdkGate = deferred<any>();
+    const gated = fakePi();
+    picc(gated.api as never, {
+      loadBuiltinSdk: () => sdkGate.promise,
+      onInitializationSettled: gated.captureInitialization,
+    });
+
+    await expect(gated.fire("input", { text: "/mcp", source: "interactive" }))
+      .resolves.toEqual({ action: "handled" });
+
+    let settled = false;
+    const input = gated.fire("input", { text: "ordinary task", source: "interactive" })
+      .then((result) => {
+        for (const name of ["bash", "read", "write", "edit", "grep", "find", "ls"]) {
+          expect(gated.tools.has(name)).toBe(true);
+        }
+        settled = true;
+        return result;
+      });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    sdkGate.resolve(await import("@earendil-works/pi-coding-agent"));
+    await expect(input).resolves.toMatchObject({ action: expect.stringMatching(/continue|transform/) });
+    expect(settled).toBe(true);
+  });
+
+  it("prepares import, factory, actual presentation, and actual checkpoint phases before any core registration", async () => {
+    const realSdk: any = await import("@earendil-works/pi-coding-agent");
+    const scenarios = [
+      { label: "import", load: async () => { throw new Error("import fault"); } },
+      { label: "factory", load: async () => ({ ...realSdk, createBashTool: () => { throw new Error("factory fault"); } }) },
+      { label: "presentation", load: async () => realSdk, failPresentation: true },
+      { label: "checkpoint", load: async () => realSdk, failCheckpoint: true },
+    ];
+    for (const scenario of scenarios) {
+      const failed = fakePi();
+      let coreRegistrations = 0;
+      const register = failed.api.registerTool as (definition: any) => void;
+      failed.api.registerTool = (definition: any) => {
+        if (["bash", "read", "write", "edit", "grep", "find", "ls"].includes(definition.name)) coreRegistrations += 1;
+        register(definition);
+      };
+      picc(failed.api as never, {
+        loadBuiltinSdk: scenario.load,
+        onInitializationSettled: failed.captureInitialization,
+        ...(scenario.failPresentation ? {
+          renderMainSessionTool: ((definition, options) => {
+            if (definition.name === "bash") throw new Error("presentation fault");
+            return renderMainSessionTool(definition, options);
+          }) as typeof renderMainSessionTool,
+        } : {}),
+        onWired: ({ mainCheckpointGate }) => {
+          if (!scenario.failCheckpoint) return;
+          const realWrap = mainCheckpointGate.wrapTool.bind(mainCheckpointGate);
+          mainCheckpointGate.wrapTool = ((definition: Record<string, unknown>) => {
+            if (definition.name === "bash") throw new Error("checkpoint fault");
+            return realWrap(definition);
+          }) as typeof mainCheckpointGate.wrapTool;
+        },
+      });
+      await failed.waitForInitialization();
+      await expect(failed.fire("input", { text: `${scenario.label} task`, source: "interactive" }, failed.tuiCtx()))
+        .resolves.toEqual({ action: "handled" });
+      expect(coreRegistrations, scenario.label).toBe(0);
+    }
+  });
+
+  it("reports one bounded detail and every reminder on the mode's real channel", async () => {
+    for (const mode of ["tui", "print", "json", "rpc"] as const) {
+      const failed = fakePi();
+      const errors: string[] = [];
+      const originalError = console.error;
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+      try {
+        picc(failed.api as never, {
+          loadBuiltinSdk: async () => { throw new Error(`sdk unavailable ${"x".repeat(4_000)}\u0007`); },
+          onInitializationSettled: failed.captureInitialization,
+        });
+        await failed.waitForInitialization();
+        const ctx = mode === "tui" ? failed.tuiCtx()
+          : mode === "print" ? failed.printCtx()
+          : mode === "rpc" ? failed.rpcCtx()
+          : failed.ctx({ mode: "json", hasUI: false });
+        for (const text of ["must stay blocked", "still blocked"]) {
+          await expect(failed.fire("input", { text, source: mode === "rpc" ? "rpc" : "interactive" }, ctx))
+            .resolves.toEqual({ action: "handled" });
+        }
+        const reports = mode === "tui"
+          ? failed.notifications.map((notice) => notice.text)
+          : mode === "print"
+            ? errors
+            : failed.entries.filter((entry) => entry.customType === "picc-core-readiness")
+              .map((entry) => String(entry.data.error));
+        expect(reports, mode).toHaveLength(3);
+        expect(reports.filter((line) => line.includes("core tool initialization failed")), mode).toHaveLength(1);
+        expect(reports.filter((line) => line.includes("core tools are unavailable")), mode).toHaveLength(2);
+        const detailed = reports.find((line) => line.includes("core tool initialization failed")) ?? "";
+        expect(detailed, mode).toContain("Check or update through the installation owner");
+        expect(detailed, mode).toContain("for a direct PiCC launch, /picc-update or picc update --check are examples");
+        expect(detailed, mode).toContain("Restart PiCC");
+        expect(detailed, mode).toContain("use /doctor and the reported cause if this persists");
+        expect(Math.max(...reports.map((line) => line.length)), mode).toBeLessThanOrEqual(2_000);
+      } finally {
+        console.error = originalError;
+      }
+    }
+  });
+
+  it("bounds malformed Error.message diagnostics and keeps repeated submissions outside hooks", async () => {
+    const malformed = [
+      () => {
+        const error = new Error("placeholder");
+        Object.defineProperty(error, "message", { get: () => { throw new Error("getter fault"); } });
+        return error;
+      },
+      () => {
+        const error = new Error("placeholder");
+        Object.defineProperty(error, "message", {
+          value: { toString: () => { throw new Error("conversion fault"); } },
+        });
+        return error;
+      },
+    ];
+    for (const makeError of malformed) {
+      const failed = fakePi();
+      const errors: string[] = [];
+      let inputHookCalls = 0;
+      const originalError = console.error;
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+      try {
+        picc(failed.api as never, {
+          loadBuiltinSdk: async () => { throw makeError(); },
+          onInitializationSettled: failed.captureInitialization,
+          onWired: ({ inputHooks }) => {
+            const fire = inputHooks.fire.bind(inputHooks);
+            inputHooks.fire = async (...args: any[]) => {
+              if (args[0] === "UserPromptSubmit") inputHookCalls += 1;
+              return fire(...args);
+            };
+          },
+        });
+        await failed.waitForInitialization();
+        for (const text of ["first malformed task", "repeat malformed task"]) {
+          await expect(failed.fire("input", { text, source: "interactive" }, failed.printCtx()))
+            .resolves.toEqual({ action: "handled" });
+        }
+        expect(inputHookCalls).toBe(0);
+        expect(errors).toHaveLength(3);
+        expect(errors[0]).toContain("Cause: unknown error");
+        expect(errors.every((line) => line.length <= 2_000)).toBe(true);
+      } finally {
+        console.error = originalError;
+      }
+    }
+  });
+
+  it("falls back to bounded stderr and stays handled when each primary reporting transport fails", async () => {
+    for (const mode of ["tui", "print", "json", "rpc"] as const) {
+      const failed = fakePi();
+      failed.api.appendEntry = () => { throw new Error("entry transport exploded"); };
+      const ctx = mode === "tui" ? failed.tuiCtx()
+        : mode === "print" ? failed.printCtx()
+        : mode === "rpc" ? failed.rpcCtx()
+        : failed.ctx({ mode: "json", hasUI: false });
+      (ctx.ui as any).notify = () => { throw new Error("notify exploded"); };
+      const originalError = console.error;
+      const originalWrite = process.stderr.write;
+      const fallbacks: string[] = [];
+      console.error = () => { throw new Error("stderr transport exploded"); };
+      process.stderr.write = ((chunk: string | Uint8Array) => {
+        fallbacks.push(String(chunk));
+        return true;
+      }) as typeof process.stderr.write;
+      try {
+        picc(failed.api as never, {
+          loadBuiltinSdk: async () => { throw new Error("sdk unavailable"); },
+          onInitializationSettled: failed.captureInitialization,
+        });
+        await failed.waitForInitialization();
+        for (const text of ["must stay blocked", "still blocked"]) {
+          await expect(failed.fire("input", { text, source: mode === "rpc" ? "rpc" : "interactive" }, ctx))
+            .resolves.toEqual({ action: "handled" });
+        }
+        expect(fallbacks, mode).toHaveLength(3);
+        expect(fallbacks.every((line) => line.length <= 2_001), mode).toBe(true);
+      } finally {
+        process.stderr.write = originalWrite;
+        console.error = originalError;
+      }
+    }
+  });
+
+  it("fails closed before and after registration starts, removes only fixed active names, and diagnoses repeats", async () => {
+    const cases = [
+      { label: "import", load: async () => { throw new Error("sdk import exploded"); } },
+      { label: "registration", load: () => import("@earendil-works/pi-coding-agent") },
+    ];
+    for (const scenario of cases) {
+      const failed = fakePi();
+      (failed.api.registerTool as (definition: any) => void)({
+        name: "custom-active", description: "custom", parameters: {}, execute: async () => undefined,
+      });
+      (failed.api.registerTool as (definition: any) => void)({
+        name: "custom-inactive", description: "custom", parameters: {}, execute: async () => undefined,
+      });
+      failed.activeTools.delete("custom-inactive");
+      for (const name of ["bash", "read", "write", "edit", "grep", "find", "ls"]) failed.activeTools.add(name);
+      if (scenario.label === "registration") {
+        const register = failed.api.registerTool as (definition: any) => void;
+        let coreRegistrations = 0;
+        failed.api.registerTool = (definition: any) => {
+          if (["bash", "read", "write", "edit", "grep", "find", "ls"].includes(definition.name) &&
+              ++coreRegistrations === 3) throw new Error("third core registration exploded");
+          register(definition);
+        };
+      }
+      const errors: string[] = [];
+      let inputHookCalls = 0;
+      const originalError = console.error;
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+      try {
+        picc(failed.api as never, {
+          loadBuiltinSdk: scenario.load,
+          onInitializationSettled: failed.captureInitialization,
+          onWired: ({ inputHooks }) => {
+            const fire = inputHooks.fire.bind(inputHooks);
+            inputHooks.fire = async (...args: any[]) => {
+              if (args[0] === "UserPromptSubmit") inputHookCalls += 1;
+              return fire(...args);
+            };
+          },
+        });
+        await failed.waitForInitialization();
+        await expect(failed.fire("input", { text: "first task", source: "interactive" }, failed.printCtx()))
+          .resolves.toEqual({ action: "handled" });
+        await expect(failed.fire("input", { text: "second task", source: "interactive" }, failed.printCtx()))
+          .resolves.toEqual({ action: "handled" });
+
+        expect(failed.activeTools.has("custom-active")).toBe(true);
+        expect(failed.activeTools.has("custom-inactive")).toBe(false);
+        for (const name of ["bash", "read", "write", "edit", "grep", "find", "ls"]) {
+          expect(failed.activeTools.has(name)).toBe(false);
+        }
+        expect(errors.filter((line) => line.includes("core tool initialization failed"))).toHaveLength(1);
+        expect(errors.join("\n")).toContain(scenario.label === "registration"
+          ? "partial core replacement may have committed"
+          : "registration did not begin");
+        expect(inputHookCalls).toBe(0);
+        if (scenario.label === "registration") {
+          expect([...failed.tools.keys()].filter((name) =>
+            ["bash", "read", "write", "edit", "grep", "find", "ls"].includes(name)))
+            .toEqual(["bash", "read"]);
+        }
+        expect(errors.filter((line) => line.includes("core tools are unavailable"))).toHaveLength(2);
+      } finally {
+        console.error = originalError;
+      }
+    }
+  });
+
+  it("keeps input blocked when active-set cleanup throws or fails verification", async () => {
+    for (const cleanup of ["throw", "unverified"] as const) {
+      const failed = fakePi();
+      failed.activeTools.add("read");
+      failed.api.setActiveTools = cleanup === "throw"
+        ? () => { throw new Error("cleanup denied"); }
+        : () => undefined;
+      const errors: string[] = [];
+      const originalError = console.error;
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+      try {
+        picc(failed.api as never, {
+          loadBuiltinSdk: async () => { throw new Error("sdk absent"); },
+          onInitializationSettled: failed.captureInitialization,
+        });
+        await failed.waitForInitialization();
+        await expect(failed.fire("input", { text: "task", source: "interactive" }, failed.printCtx()))
+          .resolves.toEqual({ action: "handled" });
+        expect(errors.join("\n")).toContain(cleanup === "throw"
+          ? "active-set cleanup failed"
+          : "cleanup verification failed");
+        expect(errors.join("\n")).toContain("task not sent");
+      } finally {
+        console.error = originalError;
+      }
+    }
+  });
+
   it("captures real extension initialization synchronously and waits for gated orphan reaping", async () => {
     const originalReapOrphans = WorktreeManager.prototype.reapOrphans;
     const reapGate = deferred<void>();

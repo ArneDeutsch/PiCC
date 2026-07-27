@@ -101,12 +101,17 @@ renderShell?:  "default" | "self"
 
 A **Component** is the structural pi-tui contract: `{ render(width: number): string[] }`. PiCC's
 renderers use the untyped structural form, so no pi-tui type import is needed — but the `theme`
-argument **is** Pi's `Theme` (see "Colors and themes").
+argument **is** Pi's `Theme` (see "Colors and themes"). The production install currently contains
+both PiCC's direct `pi-tui` dependency and Pi's nested copy. Structural components and stateless
+width helpers may cross that tested Pi 0.82 boundary; mutable singleton state and
+constructor-sensitive operations must resolve through `pi-tui-runtime.ts` from Pi's package
+context. Physical deduplication is optional, not assumed.
 
 - `options` for `renderResult` is `{ expanded: boolean; isPartial: boolean }`. `isPartial` is the
   streaming case (a live, not-yet-final result); render the rolling/partial view then.
 - `ctx` is a `ToolRenderContext` (args, `toolCallId`, `invalidate()`, `expanded`, `isError`,
-  `cwd`, …) — use `invalidate()` to force a redraw of just that row.
+  `cwd`, …) — use `invalidate()` to force a redraw of just that row. Pi owns independent call and
+  result slots, a separate `lastComponent` cache for each slot, and one shared `ctx.state` object.
 
 ### 3.2 `renderShell` — this is how you control blank lines and framing
 
@@ -125,16 +130,23 @@ diffs, and textual image fallbacks align beneath content. It never calls `theme.
 invocation rows therefore have no state background. Foreground styling is accepted only when it is
 balanced and safe, and a missing or hostile theme degrades to a plain glyph.
 
-The construction order is load-bearing: search specialization → routine/Edit rendering →
-`withDefaultCollapsedToolRendering` → `wrapForSelfShell` → the outer checkpoint gate →
-registration. Presentation decorators leave the raw built-in `execute` unchanged. Only the outer
-checkpoint gate wraps it, and that gate may alter the returned result by adding `terminate`. The
-collapse adapter snapshots display-only roots and the raw path when complete invocation arguments
-first render, so later cwd changes cannot rewrite an existing row. It recognizes an ordinary bounded Read continuation
-only when the canonical notice agrees exactly with the requested range; unknown and exceptional
-families fail open to native detail. The configured `app.tools.expand` action changes native detail
-without changing the glyph; live, exceptional, unfamiliar, and unbound-action rows keep their native
-detail inside the same outer glyph frame, while malformed display fields use a concise warning.
+`main-session-tool-render.ts` owns the construction order: search specialization → routine/Edit
+rendering → `withDefaultCollapsedToolRendering` → `wrapForSelfShell`; the outer checkpoint gate then
+wraps execution before registration. Presentation decorators leave the raw built-in `execute`
+unchanged. Only the outer checkpoint gate wraps it, and that gate may alter the returned result by
+adding `terminate`. The collapse adapter snapshots display-only roots and the raw path when complete
+invocation arguments first render, so later cwd changes cannot rewrite an existing row. It
+recognizes an ordinary bounded Read continuation only when the canonical notice agrees exactly with
+the requested range; unknown and exceptional families fail open to native detail. The configured
+`app.tools.expand` action changes native detail without changing the glyph; live, exceptional,
+unfamiliar, and unbound-action rows keep their native detail inside the same outer glyph frame,
+while malformed display fields use a concise warning. Search and subagent completion rows may add a
+separate complete cue row when the cue cannot fit inline and fail open when no usable cue exists.
+At unusably narrow widths they retain the semantic first row with at most one resize hint rather than
+wrapping a large retained body; widening restores full detail or its configured-action cue. Shared
+shell, routing, and Pi-owned bridge mechanics do not make those content policies universal: ordinary Read/Bash are call-owned, custom
+Grep/Glob are result-owned, and widgets,
+panels, messages, and entries retain separate interaction and lifecycle contracts.
 
 Lowercase Edit needs one inner exception. Pi's call renderer retains a stateful padded `Box` through
 `ctx.lastComponent`; `withRoutineToolRendering` keeps that exact Box in a WeakMap, removes only its
@@ -144,10 +156,13 @@ remain. Binary image components are added outside the textual self-render contai
 Pi-owned and unmodified; only their textual fallbacks participate in continuation alignment.
 
 HTML export is a separate Pi-owned surface, not TUI visual parity. Pi retains outer
-`.tool-execution.pending|success|error` cards and template-renders its built-in tools. Eligible
-custom renderer fragments can inherit phase-local glyphs through Pi's shared TUI-to-HTML renderer;
-escaping and canonical session data remain Pi-owned. PiCC does not patch the exporter to make those
-fragments uniform.
+`.tool-execution.pending|success|error` cards. Lowercase stock Read/Bash are template-owned and
+bypass custom renderers. Other custom-rendered tools receive one call pass and independent
+collapsed and expanded result passes, so a renderer cannot rely on TUI paint timing or a result pass
+mutating the earlier call fragment. Custom search cards use the generic click-safe cue `click to
+show detail`, never a terminal binding. Eligible custom renderer fragments can inherit phase-local
+glyphs through Pi's shared TUI-to-HTML renderer; escaping and canonical session data remain
+Pi-owned. PiCC does not patch the exporter to make those fragments uniform.
 
 - **Own tools with a renderer:** the wrapper invokes the tool's own `renderCall`/`renderResult`,
   including renderers added by a registration-time decorator, then adds foreground glyph framing.

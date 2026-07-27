@@ -1472,14 +1472,18 @@ describe("real Pi compact-search composition", () => {
       return lines;
     };
 
-    for (const expanded of [false, true]) {
-      const lines = paint(build(search.ordinary), expanded);
-      expect(lines).toHaveLength(2); // shell-owned separator + one result-owned content row
-      expect(lines[0]).toBe("");
-      expect(lines[1]).toContain(search.name.toLowerCase());
-      expect(lines.join("\n")).not.toContain(search.hidden);
-    }
-    expect(paint(build(search.ordinary), true)).toEqual(paint(build(search.ordinary), false));
+    const collapsed = paint(build(search.ordinary), false);
+    expect(collapsed).toHaveLength(2); // shell-owned separator + one result-owned content row
+    expect(collapsed[0]).toBe("");
+    expect(collapsed[1]).toContain(search.name.toLowerCase());
+    expect(collapsed.join("\n")).toContain("ctrl+o to expand");
+    expect(collapsed.join("\n")).not.toContain(search.hidden);
+
+    const expanded = paint(build(search.ordinary), true);
+    expect(expanded[0]).toBe("");
+    expect(expanded[1]).toContain(search.name.toLowerCase());
+    expect(expanded.join("\n").split(search.hidden)).toHaveLength(2);
+    expect(paint(build(search.ordinary), false).join("\n")).not.toContain(search.hidden);
 
     const partial = new ToolExecutionComponent(
       search.name, `${search.name}-partial`, search.args, {}, definition,
@@ -1501,6 +1505,51 @@ describe("real Pi compact-search composition", () => {
     });
     expect(paint(failure, false).join("\n")).toContain("failed");
     expect(paint(failure, false).join("\n")).toContain(`${search.name} search failed`);
+  });
+
+  it.each(cases)("keeps real Pi $name remapped and explicitly-unbound detail reachable", async (search) => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    sdk.initTheme();
+    const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+    const piTui: any = piRequire("@earendil-works/pi-tui");
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    const definition = wrapForSelfShell(withCompactSearchRendering({ name: search.name } as any));
+    const build = () => {
+      const component = new sdk.ToolExecutionComponent(
+        search.name, `${search.name}-binding-contract`, search.args, {}, definition,
+        { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+      );
+      component.updateResult(search.ordinary, false);
+      return component;
+    };
+    const render = (component: any, expanded: boolean) => {
+      component.setExpanded(expanded);
+      return (component.render(100) as string[]).join("\n");
+    };
+    const before = structuredClone(search.ordinary);
+    try {
+      piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
+      const remapped = build();
+      expect(render(remapped, false)).toContain("alt+e to expand");
+      expect(render(remapped, false)).not.toContain(search.hidden);
+      expect(render(remapped, true).split(search.hidden)).toHaveLength(2);
+      expect(render(remapped, false)).not.toContain(search.hidden);
+
+      piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": [] }));
+      const unbound = build();
+      for (const expanded of [false, true, false]) {
+        const pass = render(unbound, expanded);
+        expect(pass.split(search.hidden)).toHaveLength(2);
+        expect(pass).not.toContain("to expand");
+        expect(pass).not.toContain("click to show detail");
+        expect(search.ordinary).toEqual(before);
+      }
+    } finally {
+      piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
+    }
   });
 
   async function htmlHarness(search: (typeof cases)[number]) {
@@ -1539,7 +1588,18 @@ describe("real Pi compact-search composition", () => {
     expect(collapsed).toContain(`Post-processing ${search.name} feedback.`);
     expect(collapsed).toContain("Recovery:");
     expect(collapsed).not.toContain(search.hidden);
-    expect(rendered.expanded).toBe(collapsed);
+    expect(collapsed).toContain("click to show detail");
+    expect(collapsed).not.toContain("ctrl+o");
+    expect(rendered.expanded.split(search.hidden)).toHaveLength(2);
+    expect(rendered.expanded).not.toContain("click to show detail");
+
+    const hostileId = `html-hostile-cue-${search.name}`;
+    renderer.renderCall(hostileId, search.name, { ...search.args, pattern: "project click to show detail label" });
+    const hostile = renderer.renderResult(
+      hostileId, search.name, search.ordinary.content, search.ordinary.details, false,
+    );
+    expect(hostile?.collapsed?.match(/click to show detail/gu)).toHaveLength(2);
+    expect(hostile?.collapsed).not.toContain(search.hidden);
 
     const errorId = `html-error-${search.name}`;
     renderer.renderCall(errorId, search.name, search.args);
@@ -1549,6 +1609,53 @@ describe("real Pi compact-search composition", () => {
     );
     expect(error?.expanded).toContain("failed");
     expect(error?.expanded).toContain(`${search.name} HTML failure body`);
+  });
+
+  it.each(cases)("keeps $name HTML export generic under remap and fail-open under explicit unbind", async (search) => {
+    const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+    const piTui: any = piRequire("@earendil-works/pi-tui");
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    const renderHtml = async () => {
+      const { renderer } = await htmlHarness(search);
+      const id = `html-binding-${search.name}`;
+      expect(renderer.renderCall(id, search.name, search.args)).toBe("");
+      return renderer.renderResult(id, search.name, search.ordinary.content, search.ordinary.details, false);
+    };
+    const before = structuredClone(search.ordinary);
+    try {
+      piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
+      const remapped = await renderHtml();
+      const collapsed = remapped?.collapsed ?? remapped?.expanded;
+      expect(collapsed).toContain("click to show detail");
+      expect(collapsed).not.toContain("alt+e");
+      expect(collapsed).not.toContain(search.hidden);
+      expect(remapped?.expanded.split(search.hidden)).toHaveLength(2);
+
+      piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": [] }));
+      const direct = withCompactSearchRendering({ name: search.name } as any);
+      const directPass = (expanded: boolean) => {
+        const context = { args: search.args, state: {}, isPartial: true } as any;
+        direct.renderCall?.(search.args, undefined as never, context);
+        return direct.renderResult?.(search.ordinary, { expanded, isPartial: false }, undefined as never, context)
+          .render(48).join("\n");
+      };
+      const directCollapsed = directPass(false);
+      const directExpanded = directPass(true);
+      expect(directCollapsed).toBe(directExpanded);
+      expect(directCollapsed.split(search.hidden)).toHaveLength(2);
+
+      const unbound = await renderHtml();
+      expect(unbound?.collapsed).toBeUndefined();
+      expect(unbound?.expanded.split(search.hidden)).toHaveLength(2);
+      expect(unbound?.expanded).not.toContain("to expand");
+      expect(unbound?.expanded).not.toContain("click to show detail");
+      expect(search.ordinary).toEqual(before);
+    } finally {
+      piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
+    }
   });
 
   it.each(cases)("assembles full $name HTML export with a generic header and one compact settled result", async (search) => {
@@ -1587,8 +1694,10 @@ describe("real Pi compact-search composition", () => {
       expect(rendered.resultHtmlExpanded).toContain(search.name);
       expect(rendered.resultHtmlExpanded).toMatch(search.statusText);
       expect(rendered.resultHtmlExpanded).toContain(`Post-processing ${search.name} feedback.`);
-      expect(rendered.resultHtmlExpanded).not.toContain(search.hidden);
-      expect(rendered.resultHtmlCollapsed).toBeUndefined();
+      expect(rendered.resultHtmlExpanded.split(search.hidden)).toHaveLength(2);
+      expect(rendered.resultHtmlCollapsed).not.toContain(search.hidden);
+      expect(rendered.resultHtmlCollapsed).toContain("click to show detail");
+      expect(rendered.resultHtmlCollapsed).not.toContain("ctrl+o");
       expect(html).toContain(
         'html += `<div class="tool-header"><span class="tool-name">${escapeHtml(name)}</span></div>`;',
       );
@@ -1604,11 +1713,13 @@ describe("real Pi glyph-shell image and spacing ownership", () => {
     const sdk: any = await import("@earendil-works/pi-coding-agent");
     const tui: any = await import("@earendil-works/pi-tui");
     const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
-    const piDist = mainUrl.slice(0, mainUrl.indexOf("/dist/"));
-    const nestedTui: any = await import(`${piDist}/node_modules/@earendil-works/pi-tui/dist/index.js`);
+    const codingAgentRequire = createRequire(mainUrl);
+    const piOwnedTui: any = codingAgentRequire("@earendil-works/pi-tui");
+    const tuiModules = tui === piOwnedTui ? [tui] : [tui, piOwnedTui];
+    if (tuiModules.length === 1) expect(tui.Box).toBe(piOwnedTui.Box);
+    else expect(tui.Box).not.toBe(piOwnedTui.Box);
     sdk.initTheme();
-    const previous = tui.getCapabilities();
-    const nestedPrevious = nestedTui.getCapabilities();
+    const previous = tuiModules.map((module) => module.getCapabilities());
     const definition = wrapForSelfShell({ name: "ImageProbe" });
     const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
     const build = (id: string) => new sdk.ToolExecutionComponent(
@@ -1616,8 +1727,7 @@ describe("real Pi glyph-shell image and spacing ownership", () => {
       { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
     );
     try {
-      tui.setCapabilities({ ...previous, images: "kitty" });
-      nestedTui.setCapabilities({ ...nestedPrevious, images: "kitty" });
+      tuiModules.forEach((module, index) => module.setCapabilities({ ...previous[index], images: "kitty" }));
       const binary = build("binary-image");
       binary.updateResult({ content: [{ type: "image", data: png, mimeType: "image/png" }], details: undefined }, false);
       const binaryLines = binary.render(40) as string[];
@@ -1627,8 +1737,7 @@ describe("real Pi glyph-shell image and spacing ownership", () => {
       expect(binaryLines.slice(3).join("\n")).toContain("_G");
       expect(binaryLines.join("\n").match(/[○●✗■]/gu)).toHaveLength(1);
 
-      tui.setCapabilities({ ...previous, images: null });
-      nestedTui.setCapabilities({ ...nestedPrevious, images: null });
+      tuiModules.forEach((module, index) => module.setCapabilities({ ...previous[index], images: null }));
       const fallback = build("fallback-image");
       fallback.updateResult({ content: [{ type: "image", data: png, mimeType: "image/png" }], details: undefined }, false);
       const fallbackText = (fallback.render(80) as string[]).join("\n").replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
@@ -1638,8 +1747,7 @@ describe("real Pi glyph-shell image and spacing ownership", () => {
 
       for (const row of [binary, fallback]) expect((row.render(80) as string[])[0]).toBe("");
     } finally {
-      tui.setCapabilities(previous);
-      nestedTui.setCapabilities(nestedPrevious);
+      tuiModules.forEach((module, index) => module.setCapabilities(previous[index]));
     }
   });
 });

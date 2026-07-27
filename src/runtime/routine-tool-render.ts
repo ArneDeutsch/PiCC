@@ -1,11 +1,10 @@
-import { createRequire } from "node:module";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import {
   createEditToolDefinition,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { neutralizePiEditBoxBackground } from "./pi-tui-runtime.js";
 import { themedFg } from "./render-util.js";
 import {
   formatDisplayPathFromRoots,
@@ -16,12 +15,6 @@ import {
   type DisplayRootResolver,
   type DisplayRoots,
 } from "./tool-display.js";
-
-const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-// Root and Pi-nested pi-tui can have distinct constructor identities.
-// Resolve Box from Pi's public package context for the exact instanceof contract.
-const piTuiEntry = requireFromPi.resolve("@earendil-works/pi-tui");
-const { Box: PiBox } = await import(pathToFileURL(piTuiEntry).href) as typeof import("@earendil-works/pi-tui");
 
 interface Component {
   render(width: number): string[];
@@ -886,10 +879,8 @@ function knownEditPadding(line: string, width: number): boolean {
   }
 }
 
-const identityBackground = (text: string): string => text;
-
 function renderNeutralEditBox(component: Component, width: number): string[] {
-  if (component instanceof PiBox) component.setBgFn(identityBackground);
+  neutralizePiEditBoxBackground(component);
   return component.render(width);
 }
 
