@@ -65,10 +65,7 @@ import {
 import { builtinAgents } from "./claude/agents.js";
 import { loadAgentMemory } from "./claude/memory.js";
 import { createDegradeStub, DEGRADED_TOOLS } from "./runtime/tools/degrade-stubs.js";
-import { wrapForSelfShell } from "./runtime/tool-shell.js";
-import { withCompactSearchRendering } from "./runtime/search-tool-render.js";
-import { withRoutineToolRendering } from "./runtime/routine-tool-render.js";
-import { withDefaultCollapsedToolRendering } from "./runtime/default-collapsed-tool-render.js";
+import { renderMainSessionTool } from "./runtime/main-session-tool-render.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
 import {
   MainSessionCheckpointGate,
@@ -271,6 +268,8 @@ export interface PiccTestSeam {
      */
     subagentPanelFocus: SubagentPanelFocusController;
     mainCheckpointGate: MainSessionCheckpointGate;
+    /** TEST-ONLY access to the actual input hook multiplexer for boundary spies. */
+    inputHooks: { fire: (...args: any[]) => Promise<any> };
   }) => void;
   /**
    * TEST-ONLY subagent SDK override: replaces the real Pi SDK the session's
@@ -295,6 +294,8 @@ export interface PiccTestSeam {
   managedArtifactDirs?: string[];
   /** TEST-ONLY bounded replacement for detached built-in SDK loading. */
   loadBuiltinSdk?: () => Promise<any>;
+  /** TEST-ONLY in-process replacement at the actual main-session presentation-routing boundary. */
+  renderMainSessionTool?: typeof renderMainSessionTool;
   /** TEST-ONLY in-process override for trusted-Git unavailability. */
   resolveTrustedGit?: () => Promise<string | undefined>;
 }
@@ -393,6 +394,7 @@ export async function writeFdFully(
 }
 
 export default function picc(pi: any, testSeam?: PiccTestSeam) {
+  const routeMainSessionTool = testSeam?.renderMainSessionTool ?? renderMainSessionTool;
   // Capture once before project loading can spawn or inspect anything. PICC_* is
   // removed inside this call; PI_SKIP_VERSION_CHECK remains only for Pi's
   // adjacent interactive startup work and is cleared at first user admission.
@@ -1638,6 +1640,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       subagentPanel,
       subagentPanelFocus,
       mainCheckpointGate,
+      inputHooks: hooks,
     });
   } catch (err) {
     console.error(`PiCC test seam onWired failed: ${(err as Error).message}`);
@@ -1830,28 +1833,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   );
   for (const tool of claudeNamedTools) {
     try {
-      // Main-session definitions pass through specialized search → routine/Edit
-      // rendering → safe settled-success collapse → foreground-glyph self-shell.
-      // The checkpoint gate then wraps execute exactly once, outside every
-      // presentation decorator, before registration so canonical results retain
-      // its terminate metadata. `customToolsFor` skips this parent-TUI chain.
-      const mainSessionTool: Record<string, unknown> = tool.name === "Grep" || tool.name === "Glob"
-        ? withCompactSearchRendering(tool as unknown as ToolDefinition, {
-            resolveDisplayRoot: getCwd,
-            repositoryRoot: project.root,
-          }) as unknown as Record<string, unknown>
-        : tool;
-      const routineRendered = withRoutineToolRendering(
-        mainSessionTool as unknown as ToolDefinition,
+      // The checkpoint gate stays outside presentation; subagent `customToolsFor` skips both.
+      pi.registerTool(mainCheckpointGate.wrapTool(routeMainSessionTool(
+        tool as unknown as ToolDefinition,
         { resolveDisplayRoot: getCwd, repositoryRoot: project.root },
-      );
-      const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered, {
-        resolveDisplayRoot: getCwd,
-        repositoryRoot: project.root,
-      });
-      pi.registerTool(mainCheckpointGate.wrapTool(
-        wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
-      ));
+      ) as unknown as Record<string, unknown>));
     } catch (err) {
       console.error(`PiCC: failed to register tool: ${(err as Error).message}`);
     }
@@ -1893,57 +1879,90 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // pass through routine/Edit rendering → safe default collapse → foreground-glyph
   // self-shell → the one outer checkpoint gate → registration; subagent stock
   // definitions stay raw.
-  // The IIFE promise is captured (not `void`ed) so the readiness seam can await
-  // built-in registration settlement via onInitializationSettled.
-  const builtInRegistration = (async () => {
+  // The promise is captured so ordinary input and the observational test seam await
+  // the same built-in registration settlement.
+  const coreToolNames = new Set(["bash", "read", "write", "edit", "grep", "find", "ls"]);
+  type BuiltInReadiness =
+    | { ok: true }
+    | { ok: false; cause: string; possiblePartialCommit: boolean; cleanup: string; cleanupVerified: boolean };
+  const boundedCause = (value: unknown): string => {
+    let candidate: unknown = value;
+    try {
+      if (value instanceof Error) candidate = value.message;
+    } catch {
+      candidate = undefined;
+    }
+    let text = "unknown error";
+    try {
+      if (typeof candidate === "string") text = candidate;
+      else if (candidate !== undefined) text = String(candidate);
+    } catch { /* keep the bounded fallback */ }
+    try {
+      return text.slice(0, 1_000).replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ") || "unknown error";
+    } catch {
+      return "unknown error";
+    }
+  };
+  let builtInFailureDetailed = false;
+  let builtInAdmissionFailed = false;
+  const removeCoreFromActiveSet = (): { cleanup: string; cleanupVerified: boolean } => {
+    try {
+      const retained = pi.getActiveTools().filter((name: string) => !coreToolNames.has(name));
+      pi.setActiveTools(retained);
+      const remaining = pi.getActiveTools().filter((name: string) => coreToolNames.has(name));
+      return remaining.length === 0
+        ? { cleanup: "fixed core names removed from the active set", cleanupVerified: true }
+        : { cleanup: `cleanup verification failed (${remaining.join(", ")} remain active)`, cleanupVerified: false };
+    } catch (cleanupError) {
+      return { cleanup: `active-set cleanup failed: ${boundedCause(cleanupError)}`, cleanupVerified: false };
+    }
+  };
+  const builtInRegistration: Promise<BuiltInReadiness> = (async (): Promise<BuiltInReadiness> => {
+    let registrationBegan = false;
     try {
       const sdk: any = await (testSeam?.loadBuiltinSdk?.() ?? import("@earendil-works/pi-coding-agent"));
       // Pin the shell to real Git Bash on Windows — Pi's default `bash` lookup can
       // land on the System32 WSL stub (WSL_E_DEFAULT_DISTRO_NOT_FOUND without a distro).
       const shellPath = resolveGitBashPath();
-      // Both built-in sourcings (execute from create*Tool, renderers from
-      // create*ToolDefinition), the bash spawnHook/env, Git-Bash pinning, and the
-      // live-cwd execute rebind live in the shared factory so the main session and
-      // subagents construct byte-identical raw tools. Only this registration loop
-      // adds routine/Edit rendering → safe default collapse → foreground-glyph
-      // self-shell before the outer checkpoint gate and registration; keeping that
-      // composition here prevents parent-TUI policy from entering subagents.
       const builtins = buildStockBuiltinTools(sdk as BuiltinToolSdk, cwdState, {
         settingsEnv: project.settings.env ?? {},
         projectRoot: project.root,
         ...(shellPath ? { shellPath } : {}),
       });
-      for (const { def } of builtins) {
-        const searchRendered = def.name === "grep" || def.name === "find" || def.name === "ls"
-          ? withCompactSearchRendering(def as unknown as ToolDefinition, {
-              resolveDisplayRoot: getCwd,
-              repositoryRoot: project.root,
-            })
-          : def as unknown as ToolDefinition;
-        const routineRendered = withRoutineToolRendering(
-          searchRendered,
-          { resolveEditRenderCwd: getCwd, resolveDisplayRoot: getCwd, repositoryRoot: project.root },
-        );
-        const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered, {
-          resolveDisplayRoot: getCwd,
-          repositoryRoot: project.root,
-        });
-        pi.registerTool(mainCheckpointGate.wrapTool(
-          wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>),
-        ));
-      }
-      // The optional operations replacement only pins the local shell. The
-      // synchronous admission handler above is the sole cleanup owner.
+      // Construction, presentation, and the one outer execute wrapper all finish before
+      // registration starts. Pi has no public rollback if a later registerTool throws.
+      const prepared = builtins.map(({ def }) => {
+        const rendered = routeMainSessionTool(
+          def as unknown as ToolDefinition,
+          {
+            resolveEditRenderCwd: getCwd,
+            resolveDisplayRoot: getCwd,
+            repositoryRoot: project.root,
+          },
+        ) as unknown as Record<string, unknown>;
+        return mainCheckpointGate.wrapTool(rendered);
+      });
+      registrationBegan = true;
+      for (const definition of prepared) pi.registerTool(definition);
       if (shellPath && typeof sdk.createLocalBashOperations === "function") {
-        pi.on("user_bash", () => ({
-          operations: sdk.createLocalBashOperations({ shellPath }),
-        }));
+        pi.on("user_bash", () => ({ operations: sdk.createLocalBashOperations({ shellPath }) }));
       }
+      return { ok: true };
     } catch (err) {
-      console.error(`PiCC: built-in cwd overrides unavailable: ${(err as Error).message}`);
+      return {
+        ok: false,
+        cause: boundedCause(err),
+        possiblePartialCommit: registrationBegan,
+        ...removeCoreFromActiveSet(),
+      };
     }
-  })();
-  void builtInRegistration;
+  })().catch((): BuiltInReadiness => ({
+    ok: false,
+    cause: "unknown error",
+    possiblePartialCommit: true,
+    cleanup: "readiness settlement failed before cleanup could be verified",
+    cleanupVerified: false,
+  }));
 
   // ---------------------------------------------------------------------------
   // MCP tool exposure (detached; the first-turn barrier below awaits it)
@@ -1980,13 +1999,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // Per-tool catch (same idiom as the claudeNamedTools loop): one
         // throwing registerTool must not drop the sibling tools behind it.
         try {
-          const routineRendered = withRoutineToolRendering(proxy);
-          const defaultCollapsed = withDefaultCollapsedToolRendering(routineRendered);
-          pi.registerTool(mainCheckpointGate.wrapTool(
-            wrapForSelfShell(defaultCollapsed as unknown as Record<string, unknown>, {
-              fallbackCallDisplayName: proxy.label,
-            }),
-          ));
+          pi.registerTool(mainCheckpointGate.wrapTool(routeMainSessionTool(proxy, {
+            fallbackCallDisplayName: proxy.label,
+          }) as unknown as Record<string, unknown>));
         } catch (err) {
           console.error(`PiCC: failed to register MCP tool "${proxy.name}": ${(err as Error).message}`);
         }
@@ -2455,6 +2470,55 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         return inputDisposition === "accept" ? { action: "continue" } : { action: "handled" };
       }
 
+      // Registered commands normally bypass `input`; these fallbacks keep the same
+      // non-provider diagnostics available in machine modes while core readiness is blocked.
+      const admittedText = String(event.text ?? "");
+      const commandInput = parseControlCommandInput(admittedText);
+      if (commandInput) {
+        await handleControlCommand(commandInput.name, commandInput.args, ctx);
+        return { action: "handled" };
+      }
+      const admittedPiBuiltin = parseAdmittedPiBuiltin(admittedText);
+      if (admittedPiBuiltin) {
+        await emitPiBuiltinGuidance(admittedPiBuiltin, ctx);
+        return { action: "handled" };
+      }
+
+      const readiness = await builtInRegistration;
+      if (!readiness.ok) {
+        // Latch admission before cleanup or diagnostics: none of those best-effort
+        // surfaces may let the outer input catch fall through to provider work.
+        builtInAdmissionFailed = true;
+        if (!readiness.cleanupVerified) Object.assign(readiness, removeCoreFromActiveSet());
+        const stderrFallback = (text: string): void => {
+          try { process.stderr.write(`${text.slice(0, 2_000)}\n`); } catch { /* admission is already latched */ }
+        };
+        const report = (text: string, detailed: boolean): void => {
+          const bounded = text.slice(0, 2_000);
+          try {
+            if (ctx.mode === "tui") {
+              if (typeof ctx.ui?.notify !== "function") throw new Error("TUI notification unavailable");
+              ctx.ui.notify(bounded, "error");
+            } else if (ctx.mode === "print") {
+              console.error(bounded);
+            } else {
+              pi.appendEntry("picc-core-readiness", detailed ? { error: bounded, detailed: true } : { error: bounded });
+            }
+          } catch {
+            stderrFallback(bounded);
+          }
+        };
+        if (!builtInFailureDetailed) {
+          builtInFailureDetailed = true;
+          const commit = readiness.possiblePartialCommit
+            ? "registration began, so a partial core replacement may have committed"
+            : "registration did not begin";
+          report(`PiCC: core tool initialization failed; the project task was not sent. Restart PiCC after updating or reinstalling. Cause: ${readiness.cause}; ${commit}; ${readiness.cleanup}.`, true);
+        }
+        report("PiCC: core tools are unavailable; task not sent. Restart PiCC after updating or reinstalling.", false);
+        return { action: "handled" };
+      }
+
       // Every transforming path below rewrites the turn text, but Pi may have
       // already captured images the user pasted or dropped onto this input
       // (`event.images`). A `transform` result that omits them makes Pi
@@ -2499,20 +2563,6 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // otherwise it could start a second turn before or during compaction.
         return shadow || inputDisposition === "quarantine" ? { action: "handled" } : result;
       };
-
-      // Pi routes registered TUI commands before this event; this second seam
-      // keeps admitted print, JSON, and RPC input outside model context.
-      const admittedText = String(event.text ?? "");
-      const commandInput = parseControlCommandInput(admittedText);
-      if (commandInput) {
-        await handleControlCommand(commandInput.name, commandInput.args, ctx);
-        return { action: "handled" };
-      }
-      const admittedPiBuiltin = parseAdmittedPiBuiltin(admittedText);
-      if (admittedPiBuiltin) {
-        await emitPiBuiltinGuidance(admittedPiBuiltin, ctx);
-        return { action: "handled" };
-      }
 
       // 1) UserPromptSubmit hook on the raw prompt (Claude order).
       const stopRun = mainCheckpointGate.captureLogicalRunStop();
@@ -2657,6 +2707,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       // Once a checkpoint has closed admission, capture/hook/pipeline failures
       // cannot reopen transport by falling through to Pi. If quarantine could not
       // reach the normal capture path, preserve/report the raw input here.
+      if (builtInAdmissionFailed) return { action: "handled" };
       const disposition = mainCheckpointGate.ordinaryInputDisposition();
       if (disposition === "quarantine") {
         const controller = mainCheckpointGate.currentController();

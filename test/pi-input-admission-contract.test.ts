@@ -1,0 +1,272 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import picc from "../src/index.js";
+import { renderMainSessionTool } from "../src/runtime/main-session-tool-render.js";
+import { deferred } from "./helpers/async.js";
+
+const CORE = ["bash", "read", "write", "edit", "grep", "find", "ls"] as const;
+let project: string;
+let previousCwd: string;
+let previousUserDir: string | undefined;
+
+beforeAll(() => {
+  previousCwd = process.cwd();
+  previousUserDir = process.env.PICC_CLAUDE_USER_DIR;
+  project = fs.mkdtempSync(path.join(os.tmpdir(), "picc-input-contract-"));
+  fs.mkdirSync(path.join(project, ".claude-user"), { recursive: true });
+  fs.mkdirSync(path.join(project, ".claude", "commands"), { recursive: true });
+  fs.writeFileSync(path.join(project, "CLAUDE.md"), "input contract fixture\n");
+  fs.writeFileSync(path.join(project, ".claude", "commands", "deploy.md"),
+    "Deploy the release target $ARGUMENTS after the readiness gate.\n");
+  process.env.PICC_CLAUDE_USER_DIR = path.join(project, ".claude-user");
+  process.chdir(project);
+});
+
+afterAll(() => {
+  process.chdir(previousCwd);
+  if (previousUserDir === undefined) delete process.env.PICC_CLAUDE_USER_DIR;
+  else process.env.PICC_CLAUDE_USER_DIR = previousUserDir;
+  fs.rmSync(project, { recursive: true, force: true });
+});
+
+interface InstalledOptions {
+  loadBuiltinSdk: () => Promise<any>;
+  failPresentation?: boolean;
+  failCheckpoint?: boolean;
+  failCoreRegistrationAt?: number;
+  cleanup?: "throw" | "unverified";
+}
+
+async function installedSession(options: InstalledOptions) {
+  const sdk: any = await import("@earendil-works/pi-coding-agent");
+  const ai: any = await import("@earendil-works/pi-ai");
+  let providerPrompts = 0;
+  let hookCalls = 0;
+  let sdkLoads = 0;
+  let coreRegistrations = 0;
+  let extensionApi: any;
+  let initialization: Promise<void> | undefined;
+  const settingsManager = sdk.SettingsManager.inMemory();
+  const modelRuntime = await sdk.ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
+  modelRuntime.hasConfiguredAuth = () => true;
+  modelRuntime.getAuth = async () => ({ auth: { apiKey: "contract-test-key" }, source: "in-process contract" });
+  modelRuntime.streamSimple = (...args: any[]) => {
+    providerPrompts += 1;
+    void args;
+    const stream = ai.createAssistantMessageEventStream();
+    const message = {
+      role: "assistant", content: [{ type: "text", text: `answer-${providerPrompts}` }],
+      api: "openai-completions", provider: "contract", model: "admission",
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "stop", timestamp: Date.now(),
+    };
+    queueMicrotask(() => {
+      stream.push({ type: "start", partial: message });
+      stream.push({ type: "done", reason: "stop", message });
+    });
+    return stream;
+  };
+  const model = {
+    id: "admission", name: "Admission Contract", api: "openai-completions", provider: "contract",
+    baseUrl: "http://127.0.0.1", reasoning: false, input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1_000,
+  };
+  const loader = new sdk.DefaultResourceLoader({
+    cwd: project,
+    agentDir: path.join(project, ".claude-user"),
+    settingsManager,
+    noSkills: true,
+    noThemes: true,
+    noContextFiles: true,
+    extensionFactories: [{
+      name: "picc-admission-contract",
+      factory: (api: any) => {
+        extensionApi = api;
+        const register = api.registerTool.bind(api);
+        api.registerTool = (definition: any) => {
+          if (CORE.includes(definition.name)) {
+            coreRegistrations += 1;
+            if (coreRegistrations === options.failCoreRegistrationAt) throw new Error("injected registration fault");
+          }
+          return register(definition);
+        };
+        picc(api, {
+          loadBuiltinSdk: async () => { sdkLoads += 1; return options.loadBuiltinSdk(); },
+          ...(options.failPresentation ? {
+            renderMainSessionTool: ((definition, routeOptions) => {
+              if (definition.name === "bash") throw new Error("presentation fault");
+              return renderMainSessionTool(definition, routeOptions);
+            }) as typeof renderMainSessionTool,
+          } : {}),
+          onInitializationSettled: (completion) => { initialization = completion; },
+          onWired: ({ inputHooks, mainCheckpointGate }) => {
+            const fire = inputHooks.fire.bind(inputHooks);
+            inputHooks.fire = async (...args: any[]) => {
+              if (args[0] === "UserPromptSubmit") hookCalls += 1;
+              return fire(...args);
+            };
+            if (options.failCheckpoint) {
+              const realWrap = mainCheckpointGate.wrapTool.bind(mainCheckpointGate);
+              mainCheckpointGate.wrapTool = ((definition: Record<string, unknown>) => {
+                if (definition.name === "bash") throw new Error("checkpoint fault");
+                return realWrap(definition);
+              }) as typeof mainCheckpointGate.wrapTool;
+            }
+          },
+        });
+      },
+    }],
+  });
+  await loader.reload();
+  const { session } = await sdk.createAgentSession({
+    cwd: project,
+    agentDir: path.join(project, ".claude-user"),
+    resourceLoader: loader,
+    sessionManager: sdk.SessionManager.inMemory(project),
+    settingsManager,
+    modelRuntime,
+    model,
+  });
+  if (options.cleanup === "throw") extensionApi.setActiveTools = () => { throw new Error("cleanup denied"); };
+  if (options.cleanup === "unverified") extensionApi.setActiveTools = () => undefined;
+  return {
+    session,
+    extensionApi,
+    counts: () => ({ providerPrompts, hookCalls, sdkLoads, coreRegistrations }),
+    close: async () => {
+      await initialization;
+      session.dispose?.();
+    },
+  };
+}
+
+async function submit(installed: Awaited<ReturnType<typeof installedSession>>, mode: "tui" | "print" | "json" | "rpc", text: string, source: "interactive" | "rpc" | "extension" = mode === "rpc" ? "rpc" : "interactive") {
+  installed.session.extensionRunner.setUIContext({}, mode);
+  await installed.session.prompt(text, { source });
+}
+
+function providerText(context: any): string {
+  return context.messages.flatMap((message: any) => typeof message.content === "string"
+    ? [message.content]
+    : (message.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text))
+    .join("\n");
+}
+
+function malformedMessageGetter(): Error {
+  const error = new Error("placeholder");
+  Object.defineProperty(error, "message", { get: () => { throw new Error("message getter fault"); } });
+  return error;
+}
+
+function malformedMessageValue(): Error {
+  const error = new Error("placeholder");
+  Object.defineProperty(error, "message", {
+    value: { toString: () => { throw new Error("message conversion fault"); } },
+  });
+  return error;
+}
+
+describe("installed Pi AgentSession input admission", () => {
+  it("holds slash-template task input across ordinary TUI, print, JSON, and RPC prompt modes, then initializes once", async () => {
+    for (const mode of ["tui", "print", "json", "rpc"] as const) {
+      const gate = deferred<any>();
+      const installed = await installedSession({ loadBuiltinSdk: () => gate.promise });
+      try {
+        let settled = false;
+        const prompt = submit(installed, mode, `/deploy ${mode}`).then(() => { settled = true; });
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(settled, mode).toBe(false);
+        expect(installed.counts()).toMatchObject({ providerPrompts: 0, hookCalls: 0, sdkLoads: 1 });
+
+        gate.resolve(await import("@earendil-works/pi-coding-agent"));
+        await prompt;
+        expect(installed.counts()).toEqual({ providerPrompts: 1, hookCalls: 1, sdkLoads: 1, coreRegistrations: 7 });
+        expect(providerText({ messages: installed.session.messages })).toContain("Deploy the release target");
+
+        await submit(installed, mode, "second successful ordinary input");
+        expect(installed.counts()).toEqual({ providerPrompts: 2, hookCalls: 2, sdkLoads: 1, coreRegistrations: 7 });
+      } finally {
+        gate.resolve(await import("@earendil-works/pi-coding-agent"));
+        await installed.close();
+      }
+    }
+  });
+
+  it("lets an extension continuation bypass pending ordinary readiness without deadlock", async () => {
+    const gate = deferred<any>();
+    const installed = await installedSession({ loadBuiltinSdk: () => gate.promise });
+    try {
+      await submit(installed, "rpc", "authenticated continuation", "extension");
+      expect(installed.counts()).toMatchObject({ providerPrompts: 1, hookCalls: 0 });
+    } finally {
+      gate.resolve(await import("@earendil-works/pi-coding-agent"));
+      await installed.close();
+    }
+  });
+
+  it("retries unavailable pre-bind cleanup at first failed input without widening the active set", async () => {
+    const installed = await installedSession({ loadBuiltinSdk: async () => { throw new Error("sdk unavailable"); } });
+    try {
+      installed.session.setActiveToolsByName(["WebFetch", ...CORE]);
+      await submit(installed, "print", "blocked after runtime binding");
+      expect(installed.counts()).toMatchObject({ providerPrompts: 0, hookCalls: 0 });
+      expect(installed.session.getActiveToolNames()).toContain("WebFetch");
+      expect(installed.session.getActiveToolNames().filter((name: string) => CORE.includes(name as typeof CORE[number]))).toEqual([]);
+      expect(installed.session.getActiveToolNames()).not.toContain("WebSearch");
+    } finally {
+      await installed.close();
+    }
+  });
+
+  it("keeps actual provider and submit-hook counts at zero for every failure phase across repeated ordinary mode submissions", async () => {
+    const realSdk: any = await import("@earendil-works/pi-coding-agent");
+    const scenarios: Array<{ label: string; options: InstalledOptions; registrations: number }> = [
+      { label: "import", options: { loadBuiltinSdk: async () => { throw new Error("import fault"); } }, registrations: 0 },
+      { label: "factory", options: { loadBuiltinSdk: async () => ({ ...realSdk, createBashTool: () => { throw new Error("factory fault"); } }) }, registrations: 0 },
+      { label: "presentation", options: { loadBuiltinSdk: async () => realSdk, failPresentation: true }, registrations: 0 },
+      { label: "checkpoint", options: { loadBuiltinSdk: async () => realSdk, failCheckpoint: true }, registrations: 0 },
+      { label: "partial", options: { loadBuiltinSdk: async () => realSdk, failCoreRegistrationAt: 3 }, registrations: 3 },
+      { label: "malformed getter", options: { loadBuiltinSdk: async () => { throw malformedMessageGetter(); } }, registrations: 0 },
+      { label: "malformed value", options: { loadBuiltinSdk: async () => { throw malformedMessageValue(); } }, registrations: 0 },
+    ];
+    for (const scenario of scenarios) {
+      const installed = await installedSession(scenario.options);
+      try {
+        for (const [mode, source] of [["tui", "interactive"], ["print", "interactive"], ["json", "interactive"], ["rpc", "rpc"]] as const) {
+          await submit(installed, mode, `${scenario.label}-${mode}-first`, source);
+          await submit(installed, mode, `${scenario.label}-${mode}-repeat`, source);
+        }
+        expect(installed.counts(), scenario.label).toEqual({
+          providerPrompts: 0,
+          hookCalls: 0,
+          sdkLoads: 1,
+          coreRegistrations: scenario.registrations,
+        });
+      } finally {
+        await installed.close();
+      }
+    }
+  });
+
+  it("keeps cleanup throw and failed verification away from providers for repeated ordinary TUI, print, JSON, and RPC tasks", async () => {
+    for (const cleanup of ["throw", "unverified"] as const) {
+      const installed = await installedSession({
+        loadBuiltinSdk: async () => { throw new Error("sdk unavailable"); }, cleanup,
+      });
+      try {
+        installed.session.setActiveToolsByName(["WebFetch", ...CORE]);
+        for (const [mode, source] of [["tui", "interactive"], ["print", "interactive"], ["json", "interactive"], ["rpc", "rpc"]] as const) {
+          await submit(installed, mode, `${cleanup}-${mode}-first`, source);
+          await submit(installed, mode, `${cleanup}-${mode}-repeat`, source);
+        }
+        expect(installed.counts()).toMatchObject({ providerPrompts: 0, hookCalls: 0, sdkLoads: 1 });
+      } finally {
+        await installed.close();
+      }
+    }
+  });
+});
