@@ -3098,12 +3098,13 @@ describe("condensed completion records", () => {
       expect(tuiVisibleWidth(lines[0]!)).toBeLessThanOrEqual(160);
     }
     for (const lines of surfaces(false, narrowWidth)) {
-      expect(lines).toHaveLength(1);
+      expect(lines).toHaveLength(2);
       expect(lines[0]).toContain(`[${state}]`);
       expect(lines[0]).not.toContain("Inspect authentication boundaries");
       expect(lines[0]).not.toContain("4m02s");
-      expect(lines[0]).not.toContain("task-3");
-      expect(tuiVisibleWidth(lines[0]!)).toBeLessThanOrEqual(narrowWidth);
+      expect(lines.join("\n")).not.toContain("task-3");
+      expect(lines[1]).toBe(RECORD_EXPAND_HINT);
+      for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(narrowWidth);
     }
     for (const width of [160, narrowWidth]) {
       for (const lines of surfaces(true, width)) {
@@ -3136,12 +3137,21 @@ describe("condensed completion records", () => {
     }
   });
 
-  it("keeps terminal task IDs out of collapsed rows at every width", () => {
+  it("keeps terminal task IDs out of cue-backed collapsed rows at every sampled width", () => {
     const longAgent = "project-security-reviewer-with-an-extra-long-name";
-    for (const width of [1, 2, 8, 20, 60, 80]) {
+    for (const width of [6, 8, 20, 60, 80]) {
       const lines = renderLines({ ...completedDetails, agent: longAgent }, "answer", false, width);
-      expect(lines).toHaveLength(1);
       expect(lines.join("")).not.toContain("task-3");
+      expect(lines[0]).toMatch(/^●/u);
+      expect(lines.some((line) => line.includes("ctrl+o"))).toBe(true);
+      for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
+    }
+    // No complete binding fits below six columns, so accessibility deliberately
+    // fails open; the semantic marker remains first and every detail row is bounded.
+    for (const width of [1, 2]) {
+      const lines = renderLines({ ...completedDetails, agent: longAgent }, "answer", false, width);
+      expect(lines[0]).toMatch(/^●/u);
+      expect(lines.join("")).toContain("task-3");
       for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
     }
   });
@@ -3292,9 +3302,9 @@ describe("condensed completion records", () => {
     };
     for (let width = 1; width <= 140; width++) {
       const lines = renderLines(details, "body", false, width);
-      expect(lines).toHaveLength(1);
-      expect(tuiVisibleWidth(lines[0]!)).toBeLessThanOrEqual(width);
-      expect(lines[0]).not.toContain("task-3");
+      expect(lines[0]).toMatch(/^✗/u);
+      for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
+      if (width >= 6) expect(lines.join("\n")).not.toContain("task-3");
     }
     const markerOnly = renderLines(details, "body", false, 1)[0]!;
     expect(markerOnly).toBe("✗");
@@ -3311,7 +3321,7 @@ describe("condensed completion records", () => {
     expect(wide).toContain("2m03s");
   });
 
-  it("pins tiny marker/identity thresholds and priority invariants for ASCII, CJK, emoji, and combining text", () => {
+  it("pins exact first semantic rows and marker/identity priority for ASCII, CJK, emoji, and combining text", () => {
     const identities = [
       { agent: "coder", direct: ["●", "●c", "● c"] },
       { agent: "审查", direct: ["●", "●", "●审"] },
@@ -3319,56 +3329,80 @@ describe("condensed completion records", () => {
       { agent: "e\u0301ditor", direct: ["●", "●e\u0301", "● e\u0301"] },
     ];
     for (const { agent, direct } of identities) {
-      for (const [index, expected] of direct.entries()) {
-        expect(renderLines({ ...completedDetails, agent }, "body", false, index + 1)[0]).toBe(expected);
-      }
+      expect([1, 2, 3].map((width) => renderLines({ ...completedDetails, agent }, "body", false, width)[0])).toEqual(direct);
       for (let width = 1; width <= 100; width++) {
-        const line = renderLines({ ...completedDetails, agent, description: "description", durationMs: 1_000 }, "body", false, width)[0]!;
-        expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
-        expect(line.startsWith("●")).toBe(true);
-        expect(line).not.toContain("↕");
-        if (line.includes("description")) expect(line).toContain("[completed]");
-        if (line.includes("1s")) expect(line).toMatch(/ctrl\+o/u);
-        expect(line.replace(/^●\s?/u, "")).not.toBe("…");
+        const lines = renderLines({ ...completedDetails, agent, description: "description", durationMs: 1_000 }, "body", false, width);
+        const semantic = lines[0]!;
+        expect(semantic.startsWith("●")).toBe(true);
+        expect(semantic).not.toContain("↕");
+        if (semantic.includes("description")) expect(semantic).toContain("[completed]");
+        if (semantic.includes("1s")) expect(semantic).toMatch(/ctrl\+o/u);
+        if (width >= 6) expect(semantic.replace(/^●\s?/u, "")).not.toBe("…");
+        for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
       }
+      const ordinarySemantic = renderLines(
+        { ...completedDetails, agent, description: "description", durationMs: 1_000 },
+        "body",
+        false,
+        100,
+      )[0]!;
+      expect(ordinarySemantic.indexOf(agent)).toBeLessThan(ordinarySemantic.indexOf("[completed]"));
     }
 
     const wrapped = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
     const wrappedResult = (agent: string, width: number) => {
       const context = { state: {}, args: { task_id: "task-3" }, isError: false };
       wrapped.renderCall(context.args, undefined, context);
-      return (wrapped.renderResult(
+      return wrapped.renderResult(
         { content: [{ type: "text", text: "body" }], details: { ...completedDetails, agent }, isError: false },
         { isPartial: false, expanded: false }, undefined, context,
-      ).render(width) as string[])[0];
+      ).render(width) as string[];
     };
-    expect([1, 2, 3].map((width) => wrappedResult("coder", width))).toEqual(["●", "●c", "● c"]);
-    expect([1, 2, 3, 4].map((width) => wrappedResult("审查", width))).toEqual(["●", "●", "●审", "● 审"]);
-    expect([1, 2, 3, 4].map((width) => wrappedResult("😀bot", width))).toEqual(["●", "●", "●😀", "● 😀"]);
+    const wrappedExpected = [
+      { agent: "coder", rows: ["●", "●c", "● c"] },
+      { agent: "审查", rows: ["●", "●", "●审", "● 审"] },
+      { agent: "😀bot", rows: ["●", "●", "●😀", "● 😀"] },
+    ];
+    for (const { agent, rows } of wrappedExpected) {
+      for (const [index, expected] of rows.entries()) {
+        const lines = wrappedResult(agent, index + 1);
+        expect(lines[0]).toBe(expected);
+        for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(index + 1);
+      }
+    }
   });
 
   it.each([
     { status: "completed", outcome: "completed", marker: "●" },
     { status: "failed", outcome: "failed", marker: "✗" },
     { status: "stopped", outcome: "aborted", marker: "■" },
-  ] as const)("uses the full production width three for wrapped CJK and emoji $status identities", ({ status, outcome, marker }) => {
+  ] as const)("keeps exact tiny production CJK and emoji $status identities while failing open", ({ status, outcome, marker }) => {
     const wrapped = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
     const render = (agent: string, width: number) => {
       const context = { state: {}, args: { task_id: "task-3" }, isError: false };
       wrapped.renderCall(context.args, undefined, context);
-      return (wrapped.renderResult(
+      return wrapped.renderResult(
         {
           content: [{ type: "text", text: "body" }],
           details: { ...completedDetails, status, outcome, agent },
           isError: false,
         },
         { isPartial: false, expanded: false }, undefined, context,
-      ).render(width) as string[])[0];
+      ).render(width) as string[];
     };
-    expect(render("审查", 3)).toBe(`${marker}审`);
-    expect(render("😀bot", 3)).toBe(`${marker}😀`);
-    expect(render("审查", 4)).toBe(`${marker} 审`);
-    expect(render("😀bot", 4)).toBe(`${marker} 😀`);
+    for (const agent of ["审查", "😀bot"]) {
+      expect(render(agent, 1)[0]).toBe(marker);
+      expect(render(agent, 2)[0]).toBe(marker);
+      expect(render(agent, 3)[0]).toBe(`${marker}${agent === "审查" ? "审" : "😀"}`);
+      expect(render(agent, 4)[0]).toBe(`${marker} ${agent === "审查" ? "审" : "😀"}`);
+      for (const width of [1, 2, 3, 4]) {
+        const lines = render(agent, width);
+        for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
+      }
+      const resized = render(agent, 5);
+      expect(resized.join("").replace(/\s/gu, "")).toContain("body");
+      for (const line of resized) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(5);
+    }
   });
 
   it.each([
@@ -3419,20 +3453,24 @@ describe("condensed completion records", () => {
   it("keeps completed, failed, stopped, diagnostic, and fork records scalar-safe through Unicode width sweeps", () => {
     const identities = ["ascii-reviewer", "审查员", "agent-😀", "re\u0301viewer"];
     const scenarios = [
-      { ...completedDetails, outcome: "completed", status: "completed", description: "ASCII description" },
-      { ...completedDetails, outcome: "failed", status: "failed", error: "action required", description: "" },
-      { ...completedDetails, outcome: "aborted", status: "stopped", userStopped: true, description: "停止 😀 e\u0301" },
-      { ...completedDetails, outcome: "completed", status: "completed", diagnostics: [{ severity: "error" as const, message: "诊断 😀 e\u0301" }] },
-      { ...completedDetails, outcome: "completed", status: "completed", diagnostics: [{ severity: "warning" as const, message: `${FORK_DEGRADE_PREFIX} unavailable` }] },
+      { ...completedDetails, outcome: "completed", status: "completed", description: "ASCII description", marker: "●" },
+      { ...completedDetails, outcome: "failed", status: "failed", error: "action required", description: "", marker: "✗" },
+      { ...completedDetails, outcome: "aborted", status: "stopped", userStopped: true, description: "停止 😀 e\u0301", marker: "■" },
+      { ...completedDetails, outcome: "completed", status: "completed", diagnostics: [{ severity: "error" as const, message: "诊断 😀 e\u0301" }], marker: "●" },
+      { ...completedDetails, outcome: "completed", status: "completed", diagnostics: [{ severity: "warning" as const, message: `${FORK_DEGRADE_PREFIX} unavailable` }], marker: "●" },
     ];
     for (const agent of identities) {
       for (const scenario of scenarios) {
         for (let width = 1; width <= 100; width++) {
-          const lines = renderLines({ ...scenario, agent }, "body", false, width);
-          expect(lines).toHaveLength(1);
-          expect(tuiVisibleWidth(lines[0]!)).toBeLessThanOrEqual(width);
-          expect(lines[0]).not.toMatch(/[\uD800-\uDFFF]/u);
-          expect(lines[0]).not.toContain("\n");
+          const { marker, ...details } = scenario;
+          const lines = renderLines({ ...details, agent }, "body", false, width);
+          expect(lines[0]).toMatch(new RegExp(`^${marker}`, "u"));
+          for (const line of lines) {
+            expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
+            expect(line).not.toMatch(/[\uD800-\uDFFF]/u);
+            expect(line).not.toContain("\n");
+          }
+          if (width >= 6) expect(lines.join("\n")).not.toContain("task-3");
         }
       }
     }

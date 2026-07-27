@@ -14,7 +14,9 @@ import {
   type GlobResultDetails,
   type GrepResultDetails,
 } from "./tools/search-tools.js";
-import { genericResultComponent, type RenderCtx } from "./tool-shell.js";
+import { genericResultComponent, suppressToolRow, type RenderCtx } from "./tool-shell.js";
+import { toolResultHasGuardClipping } from "./guard.js";
+import { piToolsExpandKeyText } from "./pi-tui-runtime.js";
 import {
   formatDisplayPathFromRoots,
   formatToolDisplayName,
@@ -24,8 +26,10 @@ import {
   type DisplayRootResolver,
   type DisplayRoots,
 } from "./tool-display.js";
-import { themedFg } from "./render-util.js";
+import { sanitizeDisplayText, themedFg } from "./render-util.js";
 const LINE_BREAK_RE = /\r\n?|\n|\u2028|\u2029/;
+const DISPLAY_TEXT_LIMIT = 1_048_576;
+const CLIP_INSPECTION_WINDOW = 32_768;
 
 interface Component {
   render(width: number): string[];
@@ -42,6 +46,7 @@ interface SummaryState {
   count?: string;
   compactCount?: string;
   recovery?: string;
+  expansionCue?: string;
 }
 
 interface RenderContext extends RenderCtx {
@@ -153,25 +158,13 @@ function validateGlobDetails(value: unknown): GlobResultDetails | undefined {
   return { totalMatches, returned, capped, truncated };
 }
 
-function stripTerminalEscapes(text: string): string {
-  return text
-    .replace(/\u001b\][\s\S]*?(?:\u0007|\u001b\\|\u009c)/gu, "")
-    .replace(/[\u001b\u009b][[\]()#;?]*(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]/gu, "");
-}
-
-function sanitize(text: unknown, inline: boolean): string {
-  let value = typeof text === "string" ? text : "";
+function sanitize(text: unknown, inline: boolean, limit = DISPLAY_TEXT_LIMIT): string {
+  if (typeof text !== "string") return "";
   try {
-    value = value.normalize("NFC");
+    return sanitizeDisplayText(text, limit, inline);
   } catch {
     return "";
   }
-  value = stripTerminalEscapes(value)
-    .replace(/\p{Cf}/gu, "")
-    .replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, (character) =>
-      !inline && character === "\n" ? "\n" : character === "\t" ? "   " : " ",
-    );
-  return inline ? value.replace(/\s+/gu, " ").trim() : value;
 }
 
 function safeGet(value: unknown, key: PropertyKey): unknown {
@@ -379,19 +372,24 @@ function selectSummaryCore(
     : styledCore(toolName, undefined, "", "", theme);
 }
 
+interface SummaryLine {
+  line: string;
+  cueAppended: boolean;
+}
+
 function summaryLine(
   toolName: SearchName,
   args: Snapshot,
   state: SummaryState | undefined,
   theme: unknown,
   width: number,
-): string {
-  if (!Number.isFinite(width) || width <= 0) return "";
+): SummaryLine {
+  if (!Number.isFinite(width) || width <= 0) return { line: "", cueAppended: false };
   const parts = invocationParts(toolName, args);
   const inline = selectSummaryCore(toolName, parts.expression, state, theme, width, true);
   const core = inline ?? selectSummaryCore(toolName, parts.expression, state, theme, width, false);
   let line = core?.line ?? safeFg(theme, "text", formatToolDisplayName(toolName));
-  if (state?.status && !core?.hasStatus) return clamp(line, width);
+  if (state?.status && !core?.hasStatus) return { line: clamp(line, width), cueAppended: false };
   if (state?.count) {
     for (const countText of [state.count, state.compactCount].filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index)) {
       const next = addSegment(line, countText, theme, width);
@@ -410,7 +408,21 @@ function summaryLine(
     if (shortened) line = addSegment(line, shortened, theme, width) ?? line;
   }
   for (const part of [...parts.filters, ...parts.modifiers]) line = addSegment(line, part, theme, width) ?? line;
-  return clamp(line, width);
+  let cueAppended = false;
+  if (state?.expansionCue) {
+    const binding = state.expansionCue.endsWith(" to expand")
+      ? state.expansionCue.slice(0, -" to expand".length)
+      : state.expansionCue;
+    for (const cue of [state.expansionCue, binding]) {
+      const next = cue ? addSegment(line, cue, theme, width) : undefined;
+      if (next) {
+        line = next;
+        cueAppended = true;
+        break;
+      }
+    }
+  }
+  return { line: clamp(line, width), cueAppended };
 }
 
 const CLIP_HINTS: Record<SearchName, string> = {
@@ -418,16 +430,26 @@ const CLIP_HINTS: Record<SearchName, string> = {
   Glob: "re-run a narrower command — target a specific path, request fewer entries, or pipe through a filter — to recover the omitted output",
 };
 
-// The exact in-band marker is an advisory clipping signal; ordinary prose and counts are ignored.
+// The exact in-band marker is advisory. Inspect only bounded retained edges during collapsed repaint.
 function exactClipMarker(toolName: SearchName, text: string): boolean {
   const escaped = CLIP_HINTS[toolName].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(
+  const marker = new RegExp(
     `(?:^|\\n\\n)\\[PiCC clipped (?:0|[1-9]\\d*) characters from the middle of this ${toolName} output — ${escaped}\\](?=\\n\\n|$)`,
     "u",
-  ).test(text);
+  );
+  const prefix = text.slice(0, CLIP_INSPECTION_WINDOW);
+  if (marker.test(prefix)) return true;
+  if (text.length <= CLIP_INSPECTION_WINDOW) return false;
+  return marker.test(text.slice(-CLIP_INSPECTION_WINDOW));
 }
 
-function deriveState(toolName: SearchName, details: GrepResultDetails | GlobResultDetails, args: Snapshot, primaryText: string): SummaryState {
+function deriveState(
+  toolName: SearchName,
+  details: GrepResultDetails | GlobResultDetails,
+  args: Snapshot,
+  result: unknown,
+  primaryText: string,
+): SummaryState {
   const statuses: string[] = [];
   const compact: string[] = [];
   let countText: string;
@@ -467,7 +489,7 @@ function deriveState(toolName: SearchName, details: GrepResultDetails | GlobResu
     countText = `${String(glob.returned)}/${String(glob.totalMatches)} files`;
     compactCount = `${String(glob.returned)}/${String(glob.totalMatches)}`;
   }
-  if (exactClipMarker(toolName, primaryText)) {
+  if (toolResultHasGuardClipping(result) || exactClipMarker(toolName, primaryText)) {
     statuses.push("clipped"); compact.push("clip"); incomplete = true;
   }
   return {
@@ -557,6 +579,43 @@ function recoveryComponent(toolName: SearchName, args: Snapshot, state: SummaryS
   }, "Recovery unavailable");
 }
 
+function cueCandidates(cue: string): string[] {
+  const binding = cue.endsWith(" to expand") ? cue.slice(0, -" to expand".length) : cue;
+  return [cue, binding].filter((candidate, index, all) => candidate.length > 0 && all.indexOf(candidate) === index);
+}
+
+function summaryComponent(
+  toolName: SearchName,
+  args: Snapshot,
+  state: SummaryState,
+  theme: unknown,
+  failOpenDetail?: Component,
+): Component {
+  return guarded({
+    render(width: number): string[] {
+      const summary = summaryLine(toolName, args, state, theme, width);
+      if (!state.expansionCue || summary.cueAppended) return [summary.line];
+      const separate = cueCandidates(state.expansionCue).find((candidate) => measuredWidth(candidate) <= width);
+      if (separate) return [summary.line, safeFg(theme, "muted", separate)];
+      return failOpenDetail ? [summary.line, ...failOpenDetail.render(width)] : [summary.line];
+    },
+  }, toolName);
+}
+
+function detailComponent(text: string, theme: unknown): Component {
+  const snapshot = sanitize(text, false);
+  return guarded({
+    render(width: number): string[] {
+      if (width <= 0) return snapshot.split("\n").map(() => "");
+      const lines: string[] = [];
+      for (const sourceLine of snapshot.split("\n")) {
+        lines.push(...wrapTextWithAnsi(safeFg(theme, "toolOutput", sourceLine), Math.max(1, width)));
+      }
+      return lines;
+    },
+  }, "Search detail unavailable");
+}
+
 function combinedComponent(components: readonly Component[]): Component {
   return guarded({
     render(width: number): string[] {
@@ -604,6 +663,8 @@ export function withCompactSearchRendering<T extends ToolDefinition>(
     throw new TypeError("compact search rendering accepts only Grep, Glob, grep, find, or ls tools");
   }
   const roots = new WeakMap<object, DisplayRoots>();
+  // HTML invokes only the initial partial call pass; interactive Pi invokes a final call pass before its result.
+  const htmlCallStates = new WeakSet<object>();
   const rootsFor = (context: unknown): DisplayRoots => {
     const state = safeGet(context, "state");
     const resolved = () => resolveDisplayRoots(
@@ -628,6 +689,12 @@ export function withCompactSearchRendering<T extends ToolDefinition>(
     ...tool,
     renderCall(_args: unknown, _theme: unknown, context: RenderContext): Component {
       rootsFor(context);
+      suppressToolRow(context);
+      const state = safeGet(context, "state");
+      if ((typeof state === "object" || typeof state === "function") && state !== null) {
+        if (safeGet(context, "isPartial") === true) htmlCallStates.add(state);
+        else htmlCallStates.delete(state);
+      }
       return { render: () => [] };
     },
     renderResult(result: ResultShape, options: { isPartial?: boolean }, theme: unknown, context: RenderContext): Component {
@@ -639,7 +706,7 @@ export function withCompactSearchRendering<T extends ToolDefinition>(
         if (safeGet(context, "isError") === true) {
           const failed: SummaryState = { status: "failed", compactStatus: "fail" };
           return combinedComponent([
-            guarded({ render: (width) => [summaryLine(toolName, args, failed, theme, width)] }, toolName),
+            guarded({ render: (width) => [summaryLine(toolName, args, failed, theme, width).line] }, toolName),
             failOpenComponent(result, theme, context),
           ]);
         }
@@ -658,11 +725,18 @@ export function withCompactSearchRendering<T extends ToolDefinition>(
           if (text === undefined) return failOpenComponent(result, theme, context);
           feedback.push(text);
         }
-        const state = deriveState(toolName, details, args, primaryText);
-        const components: Component[] = [
-          guarded({ render: (width) => [summaryLine(toolName, args, state, theme, width)] }, toolName),
-          recoveryComponent(toolName, args, state, theme),
-        ];
+        const expansion = piToolsExpandKeyText();
+        const key = expansion.available ? sanitize(expansion.value, true, 512) : "";
+        const contextState = safeGet(context, "state");
+        const html = (typeof contextState === "object" || typeof contextState === "function") && contextState !== null &&
+          htmlCallStates.has(contextState);
+        const revealDetail = safeGet(options, "expanded") === true || !expansion.available || !key;
+        const state = deriveState(toolName, details, args, result, primaryText);
+        if (!revealDetail) state.expansionCue = html ? "click to show detail" : `${key} to expand`;
+        const detail = detailComponent(primaryText, theme);
+        const components: Component[] = [summaryComponent(toolName, args, state, theme, detail)];
+        if (revealDetail) components.push(detail);
+        components.push(recoveryComponent(toolName, args, state, theme));
         if (feedback.length > 0) components.push(feedbackComponent(feedback, theme));
         return combinedComponent(components);
       } catch {

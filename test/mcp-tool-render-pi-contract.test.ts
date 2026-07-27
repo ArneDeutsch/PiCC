@@ -134,4 +134,27 @@ describe("real Pi MCP tool-row contract", () => {
       for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
     }
   });
+
+  it("sanitizes arbitrary MCP display text through real Pi composition without changing canonical bytes", () => {
+    initTheme();
+    const definition = proxyDefinition();
+    const hostile = "first\r\nsecond\rreturn\u0000\u0085\u001b[31mred\u001b]0;title\u0007\u009b32mgreen\u009dtitle\u009c\u202eend";
+    const result = Object.freeze({
+      content: Object.freeze([{ type: "text" as const, text: hostile }]),
+      details: Object.freeze({ server: "Srv.Name", tool: "Echo__V2" }),
+      isError: false,
+    });
+    const before = JSON.stringify(result);
+    const component = row(definition, "mcp-hostile");
+    component.setArgsComplete();
+    component.updateResult(result as never, false);
+    const lines = plain(component.render(18) as string[]);
+    const shown = lines.join("\n");
+    expect(lines.some((line) => line.trimEnd().endsWith("first"))).toBe(true);
+    expect(shown).toContain("second�return�");
+    expect(shown).not.toMatch(/[\r\u0000\u0085\u001b\u009b\u009d\u009c\u202e]/u);
+    expect(shown.match(/[○●✗■]/gu)).toHaveLength(1);
+    for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(18);
+    expect(JSON.stringify(result)).toBe(before);
+  });
 });

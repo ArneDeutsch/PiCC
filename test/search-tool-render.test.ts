@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -10,6 +11,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { withCompactSearchRendering } from "../src/runtime/search-tool-render.js";
+import { createGuardExtension } from "../src/runtime/guard.js";
 import { createGlobTool, createGrepTool } from "../src/runtime/tools/search-tools.js";
 
 interface Component {
@@ -49,6 +51,13 @@ const grepDetails = {
   totalEntries: 2,
   returnedEntries: 2,
   truncated: false,
+};
+
+const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+const piTui = piRequire("@earendil-works/pi-tui") as {
+  KeybindingsManager: new (definitions: Record<string, unknown>, bindings?: Record<string, unknown>) => unknown;
+  TUI_KEYBINDINGS: Record<string, unknown>;
+  setKeybindings(manager: unknown): void;
 };
 
 const globDetails = {
@@ -333,30 +342,90 @@ describe("compact search rendering decorator", () => {
     }
   });
 
-  it("hides ordinary final output in collapsed and expanded views", () => {
-    for (const expanded of [false, true]) {
-      const grep = callAndFinalize(
-        grepTool(),
-        { pattern: "needle" },
-        textResult("a.ts\nb.ts", grepDetails),
-        100,
-        expanded,
-      );
-      expect(grep.call).toEqual([]);
-      expect(grep.result).toHaveLength(1);
-      expect(grep.result.join(" ")).toContain("2/2 entries");
-      expect(grep.result.join(" ")).not.toContain("a.ts");
+  it("keeps ordinary final output collapsed, reveals it once, and hides it again", () => {
+    for (const entry of [
+      { tool: grepTool(), args: { pattern: "needle" }, body: "a.ts\nb.ts", details: grepDetails, count: "2/2 entries" },
+      { tool: globTool(), args: { pattern: "*.ts" }, body: "/a.ts\n/b.ts", details: globDetails, count: "2/2 files" },
+    ]) {
+      const ctx = context(entry.args);
+      expect(entry.tool.renderCall(entry.args, undefined, ctx).render(100)).toEqual([]);
+      const render = (expanded: boolean) => entry.tool.renderResult(
+        textResult(entry.body, entry.details), { expanded, isPartial: false }, undefined, ctx,
+      ).render(100).join("\n");
+      const collapsed = render(false);
+      expect(collapsed).toContain(entry.count);
+      expect(collapsed).toContain("ctrl+o to expand");
+      expect(collapsed).not.toContain(entry.body.split("\n")[0]);
+      const expanded = render(true);
+      for (const line of entry.body.split("\n")) expect(expanded.split(line)).toHaveLength(2);
+      expect(render(false)).not.toContain(entry.body.split("\n")[0]);
+    }
+  });
 
-      const glob = callAndFinalize(
-        globTool(),
-        { pattern: "*.ts" },
-        textResult("/a.ts\n/b.ts", globDetails),
-        100,
-        expanded,
-      );
-      expect(glob.call).toEqual([]);
-      expect(glob.result).toHaveLength(1);
-      expect(glob.result.join(" ")).toContain("2/2 files");
+  it.each([
+    { name: "a remapped action", binding: "alt+e", cue: "alt+e to expand", reveals: false },
+    { name: "an explicit unbind", binding: [] as string[], cue: "to expand", reveals: true },
+  ])("keeps detail reachable with $name", ({ binding, cue, reveals }) => {
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": binding }));
+    try {
+      const body = "src/retained.ts:1:needle";
+      const rendered = callAndFinalize(
+        grepTool(), { pattern: "needle" },
+        textResult(body, { ...grepDetails, totalEntries: 1, returnedEntries: 1 }), 120, false,
+      ).result.join("\n");
+      expect(rendered.includes(body)).toBe(reveals);
+      if (reveals) expect(rendered).not.toContain(cue);
+      else expect(rendered).toContain(cue);
+    } finally {
+      piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
+    }
+  });
+
+  it("does not let hostile patterns impersonate full or compact renderer-owned cues", () => {
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
+    try {
+      for (const pattern of ["project alt+e label", "project alt+e to expand label"]) {
+        const rendered = callAndFinalize(
+          grepTool(), { pattern },
+          textResult("owned-hidden-detail", { ...grepDetails, totalEntries: 1, returnedEntries: 1 }), 120, false,
+        ).result.join("\n");
+        expect(rendered.match(/alt\+e/gu)).toHaveLength(2);
+        expect(rendered).not.toContain("owned-hidden-detail");
+      }
+    } finally {
+      piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
+    }
+  });
+
+  it("keeps a truthful cue with hostile labels at narrow widths and fails open when no cue fits", () => {
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
+    try {
+      const args = { pattern: `${"hostile".repeat(40)}\u001b[31m`, path: `/very/${"long/".repeat(30)}target` };
+      const result = textResult("Z-retained", { ...grepDetails, totalEntries: 1, returnedEntries: 1 });
+      const before = structuredClone(result);
+      const narrow = callAndFinalize(grepTool(), args, result, 8).result;
+      expect(narrow.join("\n")).toContain("alt+e");
+      expect(narrow.join("\n")).not.toContain("Z-retained");
+      expectBounded(narrow, 8);
+
+      const tooNarrow = callAndFinalize(grepTool(), args, result, 3).result.join("");
+      expect(tooNarrow).not.toContain("alt+e");
+      expect(tooNarrow).toContain("Z-retained");
+      expect(result).toEqual(before);
+    } finally {
+      piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
     }
   });
 
@@ -475,6 +544,56 @@ describe("compact search rendering decorator", () => {
     );
   });
 
+  it("treats CRLF as one line boundary, neutralizes lone CR, and preserves canonical bytes", () => {
+    const hostile = "first\r\nsecond\rthird\u0000\u0085\u001b[31mred\u001b]0;title\u0007\u009b32mgreen\u009dtitle\u009c\u001b]unterminated\t中🙂\u202eend";
+    const result = textResult(hostile, { ...grepDetails, totalEntries: 1, returnedEntries: 1 });
+    const before = structuredClone(result);
+    const rendered = callAndFinalize(grepTool(), { pattern: "x" }, result, 80, true).result;
+    expect(rendered[1]).toBe("first");
+    expect(rendered[2]).toContain("second�third�");
+    expect(rendered.join("\n")).toContain("red");
+    expect(rendered.join("\n")).not.toMatch(/[\r\u0000\u0085\u001b\u009b\u009d\u009c\u202e]/u);
+    expectBounded(rendered, 80);
+    expect(result).toEqual(before);
+    expect((result.content as Array<{ text: string }>)[0]!.text).toBe(hostile);
+  });
+
+  it("uses guard clipping metadata when the default-sized marker is outside inspected edges", async () => {
+    const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
+    createGuardExtension({
+      engine: {} as never,
+      hooks: { hasHooks: () => false } as never,
+      getCwd: () => ".",
+      clipMaxTokens: 20_000,
+    })({ on: (event: string, handler: (payload: unknown, context: unknown) => unknown) => handlers.set(event, handler) } as never);
+    const event = {
+      toolName: "Grep",
+      input: { pattern: "needle" },
+      content: [{ type: "text", text: `${"h".repeat(50_000)}${"t".repeat(50_000)}` }],
+      details: { ...grepDetails, totalEntries: 1, returnedEntries: 1 },
+      isError: false,
+    };
+    const patch = await handlers.get("tool_result")!(event, {});
+    const guarded = { ...event, ...(patch as object) };
+    const primary = (guarded.content[0] as { text: string }).text;
+    expect(primary.slice(0, 32_768)).not.toContain("[PiCC clipped");
+    expect(primary.slice(-32_768)).not.toContain("[PiCC clipped");
+    const collapsed = callAndFinalize(grepTool(), event.input, guarded, 120).result.join(" ");
+    expect(collapsed).toContain("clipped");
+    expect(collapsed).toContain("head_limit/offset");
+  });
+
+  it("limits fallback collapsed clip-marker inspection to retained edge windows", () => {
+    const hint = "re-run the search with a tighter pattern or a smaller head_limit/offset to recover the omitted matches";
+    const marker = `[PiCC clipped 12 characters from the middle of this Grep output — ${hint}]`;
+    const middle = `head${"x".repeat(40_000)}\n\n${marker}\n\n${"y".repeat(40_000)}tail`;
+    const collapsed = callAndFinalize(grepTool(), { pattern: "x" }, textResult(middle, grepDetails), 120).result.join(" ");
+    expect(collapsed).not.toContain("clipped");
+    const tail = `head${"x".repeat(70_000)}\n\n${marker}`;
+    expect(callAndFinalize(grepTool(), { pattern: "x" }, textResult(tail, grepDetails), 120).result.join(" "))
+      .toContain("clipped");
+  });
+
   it("sanitizes feedback completely before width-aware wrapping", () => {
     const hostile = "ok\rOVER\u001b[31mred\u001b[0m\u001b]0;title\u0007中🙂e\u0301\u0000\u0085\u007f\u202eend\u2028next";
     const rendered = callAndFinalize(
@@ -508,7 +627,7 @@ describe("compact search rendering decorator", () => {
         textResult("ordinary", { ...grepDetails, mode: "content" }),
         { expanded: false, isPartial: false }, undefined, ctx,
       ).render(width);
-      expect(lines).toHaveLength(1);
+      expect(lines.length).toBeGreaterThan(0);
       expectBounded(lines, width);
       if (width >= 3) expect(visibleWidth(lines[0] ?? "")).toBeGreaterThan(0);
       expect(lines[0]).not.toMatch(/[\r\n\u0007\u202e]/u);
@@ -628,7 +747,7 @@ describe("compact search rendering decorator", () => {
       const lines = tool.renderResult(
         textResult("ordinary", grepDetails), { expanded: false, isPartial: false }, theme, ctx,
       ).render(20);
-      expect(lines).toHaveLength(1);
+      expect(lines.length).toBeGreaterThan(0);
       expectBounded(lines, 20);
     }
     const malformedCtx = { args: { pattern: "x" }, state: null } as unknown as RenderContext;
@@ -808,7 +927,7 @@ describe("compact search rendering decorator", () => {
         });
         const row = tool.renderResult(
           result,
-          { expanded: true, isPartial: false },
+          { expanded: false, isPartial: false },
           undefined,
           context(testCase.args),
         ).render(240);
@@ -853,7 +972,7 @@ describe("compact search rendering decorator", () => {
         const primary = (result.content[0] as { type: "text"; text: string }).text;
         const lines = tool.renderResult(
           result,
-          { expanded: true, isPartial: false },
+          { expanded: false, isPartial: false },
           undefined,
           context(args),
         ).render(240);
@@ -935,7 +1054,7 @@ describe("compact search rendering decorator", () => {
       expect(row).toContain("2/2 entries");
       expect(row).toContain("in …");
       expect(row).toMatch(/recognizable-(?:posix|win)\.ts/);
-      expectBounded([row], 58);
+      expectBounded(rendered.result, 58);
     }
   });
 
@@ -992,7 +1111,7 @@ describe("compact search rendering decorator", () => {
         { expanded: false, isPartial: false }, undefined, context({ pattern: "x" }),
       ).render(width);
       for (const lines of [clean, status]) {
-        expect(lines).toHaveLength(1);
+        expect(lines.length).toBeGreaterThan(0);
         expectBounded(lines, width);
         if (width >= 3) expect(visibleWidth(lines[0] ?? "")).toBeGreaterThan(0);
         expect(lines.join(" ")).not.toContain("ordinary");

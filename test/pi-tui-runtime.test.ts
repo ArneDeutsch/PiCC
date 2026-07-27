@@ -16,10 +16,52 @@ afterEach(() => {
 });
 
 describe("Pi-owned TUI runtime bridge fallbacks", () => {
+  it.each([
+    {
+      name: "uses the documented default before application definitions initialize",
+      definition: undefined,
+      keyText: vi.fn(() => "must not be consulted"),
+      expected: { available: true, value: "ctrl+o" },
+      calls: 0,
+    },
+    {
+      name: "formats a remapped initialized action through coding-agent keyText",
+      definition: { defaultKeys: "ctrl+o" },
+      keyText: vi.fn(() => "alt+e"),
+      expected: { available: true, value: "alt+e" },
+      calls: 1,
+    },
+    {
+      name: "reports an explicitly unbound initialized action unavailable",
+      definition: { defaultKeys: "ctrl+o" },
+      keyText: vi.fn(() => ""),
+      expected: { available: false },
+      calls: 1,
+    },
+  ])("$name", async ({ definition, keyText, expected, calls }) => {
+    mockPackageContext((source) => source === "coding"
+      ? { keyText }
+      : {
+          Box: class {},
+          getCapabilities: () => ({ images: null, trueColor: false, hyperlinks: false }),
+          getKeybindings: () => ({ getDefinition: () => definition }),
+        });
+    vi.resetModules();
+
+    const runtime = await import("../src/runtime/pi-tui-runtime.js");
+    expect(runtime.piToolsExpandKeyText()).toEqual(expected);
+    expect(keyText).toHaveBeenCalledTimes(calls);
+    if (calls > 0) expect(keyText).toHaveBeenCalledWith("app.tools.expand");
+  });
+
   it("reports expansion-key lookup failure without rejecting module activation", async () => {
     mockPackageContext((source) => source === "coding"
       ? { keyText() { throw new Error("keybindings unavailable"); } }
-      : undefined);
+      : {
+          Box: class {},
+          getCapabilities: () => ({ images: null, trueColor: false, hyperlinks: false }),
+          getKeybindings: () => ({ getDefinition: () => ({ defaultKeys: "ctrl+o" }) }),
+        });
     vi.resetModules();
 
     const runtime = await import("../src/runtime/pi-tui-runtime.js");

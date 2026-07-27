@@ -18,6 +18,7 @@ import {
 import type { Diagnostic } from "../types.js";
 import { normalizeAgentColor, tintAgentColor, type AgentColorName } from "./agent-color.js";
 import { formatToolDisplayName } from "./tool-display.js";
+import { piToolsExpandKeyText } from "./pi-tui-runtime.js";
 import type { SubagentAdmission } from "./subagent-registry.js";
 
 // --- live-progress + result rendering helpers ---
@@ -28,17 +29,8 @@ import type { SubagentAdmission } from "./subagent-registry.js";
 // (clampLines, pushWrapped, pushColored, themedFg, themedBold) live in
 // render-util.ts, shared with the subagent status panel.
 
-// Collapsed-completion-record markers, exported so the pure render tests and
-// the print-mode e2e negative assertion share the exact strings (print mode
-// never runs renderers, so these must never appear on stdout).
-/**
- * The subtle expand affordance on the collapsed completion record, phrased
- * like Pi's own hints (`<key> to <verb>`). A STATIC string on purpose: Pi's
- * keybinding-aware `keyHint` helper reads Pi's module-global theme + keybinding
- * singletons (initialized only inside the real TUI), so it is not reachable
- * from this pure `(result, options, theme)` renderer seam without a throw risk —
- * and the e2e print-mode negative assertion needs a stable literal to pin.
- */
+// Retained as a compatibility sentinel for print-mode negative assertions;
+// interactive completion cues are resolved from Pi's configured action.
 export const RECORD_EXPAND_HINT = "ctrl+o to expand";
 /** The condensed fork-degrade warning — NEVER expand-only on a degraded fork. */
 export const RECORD_FORK_MARKER = "⚠ fork degraded";
@@ -305,6 +297,35 @@ function pushBodyText(text: string, width: number, into: string[]): void {
 /** Flatten model-/file-supplied label text to a single sanitized display line. */
 function sanitizeInline(text: string): string {
   return humanDisplayText(text, true);
+}
+
+function containsEquivalentErrorFraming(body: string, error: string): boolean {
+  const normalizedBody = sanitizeInline(body);
+  const normalizedError = sanitizeInline(error);
+  if (!normalizedBody || !normalizedError) return false;
+  const codePointBefore = (index: number): string | undefined => {
+    if (index <= 0) return undefined;
+    const trailing = normalizedBody.charCodeAt(index - 1);
+    const start = trailing >= 0xDC00 && trailing <= 0xDFFF && index > 1 &&
+        normalizedBody.charCodeAt(index - 2) >= 0xD800 && normalizedBody.charCodeAt(index - 2) <= 0xDBFF
+      ? index - 2
+      : index - 1;
+    return normalizedBody.slice(start, index);
+  };
+  const codePointAt = (index: number): string | undefined => {
+    const value = normalizedBody.codePointAt(index);
+    return value === undefined ? undefined : String.fromCodePoint(value);
+  };
+  const constituent = (value: string | undefined) => value !== undefined && /[\p{L}\p{M}\p{N}_]/u.test(value);
+  let offset = 0;
+  while (offset <= normalizedBody.length - normalizedError.length) {
+    const index = normalizedBody.indexOf(normalizedError, offset);
+    if (index < 0) return false;
+    const afterIndex = index + normalizedError.length;
+    if (!constituent(codePointBefore(index)) && !constituent(codePointAt(afterIndex))) return true;
+    offset = index + Math.max(1, normalizedError.length);
+  }
+  return false;
 }
 
 /**
@@ -689,6 +710,7 @@ function lifecycleLine(
     color?: AgentColorName;
   },
   width: number,
+  metadata?: { cueAppended: boolean },
 ): string[] {
   if (!Number.isFinite(width) || width <= 0) return [];
   const columns = Math.floor(width);
@@ -752,6 +774,7 @@ function lifecycleLine(
     for (const segment of optional) remainder += themedFg(theme, segment.tone ?? "muted", `${segment.separator}${segment.text}`);
     if (options.cue) remainder += themedFg(theme, "muted", ` · ${options.cue}`);
     try {
+      if (options.cue) metadata && (metadata.cueAppended = true);
       if (visibleWidth(action + remainder) <= columns) return [action + remainder];
       return [
         ...wrapTextWithAnsi(action, Math.max(1, columns)),
@@ -792,6 +815,7 @@ function lifecycleLine(
   for (const segment of required) line += themedFg(theme, segment.tone ?? "muted", `${segment.separator}${segment.text}`);
   for (const segment of optional) line += themedFg(theme, segment.tone ?? "muted", `${segment.separator}${segment.text}`);
   if (options.cue) line += themedFg(theme, "muted", ` · ${options.cue}`);
+  if (options.cue && visibleWidth(line) <= columns) metadata && (metadata.cueAppended = true);
   return clampLines([line], columns);
 }
 
@@ -808,6 +832,11 @@ function meaningfulIdentityFragment(text: string, width: number): string {
   }
 }
 
+interface CollapsedRecordLines {
+  lines: string[];
+  cueAppended: boolean;
+}
+
 function semanticTerminalLine(
   theme: unknown,
   details: SubagentRenderDetails,
@@ -816,12 +845,15 @@ function semanticTerminalLine(
   tone: string,
   exceptional: LifecycleSegment[],
   width: number,
+  expansionCue: string,
   color?: AgentColorName,
-): string[] {
-  if (!Number.isFinite(width) || width <= 0) return [];
+): CollapsedRecordLines {
+  if (!Number.isFinite(width) || width <= 0) return { lines: [], cueAppended: false };
   const columns = Math.floor(width);
   const marker = prefix.trim();
-  if (marker && columns <= visibleWidth(marker)) return clampLines([themedFg(theme, tone, marker)], columns);
+  if (marker && columns <= visibleWidth(marker)) {
+    return { lines: clampLines([themedFg(theme, tone, marker)], columns), cueAppended: false };
+  }
 
   const safeAgent = sanitizeInline(details.agent ?? "") || "subagent";
   const stateText = `[${state}]`;
@@ -862,12 +894,12 @@ function semanticTerminalLine(
         identityRoom = columns - used;
         fittedAgent = meaningfulIdentityFragment(safeAgent, identityRoom);
       }
-      if (!fittedAgent) return clampLines([line], columns);
+      if (!fittedAgent) return { lines: clampLines([line], columns), cueAppended: false };
       const styledIdentity = color
         ? tintAgentColor(color, themedBold(theme, fittedAgent))
         : themedFg(theme, "text", fittedAgent);
       line += identityGap + styledIdentity;
-      return clampLines([line], columns);
+      return { lines: clampLines([line], columns), cueAppended: false };
     }
   }
 
@@ -891,15 +923,20 @@ function semanticTerminalLine(
 
   for (const segment of exceptional) {
     if (!appendText(segment.separator, segment.text, segment.tone ?? "muted", true)) {
-      return clampLines([line], columns);
+      return { lines: clampLines([line], columns), cueAppended: false };
     }
   }
   const description = sanitizeInline(details.description ?? "");
-  if (description && !appendText(" - ", description, "accent", true)) return clampLines([line], columns);
+  if (description && !appendText(" - ", description, "accent", true)) {
+    return { lines: clampLines([line], columns), cueAppended: false };
+  }
 
   const remaining = columns - used;
-  const cue = [RECORD_EXPAND_HINT, "ctrl+o"].find((candidate) =>
-    visibleWidth(` · ${candidate}`) <= remaining,
+  const binding = expansionCue.endsWith(" to expand")
+    ? expansionCue.slice(0, -" to expand".length)
+    : expansionCue;
+  const cue = [expansionCue, binding].find((candidate) =>
+    candidate.length > 0 && visibleWidth(` · ${candidate}`) <= remaining,
   );
   const cueWidth = cue ? visibleWidth(` · ${cue}`) : 0;
   const duration = durationOf(details);
@@ -909,20 +946,38 @@ function semanticTerminalLine(
   // description · duration · cue reading order.
   if (includeDuration && duration) appendText(" · ", duration, "muted", false);
   if (cue) appendText(" · ", cue, "muted", false);
-  return clampLines([line], columns);
+  return { lines: clampLines([line], columns), cueAppended: cue !== undefined };
 }
 
 /** Semantic collapsed grammar for terminal TaskOutput and settlement records. */
+function ensureVisibleExpansionCue(
+  theme: unknown,
+  collapsed: CollapsedRecordLines,
+  expansionCue: string,
+  width: number,
+): string[] | undefined {
+  const binding = expansionCue.endsWith(" to expand")
+    ? expansionCue.slice(0, -" to expand".length)
+    : expansionCue;
+  const candidates = [expansionCue, binding].filter(
+    (candidate, index, all) => candidate.length > 0 && all.indexOf(candidate) === index,
+  );
+  if (collapsed.cueAppended) return collapsed.lines;
+  const separate = candidates.find((candidate) => visibleWidth(candidate) <= width);
+  return separate ? [...collapsed.lines, themedFg(theme, "muted", separate)] : undefined;
+}
+
 function collapsedRecordLines(
   theme: unknown,
   details: SubagentRenderDetails,
   outcome: "completed" | "failed" | "aborted",
   _chip: string | undefined,
   width: number,
+  expansionCue: string,
   suppressSymbol = false,
   color?: AgentColorName,
   semanticTerminal = true,
-): string[] {
+): CollapsedRecordLines {
   if (!semanticTerminal) {
     const userStopped = details.userStopped === true;
     const state = userStopped
@@ -946,16 +1001,18 @@ function collapsedRecordLines(
     if (usage) optional.push({ separator: " · ", text: usage });
     const completionTime = completionTimeOf(details);
     if (completionTime) optional.push({ separator: " · ", text: completionTime });
-    return lifecycleLine(theme, {
+    const metadata = { cueAppended: false };
+    const lines = lifecycleLine(theme, {
       agent: details.agent,
       state,
       ...((outcome !== "completed" || userStopped) ? { prefix: suppressSymbol ? "" : outcome === "failed" && !userStopped ? "✗ " : "■ " } : {}),
-      cue: RECORD_EXPAND_HINT,
+      cue: expansionCue,
       required,
       optional,
       tone: outcome === "completed" ? "success" : outcome === "failed" && !userStopped ? "error" : "warning",
       color,
-    }, width);
+    }, width, metadata);
+    return { lines, cueAppended: metadata.cueAppended };
   }
   if (outcome === "completed") {
     const fork = forkDegradeLine(details);
@@ -970,6 +1027,7 @@ function collapsedRecordLines(
         ...diagnosticSegments(details),
       ],
       width,
+      expansionCue,
       color,
     );
   }
@@ -1006,6 +1064,7 @@ function collapsedRecordLines(
     tone,
     required,
     width,
+    expansionCue,
     color,
   );
 }
@@ -1148,6 +1207,9 @@ export function renderAgentResult(
   const details = normalizeSubagentRenderDetails(rawDetails) ?? {};
   const isPartial = safeField(renderOptions, "isPartial") === true;
   const expanded = safeField(renderOptions, "expanded");
+  const expansion = piToolsExpandKeyText();
+  const expansionKey = expansion.available ? sanitizeInline(expansion.value) : "";
+  const expansionCue = expansionKey ? `${expansionKey} to expand` : undefined;
   const acceptedBackground = suppressibleAgentAcceptance(
     result, rawDetails, renderOptions, context, presentation.surface,
   );
@@ -1248,15 +1310,27 @@ export function renderAgentResult(
         return runningStatusLines(theme, chip, agent, details, width, color);
       }
       const outcome = typeof details.outcome === "string" ? details.outcome : undefined;
+      let failOpenCollapsed = false;
       // Collapsed by default in the interactive transcript: Pi always passes a
       // BOOLEAN `expanded` (false until the global Ctrl+O toggle), so the
       // collapse keys on the EXPLICIT false. A structural caller that omits the
       // option gets the full record — print/RPC never run renderers, so this
       // only widens compatibility for direct callers.
-      if (outcome && expanded === false) {
+      if (outcome && expanded === false && expansionCue) {
         const semanticTerminal = (presentation.surface === "task-output" && firstTerminal) || presentation.surface === "settlement" ||
           (presentation.surface === undefined && details.taskId !== undefined);
-        return collapsedRecordLines(theme, details, outcome, undefined, width, shellOwnsSymbol, color, semanticTerminal);
+        const collapsed = collapsedRecordLines(
+          theme, details, outcome, undefined, width, expansionCue, shellOwnsSymbol, color, semanticTerminal,
+        );
+        const accessible = ensureVisibleExpansionCue(theme, collapsed, expansionCue, width);
+        if (accessible) return clampLines(accessible, width);
+        // The self shell probes one- and two-column inner widths to preserve its
+        // exact marker/identity thresholds. No additional detail row can be
+        // framed there without displacing that semantic first row; resizing by
+        // one column restores the ordinary fail-open path.
+        if (shellOwnsSymbol && width <= 2) return clampLines(collapsed.lines, width);
+        lines.push(...collapsed.lines);
+        failOpenCollapsed = true;
       }
       if (!outcome && explicitTarget) {
         lines.push(...lifecycleLine(theme, {
@@ -1267,7 +1341,7 @@ export function renderAgentResult(
           color,
         }, width));
       }
-      if (outcome) {
+      if (outcome && !failOpenCollapsed) {
         const userStopped = details.userStopped === true;
         const lifecycleState = userStopped
           ? "stopped by user"
@@ -1284,7 +1358,6 @@ export function renderAgentResult(
           agent: agentName,
           state: lifecycleState,
           prefix: shellOwnsSymbol ? "" : symbol,
-          ...(semanticTerminal ? { description: details.description } : {}),
           tone,
           color,
         }, width));
@@ -1311,10 +1384,18 @@ export function renderAgentResult(
       }
       const body = humanDisplayText(stripAgentTrailerForDisplay(displaySource), false);
       if (body) pushBodyText(body, width, lines);
+      const errorSource = typeof details.error === "string" ? details.error : "";
+      const errorDetail = sanitizeInline(errorSource);
+      if (errorDetail && !containsEquivalentErrorFraming(body, errorSource)) {
+        pushColored(theme, "error", errorDetail, width, lines);
+      }
       const footer: string[] = [];
       const semanticTerminal = (presentation.surface === "task-output" && firstTerminal) || presentation.surface === "settlement" ||
         (presentation.surface === undefined && details.taskId !== undefined);
       const stableAgentId = agentIdOf(details);
+      if (typeof details.description === "string" && details.description) {
+        footer.push(`description: ${sanitizeInline(details.description)}`);
+      }
       if (semanticTerminal && isTaskId(details.taskId)) footer.push(`task: ${details.taskId}`);
       if (semanticTerminal && stableAgentId) footer.push(`agent: ${stableAgentId}`);
       if (typeof details.transcriptPath === "string" && details.transcriptPath) {
@@ -1802,7 +1883,11 @@ export function renderSettlementRecord(
   let text = finalText;
   if (outcome === "failed") {
     const err = normalized.error || "unknown error";
-    text = finalText ? `${err}\n\nPartial output before the failure:\n${finalText}` : err;
+    const errorAlreadyRetained = containsEquivalentErrorFraming(finalText, err);
+    const displayError = sanitizeInline(err);
+    text = finalText
+      ? errorAlreadyRetained ? finalText : `${displayError}\n\nPartial output before the failure:\n${finalText}`
+      : displayError;
   } else if (outcome === "aborted") {
     text = "The task was stopped before completing; its result was discarded.";
   }

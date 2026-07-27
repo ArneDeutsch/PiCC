@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Value } from "typebox/value";
 import type { TSchema } from "typebox";
@@ -31,6 +32,13 @@ import {
 } from "./helpers/fake-sdk.js";
 import type { ClaudeAgent } from "../src/types.js";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
+
+const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+const piTui = piRequire("@earendil-works/pi-tui") as {
+  KeybindingsManager: new (definitions: Record<string, unknown>, bindings?: Record<string, unknown>) => unknown;
+  TUI_KEYBINDINGS: Record<string, unknown>;
+  setKeybindings(manager: unknown): void;
+};
 
 /** onUpdate payload shape + streaming-capable tool view. */
 type ToolUpdate = {
@@ -3698,6 +3706,206 @@ describe("settlement completion record (details + exactly-once)", () => {
     expect(expanded).toContain(`task: ${id}`);
     expect(expanded).toContain(`agent: ${AGENT_ID}`);
     expect(expanded.match(new RegExp(AGENT_ID, "gu"))).toHaveLength(2); // transcript basename plus one identity footer
+  });
+
+  it("uses the configured expansion cue on Agent, TaskOutput, and settlement records", () => {
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
+    try {
+      const common = { outcome: "completed" as const, agent: "worker", agentId: AGENT_ID };
+      const taskDetails = {
+        ...common, taskId: "task-17", status: "completed" as const, admission: "admitted" as const,
+      };
+      const settlementDetails = {
+        ...common, record: "subagent-completion" as const, taskId: taskDetails.taskId, finalText: "hidden body",
+      };
+      const surfaces = [
+        renderAgentResult({ content: [{ type: "text", text: "hidden body" }], details: common },
+          { expanded: false, isPartial: false }, undefined,
+          { state: {}, args: { subagent_type: "worker" }, isError: false }, { surface: "agent" }).render(200).join("\n"),
+        renderAgentResult({ content: [{ type: "text", text: "hidden body" }], details: taskDetails },
+          { expanded: false, isPartial: false }, undefined,
+          { state: {}, args: { task_id: taskDetails.taskId }, isError: false }, { surface: "task-output" }).render(200).join("\n"),
+        renderSettlementRecord(settlementDetails, { expanded: false }, undefined)!.render(200).join("\n"),
+      ];
+      const hiddenBody = settlementDetails.finalText;
+      for (const rendered of surfaces) {
+        expect(rendered).toContain("alt+e to expand");
+        expect(rendered).not.toContain(hiddenBody);
+      }
+    } finally {
+      piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
+    }
+  });
+
+  it("does not let hostile subagent labels impersonate full or compact renderer-owned cues", () => {
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
+    try {
+      for (const agent of ["worker alt+e label", "worker alt+e to expand label"]) {
+        const rendered = renderSettlementRecord({
+          record: "subagent-completion", outcome: "completed", agent, taskId: "task-19",
+          agentId: AGENT_ID, finalText: "owned-hidden-detail",
+        }, { expanded: false }, undefined)!.render(120).join("\n");
+        expect(rendered.match(/alt\+e/gu)).toHaveLength(2);
+        expect(rendered).not.toContain("owned-hidden-detail");
+      }
+    } finally {
+      piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
+    }
+  });
+
+  it("keeps a compact cue for hostile subagent labels or fails open when it cannot fit", () => {
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
+    try {
+      const details = Object.freeze({
+        record: "subagent-completion" as const,
+        outcome: "completed" as const,
+        agent: `${"hostile-worker".repeat(20)}\u001b[31m`,
+        description: "description ".repeat(30),
+        taskId: "task-19",
+        agentId: AGENT_ID,
+        finalText: "Z-retained",
+      });
+      const narrow = renderSettlementRecord(details, { expanded: false }, undefined)!.render(8);
+      expect(narrow.join("\n")).toContain("alt+e");
+      expect(narrow.join("\n")).not.toContain("Z-retained");
+      for (const line of narrow) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(8);
+
+      const tooNarrow = renderSettlementRecord(details, { expanded: false }, undefined)!.render(3).join("");
+      expect(tooNarrow).not.toContain("alt+e");
+      expect(tooNarrow).toContain("Z-retained");
+    } finally {
+      piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
+    }
+  });
+
+  it("fails open frozen complete Agent, TaskOutput, and settlement records exactly once when unbound", () => {
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": [] }));
+    try {
+      const error = `bounded failure ${"segment ".repeat(14).trim()}\nsecond error line`;
+      const body = "retained completion body differs from the standalone error";
+      const common = Object.freeze({
+        outcome: "failed" as const,
+        agent: "worker",
+        agentId: AGENT_ID,
+        description: "Review authentication",
+        transcriptPath: "/x/t.jsonl",
+        usage: Object.freeze({ ...USAGE }),
+        durationMs: 650,
+        error,
+        resumable: true,
+        diagnostics: Object.freeze([Object.freeze({ severity: "warning" as const, source: "runner", message: "retry exhausted" })]),
+      });
+      const taskDetails = Object.freeze({
+        ...common, taskId: "task-18", status: "failed" as const, admission: "admitted" as const,
+      });
+      const settlementDetails = Object.freeze({
+        ...common, record: "subagent-completion" as const, taskId: taskDetails.taskId,
+        finalText: body,
+      });
+      const result = Object.freeze({
+        content: Object.freeze([Object.freeze({ type: "text" as const, text: body })]),
+        details: common,
+      });
+      const taskResult = Object.freeze({ ...result, details: taskDetails });
+      const before = {
+        result: structuredClone(result),
+        taskResult: structuredClone(taskResult),
+        settlementDetails: structuredClone(settlementDetails),
+      };
+      const surfaces = [
+        {
+          render: (width: number) => renderAgentResult(result, { expanded: false, isPartial: false }, undefined, {
+            state: {}, args: { subagent_type: "worker" }, isError: false,
+          }, { surface: "agent" }).render(width),
+          fields: [body, "Review authentication", "/x/t.jsonl", "worker", AGENT_ID, "duration: 0s", "usage: in 100 · out 50 · $0.01", "diagnostic [warning] · runner: retry exhausted"],
+        },
+        {
+          render: (width: number) => renderAgentResult(taskResult, { expanded: false, isPartial: false }, undefined,
+            { state: {}, args: { task_id: taskDetails.taskId }, isError: false },
+            { surface: "task-output" }).render(width),
+          fields: [body, "Review authentication", "/x/t.jsonl", "worker", taskDetails.taskId, AGENT_ID, "duration: 0s", "usage: in 100 · out 50 · $0.01", "diagnostic [warning] · runner: retry exhausted"],
+        },
+        {
+          render: (width: number) => renderSettlementRecord(settlementDetails, { expanded: false }, undefined)!.render(width),
+          fields: [body, "Review authentication", "/x/t.jsonl", "worker", settlementDetails.taskId, AGENT_ID, "duration: 0s", "usage: in 100 · out 50 · $0.01", "diagnostic [warning] · runner: retry exhausted"],
+        },
+      ];
+      const flattened = (value: string) => value.replace(/\s+/gu, " ").trim();
+      const standaloneError = flattened(error);
+      for (const { render, fields } of surfaces) {
+        const lines = render(40);
+        for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(40);
+        const display = flattened(lines.join("\n"));
+        expect(display).not.toContain("to expand");
+        for (const field of fields) {
+          expect(display.split(flattened(String(field))), `${String(field)} in ${display}`).toHaveLength(2);
+        }
+        expect(display.split(standaloneError)).toHaveLength(2);
+        expect(display.match(/resumable via SendMessage/gu)).toHaveLength(1);
+        expect(display).toContain("second error line");
+        expect(render(240).map(flattened)).toContain(standaloneError);
+      }
+      expect(result).toEqual(before.result);
+      expect(taskResult).toEqual(before.taskResult);
+      expect(settlementDetails).toEqual(before.settlementDetails);
+    } finally {
+      piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
+    }
+  });
+
+  it.each([
+    { name: "identifier collision", error: "timeout", body: "timeoutHandler retained partial output", expected: 1 },
+    { name: "astral-letter prefix collision", error: "timeout", body: "𐐀timeout retained partial output", expected: 1 },
+    { name: "astral-letter suffix collision", error: "timeout", body: "timeout𐐀 retained partial output", expected: 1 },
+    { name: "astral-mark prefix collision", error: "timeout", body: "𝅧timeout retained partial output", expected: 1 },
+    { name: "astral-mark suffix collision", error: "timeout", body: "timeout𝅧 retained partial output", expected: 1 },
+    { name: "normalized multiline/control-equivalent framing", error: "request\r\ntimeout\u0000", body: "prefix\nrequest\ntimeout�\nsuffix", expected: 1 },
+  ])("deduplicates complete error framing without substring collisions: $name", ({ error, body, expected }) => {
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": [] }));
+    try {
+      const common = { outcome: "failed" as const, agent: "worker", agentId: AGENT_ID, error };
+      const task = { ...common, taskId: "task-20", status: "failed" as const, admission: "admitted" as const };
+      const normalizedError = error.replace(/[\r\n\u0000]+/gu, " ").trim();
+      const surfaces = [
+        renderAgentResult({ content: [{ type: "text", text: body }], details: common },
+          { expanded: false, isPartial: false }, undefined,
+          { state: {}, args: { subagent_type: "worker" }, isError: false }, { surface: "agent" }).render(200).join("\n"),
+        renderAgentResult({ content: [{ type: "text", text: body }], details: task },
+          { expanded: false, isPartial: false }, undefined,
+          { state: {}, args: { task_id: task.taskId }, isError: false }, { surface: "task-output" }).render(200).join("\n"),
+        renderSettlementRecord({ ...task, record: "subagent-completion", finalText: body },
+          { expanded: false }, undefined)!.render(200).join("\n"),
+      ];
+      for (const rendered of surfaces) {
+        const normalized = rendered.replace(/[\r\n�]+/gu, " ").replace(/\s+/gu, " ");
+        const escaped = normalizedError.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+        expect(normalized.match(new RegExp(`(?:^|[^\\p{L}\\p{M}\\p{N}_])${escaped}(?=$|[^\\p{L}\\p{M}\\p{N}_])`, "gu")))
+          .toHaveLength(expected);
+        if (body.includes("timeoutHandler")) expect(rendered).toContain("timeoutHandler");
+      }
+    } finally {
+      piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
+    }
   });
 
   it("caps settlement UI final text at a scalar boundary without changing the task result", async () => {

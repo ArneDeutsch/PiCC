@@ -1203,6 +1203,7 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
         path: relativePath, edits: [{ oldText: "TOKEN", newText: "ROTATED" }],
       };
       const rotationRow = makeRow("edit-preview-rotation", rotationArgs);
+      rotationRow.setExpanded(true);
       rotationRow.setArgsComplete();
       await waitUntil({
         description: "the base Edit preview to finish before cwd rotation",
@@ -1215,6 +1216,7 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
         path: errorRelativePath, edits: [{ oldText: "ERROR TOKEN", newText: "RECOVERED" }],
       };
       const errorRow = makeRow("edit-preview-error-rotation", errorArgs);
+      errorRow.setExpanded(true);
       errorRow.setArgsComplete();
       await waitUntil({
         description: "the mismatched base Edit preview to fail before cwd rotation",
@@ -1260,6 +1262,7 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
         path: relativePath, edits: [{ oldText: "FRESH", newText: "EDITED" }],
       };
       const worktreeRow = makeRow("edit-preview-worktree", worktreeArgs);
+      worktreeRow.setExpanded(true);
       worktreeRow.setArgsComplete();
       await waitUntil({
         description: "the worktree Edit preview to finish",
@@ -1281,6 +1284,7 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
         path: relativePath, edits: [{ oldText: "TOKEN", newText: "RESTORED" }],
       };
       const baseRow = makeRow("edit-preview-base", baseArgs);
+      baseRow.setExpanded(true);
       baseRow.setArgsComplete();
       await waitUntil({
         description: "the restored-base Edit preview to finish",

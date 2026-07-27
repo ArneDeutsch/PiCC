@@ -21,9 +21,14 @@ interface PiBoxConstructor {
   [Symbol.hasInstance](value: unknown): boolean;
 }
 
+interface PiKeybindingsManager {
+  getDefinition(action: string): unknown;
+}
+
 interface PiTuiModule {
   Box: PiBoxConstructor;
   getCapabilities(): unknown;
+  getKeybindings(): PiKeybindingsManager;
 }
 
 interface CodingAgentModule {
@@ -64,7 +69,8 @@ function loadPiTuiModule(): PiTuiModule | undefined {
     if (!context) return undefined;
     const entry = context.require.resolve("@earendil-works/pi-tui");
     const candidate = context.require(entry) as Partial<PiTuiModule>;
-    if (typeof candidate.Box !== "function" || typeof candidate.getCapabilities !== "function") {
+    if (typeof candidate.Box !== "function" || typeof candidate.getCapabilities !== "function" ||
+      typeof candidate.getKeybindings !== "function") {
       piTuiModule = null;
       return undefined;
     }
@@ -80,7 +86,13 @@ function loadPiTuiModule(): PiTuiModule | undefined {
 export function piToolsExpandKeyText(): PiTuiAvailability<string> {
   try {
     const context = loadPiPackageContext();
-    if (!context) return unavailable;
+    const keybindings = loadPiTuiModule()?.getKeybindings();
+    if (!context || !keybindings) return unavailable;
+    // Pure render/HTML seams can run before coding-agent installs its application definitions.
+    // In that state Pi's documented action default is still the truthful prospective binding.
+    if (keybindings.getDefinition("app.tools.expand") === undefined) {
+      return { available: true, value: "ctrl+o" };
+    }
     const candidate = context.require(context.codingAgentPath) as Partial<CodingAgentModule>;
     if (typeof candidate.keyText !== "function") return unavailable;
     const value = candidate.keyText("app.tools.expand");
