@@ -1,5 +1,5 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
   adaptedEditPreviewError,
   recognizeMultiEditSuccess,
@@ -14,7 +14,9 @@ import {
   type DisplayRootResolver,
   type DisplayRoots,
 } from "./tool-display.js";
-import { themedFg } from "./render-util.js";
+import { piToolsExpandKeyText } from "./pi-tui-runtime.js";
+import { sanitizeDisplayText, themedFg } from "./render-util.js";
+import { setToolRowOutcome } from "./tool-shell.js";
 
 interface Component { render(width: number): string[] }
 type ToolName = "read" | "write" | "edit" | "MultiEdit" | "bash";
@@ -33,16 +35,41 @@ interface Lifecycle {
   settledCall: boolean;
 }
 
-interface FileSummary { kind: "file"; path: string; lines: number; range?: string; remaining?: number; nextOffset?: number }
+interface CallOwnedLifecycle {
+  args?: Data;
+  callSlot?: MutableCallSlot;
+  nativeCall?: Component;
+  nativeResult?: Component;
+  callExpanded?: boolean;
+  callFailed?: boolean;
+  displayRoots?: DisplayRoots;
+  displayPath?: string;
+  rootsResolved: boolean;
+  ordinary?: boolean;
+  malformedArgs?: boolean;
+  resultFallback?: string;
+}
+
+interface MutableCallSlot extends Component {
+  concise(fields: CallOwnedFields): void;
+  native(component: Component): void;
+  warn(message: string): void;
+}
+
+interface CallOwnedFields {
+  tool: "read" | "bash";
+  primary: string;
+  suffix: string;
+}
+
+interface FileSummary { kind: "file"; path: string; lines: number }
+interface ReadContinuation { remaining: number; nextOffset: number }
 interface MutationSummary { kind: "mutation"; path: string; edits: number; diffLines?: number; noNet: boolean }
-interface BashSummary { kind: "bash"; outputLines: number; commandPreview: string; additionalCommandLines: number; duration?: string }
-type Summary = FileSummary | MutationSummary | BashSummary;
+type Summary = FileSummary | MutationSummary;
 
 const MAX_PATH = 16_384;
 const MAX_TEXT = 1_000_000;
-const MAX_IMAGE_DATA = 8 * 1024 * 1024;
 const MAX_ARRAY = 1_000;
-const lifecycles = new WeakMap<object, Lifecycle>();
 
 function data(value: unknown): Data | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Data : undefined;
@@ -60,25 +87,7 @@ function booleanField(value: unknown, key: string): boolean | undefined {
   return typeof field === "boolean" ? field : undefined;
 }
 
-/**
- * Display-boundary escape stripping: OSC/CSI/lone-ESC sequences become "�" and
- * remaining control/format characters are neutralized. Exported so the MCP
- * proxy result renderer shares this one implementation instead of re-deriving
- * the regexes.
- */
-export function sanitize(value: string, limit: number, inline = false): string {
-  let text = value.slice(0, limit).normalize("NFC");
-  text = text
-    .replace(/(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c|$)/gu, "�")
-    .replace(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]?/gu, "�")
-    .replace(/\u001b(?:[ -/]*[@-~]?|.)?/gu, "�")
-    .replace(/\r/gu, "�")
-    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) => {
-      if (!inline && character === "\n") return "\n";
-      return character === "\t" ? "   " : "�";
-    });
-  return inline ? text.replace(/\s+/gu, " ").trim() : text;
-}
+const sanitize = sanitizeDisplayText;
 
 function displayArgs(toolName: ToolName, value: unknown): Data | undefined {
   if (toolName === "read") {
@@ -88,6 +97,8 @@ function displayArgs(toolName: ToolName, value: unknown): Data | undefined {
     for (const key of ["offset", "limit"] as const) {
       if (args[key] !== undefined && (!Number.isSafeInteger(args[key]) || (args[key] as number) < 1)) return undefined;
     }
+    if (typeof args.offset === "number" && typeof args.limit === "number" &&
+      args.offset > Number.MAX_SAFE_INTEGER - (args.limit - 1)) return undefined;
     return { path: sanitizeInlineDisplay(args.path, MAX_PATH), ...(args.offset === undefined ? {} : { offset: args.offset }),
       ...(args.limit === undefined ? {} : { limit: args.limit }) };
   }
@@ -201,14 +212,17 @@ function liveDisplayArgs(toolName: ToolName, value: unknown): Data | undefined {
   return copyPath("file_path") && copyEdits("edits", "old_string", "new_string") ? result : undefined;
 }
 
-function displayContent(value: unknown): Array<Data> | undefined {
+function displayContent(
+  value: unknown,
+  operations: DisplayOperationAuthority = DEFAULT_DISPLAY_OPERATIONS,
+): Array<Data> | undefined {
   if (!Array.isArray(value) || value.length > MAX_ARRAY) return undefined;
   const blocks: Data[] = [];
   for (const blockValue of value) {
     const block = data(blockValue);
     if (block?.type === "text" && typeof block.text === "string" && block.text.length <= MAX_TEXT) {
-      blocks.push({ type: "text", text: sanitize(block.text, MAX_TEXT) });
-    } else if (block?.type === "image" && typeof block.data === "string" && block.data.length <= MAX_IMAGE_DATA &&
+      blocks.push({ type: "text", text: operations.sanitize(block.text, MAX_TEXT) });
+    } else if (block?.type === "image" && typeof block.data === "string" &&
       typeof block.mimeType === "string" && block.mimeType.length <= 256) {
       blocks.push({ type: "image", data: block.data, mimeType: sanitize(block.mimeType, 256, true) });
     } else return undefined;
@@ -237,22 +251,25 @@ function canonicalEnvelope(value: unknown): boolean {
   return Boolean(source && Object.keys(source).every((key) => ["content", "details", "isError"].includes(key)));
 }
 
-function displayResult(value: unknown): Data | undefined {
+function displayResult(
+  value: unknown,
+  operations: DisplayOperationAuthority = DEFAULT_DISPLAY_OPERATIONS,
+): Data | undefined {
   const source = data(value);
-  const content = source && displayContent(source.content);
+  const content = source && displayContent(source.content, operations);
   if (!source || !content || (source.isError !== undefined && typeof source.isError !== "boolean")) return undefined;
   const details = displayDetails(source.details);
   if (source.details !== undefined && details === undefined) return undefined;
   return { content, details, ...(source.isError === undefined ? {} : { isError: source.isError }) };
 }
 
-function lifecycle(context: unknown): Lifecycle | undefined {
+function lifecycle(cache: WeakMap<object, Lifecycle>, context: unknown): Lifecycle | undefined {
   const state = data(context)?.state;
   if (state === null || typeof state !== "object") return undefined;
-  let current = lifecycles.get(state);
+  let current = cache.get(state);
   if (!current) {
     current = { settledCall: false };
-    lifecycles.set(state, current);
+    cache.set(state, current);
   }
   return current;
 }
@@ -263,25 +280,14 @@ function nativeContext(context: unknown, args: Data, lastComponent: Component | 
 }
 
 function bindingHint(): string | undefined {
-  try {
-    const keys = getKeybindings().getKeys("app.tools.expand");
-    if (!Array.isArray(keys) || keys.length === 0 || keys.length > 8 ||
-      keys.some((key) => typeof key !== "string" || key.length === 0 || key.length > 64)) return undefined;
-    return keys.map((key) => sanitize(key, 64, true)).join("/");
-  } catch {
-    return undefined;
-  }
+  const binding = piToolsExpandKeyText();
+  return binding.available ? sanitize(binding.value, 512, true) || undefined : undefined;
 }
 
 function fileLineCount(value: string): number {
   const lines = sanitize(value, MAX_TEXT).split("\n");
   while (lines.at(-1) === "") lines.pop();
   return lines.length;
-}
-
-function bashLineCount(value: string): number {
-  const trimmed = sanitize(value, MAX_TEXT).trim();
-  return trimmed.length === 0 ? 0 : trimmed.split("\n").length;
 }
 
 function oneText(result: unknown): { text: string; details: unknown } | undefined {
@@ -297,7 +303,7 @@ function finalAgreement(options: unknown, context: unknown): boolean {
     booleanField(context, "isError") === false;
 }
 
-function readContinuationSummary(args: Data, result: unknown): FileSummary | undefined {
+function readContinuationSummary(args: Data, result: unknown): ReadContinuation | undefined {
   const limit = args.limit;
   if (!Number.isSafeInteger(limit) || (limit as number) < 1) return undefined;
   const envelope = data(result);
@@ -316,49 +322,17 @@ function readContinuationSummary(args: Data, result: unknown): FileSummary | und
   const payload = block.text.slice(0, match.index);
   if (/\[[1-9]\d* more lines in file\. Use offset=[1-9]\d* to continue\.\]/u.test(payload) ||
     payload.split("\n").length !== limit) return undefined;
-  return {
-    kind: "file",
-    path: args.path as string,
-    lines: limit as number,
-    range: `:${start}-${start + (limit as number) - 1}`,
-    remaining,
-    nextOffset,
-  };
+  return { remaining, nextOffset };
 }
 
-function recognize(toolName: ToolName, args: Data, result: unknown, context: unknown): Summary | undefined {
+function recognize(toolName: "write" | "edit", args: Data, result: unknown): Summary | undefined {
   const envelope = data(result);
   if (!canonicalEnvelope(result) || !envelope || (envelope.isError !== undefined && envelope.isError !== false)) return undefined;
-  if (toolName === "MultiEdit") return undefined;
   const text = oneText(result);
   if (!text) return undefined;
-  if (toolName === "read") {
-    const continuation = readContinuationSummary(args, result);
-    if (continuation) return continuation;
-    if (text.details !== undefined || /(?:^|\n)\[(?:Showing lines |Line \d+ is |\d+ more lines in file\.|\d+ more lines in file\. Use offset=|PiCC clipped |Truncated:|First line exceeds)/u.test(text.text) ||
-      /\[[^\]\n]*more\s+lines\s+in\s+file[^\]\n]*\]/iu.test(text.text) ||
-      text.text.startsWith("Read image file [")) return undefined;
-    const offset = typeof args.offset === "number" ? args.offset : 1;
-    return { kind: "file", path: args.path as string, lines: fileLineCount(text.text),
-      ...((args.offset !== undefined || args.limit !== undefined) ? { range: `:${offset}${typeof args.limit === "number" ? `-${offset + args.limit - 1}` : ""}` } : {}) };
-  }
   if (toolName === "write") {
     if (text.details !== undefined || text.text !== `Successfully wrote ${(args.content as string).length} bytes to ${args.path as string}`) return undefined;
     return { kind: "file", path: args.path as string, lines: fileLineCount(args.content as string) };
-  }
-  if (toolName === "bash") {
-    if (text.details !== undefined) return undefined;
-    const state = data(data(context)?.state);
-    const startedAt = state?.startedAt;
-    const endedAt = state?.endedAt;
-    const duration = typeof startedAt === "number" && typeof endedAt === "number" &&
-      Number.isFinite(startedAt) && Number.isFinite(endedAt) && endedAt >= startedAt
-      ? `${((endedAt - startedAt) / 1000).toFixed(1)}s`
-      : undefined;
-    const commandLines = (args.command as string).split("\n").filter((line) => line.trim().length > 0);
-    return { kind: "bash", outputLines: text.text === "(no output)" ? 0 : bashLineCount(text.text),
-      commandPreview: commandLines[0] ?? "...", additionalCommandLines: Math.max(0, commandLines.length - 1),
-      ...(duration ? { duration } : {}) };
   }
   const editArgs = args.edits as unknown[];
   const details = exact(text.details, ["diff", "patch", "firstChangedLine"]);
@@ -393,33 +367,31 @@ function summaryComponent(
   snapshottedPath?: string,
 ): Component {
   const title = formatToolDisplayName(toolName);
-  if (summary.kind === "bash") {
-    const optional = [
-      ...(summary.additionalCommandLines > 0
-        ? [`${summary.additionalCommandLines} more command ${summary.additionalCommandLines === 1 ? "line" : "lines"}`]
-        : []),
-      summary.outputLines === 0 ? "no output" : `${summary.outputLines} output ${summary.outputLines === 1 ? "line" : "lines"} hidden`,
-      ...(summary.duration ? [summary.duration] : []),
-    ];
-    return priorityDisplayRow(title, summary.commandPreview, [], optional, `${hint} to expand`, theme);
-  }
   const path = snapshottedPath ?? sanitizeInlineDisplay(formatDisplayPathFromRoots(summary.path, displayRoots), MAX_PATH);
   if (summary.kind === "mutation") {
     const detail = summary.noNet ? "no net change" : `${summary.diffLines} diff ${summary.diffLines === 1 ? "line" : "lines"} hidden`;
     return priorityDisplayRow(title, path, [],
       [`${summary.edits} ${summary.edits === 1 ? "edit" : "edits"} applied`, detail], `${hint} to expand`, theme);
   }
-  if (summary.remaining !== undefined && summary.nextOffset !== undefined) {
-    return priorityDisplayRow(title, `${path}${summary.range ?? ""}`,
-      [`next offset ${summary.nextOffset}`], [`${summary.remaining} more lines`], `${hint} to expand`, theme);
-  }
-  return priorityDisplayRow(title, `${path}${summary.range ?? ""}`,
+  return priorityDisplayRow(title, path,
     [], [`${summary.lines} ${summary.lines === 1 ? "line" : "lines"} hidden`], `${hint} to expand`, theme);
 }
 
 function messageComponent(message: string, theme: unknown): Component {
   const safe = sanitize(message, 512, true);
   return { render: (width) => [clamp(themedFg(theme, "warning", safe), width)] };
+}
+
+function evidenceComponent(
+  message: string,
+  theme: unknown,
+  operations: DisplayOperationAuthority = DEFAULT_DISPLAY_OPERATIONS,
+): Component {
+  const safe = operations.sanitize(message, EVIDENCE_PREFIX + EVIDENCE_TAIL + 8);
+  const lines = operations.splitLines(safe);
+  return {
+    render: (width) => lines.map((line) => clamp(themedFg(theme, "warning", line), width)),
+  };
 }
 
 function combined(components: readonly Component[], theme: unknown): Component {
@@ -429,14 +401,443 @@ function combined(components: readonly Component[], theme: unknown): Component {
   } };
 }
 
+export interface DisplayOperationAuthority {
+  slice(value: string, start: number, end?: number): string;
+  sanitize(value: string, limit: number, inline?: boolean): string;
+  splitLines(value: string): string[];
+}
+
+const DEFAULT_DISPLAY_OPERATIONS: DisplayOperationAuthority = {
+  slice: (value, start, end) => value.slice(start, end),
+  sanitize: sanitizeDisplayText,
+  splitLines: (value) => value.split("\n"),
+};
+
 export interface DefaultCollapsedRenderingDependencies {
   resolveDisplayRoot?: DisplayRootResolver;
   repositoryRoot?: string;
+  displayOperations?: DisplayOperationAuthority;
+}
+
+const EMPTY_COMPONENT: Component = Object.freeze({ render: () => [] });
+const EVIDENCE_PREFIX = 512;
+const EVIDENCE_TAIL = 1_024;
+
+function conciseCallLines(fields: CallOwnedFields, width: number): string[] {
+  if (!Number.isFinite(width) || width <= 0) return [""];
+  const columns = Math.floor(width);
+  const prefix = fields.tool === "bash" ? "bash $ " : "read ";
+  if (visibleWidth(prefix) >= columns) return [truncateToWidth(prefix, columns, "…")];
+  const suffixWidth = visibleWidth(fields.suffix);
+  const available = Math.max(1, columns - visibleWidth(prefix) - suffixWidth);
+  const primary = visibleWidth(fields.primary) > available
+    ? truncateToWidth(fields.primary, available, "…")
+    : fields.primary;
+  const line = `${prefix}${primary}${fields.suffix}`;
+  return [visibleWidth(line) <= columns ? line : truncateToWidth(line, columns, "…")];
+}
+
+function mutableCallSlot(initial: CallOwnedFields): MutableCallSlot {
+  let fields = initial;
+  let delegate: Component | undefined;
+  let warning: string | undefined;
+  return {
+    concise(next) { fields = next; delegate = undefined; warning = undefined; },
+    native(component) { delegate = component; warning = undefined; },
+    warn(message) { delegate = undefined; warning = sanitize(message, 512, true); },
+    render(width) {
+      if (warning !== undefined) return [clamp(warning, width)];
+      if (delegate) return delegate.render(width).map((line) => clamp(line, width));
+      return conciseCallLines(fields, width);
+    },
+  };
+}
+
+function readRange(args: Data): string {
+  const offset = typeof args.offset === "number" ? args.offset : undefined;
+  const limit = typeof args.limit === "number" ? args.limit : undefined;
+  if (offset === undefined && limit === undefined) return "";
+  if (offset === undefined) return `:1-${limit}`;
+  if (limit === undefined) return `:${offset}`;
+  return `:${offset}-${offset + limit - 1}`;
+}
+
+function commandIdentity(command: string): { primary: string; suffix: string } {
+  const lines = command.split(/\r\n|\n|\r|\u2028|\u2029/gu)
+    .map((line) => sanitize(line, MAX_TEXT, true))
+    .filter((line) => line.length > 0);
+  return { primary: lines[0] ?? "...", suffix: lines.length > 1 ? " [ …]" : "" };
+}
+
+function callOwnedFields(toolName: "read" | "bash", args: Data, displayPath?: string): CallOwnedFields {
+  if (toolName === "read") {
+    const path = typeof args.path === "string" ? args.path : "...";
+    return { tool: "read", primary: displayPath ?? path, suffix: readRange(args) };
+  }
+  const command = commandIdentity(typeof args.command === "string" ? args.command : "...");
+  const timeout = typeof args.timeout === "number" ? ` (timeout ${args.timeout}s)` : "";
+  return { tool: "bash", primary: command.primary, suffix: `${command.suffix}${timeout}` };
+}
+
+const MAX_EVIDENCE_BLOCKS = 4;
+
+type SupportedEnvelope = "text" | "image" | "mixed";
+
+function supportedEnvelope(result: unknown): SupportedEnvelope | undefined {
+  const envelope = data(result);
+  const content = envelope?.content;
+  if (!Array.isArray(content) || content.length > MAX_ARRAY || content.length === 0) return undefined;
+  let texts = 0;
+  let images = 0;
+  let oversizedText = false;
+  for (const value of content) {
+    const block = data(value);
+    if (block?.type === "text") {
+      const text = block.text;
+      if (typeof text !== "string") return undefined;
+      if (text.length > MAX_TEXT) oversizedText = true;
+      texts++;
+    } else if (block?.type === "image" && typeof block.mimeType === "string" && block.mimeType.length <= 256) images++;
+    else return undefined;
+  }
+  if (images > 0 && oversizedText) return undefined;
+  return images === 0 ? "text" : texts === 0 ? "image" : "mixed";
+}
+
+function successfulReadImageEnvelope(
+  result: unknown,
+  operations: DisplayOperationAuthority,
+): Data | undefined {
+  const source = data(result);
+  const kind = supportedEnvelope(result);
+  if (!source || !canonicalEnvelope(result) || source.isError === true || (kind !== "image" && kind !== "mixed")) return undefined;
+  const details = displayDetails(source.details);
+  if (source.details !== undefined && details === undefined) return undefined;
+  const content: Data[] = [];
+  for (const value of source.content as unknown[]) {
+    const block = data(value);
+    if (block?.type === "text" && typeof block.text === "string" && block.text.length <= MAX_TEXT) {
+      content.push({ type: "text", text: operations.sanitize(block.text, MAX_TEXT) });
+      continue;
+    }
+    if (block?.type !== "image" || typeof block.mimeType !== "string" || block.mimeType.length > 256) return undefined;
+    const imageData = block.data;
+    if (typeof imageData !== "string") return undefined;
+    content.push({ type: "image", data: imageData, mimeType: sanitize(block.mimeType, 256, true) });
+  }
+  return { content, details, ...(source.isError === undefined ? {} : { isError: source.isError }) };
+}
+
+function boundedText(result: unknown): string | undefined {
+  const envelope = data(result);
+  const content = envelope?.content;
+  if (!Array.isArray(content) || content.length !== 1) return undefined;
+  const block = data(content[0]);
+  return block?.type === "text" && typeof block.text === "string" ? block.text : undefined;
+}
+
+function boundedProbe(text: string, operations: DisplayOperationAuthority): string {
+  if (text.length <= EVIDENCE_PREFIX + EVIDENCE_TAIL) return operations.slice(text, 0, text.length);
+  return `${operations.slice(text, 0, EVIDENCE_PREFIX)}\n…\n${operations.slice(text, -EVIDENCE_TAIL)}`;
+}
+
+function exceptionalEvidence(
+  result: unknown,
+  fallback: string,
+  operations: DisplayOperationAuthority,
+): string {
+  const content = data(result)?.content;
+  if (!Array.isArray(content)) return fallback;
+  const evidence: string[] = [];
+  for (let index = 0; index < content.length && evidence.length < MAX_EVIDENCE_BLOCKS && index < MAX_ARRAY; index++) {
+    const block = data(content[index]);
+    if (block?.type !== "text" || typeof block.text !== "string") continue;
+    const safe = operations.sanitize(boundedProbe(block.text, operations), EVIDENCE_PREFIX + EVIDENCE_TAIL + 4);
+    if (safe.trim().length > 0) evidence.push(safe);
+  }
+  return evidence.length > 0 ? evidence.join("\n") : fallback;
+}
+
+function recognizedStatus(
+  toolName: "read" | "bash",
+  result: unknown,
+  operations: DisplayOperationAuthority,
+): string | undefined {
+  const content = data(result)?.content;
+  if (!Array.isArray(content)) return undefined;
+  for (let index = 0; index < content.length && index < MAX_EVIDENCE_BLOCKS; index++) {
+    const block = data(content[index]);
+    if (block?.type !== "text" || typeof block.text !== "string") continue;
+    const probe = operations.sanitize(boundedProbe(block.text, operations), EVIDENCE_PREFIX + EVIDENCE_TAIL + 4);
+    if (toolName === "read") {
+      const noOffsetContinuation = /(?:^|\n)(\[[1-9]\d* more lines in file\.\])$/u.exec(probe);
+      if (noOffsetContinuation?.[1]) return noOffsetContinuation[1];
+    }
+    const pattern = toolName === "read"
+      ? /(?:^|\n)(\[(?:Showing (?:lines|last) [^\]\n]+|Line \d+ is [^\]\n]+|\d+ more lines in file\. Use offset=\d+ to continue\.|PiCC clipped [^\]\n]+|Truncated:[^\]\n]+|First line exceeds[^\]\n]*)\]|(?:Read|Operation|Tool|Command)?\s*(?:failed|errored|aborted|cancelled)[^\n]*)/iu
+      : /(?:^|\n)((?:Command|Operation|Tool)?\s*(?:timed out|exited with (?:code|status)|failed|errored|aborted|cancelled)[^\n]*)/iu;
+    const match = pattern.exec(probe);
+    if (match?.[1]) return match[1].trim();
+  }
+  return undefined;
+}
+
+function isUserAborted(status: string | undefined): boolean {
+  return status !== undefined && /\b(?:aborted|cancelled)\b/iu.test(status);
+}
+
+function ordinaryCallOwnedResult(
+  toolName: "read" | "bash",
+  result: unknown,
+  options: unknown,
+  context: unknown,
+  status?: string,
+): boolean {
+  if (booleanField(options, "isPartial") !== false || booleanField(context, "isPartial") !== false ||
+    booleanField(context, "isError") !== false) return false;
+  const envelope = data(result);
+  if (!envelope) return false;
+  const keys = Object.keys(envelope);
+  if (!keys.every((key) => key === "content" || key === "details" || key === "isError") ||
+    envelope.details !== undefined || envelope.isError === true) return false;
+  const kind = supportedEnvelope(result);
+  if (kind !== "text") return false;
+  const text = boundedText(result);
+  if (text === undefined) return false;
+  if (toolName === "bash") return true;
+  return status?.startsWith("[") !== true;
+}
+
+function collapsedExceptionalEvidence(
+  toolName: "read" | "bash",
+  args: Data,
+  result: unknown,
+  operations: DisplayOperationAuthority,
+  status?: string,
+): string {
+  if (toolName === "read" && (boundedText(result)?.length ?? Infinity) <= EVIDENCE_PREFIX + EVIDENCE_TAIL) {
+    const continuation = readContinuationSummary(args, result);
+    if (continuation?.remaining !== undefined && continuation.nextOffset !== undefined) {
+      return `${continuation.remaining} more lines · next offset ${continuation.nextOffset}`;
+    }
+  }
+  return status ?? recognizedStatus(toolName, result, operations) ?? exceptionalEvidence(result, "Unfamiliar result", operations);
+}
+
+function withCallOwnedRendering<T extends ToolDefinition>(
+  tool: T,
+  dependencies: DefaultCollapsedRenderingDependencies,
+  toolName: "read" | "bash",
+): T {
+  const nativeCall = tool.renderCall as NativeCall;
+  const nativeResult = tool.renderResult as NativeResult;
+  const operations = dependencies.displayOperations ?? DEFAULT_DISPLAY_OPERATIONS;
+  const cache = new WeakMap<object, CallOwnedLifecycle>();
+  const getLifecycle = (context: unknown): CallOwnedLifecycle | undefined => {
+    const state = data(context)?.state;
+    if (state === null || typeof state !== "object") return undefined;
+    let current = cache.get(state);
+    if (!current) {
+      current = { rootsResolved: false };
+      cache.set(state, current);
+    }
+    return current;
+  };
+  const decorated = { ...tool } as T;
+
+  const setConcise = (current: CallOwnedLifecycle, args: Data): MutableCallSlot => {
+    const fields = callOwnedFields(toolName, args, current.displayPath);
+    current.callSlot ??= mutableCallSlot(fields);
+    current.callSlot.concise(fields);
+    current.callExpanded = false;
+    current.callFailed = false;
+    return current.callSlot;
+  };
+  const setNativeCall = (
+    current: CallOwnedLifecycle,
+    args: Data,
+    theme: unknown,
+    context: unknown,
+  ): MutableCallSlot => {
+    const slot = current.callSlot ??= mutableCallSlot(callOwnedFields(toolName, args, current.displayPath));
+    try {
+      current.nativeCall = nativeCall(args, theme, nativeContext(context, args, current.nativeCall, true));
+      slot.native(current.nativeCall);
+      current.callExpanded = true;
+      current.callFailed = false;
+    } catch {
+      current.nativeCall = undefined;
+      current.callExpanded = false;
+      current.callFailed = true;
+      slot.warn(toolName === "bash" ? "bash $ ..." : "read ...");
+      setToolRowOutcome(context, "failure");
+    }
+    return slot;
+  };
+
+  decorated.renderCall = ((argsValue: unknown, theme: unknown, context: unknown): Component => {
+    const current = getLifecycle(context);
+    const settled = booleanField(context, "isPartial") === false;
+    const args = settled ? displayArgs(toolName, argsValue) : liveDisplayArgs(toolName, argsValue);
+    if (!current) {
+      if (!args) return messageComponent(`${toolName} (unfamiliar arguments)`, theme);
+      try { return nativeCall(args, theme, nativeContext(context, args, undefined, true)); }
+      catch { return messageComponent(toolName === "bash" ? "bash $ ..." : "read ...", theme); }
+    }
+    if (!args) {
+      current.malformedArgs = true;
+      const slot = current.callSlot ??= mutableCallSlot(callOwnedFields(toolName, {}, undefined));
+      slot.warn(`${toolName} (unfamiliar arguments)`);
+      setToolRowOutcome(context, "failure");
+      return slot;
+    }
+    current.malformedArgs = false;
+    current.args = args;
+    if (!current.rootsResolved && booleanField(context, "argsComplete") !== false) {
+      current.displayRoots = resolveDisplayRoots(dependencies.resolveDisplayRoot, dependencies.repositoryRoot, context);
+      const rawPath = data(argsValue)?.path;
+      if (toolName === "read" && typeof rawPath === "string") {
+        // Classify the validated invocation path before neutralizing its display representation.
+        current.displayPath = sanitizeInlineDisplay(formatDisplayPathFromRoots(rawPath, current.displayRoots), MAX_PATH);
+      }
+      current.rootsResolved = true;
+    }
+    const expanded = booleanField(context, "expanded") === true || !bindingHint();
+    if (expanded) return setNativeCall(current, args, theme, context);
+    if (toolName === "bash") {
+      try {
+        current.nativeCall = nativeCall(args, theme, nativeContext(context, args, current.nativeCall, false));
+        current.callFailed = false;
+      } catch {
+        current.nativeCall = undefined;
+        current.callExpanded = false;
+        current.callFailed = true;
+        const slot = current.callSlot ??= mutableCallSlot(callOwnedFields(toolName, args, current.displayPath));
+        slot.warn("bash $ ...");
+        setToolRowOutcome(context, "failure");
+        return slot;
+      }
+    }
+    return setConcise(current, args);
+  }) as T["renderCall"];
+
+  decorated.renderResult = ((resultValue: unknown, options: unknown, theme: unknown, context: unknown): Component => {
+    const current = getLifecycle(context);
+    const partial = booleanField(options, "isPartial") === true || booleanField(context, "isPartial") === true;
+    const args = current?.args ?? (partial
+      ? liveDisplayArgs(toolName, data(context)?.args)
+      : displayArgs(toolName, data(context)?.args));
+    if (!args) {
+      if (current?.malformedArgs) {
+        setToolRowOutcome(context, "failure");
+        return EMPTY_COMPONENT;
+      }
+      return messageComponent("Unfamiliar arguments", theme);
+    }
+    const requestedExpanded = booleanField(options, "expanded") === true || booleanField(context, "expanded") === true;
+    const expanded = requestedExpanded || !bindingHint();
+    if (!current) {
+      try {
+        return nativeResult(displayResult(resultValue, operations) ?? resultValue, { expanded: true, isPartial: partial }, theme,
+          nativeContext(context, args, undefined, true));
+      } catch { return messageComponent(exceptionalEvidence(resultValue, "Renderer failed", operations), theme); }
+    }
+
+    const malformedResult = supportedEnvelope(resultValue) === undefined && canonicalEnvelope(resultValue);
+    if (malformedResult) {
+      current.nativeResult = undefined;
+      current.resultFallback = undefined;
+      current.callExpanded = false;
+      const slot = current.callSlot ??= mutableCallSlot(callOwnedFields(toolName, args, current.displayPath));
+      slot.warn(`${toolName} (unfamiliar result)`);
+      setToolRowOutcome(context, "failure");
+      return EMPTY_COMPONENT;
+    }
+
+    if (expanded) {
+      if (!current.callExpanded) setNativeCall(current, args, theme, context);
+    } else if (!current.callFailed) setConcise(current, args);
+    else setToolRowOutcome(context, "failure");
+
+    let status = toolName === "read" || booleanField(context, "isError") === true
+      ? recognizedStatus(toolName, resultValue, operations)
+      : undefined;
+    if (!partial) current.ordinary = ordinaryCallOwnedResult(toolName, resultValue, options, context, status);
+    if (!current.ordinary && status === undefined) status = recognizedStatus(toolName, resultValue, operations);
+    if (booleanField(context, "isError") === true && isUserAborted(status)) setToolRowOutcome(context, "stopped");
+    const envelopeKind = supportedEnvelope(resultValue);
+    const successfulImage = toolName === "read" && booleanField(context, "isError") === false &&
+      (envelopeKind === "image" || envelopeKind === "mixed")
+      ? successfulReadImageEnvelope(resultValue, operations)
+      : undefined;
+    if (toolName === "read" && (envelopeKind === "image" || envelopeKind === "mixed") && !successfulImage) {
+      return evidenceComponent(status ?? recognizedStatus(toolName, resultValue, operations) ?? "Unfamiliar result", theme, operations);
+    }
+    if (expanded) {
+      const safeResult = successfulImage ?? displayResult(resultValue, operations);
+      if (!safeResult) return evidenceComponent(exceptionalEvidence(resultValue, "Unfamiliar result", operations), theme, operations);
+      try {
+        current.nativeResult = nativeResult(safeResult, { expanded: true, isPartial: partial }, theme,
+          nativeContext(context, args, current.nativeResult, true));
+        current.resultFallback = undefined;
+        return current.nativeResult;
+      } catch {
+        current.nativeResult = undefined;
+        current.resultFallback = status ?? exceptionalEvidence(resultValue, "Renderer failed", operations);
+        return evidenceComponent(current.resultFallback, theme, operations);
+      }
+    }
+
+    if (partial) {
+      if (toolName === "bash") {
+        try {
+          current.nativeResult = nativeResult({ content: [], details: undefined },
+            { expanded: false, isPartial: true }, theme,
+            nativeContext(context, args, current.nativeResult, false));
+        } catch {
+          current.nativeResult = undefined;
+          current.resultFallback = status ?? "Renderer failed";
+          return evidenceComponent(current.resultFallback, theme, operations);
+        }
+      }
+      return EMPTY_COMPONENT;
+    }
+    if (successfulImage) {
+      try {
+        current.nativeResult = nativeResult(successfulImage, { expanded: false, isPartial: false }, theme,
+          nativeContext(context, args, current.nativeResult, false));
+        current.resultFallback = undefined;
+        return current.nativeResult;
+      } catch {
+        current.nativeResult = undefined;
+        current.resultFallback = status ?? "Renderer failed";
+        return evidenceComponent(current.resultFallback, theme, operations);
+      }
+    }
+    if (toolName === "bash") {
+      try {
+        // Bash's native renderer owns timer settlement. An empty display envelope exercises that
+        // lifecycle without copying, sanitizing, or formatting the retained command output.
+        current.nativeResult = nativeResult({ content: [], details: undefined },
+          { expanded: false, isPartial: false }, theme,
+          nativeContext(context, args, current.nativeResult, false));
+        current.resultFallback = undefined;
+      } catch {
+        current.nativeResult = undefined;
+        current.resultFallback = status ?? exceptionalEvidence(resultValue, "Renderer failed", operations);
+      }
+    } else if (current.ordinary) {
+      current.resultFallback = undefined;
+    }
+    if (current.resultFallback) return evidenceComponent(current.resultFallback, theme, operations);
+    if (current.ordinary) return EMPTY_COMPONENT;
+    return evidenceComponent(collapsedExceptionalEvidence(toolName, args, resultValue, operations, status), theme, operations);
+  }) as T["renderResult"];
+  return decorated;
 }
 
 /**
- * Collapse only recognized settled main-session successes. Display-safe live and nonordinary states
- * delegate natively, while malformed display data gets concise warnings.
+ * Keep routine successes concise while preserving native detail and exceptional evidence.
  */
 export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(
   tool: T,
@@ -445,12 +846,16 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(
   const toolName = tool.name as ToolName;
   if (!["read", "write", "edit", "MultiEdit", "bash"].includes(toolName) ||
     typeof tool.renderCall !== "function" || typeof tool.renderResult !== "function") return tool;
+  if (toolName === "read" || toolName === "bash") {
+    return withCallOwnedRendering(tool, dependencies, toolName);
+  }
   const nativeCall = tool.renderCall as NativeCall;
   const nativeResult = tool.renderResult as NativeResult;
+  const lifecycles = new WeakMap<object, Lifecycle>();
 
   const decorated = { ...tool } as T;
   decorated.renderCall = ((argsValue: unknown, theme: unknown, context: unknown): Component => {
-    const current = lifecycle(context);
+    const current = lifecycle(lifecycles, context);
     if (current && current.displayRootsResolved !== true && booleanField(context, "argsComplete") !== false) {
       current.displayRoots = resolveDisplayRoots(dependencies.resolveDisplayRoot, dependencies.repositoryRoot, context);
       const rawArgs = data(argsValue);
@@ -471,7 +876,10 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(
       try {
         current.call = nativeCall(args, theme, nativeContext(context, args, current.call, booleanField(context, "expanded") === true));
         return current.call;
-      } catch { return messageComponent("Renderer failed", theme); }
+      } catch {
+        current.call = undefined;
+        return messageComponent("Renderer failed", theme);
+      }
     }
     current.args = args;
     const hint = bindingHint();
@@ -483,12 +891,13 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(
       if (previewError) current.editPreviewError = sanitize(previewError, 512, true);
       return settled && hint ? { render: () => [] } : current.call;
     } catch {
+      current.call = undefined;
       return messageComponent("Renderer failed", theme);
     }
   }) as T["renderCall"];
 
   decorated.renderResult = ((resultValue: unknown, options: unknown, theme: unknown, context: unknown): Component => {
-    const current = lifecycle(context);
+    const current = lifecycle(lifecycles, context);
     const partial = booleanField(options, "isPartial") === true || booleanField(context, "isPartial") === true;
     const args = current?.args ?? (partial
       ? liveDisplayArgs(toolName, data(context)?.args)
@@ -509,7 +918,10 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(
         current.result = nativeResult(result, { expanded: requestedExpanded, isPartial: true }, theme,
           nativeContext(context, args, current.result, requestedExpanded));
         return current.result;
-      } catch { return messageComponent("Renderer failed", theme); }
+      } catch {
+        current.result = undefined;
+        return messageComponent("Renderer failed", theme);
+      }
     }
 
     const agreed = finalAgreement(options, context);
@@ -518,9 +930,12 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(
     const multi = toolName === "MultiEdit"
       ? recognizeMultiEditSuccess(resultValue, options, context)
       : undefined;
-    let ordinary = agreed && !current.editPreviewError
+    const ordinary = agreed && !current.editPreviewError
       ? (multi?.kind === "displayable"
-        ? multiSummary(multi) : recognize(toolName, args, resultValue, context))
+        ? multiSummary(multi)
+        : toolName === "write" || toolName === "edit"
+          ? recognize(toolName, args, resultValue)
+          : undefined)
       : undefined;
     const forceExpanded = !hint || !agreed || !ordinary;
     let native: Component;
@@ -528,11 +943,10 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(
       native = nativeResult(result, { expanded: forceExpanded || requestedExpanded, isPartial: false }, theme,
         nativeContext(context, args, current.result, forceExpanded || requestedExpanded));
       current.result = native;
-    } catch { return messageComponent("Renderer failed", theme); }
-    if (ordinary?.kind === "bash") {
-      ordinary = recognize(toolName, args, resultValue, context) ?? ordinary;
+    } catch {
+      current.result = undefined;
+      return messageComponent("Renderer failed", theme);
     }
-
     const ownsRow = current.settledCall && current.call;
     if (ordinary && hint && !requestedExpanded && ownsRow) {
       const displayRoots = current.displayRootsResolved === true
@@ -546,7 +960,10 @@ export function withDefaultCollapsedToolRendering<T extends ToolDefinition>(
       try {
         call = nativeCall(args, theme, nativeContext(context, args, current.call, true));
         current.call = call;
-      } catch { /* The retained call is still safe to show. */ }
+      } catch {
+        current.call = undefined;
+        call = undefined;
+      }
     }
     if (!ownsRow || !call) return native;
     if (current.editPreviewError) {

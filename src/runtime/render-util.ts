@@ -6,6 +6,21 @@ import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works
 
 const SGR_RE = /\u001b\[([0-9;]*)m/gu;
 
+/** Display-only neutralization: CRLF becomes LF; non-inline LF survives, tabs become spaces, and other controls become inert markers. */
+export function sanitizeDisplayText(value: string, limit: number, inline = false): string {
+  let text = value.slice(0, limit + 1).replace(/\r\n/gu, "\n").slice(0, limit).normalize("NFC");
+  text = text
+    .replace(/(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c|$)/gu, "�")
+    .replace(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]?/gu, "�")
+    .replace(/\u001b(?:[ -/]*[@-~]?|.)?/gu, "�")
+    .replace(/\r/gu, "�")
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) => {
+      if (!inline && character === "\n") return "\n";
+      return character === "\t" ? "   " : "�";
+    });
+  return inline ? text.replace(/\s+/gu, " ").trim() : text;
+}
+
 function safeSgrText(value: unknown, requested: string): string | undefined {
   if (typeof value !== "string") return undefined;
   let plain = "";

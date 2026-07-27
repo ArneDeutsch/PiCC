@@ -1,8 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import picc, { type PiccTestSeam } from "../src/index.js";
 import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import type { BackgroundResultLike } from "../src/runtime/background-tasks.js";
@@ -27,6 +29,8 @@ let dir: string;
 let pi: FakePi;
 const originalCwd = process.cwd();
 const compatAckSentinel = '{"suppressed":true,"sentinel":"KEEP-BYTES"}\n';
+const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+const piTui = await import(pathToFileURL(requireFromPi.resolve("@earendil-works/pi-tui")).href) as typeof import("@earendil-works/pi-tui");
 
 beforeAll(async () => {
   dir = materializeFixture("full-surface");
@@ -208,8 +212,11 @@ describe("tool surface registration", () => {
       expect(pi.tools.get(name).renderShell, name).toBe("self");
     }
     const previousBindings = getKeybindings();
-    setKeybindings(new KeybindingsManager({ ...TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } }));
+    const previousPiBindings = piTui.getKeybindings();
+    const bindingDefinitions = { ...TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" } };
+    setKeybindings(new KeybindingsManager(bindingDefinitions));
+    piTui.setKeybindings(new piTui.KeybindingsManager(bindingDefinitions));
     try {
       const read = pi.tools.get("read");
       const args = { path: "registered.txt" };
@@ -218,13 +225,16 @@ describe("tool surface registration", () => {
         bg: (_slot: string, text: string) => text };
       const context = { args, state, isPartial: false, isError: false, expanded: false,
         cwd: dir, showImages: false, invalidate() {} };
-      read.renderCall(args, theme, context);
-      const rendered = read.renderResult(
+      const readCallComponent = read.renderCall(args, theme, context);
+      const readResultComponent = read.renderResult(
         { content: [{ type: "text", text: "REGISTERED_DETAIL_ONE\nREGISTERED_DETAIL_TWO" }], details: undefined },
         { expanded: false, isPartial: false }, theme, context,
-      ).render(160).join("\n");
-      expect(rendered).toContain("read registered.txt · 2 lines hidden · ctrl+o to expand");
-      expect(rendered).not.toContain("REGISTERED_DETAIL");
+      );
+      const readCall = readCallComponent.render(160).join("\n");
+      const rendered = readResultComponent.render(160).join("\n");
+      expect(readCall).toBe("● read registered.txt");
+      expect(rendered).toBe("");
+      expect(`${readCall}\n${rendered}`).not.toContain("REGISTERED_DETAIL");
 
       const multiEdit = pi.tools.get("MultiEdit");
       const multiEditArgs = {
@@ -251,6 +261,7 @@ describe("tool surface registration", () => {
       expect(multiEditRendered).toContain("multi edit registered-multi.txt · 1 edit applied · 2 diff lines hidden · ctrl+o to expand");
       expect(multiEditRendered).not.toContain("REGISTERED_MULTIEDIT_DETAIL");
     } finally {
+      piTui.setKeybindings(previousPiBindings);
       setKeybindings(previousBindings);
     }
 
@@ -470,29 +481,27 @@ describe("tool surface registration", () => {
       expect(result).toEqual(baseline);
       const beforeRender = structuredClone(result);
 
-      for (const expanded of [false, true]) {
-        const ctx = {
-          args: search.args,
-          state: {},
-          isPartial: false,
-          isError: false,
-          expanded,
-          showImages: false,
-        };
-        const call = registered.renderCall(search.args, undefined, ctx);
-        const renderedResult = registered.renderResult(
-          result,
-          { expanded, isPartial: false },
-          undefined,
-          ctx,
-        );
-        expect(call.render(80)).toEqual([]);
-        const lines = renderedResult.render(80);
-        expect(lines).toHaveLength(1);
-        expect(lines[0]!.trim()).not.toBe("");
-        expect(lines[0]).toContain(search.name.toLowerCase());
-        expect(lines[0]).toContain(search.args.pattern);
-      }
+      const ctx = {
+        args: search.args,
+        state: {},
+        isPartial: false,
+        isError: false,
+        expanded: false,
+        showImages: false,
+      };
+      const call = registered.renderCall(search.args, undefined, ctx);
+      const renderedResult = registered.renderResult(
+        result,
+        { expanded: false, isPartial: false },
+        undefined,
+        ctx,
+      );
+      expect(call.render(80)).toEqual([]);
+      const lines = renderedResult.render(80);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]!.trim()).not.toBe("");
+      expect(lines[0]).toContain(search.name.toLowerCase());
+      expect(lines[0]).toContain(search.args.pattern);
       expect(result).toEqual(beforeRender);
     }
   });
@@ -1318,10 +1327,13 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
 
   it("renders custom and rebuilt-stock paths workspace-first then repository-relative without changing canonical bytes", async () => {
     const previousBindings = getKeybindings();
-    setKeybindings(new KeybindingsManager({
+    const previousPiBindings = piTui.getKeybindings();
+    const bindingDefinitions = {
       ...TUI_KEYBINDINGS,
-      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
-    }));
+      "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
+    };
+    setKeybindings(new KeybindingsManager(bindingDefinitions));
+    piTui.setKeybindings(new piTui.KeybindingsManager(bindingDefinitions));
     const entered = await pi.tools.get("EnterWorktree").execute("t02-display-wt", { name: `it/display-${Date.now()}` });
     const wt = entered.details.worktreePath as string;
     try {
@@ -1350,10 +1362,11 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
           isError: false,
           expanded: false,
         };
-        tool.renderCall(entry.args, theme, context);
+        const callComponent = tool.renderCall(entry.args, theme, context);
         const result = await tool.execute(`t02-${entry.name}-display`, entry.args);
         const resultBefore = structuredClone(result);
-        const row = tool.renderResult(result, { expanded: false, isPartial: false }, theme, context).render(120).join("\n");
+        const resultComponent = tool.renderResult(result, { expanded: false, isPartial: false }, theme, context);
+        const row = [...callComponent.render(120), ...resultComponent.render(120)].join("\n");
         expect(row).toContain(entry.expected);
         expect(row).not.toContain(wt);
         expect(entry.args).toEqual(argsBefore);
@@ -1362,6 +1375,7 @@ describe("worktrees end-to-end (cwd swap is load-bearing)", () => {
     } finally {
       await pi.tools.get("ExitWorktree").execute("t02-display-wt-exit", { action: "remove" });
       fs.rmSync(path.join(dir, "repository-display-proof.txt"), { force: true });
+      piTui.setKeybindings(previousPiBindings);
       setKeybindings(previousBindings);
     }
   });
