@@ -46,6 +46,9 @@ async function installedSession(options: InstalledOptions) {
   let hookCalls = 0;
   let sdkLoads = 0;
   let coreRegistrations = 0;
+  let firstProviderTools: string[] | undefined;
+  let firstActiveTools: string[] | undefined;
+  let firstRegisteredTools: string[] | undefined;
   let extensionApi: any;
   let initialization: Promise<void> | undefined;
   const settingsManager = sdk.SettingsManager.inMemory();
@@ -54,7 +57,11 @@ async function installedSession(options: InstalledOptions) {
   modelRuntime.getAuth = async () => ({ auth: { apiKey: "contract-test-key" }, source: "in-process contract" });
   modelRuntime.streamSimple = (...args: any[]) => {
     providerPrompts += 1;
-    void args;
+    if (firstProviderTools === undefined) {
+      firstProviderTools = (args[1]?.tools ?? []).map((tool: { name?: unknown }) => String(tool.name));
+      firstActiveTools = extensionApi.getActiveTools().map(String);
+      firstRegisteredTools = extensionApi.getAllTools().map((tool: { name?: unknown }) => String(tool.name));
+    }
     const stream = ai.createAssistantMessageEventStream();
     const message = {
       role: "assistant", content: [{ type: "text", text: `answer-${providerPrompts}` }],
@@ -136,6 +143,11 @@ async function installedSession(options: InstalledOptions) {
     session,
     extensionApi,
     counts: () => ({ providerPrompts, hookCalls, sdkLoads, coreRegistrations }),
+    firstProviderToolState: () => ({
+      advertised: firstProviderTools,
+      active: firstActiveTools,
+      registered: firstRegisteredTools,
+    }),
     close: async () => {
       await initialization;
       session.dispose?.();
@@ -185,6 +197,11 @@ describe("installed Pi AgentSession input admission", () => {
         gate.resolve(await import("@earendil-works/pi-coding-agent"));
         await prompt;
         expect(installed.counts()).toEqual({ providerPrompts: 1, hookCalls: 1, sdkLoads: 1, coreRegistrations: 7 });
+        const firstProvider = installed.firstProviderToolState();
+        expect(firstProvider.advertised).toEqual(firstProvider.active);
+        for (const name of CORE) {
+          expect(firstProvider.registered, `${mode} registered routed ${name} before first provider call`).toContain(name);
+        }
         expect(providerText({ messages: installed.session.messages })).toContain("Deploy the release target");
 
         await submit(installed, mode, "second successful ordinary input");

@@ -3146,12 +3146,11 @@ describe("condensed completion records", () => {
       expect(lines.some((line) => line.includes("ctrl+o"))).toBe(true);
       for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
     }
-    // No complete binding fits below six columns, so accessibility deliberately
-    // fails open; the semantic marker remains first and every detail row is bounded.
+    // At unusable widths, retain only the semantic first row rather than wrapping hidden detail.
     for (const width of [1, 2]) {
       const lines = renderLines({ ...completedDetails, agent: longAgent }, "answer", false, width);
       expect(lines[0]).toMatch(/^●/u);
-      expect(lines.join("")).toContain("task-3");
+      expect(lines.join("")).not.toContain("task-3");
       for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
     }
   });
@@ -3321,6 +3320,19 @@ describe("condensed completion records", () => {
     expect(wide).toContain("2m03s");
   });
 
+  it("bounds a huge explicitly expanded completion at unusable width and restores it after widening", () => {
+    const body = `RUNTIME_HUGE_SENTINEL:${"body".repeat(300_000)}`;
+    const details = Object.freeze({ ...completedDetails, agent: "huge-worker" });
+    const tiny = renderLines(details, body, true, 6);
+    expect(tiny.length).toBeLessThanOrEqual(2);
+    expect(tiny[0]).toMatch(/^●/u);
+    expect(tiny.at(-1)).toBe("resize");
+    expect(tiny.join("\n")).not.toContain("RUNTIME_HUGE_SENTINEL");
+    for (const line of tiny) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(6);
+    expect(renderLines(details, body, true, 80).join("\n")).toContain("RUNTIME_HUGE_SENTINEL");
+    expect(details).toEqual({ ...completedDetails, agent: "huge-worker" });
+  });
+
   it("pins exact first semantic rows and marker/identity priority for ASCII, CJK, emoji, and combining text", () => {
     const identities = [
       { agent: "coder", direct: ["●", "●c", "● c"] },
@@ -3376,7 +3388,7 @@ describe("condensed completion records", () => {
     { status: "completed", outcome: "completed", marker: "●" },
     { status: "failed", outcome: "failed", marker: "✗" },
     { status: "stopped", outcome: "aborted", marker: "■" },
-  ] as const)("keeps exact tiny production CJK and emoji $status identities while failing open", ({ status, outcome, marker }) => {
+  ] as const)("keeps exact tiny production CJK and emoji $status identities until resize", ({ status, outcome, marker }) => {
     const wrapped = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
     const render = (agent: string, width: number) => {
       const context = { state: {}, args: { task_id: "task-3" }, isError: false };
@@ -3399,9 +3411,12 @@ describe("condensed completion records", () => {
         const lines = render(agent, width);
         for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
       }
-      const resized = render(agent, 5);
-      expect(resized.join("").replace(/\s/gu, "")).toContain("body");
-      for (const line of resized) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(5);
+      const stillUnusable = render(agent, 5);
+      expect(stillUnusable.join("")).not.toContain("body");
+      const resized = render(agent, 8);
+      expect(resized.join("\n")).toContain("ctrl+o");
+      expect(resized.join("\n")).not.toContain("body");
+      for (const line of resized) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(8);
     }
   });
 

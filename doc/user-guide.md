@@ -113,6 +113,10 @@ ownership with that Pi installation. PiCC does not register `/picc-update` there
 update behavior remains available. A project skill named `/update` is likewise independent and is
 never shadowed by PiCC.
 
+If core initialization fails, the task was not sent. Check or update through the installation
+owner. For a direct PiCC launch, `/picc-update` or `picc update --check` are examples. Restart PiCC,
+then use `/doctor` and the reported cause if the failure persists.
+
 ## 3. Authenticate (spend your subscription)
 
 Auth is Pi's, not ours, and is a one-time interactive step. Step by step (any shell):
@@ -208,9 +212,9 @@ Pending/streaming work, errors, aborts, clipping or truncation notices, recovery
 MCP tools, search, and subagent/task records keep bounded detail appropriate to their semantics.
 When `app.tools.expand` is unbound, a row whose hidden detail would otherwise be inaccessible fails
 open and shows it. Search and subagent completion rows keep a complete configured-action cue,
-placing it on a separate row when necessary. Search always fails open when its authentic cue cannot
-fit. Subagent completion records do so at usable widths; at an unusably narrow terminal, only their
-marker or identity may fit, and widening restores the detail. In PiCC compact summaries, paths
+placing it on a separate row when necessary, and fail open when no usable cue exists. At an
+unusably narrow terminal they show only bounded semantic state instead of a large body; detail waits
+for widening, and resize guidance appears only when it fits. In PiCC compact summaries, paths
 within the invocation-time workspace are relative to it; paths elsewhere in the repository use a
 visibly marked repository-relative form, and external paths remain absolute. Eligible custom PiCC
 fragments in HTML exports use the export context
@@ -270,11 +274,11 @@ Every subagent is visible, both to you and to the coordinating model:
   detail owns the live view. Each depth-1 normal-path result replaces its pending call in the same
   tool row. A successful background acceptance is transient in human chat rather than a durable row;
   its first terminal delivery, whether from `TaskOutput` or next-turn settlement, creates a separate
-  semantic record instead of mutating the earlier call. That single bounded line prioritizes the
+  semantic record instead of mutating the earlier call. That bounded record prioritizes the
   outcome, agent identity and textual state, actionable exceptional evidence, and dispatch description, then an
   expansion cue and duration as space permits. The configured `app.tools.expand` action (Ctrl+O by
   default) reveals the task and agent IDs, available retained output, transcript location, usage,
-  and applicable diagnostics; an unbound action fails open to that detail. A terminal `TaskOutput`
+  and applicable diagnostics. At usable widths, an unbound action fails open to that detail. A terminal `TaskOutput`
   retrieval after that record was already delivered adds no human row. Background agents still get
   the record if never awaited; an agent that settles while you are away from the prompt gets it when
   the conversation next continues. Nested agents (depth ≥ 2) get no record of their own — they keep

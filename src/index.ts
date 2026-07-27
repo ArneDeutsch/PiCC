@@ -2513,7 +2513,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           const commit = readiness.possiblePartialCommit
             ? "registration began, so a partial core replacement may have committed"
             : "registration did not begin";
-          report(`PiCC: core tool initialization failed; the project task was not sent. Restart PiCC after updating or reinstalling. Cause: ${readiness.cause}; ${commit}; ${readiness.cleanup}.`, true);
+          report(`PiCC: core tool initialization failed; the project task was not sent. Check or update through the installation owner; for a direct PiCC launch, /picc-update or picc update --check are examples. Restart PiCC, then use /doctor and the reported cause if this persists. Cause: ${readiness.cause}; ${commit}; ${readiness.cleanup}.`, true);
         }
         report("PiCC: core tools are unavailable; task not sent. Restart PiCC after updating or reinstalling.", false);
         return { action: "handled" };

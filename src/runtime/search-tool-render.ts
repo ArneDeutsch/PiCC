@@ -30,6 +30,10 @@ import { sanitizeDisplayText, themedFg } from "./render-util.js";
 const LINE_BREAK_RE = /\r\n?|\n|\u2028|\u2029/;
 const DISPLAY_TEXT_LIMIT = 1_048_576;
 const CLIP_INSPECTION_WINDOW = 32_768;
+// Below this floor, wrapping retained bodies is unusable and can amplify one large line into millions of rows.
+const DETAIL_USABLE_WIDTH = 8;
+const RESIZE_GUIDANCE = "resize";
+const resizeGuidance = (width: number): string[] => width >= RESIZE_GUIDANCE.length ? [RESIZE_GUIDANCE] : [];
 
 interface Component {
   render(width: number): string[];
@@ -213,6 +217,15 @@ function guarded(component: Component, fallback = "Search result unavailable"): 
 
 function quote(value: string): string {
   return `“${value || "?"}”`;
+}
+
+function tinySearchIdentity(toolName: SearchName, theme: unknown, width: number): string {
+  const identity = safeFg(theme, "text", formatToolDisplayName(toolName));
+  try {
+    return truncateToWidth(identity, width, "");
+  } catch {
+    return toolName.slice(0, 1);
+  }
 }
 
 function invocationParts(toolName: SearchName, args: Snapshot): {
@@ -534,33 +547,64 @@ function safeContentSnapshot(result: unknown): ResultShape {
   return { content: blocks };
 }
 
-function failOpenComponent(result: unknown, theme: unknown, context: RenderContext | undefined): Component {
-  let snapshot: ResultShape;
-  try {
-    snapshot = safeContentSnapshot(result);
-  } catch {
-    snapshot = { content: [{ type: "text", text: "Unrenderable search result" }] };
-  }
-  const safeTheme = { fg: (slot: string, text: string) => safeFg(theme, slot, text) };
-  const safeContext = { showImages: safeGet(context, "showImages") === true };
-  try {
-    return guarded(genericResultComponent(snapshot as never, safeTheme, safeContext));
-  } catch {
-    return guarded({ render: (width) => [clamp("Search result unavailable", width)] });
-  }
+function failOpenComponent(
+  toolName: SearchName,
+  result: unknown,
+  theme: unknown,
+  context: RenderContext | undefined,
+  tinyIdentity = true,
+): Component {
+  let delegate: Component | undefined;
+  let lastWidth: number | undefined;
+  let lastLines: string[] | undefined;
+  return guarded({
+    render(width: number): string[] {
+      if (width < DETAIL_USABLE_WIDTH) {
+        if (width <= 0) return [];
+        const lines = tinyIdentity ? [tinySearchIdentity(toolName, theme, width)] : [];
+        lines.push(...resizeGuidance(width));
+        return lines;
+      }
+      if (lastWidth === width && lastLines) return lastLines;
+      if (!delegate) {
+        let snapshot: ResultShape;
+        try {
+          snapshot = safeContentSnapshot(result);
+        } catch {
+          snapshot = { content: [{ type: "text", text: "Unrenderable search result" }] };
+        }
+        const safeTheme = { fg: (slot: string, text: string) => safeFg(theme, slot, text) };
+        const safeContext = { showImages: safeGet(context, "showImages") === true };
+        try {
+          delegate = genericResultComponent(snapshot as never, safeTheme, safeContext);
+        } catch {
+          delegate = { render: (columns) => [clamp("Search result unavailable", columns)] };
+        }
+      }
+      lastLines = delegate.render(width);
+      lastWidth = width;
+      return lastLines;
+    },
+  });
 }
 
 function feedbackComponent(texts: readonly string[], theme: unknown): Component {
-  const snapshot = texts.map((text) => sanitize(text, false));
+  let snapshot: string[] | undefined;
+  let lastWidth: number | undefined;
+  let lastLines: string[] | undefined;
   return guarded({
     render(width: number): string[] {
-      if (width <= 0) return snapshot.map(() => "");
+      if (width < DETAIL_USABLE_WIDTH) return [];
+      if (lastWidth === width && lastLines) return lastLines;
+      snapshot ??= texts.map((text) => sanitize(text, false));
       const lines: string[] = [];
       for (const text of snapshot) {
         for (const sourceLine of text.split(LINE_BREAK_RE)) {
-          lines.push(...wrapTextWithAnsi(safeFg(theme, "toolOutput", sourceLine), Math.max(1, width)));
+          lines.push(...wrapTextWithAnsi(safeFg(theme, "toolOutput", sourceLine), width));
         }
       }
+      lastLines = lines;
+      lastWidth = width;
       return lines;
     },
   }, "Feedback unavailable");
@@ -572,9 +616,8 @@ function recoveryComponent(toolName: SearchName, args: Snapshot, state: SummaryS
   const snapshot = recovery ? `Recovery: ${recovery}.` : "";
   return guarded({
     render(width: number): string[] {
-      if (!snapshot || selectSummaryCore(toolName, expression, state, theme, width, true)) return [];
-      if (width <= 0) return [""];
-      return wrapTextWithAnsi(safeFg(theme, "toolOutput", snapshot), Math.max(1, width));
+      if (width < DETAIL_USABLE_WIDTH || !snapshot || selectSummaryCore(toolName, expression, state, theme, width, true)) return [];
+      return wrapTextWithAnsi(safeFg(theme, "toolOutput", snapshot), width);
     },
   }, "Recovery unavailable");
 }
@@ -593,6 +636,9 @@ function summaryComponent(
 ): Component {
   return guarded({
     render(width: number): string[] {
+      if (width > 0 && width < DETAIL_USABLE_WIDTH) {
+        return [tinySearchIdentity(toolName, theme, width), ...(state.expansionCue ? resizeGuidance(width) : [])];
+      }
       const summary = summaryLine(toolName, args, state, theme, width);
       if (!state.expansionCue || summary.cueAppended) return [summary.line];
       const separate = cueCandidates(state.expansionCue).find((candidate) => measuredWidth(candidate) <= width);
@@ -603,14 +649,20 @@ function summaryComponent(
 }
 
 function detailComponent(text: string, theme: unknown): Component {
-  const snapshot = sanitize(text, false);
+  let sourceLines: string[] | undefined;
+  let lastWidth: number | undefined;
+  let lastLines: string[] | undefined;
   return guarded({
     render(width: number): string[] {
-      if (width <= 0) return snapshot.split("\n").map(() => "");
+      if (width < DETAIL_USABLE_WIDTH) return resizeGuidance(width);
+      if (lastWidth === width && lastLines) return lastLines;
+      sourceLines ??= sanitize(text, false).split("\n");
       const lines: string[] = [];
-      for (const sourceLine of snapshot.split("\n")) {
-        lines.push(...wrapTextWithAnsi(safeFg(theme, "toolOutput", sourceLine), Math.max(1, width)));
+      for (const sourceLine of sourceLines) {
+        lines.push(...wrapTextWithAnsi(safeFg(theme, "toolOutput", sourceLine), width));
       }
+      lastLines = lines;
+      lastWidth = width;
       return lines;
     },
   }, "Search detail unavailable");
@@ -706,23 +758,25 @@ export function withCompactSearchRendering<T extends ToolDefinition>(
         if (safeGet(context, "isError") === true) {
           const failed: SummaryState = { status: "failed", compactStatus: "fail" };
           return combinedComponent([
-            guarded({ render: (width) => [summaryLine(toolName, args, failed, theme, width).line] }, toolName),
-            failOpenComponent(result, theme, context),
+            guarded({ render: (width) => [width > 0 && width < DETAIL_USABLE_WIDTH
+              ? tinySearchIdentity(toolName, theme, width)
+              : summaryLine(toolName, args, failed, theme, width).line] }, toolName),
+            failOpenComponent(toolName, result, theme, context, false),
           ]);
         }
-        if (safeGet(options, "isPartial") === true) return failOpenComponent(result, theme, context);
+        if (safeGet(options, "isPartial") === true) return failOpenComponent(toolName, result, theme, context);
         const content = safeOwn(result, "content");
         const detailsValue = safeOwn(result, "details");
         const details = toolName === "Grep" ? validateGrepDetails(detailsValue, args) : validateGlobDetails(detailsValue);
         if (!validArgs(toolName, args) || !Array.isArray(content) || content.length === 0 || !details) {
-          return failOpenComponent(result, theme, context);
+          return failOpenComponent(toolName, result, theme, context);
         }
         const primaryText = textBlockSnapshot(content[0]);
-        if (primaryText === undefined) return failOpenComponent(result, theme, context);
+        if (primaryText === undefined) return failOpenComponent(toolName, result, theme, context);
         const feedback: string[] = [];
         for (const block of content.slice(1)) {
           const text = textBlockSnapshot(block);
-          if (text === undefined) return failOpenComponent(result, theme, context);
+          if (text === undefined) return failOpenComponent(toolName, result, theme, context);
           feedback.push(text);
         }
         const expansion = piToolsExpandKeyText();
@@ -740,7 +794,7 @@ export function withCompactSearchRendering<T extends ToolDefinition>(
         if (feedback.length > 0) components.push(feedbackComponent(feedback, theme));
         return combinedComponent(components);
       } catch {
-        return failOpenComponent(result, theme, context);
+        return failOpenComponent(toolName, result, theme, context);
       }
     },
   } as T;

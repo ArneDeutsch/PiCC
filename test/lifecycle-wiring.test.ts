@@ -230,6 +230,11 @@ describe("lifecycle wiring", () => {
         expect(reports, mode).toHaveLength(3);
         expect(reports.filter((line) => line.includes("core tool initialization failed")), mode).toHaveLength(1);
         expect(reports.filter((line) => line.includes("core tools are unavailable")), mode).toHaveLength(2);
+        const detailed = reports.find((line) => line.includes("core tool initialization failed")) ?? "";
+        expect(detailed, mode).toContain("Check or update through the installation owner");
+        expect(detailed, mode).toContain("for a direct PiCC launch, /picc-update or picc update --check are examples");
+        expect(detailed, mode).toContain("Restart PiCC");
+        expect(detailed, mode).toContain("use /doctor and the reported cause if this persists");
         expect(Math.max(...reports.map((line) => line.length)), mode).toBeLessThanOrEqual(2_000);
       } finally {
         console.error = originalError;

@@ -1,4 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
+
+const detailSanitizerEvidence = vi.hoisted(() => ({
+  sentinel: "UNIQUE_LAZY_SEARCH_DETAIL_SENTINEL",
+  calls: 0,
+}));
+vi.mock("../src/runtime/render-util.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/runtime/render-util.js")>();
+  return {
+    ...actual,
+    sanitizeDisplayText(value: string, limit: number, inline?: boolean) {
+      if (value.includes(detailSanitizerEvidence.sentinel)) detailSanitizerEvidence.calls += 1;
+      return actual.sanitizeDisplayText(value, limit, inline);
+    },
+  };
+});
+
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -362,6 +378,43 @@ describe("compact search rendering decorator", () => {
     }
   });
 
+  it("lazily sanitizes one retained-detail snapshot and caches same-width expanded paints", () => {
+    detailSanitizerEvidence.calls = 0;
+    let themedDetailCalls = 0;
+    const theme = {
+      fg(_slot: string, text: string) {
+        if (text.includes(detailSanitizerEvidence.sentinel)) themedDetailCalls += 1;
+        return text;
+      },
+    };
+    const body = `${detailSanitizerEvidence.sentinel}:${"x".repeat(500_000)}`;
+    const tool = grepTool();
+    const args = { pattern: "lazy" };
+    const ctx = context(args);
+    tool.renderCall(args, theme, ctx);
+    const value = textResult(body, { ...grepDetails, totalEntries: 1, returnedEntries: 1 });
+    const collapsed = tool.renderResult(value, { expanded: false, isPartial: false }, theme, ctx);
+    expect(detailSanitizerEvidence.calls).toBe(0);
+    collapsed.render(80);
+    collapsed.render(80);
+    expect(detailSanitizerEvidence.calls).toBe(0);
+
+    const expanded = tool.renderResult(value, { expanded: true, isPartial: false }, theme, ctx);
+    expect(detailSanitizerEvidence.calls).toBe(0);
+    expanded.render(80);
+    expect(detailSanitizerEvidence.calls).toBe(1);
+    expect(themedDetailCalls).toBe(1);
+    expanded.render(80);
+    expect(detailSanitizerEvidence.calls).toBe(1);
+    expect(themedDetailCalls).toBe(1);
+    for (const [width, expectedThemeCalls] of [[40, 2], [120, 3], [40, 4], [40, 4]] as const) {
+      const lines = expanded.render(width);
+      expectBounded(lines, width);
+      expect(detailSanitizerEvidence.calls).toBe(1);
+      expect(themedDetailCalls).toBe(expectedThemeCalls);
+    }
+  });
+
   it.each([
     { name: "a remapped action", binding: "alt+e", cue: "alt+e to expand", reveals: false },
     { name: "an explicit unbind", binding: [] as string[], cue: "to expand", reveals: true },
@@ -420,9 +473,12 @@ describe("compact search rendering decorator", () => {
       expect(narrow.join("\n")).not.toContain("Z-retained");
       expectBounded(narrow, 8);
 
-      const tooNarrow = callAndFinalize(grepTool(), args, result, 3).result.join("");
-      expect(tooNarrow).not.toContain("alt+e");
-      expect(tooNarrow).toContain("Z-retained");
+      const tooNarrow = callAndFinalize(grepTool(), args, result, 3).result;
+      expect(tooNarrow.join("\n")).not.toContain("alt+e");
+      expect(tooNarrow.join("\n")).not.toContain("Z-retained");
+      expect(tooNarrow).toHaveLength(1);
+      const widened = callAndFinalize(grepTool(), args, result, 80).result.join("\n");
+      expect(widened).toContain("alt+e");
       expect(result).toEqual(before);
     } finally {
       piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
@@ -544,6 +600,96 @@ describe("compact search rendering decorator", () => {
     );
   });
 
+  it("keeps known trailing feedback lazy and bounded at tiny widths, then restores it", () => {
+    detailSanitizerEvidence.calls = 0;
+    let feedbackThemeCalls = 0;
+    const theme = {
+      fg(_slot: string, text: string) {
+        if (text.includes(detailSanitizerEvidence.sentinel)) feedbackThemeCalls += 1;
+        return text;
+      },
+    };
+    const hugeFeedback = `${detailSanitizerEvidence.sentinel}:${"feedback".repeat(200_000)}`;
+    const tool = grepTool();
+    const args = { pattern: "feedback" };
+    const ctx = context(args);
+    tool.renderCall(args, theme, ctx);
+    const component = tool.renderResult(
+      textResult("primary", { ...grepDetails, totalEntries: 1, returnedEntries: 1 }, [
+        { type: "text", text: hugeFeedback },
+      ]),
+      { expanded: false, isPartial: false },
+      theme,
+      ctx,
+    );
+    for (const width of [1, 2, 3, 4, 5, 6, 7]) {
+      const lines = component.render(width);
+      expect(lines.length).toBeLessThanOrEqual(2);
+      expect(lines[0]).not.toBe("");
+      expect(lines.join("\n")).not.toContain(detailSanitizerEvidence.sentinel);
+      expect(detailSanitizerEvidence.calls).toBe(0);
+      expect(feedbackThemeCalls).toBe(0);
+      expectBounded(lines, width);
+    }
+    expect(component.render(80).join("\n")).toContain(detailSanitizerEvidence.sentinel);
+    expect(detailSanitizerEvidence.calls).toBe(1);
+    expect(feedbackThemeCalls).toBe(1);
+    component.render(80);
+    expect(feedbackThemeCalls).toBe(1);
+    expect(component.render(40).join("\n")).toContain(detailSanitizerEvidence.sentinel);
+    expect(detailSanitizerEvidence.calls).toBe(1);
+    expect(feedbackThemeCalls).toBe(2);
+  });
+
+  it("bounds huge expanded, unbound, and error bodies at unusable widths and restores detail after resize", () => {
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    const huge = `${detailSanitizerEvidence.sentinel}:${"row".repeat(350_000)}`;
+    const value = textResult(huge, { ...grepDetails, totalEntries: 1, returnedEntries: 1 });
+    const renderKnown = (expanded: boolean) => {
+      const tool = grepTool();
+      const args = { pattern: "huge" };
+      const ctx = context(args);
+      tool.renderCall(args, undefined, ctx);
+      return tool.renderResult(value, { expanded, isPartial: false }, undefined, ctx);
+    };
+
+    detailSanitizerEvidence.calls = 0;
+    const expanded = renderKnown(true);
+    const tinyExpanded = expanded.render(6);
+    expect(tinyExpanded).toHaveLength(2);
+    expect(tinyExpanded[0]).not.toBe("");
+    expect(tinyExpanded[1]).toBe("resize");
+    expect(detailSanitizerEvidence.calls).toBe(0);
+    expect(expanded.render(80).join("\n")).toContain(detailSanitizerEvidence.sentinel);
+    expect(detailSanitizerEvidence.calls).toBe(1);
+
+    piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": [] }));
+    try {
+      detailSanitizerEvidence.calls = 0;
+      const unbound = renderKnown(false);
+      expect(unbound.render(6)).toHaveLength(2);
+      expect(detailSanitizerEvidence.calls).toBe(0);
+      expect(unbound.render(80).join("\n")).toContain(detailSanitizerEvidence.sentinel);
+      expect(detailSanitizerEvidence.calls).toBe(1);
+
+      const errorTool = grepTool();
+      const args = { pattern: "error" };
+      const errorCtx = context(args, { isError: true });
+      errorTool.renderCall(args, undefined, errorCtx);
+      const error = errorTool.renderResult(
+        { content: [{ type: "text", text: huge }], details: undefined },
+        { expanded: false, isPartial: false }, undefined, errorCtx,
+      );
+      expect(error.render(6)).toHaveLength(2);
+      expect(error.render(80).join("\n")).toContain(detailSanitizerEvidence.sentinel);
+    } finally {
+      piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
+    }
+  });
+
   it("treats CRLF as one line boundary, neutralizes lone CR, and preserves canonical bytes", () => {
     const hostile = "first\r\nsecond\rthird\u0000\u0085\u001b[31mred\u001b]0;title\u0007\u009b32mgreen\u009dtitle\u009c\u001b]unterminated\t中🙂\u202eend";
     const result = textResult(hostile, { ...grepDetails, totalEntries: 1, returnedEntries: 1 });
@@ -646,6 +792,36 @@ describe("compact search rendering decorator", () => {
     expect(nonContent).not.toContain("-A");
     expect(nonContent).not.toContain("context 4");
     expect(nonContent).not.toContain("-o");
+  });
+
+  it("keeps partial and malformed search identity visible at every positive unusable width", () => {
+    const args = { pattern: "tiny" };
+    const cases = [
+      { label: "partial", result: textResult("partial match", grepDetails), partial: true },
+      { label: "malformed", result: { content: [{ type: "text", text: "body", extra: true }], details: grepDetails }, partial: false },
+    ];
+    for (const testCase of cases) {
+      const tool = grepTool();
+      const ctx = context(args);
+      tool.renderCall(args, undefined, ctx);
+      const component = tool.renderResult(
+        testCase.result,
+        { expanded: false, isPartial: testCase.partial },
+        undefined,
+        ctx,
+      );
+      for (let width = 1; width < 8; width += 1) {
+        const lines = component.render(width);
+        expect(lines.length, `${testCase.label} width ${String(width)}`).toBeGreaterThan(0);
+        expect(lines.length, `${testCase.label} width ${String(width)}`).toBeLessThanOrEqual(2);
+        expect(lines[0]?.replace(/\u001b\[[0-9;]*m/gu, ""), `${testCase.label} width ${String(width)}`)
+          .toBe("grep".slice(0, width));
+        expect(lines.join("\n")).not.toContain("partial match");
+        expect(lines.join("\n")).not.toContain("body");
+        if (lines.length === 2) expect(lines[1]).toBe("resize");
+        expectBounded(lines, width);
+      }
+    }
   });
 
   it("keeps partial output visible, then replaces it with one final summary", () => {

@@ -3782,12 +3782,42 @@ describe("settlement completion record (details + exactly-once)", () => {
       expect(narrow.join("\n")).not.toContain("Z-retained");
       for (const line of narrow) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(8);
 
-      const tooNarrow = renderSettlementRecord(details, { expanded: false }, undefined)!.render(3).join("");
-      expect(tooNarrow).not.toContain("alt+e");
-      expect(tooNarrow).toContain("Z-retained");
+      const tooNarrow = renderSettlementRecord(details, { expanded: false }, undefined)!.render(3);
+      expect(tooNarrow.join("\n")).not.toContain("alt+e");
+      expect(tooNarrow.join("\n")).not.toContain("Z-retained");
+      expect(tooNarrow).toHaveLength(1);
+      expect(renderSettlementRecord(details, { expanded: false }, undefined)!.render(80).join("\n")).toContain("alt+e");
     } finally {
       piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
     }
+  });
+
+  it("bounds huge expanded and unbound completion bodies at unusable widths, then restores them", () => {
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    const huge = `HUGE_SUBAGENT_SENTINEL:${"body".repeat(300_000)}`;
+    const details = Object.freeze({
+      record: "subagent-completion" as const,
+      outcome: "completed" as const,
+      agent: "worker",
+      taskId: "task-huge",
+      agentId: AGENT_ID,
+      finalText: huge,
+    });
+    for (const binding of [["ctrl+o"], []] as const) {
+      piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": binding }));
+      const component = renderSettlementRecord(details, { expanded: binding.length > 0 }, undefined)!;
+      const tiny = component.render(6);
+      expect(tiny.length).toBeLessThanOrEqual(2);
+      expect(tiny[0]).toMatch(/^●/u);
+      expect(tiny.at(-1)).toBe("resize");
+      expect(tiny.join("\n")).not.toContain("HUGE_SUBAGENT_SENTINEL");
+      for (const line of tiny) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(6);
+      expect(component.render(80).join("\n")).toContain("HUGE_SUBAGENT_SENTINEL");
+    }
+    piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
   });
 
   it("fails open frozen complete Agent, TaskOutput, and settlement records exactly once when unbound", () => {

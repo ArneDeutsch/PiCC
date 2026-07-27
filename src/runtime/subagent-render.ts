@@ -32,6 +32,9 @@ import type { SubagentAdmission } from "./subagent-registry.js";
 // Retained as a compatibility sentinel for print-mode negative assertions;
 // interactive completion cues are resolved from Pi's configured action.
 export const RECORD_EXPAND_HINT = "ctrl+o to expand";
+// Retained lifecycle bodies are not useful below this width and can otherwise expand into enormous row counts.
+const DETAIL_USABLE_WIDTH = 8;
+const RESIZE_GUIDANCE = "resize";
 /** The condensed fork-degrade warning — NEVER expand-only on a degraded fork. */
 export const RECORD_FORK_MARKER = "⚠ fork degraded";
 
@@ -1245,6 +1248,13 @@ export function renderAgentResult(
               tone: failOpenOutcome === "failure" ? "error" : failOpenOutcome === "stopped" ? "warning" : "muted",
             }, width));
           }
+          if (width < DETAIL_USABLE_WIDTH) {
+            if (lines.length === 0) lines.push(...lifecycleLine(theme, {
+              agent: "subagent", state: "result", tone: failOpenOutcome === "failure" ? "error" : "muted",
+            }, width));
+            if (width >= RESIZE_GUIDANCE.length) lines.push(themedFg(theme, "muted", RESIZE_GUIDANCE));
+            return clampLines(lines, width);
+          }
           const evidence = humanDisplayText(boundedBodyText(result), false);
           if (evidence) pushBodyText(evidence, width, lines);
           else pushWrapped("unrecognized lifecycle result", width, lines);
@@ -1311,6 +1321,20 @@ export function renderAgentResult(
         return runningStatusLines(theme, chip, agent, details, width, color);
       }
       const outcome = typeof details.outcome === "string" ? details.outcome : undefined;
+      const semanticTerminal = (presentation.surface === "task-output" && firstTerminal) || presentation.surface === "settlement" ||
+        (presentation.surface === undefined && details.taskId !== undefined);
+      const boundedResizeRecord = (): string[] => {
+        const collapsed = collapsedRecordLines(
+          theme, details, outcome as "completed" | "failed" | "aborted", undefined, width,
+          expansionCue ?? RECORD_EXPAND_HINT, shellOwnsSymbol, color, semanticTerminal,
+        );
+        const first = collapsed.lines.slice(0, 1);
+        if (width >= RESIZE_GUIDANCE.length) first.push(themedFg(theme, "muted", RESIZE_GUIDANCE));
+        return clampLines(first, width);
+      };
+      if (outcome && width < DETAIL_USABLE_WIDTH && (expanded !== false || !expansionCue)) {
+        return boundedResizeRecord();
+      }
       let failOpenCollapsed = false;
       // Collapsed by default in the interactive transcript: Pi always passes a
       // BOOLEAN `expanded` (false until the configured app.tools.expand action),
@@ -1318,18 +1342,12 @@ export function renderAgentResult(
       // omits the option gets the full record — print/RPC never run renderers,
       // so this only widens compatibility for direct callers.
       if (outcome && expanded === false && expansionCue) {
-        const semanticTerminal = (presentation.surface === "task-output" && firstTerminal) || presentation.surface === "settlement" ||
-          (presentation.surface === undefined && details.taskId !== undefined);
         const collapsed = collapsedRecordLines(
           theme, details, outcome, undefined, width, expansionCue, shellOwnsSymbol, color, semanticTerminal,
         );
         const accessible = ensureVisibleExpansionCue(theme, collapsed, expansionCue, width);
         if (accessible) return clampLines(accessible, width);
-        // The self shell probes one- and two-column inner widths to preserve its
-        // exact marker/identity thresholds. No additional detail row can be
-        // framed there without displacing that semantic first row; widening
-        // beyond two inner columns restores the ordinary fail-open path.
-        if (shellOwnsSymbol && width <= 2) return clampLines(collapsed.lines, width);
+        if (width < DETAIL_USABLE_WIDTH) return boundedResizeRecord();
         lines.push(...collapsed.lines);
         failOpenCollapsed = true;
       }
@@ -1353,8 +1371,6 @@ export function renderAgentResult(
               : outcome;
         const tone = outcome === "completed" ? "success" : outcome === "failed" && !userStopped ? "error" : "warning";
         const symbol = outcome === "completed" ? "● " : outcome === "failed" && !userStopped ? "✗ " : "■ ";
-        const semanticTerminal = (presentation.surface === "task-output" && firstTerminal) || presentation.surface === "settlement" ||
-          (presentation.surface === undefined && details.taskId !== undefined);
         lines.push(...lifecycleLine(theme, {
           agent: agentName,
           state: lifecycleState,
@@ -1391,8 +1407,6 @@ export function renderAgentResult(
         pushColored(theme, "error", errorDetail, width, lines);
       }
       const footer: string[] = [];
-      const semanticTerminal = (presentation.surface === "task-output" && firstTerminal) || presentation.surface === "settlement" ||
-        (presentation.surface === undefined && details.taskId !== undefined);
       const stableAgentId = agentIdOf(details);
       if (typeof details.description === "string" && details.description) {
         footer.push(`description: ${sanitizeInline(details.description)}`);

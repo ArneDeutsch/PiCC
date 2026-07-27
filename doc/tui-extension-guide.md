@@ -141,12 +141,10 @@ the requested range; unknown and exceptional families fail open to native detail
 `app.tools.expand` action changes native detail without changing the glyph; live, exceptional,
 unfamiliar, and unbound-action rows keep their native detail inside the same outer glyph frame,
 while malformed display fields use a concise warning. Search and subagent completion rows may add a
-separate complete cue row when the cue cannot fit inline. Search always fails open when its authentic
-configured-action cue cannot render completely and safely. Subagent completion records do too,
-except that the self-shell's extreme one- or two-column inner-width probe preserves only their
-semantic collapsed marker or identity until
-widened beyond two inner columns. Shared shell, routing, and Pi-owned bridge
-mechanics do not make those content policies universal: ordinary Read/Bash are call-owned, custom
+separate complete cue row when the cue cannot fit inline and fail open when no usable cue exists.
+At unusably narrow widths they retain the semantic first row with at most one resize hint rather than
+wrapping a large retained body; widening restores full detail or its configured-action cue. Shared
+shell, routing, and Pi-owned bridge mechanics do not make those content policies universal: ordinary Read/Bash are call-owned, custom
 Grep/Glob are result-owned, and widgets,
 panels, messages, and entries retain separate interaction and lifecycle contracts.
 
