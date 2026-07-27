@@ -7,11 +7,12 @@
  * glyph framing, checkpoint handling, and registration. Subagent paths consume
  * the raw definitions selected by their grants.
  */
-import { open as fsOpen, readFile as fsReadFile, stat as fsStat } from "node:fs/promises";
+import { open as fsOpen } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, resolve as resolvePath } from "node:path";
 import { sanitizedSubprocessEnv, unicodeSafeSubprocessEnv } from "../util/env.js";
 import type { CwdState } from "./cwd-state.js";
+import type { NotebookSessionState } from "./notebook-session.js";
 import { BINARY_READ_ERROR, isBinaryBuffer, sniffImageMime } from "./image-ingest.js";
 // NOTE: `./notebook-render.js` is imported dynamically inside the notebook branch
 // below, NOT at module load. It transitively imports the Pi package root (for
@@ -77,6 +78,8 @@ export interface BuiltinToolDeps {
   projectRoot: string;
   /** Pinned Git-Bash path on Windows (from resolveGitBashPath); absent elsewhere. */
   shellPath?: string;
+  /** Per-conversation state for sessions that support notebook edit authorization. */
+  notebookSession?: NotebookSessionState;
 }
 
 /**
@@ -250,16 +253,15 @@ function binaryNotice(kind: BinaryKind | undefined, rawPath: string): ReadResult
   return { content: [{ type: "text", text }], details: { binary: true } };
 }
 
-/** A read-shaped notice for a notebook that could not be rendered (degrade, never crash). */
+const NOTEBOOK_AUTHORIZATION_SESSION_NOTICE =
+  "NotebookEdit authorization could not be recorded in this session. Start a new session, then Read this notebook again before editing.";
+
+/** A read-shaped notice containing only the caller's path and a bounded domain reason. */
 function notebookNotice(message: string, rawPath: string): ReadResult {
   return {
     content: [{ type: "text", text: `Could not read notebook "${rawPath}": ${message}` }],
     details: { notebookError: true },
   };
-}
-
-function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 /**
@@ -278,33 +280,86 @@ async function routeReadExecute(
   signal: unknown,
   onUpdate: unknown,
   ctx: unknown,
+  notebookSession?: NotebookSessionState,
 ): Promise<unknown> {
   const delegate = () => makeRead().execute(id, params, signal, onUpdate, ctx);
   const rawPath = readParamPath(params);
   if (rawPath === undefined) return delegate();
 
-  // (1) Notebook. Stat FIRST and reject an over-size file before reading it: this
-  // pre-read stat is the real OOM guard — a huge/hostile .ipynb must be rejected
-  // before it is slurped into memory (renderNotebook's own byte cap runs only
-  // AFTER the read, so it cannot prevent the OOM the read itself would cause). A
-  // structural throw (bad JSON, no `cells`, missing file) is caught and degraded
-  // to a read-shaped notice — it must never escape and crash the session.
+  // (1) Notebook. When session state is present, the complete load/render/record
+  // sequence shares Pi's mutation queue with Pi's queued file writers. Failed
+  // rendering never records authorization. The imports remain behind this branch.
   if (rawPath.toLowerCase().endsWith(".ipynb")) {
     const abs = resolveReadTarget(rawPath, cwd);
     try {
+      const { withFileMutationQueue } = await import("@earendil-works/pi-coding-agent");
       const { MAX_NOTEBOOK_BYTES, renderNotebook } = await import("./notebook-render.js");
-      const { size } = await fsStat(abs);
-      if (size > MAX_NOTEBOOK_BYTES) {
-        return notebookNotice(
-          `it is ${size} bytes, larger than the ${MAX_NOTEBOOK_BYTES}-byte notebook read limit`,
-          rawPath,
-        );
-      }
-      const text = await fsReadFile(abs, "utf8");
-      const { content, truncated } = await renderNotebook(text, { model: ctxModel(ctx) });
-      return { content, details: { truncated } } satisfies ReadResult;
-    } catch (err) {
-      return notebookNotice(errorText(err), rawPath);
+      const { decodeNotebookText, parseNotebookDocument } = await import("./notebook-edit-core.js");
+      const {
+        NotebookSizeLimitError,
+        canonicalNotebookPath,
+        inspectNotebookHandle,
+        openNotebookFile,
+      } = await import("./notebook-session.js");
+      return await withFileMutationQueue(abs, async () => {
+        let stage: "access" | "bytes" | "encoding" | "render" = "access";
+        try {
+          const canonical = await canonicalNotebookPath(abs);
+          const handle = await openNotebookFile(canonical, "r");
+          let loaded: Awaited<ReturnType<typeof inspectNotebookHandle>>;
+          try {
+            stage = "bytes";
+            loaded = await inspectNotebookHandle(handle, abs, canonical, MAX_NOTEBOOK_BYTES);
+          } finally {
+            await handle.close();
+          }
+          stage = "encoding";
+          if ((loaded.bytes[0] === 0x7b && loaded.bytes[1] === 0)
+            || (loaded.bytes[0] === 0 && loaded.bytes[1] === 0x7b)) {
+            throw new Error("UTF-16 without BOM");
+          }
+          const text = decodeNotebookText(loaded.bytes).text;
+          stage = "render";
+          const { content, truncated } = await renderNotebook(text, { model: ctxModel(ctx) });
+          try {
+            parseNotebookDocument(text);
+          } catch {
+            // Permissive Read output remains useful, but malformed editor structure is not authorization.
+            return {
+              content: [
+                ...content,
+                {
+                  type: "text",
+                  text: "NotebookEdit authorization was withheld because cell structure is malformed or unsupported. Repair the notebook, then Read it again before editing.",
+                },
+              ],
+              details: { truncated },
+            } satisfies ReadResult;
+          }
+          try {
+            notebookSession?.recordRead(loaded.target, loaded.bytes);
+          } catch {
+            return {
+              content: [...content, { type: "text", text: NOTEBOOK_AUTHORIZATION_SESSION_NOTICE }],
+              details: { truncated },
+            } satisfies ReadResult;
+          }
+          return { content, details: { truncated } } satisfies ReadResult;
+        } catch (error) {
+          if (error instanceof NotebookSizeLimitError) {
+            return notebookNotice(`notebook exceeds the ${error.limit}-byte limit`, rawPath);
+          }
+          if (stage === "encoding") {
+            return notebookNotice("notebook text uses an unsupported or malformed encoding", rawPath);
+          }
+          if (stage === "render") {
+            return notebookNotice("notebook structure is malformed or unsupported", rawPath);
+          }
+          return notebookNotice("file is missing, unreadable, or not a regular file", rawPath);
+        }
+      });
+    } catch {
+      return notebookNotice("file is missing, unreadable, or not a regular file", rawPath);
     }
   }
 
@@ -377,7 +432,16 @@ export function buildStockBuiltinTools(
     const execute =
       name === "read"
         ? async (id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) =>
-            routeReadExecute(() => factory(cwdRef.get()), cwdRef.get(), id, params, signal, onUpdate, ctx)
+            routeReadExecute(
+              () => factory(cwdRef.get()),
+              cwdRef.get(),
+              id,
+              params,
+              signal,
+              onUpdate,
+              ctx,
+              deps.notebookSession,
+            )
         : async (id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) => {
             const live = factory(cwdRef.get());
             return live.execute(id, params, signal, onUpdate, ctx);

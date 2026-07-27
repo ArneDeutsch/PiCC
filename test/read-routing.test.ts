@@ -9,6 +9,7 @@ import { buildStockBuiltinTools, type BuiltinToolSdk } from "../src/runtime/buil
 import { CwdState } from "../src/runtime/cwd-state.js";
 import { BINARY_READ_ERROR } from "../src/runtime/image-ingest.js";
 import { MAX_NOTEBOOK_BYTES } from "../src/runtime/notebook-render.js";
+import { NotebookSessionState, resolveNotebookTarget } from "../src/runtime/notebook-session.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
 import { fakeSdk, type FakeCustomTool, type FakeSdkHandle } from "./helpers/fake-sdk.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
@@ -131,14 +132,20 @@ function notebookWithImage(): unknown {
 
 describe("Read routing (shared factory + real Pi read)", () => {
   let dir: string;
+  let notebookSession: NotebookSessionState;
   let read: { execute(id: string, p: unknown, s: unknown, u: unknown, c: unknown): Promise<ReadRes> };
 
   beforeAll(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "picc-readroute-"));
     fs.writeFileSync(path.join(dir, "rich.ipynb"), JSON.stringify(notebookWithImage()));
-    fs.writeFileSync(path.join(dir, "empty-cells.ipynb"), JSON.stringify({ nbformat: 4, cells: [] }));
+    fs.writeFileSync(path.join(dir, "empty-cells.ipynb"), JSON.stringify({ nbformat: 4, nbformat_minor: 5, cells: [] }));
     fs.writeFileSync(path.join(dir, "bad.ipynb"), "this is not { valid json");
     fs.writeFileSync(path.join(dir, "v3.ipynb"), JSON.stringify({ nbformat: 3, worksheets: [] }));
+    fs.writeFileSync(path.join(dir, "malformed-cell.ipynb"), JSON.stringify({
+      nbformat: 4, nbformat_minor: 5, metadata: {},
+      cells: [{ cell_type: "code", id: "bad", source: 42, outputs: [] }],
+    }));
+    fs.writeFileSync(path.join(dir, "unsupported-encoding.ipynb"), Buffer.from(JSON.stringify(notebookWithImage()), "utf16le"));
     // Over-limit .ipynb — a sparse file whose stat size exceeds the cap without
     // writing megabytes; the pre-read stat must reject it before any read.
     const huge = path.join(dir, "huge.ipynb");
@@ -163,9 +170,11 @@ describe("Read routing (shared factory + real Pi read)", () => {
       '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>\n',
     );
 
+    notebookSession = new NotebookSessionState();
     const tools = buildStockBuiltinTools(piSdk as unknown as BuiltinToolSdk, new CwdState(dir), {
       settingsEnv: {},
       projectRoot: dir,
+      notebookSession,
     });
     read = tools.find((t) => t.name === "read")!.def as never;
   });
@@ -177,7 +186,8 @@ describe("Read routing (shared factory + real Pi read)", () => {
   const run = (params: unknown, ctx: unknown): Promise<ReadRes> =>
     read.execute("call", params, undefined, undefined, ctx);
 
-  it("renders an .ipynb cell-aware (not raw notebook JSON)", async () => {
+  it("renders an .ipynb cell-aware (not raw notebook JSON) and authorizes its exact snapshot", async () => {
+    const epoch = notebookSession.captureCallEpoch();
     const res = await run({ path: "rich.ipynb" }, NONVISION_CTX);
     const text = joinText(res);
     expect(text).toContain("=== Cell 0 (markdown");
@@ -186,6 +196,9 @@ describe("Read routing (shared factory + real Pi read)", () => {
     // Not the raw JSON.
     expect(text).not.toContain('"nbformat"');
     expect(text).not.toContain('"cell_type"');
+    const target = await resolveNotebookTarget(path.join(dir, "rich.ipynb"));
+    expect(notebookSession.authorize(target, notebookSession.captureCallEpoch())).toBeDefined();
+    expect(notebookSession.authorize(target, epoch)).toBeUndefined();
   });
 
   it("emits a real image block for a notebook image output on a vision model", async () => {
@@ -208,20 +221,77 @@ describe("Read routing (shared factory + real Pi read)", () => {
     expect(joinText(res)).toContain("0 cells");
   });
 
-  it("degrades bad-JSON / missing-cells / missing-file .ipynb to a read-shaped notice, no throw", async () => {
-    for (const p of ["bad.ipynb", "v3.ipynb", "does-not-exist.ipynb"]) {
+  it("degrades bad-JSON / missing-cells / missing-file .ipynb without authorizing failed reads", async () => {
+    for (const p of ["bad.ipynb", "v3.ipynb", "unsupported-encoding.ipynb", "does-not-exist.ipynb"]) {
       const res = await run({ path: p }, NONVISION_CTX);
       const text = joinText(res);
       expect(text).toContain("Could not read notebook");
       expect(text).toContain(p);
     }
+    for (const p of ["bad.ipynb", "v3.ipynb", "unsupported-encoding.ipynb"]) {
+      const target = await resolveNotebookTarget(path.join(dir, p));
+      expect(notebookSession.authorize(target, notebookSession.captureCallEpoch())).toBeUndefined();
+    }
   });
 
-  it("rejects an over-limit .ipynb via the pre-read stat", async () => {
+  it("rejects an over-limit .ipynb without authorizing it", async () => {
     const res = await run({ path: "huge.ipynb" }, NONVISION_CTX);
     const text = joinText(res);
     expect(text).toContain("Could not read notebook");
-    expect(text).toContain("larger than");
+    expect(text).toContain(`${MAX_NOTEBOOK_BYTES}-byte limit`);
+    const target = await resolveNotebookTarget(path.join(dir, "huge.ipynb"));
+    expect(notebookSession.authorize(target, notebookSession.captureCallEpoch())).toBeUndefined();
+  });
+
+  it("returns permissive malformed-cell output with a bounded repair notice and no editor authorization", async () => {
+    const res = await run({ path: "malformed-cell.ipynb" }, NONVISION_CTX);
+    const text = joinText(res);
+    expect(text).toContain("Cell 0");
+    expect(text).toContain("NotebookEdit authorization was withheld because cell structure is malformed or unsupported.");
+    expect(text).toContain("Repair the notebook, then Read it again before editing.");
+    expect(text.length).toBeLessThan(2_000);
+    expect(text).not.toContain(path.resolve(dir));
+    const target = await resolveNotebookTarget(path.join(dir, "malformed-cell.ipynb"));
+    expect(notebookSession.authorize(target, notebookSession.captureCallEpoch())).toBeUndefined();
+  });
+
+  it("preserves valid notebook output when session exhaustion prevents authorization recording", async () => {
+    const exhaustedSession = new NotebookSessionState();
+    exhaustedSession.restore({
+      version: 1,
+      generation: Number.MAX_SAFE_INTEGER - 1_000_000,
+      records: [],
+    });
+    const tools = buildStockBuiltinTools(piSdk as unknown as BuiltinToolSdk, new CwdState(dir), {
+      settingsEnv: {},
+      projectRoot: dir,
+      notebookSession: exhaustedSession,
+    });
+    const exhaustedRead = tools.find((tool) => tool.name === "read")!.def as typeof read;
+
+    const res = await exhaustedRead.execute("call", { path: "rich.ipynb" }, undefined, undefined, NONVISION_CTX);
+    const text = joinText(res);
+    expect(text).toContain("=== Cell 0 (markdown");
+    expect(text).toContain("STREAM_MARKER");
+    expect(res.content.at(-1)?.text).toBe(
+      "NotebookEdit authorization could not be recorded in this session. Start a new session, then Read this notebook again before editing.",
+    );
+    expect(text).not.toContain("malformed");
+    expect(text).not.toContain("Could not read notebook");
+  });
+
+  it("sanitizes failed alias reads to the caller-visible path without canonical disclosure", async () => {
+    const targetDir = path.join(dir, "private-canonical-target");
+    const aliasDir = path.join(dir, "public-alias");
+    fs.mkdirSync(targetDir);
+    fs.writeFileSync(path.join(targetDir, "secret.ipynb"), "not json");
+    fs.symlinkSync(targetDir, aliasDir, process.platform === "win32" ? "junction" : "dir");
+    const res = await run({ path: path.join("public-alias", "secret.ipynb") }, NONVISION_CTX);
+    const text = joinText(res);
+    expect(text).toContain(path.join("public-alias", "secret.ipynb"));
+    expect(text).not.toContain("private-canonical-target");
+    const target = await resolveNotebookTarget(path.join(aliasDir, "secret.ipynb"));
+    expect(notebookSession.authorize(target, notebookSession.captureCallEpoch())).toBeUndefined();
   });
 
   it("returns the Claude-style binary error for a null-byte binary (no mojibake/raw bytes)", async () => {
