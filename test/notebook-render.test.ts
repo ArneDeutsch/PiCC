@@ -274,10 +274,41 @@ describe("renderNotebook — text matrix (non-vision model)", () => {
     expect(cellBlock(out.text, 8)).toContain("import os\nimport sys\nprint(os.getcwd())");
   });
 
-  it("falls back to the 0-based document index for a cell with no id", () => {
+  it("advertises a safe 0-based fallback ID for a cell with no real ID", () => {
     const block = cellBlock(out.text, 9);
-    expect(block).toMatch(/^9 \(code\)/);
+    expect(block).toMatch(/^9 \(code, id=cell-9\)/);
     expect(block).toContain("NOID_CELL_MARKER");
+  });
+
+  it("marks an ID-less fallback unavailable when it collides with any real ID", async () => {
+    const { text } = await render({
+      nbformat: 4,
+      cells: [
+        { cell_type: "code", source: "NO_SAFE_ID" },
+        { cell_type: "markdown", id: "cell-0", source: "REAL_ID" },
+      ],
+    }, TEXT_MODEL);
+    expect(cellBlock(text, 0)).toMatch(/^0 \(code, id unavailable: do not use cell-0; it identifies another cell\)/);
+    expect(cellBlock(text, 0)).not.toContain("id=cell-0");
+    expect(cellBlock(text, 1)).toMatch(/^1 \(markdown, id=cell-0\)/);
+  });
+
+  it("renders only safe identifiers for duplicate real IDs, including a blocked fallback", async () => {
+    const { text } = await render({
+      nbformat: 4,
+      cells: [
+        { cell_type: "code", id: "dup", source: "FIRST" },
+        { cell_type: "markdown", id: "dup", source: "SAFE_FALLBACK" },
+        { cell_type: "code", id: "dup", source: "BLOCKED_FALLBACK" },
+        { cell_type: "markdown", id: "cell-2", source: "FALLBACK_OWNER" },
+      ],
+    }, TEXT_MODEL);
+    expect(cellBlock(text, 0)).toMatch(/^0 \(code, id=dup\)/);
+    expect(cellBlock(text, 1)).toMatch(/^1 \(markdown, id=cell-1\)/);
+    expect(cellBlock(text, 1)).not.toContain("id=dup");
+    expect(cellBlock(text, 2)).toMatch(/^2 \(code, id unavailable: do not use cell-2; it identifies another cell\)/);
+    expect(cellBlock(text, 2)).not.toContain("id=dup");
+    expect(cellBlock(text, 3)).toMatch(/^3 \(markdown, id=cell-2\)/);
   });
 });
 

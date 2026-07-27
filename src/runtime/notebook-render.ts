@@ -10,6 +10,10 @@ import {
   toImageContent,
 } from "./image-ingest.js";
 import { modelSupportsImages } from "../util/model.js";
+import {
+  resolveNotebookCellIdentifiers,
+  type NotebookCellIdentifier,
+} from "./notebook-edit-core.js";
 
 /**
  * Cell-aware Jupyter `.ipynb` renderer. Parses an nbformat v4 notebook and
@@ -36,9 +40,9 @@ export type NotebookBlock = TextContent | ImageContent;
  * Secondary sanity cap on the raw notebook string. This renderer only ever sees
  * an already-read string, so any cap here runs post-slurp and cannot prevent an
  * OOM on the read itself; that is why it is only a cheap backstop. The
- * load-bearing OOM protection must live before the read (a stat-before-read that
- * rejects an over-size file without slurping it). Larger than search-tools' text
- * cap because notebooks legitimately embed images.
+ * load-bearing OOM protection must reject an over-size file before loading its
+ * complete contents. Larger than search-tools' text cap because notebooks
+ * legitimately embed images.
  */
 export const MAX_NOTEBOOK_BYTES = 25 * 1024 * 1024;
 
@@ -273,6 +277,7 @@ async function renderOutput(output: unknown, builder: ContentBuilder, state: Ren
 async function renderCell(
   cell: unknown,
   index: number,
+  identifier: NotebookCellIdentifier,
   builder: ContentBuilder,
   state: RenderState,
 ): Promise<void> {
@@ -283,8 +288,10 @@ async function renderCell(
   }
   const c = cell as Record<string, unknown>;
   const type = typeof c.cell_type === "string" ? c.cell_type : "unknown";
-  const id = typeof c.id === "string" && c.id.length > 0 ? c.id : undefined;
-  builder.text(`=== Cell ${index} (${type}${id !== undefined ? `, id=${id}` : ""}) ===`);
+  const identifierText = identifier.kind === "unavailable-fallback"
+    ? `, id unavailable: do not use ${identifier.fallback}; it identifies another cell`
+    : `, id=${identifier.identifier}`;
+  builder.text(`=== Cell ${index} (${type}${identifierText}) ===`);
 
   const source = joinText(c.source);
   if (source.length > 0) builder.text(source);
@@ -332,9 +339,10 @@ export async function renderNotebook(
     imageBlocks: 0,
   };
   const builder = new ContentBuilder();
+  const identifiers = resolveNotebookCellIdentifiers(cells);
   for (let index = 0; index < cells.length; index++) {
     if (index > 0) builder.text("");
-    await renderCell(cells[index], index, builder, state);
+    await renderCell(cells[index], index, identifiers[index]!, builder, state);
   }
 
   return { content: builder.build(), truncated: state.truncated };
