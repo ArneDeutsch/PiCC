@@ -197,19 +197,29 @@ Then use it like Claude Code:
 
 In the interactive TUI, each main-session tool row has one foreground state marker: `○` running,
 `●` success, `✗` failure, or `■` stopped/aborted. Lifecycle tools show the meaningful underlying
-outcome even when their transport call succeeds. Ordinary settled Read, Write, Edit, MultiEdit, and
-Bash successes use compact detail; the configured `app.tools.expand` action (Ctrl+O by default)
-reveals native detail without changing the marker. Live, exceptional, and unfamiliar rows retain
-native detail inside the same glyph frame, while malformed display data uses a concise warning.
-Binary images remain native. In PiCC compact summaries, paths within the invocation-time workspace
-are relative to it; paths elsewhere in the repository use a visibly marked repository-relative
-form, and external paths remain absolute. Eligible custom PiCC fragments in HTML exports use the
-export context available to them, while Pi owns stock built-in cards and their presentation.
-JSON and RPC have no renderer styling and retain canonical event and tool data. Plain print is
-renderer-free and uses Pi's final-text surface rather than emitting canonical tool records. None of
-these presentations changes model-facing results or execution. Panel rows and terminal semantic
-records omit internal task IDs; active waiting/running `TaskOutput` rows and `TaskStop` rows retain
-their requested targets, while terminal record expansion carries the operational IDs.
+outcome even when their transport call succeeds. An ordinary settled Read appears as
+`● read <path><optional-range>` and Bash as `● bash $ <command><optional-timeout>`, each clamped to
+the terminal width with its result body hidden. Other routine successes retain compact,
+semantically useful detail. The configured `app.tools.expand` action (Ctrl+O by default) reveals
+retained/native detail without changing the marker. It cannot recover bytes Pi or PiCC already
+removed through canonical clipping or truncation.
+
+Pending/streaming work, errors, aborts, clipping or truncation notices, recovery guidance, images,
+MCP tools, search, and subagent/task records keep bounded detail appropriate to their semantics.
+When `app.tools.expand` is unbound, a row whose hidden detail would otherwise be inaccessible fails
+open and shows it. Search and subagent completion rows keep a complete configured-action cue,
+placing it on a separate row when necessary. Search always fails open when its authentic cue cannot
+fit. Subagent completion records do so at usable widths; at an unusably narrow terminal, only their
+marker or identity may fit, and widening restores the detail. In PiCC compact summaries, paths
+within the invocation-time workspace are relative to it; paths elsewhere in the repository use a
+visibly marked repository-relative form, and external paths remain absolute. Eligible custom PiCC
+fragments in HTML exports use the export context
+available to them, while Pi owns stock built-in cards and their presentation. JSON and RPC have no
+renderer styling and retain canonical event and tool data. Plain print is renderer-free and uses
+Pi's final-text surface rather than emitting canonical tool records. None of these presentations
+changes model-facing results or execution. Panel rows and terminal semantic records omit internal
+task IDs; active waiting/running `TaskOutput` rows and `TaskStop` rows retain their requested
+targets, while terminal record expansion carries the operational IDs.
 
 ### Observing subagents
 
@@ -262,8 +272,9 @@ Every subagent is visible, both to you and to the coordinating model:
   its first terminal delivery, whether from `TaskOutput` or next-turn settlement, creates a separate
   semantic record instead of mutating the earlier call. That single bounded line prioritizes the
   outcome, agent identity and textual state, actionable exceptional evidence, and dispatch description, then an
-  expansion cue and duration as space permits. Ctrl+O expands it to the task and agent IDs, available
-  retained output, transcript location, usage, and applicable diagnostics. A terminal `TaskOutput`
+  expansion cue and duration as space permits. The configured `app.tools.expand` action (Ctrl+O by
+  default) reveals the task and agent IDs, available retained output, transcript location, usage,
+  and applicable diagnostics; an unbound action fails open to that detail. A terminal `TaskOutput`
   retrieval after that record was already delivered adds no human row. Background agents still get
   the record if never awaited; an agent that settles while you are away from the prompt gets it when
   the conversation next continues. Nested agents (depth ≥ 2) get no record of their own — they keep

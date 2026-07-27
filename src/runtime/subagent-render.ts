@@ -1186,7 +1186,8 @@ function lifecycleToolRowOutcome(
  *    and its drill-down own live activity.
  *  - FINAL: terminal TaskOutput/settlement rows use the semantic priority
  *    grammar; foreground Agent rows retain their established telemetry grammar.
- *    Ctrl+O exposes the applicable body and operational footer.
+ *    The configured app.tools.expand action exposes the applicable body and
+ *    operational footer.
  */
 export function renderAgentResult(
   result: unknown,
@@ -1312,10 +1313,10 @@ export function renderAgentResult(
       const outcome = typeof details.outcome === "string" ? details.outcome : undefined;
       let failOpenCollapsed = false;
       // Collapsed by default in the interactive transcript: Pi always passes a
-      // BOOLEAN `expanded` (false until the global Ctrl+O toggle), so the
-      // collapse keys on the EXPLICIT false. A structural caller that omits the
-      // option gets the full record — print/RPC never run renderers, so this
-      // only widens compatibility for direct callers.
+      // BOOLEAN `expanded` (false until the configured app.tools.expand action),
+      // so the collapse keys on the EXPLICIT false. A structural caller that
+      // omits the option gets the full record — print/RPC never run renderers,
+      // so this only widens compatibility for direct callers.
       if (outcome && expanded === false && expansionCue) {
         const semanticTerminal = (presentation.surface === "task-output" && firstTerminal) || presentation.surface === "settlement" ||
           (presentation.surface === undefined && details.taskId !== undefined);
@@ -1326,8 +1327,8 @@ export function renderAgentResult(
         if (accessible) return clampLines(accessible, width);
         // The self shell probes one- and two-column inner widths to preserve its
         // exact marker/identity thresholds. No additional detail row can be
-        // framed there without displacing that semantic first row; resizing by
-        // one column restores the ordinary fail-open path.
+        // framed there without displacing that semantic first row; widening
+        // beyond two inner columns restores the ordinary fail-open path.
         if (shellOwnsSymbol && width <= 2) return clampLines(collapsed.lines, width);
         lines.push(...collapsed.lines);
         failOpenCollapsed = true;
