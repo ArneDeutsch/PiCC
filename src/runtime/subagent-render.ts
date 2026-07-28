@@ -17,7 +17,7 @@ import {
 } from "./tool-shell.js";
 import type { Diagnostic } from "../types.js";
 import { normalizeAgentColor, tintAgentColor, type AgentColorName } from "./agent-color.js";
-import { formatToolDisplayName } from "./tool-display.js";
+import { formatToolDisplayName, semanticDisplayRow } from "./tool-display.js";
 import { piToolsExpandKeyText } from "./pi-tui-runtime.js";
 import type { SubagentAdmission } from "./subagent-registry.js";
 
@@ -52,6 +52,11 @@ export interface SubagentLifecycleRenderContext {
 export interface SubagentRenderingOptions {
   surface?: "agent" | "task-output" | "settlement";
   resolveAgentColor?: (agentId: string | undefined, agentName: string | undefined) => unknown;
+}
+
+interface SubagentRenderPresentation extends SubagentRenderingOptions {
+  /** Factory-owned, exact-correlated awaited TaskOutput identity; never serialized into tool data. */
+  awaitedTaskOutputFallback?: Readonly<{ taskId: string; description: string }>;
 }
 
 /** Complete details-only contract consumed by subagent lifecycle renderers. */
@@ -353,6 +358,36 @@ function taskOutputTarget(
 
 function isTaskId(value: unknown): value is string {
   return typeof value === "string" && /^task-[1-9]\d*$/u.test(value);
+}
+
+function correlatedRunningTaskId(
+  rawDetails: unknown,
+  context: SubagentLifecycleRenderContext | undefined,
+): string | undefined {
+  const details = ownDataSnapshot(rawDetails, Object.prototype);
+  const taskId = details ? snapshotField(details, "taskId") : undefined;
+  const allowed = new Set<PropertyKey>([...TASK_OUTPUT_RESULT_KEYS, "subagentProgress", "live"]);
+  const status = details ? snapshotField(details, "status") : undefined;
+  const admission = details ? snapshotField(details, "admission") : undefined;
+  const agent = details ? snapshotField(details, "agent") : undefined;
+  const agentId = details ? snapshotField(details, "agentId") : undefined;
+  const description = details ? snapshotField(details, "description") : undefined;
+  if (!details || [...details.values.keys()].some((key) => !allowed.has(key)) || !isTaskId(taskId) ||
+    status !== "running" || typeof agent !== "string" || sanitizeInline(agent) === "" ||
+    (hasSnapshotField(details, "admission") && admission !== "admitted" && admission !== "waiting") ||
+    (hasSnapshotField(details, "agentId") && agentId !== undefined &&
+      (typeof agentId !== "string" || !isAgentId(agentId))) ||
+    (hasSnapshotField(details, "description") && description !== undefined && typeof description !== "string")) {
+    return undefined;
+  }
+  const renderContext = ownDataSnapshot(context);
+  if (!renderContext || !hasSnapshotField(renderContext, "args")) return undefined;
+  const args = ownDataSnapshot(snapshotField(renderContext, "args"), Object.prototype);
+  if (!args || [...args.values.keys()].some((key) => key !== "task_id" && key !== "wait")) return undefined;
+  const requested = snapshotField(args, "task_id");
+  const wait = snapshotField(args, "wait");
+  return isTaskId(requested) && requested === taskId &&
+    (!hasSnapshotField(args, "wait") || typeof wait === "boolean") ? taskId : undefined;
 }
 
 interface OwnDataSnapshot {
@@ -1084,24 +1119,51 @@ function runningStatusLines(
   details: SubagentRenderDetails,
   width: number,
   color?: AgentColorName,
+  description?: string,
+  semanticTaskId?: string,
 ): string[] {
-  const optional: LifecycleSegment[] = [];
   const duration = durationOf(details);
-  if (duration) optional.push({ separator: " · ", text: duration });
   const usage = formatUsageBrief(details.usage ?? details.subagentProgress?.usage);
-  if (usage) optional.push({ separator: " · ", text: usage });
-  return lifecycleLine(
-    theme,
-    {
-      agent,
-      ...(chip ? { chip } : {}),
-      state: details.admission === "waiting" ? "waiting for capacity" : "running",
+  if (semanticTaskId && chip === semanticTaskId) {
+    const safeAgent = sanitizeInline(agent) || "subagent";
+    const safeDescription = sanitizeInline(description ?? "");
+    const primary = safeDescription || safeAgent || chip;
+    const optional = [
+      ...(safeDescription && safeAgent !== primary ? [safeAgent] : []),
+      ...(chip !== primary ? [chip] : []),
+      ...(duration ? [duration] : []),
+      ...(usage ? [usage] : []),
+    ];
+    const identityTheme = color ? {
+      fg(slot: string, text: string) {
+        if (text === safeAgent) {
+          return tintAgentColor(color, themedBold(theme, text));
+        }
+        return themedFg(theme, slot, text);
+      },
+    } : theme;
+    return semanticDisplayRow({
+      action: formatToolDisplayName("TaskOutput"),
+      primary,
+      required: [{
+        text: details.admission === "waiting" ? "waiting for capacity" : "running",
+        tone: "muted",
+      }],
       optional,
-      tone: "muted",
-      color,
-    },
-    width,
-  );
+    }, identityTheme).render(width);
+  }
+
+  const optional: LifecycleSegment[] = [];
+  if (duration) optional.push({ separator: " · ", text: duration });
+  if (usage) optional.push({ separator: " · ", text: usage });
+  return lifecycleLine(theme, {
+    agent,
+    ...(chip ? { chip } : {}),
+    state: details.admission === "waiting" ? "waiting for capacity" : "running",
+    optional,
+    tone: "muted",
+    color,
+  }, width);
 }
 
 /**
@@ -1197,7 +1259,7 @@ export function renderAgentResult(
   renderOptions: unknown,
   theme: unknown,
   context?: SubagentLifecycleRenderContext,
-  presentation: SubagentRenderingOptions = {},
+  presentation: SubagentRenderPresentation = {},
 ) {
   const state = safeField(context, "state");
   if (isRecord(state)) {
@@ -1281,6 +1343,13 @@ export function renderAgentResult(
   const explicitTask = presentation.surface === "task-output" ||
     (presentation.surface === undefined && details.taskId !== undefined);
   const explicitTarget = explicitTask ? taskOutputTarget(context, details) : undefined;
+  const semanticTaskId = explicitTask ? correlatedRunningTaskId(rawDetails, context) : undefined;
+  const correlatedFallback = presentation.awaitedTaskOutputFallback;
+  const resultDescription = semanticTaskId ? sanitizeInline(details.description ?? "") : "";
+  const runningDescription = resultDescription ||
+    (correlatedFallback && semanticTaskId === correlatedFallback.taskId
+      ? sanitizeInline(correlatedFallback.description)
+      : "");
   return {
     render(width: number): string[] {
       if (rowSuppressed) return [];
@@ -1296,7 +1365,7 @@ export function renderAgentResult(
             width,
           );
         }
-        return runningStatusLines(theme, chip, agent, details, width, color);
+        return runningStatusLines(theme, chip, agent, details, width, color, runningDescription, semanticTaskId);
       }
       // Final result. Valid Agent acceptance disappears only when trusted
       // suppression succeeded above; unbranded/direct callers retain fail-open
@@ -1318,7 +1387,7 @@ export function renderAgentResult(
       if (chip && details.status === "running") {
         const agent =
           sanitizeInline(typeof details.agent === "string" ? details.agent : "") || "subagent";
-        return runningStatusLines(theme, chip, agent, details, width, color);
+        return runningStatusLines(theme, chip, agent, details, width, color, runningDescription, semanticTaskId);
       }
       const outcome = typeof details.outcome === "string" ? details.outcome : undefined;
       const semanticTerminal = (presentation.surface === "task-output" && firstTerminal) || presentation.surface === "settlement" ||
@@ -1510,6 +1579,8 @@ type SendMessageCallSnapshot = Readonly<{ valid: boolean; to?: string }>;
 
 type OrdinarySendMessage = Readonly<{
   to: string;
+  agent: string;
+  agentId: string;
   delivery: "steer" | "resume";
   admission?: SubagentAdmission;
   taskId?: string;
@@ -1662,7 +1733,7 @@ function recognizeOrdinarySendMessage(
 
   if (delivery === "steer") {
     const expected = `Message delivered to running agent ${agentId} ("${agent}") as a mid-task course correction.`;
-    return text === expected ? { to: call.to, delivery } : undefined;
+    return text === expected ? { to: call.to, agent, agentId, delivery } : undefined;
   }
   if (delivery === "resume") {
     const taskId = details.taskId!.value;
@@ -1670,7 +1741,7 @@ function recognizeOrdinarySendMessage(
     if (typeof taskId !== "string" || !/^task-[1-9]\d*$/u.test(taskId) ||
       (admission !== "admitted" && admission !== "waiting") || details.resumed!.value !== true) return undefined;
     const expected = `Task(${taskId}) · Agent(${agent}) · ${agentId} — resume accepted in background with prior context; it will run when configured concurrency capacity is available. Retrieve it with TaskOutput (task_id "${taskId}").`;
-    return text === expected ? { to: call.to, delivery, admission, taskId } : undefined;
+    return text === expected ? { to: call.to, agent, agentId, delivery, admission, taskId } : undefined;
   }
   return undefined;
 }
@@ -1701,54 +1772,25 @@ function recognizeCheckpointRecoverySendMessage(
   return { to: call.to, outcome, recovered, truncated };
 }
 
-function sendMessageSemanticRow(
-  theme: unknown,
-  ordinary: OrdinarySendMessage,
-) {
-  return {
-    render(width: number): string[] {
-      if (!Number.isFinite(width) || width <= 0) return [];
-      const columns = Math.floor(width);
-      const recipient = sanitizeInline(ordinary.to) || "subagent";
-      type Segment = Readonly<{ text: string; slot: "muted" | "warning" }>;
-      const candidates: readonly (readonly Segment[])[] = ordinary.delivery === "steer"
-        ? [
-            [{ text: "delivered", slot: "muted" }],
-            [],
-          ]
-        : ordinary.admission === "waiting"
-          ? [
-              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }, { text: "⚠ waiting", slot: "warning" }],
-              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }, { text: "⚠", slot: "warning" }],
-              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }],
-              [{ text: ordinary.taskId ?? "resume", slot: "muted" }],
-              [{ text: "resume", slot: "muted" }],
-              [],
-            ]
-          : [
-              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }, { text: "admitted", slot: "muted" }],
-              [{ text: "resume", slot: "muted" }, { text: ordinary.taskId ?? "task", slot: "muted" }],
-              [{ text: ordinary.taskId ?? "resume", slot: "muted" }],
-              [{ text: "resume", slot: "muted" }],
-              [],
-            ];
-      const minimumRecipient = columns >= 12 ? 4 : 1;
-      const segments = candidates.find((candidate) =>
-        candidate.reduce((sum, segment) => sum + visibleWidth(` · ${segment.text}`), 0) + minimumRecipient <= columns,
-      ) ?? [];
-      const suffixWidth = segments.reduce((sum, segment) => sum + visibleWidth(` · ${segment.text}`), 0);
-      const recipientRoom = Math.max(1, columns - suffixWidth);
-      const fittedRecipient = visibleWidth(recipient) > recipientRoom
-        ? truncateToWidth(recipient, recipientRoom, "…")
-        : recipient;
-      const title = `${formatToolDisplayName("SendMessage")} `;
-      const includeTitle = visibleWidth(title) + visibleWidth(recipient) + suffixWidth <= columns;
-      let line = includeTitle ? themedFg(theme, "text", title) : "";
-      line += themedFg(theme, "accent", fittedRecipient);
-      for (const segment of segments) line += themedFg(theme, segment.slot, ` · ${segment.text}`);
-      return clampLines([line], columns);
-    },
-  };
+function sendMessageSemanticRow(theme: unknown, ordinary: OrdinarySendMessage) {
+  const agent = sanitizeInline(ordinary.agent) || "subagent";
+  const agentId = sanitizeInline(ordinary.agentId);
+  const requested = sanitizeInline(ordinary.to);
+  const waiting = ordinary.delivery === "resume" && ordinary.admission === "waiting";
+  const required = waiting ? [{ text: "⚠ waiting", tone: "warning" as const }] : [];
+  const optional = [
+    ordinary.delivery === "steer" ? "delivered" : "resume",
+    ...(ordinary.delivery === "resume" && !waiting ? ["admitted"] : []),
+    ...(agentId && agentId !== agent ? [agentId] : []),
+    ...(requested && requested !== agent && requested !== agentId ? [requested] : []),
+    ...(ordinary.taskId ? [ordinary.taskId] : []),
+  ];
+  return semanticDisplayRow({
+    action: formatToolDisplayName("SendMessage"),
+    primary: agent,
+    required,
+    optional,
+  }, theme);
 }
 
 function sendMessageTargetRow(theme: unknown, target: string, width: number): string[] {

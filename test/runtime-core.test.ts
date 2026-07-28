@@ -2637,6 +2637,7 @@ describe("TaskOutput identity render", () => {
       { content: [{ type: "text", text }], details },
       { isPartial },
       theme,
+      typeof details.taskId === "string" ? { args: { task_id: details.taskId }, isError: false } : undefined,
     )
       .render(width)
       .join("\n");
@@ -2715,16 +2716,16 @@ describe("TaskOutput identity render", () => {
 
   it("a live partial with an absent/empty snapshot renders only identity and running state", () => {
     const bare = render(
-      { taskId: "task-8", agent: "coder", agentId: "agent-aabbccddeeff", live: true },
+      { taskId: "task-8", status: "running", agent: "coder", agentId: "agent-aabbccddeeff", live: true },
       "",
       true,
     );
-    expect(bare).toContain("task output task-8");
-    expect(bare).toBe("task output task-8 - coder [running]");
+    expect(bare).toBe("task output coder · running · task-8");
 
     const emptySnap = render(
       {
         taskId: "task-8",
+        status: "running",
         agent: "coder",
         agentId: "agent-aabbccddeeff",
         subagentProgress: { tail: [], activity: "" },
@@ -2733,7 +2734,7 @@ describe("TaskOutput identity render", () => {
       "",
       true,
     );
-    expect(emptySnap).toBe("task output task-8 - coder [running]");
+    expect(emptySnap).toBe("task output coder · running · task-8");
   });
 
   it("a live partial collapses to one identity/state line without activity; detail owns the tail", () => {
@@ -2742,6 +2743,7 @@ describe("TaskOutput identity render", () => {
         content: [{ type: "text", text: "> Grep (x)\n… running Grep…" }],
         details: {
           taskId: "task-1",
+          status: "running",
           agent: "coder",
           agentId: "agent-aabbccddeeff",
           subagentProgress: { tail: ["> Grep (x)"], activity: "running Grep…" },
@@ -2753,9 +2755,7 @@ describe("TaskOutput identity render", () => {
     ).render(120);
     expect(lines).toHaveLength(1); // single status line — no rolling tail in chat
     const out = lines.join("\n");
-    expect(out).toContain("task output task-1");
-    expect(out).toContain("coder");
-    expect(out).toContain("running");
+    expect(out).toContain("task output task-1 - coder [running]");
     expect(out).not.toContain("Grep");
     expect(out).not.toContain("> Grep (x)"); // the tail lives in the panel/drill-down
   });
@@ -2768,9 +2768,7 @@ describe("TaskOutput identity render", () => {
       agentId: "agent-aabbccddeeff",
       lastActivity: "running Grep…",
     }, "Background task task-6 (coder) is still running — running Grep…");
-    expect(active).toContain("task output task-6");
-    expect(active).toContain("coder");
-    expect(active).toContain("running");
+    expect(active).toContain("task output coder · running · task-6");
     expect(active).not.toContain("Grep");
 
     const idle = render({
@@ -2779,8 +2777,57 @@ describe("TaskOutput identity render", () => {
       agent: "coder",
       agentId: "agent-aabbccddeeff",
     });
-    expect(idle).toContain("task output task-6");
-    expect(idle).toContain("running");
+    expect(idle).toContain("task output coder · running · task-6");
+  });
+
+  it("prefers exact-correlated running descriptions while preserving muted lifecycle metadata", () => {
+    const ESC = String.fromCharCode(27);
+    const calls: Array<{ slot: string; text: string }> = [];
+    const theme = {
+      fg(slot: string, text: string) { calls.push({ slot, text }); return text; },
+      bold(text: string) { return text; },
+    };
+    const result = {
+      content: [{ type: "text", text: "Waiting for configured concurrency capacity." }],
+      details: {
+        taskId: "task-8",
+        status: "running",
+        admission: "waiting",
+        agent: "coder",
+        agentId: "agent-aabbccddeeff",
+        durationMs: 2_000,
+        usage: { inputTokens: 10, outputTokens: 5 },
+        description: `Review · [failed]${ESC}[31m\nforged state`,
+      },
+    };
+    const canonical = structuredClone(result);
+    const component = renderAgentResult(result, { isPartial: true }, theme, {
+      args: { task_id: "task-8" }, isError: false,
+    }, {
+      surface: "task-output",
+      resolveAgentColor: () => "blue",
+    });
+    const wide = component.render(160).join("\n");
+    const plainWide = wide.replace(/\u001b\[[0-9;]*m/gu, "");
+    expect(plainWide).toContain("task output Review · [failed] forged state");
+    expect(plainWide).toContain(" · waiting for capacity · coder · task-8 · 2s · in 10 · out 5");
+    expect(wide).toContain(ESC); // configured agent identity tint survives as secondary identity
+    expect(wide).not.toContain(`${ESC}[31m`); // hostile source styling does not survive
+    expect(calls.some(({ slot, text }) => slot === "muted" && text === "task-8")).toBe(true);
+    for (const width of [1, 8, 18, 40]) {
+      const lines = component.render(width);
+      expect(lines).toHaveLength(1);
+      for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
+    }
+    expect(result).toEqual(canonical);
+
+    const foreign = structuredClone(result);
+    foreign.details.taskId = "task-9";
+    const foreignRow = renderAgentResult(foreign, { isPartial: true }, undefined, {
+      args: { task_id: "task-8" }, isError: false,
+    }, { surface: "task-output" }).render(120).join("\n");
+    expect(foreignRow).toContain("task output task-8");
+    expect(foreignRow).not.toMatch(/task-9|Review/u);
   });
 
   it("two same-type concurrent tasks render DISTINCT Task(task-N) status lines", () => {
@@ -2798,11 +2845,9 @@ describe("TaskOutput identity render", () => {
       agentId: "agent-cccc2222dddd",
       lastActivity: "running Read…",
     });
-    expect(a).toContain("task output task-1");
-    expect(a).toContain("running");
+    expect(a).toContain("task output coder · running · task-1");
     expect(a).not.toContain("Grep");
-    expect(b).toContain("task output task-2");
-    expect(b).toContain("running");
+    expect(b).toContain("task output coder · running · task-2");
     expect(b).not.toContain("Read");
     expect(a).not.toContain("task-2");
     expect(b).not.toContain("task-1");
@@ -3515,7 +3560,7 @@ describe("condensed completion records", () => {
 
   it("keeps the requested TaskOutput target across foreign, malformed, and future result shapes", () => {
     const tool = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
-    const requested = "task-requested-target-123456789";
+    const requested = "task-123456789";
     const results = [
       { content: [{ type: "text", text: "unknown task" }] },
       { content: [{ type: "text", text: "foreign task" }], details: { taskId: "task-foreign", status: "running", agent: "worker" } },
@@ -3529,7 +3574,9 @@ describe("condensed completion records", () => {
         const rendered = tool.renderResult(result, { expanded: false, isPartial: false }, undefined, context);
         expect(call.render(width)).toEqual([]);
         const lines = rendered.render(width) as string[];
-        expect(lines.join("").replace(/\s/gu, "")).toContain(requested);
+        const compact = lines.join("").replace(/\s/gu, "");
+        expect(compact).toContain(requested);
+        expect(compact).not.toContain("task-foreign");
         expect(lines.join("\n").match(/task output/gu)).toHaveLength(1);
         expect(lines.join("\n").match(/[○●✗■]/gu)).toHaveLength(1);
         for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
@@ -3539,7 +3586,7 @@ describe("condensed completion records", () => {
 
   it("keeps one complete requested TaskOutput target when foreign details are background-shaped", () => {
     const tool = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
-    const requested = "task-requested-target-123456789";
+    const requested = "task-123456789";
     const result = {
       content: [{ type: "text", text: "foreign background-shaped result" }],
       details: { background: true, taskId: "task-foreign", agent: "worker", future: "field" },

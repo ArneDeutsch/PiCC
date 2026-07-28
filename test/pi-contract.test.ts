@@ -1852,12 +1852,23 @@ describe("real Pi lifecycle row ownership", () => {
     // Use the production factories, not renderer-shaped test doubles: this
     // proves each definition forwards Pi's per-call context into the shared
     // lifecycle renderers before the real self-shell composes the component.
+    const taskRegistry = new BackgroundTaskRegistry();
+    const registeredTaskId = taskRegistry.start(
+      "agent:coder",
+      new Promise(() => {}),
+      undefined,
+      "agent-aabbccddeeff",
+      "coder",
+      undefined,
+      "Review authentication",
+    );
+    expect(registeredTaskId).toBe("task-1");
     const definitions = {
       Agent: wrapForSelfShell(
         createAgentToolDefinition({} as SubagentRuntime, { depth: 0 }),
       ),
       TaskOutput: wrapForSelfShell(
-        createTaskOutputTool(new BackgroundTaskRegistry()),
+        createTaskOutputTool(taskRegistry),
       ),
     };
     const definition = (name: "Agent" | "TaskOutput") => definitions[name];
@@ -1950,19 +1961,31 @@ describe("real Pi lifecycle row ownership", () => {
     expect(text(polling)).toContain("task output task-2 [polling]");
     expect(semanticLines(text(awaiting))).toHaveLength(1);
     expect(semanticLines(text(polling))).toHaveLength(1);
-    awaiting.updateResult(
-      {
-        content: [{ type: "text", text: "running Grep" }],
-        details: { taskId: "task-1", status: "running", agent: "coder", lastActivity: "running Grep" },
-        isError: false,
+    expect(text(awaiting).match(/[○●✗■]/gu)).toHaveLength(1);
+    expect(text(polling).match(/[○●✗■]/gu)).toHaveLength(1);
+    const runningResult = {
+      content: [{ type: "text", text: "running Grep" }],
+      details: {
+        subagentProgress: undefined,
+        admission: "admitted",
+        status: "running",
+        agent: "coder",
+        taskId: "task-1",
+        agentId: "agent-aabbccddeeff",
+        live: true,
       },
-      true,
-    );
+      isError: false,
+    };
+    const runningCanonical = structuredClone(runningResult);
+    awaiting.updateResult(runningResult, true);
     const taskRunning = text(awaiting);
-    expect(taskRunning).toContain("task output task-1 - coder [running]");
+    expect(taskRunning).toContain("task output Review authentication · running · coder · task-1");
+    expect(runningResult).toEqual(runningCanonical);
+    expect(JSON.stringify(runningResult)).not.toContain("Review authentication");
     expect(taskRunning).not.toContain("awaiting");
     expect(taskRunning).not.toContain("Grep");
     expect(semanticLines(taskRunning)).toHaveLength(1);
+    expect(taskRunning.match(/[○●✗■]/gu)).toHaveLength(1);
     const terminalResult = {
       content: [{ type: "text", text: "task answer" }],
       details: {
@@ -1976,16 +1999,28 @@ describe("real Pi lifecycle row ownership", () => {
       },
       isError: false,
     };
-    awaiting.updateResult(structuredClone(terminalResult), false);
+    const terminalCanonical = structuredClone(terminalResult);
+    awaiting.updateResult(terminalResult, false);
     const firstTerminal = text(awaiting);
     expect(firstTerminal).toContain("coder [completed] - Review authentication");
     expect(firstTerminal).not.toContain("task output");
     expect(firstTerminal).not.toContain("task-1");
+    expect(firstTerminal).not.toContain("task answer");
+    expect(firstTerminal).not.toContain("agent-aabbccddeeff");
     expect(firstTerminal).not.toContain("awaiting");
     expect(semanticLines(firstTerminal)).toHaveLength(1);
+    expect(firstTerminal.match(/[○●✗■]/gu)).toHaveLength(1);
     const firstExpanded = text(awaiting, true);
+    expect(firstExpanded).toContain("task answer");
     expect(firstExpanded).toContain("task: task-1");
     expect(firstExpanded).toContain("agent: agent-aabbccddeeff");
+    expect(firstExpanded.match(/[○●✗■]/gu)).toHaveLength(1);
+    const firstRecollapsed = text(awaiting, false);
+    expect(firstRecollapsed).not.toContain("task answer");
+    expect(firstRecollapsed).not.toContain("task: task-1");
+    expect(firstRecollapsed).not.toContain("agent: agent-aabbccddeeff");
+    expect(firstRecollapsed.match(/[○●✗■]/gu)).toHaveLength(1);
+    expect(terminalResult).toEqual(terminalCanonical);
     const firstReconstructed = build("TaskOutput", "task-first-reconstructed", { task_id: "task-1" });
     firstReconstructed.updateResult(structuredClone(terminalResult), false);
     expect(text(firstReconstructed)).toContain("coder [completed] - Review authentication");

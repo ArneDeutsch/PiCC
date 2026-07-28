@@ -1009,6 +1009,74 @@ type ToolUpdate = {
   details?: SubagentRenderDetails;
 };
 
+function exactAwaitedTaskOutputPartialId(
+  result: unknown,
+  options: unknown,
+  context: SubagentLifecycleRenderContext,
+): string | undefined {
+  const dataSnapshot = (value: unknown, prototype: object): Record<PropertyKey, PropertyDescriptor> | undefined => {
+    if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
+    try {
+      if (Reflect.getPrototypeOf(value) !== prototype) return undefined;
+      const descriptors = Object.getOwnPropertyDescriptors(value);
+      return Reflect.ownKeys(descriptors).every((key) => {
+        const descriptor = descriptors[key as keyof typeof descriptors];
+        return descriptor !== undefined && "value" in descriptor;
+      }) ? descriptors : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const exactKeys = (snapshot: Record<PropertyKey, PropertyDescriptor>, allowed: readonly string[], required: readonly string[]) => {
+    const keys = Reflect.ownKeys(snapshot);
+    return keys.every((key) => typeof key === "string" && allowed.includes(key)) &&
+      required.every((key) => keys.includes(key));
+  };
+  const renderOptions = dataSnapshot(options, Object.prototype);
+  if (!renderOptions || !exactKeys(renderOptions, ["expanded", "isPartial"], ["isPartial"]) ||
+    renderOptions.isPartial!.value !== true ||
+    (renderOptions.expanded !== undefined && typeof renderOptions.expanded.value !== "boolean")) return undefined;
+
+  const renderContext = dataSnapshot(context, Object.prototype);
+  const args = renderContext?.args && "value" in renderContext.args
+    ? dataSnapshot(renderContext.args.value, Object.prototype)
+    : undefined;
+  if (!renderContext || renderContext.isError?.value !== false || !args ||
+    !exactKeys(args, ["task_id", "wait"], ["task_id"])) return undefined;
+  const requested = args.task_id!.value;
+  const wait = args.wait?.value;
+  if (typeof requested !== "string" || !/^task-[1-9]\d*$/u.test(requested) ||
+    (wait !== undefined && wait !== true)) return undefined;
+
+  const envelope = dataSnapshot(result, Object.prototype);
+  if (!envelope || !exactKeys(envelope, ["content", "details", "isError"], ["content", "details"]) ||
+    (envelope.isError !== undefined && envelope.isError.value !== false)) return undefined;
+  const content = envelope.content && "value" in envelope.content ? envelope.content.value : undefined;
+  let block: Record<PropertyKey, PropertyDescriptor> | undefined;
+  try {
+    if (!Array.isArray(content) || content.length !== 1) return undefined;
+    block = dataSnapshot(content[0], Object.prototype);
+  } catch {
+    return undefined;
+  }
+  if (!block || !exactKeys(block, ["type", "text"], ["type", "text"]) ||
+    block.type!.value !== "text" || typeof block.text!.value !== "string") return undefined;
+
+  const details = envelope.details && "value" in envelope.details
+    ? dataSnapshot(envelope.details.value, Object.prototype)
+    : undefined;
+  const detailKeys = ["subagentProgress", "admission", "status", "agent", "taskId", "agentId", "live"];
+  if (!details || !exactKeys(details, detailKeys, detailKeys) || details.status!.value !== "running" ||
+    (details.admission!.value !== "admitted" && details.admission!.value !== "waiting") ||
+    typeof details.agent!.value !== "string" || !details.agent!.value.trim() ||
+    details.taskId!.value !== requested || details.live!.value !== true ||
+    (details.agentId!.value !== undefined &&
+      (typeof details.agentId!.value !== "string" || !isAgentId(details.agentId!.value)))) {
+    return undefined;
+  }
+  return requested;
+}
+
 /** The `TaskOutput` tool: retrieve a background task's result (waits by default). */
 export function createTaskOutputTool(
   registry: BackgroundTaskView,
@@ -1042,7 +1110,17 @@ export function createTaskOutputTool(
       theme: unknown,
       context: SubagentLifecycleRenderContext,
     ) {
-      return renderAgentResult(result, options, theme, context, { ...presentation, surface: "task-output" });
+      const correlatedId = exactAwaitedTaskOutputPartialId(result, options, context);
+      const description = correlatedId ? registry.get(correlatedId)?.description : undefined;
+      const awaitedTaskOutputFallback = correlatedId && typeof description === "string" && description.trim()
+        ? Object.freeze({ taskId: correlatedId, description })
+        : undefined;
+      const resolveAgentColor = presentation.resolveAgentColor;
+      return renderAgentResult(result, options, theme, context, {
+        surface: "task-output",
+        ...(resolveAgentColor ? { resolveAgentColor } : {}),
+        ...(awaitedTaskOutputFallback ? { awaitedTaskOutputFallback } : {}),
+      });
     },
     async execute(
       _toolCallId: string,
