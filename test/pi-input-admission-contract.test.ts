@@ -202,6 +202,9 @@ describe("installed Pi AgentSession input admission", () => {
         for (const name of CORE) {
           expect(firstProvider.registered, `${mode} registered routed ${name} before first provider call`).toContain(name);
         }
+        expect(firstProvider.registered, `${mode} registered NotebookEdit synchronously`).toContain("NotebookEdit");
+        expect(firstProvider.advertised, `${mode} advertised NotebookEdit on the first provider call`).toContain("NotebookEdit");
+        expect(firstProvider.advertised, `${mode} advertised routed Read on the first provider call`).toContain("read");
         expect(providerText({ messages: installed.session.messages })).toContain("Deploy the release target");
 
         await submit(installed, mode, "second successful ordinary input");

@@ -21,6 +21,7 @@ import {
 import {
   generateBranchSummary,
   generateSummary,
+  SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { fakePi } from "./helpers/fake-pi.js";
@@ -732,8 +733,9 @@ describe("pi 0.82.0 API contract", () => {
   it("exposes the session factories and AgentSession methods PiCC uses", async () => {
     const sdk: any = await import("@earendil-works/pi-coding-agent");
     for (const [owner, methods] of [
-      [sdk.SessionManager, ["inMemory", "create", "open"]],
+      [sdk.SessionManager, ["inMemory", "create", "open", "forkFrom"]],
       [sdk.SettingsManager, ["inMemory"]],
+      [sdk.SessionManager?.prototype, ["getSessionFile", "getBranch", "appendCustomEntry"]],
       // AgentSession methods live on the prototype; constructing a real session
       // needs a model/provider and belongs to the real-stack lane, not this smoke pin.
       [sdk.AgentSession?.prototype, [
@@ -741,6 +743,31 @@ describe("pi 0.82.0 API contract", () => {
       ]],
     ] as const) {
       for (const method of methods) expect(typeof owner?.[method], method).toBe("function");
+    }
+  });
+
+  it("SessionManager.forkFrom copies custom entries from the source transcript", () => {
+    const dir = mkdtempSync(join(tmpdir(), "picc-session-fork-contract-"));
+    try {
+      const source = SessionManager.create(dir, dir, { id: "source-custom" });
+      source.appendMessage({ role: "user", content: "fork contract" } as never);
+      source.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "ready" }],
+        stopReason: "stop",
+      } as never);
+      source.appendCustomEntry("picc-contract-custom", { marker: "copied" });
+      const sourcePath = source.getSessionFile();
+      expect(sourcePath).toBeTruthy();
+
+      const fork = SessionManager.forkFrom(sourcePath!, dir, dir, { id: "fork-custom" });
+      expect(fork.getBranch()).toContainEqual(expect.objectContaining({
+        type: "custom",
+        customType: "picc-contract-custom",
+        data: { marker: "copied" },
+      }));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

@@ -186,6 +186,26 @@ describe("Read routing (shared factory + real Pi read)", () => {
   const run = (params: unknown, ctx: unknown): Promise<ReadRes> =>
     read.execute("call", params, undefined, undefined, ctx);
 
+  it("captures the notebook-session resolver exactly once at Read execution start", async () => {
+    let resolutions = 0;
+    const captured = new NotebookSessionState();
+    const tools = buildStockBuiltinTools(piSdk as unknown as BuiltinToolSdk, new CwdState(dir), {
+      settingsEnv: {},
+      projectRoot: dir,
+      notebookSession: () => {
+        resolutions++;
+        return captured;
+      },
+    });
+    const resolvedRead = tools.find((tool) => tool.name === "read")!.def as typeof read;
+
+    await resolvedRead.execute("id", { path: "rich.ipynb" }, undefined, undefined, NONVISION_CTX);
+
+    expect(resolutions).toBe(1);
+    const target = await resolveNotebookTarget(path.join(dir, "rich.ipynb"));
+    expect(captured.authorize(target, captured.captureCallEpoch())).toBeDefined();
+  });
+
   it("renders an .ipynb cell-aware (not raw notebook JSON) and authorizes its exact snapshot", async () => {
     const epoch = notebookSession.captureCallEpoch();
     const res = await run({ path: "rich.ipynb" }, NONVISION_CTX);

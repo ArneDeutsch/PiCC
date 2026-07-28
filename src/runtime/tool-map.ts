@@ -1,4 +1,5 @@
 import type { ToolCallDescriptor } from "../types.js";
+import { normalizeNotebookPath } from "./notebook-session.js";
 
 /**
  * Claude ⇄ Pi tool-name mapping.
@@ -86,8 +87,20 @@ export function applyUpdatedInput(
 }
 
 /** File path touched by a tool call (for nested CLAUDE.md / path-scoped rule injection). */
-export function touchedFilePath(piToolName: string, input: Record<string, unknown>): string | undefined {
+export function touchedFilePath(
+  piToolName: string,
+  input: Record<string, unknown>,
+  cwd: string,
+): string | undefined {
   const tool = toClaudeToolName(piToolName);
+  if (tool === "NotebookEdit") {
+    if (typeof input.notebook_path !== "string") return undefined;
+    try {
+      return normalizeNotebookPath(input.notebook_path, cwd);
+    } catch {
+      return undefined;
+    }
+  }
   if (["Read", "Write", "Edit", "MultiEdit"].includes(tool)) {
     const p = input.file_path ?? input.path;
     return typeof p === "string" ? p : undefined;

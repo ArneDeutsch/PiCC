@@ -17,15 +17,16 @@ import {
 } from "../notebook-edit-core.js";
 import { MAX_NOTEBOOK_BYTES } from "../notebook-render.js";
 import {
-  NotebookSessionState,
   NotebookSizeLimitError,
   canonicalNotebookPath,
   identifyNotebookHandle,
   inspectNotebookHandle,
   normalizeNotebookPath,
   openNotebookFile,
+  resolveNotebookSession,
   type NotebookAuthorizationToken,
   type NotebookFileHandle,
+  type NotebookSessionSource,
   type NotebookTargetIdentity,
 } from "../notebook-session.js";
 
@@ -373,7 +374,7 @@ function mutate(
 
 export function createNotebookEditTool(
   getCwd: () => string,
-  notebookSession: NotebookSessionState,
+  notebookSession: NotebookSessionSource,
   options: NotebookEditToolOptions = {},
 ): ToolDefinition {
   const fileOps: NotebookEditFileOps = { ...DEFAULT_FILE_OPS, ...options.fileOps };
@@ -393,7 +394,8 @@ export function createNotebookEditTool(
       ])),
     }, { additionalProperties: false }),
     async execute(_toolCallId, params, signal) {
-      const callEpoch = notebookSession.captureCallEpoch();
+      const callSession = resolveNotebookSession(notebookSession);
+      const callEpoch = callSession.captureCallEpoch();
       const projected = projectInput(params, getCwd);
       let token: NotebookAuthorizationToken | undefined;
       let currentAuthorization: NotebookAuthorizationToken | undefined;
@@ -416,7 +418,7 @@ export function createNotebookEditTool(
           if (error instanceof NotebookFailure || error instanceof NotebookSizeLimitError) throw error;
           throw new NotebookFailure("unread", "the notebook is missing, unreadable, or not a regular file. Read it successfully before editing.");
         }
-        token = notebookSession.authorize(initialTarget, callEpoch);
+        token = callSession.authorize(initialTarget, callEpoch);
         currentAuthorization = token;
         if (token === undefined) {
           throw new NotebookFailure("unread", "this notebook has not been successfully Read in the current session, or that Read is stale. Read it again before editing.");
@@ -436,7 +438,7 @@ export function createNotebookEditTool(
                 handle, request.notebook_path, canonical, MAX_NOTEBOOK_BYTES, () => checkAbort(signal),
               );
               checkAbort(signal);
-              if (!notebookSession.validate(token!, loaded.target, loaded.bytes)) {
+              if (!callSession.validate(token!, loaded.target, loaded.bytes)) {
                 throw new NotebookFailure("stale", "the notebook changed after the authorizing Read. Read it again before retrying.", true);
               }
               return loaded;
@@ -484,8 +486,8 @@ export function createNotebookEditTool(
                   );
                   checkAbort(signal);
                   if (currentCanonical !== canonical || current.target.fingerprint !== comparedTarget.fingerprint
-                    || !notebookSession.validate(token!, comparedTarget, compared.bytes)
-                    || !notebookSession.validate(token!, current.target, current.bytes)) {
+                    || !callSession.validate(token!, comparedTarget, compared.bytes)
+                    || !callSession.validate(token!, current.target, current.bytes)) {
                     throw new NotebookFailure("stale", "the notebook changed while the edit was being prepared. Read it again before retrying.", true);
                   }
                 });
@@ -502,7 +504,7 @@ export function createNotebookEditTool(
               await fileOps.commit(finalHandle, updatedBytes);
               // Once commit settles, a newly observed abort is late and must not turn a completed write into failure.
               await options.afterCommit?.("before-refresh");
-              currentAuthorization = notebookSession.refreshAfterEdit(
+              currentAuthorization = callSession.refreshAfterEdit(
                 token!, comparedTarget, updatedBytes, facts.mode !== "replace",
               );
               await options.afterCommit?.("before-result");
@@ -528,7 +530,7 @@ export function createNotebookEditTool(
           || (error instanceof NotebookFailure && error.invalidates)
           || error instanceof NotebookSizeLimitError;
         if (invalidates && currentAuthorization !== undefined) {
-          notebookSession.invalidateIfCurrent(currentAuthorization);
+          callSession.invalidateIfCurrent(currentAuthorization);
         }
         return errorResult(projected, errorMessage(error, writingStarted));
       }

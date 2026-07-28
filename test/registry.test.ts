@@ -490,15 +490,15 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expectDisclosure(contract);
   });
 
-  // NotebookEdit was reconciled alongside the retirement: its note directs raw
-  // .ipynb editing via Edit and viewing raw JSON via Bash (Read now renders
-  // notebooks cell-aware). This verifies that reconciled note still reads truthfully.
-  it("keeps the NotebookEdit note truthful about editing raw JSON via Edit and viewing via Bash", () => {
+  it("discloses NotebookEdit authorization isolation, revalidation, and persistence limits", () => {
     const ne = lookupCapability("tool.NotebookEdit");
-    expect(ne?.tier).toBe("degraded-noop");
-    expect(ne?.note).toContain("Edit");
-    expect(ne?.note).toContain("Bash");
-    expect(ne?.note).toContain("Read now renders notebooks cell-aware");
+    expect(ne?.tier).toBe("full");
+    expect(ne?.note).toContain("successful notebook Read in the active conversation");
+    expect(ne?.note).toContain("ordinary child conversations keep independent authorization state");
+    expect(ne?.note).toContain("genuine inheriting main-session fork copies");
+    expect(ne?.note).toContain("canonical file identity and exact bytes");
+    expect(ne?.note).toContain("newest successfully persisted snapshot");
+    expect(ne?.note).toContain("unpersisted revocation or positional-fallback-stale transition");
   });
 
   it("stays in sync with the shipped degrade-stub list, in both directions", () => {
@@ -806,7 +806,7 @@ describe("buildCompatReport", () => {
       ],
     });
     const report = buildCompatReport(project);
-    expect(report.findings.some((f) => f.capability.id === "tool.NotebookEdit")).toBe(true);
+    expect(report.findings.some((f) => f.capability.id === "tool.NotebookEdit")).toBe(false);
     // DELIBERATE TRANSITION: an mcp__* grant stopped being a finding when
     // tool.mcp__* re-tiered to a live partial surface — a supported tool in
     // tools: is as finding-free as Read.
@@ -910,9 +910,7 @@ describe("buildCompatReport", () => {
     });
     const report = buildCompatReport(project);
     const notebook = report.findings.find((f) => f.capability.id === "tool.NotebookEdit");
-    expect(notebook).toBeDefined();
-    expect(notebook?.evidence).toContain('skill "gated-skill"');
-    expect(notebook?.evidence).toContain("allowed-tools:");
+    expect(notebook).toBeUndefined();
     // DELIBERATE TRANSITION: mcp__* in allowed-tools: is no longer a finding —
     // the wildcard re-tiered to a live partial surface with the stdio slice.
     expect(report.findings.some((f) => f.capability.id === "tool.mcp__*")).toBe(false);

@@ -6,6 +6,7 @@ import {
   NotebookSessionState,
   identifyNotebookHandle,
   inspectNotebookHandle,
+  newestNotebookSessionSnapshot,
   normalizeNotebookPathForPlatform,
   readNotebookBytesBounded,
   resolveNotebookTarget,
@@ -66,6 +67,32 @@ function stringDetails(result: TestToolResult): Record<string, unknown> {
 }
 
 describe("NotebookEdit authorization and mutation", () => {
+  it("captures a session resolver once before path work and keeps that state for the whole call", async () => {
+    const { dir, file } = fixture();
+    const authorized = new NotebookSessionState();
+    await authorize(authorized, file);
+    let active = authorized;
+    let resolutions = 0;
+    const tool = createNotebookEditTool(
+      () => dir,
+      () => {
+        resolutions++;
+        return active;
+      },
+      { afterTokenCapture: () => { active = new NotebookSessionState(); } },
+    );
+
+    const result = await tool.execute("call", {
+      notebook_path: "book.ipynb",
+      new_source: "captured state",
+      cell_id: "real-code",
+    } as never, undefined, undefined, {} as never) as unknown as TestToolResult;
+
+    expect(result.isError).not.toBe(true);
+    expect(resolutions).toBe(1);
+    expect(JSON.parse(fs.readFileSync(file, "utf8")).cells[0].source).toBe("captured state");
+  });
+
   it("rejects edit-before-read without touching the file", async () => {
     const { dir, file } = fixture();
     const before = fs.readFileSync(file);
@@ -922,6 +949,31 @@ describe("NotebookEdit compatibility, failure, and filesystem matrix", () => {
 });
 
 describe("NotebookSessionState", () => {
+  it("projects only the newest matching custom entry without invoking unsafe accessors or falling back", () => {
+    const older = { version: 1, generation: 0, records: [] };
+    let getterCalls = 0;
+    const newest = Object.defineProperty({
+      type: "custom",
+      customType: "picc-notebook-session",
+    }, "data", { get() { getterCalls++; return older; } });
+    const branch = [
+      { type: "custom", customType: "picc-notebook-session", data: older },
+      { type: "message", customType: "picc-notebook-session", data: "ignored" },
+      newest,
+    ];
+
+    expect(newestNotebookSessionSnapshot(branch)).toBeUndefined();
+    expect(getterCalls).toBe(0);
+
+    const revoked = Proxy.revocable([], {});
+    revoked.revoke();
+    expect(() => newestNotebookSessionSnapshot(revoked.proxy)).not.toThrow();
+    expect(newestNotebookSessionSnapshot(revoked.proxy)).toBeUndefined();
+    const oversized: unknown[] = [];
+    oversized.length = 1_000_001;
+    expect(newestNotebookSessionSnapshot(oversized)).toBeUndefined();
+  });
+
   it("keeps alias snapshots field-private, restores unchanged identity, rejects changed identity, and clones independently", async () => {
     const { dir, file } = fixture();
     const aliasDir = path.join(dir, "snapshot-alias");

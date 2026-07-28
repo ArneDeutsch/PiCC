@@ -5,6 +5,7 @@ import path from "node:path";
 export const MAX_NOTEBOOK_SESSION_RECORDS = 64;
 const MAX_SERIALIZED_NOTEBOOK_PATH_CHARS = 32_768;
 const MAX_RESTORED_GENERATION = Number.MAX_SAFE_INTEGER - 1_000_000;
+const MAX_NOTEBOOK_SESSION_BRANCH_ENTRIES = 1_000_000;
 const READ_CHUNK_BYTES = 64 * 1024;
 
 export interface NotebookTargetIdentity {
@@ -31,6 +32,35 @@ export interface NotebookAuthorizationToken extends NotebookReadSnapshot {}
 
 export interface NotebookSessionOptions {
   onChange?: (snapshot: SerializedNotebookSession) => void;
+}
+
+export type NotebookSessionSource = NotebookSessionState | (() => NotebookSessionState);
+
+/** Capture the conversation state once at the synchronous start of a tool call. */
+export function resolveNotebookSession(source: NotebookSessionSource): NotebookSessionState {
+  return typeof source === "function" ? source() : source;
+}
+
+export const NOTEBOOK_SESSION_CUSTOM_TYPE = "picc-notebook-session";
+
+/**
+ * Select only the newest notebook-session custom entry from a branch without
+ * invoking branch- or entry-controlled accessors.
+ */
+export function newestNotebookSessionSnapshot(branch: unknown): unknown {
+  if (safeArrayCheck(branch) !== true) return undefined;
+  const entries = branch as unknown[];
+  const length = dataProperty(entries, "length");
+  if (typeof length !== "number" || !Number.isSafeInteger(length)
+    || length < 0 || length > MAX_NOTEBOOK_SESSION_BRANCH_ENTRIES) return undefined;
+  for (let index = length - 1; index >= 0; index--) {
+    const entry = ownArrayData(entries, index);
+    if (entry === null || typeof entry !== "object" || safeArrayCheck(entry) !== false) continue;
+    if (dataProperty(entry, "type") !== "custom"
+      || dataProperty(entry, "customType") !== NOTEBOOK_SESSION_CUSTOM_TYPE) continue;
+    return dataProperty(entry, "data");
+  }
+  return undefined;
 }
 
 export interface NotebookFileHandle {

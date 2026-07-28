@@ -148,6 +148,10 @@ export interface FakeSdkOptions {
    * fork" degrade path (a `"fork"` dispatch then runs fresh with a notice).
    */
   noForkSessionManager?: boolean;
+  /** Enable deterministic fake persisted create/open managers with custom-entry branches. */
+  fakePersistedSessions?: boolean;
+  /** Throw on this one-based custom-entry append across fake managers. */
+  failCustomAppendAt?: number;
 }
 
 /** The options object the shared factory passes to each `createBashTool`. */
@@ -174,6 +178,8 @@ export interface FakeSdkHandle {
   forkCalls: () => Array<{ sourcePath: string; cwd: string; sessionDir: string; id: string }>;
   /** Options captured from each shared-factory `createBashTool` call (spawnHook + shellPath). */
   builtinBashOptions: () => BuiltinBashOptions[];
+  /** Custom-entry branches keyed by fake transcript path. */
+  sessionBranches: () => Map<string, unknown[]>;
 }
 
 export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
@@ -185,6 +191,26 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
   const promptWaiters = new Set<{ count: number; signal: Deferred<void> }>();
   let replyIndex = 0;
   const forkCalls: Array<{ sourcePath: string; cwd: string; sessionDir: string; id: string }> = [];
+  const sessionBranches = new Map<string, unknown[]>();
+  let customAppendCount = 0;
+  const fakeManager = (transcriptPath: string, seed: readonly unknown[] = []) => {
+    const branch = [...seed];
+    sessionBranches.set(transcriptPath, branch);
+    return {
+      getSessionFile: () => transcriptPath,
+      getBranch: () => branch,
+      appendCustomEntry: (customType: string, data: unknown) => {
+        customAppendCount++;
+        if (customAppendCount === options.failCustomAppendAt) throw new Error("scripted custom-entry failure");
+        branch.push({ type: "custom", customType, data });
+        return `custom-${branch.length}`;
+      },
+      appendMessage: (message: unknown) => {
+        branch.push({ type: "message", message });
+        return `message-${branch.length}`;
+      },
+    };
+  };
 
   // Shared built-in factory (buildStockBuiltinTools) wiring capture: the
   // subagent path now builds its seven built-ins from the factory against these
@@ -370,7 +396,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
       constructor(public options: Record<string, unknown>) {}
       async reload() {}
     },
-    inMemorySessionManager: () => ({}),
+    inMemorySessionManager: () => fakeManager(`/fake-memory/${sessionBranches.size}.jsonl`),
     // The REAL Pi SessionManager: transcript tests exercise the actual
     // create/flush/open surface. Only reached when a dispatch knows the main
     // session file (deps.getMainSessionFile) AND a test injected the real
@@ -379,13 +405,21 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
     persistedSessionManager: realSessionManager
       ? (cwd: string, sessionDir: string, id: string) =>
           realSessionManager!.create(cwd, sessionDir, { id })
-      : undefined,
+      : options.fakePersistedSessions
+        ? (_cwd: string, sessionDir: string, id: string) =>
+            fakeManager(`${sessionDir.replace(/[\\/]$/, "")}/${id}.jsonl`)
+        : undefined,
     // Resume: reopen the SAME transcript with the REAL SessionManager so
     // offline-integration tests exercise Pi's actual open/restore/append surface.
     reopenSessionManager: realSessionManager
       ? (transcriptPath: string, sessionDir: string, cwd: string) =>
           realSessionManager!.open(transcriptPath, sessionDir, cwd)
-      : undefined,
+      : options.fakePersistedSessions
+        ? (transcriptPath: string) => fakeManager(
+            transcriptPath,
+            sessionBranches.get(transcriptPath) ?? [],
+          )
+        : undefined,
     // Fork: seed a NEW subagent transcript from a source session's history.
     // With the real SessionManager injected, exercise the genuine on-disk
     // forkFrom; otherwise return a fake manager carrying a captured `__forkSeed`
@@ -401,13 +435,17 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
         : (sourcePath: string, cwd: string, sessionDir: string, id: string) => {
             forkCalls.push({ sourcePath, cwd, sessionDir, id });
             const messages: PiSessionMessage[] = [...(options.forkSeed ?? [])];
+            const manager = fakeManager(
+              `/fake-fork/${id}.jsonl`,
+              sessionBranches.get(sourcePath) ?? [],
+            );
             return {
+              ...manager,
               __forkSeed: messages,
-              getSessionFile: () => `/fake-fork/${id}.jsonl`,
               buildSessionContext: () => ({ messages }),
               appendMessage: (message: unknown) => {
                 messages.push(message as PiSessionMessage);
-                return "entry";
+                return manager.appendMessage(message);
               },
             } as unknown as PiSessionManagerLike;
           },
@@ -442,6 +480,7 @@ export function fakeSdk(options: FakeSdkOptions = {}): FakeSdkHandle {
     waitForPromptCalls,
     forkCalls: () => forkCalls,
     builtinBashOptions: () => builtinBashOptions,
+    sessionBranches: () => sessionBranches,
   };
 }
 
@@ -498,7 +537,7 @@ export function makeSubagentRuntime(
   const deps: SubagentRuntimeDeps = {
     getAgents: () => agents,
     buildSystemPrompt: (a: ClaudeAgent) => `SYSTEM:${a.name}`,
-    customToolsFor: () => [],
+    customToolsFor: (_agent, _granted, _depth, _owner, _fork, _cwd, _notebook, _activation, _stop) => [],
     allKnownToolNames: () => ["Read", "Write", "Edit", "Bash", "Grep", "Glob"],
     permissionEngine: engine,
     getCwd: () => process.cwd(),

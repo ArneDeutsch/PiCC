@@ -59,12 +59,6 @@ export const DEGRADED_TOOLS: Array<{ name: string; note: string; redirect?: bool
     redirect: true,
   },
   {
-    name: "NotebookEdit",
-    note:
-      "notebook editing is not implemented; edit the raw .ipynb JSON with Edit " +
-      "(view the raw JSON via Bash, e.g. cat, since Read now renders notebooks cell-aware)",
-  },
-  {
     name: "AskUserQuestion",
     note: "interactive question prompts are deliberately not provided; ask the user in plain chat instead",
   },

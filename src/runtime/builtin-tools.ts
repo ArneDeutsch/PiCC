@@ -12,7 +12,11 @@ import { homedir } from "node:os";
 import { isAbsolute, resolve as resolvePath } from "node:path";
 import { sanitizedSubprocessEnv, unicodeSafeSubprocessEnv } from "../util/env.js";
 import type { CwdState } from "./cwd-state.js";
-import type { NotebookSessionState } from "./notebook-session.js";
+import {
+  resolveNotebookSession,
+  type NotebookSessionSource,
+  type NotebookSessionState,
+} from "./notebook-session.js";
 import { BINARY_READ_ERROR, isBinaryBuffer, sniffImageMime } from "./image-ingest.js";
 // NOTE: `./notebook-render.js` is imported dynamically inside the notebook branch
 // below, NOT at module load. It transitively imports the Pi package root (for
@@ -79,7 +83,7 @@ export interface BuiltinToolDeps {
   /** Pinned Git-Bash path on Windows (from resolveGitBashPath); absent elsewhere. */
   shellPath?: string;
   /** Per-conversation state for sessions that support notebook edit authorization. */
-  notebookSession?: NotebookSessionState;
+  notebookSession?: NotebookSessionSource;
 }
 
 /**
@@ -431,8 +435,11 @@ export function buildStockBuiltinTools(
     // from `factory(cwdRef.get())` per call so the worktree cwd swap is honored.
     const execute =
       name === "read"
-        ? async (id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) =>
-            routeReadExecute(
+        ? async (id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) => {
+            const callSession = deps.notebookSession === undefined
+              ? undefined
+              : resolveNotebookSession(deps.notebookSession);
+            return routeReadExecute(
               () => factory(cwdRef.get()),
               cwdRef.get(),
               id,
@@ -440,8 +447,9 @@ export function buildStockBuiltinTools(
               signal,
               onUpdate,
               ctx,
-              deps.notebookSession,
-            )
+              callSession,
+            );
+          }
         : async (id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) => {
             const live = factory(cwdRef.get());
             return live.execute(id, params, signal, onUpdate, ctx);

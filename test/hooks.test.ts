@@ -13,6 +13,12 @@ import { PermissionEngine } from "../src/engine/permissions.js";
 import type { HookConfig, HookHandler, HookPayload, ToolCallDescriptor } from "../src/types.js";
 import { waitUntil } from "./helpers/async.js";
 import { createHookProcessFixture } from "./helpers/hook-process.js";
+import {
+  NotebookSessionState,
+  normalizeNotebookPath,
+  resolveNotebookTarget,
+} from "../src/runtime/notebook-session.js";
+import { createNotebookEditTool } from "../src/runtime/tools/notebook-edit.js";
 
 // ---------------------------------------------------------------------------
 // Test scaffolding
@@ -1110,6 +1116,109 @@ describe("guard hook payloads", () => {
     })(pi as never);
     return { fired, handlers };
   }
+
+  it("drives canonical NotebookEdit success and failure through the guard lifecycle", async () => {
+    const cwd = makeTempDir();
+    const nested = path.join(cwd, "nested");
+    fs.mkdirSync(nested);
+    const notebook = (source: string) => JSON.stringify({
+      cells: [{ cell_type: "code", id: "cell-a", metadata: {}, source, execution_count: null, outputs: [] }],
+      metadata: {}, nbformat: 4, nbformat_minor: 5,
+    });
+    const callerPath = path.join(cwd, "caller.ipynb");
+    const rewrittenPath = path.join(nested, "book.ipynb");
+    fs.writeFileSync(callerPath, notebook("caller-old"));
+    fs.writeFileSync(rewrittenPath, notebook("target-old"));
+
+    const state = new NotebookSessionState();
+    for (const filePath of [callerPath, rewrittenPath]) {
+      state.recordRead(await resolveNotebookTarget(filePath), fs.readFileSync(filePath));
+    }
+    const tool = createNotebookEditTool(() => cwd, state);
+    const fired: Array<{ event: string; payload: Partial<HookPayload> }> = [];
+    const touched: string[] = [];
+    const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+    let rewrite = "nested/book.ipynb";
+    const pi = {
+      on: (event: string, handler: (event: any, ctx: any) => unknown) => handlers.set(event, handler),
+      sendMessage: () => undefined,
+    };
+    createGuardExtension({
+      engine: new PermissionEngine(
+        { allow: [], deny: [], ask: [], additionalDirectories: [] },
+        { cwd },
+      ),
+      hooks: {
+        async fire(event: string, payload: Partial<HookPayload>) {
+          fired.push({ event, payload });
+          return {
+            block: false,
+            askDowngraded: false,
+            diagnostics: [],
+            ...(event === "PreToolUse" ? { updatedInput: { notebook_path: rewrite } } : {}),
+          };
+        },
+      } as unknown as HookRunner,
+      getCwd: () => cwd,
+      contextForTouchedFile: (filePath) => {
+        touched.push(filePath);
+        return "nested context";
+      },
+    })(pi as never);
+
+    const validInput = { notebook_path: "caller.ipynb", new_source: "target-new", cell_id: "cell-a" };
+    await handlers.get("tool_call")!({ toolName: "NotebookEdit", input: validInput }, {});
+    expect(fired[0]).toMatchObject({
+      event: "PreToolUse",
+      payload: { tool_name: "NotebookEdit", tool_input: { notebook_path: "caller.ipynb" } },
+    });
+    expect(validInput.notebook_path).toBe("nested/book.ipynb");
+    expect(touched).toEqual([normalizeNotebookPath(validInput.notebook_path, cwd)]);
+    const success = await tool.execute("valid", validInput, undefined, undefined, {} as never) as {
+      content: unknown[]; isError?: boolean;
+    };
+    await handlers.get("tool_result")!({
+      toolName: "NotebookEdit", input: validInput, content: success.content, isError: success.isError === true,
+    }, {});
+    expect(JSON.parse(fs.readFileSync(callerPath, "utf8")).cells[0].source).toBe("caller-old");
+    expect(JSON.parse(fs.readFileSync(rewrittenPath, "utf8")).cells[0].source).toBe("target-new");
+    expect(fired.at(-1)).toEqual({
+      event: "PostToolUse",
+      payload: expect.objectContaining({
+        tool_name: "NotebookEdit",
+        tool_input: validInput,
+        tool_response: success.content,
+      }),
+    });
+
+    const invalidRewrites = process.platform === "win32"
+      ? ["/rooted/book.ipynb", "\\\\?\\C:\\device\\book.ipynb", "/foreign/book.ipynb"]
+      : ["C:\\foreign\\book.ipynb", "\\\\?\\C:\\device\\book.ipynb", "\\rooted\\book.ipynb"];
+    for (const [index, invalid] of invalidRewrites.entries()) {
+      rewrite = invalid;
+      const input = { notebook_path: "caller.ipynb", new_source: `invalid-${index}`, cell_id: "cell-a" };
+      const touchedBefore = touched.length;
+      await handlers.get("tool_call")!({ toolName: "NotebookEdit", input }, {});
+      expect(touched).toHaveLength(touchedBefore);
+      const failure = await tool.execute(
+        `invalid-${index}`, input, undefined, undefined, {} as never,
+      ) as { content: unknown[]; isError?: boolean };
+      expect(failure.isError).toBe(true);
+      await handlers.get("tool_result")!({
+        toolName: "NotebookEdit", input, content: failure.content, isError: true,
+      }, {});
+      expect(fired.at(-1)).toEqual({
+        event: "PostToolUseFailure",
+        payload: expect.objectContaining({
+          tool_name: "NotebookEdit",
+          tool_input: input,
+          tool_response: failure.content,
+        }),
+      });
+      expect(JSON.parse(fs.readFileSync(callerPath, "utf8")).cells[0].source).toBe("caller-old");
+      expect(JSON.parse(fs.readFileSync(rewrittenPath, "utf8")).cells[0].source).toBe("target-new");
+    }
+  });
 
   it("passes tool_use_id from the Pi toolCallId on PreToolUse", async () => {
     const { fired, handlers } = makeGuard();
