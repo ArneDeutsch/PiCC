@@ -308,8 +308,19 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
   );
 
   it(
-    "drives the real RPC entry through checkpoint lifecycle and acknowledges only the prompt command",
+    "does not replay a consumed streaming RPC prompt after later proactive compaction",
     async () => {
+      const initialGate = createResponseGate();
+      const sentinelGate = createResponseGate();
+      const consumedSentinel = "RPC_CONSUMED_BEFORE_ARM_T02";
+      const initialPrompt = "run RPC checkpoint replay witness";
+      const userTurn = (text: string) => [{ type: "text", text }];
+      const userTurns = (request: { messages: Array<Record<string, unknown>> }) => request.messages
+        .filter((message) => message.role === "user")
+        .map((message) => message.content);
+      const isSentinelTurn = (content: unknown) => content === consumedSentinel ||
+        (Array.isArray(content) && content.length === 1 &&
+          content[0]?.type === "text" && content[0]?.text === consumedSentinel);
       const live = await startPi({
         contextWindow: CHECKPOINT_CONTEXT_WINDOW,
         piSettings: CHECKPOINT_PI_SETTINGS,
@@ -317,30 +328,66 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           writeCheckpointConfig(fixtureDir);
         },
         script: [
-          { toolCalls: [{ name: "write", args: { path: "rpc-cycle.txt", content: "complete" } }], usage: CHECKPOINT_USAGE },
-          { text: "RPC_SUMMARY_T05" },
-          { text: "RPC_RESUMED_FINAL_T05" },
+          { text: "RPC_INITIAL_BELOW_THRESHOLD_T02", gate: initialGate },
+          {
+            toolCalls: [{ name: "write", args: { path: "rpc-cycle.txt", content: "complete" } }],
+            usage: CHECKPOINT_USAGE,
+            gate: sentinelGate,
+          },
+          { text: "RPC_SUMMARY_T02" },
+          { text: "RPC_RESUMED_FINAL_T02" },
         ],
         prompt: "unused",
         modeArgs: ["--mode", "rpc"],
       });
       try {
-        live.sendInput(JSON.stringify({ id: "rpc-prompt-t05", type: "prompt", message: "run RPC checkpoint" }));
-        const ack = await live.waitForOutput((record) => record.type === "response" && record.id === "rpc-prompt-t05", 30_000);
-        expect(ack).toMatchObject({ command: "prompt", success: true });
-        await live.waitForRequest((request) => request.requestKind === "ordinary", 2, 30_000);
+        live.sendInput(JSON.stringify({ id: "rpc-initial-t02", type: "prompt", message: initialPrompt }));
+        const initialAck = await live.waitForOutput((record) =>
+          record.type === "response" && record.id === "rpc-initial-t02", 30_000);
+        expect(initialAck).toMatchObject({ command: "prompt", success: true });
+        await initialGate.entered;
+
+        live.sendInput(JSON.stringify({
+          id: "rpc-sentinel-t02",
+          type: "prompt",
+          message: consumedSentinel,
+          streamingBehavior: "steer",
+        }));
+        const sentinelAck = await live.waitForOutput((record) =>
+          record.type === "response" && record.id === "rpc-sentinel-t02", 30_000);
+        expect(sentinelAck).toMatchObject({ command: "prompt", success: true });
+        initialGate.release();
+
+        const sentinelRequest = await sentinelGate.entered;
+        expect(live.requests.map((request) => request.requestKind)).toEqual(["ordinary", "ordinary"]);
+        expect(userTurns(live.requests[0]!)).toEqual([userTurn(initialPrompt)]);
+        expect(userTurns(sentinelRequest).slice(-2)).toEqual([
+          userTurn(initialPrompt), userTurn(consumedSentinel),
+        ]);
+        sentinelGate.release();
+
+        await live.waitForRequest((request) => request.requestKind === "ordinary", 3, 30_000);
         await live.waitForOutput((record) => record.type === "message_end" &&
-          JSON.stringify(record).includes("RPC_RESUMED_FINAL_T05"), 30_000);
+          JSON.stringify(record).includes("RPC_RESUMED_FINAL_T02"), 30_000);
         await live.waitForOutput((record) => record.type === "agent_settled", 30_000, 2);
         live.closeInput();
         const result = await live.completion;
-        if (process.platform === "win32") {
+        if (process.platform === "win32" && result.code !== 0) {
           expect(result.code).toBe(3221226505);
           expect(result.stderr).toContain("UV_HANDLE_CLOSING");
         } else {
           expect(result.code, result.stderr).toBe(0);
         }
-        expect(result.requests.map((request) => request.requestKind)).toEqual(["ordinary", "compaction", "ordinary"]);
+        expect(result.requests.map((request) => request.requestKind)).toEqual([
+          "ordinary", "ordinary", "compaction", "ordinary",
+        ]);
+        const ordinaryRequests = result.requests.filter((request) => request.requestKind === "ordinary");
+        const orderedUserTurns = ordinaryRequests.map(userTurns);
+        expect(orderedUserTurns[1]!.slice(-2)).toEqual([
+          userTurn(initialPrompt), userTurn(consumedSentinel),
+        ]);
+        expect(isSentinelTurn(orderedUserTurns[1]!.at(-1))).toBe(true);
+        expect(isSentinelTurn(orderedUserTurns[2]!.at(-1))).toBe(false);
         const records = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line) as any);
         expect(result.stdout).not.toMatch(TOOL_ROW_PRESENTATION);
         expect(result.stderr).not.toMatch(TOOL_ROW_PRESENTATION);
@@ -352,9 +399,10 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
           "checkpoint-armed", "checkpoint-complete", "checkpoint-resumed",
         ]);
         expect(lifecycle.every((record) => record.id === undefined)).toBe(true);
-        expect(records.filter((record) => record.type === "response" && record.id === "rpc-prompt-t05")).toHaveLength(1);
+        expect(records.filter((record) => record.type === "response" &&
+          ["rpc-initial-t02", "rpc-sentinel-t02"].includes(record.id))).toHaveLength(2);
         const terminal = records.filter((record) => record.type === "message_end" &&
-          JSON.stringify(record).includes("RPC_RESUMED_FINAL_T05"));
+          JSON.stringify(record).includes("RPC_RESUMED_FINAL_T02"));
         expect(terminal).toHaveLength(1);
         const terminalIndex = records.indexOf(terminal[0]);
         const settlements = records
@@ -368,6 +416,8 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         expect(logicalSettlements.filter(({ index }) => index > terminalIndex)).toHaveLength(1);
         expect(records.at(-1)).toBe(logicalSettlements[0]!.record);
       } finally {
+        initialGate.release();
+        sentinelGate.release();
         live.closeInput();
         await live.stop();
       }
