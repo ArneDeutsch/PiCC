@@ -2188,12 +2188,13 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     });
     await deadlinePi.waitForInitialization();
     await deadlineGate.startSession("resumed-join-deadline");
+    let providerAborts = 0;
     const ctx = deadlinePi.ctx({
       mode: "json", hasUI: false,
       model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       hasPendingMessages: () => false,
-      abort: () => undefined,
+      abort: () => { providerAborts += 1; },
       compact: (options: any) => {
         void (async () => {
           const before = await deadlinePi.fire("session_before_compact", { reason: "manual" }, ctx);
@@ -2248,6 +2249,27 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await deadlinePi.fire("agent_settled", {}, ctx);
     await expect(outer).rejects.toThrow(/quiescence/);
 
+    expect(controller.snapshot().failureCategory).toBeUndefined();
+    const recoveryBeforeLaterInput = deadlinePi.entries.filter((entry) =>
+      entry.data.category === "checkpoint-input-recovery");
+    expect(recoveryBeforeLaterInput).toHaveLength(1);
+    await expect(deadlinePi.fire("input", {
+      text: "later ordinary prompt", source: "interactive", streamingBehavior: "followUp",
+    }, ctx)).resolves.toEqual({ action: "handled" });
+    const admissionRefusals = deadlinePi.entries.filter((entry) =>
+      entry.data.category === "checkpoint-admission-refused");
+    expect(admissionRefusals).toHaveLength(1);
+    expect(admissionRefusals[0]?.data).toMatchObject({ action: "restart-process" });
+    expectUnconfirmedHostRecovery(String(admissionRefusals[0]?.data.notice));
+    const laterInputRecovery = deadlinePi.entries.filter((entry) =>
+      entry.data.category === "checkpoint-input-recovery");
+    expect(laterInputRecovery).toHaveLength(2);
+    expect(laterInputRecovery.every((entry) => entry.data.count === 1)).toBe(true);
+    expect(laterInputRecovery.at(-1)?.data).toMatchObject({ count: 1, action: "resend-input" });
+    const providerAbortsBeforeRequest = providerAborts;
+    await deadlinePi.fire("before_provider_request", {}, ctx);
+    expect(providerAborts).toBe(providerAbortsBeforeRequest + 1);
+
     const errors: string[] = [];
     const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
       errors.push(args.map(String).join(" "));
@@ -2261,8 +2283,8 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     const stderrGuidance = errors.filter((line) => line.startsWith("PiCC: ")).join("\n");
     expectUnconfirmedHostRecovery(stderrGuidance);
     const recovery = deadlinePi.entries.filter((entry) => entry.data.category === "checkpoint-input-recovery");
-    expect(recovery).toHaveLength(1);
-    expect(recovery[0]?.data.count).toBe(1);
+    expect(recovery).toHaveLength(2);
+    expect(recovery.every((entry) => entry.data.count === 1)).toBe(true);
   });
 
   it("rejects genuine input until a universally stopped host run settles, then accepts a real tool cycle", async () => {
@@ -4565,7 +4587,13 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(mainCheckpointGate.currentController().snapshot().phase).toBe("exhausted");
   });
 
-  it.each(["rpc", "json"] as const)("emits uncorrelated %s lifecycle records on exhaustion", async (mode) => {
+  it.each([
+    ["rpc", "/compact, then explicitly continue", false],
+    ["json", "start a replacement session and resend retained input", true],
+    ["print", "start a replacement session and resend retained input", true],
+  ] as const)("gives non-persisted %s operational exhaustion truthful recovery guidance", async (
+    mode, expectedRecovery, ephemeral,
+  ) => {
     await mainCheckpointGate.startSession(`main-${mode}-exhaustion`);
     pi.messages.length = 0;
     const ctx = pi.ctx({
@@ -4577,12 +4605,22 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       compact: (options: any) => queueMicrotask(() => options.onError(new Error("private failure"))),
     });
     await pi.fire("session_start", { reason: "startup" }, ctx);
+    pi.entries.length = 0;
     await pi.fire("agent_settled", {}, ctx);
     const records = pi.entries.filter((entry) => entry.customType === "picc-checkpoint-lifecycle");
-    expect(records.some((entry) => entry.data.category === "checkpoint-exhausted")).toBe(true);
-    expect(records.at(-1)?.data.notice).toContain("ephemeral and cannot be reopened");
-    expect(records.at(-1)?.data.notice).toContain("start a replacement session");
-    expect(records.at(-1)?.data.notice).not.toContain("Run /compact");
+    const exhausted = records.find((entry) => entry.data.category === "checkpoint-exhausted");
+    expect(exhausted?.data).toMatchObject({
+      action: "manual-recovery", recovery: expect.stringContaining(expectedRecovery),
+    });
+    if (ephemeral) {
+      expect(exhausted?.data.notice).toContain("ephemeral and cannot be reopened");
+      expect(exhausted?.data.notice).toContain("start a replacement session");
+      expect(exhausted?.data.notice).not.toContain("Run /compact");
+    } else {
+      expect(exhausted?.data.notice).toContain("live RPC session can run /compact");
+      expect(exhausted?.data.notice).toContain("explicitly continue");
+      expect(exhausted?.data.notice).not.toContain("replacement session");
+    }
     expect(records.map((entry) => entry.data.notice).join("\n")).not.toContain("private failure");
     expect(pi.messages.some((entry) => entry.message.customType === "picc-checkpoint-lifecycle")).toBe(false);
   });

@@ -320,7 +320,6 @@ export interface PiccTestSeam {
   renderMainSessionTool?: typeof renderMainSessionTool;
   /** TEST-ONLY in-process override for trusted-Git unavailability. */
   resolveTrustedGit?: () => Promise<string | undefined>;
-  /** TEST-ONLY injectable clock and ceilings for checkpoint host deadlines. */
   checkpointDeadlinePolicy?: HostDeadlinePolicy;
 }
 
@@ -1438,7 +1437,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           : controller.manualCompactionDisposition() === "allow"
             ? "The prior checkpoint was cancelled. Run /compact to recover this session, or start a new session."
             : cancelledText();
-    if (controller.snapshot().failureCategory === "unconfirmed-host") {
+    if (controller.isProcessTerminal()) {
       appendCheckpointEntry({
         category: "checkpoint-admission-refused",
         action: "restart-process",
@@ -1482,11 +1481,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       : event.failureCategory === "hook-blocked"
         ? "Automatic context compaction was blocked by a PreCompact hook. Work is paused and no continuation ran. Repair or disable the hook, or allow a manual compact trigger first."
         : "Automatic context compaction could not complete. Work is paused and no continuation ran.";
+    const recoverableHere = !postCommit && (persisted || mode === "rpc");
     const recoveryGuidance = postCommit
       ? "Do not compact the committed summary again. This session cannot continue the paused work; start a replacement session and resend the retained input."
-      : persisted
-        ? `If this process exits, reopen the exact persisted session (${session}) before /compact.${mode === "rpc" ? " RPC acknowledgements are uncorrelated." : ""} Run /compact, then explicitly continue.`
-        : "This headless session is ephemeral and cannot be reopened; start a replacement session and resend the retained input.";
+      : mode === "rpc"
+        ? "This live RPC session can run /compact, then explicitly continue. RPC acknowledgements are uncorrelated."
+        : persisted
+          ? `If this process exits, reopen the exact persisted session (${session}) before /compact. Run /compact, then explicitly continue.`
+          : "This headless session is ephemeral and cannot be reopened; start a replacement session and resend the retained input.";
     const text = headlessExhaustion ? `${headlessCause} ${recoveryGuidance}` : baseText;
     if (surface === "tui") {
       try {
@@ -1516,7 +1518,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         ...(event.category === "checkpoint-exhausted" ? {
           recovery: event.failureCategory === "restoration-paused"
             ? "start a new session and resend retained input; do not compact the committed summary again"
-            : !persisted
+            : !recoverableHere
               ? "start a replacement session and resend retained input; this ephemeral session cannot be reopened"
               : event.failureCategory === "hook-blocked"
                 ? "repair or disable the hook, or allow manual compaction; then run /compact and explicitly continue"
