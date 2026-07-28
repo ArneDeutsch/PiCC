@@ -744,21 +744,23 @@ describe("pi 0.82.0 API contract", () => {
     }
   });
 
-  it("real Agent preserves duplicate-image steering identity and steer-before-followUp order", async () => {
-    const { Agent }: any = await import("@earendil-works/pi-agent-core");
-    const { createAssistantMessageEventStream }: any = await import("@earendil-works/pi-ai");
+  it("real AgentSession emits mode-less block-array user starts and preserves occurrence queue order", async () => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    const ai: any = await import("@earendil-works/pi-ai");
+    const cwd = mkdtempSync(join(tmpdir(), "picc-pi-queue-contract-"));
+    const agentDir = join(cwd, "agent");
     const calls: any[] = [];
-    let releaseFirst!: () => void;
-    const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    const model = {
-      id: "queue-model", name: "Queue Model", api: "openai-completions", provider: "mock",
-      baseUrl: "http://127.0.0.1", reasoning: false, input: ["text", "image"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1_000,
-    };
-    const agent = new Agent({
-      initialState: { systemPrompt: "queue contract", model, thinkingLevel: "off", tools: [], messages: [] },
-      streamFn: (_model: any, context: any) => {
-        const stream = createAssistantMessageEventStream();
+    const userStarts: any[] = [];
+    let releaseFirst: (() => void) | undefined;
+    let session: any;
+    try {
+      const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const settingsManager = sdk.SettingsManager.inMemory();
+      const modelRuntime = await sdk.ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
+      modelRuntime.hasConfiguredAuth = () => true;
+      modelRuntime.getAuth = async () => ({ auth: { apiKey: "contract-test-key" }, source: "in-process contract" });
+      modelRuntime.streamSimple = (_model: any, context: any) => {
+        const stream = ai.createAssistantMessageEventStream();
         const index = calls.push(structuredClone(context)) - 1;
         void (async () => {
           if (index === 0) await firstRelease;
@@ -773,23 +775,71 @@ describe("pi 0.82.0 API contract", () => {
           stream.push({ type: "done", reason: "stop", message });
         })();
         return stream;
-      },
-    });
-    const running = agent.prompt("start");
-    while (calls.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
-    const imageA = { type: "image", mimeType: "image/png", data: "a" };
-    const imageB = { type: "image", mimeType: "image/png", data: "b" };
-    agent.steer({ role: "user", content: [{ type: "text", text: "duplicate" }, imageA], timestamp: 1 });
-    agent.steer({ role: "user", content: [{ type: "text", text: "duplicate" }, imageB], timestamp: 2 });
-    agent.followUp({ role: "user", content: [{ type: "text", text: "after steering" }], timestamp: 3 });
-    releaseFirst();
-    await running;
+      };
+      const model = {
+        id: "queue-model", name: "Queue Model", api: "openai-completions", provider: "mock",
+        baseUrl: "http://127.0.0.1", reasoning: false, input: ["text", "image"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 1_000,
+      };
+      const loader = new sdk.DefaultResourceLoader({
+        cwd, agentDir, settingsManager, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+        extensionFactories: [{ name: "queue-contract", factory: (api: any) => {
+          api.on("message_start", (event: any) => {
+            if (event.message?.role === "user") userStarts.push(structuredClone(event));
+          });
+        } }],
+      });
+      await loader.reload();
+      ({ session } = await sdk.createAgentSession({
+        cwd, agentDir, settingsManager, modelRuntime, model, resourceLoader: loader,
+        sessionManager: sdk.SessionManager.inMemory(cwd), noTools: "all",
+      }));
 
-    expect(calls).toHaveLength(4);
-    const users = (call: any) => call.messages.filter((message: any) => message.role === "user").map((message: any) => message.content);
-    expect(users(calls[1]).at(-1)).toEqual([{ type: "text", text: "duplicate" }, imageA]);
-    expect(users(calls[2]).at(-1)).toEqual([{ type: "text", text: "duplicate" }, imageB]);
-    expect(users(calls[3]).at(-1)).toEqual([{ type: "text", text: "after steering" }]);
+      const running = session.prompt("start");
+      while (calls.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+      const imageA = { type: "image", mimeType: "image/png", data: "a" };
+      const imageB = { type: "image", mimeType: "image/png", data: "b" };
+      const steerA = [{ type: "text", text: "steer A" }, imageA];
+      const steerB = [{ type: "text", text: "steer B" }, imageB];
+      const followUpFirst = [{ type: "text", text: "follow-up first" }];
+      const followUpSecond = [{ type: "text", text: "follow-up second" }];
+      await session.followUp("follow-up first");
+      await session.followUp("follow-up second");
+      await session.steer("steer A", [structuredClone(imageA)]);
+      await session.steer("steer B", [structuredClone(imageB)]);
+      await session.steer("steer A", [structuredClone(imageA)]);
+      releaseFirst?.();
+      await running;
+
+      expect(calls).toHaveLength(6);
+      const users = (call: any) => call.messages
+        .filter((message: any) => message.role === "user")
+        .map((message: any) => message.content);
+      expect(users(calls[0])).toEqual([[{ type: "text", text: "start" }]]);
+      const providerQueueOrder = calls.slice(1).map((call) => users(call).at(-1));
+      expect(providerQueueOrder).toEqual([
+        steerA, steerB, steerA, followUpFirst, followUpSecond,
+      ]);
+      expect(providerQueueOrder.filter((content) => JSON.stringify(content) === JSON.stringify(steerA))).toHaveLength(2);
+      expect(providerQueueOrder[0]).not.toBe(providerQueueOrder[2]);
+
+      const eventQueueOrder = userStarts.slice(1).map((event) => event.message.content);
+      expect(userStarts[0]!.message.content).toEqual([{ type: "text", text: "start" }]);
+      expect(eventQueueOrder).toEqual([
+        steerA, steerB, steerA, followUpFirst, followUpSecond,
+      ]);
+      expect(eventQueueOrder.filter((content) => JSON.stringify(content) === JSON.stringify(steerA))).toHaveLength(2);
+      expect(eventQueueOrder[0]).not.toBe(eventQueueOrder[2]);
+      for (const event of userStarts) {
+        expect(event).not.toHaveProperty("streamingBehavior");
+        expect(event).not.toHaveProperty("delivery");
+        expect(event.message).not.toHaveProperty("delivery");
+      }
+    } finally {
+      releaseFirst?.();
+      session?.dispose?.();
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("AgentSession exposes getSessionStats() for usage accounting", async () => {
