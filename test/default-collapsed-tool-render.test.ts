@@ -66,6 +66,21 @@ function result(text: string, extra: Record<string, unknown> = {}): unknown {
   return { content: [{ type: "text", text }], details: undefined, ...extra };
 }
 
+function bashTruncation(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    content: "retained tail", truncated: true, truncatedBy: "bytes", totalLines: 100, totalBytes: 100_000,
+    outputLines: 10, outputBytes: 1_000, lastLinePartial: false, firstLineExceedsLimit: false,
+    maxLines: 2_000, maxBytes: 50_000, ...overrides,
+  };
+}
+
+function truncatedResult(text = "retained tail"): unknown {
+  return { content: [{ type: "text", text }], details: {
+    truncation: bashTruncation({ content: text }),
+    fullOutputPath: "/private/recovery/output.txt",
+  } };
+}
+
 function withBinding<T>(keys: string[], run: () => T): T {
   const previousRoot = getKeybindings();
   const previousPi = piTui.getKeybindings();
@@ -83,6 +98,7 @@ function paint(
   value: unknown | undefined,
   flags: { state?: object; partial?: boolean; expanded?: boolean; error?: boolean; argsComplete?: boolean; id?: string } = {},
   width = 160,
+  renderTheme: unknown = theme,
 ): { call: string; detail: string; all: string } {
   const state = flags.state ?? {};
   const partial = flags.partial ?? value === undefined;
@@ -92,9 +108,9 @@ function paint(
     argsComplete: flags.argsComplete ?? true, executionStarted: value !== undefined,
     cwd: process.cwd(), toolCallId: flags.id, showImages: false, invalidate() {},
   };
-  const callComponent = tool.renderCall(args, theme, context);
+  const callComponent = tool.renderCall(args, renderTheme, context);
   const detailComponent = value === undefined ? undefined : tool.renderResult(
-    value, { expanded, isPartial: partial }, theme, context,
+    value, { expanded, isPartial: partial }, renderTheme, context,
   );
   const call = callComponent.render(width).join("\n");
   const detail = detailComponent?.render(width).join("\n") ?? "";
@@ -120,7 +136,7 @@ describe("default-collapsed Read/Bash rendering", () => {
     ] as const;
     for (const [args, expected] of reads) {
       const painted = paint(definition("read"), args, result("SECRET"), { partial: false });
-      expect(painted.call).toBe(expected);
+      expect(painted.call).toBe(`${expected} · alt+x to expand`);
       expect(painted.detail).toBe("");
       expect(painted.all).not.toContain("SECRET");
     }
@@ -128,14 +144,83 @@ describe("default-collapsed Read/Bash rendering", () => {
       path: "overflow", offset: Number.MAX_SAFE_INTEGER, limit: 2,
     }, result("body"), { partial: false }).call).toContain("unfamiliar arguments");
     const bashCases = [
-      [{ command: "printf one" }, "bash $ printf one"],
-      [{ command: "\r\n printf one\r\n\r\necho two", timeout: 2.5 }, "bash $ printf one [ …] (timeout 2.5s)"],
+      [{ command: "printf one" }, "bash $ printf one · alt+x to expand"],
+      [{ command: "\r\n printf one\r\n\r\necho two", timeout: 2.5 },
+        "bash $ printf one · multiline · timeout 2.5s · alt+x to expand"],
     ] as const;
     for (const [args, expected] of bashCases) {
       const painted = paint(definition("bash"), args, result("SECRET"), { partial: false });
       expect(painted.call).toBe(expected);
       expect(painted.detail).toBe("");
     }
+  }));
+
+  it("accepts Pi's timeout boundaries and fails invalid producer invocations open", () => withBinding(["ctrl+o"], () => {
+    const maxTimeout = 2_147_483_647 / 1_000;
+    for (const [args, metadata] of [
+      [{ command: "true" }, ""],
+      [{ command: "true", timeout: undefined }, ""],
+      [{ command: "true", timeout: Number.MIN_VALUE }, ` · timeout ${Number.MIN_VALUE}s`],
+      [{ command: "true", timeout: maxTimeout }, ` · timeout ${maxTimeout}s`],
+    ] as const) {
+      expect(paint(definition("bash"), args, result("detail"), { partial: false }).call)
+        .toBe(`bash $ true${metadata} · ctrl+o to expand`);
+    }
+    for (const timeout of [0, -1, NaN, Infinity, -Infinity, maxTimeout + Number.EPSILON * maxTimeout]) {
+      const painted = paint(definition("bash"), { command: "true", timeout }, result("NATIVE EVIDENCE"),
+        { partial: false });
+      expect(painted.all).toContain("unfamiliar arguments");
+      expect(painted.all).not.toContain("to expand");
+    }
+  }));
+
+  it("keeps LF, CRLF, and lone-CR command identity on the same first meaningful line", () => withBinding(["ctrl+o"], () => {
+    for (const separator of ["\n", "\r\n", "\r"]) {
+      const command = `${separator}printf first${separator}${separator}printf SECOND_COMMAND_MUST_NOT_PREVIEW`;
+      const painted = paint(definition("bash"), { command }, result("detail"), { partial: false });
+      expect(painted.call).toBe("bash $ printf first · multiline · ctrl+o to expand");
+      expect(painted.call).not.toContain("SECOND_COMMAND_MUST_NOT_PREVIEW");
+    }
+  }));
+
+  it("uses semantic roles, centered dots, truthful cues, and warning-toned truncation", () => withBinding(["alt+e"], () => {
+    const calls: Array<[string, string]> = [];
+    const spyTheme = {
+      fg(slot: string, text: string) { calls.push([slot, text]); return text; },
+      bold(text: string) { return text; },
+    };
+    const read = paint(definition("read"), { path: "page.ts", offset: 3, limit: 2 },
+      result("one\ntwo\n\n[4 more lines in file. Use offset=5 to continue.]"), { partial: false }, 160, spyTheme);
+    expect(read.call).toBe("read page.ts:3-4 · 4 more lines · alt+e to expand");
+    expect(calls).toContainEqual(["text", "read"]);
+    expect(calls).toContainEqual(["accent", "page.ts:3-4"]);
+    expect(calls).toContainEqual(["muted", "4 more lines"]);
+    expect(calls).toContainEqual(["muted", "alt+e to expand"]);
+    expect(calls.filter(([slot, text]) => slot === "muted" && text === " · ")).toHaveLength(2);
+
+    calls.length = 0;
+    const bash = paint(definition("bash"), { command: "printf first\nprintf second", timeout: 3 },
+      truncatedResult("BODY MUST STAY HIDDEN"), { partial: false }, 160, spyTheme);
+    expect(bash.call).toBe("bash $ printf first · output truncated · multiline · timeout 3s · alt+e to expand");
+    expect(bash.all).not.toContain("BODY MUST STAY HIDDEN");
+    expect(bash.all).not.toContain("/private/recovery/output.txt");
+    expect(calls).toContainEqual(["text", "bash"]);
+    expect(calls).toContainEqual(["accent", "$ printf first"]);
+    expect(calls).toContainEqual(["warning", "output truncated"]);
+    expect(calls).toContainEqual(["muted", "multiline"]);
+    expect(calls).toContainEqual(["muted", "timeout 3s"]);
+  }));
+
+  it("omits false cues for empty successes and uses one narrow cue line", () => withBinding(["alt+e"], () => {
+    expect(paint(definition("read"), { path: "empty.txt" }, result(""), { partial: false }).all)
+      .toBe("read empty.txt");
+    expect(paint(definition("bash"), { command: "true" }, result("(no output)"), { partial: false }).all)
+      .toBe("bash $ true");
+    const narrow = paint(definition("bash"), { command: "printf retained", timeout: 9 }, result("detail"),
+      { partial: false }, 18);
+    expect(narrow.call.split("\n")).toHaveLength(2);
+    expect(narrow.call.split("\n")[1]).toBe("alt+e to expand");
+    for (const line of narrow.call.split("\n")) expect(visibleWidth(line)).toBeLessThanOrEqual(18);
   }));
 
   it("keeps pending and collapsed streaming call-owned, then expands, settles, and recollapses", () => withBinding(["ctrl+o"], () => {
@@ -153,12 +238,57 @@ describe("default-collapsed Read/Bash rendering", () => {
       expect(expandedPartial.all).toContain("native call");
       expect(expandedPartial.all).toContain("ROLLING");
       const collapsed = paint(tool, args, result("FINAL SECRET"), { state, partial: false });
-      expect(collapsed.all).toBe(identity);
+      expect(collapsed.all).toBe(`${identity} · ctrl+o to expand`);
       const expanded = paint(tool, args, result("FINAL SECRET"), { state, partial: false, expanded: true });
       expect(expanded.all).toContain("FINAL SECRET");
       expect(expanded.all.match(/native call/gu)).toHaveLength(1);
-      expect(paint(tool, args, result("FINAL SECRET"), { state, partial: false }).all).toBe(identity);
+      expect(paint(tool, args, result("FINAL SECRET"), { state, partial: false }).all)
+        .toBe(`${identity} · ctrl+o to expand`);
     }
+  }));
+
+  it("fails malformed Read envelopes, arrays, and blocks open without ordinary or continuation collapse", () => withBinding(["ctrl+o"], () => {
+    const continuation = "one\ntwo\n\n[4 more lines in file. Use offset=3 to continue.]";
+    const textBlock = { type: "text", text: "VISIBLE READ EVIDENCE" };
+    const inheritedEnvelope = Object.create({ content: [textBlock], details: undefined });
+    const inheritedArray = [textBlock];
+    Object.setPrototypeOf(inheritedArray, Object.create(Array.prototype));
+    const inheritedBlock = Object.create(textBlock);
+    const accessorEnvelope = Object.defineProperty({ details: undefined }, "content", {
+      enumerable: true, get: () => [textBlock],
+    });
+    const accessorArray = [textBlock];
+    Object.defineProperty(accessorArray, "0", { enumerable: true, configurable: true, get: () => textBlock });
+    const accessorBlock = Object.defineProperty({ type: "text" }, "text", {
+      enumerable: true, get: () => "VISIBLE READ EVIDENCE",
+    });
+    const foreignEnvelope = Object.create(new Date()) as Record<string, unknown>;
+    foreignEnvelope.content = [textBlock];
+    foreignEnvelope.details = undefined;
+    const malformed = [
+      { content: [textBlock], details: undefined, extra: true },
+      inheritedEnvelope,
+      { content: inheritedArray, details: undefined },
+      { content: [inheritedBlock], details: undefined },
+      accessorEnvelope,
+      { content: accessorArray, details: undefined },
+      { content: [accessorBlock], details: undefined },
+      foreignEnvelope,
+    ];
+    for (const value of malformed) {
+      const painted = paint(definition("read"), { path: "foreign.txt" }, value, { partial: false });
+      expect(painted.call).not.toContain("to expand");
+      expect(painted.detail.length).toBeGreaterThan(0);
+    }
+
+    const continuationAccessor = Object.defineProperty({ type: "text" }, "text", {
+      enumerable: true, get: () => continuation,
+    });
+    const painted = paint(definition("read"), { path: "page", limit: 2 }, {
+      content: [continuationAccessor], details: undefined,
+    }, { partial: false });
+    expect(painted.call).not.toMatch(/4 more lines|to expand/u);
+    expect(painted.detail).toContain("Use offset=3 to continue");
   }));
 
   it("composes both expansion-field mismatch directions through one stable mutable call slot", () => withBinding(["ctrl+o"], () => {
@@ -179,7 +309,8 @@ describe("default-collapsed Read/Bash rendering", () => {
       const recollapsedDetail = tool.renderResult(value, { expanded: false, isPartial: false }, theme,
         { ...base, expanded: false });
       expect(call).toBe(originalCallIdentity);
-      expect([call.render(100), recollapsedDetail.render(100)].flat().join("\n")).toBe("read mismatch.txt");
+      expect([call.render(100), recollapsedDetail.render(100)].flat().join("\n"))
+        .toBe("read mismatch.txt · ctrl+o to expand");
     }
   }));
 
@@ -191,7 +322,7 @@ describe("default-collapsed Read/Bash rendering", () => {
     });
     withBinding(["alt+p"], () => {
       const painted = paint(definition("read"), { path: "closed.txt" }, result("HIDDEN"), { partial: false });
-      expect(painted.all).toBe("read closed.txt");
+      expect(painted.all).toBe("read closed.txt · alt+p to expand");
     });
   });
 
@@ -218,7 +349,8 @@ describe("default-collapsed Read/Bash rendering", () => {
         const tool = definition("read", {}, { resolveDisplayRoot: () => matrix.workspace, repositoryRoot: matrix.repository });
         const state = {};
         paint(tool, { path: rawPath }, undefined, { state, partial: true });
-        expect(paint(tool, { path: rawPath }, result("body"), { state, partial: false }).call).toBe(`read ${expected}`);
+        expect(paint(tool, { path: rawPath }, result("body"), { state, partial: false }).call)
+          .toBe(`read ${expected} · ctrl+o to expand`);
       }
     }
   }));
@@ -231,8 +363,10 @@ describe("default-collapsed Read/Bash rendering", () => {
     const tool = definition("read", {}, { resolveDisplayRoot: resolver, repositoryRoot: "/repo" });
     const state = {};
     paint(tool, args, undefined, { state, partial: true, argsComplete: true });
-    expect(paint(tool, args, value, { state, partial: false }).call).toBe("read repo:src/colon�:a.ts");
-    expect(paint(tool, args, value, { state, partial: false }).call).toBe("read repo:src/colon�:a.ts");
+    expect(paint(tool, args, value, { state, partial: false }).call)
+      .toBe("read repo:src/colon�:a.ts · ctrl+o to expand");
+    expect(paint(tool, args, value, { state, partial: false }).call)
+      .toBe("read repo:src/colon�:a.ts · ctrl+o to expand");
     expect(resolver).toHaveBeenCalledTimes(1);
     expect(args.path).toBe(rawPath);
     expect(value.content[0]?.text).toBe("body");
@@ -256,8 +390,11 @@ describe("default-collapsed Read/Bash rendering", () => {
       [{ path: "page", limit: 2 }, "one [4 more lines in file. Use offset=3 to continue.] two", false],
     ] as const) {
       const painted = paint(definition("read"), args, result(text), { partial: false });
-      if (exact) expect(painted.detail).toBe("4 more lines · next offset 3".replace("3", String((args.offset ?? 1) + 2)));
-      else expect(painted.detail).not.toContain("next offset");
+      if (exact) {
+        const start = args.offset ?? 1;
+        expect(painted.call).toBe(`read page:${start}-${start + 1} · 4 more lines · ctrl+o to expand`);
+        expect(painted.detail).toBe("");
+      } else expect(painted.detail).not.toContain("next offset");
     }
     const extraBlock = paint(definition("read"), { path: "page", limit: 2 }, {
       content: [{ type: "text", text: "one\ntwo\n\n[4 more lines in file. Use offset=3 to continue.]" },
@@ -376,6 +513,118 @@ describe("default-collapsed Read/Bash rendering", () => {
     }
   }));
 
+  it("accepts only the exact hidden Bash detail families", () => withBinding(["ctrl+o"], () => {
+    const positives = [
+      { value: { content: [{ type: "text", text: "OMITTED" }] }, fact: "" },
+      { value: { content: [{ type: "text", text: "UNDEFINED" }], details: undefined }, fact: "" },
+      { value: { content: [{ type: "text", text: "TRUNCATION_ONLY" }],
+        details: { truncation: bashTruncation() } }, fact: "output truncated" },
+      { value: { content: [{ type: "text", text: "PATH_ONLY" }],
+        details: { fullOutputPath: "/private/recovery/output.txt" } }, fact: "" },
+    ] as const;
+    for (const { value, fact } of positives) {
+      const painted = paint(definition("bash"), { command: "printf exact" }, value, { partial: false });
+      expect(painted.call).toContain("ctrl+o to expand");
+      if (fact) expect(painted.call).toContain(fact);
+      expect(painted.detail).toBe("");
+      expect(painted.all).not.toContain(value.content[0].text);
+      expect(painted.all).not.toContain("/private/recovery/output.txt");
+    }
+  }));
+
+  it("accepts accumulator byte truncation with zero or maxLines retained", () => withBinding(["ctrl+o"], () => {
+    const valid = [
+      bashTruncation({ totalLines: 1, outputLines: 0, outputBytes: 0, lastLinePartial: false }),
+      bashTruncation({ totalLines: 2_001, outputLines: 2_000, outputBytes: 40_000,
+        maxLines: 2_000, lastLinePartial: false }),
+    ];
+    for (const truncation of valid) {
+      const painted = paint(definition("bash"), { command: "printf exact" },
+        { content: [{ type: "text", text: "HIDDEN" }], details: { truncation } }, { partial: false });
+      expect(painted.call).toContain("output truncated");
+      expect(painted.call).toContain("ctrl+o to expand");
+      expect(painted.detail).toBe("");
+      expect(painted.all).not.toContain("HIDDEN");
+    }
+  }));
+
+  it("fails representative malformed Bash envelopes and exact-shape members open", () => withBinding(["ctrl+o"], () => {
+    const text = { type: "text", text: "NATIVE EVIDENCE" };
+    const inheritedEnvelope = Object.create({ content: [text] }) as Record<string, unknown>;
+    const inheritedArray = [text] as Array<unknown>;
+    Object.setPrototypeOf(inheritedArray, Object.create(Array.prototype));
+    const inheritedBlock = Object.create(text) as Record<string, unknown>;
+    const inheritedDetails = Object.create({ fullOutputPath: "/inherited" }) as Record<string, unknown>;
+    const inheritedTruncation = Object.create(bashTruncation()) as Record<string, unknown>;
+    const accessorEnvelope = Object.defineProperty({}, "content", { enumerable: true, get: () => [text] });
+    const accessorArray = [text];
+    Object.defineProperty(accessorArray, "0", { enumerable: true, configurable: true, get: () => text });
+    const accessorBlock = Object.defineProperty({ type: "text" }, "text",
+      { enumerable: true, get: () => "NATIVE EVIDENCE" });
+    const accessorDetails = Object.defineProperty({}, "fullOutputPath",
+      { enumerable: true, get: () => "/private/output" });
+    const accessorTruncation = Object.defineProperty(bashTruncation(), "totalBytes",
+      { enumerable: true, get: () => 100_000 });
+    const missingTruncationField = bashTruncation();
+    delete missingTruncationField.outputBytes;
+    const malformed = [
+      { content: [text], extra: true }, {}, accessorEnvelope, inheritedEnvelope,
+      { content: [] }, { content: [text, text] }, { content: accessorArray }, { content: inheritedArray },
+      { content: [{ type: "text" }] }, { content: [{ text: "NATIVE EVIDENCE" }] },
+      { content: [{ ...text, extra: true }] }, { content: [accessorBlock] }, { content: [inheritedBlock] },
+      { content: [text], details: {} }, { content: [text], details: { extra: true } },
+      { content: [text], details: { fullOutputPath: "" } },
+      { content: [text], details: accessorDetails }, { content: [text], details: inheritedDetails },
+      { content: [text], details: { truncation: missingTruncationField } },
+      { content: [text], details: { truncation: accessorTruncation } },
+      { content: [text], details: { truncation: inheritedTruncation } },
+    ];
+    for (const value of malformed) {
+      const painted = paint(definition("bash"), { command: "printf evidence" }, value, { partial: false });
+      expect(painted.call).toContain("native call $ printf evidence");
+      expect(painted.all).not.toContain("output truncated");
+      expect(painted.all).not.toContain("to expand");
+    }
+  }));
+
+  it("fails incoherent Bash tail-truncation boundaries open", () => withBinding(["ctrl+o"], () => {
+    const lineBase = {
+      truncatedBy: "lines", totalLines: 3_000, outputLines: 2_000, totalBytes: 40_000,
+      outputBytes: 30_000, maxLines: 2_000, maxBytes: 50_000, lastLinePartial: false,
+    };
+    const mutations = [
+      { truncated: false }, { totalBytes: NaN }, { firstLineExceedsLimit: true }, { extra: true },
+      { totalBytes: 50_000 }, { outputBytes: 50_001 }, { outputLines: 2_001 }, { totalLines: 10 },
+      { lastLinePartial: true, outputLines: 2 }, { lastLinePartial: true, outputLines: 1, outputBytes: 0 },
+      lineBase, { ...lineBase, totalLines: 2_000 }, { ...lineBase, outputLines: 1_999 },
+      { ...lineBase, totalBytes: 30_000 }, { ...lineBase, lastLinePartial: true },
+    ];
+    for (const mutation of mutations) {
+      const truncation = mutation === lineBase
+        ? { ...bashTruncation(), ...mutation, firstLineExceedsLimit: false }
+        : { ...bashTruncation(), ...mutation };
+      const painted = paint(definition("bash"), { command: "printf evidence" },
+        { content: [{ type: "text", text: "NATIVE EVIDENCE" }], details: { truncation } }, { partial: false });
+      if (mutation === lineBase) {
+        expect(painted.call).toContain("output truncated");
+        expect(painted.detail).toBe("");
+      } else {
+        expect(painted.call).toContain("native call $ printf evidence");
+        expect(painted.all).not.toContain("output truncated");
+        expect(painted.all).not.toContain("to expand");
+      }
+    }
+
+    let commandReads = 0;
+    const accessorArgs = Object.defineProperty({}, "command", { enumerable: true, get() { commandReads++; return "secret"; } });
+    expect(paint(definition("bash"), accessorArgs, result("body"), { partial: false }).all)
+      .toContain("unfamiliar arguments");
+    expect(commandReads).toBe(0);
+    const inheritedArgs = Object.create({ command: "printf inherited" }) as object;
+    expect(paint(definition("bash"), inheritedArgs, result("body"), { partial: false }).all)
+      .toContain("unfamiliar arguments");
+  }));
+
   it("renders one call-owned malformed-result failure in concise and expanded prior states", () => withBinding(["ctrl+o"], () => {
     for (const expanded of [false, true]) {
       const tool = definition("read");
@@ -411,7 +660,7 @@ describe("default-collapsed Read/Bash rendering", () => {
     const resultFailureTool = definition("bash", { resultThrows: true });
     const state = {};
     const collapsed = paint(resultFailureTool, { command: "false" }, result("canonical status"), { state, partial: false });
-    expect(collapsed.call).toBe("bash $ false");
+    expect(collapsed.call).toBe("bash $ false · ctrl+o to expand");
     expect(collapsed.detail).toContain("canonical status");
     const expanded = paint(resultFailureTool, { command: "false" }, result("canonical status"), {
       state, partial: false, expanded: true,
@@ -466,7 +715,8 @@ describe("default-collapsed Read/Bash rendering", () => {
     expect(recovered.detail).toContain("recovered");
     expect(seenCallLast.at(-1)).toBeUndefined();
     expect(seenResultLast.at(-1)).toBeUndefined();
-    expect(paint(tool, args, result("recovered"), { state, partial: false }).all).toBe("read recover.txt");
+    expect(paint(tool, args, result("recovered"), { state, partial: false }).all)
+      .toBe("read recover.txt · ctrl+o to expand");
     expect(paint(tool, args, result("again"), { state, partial: false, expanded: true }).detail).not.toContain("failure evidence");
   }));
 
@@ -484,12 +734,12 @@ describe("default-collapsed Read/Bash rendering", () => {
     root = "/repo/two";
     paint(read, { path: "/repo/two/b.txt" }, undefined, { state: readB, partial: true, id: reused });
     expect(paint(read, { path: "/repo/one/a.txt" }, result("FIRST"), { state: readA, partial: false, id: reused }).all)
-      .toBe("read a.txt");
+      .toBe("read a.txt · ctrl+o to expand");
     expect(paint(read, { path: "/repo/two/b.txt" }, result("SECOND"), { state: readB, partial: false, expanded: true, id: reused }).all)
       .toContain("SECOND");
 
     expect(paint(bash, { command: "printf same", timeout: 1 }, result("A"), { state: bashA, partial: false, id: reused }).all)
-      .toBe("bash $ printf same (timeout 1s)");
+      .toBe("bash $ printf same · timeout 1s · ctrl+o to expand");
     expect(paint(bash, { command: "printf same", timeout: 9 }, result("B failed", { isError: true }),
       { state: bashB, partial: false, error: true, id: reused }).detail).toContain("B failed");
     expect(paint(bash, { command: "printf same", timeout: 1 }, result("A"), { state: bashA, partial: false, id: reused }).all)
@@ -503,7 +753,7 @@ describe("default-collapsed Read/Bash rendering", () => {
     const tool = definition("bash");
     const state = {};
     const painted = paint(tool, args, result("body"), { state, partial: false }, 200);
-    expect(painted.call).toBe("bash $ printf '�safe' [ …] (timeout 5s)");
+    expect(painted.call).toBe("bash $ printf '�safe' · multiline · timeout 5s · ctrl+o to expand");
     expect(painted.call).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/u);
     for (const width of [0, 1, 8, 24]) {
       for (const line of paint(tool, args, result("body"), { state, partial: false }, width).call.split("\n")) {

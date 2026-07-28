@@ -4,12 +4,13 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { neutralizePiEditBoxBackground } from "./pi-tui-runtime.js";
+import { neutralizePiEditBoxBackground, piToolsExpandKeyText } from "./pi-tui-runtime.js";
 import { themedFg } from "./render-util.js";
 import {
   formatDisplayPathFromRoots,
   formatToolDisplayName,
   priorityDisplayRow,
+  semanticDisplayRow,
   resolveDisplayRoots,
   sanitizeInlineDisplay,
   type DisplayRootResolver,
@@ -244,12 +245,7 @@ function commandComponent(toolName: RoutineToolName, invocation: string, theme: 
     render(width: number): string[] {
       try {
         const title = safeThemeMethod(theme, "fg", ["text", displayName], displayName);
-        const argument = safeThemeMethod(
-          theme,
-          "fg",
-          ["accent", displayedInvocation],
-          displayedInvocation,
-        );
+        const argument = safeThemeMethod(theme, "fg", ["accent", displayedInvocation], displayedInvocation);
         const styled = `${title} ${argument}`;
         try {
           visibleWidth(styled);
@@ -262,6 +258,105 @@ function commandComponent(toolName: RoutineToolName, invocation: string, theme: 
       }
     },
   };
+}
+
+function routineSummaryComponent(
+  toolName: WebToolName | ActivationToolName,
+  invocation: string,
+  theme: unknown,
+  cue?: string,
+): Component {
+  const displayedInvocation = toolName === "WebSearch" ? `“${invocation}”` : invocation;
+  return semanticDisplayRow({
+    action: formatToolDisplayName(toolName),
+    primary: displayedInvocation,
+    ...(cue ? { cue, compactCue: cue.endsWith(" to expand") ? cue.slice(0, -" to expand".length) : cue } : {}),
+  }, theme);
+}
+
+interface RoutineSuccess {
+  invocation: string;
+  retainedText: string;
+  retainedOwner: object;
+}
+
+interface RoutineDetailCache {
+  readonly owner: object;
+  readonly source: string;
+  sanitized?: string;
+  readonly wrapped: Map<number, string[]>;
+}
+
+interface RoutineDisplayLifecycle {
+  invocation?: string;
+  success?: RoutineSuccess;
+  cache?: RoutineDetailCache;
+  reveal: boolean;
+  cue?: string;
+  theme?: unknown;
+  call?: Component;
+}
+
+const routineDetailCaches = new WeakMap<Component, RoutineDetailCache>();
+
+function sanitizeRetainedText(source: string): string {
+  let text = source;
+  try { text = text.normalize("NFC"); } catch { /* Keep the original complete text. */ }
+  return stripTerminalControls(text)
+    .replace(/\p{Cf}/gu, "")
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, (character) => {
+      if (character === "\n") return "\n";
+      return character === "\t" ? "   " : " ";
+    });
+}
+
+function routineDetailCache(
+  success: RoutineSuccess,
+  prior?: RoutineDetailCache,
+): RoutineDetailCache {
+  return prior?.owner === success.retainedOwner && prior.source === success.retainedText
+    ? prior
+    : { owner: success.retainedOwner, source: success.retainedText, wrapped: new Map<number, string[]>() };
+}
+
+function retainedRoutineDetail(cache: RoutineDetailCache, theme: unknown, width: number): string[] {
+  if (!Number.isFinite(width) || width <= 0) return [];
+  const columns = Math.max(1, Math.floor(width));
+  let detailLines = cache.wrapped.get(columns);
+  if (!detailLines) {
+    cache.sanitized ??= sanitizeRetainedText(cache.source);
+    detailLines = [];
+    for (const sourceLine of cache.sanitized.split("\n")) {
+      const styled = safeThemeMethod(theme, "fg", ["toolOutput", sourceLine], sourceLine);
+      const wrapped = wrapTextWithAnsi(styled, columns);
+      if (wrapped.length === 0) detailLines.push("");
+      else for (const line of wrapped) detailLines.push(clamp(line, columns));
+    }
+    cache.wrapped.set(columns, detailLines);
+  }
+  return detailLines;
+}
+
+function lazyRoutineSuccessComponent(
+  toolName: WebToolName | ActivationToolName,
+  success: RoutineSuccess,
+  expanded: boolean,
+  theme: unknown,
+  cue: string | undefined,
+  previous: Component | undefined,
+): Component {
+  const summary = routineSummaryComponent(toolName, success.invocation, theme, cue);
+  const cache = routineDetailCache(success, previous && routineDetailCaches.get(previous));
+  const component: Component = {
+    render(width: number): string[] {
+      const summaryLines = summary.render(width);
+      return !expanded || success.retainedText.length === 0
+        ? summaryLines
+        : [...summaryLines, ...retainedRoutineDetail(cache, theme, width)];
+    },
+  };
+  routineDetailCaches.set(component, cache);
+  return component;
 }
 
 function boundedCanonicalText(
@@ -331,19 +426,22 @@ function failOpenComponent(
   };
 }
 
-function textContentBlock(value: unknown): boolean {
-  const block = plainOwnData(value, ["type", "text"]);
-  return block?.type === "text" && typeof block.text === "string";
-}
-
-function oneTextContent(value: unknown): boolean {
-  if (!Array.isArray(value)) return false;
+function oneTextContent(
+  value: unknown,
+): Pick<RoutineSuccess, "retainedText" | "retainedOwner"> | undefined {
+  if (!Array.isArray(value)) return undefined;
   try {
-    if (Object.getPrototypeOf(value) !== Array.prototype) return false;
+    if (Object.getPrototypeOf(value) !== Array.prototype) return undefined;
     const length = ownData(value, "length");
-    return length === 1 && Reflect.ownKeys(value).length === 2 && textContentBlock(ownData(value, "0"));
+    if (length !== 1 || Reflect.ownKeys(value).length !== 2) return undefined;
+    const retainedOwner = ownData(value, "0");
+    const block = plainOwnData(retainedOwner, ["type", "text"]);
+    return block?.type === "text" && typeof block.text === "string" &&
+      retainedOwner !== null && typeof retainedOwner === "object"
+      ? { retainedText: block.text, retainedOwner }
+      : undefined;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -374,17 +472,17 @@ function recognizeWebSuccess(
   result: unknown,
   options: unknown,
   context: unknown,
-): string | undefined {
+): RoutineSuccess | undefined {
   if (ownData(options, "isPartial") !== false || ownData(context, "isError") !== false) {
     return undefined;
   }
   const resultSnapshot = plainOwnData(result, ["content", "details"]) ??
     plainOwnData(result, ["content", "details", "isError"]);
-  if (
-    !resultSnapshot ||
-    ("isError" in resultSnapshot && resultSnapshot.isError !== false) ||
-    !oneTextContent(resultSnapshot.content)
-  ) return undefined;
+  if (!resultSnapshot || ("isError" in resultSnapshot && resultSnapshot.isError !== false)) {
+    return undefined;
+  }
+  const body = oneTextContent(resultSnapshot.content);
+  if (!body) return undefined;
 
   const argsValue = ownData(context, "args");
   if (toolName === "WebFetch") {
@@ -395,7 +493,7 @@ function recognizeWebSuccess(
     );
     if (!argsKeys || !details || !validFetch(argsKeys, details)) return undefined;
     const invocation = sanitizeText(argsKeys.url, true);
-    return invocation.length > 0 ? invocation : undefined;
+    return invocation.length > 0 ? { invocation, ...body } : undefined;
   }
 
   const possibleKeys = [
@@ -412,7 +510,7 @@ function recognizeWebSuccess(
   );
   if (!args || !details || !validSearch(args, details)) return undefined;
   const invocation = sanitizeText(args.query, true);
-  return invocation.length > 0 ? invocation : undefined;
+  return invocation.length > 0 ? { invocation, ...body } : undefined;
 }
 
 function emptyInvocationReason(toolName: RoutineToolName, context: unknown): string | undefined {
@@ -468,17 +566,17 @@ function recognizeActivationSuccess(
   result: unknown,
   options: unknown,
   context: unknown,
-): string | undefined {
+): RoutineSuccess | undefined {
   if (ownData(options, "isPartial") !== false || ownData(context, "isError") !== false) {
     return undefined;
   }
   const resultSnapshot = plainOwnData(result, ["content", "details"]) ??
     plainOwnData(result, ["content", "details", "isError"]);
-  if (
-    !resultSnapshot ||
-    ("isError" in resultSnapshot && resultSnapshot.isError !== false) ||
-    !oneTextContent(resultSnapshot.content)
-  ) return undefined;
+  if (!resultSnapshot || ("isError" in resultSnapshot && resultSnapshot.isError !== false)) {
+    return undefined;
+  }
+  const body = oneTextContent(resultSnapshot.content);
+  if (!body) return undefined;
   const details = plainOwnData(resultSnapshot.details, ["skill"]);
   if (!details || typeof details.skill !== "string" || details.skill.length === 0) return undefined;
 
@@ -489,7 +587,7 @@ function recognizeActivationSuccess(
     const requestedName = slashCommandName(args.command);
     if (!requestedName || !activationIdentityMatches(requestedName, details.skill)) return undefined;
     const command = sanitizeText(args.command, true);
-    return command.length > 0 ? command : undefined;
+    return command.length > 0 ? { invocation: command, ...body } : undefined;
   }
 
   const args = plainOwnData(argsValue, ["name"]) ??
@@ -503,7 +601,48 @@ function recognizeActivationSuccess(
   const name = sanitizeText(args.name, true);
   if (name.length === 0) return undefined;
   const argumentsText = sanitizeText(args.arguments, true);
-  return argumentsText.length > 0 ? `${name} — ${argumentsText}` : name;
+  return { invocation: argumentsText.length > 0 ? `${name} — ${argumentsText}` : name, ...body };
+}
+
+function routineInvocation(
+  toolName: WebToolName | ActivationToolName,
+  value: unknown,
+): string | undefined {
+  if (toolName === "WebFetch") {
+    const args = plainOwnData(value, ["url"]) ?? plainOwnData(value, ["url", "prompt"]);
+    if (!args || typeof args.url !== "string" ||
+      ("prompt" in args && typeof args.prompt !== "string")) return undefined;
+    const invocation = sanitizeText(args.url, true);
+    return invocation || undefined;
+  }
+  if (toolName === "WebSearch") {
+    const possibleKeys = [
+      ["query"],
+      ["query", "allowed_domains"],
+      ["query", "blocked_domains"],
+      ["query", "allowed_domains", "blocked_domains"],
+    ] as const;
+    let args: DataSnapshot | undefined;
+    for (const keys of possibleKeys) args ??= plainOwnData(value, keys);
+    if (!args || typeof args.query !== "string" ||
+      ("allowed_domains" in args && !exactStringArray(args.allowed_domains)) ||
+      ("blocked_domains" in args && !exactStringArray(args.blocked_domains))) return undefined;
+    const invocation = sanitizeText(args.query, true);
+    return invocation || undefined;
+  }
+  if (toolName === "SlashCommand") {
+    const args = plainOwnData(value, ["command"]);
+    if (!args || typeof args.command !== "string" || !slashCommandName(args.command)) return undefined;
+    const invocation = sanitizeText(args.command, true);
+    return invocation || undefined;
+  }
+  const args = plainOwnData(value, ["name"]) ?? plainOwnData(value, ["name", "arguments"]);
+  if (!args || typeof args.name !== "string" ||
+    ("arguments" in args && typeof args.arguments !== "string")) return undefined;
+  const name = sanitizeText(args.name, true);
+  if (!name) return undefined;
+  const argumentsText = sanitizeText(args.arguments, true);
+  return argumentsText ? `${name} — ${argumentsText}` : name;
 }
 
 interface WorktreeRow {
@@ -1205,6 +1344,9 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
   const toolName = routineToolName(tool);
   if (!toolName) return tool;
   const rootSnapshots = new WeakMap<object, DisplayRoots>();
+  const htmlCallStates = new WeakSet<object>();
+  const interactiveCallStates = new WeakSet<object>();
+  const routineLifecycles = new WeakMap<object, RoutineDisplayLifecycle>();
   const displayRootsFor = (context: unknown): DisplayRoots => {
     const state = liveEditState(context);
     const resolved = () => resolveDisplayRoots(
@@ -1283,6 +1425,37 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
       writable: true,
       value(args: unknown, theme: unknown, context: unknown): Component {
         const displayRoots = displayRootsFor(context);
+        if (toolName === "WebFetch" || toolName === "WebSearch" || toolName === "Skill" || toolName === "SlashCommand") {
+          const state = liveEditState(context);
+          // ToolExecution initializes this state before execution; HTML's independent call pass arrives already complete.
+          if (state && (interactiveCallStates.has(state) || ownData(context, "argsComplete") !== true ||
+            ownData(context, "executionStarted") !== true)) interactiveCallStates.add(state);
+          const partialCall = ownData(context, "isPartial") === true;
+          const htmlStatic = partialCall && state !== undefined && !interactiveCallStates.has(state);
+          if (state) {
+            if (htmlStatic) htmlCallStates.add(state);
+            else htmlCallStates.delete(state);
+          }
+          const invocation = routineInvocation(toolName, args);
+          if (htmlStatic || !state || !invocation) return { render: () => [] };
+          let lifecycle = routineLifecycles.get(state);
+          if (!lifecycle) {
+            lifecycle = { reveal: false };
+            routineLifecycles.set(state, lifecycle);
+          }
+          lifecycle.invocation = invocation;
+          lifecycle.theme = theme;
+          lifecycle.call ??= {
+            render(width: number): string[] {
+              const activeInvocation = lifecycle?.success?.invocation ?? lifecycle?.invocation ?? invocation;
+              const lines = routineSummaryComponent(toolName, activeInvocation, lifecycle?.theme, lifecycle?.cue).render(width);
+              return lifecycle?.success && lifecycle.reveal && lifecycle.success.retainedText.length > 0 && lifecycle.cache
+                ? [...lines, ...retainedRoutineDetail(lifecycle.cache, lifecycle.theme, width)]
+                : lines;
+            },
+          };
+          return lifecycle.call;
+        }
         if (toolName !== "MultiEdit") return { render: () => [] };
         const snapshot = plainOwnData(args, ["file_path", "edits"]);
         const displayPath = snapshot
@@ -1309,17 +1482,48 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
               ? failOpenComponent(result, toolName, theme)
               : structuredRowComponent(row.literals, row.fields, theme, row.priorityEvidence);
           }
-          const invocation = toolName === "WebFetch" || toolName === "WebSearch"
+          const success = toolName === "WebFetch" || toolName === "WebSearch"
             ? recognizeWebSuccess(toolName, result, options, context)
             : recognizeActivationSuccess(toolName, result, options, context);
-          return invocation === undefined
-            ? failOpenComponent(
-                result,
-                toolName,
-                theme,
-                emptyInvocationReason(toolName, context),
-              )
-            : commandComponent(toolName, invocation, theme);
+          if (success === undefined) {
+            const state = liveEditState(context);
+            const lifecycle = state && routineLifecycles.get(state);
+            if (lifecycle) {
+              lifecycle.success = undefined;
+              lifecycle.cache = undefined;
+              lifecycle.reveal = false;
+              lifecycle.cue = undefined;
+            }
+            return failOpenComponent(
+              result,
+              toolName,
+              theme,
+              emptyInvocationReason(toolName, context),
+            );
+          }
+          const expansion = piToolsExpandKeyText();
+          const binding = expansion.available ? sanitizeText(expansion.value, true, 512) : "";
+          const state = liveEditState(context);
+          const html = state !== undefined && htmlCallStates.has(state);
+          const requestedExpanded = ownData(options, "expanded") === true;
+          const expanded = requestedExpanded || !expansion.available || !binding;
+          if (html) {
+            const cue = success.retainedText.length > 0 && !expanded ? "click to show detail" : undefined;
+            const previous = componentFrom(ownData(context, "lastComponent"));
+            return lazyRoutineSuccessComponent(toolName, success, expanded, theme, cue, previous);
+          }
+          const lifecycle = state && routineLifecycles.get(state);
+          if (lifecycle) {
+            lifecycle.success = success;
+            lifecycle.cache = routineDetailCache(success, lifecycle.cache);
+            lifecycle.reveal = expanded;
+            lifecycle.cue = success.retainedText.length > 0 && !expanded ? `${binding} to expand` : undefined;
+            lifecycle.theme = theme;
+            return { render: () => [] };
+          }
+          const cue = success.retainedText.length > 0 && !expanded ? `${binding} to expand` : undefined;
+          const previous = componentFrom(ownData(context, "lastComponent"));
+          return lazyRoutineSuccessComponent(toolName, success, expanded, theme, cue, previous);
         } catch {
           return failOpenComponent(result, toolName, theme);
         }

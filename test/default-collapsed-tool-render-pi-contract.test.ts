@@ -222,8 +222,8 @@ describe("real Pi default-collapse contracts", () => {
         row.updateResult(result, false);
         const settled = (row.render(100) as string[]).map(stripAnsi).join("\n");
         expect(settled).toContain("read continued.txt:1-1");
-        expect(settled).toContain("3 more lines");
-        expect(settled).toContain("next offset 2");
+        expect(settled).toContain("3 more lines · ctrl+o to expand");
+        expect(settled).not.toContain("next offset");
         expect(glyphs(settled)).toEqual(["●"]);
         row.setExpanded(true);
         const expanded = (row.render(100) as string[]).map(stripAnsi).join("\n");
@@ -315,6 +315,41 @@ describe("real Pi default-collapse contracts", () => {
         row.setExpanded(false);
         expect(glyphs((row.render(100) as string[]).join("\n"))).toEqual(["●"]);
       } finally { vi.useRealTimers(); }
+    });
+  });
+
+  it("keeps exact stock Bash truncation and recovery detail behind the configured expansion", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    withBinding(["alt+e"], () => {
+      const row = new sdk.ToolExecutionComponent(
+        "bash", "bash-truncated", { command: "printf retained", timeout: 4 }, {},
+        wrapForSelfShell(withDefaultCollapsedToolRendering(sdk.createBashToolDefinition(process.cwd()))),
+        { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+      );
+      row.setArgsComplete();
+      row.markExecutionStarted();
+      row.render(100);
+      const body = "TRUNCATED BODY SECRET";
+      const fullOutputPath = "/private/recovery/bash-output.txt";
+      row.updateResult({ content: [{ type: "text", text: body }], details: {
+        truncation: {
+          content: body, truncated: true, truncatedBy: "bytes", totalLines: 100, totalBytes: 100_000,
+          outputLines: 20, outputBytes: 50_000, lastLinePartial: false, firstLineExceedsLimit: false,
+          maxLines: 2_000, maxBytes: 50_000,
+        },
+        fullOutputPath,
+      } }, false);
+      const collapsed = (row.render(100) as string[]).map(stripAnsi).join("\n");
+      expect(collapsed).toContain("bash $ printf retained · output truncated · timeout 4s · alt+e to expand");
+      expect(collapsed).not.toContain(body);
+      expect(collapsed).not.toContain(fullOutputPath);
+      row.setExpanded(true);
+      const expanded = (row.render(100) as string[]).map(stripAnsi).join("\n");
+      expect(expanded).toContain(body);
+      expect(expanded).toContain(fullOutputPath);
+      row.setExpanded(false);
+      expect((row.render(100) as string[]).map(stripAnsi).join("\n")).toBe(collapsed);
     });
   });
 

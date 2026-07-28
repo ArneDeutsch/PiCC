@@ -177,8 +177,7 @@ describe("subagent lifecycle glyph ownership", () => {
 
     const poll = renderLifecycle("TaskOutput", result({ taskId: "task-7", status: "running", lastActivity: "reading" }));
     expectSingleMarker(poll, "○");
-    expect(poll.join("\n")).toContain("task output task-7");
-    expect(poll.join("\n")).toContain("running");
+    expect(poll.join("\n")).toContain("task output task-7 - reviewer [running]");
   });
 
   it("fails open for every malformed, partial, foreground, or error acceptance shape", () => {
@@ -414,14 +413,54 @@ describe("lifecycle control result discriminators", () => {
     const steerLines = renderSendMessageResult(steer, theme, steerContext).render(80).map(stripAnsi);
     const resumeLines = renderSendMessageResult(resume, theme, resumeContext).render(80).map(stripAnsi);
     expect(steerLines).toHaveLength(1);
-    expect(steerLines[0]).toContain("reviewer");
+    expect(steerLines[0]).toContain("send message reviewer");
+    expect(steerLines[0]!.match(/reviewer/gu)).toHaveLength(1);
+    expect(steerLines[0]).toContain("agent-aabbccddeeff");
     expect(steerLines[0]).toContain("delivered");
     expect(resumeLines).toHaveLength(1);
-    expect(resumeLines[0]).toContain("agent-aabbccddeeff");
+    expect(resumeLines[0]).toContain("send message reviewer");
+    expect(resumeLines[0]!.match(/reviewer/gu)).toHaveLength(1);
+    expect(resumeLines[0]!.match(/agent-aabbccddeeff/gu)).toHaveLength(1);
     expect(resumeLines[0]).toContain("resume");
     expect(resumeLines[0]).toContain("⚠ waiting");
+
+    const commonSteer = renderSendMessageResult(steer, theme, steerContext).render(40).map(stripAnsi).join("");
+    expect(commonSteer).toContain("reviewer · delivered");
+    expect(commonSteer).not.toContain("agent-aabbccddeeff");
+    const narrowWaiting = renderSendMessageResult(resume, theme, resumeContext).render(44).map(stripAnsi).join("");
+    expect(narrowWaiting).toContain("reviewer · ⚠ waiting · resume");
+    expect(narrowWaiting).not.toMatch(/agent-aabbccddeeff|task-7/u);
+    const admitted = structuredClone(resume);
+    admitted.details.admission = "admitted";
+    const commonAdmitted = renderSendMessageResult(admitted, theme, resumeContext).render(44).map(stripAnsi).join("");
+    expect(commonAdmitted).toContain("reviewer · resume · admitted");
+    expect(commonAdmitted).not.toMatch(/agent-aabbccddeeff|task-7/u);
+
     expect([...steerLines, ...resumeLines].join("\n")).not.toMatch(/MESSAGE-PREVIEW|SECOND-MESSAGE/u);
     expect([steer, resume]).toEqual(before);
+  });
+
+  it("keeps hostile resolved identities as one bounded primary field", () => {
+    const ESC = String.fromCharCode(27);
+    const agent = `reviewer · delivered\nforged state${ESC}[31m`;
+    const agentId = "agent-aabbccddeeff";
+    const context: SubagentLifecycleRenderContext = { state: {}, args: { to: agent, message: "BODY-SENTINEL" }, isError: false };
+    renderSendMessageCall(context.args as Record<string, unknown>, theme, context);
+    const value = {
+      content: [{ type: "text", text: `Message delivered to running agent ${agentId} ("${agent}") as a mid-task course correction.` }],
+      details: { agentId, agent, delivery: "steer" },
+    };
+    const canonical = structuredClone(value);
+    const calls: Array<{ slot: string; text: string }> = [];
+    const spyTheme = { fg(slot: string, text: string) { calls.push({ slot, text }); return text; } };
+    const lines = renderSendMessageResult(value, spyTheme, context).render(120);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("send message reviewer · delivered forged state · delivered · agent-aabbccddeeff");
+    expect(calls).toContainEqual({ slot: "accent", text: "reviewer · delivered forged state" });
+    expect(calls.some(({ slot, text }) => slot === "muted" && text.includes("forged state"))).toBe(false);
+    expect(lines[0]).not.toContain("BODY-SENTINEL");
+    expect(lines[0]).not.toContain(ESC);
+    expect(value).toEqual(canonical);
   });
 
   it("fails open for incoherent or unfamiliar SendMessage results with recipient and result evidence", () => {
@@ -699,16 +738,12 @@ describe("lifecycle control result discriminators", () => {
         content: [{ type: "text", text: `Task(task-123) · Agent(${to}) · ${agentId} — resume accepted in background with prior context; it will run when configured concurrency capacity is available. Retrieve it with TaskOutput (task_id "task-123").` }],
         details: { agentId, agent: to, taskId: "task-123", admission: scenario.admission, delivery: "resume", resumed: true },
       };
-      for (const width of [18, 24, 32, 40, 48, 72]) {
+      for (const width of [18, 24, 32, 40, 48, 72, 140]) {
         const rendered = renderSendMessageResult(value, theme, context).render(width);
         const text = rendered.map(stripAnsi).join("");
-        if (width >= 18) {
-          expect(text).toContain("ver");
-          expect(text).toContain("task-123");
-        }
-        if (width >= 24) expect(text).toContain("resume");
-        if (scenario.admission === "waiting" && width >= 32) expect(text).toContain("⚠");
-        if (width >= 40) for (const required of scenario.required) expect(text).toContain(required);
+        if (scenario.admission === "admitted" && width >= 18) expect(text).toContain("ver");
+        if (scenario.admission === "waiting" && width >= 24) expect(text).toContain("⚠ waiting");
+        if (width >= 140) for (const required of scenario.required) expect(text).toContain(required);
         expect(rendered).toHaveLength(1);
         expect(visibleWidth(text)).toBeLessThanOrEqual(width);
       }
@@ -723,15 +758,13 @@ describe("lifecycle control result discriminators", () => {
       content: [{ type: "text", text: `Message delivered to running agent agent-aaaaaaaaaaaa ("${to}") as a mid-task course correction.` }],
       details: { agentId: "agent-aaaaaaaaaaaa", agent: to, delivery: "steer" },
     };
-    for (const width of [12, 18, 24, 36, 40, 48, 64, 100]) {
+    for (const width of [12, 18, 24, 36, 40, 48, 64, 100, 140]) {
       const rendered = renderSendMessageResult(value, theme, context).render(width);
       const text = rendered.map(stripAnsi).join("");
-      expect(text).toContain("ver");
+      if (width >= 18) expect(text).toContain("ver");
       if (width === 12) expect(text).not.toContain("delivered");
-      if (width >= 40) {
-        expect(text).toContain("very-");
-        expect(text).toContain("delivered");
-      }
+      if (width >= 40) expect(text).toContain("very-");
+      if (width >= 140) expect(text).toContain("delivered");
       expect(rendered).toHaveLength(1);
       expect(visibleWidth(text)).toBeLessThanOrEqual(width);
     }
@@ -802,6 +835,8 @@ describe("lifecycle control result discriminators", () => {
     }, spyTheme, context).render(100);
     expect(calls.some(({ slot, text }) => slot === "accent" && text.includes("Review lifecycle"))).toBe(true);
     for (const target of ["task-7", "task-8", "task-result-10", "reviewer"]) expect(calls.some(({ slot, text }) => slot === "accent" && text.includes(target))).toBe(true);
+    expect(calls.some(({ slot, text }) => slot === "text" && text === "send message")).toBe(true);
+    expect(calls.some(({ slot, text }) => slot === "muted" && text === "agent-aabbccddeeff")).toBe(true);
     expect(calls.some(({ slot, text }) => slot === "muted" && /awaiting|resume|task-9/u.test(text))).toBe(true);
     expect(calls.some(({ slot, text }) => slot === "warning" && text.includes("waiting"))).toBe(true);
     expect(calls.filter(({ slot }) => slot === "warning").every(({ text }) => /waiting|⚠/u.test(text))).toBe(true);

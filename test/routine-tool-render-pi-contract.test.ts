@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createRequire } from "node:module";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +7,13 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { waitUntil } from "./helpers/async.js";
 import { withRoutineToolRendering } from "../src/runtime/routine-tool-render.js";
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
+
+const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+const piTui = piRequire("@earendil-works/pi-tui") as any;
+const bindingDefinitions = {
+  ...piTui.TUI_KEYBINDINGS,
+  "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+};
 
 const cases = [
   {
@@ -254,19 +262,20 @@ describe("real Pi routine rendering composition", () => {
     }
   });
 
-  it.each(cases)("gives settled $name exactly one interactive content row in collapsed and expanded modes", async (entry) => {
+  it.each(cases)("drives settled $name through collapsed, expanded, and recollapsed interactive modes", async (entry) => {
     const sdk = await import("@earendil-works/pi-coding-agent") as any;
     sdk.initTheme();
-    const build = (payload: unknown, partial = false) => {
-      const component = new sdk.ToolExecutionComponent(
-        entry.name,
-        `${entry.name}-contract`,
-        entry.args,
-        {},
-        definition(entry.name),
-        { requestRender() {} },
-        process.cwd().replace(/\\/g, "/"),
-      );
+    const build = () => new sdk.ToolExecutionComponent(
+      entry.name,
+      `${entry.name}-contract`,
+      entry.args,
+      {},
+      definition(entry.name),
+      { requestRender() {} },
+      process.cwd().replace(/\\/g, "/"),
+    );
+    const settle = (payload: unknown, partial = false) => {
+      const component = build();
       component.updateResult(payload, partial);
       return component;
     };
@@ -276,21 +285,73 @@ describe("real Pi routine rendering composition", () => {
       for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(100);
       return lines;
     };
+    const glyphs = (lines: string[]): string[] =>
+      lines.join("\n").replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "").match(/[○●✗■]/gu) ?? [];
 
-    for (const expanded of [false, true]) {
-      const lines = paint(build(entry.ordinary), expanded);
-      expect(lines).toHaveLength(2);
-      expect(lines[0]).toBe("");
-      expect(lines[1]).toContain(entry.invocation);
-      expect(lines.join("\n")).not.toContain(entry.hidden);
-    }
+    const component = build();
+    component.setArgsComplete();
+    const pendingLines = paint(component, false);
+    const pending = pendingLines.join("\n");
+    expect(glyphs(pendingLines)).toEqual(["○"]);
+    expect(pending).toContain(entry.invocation);
+    expect(pending).not.toContain(entry.hidden);
+    expect(pending).not.toMatch(/to expand|click to show detail/u);
 
-    const partial = paint(build(entry.ordinary, true), false).join("\n");
+    component.updateResult(entry.ordinary, false);
+    const collapsed = paint(component, false);
+    expect(collapsed).toHaveLength(2);
+    expect(collapsed[0]).toBe("");
+    expect(collapsed[1]).toContain(entry.invocation);
+    expect(glyphs(collapsed)).toEqual(["●"]);
+    expect(collapsed.join("\n")).toContain("ctrl+o to expand");
+    expect(collapsed.join("\n")).not.toContain(entry.hidden);
+    const expanded = paint(component, true);
+    expect(expanded[1]).toContain(entry.invocation);
+    expect(expanded.join("\n")).toContain(entry.hidden);
+    expect(glyphs(expanded)).toEqual(["●"]);
+    const recollapsed = paint(component, false);
+    expect(recollapsed.join("\n")).not.toContain(entry.hidden);
+    expect(glyphs(recollapsed)).toEqual(["●"]);
+
+    const partial = paint(settle(entry.ordinary, true), false).join("\n");
     expect(partial).toContain(entry.hidden);
-    const failure = paint(build({ content: [{ type: "text", text: `${entry.name} visible failure` }], isError: true }), false).join("\n");
+    const failure = paint(settle({ content: [{ type: "text", text: `${entry.name} visible failure` }], isError: true }), false).join("\n");
     expect(failure).toContain(`${entry.name} visible failure`);
-    const malformed = paint(build({ content: [{ type: "text", text: `${entry.name} unfamiliar result` }], details: { future: true }, isError: false }), false).join("\n");
+    const malformed = paint(settle({ content: [{ type: "text", text: `${entry.name} unfamiliar result` }], details: { future: true }, isError: false }), false).join("\n");
     expect(malformed).toContain(`${entry.name} unfamiliar result`);
+  });
+
+  it("honors a remapped interactive binding and fails open through Pi when expansion is unbound", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    const previous = piTui.getKeybindings();
+    const build = () => {
+      const entry = cases[0]!;
+      const component = new sdk.ToolExecutionComponent(
+        entry.name,
+        "routine-binding-contract",
+        entry.args,
+        {},
+        definition(entry.name),
+        { requestRender() {} },
+        process.cwd().replace(/\\/g, "/"),
+      );
+      component.updateResult(entry.ordinary, false);
+      return { component, entry };
+    };
+    try {
+      piTui.setKeybindings(new piTui.KeybindingsManager(bindingDefinitions, { "app.tools.expand": ["alt+e"] }));
+      const remapped = build();
+      const collapsed = remapped.component.render(100).join("\n");
+      expect(collapsed).toContain("alt+e to expand");
+      expect(collapsed).not.toContain(remapped.entry.hidden);
+
+      piTui.setKeybindings(new piTui.KeybindingsManager(bindingDefinitions, { "app.tools.expand": [] }));
+      const unbound = build();
+      expect(unbound.component.render(100).join("\n")).toContain(unbound.entry.hidden);
+    } finally {
+      piTui.setKeybindings(previous);
+    }
   });
 
   it.each(cases.filter((entry) => entry.name === "Skill" || entry.name === "SlashCommand"))("keeps mismatched $name activation identity visible in the interactive TUI", async (entry) => {
@@ -327,8 +388,9 @@ describe("real Pi routine rendering composition", () => {
     const htmlModule = await import(`${piDist}/dist/core/export-html/tool-renderer.js`) as any;
     const exportModule = await import(`${piDist}/dist/core/export-html/index.js`) as any;
     const themeModule = await import(`${piDist}/dist/modes/interactive/theme/theme.js`) as any;
+    const installedDefinition = definition(entry.name);
     const renderer = htmlModule.createToolHtmlRenderer({
-      getToolDefinition: (name: string) => name === entry.name ? definition(entry.name) : undefined,
+      getToolDefinition: (name: string) => name === entry.name ? installedDefinition : undefined,
       theme: themeOverride ?? themeModule.theme,
       cwd: process.cwd(),
       width: 80,
@@ -336,7 +398,7 @@ describe("real Pi routine rendering composition", () => {
     return { sdk, exportModule, renderer };
   }
 
-  it.each(cases)("keeps ordinary $name HTML result compact while malformed/error results remain visible", async (entry) => {
+  it.each(cases)("keeps ordinary $name HTML phases escaped, expandable, and meaningfully different", async (entry) => {
     const { renderer } = await htmlHarness(entry);
     const id = `html-${entry.name}`;
     renderer.renderCall(id, entry.name, entry.args);
@@ -347,9 +409,13 @@ describe("real Pi routine rendering composition", () => {
       entry.ordinary.details,
       false,
     );
+    expect(rendered?.collapsed).toContain(entry.invocation);
+    expect(rendered?.collapsed).toContain("click to show detail");
+    expect(rendered?.collapsed).not.toContain("ctrl+o");
+    expect(rendered?.collapsed).not.toContain(entry.hidden);
     expect(rendered?.expanded).toContain(entry.invocation);
-    expect(rendered?.expanded).not.toContain(entry.hidden);
-    expect(rendered?.collapsed).toBeUndefined();
+    expect(rendered?.expanded).toContain(entry.hidden);
+    expect(rendered?.expanded).not.toContain("click to show detail");
 
     for (const [suffix, text, details, isError] of [
       ["error", `${entry.name} HTML failure`, undefined, true],
@@ -368,6 +434,44 @@ describe("real Pi routine rendering composition", () => {
     }
   });
 
+  it("coalesces an empty WebFetch body to one safe HTML summary without a false cue", async () => {
+    const entry = cases[0]!;
+    const { renderer } = await htmlHarness(entry);
+    const id = "html-empty-WebFetch";
+    const url = "https://example.test/?a=1&b=<empty>";
+    renderer.renderCall(id, entry.name, { url });
+    const rendered = renderer.renderResult(
+      id,
+      entry.name,
+      [{ type: "text", text: "" }],
+      { ...entry.ordinary.details, url, finalUrl: url },
+      false,
+    );
+    expect(rendered?.collapsed).toBeUndefined();
+    expect(rendered?.expanded).toContain("&amp;");
+    expect(rendered?.expanded).toContain("&lt;empty&gt;");
+    expect(rendered?.expanded).not.toContain("<empty>");
+    expect(rendered?.expanded).not.toMatch(/to expand|click to show detail/u);
+  });
+
+  it("escapes hostile retained text in the expanded WebFetch HTML fragment", async () => {
+    const entry = cases[0]!;
+    const { renderer } = await htmlHarness(entry);
+    const id = "html-hostile-WebFetch";
+    renderer.renderCall(id, entry.name, entry.args);
+    const rendered = renderer.renderResult(
+      id,
+      entry.name,
+      [{ type: "text", text: "BEGIN <script>alert('&')</script> END" }],
+      entry.ordinary.details,
+      false,
+    );
+    expect(rendered?.collapsed).not.toContain("<script>");
+    expect(rendered?.expanded).toContain("&lt;script&gt;");
+    expect(rendered?.expanded).toContain("&amp;");
+    expect(rendered?.expanded).not.toContain("<script>");
+  });
+
   it.each(cases.filter((entry) => entry.name === "Skill" || entry.name === "SlashCommand"))("keeps mismatched $name activation identity visible in HTML", async (entry) => {
     const { renderer } = await htmlHarness(entry);
     const id = `html-mismatch-${entry.name}`;
@@ -384,7 +488,7 @@ describe("real Pi routine rendering composition", () => {
     expect(rendered?.expanded).not.toContain(entry.invocation);
   });
 
-  it.each(cases.filter((entry) => entry.name === "Skill" || entry.name === "SlashCommand"))("does not expose ordinary $name bodies when HTML renderer styling degrades", async (entry) => {
+  it.each(cases.filter((entry) => entry.name === "Skill" || entry.name === "SlashCommand"))("keeps ordinary $name HTML bodies accessible when renderer styling degrades", async (entry) => {
     const hostileTheme = {
       bg: (_slot: string, text: string) => text,
       fg() { throw new Error("foreground unavailable"); },
@@ -400,8 +504,9 @@ describe("real Pi routine rendering composition", () => {
       entry.ordinary.details,
       false,
     );
+    expect(rendered?.collapsed).toContain("click to show detail");
     expect(rendered?.expanded).toContain(entry.invocation);
-    expect(rendered?.expanded).not.toContain(entry.hidden);
+    expect(rendered?.expanded).toContain(entry.hidden);
   });
 
   it("composes worktree structured rows with Pi's real HTML renderer and keeps exceptional text visible", async () => {
@@ -583,7 +688,7 @@ describe("real Pi routine rendering composition", () => {
     expect(details.diff).toBe("-1 old\n+1 new");
   });
 
-  it.each(cases)("retains canonical $name session content but excludes it from complete rendered HTML", async (entry) => {
+  it.each(cases)("retains canonical $name session content and exposes it only in expanded rendered HTML", async (entry) => {
     const { sdk, exportModule, renderer } = await htmlHarness(entry);
     const directory = mkdtempSync(join(tmpdir(), "picc-routine-export-"));
     const outputPath = join(directory, `${entry.name}.html`);
@@ -617,9 +722,10 @@ describe("real Pi routine rendering composition", () => {
       const rendered = data.renderedTools?.[toolCallId];
 
       expect(JSON.stringify(canonical?.message?.content)).toContain(entry.hidden);
+      expect(rendered?.resultHtmlCollapsed).toContain("click to show detail");
+      expect(rendered?.resultHtmlCollapsed).not.toContain(entry.hidden);
       expect(rendered?.resultHtmlExpanded).toContain(entry.invocation);
-      expect(rendered?.resultHtmlExpanded).not.toContain(entry.hidden);
-      expect(rendered?.resultHtmlCollapsed).toBeUndefined();
+      expect(rendered?.resultHtmlExpanded).toContain(entry.hidden);
       expect(html).not.toContain(entry.hidden);
     } finally {
       rmSync(directory, { recursive: true, force: true });

@@ -1,9 +1,25 @@
 import path from "node:path";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { themedFg } from "./render-util.js";
+import { sanitizeDisplayText, themedFg } from "./render-util.js";
 
 export interface DisplayComponent { render(width: number): string[] }
 export type DisplayRootResolver = () => unknown;
+
+export type SemanticDisplayTone = "text" | "muted" | "success" | "warning" | "error";
+
+export interface SemanticDisplaySegment {
+  readonly text: string;
+  readonly tone: SemanticDisplayTone;
+}
+
+export interface SemanticDisplayRowOptions {
+  readonly action: string;
+  readonly primary?: string;
+  readonly required?: readonly SemanticDisplaySegment[];
+  readonly optional?: readonly string[];
+  readonly cue?: string;
+  readonly compactCue?: string;
+}
 
 export interface DisplayRoots {
   readonly workspace?: string;
@@ -225,6 +241,126 @@ function clamp(line: string, width: number): string {
 
 function truncatePlain(value: string, width: number): string {
   return truncateToWidth(value, width, "…").replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
+}
+
+const SEMANTIC_SCALAR_LIMIT = 2_048;
+const SEMANTIC_SEGMENT_LIMIT = 16;
+const SEMANTIC_SECOND_LINE_MIN_WIDTH = 8;
+const SEMANTIC_SEPARATOR = " · ";
+const SEMANTIC_TONES: ReadonlySet<string> = new Set(["text", "muted", "success", "warning", "error"]);
+
+interface SemanticSnapshotSegment {
+  readonly text: string;
+  readonly tone: SemanticDisplayTone;
+}
+
+function semanticScalar(value: unknown): string {
+  return typeof value === "string" ? sanitizeDisplayText(value, SEMANTIC_SCALAR_LIMIT, true) : "";
+}
+
+function property(value: unknown, key: PropertyKey): unknown {
+  try { return Reflect.get(value as object, key); }
+  catch { return undefined; }
+}
+
+function semanticArray(value: unknown, limit: number): unknown[] {
+  if (!Array.isArray(value)) return [];
+  const values: unknown[] = [];
+  let length = 0;
+  try { length = Math.min(Math.max(0, value.length), limit); }
+  catch { return values; }
+  for (let index = 0; index < length; index++) values.push(property(value, index));
+  return values;
+}
+
+function semanticTone(value: unknown): SemanticDisplayTone {
+  return typeof value === "string" && SEMANTIC_TONES.has(value) ? value as SemanticDisplayTone : "text";
+}
+
+function plainSemanticLine(
+  action: string,
+  primary: string,
+  required: readonly SemanticSnapshotSegment[],
+  optional: readonly string[],
+  cue: string,
+): string {
+  let line = action;
+  if (primary) line += `${action ? " " : ""}${primary}`;
+  for (const segment of required) if (segment.text) line += `${line ? SEMANTIC_SEPARATOR : ""}${segment.text}`;
+  for (const segment of optional) if (segment) line += `${line ? SEMANTIC_SEPARATOR : ""}${segment}`;
+  if (cue) line += `${line ? SEMANTIC_SEPARATOR : ""}${cue}`;
+  return line;
+}
+
+function styledSemanticLine(
+  theme: unknown,
+  action: string,
+  primary: string,
+  required: readonly SemanticSnapshotSegment[],
+  optional: readonly string[],
+  cue: string,
+): string {
+  let line = action ? themedFg(theme, "text", action) : "";
+  if (primary) line += `${action ? " " : ""}${themedFg(theme, "accent", primary)}`;
+  const append = (text: string, tone: SemanticDisplayTone): void => {
+    if (line) line += themedFg(theme, "muted", SEMANTIC_SEPARATOR);
+    line += themedFg(theme, tone, text);
+  };
+  for (const segment of required) if (segment.text) append(segment.text, segment.tone);
+  for (const segment of optional) if (segment) append(segment, "muted");
+  if (cue) append(cue, "muted");
+  return line;
+}
+
+/** Build a bounded, sanitized overview row with stable semantic color and width priorities. */
+export function semanticDisplayRow(options: SemanticDisplayRowOptions, theme: unknown): DisplayComponent {
+  const action = semanticScalar(property(options, "action"));
+  const primary = semanticScalar(property(options, "primary"));
+  const requiredValues = semanticArray(property(options, "required"), SEMANTIC_SEGMENT_LIMIT);
+  const required = Object.freeze(requiredValues.map((segment) => Object.freeze({
+    text: semanticScalar(property(segment, "text")),
+    tone: semanticTone(property(segment, "tone")),
+  })));
+  const optionalLimit = Math.max(0, SEMANTIC_SEGMENT_LIMIT - required.length);
+  const optional = Object.freeze(semanticArray(property(options, "optional"), optionalLimit)
+    .map(semanticScalar).filter(Boolean));
+  const cue = semanticScalar(property(options, "cue"));
+  const compactCue = semanticScalar(property(options, "compactCue"));
+
+  return { render(width: number): string[] {
+    if (!Number.isFinite(width) || width <= 0) return [""];
+    const columns = Math.floor(width);
+    if (columns <= 0) return [""];
+    try {
+      const extras = [...optional];
+      const full = () => plainSemanticLine(action, primary, required, extras, cue);
+      while (extras.length > 0 && visibleWidth(full()) > columns) extras.pop();
+
+      const fixedInline = plainSemanticLine(action, "", required, extras, cue);
+      if (visibleWidth(fixedInline) <= columns) {
+        const separatorWidth = primary && action ? 1 : 0;
+        const allowance = Math.max(0, columns - visibleWidth(fixedInline) - separatorWidth);
+        const fittedPrimary = visibleWidth(primary) > allowance ? truncatePlain(primary, allowance) : primary;
+        return [clamp(styledSemanticLine(theme, action, fittedPrimary, required, extras, cue), columns)];
+      }
+
+      let secondLineCue = "";
+      if (cue && columns >= SEMANTIC_SECOND_LINE_MIN_WIDTH) {
+        if (visibleWidth(cue) <= columns) secondLineCue = cue;
+        else if (compactCue && visibleWidth(compactCue) <= columns) secondLineCue = compactCue;
+      }
+      const fixedFirst = plainSemanticLine(action, "", required, [], "");
+      const separatorWidth = primary && action ? 1 : 0;
+      const allowance = Math.max(0, columns - visibleWidth(fixedFirst) - separatorWidth);
+      const fittedPrimary = visibleWidth(primary) > allowance ? truncatePlain(primary, allowance) : primary;
+      const first = clamp(styledSemanticLine(theme, action, fittedPrimary, required, [], ""), columns);
+      return secondLineCue
+        ? [first, clamp(themedFg(theme, "muted", secondLineCue), columns)]
+        : [first];
+    } catch {
+      return [clamp(plainSemanticLine(action, primary, required, optional, cue), columns)];
+    }
+  } };
 }
 
 /** Fit one emphasized elastic field around pinned recovery evidence and optional metadata. */

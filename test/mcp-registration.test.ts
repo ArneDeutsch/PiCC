@@ -223,30 +223,40 @@ describe("MCP main-session tool exposure (wired)", () => {
     const echo = pi.tools.get("mcp__fixture__echo");
     expect(echo.description).toBe("echoes text back");
     expect(echo.label).toBe("echo (fixture MCP)");
-    const rendered = (echo.renderCall as Function)({}, undefined, { state: {}, isPartial: true })
+    const slots: string[] = [];
+    const theme = { fg(slot: string, text: string) { slots.push(slot); return text; } };
+    const rendered = (echo.renderCall as Function)({}, theme, { state: {}, isPartial: true })
       .render(120)
-      .join("\n")
-      .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
-    expect(rendered).toContain("echo (fixture MCP)");
+      .join("\n");
+    expect(rendered).toBe("○ mcp echo · server fixture");
+    expect(slots).toEqual(expect.arrayContaining(["text", "accent", "muted"]));
     expect(rendered).not.toContain("mcp__fixture__echo");
   });
 
   it("keeps path-shaped arguments out of an actually registered inert proxy presentation", () => {
     const tool = pi.tools.get("mcp__fixture__echo");
     const pathArgument = path.join(dir, "nested", "secret.txt");
-    const context = { state: {}, args: { path: pathArgument }, cwd: dir, isError: false, isPartial: false };
-    const call = tool.renderCall(context.args, undefined, context).render(100).join("\n");
-    const result = tool.renderResult(
-      { content: [{ type: "text", text: "inert proxy evidence" }] },
-      { expanded: false, isPartial: false },
-      undefined,
-      context,
+    const context = { state: {}, args: { path: pathArgument }, cwd: dir, isError: false, isPartial: true };
+    tool.renderCall(context.args, undefined, context);
+    context.isPartial = false;
+    const callComponent = tool.renderCall(context.args, undefined, context);
+    const canonical = {
+      content: [{ type: "text", text: "inert proxy evidence" }],
+      details: { server: "fixture", tool: "echo" }, isError: false,
+    };
+    const collapsedResult = tool.renderResult(
+      canonical, { expanded: false, isPartial: false }, undefined, context,
     ).render(100).join("\n");
-    expect(call).toContain("echo (fixture MCP)");
+    const call = callComponent.render(100).join("\n");
+    expect(call).toContain("mcp echo · server fixture");
+    expect(call).toContain("ctrl+o to expand");
     expect(call).not.toContain("mcp__fixture__echo");
     expect(call).not.toContain(pathArgument);
     expect(call).not.toContain("nested/secret.txt");
-    expect(result).toContain("inert proxy evidence");
+    expect(call).not.toContain("inert proxy evidence");
+    expect(collapsedResult).not.toContain("inert proxy evidence");
+    tool.renderResult(canonical, { expanded: true, isPartial: false }, undefined, context);
+    expect(callComponent.render(100).join("\n")).toContain("inert proxy evidence");
   });
 
   it("round-trips a real tool call through the registered proxy", async () => {

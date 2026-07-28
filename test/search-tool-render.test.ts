@@ -324,7 +324,8 @@ describe("compact search rendering decorator", () => {
       expect(narrowLine).toContain(entry.primary);
       expect(narrowLine).not.toContain("limit 5");
       expect(calls.some((call) => call.slot === "accent" && call.text.includes(entry.primary))).toBe(true);
-      expect((tool as unknown as { renderResult: unknown }).renderResult).toBe(nativeResult);
+      expect((tool as unknown as { renderResult: unknown }).renderResult).not.toBe(nativeResult);
+      expect(typeof (tool as unknown as { renderResult: unknown }).renderResult).toBe("function");
       expect((tool as unknown as { execute: unknown }).execute).toBe(execute);
       expect(ctx.args).toBe(frozenArgs);
     }
@@ -1463,4 +1464,348 @@ describe("compact search rendering decorator", () => {
     expect(rendered.result.join(" ")).not.toContain("ordinary");
   });
 
+});
+
+describe("lowercase stock search result lifecycle", () => {
+  const families = [
+    { name: "grep", args: { pattern: "needle", path: "src" }, empty: "No matches found", limitKey: "matchLimitReached", limit: 100 },
+    { name: "find", args: { pattern: "**/*.ts", path: "src" }, empty: "No files found matching pattern", limitKey: "resultLimitReached", limit: 1000 },
+    { name: "ls", args: { path: "src" }, empty: "(empty directory)", limitKey: "entryLimitReached", limit: 500 },
+  ] as const;
+  const stockResult = (text: string, details: unknown = undefined) => ({ content: [{ type: "text", text }], details });
+  const truncation = (truncatedBy: "lines" | "bytes" = "bytes") => truncatedBy === "lines"
+    ? ({ content: "TRUNCATION-CONTENT", truncated: true, truncatedBy, totalLines: 8,
+        totalBytes: 80_000, outputLines: 3, outputBytes: 30_000, lastLinePartial: false,
+        firstLineExceedsLimit: false, maxLines: 3, maxBytes: 51_200 })
+    : ({ content: "TRUNCATION-CONTENT", truncated: true, truncatedBy, totalLines: 4,
+        totalBytes: 80_000, outputLines: 2, outputBytes: 40_000, lastLinePartial: false,
+        firstLineExceedsLimit: false, maxLines: Number.MAX_SAFE_INTEGER, maxBytes: 51_200 });
+  function stock(entry: (typeof families)[number], native = vi.fn((_result, _options, _theme, ctx: any) =>
+    ctx.lastComponent ?? { render: () => ["NATIVE-DETAIL"] })) {
+    const source = { name: entry.name, execute() {}, renderCall: () => ({ render: () => ["native call"] }), renderResult: native };
+    return { tool: withCompactSearchRendering(source as never) as unknown as RenderTool, native };
+  }
+  const stockContext = (args: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    ({ args, state: {}, isError: false, isPartial: false, expanded: false, cwd: "/repo", ...extra }) as RenderContext;
+
+  it("collapses, expands through row-local native identity, recollapses, and keeps exact empty outcomes cue-free", () => {
+    for (const entry of families) {
+      const { tool, native } = stock(entry);
+      const args = { ...entry.args };
+      const ctx = stockContext(args);
+      const call = tool.renderCall(args, undefined, ctx);
+      const canonical = stockResult("STOCK-RETAINED-BODY");
+      const before = structuredClone(canonical);
+      expect(tool.renderResult(canonical, { expanded: false, isPartial: false }, undefined, ctx).render(120)).toEqual([]);
+      expect(call.render(120).join(" ")).toContain("ctrl+o to expand");
+      expect(call.render(120).join(" ")).not.toContain("STOCK-RETAINED-BODY");
+      expect(native).not.toHaveBeenCalled();
+      expect(tool.renderResult(canonical, { expanded: true, isPartial: false }, undefined, ctx).render(120)).toEqual(["NATIVE-DETAIL"]);
+      const firstNative = native.mock.results[0]!.value;
+      tool.renderResult(canonical, { expanded: true, isPartial: false }, undefined, ctx).render(120);
+      expect((native.mock.calls[1]![3] as any).lastComponent).toBe(firstNative);
+      expect(tool.renderResult(canonical, { expanded: false, isPartial: false }, undefined, ctx).render(120)).toEqual([]);
+      expect(canonical).toEqual(before);
+      tool.renderResult(stockResult(entry.empty), { expanded: false, isPartial: false }, undefined, ctx);
+      expect(call.render(120).join(" ")).toContain(entry.empty);
+      expect(call.render(120).join(" ")).not.toContain("to expand");
+    }
+  });
+
+  it.each(families)("fails $name empty noncanonical text open without an expansion cue", (entry) => {
+    const { tool, native } = stock(entry);
+    const args = { ...entry.args };
+    const ctx = stockContext(args);
+    const call = tool.renderCall(args, undefined, ctx);
+
+    expect(tool.renderResult(stockResult(""), { expanded: false, isPartial: false }, undefined, ctx).render(120))
+      .toEqual(["NATIVE-DETAIL"]);
+    expect(native).toHaveBeenCalledTimes(1);
+    expect(call.render(120).join(" ")).not.toMatch(/to expand|click to show detail/u);
+  });
+
+  it("covers each family's limit-only, line/byte truncation-only, and combined warning envelopes", () => {
+    for (const entry of families) {
+      const args = entry.name === "grep" ? { ...entry.args, limit: 0 } : { ...entry.args, limit: 7 };
+      const expectedLimit = entry.name === "grep" ? 1 : 7;
+      const noun = entry.name === "grep" ? "matches" : entry.name === "find" ? "results" : "entries";
+      const cases = [
+        { details: { [entry.limitKey]: expectedLimit }, includes: [`${expectedLimit} ${noun} limit`], excludes: ["output truncated"] },
+        { details: { truncation: truncation("lines") }, includes: ["output truncated"], excludes: [`${expectedLimit} ${noun} limit`] },
+        { details: { truncation: truncation("bytes") }, includes: ["output truncated"], excludes: [`${expectedLimit} ${noun} limit`] },
+        { details: { [entry.limitKey]: expectedLimit, truncation: truncation(),
+            ...(entry.name === "grep" ? { linesTruncated: true } : {}) },
+          includes: [`${expectedLimit} ${noun} limit`, "output truncated"], excludes: [] },
+      ];
+      for (const testCase of cases) {
+        const { tool, native } = stock(entry);
+        const ctx = stockContext(args);
+        const call = tool.renderCall(args, undefined, ctx);
+        tool.renderResult(stockResult("LIMITED-BODY", testCase.details), { expanded: false, isPartial: false }, undefined, ctx);
+        const row = call.render(160).join(" ");
+        for (const text of testCase.includes) expect(row).toContain(text);
+        for (const text of testCase.excludes) expect(row).not.toContain(text);
+        if (entry.name === "grep" && "linesTruncated" in testCase.details) expect(row).toContain("long lines truncated");
+        expect(row).toContain("ctrl+o to expand");
+        expect(row).not.toMatch(/LIMITED-BODY|TRUNCATION-CONTENT/u);
+        expect(native).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it("keeps a linesTruncated-only grep result collapsed with only its long-lines warning", () => {
+    const entry = families[0];
+    const { tool, native } = stock(entry);
+    const args = { ...entry.args };
+    const ctx = stockContext(args);
+    const call = tool.renderCall(args, undefined, ctx);
+    const result = stockResult("LONG-LINE-DETAIL", { linesTruncated: true });
+
+    expect(tool.renderResult(result, { expanded: false, isPartial: false }, undefined, ctx).render(160)).toEqual([]);
+    const row = call.render(160).join(" ");
+    expect(row).toContain("long lines truncated");
+    expect(row).not.toMatch(/matches limit|output truncated|LONG-LINE-DETAIL/u);
+    expect(row).toContain("ctrl+o to expand");
+    expect(native).not.toHaveBeenCalled();
+    expect(tool.renderResult(result, { expanded: true, isPartial: false }, undefined, ctx).render(160))
+      .toEqual(["NATIVE-DETAIL"]);
+    expect(native).toHaveBeenCalledTimes(1);
+  });
+
+  it("classifies collapsed bodies and warnings through descriptors without reading retained text", () => {
+    for (const entry of families) {
+      const reads = { resultText: 0, truncationContent: 0, other: 0 };
+      const observed = <T extends object>(value: T, retainedKey?: PropertyKey): T => new Proxy(value, {
+        get(target, key, receiver) {
+          if (key === retainedKey) {
+            if (retainedKey === "text") reads.resultText += 1;
+            else reads.truncationContent += 1;
+          } else if (key !== Symbol.toStringTag) reads.other += 1;
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      const block = observed({ type: "text", text: "DESCRIPTOR-ONLY-BODY" }, "text");
+      const content = observed([block]);
+      const truncated = observed(truncation(), "content");
+      const envelope = observed({ content, details: { truncation: truncated } });
+      const { tool, native } = stock(entry);
+      const args = { ...entry.args };
+      const ctx = stockContext(args);
+      const call = tool.renderCall(args, undefined, ctx);
+      tool.renderResult(envelope, { expanded: false, isPartial: false }, undefined, ctx).render(120);
+      expect(reads).toEqual({ resultText: 0, truncationContent: 0, other: 0 });
+      expect(native).not.toHaveBeenCalled();
+      expect(call.render(120).join(" ")).not.toMatch(/DESCRIPTOR-ONLY-BODY|TRUNCATION-CONTENT/u);
+    }
+  });
+
+  it("fails open when present result-context args are malformed or differ from captured invocation args", () => {
+    for (const entry of families) {
+      const captured = { ...entry.args };
+      const { tool: absentTool, native: absentNative } = stock(entry);
+      const absentCtx = stockContext(captured);
+      const absentCall = absentTool.renderCall(captured, undefined, absentCtx);
+      delete (absentCtx as unknown as { args?: unknown }).args;
+      expect(absentTool.renderResult(stockResult("CAPTURED-BODY"), { expanded: false, isPartial: false }, undefined, absentCtx)
+        .render(120)).toEqual([]);
+      expect(absentNative).not.toHaveBeenCalled();
+      expect(absentCall.render(120).join(" ")).toContain("to expand");
+
+      const cases: Record<string, unknown>[] = [
+        { ...captured, path: "other" },
+        { ...captured, foreign: true },
+        { ...captured, limit: undefined },
+      ];
+      const accessor = { ...captured };
+      Object.defineProperty(accessor, "path", { enumerable: true, get: () => captured.path });
+      cases.push(accessor);
+      for (const current of cases) {
+        const { tool, native } = stock(entry);
+        const ctx = stockContext(captured);
+        const call = tool.renderCall(captured, undefined, ctx);
+        ctx.args = current;
+        expect(tool.renderResult(stockResult("MISMATCH-BODY"), { expanded: false, isPartial: false }, undefined, ctx)
+          .render(120)).toEqual(["NATIVE-DETAIL"]);
+        expect(native).toHaveBeenCalledTimes(1);
+        expect(call.render(120).join(" ")).not.toContain("to expand");
+      }
+
+      const { tool: inheritedTool, native: inheritedNative } = stock(entry);
+      const inheritedCtx = stockContext(captured);
+      inheritedTool.renderCall(captured, undefined, inheritedCtx);
+      delete (inheritedCtx as unknown as { args?: unknown }).args;
+      Object.setPrototypeOf(inheritedCtx, { args: captured });
+      expect(inheritedTool.renderResult(stockResult("INHERITED-CONTEXT-BODY"),
+        { expanded: false, isPartial: false }, undefined, inheritedCtx).render(120)).toEqual(["NATIVE-DETAIL"]);
+      expect(inheritedNative).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("fails open when any present stock detail key carries no valid fact", () => {
+    for (const entry of families) {
+      const keys = [entry.limitKey, "truncation", ...(entry.name === "grep" ? ["linesTruncated"] : [])];
+      for (const key of keys) {
+        const { tool, native } = stock(entry);
+        const args = { ...entry.args };
+        const ctx = stockContext(args);
+        tool.renderCall(args, undefined, ctx);
+        expect(tool.renderResult(stockResult("FACTLESS-BODY", { [key]: undefined }),
+          { expanded: false, isPartial: false }, undefined, ctx).render(120)).toEqual(["NATIVE-DETAIL"]);
+        expect(native).toHaveBeenCalledTimes(1);
+      }
+    }
+  });
+
+  it("fails open across stock invocation primitive validators", () => {
+    const cases = [
+      { name: "grep", args: {} },
+      { name: "grep", args: { pattern: 1 } },
+      { name: "find", args: {} },
+      { name: "find", args: { pattern: false } },
+      { name: "ls", args: { path: 1 } },
+      { name: "find", args: { pattern: "*.ts", limit: Number.POSITIVE_INFINITY } },
+      { name: "ls", args: { limit: "5" } },
+      { name: "grep", args: { pattern: "x", glob: false } },
+      { name: "grep", args: { pattern: "x", ignoreCase: "yes" } },
+      { name: "grep", args: { pattern: "x", literal: 1 } },
+      { name: "grep", args: { pattern: "x", context: "2" } },
+      { name: "grep", args: { pattern: "x", context: Number.POSITIVE_INFINITY } },
+    ] as const;
+    for (const testCase of cases) {
+      const entry = families.find(({ name }) => name === testCase.name)!;
+      const { tool, native } = stock(entry);
+      const ctx = stockContext(testCase.args);
+      const call = tool.renderCall(testCase.args, undefined, ctx);
+      expect(call.render(120)).toEqual(["native call"]);
+      expect(tool.renderResult(stockResult("MALFORMED-INVOCATION"),
+        { expanded: false, isPartial: false }, undefined, ctx).render(120)).toEqual(["NATIVE-DETAIL"]);
+      expect(native).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("rejects malformed invocation, envelope, and content-block own-data per stock family", () => {
+    for (const entry of families) {
+      const inheritedArgs = Object.assign(Object.create({ foreign: true }), entry.args);
+      const accessorArgs = { ...entry.args } as Record<string, unknown>;
+      Object.defineProperty(accessorArgs, entry.name === "ls" ? "path" : "pattern", {
+        enumerable: true, get: () => entry.name === "ls" ? "src" : "query",
+      });
+      for (const args of [{ ...entry.args, foreign: true }, inheritedArgs, accessorArgs]) {
+        const { tool } = stock(entry);
+        const ctx = stockContext(args);
+        expect(tool.renderCall(args, undefined, ctx).render(120)).toEqual(["native call"]);
+        expect(tool.renderResult(stockResult("BAD-INVOCATION"), { expanded: false, isPartial: false }, undefined, ctx)
+          .render(120)).toEqual(["NATIVE-DETAIL"]);
+      }
+
+      const inheritedEnvelope = Object.assign(Object.create({ foreign: true }), stockResult("BAD-ENVELOPE"));
+      const accessorEnvelope: Record<string, unknown> = { details: undefined };
+      Object.defineProperty(accessorEnvelope, "content", { enumerable: true, get: () => [{ type: "text", text: "BAD-ENVELOPE" }] });
+      const inheritedBlock = Object.assign(Object.create({ foreign: true }), { type: "text", text: "BAD-BLOCK" });
+      const accessorBlock: Record<string, unknown> = { type: "text" };
+      Object.defineProperty(accessorBlock, "text", { enumerable: true, get: () => "BAD-BLOCK" });
+      for (const result of [
+        inheritedEnvelope,
+        accessorEnvelope,
+        { content: [inheritedBlock], details: undefined },
+        { content: [accessorBlock], details: undefined },
+      ]) {
+        const { tool, native } = stock(entry);
+        const args = { ...entry.args };
+        const ctx = stockContext(args);
+        tool.renderCall(args, undefined, ctx);
+        tool.renderResult(result as ResultShape, { expanded: false, isPartial: false }, undefined, ctx).render(120);
+        expect(native).toHaveBeenCalledTimes(1);
+      }
+    }
+  });
+
+  it("fails open for malformed envelopes/details, partial/error states, and native renderer throws", () => {
+    for (const entry of families) {
+      const malformed: unknown[] = [
+        { content: [{ type: "text", text: "EXTRA" }], details: undefined, extra: true },
+        { content: [{ type: "text", text: "TWO" }, { type: "text", text: "blocks" }], details: undefined },
+        stockResult("BAD-LIMIT", { [entry.limitKey]: entry.limit + 1 }),
+        stockResult("BAD-TRUNC", { truncation: { ...truncation(), outputBytes: 90_000 } }),
+        { content: [{ type: "image", data: "x", mimeType: "image/png" }], details: undefined },
+      ];
+      malformed.push(stockResult("INHERITED", Object.assign(Object.create({ foreign: true }), { [entry.limitKey]: entry.limit })));
+      const accessor: Record<string, unknown> = {};
+      Object.defineProperty(accessor, entry.limitKey, { enumerable: true, get: () => entry.limit });
+      malformed.push(stockResult("ACCESSOR", accessor));
+      for (const value of malformed) {
+        const { tool, native } = stock(entry);
+        const args = { ...entry.args };
+        const ctx = stockContext(args);
+        tool.renderCall(args, undefined, ctx);
+        expect(tool.renderResult(value as ResultShape, { expanded: false, isPartial: false }, undefined, ctx).render(120).join(" ").length).toBeGreaterThan(0);
+        expect(native).toHaveBeenCalledTimes(1);
+      }
+      const { tool: live, native } = stock(entry);
+      const args = { ...entry.args };
+      const partial = stockContext(args, { isPartial: true });
+      live.renderCall(args, undefined, partial);
+      live.renderResult(stockResult("PARTIAL"), { expanded: false, isPartial: true }, undefined, partial).render(120);
+      live.renderResult(stockResult("ERROR"), { expanded: false, isPartial: false }, undefined, stockContext(args, { isError: true })).render(120);
+      expect(native).toHaveBeenCalledTimes(2);
+      const { tool: throwing } = stock(entry, vi.fn(() => { throw new Error("renderer failed"); }));
+      const throwingCtx = stockContext(args);
+      throwing.renderCall(args, undefined, throwingCtx);
+      expect(throwing.renderResult(stockResult("THROW-FALLBACK"), { expanded: true, isPartial: false }, undefined, throwingCtx).render(120).join(" "))
+        .toContain("THROW-FALLBACK");
+    }
+  });
+
+  it("uses remapped cues and semantic empty, warning, and separator theme roles", () => {
+    const definitions = { ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } };
+    piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
+    try {
+      for (const entry of families) {
+        const calls: Array<{ slot: string; text: string }> = [];
+        const theme = { fg(slot: string, text: string) { calls.push({ slot, text }); return text; } };
+        const args = { ...entry.args };
+        const { tool } = stock(entry);
+        const ctx = stockContext(args);
+        const call = tool.renderCall(args, theme, ctx);
+        tool.renderResult(stockResult("WARNING", { [entry.limitKey]: entry.limit }),
+          { expanded: false, isPartial: false }, theme, ctx);
+        expect(call.render(160).join(" ")).toContain("alt+e to expand");
+        expect(calls.some(({ slot, text }) => slot === "muted" && text === "alt+e to expand")).toBe(true);
+        expect(calls.some(({ slot, text }) => slot === "warning" && text.includes("limit"))).toBe(true);
+        expect(calls.some(({ slot, text }) => slot === "muted" && text === " · ")).toBe(true);
+
+        tool.renderResult(stockResult(entry.empty), { expanded: false, isPartial: false }, theme, ctx);
+        call.render(160);
+        expect(calls.some(({ slot, text }) => slot === "muted" && text === entry.empty)).toBe(true);
+      }
+    } finally { piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS)); }
+  });
+
+  it("fails open under an unbound action and keeps the cue through narrow/wide repaints", () => {
+    const definitions = { ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" } };
+    piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": [] }));
+    try {
+      for (const entry of families) {
+        const { tool, native } = stock(entry);
+        const args = { ...entry.args };
+        const ctx = stockContext(args);
+        const call = tool.renderCall(args, undefined, ctx);
+        expect(tool.renderResult(stockResult("UNBOUND"), { expanded: false, isPartial: false }, undefined, ctx).render(80)).toEqual(["NATIVE-DETAIL"]);
+        expect(native).toHaveBeenCalledTimes(1);
+        expect(call.render(80).join(" ")).not.toContain("to expand");
+      }
+    } finally { piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS)); }
+    for (const entry of families) {
+      const { tool } = stock(entry);
+      const args = { ...entry.args };
+      const ctx = stockContext(args);
+      const call = tool.renderCall(args, undefined, ctx);
+      tool.renderResult(stockResult("WIDTH"), { expanded: false, isPartial: false }, undefined, ctx);
+      expectBounded(call.render(8), 8);
+      expect(call.render(8).join(" ")).toContain("ctrl+o");
+      expect(call.render(160).join(" ")).toContain("ctrl+o to expand");
+    }
+  });
 });
