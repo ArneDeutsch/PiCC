@@ -41,6 +41,7 @@ function producerFixture(minor: number): { dir: string; file: string } {
         execution_count: 1, outputs: [{ output_type: "stream", text: "PRODUCER_OLD_OUTPUT" }],
       },
       { cell_type: "markdown", id: "real-md", metadata: {}, source: "PRODUCER_OLD_MARKDOWN" },
+      { cell_type: "raw", id: "real-raw", metadata: { keep: true }, source: ["PRODUCER_OLD_", "RAW"] },
     ],
     metadata: { language_info: { name: "python" } },
     nbformat: 4,
@@ -209,6 +210,8 @@ describe("NotebookEdit presentation", () => {
       { minor: 5, mode: "replace", cell_id: "real-code" },
       { minor: 5, mode: "insert", cell_id: "real-code", cell_type: "code" },
       { minor: 5, mode: "delete", cell_id: "real-md" },
+      { minor: 5, mode: "replace", cell_id: "real-raw" },
+      { minor: 5, mode: "delete", cell_id: "real-raw" },
       { minor: 4, mode: "replace", cell_id: "real-code" },
       { minor: 4, mode: "insert", cell_id: "real-code", cell_type: "code" },
       { minor: 4, mode: "delete", cell_id: "real-md" },
@@ -241,8 +244,10 @@ describe("NotebookEdit presentation", () => {
       };
       expect(
         result.isError,
-        `${scenario.minor}/${scenario.mode}: ${String(result.content[0]?.text)}`,
+        `${scenario.minor}/${scenario.mode}/${scenario.cell_id}: ${String(result.content[0]?.text)}`,
       ).not.toBe(true);
+      expect(result.details.cell_type).toBe(scenario.cell_id === "real-raw" ? "raw" :
+        "cell_type" in scenario ? scenario.cell_type : scenario.cell_id === "real-md" ? "markdown" : "code");
       tool.renderCall!(callArgs as never, theme as never, { ...before, executionStarted: true });
       const continuation = tool.renderResult!(
         result as never,
@@ -255,6 +260,20 @@ describe("NotebookEdit presentation", () => {
       expect(row).toContain(scenario.mode);
       expect(text(continuation)).toBe("");
       expect(`${row}\n${text(continuation)}`).not.toMatch(/PRODUCER_(?:OLD|NEW)/u);
+
+      if (scenario.mode === "replace" && scenario.cell_id === "real-raw") {
+        const expandedContext = { ...before, expanded: true, executionStarted: true };
+        tool.renderCall!(callArgs as never, theme as never, expandedContext);
+        const expanded = tool.renderResult!(
+          result as never,
+          { expanded: true, isPartial: false } as never,
+          theme as never,
+          expandedContext,
+        );
+        const expandedText = text(expanded, 160);
+        expect(expandedText).toContain("details.cell_type: raw");
+        expect(expandedText).not.toContain("Unfamiliar notebook edit result");
+      }
     }
   });
 
@@ -419,6 +438,38 @@ describe("NotebookEdit presentation", () => {
       ...truncatedCtx, executionStarted: true,
     });
     expect(text(truncatedShown)).toContain("Unfamiliar notebook edit result");
+  });
+
+  it("accepts canonical raw facts only when details truthfully report the authoritative stored type", () => {
+    const tool = withNotebookEditRendering(rawTool());
+    const callArgs = args("replace");
+    const state = {};
+    const ctx = context(state, callArgs);
+    const call = tool.renderCall(callArgs, theme, ctx);
+    const canonical = resultFor(callArgs);
+    const details = canonical.details as Record<PropertyKey, unknown>;
+    details.cell_type = "raw";
+    const facts = details[NOTEBOOK_MUTATION_FACTS] as Record<PropertyKey, unknown>;
+    facts.cellType = "raw";
+    facts.previousCellType = "raw";
+
+    const shown = tool.renderResult(canonical, { expanded: false, isPartial: false }, theme, {
+      ...ctx, executionStarted: true,
+    });
+    expect(text(shown)).toBe("");
+    expect(text(call)).toContain("notebook write");
+
+    const mismatchState = {};
+    const mismatchCtx = context(mismatchState, callArgs);
+    tool.renderCall(callArgs, theme, mismatchCtx);
+    const mismatch = resultFor(callArgs);
+    const mismatchFacts = (mismatch.details as Record<PropertyKey, unknown>)[NOTEBOOK_MUTATION_FACTS] as Record<PropertyKey, unknown>;
+    mismatchFacts.cellType = "raw";
+    mismatchFacts.previousCellType = "raw";
+    const rejected = tool.renderResult(mismatch, { expanded: false, isPartial: false }, theme, {
+      ...mismatchCtx, executionStarted: true,
+    });
+    expect(text(rejected)).toContain("Unfamiliar notebook edit result");
   });
 
   it("rejects producer-impossible mutation-fact metadata relationships", () => {

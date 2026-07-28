@@ -206,6 +206,18 @@ describe("renderNotebook — text matrix (non-vision model)", () => {
     expect(cellBlock(out.text, 1)).toContain("id=cell-stream");
   });
 
+  it("presents a raw cell with its model-visible identifier", async () => {
+    const { text } = await render({
+      nbformat: 4,
+      nbformat_minor: 5,
+      cells: [{ cell_type: "raw", id: "raw-cell", source: ["RAW_CELL_", "MARKER"] }],
+    }, TEXT_MODEL);
+    const block = cellBlock(text, 0);
+    expect(block).toMatch(/^0 \(raw, id=raw-cell\)/);
+    expect(block).toContain("RAW_CELL_MARKER");
+    expect(block).not.toContain("Outputs:");
+  });
+
   it("includes stream stdout text under an Outputs subheader with ANSI stripped", () => {
     const block = cellBlock(out.text, 1);
     expect(block).toContain("Outputs:");

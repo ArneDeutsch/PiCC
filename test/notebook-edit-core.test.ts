@@ -26,8 +26,9 @@ describe("notebook document validation", () => {
     ["missing cells", { nbformat: 4, nbformat_minor: 5 }],
     ["non-array cells", { nbformat: 4, nbformat_minor: 5, cells: {} }],
     ["non-object cell", { nbformat: 4, nbformat_minor: 5, cells: [null] }],
-    ["unsupported cell type", { nbformat: 4, nbformat_minor: 5, cells: [{ cell_type: "raw", source: "x" }] }],
+    ["unsupported cell type", { nbformat: 4, nbformat_minor: 5, cells: [{ cell_type: "unknown", source: "x" }] }],
     ["invalid source", { nbformat: 4, nbformat_minor: 5, cells: [{ cell_type: "code", source: ["x", 2] }] }],
+    ["invalid raw source", { nbformat: 4, nbformat_minor: 5, cells: [{ cell_type: "raw", source: ["x", 2] }] }],
     ["missing nbformat", { nbformat_minor: 5, cells: [] }],
     ["string nbformat", { nbformat: "4", nbformat_minor: 5, cells: [] }],
     ["negative nbformat", { nbformat: -1, nbformat_minor: 5, cells: [] }],
@@ -51,8 +52,13 @@ describe("notebook document validation", () => {
     })).toThrow(/source/);
   });
 
-  it("parses a valid JSON notebook and reports malformed JSON without disclosing content", () => {
+  it("parses valid empty and raw-cell notebooks and reports malformed JSON without disclosing content", () => {
     expect(parseNotebookDocument('{"nbformat":4,"nbformat_minor":5,"cells":[]}').cells).toEqual([]);
+    expect(parseNotebookDocument('{"nbformat":4,"nbformat_minor":5,"cells":[{"cell_type":"raw","source":"literal"},{"cell_type":"raw","source":["line 1\\n","line 2"]}]}').cells)
+      .toEqual([
+        { cell_type: "raw", source: "literal" },
+        { cell_type: "raw", source: ["line 1\n", "line 2"] },
+      ]);
     const sentinel = "PRIVATE_NOTEBOOK_SENTINEL";
     let message = "";
     try {
@@ -69,8 +75,8 @@ describe("notebook cell identifiers", () => {
   it("makes duplicate real IDs and positional collisions safe for display and lookup", () => {
     const document = notebook([
       { cell_type: "code", source: "first", id: "dup" },
-      { cell_type: "markdown", source: "safe duplicate", id: "dup" },
-      { cell_type: "code", source: "blocked duplicate", id: "dup" },
+      { cell_type: "raw", source: "safe duplicate", id: "dup" },
+      { cell_type: "raw", source: "blocked duplicate", id: "dup" },
       { cell_type: "markdown", source: "owns duplicate fallback", id: "cell-2" },
       { cell_type: "code", source: "safe idless" },
       { cell_type: "markdown", source: "blocked idless" },
@@ -190,6 +196,43 @@ describe("applyNotebookMutation", () => {
     expect(result.clearedOutputCount).toBe(0);
   });
 
+  it("replaces raw cells with real and fallback IDs while preserving or explicitly converting their stored type", () => {
+    const input = notebook([
+      { cell_type: "raw", id: "first", source: ["old\n", "raw"], metadata: { keep: true }, attachments: { custom: [1, { deep: true }] } },
+      { cell_type: "raw", source: "fallback raw", custom: { keep: true } },
+    ]);
+    const before = JSON.stringify(input);
+
+    const preserved = applyNotebookMutation(input, request());
+    expect(preserved).toMatchObject({
+      resolvedIndex: 0,
+      previousCellType: "raw",
+      cellType: "raw",
+      oldSource: "old\nraw",
+      clearedOutputCount: 0,
+      clearedExecutionCount: 0,
+    });
+    expect(preserved.document.cells[0]).toEqual({
+      cell_type: "raw", id: "first", source: "new", metadata: { keep: true },
+      attachments: { custom: [1, { deep: true }] },
+    });
+
+    const toCode = applyNotebookMutation(input, request({ cell_type: "code" }));
+    expect(toCode.document.cells[0]).toEqual({
+      cell_type: "code", id: "first", source: "new", metadata: { keep: true },
+      attachments: { custom: [1, { deep: true }] },
+    });
+    expect(toCode.document.cells[0]).not.toHaveProperty("outputs");
+    expect(toCode.document.cells[0]).not.toHaveProperty("execution_count");
+
+    const toMarkdown = applyNotebookMutation(input, request({ cell_id: "cell-1", cell_type: "markdown" }));
+    expect(toMarkdown).toMatchObject({ resolvedIndex: 1, previousCellType: "raw", cellType: "markdown" });
+    expect(toMarkdown.document.cells[1]).toEqual({
+      cell_type: "markdown", source: "new", custom: { keep: true },
+    });
+    expect(JSON.stringify(input)).toBe(before);
+  });
+
   it("inserts at the beginning or immediately after a target with type-specific fields", () => {
     const input = notebook([{ cell_type: "markdown", id: "first", source: "old" }], 4);
     const beginning = applyNotebookMutation(input, request({ edit_mode: "insert", cell_id: undefined, cell_type: "markdown" }));
@@ -207,11 +250,11 @@ describe("applyNotebookMutation", () => {
     });
   });
 
-  it("inserts and deletes through fallback IDs without mutating input or unrelated data", () => {
+  it("uses raw fallback cells as insert anchors and preserves unrelated raw values through insert and delete", () => {
     const input = notebook([
-      { cell_type: "markdown", source: "anchor", metadata: { anchorCanary: true } },
+      { cell_type: "raw", source: ["anchor\n", "raw"], metadata: { anchorCanary: true }, custom: { nested: [1, 2] } },
       { cell_type: "code", source: "target", metadata: { targetCanary: true }, outputs: [{ keep: true }] },
-      { cell_type: "markdown", source: "untouched", attachments: { untouchedCanary: true } },
+      { cell_type: "raw", id: "untouched-raw", source: "untouched", attachments: { untouchedCanary: true } },
     ], 4);
     input.metadata = { notebookCanary: true };
     input.custom_top_level = { unknownCanary: true };
@@ -235,6 +278,22 @@ describe("applyNotebookMutation", () => {
     expect(deleted.document.custom_top_level).toEqual({ unknownCanary: true });
     expect(deleted.document.cells).toEqual([input.cells[0], input.cells[2]]);
     expect(JSON.stringify(input)).toBe(before);
+  });
+
+  it("deletes an addressed raw cell and reports its actual type", () => {
+    const input = notebook([
+      { cell_type: "markdown", id: "keep", source: "keep" },
+      { cell_type: "raw", id: "first", source: ["remove", " me"], metadata: { keepUntilDelete: true } },
+    ]);
+    const result = applyNotebookMutation(input, request({ edit_mode: "delete", new_source: "ignored" }));
+    expect(result).toMatchObject({
+      resolvedIndex: 1,
+      resultingIndex: 1,
+      previousCellType: "raw",
+      cellType: "raw",
+      oldSource: "remove me",
+    });
+    expect(result.document.cells).toEqual([input.cells[0]]);
   });
 
   it("omits IDs in old formats, supports nbformat above 4, and retries deterministic modern-ID collisions", () => {
@@ -307,7 +366,7 @@ describe("applyNotebookMutation", () => {
     expect(result.document.cells).toHaveLength(1);
   });
 
-  it("does not mutate input and preserves notebook, cell, output, and prototype-like keys as inert data", () => {
+  it("does not mutate input and preserves notebook, cell, nested, and prototype-like keys as inert data", () => {
     const input = parseNotebookDocument(`{
       "nbformat": 4,
       "nbformat_minor": 5,
@@ -323,11 +382,12 @@ describe("applyNotebookMutation", () => {
         "outputs": [{ "output_type": "stream", "text": "stale" }],
         "__proto__": "cell-data"
       }, {
-        "cell_type": "code",
+        "cell_type": "raw",
         "id": "untouched",
         "source": ["keep", " me"],
         "metadata": { "untouchedCellCanary": true },
-        "outputs": [{ "output_type": "display_data", "data": { "image/png": "payload", "outputCanary": true } }]
+        "attachments": { "nested": [{ "outputCanary": true }] },
+        "__proto__": "untouched-raw-data"
       }]
     }`);
     const before = JSON.stringify(input);
@@ -343,9 +403,8 @@ describe("applyNotebookMutation", () => {
     expect(result.document.cells[0]!.metadata).toEqual({ cellCanary: true });
     expect(result.document.cells[0]!.outputs).toEqual([]);
     expect(result.document.cells[1]).toEqual(input.cells[1]);
-    expect(result.document.cells[1]!.outputs).toEqual([
-      { output_type: "display_data", data: { "image/png": "payload", outputCanary: true } },
-    ]);
+    expect(Object.hasOwn(result.document.cells[1]!, "__proto__")).toBe(true);
+    expect(result.document.cells[1]!.attachments).toEqual({ nested: [{ outputCanary: true }] });
   });
 });
 

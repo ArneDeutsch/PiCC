@@ -33,8 +33,8 @@ interface CanonicalSuccess {
 interface CanonicalMutationFacts {
   readonly addressedCellId?: string;
   readonly generatedCellId?: string;
-  readonly cellType: "code" | "markdown";
-  readonly previousCellType?: "code" | "markdown";
+  readonly cellType: "code" | "markdown" | "raw";
+  readonly previousCellType?: "code" | "markdown" | "raw";
   readonly clearedExecutionCount: number;
 }
 
@@ -294,7 +294,7 @@ function exactMutationFacts(value: unknown, mode: EditMode): CanonicalMutationFa
   const clearedOutputCount = ownData(value, "clearedOutputCount");
   const clearedExecutionCount = ownData(value, "clearedExecutionCount");
   if (factMode !== mode || !nonnegativeInteger(resultingIndex) ||
-    (cellType !== "code" && cellType !== "markdown") ||
+    (cellType !== "code" && cellType !== "markdown" && cellType !== "raw") ||
     (persistedCellId !== undefined && typeof persistedCellId !== "string") ||
     !nonnegativeInteger(clearedOutputCount) || !nonnegativeInteger(clearedExecutionCount)) return undefined;
 
@@ -316,9 +316,9 @@ function exactMutationFacts(value: unknown, mode: EditMode): CanonicalMutationFa
   if (!nonnegativeInteger(resolvedIndex) || resultingIndex !== resolvedIndex) return undefined;
   const previousCellType = ownData(value, "previousCellType");
   const addressedCellId = ownData(value, "addressedCellId");
-  if ((previousCellType !== "code" && previousCellType !== "markdown") ||
+  if ((previousCellType !== "code" && previousCellType !== "markdown" && previousCellType !== "raw") ||
     typeof addressedCellId !== "string" ||
-    (previousCellType === "markdown" && (clearedOutputCount !== 0 || clearedExecutionCount !== 0)) ||
+    (previousCellType !== "code" && (clearedOutputCount !== 0 || clearedExecutionCount !== 0)) ||
     (mode === "replace" && previousCellType === "code" && clearedExecutionCount > 1) ||
     (mode === "delete" && (cellType !== previousCellType || clearedOutputCount !== 0 || clearedExecutionCount !== 0))) {
     return undefined;
@@ -370,7 +370,7 @@ function canonicalSuccess(
   const cellType = ownData(details, "cell_type");
   const facts = exactMutationFacts(ownData(details, NOTEBOOK_MUTATION_FACTS), intent.mode);
   if (mode !== intent.mode || resultPathIdentity !== intent.pathIdentity || !facts ||
-    cellType !== (intent.cellType ?? "code") || (cellIdPresent && typeof cellId !== "string")) return undefined;
+    cellType !== facts.cellType || (cellIdPresent && typeof cellId !== "string")) return undefined;
   if ((intent.mode === "insert" && keys.includes("old_source")) ||
     (intent.mode !== "insert" && !keys.includes("old_source"))) return undefined;
 
