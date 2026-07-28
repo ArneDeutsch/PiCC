@@ -1,6 +1,28 @@
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
+import { getKeybindings, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
 import { buildMcpProxyTools, normalizeMcpSchema, type McpToolSource } from "../src/runtime/mcp-tools.js";
 import type { McpToolInfo } from "../src/runtime/mcp.js";
+
+const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+const piTui = await import(pathToFileURL(requireFromPi.resolve("@earendil-works/pi-tui")).href) as typeof import("@earendil-works/pi-tui");
+const bindingDefinitions = {
+  ...TUI_KEYBINDINGS,
+  "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
+};
+const plainTheme = { fg: (_slot: string, text: string) => text };
+
+function withBinding<T>(keys: string[], run: () => T): T {
+  const previousRoot = getKeybindings();
+  const previousPi = piTui.getKeybindings();
+  setKeybindings(new KeybindingsManager(bindingDefinitions));
+  piTui.setKeybindings(new piTui.KeybindingsManager(bindingDefinitions, { "app.tools.expand": keys as never }));
+  try { return run(); } finally {
+    piTui.setKeybindings(previousPi);
+    setKeybindings(previousRoot);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Fixture source (structural McpToolSource — no servers spawned at this layer)
@@ -207,33 +229,235 @@ describe("buildMcpProxyTools execute", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Result display rendering
+// MCP-owned interactive presentation
 // ---------------------------------------------------------------------------
 
-describe("buildMcpProxyTools renderResult", () => {
-  it("strips ESC/OSC sequences from the display while the model-facing result keeps the original bytes", async () => {
-    // 7-bit OSC (title write), 7-bit CSI (color), and an 8-bit C1 OSC/ST pair
-    // that survives Pi's generic fallback stripping. Built from char codes so
-    // no raw control byte hides invisibly in this source file.
-    const [ESC, BEL, CSI8, OSC8, ST8] = [0x1b, 0x07, 0x9b, 0x9d, 0x9c].map((code) =>
-      String.fromCharCode(code),
-    ) as [string, string, string, string, string];
-    const hostile = `lead ${ESC}]0;owned${BEL}mid ${ESC}[31mred ${OSC8}clip${ST8} tail`;
-    const source = sourceFor([toolInfo()], async () => ({
-      content: [{ type: "text", text: hostile }],
-    }));
-    const [proxy] = buildMcpProxyTools(source);
-    const result = await proxy!.execute("id-1", {}, undefined, undefined, {} as never);
-    // Round trip to the model stays verbatim (Claude parity).
-    expect((result.content[0] as { text: string }).text).toBe(hostile);
-    const theme = { fg: (_color: string, text: string) => text };
-    const display = proxy!
-      .renderResult!(result as never, { expanded: true, isPartial: false }, theme as never, {} as never)
-      .render(120)
-      .join("\n");
-    for (const visible of ["lead", "mid", "red", "tail"]) expect(display).toContain(visible);
-    // No live escape introducer or terminator reaches the terminal.
-    for (const control of [ESC, BEL, CSI8, OSC8, ST8]) expect(display).not.toContain(control);
+type RenderProxy = NonNullable<ReturnType<typeof buildMcpProxyTools>[number]>;
+
+function exactResult(text: string, server = "srv", tool = "echo"): Record<string, unknown> {
+  return { content: [{ type: "text", text }], details: { server, tool }, isError: false };
+}
+
+function renderLifecycle(
+  proxy: RenderProxy,
+  result: unknown,
+  options: { expanded?: boolean; partial?: boolean; error?: boolean; width?: number; state?: object } = {},
+  theme: unknown = plainTheme,
+): { call: string; result: string; lines: string[]; context: Record<string, unknown> } {
+  const state = options.state ?? {};
+  const context = { state, isPartial: true, isError: false, argsComplete: true };
+  proxy.renderCall!({ secret: "/private/arbitrary/value" }, theme as never, context as never);
+  context.isPartial = options.partial ?? false;
+  context.isError = options.error ?? false;
+  const call = proxy.renderCall!({ secret: "/private/arbitrary/value" }, theme as never, context as never);
+  const resultComponent = proxy.renderResult!(
+    result as never,
+    { expanded: options.expanded ?? false, isPartial: options.partial ?? false },
+    theme as never,
+    context as never,
+  );
+  const width = options.width ?? 120;
+  const lines = call.render(width);
+  return { call: lines.join("\n"), result: resultComponent.render(width).join("\n"), lines, context };
+}
+
+describe("buildMcpProxyTools MCP-owned presentation", () => {
+  it("renders semantic pending → collapsed → expanded → recollapsed lifecycle without arguments", () => withBinding(["alt+e"], () => {
+    const [proxy] = buildMcpProxyTools(sourceFor([toolInfo()]));
+    const state = {};
+    const pendingContext = { state, isPartial: true, isError: false };
+    const call = proxy!.renderCall!({ path: "/private/secret.txt", huge: "x".repeat(10_000) }, plainTheme as never, pendingContext as never);
+    expect(call.render(120).join("\n")).toBe("mcp echo · server srv");
+    expect(call.render(120).join("\n")).not.toMatch(/private|secret|huge/u);
+
+    const settledContext = { ...pendingContext, isPartial: false };
+    const settledCall = proxy!.renderCall!({}, plainTheme as never, settledContext as never);
+    const canonical = Object.freeze({
+      content: Object.freeze([Object.freeze({ type: "text", text: "complete retained body" })]),
+      details: Object.freeze({ server: "srv", tool: "echo" }), isError: false,
+    });
+    const before = JSON.stringify(canonical);
+    for (const [expanded, bodyVisible, cueVisible] of [[false, false, true], [true, true, false], [false, false, true]] as const) {
+      const detail = proxy!.renderResult!(canonical as never, { expanded, isPartial: false }, plainTheme as never, settledContext as never);
+      expect(detail.render(120)).toEqual([]);
+      const text = settledCall.render(120).join("\n");
+      expect(text).toContain("mcp echo · server srv");
+      expect(text.includes("complete retained body")).toBe(bodyVisible);
+      expect(text.includes("alt+e to expand")).toBe(cueVisible);
+    }
+    expect(JSON.stringify(canonical)).toBe(before);
+  }));
+
+  it("recognizes only exact closure-correlated final single-text results and otherwise fails open visibly", () => {
+    const [proxy] = buildMcpProxyTools(sourceFor([toolInfo()]));
+    const inherited = Object.create({ server: "srv", tool: "echo" });
+    const accessor = Object.defineProperties({}, {
+      server: { enumerable: true, get: () => "srv" },
+      tool: { enumerable: true, value: "echo" },
+    });
+    const revokedResult = Proxy.revocable({}, {});
+    revokedResult.revoke();
+    const revokedDetails = Proxy.revocable({ server: "srv", tool: "echo" }, {});
+    revokedDetails.revoke();
+    const revokedContent = Proxy.revocable([{ type: "text", text: "revoked content body" }], {});
+    revokedContent.revoke();
+    const revokedBlock = Proxy.revocable({ type: "text", text: "revoked block body" }, {});
+    revokedBlock.revoke();
+    const throwing = (target: object, trap: "getPrototypeOf" | "ownKeys" | "getOwnPropertyDescriptor") =>
+      new Proxy(target, { [trap]: () => { throw new Error(`${trap} blocked`); } });
+    const cases: Array<[string, unknown, { partial?: boolean; error?: boolean }?]> = [
+      ["mismatch", exactResult("mismatch body", "other", "echo")],
+      ["bounded mismatch", exactResult(`bounded body ${"x".repeat(10_000)}`, "other", "echo")],
+      ["extra", { ...exactResult("extra body"), details: { server: "srv", tool: "echo", extra: true } }],
+      ["inherited", { ...exactResult("inherited body"), details: inherited }],
+      ["accessor", { ...exactResult("accessor body"), details: accessor }],
+      ["multiple", { ...exactResult("unused"), content: [{ type: "text", text: "one" }, { type: "text", text: "two" }] }],
+      ["image", { ...exactResult("unused"), content: [{ type: "image", data: "AAAA" }] }],
+      ["partial", exactResult("partial body"), { partial: true }],
+      ["error", exactResult("error body"), { error: true }],
+      ["revoked result", revokedResult.proxy],
+      ["result descriptor", throwing(exactResult("result descriptor body"), "getOwnPropertyDescriptor")],
+      ["revoked details", { ...exactResult("revoked details body"), details: revokedDetails.proxy }],
+      ["details prototype", { ...exactResult("details prototype body"), details: throwing({ server: "srv", tool: "echo" }, "getPrototypeOf") }],
+      ["details keys", { ...exactResult("details keys body"), details: throwing({ server: "srv", tool: "echo" }, "ownKeys") }],
+      ["details descriptor", { ...exactResult("details descriptor body"), details: throwing({ server: "srv", tool: "echo" }, "getOwnPropertyDescriptor") }],
+      ["revoked content array", { ...exactResult("unused"), content: revokedContent.proxy }],
+      ["content prototype", { ...exactResult("unused"), content: throwing([{ type: "text", text: "content prototype body" }], "getPrototypeOf") }],
+      ["content keys", { ...exactResult("unused"), content: throwing([{ type: "text", text: "content keys body" }], "ownKeys") }],
+      ["content descriptor", { ...exactResult("unused"), content: throwing([{ type: "text", text: "content descriptor body" }], "getOwnPropertyDescriptor") }],
+      ["revoked block", { ...exactResult("unused"), content: [revokedBlock.proxy] }],
+      ["block prototype", { ...exactResult("unused"), content: [throwing({ type: "text", text: "block prototype body" }, "getPrototypeOf")] }],
+      ["block keys", { ...exactResult("unused"), content: [throwing({ type: "text", text: "block keys body" }, "ownKeys")] }],
+      ["block descriptor", { ...exactResult("unused"), content: [throwing({ type: "text", text: "block descriptor body" }, "getOwnPropertyDescriptor")] }],
+    ];
+    for (const [name, value, flags] of cases) {
+      const row = renderLifecycle(proxy!, value, flags);
+      const rendered = `${row.call}\n${row.result}`;
+      expect(rendered, name).not.toContain("ctrl+o to expand");
+      expect(rendered, name).toMatch(/body|one|non-text|Unfamiliar/u);
+      expect(rendered.length, name).toBeLessThan(5_000);
+    }
+
+    const foreign = buildMcpProxyTools(sourceFor([toolInfo({ serverName: "other", toolName: "echo" })]))[0]!;
+    const foreignRendered = renderLifecycle(foreign, exactResult("closure mismatch body")).result;
+    expect(foreignRendered).toContain("closure mismatch body");
+  });
+
+  it("shows no false cue for exact empty output and reveals detail immediately when expansion is unbound", () => {
+    const [proxy] = buildMcpProxyTools(sourceFor([toolInfo()]));
+    const empty = withBinding(["ctrl+o"], () => renderLifecycle(proxy!, exactResult("")));
+    expect(empty.call).toBe("mcp echo · server srv");
+    expect(empty.result).toBe("");
+    expect(empty.call).not.toContain("expand");
+
+    const unbound = withBinding([], () => renderLifecycle(proxy!, exactResult("reachable without binding")));
+    expect(unbound.call).toContain("reachable without binding");
+    expect(unbound.call).not.toContain("expand");
+  });
+
+  it("isolates interleaved rows of the same proxy and replaces retained source without stale detail", () => withBinding(["ctrl+o"], () => {
+    const [proxy] = buildMcpProxyTools(sourceFor([toolInfo()]));
+    const firstState = {};
+    const secondState = {};
+    expect(renderLifecycle(proxy!, exactResult("first retained body"), { state: firstState }).call).not.toContain("first retained body");
+    expect(renderLifecycle(proxy!, exactResult("second retained body"), { state: secondState }).call).not.toContain("second retained body");
+
+    const firstExpanded = renderLifecycle(proxy!, exactResult("first retained body"), { state: firstState, expanded: true }).call;
+    expect(firstExpanded).toContain("first retained body");
+    expect(firstExpanded).not.toMatch(/second retained body|to expand/u);
+    const secondExpanded = renderLifecycle(proxy!, exactResult("second retained body"), { state: secondState, expanded: true }).call;
+    expect(secondExpanded).toContain("second retained body");
+    expect(secondExpanded).not.toMatch(/first retained body|to expand/u);
+    const firstRecollapsed = renderLifecycle(proxy!, exactResult("first retained body"), { state: firstState }).call;
+    expect(firstRecollapsed).not.toContain("first retained body");
+    expect(firstRecollapsed).toContain("ctrl+o to expand");
+    expect(renderLifecycle(proxy!, exactResult("second retained body"), { state: secondState, expanded: true }).call)
+      .not.toContain("to expand");
+
+    const replacement = exactResult("replacement retained body");
+    const replacementCollapsed = renderLifecycle(proxy!, replacement, { state: firstState }).call;
+    expect(replacementCollapsed).toContain("ctrl+o to expand");
+    expect(replacementCollapsed).not.toMatch(/first retained body|replacement retained body/u);
+    const replacementExpanded = renderLifecycle(proxy!, replacement, { state: firstState, expanded: true }).call;
+    expect(replacementExpanded).toContain("replacement retained body");
+    expect(replacementExpanded).not.toMatch(/first retained body|second retained body/u);
+    expect(renderLifecycle(proxy!, exactResult("second retained body"), { state: secondState, expanded: true }).call)
+      .not.toContain("replacement retained body");
+  }));
+
+  it("keeps collapsed repaints body-blind and sanitizes once before width-cached wrapping", () => withBinding(["ctrl+o"], () => {
+    const [ESC, BEL, OSC8, ST8] = [0x1b, 0x07, 0x9d, 0x9c].map((code) => String.fromCharCode(code)) as [string, string, string, string];
+    const body = `HEAD e\u0301 ${ESC}]0;owned${BEL}${"segment ".repeat(2_000)} ${OSC8}clip${ST8} TAIL`;
+    let blockDescriptorReads = 0;
+    let bodyThemeCalls = 0;
+    let bodyNormalizeCalls = 0;
+    const block = new Proxy({ type: "text", text: body }, {
+      getOwnPropertyDescriptor(target, key) {
+        blockDescriptorReads += 1;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const theme = { fg(slot: string, text: string) { if (slot === "toolOutput") bodyThemeCalls += 1; return text; } };
+    const originalNormalize = String.prototype.normalize;
+    const normalizeSpy = vi.spyOn(String.prototype, "normalize").mockImplementation(function(this: string, form) {
+      if (String(this) === body) bodyNormalizeCalls += 1;
+      return originalNormalize.call(String(this), form);
+    });
+    try {
+      const [proxy] = buildMcpProxyTools(sourceFor([toolInfo()]));
+      const state = {};
+      const context = { state, isPartial: false, isError: false };
+      const call = proxy!.renderCall!({}, theme as never, context as never);
+      const result = { content: [block], details: { server: "srv", tool: "echo" }, isError: false };
+      proxy!.renderResult!(result as never, { expanded: false, isPartial: false }, theme as never, context as never);
+      const descriptorsAfterRecognition = blockDescriptorReads;
+      expect(call.render(120).join("\n")).not.toContain("HEAD");
+      expect(call.render(37).join("\n")).not.toContain("HEAD");
+      expect({ blockDescriptorReads, bodyNormalizeCalls, bodyThemeCalls }).toEqual({
+        blockDescriptorReads: descriptorsAfterRecognition, bodyNormalizeCalls: 0, bodyThemeCalls: 0,
+      });
+
+      proxy!.renderResult!(result as never, { expanded: true, isPartial: false }, theme as never, context as never);
+      expect(bodyNormalizeCalls).toBe(0);
+      expect(bodyThemeCalls).toBe(0);
+      const descriptorsBeforePaint = blockDescriptorReads;
+      const expanded = call.render(37).join("\n");
+      expect(expanded).toContain("HEAD é");
+      expect(expanded).toContain("TAIL");
+      expect(expanded).not.toMatch(/[\u001b\u0007\u009d\u009c]/u);
+      expect(bodyNormalizeCalls).toBe(1);
+      expect(bodyThemeCalls).toBeGreaterThan(0);
+      const themeCallsAfterPaint = bodyThemeCalls;
+      expect(call.render(37).join("\n")).toBe(expanded);
+      expect({ blockDescriptorReads, bodyNormalizeCalls, bodyThemeCalls }).toEqual({
+        blockDescriptorReads: descriptorsBeforePaint, bodyNormalizeCalls: 1, bodyThemeCalls: themeCallsAfterPaint,
+      });
+      const changedWidth = call.render(41);
+      expect(bodyNormalizeCalls).toBe(1);
+      expect(bodyThemeCalls).toBeGreaterThan(themeCallsAfterPaint);
+      expect(blockDescriptorReads).toBe(descriptorsBeforePaint);
+      for (const line of changedWidth) expect(visibleWidth(line)).toBeLessThanOrEqual(41);
+    } finally {
+      normalizeSpy.mockRestore();
+    }
+  }));
+
+  it("uses semantic theme roles and contains hostile theme/renderer faults with visible evidence", () => {
+    const slots: string[] = [];
+    const theme = { fg(slot: string, text: string) { slots.push(slot); return text; } };
+    const [proxy] = buildMcpProxyTools(sourceFor([toolInfo({ serverName: "srv\u001b]0;x\u0007", toolName: "echo\u001b[31m" })]));
+    const pending = proxy!.renderCall!({ ignored: true }, theme as never, { state: {}, isPartial: true } as never).render(120).join("\n");
+    expect(slots).toEqual(expect.arrayContaining(["text", "accent", "muted"]));
+    expect(pending).not.toMatch(/[\u001b\u0007]/u);
+
+    const throwingTheme = Object.defineProperty({}, "fg", { get() { throw new Error("theme fault"); } });
+    const visible = renderLifecycle(proxy!, { content: [{ type: "text", text: "visible renderer fault evidence" }], details: {} }, {}, throwingTheme);
+    expect(`${visible.call}\n${visible.result}`).toContain("visible renderer fault evidence");
+    for (const width of [1, 8, 25]) {
+      for (const line of renderLifecycle(proxy!, exactResult("body"), { width }, throwingTheme).lines) {
+        expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+      }
+    }
   });
 });
 
