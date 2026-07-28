@@ -3,7 +3,7 @@ import { open, realpath, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 export const MAX_NOTEBOOK_SESSION_RECORDS = 64;
-const MAX_SERIALIZED_NOTEBOOK_PATH_CHARS = 32_768;
+const MAX_NOTEBOOK_PATH_CHARS = 32_768;
 const MAX_RESTORED_GENERATION = Number.MAX_SAFE_INTEGER - 1_000_000;
 const MAX_NOTEBOOK_SESSION_BRANCH_ENTRIES = 1_000_000;
 const READ_CHUNK_BYTES = 64 * 1024;
@@ -15,7 +15,6 @@ export interface NotebookTargetIdentity {
 }
 
 export interface NotebookReadSnapshot {
-  normalizedPath: string;
   identity: string;
   digest: string;
   generation: number;
@@ -107,7 +106,7 @@ export function normalizeNotebookPathForPlatform(
   platform: NodeJS.Platform,
 ): string {
   if (typeof input !== "string" || input.length === 0) failPath("notebook_path", "must be a non-empty string.");
-  if (input.length > MAX_SERIALIZED_NOTEBOOK_PATH_CHARS) failPath("notebook_path", "is too long.");
+  if (input.length > MAX_NOTEBOOK_PATH_CHARS) failPath("notebook_path", "is too long.");
   if (input.includes("\0")) failPath("notebook_path", "must not contain NUL.");
   const paths = platform === "win32" ? path.win32 : path.posix;
 
@@ -249,21 +248,16 @@ function safeArrayCheck(value: unknown): boolean | undefined {
 
 function parseSnapshot(value: unknown): NotebookReadSnapshot | undefined {
   if (value === null || typeof value !== "object" || safeArrayCheck(value) !== false) return undefined;
-  const normalizedPath = dataProperty(value, "normalizedPath");
   const identity = dataProperty(value, "identity");
   const digest = dataProperty(value, "digest");
   const generation = dataProperty(value, "generation");
   const fallbackCurrent = dataProperty(value, "fallbackCurrent");
-  if (typeof normalizedPath !== "string"
-    || normalizedPath.length > MAX_SERIALIZED_NOTEBOOK_PATH_CHARS
-    || !path.isAbsolute(normalizedPath)
-    || path.extname(normalizedPath) !== ".ipynb"
-    || typeof identity !== "string" || !/^[0-9a-f]{64}$/.test(identity)
+  if (typeof identity !== "string" || !/^[0-9a-f]{64}$/.test(identity)
     || typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)
     || typeof generation !== "number" || !Number.isSafeInteger(generation) || generation <= 0
     || generation > MAX_RESTORED_GENERATION
     || typeof fallbackCurrent !== "boolean") return undefined;
-  return { normalizedPath, identity, digest, generation, fallbackCurrent };
+  return { identity, digest, generation, fallbackCurrent };
 }
 
 export class NotebookSessionState {
@@ -375,7 +369,6 @@ export class NotebookSessionState {
     this.generation++;
     this.hydrated = true;
     const record: NotebookReadSnapshot = {
-      normalizedPath: target.normalizedPath,
       identity: target.fingerprint,
       digest: notebookBytesDigest(bytes),
       generation: this.generation,

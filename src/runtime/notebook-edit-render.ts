@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { toolResultHasGuardClipping } from "./guard.js";
 import { piToolsExpandKeyText } from "./pi-tui-runtime.js";
 import { sanitizeDisplayText, themedFg } from "./render-util.js";
 import {
@@ -55,6 +56,7 @@ interface CallView {
   readonly expanded: boolean;
   readonly cue: string;
   readonly recovery: boolean;
+  readonly clipped: boolean;
   readonly detail: readonly DetailLine[];
   readonly theme: unknown;
 }
@@ -117,18 +119,25 @@ function exactDataObject(value: unknown, expected: readonly (string | symbol)[])
   }
 }
 
-function exactOneTextContentShape(value: unknown): boolean {
+function exactTextContentShape(value: unknown): boolean {
   if (!Array.isArray(value)) return false;
   try {
     if (Object.getPrototypeOf(value) !== Array.prototype) return false;
+    const length = ownData(value, "length");
+    if (!Number.isSafeInteger(length) || (length as number) < 1 || (length as number) > 2) return false;
     const keys = Reflect.ownKeys(value);
-    if (keys.length !== 2 || !keys.includes("0") || !keys.includes("length") || value.length !== 1) return false;
-    const block = ownData(value, "0");
-    if (block === null || typeof block !== "object" || Array.isArray(block) ||
-      Object.getPrototypeOf(block) !== Object.prototype) return false;
-    const blockKeys = Reflect.ownKeys(block);
-    return blockKeys.length === 2 && blockKeys.includes("type") && blockKeys.includes("text") &&
-      ownData(block, "type") === "text";
+    if (keys.length !== (length as number) + 1 || !keys.includes("length")) return false;
+    for (let index = 0; index < (length as number); index++) {
+      const key = String(index);
+      if (!keys.includes(key)) return false;
+      const block = ownData(value, key);
+      if (block === null || typeof block !== "object" || Array.isArray(block) ||
+        Object.getPrototypeOf(block) !== Object.prototype) return false;
+      const blockKeys = Reflect.ownKeys(block);
+      if (blockKeys.length !== 2 || !blockKeys.includes("type") || !blockKeys.includes("text") ||
+        ownData(block, "type") !== "text" || (index > 0 && typeof ownData(block, "text") !== "string")) return false;
+    }
+    return true;
   } catch {
     return false;
   }
@@ -229,6 +238,25 @@ function detailLinesFromResult(result: unknown): readonly DetailLine[] {
   return Object.freeze(lines.slice(0, MAX_DETAIL_LINES));
 }
 
+function feedbackLinesFromResult(result: unknown): readonly DetailLine[] {
+  const content = ownData(result, "content");
+  if (!Array.isArray(content)) return [];
+  const lines: DetailLine[] = [];
+  const inspectedBlocks = Math.min(content.length, MAX_DETAIL_LINES + 1);
+  for (let index = 1; index < inspectedBlocks && lines.length < MAX_DETAIL_LINES; index++) {
+    const block = ownData(content, String(index));
+    if (ownData(block, "type") !== "text") return [];
+    const value = ownData(block, "text");
+    if (typeof value !== "string") return [];
+    const safe = sanitizeDisplayText(value, MAX_EVIDENCE);
+    for (const line of safe.split("\n")) {
+      if (line.trim()) lines.push({ label: "feedback", value: line });
+      if (lines.length >= MAX_DETAIL_LINES) break;
+    }
+  }
+  return Object.freeze(lines);
+}
+
 function nonnegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
@@ -310,7 +338,7 @@ function canonicalSuccess(
     !exactDataObject(result, ["content", "details"])) return undefined;
   const content = ownData(result, "content");
   const details = ownData(result, "details");
-  if (!exactOneTextContentShape(content) || details === null || typeof details !== "object" ||
+  if (!exactTextContentShape(content) || details === null || typeof details !== "object" ||
     Array.isArray(details)) return undefined;
 
   let keys: readonly PropertyKey[];
@@ -434,7 +462,9 @@ function callComponent(initial: CallView): MutableCall {
       const operation = intent ? `${intent.mode}${intent.cellId ? ` cell ${intent.cellId}` : ""}` : "";
       const cue = view.expanded ? "" : view.cue ? `${view.cue} to expand` : "";
       const recovery = !view.expanded && view.recovery ? RECOVERY : "";
-      const required = recovery ? [recovery] : [];
+      const required = view.clipped
+        ? [`result clipped${recovery ? `; ${recovery}` : ""}`]
+        : recovery ? [recovery] : [];
       const optional = intent?.cellType ? [operation, intent.cellType] : operation ? [operation] : [];
       const summary = priorityDisplayRow(
         "notebook write",
@@ -455,8 +485,22 @@ function messageComponent(message: string, theme: unknown): Component {
   return { render: (width) => renderDetails([{ label: "error", value: safe }], theme, width) };
 }
 
+function detailComponent(lines: readonly DetailLine[], theme: unknown): Component {
+  return { render: (width) => renderDetails(lines, theme, width) };
+}
+
+function combinedComponent(components: readonly Component[]): Component {
+  return {
+    render(width: number): string[] {
+      const lines: string[] = [];
+      for (const component of components) lines.push(...component.render(width));
+      return lines.slice(0, MAX_RENDERED_LINES);
+    },
+  };
+}
+
 function genericView(theme: unknown): CallView {
-  return { expanded: false, cue: "", recovery: false, detail: [], theme };
+  return { expanded: false, cue: "", recovery: false, clipped: false, detail: [], theme };
 }
 
 /** Add NotebookEdit's main-session-only human presentation without changing its canonical behavior. */
@@ -512,6 +556,7 @@ export function withNotebookEditRendering<T extends ToolDefinition>(
           expanded,
           cue: binding ?? "",
           recovery: !binding,
+          clipped: false,
           detail: expanded
             ? lifecycle?.expandedCall ?? (lifecycle ? (lifecycle.expandedCall = detailLinesFromArgs(args)) : detailLinesFromArgs(args))
             : [],
@@ -555,38 +600,44 @@ export function withNotebookEditRendering<T extends ToolDefinition>(
             expanded,
             cue: binding ?? "",
             recovery: !binding,
+            clipped: toolResultHasGuardClipping(result),
             detail: expanded
               ? lifecycle.expandedCall ?? (lifecycle.expandedCall = detailLinesFromArgs(ownData(context, "args")))
               : [],
             theme,
           };
+          const feedback = feedbackLinesFromResult(result);
           if (lifecycle.call) {
             lifecycle.call.update(view);
-            if (!expanded) return EMPTY_COMPONENT;
-            lifecycle.expandedResult ??= detailLinesFromResult(result);
-            return { render: (width: number) => renderDetails(lifecycle.expandedResult ?? [], theme, width) };
+            const components: Component[] = [];
+            if (feedback.length > 0) components.push(detailComponent(feedback, theme));
+            if (expanded) {
+              lifecycle.expandedResult ??= detailLinesFromResult(result);
+              components.push(detailComponent(lifecycle.expandedResult, theme));
+            }
+            return components.length > 0 ? combinedComponent(components) : EMPTY_COMPONENT;
           }
 
-          const resultOnly = callComponent(view);
-          if (!expanded) return resultOnly;
-          lifecycle.expandedResult ??= detailLinesFromResult(result);
-          return {
-            render(width: number): string[] {
-              return [...resultOnly.render(width), ...renderDetails(lifecycle.expandedResult ?? [], theme, width)]
-                .slice(0, MAX_RENDERED_LINES);
-            },
-          };
+          const components: Component[] = [callComponent(view)];
+          if (feedback.length > 0) components.push(detailComponent(feedback, theme));
+          if (expanded) {
+            lifecycle.expandedResult ??= detailLinesFromResult(result);
+            components.push(detailComponent(lifecycle.expandedResult, theme));
+          }
+          return combinedComponent(components);
         }
 
         const terminalError = ownBoolean(context, "isError") === true;
         const evidence = collapsedEvidence(result, terminalError);
         if (/\b(?:aborted|cancelled)\b/iu.test(evidence)) setToolRowOutcome(context, "stopped");
         else setToolRowOutcome(context, "failure");
-        if (expanded) {
-          const detail = expandedExceptionalDetail(result);
-          return { render: (width: number) => renderDetails(detail, theme, width) };
-        }
-        return messageComponent(evidence, theme);
+        const primary = expanded
+          ? detailComponent(expandedExceptionalDetail(result), theme)
+          : messageComponent(evidence, theme);
+        const feedback = terminalError ? feedbackLinesFromResult(result) : [];
+        return feedback.length > 0
+          ? combinedComponent([detailComponent(feedback, theme), primary])
+          : primary;
       } catch {
         setToolRowOutcome(context, "failure");
         return messageComponent("Notebook edit result could not be presented; inspect the canonical result.", theme);

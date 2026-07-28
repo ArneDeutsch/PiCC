@@ -86,6 +86,9 @@ describe("NotebookRead degrade-stub subagent-dispatch wiring", () => {
     const firstEdit = firstTools.find((tool) => tool.name === "NotebookEdit")!;
     const firstRead = firstTools.find((tool) => tool.name === "read")!;
     expect(firstTools.filter((tool) => tool.name === "NotebookEdit")).toHaveLength(1);
+    for (const field of ["renderCall", "renderResult", "renderShell"] as const) {
+      expect(firstEdit).not.toHaveProperty(field);
+    }
     expect((await firstEdit.execute("before", {
       notebook_path: notebookPath, new_source: "blocked", cell_id: "child-cell",
     })).content[0]!.text).toContain("has not been successfully Read");

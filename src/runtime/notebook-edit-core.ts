@@ -106,7 +106,6 @@ export function validateNotebookDocument(value: unknown): NotebookDocument {
   return value as NotebookDocument;
 }
 
-/** Parse and validate an ordinary JSON notebook document. */
 export function parseNotebookDocument(jsonText: string): NotebookDocument {
   let value: unknown;
   try {
@@ -322,7 +321,6 @@ export function applyNotebookMutation(
   };
 }
 
-/** Detect the dominant newline convention in decoded notebook text. */
 export function detectNotebookNewline(text: string): NotebookNewline {
   const crlf = text.match(/\r\n/g)?.length ?? 0;
   const lf = (text.match(/\n/g)?.length ?? 0) - crlf;

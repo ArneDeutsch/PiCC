@@ -11,6 +11,7 @@ vi.mock("../src/runtime/pi-tui-runtime.js", async (importOriginal) => ({
   piToolsExpandKeyText: () => bridge.expansion,
 }));
 
+import { createGuardExtension } from "../src/runtime/guard.js";
 import { withNotebookEditRendering } from "../src/runtime/notebook-edit-render.js";
 import {
   NotebookSessionState,
@@ -144,6 +145,44 @@ function text(component: { render(width: number): string[] }, width = 120): stri
   return component.render(width).join("\n");
 }
 
+async function guardTransform(
+  result: Record<string, unknown>,
+  input: Record<string, unknown>,
+  options: { clipMaxTokens?: number; feedback?: boolean } = {},
+): Promise<Record<string, unknown>> {
+  const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
+  const hooks = options.feedback
+    ? {
+        hasHooks: () => true,
+        fire: async () => ({
+          block: true,
+          blockReason: "FIX_THIS\u001b[31m_NOW",
+          additionalContext: "RUN_CHECK\u001b]0;owned\u0007_NEXT",
+          diagnostics: [],
+        }),
+      }
+    : { hasHooks: () => false };
+  createGuardExtension({
+    engine: {} as never,
+    hooks: hooks as never,
+    getCwd: () => ".",
+    ...(options.clipMaxTokens === undefined ? {} : { clipMaxTokens: options.clipMaxTokens }),
+  })({
+    on: (event: string, handler: (payload: unknown, context: unknown) => unknown) => handlers.set(event, handler),
+  } as never);
+  const patch = await handlers.get("tool_result")!({
+    toolName: "NotebookEdit",
+    input,
+    content: result.content,
+    details: result.details,
+    isError: false,
+  }, {}) as { content?: unknown; details?: unknown } | undefined;
+  return {
+    content: patch?.content ?? result.content,
+    details: patch?.details ?? result.details,
+  };
+}
+
 describe("NotebookEdit presentation", () => {
   it("renders replace, insert, and delete as concise source-private workspace-aware rows", () => {
     bridge.expansion = { available: true, value: "alt+e" };
@@ -217,6 +256,50 @@ describe("NotebookEdit presentation", () => {
       expect(text(continuation)).toBe("");
       expect(`${row}\n${text(continuation)}`).not.toMatch(/PRODUCER_(?:OLD|NEW)/u);
     }
+  });
+
+  it("surfaces guard clipping without exposing retained source", async () => {
+    bridge.expansion = { available: true, value: "ctrl+x" };
+    const tool = withNotebookEditRendering(rawTool(), { resolveDisplayRoot: () => "/repo/work" });
+    const callArgs = args("replace");
+    callArgs.new_source = `CLIPPED_SOURCE_CANARY_${"x".repeat(8_000)}`;
+    const state = {};
+    const ctx = context(state, callArgs);
+    const call = tool.renderCall(callArgs, theme, ctx);
+    const guarded = await guardTransform(resultFor(callArgs), callArgs, { clipMaxTokens: 100 });
+    const shown = tool.renderResult(guarded, { expanded: false, isPartial: false }, theme, {
+      ...ctx, executionStarted: true,
+    });
+    const collapsed = `${text(call, 160)}\n${text(shown, 160)}`;
+    expect(collapsed).toContain("result clipped");
+    expect(collapsed).toContain("ctrl+x to expand");
+    expect(collapsed).not.toContain("CLIPPED_SOURCE_CANARY");
+    expect(collapsed).not.toContain("Unfamiliar notebook edit result");
+  });
+
+  it("keeps appended PostToolUse feedback visible collapsed and expanded", async () => {
+    bridge.expansion = { available: true, value: "ctrl+x" };
+    const tool = withNotebookEditRendering(rawTool(), { resolveDisplayRoot: () => "/repo/work" });
+    const callArgs = args("replace");
+    const state = {};
+    const ctx = context(state, callArgs);
+    const call = tool.renderCall(callArgs, theme, ctx);
+    const guarded = await guardTransform(resultFor(callArgs), callArgs, { feedback: true });
+    const collapsedResult = tool.renderResult(guarded, { expanded: false, isPartial: false }, theme, {
+      ...ctx, executionStarted: true,
+    });
+    const collapsed = `${text(call, 160)}\n${text(collapsedResult, 160)}`;
+    expect(collapsed).toContain("[hook blocked] FIX_THIS�_NOW");
+    expect(collapsed).toContain("[hook context] RUN_CHECK�_NEXT");
+    expect(collapsed).not.toMatch(/\u001b|owned/u);
+    expect(collapsed).not.toContain("Unfamiliar notebook edit result");
+
+    tool.renderCall(callArgs, theme, { ...ctx, expanded: true, executionStarted: true });
+    const expandedResult = tool.renderResult(guarded, { expanded: true, isPartial: false }, theme, {
+      ...ctx, expanded: true, executionStarted: true,
+    });
+    expect(text(expandedResult, 160)).toContain("[hook blocked] FIX_THIS�_NOW");
+    expect(text(expandedResult, 160)).toContain("details.new_source: SECRET_SOURCE");
   });
 
   it("uses repository-relative and caller-visible path fallbacks without leaking partial arguments", () => {

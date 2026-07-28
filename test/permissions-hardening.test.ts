@@ -80,9 +80,29 @@ describe("Edit rules gate all file-modification tools", () => {
     expect(matchesRule("Write(docs/**)", call("Write", { file_path: "docs/x.md" }))).toBe(true);
   });
 
-  it("direct NotebookEdit/MultiEdit rules match as path rules", () => {
-    expect(matchesRule("NotebookEdit(nb/**)", call("NotebookEdit", { notebook_path: "nb/a.ipynb" }))).toBe(true);
+  it("uses Edit(path), not NotebookEdit(path), for scoped notebook writes", () => {
+    const notebookCall = call("NotebookEdit", { notebook_path: "nb/a.ipynb" });
+    expect(matchesRule("NotebookEdit(nb/**)", notebookCall)).toBe(false);
+    expect(matchesRule("Edit(nb/**)", notebookCall)).toBe(true);
+    expect(matchesRule("NotebookEdit", notebookCall)).toBe(true);
     expect(matchesRule("MultiEdit(src/**)", call("MultiEdit", { file_path: "src/a.ts" }))).toBe(true);
+  });
+
+  it("warns for every unmatched scoped NotebookEdit settings rule", () => {
+    const engine = new PermissionEngine(rules({
+      allow: ["NotebookEdit(nb/allow/**)"],
+      deny: ["NotebookEdit(nb/deny/**)"],
+      ask: ["NotebookEdit(notebook_path:nb/ask/**)"],
+    }), { cwd: ROOT });
+    expect(engine.evaluate(call("NotebookEdit", { notebook_path: "nb/deny/a.ipynb" })).decision)
+      .toBe("default");
+    expect(engine.diagnostics).toHaveLength(3);
+    expect(engine.diagnostics.map((diagnostic) => diagnostic.message)).toEqual([
+      expect.stringContaining("permissions.allow"),
+      expect.stringContaining("permissions.deny"),
+      expect.stringContaining("permissions.ask"),
+    ]);
+    expect(engine.diagnostics.every((diagnostic) => diagnostic.message.includes("use Edit(path)"))).toBe(true);
   });
 
   it("a path-scoped NotebookRead rule routes through pathSpecifierMatches", () => {

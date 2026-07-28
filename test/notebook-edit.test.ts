@@ -986,16 +986,20 @@ describe("NotebookSessionState", () => {
     expect(observed).toHaveLength(1);
     const serialized = state.serialize();
     expect(Object.keys(serialized.records[0]!).sort()).toEqual([
-      "digest", "fallbackCurrent", "generation", "identity", "normalizedPath",
+      "digest", "fallbackCurrent", "generation", "identity",
     ]);
-    expect(serialized.records[0]!.normalizedPath).toBe(alias);
+    expect(JSON.stringify(serialized)).not.toContain(alias);
     expect(serialized.records[0]!.identity).toMatch(/^[0-9a-f]{64}$/);
     expect(serialized.records[0]!.digest).toMatch(/^[0-9a-f]{64}$/);
     expect(serialized.records[0]!.identity).not.toContain(fs.realpathSync(file));
     expect(serialized.records[0]!.digest).not.toContain("old");
 
     const restored = new NotebookSessionState();
-    restored.restore(serialized);
+    restored.restore({
+      ...serialized,
+      records: serialized.records.map((record) => ({ ...record, normalizedPath: alias })),
+    });
+    expect(JSON.stringify(restored.serialize())).not.toContain(alias);
     expect(restored.authorize(await resolveNotebookTarget(alias), restored.captureCallEpoch())).toBeDefined();
     const clone = restored.clone();
     const token = restored.authorize(await resolveNotebookTarget(file), restored.captureCallEpoch())!;
@@ -1075,7 +1079,7 @@ describe("NotebookSessionState", () => {
     const invalidInputs = [
       { version: 1, generation: 70, records: Array.from({ length: 70 }, () => validRecord) },
       { version: 1, generation: Number.MAX_SAFE_INTEGER, records: [] },
-      { version: 1, generation: 2, records: [{ ...validRecord, generation: 2 }, { ...validRecord, normalizedPath: second.file, generation: 2 }] },
+      { version: 1, generation: 2, records: [{ ...validRecord, generation: 2 }, { ...validRecord, identity: "b".repeat(64), generation: 2 }] },
       { version: 1, generation: 1, records: [{ ...validRecord, digest: "bad" }] },
       { version: 1, generation: 1, records: Object.defineProperty([], "0", { get() { throw new Error("getter"); } }) },
     ];
