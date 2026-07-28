@@ -80,7 +80,7 @@ describe("MCP self-shell fallback display name", () => {
 });
 
 describe("real Pi MCP tool-row contract", () => {
-  it("renders the friendly title for pending, success, failure, and constrained widths", () => {
+  it("renders pending → settled collapsed → expanded → recollapsed/error/narrow through real Pi slots", () => {
     initTheme();
     const definition = proxyDefinition();
     expect(definition.name).toBe("mcp__Srv.Name__Echo__V2");
@@ -88,49 +88,50 @@ describe("real Pi MCP tool-row contract", () => {
 
     const pending = row(definition, "mcp-pending");
     pending.setArgsComplete();
-    const pendingLines = plain(pending.render(80) as string[])
-      .filter((line) => visibleWidth(line) > 0);
-    expect(pendingLines).toEqual(["○ Echo__V2 (Srv.Name MCP)"]);
-    expect(pendingLines.join("\n")).not.toContain(definition.name);
+    const pendingText = plain(pending.render(80) as string[]).filter((line) => visibleWidth(line) > 0).join("\n");
+    expect(pendingText).toBe("○ mcp Echo__V2 · server Srv.Name");
+    expect(pendingText).not.toMatch(/unchanged argument|mcp__Srv/u);
 
     const canonicalResult = Object.freeze({
       content: Object.freeze([{ type: "text" as const, text: "canonical result" }]),
-      details: Object.freeze({ server: "Srv.Name", tool: "Echo__V2" }),
-      isError: false,
+      details: Object.freeze({ server: "Srv.Name", tool: "Echo__V2" }), isError: false,
     });
     const canonicalBefore = JSON.stringify(canonicalResult);
     const success = row(definition, "mcp-success");
     success.setArgsComplete();
+    success.markExecutionStarted();
     success.updateResult(canonicalResult as never, false);
-    const successLines = plain(success.render(80) as string[])
-      .filter((line) => visibleWidth(line) > 0);
-    expect(successLines[0]).toBe("● Echo__V2 (Srv.Name MCP)");
-    const successText = successLines.join("\n");
-    expect(successText).toContain("canonical result");
-    expect(successText).not.toContain(definition.name);
+    success.setExpanded(false);
+    const collapsedLines = plain(success.render(80) as string[]).filter((line) => visibleWidth(line) > 0);
+    const collapsed = collapsedLines.join("\n");
+    expect(collapsed).toContain("● mcp Echo__V2 · server Srv.Name · ctrl+o to expand");
+    expect(collapsed).not.toContain("canonical result");
+    expect(collapsed.match(/[○●✗■]/gu)).toHaveLength(1);
+
+    success.setExpanded(true);
+    const expanded = plain(success.render(80) as string[]).join("\n");
+    expect(expanded.match(/canonical result/gu)).toHaveLength(1);
+    expect(expanded.match(/[○●✗■]/gu)).toHaveLength(1);
+    success.setExpanded(false);
+    expect(plain(success.render(80) as string[]).filter(Boolean).join("\n")).toBe(collapsed);
     expect(JSON.stringify(canonicalResult)).toBe(canonicalBefore);
 
     const failure = row(definition, "mcp-failure");
     failure.setArgsComplete();
+    failure.markExecutionStarted();
     failure.updateResult({ ...canonicalResult, content: [{ type: "text", text: "canonical failure" }], isError: true } as never, false);
-    const failureLines = plain(failure.render(80) as string[])
-      .filter((line) => visibleWidth(line) > 0);
-    expect(failureLines[0]).toBe("✗ Echo__V2 (Srv.Name MCP)");
-    expect(failureLines.join("\n")).not.toContain(definition.name);
+    const failureText = plain(failure.render(80) as string[]).filter(Boolean).join("\n");
+    expect(failureText).toContain("✗ mcp Echo__V2 · server Srv.Name");
+    expect(failureText).toContain("canonical failure");
+    expect(failureText.match(/[○●✗■]/gu)).toHaveLength(1);
 
-    const narrowRows = [
-      { width: 1, expected: ["○"] },
-      { width: 2, expected: ["○ "] },
-      { width: 8, expected: ["○ Echo_…"] },
-      { width: 16, expected: ["○ Echo__V2 (Srv…"] },
-    ];
-    for (const { width, expected } of narrowRows) {
+    for (const width of [1, 2, 8, 16, 32]) {
       const narrow = row(definition, `mcp-narrow-${width}`);
       narrow.setArgsComplete();
       const lines = narrow.render(width) as string[];
-      const plainLines = plain(lines).filter((line) => visibleWidth(line) > 0);
-      expect(plainLines).toEqual(expected);
-      expect(plainLines.join("\n")).not.toContain(definition.name);
+      const shown = plain(lines).join("\n");
+      expect(shown).not.toMatch(/unchanged argument|mcp__Srv/u);
+      expect(shown.match(/[○●✗■]/gu)).toHaveLength(1);
       for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
     }
   });
@@ -147,7 +148,9 @@ describe("real Pi MCP tool-row contract", () => {
     const before = JSON.stringify(result);
     const component = row(definition, "mcp-hostile");
     component.setArgsComplete();
+    component.markExecutionStarted();
     component.updateResult(result as never, false);
+    component.setExpanded(true);
     const lines = plain(component.render(18) as string[]);
     const shown = lines.join("\n");
     expect(lines.some((line) => line.trimEnd().endsWith("first"))).toBe(true);

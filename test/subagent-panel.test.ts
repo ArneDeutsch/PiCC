@@ -683,12 +683,12 @@ describe("responsive panel table", () => {
       elapsed: /\b\d+s\b/.test(line),
     })[metric]);
     const boundaries: Array<[Metric, number, number]> = [
-      ["cacheWrite", 82, 81],
-      ["cacheRead", 70, 69],
-      ["cost", 59, 58],
-      ["output", 51, 50],
-      ["input", 41, 40],
-      ["elapsed", 30, 29],
+      ["cacheWrite", 84, 83],
+      ["cacheRead", 72, 71],
+      ["cost", 61, 60],
+      ["output", 53, 52],
+      ["input", 43, 42],
+      ["elapsed", 32, 31],
     ];
     for (const [metric, lastPresent, firstAbsent] of boundaries) {
       const before = rowsOnly(renderSubagentPanel(mixedView(), { width: lastPresent, entryChord: CHORD })).slice(0, 3);
@@ -709,14 +709,32 @@ describe("responsive panel table", () => {
     expect(focusedWide.every((line) => visibleWidth(line) === 180)).toBe(true);
   });
 
-  it("keeps descriptions until telemetry is gone, then truncates the elastic description", () => {
-    const atDrop = rowsOnly(renderSubagentPanel(mixedView(), { width: 81, entryChord: CHORD }));
+  it("keeps descriptions until telemetry is gone, then preserves distinguishing narrow fragments", () => {
+    const atDrop = rowsOnly(renderSubagentPanel(mixedView(), { width: 83, entryChord: CHORD }));
     expect(atDrop[0]).toContain("build frontend");
     expect(atDrop[1]).toContain("review changes");
 
     const narrow = rowsOnly(renderSubagentPanel(mixedView(), { width: 22, entryChord: CHORD }));
     expect(narrow.join("\n")).not.toMatch(/\b(?:in|out|c\/read|c\/write)\b|\$/);
     expect(narrow.some((line) => line.includes("…"))).toBe(true);
+
+    const sameType = view(makeModel({ t: 1000 }), [
+      rec({ agentId: "same-a", agentName: "coder", description: "alpha dispatch" }),
+      rec({ agentId: "same-b", agentName: "coder", description: "bravo dispatch", startedAt: 1 }),
+    ]);
+    const sameTypeRows = rowsOnly(renderSubagentPanel(sameType, { width: 11, entryChord: CHORD }))
+      .slice(0, 2)
+      .map(stripAnsi);
+    for (const row of sameTypeRows) {
+      expect(visibleWidth(row)).toBeLessThanOrEqual(11);
+      expect(row).toContain(PANEL_RUNNING_FRAMES[0]);
+      expect(row).toContain("co");
+      expect(row).toContain(" · ");
+    }
+    const descriptionFragments = sameTypeRows.map((row) => row.split(" · ")[1]!.trim());
+    expect(descriptionFragments.every((fragment) => fragment.length > 0)).toBe(true);
+    expect(new Set(descriptionFragments).size).toBe(2);
+    expect(new Set(sameTypeRows).size).toBe(2);
   });
 
   it("uses the explicit row minimum and drops description before aggregate fallback", () => {
@@ -738,7 +756,21 @@ describe("responsive panel table", () => {
     expect(belowMinimum).toContain(PANEL_RUNNING_FRAMES[0]);
   });
 
-  it("keeps compact telemetry muted while preserving semantic identity and state styling", () => {
+  it.each([
+    ["input", "in 119.2k"],
+    ["output", "out 4.9k"],
+    ["cache read", "c/read 80"],
+    ["cache write", "c/write 20"],
+    ["elapsed", "12s"],
+    ["cost", "$1.08"],
+  ] as const)("renders %s telemetry muted and never accent", (_field, displayed) => {
+    const fg = vi.fn((_slot: string, text: string) => text);
+    renderSubagentPanel(mixedView(), { width: 180, entryChord: CHORD, theme: { fg } });
+    expect(fg.mock.calls.some(([slot, text]) => slot === "muted" && text.includes(displayed))).toBe(true);
+    expect(fg.mock.calls.some(([slot, text]) => slot === "accent" && text.includes(displayed))).toBe(false);
+  });
+
+  it("uses accent only for descriptions, muted separators/telemetry, and preserves state/identity colors", () => {
     const fg = vi.fn((_slot: string, text: string) => `${ESC}[36m${text}${ESC}[39m`);
     const themed = renderSubagentPanel(mixedView(), {
       width: 180,
@@ -746,12 +778,56 @@ describe("responsive panel table", () => {
       theme: { fg },
     }).join("\n");
     expect(fg).toHaveBeenCalledWith("accent", PANEL_RUNNING_FRAMES[0]);
-    expect(fg).toHaveBeenCalledWith("text", expect.stringContaining("build frontend"));
+    expect(fg).toHaveBeenCalledWith("accent", "build frontend");
+    expect(fg).toHaveBeenCalledWith("muted", " · ");
     expect(fg).toHaveBeenCalledWith("muted", expect.stringContaining("in 119.2k"));
+    expect(fg).not.toHaveBeenCalledWith("accent", " · ");
+    expect(fg).not.toHaveBeenCalledWith("muted", expect.stringContaining("build frontend"));
+    expect(themed).toContain(`${AGENT_COLOR_ANSI.red}coder${ESC}[39m`);
+
+    const statePanel = view(makeModel({ t: 1000 }), [
+      rec({ agentId: "waiting", admission: "waiting" }),
+      rec({ agentId: "success", state: "settled", outcome: "completed", settledAt: 900 }),
+      rec({ agentId: "failed", state: "settled", outcome: "failed", settledAt: 900 }),
+      rec({ agentId: "stopped", state: "settled", outcome: "aborted", settledAt: 900 }),
+    ]);
+    renderSubagentPanel(statePanel, { width: 100, entryChord: CHORD, theme: { fg } });
+    expect(fg).toHaveBeenCalledWith("warning", PANEL_GLYPH_WAITING);
+    expect(fg).toHaveBeenCalledWith("success", PANEL_GLYPH_SUCCESS);
+    expect(fg).toHaveBeenCalledWith("error", PANEL_GLYPH_FAILED);
+    expect(fg).toHaveBeenCalledWith("warning", PANEL_GLYPH_STOPPED);
+
     expect(themed).toContain("$1.08");
     expect(themed).toContain("<$0.01");
     expect(themed).not.toContain("$0.00");
     expect(themed).not.toContain("$1.082095");
+  });
+
+  it("determines a long fallback before display caps and renders one identity without accent or separator", () => {
+    const fg = vi.fn((_slot: string, text: string) => text);
+    const longIdentity = `custom-${"identity".repeat(30)}`;
+    const panel = view(makeModel({ t: 1000 }), [rec({ agentId: "fallback", agentName: longIdentity })]);
+    const row = renderSubagentPanel(panel, { width: 180, entryChord: CHORD, theme: { fg } })[0]!;
+    expect(row.match(/custom/gu)).toHaveLength(1);
+    expect(row).not.toContain(" · ");
+    expect(fg.mock.calls.filter(([slot]) => slot === "accent")).toEqual([["accent", PANEL_RUNNING_FRAMES[0]]]);
+  });
+
+  it("keeps a shared description column aligned without a visible separator on fallback rows", () => {
+    const fg = vi.fn((_slot: string, text: string) => text);
+    const panel = view(makeModel({ t: 12_000 }), [
+      rec({ agentId: "described", agentName: "coder", description: "real dispatch" }),
+      rec({ agentId: "fallback", agentName: "reviewer", startedAt: 2_000 }),
+    ]);
+    const rows = rowsOnly(renderSubagentPanel(panel, {
+      width: 80, entryChord: CHORD, theme: { fg },
+    })).slice(0, 2);
+    expect(rows[0]).toContain("coder");
+    expect(rows[0]).toContain(" · real dispatch");
+    expect(rows[1]).not.toContain(" · ");
+    expect(rows[0]!.indexOf("12s")).toBe(rows[1]!.indexOf("10s"));
+    expect(fg.mock.calls.filter(([slot, text]) => slot === "muted" && text === " · ")).toHaveLength(1);
+    expect(fg).toHaveBeenCalledWith("accent", "real dispatch");
   });
 
   it("keeps useful long custom identity across aggregate, row-minimum, and wide profiles", () => {
@@ -907,7 +983,7 @@ describe("panel aggregate, palette, and width safety", () => {
       width: 100, entryChord: CHORD,
       theme: { fg: (_color: string, text: string) => text },
     })[0]!;
-    expect(row).toContain(`${AGENT_COLOR_ANSI.red}coder${ESC}[39m stable work`);
+    expect(row).toContain(`${AGENT_COLOR_ANSI.red}coder${ESC}[39m · stable work`);
     expect(row.match(new RegExp(AGENT_COLOR_ANSI.red.replace("[", "\\["), "g"))).toHaveLength(1);
     const fixedTint = row.slice(row.indexOf(AGENT_COLOR_ANSI.red) + AGENT_COLOR_ANSI.red.length, row.indexOf(`${ESC}[39m`));
     expect(fixedTint).toBe("coder");
@@ -1106,21 +1182,92 @@ describe("drill-down detail rendering (pure)", () => {
     );
   });
 
-  it("themes only validated drill-down identity tint while stripped state/detail stays readable", () => {
+  it("accents only the drill-down description while preserving identity tint and state slots", () => {
     const record = rec({
       agentId: "agent-themed", agentName: "reviewer", color: "red",
       description: "inspect output", detailLog: [{ kind: "status", text: "checking evidence" }],
     });
-    const theme = { fg: (_slot: string, text: string) => `${ESC}[36m${text}${ESC}[39m` };
+    const fg = vi.fn((_slot: string, text: string) => `${ESC}[36m${text}${ESC}[39m`);
     const rendered = renderSubagentDetail(
-      { record, taskId: "task-themed", nowMs: 2000 }, detailUi(), { width: 100, theme },
+      { record, taskId: "task-themed", nowMs: 2000 }, detailUi(), { width: 100, theme: { fg } },
     ).lines.join("\n");
+    expect(fg).toHaveBeenCalledWith("accent", PANEL_RUNNING_FRAMES[0]);
+    expect(fg).toHaveBeenCalledWith("muted", " · ");
+    expect(fg).toHaveBeenCalledWith("accent", "inspect output");
+    expect(fg).not.toHaveBeenCalledWith("accent", " · ");
+    expect(fg).not.toHaveBeenCalledWith("muted", expect.stringContaining("inspect output"));
     expect(rendered).toContain(`${AGENT_COLOR_ANSI.red}reviewer${ESC}[39m`);
     expect(rendered.indexOf(AGENT_COLOR_ANSI.red)).toBe(rendered.lastIndexOf(AGENT_COLOR_ANSI.red));
     const plain = stripAnsi(rendered);
     expect(plain).toContain("reviewer · inspect output");
     expect(plain).toContain("running");
     expect(plain).toContain("status: checking evidence");
+  });
+
+  it("suppresses a long fallback description before unequal header display caps", () => {
+    const longIdentity = `custom-${"identity".repeat(30)}`;
+    const fg = vi.fn((_slot: string, text: string) => text);
+    const rendered = renderSubagentDetail(
+      { record: rec({ agentId: "fallback-detail", agentName: longIdentity }), nowMs: 1000 },
+      detailUi(),
+      { width: 180, theme: { fg } },
+    ).lines[0]!;
+    expect(rendered.match(/custom/gu)).toHaveLength(1);
+    expect(rendered).not.toContain(" · ");
+    expect(fg.mock.calls.filter(([slot]) => slot === "accent")).toEqual([["accent", PANEL_RUNNING_FRAMES[0]]]);
+  });
+
+  it("keeps a genuine description accented when it equals the capped identity display", () => {
+    const longIdentity = `identity-${"x".repeat(100)}`;
+    const cappedIdentityDisplay = `${longIdentity.slice(0, 59)}…`;
+    const fg = vi.fn((_slot: string, text: string) => text);
+    const header = renderSubagentDetail(
+      {
+        record: rec({
+          agentId: "capped-identity-description",
+          agentName: longIdentity,
+          description: cappedIdentityDisplay,
+        }),
+        nowMs: 1000,
+      },
+      detailUi(),
+      { width: 180, theme: { fg } },
+    ).lines[0]!;
+    expect(header).toContain(` · ${cappedIdentityDisplay}`);
+    expect(fg).toHaveBeenCalledWith("accent", cappedIdentityDisplay);
+  });
+
+  it.each([
+    ["waiting", rec({ agentId: "waiting-theme", admission: "waiting" }), "warning", PANEL_GLYPH_WAITING],
+    ["running", rec({ agentId: "running-theme" }), "accent", PANEL_RUNNING_FRAMES[0]],
+    ["success", rec({ agentId: "success-theme", state: "settled", outcome: "completed" }), "success", PANEL_GLYPH_SUCCESS],
+    ["failed", rec({ agentId: "failed-theme", state: "settled", outcome: "failed" }), "error", PANEL_GLYPH_FAILED],
+    ["stopped", rec({ agentId: "stopped-theme", state: "settled", outcome: "aborted" }), "warning", PANEL_GLYPH_STOPPED],
+  ] as const)("uses the %s drill-down glyph theme slot", (_state, record, slot, glyph) => {
+    const fg = vi.fn((_slot: string, text: string) => text);
+    renderSubagentDetail({ record, nowMs: 1000 }, detailUi(), { width: 80, theme: { fg } });
+    expect(fg).toHaveBeenCalledWith(slot, glyph);
+  });
+
+  it("bounds and sanitizes a hostile drill-down description at narrow and normal widths", () => {
+    const description = `safe${BEL}${ESC}[2J control\t名 ${"long".repeat(80)}\uD800`;
+    const record = rec({ agentId: "hostile-description", agentName: "reviewer", description });
+    const dangerousControls = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/u;
+    const unpairedSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+    for (const width of [11, 80]) {
+      const lines = renderSubagentDetail({ record, nowMs: 1000 }, detailUi(), { width }).lines;
+      expect(lines.length).toBeGreaterThan(0);
+      for (const line of lines) {
+        expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+        const plain = stripAnsi(line);
+        expect(plain).not.toMatch(dangerousControls);
+        expect(plain).not.toMatch(unpairedSurrogate);
+      }
+      expect(lines.join("\n")).not.toContain("[2J");
+    }
+    expect(renderSubagentDetail(
+      { record, nowMs: 1000 }, detailUi(), { width: 80 },
+    ).lines[0]).toContain("reviewer · safe control 名");
   });
 
   it("finished layout: final answer leads, then collapsed prompt, tail below; no steer line", () => {

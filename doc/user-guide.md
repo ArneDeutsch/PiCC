@@ -215,9 +215,9 @@ When `app.tools.expand` is unbound, an ordinary row whose hidden detail would ot
 inaccessible fails open and shows it. NotebookEdit deliberately keeps cell source private and shows
 a configuration recovery note instead. Search and subagent completion rows keep a complete
 configured-action cue, placing it on a separate row when necessary, and fail open when no usable cue
-exists. At an
-unusably narrow terminal they show only bounded semantic state instead of a large body; detail waits
-for widening, and resize guidance appears only when it fits. In PiCC compact summaries, paths
+exists. At an unusably narrow terminal, when expansion is available but its cue cannot fit, they show
+only bounded semantic state instead of a large body; detail waits for widening, and resize guidance
+appears only when it fits. In PiCC compact summaries, paths
 within the invocation-time workspace are relative to it; paths elsewhere in the repository use a
 visibly marked repository-relative form, and external paths remain absolute. Eligible custom PiCC
 fragments in HTML exports use the export context

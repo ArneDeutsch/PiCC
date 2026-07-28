@@ -137,9 +137,9 @@ unchanged. Only the outer checkpoint gate wraps it, and that gate may alter the 
 adding `terminate`. The collapse adapter snapshots display-only roots and the raw path when complete
 invocation arguments first render, so later cwd changes cannot rewrite an existing row. It
 recognizes an ordinary bounded Read continuation only when the canonical notice agrees exactly with
-the requested range; unknown and exceptional families fail open to native detail. The configured
-`app.tools.expand` action changes native detail without changing the glyph; live, exceptional,
-unfamiliar, and unbound-action rows keep their native detail inside the same outer glyph frame,
+the requested range; unknown and exceptional families fail open to retained/native detail. The
+configured `app.tools.expand` action changes retained/native detail without changing the glyph;
+live, exceptional, unfamiliar, and unbound-action rows keep it inside the same outer glyph frame,
 while malformed display fields use a concise warning. Search and subagent completion rows may add a
 separate complete cue row when the cue cannot fit inline and fail open when no usable cue exists.
 At unusably narrow widths they retain the semantic first row with at most one resize hint rather than
@@ -156,13 +156,14 @@ remain. Binary image components are added outside the textual self-render contai
 Pi-owned and unmodified; only their textual fallbacks participate in continuation alignment.
 
 HTML export is a separate Pi-owned surface, not TUI visual parity. Pi retains outer
-`.tool-execution.pending|success|error` cards. Lowercase stock Read/Bash are template-owned and
-bypass custom renderers. Other custom-rendered tools receive one call pass and independent
+`.tool-execution.pending|success|error` cards. Lowercase stock Read/Bash/ls are template-owned and
+bypass custom renderers. Stock grep/find and MCP/custom tools receive one call pass and independent
 collapsed and expanded result passes, so a renderer cannot rely on TUI paint timing or a result pass
 mutating the earlier call fragment. Custom search cards use the generic click-safe cue `click to
 show detail`, never a terminal binding. Eligible custom renderer fragments can inherit phase-local
 glyphs through Pi's shared TUI-to-HTML renderer; escaping and canonical session data remain
-Pi-owned. PiCC does not patch the exporter to make those fragments uniform.
+Pi-owned. PiCC does not patch the exporter to make those fragments uniform. The MCP method/server
+overview row is PiCC-defined interactive presentation, not Claude Code rendering parity.
 
 - **Own tools with a renderer:** the wrapper invokes the tool's own `renderCall`/`renderResult`,
   including renderers added by a registration-time decorator, then adds foreground glyph framing.
@@ -403,8 +404,8 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
 - Tool-row framing: specialized/routine adapters → `withDefaultCollapsedToolRendering` →
   `wrapForSelfShell` (`src/runtime/tool-shell.ts`). This removes main-session state backgrounds and
   adds one lifecycle glyph while compacting only safely recognized settled successes; expansion
-  changes native detail without changing the marker. Live, exceptional, unfamiliar, and unbound
-  rows retain native detail inside the frame; malformed display fields fall back to a concise
+  changes retained/native detail without changing the marker. Live, exceptional, unfamiliar, and
+  unbound rows keep it inside the frame; malformed display fields fall back to a concise
   warning (see "`renderShell` — this is how you control blank lines and framing").
 
 **Untapped but available right now:** `ctx.ui.setFooter`/`setHeader`,
@@ -440,23 +441,26 @@ From `src/` (grep of `pi.*` / `ctx.ui.*`):
 4. **Framing:** use `renderShell: "self"` only when you truly want to own every line. The default
    shell supplies padded state-background framing only; renderers still own content, diffs, and
    width safety.
-5. **Hierarchy and paths:** accent only an explicitly allowlisted primary field; keep counts,
-   filters, durations, and hints muted without overriding warning/error roles. Snapshot the active
-   workspace and stable repository once per invocation, then format raw paths workspace-relative
-   first, visibly marked repository-relative second, and absolute otherwise. Historical/export
-   contexts use their supplied `cwd`, not mutable session state; sanitize only after classification.
-6. **Machine-mode boundary:** presentation decorators may change human renderer components only.
+5. **Hierarchy and paths:** use `semanticDisplayRow()` rather than rebuilding its hierarchy and
+   separator grammar. Snapshot the active workspace and stable repository once per invocation, then
+   format raw paths workspace-relative first, visibly marked repository-relative second, and absolute
+   otherwise. Historical/export contexts use their supplied `cwd`, not mutable session state;
+   sanitize only after classification.
+6. **Reachable detail:** separate semantic segments with centered dots. Show a cue only for settled
+   rows with retained hidden detail; resolve the configured expansion action, and fail open to detail
+   when that action is unbound.
+7. **Machine-mode boundary:** presentation decorators may change human renderer components only.
    They must not rewrite arguments, canonical results, transcripts, execution, or print/JSON/RPC
    output. Interactive UI remains TUI-gated as described under "The one mental model."
-7. **Color:** prefer an existing `ThemeColor` slot over raw ANSI so themes keep working; there are
+8. **Color:** prefer an existing `ThemeColor` slot over raw ANSI so themes keep working; there are
    no new slots.
-8. **Keys:** add via `registerShortcut` or handle inside your own component; do not try to reassign
+9. **Keys:** add via `registerShortcut` or handle inside your own component; do not try to reassign
    Pi's actions.
-9. **Upgrade safety:** if you touch `custom`/`widget`/`theme`/`setEditorComponent`, note it under
+10. **Upgrade safety:** if you touch `custom`/`widget`/`theme`/`setEditorComponent`, note it under
    "Risks / churn watchpoints" in [`doc/pi-integration.md`](pi-integration.md) and cover the
    import/shape in the Pi-contract smoke test — these are the newest, most-churning parts of the
    API.
-10. **Parity check:** a Claude Code project does not expect PiCC-specific persistent or interactive
+11. **Parity check:** a Claude Code project does not expect PiCC-specific persistent or interactive
    chrome. Make that UI additive and opt-in. Default tool-presentation adapters may apply
    automatically when they change only human rendering, preserve canonical results, and keep
    failures and unfamiliar outcomes visible.

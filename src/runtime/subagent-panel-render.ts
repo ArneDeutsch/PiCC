@@ -127,7 +127,7 @@ const MAX_INDENT_LEVELS = 6;
 const TYPE_RENDER_CAP = 60;
 const LABEL_RENDER_CAP = 160;
 const COLUMN_GAP = "  ";
-const DESCRIPTION_GAP = " ";
+const DESCRIPTION_SEPARATOR = " · ";
 const MIN_USEFUL_IDENTITY_WIDTH = 3;
 const MIN_USEFUL_DESCRIPTION_WIDTH = 3;
 /** Smallest ordinary row: state glyph + space + a useful identity fragment. */
@@ -181,8 +181,9 @@ function finiteUsageValue(row: PanelRowView, key: keyof NonNullable<PanelRowView
 }
 
 function preparePanelRow(row: PanelRowView, opts: PanelRenderOptions, focused: boolean): PlainPanelRow {
+  const comparableIdentity = scalarSafeText(sanitizeLine(row.agentType, LABEL_RENDER_CAP));
+  const comparableLabel = scalarSafeText(sanitizeLine(row.label, LABEL_RENDER_CAP));
   const identity = scalarSafeText(sanitizeLine(row.agentType, TYPE_RENDER_CAP)) || "agent";
-  const label = scalarSafeText(sanitizeLine(row.label, LABEL_RENDER_CAP));
   const rawCacheRead = finiteUsageValue(row, "cacheReadTokens");
   const rawCacheWrite = finiteUsageValue(row, "cacheWriteTokens");
   const cacheRead = rawCacheRead !== undefined && rawCacheRead > 0
@@ -202,7 +203,7 @@ function preparePanelRow(row: PanelRowView, opts: PanelRenderOptions, focused: b
     identity,
     status: row.state === "waiting" ? " [waiting]" : "",
     chip: row.hiddenDescendants > 0 ? ` (+${row.hiddenDescendants})` : "",
-    description: label && label !== identity ? label : "",
+    description: comparableLabel && comparableLabel !== comparableIdentity ? comparableLabel : "",
     metrics: {
       elapsed: formatElapsed(row.elapsedMs),
       input: input === undefined ? undefined : `in ${input}`,
@@ -216,10 +217,6 @@ function preparePanelRow(row: PanelRowView, opts: PanelRenderOptions, focused: b
 
 function leftPad(text: string, width: number): string {
   return `${" ".repeat(Math.max(0, width - visibleWidth(text)))}${text}`;
-}
-
-function rightPad(text: string, width: number): string {
-  return `${text}${" ".repeat(Math.max(0, width - visibleWidth(text)))}`;
 }
 
 function renderAggregate(view: PanelViewModel, opts: PanelRenderOptions): string[] {
@@ -267,10 +264,10 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
   const metricTotal = (): number =>
     [...active].reduce((sum, key) => sum + visibleWidth(COLUMN_GAP) + metricWidths.get(key)!, 0);
   const hasDescription = descriptionNaturalWidth > 0;
-  const descriptionGapWidth = hasDescription ? visibleWidth(DESCRIPTION_GAP) : 0;
+  const descriptionSeparatorWidth = hasDescription ? visibleWidth(DESCRIPTION_SEPARATOR) : 0;
   const naturalWidth = (): number =>
     fullGutterWidth + identityNaturalWidth + suffixNaturalWidth +
-      descriptionGapWidth + descriptionNaturalWidth + metricTotal();
+      descriptionSeparatorWidth + descriptionNaturalWidth + metricTotal();
   for (const key of DROP_ORDER) {
     if (naturalWidth() <= opts.width) break;
     active.delete(key);
@@ -283,20 +280,22 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
     Math.min(MIN_USEFUL_IDENTITY_WIDTH, visibleWidth(row.identity))
   ));
   const descriptionFits = hasDescription && availableLeft >=
-    fullGutterWidth + minimumIdentityWidth + suffixNaturalWidth +
-      descriptionGapWidth + MIN_USEFUL_DESCRIPTION_WIDTH;
+    fullGutterWidth + minimumIdentityWidth +
+      descriptionSeparatorWidth + MIN_USEFUL_DESCRIPTION_WIDTH;
   const suffixFits = availableLeft >=
-    fullGutterWidth + minimumIdentityWidth + suffixNaturalWidth;
+    fullGutterWidth + minimumIdentityWidth + suffixNaturalWidth +
+      (descriptionFits ? descriptionSeparatorWidth + MIN_USEFUL_DESCRIPTION_WIDTH : 0);
   const fullGutterFits = availableLeft >=
-    fullGutterWidth + minimumIdentityWidth + (suffixFits ? suffixNaturalWidth : 0);
+    fullGutterWidth + minimumIdentityWidth + (suffixFits ? suffixNaturalWidth : 0) +
+      (descriptionFits ? descriptionSeparatorWidth + MIN_USEFUL_DESCRIPTION_WIDTH : 0);
   const gutterWidth = fullGutterFits ? fullGutterWidth : 2;
   const suffixWidth = suffixFits ? suffixNaturalWidth : 0;
   const identityWidth = descriptionFits
     ? Math.min(identityNaturalWidth + suffixWidth,
-      availableLeft - gutterWidth - descriptionGapWidth - MIN_USEFUL_DESCRIPTION_WIDTH)
+      availableLeft - gutterWidth - descriptionSeparatorWidth - MIN_USEFUL_DESCRIPTION_WIDTH)
     : availableLeft - gutterWidth;
   const descriptionWidth = descriptionFits
-    ? availableLeft - gutterWidth - identityWidth - descriptionGapWidth
+    ? availableLeft - gutterWidth - identityWidth - descriptionSeparatorWidth
     : 0;
   const hasDescriptionCell = descriptionFits;
 
@@ -318,7 +317,13 @@ export function renderSubagentPanel(view: PanelViewModel, opts: PanelRenderOptio
     line += " ".repeat(Math.max(0, identityWidth - visibleWidth(identityPlain)));
     if (hasDescriptionCell) {
       const description = truncateToWidth(row.description, descriptionWidth, "…");
-      line += DESCRIPTION_GAP + panelFg(opts.theme, "text", rightPad(description, descriptionWidth));
+      if (description) {
+        line += panelFg(opts.theme, "muted", DESCRIPTION_SEPARATOR);
+        line += panelFg(opts.theme, "accent", description);
+        line += " ".repeat(Math.max(0, descriptionWidth - visibleWidth(description)));
+      } else {
+        line += " ".repeat(descriptionSeparatorWidth + descriptionWidth);
+      }
     } else if (active.size > 0) {
       line += " ".repeat(Math.max(0, availableLeft - gutterWidth - identityWidth));
     }
@@ -622,12 +627,18 @@ export function renderSubagentDetail(
             : "success";
   const glyphText = stateGlyph(rowState, opts.runningFrame);
   // agentName is the one deliberately-raw record field — sanitize at render.
-  const typeText = sanitizeLine(record.agentName, TYPE_RENDER_CAP) || "agent";
-  const labelText = sanitizeLine(record.description ?? "", LABEL_RENDER_CAP);
+  const comparableTypeText = scalarSafeText(sanitizeLine(record.agentName, LABEL_RENDER_CAP));
+  const comparableLabelText = scalarSafeText(
+    sanitizeLine(record.description ?? record.agentName, LABEL_RENDER_CAP),
+  );
+  const typeText = scalarSafeText(sanitizeLine(record.agentName, TYPE_RENDER_CAP)) || "agent";
+  const labelText = comparableLabelText !== comparableTypeText ? comparableLabelText : "";
   lines.push(
     `${themedFg(theme, STATE_COLOR[rowState], glyphText)} ` +
       (theme ? tintAgentColor(record.color, typeText) : typeText) +
-      (labelText && labelText !== typeText ? muted(` · ${labelText}`) : ""),
+      (labelText
+        ? `${muted(" · ")}${themedFg(theme, "accent", labelText)}`
+        : ""),
   );
   const elapsedEnd = operational
     ? data.nowMs
