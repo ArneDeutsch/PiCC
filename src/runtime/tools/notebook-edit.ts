@@ -288,7 +288,7 @@ function successResult(
     new_source: request.new_source,
     ...(facts.oldSource === undefined ? {} : { old_source: facts.oldSource }),
     ...(cellId === undefined ? {} : { cell_id: cellId }),
-    cell_type: request.cell_type ?? "code",
+    cell_type: facts.cellType,
     language,
     edit_mode: request.edit_mode ?? "replace",
     notebook_path: request.notebook_path,
@@ -386,7 +386,10 @@ export function createNotebookEditTool(
       notebook_path: Type.String({ description: "Absolute path to the .ipynb notebook." }),
       new_source: Type.String({ description: "Complete source for the inserted or replacement cell; empty for delete." }),
       cell_id: Type.Optional(Type.String({ description: "Cell identifier shown by Read." })),
-      cell_type: Type.Optional(Type.Union([Type.Literal("code"), Type.Literal("markdown")])),
+      cell_type: Type.Optional(Type.Union(
+        [Type.Literal("code"), Type.Literal("markdown")],
+        { description: "For replace, omit to preserve the existing cell type, including raw; inserts require code or markdown." },
+      )),
       edit_mode: Type.Optional(Type.Union([
         Type.Literal("replace"),
         Type.Literal("insert"),

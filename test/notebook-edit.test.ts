@@ -2,6 +2,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import * as piSdk from "@earendil-works/pi-coding-agent";
+import { buildStockBuiltinTools, type BuiltinToolSdk } from "../src/runtime/builtin-tools.js";
+import { CwdState } from "../src/runtime/cwd-state.js";
 import {
   NotebookSessionState,
   identifyNotebookHandle,
@@ -101,6 +104,57 @@ describe("NotebookEdit authorization and mutation", () => {
     expect(resultText(result)).toContain("Read");
     expect(resultText(result)).toContain("No changes were written.");
     expect(fs.readFileSync(file)).toEqual(before);
+  });
+
+  it("reads, addresses, and semantically preserves raw cells through the filesystem-backed workflow", async () => {
+    const { dir, file } = fixture();
+    const document = JSON.parse(fs.readFileSync(file, "utf8"));
+    const untouchedRaw = {
+      cell_type: "raw",
+      id: "raw-untouched",
+      source: ["keep raw\\n", "exactly"],
+      metadata: { nested: { keep: true } },
+      attachments: { custom: [{ value: 1 }] },
+      custom_field: { constructor: "data", prototype: ["nested"] },
+    };
+    document.cells.splice(1, 0,
+      { cell_type: "raw", id: "raw-target", source: ["old raw\\n", "source"], metadata: { target: true } },
+      untouchedRaw,
+    );
+    fs.writeFileSync(file, JSON.stringify(document, null, 1));
+
+    const state = new NotebookSessionState();
+    const builtins = buildStockBuiltinTools(piSdk as unknown as BuiltinToolSdk, new CwdState(dir), {
+      settingsEnv: {},
+      projectRoot: dir,
+      notebookSession: state,
+    });
+    const read = builtins.find((tool) => tool.name === "read")!.def as {
+      execute(...args: unknown[]): Promise<unknown>;
+    };
+    const readResult = await read.execute("read-raw", { path: file }, undefined, undefined, {
+      model: { input: ["text"] },
+    }) as { content: Array<{ type: string; text?: string }>; isError?: boolean };
+    expect(readResult.isError).not.toBe(true);
+    expect(readResult.content.map((block) => block.text ?? "").join("\n")).toContain("raw-target");
+
+    const run = editor(dir, state, { generateCellIdCandidate: () => "1234abcd" });
+    const replaced = await run({ notebook_path: file, new_source: "new raw", cell_id: "raw-target" });
+    expect(replaced.isError).not.toBe(true);
+    expect(replaced.details).toMatchObject({ cell_id: "raw-target", cell_type: "raw", old_source: "old raw\\nsource" });
+    expect(JSON.parse(fs.readFileSync(file, "utf8")).cells.find((cell: { id?: string }) => cell.id === "raw-untouched"))
+      .toEqual(untouchedRaw);
+
+    const inserted = await run({
+      notebook_path: file, new_source: "after raw", cell_id: "raw-target", cell_type: "markdown", edit_mode: "insert",
+    });
+    expect(inserted.details).toMatchObject({ cell_id: "1234abcd", cell_type: "markdown" });
+
+    const deleted = await run({ notebook_path: file, new_source: "", cell_id: "raw-target", edit_mode: "delete" });
+    expect(deleted.details).toMatchObject({ cell_id: "raw-target", cell_type: "raw" });
+    const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(saved.cells.some((cell: { id?: string }) => cell.id === "raw-target")).toBe(false);
+    expect(saved.cells.find((cell: { id?: string }) => cell.id === "raw-untouched")).toEqual(untouchedRaw);
   });
 
   it("replaces sequentially, clears stale code execution state, and returns Claude-shaped output", async () => {
@@ -217,13 +271,13 @@ describe("NotebookEdit authorization and mutation", () => {
     expect(text.replaceAll("\r\n", "")).not.toContain("\n");
   });
 
-  it("pins delete output and the requested-type/default compatibility quirk", async () => {
+  it("reports the actual stored type while retaining current conversion behavior", async () => {
     const { dir, file } = fixture();
     const state = new NotebookSessionState();
     await authorize(state, file);
     const run = editor(dir, state);
     const markdown = await run({ notebook_path: file, new_source: "changed markdown", cell_id: "real-md" });
-    expect(markdown.details).toMatchObject({ cell_type: "code", old_source: "hello\nworld" });
+    expect(markdown.details).toMatchObject({ cell_type: "markdown", old_source: "hello\nworld" });
     const deleted = await run({ notebook_path: file, new_source: "ignored", cell_id: "real-md", edit_mode: "delete", cell_type: "markdown" });
     expect(resultText(deleted)).toBe("Deleted cell real-md");
     expect(deleted.details).toMatchObject({ cell_id: "real-md", cell_type: "markdown", edit_mode: "delete" });
@@ -277,6 +331,18 @@ describe("NotebookEdit authorization and mutation", () => {
 });
 
 describe("NotebookEdit compatibility, failure, and filesystem matrix", () => {
+  it("keeps request cell types narrow and makes replacement omission semantics discoverable", () => {
+    const tool = createNotebookEditTool(() => "/work", new NotebookSessionState());
+    const parameters = tool.parameters as unknown as {
+      properties: { cell_type: { anyOf: unknown[]; description?: string } };
+    };
+    expect(parameters.properties.cell_type.anyOf).toEqual([
+      { const: "code", type: "string" },
+      { const: "markdown", type: "string" },
+    ]);
+    expect(parameters.properties.cell_type.description).toContain("omit to preserve the existing cell type, including raw");
+  });
+
   it("covers the complete schema-bypass field matrix without writes or secret leakage", async () => {
     const { dir, file } = fixture();
     const run = editor(dir, new NotebookSessionState());

@@ -1,10 +1,11 @@
 export type NotebookEditMode = "replace" | "insert" | "delete";
 export type NotebookCellType = "code" | "markdown";
+export type NotebookStoredCellType = NotebookCellType | "raw";
 export type NotebookEncoding = "utf8" | "utf16le" | "utf16be";
 export type NotebookNewline = "\n" | "\r\n";
 
 export interface NotebookCell extends Record<string, unknown> {
-  cell_type: NotebookCellType;
+  cell_type: NotebookStoredCellType;
   source: string | string[];
 }
 
@@ -31,8 +32,8 @@ export interface NotebookMutationResult {
   mode: NotebookEditMode;
   resolvedIndex?: number;
   resultingIndex: number;
-  cellType: NotebookCellType;
-  previousCellType?: NotebookCellType;
+  cellType: NotebookStoredCellType;
+  previousCellType?: NotebookStoredCellType;
   oldSource?: string;
   newSource?: string;
   addressedCellId?: string;
@@ -96,7 +97,7 @@ export function validateNotebookDocument(value: unknown): NotebookDocument {
     }
     const cell = value.cells[index];
     if (!isRecord(cell)) throw new Error(`Notebook cell ${index} must be an object`);
-    if (cell.cell_type !== "code" && cell.cell_type !== "markdown") {
+    if (cell.cell_type !== "code" && cell.cell_type !== "markdown" && cell.cell_type !== "raw") {
       throw new Error(`Notebook cell ${index} has invalid "cell_type"`);
     }
     if (typeof cell.source !== "string" && !isDenseStringArray(cell.source)) {
