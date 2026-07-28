@@ -161,10 +161,14 @@ describe.skipIf(cliMissing)("e2e notebook: real Pi Read to NotebookEdit workflow
     for (const name of ["notebook_path", "new_source", "cell_id"] as const) {
       expect(requireRecord(properties[name], `NotebookEdit ${name}`).type).toBe("string");
     }
-    expect(requireRecord(properties.cell_type, "NotebookEdit cell_type").anyOf).toEqual([
+    const cellTypeProperty = requireRecord(properties.cell_type, "NotebookEdit cell_type");
+    expect(cellTypeProperty.anyOf).toEqual([
       { const: "code", type: "string" },
       { const: "markdown", type: "string" },
     ]);
+    expect(cellTypeProperty.description).toBe(
+      "For replace, omit to preserve the existing cell type, including raw; inserts require code or markdown.",
+    );
     expect(requireRecord(properties.edit_mode, "NotebookEdit edit_mode").anyOf).toEqual([
       { const: "replace", type: "string" },
       { const: "insert", type: "string" },
@@ -176,10 +180,15 @@ describe.skipIf(cliMissing)("e2e notebook: real Pi Read to NotebookEdit workflow
     expect(readText).toContain("=== Cell 1 (code, id=cell-1) ===");
     expect(readText).toContain("=== Cell 2 (code, id=log) ===");
     expect(readText).toContain("=== Cell 3 (code, id=plot) ===");
+    expect(readText).toContain("=== Cell 4 (raw, id=raw-notes) ===");
+    expect(readText).toContain("=== Cell 5 (code, id=expected-error) ===");
     expect(readText).toContain("print('replace through fallback')");
     expect(readText).toContain("stale fallback output");
     expect(readText).toContain("training complete");
     expect(readText).toContain("image/png");
+    expect(readText).toContain("RAW_CELL_SENTINEL");
+    expect(readText).toContain("FixtureError: STABLE_ERROR_VALUE");
+    expect(readText).toContain("<fixture traceback sentinel>");
     expect(textContent(toolMessage(result.requests[2]!, "call_1_0"))).toBe(
       `Updated cell cell-1 with ${replacementSource}`,
     );
@@ -234,6 +243,7 @@ describe.skipIf(cliMissing)("e2e notebook: real Pi Read to NotebookEdit workflow
       updated_file: fs.readFileSync(notebookPath, "utf8"),
     });
 
+    const originalNotebook = JSON.parse(fixtureOriginal);
     const afterReplace = JSON.parse(replace.details.updated_file);
     const afterInsert = JSON.parse(insert.details.updated_file);
     const finalNotebook = JSON.parse(remove.details.updated_file);
@@ -244,17 +254,25 @@ describe.skipIf(cliMissing)("e2e notebook: real Pi Read to NotebookEdit workflow
       metadata: { fixture_canary: "fallback-cell-metadata" },
     });
     expect(afterInsert.cells.map((cell: any) => cell.id ?? "fallback")).toEqual([
-      "intro", "fallback", "log", insertedId, "plot",
+      "intro", "fallback", "log", insertedId, "plot", "raw-notes", "expected-error",
     ]);
     expect(finalNotebook.cells.map((cell: any) => cell.id ?? "fallback")).toEqual([
-      "fallback", "log", insertedId, "plot",
+      "fallback", "log", insertedId, "plot", "raw-notes", "expected-error",
     ]);
     expect(finalNotebook.cells.map((cell: any) => cell.source)).toEqual([
       replacementSource,
       ["print('training complete')"],
       insertedSource,
       ["fig"],
+      ["RAW_CELL_SENTINEL\n", "Preserve this source representation."],
+      ["raise FixtureError('STABLE_ERROR_VALUE')"],
     ]);
+    expect(finalNotebook.cells.find((cell: any) => cell.id === "raw-notes")).toEqual(
+      originalNotebook.cells.find((cell: any) => cell.id === "raw-notes"),
+    );
+    expect(finalNotebook.cells.find((cell: any) => cell.id === "expected-error")).toEqual(
+      originalNotebook.cells.find((cell: any) => cell.id === "expected-error"),
+    );
     expect(finalNotebook.metadata).toEqual({
       kernelspec: { display_name: "Python 3", language: "python", name: "python3" },
     });
