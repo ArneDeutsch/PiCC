@@ -290,9 +290,9 @@ describe("Task tools", () => {
 
 describe("degrade stubs", () => {
   it("return non-error content and are callable with arbitrary params", async () => {
-    const stub = createDegradeStub("NotebookEdit", "notebook editing is not implemented");
+    const stub = createDegradeStub("AskUserQuestion", "ask in plain chat");
     const res = await run(stub, { anything: 123, nested: { deep: true }, cells: ["x"] });
-    expect(res.text).toContain("The NotebookEdit tool is not available in PiCC");
+    expect(res.text).toContain("The AskUserQuestion tool is not available in PiCC");
     expect(res.text).toContain("Proceed without it.");
     expect(res.details.degraded).toBe(true);
   });
@@ -301,7 +301,6 @@ describe("degrade stubs", () => {
     const names = DEGRADED_TOOLS.map((d) => d.name);
     expect(names).toEqual(
       expect.arrayContaining([
-        "NotebookEdit",
         "AskUserQuestion",
         "ExitPlanMode",
         "EnterPlanMode",
@@ -309,6 +308,7 @@ describe("degrade stubs", () => {
         "computer",
       ]),
     );
+    expect(names).not.toContain("NotebookEdit");
     // Every listed stub instantiates and executes without throwing.
     for (const { name, note, redirect } of DEGRADED_TOOLS) {
       const res = await run(createDegradeStub(name, note, { redirect }), {});

@@ -202,20 +202,22 @@ Then use it like Claude Code:
 In the interactive TUI, each main-session tool row has one foreground state marker: `○` running,
 `●` success, `✗` failure, or `■` stopped/aborted. Lifecycle tools show the meaningful underlying
 outcome even when their transport call succeeds. An ordinary settled Read appears as
-`● read <path><optional-range>` and Bash as `● bash $ <command><optional-timeout>`, each clamped to
-the terminal width with its result body hidden. Other routine successes retain compact,
-semantically useful detail. The configured `app.tools.expand` action (Ctrl+O by default) reveals
-retained/native detail without changing the marker. It cannot recover bytes Pi or PiCC already
+`● read <path><optional-range>`, Bash as `● bash $ <command><optional-timeout>`, and NotebookEdit as
+`● notebook write <path><optional-operation-and-cell>`, each clamped to the terminal width with its
+result body hidden. Other routine successes retain compact, semantically useful detail. The
+configured `app.tools.expand` action (Ctrl+O by default) reveals retained/native detail without
+changing the marker. It cannot recover bytes Pi or PiCC already
 removed through canonical clipping or truncation.
 
 Pending/streaming work, errors, aborts, clipping or truncation notices, recovery guidance, images,
 MCP tools, search, and subagent/task records keep bounded detail appropriate to their semantics.
-When `app.tools.expand` is unbound, a row whose hidden detail would otherwise be inaccessible fails
-open and shows it. Search and subagent completion rows keep a complete configured-action cue,
-placing it on a separate row when necessary, and fail open when no usable cue exists. At an
-unusably narrow terminal, when expansion is available but its cue cannot fit, they show only bounded
-semantic state instead of a large body; detail waits for widening, and resize guidance appears only
-when it fits. In PiCC compact summaries, paths
+When `app.tools.expand` is unbound, an ordinary row whose hidden detail would otherwise be
+inaccessible fails open and shows it. NotebookEdit deliberately keeps cell source private and shows
+a configuration recovery note instead. Search and subagent completion rows keep a complete
+configured-action cue, placing it on a separate row when necessary, and fail open when no usable cue
+exists. At an unusably narrow terminal, when expansion is available but its cue cannot fit, they show
+only bounded semantic state instead of a large body; detail waits for widening, and resize guidance
+appears only when it fits. In PiCC compact summaries, paths
 within the invocation-time workspace are relative to it; paths elsewhere in the repository use a
 visibly marked repository-relative form, and external paths remain absolute. Eligible custom PiCC
 fragments in HTML exports use the export context
@@ -488,8 +490,9 @@ What that means when you write rules:
 argument, which makes it best-effort — Claude Code's own limit, not a PiCC gap:
 
 1. **Confidentiality ≠ integrity.** A scoped `deny: Read(<path>)` also blocks `Grep`, `Glob`,
-   `NotebookRead`, `Edit`, and `MultiEdit` on a matching path — but **not** `Write` or
-   `NotebookEdit`. To make a path immutable, add `deny: Edit(<path>)` **and** `deny: Write(<path>)`.
+   `NotebookRead`, `Edit`, and `MultiEdit` on a matching path, but does not directly match `Write` or
+   `NotebookEdit`. A denied notebook normally cannot satisfy NotebookEdit's required successful-Read
+   snapshot. To make a path immutable, add `deny: Edit(<path>)` **and** `deny: Write(<path>)`.
 2. **Pathless read calls aren't matched.** `Grep {}` has no path for the matcher to test, yet its
    results can surface protected content. Only a **bare** `deny: Read` forecloses that — at the cost
    of removing `Read`/`Grep`/`Glob`/`NotebookRead` entirely. It does **not** also strip `Edit`/

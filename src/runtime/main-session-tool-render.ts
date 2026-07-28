@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { withDefaultCollapsedToolRendering } from "./default-collapsed-tool-render.js";
+import { withNotebookEditRendering } from "./notebook-edit-render.js";
 import { withRoutineToolRendering } from "./routine-tool-render.js";
 import { withCompactSearchRendering } from "./search-tool-render.js";
 import { wrapForSelfShell } from "./tool-shell.js";
@@ -27,7 +28,10 @@ export function renderMainSessionTool<T extends ToolDefinition>(
   const searched = SEARCH_NAMES.has(tool.name)
     ? withCompactSearchRendering(tool, display)
     : tool;
-  const routine = withRoutineToolRendering(searched, {
+  const specialized = tool.name === "NotebookEdit"
+    ? withNotebookEditRendering(searched, display)
+    : searched;
+  const routine = withRoutineToolRendering(specialized, {
     ...display,
     resolveEditRenderCwd: options.resolveEditRenderCwd,
   });

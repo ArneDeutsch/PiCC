@@ -18,6 +18,7 @@ import { fakeSdk, type FakeCustomTool, type FakeSessionState } from "./helpers/f
 import { deferred, waitUntil } from "./helpers/async.js";
 import { cleanupFixture, materializeFixture } from "./helpers/fixture.js";
 import { loadSkills } from "../src/claude/skills.js";
+import type { NotebookSessionState } from "../src/runtime/notebook-session.js";
 
 /**
  * Integration + NFR tests: the whole extension wired against
@@ -27,6 +28,7 @@ import { loadSkills } from "../src/claude/skills.js";
 
 let dir: string;
 let pi: FakePi;
+let getActiveNotebookState: () => NotebookSessionState;
 const originalCwd = process.cwd();
 const compatAckSentinel = '{"suppressed":true,"sentinel":"KEEP-BYTES"}\n';
 const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
@@ -47,7 +49,10 @@ beforeAll(async () => {
   process.env.PICC_CLAUDE_USER_DIR = userDir;
   process.chdir(dir);
   pi = fakePi();
-  picc(pi.api as never, { onInitializationSettled: pi.captureInitialization });
+  picc(pi.api as never, {
+    onInitializationSettled: pi.captureInitialization,
+    onWired: (internals) => { getActiveNotebookState = internals.getActiveNotebookState; },
+  });
   await pi.waitForInitialization();
   await pi.waitForTools(["bash", "read", "write", "edit", "grep", "find", "ls"]);
 });
@@ -149,6 +154,7 @@ describe("tool surface registration", () => {
       "Grep",
       "Glob",
       "NotebookRead",
+      "NotebookEdit",
       "MultiEdit",
       "EnterWorktree",
       "ExitWorktree",
@@ -176,9 +182,11 @@ describe("tool surface registration", () => {
       "WebFetch", "WebSearch", "Grep", "Glob", "MultiEdit", "Skill", "SlashCommand",
       "EnterWorktree", "ExitWorktree", "TaskCreate", "TaskUpdate", "TaskGet",
     ]);
-    add("specialized", ["Agent", "Task", "SendMessage", "TaskOutput", "TaskStop", "TaskList", "TodoWrite"]);
+    add("specialized", [
+      "Agent", "Task", "SendMessage", "TaskOutput", "TaskStop", "TaskList", "TodoWrite", "NotebookEdit",
+    ]);
     add("generic-fail-open", [
-      "NotebookRead", "NotebookEdit", "AskUserQuestion", "ExitPlanMode", "EnterPlanMode", "Artifact",
+      "NotebookRead", "AskUserQuestion", "ExitPlanMode", "EnterPlanMode", "Artifact",
       "computer", "LSP", "BashOutput", "KillShell", "KillBash",
     ]);
 
@@ -214,6 +222,151 @@ describe("tool surface registration", () => {
       if (matches[0] === "generic-fail-open") {
         expect(String(tool.description)).toContain("degraded no-op");
       }
+    }
+  });
+
+  it("shares main Read/Edit state per branch and persists only bounded non-model-visible snapshots", async () => {
+    const notebookPath = path.join(dir, "wired-notebook.ipynb");
+    fs.writeFileSync(notebookPath, JSON.stringify({
+      cells: [{ cell_type: "code", id: "cell-a", metadata: {}, source: "old", execution_count: 1, outputs: [] }],
+      metadata: {},
+      nbformat: 4,
+      nbformat_minor: 5,
+    }), "utf8");
+    const branchA: unknown[] = [];
+    const sessionManager = { getBranch: () => branchA, getSessionFile: () => undefined };
+    pi.entries.length = 0;
+    await pi.fire("session_start", { reason: "startup" }, pi.ctx({ sessionManager }));
+
+    const unread = await pi.tools.get("NotebookEdit").execute("edit-unread", {
+      notebook_path: notebookPath,
+      new_source: "blocked",
+      cell_id: "cell-a",
+    });
+    expect(unread.isError).toBe(true);
+
+    await pi.tools.get("read").execute("read-notebook", { path: notebookPath });
+    const firstEdit = await pi.tools.get("NotebookEdit").execute("edit-authorized", {
+      notebook_path: notebookPath,
+      new_source: "first",
+      cell_id: "cell-a",
+    });
+    expect(firstEdit.isError).not.toBe(true);
+    const persisted = pi.entries.filter((entry) => entry.customType === "picc-notebook-session");
+    expect(persisted.length).toBeGreaterThanOrEqual(2);
+    for (const entry of persisted) {
+      expect(Object.keys(entry.data).sort()).toEqual(["generation", "records", "version"]);
+      expect(JSON.stringify(entry.data)).not.toContain("old");
+      branchA.push({ type: "custom", customType: entry.customType, data: entry.data });
+    }
+
+    const outgoingState = getActiveNotebookState();
+    await pi.fire("session_before_switch", {}, pi.ctx());
+    const entriesAtAcceptedSwitch = pi.entries.length;
+    outgoingState.recordRead({
+      normalizedPath: notebookPath,
+      canonicalPath: notebookPath,
+      fingerprint: "a".repeat(64),
+    }, Buffer.from("late outgoing transition"));
+    expect(pi.entries).toHaveLength(entriesAtAcceptedSwitch);
+
+    const gapEdit = await pi.tools.get("NotebookEdit").execute("edit-switch-gap", {
+      notebook_path: notebookPath,
+      new_source: "gap-leak",
+      cell_id: "cell-a",
+    });
+    expect(gapEdit.isError).toBe(true);
+
+    await pi.fire("session_start", { reason: "new" }, pi.ctx({
+      sessionManager: { getBranch: () => [], getSessionFile: () => undefined },
+    }));
+    const isolated = await pi.tools.get("NotebookEdit").execute("edit-new-session", {
+      notebook_path: notebookPath,
+      new_source: "leaked",
+      cell_id: "cell-a",
+    });
+    expect(isolated.isError).toBe(true);
+
+    await pi.fire("session_before_switch", {}, pi.ctx());
+    await pi.fire("session_start", { reason: "resume" }, pi.ctx({
+      sessionManager: {
+        getBranch: () => [...branchA, {
+          type: "custom",
+          customType: "picc-notebook-session",
+          data: { version: 1, generation: 2, records: new Array(65).fill({}) },
+        }],
+        getSessionFile: () => undefined,
+      },
+    }));
+    const corruptNewest = await pi.tools.get("NotebookEdit").execute("edit-corrupt-resume", {
+      notebook_path: notebookPath,
+      new_source: "must-not-fallback",
+      cell_id: "cell-a",
+    });
+    expect(corruptNewest.isError).toBe(true);
+
+    await pi.fire("session_before_switch", {}, pi.ctx());
+    await pi.fire("session_start", { reason: "resume" }, pi.ctx({ sessionManager }));
+    const restored = await pi.tools.get("NotebookEdit").execute("edit-restored", {
+      notebook_path: notebookPath,
+      new_source: "restored",
+      cell_id: "cell-a",
+    });
+    expect(restored.isError).not.toBe(true);
+    expect(JSON.parse(fs.readFileSync(notebookPath, "utf8")).cells[0].source).toBe("restored");
+    fs.rmSync(notebookPath, { force: true });
+  });
+
+  it("keeps live edits successful across append failure and restores only the last persisted snapshot", async () => {
+    const notebookPath = path.join(dir, "append-failure-notebook.ipynb");
+    fs.writeFileSync(notebookPath, JSON.stringify({
+      cells: [{ cell_type: "code", id: "cell-a", metadata: {}, source: "old", execution_count: null, outputs: [] }],
+      metadata: {},
+      nbformat: 4,
+      nbformat_minor: 5,
+    }), "utf8");
+    const branch: unknown[] = [];
+    const originalAppendEntry = pi.api.appendEntry;
+    try {
+      pi.api.appendEntry = (customType: string, data: unknown) => {
+        pi.entries.push({ customType, data });
+        branch.push({ type: "custom", customType, data });
+      };
+      await pi.fire("session_before_switch", {}, pi.ctx());
+      await pi.fire("session_start", { reason: "startup" }, pi.ctx({
+        sessionManager: { getBranch: () => branch, getSessionFile: () => undefined },
+      }));
+      await pi.tools.get("read").execute("persisted-read", { path: notebookPath });
+      expect(branch).toHaveLength(1);
+
+      pi.api.appendEntry = () => { throw new Error("scripted append failure"); };
+      const entryCount = pi.entries.length;
+      const messageCount = pi.messages.length;
+      const edited = await pi.tools.get("NotebookEdit").execute("live-edit", {
+        notebook_path: notebookPath,
+        new_source: "live-success",
+        cell_id: "cell-a",
+      });
+      expect(edited.isError).not.toBe(true);
+      expect(pi.entries).toHaveLength(entryCount);
+      expect(pi.messages).toHaveLength(messageCount);
+      expect(JSON.parse(fs.readFileSync(notebookPath, "utf8")).cells[0].source).toBe("live-success");
+
+      await pi.fire("session_before_switch", {}, pi.ctx());
+      await pi.fire("session_start", { reason: "resume" }, pi.ctx({
+        sessionManager: { getBranch: () => branch, getSessionFile: () => undefined },
+      }));
+      const restored = await pi.tools.get("NotebookEdit").execute("restored-old-snapshot", {
+        notebook_path: notebookPath,
+        new_source: "must-not-write",
+        cell_id: "cell-a",
+      });
+      expect(restored.isError).toBe(true);
+      expect(restored.content[0].text).toContain("changed after the authorizing Read");
+      expect(JSON.parse(fs.readFileSync(notebookPath, "utf8")).cells[0].source).toBe("live-success");
+    } finally {
+      pi.api.appendEntry = originalAppendEntry;
+      fs.rmSync(notebookPath, { force: true });
     }
   });
 

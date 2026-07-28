@@ -187,7 +187,7 @@ export function createGuardExtension(deps: GuardDeps) {
       const contextParts: string[] = [];
       if (outcome.additionalContext) contextParts.push(outcome.additionalContext);
 
-      const touched = touchedFilePath(event.toolName, input);
+      const touched = touchedFilePath(event.toolName, input, deps.getCwd());
       if (touched && deps.contextForTouchedFile) {
         const injected = deps.contextForTouchedFile(touched);
         if (injected) contextParts.push(injected);

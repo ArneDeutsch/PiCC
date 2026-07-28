@@ -71,6 +71,7 @@ import {
 import { BackgroundTaskRegistry, createTaskOutputTool } from "../src/runtime/background-tasks.js";
 import { MainSessionCheckpointGate } from "../src/runtime/mid-run-compaction.js";
 import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
+import { createNotebookEditTool } from "../src/runtime/tools/notebook-edit.js";
 import { visibleWidth as tuiVisibleWidth, Text as TuiText } from "@earendil-works/pi-tui";
 import type { ProgressSnapshot } from "../src/runtime/subagent-progress.js";
 import {
@@ -168,10 +169,16 @@ describe("tool-map", () => {
   });
 
   it("reports touched files only for file tools", () => {
-    expect(touchedFilePath("read", { path: "a.ts" })).toBe("a.ts");
-    expect(touchedFilePath("edit", { file_path: "b.ts" })).toBe("b.ts");
-    expect(touchedFilePath("MultiEdit", { file_path: "x.ts" })).toBe("x.ts");
-    expect(touchedFilePath("bash", { command: "cat a.ts" })).toBeUndefined();
+    expect(touchedFilePath("read", { path: "a.ts" }, "/work")).toBe("a.ts");
+    expect(touchedFilePath("edit", { file_path: "b.ts" }, "/work")).toBe("b.ts");
+    expect(touchedFilePath("MultiEdit", { file_path: "x.ts" }, "/work")).toBe("x.ts");
+    const cwd = path.resolve("worktree");
+    expect(touchedFilePath("NotebookEdit", { notebook_path: "notes/book.ipynb" }, cwd))
+      .toBe(path.resolve(cwd, "notes/book.ipynb"));
+    const foreign = process.platform === "win32" ? "/rooted/book.ipynb" : "C:\\rooted\\book.ipynb";
+    expect(touchedFilePath("NotebookEdit", { notebook_path: foreign }, cwd)).toBeUndefined();
+    expect(touchedFilePath("NotebookEdit", { notebook_path: "notes/book.txt" }, cwd)).toBeUndefined();
+    expect(touchedFilePath("bash", { command: "cat a.ts" }, "/work")).toBeUndefined();
   });
 });
 
@@ -1031,6 +1038,41 @@ describe("SubagentRuntime (fake SDK)", () => {
     expect(customToolNames).not.toContain("bash");
   });
 
+  it("threads one runtime-owned notebook state into the child Read and NotebookEdit", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "picc-child-notebook-state-"));
+    const notebookPath = path.join(cwd, "shared.ipynb");
+    fs.writeFileSync(notebookPath, JSON.stringify({
+      cells: [{ cell_type: "code", id: "cell-a", metadata: {}, source: "old", execution_count: null, outputs: [] }],
+      metadata: {}, nbformat: 4, nbformat_minor: 5,
+    }));
+    let factoryState: unknown;
+    try {
+      const { sdk } = fakeSdk({
+        onPrompt: async (_text, session) => {
+          await session.customTools.find((tool) => tool.name === "read")!
+            .execute("read", { path: "shared.ipynb" });
+          const result = await session.customTools.find((tool) => tool.name === "NotebookEdit")!
+            .execute("edit", { notebook_path: "shared.ipynb", new_source: "updated", cell_id: "cell-a" });
+          expect(result.content[0]?.text).toContain("Updated cell cell-a");
+          return "done";
+        },
+      });
+      const runtime = makeSubagentRuntime([makeAgent({ tools: ["Read", "NotebookEdit"] })], sdk, {
+        getCwd: () => cwd,
+        allKnownToolNames: () => ["Read", "NotebookEdit"],
+        customToolsFor: (_agent, _granted, _depth, _owner, _fork, subCwd, notebookSession) => {
+          factoryState = notebookSession;
+          return [createNotebookEditTool(() => subCwd!.get(), notebookSession)];
+        },
+      });
+      await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+      expect(factoryState).toBeDefined();
+      expect(JSON.parse(fs.readFileSync(notebookPath, "utf8")).cells[0].source).toBe("updated");
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("subagent built-ins re-resolve to the new cwd after its own EnterWorktree, in lockstep with the guard (BUG 2)", async () => {
     // The dispatch builds the factory built-ins, the guard (getCwd), and the
     // custom tools ALL against ONE dispatch-local `subCwd` instance. `customToolsFor`
@@ -1053,7 +1095,7 @@ describe("SubagentRuntime (fake SDK)", () => {
       },
     });
     const runtime = makeSubagentRuntime([makeAgent({ tools: ["Read", "Bash"] })], sdk, {
-      customToolsFor: (_a: ClaudeAgent, _g: string[], _d: number, _o: string, _f: boolean, subCwd) => {
+      customToolsFor: (_a: ClaudeAgent, _g: string[], _d: number, _o: string, _f: boolean, subCwd, _notebook, _activation, _stop) => {
         capturedSubCwd = subCwd;
         return [
           {
@@ -1478,7 +1520,7 @@ describe("SubagentRuntime (fake SDK)", () => {
       hookRunner,
       maxDepth: 2,
       allKnownToolNames: () => ["Agent", "Task"],
-      customToolsFor: (_agent, _granted, depth, ownerAgentId, dispatcherIsFork, _cwd, _activation, captureUniversalStop) =>
+      customToolsFor: (_agent, _granted, depth, ownerAgentId, dispatcherIsFork, _cwd, _notebook, _activation, captureUniversalStop) =>
         depth === 1
           ? [
               createAgentToolDefinition(runtime, {
@@ -1541,7 +1583,7 @@ describe("SubagentRuntime (fake SDK)", () => {
       },
     });
     const runtime: SubagentRuntime = makeSubagentRuntime(agents, sdk, {
-      customToolsFor: (_a: ClaudeAgent, _g: string[], depth: number) =>
+      customToolsFor: (_a: ClaudeAgent, _g: string[], depth: number, _owner, _fork, _cwd, _notebook, _activation, _stop) =>
         depth + 1 <= 2 ? [createAgentToolDefinition(runtime, { depth, name: "Agent" })] : [],
       allKnownToolNames: () => ["Read"],
       concurrency: 1, // old code: guaranteed deadlock for ANY depth-2 nesting
@@ -1631,7 +1673,7 @@ describe("SubagentRuntime (fake SDK)", () => {
       maxDepth: 2,
       // Mirror index.ts's real wiring: the dispatching subagent's Agent tool carries
       // dispatchCwd sourced from its own dispatch-local subCwd.
-      customToolsFor: (_a: ClaudeAgent, _g: string[], depth: number, _o: string, _f: boolean, subCwd?: CwdState) =>
+      customToolsFor: (_a: ClaudeAgent, _g: string[], depth: number, _o: string, _f: boolean, subCwd: CwdState | undefined, _notebook, _activation, _stop) =>
         depth + 1 <= 2 && subCwd
           ? [createAgentToolDefinition(runtime, { depth, name: "Agent", dispatchCwd: () => subCwd.get() })]
           : [],
@@ -1758,7 +1800,7 @@ describe("SubagentRuntime (fake SDK)", () => {
     // customToolsFor sees the RESOLVED agent on every dispatch (the fake loader
     // never calls the lazy systemPromptOverride).
     const { runtime } = makeRuntime([makeAgent()], ["gp-done"], {
-      customToolsFor: (a: ClaudeAgent) => {
+      customToolsFor: (a: ClaudeAgent, _granted, _depth, _owner, _fork, _cwd, _notebook, _activation, _stop) => {
         seen.push(a);
         return [];
       },
@@ -1773,7 +1815,9 @@ describe("SubagentRuntime (fake SDK)", () => {
   it("built-ins resolve AFTER project agents: a project Explore overrides the built-in", async () => {
     const seen: ClaudeAgent[] = [];
     const capture = {
-      customToolsFor: (a: ClaudeAgent) => {
+      customToolsFor: (a: ClaudeAgent, _granted: string[], _depth: number, _owner: string,
+        _fork: boolean, _cwd: CwdState | undefined, _notebook: unknown, _activation: unknown,
+        _stop?: () => () => boolean) => {
         seen.push(a);
         return [];
       },

@@ -6,6 +6,7 @@ import {
   type BuiltinToolSdk,
 } from "../src/runtime/builtin-tools.js";
 import { CwdState } from "../src/runtime/cwd-state.js";
+import { NotebookSessionState } from "../src/runtime/notebook-session.js";
 
 const PROJECT_ROOT = "/home/proj/root";
 
@@ -163,6 +164,7 @@ describe("buildStockBuiltinTools structure (main + subagent shared path)", () =>
     const tools = buildStockBuiltinTools(sdk, new CwdState("/base"), {
       settingsEnv: {},
       projectRoot: PROJECT_ROOT,
+      notebookSession: new NotebookSessionState(),
     });
     expect(tools.map((t) => t.name)).toEqual([
       "bash",

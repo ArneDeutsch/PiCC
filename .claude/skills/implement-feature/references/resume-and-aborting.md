@@ -10,6 +10,23 @@ When a resume is *inferred* — the `feature/<feature-slug>` branch and/or featu
 
 A resume reconstructed from disk has no trustworthy in-session consent. Before any later public write (branch push, issue creation/comment, or PR creation), show the recovered frozen title verbatim alongside the recovered scope, reconstructed phase, slug/branch/worktree/plan identity, ticket target and reference (or ticketless state), and the exact remaining write contract, then require explicit confirmation. Freshly resolve `target`, `push`, `pushRemote`, and `targetDefault`; sanitize the durable `Ticket:` anchor and require its repo to match the re-derived **issue-host** — `target` **or** the freshly resolved `push` (the fork) — so a legitimate `<fork>#N` anchor is not rejected. A mismatch or declined confirmation stops before the write. This trust gate also establishes whether an already-fetched exact remote branch is confirmed as self-owned by this run; artifact agreement alone does not authorize a push.
 
+A reconstructed ticketless run without a valid durable `Ticket:` anchor may repeat
+[ticket-creation.md](ticket-creation.md)'s **file and continue**, **continue ticketless**, or
+change/reconsider choice only while the reconstructed run has not completed Phase 3. The exact frozen
+identity and scope, newly rendered exact issue preview, named target, and remaining write
+contract must be recoverable. Both complete choices continue from the reconstructed phase and never
+restart Phase 2. Record file-and-continue as canonical **file and build** and continue-ticketless as
+canonical **build ticketless**; normal Phase 3 routing handles filing.
+
+When that presentation contains every recovered identity, scope, preview, target, and remaining-write
+disclosure required by the generic trust gate, the complete per-item choice also satisfies it; ask no
+second confirmation. Ambiguous or bare replies authorize neither, and generic bare confirmation cannot
+substitute. Unrecoverable inputs follow the missing-artifact stop/re-enter-or-restart path with no
+issue write. A valid anchor instead adopts the ticket path without an offer. A reconstructed phase
+past Phase 3 with durable `Ticket: –` is canonical **build ticketless**: continue from that phase
+without re-offering, filing, or restarting Phase 2. Phase 3 duplicate matches remain a separate
+explicit reuse/new decision; ambiguous responses pause without a write.
+
 A branch created **before** this change — whose feature/review headings and commit prefix carry a leading number instead of a descriptive slug — no longer matches the descriptive resume grammar above. Such a resume simply falls through to the **generic mismatch stop** (list every disagreement, ask the user): a safe default, not undefined behavior.
 
 ## Aborting and backtracking

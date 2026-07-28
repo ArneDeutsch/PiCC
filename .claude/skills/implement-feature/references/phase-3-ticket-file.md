@@ -1,23 +1,22 @@
-# Phase 3 FILE step — file the accepted create-offer's issue and persist its anchor
+# Phase 3 FILE step — file the file-and-build issue and persist its anchor
 
-Read this at **Phase 3**, on the **ticketless** path, **only when the Phase 1 create-offer was
-accepted** — the deterministic branch in [phase-3-feature-spec.md](phase-3-feature-spec.md) sends you
-here on that already-known accept state. The given-ticket and declined-ticketless runs reach Phase 3
-but never run this step, so they never load this file. It is the deferred write half of the
-create-offer whose consent, preview, timing, and accept contract live in
+Read this at **Phase 3**, on the **ticketless** path, only for canonical **file and build** through
+the deterministic branch in [phase-3-feature-spec.md](phase-3-feature-spec.md). Given-ticket and
+build-ticketless runs never load this file. A valid durable anchor adopts the ticket path instead of
+invoking FILE. The consent, preview, timing, and contract live in
 [ticket-creation.md](ticket-creation.md).
 
 This is a `gh issue create` **write site**: load the nine-rules floor
 [ticket-integration.md](ticket-integration.md) first, and if it can't be read, **refuse the write**
 and tell the user.
 
-## Phase 3 FILE step (on accept)
+## Phase 3 FILE step (file-and-build outcome)
 
-At Phase 3, after `feature.md` is written, perform these together (both, or neither on a re-run):
+After `feature.md` is written, perform these together (both, or neither on a re-run):
 
-1. **Rule 9 dedup — mandatory, unconditional on every accept.** Before creating, run
+1. **Rule 9 dedup — mandatory for every file-and-build outcome.** Before creating, run
    `gh issue list --repo <target> --state all --search "<Title>" --json number,title,state,url`.
-   `<Title>` here must equal the display title frozen at build go byte-for-byte; do not derive or rewrite
+   `<Title>` here must equal the display title frozen at build authorization byte-for-byte; do not derive or rewrite
    a search placeholder.
    `--search` is **keyword-based, not typo-fuzzy**, so surface only **plausible** near-matches, framed
    as a reuse choice — "found a possibly-related issue #M — file new, or reuse it?" — and **reuse**
@@ -25,7 +24,7 @@ At Phase 3, after `feature.md` is written, perform these together (both, or neit
    exist yet); the resident anchor reader guards after.
 2. **File it.** Write the body with the Write tool to an **OS-temp path outside the worktree** (Rule 1),
    then `gh issue create --repo <target> --title "<Title>" --body-file <path>`. The title is one quoted
-   argument and is the display title frozen at build go. **Echo the new issue
+   argument and is the display title frozen at build authorization. **Echo the new issue
    URL** in-session (Rule 7); the body ends with the `<attribution trailer>` (Rule 8) and is
    leakage-stripped (Rule 6). On a fork the issue lands on `<target>` (the upstream).
 3. **Synthesize the cached-issue JSON** the Phase 0 gate would have produced, so every downstream
