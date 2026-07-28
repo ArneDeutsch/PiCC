@@ -1069,6 +1069,7 @@ describe("MainSessionCheckpointGate", () => {
   it.each([
     ["out-of-head", [{ type: "text", text: "later" }]],
     ["malformed", [{ type: "text", text: 1 }]],
+    ["extra-field text", [{ type: "text", text: "head", unsupported: true }]],
     ["unknown", [{ type: "audio", data: "bytes" }]],
     ["mismatched", [{ type: "text", text: "other" }]],
   ])("leaves ownership intact and invalidates the clean path for an %s observation", async (_kind, content) => {
