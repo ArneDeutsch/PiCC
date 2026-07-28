@@ -31,9 +31,13 @@ beforeEach(() => {
 afterEach(() => piTui.setKeybindings(previousBindings));
 
 function countedEnvelope(text: string, extra: Record<string, unknown> = {}) {
-  const counts = { envelopeGets: 0, blockGets: 0, ownKeys: 0 };
+  const counts = { envelopeGets: 0, blockGets: 0, bodyGets: 0, ownKeys: 0 };
   const block = new Proxy({ type: "text", text }, {
-    get(target, key, receiver) { counts.blockGets++; return Reflect.get(target, key, receiver); },
+    get(target, key, receiver) {
+      counts.blockGets++;
+      if (key === "text") counts.bodyGets++;
+      return Reflect.get(target, key, receiver);
+    },
   });
   const envelope = new Proxy({ content: [block], details: undefined, ...extra }, {
     get(target, key, receiver) { counts.envelopeGets++; return Reflect.get(target, key, receiver); },
@@ -114,6 +118,7 @@ describe("collapsed Read/Bash deterministic work bounds", () => {
       expect(counts.resultConstructs).toBe(name === "bash" ? 1 : 0);
       expect(access.envelopeGets).toBeLessThan(20);
       expect(access.blockGets).toBeLessThan(20);
+      if (name === "bash") expect(access.bodyGets).toBe(0);
       expect(access.ownKeys).toBe(1);
       expect(counts.sanitize).toBeLessThanOrEqual(name === "read" ? 1 : 0);
       expect(counts.split).toBe(0);
@@ -121,6 +126,34 @@ describe("collapsed Read/Bash deterministic work bounds", () => {
       expect(counts.maxSanitizeInput).toBeLessThanOrEqual(1_540);
       expect(counts.maxSliceSpan).toBeLessThanOrEqual(1_024);
     }
+  });
+
+  it("does not observe multi-megabyte exact truncated Bash bodies while collapsed or repainting", () => {
+    const huge = "T".repeat(8_000_000);
+    const { envelope, counts: access } = countedEnvelope(huge, { details: {
+      truncation: {
+        content: huge, truncated: true, truncatedBy: "bytes", totalLines: 9_000, totalBytes: 8_000_000,
+        outputLines: 1, outputBytes: 50_000, lastLinePartial: true, firstLineExceedsLimit: false,
+        maxLines: 2_000, maxBytes: 50_000,
+      },
+      fullOutputPath: "/private/full-output.txt",
+    } });
+    const { tool, counts } = instrumented("bash");
+    const row = collapsed(tool, "bash", envelope);
+    const rendered = [...row.call.render(80), ...row.detail.render(80)].join("\n");
+    expect(rendered).toContain("output truncated");
+    expect(rendered).toContain("ctrl+o to expand");
+    expect(rendered).not.toContain("/private/full-output.txt");
+    for (let repaint = 0; repaint < 25; repaint++) {
+      row.call.render(80);
+      row.detail.render(80);
+    }
+    expect(access.bodyGets).toBe(0);
+    expect(counts.bodyCharsObserved).toBe(0);
+    expect(counts.detailRenders).toBe(0);
+    expect(counts.sanitize).toBe(0);
+    expect(counts.split).toBe(0);
+    expect(counts.slice).toBe(0);
   });
 
   it("keeps every exceptional family bounded across repeated repaints", () => {

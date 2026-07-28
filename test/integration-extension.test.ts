@@ -232,7 +232,7 @@ describe("tool surface registration", () => {
       );
       const readCall = readCallComponent.render(160).join("\n");
       const rendered = readResultComponent.render(160).join("\n");
-      expect(readCall).toBe("● read registered.txt");
+      expect(readCall).toBe("● read registered.txt · ctrl+o to expand");
       expect(rendered).toBe("");
       expect(`${readCall}\n${rendered}`).not.toContain("REGISTERED_DETAIL");
 
