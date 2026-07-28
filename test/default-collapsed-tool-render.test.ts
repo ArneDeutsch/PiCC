@@ -247,6 +247,50 @@ describe("default-collapsed Read/Bash rendering", () => {
     }
   }));
 
+  it("fails malformed Read envelopes, arrays, and blocks open without ordinary or continuation collapse", () => withBinding(["ctrl+o"], () => {
+    const continuation = "one\ntwo\n\n[4 more lines in file. Use offset=3 to continue.]";
+    const textBlock = { type: "text", text: "VISIBLE READ EVIDENCE" };
+    const inheritedEnvelope = Object.create({ content: [textBlock], details: undefined });
+    const inheritedArray = [textBlock];
+    Object.setPrototypeOf(inheritedArray, Object.create(Array.prototype));
+    const inheritedBlock = Object.create(textBlock);
+    const accessorEnvelope = Object.defineProperty({ details: undefined }, "content", {
+      enumerable: true, get: () => [textBlock],
+    });
+    const accessorArray = [textBlock];
+    Object.defineProperty(accessorArray, "0", { enumerable: true, configurable: true, get: () => textBlock });
+    const accessorBlock = Object.defineProperty({ type: "text" }, "text", {
+      enumerable: true, get: () => "VISIBLE READ EVIDENCE",
+    });
+    const foreignEnvelope = Object.create(new Date()) as Record<string, unknown>;
+    foreignEnvelope.content = [textBlock];
+    foreignEnvelope.details = undefined;
+    const malformed = [
+      { content: [textBlock], details: undefined, extra: true },
+      inheritedEnvelope,
+      { content: inheritedArray, details: undefined },
+      { content: [inheritedBlock], details: undefined },
+      accessorEnvelope,
+      { content: accessorArray, details: undefined },
+      { content: [accessorBlock], details: undefined },
+      foreignEnvelope,
+    ];
+    for (const value of malformed) {
+      const painted = paint(definition("read"), { path: "foreign.txt" }, value, { partial: false });
+      expect(painted.call).not.toContain("to expand");
+      expect(painted.detail.length).toBeGreaterThan(0);
+    }
+
+    const continuationAccessor = Object.defineProperty({ type: "text" }, "text", {
+      enumerable: true, get: () => continuation,
+    });
+    const painted = paint(definition("read"), { path: "page", limit: 2 }, {
+      content: [continuationAccessor], details: undefined,
+    }, { partial: false });
+    expect(painted.call).not.toMatch(/4 more lines|to expand/u);
+    expect(painted.detail).toContain("Use offset=3 to continue");
+  }));
+
   it("composes both expansion-field mismatch directions through one stable mutable call slot", () => withBinding(["ctrl+o"], () => {
     for (const [optionExpanded, contextExpanded] of [[true, false], [false, true]] as const) {
       const tool = definition("read");

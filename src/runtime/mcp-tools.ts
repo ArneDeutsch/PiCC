@@ -329,6 +329,8 @@ function exactMcpSuccess(
   return text.found && typeof text.value === "string" ? { owner, source: text.value } : undefined;
 }
 
+// MCP server text is hostile: C1/OSC controls can retitle the terminal or spoof surrounding rows.
+// Sanitize only the human display copy here; canonical/model-visible MCP text remains verbatim.
 function sanitizeCompleteMcpText(source: string): string {
   let text = source;
   try { text = text.normalize("NFC"); } catch { /* Keep the complete original string. */ }

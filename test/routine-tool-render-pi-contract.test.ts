@@ -285,11 +285,15 @@ describe("real Pi routine rendering composition", () => {
       for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(100);
       return lines;
     };
+    const glyphs = (lines: string[]): string[] =>
+      lines.join("\n").replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "").match(/[○●✗■]/gu) ?? [];
 
     const component = build();
-    const pending = paint(component, false).join("\n");
-    expect(pending.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "")).toContain("○");
-    expect(pending).not.toContain(entry.invocation);
+    component.setArgsComplete();
+    const pendingLines = paint(component, false);
+    const pending = pendingLines.join("\n");
+    expect(glyphs(pendingLines)).toEqual(["○"]);
+    expect(pending).toContain(entry.invocation);
     expect(pending).not.toContain(entry.hidden);
     expect(pending).not.toMatch(/to expand|click to show detail/u);
 
@@ -298,12 +302,16 @@ describe("real Pi routine rendering composition", () => {
     expect(collapsed).toHaveLength(2);
     expect(collapsed[0]).toBe("");
     expect(collapsed[1]).toContain(entry.invocation);
+    expect(glyphs(collapsed)).toEqual(["●"]);
     expect(collapsed.join("\n")).toContain("ctrl+o to expand");
     expect(collapsed.join("\n")).not.toContain(entry.hidden);
     const expanded = paint(component, true);
     expect(expanded[1]).toContain(entry.invocation);
     expect(expanded.join("\n")).toContain(entry.hidden);
-    expect(paint(component, false).join("\n")).not.toContain(entry.hidden);
+    expect(glyphs(expanded)).toEqual(["●"]);
+    const recollapsed = paint(component, false);
+    expect(recollapsed.join("\n")).not.toContain(entry.hidden);
+    expect(glyphs(recollapsed)).toEqual(["●"]);
 
     const partial = paint(settle(entry.ordinary, true), false).join("\n");
     expect(partial).toContain(entry.hidden);

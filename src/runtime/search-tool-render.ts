@@ -847,6 +847,7 @@ function stockOutcome(toolName: StockSearchName, args: StockArgs, result: unknow
     const empty = text.length === STOCK_EMPTY[toolName].length && text === STOCK_EMPTY[toolName]
       ? STOCK_EMPTY[toolName]
       : undefined;
+    if (text === "") return undefined;
     return { ...(empty ? { empty } : {}), warnings: [], retained: !empty };
   }
   const allowed = toolName === "grep"

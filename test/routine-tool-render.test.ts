@@ -114,6 +114,30 @@ describe("routine tool rendering decorator", () => {
     }
   });
 
+  it("keeps recognized interactive routine lifecycles call-owned", () => {
+    const cases = [
+      [decorate(createWebFetchTool(() => ".")), fetchArgs, fetchResult, fetchArgs.url, "SECRET FETCH BODY"],
+      [decorate(createWebSearchTool(() => ".")), searchArgs, searchResult, searchArgs.query, "SECRET SEARCH TITLE"],
+      [decorate({ name: "Skill" } as ToolDefinition), skillArgs, activationResult, "deploy — staging 1.2.3", "SECRET INJECTED INSTRUCTION BODY"],
+      [decorate({ name: "SlashCommand" } as ToolDefinition), slashArgs, activationResult, "/deploy staging 1.2.3", "SECRET INJECTED INSTRUCTION BODY"],
+    ] as const;
+    for (const [tool, args, result, invocation, hidden] of cases) {
+      const state = {};
+      const context = { args, state, isPartial: false, isError: false };
+      const call = tool.renderCall(args, undefined, context);
+      expect(call.render(120).join("\n")).toContain(invocation);
+      expect(call.render(120).join("\n")).not.toMatch(/to expand|click to show detail/u);
+
+      expect(tool.renderResult(result, { expanded: false, isPartial: false }, undefined, context).render(120)).toEqual([]);
+      expect(call.render(120).join("\n")).toContain("ctrl+o to expand");
+      expect(call.render(120).join("\n")).not.toContain(hidden);
+      expect(tool.renderResult(result, { expanded: true, isPartial: false }, undefined, context).render(120)).toEqual([]);
+      expect(call.render(120).join("\n")).toContain(hidden);
+      tool.renderResult(result, { expanded: false, isPartial: false }, undefined, context);
+      expect(call.render(120).join("\n")).not.toContain(hidden);
+    }
+  });
+
   it("uses configured bindings, fails open when unbound, and gives empty successes no false cue", () => {
     for (const [tool, args, result] of [
       [decorate(createWebFetchTool(() => ".")), fetchArgs, fetchResult],

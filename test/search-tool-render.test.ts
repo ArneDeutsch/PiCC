@@ -1512,6 +1512,18 @@ describe("lowercase stock search result lifecycle", () => {
     }
   });
 
+  it.each(families)("fails $name empty noncanonical text open without an expansion cue", (entry) => {
+    const { tool, native } = stock(entry);
+    const args = { ...entry.args };
+    const ctx = stockContext(args);
+    const call = tool.renderCall(args, undefined, ctx);
+
+    expect(tool.renderResult(stockResult(""), { expanded: false, isPartial: false }, undefined, ctx).render(120))
+      .toEqual(["NATIVE-DETAIL"]);
+    expect(native).toHaveBeenCalledTimes(1);
+    expect(call.render(120).join(" ")).not.toMatch(/to expand|click to show detail/u);
+  });
+
   it("covers each family's limit-only, line/byte truncation-only, and combined warning envelopes", () => {
     for (const entry of families) {
       const args = entry.name === "grep" ? { ...entry.args, limit: 0 } : { ...entry.args, limit: 7 };

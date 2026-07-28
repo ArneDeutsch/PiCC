@@ -348,23 +348,36 @@ function finalAgreement(options: unknown, context: unknown): boolean {
     booleanField(context, "isError") === false;
 }
 
+interface ExactReadTextResult {
+  text: string;
+  details: unknown;
+  isError: unknown;
+}
+
+function exactReadTextResult(result: unknown): ExactReadTextResult | undefined {
+  const envelope = ownDataRecord(result, ["content", "details", "isError"]);
+  if (!envelope || envelope.details !== undefined ||
+    (envelope.isError !== undefined && envelope.isError !== false)) return undefined;
+  const item = singleOwnDataArray(envelope.content);
+  const block = ownDataRecord(item, ["type", "text"]);
+  return block && Object.keys(block).length === 2 && block.type === "text" && typeof block.text === "string"
+    ? { text: block.text, details: envelope.details, isError: envelope.isError }
+    : undefined;
+}
+
 function readContinuationSummary(args: Data, result: unknown): ReadContinuation | undefined {
   const limit = args.limit;
   if (!Number.isSafeInteger(limit) || (limit as number) < 1) return undefined;
-  const envelope = data(result);
-  if (!envelope || !canonicalEnvelope(result) || envelope.details !== undefined ||
-    (envelope.isError !== undefined && envelope.isError !== false) || !Array.isArray(envelope.content) ||
-    envelope.content.length !== 1) return undefined;
-  const block = exact(envelope.content[0], ["type", "text"]);
-  if (!block || block.type !== "text" || typeof block.text !== "string") return undefined;
-  const match = /\n\n\[([1-9]\d*) more lines in file\. Use offset=([1-9]\d*) to continue\.\]$/u.exec(block.text);
+  const snapshot = exactReadTextResult(result);
+  if (!snapshot) return undefined;
+  const match = /\n\n\[([1-9]\d*) more lines in file\. Use offset=([1-9]\d*) to continue\.\]$/u.exec(snapshot.text);
   if (!match) return undefined;
   const remaining = Number(match[1]);
   const nextOffset = Number(match[2]);
   const start = typeof args.offset === "number" ? args.offset : 1;
   if (!Number.isSafeInteger(remaining) || !Number.isSafeInteger(nextOffset) ||
     nextOffset !== start + (limit as number)) return undefined;
-  const payload = block.text.slice(0, match.index);
+  const payload = snapshot.text.slice(0, match.index);
   if (/\[[1-9]\d* more lines in file\. Use offset=[1-9]\d* to continue\.\]/u.test(payload) ||
     payload.split("\n").length !== limit) return undefined;
   return { remaining, nextOffset };
@@ -696,16 +709,11 @@ function ordinaryCallOwnedResult(
   if (booleanField(options, "isPartial") !== false || booleanField(context, "isPartial") !== false ||
     booleanField(context, "isError") !== false) return undefined;
   if (toolName === "bash") return exactBashSuccess(result);
-  const envelope = data(result);
-  if (!envelope) return undefined;
-  const keys = Object.keys(envelope);
-  if (!keys.every((key) => key === "content" || key === "details" || key === "isError") ||
-    envelope.details !== undefined || envelope.isError === true || supportedEnvelope(result) !== "text") return undefined;
-  const text = boundedText(result);
-  if (text === undefined) return undefined;
+  const snapshot = exactReadTextResult(result);
+  if (!snapshot) return undefined;
   const continuation = readContinuationSummary(args, result);
   if (!continuation && status?.startsWith("[") === true) return undefined;
-  return { continuation, retained: text !== "", truncated: false };
+  return { continuation, retained: snapshot.text !== "", truncated: false };
 }
 
 function collapsedExceptionalEvidence(
