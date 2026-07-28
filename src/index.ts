@@ -54,7 +54,14 @@ import { createWorktreeTools } from "./runtime/tools/worktree-tools.js";
 import { createWebFetchTool, createWebSearchTool } from "./runtime/tools/web-tools.js";
 import { createGrepTool as createClaudeGrepTool, createGlobTool } from "./runtime/tools/search-tools.js";
 import { createMultiEditTool } from "./runtime/tools/multi-edit.js";
+import { createNotebookEditTool } from "./runtime/tools/notebook-edit.js";
 import { createTaskTools } from "./runtime/tools/task-tools.js";
+import {
+  NOTEBOOK_SESSION_CUSTOM_TYPE,
+  NotebookSessionState,
+  newestNotebookSessionSnapshot,
+  type NotebookSessionSource,
+} from "./runtime/notebook-session.js";
 import {
   BackgroundTaskRegistry,
   createTaskOutputTool,
@@ -255,6 +262,8 @@ export interface PiccTestSeam {
      * supplied by the test). Reachable only via this in-process seam.
      */
     subagentRuntime: SubagentRuntime;
+    /** Observe the active main notebook state for deterministic lifecycle tests. */
+    getActiveNotebookState: () => NotebookSessionState;
     /**
      * The session's status-panel widget controller: lets an offline test
      * inject the panel clock/tick (`configureForTest`) so linger expiry is
@@ -468,6 +477,22 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     registerCodexAbortGuard(pi);
   }
   const cwdState = new CwdState(project.cwd);
+  let activeMainNotebookState = new NotebookSessionState();
+  const installMainNotebookState = (branch: unknown): void => {
+    let installed!: NotebookSessionState;
+    installed = new NotebookSessionState({
+      onChange: (snapshot) => {
+        if (activeMainNotebookState !== installed) return;
+        try {
+          pi.appendEntry(NOTEBOOK_SESSION_CUSTOM_TYPE, snapshot);
+        } catch {
+          // The live authorization transition succeeds even when transcript persistence does not.
+        }
+      },
+    });
+    installed.restore(newestNotebookSessionSnapshot(branch));
+    activeMainNotebookState = installed;
+  };
   // Hook payload `transcript_path`: Pi's session manager (captured on
   // session_start) exposes the session file — the closest analog to Claude's
   // transcript. Live getter so session switches stay accurate.
@@ -901,6 +926,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   function buildCwdBoundTools(
     cwdRef: CwdState,
     taskBundle: { tools: unknown[] },
+    notebookSession: NotebookSessionSource,
     captureUniversalStop?: () => () => boolean,
   ): Record<string, unknown>[] {
     const get = () => cwdRef.get();
@@ -910,6 +936,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       createClaudeGrepTool(get) as unknown as Record<string, unknown>,
       createGlobTool(get) as unknown as Record<string, unknown>,
       createMultiEditTool(get) as unknown as Record<string, unknown>,
+      createNotebookEditTool(get, notebookSession) as unknown as Record<string, unknown>,
       ...(taskBundle.tools as unknown as Record<string, unknown>[]),
       ...createWorktreeTools({ worktrees, cwdState: cwdRef, hookRunner: hookRunnerFacade, captureUniversalStop }),
       ...DEGRADED_TOOLS.map(
@@ -1060,6 +1087,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       "TaskOutput",
       "TaskStop",
       "MultiEdit",
+      "NotebookEdit",
       ...DEGRADED_TOOLS.map((d) => d.name),
       // Live MCP wire names (`mcp__<server>__<tool>`): gateTools already speaks
       // the MCP grammar (bare `mcp__server` fan-out, bare-name deny removal), so
@@ -1081,13 +1109,23 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const subagentRuntime = new SubagentRuntime({
     getAgents: () => project.agents,
     buildSystemPrompt: buildSubagentSystemPrompt,
-    customToolsFor: (agent, granted, depth, ownerAgentId, dispatcherIsFork, subCwd, activation, captureUniversalStop) => {
+    customToolsFor: (
+      agent: ClaudeAgent,
+      granted: string[],
+      depth: number,
+      ownerAgentId: string,
+      dispatcherIsFork: boolean,
+      subCwd: CwdState | undefined,
+      notebookSession: NotebookSessionState,
+      activation: SkillActivationState,
+      captureUniversalStop?: () => () => boolean,
+    ) => {
       // Per-dispatch instances (fresh TaskStore, dispatch-local cwd binding).
       // NOTE: SendMessage is deliberately NEVER built here — it is
       // parent-initiated only (no subagent→subagent or subagent→parent channel).
       // Even a future "inherit all tools" change must not add it to this set.
       const tools: Record<string, unknown>[] = [];
-      for (const tool of buildCwdBoundTools(subCwd ?? cwdState, createTaskTools(), captureUniversalStop)) {
+      for (const tool of buildCwdBoundTools(subCwd ?? cwdState, createTaskTools(), notebookSession, captureUniversalStop)) {
         const name = (tool as { name: string }).name;
         if (granted.includes(name)) tools.push(tool);
       }
@@ -1637,6 +1675,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       backgroundTasks,
       subagentRegistry,
       subagentRuntime,
+      getActiveNotebookState: () => activeMainNotebookState,
       subagentPanel,
       subagentPanelFocus,
       mainCheckpointGate,
@@ -1650,7 +1689,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // Tool registration
   // ---------------------------------------------------------------------------
   const getCwd = () => cwdState.get();
-  claudeNamedTools.push(...buildCwdBoundTools(cwdState, taskToolBundle, () => mainCheckpointGate.captureLogicalRunStop()));
+  claudeNamedTools.push(...buildCwdBoundTools(
+    cwdState,
+    taskToolBundle,
+    () => activeMainNotebookState,
+    () => mainCheckpointGate.captureLogicalRunStop(),
+  ));
 
   /**
    * The single skill-activation path shared by the Skill and SlashCommand tools
@@ -1928,6 +1972,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         settingsEnv: project.settings.env ?? {},
         projectRoot: project.root,
         ...(shellPath ? { shellPath } : {}),
+        notebookSession: () => activeMainNotebookState,
       });
       // Construction, presentation, and the one outer execute wrapper all finish before
       // registration starts. Pi has no public rollback if a later registerTool throws.
@@ -2210,6 +2255,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     // is the only authority that can confirm the logical run has joined.
     const result = await mainCheckpointGate.beforeSessionSwitch();
     if (!result?.cancel) {
+      // Disarm the outgoing conversation immediately; the accepted branch's
+      // snapshot is installed only by its subsequent session_start.
+      activeMainNotebookState = new NotebookSessionState();
       // Invalidate lifecycle authority at switch acceptance, not only at the next
       // session_start, so an old manual completion in that gap is inert.
       rotateCheckpointSessionEpoch();
@@ -2219,6 +2267,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   });
 
   pi.on("session_start", async (event: any, ctx: any) => {
+    let branch: unknown;
+    try {
+      branch = ctx.sessionManager?.getBranch?.();
+    } catch {
+      branch = undefined;
+    }
+    installMainNotebookState(branch);
     // A session being installed has a live runner behind it — before the outgoing
     // controller hands back what it could not deliver, which is the first thing that has
     // to reach the reader's editor. Pi never starts a session after a `quit` teardown, so

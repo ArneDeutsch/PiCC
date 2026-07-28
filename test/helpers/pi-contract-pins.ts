@@ -86,6 +86,20 @@ export const openReturns: ReturnType<typeof SessionManager.open> extends Session
 // …and the reopened manager exposes the restore/read surface dispatch relies on.
 export const sessionFileGetter: ReturnType<SessionManager["getSessionFile"]> = undefined;
 export const restoreSurface: keyof SessionManager = "buildSessionContext";
+export const branchSurface: ReturnType<SessionManager["getBranch"]> = [];
+export const appendCustomArgs: Parameters<SessionManager["appendCustomEntry"]> = [
+  "picc-notebook-session",
+  { version: 1, generation: 0, records: [] },
+];
+export const forkArgs: Parameters<typeof SessionManager.forkFrom> = [
+  "/source.jsonl",
+  "/cwd",
+  "/custom/session/dir",
+  { id: "agent-0123456789ab" },
+];
+export const forkReturns: ReturnType<typeof SessionManager.forkFrom> extends SessionManager
+  ? "ok"
+  : "PIN BROKEN: SessionManager.forkFrom no longer returns a SessionManager" = "ok";
 
 // --- live-progress event stream surface ---
 

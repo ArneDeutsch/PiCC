@@ -54,6 +54,12 @@ import {
 import { formatBackgroundTaskIdentity } from "./background-identity.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./builtin-tools.js";
 import {
+  NOTEBOOK_SESSION_CUSTOM_TYPE,
+  NotebookSessionState,
+  newestNotebookSessionSnapshot,
+  type SerializedNotebookSession,
+} from "./notebook-session.js";
+import {
   MainSessionCheckpointGate,
   promiseCompactionAttempt,
   type CancellationKind,
@@ -87,6 +93,18 @@ export interface WorktreeManagerLike {
   exit(opts: { worktreePath: string; action: "keep" | "remove" }): Promise<unknown>;
 }
 
+export type SubagentCustomToolsFactory = (
+  agent: ClaudeAgent,
+  grantedClaudeNames: string[],
+  depth: number,
+  ownerAgentId: string,
+  dispatcherIsFork: boolean,
+  subCwd: CwdState | undefined,
+  notebookSession: NotebookSessionState,
+  activation: SkillActivationState,
+  captureUniversalStop?: () => () => boolean,
+) => unknown[];
+
 export interface SubagentRuntimeDeps {
   getAgents: () => ClaudeAgent[];
   /** Assemble the subagent's system prompt: agent body + CLAUDE.md/rules hierarchy + env. */
@@ -106,17 +124,10 @@ export interface SubagentRuntimeDeps {
    * tool parameter (same anti-spoofing discipline as `ownerAgentId`); called
    * per-dispatch, so it scopes to THIS fork's tools and does not leak to the fork's
    * normal (non-fork) grandchildren.
+   * `notebookSession` is the dispatch-owned state shared by this child's Read and
+   * NotebookEdit tools; it is never reconstructed by the factory.
    */
-  customToolsFor: (
-    agent: ClaudeAgent,
-    grantedClaudeNames: string[],
-    depth: number,
-    ownerAgentId: string,
-    dispatcherIsFork: boolean,
-    subCwd: CwdState | undefined,
-    activation: SkillActivationState,
-    captureUniversalStop?: () => () => boolean,
-  ) => unknown[];
+  customToolsFor: SubagentCustomToolsFactory;
   /** All Claude tool names the harness knows (for gateTools' allKnown). */
   allKnownToolNames: () => string[];
   permissionEngine: PermissionEngine;
@@ -197,6 +208,8 @@ export interface SubagentRuntimeDeps {
 /** Structural view of a Pi SessionManager (only what dispatch reads). */
 export interface PiSessionManagerLike {
   getSessionFile(): string | undefined;
+  getBranch?(): unknown;
+  appendCustomEntry?(customType: string, data: SerializedNotebookSession): unknown;
 }
 
 /**
@@ -2028,6 +2041,16 @@ export class SubagentRuntime {
       // with the orchestrator or a sibling dispatch.
       const subCwd = new CwdState(cwd);
       dispatchCwd = subCwd;
+      let notebookSessionManager: PiSessionManagerLike | undefined;
+      const notebookSession = new NotebookSessionState({
+        onChange: (snapshot) => {
+          try {
+            notebookSessionManager?.appendCustomEntry?.(NOTEBOOK_SESSION_CUSTOM_TYPE, snapshot);
+          } catch {
+            // Current child state remains usable when transcript persistence fails.
+          }
+        },
+      });
       const checkpoint = new ChildCheckpointCoordinator(
         `${this.deps.sessionId}:${agentId}`,
         this.deps.proactiveCompactPercent ?? 90,
@@ -2060,6 +2083,7 @@ export class SubagentRuntime {
       // the fork's granted Agent/Task tools refuse a fork-spawns-fork. A degraded
       // fork is `isFork === false`, so its tools stay unmarked and its own nested
       // dispatches are not mis-refused.
+      const customToolsStop = () => checkpoint.gate.captureLogicalRunStop();
       let customTools = this.deps.customToolsFor(
         agent,
         granted,
@@ -2067,8 +2091,9 @@ export class SubagentRuntime {
         agentId,
         isFork,
         subCwd,
+        notebookSession,
         checkpoint.activation,
-        () => checkpoint.gate.captureLogicalRunStop(),
+        customToolsStop,
       );
 
       const sdk = await this.sdk();
@@ -2097,6 +2122,7 @@ export class SubagentRuntime {
         settingsEnv: this.deps.settingsEnv ?? {},
         projectRoot: this.deps.projectRoot ?? cwd,
         ...(this.deps.shellPath ? { shellPath: this.deps.shellPath } : {}),
+        notebookSession,
       });
       for (const builtin of factoryBuiltins) {
         if (grantedPiBuiltins.has(builtin.name)) customTools.push(builtin.def);
@@ -2290,6 +2316,14 @@ export class SubagentRuntime {
         });
       }
       sessionManager ??= sdk.inMemorySessionManager(cwd);
+      notebookSessionManager = sessionManager as PiSessionManagerLike;
+      let notebookBranch: unknown;
+      try {
+        notebookBranch = notebookSessionManager.getBranch?.();
+      } catch {
+        notebookBranch = undefined;
+      }
+      notebookSession.restore(newestNotebookSessionSnapshot(notebookBranch));
 
       const sessionOptions: Record<string, unknown> = {
         cwd,

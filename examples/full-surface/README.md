@@ -35,6 +35,7 @@ Coverage map (each canary string is asserted by tests):
 | Unknown settings keys | `futureUnknownSetting`, `outputStyle` | compat report |
 | MCP pending-approval gate (unapproved project server) | `.mcp.json` (`example-server`) | compat report + pending notice |
 | Project-bundled plugin | `.claude-plugin/` | `FS-PLUGIN-SKILL-BODY` |
+| Notebook read/edit workflow | `analysis.ipynb`, `test/e2e-notebook.test.ts` | real and fallback cell IDs |
 
 The background command documents the directional settlement guidance (focused runtime tests prove the
 behavior): an eligible uncollected current task gets one bounded next-turn notice, but a terminal
