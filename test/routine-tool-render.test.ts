@@ -14,7 +14,18 @@ import { createWebFetchTool, createWebSearchTool } from "../src/runtime/tools/we
 
 const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
 const piTuiEntry = requireFromPi.resolve("@earendil-works/pi-tui");
-const { Box: PiBox } = await import(pathToFileURL(piTuiEntry).href) as typeof import("@earendil-works/pi-tui");
+const piTui = await import(pathToFileURL(piTuiEntry).href) as typeof import("@earendil-works/pi-tui");
+const { Box: PiBox } = piTui;
+const bindingDefinitions = {
+  ...piTui.TUI_KEYBINDINGS,
+  "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
+};
+
+function withBinding<T>(keys: string[], run: () => T): T {
+  const previous = piTui.getKeybindings();
+  piTui.setKeybindings(new piTui.KeybindingsManager(bindingDefinitions, { "app.tools.expand": keys as never }));
+  try { return run(); } finally { piTui.setKeybindings(previous); }
+}
 
 interface Component {
   render(width: number): string[];
@@ -83,21 +94,180 @@ function renderRaw(
 }
 
 describe("routine tool rendering decorator", () => {
-  it("uses one result-owned command row for ordinary WebFetch/WebSearch success", () => {
+  it("keeps WebFetch/WebSearch detail collapsed, expandable, and recollapsible", () => {
     const cases = [
       [decorate(createWebFetchTool(() => ".")), fetchArgs, fetchResult, fetchArgs.url, "SECRET FETCH BODY"],
       [decorate(createWebSearchTool(() => ".")), searchArgs, searchResult, searchArgs.query, "SECRET SEARCH TITLE"],
     ] as const;
     for (const [tool, args, result, invocation, hidden] of cases) {
       expect(tool.renderCall(args, undefined, { args }).render(120)).toEqual([]);
-      for (const expanded of [false, true]) {
-        const lines = renderResult(tool, args, result, { expanded });
-        expect(lines).toHaveLength(1);
-        expect(lines[0]).toContain(formatToolDisplayName(tool.name));
-        expect(lines[0]).toContain(invocation);
-        expect(lines.join("\n")).not.toContain(hidden);
-      }
+      const collapsed = renderResult(tool, args, result);
+      expect(collapsed).toHaveLength(1);
+      expect(collapsed[0]).toContain(formatToolDisplayName(tool.name));
+      expect(collapsed[0]).toContain(invocation);
+      expect(collapsed[0]).toContain("ctrl+o to expand");
+      expect(collapsed.join("\n")).not.toContain(hidden);
+      const expanded = renderResult(tool, args, result, { expanded: true });
+      expect(expanded[0]).toContain(invocation);
+      expect(expanded.join("\n")).toContain(hidden);
+      expect(renderResult(tool, args, result).join("\n")).not.toContain(hidden);
     }
+  });
+
+  it("uses configured bindings, fails open when unbound, and gives empty successes no false cue", () => {
+    for (const [tool, args, result] of [
+      [decorate(createWebFetchTool(() => ".")), fetchArgs, fetchResult],
+      [decorate(createWebSearchTool(() => ".")), searchArgs, searchResult],
+      [decorate({ name: "Skill" } as ToolDefinition), skillArgs, activationResult],
+      [decorate({ name: "SlashCommand" } as ToolDefinition), slashArgs, activationResult],
+    ] as const) {
+      withBinding(["alt+e"], () => {
+        const collapsed = renderResult(tool, args, result).join("\n");
+        expect(collapsed).toContain("alt+e to expand");
+        expect(collapsed).not.toContain((result.content[0] as { text: string }).text);
+      });
+      withBinding([], () => {
+        const visible = renderResult(tool, args, result).join("\n");
+        expect(visible).toContain((result.content[0] as { text: string }).text);
+        expect(visible).not.toMatch(/to expand|click to show detail/u);
+      });
+      const empty = { ...result, content: [{ type: "text", text: "" }] };
+      const emptyRow = renderResult(tool, args, empty).join("\n");
+      expect(emptyRow).not.toMatch(/to expand|click to show detail/u);
+    }
+  });
+
+  it("does not inspect a large retained body while collapsed and reveals its complete sanitized tail lazily", () => {
+    const source = `BODY-BEGIN\n${"middle line\n".repeat(20_000)}BODY-END\u001b]0;hostile-title\u0007`;
+    let propertyGets = 0;
+    const noGet = <T extends object>(value: T): T => new Proxy(value, {
+      get() { propertyGets++; throw new Error("property access forbidden"); },
+    });
+    const result = noGet({
+      content: noGet([noGet({ type: "text", text: source })]),
+      details: noGet({ ...searchResult.details }),
+    });
+    const args = noGet({ ...searchArgs, allowed_domains: noGet(["example.test"]) });
+    const before = structuredClone(searchResult);
+    const tool = decorate(createWebSearchTool(() => "."));
+    const collapsedComponent = tool.renderResult(
+      result,
+      { expanded: false, isPartial: false },
+      undefined,
+      { args, isError: false },
+    );
+    for (const width of [120, 24, 120]) {
+      const collapsed = collapsedComponent.render(width).join("\n");
+      expect(collapsed).toContain("ctrl+o to expand");
+      expect(collapsed).not.toContain("BODY-BEGIN");
+      expect(collapsed).not.toContain("BODY-END");
+    }
+    expect(propertyGets).toBe(0);
+    const expanded = renderRaw(
+      tool,
+      result,
+      { expanded: true, isPartial: false },
+      { args, isError: false, lastComponent: collapsedComponent },
+      40,
+    ).join("\n");
+    expect(expanded).toContain("BODY-BEGIN");
+    expect(expanded).toContain("BODY-END");
+    expect(expanded).not.toContain("hostile-title");
+    expect(propertyGets).toBe(0);
+    expect(searchResult).toEqual(before);
+  });
+
+  it("retains the single body snapshot accepted by exact validation", () => {
+    const first = { type: "text", text: "ORIGINALLY VALIDATED BODY" };
+    const replacement = { type: "text", text: "DESCRIPTOR-SWAPPED BODY" };
+    const contentTarget = [first];
+    let blockDescriptorReads = 0;
+    const content = new Proxy(contentTarget, {
+      getOwnPropertyDescriptor(target, key) {
+        if (key !== "0") return Reflect.getOwnPropertyDescriptor(target, key);
+        blockDescriptorReads++;
+        return {
+          ...Reflect.getOwnPropertyDescriptor(target, key)!,
+          value: blockDescriptorReads === 1 ? first : replacement,
+        };
+      },
+    });
+    const tool = decorate(createWebFetchTool(() => "."));
+    const result = { content, details: fetchResult.details };
+    const expanded = renderResult(tool, fetchArgs, result, { expanded: true }).join("\n");
+    expect(blockDescriptorReads).toBe(1);
+    expect(expanded).toContain(first.text);
+    expect(expanded).not.toContain(replacement.text);
+  });
+
+  it("invalidates retained-detail caches for same-owner mutations and replacement owners", () => {
+    const tool = decorate(createWebFetchTool(() => "."));
+    const owner = { type: "text", text: "FIRST BODY" };
+    const result = { content: [owner], details: fetchResult.details };
+    const context = { args: fetchArgs, isError: false };
+    const collapsed = tool.renderResult(
+      result,
+      { expanded: false, isPartial: false },
+      undefined,
+      context,
+    );
+    const firstExpanded = tool.renderResult(
+      result,
+      { expanded: true, isPartial: false },
+      undefined,
+      { ...context, lastComponent: collapsed },
+    );
+    expect(firstExpanded.render(80).join("\n")).toContain("FIRST BODY");
+
+    owner.text = "CURRENT SAME-OWNER BODY";
+    const mutated = tool.renderResult(
+      result,
+      { expanded: true, isPartial: false },
+      undefined,
+      { ...context, lastComponent: firstExpanded },
+    );
+    expect(mutated.render(80).join("\n")).toContain("CURRENT SAME-OWNER BODY");
+    expect(mutated.render(80).join("\n")).not.toContain("FIRST BODY");
+
+    result.content[0] = { type: "text", text: "CURRENT REPLACEMENT-OWNER BODY" };
+    const replaced = tool.renderResult(
+      result,
+      { expanded: true, isPartial: false },
+      undefined,
+      { ...context, lastComponent: mutated },
+    );
+    expect(replaced.render(80).join("\n")).toContain("CURRENT REPLACEMENT-OWNER BODY");
+    expect(replaced.render(80).join("\n")).not.toContain("CURRENT SAME-OWNER BODY");
+  });
+
+  it("renders complete sanitized detail through toolOutput at finite tiny through wide widths", () => {
+    const source = "HEAD\tA\u0001B\u0085C\u200bD\u2028E\u2029TAIL";
+    const sanitized = "HEAD   A B CD E TAIL";
+    const slots: string[] = [];
+    const theme = {
+      fg(slot: string, text: string) {
+        slots.push(slot);
+        return text;
+      },
+    };
+    const tool = decorate(createWebFetchTool(() => "."));
+    const result = { ...fetchResult, content: [{ type: "text", text: source }] };
+    for (const width of [1, 7.5, 40, 200]) {
+      const component = tool.renderResult(
+        result,
+        { expanded: true, isPartial: false },
+        theme,
+        { args: fetchArgs, isError: false },
+      );
+      const lines = component.render(width);
+      expectBounded(lines, width);
+      const detail = lines.slice(1).join("");
+      if (width >= 40) expect(detail).toBe(sanitized);
+      expect(detail).toContain("HEAD");
+      expect(detail).toContain("TAIL");
+      expect(detail).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u200b\u2028\u2029]/u);
+    }
+    expect(slots).toContain("toolOutput");
   });
 
   it("freezes path-bearing routine roots per invocation and falls back to context cwd", () => {
@@ -291,17 +461,19 @@ describe("routine tool rendering decorator", () => {
     renderResult(tool, searchArgs, searchResult, { theme });
     expect(calls).toContainEqual({ slot: "text", text: "web search" });
     expect(calls).toContainEqual({ slot: "accent", text: `“${searchArgs.query}”` });
+    expect(calls).toContainEqual({ slot: "muted", text: " · " });
+    expect(calls).toContainEqual({ slot: "muted", text: "ctrl+o to expand" });
     expect(calls).not.toContainEqual({ slot: "muted", text: "web search" });
   });
 
   it("compacts redirects, truncation, empty results, and backend fallback without suffixes", () => {
     const fetch = renderResult(decorate(createWebFetchTool(() => ".")), fetchArgs, fetchResult).join("\n");
-    expect(fetch).toBe(`web fetch ${fetchArgs.url}`);
+    expect(fetch).toBe(`web fetch ${fetchArgs.url} · ctrl+o to expand`);
     expect(fetch).not.toContain("redirect.test");
     expect(fetch).not.toMatch(/trunc/i);
 
     const search = renderResult(decorate(createWebSearchTool(() => ".")), searchArgs, searchResult).join("\n");
-    expect(search).toBe(`web search “${searchArgs.query}”`);
+    expect(search).toBe(`web search “${searchArgs.query}” · ctrl+o to expand`);
     expect(search).not.toMatch(/duck|result|trunc/i);
   });
 
@@ -393,7 +565,7 @@ describe("routine tool rendering decorator", () => {
       details: { query: args.query, backend: "brave", resultCount: 1, truncated: false },
     };
     const lines = renderResult(decorate(createWebSearchTool(() => ".")), args, result, { width: 18 });
-    expect(lines).toHaveLength(1);
+    expect(lines.length).toBeLessThanOrEqual(2);
     expect(lines[0]).toContain("wide");
     expect(lines[0]).not.toContain("[31m");
     expect(lines[0]).not.toContain("]0;pwn");
@@ -544,7 +716,7 @@ describe("routine tool rendering decorator", () => {
       details: noGet({ ...searchResult.details }),
     };
     expect(renderResult(decorate(createWebSearchTool(() => ".")), args, result)).toEqual([
-      `web search “${searchArgs.query}”`,
+      `web search “${searchArgs.query}” · ctrl+o to expand`,
     ]);
     expect(propertyGets).toBe(0);
   });
@@ -621,18 +793,18 @@ describe("routine tool rendering decorator", () => {
     expect(withRoutineToolRendering(generic)).toBe(generic);
   });
 
-  it("renders ordinary Skill and slash command activations from snapshotted call arguments only", () => {
+  it("keeps ordinary Skill and slash command bodies collapsed and reveals them on expansion", () => {
     const cases = [
       [decorate({ name: "Skill" } as ToolDefinition), skillArgs, "skill deploy — staging 1.2.3"],
       [decorate({ name: "SlashCommand" } as ToolDefinition), slashArgs, "slash command /deploy staging 1.2.3"],
     ] as const;
     for (const [tool, args, expected] of cases) {
       expect(tool.renderCall(args, undefined, { args }).render(80)).toEqual([]);
-      for (const expanded of [false, true]) {
-        const lines = renderResult(tool, args, activationResult, { expanded });
-        expect(lines).toEqual([expected]);
-        expect(lines.join("\n")).not.toContain("SECRET INJECTED");
-      }
+      expect(renderResult(tool, args, activationResult)).toEqual([`${expected} · ctrl+o to expand`]);
+      const expanded = renderResult(tool, args, activationResult, { expanded: true });
+      expect(expanded[0]).toBe(expected);
+      expect(expanded.join("\n")).toContain("SECRET INJECTED");
+      expect(renderResult(tool, args, activationResult).join("\n")).not.toContain("SECRET INJECTED");
     }
   });
 
@@ -642,12 +814,12 @@ describe("routine tool rendering decorator", () => {
       [decorate({ name: "SlashCommand" } as ToolDefinition), { command: "/deploy" }, "slash command /deploy"],
     ] as const;
     for (const [tool, args, expected] of cases) {
-      for (const expanded of [false, true]) {
-        const lines = renderResult(tool, args, activationResult, { expanded });
-        expect(lines).toEqual([expected]);
-        expect(lines[0]).not.toContain("—");
-        expect(lines[0]).not.toContain("SECRET INJECTED");
-      }
+      const collapsed = renderResult(tool, args, activationResult);
+      expect(collapsed).toEqual([`${expected} · ctrl+o to expand`]);
+      expect(collapsed[0]).not.toContain("—");
+      const expanded = renderResult(tool, args, activationResult, { expanded: true });
+      expect(expanded[0]).toBe(expected);
+      expect(expanded.join("\n")).toContain("SECRET INJECTED");
     }
   });
 
@@ -659,7 +831,7 @@ describe("routine tool rendering decorator", () => {
       [decorate({ name: "SlashCommand" } as ToolDefinition), { command: "deploy now" }, { ...activationResult, details: { skill: "plugin:deploy" } }, "slash command deploy now"],
     ];
     for (const [tool, args, result, expected] of compactCases) {
-      expect(renderResult(tool, args, result)).toEqual([expected]);
+      expect(renderResult(tool, args, result)).toEqual([`${expected} · ctrl+o to expand`]);
     }
 
     const visibleBody = "VISIBLE MISMATCHED ACTIVATION BODY";
@@ -701,7 +873,7 @@ describe("routine tool rendering decorator", () => {
     const tool = decorate({ name: "Skill" } as ToolDefinition);
     for (const width of [0, 1, 2, 9, 80]) {
       const lines = renderResult(tool, args, activationResult, { width });
-      expect(lines).toHaveLength(1);
+      expect(lines.length).toBeLessThanOrEqual(2);
       expectBounded(lines, width);
       expect(lines[0]).not.toMatch(/[\r\n\u2028\u0007\u009b\u009d\u009c]/u);
       expect(lines[0]).not.toContain("[31m");
@@ -749,7 +921,7 @@ describe("routine tool rendering decorator", () => {
       details: noGet({ skill: "部署" }),
     });
     const lines = renderResult(decorate({ name: "Skill" } as ToolDefinition), args, result, { width: 80 });
-    expect(lines).toEqual(["skill 部署 — é🙂"]);
+    expect(lines).toEqual(["skill 部署 — é🙂 · ctrl+o to expand"]);
     expect(propertyGets).toBe(0);
   });
 
@@ -766,7 +938,7 @@ describe("routine tool rendering decorator", () => {
     ];
     for (const theme of themes) {
       const lines = renderResult(tool, args, result, { theme, width: 18 });
-      expect(lines).toHaveLength(1);
+      expect(lines.length).toBeLessThanOrEqual(2);
       expectBounded(lines, 18);
       expect(lines.join("\n")).toContain("slash command");
       expect(lines.join("\n")).not.toContain("FROZEN SECRET BODY");
@@ -1796,6 +1968,7 @@ describe("routine tool rendering decorator", () => {
     const argsBefore = structuredClone(fetchArgs);
     const resultBefore = structuredClone(fetchResult);
     renderResult(decorated as unknown as RenderTool, fetchArgs, fetchResult);
+    renderResult(decorated as unknown as RenderTool, fetchArgs, fetchResult, { expanded: true, width: 17 });
     expect(fetchArgs).toEqual(argsBefore);
     expect(fetchResult).toEqual(resultBefore);
 

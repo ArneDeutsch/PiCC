@@ -4,12 +4,13 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { neutralizePiEditBoxBackground } from "./pi-tui-runtime.js";
+import { neutralizePiEditBoxBackground, piToolsExpandKeyText } from "./pi-tui-runtime.js";
 import { themedFg } from "./render-util.js";
 import {
   formatDisplayPathFromRoots,
   formatToolDisplayName,
   priorityDisplayRow,
+  semanticDisplayRow,
   resolveDisplayRoots,
   sanitizeInlineDisplay,
   type DisplayRootResolver,
@@ -244,12 +245,7 @@ function commandComponent(toolName: RoutineToolName, invocation: string, theme: 
     render(width: number): string[] {
       try {
         const title = safeThemeMethod(theme, "fg", ["text", displayName], displayName);
-        const argument = safeThemeMethod(
-          theme,
-          "fg",
-          ["accent", displayedInvocation],
-          displayedInvocation,
-        );
+        const argument = safeThemeMethod(theme, "fg", ["accent", displayedInvocation], displayedInvocation);
         const styled = `${title} ${argument}`;
         try {
           visibleWidth(styled);
@@ -262,6 +258,84 @@ function commandComponent(toolName: RoutineToolName, invocation: string, theme: 
       }
     },
   };
+}
+
+function routineSummaryComponent(
+  toolName: WebToolName | ActivationToolName,
+  invocation: string,
+  theme: unknown,
+  cue?: string,
+): Component {
+  const displayedInvocation = toolName === "WebSearch" ? `“${invocation}”` : invocation;
+  return semanticDisplayRow({
+    action: formatToolDisplayName(toolName),
+    primary: displayedInvocation,
+    ...(cue ? { cue, compactCue: cue.endsWith(" to expand") ? cue.slice(0, -" to expand".length) : cue } : {}),
+  }, theme);
+}
+
+interface RoutineSuccess {
+  invocation: string;
+  retainedText: string;
+  retainedOwner: object;
+}
+
+interface RoutineDetailCache {
+  readonly owner: object;
+  readonly source: string;
+  sanitized?: string;
+  readonly wrapped: Map<number, string[]>;
+}
+
+const routineDetailCaches = new WeakMap<Component, RoutineDetailCache>();
+
+function sanitizeRetainedText(source: string): string {
+  let text = source;
+  try { text = text.normalize("NFC"); } catch { /* Keep the original complete text. */ }
+  return stripTerminalControls(text)
+    .replace(/\p{Cf}/gu, "")
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, (character) => {
+      if (character === "\n") return "\n";
+      return character === "\t" ? "   " : " ";
+    });
+}
+
+function lazyRoutineSuccessComponent(
+  toolName: WebToolName | ActivationToolName,
+  success: RoutineSuccess,
+  expanded: boolean,
+  theme: unknown,
+  cue: string | undefined,
+  previous: Component | undefined,
+): Component {
+  const summary = routineSummaryComponent(toolName, success.invocation, theme, cue);
+  const priorCache = previous && routineDetailCaches.get(previous);
+  const cache = priorCache?.owner === success.retainedOwner && priorCache.source === success.retainedText
+    ? priorCache
+    : { owner: success.retainedOwner, source: success.retainedText, wrapped: new Map<number, string[]>() };
+  const component: Component = {
+    render(width: number): string[] {
+      const summaryLines = summary.render(width);
+      if (!expanded || success.retainedText.length === 0) return summaryLines;
+      if (!Number.isFinite(width) || width <= 0) return summaryLines;
+      const columns = Math.max(1, Math.floor(width));
+      let detailLines = cache.wrapped.get(columns);
+      if (!detailLines) {
+        cache.sanitized ??= sanitizeRetainedText(cache.source);
+        detailLines = [];
+        for (const sourceLine of cache.sanitized.split("\n")) {
+          const styled = safeThemeMethod(theme, "fg", ["toolOutput", sourceLine], sourceLine);
+          const wrapped = wrapTextWithAnsi(styled, columns);
+          if (wrapped.length === 0) detailLines.push("");
+          else for (const line of wrapped) detailLines.push(clamp(line, columns));
+        }
+        cache.wrapped.set(columns, detailLines);
+      }
+      return [...summaryLines, ...detailLines];
+    },
+  };
+  routineDetailCaches.set(component, cache);
+  return component;
 }
 
 function boundedCanonicalText(
@@ -331,19 +405,22 @@ function failOpenComponent(
   };
 }
 
-function textContentBlock(value: unknown): boolean {
-  const block = plainOwnData(value, ["type", "text"]);
-  return block?.type === "text" && typeof block.text === "string";
-}
-
-function oneTextContent(value: unknown): boolean {
-  if (!Array.isArray(value)) return false;
+function oneTextContent(
+  value: unknown,
+): Pick<RoutineSuccess, "retainedText" | "retainedOwner"> | undefined {
+  if (!Array.isArray(value)) return undefined;
   try {
-    if (Object.getPrototypeOf(value) !== Array.prototype) return false;
+    if (Object.getPrototypeOf(value) !== Array.prototype) return undefined;
     const length = ownData(value, "length");
-    return length === 1 && Reflect.ownKeys(value).length === 2 && textContentBlock(ownData(value, "0"));
+    if (length !== 1 || Reflect.ownKeys(value).length !== 2) return undefined;
+    const retainedOwner = ownData(value, "0");
+    const block = plainOwnData(retainedOwner, ["type", "text"]);
+    return block?.type === "text" && typeof block.text === "string" &&
+      retainedOwner !== null && typeof retainedOwner === "object"
+      ? { retainedText: block.text, retainedOwner }
+      : undefined;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -374,17 +451,17 @@ function recognizeWebSuccess(
   result: unknown,
   options: unknown,
   context: unknown,
-): string | undefined {
+): RoutineSuccess | undefined {
   if (ownData(options, "isPartial") !== false || ownData(context, "isError") !== false) {
     return undefined;
   }
   const resultSnapshot = plainOwnData(result, ["content", "details"]) ??
     plainOwnData(result, ["content", "details", "isError"]);
-  if (
-    !resultSnapshot ||
-    ("isError" in resultSnapshot && resultSnapshot.isError !== false) ||
-    !oneTextContent(resultSnapshot.content)
-  ) return undefined;
+  if (!resultSnapshot || ("isError" in resultSnapshot && resultSnapshot.isError !== false)) {
+    return undefined;
+  }
+  const body = oneTextContent(resultSnapshot.content);
+  if (!body) return undefined;
 
   const argsValue = ownData(context, "args");
   if (toolName === "WebFetch") {
@@ -395,7 +472,7 @@ function recognizeWebSuccess(
     );
     if (!argsKeys || !details || !validFetch(argsKeys, details)) return undefined;
     const invocation = sanitizeText(argsKeys.url, true);
-    return invocation.length > 0 ? invocation : undefined;
+    return invocation.length > 0 ? { invocation, ...body } : undefined;
   }
 
   const possibleKeys = [
@@ -412,7 +489,7 @@ function recognizeWebSuccess(
   );
   if (!args || !details || !validSearch(args, details)) return undefined;
   const invocation = sanitizeText(args.query, true);
-  return invocation.length > 0 ? invocation : undefined;
+  return invocation.length > 0 ? { invocation, ...body } : undefined;
 }
 
 function emptyInvocationReason(toolName: RoutineToolName, context: unknown): string | undefined {
@@ -468,17 +545,17 @@ function recognizeActivationSuccess(
   result: unknown,
   options: unknown,
   context: unknown,
-): string | undefined {
+): RoutineSuccess | undefined {
   if (ownData(options, "isPartial") !== false || ownData(context, "isError") !== false) {
     return undefined;
   }
   const resultSnapshot = plainOwnData(result, ["content", "details"]) ??
     plainOwnData(result, ["content", "details", "isError"]);
-  if (
-    !resultSnapshot ||
-    ("isError" in resultSnapshot && resultSnapshot.isError !== false) ||
-    !oneTextContent(resultSnapshot.content)
-  ) return undefined;
+  if (!resultSnapshot || ("isError" in resultSnapshot && resultSnapshot.isError !== false)) {
+    return undefined;
+  }
+  const body = oneTextContent(resultSnapshot.content);
+  if (!body) return undefined;
   const details = plainOwnData(resultSnapshot.details, ["skill"]);
   if (!details || typeof details.skill !== "string" || details.skill.length === 0) return undefined;
 
@@ -489,7 +566,7 @@ function recognizeActivationSuccess(
     const requestedName = slashCommandName(args.command);
     if (!requestedName || !activationIdentityMatches(requestedName, details.skill)) return undefined;
     const command = sanitizeText(args.command, true);
-    return command.length > 0 ? command : undefined;
+    return command.length > 0 ? { invocation: command, ...body } : undefined;
   }
 
   const args = plainOwnData(argsValue, ["name"]) ??
@@ -503,7 +580,7 @@ function recognizeActivationSuccess(
   const name = sanitizeText(args.name, true);
   if (name.length === 0) return undefined;
   const argumentsText = sanitizeText(args.arguments, true);
-  return argumentsText.length > 0 ? `${name} — ${argumentsText}` : name;
+  return { invocation: argumentsText.length > 0 ? `${name} — ${argumentsText}` : name, ...body };
 }
 
 interface WorktreeRow {
@@ -1205,6 +1282,7 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
   const toolName = routineToolName(tool);
   if (!toolName) return tool;
   const rootSnapshots = new WeakMap<object, DisplayRoots>();
+  const htmlCallStates = new WeakSet<object>();
   const displayRootsFor = (context: unknown): DisplayRoots => {
     const state = liveEditState(context);
     const resolved = () => resolveDisplayRoots(
@@ -1283,6 +1361,14 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
       writable: true,
       value(args: unknown, theme: unknown, context: unknown): Component {
         const displayRoots = displayRootsFor(context);
+        if (toolName === "WebFetch" || toolName === "WebSearch" || toolName === "Skill" || toolName === "SlashCommand") {
+          const state = liveEditState(context);
+          if (state) {
+            if (ownData(context, "isPartial") === true) htmlCallStates.add(state);
+            else htmlCallStates.delete(state);
+          }
+          return { render: () => [] };
+        }
         if (toolName !== "MultiEdit") return { render: () => [] };
         const snapshot = plainOwnData(args, ["file_path", "edits"]);
         const displayPath = snapshot
@@ -1309,17 +1395,28 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
               ? failOpenComponent(result, toolName, theme)
               : structuredRowComponent(row.literals, row.fields, theme, row.priorityEvidence);
           }
-          const invocation = toolName === "WebFetch" || toolName === "WebSearch"
+          const success = toolName === "WebFetch" || toolName === "WebSearch"
             ? recognizeWebSuccess(toolName, result, options, context)
             : recognizeActivationSuccess(toolName, result, options, context);
-          return invocation === undefined
-            ? failOpenComponent(
-                result,
-                toolName,
-                theme,
-                emptyInvocationReason(toolName, context),
-              )
-            : commandComponent(toolName, invocation, theme);
+          if (success === undefined) {
+            return failOpenComponent(
+              result,
+              toolName,
+              theme,
+              emptyInvocationReason(toolName, context),
+            );
+          }
+          const expansion = piToolsExpandKeyText();
+          const binding = expansion.available ? sanitizeText(expansion.value, true, 512) : "";
+          const state = liveEditState(context);
+          const html = state !== undefined && htmlCallStates.has(state);
+          const requestedExpanded = ownData(options, "expanded") === true;
+          const expanded = requestedExpanded || !expansion.available || !binding;
+          const cue = success.retainedText.length > 0 && !expanded
+            ? (html ? "click to show detail" : `${binding} to expand`)
+            : undefined;
+          const previous = componentFrom(ownData(context, "lastComponent"));
+          return lazyRoutineSuccessComponent(toolName, success, expanded, theme, cue, previous);
         } catch {
           return failOpenComponent(result, toolName, theme);
         }
