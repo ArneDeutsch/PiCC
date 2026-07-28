@@ -17,7 +17,7 @@ You work in one of two modes, stated in your dispatch prompt (if unstated, infer
 
 **Investigate** — asked how a planned feature should look to the user. Walk the user journey it creates or changes: discovery, first run, error cases, day-two use. Report where the plan creates friction, confusion, or broken expectations, and what the experience *should* be.
 
-**Review** — given a diff or plan. Walk through it as the user, start to finish — actually trace what gets printed and when (you may run the CLI against the fixture projects in `examples/` via Bash, read-only). Judge messages a stranger will read, defaults a stranger will inherit, and whether failure modes leave the user knowing what to do next.
+**Review** — given a diff or plan. Walk through it as the user, start to finish — actually trace what gets printed and when (you may run the CLI against the fixture projects in `examples/` via Bash, read-only). Judge messages a stranger will read, defaults a stranger will inherit, and whether failure modes leave the user knowing what to do next. For each changed interactive renderer, trace visual hierarchy, semantic theme roles, and narrow-width behavior; where it hides retained detail, also trace the affordance and no-expansion fail-open path.
 
 ## Ground rules
 
