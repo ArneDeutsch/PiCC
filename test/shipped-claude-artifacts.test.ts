@@ -122,6 +122,151 @@ describe("small stable prompt security kernels", () => {
     ]);
   });
 
+  it("combines ticket creation with build authorization without weakening filing safeguards", () => {
+    const direction = compact(implementFile("phase-1-direction.md"));
+    const offer = compact(implementFile("ticket-creation.md"));
+    const resume = compact(implementFile("resume-and-aborting.md"));
+    const featureRouter = compact(implementFile("phase-3-feature-spec.md"));
+    const fileStep = compact(implementFile("phase-3-ticket-file.md"));
+    const forkDisclosure = compact(implementFile("phase-1-fork-disclosure.md"));
+    const phaseEight = compact(implementFile("phase-8-file-finding.md"));
+    const phaseNineFork = compact(implementFile("phase-9-fork-handoff.md"));
+    const discipline = compact(implementFile("ticket-integration.md"));
+    const proposalGate = compact(path.join(paths.evaluate, "references", "proposal-gate.md"));
+    const prompt = "choose **file and build**, **build ticketless**, or tell me what to change.";
+
+    expect(offer.split(prompt)).toHaveLength(2);
+    ordered(offer, [
+      "present these before the choice", "the exact title and body", "present that assessment",
+      "where it writes, plainly", "a public artifact appears once filed",
+      "before the choice, show the applicable compact contract",
+      "maintainer:** if the user chooses **file and build**:",
+      "fork:** at hand-off i push to the fork", "if the user chooses **file and build**:",
+      "after the preview", prompt,
+    ]);
+    contains(offer, [
+      "only a complete continue choice authorizes work", "bare `yes`, `no`, `go`, `proceed`",
+      "authorize neither outcome", "returns to convergence", "never file or start work from that same reply",
+      "file and build", "records consent to the exact preview and named target", "enters phase 2",
+      "build ticketless", "records no filing", "without a second confirmation",
+      "unconditional duplicate check", "echo the issue url", "full delivery", "partial delivery",
+      "post one issue comment", "i push to the fork", "the user opens the pr", "post nothing else",
+      "every recovered identity, scope, preview, target, and remaining-write disclosure",
+      "the complete per-item choice also satisfies that gate", "ask no second confirmation",
+      "record **file and continue** as canonical **file and build**",
+      "**continue ticketless** as canonical **build ticketless**", "normal phase 3 routing handles filing",
+      "a generic bare confirmation cannot substitute", "perform no issue write",
+      "past phase 3 with durable `ticket: –` is canonical **build ticketless**",
+      "without re-offering, filing, or restarting phase 2",
+    ]);
+    const maintainerContract = offer.slice(
+      offer.indexOf("- **maintainer:**"), offer.indexOf("- **fork:**"),
+    );
+    ordered(maintainerContract, [
+      "if the user chooses **file and build**:", "i file", "i echo the issue url",
+      "i open a ready-for-review pr", "i post one issue comment",
+      "for full delivery i make the pr close/link the issue",
+      "for partial delivery i make it link the issue and leave it open",
+    ]);
+    expect(maintainerContract).not.toContain("picc ");
+    const forkContract = offer.slice(offer.indexOf("- **fork:**"), offer.indexOf("after the preview"));
+    ordered(forkContract, [
+      "at hand-off i push to the fork", "the user opens the pr",
+      "if the user chooses **file and build**:", "i file", "after the same duplicate check",
+      "i echo its url", "for full delivery i make the paste-ready pr close/link it",
+      "for partial delivery i make it link it and leave it open",
+      "i offer an optional paste-ready issue comment", "i post nothing else to `<target>`",
+    ]);
+    expect(forkContract).not.toContain("picc ");
+    contains(direction, [
+      "either complete combined choice explicitly authorizes phase 2",
+      "when unavailable, require the ordinary explicit \"go\"", "with a ticket present", "require explicit \"go\"",
+    ]);
+    contains(implementRouter, [
+      "blank/placeholder → offer only before phase 3 completes",
+      "a reconstructed later phase remains ticketless with no re-offer",
+    ]);
+    contains(offer, [
+      "before phase 3 completes", "falls through to the offer",
+      "in a reconstructed later phase it remains canonical build-ticketless with no re-offer",
+    ]);
+    contains(resume, [
+      "without a valid durable `ticket:` anchor", "only while the reconstructed run has not completed phase 3",
+      "exact frozen identity and scope",
+      "newly rendered exact issue preview", "named target", "remaining write contract must be recoverable",
+      "file and continue", "continue ticketless", "continue from the reconstructed phase",
+      "never restart phase 2", "record file-and-continue as canonical **file and build**",
+      "continue-ticketless as canonical **build ticketless**", "normal phase 3 routing handles filing",
+      "every recovered identity, scope, preview, target, and remaining-write disclosure",
+      "complete per-item choice also satisfies it", "ask no second confirmation",
+      "generic bare confirmation cannot substitute", "missing-artifact stop/re-enter-or-restart path",
+      "with no issue write", "past phase 3 with durable `ticket: –` is canonical **build ticketless**",
+      "continue from that phase without re-offering, filing, or restarting phase 2",
+      "duplicate matches remain a separate explicit reuse/new decision",
+    ]);
+    contains(featureRouter, [
+      "only when the recorded phase 1 outcome is **file and build**",
+      "do not enter it for a given-ticket or **build ticketless** run",
+      "run the file step now",
+    ]);
+    expect(featureRouter).not.toMatch(/offer was \*\*accepted\*\*|declined run/);
+    contains(fileStep, [
+      "read this at **phase 3**", "only for canonical **file and build**",
+      "given-ticket and build-ticketless runs never load this file",
+      "a valid durable anchor adopts the ticket path instead of invoking file",
+      "after `feature.md` is written", "perform these together (both, or neither on a re-run)",
+      "mandatory for every file-and-build outcome", "gh issue list --repo <target> --state all",
+      "synthesize the cached-issue json", "persist the anchor", "ticket: <target>#n",
+    ]);
+    expect(`${offer} ${resume} ${fileStep}`).not.toMatch(
+      /recovered-late|post-phase-3 phase after \*\*file and continue\*\*|after phase 3, file-and-continue/,
+    );
+    const noOfferForkDisclosure = forkDisclosure.slice(
+      forkDisclosure.indexOf("given ticket or ticketless create-offer unavailable"),
+      forkDisclosure.indexOf("ticketless create-offer presented"),
+    );
+    contains(noOfferForkDisclosure, [
+      "i will post nothing to `<target>` automatically", "paste-ready pr", "optional comment",
+    ]);
+    expect(noOfferForkDisclosure).not.toContain("optional feature issue");
+    expect(noOfferForkDisclosure).not.toContain("file and build");
+    const offeredForkDisclosure = forkDisclosure.slice(
+      forkDisclosure.indexOf("ticketless create-offer presented"),
+    );
+    contains(offeredForkDisclosure, [
+      "i will post nothing to `<target>` automatically except the optional feature issue",
+      "choose **file and build** below", "use the second variant only when",
+      "presents the combined choice; otherwise use the first",
+    ]);
+    const forkWriteQualification =
+      "excluding the two separately approved per-item issue-create offers";
+    contains(implementRouter, [forkWriteQualification, "only routine phase 9/hand-off automatic write"]);
+    contains(discipline, [forkWriteQualification, "only routine phase 9/hand-off automatic github write"]);
+    contains(phaseNineFork, [
+      forkWriteQualification, "only routine phase 9/hand-off automatic github write",
+      "no `gh pr create`, no `gh issue comment` on fork hand-off",
+    ]);
+    expect(phaseEight).toContain("a phase 1 **file-and-build** outcome");
+    expect(phaseEight).not.toContain("accepted phase 1 create-offer");
+    expect(proposalGate).toContain("this file defines no filing-only question");
+
+    const obsolete = [
+      "distinct yes/no exchange", "separate from the build go", "then proceed to the build \"go\"",
+      "staying ticketless — nothing filed", "accept-step write-contract", "still want it filed as written?",
+    ];
+    for (const marker of obsolete) expect(`${offer} ${proposalGate}`).not.toContain(marker);
+
+    const phaseOneCorpus = [
+      path.join(paths.implementFeature, "SKILL.md"),
+      implementFile("phase-1-direction.md"),
+      implementFile("ticket-creation.md"),
+    ].reduce((bytes, file) => {
+      const normalized = fs.readFileSync(file, "utf8").replace(/\r\n?|\n/g, "\n");
+      return bytes + Buffer.byteLength(normalized, "utf8");
+    }, 0);
+    expect(phaseOneCorpus).toBeLessThanOrEqual(36_170);
+  });
+
   it("retains the review loop's trust-boundary kernel", () => {
     const dispatch = compact(implementFile("dispatch-discipline.md"));
     const implementation = compact(implementFile("phase-7-implementation.md"));
