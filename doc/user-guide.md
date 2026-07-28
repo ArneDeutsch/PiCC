@@ -416,8 +416,9 @@ tracked project files):
   pre-commit ending in a persisted session, reopen that exact session in Pi's session picker before
   `/compact`; an ephemeral print/JSON session cannot be reopened and requires a replacement session
   with the retained input resent. If PiCC says it could not confirm that checkpoint host work
-  stopped, instead exit PiCC completely, start a fresh PiCC process and a fresh session, do not
-  reopen the affected session, and resend the input PiCC reported. For a confirmed recoverable
+  stopped, first copy any restored TUI draft or recover headless input from client/request history.
+  Then exit PiCC completely, start a fresh PiCC process and a fresh session, do not reopen the
+  affected session, and resend it. For a confirmed recoverable
   operational pre-commit failure, run `/compact`, then explicitly continue. If a PreCompact hook
   blocked the attempt, first
   repair or disable that hook (or allow a manual trigger), then run `/compact` and explicitly
@@ -426,7 +427,10 @@ tracked project files):
 
   JSON and RPC expose uncorrelated `picc-checkpoint-lifecycle` custom entries: category
   `checkpoint-exhausted` marks a paused boundary, `checkpoint-cancelled` marks a checkpoint that
-  ended without resuming, and `checkpoint-resumed` marks resumed work. Read `checkpoint-resumed`
+  ended without resuming, `checkpoint-resumed` marks resumed work, and
+  `checkpoint-manual-compaction-refused` gives restart-process guidance only when manual compaction
+  is refused because an unconfirmed-host ending made the process terminal.
+  Read `checkpoint-resumed`
   as superseded by any later terminal record for the same run — resumed work can still fail after
   it, and the terminal record is then the last word. An RPC prompt acknowledgement is not a
   checkpoint-completion acknowledgement. Pi may also
@@ -558,7 +562,7 @@ behaviors worth knowing:
 | Hooks don't fire | check `disableAllHooks` in settings; `/doctor` lists unsupported events/handler types |
 | MCP pending-approval notice at every startup | Review the pending servers and choose approval or decline under [MCP server settings](#6-security--permission-posture). Use `/mcp` for bounded status and settings guidance, or `/doctor` for broader compatibility findings. |
 | Session died at high context / "input exceeds the context window" | Lower `proactiveCompactPercent` in `.claude/.picc/config.json` so PiCC compacts earlier (see Harness configuration above) |
-| Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | For a confirmed recoverable pre-commit ending, reopen the exact persisted session before recovery; an ephemeral headless session instead requires a replacement session and resent input. If PiCC could not confirm checkpoint host work stopped, exit PiCC completely, start a fresh PiCC process and fresh session, do not reopen the affected session, and resend the input PiCC reported. For confirmed recoverable operational exhaustion, run `/compact`, then explicitly continue. For a hook block, repair/disable the hook or allow manual compaction first. For any post-commit restoration/startup failure, do **not** compact again; start a new session and resend retained input. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories `checkpoint-exhausted`, `checkpoint-cancelled`, and `checkpoint-resumed`. RPC acknowledgement and print stdout do not prove logical completion; outside the TUI, exit status **3** does report that a main-session checkpoint gave up. |
+| Checkpoint says work is paused, or a print/RPC command appears finished without `checkpoint-resumed` | For a confirmed recoverable pre-commit ending, reopen the exact persisted session before recovery; an ephemeral headless session instead requires a replacement session and resent input. If PiCC could not confirm checkpoint host work stopped, copy any restored TUI draft or recover headless input from client/request history, then exit PiCC completely, start a fresh PiCC process and fresh session, do not reopen the affected session, and resend it. For confirmed recoverable operational exhaustion, run `/compact`, then explicitly continue. For a hook block, repair/disable the hook or allow manual compaction first. For any post-commit restoration/startup failure, do **not** compact again; start a new session and resend retained input. In JSON/RPC inspect uncorrelated `picc-checkpoint-lifecycle` categories, including `checkpoint-manual-compaction-refused` for an unsafe manual request. RPC acknowledgement and print stdout do not prove logical completion; outside the TUI, exit status **3** does report that a main-session checkpoint gave up. |
 | `picc -p` exited with status **3** | A main-session checkpoint gave up: PiCC paused the work for context compaction and it never resumed, so stdout is a partial answer. Read the `PiCC: ` line on stderr — or the `picc-checkpoint-lifecycle` entries under `--mode json`/RPC — for which ending it was and what to resend. The status is latched for the process: a later recovery does not clear it, and a subagent checkpoint never sets it. |
 | `picc -p` finished but a subagent's output never appeared | Background is the default and a one-shot print run has no next turn to deliver it on. Set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for scripted runs, or collect with `TaskOutput` before the run ends. |
 | Subagents can't spawn subagents / nested fan-out flattened | PiCC defaults to **main-session-only** (`subagents.maxDepth: 1`) — subagents don't recurse by default. Set `subagents.maxDepth` to a positive integer greater than 1 in `.claude/settings.json`; see "Subagent dispatch controls" above. `/doctor` also shows the current nesting posture. |

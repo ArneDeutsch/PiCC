@@ -136,6 +136,60 @@ export interface E2ELive {
   cleanup: () => Promise<void>;
 }
 
+export async function stopProcessTree(
+  child: ChildProcess,
+  closed: Promise<number | null>,
+): Promise<void> {
+  const waitForClose = async (timeoutMs: number): Promise<boolean> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        closed.then(() => true),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  if (child.exitCode !== null || child.signalCode !== null) {
+    if (await waitForClose(5_000)) return;
+    if (process.platform === "win32") {
+      throw new Error("Process exited but did not report close within 5000ms");
+    }
+  }
+
+  const pid = child.pid;
+  if (process.platform === "win32") {
+    if (pid === undefined) throw new Error("Process has no PID for Windows tree termination");
+    const termination = spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+      timeout: 3_000,
+    });
+    if (await waitForClose(5_000)) return;
+    const detail = termination.error?.message ?? `status ${termination.status ?? "unknown"}`;
+    throw new Error(`Process tree ${pid} did not close after taskkill (${detail})`);
+  }
+
+  if (pid === undefined || pid <= 0) throw new Error("Process has no valid PID for process-group termination");
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+  if (await waitForClose(2_000)) return;
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+  if (await waitForClose(5_000)) return;
+  throw new Error(`Process group ${pid} did not close after SIGKILL`);
+}
+
 /**
  * Create an isolated e2e harness instance. Each split test file calls this once
  * at module scope and wires `afterEach(cleanup)`, so per-run temp dirs and
@@ -277,73 +331,16 @@ export function createE2ELive(): E2ELive {
       })();
       return finalization;
     };
-    const waitForClose = async (timeoutMs: number): Promise<boolean> => {
-      if (!closed) return true;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        return await Promise.race([
-          closed.then(() => true),
-          new Promise<false>((resolve) => {
-            timer = setTimeout(() => resolve(false), timeoutMs);
-          }),
-        ]);
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
-    };
     let stopOperation: Promise<void> | undefined;
     const stop = (): Promise<void> => {
       stopOperation ??= (async () => {
-        if (!child) return;
-        if (child.exitCode !== null || child.signalCode !== null) {
-          if (await waitForClose(5_000)) return;
-          if (process.platform === "win32") {
-            await finalizeRun(true);
-            throw new Error("Pi process exited but did not report close within 5000ms");
-          }
-        }
-
-        const pid = child.pid;
-        if (process.platform === "win32") {
-          if (pid === undefined) {
-            await finalizeRun(true);
-            throw new Error("Pi process has no PID for Windows tree termination");
-          }
-          const termination = spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], {
-            stdio: "ignore",
-            windowsHide: true,
-            timeout: 3_000,
-          });
-          if (await waitForClose(5_000)) return;
-          await finalizeRun(true);
-          const detail = termination.error?.message ?? `status ${termination.status ?? "unknown"}`;
-          throw new Error(`Pi process tree ${pid} did not close after taskkill (${detail})`);
-        }
-
-        if (pid === undefined || pid <= 0) {
-          await finalizeRun(true);
-          throw new Error("Pi process has no valid PID for process-group termination");
-        }
+        if (!child || !closed) return;
         try {
-          process.kill(-pid, "SIGTERM");
+          await stopProcessTree(child, closed);
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
-            await finalizeRun(true);
-            throw error;
-          }
+          await finalizeRun(true);
+          throw error;
         }
-        if (await waitForClose(2_000)) return;
-        try {
-          process.kill(-pid, "SIGKILL");
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
-            await finalizeRun(true);
-            throw error;
-          }
-        }
-        if (await waitForClose(5_000)) return;
-        await finalizeRun(true);
-        throw new Error(`Pi process group ${pid} did not close after SIGKILL`);
       })();
       return stopOperation;
     };

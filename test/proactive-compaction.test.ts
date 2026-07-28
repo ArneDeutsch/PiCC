@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import picc, { FdWriteReleasedError, writeFdFully } from "../src/index.js";
 import { fakePi, type FakePi } from "./helpers/fake-pi.js";
+import { fakeSdk } from "./helpers/fake-sdk.js";
 import { deferred, settlement, waitUntil } from "./helpers/async.js";
 import {
   MainSessionCheckpointGate,
@@ -40,11 +41,13 @@ function manualDeadlineClock() {
 }
 
 function expectUnconfirmedHostRecovery(text: string): void {
-  expect(text).toContain("Exit PiCC completely");
+  expect(text).toContain("copy any restored draft before exiting");
+  expect(text).toContain("recover input from client/request history");
+  expect(text).toContain("exit PiCC completely");
   expect(text).toContain("fresh PiCC process");
   expect(text).toContain("fresh session");
   expect(text).toContain("do not reopen the affected session");
-  expect(text).toContain("resend the input PiCC reported");
+  expect(text).toContain("resend it");
   expect(text).not.toContain("/compact");
 }
 
@@ -1001,6 +1004,79 @@ describe("MidRunCompactionController", () => {
     expect(controller.snapshot().phase).toBe("cancelled");
   });
 
+  it("keeps actual default terminal timers referenced and clears their exact handles on settlement", async () => {
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const captured: Array<{ delay: number; handle: NodeJS.Timeout }> = [];
+    const cleared: NodeJS.Timeout[] = [];
+    const setSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((handler: (...args: any[]) => void, delay?: number, ...args: any[]) => {
+      const handle = realSetTimeout(handler, delay, ...args);
+      if (delay === MAIN_CALLBACK_COMPACTION_DEADLINE_MS || delay === RESUMED_RUN_JOIN_DEADLINE_MS) {
+        captured.push({ delay, handle });
+      }
+      return handle;
+    }) as typeof setTimeout);
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation(((handle?: NodeJS.Timeout) => {
+      if (handle) cleared.push(handle);
+      realClearTimeout(handle);
+    }) as typeof clearTimeout);
+
+    const resumed = deferred<void>();
+    const resumeEntered = deferred<void>();
+    const joinEntered = deferred<void>();
+    let callbackToken: any;
+    let finishCallback: ((token: any, result: CompactionAttemptResult) => void) | undefined;
+    let checkpoint: Promise<void> | undefined;
+    let cancellation: Promise<unknown> | undefined;
+    try {
+      const callback = callbackCompactionAttempt(11, (token, complete) => {
+        callbackToken = token;
+        finishCallback = complete;
+      }, new AbortController().signal);
+      const callbackTimer = captured.find((entry) => entry.delay === MAIN_CALLBACK_COMPACTION_DEADLINE_MS);
+      expect(callbackTimer?.handle.hasRef()).toBe(true);
+      finishCallback!(callbackToken, { ok: true });
+      await expect(callback).resolves.toEqual({ ok: true });
+      expect(cleared.filter((handle) => handle === callbackTimer?.handle)).toHaveLength(1);
+
+      const controller = createController({
+        sessionId: "default-timer-custody", threshold: 90,
+        compact: async () => ({ ok: true }),
+        deadlinePolicy: {},
+        resume: () => {
+          resumeEntered.resolve();
+          return {
+            settled: resumed.promise,
+            replay: async () => ({ delivered: true }),
+            cancelAndJoin: async () => {
+              joinEntered.resolve();
+              await resumed.promise;
+            },
+          };
+        },
+      });
+      const { generation, handle } = arm(controller);
+      controller.completeToolBatch(handle);
+      checkpoint = controller.checkpoint(generation);
+      await resumeEntered.promise;
+      cancellation = controller.cancel(generation, "user");
+      await joinEntered.promise;
+      const joinTimer = captured.find((entry) => entry.delay === RESUMED_RUN_JOIN_DEADLINE_MS);
+      expect(joinTimer?.handle.hasRef()).toBe(true);
+      resumed.resolve();
+      await expect(cancellation).resolves.toMatchObject({ cancelled: true });
+      await expect(checkpoint).resolves.toBeUndefined();
+      expect(cleared.filter((handle) => handle === joinTimer?.handle)).toHaveLength(1);
+    } finally {
+      resumed.resolve();
+      if (cancellation) await cancellation.catch(() => undefined);
+      if (checkpoint) await checkpoint.catch(() => undefined);
+      for (const { handle } of captured) realClearTimeout(handle);
+      clearSpy.mockRestore();
+      setSpy.mockRestore();
+    }
+  });
+
   it("token-binds callbacks and abort-races a hung Promise attempt", async () => {
     let late: ((token: any, result: CompactionAttemptResult) => void) | undefined;
     let ownedToken: any;
@@ -1872,6 +1948,9 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
   let dir: string;
   let pi: FakePi;
   let mainCheckpointGate: MainSessionCheckpointGate;
+  let inputHooks: { fire: (...args: any[]) => Promise<any> };
+  let sdk: ReturnType<typeof fakeSdk>;
+  let duringForkDispatch: ((prompt: string) => Promise<void>) | undefined;
   const integrationDeadlines = manualDeadlineClock();
   const originalCwd = process.cwd();
   const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
@@ -1937,16 +2016,48 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       path.join(denySkillDir, "SKILL.md"),
       "---\ndescription: Temporary deny\ndisallowed-tools:\n  - Bash(blocked-*)\n---\nDeny once.\n",
     );
+    const stagedDenySkillDir = path.join(dir, ".claude", "skills", "staged-deny");
+    fs.mkdirSync(stagedDenySkillDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(stagedDenySkillDir, "SKILL.md"),
+      "---\ndescription: Staged deny\ndisallowed-tools:\n  - Bash(staged-*)\n---\nStaged deny: $ARGUMENTS\n",
+    );
+    const scopedForkSkillDir = path.join(dir, ".claude", "skills", "scoped-fork");
+    fs.mkdirSync(scopedForkSkillDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(scopedForkSkillDir, "SKILL.md"),
+      [
+        "---",
+        "description: Scoped fork hook proof",
+        "context: fork",
+        "hooks:",
+        "  SubagentStart:",
+        "    - hooks:",
+        "        - type: command",
+        '          command: echo scoped >> "$CLAUDE_PROJECT_DIR/.claude/scoped-fork-hook"',
+        "---",
+        "Run the scoped fork for $ARGUMENTS.",
+        "",
+      ].join("\n"),
+    );
     const userDir = path.join(dir, ".claude-user");
     fs.mkdirSync(userDir, { recursive: true });
     process.env.PICC_CLAUDE_USER_DIR = userDir;
     process.chdir(dir);
+    sdk = fakeSdk({
+      onPrompt: async (prompt) => {
+        await duringForkDispatch?.(prompt);
+        return "scoped fork completed";
+      },
+    });
     pi = fakePi();
     picc(pi.api as never, {
+      sdk: sdk.sdk,
       onInitializationSettled: pi.captureInitialization,
       checkpointDeadlinePolicy: { clock: integrationDeadlines.clock },
       onWired: (internals) => {
         mainCheckpointGate = internals.mainCheckpointGate;
+        inputHooks = internals.inputHooks;
       },
     });
     await pi.waitForInitialization();
@@ -1972,9 +2083,11 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     process.exitCode = savedExitCode;
   });
 
-  it("fails closed when callback compaction exceeds the production ceiling", async () => {
-    const deadlinePi = fakePi();
-    let deadlineGate!: MainSessionCheckpointGate;
+  it.each(["json", "rpc"] as const)(
+    "fails closed with one structured %s manual refusal when callback compaction exceeds the production ceiling",
+    async (mode) => {
+      const deadlinePi = fakePi();
+      let deadlineGate!: MainSessionCheckpointGate;
     picc(deadlinePi.api as never, {
       onInitializationSettled: deadlinePi.captureInitialization,
       checkpointDeadlinePolicy: { clock: integrationDeadlines.clock },
@@ -1986,7 +2099,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     const committed = deferred<void>();
     let ctx: any;
     ctx = deadlinePi.ctx({
-      mode: "rpc", hasUI: true,
+      mode, hasUI: mode === "rpc",
       model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       hasPendingMessages: () => false,
@@ -2030,6 +2143,18 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     const notice = deadlinePi.entries.find((entry) => entry.data.category === "checkpoint-cancelled")?.data.notice;
     expectUnconfirmedHostRecovery(String(notice));
 
+    const recoveryCount = deadlinePi.entries.filter((entry) =>
+      entry.data.category === "checkpoint-input-recovery").length;
+    await expect(deadlinePi.fire("session_before_compact", { reason: "manual" }, ctx))
+      .resolves.toEqual({ cancel: true });
+    const manualRefusals = deadlinePi.entries.filter((entry) =>
+      entry.data.category === "checkpoint-manual-compaction-refused");
+    expect(manualRefusals).toHaveLength(1);
+    expect(manualRefusals[0]?.data).toMatchObject({ action: "restart-process" });
+    expectUnconfirmedHostRecovery(String(manualRefusals[0]?.data.notice));
+    expect(deadlinePi.entries.filter((entry) =>
+      entry.data.category === "checkpoint-input-recovery")).toHaveLength(recoveryCount);
+
     const switchCtx = deadlinePi.tuiCtx();
     await expect(deadlinePi.fire("session_before_switch", {}, switchCtx)).resolves.toEqual({ cancel: true });
     expect(deadlineGate.currentController()).toBe(controller);
@@ -2048,8 +2173,9 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(controller.snapshot().failureCategory).toBe("unconfirmed-host");
     const recovery = deadlinePi.entries.filter((entry) => entry.data.category === "checkpoint-input-recovery");
     expect(recovery).toHaveLength(1);
-    expect(recovery[0]?.data.count).toBe(1);
-  });
+      expect(recovery[0]?.data.count).toBe(1);
+    },
+  );
 
   it("fails closed through registered session switching when resumed cancellation misses its ceiling", async () => {
     const deadlines = manualDeadlineClock();
@@ -2375,12 +2501,154 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await mainCheckpointGate.startSession("registered-cycles-complete");
   });
 
-  it("handles and reports concurrent input while settled fallback cannot shadow it", async () => {
+  it("scopes a staged typed-fork hook to child execution and discards it on final refusal", async () => {
+    await mainCheckpointGate.startSession("staged-fork-hook-refusal");
+    pi.entries.length = 0;
+    const marker = path.join(dir, ".claude", "scoped-fork-hook");
+    const stopMarker = path.join(dir, ".claude", ".session-stop");
+    fs.rmSync(marker, { force: true });
+    fs.writeFileSync(stopMarker, "close after the committed summary");
+    let ctx: any;
+    ctx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      compact: (options: any) => {
+        pi.compactCalls.push(options);
+        void (async () => {
+          const before = await pi.fire("session_before_compact", { reason: "manual" }, ctx);
+          if (before?.cancel) return options.onError(new Error("cancelled"));
+          await pi.fire("session_compact", {
+            reason: "manual", compactionEntry: { summary: "fork refusal summary" },
+          }, ctx);
+          options.onComplete({ summary: "fork refusal summary" });
+        })();
+      },
+    });
+    duringForkDispatch = async () => {
+      duringForkDispatch = undefined;
+      expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toEqual(["scoped"]);
+      await pi.fire("agent_settled", {}, ctx);
+      expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+      });
+    };
+    try {
+      await expect(pi.fire("input", {
+        text: "/scoped-fork guarded child", source: "interactive", streamingBehavior: undefined,
+      }, ctx)).resolves.toEqual({ action: "handled" });
+      expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toEqual(["scoped"]);
+      expect(pi.entries.filter((entry) =>
+        entry.data.category === "checkpoint-input-recovery")).toHaveLength(1);
+
+      const promptCallsBefore = sdk.promptCalls();
+      await expect(pi.tools.get("Agent").execute("post-refusal-global-proof", {
+        subagent_type: "general-purpose",
+        prompt: "prove the refused staged hook is not global",
+        run_in_background: false,
+      })).resolves.toMatchObject({ content: [expect.objectContaining({ type: "text" })] });
+      expect(sdk.promptCalls()).toBe(promptCallsBefore + 1);
+      expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toEqual(["scoped"]);
+    } finally {
+      duringForkDispatch = undefined;
+      fs.rmSync(stopMarker, { force: true });
+      fs.rmSync(marker, { force: true });
+    }
+  });
+
+  it("merges concurrently accepted skill activations and gives the latest run deny ownership", async () => {
+    await mainCheckpointGate.startSession("concurrent-skill-activation");
+    const ctx = pi.rpcCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
+    });
+    const marker = path.join(dir, ".claude", "scoped-fork-hook");
+    fs.rmSync(marker, { force: true });
+    const releaseFirst = deferred<void>();
+    const releaseSecond = deferred<void>();
+    const promptBaseline = sdk.promptCalls();
+    let dispatchOrdinal = 0;
+    duringForkDispatch = async () => {
+      const ordinal = dispatchOrdinal++;
+      if (ordinal === 0) await releaseFirst.promise;
+      else if (ordinal === 1) await releaseSecond.promise;
+    };
+    let first: Promise<unknown> | undefined;
+    let second: Promise<unknown> | undefined;
+    try {
+      first = pi.fire("input", {
+        text: "/scoped-fork /deny-once", source: "rpc", streamingBehavior: undefined,
+      }, ctx);
+      await sdk.waitForPromptCalls(promptBaseline + 1);
+      second = pi.fire("input", {
+        text: "/scoped-fork /staged-deny second", source: "rpc", streamingBehavior: undefined,
+      }, ctx);
+      await sdk.waitForPromptCalls(promptBaseline + 2);
+
+      releaseFirst.resolve();
+      await expect(first).resolves.toMatchObject({ action: "transform" });
+      releaseSecond.resolve();
+      await expect(second).resolves.toMatchObject({ action: "transform" });
+
+      const prompt = (await pi.fire("before_agent_start", { systemPrompt: "BASE" }, ctx)).systemPrompt as string;
+      expect(prompt).toContain("Deny once.");
+      expect(prompt).toContain("Staged deny: second");
+      expect(await pi.fire("tool_call", {
+        toolName: "bash", toolCallId: "older-run-deny", input: { command: "blocked-now" },
+      }, ctx)).toBeUndefined();
+      expect(await pi.fire("tool_call", {
+        toolName: "bash", toolCallId: "latest-run-deny", input: { command: "staged-now" },
+      }, ctx)).toMatchObject({ block: true });
+      expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toHaveLength(2);
+
+      const beforeGlobalDispatch = sdk.promptCalls();
+      await expect(pi.tools.get("Agent").execute("concurrent-hook-global-proof", {
+        subagent_type: "general-purpose",
+        prompt: "prove one globally installed scoped hook",
+        run_in_background: false,
+      })).resolves.toMatchObject({ content: [expect.objectContaining({ type: "text" })] });
+      expect(sdk.promptCalls()).toBe(beforeGlobalDispatch + 1);
+      expect(fs.readFileSync(marker, "utf8").trim().split(/\r?\n/)).toHaveLength(3);
+    } finally {
+      releaseFirst.resolve();
+      releaseSecond.resolve();
+      if (first) await first.catch(() => undefined);
+      if (second) await second.catch(() => undefined);
+      duringForkDispatch = undefined;
+      fs.rmSync(marker, { force: true });
+    }
+  });
+
+  it("keeps prior skill controls while a staged slash skill races settled-fallback custody", async () => {
     await mainCheckpointGate.startSession("settled-fallback-input");
+    const priorCtx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
+    });
+    await pi.fire("input", {
+      text: "/deny-once", source: "interactive", streamingBehavior: undefined,
+    }, priorCtx);
+    expect(await pi.fire("tool_call", {
+      toolName: "bash", toolCallId: "prior-before-race", input: { command: "blocked-now" },
+    }, priorCtx)).toMatchObject({ block: true });
     pi.entries.length = 0;
     pi.compactCalls.length = 0;
-    const release = deferred<void>();
-    const ctx = pi.printCtx({
+    const hookEntered = deferred<void>();
+    const releaseHook = deferred<void>();
+    const releaseCompaction = deferred<void>();
+    const originalFire = inputHooks.fire.bind(inputHooks);
+    let hookCalls = 0;
+    let input: Promise<unknown> | undefined;
+    let settlement: Promise<unknown> | undefined;
+    inputHooks.fire = async (...args: any[]) => {
+      if (args[0] === "UserPromptSubmit") {
+        hookCalls += 1;
+        hookEntered.resolve();
+        await releaseHook.promise;
+      }
+      return originalFire(...args);
+    };
+    pi.editorText = "";
+    const ctx = pi.tuiCtx({
       model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
       compact: (options: any) => {
@@ -2390,7 +2658,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
             reason: "manual", customInstructions: undefined,
           }, ctx);
           if (before?.cancel) return options.onError(new Error("cancelled"));
-          await release.promise;
+          await releaseCompaction.promise;
           await pi.fire("session_compact", {
             reason: "manual", compactionEntry: { summary: "fallback summary" },
           }, ctx);
@@ -2398,21 +2666,107 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
         })();
       },
     });
-    const settlement = pi.fire("agent_settled", {}, ctx);
-    await waitUntil({
-      description: "settled fallback compaction",
-      predicate: () => pi.compactCalls.length > 0,
+    try {
+      input = pi.fire("input", {
+        text: "/staged-deny original request", source: "interactive", streamingBehavior: undefined,
+      }, ctx);
+      await hookEntered.promise;
+      settlement = pi.fire("agent_settled", {}, ctx);
+      await waitUntil({
+        description: "settled fallback compaction",
+        predicate: () => pi.compactCalls.length > 0,
+      });
+      releaseHook.resolve();
+      await expect(input).resolves.toEqual({ action: "handled" });
+      expect(hookCalls).toBe(1);
+      expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([]);
+      expect(pi.entries.filter((entry) =>
+        entry.data.category === "checkpoint-input-recovery")).toHaveLength(1);
+      expect(pi.entries).toContainEqual(expect.objectContaining({
+        customType: "picc-checkpoint-lifecycle",
+        data: expect.objectContaining({ category: "checkpoint-input-recovery", count: 1 }),
+      }));
+      expect(await pi.fire("tool_call", {
+        toolName: "bash", toolCallId: "prior-after-race", input: { command: "blocked-now" },
+      }, ctx)).toMatchObject({ block: true });
+      expect(await pi.fire("tool_call", {
+        toolName: "bash", toolCallId: "staged-after-race", input: { command: "staged-now" },
+      }, ctx)).toBeUndefined();
+      expect(pi.entries.find((entry) => entry.data.category === "checkpoint-input-recovery")?.data)
+        .toMatchObject({ count: 1, restoredTextCount: 1 });
+      expect(pi.editorText).toBe("/staged-deny original request\n");
+    } finally {
+      releaseHook.resolve();
+      releaseCompaction.resolve();
+      if (input) await input.catch(() => undefined);
+      if (settlement) await settlement.catch(() => undefined);
+      inputHooks.fire = originalFire;
+      pi.editorText = "";
+    }
+  });
+
+  it("routes a pipeline throw through live closed-state rejection after the prompt hook", async () => {
+    await mainCheckpointGate.startSession("closed-prompt-hook-input");
+    pi.entries.length = 0;
+    pi.compactCalls.length = 0;
+    const hookEntered = deferred<void>();
+    const releaseHook = deferred<void>();
+    const originalFire = inputHooks.fire.bind(inputHooks);
+    const stopMarker = path.join(dir, ".claude", ".session-stop");
+    let hookCalls = 0;
+    let input: Promise<unknown> | undefined;
+    let settlement: Promise<unknown> | undefined;
+    inputHooks.fire = async (...args: any[]) => {
+      if (args[0] === "UserPromptSubmit") {
+        hookCalls += 1;
+        hookEntered.resolve();
+        await releaseHook.promise;
+        throw new Error("pipeline failed after lifecycle rejection");
+      }
+      return originalFire(...args);
+    };
+    fs.writeFileSync(stopMarker, "stop after commit");
+    let ctx: any;
+    ctx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      compact: (options: any) => {
+        pi.compactCalls.push(options);
+        void (async () => {
+          const before = await pi.fire("session_before_compact", { reason: "manual" }, ctx);
+          if (before?.cancel) return options.onError(new Error("cancelled"));
+          await pi.fire("session_compact", {
+            reason: "manual", compactionEntry: { summary: "committed while hook waited" },
+          }, ctx);
+          options.onComplete({ summary: "committed while hook waited" });
+        })();
+      },
     });
-    await expect(pi.fire("input", {
-      text: "arrived during fallback", source: "interactive", streamingBehavior: undefined,
-    }, ctx)).resolves.toEqual({ action: "handled" });
-    expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([]);
-    expect(pi.entries).toContainEqual(expect.objectContaining({
-      customType: "picc-checkpoint-lifecycle",
-      data: expect.objectContaining({ category: "checkpoint-input-recovery", count: 1 }),
-    }));
-    release.resolve();
-    await settlement;
+    try {
+      input = pi.fire("input", {
+        text: "arrived before terminal close", source: "interactive", streamingBehavior: undefined,
+      }, ctx);
+      await hookEntered.promise;
+      settlement = pi.fire("agent_settled", {}, ctx);
+      await settlement;
+      expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({
+        phase: "exhausted", admission: "closed", failureCategory: "restoration-paused",
+      });
+      releaseHook.resolve();
+      await expect(input).resolves.toEqual({ action: "handled" });
+      expect(hookCalls).toBe(1);
+      expect(pi.entries.filter((entry) =>
+        entry.data.category === "checkpoint-input-recovery")).toHaveLength(1);
+      expect(pi.entries.find((entry) => entry.data.category === "checkpoint-input-recovery")?.data)
+        .toMatchObject({ count: 1 });
+      expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([]);
+    } finally {
+      releaseHook.resolve();
+      if (input) await input.catch(() => undefined);
+      if (settlement) await settlement.catch(() => undefined);
+      inputHooks.fire = originalFire;
+      fs.rmSync(stopMarker, { force: true });
+    }
   });
 
   it("awaits callback compaction, hidden resume, replay, and nested settlement", async () => {

@@ -128,8 +128,9 @@ main and child sessions run SessionStart with source `compact`, surface PostComp
 without injecting its stdout or additional context, then restore the latest rendered active skill
 bodies that fit the heuristic character budget, most-recent-first. This approximates Claude Code's
 token-counted retention policy and can under- or over-retain it. `PreCompact` runs before commit;
-SessionStart(compact) and PostCompact run only after commit. Pi's void main-session `sendMessage`
-confirms only synchronous enqueue acceptance, so later delivery failure is not observable.
+SessionStart(compact) and PostCompact run only after commit. Replayed input remains in
+session/generation-bound custody until an authenticated matching `message_start` consumes it or
+settlement reports it for recovery; synchronous enqueue acceptance alone does not release custody.
 
 `proactiveCompactPercent` defaults to 90. At `turn_end`, PiCC waits for every requested tool result.
 A clean PiCC-owned batch uses `terminate`; any mixed, blocked, malformed, truncated, pending, or

@@ -136,7 +136,7 @@ export type ReplayDeliveryResult =
 export const MAIN_CALLBACK_COMPACTION_DEADLINE_MS = 5 * 60 * 1000;
 export const RESUMED_RUN_JOIN_DEADLINE_MS = 30 * 1000;
 export const UNCONFIRMED_HOST_RECOVERY_GUIDANCE =
-  "Exit PiCC completely, start a fresh PiCC process and a fresh session, do not reopen the affected session, and resend the input PiCC reported.";
+  "In the TUI, copy any restored draft before exiting; in headless modes, recover input from client/request history. Then exit PiCC completely, start a fresh PiCC process and a fresh session, do not reopen the affected session, and resend it.";
 
 export interface HostDeadlineTimer {
   clear(): void;
@@ -545,7 +545,6 @@ export class MidRunCompactionController {
       (this.phase === "cancelled" && this.cancellation?.quiescence === "unconfirmed");
   }
 
-  /** Make malformed pre-executor state total at a true host settlement. */
   settleMalformedAtHostBoundary(generation: number): boolean {
     if (generation !== this.generation || (this.phase !== "armed" && this.phase !== "stopping")) return false;
     this.exhaust(generation, "operational");
