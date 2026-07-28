@@ -1706,6 +1706,95 @@ describe("real Pi compact-search composition", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("drives one installed lowercase grep lifecycle through real ToolExecutionComponent", async () => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    sdk.initTheme();
+    const definition = wrapForSelfShell(withCompactSearchRendering(sdk.createGrepToolDefinition(process.cwd())));
+    const args = { pattern: "stock-lifecycle", path: "src" };
+    const result = { content: [{ type: "text", text: "src/a.ts:1:stock-lifecycle\nsrc/b.ts:2:stock-lifecycle" }], details: undefined };
+    const component = new sdk.ToolExecutionComponent(
+      "grep", "stock-grep-contract", args, {}, definition,
+      { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+    );
+    component.setArgsComplete();
+    component.markExecutionStarted();
+    component.updateResult(result, false);
+    component.setExpanded(false);
+    const collapsed = (component.render(120) as string[]).join("\n");
+    expect(collapsed).toContain("grep");
+    expect(collapsed).toContain("stock-lifecycle");
+    expect(collapsed).toContain("ctrl+o to expand");
+    expect(collapsed).not.toContain("src/a.ts:1");
+    component.setExpanded(true);
+    expect((component.render(120) as string[]).join("\n")).toContain("src/a.ts:1:stock-lifecycle");
+    component.setExpanded(false);
+    expect((component.render(120) as string[]).join("\n")).not.toContain("src/a.ts:1");
+  });
+
+  it("pins exporter ownership: ls stays template-owned while grep/find custom fragments collapse safely", async () => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    sdk.initTheme();
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const piDist = mainUrl.slice(0, mainUrl.indexOf("/dist/"));
+    const htmlModule: any = await import(`${piDist}/dist/core/export-html/tool-renderer.js`);
+    const exportModule: any = await import(`${piDist}/dist/core/export-html/index.js`);
+    const themeModule: any = await import(`${piDist}/dist/modes/interactive/theme/theme.js`);
+    const definitions = new Map([
+      ["grep", wrapForSelfShell(withCompactSearchRendering(sdk.createGrepToolDefinition(process.cwd())))],
+      ["find", wrapForSelfShell(withCompactSearchRendering(sdk.createFindToolDefinition(process.cwd())))],
+      ["ls", wrapForSelfShell(withCompactSearchRendering(sdk.createLsToolDefinition(process.cwd())))],
+    ]);
+    const renderer = htmlModule.createToolHtmlRenderer({
+      getToolDefinition: (name: string) => definitions.get(name), theme: themeModule.theme,
+      cwd: process.cwd(), width: 80,
+    });
+    const customCases = [
+      ["grep", { pattern: "<needle>", path: "src" }, "src/<unsafe>.ts:1:<needle>", "&lt;needle&gt;"],
+      ["find", { pattern: "**/<unsafe>.ts", path: "src" }, "src/<unsafe>.ts", "**/&lt;unsafe&gt;.ts"],
+    ] as const;
+    for (const [name, args, body, escapedInvocation] of customCases) {
+      const id = `stock-html-${name}`;
+      expect(renderer.renderCall(id, name, args)).toBe("");
+      const rendered = renderer.renderResult(id, name, [{ type: "text", text: body }], undefined, false);
+      expect(rendered?.collapsed).toContain("click to show detail");
+      expect(rendered?.collapsed).toContain(escapedInvocation);
+      expect(rendered?.collapsed).not.toContain(name === "grep" ? "<needle>" : "**/<unsafe>.ts");
+      expect(rendered?.collapsed).not.toContain(body);
+      expect(rendered?.collapsed).not.toContain("ctrl+o");
+      expect(rendered?.expanded).toContain("&lt;unsafe&gt;");
+      expect(rendered?.expanded).not.toContain("<unsafe>");
+    }
+    const dir = mkdtempSync(join(tmpdir(), "picc-stock-export-"));
+    const outputPath = join(dir, "stock.html");
+    try {
+      const session = sdk.SessionManager.create(dir, dir, { id: "stock-export-ownership" });
+      for (const [name, args, body] of customCases) {
+        const toolCallId = `full-export-${name}`;
+        session.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: toolCallId, name,
+          arguments: args }], stopReason: "toolUse" } as never);
+        session.appendMessage({ role: "toolResult", toolCallId, toolName: name,
+          content: [{ type: "text", text: body }], details: undefined, isError: false } as never);
+      }
+      session.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "stock-html-ls", name: "ls",
+        arguments: { path: "<template-owned>" } }], stopReason: "toolUse" } as never);
+      session.appendMessage({ role: "toolResult", toolCallId: "stock-html-ls", toolName: "ls",
+        content: [{ type: "text", text: "<template-entry>" }], details: undefined, isError: false } as never);
+      await exportModule.exportSessionToHtml(session, undefined, { outputPath, toolRenderer: renderer });
+      const html = readFileSync(outputPath, "utf8");
+      const encoded = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1];
+      const data = JSON.parse(Buffer.from(encoded!, "base64").toString("utf8"));
+      for (const [name] of customCases) {
+        const rendered = data.renderedTools?.[`full-export-${name}`];
+        expect(rendered).toBeDefined();
+        expect(rendered.callHtml).toBeUndefined();
+        expect(rendered.resultHtmlCollapsed).toContain("click to show detail");
+      }
+      expect(data.renderedTools?.["stock-html-ls"]).toBeUndefined();
+      expect(JSON.stringify(data.entries)).toContain("template-entry");
+      expect(html).toContain("case 'ls':");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 describe("real Pi glyph-shell image and spacing ownership", () => {

@@ -162,6 +162,61 @@ describe("tool surface registration", () => {
     }
   });
 
+  it("classifies every actual main-session registration under one explicit presentation policy", () => {
+    type PolicyFamily = "overview" | "specialized" | "mcp" | "generic-fail-open";
+    const explicit = new Map<string, Exclude<PolicyFamily, "mcp">>();
+    const add = (family: Exclude<PolicyFamily, "mcp">, names: readonly string[]) => {
+      for (const name of names) {
+        expect(explicit.has(name), `duplicate policy for ${name}`).toBe(false);
+        explicit.set(name, family);
+      }
+    };
+    add("overview", [
+      "bash", "read", "write", "edit", "grep", "find", "ls",
+      "WebFetch", "WebSearch", "Grep", "Glob", "MultiEdit", "Skill", "SlashCommand",
+      "EnterWorktree", "ExitWorktree", "TaskCreate", "TaskUpdate", "TaskGet",
+    ]);
+    add("specialized", ["Agent", "Task", "SendMessage", "TaskOutput", "TaskStop", "TaskList", "TodoWrite"]);
+    add("generic-fail-open", [
+      "NotebookRead", "NotebookEdit", "AskUserQuestion", "ExitPlanMode", "EnterPlanMode", "Artifact",
+      "computer", "LSP", "BashOutput", "KillShell", "KillBash",
+    ]);
+
+    const isMcpName = (name: string): boolean => {
+      const prefix = "mcp__";
+      if (!name.startsWith(prefix)) return false;
+      const payload = name.slice(prefix.length);
+      const separator = payload.indexOf("__");
+      if (separator < 0) return false;
+      const server = payload.slice(0, separator);
+      const tool = payload.slice(separator + 2);
+      return /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(server) && /^[A-Za-z0-9_-]+$/u.test(tool);
+    };
+    const familiesFor = (name: string): PolicyFamily[] => [
+      ...(explicit.has(name) ? [explicit.get(name)!] : []),
+      ...(isMcpName(name) ? ["mcp" as const] : []),
+    ];
+    expect(familiesFor("mcp__future_server__future_method")).toEqual(["mcp"]);
+    expect(familiesFor("mcp__fixture____")).toEqual(["mcp"]);
+    expect(["mcp____tool", "mcp___server__tool", "mcp__server__bad.tool", "mcp__server"]
+      .map((name) => familiesFor(name))).toEqual([[], [], [], []]);
+
+    const actual = [...pi.tools.keys()].sort();
+    const declared = [...explicit.keys()].sort();
+    expect(actual.filter((name) => !isMcpName(name))).toEqual(declared);
+    for (const name of actual) {
+      const matches = familiesFor(name);
+      expect(matches, `${name} must match exactly one policy family`).toHaveLength(1);
+      const tool = pi.tools.get(name);
+      expect(tool.renderShell, `${name} policy lost self-shell`).toBe("self");
+      expect(typeof tool.renderCall, `${name} policy lost call evidence`).toBe("function");
+      expect(typeof tool.renderResult, `${name} policy lost result evidence`).toBe("function");
+      if (matches[0] === "generic-fail-open") {
+        expect(String(tool.description)).toContain("degraded no-op");
+      }
+    }
+  });
+
   it.each([
     {
       name: "WebFetch",
@@ -506,7 +561,7 @@ describe("tool surface registration", () => {
     }
   });
 
-  it("keeps unrelated Claude and lowercase built-in rendering outside compact specialization", async () => {
+  it("keeps unrelated Claude rendering generic while lowercase stock grep uses compact specialization", async () => {
     const todo = pi.tools.get("TodoWrite");
     const lowerGrep = pi.tools.get("grep");
     expect(todo.renderCall({}, undefined, { state: {} }).render(80).join("\n")).toContain("todo write");
@@ -520,12 +575,14 @@ describe("tool surface registration", () => {
       bold: (text: string) => text,
       bg: (_slot: string, text: string) => text,
     };
-    const callText = lowerGrep.renderCall(args, theme, ctx).render(100).join("\n");
+    const call = lowerGrep.renderCall(args, theme, ctx);
     const resultText = lowerGrep.renderResult(
       result, { expanded: false, isPartial: false }, theme, ctx,
     ).render(100).join("\n");
+    const callText = call.render(100).join("\n");
     expect(callText).toContain("T02-LOWERCASE-STOCK");
-    expect(resultText).toContain("complete stock result");
+    expect(callText).toContain("ctrl+o to expand");
+    expect(`${callText}\n${resultText}`).not.toContain("complete stock result");
     expect(`${callText}\n${resultText}`).not.toContain("1/1 entries");
   });
 
