@@ -1,11 +1,11 @@
 import {
-  getCapabilities,
   getImageDimensions,
   imageFallback,
   truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { piTuiCapabilities } from "./pi-tui-runtime.js";
 import { formatToolDisplayName } from "./tool-display.js";
 
 type Component = { render(width: number): string[] };
@@ -552,8 +552,10 @@ export function getTextOutput(result: ResultShape | undefined, showImages: boole
     // Remove every CR (including CRLF's CR) so output cannot return the cursor to column zero.
     .map((block) => sanitizeBinaryOutput(stripAnsi(String(block.text || ""))).replace(/\r/gu, ""))
     .join("\n");
-  const capabilities = getCapabilities();
-  if (imageBlocks.length > 0 && (!capabilities.images || !showImages)) {
+  const capabilities = piTuiCapabilities();
+  if (imageBlocks.length > 0 && (
+    !capabilities.available || !capabilities.value.images || !showImages
+  )) {
     const indicators = imageBlocks
       .map((image) => {
         const mimeType = image.mimeType ?? "image/unknown";

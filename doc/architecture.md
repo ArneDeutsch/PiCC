@@ -268,11 +268,13 @@ where to start reading, not the extent of its cluster.
   from a config **outside the project** — outside **because harness state must not touch the target
   project**.
 
-- **Tool-row rendering** (`tool-shell.ts`, `search-tool-render.ts`, `routine-tool-render.ts`,
-  `default-collapsed-tool-render.ts`, with display-name/path formatting in `tool-display.ts`) — the
-  self-shell framing seam plus guarded main-session human renderers for specialized and safely
-  classified settled tool rows; decoration changes only presentation and never canonical
-  model-facing results.
+- **Tool-row rendering** (`main-session-tool-render.ts`, `tool-shell.ts`,
+  `search-tool-render.ts`, `routine-tool-render.ts`, `default-collapsed-tool-render.ts`, with
+  display-name/path formatting in `tool-display.ts`) — the central main-session family router,
+  self-shell framing, and guarded human renderers for specialized and safely classified settled
+  tool rows. `pi-tui-runtime.ts` is the narrow package-instance bridge for Pi-owned mutable
+  singletons and constructor identity in the supported two-copy production layout. Decoration
+  changes only presentation and never canonical model-facing results.
 
 - **`tools/`** — the **self-contained** Claude-named tools, and the degrade stubs: names that resolve
   for gating but no-op with a notice. A tool that fronts a runtime subsystem lives with that
@@ -349,9 +351,14 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    eagerly here and its literal path held for injection.
 
    Load is **not** fully synchronous: the cwd-swapping overrides need Pi's SDK, so they register
-   from an async step whose settlement is awaited by a readiness seam rather than by load returning.
-   If that import fails the harness **degrades with a stderr notice** and keeps running on Pi's own
-   built-ins — losing the cwd swap, not the session.
+   from an async step whose settlement is awaited by the ordinary input-admission seam rather than
+   by load returning. The fixed replacement set is owned by `coreToolNames` in `src/index.ts`, and
+   preparation completes for the whole set before registration begins. Any initialization failure
+   rejects project task input before hooks or provider dispatch because Pi's stock built-ins cannot
+   honor PiCC's live worktree cwd. Failure cleanup is remove-only for that fixed set: it cannot widen
+   the active tools or release blocked input. See
+   [“Core-tool readiness” in `pi-integration.md`](pi-integration.md#37-core-tool-readiness) for the
+   exact lifecycle and retry mechanics.
 
 2. **`session_start`.** Captures the model registry and active model, applies the configured
    model/effort, attempts to self-heal `core.hooksPath` when `.githooks/` and a resolved Git executable are
@@ -364,10 +371,14 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    instruction set and the scratchpad section each turn.
 
 4. **`input`.** Checkpoint replay/disposition and extension-sourced input handling run first. For
-   admitted non-extension user input, in order: intercept PiCC control commands; handle the fallback
-   for Pi built-ins; fire the `UserPromptSubmit` hook (block or inject context); expand `/skill
-   [args]` slash commands by activating the skills and **transforming the user turn** into the
-   rendered bodies; then checkpoint-capture accepted input before model delivery. Pi's exact router
+   admitted non-extension user input, intercept PiCC control commands and handle the fallback for Pi
+   built-ins before awaiting the fixed core replacement set. Registered non-provider control
+   commands therefore remain available during a readiness failure. Ordinary project input across
+   TUI, print, JSON, and RPC proceeds only after readiness: fire the `UserPromptSubmit` hook (block or
+   inject context); expand `/skill [args]` slash commands by activating the skills and
+   **transforming the user turn** into the rendered bodies; then checkpoint-capture accepted input
+   before model delivery. The gate covers this ordinary input path, not authenticated extension
+   continuations or arbitrary third-party direct-trigger turns that bypass it. Pi's exact router
    normally owns canonical interactive built-ins; any reserved Pi token reaching this admitted user
    path receives fixed canonical guidance outside hooks, skills, and model context.
 

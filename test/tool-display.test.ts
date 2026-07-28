@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import { sanitize } from "../src/runtime/default-collapsed-tool-render.js";
+import { sanitizeDisplayText } from "../src/runtime/render-util.js";
 import {
   escapeRepositoryDisplayCollision,
   formatDisplayPath,
@@ -139,8 +139,21 @@ describe("display-only tool helpers", () => {
     expect(sanitizeInlineDisplay("a\u001b[31mb\u001b]0;title\u0007c\u009bd\u009de\u009cf\tg\u0085h"))
       .toBe("a�b�c��f�g�h");
     expect(sanitizeInlineDisplay("K:/secret")).toBe("K:/secret");
-    expect(sanitize("first\nsecond\rthird", 16_384)).toBe("first\nsecond�third");
-    expect(sanitize("first\nsecond\rthird", 16_384, true)).toBe("first�second�third");
+    const textCases = [
+      ["crlf\r\nline", "crlf\nline"],
+      ["lone\rreturn", "lone�return"],
+      ["c0\u0001control", "c0�control"],
+      ["c1\u0085control", "c1�control"],
+      ["csi\u001b[31mred", "csi�red"],
+      ["c1-csi\u009b31mred", "c1-csi�red"],
+      ["osc\u001b]0;title\u0007body", "osc�body"],
+      ["unterminated\u001b]0;title", "unterminated�"],
+      ["format\u200bmark", "format�mark"],
+      ["tab\tstop", "tab   stop"],
+      ["separator\u2028line\u2029paragraph", "separator�line�paragraph"],
+    ] as const;
+    for (const [input, expected] of textCases) expect(sanitizeDisplayText(input, 16_384)).toBe(expected);
+    expect(sanitizeDisplayText("first\r\nsecond\rthird\tlast", 16_384, true)).toBe("first�second�third last");
   });
 
   it("selects mutable workspace state only for the explicit live pre-execution pair", () => {

@@ -241,6 +241,43 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expectDisclosure(contract);
   });
 
+  it("keeps summary recovery scoped and separate from proactive admission", () => {
+    expectDisclosure({
+      id: "feature.compaction-summary-recovery",
+      tier: "partial",
+      core: [
+        /Default provider-backed/,
+        /automatic/,
+        /manual/,
+        /split-turn/,
+        /branch Codex summaries/,
+        /shared summarization seam/,
+        /summary-only SSE/,
+        /provider maxRetries: 0/,
+        /configured bounded summarization loop/,
+        /sole owner/,
+        /transient transport\/provider-overload classification/,
+        /attempts/,
+        /abortable exponential backoff/,
+        /retry lifecycle events/,
+      ],
+      gap: [/cancellation and deterministic failures stop category-appropriately/],
+      precedence: [/Ordinary PiCC Agent turns/, /non-Codex summaries/, /retain their configured transport and provider retry behavior/],
+      visibility: [
+        /COMPATIBILITY BOUNDARY/,
+        /public request fields cannot prove provenance/,
+        /exact-signature custom caller/,
+        /until Pi exposes a purpose marker/,
+      ],
+      parity: [/PiCC reliability hardening/, /NOT Claude Code transport\/retry parity/],
+    });
+    const proactive = lookupCapability("feature.proactive-compaction-policy")?.note ?? "";
+    expect(proactive).toContain("feature.compaction-summary-recovery");
+    expect(proactive).not.toMatch(
+      /automatic, manual|split-turn|branch Codex|shared summarization seam|summary-only SSE|force(?:s|d)? SSE|provider(?:-internal)? (?:maxRetries|retr(?:y|ies))|configured (?:bounded )?summarization loop|sole (?:retry )?owner|transport\/provider-overload|abortable exponential backoff|retry lifecycle events|public request fields|prove provenance|exact-signature|purpose marker/,
+    );
+  });
+
   it("carries explicit deferred entries for the non-stdio MCP surfaces", () => {
     for (const id of [
       "feature.mcp-remote-transports",
@@ -303,6 +340,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
         /successful acceptance is transient in human chat/,
         /first terminal delivery through TaskOutput or settlement/,
         /semantic record/,
+        /configured `app\.tools\.expand` action \(Ctrl\+O by default\)/,
+        /unbound action fails open/,
+        /At unusable widths, detail waits for widening; a resize prompt appears only when it fits/,
         /later already-reported retrieval adds no human row/,
         /Nested work at depth >= 2/,
         /default notice box/,
@@ -314,7 +354,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       gap: [/PARTIAL residual/, /notice is next-turn/],
       precedence: [/BACKGROUND-BY-DEFAULT/, /run_in_background:false/, /DISABLE_BACKGROUND_TASKS/, /MAIN-SESSION-ONLY BY DEFAULT/, /default subagents\.maxDepth/, /subagents\.maxDepth of 1/, /positive integer greater than 1/, /nested generations/],
       visibility: [/model-visible text/, /human TUI strips it/, /model-visible background dispatch still returns the task ID/, /print\/RPC rendering unchanged/],
-      parity: [/Claude-faithful/, /PiCC-defined/, /not verified parity/, /Claude Code 2\.1\.217/, /disables nested spawning by default/, /CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH/],
+      parity: [/Claude-faithful/, /not verified parity/, /PiCC's conservative default/, /subagents\.maxDepth.*explicit nesting control/],
       split: [/feature\.background-agents/, /tool\.Agent\.fork/],
     },
     { id: "tool.Task", tier: "partial", core: [/alias of the Agent subagent-dispatch tool/, /loud-failure/], gap: [/conditional/, /remaining uncollected/], precedence: [/background-by-default/, /terminal TaskOutput collection suppresses/], visibility: [/settlement notice/], parity: [/PiCC UX hardening rather than verified parity/], split: [/tool\.Agent\.fork/] },
@@ -330,6 +370,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
         /main-session retrieval of depth-1 work/,
         /FIRST terminal delivery/,
         /semantic record/,
+        /configured `app\.tools\.expand` action \(Ctrl\+O by default\)/,
+        /unbound action fails open/,
+        /At unusable widths, detail waits for widening; a resize prompt appears only when it fits/,
         /never adding a reference or duplicate row/,
       ],
       gap: [/PRE-EXISTING SCHEMA GAP/, /PiCC exposes wait/],
@@ -340,6 +383,14 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     { id: "tool.TaskStop", tier: "partial", core: [/stops a background subagent/, /TaskStop abandons it/], gap: [/PiCC accepts only task_id/, /Claude 2\.1\.198\+ also accepts agent id\/name/], precedence: [/subagent's TaskStop reaches only tasks it dispatched/, /coordinator can stop any session task/], visibility: [/model-visible wording/, /not verified as exact Claude wording/], parity: [/PiCC-defined because Claude's post-stop result semantics are undocumented/], split: [/tool\.TaskOutput/] },
   ])("retains $id semantic disclosure", (contract) => {
     expectDisclosure(contract);
+  });
+
+  it("keeps touched subagent notes conservative about nesting and user-facing about resize", () => {
+    for (const id of ["tool.Agent", "tool.Task", "tool.TaskOutput", "feature.background-agents"]) {
+      const note = lookupCapability(id)?.note ?? "";
+      expect(note, id).not.toMatch(/CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH|disables nested spawning by default/u);
+      if (id !== "tool.Task") expect(note, id).not.toMatch(/one- or two-column|self-shell/u);
+    }
   });
 
   it("documents canonical SubagentStart/SubagentStop identity with transcript_path = MAIN", () => {
@@ -385,6 +436,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
         /successful acceptance is transient in human chat/,
         /first terminal delivery through TaskOutput or settlement/,
         /semantic.*record/,
+        /configured `app\.tools\.expand` action \(Ctrl\+O by default\)/,
+        /unbound action fails open/,
+        /At unusable widths, detail waits for widening; a resize prompt appears only when it fits/,
         /later already-reported TaskOutput retrieval adds no human row/,
         /Nested work at depth >= 2/,
         /default notice box/,
@@ -394,7 +448,7 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       gap: [/idle parents are not re-invoked/, /one-shot print mode/, /no cross-session agent view/, /no remote\/cloud agents/, /PiCC has no corresponding per-session spawn budget/],
       precedence: [/first terminal delivery/, /later already-reported TaskOutput retrieval/, /Nested work at depth >= 2/, /newest-generation-wins/, /effective configured concurrency/, /queues additional accepted work FIFO/, /each nested-background depth/, /separate configured-capacity pool/, /Foreground nested dispatch bypasses those pools/],
       visibility: [/interactive TUI/, /canonical\/model-visible results/, /print\/RPC output remain unchanged/],
-      parity: [/PiCC-defined semantic/, /NOT verified parity/, /PiCC EXTENSION\/DIVERGENCE/, /Claude Code 2\.1\.217/, /concurrently-running subagent cap/, /default 20/, /CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS/, /nested spawning disabled by default/, /CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH/, /does not establish queue-versus-rejection behavior/, /precise concurrency scope/, /Claude Code 2\.1\.212/, /default-200/, /per-session subagent-spawn cap/, /CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION/, /reset by \/clear/],
+      parity: [/NOT verified parity/, /PiCC EXTENSION\/DIVERGENCE/, /Claude Code 2\.1\.217/, /concurrently-running subagent cap/, /default 20/, /CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS/, /does not establish queue-versus-rejection behavior/, /precise concurrency scope/, /Claude Code 2\.1\.212/, /default-200/, /per-session subagent-spawn cap/, /CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION/, /reset by \/clear/],
       split: [/tool\.SendMessage/, /tool\.TaskOutput/, /tool\.Agent\.fork/],
     },
     { id: "setting.subagentMaxDepth", tier: "full", core: [/caps subagent nesting depth/, /accepts any positive integer/], precedence: [/default 1/, /MAIN-SESSION-ONLY/], parity: [/PiCC extension/, /NOT Claude parity/] },

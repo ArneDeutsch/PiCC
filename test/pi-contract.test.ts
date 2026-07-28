@@ -1,10 +1,15 @@
+import { randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { createRequire } from "node:module";
-import { stream as streamCodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
+import {
+  closeOpenAICodexWebSocketSessions,
+  resetOpenAICodexWebSocketDebugStats,
+  stream as streamCodexResponses,
+} from "@earendil-works/pi-ai/api/openai-codex-responses";
 import {
   createAssistantMessageEventStream,
   type AssistantMessage,
@@ -14,6 +19,7 @@ import {
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import {
+  generateBranchSummary,
   generateSummary,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -1053,6 +1059,355 @@ describe("pi 0.82.0 API contract", () => {
   }, 30_000);
 });
 
+describe("Codex standalone-summary transport contract", () => {
+  const summaryPrompt = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+  const apiKey = `x.${Buffer.from(JSON.stringify({
+    "https://api.openai.com/auth": { chatgpt_account_id: "summary-contract" },
+  })).toString("base64url")}.x`;
+  const model: Model<"openai-codex-responses"> = {
+    id: "gpt-summary-contract", name: "GPT Summary Contract", api: "openai-codex-responses", provider: "openai-codex",
+    baseUrl: "https://example.invalid", reasoning: false, input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100_000, maxTokens: 4_096,
+  };
+  const userMessage = (text: string, timestamp = 1) => ({
+    role: "user" as const,
+    content: [{ type: "text" as const, text }],
+    timestamp,
+  });
+  const summaryContext = (overrides: Partial<Context> = {}): Context => ({
+    systemPrompt: summaryPrompt,
+    messages: [userMessage("opaque summary input")],
+    ...overrides,
+  });
+  const freshUuidV7 = () => {
+    const bytes = randomBytes(16);
+    let timestamp = BigInt(Date.now());
+    for (let index = 5; index >= 0; index -= 1) {
+      bytes[index] = Number(timestamp & 0xffn);
+      timestamp >>= 8n;
+    }
+    bytes[6] = (bytes[6]! & 0x0f) | 0x70;
+    bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+    const hex = bytes.toString("hex");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  };
+  const summaryOptions = (overrides: Record<string, unknown> = {}) => ({
+    apiKey,
+    cacheRetention: "none" as const,
+    sessionId: freshUuidV7(),
+    transport: "websocket-cached" as const,
+    maxRetries: 4,
+    ...overrides,
+  });
+  const completedSse = (text = "summary ok") => {
+    const output = [{
+      type: "message", id: "msg-summary", role: "assistant", status: "completed",
+      content: [{ type: "output_text", text, annotations: [] }],
+    }];
+    return [
+      { type: "response.created", response: { id: "response-summary", status: "in_progress", output: [] } },
+      { type: "response.output_item.added", output_index: 0, item: { ...output[0], status: "in_progress" } },
+      { type: "response.output_item.done", output_index: 0, item: output[0] },
+      { type: "response.completed", response: {
+        id: "response-summary", status: "completed", output,
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      } },
+    ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n";
+  };
+  const okResponse = (text = "summary ok") => new Response(completedSse(text), {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
+  const truncatedSseResponse = () => new Response([
+    { type: "response.created", response: { id: "response-truncated", status: "in_progress", output: [] } },
+    { type: "response.output_item.added", output_index: 0, item: {
+      type: "message", id: "msg-truncated", role: "assistant", status: "in_progress", content: [],
+    } },
+  ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
+  const overloadResponse = () => new Response("temporarily overloaded", {
+    status: 429,
+    headers: { "content-type": "text/plain", "retry-after": "0" },
+  });
+  const quotaResponse = () => new Response("insufficient_quota billing quota exceeded", {
+    status: 429,
+    headers: { "content-type": "text/plain", "retry-after": "0" },
+  });
+  const deterministicResponse = () => new Response("invalid request shape", {
+    status: 400,
+    headers: { "content-type": "text/plain" },
+  });
+  type ResponseFactory = () => Response;
+  async function withCodexWire<T>(responses: ResponseFactory[], run: (wire: {
+    fetches: Array<{ input: unknown; init?: RequestInit }>;
+    sockets: { count: number };
+  }) => Promise<T>): Promise<T> {
+    const originalFetch = globalThis.fetch;
+    const originalWebSocket = globalThis.WebSocket;
+    const fetches: Array<{ input: unknown; init?: RequestInit }> = [];
+    const sockets = { count: 0 };
+    globalThis.fetch = (async (input, init) => {
+      fetches.push({ input, init });
+      const response = responses.shift();
+      if (!response) throw new Error("Codex response script exhausted");
+      return response();
+    }) as typeof fetch;
+    globalThis.WebSocket = class {
+      constructor() {
+        sockets.count += 1;
+        throw new Error("deterministic WebSocket probe");
+      }
+    } as never;
+    try {
+      return await run({ fetches, sockets });
+    } finally {
+      try {
+        closeOpenAICodexWebSocketSessions();
+      } finally {
+        try {
+          resetOpenAICodexWebSocketDebugStats();
+        } finally {
+          globalThis.fetch = originalFetch;
+          globalThis.WebSocket = originalWebSocket;
+        }
+      }
+    }
+  }
+  async function resultWithProviderTimers(stream: ReturnType<typeof codexAbortGuardStreamSimple>) {
+    vi.useFakeTimers();
+    try {
+      const result = stream.result();
+      await vi.runAllTimersAsync();
+      return await result;
+    } finally {
+      try {
+        await vi.runAllTimersAsync();
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  }
+  const runGeneratedSummary = (
+    retry: { enabled: boolean; maxRetries: number; baseDelayMs: number },
+    callbacks?: RetryCallbacks,
+  ) => generateSummary(
+    [userMessage("public generateSummary input")], model, 1_000, apiKey, undefined, undefined,
+    undefined, undefined, undefined, codexAbortGuardStreamSimple as never, undefined, retry, callbacks,
+  );
+
+  it("routes public compaction and branch summary producers through forced SSE without provider retries", async () => {
+    await withCodexWire([() => okResponse("history summary"), () => okResponse("branch summary")], async (wire) => {
+      await expect(runGeneratedSummary({ enabled: true, maxRetries: 0, baseDelayMs: 0 }))
+        .resolves.toBe("history summary");
+      const branch = await generateBranchSummary([{
+        type: "message", id: "entry-1", parentId: null, timestamp: new Date(0).toISOString(),
+        message: userMessage("public generateBranchSummary input"),
+      }], {
+        model,
+        apiKey,
+        signal: new AbortController().signal,
+        streamFn: codexAbortGuardStreamSimple as never,
+        retry: { enabled: true, maxRetries: 0, baseDelayMs: 0 },
+      });
+      expect(branch.summary).toContain("branch summary");
+      expect(wire.fetches).toHaveLength(2);
+      expect(wire.sockets.count).toBe(0);
+    });
+  });
+
+  it("leaves overload recovery to Pi's one outer summary retry loop", async () => {
+    await withCodexWire([overloadResponse, () => okResponse("recovered")], async (wire) => {
+      const scheduled: number[] = [];
+      const started: number[] = [];
+      const finished: Array<[boolean, number, string?]> = [];
+      await expect(runGeneratedSummary(
+        { enabled: true, maxRetries: 1, baseDelayMs: 0 },
+        {
+          onRetryScheduled: (attempt) => { scheduled.push(attempt); },
+          onRetryAttemptStart: () => { started.push(scheduled.length); },
+          onRetryFinished: (...event) => { finished.push(event); },
+        },
+      )).resolves.toBe("recovered");
+      expect(wire.fetches).toHaveLength(2);
+      expect(wire.sockets.count).toBe(0);
+      expect(scheduled).toEqual([1]);
+      expect(started).toEqual([1]);
+      expect(finished).toEqual([[true, 1]]);
+    });
+  });
+
+  it("recovers a truncated Codex SSE stream through exactly one public-summary retry lifecycle", async () => {
+    await withCodexWire([truncatedSseResponse, () => okResponse("recovered after truncation")], async (wire) => {
+      const scheduled: number[] = [];
+      const started: number[] = [];
+      const finished: Array<[boolean, number, string?]> = [];
+      await expect(runGeneratedSummary(
+        { enabled: true, maxRetries: 1, baseDelayMs: 0 },
+        {
+          onRetryScheduled: (attempt) => { scheduled.push(attempt); },
+          onRetryAttemptStart: () => { started.push(scheduled.length); },
+          onRetryFinished: (...event) => { finished.push(event); },
+        },
+      )).resolves.toBe("recovered after truncation");
+      expect(wire.fetches).toHaveLength(2);
+      expect(wire.sockets.count).toBe(0);
+      expect(scheduled).toEqual([1]);
+      expect(started).toEqual([1]);
+      expect(finished).toEqual([[true, 1]]);
+    });
+  });
+
+  it("exhausts overloads at the outer budget while quota and deterministic failures fail fast", async () => {
+    await withCodexWire([overloadResponse, overloadResponse, overloadResponse], async (wire) => {
+      const scheduled: number[] = [];
+      await expect(runGeneratedSummary(
+        { enabled: true, maxRetries: 2, baseDelayMs: 0 },
+        { onRetryScheduled: (attempt) => { scheduled.push(attempt); } },
+      )).rejects.toThrow(/Summarization failed:.*overloaded/i);
+      expect(wire.fetches).toHaveLength(3);
+      expect(wire.sockets.count).toBe(0);
+      expect(scheduled).toEqual([1, 2]);
+    });
+    for (const response of [quotaResponse, deterministicResponse]) {
+      await withCodexWire([response], async (wire) => {
+        const scheduled: number[] = [];
+        await expect(runGeneratedSummary(
+          { enabled: true, maxRetries: 2, baseDelayMs: 0 },
+          { onRetryScheduled: (attempt) => { scheduled.push(attempt); } },
+        )).rejects.toThrow(/Summarization failed/);
+        expect(wire.fetches).toHaveLength(1);
+        expect(scheduled).toEqual([]);
+      });
+    }
+  });
+
+  it("delegates the original summary UUID and unrelated scalar while overriding only transport and retries", async () => {
+    const delegated = vi.fn(() => createAssistantMessageEventStream());
+    vi.resetModules();
+    vi.doMock("@earendil-works/pi-ai/compat", () => ({
+      openAICodexResponsesApi: () => ({ streamSimple: delegated }),
+    }));
+    try {
+      const isolated = await import("../src/runtime/codex-abort-guard.js");
+      const context = summaryContext({ tools: [] });
+      const sessionId = freshUuidV7();
+      const options = summaryOptions({ sessionId, temperature: 0.37 });
+      isolated.codexAbortGuardStreamSimple(model, context, options);
+
+      expect(delegated).toHaveBeenCalledOnce();
+      expect(delegated).toHaveBeenCalledWith(model, context, {
+        ...options,
+        sessionId,
+        temperature: 0.37,
+        transport: "sse",
+        maxRetries: 0,
+      });
+    } finally {
+      vi.doUnmock("@earendil-works/pi-ai/compat");
+      vi.resetModules();
+    }
+  });
+
+  it("forces an exact-signature custom summary to one SSE provider attempt and preserves unrelated callbacks", async () => {
+    await withCodexWire([overloadResponse], async (wire) => {
+      const abort = new AbortController();
+      const payloads: unknown[] = [];
+      const responses: number[] = [];
+      const stream = codexAbortGuardStreamSimple(model, summaryContext({ tools: [] }), summaryOptions({
+        signal: abort.signal,
+        headers: { "x-summary-contract": "preserved" },
+        onPayload: (payload: unknown) => { payloads.push(payload); },
+        onResponse: (response: { status: number }) => { responses.push(response.status); },
+      }));
+      const result = await stream.result();
+      expect(result.stopReason).toBe("error");
+      expect(wire.fetches).toHaveLength(1);
+      expect(wire.sockets.count).toBe(0);
+      expect(payloads).toHaveLength(1);
+      expect(responses).toEqual([429]);
+      expect(new Headers(wire.fetches[0]!.init?.headers).get("x-summary-contract")).toBe("preserved");
+      expect(wire.fetches[0]!.init?.signal?.aborted).toBe(false);
+    });
+  });
+
+  it.each([
+    ["cache retention", { options: { cacheRetention: "short" } }],
+    ["UUIDv7 session shape", { options: { sessionId: "018f22e2-7c9b-4cc1-8c2a-123456789abc" } }],
+    ["fixed system prompt", { context: { systemPrompt: `${summaryPrompt} changed` } }],
+    ["tool absence", { context: { tools: [{ name: "probe", description: "probe", parameters: {} as never }] } }],
+    ["one user-role message", { context: { messages: [userMessage("one"), userMessage("two", 2)] } }],
+  ] as const)("treats a call with mutated %s as ordinary and preserves its provider retry budget", async (_name, mutation) => {
+    await withCodexWire([overloadResponse, () => okResponse()], async (wire) => {
+      const context = summaryContext("context" in mutation ? mutation.context as Partial<Context> : {});
+      const options = summaryOptions("options" in mutation ? mutation.options : {});
+      const result = await resultWithProviderTimers(
+        codexAbortGuardStreamSimple(model, context, { ...options, transport: "sse", maxRetries: 1 }),
+      );
+      expect(result.stopReason).toBe("stop");
+      expect(wire.fetches).toHaveLength(2);
+      expect(wire.sockets.count).toBe(0);
+    });
+  });
+
+  it.each([
+    ["omitted", undefined, 1, 1],
+    ["automatic", "auto", 1, 1],
+    ["WebSocket-cached", "websocket-cached", 1, 1],
+    ["SSE", "sse", 0, 1],
+  ] as const)("preserves ordinary %s transport selection", async (_name, transport, expectedSockets, expectedFetches) => {
+    await withCodexWire([() => okResponse()], async (wire) => {
+      const options = {
+        apiKey,
+        sessionId: `ordinary-${_name}`,
+        maxRetries: 0,
+        ...(transport === undefined ? {} : { transport }),
+      };
+      await codexAbortGuardStreamSimple(model, { systemPrompt: "ordinary", messages: [] }, options).result();
+      expect(wire.sockets.count).toBe(expectedSockets);
+      expect(wire.fetches).toHaveLength(expectedFetches);
+    });
+  });
+
+  it("preserves omitted and explicit nonzero provider retry budgets on ordinary SSE calls", async () => {
+    await withCodexWire([overloadResponse], async (wire) => {
+      const result = await codexAbortGuardStreamSimple(model, { systemPrompt: "ordinary", messages: [] }, {
+        apiKey, transport: "sse", cacheRetention: "none", sessionId: "ordinary-retries-omitted",
+      }).result();
+      expect(result.stopReason).toBe("error");
+      expect(wire.fetches).toHaveLength(1);
+    });
+    await withCodexWire([overloadResponse, () => okResponse()], async (wire) => {
+      const result = await resultWithProviderTimers(
+        codexAbortGuardStreamSimple(model, { systemPrompt: "ordinary", messages: [] }, {
+          apiKey, transport: "sse", maxRetries: 1, cacheRetention: "none",
+          sessionId: "ordinary-cache-none-is-insufficient",
+        }),
+      );
+      expect(result.stopReason).toBe("stop");
+      expect(wire.fetches).toHaveLength(2);
+      expect(wire.sockets.count).toBe(0);
+    });
+  });
+
+  it("pre-aborted ordinary and summary calls perform no network work while summaries keep the collision policy", async () => {
+    await withCodexWire([], async (wire) => {
+      for (const [context, options] of [
+        [{ systemPrompt: "ordinary", messages: [] }, { apiKey, sessionId: "aborted-ordinary", maxRetries: 3 }],
+        [summaryContext(), summaryOptions()],
+      ]) {
+        const abort = new AbortController();
+        abort.abort();
+        const result = await codexAbortGuardStreamSimple(model, context as Context, { ...options, signal: abort.signal }).result();
+        expect(result.stopReason).toBe("aborted");
+      }
+      expect(wire.fetches).toHaveLength(0);
+      expect(wire.sockets.count).toBe(0);
+    });
+  });
+});
+
 describe("real Pi compact-search composition", () => {
   const cases = [
     {
@@ -1117,14 +1472,18 @@ describe("real Pi compact-search composition", () => {
       return lines;
     };
 
-    for (const expanded of [false, true]) {
-      const lines = paint(build(search.ordinary), expanded);
-      expect(lines).toHaveLength(2); // shell-owned separator + one result-owned content row
-      expect(lines[0]).toBe("");
-      expect(lines[1]).toContain(search.name.toLowerCase());
-      expect(lines.join("\n")).not.toContain(search.hidden);
-    }
-    expect(paint(build(search.ordinary), true)).toEqual(paint(build(search.ordinary), false));
+    const collapsed = paint(build(search.ordinary), false);
+    expect(collapsed).toHaveLength(2); // shell-owned separator + one result-owned content row
+    expect(collapsed[0]).toBe("");
+    expect(collapsed[1]).toContain(search.name.toLowerCase());
+    expect(collapsed.join("\n")).toContain("ctrl+o to expand");
+    expect(collapsed.join("\n")).not.toContain(search.hidden);
+
+    const expanded = paint(build(search.ordinary), true);
+    expect(expanded[0]).toBe("");
+    expect(expanded[1]).toContain(search.name.toLowerCase());
+    expect(expanded.join("\n").split(search.hidden)).toHaveLength(2);
+    expect(paint(build(search.ordinary), false).join("\n")).not.toContain(search.hidden);
 
     const partial = new ToolExecutionComponent(
       search.name, `${search.name}-partial`, search.args, {}, definition,
@@ -1146,6 +1505,51 @@ describe("real Pi compact-search composition", () => {
     });
     expect(paint(failure, false).join("\n")).toContain("failed");
     expect(paint(failure, false).join("\n")).toContain(`${search.name} search failed`);
+  });
+
+  it.each(cases)("keeps real Pi $name remapped and explicitly-unbound detail reachable", async (search) => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    sdk.initTheme();
+    const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+    const piTui: any = piRequire("@earendil-works/pi-tui");
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    const definition = wrapForSelfShell(withCompactSearchRendering({ name: search.name } as any));
+    const build = () => {
+      const component = new sdk.ToolExecutionComponent(
+        search.name, `${search.name}-binding-contract`, search.args, {}, definition,
+        { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+      );
+      component.updateResult(search.ordinary, false);
+      return component;
+    };
+    const render = (component: any, expanded: boolean) => {
+      component.setExpanded(expanded);
+      return (component.render(100) as string[]).join("\n");
+    };
+    const before = structuredClone(search.ordinary);
+    try {
+      piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
+      const remapped = build();
+      expect(render(remapped, false)).toContain("alt+e to expand");
+      expect(render(remapped, false)).not.toContain(search.hidden);
+      expect(render(remapped, true).split(search.hidden)).toHaveLength(2);
+      expect(render(remapped, false)).not.toContain(search.hidden);
+
+      piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": [] }));
+      const unbound = build();
+      for (const expanded of [false, true, false]) {
+        const pass = render(unbound, expanded);
+        expect(pass.split(search.hidden)).toHaveLength(2);
+        expect(pass).not.toContain("to expand");
+        expect(pass).not.toContain("click to show detail");
+        expect(search.ordinary).toEqual(before);
+      }
+    } finally {
+      piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
+    }
   });
 
   async function htmlHarness(search: (typeof cases)[number]) {
@@ -1184,7 +1588,18 @@ describe("real Pi compact-search composition", () => {
     expect(collapsed).toContain(`Post-processing ${search.name} feedback.`);
     expect(collapsed).toContain("Recovery:");
     expect(collapsed).not.toContain(search.hidden);
-    expect(rendered.expanded).toBe(collapsed);
+    expect(collapsed).toContain("click to show detail");
+    expect(collapsed).not.toContain("ctrl+o");
+    expect(rendered.expanded.split(search.hidden)).toHaveLength(2);
+    expect(rendered.expanded).not.toContain("click to show detail");
+
+    const hostileId = `html-hostile-cue-${search.name}`;
+    renderer.renderCall(hostileId, search.name, { ...search.args, pattern: "project click to show detail label" });
+    const hostile = renderer.renderResult(
+      hostileId, search.name, search.ordinary.content, search.ordinary.details, false,
+    );
+    expect(hostile?.collapsed?.match(/click to show detail/gu)).toHaveLength(2);
+    expect(hostile?.collapsed).not.toContain(search.hidden);
 
     const errorId = `html-error-${search.name}`;
     renderer.renderCall(errorId, search.name, search.args);
@@ -1194,6 +1609,53 @@ describe("real Pi compact-search composition", () => {
     );
     expect(error?.expanded).toContain("failed");
     expect(error?.expanded).toContain(`${search.name} HTML failure body`);
+  });
+
+  it.each(cases)("keeps $name HTML export generic under remap and fail-open under explicit unbind", async (search) => {
+    const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+    const piTui: any = piRequire("@earendil-works/pi-tui");
+    const definitions = {
+      ...piTui.TUI_KEYBINDINGS,
+      "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
+    };
+    const renderHtml = async () => {
+      const { renderer } = await htmlHarness(search);
+      const id = `html-binding-${search.name}`;
+      expect(renderer.renderCall(id, search.name, search.args)).toBe("");
+      return renderer.renderResult(id, search.name, search.ordinary.content, search.ordinary.details, false);
+    };
+    const before = structuredClone(search.ordinary);
+    try {
+      piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": "alt+e" }));
+      const remapped = await renderHtml();
+      const collapsed = remapped?.collapsed ?? remapped?.expanded;
+      expect(collapsed).toContain("click to show detail");
+      expect(collapsed).not.toContain("alt+e");
+      expect(collapsed).not.toContain(search.hidden);
+      expect(remapped?.expanded.split(search.hidden)).toHaveLength(2);
+
+      piTui.setKeybindings(new piTui.KeybindingsManager(definitions, { "app.tools.expand": [] }));
+      const direct = withCompactSearchRendering({ name: search.name } as any);
+      const directPass = (expanded: boolean) => {
+        const context = { args: search.args, state: {}, isPartial: true } as any;
+        direct.renderCall?.(search.args, undefined as never, context);
+        return direct.renderResult?.(search.ordinary, { expanded, isPartial: false }, undefined as never, context)
+          .render(48).join("\n");
+      };
+      const directCollapsed = directPass(false);
+      const directExpanded = directPass(true);
+      expect(directCollapsed).toBe(directExpanded);
+      expect(directCollapsed.split(search.hidden)).toHaveLength(2);
+
+      const unbound = await renderHtml();
+      expect(unbound?.collapsed).toBeUndefined();
+      expect(unbound?.expanded.split(search.hidden)).toHaveLength(2);
+      expect(unbound?.expanded).not.toContain("to expand");
+      expect(unbound?.expanded).not.toContain("click to show detail");
+      expect(search.ordinary).toEqual(before);
+    } finally {
+      piTui.setKeybindings(new piTui.KeybindingsManager(piTui.TUI_KEYBINDINGS));
+    }
   });
 
   it.each(cases)("assembles full $name HTML export with a generic header and one compact settled result", async (search) => {
@@ -1232,8 +1694,10 @@ describe("real Pi compact-search composition", () => {
       expect(rendered.resultHtmlExpanded).toContain(search.name);
       expect(rendered.resultHtmlExpanded).toMatch(search.statusText);
       expect(rendered.resultHtmlExpanded).toContain(`Post-processing ${search.name} feedback.`);
-      expect(rendered.resultHtmlExpanded).not.toContain(search.hidden);
-      expect(rendered.resultHtmlCollapsed).toBeUndefined();
+      expect(rendered.resultHtmlExpanded.split(search.hidden)).toHaveLength(2);
+      expect(rendered.resultHtmlCollapsed).not.toContain(search.hidden);
+      expect(rendered.resultHtmlCollapsed).toContain("click to show detail");
+      expect(rendered.resultHtmlCollapsed).not.toContain("ctrl+o");
       expect(html).toContain(
         'html += `<div class="tool-header"><span class="tool-name">${escapeHtml(name)}</span></div>`;',
       );
@@ -1249,11 +1713,13 @@ describe("real Pi glyph-shell image and spacing ownership", () => {
     const sdk: any = await import("@earendil-works/pi-coding-agent");
     const tui: any = await import("@earendil-works/pi-tui");
     const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
-    const piDist = mainUrl.slice(0, mainUrl.indexOf("/dist/"));
-    const nestedTui: any = await import(`${piDist}/node_modules/@earendil-works/pi-tui/dist/index.js`);
+    const codingAgentRequire = createRequire(mainUrl);
+    const piOwnedTui: any = codingAgentRequire("@earendil-works/pi-tui");
+    const tuiModules = tui === piOwnedTui ? [tui] : [tui, piOwnedTui];
+    if (tuiModules.length === 1) expect(tui.Box).toBe(piOwnedTui.Box);
+    else expect(tui.Box).not.toBe(piOwnedTui.Box);
     sdk.initTheme();
-    const previous = tui.getCapabilities();
-    const nestedPrevious = nestedTui.getCapabilities();
+    const previous = tuiModules.map((module) => module.getCapabilities());
     const definition = wrapForSelfShell({ name: "ImageProbe" });
     const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
     const build = (id: string) => new sdk.ToolExecutionComponent(
@@ -1261,8 +1727,7 @@ describe("real Pi glyph-shell image and spacing ownership", () => {
       { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
     );
     try {
-      tui.setCapabilities({ ...previous, images: "kitty" });
-      nestedTui.setCapabilities({ ...nestedPrevious, images: "kitty" });
+      tuiModules.forEach((module, index) => module.setCapabilities({ ...previous[index], images: "kitty" }));
       const binary = build("binary-image");
       binary.updateResult({ content: [{ type: "image", data: png, mimeType: "image/png" }], details: undefined }, false);
       const binaryLines = binary.render(40) as string[];
@@ -1272,8 +1737,7 @@ describe("real Pi glyph-shell image and spacing ownership", () => {
       expect(binaryLines.slice(3).join("\n")).toContain("_G");
       expect(binaryLines.join("\n").match(/[○●✗■]/gu)).toHaveLength(1);
 
-      tui.setCapabilities({ ...previous, images: null });
-      nestedTui.setCapabilities({ ...nestedPrevious, images: null });
+      tuiModules.forEach((module, index) => module.setCapabilities({ ...previous[index], images: null }));
       const fallback = build("fallback-image");
       fallback.updateResult({ content: [{ type: "image", data: png, mimeType: "image/png" }], details: undefined }, false);
       const fallbackText = (fallback.render(80) as string[]).join("\n").replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "");
@@ -1283,8 +1747,7 @@ describe("real Pi glyph-shell image and spacing ownership", () => {
 
       for (const row of [binary, fallback]) expect((row.render(80) as string[])[0]).toBe("");
     } finally {
-      tui.setCapabilities(previous);
-      nestedTui.setCapabilities(nestedPrevious);
+      tuiModules.forEach((module, index) => module.setCapabilities(previous[index]));
     }
   });
 });

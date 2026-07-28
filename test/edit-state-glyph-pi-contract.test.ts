@@ -1,7 +1,9 @@
+import { createRequire } from "node:module";
 import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   getKeybindings,
   KeybindingsManager,
@@ -24,6 +26,9 @@ import { withRoutineToolRendering } from "../src/runtime/routine-tool-render.js"
 import { wrapForSelfShell } from "../src/runtime/tool-shell.js";
 import { waitUntil } from "./helpers/async.js";
 
+const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+const piTui = await import(pathToFileURL(requireFromPi.resolve("@earendil-works/pi-tui")).href) as typeof import("@earendil-works/pi-tui");
+
 function stripAnsi(value: string): string {
   return value
     .replace(/\u001b\].*?(?:\u0007|\u001b\\)/gu, "")
@@ -43,13 +48,19 @@ function productionDefinition(definition: EditDefinition): ToolDefinition {
 }
 
 function installExpandBinding(): () => void {
-  const previous = getKeybindings();
+  const previousRoot = getKeybindings();
+  const previousPi = piTui.getKeybindings();
   const bindings: KeybindingsConfig = { "app.tools.expand": ["ctrl+o"] };
-  setKeybindings(new KeybindingsManager({
+  const definitions = {
     ...TUI_KEYBINDINGS,
-    "app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
-  }, bindings));
-  return () => setKeybindings(previous);
+    "app.tools.expand": { defaultKeys: "ctrl+o" as const, description: "Toggle tool output" },
+  };
+  setKeybindings(new KeybindingsManager(definitions, { "app.tools.expand": ["ctrl+k"] }));
+  piTui.setKeybindings(new piTui.KeybindingsManager(definitions, bindings));
+  return () => {
+    piTui.setKeybindings(previousPi);
+    setKeybindings(previousRoot);
+  };
 }
 
 function initializedTheme(): Theme {

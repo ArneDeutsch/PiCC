@@ -152,6 +152,21 @@ at module scope (`hasBash` in `native-temp-paths.test.ts`, `rgAvailable` in `sea
 
 One file is not a subsystem test: `test/pi-contract.test.ts` asserts that every pinned Pi API export
 still exists, so Pi churn fails first and loudly rather than as a confusing downstream break.
+Installed-Pi contract suites own package identity, renderer lifecycle, and HTML boundaries that fake
+components cannot prove. Keep each witness in the focused suite for the boundary it exercises.
+
+### Renderer performance evidence
+
+Keep local rendering cost separate from provider, network, and inference latency:
+
+- Unit tests deterministically bound retained-result property access, body scanning, component
+  construction, rendered rows, and repeated repaint work. They are the regression gate.
+- Exercise collapsed settlement and repaint directly; do not launch a provider or real Pi process
+  merely to measure renderer code.
+- Record any wall-clock settlement/repaint benchmark as diagnostic review evidence with its input
+  shape and environment. Do not make elapsed milliseconds a CI threshold.
+- Provider or process-e2e timing supports only a transport/startup claim designed for that boundary;
+  it is not evidence that a local renderer became faster or slower.
 
 ## Layer 2 — offline integration (fakePi)
 
