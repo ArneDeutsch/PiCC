@@ -196,10 +196,10 @@ judge its importance, and is **never** reduced to a one-line stamp.
 Where the assessment lands depends on the use — and, critically, it is **never baked into the Phase 1
 filed feature body**:
 
-- **Phase 1 (annotate)** — the assessment is presented **in-session**, inside the create-offer exchange
-  the human sees, as an advisory ("before I file, my read on the value is: <the rating block>; still
-  want it filed as written?"). It is **not** embedded in the issue body that gets filed: that public
-  body stays WHAT/WHY only, so `implement-feature`'s Phase 3 resume re-read of the synthesized cached
+- **Phase 1 (annotate)** — the assessment is presented **in-session** before the complete combined
+  choice owned by [ticket-creation.md](../../implement-feature/references/ticket-creation.md); this
+  file defines no filing-only question. It is **not** embedded in the issue body that gets filed: that
+  public body stays WHAT/WHY only, so `implement-feature`'s Phase 3 resume re-read of the synthesized cached
   `body` ([phase-3-ticket-file.md](../../implement-feature/references/phase-3-ticket-file.md), the FILE step)
   ingests only the feature scope, never a self-grade.
 - **Phase 8 (gate) filed findings** — a **surfaced** finding is filed as its **own separate issue**, so
@@ -276,8 +276,7 @@ proposal-gate is called from two `implement-feature` reference files, with **dif
 - **Phase 1 ticket-creation offer** —
   [ticket-creation.md](../../implement-feature/references/ticket-creation.md). proposal-gate **only
   annotates**: it rates whether the human's just-converged scope looks valuable and the assessment is
-  presented **in-session**, inside the create-offer exchange the human sees ("before I file, my read on
-  the value is …; still want it filed as written?"). It is **not** embedded in the filed issue body —
+  presented **in-session** before the complete choice in `ticket-creation.md`. It is **not** embedded in the filed issue body —
   that public body stays WHAT/WHY only. It **must not suppress** the offer — the human already converged
   on this scope; a "value: low" read on their own feature is never forced onto the public issue against
   their will, and if the score is low the assessment is still **surfaced** in-session (the human may

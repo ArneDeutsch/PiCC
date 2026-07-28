@@ -24,7 +24,7 @@ This router is the always-loaded trunk; each phase skeleton names the `reference
 - **Direction before proposal.** Ask for direction first; don't open with a plan the user must argue against.
 - **You own every commit.** Subagents never run `git commit` or `git push` — relay this verbatim into every write-access dispatch.
 - **Late decisions.** Decide in the plan only what tasks need to compose (seams, interfaces, ordering); leave the rest to the implementer as explicit left-open items.
-- **No status bookkeeping.** State = the git log + the on-disk plan folder. **Classify resume before new naming**, and on classifying a resume you MUST read `references/resume-and-aborting.md` before the confirmation gate — if it cannot be read, stop. Validate the frozen title against the on-disk `feature.md` heading (exact agreement) and show it verbatim at explicit human confirmation of scope/phase/identity/ticket/writes and fresh anchor/issue-host agreement. **Anchor reader:** before create-offer, read `feature.md`'s `Ticket:` — blank/placeholder → offer; valid sanitized ref → ticket path, re-resolve identities/cache (`references/ticket-creation.md`).
+- **No status bookkeeping.** State = the git log + the on-disk plan folder. **Classify resume before new naming**, and on classifying a resume you MUST read `references/resume-and-aborting.md` before the confirmation gate — if it cannot be read, stop. Validate the frozen title against the on-disk `feature.md` heading (exact agreement) and show it verbatim at explicit human confirmation of scope/phase/identity/ticket/writes and fresh anchor/issue-host agreement. **Anchor reader:** read `feature.md`'s `Ticket:` — valid sanitized ref → ticket path and re-resolve identities/cache; blank/placeholder → offer only before Phase 3 completes, while a reconstructed later phase remains ticketless with no re-offer (`references/ticket-creation.md`).
 - **Structural escalation boundary.** A gap inside the current task's own spec → adapt and continue; anything touching another task's contract, feature scope, or the WHAT/WHY → stop and ask.
 - **Observe while you build.** Capture friction, planning errors, and latent bugs as they appear (implementers in task logs, you in `observations.md`); surface immediately when a current direction, blocker, or safety decision is required, otherwise preserve findings for the phase's close presentation; distill into `review.md` at close.
 - **Verify claims.** When reports conflict or a claim is load-bearing, read the code yourself first.
@@ -87,19 +87,20 @@ Then run the **incoming-ticket evaluation preflight** (read-only, **zero** GitHu
 - **maintainer + no ticket** — ticketless flow + the Phase 1 create-offer.
 - **maintainer + ticket** — Phase 0 preflight for a given ref; auto-PR + one hand-off comment.
 - **fork + no ticket** — fork disclosure at Phase 1; paste-ready hand-off.
-- **fork + ticket** — the same fork hand-off; issue writes use `--repo <target>` — the only automatic write is the fork push.
+- **fork + ticket** — the same fork hand-off; issue writes use `--repo <target>` — excluding the two
+  separately approved per-item issue-create offers, the fork push is the only routine Phase 9 write.
 
 ## Phase 1 — Direction (WHAT / WHY)
 
-Entry: skill start; Phase 0 first on a ticket ref. Converge on WHAT/WHY (value, scope, non-goals; not HOW), show the **scope mirror** (*You asked for* / *WILL* / *will NOT*), and ask for go — only explicit "go" starts Phase 2; **write nothing into the repo before then.** A ticket extends the mirror with its write-contract (`references/phase-1-ticket-scope.md`); a fork checkout (ticketless too) adds the early disclosure (`references/phase-1-fork-disclosure.md`); ticketless with GitHub reachable → the create-offer before go (`references/ticket-creation.md`). You MUST read `references/phase-1-direction.md` on entry. Immediately after build go, first read the Phase 2 references (`references/phase-2-workspace.md`; fork.md already read at Phase 0 with a remote); then the identity announcement — user-visible prose — precedes every workspace, preflight, or mutating command and `EnterWorktree`.
+Entry: skill start; Phase 0 first on a ticket ref. Converge on WHAT/WHY (value, scope, non-goals; not HOW) and show the **scope mirror** (*You asked for* / *WILL* / *will NOT*). A ticket extends it with its write-contract (`references/phase-1-ticket-scope.md`); a fork checkout (ticketless too) adds the early disclosure (`references/phase-1-fork-disclosure.md`). Ticketless with GitHub reachable uses the combined create/build choice in `references/ticket-creation.md`; either complete outcome explicitly authorizes Phase 2. Given-ticket and offer-unavailable ticketless paths still require explicit "go". **Write nothing into the repo before build authorization.** You MUST read `references/phase-1-direction.md` on entry. Immediately afterward, first read the Phase 2 references (`references/phase-2-workspace.md`; fork.md already read at Phase 0 with a remote); then the identity announcement — user-visible prose — precedes every workspace, preflight, or mutating command and `EnterWorktree`.
 
 ## Phase 2 — Workspace
 
-Entry: explicit build go, announcement emitted. Validate `<feature-slug>` and preflight collisions; validation fails closed — never sanitize/add a counter. **EnterWorktree, then non-forcing `git switch -c feature/<feature-slug>`** — create-or-reenter may delete a raced unregistered directory. Then bootstrap and run the baseline. You MUST read `references/phase-2-workspace.md` before running any workspace command.
+Entry: explicit build authorization, announcement emitted. Validate `<feature-slug>` and preflight collisions; validation fails closed — never sanitize/add a counter. **EnterWorktree, then non-forcing `git switch -c feature/<feature-slug>`** — create-or-reenter may delete a raced unregistered directory. Then bootstrap and run the baseline. You MUST read `references/phase-2-workspace.md` before running any workspace command.
 
 ## Phase 3 — Feature spec
 
-Entry: worktree and branch exist. Create `doc/plan/<feature-slug>/`, write `feature.md` — WHAT/WHY, **no HOW**; the `Ticket:` anchor line; `## Tasks` placeholder. An accepted create-offer files its issue here (`references/phase-3-ticket-file.md`). You MUST read `references/phase-3-feature-spec.md` and the feature.md template in `references/templates.md` before writing it.
+Entry: worktree and branch exist. Create `doc/plan/<feature-slug>/`, write `feature.md` — WHAT/WHY, **no HOW**; the `Ticket:` anchor line; `## Tasks` placeholder. A file-and-build outcome files its issue here (`references/phase-3-ticket-file.md`). You MUST read `references/phase-3-feature-spec.md` and the feature.md template in `references/templates.md` before writing it.
 
 ## Phase 4 — HOW investigation
 
@@ -123,7 +124,9 @@ Entry: all tasks complete and all retained tracked outputs committed. You MUST r
 
 ## Phase 9 — Integrate, push, hand off
 
-Entry: close review agreed. Merge a moved default and verify green, then push `feature/<feature-slug>`. Before any push, distinguish an absent first push from a confirmed self-owned fast-forward repush; collisions stop safely; never force. Hand-off by path: **maintainer + ticket** — auto-open the ready-for-review PR and post the single issue comment; never merge it. **Maintainer ticketless** — no auto-PR: the user opens it from the pushed branch. **Fork** (`push != target`) — hand over a compare URL + paste-ready PR; the only automatic write is the fork push (`references/phase-9-fork-handoff.md` Phase 9). CI check when `gh` is available; ExitWorktree `action: keep`; final summary. **You MUST read `references/phase-9-handoff.md` and `references/ticket-integration.md` before any public write; refuse all public writes if either cannot be read.**
+Entry: close review agreed. Merge a moved default and verify green, then push `feature/<feature-slug>`. Before any push, distinguish an absent first push from a confirmed self-owned fast-forward repush; collisions stop safely; never force. Hand-off by path: **maintainer + ticket** — auto-open the ready-for-review PR and post the single issue comment; never merge it. **Maintainer ticketless** — no auto-PR: the user opens it from the pushed branch. **Fork** (`push != target`) — hand over a compare URL + paste-ready PR; excluding the two separately
+approved per-item issue-create offers, the fork push is the only routine Phase 9/hand-off automatic
+write (`references/phase-9-fork-handoff.md` Phase 9). CI check when `gh` is available; ExitWorktree `action: keep`; final summary. **You MUST read `references/phase-9-handoff.md` and `references/ticket-integration.md` before any public write; refuse all public writes if either cannot be read.**
 
 ## Aborting, layout & commits
 

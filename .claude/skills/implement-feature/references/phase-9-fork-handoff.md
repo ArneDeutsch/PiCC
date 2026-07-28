@@ -8,8 +8,9 @@ per-path final summary (step 4). The PR **body** and issue-**comment** skeletons
 in [phase-9-handoff.md](phase-9-handoff.md)** — do not re-invent them here; this section changes only the *delivery*
 (handed to the user paste-ready, not posted) and the linking form (below).
 
-**The only automatic GitHub write on the fork path is the branch push to the fork.** No `gh pr
-create`, no `gh issue comment`. **Forbid** any `gh pr create --head <login>:<branch> --repo <target>`
+**Excluding the two separately approved per-item issue-create offers, the fork push is the only
+routine Phase 9/hand-off automatic GitHub write.** No `gh pr create`, no `gh issue comment` on fork
+hand-off. **Forbid** any `gh pr create --head <login>:<branch> --repo <target>`
 fallback — a fork PR is opened by the user through GitHub's web UI, never by the skill.
 
 **This is a discipline write site.** Authoring the paste-ready PR body distills from `review.md` /
@@ -26,8 +27,9 @@ the body until the rules are available** — do not distill a body with the rule
    [phase-9-handoff.md](phase-9-handoff.md) step 1's push-safety gate against `<pushRemote>` (the fork) for
    `git push -u <pushRemote> feature/<feature-slug>` — its first-push condition, established-self-owned
    criteria, foreign-ref stop, "nothing is lost" framing, never-force rule, and non-atomic-race caveat
-   govern this push exactly as on the maintainer path, just targeting the fork. **This single fork push
-   is the only automatic GitHub write on the fork path.**
+   govern this push exactly as on the maintainer path, just targeting the fork. **Excluding the two
+   separately approved per-item issue-create offers, this single fork push is the only routine Phase
+   9/hand-off automatic GitHub write.**
 2. **Confirm the push landed before printing the compare URL** — a URL for a branch that isn't on the
    fork 404s. Only after the push succeeds, build the URL.
 3. **Compare URL — emit exactly this two-part-head form** (split `target` into
