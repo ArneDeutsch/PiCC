@@ -69,9 +69,11 @@ import { renderMainSessionTool } from "./runtime/main-session-tool-render.js";
 import { buildStockBuiltinTools, type BuiltinToolSdk } from "./runtime/builtin-tools.js";
 import {
   MainSessionCheckpointGate,
+  UNCONFIRMED_HOST_RECOVERY_GUIDANCE,
   callbackCompactionAttempt,
   type CheckpointProgress,
   type CheckpointSnapshot,
+  type HostDeadlinePolicy,
   type MidRunCompactionController,
   type ResumeToken,
 } from "./runtime/mid-run-compaction.js";
@@ -298,6 +300,8 @@ export interface PiccTestSeam {
   renderMainSessionTool?: typeof renderMainSessionTool;
   /** TEST-ONLY in-process override for trusted-Git unavailability. */
   resolveTrustedGit?: () => Promise<string | undefined>;
+  /** TEST-ONLY injectable clock and ceilings for checkpoint host deadlines. */
+  checkpointDeadlinePolicy?: HostDeadlinePolicy;
 }
 
 const codexProviderRegistries = new WeakSet<object>();
@@ -459,6 +463,8 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   const mainCheckpointGate = new MainSessionCheckpointGate(
     `pre-session:${sessionId}`,
     config.compaction.proactiveCompactPercent,
+    testSeam?.checkpointDeadlinePolicy ?? {},
+    "total-host",
   );
   // PiCC is the sole owner of this API handler while loaded. Supplying only these
   // fields preserves Pi's built-in models, OAuth, credentials, options, and headers;
@@ -573,11 +579,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     consumed: boolean;
   }
   const stopContinuationAdmission = new AsyncLocalStorage<StopContinuationCapability>();
+  type CompactionOperationOrigin = "picc-proactive" | "pi-native-auto" | "user-manual";
   interface CompactionLifecycleOperation {
     identity: object;
     epoch: object;
     controller: MidRunCompactionController;
     generation: number;
+    origin: CompactionOperationOrigin;
     proactive: boolean;
     trigger: "auto" | "manual";
     recovery?: import("./runtime/mid-run-compaction.js").RecoveryToken;
@@ -1207,6 +1215,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     ...(testSeam?.sdk ? { sdk: testSeam.sdk } : {}),
   });
 
+  const unconfirmedHostText =
+    `PiCC could not confirm that checkpoint host work stopped. ${UNCONFIRMED_HOST_RECOVERY_GUIDANCE}`;
+
   const checkpointText = (event: CheckpointProgress): string => {
     switch (event.category) {
       case "checkpoint-armed": return "Pausing for proactive context compaction.";
@@ -1225,7 +1236,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         : event.action === "session-ended"
           ? "Proactive context compaction stopped when the session ended. The paused work did not resume and was not delivered."
           : event.action === "restart-process"
-            ? "Proactive context compaction was cancelled, but PiCC could not confirm the paused work stopped. This session cannot be continued or replaced; exit PiCC and start it again."
+            ? unconfirmedHostText
             : "Proactive context compaction was cancelled. Run /compact to recover this session, or start a new session.";
       case "checkpoint-recovered": return "Manual compaction recovered the paused session; explicitly continue when ready.";
     }
@@ -1477,10 +1488,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
               });
             },
           });
-        }, signal);
+        }, signal, testSeam?.checkpointDeadlinePolicy);
       } finally {
         signal.removeEventListener("abort", abortHost);
         controller.endCompactionSummary(summary);
+        if (activeCompactionOperation?.identity === attempt.operation) {
+          activeCompactionOperation = undefined;
+        }
         if (checkpointAttempt === attempt) checkpointAttempt = undefined;
       }
     },
@@ -1586,7 +1600,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           mainCheckpointGate.withReplayAuthorization(input, () => {
             pi.sendUserMessage(input.content as any, { deliverAs: input.delivery });
           });
-          return { delivered: true } as const;
+          // Pi's void return proves enqueue/admission only. The controller keeps
+          // custody until the matching authenticated message_start confirms host start.
+          return { delivered: true, pendingHostStart: true } as const;
         },
         replayComplete: () => {
           if (!isCurrent() || resume.replayCompleted) {
@@ -2205,11 +2221,24 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     checkpointSessionEpoch = {};
   };
 
-  pi.on("session_before_switch", async () => {
+  pi.on("session_before_switch", async (_event: any, ctx: any) => {
     // The controller cancels first; the old nested agent_settled or host callback
     // is the only authority that can confirm the logical run has joined.
     const result = await mainCheckpointGate.beforeSessionSwitch();
-    if (!result?.cancel) {
+    if (result?.cancel) {
+      if (mainCheckpointGate.currentController().isProcessTerminal()) {
+        const surface = checkpointSurface(ctx);
+        try {
+          if (surface === "tui") ctx.ui?.notify?.(unconfirmedHostText, "error");
+          else if (surface === "print" || surface === "stderr") console.error(`PiCC: ${unconfirmedHostText}`);
+        } catch { /* presentation only */ }
+        appendCheckpointEntry({
+          category: "checkpoint-session-switch-refused",
+          action: "restart-process",
+          notice: unconfirmedHostText,
+        });
+      }
+    } else {
       // Invalidate lifecycle authority at switch acceptance, not only at the next
       // session_start, so an old manual completion in that gap is inert.
       rotateCheckpointSessionEpoch();
@@ -2415,9 +2444,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         // still settling into a recoverable one; for every other outlook the wait the old
         // wording asked for never ends, and what to do instead differs per outlook.
         const cancelledText = (): string => {
-          switch (cancelledCheckpointOutlook(controller.snapshot())) {
+          const snapshot = controller.snapshot();
+          if (snapshot.failureCategory === "unconfirmed-host") {
+            return unconfirmedHostText;
+          }
+          switch (cancelledCheckpointOutlook(snapshot)) {
             case "unconfirmed":
-              return "The prior checkpoint was cancelled and PiCC could not confirm the paused work stopped. This session cannot be continued or replaced; exit PiCC and start it again.";
+              return unconfirmedHostText;
             case "settling":
               return "Checkpoint cancellation is still settling. Wait before sending another prompt or attempting recovery.";
             case "settling-committed":
@@ -2437,6 +2470,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
               : controller.manualCompactionDisposition() === "allow"
                 ? "The prior checkpoint was cancelled. Run /compact to recover this session, or start a new session."
                 : cancelledText();
+        if (controller.snapshot().failureCategory === "unconfirmed-host") {
+          appendCheckpointEntry({
+            category: "checkpoint-admission-refused",
+            action: "restart-process",
+            notice: text,
+          });
+        }
         try {
           if (ctx.mode === "print") console.error(`PiCC: ${text}`);
           else if (ctx.mode === "tui") ctx.ui?.notify?.(text, "warning");
@@ -2885,6 +2925,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     checkpointContext = ctx;
     if (await settleStoppedMainRun()) return;
     const controller = mainCheckpointGate.currentController();
+    const physicalOperation = activeCompactionOperation;
+    if (physicalOperation?.origin === "pi-native-auto" &&
+        physicalOperation.epoch === checkpointSessionEpoch &&
+        physicalOperation.controller === controller &&
+        physicalOperation.generation === controller.snapshot().generation &&
+        activeCompactionOperation === physicalOperation) {
+      // Pi publishes no failure event for a native operation. A later true settlement
+      // is its definitive boundary; release only the identity observed here.
+      activeCompactionOperation = undefined;
+    }
     const resume = activeMainResume;
     if (resume?.generation === controller.snapshot().generation &&
         resume.epoch === checkpointSessionEpoch) {
@@ -2971,6 +3021,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         resume.conclude("completed");
         mainCheckpointGate.logicalRunSettled();
         if (ctx?.mode === "tui") ctx.ui?.setStatus?.("picc-checkpoint", undefined);
+        // Pi clears run-active before this callback. Finish N first, then let this same
+        // physical settlement sample exactly one fallback successor without a second Stop.
+        const successorController = mainCheckpointGate.currentController();
+        const successor = mainCheckpointGate.settlementGeneration(ctx);
+        if (successor !== undefined) await successorController.checkpoint(successor);
         return;
       }
     }
@@ -2980,7 +3035,14 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (generation !== undefined) {
       await controller.checkpoint(generation);
       const phase = controller.snapshot().phase;
-      if (phase === "exhausted" || phase === "cancelled" || checkpointWasArmed) return;
+      if (phase === "exhausted" || phase === "cancelled") return;
+      if (checkpointWasArmed) {
+        // N's stable barrier is now published. Sample at most one settled successor
+        // from this boundary; returning here also preserves one Stop hook per settlement.
+        const successor = mainCheckpointGate.settlementGeneration(ctx);
+        if (successor !== undefined) await controller.checkpoint(successor);
+        return;
+      }
     }
     const trulySettled = await runStopHook(ctx);
     if (await settleStoppedMainRun()) return;
@@ -3002,9 +3064,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   ): void => {
     const snapshot = controller.snapshot();
     const cancelledReason = (): string => {
+      if (snapshot.failureCategory === "unconfirmed-host") {
+        return `checkpoint host work could not be confirmed stopped. ${UNCONFIRMED_HOST_RECOVERY_GUIDANCE}`;
+      }
       switch (cancelledCheckpointOutlook(snapshot)) {
         case "unconfirmed":
-          return "the cancelled checkpoint's paused work could not be confirmed stopped. This session cannot be continued or replaced; exit PiCC and start it again.";
+          return `checkpoint host work could not be confirmed stopped. ${UNCONFIRMED_HOST_RECOVERY_GUIDANCE}`;
         // The reader's own Esc, still settling. Telling them to abandon the session here is
         // what made PiCC contradict itself seconds later, when the join landed and the same
         // checkpoint became recoverable.
@@ -3046,7 +3111,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     const proactive = controller.isCompactionSummaryActive(generation) &&
       attempt?.epoch === epoch && attempt.controller === controller && attempt.generation === generation;
     const replacingStaleManual = event.reason === "manual" && !proactive &&
-      activeCompactionOperation !== undefined && !activeCompactionOperation.proactive &&
+      activeCompactionOperation?.origin === "user-manual" &&
       activeCompactionOperation.epoch === epoch && activeCompactionOperation.controller === controller &&
       activeCompactionOperation.generation === generation;
     if ((activeCompactionOperation && !replacingStaleManual) ||
@@ -3064,9 +3129,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
     // Pi labels extension-initiated compact() as manual; controller summary
     // authority is what maps that physical host request to Claude's auto trigger.
-    const trigger = proactive ? "auto" : event.reason === "manual" ? "manual" : "auto";
+    const origin: CompactionOperationOrigin = proactive
+      ? "picc-proactive"
+      : event.reason === "manual" ? "user-manual" : "pi-native-auto";
+    const trigger = origin === "user-manual" ? "manual" : "auto";
     const operation: CompactionLifecycleOperation = {
-      identity: {}, epoch, controller, generation, proactive, trigger,
+      identity: {}, epoch, controller, generation, origin, proactive, trigger,
     };
     activeCompactionOperation = operation;
     if (attempt && proactive) {
@@ -3108,15 +3176,20 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     if (!operation) return;
     const { controller, generation, proactive, trigger, epoch } = operation;
     const attempt = checkpointAttempt;
-    const operationMatches = () => operation === activeCompactionOperation && epoch === checkpointSessionEpoch &&
-      controller === mainCheckpointGate.currentController() && controller.snapshot().generation === generation &&
+    const eventMatchesOrigin = operation.origin === "picc-proactive"
+      ? event.reason === "manual"
+      : operation.origin === "user-manual" ? event.reason === "manual" : event.reason !== "manual";
+    const operationMatches = () => eventMatchesOrigin && operation === activeCompactionOperation &&
+      epoch === checkpointSessionEpoch && controller === mainCheckpointGate.currentController() &&
+      controller.snapshot().generation === generation &&
       (proactive
         ? attempt?.operation === operation.identity && attempt.controller === controller && attempt.generation === generation
         : operation.recovery
           ? operation.recovery === controller.recoveryToken(generation)
           : controller.snapshot().phase === "idle");
     if (!operationMatches()) {
-      if (activeCompactionOperation === operation) activeCompactionOperation = undefined;
+      // Pi exposes no operation id on this event. A mismatched old-origin event must
+      // not clear or authenticate the live successor currently holding this identity.
       return;
     }
     if (proactive && attempt) {

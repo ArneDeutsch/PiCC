@@ -30,6 +30,7 @@ export type CompactionFailureCategory =
   | "cancelled"
   | "hook-blocked"
   | "restoration-paused"
+  | "unconfirmed-host"
   | "stale-generation"
   | "shutdown";
 export type CheckpointDiagnosticCategory =
@@ -128,7 +129,81 @@ export interface ResumeContext {
   signal: AbortSignal;
 }
 
-export type ReplayDeliveryResult = { delivered: true } | { delivered: false };
+export type ReplayDeliveryResult =
+  | { delivered: true; pendingHostStart?: boolean }
+  | { delivered: false };
+
+export const MAIN_CALLBACK_COMPACTION_DEADLINE_MS = 5 * 60 * 1000;
+export const RESUMED_RUN_JOIN_DEADLINE_MS = 30 * 1000;
+export const UNCONFIRMED_HOST_RECOVERY_GUIDANCE =
+  "Exit PiCC completely, start a fresh PiCC process and a fresh session, do not reopen the affected session, and resend the input PiCC reported.";
+
+export interface HostDeadlineTimer {
+  clear(): void;
+}
+
+export interface HostDeadlineClock {
+  schedule(delayMs: number, expired: () => void): HostDeadlineTimer;
+}
+
+export interface HostDeadlinePolicy {
+  clock?: HostDeadlineClock;
+  mainCallbackMs?: number;
+  resumedJoinMs?: number;
+}
+
+export class UnconfirmedHostDeadlineError extends Error {
+  constructor() {
+    super("Host lifecycle did not settle before its deadline");
+    this.name = "UnconfirmedHostDeadlineError";
+  }
+}
+
+const systemDeadlineClock: HostDeadlineClock = {
+  schedule(delayMs, expired) {
+    // This timer is the operation's sole liveness owner after the host stops answering.
+    // Keep Node's default referenced timer and clear it only after real settlement.
+    const timer = setTimeout(expired, delayMs);
+    return { clear: () => clearTimeout(timer) };
+  },
+};
+
+function deadlineClock(policy: HostDeadlinePolicy | undefined): HostDeadlineClock {
+  return policy?.clock ?? systemDeadlineClock;
+}
+
+function resumedJoinDeadline(policy: HostDeadlinePolicy | undefined): number {
+  return policy?.resumedJoinMs ?? RESUMED_RUN_JOIN_DEADLINE_MS;
+}
+
+async function withHostDeadline<T>(
+  operation: Promise<T>,
+  delayMs: number,
+  clock: HostDeadlineClock,
+): Promise<T> {
+  return await new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = clock.schedule(delayMs, () => {
+      if (settled) return;
+      settled = true;
+      reject(new UnconfirmedHostDeadlineError());
+    });
+    operation.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        timer.clear();
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        timer.clear();
+        reject(error);
+      },
+    );
+  });
+}
 
 /**
  * A resumed run owns replay and cancellation. Callback runs omit `settled` and transfer
@@ -164,6 +239,7 @@ export interface MidRunCompactionOptions {
    * what it cost them.
    */
   inputDropped?(rejected: readonly QueuedInputShadow[]): void;
+  deadlinePolicy?: HostDeadlinePolicy;
 }
 
 interface ToolState {
@@ -250,6 +326,7 @@ export class MidRunCompactionController {
   private committedGeneration: number | undefined;
   private terminalFailure: CompactionFailureCategory | undefined;
   private terminalization: Promise<readonly QueuedInputShadow[]> | undefined;
+  private pendingHostStarts = new Set<number>();
 
   constructor(private readonly options: MidRunCompactionOptions) {
     this.sessionId = options.sessionId;
@@ -263,7 +340,8 @@ export class MidRunCompactionController {
       checkpointAbortRequested: this.checkpointAbortRequested,
       queuedInputs: this.queue.length,
       admission: this.phase === "exhausted"
-        ? this.terminalFailure === "restoration-paused" ? "closed" : "recoverable-rejection"
+        ? this.terminalFailure === "restoration-paused" || this.terminalFailure === "unconfirmed-host"
+          ? "closed" : "recoverable-rejection"
         : this.phase === "cancelled"
           ? "closed"
           : this.phase === "idle"
@@ -306,6 +384,7 @@ export class MidRunCompactionController {
     this.committedGeneration = undefined;
     this.terminalFailure = undefined;
     this.terminalization = undefined;
+    this.pendingHostStarts.clear();
     this.emit("checkpoint-armed");
     return this.generation;
   }
@@ -424,7 +503,10 @@ export class MidRunCompactionController {
     if (generation !== this.generation || sessionId !== this.sessionId) return undefined;
     const index = this.queue.findIndex((entry) => entry.id === id && entry.generation === generation && entry.sessionId === sessionId);
     if (index < 0) return undefined;
-    return this.queue.splice(index, 1)[0];
+    const [consumed] = this.queue.splice(index, 1);
+    if (consumed) this.pendingHostStarts.delete(consumed.id);
+    this.queueChanged.resolve();
+    return consumed;
   }
 
   queuedInputSnapshot(): readonly QueuedInputShadow[] {
@@ -443,16 +525,31 @@ export class MidRunCompactionController {
    */
   releaseQueuedInput(): readonly QueuedInputShadow[] {
     const released = this.queue.splice(0);
+    this.pendingHostStarts.clear();
     return this.cancellation?.reported ? [] : released;
   }
 
   ordinaryInputDisposition(): OrdinaryInputDisposition {
     if (this.phase === "idle") return "accept";
     if (this.phase === "exhausted") {
-      return this.terminalFailure === "restoration-paused" ? "reject-restoration" : "reject-recoverable";
+      return this.terminalFailure === "restoration-paused"
+        ? "reject-restoration"
+        : this.terminalFailure === "unconfirmed-host" ? "reject-closed" : "reject-recoverable";
     }
     if (this.phase === "cancelled") return "reject-closed";
     return "quarantine";
+  }
+
+  isProcessTerminal(): boolean {
+    return (this.phase === "exhausted" && this.terminalFailure === "unconfirmed-host") ||
+      (this.phase === "cancelled" && this.cancellation?.quiescence === "unconfirmed");
+  }
+
+  /** Make malformed pre-executor state total at a true host settlement. */
+  settleMalformedAtHostBoundary(generation: number): boolean {
+    if (generation !== this.generation || (this.phase !== "armed" && this.phase !== "stopping")) return false;
+    this.exhaust(generation, "operational");
+    return true;
   }
 
   manualCompactionDisposition(): ManualCompactionDisposition {
@@ -593,6 +690,10 @@ export class MidRunCompactionController {
       // transport from inheriting summary authority after adapter settlement.
       this.compactionSummary = undefined;
     }
+    if (!result.ok && result.category === "unconfirmed-host") {
+      this.exhaustUnconfirmed(generation);
+      return;
+    }
     if (!result.ok && this.committedGeneration === generation) {
       await this.terminalizeAfterCommittedSummary(generation);
       return;
@@ -673,21 +774,26 @@ export class MidRunCompactionController {
           await this.terminalizeAfterCommittedSummary(generation);
           return;
         }
-        const entry = this.queue[0];
-        if (entry) {
-          let result: ReplayDeliveryResult = { delivered: false };
-          try {
-            const candidate = await ownership.replay(entry, context);
-            if (candidate?.delivered === true || candidate?.delivered === false) result = candidate;
-          } catch {
-            // A throwing adapter has not demonstrated delivery, so controller ownership remains.
-          }
-          if (result.delivered && this.queue[0] === entry) this.queue.shift();
-          if (this.isCancelled()) return;
-          if (!result.delivered) {
-            await this.terminalizeAfterCommittedSummary(generation);
-            return;
-          }
+        // Pending host starts retain custody but do not head-of-line block later
+        // occurrences. Select an unsent shadow so every occurrence is enqueued once
+        // before the provider barrier opens.
+        const entry = this.queue.find((candidate) => !this.pendingHostStarts.has(candidate.id));
+        if (!entry) break;
+        let result: ReplayDeliveryResult = { delivered: false };
+        try {
+          const candidate = await ownership.replay(entry, context);
+          if (candidate?.delivered === true || candidate?.delivered === false) result = candidate;
+        } catch {
+          // A throwing adapter has not demonstrated delivery, so controller ownership remains.
+        }
+        if (result.delivered && this.queue.includes(entry)) {
+          if (result.pendingHostStart) this.pendingHostStarts.add(entry.id);
+          else this.queue.splice(this.queue.indexOf(entry), 1);
+        }
+        if (this.isCancelled()) return;
+        if (!result.delivered) {
+          await this.terminalizeAfterCommittedSummary(generation);
+          return;
         }
       }
       if (!this.isCurrent(generation)) break;
@@ -706,7 +812,7 @@ export class MidRunCompactionController {
         return;
       }
       this.queueChanged = deferred();
-      if (this.queue.length > 0) continue;
+      if (this.queue.some((entry) => !this.pendingHostStarts.has(entry.id))) continue;
       const event = await Promise.race([
         settlementEvent,
         this.queueChanged.promise.then(() => "queue" as const),
@@ -742,11 +848,21 @@ export class MidRunCompactionController {
       try {
         if (ownership && context) {
           try {
-            await ownership.cancelAndJoin("replacement", context);
-          } catch {
-            // The adapter has already revoked provider/replay authority. A failed
-            // host join cannot reopen this generation, but stable publication must
-            // still wait for that exact join attempt to settle.
+            const joining = Promise.resolve(ownership.cancelAndJoin("replacement", context));
+            await (this.options.deadlinePolicy
+              ? withHostDeadline(
+                  joining,
+                  resumedJoinDeadline(this.options.deadlinePolicy),
+                  deadlineClock(this.options.deadlinePolicy),
+                )
+              : joining);
+          } catch (error) {
+            if (error instanceof UnconfirmedHostDeadlineError) {
+              return this.exhaustUnconfirmed(generation, generationBarrier);
+            }
+            // The adapter revoked provider/replay authority before this join. An ordinary
+            // settled rejection still confirms host quiescence and keeps the post-commit
+            // terminal; only deadline expiry leaves host quiescence unconfirmed.
           }
         }
         // Nothing else can leave `terminalizing`: `sample` needs `idle`, `cancel` and a
@@ -760,6 +876,7 @@ export class MidRunCompactionController {
         this.resumeToken = undefined;
         this.resumedSettlement = undefined;
         rejected = this.queue.splice(0);
+        this.pendingHostStarts.clear();
         this.phase = "exhausted";
         this.emit("checkpoint-exhausted", generation, {
           action: "new-session",
@@ -871,7 +988,14 @@ export class MidRunCompactionController {
     const join = deferred();
     cancellation.join = join.promise;
     try {
-      Promise.resolve(ownership.cancelAndJoin(cancellation.kind, context)).then(join.resolve, join.reject);
+      const joining = Promise.resolve(ownership.cancelAndJoin(cancellation.kind, context));
+      (this.options.deadlinePolicy
+        ? withHostDeadline(
+            joining,
+            resumedJoinDeadline(this.options.deadlinePolicy),
+            deadlineClock(this.options.deadlinePolicy),
+          )
+        : joining).then(join.resolve, join.reject);
     } catch (error) {
       join.reject(error);
     }
@@ -925,6 +1049,7 @@ export class MidRunCompactionController {
       }
       if (this.phase === "exhausted") return;
       rejected = this.queue.splice(0);
+      this.pendingHostStarts.clear();
       if (cancellation.kind === "user") this.recovery = { generation, token: {} };
       // Only `replacement` puts the reader in a new session. `shutdown` is the process
       // leaving and `task-stop` is a child task being abandoned: telling either to resend
@@ -939,6 +1064,31 @@ export class MidRunCompactionController {
     } finally {
       this.publishExit(generation, generationBarrier, rejected, cancellation);
     }
+  }
+
+  private exhaustUnconfirmed(
+    generation: number,
+    generationBarrier = this.stable,
+  ): readonly QueuedInputShadow[] {
+    if (generation !== this.generation) return [];
+    const rejected = this.queue.splice(0);
+    this.pendingHostStarts.clear();
+    this.phase = "exhausted";
+    this.checkpointAbortRequested = false;
+    this.compactionSummary = undefined;
+    this.resumedOwnership = undefined;
+    this.resumeContext = undefined;
+    this.resumeToken = undefined;
+    this.resumedSettlement = undefined;
+    this.terminalFailure = "unconfirmed-host";
+    this.recovery = undefined;
+    this.emit("checkpoint-cancelled", generation, {
+      action: "restart-process",
+      failureCategory: "unconfirmed-host",
+    });
+    this.reportDropped(rejected);
+    this.publishExit(generation, generationBarrier, rejected);
+    return rejected;
   }
 
   private isCurrent(generation: number): boolean {
@@ -1113,6 +1263,8 @@ interface ReplayAuthorization {
 const replayAuthorization = new AsyncLocalStorage<ReplayAuthorization>();
 
 /** Main-session lifecycle adapter around the generation-authenticated controller. */
+export type HostSettlementMode = "intermediate" | "total-host";
+
 export class MainSessionCheckpointGate {
   private controller: MidRunCompactionController;
   private execution: CheckpointExecutionAdapter | undefined;
@@ -1136,7 +1288,12 @@ export class MainSessionCheckpointGate {
     join: Promise<void>;
   } | undefined;
 
-  constructor(sessionId: string, private readonly threshold: number) {
+  constructor(
+    sessionId: string,
+    private readonly threshold: number,
+    private readonly deadlinePolicy?: HostDeadlinePolicy,
+    private readonly hostSettlementMode: HostSettlementMode = "intermediate",
+  ) {
     this.controller = this.createController(sessionId);
   }
 
@@ -1338,7 +1495,17 @@ export class MainSessionCheckpointGate {
     if (this.logicalRunStop) return undefined;
     this.resetCompletedGeneration();
     if (this.generation !== undefined) {
-      return this.controller.snapshot().phase === "awaiting-settlement" ? this.generation : undefined;
+      const snapshot = this.controller.snapshot();
+      // Child sessions publish intermediate physical settlements while their SDK run
+      // still owns progress. Only production main wiring opts into Pi's total post-run
+      // settlement contract; deadline configuration is independent of that meaning.
+      if (this.hostSettlementMode !== "total-host") {
+        return snapshot.phase === "awaiting-settlement" ? this.generation : undefined;
+      }
+      if (snapshot.phase === "armed" || snapshot.phase === "stopping") {
+        this.controller.settleMalformedAtHostBoundary(this.generation);
+      }
+      return this.generation;
     }
     if (!isProactiveCompactionApi(ctx.model?.api)) return undefined;
     let usage: ContextUsageShape | undefined;
@@ -1423,7 +1590,8 @@ export class MainSessionCheckpointGate {
   ): QueuedInputShadow | undefined {
     if (!isProactiveCompactionApi(ctx.model?.api)) return undefined;
     const content = acceptedContent(text, images);
-    this.arm(ctx);
+    // Input is evidence to reconcile, never an executor. Tool completion or a true
+    // settlement must name the generation that can actually run compaction.
     const effectiveDelivery = delivery ?? (this.generation === undefined ? undefined : "followUp");
     if (!effectiveDelivery) return undefined;
     const expected = { content, reconciliation: reconciliationContent(content), delivery: effectiveDelivery };
@@ -1460,8 +1628,6 @@ export class MainSessionCheckpointGate {
       return undefined;
     }
     this.trackedOccurrences.splice(this.trackedOccurrences.indexOf(eligible), 1);
-    // Host acceptance transferred delivery already; its callback must not consume newer shadow ownership.
-    if (eligible.pendingHostStart) return eligible.shadow;
     const consumed = this.controller.consumeShadow(this.generation, eligible.shadow.id, this.controller.sessionId);
     if (!consumed) {
       this.ambiguousInput = true;
@@ -1593,11 +1759,15 @@ export class MainSessionCheckpointGate {
       },
       progress: (event) => this.execution?.progress?.(event),
       inputDropped: (rejected) => this.execution?.inputDropped?.(rejected),
+      deadlinePolicy: this.deadlinePolicy,
     });
   }
 
   private async cancelCurrent(kind: CancellationKind): Promise<void> {
     const snapshot = this.controller.snapshot();
+    if (this.controller.isProcessTerminal()) {
+      throw new Error(`Checkpoint host quiescence is unconfirmed. ${UNCONFIRMED_HOST_RECOVERY_GUIDANCE}`);
+    }
     if (snapshot.phase !== "idle") await this.controller.cancel(snapshot.generation, kind);
   }
 
@@ -1653,15 +1823,24 @@ export function callbackCompactionAttempt(
     complete: (token: CompactionCallbackToken, result: CompactionAttemptResult) => void,
   ) => void,
   signal: AbortSignal,
+  policy?: HostDeadlinePolicy,
 ): Promise<CompactionAttemptResult> {
   return new Promise((resolve) => {
     let settled = false;
     const token = { generation, token: {} };
+    let timer: HostDeadlineTimer | undefined;
     const finish = (candidate: CompactionCallbackToken, result: CompactionAttemptResult): void => {
       if (settled || candidate !== token || candidate.generation !== generation) return;
       settled = true;
-      resolve(signal.aborted ? { ok: false, category: "cancelled" } : result);
+      timer?.clear();
+      resolve(!result.ok && result.category === "unconfirmed-host"
+        ? result
+        : signal.aborted ? { ok: false, category: "cancelled" } : result);
     };
+    timer = deadlineClock(policy).schedule(
+      policy?.mainCallbackMs ?? MAIN_CALLBACK_COMPACTION_DEADLINE_MS,
+      () => finish(token, { ok: false, category: "unconfirmed-host" }),
+    );
     // Once host compaction starts, cancellation requests host abort but still joins
     // the real callback; that callback follows Pi's committed hook/restoration work.
     if (signal.aborted) {

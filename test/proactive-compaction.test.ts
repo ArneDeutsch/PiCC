@@ -10,11 +10,43 @@ import {
   MidRunCompactionController,
   callbackCompactionAttempt,
   promiseCompactionAttempt,
+  MAIN_CALLBACK_COMPACTION_DEADLINE_MS,
+  RESUMED_RUN_JOIN_DEADLINE_MS,
   type CheckpointProgress,
+  type HostDeadlineClock,
   type CompactionAttemptResult,
   type MidRunCompactionOptions,
   type QueuedInputShadow,
 } from "../src/runtime/mid-run-compaction.js";
+
+function manualDeadlineClock() {
+  const timers: Array<{ delayMs: number; active: boolean; expire(): void }> = [];
+  const clock: HostDeadlineClock = {
+    schedule(delayMs, expired) {
+      const timer = {
+        delayMs,
+        active: true,
+        expire() {
+          if (!timer.active) return;
+          timer.active = false;
+          expired();
+        },
+      };
+      timers.push(timer);
+      return { clear: () => { timer.active = false; } };
+    },
+  };
+  return { clock, timers };
+}
+
+function expectUnconfirmedHostRecovery(text: string): void {
+  expect(text).toContain("Exit PiCC completely");
+  expect(text).toContain("fresh PiCC process");
+  expect(text).toContain("fresh session");
+  expect(text).toContain("do not reopen the affected session");
+  expect(text).toContain("resend the input PiCC reported");
+  expect(text).not.toContain("/compact");
+}
 
 describe("public async fd writer", () => {
   it("loops partial writes, retries bounded transient pressure, and propagates permanent failure", async () => {
@@ -824,6 +856,151 @@ describe("MidRunCompactionController", () => {
     expect(controller.snapshot().phase).toBe("idle");
   });
 
+  it("completes three independent generations without a hidden repeat latch", async () => {
+    let compactions = 0;
+    const controller = createController({
+      sessionId: "repeated", threshold: 90,
+      compact: async () => { compactions += 1; return { ok: true }; },
+      resume: () => owned(),
+    });
+    for (let expectedGeneration = 1; expectedGeneration <= 3; expectedGeneration += 1) {
+      const { generation, handle } = arm(controller, [`tool-${expectedGeneration}`]);
+      expect(generation).toBe(expectedGeneration);
+      expect(controller.completeToolBatch(handle).stop).toBe("terminate");
+      await controller.checkpoint(generation);
+      expect(controller.snapshot()).toMatchObject({ phase: "idle", admission: "open" });
+      expect(controller.ordinaryInputDisposition()).toBe("accept");
+    }
+    expect(compactions).toBe(3);
+  });
+
+  it("enqueues every unsent replay behind pending custody and authenticates each once", async () => {
+    const hostSettlement = deferred<void>();
+    const allReplayed = deferred<void>();
+    const providerReleased = deferred<void>();
+    const sends: QueuedInputShadow[] = [];
+    const controller = createController({
+      sessionId: "pending-host-start-success", threshold: 90,
+      compact: async () => ({ ok: true }),
+      resume: () => ({
+        settled: hostSettlement.promise,
+        replay: async (input) => {
+          sends.push(input);
+          if (sends.length === 2) allReplayed.resolve();
+          return { delivered: true, pendingHostStart: true };
+        },
+        replayComplete: () => providerReleased.resolve(),
+        cancelAndJoin: async () => hostSettlement.promise,
+      }),
+    });
+    const { generation, handle } = arm(controller);
+    const first = controller.shadowInput(generation, "A", "followUp")!;
+    const second = controller.shadowInput(generation, "B", "steer")!;
+    controller.completeToolBatch(handle);
+    const checkpoint = controller.checkpoint(generation);
+    try {
+      await allReplayed.promise;
+      await providerReleased.promise;
+      expect(sends).toEqual([first, second]);
+      expect(controller.queuedInputSnapshot()).toEqual([first, second]);
+      expect(controller.consumeShadow(generation, first.id)).toBe(first);
+      expect(controller.consumeShadow(generation, second.id)).toBe(second);
+      expect(controller.consumeShadow(generation, first.id)).toBeUndefined();
+      hostSettlement.resolve();
+      await checkpoint;
+      expect(controller.snapshot()).toMatchObject({ phase: "idle", admission: "open" });
+      expect(sends).toEqual([first, second]);
+    } finally {
+      hostSettlement.resolve();
+      await checkpoint.catch(() => undefined);
+    }
+  });
+
+  it("reports every pending-host-start occurrence once when settlement arrives first", async () => {
+    const hostSettlement = deferred<void>();
+    const allReplayed = deferred<void>();
+    const reports: Array<readonly QueuedInputShadow[]> = [];
+    const sends: QueuedInputShadow[] = [];
+    const controller = createController({
+      sessionId: "pending-host-start-settlement", threshold: 90,
+      compact: async () => ({ ok: true }),
+      resume: () => ({
+        settled: hostSettlement.promise,
+        replay: async (input) => {
+          sends.push(input);
+          if (sends.length === 2) allReplayed.resolve();
+          return { delivered: true, pendingHostStart: true };
+        },
+        cancelAndJoin: async () => hostSettlement.promise,
+      }),
+      inputDropped: (rejected) => reports.push(rejected),
+    });
+    const { generation, handle } = arm(controller);
+    controller.shadowInput(generation, "A", "followUp");
+    controller.shadowInput(generation, "B", "steer");
+    controller.completeToolBatch(handle);
+    const checkpoint = controller.checkpoint(generation);
+    try {
+      await allReplayed.promise;
+      hostSettlement.resolve();
+      await checkpoint;
+      expect(sends.map((entry) => entry.content)).toEqual(["A", "B"]);
+      expect(reports).toHaveLength(1);
+      expect(reports[0]?.map((entry) => entry.content)).toEqual(["A", "B"]);
+    } finally {
+      hostSettlement.resolve();
+      await checkpoint.catch(() => undefined);
+    }
+  });
+
+  it("classifies callback and resumed-join deadlines as fail-closed without late authority", async () => {
+    const callbackClock = manualDeadlineClock();
+    let lateComplete!: (token: any, result: CompactionAttemptResult) => void;
+    let callbackToken: any;
+    const callback = callbackCompactionAttempt(7, (token, complete) => {
+      callbackToken = token;
+      lateComplete = complete;
+    }, new AbortController().signal, { clock: callbackClock.clock });
+    expect(callbackClock.timers).toMatchObject([{ delayMs: MAIN_CALLBACK_COMPACTION_DEADLINE_MS, active: true }]);
+    callbackClock.timers[0]!.expire();
+    await expect(callback).resolves.toEqual({ ok: false, category: "unconfirmed-host" });
+    lateComplete(callbackToken, { ok: true });
+    await expect(callback).resolves.toEqual({ ok: false, category: "unconfirmed-host" });
+    expect(callbackClock.timers[0]?.active).toBe(false);
+
+    const joinClock = manualDeadlineClock();
+    const resumed = deferred<void>();
+    const reports: Array<readonly QueuedInputShadow[]> = [];
+    const controller = createController({
+      sessionId: "deadline", threshold: 90,
+      compact: async () => ({ ok: true }),
+      resume: () => ({
+        settled: resumed.promise,
+        replay: async () => ({ delivered: true }),
+        cancelAndJoin: async () => resumed.promise,
+      }),
+      inputDropped: (rejected) => reports.push(rejected),
+      deadlinePolicy: { clock: joinClock.clock },
+    });
+    const { generation, handle } = arm(controller);
+    controller.completeToolBatch(handle);
+    const checkpoint = controller.checkpoint(generation);
+    await waitUntil({ description: "deadline-owned resume", predicate: () => controller.snapshot().phase === "resuming" });
+    const cancellation = controller.cancel(generation, "user");
+    await waitUntil({ description: "resumed join deadline", predicate: () => joinClock.timers.length === 1 });
+    expect(joinClock.timers[0]).toMatchObject({ delayMs: RESUMED_RUN_JOIN_DEADLINE_MS, active: true });
+    joinClock.timers[0]!.expire();
+    await expect(cancellation).rejects.toThrow(/quiescence/);
+    await expect(checkpoint).rejects.toThrow(/quiescence/);
+    expect(controller.snapshot()).toMatchObject({
+      phase: "cancelled", admission: "closed", cancellationQuiescence: "unconfirmed",
+    });
+    expect(controller.recoveryToken(generation)).toBeUndefined();
+    expect(reports).toHaveLength(0);
+    resumed.resolve();
+    expect(controller.snapshot().phase).toBe("cancelled");
+  });
+
   it("token-binds callbacks and abort-races a hung Promise attempt", async () => {
     let late: ((token: any, result: CompactionAttemptResult) => void) | undefined;
     let ownedToken: any;
@@ -875,6 +1052,33 @@ describe("MainSessionCheckpointGate", () => {
     role: "assistant",
     content: ids.map((id) => ({ type: "toolCall", id, name: "probe", arguments: {} })),
   });
+  const armForReconciliation = (gate: MainSessionCheckpointGate, ctx: Record<string, unknown>) => {
+    gate.turnEnded({ ...ctx, hasPendingMessages: () => false });
+  };
+
+  it.each(["armed", "stopping"] as const)(
+    "makes a %s phase total only under the explicit production host-settlement contract",
+    async (phase) => {
+      const intermediate = new MainSessionCheckpointGate("child", 90, {}, "intermediate");
+      const production = new MainSessionCheckpointGate("main", 90, {}, "total-host");
+      const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage };
+      for (const gate of [intermediate, production]) {
+        if (phase === "stopping") gate.assistantMessageEnded(assistant("tool"));
+        const wrapped: any = gate.wrapTool({
+          name: "probe", execute: async () => ({ content: [], details: {} }),
+        });
+        await wrapped.execute("tool", {}, undefined, undefined, ctx);
+        expect(gate.currentController().snapshot().phase).toBe(phase);
+      }
+      expect(intermediate.settlementGeneration(ctx)).toBeUndefined();
+      expect(intermediate.currentController().snapshot().phase).toBe(phase);
+      expect(production.settlementGeneration(ctx))
+        .toBe(production.currentController().snapshot().generation);
+      expect(production.currentController().snapshot()).toMatchObject({
+        phase: "exhausted", failureCategory: "operational", admission: "recoverable-rejection",
+      });
+    },
+  );
 
   it("preserves wrapper this/arguments/metadata and cleanly terminates every successful result", async () => {
     const { gate } = setup();
@@ -989,6 +1193,7 @@ describe("MainSessionCheckpointGate", () => {
     const ctx = { model: { api: "openai-completions" }, getContextUsage: () => usage };
     const imageA = { type: "image", data: "a", mimeType: "image/png" };
     const imageB = { type: "image", data: "b", mimeType: "image/png" };
+    armForReconciliation(gate, ctx);
     const first = gate.captureAcceptedInput(ctx, "same transformed", [imageA], "steer")!;
     const second = gate.captureAcceptedInput(ctx, "same transformed", [imageB], "followUp")!;
     expect(first.id).not.toBe(second.id);
@@ -1007,6 +1212,7 @@ describe("MainSessionCheckpointGate", () => {
     const { controller, gate } = setup();
     gate.assistantMessageEnded(assistant("a"));
     const ctx = { model: { api: "openai-completions" }, getContextUsage: () => usage };
+    armForReconciliation(gate, ctx);
     const first = gate.captureAcceptedInput(ctx, "identical", undefined, "steer")!;
     const second = gate.captureAcceptedInput(ctx, "identical", undefined, "steer")!;
     const followUp = gate.captureAcceptedInput(ctx, "identical", undefined, "followUp")!;
@@ -1028,6 +1234,7 @@ describe("MainSessionCheckpointGate", () => {
 
     const high = { ...low, getContextUsage: () => usage };
     gate.captureAcceptedInput(high, "later", undefined, "followUp");
+    armForReconciliation(gate, high);
     expect(controller.queuedInputSnapshot().map((entry) => [entry.content, entry.delivery])).toEqual([
       ["identical", "steer"],
       ["later", "followUp"],
@@ -1038,6 +1245,7 @@ describe("MainSessionCheckpointGate", () => {
     const { controller, gate } = setup();
     gate.assistantMessageEnded(assistant("a"));
     const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage };
+    armForReconciliation(gate, ctx);
     const followUp = gate.captureAcceptedInput(ctx, "same", undefined, "followUp")!;
     const steer = gate.captureAcceptedInput(ctx, "same", undefined, "steer")!;
     const piMessage = { role: "user", content: [{ type: "text", text: "same" }] };
@@ -1055,6 +1263,7 @@ describe("MainSessionCheckpointGate", () => {
       model: { api: "openai-responses" }, getContextUsage: () => usage,
       hasPendingMessages: () => false, abort: vi.fn(),
     };
+    armForReconciliation(gate, ctx);
     const steer = gate.captureAcceptedInput(ctx, "A", undefined, "steer")!;
     const followUp = gate.captureAcceptedInput(ctx, "B", undefined, "followUp")!;
 
@@ -1063,7 +1272,7 @@ describe("MainSessionCheckpointGate", () => {
     const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => ({ content: [], details: {} }) });
     const result = await wrapped.execute("a", {}, undefined, undefined, ctx);
     gate.toolExecutionEnded({ toolCallId: "a", result, isError: false });
-    expect(gate.turnEnded(ctx)?.stop).toBe("abort");
+    expect(controller.snapshot()).toMatchObject({ phase: "awaiting-settlement", checkpointAbortRequested: true });
   });
 
   it.each([
@@ -1079,6 +1288,7 @@ describe("MainSessionCheckpointGate", () => {
       model: { api: "openai-responses" }, getContextUsage: () => usage,
       hasPendingMessages: () => false, abort: vi.fn(),
     };
+    armForReconciliation(gate, ctx);
     const head = gate.captureAcceptedInput(ctx, "head", undefined, "steer")!;
     const later = gate.captureAcceptedInput(ctx, "later", undefined, "steer")!;
 
@@ -1087,7 +1297,7 @@ describe("MainSessionCheckpointGate", () => {
     const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => ({ content: [], details: {} }) });
     const result = await wrapped.execute("a", {}, undefined, undefined, ctx);
     gate.toolExecutionEnded({ toolCallId: "a", result, isError: false });
-    expect(gate.turnEnded(ctx)?.stop).toBe("abort");
+    expect(controller.snapshot()).toMatchObject({ phase: "awaiting-settlement", checkpointAbortRequested: true });
   });
 
   it.each([
@@ -1100,6 +1310,7 @@ describe("MainSessionCheckpointGate", () => {
     const { controller, gate } = setup();
     gate.assistantMessageEnded(assistant("a"));
     const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage };
+    armForReconciliation(gate, ctx);
     const shadow = gate.captureAcceptedInput(ctx, expected, undefined, "steer")!;
 
     expect(gate.userMessageStarted({ role: "user", content: [{ type: "text", text: observed }] })).toBeUndefined();
@@ -1114,6 +1325,7 @@ describe("MainSessionCheckpointGate", () => {
       { type: "image", data: "one", mimeType: "image/png" },
       { type: "image", data: "two", mimeType: "image/jpeg" },
     ];
+    armForReconciliation(gate, ctx);
     const shadow = gate.captureAcceptedInput(ctx, "images", images, "steer")!;
     const clone = structuredClone(shadow.content);
 
@@ -1135,6 +1347,7 @@ describe("MainSessionCheckpointGate", () => {
       { type: "image", data: "one", mimeType: "image/png" },
       { type: "image", data: "two", mimeType: "image/jpeg" },
     ];
+    armForReconciliation(gate, ctx);
     const shadow = gate.captureAcceptedInput(ctx, "images", images, "steer")!;
     const observed = structuredClone(shadow.content) as any[];
     mutate(observed);
@@ -1223,6 +1436,7 @@ describe("MainSessionCheckpointGate", () => {
     gate.assistantMessageEnded(assistant("a"));
     const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage };
     const image = { type: "image", data: "one", mimeType: "image/png" };
+    armForReconciliation(gate, ctx);
     const shadow = gate.captureAcceptedInput(ctx, "accepted", [image], "steer")!;
     expect(() => gate.withReplayAuthorization(shadow, () => undefined)).toThrow(/stale/);
     expect(gate.authorizeReplay({
@@ -1321,9 +1535,9 @@ describe("MainSessionCheckpointGate", () => {
     });
     gate.assistantMessageEnded(assistant("a"));
     const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage, hasPendingMessages: () => false };
-    const first = gate.captureAcceptedInput(ctx, "same", undefined, "followUp")!;
     const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => ({ content: [], details: {} }) });
     const result = await wrapped.execute("a", {}, undefined, undefined, ctx);
+    const first = gate.captureAcceptedInput(ctx, "same", undefined, "followUp")!;
     gate.toolExecutionEnded({ toolCallId: "a", result, isError: false });
     gate.turnEnded(ctx);
     const checkpoint = controller.checkpoint(controller.snapshot().generation);
@@ -1331,7 +1545,7 @@ describe("MainSessionCheckpointGate", () => {
     expect(await firstAuthorized.promise).toBe(first);
     newer = gate.captureAcceptedInput(ctx, "same", undefined, "steer")!;
     expect(gate.userMessageStarted({ role: "user", content: [{ type: "text", text: "same" }] })).toBe(first);
-    expect(controller.queuedInputSnapshot()).toEqual([first, newer]);
+    expect(controller.queuedInputSnapshot()).toEqual([newer]);
     releaseFirst.resolve();
     await checkpoint;
     expect(replayCalls).toBe(2);
@@ -1358,9 +1572,9 @@ describe("MainSessionCheckpointGate", () => {
     });
     gate.assistantMessageEnded(assistant("a"));
     const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage, hasPendingMessages: () => false };
-    const old = gate.captureAcceptedInput(ctx, "retired", undefined, "followUp")!;
     const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => ({ content: [], details: {} }) });
     const result = await wrapped.execute("a", {}, undefined, undefined, ctx);
+    const old = gate.captureAcceptedInput(ctx, "retired", undefined, "followUp")!;
     gate.toolExecutionEnded({ toolCallId: "a", result, isError: false });
     gate.turnEnded(ctx);
     await controller.checkpoint(controller.snapshot().generation);
@@ -1368,11 +1582,11 @@ describe("MainSessionCheckpointGate", () => {
     expect(retired).toBe(old);
     expect(controller.snapshot().phase).toBe("idle");
     gate.assistantMessageEnded(assistant("b"));
-    const current = gate.captureAcceptedInput(ctx, "current", undefined, "steer")!;
+    expect(gate.captureAcceptedInput(ctx, "current", undefined, "steer")).toBeUndefined();
     expect(() => gate.withReplayAuthorization(old, () => undefined)).toThrow(/stale/);
     expect(gate.userMessageStarted({
       role: "user", content: [{ type: "text", text: "current" }],
-    })).toBe(current);
+    })).toBeUndefined();
     expect(controller.queuedInputSnapshot()).toEqual([]);
   });
 
@@ -1401,9 +1615,9 @@ describe("MainSessionCheckpointGate", () => {
     });
     gate.assistantMessageEnded(assistant("a"));
     const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage, hasPendingMessages: () => false };
-    const old = gate.captureAcceptedInput(ctx, "retired", undefined, "followUp")!;
     const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => ({ content: [], details: {} }) });
     const result = await wrapped.execute("a", {}, undefined, undefined, ctx);
+    const old = gate.captureAcceptedInput(ctx, "retired", undefined, "followUp")!;
     gate.toolExecutionEnded({ toolCallId: "a", result, isError: false });
     gate.turnEnded(ctx);
     const checkpoint = controller.checkpoint(controller.snapshot().generation);
@@ -1414,11 +1628,11 @@ describe("MainSessionCheckpointGate", () => {
     const replacement = gate.currentController();
     expect(replacement).not.toBe(controller);
     gate.assistantMessageEnded(assistant("b"));
-    const current = gate.captureAcceptedInput(ctx, "replacement current", undefined, "steer")!;
+    expect(gate.captureAcceptedInput(ctx, "replacement current", undefined, "steer")).toBeUndefined();
     expect(() => gate.withReplayAuthorization(old, () => undefined)).toThrow(/stale/);
     expect(gate.userMessageStarted({
       role: "user", content: [{ type: "text", text: "replacement current" }],
-    })).toBe(current);
+    })).toBeUndefined();
     expect(replacement.queuedInputSnapshot()).toEqual([]);
   });
 
@@ -1430,6 +1644,7 @@ describe("MainSessionCheckpointGate", () => {
       hasPendingMessages: () => false, abort: () => undefined,
     };
     const image = { type: "image", data: "right", mimeType: "image/png" };
+    armForReconciliation(gate, ctx);
     const shadow = gate.captureAcceptedInput(ctx, "same", [image], "followUp")!;
     expect(gate.userMessageStarted({
       role: "user", content: [{ type: "text", text: "same" }, { ...image, data: "wrong" }],
@@ -1438,7 +1653,7 @@ describe("MainSessionCheckpointGate", () => {
     const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => ({ content: [], details: {} }) });
     const result = await wrapped.execute("a", {}, undefined, undefined, ctx);
     gate.toolExecutionEnded({ toolCallId: "a", result, isError: false });
-    expect(gate.turnEnded(ctx)?.stop).toBe("abort");
+    expect(controller.snapshot()).toMatchObject({ phase: "awaiting-settlement", checkpointAbortRequested: true });
   });
 
   it("revokes a stopped logical run and permits the next genuine run only after settlement", async () => {
@@ -1559,6 +1774,7 @@ describe("MainSessionCheckpointGate", () => {
     const { controller, gate } = setup();
     gate.assistantMessageEnded(assistant("a"));
     const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage };
+    armForReconciliation(gate, ctx);
     const shadow = gate.captureAcceptedInput(ctx, "queued", undefined, "steer")!;
     await gate.beforeSessionSwitch();
     expect(controller.snapshot().phase).toBe("cancelled");
@@ -1584,10 +1800,10 @@ describe("MainSessionCheckpointGate", () => {
     });
     gate.assistantMessageEnded(assistant("a"));
     const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage, hasPendingMessages: () => false };
-    const shadow = gate.captureAcceptedInput(ctx, "queued", undefined, "steer")!;
     const authorize = deferred<void>();
     const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => ({ content: [], details: {} }) });
     const result = await wrapped.execute("a", {}, undefined, undefined, ctx);
+    const shadow = gate.captureAcceptedInput(ctx, "queued", undefined, "steer")!;
     gate.toolExecutionEnded({ toolCallId: "a", result, isError: false });
     gate.turnEnded(ctx);
     void controller.checkpoint(controller.snapshot().generation).catch(() => undefined);
@@ -1656,6 +1872,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
   let dir: string;
   let pi: FakePi;
   let mainCheckpointGate: MainSessionCheckpointGate;
+  const integrationDeadlines = manualDeadlineClock();
   const originalCwd = process.cwd();
   const savedUserDir = process.env.PICC_CLAUDE_USER_DIR;
 
@@ -1727,6 +1944,7 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     pi = fakePi();
     picc(pi.api as never, {
       onInitializationSettled: pi.captureInitialization,
+      checkpointDeadlinePolicy: { clock: integrationDeadlines.clock },
       onWired: (internals) => {
         mainCheckpointGate = internals.mainCheckpointGate;
       },
@@ -1752,6 +1970,173 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
   });
   afterEach(() => {
     process.exitCode = savedExitCode;
+  });
+
+  it("fails closed when callback compaction exceeds the production ceiling", async () => {
+    const deadlinePi = fakePi();
+    let deadlineGate!: MainSessionCheckpointGate;
+    picc(deadlinePi.api as never, {
+      onInitializationSettled: deadlinePi.captureInitialization,
+      checkpointDeadlinePolicy: { clock: integrationDeadlines.clock },
+      onWired: (internals) => { deadlineGate = internals.mainCheckpointGate; },
+    });
+    await deadlinePi.waitForInitialization();
+    await deadlineGate.startSession("callback-deadline");
+    let compactOptions: any;
+    const committed = deferred<void>();
+    let ctx: any;
+    ctx = deadlinePi.ctx({
+      mode: "rpc", hasUI: true,
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      hasPendingMessages: () => false,
+      compact: (options: any) => {
+        compactOptions = options;
+        void (async () => {
+          const before = await deadlinePi.fire("session_before_compact", { reason: "manual" }, ctx);
+          if (before?.cancel) return options.onError(new Error("cancelled"));
+          await deadlinePi.fire("session_compact", {
+            reason: "manual", compactionEntry: { summary: "committed before deadline" },
+          }, ctx);
+          committed.resolve();
+        })();
+      },
+    });
+    deadlineGate.assistantMessageEnded({
+      role: "assistant", content: [{ type: "toolCall", id: "deadline-tool", name: "probe", arguments: {} }],
+    });
+    const wrapped: any = deadlineGate.wrapTool({
+      name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }], details: {} }),
+    });
+    const result = await wrapped.execute("deadline-tool", {}, undefined, undefined, ctx);
+    deadlineGate.captureAcceptedInput(ctx, "resend after deadline", undefined, "steer");
+    deadlineGate.toolExecutionEnded({ toolCallId: "deadline-tool", result, isError: false });
+    deadlineGate.turnEnded(ctx);
+    const settling = deadlinePi.fire("agent_settled", {}, ctx);
+    await waitUntil({
+      description: "main callback deadline to arm",
+      predicate: () => integrationDeadlines.timers.some((timer) => timer.active && timer.delayMs === MAIN_CALLBACK_COMPACTION_DEADLINE_MS),
+    });
+    await committed.promise;
+    const timer = [...integrationDeadlines.timers].reverse().find((candidate) => candidate.active &&
+      candidate.delayMs === MAIN_CALLBACK_COMPACTION_DEADLINE_MS)!;
+    timer.expire();
+    await settling;
+    const controller = deadlineGate.currentController();
+    expect(controller.snapshot()).toMatchObject({
+      phase: "exhausted", admission: "closed", failureCategory: "unconfirmed-host",
+    });
+    expect(controller.recoveryToken(controller.snapshot().generation)).toBeUndefined();
+    const notice = deadlinePi.entries.find((entry) => entry.data.category === "checkpoint-cancelled")?.data.notice;
+    expectUnconfirmedHostRecovery(String(notice));
+
+    const switchCtx = deadlinePi.tuiCtx();
+    await expect(deadlinePi.fire("session_before_switch", {}, switchCtx)).resolves.toEqual({ cancel: true });
+    expect(deadlineGate.currentController()).toBe(controller);
+    expect(deadlinePi.notifications.at(-1)?.severity).toBe("error");
+    expectUnconfirmedHostRecovery(String(deadlinePi.notifications.at(-1)?.text));
+    const switchNotice = deadlinePi.entries.find((entry) =>
+      entry.data.category === "checkpoint-session-switch-refused")?.data.notice;
+    expectUnconfirmedHostRecovery(String(switchNotice));
+
+    const replacementError = await deadlineGate.startSession("forbidden-replacement").then(
+      () => "",
+      (error: unknown) => String(error),
+    );
+    expectUnconfirmedHostRecovery(replacementError);
+    compactOptions.onComplete({ summary: "late" });
+    expect(controller.snapshot().failureCategory).toBe("unconfirmed-host");
+    const recovery = deadlinePi.entries.filter((entry) => entry.data.category === "checkpoint-input-recovery");
+    expect(recovery).toHaveLength(1);
+    expect(recovery[0]?.data.count).toBe(1);
+  });
+
+  it("fails closed through registered session switching when resumed cancellation misses its ceiling", async () => {
+    const deadlines = manualDeadlineClock();
+    const deadlinePi = fakePi();
+    let deadlineGate!: MainSessionCheckpointGate;
+    picc(deadlinePi.api as never, {
+      onInitializationSettled: deadlinePi.captureInitialization,
+      checkpointDeadlinePolicy: { clock: deadlines.clock },
+      onWired: (internals) => { deadlineGate = internals.mainCheckpointGate; },
+    });
+    await deadlinePi.waitForInitialization();
+    await deadlineGate.startSession("resumed-join-deadline");
+    const ctx = deadlinePi.ctx({
+      mode: "json", hasUI: false,
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      hasPendingMessages: () => false,
+      abort: () => undefined,
+      compact: (options: any) => {
+        void (async () => {
+          const before = await deadlinePi.fire("session_before_compact", { reason: "manual" }, ctx);
+          if (before?.cancel) return options.onError(new Error("cancelled"));
+          await deadlinePi.fire("session_compact", {
+            reason: "manual", compactionEntry: { summary: "committed" },
+          }, ctx);
+          options.onComplete({ summary: "committed" });
+        })();
+      },
+    });
+    deadlineGate.assistantMessageEnded({
+      role: "assistant", content: [{ type: "toolCall", id: "join-tool", name: "probe", arguments: {} }],
+    });
+    const wrapped: any = deadlineGate.wrapTool({
+      name: "probe", execute: async () => ({ content: [{ type: "text", text: "done" }], details: {} }),
+    });
+    const result = await wrapped.execute("join-tool", {}, undefined, undefined, ctx);
+    deadlineGate.captureAcceptedInput(ctx, "resend after join expiry", undefined, "followUp");
+    deadlineGate.toolExecutionEnded({ toolCallId: "join-tool", result, isError: false });
+    deadlineGate.turnEnded(ctx);
+    const outer = deadlinePi.fire("agent_settled", {}, ctx);
+    void outer.catch(() => undefined);
+    await waitUntil({
+      description: "registered resumed run",
+      predicate: () => deadlineGate.currentController().snapshot().phase === "resuming",
+    });
+    const controllerBeforeSwitch = deadlineGate.currentController();
+    const cancelling = deadlinePi.fire("session_before_switch", {}, ctx);
+    await waitUntil({
+      description: "registered resumed join deadline",
+      predicate: () => deadlines.timers.some((timer) => timer.active && timer.delayMs === RESUMED_RUN_JOIN_DEADLINE_MS),
+    });
+    deadlines.timers.find((timer) => timer.active && timer.delayMs === RESUMED_RUN_JOIN_DEADLINE_MS)!.expire();
+    await expect(cancelling).resolves.toEqual({ cancel: true });
+    const controller = deadlineGate.currentController();
+    expect(controller.snapshot()).toMatchObject({
+      phase: "cancelled", admission: "closed", cancellationQuiescence: "unconfirmed",
+    });
+    expect(controller).toBe(controllerBeforeSwitch);
+    const notice = deadlinePi.entries.find((entry) => entry.data.category === "checkpoint-cancelled")?.data.notice;
+    expectUnconfirmedHostRecovery(String(notice));
+    const switchNotice = deadlinePi.entries.find((entry) =>
+      entry.data.category === "checkpoint-session-switch-refused")?.data.notice;
+    expectUnconfirmedHostRecovery(String(switchNotice));
+    const replacementError = await deadlineGate.startSession("forbidden-after-join").then(
+      () => "",
+      (error: unknown) => String(error),
+    );
+    expectUnconfirmedHostRecovery(replacementError);
+    expect(deadlineGate.currentController()).toBe(controller);
+    await deadlinePi.fire("agent_settled", {}, ctx);
+    await expect(outer).rejects.toThrow(/quiescence/);
+
+    const errors: string[] = [];
+    const errorSpy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    try {
+      await expect(deadlinePi.fire("session_before_switch", {}, deadlinePi.printCtx()))
+        .resolves.toEqual({ cancel: true });
+    } finally {
+      errorSpy.mockRestore();
+    }
+    const stderrGuidance = errors.filter((line) => line.startsWith("PiCC: ")).join("\n");
+    expectUnconfirmedHostRecovery(stderrGuidance);
+    const recovery = deadlinePi.entries.filter((entry) => entry.data.category === "checkpoint-input-recovery");
+    expect(recovery).toHaveLength(1);
+    expect(recovery[0]?.data.count).toBe(1);
   });
 
   it("rejects genuine input until a universally stopped host run settles, then accepts a real tool cycle", async () => {
@@ -1791,6 +2176,136 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await pi.fire("tool_execution_end", { toolCallId: "next-tool", result, isError: false }, ctx);
     expect(await pi.fire("turn_end", {}, ctx)).toBeUndefined();
     expect(result.terminate).toBeUndefined();
+  });
+
+  it("completes three registered generations with stable barriers and useful idle input", async () => {
+    await mainCheckpointGate.startSession("registered-repeated-generations");
+    let compactions = 0;
+    let usagePercent = 90;
+    const order: string[] = [];
+    let ctx: any;
+    ctx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({
+        tokens: usagePercent * 10, contextWindow: 1000, percent: usagePercent,
+      }),
+      hasPendingMessages: () => false,
+      compact: (options: any) => {
+        compactions += 1;
+        const physical = compactions;
+        order.push(`compact-${physical}`);
+        void (async () => {
+          const before = await pi.fire("session_before_compact", { reason: "manual" }, ctx);
+          if (before?.cancel) return options.onError(new Error("cancelled"));
+          await pi.fire("session_compact", {
+            reason: "manual", compactionEntry: { summary: `summary-${physical}` },
+          }, ctx);
+          options.onComplete({ summary: `summary-${physical}` });
+        })();
+      },
+    });
+    const generations: number[] = [];
+    for (let cycle = 1; cycle <= 3; cycle += 1) {
+      usagePercent = 90;
+      mainCheckpointGate.assistantMessageEnded({
+        role: "assistant",
+        content: [{ type: "toolCall", id: `repeat-${cycle}`, name: "probe", arguments: {} }],
+      });
+      const wrapped: any = mainCheckpointGate.wrapTool({
+        name: "probe", execute: async () => ({ content: [{ type: "text", text: `done-${cycle}` }], details: {} }),
+      });
+      const result = await wrapped.execute(`repeat-${cycle}`, {}, undefined, undefined, ctx);
+      mainCheckpointGate.toolExecutionEnded({ toolCallId: `repeat-${cycle}`, result, isError: false });
+      mainCheckpointGate.turnEnded(ctx);
+      generations.push(mainCheckpointGate.currentController().snapshot().generation);
+      const outer = pi.fire("agent_settled", {}, ctx);
+      await waitUntil({
+        description: `registered generation ${cycle} resume`,
+        predicate: () => mainCheckpointGate.currentController().snapshot().phase === "resuming",
+      });
+      usagePercent = 10;
+      await pi.fire("agent_settled", {}, ctx);
+      await outer;
+      order.push(`stable-${cycle}`);
+      expect(mainCheckpointGate.currentController().snapshot()).toMatchObject({ phase: "idle", admission: "open" });
+      await expect(pi.fire("input", {
+        text: `useful-after-${cycle}`, source: "interactive", streamingBehavior: undefined,
+      }, ctx)).resolves.toEqual({ action: "continue" });
+      await pi.fire("message_start", {
+        message: { role: "user", content: [{ type: "text", text: `useful-after-${cycle}` }] },
+      }, ctx);
+      expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([]);
+    }
+    expect(generations).toEqual([1, 2, 3]);
+    expect(compactions).toBe(3);
+    expect(order).toEqual([
+      "compact-1", "stable-1", "compact-2", "stable-2", "compact-3", "stable-3",
+    ]);
+  });
+
+  it("keeps registered replay custody without message_start and consumes delayed starts once", async () => {
+    const originalSendUserMessage = pi.api.sendUserMessage as (...args: any[]) => void;
+    const drive = async (sessionId: string, text: string, authenticate: boolean) => {
+      await mainCheckpointGate.startSession(sessionId);
+      let ctx: any;
+      ctx = pi.printCtx({
+        model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+        getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+        hasPendingMessages: () => false,
+        compact: (options: any) => {
+          void (async () => {
+            const before = await pi.fire("session_before_compact", { reason: "manual" }, ctx);
+            if (before?.cancel) return options.onError(new Error("cancelled"));
+            await pi.fire("session_compact", {
+              reason: "manual", compactionEntry: { summary: "replay summary" },
+            }, ctx);
+            options.onComplete({ summary: "replay summary" });
+          })();
+        },
+      });
+      mainCheckpointGate.assistantMessageEnded({
+        role: "assistant", content: [{ type: "toolCall", id: text, name: "probe", arguments: {} }],
+      });
+      const wrapped: any = mainCheckpointGate.wrapTool({
+        name: "probe", execute: async () => ({ content: [], details: {} }),
+      });
+      const result = await wrapped.execute(text, {}, undefined, undefined, ctx);
+      mainCheckpointGate.captureAcceptedInput(ctx, text, undefined, "followUp");
+      mainCheckpointGate.toolExecutionEnded({ toolCallId: text, result, isError: false });
+      mainCheckpointGate.turnEnded(ctx);
+      const beforeSends = pi.userMessages.length;
+      const beforeEntries = pi.entries.length;
+      const outer = pi.fire("agent_settled", {}, ctx);
+      await waitUntil({
+        description: `registered replay dispatch for ${text}`,
+        predicate: () => pi.userMessages.slice(beforeSends).some((entry) => entry.content === text),
+      });
+      const controller = mainCheckpointGate.currentController();
+      expect(controller.queuedInputSnapshot().map((entry) => entry.content)).toEqual([text]);
+      if (authenticate) {
+        await pi.fire("message_start", {
+          message: { role: "user", content: [{ type: "text", text }] }, delivery: "followUp",
+        }, ctx);
+        expect(controller.queuedInputSnapshot()).toEqual([]);
+      }
+      await pi.fire("agent_settled", {}, ctx);
+      await outer;
+      return { controller, reports: pi.entries.slice(beforeEntries).filter((entry) =>
+        entry.data.category === "checkpoint-input-recovery") };
+    };
+    try {
+      pi.api.sendUserMessage = (content: any, options: any) => originalSendUserMessage(content, options);
+      const withheld = await drive("registered-replay-withheld", "withheld replay", false);
+      expect(withheld.controller.snapshot()).toMatchObject({
+        phase: "exhausted", failureCategory: "restoration-paused",
+      });
+      expect(withheld.reports).toHaveLength(1);
+      const delayed = await drive("registered-replay-delayed", "delayed replay", true);
+      expect(delayed.controller.snapshot()).toMatchObject({ phase: "idle", admission: "open" });
+      expect(delayed.reports).toHaveLength(0);
+    } finally {
+      pi.api.sendUserMessage = originalSendUserMessage;
+    }
   });
 
   it("gates clean and fallback cycles through the actual registered lifecycle handlers", async () => {
@@ -1902,6 +2417,8 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
 
   it("awaits callback compaction, hidden resume, replay, and nested settlement", async () => {
     await mainCheckpointGate.startSession("main-resume");
+    pi.messages.length = 0;
+    pi.userMessages.length = 0;
     const order: string[] = [];
     const stopAdmissionResults: Array<Promise<unknown>> = [];
     const staleStopInput = deferred<void>();
@@ -1916,7 +2433,13 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     pi.api.sendUserMessage = (content: any, options: any) => {
       order.push("user-replay");
       originalSendUserMessage(content, options);
-      if (typeof content !== "string" || !content.startsWith("[Stop hook]")) return;
+      if (typeof content !== "string" || !content.startsWith("[Stop hook]")) {
+        void pi.fire("message_start", {
+          message: { role: "user", content: typeof content === "string" ? [{ type: "text", text: content }] : content },
+          delivery: options?.deliverAs,
+        }, high);
+        return;
+      }
       if (!capturedStaleStopInput) {
         capturedStaleStopInput = true;
         stopAdmissionResults.push(pi.fire("input", {
@@ -2023,7 +2546,9 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
       expect(outerDone).toBe(true);
       expect(fs.existsSync(inputHookCount)).toBe(false);
       expect(controller.snapshot().phase).toBe("idle");
-      expect(fs.readFileSync(trace, "utf8").trim().split(/\r?\n/)).toEqual(["pre", "start", "post"]);
+      expect(fs.readFileSync(trace, "utf8").trim().split(/\r?\n/)).toEqual([
+        "pre", "start", "post", "pre", "start", "post",
+      ]);
     } finally {
       pi.api.sendMessage = originalSendMessage;
       pi.api.sendUserMessage = originalSendUserMessage;
@@ -3871,7 +4396,9 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     const high = pi.ctx({
       model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
       getContextUsage: () => ({ tokens: 900, contextWindow: 1000, percent: 90 }),
+      hasPendingMessages: () => false,
     });
+    mainCheckpointGate.turnEnded(high);
     mainCheckpointGate.captureAcceptedInput(high, "queued", undefined, "steer");
     await pi.fire("session_before_switch", {}, high);
     expect(old.snapshot().phase).toBe("cancelled");
@@ -3879,6 +4406,49 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     await pi.fire("session_start", { reason: "switch" }, high);
     expect(mainCheckpointGate.currentController()).not.toBe(old);
     expect(mainCheckpointGate.currentController().snapshot().phase).toBe("idle");
+  });
+
+  it("releases a native operation without session_compact at the next true settlement", async () => {
+    await mainCheckpointGate.startSession("native-operation-settlement");
+    const ctx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
+    });
+    await expect(pi.fire("session_before_compact", { reason: "auto" }, ctx)).resolves.toBeUndefined();
+    await expect(pi.fire("session_before_compact", {
+      reason: "manual", customInstructions: "must not overlap native ownership",
+    }, ctx)).resolves.toEqual({ cancel: true });
+    await pi.fire("agent_settled", {}, ctx);
+    await expect(pi.fire("session_before_compact", {
+      reason: "manual", customInstructions: "later transaction",
+    }, ctx)).resolves.toBeUndefined();
+    await pi.fire("session_compact", {
+      reason: "manual", compactionEntry: { summary: "later succeeded" },
+    }, ctx);
+  });
+
+  it("keeps manual ownership across stale native events and refuses native overlap", async () => {
+    await mainCheckpointGate.startSession("physical-origin-interleavings");
+    const ctx = pi.printCtx({
+      model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+      getContextUsage: () => ({ tokens: 100, contextWindow: 1000, percent: 10 }),
+    });
+    await expect(pi.fire("session_before_compact", { reason: "manual" }, ctx)).resolves.toBeUndefined();
+    await expect(pi.fire("session_before_compact", { reason: "auto" }, ctx))
+      .resolves.toEqual({ cancel: true });
+    await pi.fire("session_compact", {
+      reason: "auto", compactionEntry: { summary: "stale native completion" },
+    }, ctx);
+    // The stale old-origin completion neither authenticated nor cleared the live manual.
+    await expect(pi.fire("session_before_compact", { reason: "auto" }, ctx))
+      .resolves.toEqual({ cancel: true });
+    await pi.fire("session_compact", {
+      reason: "manual", compactionEntry: { summary: "manual successor" },
+    }, ctx);
+    await expect(pi.fire("session_before_compact", { reason: "auto" }, ctx)).resolves.toBeUndefined();
+    await pi.fire("session_compact", {
+      reason: "auto", compactionEntry: { summary: "new native operation" },
+    }, ctx);
   });
 
   it("lets a new manual operation replace a failed current-epoch manual operation", async () => {
@@ -3974,57 +4544,33 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
 
     await expect(pi.fire("input", {
       text: "mode-less", source: "interactive", streamingBehavior: undefined,
-    }, high)).resolves.toEqual({ action: "handled" });
-    await expect(pi.fire("input", {
-      text: "unauthenticated extension", source: "extension", streamingBehavior: "steer",
-    }, high)).resolves.toEqual({ action: "handled" });
-    const [modeLess] = mainCheckpointGate.currentController().queuedInputSnapshot();
-    expect(modeLess).toMatchObject({ content: "mode-less", delivery: "followUp" });
+    }, high)).resolves.toEqual({ action: "continue" });
+    expect(mainCheckpointGate.currentController().snapshot().phase).toBe("idle");
+    expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([]);
     await pi.fire("message_start", {
       message: { role: "user", content: [{ type: "text", text: "mode-less" }] },
     }, high);
-    expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([]);
+    await expect(pi.fire("input", {
+      text: "unauthenticated extension", source: "extension", streamingBehavior: "steer",
+    }, high)).resolves.toEqual({ action: "continue" });
 
     for (const streamingBehavior of ["followUp", "followUp", "steer", "steer"] as const) {
       await expect(pi.fire("input", {
         text: "identical", source: "interactive", streamingBehavior,
-      }, high)).resolves.toEqual({ action: "handled" });
+      }, high)).resolves.toEqual({ action: "continue" });
+      await pi.fire("message_start", {
+        message: { role: "user", content: [{ type: "text", text: "identical" }] },
+      }, high);
     }
-    const duplicates = mainCheckpointGate.currentController().queuedInputSnapshot();
-    expect(duplicates.map((entry) => entry.delivery)).toEqual(["followUp", "followUp", "steer", "steer"]);
-    const duplicateMessage = { message: { role: "user", content: [{ type: "text", text: "identical" }] } };
-    await pi.fire("message_start", duplicateMessage, high);
-    expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([
-      duplicates[0], duplicates[1], duplicates[3],
-    ]);
-    await pi.fire("message_start", duplicateMessage, high);
-    expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([duplicates[0], duplicates[1]]);
-    await pi.fire("message_start", duplicateMessage, high);
-    expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([duplicates[1]]);
-    await pi.fire("message_start", duplicateMessage, high);
     expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([]);
 
     const image = { type: "image", data: "aW1hZ2U=", mimeType: "image/png" };
     const transformed = await pi.fire("input", {
       text: "/expand once", source: "interactive", streamingBehavior: "followUp", images: [image],
     }, high);
-    expect(transformed).toEqual({ action: "handled" });
-    const [shadow] = mainCheckpointGate.currentController().queuedInputSnapshot();
-    expect(shadow?.delivery).toBe("followUp");
-    expect(Array.isArray(shadow?.content)).toBe(true);
-    const transformedText = (shadow?.content as any[])[0]?.text;
-    expect(transformedText).toContain("Expanded: once");
-    expect(transformedText.match(/Expanded:/g)).toHaveLength(1);
-    expect(shadow?.content).toEqual([{ type: "text", text: transformedText }, image]);
-    const hookCountBeforeReplay = fs.readFileSync(path.join(dir, "input-hook-count"), "utf8");
-    expect(() => mainCheckpointGate.withReplayAuthorization(shadow!, () => pi.fire("input", {
-      text: transformedText, source: "extension", streamingBehavior: "followUp", images: [image],
-    }, high))).toThrow(/stale/);
-    expect(fs.readFileSync(path.join(dir, "input-hook-count"), "utf8")).toBe(hookCountBeforeReplay);
-    expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([shadow]);
-    await pi.fire("message_start", {
-      message: { role: "user", content: structuredClone(shadow?.content) },
-    }, high);
+    expect(transformed).toMatchObject({ action: "transform", images: [image] });
+    expect((transformed as { text: string }).text).toContain("Expanded: once");
+    expect(mainCheckpointGate.currentController().snapshot().phase).toBe("idle");
     expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([]);
   });
 });
