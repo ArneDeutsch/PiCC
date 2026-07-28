@@ -141,11 +141,10 @@ Before the choice, show the applicable compact contract; use no internal phase n
   check and I echo the issue URL; at hand-off I open a ready-for-review PR and I post one issue
   comment; for full delivery I make the PR close/link the issue, while for partial delivery I make it
   link the issue and leave it open.
-- **Fork:** at hand-off I push to the fork and give the user a compare URL and paste-ready PR; the
-  user opens the PR. If the user chooses **file and build**: I file the one consented public artifact
-  on the named upstream `<target>` after the same duplicate check and I echo its URL; for full
-  delivery I make the paste-ready PR close/link it, while for partial delivery I make it link it and
-  leave it open; I offer an optional paste-ready issue comment and I post nothing else to `<target>`.
+- **Fork:** if the user chooses **file and build**: I file the one consented public artifact on the
+  named upstream `<target>` after the same duplicate check and I echo its URL; for full delivery I
+  make the paste-ready PR close/link it, while for partial delivery I make it link it and leave it
+  open; I offer an optional paste-ready issue comment and I post nothing else to `<target>`.
 
 After the preview, destination, assessment, and contract, ask exactly one normal-run question:
 `Choose **file and build**, **build ticketless**, or tell me what to change.` Unambiguous natural-

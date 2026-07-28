@@ -141,7 +141,7 @@ describe("small stable prompt security kernels", () => {
       "where it writes, plainly", "a public artifact appears once filed",
       "before the choice, show the applicable compact contract",
       "maintainer:** if the user chooses **file and build**:",
-      "fork:** at hand-off i push to the fork", "if the user chooses **file and build**:",
+      "fork:** if the user chooses **file and build**:",
       "after the preview", prompt,
     ]);
     contains(offer, [
@@ -150,7 +150,7 @@ describe("small stable prompt security kernels", () => {
       "file and build", "records consent to the exact preview and named target", "enters phase 2",
       "build ticketless", "records no filing", "without a second confirmation",
       "unconditional duplicate check", "echo the issue url", "full delivery", "partial delivery",
-      "post one issue comment", "i push to the fork", "the user opens the pr", "post nothing else",
+      "post one issue comment", "post nothing else",
       "every recovered identity, scope, preview, target, and remaining-write disclosure",
       "the complete per-item choice also satisfies that gate", "ask no second confirmation",
       "record **file and continue** as canonical **file and build**",
@@ -171,13 +171,13 @@ describe("small stable prompt security kernels", () => {
     expect(maintainerContract).not.toContain("picc ");
     const forkContract = offer.slice(offer.indexOf("- **fork:**"), offer.indexOf("after the preview"));
     ordered(forkContract, [
-      "at hand-off i push to the fork", "the user opens the pr",
       "if the user chooses **file and build**:", "i file", "after the same duplicate check",
       "i echo its url", "for full delivery i make the paste-ready pr close/link it",
       "for partial delivery i make it link it and leave it open",
       "i offer an optional paste-ready issue comment", "i post nothing else to `<target>`",
     ]);
     expect(forkContract).not.toContain("picc ");
+    expect(forkContract).not.toMatch(/at hand-off|push to the fork|compare url|user opens the pr/);
     contains(direction, [
       "either complete combined choice explicitly authorizes phase 2",
       "when unavailable, require the ordinary explicit \"go\"", "with a ticket present", "require explicit \"go\"",
@@ -234,10 +234,23 @@ describe("small stable prompt security kernels", () => {
       forkDisclosure.indexOf("ticketless create-offer presented"),
     );
     contains(offeredForkDisclosure, [
+      "push the branch to your fork", "hand you a compare url plus paste-ready pr",
+      "you open the pr against `<target>` yourself",
       "i will post nothing to `<target>` automatically except the optional feature issue",
       "choose **file and build** below", "use the second variant only when",
       "presents the combined choice; otherwise use the first",
     ]);
+    const offeredForkPresentation = `${offeredForkDisclosure} ${forkContract}`;
+    contains(offeredForkPresentation, [
+      "push the branch to your fork", "compare url", "paste-ready pr", "you open the pr",
+      "if the user chooses **file and build**:", "same duplicate check", "echo its url",
+      "full delivery", "partial delivery", "optional paste-ready issue comment",
+      "post nothing else to `<target>`",
+    ]);
+    for (const handoff of [
+      "push the branch to your fork", "hand you a compare url plus paste-ready pr",
+      "you open the pr against `<target>` yourself",
+    ]) expect(offeredForkPresentation.split(handoff)).toHaveLength(2);
     const forkWriteQualification =
       "excluding the two separately approved per-item issue-create offers";
     contains(implementRouter, [forkWriteQualification, "only routine phase 9/hand-off automatic write"]);
