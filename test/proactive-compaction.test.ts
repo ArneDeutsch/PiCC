@@ -1110,8 +1110,8 @@ describe("MainSessionCheckpointGate", () => {
     gate.assistantMessageEnded(assistant("a"));
     const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage };
     const images = [
-      { type: "image", data: "one", mimeType: "image/png", metadata: { label: "first" } },
-      { type: "image", data: "two", mimeType: "image/jpeg", metadata: { label: "second" } },
+      { type: "image", data: "one", mimeType: "image/png" },
+      { type: "image", data: "two", mimeType: "image/jpeg" },
     ];
     const shadow = gate.captureAcceptedInput(ctx, "images", images, "steer")!;
     const clone = structuredClone(shadow.content);
@@ -1125,14 +1125,14 @@ describe("MainSessionCheckpointGate", () => {
     ["MIME type", (blocks: any[]) => { blocks[1].mimeType = "image/gif"; }],
     ["count", (blocks: any[]) => { blocks.pop(); }],
     ["order", (blocks: any[]) => { [blocks[1], blocks[2]] = [blocks[2], blocks[1]]; }],
-    ["represented fields", (blocks: any[]) => { blocks[1].metadata.label = "changed"; }],
+    ["extra field", (blocks: any[]) => { blocks[1].unsupported = true; }],
   ])("does not reconcile image content with changed %s", (_kind, mutate) => {
     const { controller, gate } = setup();
     gate.assistantMessageEnded(assistant("a"));
     const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage };
     const images = [
-      { type: "image", data: "one", mimeType: "image/png", metadata: { label: "first" } },
-      { type: "image", data: "two", mimeType: "image/jpeg", metadata: { label: "second" } },
+      { type: "image", data: "one", mimeType: "image/png" },
+      { type: "image", data: "two", mimeType: "image/jpeg" },
     ];
     const shadow = gate.captureAcceptedInput(ctx, "images", images, "steer")!;
     const observed = structuredClone(shadow.content) as any[];
@@ -1233,8 +1233,8 @@ describe("MainSessionCheckpointGate", () => {
     const { controller, gate } = setup();
     const settlement = deferred<void>();
     const images = [
-      { type: "image", data: "one", mimeType: "image/png", metadata: { label: "first" } },
-      { type: "image", data: "two", mimeType: "image/jpeg", metadata: { label: "second" } },
+      { type: "image", data: "one", mimeType: "image/png" },
+      { type: "image", data: "two", mimeType: "image/jpeg" },
     ];
     gate.attachExecution({
       compact: async () => ({ ok: true }),
@@ -1258,7 +1258,7 @@ describe("MainSessionCheckpointGate", () => {
           expect(gate.authorizeReplay({ ...base, images: [images[0]] })).toBeUndefined();
           expect(gate.authorizeReplay({ ...base, images: [images[1], images[0]] })).toBeUndefined();
           expect(gate.authorizeReplay({
-            ...base, images: [{ ...images[0], metadata: { label: "changed" } }, images[1]],
+            ...base, images: [{ ...images[0], unsupported: true }, images[1]],
           })).toBeUndefined();
           expect(gate.authorizeReplay({
             ...base, images: [{ type: "image", data: 1, mimeType: "image/png" }, images[1]],

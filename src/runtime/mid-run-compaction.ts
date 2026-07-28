@@ -1010,89 +1010,79 @@ function acceptedContent(text: string, images: readonly unknown[] | undefined): 
   return images?.length ? [{ type: "text", text }, ...images] : text;
 }
 
-type ReconciliationValue = null | boolean | number | string | ReconciliationValue[] | ReconciliationRecord;
-interface ReconciliationRecord { readonly [key: string]: ReconciliationValue }
+interface ReconciliationTextBlock { readonly type: "text"; readonly text: string }
+interface ReconciliationImageBlock { readonly type: "image"; readonly data: string; readonly mimeType: string }
+type ReconciliationBlock = ReconciliationTextBlock | ReconciliationImageBlock;
 type ReconciliationContent =
   | { kind: "text"; text: string }
-  | { kind: "blocks"; blocks: readonly ReconciliationRecord[] };
+  | { kind: "blocks"; blocks: readonly ReconciliationBlock[] };
 
-function reconciliationValue(value: unknown, active = new WeakSet<object>()): ReconciliationValue | undefined {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
-  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
-  if (typeof value !== "object" || active.has(value)) return undefined;
-  active.add(value);
+function exactOwnDataFields(value: unknown, keys: readonly string[]): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   try {
-    if (Array.isArray(value)) {
-      const result: ReconciliationValue[] = [];
-      for (const item of value) {
-        const parsed = reconciliationValue(item, active);
-        if (parsed === undefined) return undefined;
-        result.push(parsed);
-      }
-      return result;
-    }
-    const prototype = Object.getPrototypeOf(value);
-    if ((prototype !== Object.prototype && prototype !== null) || Object.getOwnPropertySymbols(value).length > 0) {
-      return undefined;
-    }
-    const result = Object.create(null) as Record<string, ReconciliationValue>;
-    for (const key of Object.keys(value)) {
+    if (Object.getPrototypeOf(value) !== Object.prototype || Object.getOwnPropertySymbols(value).length > 0) return undefined;
+    const names = Object.getOwnPropertyNames(value);
+    if (names.length !== keys.length || keys.some((key) => !names.includes(key))) return undefined;
+    const fields: Record<string, unknown> = {};
+    for (const key of keys) {
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (!descriptor || !("value" in descriptor)) return undefined;
-      const parsed = reconciliationValue(descriptor.value, active);
-      if (parsed === undefined) return undefined;
-      result[key] = parsed;
+      fields[key] = descriptor.value;
     }
-    return result;
+    return fields;
   } catch {
     return undefined;
-  } finally {
-    active.delete(value);
   }
+}
+
+function reconciliationBlock(value: unknown): ReconciliationBlock | undefined {
+  const text = exactOwnDataFields(value, ["type", "text"]);
+  if (text?.type === "text" && typeof text.text === "string") return { type: "text", text: text.text };
+  const image = exactOwnDataFields(value, ["type", "data", "mimeType"]);
+  if (image?.type === "image" && typeof image.data === "string" && typeof image.mimeType === "string") {
+    return { type: "image", data: image.data, mimeType: image.mimeType };
+  }
+  return undefined;
 }
 
 function reconciliationContent(value: unknown): ReconciliationContent | undefined {
   if (typeof value === "string") return { kind: "text", text: value };
-  if (!Array.isArray(value) || value.length === 0) return undefined;
-  const blocks: ReconciliationRecord[] = [];
-  for (const candidate of value) {
-    const block = reconciliationValue(candidate);
-    if (!block || Array.isArray(block) || typeof block !== "object") return undefined;
-    if (block.type === "text") {
-      if (typeof block.text !== "string") return undefined;
-    } else if (block.type === "image") {
-      if (typeof block.data !== "string" || typeof block.mimeType !== "string") return undefined;
-    } else {
-      return undefined;
+  if (!Array.isArray(value)) return undefined;
+  try {
+    if (Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0) return undefined;
+    const names = Object.getOwnPropertyNames(value);
+    if (value.length === 0 || names.length !== value.length + 1 || !names.includes("length")) return undefined;
+    const blocks: ReconciliationBlock[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !("value" in descriptor)) return undefined;
+      const block = reconciliationBlock(descriptor.value);
+      if (!block) return undefined;
+      blocks.push(block);
     }
-    blocks.push(block);
+    return { kind: "blocks", blocks };
+  } catch {
+    return undefined;
   }
-  return { kind: "blocks", blocks };
 }
 
-function reconciliationValueEqual(left: ReconciliationValue, right: ReconciliationValue): boolean {
-  if (Object.is(left, right)) return true;
-  if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) return false;
-  if (Array.isArray(left) || Array.isArray(right)) {
-    return Array.isArray(left) && Array.isArray(right) && left.length === right.length &&
-      left.every((value, index) => reconciliationValueEqual(value, right[index]!));
-  }
-  const leftKeys = Object.keys(left).sort();
-  const rightKeys = Object.keys(right).sort();
-  return leftKeys.length === rightKeys.length && leftKeys.every((key, index) =>
-    key === rightKeys[index] && reconciliationValueEqual(left[key]!, right[key]!));
+function reconciliationBlockEqual(left: ReconciliationBlock, right: ReconciliationBlock): boolean {
+  if (left.type !== right.type) return false;
+  return left.type === "text"
+    ? left.text === (right as ReconciliationTextBlock).text
+    : left.data === (right as ReconciliationImageBlock).data && left.mimeType === (right as ReconciliationImageBlock).mimeType;
 }
 
 function reconciliationContentEqual(left: ReconciliationContent, right: ReconciliationContent): boolean {
-  if (left.kind === "text" || right.kind === "text") {
-    const text = left.kind === "text" ? left : right.kind === "text" ? right : undefined;
-    const blocks = left.kind === "blocks" ? left.blocks : right.kind === "blocks" ? right.blocks : undefined;
-    if (!text || !blocks || blocks.length !== 1) return left.kind === "text" && right.kind === "text" && left.text === right.text;
-    const [block] = blocks;
-    return block !== undefined && Object.keys(block).length === 2 && block.type === "text" && block.text === text.text;
+  if (left.kind === "text") {
+    if (right.kind === "text") return left.text === right.text;
+    return right.blocks.length === 1 && right.blocks[0]?.type === "text" && right.blocks[0].text === left.text;
+  }
+  if (right.kind === "text") {
+    return left.blocks.length === 1 && left.blocks[0]?.type === "text" && left.blocks[0].text === right.text;
   }
   return left.blocks.length === right.blocks.length &&
-    left.blocks.every((block, index) => reconciliationValueEqual(block, right.blocks[index]!));
+    left.blocks.every((block, index) => reconciliationBlockEqual(block, right.blocks[index]!));
 }
 
 interface ExpectedInput {
