@@ -1006,28 +1006,107 @@ function toolCallIds(message: unknown): string[] {
     .map((block) => block.id);
 }
 
-function canonical(value: unknown, seen = new WeakSet<object>()): string {
-  if (value === undefined) return "u";
-  if (value === null) return "n";
-  if (typeof value === "string") return `s${value.length}:${value}`;
-  if (typeof value === "boolean") return value ? "b1" : "b0";
-  if (typeof value === "number") return `d${Number.isNaN(value) ? "nan" : String(value)}`;
-  if (typeof value !== "object") return `${typeof value}:${String(value)}`;
-  if (seen.has(value)) return "circular";
-  seen.add(value);
-  if (Array.isArray(value)) return `a[${value.map((item) => canonical(item, seen)).join(",")}]`;
-  const record = value as Record<string, unknown>;
-  return `o{${Object.keys(record).sort().map((key) => `${canonical(key)}=${canonical(record[key], seen)}`).join(",")}}`;
-}
-
 function acceptedContent(text: string, images: readonly unknown[] | undefined): QueueContent {
   return images?.length ? [{ type: "text", text }, ...images] : text;
 }
 
+type ReconciliationValue = null | boolean | number | string | ReconciliationValue[] | ReconciliationRecord;
+interface ReconciliationRecord { readonly [key: string]: ReconciliationValue }
+type ReconciliationContent =
+  | { kind: "text"; text: string }
+  | { kind: "blocks"; blocks: readonly ReconciliationRecord[] };
+
+function reconciliationValue(value: unknown, active = new WeakSet<object>()): ReconciliationValue | undefined {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== "object" || active.has(value)) return undefined;
+  active.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const result: ReconciliationValue[] = [];
+      for (const item of value) {
+        const parsed = reconciliationValue(item, active);
+        if (parsed === undefined) return undefined;
+        result.push(parsed);
+      }
+      return result;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if ((prototype !== Object.prototype && prototype !== null) || Object.getOwnPropertySymbols(value).length > 0) {
+      return undefined;
+    }
+    const result = Object.create(null) as Record<string, ReconciliationValue>;
+    for (const key of Object.keys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !("value" in descriptor)) return undefined;
+      const parsed = reconciliationValue(descriptor.value, active);
+      if (parsed === undefined) return undefined;
+      result[key] = parsed;
+    }
+    return result;
+  } catch {
+    return undefined;
+  } finally {
+    active.delete(value);
+  }
+}
+
+function reconciliationContent(value: unknown): ReconciliationContent | undefined {
+  if (typeof value === "string") return { kind: "text", text: value };
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const blocks: ReconciliationRecord[] = [];
+  for (const candidate of value) {
+    const block = reconciliationValue(candidate);
+    if (!block || Array.isArray(block) || typeof block !== "object") return undefined;
+    if (block.type === "text") {
+      if (typeof block.text !== "string") return undefined;
+    } else if (block.type === "image") {
+      if (typeof block.data !== "string" || typeof block.mimeType !== "string") return undefined;
+    } else {
+      return undefined;
+    }
+    blocks.push(block);
+  }
+  return { kind: "blocks", blocks };
+}
+
+function reconciliationValueEqual(left: ReconciliationValue, right: ReconciliationValue): boolean {
+  if (Object.is(left, right)) return true;
+  if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) return false;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right) && left.length === right.length &&
+      left.every((value, index) => reconciliationValueEqual(value, right[index]!));
+  }
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  return leftKeys.length === rightKeys.length && leftKeys.every((key, index) =>
+    key === rightKeys[index] && reconciliationValueEqual(left[key]!, right[key]!));
+}
+
+function reconciliationContentEqual(left: ReconciliationContent, right: ReconciliationContent): boolean {
+  if (left.kind === "text" || right.kind === "text") {
+    const text = left.kind === "text" ? left : right.kind === "text" ? right : undefined;
+    const blocks = left.kind === "blocks" ? left.blocks : right.kind === "blocks" ? right.blocks : undefined;
+    if (!text || !blocks || blocks.length !== 1) return left.kind === "text" && right.kind === "text" && left.text === right.text;
+    const [block] = blocks;
+    return block !== undefined && Object.keys(block).length === 2 && block.type === "text" && block.text === text.text;
+  }
+  return left.blocks.length === right.blocks.length &&
+    left.blocks.every((block, index) => reconciliationValueEqual(block, right.blocks[index]!));
+}
+
 interface ExpectedInput {
   content: QueueContent;
-  canonical: string;
+  reconciliation: ReconciliationContent | undefined;
   delivery: QueueDeliveryMode;
+}
+
+interface TrackedInputOccurrence extends ExpectedInput {
+  epoch: object;
+  sessionId: string;
+  generation: number;
+  shadow: QueuedInputShadow;
+  pendingHostStart: boolean;
 }
 
 interface ReplayAuthorization {
@@ -1035,7 +1114,7 @@ interface ReplayAuthorization {
   sessionId: string;
   generation: number;
   shadow: QueuedInputShadow;
-  canonical: string;
+  reconciliation: ReconciliationContent;
   source: string;
   mode: QueueDeliveryMode;
   used: boolean;
@@ -1052,6 +1131,7 @@ export class MainSessionCheckpointGate {
   private batch: MainBatchObservation = { run: {}, ids: [], final: new Map(), successful: new Map() };
   private abortIssued: { generation: number; run: object } | undefined;
   private acceptedBeforeArm: ExpectedInput[] = [];
+  private trackedOccurrences: TrackedInputOccurrence[] = [];
   private ambiguousInput = false;
   private sessionEpoch: object = {};
   /** Opaque identity of the user-visible logical run; physical checkpoint runs retain it. */
@@ -1300,8 +1380,12 @@ export class MainSessionCheckpointGate {
 
   withReplayAuthorization<T>(input: QueuedInputShadow, operation: () => T, source = "extension"): T {
     const current = this.controller.queuedInputSnapshot().find((entry) => entry === input);
-    if (this.controller.snapshot().phase !== "resuming" || !current ||
-        input.sessionId !== this.controller.sessionId || input.generation !== this.generation) {
+    const occurrence = this.trackedOccurrences.find((entry) => entry.shadow === input && !entry.pendingHostStart);
+    const reconciliation = reconciliationContent(input.content);
+    if (this.controller.snapshot().phase !== "resuming" || !current || !occurrence || !reconciliation ||
+        occurrence.epoch !== this.sessionEpoch || occurrence.sessionId !== this.controller.sessionId ||
+        occurrence.generation !== this.generation || input.sessionId !== this.controller.sessionId ||
+        input.generation !== this.generation) {
       throw new Error("Cannot authorize stale checkpoint replay");
     }
     return replayAuthorization.run({
@@ -1309,7 +1393,7 @@ export class MainSessionCheckpointGate {
       sessionId: input.sessionId,
       generation: input.generation,
       shadow: input,
-      canonical: canonical(input.content),
+      reconciliation,
       source,
       mode: input.delivery,
       used: false,
@@ -1324,13 +1408,20 @@ export class MainSessionCheckpointGate {
   }): QueuedInputShadow | undefined {
     const authorization = replayAuthorization.getStore();
     const phase = this.controller.snapshot().phase;
+    const observed = typeof event.text === "string"
+      ? reconciliationContent(acceptedContent(event.text, event.images))
+      : undefined;
+    const occurrence = authorization && this.trackedOccurrences.find((entry) =>
+      entry.shadow === authorization.shadow && !entry.pendingHostStart);
     if (!authorization || authorization.used || authorization.gate !== this.sessionEpoch ||
-        phase !== "resuming" ||
+        phase !== "resuming" || !observed || !occurrence || occurrence.epoch !== this.sessionEpoch ||
+        occurrence.sessionId !== this.controller.sessionId || occurrence.generation !== this.generation ||
         authorization.sessionId !== this.controller.sessionId || authorization.generation !== this.generation ||
         event.source !== authorization.source || event.streamingBehavior !== authorization.mode ||
-        canonical(acceptedContent(String(event.text ?? ""), event.images)) !== authorization.canonical ||
+        !reconciliationContentEqual(observed, authorization.reconciliation) ||
         !this.controller.queuedInputSnapshot().some((entry) => entry === authorization.shadow)) return undefined;
     authorization.used = true;
+    occurrence.pendingHostStart = true;
     return authorization.shadow;
   }
 
@@ -1345,35 +1436,75 @@ export class MainSessionCheckpointGate {
     this.arm(ctx);
     const effectiveDelivery = delivery ?? (this.generation === undefined ? undefined : "followUp");
     if (!effectiveDelivery) return undefined;
-    const expected = { content, canonical: canonical(content), delivery: effectiveDelivery };
+    const expected = { content, reconciliation: reconciliationContent(content), delivery: effectiveDelivery };
     if (this.generation === undefined) {
       this.acceptedBeforeArm.push(expected);
       return undefined;
     }
-    return this.controller.shadowInput(this.generation, content, effectiveDelivery);
+    return this.trackShadow(this.controller.shadowInput(this.generation, content, effectiveDelivery), expected);
   }
 
   userMessageStarted(message: unknown, delivery?: QueueDeliveryMode): QueuedInputShadow | undefined {
+    this.resetCompletedGeneration();
     if (!message || typeof message !== "object" || (message as { role?: string }).role !== "user") return undefined;
-    const messageCanonical = canonical((message as { content?: unknown }).content);
+    const observed = reconciliationContent((message as { content?: unknown }).content);
     if (this.generation === undefined) {
-      const index = this.acceptedBeforeArm.findIndex((entry) =>
-        entry.canonical === messageCanonical && (delivery === undefined || entry.delivery === delivery));
-      if (index >= 0) this.acceptedBeforeArm.splice(index, 1);
-      else if (this.acceptedBeforeArm.length > 0) this.ambiguousInput = true;
+      const eligible = this.eligibleOccurrence(this.acceptedBeforeArm, delivery);
+      if (eligible && observed && eligible.reconciliation && reconciliationContentEqual(eligible.reconciliation, observed)) {
+        this.acceptedBeforeArm.splice(this.acceptedBeforeArm.indexOf(eligible), 1);
+      } else if (this.acceptedBeforeArm.length > 0) {
+        this.ambiguousInput = true;
+      }
       return undefined;
     }
-    const match = this.controller.queuedInputSnapshot().find((entry) =>
-      entry.generation === this.generation && entry.sessionId === this.controller.sessionId &&
-      canonical(entry.content) === messageCanonical && (delivery === undefined || entry.delivery === delivery));
-    if (!match) {
-      if (this.controller.queuedInputSnapshot().length > 0) {
+    const current = this.trackedOccurrences.filter((entry) =>
+      entry.epoch === this.sessionEpoch && entry.sessionId === this.controller.sessionId &&
+      entry.generation === this.generation);
+    const eligible = this.eligibleOccurrence(current, delivery);
+    if (!eligible || !observed || !eligible.reconciliation ||
+        !reconciliationContentEqual(eligible.reconciliation, observed)) {
+      if (current.length > 0 || this.controller.queuedInputSnapshot().length > 0) {
         this.ambiguousInput = true;
         this.invalidate();
       }
       return undefined;
     }
-    return this.controller.consumeShadow(this.generation, match.id, this.controller.sessionId);
+    this.trackedOccurrences.splice(this.trackedOccurrences.indexOf(eligible), 1);
+    // Host acceptance transferred delivery already; its callback must not consume newer shadow ownership.
+    if (eligible.pendingHostStart) return eligible.shadow;
+    const consumed = this.controller.consumeShadow(this.generation, eligible.shadow.id, this.controller.sessionId);
+    if (!consumed) {
+      this.ambiguousInput = true;
+      this.invalidate();
+    }
+    return consumed;
+  }
+
+  private eligibleOccurrence<T extends { delivery: QueueDeliveryMode; pendingHostStart?: boolean }>(
+    occurrences: readonly T[],
+    delivery: QueueDeliveryMode | undefined,
+  ): T | undefined {
+    if (delivery !== undefined) {
+      return occurrences.find((entry) => entry.pendingHostStart === true && entry.delivery === delivery) ??
+        occurrences.find((entry) => entry.delivery === delivery);
+    }
+    const pending = occurrences.filter((entry) => entry.pendingHostStart === true);
+    const eligible = pending.length > 0 ? pending : occurrences;
+    return eligible.find((entry) => entry.delivery === "steer") ??
+      eligible.find((entry) => entry.delivery === "followUp");
+  }
+
+  private trackShadow(shadow: QueuedInputShadow | undefined, expected: ExpectedInput): QueuedInputShadow | undefined {
+    if (!shadow) return undefined;
+    this.trackedOccurrences.push({
+      ...expected,
+      epoch: this.sessionEpoch,
+      sessionId: shadow.sessionId,
+      generation: shadow.generation,
+      shadow,
+      pendingHostStart: false,
+    });
+    return shadow;
   }
 
   private successfulTool(id: string, result: Record<string, unknown>, ctx: MainGateContext | undefined): Record<string, unknown> {
@@ -1408,7 +1539,7 @@ export class MainSessionCheckpointGate {
     if (generation !== undefined) {
       this.generation = generation;
       for (const accepted of this.acceptedBeforeArm.splice(0)) {
-        this.controller.shadowInput(generation, accepted.content, accepted.delivery);
+        this.trackShadow(this.controller.shadowInput(generation, accepted.content, accepted.delivery), accepted);
       }
       this.beginBatch();
       if (this.ambiguousInput && this.handle) this.controller.invalidateToolBatch(this.handle);
@@ -1425,6 +1556,7 @@ export class MainSessionCheckpointGate {
     this.generation = undefined;
     this.handle = undefined;
     this.abortIssued = undefined;
+    this.trackedOccurrences = [];
     this.ambiguousInput = false;
     this.resumeBarrier = undefined;
   }
@@ -1511,6 +1643,7 @@ export class MainSessionCheckpointGate {
     this.batch = { run: {}, ids: [], final: new Map(), successful: new Map() };
     this.abortIssued = undefined;
     this.acceptedBeforeArm = [];
+    this.trackedOccurrences = [];
     this.ambiguousInput = false;
     this.sessionEpoch = {};
     this.resumeBarrier = undefined;

@@ -983,7 +983,7 @@ describe("MainSessionCheckpointGate", () => {
     expect(aborts).toBe(1);
   });
 
-  it("shadows only accepted streaming input and reconciles canonical duplicate text by image identity", () => {
+  it("shadows accepted streaming occurrences and reconciles exact image content", () => {
     const { controller, gate } = setup();
     gate.assistantMessageEnded(assistant("a"));
     const ctx = { model: { api: "openai-completions" }, getContextUsage: () => usage };
@@ -999,11 +999,11 @@ describe("MainSessionCheckpointGate", () => {
     expect(gate.userMessageStarted({ role: "user", content: first.content })).toBe(first);
     expect(controller.queuedInputSnapshot()).toEqual([second, modeLess]);
     expect(gate.userMessageStarted({ role: "user", content: second.content })).toBe(second);
-    expect(gate.userMessageStarted({ role: "user", content: modeLess.content })).toBe(modeLess);
+    expect(gate.userMessageStarted({ role: "user", content: [{ type: "text", text: "mode-less" }] })).toBe(modeLess);
     expect(controller.queuedInputSnapshot()).toEqual([]);
   });
 
-  it("reconciles canonical-identical duplicate shadows FIFO and uses delivery metadata when available", () => {
+  it("reconciles identical duplicate shadows FIFO and uses delivery metadata when available", () => {
     const { controller, gate } = setup();
     gate.assistantMessageEnded(assistant("a"));
     const ctx = { model: { api: "openai-completions" }, getContextUsage: () => usage };
@@ -1011,19 +1011,20 @@ describe("MainSessionCheckpointGate", () => {
     const second = gate.captureAcceptedInput(ctx, "identical", undefined, "steer")!;
     const followUp = gate.captureAcceptedInput(ctx, "identical", undefined, "followUp")!;
 
-    expect(gate.userMessageStarted({ role: "user", content: "identical" }, "followUp")).toBe(followUp);
-    expect(gate.userMessageStarted({ role: "user", content: "identical" })).toBe(first);
-    expect(gate.userMessageStarted({ role: "user", content: "identical" }, "steer")).toBe(second);
+    const piMessage = { role: "user", content: [{ type: "text", text: "identical" }] };
+    expect(gate.userMessageStarted(piMessage, "followUp")).toBe(followUp);
+    expect(gate.userMessageStarted(piMessage)).toBe(first);
+    expect(gate.userMessageStarted(piMessage, "steer")).toBe(second);
     expect(controller.queuedInputSnapshot()).toEqual([]);
   });
 
-  it("reconciles canonical-identical accepted inputs FIFO before the threshold arms", () => {
+  it("reconciles one below-threshold string occurrence from Pi's text-block message before arming", () => {
     const { controller, gate } = setup();
     gate.assistantMessageEnded(assistant("a"));
     const low = { model: { api: "openai-responses" }, getContextUsage: () => ({ ...usage, percent: 89 }) };
     gate.captureAcceptedInput(low, "identical", undefined, "steer");
     gate.captureAcceptedInput(low, "identical", undefined, "steer");
-    gate.userMessageStarted({ role: "user", content: "identical" });
+    gate.userMessageStarted({ role: "user", content: [{ type: "text", text: "identical" }] });
 
     const high = { ...low, getContextUsage: () => usage };
     gate.captureAcceptedInput(high, "later", undefined, "followUp");
@@ -1031,6 +1032,114 @@ describe("MainSessionCheckpointGate", () => {
       ["identical", "steer"],
       ["later", "followUp"],
     ]);
+  });
+
+  it("selects the steering head before an earlier accepted identical follow-up when mode is absent", () => {
+    const { controller, gate } = setup();
+    gate.assistantMessageEnded(assistant("a"));
+    const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage };
+    const followUp = gate.captureAcceptedInput(ctx, "same", undefined, "followUp")!;
+    const steer = gate.captureAcceptedInput(ctx, "same", undefined, "steer")!;
+    const piMessage = { role: "user", content: [{ type: "text", text: "same" }] };
+
+    expect(gate.userMessageStarted(piMessage)).toBe(steer);
+    expect(controller.queuedInputSnapshot()).toEqual([followUp]);
+    expect(gate.userMessageStarted(piMessage)).toBe(followUp);
+    expect(controller.queuedInputSnapshot()).toEqual([]);
+  });
+
+  it("does not probe follow-up when a mode-less observation mismatches the steering head", async () => {
+    const { controller, gate } = setup();
+    gate.assistantMessageEnded(assistant("a"));
+    const ctx = {
+      model: { api: "openai-responses" }, getContextUsage: () => usage,
+      hasPendingMessages: () => false, abort: vi.fn(),
+    };
+    const steer = gate.captureAcceptedInput(ctx, "A", undefined, "steer")!;
+    const followUp = gate.captureAcceptedInput(ctx, "B", undefined, "followUp")!;
+
+    expect(gate.userMessageStarted({ role: "user", content: [{ type: "text", text: "B" }] })).toBeUndefined();
+    expect(controller.queuedInputSnapshot()).toEqual([steer, followUp]);
+    const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => ({ content: [], details: {} }) });
+    const result = await wrapped.execute("a", {}, undefined, undefined, ctx);
+    gate.toolExecutionEnded({ toolCallId: "a", result, isError: false });
+    expect(gate.turnEnded(ctx)?.stop).toBe("abort");
+  });
+
+  it.each([
+    ["out-of-head", [{ type: "text", text: "later" }]],
+    ["malformed", [{ type: "text", text: 1 }]],
+    ["unknown", [{ type: "audio", data: "bytes" }]],
+    ["mismatched", [{ type: "text", text: "other" }]],
+  ])("leaves ownership intact and invalidates the clean path for an %s observation", async (_kind, content) => {
+    const { controller, gate } = setup();
+    gate.assistantMessageEnded(assistant("a"));
+    const ctx = {
+      model: { api: "openai-responses" }, getContextUsage: () => usage,
+      hasPendingMessages: () => false, abort: vi.fn(),
+    };
+    const head = gate.captureAcceptedInput(ctx, "head", undefined, "steer")!;
+    const later = gate.captureAcceptedInput(ctx, "later", undefined, "steer")!;
+
+    expect(gate.userMessageStarted({ role: "user", content })).toBeUndefined();
+    expect(controller.queuedInputSnapshot()).toEqual([head, later]);
+    const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => ({ content: [], details: {} }) });
+    const result = await wrapped.execute("a", {}, undefined, undefined, ctx);
+    gate.toolExecutionEnded({ toolCallId: "a", result, isError: false });
+    expect(gate.turnEnded(ctx)?.stop).toBe("abort");
+  });
+
+  it.each([
+    ["leading whitespace", " exact", "exact"],
+    ["trailing whitespace", "exact ", "exact"],
+    ["internal whitespace", "ex act", "exact"],
+    ["case", "Exact", "exact"],
+    ["Unicode normalization", "é", "e\u0301"],
+  ])("preserves exact text across %s differences", (_kind, expected, observed) => {
+    const { controller, gate } = setup();
+    gate.assistantMessageEnded(assistant("a"));
+    const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage };
+    const shadow = gate.captureAcceptedInput(ctx, expected, undefined, "steer")!;
+
+    expect(gate.userMessageStarted({ role: "user", content: [{ type: "text", text: observed }] })).toBeUndefined();
+    expect(controller.queuedInputSnapshot()).toEqual([shadow]);
+  });
+
+  it("matches cloned image blocks structurally and completely", () => {
+    const { controller, gate } = setup();
+    gate.assistantMessageEnded(assistant("a"));
+    const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage };
+    const images = [
+      { type: "image", data: "one", mimeType: "image/png", metadata: { label: "first" } },
+      { type: "image", data: "two", mimeType: "image/jpeg", metadata: { label: "second" } },
+    ];
+    const shadow = gate.captureAcceptedInput(ctx, "images", images, "steer")!;
+    const clone = structuredClone(shadow.content);
+
+    expect(gate.userMessageStarted({ role: "user", content: clone })).toBe(shadow);
+    expect(controller.queuedInputSnapshot()).toEqual([]);
+  });
+
+  it.each([
+    ["bytes", (blocks: any[]) => { blocks[1].data = "changed"; }],
+    ["MIME type", (blocks: any[]) => { blocks[1].mimeType = "image/gif"; }],
+    ["count", (blocks: any[]) => { blocks.pop(); }],
+    ["order", (blocks: any[]) => { [blocks[1], blocks[2]] = [blocks[2], blocks[1]]; }],
+    ["represented fields", (blocks: any[]) => { blocks[1].metadata.label = "changed"; }],
+  ])("does not reconcile image content with changed %s", (_kind, mutate) => {
+    const { controller, gate } = setup();
+    gate.assistantMessageEnded(assistant("a"));
+    const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage };
+    const images = [
+      { type: "image", data: "one", mimeType: "image/png", metadata: { label: "first" } },
+      { type: "image", data: "two", mimeType: "image/jpeg", metadata: { label: "second" } },
+    ];
+    const shadow = gate.captureAcceptedInput(ctx, "images", images, "steer")!;
+    const observed = structuredClone(shadow.content) as any[];
+    mutate(observed);
+
+    expect(gate.userMessageStarted({ role: "user", content: observed })).toBeUndefined();
+    expect(controller.queuedInputSnapshot()).toEqual([shadow]);
   });
 
   it("retains accepted below-threshold input if the completed batch later crosses", async () => {
@@ -1118,6 +1227,198 @@ describe("MainSessionCheckpointGate", () => {
     expect(gate.authorizeReplay({
       text: "accepted", images: [image], source: "extension", streamingBehavior: "steer",
     })).toBeUndefined();
+  });
+
+  it("keeps replay authorization source, mode, content, image structure, and one-shot bound", async () => {
+    const { controller, gate } = setup();
+    const settlement = deferred<void>();
+    const images = [
+      { type: "image", data: "one", mimeType: "image/png", metadata: { label: "first" } },
+      { type: "image", data: "two", mimeType: "image/jpeg", metadata: { label: "second" } },
+    ];
+    gate.attachExecution({
+      compact: async () => ({ ok: true }),
+      resume: () => ({
+        settled: settlement.promise,
+        replay: async (input) => gate.withReplayAuthorization(input, () => {
+          const base = { text: "accepted", images: structuredClone(images), source: "extension", streamingBehavior: "steer" };
+          expect(() => gate.withReplayAuthorization(structuredClone(input), () => undefined)).toThrow(/stale/);
+          const mutable = input as { sessionId: string; generation: number };
+          mutable.sessionId = "forged-session";
+          expect(() => gate.withReplayAuthorization(input, () => undefined)).toThrow(/stale/);
+          mutable.sessionId = controller.sessionId;
+          mutable.generation += 1;
+          expect(() => gate.withReplayAuthorization(input, () => undefined)).toThrow(/stale/);
+          mutable.generation -= 1;
+          expect(gate.authorizeReplay({ ...base, source: "interactive" })).toBeUndefined();
+          expect(gate.authorizeReplay({ ...base, streamingBehavior: "followUp" })).toBeUndefined();
+          expect(gate.authorizeReplay({ ...base, text: "changed" })).toBeUndefined();
+          expect(gate.authorizeReplay({ ...base, images: [{ ...images[0], data: "changed" }, images[1]] })).toBeUndefined();
+          expect(gate.authorizeReplay({ ...base, images: [{ ...images[0], mimeType: "image/gif" }, images[1]] })).toBeUndefined();
+          expect(gate.authorizeReplay({ ...base, images: [images[0]] })).toBeUndefined();
+          expect(gate.authorizeReplay({ ...base, images: [images[1], images[0]] })).toBeUndefined();
+          expect(gate.authorizeReplay({
+            ...base, images: [{ ...images[0], metadata: { label: "changed" } }, images[1]],
+          })).toBeUndefined();
+          expect(gate.authorizeReplay({
+            ...base, images: [{ type: "image", data: 1, mimeType: "image/png" }, images[1]],
+          })).toBeUndefined();
+          expect(gate.authorizeReplay({
+            ...base, images: [{ type: "audio", data: "unknown", mimeType: "audio/wav" }, images[1]],
+          })).toBeUndefined();
+          expect(gate.authorizeReplay(base)).toBe(input);
+          expect(gate.authorizeReplay(base)).toBeUndefined();
+          return { delivered: true as const };
+        }),
+        replayComplete: () => { settlement.resolve(); },
+        cancelAndJoin: async () => settlement.promise,
+      }),
+    });
+    gate.assistantMessageEnded(assistant("a"));
+    const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage, hasPendingMessages: () => false };
+    gate.captureAcceptedInput(ctx, "accepted", images, "steer");
+    const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => ({ content: [], details: {} }) });
+    const result = await wrapped.execute("a", {}, undefined, undefined, ctx);
+    gate.toolExecutionEnded({ toolCallId: "a", result, isError: false });
+    gate.turnEnded(ctx);
+
+    await controller.checkpoint(controller.snapshot().generation);
+    expect(controller.snapshot().phase).toBe("idle");
+  });
+
+  it("retires a pending follow-up replay before a newer identical steer shadow", async () => {
+    const { controller, gate } = setup();
+    const settlement = deferred<void>();
+    const firstAuthorized = deferred<QueuedInputShadow>();
+    const releaseFirst = deferred<void>();
+    let replayCalls = 0;
+    let newer: QueuedInputShadow | undefined;
+    gate.attachExecution({
+      compact: async () => ({ ok: true }),
+      resume: () => ({
+        settled: settlement.promise,
+        replay: async (input) => {
+          replayCalls += 1;
+          const accepted = gate.withReplayAuthorization(input, () => gate.authorizeReplay({
+            text: "same", source: "extension", streamingBehavior: input.delivery,
+          }));
+          expect(accepted).toBe(input);
+          if (replayCalls === 1) {
+            firstAuthorized.resolve(input);
+            await releaseFirst.promise;
+          } else {
+            expect(input).toBe(newer);
+            expect(gate.userMessageStarted({
+              role: "user", content: [{ type: "text", text: "same" }],
+            })).toBe(newer);
+          }
+          return { delivered: true as const };
+        },
+        replayComplete: () => { settlement.resolve(); },
+        cancelAndJoin: async () => settlement.promise,
+      }),
+    });
+    gate.assistantMessageEnded(assistant("a"));
+    const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage, hasPendingMessages: () => false };
+    const first = gate.captureAcceptedInput(ctx, "same", undefined, "followUp")!;
+    const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => ({ content: [], details: {} }) });
+    const result = await wrapped.execute("a", {}, undefined, undefined, ctx);
+    gate.toolExecutionEnded({ toolCallId: "a", result, isError: false });
+    gate.turnEnded(ctx);
+    const checkpoint = controller.checkpoint(controller.snapshot().generation);
+
+    expect(await firstAuthorized.promise).toBe(first);
+    newer = gate.captureAcceptedInput(ctx, "same", undefined, "steer")!;
+    expect(gate.userMessageStarted({ role: "user", content: [{ type: "text", text: "same" }] })).toBe(first);
+    expect(controller.queuedInputSnapshot()).toEqual([first, newer]);
+    releaseFirst.resolve();
+    await checkpoint;
+    expect(replayCalls).toBe(2);
+    expect(controller.snapshot().phase).toBe("idle");
+  });
+
+  it("revokes a pending replay tombstone after a successful generation reset", async () => {
+    const { controller, gate } = setup();
+    const settlement = deferred<void>();
+    let retired: QueuedInputShadow | undefined;
+    gate.attachExecution({
+      compact: async () => ({ ok: true }),
+      resume: () => ({
+        settled: settlement.promise,
+        replay: async (input) => {
+          retired = gate.withReplayAuthorization(input, () => gate.authorizeReplay({
+            text: "retired", source: "extension", streamingBehavior: "followUp",
+          }));
+          return { delivered: true as const };
+        },
+        replayComplete: () => { settlement.resolve(); },
+        cancelAndJoin: async () => settlement.promise,
+      }),
+    });
+    gate.assistantMessageEnded(assistant("a"));
+    const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage, hasPendingMessages: () => false };
+    const old = gate.captureAcceptedInput(ctx, "retired", undefined, "followUp")!;
+    const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => ({ content: [], details: {} }) });
+    const result = await wrapped.execute("a", {}, undefined, undefined, ctx);
+    gate.toolExecutionEnded({ toolCallId: "a", result, isError: false });
+    gate.turnEnded(ctx);
+    await controller.checkpoint(controller.snapshot().generation);
+
+    expect(retired).toBe(old);
+    expect(controller.snapshot().phase).toBe("idle");
+    gate.assistantMessageEnded(assistant("b"));
+    const current = gate.captureAcceptedInput(ctx, "current", undefined, "steer")!;
+    expect(() => gate.withReplayAuthorization(old, () => undefined)).toThrow(/stale/);
+    expect(gate.userMessageStarted({
+      role: "user", content: [{ type: "text", text: "current" }],
+    })).toBe(current);
+    expect(controller.queuedInputSnapshot()).toEqual([]);
+  });
+
+  it("revokes a pending replay tombstone when the session controller is replaced", async () => {
+    const { controller, gate } = setup();
+    const settlement = deferred<void>();
+    const authorized = deferred<void>();
+    const releaseReplay = deferred<void>();
+    gate.attachExecution({
+      compact: async () => ({ ok: true }),
+      resume: () => ({
+        settled: settlement.promise,
+        replay: async (input) => {
+          expect(gate.withReplayAuthorization(input, () => gate.authorizeReplay({
+            text: "retired", source: "extension", streamingBehavior: "followUp",
+          }))).toBe(input);
+          authorized.resolve();
+          await releaseReplay.promise;
+          return { delivered: true as const };
+        },
+        cancelAndJoin: () => {
+          releaseReplay.resolve();
+          settlement.resolve();
+        },
+      }),
+    });
+    gate.assistantMessageEnded(assistant("a"));
+    const ctx = { model: { api: "openai-responses" }, getContextUsage: () => usage, hasPendingMessages: () => false };
+    const old = gate.captureAcceptedInput(ctx, "retired", undefined, "followUp")!;
+    const wrapped: any = gate.wrapTool({ name: "probe", execute: async () => ({ content: [], details: {} }) });
+    const result = await wrapped.execute("a", {}, undefined, undefined, ctx);
+    gate.toolExecutionEnded({ toolCallId: "a", result, isError: false });
+    gate.turnEnded(ctx);
+    const checkpoint = controller.checkpoint(controller.snapshot().generation);
+    await authorized.promise;
+
+    await gate.startSession("replacement");
+    await checkpoint;
+    const replacement = gate.currentController();
+    expect(replacement).not.toBe(controller);
+    gate.assistantMessageEnded(assistant("b"));
+    const current = gate.captureAcceptedInput(ctx, "replacement current", undefined, "steer")!;
+    expect(() => gate.withReplayAuthorization(old, () => undefined)).toThrow(/stale/);
+    expect(gate.userMessageStarted({
+      role: "user", content: [{ type: "text", text: "replacement current" }],
+    })).toBe(current);
+    expect(replacement.queuedInputSnapshot()).toEqual([]);
   });
 
   it("leaves unmatched shadows intact and invalidates an ambiguous clean path", async () => {
@@ -3679,8 +3980,27 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     const [modeLess] = mainCheckpointGate.currentController().queuedInputSnapshot();
     expect(modeLess).toMatchObject({ content: "mode-less", delivery: "followUp" });
     await pi.fire("message_start", {
-      message: { role: "user", content: "mode-less" }, streamingBehavior: "followUp",
+      message: { role: "user", content: [{ type: "text", text: "mode-less" }] },
     }, high);
+    expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([]);
+
+    for (const streamingBehavior of ["followUp", "followUp", "steer", "steer"] as const) {
+      await expect(pi.fire("input", {
+        text: "identical", source: "interactive", streamingBehavior,
+      }, high)).resolves.toEqual({ action: "handled" });
+    }
+    const duplicates = mainCheckpointGate.currentController().queuedInputSnapshot();
+    expect(duplicates.map((entry) => entry.delivery)).toEqual(["followUp", "followUp", "steer", "steer"]);
+    const duplicateMessage = { message: { role: "user", content: [{ type: "text", text: "identical" }] } };
+    await pi.fire("message_start", duplicateMessage, high);
+    expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([
+      duplicates[0], duplicates[1], duplicates[3],
+    ]);
+    await pi.fire("message_start", duplicateMessage, high);
+    expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([duplicates[0], duplicates[1]]);
+    await pi.fire("message_start", duplicateMessage, high);
+    expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([duplicates[1]]);
+    await pi.fire("message_start", duplicateMessage, high);
     expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([]);
 
     const image = { type: "image", data: "aW1hZ2U=", mimeType: "image/png" };
@@ -3695,13 +4015,14 @@ describe("proactive compaction (offline integration via fake-pi)", () => {
     expect(transformedText).toContain("Expanded: once");
     expect(transformedText.match(/Expanded:/g)).toHaveLength(1);
     expect(shadow?.content).toEqual([{ type: "text", text: transformedText }, image]);
+    const hookCountBeforeReplay = fs.readFileSync(path.join(dir, "input-hook-count"), "utf8");
     expect(() => mainCheckpointGate.withReplayAuthorization(shadow!, () => pi.fire("input", {
       text: transformedText, source: "extension", streamingBehavior: "followUp", images: [image],
     }, high))).toThrow(/stale/);
-    expect(fs.readFileSync(path.join(dir, "input-hook-count"), "utf8")).toBe("xxx");
+    expect(fs.readFileSync(path.join(dir, "input-hook-count"), "utf8")).toBe(hookCountBeforeReplay);
     expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([shadow]);
     await pi.fire("message_start", {
-      message: { role: "user", content: shadow?.content }, streamingBehavior: "followUp",
+      message: { role: "user", content: structuredClone(shadow?.content) },
     }, high);
     expect(mainCheckpointGate.currentController().queuedInputSnapshot()).toEqual([]);
   });
