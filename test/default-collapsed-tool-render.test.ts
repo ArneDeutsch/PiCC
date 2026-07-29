@@ -666,6 +666,79 @@ describe("default-collapsed Read/Bash rendering", () => {
     }
   }));
 
+  it("detaches malformed byte-limit evidence across unrelated keys and nonstandard prototypes only from own data", () => {
+    type ByteResult = {
+      content: Array<Record<string, unknown>>;
+      details: { truncation: Record<string, unknown> };
+      [key: string]: unknown;
+    };
+    const make = () => byteLimitedReadResult("first\nsecond\nthird", {
+      offset: 7, fullFileLines: 40,
+    }) as ByteResult;
+    const recoverable = [
+      (() => { const value = make(); value.future = true; return value; })(),
+      (() => { const value = make(); Object.defineProperty(value.content, "future", { value: true }); return value; })(),
+      (() => { const value = make(); value.content[0]!.future = true; return value; })(),
+      (() => { const value = make(); Object.setPrototypeOf(value, { inherited: true }); return value; })(),
+      (() => { const value = make(); Object.setPrototypeOf(value.content, Object.create(Array.prototype)); return value; })(),
+      (() => { const value = make(); Object.setPrototypeOf(value.content[0]!, { inherited: true }); return value; })(),
+    ];
+
+    withBinding(["alt+e"], () => {
+      for (const value of recoverable) {
+        const tool = definition("read");
+        const state = {};
+        const collapsed = paint(tool, { path: "malformed-shape.txt", offset: 7 }, value,
+          { state, partial: false });
+        expect(collapsed.all).not.toMatch(/\d+ more lines/u);
+        expect(collapsed.call).toContain("unfamiliar result · alt+e to expand");
+        expect(collapsed.detail).toBe("");
+        const expanded = paint(tool, { path: "malformed-shape.txt", offset: 7 }, value,
+          { state, partial: false, expanded: true });
+        expect(expanded.all).not.toMatch(/\d+ more lines/u);
+        expect(expanded.detail).toContain("offset=10 to continue");
+      }
+    });
+    withBinding([], () => {
+      for (const value of recoverable) {
+        const open = paint(definition("read"), { path: "malformed-shape.txt", offset: 7 }, value,
+          { partial: false });
+        expect(open.all).not.toMatch(/\d+ more lines/u);
+        expect(open.detail).toContain("offset=10 to continue");
+        expect(open.call).not.toContain("to expand");
+      }
+    });
+
+    for (const accessor of ["content", "index", "text"] as const) {
+      const value = make();
+      let getterReads = 0;
+      if (accessor === "content") {
+        const content = value.content;
+        Object.defineProperty(value, "content", {
+          enumerable: true, get() { getterReads++; return content; },
+        });
+      } else if (accessor === "index") {
+        const item = value.content[0];
+        Object.defineProperty(value.content, "0", {
+          enumerable: true, get() { getterReads++; return item; },
+        });
+      } else {
+        const text = value.content[0]!.text;
+        Object.defineProperty(value.content[0]!, "text", {
+          enumerable: true, get() { getterReads++; return text; },
+        });
+      }
+      withBinding(["alt+e"], () => {
+        const painted = paint(definition("read"), { path: "accessor-shape.txt", offset: 7 }, value,
+          { partial: false });
+        expect(painted.all).not.toMatch(/\d+ more lines/u);
+        expect(painted.call).not.toContain("to expand");
+        expect(painted.detail).toBe("Unfamiliar result");
+      });
+      expect(getterReads).toBe(0);
+    }
+  });
+
   it("makes whitespace-only malformed byte-limit evidence non-expandable without invoking getters", () => {
     for (const keys of [["alt+e"], []] as const) withBinding([...keys], () => {
       for (const text of ["", "\n\n"]) {

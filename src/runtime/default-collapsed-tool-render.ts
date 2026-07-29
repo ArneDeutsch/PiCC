@@ -675,15 +675,25 @@ function boundedProbe(text: string, operations: DisplayOperationAuthority): stri
   return `${operations.slice(text, 0, EVIDENCE_PREFIX)}\n…\n${operations.slice(text, -EVIDENCE_TAIL)}`;
 }
 
+function ownDataValue(value: unknown, key: PropertyKey): unknown | undefined {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  } catch { return undefined; }
+}
+
 function malformedByteReadEvidence(
   result: unknown,
   operations: DisplayOperationAuthority,
 ): string | undefined {
-  const envelope = ownDataRecord(result, ["content", "details", "isError"]);
-  const item = envelope && singleOwnDataArray(envelope.content);
-  const block = ownDataRecord(item, ["type", "text"]);
-  if (block?.type !== "text" || typeof block.text !== "string" || block.text.length > MAX_TEXT) return undefined;
-  const evidence = operations.sanitize(block.text, MAX_TEXT);
+  const content = ownDataValue(result, "content");
+  if (!Array.isArray(content) || ownDataValue(content, "length") !== 1) return undefined;
+  const item = ownDataValue(content, "0");
+  if (ownDataValue(item, "type") !== "text") return undefined;
+  const text = ownDataValue(item, "text");
+  if (typeof text !== "string" || text.length > MAX_TEXT) return undefined;
+  const evidence = operations.sanitize(text, MAX_TEXT);
   return evidence.trim().length > 0 ? evidence : undefined;
 }
 
