@@ -313,6 +313,11 @@ export interface PiccTestSeam {
    * guarantee as `onWired` above (see the SECURITY note).
    */
   sdk?: PiSdk;
+  /** TEST-ONLY replacement for the session-global MCP runtime; never used by production wiring. */
+  mcpRuntime?: Pick<
+    McpRuntime,
+    "whenSettled" | "tools" | "callTool" | "diagnostics" | "serverStates" | "shutdown"
+  >;
   /** TEST-ONLY fault/timing seams for the MCP control-command boundary. */
   mcpControl?: {
     whenSettled?: () => Promise<void>;
@@ -1122,12 +1127,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     return sections.join("\n\n");
   }
 
-  // MCP stdio runtime: session-global, started non-blocking at load (zero
-  // enabled servers ⇒ nothing spawned, immediate settle). Declared above
-  // allKnownToolNames so dispatch-time closures over MCP state can never hit a
-  // TDZ. Model-facing registration happens in the detached mcpRegistration
-  // step below; shutdown joins session_shutdown.
-  const mcpRuntime = McpRuntime.start(project.mcp, {
+  // MCP runtime: session-global across stdio and remote transports, started
+  // non-blocking at load. Declared above allKnownToolNames so dispatch-time
+  // closures over MCP state can never hit a TDZ. Model-facing registration
+  // happens once in the detached mcpRegistration step below.
+  const mcpRuntime = testSeam?.mcpRuntime ?? McpRuntime.start(project.mcp, {
     projectRoot: project.root,
     sessionId,
     env: process.env,
@@ -1161,15 +1165,11 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       "MultiEdit",
       "NotebookEdit",
       ...DEGRADED_TOOLS.map((d) => d.name),
-      // Live MCP wire names (`mcp__<server>__<tool>`): gateTools already speaks
-      // the MCP grammar (bare `mcp__server` fan-out, bare-name deny removal), so
-      // appending the connected servers' names is all that agent
-      // `tools:`/`disallowedTools:` gating needs to cover MCP. Possibly
-      // incomplete (initially empty) before the runtime settles — servers
-      // settle individually; dispatches happen inside turns, after the first-turn
-      // barrier below, so they always see the settled set. An over-long name
-      // (>64 chars) stays in this universe but has no proxy instance (the
-      // builder drops it from the wire), so granting it is inert.
+      // The runtime publishes only initial catalogs and retains them across
+      // remote recovery, so this permission universe cannot widen or shrink
+      // after the first-turn settlement barrier. An over-long name (>64 chars)
+      // remains in the universe but has no proxy instance (the builder drops it
+      // from the wire), so granting it is inert.
       ...mcpRuntime.tools().map((t) => `mcp__${t.serverName}__${t.toolName}`),
     ];
   }
@@ -1201,11 +1201,9 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
         const name = (tool as { name: string }).name;
         if (granted.includes(name)) tools.push(tool);
       }
-      // Fresh per-dispatch MCP proxy instances over the SESSION-GLOBAL runtime:
-      // the ToolDefinitions are dispatch-local (never shared across sessions)
-      // while the stdio client connections stay session-global — the intended
-      // split (cf. buildCwdBoundTools above; proxies hold no cwd/TaskStore
-      // state, so freshness here is about never sharing tool OBJECTS). The same
+      // Fresh per-dispatch MCP proxy instances over the session-global runtime:
+      // ToolDefinitions are dispatch-local while transport/client state is
+      // shared. The same
       // granted-name filter as the cwd-bound tools applies: `granted` already
       // went through gateTools over the MCP-extended universe, so `tools:`
       // restriction (incl. bare `mcp__server` fan-out), `disallowedTools:`, and
@@ -2148,13 +2146,13 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   // ---------------------------------------------------------------------------
   // MCP tool exposure (detached; the first-turn barrier below awaits it)
   // ---------------------------------------------------------------------------
-  // After the non-blocking connect settles, each connected server's tools
-  // register as `mcp__<server>__<tool>` proxies through the same decoration
-  // pipeline as every other main-session custom tool; Pi auto-activates newly
-  // registered names (the main session has no tool allowlist), so post-load
-  // registration reaches the model on the next turn. Bare-name and server-level
-  // deny rules remove matching tools from the model's context entirely (Claude
-  // parity — gateTools already owns that removal grammar); the guard's
+  // Complete initial settlement publishes each discovered catalog, which the
+  // runtime retains across recovery. Its tools register once as
+  // `mcp__<server>__<tool>` proxies through the same decoration pipeline as
+  // every other main-session custom tool; reconnect never changes this set.
+  // Bare-name and server-level deny rules remove matching tools from the model's
+  // context entirely (Claude parity — gateTools already owns that removal grammar);
+  // the guard's
   // call-time deny stays the backstop for everything else. Zero enabled
   // servers: whenSettled is pre-resolved and zero proxies build — nothing
   // registers, nothing is printed, the model's context is untouched.
@@ -2218,17 +2216,16 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
   pi.on("before_agent_start", async (event: any, ctx: any) => {
     deliverSettlementNotices();
     // First-turn MCP settle barrier: Pi awaits this handler before snapshotting
-    // the run's tools, so waiting for the registration step (itself bounded by
-    // MCP_TIMEOUT via whenSettled) makes the first request deterministically
-    // carry connected servers' tools. Registration, not bare whenSettled: settle
-    // alone would race Pi's snapshot against the detached registerTool calls.
-    // Resolved-promise no-op after the first settle and on the zero-enabled
-    // path; never rejects (its own try/catch degrades to stderr).
+    // the run's tools, so waiting for the complete initial sequence and its
+    // one-time registration makes the first request deterministic. Registration,
+    // not bare settlement: settlement alone would race Pi's tool snapshot.
     let showsMcpStartupStatus = false;
     if (ctx?.mode === "tui") {
       // RPC also reports hasUI, so mode is the protocol boundary for footer-only chrome.
       try {
-        showsMcpStartupStatus = mcpRuntime.serverStates().some((state) => state.state === "connecting");
+        showsMcpStartupStatus = mcpRuntime.serverStates().some(
+          (state) => state.state === "connecting" || state.state === "retrying",
+        );
       } catch {
         /* presentation detection must not affect prompt admission */
       }
@@ -2261,9 +2258,12 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
       try {
         const failed = mcpRuntime.serverStates().filter((s) => s.state === "failed");
         if (failed.length > 0) {
+          const shown = failed.slice(0, 8).map((s) => s.name);
+          const omitted = failed.length - shown.length;
           const message =
-            `MCP server(s) failed to connect: ${failed.map((s) => s.name).join(", ")} — ` +
-            "run /doctor for details.";
+            `MCP server(s) failed to connect: ${shown.join(", ")}` +
+            (omitted > 0 ? `, and ${omitted} more` : "") +
+            " — run /doctor for details.";
           if (ctx?.hasUI) ctx.ui?.notify?.(message, "warning");
           else console.error(`PiCC: ${message}`);
         }

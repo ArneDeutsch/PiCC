@@ -293,7 +293,9 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "Deny rules at every grammar level",
       "guard's call-time deny as the backstop",
       "deny matching is case-sensitive",
-      "tool list is FROZEN at dispatch",
+      "After aggregate initial settlement, one immutable tool universe is registered",
+      "fresh proxy objects per dispatch over that same universe",
+      "Reconnect never widens it",
       "input schemas are normalized",
       "Claude passes schemas through verbatim",
       "descriptions are bounded at 2KB",
@@ -402,7 +404,12 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     }
     // The blanket "MCP deferred" wording is swept off entries whose surface now
     // partially runs; each names its specific deferred surface instead.
-    expect(lookupCapability("hook.event.mcp__elicitation")?.note).toContain("feature.mcp-elicitation");
+    expect(lookupCapability("hook.event.mcp__elicitation")?.note).toBe(
+      "MCP elicitation hook events — parsed and never fired: elicitation itself is a deferred MCP surface (see feature.mcp-elicitation), while supported MCP tools otherwise run",
+    );
+    expect(lookupCapability("feature.mcp-idle-timeout")?.note).toBe(
+      "PiCC imposes no MCP server idle timeout; remote transport or server loss may still enter recovery or terminal failure",
+    );
     expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inherit the SESSION's MCP tools");
     expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("MCP tools themselves run");
     expect(lookupCapability("feature.mcp-remote-transports")?.tier).toBe("partial");

@@ -21,8 +21,9 @@ import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdi
  *
  * Starts the ENABLED servers of a {@link ResolvedMcpConfig} through the
  * `@modelcontextprotocol/sdk` client, exposes
- * their tools and a call API, and kills every server (process trees included,
- * Windows too) at shutdown. Session-global and non-blocking: `start()`
+ * their tools and a call API, and at shutdown closes owned remote clients and
+ * transports while killing owned stdio process trees (Windows too). Session-global
+ * and non-blocking: `start()`
  * returns immediately, connects run in the background bounded by
  * `MCP_TIMEOUT`, and every failure degrades to a diagnostic — never a throw,
  * never a crash. With zero enabled servers nothing is imported and nothing is
@@ -273,7 +274,7 @@ export class McpRuntime {
     return this.connectTimeoutMs;
   }
 
-  /** Tools of already-connected servers — possibly incomplete (initially `[]`) before settle; servers settle individually. */
+  /** First catalogs retained after discovery; the aggregate is incomplete until initial settlement. */
   tools(): McpToolInfo[] {
     const out: McpToolInfo[] = [];
     for (const handle of this.handles) {

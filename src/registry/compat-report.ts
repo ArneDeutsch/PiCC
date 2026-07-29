@@ -484,7 +484,8 @@ function mcpPostureLine(
   });
   const selected = ordered.slice(0, 32);
   const parts = selected.map((server) => {
-    switch (server.status) {
+    const status = server.status;
+    switch (status) {
       case "enabled": {
         const live = liveByName.get(server.name);
         // Enabled but unknown to the runtime (states not supplied — e.g. a
@@ -519,6 +520,9 @@ function mcpPostureLine(
         return `${server.name}: skipped${mcpInactiveTransportSuffix(server)}${reason ? ` — ${boundPostureDiag(reason)}` : ""}`;
       }
     }
+    // Keep discovery status additions from silently rendering as undefined.
+    const unhandledStatus: never = status;
+    return unhandledStatus;
   });
   const omitted = mcp.servers.length - selected.length;
   const suffix = omitted > 0
