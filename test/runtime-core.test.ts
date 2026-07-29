@@ -71,6 +71,7 @@ import {
 import { BackgroundTaskRegistry, createTaskOutputTool } from "../src/runtime/background-tasks.js";
 import { MainSessionCheckpointGate } from "../src/runtime/mid-run-compaction.js";
 import { SubagentRegistry } from "../src/runtime/subagent-registry.js";
+import { createNotebookEditTool } from "../src/runtime/tools/notebook-edit.js";
 import { visibleWidth as tuiVisibleWidth, Text as TuiText } from "@earendil-works/pi-tui";
 import type { ProgressSnapshot } from "../src/runtime/subagent-progress.js";
 import {
@@ -168,10 +169,16 @@ describe("tool-map", () => {
   });
 
   it("reports touched files only for file tools", () => {
-    expect(touchedFilePath("read", { path: "a.ts" })).toBe("a.ts");
-    expect(touchedFilePath("edit", { file_path: "b.ts" })).toBe("b.ts");
-    expect(touchedFilePath("MultiEdit", { file_path: "x.ts" })).toBe("x.ts");
-    expect(touchedFilePath("bash", { command: "cat a.ts" })).toBeUndefined();
+    expect(touchedFilePath("read", { path: "a.ts" }, "/work")).toBe("a.ts");
+    expect(touchedFilePath("edit", { file_path: "b.ts" }, "/work")).toBe("b.ts");
+    expect(touchedFilePath("MultiEdit", { file_path: "x.ts" }, "/work")).toBe("x.ts");
+    const cwd = path.resolve("worktree");
+    expect(touchedFilePath("NotebookEdit", { notebook_path: "notes/book.ipynb" }, cwd))
+      .toBe(path.resolve(cwd, "notes/book.ipynb"));
+    const foreign = process.platform === "win32" ? "/rooted/book.ipynb" : "C:\\rooted\\book.ipynb";
+    expect(touchedFilePath("NotebookEdit", { notebook_path: foreign }, cwd)).toBeUndefined();
+    expect(touchedFilePath("NotebookEdit", { notebook_path: "notes/book.txt" }, cwd)).toBeUndefined();
+    expect(touchedFilePath("bash", { command: "cat a.ts" }, "/work")).toBeUndefined();
   });
 });
 
@@ -1031,6 +1038,41 @@ describe("SubagentRuntime (fake SDK)", () => {
     expect(customToolNames).not.toContain("bash");
   });
 
+  it("threads one runtime-owned notebook state into the child Read and NotebookEdit", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "picc-child-notebook-state-"));
+    const notebookPath = path.join(cwd, "shared.ipynb");
+    fs.writeFileSync(notebookPath, JSON.stringify({
+      cells: [{ cell_type: "code", id: "cell-a", metadata: {}, source: "old", execution_count: null, outputs: [] }],
+      metadata: {}, nbformat: 4, nbformat_minor: 5,
+    }));
+    let factoryState: unknown;
+    try {
+      const { sdk } = fakeSdk({
+        onPrompt: async (_text, session) => {
+          await session.customTools.find((tool) => tool.name === "read")!
+            .execute("read", { path: "shared.ipynb" });
+          const result = await session.customTools.find((tool) => tool.name === "NotebookEdit")!
+            .execute("edit", { notebook_path: "shared.ipynb", new_source: "updated", cell_id: "cell-a" });
+          expect(result.content[0]?.text).toContain("Updated cell cell-a");
+          return "done";
+        },
+      });
+      const runtime = makeSubagentRuntime([makeAgent({ tools: ["Read", "NotebookEdit"] })], sdk, {
+        getCwd: () => cwd,
+        allKnownToolNames: () => ["Read", "NotebookEdit"],
+        customToolsFor: (_agent, _granted, _depth, _owner, _fork, subCwd, notebookSession) => {
+          factoryState = notebookSession;
+          return [createNotebookEditTool(() => subCwd!.get(), notebookSession)];
+        },
+      });
+      await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
+      expect(factoryState).toBeDefined();
+      expect(JSON.parse(fs.readFileSync(notebookPath, "utf8")).cells[0].source).toBe("updated");
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("subagent built-ins re-resolve to the new cwd after its own EnterWorktree, in lockstep with the guard (BUG 2)", async () => {
     // The dispatch builds the factory built-ins, the guard (getCwd), and the
     // custom tools ALL against ONE dispatch-local `subCwd` instance. `customToolsFor`
@@ -1053,7 +1095,7 @@ describe("SubagentRuntime (fake SDK)", () => {
       },
     });
     const runtime = makeSubagentRuntime([makeAgent({ tools: ["Read", "Bash"] })], sdk, {
-      customToolsFor: (_a: ClaudeAgent, _g: string[], _d: number, _o: string, _f: boolean, subCwd) => {
+      customToolsFor: (_a: ClaudeAgent, _g: string[], _d: number, _o: string, _f: boolean, subCwd, _notebook, _activation, _stop) => {
         capturedSubCwd = subCwd;
         return [
           {
@@ -1478,7 +1520,7 @@ describe("SubagentRuntime (fake SDK)", () => {
       hookRunner,
       maxDepth: 2,
       allKnownToolNames: () => ["Agent", "Task"],
-      customToolsFor: (_agent, _granted, depth, ownerAgentId, dispatcherIsFork, _cwd, _activation, captureUniversalStop) =>
+      customToolsFor: (_agent, _granted, depth, ownerAgentId, dispatcherIsFork, _cwd, _notebook, _activation, captureUniversalStop) =>
         depth === 1
           ? [
               createAgentToolDefinition(runtime, {
@@ -1541,7 +1583,7 @@ describe("SubagentRuntime (fake SDK)", () => {
       },
     });
     const runtime: SubagentRuntime = makeSubagentRuntime(agents, sdk, {
-      customToolsFor: (_a: ClaudeAgent, _g: string[], depth: number) =>
+      customToolsFor: (_a: ClaudeAgent, _g: string[], depth: number, _owner, _fork, _cwd, _notebook, _activation, _stop) =>
         depth + 1 <= 2 ? [createAgentToolDefinition(runtime, { depth, name: "Agent" })] : [],
       allKnownToolNames: () => ["Read"],
       concurrency: 1, // old code: guaranteed deadlock for ANY depth-2 nesting
@@ -1631,7 +1673,7 @@ describe("SubagentRuntime (fake SDK)", () => {
       maxDepth: 2,
       // Mirror index.ts's real wiring: the dispatching subagent's Agent tool carries
       // dispatchCwd sourced from its own dispatch-local subCwd.
-      customToolsFor: (_a: ClaudeAgent, _g: string[], depth: number, _o: string, _f: boolean, subCwd?: CwdState) =>
+      customToolsFor: (_a: ClaudeAgent, _g: string[], depth: number, _o: string, _f: boolean, subCwd: CwdState | undefined, _notebook, _activation, _stop) =>
         depth + 1 <= 2 && subCwd
           ? [createAgentToolDefinition(runtime, { depth, name: "Agent", dispatchCwd: () => subCwd.get() })]
           : [],
@@ -1758,7 +1800,7 @@ describe("SubagentRuntime (fake SDK)", () => {
     // customToolsFor sees the RESOLVED agent on every dispatch (the fake loader
     // never calls the lazy systemPromptOverride).
     const { runtime } = makeRuntime([makeAgent()], ["gp-done"], {
-      customToolsFor: (a: ClaudeAgent) => {
+      customToolsFor: (a: ClaudeAgent, _granted, _depth, _owner, _fork, _cwd, _notebook, _activation, _stop) => {
         seen.push(a);
         return [];
       },
@@ -1773,7 +1815,9 @@ describe("SubagentRuntime (fake SDK)", () => {
   it("built-ins resolve AFTER project agents: a project Explore overrides the built-in", async () => {
     const seen: ClaudeAgent[] = [];
     const capture = {
-      customToolsFor: (a: ClaudeAgent) => {
+      customToolsFor: (a: ClaudeAgent, _granted: string[], _depth: number, _owner: string,
+        _fork: boolean, _cwd: CwdState | undefined, _notebook: unknown, _activation: unknown,
+        _stop?: () => () => boolean) => {
         seen.push(a);
         return [];
       },
@@ -2637,6 +2681,7 @@ describe("TaskOutput identity render", () => {
       { content: [{ type: "text", text }], details },
       { isPartial },
       theme,
+      typeof details.taskId === "string" ? { args: { task_id: details.taskId }, isError: false } : undefined,
     )
       .render(width)
       .join("\n");
@@ -2715,16 +2760,16 @@ describe("TaskOutput identity render", () => {
 
   it("a live partial with an absent/empty snapshot renders only identity and running state", () => {
     const bare = render(
-      { taskId: "task-8", agent: "coder", agentId: "agent-aabbccddeeff", live: true },
+      { taskId: "task-8", status: "running", agent: "coder", agentId: "agent-aabbccddeeff", live: true },
       "",
       true,
     );
-    expect(bare).toContain("task output task-8");
-    expect(bare).toBe("task output task-8 - coder [running]");
+    expect(bare).toBe("task output coder · running · task-8");
 
     const emptySnap = render(
       {
         taskId: "task-8",
+        status: "running",
         agent: "coder",
         agentId: "agent-aabbccddeeff",
         subagentProgress: { tail: [], activity: "" },
@@ -2733,7 +2778,7 @@ describe("TaskOutput identity render", () => {
       "",
       true,
     );
-    expect(emptySnap).toBe("task output task-8 - coder [running]");
+    expect(emptySnap).toBe("task output coder · running · task-8");
   });
 
   it("a live partial collapses to one identity/state line without activity; detail owns the tail", () => {
@@ -2742,6 +2787,7 @@ describe("TaskOutput identity render", () => {
         content: [{ type: "text", text: "> Grep (x)\n… running Grep…" }],
         details: {
           taskId: "task-1",
+          status: "running",
           agent: "coder",
           agentId: "agent-aabbccddeeff",
           subagentProgress: { tail: ["> Grep (x)"], activity: "running Grep…" },
@@ -2753,9 +2799,7 @@ describe("TaskOutput identity render", () => {
     ).render(120);
     expect(lines).toHaveLength(1); // single status line — no rolling tail in chat
     const out = lines.join("\n");
-    expect(out).toContain("task output task-1");
-    expect(out).toContain("coder");
-    expect(out).toContain("running");
+    expect(out).toContain("task output task-1 - coder [running]");
     expect(out).not.toContain("Grep");
     expect(out).not.toContain("> Grep (x)"); // the tail lives in the panel/drill-down
   });
@@ -2768,9 +2812,7 @@ describe("TaskOutput identity render", () => {
       agentId: "agent-aabbccddeeff",
       lastActivity: "running Grep…",
     }, "Background task task-6 (coder) is still running — running Grep…");
-    expect(active).toContain("task output task-6");
-    expect(active).toContain("coder");
-    expect(active).toContain("running");
+    expect(active).toContain("task output coder · running · task-6");
     expect(active).not.toContain("Grep");
 
     const idle = render({
@@ -2779,8 +2821,57 @@ describe("TaskOutput identity render", () => {
       agent: "coder",
       agentId: "agent-aabbccddeeff",
     });
-    expect(idle).toContain("task output task-6");
-    expect(idle).toContain("running");
+    expect(idle).toContain("task output coder · running · task-6");
+  });
+
+  it("prefers exact-correlated running descriptions while preserving muted lifecycle metadata", () => {
+    const ESC = String.fromCharCode(27);
+    const calls: Array<{ slot: string; text: string }> = [];
+    const theme = {
+      fg(slot: string, text: string) { calls.push({ slot, text }); return text; },
+      bold(text: string) { return text; },
+    };
+    const result = {
+      content: [{ type: "text", text: "Waiting for configured concurrency capacity." }],
+      details: {
+        taskId: "task-8",
+        status: "running",
+        admission: "waiting",
+        agent: "coder",
+        agentId: "agent-aabbccddeeff",
+        durationMs: 2_000,
+        usage: { inputTokens: 10, outputTokens: 5 },
+        description: `Review · [failed]${ESC}[31m\nforged state`,
+      },
+    };
+    const canonical = structuredClone(result);
+    const component = renderAgentResult(result, { isPartial: true }, theme, {
+      args: { task_id: "task-8" }, isError: false,
+    }, {
+      surface: "task-output",
+      resolveAgentColor: () => "blue",
+    });
+    const wide = component.render(160).join("\n");
+    const plainWide = wide.replace(/\u001b\[[0-9;]*m/gu, "");
+    expect(plainWide).toContain("task output Review · [failed] forged state");
+    expect(plainWide).toContain(" · waiting for capacity · coder · task-8 · 2s · in 10 · out 5");
+    expect(wide).toContain(ESC); // configured agent identity tint survives as secondary identity
+    expect(wide).not.toContain(`${ESC}[31m`); // hostile source styling does not survive
+    expect(calls.some(({ slot, text }) => slot === "muted" && text === "task-8")).toBe(true);
+    for (const width of [1, 8, 18, 40]) {
+      const lines = component.render(width);
+      expect(lines).toHaveLength(1);
+      for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
+    }
+    expect(result).toEqual(canonical);
+
+    const foreign = structuredClone(result);
+    foreign.details.taskId = "task-9";
+    const foreignRow = renderAgentResult(foreign, { isPartial: true }, undefined, {
+      args: { task_id: "task-8" }, isError: false,
+    }, { surface: "task-output" }).render(120).join("\n");
+    expect(foreignRow).toContain("task output task-8");
+    expect(foreignRow).not.toMatch(/task-9|Review/u);
   });
 
   it("two same-type concurrent tasks render DISTINCT Task(task-N) status lines", () => {
@@ -2798,11 +2889,9 @@ describe("TaskOutput identity render", () => {
       agentId: "agent-cccc2222dddd",
       lastActivity: "running Read…",
     });
-    expect(a).toContain("task output task-1");
-    expect(a).toContain("running");
+    expect(a).toContain("task output coder · running · task-1");
     expect(a).not.toContain("Grep");
-    expect(b).toContain("task output task-2");
-    expect(b).toContain("running");
+    expect(b).toContain("task output coder · running · task-2");
     expect(b).not.toContain("Read");
     expect(a).not.toContain("task-2");
     expect(b).not.toContain("task-1");
@@ -3515,7 +3604,7 @@ describe("condensed completion records", () => {
 
   it("keeps the requested TaskOutput target across foreign, malformed, and future result shapes", () => {
     const tool = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
-    const requested = "task-requested-target-123456789";
+    const requested = "task-123456789";
     const results = [
       { content: [{ type: "text", text: "unknown task" }] },
       { content: [{ type: "text", text: "foreign task" }], details: { taskId: "task-foreign", status: "running", agent: "worker" } },
@@ -3529,7 +3618,9 @@ describe("condensed completion records", () => {
         const rendered = tool.renderResult(result, { expanded: false, isPartial: false }, undefined, context);
         expect(call.render(width)).toEqual([]);
         const lines = rendered.render(width) as string[];
-        expect(lines.join("").replace(/\s/gu, "")).toContain(requested);
+        const compact = lines.join("").replace(/\s/gu, "");
+        expect(compact).toContain(requested);
+        expect(compact).not.toContain("task-foreign");
         expect(lines.join("\n").match(/task output/gu)).toHaveLength(1);
         expect(lines.join("\n").match(/[○●✗■]/gu)).toHaveLength(1);
         for (const line of lines) expect(tuiVisibleWidth(line)).toBeLessThanOrEqual(width);
@@ -3539,7 +3630,7 @@ describe("condensed completion records", () => {
 
   it("keeps one complete requested TaskOutput target when foreign details are background-shaped", () => {
     const tool = wrapForSelfShell(createTaskOutputTool(new BackgroundTaskRegistry())) as any;
-    const requested = "task-requested-target-123456789";
+    const requested = "task-123456789";
     const result = {
       content: [{ type: "text", text: "foreign background-shaped result" }],
       details: { background: true, taskId: "task-foreign", agent: "worker", future: "field" },

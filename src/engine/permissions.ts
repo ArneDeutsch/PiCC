@@ -659,11 +659,16 @@ export function matchesRule(
         return true; // `*` matches everything; a specifier on `*` is ignored
       case "Bash":
         return bashSpecifierMatches(specifier, safeCall, opts);
+      case "NotebookEdit":
+        // Claude accepts NotebookEdit(path) syntax but its file checks never match it;
+        // Edit(path) is the scoped rule that governs NotebookEdit calls. Parameter
+        // rules on non-canonical fields already returned above, and a bare
+        // NotebookEdit returned before this switch.
+        return false;
       case "Read":
       case "Edit":
       case "Write":
       case "MultiEdit":
-      case "NotebookEdit":
       case "NotebookRead":
       case "Glob":
       case "Grep":
@@ -715,18 +720,20 @@ function isUnanchoredMcpGlob(ruleTool: string): boolean {
   return sep < 0 || rest.slice(0, sep).includes("*");
 }
 
+function isUnmatchedNotebookEditPathRule(ruleText: string): boolean {
+  const rule = parseRule(ruleText);
+  if (rule.tool !== "NotebookEdit" || rule.specifier === undefined || rule.specifier === "") return false;
+  const parameter = /^([A-Za-z_][A-Za-z0-9_]*)\s*:/u.exec(rule.specifier);
+  return parameter?.[1] === undefined || CANONICAL_INPUT_FIELDS.has(parameter[1]);
+}
+
 export class PermissionEngine {
   private readonly rules: PermissionRules;
   private readonly cwd: string;
   private readonly anchor: string;
   /** Allow rules ignored by construction-time validation (unanchored MCP globs). */
   private readonly ignoredAllowRules: ReadonlySet<string>;
-  /**
-   * Construction-time rule-validation warnings (currently: unanchored MCP
-   * globs in `allow`). The engine has no other diagnostics channel, so they
-   * are exposed here for the embedder to surface like other permission
-   * diagnostics; collecting them never throws.
-   */
+  /** Construction-time rule-validation warnings surfaced by the embedder. */
   readonly diagnostics: Diagnostic[] = [];
 
   /**
@@ -742,6 +749,22 @@ export class PermissionEngine {
     this.rules = rules;
     this.cwd = opts.cwd;
     this.anchor = opts.root ?? opts.cwd;
+    // Claude accepts NotebookEdit(path) rules but file permission checks never
+    // match them; Edit(path) is the scoped family rule. Report every settings
+    // occurrence without echoing project-controlled rule text to the terminal.
+    for (const kind of ["allow", "deny", "ask"] as const) {
+      for (const rule of this.ruleList(kind)) {
+        if (!isUnmatchedNotebookEditPathRule(rule)) continue;
+        this.diagnostics.push({
+          severity: "warning",
+          message:
+            `permissions.${kind} contains a scoped NotebookEdit rule that is not matched by file ` +
+            `permission checks; use Edit(path) instead (Edit rules cover NotebookEdit)`,
+          source: "permissions",
+        });
+      }
+    }
+
     // Claude rejects allow rules whose MCP tool part is an unanchored glob.
     // PiCC ignores them for allow matching and reports a warning.
     const ignored = new Set<string>();

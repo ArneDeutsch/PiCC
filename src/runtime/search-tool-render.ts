@@ -21,6 +21,7 @@ import {
   formatDisplayPathFromRoots,
   formatToolDisplayName,
   priorityDisplayRow,
+  semanticDisplayRow,
   resolveDisplayRoots,
   sanitizeInlineDisplay,
   type DisplayRootResolver,
@@ -683,29 +684,254 @@ export interface CompactSearchRenderingDependencies {
   repositoryRoot?: string;
 }
 
-function stockSearchCall(
-  toolName: StockSearchName,
-  argsValue: unknown,
-  theme: unknown,
-  roots: DisplayRoots,
-): Component {
-  const args = snapshotArgs(argsValue);
-  const rawPath = typeof args.path === "string" ? args.path : ".";
-  const displayPath = sanitizeInlineDisplay(formatDisplayPathFromRoots(rawPath, roots)) || ".";
-  const optional = [
-    ...(toolName === "grep" && typeof args.glob === "string" && sanitize(args.glob, true)
-      ? [`glob ${quote(sanitize(args.glob, true))}`] : []),
-    ...(typeof args.limit === "number" && Number.isFinite(args.limit) ? [`limit ${String(args.limit)}`] : []),
-  ];
-  if (toolName === "ls") {
-    return priorityDisplayRow("ls", displayPath, [], optional, "", theme);
-  }
-  const expression = sanitize(args.pattern, true) || "?";
-  return priorityDisplayRow(toolName, expression, [], [`in ${displayPath}`, ...optional], "", theme);
+interface StockArgs {
+  pattern?: string;
+  path?: string;
+  glob?: string;
+  ignoreCase?: boolean;
+  literal?: boolean;
+  context?: number;
+  limit?: number;
 }
 
-// HTML serializes custom calls before results, so PiCC compact rows are result-owned.
-// Pi's stock built-ins retain their native result renderer and only replace the call fragment.
+interface StockOutcome {
+  empty?: string;
+  warnings: string[];
+  retained: boolean;
+}
+
+interface StockLifecycle {
+  args?: StockArgs;
+  call?: MutableStockCall;
+  nativeResult?: Component;
+  roots?: DisplayRoots;
+  displayPath?: string;
+}
+
+interface MutableStockCall extends Component {
+  update(args: StockArgs, displayPath: string, outcome: StockOutcome | undefined, cue: string | undefined, theme: unknown): void;
+}
+
+const STOCK_ARG_KEYS: Record<StockSearchName, readonly string[]> = {
+  grep: ["pattern", "path", "glob", "ignoreCase", "literal", "context", "limit"],
+  find: ["pattern", "path", "limit"],
+  ls: ["path", "limit"],
+};
+const STOCK_DEFAULT_LIMIT: Record<StockSearchName, number> = { grep: 100, find: 1000, ls: 500 };
+const STOCK_EMPTY: Record<StockSearchName, string> = {
+  grep: "No matches found",
+  find: "No files found matching pattern",
+  ls: "(empty directory)",
+};
+
+function stockArgs(toolName: StockSearchName, value: unknown): StockArgs | undefined {
+  if (!plainRecord(value)) return undefined;
+  let keys: PropertyKey[];
+  try { keys = Reflect.ownKeys(value); } catch { return undefined; }
+  if (keys.some((key) => typeof key !== "string" || !STOCK_ARG_KEYS[toolName].includes(key))) return undefined;
+  const result: StockArgs = {};
+  for (const key of keys as string[]) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !("value" in descriptor)) return undefined;
+    (result as Record<string, unknown>)[key] = descriptor.value;
+  }
+  const has = (key: keyof StockArgs): boolean => Object.prototype.hasOwnProperty.call(result, key);
+  if ((toolName === "grep" || toolName === "find") && typeof result.pattern !== "string") return undefined;
+  if (has("path") && typeof result.path !== "string") return undefined;
+  if (has("limit") && (typeof result.limit !== "number" || !Number.isFinite(result.limit))) return undefined;
+  if (toolName === "grep") {
+    if (has("glob") && typeof result.glob !== "string") return undefined;
+    if (has("ignoreCase") && typeof result.ignoreCase !== "boolean") return undefined;
+    if (has("literal") && typeof result.literal !== "boolean") return undefined;
+    if (has("context") && (typeof result.context !== "number" || !Number.isFinite(result.context))) return undefined;
+  }
+  return result;
+}
+
+function sameStockArgs(left: StockArgs, right: StockArgs): boolean {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  return leftKeys.length === rightKeys.length &&
+    leftKeys.every((key) => Object.prototype.hasOwnProperty.call(right, key) &&
+      Object.is((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key]));
+}
+
+function contextStockArgs(
+  toolName: StockSearchName,
+  context: RenderContext,
+  captured: StockArgs | undefined,
+): StockArgs | undefined {
+  let descriptor: PropertyDescriptor | undefined;
+  try { descriptor = Object.getOwnPropertyDescriptor(context, "args"); } catch { return undefined; }
+  if (!descriptor) {
+    try { return Reflect.has(context, "args") ? undefined : captured; } catch { return undefined; }
+  }
+  if (!("value" in descriptor)) return undefined;
+  const current = stockArgs(toolName, descriptor.value);
+  if (!current || !captured || !sameStockArgs(current, captured)) return undefined;
+  return current;
+}
+
+function exactStockRecord(value: unknown, expected: readonly string[]): Record<string, unknown> | undefined {
+  if (!plainRecord(value)) return undefined;
+  try {
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== expected.length || keys.some((key) => typeof key !== "string" || !expected.includes(key))) return undefined;
+    const snapshot: Record<string, unknown> = {};
+    for (const key of keys as string[]) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !("value" in descriptor)) return undefined;
+      snapshot[key] = descriptor.value;
+    }
+    return snapshot;
+  } catch { return undefined; }
+}
+
+function exactStockTextBlock(value: unknown): string | undefined {
+  const block = exactStockRecord(value, ["type", "text"]);
+  if (!block || safeOwn(block, "type") !== "text") return undefined;
+  const text = safeOwn(block, "text");
+  return typeof text === "string" ? text : undefined;
+}
+
+function exactStockContent(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return undefined;
+  try {
+    if (Object.getPrototypeOf(value) !== Array.prototype || Reflect.ownKeys(value).length !== 2 ||
+      safeOwn(value, "length") !== 1) return undefined;
+  } catch { return undefined; }
+  return exactStockTextBlock(safeOwn(value, "0"));
+}
+
+function exactStockTruncation(value: unknown): boolean {
+  const truncation = exactStockRecord(value, [
+    "content", "truncated", "truncatedBy", "totalLines", "totalBytes", "outputLines", "outputBytes",
+    "lastLinePartial", "firstLineExceedsLimit", "maxLines", "maxBytes",
+  ]);
+  if (!truncation || typeof safeOwn(truncation, "content") !== "string" || safeOwn(truncation, "truncated") !== true ||
+    (safeOwn(truncation, "truncatedBy") !== "lines" && safeOwn(truncation, "truncatedBy") !== "bytes") ||
+    typeof safeOwn(truncation, "lastLinePartial") !== "boolean" ||
+    typeof safeOwn(truncation, "firstLineExceedsLimit") !== "boolean") return false;
+  const numeric = ["totalLines", "totalBytes", "outputLines", "outputBytes", "maxLines", "maxBytes"] as const;
+  const values = Object.fromEntries(numeric.map((key) => [key, safeOwn(truncation, key)])) as Record<typeof numeric[number], unknown>;
+  if (numeric.some((key) => !Number.isSafeInteger(values[key]) || (values[key] as number) < 0) ||
+    (values.maxLines as number) < 1 || (values.maxBytes as number) < 1 ||
+    (values.outputLines as number) > (values.totalLines as number) ||
+    (values.outputBytes as number) > (values.totalBytes as number) ||
+    (values.outputLines as number) > (values.maxLines as number) ||
+    (values.outputBytes as number) > (values.maxBytes as number) || safeOwn(truncation, "lastLinePartial") !== false) return false;
+  if (safeOwn(truncation, "truncatedBy") === "lines") {
+    return (values.totalLines as number) > (values.maxLines as number) &&
+      values.outputLines === values.maxLines && (values.totalBytes as number) > (values.outputBytes as number) &&
+      safeOwn(truncation, "firstLineExceedsLimit") === false;
+  }
+  if ((values.totalBytes as number) <= (values.maxBytes as number)) return false;
+  return safeOwn(truncation, "firstLineExceedsLimit") === true
+    ? values.outputLines === 0 && values.outputBytes === 0
+    : (values.outputLines as number) > 0 && (values.outputBytes as number) > 0;
+}
+
+function stockEffectiveLimit(toolName: StockSearchName, args: StockArgs): number {
+  const requested = args.limit ?? STOCK_DEFAULT_LIMIT[toolName];
+  return toolName === "grep" ? Math.max(1, requested) : requested;
+}
+
+function stockOutcome(toolName: StockSearchName, args: StockArgs, result: unknown): StockOutcome | undefined {
+  const envelope = exactStockRecord(result, ["content", "details"]) ??
+    exactStockRecord(result, ["content", "details", "isError"]);
+  if (!envelope || ("isError" in envelope && envelope.isError !== false)) return undefined;
+  const text = exactStockContent(safeOwn(envelope, "content"));
+  if (text === undefined) return undefined;
+  const detailsValue = safeOwn(envelope, "details");
+  if (detailsValue === undefined) {
+    const empty = text.length === STOCK_EMPTY[toolName].length && text === STOCK_EMPTY[toolName]
+      ? STOCK_EMPTY[toolName]
+      : undefined;
+    if (text === "") return undefined;
+    return { ...(empty ? { empty } : {}), warnings: [], retained: !empty };
+  }
+  const allowed = toolName === "grep"
+    ? ["matchLimitReached", "linesTruncated", "truncation"]
+    : toolName === "find"
+      ? ["resultLimitReached", "truncation"]
+      : ["entryLimitReached", "truncation"];
+  if (!plainRecord(detailsValue)) return undefined;
+  let detailKeys: PropertyKey[];
+  try { detailKeys = Reflect.ownKeys(detailsValue); } catch { return undefined; }
+  if (detailKeys.length === 0 || detailKeys.some((key) => typeof key !== "string" || !allowed.includes(key))) return undefined;
+  const details: Record<string, unknown> = {};
+  for (const key of detailKeys as string[]) {
+    const descriptor = Object.getOwnPropertyDescriptor(detailsValue, key);
+    if (!descriptor || !("value" in descriptor)) return undefined;
+    details[key] = descriptor.value;
+  }
+  const limitKey = toolName === "grep" ? "matchLimitReached" : toolName === "find" ? "resultLimitReached" : "entryLimitReached";
+  const hasLimit = Object.prototype.hasOwnProperty.call(details, limitKey);
+  const hasLinesTruncated = Object.prototype.hasOwnProperty.call(details, "linesTruncated");
+  const hasTruncation = Object.prototype.hasOwnProperty.call(details, "truncation");
+  const limitValue = details[limitKey];
+  if (hasLimit && (typeof limitValue !== "number" || !Number.isFinite(limitValue) || limitValue <= 0 ||
+    limitValue !== stockEffectiveLimit(toolName, args))) return undefined;
+  if (hasLinesTruncated && (toolName !== "grep" || details.linesTruncated !== true)) return undefined;
+  if (hasTruncation && !exactStockTruncation(details.truncation)) return undefined;
+  const warnings: string[] = [];
+  if (hasLimit) warnings.push(`${String(limitValue)} ${toolName === "grep" ? "matches" : toolName === "find" ? "results" : "entries"} limit`);
+  if (hasLinesTruncated) warnings.push("long lines truncated");
+  if (hasTruncation) warnings.push("output truncated");
+  return { warnings, retained: true };
+}
+
+function stockSearchRow(
+  toolName: StockSearchName,
+  args: StockArgs,
+  displayPath: string,
+  outcome: StockOutcome | undefined,
+  cue: string | undefined,
+  theme: unknown,
+): Component {
+  const optional = [
+    ...(toolName !== "ls" ? [`in ${displayPath}`] : []),
+    ...(toolName === "grep" && typeof args.glob === "string" && sanitize(args.glob, true)
+      ? [`glob ${quote(sanitize(args.glob, true))}`] : []),
+    ...(typeof args.limit === "number" ? [`limit ${String(args.limit)}`] : []),
+  ];
+  return semanticDisplayRow({
+    action: toolName,
+    primary: toolName === "ls" ? displayPath : sanitize(args.pattern, true) || "?",
+    required: [
+      ...(outcome?.empty ? [{ text: outcome.empty, tone: "muted" as const }] : []),
+      ...((outcome?.warnings ?? []).map((text) => ({ text, tone: "warning" as const }))),
+    ],
+    optional,
+    ...(cue ? { cue, compactCue: cue.endsWith(" to expand") ? cue.slice(0, -" to expand".length) : cue } : {}),
+  }, theme);
+}
+
+function mutableStockCall(
+  toolName: StockSearchName,
+  args: StockArgs,
+  displayPath: string,
+  theme: unknown,
+): MutableStockCall {
+  let row = stockSearchRow(toolName, args, displayPath, undefined, undefined, theme);
+  return {
+    update(nextArgs, nextPath, outcome, cue, nextTheme) {
+      row = stockSearchRow(toolName, nextArgs, nextPath, outcome, cue, nextTheme);
+    },
+    render(width) { return row.render(width); },
+  };
+}
+
+function stockNativeContext(context: RenderContext, lastComponent: Component | undefined, expanded: boolean): RenderContext {
+  return { ...context, lastComponent, expanded } as RenderContext;
+}
+
+function stockFailOpen(result: unknown, theme: unknown, context: RenderContext): Component {
+  return failOpenComponent("Grep", result, theme, context, false);
+}
+
+// HTML serializes custom calls before results, so compact grep/find rows are result-owned.
+// Interactive stock rows retain their call component and native expanded-result identity.
 export function withCompactSearchRendering<T extends ToolDefinition>(
   tool: T,
   dependencies: CompactSearchRenderingDependencies = {},
@@ -730,10 +956,93 @@ export function withCompactSearchRendering<T extends ToolDefinition>(
     return roots.get(state as object) ?? {};
   };
   if (toolName === "grep" || toolName === "find" || toolName === "ls") {
+    const originalResult = tool.renderResult;
+    const lifecycles = new WeakMap<object, StockLifecycle>();
+    const htmlStates = new WeakSet<object>();
+    const lifecycleFor = (context: RenderContext): StockLifecycle | undefined => {
+      const state = safeGet(context, "state");
+      if ((typeof state !== "object" && typeof state !== "function") || state === null) return undefined;
+      let lifecycle = lifecycles.get(state as object);
+      if (!lifecycle) {
+        lifecycle = {};
+        lifecycles.set(state as object, lifecycle);
+      }
+      return lifecycle;
+    };
     return {
       ...tool,
-      renderCall(args: unknown, theme: unknown, context: RenderContext): Component {
-        return stockSearchCall(toolName, args, theme, rootsFor(context));
+      renderCall(argsValue: unknown, theme: unknown, context: RenderContext): Component {
+        const args = stockArgs(toolName, argsValue);
+        if (!args) {
+          try { return typeof tool.renderCall === "function" ? tool.renderCall(argsValue as never, theme as never, context as never) : { render: () => [toolName] }; }
+          catch { return { render: () => [toolName] }; }
+        }
+        const lifecycle = lifecycleFor(context);
+        const roots = rootsFor(context);
+        const rawPath = args.path ?? ".";
+        const displayPath = sanitizeInlineDisplay(formatDisplayPathFromRoots(rawPath, roots)) || ".";
+        if (!lifecycle) return stockSearchRow(toolName, args, displayPath, undefined, undefined, theme);
+        lifecycle.args = args;
+        lifecycle.roots = roots;
+        lifecycle.displayPath = displayPath;
+        lifecycle.call ??= mutableStockCall(toolName, args, displayPath, theme);
+        lifecycle.call.update(args, displayPath, undefined, undefined, theme);
+        const state = safeGet(context, "state") as object;
+        if (safeGet(context, "isPartial") === true) {
+          htmlStates.add(state);
+          if (toolName !== "ls") {
+            suppressToolRow(context);
+            return { render: () => [] };
+          }
+        } else {
+          htmlStates.delete(state);
+        }
+        return lifecycle.call;
+      },
+      renderResult(result: unknown, options: { expanded?: boolean; isPartial?: boolean }, theme: unknown, context: RenderContext): Component {
+        const lifecycle = lifecycleFor(context);
+        const args = contextStockArgs(toolName, context, lifecycle?.args);
+        const isPartial = safeGet(options, "isPartial") === true || safeGet(context, "isPartial") === true;
+        const isError = safeGet(context, "isError") === true;
+        const state = safeGet(context, "state");
+        const html = toolName !== "ls" && (typeof state === "object" || typeof state === "function") && state !== null &&
+          htmlStates.has(state as object);
+        const expanded = safeGet(options, "expanded") === true || safeGet(context, "expanded") === true;
+        const expansion = piToolsExpandKeyText();
+        const binding = expansion.available ? sanitize(expansion.value, true, 512) : "";
+        const outcome = !isPartial && !isError && args ? stockOutcome(toolName, args, result) : undefined;
+        const recognized = outcome !== undefined;
+        const retained = outcome?.retained === true;
+        const reveal = expanded || !expansion.available || !binding;
+
+        const delegate = (): Component => {
+          if (typeof originalResult !== "function") return stockFailOpen(result, theme, context);
+          try {
+            const native = originalResult(
+              result as never,
+              { expanded: true, isPartial } as never,
+              theme as never,
+              stockNativeContext(context, lifecycle?.nativeResult, true) as never,
+            ) as Component;
+            if (lifecycle) lifecycle.nativeResult = native;
+            return native;
+          } catch {
+            if (lifecycle) lifecycle.nativeResult = undefined;
+            return stockFailOpen(result, theme, context);
+          }
+        };
+
+        if (!recognized || isPartial || isError || !args || (!lifecycle && !html)) return delegate();
+        const cue = retained && !reveal ? (html ? "click to show detail" : `${binding} to expand`) : undefined;
+        const displayPath = lifecycle?.displayPath ??
+          (sanitizeInlineDisplay(formatDisplayPathFromRoots(args.path ?? ".", rootsFor(context))) || ".");
+        if (html) {
+          const row = stockSearchRow(toolName, args, displayPath, outcome, cue, theme);
+          return reveal && retained ? combinedComponent([row, delegate()]) : row;
+        }
+        lifecycle?.call?.update(args, displayPath, outcome, cue, theme);
+        if (reveal && retained) return delegate();
+        return { render: () => [] };
       },
     } as T;
   }

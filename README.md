@@ -72,7 +72,8 @@ PiCC ships as TypeScript source that Pi loads via jiti — there is no build ste
 - **Plugins** — content from already-installed plugins and project-bundled `.claude-plugin/`.
 - **Images & notebooks** — `Read` delivers image files and cell-aware `.ipynb` output (plots
   included) as real image blocks on a vision-capable model, degrading to a text placeholder on a
-  non-vision model; a genuinely unsupported binary (e.g. a PDF) returns a clean binary error.
+  non-vision model; notebooks can be edited cell-by-cell with `NotebookEdit`; a genuinely unsupported
+  binary (e.g. a PDF) returns a clean binary error.
 - **Git commits** — nudges richer, repo-style-matching commit messages by default.
 
 Everything unrecognized degrades safely instead of crashing (the completeness floor).

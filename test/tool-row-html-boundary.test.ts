@@ -232,9 +232,16 @@ describe("Pi-owned assembled HTML tool-row boundary", () => {
       expect(data.renderedTools?.["stock-read"]).toBeUndefined();
 
       const mcp = data.renderedTools?.["mcp-friendly"];
-      expect(mcp?.callHtml).toContain("echo (fixture MCP)");
+      expect(mcp?.callHtml).toContain("mcp");
+      expect(mcp?.callHtml).toContain("echo");
+      expect(mcp?.callHtml).toContain("server fixture");
       expect(mcp?.callHtml).not.toContain("mcp__fixture__echo");
+      expect(mcp?.callHtml).not.toContain("hostile");
+      expect(mcp?.resultHtmlCollapsed).toContain("click to show detail");
+      expect(mcp?.resultHtmlCollapsed).not.toMatch(/ctrl|alt|expand/u);
       expect(mcp?.resultHtmlExpanded).toContain("&lt;img src=x onerror=&quot;boom&quot;&gt;&amp; hostile");
+      expect(mcp?.resultHtmlExpanded).not.toContain("click to show detail");
+      expect(mcp?.resultHtmlExpanded).not.toMatch(/ctrl|alt/u);
       expect(JSON.stringify(data.entries)).toContain('"name":"mcp__fixture__echo"');
       expect(JSON.stringify(data.entries)).toContain('"toolName":"mcp__fixture__echo"');
 

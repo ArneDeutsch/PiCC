@@ -490,15 +490,18 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     expectDisclosure(contract);
   });
 
-  // NotebookEdit was reconciled alongside the retirement: its note directs raw
-  // .ipynb editing via Edit and viewing raw JSON via Bash (Read now renders
-  // notebooks cell-aware). This verifies that reconciled note still reads truthfully.
-  it("keeps the NotebookEdit note truthful about editing raw JSON via Edit and viewing via Bash", () => {
+  it("discloses NotebookEdit authorization isolation, revalidation, and persistence limits", () => {
     const ne = lookupCapability("tool.NotebookEdit");
-    expect(ne?.tier).toBe("degraded-noop");
-    expect(ne?.note).toContain("Edit");
-    expect(ne?.note).toContain("Bash");
-    expect(ne?.note).toContain("Read now renders notebooks cell-aware");
+    expect(ne?.tier).toBe("full");
+    expect(ne?.note).toContain("successful notebook Read in the active conversation");
+    expect(ne?.note).toContain("Existing raw cells are addressable");
+    expect(ne?.note).toContain("omitting cell_type on replace preserves the existing type, including raw");
+    expect(ne?.note).toContain("created/requested cell types remain code or markdown");
+    expect(ne?.note).toContain("ordinary child conversations keep independent authorization state");
+    expect(ne?.note).toContain("genuine inheriting main-session fork copies");
+    expect(ne?.note).toContain("canonical file identity and exact bytes");
+    expect(ne?.note).toContain("newest successfully persisted snapshot");
+    expect(ne?.note).toContain("unpersisted revocation or positional-fallback-stale transition");
   });
 
   it("stays in sync with the shipped degrade-stub list, in both directions", () => {
@@ -806,7 +809,7 @@ describe("buildCompatReport", () => {
       ],
     });
     const report = buildCompatReport(project);
-    expect(report.findings.some((f) => f.capability.id === "tool.NotebookEdit")).toBe(true);
+    expect(report.findings.some((f) => f.capability.id === "tool.NotebookEdit")).toBe(false);
     // DELIBERATE TRANSITION: an mcp__* grant stopped being a finding when
     // tool.mcp__* re-tiered to a live partial surface — a supported tool in
     // tools: is as finding-free as Read.
@@ -910,9 +913,7 @@ describe("buildCompatReport", () => {
     });
     const report = buildCompatReport(project);
     const notebook = report.findings.find((f) => f.capability.id === "tool.NotebookEdit");
-    expect(notebook).toBeDefined();
-    expect(notebook?.evidence).toContain('skill "gated-skill"');
-    expect(notebook?.evidence).toContain("allowed-tools:");
+    expect(notebook).toBeUndefined();
     // DELIBERATE TRANSITION: mcp__* in allowed-tools: is no longer a finding —
     // the wildcard re-tiered to a live partial surface with the stdio slice.
     expect(report.findings.some((f) => f.capability.id === "tool.mcp__*")).toBe(false);
@@ -1466,7 +1467,7 @@ describe("MCP pending-approval notify line (report.mcpPendingNotice)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Committed notebook-with-image fixture — a reviewable .ipynb that a durable
+// Committed full-surface notebook fixture — a reviewable .ipynb that a durable
 // artifact carries (in-test Buffers cover the unit layers; this one proves the
 // committed file parses and renders cell-aware). It is TEXT (JSON), so it is
 // deliberately NOT marked `binary` in .gitattributes. The test decodes and
@@ -1474,26 +1475,62 @@ describe("MCP pending-approval notify line (report.mcpPendingNotice)", () => {
 // truncated or malformed payload fails loudly rather than silently rotting.
 // ---------------------------------------------------------------------------
 
-describe("committed notebook-with-image fixture (examples/full-surface/analysis.ipynb)", () => {
+describe("committed full-surface notebook fixture (examples/full-surface/analysis.ipynb)", () => {
   const fixturePath = fileURLToPath(
     new URL("../examples/full-surface/analysis.ipynb", import.meta.url),
   );
   const raw = fs.readFileSync(fixturePath, "utf8");
+  const doc = JSON.parse(raw) as { cells: Array<Record<string, unknown>> };
 
-  it("carries a decodable embedded raster image", () => {
-    const doc = JSON.parse(raw) as {
-      cells: Array<{ outputs?: Array<{ data?: Record<string, unknown> }> }>;
-    };
+  it("carries valid raw and error canaries plus a decodable embedded raster image", () => {
+    expect(doc.cells.find((cell) => cell.id === "raw-notes")).toEqual({
+      cell_type: "raw",
+      id: "raw-notes",
+      metadata: {
+        fixture_canary: "raw-cell-metadata",
+        fixture_custom: { preserve: ["raw-custom-field"] },
+        nested: { preserve: true },
+      },
+      source: ["RAW_CELL_SENTINEL\n", "Preserve this source representation."],
+    });
+
+    expect(doc.cells.find((cell) => cell.id === "expected-error")).toEqual({
+      cell_type: "code",
+      id: "expected-error",
+      execution_count: 3,
+      metadata: {
+        fixture_canary: "error-cell-metadata",
+        fixture_custom: "error-cell-custom-field",
+      },
+      outputs: [{
+        output_type: "error",
+        ename: "FixtureError",
+        evalue: "STABLE_ERROR_VALUE",
+        traceback: [
+          "Traceback (most recent call last):",
+          "  <fixture traceback sentinel>",
+          "FixtureError: STABLE_ERROR_VALUE",
+        ],
+      }],
+      source: ["raise FixtureError('STABLE_ERROR_VALUE')"],
+    });
+
     const b64 = doc.cells
-      .flatMap((c) => c.outputs ?? [])
-      .map((o) => o.data?.["image/png"])
-      .find((v): v is string => typeof v === "string");
+      .flatMap((cell) => Array.isArray(cell.outputs) ? cell.outputs : [])
+      .map((output) => {
+        if (output === null || typeof output !== "object") return undefined;
+        const data = (output as Record<string, unknown>).data;
+        return data !== null && typeof data === "object"
+          ? (data as Record<string, unknown>)["image/png"]
+          : undefined;
+      })
+      .find((value): value is string => typeof value === "string");
     expect(b64, "fixture must embed an image/png output").toBeDefined();
     // Decode + magic-byte sniff: a truncated/malformed payload fails here.
     expect(sniffImageMime(Buffer.from(b64!, "base64"))).toBe("image/png");
   });
 
-  it("renders the committed notebook cell-aware, degrading the image to a placeholder off-vision", async () => {
+  it("renders every committed surface cell-aware, degrading the image to a placeholder off-vision", async () => {
     const { content } = await renderNotebook(raw, { model: { input: ["text"] } });
     const text = content
       .filter((b): b is { type: "text"; text: string } => b.type === "text")
@@ -1501,6 +1538,11 @@ describe("committed notebook-with-image fixture (examples/full-surface/analysis.
       .join("\n");
     expect(text).toContain("=== Cell 0 (markdown");
     expect(text).toContain("training complete");
+    expect(text).toContain("=== Cell 4 (raw, id=raw-notes) ===");
+    expect(text).toContain("RAW_CELL_SENTINEL");
+    expect(text).toContain("=== Cell 5 (code, id=expected-error) ===");
+    expect(text).toContain("FixtureError: STABLE_ERROR_VALUE");
+    expect(text).toContain("<fixture traceback sentinel>");
     // Off-vision: the raster output is a text placeholder, not an image block.
     expect(content.some((b) => b.type === "image")).toBe(false);
     expect(text).toContain("image/png");

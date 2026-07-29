@@ -1,5 +1,6 @@
 # Shell scripts must check out with LF on every platform — sh chokes on CRLF.
 *.sh text eol=lf
+*.ipynb text eol=lf
 .githooks/* text eol=lf
 # .mjs scripts carry a shebang; a CRLF checkout (core.autocrlf on Windows) makes
 # node/esbuild choke on "#!…\r" with "Invalid or unexpected token" — force LF.

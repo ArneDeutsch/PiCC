@@ -363,7 +363,7 @@ function runtimeFor(
         return { block, blockReason: block ? "restoration rejected" : undefined, askDowngraded: false, diagnostics: [] };
       },
     }),
-    customToolsFor: (_agent, _granted, _depth, _owner, _fork, _cwd, _activation, captureStop) => {
+    customToolsFor: (_agent, _granted, _depth, _owner, _fork, _cwd, _notebook, _activation, captureStop) => {
       if (captureStop && capturedStopFactories) capturedStopFactories.push(captureStop);
       return [
       {

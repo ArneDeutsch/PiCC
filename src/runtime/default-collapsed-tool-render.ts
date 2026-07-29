@@ -7,6 +7,7 @@ import {
 } from "./routine-tool-render.js";
 import {
   priorityDisplayRow,
+  semanticDisplayRow,
   formatDisplayPathFromRoots,
   formatToolDisplayName,
   resolveDisplayRoots,
@@ -45,21 +46,30 @@ interface CallOwnedLifecycle {
   displayRoots?: DisplayRoots;
   displayPath?: string;
   rootsResolved: boolean;
-  ordinary?: boolean;
+  ordinary?: OrdinaryCallOwnedResult;
   malformedArgs?: boolean;
   resultFallback?: string;
 }
 
 interface MutableCallSlot extends Component {
-  concise(fields: CallOwnedFields): void;
+  concise(fields: CallOwnedFields, theme: unknown): void;
   native(component: Component): void;
   warn(message: string): void;
 }
 
 interface CallOwnedFields {
-  tool: "read" | "bash";
+  action: "read" | "bash";
   primary: string;
-  suffix: string;
+  required: readonly { text: string; tone: "muted" | "warning" }[];
+  optional: readonly string[];
+  cue?: string;
+  compactCue?: string;
+}
+
+interface OrdinaryCallOwnedResult {
+  continuation?: ReadContinuation;
+  retained: boolean;
+  truncated: boolean;
 }
 
 interface FileSummary { kind: "file"; path: string; lines: number }
@@ -73,6 +83,39 @@ const MAX_ARRAY = 1_000;
 
 function data(value: unknown): Data | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Data : undefined;
+}
+
+function ownDataRecord(value: unknown, allowed: readonly string[]): Data | undefined {
+  if (!data(value)) return undefined;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return undefined;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const keys = Reflect.ownKeys(descriptors);
+    if (keys.some((key) => typeof key !== "string" || !allowed.includes(key))) return undefined;
+    const result: Data = {};
+    for (const key of keys as string[]) {
+      const descriptor = descriptors[key];
+      if (!descriptor || !("value" in descriptor)) return undefined;
+      result[key] = descriptor.value;
+    }
+    return result;
+  } catch { return undefined; }
+}
+
+function singleOwnDataArray(value: unknown): unknown | undefined {
+  if (!Array.isArray(value)) return undefined;
+  try {
+    if (Object.getPrototypeOf(value) !== Array.prototype) return undefined;
+    const descriptors = Object.getOwnPropertyDescriptors(value) as Record<string, PropertyDescriptor>;
+    const keys = Reflect.ownKeys(descriptors);
+    if (keys.length !== 2 || !keys.includes("0") || !keys.includes("length")) return undefined;
+    const item = descriptors["0"];
+    const length = descriptors["length"];
+    return item && "value" in item && length && "value" in length && length.value === 1
+      ? item.value
+      : undefined;
+  } catch { return undefined; }
 }
 
 function exact(value: unknown, keys: readonly string[]): Data | undefined {
@@ -91,8 +134,8 @@ const sanitize = sanitizeDisplayText;
 
 function displayArgs(toolName: ToolName, value: unknown): Data | undefined {
   if (toolName === "read") {
-    const args = data(value);
-    if (!args || !Object.keys(args).every((key) => ["path", "offset", "limit"].includes(key)) ||
+    const args = ownDataRecord(value, ["path", "offset", "limit"]);
+    if (!args ||
       typeof args.path !== "string" || args.path.length > MAX_PATH) return undefined;
     for (const key of ["offset", "limit"] as const) {
       if (args[key] !== undefined && (!Number.isSafeInteger(args[key]) || (args[key] as number) < 1)) return undefined;
@@ -110,10 +153,12 @@ function displayArgs(toolName: ToolName, value: unknown): Data | undefined {
       : undefined;
   }
   if (toolName === "bash") {
-    const args = data(value);
-    if (!args || !Object.keys(args).every((key) => key === "command" || key === "timeout") ||
+    const args = ownDataRecord(value, ["command", "timeout"]);
+    const maxTimeoutSeconds = 2_147_483_647 / 1_000;
+    if (!args ||
       typeof args.command !== "string" || args.command.length > MAX_TEXT ||
-      (args.timeout !== undefined && (typeof args.timeout !== "number" || !Number.isFinite(args.timeout)))) return undefined;
+      (args.timeout !== undefined && (typeof args.timeout !== "number" || !Number.isFinite(args.timeout) ||
+        args.timeout <= 0 || args.timeout > maxTimeoutSeconds))) return undefined;
     const command = args.command.split(/\r\n|\n|\r|\u2028|\u2029/u)
       .map((line) => sanitize(line, MAX_TEXT, true)).join("\n");
     return { command, ...(args.timeout === undefined ? {} : { timeout: args.timeout }) };
@@ -303,23 +348,36 @@ function finalAgreement(options: unknown, context: unknown): boolean {
     booleanField(context, "isError") === false;
 }
 
+interface ExactReadTextResult {
+  text: string;
+  details: unknown;
+  isError: unknown;
+}
+
+function exactReadTextResult(result: unknown): ExactReadTextResult | undefined {
+  const envelope = ownDataRecord(result, ["content", "details", "isError"]);
+  if (!envelope || envelope.details !== undefined ||
+    (envelope.isError !== undefined && envelope.isError !== false)) return undefined;
+  const item = singleOwnDataArray(envelope.content);
+  const block = ownDataRecord(item, ["type", "text"]);
+  return block && Object.keys(block).length === 2 && block.type === "text" && typeof block.text === "string"
+    ? { text: block.text, details: envelope.details, isError: envelope.isError }
+    : undefined;
+}
+
 function readContinuationSummary(args: Data, result: unknown): ReadContinuation | undefined {
   const limit = args.limit;
   if (!Number.isSafeInteger(limit) || (limit as number) < 1) return undefined;
-  const envelope = data(result);
-  if (!envelope || !canonicalEnvelope(result) || envelope.details !== undefined ||
-    (envelope.isError !== undefined && envelope.isError !== false) || !Array.isArray(envelope.content) ||
-    envelope.content.length !== 1) return undefined;
-  const block = exact(envelope.content[0], ["type", "text"]);
-  if (!block || block.type !== "text" || typeof block.text !== "string") return undefined;
-  const match = /\n\n\[([1-9]\d*) more lines in file\. Use offset=([1-9]\d*) to continue\.\]$/u.exec(block.text);
+  const snapshot = exactReadTextResult(result);
+  if (!snapshot) return undefined;
+  const match = /\n\n\[([1-9]\d*) more lines in file\. Use offset=([1-9]\d*) to continue\.\]$/u.exec(snapshot.text);
   if (!match) return undefined;
   const remaining = Number(match[1]);
   const nextOffset = Number(match[2]);
   const start = typeof args.offset === "number" ? args.offset : 1;
   if (!Number.isSafeInteger(remaining) || !Number.isSafeInteger(nextOffset) ||
     nextOffset !== start + (limit as number)) return undefined;
-  const payload = block.text.slice(0, match.index);
+  const payload = snapshot.text.slice(0, match.index);
   if (/\[[1-9]\d* more lines in file\. Use offset=[1-9]\d* to continue\.\]/u.test(payload) ||
     payload.split("\n").length !== limit) return undefined;
   return { remaining, nextOffset };
@@ -423,32 +481,18 @@ const EMPTY_COMPONENT: Component = Object.freeze({ render: () => [] });
 const EVIDENCE_PREFIX = 512;
 const EVIDENCE_TAIL = 1_024;
 
-function conciseCallLines(fields: CallOwnedFields, width: number): string[] {
-  if (!Number.isFinite(width) || width <= 0) return [""];
-  const columns = Math.floor(width);
-  const prefix = fields.tool === "bash" ? "bash $ " : "read ";
-  if (visibleWidth(prefix) >= columns) return [truncateToWidth(prefix, columns, "…")];
-  const suffixWidth = visibleWidth(fields.suffix);
-  const available = Math.max(1, columns - visibleWidth(prefix) - suffixWidth);
-  const primary = visibleWidth(fields.primary) > available
-    ? truncateToWidth(fields.primary, available, "…")
-    : fields.primary;
-  const line = `${prefix}${primary}${fields.suffix}`;
-  return [visibleWidth(line) <= columns ? line : truncateToWidth(line, columns, "…")];
-}
-
-function mutableCallSlot(initial: CallOwnedFields): MutableCallSlot {
-  let fields = initial;
+function mutableCallSlot(initial: CallOwnedFields, initialTheme: unknown): MutableCallSlot {
+  let overview = semanticDisplayRow(initial, initialTheme);
   let delegate: Component | undefined;
   let warning: string | undefined;
   return {
-    concise(next) { fields = next; delegate = undefined; warning = undefined; },
+    concise(next, theme) { overview = semanticDisplayRow(next, theme); delegate = undefined; warning = undefined; },
     native(component) { delegate = component; warning = undefined; },
     warn(message) { delegate = undefined; warning = sanitize(message, 512, true); },
     render(width) {
       if (warning !== undefined) return [clamp(warning, width)];
       if (delegate) return delegate.render(width).map((line) => clamp(line, width));
-      return conciseCallLines(fields, width);
+      return overview.render(width);
     },
   };
 }
@@ -462,21 +506,38 @@ function readRange(args: Data): string {
   return `:${offset}-${offset + limit - 1}`;
 }
 
-function commandIdentity(command: string): { primary: string; suffix: string } {
+function commandIdentity(command: string): { primary: string; multiline: boolean } {
   const lines = command.split(/\r\n|\n|\r|\u2028|\u2029/gu)
     .map((line) => sanitize(line, MAX_TEXT, true))
-    .filter((line) => line.length > 0);
-  return { primary: lines[0] ?? "...", suffix: lines.length > 1 ? " [ …]" : "" };
+    .filter((line) => line.trim().length > 0);
+  return { primary: lines[0] ?? "...", multiline: lines.length > 1 };
 }
 
-function callOwnedFields(toolName: "read" | "bash", args: Data, displayPath?: string): CallOwnedFields {
+function callOwnedFields(
+  toolName: "read" | "bash",
+  args: Data,
+  displayPath?: string,
+  outcome: OrdinaryCallOwnedResult = { retained: false, truncated: false },
+  hint?: string,
+): CallOwnedFields {
+  const cue = outcome.retained && hint ? `${hint} to expand` : undefined;
   if (toolName === "read") {
     const path = typeof args.path === "string" ? args.path : "...";
-    return { tool: "read", primary: displayPath ?? path, suffix: readRange(args) };
+    return {
+      action: "read",
+      primary: `${displayPath ?? path}${readRange(args)}`,
+      required: outcome.continuation ? [{ text: `${outcome.continuation.remaining} more lines`, tone: "muted" }] : [],
+      optional: [], cue, compactCue: cue ? hint : undefined,
+    };
   }
   const command = commandIdentity(typeof args.command === "string" ? args.command : "...");
-  const timeout = typeof args.timeout === "number" ? ` (timeout ${args.timeout}s)` : "";
-  return { tool: "bash", primary: command.primary, suffix: `${command.suffix}${timeout}` };
+  return {
+    action: "bash",
+    primary: `$ ${command.primary}`,
+    required: outcome.truncated ? [{ text: "output truncated", tone: "warning" }] : [],
+    optional: [command.multiline ? "multiline" : "", typeof args.timeout === "number" ? `timeout ${args.timeout}s` : ""],
+    cue, compactCue: cue ? hint : undefined,
+  };
 }
 
 const MAX_EVIDENCE_BLOCKS = 4;
@@ -586,26 +647,73 @@ function isUserAborted(status: string | undefined): boolean {
   return status !== undefined && /\b(?:aborted|cancelled)\b/iu.test(status);
 }
 
+const TRUNCATION_KEYS = [
+  "content", "truncated", "truncatedBy", "totalLines", "totalBytes", "outputLines", "outputBytes",
+  "lastLinePartial", "firstLineExceedsLimit", "maxLines", "maxBytes",
+] as const;
+
+function exactBashTruncation(value: unknown): boolean {
+  const truncation = ownDataRecord(value, TRUNCATION_KEYS);
+  if (!truncation || Object.keys(truncation).length !== TRUNCATION_KEYS.length ||
+    typeof truncation.content !== "string" || truncation.truncated !== true ||
+    (truncation.truncatedBy !== "lines" && truncation.truncatedBy !== "bytes") ||
+    typeof truncation.lastLinePartial !== "boolean" || typeof truncation.firstLineExceedsLimit !== "boolean") return false;
+  for (const key of ["totalLines", "totalBytes", "outputLines", "outputBytes", "maxLines", "maxBytes"] as const) {
+    if (!Number.isSafeInteger(truncation[key]) || (truncation[key] as number) < 0) return false;
+  }
+  const totalLines = truncation.totalLines as number;
+  const totalBytes = truncation.totalBytes as number;
+  const outputLines = truncation.outputLines as number;
+  const outputBytes = truncation.outputBytes as number;
+  const maxLines = truncation.maxLines as number;
+  const maxBytes = truncation.maxBytes as number;
+  if (maxLines < 1 || maxBytes < 1 || outputLines > totalLines || outputBytes > totalBytes ||
+    outputLines > maxLines || outputBytes > maxBytes || truncation.firstLineExceedsLimit !== false) return false;
+  if (truncation.truncatedBy === "lines") {
+    return totalLines > maxLines && totalBytes > outputBytes && outputLines === maxLines &&
+      truncation.lastLinePartial === false;
+  }
+  if (totalBytes <= maxBytes) return false;
+  if (truncation.lastLinePartial === true) return outputLines === 1 && outputBytes > 0;
+  return outputLines === 0 ? outputBytes === 0 : totalLines > outputLines;
+}
+
+function exactBashSuccess(result: unknown): OrdinaryCallOwnedResult | undefined {
+  const envelope = ownDataRecord(result, ["content", "details", "isError"]);
+  if (!envelope || (envelope.isError !== undefined && envelope.isError !== false)) return undefined;
+  const content = singleOwnDataArray(envelope.content);
+  const block = ownDataRecord(content, ["type", "text"]);
+  if (!block || Object.keys(block).length !== 2 || block.type !== "text" || typeof block.text !== "string") return undefined;
+  const details = envelope.details;
+  if (details === undefined) {
+    return { retained: block.text !== "" && block.text !== "(no output)", truncated: false };
+  }
+  const exactDetails = ownDataRecord(details, ["truncation", "fullOutputPath"]);
+  if (!exactDetails || Object.keys(exactDetails).length === 0) return undefined;
+  if (exactDetails.fullOutputPath !== undefined &&
+    (typeof exactDetails.fullOutputPath !== "string" || exactDetails.fullOutputPath.length === 0)) return undefined;
+  const truncated = exactDetails.truncation !== undefined;
+  if (truncated && !exactBashTruncation(exactDetails.truncation)) return undefined;
+  if (!truncated && exactDetails.fullOutputPath === undefined) return undefined;
+  return { retained: true, truncated };
+}
+
 function ordinaryCallOwnedResult(
   toolName: "read" | "bash",
+  args: Data,
   result: unknown,
   options: unknown,
   context: unknown,
   status?: string,
-): boolean {
+): OrdinaryCallOwnedResult | undefined {
   if (booleanField(options, "isPartial") !== false || booleanField(context, "isPartial") !== false ||
-    booleanField(context, "isError") !== false) return false;
-  const envelope = data(result);
-  if (!envelope) return false;
-  const keys = Object.keys(envelope);
-  if (!keys.every((key) => key === "content" || key === "details" || key === "isError") ||
-    envelope.details !== undefined || envelope.isError === true) return false;
-  const kind = supportedEnvelope(result);
-  if (kind !== "text") return false;
-  const text = boundedText(result);
-  if (text === undefined) return false;
-  if (toolName === "bash") return true;
-  return status?.startsWith("[") !== true;
+    booleanField(context, "isError") !== false) return undefined;
+  if (toolName === "bash") return exactBashSuccess(result);
+  const snapshot = exactReadTextResult(result);
+  if (!snapshot) return undefined;
+  const continuation = readContinuationSummary(args, result);
+  if (!continuation && status?.startsWith("[") === true) return undefined;
+  return { continuation, retained: snapshot.text !== "", truncated: false };
 }
 
 function collapsedExceptionalEvidence(
@@ -645,10 +753,16 @@ function withCallOwnedRendering<T extends ToolDefinition>(
   };
   const decorated = { ...tool } as T;
 
-  const setConcise = (current: CallOwnedLifecycle, args: Data): MutableCallSlot => {
-    const fields = callOwnedFields(toolName, args, current.displayPath);
-    current.callSlot ??= mutableCallSlot(fields);
-    current.callSlot.concise(fields);
+  const setConcise = (
+    current: CallOwnedLifecycle,
+    args: Data,
+    theme: unknown,
+    outcome: OrdinaryCallOwnedResult = { retained: false, truncated: false },
+  ): MutableCallSlot => {
+    const hint = bindingHint();
+    const fields = callOwnedFields(toolName, args, current.displayPath, outcome, hint);
+    current.callSlot ??= mutableCallSlot(fields, theme);
+    current.callSlot.concise(fields, theme);
     current.callExpanded = false;
     current.callFailed = false;
     return current.callSlot;
@@ -659,7 +773,7 @@ function withCallOwnedRendering<T extends ToolDefinition>(
     theme: unknown,
     context: unknown,
   ): MutableCallSlot => {
-    const slot = current.callSlot ??= mutableCallSlot(callOwnedFields(toolName, args, current.displayPath));
+    const slot = current.callSlot ??= mutableCallSlot(callOwnedFields(toolName, args, current.displayPath), theme);
     try {
       current.nativeCall = nativeCall(args, theme, nativeContext(context, args, current.nativeCall, true));
       slot.native(current.nativeCall);
@@ -686,7 +800,7 @@ function withCallOwnedRendering<T extends ToolDefinition>(
     }
     if (!args) {
       current.malformedArgs = true;
-      const slot = current.callSlot ??= mutableCallSlot(callOwnedFields(toolName, {}, undefined));
+      const slot = current.callSlot ??= mutableCallSlot(callOwnedFields(toolName, {}, undefined), theme);
       slot.warn(`${toolName} (unfamiliar arguments)`);
       setToolRowOutcome(context, "failure");
       return slot;
@@ -695,8 +809,8 @@ function withCallOwnedRendering<T extends ToolDefinition>(
     current.args = args;
     if (!current.rootsResolved && booleanField(context, "argsComplete") !== false) {
       current.displayRoots = resolveDisplayRoots(dependencies.resolveDisplayRoot, dependencies.repositoryRoot, context);
-      const rawPath = data(argsValue)?.path;
-      if (toolName === "read" && typeof rawPath === "string") {
+      const rawPath = toolName === "read" ? ownDataRecord(argsValue, ["path", "offset", "limit"])?.path : undefined;
+      if (typeof rawPath === "string") {
         // Classify the validated invocation path before neutralizing its display representation.
         current.displayPath = sanitizeInlineDisplay(formatDisplayPathFromRoots(rawPath, current.displayRoots), MAX_PATH);
       }
@@ -712,13 +826,13 @@ function withCallOwnedRendering<T extends ToolDefinition>(
         current.nativeCall = undefined;
         current.callExpanded = false;
         current.callFailed = true;
-        const slot = current.callSlot ??= mutableCallSlot(callOwnedFields(toolName, args, current.displayPath));
+        const slot = current.callSlot ??= mutableCallSlot(callOwnedFields(toolName, args, current.displayPath), theme);
         slot.warn("bash $ ...");
         setToolRowOutcome(context, "failure");
         return slot;
       }
     }
-    return setConcise(current, args);
+    return setConcise(current, args, theme);
   }) as T["renderCall"];
 
   decorated.renderResult = ((resultValue: unknown, options: unknown, theme: unknown, context: unknown): Component => {
@@ -743,29 +857,43 @@ function withCallOwnedRendering<T extends ToolDefinition>(
       } catch { return messageComponent(exceptionalEvidence(resultValue, "Renderer failed", operations), theme); }
     }
 
-    const malformedResult = supportedEnvelope(resultValue) === undefined && canonicalEnvelope(resultValue);
+    let status = toolName === "read" || booleanField(context, "isError") === true
+      ? recognizedStatus(toolName, resultValue, operations)
+      : undefined;
+    if (!partial) current.ordinary = ordinaryCallOwnedResult(toolName, args, resultValue, options, context, status);
+
+    const malformedBashSuccess = toolName === "bash" && !partial && booleanField(context, "isError") === false &&
+      current.ordinary === undefined;
+    const malformedResult = toolName !== "bash" && supportedEnvelope(resultValue) === undefined && canonicalEnvelope(resultValue);
     if (malformedResult) {
       current.nativeResult = undefined;
       current.resultFallback = undefined;
       current.callExpanded = false;
-      const slot = current.callSlot ??= mutableCallSlot(callOwnedFields(toolName, args, current.displayPath));
+      const slot = current.callSlot ??= mutableCallSlot(callOwnedFields(toolName, args, current.displayPath), theme);
       slot.warn(`${toolName} (unfamiliar result)`);
       setToolRowOutcome(context, "failure");
       return EMPTY_COMPONENT;
     }
 
-    if (expanded) {
+    if (expanded || malformedBashSuccess) {
       if (!current.callExpanded) setNativeCall(current, args, theme, context);
-    } else if (!current.callFailed) setConcise(current, args);
+    } else if (!current.callFailed) setConcise(current, args, theme, current.ordinary);
     else setToolRowOutcome(context, "failure");
 
-    let status = toolName === "read" || booleanField(context, "isError") === true
-      ? recognizedStatus(toolName, resultValue, operations)
-      : undefined;
-    if (!partial) current.ordinary = ordinaryCallOwnedResult(toolName, resultValue, options, context, status);
     if (!current.ordinary && status === undefined) status = recognizedStatus(toolName, resultValue, operations);
     if (booleanField(context, "isError") === true && isUserAborted(status)) setToolRowOutcome(context, "stopped");
-    const envelopeKind = supportedEnvelope(resultValue);
+    if (malformedBashSuccess) {
+      try {
+        current.nativeResult = nativeResult(resultValue, { expanded: true, isPartial: false }, theme,
+          nativeContext(context, args, current.nativeResult, true));
+        current.resultFallback = undefined;
+        return current.nativeResult;
+      } catch {
+        current.nativeResult = undefined;
+        return evidenceComponent(status ?? "Unfamiliar result", theme, operations);
+      }
+    }
+    const envelopeKind = toolName === "bash" && current.ordinary ? "text" : supportedEnvelope(resultValue);
     const successfulImage = toolName === "read" && booleanField(context, "isError") === false &&
       (envelopeKind === "image" || envelopeKind === "mixed")
       ? successfulReadImageEnvelope(resultValue, operations)

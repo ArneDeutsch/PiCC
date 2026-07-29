@@ -2501,6 +2501,8 @@ describe("TaskOutput live streaming", () => {
       () => {},
       AGENT_ID,
       "coder",
+      undefined,
+      "Review authentication",
     );
     return { registry, id, release };
   }
@@ -2525,17 +2527,78 @@ describe("TaskOutput live streaming", () => {
     // At least one partial renders as the single identity/state line. The
     // emission still carries the full snapshot for panel/RPC/detail consumers.
     const identified = partials.some((p) => {
-      const r = renderUpdate(p);
+      const canonical = structuredClone(p);
+      const serialized = JSON.stringify(p);
+      const r = taskOutput.renderResult(p, { isPartial: true }, undefined, {
+        state: {}, args: { task_id: id }, isError: false,
+      }).render(120).join("\n");
+      expect(p).toEqual(canonical);
+      expect(JSON.stringify(p)).toBe(serialized);
+      expect(p.details).not.toHaveProperty("description");
+      expect(serialized).not.toContain("Review authentication");
       return (
-        r.includes("task output " + id) &&
+        r.includes("task output Review authentication") &&
         r.includes("coder") &&
-        r.includes("[running]") &&
+        r.includes(id) &&
+        r.includes("running") &&
         !r.includes("Grep") &&
         !r.includes("\n") && // one status line, no tail
         (p.details?.subagentProgress as ProgressSnapshot | undefined)?.tail.includes("> Grep (x)") === true
       );
     });
     expect(identified).toBe(true);
+    const wirePartial = partials.find((p) => p.details?.subagentProgress !== undefined)!;
+    expect(wirePartial).toEqual({
+      content: [{ type: "text", text: renderProgressText(snap) }],
+      details: {
+        subagentProgress: snap,
+        admission: "admitted",
+        status: "running",
+        agent: "coder",
+        taskId: id,
+        agentId: AGENT_ID,
+        live: true,
+      },
+    });
+    expect(JSON.stringify(wirePartial)).toBe(
+      '{"content":[{"type":"text","text":"> Grep (x)\\n… running Grep…"}],"details":{"subagentProgress":{"tail":["> Grep (x)"],"activity":"running Grep…"},"admission":"admitted","status":"running","agent":"coder","taskId":"task-1","agentId":"agent-aabbccddeeff","live":true}}',
+    );
+    expect(Object.keys(wirePartial.details ?? {})).toEqual([
+      "subagentProgress", "admission", "status", "agent", "taskId", "agentId", "live",
+    ]);
+
+    const renderPartial = (
+      value: ToolUpdate,
+      options: Record<string, unknown> = { isPartial: true },
+      args: Record<string, unknown> = { task_id: id },
+      tool: StreamTool = taskOutput,
+    ) => tool.renderResult(value, options, undefined, {
+      state: {}, args, isError: false,
+    }).render(120).join("\n");
+    const foreign = structuredClone(wirePartial);
+    foreign.details!.taskId = "task-999";
+    const malformed = [
+      [foreign, { isPartial: true }, { task_id: id }],
+      [wirePartial, { isPartial: true, future: true }, { task_id: id }],
+      [wirePartial, { isPartial: true }, { task_id: id, wait: false }],
+      [{ ...wirePartial, isError: true }, { isPartial: true }, { task_id: id }],
+      [{ ...wirePartial, content: [...wirePartial.content, { type: "text", text: "extra" }] }, { isPartial: true }, { task_id: id }],
+      [{ ...wirePartial, details: { ...wirePartial.details, future: true } }, { isPartial: true }, { task_id: id }],
+    ] as const;
+    for (const [value, options, args] of malformed) {
+      const rendered = renderPartial(value as ToolUpdate, options, args);
+      expect(rendered).not.toContain("Review authentication");
+      expect(rendered).toContain(id);
+      expect(rendered).not.toContain("task-999");
+    }
+
+    const callerInjected = createTaskOutputTool(registry, {
+      awaitedTaskOutputFallback: { taskId: id, description: "caller injected" },
+      taskOutputDescription: { taskId: id, description: "legacy caller injected" },
+    } as never) as unknown as StreamTool;
+    const injectionRender = renderPartial(wirePartial, { isPartial: false }, { task_id: id }, callerInjected);
+    expect(injectionRender).toContain(`task output coder · running · ${id}`);
+    expect(injectionRender).not.toContain("caller injected");
     // Resolves to the final verbatim result.
     expect(final.content[0]!.text).toBe(
       `final answer${agentTrailerFrame(AGENT_ID, { completed: true })}\nusage: ${formatUsageCompact(USAGE)}`,
@@ -2573,6 +2636,9 @@ describe("TaskOutput live streaming", () => {
     const taskOutput = createTaskOutputTool(registry) as unknown as StreamTool;
     const polled = await taskOutput.execute("poll", { task_id: id, wait: false });
     expect(polled.content[0]!.text).toContain("waiting for configured concurrency capacity");
+    expect(taskOutput.renderResult(polled, { isPartial: false }, undefined, {
+      state: {}, args: { task_id: id, wait: false }, isError: false,
+    }).render(120).join("\n")).toContain("task output Review authentication · waiting for capacity");
     expect(polled.details).toMatchObject({ status: "running", admission: "waiting" });
     expect(registry.changeSubscriberCount(id)).toBe(0);
     registry.stop(id);

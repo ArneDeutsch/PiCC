@@ -288,13 +288,15 @@ where to start reading, not the extent of its cluster.
 Two invariants that are easy to get backwards when adding a tool:
 
 - A `Read(…)` rule expands across the file-**read** family (`Grep`, `Glob`, `NotebookRead`) on a
-  matching path, and an `Edit(…)` rule across the file-**edit** family (including `MultiEdit`). The
-  expansion does **not** run back the other way: a `Grep(…)` rule does not gate `Read`, just as
-  `Write` does not gate `Edit`.
+  matching path, and an `Edit(…)` rule across the file-**edit** family (`Write`, `MultiEdit`,
+  `NotebookEdit`). The expansion does **not** run back the other way: a `Grep(…)` rule does not gate
+  `Read`, just as `Write` does not gate `Edit`.
+- A direct scoped `NotebookEdit(path)` rule is accepted but never matched; startup diagnostics direct
+  each allow/deny/ask occurrence to `Edit(path)`. A bare `NotebookEdit` still matches the tool.
 - One cross runs the *other* way, and only in the deny direction: a path-scoped `deny: Read(<glob>)`
   also blocks `Edit`/`MultiEdit` on that path, mirroring Claude Code 2.1.208 (denying reads of a path
-  also prevents clobbering or recreating it). Being deny-only is the point — `allow: Read` must never
-  grant `Edit`.
+  also prevents clobbering or recreating it). `Write` and `NotebookEdit` are deliberately outside
+  this cross. Being deny-only is the point — `allow: Read` must never grant `Edit`.
 
 `MultiEdit` is a **real writer**, so a project cannot treat it as a degraded no-op safety net; its
 `Edit`/`MultiEdit` deny rules are what hold.

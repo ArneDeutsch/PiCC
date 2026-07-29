@@ -1,9 +1,11 @@
 import { Compile } from "typebox/compile";
 import type { TSchema } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
-import { sanitizeDisplayText } from "./render-util.js";
+import { semanticDisplayRow } from "./tool-display.js";
+import { sanitizeDisplayText, themedFg } from "./render-util.js";
+import { piToolsExpandKeyText } from "./pi-tui-runtime.js";
 import type { McpRuntime } from "./mcp.js";
 
 /**
@@ -34,8 +36,8 @@ const SCHEMA_MAX_CHARS = 32_768;
 const WIRE_NAME_MAX_CHARS = 64;
 /** Bound on a tool name/value quoted inside a diagnostic (mirrors mcp.ts's sliceForDiag). */
 const DIAG_NAME_MAX_CHARS = 200;
-/** Display-sanitization cap, matching the tool-row renderers' per-text bound. */
-const DISPLAY_TEXT_MAX_CHARS = 1_000_000;
+const FAIL_OPEN_TEXT_MAX_CHARS = 4_096;
+const FAIL_OPEN_LINE_MAX = 16;
 
 /**
  * Bounded, neutralized quoting of a name or value inside a diagnostic. Unlike
@@ -236,6 +238,198 @@ function mapCallResult(result: unknown, serverName: string): { text: string; isE
   return { text: parts.join("\n"), isError: record.isError === true };
 }
 
+interface DisplayComponent {
+  render(width: number): string[];
+  invalidate(): void;
+}
+
+interface RetainedMcpSuccess {
+  readonly owner: object;
+  readonly source: string;
+  sanitized?: string;
+  readonly wrapped: Map<number, string[]>;
+}
+
+interface McpDisplayLifecycle {
+  success?: RetainedMcpSuccess;
+  reveal: boolean;
+  cue?: string;
+  theme?: unknown;
+  call?: DisplayComponent;
+}
+
+const EMPTY_COMPONENT: DisplayComponent = Object.freeze({ render: () => [], invalidate() {} });
+
+function objectKey(value: unknown): object | undefined {
+  return ((typeof value === "object" && value !== null) || typeof value === "function")
+    ? value as object
+    : undefined;
+}
+
+function ownValue(value: unknown, key: PropertyKey): { found: boolean; value?: unknown } {
+  const object = objectKey(value);
+  if (!object) return { found: false };
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    return descriptor && "value" in descriptor
+      ? { found: true, value: descriptor.value }
+      : { found: false };
+  } catch {
+    return { found: false };
+  }
+}
+
+function isArray(value: unknown): value is unknown[] {
+  try { return Array.isArray(value); } catch { return false; }
+}
+
+function exactOwnKeys(value: unknown, expected: readonly string[]): boolean {
+  const object = objectKey(value);
+  if (!object) return false;
+  try {
+    if (Object.getPrototypeOf(object) !== Object.prototype) return false;
+    const keys = Reflect.ownKeys(object);
+    return keys.length === expected.length && keys.every((key) =>
+      typeof key === "string" && expected.includes(key) && ownValue(object, key).found);
+  } catch {
+    return false;
+  }
+}
+
+function exactMcpSuccess(
+  result: unknown,
+  options: unknown,
+  context: unknown,
+  serverName: string,
+  toolName: string,
+): { owner: object; source: string } | undefined {
+  if (ownValue(options, "isPartial").value !== false || ownValue(context, "isPartial").value !== false ||
+    ownValue(context, "isError").value !== false) return undefined;
+  const resultError = ownValue(result, "isError");
+  if (resultError.found && resultError.value !== false) return undefined;
+
+  const details = ownValue(result, "details");
+  if (!details.found || !exactOwnKeys(details.value, ["server", "tool"]) ||
+    ownValue(details.value, "server").value !== serverName || ownValue(details.value, "tool").value !== toolName) {
+    return undefined;
+  }
+  const content = ownValue(result, "content");
+  if (!content.found || !isArray(content.value)) return undefined;
+  try {
+    if (Object.getPrototypeOf(content.value) !== Array.prototype || content.value.length !== 1 ||
+      Reflect.ownKeys(content.value).length !== 2) return undefined;
+  } catch {
+    return undefined;
+  }
+  const blockEntry = ownValue(content.value, "0");
+  const owner = objectKey(blockEntry.value);
+  if (!blockEntry.found || !owner || !exactOwnKeys(owner, ["type", "text"]) ||
+    ownValue(owner, "type").value !== "text") return undefined;
+  const text = ownValue(owner, "text");
+  return text.found && typeof text.value === "string" ? { owner, source: text.value } : undefined;
+}
+
+// MCP server text is hostile: C1/OSC controls can retitle the terminal or spoof surrounding rows.
+// Sanitize only the human display copy here; canonical/model-visible MCP text remains verbatim.
+function sanitizeCompleteMcpText(source: string): string {
+  let text = source;
+  try { text = text.normalize("NFC"); } catch { /* Keep the complete original string. */ }
+  return text
+    .replace(/(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c|$)/gu, "�")
+    .replace(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]?/gu, "�")
+    .replace(/\u001b(?:[ -/]*[@-~]?|.)?/gu, "�")
+    .replace(/\r\n/gu, "\n")
+    .replace(/\r/gu, "�")
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) =>
+      character === "\n" ? "\n" : character === "\t" ? "   " : "�");
+}
+
+function clampDisplayLine(line: string, width: number): string {
+  if (!Number.isFinite(width) || width <= 0) return "";
+  const columns = Math.floor(width);
+  try { return visibleWidth(line) > columns ? truncateToWidth(line, columns, "…") : line; }
+  catch { return ""; }
+}
+
+function retainedDetail(success: RetainedMcpSuccess, theme: unknown, width: number): string[] {
+  if (!Number.isFinite(width) || width <= 0) return [""];
+  const columns = Math.max(1, Math.floor(width));
+  const cached = success.wrapped.get(columns);
+  if (cached) return cached;
+  success.sanitized ??= sanitizeCompleteMcpText(success.source);
+  const lines: string[] = [];
+  try {
+    for (const sourceLine of success.sanitized.split("\n")) {
+      const styled = themedFg(theme, "toolOutput", sourceLine);
+      const wrapped = wrapTextWithAnsi(styled, columns);
+      if (wrapped.length === 0) lines.push("");
+      else for (const line of wrapped) lines.push(clampDisplayLine(line, columns));
+    }
+  } catch {
+    lines.push(clampDisplayLine("MCP result renderer failed", columns));
+  }
+  success.wrapped.set(columns, lines);
+  return lines;
+}
+
+function boundedFailOpenEvidence(result: unknown): string {
+  const content = ownValue(result, "content");
+  if (!content.found || !isArray(content.value)) return "Unfamiliar MCP result";
+  const parts: string[] = [];
+  let remaining = FAIL_OPEN_TEXT_MAX_CHARS;
+  let length = 0;
+  try { length = Math.min(content.value.length, FAIL_OPEN_LINE_MAX); } catch { return "Unfamiliar MCP result"; }
+  for (let index = 0; index < length && remaining > 0; index++) {
+    const block = ownValue(content.value, String(index));
+    const type = ownValue(block.value, "type");
+    const text = ownValue(block.value, "text");
+    if (type.value === "text" && text.found && typeof text.value === "string") {
+      const safe = sanitizeDisplayText(text.value, remaining);
+      if (safe) {
+        parts.push(safe);
+        remaining -= safe.length;
+      }
+    } else {
+      const note = "[MCP result contains non-text content]";
+      parts.push(note);
+      remaining -= note.length;
+    }
+  }
+  return parts.length > 0 ? parts.join("\n") : "Unfamiliar MCP result";
+}
+
+function evidenceComponent(result: unknown, theme: unknown): DisplayComponent {
+  const evidence = boundedFailOpenEvidence(result);
+  return { invalidate() {}, render(width: number): string[] {
+    if (!Number.isFinite(width) || width <= 0) return [""];
+    const columns = Math.max(1, Math.floor(width));
+    const lines: string[] = [];
+    try {
+      for (const sourceLine of evidence.split("\n").slice(0, FAIL_OPEN_LINE_MAX)) {
+        const wrapped = wrapTextWithAnsi(themedFg(theme, "toolOutput", sourceLine), columns);
+        if (wrapped.length === 0) lines.push("");
+        else for (const line of wrapped) {
+          if (lines.length >= FAIL_OPEN_LINE_MAX) break;
+          lines.push(clampDisplayLine(line, columns));
+        }
+      }
+    } catch {
+      return [clampDisplayLine("Unfamiliar MCP result", columns)];
+    }
+    return lines.length > 0 ? lines : [clampDisplayLine("Unfamiliar MCP result", columns)];
+  } };
+}
+
+function mcpOverview(serverName: string, toolName: string, theme: unknown, cue?: string): DisplayComponent {
+  const row = semanticDisplayRow({
+    action: "mcp",
+    primary: toolName,
+    required: [{ text: `server ${serverName}`, tone: "muted" }],
+    ...(cue ? { cue, compactCue: cue.endsWith(" to expand") ? cue.slice(0, -" to expand".length) : cue } : {}),
+  }, theme);
+  return { render: (width) => row.render(width), invalidate() {} };
+}
+
 /** Builder diagnostics surface once per distinct message per process (the builder runs per dispatch). */
 const reportedBuilderDiagnostics = new Set<string>();
 
@@ -267,6 +461,18 @@ export function buildMcpProxyTools(runtime: McpToolSource): ToolDefinition[] {
     }
     const normalized = normalizeMcpSchema(info.inputSchema, name);
     if (normalized.diagnostic) reportBuilderDiagnostic(normalized.diagnostic);
+    const lifecycles = new WeakMap<object, McpDisplayLifecycle>();
+    const htmlCallStates = new WeakSet<object>();
+    const lifecycleFor = (context: unknown): { key: object; lifecycle: McpDisplayLifecycle } | undefined => {
+      const state = objectKey(ownValue(context, "state").value) ?? objectKey(context);
+      if (!state) return undefined;
+      let lifecycle = lifecycles.get(state);
+      if (!lifecycle) {
+        lifecycle = { reveal: false };
+        lifecycles.set(state, lifecycle);
+      }
+      return { key: state, lifecycle };
+    };
     const definition: ToolDefinition = {
       name,
       label: `${toolName} (${serverName} MCP)`,
@@ -286,22 +492,70 @@ export function buildMcpProxyTools(runtime: McpToolSource): ToolDefinition[] {
           details: { server: serverName, tool: toolName },
         };
       },
-      // DISPLAY-only sanitization of server-relayed result text. Pi's generic
-      // no-renderResult fallback strips 7-bit ANSI but lets 8-bit C1
-      // introducers (e.g. an OSC-starting U+009D) through to the terminal, so
-      // a hostile server could retitle/spoof it. The model-facing result from
-      // execute stays verbatim (Claude parity); only the rendered row changes,
-      // keeping the stock fallback layout: one toolOutput-styled Text.
-      renderResult(result, _options, theme) {
-        const text = result.content
-          .filter((block) => block.type === "text")
-          .map((block) => block.text ?? "")
-          .join("\n");
-        const safe = sanitizeDisplayText(text, DISPLAY_TEXT_MAX_CHARS);
-        // An empty output renders nothing, exactly like the stock fallback.
-        return safe.length === 0
-          ? { render: () => [], invalidate: () => {} }
-          : new Text(theme.fg("toolOutput", safe), 0, 0);
+      renderCall(_args, theme, context) {
+        const row = lifecycleFor(context);
+        const htmlStatic = ownValue(context, "isPartial").value === true;
+        if (row) {
+          row.lifecycle.theme = theme;
+          if (htmlStatic) htmlCallStates.add(row.key);
+          else htmlCallStates.delete(row.key);
+          row.lifecycle.call ??= { invalidate() {}, render(width: number): string[] {
+            const lifecycle = row.lifecycle;
+            const overview = mcpOverview(serverName, toolName, lifecycle.theme, lifecycle.cue);
+            const lines = overview.render(width);
+            if (lifecycle.success && lifecycle.reveal && lifecycle.success.source.length > 0) {
+              return [...lines, ...retainedDetail(lifecycle.success, lifecycle.theme, width)];
+            }
+            return lines;
+          } };
+          if (!htmlStatic) return row.lifecycle.call;
+        }
+        return mcpOverview(serverName, toolName, theme);
+      },
+      renderResult(result, options, theme, context) {
+        const row = lifecycleFor(context);
+        const success = exactMcpSuccess(result, options, context, serverName, toolName);
+        const html = row !== undefined && htmlCallStates.has(row.key);
+        if (!success) {
+          if (row) {
+            row.lifecycle.success = undefined;
+            row.lifecycle.reveal = false;
+            row.lifecycle.cue = undefined;
+          }
+          return evidenceComponent(result, theme);
+        }
+
+        const retained = row?.lifecycle.success;
+        const snapshot = retained?.owner === success.owner && retained.source === success.source
+          ? retained
+          : { owner: success.owner, source: success.source, wrapped: new Map<number, string[]>() };
+        const requestedExpanded = ownValue(options, "expanded").value === true;
+        if (html) {
+          if (success.source.length === 0) return EMPTY_COMPONENT;
+          return requestedExpanded
+            ? { render: (width: number) => retainedDetail(snapshot, theme, width), invalidate() {} }
+            : { render: (width: number) => [clampDisplayLine(themedFg(theme, "muted", "click to show detail"), width)], invalidate() {} };
+        }
+
+        const expansion = piToolsExpandKeyText();
+        const binding = expansion.available
+          ? sanitizeDisplayText(expansion.value, 512, true)
+          : "";
+        const reveal = requestedExpanded || !expansion.available || binding.length === 0;
+        if (!row) {
+          if (success.source.length === 0) return mcpOverview(serverName, toolName, theme);
+          return reveal
+            ? { render: (width: number) => [
+                ...mcpOverview(serverName, toolName, theme).render(width),
+                ...retainedDetail(snapshot, theme, width),
+              ], invalidate() {} }
+            : mcpOverview(serverName, toolName, theme, `${binding} to expand`);
+        }
+        row.lifecycle.success = snapshot;
+        row.lifecycle.reveal = reveal;
+        row.lifecycle.cue = success.source.length > 0 && !reveal ? `${binding} to expand` : undefined;
+        row.lifecycle.theme = theme;
+        return EMPTY_COMPONENT;
       },
     };
     out.push(definition);

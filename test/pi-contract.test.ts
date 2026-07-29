@@ -21,6 +21,7 @@ import {
 import {
   generateBranchSummary,
   generateSummary,
+  SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { fakePi } from "./helpers/fake-pi.js";
@@ -732,8 +733,9 @@ describe("pi 0.82.0 API contract", () => {
   it("exposes the session factories and AgentSession methods PiCC uses", async () => {
     const sdk: any = await import("@earendil-works/pi-coding-agent");
     for (const [owner, methods] of [
-      [sdk.SessionManager, ["inMemory", "create", "open"]],
+      [sdk.SessionManager, ["inMemory", "create", "open", "forkFrom"]],
       [sdk.SettingsManager, ["inMemory"]],
+      [sdk.SessionManager?.prototype, ["getSessionFile", "getBranch", "appendCustomEntry"]],
       // AgentSession methods live on the prototype; constructing a real session
       // needs a model/provider and belongs to the real-stack lane, not this smoke pin.
       [sdk.AgentSession?.prototype, [
@@ -741,6 +743,31 @@ describe("pi 0.82.0 API contract", () => {
       ]],
     ] as const) {
       for (const method of methods) expect(typeof owner?.[method], method).toBe("function");
+    }
+  });
+
+  it("SessionManager.forkFrom copies custom entries from the source transcript", () => {
+    const dir = mkdtempSync(join(tmpdir(), "picc-session-fork-contract-"));
+    try {
+      const source = SessionManager.create(dir, dir, { id: "source-custom" });
+      source.appendMessage({ role: "user", content: "fork contract" } as never);
+      source.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "ready" }],
+        stopReason: "stop",
+      } as never);
+      source.appendCustomEntry("picc-contract-custom", { marker: "copied" });
+      const sourcePath = source.getSessionFile();
+      expect(sourcePath).toBeTruthy();
+
+      const fork = SessionManager.forkFrom(sourcePath!, dir, dir, { id: "fork-custom" });
+      expect(fork.getBranch()).toContainEqual(expect.objectContaining({
+        type: "custom",
+        customType: "picc-contract-custom",
+        data: { marker: "copied" },
+      }));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
@@ -1756,6 +1783,95 @@ describe("real Pi compact-search composition", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("drives one installed lowercase grep lifecycle through real ToolExecutionComponent", async () => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    sdk.initTheme();
+    const definition = wrapForSelfShell(withCompactSearchRendering(sdk.createGrepToolDefinition(process.cwd())));
+    const args = { pattern: "stock-lifecycle", path: "src" };
+    const result = { content: [{ type: "text", text: "src/a.ts:1:stock-lifecycle\nsrc/b.ts:2:stock-lifecycle" }], details: undefined };
+    const component = new sdk.ToolExecutionComponent(
+      "grep", "stock-grep-contract", args, {}, definition,
+      { requestRender() {} }, process.cwd().replace(/\\/g, "/"),
+    );
+    component.setArgsComplete();
+    component.markExecutionStarted();
+    component.updateResult(result, false);
+    component.setExpanded(false);
+    const collapsed = (component.render(120) as string[]).join("\n");
+    expect(collapsed).toContain("grep");
+    expect(collapsed).toContain("stock-lifecycle");
+    expect(collapsed).toContain("ctrl+o to expand");
+    expect(collapsed).not.toContain("src/a.ts:1");
+    component.setExpanded(true);
+    expect((component.render(120) as string[]).join("\n")).toContain("src/a.ts:1:stock-lifecycle");
+    component.setExpanded(false);
+    expect((component.render(120) as string[]).join("\n")).not.toContain("src/a.ts:1");
+  });
+
+  it("pins exporter ownership: ls stays template-owned while grep/find custom fragments collapse safely", async () => {
+    const sdk: any = await import("@earendil-works/pi-coding-agent");
+    sdk.initTheme();
+    const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const piDist = mainUrl.slice(0, mainUrl.indexOf("/dist/"));
+    const htmlModule: any = await import(`${piDist}/dist/core/export-html/tool-renderer.js`);
+    const exportModule: any = await import(`${piDist}/dist/core/export-html/index.js`);
+    const themeModule: any = await import(`${piDist}/dist/modes/interactive/theme/theme.js`);
+    const definitions = new Map([
+      ["grep", wrapForSelfShell(withCompactSearchRendering(sdk.createGrepToolDefinition(process.cwd())))],
+      ["find", wrapForSelfShell(withCompactSearchRendering(sdk.createFindToolDefinition(process.cwd())))],
+      ["ls", wrapForSelfShell(withCompactSearchRendering(sdk.createLsToolDefinition(process.cwd())))],
+    ]);
+    const renderer = htmlModule.createToolHtmlRenderer({
+      getToolDefinition: (name: string) => definitions.get(name), theme: themeModule.theme,
+      cwd: process.cwd(), width: 80,
+    });
+    const customCases = [
+      ["grep", { pattern: "<needle>", path: "src" }, "src/<unsafe>.ts:1:<needle>", "&lt;needle&gt;"],
+      ["find", { pattern: "**/<unsafe>.ts", path: "src" }, "src/<unsafe>.ts", "**/&lt;unsafe&gt;.ts"],
+    ] as const;
+    for (const [name, args, body, escapedInvocation] of customCases) {
+      const id = `stock-html-${name}`;
+      expect(renderer.renderCall(id, name, args)).toBe("");
+      const rendered = renderer.renderResult(id, name, [{ type: "text", text: body }], undefined, false);
+      expect(rendered?.collapsed).toContain("click to show detail");
+      expect(rendered?.collapsed).toContain(escapedInvocation);
+      expect(rendered?.collapsed).not.toContain(name === "grep" ? "<needle>" : "**/<unsafe>.ts");
+      expect(rendered?.collapsed).not.toContain(body);
+      expect(rendered?.collapsed).not.toContain("ctrl+o");
+      expect(rendered?.expanded).toContain("&lt;unsafe&gt;");
+      expect(rendered?.expanded).not.toContain("<unsafe>");
+    }
+    const dir = mkdtempSync(join(tmpdir(), "picc-stock-export-"));
+    const outputPath = join(dir, "stock.html");
+    try {
+      const session = sdk.SessionManager.create(dir, dir, { id: "stock-export-ownership" });
+      for (const [name, args, body] of customCases) {
+        const toolCallId = `full-export-${name}`;
+        session.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: toolCallId, name,
+          arguments: args }], stopReason: "toolUse" } as never);
+        session.appendMessage({ role: "toolResult", toolCallId, toolName: name,
+          content: [{ type: "text", text: body }], details: undefined, isError: false } as never);
+      }
+      session.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "stock-html-ls", name: "ls",
+        arguments: { path: "<template-owned>" } }], stopReason: "toolUse" } as never);
+      session.appendMessage({ role: "toolResult", toolCallId: "stock-html-ls", toolName: "ls",
+        content: [{ type: "text", text: "<template-entry>" }], details: undefined, isError: false } as never);
+      await exportModule.exportSessionToHtml(session, undefined, { outputPath, toolRenderer: renderer });
+      const html = readFileSync(outputPath, "utf8");
+      const encoded = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/)?.[1];
+      const data = JSON.parse(Buffer.from(encoded!, "base64").toString("utf8"));
+      for (const [name] of customCases) {
+        const rendered = data.renderedTools?.[`full-export-${name}`];
+        expect(rendered).toBeDefined();
+        expect(rendered.callHtml).toBeUndefined();
+        expect(rendered.resultHtmlCollapsed).toContain("click to show detail");
+      }
+      expect(data.renderedTools?.["stock-html-ls"]).toBeUndefined();
+      expect(JSON.stringify(data.entries)).toContain("template-entry");
+      expect(html).toContain("case 'ls':");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 describe("real Pi glyph-shell image and spacing ownership", () => {
@@ -1813,12 +1929,23 @@ describe("real Pi lifecycle row ownership", () => {
     // Use the production factories, not renderer-shaped test doubles: this
     // proves each definition forwards Pi's per-call context into the shared
     // lifecycle renderers before the real self-shell composes the component.
+    const taskRegistry = new BackgroundTaskRegistry();
+    const registeredTaskId = taskRegistry.start(
+      "agent:coder",
+      new Promise(() => {}),
+      undefined,
+      "agent-aabbccddeeff",
+      "coder",
+      undefined,
+      "Review authentication",
+    );
+    expect(registeredTaskId).toBe("task-1");
     const definitions = {
       Agent: wrapForSelfShell(
         createAgentToolDefinition({} as SubagentRuntime, { depth: 0 }),
       ),
       TaskOutput: wrapForSelfShell(
-        createTaskOutputTool(new BackgroundTaskRegistry()),
+        createTaskOutputTool(taskRegistry),
       ),
     };
     const definition = (name: "Agent" | "TaskOutput") => definitions[name];
@@ -1911,19 +2038,31 @@ describe("real Pi lifecycle row ownership", () => {
     expect(text(polling)).toContain("task output task-2 [polling]");
     expect(semanticLines(text(awaiting))).toHaveLength(1);
     expect(semanticLines(text(polling))).toHaveLength(1);
-    awaiting.updateResult(
-      {
-        content: [{ type: "text", text: "running Grep" }],
-        details: { taskId: "task-1", status: "running", agent: "coder", lastActivity: "running Grep" },
-        isError: false,
+    expect(text(awaiting).match(/[○●✗■]/gu)).toHaveLength(1);
+    expect(text(polling).match(/[○●✗■]/gu)).toHaveLength(1);
+    const runningResult = {
+      content: [{ type: "text", text: "running Grep" }],
+      details: {
+        subagentProgress: undefined,
+        admission: "admitted",
+        status: "running",
+        agent: "coder",
+        taskId: "task-1",
+        agentId: "agent-aabbccddeeff",
+        live: true,
       },
-      true,
-    );
+      isError: false,
+    };
+    const runningCanonical = structuredClone(runningResult);
+    awaiting.updateResult(runningResult, true);
     const taskRunning = text(awaiting);
-    expect(taskRunning).toContain("task output task-1 - coder [running]");
+    expect(taskRunning).toContain("task output Review authentication · running · coder · task-1");
+    expect(runningResult).toEqual(runningCanonical);
+    expect(JSON.stringify(runningResult)).not.toContain("Review authentication");
     expect(taskRunning).not.toContain("awaiting");
     expect(taskRunning).not.toContain("Grep");
     expect(semanticLines(taskRunning)).toHaveLength(1);
+    expect(taskRunning.match(/[○●✗■]/gu)).toHaveLength(1);
     const terminalResult = {
       content: [{ type: "text", text: "task answer" }],
       details: {
@@ -1937,16 +2076,28 @@ describe("real Pi lifecycle row ownership", () => {
       },
       isError: false,
     };
-    awaiting.updateResult(structuredClone(terminalResult), false);
+    const terminalCanonical = structuredClone(terminalResult);
+    awaiting.updateResult(terminalResult, false);
     const firstTerminal = text(awaiting);
     expect(firstTerminal).toContain("coder [completed] - Review authentication");
     expect(firstTerminal).not.toContain("task output");
     expect(firstTerminal).not.toContain("task-1");
+    expect(firstTerminal).not.toContain("task answer");
+    expect(firstTerminal).not.toContain("agent-aabbccddeeff");
     expect(firstTerminal).not.toContain("awaiting");
     expect(semanticLines(firstTerminal)).toHaveLength(1);
+    expect(firstTerminal.match(/[○●✗■]/gu)).toHaveLength(1);
     const firstExpanded = text(awaiting, true);
+    expect(firstExpanded).toContain("task answer");
     expect(firstExpanded).toContain("task: task-1");
     expect(firstExpanded).toContain("agent: agent-aabbccddeeff");
+    expect(firstExpanded.match(/[○●✗■]/gu)).toHaveLength(1);
+    const firstRecollapsed = text(awaiting, false);
+    expect(firstRecollapsed).not.toContain("task answer");
+    expect(firstRecollapsed).not.toContain("task: task-1");
+    expect(firstRecollapsed).not.toContain("agent: agent-aabbccddeeff");
+    expect(firstRecollapsed.match(/[○●✗■]/gu)).toHaveLength(1);
+    expect(terminalResult).toEqual(terminalCanonical);
     const firstReconstructed = build("TaskOutput", "task-first-reconstructed", { task_id: "task-1" });
     firstReconstructed.updateResult(structuredClone(terminalResult), false);
     expect(text(firstReconstructed)).toContain("coder [completed] - Review authentication");
