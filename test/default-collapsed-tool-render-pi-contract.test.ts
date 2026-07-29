@@ -237,6 +237,57 @@ describe("real Pi default-collapse contracts", () => {
     });
   });
 
+  it("collapses a real stock byte-limited Read result and restores its native recovery notice", async () => {
+    const sdk = await import("@earendil-works/pi-coding-agent") as any;
+    sdk.initTheme();
+    await withBindingAsync(["alt+e"], async () => {
+      const directory = mkdtempSync(join(tmpdir(), "picc-read-byte-limit-"));
+      try {
+        const bytes = Buffer.from(Array.from({ length: 120 }, (_, index) =>
+          `${String(index + 1).padStart(3, "0")}:${"x".repeat(500)}\n`).join(""), "utf8");
+        expect(bytes.byteLength).toBeGreaterThan(sdk.DEFAULT_MAX_BYTES);
+        writeFileSync(join(directory, "byte-limited.txt"), bytes);
+        const args = { path: "byte-limited.txt", offset: 7 };
+        const native = sdk.createReadToolDefinition(directory);
+        const result = await native.execute("read-byte-limit", args);
+        const truncation = result.details?.truncation;
+        expect(truncation).toMatchObject({
+          truncated: true, truncatedBy: "bytes", maxBytes: sdk.DEFAULT_MAX_BYTES,
+          maxLines: sdk.DEFAULT_MAX_LINES, lastLinePartial: false, firstLineExceedsLimit: false,
+        });
+        expect(truncation.outputBytes).toBe(Buffer.byteLength(truncation.content, "utf8"));
+        const totalFileLines = bytes.toString("utf8").split("\n").length;
+        const displayedEnd = args.offset + truncation.outputLines - 1;
+        const remainder = totalFileLines - displayedEnd;
+        expect(remainder).toBeGreaterThan(0);
+
+        const row = new sdk.ToolExecutionComponent(
+          "read", "read-byte-limit", args, {},
+          wrapForSelfShell(withDefaultCollapsedToolRendering(native)),
+          { requestRender() {} }, directory.replace(/\\/g, "/"),
+        );
+        row.setArgsComplete();
+        row.markExecutionStarted();
+        row.render(120);
+        row.updateResult(result, false);
+        const collapsed = (row.render(120) as string[]).map(stripAnsi).join("\n");
+        expect(collapsed).toContain(`read byte-limited.txt:${args.offset}`);
+        expect(collapsed).toContain(`${remainder} more lines · alt+e to expand`);
+        expect(collapsed).not.toContain("Showing lines");
+        expect(glyphs(collapsed)).toEqual(["●"]);
+
+        row.setExpanded(true);
+        const expanded = (row.render(120) as string[]).map(stripAnsi).join("\n");
+        expect(expanded).toContain(`Showing lines ${args.offset}-${displayedEnd} of ${totalFileLines}`);
+        expect(expanded).toContain(`offset=${displayedEnd + 1} to continue`);
+        row.setExpanded(false);
+        expect((row.render(120) as string[]).map(stripAnsi).join("\n")).toBe(collapsed);
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("retains Edit preview-failure evidence and native reconstructed mutation detail", async () => {
     const sdk = await import("@earendil-works/pi-coding-agent") as any;
     sdk.initTheme();

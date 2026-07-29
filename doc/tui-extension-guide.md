@@ -136,8 +136,9 @@ wraps execution before registration. Presentation decorators leave the raw built
 unchanged. Only the outer checkpoint gate wraps it, and that gate may alter the returned result by
 adding `terminate`. The collapse adapter snapshots display-only roots and the raw path when complete
 invocation arguments first render, so later cwd changes cannot rewrite an existing row. It
-recognizes an ordinary bounded Read continuation only when the canonical notice agrees exactly with
-the requested range; unknown and exceptional families fail open to retained/native detail. The
+recognizes ordinary bounded Read continuations only when a user-requested range or Pi's exact
+byte-limit metadata agrees with the canonical notice, retained content, and invocation; unknown,
+incoherent, and exceptional families fail open to retained/native detail. The
 configured `app.tools.expand` action changes retained/native detail without changing the glyph;
 live, exceptional, unfamiliar, and unbound-action rows keep it inside the same outer glyph frame,
 while malformed display fields use a concise warning. Search and subagent completion rows may add a

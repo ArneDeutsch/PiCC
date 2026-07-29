@@ -8,7 +8,13 @@ import {
   TUI_KEYBINDINGS,
   visibleWidth,
 } from "@earendil-works/pi-tui";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_LINES,
+  formatSize,
+  truncateHead,
+  type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { withDefaultCollapsedToolRendering } from "../src/runtime/default-collapsed-tool-render.js";
 import { withRoutineToolRendering } from "../src/runtime/routine-tool-render.js";
 
@@ -79,6 +85,33 @@ function truncatedResult(text = "retained tail"): unknown {
     truncation: bashTruncation({ content: text }),
     fullOutputPath: "/private/recovery/output.txt",
   } };
+}
+
+function byteLimitedReadResult(
+  content: string,
+  options: { offset?: number; fullFileLines?: number; totalLines?: number; overrides?: Record<string, unknown> } = {},
+): Record<string, unknown> {
+  const outputLines = content.split("\n").length;
+  const offset = options.offset ?? 7;
+  const fullFileLines = options.fullFileLines ?? offset + (options.totalLines ?? outputLines + 5) - 1;
+  const totalLines = options.totalLines ?? fullFileLines - offset + 1;
+  const end = offset + outputLines - 1;
+  const notice = `[Showing lines ${offset}-${end} of ${fullFileLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Use offset=${end + 1} to continue.]`;
+  const truncation = {
+    content, truncated: true, truncatedBy: "bytes", totalLines, totalBytes: DEFAULT_MAX_BYTES + 100,
+    outputLines, outputBytes: Buffer.byteLength(content, "utf8"), lastLinePartial: false,
+    firstLineExceedsLimit: false, maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES,
+    ...options.overrides,
+  };
+  return { content: [{ type: "text", text: `${content}\n\n${notice}` }], details: { truncation } };
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object") {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
 }
 
 function withBinding<T>(keys: string[], run: () => T): T {
@@ -422,6 +455,362 @@ describe("default-collapsed Read/Bash rendering", () => {
       } else expect(noOffset.detail).not.toMatch(/^\[[1-9]\d* more lines in file\.\]$/u);
     }
   }));
+
+  it("collapses coherent multibyte byte-limit continuations and preserves expansion lifecycle", () => withBinding(["alt+e"], () => {
+    for (const content of [
+      `${"é".repeat(24_000)}\n${"ß".repeat(1_599)}`,
+      `αlpha\r\n${"界".repeat(8_000)}\r\nomega`,
+    ]) {
+      const outputBytes = Buffer.byteLength(content, "utf8");
+      const outputLines = content.split("\n").length;
+      const value = byteLimitedReadResult(content, { offset: 7, fullFileLines: outputLines + 37 });
+      const metadata = ((value.details as { truncation: Record<string, unknown> }).truncation);
+      expect(metadata.outputBytes).toBe(outputBytes);
+      expect(metadata.outputLines).toBe(outputLines);
+
+      const calls: Array<[string, string]> = [];
+      const spyTheme = { fg(slot: string, text: string) { calls.push([slot, text]); return text; }, bold: (text: string) => text };
+      const tool = definition("read");
+      const args = { path: "multibyte.txt", offset: 7 };
+      const state = {};
+      const collapsed = paint(tool, args, value, { state, partial: false }, 160, spyTheme);
+      expect(collapsed.call).toContain("read multibyte.txt:7 · 31 more lines · alt+e to expand");
+      expect(collapsed.detail).toBe("");
+      expect(collapsed.all).not.toContain("Showing lines");
+      expect(calls).toContainEqual(["muted", "31 more lines"]);
+      expect(calls).toContainEqual(["muted", "alt+e to expand"]);
+
+      const expanded = paint(tool, args, value, { state, partial: false, expanded: true });
+      expect(expanded.detail).toContain(`Showing lines 7-${7 + outputLines - 1}`);
+      expect(expanded.detail).toContain(`offset=${7 + outputLines} to continue`);
+      expect(paint(tool, args, value, { state, partial: false }).all).toBe(collapsed.all);
+    }
+  }));
+
+  it("accepts Pi blank line slots and terminal-LF selected-range totals", () => withBinding(["alt+e"], () => {
+    for (const [content, options, expectedEnd] of [
+      ["", { offset: 4, fullFileLines: 12 }, 4],
+      ["ok\n", { offset: 4, fullFileLines: 12 }, 5],
+      ["ok\n", { offset: 4, fullFileLines: 20, totalLines: 5 }, 5],
+    ] as const) {
+      const args = options.totalLines === undefined
+        ? { path: "blank-slots.txt", offset: options.offset }
+        : { path: "blank-slots.txt", offset: options.offset, limit: 6 };
+      const value = byteLimitedReadResult(content, options);
+      const outputLines = (value.details as { truncation: { outputLines: number } }).truncation.outputLines;
+      expect(outputLines).toBe(content.split("\n").length);
+      const painted = paint(definition("read"), args, value, { partial: false });
+      expect(painted.call).toContain(`${options.fullFileLines - expectedEnd} more lines · alt+e to expand`);
+      expect(painted.detail).toBe("");
+    }
+  }));
+
+  it("accepts a terminal-LF selected source when its byte-retained prefix does not end in LF", () => withBinding(["alt+e"], () => {
+    const offset = 4;
+    const selectedSlots = 53;
+    const selectedSource = `${Array.from({ length: selectedSlots - 1 }, (_, index) =>
+      `${String(index + 1).padStart(2, "0")}:${"x".repeat(1_000)}`).join("\n")}\n`;
+    const truncation = truncateHead(selectedSource);
+    expect(truncation).toMatchObject({
+      truncated: true,
+      truncatedBy: "bytes",
+      totalLines: selectedSlots - 1,
+      maxLines: DEFAULT_MAX_LINES,
+      maxBytes: DEFAULT_MAX_BYTES,
+    });
+    expect(selectedSource.endsWith("\n")).toBe(true);
+    expect(truncation.content.endsWith("\n")).toBe(false);
+
+    const fullFileLines = 90;
+    const displayedEnd = offset + truncation.outputLines - 1;
+    const notice = `[Showing lines ${offset}-${displayedEnd} of ${fullFileLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Use offset=${displayedEnd + 1} to continue.]`;
+    const value = {
+      content: [{ type: "text", text: `${truncation.content}\n\n${notice}` }],
+      details: { truncation },
+    };
+    const painted = paint(
+      definition("read"),
+      { path: "selected-terminal-lf.txt", offset, limit: selectedSlots },
+      value,
+      { partial: false },
+    );
+    expect(painted.call).toContain(`${fullFileLines - displayedEnd} more lines · alt+e to expand`);
+    expect(painted.detail).toBe("");
+  }));
+
+  it("keeps deep-frozen byte-limit arguments and results unchanged through expansion lifecycle", () => withBinding(["alt+e"], () => {
+    const args = deepFreeze({ path: "immutable.txt", offset: 7, limit: 20 });
+    const value = byteLimitedReadResult("first\nsecond\n", { offset: 7, fullFileLines: 40, totalLines: 19 });
+    const baselineArgs = structuredClone(args);
+    const baselineValue = structuredClone(value);
+    deepFreeze(value);
+    const tool = definition("read");
+    const state = {};
+
+    const collapsed = paint(tool, args, value, { state, partial: false });
+    expect(collapsed.call).toContain("more lines · alt+e to expand");
+    expect(args).toEqual(baselineArgs);
+    expect(value).toEqual(baselineValue);
+    const expanded = paint(tool, args, value, { state, partial: false, expanded: true });
+    expect(expanded.detail).toContain("Showing lines");
+    expect(args).toEqual(baselineArgs);
+    expect(value).toEqual(baselineValue);
+    expect(paint(tool, args, value, { state, partial: false }).all).toBe(collapsed.all);
+    expect(args).toEqual(baselineArgs);
+    expect(value).toEqual(baselineValue);
+  }));
+
+  it("fails incoherent byte-limit Read metadata and envelopes open with visible bounded evidence", () => withBinding(["ctrl+o"], () => {
+    const content = "écho\nsecond\nthird";
+    const coherent = byteLimitedReadResult(content, { offset: 7, fullFileLines: 20 });
+    const clone = () => structuredClone(coherent) as {
+      content: Array<{ type: string; text: string }>;
+      details: { truncation: Record<string, unknown> };
+      isError?: boolean;
+    };
+    const malformed: unknown[] = [];
+    for (const overrides of [
+      { outputBytes: Buffer.byteLength(content, "utf8") + 1 }, { content: `${content}!` }, { outputLines: 4 },
+      { totalLines: 3 }, { totalBytes: DEFAULT_MAX_BYTES }, { maxBytes: DEFAULT_MAX_BYTES + 1 },
+      { maxLines: DEFAULT_MAX_LINES + 1 }, { truncatedBy: "lines" }, { truncated: false },
+      { firstLineExceedsLimit: true }, { lastLinePartial: true }, { outputLines: Number.MAX_SAFE_INTEGER },
+      { totalLines: NaN }, { extra: true },
+    ]) malformed.push(byteLimitedReadResult(content, { offset: 7, fullFileLines: 20, overrides }));
+
+    const wrongPayload = clone();
+    wrongPayload.content[0]!.text = `changed${wrongPayload.content[0]!.text}`;
+    malformed.push(wrongPayload);
+    const wrongRange = clone();
+    wrongRange.content[0]!.text = wrongRange.content[0]!.text.replace("lines 7-9", "lines 8-9");
+    malformed.push(wrongRange);
+    const wrongEnd = clone();
+    wrongEnd.content[0]!.text = wrongEnd.content[0]!.text.replace("lines 7-9", "lines 7-10");
+    malformed.push(wrongEnd);
+    const wrongTotal = clone();
+    wrongTotal.content[0]!.text = wrongTotal.content[0]!.text.replace("of 20", "of 9");
+    malformed.push(wrongTotal);
+    const wrongNext = clone();
+    wrongNext.content[0]!.text = wrongNext.content[0]!.text.replace("offset=10", "offset=11");
+    malformed.push(wrongNext);
+    const extraEnvelope = { ...clone(), future: true };
+    const extraDetails = clone();
+    (extraDetails.details as Record<string, unknown>).future = true;
+    malformed.push(extraEnvelope, extraDetails);
+
+    const prototypeCandidates = [
+      (() => { const value = clone(); Object.setPrototypeOf(value, { inherited: true }); return value; })(),
+      (() => { const value = clone(); Object.setPrototypeOf(value.content, Object.create(Array.prototype)); return value; })(),
+      (() => { const value = clone(); Object.setPrototypeOf(value.content[0]!, { inherited: true }); return value; })(),
+      (() => { const value = clone(); Object.setPrototypeOf(value.details, { inherited: true }); return value; })(),
+      (() => { const value = clone(); Object.setPrototypeOf(value.details.truncation, { inherited: true }); return value; })(),
+      (() => { const value = clone(); value.details = Object.create(value.details) as typeof value.details; return value; })(),
+    ];
+    malformed.push(...prototypeCandidates);
+
+    let getterReads = 0;
+    const accessorCandidates = [
+      (() => { const value = clone(); const field = value.content; Object.defineProperty(value, "content", {
+        enumerable: true, get() { getterReads++; return field; },
+      }); return value; })(),
+      (() => { const value = clone(); const field = value.details; Object.defineProperty(value, "details", {
+        enumerable: true, get() { getterReads++; return field; },
+      }); return value; })(),
+      (() => { const value = clone(); const field = value.content[0]; Object.defineProperty(value.content, "0", {
+        enumerable: true, get() { getterReads++; return field; },
+      }); return value; })(),
+      (() => { const value = clone(); const field = value.content[0]!.text; Object.defineProperty(value.content[0]!, "text", {
+        enumerable: true, get() { getterReads++; return field; },
+      }); return value; })(),
+      (() => { const value = clone(); const field = value.details.truncation; Object.defineProperty(value.details, "truncation", {
+        enumerable: true, get() { getterReads++; return field; },
+      }); return value; })(),
+      (() => { const value = clone(); const field = value.details.truncation.outputBytes; Object.defineProperty(
+        value.details.truncation, "outputBytes", { enumerable: true, get() { getterReads++; return field; } },
+      ); return value; })(),
+    ];
+    malformed.push(...accessorCandidates);
+
+    const alteredNotice = clone();
+    alteredNotice.content[0]!.text = alteredNotice.content[0]!.text.replace(
+      `${formatSize(DEFAULT_MAX_BYTES)} limit`, `${formatSize(DEFAULT_MAX_BYTES)} altered limit`,
+    );
+    const trailingSuffix = clone();
+    trailingSuffix.content[0]!.text += "\nTRAILING RECOVERY EVIDENCE";
+    malformed.push(alteredNotice, trailingSuffix);
+
+    for (const value of malformed) {
+      const painted = paint(definition("read"), { path: "byte.txt", offset: 7 }, value, { partial: false });
+      expect(painted.call).not.toMatch(/\d+ more lines/u);
+      expect(painted.detail.length || painted.call.includes("unfamiliar result")).toBeTruthy();
+      for (const line of painted.all.split("\n")) expect(visibleWidth(line)).toBeLessThanOrEqual(160);
+    }
+    const unsafe = paint(definition("read"), { path: "byte.txt", offset: 7 }, accessorCandidates[0], { partial: false });
+    expect(unsafe.call).not.toContain("to expand");
+    expect(unsafe.detail).toContain("Unfamiliar result");
+    expect(getterReads).toBe(0);
+    const trailingState = {};
+    expect(paint(definition("read"), { path: "byte.txt", offset: 7 }, trailingSuffix,
+      { state: trailingState, partial: false }).call).toContain("ctrl+o to expand");
+    expect(paint(definition("read"), { path: "byte.txt", offset: 7 }, trailingSuffix,
+      { state: trailingState, partial: false, expanded: true }).detail).toContain("TRAILING RECOVERY EVIDENCE");
+
+    for (const [args, value, flags] of [
+      [{ path: "byte.txt", offset: 8 }, coherent, { partial: false }],
+      [{ path: "byte.txt", offset: 7, limit: 3 }, coherent, { partial: false }],
+      [{ path: "byte.txt", offset: 7 }, { ...coherent, isError: true }, { partial: false, error: true }],
+      [{ path: "byte.txt", offset: 7 }, coherent, { partial: true }],
+    ] as const) {
+      const painted = paint(definition("read"), args, value, flags);
+      expect(painted.call).not.toMatch(/\d+ more lines/u);
+      expect(painted.detail.length > 0 || painted.call.includes("unfamiliar result · ctrl+o to expand")).toBe(true);
+    }
+  }));
+
+  it("detaches malformed byte-limit evidence across unrelated keys and nonstandard prototypes only from own data", () => {
+    type ByteResult = {
+      content: Array<Record<string, unknown>>;
+      details: { truncation: Record<string, unknown> };
+      [key: string]: unknown;
+    };
+    const make = () => byteLimitedReadResult("first\nsecond\nthird", {
+      offset: 7, fullFileLines: 40,
+    }) as ByteResult;
+    const recoverable = [
+      (() => { const value = make(); value.future = true; return value; })(),
+      (() => { const value = make(); Object.defineProperty(value.content, "future", { value: true }); return value; })(),
+      (() => { const value = make(); value.content[0]!.future = true; return value; })(),
+      (() => { const value = make(); Object.setPrototypeOf(value, { inherited: true }); return value; })(),
+      (() => { const value = make(); Object.setPrototypeOf(value.content, Object.create(Array.prototype)); return value; })(),
+      (() => { const value = make(); Object.setPrototypeOf(value.content[0]!, { inherited: true }); return value; })(),
+    ];
+
+    withBinding(["alt+e"], () => {
+      for (const value of recoverable) {
+        const tool = definition("read");
+        const state = {};
+        const collapsed = paint(tool, { path: "malformed-shape.txt", offset: 7 }, value,
+          { state, partial: false });
+        expect(collapsed.all).not.toMatch(/\d+ more lines/u);
+        expect(collapsed.call).toContain("unfamiliar result · alt+e to expand");
+        expect(collapsed.detail).toBe("");
+        const expanded = paint(tool, { path: "malformed-shape.txt", offset: 7 }, value,
+          { state, partial: false, expanded: true });
+        expect(expanded.all).not.toMatch(/\d+ more lines/u);
+        expect(expanded.detail).toContain("offset=10 to continue");
+      }
+    });
+    withBinding([], () => {
+      for (const value of recoverable) {
+        const open = paint(definition("read"), { path: "malformed-shape.txt", offset: 7 }, value,
+          { partial: false });
+        expect(open.all).not.toMatch(/\d+ more lines/u);
+        expect(open.detail).toContain("offset=10 to continue");
+        expect(open.call).not.toContain("to expand");
+      }
+    });
+
+    for (const accessor of ["content", "index", "text"] as const) {
+      const value = make();
+      let getterReads = 0;
+      if (accessor === "content") {
+        const content = value.content;
+        Object.defineProperty(value, "content", {
+          enumerable: true, get() { getterReads++; return content; },
+        });
+      } else if (accessor === "index") {
+        const item = value.content[0];
+        Object.defineProperty(value.content, "0", {
+          enumerable: true, get() { getterReads++; return item; },
+        });
+      } else {
+        const text = value.content[0]!.text;
+        Object.defineProperty(value.content[0]!, "text", {
+          enumerable: true, get() { getterReads++; return text; },
+        });
+      }
+      withBinding(["alt+e"], () => {
+        const painted = paint(definition("read"), { path: "accessor-shape.txt", offset: 7 }, value,
+          { partial: false });
+        expect(painted.all).not.toMatch(/\d+ more lines/u);
+        expect(painted.call).not.toContain("to expand");
+        expect(painted.detail).toBe("Unfamiliar result");
+      });
+      expect(getterReads).toBe(0);
+    }
+  });
+
+  it("makes whitespace-only malformed byte-limit evidence non-expandable without invoking getters", () => {
+    for (const keys of [["alt+e"], []] as const) withBinding([...keys], () => {
+      for (const text of ["", "\n\n"]) {
+        for (const accessor of [false, true]) {
+          const value = byteLimitedReadResult("first\nsecond", { offset: 4, fullFileLines: 40 });
+          let getterReads = 0;
+          if (accessor) {
+            Object.defineProperty((value.content as Array<Record<string, unknown>>)[0]!, "text", {
+              enumerable: true,
+              get() { getterReads++; return text; },
+            });
+          } else (value.content as Array<Record<string, unknown>>)[0]!.text = text;
+
+          const painted = paint(definition("read"), { path: "whitespace-malformed.txt", offset: 4 }, value,
+            { partial: false });
+          expect(painted.call).toContain("unfamiliar result");
+          expect(painted.call).not.toContain("to expand");
+          expect(painted.detail).toBe("Unfamiliar result");
+          expect(getterReads).toBe(0);
+        }
+      }
+    });
+  });
+
+  it("keeps malformed byte-limit recovery reachable at narrow width and immediate when expansion is unbound", () => {
+    const value = byteLimitedReadResult("first\nsecond\nthird", { offset: 4, fullFileLines: 40 });
+    ((value.details as { truncation: Record<string, unknown> }).truncation).outputBytes = 0;
+    const recoveryOffset = "offset=7 to continue";
+
+    withBinding(["alt+e"], () => {
+      const tool = definition("read");
+      const state = {};
+      const collapsed = paint(tool, { path: "a/long/malformed-byte-file.txt", offset: 4 }, value,
+        { state, partial: false }, 18);
+      expect(collapsed.call).toContain("alt+e");
+      expect(collapsed.call).toContain("unfamiliar");
+      expect(collapsed.call).not.toMatch(/\d+ more lines/u);
+      expect(collapsed.detail).toBe("");
+      for (const line of collapsed.all.split("\n")) expect(visibleWidth(line)).toBeLessThanOrEqual(18);
+
+      const expanded = paint(tool, { path: "a/long/malformed-byte-file.txt", offset: 4 }, value,
+        { state, partial: false, expanded: true }, 18);
+      expect(expanded.detail).toContain(recoveryOffset);
+      expect(expanded.call).not.toMatch(/\d+ more lines/u);
+    });
+
+    withBinding([], () => {
+      const open = paint(definition("read"), { path: "malformed-byte.txt", offset: 4 }, value,
+        { partial: false }, 18);
+      expect(open.detail).toContain(recoveryOffset);
+      expect(open.call).not.toContain("to expand");
+      expect(open.call).not.toMatch(/\d+ more lines/u);
+    });
+  });
+
+  it("keeps byte-limit continuation rows width-safe and fails open when expansion is unbound", () => {
+    const content = "first\nsecond\nthird";
+    const value = byteLimitedReadResult(content, { offset: 4, fullFileLines: 40 });
+    withBinding(["alt+e"], () => {
+      const narrow = paint(definition("read"), { path: "a/long/byte-file.txt", offset: 4 }, value,
+        { partial: false }, 24);
+      expect(narrow.all).toContain("alt+e");
+      expect(narrow.all).not.toContain("Showing lines");
+      for (const line of narrow.all.split("\n")) expect(visibleWidth(line)).toBeLessThanOrEqual(24);
+    });
+    withBinding([], () => {
+      const open = paint(definition("read"), { path: "byte-file.txt", offset: 4 }, value, { partial: false });
+      expect(open.call).toContain("native call");
+      expect(open.detail).toContain("Showing lines 4-6");
+      expect(open.all).not.toContain("to expand");
+    });
+  });
 
   it("delegates detached sanitized successful image displays and contains failed mixed bodies", () => withBinding(["ctrl+o"], () => {
     const delegated: unknown[] = [];
