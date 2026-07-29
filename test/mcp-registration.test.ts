@@ -489,7 +489,7 @@ describe("MCP startup status terminal cleanup (wired)", () => {
       expect(String(result?.systemPrompt ?? "")).toContain("FAIL");
       expect(events).toEqual(["set", "clear", "notify"]);
       expect(pi.notifications).toEqual([{
-        text: "MCP server(s) failed to connect: failed — run /doctor for details.",
+        text: "MCP server(s) failed to start: failed — run /doctor for details.",
         severity: "warning",
       }]);
       expect(pi.tools.has("mcp__failed__echo")).toBe(false);

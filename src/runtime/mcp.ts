@@ -350,6 +350,15 @@ export class McpRuntime {
           `MCP tool "${toolName}" on server "${serverName}" timed out after ${timeoutMs} ms`,
         );
       }
+      if (handle.server.transport !== "stdio" && !handle.stopped) {
+        const lifecycleState = handle.state as McpLifecycleState;
+        if (lifecycleState === "reconnecting" || lifecycleState === "retrying") {
+          throw new Error(`MCP server "${serverName}" is temporarily unavailable while reconnecting`);
+        }
+        if (lifecycleState === "failed" && handle.tools.length > 0) {
+          throw new Error(`MCP server "${serverName}" is unavailable because its remote connection failed`);
+        }
+      }
       if (handle.server.transport !== "stdio" && isRemoteTransportFailure(err)) {
         const failure = classifyRemoteMcpFailure(err, { stage: "call" });
         if (failure.class === "transient") {
@@ -603,7 +612,7 @@ export class McpRuntime {
         handle,
         "failed",
         `MCP server "${handle.server.name}" exhausted its aggregate remote startup budget.`,
-        "Remote MCP startup timed out within the aggregate MCP_TIMEOUT budget.",
+        "Remote MCP startup timed out within the aggregate MCP_TIMEOUT budget; check the endpoint and network, adjust MCP_TIMEOUT if appropriate, then reload or start a new session.",
       );
     }
   }
@@ -821,7 +830,7 @@ export class McpRuntime {
     handle.attempt = delays.length;
     handle.attemptLimit = delays.length;
     handle.diagnostic = `MCP server "${handle.server.name}" exhausted remote reconnect attempts.`;
-    handle.statusSummary = "Remote MCP recovery exhausted 5 reconnect attempts; check endpoint and network availability, then reload or retry.";
+    handle.statusSummary = "Remote MCP recovery exhausted 5 reconnect attempts; check endpoint and network availability, then reload or start a new session.";
     this.diags.push(handle.diagnostic);
   }
 
@@ -1169,15 +1178,15 @@ function isRemoteTransportFailure(error: unknown): boolean {
 
 function remoteFailureSummary(failureClass: string, exhausted: boolean): string {
   if (failureClass === "authentication") {
-    return "Remote MCP authentication failed; check configured static headers. Interactive OAuth is not supported.";
+    return "Remote MCP authentication failed; check configured static headers. Interactive OAuth is not supported; then reload or start a new session.";
   }
   if (failureClass === "not-found") {
-    return "Remote MCP endpoint was not found; check the configured URL without sharing it.";
+    return "Remote MCP endpoint was not found; check the configured URL without sharing it, then reload or start a new session.";
   }
   if (exhausted) {
-    return "Remote MCP startup exhausted 4 attempts; check endpoint and network availability, then reload or retry.";
+    return "Remote MCP startup exhausted 4 attempts; check endpoint and network availability, then reload or start a new session.";
   }
-  return "Remote MCP connection failed permanently; check endpoint and network availability, then reload or retry.";
+  return "Remote MCP connection failed permanently; check endpoint and network availability, then reload or start a new session.";
 }
 
 function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {

@@ -1518,7 +1518,8 @@ describe("McpRuntime remote retry and recovery", () => {
         expect(harness.clientCount()).toBe(4);
         expect(runtime.serverStates()[0]).toMatchObject({
           state: "failed",
-          statusSummary: expect.stringContaining("check endpoint and network availability"),
+          statusSummary:
+            "Remote MCP startup exhausted 4 attempts; check endpoint and network availability, then reload or start a new session.",
         });
         expect(`${runtime.diagnostics().join("\n")}\n${JSON.stringify(runtime.serverStates())}`)
           .not.toContain("GENERIC_INITIAL_CANARY");
@@ -1567,7 +1568,8 @@ describe("McpRuntime remote retry and recovery", () => {
       expect(harness.clientCount()).toBe(1);
       expect(runtime.serverStates()[0]).toMatchObject({
         state: "failed",
-        statusSummary: expect.stringContaining("static headers"),
+        statusSummary:
+          "Remote MCP authentication failed; check configured static headers. Interactive OAuth is not supported; then reload or start a new session.",
       });
       const surfaces = `${runtime.diagnostics().join("\n")}\n${JSON.stringify(runtime.serverStates())}`;
       for (const canary of ["REMOTE_URL_CANARY", "REMOTE_HEADER_CANARY", "REMOTE_SPEECH_CANARY"]) {
@@ -1641,7 +1643,7 @@ describe("McpRuntime remote retry and recovery", () => {
       expect(harness.clientCount()).toBe(6);
       expect(runtime.tools().map((tool) => tool.toolName)).toEqual(["alpha"]);
       expect(runtime.serverStates()[0]?.statusSummary).toContain(
-        "check endpoint and network availability, then reload or retry",
+        "check endpoint and network availability, then reload or start a new session",
       );
       await expect(runtime.callTool("exhaust", "alpha", {})).rejects.toThrow(/remote connection failed/);
       expect(harness.clientCount()).toBe(6);
@@ -1659,7 +1661,7 @@ describe("McpRuntime remote retry and recovery", () => {
     try {
       await runtime.whenSettled();
       expect(runtime.serverStates()[0]?.statusSummary).toBe(
-        "Remote MCP endpoint was not found; check the configured URL without sharing it.",
+        "Remote MCP endpoint was not found; check the configured URL without sharing it, then reload or start a new session.",
       );
       expect(JSON.stringify(runtime.serverStates())).not.toContain("REMOTE_URL_CANARY");
       expect(harness.clientCount()).toBe(1);
@@ -1733,10 +1735,15 @@ describe("McpRuntime remote retry and recovery", () => {
     }));
     try {
       await runtime.whenSettled();
-      expect(runtime.serverStates()[0]).toMatchObject({ state: "failed" });
+      expect(runtime.serverStates()[0]).toMatchObject({
+        state: "failed",
+        statusSummary:
+          "Remote MCP startup timed out within the aggregate MCP_TIMEOUT budget; check the endpoint and network, adjust MCP_TIMEOUT if appropriate, then reload or start a new session.",
+      });
       gate.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
+      const lateInitialContinuation = deferred<void>();
+      setImmediate(() => lateInitialContinuation.resolve());
+      await lateInitialContinuation.promise;
       expect(runtime.tools()).toEqual([]);
       expect(runtime.serverStates()[0]).toMatchObject({ state: "failed" });
       expect(harness.clientCount()).toBe(1);
@@ -1795,7 +1802,9 @@ describe("McpRuntime remote retry and recovery", () => {
       expect(delays).toEqual([1_000, 2_000]);
       expect(firstText(await runtime.callTool("epoch", "alpha", {}))).toBe("client-2");
       stale.resolve();
-      await Promise.resolve();
+      const staleReconnectContinuation = deferred<void>();
+      setImmediate(() => staleReconnectContinuation.resolve());
+      await staleReconnectContinuation.promise;
       await expect(runtime.callTool("epoch", "new", {})).rejects.toThrow(/has no tool/);
       expect(firstText(await runtime.callTool("epoch", "alpha", {}))).toBe("client-2");
     } finally {
@@ -1844,6 +1853,47 @@ describe("McpRuntime remote retry and recovery", () => {
     }
   });
 
+  it.each([
+    ["typed disconnect", "transient"],
+    ["permanent transport error", "terminal"],
+  ] as const)(
+    "uses %s lifecycle truth when an in-flight call later rejects with generic connection closure",
+    async (transition, expected) => {
+      const callGate = deferred<void>();
+      const recoveryDelay = deferred<void>();
+      const harness = remoteHarness({ connect: ["ok", "ok"], calls: [callGate.promise] });
+      const delays: number[] = [];
+      const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "in-flight" })), makeDeps({
+        loadRemoteClient: async () => harness.FakeRemoteClient as never,
+        createRemoteTransport: harness.createRemoteTransport,
+        delay: async (ms) => { delays.push(ms); await recoveryDelay.promise; },
+      }));
+      try {
+        await runtime.whenSettled();
+        const call = runtime.callTool("in-flight", "alpha", {});
+        await waitUntil({ description: "in-flight remote call to enter", predicate: () => harness.callCount() === 1 });
+        if (transition === "typed disconnect") {
+          harness.disconnects[0]!({ kind: "abrupt-stream-failure" });
+          await waitUntil({ description: "in-flight disconnect recovery delay", predicate: () => delays.length === 1 });
+        } else {
+          harness.transportErrors[0]!(new Error("PERMANENT_TRANSPORT_CANARY"));
+        }
+        callGate.reject(new Error("Connection closed"));
+        await expect(call).rejects.toThrow(
+          expected === "transient"
+            ? 'MCP server "in-flight" is temporarily unavailable while reconnecting'
+            : 'MCP server "in-flight" is unavailable because its remote connection failed',
+        );
+        expect(runtime.serverStates()[0]?.state).toBe(expected === "transient" ? "reconnecting" : "failed");
+        expect(harness.clientCount()).toBe(1);
+        expect(delays).toEqual(expected === "transient" ? [1_000] : []);
+      } finally {
+        recoveryDelay.resolve();
+        await runtime.shutdown();
+      }
+    },
+  );
+
   it("starts one recovery loop for a classified transient call and fails unknown transport errors immediately", async () => {
     const delayGate = deferred<void>();
     const harness = remoteHarness({ connect: ["ok", "ok"], calls: [new StreamableHTTPError(503)] });
@@ -1875,6 +1925,7 @@ describe("McpRuntime remote retry and recovery", () => {
     "shutdown during remote %s invalidates work and closes each owned part once",
     async (phase) => {
       const gate = deferred<void>();
+      const importEntered = deferred<void>();
       const importGate = deferred<typeof import("@modelcontextprotocol/sdk/client/index.js").Client>();
       const harness = remoteHarness({
         connect: phase === "connect" || phase === "active-reconnect" ? [phase === "connect" ? gate.promise : "ok", gate.promise] : ["ok"],
@@ -1882,14 +1933,17 @@ describe("McpRuntime remote retry and recovery", () => {
       });
       const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: `shutdown-${phase}` })), makeDeps({
         loadRemoteClient: phase === "import"
-          ? async () => importGate.promise
+          ? async () => {
+              importEntered.resolve();
+              return importGate.promise;
+            }
           : async () => harness.FakeRemoteClient as never,
         createRemoteTransport: harness.createRemoteTransport,
         delay: async () => undefined,
       }));
       try {
         if (phase === "import") {
-          await Promise.resolve();
+          await importEntered.promise;
         } else {
           await waitUntil({ description: `${phase} work to enter`, predicate: () => harness.clientCount() >= 1 });
           if (phase === "active-reconnect") {
@@ -1901,8 +1955,9 @@ describe("McpRuntime remote retry and recovery", () => {
         await Promise.all([runtime.shutdown(), runtime.shutdown(), runtime.whenSettled()]);
         importGate.resolve(harness.FakeRemoteClient as never);
         gate.resolve();
-        await Promise.resolve();
-        await Promise.resolve();
+        const releasedWorkContinuation = deferred<void>();
+        setImmediate(() => releasedWorkContinuation.resolve());
+        await releasedWorkContinuation.promise;
         expect(runtime.serverStates()[0]).toMatchObject({ state: "failed" });
         expect(runtime.tools().map((tool) => tool.toolName)).toEqual(
           phase === "active-reconnect" ? ["alpha"] : [],
@@ -1936,9 +1991,9 @@ describe("McpRuntime remote retry and recovery", () => {
   });
 
   it.each([
-    [401, /static headers/],
-    [404, /configured URL/],
-    [400, /failed permanently/],
+    [401, "Remote MCP authentication failed; check configured static headers. Interactive OAuth is not supported; then reload or start a new session."],
+    [404, "Remote MCP endpoint was not found; check the configured URL without sharing it, then reload or start a new session."],
+    [400, "Remote MCP connection failed permanently; check endpoint and network availability, then reload or start a new session."],
   ] as const)(
     "fails a post-connect callTool HTTP %i permanently without retrying or harming a sibling",
     async (status, summary) => {
@@ -1962,7 +2017,7 @@ describe("McpRuntime remote retry and recovery", () => {
         );
         expect(runtime.serverStates()[0]).toMatchObject({
           state: "failed",
-          statusSummary: expect.stringMatching(summary),
+          statusSummary: summary,
         });
         expect(runtime.serverStates()[1]).toMatchObject({ state: "connected", toolCount: 1 });
         expect(delays).toEqual([]);

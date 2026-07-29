@@ -368,7 +368,7 @@ describe("renderMcpStatusReport", () => {
       { name: "reconnecting", transport: "http", state: "reconnecting", attempt: 3, attemptLimit: 5, toolCount: 1 },
       { name: "auth", transport: "http", state: "failed", statusSummary: "Authentication failed; check configured static headers." },
       { name: "not-found", transport: "http", state: "failed", statusSummary: "Endpoint was not found; check the configured URL." },
-      { name: "failed", transport: "http", state: "failed", statusSummary: "Recovery exhausted; check endpoint and network availability, then reload or retry." },
+      { name: "failed", transport: "http", state: "failed", statusSummary: "Recovery exhausted; check endpoint and network availability, then reload or start a new session." },
     ]);
     const rows = detailRows(report).join("\n");
     for (const name of ["retrying", "reconnecting", "skipped", "auth", "not-found", "failed"]) {

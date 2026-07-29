@@ -278,15 +278,28 @@ describe("normalizeMcpServerBlock — entry validation", () => {
     expect(s.diagnostics.some((d) => d.includes('unknown field "cwd"'))).toBe(true);
   });
 
-  it('recognizes the deferred Claude fields "alwaysLoad"/"role" (no unknown-field noise, server runs)', () => {
+  it('recognizes deferred Claude fields without parsing their values or preventing startup', () => {
+    const oauthCanary = "OAUTH_VALUE_CANARY";
     const servers = normalizeMcpServerBlock(
-      { s: { command: "x", alwaysLoad: true, role: "reviewer" } },
+      { s: { command: "x", alwaysLoad: true, role: "reviewer", oauth: { token: oauthCanary } } },
       ".mcp.json",
     );
     const s = servers[0]!;
     expect(s.skipped).toBe(false);
     expect(s.diagnostics.some((d) => d.includes("unknown field"))).toBe(false);
-    expect(s.diagnostics.filter((d) => d.includes("deferred feature"))).toHaveLength(2);
+    expect(s.diagnostics.filter((d) => d.includes("deferred feature"))).toHaveLength(3);
+    expect(s.diagnostics).toContain(
+      'MCP server "s": "oauth" is a deferred feature in PiCC; ignored (server still runs)',
+    );
+    expect(JSON.stringify(s)).not.toContain(oauthCanary);
+
+    const resolved = resolve({
+      entries: [entry("user", "/user-settings", {
+        servers: { s: { command: "x", oauth: { token: oauthCanary } } },
+      })],
+    });
+    expect(server(resolved, "s")).toMatchObject({ status: "enabled", transport: "stdio", command: "x" });
+    expect(JSON.stringify(resolved)).not.toContain(oauthCanary);
   });
 
   it.each([

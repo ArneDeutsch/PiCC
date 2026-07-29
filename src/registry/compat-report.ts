@@ -306,8 +306,56 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
       );
     }
   }
-  for (const server of mcp.servers) {
-    const diagnosticText = server.diagnostics.join("\n");
+  const mcpDiagnosticServers: Array<{
+    server: ResolvedMcpConfig["servers"][number];
+    priority: number;
+    index: number;
+  }> = [];
+  for (const [index, server] of mcp.servers.entries()) {
+    if (server.diagnostics.length === 0 && server.status !== "skipped") continue;
+    const priority = server.status === "skipped" || server.status === "pending-approval"
+      ? 0
+      : server.status === "enabled"
+        ? 1
+        : 2;
+    mcpDiagnosticServers.push({ server, priority, index });
+  }
+  const selectedMcpServers = mcpDiagnosticServers.length <= MCP_STATUS_DETAIL_MAX
+    ? mcpDiagnosticServers
+    : [...mcpDiagnosticServers]
+        .sort((left, right) => left.priority - right.priority || left.index - right.index)
+        .slice(0, MCP_STATUS_DETAIL_MAX);
+  for (const { server } of selectedMcpServers) {
+    const oauthDiagnostic = `MCP server "${server.name}": "oauth" is a deferred feature in PiCC; ignored (server still runs)`;
+    if (server.diagnostics.includes(oauthDiagnostic)) {
+      const capability = lookupCapability("feature.mcp-oauth");
+      if (capability) {
+        addFinding(
+          capability,
+          mcpStatusScalar(oauthDiagnostic, MCP_POSTURE_DIAG_MAX_CHARS),
+        );
+      }
+    }
+
+    const remainingDiagnostics = server.diagnostics.filter(
+      (diagnostic) => diagnostic !== oauthDiagnostic,
+    );
+    let evidence: string | undefined;
+    if (remainingDiagnostics.length > 0) {
+      // Most stored diagnostics already quote the server name; the resolver's
+      // unset-${VAR} warnings do not — prefix those so every finding names its
+      // server (never expanded values, the diagnostics are raw-only).
+      evidence = remainingDiagnostics.map((diagnostic) =>
+        diagnostic.includes(`"${server.name}"`)
+          ? diagnostic
+          : `MCP server "${server.name}": ${diagnostic}`,
+      ).join("; ");
+    } else if (server.diagnostics.length === 0 && server.status === "skipped") {
+      evidence = `MCP server "${server.name}" (${server.source}) skipped: invalid entry`;
+    }
+    if (evidence === undefined) continue;
+
+    const diagnosticText = remainingDiagnostics.join("\n");
     const capabilityId = diagnosticText.includes("WebSocket transport")
       ? "feature.mcp-websocket"
       : diagnosticText.includes("headersHelper")
@@ -315,19 +363,22 @@ export function buildCompatReport(project: ClaudeProject): CompatReport {
         : server.transport === "http" || server.transport === "sse"
           ? "feature.mcp-remote-transports"
           : "feature.mcp";
-    const cap = lookupCapability(capabilityId);
-    if (!cap) continue;
-    if (server.diagnostics.length > 0) {
-      // Most stored diagnostics already quote the server name; the resolver's
-      // unset-${VAR} warnings do not — prefix those so every finding names its
-      // server (never expanded values, the diagnostics are raw-only).
-      const named = server.diagnostics.map((d) =>
-        d.includes(`"${server.name}"`) ? d : `MCP server "${server.name}": ${d}`,
+    const capability = lookupCapability(capabilityId);
+    if (capability) {
+      addFinding(
+        capability,
+        mcpStatusScalar(evidence, MCP_POSTURE_DIAG_MAX_CHARS),
       );
-      addFinding(cap, named.join("; "));
-    } else if (server.status === "skipped") {
-      // A skipped server without stored diagnostics still surfaces, never silently.
-      addFinding(cap, `MCP server "${server.name}" (${server.source}) skipped: invalid entry`);
+    }
+  }
+  const omittedMcpServers = mcpDiagnosticServers.length - selectedMcpServers.length;
+  if (omittedMcpServers > 0) {
+    const capability = lookupCapability("feature.mcp");
+    if (capability) {
+      addFinding(
+        capability,
+        `${omittedMcpServers} additional MCP server diagnostic finding(s) omitted; inspect the MCP configuration for complete detail`,
+      );
     }
   }
   // Config-level diagnostics (malformed .mcp.json, ignored project-scope

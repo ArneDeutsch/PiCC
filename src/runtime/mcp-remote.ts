@@ -168,8 +168,15 @@ function createObservedRemoteMcpFetch(
         response = await abortOwned(fetchImpl(currentUrl, requestInit), initial.signal);
       } catch (error) {
         if (error instanceof RemoteMcpSafeError && error.kind === "cancelled") throw error;
-        if (!observer?.inactive()) observer?.onFetchFailure();
-        throw safeTransportError(error);
+        const safeError = safeTransportError(error);
+        if (
+          safeError.kind === "network" &&
+          safeError.networkCode !== undefined &&
+          !observer?.inactive()
+        ) {
+          observer?.onFetchFailure();
+        }
+        throw safeError;
       }
       if (!REDIRECT_STATUSES.has(response.status)) {
         if (!response.ok) {

@@ -42,11 +42,11 @@ const NAME_DIAG_SLICE_CHARS = 32;
 /** Entry fields we understand; anything else is ignored with a diagnostic. */
 const KNOWN_ENTRY_FIELDS = new Set([
   "command", "args", "env", "type", "timeout", "url", "headers", "headersHelper",
-  "alwaysLoad", "role",
+  "alwaysLoad", "role", "oauth",
 ]);
 
 /** Real Claude entry fields whose feature is deferred in PiCC (entry still runs). */
-const DEFERRED_ENTRY_FIELDS = ["alwaysLoad", "role"] as const;
+const DEFERRED_ENTRY_FIELDS = ["alwaysLoad", "role", "oauth"] as const;
 
 /** Minimum honored per-server tool-call timeout (Claude parity: <1000 ms ignored). */
 const MIN_TIMEOUT_MS = 1000;

@@ -2250,7 +2250,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
     }
     // One-time MCP failure warning: every enabled server has settled behind the
     // barrier above, so the FIRST turn after settle is the one honest moment to
-    // report connect failures. Checked exactly once per session — a "failed"
+    // report startup failures. Checked exactly once per session — a "failed"
     // state a later shutdown synthesizes must never re-trigger it. stderr is
     // the no-UI fallback, never the only surface (/doctor stays the record).
     if (!mcpFailureChecked) {
@@ -2261,7 +2261,7 @@ export default function picc(pi: any, testSeam?: PiccTestSeam) {
           const shown = failed.slice(0, 8).map((s) => s.name);
           const omitted = failed.length - shown.length;
           const message =
-            `MCP server(s) failed to connect: ${shown.join(", ")}` +
+            `MCP server(s) failed to start: ${shown.join(", ")}` +
             (omitted > 0 ? `, and ${omitted} more` : "") +
             " — run /doctor for details.";
           if (ctx?.hasUI) ctx.ui?.notify?.(message, "warning");

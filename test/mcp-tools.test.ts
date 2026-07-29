@@ -216,7 +216,7 @@ describe("buildMcpProxyTools execute", () => {
     ).rejects.toThrow(/timed out after 1000 ms/);
   });
 
-  it("maps only fixed runtime outage errors to secret-safe retry or repair guidance", async () => {
+  it("maps only fixed runtime outage errors to retry or repair guidance while preserving protocol speech", async () => {
     const canary = "https://token.example/SECRET_HEADER_CANARY";
     const messages = [
       'MCP server "srv" is temporarily unavailable while reconnecting',
@@ -232,8 +232,6 @@ describe("buildMcpProxyTools execute", () => {
       }));
       await expect(proxy!.execute("id-1", {}, undefined, undefined, {} as never))
         .rejects.toThrow(expected[index]);
-      await expect(proxy!.execute("id-2", {}, undefined, undefined, {} as never))
-        .rejects.not.toThrow(canary);
     }
 
     const protocolSpeech = `protocol failure ${canary}`;

@@ -413,6 +413,44 @@ describe("failure classification", () => {
     await handle.close();
   });
 
+  it("does not emit disconnect evidence for an arbitrary fetch rejection", async () => {
+    let transportFetch: ((url: string | URL, init?: RequestInit) => Promise<Response>) | undefined;
+    class FetchingTransport extends FakeTransport {
+      constructor(_url: URL, options?: { fetch?: typeof transportFetch }) {
+        super();
+        transportFetch = options?.fetch;
+      }
+      override async start(): Promise<void> {
+        await transportFetch!("https://example.test/mcp");
+      }
+    }
+    const handle = await createRemoteMcpTransport(config("http", "https://example.test/mcp"), {
+      StreamableHTTPClientTransport: FetchingTransport as never,
+      fetch: async () => { throw new Error("ARBITRARY_FETCH_CANARY"); },
+    });
+    const disconnects: Array<{ kind: string }> = [];
+    handle.onDisconnect((event) => disconnects.push(event));
+    const error = await handle.start().catch((caught: unknown) => caught);
+    expect(classifyRemoteMcpFailure(error, { stage: "connection" }).class).toBe("permanent");
+    expect(disconnects).toEqual([]);
+    assertCanaryFree(error, "ARBITRARY_FETCH_CANARY");
+    await handle.close();
+
+    const recognized = await createRemoteMcpTransport(config("http", "https://example.test/mcp"), {
+      StreamableHTTPClientTransport: FetchingTransport as never,
+      fetch: async () => {
+        throw Object.assign(new Error("RECOGNIZED_FETCH_CANARY"), { code: "ECONNRESET" });
+      },
+    });
+    const recognizedDisconnects: Array<{ kind: string }> = [];
+    recognized.onDisconnect((event) => recognizedDisconnects.push(event));
+    const recognizedError = await recognized.start().catch((caught: unknown) => caught);
+    expect(classifyRemoteMcpFailure(recognizedError, { stage: "connection" }).class).toBe("transient");
+    expect(recognizedDisconnects).toEqual([{ kind: "abrupt-stream-failure" }]);
+    assertCanaryFree(recognizedError, "RECOGNIZED_FETCH_CANARY");
+    await recognized.close();
+  });
+
   it("uses explicit timeout and stream-loss provenance and fails unknowns closed", () => {
     expect(
       classifyRemoteMcpFailure(new Error("CANARY"), { stage: "connection", timedOut: true }).class,
