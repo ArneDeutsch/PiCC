@@ -6,11 +6,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  package:
     runs-on: ubuntu-latest
+    outputs:
+      filename: ${{ steps.pack.outputs.filename }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -49,7 +52,7 @@ jobs:
           output_dir="$RUNNER_TEMP/picc-release-$GITHUB_RUN_ID"
           mkdir "$output_dir"
           result="$(node scripts/pack-release.mjs --output-dir "$output_dir")"
-          node -e 'const v=JSON.parse(process.argv[1]); for(const k of ["tarball","sha256","version"]){if(typeof v[k]!=="string")process.exit(1);console.log(k+"="+v[k])}' "$result" >> "$GITHUB_OUTPUT"
+          node -e 'const p=require("node:path");const v=JSON.parse(process.argv[1]);for(const k of ["tarball","sha256","version"]){if(typeof v[k]!=="string")process.exit(1);console.log(k+"="+v[k])}console.log("filename="+p.basename(v.tarball))' "$result" >> "$GITHUB_OUTPUT"
       - name: Verify packed artifact
         shell: bash
         run: |
@@ -62,27 +65,51 @@ jobs:
         env:
           PICC_TEST_TARBALL: ${{ steps.pack.outputs.tarball }}
         run: npm run test:packaged
-      - name: Upload manual release candidate
-        if: ${{ github.event_name == 'workflow_dispatch' }}
+      - name: Upload verified release artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: picc-release-${{ github.run_id }}
           path: ${{ steps.pack.outputs.tarball }}
           if-no-files-found: error
           retention-days: 7
-      - name: Recheck artifact before GitHub Release
-        if: ${{ github.event_name == 'push' }}
+
+  publish:
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+    needs: package
+    runs-on: ubuntu-latest
+    environment:
+      name: npm-publish
+    permissions:
+      contents: write
+    env:
+      RELEASE_FILENAME: ${{ needs.package.outputs.filename }}
+      RELEASE_SHA256: ${{ needs.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Download verified release artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: picc-release-${{ github.run_id }}
+          path: ${{ runner.temp }}/picc-release-${{ github.run_id }}
+      - name: Recheck artifact before publication
         run: >-
-          node scripts/verify-release.mjs artifact --event tag --tag "${{ steps.context.outputs.tag }}"
-          --tarball "${{ steps.pack.outputs.tarball }}" --expected-sha256 "${{ steps.pack.outputs.sha256 }}"
+          node scripts/verify-release.mjs artifact --event tag --tag "$GITHUB_REF_NAME"
+          --tarball "$RUNNER_TEMP/picc-release-$GITHUB_RUN_ID/$RELEASE_FILENAME"
+          --expected-sha256 "$RELEASE_SHA256"
       - name: Create GitHub Release
-        if: ${{ github.event_name == 'push' }}
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
-          files: ${{ steps.pack.outputs.tarball }}
+          files: ${{ runner.temp }}/picc-release-${{ github.run_id }}/${{ needs.package.outputs.filename }}
           generate_release_notes: true
       - name: Publish exact artifact to npm
-        if: ${{ github.event_name == 'push' }}
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
@@ -91,4 +118,4 @@ jobs:
             echo "NPM_TOKEN is absent; npm publication skipped."
             exit 0
           fi
-          node scripts/publish-release.mjs --tarball "${{ steps.pack.outputs.tarball }}" --expected-sha256 "${{ steps.pack.outputs.sha256 }}" --event tag --tag "${{ steps.context.outputs.tag }}"
+          node scripts/publish-release.mjs --tarball "$RUNNER_TEMP/picc-release-$GITHUB_RUN_ID/$RELEASE_FILENAME" --expected-sha256 "$RELEASE_SHA256" --event tag --tag "$GITHUB_REF_NAME"

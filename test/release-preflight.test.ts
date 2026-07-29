@@ -197,7 +197,7 @@ describe("publish release", () => {
 });
 
 describe("release workflow", () => {
-  it("packs once in one job, avoids artifact roundtrips, and scopes the token to the final step", () => {
+  it("packs once, hands the verified artifact to a protected publish job, and scopes the token", () => {
     const manifest = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8")) as {
       scripts: Record<string, string>;
     };
@@ -206,31 +206,50 @@ describe("release workflow", () => {
     expect(manifest.scripts.prepublishOnly).toBe("npm run verify");
     const workflow = YAML.parse(fs.readFileSync(path.resolve(".github/workflows/release.yml"), "utf8")) as any;
     expect(workflow.on).toEqual({ push: { tags: ["v*"] }, workflow_dispatch: null });
-    expect(Object.keys(workflow.jobs)).toEqual(["release"]);
-    const steps = workflow.jobs.release.steps as any[];
-    const runs = steps.map((step) => step.run ?? "");
-    const serialized = JSON.stringify(steps);
+    expect(workflow.permissions).toEqual({ contents: "read" });
+    expect(Object.keys(workflow.jobs)).toEqual(["package", "publish"]);
+    const packageJob = workflow.jobs.package;
+    const publishJob = workflow.jobs.publish;
+    const packageSteps = packageJob.steps as any[];
+    const publishSteps = publishJob.steps as any[];
+    const allSteps = [...packageSteps, ...publishSteps];
+    const runs = allSteps.map((step) => step.run ?? "");
     expect(runs.filter((run) => run.includes("scripts/pack-release.mjs"))).toHaveLength(1);
-    expect(serialized).not.toContain("actions/download-artifact");
-    expect(serialized).not.toContain("needs.");
+    expect(packageJob.outputs).toEqual({
+      filename: "${{ steps.pack.outputs.filename }}",
+      sha256: "${{ steps.pack.outputs.sha256 }}",
+    });
 
-    const packaged = steps.find((step) => step.name === "Test exact packaged product");
+    const packaged = packageSteps.find((step) => step.name === "Test exact packaged product");
     expect(packaged.env.PICC_TEST_TARBALL).toBe("${{ steps.pack.outputs.tarball }}");
-    const manual = steps.find((step) => step.name === "Upload manual release candidate");
-    expect(manual.if).toContain("workflow_dispatch");
-    expect(manual.uses).toMatch(/^actions\/upload-artifact@[a-f0-9]{40}$/);
-    const release = steps.find((step) => step.name === "Create GitHub Release");
-    const publish = steps.find((step) => step.name === "Publish exact artifact to npm");
-    const recheck = steps.find((step) => step.name === "Recheck artifact before GitHub Release");
-    expect(steps.indexOf(recheck)).toBeLessThan(steps.indexOf(release));
-    expect(recheck.run).toContain("${{ steps.pack.outputs.tarball }}");
-    expect(recheck.run).toContain("${{ steps.pack.outputs.sha256 }}");
-    expect(release.with.files).toBe("${{ steps.pack.outputs.tarball }}");
-    expect(publish.run).toContain("${{ steps.pack.outputs.tarball }}");
-    expect(publish.run).toContain("${{ steps.pack.outputs.sha256 }}");
-    expect(steps.at(-1)).toBe(publish);
+    const upload = packageSteps.find((step) => step.name === "Upload verified release artifact");
+    const download = publishSteps.find((step) => step.name === "Download verified release artifact");
+    expect(upload.uses).toMatch(/^actions\/upload-artifact@[a-f0-9]{40}$/);
+    expect(download.uses).toMatch(/^actions\/download-artifact@[a-f0-9]{40}$/);
+    expect(download.with.name).toBe(upload.with.name);
+    expect(publishJob.if).toContain("github.event_name == 'push'");
+    expect(publishJob.if).toContain("startsWith(github.ref, 'refs/tags/')");
+    expect(publishJob.needs).toBe("package");
+    expect(publishJob.environment).toEqual({ name: "npm-publish" });
+    expect(publishJob.permissions).toEqual({ contents: "write" });
+    expect(publishJob.env.RELEASE_FILENAME).toBe("${{ needs.package.outputs.filename }}");
+    expect(publishJob.env.RELEASE_SHA256).toBe("${{ needs.package.outputs.sha256 }}");
+    expect(JSON.stringify(publishJob.env)).not.toContain("runner.");
+
+    const release = publishSteps.find((step) => step.name === "Create GitHub Release");
+    const publish = publishSteps.find((step) => step.name === "Publish exact artifact to npm");
+    const recheck = publishSteps.find((step) => step.name === "Recheck artifact before publication");
+    expect(publishSteps.indexOf(recheck)).toBeLessThan(publishSteps.indexOf(release));
+    expect(recheck.run).toContain("$RUNNER_TEMP/picc-release-$GITHUB_RUN_ID/$RELEASE_FILENAME");
+    expect(recheck.run).toContain("$RELEASE_SHA256");
+    expect(release.with.files).toContain("${{ runner.temp }}");
+    expect(release.with.files).toContain("${{ needs.package.outputs.filename }}");
+    expect(publish.run).toContain("$RUNNER_TEMP/picc-release-$GITHUB_RUN_ID/$RELEASE_FILENAME");
+    expect(publish.run).toContain("$RELEASE_SHA256");
+    expect(publishSteps.at(-1)).toBe(publish);
     expect(publish.env).toEqual({ NPM_TOKEN: "${{ secrets.NPM_TOKEN }}" });
-    expect(JSON.stringify(steps.filter((step) => step !== publish))).not.toContain("NPM_TOKEN");
-    for (const step of steps.filter((item) => item.uses)) expect(step.uses).toMatch(/@[a-f0-9]{40}$/);
+    expect(JSON.stringify(allSteps.filter((step) => step !== publish))).not.toContain("NPM_TOKEN");
+    expect(JSON.stringify(packageJob)).not.toContain("secrets.");
+    for (const step of allSteps.filter((item) => item.uses)) expect(step.uses).toMatch(/@[a-f0-9]{40}$/);
   });
 });
