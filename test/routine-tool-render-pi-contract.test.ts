@@ -185,7 +185,7 @@ describe("real Pi routine rendering composition", () => {
       },
       pending: "enter worktree(PENDING-ENTER-ONLY)",
       canonical: "PENDING ENTER SENTINEL / CANONICAL ENTER PROSE",
-      row: "enter worktree(/repo/wt) on branch worktree-contract",
+      row: "enter worktree /repo/wt · branch worktree-contract",
     },
     {
       name: "ExitWorktree",
@@ -199,7 +199,7 @@ describe("real Pi routine rendering composition", () => {
       },
       pending: "exit worktree(remove)",
       canonical: "PENDING EXIT SENTINEL / CANONICAL EXIT PROSE",
-      row: "exit worktree(/repo/wt) removed; restored /repo",
+      row: "exit worktree /repo/wt · removed · restored /repo",
     },
     {
       name: "ExitWorktree",
@@ -509,7 +509,7 @@ describe("real Pi routine rendering composition", () => {
     expect(rendered?.expanded).toContain(entry.hidden);
   });
 
-  it("composes worktree structured rows with Pi's real HTML renderer and keeps exceptional text visible", async () => {
+  it("composes worktree semantic rows with Pi's real HTML renderer and keeps exceptional text visible", async () => {
     const sdk = await import("@earendil-works/pi-coding-agent") as any;
     sdk.initTheme();
     const mainUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
@@ -545,16 +545,43 @@ describe("real Pi routine rendering composition", () => {
       (match) => ({ style: match[1], text: match[2] }),
     ).find((span) => span.text === text)?.style;
     const targetStyle = spanStyle(ordinary?.expanded ?? "", "/repo/wt");
-    const branchStyle = spanStyle(ordinary?.expanded ?? "", "worktree-html");
+    const branchText = "branch worktree-html";
+    const branchStyle = spanStyle(ordinary?.expanded ?? "", branchText);
     expect(targetStyle).toBe(spanStyle(ansiModule.ansiToHtml(themeModule.theme.fg("accent", "/repo/wt")), "/repo/wt"));
-    expect(branchStyle).toBe(spanStyle(ansiModule.ansiToHtml(themeModule.theme.fg("muted", "worktree-html")), "worktree-html"));
+    expect(branchStyle).toBe(spanStyle(ansiModule.ansiToHtml(themeModule.theme.fg("muted", branchText)), branchText));
     expect(targetStyle).not.toBe(branchStyle);
     expect(ordinary?.expanded).not.toContain("HIDDEN ENTER CANONICAL");
 
-    const exitId = "html-exit-worktree";
-    renderer.renderCall(exitId, "ExitWorktree", { action: "remove" });
+    const ordinaryExitId = "html-exit-worktree-ordinary";
+    renderer.renderCall(ordinaryExitId, "ExitWorktree", { action: "remove" });
+    const ordinaryExit = renderer.renderResult(
+      ordinaryExitId,
+      "ExitWorktree",
+      [{ type: "text", text: "HIDDEN EXIT CANONICAL" }],
+      {
+        worktreePath: "/repo/wt", outcome: "removed", restorePath: "/repo",
+        ok: true, removed: true, orphaned: false, diagnostics: [],
+      },
+      false,
+    );
+    const exitHtml = ordinaryExit?.expanded ?? "";
+    expect(spanStyle(exitHtml, "exit worktree")).toBe(
+      spanStyle(ansiModule.ansiToHtml(themeModule.theme.fg("text", "exit worktree")), "exit worktree"),
+    );
+    expect(spanStyle(exitHtml, "/repo/wt")).toBe(
+      spanStyle(ansiModule.ansiToHtml(themeModule.theme.fg("accent", "/repo/wt")), "/repo/wt"),
+    );
+    for (const text of ["removed", "restored /repo"]) {
+      expect(spanStyle(exitHtml, text)).toBe(
+        spanStyle(ansiModule.ansiToHtml(themeModule.theme.fg("muted", text)), text),
+      );
+    }
+    expect(exitHtml).not.toContain("HIDDEN EXIT CANONICAL");
+
+    const exceptionalExitId = "html-exit-worktree-exceptional";
+    renderer.renderCall(exceptionalExitId, "ExitWorktree", { action: "remove" });
     const exceptional = renderer.renderResult(
-      exitId,
+      exceptionalExitId,
       "ExitWorktree",
       [{ type: "text", text: "VISIBLE MALFORMED EXIT" }],
       { outcome: "removed", restorePath: "/repo" },

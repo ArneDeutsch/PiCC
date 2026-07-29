@@ -249,6 +249,12 @@ describe("EnterWorktree tool: previous-worktree handling", () => {
     expect(text(res)).toContain("create policy stopped");
     expect(res.details).toMatchObject({ stoppedByHook: true, stopReason: "create policy stopped" });
     expect(h.universalStops()).toBe(1);
+
+    const beforeRender = structuredClone(res);
+    const rendered = interactiveText(h.enter, res, { name: "wt-a" });
+    expect(rendered).toContain("create policy stopped");
+    expect(rendered).not.toContain(`enter worktree ${h.wtPath("wt-a")} · branch`);
+    expect(res).toEqual(beforeRender);
   });
 });
 
@@ -332,6 +338,12 @@ describe("ExitWorktree tool: truthful reporting", () => {
     expect(text(res)).toContain("remove policy stopped");
     expect(res.details).toMatchObject({ stoppedByHook: true, stopReason: "remove policy stopped", removed: true });
     expect(h.universalStops()).toBe(1);
+
+    const beforeRender = structuredClone(res);
+    const rendered = interactiveText(h.exit, res, { action: "remove" });
+    expect(rendered).toContain("remove policy stopped");
+    expect(rendered).not.toContain(`exit worktree ${h.wtPath("wt-a")} · removed`);
+    expect(res).toEqual(beforeRender);
   });
 
   it("keeps the orphaned wording for blocked-but-orphaned removals", async () => {
@@ -459,7 +471,7 @@ describe("ExitWorktree tool: truthful reporting", () => {
       undefined,
       { args: { action: "remove" }, isError: false },
     ).render(120)).toEqual([
-      `exit worktree(${h.wtPath("wt-a")}) removed; restored ${h.base}`,
+      `exit worktree ${h.wtPath("wt-a")} · removed · restored ${h.base}`,
     ]);
     expect(text(result)).toBe(
       `Exited and removed worktree: ${h.wtPath("wt-a")}. Working directory restored.`,
