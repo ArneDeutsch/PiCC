@@ -245,14 +245,16 @@ where to start reading, not the extent of its cluster.
 - **Skill activation** (`skill-activation.ts`) — the one pipeline (lazy body load → substitution →
   `!`-injection) behind the `Skill` tool, slash commands, and `context: fork` dispatch.
 
-- **MCP runtime** (`mcp.ts`, `mcp-tools.ts`) — runs the **enabled** stdio servers of the
-  discovery-resolved config as session-global child processes and exposes their tools as
+- **MCP runtime** (`mcp.ts`, `mcp-remote.ts`, `mcp-tools.ts`) — starts the **enabled**
+  discovery-resolved servers without blocking extension load and exposes discovered tools as
   `mcp__<server>__<tool>` proxies through the same guard/decoration pipeline as every other tool.
-  Its invariants: the enablement gate is enforced by construction (only `enabled` servers ever
-  spawn); session load is non-blocking with a bounded first-turn settle, so the first request
-  deterministically carries connected servers' tools; server processes die with the session,
-  process trees included; and when nothing is both configured and enabled the model receives **no
-  MCP-related context of any kind** — no tool definitions, no prompt additions.
+  `mcp.ts` owns the transport-neutral lifecycle and retry authority: stdio child process-tree
+  cleanup and remote client connection/recovery. `mcp-remote.ts` owns the safe remote adapter and
+  typed failure/disconnect evidence. The first successful tool catalog is
+  immutable, proxies register once and resolve the current client, and recovery cannot widen the
+  session or inherited subagent tool set. The enablement gate is enforced by construction; failed
+  startup adds no tools, owned resources close with the session, and when nothing is both configured
+  and enabled the model receives **no MCP-related context of any kind**.
 
 - **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
   in `subagents.ts`) — a session-local controller owns threshold sampling, complete-tool-batch

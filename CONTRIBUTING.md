@@ -152,9 +152,9 @@ publication that already succeeded.
 
 Deliberately out of scope — each for a reason, not from neglect:
 
-- **Full MCP surface parity.** Local stdio MCP servers run with Claude-compatible tool exposure;
-  the remaining MCP surfaces (remote transports, prompts/resources, and more) are deferred — the
-  capability matrix ([doc/supported-features.md](doc/supported-features.md)) records each tier.
+- **Full MCP surface parity.** Local stdio and selected remote HTTP/SSE servers run with
+  Claude-compatible tool exposure; other MCP surfaces remain deferred. The
+  [capability matrix](doc/supported-features.md) records the exact limits and tiers.
 - **Plan mode.** Users plan through their own skills, with review cycles that fit their project.
 - **`AskUserQuestion`.** Chat already suffices.
 - **Plugin installation / marketplace.** PiCC loads installed plugins' *content*; it does not

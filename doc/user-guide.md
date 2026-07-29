@@ -452,9 +452,9 @@ tracked project files):
 
 ### Environment variables
 
-Values in Claude `settings.env` reach project-owned Bash, hooks, skills, and MCP servers. PiCC does
-not apply them to its own startup or worktree Git administration, so settings such as `GIT_DIR`
-cannot redirect those maintenance operations.
+Values in Claude `settings.env` reach project-owned Bash, hooks, skills, and stdio MCP child
+environments. They do not supply remote MCP URL/header interpolation, PiCC startup, or worktree Git
+administration, so settings such as `GIT_DIR` cannot redirect those maintenance operations.
 
 | Variable | Effect |
 |---|---|
@@ -467,7 +467,7 @@ cannot redirect those maintenance operations.
 | `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | Force **every** `Agent`/`Task` dispatch to the foreground (background is otherwise the default). `SendMessage` resume is inherently async and is **not** governed by this switch |
 | `CLAUDE_CODE_FORK_SUBAGENT` | Gate `subagent_type: "fork"` dispatch (inherit the parent conversation instead of starting fresh): `1` forces it on, `0` off. **Left unset it is enabled** — a deliberate PiCC choice. Inheritance is honored only for a **main-session** dispatch; nested, print-mode, and `isolation: worktree` forks run with fresh context and say so on the result |
 | `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` | Remove the built-in `Explore`/`Plan` agent types (`general-purpose` always stays) |
-| `MCP_TIMEOUT` | MCP server connect timeout in ms (default `30000` — 30 s, Claude parity) |
+| `MCP_TIMEOUT` | MCP startup bound in ms (default `30000` — 30 s): for remote servers, the aggregate initial connection/discovery/retry settlement bound and the finite bound for each reconnect attempt; see the capability matrix for retry policy |
 | `MCP_TOOL_TIMEOUT` | MCP tool-call timeout in ms when a server entry sets no `timeout` (default ~28 h, Claude parity; values clamped to [1 s, ~24.8 d]) |
 | `SLASH_COMMAND_TOOL_CHAR_BUDGET` | Override the startup skill-listing character budget |
 
@@ -507,19 +507,64 @@ argument, which makes it best-effort — Claude Code's own limit, not a PiCC gap
 3. **A shell read needs its own `Bash(...)` deny.** `Bash(cat secrets/x)` is not covered by any
    `Read` rule.
 
-**MCP servers.** Project-scope MCP servers (`.mcp.json`, or `mcpServers` in the committed
+**Remote MCP with static headers.** A remote entry requires an explicit transport `type`. Put only
+the variable reference in `.mcp.json`; remote URL and header interpolation reads the ambient
+environment that launches PiCC, not Claude `settings.env`:
+
+```json
+{
+  "mcpServers": {
+    "hosted-tools": {
+      "type": "http",
+      "url": "https://mcp.example.com/api",
+      "headers": { "Authorization": "Bearer ${MCP_TOKEN}" }
+    }
+  }
+}
+```
+
+Set the value without placing it in shell history, then launch from that environment:
+
+```powershell
+$env:MCP_TOKEN = Read-Host "MCP token"
+picc
+```
+
+```bash
+read -rs MCP_TOKEN; export MCP_TOKEN
+picc
+```
+
+Do not put a secret-bearing `${VAR:-default}` in tracked configuration. PiCC-owned configuration,
+transport, status, diagnostic, and local tool-error surfaces omit expanded URLs and headers, raw
+non-protocol HTTP failure bodies/status/redirect targets, and SDK/fetch exception text. Once enabled,
+valid MCP metadata, successful tool results, and protocol-level tool errors remain untrusted,
+server-controlled model content.
+
+Project-scope MCP servers (`.mcp.json`, or `mcpServers` in the committed
 `.claude/settings.json`) are pending by default and never start until you approve them. Approve
-selected servers in user settings or a clean, user-controlled, untracked `.claude/settings.local.json`
-with a named `"enabledMcpjsonServers"` list. Each UTF-16 code unit outside ASCII letters, digits,
-`_`, and `-` becomes `_`; an astral symbol therefore becomes `__`. One persisted named approval can
-therefore match a differently named current or future server; re-review aliases when project MCP names change.
-`"enableAllProjectMcpServers": true` instead
-trusts all current and future project servers; do not use it as a shortcut for a large named list.
-Decline with `"disabledMcpjsonServers"`, which always wins and silences the pending notice.
-Approvals in a git-tracked `settings.local.json` cannot work.
-Immediately put explicit named approvals in user-level `~/.claude/settings.json`, or wait for a
-reviewed repository change to stop tracking or remove the local path, then create a fresh untracked
-file from scratch. Never reuse project-supplied MCP content.
+selected servers with `enabledMcpjsonServers` in user settings or a clean, user-controlled,
+untracked `.claude/settings.local.json`. `enableAllProjectMcpServers` trusts current and future
+project servers; `disabledMcpjsonServers` declines named servers and wins over approval. Approvals in
+a git-tracked `settings.local.json` do not work; create approval content yourself rather than
+reusing project-supplied content.
+
+Approval is persisted by sanitized server name, not by a command, URL, or header fingerprint. A
+later project revision can change a same-name definition without another approval. Re-review project
+MCP definitions after updates and before launching with secrets. Static authentication material is
+confined to the currently configured origin across redirects; approval does not make an endpoint
+immutable.
+
+Remote startup and transient recovery are bounded. A server that fails before its initial catalog
+is discovered adds no tools; fix the endpoint, headers, or network, then reload or start a new
+session. Retained proxies and automatic recovery apply only after that initial discovery. During an
+outage, the original tool proxies stay present and return a transient local failure; after recovery
+stops or a permanent failure, those proxies return a terminal local failure until the server is
+fixed and the session is reloaded. An authentication or authorization failure means to check the
+configured static headers, not that OAuth is required. Use `/mcp` for current lifecycle state and
+`/doctor` for configuration compatibility.
+The [capability matrix](supported-features.md) owns alternative transports, deprecations, retry
+policy, and unsupported surfaces.
 
 ## 7. What is and isn't supported
 
