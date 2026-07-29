@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expandEnvVars } from "./settings.js";
 import { normalizeMcpServerBlock, type McpJsonResult, type RawMcpEntry } from "../claude/mcp-config.js";
+import { resolveRemoteMcpFields } from "../claude/mcp-remote-config.js";
 import { neutralizeControlChars } from "../util/neutralize-text.js";
 import { sanitizedSubprocessEnv } from "../util/env.js";
 import type {
@@ -246,23 +247,15 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
     }
   }
 
-  // --- Status + expansion per winning entry --------------------------------
+  // --- Status + enabled-only expansion per winning entry -------------------
   const servers: ResolvedMcpServer[] = [];
   for (const { entry, origin, source } of winners.values()) {
     const perDiags = [...entry.diagnostics];
-    const unset = new Set<string>();
-    const onUnset = (name: string): void => {
-      unset.add(name);
-    };
-    const command = expandEnvVars(entry.command, env, onUnset);
-    const args = entry.args.map((arg) => expandEnvVars(arg, env, onUnset));
-    const expandedEnv: Record<string, string> = Object.create(null) as Record<string, string>;
-    for (const [key, value] of Object.entries(entry.env)) {
-      expandedEnv[key] = expandEnvVars(value, env, onUnset);
-    }
     let status: McpServerStatus;
     if (entry.skipped) {
       status = "skipped";
+    } else if (entry.notConfigured) {
+      status = "not-configured";
     } else if (disabledNames.has(sanitizeForListMatch(entry.name))) {
       status = "disabled";
     } else if (origin === "mcpjson" || origin === "project") {
@@ -271,31 +264,75 @@ export function resolveMcpConfig(opts: ResolveMcpConfigOptions): ResolvedMcpConf
           ? "enabled"
           : "pending-approval";
     } else {
-      // user / managed / untracked local — user-authored, enabled by default.
       status = "enabled";
     }
 
-    // A declined server's command never runs, so warning about its unset
-    // ${VAR}s would break the promised quiet path of disabledMcpjsonServers.
-    if (status !== "disabled") {
-      for (const name of unset) {
-        perDiags.push(
-          neutralizeControlChars(
-            `environment variable "${name}" is not set and has no default; "\${${name}}" kept as literal text`,
-          ),
-        );
-      }
+    const common = {
+      name: entry.name,
+      source,
+      ...(entry.timeoutMs !== undefined ? { timeoutMs: entry.timeoutMs } : {}),
+    };
+    const transportIdentity = entry.remote === undefined
+      ? (entry.skipped ? {} : { transport: "stdio" as const })
+      : {
+          transport: entry.remote.transportKind,
+          configuredType: entry.remote.configuredType,
+        };
+
+    // Inactive entries carry identity only: no raw templates, expanded values,
+    // or fabricated fields can escape the resolver pipeline.
+    if (status !== "enabled") {
+      servers.push({ ...common, ...transportIdentity, status, diagnostics: perDiags });
+      continue;
     }
 
+    const unset = new Set<string>();
+    const onUnset = (name: string): void => { unset.add(name); };
+    if (entry.remote !== undefined) {
+      const resolved = resolveRemoteMcpFields(entry.remote, env, onUnset, entry.name, source);
+      if (resolved.kind === "skipped") {
+        servers.push({
+          ...common,
+          ...transportIdentity,
+          status: "skipped",
+          diagnostics: [...perDiags, ...resolved.diagnostics.map(neutralizeControlChars)],
+        });
+        continue;
+      }
+      servers.push({
+        ...common,
+        status: "enabled",
+        transport: resolved.fields.transportKind,
+        configuredType: resolved.fields.configuredType,
+        url: resolved.fields.url,
+        headers: resolved.fields.headers,
+        ...(resolved.fields.sseDeprecation !== undefined
+          ? { sseDeprecation: resolved.fields.sseDeprecation }
+          : {}),
+        diagnostics: [...perDiags, ...resolved.diagnostics.map(neutralizeControlChars)],
+      });
+      continue;
+    }
+
+    const command = expandEnvVars(entry.command, env, onUnset);
+    const args = entry.args.map((arg) => expandEnvVars(arg, env, onUnset));
+    const expandedEnv: Record<string, string> = Object.create(null) as Record<string, string>;
+    for (const [key, value] of Object.entries(entry.env)) {
+      expandedEnv[key] = expandEnvVars(value, env, onUnset);
+    }
+    for (const name of unset) {
+      perDiags.push(neutralizeControlChars(
+        `environment variable "${name}" is not set and has no default; "\${${name}}" kept as literal text`,
+      ));
+    }
     servers.push({
-      name: entry.name,
-      status,
-      source,
+      ...common,
+      status: "enabled",
+      transport: "stdio",
       command,
       args,
       env: expandedEnv,
       rawCommand: entry.command,
-      timeoutMs: entry.timeoutMs,
       diagnostics: perDiags,
     });
   }

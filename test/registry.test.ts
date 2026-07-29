@@ -134,17 +134,26 @@ function makeProject(overrides: Partial<ClaudeProject> = {}): ClaudeProject {
 }
 
 function makeMcpServer(
-  overrides: Partial<ResolvedMcpServer> & Pick<ResolvedMcpServer, "name" | "status">,
+  overrides: Record<string, unknown> & Pick<ResolvedMcpServer, "name" | "status">,
 ): ResolvedMcpServer {
+  if (overrides.status !== "enabled") {
+    return {
+      source: ".mcp.json",
+      transport: "stdio",
+      diagnostics: [],
+      ...overrides,
+    } as ResolvedMcpServer;
+  }
   return {
     source: ".mcp.json",
+    transport: "stdio",
     command: "",
     args: [],
     env: {},
     rawCommand: "",
     diagnostics: [],
     ...overrides,
-  };
+  } as ResolvedMcpServer;
 }
 
 function makeMcp(overrides: Partial<ResolvedMcpConfig> = {}): ResolvedMcpConfig {
@@ -228,15 +237,15 @@ describe("CAPABILITY_REGISTRY invariants", () => {
   });
 
   it.each<DisclosureContract>([
-    { id: "tool.mcp__*", tier: "partial", safetyRelevant: true, core: [/connected stdio servers/, /names are sanitized underscore-style like Claude/, /name EMPTY after sanitizing is dropped/, /SERVER names remain PiCC's stricter drop-with-diagnostic charset gate/], gap: [/DEGRADED tool-result content/, /structuredContent is ignored/, />32KB-serialized schema degrades/, /descriptions are bounded at 2KB/, /64-char model tool-name limit/], precedence: [/Deny rules at every grammar level/, /bare-name and server-level denies REMOVE the tools/, /deny matching is case-sensitive/, /allow\/ask stay no-ops/, /tool list is FROZEN at dispatch/], visibility: [/REMOVE the tools from the model's context/, /STDERR-ONLY/], parity: [/PiCC's own floor/, /not observed Claude behavior/, /PiCC-only bounds/, /NOT parity/, /permissive object schema/, /Claude passes schemas through verbatim/, /NOT a containment guarantee/, /schema-embedded strings ride to the model unbounded/], split: [/feature\.tool-output-clip/] },
-    { id: "setting.mcpServers", tier: "partial", core: [/settings-file mcpServers blocks/, /start real stdio servers/], gap: [/PiCC STAND-IN/, /deferred ~\/\.claude\.json local\/user MCP scopes/, /PARTIAL: stdio only/, /stand-in semantics/], precedence: [/whole entry/, /highest-precedence source wins/, /never field-merged/, /managed > untracked settings\.local\.json > project settings > \.mcp\.json > user/, /user\/managed settings/, /UNTRACKED settings\.local\.json/, /enabled by default/, /committed project-scope servers are pending/, /until approved/], visibility: [/Remote\/url entries are skipped/, /diagnostic/], parity: [/version-dependent\/unconfirmed/, /project-settings-over-\.mcp\.json precedence step is PiCC-defined/], split: [/feature\.mcp-claude-json-scopes/, /feature\.mcp-project-approval/, /feature\.mcp-remote-transports/] },
+    { id: "tool.mcp__*", tier: "partial", safetyRelevant: true, core: [/transport-neutral MCP tool proxies/, /first successfully discovered/, /catalog across remote outages/, /current client/], gap: [/fixed local transient wording/, /fixed local terminal wording/, /reconnect never widens/], precedence: [/deny enforcement/, /subagent inheritance/], visibility: [/model-facing protocol-result trust behavior/], split: [/feature\.mcp-list-changed/, /feature\.mcp-remote-transports/] },
+    { id: "setting.mcpServers", tier: "partial", core: [/explicit http/, /streamable-http/, /deprecated sse/, /static-header/], gap: [/PiCC-defined stand-in/, /deferred ~\/\.claude\.json scopes/, /upstream ordering interaction is unverified/], precedence: [/Whole-entry precedence and approval apply before expansion/, /inactive entries materialize no command, URL, or headers/], visibility: [/size\/count\/syntax caps/, /reserved transport-header restrictions/], parity: [/ambient launch environment/, /not settings.env/], split: [/feature\.mcp-claude-json-scopes/, /feature\.mcp-remote-transports/] },
     { id: "setting.enableAllProjectMcpServers", tier: "partial", core: [/blanket approval/, /current and future project server/, /NOT a shortcut for a large pending set/], gap: [/replacing Claude Code's interactive trust dialog/], precedence: [/Nearest-honored-scope-wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/PiCC's settings gate/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.enabledMcpjsonServers", tier: "partial", core: [/per-server approval list/, /user-authored scopes/, /outside ASCII letters, digits/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/accumulate-and-dedupe of the lists across settings files remains PiCC-inferred/], precedence: [/Approval from ANY honored scope wins/, /disabledMcpjsonServers always wins/], visibility: [/ignored with a diagnostic/], parity: [/Claude parity, binary-verified/], split: [/feature\.mcp-project-approval/] },
     { id: "setting.disabledMcpjsonServers", tier: "full", core: [/per-server decline list/, /honored from EVERY scope/, /outside ASCII letters, digits/], precedence: [/always wins over enableAllProjectMcpServers and enabledMcpjsonServers/], visibility: [/declined server raises no expansion warnings/], parity: [/binary-corroborated/, /accumulate-and-dedupe across settings files remains PiCC-inferred/] },
-    { id: "feature.mcp", tier: "partial", core: [/stdio MCP servers run for real/, /die with the session/, /CLAUDE_PROJECT_DIR/, /CLAUDECODE=1/, /CLAUDE_CODE_SESSION_ID/], gap: [/PARTIAL: stdio transport only/], precedence: [/launcher-only markers are removed/, /then receive project settings.env, then Claude defaults, then configured server env last/, /deliberate server overrides of CLAUDE_PROJECT_DIR, CLAUDECODE, CLAUDE_CODE_SESSION_ID, or a removed launcher key/, /do not change timeout resolution, settlement, or registration/], visibility: [/NOT reported to the model/, /surface in \/mcp/, /\/doctor/, /stderr/, /no server both configured and enabled/, /NO MCP context of any kind/, /transient status is interactive-TUI-only/, /none enters model context/], parity: [/binary-verified Claude parity/, /PROJECT ROOT/, /main checkout/, /EFFECTIVE parity/, /Claude passes no cwd/, /config-last parity/, /(?=[^.]*pre-handshake connection-closure wording)(?=[^.]*value-redacted warnings)(?=[^.]*rejected non-empty timeout variable)(?=[^.]*fallback)(?=[^.]*transient first-turn wait status)(?=[^.]*bounded PiCC-defined presentation)(?=[^.]*not verified Claude Code presentation parity)[^.]*\./], split: [/feature\.mcp-tool-search/, /feature\.mcp-\*/] },
-    { id: "feature.mcp-project-approval", tier: "partial", core: [/enablement gate/, /disabled by default/, /persisted named approval can therefore match a differently named current or future server/, /re-review aliases when project MCP names change/], gap: [/not Claude Code's interactive trust dialog/], precedence: [/disabledMcpjsonServers always rejecting/], visibility: [/session-start notice/, /\/mcp/, /\/doctor/], parity: [/SETTINGS GATE/, /PiCC has no approval prompt/], split: [/enableAllProjectMcpServers/, /enabledMcpjsonServers/] },
-    { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only \/mcp status/, /32 detailed rows/], gap: [/rather than Claude Code's interactive management UI or individual-tool view/], precedence: [/Interactive and RPC use an immediate live snapshot/, /one-shot text and JSON await/], visibility: [/never enters model context/], parity: [/Claude Code 2\.1\.205\+/, /PiCC-defined/] },
-    { id: "feature.mcp-remote-transports", tier: "not-supported", core: [/remote MCP transports/, /HTTP/, /streamable-HTTP/, /SSE/, /WebSocket/, /url-based entry/], gap: [/stdio only currently/], visibility: [/remote server entry is skipped/, /\/mcp shows a safe skipped state/, /per-server diagnostic/, /compat report/, /\/doctor/] },
+    { id: "feature.mcp", tier: "partial", core: [/enabled stdio and remote/, /non-blockingly/, /aggregate initial-settlement opportunity/], gap: [/stdio children/, /do not reconnect/, /remote lifecycle/], visibility: [/zero MCP context/], split: [/feature\.mcp-remote-transports/] },
+    { id: "feature.mcp-project-approval", tier: "partial", core: [/project-origin stdio and remote/, /disabled by default/, /name approval/], gap: [/name-based, not definition-bound/, /same-name command, URL, or header change remains approved/], precedence: [/disabledMcpjsonServers always rejects/], visibility: [/re-review definitions/], parity: [/settings gate/, /interactive trust dialog/] },
+    { id: "feature.mcp-control-status", tier: "partial", core: [/bounded read-only/, /connecting\/retrying\/connected\/reconnecting\/failed/, /attempt bounds/, /retained tool counts/], gap: [/PiCC-defined/], precedence: [/prioritize actionable states/], visibility: [/never includes endpoints, headers, or raw transport failure speech/, /never enters model context/], parity: [/SSE deprecation/] },
+    { id: "feature.mcp-remote-transports", tier: "partial", core: [/http\/streamable-http/, /deprecated sse/, /static headers/, /replayable requests capped at 1 MiB/], gap: [/at most three transient retries at 1\/2\/4 s/, /five reconnects run at 1\/2\/4\/8\/16 s/], precedence: [/aggregate MCP_TIMEOUT/, /discovery retries only network\/5xx/, /authentication\/not-found\/permanent failures stop immediately/], visibility: [/same-origin redirects only/, /no cross-origin header forwarding/], split: [/setting\.mcpServers/, /tool\.mcp__\*/, /feature\.mcp-control-status/, /feature\.mcp-project-approval/] },
   ])("retains $id semantic disclosure", (contract) => {
     expectDisclosure(contract);
   });
@@ -278,9 +287,93 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     );
   });
 
+  it("independently pins the restored MCP proxy qualification families and ownership", () => {
+    const proxy = lookupCapability("tool.mcp__*")?.note ?? "";
+    for (const qualification of [
+      "Deny rules at every grammar level",
+      "guard's call-time deny as the backstop",
+      "deny matching is case-sensitive",
+      "tool list is FROZEN at dispatch",
+      "input schemas are normalized",
+      "Claude passes schemas through verbatim",
+      "descriptions are bounded at 2KB",
+      "64-char model tool-name limit",
+      "tools/list pagination stops after 16 pages",
+      "DEGRADED tool-result content",
+      "structuredContent is ignored",
+      "Claude renders images natively",
+      "feature.tool-output-clip",
+      "catalog across remote outages and terminal failure remains immutable",
+      "calls resolve the current client",
+    ]) expect(proxy, qualification).toContain(qualification);
+
+    const listChanged = lookupCapability("feature.mcp-list-changed")?.note ?? "";
+    expect(listChanged).toContain("unsupported");
+    expect(listChanged).toContain("immutable original-catalog behavior belongs to tool.mcp__*");
+    expect(listChanged).not.toContain("first successfully discovered");
+    expect(lookupCapability("feature.mcp-remote-transports")?.note).not.toContain(
+      "immutable original",
+    );
+  });
+
+  it("independently pins restored aggregate, status, and approval qualification families", () => {
+    const aggregate = lookupCapability("feature.mcp")?.note ?? "";
+    for (const qualification of [
+      "${VAR}/${VAR:-default}",
+      "CLAUDE_PROJECT_DIR",
+      "CLAUDECODE=1",
+      "CLAUDE_CODE_SESSION_ID",
+      "process-tree shutdown on Windows/POSIX",
+      "MCP_TIMEOUT 30 s",
+      "MCP_TOOL_TIMEOUT unset default ~27.8 h",
+      "transient first-turn wait status",
+      "project-root cwd-pinned",
+      "launcher-only marker removal",
+      "no tool search",
+      "NOT reported to the model",
+      "NO MCP context of any kind",
+      "aggregate initial-settlement opportunity",
+      "feature.mcp-remote-transports",
+    ]) expect(aggregate, qualification).toContain(qualification);
+
+    const status = lookupCapability("feature.mcp-control-status")?.note ?? "";
+    for (const qualification of [
+      "at most 32 detailed rows",
+      "Interactive and RPC use an immediate live snapshot",
+      "one-shot text and JSON await bounded MCP startup settlement",
+      "Claude Code 2.1.205+",
+      "interactive management UI or individual-tool view",
+      "lifecycle/deprecation rendering",
+      "truthful further-omission guidance",
+    ]) expect(status, qualification).toContain(qualification);
+
+    const approval = lookupCapability("feature.mcp-project-approval")?.note ?? "";
+    for (const qualification of [
+      "git-tracked settings.local.json is demoted to project scope",
+      "committed project-scope approvals are ignored",
+      "bounded one-time session-start notice",
+      "bounded approval and decline guidance",
+      "Each UTF-16 code unit",
+      "astral symbol therefore becomes '__'",
+      "normalization collisions",
+      "name-based, not definition-bound",
+    ]) expect(approval, qualification).toContain(qualification);
+  });
+
+  it("pins exact provenance and unchanged-PiCC scope for registry-only MCP gaps", () => {
+    expect(lookupCapability("feature.mcp-connect-timeout-ms")?.note).toBe(
+      "PiCC ignores MCP_CONNECT_TIMEOUT_MS and uses MCP_TIMEOUT. Owner-reported Claude Code 2.1.218 binary observation covers one connect path with a 5000 ms default; broader semantics are not claimed",
+    );
+    expect(lookupCapability("feature.mcp-shell-prefix")?.note).toBe(
+      "PiCC does not honor CLAUDE_CODE_SHELL_PREFIX for stdio MCP spawning; owner-reported Claude Code 2.1.218 binary provenance reports prefixing on the observed spawn path",
+    );
+    expect(lookupCapability("feature.mcp-child-session-env")?.note).toBe(
+      "PiCC does not remove inherited CLAUDE_CODE_CHILD_SESSION from stdio MCP environments; Claude removal is documented and owner-reported, while PiCC behavior remains unchanged",
+    );
+  });
+
   it("carries explicit deferred entries for the non-stdio MCP surfaces", () => {
     for (const id of [
-      "feature.mcp-remote-transports",
       "feature.mcp-oauth",
       "feature.mcp-headers-helper",
       "feature.mcp-prompts",
@@ -297,6 +390,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
       "feature.mcp-idle-timeout",
       "feature.mcp-auto-background",
       "feature.mcp-plugin-servers",
+      "feature.mcp-websocket",
+      "feature.mcp-first-byte-timeout",
+      "feature.mcp-connect-timeout-ms",
+      "feature.mcp-shell-prefix",
+      "feature.mcp-child-session-env",
     ]) {
       const entry = lookupCapability(id);
       expect(entry, id).toBeDefined();
@@ -306,7 +404,11 @@ describe("CAPABILITY_REGISTRY invariants", () => {
     // partially runs; each names its specific deferred surface instead.
     expect(lookupCapability("hook.event.mcp__elicitation")?.note).toContain("feature.mcp-elicitation");
     expect(lookupCapability("agent.frontmatter.mcpServers")?.note).toContain("inherit the SESSION's MCP tools");
-    expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("stdio MCP tools themselves run");
+    expect(lookupCapability("feature.hook-handler.mcp_tool")?.note).toContain("MCP tools themselves run");
+    expect(lookupCapability("feature.mcp-remote-transports")?.tier).toBe("partial");
+    for (const id of ["setting.allowedMcpServers", "setting.deniedMcpServers"]) {
+      expect(lookupCapability(id)).toMatchObject({ tier: "not-supported", safetyRelevant: true });
+    }
     // Plugin MCP servers: deferred entry + qualifying clause on the plugins claim.
     expect(lookupCapability("feature.plugins-content")?.note).toContain("feature.mcp-plugin-servers");
   });
@@ -755,6 +857,23 @@ describe("buildCompatReport", () => {
     expect(report.findings).toEqual([]);
   });
 
+  it("routes registry-known managed MCP policy keys to safety findings without honoring them", () => {
+    const project = makeProject({
+      settings: makeSettings({
+        unknownKeys: [
+          { key: "allowedMcpServers", scope: "managed" },
+          { key: "deniedMcpServers", scope: "managed" },
+        ],
+      }),
+    });
+    const report = buildCompatReport(project);
+    expect(report.unassessed).toEqual([]);
+    expect(report.safetyFindings.map((finding) => finding.capability.id)).toEqual([
+      "setting.allowedMcpServers",
+      "setting.deniedMcpServers",
+    ]);
+  });
+
   it("flags unsupported hook event names and non-command handler types", () => {
     const project = makeProject({
       settings: makeSettings({
@@ -1007,8 +1126,8 @@ describe("buildCompatReport", () => {
     expect(evidence).toContain("enabledMcpjsonServers");
     expect(evidence).toContain("disabledMcpjsonServers");
     const note = pending[0]!.capability.note;
-    expect(note).toContain("/mcp and the /doctor pending finding");
-    expect(note).toContain("bounded approval and decline guidance");
+    expect(note).toContain("name-based, not definition-bound");
+    expect(note).toContain("re-review definitions after project MCP changes");
     // The one-time notify line stays bounded: names + enabling key + /doctor
     // pointer, never a JSON settings payload.
     expect(report.mcpPendingNotice).toContain("alpha");
@@ -1251,16 +1370,39 @@ describe("MCP posture line in /doctor", () => {
       }),
     });
     const doctor = renderDoctorReport(project, buildCompatReport(project), undefined, undefined, [
-      { name: "up", state: "connected", toolCount: 5 },
-      { name: "starting", state: "connecting" },
-      { name: "down", state: "failed", diagnostic: 'MCP server "down" failed to start (ENOENT) — command: broken-cmd' },
+      { name: "up", transport: "stdio", state: "connected", toolCount: 5 },
+      { name: "starting", transport: "http", state: "connecting" },
+      { name: "down", transport: "http", state: "failed", diagnostic: "UNSAFE_DIAGNOSTIC_CANARY", statusSummary: "Safe permanent failure." },
     ]);
     expect(doctor).toContain("up: connected (5 tool(s))");
-    expect(doctor).toContain("starting: connecting");
-    expect(doctor).toContain("down: failed — ");
-    expect(doctor).toContain("ENOENT");
-    // The failure diagnostic quotes the RAW command only.
-    expect(doctor).toContain("broken-cmd");
+    expect(doctor).toContain("starting: connecting via http");
+    expect(doctor).toContain("down: failed via http (0 retained tool(s)) — Safe permanent failure.");
+    expect(doctor).not.toContain("UNSAFE_DIAGNOSTIC_CANARY");
+  });
+
+  it("prioritizes actionable names within the bounded doctor posture and discloses further omission", () => {
+    const servers = [
+      ...Array.from({ length: 40 }, (_, index) => makeMcpServer({ name: `healthy-${index}`, status: "enabled" })),
+      makeMcpServer({ name: "actionable-failed", status: "enabled", transport: "http" }),
+      makeMcpServer({ name: "actionable-pending", status: "pending-approval", transport: "http" }),
+    ];
+    const project = makeProject({ mcp: makeMcp({ servers }) });
+    const live = [
+      ...Array.from({ length: 40 }, (_, index) => ({
+        name: `healthy-${index}`,
+        transport: "stdio" as const,
+        state: "connected" as const,
+        toolCount: 1,
+      })),
+      { name: "actionable-failed", transport: "http" as const, state: "failed" as const, statusSummary: "Safe failure." },
+    ];
+    const doctor = renderDoctorReport(project, buildCompatReport(project), undefined, undefined, live);
+    const posture = doctor.split("\n").find((line) => line.startsWith("MCP servers:")) ?? "";
+    expect(posture).toContain("actionable-failed");
+    expect(posture).toContain("actionable-pending");
+    expect(posture).toContain("10 additional server name(s) omitted");
+    expect(posture).toContain("inspect the MCP configuration for complete detail");
+    expect(posture.length).toBeLessThan(16_384);
   });
 
   it("bounds a failed-server diagnostic on the posture line", () => {
@@ -1268,7 +1410,7 @@ describe("MCP posture line in /doctor", () => {
       mcp: makeMcp({ servers: [makeMcpServer({ name: "noisy", status: "enabled" })] }),
     });
     const doctor = renderDoctorReport(project, buildCompatReport(project), undefined, undefined, [
-      { name: "noisy", state: "failed", diagnostic: `boom ${"x".repeat(2000)}` },
+      { name: "noisy", transport: "http", state: "failed", statusSummary: `safe ${"x".repeat(2000)}` },
     ]);
     const line = doctor.split("\n").find((l) => l.startsWith("MCP servers:")) ?? "";
     expect(line).toContain("noisy: failed");

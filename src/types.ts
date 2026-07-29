@@ -339,26 +339,57 @@ export interface McpSettingsEntry {
   disabledMcpjsonServers?: string[];
 }
 
-export type McpServerStatus = "enabled" | "pending-approval" | "disabled" | "skipped";
+export type McpServerStatus =
+  | "enabled"
+  | "pending-approval"
+  | "disabled"
+  | "skipped"
+  | "not-configured";
 
-export interface ResolvedMcpServer {
+interface ResolvedMcpServerCommon {
   name: string;
-  status: McpServerStatus;
   /** Human-readable origin, e.g. ".mcp.json" | "settings:<scope>". */
   source: string;
+  /** Per-server tool-call timeout, validated >= 1000 ms. */
+  timeoutMs?: number;
+  /** Safe per-server findings; expanded URL/header values never enter diagnostics. */
+  diagnostics: string[];
+}
+
+export interface InactiveResolvedMcpServer extends ResolvedMcpServerCommon {
+  status: Exclude<McpServerStatus, "enabled">;
+  /** Safe transport identity only; malformed or unknown shapes omit it. */
+  transport?: "stdio" | "http" | "sse";
+  /** Original remote type alias, safe to display. */
+  configuredType?: "http" | "streamable-http" | "sse";
+}
+
+export interface EnabledStdioMcpServer extends ResolvedMcpServerCommon {
+  status: "enabled";
+  transport: "stdio";
   /** Expanded (`${VAR}` / `${VAR:-default}`). */
   command: string;
-  /** Expanded. */
   args: string[];
-  /** Expanded values. */
   env: Record<string, string>;
   /** Pre-expansion command, for display (never print expanded values). */
   rawCommand: string;
-  /** Per-server tool-call timeout, validated >= 1000 ms. */
-  timeoutMs?: number;
-  /** Per-server findings (skip reasons, ignored fields, unset vars). */
-  diagnostics: string[];
 }
+
+export interface EnabledRemoteMcpServer extends ResolvedMcpServerCommon {
+  status: "enabled";
+  transport: "http" | "sse";
+  configuredType: "http" | "streamable-http" | "sse";
+  /** Secret-bearing expanded endpoint; never use on diagnostics/status surfaces. */
+  url: string;
+  /** Secret-bearing expanded static headers. */
+  headers: Record<string, string>;
+  sseDeprecation?: { deprecated: true; replacement: "http" };
+}
+
+export type ResolvedMcpServer =
+  | InactiveResolvedMcpServer
+  | EnabledStdioMcpServer
+  | EnabledRemoteMcpServer;
 
 export interface ResolvedMcpConfig {
   /** Every discovered server, all statuses. */

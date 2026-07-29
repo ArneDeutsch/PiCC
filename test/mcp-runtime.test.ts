@@ -10,9 +10,10 @@ import {
   type McpRuntimeDeps,
 } from "../src/runtime/mcp.js";
 import { renderMcpStatusReport } from "../src/registry/compat-report.js";
-import type { ResolvedMcpConfig, ResolvedMcpServer } from "../src/types.js";
+import type { EnabledStdioMcpServer, ResolvedMcpConfig, ResolvedMcpServer } from "../src/types.js";
 import { deferred, waitUntil } from "./helpers/async.js";
 import { createMcpProcessFixture, processIsAlive } from "./helpers/mcp-process.js";
+import { createMcpRemoteServer } from "./helpers/mcp-remote-server.js";
 
 // ---------------------------------------------------------------------------
 // Test scaffolding
@@ -36,16 +37,49 @@ afterAll(() => {
   }
 });
 
-function makeServer(over: Partial<ResolvedMcpServer> & { name: string }): ResolvedMcpServer {
+function makeServer(
+  over: Partial<EnabledStdioMcpServer> & { name: string; status?: "enabled" },
+): EnabledStdioMcpServer;
+function makeServer(
+  over: { name: string; status: "pending-approval" | "disabled" | "skipped" | "not-configured" },
+): ResolvedMcpServer;
+function makeServer(over: Record<string, unknown> & { name: string }): ResolvedMcpServer {
+  if (over.status !== undefined && over.status !== "enabled") {
+    return {
+      name: over.name,
+      status: over.status as "pending-approval" | "disabled" | "skipped" | "not-configured",
+      source: ".mcp.json",
+      transport: "stdio",
+      diagnostics: [],
+    };
+  }
   return {
     status: "enabled",
     source: ".mcp.json",
+    transport: "stdio",
     command: process.execPath,
     args: [],
     env: {},
     rawCommand: "node",
     diagnostics: [],
     ...over,
+  };
+}
+
+function makeRemoteServer(
+  over: Partial<Extract<ResolvedMcpServer, { status: "enabled"; transport: "http" | "sse" }>> & { name: string },
+): Extract<ResolvedMcpServer, { status: "enabled"; transport: "http" | "sse" }> {
+  const { name, ...rest } = over;
+  return {
+    status: "enabled",
+    source: ".mcp.json",
+    transport: "http",
+    configuredType: "http",
+    url: "https://REMOTE_URL_CANARY.example/mcp",
+    headers: { Authorization: "REMOTE_HEADER_CANARY" },
+    diagnostics: [],
+    ...rest,
+    name,
   };
 }
 
@@ -261,6 +295,7 @@ describe("McpRuntime zero-enabled path", () => {
       makeServer({ name: "pending", status: "pending-approval" }),
       makeServer({ name: "off", status: "disabled" }),
       makeServer({ name: "broken", status: "skipped" }),
+      makeServer({ name: "empty", status: "not-configured" }),
     );
     const runtime = McpRuntime.start(config, makeDeps());
     expect(runtime.tools()).toEqual([]);
@@ -302,7 +337,7 @@ describe("McpRuntime zero-enabled path", () => {
     try {
       expect(runtime.tools()).toEqual([]);
       expect(runtime.serverStates()).toEqual([
-        { name: "hang", state: "connecting" },
+        { name: "hang", transport: "stdio", state: "connecting" },
       ]);
       await fixture.waitFor(["hang-initialize.pid"], "hanging server to spawn");
       const pid = fixture.pidOf("hang-initialize.pid");
@@ -348,7 +383,7 @@ describe("McpRuntime stdio lifecycle", () => {
       // Exit-sweep listener discipline: exactly one listener while running.
       expect(process.listenerCount("exit")).toBe(exitListenerBaseline + 1);
       expect(runtime.serverStates()).toEqual([
-        { name: "fixture", state: "connected", toolCount: 3 },
+        { name: "fixture", transport: "stdio", state: "connected", toolCount: 3 },
       ]);
       const tools = runtime.tools();
       expect(tools.map((t) => t.toolName).sort()).toEqual(["big-output", "echo", "report-env"]);
@@ -389,8 +424,8 @@ describe("McpRuntime stdio lifecycle", () => {
     try {
       expect(runtime.tools()).toEqual([]);
       expect(runtime.serverStates()).toEqual([
-        { name: "first", state: "connecting" },
-        { name: "second", state: "connecting" },
+        { name: "first", transport: "stdio", state: "connecting" },
+        { name: "second", transport: "stdio", state: "connecting" },
       ]);
       await Promise.all([
         firstFixture.waitFor(["serve.pid"], "first concurrent server to spawn"),
@@ -528,7 +563,7 @@ describe("McpRuntime stdio lifecycle", () => {
       );
       try {
         await runtime.whenSettled();
-        expect(runtime.serverStates()).toEqual([{ name: "shim", state: "connected", toolCount: 3 }]);
+        expect(runtime.serverStates()).toEqual([{ name: "shim", transport: "stdio", state: "connected", toolCount: 3 }]);
         const result = await runtime.callTool("shim", "echo", { text: "via cmd shim" });
         expect(firstText(result)).toBe("via cmd shim");
       } finally {
@@ -1052,7 +1087,7 @@ describe("McpRuntime degrade paths", () => {
     try {
       await runtime.whenSettled();
       expect(runtime.serverStates()).toEqual([
-        { name: "hostile", state: "connected", toolCount: 8 },
+        { name: "hostile", transport: "stdio", state: "connected", toolCount: 8 },
       ]);
       const tools = runtime.tools();
       const names = tools.map((t) => t.toolName);
@@ -1216,7 +1251,7 @@ describe("McpRuntime kill discipline", () => {
     try {
       await runtime.whenSettled();
       expect(runtime.serverStates()).toEqual([
-        { name: "family", state: "connected", toolCount: 3 },
+        { name: "family", transport: "stdio", state: "connected", toolCount: 3 },
       ]);
       await fixture.waitFor(
         ["spawn-grandchild.pid", "grandchild.pid"],
@@ -1303,4 +1338,784 @@ describe("McpRuntime kill discipline", () => {
       await fixture.cleanup();
     }
   }, 25_000);
+});
+
+
+describe("McpRuntime remote retry and recovery", () => {
+  class StreamableHTTPError extends Error {
+    readonly status: number;
+    constructor(status: number) {
+      super("REMOTE_SPEECH_CANARY");
+      this.status = status;
+    }
+  }
+
+  type RemoteOutcome = "ok" | number | Error | Promise<void>;
+
+  function remoteHarness(options: {
+    connect: RemoteOutcome[];
+    discover?: RemoteOutcome[];
+    calls?: RemoteOutcome[];
+    closes?: RemoteOutcome[];
+    catalogs?: string[][];
+  }) {
+    const disconnects: Array<(event: { kind: "graceful-eof" | "abrupt-stream-failure" }) => void> = [];
+    const transportErrors: Array<(error: Error) => void> = [];
+    const closed: number[] = [];
+    const aborted: number[] = [];
+    let clients = 0;
+    let callCount = 0;
+    const events: string[] = [];
+    const run = async (outcome: RemoteOutcome | undefined): Promise<void> => {
+      if (outcome === undefined || outcome === "ok") return;
+      if (typeof outcome === "number") throw new StreamableHTTPError(outcome);
+      if (outcome instanceof Error) throw outcome;
+      await outcome;
+    };
+    class FakeRemoteClient {
+      readonly index: number;
+      constructor() {
+        this.index = clients++;
+        events.push(`client:${this.index}`);
+      }
+      async connect(): Promise<void> { await run(options.connect[this.index]); }
+      async listTools(): Promise<{ tools: Array<{ name: string; description: string; inputSchema: object }> }> {
+        await run(options.discover?.[this.index]);
+        return {
+          tools: (options.catalogs?.[this.index] ?? ["alpha"]).map((name) => ({
+            name,
+            description: `catalog-${this.index}`,
+            inputSchema: { type: "object", title: `schema-${this.index}` },
+          })),
+        };
+      }
+      async callTool(): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+        await run(options.calls?.[callCount++]);
+        return { content: [{ type: "text", text: `client-${this.index}` }] };
+      }
+      async close(): Promise<void> {
+        closed.push(this.index);
+        events.push(`close:${this.index}`);
+        await run(options.closes?.[this.index]);
+      }
+    }
+    const createRemoteTransport: NonNullable<McpRuntimeDeps["createRemoteTransport"]> = async (config) => {
+      const index = disconnects.length;
+      expect(config.transportKind).toBe(config.configuredType === "sse" ? "sse" : "http");
+      let listener: ((event: { kind: "graceful-eof" | "abrupt-stream-failure" }) => void) | undefined;
+      let errorListener: ((error: Error) => void) | undefined;
+      disconnects.push((event) => listener?.(event));
+      transportErrors.push((error) => errorListener?.(error));
+      return {
+        transportKind: config.transportKind,
+        deprecated: config.transportKind === "sse",
+        onDisconnect(next: (event: { kind: "graceful-eof" | "abrupt-stream-failure" }) => void) { listener = next; return () => { listener = undefined; }; },
+        get onerror() { return errorListener; },
+        set onerror(next) { errorListener = next; },
+        abort: async () => { aborted.push(index); },
+        close: async () => {},
+        start: async () => {},
+        send: async () => {},
+      } as never;
+    };
+    return {
+      FakeRemoteClient,
+      createRemoteTransport,
+      disconnects,
+      transportErrors,
+      closed,
+      aborted,
+      events,
+      clientCount: () => clients,
+      callCount: () => callCount,
+    };
+  }
+
+  it("round-trips initialize, discovery, call, and close through the real t02 HTTP adapter", async () => {
+    const fixture = await createMcpRemoteServer();
+    const runtime = McpRuntime.start(
+      makeConfig(makeRemoteServer({ name: "loopback", url: fixture.streamableUrl })),
+      makeDeps(),
+    );
+    try {
+      await runtime.whenSettled();
+      expect(runtime.serverStates()).toEqual([
+        { name: "loopback", transport: "http", state: "connected", toolCount: 1 },
+      ]);
+      expect(runtime.tools()).toEqual([
+        expect.objectContaining({
+          serverName: "loopback",
+          toolName: "echo",
+          description: "Returns its arguments.",
+        }),
+      ]);
+      expect(firstText(await runtime.callTool("loopback", "echo", { value: 7 }))).toBe(
+        '{"value":7}',
+      );
+    } finally {
+      await runtime.shutdown();
+      await fixture.cleanup();
+    }
+    await waitUntil({
+      description: "loopback adapter cleanup",
+      predicate: () => fixture.stats().sockets === 0,
+    });
+    expect(fixture.stats()).toEqual({ listenerOpen: false, sockets: 0, streams: 0, timers: 0 });
+  });
+
+  it("retries transient initial failures at exactly 1/2/4 seconds within one settlement", async () => {
+    const harness = remoteHarness({ connect: [503, 503, 503, "ok"] });
+    const delays: number[] = [];
+    const runtime = McpRuntime.start(
+      makeConfig(makeRemoteServer({ name: "remote" })),
+      makeDeps({
+        loadRemoteClient: async () => harness.FakeRemoteClient as never,
+        createRemoteTransport: harness.createRemoteTransport,
+        delay: async (ms) => { delays.push(ms); },
+      }),
+    );
+    try {
+      await runtime.whenSettled();
+      expect(delays).toEqual([1_000, 2_000, 4_000]);
+      expect(harness.clientCount()).toBe(4);
+      expect(runtime.serverStates()).toEqual([
+        { name: "remote", transport: "http", state: "connected", toolCount: 1 },
+      ]);
+      expect(runtime.tools().map((tool) => tool.toolName)).toEqual(["alpha"]);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it.each(["connection", "discovery"] as const)(
+    "uses typed pre-publication transport loss to retry generic %s rejection safely",
+    async (stage) => {
+      const harness = remoteHarness({ connect: [] });
+      class TypedLossClient extends harness.FakeRemoteClient {
+        override async connect(): Promise<void> {
+          if (stage === "connection") {
+            harness.disconnects[this.index]!({ kind: "abrupt-stream-failure" });
+            throw new Error("GENERIC_INITIAL_CANARY");
+          }
+        }
+        override async listTools(): Promise<{ tools: Array<{ name: string; description: string; inputSchema: object }> }> {
+          harness.disconnects[this.index]!({ kind: "abrupt-stream-failure" });
+          throw new Error("GENERIC_INITIAL_CANARY");
+        }
+      }
+      const delays: number[] = [];
+      const runtime = McpRuntime.start(
+        makeConfig(makeRemoteServer({ name: "typed-loss" })),
+        makeDeps({
+          loadRemoteClient: async () => TypedLossClient as never,
+          createRemoteTransport: harness.createRemoteTransport,
+          delay: async (ms) => { delays.push(ms); },
+        }),
+      );
+      try {
+        await runtime.whenSettled();
+        expect(delays).toEqual([1_000, 2_000, 4_000]);
+        expect(harness.clientCount()).toBe(4);
+        expect(runtime.serverStates()[0]).toMatchObject({
+          state: "failed",
+          statusSummary: expect.stringContaining("check endpoint and network availability"),
+        });
+        expect(`${runtime.diagnostics().join("\n")}\n${JSON.stringify(runtime.serverStates())}`)
+          .not.toContain("GENERIC_INITIAL_CANARY");
+      } finally {
+        await runtime.shutdown();
+      }
+    },
+  );
+
+  it("connects deprecated SSE through the remote adapter with truthful transport identity", async () => {
+    const harness = remoteHarness({ connect: ["ok"] });
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({
+      name: "legacy",
+      transport: "sse",
+      configuredType: "sse",
+      sseDeprecation: { deprecated: true, replacement: "http" },
+    })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+    }));
+    try {
+      await runtime.whenSettled();
+      expect(runtime.serverStates()).toEqual([
+        { name: "legacy", transport: "sse", state: "connected", toolCount: 1 },
+      ]);
+      expect(firstText(await runtime.callTool("legacy", "alpha", {}))).toBe("client-0");
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("does not retry authentication failures or expose endpoint/header/transport speech", async () => {
+    const harness = remoteHarness({ connect: [401] });
+    const delays: number[] = [];
+    const runtime = McpRuntime.start(
+      makeConfig(makeRemoteServer({ name: "auth" })),
+      makeDeps({
+        loadRemoteClient: async () => harness.FakeRemoteClient as never,
+        createRemoteTransport: harness.createRemoteTransport,
+        delay: async (ms) => { delays.push(ms); },
+      }),
+    );
+    try {
+      await runtime.whenSettled();
+      expect(delays).toEqual([]);
+      expect(harness.clientCount()).toBe(1);
+      expect(runtime.serverStates()[0]).toMatchObject({
+        state: "failed",
+        statusSummary: expect.stringContaining("static headers"),
+      });
+      const surfaces = `${runtime.diagnostics().join("\n")}\n${JSON.stringify(runtime.serverStates())}`;
+      for (const canary of ["REMOTE_URL_CANARY", "REMOTE_HEADER_CANARY", "REMOTE_SPEECH_CANARY"]) {
+        expect(surfaces).not.toContain(canary);
+      }
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("keeps the original catalog while reconnecting and swaps only the current client", async () => {
+    const harness = remoteHarness({ connect: ["ok", "ok"], catalogs: [["alpha"], ["alpha", "widened"]] });
+    const delays: number[] = [];
+    const runtime = McpRuntime.start(
+      makeConfig(makeRemoteServer({ name: "recover" })),
+      makeDeps({
+        loadRemoteClient: async () => harness.FakeRemoteClient as never,
+        createRemoteTransport: harness.createRemoteTransport,
+        delay: async (ms) => { delays.push(ms); },
+      }),
+    );
+    try {
+      await runtime.whenSettled();
+      expect(firstText(await runtime.callTool("recover", "alpha", {}))).toBe("client-0");
+      harness.disconnects[0]!({ kind: "abrupt-stream-failure" });
+      await waitUntil({
+        description: "remote recovery to publish the replacement client",
+        predicate: () => runtime.serverStates()[0]?.state === "connected" && harness.clientCount() === 2,
+      });
+      expect(delays).toEqual([1_000]);
+      expect(runtime.tools()).toEqual([
+        expect.objectContaining({
+          toolName: "alpha",
+          description: "catalog-0",
+          inputSchema: { type: "object", title: "schema-0" },
+        }),
+      ]);
+      expect(harness.events.indexOf("close:0")).toBeLessThan(harness.events.indexOf("client:1"));
+      await expect(runtime.callTool("recover", "widened", {})).rejects.toThrow(/has no tool/);
+      expect(firstText(await runtime.callTool("recover", "alpha", {}))).toBe("client-1");
+      harness.disconnects[0]!({ kind: "abrupt-stream-failure" });
+      harness.transportErrors[0]!(new StreamableHTTPError(503));
+      await Promise.resolve();
+      expect(harness.clientCount()).toBe(2);
+      expect(delays).toEqual([1_000]);
+      expect(runtime.serverStates()[0]).toMatchObject({ state: "connected", toolCount: 1 });
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("exhausts exactly five reconnect delays and retains terminal local proxies", async () => {
+    const harness = remoteHarness({ connect: ["ok", 503, 503, 503, 503, 503] });
+    const delays: number[] = [];
+    const runtime = McpRuntime.start(
+      makeConfig(makeRemoteServer({ name: "exhaust" })),
+      makeDeps({
+        loadRemoteClient: async () => harness.FakeRemoteClient as never,
+        createRemoteTransport: harness.createRemoteTransport,
+        delay: async (ms) => { delays.push(ms); },
+      }),
+    );
+    try {
+      await runtime.whenSettled();
+      harness.disconnects[0]!({ kind: "graceful-eof" });
+      await waitUntil({
+        description: "remote reconnect exhaustion",
+        predicate: () => runtime.serverStates()[0]?.state === "failed",
+      });
+      expect(delays).toEqual([1_000, 2_000, 4_000, 8_000, 16_000]);
+      expect(harness.clientCount()).toBe(6);
+      expect(runtime.tools().map((tool) => tool.toolName)).toEqual(["alpha"]);
+      expect(runtime.serverStates()[0]?.statusSummary).toContain(
+        "check endpoint and network availability, then reload or retry",
+      );
+      await expect(runtime.callTool("exhaust", "alpha", {})).rejects.toThrow(/remote connection failed/);
+      expect(harness.clientCount()).toBe(6);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("reports not-found startup safely without displaying the configured URL", async () => {
+    const harness = remoteHarness({ connect: [404] });
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "missing" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+    }));
+    try {
+      await runtime.whenSettled();
+      expect(runtime.serverStates()[0]?.statusSummary).toBe(
+        "Remote MCP endpoint was not found; check the configured URL without sharing it.",
+      );
+      expect(JSON.stringify(runtime.serverStates())).not.toContain("REMOTE_URL_CANARY");
+      expect(harness.clientCount()).toBe(1);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it.each([
+    ["connection 408", [408], undefined, 2],
+    ["connection 429", [429], undefined, 2],
+    ["connection 500", [500], undefined, 2],
+    ["connection 400", [400], undefined, 1],
+    ["connection 404", [404], undefined, 1],
+    ["discovery 500", ["ok", "ok"], [500, "ok"], 2],
+    ["discovery 400", ["ok"], [400], 1],
+  ] as const)("applies stage-aware initial retry policy for %s", async (_label, connect, discover, attempts) => {
+    const harness = remoteHarness({
+      connect: [...connect] as RemoteOutcome[],
+      ...(discover === undefined ? {} : { discover: [...discover] as RemoteOutcome[] }),
+    });
+    const delays: number[] = [];
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "policy" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      delay: async (ms) => { delays.push(ms); },
+    }));
+    try {
+      await runtime.whenSettled();
+      expect(harness.clientCount()).toBe(attempts);
+      expect(delays).toEqual(attempts === 2 ? [1_000] : []);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it.each([
+    ["discovery request timeout", Object.assign(new Error("SERVER_TIMEOUT_CANARY"), { code: -32_001 })],
+    ["unowned abort", Object.assign(new Error("ABORT_CANARY"), { name: "AbortError" })],
+    ["unknown connection error", new Error("UNKNOWN_CANARY")],
+  ])("does not retry %s", async (_label, error) => {
+    const discovery = _label.startsWith("discovery") ? [error] : undefined;
+    const harness = remoteHarness({ connect: discovery ? ["ok"] : [error], ...(discovery ? { discovery } : {}) });
+    const delays: number[] = [];
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "no-retry" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      delay: async (ms) => { delays.push(ms); },
+    }));
+    try {
+      await runtime.whenSettled();
+      expect(harness.clientCount()).toBe(1);
+      expect(delays).toEqual([]);
+      expect(runtime.diagnostics().join("\n")).not.toMatch(/SERVER_TIMEOUT_CANARY|ABORT_CANARY|UNKNOWN_CANARY/);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("enforces one aggregate initial budget and rejects late initial publication", async () => {
+    const gate = deferred<void>();
+    const harness = remoteHarness({ connect: [gate.promise] });
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "aggregate" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      raceWithTimeout: async (_promise, timeoutMs) => {
+        expect(timeoutMs).toBe(30_000);
+        while (harness.clientCount() < 1) await Promise.resolve();
+        return { timedOut: true };
+      },
+    }));
+    try {
+      await runtime.whenSettled();
+      expect(runtime.serverStates()[0]).toMatchObject({ state: "failed" });
+      gate.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(runtime.tools()).toEqual([]);
+      expect(runtime.serverStates()[0]).toMatchObject({ state: "failed" });
+      expect(harness.clientCount()).toBe(1);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("deduplicates recovery signals and calls during outage without accelerating the loop", async () => {
+    const retryDelay = deferred<void>();
+    const harness = remoteHarness({ connect: ["ok", "ok"] });
+    const delays: number[] = [];
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "dedupe" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      delay: async (ms) => { delays.push(ms); await retryDelay.promise; },
+    }));
+    try {
+      await runtime.whenSettled();
+      harness.disconnects[0]!({ kind: "abrupt-stream-failure" });
+      harness.disconnects[0]!({ kind: "graceful-eof" });
+      await waitUntil({ description: "recovery delay", predicate: () => delays.length === 1 });
+      await expect(runtime.callTool("dedupe", "alpha", {})).rejects.toThrow(/temporarily unavailable/);
+      expect(harness.clientCount()).toBe(1);
+      expect(delays).toEqual([1_000]);
+      retryDelay.resolve();
+      await waitUntil({ description: "deduped recovery success", predicate: () => harness.clientCount() === 2 && runtime.serverStates()[0]?.state === "connected" });
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("bounds each recovery attempt and ignores a timed-out attempt that completes after newer success", async () => {
+    const stale = deferred<void>();
+    const harness = remoteHarness({ connect: ["ok", stale.promise, "ok"], catalogs: [["alpha"], ["stale"], ["alpha", "new"]] });
+    const delays: number[] = [];
+    let races = 0;
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "epoch" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      delay: async (ms) => { delays.push(ms); },
+      raceWithTimeout: async <T>(promise: Promise<T>, timeoutMs: number) => {
+        expect(timeoutMs).toBe(30_000);
+        races += 1;
+        if (races === 2) {
+          while (harness.clientCount() < 2) await Promise.resolve();
+          return { timedOut: true };
+        }
+        return { timedOut: false, value: await promise };
+      },
+    }));
+    try {
+      await runtime.whenSettled();
+      harness.disconnects[0]!({ kind: "abrupt-stream-failure" });
+      await waitUntil({ description: "newer reconnect success", predicate: () => harness.clientCount() === 3 && runtime.serverStates()[0]?.state === "connected" });
+      expect(delays).toEqual([1_000, 2_000]);
+      expect(firstText(await runtime.callTool("epoch", "alpha", {}))).toBe("client-2");
+      stale.resolve();
+      await Promise.resolve();
+      await expect(runtime.callTool("epoch", "new", {})).rejects.toThrow(/has no tool/);
+      expect(firstText(await runtime.callTool("epoch", "alpha", {}))).toBe("client-2");
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("does not let hanging reconnect cleanup consume a second attempt timeout", async () => {
+    const connectGate = deferred<void>();
+    const cleanupGate = deferred<void>();
+    const harness = remoteHarness({
+      connect: ["ok", connectGate.promise, "ok"],
+      closes: ["ok", cleanupGate.promise, "ok"],
+    });
+    let races = 0;
+    const delays: number[] = [];
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "cleanup-budget" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      delay: async (ms) => { delays.push(ms); },
+      raceWithTimeout: async <T>(promise: Promise<T>, timeoutMs: number) => {
+        expect(timeoutMs).toBe(30_000);
+        races += 1;
+        if (races === 2) {
+          await waitUntil({ description: "timed reconnect client", predicate: () => harness.clientCount() === 2 });
+          return { timedOut: true };
+        }
+        return { timedOut: false, value: await promise };
+      },
+    }));
+    try {
+      await runtime.whenSettled();
+      harness.disconnects[0]!({ kind: "abrupt-stream-failure" });
+      await waitUntil({
+        description: "reconnect progresses past hanging cleanup",
+        predicate: () => harness.clientCount() === 3 && runtime.serverStates()[0]?.state === "connected",
+      });
+      expect(delays).toEqual([1_000, 2_000]);
+      expect(races).toBe(3);
+      expect(harness.closed).toContain(1);
+      expect(firstText(await runtime.callTool("cleanup-budget", "alpha", {}))).toBe("client-2");
+    } finally {
+      await runtime.shutdown();
+      connectGate.resolve();
+      cleanupGate.resolve();
+    }
+  });
+
+  it("starts one recovery loop for a classified transient call and fails unknown transport errors immediately", async () => {
+    const delayGate = deferred<void>();
+    const harness = remoteHarness({ connect: ["ok", "ok"], calls: [new StreamableHTTPError(503)] });
+    const delays: number[] = [];
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "call-recovery" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      delay: async (ms) => { delays.push(ms); await delayGate.promise; },
+    }));
+    try {
+      await runtime.whenSettled();
+      await expect(runtime.callTool("call-recovery", "alpha", {})).rejects.toThrow(/temporarily unavailable/);
+      await waitUntil({ description: "call-started recovery", predicate: () => delays.length === 1 });
+      await expect(runtime.callTool("call-recovery", "alpha", {})).rejects.toThrow(/temporarily unavailable/);
+      expect(delays).toEqual([1_000]);
+      delayGate.resolve();
+      await waitUntil({ description: "call recovery success", predicate: () => runtime.serverStates()[0]?.state === "connected" && harness.clientCount() === 2 });
+      harness.transportErrors[1]!(new Error("UNKNOWN_POST_CONNECT_CANARY"));
+      expect(runtime.serverStates()[0]).toMatchObject({ state: "failed" });
+      expect(delays).toEqual([1_000]);
+      expect(runtime.diagnostics().join("\n")).not.toContain("UNKNOWN_POST_CONNECT_CANARY");
+    } finally {
+      delayGate.resolve();
+      await runtime.shutdown();
+    }
+  });
+
+  it.each(["import", "connect", "discovery", "active-reconnect"] as const)(
+    "shutdown during remote %s invalidates work and closes each owned part once",
+    async (phase) => {
+      const gate = deferred<void>();
+      const importGate = deferred<typeof import("@modelcontextprotocol/sdk/client/index.js").Client>();
+      const harness = remoteHarness({
+        connect: phase === "connect" || phase === "active-reconnect" ? [phase === "connect" ? gate.promise : "ok", gate.promise] : ["ok"],
+        discover: phase === "discovery" ? [gate.promise] : undefined,
+      });
+      const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: `shutdown-${phase}` })), makeDeps({
+        loadRemoteClient: phase === "import"
+          ? async () => importGate.promise
+          : async () => harness.FakeRemoteClient as never,
+        createRemoteTransport: harness.createRemoteTransport,
+        delay: async () => undefined,
+      }));
+      try {
+        if (phase === "import") {
+          await Promise.resolve();
+        } else {
+          await waitUntil({ description: `${phase} work to enter`, predicate: () => harness.clientCount() >= 1 });
+          if (phase === "active-reconnect") {
+            await runtime.whenSettled();
+            harness.disconnects[0]!({ kind: "abrupt-stream-failure" });
+            await waitUntil({ description: "active reconnect to enter", predicate: () => harness.clientCount() === 2 });
+          }
+        }
+        await Promise.all([runtime.shutdown(), runtime.shutdown(), runtime.whenSettled()]);
+        importGate.resolve(harness.FakeRemoteClient as never);
+        gate.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(runtime.serverStates()[0]).toMatchObject({ state: "failed" });
+        expect(runtime.tools().map((tool) => tool.toolName)).toEqual(
+          phase === "active-reconnect" ? ["alpha"] : [],
+        );
+        const expectedOwned = phase === "import" ? [] : phase === "active-reconnect" ? [0, 1] : [0];
+        expect(harness.closed).toEqual(expectedOwned);
+        expect(harness.aborted).toEqual(expectedOwned);
+      } finally {
+        importGate.resolve(harness.FakeRemoteClient as never);
+        gate.resolve();
+        await runtime.shutdown();
+      }
+    },
+  );
+
+  it("keeps request-local MCP protocol errors local and model-visible through the bounded call path", async () => {
+    const protocolError = Object.assign(new Error("PROTOCOL_ERROR_CANARY"), { code: -32_602 });
+    const harness = remoteHarness({ connect: ["ok"], calls: [protocolError] });
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "protocol" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+    }));
+    try {
+      await runtime.whenSettled();
+      await expect(runtime.callTool("protocol", "alpha", {})).rejects.toThrow(/PROTOCOL_ERROR_CANARY/);
+      expect(runtime.serverStates()[0]).toMatchObject({ state: "connected" });
+      expect(harness.clientCount()).toBe(1);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it.each([
+    [401, /static headers/],
+    [404, /configured URL/],
+    [400, /failed permanently/],
+  ] as const)(
+    "fails a post-connect callTool HTTP %i permanently without retrying or harming a sibling",
+    async (status, summary) => {
+      const harness = remoteHarness({
+        connect: ["ok", "ok"],
+        calls: [status, "ok"],
+      });
+      const delays: number[] = [];
+      const runtime = McpRuntime.start(makeConfig(
+        makeRemoteServer({ name: "failed" }),
+        makeRemoteServer({ name: "healthy" }),
+      ), makeDeps({
+        loadRemoteClient: async () => harness.FakeRemoteClient as never,
+        createRemoteTransport: harness.createRemoteTransport,
+        delay: async (ms) => { delays.push(ms); },
+      }));
+      try {
+        await runtime.whenSettled();
+        await expect(runtime.callTool("failed", "alpha", {})).rejects.toThrow(
+          /unavailable because its remote connection failed/,
+        );
+        expect(runtime.serverStates()[0]).toMatchObject({
+          state: "failed",
+          statusSummary: expect.stringMatching(summary),
+        });
+        expect(runtime.serverStates()[1]).toMatchObject({ state: "connected", toolCount: 1 });
+        expect(delays).toEqual([]);
+        expect(harness.callCount()).toBe(1);
+
+        await expect(runtime.callTool("failed", "alpha", {})).rejects.toThrow(
+          /unavailable because its remote connection failed/,
+        );
+        expect(harness.callCount()).toBe(1);
+        expect(firstText(await runtime.callTool("healthy", "alpha", {}))).toBe("client-1");
+        expect(harness.callCount()).toBe(2);
+        await expect(runtime.callTool("failed", "alpha", {})).rejects.toThrow(
+          /unavailable because its remote connection failed/,
+        );
+        expect(harness.callCount()).toBe(2);
+        expect(delays).toEqual([]);
+      } finally {
+        await runtime.shutdown();
+      }
+    },
+  );
+
+  it("keeps stdio healthy when the remote client module fails to load", async () => {
+    class FakeStdioTransport {
+      pid: number | undefined;
+      stderr = undefined;
+      onclose?: () => void;
+      onerror?: (error: Error) => void;
+      onmessage?: (message: unknown) => void;
+    }
+    class FakeStdioClient {
+      async connect(): Promise<void> {}
+      async listTools(): Promise<{ tools: Array<{ name: string }> }> { return { tools: [{ name: "stdio-tool" }] }; }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(
+      makeServer({ name: "stdio" }),
+      makeRemoteServer({ name: "remote" }),
+    ), makeDeps({
+      loadSdk: async () => ({ Client: FakeStdioClient, StdioClientTransport: FakeStdioTransport }) as never,
+      loadRemoteClient: async () => { throw new Error("REMOTE_IMPORT_CANARY"); },
+      createRemoteTransport: async () => { throw new Error("must not construct"); },
+    }));
+    try {
+      await runtime.whenSettled();
+      expect(runtime.serverStates().find((state) => state.name === "stdio")).toMatchObject({ state: "connected", toolCount: 1 });
+      expect(runtime.serverStates().find((state) => state.name === "remote")).toMatchObject({ state: "failed" });
+      expect(runtime.diagnostics().join("\n")).not.toContain("REMOTE_IMPORT_CANARY");
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
+  it("shutdown during reconnect delay cancels the loop without client, request, state, or catalog resurrection", async () => {
+    const reconnectDelay = deferred<void>();
+    const harness = remoteHarness({ connect: ["ok", "ok"] });
+    const delays: number[] = [];
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "shutdown-delay" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      delay: async (ms) => { delays.push(ms); await reconnectDelay.promise; },
+    }));
+    await runtime.whenSettled();
+    const catalog = runtime.tools();
+    harness.disconnects[0]!({ kind: "abrupt-stream-failure" });
+    await waitUntil({ description: "reconnect delay before shutdown", predicate: () => delays.length === 1 });
+    await Promise.all([runtime.shutdown(), runtime.shutdown()]);
+    const stoppedState = runtime.serverStates();
+    reconnectDelay.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(delays).toEqual([1_000]);
+    expect(harness.clientCount()).toBe(1);
+    expect(harness.callCount()).toBe(0);
+    expect(harness.closed).toEqual([0]);
+    expect(harness.aborted).toEqual([0]);
+    expect(runtime.serverStates()).toEqual(stoppedState);
+    expect(runtime.tools()).toEqual(catalog);
+  });
+
+  it("shutdown concurrent with an outage call leaves one cleanup owner and no later recovery", async () => {
+    const reconnectDelay = deferred<void>();
+    const harness = remoteHarness({ connect: ["ok", "ok"] });
+    const delays: number[] = [];
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "shutdown-outage" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      delay: async (ms) => { delays.push(ms); await reconnectDelay.promise; },
+    }));
+    await runtime.whenSettled();
+    const catalog = runtime.tools();
+    harness.disconnects[0]!({ kind: "abrupt-stream-failure" });
+    await waitUntil({ description: "outage call recovery delay", predicate: () => delays.length === 1 });
+    const outageCall = runtime.callTool("shutdown-outage", "alpha", {});
+    await Promise.all([runtime.shutdown(), runtime.shutdown()]);
+    await expect(outageCall).rejects.toThrow(/temporarily unavailable/);
+    const stoppedState = runtime.serverStates();
+    const lateRecoveryContinuation = deferred<void>();
+    reconnectDelay.resolve();
+    // The check-phase signal runs only after the released delay's promise continuation processes the shutdown gate.
+    setImmediate(() => lateRecoveryContinuation.resolve());
+    await lateRecoveryContinuation.promise;
+    expect(harness.clientCount()).toBe(1);
+    expect(harness.callCount()).toBe(0);
+    expect(harness.closed).toEqual([0]);
+    expect(harness.aborted).toEqual([0]);
+    expect(delays).toEqual([1_000]);
+    expect(runtime.serverStates()).toEqual(stoppedState);
+    expect(runtime.tools()).toEqual(catalog);
+  });
+
+  it("ignores a late rejecting call and transport error after shutdown without resurrecting recovery", async () => {
+    const callGate = deferred<void>();
+    const harness = remoteHarness({ connect: ["ok"], calls: [callGate.promise] });
+    const delays: number[] = [];
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "shutdown-late" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      delay: async (ms) => { delays.push(ms); },
+    }));
+    await runtime.whenSettled();
+    const catalog = runtime.tools();
+    const lateCall = runtime.callTool("shutdown-late", "alpha", {});
+    await waitUntil({ description: "late call to enter before shutdown", predicate: () => harness.callCount() === 1 });
+    await Promise.all([runtime.shutdown(), runtime.shutdown()]);
+    const stoppedState = runtime.serverStates();
+    callGate.reject(new StreamableHTTPError(503));
+    harness.transportErrors[0]!(new StreamableHTTPError(503));
+    await expect(lateCall).rejects.toThrow(/temporarily unavailable/);
+    await Promise.resolve();
+    expect(delays).toEqual([]);
+    expect(harness.clientCount()).toBe(1);
+    expect(harness.callCount()).toBe(1);
+    expect(harness.closed).toEqual([0]);
+    expect(harness.aborted).toEqual([0]);
+    expect(runtime.serverStates()).toEqual(stoppedState);
+    expect(runtime.tools()).toEqual(catalog);
+  });
+
+  it("shutdown during initial retry delay settles once and prevents later clients or resurrection", async () => {
+    const delayGate = deferred<void>();
+    const harness = remoteHarness({ connect: [503, "ok"] });
+    const runtime = McpRuntime.start(makeConfig(makeRemoteServer({ name: "shutdown" })), makeDeps({
+      loadRemoteClient: async () => harness.FakeRemoteClient as never,
+      createRemoteTransport: harness.createRemoteTransport,
+      delay: async () => { await delayGate.promise; },
+    }));
+    await waitUntil({ description: "initial retry delay", predicate: () => runtime.serverStates()[0]?.state === "retrying" });
+    await Promise.all([runtime.shutdown(), runtime.shutdown(), runtime.whenSettled()]);
+    delayGate.resolve();
+    await Promise.resolve();
+    expect(harness.clientCount()).toBe(1);
+    expect(runtime.tools()).toEqual([]);
+    expect(runtime.serverStates()[0]).toMatchObject({ state: "failed" });
+  });
 });
