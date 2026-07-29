@@ -1,4 +1,4 @@
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -136,6 +136,60 @@ export interface E2ELive {
   cleanup: () => Promise<void>;
 }
 
+export async function stopProcessTree(
+  child: ChildProcess,
+  closed: Promise<number | null>,
+): Promise<void> {
+  const waitForClose = async (timeoutMs: number): Promise<boolean> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        closed.then(() => true),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  if (child.exitCode !== null || child.signalCode !== null) {
+    if (await waitForClose(5_000)) return;
+    if (process.platform === "win32") {
+      throw new Error("Process exited but did not report close within 5000ms");
+    }
+  }
+
+  const pid = child.pid;
+  if (process.platform === "win32") {
+    if (pid === undefined) throw new Error("Process has no PID for Windows tree termination");
+    const termination = spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+      timeout: 3_000,
+    });
+    if (await waitForClose(5_000)) return;
+    const detail = termination.error?.message ?? `status ${termination.status ?? "unknown"}`;
+    throw new Error(`Process tree ${pid} did not close after taskkill (${detail})`);
+  }
+
+  if (pid === undefined || pid <= 0) throw new Error("Process has no valid PID for process-group termination");
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+  if (await waitForClose(2_000)) return;
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+  if (await waitForClose(5_000)) return;
+  throw new Error(`Process group ${pid} did not close after SIGKILL`);
+}
+
 /**
  * Create an isolated e2e harness instance. Each split test file calls this once
  * at module scope and wires `afterEach(cleanup)`, so per-run temp dirs and
@@ -144,6 +198,8 @@ export interface E2ELive {
 export function createE2ELive(): E2ELive {
   const tempDirs: string[] = [];
   const fixtures: string[] = [];
+  const retainedTempDirs = new Set<string>();
+  const retainedFixtures = new Set<string>();
   const active = new Set<StartedPi>();
 
   function makeAgentDir(
@@ -241,10 +297,52 @@ export function createE2ELive(): E2ELive {
     let stdout = "";
     let stderr = "";
     let closed: Promise<number | null> | undefined;
-    const stop = async (): Promise<void> => {
-      if (!child || child.exitCode !== null || child.signalCode !== null) return;
-      child.kill();
-      await closed;
+    const outputRecords: Record<string, unknown>[] = [];
+    const outputWaiters = new Set<{
+      predicate: (record: Record<string, unknown>) => boolean;
+      count: number;
+      resolve: (record: Record<string, unknown>) => void;
+      reject: (error: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }>();
+    let started: StartedPi | undefined;
+    let finalization: Promise<void> | undefined;
+    let finalized = false;
+    const finalizeRun = (retainRunPaths: boolean): Promise<void> => {
+      if (retainRunPaths) {
+        retainedFixtures.add(fixture);
+        retainedTempDirs.add(agentDir);
+        retainedTempDirs.add(emptyUserDir);
+      }
+      finalization ??= (async () => {
+        try {
+          if (killTimer) clearTimeout(killTimer);
+          await mock.close();
+          const error = new Error("Pi run finalized while waiting for output");
+          for (const waiter of outputWaiters) {
+            clearTimeout(waiter.timer);
+            waiter.reject(error);
+          }
+          outputWaiters.clear();
+        } finally {
+          finalized = true;
+          if (started) active.delete(started);
+        }
+      })();
+      return finalization;
+    };
+    let stopOperation: Promise<void> | undefined;
+    const stop = (): Promise<void> => {
+      stopOperation ??= (async () => {
+        if (!child || !closed) return;
+        try {
+          await stopProcessTree(child, closed);
+        } catch (error) {
+          await finalizeRun(true);
+          throw error;
+        }
+      })();
+      return stopOperation;
     };
     try {
       child = spawn(
@@ -269,16 +367,9 @@ export function createE2ELive(): E2ELive {
           },
           stdio: [opts.modeArgs?.includes("rpc") ? "pipe" : "ignore", "pipe", "pipe"],
           windowsHide: true,
+          detached: process.platform !== "win32",
         },
       );
-      const outputRecords: Record<string, unknown>[] = [];
-      const outputWaiters = new Set<{
-        predicate: (record: Record<string, unknown>) => boolean;
-        count: number;
-        resolve: (record: Record<string, unknown>) => void;
-        reject: (error: Error) => void;
-        timer: ReturnType<typeof setTimeout>;
-      }>();
       let outputRemainder = "";
       child.stdout!.on("data", (d: Buffer) => {
         const text = d.toString();
@@ -304,21 +395,15 @@ export function createE2ELive(): E2ELive {
         child!.once("error", reject);
         child!.once("close", resolve);
       });
-      killTimer = setTimeout(() => child?.kill(), RUN_TIMEOUT_MS);
-      let started!: StartedPi;
+      killTimer = setTimeout(() => {
+        void stop().catch(() => undefined);
+      }, RUN_TIMEOUT_MS);
       const completion = (async (): Promise<RunResult> => {
         try {
           const code = await closed;
           return { code, stdout, stderr, requests: mock.requests, fixture, agentDir };
         } finally {
-          if (killTimer) clearTimeout(killTimer);
-          await mock.close();
-          for (const waiter of outputWaiters) {
-            clearTimeout(waiter.timer);
-            waiter.reject(new Error("Pi process closed while waiting for output"));
-          }
-          outputWaiters.clear();
-          active.delete(started);
+          await finalizeRun(false);
         }
       })();
       started = {
@@ -344,11 +429,12 @@ export function createE2ELive(): E2ELive {
         stop,
       };
       active.add(started);
+      if (finalized) active.delete(started);
       return started;
     } catch (error) {
       if (killTimer) clearTimeout(killTimer);
-      child?.kill();
-      await mock.close();
+      try { await stop(); } catch { /* continue with idempotent harness finalization */ }
+      await finalizeRun(false);
       throw error;
     }
   }
@@ -359,11 +445,20 @@ export function createE2ELive(): E2ELive {
 
   async function cleanup(): Promise<void> {
     await Promise.all([...active].map(async (run) => {
-      try { await run.stop(); } catch { /* continue unconditional cleanup */ }
-      try { await run.completion; } catch { /* failed process is already closed */ }
+      let stopped = false;
+      try {
+        await run.stop();
+        stopped = true;
+      } catch { /* teardown continues after the bounded best-effort stop */ }
+      if (stopped) {
+        try { await run.completion; } catch { /* process closure is confirmed; absorb harness finalization failure */ }
+      }
     }));
-    for (const dir of fixtures.splice(0)) cleanupFixture(dir);
+    for (const dir of fixtures.splice(0)) {
+      if (!retainedFixtures.has(dir)) cleanupFixture(dir);
+    }
     for (const dir of tempDirs.splice(0)) {
+      if (retainedTempDirs.has(dir)) continue;
       try {
         fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       } catch {

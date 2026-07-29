@@ -257,8 +257,11 @@ where to start reading, not the extent of its cluster.
 - **Proactive compaction** (`mid-run-compaction.ts`, with main wiring in `index.ts` and child wiring
   in `subagents.ts`) — a session-local controller owns threshold sampling, complete-tool-batch
   stopping, one Pi-owned compaction transaction, queued-input reconciliation, resume, cancellation, and
-  exhaustion. Operational or hook exhaustion remains recoverable in-session; any post-commit
-  restoration, replay, or continuation-start failure is terminal for that session. Clean PiCC-owned tool batches terminate after
+  exhaustion. Confirmed pre-commit operational or hook exhaustion remains recoverable in-session;
+  any post-commit restoration, replay, or continuation-start failure is terminal for that session.
+  If a main-session callback or main-session resumed cancellation/join misses its bounded deadline, elapsed time does not
+  confirm host quiescence: admission and recovery stay closed, and in-process controller replacement
+  is unsafe. Clean PiCC-owned tool batches terminate after
   every requested result;
   mixed or ambiguous paths abort, while provider guards remain the final fail-closed boundary.
   Compaction and resume are awaited re-entrant lifecycle work, so the original logical run does not
@@ -405,9 +408,10 @@ The wiring lives in `src/index.ts`, which registers tools and Pi event handlers.
    SessionStart(compact) context followed by recent active skill bodies within PiCC's heuristic
    character budget; PostCompact output is diagnostic-only, and the system-prompt
    suffix preserves durable instructions. SessionStart(compact) and PostCompact ordinary block output
-   is diagnostic-only, while universal hook stop closes the committed-summary session. Operational or
-   hook exhaustion leaves admission paused and recoverable; any post-commit failure closes the session
-   and requires replacement. Pi's internally
+   is diagnostic-only, while universal hook stop closes the committed-summary session. Confirmed
+   pre-commit operational or hook exhaustion leaves admission paused and recoverable; any post-commit
+   failure closes the session and requires replacement. An unconfirmed-host ending is process-terminal:
+   neither manual recovery nor in-process replacement is safe. Pi's internally
    owned overflow recovery remains outside this controller and is not retried by PiCC. `Stop` runs
    at the logical settlement boundary, and `session_shutdown` joins checkpoint work and shuts down
    the MCP servers before firing `SessionEnd`.

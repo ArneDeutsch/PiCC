@@ -9,6 +9,7 @@ import {
   CHECKPOINT_USAGE,
   cliMissing,
   createE2ELive,
+  findSessionFiles,
   systemText,
   toolResultText,
   TEST_TIMEOUT_MS,
@@ -465,6 +466,401 @@ describe.skipIf(cliMissing)("e2e core: real Pi CLI + PiCC extension + mock OpenA
         summaryGate.release();
         live.closeInput();
         await live.stop();
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "repeats compaction through Pi native cancellation before public RPC settlement",
+    async () => {
+      const firstSummaryGate = createResponseGate();
+      const hiddenContinuationGate = createResponseGate();
+      const resumedHighUsageGate = createResponseGate();
+      const fallbackSummaryGate = createResponseGate();
+      const fallbackPrefixGate = createResponseGate();
+      const finalGate = createResponseGate();
+      const initialPromptCanary = "RPC_REPEAT_INITIAL_T02";
+      const hiddenContinuation = "Continue the paused work.";
+      const collisionPrompt = "RPC_REPEAT_COLLISION_PROMPT_T02";
+      const retainedOnlyCanary = "RPC_REPEAT_RETAINED_ONLY_T02";
+      const usefulPrompt = "RPC_REPEAT_USEFUL_PROMPT_T02";
+      const hiddenCanary = "RPC_REPEAT_HIDDEN_T02";
+      const finalCanary = "RPC_REPEAT_FINAL_T02";
+      const firstSummaryCanary = "RPC_REPEAT_SUMMARY_ONE_T02";
+      const secondSummaryCanary = "RPC_REPEAT_SUMMARY_TWO_T02";
+      const secondPrefixCanary = "RPC_REPEAT_SUMMARY_TWO_PREFIX_T02";
+      const initialDiscardBegin = "RPC_REPEAT_INITIAL_DISCARD_BEGIN_T02";
+      const initialDiscardEnd = "RPC_REPEAT_INITIAL_DISCARD_END_T02";
+      const initialRetainedCanary = "RPC_REPEAT_INITIAL_RETAINED_ONLY_T02";
+      const postSummaryDiscardBegin = "RPC_REPEAT_POST_DISCARD_BEGIN_T02";
+      const postSummaryDiscardEnd = "RPC_REPEAT_POST_DISCARD_END_T02";
+      const initialDiscardable = `${initialDiscardBegin}\n${"initial compressible checkpoint content ".repeat(4_500)}\n${initialDiscardEnd}`;
+      const initialPrompt = `${initialPromptCanary}\n${initialDiscardable}`;
+      const initialRetained = `${initialRetainedCanary}\n${"initial retained compressible content ".repeat(4_000)}`;
+      const postSummaryDiscardable = `${postSummaryDiscardBegin}\n${"post summary compressible checkpoint content ".repeat(4_500)}\n${postSummaryDiscardEnd}`;
+      const collisionInput = `${collisionPrompt}\n${postSummaryDiscardable}`;
+      const hiddenResponse = `${hiddenCanary}\n${retainedOnlyCanary}\n${"post summary retained compressible content ".repeat(4_000)}`;
+      expect(Math.ceil(initialDiscardable.length / 4)).toBeGreaterThan(20_000);
+      expect(Math.ceil(postSummaryDiscardable.length / 4)).toBeGreaterThan(20_000);
+      const requestUserTurns = (messages: Array<Record<string, unknown>>): string[] => messages
+        .filter((message) => message.role === "user")
+        .map((message) => {
+          if (typeof message.content === "string") return message.content;
+          if (!Array.isArray(message.content)) return "";
+          return message.content.map((block: any) =>
+            block?.type === "text" && typeof block.text === "string" ? block.text : "").join("");
+        });
+      const live = await startPi({
+        persistSession: true,
+        contextWindow: CHECKPOINT_CONTEXT_WINDOW,
+        piSettings: { compaction: { enabled: true } },
+        setup(fixtureDir) {
+          writeCheckpointConfig(fixtureDir);
+        },
+        script: [
+          {
+            when: (request) => request.requestKind === "ordinary" &&
+              requestUserTurns(request.messages).includes(initialPrompt),
+            toolCalls: [{ name: "write", args: { path: "rpc-repeat-initial.txt", content: initialRetained } }],
+            usage: CHECKPOINT_USAGE,
+          },
+          {
+            when: (request) => request.requestKind === "compaction",
+            text: firstSummaryCanary,
+            gate: firstSummaryGate,
+          },
+          {
+            when: (request) => request.requestKind === "ordinary" &&
+              requestUserTurns(request.messages).includes(hiddenContinuation),
+            text: "RPC_REPEAT_INTERIM_T02",
+            gate: hiddenContinuationGate,
+          },
+          {
+            when: (request) => request.requestKind === "ordinary" &&
+              requestUserTurns(request.messages).includes(collisionInput),
+            text: hiddenResponse,
+            usage: CHECKPOINT_USAGE,
+            gate: resumedHighUsageGate,
+          },
+          {
+            when: (request) => request.requestKind === "compaction" &&
+              allText(request).includes(firstSummaryCanary),
+            text: secondSummaryCanary,
+            gate: fallbackSummaryGate,
+          },
+          {
+            when: (request) => request.requestKind === "compaction" &&
+              allText(request).includes(postSummaryDiscardBegin),
+            text: secondPrefixCanary,
+            gate: fallbackPrefixGate,
+          },
+          {
+            when: (request) => request.requestKind === "ordinary" &&
+              requestUserTurns(request.messages).includes(usefulPrompt),
+            text: finalCanary,
+            gate: finalGate,
+          },
+        ],
+        prompt: "unused",
+        modeArgs: ["--mode", "rpc"],
+      });
+      const waitForOutput = async (
+        label: string,
+        predicate: (record: Record<string, unknown>) => boolean,
+        count = 1,
+      ): Promise<Record<string, unknown>> => {
+        try {
+          return await live.waitForOutput(predicate, 30_000, count);
+        } catch (error) {
+          throw new Error(`Failed while waiting for ${label}`, { cause: error });
+        }
+      };
+      try {
+        live.sendInput(JSON.stringify({
+          id: "rpc-repeat-initial-t02",
+          type: "prompt",
+          message: initialPrompt,
+        }));
+        const initialAck = await waitForOutput("initial prompt acknowledgement", (record) =>
+          record.type === "response" && record.id === "rpc-repeat-initial-t02");
+        expect(initialAck).toMatchObject({ command: "prompt", success: true });
+        const initialRequest = await live.waitForRequest(
+          (request) => request.requestKind === "ordinary" &&
+            requestUserTurns(request.messages).includes(initialPrompt),
+          1,
+          30_000,
+        );
+        expect(initialRequest).toMatchObject({ requestKind: "ordinary", sessionKind: "main" });
+        await waitForOutput("initial tool result", (record) => record.type === "message_end" &&
+          record.message !== null && typeof record.message === "object" &&
+          (record.message as { role?: unknown }).role === "toolResult");
+        const firstSummaryRequest = await live.waitForRequest(
+          (request) => request.requestKind === "compaction", 1, 30_000,
+        );
+        expect(firstSummaryRequest).toMatchObject({ requestKind: "compaction", sessionKind: "main" });
+        expect(allText(firstSummaryRequest)).toContain(initialDiscardBegin);
+        expect(allText(firstSummaryRequest)).toContain(initialDiscardEnd);
+        expect(allText(firstSummaryRequest)).not.toContain(initialRetainedCanary);
+        expect(allText(firstSummaryRequest)).not.toContain(postSummaryDiscardBegin);
+        firstSummaryGate.release();
+
+        const hiddenRequest = await live.waitForRequest(
+          (request) => request.requestKind === "ordinary" &&
+            requestUserTurns(request.messages).includes(hiddenContinuation),
+          1,
+          30_000,
+        );
+        expect(hiddenRequest).toMatchObject({ requestKind: "ordinary", sessionKind: "main" });
+        live.sendInput(JSON.stringify({
+          id: "rpc-repeat-collision-t02",
+          type: "prompt",
+          message: collisionInput,
+          streamingBehavior: "steer",
+        }));
+        const collisionAck = await waitForOutput("collision prompt acknowledgement", (record) =>
+          record.type === "response" && record.id === "rpc-repeat-collision-t02");
+        expect(collisionAck).toMatchObject({ command: "prompt", success: true });
+        hiddenContinuationGate.release();
+        const resumedHighUsageRequest = await live.waitForRequest(
+          (request) => request.requestKind === "ordinary" &&
+            requestUserTurns(request.messages).includes(collisionInput),
+          1,
+          30_000,
+        );
+        expect(resumedHighUsageRequest).toMatchObject({ requestKind: "ordinary", sessionKind: "main" });
+        resumedHighUsageGate.release();
+
+        await waitForOutput("resumed high-usage agent_end", (record) => record.type === "agent_end" &&
+          JSON.stringify(record).includes(hiddenCanary));
+        await waitForOutput("native threshold compaction_start", (record) => record.type === "compaction_start" &&
+          record.reason === "threshold");
+        await waitForOutput("aborted native compaction_end", (record) => record.type === "compaction_end" &&
+          record.reason === "threshold" && record.aborted === true);
+
+        const fallbackSummaryRequest = await live.waitForRequest(
+          (request) => request.requestKind === "compaction" &&
+            allText(request).includes(firstSummaryCanary), 1, 30_000,
+        );
+        expect(fallbackSummaryRequest).toMatchObject({ requestKind: "compaction", sessionKind: "main" });
+        expect(allText(fallbackSummaryRequest)).not.toContain(postSummaryDiscardBegin);
+        expect(allText(fallbackSummaryRequest)).not.toContain(initialDiscardBegin);
+        const fallbackHistoryPrompt = userText(fallbackSummaryRequest);
+        const previousSummaryStart = fallbackHistoryPrompt.indexOf("<previous-summary>");
+        const previousSummaryEnd = fallbackHistoryPrompt.indexOf("</previous-summary>");
+        const conversationStart = fallbackHistoryPrompt.indexOf("<conversation>");
+        const conversationEnd = fallbackHistoryPrompt.indexOf("</conversation>");
+        expect(previousSummaryStart).toBeGreaterThanOrEqual(0);
+        expect(previousSummaryEnd).toBeGreaterThan(previousSummaryStart);
+        expect(conversationStart).toBeGreaterThanOrEqual(0);
+        expect(conversationEnd).toBeGreaterThan(conversationStart);
+        const firstSummaryOccurrence = fallbackHistoryPrompt.indexOf(firstSummaryCanary);
+        expect(firstSummaryOccurrence).toBeGreaterThan(previousSummaryStart);
+        expect(firstSummaryOccurrence).toBeLessThan(previousSummaryEnd);
+        expect(fallbackHistoryPrompt.lastIndexOf(firstSummaryCanary)).toBe(firstSummaryOccurrence);
+        expect(fallbackHistoryPrompt.slice(previousSummaryStart, previousSummaryEnd)).toContain(firstSummaryCanary);
+        expect(fallbackHistoryPrompt.slice(conversationStart, conversationEnd)).not.toContain(firstSummaryCanary);
+        fallbackSummaryGate.release();
+        const fallbackPrefixRequest = await live.waitForRequest(
+          (request) => request.requestKind === "compaction" &&
+            allText(request).includes(postSummaryDiscardBegin), 1, 30_000,
+        );
+        expect(fallbackPrefixRequest).toMatchObject({ requestKind: "compaction", sessionKind: "main" });
+        expect(allText(fallbackPrefixRequest)).toContain(postSummaryDiscardEnd);
+        expect(allText(fallbackPrefixRequest)).not.toContain(retainedOnlyCanary);
+        expect(live.requests.filter((request) => request.requestKind === "compaction")).toEqual([
+          firstSummaryRequest, fallbackSummaryRequest, fallbackPrefixRequest,
+        ]);
+        fallbackPrefixGate.release();
+        await waitForOutput("fallback manual compaction_end", (record) => record.type === "compaction_end" &&
+          record.reason === "manual" && JSON.stringify(record).includes(secondPrefixCanary));
+        await waitForOutput("resumed-run public settlement", (record) => record.type === "agent_settled", 2);
+
+        live.sendInput(JSON.stringify({
+          id: "rpc-repeat-useful-t02",
+          type: "prompt",
+          message: usefulPrompt,
+        }));
+        const usefulAck = await waitForOutput("useful prompt acknowledgement", (record) =>
+          record.type === "response" && record.id === "rpc-repeat-useful-t02");
+        expect(usefulAck).toMatchObject({ command: "prompt", success: true });
+        const finalRequest = await live.waitForRequest(
+          (request) => request.requestKind === "ordinary" &&
+            requestUserTurns(request.messages).includes(usefulPrompt),
+          1,
+          30_000,
+        );
+        expect(finalRequest).toMatchObject({ requestKind: "ordinary", sessionKind: "main" });
+        finalGate.release();
+        await waitForOutput("final useful response", (record) => record.type === "message_end" &&
+          JSON.stringify(record).includes(finalCanary));
+        await waitForOutput("final-input public settlement", (record) => record.type === "agent_settled", 3);
+
+        live.closeInput();
+        const result = await live.completion;
+        expect(result.requests.map((request) => request.requestKind)).toEqual([
+          "ordinary", "compaction", "ordinary", "ordinary", "compaction", "compaction", "ordinary",
+        ]);
+        expect(result.requests).toEqual([
+          initialRequest,
+          firstSummaryRequest,
+          hiddenRequest,
+          resumedHighUsageRequest,
+          fallbackSummaryRequest,
+          fallbackPrefixRequest,
+          finalRequest,
+        ]);
+        const summaryRequests = result.requests.filter((request) => request.requestKind === "compaction");
+        expect(summaryRequests).toHaveLength(3);
+        expect(summaryRequests.every((request) =>
+          systemText(request).includes("You are a context summarization assistant."))).toBe(true);
+        expect(summaryRequests.map((request) =>
+          allText(request).includes("This is the PREFIX of a turn that was too large to keep."))).toEqual([
+          true, false, true,
+        ]);
+        const ordinaryRequests = result.requests.filter((request) => request.requestKind === "ordinary");
+        expect(ordinaryRequests.filter((request) =>
+          requestUserTurns(request.messages).includes(usefulPrompt))).toEqual([
+          finalRequest,
+        ]);
+        expect(`${result.stdout}\n${result.stderr}`).not.toMatch(/checkpoint-(?:exhausted|cancelled)/u);
+        expect(`${result.stdout}\n${result.stderr}`).not.toContain("restart the process");
+
+        const records = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line) as any);
+        const indexed = (predicate: (record: any) => boolean) => records
+          .map((record, index) => ({ record, index }))
+          .filter(({ record }) => predicate(record));
+        const singleIndex = (label: string, predicate: (record: any) => boolean): number => {
+          const matches = indexed(predicate);
+          expect(matches, label).toHaveLength(1);
+          return matches[0]!.index;
+        };
+        const resumedAgentEnd = singleIndex("resumed high-usage agent_end", (record) =>
+          record.type === "agent_end" && JSON.stringify(record).includes(hiddenCanary));
+        const nativeStart = singleIndex("native threshold start", (record) =>
+          record.type === "compaction_start" && record.reason === "threshold");
+        const nativeEnd = singleIndex("aborted native threshold end", (record) =>
+          record.type === "compaction_end" && record.reason === "threshold" && record.aborted === true);
+        const manualStarts = indexed((record) => record.type === "compaction_start" && record.reason === "manual");
+        const manualEnds = indexed((record) => record.type === "compaction_end" &&
+          record.reason === "manual" && record.aborted === false);
+        expect(manualStarts).toHaveLength(2);
+        expect(manualEnds).toHaveLength(2);
+        const fallbackStart = manualStarts[1]!.index;
+        const fallbackEnd = manualEnds[1]!.index;
+        expect(manualStarts[0]!.index).toBeLessThan(manualEnds[0]!.index);
+        expect(manualEnds[0]!.index).toBeLessThan(resumedAgentEnd);
+        expect(resumedAgentEnd).toBeLessThan(nativeStart);
+        expect(nativeStart).toBeLessThan(nativeEnd);
+        expect(nativeEnd).toBeLessThan(fallbackStart);
+        expect(fallbackStart).toBeLessThan(fallbackEnd);
+        expect(records[nativeEnd]).not.toHaveProperty("result");
+        expect(JSON.stringify(records[fallbackEnd])).toContain(secondSummaryCanary);
+        expect(indexed((record) => record.type === "compaction_start")).toHaveLength(3);
+        expect(indexed((record) => record.type === "compaction_end")).toHaveLength(3);
+
+        const usefulAckIndex = singleIndex("useful prompt acknowledgement", (record) =>
+          record.type === "response" && record.id === "rpc-repeat-useful-t02");
+        const finalCanaryIndex = singleIndex("final assistant response", (record) =>
+          record.type === "message_end" && record.message?.role === "assistant" &&
+          record.message.content?.some((block: any) => block.type === "text" && block.text === finalCanary));
+        const settlements = indexed((record) => record.type === "agent_settled");
+        expect(settlements).toHaveLength(3);
+        const parentSettlements = settlements.filter(({ index }) =>
+          index > resumedAgentEnd && index < fallbackEnd);
+        const resumedSettlements = settlements.filter(({ index }) =>
+          index > fallbackEnd && index < usefulAckIndex);
+        const finalSettlements = settlements.filter(({ index }) => index > finalCanaryIndex);
+        expect(parentSettlements).toHaveLength(1);
+        expect(parentSettlements[0]!.index).toBeGreaterThan(fallbackStart);
+        expect(resumedSettlements).toHaveLength(1);
+        expect(finalSettlements).toHaveLength(1);
+        expect(parentSettlements[0]!.index).toBeLessThan(resumedSettlements[0]!.index);
+        expect(resumedSettlements[0]!.index).toBeLessThan(usefulAckIndex);
+        expect(usefulAckIndex).toBeLessThan(finalCanaryIndex);
+        expect(finalCanaryIndex).toBeLessThan(finalSettlements[0]!.index);
+
+        const lifecycle = records.filter((record) => record.type === "entry_appended" &&
+          record.entry?.customType === "picc-checkpoint-lifecycle");
+        expect(lifecycle.map((record) => [record.entry.data.generation, record.entry.data.category])).toEqual([
+          [1, "checkpoint-armed"],
+          [1, "checkpoint-complete"],
+          [1, "checkpoint-resumed"],
+          [2, "checkpoint-armed"],
+          [2, "checkpoint-complete"],
+        ]);
+
+        const mainFiles = findSessionFiles(result.agentDir).filter((file) => !file.includes(".subagents"));
+        expect(mainFiles).toHaveLength(1);
+        const entries = SessionManager.open(mainFiles[0]!).getEntries() as any[];
+        const compactions = entries.filter((entry) => entry.type === "compaction");
+        expect(compactions).toHaveLength(2);
+        expect(compactions.map((entry) => entry.summary)).toEqual([
+          expect.stringContaining(firstSummaryCanary),
+          expect.stringMatching(new RegExp(`${secondSummaryCanary}[\\s\\S]*${secondPrefixCanary}`, "u")),
+        ]);
+        const messageEntries = entries.filter((entry) => entry.type === "message");
+        const exactText = (message: any): string | undefined => {
+          if (typeof message.content === "string") return message.content;
+          if (!Array.isArray(message.content) ||
+            message.content.some((block: any) => block.type !== "text" || typeof block.text !== "string")) return undefined;
+          return message.content.map((block: any) => block.text).join("");
+        };
+        const exactTurns = (role: string, text: string) => messageEntries.filter((entry) =>
+          entry.message.role === role && exactText(entry.message) === text);
+        const initialTurns = exactTurns("user", initialPrompt);
+        const continuationEntries = entries.filter((entry) => entry.type === "custom_message" &&
+          entry.customType === "picc-checkpoint-continuation" && entry.content === hiddenContinuation);
+        const collisionTurns = exactTurns("user", collisionInput);
+        const interimTurns = exactTurns("assistant", "RPC_REPEAT_INTERIM_T02");
+        const hiddenTurns = exactTurns("assistant", hiddenResponse);
+        const usefulTurns = exactTurns("user", usefulPrompt);
+        const finalTurns = exactTurns("assistant", finalCanary);
+        for (const [label, turns] of [
+          ["initial user", initialTurns], ["hidden continuation", continuationEntries],
+          ["interim assistant", interimTurns], ["collision user", collisionTurns],
+          ["high-usage assistant", hiddenTurns], ["useful user", usefulTurns], ["final assistant", finalTurns],
+        ] as const) expect(turns, label).toHaveLength(1);
+        const writeCalls = (content: string, targetPath: string) => messageEntries.filter((entry) =>
+          entry.message.role === "assistant" && Array.isArray(entry.message.content) &&
+          entry.message.content.some((block: any) => block.type === "toolCall" && block.name === "write" &&
+            block.arguments?.path === targetPath && block.arguments?.content === content));
+        const initialWriteCalls = writeCalls(initialRetained, "rpc-repeat-initial.txt");
+        expect(initialWriteCalls).toHaveLength(1);
+        const entryIndex = (entry: any) => entries.indexOf(entry);
+        const orderedEntries = [
+          initialTurns[0], initialWriteCalls[0], compactions[0], continuationEntries[0], interimTurns[0],
+          collisionTurns[0], hiddenTurns[0], compactions[1],
+          usefulTurns[0], finalTurns[0],
+        ];
+        orderedEntries.forEach((entry) => expect(entry).toBeDefined());
+        for (let index = 1; index < orderedEntries.length; index++) {
+          expect(entryIndex(orderedEntries[index - 1])).toBeLessThan(entryIndex(orderedEntries[index]));
+        }
+        const persisted = JSON.stringify(entries);
+        for (const canary of [
+          initialPromptCanary, initialDiscardBegin, initialDiscardEnd, initialRetainedCanary, firstSummaryCanary,
+          postSummaryDiscardBegin, postSummaryDiscardEnd, collisionPrompt, retainedOnlyCanary,
+          hiddenCanary, secondSummaryCanary, secondPrefixCanary, usefulPrompt, finalCanary,
+        ]) expect(persisted.match(new RegExp(canary, "g")), canary).toHaveLength(1);
+        expect(fs.readFileSync(path.join(result.fixture, "rpc-repeat-initial.txt"), "utf8")).toBe(initialRetained);
+
+        if (process.platform === "win32" && result.code !== 0) {
+          expect(result.code).toBe(3221226505);
+          expect(result.stderr).toContain("UV_HANDLE_CLOSING");
+        } else {
+          expect(result.code, result.stderr).toBe(0);
+        }
+      } finally {
+        firstSummaryGate.release();
+        hiddenContinuationGate.release();
+        resumedHighUsageGate.release();
+        fallbackSummaryGate.release();
+        fallbackPrefixGate.release();
+        finalGate.release();
+        live.closeInput();
+        await live.stop();
+        try { await live.completion; } catch { /* process closure is confirmed; absorb harness finalization failure */ }
       }
     },
     TEST_TIMEOUT_MS,
