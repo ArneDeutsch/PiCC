@@ -226,11 +226,11 @@ const FRONTMATTER_ENTRIES: CapabilityEntry[] = [
     cap("frontmatter", `agent.frontmatter.${key}`, "full", note),
   ),
   cap("frontmatter", "agent.frontmatter.maxTurns", "partial", "best-effort cap — tool calls past the cap are blocked with an instruction to answer; the model still produces its final message"),
-  cap("frontmatter", "agent.frontmatter.permissionMode", "degraded-noop", "parsed, no-op — subagents run the default-permissive posture regardless; deny rules + tools: gating remain the controls; reported when set", true),
+  cap("frontmatter", "agent.frontmatter.permissionMode", "degraded-noop", "for non-plugin agents, parsed and reported but no-op — subagents run the default-permissive posture regardless; deny rules + tools: gating remain the controls. Plugin-provided agents forbid, diagnose, and strip this field before construction", true),
   cap("frontmatter", "agent.frontmatter.color", "partial", "recognized documented color names tint agent identity in the interactive-TUI status panel, drill-down, and Agent lifecycle rows when safe presentation metadata is available; exact hues, placement, and permissive normalization are PiCC-defined, unrecognized values are ignored for rendering, and print/RPC remain uncolored. PARTIAL because PiCC does not claim Claude's exact palette or invalid-value behavior"),
   cap("frontmatter", "agent.frontmatter.memory", "partial", "user|project|local scopes resolve to Claude's agent-memory dirs; MEMORY.md (200 lines / 25 KB) loads with full parity. PARTIAL: injected write guidance is conservative by default — the subagent writes/updates memory only on an explicit user request to remember, whereas Claude Code also writes proactively; opt into eager writes via CLAUDE.md"),
-  cap("frontmatter", "agent.frontmatter.mcpServers", "degraded-noop", "parsed, no-op — per-agent MCP server configs are a deferred surface; subagents instead inherit the SESSION's MCP tools (see tool.mcp__*), restricted via tools:/disallowedTools:"),
-  cap("frontmatter", "agent.frontmatter.hooks", "full", "scoped hook runner active for the subagent's dispatch; Stop maps to SubagentStop"),
+  cap("frontmatter", "agent.frontmatter.mcpServers", "degraded-noop", "for non-plugin agents, parsed but no-op — per-agent MCP server configs are deferred; subagents instead inherit the SESSION's MCP tools (see tool.mcp__*), restricted via tools: and disallowedTools:. Plugin-provided agents forbid, diagnose, and strip this field before construction"),
+  cap("frontmatter", "agent.frontmatter.hooks", "full", "for non-plugin agents, the scoped hook runner is active for the subagent's dispatch and Stop maps to SubagentStop. Plugin-provided agents forbid, diagnose, and strip agent-scoped hooks before construction"),
   cap("frontmatter", "rule.frontmatter.paths", "full", "path-scoped rule injection on matching file access"),
 ];
 

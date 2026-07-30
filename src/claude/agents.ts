@@ -17,8 +17,11 @@ import type {
   HookHandler,
   HookHandlerType,
   HookMatcherEntry,
+  PluginComponentSource,
   Scope,
 } from "../types.js";
+import type { PluginPathFailure, ValidatedPluginPath } from "./plugin-paths.js";
+import { revalidatePluginPath, walkPluginFiles } from "./plugin-paths.js";
 import { listDirSafe, readTextSafe } from "../util/fs.js";
 import { parseMarkdown, toStringList } from "../util/markdown.js";
 
@@ -59,6 +62,27 @@ const WRITE_CAPABLE_TOOLS = new Set(["write", "edit", "bash"]);
 export interface LoadAgentsResult {
   agents: ClaudeAgent[];
   diagnostics: Diagnostic[];
+  pathFailures?: PluginAgentPathFailure[];
+}
+
+type FileDirectoryPluginSource = Exclude<PluginComponentSource, { kind: "inline" }>;
+
+export interface PluginAgentPathFailure {
+  pluginId: string;
+  component: "agent";
+  source: FileDirectoryPluginSource;
+  terminal: boolean;
+  failure: PluginPathFailure;
+}
+
+export interface PluginAgentLoaderSource {
+  source: FileDirectoryPluginSource;
+  validatedPath: ValidatedPluginPath;
+}
+
+interface PluginIdentity {
+  pluginId?: string;
+  pluginName: string;
 }
 
 /**
@@ -77,11 +101,105 @@ export function loadAgents(
 
   for (const { dir, scope } of agentDirs) {
     for (const filePath of collectAgentFiles(dir)) {
-      const agent = loadAgentFile(filePath, scope, diagnostics, opts?.pluginName);
+      const plugin = opts?.pluginName ? { pluginName: opts.pluginName } : undefined;
+      const agent = loadAgentFile(filePath, scope, diagnostics, plugin);
       if (agent) agents.push(agent);
     }
   }
   return { agents, diagnostics };
+}
+
+export function loadPluginAgents(sources: PluginAgentLoaderSource[]): LoadAgentsResult {
+  const agents: ClaudeAgent[] = [];
+  const diagnostics: Diagnostic[] = [];
+  const pathFailures: PluginAgentPathFailure[] = [];
+  for (const input of sources) {
+    const validated = validatePluginInput(input, diagnostics, pathFailures);
+    if (!validated) continue;
+    const files = pluginAgentFiles(input, validated, diagnostics, pathFailures);
+    for (const file of files) {
+      const parent = validated.kind === "directory"
+        ? path.relative(validated.lexicalPath, path.dirname(file.lexicalPath))
+        : "";
+      const namePrefix = parent && !parent.startsWith("..") && !path.isAbsolute(parent)
+        ? parent.split(/[\\/]/).filter(Boolean).join(":")
+        : undefined;
+      const agent = loadAgentFile(file.lexicalPath, "plugin", diagnostics, {
+        pluginId: input.source.metadata.pluginId,
+        pluginName: input.source.metadata.pluginName,
+      }, namePrefix);
+      if (agent) agents.push(agent);
+    }
+  }
+  return { agents, diagnostics, pathFailures };
+}
+
+function validatePluginInput(
+  input: PluginAgentLoaderSource,
+  diagnostics: Diagnostic[],
+  pathFailures: PluginAgentPathFailure[],
+): ValidatedPluginPath | undefined {
+  const { source, validatedPath } = input;
+  const metadata = source.metadata;
+  if (
+    source.kind !== validatedPath.kind ||
+    source.path !== validatedPath.lexicalPath ||
+    metadata.authorizedRoot !== validatedPath.root.canonicalPath ||
+    metadata.lexicalPath !== validatedPath.lexicalPath ||
+    metadata.canonicalPath !== validatedPath.canonicalPath
+  ) {
+    diagnostics.push({
+      severity: "warning",
+      message: "Validated plugin component metadata does not match its filesystem capability; skipped",
+      source: source.path,
+    });
+    return undefined;
+  }
+  const current = revalidatePluginPath(validatedPath);
+  if (!current.ok) {
+    diagnostics.push(current.diagnostic);
+    pathFailures.push({
+      pluginId: metadata.pluginId,
+      component: "agent",
+      source,
+      terminal: true,
+      failure: current,
+    });
+    return undefined;
+  }
+  return current.value;
+}
+
+function pluginAgentFiles(
+  input: PluginAgentLoaderSource,
+  source: ValidatedPluginPath,
+  diagnostics: Diagnostic[],
+  pathFailures: PluginAgentPathFailure[],
+): ValidatedPluginPath[] {
+  if (source.kind === "file") {
+    if (!source.lexicalPath.toLowerCase().endsWith(".md")) {
+      diagnostics.push({
+        severity: "warning",
+        message: "Plugin agent file is not Markdown; skipped",
+        source: source.lexicalPath,
+      });
+      return [];
+    }
+    return [source];
+  }
+  const walked = walkPluginFiles({
+    directory: source,
+    predicate: (name) => name.toLowerCase().endsWith(".md"),
+  });
+  diagnostics.push(...walked.diagnostics);
+  pathFailures.push(...walked.failures.map((failure) => ({
+    pluginId: input.source.metadata.pluginId,
+    component: "agent" as const,
+    source: input.source,
+    terminal: false,
+    failure,
+  })));
+  return walked.files;
 }
 
 /** *.md directly in dir plus one level of subdirectories, deterministically sorted. */
@@ -119,7 +237,8 @@ function loadAgentFile(
   filePath: string,
   scope: Scope,
   globalDiagnostics: Diagnostic[],
-  pluginName?: string,
+  plugin?: PluginIdentity,
+  namePrefix?: string,
 ): ClaudeAgent | undefined {
   const content = readTextSafe(filePath);
   if (content === undefined) {
@@ -134,6 +253,18 @@ function loadAgentFile(
   const parsed = parseMarkdown(content, filePath);
   const fm = parsed.frontmatter;
   const agentDiagnostics: Diagnostic[] = [...parsed.diagnostics];
+  const pluginProvided = scope === "plugin";
+  const forbiddenDiagnostics: Diagnostic[] = [];
+  for (const field of ["hooks", "mcpServers", "permissionMode"] as const) {
+    if (pluginProvided && Object.hasOwn(fm, field)) {
+      forbiddenDiagnostics.push({
+        severity: "warning",
+        message: `Plugin agent field "${field}" is forbidden and was removed`,
+        source: filePath,
+      });
+    }
+  }
+  agentDiagnostics.push(...forbiddenDiagnostics);
 
   // description is required: without it the agent has no routing surface.
   const description = toOptionalString(fm["description"]);
@@ -147,8 +278,10 @@ function loadAgentFile(
     return undefined;
   }
 
-  const name =
+  const localName =
     toOptionalString(fm["name"])?.trim() || path.basename(filePath, path.extname(filePath));
+  const name = namePrefix ? `${namePrefix}:${localName}` : localName;
+  globalDiagnostics.push(...forbiddenDiagnostics);
 
   // tools / allowed-tools alias (tools wins when both present)
   const tools = toStringList(fm["tools"] !== undefined ? fm["tools"] : fm["allowed-tools"]);
@@ -194,7 +327,7 @@ function loadAgentFile(
     }
   }
 
-  const hooks = normalizeHooks(fm["hooks"], agentDiagnostics, filePath);
+  const hooks = pluginProvided ? undefined : normalizeHooks(fm["hooks"], agentDiagnostics, filePath);
 
   // background: true (Claude 2.1.198) forces background dispatch; the runtime
   // routes it through the run_in_background path.
@@ -209,7 +342,9 @@ function loadAgentFile(
     disallowedTools,
     model,
     effort: toOptionalString(fm["effort"])?.trim() || undefined,
-    permissionMode: toOptionalString(fm["permissionMode"])?.trim() || undefined,
+    ...(pluginProvided
+      ? {}
+      : { permissionMode: toOptionalString(fm["permissionMode"])?.trim() || undefined }),
     maxTurns,
     skills: toStringList(fm["skills"]),
     color: toOptionalString(fm["color"])?.trim() || undefined,
@@ -217,12 +352,11 @@ function loadAgentFile(
     background,
     initialPrompt: toOptionalString(fm["initialPrompt"]),
     metadata,
-    // Deferred subsystems: parsed and preserved raw, not interpreted here.
+    // Retained deferred memory configuration is preserved raw for later interpretation.
     memory: fm["memory"],
-    mcpServers: fm["mcpServers"],
-    hooks,
+    ...(pluginProvided ? {} : { mcpServers: fm["mcpServers"], hooks }),
     body: parsed.body,
-    source: { path: filePath, scope, pluginName },
+    source: { path: filePath, scope, ...plugin },
     unknownKeys,
     diagnostics: agentDiagnostics,
   };

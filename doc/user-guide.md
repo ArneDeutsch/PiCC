@@ -164,7 +164,7 @@ managed):
 | Skills | `.claude/skills/**/SKILL.md` (+ `~/.claude/skills`), lazy-loaded; `.claude/commands/**/*.md` legacy commands (recursive, `sub:name`-qualified on collisions) |
 | Agents | `.claude/agents/*.md` (+ user scope) plus the built-in `general-purpose`, `Explore`, and `Plan` types — dispatchable via the `Agent` tool |
 | Settings | `.claude/settings.json`, `settings.local.json`, `~/.claude/settings.json`, managed policy |
-| Hooks | `settings.json` `hooks` (+ plugin hooks, + skill- and agent-scoped `hooks:`) |
+| Hooks | `settings.json` `hooks` (+ plugin hooks, + skill-scoped `hooks:`); agent-scoped hooks apply to non-plugin agents, while plugin agents strip them |
 | MCP servers | `.mcp.json` + settings `mcpServers`; project-scope servers pending until approved |
 | Plugins | already-installed plugins from `~/.claude/plugins` + project-bundled `.claude-plugin/` |
 

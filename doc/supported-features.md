@@ -141,7 +141,7 @@ Skill (`SKILL.md`), agent (`.claude/agents/*.md`), and rule frontmatter keys.
 | `agent.frontmatter.description` | full | auto-injected routing surface for description-driven selection |
 | `agent.frontmatter.disallowedTools` | full | tool denylist enforced for the subagent |
 | `agent.frontmatter.effort` | full | per-agent effort override honored |
-| `agent.frontmatter.hooks` | full | scoped hook runner active for the subagent's dispatch; Stop maps to SubagentStop |
+| `agent.frontmatter.hooks` | full | for non-plugin agents, the scoped hook runner is active for the subagent's dispatch and Stop maps to SubagentStop. Plugin-provided agents forbid, diagnose, and strip agent-scoped hooks before construction |
 | `agent.frontmatter.initialPrompt` | full | injected as the subagent's first user message |
 | `agent.frontmatter.isolation` | full | isolation: worktree pins the subagent to its own worktree |
 | `agent.frontmatter.metadata` | full | metadata.* preserved and exposed |
@@ -170,8 +170,8 @@ Skill (`SKILL.md`), agent (`.claude/agents/*.md`), and rule frontmatter keys.
 | `skill.frontmatter.effort` | partial | honored for context:fork dispatch and ${CLAUDE_EFFORT} substitution; does not change the parent session's reasoning effort |
 | `skill.frontmatter.model` | partial | honored for context:fork dispatch; in-session activation cannot switch the parent session's model |
 | `skill.frontmatter.user-invocable` | partial | true (default) permits typed slash invocation when the effective name matches PiCC's token grammar: an ASCII alphanumeric first, then ASCII alphanumerics/underscore/hyphen, with optional colon-separated nested-alias segments. Prompt-palette stubs use the narrower single-segment ASCII token form. Reserved Pi/PiCC names are shadowed case-insensitively; this precedence is PiCC-defined and unverified against Claude Code; direct model invocation remains governed separately by model-invocation metadata |
-| `agent.frontmatter.mcpServers` | degraded-noop | parsed, no-op — per-agent MCP server configs are a deferred surface; subagents instead inherit the SESSION's MCP tools (see tool.mcp__*), restricted via tools:/disallowedTools: |
-| `agent.frontmatter.permissionMode` ⚠ | degraded-noop | parsed, no-op — subagents run the default-permissive posture regardless; deny rules + tools: gating remain the controls; reported when set |
+| `agent.frontmatter.mcpServers` | degraded-noop | for non-plugin agents, parsed but no-op — per-agent MCP server configs are deferred; subagents instead inherit the SESSION's MCP tools (see tool.mcp__*), restricted via tools: and disallowedTools:. Plugin-provided agents forbid, diagnose, and strip this field before construction |
+| `agent.frontmatter.permissionMode` ⚠ | degraded-noop | for non-plugin agents, parsed and reported but no-op — subagents run the default-permissive posture regardless; deny rules + tools: gating remain the controls. Plugin-provided agents forbid, diagnose, and strip this field before construction |
 
 ## Runtime features (57)
 
