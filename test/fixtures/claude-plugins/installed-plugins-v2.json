@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "plugins": {
+    "formatter@community": [
+      {
+        "scope": "project",
+        "projectPath": "<project>/alpha",
+        "installPath": "<plugins>/formatter/project",
+        "version": "2.4.0",
+        "installedAt": "2000-01-02T00:00:00.000Z",
+        "lastUpdated": "2000-01-03T00:00:00.000Z"
+      },
+      {
+        "scope": "user",
+        "installPath": "<plugins>/formatter/user",
+        "version": "2.3.0",
+        "installedAt": "2000-01-01T00:00:00.000Z",
+        "lastUpdated": "2000-01-01T00:00:00.000Z"
+      }
+    ],
+    "lint@official": [
+      {
+        "scope": "local",
+        "projectPath": "<project>/beta",
+        "installPath": "<plugins>/lint/local",
+        "version": "1.0.0",
+        "installedAt": "2000-02-01T00:00:00.000Z",
+        "lastUpdated": "2000-02-02T00:00:00.000Z"
+      }
+    ]
+  }
+}

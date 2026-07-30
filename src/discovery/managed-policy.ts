@@ -2,6 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { Diagnostic, ManagedPolicySourceClass } from "../types.js";
+import { isQualifiedPluginId } from "../util/plugin-id.js";
+
+export { isQualifiedPluginId } from "../util/plugin-id.js";
 
 const POLICY_KEY = "SOFTWARE\\Policies\\ClaudeCode";
 const REGISTRY_TIMEOUT_MS = 2_000;
@@ -469,10 +472,6 @@ function policyDiagnostic(
     sourceClass,
     impact: "source-ignored",
   };
-}
-
-export function isQualifiedPluginId(value: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value);
 }
 
 export function createPluginDiagnosticReporter(
