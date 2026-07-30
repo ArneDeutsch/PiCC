@@ -20,8 +20,8 @@ import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdi
  * MCP runtime manager.
  *
  * Starts the ENABLED servers of a {@link ResolvedMcpConfig} through the
- * `@modelcontextprotocol/sdk` client, exposes
- * their tools and a call API, and at shutdown closes owned remote clients and
+ * `@modelcontextprotocol/sdk` client, exposes immutable initial tool, prompt,
+ * and resource catalogs plus live operations, and at shutdown closes owned remote clients and
  * transports while killing owned stdio process trees (Windows too). Session-global
  * and non-blocking: `start()`
  * returns immediately, connects run in the background bounded by
@@ -30,7 +30,7 @@ import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdi
  * spawned: the zero-cost path.
  *
  * Model-facing registration is NOT here — this class only owns processes,
- * connections, and tool metadata; the tool-exposure layer consumes it.
+ * connections, capability metadata, and bounded live protocol operations.
  */
 
 /** Default connect bound — binary-verified Claude default (2.1.218): unset `MCP_TIMEOUT` → 30 000 ms. */
@@ -47,10 +47,16 @@ const STDERR_RING_MAX_CHARS = 4_096;
 const STDERR_EXCERPT_MAX_CHARS = 400;
 /** Tool description bound (2 KB — a PiCC-only bound, not Claude parity). */
 const DESCRIPTION_MAX_CHARS = 2_048;
-/** Bound on server-supplied error text quoted in a callTool rejection. */
+/** Bound on server-supplied error text quoted in a live-operation rejection. */
 const CALL_ERROR_MAX_CHARS = 1_000;
 /** Bound on a server-supplied tool name quoted inside a diagnostic. */
 const DIAG_NAME_MAX_CHARS = 200;
+/** Initial catalogs are immutable and bounded independently of pagination. */
+const CATALOG_MAX_ITEMS = 1_024;
+const DISCOVERY_MAX_PAGES = 16;
+const DISCOVERY_RETRY_DELAYS_MS = [100, 200, 400] as const;
+const PROTOCOL_NAME_MAX_CHARS = 1_024;
+const RESOURCE_URI_MAX_CHARS = 8_192;
 /**
  * Per-server cap on tool-metadata diagnostics (drops/sanitizes/dedupes): a
  * hostile tool list must not flood diagnostics(); overflow collapses into one
@@ -96,6 +102,35 @@ export interface McpToolInfo {
   description: string;
   /** Raw JSON Schema from the server. */
   inputSchema: unknown;
+}
+
+export interface McpPromptArgumentInfo {
+  name: string;
+  description: string;
+  required: boolean;
+}
+
+export interface McpPromptInfo {
+  serverName: string;
+  promptName: string;
+  description: string;
+  arguments: readonly McpPromptArgumentInfo[];
+}
+
+export interface McpResourceInfo {
+  serverName: string;
+  uri: string;
+  name: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+  size?: number;
+}
+
+export interface McpResourceServerInfo {
+  serverName: string;
+  resources: readonly McpResourceInfo[];
+  discoveryError?: string;
 }
 
 type McpSdk = {
@@ -160,13 +195,34 @@ export interface McpServerState {
   state: McpLifecycleState;
   attempt?: number;
   attemptLimit?: number;
+  toolsAdvertised?: boolean;
+  promptsAdvertised?: boolean;
+  resourcesAdvertised?: boolean;
   toolCount?: number;
+  promptCount?: number;
+  resourceCount?: number;
+  toolDiscoveryError?: string;
+  promptDiscoveryError?: string;
+  resourceDiscoveryError?: string;
   diagnostic?: string;
   /** Bounded, non-secret failure class safe for direct status output. */
   statusSummary?: string;
 }
 
 type EnabledMcpServer = Extract<ResolvedMcpServer, { status: "enabled" }>;
+
+interface DiscoverySnapshot {
+  toolsAdvertised: boolean;
+  promptsAdvertised: boolean;
+  resourcesAdvertised: boolean;
+  tools: readonly McpToolInfo[];
+  prompts: readonly McpPromptInfo[];
+  resources: readonly McpResourceInfo[];
+  toolDiscoveryError?: string;
+  promptDiscoveryError?: string;
+  resourceDiscoveryError?: string;
+  diagnostics: readonly string[];
+}
 
 interface ServerHandle {
   server: EnabledMcpServer;
@@ -180,7 +236,16 @@ interface ServerHandle {
   /** Captured out-of-band: transport.pid nulls on close and connect() may never return. */
   pid?: number;
   pidPoller?: NodeJS.Timeout;
-  tools: McpToolInfo[];
+  tools: readonly McpToolInfo[];
+  prompts: readonly McpPromptInfo[];
+  resources: readonly McpResourceInfo[];
+  toolsAdvertised?: boolean;
+  promptsAdvertised?: boolean;
+  resourcesAdvertised?: boolean;
+  toolDiscoveryError?: string;
+  promptDiscoveryError?: string;
+  resourceDiscoveryError?: string;
+  resourceServerInfo?: McpResourceServerInfo;
   diagnostic?: string;
   statusSummary?: string;
   stderrRing: string;
@@ -237,7 +302,9 @@ export class McpRuntime {
       this.handles.push({
         server,
         state: "connecting",
-        tools: [],
+        tools: Object.freeze([]),
+        prompts: Object.freeze([]),
+        resources: Object.freeze([]),
         generation: 0,
         stderrRing: "",
         stopped: false,
@@ -276,14 +343,20 @@ export class McpRuntime {
 
   /** First catalogs retained after discovery; the aggregate is incomplete until initial settlement. */
   tools(): McpToolInfo[] {
-    const out: McpToolInfo[] = [];
+    return this.visibleCatalog((handle) => handle.tools);
+  }
+
+  prompts(): McpPromptInfo[] {
+    return this.visibleCatalog((handle) => handle.prompts);
+  }
+
+  resourceServers(): McpResourceServerInfo[] {
+    const out: McpResourceServerInfo[] = [];
     for (const handle of this.handles) {
-      if (
-        handle.tools.length > 0 &&
-        (handle.server.transport !== "stdio" || handle.state === "connected")
-      ) out.push(...handle.tools);
+      if (!handle.resourcesAdvertised || !handle.resourceServerInfo || !this.catalogVisible(handle)) continue;
+      out.push(handle.resourceServerInfo);
     }
-    return out;
+    return Object.freeze(out) as unknown as McpResourceServerInfo[];
   }
 
   /**
@@ -303,59 +376,130 @@ export class McpRuntime {
       state: handle.state,
       ...(handle.attempt !== undefined ? { attempt: handle.attempt } : {}),
       ...(handle.attemptLimit !== undefined ? { attemptLimit: handle.attemptLimit } : {}),
-      ...(handle.tools.length > 0 || handle.state === "connected" ? { toolCount: handle.tools.length } : {}),
+      ...(handle.toolsAdvertised !== undefined ? { toolsAdvertised: handle.toolsAdvertised } : {}),
+      ...(handle.promptsAdvertised !== undefined ? { promptsAdvertised: handle.promptsAdvertised } : {}),
+      ...(handle.resourcesAdvertised !== undefined ? { resourcesAdvertised: handle.resourcesAdvertised } : {}),
+      ...(handle.toolsAdvertised ? { toolCount: handle.tools.length } : {}),
+      ...(handle.promptsAdvertised ? { promptCount: handle.prompts.length } : {}),
+      ...(handle.resourcesAdvertised ? { resourceCount: handle.resources.length } : {}),
+      ...(handle.toolDiscoveryError !== undefined ? { toolDiscoveryError: handle.toolDiscoveryError } : {}),
+      ...(handle.promptDiscoveryError !== undefined ? { promptDiscoveryError: handle.promptDiscoveryError } : {}),
+      ...(handle.resourceDiscoveryError !== undefined ? { resourceDiscoveryError: handle.resourceDiscoveryError } : {}),
       ...(handle.diagnostic !== undefined ? { diagnostic: handle.diagnostic } : {}),
       ...(handle.statusSummary !== undefined ? { statusSummary: handle.statusSummary } : {}),
     }));
   }
 
-  /** Rejects with a descriptive Error on failure/timeout; result is the raw MCP call result. */
-  async callTool(serverName: string, toolName: string, args: unknown): Promise<unknown> {
-    const handle = this.handles.find((h) => h.server.name === serverName);
-    if (!handle) {
-      // Caller-supplied names are the one interpolation here that never went
-      // through validation — neutralize before quoting.
+  async getPrompt(
+    serverName: string,
+    promptName: string,
+    args: Record<string, string>,
+  ): Promise<unknown> {
+    const handle = this.requireHandle(serverName);
+    if (!handle.prompts.some((prompt) => prompt.promptName === promptName)) {
       throw new Error(
-        `MCP server "${neutralizeControlChars(serverName)}" is not running (not configured or not enabled)`,
+        `MCP server "${handle.server.name}" has no prompt "${safeOperationName(promptName)}"`,
       );
     }
+    return this.invokeLive(handle, `prompt "${safeOperationName(promptName)}"`, (client, timeout) =>
+      client.getPrompt({ name: promptName, arguments: args }, { timeout }));
+  }
+
+  async readResource(serverName: string, uri: string): Promise<unknown> {
+    const handle = this.requireHandle(serverName);
+    if (!handle.resourcesAdvertised) {
+      throw new Error(`MCP server "${handle.server.name}" does not advertise resources`);
+    }
+    if (hasDisplayControl(uri)) {
+      throw new Error(`MCP resource URI for server "${handle.server.name}" contains display-control characters`);
+    }
+    return this.invokeLive(handle, "resource read", (client, timeout) =>
+      client.readResource({ uri }, { timeout }));
+  }
+
+  /** Rejects with a descriptive Error on failure/timeout; result is the raw MCP call result. */
+  async callTool(serverName: string, toolName: string, args: unknown): Promise<unknown> {
+    const handle = this.requireHandle(serverName);
+    if (handle.state !== "connected" || !handle.client) {
+      return this.invokeLive(handle, `tool "${safeOperationName(toolName)}"`, async () => undefined);
+    }
+    if (!handle.tools.some((tool) => tool.toolName === toolName)) {
+      throw new Error(
+        `MCP server "${handle.server.name}" has no tool "${safeOperationName(toolName)}"`,
+      );
+    }
+    const callArgs =
+      typeof args === "object" && args !== null && !Array.isArray(args)
+        ? (args as Record<string, unknown>)
+        : {};
+    return this.invokeLive(handle, `tool "${safeOperationName(toolName)}"`, (client, timeout) =>
+      client.callTool({ name: toolName, arguments: callArgs }, undefined, { timeout }));
+  }
+
+  private visibleCatalog<T>(select: (handle: ServerHandle) => readonly T[]): T[] {
+    const out: T[] = [];
+    for (const handle of this.handles) {
+      if (this.catalogVisible(handle)) out.push(...select(handle));
+    }
+    return Object.freeze(out) as unknown as T[];
+  }
+
+  private catalogVisible(handle: ServerHandle): boolean {
+    return handle.server.transport !== "stdio" || handle.state === "connected";
+  }
+
+  private requireHandle(serverName: string): ServerHandle {
+    const handle = this.handles.find((candidate) => candidate.server.name === serverName);
+    if (handle) return handle;
+    // Caller-supplied names are the one server-name interpolation that never
+    // passed through configuration validation; bound and neutralize them here.
+    throw new Error(
+      `MCP server "${safeOperationName(serverName)}" is not running (not configured or not enabled)`,
+    );
+  }
+
+  private async invokeLive(
+    handle: ServerHandle,
+    operation: string,
+    invoke: (client: Client, timeoutMs: number) => Promise<unknown>,
+  ): Promise<unknown> {
+    const serverName = handle.server.name;
     if (handle.state === "reconnecting" || handle.state === "retrying") {
       throw new Error(`MCP server "${serverName}" is temporarily unavailable while reconnecting`);
     }
     if (handle.state !== "connected" || !handle.client) {
-      const suffix = handle.tools.length > 0
-        ? " is unavailable because its remote connection failed"
-        : " is not connected";
-      throw new Error(`MCP server "${serverName}"${suffix}`);
-    }
-    if (!handle.tools.some((tool) => tool.toolName === toolName)) {
+      const retained = handle.server.transport !== "stdio" &&
+        (handle.toolsAdvertised || handle.promptsAdvertised || handle.resourcesAdvertised);
       throw new Error(
-        `MCP server "${serverName}" has no tool "${neutralizeControlChars(toolName)}"`,
+        `MCP server "${serverName}"${retained ? " is unavailable because its remote connection failed" : " is not connected"}`,
       );
     }
-    // Per-server `timeout` wins; else MCP_TOOL_TIMEOUT; else Claude's unset
-    // default — the resolved value clamped exactly as Claude clamps it.
     const timeoutMs = resolveMcpToolTimeoutMs(handle.server.timeoutMs, this.toolTimeoutMs);
+    const client = handle.client;
+    const generation = handle.generation;
     try {
-      const callArgs =
-        typeof args === "object" && args !== null && !Array.isArray(args)
-          ? (args as Record<string, unknown>)
-          : {};
-      return await handle.client.callTool({ name: toolName, arguments: callArgs }, undefined, {
-        timeout: timeoutMs,
-      });
+      const result = await invoke(client, timeoutMs);
+      if (handle.stopped || handle.state !== "connected" || handle.client !== client || handle.generation !== generation) {
+        throw staleLiveOperation();
+      }
+      return result;
     } catch (err) {
+      if (isStaleLiveOperation(err)) {
+        const lifecycleState = handle.state as McpLifecycleState;
+        if (lifecycleState === "reconnecting" || lifecycleState === "retrying") {
+          throw new Error(`MCP server "${serverName}" is temporarily unavailable while reconnecting`);
+        }
+        throw new Error(`MCP server "${serverName}" is unavailable because its connection was replaced`);
+      }
       if (errCode(err) === MCP_ERROR_REQUEST_TIMEOUT) {
-        throw new Error(
-          `MCP tool "${toolName}" on server "${serverName}" timed out after ${timeoutMs} ms`,
-        );
+        throw new Error(`MCP ${operation} on server "${serverName}" timed out after ${timeoutMs} ms`);
       }
       if (handle.server.transport !== "stdio" && !handle.stopped) {
         const lifecycleState = handle.state as McpLifecycleState;
         if (lifecycleState === "reconnecting" || lifecycleState === "retrying") {
           throw new Error(`MCP server "${serverName}" is temporarily unavailable while reconnecting`);
         }
-        if (lifecycleState === "failed" && handle.tools.length > 0) {
+        if (lifecycleState === "failed") {
           throw new Error(`MCP server "${serverName}" is unavailable because its remote connection failed`);
         }
       }
@@ -370,12 +514,10 @@ export class McpRuntime {
           throw new Error(`MCP server "${serverName}" is unavailable because its remote connection failed`);
         }
       }
-      // Reachable only on a connected server, so spawn-path error text (which
-      // embeds the expanded command) never flows here; the message is the
-      // server's own protocol-level speech — bounded and neutralized.
-      throw new Error(
-        `MCP tool "${toolName}" on server "${serverName}" failed: ${boundedErrText(err)}`,
-      );
+      // Reachable only from a live client, so spawn-path errors (which can
+      // embed expanded commands) never flow here. The source is protocol-level
+      // server speech; bound and neutralize it before making it caller-visible.
+      throw new Error(`MCP ${operation} on server "${serverName}" failed: ${boundedErrText(err)}`);
     }
   }
 
@@ -503,17 +645,20 @@ export class McpRuntime {
       const connectPromise = (async () => {
         await client.connect(transport);
         initializationComplete = true;
-        const tools: unknown[] = [];
-        let cursor: string | undefined;
-        // Bounded pagination: a hostile server must not hold connect forever
-        // with an endless cursor chain.
-        for (let page = 0; page < 16; page++) {
-          const listed = await client.listTools(cursor === undefined ? {} : { cursor });
-          tools.push(...listed.tools);
-          if (typeof listed.nextCursor !== "string" || listed.nextCursor === "") break;
-          cursor = listed.nextCursor;
+        const snapshot = await this.discoverInitialCapabilities(handle, client);
+        if (localCloseObserved || localTransportErrorObserved) {
+          throw Object.assign(new Error("transport lost during capability discovery"), {
+            code: MCP_ERROR_CONNECTION_CLOSED,
+          });
         }
-        return tools;
+        if (
+          !handle.stopped &&
+          !handle.settled &&
+          handle.client === client &&
+          handle.transport === transport
+        ) {
+          this.publishInitialCapabilities(handle, snapshot);
+        }
       })();
       // The losing branch keeps running after a timeout; never let it become
       // an unhandled rejection.
@@ -538,11 +683,10 @@ export class McpRuntime {
           "failed",
           `MCP server "${server.name}" failed to connect within ${this.connectTimeoutMs} ms ` +
             `(MCP_TIMEOUT) — command: ${server.rawCommand}${this.stderrExcerpt(handle)}`,
-          "MCP startup timed out during connection, initialization, or tool discovery; run /doctor for details.",
+          "MCP startup timed out during connection, initialization, or capability discovery; run /doctor for details.",
         );
         return;
       }
-      handle.tools = this.validateTools(server.name, outcome.value);
       this.settleHandle(handle, "connected");
     } catch (err) {
       // Snapshot before catch-path cleanup: client.close() also closes the
@@ -580,7 +724,7 @@ export class McpRuntime {
         "failed",
         `MCP server "${server.name}" failed to start (${errSummary(err)}) — ` +
           `command: ${server.rawCommand}${this.stderrExcerpt(handle)}`,
-        "MCP startup failed during connection, initialization, or tool discovery; run /doctor for details.",
+        "MCP startup failed during connection, initialization, or capability discovery; run /doctor for details.",
       );
     }
   }
@@ -629,14 +773,13 @@ export class McpRuntime {
       handle.attempt = attempt;
       handle.attemptLimit = 4;
       try {
-        const connected = await this.openRemote(handle, epoch, signal);
+        const connected = await this.openRemote(handle, epoch, signal, true);
         if (!this.remoteCurrent(handle, epoch, signal)) {
           await connected.transport.abort().catch(() => undefined);
           return;
         }
         handle.client = connected.client;
         handle.transport = connected.transport;
-        handle.tools = this.validateTools(handle.server.name, connected.tools);
         handle.attempt = undefined;
         handle.attemptLimit = undefined;
         this.settleHandle(handle, "connected");
@@ -665,7 +808,8 @@ export class McpRuntime {
     handle: ServerHandle & { server: EnabledRemoteMcpServer },
     epoch: number,
     signal: AbortSignal,
-  ): Promise<{ client: Client; transport: RemoteMcpTransportHandle; tools: unknown[] }> {
+    initialDiscovery: boolean,
+  ): Promise<{ client: Client; transport: RemoteMcpTransportHandle }> {
     const ClientCtor = await this.remoteClientCtor();
     if (!this.remoteCurrent(handle, epoch, signal)) throw cancelledRemoteAttempt();
     const factory = this.deps.createRemoteTransport ?? createRemoteMcpTransport;
@@ -713,10 +857,46 @@ export class McpRuntime {
       if (handle.transport === transport) await this.closeRemoteParts(handle, 0);
       throw cancelledRemoteAttempt();
     }
-    let tools: unknown[];
     try {
-      tools = await this.listRemoteTools(client, signal);
+      if (initialDiscovery) {
+        const snapshot = await this.discoverInitialCapabilities(handle, client, signal);
+        if (transportLoss !== undefined) {
+          throw {
+            remoteFailure: classifyRemoteMcpFailure(new Error("transport lost"), {
+              stage: "discovery",
+              transportLoss,
+            }),
+          };
+        }
+        if (!this.remoteCurrent(handle, epoch, signal)) throw cancelledRemoteAttempt();
+        this.publishInitialCapabilities(handle, snapshot);
+      } else if (typeof client.ping === "function") {
+        await client.ping({
+          signal,
+          timeout: this.connectTimeoutMs,
+          maxTotalTimeout: this.connectTimeoutMs,
+        });
+      } else if (handle.toolsAdvertised) {
+        await client.listTools({}, {
+          signal,
+          timeout: this.connectTimeoutMs,
+          maxTotalTimeout: this.connectTimeoutMs,
+        });
+      } else if (handle.promptsAdvertised) {
+        await client.listPrompts({}, {
+          signal,
+          timeout: this.connectTimeoutMs,
+          maxTotalTimeout: this.connectTimeoutMs,
+        });
+      } else if (handle.resourcesAdvertised) {
+        await client.listResources({}, {
+          signal,
+          timeout: this.connectTimeoutMs,
+          maxTotalTimeout: this.connectTimeoutMs,
+        });
+      }
     } catch (error) {
+      if (typeof error === "object" && error !== null && "remoteFailure" in error) throw error;
       throw {
         remoteFailure: classifyRemoteMcpFailure(error, {
           stage: "discovery",
@@ -729,22 +909,233 @@ export class McpRuntime {
       throw cancelledRemoteAttempt();
     }
     published = true;
-    return { client, transport, tools };
+    return { client, transport };
   }
 
-  private async listRemoteTools(client: Client, signal: AbortSignal): Promise<unknown[]> {
-    const tools: unknown[] = [];
-    let cursor: string | undefined;
-    for (let page = 0; page < 16; page += 1) {
-      const listed = await client.listTools(
-        cursor === undefined ? {} : { cursor },
-        { signal, timeout: this.connectTimeoutMs, maxTotalTimeout: this.connectTimeoutMs },
-      );
-      tools.push(...listed.tools);
-      if (typeof listed.nextCursor !== "string" || listed.nextCursor === "") break;
-      cursor = listed.nextCursor;
+  private publishInitialCapabilities(handle: ServerHandle, snapshot: DiscoverySnapshot): void {
+    handle.tools = snapshot.tools;
+    handle.prompts = snapshot.prompts;
+    handle.resources = snapshot.resources;
+    handle.toolsAdvertised = snapshot.toolsAdvertised;
+    handle.promptsAdvertised = snapshot.promptsAdvertised;
+    handle.resourcesAdvertised = snapshot.resourcesAdvertised;
+    handle.toolDiscoveryError = snapshot.toolDiscoveryError;
+    handle.promptDiscoveryError = snapshot.promptDiscoveryError;
+    handle.resourceDiscoveryError = snapshot.resourceDiscoveryError;
+    handle.resourceServerInfo = snapshot.resourcesAdvertised
+      ? Object.freeze({
+          serverName: handle.server.name,
+          resources: snapshot.resources,
+          ...(snapshot.resourceDiscoveryError !== undefined
+            ? { discoveryError: snapshot.resourceDiscoveryError }
+            : {}),
+        })
+      : undefined;
+    this.diags.push(...snapshot.diagnostics);
+  }
+
+  private async discoverInitialCapabilities(
+    handle: ServerHandle,
+    client: Client,
+    signal?: AbortSignal,
+  ): Promise<DiscoverySnapshot> {
+    const capabilities = typeof client.getServerCapabilities === "function"
+      ? client.getServerCapabilities() ?? {}
+      : { tools: {} };
+    const diagnostics: string[] = [];
+    const snapshot: DiscoverySnapshot = {
+      toolsAdvertised: capabilities.tools !== undefined,
+      promptsAdvertised: capabilities.prompts !== undefined,
+      resourcesAdvertised: capabilities.resources !== undefined,
+      tools: Object.freeze([]),
+      prompts: Object.freeze([]),
+      resources: Object.freeze([]),
+      diagnostics,
+    };
+
+    await Promise.all(([
+      ["tools", snapshot.toolsAdvertised],
+      ["prompts", snapshot.promptsAdvertised],
+      ["resources", snapshot.resourcesAdvertised],
+    ] as const).map(async ([capability, advertised]) => {
+      if (!advertised) return;
+      try {
+        const raw = await this.discoverWithRetry(handle, client, capability, diagnostics, signal);
+        if (handle.stopped || signal?.aborted) throw cancelledDiscovery();
+        if (capability === "tools") snapshot.tools = this.validateTools(handle.server.name, raw, diagnostics);
+        if (capability === "prompts") snapshot.prompts = this.validatePrompts(handle.server.name, raw, diagnostics);
+        if (capability === "resources") snapshot.resources = this.validateResources(handle.server.name, raw, diagnostics);
+      } catch (error) {
+        if (handle.stopped || signal?.aborted || capability === "tools") throw error;
+        const failure = discoveryFailureClass(error);
+        const summary = `${capability} discovery failed after ${discoveryAttempts(error)} attempt(s) (${failure})`;
+        if (capability === "prompts") snapshot.promptDiscoveryError = summary;
+        if (capability === "resources") snapshot.resourceDiscoveryError = summary;
+        diagnostics.push(`MCP server "${handle.server.name}": ${summary}`);
+      }
+    }));
+    snapshot.diagnostics = Object.freeze(diagnostics);
+    return snapshot;
+  }
+
+  private async discoverWithRetry(
+    handle: ServerHandle,
+    client: Client,
+    capability: McpDiscoveryCapability,
+    diagnostics: string[],
+    signal?: AbortSignal,
+  ): Promise<unknown[]> {
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      try {
+        return await this.listCapabilityPages(handle, client, capability, diagnostics, signal);
+      } catch (error) {
+        if (!isTransientDiscoveryFailure(error) || attempt === 4) {
+          throw Object.assign(new Error("discovery failed"), {
+            discoveryCause: error,
+            discoveryAttemptCount: attempt,
+          });
+        }
+        await (this.deps.delay ?? abortableDelay)(
+          DISCOVERY_RETRY_DELAYS_MS[attempt - 1]!,
+          signal ?? new AbortController().signal,
+        );
+      }
     }
-    return tools;
+    return [];
+  }
+
+  private async listCapabilityPages(
+    handle: ServerHandle,
+    client: Client,
+    capability: McpDiscoveryCapability,
+    diagnostics: string[],
+    signal?: AbortSignal,
+  ): Promise<unknown[]> {
+    const items: unknown[] = [];
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < DISCOVERY_MAX_PAGES; page += 1) {
+      const params = cursor === undefined ? {} : { cursor };
+      const options = signal === undefined
+        ? undefined
+        : { signal, timeout: this.connectTimeoutMs, maxTotalTimeout: this.connectTimeoutMs };
+      const listed = capability === "tools"
+        ? await client.listTools(params, options)
+        : capability === "prompts"
+          ? await client.listPrompts(params, options)
+          : await client.listResources(params, options);
+      const listedRecord = listed as unknown as Record<string, unknown>;
+      const candidateItems = listedRecord[capability];
+      const pageItems: unknown[] = Array.isArray(candidateItems) ? candidateItems : [];
+      const remaining = CATALOG_MAX_ITEMS - items.length;
+      if (remaining > 0) items.push(...pageItems.slice(0, remaining));
+      if (pageItems.length > remaining) {
+        diagnostics.push(
+          `MCP server "${handle.server.name}": ${capability} catalog truncated at ${CATALOG_MAX_ITEMS} items`,
+        );
+        return items;
+      }
+      const next = typeof listed.nextCursor === "string" && listed.nextCursor !== ""
+        ? listed.nextCursor
+        : undefined;
+      if (next === undefined) return items;
+      if (cursors.has(next)) {
+        diagnostics.push(
+          `MCP server "${handle.server.name}": ${capability} pagination cursor cycle stopped`,
+        );
+        return items;
+      }
+      cursors.add(next);
+      cursor = next;
+      if (page === DISCOVERY_MAX_PAGES - 1) {
+        diagnostics.push(
+          `MCP server "${handle.server.name}": ${capability} pagination truncated at ${DISCOVERY_MAX_PAGES} pages`,
+        );
+      }
+    }
+    return items;
+  }
+
+  private validatePrompts(
+    serverName: string,
+    rawPrompts: unknown[],
+    diagnostics: string[],
+  ): readonly McpPromptInfo[] {
+    const out: McpPromptInfo[] = [];
+    const seen = new Set<string>();
+    let dropped = 0;
+    for (const raw of rawPrompts) {
+      const prompt = raw as { name?: unknown; description?: unknown; arguments?: unknown };
+      if (!isBoundedProtocolIdentifier(prompt.name) || seen.has(prompt.name)) {
+        dropped += 1;
+        continue;
+      }
+      seen.add(prompt.name);
+      const args: McpPromptArgumentInfo[] = [];
+      if (Array.isArray(prompt.arguments)) {
+        for (const rawArgument of prompt.arguments.slice(0, CATALOG_MAX_ITEMS)) {
+          const argument = rawArgument as { name?: unknown; description?: unknown; required?: unknown };
+          if (!isBoundedProtocolIdentifier(argument.name)) {
+            dropped += 1;
+            continue;
+          }
+          args.push(Object.freeze({
+            name: argument.name,
+            description: boundedMetadata(argument.description),
+            required: argument.required === true,
+          }));
+        }
+      }
+      out.push(Object.freeze({
+        serverName,
+        promptName: prompt.name,
+        description: boundedMetadata(prompt.description),
+        arguments: Object.freeze(args),
+      }));
+    }
+    if (dropped > 0) {
+      diagnostics.push(`MCP server "${serverName}": dropped ${dropped} invalid prompt metadata entr${dropped === 1 ? "y" : "ies"}`);
+    }
+    return Object.freeze(out);
+  }
+
+  private validateResources(
+    serverName: string,
+    rawResources: unknown[],
+    diagnostics: string[],
+  ): readonly McpResourceInfo[] {
+    const out: McpResourceInfo[] = [];
+    const seen = new Set<string>();
+    let dropped = 0;
+    for (const raw of rawResources) {
+      const resource = raw as Record<string, unknown>;
+      if (
+        typeof resource.uri !== "string" || resource.uri.length === 0 ||
+        resource.uri.length > RESOURCE_URI_MAX_CHARS || hasDisplayControl(resource.uri) || seen.has(resource.uri) ||
+        !isBoundedProtocolIdentifier(resource.name)
+      ) {
+        dropped += 1;
+        continue;
+      }
+      seen.add(resource.uri);
+      const info: McpResourceInfo = {
+        serverName,
+        uri: resource.uri,
+        name: boundedMetadata(resource.name),
+      };
+      for (const field of ["title", "description", "mimeType"] as const) {
+        if (typeof resource[field] === "string") info[field] = boundedMetadata(resource[field]);
+      }
+      if (
+        typeof resource.size === "number" && Number.isFinite(resource.size) &&
+        resource.size >= 0
+      ) info.size = resource.size;
+      out.push(Object.freeze(info));
+    }
+    if (dropped > 0) {
+      diagnostics.push(`MCP server "${serverName}": dropped ${dropped} invalid resource metadata entr${dropped === 1 ? "y" : "ies"}`);
+    }
+    return Object.freeze(out);
   }
 
   private beginRecovery(handle: ServerHandle, _event: RemoteMcpDisconnect): void {
@@ -782,7 +1173,7 @@ export class McpRuntime {
       signal.addEventListener("abort", onLoopAbort, { once: true });
       const opening = (async () => {
         try {
-          return await this.openRemote(handle, attemptEpoch, attemptController.signal);
+          return await this.openRemote(handle, attemptEpoch, attemptController.signal, false);
         } catch (error) {
           // Cleanup is part of this attempt's single MCP_TIMEOUT budget. A
           // stale attempt must not close a replacement published by a newer epoch.
@@ -806,7 +1197,8 @@ export class McpRuntime {
         const connected = outcome.value;
         handle.client = connected.client;
         handle.transport = connected.transport;
-        // Discovery is required for connection health, but the first catalog is immutable.
+        // The replacement health check proves live protocol operation without
+        // re-publishing or mutating the immutable initial capability catalogs.
         handle.state = "connected";
         handle.attempt = undefined;
         handle.attemptLimit = undefined;
@@ -886,7 +1278,11 @@ export class McpRuntime {
    * binary-verified; descriptions are bounded and control-stripped. All
    * diagnostics quote bounded name slices and are capped per server.
    */
-  private validateTools(serverName: string, rawTools: unknown[]): McpToolInfo[] {
+  private validateTools(
+    serverName: string,
+    rawTools: unknown[],
+    diagnostics: string[],
+  ): McpToolInfo[] {
     const out: McpToolInfo[] = [];
     const seen = new Set<string>();
     let emitted = 0;
@@ -894,14 +1290,18 @@ export class McpRuntime {
     const diag = (text: string): void => {
       if (emitted < TOOL_DIAG_MAX_PER_SERVER) {
         emitted += 1;
-        this.diags.push(neutralizeControlChars(text));
+        diagnostics.push(neutralizeControlChars(text));
       } else {
         suppressed += 1;
       }
     };
-    for (const raw of rawTools) {
+    for (const raw of rawTools.slice(0, CATALOG_MAX_ITEMS)) {
       const tool = raw as { name?: unknown; description?: unknown; inputSchema?: unknown };
       const rawName = typeof tool.name === "string" ? tool.name : "";
+      if (rawName.length > PROTOCOL_NAME_MAX_CHARS) {
+        diag(`MCP server "${serverName}": overlong tool name dropped`);
+        continue;
+      }
       const name = rawName.replace(TOOL_NAME_SANITIZE_RE, "_");
       if (name === "") {
         diag(`MCP server "${serverName}": tool with an empty name dropped`);
@@ -925,14 +1325,14 @@ export class McpRuntime {
       if (description.length > DESCRIPTION_MAX_CHARS) {
         description = `${description.slice(0, DESCRIPTION_MAX_CHARS)}… [truncated]`;
       }
-      out.push({ serverName, toolName: name, description, inputSchema: tool.inputSchema });
+      out.push(Object.freeze({ serverName, toolName: name, description, inputSchema: tool.inputSchema }));
     }
     if (suppressed > 0) {
-      this.diags.push(
+      diagnostics.push(
         `MCP server "${serverName}": …and ${suppressed} more tool-metadata diagnostic(s) suppressed`,
       );
     }
-    return out;
+    return Object.freeze(out) as unknown as McpToolInfo[];
   }
 
   // -------------------------------------------------------------------------
@@ -1073,6 +1473,76 @@ export class McpRuntime {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+type McpDiscoveryCapability = "tools" | "prompts" | "resources";
+
+function boundedMetadata(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const clean = neutralizeControlChars(value);
+  return clean.length > DESCRIPTION_MAX_CHARS
+    ? `${clean.slice(0, DESCRIPTION_MAX_CHARS)}… [truncated]`
+    : clean;
+}
+
+function isBoundedProtocolIdentifier(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 &&
+    value.length <= PROTOCOL_NAME_MAX_CHARS && neutralizeControlChars(value) === value;
+}
+
+function safeOperationName(value: string): string {
+  return sliceForDiag(neutralizeControlChars(value));
+}
+
+function hasDisplayControl(value: string): boolean {
+  return /[\p{Cc}\p{Cf}]/u.test(value);
+}
+
+function cancelledDiscovery(): Error {
+  return Object.assign(new Error("capability discovery cancelled"), { name: "AbortError" });
+}
+
+const STALE_LIVE_OPERATION = Symbol("stale-live-operation");
+
+function staleLiveOperation(): { [STALE_LIVE_OPERATION]: true } {
+  return { [STALE_LIVE_OPERATION]: true };
+}
+
+function isStaleLiveOperation(error: unknown): boolean {
+  return typeof error === "object" && error !== null && STALE_LIVE_OPERATION in error;
+}
+
+function discoveryWrappedCause(error: unknown): unknown {
+  if (typeof error === "object" && error !== null && "discoveryCause" in error) {
+    return (error as { discoveryCause?: unknown }).discoveryCause;
+  }
+  return error;
+}
+
+function discoveryAttempts(error: unknown): number {
+  if (typeof error === "object" && error !== null) {
+    const attempts = (error as { discoveryAttemptCount?: unknown }).discoveryAttemptCount;
+    if (typeof attempts === "number") return attempts;
+  }
+  return 1;
+}
+
+function discoveryFailureClass(error: unknown): string {
+  const cause = discoveryWrappedCause(error);
+  if (errCode(cause) === MCP_ERROR_REQUEST_TIMEOUT) return "request-timeout";
+  if (isTransientDiscoveryFailure(cause)) return "transient";
+  return classifyRemoteMcpFailure(cause, { stage: "discovery" }).class;
+}
+
+function isTransientDiscoveryFailure(error: unknown): boolean {
+  if (errCode(error) === MCP_ERROR_REQUEST_TIMEOUT) return false;
+  if (classifyRemoteMcpFailure(error, { stage: "discovery" }).class === "transient") return true;
+  if (typeof error !== "object" || error === null) return false;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && [
+    "ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "EPIPE", "ETIMEDOUT",
+    "ENETDOWN", "ENETUNREACH", "EHOSTDOWN", "EHOSTUNREACH",
+  ].includes(code);
+}
 
 export function resolveMcpTimeoutPolicy(
   env: Record<string, string | undefined>,
@@ -1261,7 +1731,7 @@ function errSummary(err: unknown): string {
   return "unknown error";
 }
 
-/** Bounded, neutralized error text for callTool rejections. */
+/** Bounded, neutralized error text for live-operation rejections. */
 function boundedErrText(err: unknown): string {
   let message = "unknown error";
   if (typeof err === "object" && err !== null) {
