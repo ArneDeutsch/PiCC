@@ -15,6 +15,8 @@ It is built as an extension bundle on [Pi](https://github.com/earendil-works/pi)
 already solves the two hardest problems — spending a ChatGPT/Codex subscription and abstracting
 the model provider. PiCC adds the Claude Code compatibility layer on top.
 
+![Four PiCC instances](doc/picc_tui.png)
+
 ## Quick start
 
 Install and link a source checkout with one setup command:
