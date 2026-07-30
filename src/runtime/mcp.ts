@@ -25,9 +25,10 @@ import type { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdi
  * transports while killing owned stdio process trees (Windows too). Session-global
  * and non-blocking: `start()`
  * returns immediately, connects run in the background bounded by
- * `MCP_TIMEOUT`, and every failure degrades to a diagnostic — never a throw,
- * never a crash. With zero enabled servers nothing is imported and nothing is
- * spawned: the zero-cost path.
+ * `MCP_TIMEOUT`, and startup or connection failures degrade to diagnostics
+ * rather than crashing the harness. Live operations reject on failure. With
+ * zero enabled servers nothing is imported and nothing is spawned: the
+ * zero-cost path.
  *
  * Model-facing registration is NOT here — this class only owns processes,
  * connections, capability metadata, and bounded live protocol operations.
@@ -53,6 +54,8 @@ const CALL_ERROR_MAX_CHARS = 1_000;
 const DIAG_NAME_MAX_CHARS = 200;
 /** Initial catalogs are immutable and bounded independently of pagination. */
 const CATALOG_MAX_ITEMS = 1_024;
+const PROMPT_ARGUMENT_MAX_ITEMS = 1_024;
+/** A page bound stops a hostile server that returns a fresh cursor forever. */
 const DISCOVERY_MAX_PAGES = 16;
 const DISCOVERY_RETRY_DELAYS_MS = [100, 200, 400] as const;
 const PROTOCOL_NAME_MAX_CHARS = 1_024;
@@ -514,9 +517,9 @@ export class McpRuntime {
           throw new Error(`MCP server "${serverName}" is unavailable because its remote connection failed`);
         }
       }
-      // Reachable only from a live client, so spawn-path errors (which can
-      // embed expanded commands) never flow here. The source is protocol-level
-      // server speech; bound and neutralize it before making it caller-visible.
+      // Reachable only from a live client, so spawn-path errors that can embed
+      // expanded commands never flow here. Client, transport, and server error
+      // text still needs bounding and neutralization before caller display.
       throw new Error(`MCP ${operation} on server "${serverName}" failed: ${boundedErrText(err)}`);
     }
   }
@@ -1071,26 +1074,16 @@ export class McpRuntime {
         continue;
       }
       seen.add(prompt.name);
-      const args: McpPromptArgumentInfo[] = [];
-      if (Array.isArray(prompt.arguments)) {
-        for (const rawArgument of prompt.arguments.slice(0, CATALOG_MAX_ITEMS)) {
-          const argument = rawArgument as { name?: unknown; description?: unknown; required?: unknown };
-          if (!isBoundedProtocolIdentifier(argument.name)) {
-            dropped += 1;
-            continue;
-          }
-          args.push(Object.freeze({
-            name: argument.name,
-            description: boundedMetadata(argument.description),
-            required: argument.required === true,
-          }));
-        }
+      const args = validatePromptArguments(prompt.arguments);
+      if (args === undefined) {
+        dropped += 1;
+        continue;
       }
       out.push(Object.freeze({
         serverName,
         promptName: prompt.name,
         description: boundedMetadata(prompt.description),
-        arguments: Object.freeze(args),
+        arguments: args,
       }));
     }
     if (dropped > 0) {
@@ -1487,6 +1480,29 @@ function boundedMetadata(value: unknown): string {
 function isBoundedProtocolIdentifier(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 &&
     value.length <= PROTOCOL_NAME_MAX_CHARS && neutralizeControlChars(value) === value;
+}
+
+function validatePromptArguments(value: unknown): readonly McpPromptArgumentInfo[] | undefined {
+  if (value === undefined) return Object.freeze([]);
+  // Trimming or repairing declarations can mis-map positional input and create
+  // a different command that the server rejects, so invalid schemas fail closed.
+  if (!Array.isArray(value) || value.length > PROMPT_ARGUMENT_MAX_ITEMS) return undefined;
+  const out: McpPromptArgumentInfo[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+    const argument = raw as Record<string, unknown>;
+    if (!isBoundedProtocolIdentifier(argument.name) || seen.has(argument.name)) return undefined;
+    if (argument.description !== undefined && typeof argument.description !== "string") return undefined;
+    if (argument.required !== undefined && typeof argument.required !== "boolean") return undefined;
+    seen.add(argument.name);
+    out.push(Object.freeze({
+      name: argument.name,
+      description: boundedMetadata(argument.description),
+      required: argument.required ?? false,
+    }));
+  }
+  return Object.freeze(out);
 }
 
 function safeOperationName(value: string): string {

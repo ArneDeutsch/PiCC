@@ -699,6 +699,85 @@ describe("McpRuntime prompt and resource capabilities", () => {
     }
   });
 
+  it("keeps complete prompt argument declarations and drops every invalid declaration list fail-closed", async () => {
+    const validArguments = Array.from({ length: 1_024 }, (_, index) => ({
+      name: `argument-${index}`,
+      description: `description-${index}`,
+      required: index % 2 === 0,
+    }));
+    const hostileArgumentCanaries = [
+      "HOSTILE_NON_ARRAY_CANARY",
+      "HOSTILE_NULL_ENTRY_CANARY",
+      "HOSTILE_ARRAY_ENTRY_CANARY",
+      "HOSTILE_SCALAR_ENTRY_CANARY",
+      "HOSTILE_MISSING_NAME_CANARY",
+      "HOSTILE_NON_STRING_NAME_CANARY",
+      "HOSTILE_EMPTY_NAME_CANARY",
+      "HOSTILE_CONTROL_NAME_CANARY",
+      "HOSTILE_OVERSIZED_NAME_CANARY",
+      "HOSTILE_DESCRIPTION_CANARY",
+      "HOSTILE_REQUIRED_CANARY",
+      "HOSTILE_DUPLICATE_NAME_CANARY",
+      "HOSTILE_OVER_LIMIT_CANARY",
+    ] as const;
+    const invalidArgumentLists: Array<[string, unknown]> = [
+      ["non-array", { name: hostileArgumentCanaries[0] }],
+      ["null-entry", [{ name: hostileArgumentCanaries[1] }, null]],
+      ["array-entry", [[hostileArgumentCanaries[2]]]],
+      ["scalar-entry", [hostileArgumentCanaries[3]]],
+      ["missing-name", [{ description: hostileArgumentCanaries[4] }]],
+      ["non-string-name", [{ name: { marker: hostileArgumentCanaries[5] } }]],
+      ["empty-name", [{ name: "", description: hostileArgumentCanaries[6] }]],
+      ["control-name", [{ name: `${hostileArgumentCanaries[7]}\u001b` }]],
+      ["oversized-name", [{ name: `${hostileArgumentCanaries[8]}${"n".repeat(1_025)}` }]],
+      ["invalid-description", [{ name: "argument", description: { marker: hostileArgumentCanaries[9] } }]],
+      ["invalid-required", [{ name: "argument", required: hostileArgumentCanaries[10] }]],
+      ["duplicate-name", [{ name: hostileArgumentCanaries[11] }, { name: hostileArgumentCanaries[11] }]],
+      ["over-limit", [
+        ...Array.from({ length: 1_024 }, (_, index) => ({ name: `over-limit-${index}` })),
+        { name: hostileArgumentCanaries[12] },
+      ]],
+    ];
+    class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
+    class FakeClient {
+      async connect(): Promise<void> {}
+      getServerCapabilities() { return { prompts: {} }; }
+      async listPrompts(): Promise<{ prompts: unknown[] }> {
+        return { prompts: [
+          { name: "absent" },
+          { name: "maximum-valid", arguments: validArguments },
+          ...invalidArgumentLists.map(([name, arguments_]) => ({ name, arguments: arguments_ })),
+        ] };
+      }
+      async close(): Promise<void> {}
+    }
+    const runtime = McpRuntime.start(makeConfig(makeServer({ name: "prompt-arguments" })), makeDeps({
+      loadSdk: async () => ({ Client: FakeClient, StdioClientTransport: FakeTransport }) as never,
+    }));
+    try {
+      await runtime.whenSettled();
+      const prompts = runtime.prompts();
+      expect(prompts).toHaveLength(2);
+      expect(prompts[0]).toEqual({
+        serverName: "prompt-arguments",
+        promptName: "absent",
+        description: "",
+        arguments: [],
+      });
+      expect(prompts[1]?.arguments).toHaveLength(1_024);
+      expect(prompts[1]?.arguments).toEqual(validArguments);
+      expect(prompts.every((prompt) => Object.isFrozen(prompt.arguments))).toBe(true);
+      expect(prompts.flatMap((prompt) => prompt.arguments).every(Object.isFrozen)).toBe(true);
+      expect(runtime.diagnostics()).toContain(
+        `MCP server "prompt-arguments": dropped ${invalidArgumentLists.length} invalid prompt metadata entries`,
+      );
+      const diagnostics = runtime.diagnostics().join("\n");
+      for (const canary of hostileArgumentCanaries) expect(diagnostics).not.toContain(canary);
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+
   it("retains an advertised resource server entry when its isolated catalog discovery fails", async () => {
     class StreamableHTTPError extends Error { constructor(readonly status: number) { super("RESOURCE_SPEECH_CANARY"); } }
     class FakeTransport { readonly pid = undefined; readonly stderr = undefined; }
