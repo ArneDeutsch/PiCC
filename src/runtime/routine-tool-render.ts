@@ -645,11 +645,21 @@ function routineInvocation(
   return argumentsText ? `${name} — ${argumentsText}` : name;
 }
 
-interface WorktreeRow {
+interface OrdinaryWorktreeRow {
+  kind: "ordinary";
+  action: "enter worktree" | "exit worktree";
+  primary: string;
+  metadata: string[];
+}
+
+interface ExceptionalWorktreeRow {
+  kind: "exceptional";
   literals: string[];
   fields: string[];
   priorityEvidence?: PriorityEvidence;
 }
+
+type WorktreeRow = OrdinaryWorktreeRow | ExceptionalWorktreeRow;
 
 function recognizeEnterWorktree(
   result: unknown,
@@ -704,31 +714,36 @@ function recognizeEnterWorktree(
   }
   const seededCount = ownData(details.seeded, "length") as number;
   if (!details.created && seededCount !== 0) return undefined;
-  const literals = ["enter worktree(", ") on branch "];
-  const fields = [worktreePath, branch];
-  let suffix = seededCount > 0 ? `; seeded ${seededCount} files` : "";
-  if (previousPath !== undefined) {
-    suffix += "; previous ";
-    if (details.previousKeepOutcome === "kept") {
-      literals.push(suffix, " kept; unlock attempted");
-      fields.push(previousPath);
-    } else if (previousError !== undefined) {
-      literals.push(suffix, " keep failed: ", "; previous worktree state unknown");
-      fields.push(previousPath, previousError);
-    } else {
-      literals.push(suffix, " keep failed; previous worktree state unknown");
-      fields.push(previousPath);
-    }
-  } else {
-    literals.push(suffix);
+  if (details.previousKeepOutcome !== "keep-failed") {
+    return {
+      kind: "ordinary",
+      action: "enter worktree",
+      primary: worktreePath,
+      metadata: [
+        `branch ${branch}`,
+        ...(seededCount > 0 ? [`seeded ${seededCount} files`] : []),
+        ...(previousPath ? [`previous ${previousPath} kept`, "unlock attempted"] : []),
+      ],
+    };
   }
-  const priorityEvidence = details.previousKeepOutcome === "keep-failed"
-    ? {
-        warning: "entered; prior keep failed; state unknown",
-        ...(previousError ? { detail: `prior error: ${previousError}` } : {}),
-      }
-    : undefined;
-  return { literals, fields, ...(priorityEvidence ? { priorityEvidence } : {}) };
+  const seededFact = seededCount > 0 ? `; seeded ${seededCount} files` : "";
+  const literals = ["enter worktree(", `) on branch ${branch}${seededFact}; previous `];
+  const fields = [worktreePath, previousPath ?? ""];
+  if (previousError !== undefined) {
+    literals.push(" keep failed: ", "; previous worktree state unknown");
+    fields.push(previousError);
+  } else {
+    literals.push(" keep failed; previous worktree state unknown");
+  }
+  return {
+    kind: "exceptional",
+    literals,
+    fields,
+    priorityEvidence: {
+      warning: "entered; prior keep failed; state unknown",
+      ...(previousError ? { detail: `prior error: ${previousError}` } : {}),
+    },
+  };
 }
 
 function recognizeExitWorktree(
@@ -747,7 +762,7 @@ function recognizeExitWorktree(
     if (none.outcome !== "none" || typeof none.restorePath !== "string") return undefined;
     const restorePath = sanitizeInlineDisplay(formatDisplayPathFromRoots(none.restorePath, displayRoots));
     return restorePath
-      ? { literals: ["exit worktree (no active worktree); already at ", ""], fields: [restorePath] }
+      ? { kind: "exceptional", literals: ["exit worktree (no active worktree); already at ", ""], fields: [restorePath] }
       : undefined;
   }
   const baseKeys = [
@@ -765,8 +780,10 @@ function recognizeExitWorktree(
   if (details.outcome === "kept") {
     if (details.ok !== true || details.removed || details.orphaned || "error" in details) return undefined;
     return {
-      literals: ["exit worktree(", ") kept; restored ", ""],
-      fields: [worktreePath, restorePath],
+      kind: "ordinary",
+      action: "exit worktree",
+      primary: worktreePath,
+      metadata: ["kept", `restored ${restorePath}`],
     };
   }
   if (details.outcome === "keep-failed") {
@@ -775,6 +792,7 @@ function recognizeExitWorktree(
       const error = sanitizeText(details.error, true);
       if (typeof details.error !== "string" || !error) return undefined;
       return {
+        kind: "exceptional",
         literals: [
           "exit worktree(", ") keep failed: ",
           "; worktree state unknown; restored ", "",
@@ -788,6 +806,7 @@ function recognizeExitWorktree(
       };
     }
     return {
+      kind: "exceptional",
       literals: ["exit worktree(", ") keep failed; worktree state unknown; restored ", ""],
       fields: [worktreePath, restorePath],
       priorityEvidence: { warning: "keep failed; state unknown", restoration: "restored" },
@@ -796,13 +815,16 @@ function recognizeExitWorktree(
   if (details.outcome === "removed") {
     if (details.ok !== true || details.removed !== true || details.orphaned || "error" in details) return undefined;
     return {
-      literals: ["exit worktree(", ") removed; restored ", ""],
-      fields: [worktreePath, restorePath],
+      kind: "ordinary",
+      action: "exit worktree",
+      primary: worktreePath,
+      metadata: ["removed", `restored ${restorePath}`],
     };
   }
   if (details.outcome === "deferred-removal") {
     if (details.ok !== true || details.removed || details.orphaned !== true || "error" in details) return undefined;
     return {
+      kind: "exceptional",
       literals: ["exit worktree(", ") removal deferred; restored ", ""],
       fields: [worktreePath, restorePath],
       priorityEvidence: { warning: "removal deferred", restoration: "restored" },
@@ -815,6 +837,7 @@ function recognizeExitWorktree(
     const error = sanitizeText(details.error, true);
     if (typeof details.error !== "string" || !error) return undefined;
     return {
+      kind: "exceptional",
       literals: [
         "exit worktree(", ") removal failed: ",
         "; worktree state unknown; restored ", "",
@@ -828,6 +851,7 @@ function recognizeExitWorktree(
     };
   }
   return {
+    kind: "exceptional",
     literals: ["exit worktree(", ") removal failed; worktree state unknown; restored ", ""],
     fields: [worktreePath, restorePath],
     priorityEvidence: { warning: "removal failed; state unknown", restoration: "restored" },
@@ -1478,8 +1502,9 @@ export function withRoutineToolRendering<T extends ToolDefinition>(
             const row = toolName === "EnterWorktree"
               ? recognizeEnterWorktree(result, options, context, displayRoots)
               : recognizeExitWorktree(result, options, context, displayRoots);
-            return row === undefined
-              ? failOpenComponent(result, toolName, theme)
+            if (row === undefined) return failOpenComponent(result, toolName, theme);
+            return row.kind === "ordinary"
+              ? semanticDisplayRow({ action: row.action, primary: row.primary, optional: row.metadata }, theme)
               : structuredRowComponent(row.literals, row.fields, theme, row.priorityEvidence);
           }
           const success = toolName === "WebFetch" || toolName === "WebSearch"

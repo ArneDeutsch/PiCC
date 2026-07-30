@@ -432,10 +432,10 @@ describe("routine tool rendering decorator", () => {
 
     const literal = { ...result, details: { ...result.details, worktreePath: "/repo/worktree/repo:literal" } };
     expect(tool.renderResult(literal, { expanded: false, isPartial: false }, undefined, ctx).render(120).join(" "))
-      .toContain("worktree(./repo:literal)");
+      .toContain("worktree ./repo:literal");
     const nonSynthesized = { ...result, details: { ...result.details, worktreePath: "/repo/worktree/re\u200Bpo:literal" } };
     expect(tool.renderResult(nonSynthesized, { expanded: false, isPartial: false }, undefined, ctx).render(120).join(" "))
-      .toContain("worktree(re�po:literal)");
+      .toContain("worktree re�po:literal");
 
     for (const lifecycle of [{ argsComplete: true, executionStarted: true }, {}]) {
       const historicalResolver = vi.fn(() => "/mutable");
@@ -456,18 +456,61 @@ describe("routine tool rendering decorator", () => {
     }
   });
 
-  it("styles worktree targets as primary while preserving exceptional evidence roles", () => {
+  it("uses symmetric semantic roles for ordinary worktrees while preserving exceptional evidence roles", () => {
     const calls: Array<{ slot: string; text: string }> = [];
     const theme = { fg(slot: string, text: string) { calls.push({ slot, text }); return text; } };
-    const tool = decorate({ name: "ExitWorktree" } as ToolDefinition);
-    const result = {
-      content: [{ type: "text", text: "CANONICAL" }],
+    const enter = decorate({ name: "EnterWorktree" } as ToolDefinition);
+    renderResult(enter, { name: "a" }, {
+      content: [{ type: "text", text: "CANONICAL ENTER" }],
+      details: {
+        worktreePath: "/repo/wt", branch: "worktree-a", created: true, seeded: ["a", "b"],
+        previousUnlockAttempted: true, previousWorktreePath: "/repo/old", previousKeepOutcome: "kept",
+      },
+    }, { theme, width: 200 });
+    expect(calls).toContainEqual({ slot: "text", text: "enter worktree" });
+    expect(calls).toContainEqual({ slot: "accent", text: "/repo/wt" });
+    for (const text of [" · ", "branch worktree-a", "seeded 2 files", "previous /repo/old kept", "unlock attempted"]) {
+      expect(calls).toContainEqual({ slot: "muted", text });
+    }
+    expect(calls.some((call) => call.slot === "warning")).toBe(false);
+
+    calls.length = 0;
+    const exceptionalEnter = renderResult(enter, { name: "next" }, {
+      content: [{ type: "text", text: "CANONICAL ENTER FAILURE" }],
+      details: {
+        worktreePath: "/repo/next", branch: "worktree-next", created: true, seeded: ["a", "b"],
+        previousUnlockAttempted: true, previousWorktreePath: "/repo/old",
+        previousKeepOutcome: "keep-failed", previousKeepError: "unlock denied",
+      },
+    }, { theme, width: 200 }).join(" ");
+    expect(exceptionalEnter).toBe(
+      "enter worktree(/repo/next) on branch worktree-next; seeded 2 files; previous /repo/old keep failed: unlock denied; previous worktree state unknown",
+    );
+    expect(calls.some((call) => call.slot === "warning" && call.text.includes("unlock denied"))).toBe(true);
+
+    calls.length = 0;
+    const exit = decorate({ name: "ExitWorktree" } as ToolDefinition);
+    renderResult(exit, { action: "remove" }, {
+      content: [{ type: "text", text: "CANONICAL EXIT" }],
+      details: {
+        worktreePath: "/repo/wt", outcome: "removed", restorePath: "/repo",
+        ok: true, removed: true, orphaned: false, diagnostics: [],
+      },
+    }, { theme, width: 160 });
+    expect(calls).toContainEqual({ slot: "text", text: "exit worktree" });
+    expect(calls).toContainEqual({ slot: "accent", text: "/repo/wt" });
+    expect(calls).toContainEqual({ slot: "muted", text: "removed" });
+    expect(calls).toContainEqual({ slot: "muted", text: "restored /repo" });
+    expect(calls.some((call) => call.slot === "warning")).toBe(false);
+
+    calls.length = 0;
+    renderResult(exit, { action: "remove" }, {
+      content: [{ type: "text", text: "CANONICAL FAILURE" }],
       details: {
         worktreePath: "/repo/wt", outcome: "removal-failed", restorePath: "/repo",
         ok: false, removed: false, orphaned: false, diagnostics: [], error: "locked",
       },
-    };
-    renderResult(tool, { action: "remove" }, result, { theme, width: 160 });
+    }, { theme, width: 160 });
     expect(calls).toContainEqual({ slot: "accent", text: "/repo/wt" });
     expect(calls.some((call) => call.slot === "warning" && call.text.includes("locked"))).toBe(true);
     expect(calls.some((call) => call.slot === "muted" && call.text.includes("/repo"))).toBe(true);
@@ -1622,12 +1665,12 @@ describe("routine tool rendering decorator", () => {
       [
         { name: "a" },
         { worktreePath: "/repo/wt", branch: "worktree-a", created: true, seeded: [], previousUnlockAttempted: false },
-        "enter worktree(/repo/wt) on branch worktree-a",
+        "enter worktree /repo/wt · branch worktree-a",
       ],
       [
         { path: "/repo/wt" },
         { worktreePath: "/repo/wt", branch: "worktree-a", created: false, seeded: [], previousUnlockAttempted: false },
-        "enter worktree(/repo/wt) on branch worktree-a",
+        "enter worktree /repo/wt · branch worktree-a",
       ],
       [
         { name: "a" },
@@ -1635,7 +1678,7 @@ describe("routine tool rendering decorator", () => {
           worktreePath: "/repo/wt", branch: "worktree-a", created: true,
           seeded: ["a", "b"], previousUnlockAttempted: false,
         },
-        "enter worktree(/repo/wt) on branch worktree-a; seeded 2 files",
+        "enter worktree /repo/wt · branch worktree-a · seeded 2 files",
       ],
       [
         { name: "a" },
@@ -1644,7 +1687,7 @@ describe("routine tool rendering decorator", () => {
           seeded: [], previousUnlockAttempted: true, previousWorktreePath: "/repo/old",
           previousKeepOutcome: "kept",
         },
-        "enter worktree(/repo/wt) on branch worktree-a; previous /repo/old kept; unlock attempted",
+        "enter worktree /repo/wt · branch worktree-a · previous /repo/old kept · unlock attempted",
       ],
       [
         { name: "a" },
@@ -1653,7 +1696,7 @@ describe("routine tool rendering decorator", () => {
           seeded: ["a", "b"], previousUnlockAttempted: true, previousWorktreePath: "/repo/old",
           previousKeepOutcome: "kept",
         },
-        "enter worktree(/repo/wt) on branch worktree-a; seeded 2 files; previous /repo/old kept; unlock attempted",
+        "enter worktree /repo/wt · branch worktree-a · seeded 2 files · previous /repo/old kept · unlock attempted",
       ],
       [
         { name: "a" },
@@ -1685,10 +1728,10 @@ describe("routine tool rendering decorator", () => {
     const base = { worktreePath: "/repo/wt", restorePath: "/repo", diagnostics: [] };
     const exitCases = [
       [{ outcome: "none", restorePath: "/repo" }, "exit worktree (no active worktree); already at /repo"],
-      [{ ...base, outcome: "kept", ok: true, removed: false, orphaned: false }, "exit worktree(/repo/wt) kept; restored /repo"],
+      [{ ...base, outcome: "kept", ok: true, removed: false, orphaned: false }, "exit worktree /repo/wt · kept · restored /repo"],
       [{ ...base, outcome: "keep-failed", ok: false, removed: false, orphaned: false, error: "unlock denied" }, "exit worktree(/repo/wt) keep failed: unlock denied; worktree state unknown; restored /repo"],
       [{ ...base, outcome: "keep-failed", ok: false, removed: false, orphaned: false }, "exit worktree(/repo/wt) keep failed; worktree state unknown; restored /repo"],
-      [{ ...base, outcome: "removed", ok: true, removed: true, orphaned: false }, "exit worktree(/repo/wt) removed; restored /repo"],
+      [{ ...base, outcome: "removed", ok: true, removed: true, orphaned: false }, "exit worktree /repo/wt · removed · restored /repo"],
       [{ ...base, outcome: "deferred-removal", ok: true, removed: false, orphaned: true }, "exit worktree(/repo/wt) removal deferred; restored /repo"],
       [{ ...base, outcome: "removal-failed", ok: false, removed: false, orphaned: false, error: "boom" }, "exit worktree(/repo/wt) removal failed: boom; worktree state unknown; restored /repo"],
       [{ ...base, outcome: "removal-failed", ok: false, removed: false, orphaned: false }, "exit worktree(/repo/wt) removal failed; worktree state unknown; restored /repo"],
@@ -1752,7 +1795,7 @@ describe("routine tool rendering decorator", () => {
       expect(plain).not.toMatch(/[\r\n]/u);
       expect(plain).not.toContain("pwn");
       if (width === 100) {
-        expect(plain).toContain("enter worktree(/界🙂/long");
+        expect(plain).toContain("enter worktree /界🙂/long");
         expect(plain).not.toContain("seeded 1 files");
         expect(plain).not.toContain("unlock attempted");
       }
@@ -1897,9 +1940,35 @@ describe("routine tool rendering decorator", () => {
     for (const [result, flags] of cases) {
       const output = renderResult(exit, { action: "remove" }, result, flags).join("\n");
       expect(output).toContain("VISIBLE WORKTREE RESULT");
-      expect(output).not.toBe("exit worktree(/repo/wt) removed; restored /repo");
+      expect(output).not.toBe("exit worktree /repo/wt · removed · restored /repo");
     }
     expect(reads).toBe(0);
+
+    const stoppedEnter = {
+      content: [{ type: "text", text: "WorktreeCreate hook stopped further model processing: create denied" }],
+      details: {
+        worktreePath: "/repo/wt", branch: "worktree-a", created: true, seeded: [],
+        previousUnlockAttempted: false, stoppedByHook: true, stopReason: "create denied",
+      },
+    };
+    const stoppedExit = {
+      content: [{ type: "text", text: "WorktreeRemove hook stopped further model processing: removal denied" }],
+      details: {
+        worktreePath: "/repo/wt", outcome: "removed", restorePath: "/repo",
+        ok: true, removed: true, orphaned: false, diagnostics: [],
+        stoppedByHook: true, stopReason: "removal denied",
+      },
+    };
+    const stoppedEnterBefore = structuredClone(stoppedEnter);
+    const stoppedExitBefore = structuredClone(stoppedExit);
+    const stoppedEnterRow = renderResult(enter, { name: "a" }, stoppedEnter).join("\n");
+    const stoppedExitRow = renderResult(exit, { action: "remove" }, stoppedExit).join("\n");
+    expect(stoppedEnterRow).toContain("create denied");
+    expect(stoppedEnterRow).not.toContain("enter worktree /repo/wt · branch");
+    expect(stoppedExitRow).toContain("removal denied");
+    expect(stoppedExitRow).not.toContain("exit worktree /repo/wt · removed");
+    expect(stoppedEnter).toEqual(stoppedEnterBefore);
+    expect(stoppedExit).toEqual(stoppedExitBefore);
 
     const enterDetails = {
       worktreePath: "/repo/wt", branch: "worktree-a", created: true,
@@ -1936,7 +2005,7 @@ describe("routine tool rendering decorator", () => {
     });
     const result = Object.freeze({ content, details });
     expect(renderResult(enter, args, result)).toEqual([
-      "enter worktree(/repo/frozen) on branch worktree-frozen",
+      "enter worktree /repo/frozen · branch worktree-frozen",
     ]);
     const exit = decorate({ name: "ExitWorktree" } as ToolDefinition);
     const exitDetails = noGet({
@@ -1946,7 +2015,7 @@ describe("routine tool rendering decorator", () => {
     expect(renderResult(exit, Object.freeze({ action: "keep" }), {
       content: Object.freeze([Object.freeze({ type: "text", text: "FROZEN EXIT CANONICAL" })]),
       details: exitDetails,
-    })).toEqual(["exit worktree(/repo/frozen) kept; restored /repo"]);
+    })).toEqual(["exit worktree /repo/frozen · kept · restored /repo"]);
     expect(propertyReads).toBe(0);
     expect(content[0]?.text).toBe("FROZEN CANONICAL");
 

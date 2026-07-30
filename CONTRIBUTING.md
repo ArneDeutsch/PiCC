@@ -113,10 +113,20 @@ git push origin HEAD --follow-tags
 ```
 
 `npm version` runs the complete verification gate before it updates `package.json` and
-`package-lock.json`, commits them, and creates the matching `v<version>` tag. The tag workflow uses
-one job: it packs once, verifies and tests that exact tarball, then hands the same bytes to the
-GitHub Release and npm publication steps. A manual workflow run stops after producing its temporary
-artifact; it does not publish a release.
+`package-lock.json`, commits them, and creates the matching `v<version>` tag. The workflow first
+packs once, verifies and tests that exact tarball, and uploads it as a short-lived workflow artifact.
+For a tag, a separate `npm-publish` environment job downloads and rehashes those same bytes before
+handing them to the GitHub Release and npm publication steps. A manual workflow run stops after the
+first job and retains the verified candidate artifact for seven days; it cannot access the npm
+credential or publish a release.
+
+The repository must define an `npm-publish` environment whose `NPM_TOKEN` exists only as an
+environment secret and whose deployment rule allows tags matching `v*`. On public repositories,
+configure the release owner as the required reviewer, allow that owner to review their own release,
+and disable administrator bypass. Keep an active `v*` tag ruleset that restricts creation, updates,
+deletion, and force-push bypass to repository administrators. The protected publication job waits
+for environment approval before GitHub makes `NPM_TOKEN` available; inspect the tag and commit, then
+approve that deployment.
 
 If a tagged workflow fails after either publication step, inspect all three identities before doing
 anything else: the verified SHA-256 in the workflow log, the asset on the GitHub Release for the tag,

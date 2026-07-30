@@ -1,4 +1,9 @@
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_LINES,
+  formatSize,
+  type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
   adaptedEditPreviewError,
@@ -383,6 +388,74 @@ function readContinuationSummary(args: Data, result: unknown): ReadContinuation 
   return { remaining, nextOffset };
 }
 
+function selectedLineSlots(value: string): number {
+  return value.split("\n").length;
+}
+
+function byteLimitedReadCandidate(result: unknown): boolean {
+  const source = data(result);
+  if (!source) return false;
+  try {
+    const details = Object.getOwnPropertyDescriptor(source, "details");
+    if (!details) return false;
+    if (!("value" in details)) return true;
+    const value = data(details.value);
+    return Boolean(value && Object.getOwnPropertyDescriptor(value, "truncation"));
+  } catch { return false; }
+}
+
+function byteLimitedReadContinuation(args: Data, result: unknown): ReadContinuation | undefined {
+  const envelope = ownDataRecord(result, ["content", "details", "isError"]);
+  if (!envelope || (envelope.isError !== undefined && envelope.isError !== false)) return undefined;
+  const item = singleOwnDataArray(envelope.content);
+  const block = ownDataRecord(item, ["type", "text"]);
+  if (!block || Object.keys(block).length !== 2 || block.type !== "text" ||
+    typeof block.text !== "string" || block.text.length > MAX_TEXT) return undefined;
+  const details = ownDataRecord(envelope.details, ["truncation"]);
+  if (!details || Object.keys(details).length !== 1) return undefined;
+  const truncation = ownDataRecord(details.truncation, TRUNCATION_KEYS);
+  if (!truncation || Object.keys(truncation).length !== TRUNCATION_KEYS.length ||
+    typeof truncation.content !== "string" || truncation.content.length > MAX_TEXT ||
+    truncation.truncated !== true || truncation.truncatedBy !== "bytes" ||
+    truncation.lastLinePartial !== false || truncation.firstLineExceedsLimit !== false) return undefined;
+  for (const key of ["totalLines", "totalBytes", "outputLines", "outputBytes", "maxLines", "maxBytes"] as const) {
+    if (!Number.isSafeInteger(truncation[key]) || (truncation[key] as number) < 0) return undefined;
+  }
+  const totalLines = truncation.totalLines as number;
+  const totalBytes = truncation.totalBytes as number;
+  const outputLines = truncation.outputLines as number;
+  const outputBytes = truncation.outputBytes as number;
+  if (truncation.maxLines !== DEFAULT_MAX_LINES || truncation.maxBytes !== DEFAULT_MAX_BYTES ||
+    totalLines <= outputLines || totalBytes <= DEFAULT_MAX_BYTES || outputLines < 1 ||
+    outputLines >= DEFAULT_MAX_LINES || outputBytes > DEFAULT_MAX_BYTES ||
+    selectedLineSlots(truncation.content as string) !== outputLines ||
+    Buffer.byteLength(truncation.content as string, "utf8") !== outputBytes) return undefined;
+
+  const notice = new RegExp(
+    `\\n\\n\\[Showing lines ([1-9]\\d*)-([1-9]\\d*) of ([1-9]\\d*) \\(${formatSize(DEFAULT_MAX_BYTES).replace(".", "\\.")} limit\\)\\. Use offset=([1-9]\\d*) to continue\\.\\]$`,
+    "u",
+  ).exec(block.text);
+  if (!notice) return undefined;
+  const displayedStart = Number(notice[1]);
+  const displayedEnd = Number(notice[2]);
+  const fullFileLines = Number(notice[3]);
+  const nextOffset = Number(notice[4]);
+  const start = typeof args.offset === "number" ? args.offset : 1;
+  if (![displayedStart, displayedEnd, fullFileLines, nextOffset].every(Number.isSafeInteger) ||
+    displayedStart !== start || start > Number.MAX_SAFE_INTEGER - (outputLines - 1) ||
+    displayedEnd !== start + outputLines - 1 || displayedEnd >= Number.MAX_SAFE_INTEGER ||
+    nextOffset !== displayedEnd + 1 || fullFileLines <= displayedEnd) return undefined;
+  const availableSlots = fullFileLines - start + 1;
+  const selectedSlots = Math.min(
+    typeof args.limit === "number" ? args.limit : Number.MAX_SAFE_INTEGER,
+    availableSlots,
+  );
+  const selectedTotalMatches = totalLines === selectedSlots || totalLines === selectedSlots - 1;
+  if (selectedSlots <= outputLines || !selectedTotalMatches ||
+    block.text.slice(0, notice.index) !== truncation.content) return undefined;
+  return { remaining: fullFileLines - displayedEnd, nextOffset };
+}
+
 function recognize(toolName: "write" | "edit", args: Data, result: unknown): Summary | undefined {
   const envelope = data(result);
   if (!canonicalEnvelope(result) || !envelope || (envelope.isError !== undefined && envelope.isError !== false)) return undefined;
@@ -602,6 +675,28 @@ function boundedProbe(text: string, operations: DisplayOperationAuthority): stri
   return `${operations.slice(text, 0, EVIDENCE_PREFIX)}\n…\n${operations.slice(text, -EVIDENCE_TAIL)}`;
 }
 
+function ownDataValue(value: unknown, key: PropertyKey): unknown | undefined {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  } catch { return undefined; }
+}
+
+function malformedByteReadEvidence(
+  result: unknown,
+  operations: DisplayOperationAuthority,
+): string | undefined {
+  const content = ownDataValue(result, "content");
+  if (!Array.isArray(content) || ownDataValue(content, "length") !== 1) return undefined;
+  const item = ownDataValue(content, "0");
+  if (ownDataValue(item, "type") !== "text") return undefined;
+  const text = ownDataValue(item, "text");
+  if (typeof text !== "string" || text.length > MAX_TEXT) return undefined;
+  const evidence = operations.sanitize(text, MAX_TEXT);
+  return evidence.trim().length > 0 ? evidence : undefined;
+}
+
 function exceptionalEvidence(
   result: unknown,
   fallback: string,
@@ -710,10 +805,12 @@ function ordinaryCallOwnedResult(
     booleanField(context, "isError") !== false) return undefined;
   if (toolName === "bash") return exactBashSuccess(result);
   const snapshot = exactReadTextResult(result);
-  if (!snapshot) return undefined;
-  const continuation = readContinuationSummary(args, result);
+  const requestedContinuation = readContinuationSummary(args, result);
+  const continuation = requestedContinuation ??
+    (byteLimitedReadCandidate(result) ? byteLimitedReadContinuation(args, result) : undefined);
+  if (!snapshot && !continuation) return undefined;
   if (!continuation && status?.startsWith("[") === true) return undefined;
-  return { continuation, retained: snapshot.text !== "", truncated: false };
+  return { continuation, retained: snapshot?.text !== "" || continuation !== undefined, truncated: false };
 }
 
 function collapsedExceptionalEvidence(
@@ -857,6 +954,35 @@ function withCallOwnedRendering<T extends ToolDefinition>(
       } catch { return messageComponent(exceptionalEvidence(resultValue, "Renderer failed", operations), theme); }
     }
 
+    const malformedByteRead = toolName === "read" && !partial &&
+      booleanField(context, "isError") === false && byteLimitedReadCandidate(resultValue) &&
+      byteLimitedReadContinuation(args, resultValue) === undefined;
+    if (malformedByteRead) {
+      current.nativeResult = undefined;
+      current.resultFallback = undefined;
+      current.callExpanded = false;
+      const evidence = malformedByteReadEvidence(resultValue, operations);
+      const hint = evidence === undefined ? undefined : bindingHint();
+      const fields: CallOwnedFields = {
+        ...callOwnedFields(toolName, args, current.displayPath, { retained: hint !== undefined, truncated: false }, hint),
+        required: [{ text: "unfamiliar result", tone: "warning" }],
+      };
+      const slot = current.callSlot ??= mutableCallSlot(fields, theme);
+      slot.concise(fields, theme);
+      setToolRowOutcome(context, "failure");
+      if (evidence === undefined) return evidenceComponent("Unfamiliar result", theme, operations);
+      if (!requestedExpanded && hint !== undefined) return EMPTY_COMPONENT;
+      const safeResult = { content: [{ type: "text", text: evidence }], details: undefined, isError: true };
+      try {
+        current.nativeResult = nativeResult(safeResult, { expanded: true, isPartial: false }, theme,
+          nativeContext(context, args, current.nativeResult, true));
+        return current.nativeResult;
+      } catch {
+        current.nativeResult = undefined;
+        return evidenceComponent(evidence, theme, operations);
+      }
+    }
+
     let status = toolName === "read" || booleanField(context, "isError") === true
       ? recognizedStatus(toolName, resultValue, operations)
       : undefined;
@@ -927,7 +1053,7 @@ function withCallOwnedRendering<T extends ToolDefinition>(
           current.resultFallback = status ?? "Renderer failed";
           return evidenceComponent(current.resultFallback, theme, operations);
         }
-      }
+      } else if (status !== undefined) return evidenceComponent(status, theme, operations);
       return EMPTY_COMPONENT;
     }
     if (successfulImage) {
