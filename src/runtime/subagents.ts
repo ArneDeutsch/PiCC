@@ -2,6 +2,11 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { Type } from "typebox";
+import {
+  isContextOverflow,
+  isRetryableAssistantError,
+  type AssistantMessage,
+} from "@earendil-works/pi-ai";
 import type {
   ClaudeAgent,
   Diagnostic,
@@ -73,6 +78,11 @@ import {
   newSkillActivationState,
   type SkillActivationState,
 } from "./skill-activation.js";
+import {
+  formatSubagentRecoveryGuidance,
+  SubagentRecoveryProgress,
+  type SubagentRecoveryDisposition,
+} from "./subagent-recovery.js";
 
 /**
  * Subagent dispatch runtime: spawns fresh-context Pi sessions per dispatch,
@@ -442,6 +452,8 @@ export interface DispatchResult {
   usage?: DispatchUsage;
   /** True when exhaustion retained this exact live guarded session for recovery/stop. */
   checkpointPaused?: boolean;
+  /** State-aware recovery advice for an ordinary transient-category terminal failure. */
+  recoveryDisposition?: SubagentRecoveryDisposition;
   /** The single error channel: present iff `outcome !== "completed"`, names the cause. */
   error?: string;
   diagnostics: Diagnostic[];
@@ -1851,6 +1863,7 @@ export class SubagentRuntime {
     let stopFired = false;
     let abortListener: (() => void) | undefined;
     let progressUnsub: (() => void) | undefined;
+    let recoveryUnsub: (() => void) | undefined;
     // Usage accounting: capture the session's aggregate stats AFTER the
     // last prompt() and BEFORE each result is built — the result literals live
     // in this try block, so a finally-only capture would have nowhere to attach
@@ -2339,6 +2352,16 @@ export class SubagentRuntime {
       const created = await sdk.createAgentSession(sessionOptions);
       session = created.session;
       checkpoint.attach(session);
+      const recoveryProgress = new SubagentRecoveryProgress(session.messages, !isFork);
+      if (typeof session.subscribe === "function") {
+        try {
+          recoveryUnsub = session.subscribe((event: unknown) => recoveryProgress.consume(event));
+          recoveryProgress.markObservationAvailable();
+        } catch {
+          recoveryProgress.markObservationIncomplete();
+        }
+      }
+      const actualResumable = !overrideDispatch && !isFork && resumable;
       if (thinking && session.setThinkingLevel) session.setThinkingLevel(thinking);
 
       // Dispatch registry: record this live run so SendMessage can steer it
@@ -2363,7 +2386,7 @@ export class SubagentRuntime {
         // conversation at fork time cannot be safely re-derived (the local
         // `resumable` is already forced false in the fork branch; this predicate
         // keeps the registry record honest even if that ever changes).
-        resumable: overrideDispatch || isFork ? false : resumable,
+        resumable: actualResumable,
         oneShot,
         session: {
           steer: (text: string) => checkpoint.steer(text),
@@ -2448,20 +2471,37 @@ export class SubagentRuntime {
           // Best-effort partial output: whatever assistant text exists post-run
           // (compaction inside prompt() may have rewritten earlier turns).
           settledFinalText = assistantTextSoFar(live);
+          recoveryProgress.observeMessages(live.messages);
+          let contextWindow: number | undefined;
+          try {
+            contextWindow = live.getContextUsage?.()?.contextWindow;
+          } catch {
+            contextWindow = undefined;
+          }
+          const assistant = last as unknown as AssistantMessage;
+          const transientCategory =
+            !isContextOverflow(assistant, contextWindow) && isRetryableAssistantError(assistant);
+          const progressed = recoveryProgress.hasProgress();
+          const recoveryDisposition: SubagentRecoveryDisposition | undefined = transientCategory
+            ? progressed
+              ? actualResumable
+                ? "resume-preferred"
+                : "progressed-non-resumable"
+              : "fresh-dispatch-preferred"
+            : undefined;
           return {
             ok: false,
             outcome: "failed",
             finalMessage: settledFinalText,
             agentId,
             transcriptPath,
-            // A failed-but-persisted agent stays resumable: the coordinator may
-            // follow up / retry it with its prior context.
-            resumable,
+            resumable: actualResumable,
             agentName: agent.name,
             worktreePath,
             isFork,
             // Partial usage of the failed run: "what did the failure cost me".
             usage: captureUsage(),
+            recoveryDisposition,
             error: `Agent terminated early due to an API error: ${capErrorText(last.errorMessage ?? "unknown error")}`,
             diagnostics,
           };
@@ -2501,6 +2541,7 @@ export class SubagentRuntime {
             try { opts.abortSignal.removeEventListener("abort", abortListener); } catch { /* floor */ }
           }
           try { progressUnsub?.(); } catch { /* presentation only */ }
+          try { recoveryUnsub?.(); } catch { /* classification only */ }
           // Session statistics must be sampled while the public session is live.
           captureUsage();
           try { session?.dispose(); } catch { /* disposal cannot mask recovery */ }
@@ -2701,6 +2742,11 @@ export class SubagentRuntime {
           // unsubscribe must not mask results
         }
         try {
+          recoveryUnsub?.();
+        } catch {
+          // unsubscribe must not mask results
+        }
+        try {
           session?.dispose();
         } catch {
           // dispose failures must not mask results
@@ -2797,9 +2843,11 @@ const DEFAULT_CUT_OFF_NOTE = "The run ended on an API error before completing.";
 /**
  * The user-facing presentation of a {@link DispatchResult}. A
  * `result` is returned/folded into content text (carrying `cutOff`); a
- * `failure` is thrown or folded into an error channel. The `text`/`message`
- * already carry any resume trailer and cut-off frame — the consumer owns only
- * the surrounding `details` (identity/usage/outcome/error) and the actual
+ * `failure` is thrown or folded into an error channel. Successful results may
+ * carry an identity trailer; failed results may carry disposition-dependent
+ * recovery guidance. For a partial failure, trusted guidance follows the
+ * untrusted partial-output/cause cut-off frame. The consumer owns only the
+ * surrounding `details` (identity/usage/outcome/error) and the actual
  * throw-vs-return plumbing.
  */
 export type DispatchPresentation =
@@ -2816,9 +2864,8 @@ export type DispatchPresentation =
  * arrives pre-capped from dispatch construction, so re-capping would double-cap
  * and could corrupt the verbatim channel.
  *
- * `allowResumeTrailer` (default `true`) gates the resume trailer on top of
- * `result.resumable`; passing `false` suppresses every trailer regardless of
- * resumability (forks are non-resumable — the fork path passes `false`).
+ * `allowResumeTrailer` (default `true`) controls only successful-result identity
+ * trailers. Passing `false` preserves completed output bytes without a trailer.
  */
 export function presentDispatchResult(
   result: DispatchResult,
@@ -2826,33 +2873,39 @@ export function presentDispatchResult(
 ): DispatchPresentation {
   const withTrailer = result.resumable && opts?.allowResumeTrailer !== false;
   const finalMessage = result.finalMessage ?? "";
+  const agentId = isAgentId(result.agentId) ? result.agentId : undefined;
+  const guidanceInput = result.recoveryDisposition === "resume-preferred"
+    ? result.resumable
+      ? { disposition: result.recoveryDisposition, agentId, resumable: true } as const
+      : undefined
+    : result.recoveryDisposition === "progressed-non-resumable"
+      ? !result.resumable
+        ? { disposition: result.recoveryDisposition, agentId, resumable: false } as const
+        : undefined
+      : result.recoveryDisposition === "fresh-dispatch-preferred"
+        ? { disposition: result.recoveryDisposition, agentId, resumable: result.resumable } as const
+        : undefined;
+  const recoveryGuidance = guidanceInput
+    ? formatSubagentRecoveryGuidance(guidanceInput)
+    : undefined;
 
-  // failed WITH partial output → SUCCESS-shaped result: the partial output plus
-  // a clearly separated cut-off note naming the error. A resumable agent's ID
-  // rides in the same frame (single `\n`, non-"completed" wording).
+  // Failed partial output keeps its existing provider-output/cause cut-off frame
+  // intact. Trusted PiCC recovery framing follows outside that untrusted channel.
   if (result.outcome === "failed" && finalMessage.trim()) {
     const cut = appendCutOffNote(finalMessage, result.error ?? DEFAULT_CUT_OFF_NOTE);
     return {
       kind: "result",
-      text: withTrailer
-        ? `${cut}\n${agentTrailerLine(result.agentId, { completed: false })}`
-        : cut,
+      text: recoveryGuidance ? `${cut}\n${recoveryGuidance}` : cut,
       cutOff: true,
     };
   }
 
-  // failed with no partial output, or aborted → surface as a failure. A
-  // resumable FAILED-with-no-partial run still delivers its agent ID; aborted
-  // and non-resumable failures carry no trailer (aborted's ternary requires
-  // outcome === "failed").
+  // Failed with no partial output, or aborted, stays in the failure channel.
   if (!result.ok) {
     const base = result.error ?? "subagent failed";
     return {
       kind: "failure",
-      message:
-        result.outcome === "failed" && withTrailer
-          ? `${base}${agentTrailerFrame(result.agentId, { completed: false })}`
-          : base,
+      message: recoveryGuidance ? `${base}\n\n${recoveryGuidance}` : base,
     };
   }
 
@@ -3158,8 +3211,9 @@ export function createAgentToolDefinition(
         durationMs >= 0
           ? { durationMs, settledAt }
           : {};
-      // Structured copy of the identity fields for every content-returning path
-      // (details is logs/UI-only — the model never sees it, hence the trailer).
+      // Structured identity fields for every content-returning path. Details are
+      // logs/UI-only; model-visible identity is handled separately by successful
+      // trailers or disposition-dependent failed recovery guidance.
       const identityDetails = {
         agentId: result.agentId,
         transcriptPath: result.transcriptPath,
@@ -3173,18 +3227,20 @@ export function createAgentToolDefinition(
         // completion clock keeps duration and settlement instant in agreement.
         ...timing,
       } satisfies SubagentRenderDetails;
-      // Claude 2.1.200 outcome→presentation mapping: the text, cut-off frame,
-      // resume trailer, and throw-vs-return decision all live in the shared,
-      // pure `presentDispatchResult` helper — the fork path consumes the same
-      // helper for byte-identical framing. `details`
+      // Claude 2.1.200 outcome→presentation mapping: successful identity
+      // trailers, disposition-dependent failed recovery guidance, cut-off
+      // framing, and throw-vs-return decisions live in the shared, pure
+      // `presentDispatchResult` helper. Trusted guidance follows outside any
+      // untrusted partial-output/cause frame. The fork path consumes the same
+      // helper for byte-identical framing; `details`
       // (identity/usage/outcome/error/note) stays this consumer's job.
       const presentation = presentDispatchResult(result);
       if (presentation.kind === "failure") {
         // Failed with no output ("Agent terminated early due to an API error: ...",
         // or a pre-start failure naming its cause) and aborted runs (distinct
         // wording naming the abort) both surface on the isError channel.
-        // A resumable FAILED-with-no-partial run still delivers its agent ID;
-        // aborted and non-resumable failures carry no trailer.
+        // Failed recovery guidance is disposition-dependent; stable identity and
+        // actual resumability remain separate facts when guidance is present.
         throw new Error(presentation.message);
       }
       // A `kind:"result"` with outcome "failed" is necessarily the cut-off case:
@@ -3192,10 +3248,9 @@ export function createAgentToolDefinition(
       // and failed-no-output become `kind:"failure"` above). This mirrors the
       // helper's own branch guard — keep the two in sync if that guard changes.
       if (result.outcome === "failed") {
-        // failed WITH partial output → success-shaped cut-off result: the partial
-        // output plus a clearly separated cut-off note. A resumable agent's ID
-        // rides in the same delimited frame: the coordinator can follow up on
-        // the cut-off run via SendMessage.
+        // failed WITH partial output → success-shaped cut-off result: untrusted
+        // partial output and cause stay in the delimited frame, while any trusted,
+        // disposition-dependent recovery guidance follows outside it.
         return {
           content: [{ type: "text", text: presentation.text }],
           details: {
