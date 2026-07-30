@@ -452,6 +452,8 @@ export interface DispatchResult {
   usage?: DispatchUsage;
   /** True when exhaustion retained this exact live guarded session for recovery/stop. */
   checkpointPaused?: boolean;
+  /** True only for an ordinary terminal assistant error after the session ran. */
+  terminalAssistantError?: true;
   /** State-aware recovery advice for an ordinary transient-category terminal failure. */
   recoveryDisposition?: SubagentRecoveryDisposition;
   /** The single error channel: present iff `outcome !== "completed"`, names the cause. */
@@ -2501,6 +2503,7 @@ export class SubagentRuntime {
             isFork,
             // Partial usage of the failed run: "what did the failure cost me".
             usage: captureUsage(),
+            terminalAssistantError: true,
             recoveryDisposition,
             error: `Agent terminated early due to an API error: ${capErrorText(last.errorMessage ?? "unknown error")}`,
             diagnostics,
@@ -2888,6 +2891,10 @@ export function presentDispatchResult(
   const recoveryGuidance = guidanceInput
     ? formatSubagentRecoveryGuidance(guidanceInput)
     : undefined;
+  const neutralIdentity = result.outcome === "failed" && result.terminalAssistantError === true &&
+      result.resumable && agentId && !recoveryGuidance
+    ? `Agent ID: ${agentId}.`
+    : undefined;
 
   // Failed partial output keeps its existing provider-output/cause cut-off frame
   // intact. Trusted PiCC recovery framing follows outside that untrusted channel.
@@ -2895,7 +2902,11 @@ export function presentDispatchResult(
     const cut = appendCutOffNote(finalMessage, result.error ?? DEFAULT_CUT_OFF_NOTE);
     return {
       kind: "result",
-      text: recoveryGuidance ? `${cut}\n${recoveryGuidance}` : cut,
+      text: recoveryGuidance
+        ? `${cut}\n${recoveryGuidance}`
+        : neutralIdentity
+          ? `${cut}\n${neutralIdentity}`
+          : cut,
       cutOff: true,
     };
   }
@@ -2905,7 +2916,11 @@ export function presentDispatchResult(
     const base = result.error ?? "subagent failed";
     return {
       kind: "failure",
-      message: recoveryGuidance ? `${base}\n\n${recoveryGuidance}` : base,
+      message: recoveryGuidance
+        ? `${base}\n\n${recoveryGuidance}`
+        : neutralIdentity
+          ? `${base}\n\n${neutralIdentity}`
+          : base,
     };
   }
 
@@ -3213,7 +3228,7 @@ export function createAgentToolDefinition(
           : {};
       // Structured identity fields for every content-returning path. Details are
       // logs/UI-only; model-visible identity is handled separately by successful
-      // trailers or disposition-dependent failed recovery guidance.
+      // trailers, disposition-dependent guidance, or neutral ordinary-failure metadata.
       const identityDetails = {
         agentId: result.agentId,
         transcriptPath: result.transcriptPath,
@@ -3228,8 +3243,8 @@ export function createAgentToolDefinition(
         ...timing,
       } satisfies SubagentRenderDetails;
       // Claude 2.1.200 outcome→presentation mapping: successful identity
-      // trailers, disposition-dependent failed recovery guidance, cut-off
-      // framing, and throw-vs-return decisions live in the shared, pure
+      // trailers, failed guidance or neutral identity metadata, cut-off framing,
+      // and throw-vs-return decisions live in the shared, pure
       // `presentDispatchResult` helper. Trusted guidance follows outside any
       // untrusted partial-output/cause frame. The fork path consumes the same
       // helper for byte-identical framing; `details`
@@ -3239,8 +3254,8 @@ export function createAgentToolDefinition(
         // Failed with no output ("Agent terminated early due to an API error: ...",
         // or a pre-start failure naming its cause) and aborted runs (distinct
         // wording naming the abort) both surface on the isError channel.
-        // Failed recovery guidance is disposition-dependent; stable identity and
-        // actual resumability remain separate facts when guidance is present.
+        // Failed recovery guidance is disposition-dependent; a cause-only ordinary
+        // error may expose neutral stable identity without turning it into advice.
         throw new Error(presentation.message);
       }
       // A `kind:"result"` with outcome "failed" is necessarily the cut-off case:

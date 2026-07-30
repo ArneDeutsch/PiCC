@@ -467,17 +467,20 @@ These are the choices where "close enough" breaks real projects.
 - **Subagent error contract.** Every dispatch is classified into exactly one outcome, and the
   classification — never a normal-looking success — is what reaches the coordinator:
   - **completed** — the run finished; its verbatim final message is returned.
-  - **failed** — the run ended on a terminal API or session error. The tool reports a **loud
-    failure** with capped, sanitized provider/API cause text that is treated as untrusted input and
-    kept structurally separate from PiCC-authored guidance. An empty success here is the exact
-    failure mode that lets a coordinator commit under-reviewed work believing a subagent approved it.
+  - **failed** — the dispatch or run ended through the loud failure channel. Ordinary terminal
+    assistant errors expose capped, sanitized provider/API cause text as untrusted input and may
+    carry a structured disposition rendered by PiCC's fixed formatter. Identity, setup, depth,
+    policy, hook, checkpoint, and other specialized failures instead retain their cause-specific
+    framing and receive no generic disposition. An empty success here is the exact failure mode that lets a
+    coordinator commit under-reviewed work believing a subagent approved it.
   - **aborted** — the run was stopped on purpose (Esc, `TaskStop`); distinct from a failure. A signal
     wins on every settle path, and a deliberately stopped background result discards its output.
   - **Partial output is preserved,** delivered inside an explicit cut-off frame rather than dropped;
     a turn-cap truncation also pushes a warning diagnostic, never silent.
-  - The contract holds on the foreground, background-settlement, and `TaskOutput` paths through a
-    shared structured disposition and fixed guidance formatter; each surface retains its own result
-    envelope. A background failure is never shown as completed.
+  - For ordinary terminal assistant errors carrying a disposition, the contract holds on the
+    foreground, background-settlement, and `TaskOutput` paths through the shared structured
+    disposition and fixed guidance formatter; each surface retains its own result envelope. A
+    background failure is never shown as completed.
   - Pi owns retry execution, budget, and backoff. After those retries settle, PiCC derives guidance
     only from Pi's transient-error classifier and lifecycle observation. Complete observation can
     prove no successful assistant response, retained model/tool-call content, or started tool

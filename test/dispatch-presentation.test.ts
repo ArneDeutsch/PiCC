@@ -214,12 +214,42 @@ describe("presentDispatchResult — failed WITHOUT partial output", () => {
     expect(f.message).not.toMatch(/[\r\n]/);
   });
 
-  it("resumable without a disposition has no generic recovery recommendation", () => {
+  it("ordinary resumable failure without a disposition exposes only neutral stable identity after the cause", () => {
     const f = asFailure(
-      presentDispatchResult(makeResult({ outcome: "failed", error: CAPPED_ERROR, resumable: true })),
+      presentDispatchResult(makeResult({
+        outcome: "failed",
+        error: CAPPED_ERROR,
+        resumable: true,
+        terminalAssistantError: true,
+      })),
     );
+    expect(f.message).toBe(`${CAPPED_ERROR}\n\nAgent ID: ${AGENT_ID}.`);
+    expect(f.message).not.toMatch(/SendMessage|resume|replacement|recommend/iu);
+  });
+
+  it("ordinary partial failure keeps content and cause before neutral stable identity", () => {
+    const res = asResult(presentDispatchResult(makeResult({
+      outcome: "failed",
+      finalMessage: "half a review",
+      error: CAPPED_ERROR,
+      resumable: true,
+      terminalAssistantError: true,
+    })));
+    const cut = appendCutOffNote("half a review", CAPPED_ERROR);
+    expect(res.text).toBe(`${cut}\nAgent ID: ${AGENT_ID}.`);
+    expect(res.text).not.toMatch(/SendMessage|resume|replacement|recommend/iu);
+  });
+
+  it("invalid identity is not exposed on an ordinary cause-only failure", () => {
+    const f = asFailure(presentDispatchResult(makeResult({
+      outcome: "failed",
+      error: CAPPED_ERROR,
+      agentId: "agent-invalid\nleak",
+      resumable: true,
+      terminalAssistantError: true,
+    })));
     expect(f.message).toBe(CAPPED_ERROR);
-    expect(f.message).not.toContain("SendMessage");
+    expect(f.message).not.toContain("agent-invalid");
   });
 
   it("fresh-dispatch-preferred recommends explicit replacement while reporting separate resumability", () => {
@@ -269,13 +299,14 @@ describe("presentDispatchResult — failed WITHOUT partial output", () => {
     ["setup", { error: "session setup failed" }],
     ["policy", { error: "dispatch denied by policy" }],
     ["hook", { error: "SubagentStart hook blocked dispatch" }],
+    ["specialized resumable shape", { error: "specialized bounded cause", resumable: true }],
   ])("specialized %s failure stays without generic disposition", (_name, overrides) => {
     const rendered = asFailure(presentDispatchResult(makeResult(overrides)));
     expect(rendered.message).not.toContain("Recovery guidance");
     expect(rendered.message).not.toContain("fresh replacement agent");
   });
 
-  it("resumable + allowResumeTrailer:false → bare failure message, no trailer", () => {
+  it("resumable + allowResumeTrailer:false → bare specialized failure message, no trailer", () => {
     const f = asFailure(
       presentDispatchResult(
         makeResult({ outcome: "failed", error: CAPPED_ERROR, resumable: true }),

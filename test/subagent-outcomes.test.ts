@@ -71,6 +71,8 @@ describe("dispatch outcome classification", () => {
     ["retained text", [{ role: "assistant", content: [{ type: "text", text: "finding" }], stopReason: "toolUse" }]],
     ["successful empty assistant response", [{ role: "assistant", content: [], stopReason: "stop" }]],
     ["text-free tool-call content", [{ role: "assistant", content: [{ type: "toolCall", id: "c1", name: "Write", arguments: {} }], stopReason: "toolUse" }]],
+    ["ordinary thinking", [{ role: "assistant", content: [{ type: "thinking", thinking: "analysis" }], stopReason: "stop" }]],
+    ["opaque signed/redacted thinking", [{ role: "assistant", content: [{ type: "thinking", thinking: "", thinkingSignature: "opaque", redacted: true }], stopReason: "stop" }]],
   ])("transient failure after %s prefers resume when persisted", async (_name, prior) => {
     const h = fakeSdk({
       fakePersistedSessions: true,
@@ -132,6 +134,37 @@ describe("dispatch outcome classification", () => {
     });
     expect(resumed.recoveryDisposition).toBe("resume-preferred");
     expect(resumed.finalMessage).toContain("retained first-run findings");
+  });
+
+  it("an immediate failed resume counts a retained tool result as progress", async () => {
+    const transcriptPath = "/sessions/prior-tool-result.jsonl";
+    const h = fakeSdk({
+      fakePersistedSessions: true,
+      replies: [{ stopReason: "error", errorMessage: "503 unavailable" }],
+    });
+    h.sessionBranches().set(transcriptPath, [{
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolCallId: "call-1",
+        toolName: "Write",
+        content: [{ type: "text", text: "permission denied" }],
+        isError: true,
+        timestamp: 1,
+      },
+    }]);
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      getMainSessionFile: () => "/sessions/main.jsonl",
+    });
+    const resumed = await runtime.dispatch({
+      subagentType: "reviewer",
+      prompt: "continue",
+      depth: 1,
+      agentId: "agent-0123456789ab",
+      resume: { transcriptPath, cwd: process.cwd() },
+    });
+    expect(resumed.resumable).toBe(true);
+    expect(resumed.recoveryDisposition).toBe("resume-preferred");
   });
 
   it("a started tool counts before its result and warns when the agent is non-resumable", async () => {
@@ -205,6 +238,20 @@ describe("dispatch outcome classification", () => {
           stopReason: "stop",
         },
       },
+    }],
+    ["ordinary thinking", {
+      type: "message_update",
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "analysis" }], stopReason: "stop" },
+      assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "analysis" },
+    }],
+    ["opaque signed/redacted thinking", {
+      type: "message_update",
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "", thinkingSignature: "opaque", redacted: true }],
+        stopReason: "stop",
+      },
+      assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "" },
     }],
     ["a successful empty message_end", {
       type: "message_end",
@@ -304,6 +351,28 @@ describe("dispatch outcome classification", () => {
     const runtime = makeSubagentRuntime([makeAgent()], h.sdk);
     const result = await runtime.dispatch({ subagentType: "reviewer", prompt: "p", depth: 1 });
     expect(result.recoveryDisposition).toBeUndefined();
+  });
+
+  it("foreground Agent keeps neutral identity model-visible for a resumable no-disposition failure", async () => {
+    const h = fakeSdk({
+      fakePersistedSessions: true,
+      replies: [{ stopReason: "error", errorMessage: "quota exceeded" }],
+    });
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      getMainSessionFile: () => "/sessions/main.jsonl",
+    });
+    const tool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: new BackgroundTaskRegistry(),
+    }) as unknown as ToolLike;
+    const error = await tool.execute("t", {
+      subagent_type: "reviewer",
+      prompt: "p",
+      run_in_background: false,
+    }).catch((cause: Error) => cause);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/quota exceeded[\s\S]*Agent ID: agent-[0-9a-f]{12}\./u);
+    expect((error as Error).message).not.toMatch(/SendMessage|resume|replacement|recommend/iu);
   });
 
   it("error stops do NOT trigger the retry-on-empty (previously masked the failure and doubled latency)", async () => {
@@ -790,6 +859,33 @@ describe("background dispatch failure mapping (through dispatch — not registry
     expect(out.content[0]!.text).toMatch(API_DEATH);
     expect(out.content[0]!.text).toContain("429 too many requests");
     expect(out.content[0]!.text.trim()).not.toBe(""); // demonstrably no empty success
+  });
+
+  it("cause-only background failure does not gain the foreground neutral identity line", async () => {
+    const h = fakeSdk({
+      fakePersistedSessions: true,
+      replies: [{ stopReason: "error", errorMessage: "quota exceeded" }],
+    });
+    const registry = new BackgroundTaskRegistry();
+    const runtime = makeSubagentRuntime([makeAgent()], h.sdk, {
+      getMainSessionFile: () => "/sessions/main.jsonl",
+    });
+    const tool = createAgentToolDefinition(runtime, {
+      depth: 0,
+      backgroundTasks: registry,
+    }) as unknown as ToolLike;
+    const started = await tool.execute("t", {
+      subagent_type: "reviewer",
+      prompt: "p",
+      run_in_background: true,
+    });
+    const taskId = String(started.details.taskId);
+    await registry.wait(taskId);
+    const out = await (createTaskOutputTool(registry) as unknown as ToolLike).execute("t2", {
+      task_id: taskId,
+    });
+    expect(out.content[0]!.text).toContain("quota exceeded");
+    expect(out.content[0]!.text).not.toContain("Agent ID:");
   });
 
   it("TaskOutput surfaces partial output alongside the failure", async () => {

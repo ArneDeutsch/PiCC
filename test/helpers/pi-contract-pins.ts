@@ -12,6 +12,8 @@ import {
   type RetryCallbacks,
   type RetryPolicy,
   type StopReason,
+  type ThinkingContent,
+  type ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import type {
   AgentSession,
@@ -162,6 +164,84 @@ export const messageUpdate: Extract<AgentSessionEvent, { type: "message_update" 
     },
   },
 };
+export const ordinaryThinking: ThinkingContent = {
+  type: "thinking",
+  thinking: "retained reasoning",
+};
+export const opaqueThinking: ThinkingContent = {
+  type: "thinking",
+  thinking: "",
+  thinkingSignature: "opaque-provider-payload",
+  redacted: true,
+};
+export const ordinaryThinkingAssistant: AssistantMessage = {
+  role: "assistant",
+  content: [ordinaryThinking],
+  api: "openai-completions",
+  provider: "contract",
+  model: "contract-model",
+  usage: {
+    input: 0,
+    output: 1,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 1,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  },
+  stopReason: "stop",
+  timestamp: 1,
+};
+export const thinkingMessageUpdate: Extract<AgentSessionEvent, { type: "message_update" }> = {
+  type: "message_update",
+  message: {
+    role: "assistant",
+    content: [opaqueThinking],
+    api: "openai-completions",
+    provider: "contract",
+    model: "contract-model",
+    usage: {
+      input: 0,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 1,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: 1,
+  },
+  assistantMessageEvent: {
+    type: "thinking_end",
+    contentIndex: 0,
+    content: "",
+    partial: {
+      role: "assistant",
+      content: [opaqueThinking],
+      api: "openai-completions",
+      provider: "contract",
+      model: "contract-model",
+      usage: {
+        input: 0,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 1,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: 1,
+    },
+  },
+};
+export const retainedToolResult: ToolResultMessage = {
+  role: "toolResult",
+  toolCallId: "call-1",
+  toolName: "Write",
+  content: [{ type: "text", text: "permission denied" }],
+  isError: true,
+  timestamp: 1,
+};
+
 export const messageEnd: Extract<AgentSessionEvent, { type: "message_end" }> = {
   type: "message_end",
   message: {

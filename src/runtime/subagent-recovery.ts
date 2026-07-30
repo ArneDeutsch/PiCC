@@ -65,6 +65,7 @@ function hasModelContent(content: unknown): boolean {
 }
 
 function messageShowsProgress(message: MessageLike): boolean {
+  if (message.role === "toolResult") return true;
   if (message.role !== "assistant") return false;
   if (hasModelContent(message.content)) return true;
   return message.stopReason !== "error" && message.stopReason !== "aborted";

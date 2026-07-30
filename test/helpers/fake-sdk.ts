@@ -119,7 +119,6 @@ export interface FakeSdkOptions {
    * when the session cannot stream events (older SDK / minimal fake).
    */
   noSubscribe?: boolean;
-  /** Throw while installing a lifecycle subscription. */
   subscribeThrows?: boolean;
   /**
    * Scripted session stats: fake sessions return this from
