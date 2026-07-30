@@ -5,11 +5,15 @@
  * excludes test/), so a Pi type-surface change fails the contract suite
  * loudly with the tsc message.
  */
-import type {
-  AssistantMessage,
-  RetryCallbacks,
-  RetryPolicy,
-  StopReason,
+import {
+  isContextOverflow,
+  isRetryableAssistantError,
+  type AssistantMessage,
+  type RetryCallbacks,
+  type RetryPolicy,
+  type StopReason,
+  type ThinkingContent,
+  type ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import type {
   AgentSession,
@@ -45,6 +49,10 @@ export const stopReasonRequired: undefined extends AssistantMessage["stopReason"
 // ...and errorMessage is an optional string carrying the terminal failure text.
 export const errorMessageOptional: AssistantMessage["errorMessage"] = undefined;
 export const errorMessageString: AssistantMessage["errorMessage"] = "terminal failure";
+export const retryClassifierArg: Parameters<typeof isRetryableAssistantError>[0] = {} as AssistantMessage;
+export const retryClassifierResult: ReturnType<typeof isRetryableAssistantError> = true;
+export const overflowClassifierArgs: Parameters<typeof isContextOverflow> = [{} as AssistantMessage, 100_000];
+export const overflowClassifierResult: ReturnType<typeof isContextOverflow> = false;
 
 // ToolDefinition.execute is (toolCallId, params, signal, onUpdate, ctx) — the
 // Agent tool forwards the 3rd parameter (AbortSignal | undefined) into dispatch.
@@ -114,12 +122,152 @@ export const listenerAssignable: AgentSessionEventListener = (_event) => {};
 // The event kinds the condenser keys off must all be members of the union.
 export const turnStart: Extract<AgentSessionEvent, { type: "turn_start" }>["type"] = "turn_start";
 export const turnEnd: Extract<AgentSessionEvent, { type: "turn_end" }>["type"] = "turn_end";
-export const messageUpdate: Extract<AgentSessionEvent, { type: "message_update" }>["type"] =
-  "message_update";
-export const toolStart: Extract<
-  AgentSessionEvent,
-  { type: "tool_execution_start" }
->["type"] = "tool_execution_start";
+export const messageUpdate: Extract<AgentSessionEvent, { type: "message_update" }> = {
+  type: "message_update",
+  message: {
+    role: "assistant",
+    content: [{ type: "text", text: "retained" }],
+    api: "openai-completions",
+    provider: "contract",
+    model: "contract-model",
+    usage: {
+      input: 0,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 1,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: 1,
+  },
+  assistantMessageEvent: {
+    type: "text_delta",
+    contentIndex: 0,
+    delta: "retained",
+    partial: {
+      role: "assistant",
+      content: [{ type: "text", text: "retained" }],
+      api: "openai-completions",
+      provider: "contract",
+      model: "contract-model",
+      usage: {
+        input: 0,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 1,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: 1,
+    },
+  },
+};
+export const ordinaryThinking: ThinkingContent = {
+  type: "thinking",
+  thinking: "retained reasoning",
+};
+export const opaqueThinking: ThinkingContent = {
+  type: "thinking",
+  thinking: "",
+  thinkingSignature: "opaque-provider-payload",
+  redacted: true,
+};
+export const ordinaryThinkingAssistant: AssistantMessage = {
+  role: "assistant",
+  content: [ordinaryThinking],
+  api: "openai-completions",
+  provider: "contract",
+  model: "contract-model",
+  usage: {
+    input: 0,
+    output: 1,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 1,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  },
+  stopReason: "stop",
+  timestamp: 1,
+};
+export const thinkingMessageUpdate: Extract<AgentSessionEvent, { type: "message_update" }> = {
+  type: "message_update",
+  message: {
+    role: "assistant",
+    content: [opaqueThinking],
+    api: "openai-completions",
+    provider: "contract",
+    model: "contract-model",
+    usage: {
+      input: 0,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 1,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: 1,
+  },
+  assistantMessageEvent: {
+    type: "thinking_end",
+    contentIndex: 0,
+    content: "",
+    partial: {
+      role: "assistant",
+      content: [opaqueThinking],
+      api: "openai-completions",
+      provider: "contract",
+      model: "contract-model",
+      usage: {
+        input: 0,
+        output: 1,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 1,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: 1,
+    },
+  },
+};
+export const retainedToolResult: ToolResultMessage = {
+  role: "toolResult",
+  toolCallId: "call-1",
+  toolName: "Write",
+  content: [{ type: "text", text: "permission denied" }],
+  isError: true,
+  timestamp: 1,
+};
+
+export const messageEnd: Extract<AgentSessionEvent, { type: "message_end" }> = {
+  type: "message_end",
+  message: {
+    role: "assistant",
+    content: [],
+    api: "openai-completions",
+    provider: "contract",
+    model: "contract-model",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: 1,
+  },
+};
+export const toolStart: Extract<AgentSessionEvent, { type: "tool_execution_start" }> = {
+  type: "tool_execution_start",
+  toolCallId: "call-1",
+  toolName: "Write",
+  args: { path: "file.txt" },
+};
 export const toolUpdate: Extract<
   AgentSessionEvent,
   { type: "tool_execution_update" }
