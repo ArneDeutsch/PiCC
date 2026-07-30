@@ -9,6 +9,7 @@ import {
   systemText,
   toolNames,
   toolResultText,
+  userText,
   TEST_TIMEOUT_MS,
   CLI_PATH,
 } from "./helpers/e2e-live.js";
@@ -48,14 +49,17 @@ import { createMcpProcessFixture, processIsAlive, type McpProcessFixture } from 
  * deliberately not duplicated here.
  */
 
-const { runPi, cleanup } = createE2ELive();
+const { startPi, runPi, cleanup } = createE2ELive();
 afterEach(cleanup);
 
 /** Fixture-server entry for a `.mcp.json` / settings `mcpServers` map. */
-function serverEntry(fixture: McpProcessFixture): Record<string, unknown> {
+function serverEntry(
+  fixture: McpProcessFixture,
+  mode = "serve",
+): Record<string, unknown> {
   return {
     command: fixture.nodeCommand,
-    args: [fixture.serverScript, "serve"],
+    args: [fixture.serverScript, mode],
     env: fixture.env,
   };
 }
@@ -175,6 +179,73 @@ describe.skipIf(cliMissing)("e2e MCP: real Pi CLI + PiCC extension + mock OpenAI
         expect(result.stdout).toContain('"fixture": connected (3 tools)');
       } finally {
         await barrier?.cleanup();
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "holds first-input JSON prompt discovery before sending only the transformed prompt result",
+    async () => {
+      const required = "FIRST-ARG-7421";
+      const optional = "SECOND-ARG-9365";
+      const rawCommand = `/mcp__fixture__fixture-prompt ${required} ${optional}`;
+      let barrier: McpProcessFixture | undefined;
+      let started: Awaited<ReturnType<typeof startPi>> | undefined;
+      try {
+        started = await startPi({
+          script: [{ text: "PROMPT-DONE" }],
+          prompt: "unused",
+          modeArgs: ["--mode", "json", "-p", rawCommand],
+          setup(dir) {
+            barrier = createMcpProcessFixture(dir);
+            fs.writeFileSync(
+              path.join(dir, ".mcp.json"),
+              JSON.stringify({
+                mcpServers: {
+                  fixture: serverEntry(barrier, "gated-prompt-discovery"),
+                },
+              }, null, 2),
+            );
+            fs.writeFileSync(
+              path.join(dir, ".claude", "settings.local.json"),
+              JSON.stringify({ enabledMcpjsonServers: ["fixture"] }, null, 2),
+            );
+          },
+        });
+
+        await Promise.race([
+          barrier!.waitFor(
+            ["prompt-discovery.entered"],
+            "initial MCP prompt discovery to hold the first typed input",
+            20_000,
+          ),
+          started.completion.then((result) => {
+            throw new Error(
+              `Pi exited before gated prompt discovery: code=${result.code}; stderr=${result.stderr}; stdout=${result.stdout}`,
+            );
+          }),
+        ]);
+        expect(started.requests).toEqual([]);
+
+        barrier!.release("prompt-discovery");
+        const firstRequest = await started.waitForRequest(undefined, 1);
+        const transformed = userText(firstRequest);
+        expect(transformed).toContain(required);
+        expect(transformed).toContain(optional);
+        expect(transformed).not.toContain(rawCommand);
+        expect(allText(firstRequest)).not.toContain("/mcp__fixture__fixture-prompt");
+        expect(toolNames(firstRequest)).not.toContain("ListMcpResourcesTool");
+        expect(toolNames(firstRequest)).not.toContain("ReadMcpResourceTool");
+
+        const result = await started.completion;
+        expect(result.code, result.stderr).toBe(0);
+        expect(result.requests).toHaveLength(1);
+        expect(barrier!.exists("prompt-discovery.done")).toBe(true);
+      } finally {
+        barrier?.release("prompt-discovery");
+        await started?.stop().catch(() => undefined);
+        await barrier?.cleanup("prompt-discovery");
       }
     },
     TEST_TIMEOUT_MS,

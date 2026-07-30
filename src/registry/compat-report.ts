@@ -497,7 +497,15 @@ export interface McpServerLiveState {
   state: "connecting" | "retrying" | "connected" | "reconnecting" | "failed";
   attempt?: number;
   attemptLimit?: number;
+  toolsAdvertised?: boolean;
+  promptsAdvertised?: boolean;
+  resourcesAdvertised?: boolean;
   toolCount?: number;
+  promptCount?: number;
+  resourceCount?: number;
+  toolDiscoveryError?: string;
+  promptDiscoveryError?: string;
+  resourceDiscoveryError?: string;
   diagnostic?: string;
   statusSummary?: string;
 }
@@ -516,6 +524,54 @@ function mcpInactiveTransportSuffix(
   server: ResolvedMcpConfig["servers"][number],
 ): string {
   return server.transport === "sse" ? ` via ${mcpTransportLabel(server.transport)}` : "";
+}
+
+function hasMcpCapabilityState(live: McpServerLiveState): boolean {
+  return live.toolsAdvertised !== undefined || live.promptsAdvertised !== undefined ||
+    live.resourcesAdvertised !== undefined;
+}
+
+function isMcpToolOnlyState(live: McpServerLiveState): boolean {
+  return live.toolsAdvertised === true && live.promptsAdvertised === false &&
+    live.resourcesAdvertised === false && live.toolDiscoveryError === undefined;
+}
+
+function mcpCapabilitySummary(live: McpServerLiveState, retained = false): string {
+  const surfaces: string[] = [];
+  const add = (
+    label: "tools" | "prompts" | "resources",
+    advertised: boolean | undefined,
+    count: number | undefined,
+    discoveryError: string | undefined,
+  ): void => {
+    if (advertised !== true) return;
+    if (discoveryError !== undefined) {
+      surfaces.push(`${label}: advertised, discovery failed`);
+      return;
+    }
+    const safeCount = Number.isSafeInteger(count) && (count ?? -1) >= 0 ? count! : 0;
+    surfaces.push(`${label}: ${safeCount}${retained ? " retained" : ""}`);
+  };
+  add("tools", live.toolsAdvertised, live.toolCount, live.toolDiscoveryError);
+  add("prompts", live.promptsAdvertised, live.promptCount, live.promptDiscoveryError);
+  add("resources", live.resourcesAdvertised, live.resourceCount, live.resourceDiscoveryError);
+  if (surfaces.length > 0) {
+    const summary = surfaces.join(", ");
+    const discoveryFailed = live.toolDiscoveryError !== undefined ||
+      live.promptDiscoveryError !== undefined || live.resourceDiscoveryError !== undefined;
+    return discoveryFailed
+      ? `${summary}; check the server configuration and logs, then restart PiCC`
+      : summary;
+  }
+  if (
+    live.toolsAdvertised === false &&
+    live.promptsAdvertised === false &&
+    live.resourcesAdvertised === false
+  ) return "no tool, prompt, or resource capabilities advertised";
+  const fallbackCount = Number.isSafeInteger(live.toolCount) && (live.toolCount ?? -1) >= 0
+    ? live.toolCount!
+    : 0;
+  return `tools: ${fallbackCount}${retained ? " retained" : ""}`;
 }
 
 function mcpPostureLine(
@@ -548,15 +604,23 @@ function mcpPostureLine(
           ? ` ${live.attempt}/${live.attemptLimit}`
           : "";
         if (liveTransport === "stdio") {
-          if (live.state === "connected") return `${server.name}: connected (${live.toolCount ?? 0} tool(s))`;
+          if (live.state === "connected") return hasMcpCapabilityState(live) && !isMcpToolOnlyState(live)
+            ? `${server.name}: connected (${mcpCapabilitySummary(live)})`
+            : `${server.name}: connected (${live.toolCount ?? 0} tool(s))`;
           if (live.state === "connecting") return `${server.name}: connecting`;
           return `${server.name}: failed — ${boundPostureDiag(live.diagnostic ?? "no diagnostic")}`;
         }
-        if (live.state === "connected") return `${server.name}: connected via ${transport} (${live.toolCount ?? 0} tool(s))`;
+        if (live.state === "connected") return hasMcpCapabilityState(live) && !isMcpToolOnlyState(live)
+          ? `${server.name}: connected via ${transport} (${mcpCapabilitySummary(live)})`
+          : `${server.name}: connected via ${transport} (${live.toolCount ?? 0} tool(s))`;
         if (live.state === "connecting") return `${server.name}: connecting via ${transport}${attempts}`;
         if (live.state === "retrying") return `${server.name}: retrying via ${transport}${attempts}`;
-        if (live.state === "reconnecting") return `${server.name}: reconnecting via ${transport}${attempts} (${live.toolCount ?? 0} retained tool(s))`;
-        return `${server.name}: failed via ${transport} (${live.toolCount ?? 0} retained tool(s)) — ${boundPostureDiag(live.statusSummary ?? "no safe summary")}`;
+        if (live.state === "reconnecting") return hasMcpCapabilityState(live) && !isMcpToolOnlyState(live)
+          ? `${server.name}: reconnecting via ${transport}${attempts} (${mcpCapabilitySummary(live, true)})`
+          : `${server.name}: reconnecting via ${transport}${attempts} (${live.toolCount ?? 0} retained tool(s))`;
+        return hasMcpCapabilityState(live) && !isMcpToolOnlyState(live)
+          ? `${server.name}: failed via ${transport} (${mcpCapabilitySummary(live, true)}) — ${boundPostureDiag(live.statusSummary ?? "no safe summary")}`
+          : `${server.name}: failed via ${transport} (${live.toolCount ?? 0} retained tool(s)) — ${boundPostureDiag(live.statusSummary ?? "no safe summary")}`;
       }
       case "pending-approval":
         // No enable/decline hint here — the pending finding rendered below
@@ -665,24 +729,36 @@ function mcpStatusRow(
     case "retrying":
       return `- ${name}: retrying via ${mcpTransportLabel(live?.transport ?? server.transport ?? "unknown")}${mcpAttemptSuffix(live)}`;
     case "connected": {
-      const rawCount = live?.toolCount;
-      const count = Number.isSafeInteger(rawCount) && (rawCount ?? -1) >= 0 ? rawCount! : 0;
       const transport = live?.transport ?? server.transport ?? "unknown";
-      if (transport === "stdio") return `- ${name}: connected (${count} ${count === 1 ? "tool" : "tools"})`;
-      return `- ${name}: connected via ${mcpTransportLabel(transport)} (${count} ${count === 1 ? "tool" : "tools"})`;
+      if (live && (!hasMcpCapabilityState(live) || isMcpToolOnlyState(live))) {
+        const count = Number.isSafeInteger(live.toolCount) && (live.toolCount ?? -1) >= 0 ? live.toolCount! : 0;
+        if (transport === "stdio") return `- ${name}: connected (${count} ${count === 1 ? "tool" : "tools"})`;
+        return `- ${name}: connected via ${mcpTransportLabel(transport)} (${count} ${count === 1 ? "tool" : "tools"})`;
+      }
+      const capabilities = live ? mcpCapabilitySummary(live) : "tools: 0";
+      if (transport === "stdio") return `- ${name}: connected (${capabilities})`;
+      return `- ${name}: connected via ${mcpTransportLabel(transport)} (${capabilities})`;
     }
     case "reconnecting": {
-      const count = Number.isSafeInteger(live?.toolCount) ? live!.toolCount! : 0;
-      return `- ${name}: reconnecting via ${mcpTransportLabel(live?.transport ?? server.transport ?? "unknown")}${mcpAttemptSuffix(live)} (${count} retained ${count === 1 ? "tool" : "tools"})`;
+      if (live && (!hasMcpCapabilityState(live) || isMcpToolOnlyState(live))) {
+        const count = Number.isSafeInteger(live.toolCount) ? live.toolCount! : 0;
+        return `- ${name}: reconnecting via ${mcpTransportLabel(live.transport ?? server.transport ?? "unknown")}${mcpAttemptSuffix(live)} (${count} retained ${count === 1 ? "tool" : "tools"})`;
+      }
+      const capabilities = live ? mcpCapabilitySummary(live, true) : "tools: 0 retained";
+      return `- ${name}: reconnecting via ${mcpTransportLabel(live?.transport ?? server.transport ?? "unknown")}${mcpAttemptSuffix(live)} (${capabilities})`;
     }
     case "failed": {
       const summary = mcpStatusScalar(live?.statusSummary ?? "", MCP_STATUS_SUMMARY_MAX);
       const transport = live?.transport ?? server.transport ?? "unknown";
-      const count = Number.isSafeInteger(live?.toolCount) ? live!.toolCount! : 0;
       if (transport === "stdio") {
         return `- ${name}: failed — ${summary || "Connection failed; no safe summary is available; run /doctor for details."}`;
       }
-      return `- ${name}: failed via ${mcpTransportLabel(transport)} (${count} retained ${count === 1 ? "tool" : "tools"}) — ${summary || "Connection failed; no safe summary is available; run /doctor for details."}`;
+      if (live && (!hasMcpCapabilityState(live) || isMcpToolOnlyState(live))) {
+        const count = Number.isSafeInteger(live.toolCount) ? live.toolCount! : 0;
+        return `- ${name}: failed via ${mcpTransportLabel(transport)} (${count} retained ${count === 1 ? "tool" : "tools"}) — ${summary || "Connection failed; no safe summary is available; run /doctor for details."}`;
+      }
+      const capabilities = live ? mcpCapabilitySummary(live, true) : "tools: 0 retained";
+      return `- ${name}: failed via ${mcpTransportLabel(transport)} (${capabilities}) — ${summary || "Connection failed; no safe summary is available; run /doctor for details."}`;
     }
     case "pending approval":
       return `- ${name}: pending approval${mcpInactiveTransportSuffix(server)}`;

@@ -2068,11 +2068,19 @@ export class SubagentRuntime {
       dispatchCheckpointGate = checkpoint.gate;
       hookRunner = checkpoint.hookFacade(hookRunner);
 
-      const granted = this.deps.permissionEngine.gateTools(
+      let granted = this.deps.permissionEngine.gateTools(
         agent.tools,
         agent.disallowedTools,
         this.deps.allKnownToolNames(),
       );
+      if (opts.background && !isFork) {
+        // Claude excludes these built-in resource surfaces only from real
+        // non-fork background agents. A conversation fork keeps the parent's
+        // pool even when background execution was selected by default.
+        granted = granted.filter(
+          (name) => name !== "ListMcpResourcesTool" && name !== "ReadMcpResourceTool",
+        );
+      }
       const piBuiltins = claudeToolsToPiBuiltins(granted);
       // `agentId` (the dispatch's own minted id, above) is the OWNER that
       // scopes this agent's TaskOutput/TaskStop and tags the tasks it starts.

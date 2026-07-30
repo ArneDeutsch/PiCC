@@ -532,3 +532,42 @@ describe("MCP pending guidance", () => {
     expect(doctorReport).toContain("TRACKED_LOCAL_PATH_CANARY");
   });
 });
+
+describe("capability-aware MCP live reports", () => {
+  it("names prompt/resource surfaces, advertised empties, discovery failures, and retained catalogs in /mcp and /doctor", () => {
+    const mcp = config([
+      server("prompt", "enabled"),
+      server("resource", "enabled"),
+      server("mixed", "enabled", { transport: "http", url: "https://safe.invalid" }),
+      server("empty", "enabled"),
+      server("failed-list", "enabled"),
+      server("recover", "enabled", { transport: "http", url: "https://safe.invalid" }),
+      server("terminal", "enabled", { transport: "http", url: "https://safe.invalid" }),
+    ]);
+    const live: McpServerLiveState[] = [
+      { name: "prompt", transport: "stdio", state: "connected", toolsAdvertised: false, promptsAdvertised: true, resourcesAdvertised: false, promptCount: 2 },
+      { name: "resource", transport: "stdio", state: "connected", toolsAdvertised: false, promptsAdvertised: false, resourcesAdvertised: true, resourceCount: 0 },
+      { name: "mixed", transport: "http", state: "connected", toolsAdvertised: true, promptsAdvertised: true, resourcesAdvertised: true, toolCount: 1, promptCount: 2, resourceCount: 3 },
+      { name: "empty", transport: "stdio", state: "connected", toolsAdvertised: false, promptsAdvertised: false, resourcesAdvertised: false },
+      { name: "failed-list", transport: "stdio", state: "connected", toolsAdvertised: false, promptsAdvertised: true, resourcesAdvertised: true, promptCount: 0, resourceCount: 0, resourceDiscoveryError: "SERVER_SPEECH_CANARY" },
+      { name: "recover", transport: "http", state: "reconnecting", toolsAdvertised: false, promptsAdvertised: true, resourcesAdvertised: true, promptCount: 2, resourceCount: 0 },
+      { name: "terminal", transport: "http", state: "failed", toolsAdvertised: false, promptsAdvertised: true, resourcesAdvertised: true, promptCount: 2, resourceCount: 1, statusSummary: "Safe terminal summary." },
+    ];
+    const status = renderMcpStatusReport(mcp, live);
+    expect(status).toContain('"prompt": connected (prompts: 2)');
+    expect(status).toContain('"resource": connected (resources: 0)');
+    expect(status).toContain('tools: 1, prompts: 2, resources: 3');
+    expect(status).toContain('no tool, prompt, or resource capabilities advertised');
+    expect(status).toContain('resources: advertised, discovery failed; check the server configuration and logs, then restart PiCC');
+    expect(status).toContain('prompts: 2 retained, resources: 0 retained');
+    expect(status).toContain('prompts: 2 retained, resources: 1 retained');
+    expect(status).not.toContain("SERVER_SPEECH_CANARY");
+
+    const doctor = renderDoctorReport(project(mcp), buildCompatReport(project(mcp)), undefined, undefined, live);
+    expect(doctor).toContain("prompt: connected (prompts: 2)");
+    expect(doctor).toContain("resource: connected (resources: 0)");
+    expect(doctor).toContain("resources: advertised, discovery failed; check the server configuration and logs, then restart PiCC");
+    expect(doctor).toContain("prompts: 2 retained, resources: 1 retained");
+    expect(doctor).not.toContain("SERVER_SPEECH_CANARY");
+  });
+});

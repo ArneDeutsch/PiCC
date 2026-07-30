@@ -10,6 +10,7 @@
 //   exit-early       — exits immediately after publishing its pid
 //   hostile-tools    — advertises invalid/duplicate/oversized tool metadata
 //   prompt-only      — advertises prompts without tools
+//   gated-prompt-discovery — prompt-only; `prompts/list` waits for prompt-discovery.release
 //   resource-only    — advertises resources without tools
 //   prompt-resource  — advertises prompts and resources without tools
 //   empty-capabilities — advertises empty prompt/resource catalogs
@@ -118,8 +119,19 @@ async function serve() {
     ];
   }
 
-  const hasTools = !["prompt-only", "resource-only", "prompt-resource", "empty-capabilities"].includes(mode);
-  const hasPrompts = ["prompt-only", "prompt-resource", "empty-capabilities"].includes(mode);
+  const hasTools = ![
+    "prompt-only",
+    "gated-prompt-discovery",
+    "resource-only",
+    "prompt-resource",
+    "empty-capabilities",
+  ].includes(mode);
+  const hasPrompts = [
+    "prompt-only",
+    "gated-prompt-discovery",
+    "prompt-resource",
+    "empty-capabilities",
+  ].includes(mode);
   const hasResources = ["resource-only", "prompt-resource", "empty-capabilities"].includes(mode);
   const capabilities = {
     ...(hasTools ? { tools: {} } : {}),
@@ -150,16 +162,23 @@ async function serve() {
     throw new Error(`unknown tool: ${name}`);
   });
   if (hasPrompts) {
-    server.setRequestHandler(ListPromptsRequestSchema, async () => ({
-      prompts: mode === "empty-capabilities" ? [] : [{
-        name: "fixture-prompt",
-        description: "Builds a fixture prompt",
-        arguments: [
-          { name: "required", description: "required value", required: true },
-          { name: "optional", description: "optional value" },
-        ],
-      }],
-    }));
+    server.setRequestHandler(ListPromptsRequestSchema, async () => {
+      if (mode === "gated-prompt-discovery") {
+        publish("prompt-discovery.entered", JSON.stringify({ pid: process.pid }));
+        await waitForMarker("prompt-discovery.release");
+        publish("prompt-discovery.done", JSON.stringify({ pid: process.pid }));
+      }
+      return {
+        prompts: mode === "empty-capabilities" ? [] : [{
+          name: "fixture-prompt",
+          description: "Builds a fixture prompt",
+          arguments: [
+            { name: "required", description: "required value", required: true },
+            { name: "optional", description: "optional value" },
+          ],
+        }],
+      };
+    });
     server.setRequestHandler(GetPromptRequestSchema, async (request) => ({
       description: "fixture result",
       messages: [{
