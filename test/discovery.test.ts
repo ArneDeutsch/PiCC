@@ -4,7 +4,16 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { expandEnvVars, loadSettings, stripJsonc } from "../src/discovery/settings.js";
 import {
+  createWindowsManagedRegistryAdapter,
+  defaultManagedPolicyDescription,
+  discoverManagedPolicy,
+  type ManagedPolicyIo,
+  type ManagedRegistryAdapter,
+  type RegistryCommandInvocation,
+} from "../src/discovery/managed-policy.js";
+import {
   dedupeByName,
+  defaultManagedDirs,
   discoverArtifactDirs,
   resolveProjectRoot,
 } from "../src/discovery/locations.js";
@@ -60,6 +69,37 @@ function load(scopes: { userDir: string; projectRoot: string; absentManaged: str
     userDir: scopes.userDir,
     managedPaths: managedPaths ?? scopes.absentManaged,
   });
+}
+
+function inertPolicyIo(
+  files: Record<string, string | "<unreadable>">,
+  dropIns: string[] = [],
+): ManagedPolicyIo {
+  return {
+    readFile(filePath) {
+      if (!Object.hasOwn(files, filePath)) return { status: "absent" };
+      const text = files[filePath];
+      return text === "<unreadable>"
+        ? { status: "unreadable" }
+        : { status: "present", text: text! };
+    },
+    listJsonFiles() {
+      return { status: "present", files: dropIns };
+    },
+  };
+}
+
+function inertRegistry(
+  hklm: ReturnType<ManagedRegistryAdapter["readSettings"]>,
+  hkcu: ReturnType<ManagedRegistryAdapter["readSettings"]>,
+  calls: string[] = [],
+): ManagedRegistryAdapter {
+  return {
+    readSettings(hive) {
+      calls.push(hive);
+      return hive === "HKLM" ? hklm : hkcu;
+    },
+  };
 }
 
 describe("loadSettings — precedence & merging", () => {
@@ -215,7 +255,7 @@ describe("loadSettings — precedence & merging", () => {
     });
   });
 
-  it("normalizes array-form enabledPlugins into the merged object", () => {
+  it("rejects array-form enabledPlugins without affecting valid entries", () => {
     const scopes = makeScopes();
     writeJson(path.join(scopes.userDir, "settings.json"), { enabledPlugins: ["foo@official"] });
     writeJson(path.join(scopes.projectRoot, ".claude", "settings.json"), {
@@ -223,7 +263,62 @@ describe("loadSettings — precedence & merging", () => {
     });
 
     const settings = load(scopes);
-    expect(settings.enabledPlugins).toEqual({ "foo@official": true, "bar@acme": true });
+    expect(settings.enabledPlugins).toEqual({ "bar@acme": true });
+    expect(settings.diagnostics).toContainEqual(
+      expect.objectContaining({ message: 'Setting "enabledPlugins" is not an object; ignored' }),
+    );
+  });
+
+  it("accepts only exact qualified-ID literal booleans and preserves each winning source", () => {
+    const scopes = makeScopes();
+    const userFile = path.join(scopes.userDir, "settings.json");
+    const projectFile = path.join(scopes.projectRoot, ".claude", "settings.json");
+    writeJson(userFile, {
+      enabledPlugins: {
+        "good@official": true,
+        bare: true,
+        " spaced@official": true,
+        "string@official": "false",
+        "number@official": 1,
+        "null@official": null,
+        "array@official": [],
+        "object@official": {},
+      },
+    });
+    writeJson(projectFile, {
+      enabledPlugins: { "good@official": false, "second@acme": true },
+    });
+
+    const settings = load(scopes);
+    expect(settings.enabledPlugins).toEqual({
+      "good@official": false,
+      "second@acme": true,
+    });
+    expect(settings.effectivePluginEnablement).toEqual({
+      "good@official": { enabled: false, scope: "project", source: projectFile },
+      "second@acme": { enabled: true, scope: "project", source: projectFile },
+    });
+    expect(settings.diagnostics.filter((d) => d.message.includes("literal boolean"))).toHaveLength(5);
+    expect(settings.diagnostics.filter((d) => d.message.includes("Invalid plugin identity"))).toHaveLength(2);
+  });
+
+  it("does not let an invalid higher-precedence plugin value erase a valid lower value", () => {
+    const scopes = makeScopes();
+    const userFile = path.join(scopes.userDir, "settings.json");
+    const projectFile = path.join(scopes.projectRoot, ".claude", "settings.json");
+    writeJson(userFile, { enabledPlugins: { "safe@official": false } });
+    writeJson(projectFile, { enabledPlugins: { "safe@official": "yes" } });
+
+    const settings = load(scopes);
+    expect(settings.enabledPlugins).toEqual({ "safe@official": false });
+    expect(settings.effectivePluginEnablement?.["safe@official"]).toEqual({
+      enabled: false,
+      scope: "user",
+      source: userFile,
+    });
+    expect(settings.diagnostics).toContainEqual(
+      expect.objectContaining({ source: projectFile, message: expect.stringContaining("literal boolean") }),
+    );
   });
 
   it("ignores a malformed boolean at a higher scope instead of resetting the lower scope's value", () => {
@@ -384,7 +479,10 @@ describe("loadSettings — hostile keys (never-throw floor)", () => {
     expect(settings.enabledPlugins).toEqual({ "foo@mp": true });
     expect(Object.getPrototypeOf(settings.env)).toBe(Object.prototype);
     expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
-    expect(settings.diagnostics.filter((d) => d.message.includes("Unsafe key"))).toHaveLength(3);
+    expect(settings.diagnostics.filter((d) => d.message.includes("Unsafe key"))).toHaveLength(2);
+    expect(settings.diagnostics).toContainEqual(
+      expect.objectContaining({ message: 'Invalid plugin identity in "enabledPlugins" ignored' }),
+    );
   });
 });
 
@@ -486,9 +584,18 @@ describe("loadSettings — robustness (completeness floor)", () => {
     expect(settings.model).toBe("m");
     expect(settings.diagnostics).toHaveLength(0);
 
-    // Default platform managed path (probed, most likely absent) must not throw either.
+    // Ambient source resolution is covered through inert adapters; tests never probe host policy.
     expect(() =>
-      loadSettings({ cwd: scopes.projectRoot, projectRoot: scopes.projectRoot, userDir: scopes.userDir }),
+      loadSettings({
+        cwd: scopes.projectRoot,
+        projectRoot: scopes.projectRoot,
+        userDir: scopes.userDir,
+        managedPolicy: {
+          platform: "win32",
+          io: inertPolicyIo({}),
+          registry: inertRegistry({ status: "absent" }, { status: "absent" }),
+        },
+      }),
     ).not.toThrow();
   });
 
@@ -766,6 +873,1037 @@ describe("loadSettings — MCP settings capture (graduated keys)", () => {
 
   it("defaults to an empty mcpSettings capture when no file carries MCP keys", () => {
     expect(load(makeScopes()).mcpSettings).toEqual([]);
+  });
+});
+
+describe("loadSettings — strict plugin enablement diagnostics", () => {
+  it("accepts only syntactically qualified IDs across separator and whitespace cases", () => {
+    const scopes = makeScopes();
+    const entries: Record<string, boolean> = {
+      "a@b": true,
+      "A-1._@M_p.-": false,
+      "@b": true,
+      "a@": true,
+      "a@b@c": true,
+      " a@b": true,
+      "a @b": true,
+      "a@ b": true,
+      "a/b@c": true,
+      "a\\b@c": true,
+      "a@b/c": true,
+      "a:b@c": true,
+      ".a@b": true,
+      "a@.b": true,
+    };
+    writeJson(path.join(scopes.userDir, "settings.json"), { enabledPlugins: entries });
+
+    const settings = load(scopes);
+    expect(settings.enabledPlugins).toEqual({ "a@b": true, "A-1._@M_p.-": false });
+    const messages = settings.diagnostics.map((diagnostic) => diagnostic.message);
+    expect(messages.filter((message) => message.includes("Invalid plugin identity"))).toHaveLength(8);
+    expect(messages).toContain('Additional malformed "enabledPlugins" entries omitted');
+  });
+
+  it("bounds diagnostics independently per source without echoing hostile keys or values", () => {
+    const scopes = makeScopes();
+    const userFile = path.join(scopes.userDir, "settings.json");
+    const projectFile = path.join(scopes.projectRoot, ".claude", "settings.json");
+    const hostileEntries = (prefix: string): Record<string, unknown> =>
+      Object.fromEntries(
+        Array.from({ length: 12 }, (_, index) => [
+          `${prefix}/../\u001b[31m-${index}`,
+          `secret-value-${index}`,
+        ]),
+      );
+    writeJson(userFile, {
+      enabledPlugins: {
+        ...hostileEntries("user-hostile"),
+        "user-on@official": true,
+        "user-off@official": false,
+      },
+    });
+    writeJson(projectFile, {
+      enabledPlugins: {
+        ...hostileEntries("project-hostile"),
+        "project-on@official": true,
+        "project-off@official": false,
+      },
+    });
+
+    const settings = load(scopes);
+    expect(settings.enabledPlugins).toEqual({
+      "user-on@official": true,
+      "user-off@official": false,
+      "project-on@official": true,
+      "project-off@official": false,
+    });
+    expect(settings.effectivePluginEnablement).toEqual({
+      "user-on@official": { enabled: true, scope: "user", source: userFile },
+      "user-off@official": { enabled: false, scope: "user", source: userFile },
+      "project-on@official": { enabled: true, scope: "project", source: projectFile },
+      "project-off@official": { enabled: false, scope: "project", source: projectFile },
+    });
+    for (const source of [userFile, projectFile]) {
+      const diagnostics = settings.diagnostics.filter((diagnostic) => diagnostic.source === source);
+      expect(diagnostics).toHaveLength(9);
+      expect(
+        diagnostics.filter(
+          (diagnostic) =>
+            diagnostic.message === 'Additional malformed "enabledPlugins" entries omitted',
+        ),
+      ).toHaveLength(1);
+    }
+    const rendered = settings.diagnostics.map((diagnostic) => diagnostic.message).join("\n");
+    expect(rendered).not.toContain("hostile");
+    expect(rendered).not.toContain("secret-value");
+    expect(rendered).not.toContain("secret-user-value");
+  });
+
+  it("identifies a safe qualified ID for a malformed value without echoing that value", () => {
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), {
+      enabledPlugins: { "safe-id@official": "credential-shaped-value" },
+    });
+
+    const settings = load(scopes);
+    expect(settings.diagnostics).toContainEqual(
+      expect.objectContaining({
+        message:
+          'Plugin "safe-id@official" in "enabledPlugins" must be a literal boolean; ignored',
+      }),
+    );
+    expect(settings.diagnostics[0]?.message).not.toContain("credential-shaped-value");
+  });
+});
+
+describe("managed policy discovery", () => {
+  it("describes current platform file and artifact locations without obsolete ProgramData", () => {
+    expect(defaultManagedPolicyDescription("win32")).toEqual({
+      systemSettingsPath: path.win32.join("C:\\", "Program Files", "ClaudeCode", "managed-settings.json"),
+      dropInDir: path.win32.join("C:\\", "Program Files", "ClaudeCode", "managed-settings.d"),
+      artifactDirs: [path.win32.join("C:\\", "Program Files", "ClaudeCode")],
+    });
+    expect(defaultManagedPolicyDescription("darwin").systemSettingsPath).toBe(
+      "/Library/Application Support/ClaudeCode/managed-settings.json",
+    );
+    expect(defaultManagedPolicyDescription("linux").systemSettingsPath).toBe(
+      "/etc/claude-code/managed-settings.json",
+    );
+    expect(defaultManagedDirs("win32").join("|")).not.toContain("ProgramData");
+  });
+
+  it("deep-merges base, sorted drop-ins, and HKLM with scalar, object, and stable-array semantics", () => {
+    const description = {
+      systemSettingsPath: "/policy/managed-settings.json",
+      dropInDir: "/policy/managed-settings.d",
+      artifactDirs: ["/policy"],
+    };
+    const a = "/policy/managed-settings.d/10-a.json";
+    const b = "/policy/managed-settings.d/20-b.json";
+    const result = discoverManagedPolicy({
+      platform: "win32",
+      description,
+      io: inertPolicyIo(
+        {
+          [description.systemSettingsPath]: JSON.stringify({
+            model: "base",
+            nested: { a: 1, same: "base" },
+            list: ["base", { x: 1 }],
+            enabledPlugins: { "base@official": true },
+          }),
+          [a]: JSON.stringify({ nested: { b: 2, same: "a" }, list: ["a", { x: 1 }] }),
+          [b]: JSON.stringify({ model: "drop-in", list: ["base", "b"] }),
+        },
+        [a, b],
+      ),
+      registry: inertRegistry(
+        { status: "present", json: JSON.stringify({ model: "hklm", nested: { c: 3 }, list: ["hklm"] }) },
+        { status: "present", json: JSON.stringify({ model: "hkcu" }) },
+      ),
+    });
+
+    expect(result.settings).toEqual({
+      model: "hklm",
+      nested: { a: 1, same: "a", b: 2, c: 3 },
+      list: ["base", { x: 1 }, "a", "b", "hklm"],
+      enabledPlugins: { "base@official": true },
+    });
+    expect(result.sources.map(({ source }) => source)).toEqual([
+      description.systemSettingsPath,
+      a,
+      b,
+      `HKLM\\SOFTWARE\\Policies\\ClaudeCode\\Settings`,
+    ]);
+  });
+
+  it("keeps hostile managed object keys on null-prototype records without leakage", () => {
+    const source = "/policy/hostile.json";
+    const result = discoverManagedPolicy({
+      platform: "linux",
+      overridePaths: [source],
+      io: inertPolicyIo({
+        [source]:
+          '{"nested":{"__proto__":{"polluted":"yes"},"constructor":{"safe":true}}}',
+      }),
+    });
+
+    const nested = result.settings?.nested as Record<string, unknown>;
+    expect(Object.getPrototypeOf(result.settings)).toBeNull();
+    expect(Object.getPrototypeOf(nested)).toBeNull();
+    expect(Object.keys(nested)).toEqual(["__proto__", "constructor"]);
+    expect(nested.__proto__).toEqual({ polluted: "yes" });
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it("uses HKCU only when no administrator source is present", () => {
+    const description = {
+      systemSettingsPath: "/policy/base.json",
+      dropInDir: "/policy/drop",
+      artifactDirs: ["/policy"],
+    };
+    const fallbackCalls: string[] = [];
+    const fallback = discoverManagedPolicy({
+      platform: "win32",
+      description,
+      io: inertPolicyIo({}),
+      registry: inertRegistry(
+        { status: "absent" },
+        { status: "present", json: JSON.stringify({ model: "hkcu" }) },
+        fallbackCalls,
+      ),
+    });
+    expect(fallback.settings).toEqual({ model: "hkcu" });
+    expect(fallbackCalls).toEqual(["HKLM", "HKCU"]);
+
+    for (const administrator of ["{ malformed", "<unreadable>"] as const) {
+      const calls: string[] = [];
+      const blockedFallback = discoverManagedPolicy({
+        platform: "win32",
+        description,
+        io: inertPolicyIo({ [description.systemSettingsPath]: administrator }),
+        registry: inertRegistry(
+          { status: "absent" },
+          { status: "present", json: JSON.stringify({ model: "hkcu" }) },
+          calls,
+        ),
+      });
+      expect(blockedFallback.settings).toBeUndefined();
+      expect(calls).toEqual(["HKLM"]);
+      expect(blockedFallback.diagnostics[0]).toMatchObject({
+        sourceClass: "system-file",
+        impact: "weaker-policy-suppressed",
+      });
+    }
+  });
+
+  it("suppresses HKCU for malformed or unreadable HKLM and emits stable policy diagnostics", () => {
+    for (const hklm of [
+      { status: "present", json: "not json" } as const,
+      { status: "unreadable" } as const,
+    ]) {
+      const calls: string[] = [];
+      const result = discoverManagedPolicy({
+        platform: "win32",
+        io: inertPolicyIo({}),
+        registry: inertRegistry(
+          hklm,
+          { status: "present", json: JSON.stringify({ model: "weaker" }) },
+          calls,
+        ),
+      });
+      expect(result.settings).toBeUndefined();
+      expect(calls).toEqual(["HKLM"]);
+      expect(result.diagnostics).toEqual([
+        expect.objectContaining({
+          category: hklm.status === "present" ? "managed-policy-malformed" : "managed-policy-unreadable",
+          sourceClass: "registry-hklm",
+          impact: "weaker-policy-suppressed",
+        }),
+      ]);
+      expect(result.events).toEqual([
+        { type: "diagnostic", diagnostic: result.diagnostics[0] },
+      ]);
+    }
+  });
+
+  it("emits discovery and validation diagnostics in exact managed source order", () => {
+    const description = {
+      systemSettingsPath: "/policy/base.json",
+      dropInDir: "/policy/drop",
+      artifactDirs: ["/policy"],
+    };
+    const pluginSource = "/policy/drop/10-plugin.json";
+    const malformedSource = "/policy/drop/20-malformed.json";
+    const scopes = makeScopes();
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: {
+        platform: "linux",
+        description,
+        io: inertPolicyIo(
+          {
+            [description.systemSettingsPath]: JSON.stringify({ model: 42 }),
+            [pluginSource]: JSON.stringify({ enabledPlugins: "invalid" }),
+            [malformedSource]: "not json",
+          },
+          [malformedSource, pluginSource],
+        ),
+      },
+    });
+
+    expect(
+      settings.diagnostics.map(({ source, message, category }) => ({ source, message, category })),
+    ).toEqual([
+      {
+        source: description.systemSettingsPath,
+        message: 'Setting "model" is not a string; ignored',
+        category: undefined,
+      },
+      {
+        source: pluginSource,
+        message: 'Setting "enabledPlugins" is not an object; ignored',
+        category: undefined,
+      },
+      {
+        source: malformedSource,
+        message: "Managed policy JSON is malformed; source ignored",
+        category: "managed-policy-malformed",
+      },
+    ]);
+  });
+
+  it("keeps valid lower managed plugin values when a later source has an invalid entry", () => {
+    const description = {
+      systemSettingsPath: "/policy/base.json",
+      dropInDir: "/policy/drop",
+      artifactDirs: ["/policy"],
+    };
+    const dropIn = "/policy/drop/later.json";
+    const scopes = makeScopes();
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: {
+        platform: "linux",
+        description,
+        io: inertPolicyIo(
+          {
+            [description.systemSettingsPath]: JSON.stringify({ enabledPlugins: { "safe@official": false } }),
+            [dropIn]: JSON.stringify({ enabledPlugins: { "safe@official": "yes", "other@acme": true } }),
+          },
+          [dropIn],
+        ),
+      },
+    });
+    expect(settings.enabledPlugins).toEqual({ "safe@official": false, "other@acme": true });
+    expect(settings.effectivePluginEnablement).toEqual({
+      "safe@official": { enabled: false, scope: "managed", source: description.systemSettingsPath },
+      "other@acme": { enabled: true, scope: "managed", source: dropIn },
+    });
+    expect(settings.diagnostics.filter((d) => d.message.includes("literal boolean"))).toHaveLength(1);
+  });
+
+  it("replaces lower object owners at the first managed source, then deep-merges later managed sources", () => {
+    const description = {
+      systemSettingsPath: "/policy/base.json",
+      dropInDir: "/policy/drop",
+      artifactDirs: ["/policy"],
+    };
+    const later = "/policy/drop/later.json";
+    const scopes = makeScopes();
+    writeJson(path.join(scopes.userDir, "settings.json"), {
+      attribution: {
+        lowerOnly: true,
+        nested: { lowerOnly: true, replaced: "lower" },
+      },
+      skillOverrides: {
+        shared: { lowerOnly: true, nested: { lowerOnly: true, replaced: "lower" } },
+        unrelated: { preserved: true },
+      },
+    });
+
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: {
+        platform: "linux",
+        description,
+        io: inertPolicyIo(
+          {
+            [description.systemSettingsPath]: JSON.stringify({
+              attribution: {
+                baseOnly: true,
+                nested: { baseOnly: true, replaced: "base" },
+              },
+              skillOverrides: {
+                shared: { baseOnly: true, nested: { baseOnly: true, replaced: "base" } },
+                managedOnly: { baseOnly: true },
+              },
+            }),
+            [later]: JSON.stringify({
+              attribution: {
+                laterOnly: true,
+                nested: { laterOnly: true, replaced: "later" },
+              },
+              skillOverrides: {
+                shared: { laterOnly: true, nested: { laterOnly: true, replaced: "later" } },
+                managedOnly: { laterOnly: true },
+              },
+            }),
+          },
+          [later],
+        ),
+      },
+    });
+
+    expect(settings.attribution).toEqual({
+      baseOnly: true,
+      laterOnly: true,
+      nested: { baseOnly: true, laterOnly: true, replaced: "later" },
+    });
+    expect(settings.skillOverrides).toEqual({
+      shared: {
+        baseOnly: true,
+        laterOnly: true,
+        nested: { baseOnly: true, laterOnly: true, replaced: "later" },
+      },
+      unrelated: { preserved: true },
+      managedOnly: { baseOnly: true, laterOnly: true },
+    });
+  });
+
+  it("keeps late valid managed booleans and provenance after the diagnostic cap", () => {
+    const description = {
+      systemSettingsPath: "/policy/base.json",
+      dropInDir: "/policy/drop",
+      artifactDirs: ["/policy"],
+    };
+    const hostile = Object.fromEntries(
+      Array.from({ length: 12 }, (_, index) => [`managed/hostile-${index}`, `secret-${index}`]),
+    );
+    const scopes = makeScopes();
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: {
+        platform: "linux",
+        description,
+        io: inertPolicyIo({
+          [description.systemSettingsPath]: JSON.stringify({
+            enabledPlugins: {
+              ...hostile,
+              "managed-on@official": true,
+              "managed-off@official": false,
+            },
+          }),
+        }),
+      },
+    });
+
+    expect(settings.enabledPlugins).toEqual({
+      "managed-on@official": true,
+      "managed-off@official": false,
+    });
+    expect(settings.effectivePluginEnablement).toEqual({
+      "managed-on@official": {
+        enabled: true,
+        scope: "managed",
+        source: description.systemSettingsPath,
+      },
+      "managed-off@official": {
+        enabled: false,
+        scope: "managed",
+        source: description.systemSettingsPath,
+      },
+    });
+    const diagnostics = settings.diagnostics.filter(
+      (diagnostic) => diagnostic.source === description.systemSettingsPath,
+    );
+    expect(diagnostics).toHaveLength(9);
+    expect(
+      diagnostics.filter(
+        (diagnostic) =>
+          diagnostic.message === 'Additional malformed "enabledPlugins" entries omitted',
+      ),
+    ).toHaveLength(1);
+    expect(diagnostics.map((diagnostic) => diagnostic.message).join("\n")).not.toMatch(
+      /managed\/hostile|secret-/,
+    );
+  });
+
+  it("ignores hidden drop-ins and applies visible drop-ins alphabetically", () => {
+    const base = makeTmp();
+    const description = {
+      systemSettingsPath: path.join(base, "managed-settings.json"),
+      dropInDir: path.join(base, "managed-settings.d"),
+      artifactDirs: [base],
+    };
+    writeJson(description.systemSettingsPath, { model: "base" });
+    writeJson(path.join(description.dropInDir, "20-z.json"), { model: "z" });
+    writeJson(path.join(description.dropInDir, "10-a.json"), { model: "a" });
+    writeJson(path.join(description.dropInDir, ".hidden.json"), { model: "hidden" });
+
+    const result = discoverManagedPolicy({ platform: "linux", description });
+    expect(result.settings?.model).toBe("z");
+    expect(result.diagnostics).toEqual([]);
+  });
+
+  it("explicit settings overrides perform zero ambient directory or registry I/O", () => {
+    const scopes = makeScopes();
+    const override = scopes.absentManaged[0]!;
+    const ioCalls: string[] = [];
+    const registryCalls: string[] = [];
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPaths: [override],
+      managedPolicy: {
+        platform: "win32",
+        io: {
+          readFile(filePath) {
+            ioCalls.push(filePath);
+            return filePath === override
+              ? { status: "present", text: JSON.stringify({ model: "override" }) }
+              : { status: "absent" };
+          },
+          listJsonFiles() {
+            throw new Error("ambient directory access");
+          },
+        },
+        registry: inertRegistry(
+          { status: "present", json: JSON.stringify({ model: "ambient" }) },
+          { status: "absent" },
+          registryCalls,
+        ),
+      },
+    });
+    expect(settings.model).toBe("override");
+    expect(ioCalls).toEqual([override]);
+    expect(registryCalls).toEqual([]);
+  });
+
+  it("keeps lower plugin values through invalid whole containers and diagnoses every source", () => {
+    const description = {
+      systemSettingsPath: "/policy/base.json",
+      dropInDir: "/policy/drop",
+      artifactDirs: ["/policy"],
+    };
+    const invalidContainer = "/policy/drop/10-invalid.json";
+    const invalidEntry = "/policy/drop/20-invalid-entry.json";
+    const laterValid = "/policy/drop/30-valid.json";
+    const scopes = makeScopes();
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: {
+        platform: "linux",
+        description,
+        io: inertPolicyIo(
+          {
+            [description.systemSettingsPath]: JSON.stringify({
+              enabledPlugins: { "kept@official": false },
+            }),
+            [invalidContainer]: JSON.stringify({ enabledPlugins: ["erase@official"] }),
+            [invalidEntry]: JSON.stringify({
+              enabledPlugins: { "kept@official": "erase", "bad/path@official": true },
+            }),
+            [laterValid]: JSON.stringify({
+              unrelated: true,
+              enabledPlugins: { "later@official": true },
+            }),
+          },
+          [laterValid, invalidEntry, invalidContainer],
+        ),
+      },
+    });
+
+    expect(settings.enabledPlugins).toEqual({
+      "kept@official": false,
+      "later@official": true,
+    });
+    expect(settings.effectivePluginEnablement).toEqual({
+      "kept@official": {
+        enabled: false,
+        scope: "managed",
+        source: description.systemSettingsPath,
+      },
+      "later@official": { enabled: true, scope: "managed", source: laterValid },
+    });
+    expect(settings.diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ source: invalidContainer }),
+        expect.objectContaining({ source: invalidEntry, message: expect.stringContaining("kept@official") }),
+        expect.objectContaining({ source: invalidEntry, message: expect.stringContaining("Invalid plugin identity") }),
+      ]),
+    );
+  });
+
+  it("retains field provenance through later unrelated and nested managed contributions", () => {
+    const description = {
+      systemSettingsPath: "/policy/base.json",
+      dropInDir: "/policy/drop",
+      artifactDirs: ["/policy"],
+    };
+    const later = "/policy/drop/later.json";
+    const scopes = makeScopes();
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: {
+        platform: "linux",
+        description,
+        io: inertPolicyIo(
+          {
+            [description.systemSettingsPath]: JSON.stringify({
+              model: [],
+              subagents: { maxDepth: 0 },
+            }),
+            [later]: JSON.stringify({
+              env: { OK: "yes" },
+              subagents: { concurrency: 3 },
+            }),
+          },
+          [later],
+        ),
+      },
+    });
+
+    expect(settings.subagentConcurrency).toBe(3);
+    expect(settings.diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ source: description.systemSettingsPath, message: expect.stringContaining('"model"') }),
+        expect.objectContaining({ source: description.systemSettingsPath, message: expect.stringContaining("subagents.maxDepth") }),
+      ]),
+    );
+    expect(settings.diagnostics.some((diagnostic) => diagnostic.source === later)).toBe(false);
+  });
+
+  it("validates overwritten scalars against their contributing managed source", () => {
+    const description = {
+      systemSettingsPath: "/policy/base.json",
+      dropInDir: "/policy/drop",
+      artifactDirs: ["/policy"],
+    };
+    const later = "/policy/drop/later.json";
+    const scopes = makeScopes();
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: {
+        platform: "linux",
+        description,
+        io: inertPolicyIo(
+          {
+            [description.systemSettingsPath]: JSON.stringify({ model: [] }),
+            [later]: JSON.stringify({ model: "valid-later" }),
+          },
+          [later],
+        ),
+      },
+    });
+
+    expect(settings.model).toBe("valid-later");
+    expect(settings.diagnostics).toContainEqual(
+      expect.objectContaining({
+        source: description.systemSettingsPath,
+        message: expect.stringContaining('Setting "model" is not a string'),
+      }),
+    );
+  });
+
+  it("keeps mixed-origin top-level array diagnostics with each contribution", () => {
+    const description = {
+      systemSettingsPath: "/policy/base.json",
+      dropInDir: "/policy/drop",
+      artifactDirs: ["/policy"],
+    };
+    const later = "/policy/drop/later.json";
+    const scopes = makeScopes();
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: {
+        platform: "linux",
+        description,
+        io: inertPolicyIo(
+          {
+            [description.systemSettingsPath]: JSON.stringify({ claudeMdExcludes: ["base", 7] }),
+            [later]: JSON.stringify({ claudeMdExcludes: ["later"] }),
+          },
+          [later],
+        ),
+      },
+    });
+
+    expect(settings.claudeMdExcludes).toEqual(["base", "later"]);
+    expect(settings.diagnostics).toContainEqual(
+      expect.objectContaining({
+        source: description.systemSettingsPath,
+        message: 'Non-string entry in "claudeMdExcludes" ignored',
+      }),
+    );
+    expect(settings.diagnostics.some((diagnostic) => diagnostic.source === later)).toBe(false);
+  });
+
+  it("keeps same-event hook diagnostics with the contributing managed source", () => {
+    const description = {
+      systemSettingsPath: "/policy/base.json",
+      dropInDir: "/policy/drop",
+      artifactDirs: ["/policy"],
+    };
+    const later = "/policy/drop/later.json";
+    const scopes = makeScopes();
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPolicy: {
+        platform: "linux",
+        description,
+        io: inertPolicyIo(
+          {
+            [description.systemSettingsPath]: JSON.stringify({
+              hooks: { PreToolUse: ["malformed", { hooks: [{ type: "command", command: "base" }] }] },
+            }),
+            [later]: JSON.stringify({
+              hooks: {
+                PreToolUse: [
+                  { hooks: [{ type: "command", command: "base" }] },
+                  { hooks: [{ type: "command", command: "later" }] },
+                ],
+              },
+            }),
+          },
+          [later],
+        ),
+      },
+    });
+
+    expect(
+      settings.hooks.PreToolUse?.flatMap((entry) => entry.hooks.map((hook) => hook.command)),
+    ).toEqual(["base", "later"]);
+    expect(settings.diagnostics).toContainEqual(
+      expect.objectContaining({
+        source: description.systemSettingsPath,
+        message: 'Malformed matcher entry in "hooks.PreToolUse" ignored',
+      }),
+    );
+    expect(settings.diagnostics.some((diagnostic) => diagnostic.source === later)).toBe(false);
+  });
+
+  it("shares the plugin diagnostic cap across duplicate managed source paths", () => {
+    const scopes = makeScopes();
+    const source = "/policy/repeated.json";
+    const entries = Object.fromEntries(
+      Array.from({ length: 12 }, (_, index) => [`invalid/path-${index}`, true]),
+    );
+    let reads = 0;
+    const settings = loadSettings({
+      cwd: scopes.projectRoot,
+      projectRoot: scopes.projectRoot,
+      userDir: scopes.userDir,
+      managedPaths: [source, source],
+      managedPolicy: {
+        platform: "linux",
+        io: {
+          readFile() {
+            reads++;
+            return { status: "present", text: JSON.stringify({ enabledPlugins: entries }) };
+          },
+          listJsonFiles() {
+            throw new Error("ambient directory access");
+          },
+        },
+      },
+    });
+
+    expect(reads).toBe(1);
+    expect(settings.diagnostics.filter((diagnostic) => diagnostic.source === source)).toHaveLength(9);
+    expect(
+      settings.diagnostics.filter(
+        (diagnostic) =>
+          diagnostic.message === 'Additional malformed "enabledPlugins" entries omitted',
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("covers every injected managed source/status with exact fallback and no host access", () => {
+    type Status = "absent" | "unreadable" | "malformed" | "present";
+    type Target = "system" | "directory" | "drop-in" | "HKLM" | "HKCU" | "override";
+    const description = {
+      systemSettingsPath: "/policy/base.json",
+      dropInDir: "/policy/drop",
+      artifactDirs: ["/policy"],
+    };
+    const dropIn = "/policy/drop/listed.json";
+    const override = "/override.json";
+    const registrySource = (hive: "HKLM" | "HKCU"): string =>
+      `${hive}\\SOFTWARE\\Policies\\ClaudeCode\\Settings`;
+    const cases: Array<{
+      target: Target;
+      status: Status;
+      model?: string;
+      diagnostic?: {
+        source: string;
+        sourceClass: "system-file" | "system-drop-in" | "registry-hklm" | "registry-hkcu" | "override";
+        impact: "source-ignored" | "weaker-policy-suppressed";
+      };
+      registryCalls: string[];
+      fileCalls: string[];
+      listCalls: string[];
+    }> = [];
+    const addCases = (
+      target: Target,
+      statuses: readonly Status[],
+      source: string,
+      sourceClass: "system-file" | "system-drop-in" | "registry-hklm" | "registry-hkcu" | "override",
+      administrator: boolean,
+    ): void => {
+      for (const status of statuses) {
+        const success = status === "present";
+        const fallsBack =
+          (target === "system" && status === "absent") ||
+          (target === "directory" && status !== "unreadable") ||
+          (target === "drop-in" && status === "absent") ||
+          (target === "HKLM" && status === "absent");
+        cases.push({
+          target,
+          status,
+          model: success
+            ? target === "directory"
+              ? "hkcu"
+              : target.toLowerCase()
+            : fallsBack
+              ? "hkcu"
+              : undefined,
+          diagnostic:
+            status === "unreadable" || status === "malformed"
+              ? {
+                  source,
+                  sourceClass,
+                  impact: administrator ? "weaker-policy-suppressed" : "source-ignored",
+                }
+              : undefined,
+          registryCalls:
+            target === "override"
+              ? []
+              : target === "HKCU" || fallsBack
+                ? ["HKLM", "HKCU"]
+                : ["HKLM"],
+          fileCalls:
+            target === "override"
+              ? [override]
+              : target === "drop-in"
+                ? [description.systemSettingsPath, dropIn]
+                : [description.systemSettingsPath],
+          listCalls: target === "override" ? [] : [description.dropInDir],
+        });
+      }
+    };
+    addCases("system", ["absent", "unreadable", "malformed", "present"], description.systemSettingsPath, "system-file", true);
+    addCases("directory", ["absent", "unreadable", "present"], description.dropInDir, "system-drop-in", true);
+    addCases("drop-in", ["absent", "unreadable", "malformed", "present"], dropIn, "system-drop-in", true);
+    addCases("HKLM", ["absent", "unreadable", "malformed", "present"], registrySource("HKLM"), "registry-hklm", true);
+    addCases("HKCU", ["absent", "unreadable", "malformed", "present"], registrySource("HKCU"), "registry-hkcu", false);
+    addCases("override", ["absent", "unreadable", "malformed", "present"], override, "override", false);
+
+    const fileRead = (status: Status, model: string): ReturnType<ManagedPolicyIo["readFile"]> => {
+      if (status === "absent") return { status: "absent" };
+      if (status === "unreadable") return { status: "unreadable" };
+      return {
+        status: "present",
+        text: status === "malformed" ? "{" : JSON.stringify({ model }),
+      };
+    };
+    const registryRead = (
+      status: Status,
+      model: string,
+    ): ReturnType<ManagedRegistryAdapter["readSettings"]> => {
+      if (status === "absent") return { status: "absent" };
+      if (status === "unreadable") return { status: "unreadable" };
+      return {
+        status: "present",
+        json: status === "malformed" ? "{" : JSON.stringify({ model }),
+      };
+    };
+
+    for (const testCase of cases) {
+      const fileCalls: string[] = [];
+      const listCalls: string[] = [];
+      const registryCalls: string[] = [];
+      const io: ManagedPolicyIo = {
+        readFile(filePath) {
+          fileCalls.push(filePath);
+          if (testCase.target === "override") return fileRead(testCase.status, "override");
+          if (filePath === description.systemSettingsPath) {
+            return testCase.target === "system"
+              ? fileRead(testCase.status, "system")
+              : { status: "absent" };
+          }
+          return testCase.target === "drop-in"
+            ? fileRead(testCase.status, "drop-in")
+            : { status: "absent" };
+        },
+        listJsonFiles(dir) {
+          listCalls.push(dir);
+          if (testCase.target === "directory") {
+            if (testCase.status === "absent") return { status: "absent" };
+            if (testCase.status === "unreadable") return { status: "unreadable" };
+            return { status: "present", files: [] };
+          }
+          return {
+            status: "present",
+            files: testCase.target === "drop-in" ? [dropIn] : [],
+          };
+        },
+      };
+      const registry: ManagedRegistryAdapter = {
+        readSettings(hive) {
+          registryCalls.push(hive);
+          if (testCase.target === hive) return registryRead(testCase.status, hive.toLowerCase());
+          if (hive === "HKLM") return { status: "absent" };
+          return { status: "present", json: JSON.stringify({ model: "hkcu" }) };
+        },
+      };
+
+      const result = discoverManagedPolicy({
+        platform: "win32",
+        description,
+        io,
+        registry,
+        ...(testCase.target === "override" ? { overridePaths: [override] } : {}),
+      });
+      expect(result.settings, `${testCase.target}:${testCase.status} settings`).toEqual(
+        testCase.model === undefined ? undefined : { model: testCase.model },
+      );
+      expect(fileCalls, `${testCase.target}:${testCase.status} file calls`).toEqual(
+        testCase.fileCalls,
+      );
+      expect(listCalls, `${testCase.target}:${testCase.status} directory calls`).toEqual(
+        testCase.listCalls,
+      );
+      expect(registryCalls, `${testCase.target}:${testCase.status} registry calls`).toEqual(
+        testCase.registryCalls,
+      );
+      expect(result.diagnostics, `${testCase.target}:${testCase.status} diagnostics`).toEqual(
+        testCase.diagnostic === undefined
+          ? []
+          : [
+              {
+                severity: "error",
+                message:
+                  testCase.status === "malformed"
+                    ? "Managed policy JSON is malformed; source ignored"
+                    : "Managed policy source is unreadable; source ignored",
+                source: testCase.diagnostic.source,
+                category:
+                  testCase.status === "malformed"
+                    ? "managed-policy-malformed"
+                    : "managed-policy-unreadable",
+                sourceClass: testCase.diagnostic.sourceClass,
+                impact: testCase.diagnostic.impact,
+              },
+            ],
+      );
+    }
+  });
+
+  it("marks policy impact only when a failed source actually suppresses HKCU", () => {
+    const description = {
+      systemSettingsPath: "/policy/base.json",
+      dropInDir: "/policy/drop",
+      artifactDirs: ["/policy"],
+    };
+    const withValidHklm = discoverManagedPolicy({
+      platform: "win32",
+      description,
+      io: inertPolicyIo({ [description.systemSettingsPath]: "<unreadable>" }),
+      registry: inertRegistry(
+        { status: "present", json: JSON.stringify({ model: "admin" }) },
+        { status: "present", json: JSON.stringify({ model: "user" }) },
+      ),
+    });
+    expect(withValidHklm.diagnostics[0]).toMatchObject({ impact: "source-ignored" });
+
+    const onlyFailure = discoverManagedPolicy({
+      platform: "win32",
+      description,
+      io: inertPolicyIo({ [description.systemSettingsPath]: "<unreadable>" }),
+      registry: inertRegistry(
+        { status: "absent" },
+        { status: "present", json: JSON.stringify({ model: "user" }) },
+      ),
+    });
+    expect(onlyFailure.diagnostics[0]).toMatchObject({ impact: "weaker-policy-suppressed" });
+  });
+
+  it("uses an authored locale-independent registry protocol with fixed bounded invocation", () => {
+    const calls: RegistryCommandInvocation[] = [];
+    const absent = createWindowsManagedRegistryAdapter((invocation) => {
+      calls.push(invocation);
+      return "ABSENT";
+    });
+    expect(absent.readSettings("HKLM")).toEqual({ status: "absent" });
+    expect(calls[0]).toMatchObject({
+      executable: "powershell.exe",
+      options: {
+        shell: false,
+        timeout: 2_000,
+        maxBuffer: 256 * 1024,
+        windowsHide: true,
+      },
+    });
+    expect(calls[0]?.args.at(-2)).toBe("-EncodedCommand");
+    const authoredScript = Buffer.from(calls[0]!.args.at(-1)!, "base64").toString("utf16le");
+    expect(authoredScript).toContain("[Microsoft.Win32.Registry]::LocalMachine");
+    expect(authoredScript).toContain("SOFTWARE\\Policies\\ClaudeCode");
+    expect(authoredScript).not.toContain("/policy");
+    expect(authoredScript).not.toContain("project");
+
+    const json = JSON.stringify({ model: "registry" });
+    const present = createWindowsManagedRegistryAdapter(
+      () => `PRESENT\n${Buffer.from(json, "utf8").toString("base64")}`,
+    );
+    expect(present.readSettings("HKCU")).toEqual({ status: "present", json });
+
+    for (const error of [
+      Object.assign(new Error("Der Registrierungsschlüssel wurde nicht gefunden"), {
+        stderr: "Der Registrierungsschlüssel wurde nicht gefunden",
+      }),
+      Object.assign(new Error("tempo limite excedido"), { code: "ETIMEDOUT" }),
+    ]) {
+      const unreadable = createWindowsManagedRegistryAdapter(() => {
+        throw error;
+      });
+      expect(unreadable.readSettings("HKLM")).toEqual({ status: "unreadable" });
+    }
+    expect(createWindowsManagedRegistryAdapter(() => "localized arbitrary output").readSettings("HKLM")).toEqual({
+      status: "unreadable",
+    });
+  });
+
+  it("resolves all platform defaults through inert adapters", () => {
+    for (const platform of ["win32", "darwin", "linux"] as const) {
+      const registryCalls: string[] = [];
+      const result = discoverManagedPolicy({
+        platform,
+        io: inertPolicyIo({}),
+        registry: inertRegistry({ status: "absent" }, { status: "absent" }, registryCalls),
+      });
+      expect(result.settings).toBeUndefined();
+      expect(result.diagnostics).toEqual([]);
+      expect(registryCalls).toEqual(platform === "win32" ? ["HKLM", "HKCU"] : []);
+    }
   });
 });
 

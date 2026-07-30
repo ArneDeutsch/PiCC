@@ -1,10 +1,8 @@
 /**
- * Installed-plugin content loading.
+ * Legacy plugin content scanner used only as an internal compatibility seam.
  *
- * Discovers the user's *already-installed* plugins under `<userDir>/plugins`
- * and a project-bundled `.claude-plugin/` structure, and resolves the plugin
- * content directories (skills/agents/commands/hooks) so the respective
- * subsystems can fold them into their registries.
+ * It scans plugin storage and project-bundled content for the current loaders;
+ * discovered roots are not an installed-state authorization boundary.
  *
  * Explicitly OUT of scope: plugin installation / marketplace machinery.
  * We never download, install, or register anything — if a plugin isn't on

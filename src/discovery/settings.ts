@@ -1,5 +1,13 @@
 import path from "node:path";
 import { isFile, readTextSafe } from "../util/fs.js";
+import {
+  createPluginDiagnosticReporter,
+  discoverManagedPolicy,
+  isQualifiedPluginId,
+  mergeManagedObject,
+  stripJsonc,
+  type ManagedPolicyDiscoveryOptions,
+} from "./managed-policy.js";
 import type {
   ClaudeSettings,
   Diagnostic,
@@ -10,43 +18,28 @@ import type {
   Scope,
 } from "../types.js";
 
-/**
- * Settings loading & merging.
- *
- * Reads the standard settings hierarchy in ascending precedence:
- *   user (`<userDir>/settings.json`)
- *   → project (`.claude/settings.json` + `.claude/settings.local.json` at every
- *     directory from the repo root down to cwd — monorepo walk-up, nearest wins)
- *   → managed policy (platform-specific, highest; degrade-silent when absent)
- *
- * Merge semantics:
- * - `permissions.allow/deny/ask/additionalDirectories` ACCUMULATE across scopes (deduped).
- * - `hooks` accumulate per event (matcher entries concatenated).
- * - `env` merges key-wise, higher precedence wins.
- * - `enabledPlugins` merges key-wise, higher precedence wins per plugin key.
- * - `claudeMdExcludes` accumulates (arrays merge across layers, per Claude docs).
- * - MCP keys (`mcpServers`, `enableAllProjectMcpServers`, `enabled/disabledMcpjsonServers`)
- *   are captured scope-tagged per file in `mcpSettings`, never merged here —
- *   precedence and the enablement gate resolve in `discovery/mcp.ts`.
- * - Scalar settings follow precedence (higher scope wins; a malformed value at a
- *   higher scope is ignored with a diagnostic, keeping the lower-scope value).
- *
- * Completeness floor: NO input throws. Malformed files degrade to a diagnostic and are
- * skipped; unrecognized keys land in `unknownKeys`; recognized-but-deferred keys land in
- * `deferredKeys`. JSONC tolerance: `//` line comments and trailing commas are stripped
- * before parsing (Claude Code tolerates these).
- */
+export { stripJsonc } from "./managed-policy.js";
 
+/**
+ * Settings loading and merging in ascending scope precedence. Managed files,
+ * drop-ins, and registry values are validated in source order while preserving
+ * their deep-object and stable-array merge behavior at managed scope.
+ *
+ * Rule lists and hooks accumulate, `env` and `enabledPlugins` merge key-wise,
+ * and valid scalar values replace lower-precedence values. Malformed entries
+ * diagnose without discarding unrelated settings or valid lower-scope values.
+ */
 export interface LoadSettingsOptions {
-  /** Launch directory; nested `.claude/settings*.json` between here and projectRoot load too. */
+  /** Launch directory; nested settings between here and projectRoot load too. */
   cwd: string;
   projectRoot: string;
   userDir: string;
-  /** Override managed/policy settings probe locations (used by tests). */
+  /** Explicit paths bypass ambient managed-policy discovery. */
   managedPaths?: string[];
+  /** Injectable ambient managed-policy boundary (used by deterministic tests). */
+  managedPolicy?: ManagedPolicyDiscoveryOptions;
 }
 
-/** Keys recognized but gating DEFERRED subsystems — recorded, no-op. */
 const DEFERRED_TOP_KEYS = new Set([
   "outputStyle",
   "statusLine",
@@ -63,14 +56,6 @@ const DEFERRED_TOP_KEYS = new Set([
 ]);
 
 const KNOWN_HANDLER_TYPES: readonly string[] = ["command", "http", "prompt", "agent", "mcp_tool"];
-
-/** Default managed/policy settings locations; degrade-silent when absent. */
-function defaultManagedPaths(): string[] {
-  if (process.platform === "win32") {
-    return [path.join("C:\\", "ProgramData", "ClaudeCode", "managed-settings.json")];
-  }
-  return [path.join("/etc", "claude-code", "managed-settings.json")];
-}
 
 function createDefaultSettings(): ClaudeSettings {
   return {
@@ -90,84 +75,12 @@ function createDefaultSettings(): ClaudeSettings {
     subagentMaxDepth: 1,
     subagentConcurrency: 10,
     enabledPlugins: undefined,
+    effectivePluginEnablement: {},
     mcpSettings: [],
     unknownKeys: [],
     deferredKeys: [],
     diagnostics: [],
   };
-}
-
-/**
- * Strip `//` line comments, `/* ... ` block comments, and trailing commas from
- * JSONC-ish text, string-aware (never touches content inside string literals).
- */
-export function stripJsonc(text: string): string {
-  // A UTF-8 BOM (written by Notepad / PowerShell 5.1 by default) must not
-  // reject the file — JSON.parse chokes on it, and losing a settings file
-  // silently drops its deny rules.
-  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-  // Pass 1: remove comments.
-  let noComments = "";
-  let inString = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text.charAt(i);
-    if (inString) {
-      noComments += ch;
-      if (ch === "\\") {
-        noComments += text.charAt(i + 1);
-        i++;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      noComments += ch;
-      continue;
-    }
-    if (ch === "/" && text.charAt(i + 1) === "/") {
-      while (i < text.length && text.charAt(i) !== "\n") i++;
-      if (i < text.length) noComments += "\n";
-      continue;
-    }
-    if (ch === "/" && text.charAt(i + 1) === "*") {
-      i += 2;
-      while (i < text.length && !(text.charAt(i) === "*" && text.charAt(i + 1) === "/")) i++;
-      i += 1; // skip the closing "/" (loop increment skips past it)
-      continue;
-    }
-    noComments += ch;
-  }
-  // Pass 2: drop trailing commas.
-  let out = "";
-  inString = false;
-  for (let i = 0; i < noComments.length; i++) {
-    const ch = noComments.charAt(i);
-    if (inString) {
-      out += ch;
-      if (ch === "\\") {
-        out += noComments.charAt(i + 1);
-        i++;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      out += ch;
-      continue;
-    }
-    if (ch === ",") {
-      let j = i + 1;
-      while (j < noComments.length && /\s/.test(noComments.charAt(j))) j++;
-      const next = noComments.charAt(j);
-      if (next === "}" || next === "]") continue; // trailing comma — drop it
-    }
-    out += ch;
-  }
-  return out;
 }
 
 /**
@@ -204,6 +117,17 @@ export function expandEnvVars(
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function canonicalSettingValue(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalSettingValue).join(",")}]`;
+  if (isPlainObject(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalSettingValue(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? String(value);
 }
 
 /**
@@ -392,8 +316,19 @@ function normalizeHookHandler(
   };
 }
 
+interface ManagedApplyState {
+  hookEntries: Map<string, Set<string>>;
+  attributionOwned: boolean;
+  skillOverrideKeys: Set<string>;
+}
+
 /** Normalize a settings `hooks` block and concatenate its entries per event. */
-function applyHooks(value: unknown, source: string, out: ClaudeSettings): void {
+function applyHooks(
+  value: unknown,
+  source: string,
+  out: ClaudeSettings,
+  managedState?: ManagedApplyState,
+): void {
   if (!isPlainObject(value)) {
     out.diagnostics.push({
       severity: "warning",
@@ -403,12 +338,13 @@ function applyHooks(value: unknown, source: string, out: ClaudeSettings): void {
     return;
   }
   for (const [event, entriesRaw] of Object.entries(value)) {
-    if (skipUnsafeKey(event, "hooks", source, out.diagnostics)) continue;
+    const eventSource = source;
+    if (skipUnsafeKey(event, "hooks", eventSource, out.diagnostics)) continue;
     if (!Array.isArray(entriesRaw)) {
       out.diagnostics.push({
         severity: "warning",
         message: `"hooks.${event}" is not an array; ignored`,
-        source,
+        source: eventSource,
       });
       continue;
     }
@@ -418,7 +354,7 @@ function applyHooks(value: unknown, source: string, out: ClaudeSettings): void {
         out.diagnostics.push({
           severity: "warning",
           message: `Malformed matcher entry in "hooks.${event}" ignored`,
-          source,
+          source: eventSource,
         });
         continue;
       }
@@ -426,12 +362,12 @@ function applyHooks(value: unknown, source: string, out: ClaudeSettings): void {
       if (Array.isArray(entryRaw.hooks)) {
         for (const handlerRaw of entryRaw.hooks) {
           if (isPlainObject(handlerRaw)) {
-            handlers.push(normalizeHookHandler(handlerRaw, source, out.diagnostics));
+            handlers.push(normalizeHookHandler(handlerRaw, eventSource, out.diagnostics));
           } else {
             out.diagnostics.push({
               severity: "warning",
               message: `Malformed hook handler in "hooks.${event}" ignored`,
-              source,
+              source: eventSource,
             });
           }
         }
@@ -439,14 +375,22 @@ function applyHooks(value: unknown, source: string, out: ClaudeSettings): void {
         out.diagnostics.push({
           severity: "warning",
           message: `Matcher entry in "hooks.${event}" has no "hooks" array; kept with no handlers`,
-          source,
+          source: eventSource,
         });
       }
-      entries.push({
+      const entry = {
         matcher: asString(entryRaw.matcher),
         if: asString(entryRaw.if),
         hooks: handlers,
-      });
+      };
+      if (managedState !== undefined) {
+        const seen = managedState.hookEntries.get(event) ?? new Set<string>();
+        managedState.hookEntries.set(event, seen);
+        const identity = canonicalSettingValue(entryRaw);
+        if (seen.has(identity)) continue;
+        seen.add(identity);
+      }
+      entries.push(entry);
     }
     if (entries.length > 0) {
       const existing = Object.hasOwn(out.hooks, event) ? out.hooks[event]! : [];
@@ -455,7 +399,12 @@ function applyHooks(value: unknown, source: string, out: ClaudeSettings): void {
   }
 }
 
-function applyPermissions(value: unknown, scope: Scope, source: string, out: ClaudeSettings): void {
+function applyPermissions(
+  value: unknown,
+  scope: Scope,
+  source: string,
+  out: ClaudeSettings,
+): void {
   if (!isPlainObject(value)) {
     out.diagnostics.push({
       severity: "warning",
@@ -465,15 +414,23 @@ function applyPermissions(value: unknown, scope: Scope, source: string, out: Cla
     return;
   }
   for (const [key, sub] of Object.entries(value)) {
+    const fieldSource = source;
     switch (key) {
       case "allow":
       case "deny":
       case "ask":
-        out.permissions[key].push(...toStringArray(sub, `permissions.${key}`, source, out.diagnostics));
+        out.permissions[key].push(
+          ...toStringArray(sub, `permissions.${key}`, fieldSource, out.diagnostics),
+        );
         break;
       case "additionalDirectories":
         out.permissions.additionalDirectories.push(
-          ...toStringArray(sub, "permissions.additionalDirectories", source, out.diagnostics).map((d) =>
+          ...toStringArray(
+            sub,
+            "permissions.additionalDirectories",
+            fieldSource,
+            out.diagnostics,
+          ).map((d) =>
             expandEnvVars(d),
           ),
         );
@@ -493,7 +450,12 @@ function applyPermissions(value: unknown, scope: Scope, source: string, out: Cla
   }
 }
 
-function applyWorktree(value: unknown, scope: Scope, source: string, out: ClaudeSettings): void {
+function applyWorktree(
+  value: unknown,
+  scope: Scope,
+  source: string,
+  out: ClaudeSettings,
+): void {
   if (!isPlainObject(value)) {
     out.diagnostics.push({
       severity: "warning",
@@ -503,6 +465,7 @@ function applyWorktree(value: unknown, scope: Scope, source: string, out: Claude
     return;
   }
   for (const [key, sub] of Object.entries(value)) {
+    const fieldSource = source;
     if (key === "baseRef") {
       if (sub === "head" || sub === "fresh") {
         out.worktree.baseRef = sub;
@@ -510,7 +473,7 @@ function applyWorktree(value: unknown, scope: Scope, source: string, out: Claude
         out.diagnostics.push({
           severity: "warning",
           message: `"worktree.baseRef" must be "head" or "fresh" (got ${JSON.stringify(sub)}); keeping "${out.worktree.baseRef}"`,
-          source,
+          source: fieldSource,
         });
       }
     } else {
@@ -519,7 +482,12 @@ function applyWorktree(value: unknown, scope: Scope, source: string, out: Claude
   }
 }
 
-function applySubagents(value: unknown, scope: Scope, source: string, out: ClaudeSettings): void {
+function applySubagents(
+  value: unknown,
+  scope: Scope,
+  source: string,
+  out: ClaudeSettings,
+): void {
   if (!isPlainObject(value)) {
     out.diagnostics.push({
       severity: "warning",
@@ -529,19 +497,20 @@ function applySubagents(value: unknown, scope: Scope, source: string, out: Claud
     return;
   }
   for (const [key, sub] of Object.entries(value)) {
+    const fieldSource = source;
     switch (key) {
       case "enabled": {
-        const b = expectBool(sub, "subagents.enabled", source, out.diagnostics);
+        const b = expectBool(sub, "subagents.enabled", fieldSource, out.diagnostics);
         if (b !== undefined) out.subagentsEnabled = b;
         break;
       }
       case "maxDepth": {
-        const n = expectPositiveInt(sub, "subagents.maxDepth", source, out.diagnostics);
+        const n = expectPositiveInt(sub, "subagents.maxDepth", fieldSource, out.diagnostics);
         if (n !== undefined) out.subagentMaxDepth = n;
         break;
       }
       case "concurrency": {
-        const n = expectPositiveInt(sub, "subagents.concurrency", source, out.diagnostics);
+        const n = expectPositiveInt(sub, "subagents.concurrency", fieldSource, out.diagnostics);
         if (n !== undefined) out.subagentConcurrency = n;
         break;
       }
@@ -560,7 +529,13 @@ function applySubagents(value: unknown, scope: Scope, source: string, out: Claud
 function mcpEntryFor(out: ClaudeSettings, scope: Scope, source: string): McpSettingsEntry {
   const list = (out.mcpSettings ??= []);
   const last = list[list.length - 1];
-  if (last !== undefined && last.sourcePath === source) return last;
+  if (
+    last !== undefined &&
+    (last.sourcePath === source || (scope === "managed" && last.scope === "managed"))
+  ) {
+    last.sourcePath = source;
+    return last;
+  }
   const entry: McpSettingsEntry = { scope, sourcePath: source };
   list.push(entry);
   return entry;
@@ -572,6 +547,7 @@ function applySettingsFile(
   scope: Scope,
   source: string,
   out: ClaudeSettings,
+  managedState?: ManagedApplyState,
 ): void {
   for (const [key, value] of Object.entries(raw)) {
     switch (key) {
@@ -581,7 +557,7 @@ function applySettingsFile(
         applyPermissions(value, scope, source, out);
         break;
       case "hooks":
-        applyHooks(value, source, out);
+        applyHooks(value, source, out, managedState);
         break;
       case "env": {
         if (!isPlainObject(value)) {
@@ -610,7 +586,18 @@ function applySettingsFile(
       }
       case "attribution": {
         if (isPlainObject(value)) {
-          out.attribution = value;
+          if (scope === "managed") {
+            const firstManaged = managedState !== undefined && !managedState.attributionOwned;
+            if (managedState !== undefined) managedState.attributionOwned = true;
+            out.attribution = mergeManagedObject(
+              firstManaged || out.attribution === undefined
+                ? (Object.create(null) as Record<string, unknown>)
+                : out.attribution,
+              value,
+            );
+          } else {
+            out.attribution = value;
+          }
         } else {
           out.diagnostics.push({
             severity: "warning",
@@ -644,7 +631,23 @@ function applySettingsFile(
         if (isPlainObject(value)) {
           for (const [skillKey, mode] of Object.entries(value)) {
             if (skipUnsafeKey(skillKey, "skillOverrides", source, out.diagnostics)) continue;
-            out.skillOverrides[skillKey] = mode;
+            const current = out.skillOverrides[skillKey];
+            if (scope === "managed") {
+              const firstManaged =
+                managedState !== undefined && !managedState.skillOverrideKeys.has(skillKey);
+              managedState?.skillOverrideKeys.add(skillKey);
+              out.skillOverrides[skillKey] =
+                !firstManaged && isPlainObject(current) && isPlainObject(mode)
+                  ? mergeManagedObject(current, mode)
+                  : isPlainObject(mode)
+                    ? mergeManagedObject(
+                        Object.create(null) as Record<string, unknown>,
+                        mode,
+                      )
+                    : mode;
+            } else {
+              out.skillOverrides[skillKey] = mode;
+            }
           }
         } else {
           out.diagnostics.push({
@@ -700,31 +703,32 @@ function applySettingsFile(
         break;
       }
       case "enabledPlugins": {
-        // Key-wise merge across scopes (like `env`): the nearer scope wins PER
-        // PLUGIN KEY — a project file enabling its own plugins must not wipe the
-        // user's enabled set. Array form normalizes to `{ name: true }`.
-        let entries: Array<[string, boolean]> | undefined;
-        if (isPlainObject(value)) {
-          entries = Object.entries(value).map(([k, v]) => [k, Boolean(v)]);
-        } else if (Array.isArray(value)) {
-          entries = value.map((v) => [String(v), true]);
-        }
-        if (entries === undefined) {
-          out.diagnostics.push({
-            severity: "warning",
-            message: `Setting "enabledPlugins" is not an object or array; ignored`,
-            source,
-          });
+        const report = createPluginDiagnosticReporter(source, out.diagnostics);
+        if (!isPlainObject(value)) {
+          report('Setting "enabledPlugins" is not an object; ignored');
           break;
         }
-        const merged: Record<string, boolean> = isPlainObject(out.enabledPlugins)
-          ? out.enabledPlugins
-          : {};
-        for (const [pluginKey, enabled] of entries) {
-          if (skipUnsafeKey(pluginKey, "enabledPlugins", source, out.diagnostics)) continue;
+        // Merge per qualified identity: a higher scope may override one plugin,
+        // but must not erase unrelated enablement from a lower scope.
+        const merged = out.enabledPlugins ?? {};
+        for (const [pluginKey, enabled] of Object.entries(value)) {
+          const entrySource = source;
+          if (!isQualifiedPluginId(pluginKey)) {
+            report('Invalid plugin identity in "enabledPlugins" ignored');
+            continue;
+          }
+          if (typeof enabled !== "boolean") {
+            report(`Plugin "${pluginKey}" in "enabledPlugins" must be a literal boolean; ignored`);
+            continue;
+          }
           merged[pluginKey] = enabled;
+          (out.effectivePluginEnablement ??= {})[pluginKey] = {
+            enabled,
+            scope,
+            source: entrySource,
+          };
         }
-        out.enabledPlugins = merged;
+        out.enabledPlugins = Object.keys(merged).length > 0 ? merged : undefined;
         break;
       }
       case "subagents":
@@ -743,7 +747,11 @@ function applySettingsFile(
         // collide with Object.prototype members ("constructor", "toString").
         const servers: Record<string, unknown> = Object.create(null);
         for (const [name, entryRaw] of Object.entries(value)) servers[name] = entryRaw;
-        mcpEntryFor(out, scope, source).servers = servers;
+        const entry = mcpEntryFor(out, scope, source);
+        entry.servers =
+          scope === "managed" && entry.servers !== undefined
+            ? mergeManagedObject(entry.servers, servers)
+            : servers;
         break;
       }
       case "enableAllProjectMcpServers": {
@@ -763,7 +771,10 @@ function applySettingsFile(
           });
           break;
         }
-        mcpEntryFor(out, scope, source)[key] = toStringArray(value, key, source, out.diagnostics);
+        const entry = mcpEntryFor(out, scope, source);
+        const strings = toStringArray(value, key, source, out.diagnostics);
+        entry[key] =
+          scope === "managed" ? Array.from(new Set([...(entry[key] ?? []), ...strings])) : strings;
         break;
       }
       case "disableSubagents": {
@@ -815,7 +826,6 @@ function settingsDirChain(cwd: string, projectRoot: string): string[] {
  */
 export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
   const settings = createDefaultSettings();
-  const managed = opts.managedPaths ?? defaultManagedPaths();
 
   // Ascending precedence: later files win on scalar conflicts. Project scope
   // walks repo root → cwd so nested/monorepo .claude/settings.json files load
@@ -827,7 +837,6 @@ export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
     files.push({ path: path.join(dir, ".claude", "settings.json"), scope: "project" });
     files.push({ path: path.join(dir, ".claude", "settings.local.json"), scope: "local" });
   }
-  files.push(...managed.map((p) => ({ path: p, scope: "managed" as Scope })));
 
   for (const file of files) {
     if (!isFile(file.path)) continue; // absent — degrade silently (incl. managed/policy)
@@ -860,6 +869,29 @@ export function loadSettings(opts: LoadSettingsOptions): ClaudeSettings {
       continue;
     }
     applySettingsFile(parsed, file.scope, file.path, settings);
+  }
+
+  const managed = discoverManagedPolicy({
+    ...opts.managedPolicy,
+    ...(opts.managedPaths !== undefined ? { overridePaths: opts.managedPaths } : {}),
+  });
+  const managedState: ManagedApplyState = {
+    hookEntries: new Map(),
+    attributionOwned: false,
+    skillOverrideKeys: new Set(),
+  };
+  for (const event of managed.events) {
+    if (event.type === "diagnostic") {
+      settings.diagnostics.push(event.diagnostic);
+    } else {
+      applySettingsFile(
+        event.source.value,
+        "managed",
+        event.source.source,
+        settings,
+        managedState,
+      );
+    }
   }
 
   // Accumulating rule lists dedup while preserving first-seen order.
